@@ -88,8 +88,9 @@ let options = DriverOptions {
         max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
     },
     charge: poot_llm::driver::program_retention,
-    draft: DraftPolicy::Off, // or PromptLookup / DraftModel: see Speculative decoding
-    hidden_window: None,    // Some(window): every program also writes a hidden-state carry
+    draft: DraftPolicy::Off, // or PromptLookup / DraftModel / Mtp { k }: see Speculative decoding
+    hidden_window: None,    // Some(window): every program also writes a hidden-state carry;
+                            // under Mtp, draft.carry_window() (the driver refuses otherwise)
 };
 let mut driver = Driver::new(Arc::clone(&handle), open_executor(BackendChoice::Auto)?, options)?;
 let generation = driver.generate(

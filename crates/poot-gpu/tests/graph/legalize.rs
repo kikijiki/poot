@@ -9,6 +9,7 @@
 use super::*;
 use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_target::{Backend, DeviceCaps};
+use poot_test_util::graph_fixtures::gpu_caps;
 
 #[test]
 fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
@@ -26,16 +27,16 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
     // The tracers' `linear`: an `[out, in]` weight read through a transpose.
     let w = b.constant("w", TensorType::f32(vec![n, k]));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     // row_bytes = k*4 = 16 bytes; a 48-byte limit (well under this device's real max_buffer_bytes, and
     // below 4096 so `usable == limit`) forces 3 rows per chunk: row ranges (0,3),(3,6),(6,9),(9,10) - 4
     // chunks, including an uneven final one.
-    let split_target = Target {
+    let split_target = Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: DeviceCaps {
             max_buffer_bytes: 48,
-            ..target.caps
+            ..gpu_caps(&target)
         },
     };
     let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
@@ -43,7 +44,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
         compile(&g, &split_target, &options).expect("an oversized matmul weight always splits");
     let gh = program.graph();
     assert!(
-        gh.eqns
+        gh.eqns()
             .iter()
             .any(|e| matches!(e.op, OpKind::Concat { .. })),
         "the compiled program must show the split outcome (chunks joined by concat)"
@@ -51,7 +52,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
 
     let w_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.01 - 0.05).collect();
     let mut cpu_inputs = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let m = g.meta(id);
         let t = match m.name.as_deref() {
             Some("w") => HostTensor::f32(vec![n, k], w_data.clone()),
@@ -69,7 +70,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
     // The device binds the compiled program's `w.chunkN` consts from the one parent weight `w`, stored
     // whole under its own name: the binder places chunk N as the next rows of `w`.
     let gh_chunks: Vec<_> = gh
-        .consts
+        .consts()
         .iter()
         .filter_map(|&id| gh.meta(id).name.as_deref())
         .filter(|name| name.starts_with("w.chunk"))

@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::builder::Resumed;
-use poot_graph_ir::graph::{Eqn, Graph, Operand, Storage, ValidationChannel, ValueId, ValueMeta};
+use poot_graph_ir::graph::{Eqn, Graph, Operand, Storage, ValueId, ValueMeta};
 use poot_graph_ir::op::{BinOp, OpKind};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Builder, PackedSourceName, Slot, ValueTable};
@@ -75,6 +75,14 @@ pub enum LoraError {
     },
     #[error(transparent)]
     Expansion(#[from] ExpansionError),
+    #[error(transparent)]
+    Edit(Box<poot_graph_ir::EditError>),
+}
+
+impl From<poot_graph_ir::EditError> for LoraError {
+    fn from(error: poot_graph_ir::EditError) -> Self {
+        Self::Edit(Box::new(error))
+    }
 }
 
 /// One contraction of an adapted projection.
@@ -89,11 +97,7 @@ struct Site {
 }
 
 /// Insert the LoRA correction of `plan` after every contraction of a targeted projection of `g`.
-pub fn apply_lora<V: ValidationChannel>(
-    g: &Graph<V>,
-    plan: &LoraPlan,
-    budget: &GraphBudget,
-) -> Result<Graph<V>, LoraError> {
+pub fn apply_lora(g: &Graph, plan: &LoraPlan, budget: &GraphBudget) -> Result<Graph, LoraError> {
     if plan.projections.is_empty() {
         return Err(LoraError::NoTargets);
     }
@@ -127,33 +131,7 @@ pub fn apply_lora<V: ValidationChannel>(
 
     // The adapter inputs: the one index slot, the scale vector, and the stacked factors of each
     // adapted (layer, projection). Declared through a builder so the slot carries its typed key.
-    let Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        eqns,
-        output,
-        state,
-        validations,
-        exports,
-    } = g.clone();
-    let plain = Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        eqns,
-        output,
-        validations: poot_graph_ir::NoValidations,
-        exports,
-        state,
-    };
-    let Resumed {
-        builder,
-        out: traced,
-        state: carried,
-    } = Builder::resume(plain);
+    let Resumed { builder, outputs } = Builder::resume(g.clone());
     let b = &builder;
     let idx = b
         .slot(Slot::LoraIdx, TensorType::new(vec![rows], DType::I32))
@@ -183,11 +161,14 @@ pub fn apply_lora<V: ValidationChannel>(
             )
         });
     }
-    let mut declared = builder.finish_with_state(traced, &carried);
-    let originals = std::mem::take(&mut declared.eqns);
+    // The builder keeps the witnesses and exports `g` declared, and refuses a finish that does not
+    // carry every state pair again.
+    let declared = builder.finish(outputs)?;
+    let mut edit = declared.edit();
+    let originals = std::mem::take(edit.eqns_mut());
 
     let mut emitter = Emitter {
-        values: &mut declared.values,
+        values: edit.values_mut(),
         eqns: Vec::with_capacity(originals.len() + sites.len() * 11),
         budget,
         layer: None,
@@ -283,27 +264,8 @@ pub fn apply_lora<V: ValidationChannel>(
         )?;
     }
     let eqns = emitter.eqns;
-    let Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        output,
-        state,
-        exports,
-        ..
-    } = declared;
-    Ok(Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        eqns,
-        output,
-        validations,
-        exports,
-        state,
-    })
+    *edit.eqns_mut() = eqns;
+    Ok(edit.commit()?)
 }
 
 fn declared_shape(emitter: &Emitter<'_>, value: ValueId) -> Vec<usize> {
@@ -311,13 +273,13 @@ fn declared_shape(emitter: &Emitter<'_>, value: ValueId) -> Vec<usize> {
 }
 
 /// The contractions of `g` whose weight is a targeted projection, in equation order.
-fn sites<V: ValidationChannel>(g: &Graph<V>, plan: &LoraPlan) -> Vec<Site> {
-    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
-    for (e, eqn) in g.eqns.iter().enumerate() {
+fn sites(g: &Graph, plan: &LoraPlan) -> Vec<Site> {
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
+    for (e, eqn) in g.eqns().iter().enumerate() {
         producer[eqn.out] = Some(e);
     }
     let mut found = Vec::new();
-    for (e, eqn) in g.eqns.iter().enumerate() {
+    for (e, eqn) in g.eqns().iter().enumerate() {
         let (OpKind::MatMul, [Operand::Value(x), Operand::Value(w)]) =
             (&eqn.op, eqn.inputs.as_slice())
         else {
@@ -347,12 +309,12 @@ fn sites<V: ValidationChannel>(g: &Graph<V>, plan: &LoraPlan) -> Vec<Site> {
 
 /// The const name of the weight a contraction's right operand is: the const itself, a transpose of it,
 /// or the `PackedDequant` of its source tensors, whichever way the tracer spelled the linear.
-fn weight_name<V: ValidationChannel>(
-    g: &Graph<V>,
+fn weight_name(
+    g: &Graph,
     producer: &ValueTable<Option<usize>>,
     operand: ValueId,
 ) -> Option<String> {
-    let through = match producer[operand].map(|e| &g.eqns[e]) {
+    let through = match producer[operand].map(|e| &g.eqns()[e]) {
         Some(Eqn {
             op: OpKind::Transpose { perm },
             inputs,
@@ -363,7 +325,7 @@ fn weight_name<V: ValidationChannel>(
         },
         _ => operand,
     };
-    match producer[through].map(|e| &g.eqns[e]) {
+    match producer[through].map(|e| &g.eqns()[e]) {
         None => {
             let meta = g.meta(through);
             (meta.storage == Storage::Const)
@@ -439,7 +401,7 @@ mod tests {
     use std::collections::HashMap;
 
     use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-    use poot_executor_parity::dense::{Dense, Family, plain, step};
+    use poot_executor_parity::dense::{Dense, Family, step};
     use poot_graph_ir::Graph;
     use poot_graph_ir::{Builder, Slot, Storage, TensorType, ValueId};
     use poot_models::model::{LogitRows, Phase};
@@ -454,7 +416,7 @@ mod tests {
     const RANK: usize = 2;
 
     fn target() -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: default_caps_for(Backend::SpirvVulkan),
         }
@@ -503,12 +465,10 @@ mod tests {
     }
 
     fn decode(rows: usize) -> Graph {
-        plain(
-            qwen2()
-                .model
-                .trace(Phase::Decode, step(rows, 1, 8, LogitRows::Last))
-                .unwrap(),
-        )
+        qwen2()
+            .model
+            .trace(Phase::Decode, step(rows, 1, 8, LogitRows::Last))
+            .unwrap()
     }
 
     /// `(in, out)` of every targeted projection of the tiny qwen2.
@@ -614,7 +574,7 @@ mod tests {
         lora: &[i32],
     ) -> Vec<f32> {
         let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let aval = g.aval(id).clone();
             let meta = g.meta(id);
             let tensor = match meta.storage {
@@ -731,7 +691,7 @@ mod tests {
             TensorType::f32(vec![4, 4]),
         );
         let y = b.matmul(x, b.transpose(w, vec![1, 0]));
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         let wanted = LoraPlan {
             rows: NonZeroUsize::new(ROWS).unwrap(),
             adapters: NonZeroUsize::MIN,
@@ -772,7 +732,7 @@ mod tests {
             TensorType::new(vec![4, 4], dtype),
         );
         let y = b.matmul(x, b.transpose(w, vec![1, 0]));
-        b.finish(y)
+        b.finish(y).unwrap()
     }
 
     fn q_plan(rows: usize, projections: Vec<LoraTarget>) -> LoraPlan {

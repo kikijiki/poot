@@ -61,7 +61,7 @@ fn attention_dispatches(
     shape: StepShape,
 ) -> Vec<usize> {
     let graph = model.trace(phase, shape).unwrap();
-    let target = Target {
+    let target = Target::Gpu {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     };

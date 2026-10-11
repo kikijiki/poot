@@ -19,7 +19,7 @@ use poot_graph_plan::passes_without_target as optimize;
 
 /// Deterministic inputs in `[-0.5, 0.5)`, one stream per input id.
 fn inputs(g: &Graph) -> HashMap<ValueId, Value> {
-    g.inputs
+    g.inputs()
         .iter()
         .map(|&id| {
             let shape = g.aval(id).shape.clone();
@@ -40,9 +40,6 @@ fn inputs(g: &Graph) -> HashMap<ValueId, Value> {
 /// The optimized graph validates and its oracle result equals the raw graph's in every element, bit for
 /// bit (a NaN never equals).
 fn assert_optimize_preserves(name: &str, raw: &Graph, optimized: &Graph) {
-    optimized
-        .validate()
-        .unwrap_or_else(|e| panic!("{name}: optimized graph invalid: {e}"));
     let ins = inputs(raw);
     let want = eval(raw, &ins, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap_or_else(|e| panic!("{name}: raw eval: {e}"))
@@ -70,7 +67,7 @@ fn assert_optimize_preserves(name: &str, raw: &Graph, optimized: &Graph) {
 }
 
 fn flash_ops(g: &Graph) -> Vec<String> {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .map(|e| e.op.name())
@@ -85,7 +82,7 @@ fn assert_plans_everywhere(name: &str, g: &Graph) {
         ("Nvptx", Backend::Nvptx),
     ];
     for (backend_name, backend) in backends {
-        for (i, eqn) in g.eqns.iter().enumerate() {
+        for (i, eqn) in g.eqns().iter().enumerate() {
             if let Err(e) = plan_eqn(
                 g,
                 eqn,
@@ -109,7 +106,7 @@ fn decode_attention(q: [usize; 4], kv: [usize; 4], mask: [usize; 4], n_rep: usiz
     let v = b.constant("v", TensorType::f32(kv.to_vec()));
     let mask = b.constant("mask", TensorType::f32(mask.to_vec()));
     let out = attention_masked(&b, q, k, v, n_rep, 0.25, mask);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// A prefill attention (`ops::attention_prefill`) with `hkv` KV heads repeated `n_rep` times.
@@ -120,7 +117,7 @@ fn prefill_attention(hkv: usize, n_rep: usize, l: usize, d: usize) -> Graph {
     let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let out = attention_prefill(&b, q, k, v, n_rep, 0.25, mask);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// SC-001 (R467-001, 467 probe p10): K/V with a size-1 head axis (MQA by broadcast) or a size-1 batch axis
@@ -146,10 +143,10 @@ fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
     ];
     for (name, q, kv, mask) in cases {
         let raw = decode_attention(q, kv, mask, 1);
-        let optimized = optimize(&raw);
+        let optimized = optimize(&raw).unwrap();
         assert_eq!(flash_ops(&optimized), Vec::<String>::new(), "{name}: fused");
         let kinds: Vec<&str> = optimized
-            .eqns
+            .eqns()
             .iter()
             .map(|e| match e.op {
                 OpKind::Transpose { .. } => "transpose",
@@ -201,8 +198,8 @@ fn rope_chain_that_broadcasts_x_up_optimizes_to_a_plannable_graph() {
     let xc = b.binary(BinOp::Mul, x, cos);
     let rs = b.binary(BinOp::Mul, rotate_half, sin);
     let out = b.binary(BinOp::Add, xc, rs);
-    let raw = b.finish(out);
-    let optimized = optimize(&raw);
+    let raw = b.finish(out).unwrap();
+    let optimized = optimize(&raw).unwrap();
     assert_plans_everywhere("rope broadcasting x", &optimized);
     assert_optimize_preserves("rope broadcasting x", &raw, &optimized);
 }
@@ -240,7 +237,7 @@ fn optimize_preserves_attention_over_head_layouts() {
         ),
     ];
     for (name, raw, fuses) in cases {
-        let optimized = optimize(&raw);
+        let optimized = optimize(&raw).unwrap();
         assert_eq!(
             flash_ops(&optimized).len(),
             usize::from(fuses),

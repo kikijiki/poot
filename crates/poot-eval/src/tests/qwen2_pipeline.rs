@@ -6,7 +6,7 @@ use poot_executor_parity::dense::{Dense, Family, paged_step, step};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{attention, attention_masked, attention_softcap, softcap};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Graph, Slot, StateRole, Storage, ValidationOutputs, ValueId};
+use poot_graph_ir::{Graph, Slot, StateRole, Storage, ValueId};
 use poot_models::model::{LogitRows, Model, Phase};
 use poot_tensor::HostTensor;
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ fn masked_attention_equals_sliced() {
         let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
         let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
         let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(qi, HostTensor::f32(vec![1, hq, 1, d], qd.clone()));
         inputs.insert(ki, HostTensor::f32(vec![1, hkv, cap, d], kd.clone()));
@@ -68,7 +68,7 @@ fn masked_attention_equals_sliced() {
         let vvalid = b.slice(v, 2, 0, pos + 1);
         let out = attention(&b, q, kvalid, vvalid, n_rep, scale);
         let (qi, ki, vi) = (q.id(), k.id(), v.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(qi, HostTensor::f32(vec![1, hq, 1, d], qd.clone()));
         inputs.insert(ki, HostTensor::f32(vec![1, hkv, cap, d], kd.clone()));
@@ -102,7 +102,7 @@ fn softcap_evaluates_to_c_tanh_and_approaches_identity() {
     let x = b.constant("x", TensorType::f32(vec![n]));
     let y = softcap(&b, x, c);
     let xi = x.id();
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(xi, HostTensor::f32(vec![n], xd.clone()));
     let out = {
@@ -129,7 +129,7 @@ fn softcap_evaluates_to_c_tanh_and_approaches_identity() {
     let x2 = b2.constant("x", TensorType::f32(vec![n]));
     let y2 = softcap(&b2, x2, big);
     let xi2 = x2.id();
-    let g2 = b2.finish(y2);
+    let g2 = b2.finish(y2).unwrap();
     let mut in2 = HashMap::new();
     in2.insert(xi2, HostTensor::f32(vec![n], modest.clone()));
     let out2 = {
@@ -166,7 +166,7 @@ fn attention_softcap_matches_reference_and_differs_from_uncapped() {
         let v = b.constant("v", TensorType::f32(vec![1, hkv, s, d]));
         let out = attention_softcap(&b, q, k, v, n_rep, scale, softcap_c);
         let (qi, ki, vi) = (q.id(), k.id(), v.id());
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(qi, HostTensor::f32(vec![1, hq, 1, d], qd.clone()));
         inputs.insert(ki, HostTensor::f32(vec![1, hkv, s, d], kd.clone()));
@@ -228,7 +228,7 @@ fn matmul_matches_naive() {
     let w = b.constant("w", TensorType::f32(vec![3, 2]));
     let out = b.matmul(a, w);
     let (ai, wi) = (a.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let ad = vec![1.0, 2.0, 3.0];
     let wd = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]; // row-major [3,2]
@@ -276,7 +276,7 @@ pub(super) fn trace_step(
     (rows, tokens, capacity): (usize, usize, usize),
     pool: Option<usize>,
     logits: LogitRows,
-) -> Graph<ValidationOutputs> {
+) -> Graph {
     let shape = match pool {
         None => step(rows, tokens, capacity, logits),
         Some(pool) => paged_step(rows, tokens, capacity, pool, logits),
@@ -336,14 +336,14 @@ pub(super) struct Stepped {
 /// (`[rows * tokens]`, row-major), a paged step's `(read, write)` maps, and `state` (zeros when
 /// `None`).
 pub(super) fn eval_step(
-    g: &Graph<ValidationOutputs>,
+    g: &Graph,
     tokens: &[i32],
     pos: &[i32],
     maps: Option<(&[i32], &[i32])>,
     state: Option<&[HostTensor]>,
 ) -> Stepped {
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let m = g.meta(id);
         let t = match m.storage {
             Storage::Slot(Slot::Token) => HostTensor::i32(m.aval.shape.clone(), tokens.to_vec()),
@@ -365,7 +365,7 @@ pub(super) fn eval_step(
         };
         inputs.insert(id, Value::from(t));
     }
-    for (i, &(si, _)) in g.state.iter().enumerate() {
+    for (i, (si, _)) in g.state().enumerate() {
         let carried = match state {
             None => HostTensor::zeros(g.aval(si).shape.clone()),
             Some(prev) => prev[i].clone(),
@@ -390,7 +390,6 @@ pub(super) fn eval_step(
 fn qwen2_tiny_runs_end_to_end() {
     let model = tiny_qwen2(32, 16, 32, 16);
     let g = trace_step(&*model, Phase::Decode, (1, 1, 8), None, LogitRows::Last);
-    g.validate().expect("validate");
     let logits = eval_step(&g, &[5], &[3], None, None).logits;
     assert_eq!(logits.shape(), vec![1, 1, 32]);
     assert!(
@@ -415,8 +414,9 @@ fn dynamic_update_slice_writes_one_slot() {
     let written = b.dynamic_update_slice(cache, upd, 2, 1);
     // a trivial logits output so the graph is well-formed.
     let logits = b.constant("logits", TensorType::f32(vec![1, 1, 4]));
-    let g = b.finish_with_state(logits, &[(cache, written)]);
-    g.validate().expect("valid");
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(logits).with_state(&[(cache, written)]))
+        .unwrap();
 
     let mut inputs: HashMap<ValueId, HostTensor> = HashMap::new();
     inputs.insert(cache.id(), HostTensor::zeros(vec![2, 4, 3]));
@@ -538,8 +538,8 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
             LogitRows::Last,
         );
         assert_eq!(
-            g.state.len(),
-            g_one.state.len(),
+            g.state().count(),
+            g_one.state().count(),
             "chunk and one-shot graphs must carry the same per-layer state pairs"
         );
         let (read, write) = paged_maps(

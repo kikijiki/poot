@@ -21,10 +21,10 @@ fn which(tool: &str) -> bool {
 }
 
 /// Encode f32 -> f16 bytes (little-endian), reusing the loader's own f32->f16 narrowing
-/// (`poot_load::gguf::f32_to_f16`), matching `f16_matmul_probe.rs`'s helper.
+/// (`poot_quant::scalar::f32_to_f16`), matching `f16_matmul_probe.rs`'s helper.
 fn f16_encode(data: &[f32]) -> Vec<u8> {
     data.iter()
-        .flat_map(|&f| poot_load::gguf::f32_to_f16(f).to_le_bytes())
+        .flat_map(|&f| poot_quant::scalar::f32_to_f16(f).to_le_bytes())
         .collect()
 }
 
@@ -95,7 +95,7 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
 
     // CPU oracle: round A/B to f16 (the coopmat load narrows on the way in), f32-accumulate,
     // k=0..16 - matching the NVPTX WMMA sibling probe's oracle shape (`probe_tc_matmul`).
-    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_load::gguf::f32_to_f16(x));
+    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
     let ra: Vec<f32> = a_data.iter().map(|&x| round(x)).collect();
     let rb: Vec<f32> = b_data.iter().map(|&x| round(x)).collect();
     let mut max_abs = 0.0f32;
@@ -197,7 +197,7 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
-    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_load::gguf::f32_to_f16(x));
+    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
     let ra: Vec<f32> = a_data.iter().map(|&x| round(x)).collect();
     let rb: Vec<f32> = b_data.iter().map(|&x| round(x)).collect();
     let mut max_abs = 0.0f32;

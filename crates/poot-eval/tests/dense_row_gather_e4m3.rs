@@ -11,8 +11,8 @@
 use poot_eval::fp8::e4m3fn_tensor;
 use poot_eval::{EvalBudget, EvalOptions, Value};
 use poot_graph_ir::{
-    BinOp, DENSE_ROW_GATHER_SOURCE_DTYPES, Eqn, Graph, OpKind, Operand, Scalar, Slot, Storage,
-    TensorType, ValueId, ValueMeta,
+    BinOp, DENSE_ROW_GATHER_SOURCE_DTYPES, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot,
+    Storage, TensorType, ValueId, ValueMeta,
 };
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
@@ -45,25 +45,25 @@ fn build_graph(
     index_len: usize,
     scale: Option<f32>,
 ) -> (Graph, ValueId, ValueId) {
-    let mut g = Graph::default();
+    let mut g = GraphEdit::new();
 
     let table_shape = vec![rows, row_width];
-    let table_id = g.values.push(ValueMeta::new(
+    let table_id = g.values_mut().push(ValueMeta::new(
         TensorType::new(table_shape.clone(), DType::E4M3FN),
         Storage::Const,
         Some("table".to_string()),
     ));
-    g.inputs.push(table_id);
-    g.consts.push(table_id);
+    g.inputs_mut().push(table_id);
+    g.consts_mut().push(table_id);
 
     let index_shape = vec![index_len];
-    let index_id = g.values.push(ValueMeta::new(
+    let index_id = g.values_mut().push(ValueMeta::new(
         TensorType::new(index_shape.clone(), DType::I32),
         Storage::Slot(Slot::Token),
         None,
     ));
-    g.inputs.push(index_id);
-    g.slots.push((index_id, Slot::Token));
+    g.inputs_mut().push(index_id);
+    g.slots_mut().push((index_id, Slot::Token));
 
     let gather_op = OpKind::DenseRowGather {
         source: DType::E4M3FN,
@@ -75,9 +75,9 @@ fn build_graph(
         ])
         .expect("E4M3FN is an admitted DenseRowGather source (Card 405); operands are well-formed");
     let gather_id = g
-        .values
+        .values_mut()
         .push(ValueMeta::new(gather_type.clone(), Storage::Device, None));
-    g.eqns.push(Eqn {
+    g.eqns_mut().push(Eqn {
         op: gather_op,
         inputs: vec![Operand::Value(table_id), Operand::Value(index_id)],
         out: gather_id,
@@ -92,9 +92,9 @@ fn build_graph(
                 .infer(&[gather_type, Scalar::F32(scale).ty()])
                 .expect("F32 gather output times an F32 scalar literal broadcasts");
             let mul_id = g
-                .values
+                .values_mut()
                 .push(ValueMeta::new(mul_type, Storage::Device, None));
-            g.eqns.push(Eqn {
+            g.eqns_mut().push(Eqn {
                 op: mul_op,
                 inputs: vec![Operand::Value(gather_id), Operand::Lit(Scalar::F32(scale))],
                 out: mul_id,
@@ -103,7 +103,8 @@ fn build_graph(
             mul_id
         }
     };
-    g.output = output_id;
+    g.set_result(output_id);
+    let g = g.commit().expect("the fixture is a well-formed graph");
     (g, table_id, index_id)
 }
 

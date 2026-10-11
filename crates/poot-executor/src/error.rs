@@ -93,12 +93,34 @@ pub enum LoadError {
     /// `WeightId::const_name` (even when a store key equals it).
     #[error("const {value} ({name}) is bound to no weight")]
     Unbound { value: ValueId, name: String },
-    /// The device's backend loads linked artifacts, not the byte artifacts the engine's kernel cache
-    /// compiles (an AIE core): no engine path builds its kernel handle.
-    #[error(
-        "{backend:?} kernels are linked artifacts; the engine's byte-artifact path cannot load them"
-    )]
-    NoByteArtifact { backend: poot_target::Backend },
+    /// An AIE kernel's plan has no shape ABI to link against (POOT-664).
+    #[error("kernel {key}: {source}")]
+    AieAbi {
+        key: String,
+        source: poot_graph_plan::AieAbiRefusal,
+    },
+    /// A linked AIE artifact's instruction stream is empty or longer than `u32::MAX` words, which the
+    /// artifact validator and the artifact limit rule out: an invariant breach, named.
+    #[error("kernel {key}: the AIE instruction stream is {bytes} bytes")]
+    AieInstructionStream { key: String, bytes: usize },
+    /// An AIE kernel could not be linked: a toolchain stage, the body/ABI check or the artifact validator.
+    #[error("kernel {key}: {source}")]
+    AieCompile {
+        key: String,
+        source: poot_codegen::AieCompileError,
+    },
+    /// The linked AIE artifact does not fit the target's measured limits (an unmeasured limit refuses).
+    #[error("kernel {key}: {source}")]
+    AieLimit {
+        key: String,
+        source: poot_graph_plan::AieLimitRefusal,
+    },
+    /// The linked AIE artifact does not describe the body's buffer parameters.
+    #[error("kernel {key}: {source}")]
+    AieHandle {
+        key: String,
+        source: poot_codegen::AieAbiMismatch,
+    },
     #[error("const {value} has no name to bind by")]
     UnnamedConst { value: ValueId },
     #[error("slot {value} has no structured slot key")]

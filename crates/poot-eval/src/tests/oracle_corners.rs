@@ -4,7 +4,7 @@
 
 use crate::ops::elementwise::unary_f32;
 use poot_graph_ir::op::UnOp;
-use poot_runtime_common::f32_to_bf16;
+use poot_quant::scalar::f32_to_bf16;
 use poot_tensor::HostTensor;
 
 /// EV-1: `f32_to_bf16` rounds a tie to even. `0x3F81_8000` is exactly halfway between the bf16 values

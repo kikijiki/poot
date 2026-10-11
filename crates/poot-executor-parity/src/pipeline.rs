@@ -22,7 +22,7 @@ use poot_executor::{
 };
 use poot_graph_ir::{
     BinOp, Builder, Graph, RedOp, Scalar, Slot, SlotKey, StateRole, Storage, TensorType, UnOp,
-    ValidationId, ValidationOutputs,
+    ValidationId,
 };
 use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
@@ -36,7 +36,7 @@ use poot_target::BufferStorage;
 use poot_tensor::{DType, HostView};
 use poot_test_util::const_weights::ConstWeights;
 
-use crate::dense::{Dense, Family, plain, step};
+use crate::dense::{Dense, Family, step};
 
 /// Decode positions of the qwen2 row: the cache capacity, and the number of steps it runs.
 const CAP: usize = 16;
@@ -74,7 +74,7 @@ fn const_data(name: &str, shape: &[usize]) -> Vec<f32> {
 /// A store holding every const `g` names, as F32 stored tensors.
 fn store_for(g: &Graph) -> WeightStore {
     let mut entries: HashMap<String, Vec<usize>> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage == Storage::Const {
             entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
@@ -92,11 +92,7 @@ fn store_for(g: &Graph) -> WeightStore {
     builder.build()
 }
 
-fn compile<V: poot_graph_ir::ValidationChannel>(
-    g: &Graph<V>,
-    target: Target,
-    devices: DevicePlacement,
-) -> StagedProgram<V> {
+fn compile(g: &Graph, target: Target, devices: DevicePlacement) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -118,11 +114,11 @@ fn pipeline(after_layers: &[usize]) -> DevicePlacement {
 
 /// A graph whose sole output is one named state value: a production entry that reads a carried
 /// buffer through the same bind, commit and readback path as any other.
-fn state_probe(name: &str, aval: TensorType) -> Graph<ValidationOutputs> {
+fn state_probe(name: &str, aval: TensorType) -> Graph {
     let b = Builder::new();
     let state = b.state_input(name, aval, StateRole::Recurrent);
-    b.finish_with_state(state, &[(state, state)])
-        .with_validations(Vec::new())
+    b.finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+        .unwrap()
 }
 
 /// One slot's host data for a step.
@@ -174,7 +170,7 @@ struct Pair {
 fn load_pair(
     exec: &mut dyn Executor,
     target: Target,
-    g: &Graph<ValidationOutputs>,
+    g: &Graph,
     plain_graph: &Graph,
     after_layers: &[usize],
 ) -> Pair {
@@ -340,18 +336,16 @@ pub fn assert_qwen2_pipeline_matches_single_stage(
         .head_dim(4)
         .max_positions(16)
         .f32_model();
-    let graph = plain(
-        model
-            .model
-            .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
-            .unwrap(),
-    );
-    let validated = graph.clone().with_validations(Vec::new());
+    let graph = model
+        .model
+        .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
+        .unwrap();
+    let validated = graph.clone();
     let pair = load_pair(exec, target, &validated, &graph, &[0, 1]);
     assert_eq!(pair.stages, 3);
 
     let slots: Vec<(SlotKey, Slot, TensorType)> = graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             let meta = graph.meta(id);
@@ -425,7 +419,7 @@ pub fn assert_export_fixture_matches_single_stage(
     );
 }
 
-fn export_fixture() -> (Graph<ValidationOutputs>, Graph) {
+fn export_fixture() -> (Graph, Graph) {
     let b = Builder::new();
     let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
     let w = b.constant("w", TensorType::f32(vec![4]));
@@ -457,16 +451,27 @@ fn export_fixture() -> (Graph<ValidationOutputs>, Graph) {
         let _layer = b.layer_scope(2);
         out = b.binary(BinOp::Add, g, c);
     }
-    let graph = b.finish_with_state(out, &[(k0_in, k0_out), (k1_in, k1_out)]);
-    let validated = graph
-        .clone()
-        .with_validations(vec![poot_graph_ir::ValidationOutput {
-            id: ValidationId(1),
-            name: "d_not_positive".to_owned(),
-            value: witness.id(),
-        }]);
-    validated.validate().expect("the export fixture validates");
-    (validated, graph)
+    let state = [(k0_in, k0_out), (k1_in, k1_out)];
+    let validated = b
+        .finish(
+            poot_graph_ir::Outputs::new(out)
+                .with_state(&state)
+                .with_witness(ValidationId(1), "d_not_positive", witness),
+        )
+        .expect("the export fixture is well formed");
+    // The same graph without its witness: a second finish over the same tables.
+    let mut plain = poot_graph_ir::GraphEdit::new();
+    *plain.values_mut() = validated.values().clone();
+    *plain.inputs_mut() = validated.inputs().to_vec();
+    *plain.consts_mut() = validated.consts().to_vec();
+    *plain.slots_mut() = validated.slots().to_vec();
+    *plain.eqns_mut() = validated.eqns().to_vec();
+    plain.set_result(validated.result());
+    for (input, next) in validated.state() {
+        plain.push_state(input, next);
+    }
+    let plain = plain.commit().expect("the export fixture is well formed");
+    (validated, plain)
 }
 
 /// What a [`Counting`] device was asked for.
@@ -553,8 +558,7 @@ impl<D: Device> Device for Counting<D> {
                 buffer: d.output.buffer,
                 elems: d.output.elems,
             },
-            threads: d.threads,
-            workgroup: d.workgroup,
+            launch: d.launch,
             work: d.work,
         })
     }
@@ -607,16 +611,14 @@ fn decode_pair(exec: &mut dyn Executor, target: Target) -> (Pair, Vec<SlotValue>
         .head_dim(4)
         .max_positions(16)
         .f32_model();
-    let graph = plain(
-        model
-            .model
-            .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
-            .unwrap(),
-    );
-    let validated = graph.clone().with_validations(Vec::new());
+    let graph = model
+        .model
+        .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
+        .unwrap();
+    let validated = graph.clone();
     let pair = load_pair(exec, target, &validated, &graph, &[0, 1]);
     let values: Vec<SlotValue> = graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             let meta = graph.meta(id);

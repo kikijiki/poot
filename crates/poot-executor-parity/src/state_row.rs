@@ -77,7 +77,9 @@ fn fixture(dtype: DType) -> Fixture {
         _ => next,
     };
     let out = b.concat(0, &[shown, counted]);
-    let graph: Graph = b.finish_with_state(out, &[(pool, updated), (counter, counted)]);
+    let graph: Graph = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(pool, updated), (counter, counted)]))
+        .unwrap();
     Fixture {
         name: "state_pool_row_reset",
         graph,

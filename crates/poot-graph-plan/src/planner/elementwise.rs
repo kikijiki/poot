@@ -1,7 +1,7 @@
 //! Elementwise, reduction, fused-region and fused-RoPE equation planning.
 
 use super::*;
-use poot_target::{Backend, DeviceCaps};
+use poot_target::Backend;
 
 /// Plan one elementwise-family equation (Binary/Select/Unary/Rope/Reduce/Fused/FusedRow).
 #[allow(clippy::too_many_arguments)]
@@ -10,14 +10,13 @@ pub(super) fn plan(
     eqn: &Eqn,
     out_shape: &[usize],
     out_numel: usize,
-    backend: Backend,
+    lowering: Lowering<'_>,
     views: &HashMap<ValueId, Layout>,
     odt: DType,
-    caps: &DeviceCaps,
     limits: BodyLimits,
     packed_operands: &[bool],
 ) -> Result<Planned, PlanError> {
-    let site = Site::new(g, eqn, backend, limits);
+    let site = Site::new(g, eqn, lowering.id(), limits);
     let shape = |vid: ValueId| g.aval(vid).shape.clone();
     let layout_of = |vid: ValueId| -> Layout {
         views
@@ -41,8 +40,18 @@ pub(super) fn plan(
     // scatter/DUS/index_remap kernels use; a flat X dispatch cannot clear wgpu's `gridDim.x` cap however
     // large `workgroup_size` gets. `finalize` bakes `workgroup_size[0] = ELEMENTWISE_2D_WIDTH` whenever
     // the predicate holds; `generate` derives the matching `x_groups` and grid from the same decision.
-    let fold = elementwise_fold(g, backend, eqn, out_shape, out_numel, caps);
-    let generate = |request: KernelRequest| Planned::generated(site, request, backend, caps);
+    let fold = match lowering {
+        Lowering::Gpu { backend, caps } => {
+            elementwise_fold(g, backend, eqn, out_shape, out_numel, caps)
+        }
+        // A sequential loop has no grid to fold onto.
+        Lowering::Aie(_) => kg::Fold {
+            numel: out_numel,
+            two_d: false,
+            width: ELEMENTWISE_2D_WIDTH,
+        },
+    };
+    let generate = |request: KernelRequest| Planned::lowered(site, request, lowering);
     let planned = match &eqn.op {
         OpKind::Binary(bop) => {
             match eqn.inputs.as_slice() {
@@ -146,7 +155,16 @@ pub(super) fn plan(
             let branch = match odt {
                 DType::I32 => kg::LeafTy::I32,
                 DType::F32 => kg::LeafTy::F32,
-                DType::BF16 | DType::F16 if backend != Backend::SpirvVulkan => {
+                // SPIR-V has no native two-byte lane, and neither has an AIE core.
+                DType::BF16 | DType::F16
+                    if matches!(
+                        lowering,
+                        Lowering::Gpu {
+                            backend: Backend::Nvptx | Backend::AmdGcn(_),
+                            ..
+                        }
+                    ) =>
+                {
                     if odt == DType::BF16 {
                         kg::LeafTy::BF16
                     } else {

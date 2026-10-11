@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use poot_eval::{EvalBudget, EvalOptions, Value};
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_executor_parity::weight_map::MappedModel;
 use poot_graph_ir::{Graph, Slot, Storage, ValueId};
 use poot_models::model::{LogitRows, Phase};
@@ -35,12 +35,7 @@ fn model() -> MappedModel {
 }
 
 /// `m`'s step graph: one sequence of `tokens` new tokens over `cap` positions.
-fn trace(
-    m: &MappedModel,
-    phase: Phase,
-    tokens: usize,
-    cap: usize,
-) -> poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs> {
+fn trace(m: &MappedModel, phase: Phase, tokens: usize, cap: usize) -> poot_graph_ir::Graph {
     m.model
         .trace(phase, step(1, tokens, cap, LogitRows::Last))
         .unwrap()
@@ -67,7 +62,7 @@ fn weight(name: &str, shape: &[usize]) -> HostTensor {
 /// other slots.
 fn bind(g: &Graph) -> HashMap<ValueId, Value> {
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let m = g.meta(id);
         let numel = m.aval.shape.iter().product::<usize>().max(1);
         match m.storage {
@@ -99,7 +94,7 @@ fn bind(g: &Graph) -> HashMap<ValueId, Value> {
             Storage::State | Storage::Device | Storage::Computed(_) => {}
         }
     }
-    for &(si, _) in &g.state {
+    for (si, _) in g.state() {
         inputs.insert(si, Value::from(HostTensor::zeros(g.aval(si).shape.clone())));
     }
     inputs
@@ -135,18 +130,18 @@ fn prefill_benches(c: &mut Criterion) {
             )
         })
     });
-    let gb = plain(trace(&model_b, Phase::Prefill, 64, 64));
+    let gb = trace(&model_b, Phase::Prefill, 64, 64);
     c.bench_function("prefill_cse+fuse", |b| {
-        b.iter(|| transform::fuse(&transform::cse(black_box(&gb))))
+        b.iter(|| transform::fuse(&transform::cse(black_box(&gb)).unwrap()).unwrap())
     });
 
     // Eager prefill forward, un-fused vs fused, on the small config at two prompt lengths; each pair is the
     // prefill analogue of `eval_decode_step` / `_fused`.
     let model = model();
     for n in [16usize, 64usize] {
-        let g = plain(trace(&model, Phase::Prefill, n, n));
+        let g = trace(&model, Phase::Prefill, n, n);
         let inputs = bind(&g);
-        let gf = transform::fuse(&transform::cse(&g));
+        let gf = transform::fuse(&transform::cse(&g).unwrap()).unwrap();
         c.bench_function(&format!("eval_prefill_{n}"), |b| {
             b.iter(|| {
                 poot_eval::eval(
@@ -194,9 +189,9 @@ fn decode_benches(c: &mut Criterion) {
         b.iter(|| trace(black_box(&model), Phase::Decode, 1, black_box(cap)))
     });
 
-    let g = plain(trace(&model, Phase::Decode, 1, cap));
+    let g = trace(&model, Phase::Decode, 1, cap);
     c.bench_function("cse+fuse", |b| {
-        b.iter(|| transform::fuse(&transform::cse(black_box(&g))))
+        b.iter(|| transform::fuse(&transform::cse(black_box(&g)).unwrap()).unwrap())
     });
 
     // Un-fused vs fused eager decode step on the same graph and inputs: fusion collapses the
@@ -221,7 +216,7 @@ fn decode_benches(c: &mut Criterion) {
             .unwrap()
         })
     });
-    let gf = transform::fuse(&transform::cse(&g));
+    let gf = transform::fuse(&transform::cse(&g).unwrap()).unwrap();
     c.bench_function("eval_decode_step_fused", |b| {
         b.iter(|| {
             poot_eval::eval(
@@ -244,9 +239,9 @@ fn decode_benches(c: &mut Criterion) {
     // Same pair at the larger config.
     let model_b = model_big();
     let cap_b = 64;
-    let gb = plain(trace(&model_b, Phase::Decode, 1, cap_b));
+    let gb = trace(&model_b, Phase::Decode, 1, cap_b);
     let inputs_b = bind(&gb);
-    let gbf = transform::fuse(&transform::cse(&gb));
+    let gbf = transform::fuse(&transform::cse(&gb).unwrap()).unwrap();
     c.bench_function("eval_decode_step_big", |b| {
         b.iter(|| {
             poot_eval::eval(

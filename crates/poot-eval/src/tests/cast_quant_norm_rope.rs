@@ -30,7 +30,7 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
     let y = b.cast(x, DType::BF16);
     assert_eq!(b.aval(y).dtype, DType::BF16, "cast retypes to BF16");
     assert_eq!(b.aval(y).shape, vec![6], "cast keeps the shape");
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let vals = vec![1.0f32, 0.1, 3.13159, -2.73828, 12345.678, 1e-7];
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), Value::from(HostTensor::f32(vec![6], vals.clone())));
@@ -63,7 +63,7 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
     let x2 = b2.constant("x", TensorType::new(vec![3], DType::BF16));
     let y2 = b2.cast(x2, DType::F32);
     assert_eq!(b2.aval(y2).dtype, DType::F32);
-    let g2 = b2.finish(y2);
+    let g2 = b2.finish(y2).unwrap();
     let mut in2 = HashMap::new();
     in2.insert(
         x2.id(),
@@ -84,13 +84,13 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
 /// `cast_f32_to_bf16_rounds_and_infers_dtype`.
 #[test]
 fn cast_f32_to_f16_rounds_and_infers_dtype() {
-    let ref_f16 = |f: f32| poot_quant::scalar::f16_to_f32(poot_load::gguf::f32_to_f16(f));
+    let ref_f16 = |f: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(f));
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![6]));
     let y = b.cast(x, DType::F16);
     assert_eq!(b.aval(y).dtype, DType::F16, "cast retypes to F16");
     assert_eq!(b.aval(y).shape, vec![6], "cast keeps the shape");
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let vals = vec![1.0f32, 0.1, 3.13159, -2.73828, 1234.5, 1e-5];
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), Value::from(HostTensor::f32(vec![6], vals.clone())));
@@ -117,14 +117,14 @@ fn cast_f32_to_f16_rounds_and_infers_dtype() {
     let x2 = b2.constant("x", TensorType::new(vec![3], DType::F16));
     let y2 = b2.cast(x2, DType::F32);
     assert_eq!(b2.aval(y2).dtype, DType::F32);
-    let g2 = b2.finish(y2);
+    let g2 = b2.finish(y2).unwrap();
     let mut in2 = HashMap::new();
     in2.insert(
         x2.id(),
         Value::from(HostTensor::f16(
             vec![3],
             [0.5f32, 0.25, -0.75]
-                .map(poot_load::gguf::f32_to_f16)
+                .map(poot_quant::scalar::f32_to_f16)
                 .to_vec(),
         )),
     );
@@ -145,14 +145,14 @@ fn matmul_f16_output_narrows_the_accumulator() {
     let w = b.constant("w", TensorType::new(vec![3, 2], DType::F16));
     let mm = b.matmul(a, w);
     assert_eq!(b.aval(mm).dtype, DType::F16, "matmul keeps the F16 dtype");
-    let g = b.finish(mm);
+    let g = b.finish(mm).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         a.id(),
         Value::from(HostTensor::f16(
             vec![1, 2, 3],
             [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
-                .map(poot_load::gguf::f32_to_f16)
+                .map(poot_quant::scalar::f32_to_f16)
                 .to_vec(),
         )),
     );
@@ -161,7 +161,7 @@ fn matmul_f16_output_narrows_the_accumulator() {
         Value::from(HostTensor::f16(
             vec![3, 2],
             [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6]
-                .map(poot_load::gguf::f32_to_f16)
+                .map(poot_quant::scalar::f32_to_f16)
                 .to_vec(),
         )),
     );
@@ -181,7 +181,7 @@ fn matmul_f16_output_narrows_the_accumulator() {
         .zip(want_f32.iter())
         .enumerate()
     {
-        let want_f16 = poot_quant::scalar::f16_to_f32(poot_load::gguf::f32_to_f16(w));
+        let want_f16 = poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(w));
         assert_eq!(
             got.to_bits(),
             want_f16.to_bits(),
@@ -213,7 +213,7 @@ fn pack_unpack_i8_graph_round_trips() {
         .collect();
 
     // check the packed tensor itself is an int tensor (eval the pack node alone).
-    let gp = b.finish(packed);
+    let gp = b.finish(packed).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         xi,
@@ -232,7 +232,7 @@ fn pack_unpack_i8_graph_round_trips() {
     let x2 = b2.constant("x", TensorType::f32(vec![rows, cols]));
     let rt = b2.unpack_i8(b2.pack_i8(x2), cols);
     let x2i = x2.id();
-    let g = b2.finish(rt);
+    let g = b2.finish(rt).unwrap();
     let mut in2 = HashMap::new();
     in2.insert(
         x2i,
@@ -266,7 +266,7 @@ fn packed_i8_survives_copy_ops_in_eval() {
     let idx = b.constant("idx", TensorType::new(vec![rows], DType::I32));
     let rt = b.unpack_i8(b.gather(packed, 0, idx), cols);
     let (xi, ii) = (x.id(), idx.id());
-    let g = b.finish(rt);
+    let g = b.finish(rt).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         xi,
@@ -301,7 +301,7 @@ fn packed_i8_survives_copy_ops_in_eval() {
     let back = b2.transpose(t, vec![1, 0]); // [rows, w]
     let rt2 = b2.unpack_i8(back, cols);
     let x2i = x2.id();
-    let g2 = b2.finish(rt2);
+    let g2 = b2.finish(rt2).unwrap();
     let mut in2 = HashMap::new();
     in2.insert(
         x2i,
@@ -331,7 +331,7 @@ fn layernorm_matches_direct() {
     let eps = 1e-6f32;
     let out = layernorm(&b, x, w, bias, eps);
     let (xi, wi, bi) = (x.id(), w.id(), bias.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd = fill(n, 3);
     let wd = fill(n, 4);
@@ -367,7 +367,7 @@ fn rmsnorm_matches_direct() {
     let eps = 1e-6f32;
     let out = rmsnorm(&b, x, w, eps);
     let (xi, wi) = (x.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd = fill(n, 1);
     let wd = fill(n, 2);
@@ -406,7 +406,7 @@ fn rmsnorm_and_layernorm_stay_accurate_at_real_hidden_dim_with_outlier_channels(
     let w = b.constant("w", TensorType::f32(vec![n]));
     let out = rmsnorm(&b, x, w, eps);
     let (xi, wi) = (x.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(xi, Value::from(HostTensor::f32(vec![1, 1, n], xd.clone())));
     inputs.insert(wi, Value::from(HostTensor::f32(vec![n], wd.clone())));
@@ -437,7 +437,7 @@ fn rmsnorm_and_layernorm_stay_accurate_at_real_hidden_dim_with_outlier_channels(
     let bias = bl.constant("b", TensorType::f32(vec![n]));
     let outl = layernorm(&bl, xl, wl, bias, eps);
     let (xli, wli, bli) = (xl.id(), wl.id(), bias.id());
-    let gl = bl.finish(outl);
+    let gl = bl.finish(outl).unwrap();
     let mut inl = HashMap::new();
     inl.insert(xli, Value::from(HostTensor::f32(vec![1, 1, n], xd.clone())));
     inl.insert(wli, Value::from(HostTensor::f32(vec![n], wd.clone())));
@@ -480,7 +480,7 @@ fn swiglu_matches_direct() {
     let up = b.constant("up", TensorType::f32(vec![1, 1, n]));
     let out = swiglu(&b, gate, up);
     let (gi, ui) = (gate.id(), up.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let gd = fill(n, 3);
     let ud = fill(n, 4);
@@ -513,7 +513,7 @@ fn rope_matches_direct() {
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
     let out = rope(&b, x, cos, sin, pos);
     let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd = fill(d, 5);
     let cosd = fill(max_pos * d, 6);
@@ -567,7 +567,7 @@ fn rope_partial_matches_direct() {
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
     let out = rope(&b, x, cos, sin, pos);
     let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd = fill(d, 5);
     let cosd = fill(max_pos * rot, 6);
@@ -625,7 +625,7 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
     let b = Builder::new();
     let x = i32_constant(&b, "x", vec![2]).unwrap();
     let y = b.cast(x, poot_tensor::DType::F32);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
         Value::from(poot_tensor::HostTensor::i32(vec![2], vec![0, 16_777_217])),
@@ -650,7 +650,7 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![2]));
     let y = b.cast(x, poot_tensor::DType::I32);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
         Value::from(HostTensor::f32(vec![2], vec![0.0, 1.5])),
@@ -668,7 +668,7 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![1]));
     let y = b.cast(x, poot_tensor::DType::I32);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
         Value::from(HostTensor::f32(vec![1], vec![f32::NAN])),
@@ -687,7 +687,7 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
     let b = Builder::new();
     let x = i32_constant(&b, "x", vec![2]).unwrap();
     let y = b.cast(x, poot_tensor::DType::I8);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
         Value::from(poot_tensor::HostTensor::i32(vec![2], vec![0, 300])),
@@ -718,7 +718,7 @@ fn cast_table_literal_bits_sc002() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::new(vec![1], from));
         let y = b.cast(x, to);
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         let inputs = HashMap::from([(
             x.id(),
             Value::from(HostTensor::f32(vec![1], vec![f32::from_bits(bits)])),
@@ -765,7 +765,7 @@ fn cast_table_literal_bits_sc002() {
         let b = Builder::new();
         let x = b.constant("x", TensorType::new(vec![1], DType::E4M3FN));
         let y = b.cast(x, DType::F32);
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         let inputs = HashMap::from([(
             x.id(),
             Value::Host(crate::fp8::e4m3fn_tensor(vec![1], vec![byte]).unwrap()),
@@ -784,7 +784,7 @@ fn cast_table_literal_bits_sc002() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![1]));
     let y = b.cast(x, DType::E4M3FN);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
         Value::from(HostTensor::f32(vec![1], vec![448.0f32])),
@@ -801,7 +801,7 @@ fn cast_table_literal_bits_sc002() {
     let b = Builder::new();
     let x = i32_constant(&b, "x", vec![1]).unwrap();
     let y = b.cast(x, DType::I8);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(x.id(), Value::from(HostTensor::i32(vec![1], vec![127])))]);
     let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()

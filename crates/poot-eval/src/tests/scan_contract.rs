@@ -56,7 +56,7 @@ fn y_and_s_out_are_distinct_typed_projections_of_one_packed_result() {
         let scan = fixture.graph();
         let scans: Vec<_> = scan
             .graph
-            .eqns
+            .eqns()
             .iter()
             .filter(|eqn| matches!(eqn.op, OpKind::Scan(_)))
             .collect();
@@ -74,12 +74,12 @@ fn y_and_s_out_are_distinct_typed_projections_of_one_packed_result() {
             .collect();
         let layout = attrs.layout(&types).unwrap();
         assert_eq!(scan.graph.aval(scans[0].out).shape, layout.packed_shape());
-        let (_, carried) = scan.graph.state[0];
-        assert_ne!(carried, scan.graph.output, "y and s_out are two values");
+        let (_, carried) = scan.graph.state().next().unwrap();
+        assert_ne!(carried, scan.graph.result(), "y and s_out are two values");
         let rows = |value| {
             let eqn = scan
                 .graph
-                .eqns
+                .eqns()
                 .iter()
                 .find(|e| e.out == value)
                 .expect("produced");
@@ -94,7 +94,7 @@ fn y_and_s_out_are_distinct_typed_projections_of_one_packed_result() {
             }
         };
         assert_eq!(
-            rows(scan.graph.output),
+            rows(scan.graph.result()),
             (2, layout.y_rows()),
             "{:?}: y rows",
             fixture.family
@@ -154,7 +154,9 @@ fn the_delta_rule_scan_is_bitwise_the_pre_card_chain() {
         lower_triangle(&b, 4, 1.0),
         4,
     );
-    let chain = b.finish_with_state(o, &[(s, s_chain)]);
+    let chain = b
+        .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s, s_chain)]))
+        .unwrap();
     let shapes = fixture.operand_shapes();
     let values: HashMap<_, _> = ids
         .iter()
@@ -211,7 +213,9 @@ fn the_ssd_scan_matches_the_decode_loop_and_the_seeded_prefill() {
             &b, traced[0], traced[1], traced[2], traced[3], traced[4], traced[5], h, tril,
         );
         let ids: Vec<_> = traced.iter().map(|t| t.id()).chain([h.id()]).collect();
-        let prefill = b.finish_with_state(py, &[(h, ph)]);
+        let prefill = b
+            .finish(poot_graph_ir::Outputs::new(py).with_state(&[(h, ph)]))
+            .unwrap();
         let values: HashMap<_, _> = ids
             .iter()
             .zip(&shapes)
@@ -264,7 +268,9 @@ fn the_ssd_scan_matches_the_decode_loop_and_the_seeded_prefill() {
         );
         let (dy, dh_out) = mamba2_ssd_decode(&d, dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dh);
         let ids: Vec<_> = dt.iter().map(|t| t.id()).chain([dh.id()]).collect();
-        let decode = d.finish_with_state(dy, &[(dh, dh_out)]);
+        let decode = d
+            .finish(poot_graph_ir::Outputs::new(dy).with_state(&[(dh, dh_out)]))
+            .unwrap();
         let mut state = inputs.operands[6].clone();
         let mut loop_y = vec![0.0f32; 2 * len * 3];
         for t in 0..len {

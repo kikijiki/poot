@@ -16,9 +16,7 @@ use poot_executor::{
     BufferRole, Collectives, Coordinator, CoordinatorError, Device, DeviceTime, Dispatch, Engine,
     ExecError, ExecutableId, Executor, NativeCounters, NoSync, StepInputs, SupportBound,
 };
-use poot_graph_ir::{
-    BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType, ValidationOutputs,
-};
+use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
     StagedProgram, Submission, Target, TargetSet, compile_staged,
@@ -198,7 +196,7 @@ struct FakeDevice {
 }
 
 fn target() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::Nvptx,
         caps: DeviceCaps {
             memory_budget_bytes: Some(1 << 30),
@@ -496,7 +494,7 @@ fn device(world: &Rc<World>, index: usize) -> FakeDevice {
 
 /// `LAYERS` blocks in the shape a pipeline partition cuts: one activation slot, one shared
 /// constant and one carried state pair per block, each block tagged with its layer.
-fn layered() -> (Graph<ValidationOutputs>, Arc<WeightStore>, Arc<WeightMap>) {
+fn layered() -> (Graph, Arc<WeightStore>, Arc<WeightMap>) {
     let b = Builder::new();
     let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
     let w = b.constant("w", TensorType::f32(vec![4]));
@@ -515,8 +513,8 @@ fn layered() -> (Graph<ValidationOutputs>, Arc<WeightStore>, Arc<WeightMap>) {
         state.push((k_in, k_out));
     }
     let g = b
-        .finish_with_state(hidden, &state)
-        .with_validations(Vec::new());
+        .finish(poot_graph_ir::Outputs::new(hidden).with_state(&state))
+        .unwrap();
     let mut builder = WeightStore::builder();
     let bytes: Vec<u8> = [0.5f32, 2.0, -1.25, 1.0]
         .iter()
@@ -547,7 +545,7 @@ fn targets(devices: usize) -> TargetSet {
 }
 
 /// The layered graph cut after layers 0 and 1, stage `i` on `devices[i]`.
-fn pipeline(g: &Graph<ValidationOutputs>, devices: &[u32]) -> StagedProgram<ValidationOutputs> {
+fn pipeline(g: &Graph, devices: &[u32]) -> StagedProgram {
     compile_staged(
         g,
         &targets(2),
@@ -564,14 +562,14 @@ fn pipeline(g: &Graph<ValidationOutputs>, devices: &[u32]) -> StagedProgram<Vali
 }
 
 /// A graph whose sole output is one named carried value: reads state through a production entry.
-fn state_probe(name: &str) -> Graph<ValidationOutputs> {
+fn state_probe(name: &str) -> Graph {
     let b = Builder::new();
     let state = b.state_input(name, TensorType::f32(vec![4]), StateRole::Recurrent);
-    b.finish_with_state(state, &[(state, state)])
-        .with_validations(Vec::new())
+    b.finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+        .unwrap()
 }
 
-fn probe_program(name: &str, device: u32) -> StagedProgram<ValidationOutputs> {
+fn probe_program(name: &str, device: u32) -> StagedProgram {
     compile_staged(
         &state_probe(name),
         &targets(2),
@@ -1150,7 +1148,7 @@ const INTER: usize = 16;
 
 /// `y = (x @ gate^T) @ down^T` with the weights mapped under the roles the Megatron rule cuts: the gate
 /// is column-parallel and the down projection row-parallel, so one all-reduce joins the two ranks.
-fn tensor_mlp() -> (Graph<ValidationOutputs>, Arc<WeightStore>, Arc<WeightMap>) {
+fn tensor_mlp() -> (Graph, Arc<WeightStore>, Arc<WeightMap>) {
     let gate = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
     let down = WeightId::layer(0, WeightRole::Ffn(FfnRole::Down));
     let b = Builder::new();
@@ -1159,7 +1157,7 @@ fn tensor_mlp() -> (Graph<ValidationOutputs>, Arc<WeightStore>, Arc<WeightMap>) 
     let wd = b.constant(&down.const_name(), TensorType::f32(vec![HIDDEN, INTER]));
     let hidden = b.matmul(x, b.transpose(wg, vec![1, 0]));
     let y = b.matmul(hidden, b.transpose(wd, vec![1, 0]));
-    let g = b.finish(y).with_validations(Vec::new());
+    let g = b.finish(y).unwrap();
 
     let entry = |rows: usize, cols: usize, seed: f32| {
         let bytes: Vec<u8> = (0..rows * cols)
@@ -1180,10 +1178,7 @@ fn tensor_mlp() -> (Graph<ValidationOutputs>, Arc<WeightStore>, Arc<WeightMap>) 
     (g, store, map)
 }
 
-fn tensor_program(
-    g: &Graph<ValidationOutputs>,
-    map: &Arc<WeightMap>,
-) -> StagedProgram<ValidationOutputs> {
+fn tensor_program(g: &Graph, map: &Arc<WeightMap>) -> StagedProgram {
     compile_staged(
         g,
         &targets(2),

@@ -4,7 +4,7 @@ use poot_tensor::DType;
 use std::collections::{HashMap, HashSet};
 
 use poot_graph_ir::Storage;
-use poot_target::Backend;
+use poot_target::TargetId;
 
 use crate::dtype_widen::bf16_const_is_packed;
 use crate::*;
@@ -31,18 +31,19 @@ use crate::*;
 ///
 /// Also refuses a dense-contraction weight stored in a layout of its own (packed F16, Card 1007) that another
 /// reader shares ([`StorageGap::F16PackedLanes`]).
-pub(crate) fn value_storage_of_plans<'p, V: ValidationChannel>(
-    g: &Graph<V>,
-    backend: Backend,
+pub(crate) fn value_storage_of_plans<'p>(
+    g: &Graph,
+    target: impl Into<TargetId>,
     plans: impl Iterator<Item = Option<&'p Plan>>,
 ) -> Result<GraphStorage, PlanError> {
+    let target = target.into();
     let plans: Vec<Option<&Plan>> = plans.collect();
     check_i32_reads(g, &plans)?;
     let mut weights = dense_contraction_weight_storages(g)?;
     weights.extend(e4m3_row_gather_table_storages(g)?);
-    let views = compute_views(g, backend);
-    let storage = storage_of_kinds(g, backend, &views, &weights);
-    check_bf16_const_reads(g, backend, &storage, &plans)?;
+    let views = compute_views(g, target);
+    let storage = storage_of_kinds(g, target, &views, &weights);
+    check_bf16_const_reads(g, target, &storage, &plans)?;
     Ok(storage)
 }
 
@@ -56,14 +57,14 @@ pub(crate) fn value_storage_of_plans<'p, V: ValidationChannel>(
 /// `binding.reads()[p]` names (data params come first with or without a metadata buffer, which rides after
 /// them). A read bound to scratch has no graph value and is skipped.
 /// `bf16_const_reads_refuse_a_reader_without_the_lane` pins the refusal on a real reader.
-fn check_bf16_const_reads<V: ValidationChannel>(
-    g: &Graph<V>,
-    backend: Backend,
+fn check_bf16_const_reads(
+    g: &Graph,
+    target: TargetId,
     storage: &GraphStorage,
     plans: &[Option<&Plan>],
 ) -> Result<(), PlanError> {
     let mut roots: HashMap<ValueId, ValueId> = HashMap::new();
-    for (eqn, plan) in g.eqns.iter().zip(plans) {
+    for (eqn, plan) in g.eqns().iter().zip(plans) {
         if let Some(Plan::Alias(src) | Plan::View { src, .. }) = plan {
             let root = roots.get(src).copied().unwrap_or(*src);
             roots.insert(eqn.out, root);
@@ -86,7 +87,7 @@ fn check_bf16_const_reads<V: ValidationChannel>(
                 return Err(refusal_at(
                     GraphTables::from(g),
                     eqn,
-                    backend,
+                    target,
                     Capability::DtypeLowering,
                 ));
             }
@@ -95,19 +96,19 @@ fn check_bf16_const_reads<V: ValidationChannel>(
     Ok(())
 }
 
-fn storage_of_kinds<V: ValidationChannel>(
-    g: &Graph<V>,
-    backend: Backend,
+fn storage_of_kinds(
+    g: &Graph,
+    target: TargetId,
     views: &HashMap<ValueId, Layout>,
     weights: &HashMap<ValueId, StorageKind>,
 ) -> GraphStorage {
     let values = g
-        .values
+        .values()
         .ids()
         .map(|id| {
             ValueStorage::new(match weights.get(&id) {
                 Some(&kind) => kind,
-                None => value_storage_kind(g, views, id, backend),
+                None => value_storage_kind(g, views, id, target),
             })
         })
         .collect();
@@ -133,8 +134,8 @@ pub(crate) fn dense_contraction_weight_storage(dtype: DType) -> Option<StorageKi
 /// else is [`PlanError::UnrepresentableValue`] with [`StorageGap::F16PackedLanes`], naming the value. The fold
 /// (`fold_dense_contractions`) only produces F16 contractions that satisfy this, so a refusal here is a graph
 /// some other path built.
-fn dense_contraction_weight_storages<V: ValidationChannel>(
-    g: &Graph<V>,
+fn dense_contraction_weight_storages(
+    g: &Graph,
 ) -> Result<HashMap<ValueId, StorageKind>, PlanError> {
     let reads = |eqn: &Eqn| match (eqn.op.dense_weight(), eqn.inputs.get(1)) {
         (Some(weight), Some(Operand::Value(value))) => dense_contraction_weight_storage(weight)
@@ -142,9 +143,9 @@ fn dense_contraction_weight_storages<V: ValidationChannel>(
             .map(|kind| (*value, kind)),
         _ => None,
     };
-    let weights: HashMap<ValueId, StorageKind> = g.eqns.iter().filter_map(reads).collect();
+    let weights: HashMap<ValueId, StorageKind> = g.eqns().iter().filter_map(reads).collect();
     for (&value, &kind) in &weights {
-        let sole_reader = g.eqns.iter().all(|eqn| {
+        let sole_reader = g.eqns().iter().all(|eqn| {
             eqn.inputs.iter().enumerate().all(|(position, operand)| {
                 !matches!(operand, Operand::Value(read) if *read == value)
                     || (position == 1 && reads(eqn) == Some((value, kind)))
@@ -169,9 +170,7 @@ fn dense_contraction_weight_storages<V: ValidationChannel>(
 /// const whose every reader is a `DenseRowGather` at its table operand: anything else is
 /// [`PlanError::UnrepresentableValue`] with [`StorageGap::E4m3PackedLanes`], naming the table. An E4M3FN value
 /// no row gather reads keeps its dense record, which no executor binds (the engine refuses it by name).
-fn e4m3_row_gather_table_storages<V: ValidationChannel>(
-    g: &Graph<V>,
-) -> Result<HashMap<ValueId, StorageKind>, PlanError> {
+fn e4m3_row_gather_table_storages(g: &Graph) -> Result<HashMap<ValueId, StorageKind>, PlanError> {
     let gathers = |eqn: &Eqn| match (&eqn.op, eqn.inputs.first()) {
         (
             OpKind::DenseRowGather {
@@ -181,9 +180,9 @@ fn e4m3_row_gather_table_storages<V: ValidationChannel>(
         ) => Some(*table),
         _ => None,
     };
-    let tables: HashSet<ValueId> = g.eqns.iter().filter_map(gathers).collect();
+    let tables: HashSet<ValueId> = g.eqns().iter().filter_map(gathers).collect();
     for &table in &tables {
-        let sole_reader = g.eqns.iter().all(|eqn| {
+        let sole_reader = g.eqns().iter().all(|eqn| {
             eqn.inputs.iter().enumerate().all(|(position, operand)| {
                 !matches!(operand, Operand::Value(read) if *read == table)
                     || (position == 0 && gathers(eqn) == Some(table))
@@ -215,14 +214,11 @@ fn e4m3_row_gather_table_storages<V: ValidationChannel>(
 /// buffer, so a read of it is a read of the source's bytes. Each read is keyed by its root buffer (the value
 /// an alias/view chain bottoms out at). Data-input params come first, with or without a metadata buffer (it
 /// rides after them): each dispatch of a plan is scanned through its own binding.
-fn check_i32_reads<V: ValidationChannel>(
-    g: &Graph<V>,
-    plans: &[Option<&Plan>],
-) -> Result<(), PlanError> {
+fn check_i32_reads(g: &Graph, plans: &[Option<&Plan>]) -> Result<(), PlanError> {
     // Each alias/view output's root buffer. Equations are topological, so a source's root is known
     // before any alias of it, and before any reader of that alias.
     let mut roots: HashMap<ValueId, ValueId> = HashMap::new();
-    for (eqn, plan) in g.eqns.iter().zip(plans) {
+    for (eqn, plan) in g.eqns().iter().zip(plans) {
         if let Some(Plan::Alias(src) | Plan::View { src, .. }) = plan {
             let root = roots.get(src).copied().unwrap_or(*src);
             roots.insert(eqn.out, root);
@@ -288,17 +284,17 @@ fn slice_elem(ty: &poot_kernel_ir::Ty) -> Option<&poot_kernel_ir::Ty> {
 /// One value's storage kind. A value keeps its declared dtype, densely stored, except a BF16 const: it is never
 /// widened (Card 1011), it is BF16 on every backend, and [`bf16_const_is_packed`] decides whether the buffer
 /// is packed two-per-`u32` word or native two-byte bf16, the one answer the cast planner reads too.
-fn value_storage_kind<V: ValidationChannel>(
-    g: &Graph<V>,
+fn value_storage_kind(
+    g: &Graph,
     views: &HashMap<ValueId, Layout>,
     id: ValueId,
-    backend: Backend,
+    target: TargetId,
 ) -> StorageKind {
     let declared = g.aval(id).dtype;
     if !g.meta(id).storage.holds_weight_bytes() || declared != DType::BF16 {
         return StorageKind::Dense(declared);
     }
-    if bf16_const_is_packed(g, views, id, backend) {
+    if bf16_const_is_packed(g, views, id, target) {
         StorageKind::Bf16Packed
     } else {
         StorageKind::Dense(DType::BF16)
@@ -331,7 +327,7 @@ mod value_storage_tests {
         caps: &DeviceCaps,
     ) -> Result<GraphStorage, crate::PlanError> {
         let plans: Vec<Option<Plan>> = g
-            .eqns
+            .eqns()
             .iter()
             .map(|eqn| {
                 plan_eqn(
@@ -354,15 +350,17 @@ mod value_storage_tests {
         let a = b.constant("a", TensorType::new(vec![m, 32], a_dtype));
         let w = b.constant("w", TensorType::new(vec![32, 32], w_dtype));
         let mm = b.matmul(a, w);
-        let mut g = b.finish(mm);
+        let g = b.finish(mm).unwrap();
         let out = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .expect("matmul eqn")
             .out;
-        g.values[out].aval.dtype = DType::F32;
-        g
+        poot_test_util::graph_fixtures::derive(&g, |draft| {
+            draft.values_mut()[out].aval.dtype = DType::F32;
+        })
+        .unwrap()
     }
 
     /// Card 526, Card 1011: [`fixture_value_storage`]'s per-value dtype is the const's declared dtype for every
@@ -402,10 +400,10 @@ mod value_storage_tests {
         for backend in backends {
             for (label, g) in &graphs {
                 let caps = poot_test_util::device_caps::default_caps_for(backend);
-                let prepared = prepare_target_graph(g, backend);
+                let prepared = prepare_target_graph(g, backend).unwrap();
                 let storage = fixture_value_storage(&prepared, backend, &caps);
                 for id in prepared
-                    .values
+                    .values()
                     .ids()
                     .filter(|&id| prepared.meta(id).storage == Storage::Const)
                 {
@@ -462,7 +460,7 @@ mod value_storage_tests {
         let gather_index_id = idx.id();
         let slot_id = slot_map.id();
         let token_id = token.id();
-        (b.finish(out), gather_index_id, slot_id, token_id)
+        (b.finish(out).unwrap(), gather_index_id, slot_id, token_id)
     }
 
     /// POOT-725: every declared-I32 value is stored as dense I32 words, whatever reads it: a computed `Gather`
@@ -518,14 +516,14 @@ mod value_storage_tests {
                 _ => Scalar::F32(1.0),
             };
             let y = b.binary_scalar(BinOp::Add, x, scalar);
-            (b.finish(y), x.id(), y.id())
+            (b.finish(y).unwrap(), x.id(), y.id())
         };
         let (f32_graph, ..) = build(DType::F32);
         let (i32_graph, x, y) = build(DType::I32);
         let backend = Backend::SpirvVulkan;
         let caps = poot_test_util::device_caps::default_caps_for(backend);
         let limits = poot_test_util::graph_fixtures::roomy_body_limits();
-        let plan_of = |g: &Graph| plan_eqn(g, &g.eqns[0], backend, &caps, &limits).unwrap();
+        let plan_of = |g: &Graph| plan_eqn(g, &g.eqns()[0], backend, &caps, &limits).unwrap();
 
         let honest = plan_of(&i32_graph);
         super::value_storage_of_plans(&i32_graph, backend, [Some(&honest)].into_iter())
@@ -554,12 +552,12 @@ mod value_storage_tests {
         let table = b.constant("table", TensorType::new(vec![8, 3], DType::F32));
         let index = b.constant("index", TensorType::new(vec![2], DType::I32));
         let gathered = b.gather(table, 0, index);
-        let (g, index, gathered) = (b.finish(gathered), index.id(), gathered.id());
+        let (g, index, gathered) = (b.finish(gathered).unwrap(), index.id(), gathered.id());
         let backend = Backend::SpirvVulkan;
         let caps = poot_test_util::device_caps::default_caps_for(backend);
         let limits = poot_test_util::graph_fixtures::roomy_body_limits();
         let gather = g
-            .eqns
+            .eqns()
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Gather { .. }))
             .expect("the gather");
@@ -588,7 +586,7 @@ mod value_storage_tests {
                 Dispatch::new(body, key, label, launch, binding, choice)
             })
             .collect();
-        let swapped = Plan::Dispatches(crate::DispatchPlan::new(swapped, 0).unwrap());
+        let swapped = Plan::Dispatches(crate::DispatchPlan::new(swapped, Vec::new()).unwrap());
         match super::value_storage_of_plans(&g, backend, [Some(&swapped)].into_iter()) {
             Err(crate::PlanError::I32ReadAsF32 { value, reader }) => {
                 assert_eq!((value, reader), (index, gathered));
@@ -620,9 +618,9 @@ mod value_storage_tests {
         let token = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
         let rows = b.gather(table, 0, token);
         let neg = b.unary(poot_graph_ir::UnOp::Neg, rows);
-        let g = b.finish(neg).with_validations(Vec::new());
+        let g = b.finish(neg).unwrap();
         let gather = g
-            .eqns
+            .eqns()
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Gather { .. }))
             .expect("the gather")
@@ -630,7 +628,7 @@ mod value_storage_tests {
         // Only wgpu always packs: AMD and PTX keep a native BF16 lane for a const with a non-packed reader,
         // where a BF16-element body is the matching lane.
         let backend = Backend::SpirvVulkan;
-        let target = Target {
+        let target = Target::Gpu {
             backend,
             caps: poot_test_util::device_caps::default_caps_for(backend),
         };
@@ -680,9 +678,9 @@ mod value_storage_tests {
         let rows = b.cast(b.gather(embed, 0, token), DType::F32);
         let w = b.constant("w", TensorType::new(vec![8, 32], DType::BF16));
         let out = b.matmul(rows, b.transpose(w, vec![1, 0]));
-        let g = b.finish(out).with_validations(Vec::new());
+        let g = b.finish(out).unwrap();
         for backend in [Backend::AmdGcn(AmdArch::gfx1151()), Backend::Nvptx] {
-            let target = Target {
+            let target = Target::Gpu {
                 backend,
                 caps: poot_test_util::device_caps::default_caps_for(backend),
             };
@@ -706,7 +704,7 @@ mod value_storage_tests {
             assert_eq!(readers, ["dense_row_gather", "dense_contraction"]);
             for name in ["embed", "w"] {
                 let id = pg
-                    .consts
+                    .consts()
                     .iter()
                     .copied()
                     .find(|&id| pg.meta(id).name.as_deref() == Some(name))
@@ -743,7 +741,7 @@ mod value_storage_tests {
             gathered
         };
         (
-            crate::fold_dense_bf16_row_gathers(&b.finish(out)),
+            crate::fold_dense_bf16_row_gathers(&b.finish(out).unwrap()).unwrap(),
             table.id(),
         )
     }

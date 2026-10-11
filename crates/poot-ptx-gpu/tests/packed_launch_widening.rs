@@ -25,6 +25,7 @@ use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComp
 use poot_runtime_common::DeviceBackend;
 use poot_target::Backend;
 use poot_tensor::{DType, HostTensor};
+use poot_test_util::graph_fixtures::gpu_caps;
 
 mod common;
 
@@ -34,9 +35,9 @@ mod common;
 fn compiled(gpu: &PtxDevice, graph: &Graph) -> Graph {
     compile(
         graph,
-        &Target {
+        &Target::Gpu {
             backend: Backend::Nvptx,
-            caps: Device::target(gpu).caps,
+            caps: gpu_caps(&Device::target(gpu)),
         },
         &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
     )
@@ -52,7 +53,7 @@ fn carriers(
     owner_of: impl Fn(&str) -> Arc<PackedPayload>,
 ) -> HashMap<ValueId, Value> {
     graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
@@ -103,10 +104,10 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
         TensorType::new(vec![ROWS], DType::I32),
     );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
-    let graph = compiled(gpu, &b.finish(y));
+    let graph = compiled(gpu, &b.finish(y).unwrap());
     assert!(
         matches!(
-            graph.eqns.as_slice(),
+            graph.eqns(),
             [poot_graph_ir::Eqn {
                 op: poot_graph_ir::OpKind::PackedContraction {
                     rows: poot_graph_ir::ContractionRows::Indexed { .. },
@@ -116,10 +117,10 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
             }]
         ),
         "[{out}, {k}]: one indexed packed contraction, got {:?}",
-        graph.eqns
+        graph.eqns()
     );
     let mut inputs: HashMap<ValueId, Value> = graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
@@ -195,10 +196,10 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
         let rows =
             poot_graph_ir::ops::packed_embedding(&b, token, "model.embed_tokens", owner.weight())
                 .unwrap();
-        let graph = compiled(&gpu, &b.finish(rows));
+        let graph = compiled(&gpu, &b.finish(rows).unwrap());
         assert!(
             graph
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedRowGather { .. })),
             "{n} ids: compile claims the embedding"

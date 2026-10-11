@@ -31,6 +31,9 @@ pub enum Unsupported {
     /// The traced graph cannot take the checkpoint's packed storage.
     #[error(transparent)]
     PackedBind(poot_graph_plan::PackedBindError),
+    /// Extending the traced graph (the sampling suffix) produced a malformed graph.
+    #[error(transparent)]
+    Graph(Box<poot_graph_ir::EditError>),
     /// No registered family names the checkpoint's config.
     #[error(transparent)]
     Registry(RegistryError),
@@ -83,6 +86,21 @@ pub enum SpeculationRefusal {
     /// The draft model cannot propose tokens the target verifies.
     #[error("the draft model does not fit the target: {0}")]
     DraftMismatch(DraftMismatch),
+    /// The family's MTP program carries recurrent state. Only the target's decode program defines
+    /// the rollback's snapshot schema, so MTP-only recurrent state would never be restored after a
+    /// rejected draft.
+    #[error(
+        "the MTP program carries recurrent state, which a rejected draft cannot be rolled back out of"
+    )]
+    RecurrentMtp,
+    /// The MTP layer has the base weights only: an adapter changes the target's effective weights
+    /// and the layer would draft for a different model.
+    #[error("MTP speculation serves the base weights only, not adapter set generation {0:?}")]
+    MtpAdapters(GenerationId),
+    /// Beam search runs the target's programs without the hidden-state carry, so the MTP layer's
+    /// cache would not follow its rows.
+    #[error("beam search is not served under MTP speculation")]
+    MtpBeam,
 }
 
 /// How a draft model disagrees with the target it proposes for.
@@ -224,6 +242,10 @@ pub enum EmbedsError {
     /// proposals for such a prompt would come from placeholder tokens.
     #[error("a prompt with embedding rows cannot run under a draft-model speculation policy")]
     DraftModel,
+    /// The MTP layer embeds the tokens the sequence holds, which are placeholders where the prompt
+    /// supplies rows.
+    #[error("a prompt with embedding rows cannot run under an MTP speculation policy")]
+    Mtp,
 }
 
 /// Why an encode request is refused.
@@ -304,6 +326,10 @@ pub enum InvalidOptions {
     /// speculative rounds snapshot recurrent state: the rejected drafts would already have advanced it.
     #[error("a model with recurrent state cannot verify a window of drafts")]
     RecurrentHasNoVerifyWindows,
+    /// An MTP policy reads the hidden-state carry of its verify window: the options name none, or
+    /// one narrower than the window (`k + 1` positions).
+    #[error("an MTP policy of k = {k} needs a hidden-state carry window of at least {} positions, got {window:?}", k + 1)]
+    MtpCarryWindow { k: usize, window: Option<usize> },
     /// A timing bound of zero would disable what it bounds: a detailed run needs every bound positive.
     #[error("the timing bound `{bound}` must be positive, got 0")]
     TimingBoundZero { bound: &'static str },

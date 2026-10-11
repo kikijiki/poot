@@ -16,7 +16,7 @@ use poot_executor::{
     BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
     ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
 use poot_graph_plan::{CompileOptions, StagedProgram, Submission, Target, TargetSet};
 use poot_models::chat::ChatFormat;
 use poot_models::components::linear::{Weight, linear};
@@ -117,11 +117,7 @@ impl Model for Tiny {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: TINY,
@@ -197,7 +193,7 @@ impl Model for Tiny {
             let inputs = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, 4]);
             logits = b.binary(BinOp::Add, logits, linear(&b, inputs, &q, None));
         }
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits).unwrap())
     }
 }
 
@@ -426,7 +422,7 @@ impl Device for FakeDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -604,7 +600,7 @@ impl Executor for Counting {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<ValidationOutputs>,
+        program: &StagedProgram,
     ) -> Result<EntryId, ExecError> {
         let before = self.world.borrow().allocated.len();
         let id = self.inner.add_entry(exe, program)?;

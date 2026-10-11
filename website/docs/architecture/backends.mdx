@@ -8,7 +8,8 @@ sidebar_position: 6
 
 poot has three first-class backends built from one kernel source: **wgpu** (Vulkan/SPIR-V, the
 portable default), **ROCm** (AMD, raw HSA) and **PTX** (NVIDIA). Raw Vulkan has a runtime crate but no
-executor or `Device` implementation. The NPU path was removed (see [NPU Offload](./npu)). The CPU
+executor or `Device` implementation. The AMD XDNA2 NPU is an experimental `Device` that runs a few F32
+elementwise programs (see [NPU Offload](./npu)). The CPU
 oracle also powers current embeddings and reranking.
 
 Everything from model definition through graph IR, fusion and planning is backend-neutral. Backends
@@ -19,7 +20,7 @@ diverge late, in three places:
   refusal, not an executor branch.
 - **Codegen target.** `poot-codegen` emits LLVM IR for `SpirvVulkan`, `Nvptx` or `AmdGcn(arch)`, choosing
   address spaces, intrinsics, atomics and the AMD tensor-core family. `AieCore` codegen produces a typed,
-  linked artifact for a sequential one-core schedule; no runtime loads it or executes it on an NPU yet.
+  linked artifact for a sequential one-core schedule, which `poot-npu` loads and runs on an XDNA2 NPU.
 - **Runtime dispatch.** wgpu re-encodes a cached command buffer; ROCm replays recorded HSA AQL
   packets; PTX replays CUDA graphs through [cudarc](https://github.com/coreylowman/cudarc).
 

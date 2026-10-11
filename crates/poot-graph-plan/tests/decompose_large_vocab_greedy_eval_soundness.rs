@@ -111,12 +111,12 @@ fn check_large_vocab_decomposition(logits: Vec<f32>) {
     let b = Builder::new();
     let x = b.constant("logits", poot_graph_ir::TensorType::f32(vec![v]));
     let out = b.sample_token(SampleRule::Greedy, x, None, None, None);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let decomposed =
         decompose_large_vocab_greedy(&g, &poot_graph_plan::CompileLimits::STANDARD).unwrap();
     assert!(
         decomposed
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| matches!(e.op, poot_graph_ir::OpKind::SampleToken { .. }))
             .count()
@@ -195,12 +195,12 @@ fn large_vocab_greedy_decomposition_matches_the_oracle_at_card_scale_b1_and_b4()
         let b = Builder::new();
         let x = b.constant("logits", poot_graph_ir::TensorType::f32(vec![b_rows, v]));
         let out = b.sample_token(poot_graph_ir::op::SampleRule::Greedy, x, None, None, None);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let decomposed =
             decompose_large_vocab_greedy(&g, &poot_graph_plan::CompileLimits::STANDARD).unwrap();
         assert!(
             decomposed
-                .eqns
+                .eqns()
                 .iter()
                 .filter(|e| matches!(e.op, poot_graph_ir::OpKind::SampleToken { .. }))
                 .count()

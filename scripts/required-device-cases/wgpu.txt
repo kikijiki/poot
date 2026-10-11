@@ -40,6 +40,8 @@ poot-gpu	parity_tests::checkpoint_orientation_projection_matches_the_oracle_on_w
 poot-gpu	parity_tests::f16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu
 poot-gpu	parity_tests::packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_wgpu
 poot-gpu	parity_tests::select_is_bitwise_on_wgpu
+poot-gpu	parity_tests::split_kv_decode_matches_the_oracle_on_wgpu
+poot-gpu	parity_tests::split_kv_decode_replay_equals_the_recording_step_on_wgpu
 poot-gpu	parity_tests::state_pool_rows_reset_independently_on_wgpu
 poot-gpu	parity_tests::two_byte_select_is_refused_on_wgpu
 poot-gpu::buffer_plan	a_short_value_reusing_a_larger_slot_publishes_its_own_length_not_the_slots
@@ -74,6 +76,7 @@ poot-gpu::executor_contract	state_with_same_name_and_other_aval_is_refused
 poot-gpu::executor_contract	the_wgpu_device_reports_live_free_memory_within_its_open_time_ceiling
 poot-gpu::executor_contract	two_phase_state_commit_matches_the_oracle_after_four_steps
 poot-gpu::executor_contract	wgpu_device_classifies_a_kernel_assert_fault_from_synchronize
+poot-gpu::executor_contract	wgpu_device_refuses_an_aie_launch_as_a_typed_error
 poot-gpu::graph	dense_gemv::a_contraction_keeps_its_lds_width_through_the_planner_on_wgpu
 poot-gpu::graph	dense_gemv::the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_wgpu
 poot-gpu::graph	epilogue::a_dense_bf16_weight_epilogue_matches_the_oracle_on_wgpu
@@ -243,6 +246,11 @@ poot-llm	driver::device_tests::smolvlm_batched_paged_embeds_match_single_row_run
 poot-llm	driver::device_tests::smolvlm_caption_matches_the_oracle_rows_wgpu
 poot-llm	driver::device_tests::smolvlm_front_end_requests_served_batched_equal_single_row_captions_wgpu
 poot-llm	driver::device_tests::two_frames_of_one_size_embed_differently_wgpu
+poot-llm	driver::step::mtp_tests::mtp_all_accepted_equals_off_wgpu
+poot-llm	driver::step::mtp_tests::mtp_greedy_equals_off_wgpu
+poot-llm	driver::step::mtp_tests::mtp_proposals_equal_the_oracle_chain_wgpu
+poot-llm	driver::step::mtp_tests::mtp_serves_a_sampled_row_wgpu
+poot-llm	driver::step::mtp_tests::mtp_two_rows_equal_off_wgpu
 poot-llm::add_a_model	four_paged_rows_equal_single_row_runs_wgpu
 poot-llm::add_a_model	generate_equals_the_oracle_tokens_wgpu
 poot-llm::beam	beam_matches_the_host_reference_wgpu
@@ -322,6 +330,7 @@ poot-serve::bin/poot-serve	tests::lifecycle::device::a_multimodal_job_through_th
 poot-serve::bin/poot-serve	tests::lifecycle::device::an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode_wgpu
 poot-serve::bounded_drain_production	bounded_drain_production_completes_accepted_barrier_before_exit
 poot-serve::bounded_drain_production	bounded_drain_production_timeout_closes_accepted_barrier
+poot-serve::served_groups	a_model_without_an_mtp_layer_refuses_draft_mtp_startup_wgpu
 poot-serve::served_groups	draft_with_a_larger_vocabulary_refuses_startup_wgpu
 poot-serve::served_groups	served_bloom_wgpu
 poot-serve::served_groups	served_deepseek2_wgpu
@@ -341,6 +350,7 @@ poot-serve::served_groups	served_lookup_speculation_returns_the_off_tokens_wgpu
 poot-serve::served_groups	served_minimax_m2_wgpu
 poot-serve::served_groups	served_mixtral_wgpu
 poot-serve::served_groups	served_mpt_wgpu
+poot-serve::served_groups	served_mtp_speculation_returns_the_off_tokens_wgpu
 poot-serve::served_groups	served_nemotron_h_wgpu
 poot-serve::served_groups	served_olmo2_wgpu
 poot-serve::served_groups	served_olmoe_wgpu

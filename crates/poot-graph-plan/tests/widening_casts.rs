@@ -44,7 +44,7 @@ fn output_bits(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Vec<u32> {
 }
 
 fn casts(g: &Graph) -> usize {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Cast { .. }))
         .count()
@@ -52,7 +52,7 @@ fn casts(g: &Graph) -> usize {
 
 /// The one eqn of `g` that `pick` selects.
 fn only(g: &Graph, pick: impl Fn(&OpKind) -> bool) -> &poot_graph_ir::Eqn {
-    let mut found = g.eqns.iter().filter(|e| pick(&e.op));
+    let mut found = g.eqns().iter().filter(|e| pick(&e.op));
     let eqn = found.next().expect("one such eqn");
     assert!(found.next().is_none(), "exactly one such eqn");
     eqn
@@ -66,10 +66,9 @@ fn a_norm_scale_cast_folds_into_the_row_region_and_evaluates_identically() {
     let w = b.constant("w", TensorType::new(vec![n], DType::BF16));
     let out = rmsnorm(&b, x, b.cast(w, DType::F32), 1e-6);
     let (xi, wi) = (x.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
-    let og = optimize(&g);
-    og.validate().expect("the folded graph is valid");
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&g), 1);
     assert_eq!(casts(&og), 0, "the widening cast is a step, not an eqn");
     let row = only(&og, |op| matches!(op, OpKind::FusedRow(_)));
@@ -77,7 +76,7 @@ fn a_norm_scale_cast_folds_into_the_row_region_and_evaluates_identically() {
         unreachable!()
     };
     assert_eq!(row.inputs.len(), 2, "the row reads x and the narrow w");
-    assert_eq!(og.aval(og.eqns[0].out).dtype, DType::F32);
+    assert_eq!(og.aval(og.eqns()[0].out).dtype, DType::F32);
     assert!(
         row.inputs
             .iter()
@@ -118,16 +117,15 @@ fn a_bias_cast_folds_into_the_contraction_epilogue_and_evaluates_identically() {
     let bias = b.broadcast(b.cast(bias, DType::F32), vec![1, 1, n]);
     let out = b.binary(BinOp::Add, y, bias);
     let (xi, wi) = (x.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let bias_const = g
-        .values
+        .values()
         .iter_enumerated()
         .find(|(_, v)| v.name.as_deref() == Some("bias"))
         .map(|(id, _)| id)
         .expect("the bias const");
 
-    let og = optimize(&g);
-    og.validate().expect("the folded graph is valid");
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&og), 0, "the widening cast is a step, not an eqn");
     let epilogue = only(&og, |op| matches!(op, OpKind::ContractionEpilogue { .. }));
     let OpKind::ContractionEpilogue { region, .. } = &epilogue.op else {
@@ -168,8 +166,8 @@ fn a_cast_nothing_else_may_see_stays_a_cast() {
     let normed = rmsnorm(&b, x, scale, 1e-6);
     let other = b.cast(b.reshape(w, vec![1, 1, n]), DType::F32);
     let out = b.binary(BinOp::Add, normed, other);
-    let g = b.finish(out);
-    let og = optimize(&g);
+    let g = b.finish(out).unwrap();
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&og), 2, "a const with a second reader folds nothing");
 
     // The cast result has a second reader: the widened f32 value is still needed outside the region.
@@ -179,8 +177,8 @@ fn a_cast_nothing_else_may_see_stays_a_cast() {
     let scale = b.cast(w, DType::F32);
     let normed = rmsnorm(&b, x, scale, 1e-6);
     let out = b.binary(BinOp::Add, normed, b.reshape(scale, vec![1, 1, n]));
-    let g = b.finish(out);
-    let og = optimize(&g);
+    let g = b.finish(out).unwrap();
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&og), 1, "a cast with a second reader stays a cast");
 
     // A pointwise region's kernels read every leaf as f32: its cast is not folded.
@@ -189,7 +187,7 @@ fn a_cast_nothing_else_may_see_stays_a_cast() {
     let w = b.constant("w", TensorType::new(vec![n], DType::BF16));
     let widened = b.broadcast(b.cast(w, DType::F32), vec![1, 1, n]);
     let out = b.binary(BinOp::Add, b.unary(UnOp::Neg, x), widened);
-    let g = b.finish(out);
-    let og = optimize(&g);
+    let g = b.finish(out).unwrap();
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&og), 1, "a pointwise region keeps its widening cast");
 }

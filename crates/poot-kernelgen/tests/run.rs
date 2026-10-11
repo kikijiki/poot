@@ -208,7 +208,7 @@ fn binary_mul() {
 #[test]
 fn cross_block_fence_spin_wait_coop_compiles_to_ptx() {
     let p = ptx(
-        &kg::cross_block_fence_spin_wait_coop("fencespinwaitc"),
+        &poot_test_util::kernel_fixtures::cross_block_fence_spin_wait_coop("fencespinwaitc"),
         "fencespinwaitc",
     );
     assert!(
@@ -242,7 +242,7 @@ fn fence_validates_as_spirv_both_scopes() {
     for (body, name) in [
         (workgroup_fence_spin_wait("wgfence_val", 128), "wgfence_val"),
         (
-            kg::cross_block_fence_spin_wait_coop("devfence_val"),
+            poot_test_util::kernel_fixtures::cross_block_fence_spin_wait_coop("devfence_val"),
             "devfence_val",
         ),
     ] {

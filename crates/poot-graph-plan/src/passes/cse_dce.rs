@@ -14,10 +14,10 @@ use poot_graph_ir::ValueTable;
 ///
 /// The rest of the value table is preserved (dead entries are harmless); the eqn list shrinks and the
 /// output is remapped to its canonical value.
-pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub fn cse(g: &Graph) -> Result<Graph, EditError> {
     let mut remap: HashMap<ValueId, ValueId> = HashMap::new(); // old value id -> canonical id
     let mut computed: HashMap<ComputedConst, ValueId> = HashMap::new();
-    for (id, value) in g.values.iter_enumerated() {
+    for (id, value) in g.values().iter_enumerated() {
         if let Storage::Computed(payload) = value.storage {
             let canon = *computed.entry(payload).or_insert(id);
             if canon != id {
@@ -26,7 +26,7 @@ pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         }
     }
     let mut seen: HashMap<String, ValueId> = HashMap::new(); // eqn key -> canonical out id
-    let mut eqns: Vec<Eqn> = Vec::with_capacity(g.eqns.len());
+    let mut eqns: Vec<Eqn> = Vec::with_capacity(g.eqns().len());
 
     let resolve = |o: &Operand, remap: &HashMap<ValueId, ValueId>| -> Operand {
         match o {
@@ -35,7 +35,7 @@ pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         }
     };
 
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         let inputs: Vec<Operand> = eqn.inputs.iter().map(|o| resolve(o, &remap)).collect();
         // a deterministic structural key: the op (params included) + the resolved operands.
         let key = format!("{:?}|{:?}", eqn.op, inputs);
@@ -53,16 +53,17 @@ pub fn cse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     }
 
     let canon = |v: ValueId| remap.get(&v).copied().unwrap_or(v);
-    let mut out = Graph { eqns, ..g.clone() };
-    out.inputs.retain(|id| !remap.contains_key(id));
-    out.consts.retain(|id| !remap.contains_key(id));
+    let mut out = g.edit();
+    *out.eqns_mut() = eqns;
+    out.inputs_mut().retain(|id| !remap.contains_key(id));
+    out.consts_mut().retain(|id| !remap.contains_key(id));
     out.remap_results(canon);
-    out
+    out.commit()
 }
 
 /// Dead-code elimination: drop eqns whose output is never (transitively) used by the graph output.
 /// Eqns are topologically ordered, so a single reverse liveness sweep suffices.
-pub fn dce<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub fn dce(g: &Graph) -> Result<Graph, EditError> {
     dce_with_roots(g, &[])
 }
 
@@ -70,8 +71,8 @@ pub fn dce<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
 ///
 /// Extra roots are a transform hint only. They do not change [`Graph::output`] or carried-state
 /// semantics and must be re-proved by the caller after this pass.
-pub fn dce_with_roots<V: ValidationChannel>(g: &Graph<V>, extra_roots: &[ValueId]) -> Graph<V> {
-    let mut live = ValueTable::filled(g.values.len(), false);
+pub fn dce_with_roots(g: &Graph, extra_roots: &[ValueId]) -> Result<Graph, EditError> {
+    let mut live = ValueTable::filled(g.values().len(), false);
     for root in g.liveness_roots() {
         live[root] = true;
     }
@@ -80,7 +81,7 @@ pub fn dce_with_roots<V: ValidationChannel>(g: &Graph<V>, extra_roots: &[ValueId
             *live = true;
         }
     }
-    for eqn in g.eqns.iter().rev() {
+    for eqn in g.eqns().iter().rev() {
         if live[eqn.out] {
             for o in &eqn.inputs {
                 if let Operand::Value(v) = o {
@@ -89,6 +90,6 @@ pub fn dce_with_roots<V: ValidationChannel>(g: &Graph<V>, extra_roots: &[ValueId
             }
         }
     }
-    let eqns: Vec<Eqn> = g.eqns.iter().filter(|e| live[e.out]).cloned().collect();
-    Graph { eqns, ..g.clone() }
+    let eqns: Vec<Eqn> = g.eqns().iter().filter(|e| live[e.out]).cloned().collect();
+    with_eqns(g, eqns)
 }

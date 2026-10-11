@@ -10,7 +10,7 @@ use poot_eval::{EvalBudget, EvalError, EvalOptions, Value, eval};
 use poot_graph_ir::ops::{attention_masked_softcap, repeat_kv};
 use poot_graph_ir::{
     AttentionAttrs, BinOp, Builder, Eqn, Graph, KeyLayout, KvBound, OpKind, Operand, Scalar,
-    TensorType, ValidationOutputs, ValueId,
+    TensorType, ValueId,
 };
 use poot_graph_plan::{
     Capability, CompileError, CompileOptions, KernelChoice, Plan, PlanError, Submission, Target,
@@ -21,10 +21,7 @@ use poot_target::{AmdArch, Backend};
 use poot_test_util::assert_close;
 use poot_test_util::live_attention::{Inputs, LiveAttentionFixture, LiveAttentionGraph};
 
-fn evaluate(
-    graph: &Graph<ValidationOutputs>,
-    inputs: &HashMap<ValueId, Value>,
-) -> Result<Vec<f32>, EvalError> {
+fn evaluate(graph: &Graph, inputs: &HashMap<ValueId, Value>) -> Result<Vec<f32>, EvalError> {
     let output = eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?
         .output
         .into_host()
@@ -41,9 +38,9 @@ fn assert_same_words(label: &str, a: &[f32], b: &[f32]) {
     }
 }
 
-fn attentions(graph: &Graph<ValidationOutputs>) -> Vec<&AttentionAttrs> {
+fn attentions(graph: &Graph) -> Vec<&AttentionAttrs> {
     graph
-        .eqns
+        .eqns()
         .iter()
         .filter_map(|eqn| match &eqn.op {
             OpKind::Attention(attrs) => Some(attrs),
@@ -80,7 +77,7 @@ fn split_key() -> LiveAttentionFixture {
 fn without_guard(mut graph: LiveAttentionGraph, which: usize) -> LiveAttentionGraph {
     let selects: Vec<usize> = graph
         .graph
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .filter(|(_, eqn)| {
@@ -91,13 +88,17 @@ fn without_guard(mut graph: LiveAttentionGraph, which: usize) -> LiveAttentionGr
         .collect();
     let shape = graph
         .graph
-        .aval(graph.graph.eqns[selects[which]].out)
+        .aval(graph.graph.eqns()[selects[which]].out)
         .shape
         .clone();
-    let eqn: &mut Eqn = &mut graph.graph.eqns[selects[which]];
-    let data = eqn.inputs[1];
-    eqn.op = OpKind::Reshape { shape };
-    eqn.inputs = vec![data];
+    let index = selects[which];
+    let data = graph.graph.eqns()[index].inputs[1];
+    graph.graph = poot_test_util::graph_fixtures::derive(&graph.graph, |draft| {
+        let eqn: &mut Eqn = &mut draft.eqns_mut()[index];
+        eqn.op = OpKind::Reshape { shape };
+        eqn.inputs = vec![data];
+    })
+    .unwrap();
     graph
 }
 
@@ -111,7 +112,7 @@ fn the_guarded_graph_and_the_matched_live_composite_evaluate_bit_identically() {
     for fixture in [single_key(), split_key()] {
         let built = fixture.build(true);
         let inputs = fixture.inputs(&built, &len, true).values();
-        let optimized = optimize(&built.graph);
+        let optimized = optimize(&built.graph).unwrap();
         let [attrs] = attentions(&optimized)[..] else {
             panic!(
                 "the guarded graph fuses to one attention op: {:?}",
@@ -152,7 +153,7 @@ fn unproved_guards_stay_generic_and_a_score_mask_stays_capacity() {
     let mut off_by_one = fixture.build(true);
     let iotas: Vec<ValueId> = off_by_one
         .graph
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| {
             matches!(
@@ -170,18 +171,21 @@ fn unproved_guards_stay_generic_and_a_score_mask_stays_capacity() {
         1,
         "the live bound's key ends come from one exact I32 iota"
     );
-    for eqn in &mut off_by_one.graph.eqns {
-        let key_ends = matches!(eqn.op, OpKind::Binary(BinOp::Add))
-            && matches!(eqn.inputs.first(), Some(Operand::Value(id)) if iotas.contains(id))
-            && matches!(eqn.inputs.get(1), Some(Operand::Lit(Scalar::I32(1))));
-        if key_ends {
-            eqn.inputs[1] = Operand::Lit(Scalar::I32(2));
+    off_by_one.graph = poot_test_util::graph_fixtures::derive(&off_by_one.graph, |draft| {
+        for eqn in draft.eqns_mut().iter_mut() {
+            let key_ends = matches!(eqn.op, OpKind::Binary(BinOp::Add))
+                && matches!(eqn.inputs.first(), Some(Operand::Value(id)) if iotas.contains(id))
+                && matches!(eqn.inputs.get(1), Some(Operand::Lit(Scalar::I32(1))));
+            if key_ends {
+                eqn.inputs[1] = Operand::Lit(Scalar::I32(2));
+            }
         }
-    }
+    })
+    .unwrap();
     rows.push(("conditions one key off", off_by_one));
     for (name, built) in rows {
         let inputs = fixture.inputs(&built, &len, true).values();
-        let optimized = optimize(&built.graph);
+        let optimized = optimize(&built.graph).unwrap();
         // First what the rewrite would change: the unguarded graph is NaN on the poisoned tail and a `Live`
         // composite is finite, so a wrongly emitted `Live` shows up as a different result.
         assert_same_words(
@@ -200,7 +204,7 @@ fn unproved_guards_stay_generic_and_a_score_mask_stays_capacity() {
     // nothing instead of becoming a valid-looking answer.
     let validated = fixture.build(true);
     assert_eq!(
-        attentions(&optimize(&validated.graph)).len(),
+        attentions(&optimize(&validated.graph).unwrap()).len(),
         1,
         "a clamped length whose witness is declared is matched"
     );
@@ -218,8 +222,8 @@ fn unproved_guards_stay_generic_and_a_score_mask_stays_capacity() {
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
     let out = attention_masked_softcap(&b, q, k, v, 1, 0.5, mask, None);
-    let graph = b.finish(out).with_validations(Vec::new());
-    let optimized = optimize(&graph);
+    let graph = b.finish(out).unwrap();
+    let optimized = optimize(&graph).unwrap();
     let [attrs] = attentions(&optimized)[..] else {
         panic!("the production mask fuses to one attention op");
     };
@@ -274,7 +278,7 @@ fn an_out_of_range_live_length_fails_validation_and_the_endpoints_run() {
         ..single_key()
     };
     let built = fixture.build(true);
-    let optimized = optimize(&built.graph);
+    let optimized = optimize(&built.graph).unwrap();
     for len in [0, -1, 10] {
         let inputs = fixture.inputs(&built, &[len], false).values();
         for (name, graph) in [
@@ -336,7 +340,7 @@ fn targets() -> [(&'static str, Target); 3] {
                 Backend::Nvptx => "nvptx",
                 _ => "amdgcn",
             },
-            Target {
+            Target::Gpu {
                 backend,
                 caps: poot_test_util::device_caps::default_caps_for(backend),
             },
@@ -345,7 +349,7 @@ fn targets() -> [(&'static str, Target); 3] {
 }
 
 /// The one generated attention request of `graph` compiled for `target`, and how many launches its plan makes.
-fn planned_attention(graph: &Graph<ValidationOutputs>, target: &Target) -> (AttentionSpec, usize) {
+fn planned_attention(graph: &Graph, target: &Target) -> (AttentionSpec, usize) {
     let program = compile(
         graph,
         target,
@@ -390,7 +394,7 @@ fn gemma2_softcap_decode_and_mla_select_the_streaming_attention_schedule() {
     );
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
     let out = attention_masked_softcap(&b, q, k, v, hq / hkv, 0.25, mask, Some(50.0));
-    let gemma2 = b.finish(out).with_validations(Vec::new());
+    let gemma2 = b.finish(out).unwrap();
 
     // DeepSeek-V2 MLA: per-head `k_nope` (128) and the one shared `k_pe` (64) the tracer broadcasts and
     // concatenates, a 128-wide value.
@@ -408,7 +412,7 @@ fn gemma2_softcap_decode_and_mla_select_the_streaming_attention_schedule() {
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
     let key = b.concat(3, &[k_nope, repeat_kv(&b, k_pe, hq)]);
     let out = attention_masked_softcap(&b, q, key, v, 1, 0.07, mask, None);
-    let mla = b.finish(out).with_validations(Vec::new());
+    let mla = b.finish(out).unwrap();
 
     for (name, target) in targets() {
         let (spec, launches) = planned_attention(&gemma2, &target);
@@ -439,8 +443,11 @@ fn gemma2_softcap_decode_and_mla_select_the_streaming_attention_schedule() {
 }
 
 /// SC-002, planning half: the compiled live decode plans `bound=live` over the length operand the graph derived
-/// from `Pos`, with one dispatch whose grid does not depend on the length. Mutation: plan the bound as
-/// `Static` in `planner/attention.rs`; the assertion on `spec.bound` fails.
+/// from `Pos`, with launches whose grids do not depend on the length. Two query rows on a 4096-key cache is the
+/// low-head case the split-KV schedule serves (POOT-1113): its two launches (partials, then combine) take their
+/// grids from the shape alone, and a split a short live length leaves empty publishes its own neutral partial
+/// at run time. Mutation: plan the bound as `Static` in `planner/attention.rs`; the assertion on `spec.bound`
+/// fails.
 #[test]
 fn the_compiled_live_decode_plans_a_live_bound_and_a_length_independent_launch() {
     let fixture = LiveAttentionFixture {
@@ -458,11 +465,14 @@ fn the_compiled_live_decode_plans_a_live_bound_and_a_length_independent_launch()
     for (name, target) in targets() {
         let (spec, launches) = planned_attention(&built.graph, &target);
         assert_eq!(spec.bound, poot_kernelgen::KeyBound::Live, "{name}");
-        assert_eq!(launches, 1, "{name}");
+        let AttentionSchedule::SplitKv { splits, .. } = spec.schedule else {
+            panic!("{name}: two rows on a 4096-key cache split: {spec:?}");
+        };
+        assert_eq!(launches, 2, "{name}: partials, then combine");
         assert_eq!(
             spec.workgroups(),
-            2,
-            "{name}: the grid is (batch, head, row)"
+            2 * splits,
+            "{name}: the grid is (batch, head, row, split)"
         );
     }
 }
@@ -476,7 +486,7 @@ fn the_live_bound_builds_its_key_ends_in_exact_i32() {
     let built = single_key().build(true);
     let g = &built.graph;
     let i32_iotas = g
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| {
             matches!(
@@ -490,7 +500,7 @@ fn the_live_bound_builds_its_key_ends_in_exact_i32() {
         .count();
     assert_eq!(i32_iotas, 1, "one exact I32 iota feeds the key ends");
     let float_to_int_casts: Vec<_> = g
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| {
             matches!(
@@ -619,7 +629,7 @@ fn a_narrow_live_graph_plans_its_selects_natively_and_spirv_refuses_them() {
     for dtype in NARROW {
         let built = narrow(single_key(), dtype).build(true);
         assert!(
-            attentions(&optimize(&built.graph)).is_empty(),
+            attentions(&optimize(&built.graph).unwrap()).is_empty(),
             "{dtype:?}: the F32 attention kernel must not claim a narrow chain"
         );
         let leaf = match dtype {
@@ -685,9 +695,9 @@ fn a_narrow_capacity_attention_chain_stays_the_decomposition() {
         let v = input("v", vec![1, hq, cap, d]);
         let mask = input("mask", vec![1, 1, 1, cap]);
         let out = attention_masked_softcap(&b, q, k, v, 1, 0.5, mask, None);
-        let graph = b.finish(out).with_validations(Vec::new());
+        let graph = b.finish(out).unwrap();
         assert!(
-            attentions(&optimize(&graph)).is_empty(),
+            attentions(&optimize(&graph).unwrap()).is_empty(),
             "{dtype:?}: the chain must stay generic"
         );
     }

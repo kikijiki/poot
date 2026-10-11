@@ -317,7 +317,7 @@ mod tests {
             .enumerate()
             .map(|(index, &usable_bytes)| DeviceSpec {
                 id: DeviceId(index as u32),
-                backend: Backend::Nvptx,
+                target: Backend::Nvptx.into(),
                 usable_bytes,
             })
             .collect()

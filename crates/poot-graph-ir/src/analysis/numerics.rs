@@ -123,8 +123,8 @@ fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
 /// The strongest property the equations of `g` exhibit, read off their ops and output dtypes. This is
 /// the ground truth a program publishes and a declaration is checked against, never a restatement of a
 /// declaration.
-pub fn implied_numerics<V: ValidationChannel>(g: &Graph<V>) -> NumericsProperty {
-    g.eqns
+pub fn implied_numerics(g: &Graph) -> NumericsProperty {
+    g.eqns()
         .iter()
         .map(|eqn| implied_op_numerics(&eqn.op, g.aval(eqn.out).dtype))
         .fold(NumericsProperty::Exact, NumericsProperty::strongest)
@@ -354,12 +354,12 @@ pub enum NumericsError {
 /// Check a declaration against the strongest property among the ops the pass produces in `out`. Fails
 /// closed when the declaration is weaker than what it produced (a pass that reassociates while claiming
 /// `Exact`).
-pub fn verify_pass_numerics<V: ValidationChannel>(
+pub fn verify_pass_numerics(
     declaration: &PassDeclaration,
-    out: &Graph<V>,
+    out: &Graph,
 ) -> Result<(), NumericsError> {
     let implied = out
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| (declaration.produces)(&eqn.op))
         .map(|eqn| implied_op_numerics(&eqn.op, out.aval(eqn.out).dtype))

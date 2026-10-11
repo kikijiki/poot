@@ -10,7 +10,7 @@
 
 use poot_graph_ir::{
     Builder, BuilderAppendError, Graph, GraphValidationError, Storage, TensorType, Traced,
-    ValidationId, ValidationOutput, ValidationOutputs,
+    ValidationId,
 };
 use poot_tensor::DType;
 
@@ -42,7 +42,7 @@ pub(super) fn finish_with_validations(
     b: Builder,
     out: Traced,
     validations: &[(ValidationId, &str, Traced)],
-) -> Result<Graph<ValidationOutputs>, GraphValidationError> {
+) -> Result<Graph, GraphValidationError> {
     finish_with_state_and_validations(b, out, &[], validations)
 }
 
@@ -51,19 +51,15 @@ pub(super) fn finish_with_state_and_validations(
     out: Traced,
     state: &[(Traced, Traced)],
     validations: &[(ValidationId, &str, Traced)],
-) -> Result<Graph<ValidationOutputs>, GraphValidationError> {
-    let g = b.finish_with_state(out, state).with_validations(
-        validations
-            .iter()
-            .map(|&(id, name, value)| ValidationOutput {
-                id,
-                name: name.to_owned(),
-                value: value.id(),
-            })
-            .collect(),
+) -> Result<Graph, GraphValidationError> {
+    let outputs = validations.iter().fold(
+        poot_graph_ir::Outputs::new(out).with_state(state),
+        |outputs, &(id, name, value)| outputs.with_witness(id, name, value),
     );
-    g.validate()?;
-    Ok(g)
+    b.finish(outputs).map_err(|error| match error {
+        poot_graph_ir::EditError::Invalid(error) => error,
+        other => panic!("a fresh builder has no baseline to break: {other}"),
+    })
 }
 
 /// deterministic pseudo-random fill in [-1, 1), no rng dependency.

@@ -4,9 +4,7 @@
 //! bind check that produced it. Card 626 deleted the one untyped `String` variant,
 //! `Executor`: its 14 executor-built sites died with the pre-contract device executors (Cards 546b/549).
 
-use poot_graph_ir::{
-    ExecutionValidationFailure, GraphValidationError, IndexRange, TensorType, ValueId,
-};
+use poot_graph_ir::{ExecutionValidationFailure, IndexRange, TensorType, ValueId};
 use poot_tensor::DType;
 
 use crate::ops::index_rule::IndexFault;
@@ -55,8 +53,6 @@ pub struct SlotRangeFault {
 /// One evaluator, one error type. Every walk refusal is one of these.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
-    #[error("invalid graph: {0}")]
-    InvalidGraph(#[from] GraphValidationError),
     #[error(transparent)]
     Validation(#[from] ExecutionValidationFailure),
     #[error("validation output {value} is not a complete dense f32 tensor")]

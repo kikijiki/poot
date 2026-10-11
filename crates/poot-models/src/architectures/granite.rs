@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
 use crate::chat::ChatFormat;
@@ -331,11 +331,7 @@ impl Model for Granite {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         if let Some(params) = &p.moe {
@@ -357,7 +353,7 @@ impl Model for Granite {
                 },
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 

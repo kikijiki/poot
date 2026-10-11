@@ -25,7 +25,7 @@ fn select_f32_bits(shape: &[usize], cond: &[i32], if_true: &[u32], if_false: &[u
     let t = b.constant("if_true", ty(DType::F32));
     let f = b.constant("if_false", ty(DType::F32));
     let out = b.select(c, t, f);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let floats = |bits: &[u32]| {
         HostTensor::f32(
             shape.to_vec(),
@@ -126,7 +126,7 @@ fn float_select_broadcasts_the_condition() {
     let t = b.constant("if_true", TensorType::new(vec![2, 3], DType::F32));
     let f = b.constant("if_false", TensorType::new(vec![3], DType::F32));
     let out = b.select(c, t, f);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inputs = HashMap::from([
         (c.id(), Value::from(HostTensor::i32(vec![2, 1], vec![1, 0]))),
         (
@@ -174,7 +174,7 @@ fn bf16_select_passes_half_width_bits_through() {
     let t = b.constant("if_true", ty(DType::BF16));
     let f = b.constant("if_false", ty(DType::BF16));
     let out = b.select(c, t, f);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inputs = HashMap::from([
         (
             c.id(),
@@ -252,7 +252,7 @@ fn narrow_select_moves_exact_words_through_movement_ops() {
         );
         let other = b.slice(widened, 0, 6, 12);
         let out = b.select(cond, joined, other);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let inputs = HashMap::from([
             (
                 cond.id(),

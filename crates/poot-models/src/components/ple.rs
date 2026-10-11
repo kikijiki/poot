@@ -834,7 +834,7 @@ pub(crate) mod oracle {
 
 #[cfg(test)]
 mod tests {
-    use poot_graph_ir::{Graph, NoValidations, Slot};
+    use poot_graph_ir::{Graph, Slot};
 
     use poot_graph_ir::TensorType;
 
@@ -932,11 +932,10 @@ mod tests {
         let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All));
         let xs = b.constant("x", TensorType::f32(vec![1, tokens.len(), stream]));
         let y = ple(&b, &step, LAYER, xs, &w, p);
-        let g = step.finish(b, y);
+        let g = step.finish(b, y).unwrap();
         let zeros: Vec<Vec<f32>> = g
-            .state
-            .iter()
-            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
             .collect();
         let state: Vec<&[f32]> = if state.is_empty() { &zeros } else { state }
             .iter()
@@ -1050,7 +1049,7 @@ mod tests {
         let b = Builder::new();
         let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All));
         let ids = ngram_ids(&b, &step, LAYER, p);
-        let g = step.finish(b, ids);
+        let g = step.finish(b, ids).unwrap();
         let encoded: Vec<f32> = match history {
             Some(raw) => raw.iter().map(|&t| (t ^ p.eos) as f32).collect(),
             None => vec![0.0; p.context()],
@@ -1165,33 +1164,20 @@ mod tests {
         assert_eq!(real.conv.window(), 9);
     }
 
-    /// `g` with its validation channel dropped and `output` as its output: the oracle refuses a
-    /// failing validation, so a test that reads a witness reads it as the output.
-    fn unvalidated(
-        g: Graph<poot_graph_ir::ValidationOutputs>,
-        output: Option<poot_graph_ir::ValueId>,
-    ) -> Graph {
-        let Graph {
-            values,
-            inputs,
-            consts,
-            slots,
-            eqns,
-            output: own,
-            state,
-            ..
-        } = g;
-        Graph {
-            values,
-            inputs,
-            consts,
-            slots,
-            eqns,
-            output: output.unwrap_or(own),
-            validations: NoValidations,
-            exports: Vec::new(),
-            state,
+    /// `g` with its witnesses dropped and `output` as its result: the oracle refuses a failing
+    /// validation, so a test that reads a witness reads it as the result.
+    fn unvalidated(g: Graph, output: Option<poot_graph_ir::ValueId>) -> Graph {
+        let mut draft = poot_graph_ir::GraphEdit::new();
+        *draft.values_mut() = g.values().clone();
+        *draft.inputs_mut() = g.inputs().to_vec();
+        *draft.consts_mut() = g.consts().to_vec();
+        *draft.slots_mut() = g.slots().to_vec();
+        *draft.eqns_mut() = g.eqns().to_vec();
+        draft.set_result(output.unwrap_or(g.result()));
+        for (input, next) in g.state() {
+            draft.push_state(input, next);
         }
+        draft.commit().expect("the same tables stay well formed")
     }
 
     /// SC-009 (component half): an id outside the vocabulary leaves the witness non-zero, counts
@@ -1205,11 +1191,14 @@ mod tests {
             let b = Builder::new();
             let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All));
             let ids = ngram_ids(&b, &step, LAYER, &p);
-            let g = step.finish(b, ids);
-            let outputs = g.validation_outputs().to_vec();
+            let g = step.finish(b, ids).unwrap();
+            let outputs: Vec<_> = g
+                .witnesses()
+                .map(|witness| (witness.id, witness.value))
+                .collect();
             assert_eq!(outputs.len(), 1, "one witness per PLE layer");
-            assert_eq!(PleWitness::decode(outputs[0].id), Some(LAYER));
-            let g = unvalidated(g, witness.then_some(outputs[0].value));
+            assert_eq!(PleWitness::decode(outputs[0].0), Some(LAYER));
+            let g = unvalidated(g, witness.then_some(outputs[0].1));
             let pos: Vec<i32> = (0..tokens.len() as i32).collect();
             let zeros = vec![0.0; p.context()];
             Fx::new(1)
@@ -1427,7 +1416,7 @@ mod tests {
         let b = Builder::new();
         let ids = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
         let rows = table.lookup(&b, ids);
-        let g = b.finish(rows);
+        let g = b.finish(rows).unwrap();
         let wanted = [id_row, lossy, id_row + 1, 0];
         let tokens: Vec<i32> = wanted.iter().map(|&row| row as i32).collect();
         let (got, _) = fx.eval(&g, &[], &[(Slot::Token, &tokens)], &[]);

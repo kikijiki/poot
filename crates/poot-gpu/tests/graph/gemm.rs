@@ -44,9 +44,9 @@ fn tiled_gemm_large_n_under_tile_threshold_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![m, k]));
     let wt = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, wt);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let eqn = g
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .unwrap();
@@ -113,9 +113,9 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
         let a = b.constant("a", TensorType::f32(vec![m, k]));
         let wt = b.constant("w", TensorType::f32(vec![k, n]));
         let out = b.matmul(a, wt);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .unwrap();
@@ -181,7 +181,7 @@ fn large_elementwise_readback_matches_cpu() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![n]));
     let y = b.binary(B2::Mul, x, x); // x*x, one thread per element
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let xd: Vec<f32> = (0..n).map(|i| ((i % 1000) as f32) * 0.001).collect();
     let mut inp = HashMap::new();
     inp.insert(x.id(), HostTensor::f32(vec![n], xd.clone()));
@@ -213,10 +213,10 @@ fn lm_head_gemv_2d_grid_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![1, k]));
     let wt = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, wt);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     // sanity: this is the decode-GEMV path (M=1, rank-2 weight, large N).
     let eqn = g
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .unwrap();
@@ -281,11 +281,11 @@ fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
     let a = b.constant("a", TensorType::f32(vec![1, k]));
     let wt = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, wt);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     // sanity: this is the decode-GEMV path, over the chunk trigger - plan_eqn must actually take the new
     // split-dispatch branch, not silently stay a single dispatch.
     let eqn = g
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .unwrap();
@@ -343,9 +343,9 @@ fn concat_n_gpu_matches_cpu() {
     let p2 = b.constant("p2", TensorType::f32(vec![2, 3, 3]));
     let out = b.concat(1, &[p0, p1, p2]);
     let (i0, i1, i2) = (p0.id(), p1.id(), p2.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let eqn = g
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::Concat { .. }))
         .unwrap();
@@ -406,9 +406,9 @@ fn concat_n_rank4_axis2_gpu_matches_cpu() {
         .collect();
     let out = b.concat(2, &ps);
     let ids: Vec<_> = ps.iter().map(|p| p.id()).collect();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let eqn = g
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::Concat { .. }))
         .unwrap();
@@ -555,7 +555,7 @@ fn indexed_program(case: &IndexedCase, gate: Option<Vec<f32>>) -> IndexedProgram
         out = b.binary(poot_graph_ir::op::BinOp::Mul, out, column);
     }
     IndexedProgram {
-        graph: b.finish(out),
+        graph: b.finish(out).unwrap(),
         inputs,
     }
 }
@@ -656,7 +656,7 @@ fn indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit() {
         inputs.insert(idx.id(), HostTensor::i32(vec![m], ids));
         let out = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), idx);
         let program = IndexedProgram {
-            graph: b.finish(out),
+            graph: b.finish(out).unwrap(),
             inputs,
         };
         let want = indexed_oracle(&program).unwrap();
@@ -832,7 +832,7 @@ fn routed_gate_weighting_checkpoint_order_equals_the_oracle_bit_for_bit() {
             b.reshape(gate_t, vec![m, 1]),
         );
         let program = IndexedProgram {
-            graph: b.finish(out),
+            graph: b.finish(out).unwrap(),
             inputs,
         };
         let want = indexed_oracle(&program).unwrap();
@@ -906,7 +906,7 @@ fn indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit() {
                     );
                 }
                 let program = IndexedProgram {
-                    graph: b.finish(out),
+                    graph: b.finish(out).unwrap(),
                     inputs,
                 };
                 let want = indexed_oracle(&program).unwrap();
@@ -942,7 +942,7 @@ fn tiled_gemm_gpu_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(x, w);
     let (xi, wi) = (x.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     // small, well-conditioned values so the f32 dot is near-exact.
     let xd: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
@@ -1040,7 +1040,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
         } else {
             b.matmul(x, w)
         };
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         // require the tiled path (else we'd be fuzzing the naive kernel, not the tiled one under test), on the
         // graph `compile` actually plans.
         let program = compile(
@@ -1155,7 +1155,7 @@ fn synthesized_tiled_gemm_choice_matches_cpu() {
             HostTensor::f32(vec![k, n], fill(seed * 7 + 2, k * n)),
         );
         let out = b.matmul(x, w);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
             matches!(op, OpKind::MatMul)
@@ -1213,9 +1213,9 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(x, w);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let eqn = g
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .unwrap();
@@ -1331,9 +1331,9 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
             w.id(),
             HostTensor::f32(wshape.clone(), fill(seed * 7 + 2, wshape.iter().product())),
         );
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .unwrap();
@@ -1412,7 +1412,7 @@ fn tiled_gemm_then_bias_add_gpu_matches_cpu() {
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let out = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
     let (xi, wi, bi) = (x.id(), w.id(), bias.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let choice = compiled_choice(&g, &spirv_fixture_target(), |op| {
         matches!(
             op,
@@ -1478,7 +1478,7 @@ fn batched_tiled_gemm_gpu_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![e, k, n]));
     let out = b.matmul(x, w);
     let (xi, wi) = (x.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd: Vec<f32> = (0..e * m * k)
         .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
@@ -1534,7 +1534,7 @@ fn rank4_batched_tiled_gemm_gpu_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![bb, h, k, n]));
     let out = b.matmul(x, w);
     let (xi, wi) = (x.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd: Vec<f32> = (0..bb * h * m * k)
         .map(|i| ((i % 11) as f32) * 0.07 - 0.35)
@@ -1587,9 +1587,9 @@ fn nvptx_prefill_tiled_gemm_plan_selection() {
         let x = b.constant("x", TensorType::f32(vec![m, 64]));
         let w = b.constant("w", TensorType::f32(vec![64, n]));
         let out = b.matmul(x, w);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .unwrap();

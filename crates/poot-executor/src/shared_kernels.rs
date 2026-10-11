@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 use poot_codegen::{ArtifactTooLarge, CompileError};
-use poot_target::Backend;
+use poot_target::TargetId;
 
 /// Compiled kernel artifacts, keyed by the kernel body's content fingerprint
 /// (`poot_codegen::KernelKey::fingerprint`, the same key `Engine::kernel` indexes by), shared by every
@@ -14,34 +14,37 @@ use poot_target::Backend;
 /// The startup fit plans many candidates, each through its own planning `Engine`; the candidates draw on
 /// largely the same kernels, so one table resolves each distinct kernel through the kernel cache once
 /// and every later candidate reuses the bytes. Clones share the table. An artifact depends on the backend
-/// it was compiled for, so the table is bound to one [`Backend`] and an engine of another is refused; the
+/// it was compiled for, so the table is bound to one [`TargetId`] and an engine of another is refused; the
 /// per-program artifact limit is checked again on every hit. An engine without a table keeps no artifacts
 /// at all: the executing engine's cache behavior is unchanged.
 #[derive(Clone, Debug)]
 pub struct SharedKernels {
-    backend: Backend,
+    target: TargetId,
     artifacts: Arc<Mutex<HashMap<u64, Arc<[u8]>>>>,
 }
 
-/// An engine for one backend was given a [`SharedKernels`] bound to another.
+/// An engine was given a [`SharedKernels`] it cannot use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("shared kernels are bound to {table:?}; this engine drives {engine:?}")]
-pub struct SharedKernelsMismatch {
-    pub table: Backend,
-    pub engine: Backend,
+pub enum SharedKernelsMismatch {
+    /// The table is bound to another target than the engine's.
+    #[error("shared kernels are bound to {table:?}; this engine drives {engine:?}")]
+    Target { table: TargetId, engine: TargetId },
+    /// The table holds byte artifacts, and an AIE engine's kernels are linked artifacts.
+    #[error("shared kernels hold byte artifacts; the AIE engine for {engine:?} links its kernels")]
+    LinkedArtifacts { engine: TargetId },
 }
 
 impl SharedKernels {
-    /// An empty table for engines driving `backend`.
-    pub fn new(backend: Backend) -> Self {
+    /// An empty table for engines driving `target`.
+    pub fn new(target: TargetId) -> Self {
         Self {
-            backend,
+            target,
             artifacts: Arc::default(),
         }
     }
 
-    pub fn backend(&self) -> Backend {
-        self.backend
+    pub fn target(&self) -> TargetId {
+        self.target
     }
 
     /// The artifact for `fingerprint` and whether `resolve` ran for it. `resolve` runs under the table's

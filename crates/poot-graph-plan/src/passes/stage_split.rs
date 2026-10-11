@@ -60,12 +60,8 @@ use std::ops::Range;
 
 use poot_graph_ir::Operand;
 use poot_graph_ir::ValueTable;
-use poot_graph_ir::error::GraphValidationError;
-use poot_graph_ir::graph::ValueId;
-use poot_graph_ir::graph::{
-    BoundaryId, Eqn, Export, Graph, LayerTagError, NoValidations, Slot, ValidationChannel,
-    ValueMeta,
-};
+use poot_graph_ir::graph::{BoundaryId, Eqn, Export, Graph, LayerTagError, Slot, ValueMeta};
+use poot_graph_ir::graph::{EditError, GraphEdit, ValueId, WitnessLedger};
 use poot_graph_ir::types::TensorType;
 
 /// Where one stage ends and the next begins.
@@ -102,11 +98,8 @@ impl StageAssignment {
     /// Cut `g` at `sites`, in order: `sites.len() + 1` stages. Every site resolves to the first
     /// equation of the stage it opens; those positions must lie strictly inside the equation list
     /// and strictly increase, so no stage is empty.
-    pub(crate) fn from_sites<V: ValidationChannel>(
-        g: &Graph<V>,
-        sites: &[CutSite],
-    ) -> Result<Self, StageSplitError> {
-        let eqn_count = g.eqns.len();
+    pub(crate) fn from_sites(g: &Graph, sites: &[CutSite]) -> Result<Self, StageSplitError> {
+        let eqn_count = g.eqns().len();
         let runs = if sites.iter().any(|s| matches!(s, CutSite::AfterLayer(_))) {
             Some(g.layer_runs()?)
         } else {
@@ -238,14 +231,14 @@ pub struct BoundaryDescriptor {
 /// ([`Graph::exports`], in producing-equation order; each is an input of the stages in
 /// [`BoundaryDescriptor::consuming_stages`]).
 #[derive(Clone, Debug)]
-pub(crate) struct StageGraph<V: ValidationChannel = NoValidations> {
-    pub graph: Graph<V>,
+pub(crate) struct StageGraph {
+    pub graph: Graph,
 }
 
 /// The result of [`split_stages`]: one graph per stage plus the values that cross between them.
 #[derive(Clone, Debug)]
-pub(crate) struct StageSplit<V: ValidationChannel = NoValidations> {
-    pub stages: Vec<StageGraph<V>>,
+pub(crate) struct StageSplit {
+    pub stages: Vec<StageGraph>,
     pub boundaries: Vec<BoundaryDescriptor>,
 }
 
@@ -253,27 +246,29 @@ pub(crate) struct StageSplit<V: ValidationChannel = NoValidations> {
 ///
 /// Every equation lands in exactly one stage; each crossing value becomes an explicit export of its
 /// producing stage and an explicit input of its consumers; carried state stays with one stage. Each
-/// returned stage graph passes [`Graph::validate`].
-pub(crate) fn split_stages<V: ValidationChannel>(
-    g: &Graph<V>,
+/// returned stage graph is a checked [`Graph`]; the witnesses of `g` are accounted across the stages
+/// by a [`WitnessLedger`], so a split cannot silently shed one.
+pub(crate) fn split_stages(
+    g: &Graph,
     assignment: &StageAssignment,
-) -> Result<StageSplit<V>, StageSplitError> {
-    g.validate()?;
-    if assignment.equation_count() != g.eqns.len() {
+) -> Result<StageSplit, StageSplitError> {
+    if assignment.equation_count() != g.eqns().len() {
         return Err(StageSplitError::AssignmentLength {
             assigned: assignment.equation_count(),
-            eqn_count: g.eqns.len(),
+            eqn_count: g.eqns().len(),
         });
     }
     let stage_count = assignment.stage_count();
     let ranges = assignment.stage_ranges();
+    let state_pairs: Vec<(ValueId, ValueId)> = g.state().collect();
+    let mut ledger = WitnessLedger::of(g);
 
     // Which stage defines each value, and which stages read it. A value with no defining equation is
     // a graph input binder: every stage that reads it binds it itself, so it never crosses.
-    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
     let mut readers: ValueTable<BTreeSet<usize>> =
-        ValueTable::filled(g.values.len(), BTreeSet::new());
-    for (equation, eqn) in g.eqns.iter().enumerate() {
+        ValueTable::filled(g.values().len(), BTreeSet::new());
+    for (equation, eqn) in g.eqns().iter().enumerate() {
         let stage = assignment.stage_of(equation);
         producer[eqn.out] = Some(stage);
         for operand in &eqn.inputs {
@@ -298,7 +293,7 @@ pub(crate) fn split_stages<V: ValidationChannel>(
     let pair_stage = state_pair_stages(g, &producer, &readers)?;
 
     let mut boundaries = Vec::new();
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         if !consuming_stages.contains_key(&eqn.out) {
             continue;
         }
@@ -329,15 +324,15 @@ pub(crate) fn split_stages<V: ValidationChannel>(
         stage_exports[boundary.producing_stage].push(boundary.id.0);
     }
 
-    let mut input_binder = ValueTable::filled(g.values.len(), false);
-    for &value in &g.inputs {
+    let mut input_binder = ValueTable::filled(g.values().len(), false);
+    for &value in g.inputs() {
         input_binder[value] = true;
     }
 
     let mut stages = Vec::with_capacity(stage_count);
     for (stage, range) in ranges.iter().enumerate() {
         let final_stage = stage + 1 == stage_count;
-        let eqns = &g.eqns[range.clone()];
+        let eqns = &g.eqns()[range.clone()];
 
         // What this stage binds: the graph inputs its own equations read, the carried state it owns,
         // the values earlier stages hand it, and (on the final stage) the graph output when that is
@@ -353,18 +348,18 @@ pub(crate) fn split_stages<V: ValidationChannel>(
             }
         }
         for &pair in &stage_state_pairs[stage] {
-            let (state_input, state_output) = g.state[pair];
+            let (state_input, state_output) = state_pairs[pair];
             bound.insert(state_input);
             if input_binder[state_output] {
                 bound.insert(state_output);
             }
         }
-        if final_stage && input_binder[g.output] {
-            bound.insert(g.output);
+        if final_stage && input_binder[g.result()] {
+            bound.insert(g.result());
         }
 
         let output = if final_stage {
-            g.output
+            g.result()
         } else {
             eqns.iter()
                 .rev()
@@ -377,15 +372,14 @@ pub(crate) fn split_stages<V: ValidationChannel>(
         let mut defined: BTreeSet<ValueId> = bound.clone();
         defined.extend(stage_boundary_inputs[stage].iter().copied());
         defined.extend(eqns.iter().map(|eqn| eqn.out));
-        if final_stage && !defined.contains(&g.output) {
+        if final_stage && !defined.contains(&g.result()) {
             return Err(StageSplitError::FinalStageMissingOutput {
                 stage,
-                output: g.output,
+                output: g.result(),
             });
         }
         let witnesses: Vec<ValueId> = g
-            .validation_outputs()
-            .iter()
+            .witnesses()
             .map(|declaration| declaration.value)
             .filter(|value| defined.contains(value))
             .collect();
@@ -399,7 +393,7 @@ pub(crate) fn split_stages<V: ValidationChannel>(
             }));
         }
         for &pair in &stage_state_pairs[stage] {
-            used.insert(g.state[pair].1);
+            used.insert(state_pairs[pair].1);
         }
         used.insert(output);
         used.extend(witnesses.iter().copied());
@@ -411,13 +405,13 @@ pub(crate) fn split_stages<V: ValidationChannel>(
             let meta = if stage_boundary_inputs[stage].binary_search(&old).is_ok() {
                 ValueMeta::boundary_input(g.aval(old).clone(), BoundaryId(old))
             } else {
-                g.values[old].clone()
+                g.values()[old].clone()
             };
             renumber.insert(old, values.push(meta));
         }
         let new = |old: ValueId| renumber[&old];
         let mut inputs: Vec<ValueId> = g
-            .inputs
+            .inputs()
             .iter()
             .copied()
             .filter(|value| bound.contains(value))
@@ -425,14 +419,14 @@ pub(crate) fn split_stages<V: ValidationChannel>(
             .collect();
         inputs.extend(stage_boundary_inputs[stage].iter().copied().map(new));
         let consts: Vec<ValueId> = g
-            .consts
+            .consts()
             .iter()
             .copied()
             .filter(|value| bound.contains(value))
             .map(new)
             .collect();
         let mut slots: Vec<(ValueId, Slot)> = g
-            .slots
+            .slots()
             .iter()
             .copied()
             .filter(|(value, _)| bound.contains(value))
@@ -459,42 +453,43 @@ pub(crate) fn split_stages<V: ValidationChannel>(
                 layer: eqn.layer,
             })
             .collect();
-        let state: Vec<(ValueId, ValueId)> = stage_state_pairs[stage]
-            .iter()
-            .map(|&pair| g.state[pair])
-            .collect();
-        let exports: Vec<Export> = stage_exports[stage]
-            .iter()
-            .map(|&value| Export {
+        // Roots and witnesses are in the uncut graph's ids; the stage's tables are renumbered, so
+        // every output is declared through `new`. Exports keep their uncut-graph boundary id.
+        let mut piece = GraphEdit::new();
+        *piece.values_mut() = values;
+        *piece.inputs_mut() = inputs;
+        *piece.consts_mut() = consts;
+        *piece.slots_mut() = slots;
+        *piece.eqns_mut() = eqns;
+        piece.set_result(new(output));
+        for witness in g.witnesses() {
+            if witnesses.contains(&witness.value) {
+                piece.push_witness(witness.id, witness.name, new(witness.value));
+            }
+        }
+        for &value in &stage_exports[stage] {
+            piece.push_export(Export {
                 id: BoundaryId(value),
-                value,
-            })
-            .collect();
-
-        // Roots and witnesses are still in the uncut graph's ids; one remap moves them all.
-        let mut graph = Graph {
-            values,
-            inputs,
-            consts,
-            slots,
-            eqns,
-            output,
-            validations: g.validations.clone(),
-            exports,
-            state: state
-                .into_iter()
-                .map(|(state_input, state_output)| (new(state_input), state_output))
-                .collect(),
-        };
-        graph.retain_validations(|declaration| witnesses.contains(&declaration.value));
-        graph.remap_results(new);
-        graph
-            .validate()
+                value: new(value),
+            });
+        }
+        for &pair in &stage_state_pairs[stage] {
+            let (state_input, state_output) = state_pairs[pair];
+            piece.push_state(new(state_input), new(state_output));
+        }
+        let graph = piece
+            .commit_piece(&mut ledger)
             .map_err(|source| StageSplitError::InvalidStage { stage, source })?;
 
         stages.push(StageGraph { graph });
     }
 
+    ledger
+        .finish()
+        .map_err(|source| StageSplitError::InvalidStage {
+            stage: stages.len(),
+            source,
+        })?;
     Ok(StageSplit { stages, boundaries })
 }
 
@@ -502,13 +497,13 @@ pub(crate) fn split_stages<V: ValidationChannel>(
 ///
 /// A pair is owned by the equations that touch it: the producer of `state_out` and every reader of
 /// `state_in`/`state_out` must agree. A pair no equation touches is inert and stays with stage 0.
-fn state_pair_stages<V: ValidationChannel>(
-    g: &Graph<V>,
+fn state_pair_stages(
+    g: &Graph,
     producer: &ValueTable<Option<usize>>,
     readers: &ValueTable<BTreeSet<usize>>,
 ) -> Result<Vec<usize>, StageSplitError> {
-    let mut owners = Vec::with_capacity(g.state.len());
-    for (pair, &(state_input, state_output)) in g.state.iter().enumerate() {
+    let mut owners = Vec::new();
+    for (pair, (state_input, state_output)) in g.state().enumerate() {
         let mut stages = BTreeSet::new();
         if let Some(stage) = producer[state_output] {
             stages.insert(stage);
@@ -548,8 +543,6 @@ fn tensor_byte_len(aval: &TensorType, value: ValueId) -> Result<usize, StageSpli
 /// classify a bad split without parsing diagnostics.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StageSplitError {
-    #[error("input graph is invalid: {0}")]
-    InvalidGraph(#[from] GraphValidationError),
     #[error("stage assignment covers {assigned} equations but the graph has {eqn_count}")]
     AssignmentLength { assigned: usize, eqn_count: usize },
     #[error("stage assignment is empty")]
@@ -605,7 +598,7 @@ pub enum StageSplitError {
     InvalidStage {
         stage: usize,
         #[source]
-        source: GraphValidationError,
+        source: EditError,
     },
 }
 
@@ -637,7 +630,7 @@ mod tests {
         let whole = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .expect("the whole graph evaluates");
         assert!(
-            !graph.state.is_empty(),
+            graph.state().next().is_some(),
             "a decode step carries its KV cache"
         );
         assert!(
@@ -665,13 +658,10 @@ mod tests {
             );
             assert_eq!(
                 chained.state.len(),
-                graph.state.len(),
+                graph.state().count(),
                 "cut {k}: every pair is owned"
             );
-            for (pair, (got, expected)) in graph
-                .state
-                .iter()
-                .zip(chained.state.iter().zip(&whole.state))
+            for (pair, (got, expected)) in graph.state().zip(chained.state.iter().zip(&whole.state))
             {
                 assert_eq!(
                     bits(got),

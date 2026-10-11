@@ -489,7 +489,7 @@ mod tests {
                 let out = pick(&mix);
                 Fx::new(0)
                     .eval(
-                        &b.finish(out),
+                        &b.finish(out).unwrap(),
                         &[
                             ("x", &x),
                             ("projection", &projection),
@@ -559,7 +559,7 @@ mod tests {
         );
         let got = Fx::new(0)
             .eval(
-                &b.finish(y),
+                &b.finish(y).unwrap(),
                 &[("post", &post), ("comb", &comb), ("out", &out), ("x", &x)],
                 &[],
                 &[],
@@ -611,7 +611,7 @@ mod tests {
         );
         let got = Fx::new(0)
             .eval(
-                &b.finish(y),
+                &b.finish(y).unwrap(),
                 &[
                     ("x", &x),
                     ("projection", &projection),
@@ -648,7 +648,9 @@ mod tests {
         let b = Builder::new();
         let xs = b.constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH]));
         let collapsed = w.pre(&b, xs, &p).collapsed;
-        let got = fx.eval(&b.finish(collapsed), &[("x", &x)], &[], &[]).0;
+        let got = fx
+            .eval(&b.finish(collapsed).unwrap(), &[("x", &x)], &[], &[])
+            .0;
         let stored = fx.values(id(MhcRole::AttnFn)); // [mix][hc * width]
         let mut projection = vec![0.0f32; HC * WIDTH * mix]; // [in][out]
         for o in 0..mix {

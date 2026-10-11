@@ -550,7 +550,7 @@ mod needs_tests {
         let a = b.constant("a", TensorType::new(vec![batch, m, k], DType::F32));
         let w = b.constant("w", TensorType::new(vec![k, n], weight));
         let out = poot_graph_ir::ops::linear(&b, a, w, None);
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     fn is_matmul(op: &OpKind) -> bool {
@@ -591,7 +591,7 @@ mod needs_tests {
                 .then(|| b.constant("top_k", TensorType::new(vec![SAMPLE_ROWS], DType::I32)));
             b.sample_token(rule, logits, Some(noise), Some(params), top_k)
         };
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// Each sampler's declared vocabulary work is `rows * lanes` threads of `passes * ceil(vocab / lanes)`
@@ -619,7 +619,7 @@ mod needs_tests {
             };
             let graph = sample_graph(rule);
             let eqn = graph
-                .eqns
+                .eqns()
                 .iter()
                 .find(|e| is_sample_token(&e.op))
                 .expect("fixture has a SampleToken equation");
@@ -629,7 +629,7 @@ mod needs_tests {
                 crate::plan_eqn_compiled(
                     &graph,
                     eqn,
-                    &Target { backend, caps },
+                    &Target::Gpu { backend, caps },
                     &HashMap::new(),
                     &poot_test_util::graph_fixtures::roomy_body_limits(),
                 )
@@ -695,7 +695,7 @@ mod needs_tests {
             let q = b.constant("q", TensorType::new(vec![1, 14, 64, 64], DType::F32));
             let kt = b.constant("kt", TensorType::new(vec![1, 14, 64, 64], DType::F32));
             let out = b.matmul(q, kt);
-            b.finish(out)
+            b.finish(out).unwrap()
         };
         // A batched decode projection past the NVPTX GEMV's width gate: not a decode GEMV, and its
         // `[B, 1, N]` output has no tileable M, so the shipped tiled GEMM plans it.
@@ -741,7 +741,7 @@ mod needs_tests {
         } in fixtures
         {
             let eqn = graph
-                .eqns
+                .eqns()
                 .iter()
                 .find(|e| is_eqn(&e.op))
                 .unwrap_or_else(|| panic!("{kernel:?}: fixture has no matching equation"));
@@ -749,7 +749,7 @@ mod needs_tests {
                 crate::plan_eqn_compiled(
                     &graph,
                     eqn,
-                    &Target { backend, caps },
+                    &Target::Gpu { backend, caps },
                     &HashMap::new(),
                     &poot_test_util::graph_fixtures::roomy_body_limits(),
                 )

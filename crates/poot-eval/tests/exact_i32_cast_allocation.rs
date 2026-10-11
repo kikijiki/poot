@@ -132,7 +132,7 @@ fn selected_cast_allocates_only_its_published_result() {
             .unwrap();
     let selected = builder.gather(table, 0, index);
     let cast = builder.cast(selected, DType::F32);
-    let graph = builder.finish(cast);
+    let graph = builder.finish(cast).unwrap();
 
     let table_words: Arc<[i32]> = (0..SELECTED).map(|row| (row % 3) as i32).collect();
     let index_words: Arc<[i32]> = (0..SELECTED)

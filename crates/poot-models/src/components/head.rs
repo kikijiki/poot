@@ -50,7 +50,7 @@ mod tests {
         let b = Builder::new();
         let xs = b.constant("x", TensorType::f32(vec![t, w]));
         let y = head.logits(&b, xs);
-        fx.eval(&b.finish(y), &[("x", x)], &[], &[]).0
+        fx.eval(&b.finish(y).unwrap(), &[("x", x)], &[], &[]).0
     }
 
     fn reference(x: &[f32], table: &[f32], vocab: usize, w: usize) -> Vec<f64> {

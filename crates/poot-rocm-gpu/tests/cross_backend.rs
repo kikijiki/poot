@@ -40,7 +40,7 @@ fn run_once_rocm(
     inputs: &HashMap<ValueId, Value>,
 ) -> HostTensor {
     let mut builder = WeightStore::builder();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage != Storage::Const {
             panic!(
@@ -60,7 +60,7 @@ fn run_once_rocm(
     let store = Arc::new(builder.build());
     let mut weights = ConstWeights::new(&store);
     let staged = {
-        let g = weights.graph(g).with_validations(Vec::new());
+        let g = weights.graph(g);
         poot_graph_plan::compile_staged(
             &g,
             &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -91,7 +91,7 @@ fn run_once_rocm(
         .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    HostTensor::f32(g.aval(g.output).shape.clone(), data)
+    HostTensor::f32(g.aval(g.result()).shape.clone(), data)
 }
 
 fn fill(seed: u64, count: usize) -> Vec<f32> {
@@ -197,7 +197,7 @@ fn elementwise_add_rocm_matches_cpu() {
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Add, a, c);
     let (ai, ci) = (a.id(), c.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let ad = fill(42, n);
     let cd = fill(99, n);
@@ -229,7 +229,7 @@ fn elementwise_mul_rocm_matches_cpu() {
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Mul, a, c);
     let (ai, ci) = (a.id(), c.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = make_inputs(&[(ai, vec![n], fill(201, n)), (ci, vec![n], fill(202, n))]);
 
@@ -258,7 +258,7 @@ fn elementwise_neg_rocm_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![n]));
     let out = b.unary(UnOp::Neg, x);
     let xi = x.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = make_inputs(&[(xi, vec![n], fill(301, n))]);
 
@@ -291,7 +291,7 @@ fn matmul_rocm_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(a, w);
     let (ai, wi) = (a.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = make_inputs(&[
         (ai, vec![m, k], fill(401, m * k)),
@@ -325,7 +325,7 @@ fn reduce_sum_rocm_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let out = b.reduce(RedOp::Sum, x, 1, false);
     let xi = x.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = make_inputs(&[(xi, vec![rows, cols], fill(501, rows * cols))]);
 
@@ -355,7 +355,7 @@ fn reduce_max_last_axis_rocm_matches_cpu() {
     let x = b.constant("x", TensorType::f32(vec![rows, cols]));
     let out = b.reduce(RedOp::Max, x, 1, false);
     let xi = x.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = make_inputs(&[(xi, vec![rows, cols], fill(511, rows * cols))]);
 
@@ -392,7 +392,7 @@ fn reduce_sum_nonpow2_wide_real_magnitude_rocm_matches_cpu() {
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Sum, x, 1, false);
         let xi = x.id();
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let data = fill_real_magnitude(820 + i as u64, rows * cols);
         let inputs = make_inputs(&[(xi, vec![rows, cols], data.clone())]);
@@ -442,7 +442,7 @@ fn reduce_max_nonpow2_wide_real_magnitude_rocm_matches_cpu() {
         let x = b.constant("x", TensorType::f32(vec![rows, cols]));
         let out = b.reduce(RedOp::Max, x, 1, false);
         let xi = x.id();
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let data = fill_real_magnitude(920 + i as u64, rows * cols);
         let inputs = make_inputs(&[(xi, vec![rows, cols], data.clone())]);
@@ -495,7 +495,7 @@ fn rmsnorm_rocm_matches_cpu() {
     let w = b.constant("w", TensorType::f32(vec![n]));
     let out = poot_graph_ir::ops::rmsnorm(&b, x, w, 1e-6);
     let (xi, wi) = (x.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd = fill_real_magnitude(931, n);
     // Weights stay near typical learned-scale magnitude (not +-30).
@@ -529,7 +529,7 @@ fn layernorm_rocm_matches_cpu() {
     let bias = b.constant("bias", TensorType::f32(vec![n]));
     let out = poot_graph_ir::ops::layernorm(&b, x, w, bias, 1e-6);
     let (xi, wi, bi) = (x.id(), w.id(), bias.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let xd = fill_real_magnitude(941, n);
     let wd: Vec<f32> = fill(942, n).iter().map(|v| 1.0 + v.abs()).collect();
@@ -568,7 +568,7 @@ fn non_power_of_2_rocm_matches_cpu() {
     let c = b.constant("c", TensorType::f32(vec![n]));
     let out = b.binary(BinOp::Add, a, c);
     let (ai, ci) = (a.id(), c.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = make_inputs(&[(ai, vec![n], fill(601, n)), (ci, vec![n], fill(602, n))]);
 
@@ -599,7 +599,7 @@ fn single_element_rocm_matches_cpu() {
     let c = b.constant("c", TensorType::f32(vec![1]));
     let out = b.binary(BinOp::Add, a, c);
     let (ai, ci) = (a.id(), c.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = make_inputs(&[(ai, vec![1], vec![3.5]), (ci, vec![1], vec![2.5])]);
 
@@ -637,7 +637,7 @@ fn dynamic_update_slice_rocm_matches_cpu() {
     let update = b.constant("update", TensorType::f32(vec![1, cols]));
     let out = b.dynamic_update_slice(operand, update, index, 0);
     let (oi, ui) = (operand.id(), update.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = make_inputs(&[
         (oi, vec![rows, cols], fill(701, rows * cols)),
@@ -680,7 +680,7 @@ fn gather_axis0_rocm_matches_cpu() {
     );
     let out = b.gather(data, 0, idx);
     let (di, ii) = (data.id(), idx.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let mut inputs = make_inputs(&[(di, vec![n, d], fill(901, n * d))]);
     inputs.insert(ii, HostTensor::i32(vec![idx_count], vec![3, 0, 6]).into());
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -727,7 +727,7 @@ fn i32_table_gather_is_exact_beyond_f32_rocm() {
     let store = Arc::new(builder.build());
     let mut weights = ConstWeights::new(&store);
     let staged = {
-        let g = weights.graph(&g).with_validations(Vec::new());
+        let g = weights.graph(&g);
         poot_graph_plan::compile_staged(
             &g,
             &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -749,7 +749,7 @@ fn i32_table_gather_is_exact_beyond_f32_rocm() {
     let tokens = fixture::tokens();
     let token_bytes: Vec<u8> = tokens.iter().flat_map(|w| w.to_le_bytes()).collect();
     let key = g
-        .inputs
+        .inputs()
         .iter()
         .find_map(|&id| g.meta(id).slot_key().cloned())
         .expect("the token slot");
@@ -789,7 +789,7 @@ fn matmul_bias_rocm_matches_cpu() {
     let mm = b.matmul(a, w);
     let out = b.binary(BinOp::Add, mm, bias);
     let (ai, wi, bi) = (a.id(), w.id(), bias.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inputs = make_inputs(&[
         (ai, vec![m, k], fill(401, m * k)),
         (wi, vec![k, n], fill(402, k * n)),
@@ -822,7 +822,7 @@ fn unary_rocm_case(op: UnOp, xd: Vec<f32>, label: &str) {
     let x = b.constant("x", TensorType::f32(vec![n]));
     let out = b.unary(op, x);
     let xi = x.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inputs = make_inputs(&[(xi, vec![n], xd)]);
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
@@ -891,7 +891,7 @@ fn unary_transcendental_rocm(op: UnOp, label: &str, saturates_at: f32) {
     let x = b.constant("x", TensorType::f32(vec![n]));
     let out = b.unary(op, x);
     let xi = x.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inputs = make_inputs(&[(xi, vec![n], TRANSCENDENTAL_TABLE.to_vec())]);
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
@@ -938,7 +938,7 @@ fn broadcast_binary_rocm_matches_cpu() {
     let bias = b.constant("bias", TensorType::f32(vec![cols]));
     let out = b.binary(BinOp::Add, a, bias);
     let (ai, bi) = (a.id(), bias.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inputs = make_inputs(&[
         (ai, vec![batch, rows, cols], fill(601, batch * rows * cols)),
         (bi, vec![cols], fill(602, cols)),
@@ -969,7 +969,7 @@ fn transpose_slice_rocm_matches_cpu() {
     let t = b.transpose(x, vec![1, 0]); // [c, r] = [4, 8]
     let s = b.slice(t, 1, 2, 6); // axis 1 has size r=8; 2..6 valid
     let xi = x.id();
-    let g = b.finish(s);
+    let g = b.finish(s).unwrap();
     let inputs = make_inputs(&[(xi, vec![r, c], fill(701, r * c))]);
     let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
         .unwrap()
@@ -999,7 +999,7 @@ fn elementwise_sub_div_rocm_matches_cpu() {
     let sub = b.binary(BinOp::Sub, a, c);
     let out = b.binary(BinOp::Div, sub, c);
     let (ai, ci) = (a.id(), c.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     // c is strictly nonzero to avoid div-by-zero.
     let mut cd = fill(802, n);
     for v in cd.iter_mut() {
@@ -1036,7 +1036,7 @@ fn masked_attention_rocm_matches_cpu() {
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let inputs = make_inputs(&[
         (qi, vec![1, hq, 1, d], fill(501, hq * d)),
         (ki, vec![1, hkv, cap, d], fill(502, hkv * cap * d)),
@@ -1074,7 +1074,7 @@ fn decomposed_prefill_attention_over_65535_query_groups_rocm_matches_cpu() {
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
     let out = attention_prefill(&b, q, k, v, 1, 0.3, mask);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let causal: Vec<f32> = (0..l * l)
         .map(|i| if i % l <= i / l { 0.0 } else { -1.0e9 })
         .collect();
@@ -1126,7 +1126,7 @@ fn sample_token_greedy_rocm_matches_cpu() {
         None,
     );
     let li = logits.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let mut data = vec![0f32; rows * vocab];
     for row in 0..rows {
@@ -1168,7 +1168,7 @@ fn sample_token_greedy_rocm_matches_cpu() {
     let store = Arc::new(builder.build());
     let mut weights = ConstWeights::new(&store);
     let staged = {
-        let g = weights.graph(&g).with_validations(Vec::new());
+        let g = weights.graph(&g);
         poot_graph_plan::compile_staged(
             &g,
             &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -1227,7 +1227,7 @@ fn random_uniform_rocm_matches_cpu() {
         TensorType::new(vec![rows], DType::I32),
     );
     let out = b.random_uniform(seed, cols);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let seed_data: Vec<i32> = vec![0, 1, 0xDEADBEEFu32 as i32];
     let inputs: HashMap<ValueId, Value> = HashMap::from([(
@@ -1241,7 +1241,7 @@ fn random_uniform_rocm_matches_cpu() {
         .unwrap();
 
     let staged = {
-        let g = g.clone().with_validations(Vec::new());
+        let g = g.clone();
         poot_graph_plan::compile_staged(
             &g,
             &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -1309,7 +1309,7 @@ fn run_gumbel_family_contract_rocm(
     let store = Arc::new(builder.build());
     let mut weights = ConstWeights::new(&store);
     let staged = {
-        let g = weights.graph(g).with_validations(Vec::new());
+        let g = weights.graph(g);
         poot_graph_plan::compile_staged(
             &g,
             &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -1379,7 +1379,7 @@ fn sample_token_gumbel_rocm_matches_cpu() {
         None,
     );
     let (li, ni, pi) = (logits.id(), noise.id(), params.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let mut logits_data = vec![-5.0f32; rows * vocab];
     logits_data[0] = 10.0;
@@ -1464,7 +1464,7 @@ fn sample_token_gumbel_topk_rocm_matches_cpu() {
         Some(top_k),
     );
     let (li, ni, pi) = (logits.id(), noise.id(), params.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let mut logits_data = vec![0.0f32; rows * vocab];
     logits_data[3] = 10.0;
@@ -1546,7 +1546,7 @@ fn sample_token_gumbel_topk_topp_rocm_matches_cpu() {
         Some(top_k),
     );
     let (li, ni, pi) = (logits.id(), noise.id(), params.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let mut logits_data = vec![-100.0f32; rows * vocab];
     logits_data[2] = 9.0;
@@ -1633,7 +1633,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_rocm_matches_cpu() 
         Some(top_k),
     );
     let (li, ni, pi) = (logits.id(), noise.id(), params.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let mut logits_data = vec![-100.0f32; rows * vocab];
     logits_data[2] = 9.0;
@@ -1722,7 +1722,7 @@ fn run_under(
         .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
     let staged = poot_graph_plan::compile_staged(
-        &named.with_validations(Vec::new()),
+        &named,
         &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
         &poot_graph_plan::Partition {
             experts: poot_graph_plan::ExpertPlacement::AllResident,
@@ -1742,7 +1742,7 @@ fn run_under(
         .unwrap();
     engine.remove_entry(exe, entry).unwrap();
     engine.unload(exe).unwrap();
-    let out = g.aval(g.output);
+    let out = g.aval(g.result());
     let words = || -> Vec<u16> {
         bytes
             .as_chunks::<2>()
@@ -1784,7 +1784,7 @@ fn assert_fuses_into_one_epilogue(
     .expect("the graph compiles");
     let heads: Vec<_> = fused
         .graph()
-        .eqns
+        .eqns()
         .iter()
         .filter_map(|eqn| match &eqn.op {
             poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
@@ -1795,7 +1795,7 @@ fn assert_fuses_into_one_epilogue(
         heads,
         [head],
         "one fused contraction: {:?}",
-        fused.graph().eqns
+        fused.graph().eqns()
     );
 }
 
@@ -1868,7 +1868,7 @@ fn a_dense_gemv_epilogue_matches_the_oracle_on_rocm() {
         (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
         (residual.id(), HostTensor::f32(vec![1, 1, n], fill(4, n))),
     ]);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     assert_fuses_into_one_epilogue(
         &g,
         &target,
@@ -1916,7 +1916,7 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_rocm() {
                 (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
                 (residual.id(), HostTensor::f32(vec![m, n], fill(4, m * n))),
             ]);
-            let g = b.finish(out);
+            let g = b.finish(out).unwrap();
             assert_fuses_into_one_epilogue(
                 &g,
                 &target,
@@ -1958,7 +1958,7 @@ fn a_serial_matmul_epilogue_matches_the_oracle_on_rocm() {
             HostTensor::f32(vec![1, 2, 3, 5], fill(14, 30)),
         ),
     ]);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
     assert_fused_matches_oracle(&mut rocm, target, &g, &inputs, "serial matmul epilogue");
 }
@@ -1987,7 +1987,7 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_rocm() {
             (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
             (residual.id(), HostTensor::f32(vec![m, n], fill(4, m * n))),
         ]);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
         assert_fused_matches_oracle(
             &mut rocm,
@@ -2031,7 +2031,7 @@ fn a_narrow_head_rounds_before_its_residual_on_rocm() {
             (w.id(), tensor(&[2, 1], vec![one, tie])),
             (residual.id(), tensor(&[1, 1], vec![minus_one])),
         ]);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
         let got = assert_fused_matches_oracle(
             &mut rocm,
@@ -2071,7 +2071,7 @@ fn every_step_of_a_narrow_epilogue_rounds_through_its_dtype_on_rocm() {
         (w.id(), HostTensor::bf16(vec![1, 1], vec![one])),
         (leaf.id(), HostTensor::bf16(vec![1, 1], vec![tie])),
     ]);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     assert_fuses_into_one_epilogue(&g, &target, poot_graph_ir::op::ContractionHead::MatMul);
     let got = assert_fused_matches_oracle(&mut rocm, target, &g, &inputs, "bf16 multistage");
     assert_eq!(got.to_f32().unwrap().as_ref(), [1.0]);

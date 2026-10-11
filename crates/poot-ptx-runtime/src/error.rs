@@ -9,7 +9,7 @@ pub enum PtxError {
     /// A dispatch was given a [`poot_runtime_common::CompiledKernel`] compiled for a different backend
     /// (card 608): this runtime only ever dispatches an `Nvptx`-compiled kernel.
     #[error("PTX dispatch requires an Nvptx-compiled kernel, got one compiled for {actual:?}")]
-    WrongKernelTarget { actual: poot_target::Backend },
+    WrongKernelTarget { actual: poot_target::TargetId },
     /// The bound buffers did not meet the compiled kernel's argument schema (card 608, SC-002): a typed
     /// release-build error before any submission.
     #[error("kernel argument schema violation: {0}")]

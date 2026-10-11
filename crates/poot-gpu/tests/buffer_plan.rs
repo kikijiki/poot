@@ -37,7 +37,7 @@ use std::sync::Arc;
 use poot_executor::{Arg, BufferRole, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
 use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::op::RedOp;
-use poot_graph_ir::{Builder, TensorType, ValidationOutputs};
+use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
@@ -48,7 +48,7 @@ use poot_target::BufferStorage;
 use poot_tensor::DType;
 use poot_test_util::assert_close_rel;
 
-type Graph = poot_graph_ir::Graph<ValidationOutputs>;
+type Graph = poot_graph_ir::Graph;
 
 const K: usize = 64;
 
@@ -71,7 +71,7 @@ fn fixture() -> (Graph, Vec<f32>, Vec<f32>, f32) {
     let v2 = builder.binary(poot_graph_ir::op::BinOp::Add, tc, tc);
     let s2 = builder.reduce(RedOp::Max, v2, 0, true);
     let out = builder.binary(poot_graph_ir::op::BinOp::Add, s1, s2);
-    (builder.finish(out).with_validations(Vec::new()), a, b, c)
+    (builder.finish(out).unwrap(), a, b, c)
 }
 
 fn store(a: &[f32], b: &[f32], c: f32) -> Arc<WeightStore> {
@@ -104,7 +104,7 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
 const REPLAY: CompileOptions =
     CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
 
-fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
+fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -269,8 +269,10 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
                 buffer: &out_buf,
                 elems: 1,
             },
-            threads: [1, 1, 1],
-            workgroup: [1, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [1, 1, 1],
+                workgroup: [1, 1, 1],
+            },
             work: 1,
         })
         .unwrap();

@@ -57,6 +57,10 @@ pub enum PrefixSkip {
     /// Recurrent state folds every token into a value a cached block does not hold, so a later
     /// request reusing the blocks would run without that state.
     RecurrentState,
+    /// An MTP draft layer's cache at a block's last position was computed from the token after the
+    /// block, which a later prompt sharing the block need not share: a cached block would hand it a
+    /// wrong key and value, and a shared block cannot be rewritten.
+    MtpState,
     /// The contiguous layout is one private cache with no block table: there are no blocks to cache.
     NoBlockTable,
     /// A preempted sequence is recomputed; its blocks go back to the pool.

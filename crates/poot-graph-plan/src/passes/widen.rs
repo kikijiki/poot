@@ -3,6 +3,7 @@ use poot_graph_ir::op::{FusedOp, FusedOperand, FusedStep};
 use super::fuse::{is_i32_pointwise, lone_pointwise_region};
 use super::*;
 use poot_graph_ir::ValueTable;
+use poot_graph_ir::graph::GraphEdit;
 
 /// Fold the widening `Cast` of a narrow weight into the fused region that reads it.
 ///
@@ -18,10 +19,10 @@ use poot_graph_ir::ValueTable;
 /// reader and is not pinned, and the BF16 const it widens has the cast as its one reader, so the const's
 /// every reader is a packed reader ([`crate::bf16_const_feeds_only_packed_readers`]). Pointwise
 /// [`OpKind::Fused`] regions are left as they are: their kernels read every leaf as f32.
-pub fn fuse_widening_casts<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
-    let mut uses: ValueTable<usize> = ValueTable::filled(g.values.len(), 0);
-    for (e, eqn) in g.eqns.iter().enumerate() {
+pub fn fuse_widening_casts(g: &Graph) -> Result<Graph, EditError> {
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
+    let mut uses: ValueTable<usize> = ValueTable::filled(g.values().len(), 0);
+    for (e, eqn) in g.eqns().iter().enumerate() {
         producer[eqn.out] = Some(e);
         for operand in &eqn.inputs {
             if let Operand::Value(v) = operand {
@@ -33,7 +34,7 @@ pub fn fuse_widening_casts<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // The narrow const a single-use widening `Cast` produces `value` from, and the cast's equation.
     let widened_const = |value: ValueId| -> Option<(usize, ValueId)> {
         let cast = producer[value]?;
-        let eqn = &g.eqns[cast];
+        let eqn = &g.eqns()[cast];
         let [Operand::Value(source)] = eqn.inputs.as_slice() else {
             return None;
         };
@@ -49,7 +50,7 @@ pub fn fuse_widening_casts<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
 
     let mut folded: HashMap<usize, Eqn> = HashMap::new();
     let mut dropped: HashSet<usize> = HashSet::new();
-    for (e, eqn) in g.eqns.iter().enumerate() {
+    for (e, eqn) in g.eqns().iter().enumerate() {
         let mut rewritten = eqn.clone();
         let mut changed = false;
         for position in 0..eqn.inputs.len() {
@@ -84,16 +85,16 @@ pub fn fuse_widening_casts<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         }
     }
     if folded.is_empty() {
-        return g.clone();
+        return Ok(g.clone());
     }
     let eqns = g
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .filter(|(e, _)| !dropped.contains(e))
         .map(|(e, eqn)| folded.remove(&e).unwrap_or_else(|| eqn.clone()))
         .collect();
-    Graph { eqns, ..g.clone() }
+    with_eqns(g, eqns)
 }
 
 /// Renumber a region's locals after [`FusedStep`] `Cast` of input `input` is inserted as the first step: the
@@ -184,19 +185,19 @@ fn widen_row_input(region: &mut RowRegion, input: usize, to: DType) {
 /// computes what it computed over the stored value. A producer fold needs the cast to be the producer's one
 /// reader and the producer's output unpinned; the cast's own result may be pinned (it reuses the region's
 /// output). A consumer fold needs the cast's result and each view's unpinned.
-pub fn fuse_index_casts<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    let mut folded = g.clone();
+pub fn fuse_index_casts(g: &Graph) -> Result<Graph, EditError> {
+    let mut folded = g.edit();
     while let Some(next) = fold_one_index_cast(&folded) {
         folded = next;
     }
-    folded
+    folded.commit()
 }
 
 /// The graph with the first foldable I32-to-F32 cast folded, or `None` when none is.
-fn fold_one_index_cast<V: ValidationChannel>(g: &Graph<V>) -> Option<Graph<V>> {
-    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
-    let mut readers: ValueTable<Vec<usize>> = ValueTable::filled(g.values.len(), Vec::new());
-    for (e, eqn) in g.eqns.iter().enumerate() {
+fn fold_one_index_cast(g: &Graph) -> Option<GraphEdit> {
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
+    let mut readers: ValueTable<Vec<usize>> = ValueTable::filled(g.values().len(), Vec::new());
+    for (e, eqn) in g.eqns().iter().enumerate() {
         producer[eqn.out] = Some(e);
         for operand in &eqn.inputs {
             if let Operand::Value(v) = operand {
@@ -205,7 +206,7 @@ fn fold_one_index_cast<V: ValidationChannel>(g: &Graph<V>) -> Option<Graph<V>> {
         }
     }
     let pinned: HashSet<ValueId> = g.pinned_values().collect();
-    g.eqns.iter().enumerate().find_map(|(cast, eqn)| {
+    g.eqns().iter().enumerate().find_map(|(cast, eqn)| {
         let (OpKind::Cast { to: DType::F32 }, [Operand::Value(source)]) =
             (&eqn.op, eqn.inputs.as_slice())
         else {
@@ -222,21 +223,21 @@ fn fold_one_index_cast<V: ValidationChannel>(g: &Graph<V>) -> Option<Graph<V>> {
 /// The cast `cast` as the last step of its producer, which then writes the cast's value. When the value's
 /// one reader is a float pointwise equation of the same shape, the region joins it: one kernel computes the
 /// exact words, converts them and runs the arithmetic that reads them.
-fn fold_into_producer<V: ValidationChannel>(
-    g: &Graph<V>,
+fn fold_into_producer(
+    g: &Graph,
     cast: usize,
     producer: &ValueTable<Option<usize>>,
     readers: &ValueTable<Vec<usize>>,
     pinned: &HashSet<ValueId>,
-) -> Option<Graph<V>> {
-    let Operand::Value(source) = g.eqns[cast].inputs[0] else {
+) -> Option<GraphEdit> {
+    let Operand::Value(source) = g.eqns()[cast].inputs[0] else {
         return None;
     };
     let p = producer[source]?;
     if readers[source].len() != 1 || pinned.contains(&source) {
         return None;
     }
-    let produced = &g.eqns[p];
+    let produced = &g.eqns()[p];
     if g.aval(produced.out).dtype != DType::I32 {
         return None;
     }
@@ -264,8 +265,8 @@ fn fold_into_producer<V: ValidationChannel>(
         inputs: vec![FusedOperand::Local(region.output)],
     });
     region.output = region.n_inputs + region.steps.len() - 1;
-    let cast_out = g.eqns[cast].out;
-    let mut eqns = g.eqns.clone();
+    let cast_out = g.eqns()[cast].out;
+    let mut eqns = g.eqns().to_vec();
     let mut removed = vec![cast];
     let joined = match readers[cast_out].as_slice() {
         [reader] if !pinned.contains(&cast_out) => {
@@ -291,20 +292,22 @@ fn fold_into_producer<V: ValidationChannel>(
     for index in removed.into_iter().rev() {
         eqns.remove(index);
     }
-    Some(Graph { eqns, ..g.clone() })
+    let mut folded = g.edit();
+    *folded.eqns_mut() = eqns;
+    Some(folded)
 }
 
 /// `reader` with the region `producer` (over `producer_leaves`, writing `value`) inlined: the reader's one
 /// operand `value` becomes the producer's steps, so the producer's output is never stored. Only an equation
 /// of the producer's shape joins it, so the steps keep one output shape; `None` for any other reader.
-fn join_reader<V: ValidationChannel>(
-    g: &Graph<V>,
+fn join_reader(
+    g: &Graph,
     reader: usize,
     value: ValueId,
     producer: &FusedRegion,
     producer_leaves: &[Operand],
 ) -> Option<(usize, Eqn)> {
-    let eqn = &g.eqns[reader];
+    let eqn = &g.eqns()[reader];
     if !reads_float_pointwise(g, eqn) || g.aval(eqn.out).shape != g.aval(value).shape {
         return None;
     }
@@ -389,13 +392,13 @@ fn join_reader<V: ValidationChannel>(
 }
 
 /// The cast `cast` as a first step of every float pointwise equation that reads its value, through views.
-fn fold_into_consumers<V: ValidationChannel>(
-    g: &Graph<V>,
+fn fold_into_consumers(
+    g: &Graph,
     cast: usize,
     readers: &ValueTable<Vec<usize>>,
     pinned: &HashSet<ValueId>,
-) -> Option<Graph<V>> {
-    let (cast_out, Operand::Value(source)) = (g.eqns[cast].out, g.eqns[cast].inputs[0]) else {
+) -> Option<GraphEdit> {
+    let (cast_out, Operand::Value(source)) = (g.eqns()[cast].out, g.eqns()[cast].inputs[0]) else {
         return None;
     };
     // The values the cast result reaches through views, and the equations that read one of them: the views
@@ -409,7 +412,7 @@ fn fold_into_consumers<V: ValidationChannel>(
             return None;
         }
         for &reader in &readers[value] {
-            let eqn = &g.eqns[reader];
+            let eqn = &g.eqns()[reader];
             let is_view = matches!(eqn.op, OpKind::Reshape { .. } | OpKind::Broadcast { .. });
             if is_view && eqn.inputs.len() == 1 {
                 if !views.contains(&reader) {
@@ -435,13 +438,13 @@ fn fold_into_consumers<V: ValidationChannel>(
     };
     if terminals
         .iter()
-        .any(|&terminal| reads_source(&g.eqns[terminal]))
+        .any(|&terminal| reads_source(&g.eqns()[terminal]))
     {
         return None;
     }
-    let mut folded = g.clone();
+    let mut folded = g.edit();
     for &view in &views {
-        folded.values[g.eqns[view].out].aval.dtype = DType::I32;
+        folded.values_mut()[g.eqns()[view].out].aval.dtype = DType::I32;
     }
     // The cast result is the I32 source from here on.
     let uncast = |operand: &Operand| match operand {
@@ -450,12 +453,12 @@ fn fold_into_consumers<V: ValidationChannel>(
     };
     let mut rewritten: HashMap<usize, Eqn> = HashMap::new();
     for &view in &views {
-        let mut eqn = g.eqns[view].clone();
+        let mut eqn = g.eqns()[view].clone();
         eqn.inputs = eqn.inputs.iter().map(uncast).collect();
         rewritten.insert(view, eqn);
     }
     for &terminal in &terminals {
-        let eqn = &g.eqns[terminal];
+        let eqn = &g.eqns()[terminal];
         let (mut region, leaves) = match &eqn.op {
             OpKind::Fused(region) => (region.clone(), eqn.inputs.clone()),
             _ => {
@@ -478,8 +481,8 @@ fn fold_into_consumers<V: ValidationChannel>(
             },
         );
     }
-    folded.eqns = g
-        .eqns
+    *folded.eqns_mut() = g
+        .eqns()
         .iter()
         .enumerate()
         .filter(|(e, _)| *e != cast)
@@ -490,7 +493,7 @@ fn fold_into_consumers<V: ValidationChannel>(
 
 /// Whether `eqn` is a float pointwise equation a cast of one of its operands can fold into: a fused region
 /// or a lone pointwise step, computing in f32.
-fn reads_float_pointwise<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
+fn reads_float_pointwise(g: &Graph, eqn: &Eqn) -> bool {
     if g.aval(eqn.out).dtype != DType::F32 {
         return false;
     }

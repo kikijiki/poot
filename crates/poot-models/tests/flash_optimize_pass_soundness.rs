@@ -8,7 +8,7 @@
 //! a poot-graph-plan pass.)
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_executor_parity::weight_map::MappedModel;
 use poot_graph_ir::{Graph, OpKind, Slot, Storage, ValueId};
 use poot_models::model::{LogitRows, Phase};
@@ -36,7 +36,7 @@ fn assert_bits_equal(got: &HostTensor, want: &HostTensor, what: &str) {
 
 /// How many equations of `g` satisfy `is_op`; asserted above zero so a bit-exact row is not vacuous.
 fn count(g: &Graph, is_op: impl Fn(&OpKind) -> bool) -> usize {
-    g.eqns.iter().filter(|eqn| is_op(&eqn.op)).count()
+    g.eqns().iter().filter(|eqn| is_op(&eqn.op)).count()
 }
 
 /// Deterministic pseudo-random fill in [-1, 1), no rng dependency (poot-eval's own test helper of the
@@ -85,11 +85,9 @@ fn tiny_qwen2(layers: usize, max_positions: usize) -> MappedModel {
 /// token of each. A whole-prompt prefill has `cap == tokens` (the only shape whose attention mask is
 /// square, which the flash matcher requires).
 fn trace(m: &MappedModel, phase: Phase, rows: usize, tokens: usize, cap: usize) -> Graph {
-    plain(
-        m.model
-            .trace(phase, step(rows, tokens, cap, LogitRows::Last))
-            .unwrap(),
-    )
+    m.model
+        .trace(phase, step(rows, tokens, cap, LogitRows::Last))
+        .unwrap()
 }
 
 /// Every input of `g` bound: the token slot cycling through `tokens`, the position slot counting up
@@ -101,8 +99,8 @@ fn bind(
     state: &dyn Fn(usize, &[usize]) -> HostTensor,
 ) -> Map<ValueId, Value> {
     let mut inputs: Map<ValueId, Value> = Map::new();
-    for &id in &g.inputs {
-        let m = &g.values[id];
+    for &id in g.inputs() {
+        let m = &g.values()[id];
         let shape = m.aval.shape.clone();
         let numel = shape.iter().product::<usize>().max(1);
         let t = match m.storage {
@@ -125,7 +123,7 @@ fn bind(
         };
         inputs.insert(id, Value::from(t));
     }
-    for (k, &(si, _)) in g.state.iter().enumerate() {
+    for (k, (si, _)) in g.state().enumerate() {
         let shape = g.aval(si).shape.clone();
         inputs.insert(si, Value::from(state(k, &shape)));
     }
@@ -194,7 +192,7 @@ fn optimize_preserves_results_over_random_configs() {
 
         // --- decode: a single step, random weights + caches, raw vs optimize on identical inputs ---
         let gd = trace(&m, Phase::Decode, 1, 1, cap);
-        let ogd = optimize(&gd);
+        let ogd = optimize(&gd).unwrap();
         assert!(count(&ogd, |op| matches!(op, OpKind::Attention(_))) > 0);
         assert!(count(&ogd, |op| matches!(op, OpKind::Rope { .. })) > 0);
         assert!(
@@ -219,7 +217,7 @@ fn optimize_preserves_results_over_random_configs() {
 
         // --- prefill: a whole forward from empty caches, raw vs optimize on identical inputs ---
         let gp = trace(&m, Phase::Prefill, 1, l, l);
-        let ogp = optimize(&gp);
+        let ogp = optimize(&gp).unwrap();
         assert!(count(&ogp, |op| matches!(op, OpKind::Attention(_))) > 0);
         let (raw_p, _) = run(&gp, &bind(&gp, &tokens, 0, &zeros));
         let (opt_p, _) = run(&ogp, &bind(&ogp, &tokens, 0, &zeros));
@@ -246,7 +244,7 @@ fn optimize_is_bit_exact_on_traced_gemma2_softcap_prefill() {
         .f32_model();
     let n = 6usize;
     let g = trace(&m, Phase::Prefill, 1, n, n);
-    let og = optimize(&g);
+    let og = optimize(&g).unwrap();
     let softcapped = count(
         &og,
         |op| matches!(op, OpKind::Attention(attrs) if attrs.softcap.is_some()),
@@ -302,12 +300,12 @@ fn optimize_matches_oracle_on_real_qwen2_decode_configs_real_dims() {
         let m = dense.zeroed_model(DType::F32);
         let cap = 16usize;
         let g = trace(&m, Phase::Decode, 1, 1, cap);
-        let og = optimize(&g);
+        let og = optimize(&g).unwrap();
         assert!(
-            og.eqns.len() < g.eqns.len(),
+            og.eqns().len() < g.eqns().len(),
             "{label}: optimize should shrink the real-config decode graph ({} -> {} eqns)",
-            g.eqns.len(),
-            og.eqns.len()
+            g.eqns().len(),
+            og.eqns().len()
         );
 
         let caches = |k: usize, sh: &[usize]| {
@@ -344,9 +342,9 @@ fn dispatch_count_regression_on_real_qwen2_decode_configs() {
     for (label, dense, pin) in [(label2, qwen2, PIN_QWEN2), (label3, qwen3, PIN_QWEN3)] {
         let g = trace(&dense.zeroed_model(DType::F32), Phase::Decode, 1, 1, cap);
         assert_eq!(
-            dispatch_count(&optimize(&g)),
+            dispatch_count(&optimize(&g).unwrap()),
             pin,
-            "{label} real-config optimize() dispatch_count moved off its pin"
+            "{label} real-config optimize().unwrap() dispatch_count moved off its pin"
         );
     }
 }
@@ -370,14 +368,15 @@ fn flash_default_cuts_prefill_dispatch_count() {
     use poot_graph_plan::{cse, flash_attention_capped, fuse};
     let layers = 4;
     let g = trace(&tiny_qwen2(layers, 64), Phase::Prefill, 1, 16, 16);
-    let n_flash = flash_attention_capped(&cse(&g), None)
-        .eqns
+    let n_flash = flash_attention_capped(&cse(&g).unwrap(), None)
+        .unwrap()
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
     assert_eq!(n_flash, layers, "one Attention per layer");
-    let no_flash = dispatch_count(&fuse(&cse(&g)));
-    let with_flash = dispatch_count(&optimize(&g));
+    let no_flash = dispatch_count(&fuse(&cse(&g).unwrap()).unwrap());
+    let with_flash = dispatch_count(&optimize(&g).unwrap());
     assert!(
         with_flash < no_flash,
         "flash reduces prefill dispatches: {no_flash} -> {with_flash}"
@@ -395,8 +394,8 @@ fn flash_default_cuts_decode_dispatch_count() {
     let layers = 4;
     let cap = 8;
     let g = trace(&tiny_qwen2(layers, 16), Phase::Decode, 1, 1, cap);
-    let no_flash = dispatch_count(&fuse(&cse(&g)));
-    let with_flash = dispatch_count(&optimize(&g));
+    let no_flash = dispatch_count(&fuse(&cse(&g).unwrap()).unwrap());
+    let with_flash = dispatch_count(&optimize(&g).unwrap());
     let saved = no_flash - with_flash;
     eprintln!(
         "decode dispatch count: no-flash={no_flash}, flash={with_flash} (saved {saved} over {layers} layers, {} per layer)",
@@ -422,7 +421,9 @@ fn flash_attention_shrinks_prefill_peak_memory_quadratically() {
     let measure = |l: usize| -> (usize, usize) {
         let g = trace(&m, Phase::Prefill, 1, l, l);
         let mat = peak_transient_bytes(&g);
-        let flash = peak_transient_bytes(&dce(&flash_attention_capped(&cse(&g), None)));
+        let flash = peak_transient_bytes(
+            &dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap(),
+        );
         (mat, flash)
     };
     let (m16, f16) = measure(16);
@@ -468,9 +469,9 @@ fn flash_attention_pass_fuses_prefill_attention() {
     let tokens: Vec<i32> = vec![5, 9, 2, 14, 7, 1];
     let l = tokens.len();
     let g = trace(&tiny_qwen2(layers, 16), Phase::Prefill, 1, l, l);
-    let fused = dce(&flash_attention_capped(&cse(&g), None));
+    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
     let n_flash = fused
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
@@ -489,11 +490,12 @@ fn flash_attention_pass_fuses_batched_decode() {
     use poot_graph_plan::{cse, flash_attention_capped};
     let layers = 2;
     let g = flash_attention_capped(
-        &cse(&trace(&tiny_qwen2(layers, 16), Phase::Decode, 3, 1, 5)),
+        &cse(&trace(&tiny_qwen2(layers, 16), Phase::Decode, 3, 1, 5)).unwrap(),
         None,
-    );
+    )
+    .unwrap();
     let n_dec = g
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
@@ -511,23 +513,21 @@ fn flash_attention_pass_fuses_decode_attention() {
     let tokens: Vec<i32> = vec![5, 9, 2, 14, 7];
     let cap = tokens.len();
     let g = trace(&tiny_qwen2(layers, 16), Phase::Decode, 1, 1, cap);
-    let fused = dce(&flash_attention_capped(&cse(&g), None));
+    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
     let n_flash = fused
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Attention(_)))
         .count();
     assert_eq!(n_flash, layers, "one Attention per layer");
 
     let mut base_caches: Vec<HostTensor> = g
-        .state
-        .iter()
-        .map(|&(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
+        .state()
+        .map(|(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
         .collect();
     let mut fused_caches: Vec<HostTensor> = fused
-        .state
-        .iter()
-        .map(|&(si, _)| HostTensor::zeros(fused.aval(si).shape.clone()))
+        .state()
+        .map(|(si, _)| HostTensor::zeros(fused.aval(si).shape.clone()))
         .collect();
     for (pos, &token) in tokens.iter().enumerate() {
         let token = [token];

@@ -17,6 +17,22 @@
 //! sequences mirror each other through the one `open`/`commit`/`release` surface. A draft model
 //! with recurrent state is refused typed: only the target's state is rolled back.
 //!
+//! A [`DraftPolicy::Mtp`] drafts with the served model's own multi-token-prediction layer, a
+//! [`ModelRole::Mtp`] program set on the target's executable that reads the hidden-state carry the
+//! target's programs write. After every step, `Driver::step` runs the layer eagerly over the
+//! positions the step wrote (one entry per width, after `roll_back`, so a recurrent target's replay
+//! chunk has written the carry's first columns again): its cache then holds every position of the
+//! committed result, and the last position's argmax is the first draft of the sequence's next
+//! round. The round's other `k - 1` drafts are one-token chain steps at `propose`, each feeding the
+//! draft before it and the state the step before left in column 0 of the carry. Drafts are point
+//! masses, so a sampled row verifies by `u < p(d)` like prompt lookup. The layer's cache is
+//! positional: a stale write past the committed prefix is masked until the next catch-up, which
+//! always begins at the query position, overwrites it. A result committed in part leaves a draft that
+//! followed a dropped token, so the sequence proposes nothing the next round. Prefix reuse is
+//! refused (a block's last position depends on the token after it), a resumed sequence reuses one
+//! position less, and a recurrent MTP program, adapters, beam search, embedding prompts and a
+//! non-single placement are refused typed.
+//!
 //! A target with `StateRole::Recurrent` state rolls back by copy (POOT-631, POOT-647): before the
 //! window runs, the rows that hold drafts are copied into a shadow state set ([`super::snapshot`]).
 //! The window is as wide as the row's drafts, because filler would fold into the state: rows are
@@ -76,6 +92,13 @@ pub enum DraftPolicy {
         handle: Arc<ModelHandle>,
         k: NonZeroUsize,
     },
+    /// Propose with the served model's own multi-token-prediction layer (`Phase::Mtp`), `k` tokens a
+    /// round: one layer over the target's hidden state and the host-known token that follows it,
+    /// chained `k` deep. `k` is required: the evidence says 1 for GLM and 2 to 3 are worth
+    /// measuring, so no value is the default. The layer runs on the target's executable, reads the
+    /// hidden-state carry the target's programs write ([`DriverOptions::hidden_window`], which
+    /// [`DraftPolicy::carry_window`] derives) and keeps a cache of its own.
+    Mtp { k: NonZeroUsize },
 }
 
 impl DraftPolicy {
@@ -83,12 +106,26 @@ impl DraftPolicy {
     pub(super) fn caps(&self) -> Option<SpeculationCaps> {
         let k = match self {
             DraftPolicy::Off => return None,
-            DraftPolicy::PromptLookup { k, .. } | DraftPolicy::DraftModel { k, .. } => *k,
+            DraftPolicy::PromptLookup { k, .. }
+            | DraftPolicy::DraftModel { k, .. }
+            | DraftPolicy::Mtp { k } => *k,
         };
         Some(SpeculationCaps {
             k,
             window: k.checked_add(1).expect("k + 1 fits in a usize"),
         })
+    }
+
+    /// The hidden-state carry window the policy reads: the verify window, `k + 1` positions. The
+    /// value a caller puts in [`DriverOptions::hidden_window`] for this policy; `None` for a policy
+    /// that reads no hidden state.
+    pub fn carry_window(&self) -> Option<NonZeroUsize> {
+        match self {
+            DraftPolicy::Mtp { k } => Some(k.checked_add(1).expect("k + 1 fits in a usize")),
+            DraftPolicy::Off
+            | DraftPolicy::PromptLookup { .. }
+            | DraftPolicy::DraftModel { .. } => None,
+        }
     }
 }
 
@@ -204,11 +241,35 @@ struct DraftSeq {
     sampler: Option<Sampler>,
 }
 
+/// The first draft of a sequence's next round, which the MTP layer's catch-up produced at the end of
+/// the step that committed `last` as the sequence's `len`-th token: valid while the sequence is still
+/// exactly that long, that is, while the step's whole result was committed.
+#[derive(Clone, Copy, Debug)]
+struct MtpNext {
+    len: usize,
+    last: u32,
+    draft: u32,
+}
+
+/// A row the MTP layer catches up over after a step: the plan it runs (`picks` is one when the row
+/// leaves a draft), and the sequence length and last token that draft is valid for.
+struct Cover {
+    seq: SeqId,
+    plan: RowPlan,
+    next: Option<(usize, u32)>,
+}
+
 /// The driver's speculation state: the policy, the loaded draft and the per-sequence draft progress.
 pub(super) struct Speculation {
     pub(super) policy: DraftPolicy,
     pub(super) draft: Option<DraftScope>,
     seqs: HashMap<SeqId, DraftSeq>,
+    /// Under [`DraftPolicy::Mtp`], each sequence's first draft of its next round.
+    mtp: HashMap<SeqId, MtpNext>,
+    /// Every proposal made, in order: no stat or event carries the rejected drafts, and the oracle rows
+    /// compare them.
+    #[cfg(test)]
+    pub(super) proposed: Vec<(SeqId, Vec<u32>)>,
 }
 
 impl Speculation {
@@ -217,6 +278,9 @@ impl Speculation {
             policy,
             draft: None,
             seqs: HashMap::new(),
+            mtp: HashMap::new(),
+            #[cfg(test)]
+            proposed: Vec::new(),
         }
     }
 
@@ -241,10 +305,12 @@ impl Speculation {
             state.valid = state.valid.min(kept);
             state.sampler = None;
         }
+        self.mtp.remove(&seq);
     }
 
     pub(super) fn close(&mut self, seq: SeqId) {
         self.seqs.remove(&seq);
+        self.mtp.remove(&seq);
     }
 }
 
@@ -338,6 +404,11 @@ impl Driver {
         rows: &mut [StepRow<'_>],
         plans: &mut [RowPlan],
     ) -> Result<(), DriverError> {
+        let mut chains = if matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
+            self.propose_mtp(rows, plans)?
+        } else {
+            HashMap::new()
+        };
         for (row, plan) in rows.iter().zip(plans.iter_mut()) {
             let Some(room) = plan.spec.as_ref().map(|spec| spec.room) else {
                 continue;
@@ -348,13 +419,13 @@ impl Driver {
                 DraftPolicy::PromptLookup { ngram, .. } => {
                     let tokens = self.committed(row.seq);
                     let drafts = propose_lookup(&tokens, ngram.get(), room);
-                    let vocab = self.handle.config().vocab;
-                    let q = if sampled {
-                        drafts.iter().map(|&d| one_hot(d, vocab)).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    Proposal { drafts, q }
+                    point_mass_proposal(drafts, self.handle.config().vocab, sampled)
+                }
+                DraftPolicy::Mtp { .. } => {
+                    // The layer's draft is its argmax whatever the row's sampler: a point mass, so
+                    // the accept test is `u < p(d)` exactly as for prompt lookup.
+                    let drafts = chains.remove(&row.seq).unwrap_or_default();
+                    point_mass_proposal(drafts, self.handle.config().vocab, sampled)
                 }
                 DraftPolicy::DraftModel { .. } => {
                     self.propose_with_draft(row.seq, row.sampler, room)?
@@ -379,6 +450,10 @@ impl Driver {
                 }
                 plan.picks = plan.feed.len();
             }
+            #[cfg(test)]
+            self.speculation
+                .proposed
+                .push((row.seq, proposal.drafts.clone()));
             plan.spec = Some(SpecRow { room, proposal });
         }
         self.snapshot_rows(rows, plans)
@@ -409,14 +484,31 @@ impl Driver {
         }
     }
 
-    /// Admit what a recurrent target's speculative rounds run beyond the full-width window: the
-    /// snapshot and restore copies on each executable, a window of every narrower width `2..=k` (a
-    /// row with fewer drafts, since filler would fold into its state), the replay chunk of every width
-    /// a rejection can keep (`1..=k`, the query token and up to `k - 1` accepted drafts) at each row
-    /// count, and, for the step that groups its rows by width, the prompt pieces and the decode step
-    /// under the head a window step reads (the greedy suffix, and the logits head when a request
-    /// samples). A model with positional state needs none of it: its window carries every row at one
-    /// width.
+    /// Whether a step runs its rows grouped by the tokens they feed, each group its own entry. A
+    /// recurrent state folds left padding into itself, and the hidden-state carry an MTP layer
+    /// reads is indexed by the step's columns, so a left-padded row would hand the layer the wrong
+    /// positions: both need every row at exactly its own width.
+    pub(super) fn groups_rows_by_width(&self) -> bool {
+        self.residency == StateResidency::Recurrent
+            || matches!(self.speculation.policy, DraftPolicy::Mtp { .. })
+    }
+
+    /// Admit what a speculative round runs beyond the full-width window.
+    ///
+    /// A recurrent target needs the snapshot and restore copies on each executable, a window of every
+    /// narrower width `2..=k` (a row with fewer drafts, since filler would fold into its state) and
+    /// the replay chunk of every width a rejection can keep (`1..=k`, the query token and up to
+    /// `k - 1` accepted drafts) at each row count.
+    ///
+    /// A step that groups its rows by width ([`Driver::groups_rows_by_width`]) needs the prompt
+    /// pieces and the decode step under the head a window step reads (the greedy suffix, and the
+    /// logits head when a request samples).
+    ///
+    /// Under [`DraftPolicy::Mtp`] the entries of the layer's catch-up and chain
+    /// ([`Driver::prepare_mtp`]).
+    ///
+    /// A model with positional state under any other policy needs none of it: its window carries
+    /// every row at one width.
     pub(super) fn prepare_rollback(
         &mut self,
         shapes: &ServingShapes<'_>,
@@ -426,9 +518,10 @@ impl Driver {
         let Some(speculation) = self.speculation.policy.caps() else {
             return Ok(());
         };
-        if self.residency != StateResidency::Recurrent {
+        if !self.groups_rows_by_width() {
             return Ok(());
         }
+        let recurrent = self.residency == StateResidency::Recurrent;
         let sampled = shapes.heads.iter().any(|&head| head != Head::GREEDY);
         let heads: &[Head] = if sampled {
             &[Head::GREEDY, Head::Logits]
@@ -436,8 +529,10 @@ impl Driver {
             &[Head::GREEDY]
         };
         for adapters in std::iter::once(None).chain(shapes.adapters.iter().copied().map(Some)) {
-            for role in [ModelRole::Snapshot, ModelRole::Restore] {
-                self.prepared(self.rollback_key(role, kv, adapters))?;
+            if recurrent {
+                for role in [ModelRole::Snapshot, ModelRole::Restore] {
+                    self.prepared(self.rollback_key(role, kv, adapters))?;
+                }
             }
             let capacity = self.options.capacity;
             let hidden = self.hidden_of(ModelRole::Target);
@@ -456,12 +551,14 @@ impl Driver {
                     head,
                     adapters,
                 };
-                for width in 1..=speculation.k.get() {
-                    self.prepared(key(width, LogitRows::Last, Head::GREEDY))?;
-                }
-                for width in 2..=speculation.k.get() {
-                    for &head in heads {
-                        self.prepared(key(width, LogitRows::All, head))?;
+                if recurrent {
+                    for width in 1..=speculation.k.get() {
+                        self.prepared(key(width, LogitRows::Last, Head::GREEDY))?;
+                    }
+                    for width in 2..=speculation.k.get() {
+                        for &head in heads {
+                            self.prepared(key(width, LogitRows::All, head))?;
+                        }
                     }
                 }
                 for &piece in pieces {
@@ -473,6 +570,56 @@ impl Driver {
                         self.prepared(key(width, LogitRows::Last, head))?;
                     }
                 }
+            }
+        }
+        if matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
+            self.prepare_mtp(shapes, kv, pieces)?;
+        }
+        Ok(())
+    }
+
+    /// Admit the MTP layer's entries on the target's executable: one program per row count and per
+    /// width a step can leave to catch up over (a prompt piece, the `1..=k + 1` tokens a round
+    /// keeps, a caller-named window), at the last position's greedy suffix. The chain's one-token
+    /// step is the width-one entry.
+    fn prepare_mtp(
+        &mut self,
+        shapes: &ServingShapes<'_>,
+        kv: KvLayout,
+        pieces: &[Piece],
+    ) -> Result<(), DriverError> {
+        let window = self
+            .speculation
+            .policy
+            .caps()
+            .expect("an MTP policy speculates")
+            .window
+            .get();
+        let mut widths: Vec<usize> = (1..=window).collect();
+        widths.extend(pieces.iter().filter_map(|piece| match piece {
+            Piece::Prefill(n) => Some(n.get()),
+            Piece::Decode => None,
+        }));
+        widths.extend(shapes.windows.iter().map(|width| width.get()));
+        widths.sort_unstable();
+        widths.dedup();
+        let hidden = self.hidden_of(ModelRole::Mtp);
+        for &rows in shapes.rows {
+            for &width in &widths {
+                self.prepared(EntryKey {
+                    role: ModelRole::Mtp,
+                    phase: Phase::Mtp,
+                    shape: StepShape {
+                        rows,
+                        tokens: NonZeroUsize::new(width).expect("a width is at least one"),
+                        capacity: self.options.capacity,
+                        kv,
+                        logits: LogitRows::Last,
+                        hidden,
+                    },
+                    head: Head::GREEDY,
+                    adapters: None,
+                })?;
             }
         }
         Ok(())
@@ -811,6 +958,194 @@ impl Driver {
         Ok(())
     }
 
+    /// One step of the MTP layer over the sequences `seqs`, one lane each of `plans`: tokens and
+    /// start come from each plan, the carry rows from the sequences' own pool rows. Every plan feeds
+    /// `width` tokens. Returns the greedy token of each lane that picks.
+    fn run_mtp(
+        &mut self,
+        seqs: &[SeqId],
+        plans: &[RowPlan],
+        width: usize,
+    ) -> Result<Vec<Vec<u32>>, DriverError> {
+        let key = self.step_entry(
+            ModelRole::Mtp,
+            seqs.len(),
+            width,
+            (false, false),
+            Some(Head::GREEDY),
+            None,
+        )?;
+        let mut idle: Vec<Sampler> = seqs.iter().map(|_| Sampler::greedy()).collect();
+        let mut lanes: Vec<Lane<'_>> = seqs
+            .iter()
+            .zip(&mut idle)
+            .map(|(&seq, sampler)| Lane { seq, sampler })
+            .collect();
+        match self.run_plans(&mut lanes, plans, key)? {
+            Readback::Tokens(tokens) => Ok(tokens),
+            Readback::Logits { .. } => unreachable!("the layer runs the greedy suffix"),
+        }
+    }
+
+    /// The first `k` drafts of each speculative row from the MTP layer: the draft the row's last
+    /// catch-up left, then one-token chain steps, each feeding the draft before it at the position
+    /// after and reading the post-norm state that step left in row 0 of the carry. Rows chain
+    /// together: step `j` runs every row that still has room for a draft, as one entry. A row with no
+    /// draft left by its last step (its result was not committed whole, or it has not stepped yet)
+    /// proposes nothing.
+    fn propose_mtp(
+        &mut self,
+        rows: &[StepRow<'_>],
+        plans: &[RowPlan],
+    ) -> Result<HashMap<SeqId, Vec<u32>>, DriverError> {
+        let serving = self.serving.as_ref().expect("a step is served");
+        // The row's sequence, the tokens it holds, how many drafts it may take, and what it has.
+        let mut chains: Vec<(SeqId, usize, usize, Vec<u32>)> = Vec::new();
+        for (row, plan) in rows.iter().zip(plans) {
+            let Some(spec) = &plan.spec else {
+                continue;
+            };
+            let tokens = &serving.seqs[&row.seq].tokens;
+            let ready = self
+                .speculation
+                .mtp
+                .get(&row.seq)
+                .filter(|next| next.len == tokens.len() && tokens.last() == Some(&next.last));
+            if let (Some(next), true) = (ready, spec.room > 0) {
+                chains.push((row.seq, tokens.len(), spec.room, vec![next.draft]));
+            }
+        }
+        loop {
+            // The chain step that follows `drafts.len()` drafts feeds the last at the position after
+            // the layer's last catch-up position, which is the query token's own.
+            let live: Vec<usize> = (0..chains.len())
+                .filter(|&i| chains[i].3.len() < chains[i].2)
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let seqs: Vec<SeqId> = live.iter().map(|&i| chains[i].0).collect();
+            let steps: Vec<RowPlan> = live
+                .iter()
+                .map(|&i| {
+                    let (_, committed, _, drafts) = &chains[i];
+                    RowPlan {
+                        feed: vec![*drafts.last().expect("a chain starts with a draft")],
+                        start: committed - 2 + drafts.len(),
+                        picks: 1,
+                        prefill: false,
+                        embeds: false,
+                        spec: None,
+                        not_speculated: None,
+                    }
+                })
+                .collect();
+            let picked = self.run_mtp(&seqs, &steps, 1)?;
+            for (&i, tokens) in live.iter().zip(picked) {
+                chains[i].3.push(tokens[0]);
+            }
+        }
+        Ok(chains
+            .into_iter()
+            .map(|(seq, _, _, drafts)| (seq, drafts))
+            .collect())
+    }
+
+    /// Run the MTP layer over the positions a step just wrote, so its cache holds every position the
+    /// sequence's committed tokens (all of the step's result, as `commit` takes it) reach, and keep
+    /// the draft its last position yields for the sequence's next round. A prompt piece covers its own
+    /// positions with the tokens that follow them (the next prompt token past its last, or the pick
+    /// when the piece ends the prompt); a decode or window row covers its query position and the
+    /// accepted drafts with the tokens it picked. Rows group by the width they cover, each group one
+    /// entry, so the carry's first columns are exactly the positions.
+    ///
+    /// It runs after [`Driver::roll_back`]: a recurrent target's replay chunk writes the carry's
+    /// first columns again, and the layer's chain recycles its own state through column 0.
+    pub(super) fn mtp_catch_up(
+        &mut self,
+        rows: &[StepRow<'_>],
+        plans: &[RowPlan],
+    ) -> Result<(), DriverError> {
+        if !matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
+            return Ok(());
+        }
+        let serving = self.serving.as_ref().expect("a step is served");
+        let mut covers: Vec<Cover> = Vec::new();
+        for (row, plan) in rows.iter().zip(plans) {
+            let seq = &serving.seqs[&row.seq];
+            let picked = &seq.pending;
+            let feed = if plan.prefill {
+                let n = plan.feed.len();
+                let after = match picked.first() {
+                    Some(&pick) => pick,
+                    None => seq.tokens[plan.start + n],
+                };
+                let mut feed = plan.feed[1..].to_vec();
+                feed.push(after);
+                feed
+            } else {
+                picked.clone()
+            };
+            if feed.is_empty() {
+                continue;
+            }
+            // The sequence is as long as the whole result makes it once committed, and ends in the
+            // result's last token: what the draft its last position yields is valid for.
+            let next = picked
+                .last()
+                .map(|&last| (seq.tokens.len() + picked.len(), last));
+            covers.push(Cover {
+                seq: row.seq,
+                plan: RowPlan {
+                    picks: usize::from(next.is_some()),
+                    feed,
+                    start: plan.start,
+                    prefill: true,
+                    embeds: false,
+                    spec: None,
+                    not_speculated: None,
+                },
+                next,
+            });
+        }
+        let mut widths: Vec<usize> = covers.iter().map(|cover| cover.plan.feed.len()).collect();
+        widths.sort_unstable();
+        widths.dedup();
+        for width in widths {
+            let group: Vec<&Cover> = covers
+                .iter()
+                .filter(|cover| cover.plan.feed.len() == width)
+                .collect();
+            let seqs: Vec<SeqId> = group.iter().map(|cover| cover.seq).collect();
+            let steps: Vec<RowPlan> = group
+                .iter()
+                .map(|cover| RowPlan {
+                    feed: cover.plan.feed.clone(),
+                    start: cover.plan.start,
+                    picks: cover.plan.picks,
+                    prefill: true,
+                    embeds: false,
+                    spec: None,
+                    not_speculated: None,
+                })
+                .collect();
+            let picked = self.run_mtp(&seqs, &steps, width)?;
+            for (cover, tokens) in group.iter().zip(picked) {
+                match (cover.next, tokens.first()) {
+                    (Some((len, last)), Some(&draft)) => {
+                        self.speculation
+                            .mtp
+                            .insert(cover.seq, MtpNext { len, last, draft });
+                    }
+                    _ => {
+                        self.speculation.mtp.remove(&cover.seq);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A speculative row settled: `kept` tokens came back for `proposed` drafts, so the draft's K/V
     /// is valid for the committed tokens and the accepted drafts it fed, `committed` positions plus
     /// the accepted ones below the last draft (which it never fed).
@@ -891,7 +1226,19 @@ pub(super) fn verify_row(
     )?))
 }
 
-/// The one-hot distribution of `token` over `vocab` tokens: prompt lookup's `q`.
+/// A proposal of tokens a deterministic proposer chose (prompt lookup's earlier continuation, the
+/// MTP layer's argmax): each draft's distribution is the point mass on it, which a sampled row's
+/// accept test needs and a greedy row's does not read.
+fn point_mass_proposal(drafts: Vec<u32>, vocab: usize, sampled: bool) -> Proposal {
+    let q = if sampled {
+        drafts.iter().map(|&d| one_hot(d, vocab)).collect()
+    } else {
+        Vec::new()
+    };
+    Proposal { drafts, q }
+}
+
+/// The one-hot distribution of `token` over `vocab` tokens: a deterministic proposer's `q`.
 fn one_hot(token: u32, vocab: usize) -> Vec<f32> {
     let mut row = vec![0.0; vocab];
     row[token as usize] = 1.0;
@@ -1184,6 +1531,45 @@ mod spec_sampling_tests {
                  residual procedure's output does not match the target distribution"
             );
         }
+    }
+
+    /// A deterministic proposer's draft (the MTP layer's argmax, prompt lookup's earlier
+    /// continuation) is a point mass, and the production proposal builds exactly that `q` for a
+    /// sampled row: the accept test is `u < p(d)` and a rejection resamples from `p` without the
+    /// drafted token, which together draw from `p`. The output of the production round over the
+    /// production proposal follows the target's distribution whatever token the layer drafts,
+    /// likely or not. Mutation: put half the mass on the drafted token in `one_hot`; the accept
+    /// probability becomes `min(1, 2p)` and the drafted token is over-drawn.
+    #[test]
+    fn a_point_mass_draft_matches_the_target_distribution_chi_squared() {
+        let p = vec![0.30f32, 0.25, 0.15, 0.10, 0.08, 0.05, 0.04, 0.03];
+        for drafted in [0u32, 3, 7] {
+            let n = 200_000u64;
+            let mut target_sampler = Sampler::new(1.0, 0, 1.0, 0x7A5CE7 + u64::from(drafted));
+            let mut counts = vec![0u64; p.len()];
+            for _ in 0..n {
+                let proposal = point_mass_proposal(vec![drafted], p.len(), true);
+                let (accepted, next) = spec_sample_round(
+                    &proposal.drafts,
+                    &proposal.q,
+                    &[p.clone(), p.clone()],
+                    &mut target_sampler,
+                )
+                .unwrap();
+                let out = if accepted == 1 { drafted } else { next };
+                counts[out as usize] += 1;
+            }
+            let chi2 = chi_squared(&counts, &p, n);
+            assert!(
+                chi2 < 60.0,
+                "chi-squared {chi2:.2} too high for a point-mass draft of token {drafted} \
+                 (counts={counts:?}): the output does not follow the target's distribution"
+            );
+        }
+        assert!(
+            point_mass_proposal(vec![1, 2], 8, false).q.is_empty(),
+            "a greedy row reads no draft distribution"
+        );
     }
 
     #[test]

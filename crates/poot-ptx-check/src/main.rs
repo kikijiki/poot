@@ -10,7 +10,7 @@
 
 use poot_ptx_runtime::PtxContext;
 use poot_runtime_common::{ArgAccess, ArgSchema, CompiledKernel, KernelCode};
-use poot_target::{Backend, ElementKind};
+use poot_target::{Backend, ElementKind, TargetId};
 
 /// Wrap a poot-codegen-emitted `.ptx` file's text as a dispatchable [`CompiledKernel`] (card 608's
 /// sanctioned "imported kernel" escape hatch: this binary loads compiled `.ptx` text straight off disk,
@@ -33,7 +33,7 @@ fn ptx_kernel(ptx: &str, entry: &str, elements: &[ElementKind]) -> CompiledKerne
     // parameters are the caller-declared `elements` in binding order.
     unsafe {
         CompiledKernel::new(
-            Backend::Nvptx,
+            TargetId::Gpu(Backend::Nvptx),
             entry,
             KernelCode::Ptx(ptx.into()),
             args,

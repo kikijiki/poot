@@ -22,7 +22,7 @@ use poot_executor::{
     BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
     ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{Slot, SlotKey, ValidationOutputs};
+use poot_graph_ir::{Slot, SlotKey};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet,
 };
@@ -174,7 +174,7 @@ impl Device for FakeDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -260,7 +260,7 @@ impl Executor for Counting {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<ValidationOutputs>,
+        program: &StagedProgram,
     ) -> Result<EntryId, ExecError> {
         self.inner.add_entry(exe, program)
     }
@@ -587,9 +587,8 @@ fn oracle_rows(store: &WeightStore, tokens: &[u32]) -> Vec<Vec<f32>> {
     };
     let graph = model.trace(Phase::Prefill, shape).unwrap();
     let state: Vec<HostTensor> = graph
-        .state
-        .iter()
-        .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .state()
+        .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
         .collect();
     let slots = [
         (

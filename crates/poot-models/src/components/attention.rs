@@ -838,7 +838,7 @@ mod tests {
         );
         let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH]));
         let y = attention(&b, &step, 2, xs, &w, &p);
-        let g = step.finish(b, y);
+        let g = step.finish(b, y).unwrap();
         let pairs: Vec<_> = g.state_pairs().collect();
         assert_eq!(pairs.len(), 2);
         assert!(
@@ -1269,7 +1269,7 @@ mod tests {
             );
             let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH]));
             let y = attention(&b, &step, 2, xs, &w, &p);
-            let g = step.finish(b, y);
+            let g = step.finish(b, y).unwrap();
             fx.eval(
                 &g,
                 &[("x", x)],
@@ -1455,7 +1455,7 @@ mod tests {
         );
         let xs = b.constant("x", TensorType::f32(vec![rows, t, WIDTH]));
         let y = attention(&b, &step, 2, xs, &w, &p);
-        let g = step.finish(b, y);
+        let g = step.finish(b, y).unwrap();
         let role = match paged {
             None => StateRole::Positional { axis: 2 },
             Some(_) => StateRole::Positional { axis: 0 },

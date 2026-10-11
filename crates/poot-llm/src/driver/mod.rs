@@ -71,7 +71,7 @@ use poot_executor::{
     Collectives, Coordinator, Device, EntryId, ExecError, ExecutableId, Executor, HostSync, NoSync,
     StepInputs,
 };
-use poot_graph_ir::{Graph, Slot, SlotKey, StateRole, ValidationOutputs};
+use poot_graph_ir::{Graph, Slot, SlotKey, StateRole};
 use poot_graph_plan::{
     CompileOptions, ExpertPlacement, ShardRule, StagedCompileError, StagedProgram, TensorParallel,
     WeightFormats, bind_packed_weights, compile_staged, shard,
@@ -155,14 +155,14 @@ impl Retention {
 }
 
 /// How a driver measures what a compiled program retains.
-pub type RetentionCharge = fn(&StagedProgram<ValidationOutputs>) -> Retention;
+pub type RetentionCharge = fn(&StagedProgram) -> Retention;
 
 /// The host bytes a program's graph, plans and kernel bodies retain. Its value table, equations and
 /// per-equation plans are private to the entry. Each distinct kernel body, keyed by its plan key, is a
 /// shared owner: entries of one executable load a kernel once however many plans name it. The bytes are
 /// the body's own size; the compiled artifact is the executor's and is bounded by
 /// `CompileLimits::max_artifact_bytes` where it is loaded, and device memory is not counted here.
-pub fn program_retention(program: &StagedProgram<ValidationOutputs>) -> Retention {
+pub fn program_retention(program: &StagedProgram) -> Retention {
     let mut retention = Retention::default();
     let mut seen = HashSet::new();
     let mut own = |key: &str, body: &poot_kernel_ir::Body, retention: &mut Retention| {
@@ -175,8 +175,8 @@ pub fn program_retention(program: &StagedProgram<ValidationOutputs>) -> Retentio
     };
     for (_, _, p) in program.stages() {
         let graph = p.graph();
-        let values = graph.values.len() * size_of::<poot_graph_ir::ValueMeta>();
-        let eqns = graph.eqns.len()
+        let values = graph.values().len() * size_of::<poot_graph_ir::ValueMeta>();
+        let eqns = graph.eqns().len()
             * (size_of::<poot_graph_ir::Eqn>() + size_of::<poot_graph_plan::Plan>());
         retention.private += (values + eqns) as u64;
         for (_, plan) in p.planned() {
@@ -226,8 +226,9 @@ pub struct DriverOptions {
     pub draft: DraftPolicy,
     /// The widest verify window the programs of a later step read the hidden-state carry over; `Some`
     /// makes every target program write the carry ([`StepShape::hidden`]), sized for the window or the
-    /// widest prefill piece, whichever is larger. The draft policy that consumes the carry sets it;
-    /// `None` writes none.
+    /// widest prefill piece, whichever is larger. The draft policy that consumes the carry names its
+    /// window ([`DraftPolicy::carry_window`]): a [`DraftPolicy::Mtp`] driver refuses options that
+    /// name none or a narrower one. `None` writes none.
     pub hidden_window: Option<NonZeroUsize>,
 }
 
@@ -359,6 +360,10 @@ pub enum Warm<'a> {
 enum ModelRole {
     Target,
     Draft,
+    /// The served model's multi-token-prediction layer under [`DraftPolicy::Mtp`]: its programs run
+    /// on the target's executable, over the hidden-state carry the target's programs write, so the
+    /// scope is the target's and never a draft model's.
+    Mtp,
     Beam,
     /// Copy recurrent rows from live state into the shadow set.
     Snapshot,
@@ -461,7 +466,7 @@ enum SlotRole {
 
 impl Prepared {
     /// The slots of `graph`, each classified. A slot no role names is a graph this driver cannot bind.
-    fn slots_of(graph: &Graph<ValidationOutputs>) -> Result<Vec<SlotSpec>, DriverError> {
+    fn slots_of(graph: &Graph) -> Result<Vec<SlotSpec>, DriverError> {
         let named = |slot, tag| SlotKey::new(slot, Some(tag));
         let roles = [
             (token_slot(), SlotRole::Token),
@@ -493,7 +498,7 @@ impl Prepared {
             (reorder::beam_rows_slot(), SlotRole::BeamRows),
         ];
         let mut slots = Vec::new();
-        for &(value, _) in &graph.slots {
+        for &(value, _) in graph.slots() {
             let meta = graph.meta(value);
             let key = meta
                 .slot_key()
@@ -654,14 +659,24 @@ impl Driver {
         placement: Placement,
     ) -> Result<Self, DriverError> {
         let placed = Placed::resolve(coordinator.target_set(), placement)?;
-        if !matches!(placed.placement(), Placement::Single)
-            && matches!(options.draft, DraftPolicy::DraftModel { .. })
-        {
-            return Err(Unsupported::Placement {
-                placement: placed.name(),
-                what: "a draft model, whose layers are not the target's",
+        if !matches!(placed.placement(), Placement::Single) {
+            let what = match options.draft {
+                DraftPolicy::DraftModel { .. } => {
+                    Some("a draft model, whose layers are not the target's")
+                }
+                DraftPolicy::Mtp { .. } => Some(
+                    "an MTP layer, whose hidden-state carry and cache sit on one device past the \
+                     target's stages",
+                ),
+                DraftPolicy::Off | DraftPolicy::PromptLookup { .. } => None,
+            };
+            if let Some(what) = what {
+                return Err(Unsupported::Placement {
+                    placement: placed.name(),
+                    what,
+                }
+                .into());
             }
-            .into());
         }
         let chunks = Self::check_options(&handle, &options)?;
         let weights = Arc::new(handle.model().weights().clone());
@@ -697,6 +712,14 @@ impl Driver {
                 max_positions: handle.config().max_positions,
             }
             .into());
+        }
+        if let DraftPolicy::Mtp { k } = &options.draft {
+            // The layer reads the carry the verify window wrote: the options must size it for the
+            // window, whichever way they were built.
+            let window = options.hidden_window.map(NonZeroUsize::get);
+            if window.is_none_or(|window| window < k.get() + 1) {
+                return Err(InvalidOptions::MtpCarryWindow { k: k.get(), window }.into());
+            }
         }
         Ok(ChunkPolicy::new(
             options.prefill_chunk,
@@ -805,14 +828,14 @@ impl Driver {
         self.hidden = Some(HiddenCarry { positions: widest });
     }
 
-    /// The hidden-state carry `role`'s programs write: the target's, identically for every key, and
-    /// none for a draft model, a beam or an encode step (its own executable). The rollback copies
-    /// trace the target's decode program as their state schema, so they see the carry too (and leave
-    /// it out: a `Handoff` value is never rolled back).
+    /// The hidden-state carry `role`'s programs write or read: the target's, identically for every
+    /// key (the MTP layer's programs read it), and none for a draft model, a beam or an encode step
+    /// (its own executable). The rollback copies trace the target's decode program as their state
+    /// schema, so they see the carry too (and leave it out: a `Handoff` value is never rolled back).
     fn hidden_of(&self, role: ModelRole) -> Option<HiddenCarry> {
         if matches!(
             role,
-            ModelRole::Target | ModelRole::Snapshot | ModelRole::Restore
+            ModelRole::Target | ModelRole::Mtp | ModelRole::Snapshot | ModelRole::Restore
         ) {
             self.hidden
         } else {
@@ -999,6 +1022,17 @@ impl Driver {
             }
             .into());
         }
+        if matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
+            // The layer drafts for the base weights, and its cache follows the serving rows only.
+            if let Some(generation) = key.adapters {
+                return Err(
+                    Unsupported::Speculation(SpeculationRefusal::MtpAdapters(generation)).into(),
+                );
+            }
+            if key.role == ModelRole::Beam {
+                return Err(Unsupported::Speculation(SpeculationRefusal::MtpBeam).into());
+            }
+        }
         if let Some(generation) = key.adapters
             && !self.lora.contains(generation)
         {
@@ -1012,6 +1046,9 @@ impl Driver {
         let residency = Self::check_state_rows(&handle, &graph, key.shape)?;
         if key.role == ModelRole::Draft && residency == StateResidency::Recurrent {
             return Err(Unsupported::Speculation(SpeculationRefusal::RecurrentDraft).into());
+        }
+        if key.role == ModelRole::Mtp && residency == StateResidency::Recurrent {
+            return Err(Unsupported::Speculation(SpeculationRefusal::RecurrentMtp).into());
         }
         let graph = match key.role {
             ModelRole::Snapshot | ModelRole::Restore => {
@@ -1027,11 +1064,12 @@ impl Driver {
             _ => {
                 let graph = bind_packed_weights(&graph, self.formats_of(key.role))
                     .map_err(Unsupported::PackedBind)?;
-                suffix::append_head(graph, key.head).0
+                suffix::with_head(graph, key.head)
+                    .map_err(|error| Unsupported::Graph(Box::new(error)))?
             }
         };
         let mut slots = Prepared::slots_of(&graph)?;
-        let output = graph.aval(graph.output).shape.clone();
+        let output = graph.aval(graph.result()).shape.clone();
         let mut compile = self.options_for(key.phase);
         let stack = key
             .adapters
@@ -1068,9 +1106,9 @@ impl Driver {
     /// Compile `graph` for the executor's target.
     fn compile(
         &self,
-        graph: &Graph<ValidationOutputs>,
+        graph: &Graph,
         options: &CompileOptions,
-    ) -> Result<StagedProgram<ValidationOutputs>, Unsupported> {
+    ) -> Result<StagedProgram, Unsupported> {
         // The pool pages the graphs that have routed experts; a dense draft model's or an encode graph's
         // stays resident, decided here from the graph rather than by catching the pool's refusal.
         let experts = match &self.pool {
@@ -1102,10 +1140,7 @@ impl Driver {
 
     /// Count the compile of `program` and check what retaining it would hold against the limits.
     /// Nothing is recorded until [`Self::add_entry`].
-    fn admit(
-        &mut self,
-        program: &StagedProgram<ValidationOutputs>,
-    ) -> Result<Reservation, DriverError> {
+    fn admit(&mut self, program: &StagedProgram) -> Result<Reservation, DriverError> {
         self.stats.compiles += 1;
         let reservation = self.reserve((self.options.charge)(program));
         let would_retain = self.retained_bytes.saturating_add(reservation.charge);
@@ -1126,7 +1161,7 @@ impl Driver {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<ValidationOutputs>,
+        program: &StagedProgram,
         reservation: Reservation,
         slots: Vec<SlotSpec>,
         output: Vec<usize>,
@@ -1207,7 +1242,7 @@ impl Driver {
     /// state residency, read from its state roles, never from a family.
     fn check_state_rows(
         handle: &ModelHandle,
-        graph: &Graph<ValidationOutputs>,
+        graph: &Graph,
         shape: StepShape,
     ) -> Result<StateResidency, Unsupported> {
         let mut residency = StateResidency::KvOnly;
@@ -1387,9 +1422,11 @@ impl Driver {
     /// The model and executable `role`'s entries run: the served model's, or the loaded draft's.
     fn scope(&self, role: ModelRole) -> Result<(Arc<ModelHandle>, ExecutableId), DriverError> {
         match role {
-            ModelRole::Target | ModelRole::Beam | ModelRole::Snapshot | ModelRole::Restore => {
-                Ok((Arc::clone(&self.handle), self.exe))
-            }
+            ModelRole::Target
+            | ModelRole::Mtp
+            | ModelRole::Beam
+            | ModelRole::Snapshot
+            | ModelRole::Restore => Ok((Arc::clone(&self.handle), self.exe)),
             ModelRole::Draft => self
                 .speculation
                 .draft

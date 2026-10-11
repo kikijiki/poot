@@ -33,7 +33,7 @@ fn fuse_preserves_the_exact_i32_bit_select_and_clz_chain() {
     for term in [shl, shr, not, clz] {
         out = b.binary(BinOp::Or, out, term);
     }
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let inputs = HashMap::from([
         (
@@ -51,13 +51,12 @@ fn fuse_preserves_the_exact_i32_bit_select_and_clz_chain() {
     // Lane 0 by hand: select(and=0, or=7, xor=7) = 7; or-ed with shl 0, shr 0, not -1, clz 32 = -1.
     assert_eq!(unfused.as_deref().map(|words| words[0]), Some(-1));
 
-    let fused = poot_graph_plan::fuse(&g);
-    fused.validate().unwrap();
+    let fused = poot_graph_plan::fuse(&g).unwrap();
     assert!(
-        fused.eqns.len() < g.eqns.len(),
+        fused.eqns().len() < g.eqns().len(),
         "fuse must actually rewrite this chain ({} eqns before, {} after)",
-        g.eqns.len(),
-        fused.eqns.len()
+        g.eqns().len(),
+        fused.eqns().len()
     );
     assert_eq!(
         ints(eval(&fused, &inputs, options()).unwrap().output),

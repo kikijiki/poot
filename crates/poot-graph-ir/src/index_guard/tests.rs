@@ -14,12 +14,7 @@ fn i32_input(builder: &Builder, name: &str, shape: Vec<usize>) -> Traced {
 }
 
 /// A graph whose primary output is the guarded selector and whose only validation output is the witness.
-fn guarded_graph() -> (
-    crate::Graph<crate::ValidationOutputs>,
-    ValueId,
-    ValueId,
-    ValueId,
-) {
+fn guarded_graph() -> (crate::Graph, ValueId, ValueId, ValueId) {
     let builder = Builder::new();
     let raw = i32_input(&builder, "raw", vec![4]);
     let guard = builder.guard_index_bounds(raw, UPPER).unwrap();
@@ -32,8 +27,8 @@ fn guarded_graph() -> (
     (graph, raw.id(), guard.guarded.id(), guard.witness.id())
 }
 
-fn producer(graph: &crate::Graph<crate::ValidationOutputs>, value: ValueId) -> &crate::Eqn {
-    graph.eqns.iter().find(|eqn| eqn.out == value).unwrap()
+fn producer(graph: &crate::Graph, value: ValueId) -> &crate::Eqn {
+    graph.eqns().iter().find(|eqn| eqn.out == value).unwrap()
 }
 
 #[test]
@@ -88,8 +83,9 @@ fn guard_helper_emits_the_documented_chain() {
     assert!(matches!(cast.inputs.as_slice(), [Operand::Value(value)] if value == invalid));
 
     // The declared validation value is the witness, and it is a single F32 lane.
-    assert_eq!(graph.validation_outputs().len(), 1);
-    assert_eq!(graph.validation_outputs()[0].value, witness);
+    let witnesses: Vec<_> = graph.witnesses().collect();
+    assert_eq!(witnesses.len(), 1);
+    assert_eq!(witnesses[0].value, witness);
     assert_eq!(graph.aval(witness).dtype, DType::F32);
     assert_eq!(graph.aval(witness).numel(), 1);
 }

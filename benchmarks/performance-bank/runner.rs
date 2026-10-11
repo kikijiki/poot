@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
+use poot_executor::{Device, Engine, Executor, HostView, NoSync, StepInputs};
 use poot_graph_ir::{Builder, Graph, TensorType, ops};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
@@ -90,6 +90,8 @@ struct Prepared {
     consts: Vec<(String, HostTensor)>,
     references: Vec<Vec<f64>>,
     out_shape: Vec<usize>,
+    /// Per-step slot inputs, bound identically at every step: key, shape and the I32 words as bytes.
+    slots: Vec<(poot_graph_ir::SlotKey, Vec<usize>, Vec<u8>)>,
     observed: Value,
 }
 
@@ -137,7 +139,7 @@ fn dense_matmul(bank: &Value, case: &Value) -> Result<Prepared, String> {
         let xi = b.constant("x", TensorType::f32(vec![m, k]));
         let wi = b.constant(&name, TensorType::f32(vec![k, n]));
         let y = b.matmul(xi, wi);
-        graphs.push(b.finish(y));
+        graphs.push(b.finish(y).unwrap());
         consts.push((name, HostTensor::f32(vec![k, n], w)));
     }
     Ok(Prepared {
@@ -145,6 +147,7 @@ fn dense_matmul(bank: &Value, case: &Value) -> Result<Prepared, String> {
         consts,
         references,
         out_shape: vec![m, n],
+        slots: Vec::new(),
         observed: json!({
             "shape": { "m": m, "k": k, "n": n },
             "storage": "f32",
@@ -163,6 +166,20 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
         dim(shape, "d")?,
         dim(shape, "cap")?,
     );
+    // `live`, when the shape names it, is the number of keys the step attends to: the graph derives its
+    // length from `Slot::Pos` (the guarded live composite), so a short live length against a long capacity
+    // is what a decode step at that position runs. Without it the whole capacity is live.
+    let live = match shape.get("live") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .map(|v| v as usize)
+                .filter(|&v| (1..=cap).contains(&v))
+                .ok_or("case shape `live` must be an integer in 1..=cap")?,
+        ),
+    };
+    let attended = live.unwrap_or(cap);
     let copies = weight_copies(bank, case, 2 * hkv * cap * d * 4)?;
     if copies != 1 {
         return Err(
@@ -182,7 +199,7 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
     let mut want = vec![0.0f64; hq * d];
     for head in 0..hq {
         let kv = head / n_rep;
-        let scores: Vec<f64> = (0..cap)
+        let scores: Vec<f64> = (0..attended)
             .map(|t| {
                 let dot: f64 = (0..d)
                     .map(|i| f64::from(q[head * d + i]) * f64::from(k[(kv * cap + t) * d + i]))
@@ -194,7 +211,7 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
         let weights: Vec<f64> = scores.iter().map(|s| (s - peak).exp()).collect();
         let total: f64 = weights.iter().sum();
         for i in 0..d {
-            want[head * d + i] = (0..cap)
+            want[head * d + i] = (0..attended)
                 .map(|t| weights[t] * f64::from(v[(kv * cap + t) * d + i]))
                 .sum::<f64>()
                 / total;
@@ -204,23 +221,71 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
     let qi = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
     let ki = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
     let vi = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-    let y = ops::attention_masked(&b, qi, ki, vi, n_rep, scale, mask);
+    let mut consts = vec![
+        ("q".into(), HostTensor::f32(vec![1, hq, 1, d], q)),
+        ("k".into(), HostTensor::f32(vec![1, hkv, cap, d], k)),
+        ("v".into(), HostTensor::f32(vec![1, hkv, cap, d], v)),
+    ];
+    let mut slots = Vec::new();
+    let graph = if live.is_some() {
+        let pos = b.slot_ranged(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+            // The position is declared in `0..cap`, which every binder checks: the guarded composite then
+            // needs no validation witness to fuse to the live attention (the serving decode graphs' form).
+            poot_graph_ir::IndexRange::below(cap).ok_or("cap must be non-zero")?,
+        );
+        let mask = ops::causal_mask_from_pos(&b, pos, cap, None);
+        let len = b.binary_scalar(
+            poot_graph_ir::BinOp::Add,
+            b.reshape(pos, vec![1]),
+            poot_graph_ir::Scalar::I32(1),
+        );
+        let composite = ops::attention_live(
+            &b,
+            qi,
+            ops::AttentionKeys::Single(ki),
+            vi,
+            n_rep,
+            scale,
+            mask,
+            None,
+            len,
+        )
+        .map_err(|e| format!("the live attention composite: {e:?}"))?;
+        let graph = b.finish(composite.out).unwrap();
+        let key = graph
+            .meta(pos.id())
+            .slot_key()
+            .cloned()
+            .ok_or("Slot::Pos has no slot key")?;
+        slots.push((
+            key,
+            vec![1, 1],
+            ((attended - 1) as i32).to_le_bytes().to_vec(),
+        ));
+        graph
+    } else {
+        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
+        consts.push((
+            "mask".into(),
+            HostTensor::f32(vec![1, 1, 1, cap], vec![0.0; cap]),
+        ));
+        let y = ops::attention_masked(&b, qi, ki, vi, n_rep, scale, mask);
+        b.finish(y).unwrap()
+    };
+    let mut shape_json = json!({ "hq": hq, "hkv": hkv, "d": d, "cap": cap });
+    if let Some(live) = live {
+        shape_json["live"] = json!(live);
+    }
     Ok(Prepared {
-        graphs: vec![b.finish(y)],
-        consts: vec![
-            ("q".into(), HostTensor::f32(vec![1, hq, 1, d], q)),
-            ("k".into(), HostTensor::f32(vec![1, hkv, cap, d], k)),
-            ("v".into(), HostTensor::f32(vec![1, hkv, cap, d], v)),
-            (
-                "mask".into(),
-                HostTensor::f32(vec![1, 1, 1, cap], vec![0.0; cap]),
-            ),
-        ],
+        graphs: vec![graph],
+        consts,
         references: vec![want],
         out_shape: vec![1, hq, 1, d],
+        slots,
         observed: json!({
-            "shape": { "hq": hq, "hkv": hkv, "d": d, "cap": cap },
+            "shape": shape_json,
             "storage": "f32",
             "layout": "bhsd",
             "weight_copies": 1,
@@ -324,7 +389,7 @@ fn ssd_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
         &operands,
     );
     Ok(Prepared {
-        graphs: vec![b.finish(scan.packed)],
+        graphs: vec![b.finish(scan.packed).unwrap()],
         consts: vec![
             ("x".into(), HostTensor::f32(x_ty, x)),
             ("b".into(), HostTensor::f32(bc_ty.clone(), b_in)),
@@ -336,6 +401,7 @@ fn ssd_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
         ],
         references: vec![want],
         out_shape: vec![1, heads, rows, p],
+        slots: Vec::new(),
         observed: json!({
             "shape": { "family": "ssd", "heads": heads, "p": p, "n": n, "steps": len },
             "storage": "f32",
@@ -420,7 +486,7 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
         &operands,
     );
     Ok(Prepared {
-        graphs: vec![b.finish(scan.packed)],
+        graphs: vec![b.finish(scan.packed).unwrap()],
         consts: vec![
             ("q".into(), HostTensor::f32(sequence.clone(), q)),
             ("k".into(), HostTensor::f32(sequence.clone(), k)),
@@ -431,6 +497,7 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
         ],
         references: vec![want],
         out_shape: vec![1, heads, rows, d],
+        slots: Vec::new(),
         observed: json!({
             "shape": { "heads": heads, "d": d, "steps": len },
             "storage": "f32",
@@ -456,12 +523,9 @@ fn prepare(bank: &Value, case: &Value) -> Result<Prepared, String> {
     }
 }
 
-fn staged(
-    g: &Graph,
-    target: Target,
-) -> Result<StagedProgram<poot_graph_ir::ValidationOutputs>, String> {
+fn staged(g: &Graph, target: Target) -> Result<StagedProgram, String> {
     compile_staged(
-        &g.clone().with_validations(Vec::new()),
+        &g.clone(),
         &TargetSet::single(DeviceId(0), target),
         &Partition {
             experts: ExpertPlacement::AllResident,
@@ -473,7 +537,7 @@ fn staged(
 }
 
 /// The kernels the planner chose, in plan order: label (family, schedule, shape) and plan key.
-fn plan_of(program: &StagedProgram<poot_graph_ir::ValidationOutputs>) -> Vec<String> {
+fn plan_of(program: &StagedProgram) -> Vec<String> {
     program
         .stages()
         .flat_map(|(_, _, p)| p.planned())
@@ -541,9 +605,15 @@ where
     let repeats = timing["repeats"].as_u64().ok_or("timing_policy.repeats")? as usize;
     let mut step = |index: usize| -> Result<(f64, HostTensor), String> {
         let entry = entries[index % entries.len()];
+        let mut inputs = StepInputs::new();
+        for (key, shape, bytes) in &prepared.slots {
+            let words = HostView::new(poot_tensor::DType::I32, bytes.len() / 4, bytes)
+                .map_err(|e| format!("slot input: {e}"))?;
+            inputs.push(key.clone(), shape, words);
+        }
         let started = Instant::now();
         let output = exec
-            .step(exe, entry, &StepInputs::new(), &mut NoSync)
+            .step(exe, entry, &inputs, &mut NoSync)
             .map_err(|e| format!("step: {e}"))?
             .to_host()
             .map_err(|e| format!("read: {e}"))?;

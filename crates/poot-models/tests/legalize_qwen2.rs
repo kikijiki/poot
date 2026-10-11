@@ -11,7 +11,7 @@
 use std::collections::HashMap as Map;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::{Slot, Storage, ValueId};
 use poot_graph_plan::{CompileOptions, Submission, Target, compile};
 use poot_models::model::{LogitRows, Phase};
@@ -52,12 +52,10 @@ fn tiny_legalize_model() -> poot_executor_parity::weight_map::MappedModel {
 /// `tiny_legalize_model`'s step graph for `phase`: `tokens` new tokens over `cap` positions, logits
 /// at every position so the graph ends in the lm_head `MatMul` [`without_lm_head`] cuts at.
 fn trace(phase: Phase, tokens: usize, cap: usize) -> poot_graph_ir::Graph {
-    plain(
-        tiny_legalize_model()
-            .model
-            .trace(phase, step(1, tokens, cap, LogitRows::All))
-            .unwrap(),
-    )
+    tiny_legalize_model()
+        .model
+        .trace(phase, step(1, tokens, cap, LogitRows::All))
+        .unwrap()
 }
 
 /// A [`poot_target::DeviceCaps`] whose `max_buffer_bytes` sits strictly between the largest non-embed
@@ -83,12 +81,12 @@ fn caps_hosting_only_the_tiny_embed() -> poot_target::DeviceCaps {
 
 /// [`tiny_legalize_cfg`]'s decode/prefill graph, stopped at the final RMSNorm (no lm_head matmul): the
 /// dense embed gather always emits, with everything after it that `legalize`'s rewrite cannot affect.
-fn without_lm_head(mut g: poot_graph_ir::Graph) -> poot_graph_ir::Graph {
+fn without_lm_head(g: poot_graph_ir::Graph) -> poot_graph_ir::Graph {
     use poot_graph_ir::{OpKind, Operand};
     let out_eqn = g
-        .eqns
+        .eqns()
         .iter()
-        .find(|e| e.out == g.output)
+        .find(|e| e.out == g.result())
         .expect("the graph's declared output is produced by an equation");
     assert!(
         matches!(out_eqn.op, OpKind::MatMul),
@@ -98,11 +96,11 @@ fn without_lm_head(mut g: poot_graph_ir::Graph) -> poot_graph_ir::Graph {
     let Operand::Value(hidden) = out_eqn.inputs[0] else {
         panic!("lm_head MatMul's first operand must be a value")
     };
-    g.output = hidden;
-    let g = poot_graph_plan::dce(&g);
+    let g = poot_test_util::graph_fixtures::derive(&g, |draft| draft.set_result(hidden)).unwrap();
+    let g = poot_graph_plan::dce(&g).unwrap();
 
     let referenced: std::collections::HashSet<_> = g
-        .eqns
+        .eqns()
         .iter()
         .flat_map(|e| {
             e.inputs.iter().filter_map(|&o| match o {
@@ -110,30 +108,14 @@ fn without_lm_head(mut g: poot_graph_ir::Graph) -> poot_graph_ir::Graph {
                 Operand::Lit(_) => None,
             })
         })
-        .chain(std::iter::once(g.output))
-        .chain(g.state.iter().flat_map(|&(a, b)| [a, b]))
+        .chain(std::iter::once(g.result()))
+        .chain(g.state().flat_map(|(a, b)| [a, b]))
         .collect();
-    poot_graph_ir::Graph {
-        inputs: g
-            .inputs
-            .iter()
-            .copied()
-            .filter(|id| referenced.contains(id))
-            .collect(),
-        consts: g
-            .consts
-            .iter()
-            .copied()
-            .filter(|id| referenced.contains(id))
-            .collect(),
-        slots: g
-            .slots
-            .iter()
-            .copied()
-            .filter(|(id, _)| referenced.contains(id))
-            .collect(),
-        ..g
-    }
+    let mut pruned = g.edit();
+    pruned.inputs_mut().retain(|id| referenced.contains(id));
+    pruned.consts_mut().retain(|id| referenced.contains(id));
+    pruned.slots_mut().retain(|(id, _)| referenced.contains(id));
+    pruned.commit().unwrap()
 }
 
 #[test]
@@ -155,7 +137,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     };
     let gd = without_lm_head(trace(Phase::Decode, 1, cap));
     let mut di: Map<ValueId, Value> = Map::new();
-    for &id in &gd.inputs {
+    for &id in gd.inputs() {
         let m = gd.meta(id);
         match m.storage {
             Storage::Slot(Slot::Token) => di.insert(
@@ -175,7 +157,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             Storage::Device => unreachable!(),
         };
     }
-    for &(si, _) in &gd.state {
+    for (si, _) in gd.state() {
         di.insert(
             si,
             Value::from(HostTensor::zeros(gd.aval(si).shape.clone())),
@@ -187,7 +169,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
         .into_host()
         .unwrap();
 
-    let target = Target {
+    let target = Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: caps_hosting_only_the_tiny_embed(),
     };
@@ -196,7 +178,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
         .expect("the embed table hosts; nothing else in this fixture is oversized");
     let gh = program.graph();
     assert!(
-        gh.consts
+        gh.consts()
             .iter()
             .all(|&id| gh.meta(id).name.as_deref() != Some("w.embed")),
         "legalize must drop the oversized embed const, not merely refuse it"
@@ -206,7 +188,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     let token_row =
         embed_w.as_f32().unwrap()[token as usize * h..(token as usize + 1) * h].to_vec();
     let mut hi: Map<ValueId, Value> = Map::new();
-    for &id in &gh.inputs {
+    for &id in gh.inputs() {
         let m = gh.meta(id);
         match m.storage {
             Storage::Slot(Slot::Token) => {
@@ -232,7 +214,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             Storage::Device => unreachable!(),
         };
     }
-    for &(si, _) in &gh.state {
+    for (si, _) in gh.state() {
         hi.insert(
             si,
             Value::from(HostTensor::zeros(gh.aval(si).shape.clone())),
@@ -273,7 +255,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
 
     let gd = without_lm_head(trace(Phase::Prefill, l, l));
     let mut di: Map<ValueId, Value> = Map::new();
-    for &id in &gd.inputs {
+    for &id in gd.inputs() {
         let m = gd.meta(id);
         match m.storage {
             Storage::Slot(Slot::Token) => di.insert(
@@ -297,7 +279,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             Storage::Device => unreachable!(),
         };
     }
-    for &(si, _) in &gd.state {
+    for (si, _) in gd.state() {
         di.insert(
             si,
             Value::from(HostTensor::zeros(gd.aval(si).shape.clone())),
@@ -309,7 +291,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         .into_host()
         .unwrap();
 
-    let target = Target {
+    let target = Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: caps_hosting_only_the_tiny_embed(),
     };
@@ -324,7 +306,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         rows.extend_from_slice(&embed_w.as_f32().unwrap()[t as usize * h..(t as usize + 1) * h]);
     }
     let mut hi: Map<ValueId, Value> = Map::new();
-    for &id in &gh.inputs {
+    for &id in gh.inputs() {
         let m = gh.meta(id);
         match m.storage {
             Storage::Slot(Slot::Token) => {
@@ -351,7 +333,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             Storage::Device => unreachable!(),
         };
     }
-    for &(si, _) in &gh.state {
+    for (si, _) in gh.state() {
         hi.insert(
             si,
             Value::from(HostTensor::zeros(gh.aval(si).shape.clone())),

@@ -10,7 +10,7 @@
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor_parity::dense::step;
 use poot_graph_ir::op::OpKind;
-use poot_graph_ir::{Graph, Slot, Storage, ValidationOutputs};
+use poot_graph_ir::{Graph, Slot, Storage};
 use poot_graph_plan::{cse, dce, flash_attention_capped};
 use poot_models::model::{LogitRows, Phase};
 use poot_models::registry::Registry;
@@ -58,7 +58,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 
 /// The MPT registry fixture (ALiBi lives in the MPT and BLOOM families) over an F32 copy of its
 /// checkpoint, traced for `phase` with `tokens` new tokens over `cap` positions.
-fn mpt_graph(phase: Phase, tokens: usize, cap: usize) -> Graph<ValidationOutputs> {
+fn mpt_graph(phase: Phase, tokens: usize, cap: usize) -> Graph {
     let registry = Registry::builtin().unwrap();
     let entry = registry
         .entries()
@@ -94,13 +94,13 @@ fn mpt_graph(phase: Phase, tokens: usize, cap: usize) -> Graph<ValidationOutputs
 /// Bind every input of `g`: tokens `i % 13`, positions from `first_pos`, constants filled by shape,
 /// the ALiBi slopes (the graph's computed constant) as `slopes` when given, zeroed state.
 fn bind(
-    g: &Graph<ValidationOutputs>,
+    g: &Graph,
     first_pos: i32,
     slopes: Option<&[f32]>,
 ) -> HashMap<poot_graph_ir::ValueId, Value> {
     let mut inputs: HashMap<poot_graph_ir::ValueId, Value> = HashMap::new();
-    for id in g.inputs.iter().copied() {
-        let m = &g.values[id];
+    for id in g.inputs().iter().copied() {
+        let m = &g.values()[id];
         let numel = m.aval.shape.iter().product::<usize>().max(1);
         let t = match m.storage {
             Storage::Slot(Slot::Token) => HostTensor::i32(
@@ -143,18 +143,19 @@ fn bind(
 const SLOPES: &str = "alibi.slopes";
 
 /// `g` with its computed ALiBi slopes turned into a constant input, so a test can bind other values.
-fn slopes_as_input(g: &Graph<ValidationOutputs>) -> Graph<ValidationOutputs> {
-    let mut g = g.clone();
-    for &id in &g.inputs {
-        if matches!(g.values[id].storage, Storage::Computed(_)) {
-            g.values[id].storage = Storage::Const;
-            g.values[id].name = Some(SLOPES.to_string());
+fn slopes_as_input(g: &Graph) -> Graph {
+    poot_test_util::graph_fixtures::derive(g, |draft| {
+        for &id in g.inputs() {
+            if matches!(g.values()[id].storage, Storage::Computed(_)) {
+                draft.values_mut()[id].storage = Storage::Const;
+                draft.values_mut()[id].name = Some(SLOPES.to_string());
+            }
         }
-    }
-    g
+    })
+    .unwrap()
 }
 
-fn logits(g: &Graph<ValidationOutputs>, first_pos: i32, slopes: Option<&[f32]>) -> HostTensor {
+fn logits(g: &Graph, first_pos: i32, slopes: Option<&[f32]>) -> HostTensor {
     let g = &if slopes.is_some() {
         slopes_as_input(g)
     } else {
@@ -171,15 +172,15 @@ fn logits(g: &Graph<ValidationOutputs>, first_pos: i32, slopes: Option<&[f32]>) 
     .expect("a dense output")
 }
 
-fn count(g: &Graph<ValidationOutputs>, is: fn(&OpKind) -> bool) -> usize {
-    g.eqns.iter().filter(|e| is(&e.op)).count()
+fn count(g: &Graph, is: fn(&OpKind) -> bool) -> usize {
+    g.eqns().iter().filter(|e| is(&e.op)).count()
 }
 
 #[test]
 fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
     let (pos, cap) = (3usize, 8usize);
     let g = mpt_graph(Phase::Decode, 1, cap);
-    let fused = dce(&flash_attention_capped(&cse(&g), None));
+    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
     let n_flash = count(&fused, |op| matches!(op, OpKind::Attention(_)));
     assert_eq!(
         n_flash, LAYERS,
@@ -217,7 +218,7 @@ fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
 fn alibi_prefill_chain_fuses_to_flash_without_changing_logits() {
     let l = 5usize;
     let g = mpt_graph(Phase::Prefill, l, l);
-    let fused = dce(&flash_attention_capped(&cse(&g), None));
+    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
     let n_flash = count(&fused, |op| matches!(op, OpKind::Attention(_)));
     assert_eq!(
         n_flash, LAYERS,

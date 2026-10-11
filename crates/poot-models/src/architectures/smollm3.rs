@@ -36,7 +36,6 @@ use poot_graph_ir::{Builder, Graph};
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::ValidationOutputs;
 use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::chat::ChatFormat;
@@ -236,11 +235,7 @@ impl Model for Smollm3 {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         let b = Builder::new();
@@ -256,7 +251,7 @@ impl Model for Smollm3 {
                 |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 

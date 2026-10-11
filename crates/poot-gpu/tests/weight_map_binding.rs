@@ -12,6 +12,7 @@ use poot_models::model::Phase;
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::DType;
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::gpu_caps;
 use poot_test_util::weight_map_oracle::eval_mapped;
 
 fn engine() -> Option<(Box<dyn Executor>, poot_graph_plan::Target)> {
@@ -76,13 +77,13 @@ fn a_hosted_embed_gather_equals_the_device_gather() {
         return;
     };
     let m = fixture::qwen2(HOSTED, Projections::Bf16, DType::F32);
-    let mut caps = target.caps;
+    let mut caps = gpu_caps(&target);
     caps.max_buffer_bytes = (HOSTED.vocab * HOSTED.hidden * 4 - 1) as u64;
     let hosted = |g| {
         let g = poot_graph_plan::legalize(&g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
             .unwrap();
         assert!(
-            g.slots.iter().any(|&(_, slot)| slot == Slot::TokenEmbed),
+            g.slots().iter().any(|&(_, slot)| slot == Slot::TokenEmbed),
             "the fixture cap hosts the embed gather"
         );
         g

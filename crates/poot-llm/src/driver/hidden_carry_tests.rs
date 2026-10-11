@@ -10,7 +10,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use poot_executor::{BufferRole, Device, Dispatch, Engine};
-use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
 use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target};
 use poot_models::chat::ChatFormat;
 use poot_models::components::standard::{HIDDEN_CARRY_STATE, Step, check_step};
@@ -90,11 +90,7 @@ impl Model for Carrier {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         check_step(CARRIER, phase, shape, CAPACITY)?;
         let b = Builder::new();
         let step = Step::new(&b, shape);
@@ -139,7 +135,7 @@ impl Model for Carrier {
             b.reshape(logits, vec![rows, out, 1]),
             vec![rows, out, VOCAB],
         );
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits).unwrap())
     }
 }
 
@@ -207,7 +203,7 @@ impl Device for FakeDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -432,9 +428,8 @@ fn the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched() {
     let rollback = snapshot::snapshot_entries(&schema).expect("recurrent state is rolled back");
     for graph in [&rollback.snapshot, &rollback.restore] {
         let mut names: Vec<String> = graph
-            .state
-            .iter()
-            .map(|&(input, _)| graph.meta(input).name.clone().unwrap())
+            .state()
+            .map(|(input, _)| graph.meta(input).name.clone().unwrap())
             .collect();
         names.sort();
         assert_eq!(names, ["toy.state", "toy.state@snap"]);

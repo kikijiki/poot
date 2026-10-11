@@ -153,7 +153,7 @@ mod tests {
         let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All));
         let xs = b.constant("x", TensorType::f32(vec![1, tokens, C]));
         let y = causal_conv(&b, &step, "conv.window", xs, &w, &p);
-        let g = step.finish(b, y);
+        let g = step.finish(b, y).unwrap();
         let zeros = vec![0.0; p.window() * C];
         let state = if state.is_empty() { &zeros[..] } else { state };
         let ids: Vec<i32> = (0..tokens as i32).collect();

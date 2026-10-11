@@ -200,6 +200,80 @@
       "identity_digest": "199253cbba3a85b4fe014043d3d0db8d73a3ddf52869559a1716520b05811001"
     },
     {
+      "id": "attention-low-head-decode-live-full",
+      "regime": "low-head attention, live length at the cache capacity",
+      "level": "kernel",
+      "producer": "attention_decode",
+      "shape": {
+        "hq": 2,
+        "hkv": 1,
+        "d": 128,
+        "cap": 32768,
+        "live": 32768
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "5a58c8abb74adda8befd92b69a8f16c4df9d78cfc32ca8f1eb42efefb222a713",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "6d3686ddf309fb60202dbcb17aec8b5ff085e03040985ba04de1ea773ddc261e"
+    },
+    {
+      "id": "attention-low-head-decode-live-short",
+      "regime": "low-head attention, live length far below the cache capacity",
+      "level": "kernel",
+      "producer": "attention_decode",
+      "shape": {
+        "hq": 2,
+        "hkv": 1,
+        "d": 128,
+        "cap": 32768,
+        "live": 1024
+      },
+      "storage": "f32",
+      "layout": "bhsd",
+      "numerics": {
+        "accumulate": "f32",
+        "scale": "1/sqrt(d)",
+        "reference": "f64 loop"
+      },
+      "token_fixture": "splitmix64-seed0-unit",
+      "cache": "weights-resident-hot",
+      "schedules": {
+        "parent": "planner-default",
+        "candidate": null
+      },
+      "scratch": "planner-owned; reported by the receipt as live/peak bytes",
+      "backends": [
+        "wgpu",
+        "rocm",
+        "ptx"
+      ],
+      "status": "runnable",
+      "fixture_id": "e490cd154004a42f8b9c60211ac17850201fc28428c8b663a729b73eb526e71c",
+      "schedule_id": "d49a78ddb52a610abcbaeef93c812e4a2548064b64390b568c395ab3b274db77",
+      "cache_id": "4f0c858246524ebfee5f1018a6dc35d61e57f2ad4a4db85c7f2c2d71ddc2f1fb",
+      "identity_digest": "6f3b510c9803383fe84f5ca54401873193a0a07087f104c5e882d9d91beaae2e"
+    },
+    {
       "id": "packed-decode-gemv",
       "regime": "packed bandwidth decode",
       "level": "kernel",

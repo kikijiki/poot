@@ -16,9 +16,9 @@ fn concat2_plan_selection() {
         let x = b.constant("x", TensorType::new(vec![2, 3], dt));
         let y = b.constant("y", TensorType::new(vec![2, 5], dt));
         let out = b.concat(1, &[x, y]);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::Concat { .. }))
             .unwrap();
@@ -73,9 +73,9 @@ fn dyn_update_slice_plan_selection() {
         let update = b.constant("update", TensorType::new(ushape, dt.dtype));
         let index = b.constant("index", TensorType::scalar(poot_tensor::DType::I32));
         let out = b.dynamic_update_slice_dyn(operand, update, index, 1);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::DynamicUpdateSlice { .. }))
             .unwrap();
@@ -129,9 +129,9 @@ fn dyn_update_slice_plan_selection() {
         let operand = b.constant("operand", TensorType::f32(vec![4, 5]));
         let update = b.constant("update", TensorType::f32(vec![4, 2]));
         let out = b.dynamic_update_slice(operand, update, 1, 1);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::DynamicUpdateSlice { .. }))
             .unwrap();
@@ -165,7 +165,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
     let index = b.constant("index", TensorType::scalar(poot_tensor::DType::I32));
     let out = b.dynamic_update_slice_dyn(operand, update, index, 1);
     let (oi, ui, ii) = (operand.id(), update.id(), index.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         oi,
@@ -191,7 +191,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
     let su = bs.constant("update", TensorType::f32(vec![rows, 1, cols]));
     let sout = bs.dynamic_update_slice(so, su, idx, 1);
     let (soi, sui) = (so.id(), su.id());
-    let gs = bs.finish(sout);
+    let gs = bs.finish(sout).unwrap();
     let mut sinputs = HashMap::new();
     sinputs.insert(
         soi,
@@ -254,10 +254,10 @@ fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
     let regrouped = b.reshape(attention, vec![1, hq, d, l]);
     let w = b.constant("w", TensorType::f32(vec![1, hq, l, 6]));
     let out = b.matmul(regrouped, w);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
-    let target = Target {
+    let target = Target::Gpu {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     };

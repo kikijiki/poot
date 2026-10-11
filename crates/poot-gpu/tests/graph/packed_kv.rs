@@ -19,9 +19,9 @@ fn nvptx_decode_gemv_plan_selection() {
         let x = b.constant("x", TensorType::f32(vec![bsz, 1, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let out = b.matmul(x, w);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eqn = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .unwrap();
@@ -129,7 +129,7 @@ fn decode_gemv_random_shapes_gpu_matches_cpu() {
         } else {
             b.matmul(x, w)
         };
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         // Plan and choice are read off the compiled program. The decode GEMV has no epilogue lowering, so
         // `compile` leaves the traced bias add as its own equation.
         let program = compile_full(&g, &spirv_fixture_target());
@@ -253,7 +253,7 @@ fn batched_decode_gemv_gpu_matches_cpu() {
         } else {
             b.matmul(x, w)
         };
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         // Plan and choice are read off the compiled program. The decode GEMV has no epilogue lowering, so
         // `compile` leaves the traced bias add as its own equation.
         let program = compile_full(&g, &spirv_fixture_target());

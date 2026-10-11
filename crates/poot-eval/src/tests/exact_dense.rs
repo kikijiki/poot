@@ -213,7 +213,7 @@ fn dense_view_lifecycle_bytes(elements: usize) -> usize {
     );
     let builder = Builder::new();
     let constant = builder.constant("i64", TensorType::new([elements], DType::BF16));
-    let graph = builder.finish(constant);
+    let graph = builder.finish(constant).unwrap();
     let (output, bytes) = allocated_bytes(|| {
         let view = DenseOwnerTensorView::new(Arc::clone(&owner)).unwrap();
         let _reshaped = view.reshape(vec![2, elements / 2]).unwrap();
@@ -308,7 +308,7 @@ fn dense_exact_value_rejects_nonview_ops() {
         let builder = Builder::new();
         let source = builder.constant("bf16", TensorType::new([2, 3], DType::BF16));
         let output = operation(&builder, source);
-        let graph = builder.finish(output);
+        let graph = builder.finish(output).unwrap();
         let error = eval(
             &graph,
             &HashMap::from([(source.id(), value.clone())]),
@@ -338,7 +338,7 @@ fn dense_eval_preflight_precedes_execution() {
     let exact = builder.constant("bf16", TensorType::new([2, 3], DType::BF16));
     let _allocating_prefix = builder.binary(BinOp::Add, unrelated, unrelated);
     let output = builder.slice(exact, 0, 0, 1);
-    let graph = builder.finish(output);
+    let graph = builder.finish(output).unwrap();
     let mut inputs = HashMap::from([
         (
             unrelated.id(),
@@ -376,7 +376,7 @@ fn dense_eval_identity_reuses_typed_metadata_validation() {
     let (bf16, _) = views();
     let builder = Builder::new();
     let exact = builder.constant("wrong", TensorType::new([6], DType::BF16));
-    let graph = builder.finish(exact);
+    let graph = builder.finish(exact).unwrap();
     let error = eval(
         &graph,
         &HashMap::from([(exact.id(), Value::from(bf16.clone()))]),
@@ -392,7 +392,7 @@ fn dense_eval_identity_reuses_typed_metadata_validation() {
 
     let builder = Builder::new();
     let exact = builder.constant("bf16", TensorType::new([6], DType::BF16));
-    let graph = builder.finish(exact);
+    let graph = builder.finish(exact).unwrap();
     let output = eval(
         &graph,
         &HashMap::from([(exact.id(), Value::from(bf16.clone()))]),

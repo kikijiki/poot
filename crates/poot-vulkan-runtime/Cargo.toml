@@ -11,7 +11,7 @@ rust-version.workspace = true
 [dependencies]
 # Dynamically loaded (`Entry::load` dlopens libvulkan.so.1, the default "loaded" feature), so this
 # crate builds without the Vulkan SDK or headers (spec 133 FR-001, as poot-rocm-runtime does for libhsa).
-ash = "0.38"
+ash.workspace = true
 poot-target.workspace = true
 thiserror.workspace = true
 # The library only dispatches the .spv bytes it is given. These three are for the `poot-vulkan-check`

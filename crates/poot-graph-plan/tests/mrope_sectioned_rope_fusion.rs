@@ -54,10 +54,10 @@ fn rope_fusion_matches_and_is_result_preserving_on_sectioned_rope() {
         pos_h.id(),
         pos_w.id(),
     );
-    let g = b.finish(out);
-    let g2 = rope_fusion(&cse(&g));
+    let g = b.finish(out).unwrap();
+    let g2 = rope_fusion(&cse(&g).unwrap()).unwrap();
     let has_rope_op = g2
-        .eqns
+        .eqns()
         .iter()
         .any(|e| matches!(e.op, poot_graph_ir::op::OpKind::Rope { .. }));
     assert!(

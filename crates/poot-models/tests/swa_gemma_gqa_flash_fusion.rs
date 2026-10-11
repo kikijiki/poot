@@ -28,9 +28,9 @@ fn swa_gqa_prefill_reaches_the_grouped_flash_path() {
         .model
         .trace(Phase::Prefill, step(1, 6, 6, LogitRows::Last))
         .unwrap();
-    let fused = dce(&flash_attention_capped(&cse(&g), None));
+    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
     let reps: Vec<usize> = fused
-        .eqns
+        .eqns()
         .iter()
         .filter_map(|e| match &e.op {
             OpKind::Attention(attrs) => Some(attrs.n_rep),

@@ -1,0 +1,18 @@
+# Required cases for `just test-device-npu`, one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py npu) fails the lane unless every case here ran and passed - a skip is
+# never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# Every poot-npu device row, on the XDNA2 NPU through the real compile -> Engine -> XRT route: the fixture
+# bank against the shared oracle, the measured tile-memory boundary, the planner's typed refusals for the NPU
+# target, the device's own pre-XRT refusals, unload releasing every buffer, capture/replay, and the failed
+# run's poison and quarantine.
+poot-npu::xdna_device	a_byte_artifact_kernel_is_refused_at_load
+poot-npu::xdna_device	a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs
+poot-npu::xdna_device	a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers
+poot-npu::xdna_device	equations_the_npu_cannot_lower_are_refused_with_typed_capabilities
+poot-npu::xdna_device	every_buffer_is_released_when_the_executable_is_unloaded
+poot-npu::xdna_device	replaying_a_recording_over_reset_state_is_bit_identical
+poot-npu::xdna_device	the_declared_tile_memory_is_the_size_that_links_and_runs
+poot-npu::xdna_device	the_fixture_bank_matches_the_oracle_on_the_npu

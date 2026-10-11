@@ -60,11 +60,13 @@ fn optimized_exact_i32_region_matches_the_unoptimized_graph() {
     let decremented = b.binary(BinOp::Sub, history, ones);
     let nonnegative = b.binary(BinOp::Ge, history, zero);
     let selected = b.select(nonnegative, decremented, history);
-    let graph = b.finish_with_state(selected, &[(history, selected)]);
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(selected).with_state(&[(history, selected)]))
+        .unwrap();
 
-    let optimized = optimize(&graph);
+    let optimized = optimize(&graph).unwrap();
     assert!(
-        optimized.eqns.iter().any(|eqn| {
+        optimized.eqns().iter().any(|eqn| {
             matches!(eqn.op, poot_graph_ir::OpKind::Fused(_))
                 && optimized.aval(eqn.out).dtype == DType::I32
         }),
@@ -130,12 +132,12 @@ fn exact_i32_pack_region_replays_its_concat() {
     let not0 = b.unary(UnOp::Not, lane0);
     let not1 = b.unary(UnOp::Not, lane1);
     let concatenated = b.concat(1, &[not0, not1]);
-    let graph = b.finish(concatenated);
-    let optimized = optimize(&graph);
+    let graph = b.finish(concatenated).unwrap();
+    let optimized = optimize(&graph).unwrap();
 
     assert_eq!(
         optimized
-            .eqns
+            .eqns()
             .iter()
             .filter(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Fused(_)))
             .count(),
@@ -171,8 +173,8 @@ fn exact_i32_pack_region_replays_its_concat() {
 /// optimized graph is bit-identical to the unoptimized one on the one walk over three chained
 /// steps, witness included.
 ///
-/// Mutation: drop the `ValidationChannel` generic on one pass (for example make `optimize` take
-/// `&Graph`); this call stops compiling, which is the type-check row recorded in the card.
+/// Mutation: make one pass shed the witness (`retain_witnesses(|_| false)` before its commit); the
+/// commit is refused with `EditError::WitnessDropped` and this row goes red.
 #[test]
 fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
     let b = Builder::new();
@@ -190,10 +192,9 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
     )
     .unwrap();
 
-    let optimized = optimize(&graph);
-    assert_eq!(
-        optimized.validation_outputs(),
-        graph.validation_outputs(),
+    let optimized = optimize(&graph).unwrap();
+    assert!(
+        optimized.witnesses().eq(graph.witnesses()),
         "optimize must keep the witness declaration"
     );
 
@@ -254,14 +255,14 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
         .environment
         .unwrap();
         assert_eq!(
-            env_a[graph.output]
+            env_a[graph.result()]
                 .as_ref()
                 .unwrap()
                 .as_host()
                 .unwrap()
                 .as_f32()
                 .unwrap(),
-            env_b[optimized.output]
+            env_b[optimized.result()]
                 .as_ref()
                 .unwrap()
                 .as_host()
@@ -315,10 +316,10 @@ fn pipeline_witness_output_survives_every_pass() {
     let graph =
         helpers::finish_with_validations(b, primary, &[(ValidationId(533), "neighbour", witness)])
             .unwrap();
-    let optimized = optimize(&graph);
+    let optimized = optimize(&graph).unwrap();
     assert!(
         optimized
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Fused(_))),
         "the neighbouring chain must fuse, or this row proves nothing"

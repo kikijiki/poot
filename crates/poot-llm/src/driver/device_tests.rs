@@ -4262,9 +4262,8 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
         let graph = model.trace(phase, shape(tokens)).unwrap();
         assert!(
             graph
-                .state
-                .iter()
-                .any(|&(input, _)| graph.meta(input).name.as_deref() == Some(HIDDEN_CARRY_STATE)),
+                .state()
+                .any(|(input, _)| graph.meta(input).name.as_deref() == Some(HIDDEN_CARRY_STATE)),
             "{phase:?} at {tokens} tokens declares the carry"
         );
         let graph = bind_packed_weights(&graph, &formats).unwrap();
@@ -4435,9 +4434,8 @@ fn oracle_step_logits(
         if state.is_empty() {
             // A carried token history is I32; every other state starts as zeros.
             state = graph
-                .state
-                .iter()
-                .map(|&(si, _)| {
+                .state()
+                .map(|(si, _)| {
                     let aval = graph.aval(si);
                     match aval.dtype {
                         poot_tensor::DType::I32 => {
@@ -4630,9 +4628,8 @@ fn oracle(
     let model = handle.model();
     let graph = model.trace(phase, shape).unwrap();
     let state: Vec<HostTensor> = graph
-        .state
-        .iter()
-        .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .state()
+        .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
         .collect();
     eval_mapped(&graph, handle.store(), model.weights(), slots, &state)
         .0

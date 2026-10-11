@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::chat::ChatFormat;
@@ -291,11 +291,7 @@ impl Model for Qwen2 {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         let phase = check_embeddable_step(self.family, phase, shape, p.max_positions)?;
         let b = Builder::new();
@@ -320,7 +316,7 @@ impl Model for Qwen2 {
                 |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -465,10 +461,9 @@ mod tests {
     /// The prompt every encode and embeds test traces.
     const PROMPT: [i32; 5] = [3, 17, 40, 8, 25];
 
-    fn zero_state(g: &Graph<ValidationOutputs>) -> Vec<Vec<f32>> {
-        g.state
-            .iter()
-            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+    fn zero_state(g: &Graph) -> Vec<Vec<f32>> {
+        g.state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
             .collect()
     }
 
@@ -940,8 +935,9 @@ mod tests {
         let g = model.trace(Phase::Prefill, shape).unwrap();
         let bound =
             bind_packed_weights(&g, &WeightFormats::from_weight_map(model.weights())).unwrap();
-        let claimed = recognize_packed_row_gathers(&recognize_packed_contractions(&bound));
-        let count = |f: fn(&OpKind) -> bool| claimed.eqns.iter().filter(|e| f(&e.op)).count();
+        let claimed =
+            recognize_packed_row_gathers(&recognize_packed_contractions(&bound).unwrap()).unwrap();
+        let count = |f: fn(&OpKind) -> bool| claimed.eqns().iter().filter(|e| f(&e.op)).count();
         assert_eq!(
             count(|op| matches!(op, OpKind::PackedRowGather { .. })),
             1,
@@ -955,9 +951,8 @@ mod tests {
         assert_eq!(count(|op| matches!(op, OpKind::PackedDequant { .. })), 0);
 
         let zeros: Vec<Vec<f32>> = claimed
-            .state
-            .iter()
-            .map(|&(si, _)| vec![0.0; claimed.aval(si).numel()])
+            .state()
+            .map(|(si, _)| vec![0.0; claimed.aval(si).numel()])
             .collect();
         let zeros: Vec<&[f32]> = zeros.iter().map(Vec::as_slice).collect();
         let (got, state) = oracle::eval(

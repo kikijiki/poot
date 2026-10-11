@@ -107,7 +107,7 @@ fn program(ids: &[i32], gate: Option<Vec<f32>>) -> Program {
         out = b.binary(BinOp::Mul, out, column);
     }
     Program {
-        graph: b.finish(out),
+        graph: b.finish(out).unwrap(),
         inputs,
     }
 }
@@ -147,7 +147,7 @@ fn checkpoint_program_gated(ids: &[i32], gate: Option<Vec<f32>>) -> Program {
         out = b.binary(BinOp::Mul, out, b.reshape(gate_t, vec![m, 1]));
     }
     Program {
-        graph: b.finish(out),
+        graph: b.finish(out).unwrap(),
         inputs,
     }
 }
@@ -387,7 +387,7 @@ fn bf16_program(ids: &[i32], checkpoint_order: bool, gate: Option<Vec<f32>>) -> 
         out = b.binary(BinOp::Mul, out, b.reshape(gate_t, vec![m, 1]));
     }
     Program {
-        graph: b.finish(out),
+        graph: b.finish(out).unwrap(),
         inputs,
     }
 }

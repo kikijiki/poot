@@ -53,9 +53,8 @@ fn state_names(model: &dyn Model, capacity: usize) -> Vec<String> {
     let g = model
         .trace(Phase::Decode, shape(1, capacity, LogitRows::All))
         .unwrap();
-    g.state
-        .iter()
-        .map(|&(input, _)| g.meta(input).name.clone().unwrap())
+    g.state()
+        .map(|(input, _)| g.meta(input).name.clone().unwrap())
         .collect()
 }
 
@@ -308,7 +307,7 @@ fn the_hash_table_is_declared_in_the_expert_range() {
         .trace(Phase::Decode, shape(1, CAPACITY, LogitRows::All))
         .unwrap();
     let tables: Vec<_> = g
-        .inputs
+        .inputs()
         .iter()
         .map(|&id| g.meta(id))
         .filter(|meta| {
@@ -430,9 +429,8 @@ fn two_rows_do_not_share_state() {
     let run = |phase, tokens: usize, ids: Vec<i32>, pos: Vec<i32>, state: Vec<Vec<f32>>| {
         let g = model.trace(phase, two(tokens)).unwrap();
         let zeros: Vec<Vec<f32>> = g
-            .state
-            .iter()
-            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
             .collect();
         let state = if state.is_empty() { zeros } else { state };
         let views: Vec<&[f32]> = state.iter().map(Vec::as_slice).collect();
@@ -715,7 +713,7 @@ fn a_real_dims_fp4_expert_projection_equals_the_hand_decoded_column_real_dims() 
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![1, k]));
     let y = linear(&b, x, &w, None);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
     let formats = poot_graph_plan::WeightFormats::from_weight_map(&map);
     let g = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
     // Columns on both sides of a scale-block edge and in the last (ragged-free) block.
@@ -784,13 +782,12 @@ fn a_granule_four_prompt_decodes_as_the_reference() {
 }
 
 fn target_of(backend: Backend) -> Target {
-    Target {
+    Target::Gpu {
         backend,
         caps: match backend {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
-            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -806,11 +803,7 @@ fn backends() -> [Backend; 3] {
 const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
 
 /// The traced and weight-bound graph of one step of `phase` at `tokens` tokens.
-fn bound_step(
-    model: &dyn Model,
-    phase: Phase,
-    tokens: usize,
-) -> poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs> {
+fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
     let graph = model
         .trace(phase, shape(tokens, CAPACITY, LogitRows::Last))
         .unwrap();
@@ -858,7 +851,7 @@ fn a_bf16_checkpoint_keeps_the_grouped_o_projection_bf16_resident() {
             let g = program.graph();
             for name in &consts {
                 let id = g
-                    .values
+                    .values()
                     .iter_enumerated()
                     .find(|(_, meta)| meta.name.as_deref() == Some(name))
                     .map(|(id, _)| id)
@@ -869,17 +862,17 @@ fn a_bf16_checkpoint_keeps_the_grouped_o_projection_bf16_resident() {
                     "{phase:?} on {backend:?}: {name} is resident at its checkpoint dtype"
                 );
                 assert!(
-                    !g.eqns
-                        .iter()
-                        .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Cast { .. })
-                            && matches!(
-                                eqn.inputs.first(),
-                                Some(poot_graph_ir::Operand::Value(w)) if *w == id
-                            )),
+                    !g.eqns().iter().any(|eqn| matches!(
+                        eqn.op,
+                        poot_graph_ir::OpKind::Cast { .. }
+                    ) && matches!(
+                        eqn.inputs.first(),
+                        Some(poot_graph_ir::Operand::Value(w)) if *w == id
+                    )),
                     "{phase:?} on {backend:?}: {name} has no widened F32 copy"
                 );
                 assert!(
-                    g.eqns.iter().any(|eqn| matches!(
+                    g.eqns().iter().any(|eqn| matches!(
                         eqn.op,
                         poot_graph_ir::OpKind::GroupedDenseContraction {
                             weight: DType::BF16,
@@ -909,9 +902,8 @@ fn compile_preserves_every_witness_lane() {
     for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
         let graph = bound_step(&*model, phase, tokens);
         let traced: Vec<(poot_graph_ir::ValidationId, String, usize)> = graph
-            .validation_outputs()
-            .iter()
-            .map(|o| (o.id, o.name.clone(), graph.aval(o.value).numel()))
+            .witnesses()
+            .map(|o| (o.id, o.name.to_owned(), graph.aval(o.value).numel()))
             .collect();
         assert_eq!(
             traced.len(),

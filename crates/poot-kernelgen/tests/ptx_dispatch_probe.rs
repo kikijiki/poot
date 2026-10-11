@@ -16,10 +16,10 @@ use poot_ptx_runtime::PtxContext;
 use poot_test_util::kernel_fixtures::{attention_reference, attention_reference_keys};
 
 /// Encode f32 -> f16 bytes (little-endian), reusing the loader's own f32->f16 narrowing
-/// (`poot_load::gguf::f32_to_f16`), matching `coopmat_dispatch_probe.rs`'s helper.
+/// (`poot_quant::scalar::f32_to_f16`), matching `coopmat_dispatch_probe.rs`'s helper.
 fn f16_encode(data: &[f32]) -> Vec<u8> {
     data.iter()
-        .flat_map(|&f| poot_load::gguf::f32_to_f16(f).to_le_bytes())
+        .flat_map(|&f| poot_quant::scalar::f32_to_f16(f).to_le_bytes())
         .collect()
 }
 
@@ -68,7 +68,7 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
 
     // CPU oracle: round A/B to f16 (the WMMA load narrows on the way in), f32-accumulate, k=0..16 -
     // matching the RADV coopmat sibling probe's oracle shape (`coopmat_dispatch_probe.rs`).
-    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_load::gguf::f32_to_f16(x));
+    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
     let ra: Vec<f32> = a_data.iter().map(|&x| round(x)).collect();
     let rb: Vec<f32> = b_data.iter().map(|&x| round(x)).collect();
     let mut max_abs = 0.0f32;

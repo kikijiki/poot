@@ -136,7 +136,7 @@ multiple configurations. For the imported tiled GEMM the buffer is `[M, K, N, of
 ## The compile pipeline
 
 `poot_graph_plan::compile(graph, target, options)` runs the graph passes and planning together and
-returns a `Program`. `Target` combines the backend with runtime-measured `DeviceCaps`.
+returns a `Program`. A GPU `Target` pairs a backend with runtime-measured `DeviceCaps`; an AIE `Target` carries its own `AieCaps`.
 
 The current order is canonicalization, CSE, iota folding, RoPE and attention recognition, DCE, packed
 contraction/row-gather recognition and the packed escape check, legalization, dense BF16 recognition,

@@ -20,7 +20,7 @@ use poot_runtime_common::{
     AieArtifactError, AieBindError, AieBinding, AieBound, AieLinkedArtifact, AieShapeAbi,
     ArgAccess, KernelCode, check_aie_bindings, check_kernel_args,
 };
-use poot_target::{AieTargetId, Backend, BufferStorage, ElementKind, LogicalDType};
+use poot_target::{AieTargetId, BufferStorage, ElementKind, LogicalDType, TargetId};
 
 const LIMIT: NonZeroU64 = NonZeroU64::new(1 << 20).unwrap();
 
@@ -206,7 +206,14 @@ fn linked(dir: &Path, n: u64, dims: &[u64]) -> (poot_kernel_ir::Body, AieLinkedA
         Some(iron(dir, "npu2", Iron::Links)),
     );
     let cache = KernelCache::at(dir.join("cache"), Target::AieCore);
-    let compiled = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT).unwrap();
+    let compiled = compile_aie(
+        &body,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .unwrap();
     (body, compiled.artifact)
 }
 
@@ -222,7 +229,7 @@ fn the_ordinary_handle_carries_the_compiler_derived_abi() {
     assert_eq!(artifact.abi().core_lengths(), vec![6, 6, 6]);
 
     let handle = aie_kernel_handle(&body, artifact.clone()).unwrap();
-    assert_eq!(handle.target(), Backend::Aie(AieTargetId::Xdna2));
+    assert_eq!(handle.target(), TargetId::Aie(AieTargetId::Xdna2));
     assert_eq!(handle.entry_point(), "MLIR_AIE");
     assert!(!handle.has_trap());
     let args: Vec<_> = handle
@@ -598,7 +605,13 @@ fn an_unavailable_toolchain_is_a_typed_stage_cause_and_publishes_nothing() {
     let good_iron = iron(&dir, "npu2", Iron::Links);
     let run = |tc: Toolchain, name: &str| {
         let cache = KernelCache::at(dir.join(format!("cache-{name}")), Target::AieCore);
-        let result = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT);
+        let result = compile_aie(
+            &body,
+            &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+            &tc,
+            &cache,
+            LIMIT,
+        );
         assert_nothing_published(&cache);
         result.map(|_| ()).unwrap_err()
     };
@@ -671,9 +684,15 @@ fn a_failed_link_leaves_no_half_published_bundle() {
     ] {
         let tc = toolchain(Some(peano.clone()), Some(iron(&dir, "npu2", mode)));
         let cache = KernelCache::at(dir.join(format!("cache-{name}")), Target::AieCore);
-        let error = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT)
-            .map(|_| ())
-            .unwrap_err();
+        let error = compile_aie(
+            &body,
+            &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+            &tc,
+            &cache,
+            LIMIT,
+        )
+        .map(|_| ())
+        .unwrap_err();
         match (name, &error) {
             (
                 "fails",
@@ -712,15 +731,36 @@ fn a_linked_artifact_is_published_once_and_served_by_identity() {
     );
     let cache = KernelCache::at(dir.join("cache"), Target::AieCore);
     let (body, abi) = generated(6, &[2, 3]);
-    let first = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT).unwrap();
+    let first = compile_aie(
+        &body,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .unwrap();
     assert!(first.built);
     assert_eq!(entries(cache.dir()).len(), 1);
-    let second = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT).unwrap();
+    let second = compile_aie(
+        &body,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .unwrap();
     assert!(!second.built, "an unchanged schema is a cache hit");
     assert_eq!(second.artifact, first.artifact);
 
     let (body_t, abi_t) = generated(6, &[3, 2]);
-    let other = compile_aie(&body_t, &abi_t, AieTargetId::Xdna2, &tc, &cache, LIMIT).unwrap();
+    let other = compile_aie(
+        &body_t,
+        &AieLinkRecipe::sequential(&body_t.name, AieTargetId::Xdna2, &abi_t).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .unwrap();
     assert!(
         other.built,
         "equal element count, different dimensions: a different artifact"
@@ -743,8 +783,14 @@ fn a_real_peano_and_iron_toolchain_links_a_loadable_artifact() {
         .join(".cache/poot-codegen-test/aie-npu-artifact");
     let cache = KernelCache::at(dir, Target::AieCore);
     let (body, abi) = generated(6, &[2, 3]);
-    let compiled = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT)
-        .unwrap_or_else(|e| panic!("real AIE compile failed: {e}"));
+    let compiled = compile_aie(
+        &body,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .unwrap_or_else(|e| panic!("real AIE compile failed: {e}"));
     let handle = aie_kernel_handle(&body, compiled.artifact).unwrap();
     assert_eq!(handle.args().len(), 3);
 }
@@ -798,14 +844,20 @@ fn a_stale_cache_entry_for_another_shape_is_refused() {
     );
     let cache = KernelCache::at(dir.join("cache"), Target::AieCore);
     let (body, abi) = generated(6, &[2, 3]);
-    let first = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT).unwrap();
+    let first = compile_aie(
+        &body,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .unwrap();
 
     // The artifact of a different shape, planted under the [2,3] request's key.
     let (_, other_abi) = generated(6, &[3, 2]);
     let other = compile_aie(
         &body,
-        &other_abi,
-        AieTargetId::Xdna2,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &other_abi).unwrap(),
         &tc,
         &KernelCache::at(dir.join("other"), Target::AieCore),
         LIMIT,
@@ -815,9 +867,15 @@ fn a_stale_cache_entry_for_another_shape_is_refused() {
         .store(&first.identity.cache_key(), &other.artifact.to_bytes())
         .unwrap();
 
-    let error = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT)
-        .map(|_| ())
-        .unwrap_err();
+    let error = compile_aie(
+        &body,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .map(|_| ())
+    .unwrap_err();
     assert!(
         matches!(error, AieCompileError::StaleEntry { what: "shape ABI" }),
         "got {error:?}"
@@ -837,9 +895,15 @@ fn a_body_with_no_symbol_is_a_typed_core_object_error() {
     let cache = KernelCache::at(dir.join("cache"), Target::AieCore);
     let (mut body, abi) = generated(6, &[2, 3]);
     body.name.clear();
-    let error = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT)
-        .map(|_| ())
-        .unwrap_err();
+    let error = compile_aie(
+        &body,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .map(|_| ())
+    .unwrap_err();
     assert!(
         matches!(&error, AieCompileError::CoreObject { symbol } if symbol.is_empty()),
         "got {error:?}"
@@ -865,9 +929,15 @@ fn a_body_that_can_trap_is_refused_before_any_tool_runs_a_link() {
     let last = body.blocks.last_mut().unwrap();
     last.terminator = poot_kernel_ir::Terminator::Trap { code: 1 };
     assert!(body.has_trap());
-    let error = compile_aie(&body, &abi, AieTargetId::Xdna2, &tc, &cache, LIMIT)
-        .map(|_| ())
-        .unwrap_err();
+    let error = compile_aie(
+        &body,
+        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &tc,
+        &cache,
+        LIMIT,
+    )
+    .map(|_| ())
+    .unwrap_err();
     assert!(
         matches!(error, AieCompileError::Abi(AieAbiMismatch::Trap)),
         "got {error:?}"

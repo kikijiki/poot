@@ -34,7 +34,7 @@
 //! ```compile_fail,E0133
 //! fn from_any_text(text: &str) -> poot_ptx_runtime::CompiledKernel {
 //!     poot_ptx_runtime::CompiledKernel::new(
-//!         poot_target::Backend::Nvptx,
+//!         poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
 //!         "add",
 //!         poot_runtime_common::KernelCode::Ptx(text.into()),
 //!         Vec::new(),
@@ -46,7 +46,7 @@
 //! ```compile_fail,E0451
 //! fn forge(code: poot_runtime_common::KernelCode) -> poot_ptx_runtime::CompiledKernel {
 //!     poot_ptx_runtime::CompiledKernel {
-//!         target: poot_target::Backend::Nvptx,
+//!         target: poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
 //!         entry_point: "add".into(),
 //!         code,
 //!         args: Vec::new().into(),
@@ -66,7 +66,7 @@ mod owner;
 mod upload;
 
 pub use buffer::{AllocGuard, BufferRole, MemoryCounterSnapshot, PtxBuffer};
-pub use context::{PtxContext, f32_to_bf16};
+pub use context::PtxContext;
 pub use error::{BufferElement, BufferStorage, LogicalDType, PtxError, StorageLayout};
 pub use graph::{PtxGraphExec, PtxSpan, PtxSyncEvent};
 pub use owner::NativeCounters;

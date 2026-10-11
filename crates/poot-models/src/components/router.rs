@@ -607,7 +607,7 @@ mod tests {
             let step = Step::new(&b, step_shape(T, CAP, LogitRows::All));
             let xs = b.constant("x", TensorType::f32(vec![T, WIDTH]));
             let routes = route(&b, &step, 0, xs, &w, p);
-            let g = b.finish(pick(&routes));
+            let g = b.finish(pick(&routes)).unwrap();
             let tokens = vec![0; T];
             let pos: Vec<i32> = (0..T as i32).collect();
             fx.eval(
@@ -993,7 +993,7 @@ mod tests {
             let out = pick(crate::deepseek3::deepseek3_router_gate_and_ids(
                 &b, l, bs, TOP_K, 3, 2, 2.5,
             ));
-            let g = b.finish(out);
+            let g = b.finish(out).unwrap();
             fx.eval(&g, &[("l", &logits), ("bias", &bias)], &[], &[]).0
         };
         assert_eq!(ids, reference(|(_, ids)| ids), "selected experts");

@@ -103,8 +103,7 @@ contract. Current state:
 - Packed projections keep their stored representation through loading. Dense BF16/F16 weights are kept
   as stored words with no host f32 copy, and packed MoE experts are read in place by an indexed packed
   contraction, so no expert table is materialized on the device.
-- NPU offload was removed; the megakernel is a possible future
-  execution strategy, not code.
+- The megakernel was removed; it is a possible future execution strategy, not code.
 
 For models and features by backend, use the [feature matrix](../reference/feature-matrix.md).
 
@@ -123,5 +122,5 @@ For models and features by backend, use the [feature matrix](../reference/featur
 | [Serving design](./serving-design.mdx)                    | HTTP API and the serving design                      |
 | [Crates and implementation details](./implementation.mdx) | Crate map and cross-cutting notes                    |
 | [The Megakernel](./megakernel.mdx)                        | Removed; a possible future execution strategy        |
-| [NPU Offload](./npu.mdx)                                  | Removed for now                                      |
+| [NPU Offload](./npu.mdx)                                  | Experimental XDNA2 device, F32 add/sub/mul only      |
 | [Glossary](./glossary.mdx)                                | Terms used in this section                           |

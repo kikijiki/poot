@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::Device;
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::op::{FusedOp, FusedOperand, OpKind, UnOp};
 use poot_graph_ir::{Slot, Storage, ValueId};
 use poot_graph_plan::{CompileOptions, Submission, Target, compile};
@@ -29,6 +29,7 @@ use poot_models::model::{LogitRows, Phase};
 use poot_ptx_gpu::PtxDevice;
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::HostTensor;
+use poot_test_util::graph_fixtures::gpu_caps;
 use poot_test_util::{assert_close_rel, max_abs_error, seed_of};
 
 mod common;
@@ -64,7 +65,7 @@ fn carries_gelu(region: &poot_graph_ir::op::FusedRegion) -> bool {
 
 /// Count `Fused` regions in `g` that carry the GeGLU GELU.
 fn geglu_region_count(g: &poot_graph_ir::Graph) -> usize {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| match &e.op {
             OpKind::Fused(region) => carries_gelu(region),
@@ -97,17 +98,16 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
         .with("final_logit_softcapping", 30.0)
         .with("query_pre_attn_scalar", serde_json::Value::Null)
         .f32_model();
-    let g = plain(
-        m.model
-            .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
-            .unwrap(),
-    );
+    let g = m
+        .model
+        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .unwrap();
 
     // Bind the slots and Const inputs against the raw traced graph; `compile` preserves `g`'s
     // input/const identity (card 535b), so this bind stays valid for both compiled graphs below.
     // `Storage::State` (the KV cache) is zero at first declaration (Z5) and bound by the contract.
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for (i, &id) in g.inputs.iter().enumerate() {
+    for (i, &id) in g.inputs().iter().enumerate() {
         let m = g.meta(id);
         match m.storage {
             Storage::State | Storage::Computed(_) => continue,
@@ -130,9 +130,9 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
     }
 
     // Card 522: compile against the real, measured PTX device, never a default target.
-    let target = Target {
+    let target = Target::Gpu {
         backend: poot_target::Backend::Nvptx,
-        caps: Device::target(&ptx).caps,
+        caps: gpu_caps(&Device::target(&ptx)),
     };
     let fused = compile(
         &g,
@@ -149,10 +149,10 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
         fused_geglu_count,
         layers,
         "expected one Fused region carrying the GeGLU Gelu step per layer: {} eqns {:?}",
-        fused.graph().eqns.len(),
+        fused.graph().eqns().len(),
         fused
             .graph()
-            .eqns
+            .eqns()
             .iter()
             .map(|e| e.op.name())
             .collect::<Vec<_>>()
@@ -167,18 +167,17 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
     // The executor contract's own state buffers are always zero at first declaration (Z5), so this
     // matches `common::run_resident`'s state exactly with no seeding of its own.
     let zero_state: Vec<HostTensor> = g
-        .state
-        .iter()
-        .map(|&(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
+        .state()
+        .map(|(si, _)| HostTensor::zeros(g.aval(si).shape.clone()))
         .collect();
 
     let mut cpu_inputs = inputs.clone();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         if let Storage::Computed(computed) = g.meta(id).storage {
             cpu_inputs.insert(id, computed.tensor().into());
         }
     }
-    for (i, &(si, _)) in g.state.iter().enumerate() {
+    for (i, (si, _)) in g.state().enumerate() {
         cpu_inputs.insert(si, zero_state[i].clone().into());
     }
     let cpu_eval = eval(&g, &cpu_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))

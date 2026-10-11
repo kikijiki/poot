@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, TensorType, Traced, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph, Slot, TensorType, Traced};
 use poot_quant::weights::{
     AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
 };
@@ -330,11 +330,7 @@ impl Model for Idefics3Vision {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         if phase != Phase::Encode {
             return Err(TraceError::PhaseUnsupported {
@@ -406,7 +402,7 @@ impl Model for Idefics3Vision {
             vec![rows, p.visual_tokens(), p.text_width]
         );
         // The tower is stateless: the graph carries nothing to the next step.
-        Ok(b.finish(visual).with_validations(Vec::new()))
+        Ok(b.finish(visual)?)
     }
 }
 

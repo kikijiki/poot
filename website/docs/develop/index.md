@@ -32,10 +32,10 @@ poot has **three production backends** and a fourth, lower-priority one (`--back
 - **ptx**: NVIDIA via cudarc
 - **vulkan**: the same SPIR-V kernels as wgpu through raw Vulkan; verified on AMD (RADV) only, NVIDIA and Intel Vulkan drivers are untested
 
-**Removed:**
+**Experimental:**
 
-- **NPU offload**: removed; not a `--backend` and not in the library. See
-  [NPU](../architecture/npu.mdx).
+- **NPU**: an AMD XDNA2 library device (`poot-npu`, behind its `xdna` feature); not a `--backend`, and
+  it runs only a few F32 elementwise programs. See [NPU](../architecture/npu.mdx).
 
 See [Backends](../architecture/backends.mdx) for codegen and runtime details, and [Picking a
 backend](../serve/choosing-a-backend.md) for serve-time tradeoffs.

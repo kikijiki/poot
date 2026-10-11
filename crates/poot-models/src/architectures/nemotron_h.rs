@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{BinOp, Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph};
 use poot_quant::weights::{
     AttnRole, FfnRole, Mamba2Role, NormRole, WeightId, WeightKey, WeightMap, WeightMapError,
     WeightRole, WeightStore, WeightView,
@@ -366,11 +366,7 @@ impl Model for NemotronH {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         let b = Builder::new();
@@ -392,7 +388,7 @@ impl Model for NemotronH {
                 b.binary(BinOp::Add, x, y)
             },
         );
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -529,9 +525,8 @@ mod tests {
             .trace(Phase::Decode, step_shape(1, CAP, LogitRows::Last))
             .unwrap();
         let names: Vec<String> = g
-            .state
-            .iter()
-            .map(|&(input, _)| g.meta(input).name.clone().unwrap())
+            .state()
+            .map(|(input, _)| g.meta(input).name.clone().unwrap())
             .collect();
         assert_eq!(
             names,
@@ -565,9 +560,8 @@ mod tests {
         let g = model.trace(Phase::Prefill, shape).unwrap();
         let g = bind_packed_weights(&g, &WeightFormats::from_weight_map(model.weights())).unwrap();
         let zeros: Vec<Vec<f32>> = g
-            .state
-            .iter()
-            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
             .collect();
         let state: Vec<&[f32]> = zeros.iter().map(Vec::as_slice).collect();
         let tokens: Vec<i32> = prompts.concat();

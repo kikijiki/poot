@@ -107,7 +107,7 @@ fn slot_fixture(
     let if_true = branch_slot("if_true");
     let if_false = branch_slot("if_false");
     let out = build(&b, [cond, if_true, if_false]);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let step = || -> Vec<StepFixture> {
         [cond, if_true, if_false]
             .into_iter()
@@ -337,7 +337,7 @@ fn two_byte_cases() -> Vec<(Fixture, Vec<u16>)> {
             let on = b.constant("if_true", TensorType::new(vec![n], dtype));
             let off = b.constant("if_false", TensorType::new(vec![n], dtype));
             let selected = b.select(cond, on, off);
-            let graph = b.finish(selected);
+            let graph = b.finish(selected).unwrap();
             let bytes = |words: &[u16]| -> StoredBytes {
                 words
                     .iter()

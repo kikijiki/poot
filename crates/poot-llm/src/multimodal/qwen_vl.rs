@@ -889,9 +889,8 @@ pub(crate) mod fixture {
             )
             .unwrap();
         let state: Vec<HostTensor> = graph
-            .state
-            .iter()
-            .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+            .state()
+            .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
             .collect();
         let activation = |tag| SlotKey::new(Slot::Activation, Some(tag));
         let slots = [

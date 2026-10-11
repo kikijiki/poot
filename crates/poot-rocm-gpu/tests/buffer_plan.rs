@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use poot_executor::{Arg, BufferRole, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::op::RedOp;
-use poot_graph_ir::{Builder, TensorType, ValidationOutputs};
+use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, compile_staged,
@@ -27,8 +27,9 @@ use poot_tensor::DType;
 use poot_test_util::assert_close_rel;
 use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::gpu_backend;
 
-type Graph = poot_graph_ir::Graph<ValidationOutputs>;
+type Graph = poot_graph_ir::Graph;
 
 const K: usize = 64;
 
@@ -50,7 +51,7 @@ fn fixture() -> (Graph, Vec<f32>, Vec<f32>, f32) {
     let v2 = builder.binary(poot_graph_ir::op::BinOp::Add, tc, tc);
     let s2 = builder.reduce(RedOp::Max, v2, 0, true);
     let out = builder.binary(poot_graph_ir::op::BinOp::Add, s1, s2);
-    (builder.finish(out).with_validations(Vec::new()), a, b, c)
+    (builder.finish(out).unwrap(), a, b, c)
 }
 
 fn store(a: &[f32], b: &[f32], c: f32) -> Arc<WeightStore> {
@@ -83,7 +84,7 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
 const REPLAY: CompileOptions =
     CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
 
-fn staged(g: &Graph, target: Target) -> StagedProgram<ValidationOutputs> {
+fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -149,7 +150,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm(
     const SLOT_CAPACITY: usize = 64;
 
     let target = device.target();
-    let arch = match target.backend {
+    let arch = match gpu_backend(&target) {
         poot_target::Backend::AmdGcn(arch) => arch,
         other => panic!("RocmDevice::target must report AmdGcn, got {other:?}"),
     };
@@ -195,8 +196,10 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm(
                 buffer: &out_buf,
                 elems: 1,
             },
-            threads: [1, 1, 1],
-            workgroup: [1, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [1, 1, 1],
+                workgroup: [1, 1, 1],
+            },
             work: 1,
         })
         .unwrap();
@@ -217,4 +220,78 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm(
         "Len(len_src) inside the kernel must equal the dispatch's own Arg::elems ({REAL_LEN}), never \
          len_src's SLOT_CAPACITY={SLOT_CAPACITY} device buffer capacity"
     );
+}
+
+/// POOT-1117: a `LaunchKind::Aie` dispatch handed to the ROCm device is the typed refusal
+/// `RocmError::WrongKernelTarget` naming the AIE target; nothing is captured and the open step is
+/// abortable. Mutation: let `RocmDevice::dispatch` accept `LaunchKind::Aie` (bind its arm to a fixture grid);
+/// `dispatch` returns `Ok` and the row goes red.
+#[test]
+fn an_aie_launch_is_a_typed_refusal_on_rocm() {
+    use poot_rocm_gpu::RocmGpuError;
+    use poot_target::{AieTargetId, TargetId};
+
+    let Some(mut device) = require_rocm() else {
+        return;
+    };
+    let target = device.target();
+    let arch = match gpu_backend(&target) {
+        poot_target::Backend::AmdGcn(arch) => arch,
+        other => panic!("RocmDevice::target must report AmdGcn, got {other:?}"),
+    };
+    let codegen_target = poot_codegen::Target::AmdGcn(arch);
+    let body = poot_test_util::kernel_fixtures::len_probe_kernel();
+    let dir = poot_codegen::kernel_cache_root("rocm-aie-launch-refusal", codegen_target);
+    let out_path = poot_codegen::artifact_path(&dir, "aie_launch_probe", codegen_target);
+    poot_codegen::compile(&body, codegen_target, &out_path)
+        .expect("len_probe must compile to HSACO");
+    let bytes = std::fs::read(&out_path).unwrap();
+    let compiled = poot_codegen::kernel_handle(
+        &body,
+        poot_codegen::GpuTarget::try_from(codegen_target).expect("a byte-artifact target"),
+        bytes,
+    );
+    let kernel = device
+        .load_kernel("aie_launch_probe", compiled)
+        .expect("load the probe kernel");
+    let input = device
+        .allocate(BufferRole::Input, BufferStorage::f32(), 4)
+        .unwrap();
+    let output = device
+        .allocate(BufferRole::Output, BufferStorage::f32(), 1)
+        .unwrap();
+
+    device.begin(Submission::Replay).unwrap();
+    let error = device
+        .dispatch(Dispatch {
+            kernel: &kernel,
+            inputs: &[Arg {
+                buffer: &input,
+                elems: 4,
+            }],
+            output: Arg {
+                buffer: &output,
+                elems: 1,
+            },
+            launch: poot_executor::LaunchKind::Aie(poot_executor::AieInvocation::new(
+                AieTargetId::Xdna2,
+                std::num::NonZeroU32::new(1).unwrap(),
+            )),
+            work: 1,
+        })
+        .expect_err("a thread-grid device runs no AIE invocation");
+    assert!(
+        matches!(
+            &error,
+            RocmGpuError::Rocm(rocm)
+                if matches!(
+                    **rocm,
+                    poot_rocm_runtime::RocmError::WrongKernelTarget {
+                        actual: TargetId::Aie(AieTargetId::Xdna2)
+                    }
+                )
+        ),
+        "{error:?}"
+    );
+    device.abort().unwrap();
 }

@@ -51,7 +51,7 @@ fn four_layer_graph(weight_name: impl Fn(usize) -> String) -> poot_graph_ir::Gra
             }
         };
     }
-    b.finish(h)
+    b.finish(h).unwrap()
 }
 
 fn row(

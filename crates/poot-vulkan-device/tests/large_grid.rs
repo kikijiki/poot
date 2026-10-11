@@ -59,7 +59,7 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
     plan.declare_result(o).expect("declare the result");
     let mut prepared = b.preflight_append(plan).expect("preflight");
     let out = b.commit_append(&mut prepared).expect("commit");
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
 
     // The planner trusts the device's x grid: one dispatch of more than 65535 workgroups.
     let program = compile(

@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_executor::{ExecError, Executor, NoSync, StepInputs};
-use poot_graph_ir::{Graph, Slot, SlotKey, ValidationOutputs};
+use poot_graph_ir::{Graph, Slot, SlotKey};
 use poot_graph_plan::{
     CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
     Submission, Target, TargetSet, WeightFormats, bind_packed_weights, compile_staged,
@@ -380,7 +380,7 @@ pub fn trace(
     phase: Phase,
     tokens: usize,
     capacity: usize,
-) -> Graph<ValidationOutputs> {
+) -> Graph {
     let shape = StepShape {
         rows: NonZeroUsize::MIN,
         tokens: NonZeroUsize::new(tokens).unwrap(),
@@ -394,7 +394,7 @@ pub fn trace(
 }
 
 /// `g` compiled for `target`, single stage and single device, replayed.
-pub fn compile(g: &Graph<ValidationOutputs>, target: Target) -> StagedProgram<ValidationOutputs> {
+pub fn compile(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -421,7 +421,7 @@ pub fn run_steps(
     store: Arc<WeightStore>,
     map: Arc<WeightMap>,
     steps: &[Step],
-    prepare: &dyn Fn(Graph<ValidationOutputs>) -> Graph<ValidationOutputs>,
+    prepare: &dyn Fn(Graph) -> Graph,
 ) -> Result<Vec<Vec<f32>>, ExecError> {
     let exe = exec.load_weights(store, Arc::clone(&map))?;
     let mut entries = HashMap::new();
@@ -477,7 +477,7 @@ pub fn chunked_steps(prompt: &[i32], chunk: usize, decode: &[i32]) -> Vec<Step> 
 /// eval_mapped`): the graph, the store and map its weights bind through, the step's slots and the
 /// carried state; returns the output and the state outputs.
 pub type MappedOracle<'a> = dyn Fn(
-        &Graph<ValidationOutputs>,
+        &Graph,
         &WeightStore,
         &WeightMap,
         &[(SlotKey, HostTensor)],
@@ -540,9 +540,8 @@ pub fn check_matches_oracle(
         );
         if state.is_empty() {
             state = g
-                .state
-                .iter()
-                .map(|&(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
+                .state()
+                .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
                 .collect();
         }
         let (want, next) = oracle(&g, &m.store, &m.map, &step.slots(), &state);
@@ -640,13 +639,15 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
         Step::new(Phase::Prefill, &[3, 1, 4], 0),
         Step::new(Phase::Decode, &[1], 3),
     ];
-    let mut caps = target.caps;
+    let Target::Gpu { mut caps, .. } = target else {
+        panic!("the split-head check legalizes against GPU limits; {target:?} has none");
+    };
     caps.max_buffer_bytes = SPLIT_LIMIT;
-    let split = |g: Graph<ValidationOutputs>| {
+    let split = |g: Graph| {
         let g = poot_graph_plan::legalize(&g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
             .unwrap_or_else(|e| panic!("legalize under a {SPLIT_LIMIT}-byte limit: {e}"));
         let head_chunks = g
-            .consts
+            .consts()
             .iter()
             .filter(|&&id| {
                 g.meta(id)
@@ -656,7 +657,7 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
             })
             .count();
         assert!(head_chunks >= 2, "the head splits ({head_chunks} chunks)");
-        for &id in &g.consts {
+        for &id in g.consts() {
             let bytes = g.aval(id).numel() * g.aval(id).dtype.byte_size();
             assert!(
                 bytes as u64 <= SPLIT_LIMIT,
@@ -747,9 +748,8 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
         .unwrap();
     let entry = exec.add_entry(exe, &compile(&g, target)).unwrap();
     let mut state: Vec<HostTensor> = g
-        .state
-        .iter()
-        .map(|&(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
+        .state()
+        .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
         .collect();
     for step in [
         Step::new(Phase::Decode, &[3], 0),

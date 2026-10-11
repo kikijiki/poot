@@ -13,8 +13,7 @@ use poot_graph_ir::ops::{
     AttentionKeys, attention_live, attention_masked_softcap, causal_mask_from_pos,
 };
 use poot_graph_ir::{
-    Builder, Graph, IndexRange, Slot, TensorType, Traced, ValidationId, ValidationOutput,
-    ValidationOutputs, ValueId,
+    Builder, Graph, IndexRange, Outputs, Slot, TensorType, Traced, ValidationId, ValueId,
 };
 use poot_tensor::{DType, HostTensor};
 
@@ -50,7 +49,7 @@ fn cast_to(b: &Builder, x: Traced, dtype: DType) -> Traced {
 
 /// The built graph and the value ids its operands bind to.
 pub struct LiveAttentionGraph {
-    pub graph: Graph<ValidationOutputs>,
+    pub graph: Graph,
     pub q: ValueId,
     /// The key, or the per-head part of a split key.
     pub k: ValueId,
@@ -118,19 +117,14 @@ impl LiveAttentionFixture {
             len,
         )
         .expect("the live composite builds");
-        let validations = if validated {
-            vec![ValidationOutput {
-                id: ValidationId(1),
-                name: "attention.len".to_owned(),
-                value: live.witness.id(),
-            }]
-        } else {
-            Vec::new()
-        };
         let out = cast_to(&b, live.out, DType::F32);
-        let graph = b.finish(out).with_validations(validations);
-        graph
-            .validate()
+        let outputs = if validated {
+            Outputs::new(out).with_witness(ValidationId(1), "attention.len", live.witness)
+        } else {
+            Outputs::new(out)
+        };
+        let graph = b
+            .finish(outputs)
             .expect("the live composite is a valid graph");
         LiveAttentionGraph {
             graph,
@@ -246,7 +240,7 @@ impl LiveAttentionFixture {
                 softcap,
             );
             let attended = cast_to(&g, attended, DType::F32);
-            let graph = g.finish(attended);
+            let graph = g.finish(attended).unwrap();
             let bound = HashMap::from([
                 (
                     qi.id(),

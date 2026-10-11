@@ -8,7 +8,7 @@
 //!
 //! Value-preserving: every consumer of the folded value reads the same elements it read before.
 
-use poot_graph_ir::graph::{ComputedConst, Graph, Storage, ValidationChannel, ValueId};
+use poot_graph_ir::graph::{ComputedConst, EditError, Graph, Storage, ValueId};
 use poot_graph_ir::op::OpKind;
 
 /// Rewrite every `OpKind::Iota { len, dtype }` into a [`Storage::Computed`] graph constant and drop its
@@ -16,10 +16,9 @@ use poot_graph_ir::op::OpKind;
 ///
 /// A graph with no `Iota` is returned unchanged (a clone-cost no-op callers still pay; the pass is
 /// written for the pipeline's simple `Graph -> Graph` shape).
-pub fn fold_iota<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    let mut g = g.clone();
+pub fn fold_iota(g: &Graph) -> Result<Graph, EditError> {
     let mut folded: Vec<(ValueId, ComputedConst)> = Vec::new();
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         if let OpKind::Iota { len, dtype } = &eqn.op {
             folded.push((
                 eqn.out,
@@ -31,17 +30,19 @@ pub fn fold_iota<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         }
     }
     if folded.is_empty() {
-        return g;
+        return Ok(g.clone());
     }
+    let mut edit = g.edit();
     for &(value, constant) in &folded {
-        g.values[value].storage = Storage::Computed(constant);
+        edit.values_mut()[value].storage = Storage::Computed(constant);
     }
-    g.eqns.retain(|eqn| !matches!(eqn.op, OpKind::Iota { .. }));
+    edit.eqns_mut()
+        .retain(|eqn| !matches!(eqn.op, OpKind::Iota { .. }));
     for &(value, _) in &folded {
-        g.inputs.push(value);
-        g.consts.push(value);
+        edit.inputs_mut().push(value);
+        edit.consts_mut().push(value);
     }
-    g
+    edit.commit()
 }
 
 #[cfg(test)]
@@ -51,15 +52,15 @@ mod tests {
     use poot_graph_ir::graph::Operand;
     use poot_graph_ir::op::BinOp;
 
-    fn iota_count<V: ValidationChannel>(g: &Graph<V>, len: usize) -> usize {
-        g.eqns
+    fn iota_count(g: &Graph, len: usize) -> usize {
+        g.eqns()
             .iter()
             .filter(|eqn| matches!(eqn.op, OpKind::Iota { len: l, .. } if l == len))
             .count()
     }
 
-    fn computed_count<V: ValidationChannel>(g: &Graph<V>) -> usize {
-        g.inputs
+    fn computed_count(g: &Graph) -> usize {
+        g.inputs()
             .iter()
             .filter(|&&id| matches!(g.meta(id).storage, Storage::Computed(_)))
             .count()
@@ -73,12 +74,12 @@ mod tests {
         let a = b.iota(4);
         let c = b.iota(4);
         let out = b.binary(BinOp::Add, a, c);
-        let graph = b.finish(out);
+        let graph = b.finish(out).unwrap();
 
-        let merged = crate::passes::cse(&graph);
+        let merged = crate::passes::cse(&graph).unwrap();
         assert_eq!(iota_count(&merged, 4), 1, "identical iotas must merge");
         let add = merged
-            .eqns
+            .eqns()
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Binary(BinOp::Add)))
             .expect("the Add survives");
@@ -87,12 +88,12 @@ mod tests {
             "the merged Add must read one iota value twice"
         );
         assert_eq!(
-            computed_count(&fold_iota(&merged)),
+            computed_count(&fold_iota(&merged).unwrap()),
             1,
             "folding the merged graph yields one computed constant"
         );
         assert_eq!(
-            computed_count(&fold_iota(&crate::passes::cse(&graph))),
+            computed_count(&fold_iota(&crate::passes::cse(&graph).unwrap()).unwrap()),
             1,
             "cse then fold_iota yields one computed constant"
         );
@@ -101,18 +102,18 @@ mod tests {
         let a = b.iota(4);
         let c = b.iota(5);
         let out = b.concat(0, &[a, c]);
-        let graph = b.finish(out);
+        let graph = b.finish(out).unwrap();
 
-        let merged = crate::passes::cse(&graph);
+        let merged = crate::passes::cse(&graph).unwrap();
         assert_eq!(iota_count(&merged, 4), 1);
         assert_eq!(iota_count(&merged, 5), 1);
         assert_eq!(
-            computed_count(&fold_iota(&merged)),
+            computed_count(&fold_iota(&merged).unwrap()),
             2,
             "distinct lengths stay distinct through the fold"
         );
         assert_eq!(
-            computed_count(&fold_iota(&crate::passes::cse(&graph))),
+            computed_count(&fold_iota(&crate::passes::cse(&graph).unwrap()).unwrap()),
             2,
             "distinct lengths stay distinct through cse then fold_iota"
         );

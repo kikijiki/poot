@@ -17,13 +17,15 @@
 //! `poot_runtime_common::check_element_schema`'s width-based compatibility (same byte width, not
 //! exact `ElementKind`) is exactly what lets one bit-mover kernel serve either storage in its class.
 
-use poot_executor::{Arg, BufferRole, Device, DeviceTime, Dispatch, MeasuredDeviceTime};
+use poot_executor::{
+    Arg, BufferRole, Device, DeviceTime, Dispatch, LaunchKind, MeasuredDeviceTime,
+};
 use poot_graph_plan::{Submission, Target};
 use poot_kernel_ir::Ty;
 use poot_ptx_runtime::{
-    BufferStorage, CompiledKernel, PtxBuffer, PtxContext, PtxGraphExec, PtxSpan,
+    BufferStorage, CompiledKernel, PtxBuffer, PtxContext, PtxError, PtxGraphExec, PtxSpan,
 };
-use poot_target::{Backend, ElementKind};
+use poot_target::{Backend, ElementKind, TargetId};
 
 use crate::PtxGpuError;
 
@@ -107,7 +109,7 @@ impl Device for PtxDevice {
     type Error = PtxGpuError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::Nvptx,
             caps: self.ctx.device_caps(),
         }
@@ -144,6 +146,16 @@ impl Device for PtxDevice {
     }
 
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), PtxGpuError> {
+        // A thread-grid device: an AIE invocation has no grid to run, and its kernel was never loadable here.
+        let (threads, workgroup) = match d.launch {
+            LaunchKind::Grid { threads, workgroup } => (threads, workgroup),
+            LaunchKind::Aie(invocation) => {
+                return Err(PtxError::WrongKernelTarget {
+                    actual: TargetId::Aie(invocation.target()),
+                }
+                .into());
+            }
+        };
         // Card 547b: every argument's own logical element count from the plan, never
         // the bound buffer's capacity (an arena slot's buffer is sized to its largest occupant,
         // which can exceed this particular dispatch's operand).
@@ -152,8 +164,8 @@ impl Device for PtxDevice {
         Ok(self.ctx.dispatch_dev(
             &d.kernel.key,
             &d.kernel.compiled,
-            d.workgroup,
-            d.threads,
+            workgroup,
+            threads,
             &ins,
             &in_lens,
             d.output.buffer,

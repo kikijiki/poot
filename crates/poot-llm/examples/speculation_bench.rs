@@ -1,15 +1,16 @@
 //! Measure speculative decoding on a real checkpoint: one process runs one draft policy over one prompt
-//! and prints one line, so `off`, `lookup` and `model` run on the same binary and prompt are comparable.
+//! and prints one line, so `off`, `lookup`, `model` and `mtp` run on the same binary and prompt are comparable.
 //!
 //! The decode rate is timed from the token callback (first token to last, prefill excluded). The
 //! acceptance numbers are the driver's own counters (`Driver::stats().speculation`, accepted over
 //! proposed drafts), and `hash` is an FNV-1a digest of the generated tokens: a greedy run under any
 //! policy must print the digest `off` prints.
 //!
-//! Run: `cargo run -p poot-llm --release --example speculation_bench -- --target DIR --policy off|lookup|model
+//! Run: `cargo run -p poot-llm --release --example speculation_bench -- --target DIR --policy off|lookup|model|mtp
 //! [--draft DIR] [--backend wgpu|rocm|ptx|vulkan|auto] [--prompt-file F] [--new N] [--k K] [--ngram N]
 //! [--warmup N] [--iters N]`. `--draft` is required by (and only read under) `--policy model`; its
-//! vocabulary and token ids must match the target's. Use a fresh process per policy: a ROCm executor
+//! vocabulary and token ids must match the target's. `--policy mtp` drafts with the target's own
+//! multi-token-prediction layer, `--k` tokens a round (a target with no such layer is refused). Use a fresh process per policy: a ROCm executor
 //! cannot be reopened after a drop.
 
 use std::collections::HashMap;
@@ -118,7 +119,8 @@ fn main() -> Result<()> {
             )?,
             k,
         },
-        other => bail!("--policy {other}: expected off, lookup or model"),
+        "mtp" => DraftPolicy::Mtp { k },
+        other => bail!("--policy {other}: expected off, lookup, model or mtp"),
     };
     let prompt = match values.get("--prompt-file") {
         Some(file) => std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?,
@@ -140,8 +142,8 @@ fn main() -> Result<()> {
             max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
         },
         charge: poot_llm::driver::program_retention,
+        hidden_window: policy.carry_window(),
         draft: policy,
-        hidden_window: None,
     };
     let mut driver = Driver::new(
         Arc::clone(&target),

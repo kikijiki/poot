@@ -22,7 +22,7 @@
 //! experts or other compression rates is the same family, and the checkpoint's packed experts and
 //! projections are read as stored.
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
 
@@ -97,11 +97,7 @@ impl Model for DeepseekV4 {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         crate::components::moe::check_step(FAMILY, shape, &p.score_moe)?;
@@ -116,7 +112,7 @@ impl Model for DeepseekV4 {
         let b = Builder::new();
         let step = Step::new(&b, shape);
         let logits = self.tower.trace(&b, &step, p);
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 

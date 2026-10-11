@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
-use poot_graph_ir::{Graph, PackedSourceName, SlotKey, Storage, ValidationChannel, ValueId};
+use poot_graph_ir::{Graph, PackedSourceName, SlotKey, Storage, ValueId};
 use poot_quant::weights::{WeightEntry, WeightId, WeightMap, WeightStore, WeightView};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
 use poot_tensor::{DType, HostTensor};
@@ -18,8 +18,8 @@ use crate::StepFixture;
 /// Evaluate `g` on the CPU: weights through `map` over `store`, slots by key from `slots`, state
 /// inputs from `state` in [`Graph::state`] order. Returns the output and every state output.
 /// Panics on a const the map does not name: the oracle has no fallback a binder could hide behind.
-pub fn eval_mapped<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn eval_mapped(
+    g: &Graph,
     store: &WeightStore,
     map: &WeightMap,
     slots: &[(SlotKey, HostTensor)],
@@ -30,12 +30,12 @@ pub fn eval_mapped<V: ValidationChannel>(
     let materialize = |id: WeightId| map.materialize(id, store).unwrap();
     // One stack per packed expert-stack id, shared by every source role that names it.
     let mut stacks: HashMap<WeightId, Arc<PackedStack>> = HashMap::new();
-    assert_eq!(state.len(), g.state.len(), "one value per state input");
+    assert_eq!(state.len(), g.state().count(), "one value per state input");
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for (&(input, _), value) in g.state.iter().zip(state) {
+    for ((input, _), value) in g.state().zip(state) {
         inputs.insert(input, value.clone().into());
     }
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let value: Value = match meta.storage {
             Storage::State => continue,
@@ -109,14 +109,14 @@ pub fn eval_mapped<V: ValidationChannel>(
 /// a const named as a packed source ([`PackedSourceName`]) over a packed entry binds that entry's component
 /// of the named role, every other const the store entry as its stored dtype (an F16 or BF16 weight binds as
 /// its stored words). This is the one definition every backend's parity tests share.
-pub fn oracle_for<'a, V: ValidationChannel>(
-    graph: &'a Graph<V>,
+pub fn oracle_for<'a>(
+    graph: &'a Graph,
     store: &'a WeightStore,
 ) -> impl FnMut(&[StepFixture]) -> HostTensor + 'a {
     let mut state: HashMap<String, HostTensor> = HashMap::new();
     let mut stacks: HashMap<String, Arc<PackedStack>> = HashMap::new();
     let packed: HashMap<ValueId, Value> = graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             let source = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
@@ -142,7 +142,7 @@ pub fn oracle_for<'a, V: ValidationChannel>(
         .collect();
     move |step: &[StepFixture]| {
         let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-        for &id in &graph.inputs {
+        for &id in graph.inputs() {
             let meta = graph.meta(id);
             let value = match meta.storage {
                 Storage::Const => match packed.get(&id) {
@@ -168,7 +168,7 @@ pub fn oracle_for<'a, V: ValidationChannel>(
             inputs.insert(id, value);
         }
         let evaluation = eval(graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
-        for (&(si, _), t) in graph.state.iter().zip(evaluation.state) {
+        for ((si, _), t) in graph.state().zip(evaluation.state) {
             state.insert(
                 graph.meta(si).name.clone().unwrap(),
                 t.into_host().expect("dense state tensor"),

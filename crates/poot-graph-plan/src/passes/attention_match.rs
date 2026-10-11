@@ -77,8 +77,8 @@ pub(super) enum RopeDecline {
 }
 
 /// The producer index of every value defined by an equation.
-pub(super) fn producer_map<V: ValidationChannel>(g: &Graph<V>) -> HashMap<ValueId, usize> {
-    g.eqns
+pub(super) fn producer_map(g: &Graph) -> HashMap<ValueId, usize> {
+    g.eqns()
         .iter()
         .enumerate()
         .map(|(index, eqn)| (eqn.out, index))
@@ -86,9 +86,9 @@ pub(super) fn producer_map<V: ValidationChannel>(g: &Graph<V>) -> HashMap<ValueI
 }
 
 /// The equation indices that consume each value.
-fn consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Vec<usize>> {
-    let mut consumers = ValueTable::filled(g.values.len(), Vec::new());
-    for (index, eqn) in g.eqns.iter().enumerate() {
+fn consumer_map(g: &Graph) -> ValueTable<Vec<usize>> {
+    let mut consumers = ValueTable::filled(g.values().len(), Vec::new());
+    for (index, eqn) in g.eqns().iter().enumerate() {
         for operand in &eqn.inputs {
             if let Operand::Value(value) = operand {
                 consumers[*value].push(index);
@@ -98,7 +98,7 @@ fn consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Vec<usize>> {
     consumers
 }
 
-fn is_liveness_root<V: ValidationChannel>(g: &Graph<V>, value: ValueId) -> bool {
+fn is_liveness_root(g: &Graph, value: ValueId) -> bool {
     g.liveness_roots().any(|root| root == value)
 }
 
@@ -123,20 +123,20 @@ fn two_values(inputs: &[Operand]) -> Option<(ValueId, ValueId)> {
 /// Canonicalize only proved identities. A scalar can be removed from a contraction operand when it
 /// is exactly F32 +1 and the multiplication is F32. No general factoring or reciprocal-to-division
 /// rewrite is valid without a range and rounding proof. Matchers detect operand roles separately.
-pub fn canonicalize<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    canonicalize_with_declines(g).0
+pub fn canonicalize(g: &Graph) -> Result<Graph, EditError> {
+    Ok(canonicalize_with_declines(g)?.0)
 }
 
 /// The canonical graph and typed explanations of numerical rewrites that were withheld. Value ids
 /// identify the original candidate's result; a declined optimization does not refuse compilation.
-pub fn canonicalize_with_declines<V: ValidationChannel>(
-    g: &Graph<V>,
-) -> (Graph<V>, Vec<NumericalRewriteDecline>) {
+pub fn canonicalize_with_declines(
+    g: &Graph,
+) -> Result<(Graph, Vec<NumericalRewriteDecline>), EditError> {
     let producers = producer_map(g);
     let consumers = consumer_map(g);
-    let mut out = g.clone();
+    let mut out = g.edit();
     let mut declines = Vec::new();
-    for eqn in &mut out.eqns {
+    for eqn in out.eqns_mut() {
         if matches!(eqn.op, OpKind::Binary(BinOp::Mul))
             && two_values(&eqn.inputs).is_some()
             && eqn.inputs.iter().any(|operand| {
@@ -145,7 +145,7 @@ pub fn canonicalize_with_declines<V: ValidationChannel>(
                 };
                 producers
                     .get(value)
-                    .is_some_and(|&index| matches!(g.eqns[index].op, OpKind::Unary(UnOp::Recip)))
+                    .is_some_and(|&index| matches!(g.eqns()[index].op, OpKind::Unary(UnOp::Recip)))
             })
         {
             declines.push(NumericalRewriteDecline {
@@ -163,7 +163,7 @@ pub fn canonicalize_with_declines<V: ValidationChannel>(
             let Some(&index) = producers.get(side) else {
                 continue;
             };
-            let mul = &g.eqns[index];
+            let mul = &g.eqns()[index];
             if !matches!(mul.op, OpKind::Binary(BinOp::Mul))
                 || consumers[*side].len() != 1
                 || is_liveness_root(g, *side)
@@ -188,7 +188,7 @@ pub fn canonicalize_with_declines<V: ValidationChannel>(
             }
         }
     }
-    (out, declines)
+    Ok((out.commit()?, declines))
 }
 /// A matched materialized softmax-attention subgraph (the operands of the fused op it collapses to).
 pub(super) struct AttnMatch {
@@ -216,12 +216,12 @@ struct Guarded {
 }
 
 /// `value`'s producing equation and its three value operands when it is a `Select`.
-fn select_operands<V: ValidationChannel>(
-    g: &Graph<V>,
+fn select_operands(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     value: ValueId,
 ) -> Option<[ValueId; 3]> {
-    let eqn = prod.get(&value).map(|&i| &g.eqns[i])?;
+    let eqn = prod.get(&value).map(|&i| &g.eqns()[i])?;
     if !matches!(eqn.op, OpKind::Select) {
         return None;
     }
@@ -233,13 +233,13 @@ fn select_operands<V: ValidationChannel>(
 
 /// `value` as the `[0, 1, .., len)` range of `dtype`, produced by an `Iota` equation or bound as the computed
 /// constant `fold_iota` leaves.
-fn iota_len<V: ValidationChannel>(
-    g: &Graph<V>,
+fn iota_len(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     value: ValueId,
     dtype: DType,
 ) -> Option<usize> {
-    match prod.get(&value).map(|&i| &g.eqns[i].op) {
+    match prod.get(&value).map(|&i| &g.eqns()[i].op) {
         Some(OpKind::Iota { len, dtype: d }) if *d == dtype => Some(*len),
         Some(_) => None,
         None => match g.meta(value).storage {
@@ -250,13 +250,8 @@ fn iota_len<V: ValidationChannel>(
 }
 
 /// The key positions `1..=lk` of the live bound: `Add(iota_i32(lk), 1)`, exact I32 `[lk]`.
-fn is_key_ends<V: ValidationChannel>(
-    g: &Graph<V>,
-    prod: &HashMap<ValueId, usize>,
-    ends: ValueId,
-    lk: usize,
-) -> bool {
-    let Some(eqn) = prod.get(&ends).map(|&i| &g.eqns[i]) else {
+fn is_key_ends(g: &Graph, prod: &HashMap<ValueId, usize>, ends: ValueId, lk: usize) -> bool {
+    let Some(eqn) = prod.get(&ends).map(|&i| &g.eqns()[i]) else {
         return false;
     };
     matches!(eqn.op, OpKind::Binary(BinOp::Add))
@@ -267,13 +262,13 @@ fn is_key_ends<V: ValidationChannel>(
 }
 
 /// `value` as `reshape(source)` to exactly `shape`.
-fn reshaped_from<V: ValidationChannel>(
-    g: &Graph<V>,
+fn reshaped_from(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     value: ValueId,
     shape: &[usize],
 ) -> Option<ValueId> {
-    let eqn = prod.get(&value).map(|&i| &g.eqns[i])?;
+    let eqn = prod.get(&value).map(|&i| &g.eqns()[i])?;
     match (&eqn.op, eqn.inputs.as_slice()) {
         (OpKind::Reshape { shape: target }, [Operand::Value(source)]) if target == shape => {
             Some(*source)
@@ -286,14 +281,14 @@ fn reshaped_from<V: ValidationChannel>(
 /// where `along` puts the `lk` key positions on the key-row axis (`[1,1,lk,1]`) or the score-row axis
 /// (`[1,1,1,lk]`). `None` for any other comparison: an off-by-one key range, another operand order, a
 /// different axis.
-fn live_active_len<V: ValidationChannel>(
-    g: &Graph<V>,
+fn live_active_len(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     active: ValueId,
     lk: usize,
     along: [usize; 4],
 ) -> Option<ValueId> {
-    let eqn = prod.get(&active).map(|&i| &g.eqns[i])?;
+    let eqn = prod.get(&active).map(|&i| &g.eqns()[i])?;
     let (OpKind::Binary(BinOp::Ge), [Operand::Value(len_view), Operand::Value(ends_view)]) =
         (&eqn.op, eqn.inputs.as_slice())
     else {
@@ -315,8 +310,8 @@ enum LiveFallback {
 
 /// `fallback` as the live bound's select fallback over key row `along`: `reshape` of the F32 zero range
 /// `Mul(iota(lk), 0.0)`, or of that range plus `-inf`.
-fn is_live_fallback<V: ValidationChannel>(
-    g: &Graph<V>,
+fn is_live_fallback(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     fallback: ValueId,
     lk: usize,
@@ -329,7 +324,7 @@ fn is_live_fallback<V: ValidationChannel>(
     let zero_range = match which {
         LiveFallback::Zero => product,
         LiveFallback::NegInf => {
-            let Some(eqn) = prod.get(&product).map(|&i| &g.eqns[i]) else {
+            let Some(eqn) = prod.get(&product).map(|&i| &g.eqns()[i]) else {
                 return false;
             };
             match (&eqn.op, value_and_scalar(&eqn.inputs)) {
@@ -342,7 +337,7 @@ fn is_live_fallback<V: ValidationChannel>(
             }
         }
     };
-    let Some(eqn) = prod.get(&zero_range).map(|&i| &g.eqns[i]) else {
+    let Some(eqn) = prod.get(&zero_range).map(|&i| &g.eqns()[i]) else {
         return false;
     };
     matches!(eqn.op, OpKind::Binary(BinOp::Mul))
@@ -355,8 +350,8 @@ fn is_live_fallback<V: ValidationChannel>(
 }
 
 /// `source` as a guarded K or V source: `Select(active, data, zeros)` with the live bound's zero fallback.
-fn peel_live_rows<V: ValidationChannel>(
-    g: &Graph<V>,
+fn peel_live_rows(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     source: ValueId,
     lk: usize,
@@ -378,8 +373,8 @@ struct PeeledKey {
 /// Peel a key operand: its GQA repeat, then either a single source or the `concat(head, repeat(shared))` of a
 /// split key, with each source behind the live bound's select when `live`. `None` when `live` and a source is
 /// not guarded.
-fn peel_key<V: ValidationChannel>(
-    g: &Graph<V>,
+fn peel_key(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     krep: ValueId,
     live: bool,
@@ -396,7 +391,7 @@ fn peel_key<V: ValidationChannel>(
         Some(data)
     };
     let mut guards = Vec::new();
-    let split = prod.get(&k).map(|&i| &g.eqns[i]).and_then(|eqn| {
+    let split = prod.get(&k).map(|&i| &g.eqns()[i]).and_then(|eqn| {
         let OpKind::Concat { axis } = eqn.op else {
             return None;
         };
@@ -427,12 +422,8 @@ fn peel_key<V: ValidationChannel>(
 
 /// Peel a `repeat_kv(x, n_rep)` chain (`reshape(broadcast(reshape(x)))`) back to `(x, n_rep)`. If `v` is not
 /// produced by that exact 3-op chain (the `n_rep == 1` case emits nothing), return `(v, 1)`.
-fn peel_repeat_kv<V: ValidationChannel>(
-    g: &Graph<V>,
-    prod: &HashMap<ValueId, usize>,
-    v: ValueId,
-) -> (ValueId, usize) {
-    let pe = |x: ValueId| -> Option<&Eqn> { prod.get(&x).map(|&i| &g.eqns[i]) };
+fn peel_repeat_kv(g: &Graph, prod: &HashMap<ValueId, usize>, v: ValueId) -> (ValueId, usize) {
+    let pe = |x: ValueId| -> Option<&Eqn> { prod.get(&x).map(|&i| &g.eqns()[i]) };
     let val = |o: &Operand| -> Option<ValueId> {
         match o {
             Operand::Value(x) => Some(*x),
@@ -486,12 +477,12 @@ fn peel_repeat_kv<V: ValidationChannel>(
 ///
 /// Both the scale and the `1/cap` constants are matched in either operand position (R467-005 scalar
 /// placement). Returns `(qk, scale, softcap)`.
-fn match_pre_mask<V: ValidationChannel>(
-    g: &Graph<V>,
+fn match_pre_mask(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     pre_mask: ValueId,
 ) -> Result<(ValueId, f32, Option<f32>), AttentionDecline> {
-    let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns[i]) };
+    let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns()[i]) };
     let eqn = pe(pre_mask).ok_or(AttentionDecline::ScoreProduct)?;
     if matches!(eqn.op, OpKind::MatMul) && g.aval(pre_mask).dtype == DType::F32 {
         // A pre-scaled query remains an input value, including its rounding boundary. The
@@ -561,13 +552,13 @@ fn match_pre_mask<V: ValidationChannel>(
 /// role detection rather than by position (R467-005). Pre-scaled operands remain inputs, and
 /// reciprocal normalization remains primitive because this fused definition uses division. The final
 /// infer-and-compare gate requires the fused op's type to reproduce the root's declared type.
-pub(super) fn match_attention<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(super) fn match_attention(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     facts: &RangeFacts,
     root: &Eqn,
 ) -> Result<AttnMatch, AttentionDecline> {
-    let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns[i]) };
+    let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns()[i]) };
     let val = |o: &Operand| -> Option<ValueId> {
         match o {
             Operand::Value(x) => Some(*x),
@@ -760,8 +751,8 @@ pub(super) fn match_attention<V: ValidationChannel>(
 /// guard clamped the length (`facts.clamps`) fuses only when each such guard's witness is a declared
 /// validation output, so a bad length publishes nothing instead of turning silently into a valid-looking
 /// answer (spec 375).
-fn live_length_proved<V: ValidationChannel>(
-    g: &Graph<V>,
+fn live_length_proved(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     facts: &RangeFacts,
     len: ValueId,
@@ -781,13 +772,9 @@ fn live_length_proved<V: ValidationChannel>(
 /// Whether a declared validation output counts the lanes where `condition` is set: a keepdim last-axis
 /// `Sum` of its F32 cast, the shape `Builder::guard_index_bounds` declares for its witness. Anything else
 /// (a witness over another value, a reduction over another axis) does not observe every clamped lane.
-fn guard_witnessed<V: ValidationChannel>(
-    g: &Graph<V>,
-    prod: &HashMap<ValueId, usize>,
-    condition: ValueId,
-) -> bool {
-    let producer = |value: ValueId| prod.get(&value).map(|&index| &g.eqns[index]);
-    g.validation_outputs().iter().any(|validation| {
+fn guard_witnessed(g: &Graph, prod: &HashMap<ValueId, usize>, condition: ValueId) -> bool {
+    let producer = |value: ValueId| prod.get(&value).map(|&index| &g.eqns()[index]);
+    g.witnesses().any(|validation| {
         let Some(sum) = producer(validation.value) else {
             return false;
         };
@@ -848,12 +835,12 @@ impl AttnMatch {
 /// gets flash without a separate `_flash` variant. Best run on a `cse`'d graph. `compile` passes its own
 /// measured `target.caps.max_grid[0]` (wgpu's `gridDim.x` caps at 65535 and has no plan-time fallback
 /// from the op to the decomposition).
-pub fn flash_attention_capped<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn flash_attention_capped(
+    g: &Graph,
     max_prefill_groups: Option<usize>,
-) -> Graph<V> {
+) -> Result<Graph, EditError> {
     let mut prod: HashMap<ValueId, usize> = HashMap::new();
-    for (i, e) in g.eqns.iter().enumerate() {
+    for (i, e) in g.eqns().iter().enumerate() {
         prod.insert(e.out, i);
     }
     // One range analysis per pass run: every live candidate reads its length from it.
@@ -871,7 +858,7 @@ pub fn flash_attention_capped<V: ValidationChannel>(
         }
     };
     let eqns: Vec<Eqn> = g
-        .eqns
+        .eqns()
         .iter()
         .map(|e| match match_attention(g, &prod, &facts, e) {
             Ok(m) if fits(&m) => Eqn {
@@ -883,7 +870,7 @@ pub fn flash_attention_capped<V: ValidationChannel>(
             _ => e.clone(),
         })
         .collect();
-    Graph { eqns, ..g.clone() }
+    with_eqns(g, eqns)
 }
 
 /// A matched RoPE rotate-half chain. `x` is the tensor the rotation applies to (width `rot` on the last
@@ -904,12 +891,12 @@ struct RopeMatch {
 /// The rotated tensor `a` is identified structurally (the tensor both slices split), and `cos` is
 /// whichever factor of the `Mul` `a` is (R467-005: `Mul(cos, a)` and `Mul(a, cos)` are the same
 /// rotation), so a non-rope `Add` of two `Mul`s never matches.
-pub(super) fn match_rope_core<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(super) fn match_rope_core(
+    g: &Graph,
     prod: &HashMap<ValueId, usize>,
     add: &Eqn,
 ) -> Result<(ValueId, ValueId, ValueId, usize), RopeDecline> {
-    let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns[i]) };
+    let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns()[i]) };
     let val = |o: &Operand| -> Option<ValueId> {
         match o {
             Operand::Value(x) => Some(*x),
@@ -1044,8 +1031,8 @@ pub(super) fn match_rope_core<V: ValidationChannel>(
 /// The rotate-half chain broadcasts its `Mul`s, so a valid chain can grow `x` (e.g. `x[1,1,S,D]` against
 /// per-head `cos[1,H,S,D]`), while `Rope` is shape-preserving: such a chain is not this op and stays the
 /// decomposition.
-fn rope_types_as<V: ValidationChannel>(
-    g: &Graph<V>,
+fn rope_types_as(
+    g: &Graph,
     x: ValueId,
     cos: ValueId,
     sin: ValueId,
@@ -1068,12 +1055,12 @@ fn rope_types_as<V: ValidationChannel>(
 /// `Add` core dead. Conservative and result-preserving (one semantic definition shared by tracing, the oracle and every lowering). Run on a `cse`'d graph, before
 /// flash/fuse; the dead intermediates need a following `dce`. It only rewrites the q/k rope, so it is
 /// independent of the flash-attention match.
-pub fn rope_fusion<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub fn rope_fusion(g: &Graph) -> Result<Graph, EditError> {
     let mut prod: HashMap<ValueId, usize> = HashMap::new();
-    for (i, e) in g.eqns.iter().enumerate() {
+    for (i, e) in g.eqns().iter().enumerate() {
         prod.insert(e.out, i);
     }
-    let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns[i]) };
+    let pe = |v: ValueId| -> Option<&Eqn> { prod.get(&v).map(|&i| &g.eqns()[i]) };
     let val = |o: &Operand| -> Option<ValueId> {
         match o {
             Operand::Value(x) => Some(*x),
@@ -1086,7 +1073,7 @@ pub fn rope_fusion<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // (its output becomes dead once the Concat is replaced).
     let mut partial: HashMap<ValueId, RopeMatch> = HashMap::new();
     let mut consumed: HashSet<ValueId> = HashSet::new();
-    for e in &g.eqns {
+    for e in g.eqns() {
         let axis = match &e.op {
             OpKind::Concat { axis } if e.inputs.len() == 2 => *axis,
             _ => continue,
@@ -1144,7 +1131,7 @@ pub fn rope_fusion<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // Pass 2: emit the fused ops. Partial matches replace their Concat; every remaining Add that matches the
     // core (and was not consumed by a partial) becomes a FULL rope over `a` (rot == a's last dim).
     let eqns: Vec<Eqn> = g
-        .eqns
+        .eqns()
         .iter()
         .map(|e| {
             if let Some(m) = partial.get(&e.out) {
@@ -1177,5 +1164,5 @@ pub fn rope_fusion<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
             e.clone()
         })
         .collect();
-    Graph { eqns, ..g.clone() }
+    with_eqns(g, eqns)
 }

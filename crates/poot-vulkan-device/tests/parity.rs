@@ -19,6 +19,7 @@ use poot_kernel_ir::Body;
 use poot_runtime_common::DeviceBackend;
 use poot_tensor::HostTensor;
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::gpu_caps;
 use poot_test_util::weight_map_oracle::oracle_for;
 use poot_vulkan_device::VulkanDevice;
 
@@ -390,7 +391,7 @@ fn batched_multi_block_coopmat_matmul_matches_the_oracle_on_vulkan() {
     let Some((mut exec, target)) = vulkan() else {
         return;
     };
-    if target.caps.tensor_core == poot_target::TensorCoreSupport::None {
+    if gpu_caps(&target).tensor_core == poot_target::TensorCoreSupport::None {
         eprintln!("SKIP: this device reports no cooperative-matrix hardware");
         return;
     }
@@ -491,7 +492,9 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_vulkan() {
         StateRole::Recurrent,
     );
     let (out, state_out) = gated_delta_net_decode(&b, q, k, v, g, beta, state);
-    let graph = b.finish_with_state(out, &[(state, state_out)]);
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(state, state_out)]))
+        .unwrap();
     let mut carried = HostTensor::zeros(vec![1, H_V, D, D]);
     for (call, (inputs, got)) in case.inputs.iter().zip(&outputs).enumerate() {
         let GdnInputs {
@@ -541,4 +544,40 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_vulkan() {
             "call {call}: the chunked prefill differs from the sequential recurrence by {worst:.3e}"
         );
     }
+}
+
+/// POOT-1113: a low-head live decode (2 query rows over a 1024-key cache, `Slot::Pos` bounding the keys)
+/// plans the split-KV schedule (two launches through one scratch) and, stepped at live lengths 1024, 5, 400,
+/// 1, 1024 over one executable, matches the CPU oracle's evaluation of each length within
+/// `SPLIT_KV_DEVICE_TOLERANCE`. The scratch slot is stale from the
+/// previous step at every step but the first (length 5 leaves seven of the eight splits with no key), so a
+/// split that did not publish its own neutral partial reads the first step's.
+/// Mutation: in `poot-kernelgen`'s `attention_body`, skip the partial writes of a split with no key; the
+/// length-5 and length-1 steps go red. Dropping one split's partial in the combine (`count` starting at 1)
+/// goes red on every step.
+#[test]
+fn split_kv_decode_matches_the_oracle_on_vulkan() {
+    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_split_kv_decode_matches_the_oracle(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// POOT-1113: the split-KV decode stepped through its live lengths twice over one entry: the second pass
+/// replays the captured two-launch plan, and every step's output equals the first pass's bit for bit.
+#[test]
+fn split_kv_decode_replay_equals_the_recording_step_on_vulkan() {
+    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_split_kv_decode_replays_bit_identically(
+        exec.as_mut(),
+        t,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
 }

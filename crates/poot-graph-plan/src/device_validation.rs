@@ -11,9 +11,7 @@
 //! classified.
 
 use poot_graph_ir::op::{BinOp, OpKind, RedOp};
-use poot_graph_ir::{
-    Eqn, Graph, Operand, Scalar, ValidationChannel, ValidationPacketLayout, ValueId, ValueTable,
-};
+use poot_graph_ir::{Eqn, Graph, Operand, Scalar, ValidationPacketLayout, ValueId, ValueTable};
 use poot_kernel_ir::{Body, WmmaShape};
 use poot_kernelgen::{BodyUse, FragmentUse, KernelRequirements, UnmeasurableLds};
 use poot_target::{DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
@@ -159,22 +157,22 @@ fn witness_op(op: &OpKind) -> WitnessOp {
     }
 }
 
-struct WitnessWalk<'g, V: ValidationChannel> {
-    graph: &'g Graph<V>,
+struct WitnessWalk<'g> {
+    graph: &'g Graph,
     producers: ValueTable<Option<&'g Eqn>>,
     bounds: ValueTable<Option<u64>>,
 }
 
-impl<'g, V: ValidationChannel> WitnessWalk<'g, V> {
-    fn new(graph: &'g Graph<V>) -> Self {
-        let mut producers = ValueTable::filled(graph.values.len(), None);
-        for eqn in &graph.eqns {
+impl<'g> WitnessWalk<'g> {
+    fn new(graph: &'g Graph) -> Self {
+        let mut producers = ValueTable::filled(graph.values().len(), None);
+        for eqn in graph.eqns() {
             producers[eqn.out] = Some(eqn);
         }
         Self {
             graph,
             producers,
-            bounds: ValueTable::filled(graph.values.len(), None),
+            bounds: ValueTable::filled(graph.values().len(), None),
         }
     }
 
@@ -304,14 +302,12 @@ impl<'g, V: ValidationChannel> WitnessWalk<'g, V> {
 /// producer chain into one `OpKind::Fused` region, which this structural classifier does not see
 /// through, so the walk must run on the graph the classifier is defined over. A graph with no
 /// validation declarations returns immediately, with no walk.
-pub(crate) fn admit_device_witnesses<V: ValidationChannel>(
-    graph: &Graph<V>,
-) -> Result<(), PlanError> {
-    if graph.validation_outputs().is_empty() {
+pub(crate) fn admit_device_witnesses(graph: &Graph) -> Result<(), PlanError> {
+    if graph.witnesses().next().is_none() {
         return Ok(());
     }
     let mut walk = WitnessWalk::new(graph);
-    for validation in graph.validation_outputs() {
+    for validation in graph.witnesses() {
         walk.bound(validation.value).map_err(|reason| {
             PlanError::ValidationWitnessNotCanonical {
                 id: validation.id,
@@ -324,14 +320,10 @@ pub(crate) fn admit_device_witnesses<V: ValidationChannel>(
 }
 
 /// The declaration-ordered packet plan for any validation channel.
-pub(crate) fn validation_packet_plan<V: ValidationChannel>(
-    graph: &Graph<V>,
-) -> Result<ValidationPacketPlan, PlanError> {
-    graph.validate()?;
-    let layout = ValidationPacketLayout::for_graph(graph)?;
+pub(crate) fn validation_packet_plan(graph: &Graph) -> ValidationPacketPlan {
+    let layout = ValidationPacketLayout::for_graph(graph);
     let sources = graph
-        .validation_outputs()
-        .iter()
+        .witnesses()
         .zip(&layout.entries)
         .map(|(validation, entry)| ValidationPacketSource {
             value: validation.value,
@@ -339,7 +331,7 @@ pub(crate) fn validation_packet_plan<V: ValidationChannel>(
             lane_count: entry.lane_count,
         })
         .collect();
-    Ok(ValidationPacketPlan { layout, sources })
+    ValidationPacketPlan { layout, sources }
 }
 
 /// Why a planned kernel cannot run on a device: its body, launch or declared requirements need more

@@ -3,13 +3,14 @@
 //! donated state updates in place on every backend, decided by the engine from the state-commit plan,
 //! never asked of the device.
 
+use std::num::NonZeroU32;
 use std::ops::Range;
 use std::time::Duration;
 
 use poot_graph_plan::{Submission, Target};
 use poot_runtime_common::CompiledKernel;
 pub use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
-use poot_target::BufferStorage;
+use poot_target::{AieTargetId, BufferStorage};
 
 /// One dispatch's device duration within a step's recording, in replay order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,17 +61,63 @@ pub struct Arg<'a, D: Device + ?Sized> {
     pub elems: u32,
 }
 
+/// How a dispatch launches: the execution domain of its kernel (POOT-1117). The engine is one engine over
+/// every backend, so the domain is a closed enum on the dispatch rather than a second device trait: a
+/// device matches it explicitly and refuses the launch kind it does not run, with a typed error, never a
+/// silent arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchKind {
+    /// A thread grid: `threads` is the plan's total thread grid (Card 525); the device divides it by
+    /// `workgroup`.
+    Grid {
+        threads: [u32; 3],
+        workgroup: [u32; 3],
+    },
+    /// One finite run of a loaded AIE kernel's instruction stream over the dispatch's host buffer objects.
+    Aie(AieInvocation),
+}
+
+/// One run of an AIE kernel: its instruction stream executes once over the dispatch's host buffer objects
+/// (the `inputs` then the `output`, in the kernel's shape-ABI binding order) and ends; there is no grid.
+/// It names the target the kernel was linked for and the stream's length in 32-bit instruction words (a
+/// loaded artifact's stream is validated non-empty and word-aligned). A device implementation (POOT-641)
+/// must read `instruction_words` and refuse an invocation that disagrees with the stream of the kernel it
+/// loaded; the GPU devices read only `target`, to refuse the launch kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AieInvocation {
+    target: AieTargetId,
+    instruction_words: NonZeroU32,
+}
+
+impl AieInvocation {
+    /// An invocation of a stream of `instruction_words` words linked for `target`.
+    pub const fn new(target: AieTargetId, instruction_words: NonZeroU32) -> Self {
+        Self {
+            target,
+            instruction_words,
+        }
+    }
+
+    /// The target the kernel was linked for.
+    pub const fn target(&self) -> AieTargetId {
+        self.target
+    }
+
+    /// The instruction stream's length, in 32-bit words.
+    pub const fn instruction_words(&self) -> NonZeroU32 {
+        self.instruction_words
+    }
+}
+
 /// One kernel launch. `inputs` are the kernel's read operands in parameter order (including a metadata
-/// buffer), `output` its written operand. `threads` is the plan's total thread grid (Card 525); the
-/// device divides it by `workgroup`. `work` is the planner-owned watchdog weight: the
-/// device uses it to decide when a long run of dispatches must flush to a new submit before the
-/// driver's TDR fires.
+/// buffer), `output` its written operand. `launch` is how the kernel runs (a thread grid, or an AIE
+/// instruction stream). `work` is the planner-owned watchdog weight: the device uses it to decide when a
+/// long run of dispatches must flush to a new submit before the driver's TDR fires.
 pub struct Dispatch<'a, D: Device + ?Sized> {
     pub kernel: &'a D::Kernel,
     pub inputs: &'a [Arg<'a, D>],
     pub output: Arg<'a, D>,
-    pub threads: [u32; 3],
-    pub workgroup: [u32; 3],
+    pub launch: LaunchKind,
     pub work: u64,
 }
 

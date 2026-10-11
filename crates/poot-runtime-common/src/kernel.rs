@@ -14,7 +14,7 @@
 //! ```compile_fail,E0133
 //! fn from_any_bytes(code: poot_runtime_common::KernelCode) -> poot_runtime_common::CompiledKernel {
 //!     poot_runtime_common::CompiledKernel::new(
-//!         poot_target::Backend::SpirvVulkan,
+//!         poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
 //!         "main",
 //!         code,
 //!         Vec::new(),
@@ -27,7 +27,7 @@
 //! checks the bound buffers' count and native element kind against [`CompiledKernel::args`] in release
 //! builds, returning a typed error on a mismatch.
 
-use poot_target::{AieTargetId, Backend, BufferStorage, ElementKind};
+use poot_target::{AieTargetId, BufferStorage, ElementKind, TargetId};
 
 /// Whether a kernel argument is read, or written back to the caller's buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,7 +104,7 @@ impl KernelCode {
 /// the runtime zeroes before dispatch and checks after). See the module doc for the soundness contract.
 #[derive(Clone, Debug)]
 pub struct CompiledKernel {
-    target: Backend,
+    target: TargetId,
     entry_point: Box<str>,
     code: KernelCode,
     args: Box<[ArgSchema]>,
@@ -124,7 +124,7 @@ impl CompiledKernel {
     /// the bound buffer's element count at dispatch time (the codegen-side half of that contract: the
     /// runtime bounds the length it publishes to the code from the buffer's own recorded capacity).
     pub unsafe fn new(
-        target: Backend,
+        target: TargetId,
         entry_point: impl Into<Box<str>>,
         code: KernelCode,
         args: impl Into<Box<[ArgSchema]>>,
@@ -139,7 +139,7 @@ impl CompiledKernel {
         }
     }
 
-    pub fn target(&self) -> Backend {
+    pub fn target(&self) -> TargetId {
         self.target
     }
 
@@ -757,7 +757,7 @@ mod tests {
         // SAFETY: test-only kernel; never dispatched, only used to check the schema comparison.
         unsafe {
             CompiledKernel::new(
-                Backend::SpirvVulkan,
+                TargetId::Gpu(poot_target::Backend::SpirvVulkan),
                 "main",
                 KernelCode::SpirvWords(Box::new([])),
                 args,

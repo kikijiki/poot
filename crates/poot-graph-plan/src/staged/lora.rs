@@ -4,19 +4,16 @@
 
 use std::borrow::Cow;
 
-use poot_graph_ir::{Graph, ValidationChannel};
+use poot_graph_ir::Graph;
 
 use super::StagedCompileError;
 use crate::passes::GraphBudget;
-use crate::{CompileError, CompileOptions, PlanError, adapt};
+use crate::{CompileError, CompileOptions, adapt};
 
-pub(super) fn apply<'g, V: ValidationChannel>(
-    g: &'g Graph<V>,
+pub(super) fn apply<'g>(
+    g: &'g Graph,
     options: &CompileOptions,
-) -> Result<Cow<'g, Graph<V>>, StagedCompileError> {
-    g.validate()
-        .map_err(PlanError::from)
-        .map_err(CompileError::from)?;
+) -> Result<Cow<'g, Graph>, StagedCompileError> {
     let budget = GraphBudget::of(&options.limits);
     budget
         .admit("compile input", g)

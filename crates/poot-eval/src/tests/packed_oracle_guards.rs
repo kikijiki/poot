@@ -89,7 +89,7 @@ fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, ValueId
     let weight = b.constant(weight_name.as_str(), weight_type);
     let scale = b.constant(scale_name.as_str(), scale_type);
     let output = b.packed_dequant(&[weight, scale], descriptor);
-    (b.finish(output), weight.id(), scale.id())
+    (b.finish(output).unwrap(), weight.id(), scale.id())
 }
 
 /// `packed_components` binds each graph operand to `descriptor.sources()[i]`'s own role (the
@@ -118,7 +118,7 @@ fn packed_dequant_binding_rejects_a_swapped_role() {
     // (`Codes` and `Scale` have different source shapes), so this calls `packed_components` directly -
     // the seam this mutation targets - rather than going through the outer gate a same-shape role swap
     // would slip past.
-    let mut env: ValueTable<Option<Value>> = ValueTable::filled(graph.values.len(), None);
+    let mut env: ValueTable<Option<Value>> = ValueTable::filled(graph.values().len(), None);
     env[weight_id] = Some(Value::Packed(PackedComponentRef::new(
         Arc::clone(&owner),
         SourceRole::Planar(OperandRole::Scale),
@@ -127,7 +127,7 @@ fn packed_dequant_binding_rejects_a_swapped_role() {
         Arc::clone(&owner),
         SourceRole::Planar(OperandRole::Codes),
     )));
-    let result = crate::ops::packed_components(&graph, &graph.eqns[0], &env, descriptor);
+    let result = crate::ops::packed_components(&graph, &graph.eqns()[0], &env, descriptor);
     assert!(
         matches!(
             result,

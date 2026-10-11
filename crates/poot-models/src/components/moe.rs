@@ -576,7 +576,7 @@ mod tests {
         let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All));
         let xs = b.constant("x", TensorType::f32(vec![1, tokens, WIDTH]));
         let y = moe(&b, &step, 0, xs, None, &w, &p);
-        let g = b.finish(y);
+        let g = b.finish(y).unwrap();
         let ids = vec![0; tokens];
         let pos: Vec<i32> = (0..tokens as i32).collect();
         let formats = poot_graph_plan::WeightFormats::from_weight_map(&map);
@@ -933,7 +933,7 @@ mod layout_tests {
         } else {
             (moe(&b, &step, LAYER, xs, None, &w, &p), vec![("x", x)])
         };
-        let g = step.finish(b, y);
+        let g = step.finish(b, y).unwrap();
         let zeros = vec![0; TOKENS];
         fx.eval(
             &g,

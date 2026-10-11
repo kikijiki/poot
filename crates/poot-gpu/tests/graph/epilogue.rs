@@ -79,7 +79,7 @@ fn run_under(
         .unwrap();
     gpu.remove_entry(exe, entry).unwrap();
     gpu.unload(exe).unwrap();
-    let out = g.aval(g.output);
+    let out = g.aval(g.result());
     assert_eq!(out.dtype, DType::F32, "the wgpu rows read an f32 output");
     HostTensor::f32(
         out.shape.clone(),
@@ -107,7 +107,7 @@ fn epilogue_head(g: &poot_graph_ir::Graph, target: &Target) -> ContractionHead {
     let fused = compiled(g, target);
     let heads: Vec<ContractionHead> = fused
         .graph()
-        .eqns
+        .eqns()
         .iter()
         .filter_map(|eqn| match &eqn.op {
             OpKind::ContractionEpilogue { head, .. } => Some(*head),
@@ -118,7 +118,7 @@ fn epilogue_head(g: &poot_graph_ir::Graph, target: &Target) -> ContractionHead {
         heads.len(),
         1,
         "one fused contraction: {:?}",
-        fused.graph().eqns
+        fused.graph().eqns()
     );
     assert_eq!(
         dispatch_count(fused.graph()),
@@ -180,7 +180,7 @@ fn a_dense_gemv_epilogue_matches_the_oracle_on_wgpu() {
         (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
         (residual.id(), HostTensor::f32(vec![1, 1, n], fill(4, n))),
     ]);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let head = epilogue_head(&g, &target);
     assert!(matches!(
         head,
@@ -215,7 +215,7 @@ fn a_serial_matmul_epilogue_matches_the_oracle_on_wgpu() {
             HostTensor::f32(vec![1, 2, 3, 5], fill(14, 30)),
         ),
     ]);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let head = epilogue_head(&g, &spirv_fixture_target());
     assert!(matches!(head, ContractionHead::MatMul));
     assert_fused_matches_oracle(&mut gpu, target, &g, &inputs, "serial matmul epilogue");
@@ -248,7 +248,7 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_wgpu() {
             (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
             (residual.id(), HostTensor::f32(vec![m, n], fill(4, m * n))),
         ]);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let head = epilogue_head(&g, &target);
         assert!(matches!(head, ContractionHead::MatMul), "M={m}");
         assert_fused_matches_oracle(
@@ -287,7 +287,7 @@ fn a_dense_bf16_weight_epilogue_matches_the_oracle_on_wgpu() {
         (bias.id(), HostTensor::f32(vec![n], fill(23, n))),
         (residual.id(), HostTensor::f32(vec![m, n], fill(24, m * n))),
     ]);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let head = epilogue_head(&g, &target);
     assert!(matches!(
         head,
@@ -332,7 +332,7 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_wgpu() {
                 (bias.id(), HostTensor::f32(vec![n], fill(3, n))),
                 (residual.id(), HostTensor::f32(vec![m, n], fill(4, m * n))),
             ]);
-            let g = b.finish(out);
+            let g = b.finish(out).unwrap();
             let head = epilogue_head(&g, &target);
             assert_eq!(
                 head,
@@ -364,7 +364,7 @@ fn a_narrow_head_is_refused_by_name_on_wgpu() {
     let w = b.constant("w", TensorType::new(vec![2, 1], DType::BF16));
     let residual = b.constant("residual", TensorType::new(vec![1, 1], DType::BF16));
     let out = b.binary(BinOp::Add, b.matmul(a, w), residual);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let Err(error) = poot_graph_plan::compile(
         &g,
         &spirv_fixture_target(),

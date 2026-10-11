@@ -667,8 +667,11 @@ mod tests {
         cache.load(key, ROOMY).unwrap()
     }
 
+    /// A complete, valid kernel (the kernel-ir fixture) renamed to `name`, so each test's key is its own.
     fn sample_body(name: &str) -> Body {
-        poot_kernelgen::unary(name, poot_kernel_ir::UnOp::Neg)
+        let mut body = poot_kernel_ir::fixtures::add_kernel();
+        body.name = name.to_string();
+        body
     }
 
     const TARGETS: [Target; 2] = [Target::SpirvVulkan, Target::Nvptx];

@@ -40,7 +40,9 @@ fn layered_graph(layers: usize) -> (Graph, HashMap<ValueId, Value>) {
         state.push((k_in, k_out));
         hidden = next;
     }
-    let graph = b.finish_with_state(hidden, &state);
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(hidden).with_state(&state))
+        .unwrap();
 
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -51,7 +53,7 @@ fn layered_graph(layers: usize) -> (Graph, HashMap<ValueId, Value>) {
         w.id(),
         Value::from(HostTensor::f32(vec![4], vec![0.5, 2.0, -1.25, 1.0])),
     );
-    for (layer, &(state_input, _)) in graph.state.iter().enumerate() {
+    for (layer, (state_input, _)) in graph.state().enumerate() {
         let offset = 0.125 * layer as f32;
         inputs.insert(
             state_input,
@@ -79,7 +81,7 @@ fn bits(tensor: &HostTensor) -> Vec<u32> {
 #[test]
 fn adr0099_s2_split_then_chain_matches_the_unsplit_graph() {
     let (graph, inputs) = layered_graph(3);
-    assert_eq!(graph.eqns.len(), 9, "three equations per block");
+    assert_eq!(graph.eqns().len(), 9, "three equations per block");
     let reference = eval(
         &graph,
         &inputs,
@@ -88,7 +90,7 @@ fn adr0099_s2_split_then_chain_matches_the_unsplit_graph() {
     .expect("the unsplit graph evaluates")
     .environment
     .unwrap();
-    let reference_output = reference[graph.output]
+    let reference_output = reference[graph.result()]
         .as_ref()
         .expect("the unsplit graph computes its output")
         .as_host()

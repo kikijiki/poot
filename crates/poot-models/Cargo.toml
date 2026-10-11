@@ -19,16 +19,25 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-poot-test-util = { workspace = true, features = ["graph-fixtures"] }
+# `graph-fixtures`: the reimplemented `plan_eqn` wrapper and `default_caps_for`; it also carries
+# `poot-graph-plan/test-support` (`reassociation_class`, `per_eqn_plans_outside_compile`, ADR-0113) to the
+# integration tests that trace models through `compile`.
+poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
 poot-eval.workspace = true
 poot-executor-parity.workspace = true
 poot-runtime-common.workspace = true
 # Card 534a: fold_dense_bf16_row_gathers is pub(crate) in poot-graph-plan now,
-# reachable only through prepare_target_graph. Test-only and acyclic: poot-graph-plan's own
-# dependency on poot-models is dev-only, so building this crate's tests never needs poot-models.
+# reachable only through prepare_target_graph. The planner's pass-soundness tests that trace models live
+# here (POOT-755): a model crate sits above the planner, never the reverse.
 poot-graph-plan.workspace = true
+poot-kernel-ir.workspace = true
 poot-kernelgen.workspace = true
 poot-target.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
 
 [lints]
 workspace = true

@@ -61,7 +61,9 @@ mod tests {
         let b = Builder::new();
         let xs = b.constant("x", TensorType::f32(vec![ROWS, N]));
         let out = pick(&b, xs);
-        Fx::new(1).eval(&b.finish(out), &[("x", x)], &[], &[]).0
+        Fx::new(1)
+            .eval(&b.finish(out).unwrap(), &[("x", x)], &[], &[])
+            .0
     }
 
     /// The rank of each entry written from its definition: how many entries of the row are strictly

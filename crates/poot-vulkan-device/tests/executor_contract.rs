@@ -17,6 +17,7 @@ use poot_graph_plan::{ImportedKernel, Submission};
 use poot_runtime_common::{CompiledKernel, DeviceBackend};
 use poot_target::{BufferStorage, ElementKind, LogicalDType};
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::gpu_caps;
 use poot_test_util::weight_map_oracle::oracle_for;
 use poot_test_util::{StepFixture, assert_close_rel};
 use poot_vulkan_device::{VulkanDevice, VulkanKernel};
@@ -183,8 +184,10 @@ fn record_add(
             kernel,
             inputs: &[Arg { buffer: lhs, elems }, Arg { buffer: rhs, elems }],
             output: Arg { buffer: dst, elems },
-            threads: [elems, 1, 1],
-            workgroup: [64, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [elems, 1, 1],
+                workgroup: [64, 1, 1],
+            },
             work: n as u64,
         })
         .unwrap();
@@ -229,8 +232,10 @@ fn dispatch_reads_the_argument_element_count_not_the_buffer_capacity() {
                 buffer: &out,
                 elems: 2,
             },
-            threads: [4, 1, 1],
-            workgroup: [64, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [4, 1, 1],
+                workgroup: [64, 1, 1],
+            },
             work: 4,
         })
         .unwrap();
@@ -238,6 +243,62 @@ fn dispatch_reads_the_argument_element_count_not_the_buffer_capacity() {
     device.replay(&recording).unwrap();
     device.synchronize().unwrap();
     assert_eq!(read_f32(&mut device, &out), [11.0, 22.0, -1.0, -1.0]);
+}
+
+/// POOT-1117: a `LaunchKind::Aie` dispatch handed to the Vulkan device is the typed refusal
+/// `RuntimeError::WrongKernelTarget` naming the AIE target, and the open step is still abortable.
+///
+/// Mutation: let `VulkanDevice::dispatch` accept `LaunchKind::Aie` (bind its arm to a fixture grid); `dispatch`
+/// returns `Ok` and the row goes red.
+#[test]
+fn an_aie_launch_is_a_typed_refusal_on_vulkan() {
+    use poot_target::{AieTargetId, TargetId};
+    let Some(mut device) = vulkan() else {
+        return;
+    };
+    let kernel = add_kernel(&mut device);
+    let a = f32_buffer(&mut device, BufferRole::Input, &[1.0; 4]);
+    let b = f32_buffer(&mut device, BufferRole::Input, &[1.0; 4]);
+    let out = f32_buffer(&mut device, BufferRole::Output, &[0.0; 4]);
+    device.begin(Submission::Replay).unwrap();
+    let error = device
+        .dispatch(Dispatch {
+            kernel: &kernel,
+            inputs: &[
+                Arg {
+                    buffer: &a,
+                    elems: 4,
+                },
+                Arg {
+                    buffer: &b,
+                    elems: 4,
+                },
+            ],
+            output: Arg {
+                buffer: &out,
+                elems: 4,
+            },
+            launch: poot_executor::LaunchKind::Aie(poot_executor::AieInvocation::new(
+                AieTargetId::Xdna2,
+                std::num::NonZeroU32::new(1).unwrap(),
+            )),
+            work: 4,
+        })
+        .expect_err("a thread-grid device runs no AIE invocation");
+    assert!(
+        matches!(
+            &error,
+            poot_vulkan_device::VulkanGpuError::Runtime(runtime)
+                if matches!(
+                    **runtime,
+                    poot_vulkan_runtime::RuntimeError::WrongKernelTarget {
+                        actual: TargetId::Aie(AieTargetId::Xdna2)
+                    }
+                )
+        ),
+        "{error:?}"
+    );
+    device.abort().unwrap();
 }
 
 /// `copy` is `vkCmdCopyBuffer` in the command stream, ordered after the dispatch that wrote its source
@@ -354,8 +415,10 @@ fn a_long_recording_is_cut_into_several_submissions_and_replays_exactly() {
                         buffer: dst,
                         elems: 4,
                     },
-                    threads: [4, 1, 1],
-                    workgroup: [64, 1, 1],
+                    launch: poot_executor::LaunchKind::Grid {
+                        threads: [4, 1, 1],
+                        workgroup: [64, 1, 1],
+                    },
                     work,
                 })
                 .unwrap();
@@ -435,8 +498,10 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
                 buffer: &out,
                 elems: 4,
             },
-            threads: [4, 1, 1],
-            workgroup: [64, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [4, 1, 1],
+                workgroup: [64, 1, 1],
+            },
             work: 4,
         })
         .unwrap();
@@ -537,9 +602,7 @@ fn the_vulkan_device_reports_live_free_memory_within_its_open_time_ceiling() {
     let Some(mut device) = vulkan() else {
         return;
     };
-    let ceiling = device
-        .target()
-        .caps
+    let ceiling = gpu_caps(&device.target())
         .memory_budget_bytes
         .expect("the vulkan device queried its heap budget at open");
     let free = device

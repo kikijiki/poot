@@ -63,11 +63,10 @@ fn fused_pointwise_chain_is_bit_identical_to_unfused() {
     let t3 = b.binary(BinOp::Mul, t2, c);
     let out = b.binary(BinOp::Add, t3, a);
     let (ai, bi, ci) = (a.id(), bb.id(), c.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
-    let fg = fuse(&g);
-    fg.validate().expect("fused graph valid");
-    assert_eq!(fg.eqns.len(), 1, "the 4-op chain fuses to one eqn");
+    let fg = fuse(&g).unwrap();
+    assert_eq!(fg.eqns().len(), 1, "the 4-op chain fuses to one eqn");
 
     let mut inputs = HashMap::new();
     inputs.insert(ai, Value::from(HostTensor::f32(vec![1, 1, n], fill(n, 11))));
@@ -133,7 +132,7 @@ fn fused_equals_unfused_over_random_pointwise_graphs() {
                 }
             }
         }
-        let g = b.finish(acc);
+        let g = b.finish(acc).unwrap();
         let mut inputs = HashMap::new();
         for (i, id) in leaf_ids.iter().enumerate() {
             inputs.insert(
@@ -144,9 +143,8 @@ fn fused_equals_unfused_over_random_pointwise_graphs() {
                 )),
             );
         }
-        let fg = fuse(&cse(&g));
-        fg.validate().expect("fused graph valid");
-        if fg.eqns.len() < g.eqns.len() {
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        if fg.eqns().len() < g.eqns().len() {
             fused_count += 1;
         }
         let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -180,8 +178,8 @@ fn fused_equals_unfused_over_random_pointwise_graphs() {
             ub,
             fb,
             "seed {seed}: fused eval not bit-identical to unfused ({} -> {} eqns)",
-            g.eqns.len(),
-            fg.eqns.len()
+            g.eqns().len(),
+            fg.eqns().len()
         );
     }
     eprintln!("pointwise fuzz: 400 graphs, {fused_count} exercised fusion");
@@ -256,7 +254,7 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
         if reduced {
             had_reduction += 1;
         }
-        let g = b.finish(acc);
+        let g = b.finish(acc).unwrap();
         let mut inputs = HashMap::new();
         for (i, t) in full.iter().enumerate() {
             inputs.insert(
@@ -274,8 +272,7 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
                 fill(bnumel, seed * 13 + 101),
             )),
         );
-        let fg = fuse(&cse(&g));
-        fg.validate().expect("fused graph valid");
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
         let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
             .output
@@ -322,7 +319,7 @@ fn rope_graph_and_inputs(d: usize, rot: usize) -> (poot_graph_ir::Graph, HashMap
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
     let out = rope(&b, x, cos, sin, pos);
     let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
         xi,
@@ -345,10 +342,10 @@ fn rope_fusion_eval_matches_unfused_full() {
     // full rotary: eval(rope_fusion(g)) == eval(g) approximately; checks match_rope fired without
     // changing numerics.
     let (g, inputs) = rope_graph_and_inputs(8, 8);
-    let fused = poot_graph_plan::rope_fusion(&cse(&g));
+    let fused = poot_graph_plan::rope_fusion(&cse(&g).unwrap()).unwrap();
     assert!(
         fused
-            .eqns
+            .eqns()
             .iter()
             .any(|e| matches!(e.op, poot_graph_ir::op::OpKind::Rope { .. })),
         "rope_fusion should fire on the full-rotary chain"
@@ -374,9 +371,9 @@ fn rope_fusion_eval_matches_unfused_full() {
 fn rope_fusion_eval_matches_unfused_partial() {
     // partial rotary (rot=4 of D=8): the fused Rope op passes [rot, D) through; eval stays bit-approximate.
     let (g, inputs) = rope_graph_and_inputs(8, 4);
-    let fused = poot_graph_plan::rope_fusion(&cse(&g));
+    let fused = poot_graph_plan::rope_fusion(&cse(&g).unwrap()).unwrap();
     let rope_eqn = fused
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, poot_graph_ir::op::OpKind::Rope { .. }))
         .expect("rope_fusion should fire on the partial chain");
@@ -406,7 +403,7 @@ fn optimize_preserves_rope_numerics() {
     // the full pass pipeline must be eval-equivalent to the raw graph.
     for (d, rot) in [(8usize, 8usize), (8, 4)] {
         let (g, inputs) = rope_graph_and_inputs(d, rot);
-        let opt = optimize(&g);
+        let opt = optimize(&g).unwrap();
         let got_unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
             .output

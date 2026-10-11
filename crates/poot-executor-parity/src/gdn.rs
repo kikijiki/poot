@@ -90,7 +90,9 @@ pub fn gdn_prefill_chunked_case() -> GdnChunkedCase {
     let tril_strict = b.constant("gdn.tril_strict", TensorType::f32(vec![1, 1, CHUNK, CHUNK]));
     let (out, state_out) =
         gdn_prefill_chunked(&b, q, k, v, g, beta, state, tril_incl, tril_strict, CHUNK);
-    let graph = b.finish_with_state(out, &[(state, state_out)]);
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(state, state_out)]))
+        .unwrap();
 
     let triangle = |keep: fn(usize, usize) -> bool| {
         let data = (0..CHUNK * CHUNK)

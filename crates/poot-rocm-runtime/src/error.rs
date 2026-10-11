@@ -35,7 +35,7 @@ pub enum RocmError {
     /// [`RocmContext::load_hsaco`] was given a [`poot_runtime_common::CompiledKernel`] compiled for a
     /// different backend (card 608): this runtime only ever loads an `AmdGcn`-compiled kernel.
     #[error("ROCm load_hsaco requires an AmdGcn-compiled kernel, got one compiled for {actual:?}")]
-    WrongKernelTarget { actual: poot_target::Backend },
+    WrongKernelTarget { actual: poot_target::TargetId },
     /// The buffers a ROCm dispatch packed into its kernarg segment did not meet the compiled kernel's
     /// argument schema (card 608, SC-002): a typed release-build error before
     /// any submission, checked against the schema `load_hsaco`/`lookup_kernel` carried from the

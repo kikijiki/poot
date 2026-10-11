@@ -27,19 +27,19 @@ mod test_support;
 pub mod types;
 
 pub use builder::{
-    Builder, BuilderAppendAccounting, BuilderAppendPlan, LayerScope, PreparedBuilderAppend,
-    ScanResult, Traced,
+    Builder, BuilderAppendAccounting, BuilderAppendPlan, LayerScope, Outputs,
+    PreparedBuilderAppend, ScanResult, Traced, WitnessDeclaration,
 };
 pub use error::{
     BuilderAppendError, BuilderCollection, BuilderValueNamespace, FusedOperandReason,
     GraphValidationError, ScanReason, ShapeError,
 };
 pub use graph::{
-    BoundaryId, ComputedConst, Eqn, ExecutionValidationFailure, Export, Graph, LayerIndex,
-    LayerRuns, LayerTagError, MAX_VALIDATION_PACKET_BYTES, NoValidations, Operand, Slot, SlotKey,
-    StatePair, StateRole, Storage, ValidationChannel, ValidationId, ValidationOutput,
-    ValidationOutputs, ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout,
-    ValueId, ValueMeta, ValueTable,
+    BoundaryId, ComputedConst, EditError, Eqn, ExecutionValidationFailure, Export, Graph,
+    GraphEdit, GraphOutput, LayerIndex, LayerRuns, LayerTagError, MAX_VALIDATION_PACKET_BYTES,
+    Operand, OutputKind, Slot, SlotKey, StatePair, StateRole, Storage, ValidationId,
+    ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
+    ValueTable, Witness, WitnessLedger,
 };
 pub use index_guard::{GuardedIndex, IndexGuardError};
 pub use op::{

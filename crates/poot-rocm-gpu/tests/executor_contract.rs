@@ -11,7 +11,7 @@ use std::time::Duration;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::StepInputs;
 use poot_executor::{Arg, Device, Dispatch, Engine, Executor, ExecutorStats, NoSync};
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
 use poot_graph_plan::{ImportedKernel, Submission};
 use poot_kernel_ir::Body;
@@ -26,6 +26,7 @@ use poot_tensor::DType;
 use poot_tensor::HostTensor;
 use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::{gpu_backend, gpu_caps};
 use poot_test_util::{assert_close_rel, max_abs_error};
 
 const CAP: usize = 8;
@@ -63,11 +64,9 @@ fn decode_graph() -> Graph {
         .head_dim(4)
         .max_positions(16)
         .f32_model();
-    plain(
-        m.model
-            .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
-            .unwrap(),
-    )
+    m.model
+        .trace(Phase::Decode, step(1, 1, CAP, LogitRows::Last))
+        .unwrap()
 }
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -84,7 +83,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 
 fn store_for(g: &Graph) -> Arc<WeightStore> {
     let mut entries: HashMap<String, Vec<usize>> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage == poot_graph_ir::Storage::Const {
             entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
@@ -112,11 +111,8 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn decode_staged(
-    g: &Graph,
-    target: poot_graph_plan::Target,
-) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+fn decode_staged(g: &Graph, target: poot_graph_plan::Target) -> poot_graph_plan::StagedProgram {
+    let g = g.clone();
     poot_graph_plan::compile_staged(
         &g,
         &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -136,7 +132,7 @@ fn decode_slot_inputs(g: &Graph, token: u32, pos: usize, _cap: usize) -> StepInp
     // Leak the encoded byte buffers for the step's lifetime (test-only convenience; avoids a
     // borrow-lifetime struct just to feed `StepInputs`, which borrows its byte slices).
     let mut inputs = StepInputs::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let poot_graph_ir::Storage::Slot(slot) = meta.storage else {
             continue;
@@ -269,7 +265,7 @@ fn oracle_decode_step(
     _cap: usize,
 ) -> Vec<f32> {
     let mut inputs: HashMap<poot_graph_ir::ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let value = match meta.storage {
             poot_graph_ir::Storage::Const => {
@@ -312,7 +308,7 @@ fn oracle_decode_step(
         inputs.insert(id, value);
     }
     let evaluation = eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
-    for (&(si, _), t) in g.state.iter().zip(evaluation.state) {
+    for ((si, _), t) in g.state().zip(evaluation.state) {
         state.insert(g.meta(si).name.clone().unwrap(), t.into_host().unwrap());
     }
     evaluation
@@ -332,9 +328,7 @@ fn the_rocm_device_reports_live_free_memory_within_its_open_time_ceiling() {
     let Some(device) = require_rocm() else {
         return;
     };
-    let ceiling = device
-        .target()
-        .caps
+    let ceiling = gpu_caps(&device.target())
         .memory_budget_bytes
         .expect("the ROCm device queried its pool size at open");
     let free = device
@@ -489,7 +483,9 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps_on_rocm() {
     let output = b.binary(BinOp::Add, a, s);
     let new_a = b.binary(BinOp::Add, s, bias);
     let new_s = b.binary(BinOp::Add, a, bias);
-    let g = b.finish_with_state(output, &[(a, new_a), (s, new_s)]);
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, new_a), (s, new_s)]))
+        .unwrap();
 
     let bias_value = vec![1.0f32, 2.0, 3.0, 4.0];
     let mut builder = WeightStore::builder();
@@ -651,7 +647,7 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
     };
     let mut device = RocmDevice::from_context(ctx).expect("RocmDevice over the 2s-bound context");
     let target = device.target();
-    let arch = match target.backend {
+    let arch = match gpu_backend(&target) {
         poot_target::Backend::AmdGcn(arch) => arch,
         other => panic!("RocmDevice::target must report AmdGcn, got {other:?}"),
     };
@@ -703,8 +699,10 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
                 buffer: &out_buf,
                 elems: 1,
             },
-            threads: [1, 1, 1],
-            workgroup: [1, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [1, 1, 1],
+                workgroup: [1, 1, 1],
+            },
             work: 1,
         })
         .unwrap();
@@ -808,7 +806,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
     poot_test_util::i32_slot_gather::run_all("rocm", |variant| {
         let base_inputs = variant.inputs(&variant.graph);
         let mut builder = WeightStore::builder();
-        for &id in &variant.graph.inputs {
+        for &id in variant.graph.inputs() {
             let meta = variant.graph.meta(id);
             if meta.storage != poot_graph_ir::Storage::Const {
                 continue;
@@ -840,7 +838,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
         }
         let state_seeds = variant.state();
         for (i, seed) in state_seeds.iter().enumerate() {
-            let (si, _) = variant.graph.state[i];
+            let (si, _) = variant.graph.state().nth(i).unwrap();
             let shape = variant.graph.meta(si).aval.shape.clone();
             let bytes: Vec<u8> = seed.iter().flat_map(|v| v.to_le_bytes()).collect();
             builder
@@ -857,7 +855,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
         let mut weights = ConstWeights::new(&store);
         let real_graph = weights.graph(&variant.graph);
         let mut seed_graphs = Vec::new();
-        for (i, &(si, _)) in variant.graph.state.iter().enumerate() {
+        for (i, (si, _)) in variant.graph.state().enumerate() {
             let meta = variant.graph.meta(si);
             let name = meta.name.as_deref().unwrap().to_string();
             let shape = meta.aval.shape.clone();
@@ -865,7 +863,11 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
             let state_in =
                 b.state_input(&name, TensorType::f32(shape.clone()), StateRole::Recurrent);
             let seed_const = b.constant(&format!("seed_{i}"), TensorType::f32(shape));
-            let seed_g = b.finish_with_state(seed_const, &[(state_in, seed_const)]);
+            let seed_g = b
+                .finish(
+                    poot_graph_ir::Outputs::new(seed_const).with_state(&[(state_in, seed_const)]),
+                )
+                .unwrap();
             seed_graphs.push((name, weights.graph(&seed_g)));
         }
         let exe = engine
@@ -887,7 +889,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
         }
 
         let mut slot_inputs = StepInputs::new();
-        for &id in &variant.graph.inputs {
+        for &id in variant.graph.inputs() {
             let meta = variant.graph.meta(id);
             if !matches!(meta.storage, poot_graph_ir::Storage::Slot(_)) {
                 continue;
@@ -931,7 +933,7 @@ fn i32_slot_gather_variants_compiled_match_cpu_oracle_on_rocm() {
             .map_err(|e| format!("step: {e}"))?
             .read()
             .map_err(|e| format!("read: {e}"))?;
-        let out_shape = variant.graph.aval(variant.graph.output).shape.clone();
+        let out_shape = variant.graph.aval(variant.graph.result()).shape.clone();
         engine.unload(exe).map_err(|e| format!("unload: {e}"))?;
         Ok(HostTensor::f32(out_shape, bytemuck_f32(&bytes)))
     });
@@ -965,7 +967,7 @@ fn sliding_window_mask_from_pos_rocm_matches_cpu() {
     let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, l, Some(window));
     let out = poot_graph_ir::ops::attention_prefill(&b, q, k, v, n_rep, scale, mask);
     let (qi, ki, vi, posi) = (q.id(), k.id(), v.id(), pos.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let fill = |seed: u64, count: usize| -> Vec<f32> {
         let mut s = seed.wrapping_add(0x9E3779B97F4A7C15) | 1;

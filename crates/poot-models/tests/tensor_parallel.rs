@@ -12,12 +12,10 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, paged_step, plain, step};
+use poot_executor_parity::dense::{Dense, Family, paged_step, step};
 use poot_executor_parity::weight_map::{MappedModel, TIER2, assert_close};
 use poot_graph_ir::builder::Builder;
-use poot_graph_ir::{
-    ComputedConst, Graph, Slot, SlotKey, Storage, TensorType, ValidationChannel, ValueId,
-};
+use poot_graph_ir::{ComputedConst, Graph, Slot, SlotKey, Storage, TensorType, ValueId};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, LoraPlan, Partition,
     ShardError, ShardRule, StagedCompileError, StagedProgram, Submission, Target, TargetSet,
@@ -30,7 +28,7 @@ use poot_quant::weights::{
     WeightRole, WeightStore, WeightView,
 };
 use poot_quant::{PackedPayload, PackedWeight, SourceRole};
-use poot_target::Backend;
+use poot_target::{Backend, TargetId};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::device_caps::default_caps_for;
 
@@ -51,7 +49,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 fn target(backend: Backend) -> Target {
     let mut caps = default_caps_for(backend);
     caps.memory_budget_bytes = Some(1 << 30);
-    Target { backend, caps }
+    Target::Gpu { backend, caps }
 }
 
 fn options() -> CompileOptions {
@@ -102,25 +100,21 @@ fn tiny_qwen2() -> MappedModel {
 }
 
 fn decode_graph(mapped: &MappedModel, rows: usize) -> Graph {
-    plain(
-        mapped
-            .model
-            .trace(Phase::Decode, step(rows, 1, 6, LogitRows::Last))
-            .expect("the fixture traces a decode step"),
-    )
+    mapped
+        .model
+        .trace(Phase::Decode, step(rows, 1, 6, LogitRows::Last))
+        .expect("the fixture traces a decode step")
 }
 
 /// One paged decode step of `rows` rows over `capacity` positions and a pool of `pool_slots` slots.
 fn paged_decode_graph(mapped: &MappedModel, rows: usize, pool_slots: usize) -> Graph {
-    plain(
-        mapped
-            .model
-            .trace(
-                Phase::Decode,
-                paged_step(rows, 1, CAPACITY, pool_slots, LogitRows::Last),
-            )
-            .expect("the fixture traces a paged decode step"),
-    )
+    mapped
+        .model
+        .trace(
+            Phase::Decode,
+            paged_step(rows, 1, CAPACITY, pool_slots, LogitRows::Last),
+        )
+        .expect("the fixture traces a paged decode step")
 }
 
 /// The capacity of the paged steps below: positions each row reads.
@@ -140,7 +134,7 @@ enum Identity {
     Computed(ComputedConst),
 }
 
-fn identity<V: ValidationChannel>(graph: &Graph<V>, value: ValueId) -> Identity {
+fn identity(graph: &Graph, value: ValueId) -> Identity {
     let meta = graph.meta(value);
     match meta.storage {
         Storage::Const | Storage::State => Identity::Named(meta.name.clone().expect("named")),
@@ -206,12 +200,12 @@ struct Step {
     state: HashMap<String, HostTensor>,
 }
 
-fn decode_step<V: ValidationChannel>(graph: &Graph<V>) -> Step {
+fn decode_step(graph: &Graph) -> Step {
     let mut slots = HashMap::new();
     let mut state = HashMap::new();
     // A paged step's pool, and its rows, from the inputs that declare them.
     let slot_shape = |slot: Slot, rank: usize| {
-        graph.inputs.iter().find_map(|&input| {
+        graph.inputs().iter().find_map(|&input| {
             let meta = graph.meta(input);
             (meta.storage == Storage::Slot(slot) && meta.aval.shape.len() == rank)
                 .then(|| meta.aval.shape.clone())
@@ -219,7 +213,7 @@ fn decode_step<V: ValidationChannel>(graph: &Graph<V>) -> Step {
     };
     let pool_slots = slot_shape(Slot::SlotMap, 1).map_or(1, |shape| shape[0]);
     let rows = slot_shape(Slot::Token, 2).map_or(1, |shape| shape[0]);
-    for &input in &graph.inputs {
+    for &input in graph.inputs() {
         let meta = graph.meta(input);
         let shape = meta.aval.shape.clone();
         let numel = shape.iter().product::<usize>().max(1);
@@ -305,8 +299,8 @@ fn base_name(name: &str) -> (&str, usize) {
 }
 
 /// The program's stages in order, each bound as its rank binds it.
-fn walk<V: ValidationChannel>(
-    program: &StagedProgram<V>,
+fn walk(
+    program: &StagedProgram,
     weights: (&WeightStore, &WeightMap),
     step: &Step,
     extra: &HashMap<String, HostTensor>,
@@ -338,7 +332,7 @@ fn walk<V: ValidationChannel>(
             .expect("a stage runs on a rank's device");
         let g = stage.graph();
         let inputs: HashMap<ValueId, Value> = g
-            .inputs
+            .inputs()
             .iter()
             .map(|&id| {
                 let tensor = match identity(g, id) {
@@ -376,13 +370,13 @@ fn walk<V: ValidationChannel>(
         )
         .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
         let environment = result.environment.expect("the environment was kept");
-        for export in &g.exports {
+        for export in g.exports() {
             let value = environment[export.value]
                 .clone()
                 .unwrap_or_else(|| panic!("stage {index} lacks boundary {:?}", export.id));
             boundaries.insert(export.id.slot_key(), value);
         }
-        for (&(state_in, _), value) in g.state.iter().zip(result.state) {
+        for ((state_in, _), value) in g.state().zip(result.state) {
             let name = g.meta(state_in).name.clone().unwrap();
             let (base, from) = base_name(&name);
             state.insert(
@@ -405,8 +399,8 @@ fn walk<V: ValidationChannel>(
 }
 
 /// The whole graph on the oracle, bound from the same weights and step.
-fn whole<V: ValidationChannel>(
-    graph: &Graph<V>,
+fn whole(
+    graph: &Graph,
     weights: (&WeightStore, &WeightMap),
     step: &Step,
     extra: &HashMap<String, HostTensor>,
@@ -416,7 +410,7 @@ fn whole<V: ValidationChannel>(
         tensors.insert(name.clone(), value.clone());
     }
     let inputs: HashMap<ValueId, Value> = graph
-        .inputs
+        .inputs()
         .iter()
         .map(|&id| {
             let value = match identity(graph, id) {
@@ -433,10 +427,9 @@ fn whole<V: ValidationChannel>(
         .collect();
     let result = eval(graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).expect("evaluates");
     let state = graph
-        .state
-        .iter()
+        .state()
         .zip(result.state)
-        .map(|(&(state_in, _), value)| {
+        .map(|((state_in, _), value)| {
             (
                 graph.meta(state_in).name.clone().unwrap(),
                 value.as_host().unwrap().clone(),
@@ -446,20 +439,20 @@ fn whole<V: ValidationChannel>(
     (result.output.as_host().unwrap().clone(), state)
 }
 
-fn compile<V: ValidationChannel>(
-    graph: &Graph<V>,
+fn compile(
+    graph: &Graph,
     weights: &Arc<WeightMap>,
     options: &CompileOptions,
-) -> Result<StagedProgram<V>, StagedCompileError> {
+) -> Result<StagedProgram, StagedCompileError> {
     compile_over(graph, weights, options, WORLD)
 }
 
-fn compile_over<V: ValidationChannel>(
-    graph: &Graph<V>,
+fn compile_over(
+    graph: &Graph,
     weights: &Arc<WeightMap>,
     options: &CompileOptions,
     world: u32,
-) -> Result<StagedProgram<V>, StagedCompileError> {
+) -> Result<StagedProgram, StagedCompileError> {
     compile_staged(
         graph,
         &gpus(Backend::Nvptx, world),
@@ -468,9 +461,9 @@ fn compile_over<V: ValidationChannel>(
     )
 }
 
-fn assert_walk_matches<V: ValidationChannel>(
-    program: &StagedProgram<V>,
-    graph: &Graph<V>,
+fn assert_walk_matches(
+    program: &StagedProgram,
+    graph: &Graph,
     weights: (&WeightStore, &WeightMap),
     step: &Step,
     extra: &HashMap<String, HostTensor>,
@@ -569,7 +562,7 @@ fn dense_linear(id: WeightId, out: usize, input: usize) -> (Graph, WeightMap, We
     let w = b.constant(&id.const_name(), TensorType::f32(vec![out, input]));
     let wt = b.transpose(w, vec![1, 0]);
     let y = b.matmul(x, wt);
-    (b.finish(y), map, store)
+    (b.finish(y).unwrap(), map, store)
 }
 
 /// SC-002 (MLA): a weight of multi-head latent attention has no Megatron rule; `shard` names it.
@@ -628,7 +621,7 @@ fn shard_refuses_a_q4_k_column_split_mid_block() {
         let weight = PackedWeight::try_new(WeightFormat::Q4_K, [4, k]).unwrap();
         let y = poot_graph_ir::ops::packed_linear(&b, h, &id.const_name(), weight, None, None)
             .expect("a packed linear");
-        (b.finish(y), map)
+        (b.finish(y).unwrap(), map)
     };
     let world = NonZeroU32::new(WORLD).unwrap();
 
@@ -651,7 +644,7 @@ fn shard_refuses_a_q4_k_column_split_mid_block() {
     assert_eq!(sharded.weights, vec![(q, 0), (id, 1)]);
     let local = sharded
         .graph
-        .consts
+        .consts()
         .iter()
         .map(|&c| sharded.graph.aval(c).shape.clone())
         .collect::<Vec<_>>();
@@ -828,7 +821,7 @@ fn a_split_output_is_gathered_and_the_ranks_slices_concatenate_in_rank_order() {
         shard(&graph, &map, ShardRule::Megatron, world).expect("a column-parallel linear");
     assert_eq!(sharded.collectives.len(), 1);
     assert_eq!(
-        sharded.graph.eqns.last().unwrap().op,
+        sharded.graph.eqns().last().unwrap().op,
         poot_graph_ir::OpKind::AllGather { axis: 2, world },
         "the split output is gathered on its split axis"
     );
@@ -860,7 +853,7 @@ fn an_op_with_no_rule_on_a_split_axis_is_refused_by_name() {
     let wt = b.transpose(w, vec![1, 0]);
     let y = b.matmul(x, wt);
     let cut = b.slice(y, 2, 0, 4);
-    let graph = b.finish(cut);
+    let graph = b.finish(cut).unwrap();
     let refusal = shard(
         &graph,
         &map,
@@ -912,7 +905,7 @@ fn a_collective_on_a_target_without_collectives_is_refused_by_compile() {
         "{backend:?}: the refusal names the collective equation, not {:?}",
         refusal.op
     );
-    assert_eq!(refusal.target, backend);
+    assert_eq!(refusal.target, TargetId::Gpu(backend));
 }
 
 /// POOT-1102 SC-001: a group of four ranks shards, and the walk equals the whole graph on the logits

@@ -33,10 +33,9 @@ use std::collections::{HashMap, HashSet};
 
 use poot_target::DeviceCaps;
 
+use poot_graph_ir::graph::EditError;
 use poot_graph_ir::graph::LayerIndex;
-use poot_graph_ir::graph::{
-    Eqn, Graph, Operand, Slot, Storage, ValidationChannel, ValueId, ValueMeta,
-};
+use poot_graph_ir::graph::{Eqn, Graph, Operand, Slot, Storage, ValueId, ValueMeta};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{BinOp, ContractionRows, PackedSourceName, Scalar};
@@ -51,7 +50,7 @@ use poot_graph_ir::ValueTable;
 const STAGE: &str = "legalize";
 
 /// Why [`legalize`] could not fit `g` onto a target's device limits.
-#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum LegalizeError {
     /// A named constant is larger than the target's single-buffer limit, and legalize has no rewrite
     /// for how it is used: today's one rewrite is an axis-0 gather of a constant by a `Slot::Token`
@@ -69,6 +68,15 @@ pub enum LegalizeError {
     /// Splitting an oversized weight would grow the graph past the caller's [`CompileLimits`].
     #[error(transparent)]
     Expansion(#[from] ExpansionError),
+    /// A rewrite produced a graph the edit check refused: a defect of the pass, never of the input.
+    #[error(transparent)]
+    Edit(Box<poot_graph_ir::EditError>),
+}
+
+impl From<poot_graph_ir::EditError> for LegalizeError {
+    fn from(error: poot_graph_ir::EditError) -> Self {
+        Self::Edit(Box::new(error))
+    }
 }
 
 /// Legalize `g` for a target whose measured single-buffer limit is `caps.max_buffer_bytes` (card 522).
@@ -83,21 +91,46 @@ pub enum LegalizeError {
 /// oversized 2D weight read by a `DenseContraction`, or through a transpose into a `MatMul`, splits into row
 /// chunks that each fit, joined by a `Concat`). Anything
 /// still over the limit after both rewrites is a typed refusal, before any device allocation (SC-002).
-pub fn legalize<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn legalize(
+    g: &Graph,
     caps: &DeviceCaps,
     limits: &CompileLimits,
-) -> Result<Graph<V>, LegalizeError> {
+) -> Result<Graph, LegalizeError> {
     let limit = caps.max_buffer_bytes;
-    let g = host_oversized_token_gathers(g, limit);
+    let g = host_oversized_token_gathers(g, limit)?;
     let g = split_oversized_matmul_weights(&g, limit, GraphBudget::of(limits))?;
     let g = split_oversized_expert_stacks(&g, limit, GraphBudget::of(limits))?;
     refuse_oversized_constants(&g, limit)?;
     Ok(g)
 }
 
+/// `g` with the split's values and equations and the new chunk constants declared beside the weights
+/// they replace, dead-code-eliminated. The replaced weights stay declared until liveness shows nothing
+/// reads them; [`without_consts`] then drops the dead ones.
+fn staged_split(
+    g: &Graph,
+    values: ValueTable<ValueMeta>,
+    eqns: Vec<Eqn>,
+    new_consts: &[ValueId],
+) -> Result<Graph, EditError> {
+    let mut staged = g.edit();
+    *staged.values_mut() = values;
+    *staged.eqns_mut() = eqns;
+    staged.inputs_mut().extend_from_slice(new_consts);
+    staged.consts_mut().extend_from_slice(new_consts);
+    super::dce(&staged.commit()?)
+}
+
+/// `split` with the constants in `dropped` no longer declared as inputs or constants.
+fn without_consts(split: &Graph, dropped: &HashSet<ValueId>) -> Result<Graph, EditError> {
+    let mut out = split.edit();
+    out.inputs_mut().retain(|id| !dropped.contains(id));
+    out.consts_mut().retain(|id| !dropped.contains(id));
+    out.commit()
+}
+
 /// A named constant's byte footprint as one dense device buffer: element count times dtype width.
-fn const_bytes<V: ValidationChannel>(g: &Graph<V>, id: ValueId) -> u64 {
+fn const_bytes(g: &Graph, id: ValueId) -> u64 {
     let aval = g.aval(id);
     let elems: u64 = aval.shape.iter().map(|&d| d as u64).product();
     elems.saturating_mul(aval.dtype.byte_size() as u64)
@@ -117,12 +150,12 @@ fn operand_value(o: Operand) -> Option<ValueId> {
 /// [`ValueId`], so nothing downstream needs rewiring. A constant is hosted only when every reader of it
 /// is a hosted gather: a tied head (the same table also read by a `MatMul` over its transpose) keeps
 /// the constant, and the later stages split it or refuse it.
-fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) -> Graph<V> {
+fn host_oversized_token_gathers(g: &Graph, limit: u64) -> Result<Graph, EditError> {
     let mut dropped_eqns = std::collections::HashSet::new();
     let mut hosted: Vec<(ValueId, ValueId, ValueId)> = Vec::new(); // (gather output, const, token index)
     let mut candidates: Vec<(usize, ValueId, ValueId, ValueId)> = Vec::new(); // (eqn, out, const, index)
 
-    for (i, eqn) in g.eqns.iter().enumerate() {
+    for (i, eqn) in g.eqns().iter().enumerate() {
         let OpKind::Gather { axis } = eqn.op else {
             continue;
         };
@@ -155,7 +188,7 @@ fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) 
     let pinned: HashSet<ValueId> = g.pinned_values().collect();
     for &(i, out, data_id, index_id) in &candidates {
         let sole_readers = !pinned.contains(&data_id)
-            && g.eqns.iter().enumerate().all(|(j, e)| {
+            && g.eqns().iter().enumerate().all(|(j, e)| {
                 candidate_eqns.contains(&j)
                     || !e.inputs.iter().any(|&o| operand_value(o) == Some(data_id))
             });
@@ -166,11 +199,11 @@ fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) 
     }
 
     if hosted.is_empty() {
-        return g.clone();
+        return Ok(g.clone());
     }
 
     let eqns: Vec<Eqn> = g
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .filter(|(i, _)| !dropped_eqns.contains(i))
@@ -180,14 +213,12 @@ fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) 
     let referenced = |id: ValueId| -> bool {
         eqns.iter()
             .any(|e| e.inputs.iter().any(|&o| operand_value(o) == Some(id)))
-            || g.output == id
-            || g.state
-                .iter()
-                .any(|&(s_in, s_out)| s_in == id || s_out == id)
-            || g.validation_outputs().iter().any(|v| v.value == id)
+            || g.result() == id
+            || g.state().any(|(s_in, s_out)| s_in == id || s_out == id)
+            || g.witnesses().any(|v| v.value == id)
     };
 
-    let mut values = g.values.clone();
+    let mut values = g.values().clone();
     let mut drop_values = std::collections::HashSet::new();
     let mut new_inputs = Vec::new();
     let mut new_slots = Vec::new();
@@ -210,34 +241,33 @@ fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) 
     }
 
     let inputs: Vec<ValueId> = g
-        .inputs
+        .inputs()
         .iter()
         .copied()
         .filter(|id| !drop_values.contains(id))
         .chain(new_inputs)
         .collect();
     let consts: Vec<ValueId> = g
-        .consts
+        .consts()
         .iter()
         .copied()
         .filter(|id| !drop_values.contains(id))
         .collect();
     let slots: Vec<(ValueId, Slot)> = g
-        .slots
+        .slots()
         .iter()
         .copied()
         .filter(|(id, _)| !drop_values.contains(id))
         .chain(new_slots)
         .collect();
 
-    Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        eqns,
-        ..g.clone()
-    }
+    let mut hosted = g.edit();
+    *hosted.values_mut() = values;
+    *hosted.inputs_mut() = inputs;
+    *hosted.consts_mut() = consts;
+    *hosted.slots_mut() = slots;
+    *hosted.eqns_mut() = eqns;
+    hosted.commit()
 }
 
 /// Refuse (before any device allocation) every remaining LIVE named constant over `limit`: whatever
@@ -252,12 +282,9 @@ fn host_oversized_token_gathers<V: ValidationChannel>(g: &Graph<V>, limit: u64) 
 /// `legalize` calls this on its own output, and `compile` calls it again on the finished pipeline's
 /// graph: `revert_unplannable_rewrites` can undo a split the target cannot plan, so the graph the
 /// planner receives may hold a constant `legalize` had already brought under `limit`.
-pub(crate) fn refuse_oversized_constants<V: ValidationChannel>(
-    g: &Graph<V>,
-    limit: u64,
-) -> Result<(), LegalizeError> {
+pub(crate) fn refuse_oversized_constants(g: &Graph, limit: u64) -> Result<(), LegalizeError> {
     let live = live_value_ids(g);
-    for &id in &g.consts {
+    for &id in g.consts() {
         if !live.contains(&id) {
             continue;
         }
@@ -274,9 +301,9 @@ pub(crate) fn refuse_oversized_constants<V: ValidationChannel>(
 /// (output, validation outputs, state outputs), the state inputs they carry across steps, and
 /// everything an eqn reachable from those roots reads - the same backward walk [`super::dce`] runs,
 /// so this always agrees with what `dce` just kept.
-fn live_value_ids<V: ValidationChannel>(g: &Graph<V>) -> HashSet<ValueId> {
+fn live_value_ids(g: &Graph) -> HashSet<ValueId> {
     let mut live: HashSet<ValueId> = g.pinned_values().collect();
-    for eqn in g.eqns.iter().rev() {
+    for eqn in g.eqns().iter().rev() {
         if live.contains(&eqn.out) {
             for o in &eqn.inputs {
                 if let Some(id) = operand_value(*o) {
@@ -347,8 +374,8 @@ enum WeightRead {
 }
 
 /// Every `[1, 0]` `Transpose` of a 2D named [`Storage::Const`], keyed by the transpose's output value.
-fn transposed_consts<V: ValidationChannel>(g: &Graph<V>) -> HashMap<ValueId, ValueId> {
-    g.eqns
+fn transposed_consts(g: &Graph) -> HashMap<ValueId, ValueId> {
+    g.eqns()
         .iter()
         .filter_map(|eqn| {
             let OpKind::Transpose { perm } = &eqn.op else {
@@ -369,8 +396,8 @@ fn transposed_consts<V: ValidationChannel>(g: &Graph<V>) -> HashMap<ValueId, Val
 /// [`transposed_consts`]: the layout every driver-traced dense weight has), with at least two resulting
 /// chunks (a "split" into one chunk is not a rewrite). A matmul that reads a const directly has no
 /// split: its chunks would be column slices of the stored weight, which no binder places.
-fn splittable_matmul<V: ValidationChannel>(
-    g: &Graph<V>,
+fn splittable_matmul(
+    g: &Graph,
     eqn: &Eqn,
     transposed: &HashMap<ValueId, ValueId>,
     limit: u64,
@@ -421,18 +448,18 @@ fn splittable_matmul<V: ValidationChannel>(
 /// const `{name}.chunkN` (`N` dense from 0): the `[width, k]` row block of the `[n, k]` stored weight
 /// that the chunks before it leave off, read through its own `Transpose`. The executor binder places a
 /// chunk const as that row range of `{name}`'s own bytes (`poot-executor`'s `binder::chunks`).
-fn split_oversized_matmul_weights<V: ValidationChannel>(
-    g: &Graph<V>,
+fn split_oversized_matmul_weights(
+    g: &Graph,
     limit: u64,
     budget: GraphBudget,
-) -> Result<Graph<V>, ExpansionError> {
+) -> Result<Graph, LegalizeError> {
     let transposed = transposed_consts(g);
-    let mut values = g.values.clone();
+    let mut values = g.values().clone();
     let mut new_consts = Vec::new();
     let mut split_weights = HashSet::new();
-    let mut eqns = Vec::with_capacity(g.eqns.len());
+    let mut eqns = Vec::with_capacity(g.eqns().len());
 
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         let Some(SplitCandidate {
             x: x_id,
             weight: w_id,
@@ -531,36 +558,13 @@ fn split_oversized_matmul_weights<V: ValidationChannel>(
     }
     // A transposed weight's old `Transpose` read is dead now; `dce` removes it. A split weight some
     // other live eqn still reads stays declared (and is refused if still oversized).
-    let split = super::dce(&Graph {
-        values,
-        eqns,
-        ..g.clone()
-    });
+    let split = staged_split(g, values, eqns, &new_consts)?;
     let live = live_value_ids(&split);
     let drop_consts: HashSet<ValueId> = split_weights
         .into_iter()
         .filter(|id| !live.contains(id))
         .collect();
-    // `consts` is declared as a subset of `inputs` (both drop the old weight, both gain the chunks).
-    let inputs: Vec<ValueId> = g
-        .inputs
-        .iter()
-        .copied()
-        .filter(|id| !drop_consts.contains(id))
-        .chain(new_consts.iter().copied())
-        .collect();
-    let consts: Vec<ValueId> = g
-        .consts
-        .iter()
-        .copied()
-        .filter(|id| !drop_consts.contains(id))
-        .chain(new_consts)
-        .collect();
-    Ok(Graph {
-        inputs,
-        consts,
-        ..split
-    })
+    Ok(without_consts(&split, &drop_consts)?)
 }
 
 /// The expert ranges an indexed packed contraction of `experts` experts splits into so that each range's sources
@@ -688,17 +692,17 @@ impl Appender<'_> {
 /// outputs the NaN row of the unsplit contraction. The sum of the pieces is then the owning piece's row plus
 /// zeros. The split costs one full contraction per piece, and a non-finite activation row turns into NaN rather than
 /// whatever the unsplit contraction makes of it.
-fn split_oversized_expert_stacks<V: ValidationChannel>(
-    g: &Graph<V>,
+fn split_oversized_expert_stacks(
+    g: &Graph,
     limit: u64,
     budget: GraphBudget,
-) -> Result<Graph<V>, ExpansionError> {
-    let mut values = g.values.clone();
+) -> Result<Graph, LegalizeError> {
+    let mut values = g.values().clone();
     let mut new_consts = Vec::new();
     let mut split_carriers = HashSet::new();
-    let mut eqns = Vec::with_capacity(g.eqns.len());
+    let mut eqns = Vec::with_capacity(g.eqns().len());
 
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         let Some(StackSplit {
             descriptor,
             experts,
@@ -829,44 +833,18 @@ fn split_oversized_expert_stacks<V: ValidationChannel>(
     if split_carriers.is_empty() {
         return Ok(g.clone());
     }
-    let split = super::dce(&Graph {
-        values,
-        eqns,
-        ..g.clone()
-    });
+    let split = staged_split(g, values, eqns, &new_consts)?;
     let live = live_value_ids(&split);
     let drop_consts: HashSet<ValueId> = split_carriers
         .into_iter()
         .filter(|id| !live.contains(id))
         .collect();
-    let inputs: Vec<ValueId> = g
-        .inputs
-        .iter()
-        .copied()
-        .filter(|id| !drop_consts.contains(id))
-        .chain(new_consts.iter().copied())
-        .collect();
-    let consts: Vec<ValueId> = g
-        .consts
-        .iter()
-        .copied()
-        .filter(|id| !drop_consts.contains(id))
-        .chain(new_consts)
-        .collect();
-    Ok(Graph {
-        inputs,
-        consts,
-        ..split
-    })
+    Ok(without_consts(&split, &drop_consts)?)
 }
 
 /// The split of `eqn` when it is an indexed packed contraction over named constant carriers and I32 ids whose
 /// stacked table [`expert_ranges`] splits.
-fn splittable_stack<V: ValidationChannel>(
-    g: &Graph<V>,
-    eqn: &Eqn,
-    limit: u64,
-) -> Option<StackSplit> {
+fn splittable_stack(g: &Graph, eqn: &Eqn, limit: u64) -> Option<StackSplit> {
     let OpKind::PackedContraction {
         descriptor,
         rows: ContractionRows::Indexed { experts },
@@ -919,7 +897,7 @@ mod tests {
             TensorType::f32(vec![vocab, hidden]),
         );
         let out = b.gather_scalar(embed, 0, token);
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// SC-002 (host): an embed table over the limit is rewritten to a host-computed `Slot::TokenEmbed`
@@ -938,18 +916,21 @@ mod tests {
 
         assert!(
             !legalized
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Gather { .. })),
             "the gather is replaced, not merely left decomposed"
         );
-        assert!(legalized.consts.is_empty(), "the oversized const drops out");
+        assert!(
+            legalized.consts().is_empty(),
+            "the oversized const drops out"
+        );
         assert_eq!(
-            legalized.inputs.len(),
+            legalized.inputs().len(),
             1,
             "one host-computed input replaces token+const"
         );
-        let id = legalized.inputs[0];
+        let id = legalized.inputs()[0];
         let meta = legalized.meta(id);
         assert_eq!(meta.storage, Storage::Slot(Slot::TokenEmbed));
         assert_eq!(meta.name.as_deref(), Some("model.embed_tokens.weight"));
@@ -967,7 +948,7 @@ mod tests {
         let row = b.gather_scalar(embed, 0, token);
         let x = b.reshape(row, vec![1, 3584]);
         let out = b.matmul(x, b.transpose(embed, vec![1, 0]));
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let err = legalize(
             &g,
@@ -983,7 +964,7 @@ mod tests {
 
     fn hidden_of(g: &Graph) -> usize {
         // The gather's output shape before legalizing (scalar index drops the vocab axis): [hidden].
-        g.aval(g.output).shape[0]
+        g.aval(g.result()).shape[0]
     }
 
     /// A small model's embed table fits one device buffer: legalize leaves the dense gather alone.
@@ -993,15 +974,15 @@ mod tests {
         let caps = caps_with_limit(2_147_483_647);
         let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
             .expect("under the limit, no rewrite needed");
-        assert_eq!(legalized.eqns.len(), g.eqns.len());
+        assert_eq!(legalized.eqns().len(), g.eqns().len());
         assert!(
             legalized
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Gather { .. })),
             "the dense gather stays: this device can hold the table"
         );
-        assert_eq!(legalized.consts, g.consts);
+        assert_eq!(legalized.consts(), g.consts());
     }
 
     /// SC-001: the SAME model (qwen2.5-7b's embed shape) on a device whose limit is not wgpu's -
@@ -1017,7 +998,7 @@ mod tests {
             .expect("ROCm's real limit holds this table");
         assert!(
             legalized
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Gather { .. })),
             "ROCm's real buffer limit holds the whole table; no host rewrite is needed"
@@ -1039,7 +1020,7 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![1, 4096]));
         let w = b.constant("big.weight", TensorType::f32(vec![200_000, 4096])); // ~3.05 GB
         let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
         let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
@@ -1047,13 +1028,13 @@ mod tests {
 
         assert!(
             legalized
-                .consts
+                .consts()
                 .iter()
                 .all(|&id| legalized.meta(id).name.as_deref() != Some("big.weight")),
             "the unsplit weight is gone"
         );
         let chunk_names: Vec<&str> = legalized
-            .consts
+            .consts()
             .iter()
             .filter_map(|&id| legalized.meta(id).name.as_deref())
             .filter(|n| n.starts_with("big.weight.chunk"))
@@ -1065,16 +1046,17 @@ mod tests {
         );
         assert!(
             legalized
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Concat { .. })),
             "the chunks join by concat"
         );
         assert_eq!(
-            legalized.output, g.output,
+            legalized.result(),
+            g.result(),
             "the concat computes at the original matmul's output id"
         );
-        for &id in &legalized.consts {
+        for &id in legalized.consts() {
             assert!(
                 const_bytes(&legalized, id) <= 2_147_483_647,
                 "every remaining constant, including each chunk, fits the limit"
@@ -1095,9 +1077,9 @@ mod tests {
             TensorType::new(vec![200_000, 4096], DType::BF16),
         );
         let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-        let g = crate::fold_dense_contractions(&b.finish(out));
+        let g = crate::fold_dense_contractions(&b.finish(out).unwrap()).unwrap();
         assert!(
-            g.eqns
+            g.eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::DenseContraction { .. })),
             "the fixture folds"
@@ -1107,7 +1089,7 @@ mod tests {
         let legalized = legalize(&g, &caps_with_limit(limit), &CompileLimits::STANDARD)
             .expect("an oversized dense weight always splits");
         let chunks = legalized
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| {
                 matches!(
@@ -1121,13 +1103,13 @@ mod tests {
         assert_eq!(chunks, 2, "1.6 GB over a 1 GB limit needs 2 chunks");
         assert!(
             !legalized
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Transpose { .. } | OpKind::MatMul)),
             "the chunks read the stored rows directly"
         );
-        assert_eq!(legalized.output, g.output);
-        for &id in &legalized.consts {
+        assert_eq!(legalized.result(), g.result());
+        for &id in legalized.consts() {
             assert!(const_bytes(&legalized, id) <= limit, "every chunk fits");
         }
     }
@@ -1151,7 +1133,7 @@ mod tests {
             } else {
                 out
             };
-            b.finish(out)
+            b.finish(out).unwrap()
         };
         // 64-byte limit: a row is 16 bytes, 4 rows per chunk -> (0,4) (4,8) (8,10).
         let caps = caps_with_limit(64);
@@ -1160,7 +1142,7 @@ mod tests {
         let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
             .expect("a transposed oversized weight splits");
         let chunks: Vec<(&str, Vec<usize>)> = legalized
-            .consts
+            .consts()
             .iter()
             .filter_map(|&id| {
                 let m = legalized.meta(id);
@@ -1176,8 +1158,8 @@ mod tests {
                 ("head.weight.chunk2", vec![2, 4]),
             ]
         );
-        assert_eq!(legalized.output, g.output);
-        let count = |f: fn(&OpKind) -> bool| legalized.eqns.iter().filter(|e| f(&e.op)).count();
+        assert_eq!(legalized.result(), g.result());
+        let count = |f: fn(&OpKind) -> bool| legalized.eqns().iter().filter(|e| f(&e.op)).count();
         assert_eq!(count(|op| matches!(op, OpKind::Transpose { .. })), 3);
         assert_eq!(count(|op| matches!(op, OpKind::Concat { .. })), 1);
 
@@ -1197,7 +1179,7 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![1, 4]));
         let w = b.constant("direct.weight", TensorType::f32(vec![4, 10]));
         let out = b.matmul(x, w);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let error = legalize(&g, &caps_with_limit(64), &CompileLimits::STANDARD)
             .expect_err("a direct oversized weight has no split");
         assert!(matches!(
@@ -1218,7 +1200,7 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![1, 4]));
         let w = b.constant(&name, TensorType::f32(vec![10, 4]));
         let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let error = legalize(&g, &caps_with_limit(64), &CompileLimits::STANDARD)
             .expect_err("a packed source never splits");
         assert!(matches!(
@@ -1235,13 +1217,13 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![1, 64]));
         let w = b.constant("small.weight", TensorType::f32(vec![64, 128])); // 32 KB
         let out = b.matmul(x, w);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
         let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
             .expect("under the limit, no rewrite needed");
-        assert_eq!(legalized.consts, g.consts);
-        assert_eq!(legalized.eqns.len(), g.eqns.len());
+        assert_eq!(legalized.consts(), g.consts());
+        assert_eq!(legalized.eqns().len(), g.eqns().len());
     }
 
     /// SC-002 (refuse): a matmul weight whose single row already exceeds the limit has no rewrite
@@ -1262,7 +1244,7 @@ mod tests {
         let x = b.broadcast(x0, vec![1, 600_000_000]);
         let w = b.constant("big.weight", TensorType::f32(vec![2, 600_000_000]));
         let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
         let error = legalize(&g, &caps, &CompileLimits::STANDARD).expect_err(
@@ -1291,21 +1273,23 @@ mod tests {
         let x = b.constant("x", TensorType::f32(vec![1, 4]));
         let live = b.constant("live.weight", TensorType::f32(vec![4, 8]));
         let out = b.matmul(x, live);
-        let mut g = b.finish(out);
+        let traced = b.finish(out).unwrap();
 
         // A dead oversized const: declared in `values`/`inputs`/`consts`, referenced by no eqn, no
         // output, no state - exactly what `dce` leaves behind (it never touches these tables).
-        let dead = g.values.push(ValueMeta::new(
+        let mut edit = traced.edit();
+        let dead = edit.values_mut().push(ValueMeta::new(
             TensorType::f32(vec![4096, 200_000]), // ~3.05 GB, unreachable
             Storage::Const,
             Some("dead.weight".to_string()),
         ));
-        g.inputs.push(dead);
-        g.consts.push(dead);
+        edit.inputs_mut().push(dead);
+        edit.consts_mut().push(dead);
+        let g = edit.commit().unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
         let legalized = legalize(&g, &caps, &CompileLimits::STANDARD)
             .expect("a dead oversized const must not be refused");
-        assert_eq!(legalized.output, g.output);
+        assert_eq!(legalized.result(), g.result());
     }
 }

@@ -20,8 +20,8 @@ poot-ptx-gpu.workspace = true
 poot-vulkan-device.workspace = true
 poot-rocm-gpu = { workspace = true, optional = true }
 tokenizers.workspace = true
-# Guided decoding: byte-level DFA for regex-constrained generation (same 0.4 line as tokenizers/regex).
-regex-automata = "0.4"
+# Guided decoding: byte-level DFA for regex-constrained generation.
+regex-automata.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
 serde.workspace = true

@@ -13,6 +13,7 @@
 mod blocks;
 mod content;
 pub mod decode;
+mod encode;
 pub mod format;
 pub mod plan;
 mod planar;
@@ -29,6 +30,7 @@ use content::ContentCheck;
 use decode::DecodeError;
 use format::{Axis, GroupMap, Storage, WeightFormat};
 
+pub use encode::{EncodeError, encode};
 pub use format::OperandRole;
 pub use stored::{Access, FileIdentity, MapError, SliceError, SourceChanged, StoredBytes};
 

@@ -121,11 +121,8 @@ fn run_via_contract(
         .unwrap_or_else(|e| panic!("{e}"))
 }
 
-fn staged_replay(
-    g: &poot_graph_ir::Graph,
-    target: Target,
-) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let gc = g.clone().with_validations(Vec::new());
+fn staged_replay(g: &poot_graph_ir::Graph, target: Target) -> poot_graph_plan::StagedProgram {
+    let gc = g.clone();
     poot_graph_plan::compile_staged(
         &gc,
         &poot_graph_plan::TargetSet::single(poot_graph_plan::DeviceId(0), target),
@@ -203,7 +200,7 @@ fn step_resident(
         .unwrap()
         .read()
         .unwrap();
-    let out = g.aval(g.output);
+    let out = g.aval(g.result());
     HostTensor::f32(
         out.shape.clone(),
         bytes
@@ -247,7 +244,7 @@ fn build_rope_decomposition(
         rotated
     };
     let (xi, ci, si) = (x.id(), cos.id(), sin.id());
-    (b.finish(out), xi, ci, si)
+    (b.finish(out).unwrap(), xi, ci, si)
 }
 
 // --- card 158: batched-prefill-only ops, GPU vs CPU, at the real chunk size C=64 ---
@@ -399,7 +396,7 @@ fn check_gdn_prefill_chunked_gpu(
             ts.id(),
         ];
         let (o, s_out) = gdn_prefill_chunked(&b, q, k, v, gate, beta, s_in, ti, ts, c);
-        let graph = b.finish(if pick == 0 { o } else { s_out });
+        let graph = b.finish(if pick == 0 { o } else { s_out }).unwrap();
 
         let mut inputs = HashMap::new();
         inputs.insert(ids[0], HostTensor::f32(vec![1, h_k, l, d], qd.clone()));
@@ -455,7 +452,7 @@ fn compiled_choice(
     let program = compile_full(g, target);
     let eqn = program
         .graph()
-        .eqns
+        .eqns()
         .iter()
         .find(|e| op(&e.op))
         .expect("the compiled graph holds the equation");
@@ -480,7 +477,7 @@ fn compile_full(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::P
 /// the adapter the test happens to open.
 fn spirv_fixture_target() -> Target {
     let backend = poot_target::Backend::SpirvVulkan;
-    Target {
+    Target::Gpu {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     }
@@ -498,9 +495,11 @@ fn plan_eqn_with_choice(
     poot_graph_plan::plan_eqn_choice(
         g,
         eqn,
-        backend,
+        &Target::Gpu {
+            backend,
+            caps: *caps,
+        },
         &std::collections::HashMap::new(),
-        caps,
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
     .map(|planned| (planned.plan, planned.choice))

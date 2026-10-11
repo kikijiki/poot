@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use poot_executor_parity::dense::{Dense, Family, paged_step, plain, step};
+use poot_executor_parity::dense::{Dense, Family, paged_step, step};
 use poot_graph_ir::{Graph, Storage};
 use poot_models::model::{LogitRows, Phase};
 
@@ -42,13 +42,11 @@ fn dense_trace(family: Family, phase: Phase, shape: poot_models::model::StepShap
     if family != Family::Olmo2 {
         dense = dense.head_dim(6);
     }
-    plain(
-        dense
-            .f32_model()
-            .model
-            .trace(phase, shape)
-            .unwrap_or_else(|e| panic!("{family:?}: {e}")),
-    )
+    dense
+        .f32_model()
+        .model
+        .trace(phase, shape)
+        .unwrap_or_else(|e| panic!("{family:?}: {e}"))
 }
 
 /// `family`'s registry fixture, traced through `Model::trace` at `shape`.
@@ -62,28 +60,18 @@ fn registered_trace(family: &str, phase: Phase, shape: poot_models::model::StepS
     let fixture = (entry.fixture)();
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     // A routed family declares router witnesses; the corpus counts consts, which they do not touch.
-    let poot_graph_ir::Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        eqns,
-        output,
-        state,
-        exports: _,
-        validations: _,
-    } = model.trace(phase, shape).expect("the fixture traces");
-    Graph {
-        values,
-        inputs,
-        consts,
-        slots,
-        eqns,
-        output,
-        validations: poot_graph_ir::NoValidations,
-        exports: Vec::new(),
-        state,
+    let traced = model.trace(phase, shape).expect("the fixture traces");
+    let mut plain = poot_graph_ir::GraphEdit::new();
+    *plain.values_mut() = traced.values().clone();
+    *plain.inputs_mut() = traced.inputs().to_vec();
+    *plain.consts_mut() = traced.consts().to_vec();
+    *plain.slots_mut() = traced.slots().to_vec();
+    *plain.eqns_mut() = traced.eqns().to_vec();
+    plain.set_result(traced.result());
+    for (input, next) in traced.state() {
+        plain.push_state(input, next);
     }
+    plain.commit().expect("the traced tables stay well formed")
 }
 
 /// The named corpus: every production family tracer whose graph this crate can reach, at two call
@@ -348,7 +336,7 @@ fn corpus() -> Vec<Row> {
 
 /// Every `Storage::Const` input of `g`, keyed by name with its declared shape.
 fn const_avals(g: &Graph) -> BTreeMap<String, Vec<usize>> {
-    g.inputs
+    g.inputs()
         .iter()
         .filter_map(|&id| {
             let m = g.meta(id);
@@ -459,7 +447,7 @@ fn card_550_dense_corpus_counts_zero_mask_step_inputs_and_consts() {
     let mut offenders = Vec::new();
     for row in &dense {
         let g = (row.build)(PROMPT_A, CAP_A);
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let m = g.meta(id);
             let is_mask_const = m.storage == Storage::Const
                 && m.name

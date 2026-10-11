@@ -10,30 +10,18 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_graph_ir::op::{ContractionHead, OpKind, UnOp as GUnOp};
-use poot_graph_ir::{
-    Eqn, Graph, Operand, TensorType, ValidationChannel, ValueId, ValueMeta, ValueTable,
-};
+use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValueId, ValueMeta, ValueTable};
 use poot_kernelgen as kg;
-use poot_target::{Backend, DeviceCaps, TensorCoreSupport};
+use poot_target::{Backend, DeviceCaps, TargetId, TensorCoreSupport};
 
 use crate::imported::*;
 use crate::{ContractionSpec, KernelRequest, Layout, PlanError, Planned, Site};
 
-/// The codegen capability query for the equation's backend (card 522, R468-014). `Backend`'s `AmdGcn`
-/// payload already carries the same `AmdArch` `poot_codegen::Target::AmdGcn` takes, so the conversion is
-/// a bare re-tag, not a new dependency.
-fn codegen_capability(backend: Backend) -> poot_codegen::Capability {
-    poot_codegen::capability(codegen_target(backend))
-}
-
-/// The codegen target a planner backend compiles for.
-pub(crate) fn codegen_target(backend: Backend) -> poot_codegen::Target {
-    match backend {
-        Backend::SpirvVulkan => poot_codegen::Target::SpirvVulkan,
-        Backend::Nvptx => poot_codegen::Target::Nvptx,
-        Backend::AmdGcn(arch) => poot_codegen::Target::AmdGcn(arch),
-        Backend::Aie(_) => poot_codegen::Target::AieCore,
-    }
+/// The codegen capability query for the target (card 522, R468-014). `Backend`'s `AmdGcn` payload already
+/// carries the same `AmdArch` `poot_codegen::Target::AmdGcn` takes, so the conversion is a bare re-tag, not
+/// a new dependency.
+fn codegen_capability(target: TargetId) -> poot_codegen::Capability {
+    poot_codegen::capability(poot_codegen::Target::from(target))
 }
 
 /// The value-operand ids of an eqn, in order (literals dropped) - these are the kernel's data params.
@@ -69,11 +57,11 @@ impl<'g> GraphTables<'g> {
     }
 }
 
-impl<'g, V: ValidationChannel> From<&'g Graph<V>> for GraphTables<'g> {
-    fn from(graph: &'g Graph<V>) -> Self {
+impl<'g> From<&'g Graph> for GraphTables<'g> {
+    fn from(graph: &'g Graph) -> Self {
         Self {
-            values: &graph.values,
-            eqns: &graph.eqns,
+            values: graph.values(),
+            eqns: graph.eqns(),
         }
     }
 }
@@ -170,12 +158,9 @@ fn is_movement_view_candidate(op: &OpKind) -> bool {
 ///
 /// Every pinned value ([`Graph::pinned_values`]: the output, each validation value, and both sides of each
 /// state pair) keeps its own materialized buffer, so a validation packet can copy it row-major from offset 0.
-pub fn compute_views<V: ValidationChannel>(
-    g: &Graph<V>,
-    backend: Backend,
-) -> HashMap<ValueId, Layout> {
+pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId, Layout> {
     let mut views: HashMap<ValueId, Layout> = HashMap::new();
-    if !codegen_capability(backend).strided_views {
+    if !codegen_capability(target.into()).strided_views {
         return views;
     }
     let cons = consumers(g.into());
@@ -183,7 +168,7 @@ pub fn compute_views<V: ValidationChannel>(
 
     // Pass A (reverse topological order): decide the promoted set (no strides yet).
     let mut promoted: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
-    for eqn in g.eqns.iter().rev() {
+    for eqn in g.eqns().iter().rev() {
         let out = eqn.out;
         if pinned.contains(&out) || !is_movement_view_candidate(&eqn.op) {
             continue;
@@ -200,14 +185,14 @@ pub fn compute_views<V: ValidationChannel>(
             DType::F32 => true,
             DType::I32 => cons.get(&out).is_some_and(|users| {
                 users.iter().all(|&i| {
-                    matches!(g.eqns[i].op, OpKind::Fused(_))
-                        && g.aval(g.eqns[i].out).dtype == DType::F32
+                    matches!(g.eqns()[i].op, OpKind::Fused(_))
+                        && g.aval(g.eqns()[i].out).dtype == DType::F32
                 })
             }),
             DType::BF16 => cons.get(&out).is_some_and(|users| {
                 users
                     .iter()
-                    .all(|&i| reads_as_indexed_weight(&g.eqns[i], out))
+                    .all(|&i| reads_as_indexed_weight(&g.eqns()[i], out))
             }),
             _ => false,
         };
@@ -216,7 +201,7 @@ pub fn compute_views<V: ValidationChannel>(
         }
         let all_strided_capable = cons.get(&out).is_some_and(|users| {
             users.iter().all(|&i| {
-                let c = &g.eqns[i];
+                let c = &g.eqns()[i];
                 is_strided_capable(c, out)
                     || (is_movement_view_candidate(&c.op) && promoted.contains(&c.out))
             })
@@ -227,7 +212,7 @@ pub fn compute_views<V: ValidationChannel>(
     }
 
     // Pass B (forward topological order): compose each promoted value's Layout from its input's Layout.
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         let out = eqn.out;
         if !promoted.contains(&out) {
             continue;
@@ -559,6 +544,63 @@ pub(crate) fn attention_lanes(dv: usize, caps: &DeviceCaps) -> Option<usize> {
         .find(|&lanes| lanes <= lanes_limit && 4 * (lanes * dv + 2 * lanes) <= lds_bytes)
 }
 
+/// The most key chunks one decode row is split into: past this the combine stage's per-row reduction costs
+/// more than the extra workgroups hide.
+const MAX_ATTENTION_SPLITS: usize = 16;
+/// The fewest keys a split walks. A shorter chunk leaves a workgroup's lanes mostly idle and the launch
+/// is the combine's overhead alone.
+const MIN_KEYS_PER_SPLIT: usize = 128;
+/// Workgroups per compute unit the split count aims at: two resident workgroups keep a CU busy while one
+/// waits on its K/V loads.
+const WORKGROUPS_PER_COMPUTE_UNIT: usize = 2;
+
+/// The split-KV factor of a decode attention (`Lq == 1`), or `None` for the streaming schedule.
+///
+/// The streaming schedule runs `batch * heads` workgroups; at a few heads that leaves most of a many-CU
+/// device idle while each workgroup walks the whole cache (the Strix Halo shape: 2 workgroups on 40 CUs).
+/// Splitting the keys across `splits` workgroups and reducing the partial `(m, l, o)` states in a second
+/// launch is Flash-Decoding (Dao et al., <https://pytorch.org/blog/flash-decoding/>, retrieved 2026-10-11);
+/// vLLM's Triton decode attention chooses its split count the same way, from the occupancy the
+/// batch-and-head grid leaves
+/// (<https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_decode_attention.py>,
+/// retrieved 2026-10-11). The count follows `caps.compute_units` and the cache length, never the live
+/// length (which is a run-time value: a split a short length leaves empty publishes a neutral partial).
+///
+/// Streaming is kept when any of these holds, so a request never needs a capability the device lacks:
+/// the rows already fill the device, the cache is too short for two chunks of [`MIN_KEYS_PER_SPLIT`], the
+/// partial-state scratch exceeds `caps.max_buffer_bytes`, or the launch's 2-D fold would pass `max_grid`.
+/// `spec` is the streaming-schedule request being considered.
+pub(crate) fn attention_splits(
+    spec: &poot_kernelgen::AttentionSpec,
+    caps: &DeviceCaps,
+) -> Option<usize> {
+    if spec.lq != 1 {
+        return None;
+    }
+    let rows = spec.rows();
+    let compute_units = caps.compute_units as usize;
+    let wanted = (compute_units * WORKGROUPS_PER_COMPUTE_UNIT).div_ceil(rows);
+    let splits = wanted
+        .min(MAX_ATTENTION_SPLITS)
+        .min(spec.lk / MIN_KEYS_PER_SPLIT);
+    if splits < 2 || rows >= compute_units {
+        return None;
+    }
+    let split = poot_kernelgen::AttentionSpec {
+        schedule: poot_kernelgen::AttentionSchedule::SplitKv {
+            lanes: spec.schedule.lanes(),
+            splits,
+        },
+        ..spec.clone()
+    };
+    let scratch_bytes = split.partial_elems()? as u64 * 4;
+    if scratch_bytes > caps.max_buffer_bytes {
+        return None;
+    }
+    let (_, y) = poot_kernelgen::fold_groups(split.workgroups(), caps.max_grid[0]);
+    (y <= caps.max_grid[1] as usize).then_some(splits)
+}
+
 /// Is this `MatMul` a candidate for the generated tiled GEMM (`kg::tiled_region`, card 099b), the
 /// contraction choice `planner::matmul` makes first (Card 557; it was the `tile_matmuls` retag)? Backend
 /// agnostic: output `[..,M,N]` with M>1 (M==1 is the decode GEMV), F32 operands, and a rank-2 `[K,N]`
@@ -608,7 +650,7 @@ pub(crate) fn is_tiled_gemm_in(
     // matmul takes the tc-arm on NVPTX and matmul_batched_dt on AmdGcn.
     if g.aval(eqn.out).dtype != DType::F32
         || !matches!(eqn.op, OpKind::MatMul)
-        || !codegen_capability(backend).imported_lds_array_bodies
+        || !codegen_capability(backend.into()).imported_lds_array_bodies
     {
         return false;
     }
@@ -694,7 +736,7 @@ pub(crate) fn is_batched_tiled_gemm_in(
     // imported LDS-array bodies do not compile (R468-015); that target falls back to serial
     // matmul_batched_dt.
     if g.aval(eqn.out).dtype != DType::F32
-        || !codegen_capability(backend).imported_lds_array_bodies
+        || !codegen_capability(backend.into()).imported_lds_array_bodies
         || !matches!(eqn.op, OpKind::MatMul)
     {
         return false;
@@ -953,7 +995,7 @@ fn matmul_takes_tensorcore(
                 && out_shape[..r - 2].iter().product::<usize>() == 1
         }
         // No tensor-core kernel: the portable body, and an AIE core has no fragment hardware.
-        Backend::SpirvVulkan | Backend::Aie(_) => false,
+        Backend::SpirvVulkan => false,
     }
 }
 

@@ -88,7 +88,7 @@ def case_identity(bank, case, hardware=None):
         "layout": case["layout"],
         "dimensions": case["shape"],
         "prompt_tokens": rows,
-        "live_context": case["shape"].get("cap", "n/a"),
+        "live_context": case["shape"].get("live", case["shape"].get("cap", "n/a")),
         "max_context": case["shape"].get("cap", "n/a"),
         "requested_output": "n/a",
         "actual_output": "n/a",

@@ -34,7 +34,7 @@ fn igpu_matmul_latency_vs_npu() {
         let a = b.constant("a", TensorType::f32(vec![m, k]));
         let w = b.constant("w", TensorType::f32(vec![k, n]));
         let out = b.matmul(a, w);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         // Small deterministic inputs (values don't affect dispatch timing).
         let fill = |sz: usize, seed: u64| -> Vec<f32> {
             (0..sz)
@@ -49,7 +49,7 @@ fn igpu_matmul_latency_vs_npu() {
                 .collect()
         };
         let mut inp: HashMap<poot_graph_ir::ValueId, HostTensor> = HashMap::new();
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let meta = g.meta(id);
             let sz: usize = meta.aval.shape.iter().product();
             inp.insert(
@@ -189,7 +189,7 @@ fn masked_attention_gpu_matches_cpu() {
     let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
     let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let fill =
         |n: usize, seed: f32| -> Vec<f32> { (0..n).map(|i| (i as f32) * 0.1 + seed).collect() };
@@ -243,7 +243,7 @@ fn swiglu_gpu_matches_cpu() {
     let up = b.constant("up", TensorType::f32(vec![1, 1, n]));
     let out = poot_graph_ir::ops::swiglu(&b, gate, up);
     let (gi, ui) = (gate.id(), up.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
     let gd: Vec<f32> = (0..n).map(|i| (i as f32) * 0.3 - 1.5).collect();
     let ud: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 + 0.2).collect();
@@ -358,7 +358,7 @@ fn fused_gpu_matches_cpu_over_random_graphs() {
                 }
             }
         }
-        let g = b.finish(acc);
+        let g = b.finish(acc).unwrap();
         let mut inputs = HashMap::new();
         for (i, t) in full.iter().enumerate() {
             inputs.insert(
@@ -370,8 +370,8 @@ fn fused_gpu_matches_cpu_over_random_graphs() {
             bcast.id(),
             HostTensor::f32(bshape.clone(), fill(seed * 7 + 101, bnumel)),
         );
-        let fg = fuse(&cse(&g));
-        if fg.eqns.len() < g.eqns.len() {
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        if fg.eqns().len() < g.eqns().len() {
             fused_total += 1;
         }
         let eval_inputs: HashMap<_, Value> = inputs
@@ -396,8 +396,8 @@ fn fused_gpu_matches_cpu_over_random_graphs() {
             assert!(
                 (a - c).abs() <= tol,
                 "seed {seed} elem {i}: fused-gpu {a} vs cpu {c} ({} -> {} eqns)",
-                g.eqns.len(),
-                fg.eqns.len()
+                g.eqns().len(),
+                fg.eqns().len()
             );
         }
     }
@@ -541,7 +541,7 @@ fn movement_gpu_matches_cpu_over_random_graphs() {
             had_movement += 1;
         }
         let (out, out_shape) = pool.last().unwrap().clone();
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         let eval_inputs: HashMap<_, Value> = inputs
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -551,7 +551,7 @@ fn movement_gpu_matches_cpu_over_random_graphs() {
             .output
             .into_host()
             .unwrap();
-        let got = run_via_contract(&mut gpu, target, &fuse(&cse(&g)), &inputs);
+        let got = run_via_contract(&mut gpu, target, &fuse(&cse(&g).unwrap()).unwrap(), &inputs);
         assert_eq!(
             got.shape(),
             cpu.shape(),

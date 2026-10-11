@@ -17,7 +17,7 @@ use poot_graph_plan::fuse;
 use poot_tensor::HostTensor;
 
 fn bind_inputs(g: &Graph) -> HashMap<ValueId, HostTensor> {
-    g.inputs
+    g.inputs()
         .iter()
         .map(|&id| {
             let shape = g.aval(id).shape.clone();
@@ -63,11 +63,15 @@ fn recip_tanh_erf_fused_region_matches_the_oracle() {
     let g = b.unary(UnOp::Tanh, x);
     let e = b.unary(UnOp::Erf, g);
     let r = b.unary(UnOp::Recip, e);
-    let graph = b.finish(r);
+    let graph = b.finish(r).unwrap();
 
-    let fused = fuse(&graph);
-    assert_eq!(fused.eqns.len(), 1, "expected one fused region: {fused:?}");
-    assert!(matches!(fused.eqns[0].op, OpKind::Fused(_)));
+    let fused = fuse(&graph).unwrap();
+    assert_eq!(
+        fused.eqns().len(),
+        1,
+        "expected one fused region: {fused:?}"
+    );
+    assert!(matches!(fused.eqns()[0].op, OpKind::Fused(_)));
 
     let inputs: HashMap<ValueId, Value> = bind_inputs(&graph)
         .into_iter()

@@ -79,9 +79,8 @@ fn assert_paged_matches_contiguous(
         )
         .unwrap();
     // The paged state is smaller than the per-row caches only when the pool is sized for live usage.
-    let numel = |g: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>| -> usize {
-        g.state.iter().map(|&(si, _)| g.aval(si).numel()).sum()
-    };
+    let numel =
+        |g: &poot_graph_ir::Graph| -> usize { g.state().map(|(si, _)| g.aval(si).numel()).sum() };
     if pool_slots < BATCH * CAP {
         assert!(
             numel(&paged) < numel(&cont),
@@ -163,14 +162,13 @@ fn batched_decode_rows_equal_batch1_decodes() {
         .model
         .trace(Phase::Decode, step_shape(1, 1, CAP, LogitRows::Last))
         .unwrap();
-    assert_eq!(gb.state.len(), g1.state.len());
+    assert_eq!(gb.state().count(), g1.state().count());
 
     // random per-row KV caches [B, hkv, cap, d], one per state input, in state order.
     let caches: Vec<HostTensor> = gb
-        .state
-        .iter()
+        .state()
         .enumerate()
-        .map(|(i, &(si, _))| {
+        .map(|(i, (si, _))| {
             let shape = gb.aval(si).shape.clone();
             assert_eq!(shape, vec![BATCH, hkv, CAP, d]);
             HostTensor::f32(shape, fill(&format!("cache{i}"), BATCH * hkv * CAP * d))

@@ -11,6 +11,7 @@ use poot_tensor::{DType, HostTensor};
 use poot_test_util::StepFixture;
 
 use super::{gpu_lock, open_engine_or_skip};
+use poot_test_util::graph_fixtures::gpu_caps;
 
 /// A seeded xorshift stream.
 fn stream(seed: u64) -> impl FnMut() -> u64 {
@@ -70,7 +71,7 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]));
     let w = b.constant("w", TensorType::new(vec![n, k], dtype));
     let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let (bytes, held) = weight(dtype, n * k, (k * 131 + n) as u64);
     let mut builder = WeightStore::builder();
@@ -160,7 +161,7 @@ fn the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_wgpu() {
     };
     let mut exec: Box<dyn poot_executor::Executor> = Box::new(engine);
     let target = device_target;
-    for (n, cols) in launch_shapes(target.caps.compute_units) {
+    for (n, cols) in launch_shapes(gpu_caps(&target).compute_units) {
         for dtype in [DType::F32, DType::F16, DType::BF16] {
             for k in [1037, 515] {
                 let case = gemv_case(dtype, k, n);
@@ -168,7 +169,7 @@ fn the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_wgpu() {
                 assert!(
                     matches!(schedule, Schedule::Gemv { cols: c, .. } if c == cols),
                     "N = {n} on {} compute units: {schedule:?}",
-                    target.caps.compute_units
+                    gpu_caps(&target).compute_units
                 );
                 let what = format!("{dtype:?} k={k} n={n} {schedule:?}");
                 let outputs = run_outputs(exec.as_mut(), target, &case.fixture)
@@ -190,7 +191,7 @@ fn attention_gemv_case(hq: usize, cap: usize, d: usize) -> (Fixture, Vec<f32>, V
     );
     let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
     let out = b.matmul(scores, v);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let key = graph.meta(scores.id()).slot_key().unwrap().clone();
     let (bytes, values) = weight(DType::F32, hq * cap * d, 0x5C0);
     let mut builder = WeightStore::builder();
@@ -234,7 +235,7 @@ fn a_contraction_keeps_its_lds_width_through_the_planner_on_wgpu() {
     // Enough output elements that `out_numel / 128` passes the device's X grid cap: the generic bump's
     // trigger. A tiny cache length keeps the run short.
     let (cap, d) = (4usize, 4096usize);
-    let hq = 128 * target.caps.max_grid[0] as usize / d + 1;
+    let hq = 128 * gpu_caps(&target).max_grid[0] as usize / d + 1;
     let (fixture, scores, values) = attention_gemv_case(hq, cap, d);
     let program = compile(&fixture.graph, &target, &OPTIONS).expect("the fixture compiles");
     let (eqn, plan) = program

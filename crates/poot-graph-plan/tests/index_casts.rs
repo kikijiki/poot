@@ -33,14 +33,14 @@ fn f32_value(shape: Vec<usize>, values: Vec<f32>) -> Value {
 }
 
 fn casts(g: &Graph) -> usize {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Cast { .. }))
         .count()
 }
 
 fn regions(g: &Graph) -> Vec<&Eqn> {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Fused(_)))
         .collect()
@@ -71,10 +71,9 @@ fn a_position_cast_becomes_a_step_of_the_mask_region_that_reads_it() {
     let mask = b.binary_scalar(BinOp::Sub, keep, poot_graph_ir::Scalar::F32(1.0));
     let out = b.binary(BinOp::Add, x, mask);
     let (pos_id, x_id) = (pos.id(), x.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
-    let og = optimize(&g);
-    og.validate().expect("the folded graph is valid");
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&g), 1);
     assert_eq!(
         casts(&og),
@@ -116,10 +115,9 @@ fn an_i32_producer_writes_the_f32_the_cast_would_have_made() {
     let flag = b.cast(b.binary(BinOp::GeU, a, c), DType::F32);
     let out = b.transpose(flag, vec![1, 0]);
     let (a_id, c_id) = (a.id(), c.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
-    let og = optimize(&g);
-    og.validate().expect("the folded graph is valid");
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&g), 1);
     assert_eq!(casts(&og), 0);
     let producer = regions(&og);
@@ -154,10 +152,9 @@ fn an_i32_chain_its_cast_and_the_float_arithmetic_after_it_are_one_region() {
     );
     let out = b.binary(BinOp::Mul, b.cast(hit, DType::F32), w);
     let (a_id, c_id, w_id) = (a.id(), c.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
-    let og = optimize(&g);
-    og.validate().expect("the folded graph is valid");
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&og), 0);
     let all = regions(&og);
     assert_eq!(
@@ -165,7 +162,7 @@ fn an_i32_chain_its_cast_and_the_float_arithmetic_after_it_are_one_region() {
         1,
         "compare, product, cast and scale are one region"
     );
-    assert_eq!(og.eqns.len(), 1, "nothing else launches");
+    assert_eq!(og.eqns().len(), 1, "nothing else launches");
     assert_eq!(cast_steps(all[0]), 1);
 
     let inputs = HashMap::from([
@@ -197,10 +194,9 @@ fn a_cast_read_by_lone_pointwise_equations_folds_into_each() {
         b.reduce(poot_graph_ir::RedOp::Sum, scaled, 0, true),
     );
     let pos_id = pos.id();
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
-    let og = optimize(&g);
-    og.validate().expect("the folded graph is valid");
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&og), 0);
     assert_eq!(
         regions(&og).iter().filter(|e| cast_steps(e) == 1).count(),
@@ -221,15 +217,23 @@ fn a_cast_no_pointwise_kernel_can_absorb_stays_a_cast() {
     let pos = b.slot(Slot::Pos, TensorType::new(vec![1, 4], DType::I32));
     let w = b.constant("w", TensorType::f32(vec![4, 3]));
     let out = b.matmul(b.cast(pos, DType::F32), w);
-    let g = b.finish(out);
-    assert_eq!(casts(&optimize(&g)), 1, "a matmul operand keeps its cast");
+    let g = b.finish(out).unwrap();
+    assert_eq!(
+        casts(&optimize(&g).unwrap()),
+        1,
+        "a matmul operand keeps its cast"
+    );
 
     // The graph output is the cast itself: its value is read from outside, with no reader to fold into.
     let b = Builder::new();
     let pos = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
     let out = b.cast(pos, DType::F32);
-    let g = b.finish(out);
-    assert_eq!(casts(&optimize(&g)), 1, "a cast that is the output stays");
+    let g = b.finish(out).unwrap();
+    assert_eq!(
+        casts(&optimize(&g).unwrap()),
+        1,
+        "a cast that is the output stays"
+    );
 
     // The select's condition is the I32 word, its branch the cast of the same word: one leaf, two meanings.
     let b = Builder::new();
@@ -237,8 +241,8 @@ fn a_cast_no_pointwise_kernel_can_absorb_stays_a_cast() {
     let x = b.constant("x", TensorType::f32(vec![4]));
     let (pos_id, x_id) = (pos.id(), x.id());
     let out = b.select(pos, b.cast(pos, DType::F32), x);
-    let g = b.finish(out);
-    let og = optimize(&g);
+    let g = b.finish(out).unwrap();
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&og), 1, "a reader of the word itself keeps the cast");
     let inputs = HashMap::from([
         (pos_id, i32_value(vec![4], vec![0, 2, 0, -3])),
@@ -260,10 +264,9 @@ fn a_producer_another_equation_reads_is_not_rewritten() {
     let other = b.cast(b.unary(UnOp::Not, flag), DType::F32);
     let out = b.binary(BinOp::Add, scaled, other);
     let (a_id, c_id, w_id) = (a.id(), c.id(), w.id());
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
 
-    let og = optimize(&g);
-    og.validate().expect("the folded graph is valid");
+    let og = optimize(&g).unwrap();
     assert_eq!(casts(&og), 0);
     let inputs = HashMap::from([
         (a_id, i32_value(vec![4], vec![1, 5, 2, -1])),

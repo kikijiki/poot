@@ -30,8 +30,8 @@ use poot_tensor::DType;
 
 /// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
 /// submission), single-stage, single-device.
-fn staged(g: &Graph, target: Target) -> StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+fn staged(g: &Graph, target: Target) -> StagedProgram {
+    let g = g.clone();
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -95,7 +95,7 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
         TensorType::new(vec![ROWS], DType::I32),
     );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
 
     let mut store = WeightStore::builder();
     for (ordinal, owner) in owners.iter().enumerate() {
@@ -112,7 +112,7 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
     let compiled_graph = program.stages().next().expect("single stage").2.graph();
     assert!(
         matches!(
-            compiled_graph.eqns.as_slice(),
+            compiled_graph.eqns(),
             [poot_graph_ir::Eqn {
                 op: poot_graph_ir::OpKind::PackedContraction {
                     rows: poot_graph_ir::ContractionRows::Indexed { .. },
@@ -122,7 +122,7 @@ fn run_moe(exec: &mut dyn Executor, target: Target, out: usize, k: usize) -> (Ve
             }]
         ),
         "[{out}, {k}]: one indexed packed contraction, got {:?}",
-        compiled_graph.eqns
+        compiled_graph.eqns()
     );
 
     let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
@@ -215,7 +215,7 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
         let rows =
             poot_graph_ir::ops::packed_embedding(&b, token, "model.embed_tokens", owner.weight())
                 .unwrap();
-        let g = b.finish(rows);
+        let g = b.finish(rows).unwrap();
 
         let mut store = WeightStore::builder();
         store
@@ -230,7 +230,7 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
         let compiled_graph = program.stages().next().expect("single stage").2.graph();
         assert!(
             compiled_graph
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedRowGather { .. })),
             "{n} ids: compile claims the embedding"

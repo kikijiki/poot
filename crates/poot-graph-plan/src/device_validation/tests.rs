@@ -1,12 +1,10 @@
 use poot_graph_ir::op::{BinOp, OpKind, RedOp, UnOp};
 use poot_graph_ir::{
-    Builder, Eqn, Graph, NoValidations, Operand, Scalar, Storage, TensorType, Traced, ValidationId,
-    ValueMeta,
+    Builder, Eqn, Operand, Scalar, Storage, TensorType, Traced, ValidationId, ValueMeta,
 };
 use poot_tensor::DType;
 
 use super::*;
-use crate::plan_validation_packet;
 
 const MAX: f32 = f32::MAX;
 
@@ -65,7 +63,7 @@ fn device_witness_admits_spec_recipes() {
     )
     .unwrap();
 
-    let packet = plan_validation_packet(&graph).unwrap();
+    let packet = crate::device_validation::validation_packet_plan(&graph);
     admit_device_witnesses(&graph).unwrap();
     assert!(!packet.sources.is_empty());
     assert_eq!(
@@ -161,19 +159,6 @@ fn device_witness_rejects_noncanonical_heads() {
     }
 }
 
-/// An ordinary graph takes the empty-plan path: no walk, and no second `Graph::validate`. A graph
-/// that `Graph::validate` would reject still admits (vacuously), which is only possible if the walk
-/// never validates it.
-#[test]
-fn ordinary_graph_plan_is_empty_and_does_not_validate() {
-    let malformed = Graph::default();
-    assert!(
-        malformed.validate().is_err(),
-        "an empty graph has no output value, so validation must reject it"
-    );
-    admit_device_witnesses(&malformed).unwrap();
-}
-
 /// The count domain is checked per value, not only where a `Cast` names a dtype. The graph is
 /// hand-built because no traced graph can reach a narrow intermediate: the packet forces an F32
 /// validation value, and `Cast`, the only dtype-changing admitted producer, rejects a narrow source itself.
@@ -183,40 +168,30 @@ fn device_witness_rejects_a_narrow_intermediate() {
         ValueMeta::new(TensorType::new(shape, DType::BF16), Storage::Device, None)
     };
     let (x, mid, out) = (ValueId::new(0), ValueId::new(1), ValueId::new(2));
-    let graph: Graph<NoValidations> = Graph {
-        values: [
-            ValueMeta::new(
-                TensorType::new(vec![4], DType::BF16),
-                Storage::Const,
-                Some("x".into()),
-            ),
-            narrow(vec![4]),
-            narrow(vec![4]),
-        ]
-        .into_iter()
-        .collect(),
-        inputs: vec![x],
-        consts: vec![x],
-        slots: Vec::new(),
-        eqns: vec![
-            Eqn {
-                op: OpKind::Binary(BinOp::Ge),
-                inputs: vec![Operand::Value(x), Operand::Lit(Scalar::F32(0.0))],
-                out: mid,
-                layer: None,
-            },
-            Eqn {
-                op: OpKind::Binary(BinOp::Mul),
-                inputs: vec![Operand::Value(mid), Operand::Value(mid)],
-                out,
-                layer: None,
-            },
-        ],
-        output: out,
-        validations: NoValidations,
-        exports: Vec::new(),
-        state: Vec::new(),
-    };
+    let mut draft = poot_graph_ir::GraphEdit::new();
+    draft.values_mut().push(ValueMeta::new(
+        TensorType::new(vec![4], DType::BF16),
+        Storage::Const,
+        Some("x".into()),
+    ));
+    draft.values_mut().push(narrow(vec![4]));
+    draft.values_mut().push(narrow(vec![4]));
+    draft.inputs_mut().push(x);
+    draft.consts_mut().push(x);
+    draft.eqns_mut().push(Eqn {
+        op: OpKind::Binary(BinOp::Ge),
+        inputs: vec![Operand::Value(x), Operand::Lit(Scalar::F32(0.0))],
+        out: mid,
+        layer: None,
+    });
+    draft.eqns_mut().push(Eqn {
+        op: OpKind::Binary(BinOp::Mul),
+        inputs: vec![Operand::Value(mid), Operand::Value(mid)],
+        out,
+        layer: None,
+    });
+    draft.set_result(out);
+    let graph = draft.commit().expect("the narrow chain is well formed");
     let mut walk = WitnessWalk::new(&graph);
     assert_eq!(
         walk.bound(out),
@@ -259,7 +234,7 @@ fn device_witness_admits_the_selector_bounds_chain() {
     )
     .unwrap();
 
-    let packet = plan_validation_packet(&graph).unwrap();
+    let packet = crate::device_validation::validation_packet_plan(&graph);
     admit_device_witnesses(&graph).unwrap();
     assert_eq!(packet.layout.lane_count, 1);
     assert_eq!(packet.layout.byte_len, 4);

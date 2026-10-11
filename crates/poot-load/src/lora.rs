@@ -18,11 +18,22 @@
 //! rejected with an error rather than ignored.
 
 use crate::LoadError;
-use crate::safetensors::{decode_dense, dense_bytes};
+use crate::safetensors::dense_bytes;
 use poot_quant::weights::WeightStore;
 use poot_tensor::HostTensor;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// The dense entry `name` as its logical shape and row-major f32 values.
+fn dense_f32(store: &WeightStore, name: &str) -> Result<(Vec<usize>, Vec<f32>), LoadError> {
+    let dense = dense_bytes(store, name)?;
+    let data = dense
+        .decode_f32()
+        .map_err(|error| LoadError::UndecodableCheckpointDtype {
+            name: format!("{:?}", error.dtype),
+        })?;
+    Ok((dense.shape().to_vec(), data))
+}
 
 /// The `adapter_config.json` fields this loader needs. PEFT's file has many training and
 /// bookkeeping fields; `#[serde(deny_unknown_fields)]` is not set so they are ignored.
@@ -125,8 +136,8 @@ impl LoraAdapter {
             let b_key = b_by_module.get(&module).ok_or_else(|| {
                 LoadError::SafeTensors(format!("lora adapter: {module} has lora_A but no lora_B"))
             })?;
-            let a = decode_dense(dense_bytes(store, &a_key)?)?;
-            let b = decode_dense(dense_bytes(store, b_key)?)?;
+            let a = dense_f32(store, &a_key)?;
+            let b = dense_f32(store, b_key)?;
             if a.0.len() != 2 || b.0.len() != 2 {
                 return Err(LoadError::SafeTensors(format!(
                     "lora adapter: {module} lora_A/lora_B must be 2-D linear weights, got {:?}/{:?}",

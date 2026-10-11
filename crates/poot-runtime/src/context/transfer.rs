@@ -53,7 +53,7 @@ impl Context {
 
     /// Upload raw IEEE-754 half-precision bits as a device buffer, for a kernel param declared
     /// `Slice<f16>` (card 154's SPIR-V cooperative-matrix matmul operands). Each `u16` is a narrowed
-    /// f16's bit pattern (e.g. from `poot_load::gguf::f32_to_f16`), little-endian, 2 bytes per element;
+    /// f16's bit pattern (e.g. from `poot_quant::scalar::f32_to_f16`), little-endian, 2 bytes per element;
     /// `upload_f32` would upload the same element count as 4-byte words, which the coopmat kernel's
     /// byte-addressed `Slice<f16>` binding would index at the wrong stride.
     pub fn upload_f16(&self, data: &[u16]) -> DeviceBuffer {

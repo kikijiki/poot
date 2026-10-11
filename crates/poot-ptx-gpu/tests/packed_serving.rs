@@ -42,6 +42,7 @@ use poot_target::Backend;
 use poot_tensor::HostTensor;
 use poot_test_util::const_weights::ConstWeights;
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::gpu_caps;
 
 mod common;
 
@@ -79,9 +80,9 @@ fn canonical(value: f32) -> u32 {
 }
 
 fn target(ptx: &PtxDevice) -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::Nvptx,
-        caps: poot_executor::Device::target(ptx).caps,
+        caps: gpu_caps(&poot_executor::Device::target(ptx)),
     }
 }
 
@@ -91,7 +92,7 @@ fn target(ptx: &PtxDevice) -> Target {
 fn compiled(ptx: &PtxDevice, graph: &Graph) -> Graph {
     let graph = compiled_graph(ptx, graph);
     assert!(
-        graph.eqns.iter().any(|eqn| matches!(
+        graph.eqns().iter().any(|eqn| matches!(
             eqn.op,
             OpKind::PackedContraction { .. }
                 | OpKind::ContractionEpilogue {
@@ -118,7 +119,7 @@ fn compiled_graph(ptx: &PtxDevice, graph: &Graph) -> Graph {
 /// The packed carriers of `graph`, bound as components of `owner` by the role their names carry.
 fn carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<ValueId, Value> {
     graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             let name = PackedSourceName::parse(graph.meta(id).name.as_deref()?)?;
@@ -167,7 +168,8 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, ValueId, V
     );
     let cache_out = b.dynamic_update_slice_dyn(cache, y, pos, 0);
     (
-        b.finish_with_state(y, &[(cache, cache_out)]),
+        b.finish(poot_graph_ir::Outputs::new(y).with_state(&[(cache, cache_out)]))
+            .unwrap(),
         x.id(),
         pos.id(),
     )
@@ -189,7 +191,8 @@ fn captured_decode_graph(descriptor: poot_quant::PackedWeight) -> Graph {
         StateRole::Recurrent,
     );
     let cache_out = b.dynamic_update_slice_dyn(cache, y, pos, 0);
-    b.finish_with_state(y, &[(cache, cache_out)])
+    b.finish(poot_graph_ir::Outputs::new(y).with_state(&[(cache, cache_out)]))
+        .unwrap()
 }
 
 fn eye() -> HostTensor {
@@ -267,7 +270,7 @@ fn packed_decode_through_capture_and_replay_is_bit_exact_on_ptx() {
         compiled(&ptx, &graph);
         let mut consts = carriers(&graph, &owner);
         let eye_id = graph
-            .inputs
+            .inputs()
             .iter()
             .copied()
             .find(|&id| graph.meta(id).name.as_deref() == Some("eye"))
@@ -275,13 +278,13 @@ fn packed_decode_through_capture_and_replay_is_bit_exact_on_ptx() {
         consts.insert(eye_id, eye().into());
 
         let token_id = graph
-            .inputs
+            .inputs()
             .iter()
             .copied()
             .find(|&id| graph.meta(id).storage == poot_graph_ir::Storage::Slot(Slot::Token))
             .unwrap();
         let pos_id = graph
-            .inputs
+            .inputs()
             .iter()
             .copied()
             .find(|&id| graph.meta(id).storage == poot_graph_ir::Storage::Slot(Slot::Pos))
@@ -333,7 +336,9 @@ fn packed_prefill_through_serving_path_is_bit_exact_on_ptx() {
             StateRole::Recurrent,
         );
         let cache_out = b.dynamic_update_slice(cache, y, 0, 0);
-        let graph = b.finish_with_state(y, &[(cache, cache_out)]);
+        let graph = b
+            .finish(poot_graph_ir::Outputs::new(y).with_state(&[(cache, cache_out)]))
+            .unwrap();
         compiled(&ptx, &graph);
         let mut inputs = carriers(&graph, &owner);
         inputs.insert(x.id(), one_hot(K, |r| r).into());
@@ -453,13 +458,13 @@ impl StackBuffers {
                 );
                 let caps = poot_target::DeviceCaps {
                     max_buffer_bytes: 2 * slab,
-                    ..target.caps
+                    ..gpu_caps(&target)
                 };
                 let split =
                     poot_graph_plan::legalize(g, &caps, &poot_graph_plan::CompileLimits::STANDARD)
                         .expect("the stacked table splits");
                 let carriers: Vec<usize> = split
-                    .consts
+                    .consts()
                     .iter()
                     .map(|&id| split.aval(id).shape[0])
                     .collect();
@@ -517,9 +522,9 @@ fn run_indexed_case(
         TensorType::new(vec![rows], DType::I32),
     );
     let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
-    let graph = b.finish(y);
+    let graph = b.finish(y).unwrap();
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &graph.inputs {
+    for &id in graph.inputs() {
         let Some(name) = graph
             .meta(id)
             .name
@@ -687,10 +692,10 @@ fn packed_embedding_row_gather_is_bit_exact_on_ptx() {
                 owner.weight(),
             )
             .unwrap();
-            let graph = b.finish(rows);
+            let graph = b.finish(rows).unwrap();
             assert!(
                 compiled_graph(&ptx, &graph)
-                    .eqns
+                    .eqns()
                     .iter()
                     .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::PackedRowGather { .. })),
                 "{what}: compile claims the embedding"
@@ -748,7 +753,7 @@ fn dense_e4m3_row_gather_is_bit_exact_on_ptx() {
             TensorType::new(vec![ids.len()], DType::I32),
         );
         let gathered = b.cast(b.gather(table_value, 0, idx), DType::F32);
-        let graph = b.finish(gathered);
+        let graph = b.finish(gathered).unwrap();
         let idx_key = graph.meta(idx.id()).slot_key().unwrap().clone();
 
         let store = {
@@ -871,7 +876,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_ptx() {
             let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]));
             let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                 .unwrap();
-            let graph = b.finish(y);
+            let graph = b.finish(y).unwrap();
             let mut inputs = carriers(&graph, &owner);
             inputs.insert(
                 x.id(),
@@ -921,11 +926,11 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_ptx() {
                 poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                     .unwrap();
             if !with_bias {
-                return (b.finish(head), x.id(), None);
+                return (b.finish(head).unwrap(), x.id(), None);
             }
             let bias = b.constant("bias", TensorType::f32(vec![OUT]));
             let out = b.binary(BinOp::Add, head, bias);
-            (b.finish(out), x.id(), Some(bias.id()))
+            (b.finish(out).unwrap(), x.id(), Some(bias.id()))
         };
 
         let (head_graph, head_x, _) = build(false);
@@ -937,7 +942,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_ptx() {
         let (graph, x, bias) = build(true);
         let bias = bias.unwrap();
         let heads: Vec<ContractionHead> = compiled_graph(&ptx, &graph)
-            .eqns
+            .eqns()
             .iter()
             .filter_map(|eqn| match &eqn.op {
                 poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),
@@ -1011,7 +1016,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
                 poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
                     .unwrap();
             if !with_chain {
-                return (b.finish(head), x.id(), None);
+                return (b.finish(head).unwrap(), x.id(), None);
             }
             let bias = b.constant("bias", TensorType::f32(vec![OUT]));
             let residual = b.constant("residual", TensorType::f32(vec![1, OUT]));
@@ -1019,7 +1024,11 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
             let activated = b.unary(UnOp::Tanh, biased);
             let scaled = b.binary_scalar(BinOp::Mul, activated, Scalar::F32(0.5));
             let out = b.binary(BinOp::Add, scaled, residual);
-            (b.finish(out), x.id(), Some((bias.id(), residual.id())))
+            (
+                b.finish(out).unwrap(),
+                x.id(),
+                Some((bias.id(), residual.id())),
+            )
         };
 
         // The device head alone, to cancel against.
@@ -1034,7 +1043,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
         let (bias, residual) = leaves.unwrap();
         let residual_values = fill(5, OUT);
         let heads: Vec<ContractionHead> = compiled_graph(&ptx, &graph)
-            .eqns
+            .eqns()
             .iter()
             .filter_map(|eqn| match &eqn.op {
                 poot_graph_ir::OpKind::ContractionEpilogue { head, .. } => Some(*head),

@@ -18,9 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use poot_executor::{BufferRole, Device, Dispatch, Engine};
-use poot_graph_ir::{
-    BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType, UnOp, ValidationOutputs,
-};
+use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType, UnOp};
 use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target};
 use poot_llm::GenerationControl;
 use poot_llm::Sampler;
@@ -206,11 +204,7 @@ impl Model for Recurrentish {
     /// `-0.5 * (v - 47 * m)^2` with `m = (1 + tanh(1.2 * state . [-1, 1, -1, 1] - 1.8)) / 2`, a peak
     /// at the vocabulary position the state selects: it climbs toward the end-of-sequence token as
     /// tokens accumulate.
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         check_step(RECURRENT, phase, shape, self.config.max_positions)?;
         let b = Builder::new();
         let step = Step::new(&b, shape);
@@ -296,7 +290,7 @@ impl Model for Recurrentish {
         } else {
             b.concat(1, &logits)
         };
-        Ok(step.finish(b, out))
+        Ok(step.finish(b, out).unwrap())
     }
 }
 
@@ -335,9 +329,8 @@ impl Oracle {
         };
         let graph = self.model.trace(Phase::Prefill, shape).unwrap();
         let state: Vec<HostTensor> = graph
-            .state
-            .iter()
-            .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+            .state()
+            .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
             .collect();
         let slots = [
             (
@@ -1050,7 +1043,7 @@ impl Device for FakeDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use poot_graph_ir::decompose::{Decomposition, decompose};
 use poot_graph_ir::{
     ComputedConst, Eqn, Graph, OpClass, OpKind, Operand as IrOperand, ScanAttrs, TensorType,
-    ValidationChannel, ValueId, ValueTable,
+    ValueId, ValueTable,
 };
 
 use crate::exact_bf16::{self, ExactBf16TensorView};
@@ -146,19 +146,18 @@ pub struct Evaluation {
 /// restricts every op's admitted dtype combination to exactly what the match in
 /// [`evaluate_equation`] implements for it, so an unadmitted shape fails there, the first time (and
 /// only time) that equation is evaluated, not in an earlier, now-vacuous pass.
-pub fn eval<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn eval(
+    g: &Graph,
     inputs: &HashMap<ValueId, Value>,
     mut opts: EvalOptions<'_>,
 ) -> Result<Evaluation, EvalError> {
-    g.validate()?;
     preflight_bindings(g, inputs)?;
 
-    let mut env: ValueTable<Option<Value>> = ValueTable::filled(g.values.len(), None);
+    let mut env: ValueTable<Option<Value>> = ValueTable::filled(g.values().len(), None);
     bind_inputs(g, inputs, &mut env)?;
 
     let mut decompositions = Decompositions::default();
-    for (idx, eqn) in g.eqns.iter().enumerate() {
+    for (idx, eqn) in g.eqns().iter().enumerate() {
         let value = evaluate_equation(g, eqn, &env, idx, &mut opts, &mut decompositions)?;
         let value = store_as_declared(value, g.aval(eqn.out).dtype)?;
         check_published(g, eqn, &value)?;
@@ -170,11 +169,10 @@ pub fn eval<V: ValidationChannel>(
 
     validate_environment(g, &env)?;
 
-    let output = publish_value(&env, g.output)?;
+    let output = publish_value(&env, g.result())?;
     let state = g
-        .state
-        .iter()
-        .map(|&(state_in, state_out)| {
+        .state()
+        .map(|(state_in, state_out)| {
             let value = publish_value(&env, state_out)?;
             check_state_storage(g, state_in, state_out, &value)?;
             Ok(value)
@@ -206,15 +204,12 @@ fn publish_value(env: &ValueTable<Option<Value>>, value: ValueId) -> Result<Valu
 
 /// The validation-packet gate (ADR-0090/ADR-0101): every declared validation root must be a complete
 /// dense F32 tensor of its declared shape; an empty validation set is a no-op.
-fn validate_environment<V: ValidationChannel>(
-    g: &Graph<V>,
-    env: &ValueTable<Option<Value>>,
-) -> Result<(), EvalError> {
-    let validations = g.validation_outputs();
-    if validations.is_empty() {
+fn validate_environment(g: &Graph, env: &ValueTable<Option<Value>>) -> Result<(), EvalError> {
+    let mut validations = g.witnesses().peekable();
+    if validations.peek().is_none() {
         return Ok(());
     }
-    let layout = poot_graph_ir::ValidationPacketLayout::for_graph(g)?;
+    let layout = poot_graph_ir::ValidationPacketLayout::for_graph(g);
     let mut bits = Vec::with_capacity(layout.lane_count);
     for validation in validations {
         let not_dense = || EvalError::ValidationValueNotHost {
@@ -247,8 +242,8 @@ fn validate_environment<V: ValidationChannel>(
         })
 }
 
-fn check_state_storage<V: ValidationChannel>(
-    g: &Graph<V>,
+fn check_state_storage(
+    g: &Graph,
     state_in: ValueId,
     state_out: ValueId,
     value: &Value,
@@ -284,11 +279,7 @@ fn store_as_declared(value: Value, declared: DType) -> Result<Value, EvalError> 
 /// the declared element count by construction); `debug_assert`s the stronger claim, since a release
 /// build should fail closed on a typed error rather than publish a mismatched carrier, but never
 /// panic on a build the caller ships.
-fn check_published<V: ValidationChannel>(
-    g: &Graph<V>,
-    eqn: &Eqn,
-    value: &Value,
-) -> Result<(), EvalError> {
+fn check_published(g: &Graph, eqn: &Eqn, value: &Value) -> Result<(), EvalError> {
     let expected = g.aval(eqn.out);
     let shape_ok = value.shape().as_ref() == expected.shape.as_slice();
     let class_ok = match value {
@@ -326,11 +317,8 @@ fn check_published<V: ValidationChannel>(
 /// exactly the declared dtype and shape (a payload cannot disagree with its dtype, so no narrowing or
 /// widening happens at bind), and a non-output owner-backed exact-dense view must be consumed by an
 /// equation that actually reads it.
-fn preflight_bindings<V: ValidationChannel>(
-    g: &Graph<V>,
-    inputs: &HashMap<ValueId, Value>,
-) -> Result<(), EvalError> {
-    for &id in &g.inputs {
+fn preflight_bindings(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Result<(), EvalError> {
+    for &id in g.inputs() {
         let aval = g.aval(id);
         if let poot_graph_ir::Storage::Computed(_) = g.meta(id).storage {
             continue;
@@ -408,12 +396,12 @@ fn check_declared_range(
 
 /// Bind every graph input into `env`, exactly as bound: [`preflight_bindings`] has already checked
 /// each host tensor's dtype and shape against the graph's declaration.
-fn bind_inputs<V: ValidationChannel>(
-    g: &Graph<V>,
+fn bind_inputs(
+    g: &Graph,
     inputs: &HashMap<ValueId, Value>,
     env: &mut ValueTable<Option<Value>>,
 ) -> Result<(), EvalError> {
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         if let poot_graph_ir::Storage::Computed(computed) = g.meta(id).storage {
             env[id] = Some(Value::Host(computed.tensor()));
             continue;
@@ -427,7 +415,7 @@ fn bind_inputs<V: ValidationChannel>(
 // Evaluate: one equation
 // ---------------------------------------------------------------------------------------------
 
-fn touches_e4m3<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
+fn touches_e4m3(g: &Graph, eqn: &Eqn) -> bool {
     g.aval(eqn.out).dtype == DType::E4M3FN
         || eqn.inputs.iter().any(|operand| match operand {
             IrOperand::Value(id) => g.aval(*id).dtype == DType::E4M3FN,
@@ -435,8 +423,8 @@ fn touches_e4m3<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
         })
 }
 
-fn evaluate_equation<V: ValidationChannel>(
-    g: &Graph<V>,
+fn evaluate_equation(
+    g: &Graph,
     eqn: &Eqn,
     env: &ValueTable<Option<Value>>,
     idx: usize,
@@ -539,8 +527,8 @@ impl Decompositions {
 /// decomposition's output. Each intermediate is charged to the budget, attributed to the composite
 /// equation; the observer sees only the composite's own value, which the caller publishes. An error a
 /// primitive raises is attributed to the composite equation too ([`attributed_to`]).
-fn evaluate_composite<V: ValidationChannel>(
-    g: &Graph<V>,
+fn evaluate_composite(
+    g: &Graph,
     eqn: &Eqn,
     env: &ValueTable<Option<Value>>,
     idx: usize,
@@ -606,11 +594,11 @@ fn run_decomposition(
     decompositions: &mut Decompositions,
 ) -> Result<Value, EvalError> {
     let inner = &decomposition.graph;
-    let mut inner_env: ValueTable<Option<Value>> = ValueTable::filled(inner.values.len(), None);
+    let mut inner_env: ValueTable<Option<Value>> = ValueTable::filled(inner.values().len(), None);
     for (&placeholder, value) in decomposition.operands.iter().zip(bound) {
         inner_env[placeholder] = Some(value);
     }
-    for inner_eqn in &inner.eqns {
+    for inner_eqn in inner.eqns() {
         let declared = inner.aval(inner_eqn.out);
         // Every dense equation computes into a 4-byte-per-element F32 or I32 buffer before the
         // declared-dtype store.
@@ -630,9 +618,9 @@ fn run_decomposition(
         check_published(inner, inner_eqn, &value)?;
         inner_env[inner_eqn.out] = Some(value);
     }
-    inner_env[inner.output]
+    inner_env[inner.result()]
         .take()
-        .ok_or(EvalError::UseBeforeDef(inner.output))
+        .ok_or(EvalError::UseBeforeDef(inner.result()))
 }
 
 /// Evaluate a `Scan` one chunk at a time with the state carried between chunks: each window of
@@ -737,8 +725,8 @@ fn attributed_to(composite: &Eqn, error: EvalError) -> EvalError {
 // Cast (X3, X9)
 // ---------------------------------------------------------------------------------------------
 
-fn evaluate_cast<V: ValidationChannel>(
-    g: &Graph<V>,
+fn evaluate_cast(
+    g: &Graph,
     eqn: &Eqn,
     to: DType,
     env: &ValueTable<Option<Value>>,
@@ -934,8 +922,8 @@ fn evaluate_cast<V: ValidationChannel>(
 // Gather: data-carrier-aware (I32 index over I32/dense/owner data; E4M3FN)
 // ---------------------------------------------------------------------------------------------
 
-fn evaluate_gather<V: ValidationChannel>(
-    g: &Graph<V>,
+fn evaluate_gather(
+    g: &Graph,
     eqn: &Eqn,
     axis: usize,
     env: &ValueTable<Option<Value>>,
@@ -1007,8 +995,8 @@ fn evaluate_gather<V: ValidationChannel>(
 // BF16 table (Spec 376): Widen, Gather/RowGatherWiden, Reshape, Transpose, Weight{MatMul,Contraction}
 // ---------------------------------------------------------------------------------------------
 
-fn evaluate_bf16<V: ValidationChannel>(
-    g: &Graph<V>,
+fn evaluate_bf16(
+    g: &Graph,
     eqn: &Eqn,
     equation: Bf16Equation<'_>,
     env: &ValueTable<Option<Value>>,
@@ -1092,8 +1080,8 @@ fn evaluate_bf16<V: ValidationChannel>(
 // E4M3FN (storage-only; Cast is handled in `evaluate_cast`)
 // ---------------------------------------------------------------------------------------------
 
-fn evaluate_e4m3<V: ValidationChannel>(
-    g: &Graph<V>,
+fn evaluate_e4m3(
+    g: &Graph,
     eqn: &Eqn,
     env: &ValueTable<Option<Value>>,
 ) -> Result<Value, EvalError> {
@@ -1209,8 +1197,8 @@ fn i32_tensor(id: ValueId, env: &ValueTable<Option<Value>>) -> Result<HostTensor
     }
 }
 
-fn evaluate_dense<V: ValidationChannel>(
-    g: &Graph<V>,
+fn evaluate_dense(
+    g: &Graph,
     eqn: &Eqn,
     env: &ValueTable<Option<Value>>,
     idx: usize,

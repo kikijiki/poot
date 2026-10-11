@@ -20,7 +20,7 @@ pub const FUSABLE_FLOAT_UNARY_OPS: &[UnOp] = &[
 /// emits inside a fused region's body (the transcendentals `Exp`/`Log`/`Sqrt`/`Recip`/`Tanh`/`Erf`
 /// and `Neg`); the activations are compositions over these, so swiglu and geglu fuse as plain chains.
 /// Movement/contraction ops are never pointwise.
-fn is_fusable<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
+fn is_fusable(g: &Graph, eqn: &Eqn) -> bool {
     match &eqn.op {
         OpKind::Binary(_) => true,
         OpKind::Unary(u) if g.aval(eqn.out).dtype == DType::I32 => {
@@ -32,7 +32,7 @@ fn is_fusable<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
     }
 }
 
-pub(super) fn is_i32_pointwise<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
+pub(super) fn is_i32_pointwise(g: &Graph, eqn: &Eqn) -> bool {
     g.aval(eqn.out).dtype == DType::I32 && is_fusable(g, eqn)
 }
 
@@ -48,10 +48,7 @@ fn to_fused_op(op: &OpKind) -> FusedOp {
 /// The pointwise equation `eqn` as a one-step [`FusedRegion`] and its leaves (its value operands, once
 /// each, in first-encounter order), or `None` when it is no pointwise step. The region computes what the
 /// equation computed: a later pass can extend it where a standalone equation has no room.
-pub(super) fn lone_pointwise_region<V: ValidationChannel>(
-    g: &Graph<V>,
-    eqn: &Eqn,
-) -> Option<(FusedRegion, Vec<ValueId>)> {
+pub(super) fn lone_pointwise_region(g: &Graph, eqn: &Eqn) -> Option<(FusedRegion, Vec<ValueId>)> {
     if !is_fusable(g, eqn) {
         return None;
     }
@@ -116,10 +113,7 @@ impl DisjointSet {
 }
 
 /// If `eqn` is a last-axis, keepdim reduction (the shape the row synthesizer handles), its op.
-fn row_reduce_op<V: ValidationChannel>(
-    g: &Graph<V>,
-    eqn: &Eqn,
-) -> Option<poot_graph_ir::op::RedOp> {
+fn row_reduce_op(g: &Graph, eqn: &Eqn) -> Option<poot_graph_ir::op::RedOp> {
     if let OpKind::Reduce { op, axis, keepdim } = &eqn.op {
         let in_rank = match eqn.inputs.first() {
             Some(Operand::Value(v)) => g.aval(*v).rank(),
@@ -136,7 +130,7 @@ fn row_reduce_op<V: ValidationChannel>(
 /// Exact I32 stays out of this phase: I32 reduction is rejected at inference, and I32 row-fusion is not
 /// part of the pointwise-DAG fusion contract. `Select` stays out too: its condition is an I32 leaf, and a
 /// row kernel reads float lanes only, so a select ends a row region and joins a pointwise one.
-fn is_row_candidate<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> bool {
+fn is_row_candidate(g: &Graph, eqn: &Eqn) -> bool {
     (is_fusable(g, eqn) && g.aval(eqn.out).dtype != DType::I32 && !matches!(eqn.op, OpKind::Select))
         || row_reduce_op(g, eqn).is_some()
 }
@@ -151,15 +145,15 @@ fn row_fits(shape: &[usize], l: &[usize], n: usize) -> bool {
 /// The leaf/local layout of a fused region: the root eqn (its escaping output), the external value-operand
 /// leaves in first-encounter order, and the outer-`ValueId` -> region-local map (leaves `0..n_inputs`,
 /// then each member's output). Shared by pointwise and row-wise region building.
-fn region_layout<V: ValidationChannel>(
-    g: &Graph<V>,
+fn region_layout(
+    g: &Graph,
     members: &[usize],
     producer: &ValueTable<Option<usize>>,
 ) -> (usize, Vec<ValueId>, HashMap<ValueId, usize>) {
     let member_set: HashSet<usize> = members.iter().copied().collect();
     let consumed_internally = |out: ValueId| -> bool {
         members.iter().any(|&m| {
-            g.eqns[m]
+            g.eqns()[m]
                 .inputs
                 .iter()
                 .any(|o| matches!(o, Operand::Value(v) if *v == out))
@@ -167,13 +161,13 @@ fn region_layout<V: ValidationChannel>(
     };
     let root = *members
         .iter()
-        .find(|&&m| !consumed_internally(g.eqns[m].out))
+        .find(|&&m| !consumed_internally(g.eqns()[m].out))
         .expect("a fused region has exactly one escaping (root) output");
 
     let mut local_of: HashMap<ValueId, usize> = HashMap::new();
     let mut leaves: Vec<ValueId> = Vec::new();
     for &m in members {
-        for o in &g.eqns[m].inputs {
+        for o in &g.eqns()[m].inputs {
             if let Operand::Value(v) = o {
                 let internal = producer[*v].is_some_and(|p| member_set.contains(&p));
                 if !internal && !local_of.contains_key(v) {
@@ -185,7 +179,7 @@ fn region_layout<V: ValidationChannel>(
     }
     let n_inputs = leaves.len();
     for (s, &m) in members.iter().enumerate() {
-        local_of.insert(g.eqns[m].out, n_inputs + s);
+        local_of.insert(g.eqns()[m].out, n_inputs + s);
     }
     (root, leaves, local_of)
 }
@@ -198,13 +192,13 @@ fn to_region_operand(o: &Operand, local_of: &HashMap<ValueId, usize>) -> FusedOp
     }
 }
 
-fn i32_unit_last_slice<V: ValidationChannel>(
-    g: &Graph<V>,
+fn i32_unit_last_slice(
+    g: &Graph,
     producer: &ValueTable<Option<usize>>,
     value: ValueId,
 ) -> Option<(usize, ValueId, usize)> {
     let eqn_idx = producer[value]?;
-    let OpKind::Slice { axis, start, end } = g.eqns[eqn_idx].op else {
+    let OpKind::Slice { axis, start, end } = g.eqns()[eqn_idx].op else {
         return None;
     };
     if end != start + 1 || g.aval(value).dtype != DType::I32 {
@@ -214,7 +208,7 @@ fn i32_unit_last_slice<V: ValidationChannel>(
     if out_shape.last() != Some(&1) || axis + 1 != out_shape.len() {
         return None;
     }
-    let Operand::Value(parent) = g.eqns[eqn_idx].inputs.first()? else {
+    let Operand::Value(parent) = g.eqns()[eqn_idx].inputs.first()? else {
         return None;
     };
     let parent_ty = g.aval(*parent);
@@ -227,8 +221,8 @@ fn i32_unit_last_slice<V: ValidationChannel>(
     Some((eqn_idx, *parent, start))
 }
 
-fn i32_region_leaves<V: ValidationChannel>(
-    g: &Graph<V>,
+fn i32_region_leaves(
+    g: &Graph,
     members: &[usize],
     producer: &ValueTable<Option<usize>>,
     consumers: &ValueTable<Vec<usize>>,
@@ -240,7 +234,7 @@ fn i32_region_leaves<V: ValidationChannel>(
     let mut operand_of: HashMap<ValueId, FusedOperand> = HashMap::new();
     let mut slice_eqns: Vec<usize> = Vec::new();
     for &member in members {
-        for operand in &g.eqns[member].inputs {
+        for operand in &g.eqns()[member].inputs {
             let Operand::Value(value) = operand else {
                 continue;
             };
@@ -270,12 +264,12 @@ fn i32_region_leaves<V: ValidationChannel>(
     }
     let n_inputs = leaves.len();
     for (step, &member) in members.iter().enumerate() {
-        operand_of.insert(g.eqns[member].out, FusedOperand::Local(n_inputs + step));
+        operand_of.insert(g.eqns()[member].out, FusedOperand::Local(n_inputs + step));
     }
     let absorbed_slices = slice_eqns
         .into_iter()
         .filter(|&slice_eqn| {
-            let out = g.eqns[slice_eqn].out;
+            let out = g.eqns()[slice_eqn].out;
             !pinned.contains(&out)
                 && consumers[out]
                     .iter()
@@ -310,17 +304,17 @@ fn to_i32_region_operand(o: &Operand, operand_of: &HashMap<ValueId, FusedOperand
 /// whose steps stay in `Ge`/`GeU`/`Sub`/`Add`/`Mul`, `Not`/`Clz` and `Select`, and whose packed
 /// last-axis concat is carried by the region's `pack`. The exact-I32 evaluator has a `Fused` arm for
 /// exactly that subset (`poot-eval/src/exact_i32.rs`), so the region is supported rather than dropped.
-pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
     // First turn data-no-op transposes into (free) reshapes so they cost no dispatch on the launch-bound
     // decode; the fusion grouping below treats both as movement boundaries, so this only removes launches.
     // Then collapse the reshape chains that elision exposes (seq-1 attention q/k/v), shrinking the graph.
-    let g = &collapse_reshape_chains(&elide_noop_transposes(g));
-    let n_vals = g.values.len();
-    let n_eqns = g.eqns.len();
+    let g = &collapse_reshape_chains(&elide_noop_transposes(g)?)?;
+    let n_vals = g.values().len();
+    let n_eqns = g.eqns().len();
 
     let mut producer: ValueTable<Option<usize>> = ValueTable::filled(n_vals, None);
     let mut uses: ValueTable<usize> = ValueTable::filled(n_vals, 0);
-    for (e, eqn) in g.eqns.iter().enumerate() {
+    for (e, eqn) in g.eqns().iter().enumerate() {
         producer[eqn.out] = Some(e);
         for o in &eqn.inputs {
             if let Operand::Value(v) = o {
@@ -340,7 +334,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // union candidates whose shapes fit a common (L, N) signature seeded from the reductions.
     let mut ds = DisjointSet::new(n_eqns);
     let mut sig: HashMap<usize, (Vec<usize>, usize)> = HashMap::new();
-    for (e, eqn) in g.eqns.iter().enumerate() {
+    for (e, eqn) in g.eqns().iter().enumerate() {
         if row_reduce_op(g, eqn).is_some()
             && let Some(Operand::Value(v)) = eqn.inputs.first()
         {
@@ -352,7 +346,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // grow to a fixpoint: an edge joins two candidates when a consistent signature covers both ends.
     loop {
         let mut changed = false;
-        for (e, eqn) in g.eqns.iter().enumerate() {
+        for (e, eqn) in g.eqns().iter().enumerate() {
             if !is_row_candidate(g, eqn) {
                 continue;
             }
@@ -362,7 +356,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
                     continue;
                 }
                 let Some(pe) = producer[*v] else { continue };
-                if !is_row_candidate(g, &g.eqns[pe]) {
+                if !is_row_candidate(g, &g.eqns()[pe]) {
                     continue;
                 }
                 let (re, rp) = (ds.find(e), ds.find(pe));
@@ -376,7 +370,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
                     (None, None) => None,
                 };
                 let Some((l, n)) = sg else { continue };
-                if row_fits(&g.aval(g.eqns[e].out).shape, &l, n)
+                if row_fits(&g.aval(g.eqns()[e].out).shape, &l, n)
                     && row_fits(&g.aval(*v).shape, &l, n)
                 {
                     ds.union(e, pe);
@@ -392,7 +386,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // collect row components (those with a signature, i.e. containing a reduce).
     let mut row_groups: HashMap<usize, Vec<usize>> = HashMap::new();
     for e in 0..n_eqns {
-        if is_row_candidate(g, &g.eqns[e]) {
+        if is_row_candidate(g, &g.eqns()[e]) {
             let r = ds.find(e);
             if sig.contains_key(&r) {
                 row_groups.entry(r).or_default().push(e);
@@ -418,13 +412,13 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         // row-width pointwise. When the output is reduced, skip the region: the pointwise members fall
         // to the pointwise-fusion phase and the reduce(s) stay plain `Reduce` ops. Fusing into a
         // reduce-output region would need the reduce width carried separately from the output width.
-        if g.aval(g.eqns[root].out).shape.get(axis) != Some(&n) {
+        if g.aval(g.eqns()[root].out).shape.get(axis) != Some(&n) {
             continue;
         }
         let steps: Vec<RowStep> = members
             .iter()
             .map(|&m| {
-                let eqn = &g.eqns[m];
+                let eqn = &g.eqns()[m];
                 if let Some(op) = row_reduce_op(g, eqn) {
                     RowStep::Reduce {
                         op,
@@ -446,15 +440,15 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
             n_inputs: leaves.len(),
             axis,
             steps,
-            output: local_of[&g.eqns[root].out],
+            output: local_of[&g.eqns()[root].out],
         };
         fused_at.insert(
             root,
             Eqn {
                 op: OpKind::FusedRow(region),
                 inputs: leaves.into_iter().map(Operand::Value).collect(),
-                out: g.eqns[root].out,
-                layer: g.eqns[root].layer,
+                out: g.eqns()[root].out,
+                layer: g.eqns()[root].layer,
             },
         );
         for &m in members {
@@ -467,12 +461,12 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
 
     // --- Phase B: f32 pointwise regions -------------------------------------------------------------
     let f32_pointwise = |e: usize| {
-        is_fusable(g, &g.eqns[e])
+        is_fusable(g, &g.eqns()[e])
             && !claimed.contains(&e)
-            && g.aval(g.eqns[e].out).dtype != DType::I32
+            && g.aval(g.eqns()[e].out).dtype != DType::I32
     };
     let mut dp = DisjointSet::new(n_eqns);
-    for (e, eqn) in g.eqns.iter().enumerate() {
+    for (e, eqn) in g.eqns().iter().enumerate() {
         if !is_fusable(g, eqn) || claimed.contains(&e) || g.aval(eqn.out).dtype == DType::I32 {
             continue;
         }
@@ -480,8 +474,8 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         for o in &eqn.inputs {
             let Operand::Value(v) = o else { continue };
             let Some(pe) = producer[*v] else { continue };
-            if is_fusable(g, &g.eqns[pe])
-                && g.aval(g.eqns[pe].out).dtype != DType::I32
+            if is_fusable(g, &g.eqns()[pe])
+                && g.aval(g.eqns()[pe].out).dtype != DType::I32
                 && !claimed.contains(&pe)
                 && single_use(*v)
                 && &g.aval(*v).shape == e_shape
@@ -494,7 +488,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // the activation compositions read their input twice, `x / (1 + exp(-x))`). Its value then never
     // escapes the region, so legality is the single-use rule's: no outside reader, no pinned value.
     let mut readers: ValueTable<Vec<usize>> = ValueTable::filled(n_vals, Vec::new());
-    for (e, eqn) in g.eqns.iter().enumerate() {
+    for (e, eqn) in g.eqns().iter().enumerate() {
         for o in &eqn.inputs {
             if let Operand::Value(v) = o {
                 readers[*v].push(e);
@@ -504,7 +498,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     loop {
         let mut changed = false;
         for pe in (0..n_eqns).filter(|&pe| f32_pointwise(pe)) {
-            let v = g.eqns[pe].out;
+            let v = g.eqns()[pe].out;
             if uses[v] < 2 || pinned.contains(&v) {
                 continue;
             }
@@ -512,7 +506,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
             if dp.find(pe) != group
                 && readers[v].iter().all(|&r| {
                     f32_pointwise(r)
-                        && g.aval(g.eqns[r].out).shape == g.aval(v).shape
+                        && g.aval(g.eqns()[r].out).shape == g.aval(v).shape
                         && dp.find(r) == group
                 })
             {
@@ -538,8 +532,8 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         let steps: Vec<FusedStep> = members
             .iter()
             .map(|&m| FusedStep {
-                op: to_fused_op(&g.eqns[m].op),
-                inputs: g.eqns[m]
+                op: to_fused_op(&g.eqns()[m].op),
+                inputs: g.eqns()[m]
                     .inputs
                     .iter()
                     .map(|o| to_region_operand(o, &local_of))
@@ -549,7 +543,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         let region = FusedRegion {
             n_inputs: leaves.len(),
             steps,
-            output: local_of[&g.eqns[root].out],
+            output: local_of[&g.eqns()[root].out],
             pack: Vec::new(),
         };
         fused_at.insert(
@@ -557,8 +551,8 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
             Eqn {
                 op: OpKind::Fused(region),
                 inputs: leaves.into_iter().map(Operand::Value).collect(),
-                out: g.eqns[root].out,
-                layer: g.eqns[root].layer,
+                out: g.eqns()[root].out,
+                layer: g.eqns()[root].layer,
             },
         );
         for &m in members {
@@ -574,7 +568,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
     // rebuild the eqn list in order: a root emits its fused eqn, an absorbed member is dropped, the rest
     // pass through.
     let mut eqns: Vec<Eqn> = Vec::with_capacity(n_eqns);
-    for (e, eqn) in g.eqns.iter().enumerate() {
+    for (e, eqn) in g.eqns().iter().enumerate() {
         if let Some(fe) = fused_at.remove(&e) {
             eqns.push(fe);
         } else if !absorbed.contains(&e) {
@@ -582,7 +576,7 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
         }
     }
 
-    Graph { eqns, ..g.clone() }
+    with_eqns(g, eqns)
 }
 
 /// The contraction epilogue fuse rule: a dense contraction head whose result is read only by a chain of float
@@ -602,14 +596,14 @@ pub fn fuse<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
 /// Near misses stay as they were: a head with two consumers, a reducing or reshaping consumer, a step that
 /// changes the shape or the dtype, and a head `head_lowers` refuses (the planner has no epilogue lowering
 /// for it on the target: a tensor-core `MatMul`).
-pub fn fuse_contraction_epilogues<V: ValidationChannel>(
-    g: &Graph<V>,
-    head_lowers: impl Fn(&Graph<V>, &Eqn) -> bool,
-) -> Graph<V> {
-    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
-    let mut uses: ValueTable<usize> = ValueTable::filled(g.values.len(), 0);
-    let mut consumer: ValueTable<Option<usize>> = ValueTable::filled(g.values.len(), None);
-    for (e, eqn) in g.eqns.iter().enumerate() {
+pub fn fuse_contraction_epilogues(
+    g: &Graph,
+    head_lowers: impl Fn(&Graph, &Eqn) -> bool,
+) -> Result<Graph, EditError> {
+    let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
+    let mut uses: ValueTable<usize> = ValueTable::filled(g.values().len(), 0);
+    let mut consumer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
+    for (e, eqn) in g.eqns().iter().enumerate() {
         producer[eqn.out] = Some(e);
         for operand in &eqn.inputs {
             if let Operand::Value(v) = operand {
@@ -622,7 +616,7 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
     let single_use = |v: ValueId| uses[v] == 1 && !pinned.contains(&v);
     let mut fused_at: HashMap<usize, Eqn> = HashMap::new();
     let mut absorbed: HashSet<usize> = HashSet::new();
-    for (h, head) in g.eqns.iter().enumerate() {
+    for (h, head) in g.eqns().iter().enumerate() {
         if absorbed.contains(&h) {
             continue;
         }
@@ -639,7 +633,7 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
             let Some(next) = consumer[current] else {
                 break;
             };
-            let step = &g.eqns[next];
+            let step = &g.eqns()[next];
             if absorbed.contains(&next)
                 || fused_at.contains_key(&next)
                 || !is_epilogue_step(g, step, head_ty)
@@ -655,19 +649,19 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
         // The region's inputs: the head result (local 0), then every other value the chain reads, in order. A
         // single-use `Broadcast` of a value is read through: the leaf is its source, which the epilogue reads
         // at the output element's broadcast position, so the expanded copy (or a view of it) is never made.
-        let chain_values: HashSet<ValueId> = chain.iter().map(|&c| g.eqns[c].out).collect();
+        let chain_values: HashSet<ValueId> = chain.iter().map(|&c| g.eqns()[c].out).collect();
         let mut extras: Vec<ValueId> = Vec::new();
         let mut leaf_of: HashMap<ValueId, usize> = HashMap::new();
         let mut folded: Vec<usize> = Vec::new();
         for &c in &chain {
-            for operand in &g.eqns[c].inputs {
+            for operand in &g.eqns()[c].inputs {
                 let Operand::Value(v) = operand else {
                     continue;
                 };
                 if *v == head.out || chain_values.contains(v) || leaf_of.contains_key(v) {
                     continue;
                 }
-                let source = match producer[*v].map(|b| (b, &g.eqns[b])) {
+                let source = match producer[*v].map(|b| (b, &g.eqns()[b])) {
                     Some((b, broadcast))
                         if matches!(broadcast.op, OpKind::Broadcast { .. })
                             && single_use(*v)
@@ -696,7 +690,7 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
         let local_of = |v: ValueId| -> usize {
             if v == head.out {
                 0
-            } else if let Some(position) = chain.iter().position(|&c| g.eqns[c].out == v) {
+            } else if let Some(position) = chain.iter().position(|&c| g.eqns()[c].out == v) {
                 n_inputs + position
             } else {
                 1 + leaf_of[&v]
@@ -705,8 +699,8 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
         let steps: Vec<FusedStep> = chain
             .iter()
             .map(|&c| FusedStep {
-                op: to_fused_op(&g.eqns[c].op),
-                inputs: g.eqns[c]
+                op: to_fused_op(&g.eqns()[c].op),
+                inputs: g.eqns()[c]
                     .inputs
                     .iter()
                     .map(|operand| match operand {
@@ -735,7 +729,7 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
             })
             .collect();
         // The fused equation must type exactly as the chain's last equation did.
-        if op.infer(&operand_types).as_ref() != Ok(g.aval(g.eqns[root].out)) {
+        if op.infer(&operand_types).as_ref() != Ok(g.aval(g.eqns()[root].out)) {
             continue;
         }
         fused_at.insert(
@@ -743,8 +737,8 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
             Eqn {
                 op,
                 inputs,
-                out: g.eqns[root].out,
-                layer: g.eqns[root].layer,
+                out: g.eqns()[root].out,
+                layer: g.eqns()[root].layer,
             },
         );
         absorbed.insert(h);
@@ -752,20 +746,20 @@ pub fn fuse_contraction_epilogues<V: ValidationChannel>(
         absorbed.extend(folded);
     }
     let eqns = g
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .filter(|(e, _)| !absorbed.contains(e))
         .map(|(e, eqn)| fused_at.remove(&e).unwrap_or_else(|| eqn.clone()))
         .collect();
-    Graph { eqns, ..g.clone() }
+    with_eqns(g, eqns)
 }
 
 /// The [`ContractionHead`] of `eqn` when it is a contraction an epilogue can follow: a `MatMul` whose operands
 /// and result share one float dtype (a mixed-dtype matmul is the tensor-core and decode-GEMV arms' contract), an
 /// `IndexedMatMul` of one float dtype (the routed expert matmul, whose gate weighting is the epilogue), a
 /// `DenseContraction`, or a plain (`Blocks(1)`) or indexed `PackedContraction`.
-fn epilogue_head<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> Option<ContractionHead> {
+fn epilogue_head(g: &Graph, eqn: &Eqn) -> Option<ContractionHead> {
     match &eqn.op {
         OpKind::DenseContraction { weight } => Some(ContractionHead::Dense { weight: *weight }),
         // A plain (`Blocks(1)`) or indexed contraction: the packed Gemv carries an epilogue, the tiled one does not
@@ -803,7 +797,7 @@ fn epilogue_head<V: ValidationChannel>(g: &Graph<V>, eqn: &Eqn) -> Option<Contra
 
 /// Whether `step` can follow a contraction head of type `head_ty` inside an epilogue: a float pointwise
 /// equation with the head's shape and dtype, so every step's operands broadcast into the head's output.
-fn is_epilogue_step<V: ValidationChannel>(g: &Graph<V>, step: &Eqn, head_ty: &TensorType) -> bool {
+fn is_epilogue_step(g: &Graph, step: &Eqn, head_ty: &TensorType) -> bool {
     let out = g.aval(step.out);
     is_fusable(g, step)
         && out == head_ty
@@ -817,16 +811,16 @@ fn is_float(dtype: DType) -> bool {
     matches!(dtype, DType::F32 | DType::BF16 | DType::F16)
 }
 
-fn fuse_i32_pack_concat<V: ValidationChannel>(
-    g: &Graph<V>,
+fn fuse_i32_pack_concat(
+    g: &Graph,
     producer: &ValueTable<Option<usize>>,
     pinned: &HashSet<ValueId>,
     fused_at: &mut HashMap<usize, Eqn>,
     absorbed: &mut HashSet<usize>,
 ) {
-    let n_eqns = g.eqns.len();
-    let mut consumers: ValueTable<Vec<usize>> = ValueTable::filled(g.values.len(), Vec::new());
-    for (index, eqn) in g.eqns.iter().enumerate() {
+    let n_eqns = g.eqns().len();
+    let mut consumers: ValueTable<Vec<usize>> = ValueTable::filled(g.values().len(), Vec::new());
+    for (index, eqn) in g.eqns().iter().enumerate() {
         for input in &eqn.inputs {
             if let Operand::Value(value) = input {
                 consumers[*value].push(index);
@@ -844,16 +838,16 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
         if claimed.contains(&concat_idx) {
             continue;
         }
-        let OpKind::Concat { axis } = g.eqns[concat_idx].op else {
+        let OpKind::Concat { axis } = g.eqns()[concat_idx].op else {
             continue;
         };
-        if g.aval(g.eqns[concat_idx].out).dtype != DType::I32 {
+        if g.aval(g.eqns()[concat_idx].out).dtype != DType::I32 {
             continue;
         }
         let mut parts: Vec<ValueId> = Vec::new();
         let mut part_eqns: Vec<usize> = Vec::new();
         let mut valid = true;
-        for input in &g.eqns[concat_idx].inputs {
+        for input in &g.eqns()[concat_idx].inputs {
             let Operand::Value(value) = input else {
                 valid = false;
                 break;
@@ -864,7 +858,7 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
             };
             if claimed.contains(&producer_eqn)
                 || pinned.contains(value)
-                || !is_i32_pointwise(g, &g.eqns[producer_eqn])
+                || !is_i32_pointwise(g, &g.eqns()[producer_eqn])
             {
                 valid = false;
                 break;
@@ -891,7 +885,7 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
             ancestors[part_eqn] = true;
         }
         while let Some(current) = pending.pop() {
-            for input in &g.eqns[current].inputs {
+            for input in &g.eqns()[current].inputs {
                 let Operand::Value(value) = input else {
                     continue;
                 };
@@ -901,7 +895,7 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
                 if claimed.contains(&producer_eqn)
                     || ancestors[producer_eqn]
                     || pinned.contains(value)
-                    || !is_i32_pointwise(g, &g.eqns[producer_eqn])
+                    || !is_i32_pointwise(g, &g.eqns()[producer_eqn])
                     || !same_shape(*value, part_shape_id)
                 {
                     continue;
@@ -918,7 +912,7 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
                 if !in_region[index] {
                     continue;
                 }
-                let out = g.eqns[index].out;
+                let out = g.eqns()[index].out;
                 let escapes = consumers[out]
                     .iter()
                     .any(|&consumer| consumer != concat_idx && !in_region[consumer]);
@@ -942,8 +936,8 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
         let steps: Vec<FusedStep> = members
             .iter()
             .map(|&member| FusedStep {
-                op: to_fused_op(&g.eqns[member].op),
-                inputs: g.eqns[member]
+                op: to_fused_op(&g.eqns()[member].op),
+                inputs: g.eqns()[member]
                     .inputs
                     .iter()
                     .map(|operand| to_i32_region_operand(operand, &operand_of))
@@ -967,8 +961,8 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
                     pack,
                 }),
                 inputs: leaves.into_iter().map(Operand::Value).collect(),
-                out: g.eqns[concat_idx].out,
-                layer: g.eqns[concat_idx].layer,
+                out: g.eqns()[concat_idx].out,
+                layer: g.eqns()[concat_idx].layer,
             },
         );
         claimed.insert(concat_idx);
@@ -983,16 +977,16 @@ fn fuse_i32_pack_concat<V: ValidationChannel>(
     }
 }
 
-fn fuse_closed_i32_pointwise<V: ValidationChannel>(
-    g: &Graph<V>,
+fn fuse_closed_i32_pointwise(
+    g: &Graph,
     producer: &ValueTable<Option<usize>>,
     pinned: &HashSet<ValueId>,
     fused_at: &mut HashMap<usize, Eqn>,
     absorbed: &mut HashSet<usize>,
 ) {
-    let n_eqns = g.eqns.len();
-    let mut consumers: ValueTable<Vec<usize>> = ValueTable::filled(g.values.len(), Vec::new());
-    for (index, eqn) in g.eqns.iter().enumerate() {
+    let n_eqns = g.eqns().len();
+    let mut consumers: ValueTable<Vec<usize>> = ValueTable::filled(g.values().len(), Vec::new());
+    for (index, eqn) in g.eqns().iter().enumerate() {
         for input in &eqn.inputs {
             if let Operand::Value(value) = input {
                 consumers[*value].push(index);
@@ -1007,10 +1001,10 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
         .collect();
 
     let is_i32_root = |index: usize| -> bool {
-        if !is_i32_pointwise(g, &g.eqns[index]) {
+        if !is_i32_pointwise(g, &g.eqns()[index]) {
             return false;
         }
-        let out = g.eqns[index].out;
+        let out = g.eqns()[index].out;
         if pinned.contains(&out) {
             return true;
         }
@@ -1019,7 +1013,7 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
             return false;
         }
         uses.iter().any(|&consumer| {
-            !is_i32_pointwise(g, &g.eqns[consumer]) || !same_shape(out, g.eqns[consumer].out)
+            !is_i32_pointwise(g, &g.eqns()[consumer]) || !same_shape(out, g.eqns()[consumer].out)
         })
     };
 
@@ -1027,12 +1021,12 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
         if claimed.contains(&root) || !is_i32_root(root) {
             continue;
         }
-        let root_out = g.eqns[root].out;
+        let root_out = g.eqns()[root].out;
         let mut ancestors = vec![false; n_eqns];
         let mut pending = vec![root];
         ancestors[root] = true;
         while let Some(current) = pending.pop() {
-            for input in &g.eqns[current].inputs {
+            for input in &g.eqns()[current].inputs {
                 let Operand::Value(value) = input else {
                     continue;
                 };
@@ -1041,7 +1035,7 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
                 };
                 if claimed.contains(&producer_eqn)
                     || ancestors[producer_eqn]
-                    || !is_i32_pointwise(g, &g.eqns[producer_eqn])
+                    || !is_i32_pointwise(g, &g.eqns()[producer_eqn])
                     || !same_shape(*value, root_out)
                 {
                     continue;
@@ -1052,7 +1046,7 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
         }
         let mut in_region = ancestors.clone();
         for index in 0..n_eqns {
-            if index != root && (pinned.contains(&g.eqns[index].out) || !ancestors[index]) {
+            if index != root && (pinned.contains(&g.eqns()[index].out) || !ancestors[index]) {
                 in_region[index] = false;
             }
         }
@@ -1063,7 +1057,7 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
                 if index == root || !in_region[index] {
                     continue;
                 }
-                let out = g.eqns[index].out;
+                let out = g.eqns()[index].out;
                 if consumers[out].iter().any(|&consumer| !in_region[consumer]) {
                     in_region[index] = false;
                     changed = true;
@@ -1080,8 +1074,8 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
             .copied()
             .find(|&index| {
                 !members.iter().any(|&member| {
-                    g.eqns[member].inputs.iter().any(|operand| {
-                        matches!(operand, Operand::Value(value) if *value == g.eqns[index].out)
+                    g.eqns()[member].inputs.iter().any(|operand| {
+                        matches!(operand, Operand::Value(value) if *value == g.eqns()[index].out)
                     })
                 })
             })
@@ -1091,15 +1085,15 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
         let steps: Vec<FusedStep> = members
             .iter()
             .map(|&member| FusedStep {
-                op: to_fused_op(&g.eqns[member].op),
-                inputs: g.eqns[member]
+                op: to_fused_op(&g.eqns()[member].op),
+                inputs: g.eqns()[member]
                     .inputs
                     .iter()
                     .map(|operand| to_i32_region_operand(operand, &operand_of))
                     .collect(),
             })
             .collect();
-        let FusedOperand::Local(output) = operand_of[&g.eqns[region_root].out] else {
+        let FusedOperand::Local(output) = operand_of[&g.eqns()[region_root].out] else {
             panic!("fused I32 root must be a region local");
         };
         fused_at.insert(
@@ -1112,8 +1106,8 @@ fn fuse_closed_i32_pointwise<V: ValidationChannel>(
                     pack: Vec::new(),
                 }),
                 inputs: leaves.into_iter().map(Operand::Value).collect(),
-                out: g.eqns[region_root].out,
-                layer: g.eqns[region_root].layer,
+                out: g.eqns()[region_root].out,
+                layer: g.eqns()[region_root].layer,
             },
         );
         for &member in &members {
@@ -1136,8 +1130,12 @@ mod tests {
     use poot_graph_ir::types::TensorType;
 
     fn single_fused_region(g: &Graph) -> &FusedRegion {
-        assert_eq!(g.eqns.len(), 1, "expected exactly one surviving eqn: {g:?}");
-        match &g.eqns[0].op {
+        assert_eq!(
+            g.eqns().len(),
+            1,
+            "expected exactly one surviving eqn: {g:?}"
+        );
+        match &g.eqns()[0].op {
             OpKind::Fused(region) => region,
             other => panic!("expected one Fused region, got {other:?}"),
         }
@@ -1153,9 +1151,9 @@ mod tests {
         let g = b.unary(UnOp::Tanh, x);
         let e = b.unary(UnOp::Erf, g);
         let r = b.unary(UnOp::Recip, e);
-        let graph = b.finish(r);
+        let graph = b.finish(r).unwrap();
 
-        let fused = fuse(&graph);
+        let fused = fuse(&graph).unwrap();
         let region = single_fused_region(&fused);
         assert_eq!(
             region.steps.len(),
@@ -1195,9 +1193,9 @@ mod tests {
         let y = b.constant("y", TensorType::f32(vec![4, 8]));
         let sum = b.binary(poot_graph_ir::BinOp::Add, x, y);
         let out = poot_graph_ir::ops::silu(&b, sum);
-        let graph = b.finish(out);
+        let graph = b.finish(out).unwrap();
 
-        let fused = fuse(&graph);
+        let fused = fuse(&graph).unwrap();
         let region = single_fused_region(&fused);
         assert_eq!(
             region.steps.len(),
@@ -1217,12 +1215,11 @@ mod tests {
         let sum = b.binary(poot_graph_ir::BinOp::Add, x, y);
         let act = b.reshape(poot_graph_ir::ops::silu(&b, sum), vec![32]);
         let out = b.binary(poot_graph_ir::BinOp::Mul, act, b.reshape(sum, vec![32]));
-        let graph = b.finish(out);
+        let graph = b.finish(out).unwrap();
 
-        let fused = fuse(&graph);
-        fused.validate().expect("fused graph stays valid");
+        let fused = fuse(&graph).unwrap();
         let plain_adds = fused
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| matches!(e.op, OpKind::Binary(poot_graph_ir::BinOp::Add)))
             .count();

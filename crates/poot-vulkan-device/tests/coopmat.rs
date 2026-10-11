@@ -20,17 +20,19 @@ use poot_executor_parity::{ConstFixture, run_once};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::types::TensorType;
+use poot_graph_plan::Target;
 use poot_runtime_common::DeviceBackend;
 use poot_target::{Backend, TensorCoreSupport};
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::device_skip::open_or_skip;
+use poot_test_util::graph_fixtures::gpu_caps;
 use poot_vulkan_device::VulkanDevice;
 
 fn f16_tensor(shape: Vec<usize>, data: &[f32]) -> HostTensor {
     HostTensor::f16(
         shape,
         data.iter()
-            .map(|&x| poot_load::gguf::f32_to_f16(x))
+            .map(|&x| poot_quant::scalar::f32_to_f16(x))
             .collect(),
     )
 }
@@ -41,15 +43,17 @@ fn f16_in_f32_out_matmul_graph(m: usize, k: usize, n: usize) -> poot_graph_ir::G
     let a = builder.constant("a", TensorType::new(vec![1, m, k], DType::F16));
     let w = builder.constant("w", TensorType::new(vec![k, n], DType::F16));
     let product = builder.matmul(a, w);
-    let mut graph = builder.finish(product);
+    let graph = builder.finish(product).unwrap();
     let out = graph
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .expect("a matmul eqn")
         .out;
-    graph.values[out].aval.dtype = DType::F32;
-    graph
+    poot_test_util::graph_fixtures::derive(&graph, |draft| {
+        draft.values_mut()[out].aval.dtype = DType::F32;
+    })
+    .unwrap()
 }
 
 #[test]
@@ -58,7 +62,7 @@ fn coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan() 
         return;
     };
     let target = device.target();
-    if target.caps.tensor_core == TensorCoreSupport::None {
+    if gpu_caps(&target).tensor_core == TensorCoreSupport::None {
         eprintln!("SKIP: this device reports no cooperative-matrix hardware");
         return;
     }
@@ -67,16 +71,18 @@ fn coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan() 
 
     // The planner selects the coopmat arm for this target.
     let eqn = graph
-        .eqns
+        .eqns()
         .iter()
         .find(|e| matches!(e.op, OpKind::MatMul))
         .unwrap();
     let planned = poot_graph_plan::plan_eqn_choice(
         &graph,
         eqn,
-        Backend::SpirvVulkan,
+        &Target::Gpu {
+            backend: Backend::SpirvVulkan,
+            caps: gpu_caps(&target),
+        },
         &std::collections::HashMap::new(),
-        &target.caps,
         &poot_test_util::graph_fixtures::roomy_body_limits(),
     )
     .expect("the coopmat-eligible matmul plans on SpirvVulkan");
@@ -108,7 +114,7 @@ fn coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan() 
         .unwrap_or_else(|e| panic!("the coopmat matmul runs through the contract: {e}"));
     let got = out.as_f32().expect("the matmul output is F32");
 
-    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_load::gguf::f32_to_f16(x));
+    let round = |x: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(x));
     let ra: Vec<f32> = a_data.iter().map(|&x| round(x)).collect();
     let rw: Vec<f32> = w_data.iter().map(|&x| round(x)).collect();
     for i in 0..m {

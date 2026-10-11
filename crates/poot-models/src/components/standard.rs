@@ -21,8 +21,8 @@
 use std::cell::RefCell;
 
 use poot_graph_ir::{
-    BinOp, Builder, Graph, IndexRange, Slot, StateRole, TensorType, Traced, ValidationId,
-    ValidationOutput, ValidationOutputs, ops,
+    BinOp, Builder, EditError, Graph, IndexRange, Outputs, Slot, StateRole, TensorType, Traced,
+    ValidationId, ops,
 };
 use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
@@ -82,7 +82,7 @@ pub struct Step {
     /// The recurrent state pool's index inputs, declared by the first recurrent component.
     state_rows: RefCell<Option<StateRows>>,
     state: RefCell<Vec<(Traced, Traced)>>,
-    validations: RefCell<Vec<ValidationOutput>>,
+    validations: RefCell<Vec<(ValidationId, String, Traced)>>,
 }
 
 /// The hidden-state carry a step declared: the pooled [`StateRole::Handoff`] value `[seqs, positions,
@@ -400,18 +400,17 @@ impl Step {
     /// Declare `value`, a bounded F32 witness, as validation root `id` named `name`: the executor
     /// checks it every step before any output is read back.
     pub fn validate(&self, id: ValidationId, name: String, value: Traced) {
-        self.validations.borrow_mut().push(ValidationOutput {
-            id,
-            name,
-            value: value.id(),
-        });
+        self.validations.borrow_mut().push((id, name, value));
     }
 
     /// The step's graph: `out` plus every carried state pair, in carry order, and every declared
     /// validation root, in declaration order.
-    pub fn finish(self, b: Builder, out: Traced) -> Graph<ValidationOutputs> {
-        b.finish_with_state(out, &self.state.into_inner())
-            .with_validations(self.validations.into_inner())
+    pub fn finish(self, b: Builder, out: Traced) -> Result<Graph, EditError> {
+        let outputs = self.validations.into_inner().into_iter().fold(
+            Outputs::new(out).with_state(&self.state.into_inner()),
+            |outputs, (id, name, value)| outputs.with_witness(id, name, value),
+        );
+        b.finish(outputs)
     }
 }
 
@@ -857,7 +856,7 @@ pub(crate) mod oracle {
     use std::sync::Arc;
 
     use poot_eval::{EvalBudget, EvalOptions, Value};
-    use poot_graph_ir::{Graph, PackedSourceName, Slot, Storage, ValidationChannel, ValueId};
+    use poot_graph_ir::{Graph, PackedSourceName, Slot, Storage, ValueId};
     use poot_quant::weights::{
         DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightStore, WeightView,
     };
@@ -1088,9 +1087,9 @@ pub(crate) mod oracle {
         }
 
         /// Evaluate `g` on the oracle with this fixture's weights; see [`eval`].
-        pub(crate) fn eval<V: ValidationChannel>(
+        pub(crate) fn eval(
             &self,
-            g: &Graph<V>,
+            g: &Graph,
             consts: &[(&str, &[f32])],
             slots: &[(Slot, &[i32])],
             state: &[&[f32]],
@@ -1100,9 +1099,9 @@ pub(crate) mod oracle {
 
         /// [`Fx::eval`] with `named` slots (a [`Slot::SlotMap`]'s `"read"`/`"write"` tags) bound by
         /// their key spelling.
-        pub(crate) fn eval_named<V: ValidationChannel>(
+        pub(crate) fn eval_named(
             &self,
-            g: &Graph<V>,
+            g: &Graph,
             consts: &[(&str, &[f32])],
             slots: &[(Slot, &[i32])],
             named: &[(&str, &[i32])],
@@ -1116,8 +1115,8 @@ pub(crate) mod oracle {
     /// [`WeightId::const_name`] (packed carriers by their [`PackedSourceName`]); other consts by name
     /// from `consts`; slots by kind; state inputs in [`Graph::state`] order. Returns the output and
     /// every state output, as f32.
-    pub(crate) fn eval<V: ValidationChannel>(
-        g: &Graph<V>,
+    pub(crate) fn eval(
+        g: &Graph,
         store: &WeightStore,
         map: &WeightMap,
         consts: &[(&str, &[f32])],
@@ -1129,8 +1128,8 @@ pub(crate) mod oracle {
 
     /// [`eval`] with `named` slots: a tagged slot (`Builder::slot_named`) takes the entry whose name
     /// is its key spelling (`"slotmap.read"`) before falling back to its kind's entry.
-    pub(crate) fn eval_named<V: ValidationChannel>(
-        g: &Graph<V>,
+    pub(crate) fn eval_named(
+        g: &Graph,
         store: &WeightStore,
         map: &WeightMap,
         consts: &[(&str, &[f32])],
@@ -1146,8 +1145,8 @@ pub(crate) mod oracle {
     pub(crate) type NamedSlots<'a> = (&'a [(&'a str, &'a [i32])], &'a [(&'a str, &'a [f32])]);
 
     /// [`eval_named`] with F32 named slots as well, bound by the same key spelling.
-    pub(crate) fn eval_slots<V: ValidationChannel>(
-        g: &Graph<V>,
+    pub(crate) fn eval_slots(
+        g: &Graph,
         store: &WeightStore,
         map: &WeightMap,
         consts: &[(&str, &[f32])],
@@ -1163,13 +1162,13 @@ pub(crate) mod oracle {
             map.materialize(id, store)
                 .unwrap_or_else(|e| panic!("{id}: {e}"))
         };
-        assert_eq!(state.len(), g.state.len(), "one value per state input");
+        assert_eq!(state.len(), g.state().count(), "one value per state input");
         // One stack per packed expert-stack id, shared by every source role that names it.
         let mut stacks: HashMap<WeightId, Arc<PackedStack>> = HashMap::new();
         let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         // The harness carries every state as f32; an integer state (a token history) is exact
         // below 2^24 and is bound at its own dtype.
-        for (i, &(si, _)) in g.state.iter().enumerate() {
+        for (i, (si, _)) in g.state().enumerate() {
             let aval = g.aval(si);
             let tensor = match aval.dtype {
                 DType::I32 => HostTensor::i32(
@@ -1180,7 +1179,7 @@ pub(crate) mod oracle {
             };
             inputs.insert(si, tensor.into());
         }
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let meta = g.meta(id);
             let shape = meta.aval.shape.clone();
             let value: Value = match &meta.storage {
@@ -1356,9 +1355,8 @@ pub(crate) mod oracle {
         let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
         let g = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
         let zeros: Vec<Vec<f32>> = g
-            .state
-            .iter()
-            .map(|&(si, _)| vec![0.0; g.aval(si).numel()])
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
             .collect();
         let state: Vec<&[f32]> = if state.is_empty() { &zeros } else { state }
             .iter()
@@ -1460,7 +1458,7 @@ mod tests {
                 |b, h| super::super::linear::linear(b, h, &m, None),
                 |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
             );
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
         let mat = |id, v: &[f64]| -> Vec<f64> {
@@ -1521,8 +1519,8 @@ mod tests {
                 2,
                 |_, _, x| x,
             );
-            let g = step.finish(b, out);
-            assert_eq!(g.state.len(), 0);
+            let g = step.finish(b, out).unwrap();
+            assert_eq!(g.state().count(), 0);
             fx.eval(
                 &g,
                 &[],
@@ -1593,7 +1591,7 @@ mod tests {
                 2,
                 |_, _, x| x,
             );
-            let g = step.finish(b, out);
+            let g = step.finish(b, out).unwrap();
             let pos: Vec<i32> = (start..).take(tokens.len()).collect();
             let zeros = vec![vec![0.0; positions * w]];
             let state: Vec<&[f32]> = if state.is_empty() { &zeros } else { state }
@@ -1710,7 +1708,7 @@ mod tests {
                 |b, h| super::super::linear::linear(b, h, &m, None),
                 |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
             );
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx, NormPlacement::Post);
         let mat = |id, v: &[f64]| -> Vec<f64> {
@@ -1767,7 +1765,7 @@ mod tests {
             let step = Step::new(&b, shape);
             let out = standard_stack(&b, &step, &sw, &params, 1, |_, _, x| x);
             fx.eval(
-                &step.finish(b, out),
+                &step.finish(b, out).unwrap(),
                 &[],
                 &[(Slot::Token, &tokens), (Slot::Pos, &[0, 1])],
                 &[],
@@ -1852,7 +1850,7 @@ mod tests {
                 |b, h| super::super::linear::linear(b, h, &m, None),
                 |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
             );
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
         let mat = |id, v: &[f64]| -> Vec<f64> {
@@ -1956,7 +1954,7 @@ mod tests {
                 |b, h| super::super::linear::linear(b, h, &m, None),
                 |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
             );
-            fx.eval(&b.finish(y), &[("x", &x)], &[], &[]).0
+            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
         let mat = |id, v: &[f64]| -> Vec<f64> {
@@ -2032,7 +2030,7 @@ mod tests {
             let params = StackParams::new(NormParams::of(NormKind::Layer, eps).unwrap());
             let out = standard_stack(&b, &step, &sw, &params, 1, |_, _, x| x);
             fx.eval(
-                &step.finish(b, out),
+                &step.finish(b, out).unwrap(),
                 &[],
                 &[(Slot::Token, &tokens), (Slot::Pos, &[0, 1])],
                 &[],

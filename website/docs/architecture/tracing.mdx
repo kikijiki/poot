@@ -30,8 +30,9 @@ let o  = ops::attention_masked(b, q, k_cache, v_cache, n_rep, scale, mask);
 let ff = ops::swiglu(b, gate, up);
 ```
 
-Each helper appends primitive eqns; none of them is an opcode. `Builder::finish(out)` (or
-`finish_with_state(out, &[(state_in, state_out)])`) closes the graph.
+Each helper appends primitive eqns; none of them is an opcode. `Builder::finish(out)` closes the graph; to carry
+state or declare validation witnesses it takes `Outputs::new(out).with_state(&[(state_in, state_out)])`. A
+finished `Graph` is always well formed, and a pass changes it only through an edit that is checked again.
 
 ## From a family to a step
 
@@ -50,7 +51,7 @@ let logits = standard_stack(&b, &step, &stack, &params, layers, |b, l, x| {
         |b, input| gated_ffn(b, input.block, &layers[l].ffn),              // the feed-forward
     )
 });
-step.finish(b, logits)
+step.finish(b, logits)?
 ```
 
 `standard_stack` embeds the step's tokens, runs one `layer_scope` per layer and applies the final norm and the

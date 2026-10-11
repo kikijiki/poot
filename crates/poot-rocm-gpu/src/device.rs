@@ -23,16 +23,16 @@
 use std::sync::Arc;
 
 use poot_executor::{
-    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, MeasuredDeviceTime,
-    MemoryCounterSnapshot,
+    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind,
+    MeasuredDeviceTime, MemoryCounterSnapshot,
 };
 use poot_graph_plan::{ImportedKernel, Submission, Target};
 use poot_kernel_ir::Body;
 use poot_rocm_runtime::{
-    DispatchSpan, HsacoModule, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions,
+    DispatchSpan, HsacoModule, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions, RocmError,
 };
 use poot_runtime_common::CompiledKernel;
-use poot_target::{AmdArch, Backend, BufferStorage, ElementKind};
+use poot_target::{AmdArch, Backend, BufferStorage, ElementKind, TargetId};
 
 use crate::error::RocmGpuError;
 
@@ -228,7 +228,7 @@ impl Device for RocmDevice {
     type Error = RocmGpuError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::AmdGcn(self.arch),
             caps: self.ctx.device_caps(),
         }
@@ -276,6 +276,16 @@ impl Device for RocmDevice {
     }
 
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), RocmGpuError> {
+        // A thread-grid device: an AIE invocation has no grid to run, and its kernel was never loadable here.
+        let (threads, workgroup) = match d.launch {
+            LaunchKind::Grid { threads, workgroup } => (threads, workgroup),
+            LaunchKind::Aie(invocation) => {
+                return Err(RocmError::WrongKernelTarget {
+                    actual: TargetId::Aie(invocation.target()),
+                }
+                .into());
+            }
+        };
         let in_bufs: Vec<&RocmBuffer> = d.inputs.iter().map(|a: &Arg<'_, Self>| a.buffer).collect();
         // Card 547b: each argument's own logical element count from the plan, never
         // the bound buffer's `elem_count()` (an arena slot's buffer is sized to its largest
@@ -293,7 +303,7 @@ impl Device for RocmDevice {
         )?;
         let mut elements: Vec<ElementKind> = in_bufs.iter().map(|b| b.element()).collect();
         elements.push(d.output.buffer.element());
-        let (grid, block) = padded_launch(d.threads, d.workgroup);
+        let (grid, block) = padded_launch(threads, workgroup);
         self.push(CapturedAql {
             module: Arc::clone(&d.kernel.module),
             kernel: d.kernel.kernel.clone(),

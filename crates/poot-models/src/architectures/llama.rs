@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::chat::ChatFormat;
@@ -306,11 +306,7 @@ impl Model for Llama {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         let phase = check_embeddable_step(FAMILY, phase, shape, p.max_positions)?;
         if let Some(params) = &p.moe {
@@ -336,7 +332,7 @@ impl Model for Llama {
                 },
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 

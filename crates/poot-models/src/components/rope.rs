@@ -565,7 +565,12 @@ mod tests {
             let rows = rope_rows(&b, p, ps, cap);
             let y = apply_rope(&b, xs, &rows);
             let got = Fx::new(0)
-                .eval(&b.finish(y), &[("x", &x)], &[(Slot::Pos, &pos)], &[])
+                .eval(
+                    &b.finish(y).unwrap(),
+                    &[("x", &x)],
+                    &[(Slot::Pos, &pos)],
+                    &[],
+                )
                 .0;
             let half = rotary / 2;
             let mut want: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
@@ -607,7 +612,7 @@ mod tests {
         let y = apply_rope_sectioned(&b, p, xs, ms, cap);
         let got = Fx::new(0)
             .eval(
-                &b.finish(y),
+                &b.finish(y).unwrap(),
                 &[("x", &x)],
                 &[(Slot::MropePosition, &packed)],
                 &[],
@@ -680,7 +685,12 @@ mod tests {
             let rows = rope_rows(&b, p, ps, cap);
             let y = apply_rope(&b, xs, &rows);
             Fx::new(0)
-                .eval(&b.finish(y), &[("x", x)], &[(Slot::Pos, &pos)], &[])
+                .eval(
+                    &b.finish(y).unwrap(),
+                    &[("x", x)],
+                    &[(Slot::Pos, &pos)],
+                    &[],
+                )
                 .0
         };
         for rotary in [d, 4] {
@@ -951,7 +961,12 @@ mod tests {
                 };
                 let pos: Vec<i32> = positions.iter().chain(&positions).copied().collect();
                 Fx::new(0)
-                    .eval(&b.finish(out), &[("x", &x)], &[(Slot::Pos, &pos)], &[])
+                    .eval(
+                        &b.finish(out).unwrap(),
+                        &[("x", &x)],
+                        &[(Slot::Pos, &pos)],
+                        &[],
+                    )
                     .0
             };
             let (strided, by_pos, back) = (run(0), run(1), run(2));

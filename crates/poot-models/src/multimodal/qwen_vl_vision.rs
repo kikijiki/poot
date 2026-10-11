@@ -28,8 +28,7 @@ use std::num::NonZeroUsize;
 
 use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeTable};
 use poot_graph_ir::{
-    BinOp, Builder, ComputedConst, Graph, Scalar, Slot, TensorType, Traced, UnOp,
-    ValidationOutputs, ops,
+    BinOp, Builder, ComputedConst, Graph, Scalar, Slot, TensorType, Traced, UnOp, ops,
 };
 use poot_quant::weights::{
     AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
@@ -592,11 +591,7 @@ impl Model for Qwen25VlVision {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         if phase != Phase::Encode {
             return Err(TraceError::PhaseUnsupported {
@@ -681,7 +676,7 @@ impl Model for Qwen25VlVision {
             &self.merger_out,
             Some(&self.merger_out_bias),
         );
-        Ok(b.finish(out).with_validations(Vec::new()))
+        Ok(b.finish(out)?)
     }
 }
 

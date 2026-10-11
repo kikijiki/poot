@@ -200,7 +200,9 @@ impl ScanFixture {
         let result = b.scan(self.attrs(), &operands);
         let ids = operands.iter().map(|t| t.id()).collect();
         let output = if packed { result.packed } else { result.y };
-        let graph = b.finish_with_state(output, &[(s_in, result.s_out)]);
+        let graph = b
+            .finish(poot_graph_ir::Outputs::new(output).with_state(&[(s_in, result.s_out)]))
+            .unwrap();
         ScanGraph {
             graph,
             operands: ids,

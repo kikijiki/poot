@@ -5,17 +5,17 @@
 //! order is a different plan.
 
 use crate::CollectiveKind;
-use poot_target::Backend;
+use poot_target::{Backend, TargetId};
 
 /// Caller-assigned stable device identity. Never reordered, merged, or reassigned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId(pub u32);
 
-/// One device's stable identity, backend, and usable capacity.
+/// One device's stable identity, target, and usable capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceSpec {
     pub id: DeviceId,
-    pub backend: Backend,
+    pub target: TargetId,
     /// Usable bytes on this device, after any reserve the caller already excluded. The
     /// [`crate::multi_device::accounting`] reserve category is separate.
     pub usable_bytes: u64,
@@ -24,7 +24,7 @@ pub struct DeviceSpec {
 /// One accepted (from, to, operation) row: `from` can perform `kind` targeting `to`. A group operation
 /// (`AllReduce`/`AllGather`/`AllToAll`) needs a row for every ordered pair of participants (see
 /// [`crate::multi_device::communication::admit_communication_capability`]). Compute capability is
-/// carried by [`DeviceSpec::backend`]; every cross-device capability is a link row.
+/// carried by [`DeviceSpec::target`]; every cross-device capability is a link row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LinkCapability {
     pub from: DeviceId,
@@ -66,21 +66,21 @@ pub fn validate_topology(topology: &Topology) -> Result<(), TopologyError> {
     Ok(())
 }
 
-/// The cross-device operations `backend`'s runtime performs between two of its own devices. A link row
-/// between two devices exists only for a kind both devices' backends implement.
+/// The cross-device operations `target`'s runtime performs between two of its own devices. A link row
+/// between two devices exists only for a kind both devices' targets implement.
 ///
 /// NVIDIA's runtime has the peer-to-peer transport (point-to-point copies and the ring collectives built
 /// on it). The wgpu, ROCm and Vulkan runtimes have no cross-device transport, so a stage cut between two
 /// of their devices has nothing to carry its boundary. The match is exhaustive: a new backend states its
 /// answer here.
-pub(crate) fn backend_link_kinds(backend: Backend) -> &'static [CollectiveKind] {
-    match backend {
-        Backend::Nvptx => &[
+pub(crate) fn target_link_kinds(target: TargetId) -> &'static [CollectiveKind] {
+    match target {
+        TargetId::Gpu(Backend::Nvptx) => &[
             CollectiveKind::PointToPoint,
             CollectiveKind::AllReduce,
             CollectiveKind::AllGather,
             CollectiveKind::AllToAll,
         ],
-        Backend::SpirvVulkan | Backend::AmdGcn(_) | Backend::Aie(_) => &[],
+        TargetId::Gpu(Backend::SpirvVulkan | Backend::AmdGcn(_)) | TargetId::Aie(_) => &[],
     }
 }

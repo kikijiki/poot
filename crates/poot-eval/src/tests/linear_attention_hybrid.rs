@@ -118,7 +118,9 @@ fn linear_attention_decode_gated_fuzz_matches_recurrence() {
         );
         let gc = b.constant("g", TensorType::f32(vec![1, hq, dk, 1]));
         let (o, s_out) = linear_attention_decode_gated(&b, qc, kc, vc, n_rep, gc, s_in);
-        let g = b.finish_with_state(o, &[(s_in, s_out)]);
+        let g = b
+            .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s_in, s_out)]))
+            .unwrap();
 
         let mut state = HostTensor::f32(vec![1, hq, dk, dv], vec![0.0f32; hq * dk * dv]);
         let mut got = vec![0.0f32; l * hq * dv];
@@ -246,7 +248,9 @@ fn mamba2_ssd_decode_fuzz_matches_recurrence() {
             StateRole::Recurrent,
         );
         let (y, h_out) = mamba2_ssd_decode(&b, x, bin, cin, delta, a, dsk, h_in);
-        let g = b.finish_with_state(y, &[(h_in, h_out)]);
+        let g = b
+            .finish(poot_graph_ir::Outputs::new(y).with_state(&[(h_in, h_out)]))
+            .unwrap();
 
         let mut hstate = HostTensor::f32(vec![1, hq, n, p], vec![0.0f32; hq * n * p]);
         let mut got = vec![0.0f32; l * hq * p];
@@ -381,7 +385,9 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
             StateRole::Recurrent,
         );
         let (yd, h_outd) = mamba2_ssd_decode(&bd, xd, bind, cind, deltad, ad, dskd, h_ind);
-        let gd = bd.finish_with_state(yd, &[(h_ind, h_outd)]);
+        let gd = bd
+            .finish(poot_graph_ir::Outputs::new(yd).with_state(&[(h_ind, h_outd)]))
+            .unwrap();
 
         let mut hstate = HostTensor::f32(vec![1, hq, n, p], vec![0.0f32; hq * n * p]);
         let mut want_y = vec![0.0f32; l * hq * p]; // step-major [L,Hq,P]
@@ -446,9 +452,9 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
         let trilp = bp.constant("tr", TensorType::f32(vec![1, hq, l, l]));
         let h0p = bp.constant("h0", TensorType::f32(vec![1, hq, n, p]));
         let (yp, h_outp) = mamba2_ssd_prefill(&bp, xp, binp, cinp, deltap, ap, dskp, h0p, trilp);
-        let gy = bp.finish(yp);
-        let mut gh = gy.clone();
-        gh.output = h_outp.id();
+        let gy = bp.finish(yp).unwrap();
+        let gh = poot_test_util::graph_fixtures::derive(&gy, |draft| draft.set_result(h_outp.id()))
+            .unwrap();
 
         // Reindex the step-major generated data into head-major [Hq,L,*] for the prefill inputs.
         let mut x_hm = vec![0.0f32; hq * l * p];
@@ -570,7 +576,9 @@ fn causal_conv1d_decode_fuzz_matches_reference() {
             StateRole::Recurrent,
         );
         let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, kk);
-        let g = b.finish_with_state(out, &[(cache, new_cache)]);
+        let g = b
+            .finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, new_cache)]))
+            .unwrap();
 
         let mut cv = HostTensor::f32(vec![1, kk - 1, c], vec![0.0f32; (kk - 1) * c]);
         let mut got = vec![0.0f32; l * c];
@@ -681,7 +689,9 @@ fn causal_conv1d_decode_batch_generalizes_from_batch1() {
                 StateRole::Recurrent,
             );
             let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k);
-            let g = b.finish_with_state(out, &[(cache, new_cache)]);
+            let g = b
+                .finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, new_cache)]))
+                .unwrap();
 
             let mut cv = HostTensor::f32(vec![1, k - 1, c], init_caches[row].clone());
             let mut got = vec![vec![0.0f32; c]; l];
@@ -743,7 +753,9 @@ fn causal_conv1d_decode_batch_generalizes_from_batch1() {
         vec![b_batch, k - 1, c],
         "batched new_cache shape [B,K-1,C]"
     );
-    let g = b.finish_with_state(out, &[(cache, new_cache)]);
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, new_cache)]))
+        .unwrap();
 
     let mut cv_flat: Vec<f32> = (0..b_batch)
         .flat_map(|row| init_caches[row].clone())
@@ -834,7 +846,7 @@ fn decay_mask_from_gates_fuzz_matches_cumprod() {
         let gates = b.constant("g", TensorType::f32(vec![1, hh, 1, l]));
         let tr = b.constant("tr", TensorType::f32(vec![1, hh, l, l]));
         let m = decay_mask_from_gates(&b, gates, tr, hh, l);
-        let g = b.finish(m);
+        let g = b.finish(m).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
             gates.id(),
@@ -906,7 +918,7 @@ fn flash_prefill_matches_materialized_attention_prefill() {
                 0 => attention_prefill(&b, q, k, v, n_rep, scale, m),
                 _ => stage_flash_prefill(&b, [q, k, v, m], n_rep, scale),
             };
-            let g = b.finish(o);
+            let g = b.finish(o).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
                 q.id(),
@@ -983,7 +995,7 @@ fn flash_attention_matches_f64_reference_at_real_head_dim_and_sink_outlier() {
             0 => attention_prefill(&b, q, k, v, n_rep, scale, m),
             _ => stage_flash_prefill(&b, [q, k, v, m], n_rep, scale),
         };
-        let g = b.finish(o);
+        let g = b.finish(o).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
             q.id(),
@@ -1156,7 +1168,7 @@ fn hybrid_model_decode_loop_matches_prefill() {
         x1,
         linear(&bp, from_heads(&bp, a1, l), w1[4], None),
     );
-    let gp = bp.finish(x2);
+    let gp = bp.finish(x2).unwrap();
     let mut pin = HashMap::new();
     pin.insert(
         xp.id(),
@@ -1223,7 +1235,13 @@ fn hybrid_model_decode_loop_matches_prefill() {
             x1,
             linear(&b, from_heads(&b, a1, 1), w1d[4], None),
         );
-        let g = b.finish_with_state(x2, &[(s_in, s_out), (kc_in, kc_out), (vc_in, vc_out)]);
+        let g = b
+            .finish(poot_graph_ir::Outputs::new(x2).with_state(&[
+                (s_in, s_out),
+                (kc_in, kc_out),
+                (vc_in, vc_out),
+            ]))
+            .unwrap();
 
         let mut inp = HashMap::new();
         inp.insert(
@@ -1286,7 +1304,7 @@ fn decay_mask_from_gates_matches_reference() {
         let gates = b.constant("g", TensorType::f32(vec![1, hh, 1, l]));
         let tr = b.constant("tr", TensorType::f32(vec![1, hh, l, l]));
         let m = decay_mask_from_gates(&b, gates, tr, hh, l);
-        let g = b.finish(m);
+        let g = b.finish(m).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
             gates.id(),
@@ -1364,7 +1382,7 @@ fn gated_linear_attention_prefill_with_in_graph_mask_matches_reference() {
     let tr = b.constant("tr", TensorType::f32(vec![1, hq, l, l]));
     let mask = decay_mask_from_gates(&b, gates, tr, hq, l);
     let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
-    let g = b.finish(o);
+    let g = b.finish(o).unwrap();
     let mut inp = HashMap::new();
     inp.insert(
         q.id(),
@@ -1481,7 +1499,12 @@ fn mamba2_block_decode_loop_matches_reference() {
     let yflat = b.reshape(ygated, vec![1, 1, ch]);
     let out = linear(&b, yflat, cwout, None);
     let result = b.binary(BinOp::Add, x, out);
-    let g = b.finish_with_state(result, &[(conv_cache, conv_cache_out), (h_in, h_out)]);
+    let g = b
+        .finish(
+            poot_graph_ir::Outputs::new(result)
+                .with_state(&[(conv_cache, conv_cache_out), (h_in, h_out)]),
+        )
+        .unwrap();
 
     let bind_w = |inp: &mut HashMap<ValueId, Value>| {
         inp.insert(
@@ -1675,7 +1698,7 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
     let o = linear_attention_prefill(&bp, q, k, v, n_rep, cmask);
     let attn = linear(&bp, from_heads(&bp, o, l), cwo, None);
     let xout_p = bp.binary(BinOp::Add, xp, attn);
-    let gp = bp.finish(xout_p);
+    let gp = bp.finish(xout_p).unwrap();
     let bindw = |inp: &mut HashMap<ValueId, Value>, ids: [ValueId; 5]| {
         inp.insert(ids[0], Value::from(HostTensor::f32(vec![h], wn.clone())));
         inp.insert(
@@ -1731,7 +1754,9 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
     let (od, s_out) = scalar_decay_decode(&bd, qd_, kd_, vd_, n_rep, decay, s_in);
     let attnd = linear(&bd, from_heads(&bd, od, 1), dwo, None);
     let xout_d = bd.binary(BinOp::Add, xt, attnd);
-    let gd = bd.finish_with_state(xout_d, &[(s_in, s_out)]);
+    let gd = bd
+        .finish(poot_graph_ir::Outputs::new(xout_d).with_state(&[(s_in, s_out)]))
+        .unwrap();
 
     let mut caches = vec![HostTensor::f32(vec![1, hq, d, d], vec![0.0f32; hq * d * d])];
     let mut got = vec![0.0f32; l * h];
@@ -1745,7 +1770,7 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
             )),
         );
         bindw(&mut inp, [dwn.id(), dwq.id(), dwk.id(), dwv.id(), dwo.id()]);
-        for (ci, &(s, _)) in gd.state.iter().enumerate() {
+        for (ci, (s, _)) in gd.state().enumerate() {
             inp.insert(s, Value::from(caches[ci].clone()));
         }
         let (o_t, new) = eval(&gd, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -1796,7 +1821,9 @@ fn linear_attention_decode_loop_matches_prefill() {
     );
     let (o, s_out) = scalar_decay_decode(&b, q, k, v, n_rep, decay, s_in);
     let (qi, ki, vi) = (q.id(), k.id(), v.id());
-    let gd = b.finish_with_state(o, &[(s_in, s_out)]);
+    let gd = b
+        .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s_in, s_out)]))
+        .unwrap();
 
     // run the decode loop, carrying S; collect outputs into the prefill's [Hq, L, D_v] layout.
     let mut caches = vec![HostTensor::f32(
@@ -1818,7 +1845,7 @@ fn linear_attention_decode_loop_matches_prefill() {
         inputs.insert(qi, Value::from(HostTensor::f32(vec![1, hq, 1, dk], qt)));
         inputs.insert(ki, Value::from(HostTensor::f32(vec![1, hkv, 1, dk], kt)));
         inputs.insert(vi, Value::from(HostTensor::f32(vec![1, hkv, 1, dv], vt)));
-        for (ci, &(s, _)) in gd.state.iter().enumerate() {
+        for (ci, (s, _)) in gd.state().enumerate() {
             inputs.insert(s, Value::from(caches[ci].clone()));
         }
         let (o_t, new) = eval(&gd, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -1861,7 +1888,7 @@ fn linear_attention_decode_loop_matches_prefill() {
     let pm = bp.constant("m", TensorType::f32(vec![1, 1, l, l]));
     let po = linear_attention_prefill(&bp, pq, pk, pv, n_rep, pm);
     let (pqi, pki, pvi, pmi) = (pq.id(), pk.id(), pv.id(), pm.id());
-    let gp = bp.finish(po);
+    let gp = bp.finish(po).unwrap();
     let mut pin = HashMap::new();
     pin.insert(pqi, Value::from(HostTensor::f32(vec![1, hq, l, dk], qd)));
     pin.insert(pki, Value::from(HostTensor::f32(vec![1, hkv, l, dk], kd)));
@@ -1908,9 +1935,9 @@ fn mamba2_ssd_prefill_stays_finite_when_delta_a_underflows_the_gate() {
     let tr = b.constant("tr", TensorType::f32(vec![1, hq, l, l]));
     let h = b.constant("h0", TensorType::f32(vec![1, hq, n, p]));
     let (y, h_out) = mamba2_ssd_prefill(&b, xs, bs, cs, dl, ap, dk, h, tr);
-    let gy = b.finish(y);
-    let mut gh = gy.clone();
-    gh.output = h_out.id();
+    let gy = b.finish(y).unwrap();
+    let gh =
+        poot_test_util::graph_fixtures::derive(&gy, |draft| draft.set_result(h_out.id())).unwrap();
 
     let mut inp = HashMap::new();
     let mut put = |id, shape: Vec<usize>, data: Vec<f32>| {

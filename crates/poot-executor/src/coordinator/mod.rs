@@ -29,7 +29,6 @@ mod schedule;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_graph_ir::ValidationOutputs;
 use poot_graph_plan::multi_device::{PlanNodeId, TopologyError};
 use poot_graph_plan::{DeviceId, StageId, StagedProgram, TargetSet, TensorParallel};
 use poot_quant::weights::{WeightMap, WeightStore};
@@ -424,7 +423,7 @@ struct Plan {
 }
 
 impl<D: Device + Collectives> Coordinator<D> {
-    fn plan(&self, program: &StagedProgram<ValidationOutputs>) -> Result<Plan, ExecError> {
+    fn plan(&self, program: &StagedProgram) -> Result<Plan, ExecError> {
         if !program.sync_points().is_empty() {
             return Err(CoordinatorError::HostSync(program.sync_points().len()).into());
         }
@@ -614,7 +613,7 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<ValidationOutputs>,
+        program: &StagedProgram,
     ) -> Result<EntryId, ExecError> {
         self.check_usable()?;
         let per_rank_exe = self.executable(exe)?.per_rank.clone();
@@ -642,7 +641,7 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
             let (from_rank, to_rank) = (plan.ranks[from_stage], plan.ranks[to_stage]);
             let mut create = |rank: usize| -> Result<D::Event, ExecError> {
                 let engine = &mut self.engines[rank];
-                let backend = engine.device().target().backend;
+                let backend = engine.device().target().id();
                 engine
                     .device_mut()
                     .create_event()

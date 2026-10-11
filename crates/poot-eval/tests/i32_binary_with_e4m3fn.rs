@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use poot_eval::fp8::e4m3fn_tensor;
 use poot_eval::{EvalBudget, EvalOptions, Value};
 use poot_graph_ir::{
-    BinOp, Eqn, Graph, OpKind, Operand, Scalar, Slot, Storage, TensorType, ValueId, ValueMeta,
+    BinOp, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot, Storage, TensorType, ValueId,
+    ValueMeta,
 };
 use poot_tensor::HostTensor;
 
@@ -21,49 +22,50 @@ use poot_tensor::HostTensor;
 /// shape of `mask = lo_ok * hi_ok`). The chain shows the arm's output re-enters `env` as `Value::Host` for a
 /// second I32 equation to consume.
 fn build_graph() -> (Graph, ValueId, ValueId) {
-    let mut g = Graph::default();
+    let mut g = GraphEdit::new();
 
-    let e4m3_id = g.values.push(ValueMeta::new(
+    let e4m3_id = g.values_mut().push(ValueMeta::new(
         TensorType::new(vec![1], DType::E4M3FN),
         Storage::Const,
         Some("i32_binary_test.e4m3_dummy".to_string()),
     ));
-    g.inputs.push(e4m3_id);
-    g.consts.push(e4m3_id);
+    g.inputs_mut().push(e4m3_id);
+    g.consts_mut().push(e4m3_id);
 
-    let id_val = g.values.push(ValueMeta::new(
+    let id_val = g.values_mut().push(ValueMeta::new(
         TensorType::scalar(DType::I32),
         Storage::Slot(Slot::Token),
         None,
     ));
-    g.inputs.push(id_val);
-    g.slots.push((id_val, Slot::Token));
+    g.inputs_mut().push(id_val);
+    g.slots_mut().push((id_val, Slot::Token));
 
-    let local_row = g.values.push(ValueMeta::new(
+    let local_row = g.values_mut().push(ValueMeta::new(
         TensorType::scalar(DType::I32),
         Storage::Device,
         None,
     ));
-    g.eqns.push(Eqn {
+    g.eqns_mut().push(Eqn {
         op: OpKind::Binary(BinOp::Sub),
         inputs: vec![Operand::Value(id_val), Operand::Lit(Scalar::I32(3))],
         out: local_row,
         layer: None,
     });
 
-    let squared = g.values.push(ValueMeta::new(
+    let squared = g.values_mut().push(ValueMeta::new(
         TensorType::scalar(DType::I32),
         Storage::Device,
         None,
     ));
-    g.eqns.push(Eqn {
+    g.eqns_mut().push(Eqn {
         op: OpKind::Binary(BinOp::Mul),
         inputs: vec![Operand::Value(local_row), Operand::Value(local_row)],
         out: squared,
         layer: None,
     });
 
-    g.output = squared;
+    g.set_result(squared);
+    let g = g.commit().expect("the fixture is a well-formed graph");
     (g, e4m3_id, id_val)
 }
 

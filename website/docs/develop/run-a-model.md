@@ -76,7 +76,8 @@ library code you select the backend by wiring the matching executor crate (`poot
 tradeoffs.
 
 :::note
-NPU offload was removed. See [Develop: Backends](./index.md#backends).
+The AMD XDNA2 NPU is an experimental library device, not a serving backend. See
+[Develop: Backends](./index.md#backends).
 :::
 
 ## What runs where

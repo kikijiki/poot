@@ -833,7 +833,7 @@ fn test_kernel_with_code(data_buffers: usize, first_word: u32) -> CompiledKernel
     // refused by the schema/foreign-object check first).
     unsafe {
         CompiledKernel::new(
-            poot_target::Backend::SpirvVulkan,
+            poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
             "main",
             poot_runtime_common::KernelCode::SpirvWords(Box::new([first_word])),
             args,

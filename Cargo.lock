@@ -1810,7 +1810,6 @@ name = "poot-codegen"
 version = "0.0.0"
 dependencies = [
  "poot-kernel-ir",
- "poot-kernelgen",
  "poot-runtime-common",
  "poot-target",
  "poot-test-util",
@@ -1828,7 +1827,6 @@ dependencies = [
  "poot-load",
  "poot-models",
  "poot-quant",
- "poot-runtime-common",
  "poot-target",
  "poot-tensor",
  "poot-test-util",
@@ -1912,7 +1910,6 @@ name = "poot-graph-plan"
 version = "0.0.0"
 dependencies = [
  "blake3",
- "criterion",
  "poot-codegen",
  "poot-eval",
  "poot-executor-parity",
@@ -1958,7 +1955,6 @@ version = "0.0.0"
 dependencies = [
  "poot-codegen",
  "poot-kernel-ir",
- "poot-load",
  "poot-ptx-runtime",
  "poot-quant",
  "poot-rocm-runtime",
@@ -2029,10 +2025,12 @@ dependencies = [
 name = "poot-models"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "poot-eval",
  "poot-executor-parity",
  "poot-graph-ir",
  "poot-graph-plan",
+ "poot-kernel-ir",
  "poot-kernelgen",
  "poot-load",
  "poot-quant",
@@ -2042,6 +2040,27 @@ dependencies = [
  "poot-test-util",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "poot-npu"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "poot-codegen",
+ "poot-executor",
+ "poot-executor-parity",
+ "poot-graph-ir",
+ "poot-graph-plan",
+ "poot-kernel-ir",
+ "poot-kernelgen",
+ "poot-quant",
+ "poot-runtime-common",
+ "poot-target",
+ "poot-tensor",
+ "poot-test-util",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -2280,7 +2299,6 @@ dependencies = [
  "poot-kernel-ir",
  "poot-kernelgen",
  "poot-llm",
- "poot-load",
  "poot-models",
  "poot-quant",
  "poot-runtime-common",

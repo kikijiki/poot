@@ -70,7 +70,7 @@ fn graph_over(
         .zip(inputs)
         .map(|(traced, tensor)| (traced.id(), Value::from(tensor.clone())))
         .collect();
-    (b.finish(out), bound)
+    (b.finish(out).unwrap(), bound)
 }
 
 /// A one-equation graph holding `op` over `inputs`. A composite is compiler-only (`Builder` has no
@@ -461,7 +461,7 @@ fn prefill_composite_scores_are_charged_to_the_budget() {
     ];
     let op = OpKind::Attention(AttentionAttrs::new(1, scale, None));
     let graph = one_equation(op, &inputs);
-    let composite = graph.0.eqns[0].out;
+    let composite = graph.0.eqns()[0].out;
     let scores = hq * l * l;
     let limit = 300usize;
     assert!(hq * l * d < limit && l * l < limit && scores > limit);
@@ -515,7 +515,7 @@ fn an_error_inside_a_decomposition_names_the_composite_equation() {
         HostTensor::i32(vec![2], vec![3, 0]),
     ];
     let graph = one_equation(OpKind::Fused(region), &inputs);
-    let composite = graph.0.eqns[0].out;
+    let composite = graph.0.eqns()[0].out;
     assert_ne!(
         composite,
         ValueId::new(0),

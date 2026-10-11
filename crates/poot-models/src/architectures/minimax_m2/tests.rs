@@ -491,13 +491,12 @@ fn a_step_above_the_cache_is_a_typed_refusal() {
 }
 
 fn target_of(backend: Backend) -> Target {
-    Target {
+    Target::Gpu {
         backend,
         caps: match backend {
             Backend::SpirvVulkan => DeviceCaps::wgpu_rdna3_igpu(),
             Backend::Nvptx => DeviceCaps::ptx_default(),
             Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
-            Backend::Aie(_) => unreachable!("an AIE target has no GPU DeviceCaps"),
         },
     }
 }
@@ -511,11 +510,7 @@ fn backends() -> [Backend; 3] {
 }
 
 /// The traced and weight-bound graph of one step of `phase` at `tokens` tokens.
-fn bound_step(
-    model: &dyn Model,
-    phase: Phase,
-    tokens: usize,
-) -> poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs> {
+fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
     let shape = StepShape {
         rows: NonZeroUsize::MIN,
         tokens: NonZeroUsize::new(tokens).unwrap(),
@@ -561,9 +556,8 @@ fn compile_preserves_every_witness_lane() {
     for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
         let graph = bound_step(&*model, phase, tokens);
         let traced: Vec<(poot_graph_ir::ValidationId, String, usize)> = graph
-            .validation_outputs()
-            .iter()
-            .map(|o| (o.id, o.name.clone(), graph.aval(o.value).numel()))
+            .witnesses()
+            .map(|o| (o.id, o.name.to_owned(), graph.aval(o.value).numel()))
             .collect();
         assert!(
             traced.len() >= 3 * layers,

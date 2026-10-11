@@ -6,15 +6,32 @@ sidebar_position: 12
 
 # NPU Offload
 
-:::note[Compiles, does not execute]
-The NPU runtime and executor have been removed. No `--backend` or library execution path reaches a
-laptop NPU today, but NPU support (Intel and AMD) remains a poot objective. The compiler side exists as a
-typed target, a typed shape and argument ABI and a linked-artifact format for AMD XDNA2, and a sequential
-one-core schedule the planner can choose. Nothing runs on hardware: no executor loads these artifacts, and
-no Peano/IRON positive compile or device parity has been recorded. It does not provide usable NPU support.
+:::note[Experimental, correctness-scoped]
+The AMD XDNA2 NPU runs a narrow set of programs through the ordinary pipeline. It is not a serving
+backend and has no `--backend` option: it is a library `Device` (`poot-npu`, behind its `xdna` feature,
+built under the repository's `nix develop .#npu` shell). Intel NPUs are not supported.
 :::
 
-Before removal, poot had an experimental, opt-in NPU library path (not a serving option): Intel
-prefill through OpenVINO IR and Level Zero, and AMD XDNA2 prefill through a Peano/IRON-built xclbin
-dispatched over XRT. Those runtime paths are gone. The typed compiler artifact and ABI now exist; a
-device implementation that loads and runs them does not. It will re-enter on the single pipeline.
+## What runs
+
+The planner admits an equation for the AIE target, `poot-codegen` compiles it to a Peano core object and
+links it with IRON into an xclbin and instruction stream, the shared `Engine` loads that artifact, and
+`XdnaDevice` runs it through XRT. There is no second executor and no graph matcher.
+
+Verified on an AMD XDNA2 NPU (Strix Halo, `aie2p`):
+
+- **F32 `add`, `sub` and `mul`** over dense tensors, run as one sequential core, match the CPU oracle bit
+  for bit on integer-valued inputs and within 1e-5 on fractional ones, including activation slots and a
+  carried running-sum state, replayed over changing inputs.
+- **Tile-local limit: 64512 bytes**, measured. An add whose double-buffered FIFOs reserve exactly that runs;
+  one element more per binding is refused before linking as a typed limit.
+
+Nothing else is verified. Every other equation (unary ops, `max`, `div`, reductions, matmul, attention,
+collectives) is refused by the planner with a typed capability, and no model runs on the NPU. Performance
+is not a goal of this path: it is scalar, one core, and not competitive with the GPU backends.
+
+## Failure behavior
+
+Dispatch refusals that need no hardware (a grid launch, a stream or buffer that is not the kernel's shape
+ABI) are typed errors before XRT is touched. A run that misses its deadline is a typed error and poisons the
+device; the buffers it used stay allocated until the device is dropped.

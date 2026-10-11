@@ -15,10 +15,9 @@
 use std::collections::{HashMap, HashSet};
 
 use poot_graph_ir::analysis::{NumericalRewriteDecline, NumericalRewriteReason};
-use poot_graph_ir::error::GraphValidationError;
 #[cfg(test)]
 use poot_graph_ir::graph::StateRole;
-use poot_graph_ir::graph::{Eqn, Graph, Operand, Storage, ValidationChannel, ValueId, ValueMeta};
+use poot_graph_ir::graph::{EditError, Eqn, Graph, Operand, Storage, ValueId, ValueMeta};
 use poot_graph_ir::op::{
     BinOp, ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, OpKind, RedOp,
     RowRegion, RowStep, UnOp,
@@ -43,12 +42,20 @@ mod sharding;
 mod stage_split;
 mod widen;
 
+/// `g` with its equations replaced by `eqns`, checked through the edit API: the one way a pass that
+/// only rewrites equations produces its graph.
+pub(crate) fn with_eqns(g: &Graph, eqns: Vec<Eqn>) -> Result<Graph, EditError> {
+    let mut edit = g.edit();
+    *edit.eqns_mut() = eqns;
+    edit.commit()
+}
+
 pub(crate) use budget::GraphBudget;
 pub(crate) use legalize::refuse_oversized_constants;
 pub use legalize::{LegalizeError, legalize};
 pub(crate) use lora::apply_lora;
 pub use lora::{LoraError, LoraPlan};
-pub use sample_token_large_vocab::decompose_large_vocab_greedy;
+pub use sample_token_large_vocab::{DecomposeError, decompose_large_vocab_greedy};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use attention_match::canonicalize;
@@ -98,14 +105,11 @@ pub(crate) use dtype::transpose_is_noop;
 /// entry for pass-soundness and plan-shape tests that want the fused graph but no program; never a
 /// production path (`compile` is the pipeline, Card 626).
 #[cfg(any(test, feature = "test-support"))]
-pub fn passes_without_target<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    fuse_index_casts(&fuse_widening_casts(&fuse(&fuse_contraction_epilogues(
-        &dce(&flash_attention_capped(
-            &rope_fusion(&fold_iota(&cse(&canonicalize(g)))),
-            Some(65_535),
-        )),
-        |_, _| true,
-    ))))
+pub fn passes_without_target(g: &Graph) -> Result<Graph, EditError> {
+    let g = cse(&canonicalize(g)?)?;
+    let g = flash_attention_capped(&rope_fusion(&fold_iota(&g)?)?, Some(65_535))?;
+    let g = fuse_contraction_epilogues(&dce(&g)?, |_, _| true)?;
+    fuse_index_casts(&fuse_widening_casts(&fuse(&g)?)?)
 }
 
 #[cfg(test)]

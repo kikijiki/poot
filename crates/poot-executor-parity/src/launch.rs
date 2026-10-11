@@ -15,7 +15,7 @@ fn matmul_fixture(name: &'static str, m: usize, k: usize, n: usize) -> Fixture {
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
     let w = b.constant("w", TensorType::f32(vec![k, n]));
     let out = b.matmul(x, w);
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
@@ -72,8 +72,10 @@ fn wmma_fixture(name: &'static str, s: usize) -> Fixture {
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![s, s]));
     let w = b.constant("w", TensorType::new(vec![s, s], DType::BF16));
     let out = b.matmul(b.cast(x, DType::BF16), w);
-    let mut graph = b.finish(out);
-    graph.values[out.id()].aval.dtype = DType::F32;
+    let graph = b.finish(out).unwrap();
+    let accumulated = TensorType::new(graph.aval(out.id()).shape.clone(), DType::F32);
+    let graph =
+        poot_test_util::graph_fixtures::with_declared_type(&graph, out.id(), accumulated).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
@@ -136,8 +138,10 @@ fn wmma_batched_fixture(name: &'static str, operand: DType) -> Fixture {
         TensorType::new(vec![WMMA_BATCH, WMMA_K, WMMA_N], operand),
     );
     let out = b.matmul(b.cast(x, operand), w);
-    let mut graph = b.finish(out);
-    graph.values[out.id()].aval.dtype = DType::F32;
+    let graph = b.finish(out).unwrap();
+    let accumulated = TensorType::new(graph.aval(out.id()).shape.clone(), DType::F32);
+    let graph =
+        poot_test_util::graph_fixtures::with_declared_type(&graph, out.id(), accumulated).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2usize)
         .map(|step| {
@@ -205,7 +209,7 @@ pub fn wide_grid_fixture() -> Fixture {
         b.binary(poot_graph_ir::BinOp::Mul, x, y),
         x,
     );
-    let graph = b.finish(out);
+    let graph = b.finish(out).unwrap();
     let (kx, ky) = (
         graph.meta(x.id()).slot_key().unwrap().clone(),
         graph.meta(y.id()).slot_key().unwrap().clone(),

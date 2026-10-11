@@ -29,22 +29,73 @@ use poot_graph_ir::analysis::{
     implied_numerics, verify_pass_numerics,
 };
 use poot_graph_ir::{
-    BoundaryId, Eqn, Export, Graph, IndexRange, NoValidations, OpKind, Operand, Slot,
-    ValidationChannel, ValueId, ValueTable, value_ranges,
+    BoundaryId, EditError, Eqn, Export, Graph, IndexRange, OpKind, Operand, Slot, ValueId,
+    ValueTable, value_ranges,
 };
-use poot_target::{Backend, DeviceCaps};
+use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType;
 
-use crate::passes::{self as transform, GraphBudget, LegalizeError, PackedDequantProductionError};
+use crate::passes::{
+    self as transform, DecomposeError, GraphBudget, LegalizeError, PackedDequantProductionError,
+};
 pub use crate::passes::{LoraError, LoraPlan};
 use crate::*;
 
-/// What a graph is compiled for: the backend and the device's measured capabilities (card 522). Passes and
+/// What a graph is compiled for: the target and the device's measured capabilities (card 522). Passes and
 /// the planner read it; tracers never see it.
+///
+/// One enum, so a target's identity and its capability descriptor can never disagree: a GPU backend
+/// carries [`DeviceCaps`], an AIE target carries [`AieCaps`], and no value pairs one with the other's
+/// (POOT-1117). A consumer that needs GPU capabilities matches [`Target::Gpu`]; the planner answers a GPU-only
+/// lowering on an AIE target with [`Capability::GpuOnly`].
+///
+/// An AIE target with GPU capabilities, and a GPU target with an AIE tag, are not constructible:
+///
+/// ```compile_fail,E0308
+/// use poot_graph_plan::Target;
+/// use poot_target::{AieTargetId, DeviceCaps};
+/// let _ = Target::Aie {
+///     target: AieTargetId::Xdna2,
+///     caps: DeviceCaps::wgpu_rdna3_igpu(),
+/// };
+/// ```
+///
+/// ```compile_fail,E0308
+/// use poot_graph_plan::Target;
+/// use poot_target::{AieCaps, AieTargetId, Backend};
+/// let _ = Target::Gpu {
+///     backend: AieTargetId::Xdna2,
+///     caps: AieCaps::unmeasured(AieTargetId::Xdna2),
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Target {
-    pub backend: Backend,
-    pub caps: DeviceCaps,
+pub enum Target {
+    /// A GPU lowering backend and what its device measured.
+    Gpu { backend: Backend, caps: DeviceCaps },
+    /// An AMD XDNA target and the limits its runtime reports (unmeasured until POOT-641).
+    Aie { target: AieTargetId, caps: AieCaps },
+}
+
+impl Target {
+    /// The device memory budget its runtime measured, if it did: GPU memory for a GPU target, the host
+    /// buffer-object budget for an AIE target. `None` is unknown, never unlimited.
+    pub fn memory_budget_bytes(&self) -> Option<u64> {
+        match self {
+            Target::Gpu { caps, .. } => caps.memory_budget_bytes,
+            Target::Aie { caps, .. } => match caps.memory_budget_bytes {
+                Queried::Known(bytes) => Some(bytes),
+                Queried::Unknown => None,
+            },
+        }
+    }
+
+    /// This target's identity, without its limits.
+    pub const fn id(&self) -> TargetId {
+        match self {
+            Target::Gpu { backend, .. } => TargetId::Gpu(*backend),
+            Target::Aie { target, .. } => TargetId::Aie(*target),
+        }
+    }
 }
 
 /// Typed execution choices a caller makes for one compile. Never an environment variable.
@@ -174,6 +225,10 @@ pub enum CompileError {
     /// An `I32 -> F32` cast whose operand the graph does not prove exactly representable (POOT-726).
     #[error(transparent)]
     CastRange(Box<CastRangeError>),
+    /// A pass produced a graph the edit check refused: a defect of the pass, never of the input graph
+    /// (every `Graph` is well formed on its own).
+    #[error(transparent)]
+    Edit(Box<EditError>),
 }
 
 /// A `Cast(I32 -> F32)` whose operand is not proven inside `[-2^24, 2^24]`, the integers an `f32`
@@ -199,9 +254,9 @@ pub struct CastRangeError {
 /// Refuse every `Cast(I32 -> F32)` of `g` whose operand's proven range leaves the exact f32 integers.
 /// The device casts convert without checking, so a word past `2^24` would round silently; the oracle
 /// faults at run time on the same words, and this refuses the graph before any of them exist.
-fn refuse_unproven_i32_casts<V: ValidationChannel>(g: &Graph<V>) -> Result<(), CastRangeError> {
+fn refuse_unproven_i32_casts(g: &Graph) -> Result<(), CastRangeError> {
     let facts = value_ranges(g);
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         let (OpKind::Cast { to: DType::F32 }, [Operand::Value(operand)]) =
             (&eqn.op, eqn.inputs.as_slice())
         else {
@@ -253,6 +308,21 @@ impl From<ExpansionError> for CompileError {
     }
 }
 
+impl From<EditError> for CompileError {
+    fn from(error: EditError) -> Self {
+        CompileError::Edit(Box::new(error))
+    }
+}
+
+impl From<DecomposeError> for CompileError {
+    fn from(error: DecomposeError) -> Self {
+        match error {
+            DecomposeError::Expansion(error) => error.into(),
+            DecomposeError::Edit(error) => (*error).into(),
+        }
+    }
+}
+
 impl From<CastRangeError> for CompileError {
     fn from(error: CastRangeError) -> Self {
         CompileError::CastRange(Box::new(error))
@@ -276,8 +346,8 @@ pub struct SlotSchema {
 /// A graph compiled for one [`Target`]: the optimized graph and every decision an executor needs to load
 /// and replay it. Built only by [`compile`].
 #[derive(Debug)]
-pub struct Program<V: ValidationChannel = NoValidations> {
-    graph: Graph<V>,
+pub struct Program {
+    graph: Graph,
     /// One plan per equation of `graph`, index-aligned with `graph.eqns`.
     plans: Vec<Plan>,
     /// The kernel the planner chose for each equation, index-aligned with `plans`. The executor never
@@ -303,7 +373,7 @@ pub struct Program<V: ValidationChannel = NoValidations> {
     /// (`state_commit_from_plans`) rather than re-planning the graph a second time.
     state_commit: StateCommitPlan,
     /// The validation packet layout and source plan (ADR-0101 decision 2's validated session, Card
-    /// 546a): a zero-lane packet for a graph with no validation outputs (`NoValidations`), checked
+    /// 546a): a zero-lane packet for a graph with no validation outputs, checked
     /// by the contract before any readback the same way either way.
     validation: ValidationPacketPlan,
     /// Lifetimes and arena-slot assignment for this program's locally-computed values (Card 547b),
@@ -314,9 +384,9 @@ pub struct Program<V: ValidationChannel = NoValidations> {
     limits: CompileLimits,
 }
 
-impl<V: ValidationChannel> Program<V> {
+impl Program {
     /// The compiled graph.
-    pub fn graph(&self) -> &Graph<V> {
+    pub fn graph(&self) -> &Graph {
         &self.graph
     }
 
@@ -356,22 +426,22 @@ impl<V: ValidationChannel> Program<V> {
 
     /// Where each exported boundary lives after optimization, CSE and renumbering: the compiled
     /// graph's [`Graph::exports`]. Several boundaries may resolve to one value.
-    pub fn exports(&self) -> &[Export] {
-        &self.graph.exports
+    pub fn exports(&self) -> impl Iterator<Item = Export> + '_ {
+        self.graph.exports()
     }
 
     /// The first export that is, after planning, a view (alias, reshape, strided view) of a carried-state
     /// input, with that input: a later stage reading it would see the value the stage's own commit
     /// wrote, not the one the uncut graph reads. `None` when every export is a computed or bound value.
     pub fn export_aliasing_state(&self) -> Option<(BoundaryId, ValueId)> {
-        let mut root: ValueTable<ValueId> = self.graph.values.ids().collect();
+        let mut root: ValueTable<ValueId> = self.graph.values().ids().collect();
         for (eqn, plan) in self.planned() {
             match plan {
                 Plan::Alias(src) | Plan::View { src, .. } => root[eqn.out] = root[*src],
                 Plan::Dispatches(_) => {}
             }
         }
-        self.graph.exports.iter().find_map(|export| {
+        self.graph.exports().find_map(|export| {
             let source = root[export.value];
             (self.graph.meta(source).storage == poot_graph_ir::Storage::State)
                 .then_some((export.id, source))
@@ -383,7 +453,7 @@ impl<V: ValidationChannel> Program<V> {
     pub fn boundary_input(&self, id: BoundaryId) -> Option<ValueId> {
         let key = id.slot_key();
         self.graph
-            .inputs
+            .inputs()
             .iter()
             .copied()
             .find(|&input| self.graph.meta(input).slot_key() == Some(&key))
@@ -391,7 +461,7 @@ impl<V: ValidationChannel> Program<V> {
 
     /// Each equation of [`Program::graph`] with its plan, in execution order.
     pub fn planned(&self) -> impl Iterator<Item = (&Eqn, &Plan)> {
-        self.graph.eqns.iter().zip(&self.plans)
+        self.graph.eqns().iter().zip(&self.plans)
     }
 
     /// The kernel the planner chose for `eqn`, an equation of [`Program::graph`]: a generated request, an
@@ -400,7 +470,7 @@ impl<V: ValidationChannel> Program<V> {
     pub fn kernel_choice(&self, eqn: &Eqn) -> &KernelChoice {
         let index = self
             .graph
-            .eqns
+            .eqns()
             .iter()
             .position(|candidate| candidate.out == eqn.out)
             .expect("kernel_choice: the equation belongs to this program's graph");
@@ -409,12 +479,12 @@ impl<V: ValidationChannel> Program<V> {
 
     /// Rebind every dispatch of equation `index`'s plan through `rebind`, as the executor's load-time
     /// refusal rows need a plan the planner would never emit (ADR-0113: gated, no production caller). The
-    /// new plan declares `scratch` scratch buffers and passes [`DispatchPlan::new`] like any other.
+    /// new plan declares the `scratch` buffers and passes [`DispatchPlan::new`] like any other.
     #[cfg(feature = "test-support")]
     pub fn rebind_dispatches(
         &mut self,
         index: usize,
-        scratch: usize,
+        scratch: Vec<ScratchDecl>,
         rebind: impl Fn(&Binding) -> Binding,
     ) -> Result<(), DispatchPlanError> {
         let dispatches = self.plans[index]
@@ -469,7 +539,7 @@ impl<V: ValidationChannel> Program<V> {
 /// and backend dtype retyping (Card 534a), then fusion, then `crate::plan_graph`, which makes every
 /// kernel choice (Card 557). The contraction epilogue fuse rule runs right before `fuse`.
 ///
-/// Legalization (card 523a: `legalize`, reading `target.caps` to host or split a constant the target
+/// Legalization (card 523a: `legalize`, reading the GPU target's caps to host or split a constant the target
 /// cannot allocate as one device buffer) and Card 534a's step (`poot_graph_plan::prepare_target_graph`'s
 /// guts, inlined here so every sub-pass is individually tracked and numerics-checked) join the pipeline
 /// between DCE and fusion, each its own `PassDeclaration` row like every other pass here
@@ -481,13 +551,14 @@ impl<V: ValidationChannel> Program<V> {
 /// so a table `legalize` already hosted must not still look like one to it. Card 534a's step is the one
 /// preparation every target needs before planning: no executor sequences its own copy of it any more.
 ///
-/// Every target runs every pass, in this one order, on every graph.
-pub fn compile<V: ValidationChannel>(
-    g: &Graph<V>,
+/// Every target runs every pass, in this one order, on every graph, except the GPU-limit stages (flash
+/// prefill cap, legalization, matmul dtype widening, the contraction epilogue probe and the oversized-constant
+/// re-check): they read [`DeviceCaps`], so an AIE target does not run them.
+pub fn compile(
+    g: &Graph,
     target: &Target,
     options: &CompileOptions,
-) -> Result<Program<V>, CompileError> {
-    g.validate().map_err(PlanError::from)?;
+) -> Result<Program, CompileError> {
     let budget = GraphBudget::of(&options.limits);
     budget.admit("compile input", g)?;
     // The LoRA mode transform comes first: it rewrites the traced graph, and everything after it
@@ -504,17 +575,24 @@ pub fn compile<V: ValidationChannel>(
     // rewrites it: a pass preserves the words, so its casts are the traced ones.
     refuse_unproven_i32_casts(g)?;
     let _scope = CompileScope::enter();
+    // The passes that fit a graph to a GPU's limits read its capabilities; an AIE target has none of them
+    // (no grid, no single-buffer limit, no tensor cores, no contraction lowering), so those passes are
+    // GPU stages and an AIE compile does not run them.
+    let gpu = match target {
+        Target::Gpu { backend, caps } => Some((*backend, caps)),
+        Target::Aie { .. } => None,
+    };
     // A flash prefill launches `Hq * L` workgroups on one grid axis; cap the rewrite at the target's grid so
     // the planner is never handed a launch the device cannot issue.
-    let max_prefill_groups = target.caps.max_grid[0] as usize;
+    let max_prefill_groups = gpu.map(|(_, caps)| caps.max_grid[0] as usize);
     let mut pipeline = PassPipeline::new(g, target, options.limits);
-    let (canonical, numerical_declines) = transform::canonicalize_with_declines(g);
+    let (canonical, numerical_declines) = transform::canonicalize_with_declines(g)?;
     pipeline.after_apply("canonicalize", canonical)?;
     pipeline.run("cse", transform::cse)?;
     pipeline.run("fold_iota", transform::fold_iota)?;
     pipeline.run("rope_fusion", transform::rope_fusion)?;
     pipeline.run("flash_attention_capped", |g| {
-        transform::flash_attention_capped(g, Some(max_prefill_groups))
+        transform::flash_attention_capped(g, max_prefill_groups)
     })?;
     pipeline.run("dce", transform::dce)?;
     // The two claiming passes are the only rewrites whose refusals the escape gate can mask: their
@@ -532,22 +610,26 @@ pub fn compile<V: ValidationChannel>(
     )?);
     pipeline.reject_escapes(restored)?;
     pipeline.run("fold_dense_contractions", fold_dense_contractions)?;
-    pipeline.try_run("legalize", |g| {
-        transform::legalize(g, &target.caps, &options.limits)
-    })?;
+    if let Some((_, caps)) = gpu {
+        pipeline.try_run("legalize", |g| {
+            transform::legalize(g, caps, &options.limits)
+        })?;
+    }
     pipeline.run("fold_dense_bf16_row_gathers", fold_dense_bf16_row_gathers)?;
     pipeline.reserve(
         "lower_nonlast_reduces",
         lower_nonlast_growth(pipeline.graph()),
     )?;
     pipeline.run("lower_nonlast_reduces", lower_nonlast_reduces)?;
-    pipeline.reserve(
-        "widen_mismatched_matmul_dtypes",
-        widen_growth(pipeline.graph()),
-    )?;
-    pipeline.run("widen_mismatched_matmul_dtypes", |g| {
-        widen_mismatched_matmul_dtypes(g, target.backend)
-    })?;
+    if let Some((backend, _)) = gpu {
+        pipeline.reserve(
+            "widen_mismatched_matmul_dtypes",
+            widen_growth(pipeline.graph()),
+        )?;
+        pipeline.run("widen_mismatched_matmul_dtypes", |g| {
+            widen_mismatched_matmul_dtypes(g, backend)
+        })?;
+    }
     // Card 673: admit every validation witness here, on the unfused graph. `fuse` folds a witness
     // producer chain into one `OpKind::Fused` region the structural classifier does not see through,
     // so the walk must run before it. Every backend reaches this through `compile`; a noncanonical
@@ -568,8 +650,10 @@ pub fn compile<V: ValidationChannel>(
     // lowering carries an epilogue (`epilogue_head_lowers`), so no head trades a faster schedule for it. Like
     // `fuse`.
     pipeline.run("fuse_contraction_epilogues", |g| {
-        transform::fuse_contraction_epilogues(g, |graph, head| {
-            planner::epilogue_head_lowers(graph, head, target.backend, &target.caps)
+        transform::fuse_contraction_epilogues(g, |graph, head| match gpu {
+            Some((backend, caps)) => planner::epilogue_head_lowers(graph, head, backend, caps),
+            // The planner refuses every contraction for an AIE target, so no head lowers there.
+            None => false,
         })
     })?;
     pipeline.run("fuse", transform::fuse)?;
@@ -580,10 +664,12 @@ pub fn compile<V: ValidationChannel>(
     let (graph, baseline, passes) = pipeline.finish()?;
     // `legalize` fitted every constant, but a later pass's revert of an unplannable split (`after_apply`) can
     // put an oversized one back: re-check the graph the planner receives, never trust the pass's own result.
-    transform::refuse_oversized_constants(&graph, target.caps.max_buffer_bytes)?;
+    if let Some((_, caps)) = gpu {
+        transform::refuse_oversized_constants(&graph, caps.max_buffer_bytes)?;
+    }
     let planned = plan_graph(&graph, target, &options.limits.body())?;
     let state_commit = state_commit_from_plans(&graph, &planned.plans)?;
-    let validation = device_validation::validation_packet_plan(&graph)?;
+    let validation = device_validation::validation_packet_plan(&graph);
     let buffer_plan = plan_buffers(
         &graph,
         &planned.plans,
@@ -612,20 +698,19 @@ pub fn compile<V: ValidationChannel>(
 /// The LoRA mode transform over a whole graph, validated and within `budget`. [`compile`] applies it
 /// to the graph it is handed; [`crate::compile_staged`] applies it once to the uncut graph and
 /// compiles every stage without it.
-pub(crate) fn adapt<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn adapt(
+    g: &Graph,
     plan: &LoraPlan,
     budget: &GraphBudget,
-) -> Result<Graph<V>, CompileError> {
+) -> Result<Graph, CompileError> {
     let adapted = transform::apply_lora(g, plan, budget)?;
-    adapted.validate().map_err(PlanError::from)?;
     budget.admit("apply_lora", &adapted)?;
     Ok(adapted)
 }
 
 /// The graph as it moves through the passes, with the record of the passes that changed it.
-struct PassPipeline<'t, V: ValidationChannel> {
-    graph: Graph<V>,
+struct PassPipeline<'t> {
+    graph: Graph,
     target: &'t Target,
     /// The numerics of the graph as traced: the unfused baseline every device run carries.
     baseline: NumericsProperty,
@@ -634,8 +719,8 @@ struct PassPipeline<'t, V: ValidationChannel> {
     budget: GraphBudget,
 }
 
-impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
-    fn new(g: &Graph<V>, target: &'t Target, limits: CompileLimits) -> Self {
+impl<'t> PassPipeline<'t> {
+    fn new(g: &Graph, target: &'t Target, limits: CompileLimits) -> Self {
         Self {
             graph: g.clone(),
             target,
@@ -658,7 +743,7 @@ impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
     /// The graph as the passes have rewritten it so far. Card 673's witness admission reads it
     /// immediately before `fuse`, which folds a witness producer chain into one `OpKind::Fused`
     /// region the structural classifier does not see through.
-    fn graph(&self) -> &Graph<V> {
+    fn graph(&self) -> &Graph {
         &self.graph
     }
 
@@ -669,9 +754,10 @@ impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
     fn run(
         &mut self,
         pass: &'static str,
-        apply: impl FnOnce(&Graph<V>) -> Graph<V>,
+        apply: impl FnOnce(&Graph) -> Result<Graph, EditError>,
     ) -> Result<HashMap<ValueId, Refusal>, CompileError> {
-        self.after_apply(pass, apply(&self.graph))
+        let out = apply(&self.graph)?;
+        self.after_apply(pass, out)
     }
 
     /// Like [`Self::run`], for a pass that can refuse the graph outright (`legalize`'s
@@ -680,7 +766,7 @@ impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
     fn try_run<E>(
         &mut self,
         pass: &'static str,
-        apply: impl FnOnce(&Graph<V>) -> Result<Graph<V>, E>,
+        apply: impl FnOnce(&Graph) -> Result<Graph, E>,
     ) -> Result<HashMap<ValueId, Refusal>, CompileError>
     where
         CompileError: From<E>,
@@ -696,7 +782,7 @@ impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
     fn after_apply(
         &mut self,
         pass: &'static str,
-        out: Graph<V>,
+        out: Graph,
     ) -> Result<HashMap<ValueId, Refusal>, CompileError> {
         let declaration = declaration(pass);
         self.budget.admit(pass, &out)?;
@@ -724,18 +810,16 @@ impl<'t, V: ValidationChannel> PassPipeline<'t, V> {
             Ok(()) => self
                 .after_apply("reject_packed_dequant_escapes", self.graph.clone())
                 .map(|_gate_restored| ()),
-            Err(error) => Err(
-                match escaped_value(&error).and_then(|value| restored.get(&value)) {
-                    Some(refusal) => PlanError::Refused(Box::new(refusal.clone())).into(),
-                    None => error.into(),
-                },
-            ),
+            Err(error) => Err(match restored.get(&escaped_value(&error)) {
+                Some(refusal) => PlanError::Refused(Box::new(refusal.clone())).into(),
+                None => error.into(),
+            }),
         }
     }
 
     /// The compiled graph, its baseline and the passes that changed it. Fails closed when the graph implies
     /// a looser class than the recorded passes and the baseline allow.
-    fn finish(self) -> Result<(Graph<V>, NumericsProperty, Vec<PassDeclaration>), NumericsError> {
+    fn finish(self) -> Result<(Graph, NumericsProperty, Vec<PassDeclaration>), NumericsError> {
         let recorded = recorded_numerics(self.baseline, &self.passes);
         let implied = implied_numerics(&self.graph);
         if implied > recorded {
@@ -758,9 +842,9 @@ struct Growth {
 
 /// What `lower_nonlast_reduces` can add: a non-last-axis `Reduce` becomes a transpose and a reduce, and a
 /// `keepdim` one also a reshape, so one equation and one value more, or two and two.
-fn lower_nonlast_growth<V: ValidationChannel>(g: &Graph<V>) -> Growth {
+fn lower_nonlast_growth(g: &Graph) -> Growth {
     let added = g
-        .eqns
+        .eqns()
         .iter()
         .fold(0usize, |added, eqn| match (&eqn.op, eqn.inputs.first()) {
             (OpKind::Reduce { axis, keepdim, .. }, Some(Operand::Value(input)))
@@ -778,8 +862,8 @@ fn lower_nonlast_growth<V: ValidationChannel>(g: &Graph<V>) -> Growth {
 
 /// What `widen_mismatched_matmul_dtypes` can add: one cast per widened table of a `Gather`/`Slice`, and
 /// at most two (one per operand) for a `MatMul` or `Binary`.
-fn widen_growth<V: ValidationChannel>(g: &Graph<V>) -> Growth {
-    let casts = g.eqns.iter().fold(0usize, |casts, eqn| {
+fn widen_growth(g: &Graph) -> Growth {
+    let casts = g.eqns().iter().fold(0usize, |casts, eqn| {
         casts.saturating_add(match eqn.op {
             OpKind::Gather { axis: 0 } | OpKind::Slice { .. } => 1,
             OpKind::MatMul | OpKind::Binary(_) => 2,
@@ -810,10 +894,10 @@ fn declaration(pass: &'static str) -> PassDeclaration {
 }
 
 /// Whether a pass changed the graph: an equation added, removed, retyped or rewired, or a value added.
-fn changed<V: ValidationChannel>(before: &Graph<V>, after: &Graph<V>) -> bool {
-    before.values.len() != after.values.len()
-        || before.eqns.len() != after.eqns.len()
-        || before.eqns.iter().zip(&after.eqns).any(|(a, b)| {
+fn changed(before: &Graph, after: &Graph) -> bool {
+    before.values().len() != after.values().len()
+        || before.eqns().len() != after.eqns().len()
+        || before.eqns().iter().zip(after.eqns()).any(|(a, b)| {
             a.out != b.out
                 || a.op != b.op
                 || a.inputs.len() != b.inputs.len()
@@ -833,12 +917,11 @@ fn same_operand(a: &Operand, b: &Operand) -> bool {
 }
 
 /// The `PackedDequant` output a [`PackedDequantProductionError`] names: every variant the escape gate
-/// reports carries the error context of the escaping dequant (`InvalidGraph` cannot name one). Matched
+/// reports carries the error context of the escaping dequant Matched
 /// exhaustively on purpose: a new variant forces this site to decide whether it carries an escape.
-fn escaped_value(error: &PackedDequantProductionError) -> Option<ValueId> {
+fn escaped_value(error: &PackedDequantProductionError) -> ValueId {
     use PackedDequantProductionError as Error;
     match error {
-        Error::InvalidGraph(_) => None,
         Error::PreexistingContraction { context }
         | Error::CarrierStorage { context, .. }
         | Error::CarrierIdentity { context, .. }
@@ -851,7 +934,7 @@ fn escaped_value(error: &PackedDequantProductionError) -> Option<ValueId> {
         | Error::ConsumerCount { context, .. }
         | Error::TransposePermutation { context, .. }
         | Error::Movement { context, .. }
-        | Error::Unmatched { context } => Some(context.value),
+        | Error::Unmatched { context } => context.value,
     }
 }
 
@@ -873,26 +956,26 @@ fn escaped_value(error: &PackedDequantProductionError) -> Option<ValueId> {
 /// there is the restored graph's own, not this revert's. [`PassPipeline::reject_escapes`] reports the
 /// recorded refusal when the escape gate finds one of these restored values escaping; `compile` threads
 /// the map there as a local and no other site reads it.
-fn revert_unplannable_rewrites<V: ValidationChannel>(
-    before: &Graph<V>,
-    after: Graph<V>,
+fn revert_unplannable_rewrites(
+    before: &Graph,
+    after: Graph,
     target: &Target,
     limits: &poot_kernelgen::BodyLimits,
-) -> Result<(Graph<V>, HashMap<ValueId, Refusal>), CompileError> {
+) -> Result<(Graph, HashMap<ValueId, Refusal>), CompileError> {
     let before_at: HashMap<ValueId, usize> = before
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .map(|(i, eqn)| (eqn.out, i))
         .collect();
-    let rewritten = after.eqns.iter().filter(|eqn| {
+    let rewritten = after.eqns().iter().filter(|eqn| {
         before_at
             .get(&eqn.out)
-            .is_none_or(|&i| before.eqns[i].op != eqn.op)
+            .is_none_or(|&i| before.eqns()[i].op != eqn.op)
     });
     // Probe exactly as `plan_graph` plans: with the graph's own strided views.
     // A probe stricter than the final plan would drop a rewrite the target can run.
-    let views = compute_views(&after, target.backend);
+    let views = compute_views(&after, target.id());
     let mut refused: Vec<(ValueId, Refusal)> = Vec::new();
     for eqn in rewritten {
         match plan_eqn_compiled(&after, eqn, target, &views, limits) {
@@ -905,7 +988,7 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
         return Ok((after, HashMap::new()));
     }
     if after
-        .eqns
+        .eqns()
         .iter()
         .any(|eqn| !before_at.contains_key(&eqn.out))
     {
@@ -913,7 +996,7 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
     }
 
     let after_at: HashMap<ValueId, usize> = after
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .map(|(i, eqn)| (eqn.out, i))
@@ -926,7 +1009,7 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
                 continue;
             }
             restored.insert(out, refusal.clone());
-            for operand in &before.eqns[before_at[&out]].inputs {
+            for operand in &before.eqns()[before_at[&out]].inputs {
                 if let Operand::Value(input) = operand
                     && before_at.contains_key(input)
                     && !after_at.contains_key(input)
@@ -937,21 +1020,22 @@ fn revert_unplannable_rewrites<V: ValidationChannel>(
         }
     }
     let eqns = before
-        .eqns
+        .eqns()
         .iter()
         .filter_map(|eqn| {
             if restored.contains_key(&eqn.out) {
                 Some(eqn.clone())
             } else {
-                after_at.get(&eqn.out).map(|&i| after.eqns[i].clone())
+                after_at.get(&eqn.out).map(|&i| after.eqns()[i].clone())
             }
         })
         .collect();
-    Ok((Graph { eqns, ..after }, restored))
+    Ok((crate::passes::with_eqns(&after, eqns)?, restored))
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::{gpu_caps, gpu_caps_mut};
     use poot_graph_ir::{BinOp, Builder, OpKind, RedOp, Scalar, Slot, Storage, TensorType, UnOp};
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
@@ -959,14 +1043,14 @@ mod tests {
     use super::*;
 
     fn wgpu() -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: default_caps_for(Backend::SpirvVulkan),
         }
     }
 
     fn target_for(backend: Backend) -> Target {
-        Target {
+        Target::Gpu {
             backend,
             caps: default_caps_for(backend),
         }
@@ -994,7 +1078,7 @@ mod tests {
         let scaled = b.binary(BinOp::Mul, x, s);
         let e = b.unary(UnOp::Exp, scaled);
         let out = b.binary(BinOp::Add, e, bias);
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// SC-002: the published class is the one the recorded passes imply. Fusion reassociates, so a graph
@@ -1008,7 +1092,7 @@ mod tests {
         assert!(
             program
                 .graph()
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::Fused(_))),
             "the chain is one fused region"
@@ -1018,10 +1102,7 @@ mod tests {
 
     /// The first `phase` step of the granitemoe registry fixture (two routed layers, four experts) at
     /// `tokens` tokens: the production family's own trace, not a hand-built graph.
-    fn granitemoe_step(
-        phase: poot_models::model::Phase,
-        tokens: usize,
-    ) -> poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs> {
+    fn granitemoe_step(phase: poot_models::model::Phase, tokens: usize) -> poot_graph_ir::Graph {
         granitemoe_step_and_weights(phase, tokens).0
     }
 
@@ -1030,7 +1111,7 @@ mod tests {
         phase: poot_models::model::Phase,
         tokens: usize,
     ) -> (
-        poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+        poot_graph_ir::Graph,
         poot_quant::weights::WeightMap,
         poot_quant::weights::WeightStore,
     ) {
@@ -1045,7 +1126,7 @@ mod tests {
         phase: poot_models::model::Phase,
         tokens: usize,
     ) -> (
-        poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+        poot_graph_ir::Graph,
         poot_quant::weights::WeightMap,
         poot_quant::weights::WeightStore,
     ) {
@@ -1090,7 +1171,7 @@ mod tests {
     /// The CPU oracle's output for `g` over the granitemoe fixture's weights and a fixed `tokens` prompt at
     /// positions `0..` with zeroed caches.
     fn oracle_logits(
-        g: &poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+        g: &poot_graph_ir::Graph,
         map: &poot_quant::weights::WeightMap,
         store: &poot_quant::weights::WeightStore,
         tokens: &[i32],
@@ -1108,9 +1189,8 @@ mod tests {
             ),
         ];
         let zeros: Vec<poot_tensor::HostTensor> = g
-            .state
-            .iter()
-            .map(|&(si, _)| poot_tensor::HostTensor::zeros(g.aval(si).shape.clone()))
+            .state()
+            .map(|(si, _)| poot_tensor::HostTensor::zeros(g.aval(si).shape.clone()))
             .collect();
         let (out, _) =
             poot_test_util::weight_map_oracle::eval_mapped(g, store, map, &slots, &zeros);
@@ -1118,7 +1198,7 @@ mod tests {
     }
 
     /// Whether `program` ran the pass named `pass` (it changed the graph).
-    fn ran(program: &Program<poot_graph_ir::ValidationOutputs>, pass: &str) -> bool {
+    fn ran(program: &Program, pass: &str) -> bool {
         program.passes().any(|ran| ran == pass)
     }
 
@@ -1144,14 +1224,14 @@ mod tests {
         let presets = [
             (
                 "ROCm",
-                Target {
+                Target::Gpu {
                     backend: Backend::AmdGcn(AmdArch::gfx1151()),
                     caps: DeviceCaps::rocm_default(),
                 },
             ),
             (
                 "PTX",
-                Target {
+                Target::Gpu {
                     backend: Backend::Nvptx,
                     caps: DeviceCaps::ptx_default(),
                 },
@@ -1220,7 +1300,7 @@ mod tests {
             ("gpt_oss", None),
             ("gemma4", Some("moe")),
         ];
-        let rocm = Target {
+        let rocm = Target::Gpu {
             backend: Backend::AmdGcn(AmdArch::gfx1151()),
             caps: DeviceCaps::rocm_default(),
         };
@@ -1269,14 +1349,14 @@ mod tests {
         let presets = [
             (
                 "ROCm",
-                Target {
+                Target::Gpu {
                     backend: Backend::AmdGcn(AmdArch::gfx1151()),
                     caps: DeviceCaps::rocm_default(),
                 },
             ),
             (
                 "PTX",
-                Target {
+                Target::Gpu {
                     backend: Backend::Nvptx,
                     caps: DeviceCaps::ptx_default(),
                 },
@@ -1320,13 +1400,9 @@ mod tests {
 
     /// Whether each eqn of `program` that produces the router's `[tokens, experts]` logits plans the
     /// one-thread-per-output serial kernel (`true`) or something else, the generated tiled GEMM among them.
-    fn router_choices_are_serial(
-        program: &Program<poot_graph_ir::ValidationOutputs>,
-        tokens: usize,
-        experts: usize,
-    ) -> Vec<bool> {
+    fn router_choices_are_serial(program: &Program, tokens: usize, experts: usize) -> Vec<bool> {
         let g = program.graph();
-        g.eqns
+        g.eqns()
             .iter()
             .filter(|eqn| {
                 matches!(
@@ -1361,14 +1437,14 @@ mod tests {
         for (label, target) in [
             (
                 "ROCm",
-                Target {
+                Target::Gpu {
                     backend: Backend::AmdGcn(AmdArch::gfx1151()),
                     caps: DeviceCaps::rocm_default(),
                 },
             ),
             (
                 "PTX",
-                Target {
+                Target::Gpu {
                     backend: Backend::Nvptx,
                     caps: DeviceCaps::ptx_default(),
                 },
@@ -1395,7 +1471,8 @@ mod tests {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![4, 8]));
         let out = b.reshape(x, vec![8, 4]);
-        let program = compile(&b.finish(out), &wgpu(), &REPLAY).expect("a reshape compiles");
+        let program =
+            compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY).expect("a reshape compiles");
         assert_eq!(program.passes().count(), 0);
         assert_eq!(program.reassociation_class(), Tier2Class::BitExact);
     }
@@ -1408,14 +1485,14 @@ mod tests {
         let b = Builder::new();
         let raw = b.constant("raw", TensorType::new(vec![1024, 1], DType::E4M3FN));
         let out = b.cast(raw, DType::F32);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         compile(&g, &wgpu(), &REPLAY).expect("the measured wgpu grid holds the dispatch");
 
         let mut narrow = wgpu();
-        narrow.caps.max_grid = [2, 65_535, 65_535];
+        gpu_caps_mut(&mut narrow).max_grid = [2, 65_535, 65_535];
         let refusal = refusal(compile(&g, &narrow, &REPLAY), "a two-workgroup x-grid");
         assert_eq!(refusal.eqn, out.id());
-        assert_eq!(refusal.target, Backend::SpirvVulkan);
+        assert_eq!(refusal.target, TargetId::Gpu(Backend::SpirvVulkan));
         let Capability::DispatchGridLimit {
             workgroups_x,
             limit,
@@ -1437,14 +1514,14 @@ mod tests {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![1, 8, 16, 16]));
         let out = poot_graph_ir::ops::softmax(&b, x);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         for backend in [
             Backend::SpirvVulkan,
             Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
             Backend::Nvptx,
         ] {
             let mut target = target_for(backend);
-            target.caps.max_grid = [64, 65_535, 65_535];
+            gpu_caps_mut(&mut target).max_grid = [64, 65_535, 65_535];
             let program = compile(&g, &target, &REPLAY).expect("the softmax compiles");
             let (_, plan) = program
                 .planned()
@@ -1476,13 +1553,16 @@ mod tests {
         let src = b.constant("src", TensorType::f32(vec![4, 5]));
         let index = b.constant("index", TensorType::new(vec![4], DType::I32));
         let out = b.scatter(src, index);
-        let mut g = b.finish(out);
-        let scatter_idx = g
-            .eqns
+        let traced = b.finish(out).unwrap();
+        let scatter_idx = traced
+            .eqns()
             .iter()
             .position(|eqn| matches!(eqn.op, OpKind::Scatter { .. }))
             .expect("the traced graph has one Scatter equation");
-        g.eqns[scatter_idx].op = OpKind::Scatter { axis: 1 };
+        let g = poot_test_util::graph_fixtures::derive(&traced, |draft| {
+            draft.eqns_mut()[scatter_idx].op = OpKind::Scatter { axis: 1 };
+        })
+        .unwrap();
 
         for backend in [
             Backend::SpirvVulkan,
@@ -1494,7 +1574,7 @@ mod tests {
                 &format!("{backend:?} non-axis-0 scatter"),
             );
             assert_eq!(refusal.eqn, out.id());
-            assert_eq!(refusal.target, backend);
+            assert_eq!(refusal.target, TargetId::Gpu(backend));
             assert_eq!(refusal.missing, Capability::ScatterNonZeroAxis { axis: 1 });
         }
     }
@@ -1511,7 +1591,7 @@ mod tests {
         let inverse = b.constant("inverse", TensorType::new(vec![2], DType::I32));
         let out = b.scatter_update(base, src, inverse);
         let refusal = refusal(
-            compile(&b.finish(out), &wgpu(), &REPLAY),
+            compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY),
             "E4M3FN ScatterUpdate over an f32 source",
         );
         assert_eq!(refusal.eqn, out.id());
@@ -1533,11 +1613,11 @@ mod tests {
         let scaled = b.binary(BinOp::Mul, x, s);
         let e = b.unary(UnOp::Exp, scaled);
         let out = b.binary(BinOp::Add, e, bias);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
-        let optimized = transform::fuse(&g);
+        let optimized = transform::fuse(&g).unwrap();
         let fused = optimized
-            .eqns
+            .eqns()
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Fused(_)))
             .expect("fuse fuses the chain");
@@ -1547,7 +1627,7 @@ mod tests {
                     &optimized,
                     fused,
                     Backend::SpirvVulkan,
-                    &wgpu().caps,
+                    &gpu_caps(&wgpu()),
                     &poot_test_util::graph_fixtures::roomy_body_limits()
                 ),
                 Err(PlanError::Refused(_))
@@ -1558,7 +1638,7 @@ mod tests {
         let program = compile(&g, &wgpu(), &REPLAY).expect("the decomposition plans");
         let ops: Vec<String> = program
             .graph()
-            .eqns
+            .eqns()
             .iter()
             .map(|eqn| eqn.op.name())
             .collect();
@@ -1585,13 +1665,13 @@ mod tests {
         );
         assert_eq!(
             per_eqn_plans_inside_compile() - before,
-            program.graph().eqns.len() as u64,
+            program.graph().eqns().len() as u64,
             "one plan per equation"
         );
 
         let before = per_eqn_plans_inside_compile();
         let program = compile(&pointwise_chain(), &wgpu(), &REPLAY).expect("the chain compiles");
-        assert_eq!(program.graph().eqns.len(), 1, "fusion leaves one region");
+        assert_eq!(program.graph().eqns().len(), 1, "fusion leaves one region");
         assert_eq!(
             per_eqn_plans_inside_compile() - before,
             2,
@@ -1608,9 +1688,9 @@ mod tests {
         assert_eq!(per_eqn_plans_outside_compile(), before);
         plan_eqn(
             &g,
-            &g.eqns[0],
+            &g.eqns()[0],
             Backend::SpirvVulkan,
-            &wgpu().caps,
+            &gpu_caps(&wgpu()),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
         .expect("a mul plans");
@@ -1629,7 +1709,7 @@ mod tests {
         let b = Builder::new();
         let logits = b.constant("expert_logits", TensorType::f32(vec![4, 2]));
         let gate = b.reduce(RedOp::Sum, logits, 0, false);
-        let g = b.finish(gate);
+        let g = b.finish(gate).unwrap();
 
         let inputs = HashMap::from([(
             logits.id(),
@@ -1661,7 +1741,7 @@ mod tests {
             assert!(
                 !program
                     .graph()
-                    .eqns
+                    .eqns()
                     .iter()
                     .any(|eqn| matches!(eqn.op, OpKind::Reduce { axis: 0, .. })),
                 "{name}: the axis-0 reduce must be legalized away, not left for the planner"
@@ -1697,7 +1777,7 @@ mod tests {
 
     fn wgpu_with_limit(max_buffer_bytes: u64) -> Target {
         let mut target = wgpu();
-        target.caps.max_buffer_bytes = max_buffer_bytes;
+        gpu_caps_mut(&mut target).max_buffer_bytes = max_buffer_bytes;
         target
     }
 
@@ -1712,7 +1792,7 @@ mod tests {
             TensorType::f32(vec![vocab, hidden]),
         );
         let out = b.gather_scalar(embed, 0, token);
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// `x @ w^T`, `w` an `[n, k]` named constant read through a transpose (how the tracers declare every
@@ -1725,7 +1805,7 @@ mod tests {
         let x = b.broadcast(x0, vec![1, k]);
         let w = b.constant(w_name, TensorType::f32(vec![n, k]));
         let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     fn legalize_error(result: Result<Program, CompileError>, what: &str) -> LegalizeError {
@@ -1757,14 +1837,14 @@ mod tests {
         assert!(
             !program
                 .graph()
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Gather { .. })),
             "the gather is replaced, not merely left decomposed"
         );
         let hosted = program
             .graph()
-            .inputs
+            .inputs()
             .iter()
             .find(|&&id| program.graph().meta(id).storage == Storage::Slot(Slot::TokenEmbed))
             .expect("compile's output graph declares the hosted embed input");
@@ -1786,7 +1866,7 @@ mod tests {
         assert!(
             program
                 .graph()
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Gather { .. })),
             "the dense gather stays: this target can hold the table"
@@ -1808,7 +1888,7 @@ mod tests {
         assert!(program.passes().any(|p| p == "legalize"));
         let chunk_names: Vec<String> = program
             .graph()
-            .consts
+            .consts()
             .iter()
             .filter_map(|&id| program.graph().meta(id).name.clone())
             .filter(|n| n.starts_with("big.weight.chunk"))
@@ -1821,7 +1901,7 @@ mod tests {
         assert!(
             program
                 .graph()
-                .eqns
+                .eqns()
                 .iter()
                 .any(|e| matches!(e.op, OpKind::Concat { .. })),
             "the chunks join by concat"
@@ -1861,7 +1941,7 @@ mod tests {
         };
         let dense = eval(
             &g,
-            &bind_seed(&g.inputs, &g),
+            &bind_seed(g.inputs(), &g),
             EvalOptions::new(EvalBudget::UNBOUNDED),
         )
         .unwrap()
@@ -1872,7 +1952,7 @@ mod tests {
         let gh = program.graph();
         let mut split_inputs: HashMap<ValueId, Value> = HashMap::new();
         let mut row = 0usize;
-        for &id in &gh.consts {
+        for &id in gh.consts() {
             let m = gh.meta(id);
             let name = m.name.as_deref().unwrap();
             if let Some(rest) = name.strip_prefix("w.chunk") {
@@ -1939,7 +2019,7 @@ mod tests {
         let embedded = b.cast(b.gather_scalar(w, 0, token), DType::F32);
         let x = b.reshape(embedded, vec![1, hidden]);
         let head = b.matmul(x, b.transpose(w, vec![1, 0]));
-        b.finish(head)
+        b.finish(head).unwrap()
     }
 
     /// POOT-1050: `compile` never returns a program holding a constant over `max_buffer_bytes`, whether
@@ -1954,7 +2034,7 @@ mod tests {
             Backend::Nvptx,
         ] {
             let mut target = target_for(backend);
-            target.caps.max_buffer_bytes = limit;
+            gpu_caps_mut(&mut target).max_buffer_bytes = limit;
             let g = tied_f16_head_graph(4096, 64);
             match compile(&g, &target, &REPLAY) {
                 Err(CompileError::Legalize(error)) => assert!(
@@ -1963,7 +2043,7 @@ mod tests {
                 ),
                 Ok(program) => {
                     let graph = program.graph();
-                    for &id in &graph.consts {
+                    for &id in graph.consts() {
                         let aval = graph.aval(id);
                         let bytes = aval.numel() as u64 * aval.dtype.byte_size() as u64;
                         assert!(
@@ -1991,7 +2071,7 @@ mod tests {
         );
         let out =
             poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// `compile` claims `packed_linear`'s `PackedDequant -> Transpose -> MatMul` as one planned
@@ -2088,7 +2168,7 @@ mod tests {
                 .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type))
                 .collect();
         let decoded = b.packed_dequant(&sources, descriptor);
-        let graph = b.finish(decoded);
+        let graph = b.finish(decoded).unwrap();
         match compile(&graph, &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(error)) => assert!(
                 matches!(*error, PackedDequantProductionError::GraphOutput { .. }),
@@ -2158,7 +2238,7 @@ mod tests {
             experts: MOE_EXPERTS,
         };
         let out = poot_graph_ir::ops::packed_indexed_linear(&b, x, selector, &table).unwrap();
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// SC-001 (compile half): a routed packed projection over a stacked table of every layout the engine
@@ -2234,7 +2314,7 @@ mod tests {
         };
         let table = b.concat(0, &[branch("expert.0"), branch("expert.1")]);
         let out = b.indexed_matmul(x, table, selector);
-        match compile(&b.finish(out), &wgpu(), &REPLAY) {
+        match compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(_)) => {}
             other => panic!(
                 "expected the escape gate's refusal, got {:?}",
@@ -2285,12 +2365,12 @@ mod tests {
             gathered,
             b.broadcast(b.reshape(q, vec![4, 1]), vec![4, 8]),
         );
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         let program = compile(&g, &wgpu(), &REPLAY).expect("every reader reads Slice<i32>");
         let graph = program.graph();
         let &(slot, _) = graph
-            .slots
+            .slots()
             .iter()
             .find(|&&(_, kind)| kind == Slot::Pos)
             .expect("the Pos slot survives compile");
@@ -2308,7 +2388,7 @@ mod tests {
             .expect("the cast folds into the region that adds it");
         assert!(
             !graph
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::Cast { .. })),
             "no cast equation is left to launch"
@@ -2345,12 +2425,14 @@ mod tests {
         );
         let cache = b.state_input("cache", TensorType::f32(vec![4, 8]), StateRole::Recurrent);
         let written = b.scatter_update(cache, update, idx);
-        let g = b.finish_with_state(written, &[(cache, written)]);
+        let g = b
+            .finish(poot_graph_ir::Outputs::new(written).with_state(&[(cache, written)]))
+            .unwrap();
 
         let program = compile(&g, &wgpu(), &REPLAY).expect("every reader reads Slice<i32>");
         let &(slot, _) = program
             .graph()
-            .slots
+            .slots()
             .iter()
             .find(|&&(_, kind)| kind == Slot::Pos)
             .expect("the Pos slot survives compile");
@@ -2381,7 +2463,9 @@ mod tests {
         let x = b.slot(Slot::Activation, TensorType::new(vec![2, 3], DType::I32));
         let next = b.binary(BinOp::Add, b.gather(pool, 0, read), x);
         let updated = b.scatter_update(pool, next, write);
-        let g = b.finish_with_state(next, &[(pool, updated)]);
+        let g = b
+            .finish(poot_graph_ir::Outputs::new(next).with_state(&[(pool, updated)]))
+            .unwrap();
         for backend in [
             Backend::SpirvVulkan,
             Backend::Nvptx,
@@ -2411,7 +2495,7 @@ mod tests {
         let updated = b.scatter_update(base, src, inv);
         let rows = b.cast(b.gather(updated, 0, at), DType::F32);
         let out = b.binary(BinOp::Add, rows, b.cast(src, DType::F32));
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         for backend in [
             Backend::SpirvVulkan,
             Backend::Nvptx,
@@ -2424,7 +2508,7 @@ mod tests {
 
     // POOT-726: which `I32 -> F32` casts `compile` proves exact, from value ranges alone.
 
-    fn compile_verdict<V: ValidationChannel>(g: &Graph<V>) -> Result<(), CompileError> {
+    fn compile_verdict(g: &Graph) -> Result<(), CompileError> {
         compile(g, &wgpu(), &REPLAY).map(|_| ())
     }
 
@@ -2445,7 +2529,7 @@ mod tests {
         let b = Builder::new();
         let ids = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
         let cast = b.cast(ids, DType::F32);
-        let g = b.finish(cast);
+        let g = b.finish(cast).unwrap();
         let error = refused_cast(compile_verdict(&g).unwrap_err());
         assert_eq!(
             error,
@@ -2466,7 +2550,7 @@ mod tests {
         );
         let late = b.binary_scalar(BinOp::Add, pos, Scalar::I32(1 << 24));
         let cast = b.cast(late, DType::F32);
-        let g = b.finish(cast);
+        let g = b.finish(cast).unwrap();
         let error = refused_cast(compile_verdict(&g).unwrap_err());
         assert_eq!(error.cast, cast.id());
         assert_eq!(error.operand, late.id());
@@ -2497,7 +2581,7 @@ mod tests {
             IndexRange::below(1 << 20).unwrap(),
         );
         let out = b.cast(pos, DType::F32);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         compile_verdict(&g).expect("a declared position is exact");
 
         // `ArgTopK` ids over an extent of 16.
@@ -2505,7 +2589,7 @@ mod tests {
         let scores = b.constant("scores", TensorType::f32(vec![2, 16]));
         let ids = b.arg_top_k(scores, 4);
         let out = b.cast(ids, DType::F32);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         compile_verdict(&g).expect("top-k ids are below the extent");
 
         // A guard output over an unbounded selector, and its successor (the live length).
@@ -2519,7 +2603,7 @@ mod tests {
                 guard.guarded
             };
             let out = b.cast(used, DType::F32);
-            let g = b.finish(out);
+            let g = b.finish(out).unwrap();
             compile_verdict(&g)
                 .unwrap_or_else(|error| panic!("guarded (successor {successor}): {error}"));
         }
@@ -2534,21 +2618,21 @@ mod tests {
     /// refused row compiles and this test goes red naming the row.
     #[test]
     fn compile_gives_the_cast_authority_cases_a_range_verdict() {
-        use poot_graph_ir::{ValidationId, ValidationOutput};
+        use poot_graph_ir::{Outputs, ValidationId};
 
         #[derive(Debug, PartialEq, Eq)]
         enum Verdict {
             Proved,
             Refused,
         }
-        fn verdict<V: ValidationChannel>(g: &Graph<V>) -> Verdict {
+        fn verdict(g: &Graph) -> Verdict {
             match compile_verdict(g) {
                 Ok(()) => Verdict::Proved,
                 Err(CompileError::CastRange(_)) => Verdict::Refused,
                 Err(other) => panic!("a refusal other than the cast range: {other:?}"),
             }
         }
-        fn guarded_selector(bound: usize) -> Graph<poot_graph_ir::ValidationOutputs> {
+        fn guarded_selector(bound: usize) -> Graph {
             // The `exact_i32.rs` selector chain: a Gather over an I32 weight table, the guard, the
             // selector Cast as the output, the guard's flag as the validation output.
             let b = Builder::new();
@@ -2557,12 +2641,12 @@ mod tests {
             let raw = b.gather(table, 0, indices);
             let guard = b.guard_index_bounds(raw, bound).unwrap();
             let selected = b.cast(guard.guarded, DType::F32);
-            let witness = guard.witness.id();
-            b.finish(selected).with_validations(vec![ValidationOutput {
-                id: ValidationId(3),
-                name: "route.bounds".to_owned(),
-                value: witness,
-            }])
+            b.finish(Outputs::new(selected).with_witness(
+                ValidationId(3),
+                "route.bounds",
+                guard.witness,
+            ))
+            .unwrap()
         }
 
         // (row, authority's verdict, range analysis' verdict, graph)
@@ -2574,7 +2658,7 @@ mod tests {
         let table = b.constant("table", TensorType::new(vec![3], DType::I32));
         let index = b.constant("index", TensorType::new(vec![2], DType::I32));
         let out = b.cast(b.gather(table, 0, index), DType::F32);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         rows.push((
             "host-checked selector over a weight table",
             Verdict::Proved,
@@ -2587,7 +2671,7 @@ mod tests {
         let table = b.iota_i32(3);
         let index = b.constant("index", TensorType::new(vec![2], DType::I32));
         let out = b.cast(b.gather(table, 0, index), DType::F32);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         rows.push((
             "host-checked selector over a defined table",
             Verdict::Proved,
@@ -2616,7 +2700,7 @@ mod tests {
         let raw = b.constant("raw", TensorType::new(vec![4], DType::I32));
         let flag = b.binary_scalar(BinOp::GeU, raw, Scalar::I32(4));
         let out = b.cast(flag, DType::F32);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         rows.push((
             "witness lane flag",
             Verdict::Proved,
@@ -2629,7 +2713,7 @@ mod tests {
         let left = b.constant("left", TensorType::new(vec![2], DType::I32));
         let right = b.constant("right", TensorType::new(vec![2], DType::I32));
         let out = b.cast(b.binary(BinOp::Sub, left, right), DType::F32);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
         rows.push((
             "difference of two weight words",
             Verdict::Refused,
@@ -2669,7 +2753,9 @@ mod tests {
         let gathered = b.gather(table, 0, s);
         let pos = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
         let next = b.binary_scalar(BinOp::GeU, pos, Scalar::I32(3));
-        let g = b.finish_with_state(gathered, &[(s, next)]);
+        let g = b
+            .finish(poot_graph_ir::Outputs::new(gathered).with_state(&[(s, next)]))
+            .unwrap();
         for backend in [
             Backend::SpirvVulkan,
             Backend::Nvptx,
@@ -2705,12 +2791,14 @@ mod tests {
         let cache = b.state_input("cache", TensorType::f32(vec![4, 8]), StateRole::Recurrent);
         let inverse = b.reshape(b.reshape(idx, vec![2, 2]), vec![4]);
         let written = b.scatter_update(cache, update, inverse);
-        let g = b.finish_with_state(written, &[(cache, written)]);
+        let g = b
+            .finish(poot_graph_ir::Outputs::new(written).with_state(&[(cache, written)]))
+            .unwrap();
 
         let program = compile(&g, &wgpu(), &REPLAY).expect("the slot's buffer is read as i32");
         let &(slot, _) = program
             .graph()
-            .slots
+            .slots()
             .iter()
             .find(|&&(_, kind)| kind == Slot::Pos)
             .expect("the Pos slot survives compile");
@@ -2751,7 +2839,7 @@ mod tests {
         chain: PackedChain,
         live: Option<(&str, Live)>,
     ) -> (
-        poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+        poot_graph_ir::Graph,
         Vec<(&'static str, poot_graph_ir::ValueId)>,
     ) {
         let b = Builder::new();
@@ -3057,7 +3145,7 @@ mod tests {
                 let w_t = b.transpose(dequant, vec![1, 0]);
                 b.binary(BinOp::Add, x, w_t)
             };
-            let graph = b.finish(out);
+            let graph = b.finish(out).unwrap();
             match compile(&graph, &wgpu(), &REPLAY) {
                 Err(CompileError::PackedDequant(error))
                     if matches!(*error, PackedDequantProductionError::Unmatched { .. }) => {}
@@ -3083,7 +3171,7 @@ mod tests {
         let b_t = b.transpose(dequant_b, vec![1, 0]);
         let product = b.matmul(a, b_t);
         let out = b.transpose(product, vec![1, 0]);
-        let graph = b.finish(out);
+        let graph = b.finish(out).unwrap();
         match compile(&graph, &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(error))
                 if matches!(*error, PackedDequantProductionError::Unmatched { .. }) => {}
@@ -3111,7 +3199,9 @@ mod tests {
         let transpose = b.transpose(dequant, vec![1, 0]);
         let out = b.matmul(x, transpose);
         let state_in = b.state_input("carrier.state", carrier_type, StateRole::Recurrent);
-        let graph = b.finish_with_state(out, &[(state_in, sources[0])]);
+        let graph = b
+            .finish(poot_graph_ir::Outputs::new(out).with_state(&[(state_in, sources[0])]))
+            .unwrap();
         match compile(&graph, &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(error))
                 if matches!(
@@ -3151,7 +3241,12 @@ mod tests {
             TensorType::f32(vec![2, 2]),
             StateRole::Recurrent,
         );
-        let graph = b.finish_with_state(kv_out, &[(kv_cache, kv_out), (gdn_state, gdn_state)]);
+        let graph = b
+            .finish(
+                poot_graph_ir::Outputs::new(kv_out)
+                    .with_state(&[(kv_cache, kv_out), (gdn_state, gdn_state)]),
+            )
+            .unwrap();
 
         let program = compile(&graph, &wgpu(), &REPLAY).expect("the state fixture compiles");
         let roles: std::collections::HashMap<ValueId, StateRole> = program
@@ -3190,7 +3285,7 @@ mod tests {
             embedding_descriptor(),
         )
         .unwrap();
-        b.finish(rows)
+        b.finish(rows).unwrap()
     }
 
     /// W16: `compile` claims `Gather(axis 0)` of a packed table as one planned `PackedRowGather` on
@@ -3253,7 +3348,7 @@ mod tests {
         let scaled = b.binary(BinOp::Mul, decoded, expanded_scale);
         let weight = b.transpose(scaled, vec![1, 0]);
         let y = b.matmul(x, weight);
-        b.finish(y)
+        b.finish(y).unwrap()
     }
 
     fn dense_decode_fixture() -> Graph {
@@ -3262,7 +3357,7 @@ mod tests {
         let w = b.constant("w", TensorType::f32(vec![8, 8]));
         let bias = b.constant("bias", TensorType::f32(vec![8]));
         let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
-        b.finish(y)
+        b.finish(y).unwrap()
     }
 
     fn prefill_fixture() -> Graph {
@@ -3271,7 +3366,7 @@ mod tests {
         let w = b.constant("w", TensorType::f32(vec![8, 8]));
         let bias = b.constant("bias", TensorType::f32(vec![8]));
         let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
-        b.finish(y)
+        b.finish(y).unwrap()
     }
 
     fn packed_q8_0_linear_fixture() -> Graph {
@@ -3282,7 +3377,7 @@ mod tests {
         let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, 256]));
         let weight = PackedWeight::try_new(WeightFormat::Q8_0, [64, 256]).unwrap();
         let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", weight, None, None).unwrap();
-        b.finish(y)
+        b.finish(y).unwrap()
     }
 
     /// Submission mode does not affect the compiled plans.
@@ -3328,7 +3423,7 @@ mod tests {
                 .collect();
         let table = b.packed_dequant(&sources, embedding_descriptor());
         let columns = b.gather(table, 1, ids);
-        match compile(&b.finish(columns), &wgpu(), &REPLAY) {
+        match compile(&b.finish(columns).unwrap(), &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(_)) => {}
             other => panic!(
                 "expected the escape gate's refusal, got {:?}",
@@ -3354,7 +3449,7 @@ mod tests {
             .unwrap();
         let program = fixture.compile();
         assert_eq!(
-            program.graph().consts.len(),
+            program.graph().consts().len(),
             3,
             "5 experts at 2 per buffer: ranges 0..2, 2..4, 4..5, one Q8_0 carrier each"
         );
@@ -3428,7 +3523,7 @@ mod tests {
             TensorType::new(vec![1], DType::I32),
         );
         let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
-        b.finish(y)
+        b.finish(y).unwrap()
     }
 
     /// SC-003 (card 1067), through `compile` at the real wgpu caps: 16 Q8_0 `[4096, 8192]` experts are 570 MB
@@ -3442,10 +3537,10 @@ mod tests {
     fn compile_splits_a_stack_past_the_bit_offset_range_and_refuses_one_expert_past_it() {
         let program = compile(&decode_stack_graph(16, 4096, 8192), &wgpu(), &REPLAY)
             .expect("570 MB of experts splits");
-        assert_eq!(program.graph().consts.len(), 2, "15 + 1 experts");
+        assert_eq!(program.graph().consts().len(), 2, "15 + 1 experts");
         let heights: Vec<usize> = program
             .graph()
-            .consts
+            .consts()
             .iter()
             .map(|&id| program.graph().aval(id).shape[0])
             .collect();
@@ -3489,7 +3584,7 @@ mod tests {
             );
             let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
             Self {
-                graph: b.finish(y),
+                graph: b.finish(y).unwrap(),
                 x: x.id(),
                 ids: ids.id(),
                 descriptor,
@@ -3518,7 +3613,7 @@ mod tests {
         fn legalize(&self) -> Graph {
             crate::passes::legalize(
                 &self.graph,
-                &self.two_experts().caps,
+                &gpu_caps(&self.two_experts()),
                 &CompileLimits::STANDARD,
             )
             .expect("splits the stack")
@@ -3545,10 +3640,10 @@ mod tests {
             impl Fn(&str) -> poot_quant::PackedStackComponentRef + use<>,
         ) {
             use poot_graph_ir::PackedSourceName;
-            let mut graph = split.clone();
+            let mut renames: Vec<(ValueId, String)> = Vec::new();
             let mut start = 0;
             let mut runs: HashMap<String, std::ops::Range<usize>> = HashMap::new();
-            for &id in &split.consts {
+            for &id in split.consts() {
                 let meta = split.meta(id);
                 let name = meta.name.clone().expect("a named carrier");
                 let (carrier, index) = name
@@ -3565,9 +3660,15 @@ mod tests {
                 .to_string();
                 let end = start + meta.aval.shape[0];
                 runs.insert(renamed.clone(), start..end);
-                graph.values[id].name = Some(renamed);
+                renames.push((id, renamed));
                 start = end;
             }
+            let graph = poot_test_util::graph_fixtures::derive(split, |draft| {
+                for (id, name) in &renames {
+                    draft.values_mut()[*id].name = Some(name.clone());
+                }
+            })
+            .unwrap();
             let owners = self.owners.clone();
             (graph, move |name: &str| {
                 let role = PackedSourceName::parse(name).unwrap().role();
@@ -3589,7 +3690,7 @@ mod tests {
                 .map(|i| ((i % 17) as f32 - 8.0) * 0.125)
                 .collect();
             let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-            for &id in &graph.inputs {
+            for &id in graph.inputs() {
                 let value = if id == self.x {
                     Value::from(poot_tensor::HostTensor::f32(
                         vec![11, 64],

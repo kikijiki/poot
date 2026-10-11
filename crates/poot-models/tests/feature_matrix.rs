@@ -15,7 +15,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use poot_graph_ir::{Graph, ValidationOutputs};
+use poot_graph_ir::Graph;
 use poot_graph_plan::{CompileError, Target, compile};
 use poot_models::model::{LogitRows, Phase};
 use poot_models::registry::{ConfigSource, FamilyEntry, Registry};
@@ -28,6 +28,7 @@ mod corpus;
 mod targets;
 
 use corpus::{CAP, Fixtured, fixtured};
+use poot_test_util::graph_fixtures::gpu_caps_mut;
 use targets::{RefTarget, reference_targets};
 
 const BEGIN: &str = "<!-- generated:feature-matrix:begin -->";
@@ -62,7 +63,7 @@ struct Measured {
 }
 
 /// Compile every `(shape, graph)` for `target`; the first graph `compile` does not accept is the cell.
-fn cell(graphs: &[(&'static str, Graph<ValidationOutputs>)], target: &Target) -> Cell {
+fn cell(graphs: &[(&'static str, Graph)], target: &Target) -> Cell {
     let options = targets::options();
     for (shape, graph) in graphs {
         let Err(error) = compile(graph, target, &options) else {
@@ -92,7 +93,7 @@ fn cell(graphs: &[(&'static str, Graph<ValidationOutputs>)], target: &Target) ->
 // ---- table (a): families x targets ------------------------------------------------------------
 
 /// The fixture's graphs, one per shape, traced once and compiled for every target.
-fn family_graphs(fixtured: &Fixtured) -> Vec<(&'static str, Graph<ValidationOutputs>)> {
+fn family_graphs(fixtured: &Fixtured) -> Vec<(&'static str, Graph)> {
     fixtured
         .shapes()
         .iter()
@@ -205,7 +206,7 @@ fn reference_dense() -> poot_executor_parity::dense::Dense {
 /// The reference dense checkpoint with every projection stored as a `format` payload from
 /// `poot_test_util::packed::random_payload` (`None`: left as the dense BF16 the checkpoint holds), traced
 /// for decode and prefill.
-fn format_graphs(format: Option<WeightFormat>) -> Vec<(&'static str, Graph<ValidationOutputs>)> {
+fn format_graphs(format: Option<WeightFormat>) -> Vec<(&'static str, Graph)> {
     use poot_executor_parity::weight_map::Projections;
     let dense = reference_dense();
     let base = dense.store(Projections::Bf16, poot_tensor::DType::F32, None);
@@ -545,7 +546,7 @@ fn rendering_twice_gives_identical_bytes() {
 /// A target whose workgroup memory cannot hold one attention lane.
 fn tiny_lds_target() -> RefTarget {
     let mut target = targets::preset("tiny-lds", "-", poot_target::Backend::SpirvVulkan);
-    target.target.caps.lds_bytes = 16;
+    gpu_caps_mut(&mut target.target).lds_bytes = 16;
     target
 }
 

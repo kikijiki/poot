@@ -291,7 +291,7 @@ impl Budget {
             let live = observed
                 .free_bytes
                 .map(|free| free.saturating_add(observed.held_bytes));
-            let device_budget = match (live, target.caps.memory_budget_bytes) {
+            let device_budget = match (live, target.memory_budget_bytes()) {
                 (None, _) => DeviceBudget::Unknown,
                 (Some(live), Some(ceiling)) => DeviceBudget::Known {
                     bytes: live.min(ceiling),
@@ -584,11 +584,11 @@ impl Planner {
         placement: Placement,
     ) -> Result<Self, DriverError> {
         let placed = Placed::resolve(targets.clone(), placement)?;
-        let backend = targets.devices()[0].1.backend;
+        let target = targets.devices()[0].1.id();
         Ok(Self {
             handle,
             placed,
-            kernels: SharedKernels::new(backend),
+            kernels: SharedKernels::new(target),
             pool: None,
         })
     }
@@ -875,6 +875,7 @@ impl Collectives for PlanningDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poot_test_util::graph_fixtures::gpu_caps_mut;
 
     const D0: DeviceId = DeviceId(0);
     const D1: DeviceId = DeviceId(1);
@@ -1210,11 +1211,11 @@ mod tests {
     #[test]
     fn observed_budget_is_free_plus_held_under_the_ceiling_and_unknown_without_a_live_figure() {
         let observe = |ceiling: Option<u64>, free: Option<u64>, held: u64| {
-            let mut target = Target {
+            let mut target = Target::Gpu {
                 backend: poot_target::Backend::SpirvVulkan,
                 caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
             };
-            target.caps.memory_budget_bytes = ceiling;
+            gpu_caps_mut(&mut target).memory_budget_bytes = ceiling;
             Budget::observed(
                 &Observation {
                     devices: vec![DeviceObservation {
@@ -1365,7 +1366,7 @@ mod tests {
 
         const POOL: usize = 3;
         let handle = mixtral_handle();
-        let target = Target {
+        let target = Target::Gpu {
             backend: poot_target::Backend::SpirvVulkan,
             caps: poot_target::DeviceCaps::wgpu_rdna3_igpu(),
         };

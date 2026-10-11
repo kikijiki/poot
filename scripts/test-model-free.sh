@@ -57,6 +57,7 @@ readonly gate_policy=(
   "poot-kernel-ir|host|"
   "poot-kernel-intrinsics|host|"
   "poot-kernelgen|reviewed|"
+  "poot-npu|excluded|every test dispatches on the XDNA2 NPU and builds only with the xdna feature under nix develop .#npu"
   "poot-llm|reviewed|"
   "poot-load|reviewed|"
   "poot-models|reviewed|"
@@ -343,7 +344,7 @@ print_summary() {
 lane_environment() {
   mkdir -p "$tmp_dir/tmp"
   env -u POOT_MODELS_DIR TMPDIR="$tmp_dir/tmp" POOT_MODEL_FREE_LANE=1 POOT_REQUIRE_MODELS=1 \
-    POOT_REQUIRE_WGPU=1 POOT_REQUIRE_VULKAN=1 POOT_REQUIRE_ROCM=1 POOT_REQUIRE_PTX=1 \
+    POOT_REQUIRE_WGPU=1 POOT_REQUIRE_VULKAN=1 POOT_REQUIRE_ROCM=1 POOT_REQUIRE_PTX=1 POOT_REQUIRE_NPU=1 \
     ROCR_VISIBLE_DEVICES= CUDA_VISIBLE_DEVICES= \
     VK_ICD_FILENAMES=/nonexistent VK_DRIVER_FILES=/nonexistent "$@"
 }

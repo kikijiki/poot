@@ -5,10 +5,10 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_eval::{EvalBudget, EvalError, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::{
     BinOp, Eqn, ExecutionValidationFailure, Graph, MAX_VALIDATION_PACKET_BYTES, OpKind, Operand,
-    Storage, ValidationId, ValidationOutput, ValidationOutputs, ValueId, ValueMeta, ValueTable,
+    Storage, ValidationId, ValueId, ValueMeta, ValueTable,
 };
 use poot_graph_plan::{collapse_reshape_chains, cse, dce, elide_noop_transposes, fuse};
 use poot_models::model::{LogitRows, Phase};
@@ -16,13 +16,11 @@ use poot_tensor::HostTensor;
 
 /// A tiny qwen2 decode graph: `layers` layers over a cache of `cap` positions.
 fn qwen2_decode(dense: &Dense, cap: usize) -> Graph {
-    plain(
-        dense
-            .f32_model()
-            .model
-            .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
-            .expect("the qwen2 decode traces"),
-    )
+    dense
+        .f32_model()
+        .model
+        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .expect("the qwen2 decode traces")
 }
 
 /// The qwen2 decode the transform rows run over: repeated layers, so CSE has work.
@@ -40,37 +38,35 @@ fn deep_qwen2_decode() -> Graph {
 #[test]
 fn cse_shrinks_qwen2_and_stays_valid() {
     let g = deep_qwen2_decode();
-    let c = cse(&g);
-    c.validate().expect("cse graph should validate");
+    let c = cse(&g).unwrap();
     assert!(
-        c.eqns.len() < g.eqns.len(),
+        c.eqns().len() < g.eqns().len(),
         "cse should remove eqns: {} -> {}",
-        g.eqns.len(),
-        c.eqns.len()
+        g.eqns().len(),
+        c.eqns().len()
     );
     // output type unchanged.
-    assert_eq!(c.aval(c.output).shape, g.aval(g.output).shape);
+    assert_eq!(c.aval(c.result()).shape, g.aval(g.result()).shape);
 }
 
 #[test]
 fn cse_is_idempotent_on_qwen2() {
     let g = deep_qwen2_decode();
-    let c1 = cse(&g);
-    let c2 = cse(&c1);
-    assert_eq!(c1.eqns.len(), c2.eqns.len());
+    let c1 = cse(&g).unwrap();
+    let c2 = cse(&c1).unwrap();
+    assert_eq!(c1.eqns().len(), c2.eqns().len());
 }
 
 #[test]
 fn dce_keeps_qwen2_valid() {
     let g = deep_qwen2_decode();
-    let d = dce(&g);
-    d.validate().expect("dce graph should validate");
-    assert_eq!(d.aval(d.output).shape, g.aval(g.output).shape);
+    let d = dce(&g).unwrap();
+    assert_eq!(d.aval(d.result()).shape, g.aval(g.result()).shape);
 }
 
 #[test]
 fn qwen2_value_preserving_transforms_keep_validation_bits() {
-    let mut traced = qwen2_decode(
+    let traced = qwen2_decode(
         &Dense::new(Family::Qwen2)
             .vocab(16)
             .dims(8, 16, 1)
@@ -85,7 +81,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
     // `duplicate = h - h` is a structural duplicate CSE must remap; `failing = h * h + h` is a nonzero witness through a
     // fusible chain, declared by a second graph so the reported failure pins real nonzero bits across transforms.
     let h = traced
-        .eqns
+        .eqns()
         .iter()
         .filter(|eqn| matches!(eqn.op, OpKind::MatMul | OpKind::ContractionEpilogue { .. }))
         .map(|eqn| eqn.out)
@@ -97,49 +93,66 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
         (1..=MAX_VALIDATION_PACKET_BYTES / 16).contains(&lanes),
         "four witnesses of {lanes} lanes must fit the packet"
     );
-    let mut append = |op: BinOp, left: ValueId, right: ValueId| -> ValueId {
-        let out = traced.values.push(ValueMeta::new(
-            traced.aval(h).clone(),
-            Storage::Device,
-            None,
-        ));
-        traced.eqns.push(Eqn {
-            op: OpKind::Binary(op),
-            inputs: vec![Operand::Value(left), Operand::Value(right)],
-            out,
-            layer: None,
-        });
-        out
-    };
-    let exact = append(BinOp::Sub, h, h);
-    let fused = append(BinOp::Mul, exact, h);
-    let duplicate = append(BinOp::Sub, h, h);
-    let square = append(BinOp::Mul, h, h);
-    let failing = append(BinOp::Add, square, h);
-    let declarations = |entries: &[(ValidationId, &str, ValueId)]| -> Vec<ValidationOutput> {
-        entries
-            .iter()
-            .map(|&(id, name, value)| ValidationOutput {
-                id,
-                name: name.into(),
-                value,
-            })
-            .collect()
+    let h_aval = traced.aval(h).clone();
+    let first_new = traced.values().next_id().expect("the table has room");
+    // The five new equations, appended in order; each result is the next value id.
+    let (exact, fused, duplicate, square, failing) = (
+        first_new,
+        ValueId::new(first_new.index() as u32 + 1),
+        ValueId::new(first_new.index() as u32 + 2),
+        ValueId::new(first_new.index() as u32 + 3),
+        ValueId::new(first_new.index() as u32 + 4),
+    );
+    let appended = [
+        (BinOp::Sub, h, h, exact),
+        (BinOp::Mul, exact, h, fused),
+        (BinOp::Sub, h, h, duplicate),
+        (BinOp::Mul, h, h, square),
+        (BinOp::Add, square, h, failing),
+    ];
+    let with_equations = |graph: &Graph| -> poot_graph_ir::GraphEdit {
+        let mut draft = poot_graph_ir::GraphEdit::new();
+        *draft.values_mut() = graph.values().clone();
+        *draft.inputs_mut() = graph.inputs().to_vec();
+        *draft.consts_mut() = graph.consts().to_vec();
+        *draft.slots_mut() = graph.slots().to_vec();
+        *draft.eqns_mut() = graph.eqns().to_vec();
+        draft.set_result(graph.result());
+        for (input, next) in graph.state() {
+            draft.push_state(input, next);
+        }
+        for &(op, left, right, out) in &appended {
+            let id = draft
+                .values_mut()
+                .push(ValueMeta::new(h_aval.clone(), Storage::Device, None));
+            assert_eq!(id, out, "the appended ids are consecutive");
+            draft.eqns_mut().push(Eqn {
+                op: OpKind::Binary(op),
+                inputs: vec![Operand::Value(left), Operand::Value(right)],
+                out,
+                layer: None,
+            });
+        }
+        draft
     };
     let passing = [
         (ValidationId(31), "exact", exact),
         (ValidationId(32), "fused", fused),
         (ValidationId(33), "duplicate", duplicate),
     ];
-    let failing_graph = traced.clone().with_validations(declarations(
-        &[&passing[..], &[(ValidationId(34), "failing", failing)]].concat(),
-    ));
-    failing_graph.validate().unwrap();
-    let graph = traced.with_validations(declarations(&passing));
-    graph.validate().unwrap();
+    let declare = |entries: &[(ValidationId, &str, ValueId)]| -> Graph {
+        let mut draft = with_equations(&traced);
+        for &(id, name, value) in entries {
+            draft.push_witness(id, name, value);
+        }
+        draft.commit().expect("the witnessed graph is well formed")
+    };
+    let failing_graph =
+        declare(&[&passing[..], &[(ValidationId(34), "failing", failing)]].concat());
+    let graph = declare(&passing);
 
     let inputs: HashMap<ValueId, HostTensor> = graph
-        .inputs
+        .inputs()
         .iter()
         .map(|&value| {
             let shape = graph.aval(value).shape.clone();
@@ -172,7 +185,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
         .collect();
 
     fn execution_snapshot(
-        graph: &Graph<ValidationOutputs>,
+        graph: &Graph,
         inputs: &HashMap<ValueId, HostTensor>,
     ) -> (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) {
         let inputs_v: HashMap<ValueId, Value> =
@@ -190,8 +203,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
             .map(|slot| slot.map(|v| v.into_host().expect("dense environment slot")))
             .collect();
         let packet = graph
-            .validation_outputs()
-            .iter()
+            .witnesses()
             .flat_map(|validation| {
                 environment[validation.value]
                     .as_ref()
@@ -231,7 +243,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
     }
 
     let expected = execution_snapshot(&graph, &inputs);
-    let failure = |graph: &Graph<ValidationOutputs>| -> ExecutionValidationFailure {
+    let failure = |graph: &Graph| -> ExecutionValidationFailure {
         let inputs_v: HashMap<ValueId, Value> =
             inputs.iter().map(|(&k, v)| (k, v.clone().into())).collect();
         match eval(graph, &inputs_v, EvalOptions::new(EvalBudget::UNBOUNDED)) {
@@ -246,7 +258,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
         0,
         "the failing witness must report nonzero bits"
     );
-    type Transform = fn(&Graph<ValidationOutputs>) -> Graph<ValidationOutputs>;
+    type Transform = fn(&Graph) -> Result<Graph, poot_graph_ir::EditError>;
     let transforms: [(&str, Transform); 5] = [
         ("cse", cse),
         ("dce", dce),
@@ -255,11 +267,10 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
         ("transpose elision", elide_noop_transposes),
     ];
     for (name, transform) in transforms {
-        let transformed = transform(&graph);
-        transformed.validate().unwrap();
+        let transformed = transform(&graph).unwrap();
         assert_eq!(
-            poot_test_util::graph_fixtures::validation_packet_layout(&transformed).unwrap(),
-            poot_test_util::graph_fixtures::validation_packet_layout(&graph).unwrap(),
+            poot_graph_ir::ValidationPacketLayout::for_graph(&transformed),
+            poot_graph_ir::ValidationPacketLayout::for_graph(&graph),
             "{name} changed the canonical packet layout"
         );
         assert_eq!(
@@ -268,13 +279,13 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
             "{name} changed primary values, validation bits, or state"
         );
         assert_eq!(
-            failure(&transform(&failing_graph)),
+            failure(&transform(&failing_graph).unwrap()),
             expected_failure,
             "{name} changed the reported validation failure"
         );
     }
     assert_eq!(
-        cse(&graph).validation_outputs()[2].value,
+        cse(&graph).unwrap().witnesses().nth(2).unwrap().value,
         exact,
         "CSE must remap the duplicate witness to its canonical producer"
     );

@@ -12,18 +12,19 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, RedOp, TensorType, UnOp};
 use poot_graph_plan::{
-    Capability, CompileError, CompileLimits, CompileOptions, ExpansionError, GraphResource,
-    KernelChoice, PlanError, Submission, Target, compile, decompose_large_vocab_greedy,
-    plan_eqn_choice,
+    Capability, CompileError, CompileLimits, CompileOptions, DecomposeError, ExpansionError,
+    GraphResource, KernelChoice, PlanError, Submission, Target, compile,
+    decompose_large_vocab_greedy, plan_eqn_choice,
 };
 use poot_kernelgen::{BodyLimits, BodyResource, BodyStage, KernelGenError, KernelRequest};
 use poot_target::Backend;
 use poot_test_util::device_caps::default_caps_for;
+use poot_test_util::graph_fixtures::{gpu_backend, gpu_caps};
 
 const DECOMPOSE: &str = "decompose_large_vocab_greedy";
 
 fn wgpu() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: default_caps_for(Backend::SpirvVulkan),
     }
@@ -69,7 +70,7 @@ fn greedy_over(vocab: usize) -> Graph {
     let b = Builder::new();
     let logits = b.constant("logits", TensorType::f32(vec![vocab]));
     let out = b.sample_token(SampleRule::Greedy, logits, None, None, None);
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 /// SC-001 (transform expansion): with `max_intermediate_eqns = 8` the decomposition is refused when it
@@ -102,19 +103,26 @@ fn a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it
     );
 
     let whole = decompose_large_vocab_greedy(&g, &CompileLimits::STANDARD).unwrap();
-    let n = whole.eqns.len();
+    let n = whole.eqns().len();
     assert!(n > 9, "the fixture expands past the card's limit: {n}");
     let fits = decompose_large_vocab_greedy(&g, &graph_limits(1 << 20, n)).unwrap();
-    assert_eq!(fits.eqns.len(), n, "a cap equal to the expansion admits it");
     assert_eq!(
-        decompose_large_vocab_greedy(&g, &graph_limits(1 << 20, n - 1)).unwrap_err(),
-        ExpansionError {
-            stage: DECOMPOSE,
-            resource: GraphResource::Eqns,
-            held: n - 1,
-            attempted: n,
-            limit: n - 1,
-        }
+        fits.eqns().len(),
+        n,
+        "a cap equal to the expansion admits it"
+    );
+    assert!(
+        matches!(
+            decompose_large_vocab_greedy(&g, &graph_limits(1 << 20, n - 1)).unwrap_err(),
+            DecomposeError::Expansion(error) if error == ExpansionError {
+                stage: DECOMPOSE,
+                resource: GraphResource::Eqns,
+                held: n - 1,
+                attempted: n,
+                limit: n - 1,
+            }
+        ),
+        "the cap one short of the expansion refuses it, naming the equation count"
     );
     compile(&g, &wgpu(), &options(CompileLimits::STANDARD))
         .expect("the production limits compile it");
@@ -144,13 +152,13 @@ fn the_value_table_is_capped_independently_of_the_equation_list() {
 #[test]
 fn a_traced_graph_over_the_caps_is_refused_before_any_pass_runs() {
     let g = greedy_over(16);
-    assert_eq!(g.eqns.len(), 1);
+    assert_eq!(g.eqns().len(), 1);
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![4]));
     let y = b.binary(BinOp::Add, x, x);
     let z = b.binary(BinOp::Mul, y, y);
-    let three = b.finish(z);
-    assert_eq!(three.eqns.len(), 2);
+    let three = b.finish(z).unwrap();
+    assert_eq!(three.eqns().len(), 2);
     let refusal = expansion(
         compile(&three, &wgpu(), &options(graph_limits(1 << 20, 1))),
         "compile",
@@ -177,8 +185,8 @@ fn a_pass_sized_ahead_of_time_is_refused_before_it_runs() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![4, 8]));
     let out = b.reduce(RedOp::Sum, x, 0, true);
-    let g = b.finish(out);
-    assert_eq!(g.eqns.len(), 1);
+    let g = b.finish(out).unwrap();
+    assert_eq!(g.eqns().len(), 1);
 
     let refusal = expansion(
         compile(&g, &wgpu(), &options(graph_limits(1 << 20, 2))),
@@ -208,9 +216,11 @@ fn the_dtype_widening_is_sized_before_it_runs() {
     let x = b.constant("x", TensorType::f32(vec![3, 5]));
     let w = b.constant("w", TensorType::f32(vec![5, 4]));
     let out = b.matmul(x, w);
-    let mut g = b.finish(out);
-    g.values[w.id()].aval.dtype = poot_tensor::DType::BF16;
-    assert_eq!(g.eqns.len(), 1);
+    let g = poot_test_util::graph_fixtures::derive(&b.finish(out).unwrap(), |draft| {
+        draft.values_mut()[w.id()].aval.dtype = poot_tensor::DType::BF16;
+    })
+    .unwrap();
+    assert_eq!(g.eqns().len(), 1);
 
     let refusal = expansion(
         compile(&g, &wgpu(), &options(graph_limits(1 << 20, 2))),
@@ -244,7 +254,7 @@ fn pointwise_chain(depth: usize) -> Graph {
             bias,
         );
     }
-    b.finish(v)
+    b.finish(v).unwrap()
 }
 
 fn fused_eqns(program: &poot_graph_plan::Program) -> usize {
@@ -289,9 +299,11 @@ fn a_real_fused_region_is_refused_before_it_is_generated_under_small_body_limits
         plan_eqn_choice(
             graph,
             eqn,
-            target.backend,
+            &Target::Gpu {
+                backend: gpu_backend(&target),
+                caps: gpu_caps(&target),
+            },
             &HashMap::new(),
-            &target.caps,
             limits,
         )
     };
@@ -356,7 +368,7 @@ fn a_kernel_over_the_body_limits_with_no_smaller_form_is_a_typed_planner_refusal
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![4, 8]));
     let out = b.unary(UnOp::Exp, x);
-    let g = b.finish(out);
+    let g = b.finish(out).unwrap();
     let refusal = match compile(&g, &wgpu(), &options(body_limits(2, 2))) {
         Err(CompileError::Plan(error)) => match *error {
             PlanError::Refused(refusal) => *refusal,

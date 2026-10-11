@@ -40,6 +40,9 @@ use super::suffix::{self, Head, SuffixRows};
 use super::{Driver, EntryKey, ModelRole, SlotRole, StepData, host_sample};
 use crate::core::sampler::{Sampler, TokenLogprob};
 
+#[cfg(test)]
+mod mtp_tests;
+
 /// A driver-issued sequence id, never reused while the driver lives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SeqId(NonZeroU64);
@@ -533,6 +536,14 @@ impl Driver {
             .take_while(|(held, new)| held == new)
             .count();
         let mut reused = shared.min(prompt.len() - 1);
+        // The MTP layer's cache at the last shared position was computed from the token after it,
+        // which the new prompt may not share: that position runs again, so the layer rewrites it
+        // from the target's hidden state (the private cache is this sequence's own to rewrite). A
+        // recurrent state has folded that position already and cannot step back, so it restarts
+        // from zero below.
+        if matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
+            reused = reused.saturating_sub(1);
+        }
         if residency == StateResidency::Recurrent && (reused != resident || state.state_ahead) {
             reused = 0;
         }
@@ -602,6 +613,9 @@ impl Driver {
         }
         if matches!(self.speculation.policy, DraftPolicy::DraftModel { .. }) {
             return Err(InvalidRequest::Embeds(EmbedsError::DraftModel).into());
+        }
+        if matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
+            return Err(InvalidRequest::Embeds(EmbedsError::Mtp).into());
         }
         embeds
             .check_prompt(request.prompt.len())
@@ -744,6 +758,7 @@ impl Driver {
             self.settle(seq, committed, proposed, kept);
         }
         self.roll_back(&settled)?;
+        self.mtp_catch_up(rows, &plans)?;
         Ok(results)
     }
 
@@ -759,12 +774,11 @@ impl Driver {
         plans: &mut Vec<RowPlan>,
         (head, adapter): (Option<Head>, Option<GenerationId>),
     ) -> Result<Readback, DriverError> {
+        let grouped = self.groups_rows_by_width();
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for (i, plan) in plans.iter().enumerate() {
-            let same_width = |group: &Vec<usize>| {
-                self.residency != StateResidency::Recurrent
-                    || plans[group[0]].feed.len() == plan.feed.len()
-            };
+            let same_width =
+                |group: &Vec<usize>| !grouped || plans[group[0]].feed.len() == plan.feed.len();
             match groups.iter_mut().find(|group| same_width(group)) {
                 Some(group) => group.push(i),
                 None => groups.push(vec![i]),
@@ -1054,10 +1068,13 @@ impl Driver {
     }
 
     /// Close `seq` and free its blocks. A finished sequence registers its filled prompt blocks in the
-    /// prefix cache under its adapter identity, unless the model's state is recurrent: a cached block
-    /// holds no recurrent state, so a later request reusing it would run without it.
+    /// prefix cache under its adapter identity, unless the model's state is recurrent (a cached block
+    /// holds no recurrent state, so a later request reusing it would run without it) or the driver
+    /// speculates with an MTP layer (its cache at a block's last position depends on the token after
+    /// the block, and a shared block cannot be rewritten).
     pub fn release(&mut self, seq: SeqId, mode: Release) -> Result<PrefixOutcome, DriverError> {
         let residency = self.residency;
+        let mtp = matches!(self.speculation.policy, DraftPolicy::Mtp { .. });
         let serving = self.serving.as_mut().ok_or(InvalidRequest::NotPrepared)?;
         let state = serving
             .seqs
@@ -1069,6 +1086,9 @@ impl Driver {
                 if residency == StateResidency::Recurrent {
                     cache.reset(state.slot);
                     PrefixOutcome::Skipped(PrefixSkip::RecurrentState)
+                } else if mtp {
+                    cache.reset(state.slot);
+                    PrefixOutcome::Skipped(PrefixSkip::MtpState)
                 } else if state.embeds.is_some() {
                     cache.reset(state.slot);
                     PrefixOutcome::Skipped(PrefixSkip::PromptEmbeds)
@@ -1275,7 +1295,9 @@ impl Driver {
         } else {
             LogitRows::Last
         };
-        let phase = if embeds {
+        let phase = if role == ModelRole::Mtp {
+            Phase::Mtp
+        } else if embeds {
             Phase::PrefillEmbeds
         } else {
             serving_phase(width, logits)

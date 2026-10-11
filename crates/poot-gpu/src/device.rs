@@ -12,13 +12,14 @@
 //! state, and `abort` only needs to drop the attempted recording's buffered metadata.
 
 use poot_executor::{
-    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, MeasuredDeviceTime,
+    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind,
+    MeasuredDeviceTime,
 };
 use poot_graph_plan::{Submission, Target};
 use poot_runtime::{
     BufferStorage, CachedDispatch, CompiledKernel, Context, DeviceBuffer, RuntimeError,
 };
-use poot_target::Backend;
+use poot_target::{Backend, TargetId};
 use std::num::NonZeroUsize;
 
 /// One loaded kernel: its compiled code and the plan key the pipeline cache and labels use.
@@ -145,7 +146,7 @@ impl Device for WgpuDevice {
     type Error = RuntimeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: self.ctx.device_caps(),
         }
@@ -188,6 +189,15 @@ impl Device for WgpuDevice {
     }
 
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), RuntimeError> {
+        // A thread-grid device: an AIE invocation has no grid to run, and its kernel was never loadable here.
+        let (threads, workgroup) = match d.launch {
+            LaunchKind::Grid { threads, workgroup } => (threads, workgroup),
+            LaunchKind::Aie(invocation) => {
+                return Err(RuntimeError::WrongKernelTarget {
+                    actual: TargetId::Aie(invocation.target()),
+                });
+            }
+        };
         let inputs: Vec<&DeviceBuffer> =
             d.inputs.iter().map(|a: &Arg<'_, Self>| a.buffer).collect();
         // Card 547b: each argument's own logical element count from the plan, never
@@ -197,8 +207,8 @@ impl Device for WgpuDevice {
             &d.kernel.key,
             &d.kernel.key,
             &d.kernel.kernel,
-            d.workgroup,
-            d.threads,
+            workgroup,
+            threads,
             &inputs,
             &input_lens,
             d.output.buffer,

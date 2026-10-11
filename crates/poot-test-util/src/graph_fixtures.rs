@@ -19,7 +19,7 @@
 
 use poot_graph_ir::{
     Builder, BuilderAppendError, Eqn, Graph, GraphValidationError, Storage, TensorType, Traced,
-    ValidationId, ValidationOutput, ValidationPacketLayout,
+    ValidationId,
 };
 use poot_graph_plan::{Plan, PlanError};
 use poot_target::{Backend, DeviceCaps};
@@ -56,7 +56,7 @@ pub fn finish_with_validations(
     b: Builder,
     out: Traced,
     validations: &[(ValidationId, &str, Traced)],
-) -> Result<Graph<poot_graph_ir::ValidationOutputs>, GraphValidationError> {
+) -> Result<Graph, GraphValidationError> {
     finish_with_state_and_validations(b, out, &[], validations)
 }
 
@@ -68,27 +68,78 @@ pub fn finish_with_state_and_validations(
     out: Traced,
     state: &[(Traced, Traced)],
     validations: &[(ValidationId, &str, Traced)],
-) -> Result<Graph<poot_graph_ir::ValidationOutputs>, GraphValidationError> {
-    let g = b.finish_with_state(out, state).with_validations(
-        validations
-            .iter()
-            .map(|&(id, name, value)| ValidationOutput {
-                id,
-                name: name.to_owned(),
-                value: value.id(),
-            })
-            .collect(),
+) -> Result<Graph, GraphValidationError> {
+    let outputs = validations.iter().fold(
+        poot_graph_ir::Outputs::new(out).with_state(state),
+        |outputs, &(id, name, value)| outputs.with_witness(id, name, value),
     );
-    g.validate()?;
-    Ok(g)
+    b.finish(outputs).map_err(|error| match error {
+        poot_graph_ir::EditError::Invalid(error) => error,
+        other => panic!("a fresh builder has no baseline to break: {other}"),
+    })
 }
 
-/// A validated graph's packet layout. Reimplements `poot-graph-ir`'s deleted
-/// `Graph::validation_packet_layout` via `ValidationPacketLayout::for_graph`.
-pub fn validation_packet_layout(
-    g: &Graph<poot_graph_ir::ValidationOutputs>,
-) -> Result<ValidationPacketLayout, GraphValidationError> {
-    ValidationPacketLayout::for_graph(g)
+/// A new program derived from `g`: its tables and outputs as a draft with no baseline, for `change` to
+/// edit before the check. A rewrite that must keep what `g` computes goes through [`Graph::edit`]; this is
+/// for a fixture that wants a different graph (a retyped result, a malformed-looking-but-valid variant).
+pub fn derive(
+    g: &Graph,
+    change: impl FnOnce(&mut poot_graph_ir::GraphEdit),
+) -> Result<Graph, poot_graph_ir::EditError> {
+    let mut draft = poot_graph_ir::GraphEdit::new();
+    *draft.values_mut() = g.values().clone();
+    *draft.inputs_mut() = g.inputs().to_vec();
+    *draft.consts_mut() = g.consts().to_vec();
+    *draft.slots_mut() = g.slots().to_vec();
+    *draft.eqns_mut() = g.eqns().to_vec();
+    draft.set_result(g.result());
+    for witness in g.witnesses() {
+        draft.push_witness(witness.id, witness.name, witness.value);
+    }
+    for export in g.exports() {
+        draft.push_export(export);
+    }
+    for (input, next) in g.state() {
+        draft.push_state(input, next);
+    }
+    change(&mut draft);
+    draft.commit()
+}
+
+/// Recompute every equation's declared output type from its operands' types, in order. A fixture that
+/// changes an operation (a different axis, another permutation) calls this so the graph stays well
+/// formed and only the shape consequences of the change remain. A `MatMul` keeps an f32-accumulate
+/// widening it already declares.
+pub fn reinfer(draft: &mut poot_graph_ir::GraphEdit) {
+    for index in 0..draft.eqns().len() {
+        let eqn = draft.eqns()[index].clone();
+        let ins: Vec<TensorType> = eqn
+            .inputs
+            .iter()
+            .map(|operand| match operand {
+                poot_graph_ir::Operand::Value(value) => draft.values()[*value].aval.clone(),
+                poot_graph_ir::Operand::Lit(scalar) => scalar.ty(),
+            })
+            .collect();
+        if let Ok(inferred) = eqn.op.infer(&ins) {
+            let kept_widening = matches!(eqn.op, poot_graph_ir::OpKind::MatMul)
+                && draft.values()[eqn.out].aval.dtype == poot_tensor::DType::F32
+                && inferred.shape == draft.values()[eqn.out].aval.shape;
+            if !kept_widening {
+                draft.values_mut()[eqn.out].aval = inferred;
+            }
+        }
+    }
+}
+
+/// `g` with `value`'s declared type replaced by `aval`, everything else unchanged: a fixture for a graph
+/// shape no tracer emits (a matmul that accumulates and stores f32 over bf16 operands).
+pub fn with_declared_type(
+    g: &Graph,
+    value: poot_graph_ir::ValueId,
+    aval: TensorType,
+) -> Result<Graph, poot_graph_ir::EditError> {
+    derive(g, |draft| draft.values_mut()[value].aval = aval)
 }
 
 /// Kernel-body limits no fixture comes near, for a test that plans a kernel and is not about the limit.
@@ -108,4 +159,40 @@ pub fn plan_eqn(
     caps: &DeviceCaps,
 ) -> Result<Plan, PlanError> {
     poot_graph_plan::plan_eqn(g, eqn, backend, caps, &roomy_body_limits())
+}
+
+// --- GPU-target accessors for tests --------------------------------------------------------------------------
+//
+// A test that builds a `Target::Gpu` fixture reads its backend and capabilities directly: it knows which arm
+// it constructed. Production consumers match the enum, and the planner refuses a GPU-only lowering on an AIE
+// target with `Capability::GpuOnly`; a test that reads these off an AIE target has a bug, so these panic.
+
+/// The GPU capabilities of the GPU target fixture `target`.
+pub fn gpu_caps(target: &poot_graph_plan::Target) -> poot_target::DeviceCaps {
+    match target {
+        poot_graph_plan::Target::Gpu { caps, .. } => *caps,
+        poot_graph_plan::Target::Aie { .. } => {
+            panic!("{target:?} is an AIE target: it has AieCaps, not GPU DeviceCaps")
+        }
+    }
+}
+
+/// The GPU capabilities of the GPU target fixture `target`, for a test that shrinks one limit.
+pub fn gpu_caps_mut(target: &mut poot_graph_plan::Target) -> &mut poot_target::DeviceCaps {
+    match target {
+        poot_graph_plan::Target::Gpu { caps, .. } => caps,
+        poot_graph_plan::Target::Aie { .. } => {
+            panic!("an AIE target has AieCaps, not GPU DeviceCaps")
+        }
+    }
+}
+
+/// The GPU backend of the GPU target fixture `target`.
+pub fn gpu_backend(target: &poot_graph_plan::Target) -> poot_target::Backend {
+    match target {
+        poot_graph_plan::Target::Gpu { backend, .. } => *backend,
+        poot_graph_plan::Target::Aie { .. } => {
+            panic!("{target:?} is an AIE target: it has no GPU backend")
+        }
+    }
 }

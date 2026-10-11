@@ -15,18 +15,18 @@ use poot_executor::{
     ExecutableId, Executor, ExecutorStats, HostSync, NativeCounters, StateScope, StepInputs,
     StepOutputs, SupportBound,
 };
-use poot_graph_ir::ValidationOutputs;
 use poot_graph_plan::{Capability, StagedProgram, Submission, Target, TargetSet};
 use poot_llm::driver::{BackendChoice, DraftPolicy, ModelHandle};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::{CompiledKernel, MemoryCounterSnapshot, MemoryCounters};
-use poot_target::{AmdArch, Backend, DeviceCaps, Queried};
+use poot_target::{AmdArch, Backend, DeviceCaps, Queried, TargetId};
 
 use super::*;
 use crate::admin::LoraAdminPolicy;
 use crate::http::{RateLimiter, handle};
 use crate::tests::{load_handle, test_metrics, write_tiny_gguf};
 use poot_llm::driver::capacity::{CapacityRefusal, FitError, Observation, Rejection};
+use poot_test_util::graph_fixtures::gpu_caps_mut;
 
 /// The production budget reader (`device_budget`) over a group whose devices hold exactly
 /// `capacity[rank]` bytes: the synthetic per-device budget of the admission rows below.
@@ -327,7 +327,7 @@ impl Executor for Probe {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<ValidationOutputs>,
+        program: &StagedProgram,
     ) -> Result<EntryId, ExecError> {
         self.add_entries.fetch_add(1, Ordering::SeqCst);
         if let Some((entered, release)) = &self.gate {
@@ -361,7 +361,7 @@ impl Executor for Probe {
 }
 
 fn spirv_target() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: DeviceCaps::wgpu_rdna3_igpu(),
     }
@@ -552,7 +552,7 @@ fn health_is_503_starting_while_prepare_runs_and_200_serving_after() {
 /// A target for a ROCm device whose per-dispatch work bound is below what the model's smallest
 /// dispatch needs: the planner refuses it on that target, naming the op and the capability.
 fn amd_target_missing_dispatch_work() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::AmdGcn(AmdArch::gfx1151()),
         caps: DeviceCaps {
             max_dispatch_work: Queried::Known(1),
@@ -583,7 +583,7 @@ fn a_rocm_backend_missing_a_capability_fails_with_the_typed_refusal() {
         panic!("expected the typed refusal, got {:?}", result.err());
     };
     assert!(
-        matches!(refusal.target, Backend::AmdGcn(_)),
+        matches!(refusal.target, TargetId::Gpu(Backend::AmdGcn(_))),
         "the refusal names the ROCm target: {refusal:?}"
     );
     assert!(
@@ -1158,7 +1158,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
     let args = args(BackendChoice::Wgpu);
     let first = candidates(&handle, &args)[0];
     let mut target = spirv_target();
-    target.caps.memory_budget_bytes = Some(u64::MAX / 2);
+    gpu_caps_mut(&mut target).memory_budget_bytes = Some(u64::MAX / 2);
     // The independent oracle: what the first candidate allocates on a counting device.
     let (executor, _) = probe(target, 0);
     let mut oracle = Driver::new(
@@ -1240,7 +1240,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
 fn a_runtime_that_cannot_report_free_memory_is_an_unknown_budget() {
     let handle = fixture_model();
     let mut target = spirv_target();
-    target.caps.memory_budget_bytes = Some(u64::MAX / 2);
+    gpu_caps_mut(&mut target).memory_budget_bytes = Some(u64::MAX / 2);
     let (executor, add_entries) = probe_reporting(target, 0, None);
     let health = EngineHealth::starting();
     let (result, _) = build_with(
@@ -1470,7 +1470,7 @@ impl Collectives for FixtureDevice {
 }
 
 fn ptx_target() -> Target {
-    Target {
+    Target::Gpu {
         backend: Backend::Nvptx,
         caps: DeviceCaps {
             memory_budget_bytes: Some(1 << 40),

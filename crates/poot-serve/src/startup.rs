@@ -77,21 +77,24 @@ pub(crate) fn engine_args(config: &ServeConfig, draft: DraftPolicy) -> Result<En
         .with_expert_pool(config.expert_pool))
 }
 
-/// The draft policy the flags name: `Off` with neither flag. A `--draft-model` checkpoint is loaded
+/// The draft policy the flags name: `Off` with none of the three. A `--draft-model` checkpoint is loaded
 /// here, so a path that does not load is a startup error before the listener binds.
 pub(crate) fn draft_policy(config: &ServeConfig) -> Result<DraftPolicy> {
-    match (&config.draft_lookup, &config.draft_model) {
-        (None, None) => Ok(DraftPolicy::Off),
-        (Some(lookup), None) => Ok(DraftPolicy::PromptLookup {
+    match (&config.draft_lookup, &config.draft_model, config.draft_mtp) {
+        (None, None, None) => Ok(DraftPolicy::Off),
+        (Some(lookup), None, None) => Ok(DraftPolicy::PromptLookup {
             ngram: lookup.ngram,
             k: lookup.k,
         }),
-        (None, Some(draft)) => Ok(DraftPolicy::DraftModel {
+        (None, Some(draft), None) => Ok(DraftPolicy::DraftModel {
             k: draft.k,
             handle: load_model(&draft.path, &LoadOptions::default())
                 .context("load the draft model")?,
         }),
-        (Some(_), Some(_)) => anyhow::bail!("--draft-lookup and --draft-model are exclusive"),
+        (None, None, Some(k)) => Ok(DraftPolicy::Mtp { k }),
+        _ => anyhow::bail!(
+            "--draft-lookup, --draft-model and --draft-mtp are exclusive: name one policy"
+        ),
     }
 }
 

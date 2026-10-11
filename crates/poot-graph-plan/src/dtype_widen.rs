@@ -27,8 +27,8 @@
 use poot_graph_ir::graph::{Storage, ValueMeta};
 use poot_graph_ir::op::{ContractionHead, OpKind};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Eqn, Graph, Operand, ValidationChannel, ValueId, ValueTable};
-use poot_target::{Backend, TensorCoreSupport};
+use poot_graph_ir::{EditError, Eqn, Graph, GraphEdit, Operand, ValueId, ValueTable};
+use poot_target::{Backend, TargetId, TensorCoreSupport};
 use poot_tensor::DType;
 
 use crate::Layout;
@@ -127,18 +127,19 @@ pub fn matmul_tensor_core_eligible(
 ///
 /// The one decision the storage plan (`value_storage_kind`) and the cast planner share, so the lane a
 /// `Cast` kernel reads and the lane its source uploads to cannot drift apart.
-pub(crate) fn bf16_const_is_packed<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn bf16_const_is_packed(
+    g: &Graph,
     views: &HashMap<ValueId, Layout>,
     id: ValueId,
-    backend: Backend,
+    target: impl Into<TargetId>,
 ) -> bool {
-    match backend {
-        Backend::SpirvVulkan => true,
-        Backend::AmdGcn(_) => bf16_const_feeds_only_packed_readers(g, views, id),
-        Backend::Nvptx => bf16_const_feeds_only_packed_readers(g, views, id),
+    match target.into() {
+        TargetId::Gpu(Backend::SpirvVulkan) => true,
+        TargetId::Gpu(Backend::AmdGcn(_) | Backend::Nvptx) => {
+            bf16_const_feeds_only_packed_readers(g, views, id)
+        }
         // An AIE core has no BF16 lane: the const stays unpacked and the BF16 consumers refuse.
-        Backend::Aie(_) => false,
+        TargetId::Aie(_) => false,
     }
 }
 
@@ -165,7 +166,7 @@ pub fn matmul_bf16_column_gemv(
 ) -> bool {
     let packed_bf16_lane = match backend {
         Backend::SpirvVulkan | Backend::AmdGcn(_) => true,
-        Backend::Nvptx | Backend::Aie(_) => false,
+        Backend::Nvptx => false,
     };
     packed_bf16_lane
         && a_dtype == DType::F32
@@ -223,8 +224,8 @@ fn packed_bf16_reader(op: &OpKind, position: usize) -> bool {
 /// lane that stores packed BF16, which is the typed value walk on each backend that has one - wgpu's,
 /// and ROCm's since card 450 ROCm. Every other wgpu entry point rejects a BF16 value through
 /// `crate::validate_wgpu_tensor_execution`.
-pub fn bf16_const_feeds_only_packed_readers<V: ValidationChannel>(
-    g: &Graph<V>,
+pub fn bf16_const_feeds_only_packed_readers(
+    g: &Graph,
     views: &HashMap<ValueId, Layout>,
     id: ValueId,
 ) -> bool {
@@ -232,7 +233,7 @@ pub fn bf16_const_feeds_only_packed_readers<V: ValidationChannel>(
         return false;
     }
     let mut consumed = false;
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         for (position, operand) in eqn.inputs.iter().enumerate() {
             if !matches!(operand, Operand::Value(value) if *value == id) {
                 continue;
@@ -264,10 +265,10 @@ pub fn bf16_const_feeds_only_packed_readers<V: ValidationChannel>(
 /// bit-exact arithmetic that walk's contract requires. One function for every caller closes the R481-003
 /// drift: wgpu's copy ran `lower_nonlast_reduces`, ROCm's and PTX's did not, so a MiniMax-M2 decode graph
 /// planned on wgpu and refused on ROCm and PTX for a pass gap, not a real capability difference.
-pub fn prepare_target_graph<V: ValidationChannel>(g: &Graph<V>, backend: Backend) -> Graph<V> {
-    let folded = fold_dense_contractions(g);
-    let folded = fold_dense_bf16_row_gathers(&folded);
-    let folded = lower_nonlast_reduces(&folded);
+pub fn prepare_target_graph(g: &Graph, backend: Backend) -> Result<Graph, EditError> {
+    let folded = fold_dense_contractions(g)?;
+    let folded = fold_dense_bf16_row_gathers(&folded)?;
+    let folded = lower_nonlast_reduces(&folded)?;
     widen_mismatched_matmul_dtypes(&folded, backend)
 }
 
@@ -275,9 +276,9 @@ pub fn prepare_target_graph<V: ValidationChannel>(g: &Graph<V>, backend: Backend
 /// produces it. Local to the two folds below (their own copy of `poot-graph-ir`'s private
 /// `packed_consumer_map`/`value_input`/`is_graph_escape`, kept small rather than widening
 /// `poot-graph-ir`'s public surface for two callers - Card 534a).
-fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Vec<usize>> {
-    let mut consumers = ValueTable::filled(g.values.len(), Vec::new());
-    for (equation, eqn) in g.eqns.iter().enumerate() {
+fn packed_consumer_map(g: &Graph) -> ValueTable<Vec<usize>> {
+    let mut consumers = ValueTable::filled(g.values().len(), Vec::new());
+    for (equation, eqn) in g.eqns().iter().enumerate() {
         for operand in &eqn.inputs {
             if let Operand::Value(value) = operand {
                 consumers[*value].push(equation);
@@ -287,7 +288,7 @@ fn packed_consumer_map<V: ValidationChannel>(g: &Graph<V>) -> ValueTable<Vec<usi
     consumers
 }
 
-fn is_graph_escape<V: ValidationChannel>(g: &Graph<V>, value: ValueId) -> bool {
+fn is_graph_escape(g: &Graph, value: ValueId) -> bool {
     g.liveness_roots().any(|root| root == value)
 }
 
@@ -327,17 +328,17 @@ fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
 /// let g = poot_graph_ir::Graph::default();
 /// let _ = poot_graph_plan::fold_dense_contractions(&g);
 /// ```
-pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub(crate) fn fold_dense_contractions(g: &Graph) -> Result<Graph, EditError> {
     let consumers = packed_consumer_map(g);
     let mut producer = HashMap::new();
-    for (index, eqn) in g.eqns.iter().enumerate() {
+    for (index, eqn) in g.eqns().iter().enumerate() {
         producer.insert(eqn.out, index);
     }
     let mut replacements: HashMap<usize, Eqn> = HashMap::new();
     let mut removed = HashSet::new();
     let mut f16_folds = Vec::new();
 
-    for (matmul_index, matmul) in g.eqns.iter().enumerate() {
+    for (matmul_index, matmul) in g.eqns().iter().enumerate() {
         if !matches!(matmul.op, OpKind::MatMul) || matmul.inputs.len() != 2 {
             continue;
         }
@@ -348,13 +349,13 @@ pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Gra
         let Some(&transpose_index) = producer.get(&transposed) else {
             continue;
         };
-        let OpKind::Transpose { perm } = &g.eqns[transpose_index].op else {
+        let OpKind::Transpose { perm } = &g.eqns()[transpose_index].op else {
             continue;
         };
         if consumers[transposed].len() != 1 || is_graph_escape(g, transposed) {
             continue;
         }
-        let Some(source) = value_input(&g.eqns[transpose_index], 0) else {
+        let Some(source) = value_input(&g.eqns()[transpose_index], 0) else {
             continue;
         };
         // The folded equations: the transpose, and for a grouped weight the reshape that blocks it.
@@ -371,13 +372,13 @@ pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Gra
                 let Some(&reshape_index) = producer.get(&source) else {
                     continue;
                 };
-                let OpKind::Reshape { .. } = &g.eqns[reshape_index].op else {
+                let OpKind::Reshape { .. } = &g.eqns()[reshape_index].op else {
                     continue;
                 };
                 if consumers[source].len() != 1 || is_graph_escape(g, source) {
                     continue;
                 }
-                let Some(weight) = value_input(&g.eqns[reshape_index], 0) else {
+                let Some(weight) = value_input(&g.eqns()[reshape_index], 0) else {
                     continue;
                 };
                 let (blocks, stored) = (g.aval(source), g.aval(weight));
@@ -457,7 +458,7 @@ pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Gra
     }
 
     let eqns = g
-        .eqns
+        .eqns()
         .iter()
         .enumerate()
         .filter_map(|(index, eqn)| {
@@ -467,7 +468,7 @@ pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Gra
                 .or_else(|| (!removed.contains(&index)).then(|| eqn.clone()))
         })
         .collect();
-    Graph { eqns, ..g.clone() }
+    crate::passes::with_eqns(g, eqns)
 }
 
 /// Card 381 (Card 534a: moved out of `poot-graph-ir`, see [`fold_dense_contractions`]'s doc).
@@ -502,18 +503,18 @@ pub(crate) fn fold_dense_contractions<V: ValidationChannel>(g: &Graph<V>) -> Gra
 /// let g = poot_graph_ir::Graph::default();
 /// let _ = poot_graph_plan::fold_dense_bf16_row_gathers(&g);
 /// ```
-pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
+pub(crate) fn fold_dense_bf16_row_gathers(g: &Graph) -> Result<Graph, EditError> {
     let consumers = packed_consumer_map(g);
     let mut producer = HashMap::new();
-    for (index, eqn) in g.eqns.iter().enumerate() {
+    for (index, eqn) in g.eqns().iter().enumerate() {
         producer.insert(eqn.out, index);
     }
 
-    let mut out = g.clone();
+    let mut out = g.edit();
     let mut replacements: HashMap<usize, Vec<Eqn>> = HashMap::new();
     let mut removed = HashSet::new();
 
-    for (cast_index, cast) in g.eqns.iter().enumerate() {
+    for (cast_index, cast) in g.eqns().iter().enumerate() {
         if !matches!(cast.op, OpKind::Cast { to: DType::F32 }) || cast.inputs.len() != 1 {
             continue;
         }
@@ -531,10 +532,10 @@ pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) ->
             if consumers[current].len() != 1 || is_graph_escape(g, current) {
                 break None;
             }
-            match g.eqns[index].op {
+            match g.eqns()[index].op {
                 OpKind::Gather { axis: 0 } => break Some(index),
                 OpKind::Reshape { .. } => {
-                    let Some(source) = value_input(&g.eqns[index], 0) else {
+                    let Some(source) = value_input(&g.eqns()[index], 0) else {
                         break None;
                     };
                     links.push(index);
@@ -546,7 +547,7 @@ pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) ->
         let Some(gather_index) = chain else {
             continue;
         };
-        let gather = &g.eqns[gather_index];
+        let gather = &g.eqns()[gather_index];
         let (Some(table), Some(index)) = (value_input(gather, 0), value_input(gather, 1)) else {
             continue;
         };
@@ -564,24 +565,24 @@ pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) ->
 
         // Rebuild the chain over F32, innermost first, with the outermost equation writing the cast's own
         // value id. A fresh value is appended for every intermediate the chain still needs.
-        let values_before = out.values.len();
+        let values_before = out.values().len();
         let mut rebuilt = Vec::with_capacity(links.len() + 1);
         let mut inputs = vec![Operand::Value(table), Operand::Value(index)];
         let mut current_op = op;
         let mut current_type = gathered;
         let mut agreed = true;
         for &link in links.iter().rev() {
-            let link_op = g.eqns[link].op.clone();
+            let link_op = g.eqns()[link].op.clone();
             let Ok(next_type) = link_op.infer(std::slice::from_ref(&current_type)) else {
                 agreed = false;
                 break;
             };
-            if next_type.shape != g.aval(g.eqns[link].out).shape {
+            if next_type.shape != g.aval(g.eqns()[link].out).shape {
                 agreed = false;
                 break;
             }
             let value = out
-                .values
+                .values_mut()
                 .push(ValueMeta::new(current_type, Storage::Device, None));
             rebuilt.push(Eqn {
                 op: current_op,
@@ -596,7 +597,7 @@ pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) ->
         if !agreed || &current_type != g.aval(cast.out) {
             // Nothing is committed until every check passes: drop this candidate's appended values, and
             // leave every equation of its chain exactly as it was.
-            out.values.truncate(values_before);
+            out.values_mut().truncate(values_before);
             continue;
         }
         rebuilt.push(Eqn {
@@ -610,8 +611,8 @@ pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) ->
         replacements.insert(cast_index, rebuilt);
     }
 
-    out.eqns = g
-        .eqns
+    *out.eqns_mut() = g
+        .eqns()
         .iter()
         .enumerate()
         .filter_map(|(index, eqn)| {
@@ -622,7 +623,7 @@ pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) ->
         })
         .flatten()
         .collect();
-    out
+    out.commit()
 }
 
 /// Card 454 D1 (Card 534a: moved out of `poot-graph-ir`, see [`fold_dense_contractions`]'s doc).
@@ -663,11 +664,11 @@ pub(crate) fn fold_dense_bf16_row_gathers<V: ValidationChannel>(g: &Graph<V>) ->
 /// let g = poot_graph_ir::Graph::default();
 /// let _ = poot_graph_plan::lower_nonlast_reduces(&g);
 /// ```
-pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph<V> {
-    let mut out = g.clone();
+pub(crate) fn lower_nonlast_reduces(g: &Graph) -> Result<Graph, EditError> {
+    let mut out = g.edit();
     let mut replacements: HashMap<usize, Vec<Eqn>> = HashMap::new();
 
-    for (index, eqn) in g.eqns.iter().enumerate() {
+    for (index, eqn) in g.eqns().iter().enumerate() {
         let OpKind::Reduce { op, axis, keepdim } = eqn.op else {
             continue;
         };
@@ -694,16 +695,16 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
         .infer(std::slice::from_ref(&transposed_aval)) else {
             continue;
         };
-        let Some(out_aval) = g.values.get(eqn.out).map(|meta| &meta.aval) else {
+        let Some(out_aval) = g.values().get(eqn.out).map(|meta| &meta.aval) else {
             continue;
         };
 
         // Nothing is committed until every check passes: the fresh intermediates are appended to
         // a scratch prefix and dropped again on any disagreement.
-        let committed_before = out.values.len();
-        let transposed_id = out
-            .values
-            .push(ValueMeta::new(transposed_aval, Storage::Device, None));
+        let committed_before = out.values().len();
+        let transposed_id =
+            out.values_mut()
+                .push(ValueMeta::new(transposed_aval, Storage::Device, None));
 
         let mut rebuilt = Vec::with_capacity(3);
         rebuilt.push(Eqn {
@@ -729,9 +730,9 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
             true
         } else if reduced_aval.numel() == out_aval.numel() {
             // keepdim=true: the size-1 axis sits where the reduced axis was, not at the end.
-            let reduced_id = out
-                .values
-                .push(ValueMeta::new(reduced_aval, Storage::Device, None));
+            let reduced_id =
+                out.values_mut()
+                    .push(ValueMeta::new(reduced_aval, Storage::Device, None));
             rebuilt.push(Eqn {
                 op: OpKind::Reduce {
                     op,
@@ -756,14 +757,14 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
         };
 
         if !agreed {
-            out.values.truncate(committed_before);
+            out.values_mut().truncate(committed_before);
             continue;
         }
         replacements.insert(index, rebuilt);
     }
 
-    out.eqns = g
-        .eqns
+    *out.eqns_mut() = g
+        .eqns()
         .iter()
         .enumerate()
         .flat_map(|(index, eqn)| {
@@ -773,7 +774,7 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
                 .unwrap_or_else(|| vec![eqn.clone()])
         })
         .collect();
-    out
+    out.commit()
 }
 
 /// Widen a `MatMul`/`Binary` operand whose dtype does not match the eqn's output dtype
@@ -813,10 +814,7 @@ pub(crate) fn lower_nonlast_reduces<V: ValidationChannel>(g: &Graph<V>) -> Graph
 /// `Unary`/`Cast`/`Reduce`/`Transpose`/`Reshape`/`Concat` etc. are not covered: no known real trace
 /// feeds them a raw Const directly (always through a Gather/Slice/compute op first); add them the same
 /// way if one does.
-pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
-    g: &Graph<V>,
-    backend: Backend,
-) -> Graph<V> {
+pub fn widen_mismatched_matmul_dtypes(g: &Graph, backend: Backend) -> Result<Graph, EditError> {
     // Card 273: widen a single-value-operand movement op (`Gather{axis:0}`, `Slice`) whose one operand
     // is directly a mismatched-dtype `Storage::Const`: inserts a Cast on that operand only, so the
     // eqn's output dtype and every downstream consumer are untouched. Both ops can plan to a zero-cost
@@ -824,7 +822,7 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
     // elem width (`fty(odt)`) with no mismatch guard, so a Const read at an element width its dtype does not
     // have is silent corruption (`probe_bf16_graph` for Gather, `ptx_prefill_check_bf16` for
     // Slice on `rope.cos`/`rope.sin`, both `TensorType::f32(...)` at trace regardless of `proj_dtype`).
-    let widen_single_operand = |out: &mut Graph<V>, eqn: &Eqn| -> bool {
+    let widen_single_operand = |out: &mut GraphEdit, eqn: &Eqn| -> bool {
         let table_id = match eqn.inputs.first() {
             Some(Operand::Value(v)) => *v,
             _ => return false,
@@ -834,8 +832,10 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
             return false;
         }
         let aval = TensorType::new(out.aval(table_id).shape.clone(), odt);
-        let nv = out.values.push(ValueMeta::new(aval, Storage::Device, None));
-        out.eqns.push(Eqn {
+        let nv = out
+            .values_mut()
+            .push(ValueMeta::new(aval, Storage::Device, None));
+        out.eqns_mut().push(Eqn {
             op: OpKind::Cast { to: odt },
             inputs: vec![Operand::Value(table_id)],
             out: nv,
@@ -843,7 +843,7 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
         });
         let mut inputs = eqn.inputs.clone();
         inputs[0] = Operand::Value(nv);
-        out.eqns.push(Eqn {
+        out.eqns_mut().push(Eqn {
             op: eqn.op.clone(),
             inputs,
             out: eqn.out,
@@ -852,12 +852,12 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
         true
     };
 
-    let mut out = g.clone();
-    out.eqns.clear();
-    for eqn in &g.eqns {
+    let mut out = g.edit();
+    out.eqns_mut().clear();
+    for eqn in g.eqns() {
         if matches!(eqn.op, OpKind::Gather { axis: 0 } | OpKind::Slice { .. }) {
             if !widen_single_operand(&mut out, eqn) {
-                out.eqns.push(eqn.clone());
+                out.eqns_mut().push(eqn.clone());
             }
             continue;
         }
@@ -866,7 +866,7 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
         let (a_id, b_id) = match (eqn.inputs.first(), eqn.inputs.get(1)) {
             (Some(Operand::Value(a)), Some(Operand::Value(b))) if widenable => (*a, *b),
             _ => {
-                out.eqns.push(eqn.clone());
+                out.eqns_mut().push(eqn.clone());
                 continue;
             }
         };
@@ -874,7 +874,7 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
         let a_dt = g.aval(a_id).dtype;
         let b_dt = g.aval(b_id).dtype;
         if a_dt == odt && b_dt == odt {
-            out.eqns.push(eqn.clone());
+            out.eqns_mut().push(eqn.clone());
             continue;
         }
         if is_matmul {
@@ -882,29 +882,31 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
             let r = out_shape.len();
             if r < 2 {
                 // MatMul always infers a rank >= 2 output (see OpKind::infer); defensive only.
-                out.eqns.push(eqn.clone());
+                out.eqns_mut().push(eqn.clone());
                 continue;
             }
             let (m, n) = (out_shape[r - 2], out_shape[r - 1]);
             let k = g.aval(a_id).shape.last().copied().unwrap_or(0);
             if matmul_tensor_core_eligible(backend, a_dt, b_dt, m, n, k) {
-                out.eqns.push(eqn.clone());
+                out.eqns_mut().push(eqn.clone());
                 continue;
             }
             // A BF16 `[K, N]` decode projection has no lowering: a widening Cast would materialize an F32
             // copy of the weight, so it stays mixed and `plan_eqn` refuses it by name.
             if matmul_bf16_column_gemv(backend, a_dt, b_dt, odt, m, g.aval(b_id).shape.len()) {
-                out.eqns.push(eqn.clone());
+                out.eqns_mut().push(eqn.clone());
                 continue;
             }
         }
-        let cast_to = |out: &mut Graph<V>, id: ValueId, dt: DType| -> ValueId {
+        let cast_to = |out: &mut GraphEdit, id: ValueId, dt: DType| -> ValueId {
             if out.aval(id).dtype == dt {
                 return id;
             }
             let aval = TensorType::new(out.aval(id).shape.clone(), dt);
-            let nv = out.values.push(ValueMeta::new(aval, Storage::Device, None));
-            out.eqns.push(Eqn {
+            let nv = out
+                .values_mut()
+                .push(ValueMeta::new(aval, Storage::Device, None));
+            out.eqns_mut().push(Eqn {
                 op: OpKind::Cast { to: dt },
                 inputs: vec![Operand::Value(id)],
                 out: nv,
@@ -917,20 +919,21 @@ pub fn widen_mismatched_matmul_dtypes<V: ValidationChannel>(
         inputs[0] = Operand::Value(na);
         let nb = cast_to(&mut out, b_id, odt);
         inputs[1] = Operand::Value(nb);
-        out.eqns.push(Eqn {
+        out.eqns_mut().push(Eqn {
             op: eqn.op.clone(),
             inputs,
             out: eqn.out,
             layer: eqn.layer,
         });
     }
-    out
+    out.commit()
 }
 
 #[cfg(test)]
 mod tests {
     use poot_graph_ir::{Builder, Graph, OpKind, Storage, TensorType};
     use poot_target::AmdArch;
+    use poot_test_util::graph_fixtures::derive;
 
     use poot_target::Backend;
     use poot_tensor::DType;
@@ -943,15 +946,14 @@ mod tests {
         let a = b.constant("a", TensorType::new(vec![m, 32], a_dtype));
         let w = b.constant("w", TensorType::new(vec![32, 32], w_dtype));
         let mm = b.matmul(a, w);
-        let mut g = b.finish(mm);
+        let g = b.finish(mm).unwrap();
         let out = g
-            .eqns
+            .eqns()
             .iter()
             .find(|e| matches!(e.op, OpKind::MatMul))
             .expect("matmul eqn")
             .out;
-        g.values[out].aval.dtype = DType::F32;
-        g
+        derive(&g, |draft| draft.values_mut()[out].aval.dtype = DType::F32).unwrap()
     }
 
     /// Card 1011: no pass retypes a BF16 const, on any backend or AMD arch family, over the mixed-bf16 and
@@ -990,9 +992,9 @@ mod tests {
         ];
         for backend in backends {
             for (label, g) in &graphs {
-                let prepared = prepare_target_graph(g, backend);
+                let prepared = prepare_target_graph(g, backend).unwrap();
                 for id in g
-                    .values
+                    .values()
                     .ids()
                     .filter(|&id| g.meta(id).storage == Storage::Const)
                 {
@@ -1023,27 +1025,29 @@ mod tensor_core_weight_tests {
         let x = b.slot(Slot::TokenEmbed, TensorType::new(vec![16, 16], DType::BF16));
         let weight = b.constant("weight", TensorType::new(vec![16, 16], DType::BF16));
         let out = b.matmul(x, weight);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
-        let widened = widen_mismatched_matmul_dtypes(&g, Backend::Nvptx);
+        let widened = widen_mismatched_matmul_dtypes(&g, Backend::Nvptx).unwrap();
         assert_eq!(widened.aval(weight.id()).dtype, DType::BF16);
         assert!(
             !widened
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::Cast { .. }))
         );
         let eqn = widened
-            .eqns
+            .eqns()
             .iter()
             .find(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::MatMul))
             .expect("matmul remains");
         match crate::plan_eqn_choice(
             &widened,
             eqn,
-            Backend::Nvptx,
+            &crate::Target::Gpu {
+                backend: Backend::Nvptx,
+                caps: poot_test_util::device_caps::default_caps_for(Backend::Nvptx),
+            },
             &std::collections::HashMap::new(),
-            &poot_test_util::device_caps::default_caps_for(Backend::Nvptx),
             &poot_test_util::graph_fixtures::roomy_body_limits(),
         )
         .expect("eligible BF16 matmul plans")
@@ -1079,7 +1083,7 @@ mod prepare_target_graph_tests {
         let b = Builder::new();
         let weights = b.constant("expert_weights", TensorType::f32(vec![4, 3]));
         let out = b.reduce(RedOp::Sum, weights, 0, false);
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     #[test]
@@ -1089,17 +1093,17 @@ mod prepare_target_graph_tests {
             Backend::Nvptx,
             Backend::AmdGcn(AmdArch::gfx1151()),
         ] {
-            let prepared = prepare_target_graph(&moe_gate_reduce_graph(), backend);
+            let prepared = prepare_target_graph(&moe_gate_reduce_graph(), backend).unwrap();
             assert!(
                 !prepared
-                    .eqns
+                    .eqns()
                     .iter()
                     .any(|eqn| matches!(eqn.op, OpKind::Reduce { axis: 0, .. })),
                 "{backend:?}: the axis-0 reduce must be lowered away, not left for the planner to refuse"
             );
             assert!(
                 prepared
-                    .eqns
+                    .eqns()
                     .iter()
                     .any(|eqn| matches!(eqn.op, OpKind::Transpose { .. })),
                 "{backend:?}: `lower_nonlast_reduces` moves the reduced axis to the end with a transpose"
@@ -1116,13 +1120,13 @@ mod prepare_target_graph_tests {
         let x = b.constant("x", TensorType::new(vec![4, 8], DType::F32));
         let weight = b.constant("weight", TensorType::new(vec![8, 16], DType::BF16));
         let out = b.matmul(x, weight);
-        let g = b.finish(out);
+        let g = b.finish(out).unwrap();
 
         for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
-            let prepared = prepare_target_graph(&g, backend);
+            let prepared = prepare_target_graph(&g, backend).unwrap();
             assert_eq!(prepared.aval(weight.id()).dtype, DType::BF16, "{backend:?}");
             assert!(
-                prepared.eqns.iter().any(|eqn| matches!(
+                prepared.eqns().iter().any(|eqn| matches!(
                     eqn.op,
                     OpKind::Cast { to: DType::F32 }
                 ) && matches!(eqn.inputs.as_slice(), [poot_graph_ir::Operand::Value(v)] if *v == weight.id())),
@@ -1140,6 +1144,7 @@ mod fold_dense_bf16_tests {
     use poot_graph_ir::graph::{Eqn, Operand, Storage, ValueMeta};
     use poot_graph_ir::{Builder, Graph, OpKind, Slot, TensorType, ValueId};
     use poot_tensor::DType;
+    use poot_test_util::graph_fixtures::derive;
 
     use super::{fold_dense_bf16_row_gathers, fold_dense_contractions};
 
@@ -1150,11 +1155,11 @@ mod fold_dense_bf16_tests {
         let x = b.constant("activation", TensorType::f32(vec![1, 2, 5]));
         let weight = b.constant("lm_head.weight", TensorType::new(vec![7, 5], weight_dtype));
         let logits = poot_graph_ir::ops::linear(&b, x, b.transpose(weight, vec![1, 0]), None);
-        b.finish(logits)
+        b.finish(logits).unwrap()
     }
 
     fn const_id(g: &Graph, name: &str) -> ValueId {
-        g.values
+        g.values()
             .iter_enumerated()
             .find(|(_, value)| value.name.as_deref() == Some(name))
             .map(|(id, _)| id)
@@ -1164,7 +1169,7 @@ mod fold_dense_bf16_tests {
     /// `Eqn` and `Operand` carry no `PartialEq`, so compare equation lists structurally: the op's name,
     /// its value operands in order, and its output.
     fn eqn_summary(g: &Graph) -> Vec<(String, Vec<ValueId>, ValueId)> {
-        g.eqns
+        g.eqns()
             .iter()
             .map(|eqn| {
                 let inputs = eqn
@@ -1187,7 +1192,7 @@ mod fold_dense_bf16_tests {
         let w = b.constant("w", TensorType::new(vec![12, 5], weight_dtype));
         let blocks = b.reshape(w, vec![3, 4, 5]);
         let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
-        b.finish(out)
+        b.finish(out).unwrap()
     }
 
     /// POOT-1048. Only a BF16 grouped weight folds (into one `GroupedDenseContraction` keeping the matmul's
@@ -1198,20 +1203,20 @@ mod fold_dense_bf16_tests {
     #[test]
     fn a_grouped_weight_folds_only_when_it_is_bf16() {
         let graph = grouped_graph(DType::BF16);
-        let folded = fold_dense_contractions(&graph);
-        assert_eq!(folded.eqns.len(), 1, "{:?}", eqn_summary(&folded));
+        let folded = fold_dense_contractions(&graph).unwrap();
+        assert_eq!(folded.eqns().len(), 1, "{:?}", eqn_summary(&folded));
         assert_eq!(
-            folded.eqns[0].op,
+            folded.eqns()[0].op,
             OpKind::GroupedDenseContraction {
                 weight: DType::BF16,
                 groups: 3
             }
         );
-        assert_eq!(folded.eqns[0].out, graph.output);
+        assert_eq!(folded.eqns()[0].out, graph.result());
         for dtype in [DType::F32, DType::F16] {
             let graph = grouped_graph(dtype);
             assert_eq!(
-                eqn_summary(&fold_dense_contractions(&graph)),
+                eqn_summary(&fold_dense_contractions(&graph).unwrap()),
                 eqn_summary(&graph),
                 "{dtype:?}"
             );
@@ -1223,24 +1228,24 @@ mod fold_dense_bf16_tests {
     #[test]
     fn fold_matches_only_the_transposed_bf16_weight_shape() {
         let graph = lm_head_shaped_graph(DType::BF16);
-        let folded = fold_dense_contractions(&graph);
+        let folded = fold_dense_contractions(&graph).unwrap();
 
-        assert_eq!(folded.output, graph.output);
-        assert_eq!(folded.aval(folded.output), graph.aval(graph.output));
+        assert_eq!(folded.result(), graph.result());
+        assert_eq!(folded.aval(folded.result()), graph.aval(graph.result()));
         assert!(
             !folded
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::Transpose { .. })),
             "the transpose is the copy this fold exists to remove"
         );
         let index = folded
-            .eqns
+            .eqns()
             .iter()
             .position(|eqn| matches!(eqn.op, OpKind::DenseContraction { .. }))
             .expect("the LM head folds");
         assert_eq!(
-            folded.eqns[index].op,
+            folded.eqns()[index].op,
             OpKind::DenseContraction {
                 weight: DType::BF16
             }
@@ -1248,44 +1253,44 @@ mod fold_dense_bf16_tests {
         assert_eq!(
             eqn_summary(&folded)[index],
             (
-                folded.eqns[index].op.name(),
+                folded.eqns()[index].op.name(),
                 vec![
                     const_id(&graph, "activation"),
                     const_id(&graph, "lm_head.weight")
                 ],
-                graph.output
+                graph.result()
             ),
             "the contraction reads the activation and the constant in checkpoint order"
         );
 
         // Idempotent: a folded graph has no transpose left to match.
         assert_eq!(
-            eqn_summary(&fold_dense_contractions(&folded)),
+            eqn_summary(&fold_dense_contractions(&folded).unwrap()),
             eqn_summary(&folded),
             "the fold must be idempotent"
         );
 
         // An F32 weight is in the table (Card 645): it folds the same way, into an F32 contraction.
-        let f32_weight = fold_dense_contractions(&lm_head_shaped_graph(DType::F32));
+        let f32_weight = fold_dense_contractions(&lm_head_shaped_graph(DType::F32)).unwrap();
         assert!(
             f32_weight
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| eqn.op == OpKind::DenseContraction { weight: DType::F32 }),
             "an F32 checkpoint weight folds"
         );
         assert!(
             !f32_weight
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::Transpose { .. }))
         );
 
         // An F16 const weight is in the table (Card 1007) and the contraction is its sole reader: it folds.
-        let f16_weight = fold_dense_contractions(&lm_head_shaped_graph(DType::F16));
+        let f16_weight = fold_dense_contractions(&lm_head_shaped_graph(DType::F16)).unwrap();
         assert!(
             f16_weight
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| eqn.op == OpKind::DenseContraction { weight: DType::F16 }),
             "an F16 checkpoint weight folds"
@@ -1297,53 +1302,27 @@ mod fold_dense_bf16_tests {
             let x = b.constant("activation", TensorType::f32(vec![1, 2, 5]));
             let weight = b.slot(Slot::Activation, TensorType::new(vec![7, 5], DType::F16));
             let logits = poot_graph_ir::ops::linear(&b, x, b.transpose(weight, vec![1, 0]), None);
-            b.finish(logits)
+            b.finish(logits).unwrap()
         };
         assert_eq!(
-            eqn_summary(&fold_dense_contractions(&computed_f16)),
+            eqn_summary(&fold_dense_contractions(&computed_f16).unwrap()),
             eqn_summary(&computed_f16)
         );
 
         // The transposed value escapes the graph, so something outside reads it and the fold cannot
         // remove the equation that produces it. Its consumer count is still exactly one.
-        let mut escaping = graph.clone();
-        let transposed = escaping
-            .eqns
+        let transposed = graph
+            .eqns()
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Transpose { .. }))
             .expect("the traced graph transposes")
             .out;
-        escaping.output = transposed;
+        let escaping = derive(&graph, |draft| draft.set_result(transposed)).unwrap();
         assert!(escaping.liveness_roots().any(|root| root == transposed));
         assert_eq!(
-            eqn_summary(&fold_dense_contractions(&escaping)),
+            eqn_summary(&fold_dense_contractions(&escaping).unwrap()),
             eqn_summary(&escaping),
             "an escaping transpose must not fold"
-        );
-
-        // `infer` must agree with the matmul's OWN declared output type. If it does not, the composition is
-        // not the one this operation means, whatever it looks like structurally.
-        let mut disagreeing = graph.clone();
-        disagreeing.values[graph.output].aval = TensorType::f32(vec![1, 2, 9]);
-        assert_eq!(
-            eqn_summary(&fold_dense_contractions(&disagreeing)),
-            eqn_summary(&disagreeing),
-            "a matmul whose declared output disagrees with infer must not fold"
-        );
-
-        // A non-swapping permutation reads the weight in a different order, so it must not fold.
-        let mut wrong_perm = graph.clone();
-        let transpose = wrong_perm
-            .eqns
-            .iter_mut()
-            .find(|eqn| matches!(eqn.op, OpKind::Transpose { .. }))
-            .expect("the traced graph transposes");
-        transpose.op = OpKind::Transpose { perm: vec![0, 1] };
-        let out = transpose.out;
-        wrong_perm.values[out].aval = TensorType::new(vec![7, 5], DType::BF16);
-        assert_eq!(
-            eqn_summary(&fold_dense_contractions(&wrong_perm)),
-            eqn_summary(&wrong_perm)
         );
     }
 
@@ -1357,10 +1336,10 @@ mod fold_dense_bf16_tests {
         use std::collections::HashMap;
 
         let graph = lm_head_shaped_graph(DType::F32);
-        let folded = fold_dense_contractions(&graph);
+        let folded = fold_dense_contractions(&graph).unwrap();
         assert!(
             folded
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::DenseContraction { .. })),
             "the fixture folds"
@@ -1403,26 +1382,29 @@ mod fold_dense_bf16_tests {
     /// away would leave the other consumer reading a value the graph no longer produces.
     #[test]
     fn fold_declines_a_transpose_with_a_second_consumer() {
-        let mut graph = lm_head_shaped_graph(DType::BF16);
-        let transposed = graph
-            .eqns
+        let traced = lm_head_shaped_graph(DType::BF16);
+        let transposed = traced
+            .eqns()
             .iter()
             .find(|eqn| matches!(eqn.op, OpKind::Transpose { .. }))
             .expect("the traced graph transposes")
             .out;
-        let widened = graph.values.push(ValueMeta::new(
-            TensorType::f32(vec![5, 7]),
-            Storage::Device,
-            None,
-        ));
-        graph.eqns.push(Eqn {
-            op: OpKind::Cast { to: DType::F32 },
-            inputs: vec![Operand::Value(transposed)],
-            out: widened,
-            layer: None,
-        });
+        let graph = derive(&traced, |draft| {
+            let widened = draft.values_mut().push(ValueMeta::new(
+                TensorType::f32(vec![5, 7]),
+                Storage::Device,
+                None,
+            ));
+            draft.eqns_mut().push(Eqn {
+                op: OpKind::Cast { to: DType::F32 },
+                inputs: vec![Operand::Value(transposed)],
+                out: widened,
+                layer: None,
+            });
+        })
+        .unwrap();
         assert_eq!(
-            eqn_summary(&fold_dense_contractions(&graph)),
+            eqn_summary(&fold_dense_contractions(&graph).unwrap()),
             eqn_summary(&graph)
         );
     }
@@ -1439,11 +1421,11 @@ mod fold_dense_bf16_tests {
         let rows = b.gather(table, 0, token);
         let shaped = b.reshape(rows, vec![1, 3, 5]);
         let widened = b.cast(shaped, DType::F32);
-        b.finish(widened)
+        b.finish(widened).unwrap()
     }
 
     fn eqn_index(g: &Graph, matches: impl Fn(&Eqn) -> bool) -> usize {
-        g.eqns.iter().position(matches).expect("equation")
+        g.eqns().iter().position(matches).expect("equation")
     }
 
     /// Card 381 FR-004. The fold replaces the widening cast with one row gather over the checkpoint
@@ -1452,20 +1434,20 @@ mod fold_dense_bf16_tests {
     #[test]
     fn fold_matches_only_a_widened_axis0_gather() {
         let graph = embedding_shaped_graph(DType::BF16);
-        let folded = fold_dense_bf16_row_gathers(&graph);
+        let folded = fold_dense_bf16_row_gathers(&graph).unwrap();
 
-        assert_eq!(folded.output, graph.output);
-        assert_eq!(folded.aval(folded.output), graph.aval(graph.output));
+        assert_eq!(folded.result(), graph.result());
+        assert_eq!(folded.aval(folded.result()), graph.aval(graph.result()));
         assert!(
             !folded
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::Gather { .. })),
             "the BF16 gather is what this fold exists to remove"
         );
         assert!(
             !folded
-                .eqns
+                .eqns()
                 .iter()
                 .any(|eqn| matches!(eqn.op, OpKind::Cast { .. })),
             "the widening cast is folded into the row gather"
@@ -1474,7 +1456,7 @@ mod fold_dense_bf16_tests {
             matches!(eqn.op, OpKind::DenseRowGather { .. })
         });
         assert_eq!(
-            folded.eqns[index].op,
+            folded.eqns()[index].op,
             OpKind::DenseRowGather {
                 source: DType::BF16
             }
@@ -1482,19 +1464,19 @@ mod fold_dense_bf16_tests {
         assert_eq!(
             eqn_summary(&folded)[index],
             (
-                folded.eqns[index].op.name(),
+                folded.eqns()[index].op.name(),
                 vec![
                     const_id(&graph, "model.language_model.embed_tokens.weight"),
                     const_id(&graph, "token")
                 ],
-                folded.eqns[index].out
+                folded.eqns()[index].out
             ),
             "the row gather reads the checkpoint constant and the token id directly"
         );
 
         // Idempotent: a folded graph has no widened gather left to match.
         assert_eq!(
-            eqn_summary(&fold_dense_bf16_row_gathers(&folded)),
+            eqn_summary(&fold_dense_bf16_row_gathers(&folded).unwrap()),
             eqn_summary(&folded),
             "the fold must be idempotent"
         );
@@ -1502,29 +1484,8 @@ mod fold_dense_bf16_tests {
         // An F32 table is not in the admitted table, so the composition is left exactly as traced.
         let f32_table = embedding_shaped_graph(DType::F32);
         assert_eq!(
-            eqn_summary(&fold_dense_bf16_row_gathers(&f32_table)),
+            eqn_summary(&fold_dense_bf16_row_gathers(&f32_table).unwrap()),
             eqn_summary(&f32_table)
-        );
-
-        // A non-axis-0 gather selects along a different axis, so it is a different equation whatever the
-        // declared shapes say.
-        let mut other_axis = graph.clone();
-        let gather = eqn_index(&graph, |eqn| matches!(eqn.op, OpKind::Gather { .. }));
-        other_axis.eqns[gather].op = OpKind::Gather { axis: 1 };
-        assert_eq!(
-            eqn_summary(&fold_dense_bf16_row_gathers(&other_axis)),
-            eqn_summary(&other_axis),
-            "an axis-1 gather must not fold"
-        );
-
-        // `infer` must agree with the cast's OWN declared output type. If it does not, the composition is
-        // not the one this operation means, whatever it looks like structurally.
-        let mut disagreeing = graph.clone();
-        disagreeing.values[graph.output].aval = TensorType::f32(vec![1, 3, 9]);
-        assert_eq!(
-            eqn_summary(&fold_dense_bf16_row_gathers(&disagreeing)),
-            eqn_summary(&disagreeing),
-            "a cast whose declared output disagrees with infer must not fold"
         );
     }
 
@@ -1533,28 +1494,28 @@ mod fold_dense_bf16_tests {
     #[test]
     fn fold_rebuilds_the_reshape_chain_over_f32() {
         let graph = embedding_shaped_graph(DType::BF16);
-        let folded = fold_dense_bf16_row_gathers(&graph);
+        let folded = fold_dense_bf16_row_gathers(&graph).unwrap();
 
         let gather = eqn_index(&folded, |eqn| {
             matches!(eqn.op, OpKind::DenseRowGather { .. })
         });
         let reshape = eqn_index(&folded, |eqn| matches!(eqn.op, OpKind::Reshape { .. }));
         assert_eq!(
-            folded.aval(folded.eqns[gather].out),
+            folded.aval(folded.eqns()[gather].out),
             &TensorType::f32(vec![3, 5]),
             "the row gather writes decoded F32 rows, not packed BF16"
         );
         assert_eq!(
             eqn_summary(&folded)[reshape],
             (
-                folded.eqns[reshape].op.name(),
-                vec![folded.eqns[gather].out],
-                graph.output
+                folded.eqns()[reshape].op.name(),
+                vec![folded.eqns()[gather].out],
+                graph.result()
             ),
             "the rebuilt reshape reads the gathered rows and writes the cast's own id"
         );
         assert_eq!(
-            folded.eqns[reshape].op,
+            folded.eqns()[reshape].op,
             OpKind::Reshape {
                 shape: vec![1, 3, 5]
             }
@@ -1565,21 +1526,25 @@ mod fold_dense_bf16_tests {
     /// away would leave the other consumer reading a value the graph no longer produces.
     #[test]
     fn fold_declines_a_gather_with_a_second_consumer() {
-        let mut graph = embedding_shaped_graph(DType::BF16);
-        let rows = graph.eqns[eqn_index(&graph, |eqn| matches!(eqn.op, OpKind::Gather { .. }))].out;
-        let second = graph.values.push(ValueMeta::new(
-            TensorType::f32(vec![3, 5]),
-            Storage::Device,
-            None,
-        ));
-        graph.eqns.push(Eqn {
-            op: OpKind::Cast { to: DType::F32 },
-            inputs: vec![Operand::Value(rows)],
-            out: second,
-            layer: None,
-        });
+        let traced = embedding_shaped_graph(DType::BF16);
+        let rows =
+            traced.eqns()[eqn_index(&traced, |eqn| matches!(eqn.op, OpKind::Gather { .. }))].out;
+        let graph = derive(&traced, |draft| {
+            let second = draft.values_mut().push(ValueMeta::new(
+                TensorType::f32(vec![3, 5]),
+                Storage::Device,
+                None,
+            ));
+            draft.eqns_mut().push(Eqn {
+                op: OpKind::Cast { to: DType::F32 },
+                inputs: vec![Operand::Value(rows)],
+                out: second,
+                layer: None,
+            });
+        })
+        .unwrap();
         assert_eq!(
-            eqn_summary(&fold_dense_bf16_row_gathers(&graph)),
+            eqn_summary(&fold_dense_bf16_row_gathers(&graph).unwrap()),
             eqn_summary(&graph)
         );
     }
@@ -1588,12 +1553,13 @@ mod fold_dense_bf16_tests {
     /// them cannot be removed. Its consumer count is still exactly one.
     #[test]
     fn fold_declines_an_escaping_gather() {
-        let mut graph = embedding_shaped_graph(DType::BF16);
-        let rows = graph.eqns[eqn_index(&graph, |eqn| matches!(eqn.op, OpKind::Gather { .. }))].out;
-        graph.output = rows;
+        let traced = embedding_shaped_graph(DType::BF16);
+        let rows =
+            traced.eqns()[eqn_index(&traced, |eqn| matches!(eqn.op, OpKind::Gather { .. }))].out;
+        let graph = derive(&traced, |draft| draft.set_result(rows)).unwrap();
         assert!(graph.liveness_roots().any(|root| root == rows));
         assert_eq!(
-            eqn_summary(&fold_dense_bf16_row_gathers(&graph)),
+            eqn_summary(&fold_dense_bf16_row_gathers(&graph).unwrap()),
             eqn_summary(&graph),
             "an escaping gather must not fold"
         );
@@ -1613,9 +1579,9 @@ mod fold_dense_bf16_tests {
         let rows = b.gather(table, 0, token);
         let moved = b.transpose(rows, vec![1, 0]);
         let widened = b.cast(moved, DType::F32);
-        let graph = b.finish(widened);
+        let graph = b.finish(widened).unwrap();
         assert_eq!(
-            eqn_summary(&fold_dense_bf16_row_gathers(&graph)),
+            eqn_summary(&fold_dense_bf16_row_gathers(&graph).unwrap()),
             eqn_summary(&graph)
         );
     }
@@ -1640,44 +1606,44 @@ mod lower_nonlast_reduces_tests {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![2, 4]));
         let reduced = b.reduce(RedOp::Sum, x, 0, false);
-        let graph = b.finish(reduced);
-        assert_eq!(graph.aval(graph.output).shape, vec![4]);
+        let graph = b.finish(reduced).unwrap();
+        assert_eq!(graph.aval(graph.result()).shape, vec![4]);
 
-        let lowered = lower_nonlast_reduces(&graph);
-        assert_eq!(lowered.eqns.len(), 2, "transpose + last-axis reduce");
-        let OpKind::Transpose { perm } = &lowered.eqns[0].op else {
+        let lowered = lower_nonlast_reduces(&graph).unwrap();
+        assert_eq!(lowered.eqns().len(), 2, "transpose + last-axis reduce");
+        let OpKind::Transpose { perm } = &lowered.eqns()[0].op else {
             panic!(
                 "first lowered equation must be the transpose, got {:?}",
-                lowered.eqns[0].op
+                lowered.eqns()[0].op
             );
         };
         assert_eq!(perm, &vec![1, 0], "axis 0 moves last");
-        let OpKind::Reduce { op, axis, keepdim } = &lowered.eqns[1].op else {
+        let OpKind::Reduce { op, axis, keepdim } = &lowered.eqns()[1].op else {
             panic!(
                 "second lowered equation must be the reduce, got {:?}",
-                lowered.eqns[1].op
+                lowered.eqns()[1].op
             );
         };
         assert_eq!((*op, *axis, *keepdim), (RedOp::Sum, 1, false));
         assert!(
-            matches!(&lowered.eqns[1].inputs[..], [Operand::Value(id)] if *id == lowered.eqns[0].out),
+            matches!(&lowered.eqns()[1].inputs[..], [Operand::Value(id)] if *id == lowered.eqns()[0].out),
             "the reduce reads the transposed value"
         );
         assert_eq!(
-            lowered.eqns[1].out, graph.output,
+            lowered.eqns()[1].out,
+            graph.result(),
             "the reduce keeps the original output value id"
         );
-        assert_eq!(lowered.aval(lowered.eqns[1].out).shape, vec![4]);
-        lowered.validate().expect("lowered graph stays valid");
+        assert_eq!(lowered.aval(lowered.eqns()[1].out).shape, vec![4]);
 
         // Idempotent: nothing non-last is left to rewrite.
-        let again = lower_nonlast_reduces(&lowered);
-        assert_eq!(again.eqns.len(), lowered.eqns.len());
+        let again = lower_nonlast_reduces(&lowered).unwrap();
+        assert_eq!(again.eqns().len(), lowered.eqns().len());
         assert!(
             again
-                .eqns
+                .eqns()
                 .iter()
-                .zip(&lowered.eqns)
+                .zip(lowered.eqns())
                 .all(|(a, b)| a.op == b.op && a.out == b.out),
             "a lowered graph must come back unchanged"
         );
@@ -1686,9 +1652,9 @@ mod lower_nonlast_reduces_tests {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![2, 4]));
         let reduced = b.reduce(RedOp::Sum, x, 1, false);
-        let last_axis = b.finish(reduced);
+        let last_axis = b.finish(reduced).unwrap();
         assert_eq!(
-            lower_nonlast_reduces(&last_axis).eqns.len(),
+            lower_nonlast_reduces(&last_axis).unwrap().eqns().len(),
             1,
             "a last-axis reduce has nothing to lower"
         );
@@ -1697,34 +1663,31 @@ mod lower_nonlast_reduces_tests {
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![2, 4]));
         let reduced = b.reduce(RedOp::Max, x, 0, true);
-        let graph = b.finish(reduced);
-        assert_eq!(graph.aval(graph.output).shape, vec![1, 4]);
+        let graph = b.finish(reduced).unwrap();
+        assert_eq!(graph.aval(graph.result()).shape, vec![1, 4]);
 
-        let lowered = lower_nonlast_reduces(&graph);
+        let lowered = lower_nonlast_reduces(&graph).unwrap();
         assert_eq!(
-            lowered.eqns.len(),
+            lowered.eqns().len(),
             3,
             "transpose + keepdim reduce + reshape"
         );
-        let OpKind::Reduce { op, axis, keepdim } = &lowered.eqns[1].op else {
+        let OpKind::Reduce { op, axis, keepdim } = &lowered.eqns()[1].op else {
             panic!(
                 "second lowered equation must be the reduce, got {:?}",
-                lowered.eqns[1].op
+                lowered.eqns()[1].op
             );
         };
         assert_eq!((*op, *axis, *keepdim), (RedOp::Max, 1, true));
-        let OpKind::Reshape { shape } = lowered.eqns[2].op.clone() else {
+        let OpKind::Reshape { shape } = lowered.eqns()[2].op.clone() else {
             panic!(
                 "third lowered equation must be the reshape, got {:?}",
-                lowered.eqns[2].op
+                lowered.eqns()[2].op
             );
         };
         assert_eq!(shape, vec![1, 4]);
-        assert_eq!(lowered.eqns[2].out, graph.output);
-        assert_eq!(lowered.aval(lowered.eqns[2].out).shape, vec![1, 4]);
-        lowered
-            .validate()
-            .expect("lowered keepdim graph stays valid");
+        assert_eq!(lowered.eqns()[2].out, graph.result());
+        assert_eq!(lowered.aval(lowered.eqns()[2].out).shape, vec![1, 4]);
     }
 
     /// Card 454 D1: the CPU oracle evaluates `lower_nonlast_reduces`'s output identically to the
@@ -1753,7 +1716,7 @@ mod lower_nonlast_reduces_tests {
 
         /// Every `Reduce` in `g` reduces the last axis of its input.
         fn all_reduces_are_last_axis(g: &poot_graph_ir::Graph) -> bool {
-            g.eqns.iter().all(|eqn| {
+            g.eqns().iter().all(|eqn| {
                 let OpKind::Reduce { axis, .. } = eqn.op else {
                     return true;
                 };
@@ -1774,14 +1737,14 @@ mod lower_nonlast_reduces_tests {
             let b = Builder::new();
             let x = b.constant("x", TensorType::f32(vec![3, 4]));
             let reduced = b.reduce(op, x, 0, keepdim);
-            let bare = b.finish(reduced);
+            let bare = b.finish(reduced).unwrap();
 
             // With a consumer, so a wrong lowered value would surface downstream too.
             let b = Builder::new();
             let x = b.constant("x", TensorType::f32(vec![3, 4]));
             let reduced = b.reduce(op, x, 0, keepdim);
             let consumed = b.binary(BinOp::Add, reduced, reduced);
-            let graph = b.finish(consumed);
+            let graph = b.finish(consumed).unwrap();
 
             for original in [bare, graph] {
                 let bound = inputs(x.id());
@@ -1794,7 +1757,7 @@ mod lower_nonlast_reduces_tests {
                 .output
                 .into_host()
                 .unwrap();
-                let lowered = lower_nonlast_reduces(&original);
+                let lowered = lower_nonlast_reduces(&original).unwrap();
                 assert!(
                     all_reduces_are_last_axis(&lowered),
                     "lowered graph still holds a non-last-axis reduce (op={op:?}, keepdim={keepdim})"
@@ -1830,7 +1793,7 @@ mod lower_nonlast_reduces_tests {
 /// POOT-651: the tied lm_head of a BF16 checkpoint plans on the dense BF16 Gemv over its BF16-resident weight.
 #[cfg(test)]
 mod tied_head_tests {
-    use poot_executor_parity::dense::{Dense, Family, plain, step};
+    use poot_executor_parity::dense::{Dense, Family, step};
     use poot_graph_ir::{OpKind, Operand, Storage};
     use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_models::model::{LogitRows, Phase};
@@ -1852,13 +1815,11 @@ mod tied_head_tests {
             .heads(14, 2)
             .head_dim(64)
             .max_positions(32768);
-        plain(
-            dense
-                .zeroed_model(DType::BF16)
-                .model
-                .trace(Phase::Decode, step(1, 1, 64, LogitRows::Last))
-                .unwrap(),
-        )
+        dense
+            .zeroed_model(DType::BF16)
+            .model
+            .trace(Phase::Decode, step(1, 1, 64, LogitRows::Last))
+            .unwrap()
     }
 
     /// POOT-651 SC-001, at planning, through `compile` on wgpu and ROCm: the head contraction is the dense Gemv over
@@ -1873,7 +1834,7 @@ mod tied_head_tests {
         let graph = qwen2_5_0_5b_decode();
         let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
         for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
-            let target = Target {
+            let target = Target::Gpu {
                 backend,
                 caps: default_caps_for(backend),
             };
@@ -1914,7 +1875,7 @@ mod tied_head_tests {
             let g = program.graph();
             let head_elems = VOCAB * HIDDEN;
             assert!(
-                g.values.iter_enumerated().all(|(id, meta)| {
+                g.values().iter_enumerated().all(|(id, meta)| {
                     meta.storage != Storage::Const
                         || g.aval(id).dtype != DType::F32
                         || numel(&g.aval(id).shape) < head_elems

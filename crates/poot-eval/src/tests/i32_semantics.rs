@@ -34,7 +34,7 @@ fn words_through_both_bindings(
         })
         .collect();
     let out = build(&builder, &constants);
-    let graph = builder.finish(out);
+    let graph = builder.finish(out).unwrap();
     let ids: Vec<ValueId> = constants.iter().map(|constant| constant.id()).collect();
     (
         dense_bound_words(&graph, &ids, inputs),
@@ -154,7 +154,7 @@ fn exact_i32_add_published_as_the_output_evaluates_to_wrapped_words() {
     let left = helpers::i32_constant(&builder, "left", vec![2]).unwrap();
     let right = helpers::i32_constant(&builder, "right", vec![2]).unwrap();
     let sum = builder.binary(BinOp::Add, left, right);
-    let graph = builder.finish(sum);
+    let graph = builder.finish(sum).unwrap();
     let view = |words: [i32; 2]| {
         Value::Owner(ExactValue::I32(
             ExactI32TensorView::try_from_words(vec![2], Arc::from(words)).unwrap(),

@@ -15,6 +15,8 @@ poot-runtime.workspace = true
 poot-executor.workspace = true
 
 [dev-dependencies]
+# The performance-bank example loads a checkpoint through the loader.
+poot-load.workspace = true
 bytemuck.workspace = true
 serde_json.workspace = true
 poot-executor-parity.workspace = true
@@ -35,9 +37,6 @@ poot-tensor = { workspace = true, features = ["read-counter"] }
 poot-eval.workspace = true
 poot-quant.workspace = true
 poot-runtime-common.workspace = true
-# tests/coopmat_resident.rs's F16-const upload narrows via the loader's f32->f16, shared with the
-# GGUF loader and the resident bind path it fixtures.
-poot-load.workspace = true
 # tests/executor_contract.rs deserializes a committed offline-imported Body (.kir.json) and compiles
 # it directly against poot-codegen's on-disk kernel cache (the SC-015 fault probe).
 poot-kernel-ir = { workspace = true, features = ["serde"] }

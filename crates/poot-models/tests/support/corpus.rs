@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use poot_executor_parity::dense::{Dense, Family, step};
 use poot_executor_parity::weight_map::Projections;
-use poot_graph_ir::{Graph, ValidationOutputs};
+use poot_graph_ir::Graph;
 use poot_models::model::{
     LogitRows, Model, ModelOutput, Phase, ShapeReason, StepShape, TraceError,
 };
@@ -32,21 +32,18 @@ const BATCH: usize = 2;
 /// so a planner pass cannot leak state from one target to the next).
 pub struct Row {
     pub name: String,
-    build: Box<dyn Fn() -> Graph<ValidationOutputs>>,
+    build: Box<dyn Fn() -> Graph>,
 }
 
 impl Row {
-    fn new(
-        name: impl Into<String>,
-        build: impl Fn() -> Graph<ValidationOutputs> + 'static,
-    ) -> Self {
+    fn new(name: impl Into<String>, build: impl Fn() -> Graph + 'static) -> Self {
         Self {
             name: name.into(),
             build: Box::new(build),
         }
     }
 
-    pub fn graph(&self) -> Graph<ValidationOutputs> {
+    pub fn graph(&self) -> Graph {
         (self.build)()
     }
 }
@@ -133,7 +130,7 @@ impl Fixtured {
     }
 
     /// The graph of `shape`. A fixture that cannot trace a shape its own list holds is a broken fixture.
-    pub fn trace(&self, shape: Shape) -> Graph<ValidationOutputs> {
+    pub fn trace(&self, shape: Shape) -> Graph {
         let traced = self
             .model
             .trace(

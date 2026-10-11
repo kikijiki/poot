@@ -13,7 +13,7 @@ use poot_executor::{
     BufferRole, Device, DeviceError, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
     ExecutorStats, HostSync, LoadError, StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType, ValidationOutputs};
+use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet,
 };
@@ -69,11 +69,7 @@ impl Model for Tiny {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: TINY,
@@ -122,7 +118,7 @@ impl Model for Tiny {
             step.carry(state, folded);
         }
         let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits).unwrap())
     }
 }
 
@@ -219,7 +215,7 @@ impl Device for FakeDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -338,7 +334,7 @@ impl Executor for Wrapped {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<ValidationOutputs>,
+        program: &StagedProgram,
     ) -> Result<EntryId, ExecError> {
         if std::mem::take(&mut self.asked.borrow_mut().fail_add) {
             return Err(device_failure());
@@ -504,11 +500,11 @@ fn generate(rig: &mut Rig, request: GenerateRequest) {
 }
 
 /// The tokens one program's step carries: the extent of its `Slot::Token` input.
-fn token_extent(program: &StagedProgram<ValidationOutputs>) -> usize {
+fn token_extent(program: &StagedProgram) -> usize {
     let (_, _, stage) = program.stages().next().expect("one stage");
     let graph = stage.graph();
     graph
-        .slots
+        .slots()
         .iter()
         .find(|(_, slot)| *slot == Slot::Token)
         .map(|(value, _)| graph.aval(*value).shape.iter().product())
@@ -517,7 +513,7 @@ fn token_extent(program: &StagedProgram<ValidationOutputs>) -> usize {
 
 /// One fixture-owned 32-byte kernel per distinct token extent, no private bytes: entries of one extent
 /// (the one-token step) hold the same owner across heads.
-fn one_kernel_per_extent(program: &StagedProgram<ValidationOutputs>) -> Retention {
+fn one_kernel_per_extent(program: &StagedProgram) -> Retention {
     Retention {
         shared: vec![SharedOwner {
             key: format!("kernel@{}", token_extent(program)),
@@ -528,7 +524,7 @@ fn one_kernel_per_extent(program: &StagedProgram<ValidationOutputs>) -> Retentio
 }
 
 /// A 32-byte kernel every entry shares, plus 8 private bytes each.
-fn one_shared_kernel(_: &StagedProgram<ValidationOutputs>) -> Retention {
+fn one_shared_kernel(_: &StagedProgram) -> Retention {
     Retention {
         shared: vec![SharedOwner {
             key: "the-one-kernel".to_string(),

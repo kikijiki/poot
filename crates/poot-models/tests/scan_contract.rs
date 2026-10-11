@@ -3,7 +3,7 @@
 //! `y` and `s_out`, and `s_out` published as state. No device.
 
 use poot_executor_parity::dense::step;
-use poot_graph_ir::{Graph, OpKind, ValidationOutputs};
+use poot_graph_ir::{Graph, OpKind};
 use poot_graph_plan::device_validation::ResourceRefusal;
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, KernelChoice, Plan, PlanError,
@@ -13,6 +13,7 @@ use poot_kernelgen::{KernelRequest, ScanKernel, ScanSpec};
 use poot_models::model::{LogitRows, Phase};
 use poot_models::registry::Registry;
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried};
+use poot_test_util::graph_fixtures::{gpu_backend, gpu_caps, gpu_caps_mut};
 use poot_test_util::scan::ScanFixture;
 
 fn targets() -> [(&'static str, Target); 3] {
@@ -28,7 +29,7 @@ fn targets() -> [(&'static str, Target); 3] {
                 Backend::Nvptx => "nvptx",
                 _ => "amdgcn",
             },
-            Target {
+            Target::Gpu {
                 backend,
                 caps: poot_test_util::device_caps::default_caps_for(backend),
             },
@@ -91,7 +92,7 @@ fn graph_and_body_do_not_grow_with_the_chunk_count() {
         ),
         ("ssd", |len| families(len)[1]),
     ] {
-        let equations: Vec<usize> = lens.map(|len| make(len).graph().graph.eqns.len()).into();
+        let equations: Vec<usize> = lens.map(|len| make(len).graph().graph.eqns().len()).into();
         assert!(
             equations.windows(2).all(|w| w[0] == w[1]),
             "{family}: the traced graph grows with the sequence: equations at L={lens:?} are {equations:?}"
@@ -134,13 +135,13 @@ fn results_have_distinct_buffers_and_s_out_is_committed() {
             let program = compiled(&fixture.graph().graph, &target).unwrap();
             let graph = program.graph();
             let packed = graph
-                .eqns
+                .eqns()
                 .iter()
                 .find(|e| matches!(e.op, OpKind::Scan(_)))
                 .unwrap()
                 .out;
-            let y = graph.output;
-            let (s_in, s_out) = graph.state[0];
+            let y = graph.result();
+            let (s_in, s_out) = graph.state().next().unwrap();
             let plan = program.buffer_plan();
             let slots = [packed, y, s_out].map(|v| plan.slot(v));
             let label = format!("{:?} {name}", fixture.family);
@@ -187,7 +188,7 @@ fn refusal(error: CompileError) -> Capability {
 #[test]
 fn a_state_column_that_cannot_fit_is_refused_before_dispatch() {
     let (_, mut target) = targets().into_iter().next().unwrap();
-    target.caps.lds_bytes = 64; // 16 floats: a 32-row column does not fit
+    gpu_caps_mut(&mut target).lds_bytes = 64; // 16 floats: a 32-row column does not fit
     for fixture in [
         ScanFixture::delta_rule(1, 4, 32, 4),
         ScanFixture::ssd(1, 4, 4, 32, 4),
@@ -206,11 +207,11 @@ fn a_state_column_that_cannot_fit_is_refused_before_dispatch() {
 }
 
 fn budgeted(target: &Target, budget: u64) -> Target {
-    Target {
-        backend: target.backend,
+    Target::Gpu {
+        backend: gpu_backend(target),
         caps: DeviceCaps {
             max_dispatch_work: Queried::Known(budget),
-            ..target.caps
+            ..gpu_caps(target)
         },
     }
 }
@@ -275,7 +276,7 @@ fn the_work_bound_splits_the_sequence_or_refuses_before_dispatch() {
                 };
                 let generated = poot_kernelgen::generate(
                     &KernelRequest::Scan(expected),
-                    &target.caps,
+                    &gpu_caps(&target),
                     &poot_kernelgen::BodyLimits {
                         max_instructions: std::num::NonZeroUsize::new(1 << 16).unwrap(),
                         max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
@@ -317,7 +318,7 @@ fn the_work_bound_splits_the_sequence_or_refuses_before_dispatch() {
 #[test]
 fn per_head_states_stay_within_the_declared_resources() {
     for (name, target) in targets() {
-        let fill = |width: usize| target.caps.compute_units as usize * 64 / width + 1;
+        let fill = |width: usize| gpu_caps(&target).compute_units as usize * 64 / width + 1;
         for rows in [4usize, 32, 128, 256] {
             for (regime, filled, len, shares) in [
                 ("short", false, 16usize, false),
@@ -349,7 +350,7 @@ fn per_head_states_stay_within_the_declared_resources() {
                         "{label}: declared against measured LDS"
                     );
                     assert!(
-                        used.lds_bytes <= u64::from(target.caps.lds_bytes),
+                        used.lds_bytes <= u64::from(gpu_caps(&target).lds_bytes),
                         "{label}: LDS {} over the device",
                         used.lds_bytes
                     );
@@ -359,8 +360,8 @@ fn per_head_states_stay_within_the_declared_resources() {
                         "{label}: workgroup"
                     );
                     assert!(
-                        spec.cols as u32 <= target.caps.max_workgroup_size[0]
-                            && spec.cols as u32 <= target.caps.max_workgroup_invocations,
+                        spec.cols as u32 <= gpu_caps(&target).max_workgroup_size[0]
+                            && spec.cols as u32 <= gpu_caps(&target).max_workgroup_invocations,
                         "{label}: {} lanes over the device's workgroup limits",
                         spec.cols
                     );
@@ -387,9 +388,9 @@ fn per_head_states_stay_within_the_declared_resources() {
                     };
                     let wider = spec.state_cols() * 2;
                     let lanes_limit = if spec.row_split == 1 { 64 } else { 256 }
-                        .min(target.caps.max_workgroup_size[0] as usize);
+                        .min(gpu_caps(&target).max_workgroup_size[0] as usize);
                     assert!(
-                        4 * wider * (rows + planes) > target.caps.lds_bytes as usize
+                        4 * wider * (rows + planes) > gpu_caps(&target).lds_bytes as usize
                             || wider * spec.row_split > lanes_limit
                             || spec.state_cols() == spec.width.min(64),
                         "{label}: {} columns is not the widest that fits",
@@ -405,13 +406,7 @@ fn per_head_states_stay_within_the_declared_resources() {
 
 const PROMPT: usize = 4;
 
-fn registered(
-    family: &str,
-    phase: Phase,
-    rows: usize,
-    tokens: usize,
-    cap: usize,
-) -> Graph<ValidationOutputs> {
+fn registered(family: &str, phase: Phase, rows: usize, tokens: usize, cap: usize) -> Graph {
     let registry = Registry::builtin().expect("the builtin registry");
     // `family/variant` names one of the family's option fixtures (llama's Mixtral, granite's granitemoe).
     let (name, variant) = family.split_once('/').unwrap_or((family, ""));
@@ -439,7 +434,7 @@ fn registered(
 }
 
 /// The scans of `program` and, for each, the generated request and the dispatches it launches.
-fn scans(program: &Program<ValidationOutputs>) -> Vec<(ScanSpec, usize)> {
+fn scans(program: &Program) -> Vec<(ScanSpec, usize)> {
     program
         .planned()
         .filter(|(eqn, _)| matches!(eqn.op, OpKind::Scan(_)))
@@ -465,7 +460,7 @@ fn scans(program: &Program<ValidationOutputs>) -> Vec<(ScanSpec, usize)> {
 /// (a whole-model graph cannot take a synthetic budget: every other kernel in it is bounded by it too).
 #[test]
 fn the_model_prefills_plan_bounded_generated_scans() {
-    let graphs: [(&str, ScanKernel, Graph<ValidationOutputs>); 3] = [
+    let graphs: [(&str, ScanKernel, Graph); 3] = [
         (
             "qwen4exp.prefill",
             ScanKernel::DeltaRule,
@@ -500,7 +495,7 @@ fn the_model_prefills_plan_bounded_generated_scans() {
                     "{label}: an unbounded device launches the scan once"
                 );
                 assert!(
-                    spec.lds_bytes() <= u64::from(target.caps.lds_bytes),
+                    spec.lds_bytes() <= u64::from(gpu_caps(&target).lds_bytes),
                     "{label}: LDS"
                 );
                 let work = KernelRequest::Scan(spec.clone())

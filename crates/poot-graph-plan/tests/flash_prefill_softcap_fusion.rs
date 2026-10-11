@@ -68,7 +68,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
             let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
             let m = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
             let o = attention_prefill_softcap(&b, q, k, v, n_rep, scale, m, softcap_opt);
-            let g = b.finish(o);
+            let g = b.finish(o).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
                 q.id(),
@@ -98,10 +98,10 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
     };
     let autofused = |softcap_opt: Option<f32>| -> HostTensor {
         let (g, inp) = trace(softcap_opt);
-        let opt = optimize(&g);
+        let opt = optimize(&g).unwrap();
         // Structural check that fusion fired: exactly one flash-prefill op, carrying the same softcap passed in.
         let flash_ops: Vec<&poot_graph_ir::op::OpKind> = opt
-            .eqns
+            .eqns()
             .iter()
             .map(|e| &e.op)
             .filter(|op| matches!(op, poot_graph_ir::op::OpKind::Attention(_)))
@@ -109,7 +109,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
         assert_eq!(
             flash_ops.len(),
             1,
-            "expected optimize() to fuse this attention_prefill_softcap chain into exactly one flash op"
+            "expected optimize().unwrap() to fuse this attention_prefill_softcap chain into exactly one flash op"
         );
         let got_softcap = match flash_ops[0] {
             poot_graph_ir::op::OpKind::Attention(attrs) => attrs.softcap,

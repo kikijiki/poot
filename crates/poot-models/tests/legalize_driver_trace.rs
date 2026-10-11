@@ -43,7 +43,7 @@ fn options() -> CompileOptions {
 }
 
 struct Driver {
-    graph: poot_graph_ir::Graph<poot_graph_ir::ValidationOutputs>,
+    graph: poot_graph_ir::Graph,
     store: WeightStore,
     map: WeightMap,
 }
@@ -130,13 +130,12 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
     let d = driver_trace();
     let state: Vec<HostTensor> = d
         .graph
-        .state
-        .iter()
-        .map(|&(si, _)| HostTensor::zeros(d.graph.aval(si).shape.clone()))
+        .state()
+        .map(|(si, _)| HostTensor::zeros(d.graph.aval(si).shape.clone()))
         .collect();
     let (dense, _) = eval_mapped(&d.graph, &d.store, &d.map, &slot_values(), &state);
 
-    let target = Target {
+    let target = Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: caps(LIMIT),
     };
@@ -147,10 +146,10 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
     // per split weight: (chunks bound so far, rows bound so far)
     let mut next: HashMap<String, (usize, usize)> = HashMap::new();
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &(si, _) in &g.state {
+    for (si, _) in g.state() {
         inputs.insert(si, Value::from(HostTensor::zeros(g.aval(si).shape.clone())));
     }
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let name = meta.name.as_deref();
         let value = match meta.storage {
@@ -184,7 +183,7 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
         };
         inputs.insert(id, Value::from(value));
     }
-    for &id in &g.consts {
+    for &id in g.consts() {
         let bytes = g.aval(id).numel() as u64 * g.aval(id).dtype.byte_size() as u64;
         assert!(
             bytes <= LIMIT,
@@ -216,7 +215,7 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
 #[test]
 fn driver_compile_refuses_a_head_no_row_split_can_fit() {
     let d = driver_trace();
-    let target = Target {
+    let target = Target::Gpu {
         backend: Backend::SpirvVulkan,
         caps: caps(100),
     };

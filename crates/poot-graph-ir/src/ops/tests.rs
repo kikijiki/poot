@@ -9,7 +9,12 @@ fn trace_kinds(f: fn(&Builder, Traced) -> Traced) -> Vec<OpKind> {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![2, 3]));
     let out = f(&b, x);
-    b.finish(out).eqns.into_iter().map(|e| e.op).collect()
+    b.finish(out)
+        .unwrap()
+        .eqns()
+        .iter()
+        .map(|e| e.op.clone())
+        .collect()
 }
 
 /// Card 630: the activations are primitive compositions, not primitives. `silu` is the single division
@@ -60,7 +65,13 @@ fn swiglu_and_geglu_emit_activation_then_mul() {
         let gate = b.constant("gate", TensorType::f32(vec![2, 3]));
         let up = b.constant("up", TensorType::f32(vec![2, 3]));
         let out = f(&b, gate, up);
-        let kinds: Vec<OpKind> = b.finish(out).eqns.into_iter().map(|e| e.op).collect();
+        let kinds: Vec<OpKind> = b
+            .finish(out)
+            .unwrap()
+            .eqns()
+            .iter()
+            .map(|e| e.op.clone())
+            .collect();
         let mut want = trace_kinds(act);
         want.push(OpKind::Binary(BinOp::Mul));
         assert_eq!(kinds, want);
@@ -74,15 +85,15 @@ fn packed_linear_append_is_transactional() -> Result<(), BuilderAppendError> {
     let x = b.constant("x", TensorType::f32(vec![2, 35]));
     let bias = b.constant("bias", TensorType::f32(vec![3]));
     let output = packed_linear(&b, x, "layer", descriptor, None, Some(bias))?;
-    let graph = b.finish(output);
-    assert_eq!(graph.values.len(), 8);
-    assert_eq!(graph.inputs.len(), 4);
-    assert_eq!(graph.consts.len(), 4);
-    assert!(graph.slots.is_empty());
+    let graph = b.finish(output).unwrap();
+    assert_eq!(graph.values().len(), 8);
+    assert_eq!(graph.inputs().len(), 4);
+    assert_eq!(graph.consts().len(), 4);
+    assert!(graph.slots().is_empty());
     let [weight_name, scale_name] = PackedSourceName::pair("layer");
     assert_eq!(
         graph
-            .inputs
+            .inputs()
             .iter()
             .map(|&value| graph.meta(value).name.as_deref())
             .collect::<Vec<_>>(),
@@ -94,7 +105,7 @@ fn packed_linear_append_is_transactional() -> Result<(), BuilderAppendError> {
         ]
     );
     assert!(matches!(
-        graph.eqns.iter().map(|eqn| &eqn.op).collect::<Vec<_>>().as_slice(),
+        graph.eqns().iter().map(|eqn| &eqn.op).collect::<Vec<_>>().as_slice(),
         [
             OpKind::PackedDequant { .. },
             OpKind::Transpose { perm },
@@ -104,7 +115,7 @@ fn packed_linear_append_is_transactional() -> Result<(), BuilderAppendError> {
     ));
     assert_eq!(
         graph
-            .eqns
+            .eqns()
             .iter()
             .filter(|eqn| matches!(eqn.op, OpKind::PackedDequant { .. }))
             .count(),
@@ -138,13 +149,13 @@ fn packed_linear_stages_every_source_in_role_order() -> Result<(), BuilderAppend
         let b = Builder::new();
         let x = b.constant("x", TensorType::f32(vec![2, 256]));
         let output = packed_linear(&b, x, "layer", descriptor, None, None)?;
-        let graph = b.finish(output);
+        let graph = b.finish(output).unwrap();
         let roles = descriptor.sources();
         assert_eq!(roles.len(), source_count, "{format:?}");
-        let OpKind::PackedDequant { .. } = graph.eqns[0].op else {
-            panic!("{format:?}: first equation is {:?}", graph.eqns[0].op);
+        let OpKind::PackedDequant { .. } = graph.eqns()[0].op else {
+            panic!("{format:?}: first equation is {:?}", graph.eqns()[0].op);
         };
-        let carriers: Vec<crate::ValueId> = graph.eqns[0]
+        let carriers: Vec<crate::ValueId> = graph.eqns()[0]
             .inputs
             .iter()
             .map(|operand| match operand {
@@ -194,12 +205,12 @@ fn packed_linear_error_preserves_graph() {
         }) if name == taken.as_str()
     ));
     assert_eq!(collision_builder.generation(), before);
-    let graph = collision_builder.finish(x);
-    assert_eq!(graph.values.len(), 2);
-    assert_eq!(graph.inputs.len(), 2);
-    assert_eq!(graph.consts.len(), 2);
-    assert!(graph.slots.is_empty());
-    assert!(graph.eqns.is_empty());
+    let graph = collision_builder.finish(x).unwrap();
+    assert_eq!(graph.values().len(), 2);
+    assert_eq!(graph.inputs().len(), 2);
+    assert_eq!(graph.consts().len(), 2);
+    assert!(graph.slots().is_empty());
+    assert!(graph.eqns().is_empty());
 
     let inference_builder = Builder::new();
     let wrong_x = inference_builder.constant("wrong_x", TensorType::f32(vec![2, 34]));
@@ -220,12 +231,12 @@ fn packed_linear_error_preserves_graph() {
         }) if operation == "matmul"
     ));
     assert_eq!(inference_builder.generation(), before);
-    let graph = inference_builder.finish(wrong_x);
-    assert_eq!(graph.values.len(), 1);
-    assert_eq!(graph.inputs, vec![wrong_x.id()]);
-    assert_eq!(graph.consts, vec![wrong_x.id()]);
-    assert!(graph.slots.is_empty());
-    assert!(graph.eqns.is_empty());
+    let graph = inference_builder.finish(wrong_x).unwrap();
+    assert_eq!(graph.values().len(), 1);
+    assert_eq!(graph.inputs(), vec![wrong_x.id()]);
+    assert_eq!(graph.consts(), vec![wrong_x.id()]);
+    assert!(graph.slots().is_empty());
+    assert!(graph.eqns().is_empty());
 }
 
 #[test]
@@ -241,10 +252,10 @@ fn packed_block_diagonal_linear_builds_expected_chain() -> Result<(), BuilderApp
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![4, 5, 35]));
     let output = packed_block_diagonal_linear(&b, x, "layer", descriptor, 4, None)?;
-    let graph = b.finish(output);
-    assert_eq!(graph.aval(graph.output).shape, vec![4, 5, 2]);
+    let graph = b.finish(output).unwrap();
+    assert_eq!(graph.aval(graph.result()).shape, vec![4, 5, 2]);
     assert!(matches!(
-        graph.eqns.iter().map(|eqn| &eqn.op).collect::<Vec<_>>().as_slice(),
+        graph.eqns().iter().map(|eqn| &eqn.op).collect::<Vec<_>>().as_slice(),
         [
             OpKind::PackedDequant { .. },
             OpKind::Reshape { shape },
@@ -270,9 +281,9 @@ fn packed_block_diagonal_linear_rejects_indivisible_blocks() {
         before,
         "a rejected call must not mutate the builder"
     );
-    let graph = b.finish(x);
-    assert_eq!(graph.values.len(), 1);
-    assert!(graph.eqns.is_empty(), "no packed equations were staged");
+    let graph = b.finish(x).unwrap();
+    assert_eq!(graph.values().len(), 1);
+    assert!(graph.eqns().is_empty(), "no packed equations were staged");
 }
 
 fn operand_value(eqn: &crate::Eqn, position: usize) -> crate::ValueId {
@@ -320,10 +331,10 @@ fn packed_indexed_linear_is_one_claimed_contraction_over_stacked_carriers()
         let x = b.constant("x", TensorType::f32(vec![4, k]));
         let selector = b.constant("selector", TensorType::new(vec![4], DType::I32));
         let output = packed_indexed_linear(&b, x, selector, &table)?;
-        let graph = b.finish(output);
+        let graph = b.finish(output).unwrap();
 
-        let [eqn] = graph.eqns.as_slice() else {
-            panic!("{format:?}: expected one equation, got {:?}", graph.eqns);
+        let [eqn] = graph.eqns() else {
+            panic!("{format:?}: expected one equation, got {:?}", graph.eqns());
         };
         assert_eq!(
             eqn.op,
@@ -352,7 +363,7 @@ fn packed_indexed_linear_is_one_claimed_contraction_over_stacked_carriers()
                 "{format:?} {role:?}"
             );
         }
-        assert_eq!(graph.output, eqn.out);
+        assert_eq!(graph.result(), eqn.out);
     }
     Ok(())
 }
@@ -475,22 +486,22 @@ fn ut_transform_neumann_doubling_is_log_op_count() {
         let b = Builder::new();
         let attn = b.constant("attn", TensorType::f32(vec![c, c]));
         let t = unit_lower_triangular_inverse(&b, attn);
-        let g = b.finish(t);
+        let g = b.finish(t).unwrap();
         assert!(
-            g.eqns.len() <= max_eqns,
+            g.eqns().len() <= max_eqns,
             "UT-transform C={c} emitted {} eqns (expected <= {max_eqns}, LOG in C)",
-            g.eqns.len()
+            g.eqns().len()
         );
     }
     // and the old block-recursive (kept as a cross-check) is still ~20x heavier at C=64.
     let b = Builder::new();
     let attn = b.constant("attn", TensorType::f32(vec![64, 64]));
     let t = ut_inverse_block_recursive(&b, attn, 64, 2);
-    let g = b.finish(t);
+    let g = b.finish(t).unwrap();
     assert!(
-        g.eqns.len() > 900,
+        g.eqns().len() > 900,
         "block-recursive C=64 should stay LINEAR (~947 eqns), got {}",
-        g.eqns.len()
+        g.eqns().len()
     );
 }
 

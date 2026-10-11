@@ -168,7 +168,7 @@ fn fuzz_reduce_all_axes_and_keepdim() {
                     let b = Builder::new();
                     let x = b.constant("x", TensorType::f32(shape.to_vec()));
                     let r = b.reduce(op, x, axis, keepdim);
-                    let g = b.finish(r);
+                    let g = b.finish(r).unwrap();
                     let mut inp = HashMap::new();
                     inp.insert(
                         x.id(),
@@ -244,7 +244,7 @@ fn fuzz_matmul_random_shapes() {
         let av = bld.constant("a", TensorType::f32(a_shape.to_vec()));
         let bv = bld.constant("b", TensorType::f32(b_shape.to_vec()));
         let out = bld.matmul(av, bv);
-        let g = bld.finish(out);
+        let g = bld.finish(out).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
             av.id(),
@@ -323,7 +323,7 @@ fn fuzz_transpose_correctness() {
         let bld = Builder::new();
         let x = bld.constant("x", TensorType::f32(shape.to_vec()));
         let t = bld.transpose(x, perm.to_vec());
-        let g = bld.finish(t);
+        let g = bld.finish(t).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
             x.id(),
@@ -389,7 +389,7 @@ fn fuzz_broadcast_correctness() {
         let bld = Builder::new();
         let x = bld.constant("x", TensorType::f32(in_shape.to_vec()));
         let y = bld.broadcast(x, out_shape.to_vec());
-        let g = bld.finish(y);
+        let g = bld.finish(y).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
             x.id(),
@@ -438,7 +438,7 @@ fn fuzz_elementwise_correctness() {
             let bld = Builder::new();
             let x = bld.constant("x", TensorType::f32(vec![width]));
             let y = bld.unary(UnOp::Neg, x);
-            let g = bld.finish(y);
+            let g = bld.finish(y).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
                 x.id(),
@@ -466,7 +466,7 @@ fn fuzz_elementwise_correctness() {
             let bld = Builder::new();
             let x = bld.constant("x", TensorType::f32(vec![width]));
             let y = bld.unary(UnOp::Exp, x);
-            let g = bld.finish(y);
+            let g = bld.finish(y).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
                 x.id(),
@@ -501,7 +501,7 @@ fn fuzz_elementwise_correctness() {
             let bld = Builder::new();
             let x = bld.constant("x", TensorType::f32(vec![width]));
             let y = bld.unary(op, x);
-            let g = bld.finish(y);
+            let g = bld.finish(y).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
                 x.id(),
@@ -541,7 +541,7 @@ fn fuzz_elementwise_correctness() {
             let av = bld.constant("a", TensorType::f32(vec![width]));
             let bv = bld.constant("b", TensorType::f32(vec![width]));
             let r = bld.binary(*op, av, bv);
-            let g = bld.finish(r);
+            let g = bld.finish(r).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
                 av.id(),
@@ -600,7 +600,7 @@ fn fuzz_softmax_vs_independent_formula() {
         let bld = Builder::new();
         let x = bld.constant("x", TensorType::f32(shape.to_vec()));
         let s = softmax(&bld, x);
-        let g = bld.finish(s);
+        let g = bld.finish(s).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
             x.id(),
@@ -659,7 +659,7 @@ fn softmax_stays_accurate_at_extreme_score_magnitude() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::f32(vec![l]));
     let s = softmax(&b, x);
-    let g = b.finish(s);
+    let g = b.finish(s).unwrap();
     let mut inp = HashMap::new();
     inp.insert(
         x.id(),

@@ -130,15 +130,14 @@ fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
     let unembed = b.constant("unembed", TensorType::f32(vec![H, VOCAB]));
     let logits = linear(&b, xf, unembed, None);
 
-    let graph = b.finish_with_state(
-        logits,
-        &[
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(logits).with_state(&[
             (kc, kc_out),
             (vc, vc_out),
             (conv_cache, conv_cache_out),
             (ssm, ssm_out),
-        ],
-    );
+        ]))
+        .unwrap();
     let store = store_with(&graph, toy_weights);
     let key = |id| graph.meta(id).slot_key().unwrap().clone();
     let steps = (0..CAP)

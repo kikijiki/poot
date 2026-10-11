@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::chat::ChatFormat;
@@ -260,11 +260,7 @@ impl Model for Gemma2 {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         let b = Builder::new();
@@ -280,7 +276,7 @@ impl Model for Gemma2 {
                 |b, BlockInput { block: h, .. }| geglu_ffn(b, h, &layer.ffn),
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -717,10 +713,7 @@ mod family_tests {
     /// Gemma 2-2B's real dimensions at four layers (two global, two sliding) and a trimmed
     /// vocabulary and feed-forward width, as a zero-weight checkpoint: only the graph's structure
     /// matters here, and a host-only trace of it is fast. `softcap` is the attention-logit cap.
-    fn real_shape_prefill(
-        softcap: Option<f32>,
-        n: usize,
-    ) -> poot_graph_ir::Graph<ValidationOutputs> {
+    fn real_shape_prefill(softcap: Option<f32>, n: usize) -> poot_graph_ir::Graph {
         let mut config = json!({
             "model_type": "gemma2",
             "vocab_size": 4096,
@@ -778,9 +771,9 @@ mod family_tests {
     fn prefill_with_the_real_softcap_flash_fuses_every_layer() {
         let n = 2048;
         let g = real_shape_prefill(Some(50.0), n);
-        let opt = crate::test_support::optimize(&g);
+        let opt = crate::test_support::optimize(&g).unwrap();
         let softcaps: Vec<Option<f32>> = opt
-            .eqns
+            .eqns()
             .iter()
             .filter_map(|e| match &e.op {
                 poot_graph_ir::OpKind::Attention(attrs) => Some(attrs.softcap),
@@ -800,9 +793,9 @@ mod family_tests {
     #[test]
     fn prefill_without_a_softcap_flash_fuses_every_layer() {
         let n = 2048;
-        let opt = crate::test_support::optimize(&real_shape_prefill(None, n));
+        let opt = crate::test_support::optimize(&real_shape_prefill(None, n)).unwrap();
         let fused = opt
-            .eqns
+            .eqns()
             .iter()
             .filter(|e| matches!(e.op, poot_graph_ir::OpKind::Attention(_)))
             .count();
@@ -813,11 +806,8 @@ mod family_tests {
     /// A rank-4 `[., Hq, L, L']` MatMul output with both trailing dims at least `n` is the
     /// materialized softmax(QK^T) matrix, not a projection (rank 3) or the last-position-only
     /// lm_head (second-to-last dim 1).
-    fn assert_no_materialized_scores<V: poot_graph_ir::ValidationChannel>(
-        g: &poot_graph_ir::Graph<V>,
-        n: usize,
-    ) {
-        for e in &g.eqns {
+    fn assert_no_materialized_scores(g: &poot_graph_ir::Graph, n: usize) {
+        for e in g.eqns() {
             if matches!(e.op, poot_graph_ir::OpKind::MatMul) {
                 let shape = &g.aval(e.out).shape;
                 let r = shape.len();

@@ -655,22 +655,3 @@ pub fn dense_bytes<'a>(store: &'a WeightStore, name: &str) -> Result<&'a DenseWe
         None => Err(LoadError::SafeTensors(format!("missing tensor {name}"))),
     }
 }
-
-/// Decode a dense entry's stored bytes to row-major f32 (the CPU-oracle payload). See
-/// [`dense_bytes`]'s doc for why this is `pub`.
-pub fn decode_dense(dense: &DenseWeight) -> Result<(Vec<usize>, Vec<f32>), LoadError> {
-    let dtype_str = match dense.dtype() {
-        DType::F32 => "F32",
-        DType::BF16 => "BF16",
-        DType::F16 => "F16",
-        DType::E4M3FN => "F8_E4M3",
-        DType::E8M0 => "F8_E8M0",
-        other => {
-            return Err(LoadError::UndecodableCheckpointDtype {
-                name: format!("{other:?}"),
-            });
-        }
-    };
-    let data = decode(dtype_str, dense.bytes().as_slice())?;
-    Ok((dense.shape().to_vec(), data))
-}

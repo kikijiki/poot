@@ -187,6 +187,8 @@ pub struct AieLinkRecipe {
     fifos: Vec<AieFifo>,
     /// One finite invocation: the core runs its loop once over the whole tensors.
     invocations: u64,
+    /// Tile-local bytes every FIFO buffer reserves at its depth, checked once at construction.
+    tile_local_bytes: u64,
 }
 
 impl AieLinkRecipe {
@@ -215,17 +217,28 @@ impl AieLinkRecipe {
                 element: b.storage().element(),
             })
             .collect();
-        let recipe = Self {
+        let tile_local_bytes = fifos
+            .iter()
+            .try_fold(0u64, |total, fifo| {
+                let one = fifo
+                    .elements
+                    .checked_mul(fifo.element.byte_width() as u64)?;
+                total.checked_add(one.checked_mul(u64::from(fifo.depth))?)
+            })
+            .ok_or(AieAbiMismatch::TileLocalOverflow)?;
+        Ok(Self {
             symbol: symbol.to_owned(),
             target,
             abi: abi.clone(),
             fifos,
             invocations: 1,
-        };
-        recipe
-            .tile_local_bytes()
-            .ok_or(AieAbiMismatch::TileLocalOverflow)?;
-        Ok(recipe)
+            tile_local_bytes,
+        })
+    }
+
+    /// The target this recipe links for.
+    pub fn target(&self) -> AieTargetId {
+        self.target
     }
 
     pub fn symbol(&self) -> &str {
@@ -244,14 +257,9 @@ impl AieLinkRecipe {
         self.invocations
     }
 
-    /// Tile-local bytes every FIFO buffer reserves at its depth; `None` on overflow.
-    pub fn tile_local_bytes(&self) -> Option<u64> {
-        self.fifos.iter().try_fold(0u64, |total, fifo| {
-            let one = fifo
-                .elements
-                .checked_mul(fifo.element.byte_width() as u64)?;
-            total.checked_add(one.checked_mul(u64::from(fifo.depth))?)
-        })
+    /// Tile-local bytes every FIFO buffer reserves at its depth (no overflow: construction refused one).
+    pub fn tile_local_bytes(&self) -> u64 {
+        self.tile_local_bytes
     }
 
     /// The recipe's canonical text: versioned, tagged and length-prefixed, and the file the driver reads.
@@ -554,13 +562,11 @@ pub(crate) struct AieObjectPlan {
 /// caller owns and removes.
 pub(crate) fn build_object_plan(
     body: &Body,
-    abi: &AieShapeAbi,
-    target: AieTargetId,
+    recipe: &AieLinkRecipe,
     toolchain: &Toolchain,
     scratch: &Path,
 ) -> Result<AieObjectPlan, AieCompileError> {
-    check_body_abi(body, abi)?;
-    let recipe = AieLinkRecipe::sequential(&body.name, target, abi)?;
+    check_body_abi(body, recipe.abi())?;
     let out = scratch.join(format!("{}.o", body.name));
     compile_with(body, Target::AieCore, &out, toolchain).map_err(|error| match error {
         CompileError::Emit(error) => AieCompileError::Emit(error),
@@ -594,7 +600,7 @@ pub(crate) fn build_object_plan(
     Ok(AieObjectPlan {
         symbol: body.name.clone(),
         object,
-        recipe,
+        recipe: recipe.clone(),
     })
 }
 
@@ -638,10 +644,7 @@ pub(crate) fn link_object(
     };
     let xclbin = read(&xclbin, "xclbin")?;
     let insts = read(&insts, "instruction stream")?;
-    let tile_local = plan
-        .recipe
-        .tile_local_bytes()
-        .ok_or(AieAbiMismatch::TileLocalOverflow)?;
+    let tile_local = plan.recipe.tile_local_bytes();
     Ok(AieLinkedArtifact::new(
         xclbin,
         insts,
@@ -678,26 +681,25 @@ pub struct AieCompiled {
     pub identity: AieIdentity,
 }
 
-/// The whole pipeline: resolve the tools, then serve the artifact for `(body, abi, target)` from `cache`
+/// The whole pipeline: resolve the tools, then serve the artifact for `(body, recipe)` from `cache`
 /// or build it (core object, recipe, IRON link), publishing the validated bundle as one entry. Tool
 /// resolution comes first, so a missing or unsupported toolchain fails before any scratch exists or any
 /// entry is written.
 pub fn compile_aie(
     body: &Body,
-    abi: &AieShapeAbi,
-    target: AieTargetId,
+    recipe: &AieLinkRecipe,
     toolchain: &Toolchain,
     cache: &KernelCache,
     max_artifact_bytes: NonZeroU64,
 ) -> Result<AieCompiled, AieCompileError> {
+    let (abi, target) = (recipe.abi(), recipe.target());
     let tools = resolve_aie_tools(toolchain, target)?;
     check_body_abi(body, abi)?;
-    let recipe = AieLinkRecipe::sequential(&body.name, target, abi)?;
-    let identity = AieIdentity::new(body, &recipe, &tools);
+    let identity = AieIdentity::new(body, recipe, &tools);
     let key = identity.cache_key();
     let built = cache.load_or_build(&key, max_artifact_bytes, || {
         let scratch = Scratch::create(cache, &key)?;
-        let plan = build_object_plan(body, abi, target, toolchain, &scratch.0)?;
+        let plan = build_object_plan(body, recipe, toolchain, &scratch.0)?;
         Ok::<_, AieCompileError>(link_object(&plan, &tools, target, &scratch.0)?.to_bytes())
     })?;
     let artifact = AieLinkedArtifact::from_bytes(&built.bytes, target)?;

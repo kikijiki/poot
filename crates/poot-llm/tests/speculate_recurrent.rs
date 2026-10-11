@@ -25,9 +25,7 @@ use poot_executor::{
     BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
     ExecutorStats, HostSync, NoSync, StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{
-    BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType, ValidationOutputs,
-};
+use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
     StagedProgram, Submission, Target, TargetSet, compile_staged,
@@ -219,11 +217,7 @@ impl Model for Recurrentish {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         check_step(RECURRENT, phase, shape, self.config.max_positions)?;
         let b = Builder::new();
         let step = Step::new(&b, shape);
@@ -258,7 +252,7 @@ impl Model for Recurrentish {
         let folded = b.binary(BinOp::Add, state, b.broadcast(last, dims));
         step.carry(state, folded);
         let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits).unwrap())
     }
 }
 
@@ -305,7 +299,7 @@ impl Device for FakeDevice {
     type Error = FakeError;
 
     fn target(&self) -> Target {
-        Target {
+        Target::Gpu {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         }
@@ -767,8 +761,8 @@ impl Probed {
         let b = Builder::new();
         let state = b.state_input(name, aval.clone(), StateRole::Recurrent);
         let graph = b
-            .finish_with_state(state, &[(state, state)])
-            .with_validations(Vec::new());
+            .finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+            .unwrap();
         let partition = Partition {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
@@ -804,7 +798,7 @@ impl Executor for Probed {
     fn add_entry(
         &mut self,
         exe: ExecutableId,
-        program: &StagedProgram<ValidationOutputs>,
+        program: &StagedProgram,
     ) -> Result<EntryId, ExecError> {
         self.inner.add_entry(exe, program)
     }
@@ -1414,9 +1408,8 @@ fn oracle_rows(family: FamilyKey, tokens: &[u32]) -> Vec<Vec<f32>> {
     };
     let graph = model.trace(Phase::Prefill, shape).unwrap();
     let state: Vec<HostTensor> = graph
-        .state
-        .iter()
-        .map(|&(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .state()
+        .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
         .collect();
     let slots = [
         (

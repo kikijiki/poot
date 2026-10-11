@@ -10,15 +10,13 @@
 //! `poot-graph-ir`'s already-public `Builder`/`Graph` methods, exactly as
 //! `poot_test_util::graph_fixtures` builds its own copy.
 
-use poot_graph_ir::{
-    Builder, Graph, GraphValidationError, Traced, ValidationId, ValidationOutput, ValidationOutputs,
-};
+use poot_graph_ir::{Builder, Graph, GraphValidationError, Traced, ValidationId};
 
 pub(crate) fn finish_with_validations(
     b: Builder,
     out: Traced,
     validations: &[(ValidationId, &str, Traced)],
-) -> Result<Graph<ValidationOutputs>, GraphValidationError> {
+) -> Result<Graph, GraphValidationError> {
     finish_with_state_and_validations(b, out, &[], validations)
 }
 
@@ -27,19 +25,15 @@ pub(crate) fn finish_with_state_and_validations(
     out: Traced,
     state: &[(Traced, Traced)],
     validations: &[(ValidationId, &str, Traced)],
-) -> Result<Graph<ValidationOutputs>, GraphValidationError> {
-    let g = b.finish_with_state(out, state).with_validations(
-        validations
-            .iter()
-            .map(|&(id, name, value)| ValidationOutput {
-                id,
-                name: name.to_owned(),
-                value: value.id(),
-            })
-            .collect(),
+) -> Result<Graph, GraphValidationError> {
+    let outputs = validations.iter().fold(
+        poot_graph_ir::Outputs::new(out).with_state(state),
+        |outputs, &(id, name, value)| outputs.with_witness(id, name, value),
     );
-    g.validate()?;
-    Ok(g)
+    b.finish(outputs).map_err(|error| match error {
+        poot_graph_ir::EditError::Invalid(error) => error,
+        other => panic!("a fresh builder has no baseline to break: {other}"),
+    })
 }
 
 // ---- stage splits ---------------------------------------------------------------------------
@@ -47,16 +41,14 @@ pub(crate) fn finish_with_state_and_validations(
 use std::collections::HashMap;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_graph_ir::{
-    BoundaryId, ComputedConst, SlotKey, Storage, ValidationChannel, ValueId, ValueMeta,
-};
+use poot_graph_ir::{BoundaryId, ComputedConst, SlotKey, Storage, ValueId, ValueMeta};
 
 use crate::passes::StageSplit;
 use crate::{CutSite, StageAssignment, StageSplitError, split_stages};
 
 /// Cut `g` before each listed equation.
-pub(crate) fn assignment_before<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn assignment_before(
+    g: &Graph,
     cuts: &[usize],
 ) -> Result<StageAssignment, StageSplitError> {
     let sites: Vec<CutSite> = cuts.iter().map(|&cut| CutSite::Before(cut)).collect();
@@ -64,8 +56,8 @@ pub(crate) fn assignment_before<V: ValidationChannel>(
 }
 
 /// Cut `g` after each listed layer.
-pub(crate) fn assignment_after_layers<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn assignment_after_layers(
+    g: &Graph,
     layers: &[usize],
 ) -> Result<StageAssignment, StageSplitError> {
     let sites: Vec<CutSite> = layers
@@ -76,18 +68,15 @@ pub(crate) fn assignment_after_layers<V: ValidationChannel>(
 }
 
 /// Split `g` before each listed equation.
-pub(crate) fn split_before<V: ValidationChannel>(
-    g: &Graph<V>,
-    cuts: &[usize],
-) -> Result<StageSplit<V>, StageSplitError> {
+pub(crate) fn split_before(g: &Graph, cuts: &[usize]) -> Result<StageSplit, StageSplitError> {
     split_stages(g, &assignment_before(g, cuts)?)
 }
 
 /// Split `g` after each listed layer.
-pub(crate) fn split_after_layers<V: ValidationChannel>(
-    g: &Graph<V>,
+pub(crate) fn split_after_layers(
+    g: &Graph,
     layers: &[usize],
-) -> Result<StageSplit<V>, StageSplitError> {
+) -> Result<StageSplit, StageSplitError> {
     split_stages(g, &assignment_after_layers(g, layers)?)
 }
 
@@ -130,13 +119,9 @@ pub(crate) struct Chain {
 /// Evaluate `stages` one after another: each stage is bound to the uncut `inputs` it reads (matched by
 /// declared identity) and to the boundary values earlier stages exported (matched by
 /// [`BoundaryId::slot_key`]), and every export is read back from the stage's environment.
-pub(crate) fn chain<V: ValidationChannel>(
-    graph: &Graph<V>,
-    stages: &[&Graph<V>],
-    inputs: &HashMap<ValueId, Value>,
-) -> Chain {
+pub(crate) fn chain(graph: &Graph, stages: &[&Graph], inputs: &HashMap<ValueId, Value>) -> Chain {
     let mut by_identity: HashMap<Identity, Value> = graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             inputs
@@ -150,7 +135,7 @@ pub(crate) fn chain<V: ValidationChannel>(
     let mut output = None;
     for (index, &g) in stages.iter().enumerate() {
         let stage_inputs: HashMap<ValueId, Value> = g
-            .inputs
+            .inputs()
             .iter()
             .map(|&id| {
                 // A computed constant is its own payload; a compile pass may have introduced
@@ -172,20 +157,20 @@ pub(crate) fn chain<V: ValidationChannel>(
         )
         .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
         let environment = result.environment.expect("the environment was kept");
-        for export in &g.exports {
+        for export in g.exports() {
             let value = environment[export.value]
                 .clone()
                 .unwrap_or_else(|| panic!("stage {index} lacks boundary {:?}", export.id));
             by_identity.insert(Identity::Slot(export.id.slot_key()), value.clone());
             boundaries.insert(export.id, value);
         }
-        for declaration in g.validation_outputs() {
+        for declaration in g.witnesses() {
             let value = environment[declaration.value]
                 .clone()
                 .unwrap_or_else(|| panic!("stage {index} lacks witness {:?}", declaration.id));
             witnesses.insert(declaration.id, value);
         }
-        for (&(state_input, _), value) in g.state.iter().zip(result.state) {
+        for ((state_input, _), value) in g.state().zip(result.state) {
             let name = g.meta(state_input).name.clone().expect("state is named");
             state_by_name.insert(name, value);
         }
@@ -194,9 +179,8 @@ pub(crate) fn chain<V: ValidationChannel>(
         }
     }
     let state = graph
-        .state
-        .iter()
-        .map(|&(state_input, _)| {
+        .state()
+        .map(|(state_input, _)| {
             let name = graph
                 .meta(state_input)
                 .name
@@ -217,7 +201,7 @@ pub(crate) fn chain<V: ValidationChannel>(
 
 // ---- the qwen2 decode fixture ---------------------------------------------------------------
 
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_models::model::{LogitRows, Phase};
 use poot_tensor::HostTensor;
 
@@ -251,19 +235,17 @@ pub(crate) fn qwen2_decode_rows(layers: usize, rows: usize) -> Graph {
         .head_dim(4)
         .max_positions(32)
         .f32_model();
-    plain(
-        model
-            .model
-            .trace(Phase::Decode, step(rows, 1, 6, LogitRows::Last))
-            .expect("the qwen2 fixture traces a decode step"),
-    )
+    model
+        .model
+        .trace(Phase::Decode, step(rows, 1, 6, LogitRows::Last))
+        .expect("the qwen2 fixture traces a decode step")
 }
 
 /// Every input binder of `g` bound: token 5 at position 3, name-seeded weights, and a nonzero KV
 /// cache per state pair (a zero cache would let a lost state input cancel).
 pub(crate) fn bind_decode(g: &Graph) -> HashMap<ValueId, Value> {
     let mut inputs = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let shape = meta.aval.shape.clone();
         let numel = shape.iter().product::<usize>().max(1);
@@ -292,7 +274,7 @@ pub(crate) fn bind_decode(g: &Graph) -> HashMap<ValueId, Value> {
         };
         inputs.insert(id, Value::from(tensor));
     }
-    for (pair, &(state_input, _)) in g.state.iter().enumerate() {
+    for (pair, (state_input, _)) in g.state().enumerate() {
         let shape = g.aval(state_input).shape.clone();
         let numel = shape.iter().product::<usize>().max(1);
         inputs.insert(
@@ -313,4 +295,24 @@ pub(crate) fn bits(value: &Value) -> Vec<u32> {
         .iter()
         .map(|v| v.to_bits())
         .collect()
+}
+
+// A GPU target fixture's backend and capabilities, for this crate's own tests: they know which arm they
+// built. Duplicated for the same reason as the builders above (`poot_test_util::graph_fixtures` has its own
+// copy over the other `poot-graph-plan` instance). Production code matches `Target` or asks `Target::gpu`.
+
+pub(crate) fn gpu_caps(target: &crate::Target) -> poot_target::DeviceCaps {
+    match target {
+        crate::Target::Gpu { caps, .. } => *caps,
+        crate::Target::Aie { .. } => {
+            panic!("{target:?} is an AIE target: it has no GPU DeviceCaps")
+        }
+    }
+}
+
+pub(crate) fn gpu_caps_mut(target: &mut crate::Target) -> &mut poot_target::DeviceCaps {
+    match target {
+        crate::Target::Gpu { caps, .. } => caps,
+        crate::Target::Aie { .. } => panic!("an AIE target has no GPU DeviceCaps"),
+    }
 }

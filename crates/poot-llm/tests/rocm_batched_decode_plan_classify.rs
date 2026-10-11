@@ -9,7 +9,7 @@
 
 #![cfg(feature = "rocm")]
 
-use poot_executor_parity::dense::{Dense, Family, paged_step, plain};
+use poot_executor_parity::dense::{Dense, Family, paged_step};
 use poot_graph_plan::{Plan, prepare_target_graph};
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_models::model::{LogitRows, Phase};
@@ -53,20 +53,19 @@ fn rocm_batched_decode_plan_classify_qwen2_n_slots_2() {
     let pool_slots = num_blocks * BLOCK_SIZE + 1;
 
     let m = qwen25_05b().zeroed_model(DType::BF16);
-    let g = plain(
-        m.model
-            .trace(
-                Phase::Decode,
-                paged_step(n_slots, 1, cap, pool_slots, LogitRows::Last),
-            )
-            .unwrap(),
-    );
+    let g = m
+        .model
+        .trace(
+            Phase::Decode,
+            paged_step(n_slots, 1, cap, pool_slots, LogitRows::Last),
+        )
+        .unwrap();
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     // The pre-`compile` passes, so the equations classified are the fused ones `compile` plans: the
     // BF16 checkpoint's dense contractions are folded and its mixed-dtype matmuls widened as `compile` does.
-    let g = prepare_target_graph(&optimize(&g), backend);
+    let g = prepare_target_graph(&optimize(&g).unwrap(), backend).unwrap();
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for eqn in &g.eqns {
+    for eqn in g.eqns() {
         let plan = plan_eqn(
             &g,
             eqn,
@@ -79,6 +78,6 @@ fn rocm_batched_decode_plan_classify_qwen2_n_slots_2() {
 
     eprintln!(
         "rocm_batched_decode_plan_classify: n_slots={n_slots} total_eqns={} tally={tally:?}",
-        g.eqns.len()
+        g.eqns().len()
     );
 }

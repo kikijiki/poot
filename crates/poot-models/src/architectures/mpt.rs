@@ -46,7 +46,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::rope_table::RopeFlavor;
-use poot_graph_ir::{Builder, Graph, ValidationOutputs};
+use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole, WeightStore};
 
 use crate::chat::ChatFormat;
@@ -355,11 +355,7 @@ impl Model for Mpt {
         &self.weights
     }
 
-    fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-    ) -> Result<Graph<ValidationOutputs>, TraceError> {
+    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         let b = Builder::new();
@@ -375,7 +371,7 @@ impl Model for Mpt {
                 |b, BlockInput { block: h, .. }| plain_mlp(b, h, &layer.ffn, Gelu::Erf),
             )
         });
-        Ok(step.finish(b, logits))
+        Ok(step.finish(b, logits)?)
     }
 }
 

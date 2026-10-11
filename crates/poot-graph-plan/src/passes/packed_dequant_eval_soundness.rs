@@ -97,12 +97,10 @@ const PACKED_ORACLE_MAX_ELEMENTS: usize = 8 * 1024 * 1024;
 /// remaining escape: the graph-level packed-dequant preparation the planner's production entry
 /// extends with block-float claims.
 fn prepare_packed_dequant_production(g: &Graph) -> Result<Graph, PackedDequantProductionError> {
-    g.validate()?;
     reject_preexisting_packed_contractions(g)?;
-    let graph = dce_with_roots(g, &[]);
-    let graph = recognize_packed_contractions(&graph);
+    let graph = dce_with_roots(g, &[]).unwrap();
+    let graph = recognize_packed_contractions(&graph).unwrap();
     reject_packed_dequant_escapes(&graph)?;
-    graph.validate()?;
     Ok(graph)
 }
 
@@ -184,7 +182,7 @@ fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, ValueId
     let weight = b.constant(weight_name.as_str(), weight_type);
     let scale = b.constant(scale_name.as_str(), scale_type);
     let output = b.packed_dequant(&[weight, scale], descriptor);
-    (b.finish(output), weight.id(), scale.id())
+    (b.finish(output).unwrap(), weight.id(), scale.id())
 }
 
 fn independent_fp4(owner: &PackedPayload, coordinate: [usize; 2]) -> f32 {
@@ -374,7 +372,7 @@ fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderAp
             TensorType::f32(activation_shape.clone()),
         );
         let output = packed_linear(&b, activation, "layer", descriptor, None, None)?;
-        let graph = b.finish(output);
+        let graph = b.finish(output).unwrap();
         let fused = prepare_packed_dequant_production(&graph).unwrap();
         let mut inputs = HashMap::new();
         inputs.insert(
@@ -386,7 +384,7 @@ fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderAp
                     .collect(),
             )),
         );
-        for graph_input in &graph.inputs {
+        for graph_input in graph.inputs() {
             let Some(source) = graph
                 .meta(*graph_input)
                 .name
@@ -487,7 +485,7 @@ fn indexed_graph(
         TensorType::new(vec![m], DType::I32),
     );
     let output = packed_indexed_linear(&b, x, selector, &table).unwrap();
-    let graph = b.finish(output);
+    let graph = b.finish(output).unwrap();
     let stack = Arc::new(PackedStack::try_new(experts.to_vec()).unwrap());
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -501,7 +499,7 @@ fn indexed_graph(
             route.iter().map(|&expert| expert as i32).collect(),
         )),
     );
-    for graph_input in &graph.inputs {
+    for graph_input in graph.inputs() {
         let Some(source) = graph
             .meta(*graph_input)
             .name
@@ -623,7 +621,7 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
     let w = b.constant("w", TensorType::f32(vec![experts.len(), k, out]));
     let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
     let y = b.indexed_matmul(x, w, ids);
-    let dense = b.finish(y);
+    let dense = b.finish(y).unwrap();
     let dense_inputs: HashMap<ValueId, Value> = [
         (x.id(), HostTensor::f32(vec![m, k], x_data.clone())),
         (w.id(), HostTensor::f32(vec![experts.len(), k, out], table)),
@@ -727,12 +725,12 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match()
         plan.declare_result(y)?;
         let mut prepared = b.preflight_append(plan)?;
         let committed = b.commit_append(&mut prepared)?;
-        let graph = b.finish(committed);
+        let graph = b.finish(committed).unwrap();
 
         let fused = prepare_packed_dequant_production(&graph).unwrap();
         assert!(
             matches!(
-                fused.eqns.as_slice(),
+                fused.eqns(),
                 [poot_graph_ir::Eqn {
                     op: OpKind::PackedContraction {
                         rows: poot_graph_ir::ContractionRows::Blocks(1),
@@ -754,7 +752,7 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match()
                     .collect(),
             )),
         );
-        for graph_input in &graph.inputs {
+        for graph_input in graph.inputs() {
             let Some(source) = graph
                 .meta(*graph_input)
                 .name
@@ -821,10 +819,10 @@ fn blocked_packed_contraction_fused_and_unfused_compositions_match()
         );
         let output =
             packed_block_diagonal_linear(&b, activation, "blocked-layer", descriptor, 4, None)?;
-        let graph = b.finish(output);
+        let graph = b.finish(output).unwrap();
         let fused = prepare_packed_dequant_production(&graph).unwrap();
         assert!(matches!(
-            fused.eqns.as_slice(),
+            fused.eqns(),
             [poot_graph_ir::Eqn {
                 op: poot_graph_ir::OpKind::PackedContraction {
                     rows: poot_graph_ir::ContractionRows::Blocks(4),
@@ -843,7 +841,7 @@ fn blocked_packed_contraction_fused_and_unfused_compositions_match()
                     .collect(),
             )),
         );
-        for graph_input in &graph.inputs {
+        for graph_input in graph.inputs() {
             let Some(source) = graph
                 .meta(*graph_input)
                 .name
@@ -900,10 +898,10 @@ fn packed_dequant_production_rejects_valid_preexisting_candidate() -> Result<(),
         TensorType::f32(vec![2, 35]),
     );
     let output = packed_linear(&builder, activation, "direct.layer", descriptor, None, None)?;
-    let source = builder.finish(output);
+    let source = builder.finish(output).unwrap();
     let direct = prepare_packed_dequant_production(&source).unwrap();
     assert!(matches!(
-        direct.eqns.as_slice(),
+        direct.eqns(),
         [poot_graph_ir::Eqn {
             op: poot_graph_ir::OpKind::PackedContraction {
                 descriptor: actual,
@@ -913,7 +911,7 @@ fn packed_dequant_production_rejects_valid_preexisting_candidate() -> Result<(),
         }] if *actual == descriptor
     ));
 
-    let candidate = &direct.eqns[0];
+    let candidate = &direct.eqns()[0];
     let [
         _,
         poot_graph_ir::Operand::Value(weight_id),
@@ -982,7 +980,7 @@ fn contract_through_the_oracle(
     plan.declare_result(output)?;
     let mut prepared = b.preflight_append(plan)?;
     let committed = b.commit_append(&mut prepared)?;
-    let graph = b.finish(committed);
+    let graph = b.finish(committed).unwrap();
 
     let mut inputs = HashMap::new();
     inputs.insert(activation_value.id(), Value::Host(activation));
@@ -1960,7 +1958,7 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
         for k in [512, 1024] {
             let packed_inputs = |graph: &Graph, owner: &Arc<PackedPayload>| {
                 graph
-                    .inputs
+                    .inputs()
                     .iter()
                     .filter_map(|&input| {
                         let source = graph
@@ -1985,7 +1983,7 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
             .expect("a GGUF block format has exactly one source");
             let source = b.constant(name.as_str(), source_type);
             let decoded = b.packed_dequant(&[source], descriptor);
-            let graph = b.finish(decoded);
+            let graph = b.finish(decoded).unwrap();
             let inputs = packed_inputs(&graph, &owner);
             let (result, dequant_bytes) = allocated_bytes(|| {
                 eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output)
@@ -1995,7 +1993,7 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
             let b = Builder::new();
             let activation = b.slot_named(Slot::Activation, "work", TensorType::f32(vec![2, k]));
             let output = packed_linear(&b, activation, "layer", descriptor, None, None)?;
-            let graph = prepare_packed_dequant_production(&b.finish(output)).unwrap();
+            let graph = prepare_packed_dequant_production(&b.finish(output).unwrap()).unwrap();
             let mut inputs = packed_inputs(&graph, &owner);
             inputs.insert(
                 activation.id(),
@@ -2060,9 +2058,9 @@ fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), Build
         } else {
             packed_block_diagonal_linear(&b, activation, "gguf", descriptor, blocks, None)?
         };
-        let graph = prepare_packed_dequant_production(&b.finish(output)).unwrap();
+        let graph = prepare_packed_dequant_production(&b.finish(output).unwrap()).unwrap();
         assert!(matches!(
-            graph.eqns.as_slice(),
+            graph.eqns(),
             [poot_graph_ir::Eqn {
                 op: OpKind::PackedContraction { .. },
                 ..
@@ -2076,7 +2074,7 @@ fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), Build
             activation.id(),
             Value::Host(HostTensor::f32(activation_shape.clone(), x.clone())),
         );
-        for graph_input in &graph.inputs {
+        for graph_input in graph.inputs() {
             if let Some(source) = graph
                 .meta(*graph_input)
                 .name
@@ -2156,16 +2154,16 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
     let b = Builder::new();
     let ids = b.slot(Slot::Token, TensorType::new(vec![3], DType::I32));
     let out = poot_graph_ir::ops::packed_embedding(&b, ids, "embed", descriptor).unwrap();
-    let graph = recognize_packed_row_gathers(&b.finish(out));
+    let graph = recognize_packed_row_gathers(&b.finish(out).unwrap()).unwrap();
     assert!(matches!(
-        graph.eqns.as_slice(),
+        graph.eqns(),
         [poot_graph_ir::Eqn {
             op: OpKind::PackedRowGather { .. },
             ..
         }]
     ));
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &graph.inputs {
+    for &id in graph.inputs() {
         if let Some(source) = graph
             .meta(id)
             .name
@@ -2249,7 +2247,7 @@ fn distinct_row_q8_0(rows: usize, k: usize) -> Arc<PackedPayload> {
 
 fn bind_carriers(graph: &Graph, owner: &Arc<PackedPayload>) -> HashMap<ValueId, Value> {
     graph
-        .inputs
+        .inputs()
         .iter()
         .filter_map(|&id| {
             let source = graph
@@ -2279,10 +2277,10 @@ fn a_packed_projection_past_the_oracle_cap_evaluates() {
     let b = Builder::new();
     let x = b.slot(Slot::Activation, TensorType::f32(vec![1, k]));
     let y = packed_linear(&b, x, "proj", owner.weight(), None, None).unwrap();
-    let graph = recognize_packed_contractions(&b.finish(y));
+    let graph = recognize_packed_contractions(&b.finish(y).unwrap()).unwrap();
     assert!(
         graph
-            .eqns
+            .eqns()
             .iter()
             .any(|eqn| matches!(eqn.op, OpKind::PackedContraction { .. }))
     );
@@ -2337,17 +2335,17 @@ fn packed_contraction_above_budget_is_refused_unbounded_evaluates() -> Result<()
         TensorType::f32(vec![2, 35]),
     );
     let output = packed_linear(&builder, activation, "budget.layer", descriptor, None, None)?;
-    let source = builder.finish(output);
+    let source = builder.finish(output).unwrap();
     let direct = prepare_packed_dequant_production(&source).unwrap();
     assert!(matches!(
-        direct.eqns.as_slice(),
+        direct.eqns(),
         [poot_graph_ir::Eqn {
             op: poot_graph_ir::OpKind::PackedContraction { .. },
             ..
         }]
     ));
 
-    let candidate = &direct.eqns[0];
+    let candidate = &direct.eqns()[0];
     let [
         _,
         poot_graph_ir::Operand::Value(weight_id),

@@ -4,7 +4,7 @@
 //! on poot-eval, so an integration test here can drive both.
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::{Graph, Slot, Storage, ValueId};
 use poot_graph_plan::{cse, dce, fuse, legalize};
@@ -42,21 +42,19 @@ fn tiny_qwen2() -> poot_executor_parity::weight_map::MappedModel {
 
 /// `model`'s one-token decode step over `cap` positions.
 fn decode_graph(model: &poot_executor_parity::weight_map::MappedModel, cap: usize) -> Graph {
-    plain(
-        model
-            .model
-            .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
-            .unwrap(),
-    )
+    model
+        .model
+        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .unwrap()
 }
 
 /// Every input of `g` bound: the token and position slots as one decode step at `pos`, state and
 /// weights filled by input index (weights scaled by 0.1).
 fn bind_decode(g: &Graph, token: i32, pos: i32) -> HashMap<ValueId, HostTensor> {
     let mut inputs: HashMap<ValueId, HostTensor> = HashMap::new();
-    for (i, &id) in g.inputs.iter().enumerate() {
+    for (i, &id) in g.inputs().iter().enumerate() {
         let aval = g.aval(id).clone();
-        let t = match g.values[id].storage {
+        let t = match g.values()[id].storage {
             Storage::Slot(Slot::Token) => HostTensor::i32(aval.shape, vec![token]),
             Storage::Slot(Slot::Pos) => HostTensor::i32(aval.shape, vec![pos]),
             Storage::Slot(other) => unreachable!("unexpected slot {other:?}"),
@@ -80,8 +78,8 @@ fn cse_preserves_results() {
     // CSE only removes redundant identical computations, so eval(cse(g)) is bit-identical to eval(g).
     let pos = 3usize;
     let g = decode_graph(&tiny_qwen2(), 8);
-    let c = cse(&g);
-    assert!(c.eqns.len() < g.eqns.len());
+    let c = cse(&g).unwrap();
+    assert!(c.eqns().len() < g.eqns().len());
 
     let inputs = bind_decode(&g, 5, pos as i32);
     let a = {
@@ -120,21 +118,20 @@ fn fuse_preserves_qwen2_results_and_shrinks() {
     // reduction-rooted FusedRow regions (each layer's RMSNorm + softmax).
     let pos = 3usize;
     let g = decode_graph(&tiny_qwen2(), 8);
-    let fg = fuse(&g);
-    fg.validate().expect("fused graph valid");
+    let fg = fuse(&g).unwrap();
     assert!(
-        fg.eqns.len() < g.eqns.len(),
+        fg.eqns().len() < g.eqns().len(),
         "fusion should drop eqns: {} -> {}",
-        g.eqns.len(),
-        fg.eqns.len()
+        g.eqns().len(),
+        fg.eqns().len()
     );
     let n_fused = fg
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::Fused(_)))
         .count();
     let n_row = fg
-        .eqns
+        .eqns()
         .iter()
         .filter(|e| matches!(e.op, OpKind::FusedRow(_)))
         .count();
@@ -145,8 +142,8 @@ fn fuse_preserves_qwen2_results_and_shrinks() {
     );
     eprintln!(
         "qwen2 tiny fuse: {} eqns -> {} ({} Fused, {} FusedRow)",
-        g.eqns.len(),
-        fg.eqns.len(),
+        g.eqns().len(),
+        fg.eqns().len(),
         n_fused,
         n_row
     );
@@ -201,12 +198,10 @@ fn tiny_legalize_model() -> poot_executor_parity::weight_map::MappedModel {
 /// [`tiny_legalize_model`]'s step graph: `tokens` new tokens over `cap` positions, logits at every
 /// position so the graph ends in the lm_head `MatMul` [`without_lm_head`] cuts at.
 fn legalize_graph(phase: Phase, tokens: usize, cap: usize) -> Graph {
-    plain(
-        tiny_legalize_model()
-            .model
-            .trace(phase, step(1, tokens, cap, LogitRows::All))
-            .unwrap(),
-    )
+    tiny_legalize_model()
+        .model
+        .trace(phase, step(1, tokens, cap, LogitRows::All))
+        .unwrap()
 }
 
 /// A [`poot_target::DeviceCaps`] whose `max_buffer_bytes` sits strictly between the largest
@@ -235,7 +230,7 @@ fn caps_hosting_only_the_tiny_embed() -> poot_target::DeviceCaps {
 /// [`legalize`]'s rewrite cannot affect. This crate has no direct hook to truncate the tracer, so
 /// this walks the graph back from the traced output to the last `Rmsnorm`-shaped value so lm_head's
 /// `MatMul` against the embed-sized weight never enters either compared graph.
-fn without_lm_head(mut g: Graph) -> Graph {
+fn without_lm_head(g: Graph) -> Graph {
     use poot_graph_ir::Operand;
     // a decode or prefill step with all-position logits ends with `linear(rmsnorm_output, lm_head)`: a `MatMul`
     // (bias-free, since lm_head passes no bias) whose output is the graph's declared output. Retarget
@@ -243,9 +238,9 @@ fn without_lm_head(mut g: Graph) -> Graph {
     // `eqns` with ordinary DCE, so nothing downstream of it - including the embed-sized
     // `w.head` const - survives.
     let out_eqn = g
-        .eqns
+        .eqns()
         .iter()
-        .find(|e| e.out == g.output)
+        .find(|e| e.out == g.result())
         .expect("the graph's declared output is produced by an equation");
     assert!(
         matches!(out_eqn.op, OpKind::MatMul),
@@ -255,15 +250,15 @@ fn without_lm_head(mut g: Graph) -> Graph {
     let Operand::Value(hidden) = out_eqn.inputs[0] else {
         panic!("lm_head MatMul's first operand must be a value")
     };
-    g.output = hidden;
-    let g = dce(&g);
+    let g = poot_test_util::graph_fixtures::derive(&g, |draft| draft.set_result(hidden)).unwrap();
+    let g = dce(&g).unwrap();
 
     // `dce` only prunes `eqns` ("the value table is preserved, dead entries are harmless" - true for
     // an ordinary unused intermediate, but `lm_head.weight` staying in `consts` here would still be an
     // embed-sized constant `legalize`'s refusal path sees). Prune the input tables to what the
     // DCE'd graph actually reads.
     let referenced: std::collections::HashSet<_> = g
-        .eqns
+        .eqns()
         .iter()
         .flat_map(|e| {
             e.inputs.iter().filter_map(|&o| match o {
@@ -271,30 +266,14 @@ fn without_lm_head(mut g: Graph) -> Graph {
                 Operand::Lit(_) => None,
             })
         })
-        .chain(std::iter::once(g.output))
-        .chain(g.state.iter().flat_map(|&(a, b)| [a, b]))
+        .chain(std::iter::once(g.result()))
+        .chain(g.state().flat_map(|(a, b)| [a, b]))
         .collect();
-    poot_graph_ir::Graph {
-        inputs: g
-            .inputs
-            .iter()
-            .copied()
-            .filter(|id| referenced.contains(id))
-            .collect(),
-        consts: g
-            .consts
-            .iter()
-            .copied()
-            .filter(|id| referenced.contains(id))
-            .collect(),
-        slots: g
-            .slots
-            .iter()
-            .copied()
-            .filter(|(id, _)| referenced.contains(id))
-            .collect(),
-        ..g
-    }
+    let mut pruned = g.edit();
+    pruned.inputs_mut().retain(|id| referenced.contains(id));
+    pruned.consts_mut().retain(|id| referenced.contains(id));
+    pruned.slots_mut().retain(|(id, _)| referenced.contains(id));
+    pruned.commit().unwrap()
 }
 
 #[test]
@@ -324,7 +303,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     };
     let gd = without_lm_head(legalize_graph(Phase::Decode, 1, cap));
     let mut di: Map<ValueId, HostTensor> = Map::new();
-    for &id in &gd.inputs {
+    for &id in gd.inputs() {
         let m = gd.meta(id);
         match m.storage {
             Storage::Slot(Slot::Token) => {
@@ -338,7 +317,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             Storage::Device => unreachable!(),
         };
     }
-    for &(si, _) in &gd.state {
+    for (si, _) in gd.state() {
         di.insert(si, HostTensor::zeros(gd.aval(si).shape.clone()));
     }
     let (hidden_dense, _) = {
@@ -363,7 +342,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     )
     .expect("the embed table hosts; nothing else in this fixture is oversized");
     assert!(
-        gh.consts
+        gh.consts()
             .iter()
             .all(|&id| gh.meta(id).name.as_deref() != Some("w.embed")),
         "legalize must drop the oversized embed const, not merely refuse it"
@@ -373,7 +352,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
     let token_row =
         embed_w.as_f32().unwrap()[token as usize * h..(token as usize + 1) * h].to_vec();
     let mut hi: Map<ValueId, HostTensor> = Map::new();
-    for &id in &gh.inputs {
+    for &id in gh.inputs() {
         let m = gh.meta(id);
         match m.storage {
             Storage::Slot(Slot::Token) => {
@@ -391,7 +370,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             Storage::Device => unreachable!(),
         };
     }
-    for &(si, _) in &gh.state {
+    for (si, _) in gh.state() {
         hi.insert(si, HostTensor::zeros(gh.aval(si).shape.clone()));
     }
     let (hidden_host, _) = {
@@ -440,7 +419,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
 
     let gd = without_lm_head(legalize_graph(Phase::Prefill, l, l));
     let mut di: Map<ValueId, HostTensor> = Map::new();
-    for &id in &gd.inputs {
+    for &id in gd.inputs() {
         let m = gd.meta(id);
         match m.storage {
             Storage::Slot(Slot::Token) => di.insert(
@@ -457,7 +436,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             Storage::Device => unreachable!(),
         };
     }
-    for &(si, _) in &gd.state {
+    for (si, _) in gd.state() {
         di.insert(si, HostTensor::zeros(gd.aval(si).shape.clone()));
     }
     let hidden_dense = {
@@ -485,7 +464,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         rows.extend_from_slice(&embed_w.as_f32().unwrap()[t as usize * h..(t as usize + 1) * h]);
     }
     let mut hi: Map<ValueId, HostTensor> = Map::new();
-    for &id in &gh.inputs {
+    for &id in gh.inputs() {
         let m = gh.meta(id);
         match m.storage {
             Storage::Slot(Slot::Token) => {
@@ -505,7 +484,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             Storage::Device => unreachable!(),
         };
     }
-    for &(si, _) in &gh.state {
+    for (si, _) in gh.state() {
         hi.insert(si, HostTensor::zeros(gh.aval(si).shape.clone()));
     }
     let hidden_host = {

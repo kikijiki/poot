@@ -22,7 +22,7 @@ fn bf16_host_tensor_binds_to_the_oracle_and_wgpu_without_widening() {
     let b = Builder::new();
     let x = b.constant("x", TensorType::new(vec![3, 2], DType::BF16));
     let widened = b.cast(x, DType::F32);
-    let g = b.finish(widened);
+    let g = b.finish(widened).unwrap();
     let input = HostTensor::bf16(vec![3, 2], WORDS.to_vec());
 
     let reads_before = poot_tensor::read_counter::reads();

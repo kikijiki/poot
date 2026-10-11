@@ -765,7 +765,7 @@ fn fence_lowers_to_amdgpu_both_scopes() {
         ),
         (
             "devfence_amd",
-            poot_kernelgen::cross_block_fence_spin_wait_coop("devfence_amd"),
+            poot_test_util::kernel_fixtures::cross_block_fence_spin_wait_coop("devfence_amd"),
         ),
     ] {
         let out = poot_codegen::artifact_path(&dir, name, target);

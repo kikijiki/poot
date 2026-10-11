@@ -17,7 +17,7 @@ use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{
     BindError, Executor, ExecutorStats, LoadError, NoSync, StateScope, StepInputs,
 };
-use poot_executor_parity::dense::{Dense, Family, plain, step};
+use poot_executor_parity::dense::{Dense, Family, step};
 use poot_gpu::device::WgpuDevice;
 use poot_graph_ir::PackedSourceName;
 use poot_graph_ir::{Graph, Slot, SlotKey, StateRole, Storage, TensorType, ValueId};
@@ -33,6 +33,7 @@ use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::HostTensor;
 use poot_tensor::{DType, HostView};
 use poot_test_util::assert_close_rel;
+use poot_test_util::graph_fixtures::{gpu_caps, gpu_caps_mut};
 
 const CAP: usize = 8;
 
@@ -47,24 +48,20 @@ fn dense() -> Dense {
 
 /// `dense`'s one-token decode step over `cap` positions, as `Model::trace` returns it.
 fn decode_graph(dense: &Dense, cap: usize) -> Graph {
-    plain(
-        dense
-            .f32_model()
-            .model
-            .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
-            .unwrap(),
-    )
+    dense
+        .f32_model()
+        .model
+        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .unwrap()
 }
 
 /// `dense`'s `n`-token prefill step over `cap` positions, logits of the last token.
 fn prefill_graph(dense: &Dense, n: usize, cap: usize) -> Graph {
-    plain(
-        dense
-            .f32_model()
-            .model
-            .trace(Phase::Prefill, step(1, n, cap, LogitRows::Last))
-            .unwrap(),
-    )
+    dense
+        .f32_model()
+        .model
+        .trace(Phase::Prefill, step(1, n, cap, LogitRows::Last))
+        .unwrap()
 }
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -98,7 +95,7 @@ fn const_data(name: &str, shape: &[usize]) -> Vec<f32> {
 fn store_for(graphs: &[&Graph]) -> WeightStore {
     let mut entries: HashMap<String, Vec<usize>> = HashMap::new();
     for g in graphs {
-        for &id in &g.inputs {
+        for &id in g.inputs() {
             let meta = g.meta(id);
             if meta.storage == Storage::Const {
                 entries.insert(meta.name.clone().unwrap(), meta.aval.shape.clone());
@@ -129,12 +126,8 @@ fn wgpu_target(device: &WgpuDevice) -> Target {
     device.target()
 }
 
-fn staged(
-    g: &Graph,
-    target: Target,
-    submission: Submission,
-) -> poot_graph_plan::StagedProgram<poot_graph_ir::ValidationOutputs> {
-    let g = g.clone().with_validations(Vec::new());
+fn staged(g: &Graph, target: Target, submission: Submission) -> poot_graph_plan::StagedProgram {
+    let g = g.clone();
     compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -157,7 +150,7 @@ struct SlotValue {
 }
 
 fn slot_values(g: &Graph, tokens: &[u32], start: usize) -> Vec<SlotValue> {
-    g.inputs
+    g.inputs()
         .iter()
         .filter_map(|&id| {
             let meta = g.meta(id);
@@ -215,7 +208,7 @@ fn oracle_step(
     state: &mut HashMap<String, HostTensor>,
 ) -> Vec<f32> {
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let value = match meta.storage {
             Storage::Const => {
@@ -246,7 +239,7 @@ fn oracle_step(
         inputs.insert(id, value);
     }
     let evaluation = eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
-    for (&(si, _), t) in g.state.iter().zip(evaluation.state) {
+    for ((si, _), t) in g.state().zip(evaluation.state) {
         state.insert(
             g.meta(si).name.clone().unwrap(),
             t.into_host().expect("dense state tensor"),
@@ -277,7 +270,8 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
 fn state_probe_graph(name: &str, aval: TensorType) -> Graph {
     let b = poot_graph_ir::Builder::new();
     let state = b.state_input(name, aval, StateRole::Recurrent);
-    b.finish_with_state(state, &[(state, state)])
+    b.finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
+        .unwrap()
 }
 
 fn require_wgpu() -> Option<WgpuDevice> {
@@ -313,9 +307,7 @@ fn the_wgpu_device_reports_live_free_memory_within_its_open_time_ceiling() {
         eprintln!("skip: no wgpu adapter");
         return;
     };
-    let ceiling = device
-        .target()
-        .caps
+    let ceiling = gpu_caps(&device.target())
         .memory_budget_bytes
         .expect("the wgpu device queried its heap budget at open");
     let free = device
@@ -425,7 +417,7 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
 
     // One state-probe entry per KV state name, sharing the real entries' buffers.
     let mut probes = Vec::new();
-    for &id in &decode_g.inputs {
+    for &id in decode_g.inputs() {
         let meta = decode_g.meta(id);
         if meta.storage == Storage::State {
             let name = meta.name.clone().unwrap();
@@ -680,14 +672,18 @@ fn mid_load_refusal_rolls_back_a_newly_allocated_state_and_leaves_the_existing_e
     let a1 = b1.state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent);
     let b1_state = b1.state_input("b", TensorType::f32(vec![2]), StateRole::Recurrent);
     let out1 = b1.binary(poot_graph_ir::BinOp::Add, a1, b1_state);
-    let g1 = b1.finish_with_state(out1, &[(a1, a1), (b1_state, b1_state)]);
+    let g1 = b1
+        .finish(poot_graph_ir::Outputs::new(out1).with_state(&[(a1, a1), (b1_state, b1_state)]))
+        .unwrap();
 
     // g2: a brand-new state "c" declared first (so load_entry allocates it before reaching "b"),
     // then "b" at a mismatched shape ([3], not g1's [2]) to force the refusal.
     let b2 = poot_graph_ir::Builder::new();
     let c2 = b2.state_input("c", TensorType::f32(vec![2]), StateRole::Recurrent);
     let b2_state = b2.state_input("b", TensorType::f32(vec![3]), StateRole::Recurrent);
-    let g2 = b2.finish_with_state(c2, &[(c2, c2), (b2_state, b2_state)]);
+    let g2 = b2
+        .finish(poot_graph_ir::Outputs::new(c2).with_state(&[(c2, c2), (b2_state, b2_state)]))
+        .unwrap();
 
     let store = Arc::new(WeightStore::builder().build());
     let (named, map) = bind_graphs(&store, &[&g1, &g2]);
@@ -903,7 +899,7 @@ fn binder_and_target_refusals_are_typed() {
     );
 
     let mut other = target;
-    other.caps.max_grid[0] -= 1;
+    gpu_caps_mut(&mut other).max_grid[0] -= 1;
     let err = engine
         .add_entry(exe, &staged(&named[0], other, Submission::Replay))
         .unwrap_err();
@@ -941,7 +937,9 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps() {
     let output = b.binary(poot_graph_ir::BinOp::Add, a, s);
     let new_a = b.binary(poot_graph_ir::BinOp::Add, s, bias);
     let new_s = b.binary(poot_graph_ir::BinOp::Add, a, bias);
-    let g = b.finish_with_state(output, &[(a, new_a), (s, new_s)]);
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, new_a), (s, new_s)]))
+        .unwrap();
 
     let bias_value = vec![1.0f32, 2.0, 3.0, 4.0];
     let mut builder = WeightStore::builder();
@@ -1122,7 +1120,7 @@ fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) 
     let b = poot_graph_ir::Builder::new();
     let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]));
     let y = poot_graph_ir::ops::packed_linear(&b, x, "linear0", descriptor, None, None).unwrap();
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
 
     let store = {
         let mut builder = WeightStore::builder();
@@ -1140,7 +1138,7 @@ fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) 
 
     let x_values = fill(k, 0xA5);
     let (x_id, _) = *g
-        .slots
+        .slots()
         .iter()
         .find(|&&(_, kind)| kind == Slot::Activation)
         .unwrap();
@@ -1160,7 +1158,7 @@ fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) 
     );
 
     let mut oracle_inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let value = match meta.storage {
             Storage::Const => {
@@ -1308,8 +1306,10 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
                 buffer: &out_buf,
                 elems: 4,
             },
-            threads: [4, 1, 1],
-            workgroup: [64, 1, 1],
+            launch: poot_executor::LaunchKind::Grid {
+                threads: [4, 1, 1],
+                workgroup: [64, 1, 1],
+            },
             work: 4,
         })
         .unwrap();
@@ -1334,8 +1334,74 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
     );
 }
 
+/// POOT-1117: a `LaunchKind::Aie` dispatch handed to the wgpu device is the typed refusal
+/// `RuntimeError::WrongKernelTarget` naming the AIE target; nothing is recorded, and the open step still
+/// finishes empty. Mutation: let `WgpuDevice::dispatch` accept `LaunchKind::Aie` (bind its arm to a fixture grid,
+/// as a silent dead arm would); `dispatch` returns `Ok` and the row goes red.
+#[test]
+fn wgpu_device_refuses_an_aie_launch_as_a_typed_error() {
+    use poot_executor::{AieInvocation, Arg, BufferRole, Device, Dispatch, LaunchKind};
+    use poot_target::{AieTargetId, BufferStorage, TargetId};
+    use std::num::NonZeroU32;
+
+    let Some(mut device) = require_wgpu() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let body = poot_test_util::kernel_fixtures::len_probe_kernel();
+    let dir = std::env::temp_dir().join("poot-gpu-aie-launch-refusal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_path =
+        poot_codegen::artifact_path(&dir, "aie_launch_probe", poot_codegen::Target::SpirvVulkan);
+    poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out_path)
+        .expect("len_probe must compile to SPIR-V");
+    let spv = std::fs::read(&out_path).unwrap();
+    let kernel = device
+        .load_kernel(
+            "aie_launch_probe",
+            poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv),
+        )
+        .expect("load the probe kernel");
+    let input = device
+        .allocate(BufferRole::Input, BufferStorage::f32(), 4)
+        .unwrap();
+    let output = device
+        .allocate(BufferRole::Output, BufferStorage::f32(), 1)
+        .unwrap();
+
+    device.begin(Submission::Replay).unwrap();
+    let error = device
+        .dispatch(Dispatch {
+            kernel: &kernel,
+            inputs: &[Arg {
+                buffer: &input,
+                elems: 4,
+            }],
+            output: Arg {
+                buffer: &output,
+                elems: 1,
+            },
+            launch: LaunchKind::Aie(AieInvocation::new(
+                AieTargetId::Xdna2,
+                NonZeroU32::new(1).unwrap(),
+            )),
+            work: 1,
+        })
+        .expect_err("a thread-grid device runs no AIE invocation");
+    assert!(
+        matches!(
+            error,
+            poot_runtime::RuntimeError::WrongKernelTarget {
+                actual: TargetId::Aie(AieTargetId::Xdna2)
+            }
+        ),
+        "{error:?}"
+    );
+    device.abort().unwrap();
+}
+
 /// SC-009: a planted bad validation packet is reported before any readback of outputs (the
-/// validated session). The graph's sole output IS its validated value (`b.finish(witness)`
+/// validated session). The graph's sole output IS its validated value (`b.finish(witness).unwrap()`
 /// with a `ValidationOutput` naming that same `witness`), bound from the store to a nonzero f32: the
 /// packet's lane check (`0x7fff_ffff` masked nonzero fails, ADR-0101 decision 2) must reject it in
 /// `step`, which returns before ever constructing a `StepOutputs` for the caller to `.read()`.
@@ -1362,12 +1428,12 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
         poot_graph_ir::Scalar::F32(0.0),
     );
     let g = b
-        .finish(witness)
-        .with_validations(vec![poot_graph_ir::ValidationOutput {
-            id: poot_graph_ir::ValidationId(1),
-            name: "planted".into(),
-            value: witness.id(),
-        }]);
+        .finish(poot_graph_ir::Outputs::new(witness).with_witness(
+            poot_graph_ir::ValidationId(1),
+            "planted",
+            witness,
+        ))
+        .unwrap();
 
     let store = {
         let mut builder = WeightStore::builder();
@@ -1446,12 +1512,12 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
     let w_t = b.transpose(w, vec![1, 0]);
     let gemv = b.matmul(x, w_t);
     let y = b.binary(poot_graph_ir::BinOp::Add, gathered_f32, gemv);
-    let g = b.finish(y);
+    let g = b.finish(y).unwrap();
 
     let w_values: Vec<f32> = fill(rows * cols, 0x6a54);
     let w_bytes: Vec<u8> = w_values
         .iter()
-        .flat_map(|&v| poot_runtime_common::f32_to_bf16(v).to_le_bytes())
+        .flat_map(|&v| poot_quant::scalar::f32_to_bf16(v).to_le_bytes())
         .collect();
     let store = {
         let mut builder = WeightStore::builder();
@@ -1476,7 +1542,7 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
     let x_values = fill(cols, 0xA5);
     let x_shape = [1, cols];
     let mut inputs = StepInputs::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         if meta.storage != Storage::Slot(Slot::Activation) {
             continue;
@@ -1519,7 +1585,7 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
     );
 
     let mut oracle_inputs: HashMap<ValueId, Value> = HashMap::new();
-    for &id in &g.inputs {
+    for &id in g.inputs() {
         let meta = g.meta(id);
         let value = match meta.storage {
             Storage::Const => Value::from(

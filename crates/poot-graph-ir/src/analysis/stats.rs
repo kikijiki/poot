@@ -11,16 +11,16 @@ use super::*;
 /// `[1,Hq,L,L]` attention scores dominate a materialized prefill (`O(L^2)`), and `flash_attention`
 /// removes them (`O(L*D)`). Engine-produced (derived from poot's own graph), no vendor/runtime API.
 pub fn peak_transient_bytes(g: &Graph) -> usize {
-    let n = g.eqns.len();
+    let n = g.eqns().len();
     // birth + last-use index per value. Only eqn-produced values are transient; the rest stay at the
     // never-born sentinel and contribute nothing.
-    let mut born = ValueTable::filled(g.values.len(), false);
-    let mut last_use = ValueTable::filled(g.values.len(), 0usize);
-    for (i, e) in g.eqns.iter().enumerate() {
+    let mut born = ValueTable::filled(g.values().len(), false);
+    let mut last_use = ValueTable::filled(g.values().len(), 0usize);
+    for (i, e) in g.eqns().iter().enumerate() {
         born[e.out] = true;
         last_use[e.out] = i; // dies at birth if never used
     }
-    for (i, e) in g.eqns.iter().enumerate() {
+    for (i, e) in g.eqns().iter().enumerate() {
         for o in &e.inputs {
             if let Operand::Value(v) = o
                 && born[*v]
@@ -30,18 +30,18 @@ pub fn peak_transient_bytes(g: &Graph) -> usize {
         }
     }
     // graph output + state writes are live to the end (never freed within the sweep).
-    let mut lives_to_end = ValueTable::filled(g.values.len(), false);
-    if born[g.output] {
-        lives_to_end[g.output] = true;
+    let mut lives_to_end = ValueTable::filled(g.values().len(), false);
+    if born[g.result()] {
+        lives_to_end[g.result()] = true;
     }
-    for &(_, so) in &g.state {
+    for (_, so) in g.state() {
         if born[so] {
             lives_to_end[so] = true;
         }
     }
     // deaths[i] = transient values whose last use is eqn i (and that do not live to the end).
     let mut deaths: Vec<Vec<ValueId>> = vec![Vec::new(); n.max(1)];
-    for v in g.values.ids() {
+    for v in g.values().ids() {
         if born[v] && !lives_to_end[v] {
             deaths[last_use[v]].push(v);
         }
@@ -52,7 +52,7 @@ pub fn peak_transient_bytes(g: &Graph) -> usize {
     };
     let mut live = 0usize;
     let mut peak = 0usize;
-    for (i, e) in g.eqns.iter().enumerate() {
+    for (i, e) in g.eqns().iter().enumerate() {
         live += bytes(e.out); // the output is allocated
         peak = peak.max(live);
         for &v in &deaths[i] {
@@ -70,7 +70,7 @@ pub fn peak_transient_bytes(g: &Graph) -> usize {
 /// softmax-attention chain to a single op. Engine-produced and plan-independent (it counts the graph,
 /// not a backend's scheduling), so it is a faithful relative measure of what each transform removes.
 pub fn dispatch_count(g: &Graph) -> usize {
-    g.eqns
+    g.eqns()
         .iter()
         .filter(|e| !matches!(e.op, OpKind::Reshape { .. }))
         .count()

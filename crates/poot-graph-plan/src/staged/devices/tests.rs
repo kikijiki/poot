@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use poot_graph_ir::{BinOp, Builder, Graph, RedOp, Slot, StateRole, TensorType};
-use poot_target::{AmdArch, Backend};
+use poot_target::{AmdArch, Backend, TargetId};
 use poot_tensor::DType;
 use poot_test_util::device_caps::default_caps_for;
 
@@ -16,6 +16,7 @@ use crate::planner::per_eqn_plans_inside_compile;
 use crate::staged::{
     DevicePlacement, ExpertPlacement, Partition, StagedCompileError, TargetSet, compile_staged,
 };
+use crate::test_support::gpu_caps;
 use crate::test_support::{LAYERS, qwen2_decode};
 use crate::{Capability, CompileLimits, CompileOptions, DeviceId, StageId, Submission, Target};
 
@@ -24,7 +25,7 @@ const GIB: u64 = 1 << 30;
 fn target(backend: Backend, budget: u64) -> Target {
     let mut caps = default_caps_for(backend);
     caps.memory_budget_bytes = Some(budget);
-    Target { backend, caps }
+    Target::Gpu { backend, caps }
 }
 
 fn options() -> CompileOptions {
@@ -80,14 +81,14 @@ fn three_device_fixture() -> Graph {
         let shifted = b.binary(BinOp::Add, t1, w2);
         out = b.binary(BinOp::Mul, shifted, total);
     }
-    b.finish(out)
+    b.finish(out).unwrap()
 }
 
 fn compile_on(
     graph: &Graph,
     targets: &TargetSet,
     partition: &Partition,
-) -> Result<crate::StagedProgram<poot_graph_ir::NoValidations>, StagedCompileError> {
+) -> Result<crate::StagedProgram, StagedCompileError> {
     compile_staged(graph, targets, partition, &options())
 }
 
@@ -170,9 +171,9 @@ fn a_two_device_pipeline_on_wgpu_or_rocm_is_refused_before_any_stage_is_compiled
             Capability::Collective(CollectiveKind::PointToPoint),
             "{backend:?}"
         );
-        assert_eq!(refusal.target, backend);
+        assert_eq!(refusal.target, TargetId::Gpu(backend));
         assert!(
-            graph.eqns.iter().any(|eqn| eqn.out == refusal.eqn),
+            graph.eqns().iter().any(|eqn| eqn.out == refusal.eqn),
             "the refusal names an equation of the uncut graph"
         );
         assert_eq!(
@@ -235,7 +236,6 @@ fn a_multi_consumer_boundary_has_a_complete_map_and_an_exact_per_device_footprin
         let consumer = stages[transfer.to.0 as usize].2;
         let export = producer
             .exports()
-            .iter()
             .find(|export| export.id == transfer.id)
             .expect("the producer exports the boundary");
         assert_eq!(export.value, transfer.export);
@@ -308,7 +308,9 @@ fn an_i32_boundary_read_only_as_an_index_crosses_devices() {
         k_out = b.binary(BinOp::Add, k_in, rows);
         out = b.gather(table, 0, ids);
     }
-    let graph = b.finish_with_state(out, &[(k_in, k_out)]);
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(k_in, k_out)]))
+        .unwrap();
     let before = per_eqn_plans_inside_compile();
     let program = compile_on(&graph, &targets(Backend::Nvptx, &[GIB, GIB]), &pipeline(2))
         .unwrap_or_else(|error| panic!("an I32 boundary has one representation: {error}"));
@@ -371,11 +373,11 @@ fn a_device_over_its_budget_refuses_the_placement() {
 fn a_device_with_an_unknown_budget_is_refused() {
     let graph = three_device_fixture();
     let mut devices = targets(Backend::Nvptx, &[GIB, GIB, GIB]);
-    let unknown = Target {
+    let unknown = Target::Gpu {
         backend: Backend::Nvptx,
         caps: default_caps_for(Backend::Nvptx),
     };
-    assert_eq!(unknown.caps.memory_budget_bytes, None);
+    assert_eq!(gpu_caps(&unknown).memory_budget_bytes, None);
     devices = TargetSet::new(vec![
         (DeviceId(0), devices.devices()[0].1),
         (DeviceId(1), unknown),
@@ -410,7 +412,7 @@ fn one_store_key_naming_two_different_tensors_is_a_duplicate_owner() {
             let w = b.constant("w", TensorType::f32(second));
             out = b.binary(BinOp::Add, hidden, w);
         }
-        b.finish(out)
+        b.finish(out).unwrap()
     };
     let devices = targets(Backend::Nvptx, &[GIB, GIB]);
 
@@ -451,7 +453,7 @@ fn the_weight_derivation_of_a_real_model_places_every_owner_on_its_stages() {
         let weights: u64 = stage
             .2
             .graph()
-            .consts
+            .consts()
             .iter()
             .filter(|&&value| {
                 stage.2.graph().meta(value).storage == poot_graph_ir::Storage::Const

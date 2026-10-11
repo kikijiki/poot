@@ -78,8 +78,8 @@ fn fused_equals_unfused_elementwise_chain_all_fusable() {
                 acc = b.binary(op, acc, other);
             }
         }
-        let g = b.finish(acc);
-        let n_raw = g.eqns.len();
+        let g = b.finish(acc).unwrap();
+        let n_raw = g.eqns().len();
         // Inputs in [0.1, 1.1] so Log/Sqrt don't produce NaN.
         let safe = |v: f32| v.abs() + 0.1;
         let d0: Vec<f32> = fill(numel, seed * 3 + 1).into_iter().map(safe).collect();
@@ -88,16 +88,15 @@ fn fused_equals_unfused_elementwise_chain_all_fusable() {
         inputs.insert(leaf_ids[0], Value::from(HostTensor::f32(shape.clone(), d0)));
         inputs.insert(leaf_ids[1], Value::from(HostTensor::f32(shape.clone(), d1)));
 
-        let fg = fuse(&cse(&g));
-        fg.validate().expect("fused graph valid");
-        let n_fused = fg.eqns.len();
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let n_fused = fg.eqns().len();
 
         // Assertion (a): fusion must fire.
         assert!(
             n_fused < n_raw,
             "seed {seed}: depth {depth} chain did not shrink eqn count ({n_raw} -> {n_fused})"
         );
-        let has_fused_region = fg.eqns.iter().any(|e| matches!(e.op, OpKind::Fused(_)));
+        let has_fused_region = fg.eqns().iter().any(|e| matches!(e.op, OpKind::Fused(_)));
         assert!(
             has_fused_region,
             "seed {seed}: no Fused region in fused graph (eqns: {n_fused})"
@@ -184,8 +183,8 @@ fn fused_equals_unfused_matmul_epilogue() {
                 acc = b.binary(op, acc, other);
             }
         }
-        let g = b.finish(acc);
-        let n_raw = g.eqns.len(); // matmul + epilogue_len eqns
+        let g = b.finish(acc).unwrap();
+        let n_raw = g.eqns().len(); // matmul + epilogue_len eqns
 
         // Inputs.
         let numel_a = m * k;
@@ -208,9 +207,8 @@ fn fused_equals_unfused_matmul_epilogue() {
             )),
         );
 
-        let fg = fuse(&cse(&g));
-        fg.validate().expect("fused graph valid");
-        let n_fused = fg.eqns.len();
+        let fg = fuse(&cse(&g).unwrap()).unwrap();
+        let n_fused = fg.eqns().len();
 
         // Assertion (a): epilogue must fuse (at least 2 epilogue eqns -> 1 Fused).
         assert!(
@@ -218,13 +216,13 @@ fn fused_equals_unfused_matmul_epilogue() {
             "seed {seed}: matmul+epilogue({epilogue_len}) did not reduce eqn count \
              ({n_raw} -> {n_fused})"
         );
-        let has_fused_region = fg.eqns.iter().any(|e| matches!(e.op, OpKind::Fused(_)));
+        let has_fused_region = fg.eqns().iter().any(|e| matches!(e.op, OpKind::Fused(_)));
         assert!(
             has_fused_region,
             "seed {seed}: no Fused region after matmul epilogue (eqns: {n_fused})"
         );
         // The matmul itself must not have been absorbed.
-        let has_matmul = fg.eqns.iter().any(|e| matches!(e.op, OpKind::MatMul));
+        let has_matmul = fg.eqns().iter().any(|e| matches!(e.op, OpKind::MatMul));
         assert!(
             has_matmul,
             "seed {seed}: matmul disappeared - fusion crossed the matmul boundary"

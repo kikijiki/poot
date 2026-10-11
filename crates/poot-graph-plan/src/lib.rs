@@ -8,7 +8,7 @@
 //! (the rare layout-op fallback), or alias an input buffer (reshape). The wgpu, PTX, ROCm, and restricted
 //! raw-Vulkan GPU executors consume this planner with `Backend::SpirvVulkan`, `Backend::Nvptx`, or
 //! `Backend::AmdGcn`; target compilation and recorder dispatch remain runtime-specific. An AIE target
-//! (`Backend::Aie`) plans the same requests under a sequential one-core schedule instead of a thread grid
+//! (`Target::Aie`, carrying `AieCaps`, never GPU caps) plans the same requests under a sequential one-core schedule instead of a thread grid
 //! (POOT-664); a plan that is not that schedule is refused with `Capability::AieSchedule`. The generated
 //! `Body` is named `"k"`, the
 //! shared entry point used by the GPU emitters.
@@ -29,11 +29,7 @@ use poot_graph_ir::op::{
     UnOp as GUnOp,
 };
 
-#[cfg(test)]
-use poot_graph_ir::ValidationOutputs;
-use poot_graph_ir::{
-    Eqn, Graph, Operand, Scalar, ValidationChannel, ValidationPacketLayout, ValueId,
-};
+use poot_graph_ir::{Eqn, Graph, Operand, Scalar, ValidationPacketLayout, ValueId};
 
 use poot_kernel_ir::{BinOp, Body, MathOp, Ty, UnOp};
 
@@ -142,6 +138,10 @@ mod storage_analysis;
 pub use compile::*;
 pub use graph_validation::*;
 pub(crate) use kernel_mapping::*;
+pub use kernel_mapping::{
+    AieAbiRefusal, AieLimitRefusal, aie_shape_abi, validate_linked_artifact,
+    validate_recipe_tile_local,
+};
 pub use passes::{
     BoundaryDescriptor, ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout, PoolError,
     PoolSite, PoolSpec, PooledWeight, ShardError, ShardRule, ShardedGraph, StageSplitError,
@@ -162,7 +162,7 @@ pub use passes::{recognize_packed_contractions, recognize_packed_row_gathers};
 pub(crate) use passes::{CutSite, StageAssignment, split_stages};
 #[cfg(any(test, feature = "test-support"))]
 pub use passes::{
-    FUSABLE_FLOAT_UNARY_OPS, LegalizeError, PackedDequantErrorContext,
+    DecomposeError, FUSABLE_FLOAT_UNARY_OPS, LegalizeError, PackedDequantErrorContext,
     PackedDequantProductionError, canonicalize, canonicalize_with_declines,
     collapse_reshape_chains, cse, dce, dce_with_roots, decompose_large_vocab_greedy,
     elide_noop_transposes, flash_attention_capped, fold_iota, fuse, fuse_contraction_epilogues,

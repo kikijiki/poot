@@ -52,7 +52,7 @@ let b = Builder::new();
 let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
 let w = b.constant("w", TensorType::f32(vec![n]));
 let out = ops::rmsnorm(&b, x, w, 1e-6);
-let g = b.finish(out);
+let g = b.finish(out)?;
 
 let mut inputs = HashMap::new();
 inputs.insert(x.id(), Value::from(HostTensor::f32(vec![1, 1, n], vec![1.0; n])));
@@ -82,7 +82,7 @@ use poot_graph_plan::{compile, CompileLimits, CompileOptions, Submission, Target
 use poot_gpu::device::WgpuDevice;
 
 let device = WgpuDevice::new()?;
-let target: Target = device.target(); // backend plus measured DeviceCaps
+let target: Target = device.target(); // a GPU target: backend plus measured DeviceCaps
 let program = compile(&g, &target, &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD))?;
 ```
 
@@ -127,7 +127,7 @@ let target = device.target();
 
 // Stage the graph for one device: compile runs the passes, then planning.
 let staged = compile_staged(
-    &g.clone().with_validations(Vec::new()),
+    &g,
     &TargetSet::single(DeviceId(0), target),
     &Partition {
         experts: ExpertPlacement::AllResident,
