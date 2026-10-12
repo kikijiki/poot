@@ -154,6 +154,13 @@ impl RawEmitter<'_> {
 /// `vocab.div_ceil(CHUNK_LEN)`) then sits at or under the threshold and passes through unchanged on a
 /// second pass. Beyond that bound, stage 2's reduction would itself exceed the threshold and a second
 /// application would decompose it further - still correct, just not maximally parallel.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn decompose_large_vocab_greedy(
     g: &Graph,
     limits: &CompileLimits,
@@ -535,8 +542,10 @@ mod tests {
 
     fn greedy_row(b: Builder, logits: &[f32]) -> Graph {
         let v = logits.len();
-        let x = b.constant("logits", TensorType::f32(vec![v]));
-        let out = b.sample_token(SampleRule::Greedy, x, None, None, None);
+        let x = b.constant("logits", TensorType::f32(vec![v])).unwrap();
+        let out = b
+            .sample_token(SampleRule::Greedy, x, None, None, None)
+            .unwrap();
         b.finish(out).unwrap()
     }
 
@@ -570,7 +579,7 @@ mod tests {
     #[test]
     fn large_vocab_greedy_decomposes_into_more_than_one_sample_token() {
         let v = DECOMPOSE_THRESHOLD + 1;
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let g = greedy_row(b, &vec![0.0f32; v][..]);
         let out = decompose_large_vocab_greedy(&g, &CompileLimits::STANDARD).unwrap();
         let count = out
@@ -591,7 +600,7 @@ mod tests {
     /// then restored.
     #[test]
     fn small_vocab_greedy_is_left_alone() {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let g = greedy_row(b, &[1.0, 5.0, 3.0, 2.0]);
         let out = decompose_large_vocab_greedy(&g, &CompileLimits::STANDARD).unwrap();
         assert_eq!(

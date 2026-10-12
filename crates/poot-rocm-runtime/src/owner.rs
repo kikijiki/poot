@@ -1,4 +1,6 @@
-use crate::*;
+use crate::bindings;
+use crate::ffi::Hsa;
+use std::ffi::c_void;
 
 /// Cleanup operations carried by every resource created from one initialized HSA runtime.
 ///

@@ -1,10 +1,10 @@
-use super::*;
+use super::{Context, Db, ErrorKind, OptionalExtension, Result, bail, now_iso, params};
 
 /// A run record. `status` drives resume/teardown. `kind` is the resumable bench `sweep` (the `run`
 /// command) or a one-off `exec`; both are recorded so every pod is tracked, but only `sweep` rows are
 /// eligible for resume (see `active_run`).
 #[derive(Debug, Clone)]
-pub struct Run {
+pub(crate) struct Run {
     pub id: String,
     pub kind: String, // sweep | exec
     pub git_ref: String,
@@ -22,7 +22,7 @@ pub struct Run {
 impl Run {
     /// The results directories one model's sweep wrote, given the `bench run --run-id` it recorded: the run
     /// itself for one repeat, else `<run_id>-r1` .. `-rN`, each a valid `bench compare` input.
-    pub fn model_snapshot_dirs(&self, run_id: &str) -> Vec<String> {
+    pub(crate) fn model_snapshot_dirs(&self, run_id: &str) -> Vec<String> {
         repeat_dirs(run_id, self.repeats)
     }
 }
@@ -37,7 +37,7 @@ fn repeat_dirs(run_id: &str, repeats: u32) -> Vec<String> {
 
 /// A kept-warm exec pod a later exec may adopt (see [`Db::find_warm_exec`]).
 #[derive(Debug, Clone)]
-pub struct WarmExec {
+pub(crate) struct WarmExec {
     pub run_id: String,
     pub image: String,
     pub pod_id: String,
@@ -49,7 +49,7 @@ pub struct WarmExec {
 /// Identity of the local process that owns a nonterminal `exec` row. A PID can be reused, so the
 /// process start tick and boot id must also match before the owner counts as live.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecOwner {
+pub(crate) struct ExecOwner {
     pub hostname: String,
     pub pid: i64,
     pub boot_id: String,
@@ -57,7 +57,7 @@ pub struct ExecOwner {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OwnerLiveness {
+pub(crate) enum OwnerLiveness {
     /// The recorded owner is still the same local process.
     Live,
     /// The recorded owner is provably gone, or the PID now names a different process.
@@ -67,7 +67,7 @@ pub enum OwnerLiveness {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ExecReapReport {
+pub(crate) struct ExecReapReport {
     pub aborted: usize,
     pub kept_live: usize,
     pub kept_unknown: usize,
@@ -79,7 +79,7 @@ pub struct ExecReapReport {
 /// recorded. `has_unrecorded` covers an older concurrent orchestrator whose generic pod name cannot be
 /// mapped back to its run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReapProtection {
+pub(crate) struct ReapProtection {
     pub pod_ids: Vec<String>,
     pub run_ids: Vec<String>,
     pub has_unrecorded: bool,
@@ -116,7 +116,7 @@ impl ExecReapCandidate {
 }
 
 impl ExecOwner {
-    pub fn current() -> Result<Self> {
+    pub(crate) fn current() -> Result<Self> {
         let pid = std::process::id() as i64;
         Ok(Self {
             hostname: local_hostname(),
@@ -128,7 +128,7 @@ impl ExecOwner {
         })
     }
 
-    pub fn local_liveness(&self) -> OwnerLiveness {
+    pub(crate) fn local_liveness(&self) -> OwnerLiveness {
         let hostname = local_hostname();
         if self.hostname != hostname {
             return OwnerLiveness::Unknown;
@@ -190,7 +190,7 @@ pub(crate) fn process_start_liveness(
 
 /// Per-model progress inside a run.
 #[derive(Debug, Clone, Default)]
-pub struct ModelState {
+pub(crate) struct ModelState {
     pub setup_done: bool,
     pub sweep_done: bool,
     pub pod_run_id: Option<String>, // the harness results dir the sweep wrote on the pod
@@ -199,7 +199,7 @@ pub struct ModelState {
 
 /// A run plus its per-model progress, serialized to JSON for the web dashboard.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct RunView {
+pub(crate) struct RunView {
     pub id: String,
     pub kind: String,
     pub created_at: String,
@@ -216,7 +216,7 @@ pub struct RunView {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ModelView {
+pub(crate) struct ModelView {
     pub model: String,
     pub setup_done: bool,
     pub sweep_done: bool,
@@ -225,11 +225,11 @@ pub struct ModelView {
 }
 
 impl Db {
-    pub fn create_run(&self, r: &Run) -> Result<()> {
+    pub(crate) fn create_run(&self, r: &Run) -> Result<()> {
         self.create_run_with_owner(r, None)
     }
 
-    pub fn create_run_with_owner(&self, r: &Run, owner: Option<&ExecOwner>) -> Result<()> {
+    pub(crate) fn create_run_with_owner(&self, r: &Run, owner: Option<&ExecOwner>) -> Result<()> {
         let now = now_iso();
         self.conn.execute(
             "INSERT INTO runs (
@@ -263,26 +263,8 @@ impl Db {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn set_exec_owner(&self, run_id: &str, owner: &ExecOwner) -> Result<()> {
-        self.conn.execute(
-            "UPDATE runs
-             SET owner_hostname=?2, owner_pid=?3, owner_boot_id=?4, owner_start_ticks=?5, updated_at=?6
-             WHERE id=?1 AND kind='exec'",
-            params![
-                run_id,
-                owner.hostname.as_str(),
-                owner.pid,
-                owner.boot_id.as_str(),
-                owner.start_ticks.as_str(),
-                now_iso()
-            ],
-        )?;
-        Ok(())
-    }
-
     /// The single in-progress run, if any. One sweep at a time: a second would fight over pod-name reaping.
-    pub fn active_run(&self) -> Result<Option<Run>> {
+    pub(crate) fn active_run(&self) -> Result<Option<Run>> {
         self.conn
             .query_row(
                 "SELECT id, git_ref, scenario, models, gpu_types, image, status, pod_id, kind, repeats
@@ -322,7 +304,7 @@ impl Db {
     ///
     /// Legitimate exits from 'warm' use their own guarded SQL ([`Self::try_adopt_warm_exec`],
     /// [`Self::try_abort_warm_exec`], `abort_exec_candidate`). An expired warm row is not protected.
-    pub fn set_status(&self, run_id: &str, status: &str) -> Result<()> {
+    pub(crate) fn set_status(&self, run_id: &str, status: &str) -> Result<()> {
         let now = now_iso();
         self.conn.execute(
             "UPDATE runs SET status=?2, updated_at=?3
@@ -333,7 +315,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_pod(
+    pub(crate) fn set_pod(
         &self,
         run_id: &str,
         pod_id: &str,
@@ -347,7 +329,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn model_state(&self, run_id: &str, model: &str) -> Result<ModelState> {
+    pub(crate) fn model_state(&self, run_id: &str, model: &str) -> Result<ModelState> {
         self.conn
             .query_row(
                 "SELECT setup_done, sweep_done, pod_run_id, gathered FROM model_runs WHERE run_id=?1 AND model=?2",
@@ -366,7 +348,7 @@ impl Db {
             .map_err(Into::into)
     }
 
-    pub fn set_model_setup(&self, run_id: &str, model: &str, done: bool) -> Result<()> {
+    pub(crate) fn set_model_setup(&self, run_id: &str, model: &str, done: bool) -> Result<()> {
         self.conn.execute(
             "UPDATE model_runs SET setup_done=?3 WHERE run_id=?1 AND model=?2",
             params![run_id, model, done as i64],
@@ -374,7 +356,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_model_sweep(
+    pub(crate) fn set_model_sweep(
         &self,
         run_id: &str,
         model: &str,
@@ -388,7 +370,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_model_gathered(&self, run_id: &str, model: &str) -> Result<()> {
+    pub(crate) fn set_model_gathered(&self, run_id: &str, model: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE model_runs SET gathered=1 WHERE run_id=?1 AND model=?2",
             params![run_id, model],
@@ -398,7 +380,7 @@ impl Db {
 
     /// The results-snapshot dirs this run produced, each a `benchmarks/results/<dir>`: every repeat of every
     /// model's sweep (see [`Run::model_snapshot_dirs`]). Used by the dashboard's Results tab and the commit message.
-    pub fn snapshot_dirs(&self, run_id: &str) -> Result<Vec<String>> {
+    pub(crate) fn snapshot_dirs(&self, run_id: &str) -> Result<Vec<String>> {
         let repeats: u32 = self
             .conn
             .query_row(
@@ -423,11 +405,11 @@ impl Db {
     /// Finalize nonterminal `exec` rows only when their owner is gone. An `exec` is non-resumable, but
     /// another process may be running it, so normal reap checks the owner identity before releasing its
     /// pod from `live_pod_ids`. `force` is the `reap --all` override.
-    pub fn abort_stale_execs(&self, force: bool) -> Result<ExecReapReport> {
+    pub(crate) fn abort_stale_execs(&self, force: bool) -> Result<ExecReapReport> {
         self.abort_stale_execs_with(force, |owner| owner.local_liveness())
     }
 
-    pub fn abort_stale_execs_with(
+    pub(crate) fn abort_stale_execs_with(
         &self,
         force: bool,
         liveness: impl Fn(&ExecOwner) -> OwnerLiveness,
@@ -520,7 +502,7 @@ impl Db {
 
     /// Keep a finished exec's pod warm until `warm_until` (UTC ISO); a later exec with the same image
     /// adopts it via [`find_warm_exec`].
-    pub fn set_warm(&self, run_id: &str, warm_until: &str) -> Result<()> {
+    pub(crate) fn set_warm(&self, run_id: &str, warm_until: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET status='warm', warm_until=?2, updated_at=?3 WHERE id=?1",
             params![run_id, warm_until, now_iso()],
@@ -530,7 +512,7 @@ impl Db {
 
     /// Atomically move a still-matching warm pod claim to this exec row, so two concurrent execs cannot
     /// adopt the same pod.
-    pub fn try_adopt_warm_exec(
+    pub(crate) fn try_adopt_warm_exec(
         &self,
         warm: &WarmExec,
         new_run_id: &str,
@@ -596,7 +578,7 @@ impl Db {
 
     /// Mark a still-matching warm row aborted before deleting its pod. If another process already
     /// changed the row, the caller must not delete the pod.
-    pub fn try_abort_warm_exec(&self, warm: &WarmExec) -> Result<bool> {
+    pub(crate) fn try_abort_warm_exec(&self, warm: &WarmExec) -> Result<bool> {
         let n = self.conn.execute(
             "UPDATE runs
              SET status='aborted', updated_at=?7
@@ -623,7 +605,7 @@ impl Db {
 
     /// The newest kept-warm exec pod for `image` with a recorded endpoint. The caller checks expiry and
     /// SSH reachability.
-    pub fn find_warm_exec(&self, image: &str) -> Result<Option<WarmExec>> {
+    pub(crate) fn find_warm_exec(&self, image: &str) -> Result<Option<WarmExec>> {
         self.conn
             .query_row(
                 "SELECT id, image, pod_id, ssh_host, ssh_port, warm_until FROM runs
@@ -646,23 +628,11 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// Test-only view of recorded pod ids of nonterminal runs. Production reap uses [`Self::reap_protection`].
-    #[cfg(test)]
-    pub fn live_pod_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT pod_id FROM runs WHERE pod_id IS NOT NULL AND status NOT IN ('done','failed','aborted')",
-        )?;
-        let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(ids)
-    }
-
     /// Snapshot every nonterminal run claim after the cloud pod list has been read (the caller owns that
     /// ordering). A pod that appears before `on_create` stores `pod_id` is protected by `run_ids` when its
     /// name is run-specific; with a generic name from an older binary, any unrecorded live claim makes
     /// normal reap defer deletion for this pass.
-    pub fn reap_protection(&self) -> Result<ReapProtection> {
+    pub(crate) fn reap_protection(&self) -> Result<ReapProtection> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pod_id FROM runs WHERE status NOT IN ('done','failed','aborted')",
         )?;
@@ -685,7 +655,7 @@ impl Db {
     /// The pod_id recorded for a run, if any (card 230). The SIGINT/SIGTERM handler calls this on a fresh
     /// connection because the main thread's `Connection` is not `Sync`. `Ok(None)` when there is no pod
     /// or row; an error makes the handler skip teardown.
-    pub fn pod_id_for_run(&self, run_id: &str) -> Result<Option<String>> {
+    pub(crate) fn pod_id_for_run(&self, run_id: &str) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
@@ -697,20 +667,8 @@ impl Db {
             .flatten())
     }
 
-    #[cfg(test)]
-    pub fn run_status(&self, run_id: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT status FROM runs WHERE id=?1",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
     /// Recent runs with per-model progress for the web dashboard: one query for runs, one per run for models.
-    pub fn dashboard(&self, limit: i64) -> Result<Vec<RunView>> {
+    pub(crate) fn dashboard(&self, limit: i64) -> Result<Vec<RunView>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, updated_at, git_ref, scenario, gpu_types, image, status, pod_id, ssh_host, ssh_port, kind
              FROM runs ORDER BY created_at DESC LIMIT ?1",
@@ -755,7 +713,7 @@ impl Db {
     }
 
     /// All recent runs for the `status` command.
-    pub fn recent_runs(&self, limit: i64) -> Result<Vec<(Run, String)>> {
+    pub(crate) fn recent_runs(&self, limit: i64) -> Result<Vec<(Run, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, git_ref, scenario, models, gpu_types, image, status, pod_id, kind, repeats, updated_at
              FROM runs ORDER BY created_at DESC LIMIT ?1",
@@ -768,5 +726,51 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl Db {
+        pub(crate) fn set_exec_owner(&self, run_id: &str, owner: &ExecOwner) -> Result<()> {
+            self.conn.execute(
+                "UPDATE runs
+                 SET owner_hostname=?2, owner_pid=?3, owner_boot_id=?4, owner_start_ticks=?5, updated_at=?6
+                 WHERE id=?1 AND kind='exec'",
+                params![
+                    run_id,
+                    owner.hostname.as_str(),
+                    owner.pid,
+                    owner.boot_id.as_str(),
+                    owner.start_ticks.as_str(),
+                    now_iso()
+                ],
+            )?;
+            Ok(())
+        }
+
+        /// Test-only view of recorded pod ids of nonterminal runs. Production reap uses [`Self::reap_protection`].
+        pub(crate) fn live_pod_ids(&self) -> Result<Vec<String>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT pod_id FROM runs WHERE pod_id IS NOT NULL AND status NOT IN ('done','failed','aborted')",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(ids)
+        }
+
+        pub(crate) fn run_status(&self, run_id: &str) -> Result<Option<String>> {
+            self.conn
+                .query_row(
+                    "SELECT status FROM runs WHERE id=?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Into::into)
+        }
     }
 }

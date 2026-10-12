@@ -1,21 +1,16 @@
-use super::*;
-
-/// Elementwise math-unary `y[i] = f(x[i])` (sqrt/abs/floor/..., non-transcendental), in storage dtype `dt`
-/// (spec 024; f32 compute). Only this crate's own tests exercise the plain (non-grid, non-view) form
-/// directly today; production callers go through [`math_unary_dt_grid`]/[`math_unary_dt_views_grid`].
-#[cfg(test)]
-fn math_unary_dt(name: &str, dt: Ty, op: MathOp) -> Body {
-    build_unary_dt(name, dt, |x_i| Rvalue::MathUnary(op, copy(x_i)))
-}
+use super::{
+    BinOp, Body, Constant, IntScalarOp, Layout, MathOp, Operand, Rvalue, Ty, UnOp, build_unary_dt,
+    build_unary_dt_grid, build_unary_dt_views_grid, copy,
+};
 
 /// [`math_unary_dt`] with an optional 2-D grid fold; see [`build_unary_dt_grid`]. `x_groups: None` is
 /// identical to [`math_unary_dt`].
-pub fn math_unary_dt_grid(name: &str, dt: Ty, op: MathOp, x_groups: Option<usize>) -> Body {
+pub(crate) fn math_unary_dt_grid(name: &str, dt: Ty, op: MathOp, x_groups: Option<usize>) -> Body {
     build_unary_dt_grid(name, dt, |x_i| Rvalue::MathUnary(op, copy(x_i)), x_groups)
 }
 
 /// Math-unary `dt` over a view layout with an optional 2-D grid fold; see `build_unary_dt_views_grid`.
-pub fn math_unary_dt_views_grid(
+pub(crate) fn math_unary_dt_views_grid(
     name: &str,
     dt: Ty,
     op: MathOp,
@@ -34,7 +29,7 @@ pub fn math_unary_dt_views_grid(
 }
 
 /// Reciprocal `dt` with an optional 2-D grid fold; see `build_unary_dt_grid`.
-pub fn recip_dt_grid(name: &str, dt: Ty, x_groups: Option<usize>) -> Body {
+pub(crate) fn recip_dt_grid(name: &str, dt: Ty, x_groups: Option<usize>) -> Body {
     build_unary_dt_grid(
         name,
         dt,
@@ -44,7 +39,7 @@ pub fn recip_dt_grid(name: &str, dt: Ty, x_groups: Option<usize>) -> Body {
 }
 
 /// Reciprocal `dt` over a view layout with an optional 2-D grid fold; see `build_unary_dt_views_grid`.
-pub fn recip_dt_views_grid(
+pub(crate) fn recip_dt_views_grid(
     name: &str,
     dt: Ty,
     out_shape: &[usize],
@@ -67,7 +62,7 @@ pub fn unary(name: &str, op: UnOp) -> Body {
 }
 
 /// `unary` in storage dtype `dt` (spec 024; f32 compute).
-pub fn unary_dt(name: &str, dt: Ty, op: UnOp) -> Body {
+pub(crate) fn unary_dt(name: &str, dt: Ty, op: UnOp) -> Body {
     build_unary_dt(name, dt, |x_i| Rvalue::UnaryOp(op, copy(x_i)))
 }
 
@@ -87,7 +82,7 @@ pub fn unary_i32_clz_grid(name: &str, x_groups: Option<usize>) -> Body {
 }
 
 /// Exact I32 leading-zero count reading `x` through `layout`.
-pub fn unary_i32_clz_views_grid(
+pub(crate) fn unary_i32_clz_views_grid(
     name: &str,
     out_shape: &[usize],
     layout: &Layout,
@@ -103,23 +98,8 @@ pub fn unary_i32_clz_views_grid(
     )
 }
 
-/// [`unary_dt`] generalized to read `x` through a physical [`Layout`] (spec 132 phase 1). Only this
-/// crate's own tests exercise the plain (non-grid) form directly today; production callers go through
-/// [`unary_dt_views_grid`].
-#[cfg(test)]
-fn unary_dt_views(name: &str, dt: Ty, op: UnOp, out_shape: &[usize], layout: &Layout) -> Body {
-    build_unary_dt_views_grid(
-        name,
-        dt,
-        out_shape,
-        layout,
-        |x_i| Rvalue::UnaryOp(op, copy(x_i)),
-        None,
-    )
-}
-
 /// [`unary_dt_views`] with an optional 2-D grid fold; see [`build_unary_dt_views_grid`].
-pub fn unary_dt_views_grid(
+pub(crate) fn unary_dt_views_grid(
     name: &str,
     dt: Ty,
     op: UnOp,
@@ -139,10 +119,10 @@ pub fn unary_dt_views_grid(
 
 #[cfg(test)]
 mod tests {
-    use poot_runtime::KernelBuffer;
+    use poot_wgpu_runtime::KernelBuffer;
 
     use super::*;
-    use crate::test_support::{ctx, spv};
+    use crate::unit_helpers::{ctx, spv};
 
     #[test]
     fn math_sqrt() {
@@ -201,5 +181,26 @@ mod tests {
         let a = unary_dt("k", Ty::F32, UnOp::Neg);
         let b = unary_dt_views("k", Ty::F32, UnOp::Neg, &shape, &Layout::contiguous(&shape));
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    /// Elementwise math-unary `y[i] = f(x[i])` (sqrt/abs/floor/..., non-transcendental), in storage dtype `dt`
+    /// (spec 024; f32 compute). Only this crate's own tests exercise the plain (non-grid, non-view) form
+    /// directly today; production callers go through [`math_unary_dt_grid`]/[`math_unary_dt_views_grid`].
+    fn math_unary_dt(name: &str, dt: Ty, op: MathOp) -> Body {
+        build_unary_dt(name, dt, |x_i| Rvalue::MathUnary(op, copy(x_i)))
+    }
+
+    /// [`unary_dt`] generalized to read `x` through a physical [`Layout`] (spec 132 phase 1). Only this
+    /// crate's own tests exercise the plain (non-grid) form directly today; production callers go through
+    /// [`unary_dt_views_grid`].
+    fn unary_dt_views(name: &str, dt: Ty, op: UnOp, out_shape: &[usize], layout: &Layout) -> Body {
+        build_unary_dt_views_grid(
+            name,
+            dt,
+            out_shape,
+            layout,
+            |x_i| Rvalue::UnaryOp(op, copy(x_i)),
+            None,
+        )
     }
 }

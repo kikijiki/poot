@@ -5,7 +5,7 @@
 //!
 //! Exits 0 on success; exits 1 with a diagnostic when ROCm is missing or no GPU is visible.
 
-use poot_rocm_runtime::{Funcs, RocmContext, RocmError};
+use poot_rocm_runtime::{RocmContext, RocmError, ffi::Funcs};
 use std::cell::RefCell;
 use std::ffi::{CStr, c_void};
 

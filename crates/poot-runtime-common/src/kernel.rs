@@ -429,6 +429,7 @@ impl AieShapeAbi {
     }
 
     /// The core's ABI is interleaved `(ptr, u32 len)` pairs; these are the lengths, in binding order.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn core_lengths(&self) -> Vec<u64> {
         self.bindings.iter().map(AieBinding::elements).collect()
     }
@@ -642,6 +643,7 @@ impl<'a> Reader<'a> {
 /// One host buffer a dispatch binds to an AIE kernel: its full storage record, logical dimensions and
 /// whether the runtime may let the kernel write it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct AieBound<'a> {
     pub storage: BufferStorage,
     pub dims: &'a [u64],
@@ -651,6 +653,7 @@ pub struct AieBound<'a> {
 /// A dispatch's bound buffers did not meet an AIE kernel's shape ABI: the one error the AIE loader
 /// returns before XRT sees a buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum AieBindError {
     Count {
         expected: usize,
@@ -673,6 +676,7 @@ pub enum AieBindError {
     },
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Display for AieBindError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -704,11 +708,13 @@ impl std::fmt::Display for AieBindError {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl std::error::Error for AieBindError {}
 
 /// Check `bound` (binding order) against `artifact`'s shape ABI: count, exact storage (an F32 buffer is
 /// not an I32 one although both are 4-byte words), writability of every written binding, and the exact
 /// dimensions the kernel was specialized for.
+#[cfg(any(test, feature = "test-support"))]
 pub fn check_aie_bindings(
     artifact: &AieLinkedArtifact,
     bound: &[AieBound],

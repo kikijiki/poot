@@ -1,4 +1,10 @@
-use crate::*;
+use crate::kernel::spirv_words;
+use crate::owner::PipelineShape;
+use crate::{Binding, Context, Pipeline, RuntimeError};
+use ash::vk;
+use poot_runtime_common::CompiledKernel;
+use poot_target::ElementKind;
+use std::sync::Arc;
 
 impl Context {
     /// Validate one dispatch's bindings against the kernel's argument `schema` (card 608, SC-002) and
@@ -31,7 +37,7 @@ impl Context {
             }
         }
         // Fold first so the length block carries the X-thread extent for `thread_index` reconstruction.
-        crate::resolve_groups(threads, wg, self.max_workgroup_count)
+        crate::util::resolve_groups(threads, wg, self.max_workgroup_count)
     }
 
     /// Build the (module, descriptor-set-layout, pipeline-layout, pipeline) quartet for `kernel`: its

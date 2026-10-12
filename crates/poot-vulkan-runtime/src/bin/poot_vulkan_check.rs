@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use poot_codegen::{Target, compile, kernel_handle};
 use poot_kernel_ir::fixtures;
 use poot_runtime_common::BufferRole;
-use poot_vulkan_runtime::{BufferStorage, Context, DeviceBuffer};
+use poot_target::BufferStorage;
+use poot_vulkan_runtime::{Context, DeviceBuffer};
 
 /// Upload `data` as f32 through the storage-typed [`Context::alloc_storage`]/[`DeviceBuffer::write_with`]
 /// primitives (Card 547a: this crate has no `upload_f32`/`alloc_f32`/`read_f32` family, since it has no
@@ -87,12 +88,12 @@ fn run_add() -> i32 {
     }
     println!("PASS: raw-vulkan add matches the CPU oracle ({got:?})");
 
-    match poot_runtime::Context::new() {
+    match poot_wgpu_runtime::Context::new() {
         Ok(wgpu_ctx) => {
             let mut bufs = [
-                poot_runtime::KernelBuffer::read_only_f32(&a),
-                poot_runtime::KernelBuffer::read_only_f32(&b),
-                poot_runtime::KernelBuffer::write_f32(a.len()),
+                poot_wgpu_runtime::KernelBuffer::read_only_f32(&a),
+                poot_wgpu_runtime::KernelBuffer::read_only_f32(&b),
+                poot_wgpu_runtime::KernelBuffer::write_f32(a.len()),
             ];
             // Same `.spv` bytes, recompiled into a wgpu-side handle: the ABI is identical across the two
             // runtimes (module doc), so this is still a same-artifact cross-check.

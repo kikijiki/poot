@@ -1,14 +1,12 @@
-use crate::*;
+use crate::RocmError;
+use crate::context::DevicePoison;
+use crate::owner::ResourceOwner;
+use poot_runtime_common::{AllocGuard, BufferRole};
+use poot_target::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
+use std::ffi::c_void;
+use std::sync::Arc;
 
 use poot_runtime_common::CopyRange;
-pub use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
-
-/// Native element representation retained by a ROCm allocation (card 527: moved to `poot-target`, the
-/// shared type every runtime's buffer handle now uses, so ROCm and PTX no longer keep independent
-/// copies; `BufferElement` stays the name this crate's callers use). See [`poot_target::BufferStorage`]
-/// for the fuller element-kind + logical-dtype + layout contract [`RocmBuffer`] now carries.
-pub use poot_target::ElementKind as BufferElement;
-pub use poot_target::{BufferStorage, LogicalDType, StorageLayout};
 
 /// Which native pool a ROCm allocation lives in (Card 547a): `Weight`/`Activation`/`State` allocate
 /// from the coarse-grained device pool, `Input`/`Output`/`Meta`/`Staging` from the fine-grained system
@@ -57,7 +55,7 @@ pub struct RocmBuffer {
     pub(crate) byte_capacity: usize,
     /// The storage this handle currently records (card 527). Handle-level: a caller that legitimately
     /// changes what a reused buffer holds retags one handle via [`Self::with_storage`] without
-    /// affecting any other clone's view, exactly like `poot-runtime`'s `DeviceBuffer`.
+    /// affecting any other clone's view, exactly like `poot-wgpu-runtime`'s `DeviceBuffer`.
     pub(crate) storage: BufferStorage,
 }
 
@@ -78,7 +76,7 @@ impl RocmBuffer {
     }
 
     /// The native element representation (card 527: the physical word of [`Self::storage`]).
-    pub fn element(&self) -> BufferElement {
+    pub fn element(&self) -> ElementKind {
         self.storage.element()
     }
 
@@ -97,18 +95,6 @@ impl RocmBuffer {
     /// layout together, set at allocation from the plan's storage record.
     pub fn storage(&self) -> BufferStorage {
         self.storage
-    }
-
-    /// Replace this handle's recorded storage with `storage` (card 527; Card 547a: moved to
-    /// the handle, so it no longer panics on a shared buffer). The low-level `RocmContext::upload_*`
-    /// methods tag a buffer by which method was called, which is right for the common case but wrong
-    /// when one generic method (e.g. `upload_i32`) serves several distinct logical payloads (a
-    /// packed-BF16 const vs. plain i32 data): the caller, which knows the plan's real decision for this
-    /// value, retags the freshly uploaded handle before binding it. Retagging one clone never affects
-    /// another, since `storage` lives on the handle, not the shared physical allocation.
-    pub fn with_storage(mut self, storage: BufferStorage) -> Self {
-        self.storage = storage;
-        self
     }
 
     /// Which native pool this allocation lives in (Card 547a).
@@ -217,7 +203,7 @@ pub(crate) fn checked_copy<T>(
 
 /// Validate a byte range against `buf`'s capacity alone, with no storage/dtype check (Card 547a: the
 /// storage-typed primitive's own range check, deliberately dtype-agnostic - [`RocmContext::write_with`]/
-/// [`RocmContext::read_bytes`] serve any role's buffer, mirroring `poot_runtime::Context::write_with`'s
+/// [`RocmContext::read_bytes`] serve any role's buffer, mirroring `poot_wgpu_runtime::Context::write_with`'s
 /// lack of a storage check).
 pub(crate) fn checked_byte_range(
     op: &'static str,

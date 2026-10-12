@@ -30,7 +30,7 @@ use poot_graph_ir::ops::{attention_masked, attention_masked_softcap};
 use poot_graph_ir::{
     BinOp, Builder, Graph, OpKind, Operand, RedOp, Scalar, TensorType, UnOp, ValueId,
 };
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 use poot_tensor::HostTensor;
 
 /// Bind every graph input to a deterministic tensor of its declared shape.
@@ -111,59 +111,67 @@ struct AttentionSpelling {
 fn hand_attention_decode(spelling: AttentionSpelling) -> Graph {
     let (hq, cap, d) = (4usize, 8usize, 16usize);
     let scale = 1.0 / (d as f32).sqrt();
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-    let kt = b.transpose(k, vec![0, 1, 3, 2]);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
+    let kt = b.transpose(k, vec![0, 1, 3, 2]).unwrap();
     let scores = if spelling.scale_q_first {
-        let scaled_q = b.binary_scalar(BinOp::Mul, q, Scalar::F32(scale));
-        b.matmul(scaled_q, kt)
+        let scaled_q = b.binary_scalar(BinOp::Mul, q, Scalar::F32(scale)).unwrap();
+        b.matmul(scaled_q, kt).unwrap()
     } else {
-        let qk = b.matmul(q, kt);
-        b.binary_scalar(BinOp::Mul, qk, Scalar::F32(scale))
+        let qk = b.matmul(q, kt).unwrap();
+        b.binary_scalar(BinOp::Mul, qk, Scalar::F32(scale)).unwrap()
     };
     let scores = if spelling.mask_first {
-        b.binary(BinOp::Add, mask, scores)
+        b.binary(BinOp::Add, mask, scores).unwrap()
     } else {
-        b.binary(BinOp::Add, scores, mask)
+        b.binary(BinOp::Add, scores, mask).unwrap()
     };
-    let last = b.aval(scores).rank() - 1;
-    let m = b.reduce(RedOp::Max, scores, last, true);
-    let shifted = b.binary(BinOp::Sub, scores, m);
-    let e = b.unary(UnOp::Exp, shifted);
-    let denom = b.reduce(RedOp::Sum, e, last, true);
+    let last = b.aval(scores).unwrap().rank() - 1;
+    let m = b.reduce(RedOp::Max, scores, last, true).unwrap();
+    let shifted = b.binary(BinOp::Sub, scores, m).unwrap();
+    let e = b.unary(UnOp::Exp, shifted).unwrap();
+    let denom = b.reduce(RedOp::Sum, e, last, true).unwrap();
     let p = if spelling.recip_softmax {
-        let recip = b.unary(UnOp::Recip, denom);
-        b.binary(BinOp::Mul, e, recip)
+        let recip = b.unary(UnOp::Recip, denom).unwrap();
+        b.binary(BinOp::Mul, e, recip).unwrap()
     } else {
-        b.binary(BinOp::Div, e, denom)
+        b.binary(BinOp::Div, e, denom).unwrap()
     };
-    let out = b.matmul(p, v);
+    let out = b.matmul(p, v).unwrap();
     b.finish(out).unwrap()
 }
 
 /// A full-rotary rotate-half rope with free `x`/`cos`/`sin` shapes; `commute` writes `Mul(cos, x)`.
 fn hand_rope(x_shape: Vec<usize>, cos_shape: Vec<usize>, commute: bool) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(x_shape.clone()));
-    let cos = b.constant("cos", TensorType::f32(cos_shape.clone()));
-    let sin = b.constant("sin", TensorType::f32(cos_shape));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(x_shape.clone())).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(cos_shape.clone()))
+        .unwrap();
+    let sin = b.constant("sin", TensorType::f32(cos_shape)).unwrap();
     let last = x_shape.len() - 1;
     let d = x_shape[last];
     let half = d / 2;
-    let x1 = b.slice(x, last, 0, half);
-    let x2 = b.slice(x, last, half, d);
-    let neg_x2 = b.unary(UnOp::Neg, x2);
-    let rotate_half = b.concat(last, &[neg_x2, x1]);
+    let x1 = b.slice(x, last, 0, half).unwrap();
+    let x2 = b.slice(x, last, half, d).unwrap();
+    let neg_x2 = b.unary(UnOp::Neg, x2).unwrap();
+    let rotate_half = b.concat(last, &[neg_x2, x1]).unwrap();
     let xc = if commute {
-        b.binary(BinOp::Mul, cos, x)
+        b.binary(BinOp::Mul, cos, x).unwrap()
     } else {
-        b.binary(BinOp::Mul, x, cos)
+        b.binary(BinOp::Mul, x, cos).unwrap()
     };
-    let rs = b.binary(BinOp::Mul, rotate_half, sin);
-    let out = b.binary(BinOp::Add, xc, rs);
+    let rs = b.binary(BinOp::Mul, rotate_half, sin).unwrap();
+    let out = b.binary(BinOp::Add, xc, rs).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -173,15 +181,21 @@ fn hand_rope(x_shape: Vec<usize>, cos_shape: Vec<usize>, commute: bool) -> Graph
 #[test]
 fn card536a_attention_spellings_fuse_like_the_helper() {
     let (hq, cap, d) = (4usize, 8usize, 16usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-    let helper_out = attention_masked(&b, q, k, v, 1, 0.25, mask);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
+    let helper_out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
     let helper = b.finish(helper_out).unwrap();
 
-    let optimized_helper = optimize(&helper).unwrap();
+    let optimized_helper = passes_without_target(&helper).unwrap();
     assert_eq!(
         flash_count(&optimized_helper),
         1,
@@ -215,7 +229,7 @@ fn card536a_attention_spellings_fuse_like_the_helper() {
     ];
     for (name, spelling) in spellings {
         let graph = hand_attention_decode(spelling);
-        let optimized = optimize(&graph).unwrap();
+        let optimized = passes_without_target(&graph).unwrap();
         let expected_flash = usize::from(!spelling.recip_softmax);
         assert_eq!(
             flash_count(&optimized),
@@ -241,13 +255,13 @@ fn card536a_rope_commuted_spelling_fuses_like_the_helper() {
     let helper = hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], false);
     let commuted = hand_rope(vec![1, 4, 3, 8], vec![1, 1, 3, 8], true);
     for (name, graph) in [("helper", &helper), ("Mul(cos, x)", &commuted)] {
-        let optimized = optimize(graph).unwrap();
+        let optimized = passes_without_target(graph).unwrap();
         assert_eq!(rope_count(&optimized), 1, "{name}: one fused Rope expected");
         assert_same_bits(&eval_graph(graph), &eval_graph(&optimized));
     }
     assert_eq!(
-        dispatch_count(&optimize(&helper).unwrap()),
-        dispatch_count(&optimize(&commuted).unwrap()),
+        dispatch_count(&passes_without_target(&helper).unwrap()),
+        dispatch_count(&passes_without_target(&commuted).unwrap()),
         "commuted rope must reach the helper's dispatch count"
     );
 }
@@ -264,12 +278,18 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     // Axis: the row softmax reduces the wrong axis.
     let wrong_axis = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-        let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+            .unwrap();
+        let out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
         b.finish(out).unwrap()
     };
     // Axis 0 is the batch dim and is always 1 in these fixtures, so forcing the reduce there with
@@ -285,7 +305,7 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
             _ => None,
         })
         .collect();
-    let wrong_axis = poot_test_util::graph_fixtures::derive(&wrong_axis, |draft| {
+    let wrong_axis = poot_graph_ir::test_support::graph_fixtures::derive(&wrong_axis, |draft| {
         for eqn in draft.eqns_mut().iter_mut() {
             if let OpKind::Reduce { axis, .. } = &mut eqn.op {
                 *axis = 0;
@@ -301,44 +321,53 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     // Scale: a softcap chain whose two constants are not reciprocals.
     let wrong_softcap = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-        let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+            .unwrap();
+        let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0)).unwrap();
         b.finish(out).unwrap()
     };
     let mut rewrote = false;
-    let wrong_softcap = poot_test_util::graph_fixtures::derive(&wrong_softcap, |draft| {
-        for eqn in draft.eqns_mut().iter_mut() {
-            if let OpKind::Binary(BinOp::Mul) = eqn.op
-                && let Some(Operand::Lit(Scalar::F32(0.5))) = eqn.inputs.get(1)
-            {
-                eqn.inputs[1] = Operand::Lit(Scalar::F32(0.6));
-                rewrote = true;
+    let wrong_softcap =
+        poot_graph_ir::test_support::graph_fixtures::derive(&wrong_softcap, |draft| {
+            for eqn in draft.eqns_mut().iter_mut() {
+                if let OpKind::Binary(BinOp::Mul) = eqn.op
+                    && let Some(Operand::Lit(Scalar::F32(0.5))) = eqn.inputs.get(1)
+                {
+                    eqn.inputs[1] = Operand::Lit(Scalar::F32(0.6));
+                    rewrote = true;
+                }
             }
-        }
-    })
-    .unwrap();
+        })
+        .unwrap();
     assert!(rewrote, "the softcap reciprocal literal must be present");
     cases.push(("softcap constants not reciprocal", wrong_softcap));
 
     // Type gate: a shared single-head key the decomposition merely broadcasts; the fused op indexes one key
     // head per group.
     let broadcast_key = {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3]));
-        let k = b.constant("k", TensorType::f32(vec![1, 1, 5, 3]));
-        let v = b.constant("v", TensorType::f32(vec![1, 1, 5, 2]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, 5]));
-        let out = attention_masked(&b, q, k, v, 1, 1.0, mask);
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3])).unwrap();
+        let k = b.constant("k", TensorType::f32(vec![1, 1, 5, 3])).unwrap();
+        let v = b.constant("v", TensorType::f32(vec![1, 1, 5, 2])).unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, 5]))
+            .unwrap();
+        let out = attention_masked(&b, q, k, v, 1, 1.0, mask).unwrap();
         b.finish(out).unwrap()
     };
     cases.push(("a size-1 key head broadcast by the matmul", broadcast_key));
 
     for (name, graph) in cases {
-        let optimized = optimize(&graph).unwrap();
+        let optimized = passes_without_target(&graph).unwrap();
         assert_eq!(flash_count(&optimized), 0, "{name}: must stay unfused");
         assert_same_bits(&eval_graph(&graph), &eval_graph(&optimized));
     }
@@ -350,30 +379,32 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
 #[test]
 fn card536a_flash_head_dim_is_aware() {
     let build = |m: usize, d: usize| {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, 2, m, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, 2, 5, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, 2, 5, d]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, m, 5]));
-        let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, 2, m, d])).unwrap();
+        let k = b.constant("k", TensorType::f32(vec![1, 2, 5, d])).unwrap();
+        let v = b.constant("v", TensorType::f32(vec![1, 2, 5, d])).unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, m, 5]))
+            .unwrap();
+        let out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
         b.finish(out).unwrap()
     };
 
     let narrow = build(1, 256);
     assert_eq!(
-        flash_count(&optimize(&narrow).unwrap()),
+        flash_count(&passes_without_target(&narrow).unwrap()),
         1,
         "D=256 decode must fuse"
     );
 
     let wide = build(1, 512);
-    let optimized = optimize(&wide).unwrap();
+    let optimized = passes_without_target(&wide).unwrap();
     assert_eq!(flash_count(&optimized), 1, "D=512 decode must fuse");
     assert_same_bits(&eval_graph(&wide), &eval_graph(&optimized));
 
     let prefill_wide = build(5, 512);
     assert_eq!(
-        flash_count(&optimize(&prefill_wide).unwrap()),
+        flash_count(&passes_without_target(&prefill_wide).unwrap()),
         1,
         "D=512 prefill must fuse"
     );
@@ -385,13 +416,13 @@ fn card536a_flash_head_dim_is_aware() {
 /// evaluates raw and optimized identically.
 #[test]
 fn card536a_contraction_is_covered_by_the_in_crate_oracle() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 16, 32]));
-    let w = b.constant("w", TensorType::f32(vec![32, 16]));
-    let raw_out = b.matmul(x, w);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 16, 32])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![32, 16])).unwrap();
+    let raw_out = b.matmul(x, w).unwrap();
     let raw = b.finish(raw_out).unwrap();
 
-    let optimized = optimize(&raw).unwrap();
+    let optimized = passes_without_target(&raw).unwrap();
     assert!(
         optimized
             .eqns()
@@ -444,16 +475,24 @@ fn flash_decode_batched_matches_attention_masked() {
             .collect();
 
         let build = |flash: bool| -> HostTensor {
-            let b = Builder::new();
-            let q = b.constant("q", TensorType::f32(vec![bsz, hq, 1, d]));
-            let k = b.constant("k", TensorType::f32(vec![bsz, hkv, cap, d]));
-            let v = b.constant("v", TensorType::f32(vec![bsz, hkv, cap, d]));
-            let mask = b.constant("m", TensorType::f32(vec![bsz, 1, 1, cap]));
-            let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
+            let b = Builder::for_tests();
+            let q = b
+                .constant("q", TensorType::f32(vec![bsz, hq, 1, d]))
+                .unwrap();
+            let k = b
+                .constant("k", TensorType::f32(vec![bsz, hkv, cap, d]))
+                .unwrap();
+            let v = b
+                .constant("v", TensorType::f32(vec![bsz, hkv, cap, d]))
+                .unwrap();
+            let mask = b
+                .constant("m", TensorType::f32(vec![bsz, 1, 1, cap]))
+                .unwrap();
+            let out = attention_masked(&b, q, k, v, n_rep, scale, mask).unwrap();
             let materialized = b.finish(out).unwrap();
             // Card 557: tracers cannot build the flash op; the matcher forms it from the chain.
             let g = if flash {
-                let fused = optimize(&materialized).unwrap();
+                let fused = passes_without_target(&materialized).unwrap();
                 assert_eq!(flash_count(&fused), 1, "the batched decode chain must fuse");
                 fused
             } else {

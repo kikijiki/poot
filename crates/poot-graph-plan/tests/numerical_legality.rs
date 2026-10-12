@@ -7,8 +7,7 @@ use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::{
     BinOp, Builder, Graph, OpKind, Scalar, StateRole, TensorType, UnOp, ValueId, ValueTable,
 };
-use poot_graph_plan::canonicalize;
-use poot_graph_plan::{CompileOptions, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Target, canonicalize, compile, production_plan::Submission};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::HostTensor;
 
@@ -93,11 +92,13 @@ fn assert_observables(graph: &Graph, transformed: &Graph, inputs: &HashMap<Value
 }
 
 fn with_states(b: Builder, output: poot_graph_ir::Traced) -> Graph {
-    let ty = b.aval(output);
-    let first = b.state_input("first", ty.clone(), StateRole::Recurrent);
-    let second = b.state_input("second", ty, StateRole::Recurrent);
-    let next_first = b.binary(BinOp::Add, output, first);
-    let next_second = b.binary(BinOp::Sub, second, output);
+    let ty = b.aval(output).unwrap();
+    let first = b
+        .state_input("first", ty.clone(), StateRole::Recurrent)
+        .unwrap();
+    let second = b.state_input("second", ty, StateRole::Recurrent).unwrap();
+    let next_first = b.binary(BinOp::Add, output, first).unwrap();
+    let next_second = b.binary(BinOp::Sub, second, output).unwrap();
     b.finish(
         poot_graph_ir::Outputs::new(output)
             .with_state(&[(first, next_first), (second, next_second)]),
@@ -119,11 +120,13 @@ fn bind_states(graph: &Graph, inputs: &mut HashMap<ValueId, HostTensor>) {
 #[test]
 fn finite_scaled_contraction_survives_compile() {
     // The preserved review reproduction, unchanged in size and arithmetic.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([1, 1]));
-    let w = b.constant("w", TensorType::f32([1, 1]));
-    let scaled = b.binary_scalar(BinOp::Mul, x, Scalar::F32(1.0e-30));
-    let output = b.matmul(scaled, w);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([1, 1])).unwrap();
+    let w = b.constant("w", TensorType::f32([1, 1])).unwrap();
+    let scaled = b
+        .binary_scalar(BinOp::Mul, x, Scalar::F32(1.0e-30))
+        .unwrap();
+    let output = b.matmul(scaled, w).unwrap();
     let graph = with_states(b, output);
     let mut inputs = HashMap::from([
         (x.id(), HostTensor::f32(vec![1, 1], vec![1.0e30])),
@@ -195,18 +198,20 @@ fn scalar_contraction_corner_corpus_is_bitwise() {
     ];
     for (name, x_data, w_data, scale) in cases {
         for scale_rhs in [false, true] {
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32([2, 2]));
-            let w = b.constant("w", TensorType::f32([2, 2]));
-            let scaled = b.binary_scalar(
-                BinOp::Mul,
-                if scale_rhs { w } else { x },
-                Scalar::F32(scale),
-            );
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32([2, 2])).unwrap();
+            let w = b.constant("w", TensorType::f32([2, 2])).unwrap();
+            let scaled = b
+                .binary_scalar(
+                    BinOp::Mul,
+                    if scale_rhs { w } else { x },
+                    Scalar::F32(scale),
+                )
+                .unwrap();
             let result = if scale_rhs {
-                b.matmul(x, scaled)
+                b.matmul(x, scaled).unwrap()
             } else {
-                b.matmul(scaled, w)
+                b.matmul(scaled, w).unwrap()
             };
             let graph = with_states(b, result);
             let mut inputs = HashMap::from([
@@ -227,11 +232,11 @@ fn scalar_contraction_corner_corpus_is_bitwise() {
 
 #[test]
 fn reciprocal_rounding_is_not_division() {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::f32([4]));
-    let d = b.constant("d", TensorType::f32([4]));
-    let reciprocal = b.unary(UnOp::Recip, d);
-    let output = b.binary(BinOp::Mul, a, reciprocal);
+    let b = Builder::for_tests();
+    let a = b.constant("a", TensorType::f32([4])).unwrap();
+    let d = b.constant("d", TensorType::f32([4])).unwrap();
+    let reciprocal = b.unary(UnOp::Recip, d).unwrap();
+    let output = b.binary(BinOp::Mul, a, reciprocal).unwrap();
     let graph = with_states(b, output);
     let mut inputs = HashMap::from([
         (a.id(), HostTensor::f32(vec![4], vec![3.0, -3.0, 0.0, -0.0])),
@@ -266,21 +271,21 @@ fn reciprocal_rounding_is_not_division() {
 #[test]
 fn narrow_contraction_rounds_before_fused_epilogue() {
     for (dtype, half_ulp) in [(DType::BF16, 1.0 / 256.0), (DType::F16, 1.0 / 2048.0)] {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32([2, 2]));
-        let w = b.constant("w", TensorType::f32([2, 2]));
-        let nx = b.cast(x, dtype);
-        let nw = b.cast(w, dtype);
-        let product = b.matmul(nx, nw);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32([2, 2])).unwrap();
+        let w = b.constant("w", TensorType::f32([2, 2])).unwrap();
+        let nx = b.cast(x, dtype).unwrap();
+        let nw = b.cast(w, dtype).unwrap();
+        let product = b.matmul(nx, nw).unwrap();
         assert_eq!(
-            b.aval(product).dtype,
+            b.aval(product).unwrap().dtype,
             dtype,
             "a real narrow contraction result"
         );
-        let wide = b.cast(product, DType::F32);
-        let bias = b.constant("bias", TensorType::f32([2]));
-        let sum = b.binary(BinOp::Add, wide, bias);
-        let output = b.binary_scalar(BinOp::Mul, sum, Scalar::F32(1.0));
+        let wide = b.cast(product, DType::F32).unwrap();
+        let bias = b.constant("bias", TensorType::f32([2])).unwrap();
+        let sum = b.binary(BinOp::Add, wide, bias).unwrap();
+        let output = b.binary_scalar(BinOp::Mul, sum, Scalar::F32(1.0)).unwrap();
         let graph = with_states(b, output);
         let mut inputs = HashMap::from([
             (
@@ -345,14 +350,16 @@ fn narrow_contraction_rounds_before_fused_epilogue() {
 #[test]
 fn explicit_narrow_casts_remain_between_contraction_and_epilogue() {
     for (dtype, half_ulp) in [(DType::BF16, 1.0 / 256.0), (DType::F16, 1.0 / 2048.0)] {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32([1, 2]));
-        let w = b.constant("w", TensorType::f32([2, 2]));
-        let product = b.matmul(x, w);
-        let narrow = b.cast(product, dtype);
-        let wide = b.cast(narrow, DType::F32);
-        let sum = b.binary_scalar(BinOp::Add, wide, Scalar::F32(-1.0));
-        let output = b.binary_scalar(BinOp::Mul, sum, Scalar::F32(1.0));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32([1, 2])).unwrap();
+        let w = b.constant("w", TensorType::f32([2, 2])).unwrap();
+        let product = b.matmul(x, w).unwrap();
+        let narrow = b.cast(product, dtype).unwrap();
+        let wide = b.cast(narrow, DType::F32).unwrap();
+        let sum = b
+            .binary_scalar(BinOp::Add, wide, Scalar::F32(-1.0))
+            .unwrap();
+        let output = b.binary_scalar(BinOp::Mul, sum, Scalar::F32(1.0)).unwrap();
         let graph = with_states(b, output);
         let mut inputs = HashMap::from([
             (x.id(), HostTensor::f32(vec![1, 2], vec![1.0, 1.0])),
@@ -392,11 +399,11 @@ fn explicit_narrow_casts_remain_between_contraction_and_epilogue() {
 #[test]
 fn nonfinite_inputs_keep_ieee_classification() {
     // This asserts defined IEEE classifications, not NaN equality or a device tolerance success.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([1, 2]));
-    let w = b.constant("w", TensorType::f32([2, 2]));
-    let scaled = b.binary_scalar(BinOp::Mul, x, Scalar::F32(0.5));
-    let output = b.matmul(scaled, w);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([1, 2])).unwrap();
+    let w = b.constant("w", TensorType::f32([2, 2])).unwrap();
+    let scaled = b.binary_scalar(BinOp::Mul, x, Scalar::F32(0.5)).unwrap();
+    let output = b.matmul(scaled, w).unwrap();
     let graph = b.finish(output).unwrap();
     let program = compile(&graph, &target(Backend::SpirvVulkan), &OPTIONS).unwrap();
     for data in [vec![f32::INFINITY, 1.0], vec![f32::NAN, 1.0]] {
@@ -445,39 +452,39 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
         ("prescaled query", true, false, false),
         ("reciprocal near-miss", false, true, false),
     ] {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32([1, 2, 1, 4]));
-        let k = b.constant("k", TensorType::f32([1, 2, 3, 4]));
-        let v = b.constant("v", TensorType::f32([1, 2, 3, 4]));
-        let mask = b.constant("mask", TensorType::f32([1, 1, 1, 3]));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32([1, 2, 1, 4])).unwrap();
+        let k = b.constant("k", TensorType::f32([1, 2, 3, 4])).unwrap();
+        let v = b.constant("v", TensorType::f32([1, 2, 3, 4])).unwrap();
+        let mask = b.constant("mask", TensorType::f32([1, 1, 1, 3])).unwrap();
         let query = if prescale {
-            b.binary_scalar(BinOp::Mul, q, Scalar::F32(1e-30))
+            b.binary_scalar(BinOp::Mul, q, Scalar::F32(1e-30)).unwrap()
         } else {
             q
         };
-        let kt = b.transpose(k, vec![0, 1, 3, 2]);
-        let qk = b.matmul(query, kt);
+        let kt = b.transpose(k, vec![0, 1, 3, 2]).unwrap();
+        let qk = b.matmul(query, kt).unwrap();
         let scaled = if prescale {
             qk
         } else {
-            b.binary_scalar(BinOp::Mul, qk, Scalar::F32(0.5))
+            b.binary_scalar(BinOp::Mul, qk, Scalar::F32(0.5)).unwrap()
         };
         let scores = if commute {
-            b.binary(BinOp::Add, mask, scaled)
+            b.binary(BinOp::Add, mask, scaled).unwrap()
         } else {
-            b.binary(BinOp::Add, scaled, mask)
+            b.binary(BinOp::Add, scaled, mask).unwrap()
         };
-        let max = b.reduce(RedOp::Max, scores, 3, true);
-        let shifted = b.binary(BinOp::Sub, scores, max);
-        let exp = b.unary(UnOp::Exp, shifted);
-        let denom = b.reduce(RedOp::Sum, exp, 3, true);
+        let max = b.reduce(RedOp::Max, scores, 3, true).unwrap();
+        let shifted = b.binary(BinOp::Sub, scores, max).unwrap();
+        let exp = b.unary(UnOp::Exp, shifted).unwrap();
+        let denom = b.reduce(RedOp::Sum, exp, 3, true).unwrap();
         let p = if reciprocal {
-            let recip = b.unary(UnOp::Recip, denom);
-            b.binary(BinOp::Mul, exp, recip)
+            let recip = b.unary(UnOp::Recip, denom).unwrap();
+            b.binary(BinOp::Mul, exp, recip).unwrap()
         } else {
-            b.binary(BinOp::Div, exp, denom)
+            b.binary(BinOp::Div, exp, denom).unwrap()
         };
-        let output = b.matmul(p, v);
+        let output = b.matmul(p, v).unwrap();
         let graph = with_states(b, output);
         let mut inputs = HashMap::from([
             (
@@ -547,7 +554,7 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
             );
         }
         // Card 546b: `Program::reassociation_class` narrowed to `pub(crate)` (its one other
-        // cross-crate reader was deleted with poot-gpu's cached-decode test suite); the general
+        // cross-crate reader was deleted with poot-wgpu-device's cached-decode test suite); the general
         // "a reassociating pass publishes `Tier2Class::Reassociating`" mechanism this `else` branch
         // checked stays covered in-crate by
         // `compile::tests::compile_publishes_the_class_of_the_passes_that_changed_the_graph`.
@@ -563,12 +570,12 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
 #[test]
 fn softcap_requires_the_exact_reciprocal_literal() {
     use poot_graph_ir::{Operand, ops::attention_masked_softcap};
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32([1, 2, 3, 4]));
-    let k = b.constant("k", TensorType::f32([1, 2, 3, 4]));
-    let v = b.constant("v", TensorType::f32([1, 2, 3, 4]));
-    let mask = b.constant("mask", TensorType::f32([1, 1, 3, 3]));
-    let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0));
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32([1, 2, 3, 4])).unwrap();
+    let k = b.constant("k", TensorType::f32([1, 2, 3, 4])).unwrap();
+    let v = b.constant("v", TensorType::f32([1, 2, 3, 4])).unwrap();
+    let mask = b.constant("mask", TensorType::f32([1, 1, 3, 3])).unwrap();
+    let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0)).unwrap();
     let original = with_states(b, out);
     let mut inputs = HashMap::from([
         (
@@ -600,20 +607,22 @@ fn softcap_requires_the_exact_reciprocal_literal() {
             original.clone()
         } else {
             let mut changed = 0;
-            let perturbed = poot_test_util::graph_fixtures::derive(&original, |draft| {
-                for eqn in draft.eqns_mut().iter_mut() {
-                    if matches!(eqn.op, OpKind::Binary(BinOp::Mul)) {
-                        for operand in &mut eqn.inputs {
-                            if matches!(operand, Operand::Lit(Scalar::F32(0.5))) {
-                                *operand =
-                                    Operand::Lit(Scalar::F32(f32::from_bits(0.5f32.to_bits() + 1)));
-                                changed += 1;
+            let perturbed =
+                poot_graph_ir::test_support::graph_fixtures::derive(&original, |draft| {
+                    for eqn in draft.eqns_mut().iter_mut() {
+                        if matches!(eqn.op, OpKind::Binary(BinOp::Mul)) {
+                            for operand in &mut eqn.inputs {
+                                if matches!(operand, Operand::Lit(Scalar::F32(0.5))) {
+                                    *operand = Operand::Lit(Scalar::F32(f32::from_bits(
+                                        0.5f32.to_bits() + 1,
+                                    )));
+                                    changed += 1;
+                                }
                             }
                         }
                     }
-                }
-            })
-            .unwrap();
+                })
+                .unwrap();
             assert_eq!(changed, 1, "exactly the reciprocal is perturbed by one ULP");
             perturbed
         };
@@ -634,18 +643,20 @@ fn softcap_requires_the_exact_reciprocal_literal() {
 }
 
 fn underflow_before_contraction(scale_rhs: bool) {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([2, 2]));
-    let w = b.constant("w", TensorType::f32([2, 2]));
-    let scaled = b.binary_scalar(
-        BinOp::Mul,
-        if scale_rhs { w } else { x },
-        Scalar::F32(1e-20),
-    );
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([2, 2])).unwrap();
+    let w = b.constant("w", TensorType::f32([2, 2])).unwrap();
+    let scaled = b
+        .binary_scalar(
+            BinOp::Mul,
+            if scale_rhs { w } else { x },
+            Scalar::F32(1e-20),
+        )
+        .unwrap();
     let output = if scale_rhs {
-        b.matmul(x, scaled)
+        b.matmul(x, scaled).unwrap()
     } else {
-        b.matmul(scaled, w)
+        b.matmul(scaled, w).unwrap()
     };
     let graph = with_states(b, output);
     let (x_data, w_data) = if scale_rhs {
@@ -711,12 +722,14 @@ fn rhs_underflow_is_not_factored_out_of_contraction() {
 
 #[test]
 fn reciprocal_identity_reports_no_numerical_decline() {
-    let b = Builder::new();
-    let denominator = b.constant("denominator", TensorType::f32([2, 2]));
-    let weight = b.constant("weight", TensorType::f32([2, 2]));
-    let reciprocal = b.unary(UnOp::Recip, denominator);
-    let identity = b.binary_scalar(BinOp::Mul, reciprocal, Scalar::F32(1.0));
-    let output = b.matmul(identity, weight);
+    let b = Builder::for_tests();
+    let denominator = b.constant("denominator", TensorType::f32([2, 2])).unwrap();
+    let weight = b.constant("weight", TensorType::f32([2, 2])).unwrap();
+    let reciprocal = b.unary(UnOp::Recip, denominator).unwrap();
+    let identity = b
+        .binary_scalar(BinOp::Mul, reciprocal, Scalar::F32(1.0))
+        .unwrap();
+    let output = b.matmul(identity, weight).unwrap();
     let graph = with_states(b, output);
     let mut inputs = HashMap::from([
         (

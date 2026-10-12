@@ -6,7 +6,13 @@
 //! element by element, an E4M3FN payload moves as packed byte lanes with its rows padded to a word. The
 //! generator copies bits either way, so no storage is decoded or re-encoded on the way.
 
-use super::*;
+use super::{
+    BodyLimits, Capability, ContractionHead, DType, Eqn, HashMap, KernelRequest, OpKind, Operand,
+    PlanError, Planned, Scalar, ValueId, fty_ty, numel, value_ids,
+};
+use crate::planner::{GraphTables, Layout};
+use crate::predicates::{is_elementwise_2d_in, scatter_update_plan};
+use crate::refusal::Site;
 use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
 use poot_target::{Backend, DeviceCaps};
 
@@ -110,7 +116,7 @@ pub(super) fn plan(
             )?;
             // card 059: base[POOL,..rest], src[N,..rest], inv[POOL] -> base. card 159 Inc3: a large pool
             // chunks by output-unit range (see `scatter_update_plan`) so a wide shared-pool KV write
-            // (gemma4-dense batched prefill) does not trip `poot-gpu`'s display-watchdog `flush_work` cap
+            // (gemma4-dense batched prefill) does not trip `poot-wgpu-device`'s display-watchdog `flush_work` cap
             // on its own.
             scatter_update_plan(site, backend, &storage, out_shape, src_shape, caps)?
         }

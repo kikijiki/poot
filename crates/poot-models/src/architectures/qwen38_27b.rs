@@ -24,15 +24,14 @@ use std::num::NonZeroUsize;
 
 use std::sync::Arc;
 
-use poot_graph_ir::op::{PackedWeight, ScaleEncoding, WeightFormat};
 use poot_graph_ir::{Builder, Graph};
+use poot_quant::format::{ScaleEncoding, WeightFormat};
 use poot_quant::weights::{
     AttnRole, FfnRole, GdnRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap,
     WeightMapError, WeightRole, WeightStore, WeightView,
 };
-use poot_quant::{OperandRole, PackedPayload, SourceRole};
+use poot_quant::{OperandRole, PackedPayload, PackedWeight, SourceRole};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -48,8 +47,9 @@ use crate::model::{
     TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, FixtureVariant, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("qwen35");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen35");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -85,7 +85,7 @@ const INTERVAL: Field = Field::hf("full_attention_interval");
 
 /// One layer's mixer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerKind {
+pub(crate) enum LayerKind {
     /// Gated DeltaNet linear attention.
     LinearAttention,
     /// Gated full attention.
@@ -114,7 +114,7 @@ const TEXT_NAMES: Names = Names {
 
 /// Qwen3.5's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Qwen35Params {
+pub(crate) struct Qwen35Params {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -218,7 +218,7 @@ fn layer_kinds(
 }
 
 impl Qwen35Params {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let RawConfig::HfJson { config, generation } = raw else {
             return Err(ModelError::Config {
                 family: FAMILY,
@@ -402,7 +402,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Qwen35 {
+pub(crate) struct Qwen35 {
     params: Qwen35Params,
     weights: WeightMap,
     stack: StackWeights,
@@ -466,11 +466,10 @@ impl Model for Qwen35 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(
             &b,
             &step,
@@ -491,7 +490,7 @@ impl Model for Qwen35 {
                     |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
                 )
             },
-        );
+        )?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -551,7 +550,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 /// The tensors of a Qwen3.5 text tower of `text`'s dims under `root` (`model.language_model` or
 /// `model`), by HF name, and its `lm_head.weight`.
 pub(crate) fn hf_shapes(text: &serde_json::Value, root: &str) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| text[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(text, f);
     let (vocab, w, inter) = (n("vocab_size"), n("hidden_size"), n("intermediate_size"));
     let (heads, kv, hd) = (
         n("num_attention_heads"),
@@ -804,7 +803,7 @@ mod tests {
 
     impl Dims {
         fn of(text: &serde_json::Value) -> Self {
-            let n = |f: &str| text[f].as_u64().unwrap() as usize;
+            let n = |f: &str| crate::registry::Fixture::count(text, f);
             let rope = &text["rope_parameters"];
             let head_dim = n("head_dim");
             Self {
@@ -1315,7 +1314,11 @@ mod tests {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
         let g = model
-            .trace(Phase::Decode, step_shape(1, CAP, LogitRows::Last))
+            .trace(
+                Phase::Decode,
+                step_shape(1, CAP, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let names: Vec<String> = g
             .state()
@@ -1584,11 +1587,19 @@ mod tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }

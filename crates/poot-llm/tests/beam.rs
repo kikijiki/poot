@@ -17,18 +17,16 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_executor::{BufferRole, Device, Dispatch, Engine};
+use poot_eval::test_support::weight_map_oracle::eval_mapped;
+use poot_executor::{Device, Dispatch, Engine};
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType, UnOp};
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target};
-use poot_llm::GenerationControl;
-use poot_llm::Sampler;
+use poot_graph_plan::{CompileLimits, CompileOptions, Target, production_plan::Submission};
 use poot_llm::driver::{
-    BackendChoice, Beam, BeamRequest, Driver, DriverOptions, FinishReason, GenerateRequest, Head,
-    Layout, LoadOptions, ModelHandle, PoolShape, PreparedSetLimits, ServingShapes, Warm,
-    open_executor, program_retention,
+    BackendChoice, Beam, BeamError, BeamRequest, DraftPolicy, Driver, DriverOptions, FinishReason,
+    GenerateRequest, Head, Layout, LoadOptions, ModelHandle, PoolShape, PreparedSetLimits,
+    ServingShapes, Warm, open_executor, program_retention,
 };
-use poot_llm::driver::{BeamError, DraftPolicy};
-use poot_models::chat::ChatFormat;
+use poot_llm::{GenerationControl, Sampler};
 use poot_models::components::standard::{Step, check_step};
 use poot_models::model::{
     FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
@@ -36,10 +34,10 @@ use poot_models::model::{
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
-use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
-use poot_test_util::weight_map_oracle::eval_mapped;
+use poot_text::ChatFormat;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -89,7 +87,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
     tokenizer().save(dir.join("tokenizer.json"), false).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
 }
 
 /// The fixture with its output head scaled by `factor`: the same family, token for token ranked as the
@@ -204,58 +202,62 @@ impl Model for Recurrentish {
     /// `-0.5 * (v - 47 * m)^2` with `m = (1 + tanh(1.2 * state . [-1, 1, -1, 1] - 1.8)) / 2`, a peak
     /// at the vocabulary position the state selects: it climbs toward the end-of-sequence token as
     /// tokens accumulate.
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         check_step(RECURRENT, phase, shape, self.config.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let tokens = b.cast(
             b.guard_index_bounds(step.tokens(), VOCAB)
                 .expect("the step's ids are a rank-2 I32 tensor")
                 .guarded,
             DType::F32,
-        );
+        )?;
         let state_dims = vec![rows, 4];
         let state = b.state_input(
             "toy.state",
             TensorType::f32(state_dims.clone()),
             StateRole::Recurrent,
-        );
+        )?;
         let coefficient = b.binary_scalar(
             BinOp::Mul,
-            b.binary_scalar(BinOp::Add, b.iota(4), Builder::f32(1.0)),
+            b.binary_scalar(BinOp::Add, b.iota(4)?, Builder::f32(1.0))?,
             Builder::f32(0.25),
-        );
-        let coefficient = b.broadcast(coefficient, state_dims.clone());
+        )?;
+        let coefficient = b.broadcast(coefficient, state_dims.clone())?;
         let readout = {
-            let one = b.binary_scalar(BinOp::Add, b.iota(1), Builder::f32(1.0));
-            let minus = b.binary_scalar(BinOp::Sub, b.iota(1), Builder::f32(1.0));
-            b.broadcast(b.concat(0, &[minus, one, minus, one]), state_dims.clone())
+            let one = b.binary_scalar(BinOp::Add, b.iota(1)?, Builder::f32(1.0))?;
+            let minus = b.binary_scalar(BinOp::Sub, b.iota(1)?, Builder::f32(1.0))?;
+            b.broadcast(b.concat(0, &[minus, one, minus, one])?, state_dims.clone())?
         };
-        let vocab_axis = b.broadcast(b.iota(VOCAB), vec![rows, VOCAB]);
+        let vocab_axis = b.broadcast(b.iota(VOCAB)?, vec![rows, VOCAB])?;
         let mut state_now = state;
         let mut logits = Vec::new();
         for j in 0..n {
-            let token = b.broadcast(b.slice(tokens, 1, j, j + 1), state_dims.clone());
+            let token = b.broadcast(b.slice(tokens, 1, j, j + 1)?, state_dims.clone())?;
             let drive = b.binary(
                 BinOp::Mul,
                 b.binary_scalar(
                     BinOp::Mul,
-                    b.binary_scalar(BinOp::Add, token, Builder::f32(1.0)),
+                    b.binary_scalar(BinOp::Add, token, Builder::f32(1.0))?,
                     Builder::f32(1.0 / 48.0),
-                ),
+                )?,
                 coefficient,
-            );
-            state_now = b.binary(BinOp::Add, state_now, drive);
+            )?;
+            state_now = b.binary(BinOp::Add, state_now, drive)?;
             if shape.logits == LogitRows::Last && j + 1 < n {
                 continue;
             }
             let read = b.reduce(
                 poot_graph_ir::op::RedOp::Sum,
-                b.binary(BinOp::Mul, state_now, readout),
+                b.binary(BinOp::Mul, state_now, readout)?,
                 1,
                 true,
-            );
+            )?;
             let m = b.binary_scalar(
                 BinOp::Mul,
                 b.binary_scalar(
@@ -264,33 +266,33 @@ impl Model for Recurrentish {
                         UnOp::Tanh,
                         b.binary_scalar(
                             BinOp::Add,
-                            b.binary_scalar(BinOp::Mul, read, Builder::f32(1.2)),
+                            b.binary_scalar(BinOp::Mul, read, Builder::f32(1.2))?,
                             Builder::f32(-1.8),
-                        ),
-                    ),
+                        )?,
+                    )?,
                     Builder::f32(1.0),
-                ),
+                )?,
                 Builder::f32(0.5),
-            );
+            )?;
             let peak = b.broadcast(
-                b.binary_scalar(BinOp::Mul, m, Builder::f32(47.0)),
+                b.binary_scalar(BinOp::Mul, m, Builder::f32(47.0))?,
                 vec![rows, VOCAB],
-            );
-            let distance = b.binary(BinOp::Sub, vocab_axis, peak);
+            )?;
+            let distance = b.binary(BinOp::Sub, vocab_axis, peak)?;
             let row = b.binary_scalar(
                 BinOp::Mul,
-                b.binary(BinOp::Mul, distance, distance),
+                b.binary(BinOp::Mul, distance, distance)?,
                 Builder::f32(-0.5),
-            );
-            logits.push(b.reshape(row, vec![rows, 1, VOCAB]));
+            )?;
+            logits.push(b.reshape(row, vec![rows, 1, VOCAB])?);
         }
         step.carry(state, state_now);
         let out = if logits.len() == 1 {
             logits[0]
         } else {
-            b.concat(1, &logits)
+            b.concat(1, &logits)?
         };
-        Ok(step.finish(b, out).unwrap())
+        Ok(step.finish(b, out)?)
     }
 }
 
@@ -327,7 +329,14 @@ impl Oracle {
             logits: LogitRows::Last,
             hidden: None,
         };
-        let graph = self.model.trace(Phase::Prefill, shape).unwrap();
+        let graph = self
+            .model
+            .trace(
+                Phase::Prefill,
+                shape,
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         let state: Vec<HostTensor> = graph
             .state()
             .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
@@ -514,7 +523,7 @@ fn options() -> DriverOptions {
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(8),
-        max_trace_tokens: nz(64),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(64)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
@@ -581,7 +590,7 @@ fn device(
     choice: BackendChoice,
     backend: DeviceBackend,
 ) -> Option<Box<dyn poot_executor::Executor>> {
-    poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
 }
 
 fn nothing(_: u32, _: &str) -> GenerationControl {

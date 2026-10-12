@@ -21,14 +21,13 @@ pub use coordinator::{
     ScheduleError, SupportActual, SupportPlan,
 };
 pub use device::{
-    AieInvocation, Arg, BufferRole, Collectives, Device, DeviceTime, Dispatch, DispatchDeviceTime,
-    LaunchKind, MeasuredDeviceTime, MemoryCounterSnapshot, NativeCounters, SupportBound,
-    WeightUpload, write_slice,
+    AieInvocation, Arg, Collectives, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind,
+    MeasuredDeviceTime, NativeCounters, SupportBound, WeightUpload, write_slice,
 };
 pub use engine::Engine;
 pub use error::{BindError, DeviceError, ExecError, LoadError};
-use poot_tensor::HostTensor;
-pub use poot_tensor::HostView;
+use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
+use poot_tensor::{HostTensor, HostView};
 pub use shared_kernels::{SharedKernels, SharedKernelsMismatch};
 pub use timing::{DetailedTiming, DrainPolicy, TimingOptions};
 
@@ -36,7 +35,10 @@ pub use timing::{DetailedTiming, DrainPolicy, TimingOptions};
 mod tests;
 
 use poot_graph_ir::{BoundaryId, SlotKey};
-use poot_graph_plan::{DeviceId, StageId, StagedProgram, SyncPoint, TargetSet};
+use poot_graph_plan::{
+    multi_device::topology::DeviceId, staged::StageId, staged::StagedProgram, staged::SyncPoint,
+    staged::TargetSet,
+};
 use poot_quant::weights::{WeightMap, WeightStore};
 use std::sync::Arc;
 

@@ -20,7 +20,7 @@ use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_quant::{PackedPayload, PackedWeight, SourceRole};
 use poot_tensor::HostTensor;
 
-use poot_test_util::StepFixture;
+use poot_eval::test_support::StepFixture;
 
 use crate::{Fixture, fill};
 
@@ -221,8 +221,10 @@ pub fn packed_linear_fixtures() -> Vec<Fixture> {
     for (index, scheme) in SCHEMES.iter().enumerate() {
         let payload = real_magnitude_payload(scheme, 11 + index as u64);
         for (name, m) in [(scheme.linear_m1, 1), (scheme.linear_m4, 4)] {
-            let b = Builder::new();
-            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]));
+            let b = Builder::for_tests();
+            let x = b
+                .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]))
+                .unwrap();
             let y = ops::packed_linear(&b, x, "layer", payload.weight(), None, None).unwrap();
             let graph = b.finish(y).unwrap();
             let key = graph.meta(x.id()).slot_key().unwrap().clone();
@@ -264,13 +266,18 @@ pub fn packed_expert_fixtures() -> Vec<Fixture> {
             .enumerate()
             .map(|(expert, payload)| (format!("experts.{expert}"), Arc::clone(payload)))
             .collect();
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, K]));
-        let ids = b.slot_named(
-            Slot::Activation,
-            "moe-ids",
-            TensorType::new(vec![ROWS], poot_tensor::DType::I32),
-        );
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![ROWS, K]))
+            .unwrap();
+        let ids = b
+            .slot_named_ranged(
+                Slot::Activation,
+                "moe-ids",
+                TensorType::new(vec![ROWS], poot_tensor::DType::I32),
+                poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+            )
+            .unwrap();
         let y = packed_indexed_linear(&b, x, ids, &table).unwrap();
         let graph = b.finish(y).unwrap();
         let (kx, ki) = (

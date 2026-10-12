@@ -1,6 +1,6 @@
-use super::*;
+use super::{Connection, Context, Result, migrate};
 
-pub struct Db {
+pub(crate) struct Db {
     pub(super) conn: Connection,
 }
 
@@ -13,7 +13,7 @@ fn add_column_if_missing(conn: &Connection, sql: &str, context: &str) -> Result<
 }
 
 impl Db {
-    pub fn open(path: &str) -> Result<Db> {
+    pub(crate) fn open(path: &str) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             r#"

@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Alloc, BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Operand, Place, Rvalue,
+    Statement, Terminator, Ty, copy, elem, guard, ld, local, slice_dtype, slice_f32,
+};
 
 /// Batched argtop-k index extraction (spec 136 P2, naive scalar body, FR-003): `rank [rows,e] -> out
 /// [rows,k]`, `out[l,r]` = the index `i` in `0..e` with `rank[l,i] == r`. One thread per output element

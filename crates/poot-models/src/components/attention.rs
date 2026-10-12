@@ -20,6 +20,8 @@ use super::linear::{Weight, WeightError, linear};
 use super::norm::{NormParams, norm};
 use super::rope::{RopeParams, apply_rope, apply_rope_sectioned, rope_rows};
 use super::standard::{PagedMaps, ParamError, Step};
+use crate::model::TraceError;
+use crate::model::WiringError;
 use crate::model::{ConfigReason, KvLayout};
 
 /// Where a Q/K RMSNorm normalizes (applied before RoPE).
@@ -414,18 +416,18 @@ impl AttentionWeights {
 type CacheWrite = ((Traced, Traced), Traced);
 
 /// Each row's first position as the scalar index of its cache write, `[]` I32.
-fn first_positions(b: &Builder, step: &Step) -> Vec<Traced> {
+fn first_positions(b: &Builder, step: &Step) -> Result<Vec<Traced>, TraceError> {
     let rows = step.shape().rows.get();
     (0..rows)
         .map(|row| {
             let row_pos = if rows == 1 {
                 step.pos()
             } else {
-                b.slice(step.pos(), 0, row, row + 1)
+                b.slice(step.pos(), 0, row, row + 1)?
             };
-            b.reshape(b.slice(row_pos, 1, 0, 1), vec![])
+            Ok::<_, TraceError>(b.reshape(b.slice(row_pos, 1, 0, 1)?, vec![])?)
         })
-        .collect()
+        .collect::<Result<_, TraceError>>()
 }
 
 /// The contiguous layout: row `r` writes its `tokens` new positions at its own first position
@@ -439,27 +441,27 @@ fn write_contiguous(
     new: Traced,
     hkv: usize,
     d: usize,
-) -> CacheWrite {
+) -> Result<CacheWrite, TraceError> {
     let shape = step.shape();
     let (rows, cap) = (shape.rows.get(), shape.capacity.get());
     let input = b.state_input(
         name,
         TensorType::f32(vec![rows, hkv, cap, d]),
         StateRole::Positional { axis: 2 },
-    );
+    )?;
     let output = if rows == 1 {
-        b.dynamic_update_slice_dyn(input, new, write_at[0], 2)
+        b.dynamic_update_slice_dyn(input, new, write_at[0], 2)?
     } else {
         let updated: Vec<Traced> = (0..rows)
             .map(|row| {
-                let cache = b.slice(input, 0, row, row + 1);
-                let part = b.slice(new, 0, row, row + 1);
-                b.dynamic_update_slice_dyn(cache, part, write_at[row], 2)
+                let cache = b.slice(input, 0, row, row + 1)?;
+                let part = b.slice(new, 0, row, row + 1)?;
+                Ok::<_, TraceError>(b.dynamic_update_slice_dyn(cache, part, write_at[row], 2)?)
             })
-            .collect();
-        b.concat(0, &updated)
+            .collect::<Result<_, TraceError>>()?;
+        b.concat(0, &updated)?
     };
-    ((input, output), output)
+    Ok(((input, output), output))
 }
 
 /// The paged layout: one `[pool_slots, kv_heads, head_dim]` pool shared by every row. The step's
@@ -474,30 +476,30 @@ fn write_paged(
     new: Traced,
     hkv: usize,
     d: usize,
-) -> CacheWrite {
+) -> Result<CacheWrite, TraceError> {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let KvLayout::Paged { pool_slots, .. } = shape.kv else {
-        unreachable!("a step with slot maps is paged")
+        return Err(WiringError::SlotMapsOnContiguousStep.into());
     };
     let input = b.state_input(
         name,
         TensorType::f32(vec![pool_slots.get(), hkv, d]),
         StateRole::Positional { axis: 0 },
-    );
-    let flat = b.reshape(b.transpose(new, vec![0, 2, 1, 3]), vec![rows * t, hkv, d]);
-    let output = b.scatter_update(input, flat, maps.write);
-    let slots = b.reshape(maps.read, vec![rows * cap]);
-    let gathered = b.reshape(b.gather(output, 0, slots), vec![rows, cap, hkv, d]);
-    ((input, output), b.transpose(gathered, vec![0, 2, 1, 3]))
+    )?;
+    let flat = b.reshape(b.transpose(new, vec![0, 2, 1, 3])?, vec![rows * t, hkv, d])?;
+    let output = b.scatter_update(input, flat, maps.write)?;
+    let slots = b.reshape(maps.read, vec![rows * cap])?;
+    let gathered = b.reshape(b.gather(output, 0, slots)?, vec![rows, cap, hkv, d])?;
+    Ok(((input, output), b.transpose(gathered, vec![0, 2, 1, 3])?))
 }
 
 /// Where each row of `step` writes its new positions: the first position of each row under the
 /// contiguous layout, nothing under a paged one (it writes through its slot maps).
-pub(crate) fn first_writes(b: &Builder, step: &Step) -> Vec<Traced> {
+pub(crate) fn first_writes(b: &Builder, step: &Step) -> Result<Vec<Traced>, TraceError> {
     match step.paged() {
         None => first_positions(b, step),
-        Some(_) => Vec::new(),
+        Some(_) => Ok(Vec::new()),
     }
 }
 
@@ -516,7 +518,7 @@ pub(crate) fn carried_cache(
     new: Traced,
     hkv: usize,
     d: usize,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let ((input, output), read) = match step.paged() {
         None => write_contiguous(
             b,
@@ -526,14 +528,14 @@ pub(crate) fn carried_cache(
             new,
             hkv,
             d,
-        ),
+        )?,
         Some(maps) => {
             let name = format!("kv.pool.l{layer}.{name}");
-            write_paged(b, step, maps, &name, new, hkv, d)
+            write_paged(b, step, maps, &name, new, hkv, d)?
         }
     };
     step.carry(input, output);
-    read
+    Ok(read)
 }
 
 /// Self-attention of `x` (`[rows, tokens, width]`) at layer `layer`; returns `[rows, tokens, width]`.
@@ -545,13 +547,13 @@ pub fn attention(
     x: Traced,
     w: &AttentionWeights,
     p: &AttentionParams,
-) -> Traced {
-    attention_selecting(b, step, layer, x, w, p, &|_, mask| mask)
+) -> Result<Traced, TraceError> {
+    attention_selecting(b, step, layer, x, w, p, &|_, mask| Ok(mask))
 }
 
 /// Replaces the causal-over-cache mask `[rows, 1, tokens, capacity]` of an attention with the one a
 /// selector builds from it (a sparse selection narrows which cached positions a query reads).
-pub type MaskSelector<'a> = &'a dyn Fn(&Builder, Traced) -> Traced;
+pub type MaskSelector<'a> = &'a dyn Fn(&Builder, Traced) -> Result<Traced, TraceError>;
 
 /// [`attention`] under the mask `select` makes of the causal one.
 pub fn attention_selecting(
@@ -562,86 +564,89 @@ pub fn attention_selecting(
     w: &AttentionWeights,
     p: &AttentionParams,
     select: MaskSelector<'_>,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let (hq, hkv, d) = (p.heads, p.kv_heads, p.head_dim);
     let heads_first = |y: Traced, heads: usize| {
-        b.transpose(b.reshape(y, vec![rows, t, heads, d]), vec![0, 2, 1, 3])
+        Ok::<_, TraceError>(b.transpose(b.reshape(y, vec![rows, t, heads, d])?, vec![0, 2, 1, 3])?)
     };
     let (q, k, v) = match &w.qkv {
         QkvWeights::Separate(sep) => {
             let SeparateQkv { q, k, v, bias } = &**sep;
             let bias = |i: usize| bias.as_ref().map(|biases| &biases[i]);
-            let q = linear(b, x, q, bias(0));
-            let k = linear(b, x, k, bias(1));
+            let q = linear(b, x, q, bias(0))?;
+            let k = linear(b, x, k, bias(1))?;
             let v = match v {
-                Some(v) => linear(b, x, v, bias(2)),
+                Some(v) => linear(b, x, v, bias(2))?,
                 None => k,
             };
             (q, k, v)
         }
         QkvWeights::Fused { qkv, bias } => {
             // Rows are `[heads, 3, head_dim]`: split the 3-axis, then flatten each part back.
-            let fused = b.reshape(linear(b, x, qkv, bias.as_ref()), vec![rows, t, hq, 3, d]);
+            let fused = b.reshape(linear(b, x, qkv, bias.as_ref())?, vec![rows, t, hq, 3, d])?;
             let part = |i: usize| {
-                let y = b.slice(fused, 3, i, i + 1);
-                b.reshape(y, vec![rows, t, hq * d])
+                let y = b.slice(fused, 3, i, i + 1)?;
+                Ok::<_, TraceError>(b.reshape(y, vec![rows, t, hq * d])?)
             };
-            (part(0), part(1), part(2))
+            (part(0)?, part(1)?, part(2)?)
         }
     };
     // Each head's rows are its query then its gate: `[rows, tokens, heads, 2 * head_dim]`.
     let (q, gate) = if p.output_gate {
-        let pairs = b.reshape(q, vec![rows, t, hq, 2 * d]);
-        let part =
-            |from: usize| b.reshape(b.slice(pairs, 3, from, from + d), vec![rows, t, hq * d]);
-        (part(0), Some(part(d)))
+        let pairs = b.reshape(q, vec![rows, t, hq, 2 * d])?;
+        let part = |from: usize| {
+            Ok::<_, TraceError>(
+                b.reshape(b.slice(pairs, 3, from, from + d)?, vec![rows, t, hq * d])?,
+            )
+        };
+        (part(0)?, Some(part(d)?))
     } else {
         (q, None)
     };
     let (q, k) = match (p.qk_norm, &w.qk_norm) {
-        (Some(QkNorm::Projection(np)), Some([qw, kw])) => (norm(b, q, qw, np), norm(b, k, kw, np)),
+        (Some(QkNorm::Projection(np)), Some([qw, kw])) => {
+            (norm(b, q, qw, np)?, norm(b, k, kw, np)?)
+        }
         _ => (q, k),
     };
-    let (q, k) = (heads_first(q, hq), heads_first(k, hkv));
+    let (q, k) = (heads_first(q, hq)?, heads_first(k, hkv)?);
     let (q, k) = match (p.qk_norm, &w.qk_norm) {
-        (Some(QkNorm::PerHead(np)), Some([qw, kw])) => (norm(b, q, qw, np), norm(b, k, kw, np)),
+        (Some(QkNorm::PerHead(np)), Some([qw, kw])) => (norm(b, q, qw, np)?, norm(b, k, kw, np)?),
         _ => (q, k),
     };
-    let v = heads_first(v, hkv);
+    let v = heads_first(v, hkv)?;
     let v = match p.value_norm {
-        Some(np) => ops::rmsnorm_no_weight(b, v, np.eps()),
+        Some(np) => ops::rmsnorm_no_weight(b, v, np.eps())?,
         None => v,
     };
 
     let (q, k) = match p.rope {
         Some(rope) if rope.sections().is_some() => {
-            let mrope = step
-                .mrope()
-                .expect("a sectioned rope traces over Step::with_mrope");
+            let mrope = step.mrope().ok_or(WiringError::SectionedRopeWithoutMrope)?;
             (
-                apply_rope_sectioned(b, rope, q, mrope, cap),
-                apply_rope_sectioned(b, rope, k, mrope, cap),
+                apply_rope_sectioned(b, rope, q, mrope, cap)?,
+                apply_rope_sectioned(b, rope, k, mrope, cap)?,
             )
         }
         Some(rope) => {
-            let rows = rope_rows(b, rope, step.pos(), cap);
-            (apply_rope(b, q, &rows), apply_rope(b, k, &rows))
+            let rows = rope_rows(b, rope, step.pos(), cap)?;
+            (apply_rope(b, q, &rows)?, apply_rope(b, k, &rows)?)
         }
         None => (q, k),
     };
 
-    let write_at = first_writes(b, step);
-    let k_cache = carried_cache(b, step, &write_at, layer, "k", k, hkv, d);
-    let v_cache = carried_cache(b, step, &write_at, layer, "v", v, hkv, d);
+    let write_at = first_writes(b, step)?;
+    let k_cache = carried_cache(b, step, &write_at, layer, "k", k, hkv, d)?;
+    let v_cache = carried_cache(b, step, &write_at, layer, "v", v, hkv, d)?;
     let mask = if p.alibi {
-        let slopes = b.computed(ComputedConst::AlibiSlopes { heads: hq });
-        ops::alibi_mask_from_pos(b, step.pos(), cap, p.window, slopes, hq)
+        let slopes = b.computed(ComputedConst::AlibiSlopes { heads: hq })?;
+        ops::alibi_mask_from_pos(b, step.pos(), cap, p.window, slopes, hq)?
     } else {
-        ops::causal_mask_from_pos(b, step.pos(), cap, p.window)
+        ops::causal_mask_from_pos(b, step.pos(), cap, p.window)?
     };
-    let mask = select(b, mask);
+    let mask = select(b, mask)?;
     let out = match &w.sinks {
         Some(sinks) => ops::attention_prefill_with_sink(
             b,
@@ -651,10 +656,10 @@ pub fn attention_selecting(
             hq / hkv,
             p.scale,
             mask,
-            sinks.declare_f32(b),
+            sinks.declare_f32(b)?,
             hq,
             t,
-        ),
+        )?,
         None => ops::attention_masked_softcap(
             b,
             q,
@@ -664,11 +669,11 @@ pub fn attention_selecting(
             p.scale,
             mask,
             p.softcap,
-        ),
+        )?,
     };
-    let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3]), vec![rows, t, hq * d]);
+    let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3])?, vec![rows, t, hq * d])?;
     let out = match gate {
-        Some(gate) => b.binary(BinOp::Mul, out, ops::sigmoid(b, gate)),
+        Some(gate) => b.binary(BinOp::Mul, out, ops::sigmoid(b, gate)?)?,
         None => out,
     };
     linear(b, out, &w.o, w.o_bias.as_ref())
@@ -824,7 +829,7 @@ mod tests {
         let t = pos.len();
         let p = params(o);
         let w = AttentionWeights::new(&fx.map(), 2, WIDTH, &p).unwrap();
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let step = Step::new(
             &b,
             StepShape {
@@ -835,9 +840,10 @@ mod tests {
                 logits: LogitRows::All,
                 hidden: None,
             },
-        );
-        let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH]));
-        let y = attention(&b, &step, 2, xs, &w, &p);
+        )
+        .unwrap();
+        let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH])).unwrap();
+        let y = attention(&b, &step, 2, xs, &w, &p).unwrap();
         let g = step.finish(b, y).unwrap();
         let pairs: Vec<_> = g.state_pairs().collect();
         assert_eq!(pairs.len(), 2);
@@ -1255,7 +1261,7 @@ mod tests {
         fx.bf16(id(AttnRole::OBias), &[WIDTH]);
         let run = |fx: &Fx, x: &[f32], pos: &[i32], state: &[Vec<f32>; 2]| {
             let w = AttentionWeights::new(&fx.map(), 2, WIDTH, &p).unwrap();
-            let b = Builder::new();
+            let b = Builder::for_tests();
             let step = Step::new(
                 &b,
                 StepShape {
@@ -1266,9 +1272,10 @@ mod tests {
                     logits: LogitRows::All,
                     hidden: None,
                 },
-            );
-            let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH]));
-            let y = attention(&b, &step, 2, xs, &w, &p);
+            )
+            .unwrap();
+            let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH])).unwrap();
+            let y = attention(&b, &step, 2, xs, &w, &p).unwrap();
             let g = step.finish(b, y).unwrap();
             fx.eval(
                 &g,
@@ -1434,7 +1441,7 @@ mod tests {
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let p = params(o);
         let w = AttentionWeights::new(&fx.map(), 2, WIDTH, &p).unwrap();
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let kv = match paged {
             None => KvLayout::Contiguous,
             Some((pool_slots, ..)) => KvLayout::Paged {
@@ -1452,9 +1459,12 @@ mod tests {
                 logits: LogitRows::All,
                 hidden: None,
             },
-        );
-        let xs = b.constant("x", TensorType::f32(vec![rows, t, WIDTH]));
-        let y = attention(&b, &step, 2, xs, &w, &p);
+        )
+        .unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![rows, t, WIDTH]))
+            .unwrap();
+        let y = attention(&b, &step, 2, xs, &w, &p).unwrap();
         let g = step.finish(b, y).unwrap();
         let role = match paged {
             None => StateRole::Positional { axis: 2 },

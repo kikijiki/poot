@@ -13,7 +13,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -25,16 +24,17 @@ use crate::components::standard::{
     standard_layer, standard_stack,
 };
 use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, ParamBlock, Phase,
+    StepShape, TraceError, WiringError,
 };
 use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
 use crate::names::{
     ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("qwen3moe");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen3moe");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -124,7 +124,7 @@ const GGUF_MOE: MoeNames = MoeNames {
 
 /// qwen3-MoE's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Qwen3MoeParams {
+pub(crate) struct Qwen3MoeParams {
     vocab: usize,
     width: usize,
     /// The dense layers' FFN width; `None` when the config does not state one.
@@ -143,7 +143,7 @@ pub struct Qwen3MoeParams {
 }
 
 impl Qwen3MoeParams {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read_with_inter(&fields, &SPEC, EXPERT_INTER)?;
         for unsupported in ["attention_bias", "use_sliding_window"] {
@@ -249,7 +249,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Qwen3Moe {
+pub(crate) struct Qwen3Moe {
     params: Qwen3MoeParams,
     weights: WeightMap,
     stack: StackWeights,
@@ -284,7 +284,9 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
                 (false, Some(inter)) => {
                     Ffn::Dense(Box::new(GatedFfnWeights::new(&weights, l, p.width, inter)?))
                 }
-                (false, None) => unreachable!("from_raw requires a dense width for a dense layer"),
+                (false, None) => {
+                    return Err(WiringError::MissingParams(ParamBlock::Dense).into());
+                }
             };
             Ok(Layer {
                 norms: LayerNorms::new(&weights, l, p.width)?,
@@ -323,12 +325,11 @@ impl Model for Qwen3Moe {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -342,7 +343,7 @@ impl Model for Qwen3Moe {
                     Ffn::Routed(w) => moe::moe(b, &step, l, h, None, w, &p.moe),
                 },
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -377,7 +378,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 fn fixture() -> Fixture {
     let config = fixture_config();
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (h, d) = (n("hidden_size"), n("head_dim"));
     let (experts, inter) = (n("num_experts"), n("moe_intermediate_size"));
     let sparse = sparse_flags(&config);
@@ -493,7 +494,11 @@ mod tests {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
         let g = model
-            .trace(Phase::Decode, step_shape(1, CAP, LogitRows::Last))
+            .trace(
+                Phase::Decode,
+                step_shape(1, CAP, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let declared: Vec<_> = g
             .witnesses()
@@ -572,6 +577,7 @@ mod tests {
                 .trace(
                     Phase::Prefill,
                     step_shape(prompt.len(), CAP, LogitRows::All),
+                    poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
             let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
@@ -879,11 +885,19 @@ mod tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(1, 2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(1, 2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }

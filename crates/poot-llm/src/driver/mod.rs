@@ -39,6 +39,7 @@ pub mod embeds;
 pub mod encode;
 pub mod error;
 pub mod expert_residency;
+mod gguf_vocab;
 pub mod handle;
 mod host_sample;
 pub mod lora;
@@ -48,6 +49,7 @@ pub mod open;
 pub mod placement;
 pub mod prefix_cache;
 mod reorder;
+pub use reorder::RowGraphError;
 mod snapshot;
 pub mod speculate;
 pub mod step;
@@ -62,6 +64,8 @@ mod hidden_carry_tests;
 mod placed_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod text_checkpoint_tests;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -73,8 +77,9 @@ use poot_executor::{
 };
 use poot_graph_ir::{Graph, Slot, SlotKey, StateRole};
 use poot_graph_plan::{
-    CompileOptions, ExpertPlacement, ShardRule, StagedCompileError, StagedProgram, TensorParallel,
-    WeightFormats, bind_packed_weights, compile_staged, shard,
+    CompileOptions, ShardRule, WeightFormats, bind_packed_weights, shard, staged::ExpertPlacement,
+    staged::ReadTraffic, staged::StagedCompileError, staged::StagedProgram, staged::TensorParallel,
+    staged::compile_staged,
 };
 use poot_models::bert::{ATTENTION_MASK_SLOT, TOKEN_TYPE_SLOT};
 use poot_models::components::embed::{EMBEDS_AT_SLOT, EMBEDS_SLOT};
@@ -85,14 +90,14 @@ use poot_models::mrope::MropePositionIds;
 use poot_models::qwen_vl_vision::{FRAME_SLOT, POS_H_SLOT, POS_W_SLOT, WINDOW_SLOT};
 use poot_profile::{Mark, Report, TimingSnapshot};
 use poot_quant::weights::WeightMap;
-use poot_tensor::DType;
-use poot_tensor::HostTensor;
+use poot_tensor::{DType, HostTensor};
 
 use crate::GenerationControl;
 use crate::core::sampler::{Sampler, TokenLogprob};
 pub use beam::{Beam, BeamError, BeamRequest};
 pub use caps::{
     DriverCaps, HeadSet, InputSet, Layout, LoraCaps, PoolShape, ServingShapes, StateResidency,
+    WindowCap,
 };
 use chunks::ChunkPolicy;
 pub use embeds::PromptEmbeds;
@@ -206,6 +211,26 @@ fn body_bytes(body: &poot_kernel_ir::Body) -> u64 {
     (body.locals.len() * size_of::<poot_kernel_ir::LocalDecl>() + blocks) as u64
 }
 
+/// The finite trace limits of the workloads this crate serves, for a step of at most `max_tokens`
+/// tokens. Measured on the 659 workload (qwen2.5-0.5b, 24 layers, ISL=570 prefill; POOT-733): the
+/// graph holds 2,778 values and 2,389 equations, 776 bytes of scalar literals and about 0.95 MB of
+/// owned storage, and a 64-layer tower of the same family 7,378 values and 6,349 equations; decode is
+/// one value fewer. The values, equations and literal bytes below are 100x and more above the 24-layer
+/// measurement so a deeper or recurrence-unrolled family still fits, and the owned-byte cap is 1 GiB.
+/// Each is a hard cap on what one trace may build, not a target.
+///
+/// A caller with another workload states its own [`poot_graph_ir::TraceLimits`]; nothing here is
+/// consulted unless a caller asks for it.
+pub const fn serving_trace_limits(max_tokens: NonZeroUsize) -> poot_graph_ir::TraceLimits {
+    poot_graph_ir::TraceLimits {
+        max_tokens,
+        max_values: NonZeroUsize::new(1 << 20).unwrap(),
+        max_eqns: NonZeroUsize::new(1 << 20).unwrap(),
+        max_literal_bytes: NonZeroU64::new(1 << 24).unwrap(),
+        max_owned_bytes: NonZeroU64::new(1 << 30).unwrap(),
+    }
+}
+
 /// Every choice the caller makes about a driver; there is no `Default`.
 #[derive(Clone, Debug)]
 pub struct DriverOptions {
@@ -218,8 +243,11 @@ pub struct DriverOptions {
     pub capacity: NonZeroUsize,
     /// New tokens per full prefill step: a multiple of the model's prefill granule.
     pub prefill_chunk: NonZeroUsize,
-    /// The most new tokens a traced step may carry (the trace limit the chunk must fit).
-    pub max_trace_tokens: NonZeroUsize,
+    /// The finite limits every traced step runs under: `trace.max_tokens` is the most new tokens a
+    /// traced step may carry (the limit the prefill chunk must fit), and the values, equations, literal
+    /// bytes and owned storage a step's graph may hold bound its construction. A step that exceeds one
+    /// is refused with the exact resource named, before the excess is built.
+    pub trace: poot_graph_ir::TraceLimits,
     pub prepared: PreparedSetLimits,
     pub charge: RetentionCharge,
     /// How a decode row proposes tokens to verify ([`speculate`]).
@@ -295,6 +323,9 @@ pub struct Generation {
 pub struct PhaseTiming {
     pub tokens: usize,
     pub wall: std::time::Duration,
+    /// Weight and carried-state bytes the plan reads for this phase's steps ([`ReadTraffic`]): the
+    /// engine's own count from the planned storage of each value a dispatch reads.
+    pub bytes: u64,
 }
 
 impl PhaseTiming {
@@ -302,14 +333,59 @@ impl PhaseTiming {
     pub fn tokens_per_second(&self) -> Option<f64> {
         (!self.wall.is_zero()).then(|| self.tokens as f64 / self.wall.as_secs_f64())
     }
+
+    /// Milliseconds of engine wall time per token; `None` for no tokens or no measured time.
+    pub fn ms_per_token(&self) -> Option<f64> {
+        (self.tokens > 0 && !self.wall.is_zero())
+            .then(|| self.wall.as_secs_f64() * 1e3 / self.tokens as f64)
+    }
+
+    /// Bytes the plan reads per token of this phase; `None` for no tokens.
+    pub fn bytes_per_token(&self) -> Option<f64> {
+        (self.tokens > 0).then(|| self.bytes as f64 / self.tokens as f64)
+    }
+
+    /// The phase against `ceiling`: `None` unless both a time and a byte count were measured.
+    pub fn roofline(&self, ceiling: poot_profile::Ceiling) -> Option<poot_profile::Roofline> {
+        poot_profile::Roofline::of(self.bytes_per_token()?, self.ms_per_token()?, ceiling)
+    }
+}
+
+impl std::ops::Add for PhaseTiming {
+    type Output = Self;
+
+    /// The work and engine time of two phases run one after the other.
+    fn add(self, other: Self) -> Self {
+        Self {
+            tokens: self.tokens + other.tokens,
+            wall: self.wall + other.wall,
+            bytes: self.bytes.saturating_add(other.bytes),
+        }
+    }
+}
+
+impl std::ops::Sub for PhaseTiming {
+    type Output = Self;
+
+    /// The work between two readings of a running total (`later - earlier`).
+    fn sub(self, earlier: Self) -> Self {
+        Self {
+            tokens: self.tokens.saturating_sub(earlier.tokens),
+            wall: self.wall.saturating_sub(earlier.wall),
+            bytes: self.bytes.saturating_sub(earlier.bytes),
+        }
+    }
 }
 
 /// The prefill and decode phases of one generation. Prefill ends with the step that yields the first
 /// token, so the first token belongs to prefill and decode counts the tokens that follow it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GenerationTiming {
     pub prefill: PhaseTiming,
     pub decode: PhaseTiming,
+    /// The decode phase against the device's pinned ceiling; `None` for a device without one, or a
+    /// decode that took no measured time.
+    pub decode_roofline: Option<poot_profile::Roofline>,
 }
 
 /// Receives each generated token with the text it adds. Any `FnMut(u32, &str) -> GenerationControl`
@@ -332,6 +408,10 @@ pub struct DriverStats {
     /// Entries added to the executor.
     pub entries_added: u64,
     pub steps: u64,
+    /// Bytes the plan reads, summed over the steps run, split by whether the step's entry was a
+    /// decode entry ([`ReadTraffic`]).
+    pub decode_read_bytes: u64,
+    pub prefill_read_bytes: u64,
     /// Picks that took the host sampling path.
     pub host_picks: u64,
     /// What the draft policy did across the rows stepped.
@@ -390,6 +470,10 @@ struct Prepared {
     exe: ExecutableId,
     /// What the entry holds against the retention limit.
     held: Held,
+    /// What one step of the entry reads from weights and carried state.
+    traffic: ReadTraffic,
+    /// Whether the entry is a [`Phase::Decode`] entry, which the read-byte counters split on.
+    decode: bool,
     slots: Vec<SlotSpec>,
     /// The shape of the program's output, as traced: `[rows, positions, width]` for an encode step.
     output: Vec<usize>,
@@ -724,7 +808,7 @@ impl Driver {
         Ok(ChunkPolicy::new(
             options.prefill_chunk,
             handle.config().prefill_granule,
-            options.max_trace_tokens,
+            options.trace.max_tokens,
         )?)
     }
 
@@ -754,7 +838,7 @@ impl Driver {
         };
         let graph = handle
             .model()
-            .trace(Phase::Decode, shape)
+            .trace(Phase::Decode, shape, options.trace)
             .map_err(Unsupported::Trace)?;
         let formats = WeightFormats::from_weight_map(weights);
         let graph = bind_packed_weights(&graph, &formats).map_err(Unsupported::PackedBind)?;
@@ -861,7 +945,7 @@ impl Driver {
         let graph = self
             .handle
             .model()
-            .trace(Phase::Decode, shape)
+            .trace(Phase::Decode, shape, self.options.trace)
             .map_err(Unsupported::Trace)?;
         let graph = bind_packed_weights(&graph, &self.formats).map_err(Unsupported::PackedBind)?;
         let per_token = poot_graph_plan::routed_step_demand(&graph)
@@ -882,7 +966,7 @@ impl Driver {
         self.chunks = ChunkPolicy::new(
             chunk,
             self.handle.config().prefill_granule,
-            self.options.max_trace_tokens,
+            self.options.trace.max_tokens,
         )?;
         self.pool = Some(ExpertPool {
             slots: slots_per_layer,
@@ -975,6 +1059,16 @@ impl Driver {
         }
     }
 
+    /// The pinned bandwidth ceiling of the one device this driver runs on ([`poot_profile::Ceiling`]);
+    /// `None` for a device nobody calibrated, an NPU, or a placement over several devices.
+    pub fn ceiling(&self) -> Option<poot_profile::Ceiling> {
+        let targets = self.executor.target_set();
+        let [(_, target)] = targets.devices() else {
+            return None;
+        };
+        poot_profile::Ceiling::pinned(&target.id().calibration_label()?)
+    }
+
     /// The executor's own counters: recordings, replays and live memory by role.
     pub fn executor_stats(&self) -> poot_executor::ExecutorStats {
         self.executor.stats()
@@ -1014,14 +1108,6 @@ impl Driver {
             }
             .into());
         }
-        let trace_limit = self.options.max_trace_tokens.get();
-        if key.shape.tokens.get() > trace_limit {
-            return Err(PreparedSetRefusal::TraceTokens {
-                tokens: key.shape.tokens.get(),
-                limit: trace_limit,
-            }
-            .into());
-        }
         if matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
             // The layer drafts for the base weights, and its cache follows the serving rows only.
             if let Some(generation) = key.adapters {
@@ -1041,7 +1127,7 @@ impl Driver {
         let (handle, exe) = self.scope(key.role)?;
         let graph = handle
             .model()
-            .trace(key.phase, key.shape)
+            .trace(key.phase, key.shape, self.options.trace)
             .map_err(Unsupported::Trace)?;
         let residency = Self::check_state_rows(&handle, &graph, key.shape)?;
         if key.role == ModelRole::Draft && residency == StateResidency::Recurrent {
@@ -1054,8 +1140,11 @@ impl Driver {
             ModelRole::Snapshot | ModelRole::Restore => {
                 // A rollback copy moves state and binds no weight: its graph is the decode
                 // program's state schema, rows copied by index.
-                let entries = snapshot::snapshot_entries(&graph)
-                    .expect("a rollback entry is prepared for a model with recurrent state");
+                let entries = snapshot::snapshot_entries(&graph, self.options.trace)
+                    .map_err(|error| Unsupported::RowGraph(Box::new(error)))?
+                    .ok_or(Unsupported::RowGraph(Box::new(
+                        reorder::RowGraphError::NoState,
+                    )))?;
                 match key.role {
                     ModelRole::Snapshot => entries.snapshot,
                     _ => entries.restore,
@@ -1064,7 +1153,7 @@ impl Driver {
             _ => {
                 let graph = bind_packed_weights(&graph, self.formats_of(key.role))
                     .map_err(Unsupported::PackedBind)?;
-                suffix::with_head(graph, key.head)
+                suffix::with_head(graph, key.head, self.options.trace)
                     .map_err(|error| Unsupported::Graph(Box::new(error)))?
             }
         };
@@ -1095,7 +1184,7 @@ impl Driver {
             (None, Phase::Encode) if key.role == ModelRole::Target => self.encode_exe(key.shape)?,
             (None, _) => exe,
         };
-        let entry = self.add_entry(exe, &program, reservation, slots, output)?;
+        let entry = self.add_entry(exe, &program, reservation, slots, output, key.phase)?;
         if key.role != ModelRole::Draft && residency == StateResidency::Recurrent {
             self.residency = StateResidency::Recurrent;
         }
@@ -1165,6 +1254,7 @@ impl Driver {
         reservation: Reservation,
         slots: Vec<SlotSpec>,
         output: Vec<usize>,
+        phase: Phase,
     ) -> Result<Prepared, DriverError> {
         let id = self.executor.add_entry(exe, program)?;
         self.stats.entries_added += 1;
@@ -1173,6 +1263,8 @@ impl Driver {
             id,
             exe,
             held: reservation.held,
+            traffic: program.read_traffic(),
+            decode: phase == Phase::Decode,
             slots,
             output,
         })
@@ -1351,6 +1443,20 @@ impl Driver {
             inputs.push((*key).clone(), tensor.shape(), tensor.view());
         }
         self.stats.steps += 1;
+        // A token at position `p` attends `p + 1` cached positions: the plan's KV bytes per position
+        // times that count, on top of the weights and recurrent state every step streams.
+        let attended: u64 = data
+            .pos
+            .iter()
+            .map(|&p| u64::from(p.max(0).cast_unsigned()) + 1)
+            .sum();
+        let bytes = entry.traffic.step_bytes(attended);
+        let counter = if entry.decode {
+            &mut self.stats.decode_read_bytes
+        } else {
+            &mut self.stats.prefill_read_bytes
+        };
+        *counter = counter.saturating_add(bytes);
         let mut none = NoSync;
         let host: &mut dyn HostSync = match &mut self.pool {
             Some(pool) => pool.managers.entry(entry.exe).or_default(),
@@ -1673,6 +1779,7 @@ impl Driver {
         let started = self
             .time_phases
             .then(|| self.executor.stats().timing.mark());
+        let read_before = (self.stats.prefill_read_bytes, self.stats.decode_read_bytes);
         let mut pending = loop {
             let result = self.step_one(seq, RowWork::Prefill { upto }, sampler)?;
             logprobs.extend(result.logprobs);
@@ -1737,14 +1844,18 @@ impl Driver {
         let timing = match (&started, &prefilled, &decoding) {
             (Some(started), Some(prefilled), Some(decoding)) => {
                 let finished = self.executor.stats().timing;
+                let decode = PhaseTiming {
+                    tokens: decoded,
+                    wall: window_wall(&finished, decoding),
+                    bytes: self.stats.decode_read_bytes - read_before.1,
+                };
                 Some(GenerationTiming {
+                    decode_roofline: self.ceiling().and_then(|ceiling| decode.roofline(ceiling)),
+                    decode,
                     prefill: PhaseTiming {
                         tokens: prefilled_tokens,
                         wall: window_wall(prefilled, started),
-                    },
-                    decode: PhaseTiming {
-                        tokens: decoded,
-                        wall: window_wall(&finished, decoding),
+                        bytes: self.stats.prefill_read_bytes - read_before.0,
                     },
                 })
             }

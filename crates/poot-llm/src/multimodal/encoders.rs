@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use poot_executor::Executor;
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
 use poot_models::registry::Registry;
 
 use crate::driver::error::DriverError;
@@ -20,7 +20,7 @@ use crate::driver::{
     DraftPolicy, Driver, DriverOptions, EncodeRequest, EncodeRow, Encoded, LoadOptions,
     ModelHandle, PreparedSetLimits, program_retention,
 };
-use crate::error::TextError;
+use poot_text::TextError;
 
 /// Why an encoder request is refused.
 #[derive(Debug, thiserror::Error)]
@@ -52,7 +52,7 @@ fn open(
         decode: compile,
         capacity: positions,
         prefill_chunk: positions,
-        max_trace_tokens: positions,
+        trace: crate::driver::serving_trace_limits(positions),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(32).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),

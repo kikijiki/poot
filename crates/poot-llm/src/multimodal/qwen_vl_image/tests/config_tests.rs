@@ -1,4 +1,5 @@
 use super::*;
+use crate::multimodal::qwen_vl_image::config::PREPROCESSOR_CONFIG_FILE;
 
 #[test]
 fn qwen25_vl_image_processor_config_overlays_released_defaults() {

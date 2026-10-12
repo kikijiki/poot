@@ -12,19 +12,17 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
-use poot_llm::ChatTurn;
-use poot_llm::GenerationControl;
+use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, DriverOptions, PreparedSetLimits, open_executor, program_retention,
 };
 use poot_llm::front_end::{CaptionRequest, Idefics3, decode_image};
 use poot_llm::qwen_vl::{Qwen25Vl, Qwen25VlGenerate};
 use poot_llm::{
-    MropeProcessorFpsInput, QWEN2_5_VL_PROCESSOR_DEFAULT_FPS, Qwen25VlApng, Qwen25VlApngError,
-    Qwen25VlApngFrameSource, Qwen25VlChatContent, Qwen25VlChatMessage, Qwen25VlChatMessageContent,
-    Sampler,
+    ChatTurn, GenerationControl, Qwen25VlApng, Qwen25VlApngError, Qwen25VlApngFrameSource,
+    Qwen25VlChatContent, Qwen25VlChatMessage, Qwen25VlChatMessageContent, Sampler,
 };
+use poot_models::mrope::{MropeProcessorFpsInput, QWEN2_5_VL_PROCESSOR_DEFAULT_FPS};
 use poot_models::registry::Registry;
 
 /// The driver options of one tower: `capacity` positions, prefill in pieces of at most `chunk`.
@@ -36,7 +34,7 @@ fn options(capacity: usize, chunk: usize) -> DriverOptions {
         decode: compile,
         capacity: nz(capacity),
         prefill_chunk: nz(chunk),
-        max_trace_tokens: nz(chunk),
+        trace: poot_llm::driver::serving_trace_limits(nz(chunk)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),

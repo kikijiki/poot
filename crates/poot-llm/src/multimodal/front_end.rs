@@ -22,8 +22,7 @@ use crate::driver::{
     Driver, DriverOptions, EncodeRequest, EncodeRow, GenerateRequest, Generation, ModelHandle,
     PromptEmbeds, TokenSink,
 };
-use crate::error::TextError;
-use crate::text::tokenize::TextCodec;
+use poot_text::{TextCodec, TextError};
 
 use super::{
     ChatTurn, ImageCheckpoint, ImageCheckpointError, ImageFrontEnd, ImageRequestError,
@@ -54,6 +53,8 @@ pub enum FrontEndError {
     },
     #[error("a caption needs at least one image")]
     NoImage,
+    #[error(transparent)]
+    ImageBuffer(#[from] poot_models::vision::ImageBufferError),
     #[error("the turns carry {turns} images but {images} were given")]
     TurnImages { turns: usize, images: usize },
     #[error(
@@ -545,7 +546,8 @@ impl Idefics3FrontEnd {
         let mut frames: Vec<Vec<f32>> = Vec::new();
         let mut grids = Vec::with_capacity(images.len());
         for image in images {
-            let split = idefics3_preprocess(image.rgb, image.height, image.width, &self.preprocess);
+            let split =
+                idefics3_preprocess(image.rgb, image.height, image.width, &self.preprocess)?;
             grids.push((split.rows, split.cols));
             frames.extend(split.frames);
             // Checked as frames accumulate, so the oversized batch is never materialized whole.
@@ -766,7 +768,7 @@ mod tests {
             (1, 1),
             (3, 4000),
         ] {
-            let split = idefics3_preprocess(&vec![100.0; h * w * 3], h, w, &config);
+            let split = idefics3_preprocess(&vec![100.0; h * w * 3], h, w, &config).unwrap();
             let (rows, cols, frames) = (split.rows, split.cols, split.frames.len());
             assert!(rows <= 6 && cols <= 6, "{h}x{w} -> {rows}x{cols}");
             let prompt = caption_prompt("Describe.", &[(rows, cols)], tokens);
@@ -879,7 +881,7 @@ mod tests {
 mod smolvlm {
     use std::num::{NonZeroU64, NonZeroUsize};
 
-    use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+    use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
     use poot_runtime_common::DeviceBackend;
 
     use super::*;
@@ -894,7 +896,7 @@ mod smolvlm {
             decode: compile,
             capacity: nz(capacity),
             prefill_chunk: nz(chunk),
-            max_trace_tokens: nz(chunk),
+            trace: crate::driver::serving_trace_limits(nz(chunk)),
             prepared: PreparedSetLimits {
                 max_entries: nz(64),
                 max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
@@ -914,7 +916,8 @@ mod smolvlm {
             BackendChoice::Ptx => DeviceBackend::Ptx,
             other => unreachable!("{other:?} has no smolvlm row"),
         };
-        let open = || poot_test_util::device_skip::open_or_skip(backend, open_executor(choice));
+        let open =
+            || poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice));
         let (vision, text) = (open()?, open()?);
         Some(
             Idefics3::load(

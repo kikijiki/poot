@@ -19,15 +19,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use common::{step, token_pos, zero_state};
-use poot_executor::{
-    BufferRole, DetailedTiming, Device, Dispatch, Engine, Executor, NoSync, StepInputs,
-};
-use poot_executor_parity::dense::step as step_shape;
-use poot_executor_parity::weight_map::MappedModel;
+use poot_executor::{DetailedTiming, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::{Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
-    Submission, Target, compile_staged,
+    CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::compile_staged,
 };
 use poot_llm::driver::capacity::Planner;
 use poot_llm::driver::error::DriverError;
@@ -39,9 +36,11 @@ use poot_llm::driver::{
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::{FamilyKey, LogitRows, Phase};
 use poot_models::registry::{FamilyEntry, Fixture, Registry};
+use poot_models::test_support::dense::step as step_shape;
+use poot_models::test_support::weight_map::MappedModel;
 use poot_profile::Report;
 use poot_quant::weights::{WeightMap, WeightStore};
-use poot_runtime_common::{DeviceBackend, MemoryCounters};
+use poot_runtime_common::{BufferRole, DeviceBackend, MemoryCounters};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
 use tokenizers::Tokenizer;
@@ -103,7 +102,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
     tokenizer.save(dir.join("tokenizer.json"), false).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
 }
 
 fn options() -> DriverOptions {
@@ -113,7 +112,7 @@ fn options() -> DriverOptions {
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(4),
-        max_trace_tokens: nz(CAPACITY),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(CAPACITY)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 40).unwrap(),
@@ -147,6 +146,7 @@ fn decode_graph(m: &MappedModel, rows: usize) -> Graph {
         .trace(
             Phase::Decode,
             step_shape(rows, 1, CAPACITY, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
 }
@@ -197,24 +197,30 @@ fn identity_rows(rows: usize) -> Vec<(SlotKey, HostTensor)> {
 /// into the shadow, restore copies the shadow back into live. The untouched side is its own state
 /// output (an alias, no copy).
 fn copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph {
-    let b = Builder::new();
-    let index = b.slot_named(
-        Slot::Activation,
-        ROWS_TAG,
-        TensorType::new(vec![rows], DType::I32),
-    );
+    let b = Builder::for_tests();
+    let index = b
+        .slot_named(
+            Slot::Activation,
+            ROWS_TAG,
+            TensorType::new(vec![rows], DType::I32),
+        )
+        .unwrap();
     let mut pairs = Vec::new();
     let mut out = None;
     for s in state {
-        let live = b.state_input(&s.name, s.aval.clone(), StateRole::Recurrent);
-        let shadow = b.state_input(&shadow_name(&s.name), s.aval.clone(), StateRole::Recurrent);
+        let live = b
+            .state_input(&s.name, s.aval.clone(), StateRole::Recurrent)
+            .unwrap();
+        let shadow = b
+            .state_input(&shadow_name(&s.name), s.aval.clone(), StateRole::Recurrent)
+            .unwrap();
         let copied = if restore {
-            let copied = b.gather(shadow, 0, index);
+            let copied = b.gather(shadow, 0, index).unwrap();
             pairs.push((live, copied));
             pairs.push((shadow, shadow));
             copied
         } else {
-            let copied = b.gather(live, 0, index);
+            let copied = b.gather(live, 0, index).unwrap();
             pairs.push((live, live));
             pairs.push((shadow, copied));
             copied
@@ -233,24 +239,34 @@ fn copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph {
 /// `rows + r` to copy. Each row of a round it copies is a bandwidth cost the plain gather above does
 /// not show, so the cost rows time both.
 fn concat_copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph {
-    let b = Builder::new();
-    let index = b.slot_named(
-        Slot::Activation,
-        ROWS_TAG,
-        TensorType::new(vec![rows], DType::I32),
-    );
+    let b = Builder::for_tests();
+    let index = b
+        .slot_named(
+            Slot::Activation,
+            ROWS_TAG,
+            TensorType::new(vec![rows], DType::I32),
+        )
+        .unwrap();
     let mut pairs = Vec::new();
     let mut out = None;
     for s in state {
-        let live = b.state_input(&s.name, s.aval.clone(), StateRole::Recurrent);
-        let shadow = b.state_input(&shadow_name(&s.name), s.aval.clone(), StateRole::Recurrent);
+        let live = b
+            .state_input(&s.name, s.aval.clone(), StateRole::Recurrent)
+            .unwrap();
+        let shadow = b
+            .state_input(&shadow_name(&s.name), s.aval.clone(), StateRole::Recurrent)
+            .unwrap();
         let copied = if restore {
-            let copied = b.gather(b.concat(0, &[live, shadow]), 0, index);
+            let copied = b
+                .gather(b.concat(0, &[live, shadow]).unwrap(), 0, index)
+                .unwrap();
             pairs.push((live, copied));
             pairs.push((shadow, shadow));
             copied
         } else {
-            let copied = b.gather(b.concat(0, &[shadow, live]), 0, index);
+            let copied = b
+                .gather(b.concat(0, &[shadow, live]).unwrap(), 0, index)
+                .unwrap();
             pairs.push((live, live));
             pairs.push((shadow, copied));
             copied
@@ -266,17 +282,19 @@ fn concat_copy_graph(state: &[Carried], rows: usize, restore: bool) -> Graph {
 
 /// The beam reorder's shape: every state value of the decode program gathered by row.
 fn reorder_graph(state: &[Carried], rows: usize) -> Graph {
-    let b = Builder::new();
-    let index = b.slot_named(
-        Slot::Activation,
-        ROWS_TAG,
-        TensorType::new(vec![rows], DType::I32),
-    );
+    let b = Builder::for_tests();
+    let index = b
+        .slot_named(
+            Slot::Activation,
+            ROWS_TAG,
+            TensorType::new(vec![rows], DType::I32),
+        )
+        .unwrap();
     let mut pairs = Vec::new();
     let mut out = None;
     for s in state {
-        let value = b.state_input(&s.name, s.aval.clone(), s.role);
-        let moved = b.gather(value, 0, index);
+        let value = b.state_input(&s.name, s.aval.clone(), s.role).unwrap();
+        let moved = b.gather(value, 0, index).unwrap();
         pairs.push((value, moved));
         out = Some(moved);
     }
@@ -665,7 +683,7 @@ fn checkpoint_scale_gdn(rows: usize) -> Vec<Carried> {
 }
 
 fn measure(backend: DeviceBackend, choice: BackendChoice) {
-    let Some(mut executor) = poot_test_util::device_skip::open_or_skip(
+    let Some(mut executor) = poot_runtime_common::device_skip::open_or_skip(
         backend,
         open_timed_executor(choice, DetailedTiming::default_diagnostic()),
     ) else {
@@ -791,7 +809,7 @@ fn generate(
 /// the rejected drafts stay folded, the tokens diverge from greedy and the assertion prints both lists.
 #[test]
 fn a_gdn_fixture_speculates_with_prompt_lookup_without_diverging_from_greedy_wgpu() {
-    let Some(greedy_executor) = poot_test_util::device_skip::open_or_skip(
+    let Some(greedy_executor) = poot_runtime_common::device_skip::open_or_skip(
         DeviceBackend::Wgpu,
         poot_llm::driver::open_executor(BackendChoice::Wgpu),
     ) else {

@@ -291,12 +291,9 @@ mod packed_lowering_tests {
     }
 
     /// Card 542d, ADR-0104: whether a format executes is decided here, at planning, never by a
-    /// loader-side registry (`poot_load::packed_safetensors::validation`'s
-    /// `expected_dtype_derives_from_the_descriptor_for_an_unregistered_planar_format` proves the
-    /// loader-side half: `E4m3PerChannel` - never one of the four `PackedLinearFormat` cells card
-    /// 542d deleted - loads with no panic). This is the planning-side half of the same story: the
-    /// same unregistered-but-described format has a descriptor (so `admits_planar` would admit it
-    /// for `Contraction`), but `RowGather` stays block-only, so it is refused here by
+    /// loader-side registry. An unregistered-but-described format (`E4m3PerChannel` - never one of
+    /// the four `PackedLinearFormat` cells card 542d deleted) has a descriptor (so `admits_planar`
+    /// would admit it for `Contraction`), but `RowGather` stays block-only, so it is refused here by
     /// name, a typed `Refusal`, not a panic - the same shape as
     /// `the_real_table_does_not_admit_a_planar_format_for_row_gather` above, for a format that was
     /// never registered at all.

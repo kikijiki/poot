@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Alloc, BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, KernelGenError, Local, Operand,
+    Place, Rvalue, Statement, Terminator, Ty, UnOp, copy, elem, guard, ld, local,
+    row_major_strides, slice_dtype,
+};
 
 /// Fused RoPE (rotary position embedding): one dispatch replacing the `slice/slice/neg/concat/mul/mul/add`
 /// (`+slice/concat` for partial) chain traced by `ops::rope_partial`. f32; see [`rope_dt`].

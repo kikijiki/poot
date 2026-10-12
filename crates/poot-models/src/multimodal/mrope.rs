@@ -195,13 +195,24 @@ pub fn reconcile_mrope_special_token_ids(
         }
         role_tokens[mrope_special_token_role_index(role)] = Some(token);
     }
+    // Every role was matched above, so each slot is filled; a missing one is the same refusal.
+    let [Some(vision_start), Some(image), Some(video)] = role_tokens else {
+        let missing = MROPE_SPECIAL_TOKEN_ROLE_ORDER
+            .into_iter()
+            .find(|&role| role_tokens[mrope_special_token_role_index(role)].is_none())
+            .unwrap_or(MROPE_SPECIAL_TOKEN_ROLE_ORDER[0]);
+        return Err(
+            MropeSpecialTokenReconcileError::MissingProcessorSpecialToken { role: missing },
+        );
+    };
+    let role_tokens = [vision_start, image, video];
 
     for first_index in 0..MROPE_SPECIAL_TOKEN_ROLE_ORDER.len() {
         for second_index in first_index + 1..MROPE_SPECIAL_TOKEN_ROLE_ORDER.len() {
             let first = MROPE_SPECIAL_TOKEN_ROLE_ORDER[first_index];
             let second = MROPE_SPECIAL_TOKEN_ROLE_ORDER[second_index];
-            let first_token = role_tokens[first_index].expect("role token checked above");
-            let second_token = role_tokens[second_index].expect("role token checked above");
+            let first_token = role_tokens[first_index];
+            let second_token = role_tokens[second_index];
             if first_token == second_token {
                 return Err(MropeSpecialTokenReconcileError::DuplicateProcessorMarker {
                     token: first_token.to_string(),
@@ -215,7 +226,7 @@ pub fn reconcile_mrope_special_token_ids(
     let mut role_ids = [0u32; 3];
     for role in MROPE_SPECIAL_TOKEN_ROLE_ORDER {
         let index = mrope_special_token_role_index(role);
-        let token = role_tokens[index].expect("role token checked above");
+        let token = role_tokens[index];
         let mut matches = tokenizer_tokens
             .iter()
             .filter(|record| record.token == token)
@@ -263,9 +274,7 @@ pub fn reconcile_mrope_special_token_ids(
             return Err(
                 MropeSpecialTokenReconcileError::ConfigSpecialTokenMismatch {
                     role,
-                    token: role_tokens[index]
-                        .expect("role token checked above")
-                        .to_string(),
+                    token: role_tokens[index].to_string(),
                     tokenizer_id,
                     config_id,
                 },
@@ -638,6 +647,9 @@ pub enum MropePositionAssemblyError {
     ProcessorTiming(#[from] MropeProcessorTimingError),
     #[error(transparent)]
     Position(#[from] MropePositionError),
+    /// Span discovery found more videos than timings were assembled for.
+    #[error("span discovery found more videos than video timings were assembled")]
+    VideoTimingCount,
 }
 
 /// Assemble Qwen2.5-VL mRoPE positions from an already-tokenized prompt. Span discovery runs before timing
@@ -664,15 +676,15 @@ pub fn assemble_qwen2_5_vl_mrope_positions(
     let timestamped_segments = segments
         .into_iter()
         .map(|segment| match segment {
-            MropeSegment::Video(grid) => MropeSegment::TimestampedVideo {
-                grid,
-                timing: next_video_timing
+            MropeSegment::Video(grid) => {
+                let timing = next_video_timing
                     .next()
-                    .expect("span discovery and video timing assembly must agree on video count"),
-            },
-            segment => segment,
+                    .ok_or(MropePositionAssemblyError::VideoTimingCount)?;
+                Ok(MropeSegment::TimestampedVideo { grid, timing })
+            }
+            segment => Ok(segment),
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, MropePositionAssemblyError>>()?;
     debug_assert!(next_video_timing.next().is_none());
 
     Ok(build_mrope_position_ids(
@@ -713,6 +725,7 @@ impl MropePosition {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub const fn packed(self) -> [i32; 3] {
         [self.temporal, self.height, self.width]
     }
@@ -738,6 +751,7 @@ impl MropePositionIds {
     }
 
     /// Axis-major `[3,L]` data, matching `Slot::MropePosition`'s prefill shape.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn packed(&self) -> Vec<i32> {
         let mut packed = Vec::with_capacity(self.len() * 3);
         packed.extend_from_slice(&self.axes[0]);

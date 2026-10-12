@@ -18,16 +18,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use poot_executor::{
-    BufferRole, Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine,
-    MemoryCounterSnapshot, NativeCounters, SupportBound,
+    Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, NativeCounters, SupportBound,
 };
-use poot_graph_ir::{BinOp, Builder, Graph};
+use poot_graph_ir::{BinOp, Graph};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, ShardRule, StagedProgram, Submission, Target, TargetSet,
+    CompileOptions, ShardRule, Target, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::StagedProgram, staged::TargetSet,
 };
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernel_ir::{Body, Ty};
-use poot_models::chat::ChatFormat;
 use poot_models::components::attention::{AttentionParams, AttentionWeights, attention};
 use poot_models::components::linear::{Weight, linear};
 use poot_models::components::standard::Step;
@@ -41,9 +40,12 @@ use poot_quant::weights::{
     AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole,
     WeightStore, WeightView,
 };
-use poot_runtime_common::{AllocGuard, CompiledKernel, MemoryCounters};
+use poot_runtime_common::{
+    AllocGuard, BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters,
+};
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 use poot_tensor::DType;
+use poot_text::ChatFormat;
 
 use super::capacity::{AllocationOwner, Footprint, Planner};
 use super::error::{DriverError, InvalidOptions, Unsupported};
@@ -101,7 +103,12 @@ impl Model for Mlp {
         &self.weights
     }
 
-    fn trace(&self, _phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        _phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         if shape.capacity.get() > self.config.max_positions {
             return Err(TraceError::ShapeUnsupported {
                 family: MLP,
@@ -114,8 +121,7 @@ impl Model for Mlp {
         let weight = |id, shape: &[usize]| {
             Weight::new(&self.weights, id, shape).expect("the fixture maps every weight it reads")
         };
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
             0
@@ -131,24 +137,24 @@ impl Model for Mlp {
                 1,
                 first,
                 n,
-            ),
+            )?,
             DType::F32,
-        );
-        let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
-        let seed = b.binary(BinOp::Add, token, pos);
+        )?;
+        let pos = b.cast(b.slice(step.pos(), 1, first, n)?, DType::F32)?;
+        let seed = b.binary(BinOp::Add, token, pos)?;
         let flat = rows * out;
-        let mut x = b.broadcast(b.reshape(seed, vec![flat, 1]), vec![flat, HIDDEN]);
+        let mut x = b.broadcast(b.reshape(seed, vec![flat, 1])?, vec![flat, HIDDEN])?;
         for layer in 0..LAYERS {
             let _scope = b.layer_scope(layer);
-            let g = linear(&b, x, &weight(gate(layer), &[INTER, HIDDEN]), None);
-            let u = linear(&b, x, &weight(up(layer), &[INTER, HIDDEN]), None);
-            let h = b.binary(BinOp::Mul, g, u);
-            let d = linear(&b, h, &weight(down(layer), &[HIDDEN, INTER]), None);
-            x = b.binary(BinOp::Add, x, d);
+            let g = linear(&b, x, &weight(gate(layer), &[INTER, HIDDEN]), None)?;
+            let u = linear(&b, x, &weight(up(layer), &[INTER, HIDDEN]), None)?;
+            let h = b.binary(BinOp::Mul, g, u)?;
+            let d = linear(&b, h, &weight(down(layer), &[HIDDEN, INTER]), None)?;
+            x = b.binary(BinOp::Add, x, d)?;
         }
-        let logits = linear(&b, x, &weight(head(), &[VOCAB, HIDDEN]), None);
-        let logits = b.reshape(logits, vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits).unwrap())
+        let logits = linear(&b, x, &weight(head(), &[VOCAB, HIDDEN]), None)?;
+        let logits = b.reshape(logits, vec![rows, out, VOCAB])?;
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -289,7 +295,12 @@ impl Model for Attn {
         &self.weights
     }
 
-    fn trace(&self, _phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        _phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         if shape.capacity.get() > self.config.max_positions {
             return Err(TraceError::ShapeUnsupported {
                 family: ATTN,
@@ -299,8 +310,7 @@ impl Model for Attn {
                 },
             });
         }
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
             0
@@ -317,24 +327,24 @@ impl Model for Attn {
                 .expect("the step's ids are a rank-2 I32 tensor")
                 .guarded,
             DType::F32,
-        );
-        let pos = b.cast(step.pos(), DType::F32);
-        let seed = b.binary(BinOp::Add, token, pos);
-        let seed = b.broadcast(b.reshape(seed, vec![rows, n, 1]), vec![rows, n, HIDDEN]);
+        )?;
+        let pos = b.cast(step.pos(), DType::F32)?;
+        let seed = b.binary(BinOp::Add, token, pos)?;
+        let seed = b.broadcast(b.reshape(seed, vec![rows, n, 1])?, vec![rows, n, HIDDEN])?;
         // A ramp over the hidden columns: with equal columns every projection is one direction scaled
         // by the seed, and the decode would be one token.
-        let ramp = b.broadcast(b.iota(HIDDEN), vec![rows, n, HIDDEN]);
-        let x = b.binary(BinOp::Add, seed, ramp);
+        let ramp = b.broadcast(b.iota(HIDDEN)?, vec![rows, n, HIDDEN])?;
+        let x = b.binary(BinOp::Add, seed, ramp)?;
         let x = {
             let _scope = b.layer_scope(0);
-            let attended = attention(&b, &step, 0, x, &weights, &params);
-            b.binary(BinOp::Add, x, attended)
+            let attended = attention(&b, &step, 0, x, &weights, &params)?;
+            b.binary(BinOp::Add, x, attended)?
         };
-        let x = b.slice(x, 1, first, n);
+        let x = b.slice(x, 1, first, n)?;
         let head = Weight::new(&self.weights, head(), &[VOCAB, HIDDEN])
             .expect("the fixture maps the head");
-        let logits = b.reshape(linear(&b, x, &head, None), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits).unwrap())
+        let logits = b.reshape(linear(&b, x, &head, None)?, vec![rows, out, VOCAB])?;
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -790,7 +800,7 @@ fn options() -> DriverOptions {
         decode: compile,
         capacity: nz(16),
         prefill_chunk: nz(4),
-        max_trace_tokens: nz(8),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(8)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 40).unwrap(),

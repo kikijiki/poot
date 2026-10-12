@@ -1,4 +1,5 @@
-use crate::*;
+use ash::vk;
+use std::ffi::c_void;
 
 /// The native calls whose ordering is part of the ownership contract. Production forwards to ash; tests
 /// substitute a dispatch table so failure and destruction paths need no Vulkan device.

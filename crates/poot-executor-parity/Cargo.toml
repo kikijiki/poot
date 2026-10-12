@@ -12,16 +12,15 @@ publish = false
 [dependencies]
 poot-tensor.workspace = true
 poot-executor.workspace = true
-poot-graph-plan.workspace = true
-poot-graph-ir.workspace = true
-poot-quant.workspace = true
-poot-runtime-common.workspace = true
+poot-graph-plan = { workspace = true, features = ["test-support"] }
+# This crate is itself test-only fixtures (ruling XC2-06): the device crates dev-depend on it, so the fixture
+# modules it builds on are its normal surface and each owner's `test-support` feature is enabled here.
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+poot-eval = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
 poot-target.workspace = true
-poot-profile.workspace = true
-poot-models.workspace = true
-poot-test-util = { workspace = true, features = ["graph-fixtures"] }
-serde_json.workspace = true
-bytemuck.workspace = true
+poot-runtime-common.workspace = true
+poot-test-util.workspace = true
 
 [lints]
 workspace = true

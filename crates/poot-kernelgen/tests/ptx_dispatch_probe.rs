@@ -2,7 +2,7 @@
 //! `wmma_tile` (the target-neutral single 16x16x16 fragment tile, F16 operands / F32 accumulate), compiled
 //! to real PTX (`poot_codegen::compile`, `Target::Nvptx`) and run via `poot_ptx_runtime::PtxContext`'s
 //! `dispatch_dev`. The NVPTX sibling of `poot-kernelgen`'s `coopmat_dispatch_probe` (wgpu/RADV coopmat) and
-//! `poot-rocm-gpu`'s `tests::resident::probe_*_wmma_rocm` (ROCm WMMA): all three exercise the same fragment
+//! `poot-rocm-device`'s `tests::resident::probe_*_wmma_rocm` (ROCm WMMA): all three exercise the same fragment
 //! op lowered to a different target and compare against the same CPU oracle.
 //!
 //! `PtxContext::new()` already implements the project's device-skip convention (AGENTS.md): it returns
@@ -13,7 +13,10 @@
 use poot_codegen::{Target, artifact_path, compile};
 use poot_kernelgen as kg;
 use poot_ptx_runtime::PtxContext;
-use poot_test_util::kernel_fixtures::{attention_reference, attention_reference_keys};
+
+#[path = "support/attention.rs"]
+mod attention;
+use attention::{attention_reference, attention_reference_keys};
 
 /// Encode f32 -> f16 bytes (little-endian), reusing the loader's own f32->f16 narrowing
 /// (`poot_quant::scalar::f32_to_f16`), matching `coopmat_dispatch_probe.rs`'s helper.
@@ -33,7 +36,7 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
         }
     };
 
-    let body = poot_test_util::kernel_fixtures::wmma_tile("k");
+    let body = poot_kernel_ir::test_support::wmma_tile("k");
     let dir = std::env::temp_dir().join("poot-ptx-wmma-dispatch-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out = artifact_path(&dir, "wmma_tile_ptx", Target::Nvptx);

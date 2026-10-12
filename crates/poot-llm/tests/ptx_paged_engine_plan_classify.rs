@@ -8,15 +8,15 @@
 //! the qwen2 family's paged decode step directly (no real checkpoint needed)
 //! and applies the pre-`compile` pass chain locally (below), so the equations classified are the fused ones `compile` plans.
 
-use poot_executor_parity::dense::{Dense, Family, paged_step};
-use poot_graph_plan::{Plan, widen_mismatched_matmul_dtypes};
+use poot_graph_plan::{Plan, dtype_widen::widen_mismatched_matmul_dtypes};
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, paged_step};
 use poot_target::Backend;
 use poot_tensor::DType;
 
-use poot_graph_plan::passes_without_target as optimize;
-use poot_test_util::graph_fixtures::plan_eqn;
+use poot_graph_plan::passes_without_target;
+use poot_graph_plan::test_support::plan_eqn;
 use std::collections::BTreeMap;
 
 /// qwen2.5-0.5b dims (a BF16 checkpoint of zeros: only the traced graph is read).
@@ -58,12 +58,13 @@ fn ptx_paged_engine_plan_classify_qwen2_n_slots_2() {
         .trace(
             Phase::Decode,
             paged_step(n_slots, 1, cap, pool_slots, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     let backend = Backend::Nvptx;
     // The pre-`compile` passes, so the equations classified are the fused ones `compile` plans: the
     // BF16 checkpoint's mixed-dtype matmuls are widened as `compile` widens them.
-    let g = widen_mismatched_matmul_dtypes(&optimize(&g).unwrap(), backend).unwrap();
+    let g = widen_mismatched_matmul_dtypes(&passes_without_target(&g).unwrap(), backend).unwrap();
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
     for eqn in g.eqns() {
         let plan = plan_eqn(

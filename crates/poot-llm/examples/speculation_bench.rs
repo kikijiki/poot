@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, LoadOptions, ModelHandle,
     PreparedSetLimits, open_executor,
@@ -136,7 +136,7 @@ fn main() -> Result<()> {
         decode: compile,
         capacity: NonZeroUsize::new(prompt_tokens.len() + new).expect("nonzero"),
         prefill_chunk: chunk,
-        max_trace_tokens: chunk,
+        trace: poot_llm::driver::serving_trace_limits(chunk),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(64).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),

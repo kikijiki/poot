@@ -1,11 +1,13 @@
 //! The attention generator takes the softcap decode, the split-key MLA shape and the guarded live-capacity
 //! composite (POOT-730), proven on the CPU oracle and the planner (no device).
 //!
-//! The device rows (`poot-gpu`, `poot-rocm-gpu`) run the same fixture through the executor contract.
+//! The device rows (`poot-wgpu-device`, `poot-rocm-device`) run the same fixture through the executor contract.
 //! This is an integration test: the crate dev-depends on `poot-eval`, which depends back on it.
 
+use poot_graph_plan::passes_without_target;
 use std::collections::HashMap;
 
+use poot_eval::test_support::live_attention::{Inputs, LiveAttentionFixture, LiveAttentionGraph};
 use poot_eval::{EvalBudget, EvalError, EvalOptions, Value, eval};
 use poot_graph_ir::ops::{attention_masked_softcap, repeat_kv};
 use poot_graph_ir::{
@@ -13,13 +15,12 @@ use poot_graph_ir::{
     TensorType, ValueId,
 };
 use poot_graph_plan::{
-    Capability, CompileError, CompileOptions, KernelChoice, Plan, PlanError, Submission, Target,
-    compile, passes_without_target as optimize,
+    Capability, CompileError, CompileOptions, KernelChoice, Plan, PlanError, Target, compile,
+    production_plan::Submission,
 };
 use poot_kernelgen::{AttentionSchedule, AttentionSpec, KernelRequest, ScoreTransform};
 use poot_target::{AmdArch, Backend};
 use poot_test_util::assert_close;
-use poot_test_util::live_attention::{Inputs, LiveAttentionFixture, LiveAttentionGraph};
 
 fn evaluate(graph: &Graph, inputs: &HashMap<ValueId, Value>) -> Result<Vec<f32>, EvalError> {
     let output = eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?
@@ -93,7 +94,7 @@ fn without_guard(mut graph: LiveAttentionGraph, which: usize) -> LiveAttentionGr
         .clone();
     let index = selects[which];
     let data = graph.graph.eqns()[index].inputs[1];
-    graph.graph = poot_test_util::graph_fixtures::derive(&graph.graph, |draft| {
+    graph.graph = poot_graph_ir::test_support::graph_fixtures::derive(&graph.graph, |draft| {
         let eqn: &mut Eqn = &mut draft.eqns_mut()[index];
         eqn.op = OpKind::Reshape { shape };
         eqn.inputs = vec![data];
@@ -112,7 +113,7 @@ fn the_guarded_graph_and_the_matched_live_composite_evaluate_bit_identically() {
     for fixture in [single_key(), split_key()] {
         let built = fixture.build(true);
         let inputs = fixture.inputs(&built, &len, true).values();
-        let optimized = optimize(&built.graph).unwrap();
+        let optimized = passes_without_target(&built.graph).unwrap();
         let [attrs] = attentions(&optimized)[..] else {
             panic!(
                 "the guarded graph fuses to one attention op: {:?}",
@@ -171,21 +172,22 @@ fn unproved_guards_stay_generic_and_a_score_mask_stays_capacity() {
         1,
         "the live bound's key ends come from one exact I32 iota"
     );
-    off_by_one.graph = poot_test_util::graph_fixtures::derive(&off_by_one.graph, |draft| {
-        for eqn in draft.eqns_mut().iter_mut() {
-            let key_ends = matches!(eqn.op, OpKind::Binary(BinOp::Add))
-                && matches!(eqn.inputs.first(), Some(Operand::Value(id)) if iotas.contains(id))
-                && matches!(eqn.inputs.get(1), Some(Operand::Lit(Scalar::I32(1))));
-            if key_ends {
-                eqn.inputs[1] = Operand::Lit(Scalar::I32(2));
+    off_by_one.graph =
+        poot_graph_ir::test_support::graph_fixtures::derive(&off_by_one.graph, |draft| {
+            for eqn in draft.eqns_mut().iter_mut() {
+                let key_ends = matches!(eqn.op, OpKind::Binary(BinOp::Add))
+                    && matches!(eqn.inputs.first(), Some(Operand::Value(id)) if iotas.contains(id))
+                    && matches!(eqn.inputs.get(1), Some(Operand::Lit(Scalar::I32(1))));
+                if key_ends {
+                    eqn.inputs[1] = Operand::Lit(Scalar::I32(2));
+                }
             }
-        }
-    })
-    .unwrap();
+        })
+        .unwrap();
     rows.push(("conditions one key off", off_by_one));
     for (name, built) in rows {
         let inputs = fixture.inputs(&built, &len, true).values();
-        let optimized = optimize(&built.graph).unwrap();
+        let optimized = passes_without_target(&built.graph).unwrap();
         // First what the rewrite would change: the unguarded graph is NaN on the poisoned tail and a `Live`
         // composite is finite, so a wrongly emitted `Live` shows up as a different result.
         assert_same_words(
@@ -204,26 +206,32 @@ fn unproved_guards_stay_generic_and_a_score_mask_stays_capacity() {
     // nothing instead of becoming a valid-looking answer.
     let validated = fixture.build(true);
     assert_eq!(
-        attentions(&optimize(&validated.graph).unwrap()).len(),
+        attentions(&passes_without_target(&validated.graph).unwrap()).len(),
         1,
         "a clamped length whose witness is declared is matched"
     );
 
     // The production mask: additive `-1e9` on the scores, no live bound. It fuses as a capacity attention.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (hq, cap, d) = (2usize, 6usize, 4usize);
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-    let pos = b.slot_ranged(
-        poot_graph_ir::Slot::Pos,
-        TensorType::new(vec![1, 1], poot_tensor::DType::I32),
-        poot_graph_ir::IndexRange::below(cap).unwrap(),
-    );
-    let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
-    let out = attention_masked_softcap(&b, q, k, v, 1, 0.5, mask, None);
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+            poot_graph_ir::IndexRange::below(cap).unwrap(),
+        )
+        .unwrap();
+    let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None).unwrap();
+    let out = attention_masked_softcap(&b, q, k, v, 1, 0.5, mask, None).unwrap();
     let graph = b.finish(out).unwrap();
-    let optimized = optimize(&graph).unwrap();
+    let optimized = passes_without_target(&graph).unwrap();
     let [attrs] = attentions(&optimized)[..] else {
         panic!("the production mask fuses to one attention op");
     };
@@ -278,7 +286,7 @@ fn an_out_of_range_live_length_fails_validation_and_the_endpoints_run() {
         ..single_key()
     };
     let built = fixture.build(true);
-    let optimized = optimize(&built.graph).unwrap();
+    let optimized = passes_without_target(&built.graph).unwrap();
     for len in [0, -1, 10] {
         let inputs = fixture.inputs(&built, &[len], false).values();
         for (name, graph) in [
@@ -383,35 +391,53 @@ fn planned_attention(graph: &Graph, target: &Target) -> (AttentionSpec, usize) {
 fn gemma2_softcap_decode_and_mla_select_the_streaming_attention_schedule() {
     // Gemma2: GQA decode with the logit softcap, over the in-graph position mask.
     let (hq, hkv, cap, d) = (4usize, 2usize, 16usize, 32usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
-    let pos = b.slot_ranged(
-        poot_graph_ir::Slot::Pos,
-        TensorType::new(vec![1, 1], poot_tensor::DType::I32),
-        poot_graph_ir::IndexRange::below(cap).unwrap(),
-    );
-    let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
-    let out = attention_masked_softcap(&b, q, k, v, hq / hkv, 0.25, mask, Some(50.0));
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+            poot_graph_ir::IndexRange::below(cap).unwrap(),
+        )
+        .unwrap();
+    let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None).unwrap();
+    let out = attention_masked_softcap(&b, q, k, v, hq / hkv, 0.25, mask, Some(50.0)).unwrap();
     let gemma2 = b.finish(out).unwrap();
 
     // DeepSeek-V2 MLA: per-head `k_nope` (128) and the one shared `k_pe` (64) the tracer broadcasts and
     // concatenates, a 128-wide value.
     let (hq, cap, nope, rope, dv) = (2usize, 16usize, 128usize, 64usize, 128usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, nope + rope]));
-    let k_nope = b.constant("k_nope", TensorType::f32(vec![1, hq, cap, nope]));
-    let k_pe = b.constant("k_pe", TensorType::f32(vec![1, 1, cap, rope]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, dv]));
-    let pos = b.slot_ranged(
-        poot_graph_ir::Slot::Pos,
-        TensorType::new(vec![1, 1], poot_tensor::DType::I32),
-        poot_graph_ir::IndexRange::below(cap).unwrap(),
-    );
-    let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None);
-    let key = b.concat(3, &[k_nope, repeat_kv(&b, k_pe, hq)]);
-    let out = attention_masked_softcap(&b, q, key, v, 1, 0.07, mask, None);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, 1, nope + rope]))
+        .unwrap();
+    let k_nope = b
+        .constant("k_nope", TensorType::f32(vec![1, hq, cap, nope]))
+        .unwrap();
+    let k_pe = b
+        .constant("k_pe", TensorType::f32(vec![1, 1, cap, rope]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, dv]))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+            poot_graph_ir::IndexRange::below(cap).unwrap(),
+        )
+        .unwrap();
+    let mask = poot_graph_ir::ops::causal_mask_from_pos(&b, pos, cap, None).unwrap();
+    let key = b
+        .concat(3, &[k_nope, repeat_kv(&b, k_pe, hq).unwrap()])
+        .unwrap();
+    let out = attention_masked_softcap(&b, q, key, v, 1, 0.07, mask, None).unwrap();
     let mla = b.finish(out).unwrap();
 
     for (name, target) in targets() {
@@ -629,7 +655,7 @@ fn a_narrow_live_graph_plans_its_selects_natively_and_spirv_refuses_them() {
     for dtype in NARROW {
         let built = narrow(single_key(), dtype).build(true);
         assert!(
-            attentions(&optimize(&built.graph).unwrap()).is_empty(),
+            attentions(&passes_without_target(&built.graph).unwrap()).is_empty(),
             "{dtype:?}: the F32 attention kernel must not claim a narrow chain"
         );
         let leaf = match dtype {
@@ -687,17 +713,18 @@ fn a_narrow_live_graph_plans_its_selects_natively_and_spirv_refuses_them() {
 #[test]
 fn a_narrow_capacity_attention_chain_stays_the_decomposition() {
     for dtype in NARROW {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let (hq, cap, d) = (2usize, 6usize, 4usize);
-        let input = |name, shape: Vec<usize>| b.constant(name, TensorType::new(shape, dtype));
+        let input =
+            |name, shape: Vec<usize>| b.constant(name, TensorType::new(shape, dtype)).unwrap();
         let q = input("q", vec![1, hq, 1, d]);
         let k = input("k", vec![1, hq, cap, d]);
         let v = input("v", vec![1, hq, cap, d]);
         let mask = input("mask", vec![1, 1, 1, cap]);
-        let out = attention_masked_softcap(&b, q, k, v, 1, 0.5, mask, None);
+        let out = attention_masked_softcap(&b, q, k, v, 1, 0.5, mask, None).unwrap();
         let graph = b.finish(out).unwrap();
         assert!(
-            attentions(&optimize(&graph).unwrap()).is_empty(),
+            attentions(&passes_without_target(&graph).unwrap()).is_empty(),
             "{dtype:?}: the chain must stay generic"
         );
     }

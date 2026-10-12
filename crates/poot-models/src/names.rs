@@ -335,7 +335,7 @@ pub(crate) fn hf_base_shapes(
     config: &serde_json::Value,
     qkv_bias: bool,
 ) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, h, inter) = (n("vocab_size"), n("hidden_size"), n("intermediate_size"));
     let heads = n("num_attention_heads");
     let d = config["head_dim"]
@@ -437,20 +437,6 @@ fn check_head(
         });
     }
     Ok(weights)
-}
-
-/// The weight map of a `layers`-layer model whose checkpoint `tables` describe (later tables
-/// override earlier ones by role): every model-level row once and every per-layer row at each layer,
-/// each read as one stored entry. A required row whose tensor is absent is
-/// [`WeightMapError::Missing`], naming its preferred key; a tied row that is absent reads its
-/// model-level role's entry.
-#[cfg(test)]
-pub(crate) fn build_weight_map(
-    store: &WeightStore,
-    tables: &[&[NameRow]],
-    layers: usize,
-) -> Result<WeightMap, WeightMapError> {
-    build_map(store, tables, layers, FusedDims::NONE, None)
 }
 
 /// Where the routed layers of a model keep their weights.
@@ -698,6 +684,7 @@ mod tests {
     use poot_quant::{PackedPayload, PackedWeight, SourceRole};
     use poot_tensor::DType;
 
+    use super::test_only::build_weight_map;
     use super::*;
 
     fn dense(shape: &[usize]) -> WeightEntry {
@@ -898,5 +885,23 @@ mod tests {
                 key: "model.layers.0.self_attn.qkv_proj.weight".into(),
             })
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    /// The weight map of a `layers`-layer model whose checkpoint `tables` describe (later tables
+    /// override earlier ones by role): every model-level row once and every per-layer row at each layer,
+    /// each read as one stored entry. A required row whose tensor is absent is
+    /// [`WeightMapError::Missing`], naming its preferred key; a tied row that is absent reads its
+    /// model-level role's entry.
+    pub(crate) fn build_weight_map(
+        store: &WeightStore,
+        tables: &[&[NameRow]],
+        layers: usize,
+    ) -> Result<WeightMap, WeightMapError> {
+        build_map(store, tables, layers, FusedDims::NONE, None)
     }
 }

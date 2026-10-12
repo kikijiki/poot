@@ -8,7 +8,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::Glu;
@@ -28,8 +27,9 @@ use crate::names::{
     ExpertNames, HF_BASE, HF_SINK_ATTENTION, MoeLayers, MoeNames, family_weights_routed,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("gpt_oss");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("gpt_oss");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -114,7 +114,7 @@ const GGUF_MOE: MoeNames = MoeNames {
 
 /// gpt-oss's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct GptOssConfig {
+pub(crate) struct GptOssConfig {
     vocab: usize,
     width: usize,
     layers: usize,
@@ -133,7 +133,7 @@ pub struct GptOssConfig {
 }
 
 impl GptOssConfig {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
         // Every gpt-oss projection has a bias; a config that says otherwise describes another model.
@@ -229,7 +229,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct GptOss {
+pub(crate) struct GptOss {
     params: GptOssConfig,
     weights: WeightMap,
     stack: StackWeights,
@@ -297,12 +297,11 @@ impl Model for GptOss {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             let attn = if p.layer_is_sliding[l] {
@@ -318,7 +317,7 @@ impl Model for GptOss {
                 |b, h| attention(b, &step, l, h, &layer.attn, attn),
                 |b, BlockInput { block: h, .. }| moe::moe(b, &step, l, h, None, &layer.moe, &p.moe),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -353,7 +352,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 fn fixture() -> Fixture {
     let config = fixture_config();
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (h, d, inter, experts) = (
         n("hidden_size"),
         n("head_dim"),
@@ -464,7 +463,7 @@ mod family_tests {
     /// transposed copy of every projection, and over the selected experts only. Returns the
     /// logits of every position.
     fn reference(config: &serde_json::Value, store: &WeightStore, tokens: &[usize]) -> Vec<f64> {
-        let n = |f: &str| config[f].as_u64().unwrap() as usize;
+        let n = |f: &str| crate::registry::Fixture::count(config, f);
         let (h, d, hq, hkv) = (
             n("hidden_size"),
             n("head_dim"),
@@ -845,7 +844,7 @@ mod family_tests {
     /// holding the same logical values (the Q8_0 case derives them from the decoded payloads).
     fn gguf_case(q8_experts: bool) -> (GgufIndex, WeightStore, WeightStore) {
         let fx = fixture();
-        let n = |f: &str| fx.config[f].as_u64().unwrap() as usize;
+        let n = |f: &str| crate::registry::Fixture::count(&fx.config, f);
         let (h, inter, e) = (
             n("hidden_size"),
             n("intermediate_size"),
@@ -902,7 +901,7 @@ mod family_tests {
                         (2, &mut down, h, inter),
                     ] {
                         let seed = (1000 * l + ex * 3 + slot) as u64;
-                        let payload = Arc::new(poot_test_util::packed::random_payload(
+                        let payload = Arc::new(poot_quant::test_support::packed::random_payload(
                             WeightFormat::Q8_0,
                             [rows, kk],
                             seed,
@@ -1060,11 +1059,19 @@ mod family_tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(1, 2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(1, 2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }

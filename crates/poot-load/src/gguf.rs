@@ -9,7 +9,10 @@
 
 mod format;
 
-pub use format::*;
+pub(crate) use format::gerr;
+#[cfg(any(test, feature = "test-support"))]
+pub use format::write_gguf;
+pub use format::{GgufIndex, GgufTensorInfo, GgufValue, weight_format_of};
 
 use poot_tensor::DType;
 use std::num::NonZeroUsize;
@@ -21,7 +24,6 @@ use poot_quant::{PackedWeight, SourceRole, StoredBytes};
 
 use crate::LoadError;
 use crate::plan::{Container, JobKind, LoadPlan, TensorJob, build_store};
-use format::gerr;
 
 /// Which GGUF tensor names a family's tracer reads, and the [`WeightKey`] to store each one under
 /// in the [`WeightStore`] [`read_gguf`] builds. The reader itself names no family (ADR-0103

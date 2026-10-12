@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::{Builder, Graph, TensorType};
-use poot_models::chat::ChatFormat;
 use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
     Phase, StepShape, TraceError,
@@ -18,6 +17,7 @@ use poot_quant::weights::{
     DenseWeight, WeightEntry, WeightId, WeightMap, WeightRole, WeightStore, WeightView,
 };
 use poot_tensor::DType;
+use poot_text::ChatFormat;
 
 const FAKE: FamilyKey = FamilyKey::new("fake-lm");
 
@@ -38,13 +38,17 @@ impl Model for FakeLm {
         &self.weights
     }
 
-    fn trace(&self, _phase: Phase, _shape: StepShape) -> Result<Graph, TraceError> {
-        let b = Builder::new();
+    fn trace_into(
+        &self,
+        _phase: Phase,
+        _shape: StepShape,
+        b: Builder,
+    ) -> Result<Graph, TraceError> {
         let embed = b.constant(
             &WeightId::model(WeightRole::Embed).const_name(),
             TensorType::f32(vec![self.config.vocab, self.width]),
-        );
-        Ok(b.finish(embed).unwrap())
+        )?;
+        Ok(b.finish(embed)?)
     }
 }
 
@@ -163,7 +167,13 @@ fn an_externally_registered_family_resolves_by_model_type_and_builds() {
     let embed = WeightId::model(WeightRole::Embed);
     assert_eq!(model.weights().handle(embed).unwrap().shape, vec![3, 2]);
 
-    let graph = model.trace(Phase::Decode, decode_shape()).unwrap();
+    let graph = model
+        .trace(
+            Phase::Decode,
+            decode_shape(),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     let names: Vec<&str> = graph
         .consts()
         .iter()

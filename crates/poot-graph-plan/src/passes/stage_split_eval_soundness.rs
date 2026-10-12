@@ -23,20 +23,22 @@ use poot_tensor::HostTensor;
 /// non-constant and the blocks mix `Mul` and `Add`, so a boundary bound to the wrong tensor, to a
 /// zero, or to another block's state changes the result instead of cancelling.
 fn layered_graph(layers: usize) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
-    let w = b.constant("w", TensorType::f32(vec![4]));
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+    let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
     let mut hidden = x;
     let mut state = Vec::new();
     for layer in 0..layers {
-        let scaled = b.binary(BinOp::Mul, hidden, w);
-        let k_in = b.state_input(
-            &format!("k{layer}"),
-            TensorType::f32(vec![4]),
-            StateRole::Recurrent,
-        );
-        let k_out = b.binary(BinOp::Add, k_in, scaled);
-        let next = b.binary(BinOp::Add, scaled, k_out);
+        let scaled = b.binary(BinOp::Mul, hidden, w).unwrap();
+        let k_in = b
+            .state_input(
+                &format!("k{layer}"),
+                TensorType::f32(vec![4]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let k_out = b.binary(BinOp::Add, k_in, scaled).unwrap();
+        let next = b.binary(BinOp::Add, scaled, k_out).unwrap();
         state.push((k_in, k_out));
         hidden = next;
     }
@@ -97,7 +99,7 @@ fn adr0099_s2_split_then_chain_matches_the_unsplit_graph() {
         .expect("the unsplit graph's output is dense");
 
     for (cuts, expected_boundaries) in [(vec![3usize], 1usize), (vec![3usize, 6], 2usize)] {
-        let split = crate::test_support::split_before(&graph, &cuts).expect("the graph splits");
+        let split = crate::unit_helpers::split_before(&graph, &cuts).expect("the graph splits");
         assert_eq!(split.stages.len(), cuts.len() + 1);
         assert_eq!(
             split.boundaries.len(),
@@ -105,7 +107,7 @@ fn adr0099_s2_split_then_chain_matches_the_unsplit_graph() {
             "the fixture must actually cross the cut, or this row proves nothing"
         );
 
-        let chained = crate::test_support::chain(
+        let chained = poot_eval::test_support::stage_chain::chain(
             &graph,
             &split.stages.iter().map(|s| &s.graph).collect::<Vec<_>>(),
             &inputs,

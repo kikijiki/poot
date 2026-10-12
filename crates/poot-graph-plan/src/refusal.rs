@@ -2,12 +2,16 @@
 //! target and the missing capability. It is never free text, so a caller matches on it instead of
 //! restating the planner's gaps.
 
+use crate::predicates::GraphTables;
 use std::fmt;
 
 use poot_kernelgen::BodyLimits;
 use poot_target::TargetId;
 
-use crate::*;
+use crate::{CollectiveKind, PlanError};
+use poot_graph_ir::op::{FusedOp, OpKind};
+use poot_graph_ir::{Eqn, Operand, ValueId};
+use poot_tensor::DType;
 
 /// One equation the planner cannot lower for one target.
 ///

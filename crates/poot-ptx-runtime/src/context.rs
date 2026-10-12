@@ -1,3 +1,4 @@
+use poot_target::BufferStorage;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CString, c_void};
@@ -10,7 +11,7 @@ use poot_target::ElementKind;
 
 use super::buffer::{PtxBuffer, allocate_owned, checked_copy};
 use super::driver::{CudaDriver, DriverCleanup};
-use super::error::{BufferStorage, PtxError};
+use super::error::PtxError;
 use super::graph::{
     CaptureRetention, ModuleConstruction, PtxEvent, PtxGraphExec, PtxSpan, PtxSyncEvent,
     create_event_pair, instantiate_graph,
@@ -50,7 +51,7 @@ unsafe impl Send for PtxContext {}
 
 /// `POOT_REQUIRE_PTX=1` turns the "no PTX device -> tests skip cleanly" convention into a loud failure:
 /// a failed context open panics instead of returning the Err the skip guards convert into a silent pass
-/// (`just test-device-ptx` sets it). Mirrors `poot-runtime::require_gpu_check`.
+/// (`just test-device-ptx` sets it). Mirrors `poot-wgpu-runtime::require_gpu_check`.
 fn require_gpu_check<E: std::fmt::Display>(e: E) -> E {
     require_gpu_check_with(|name| std::env::var(name).ok(), e)
 }
@@ -206,20 +207,6 @@ impl PtxContext {
         })
     }
 
-    /// Make this context current on the calling thread. Current-context state is per-thread: `PtxContext::new` sets
-    /// it on the constructing thread, but a launch from any other thread needs its own `cuCtxSetCurrent`, or
-    /// every driver call fails with `CUDA_ERROR_INVALID_CONTEXT`. Call once at the top of a thread that a
-    /// `PtxContext` (or a `PtxGraphExec`/`Engine<PtxDevice>` built on one) was moved into.
-    ///
-    /// `#[cfg(test)]` (card 549): no production caller moves a `PtxContext` across
-    /// threads today, so this stays test-only until one does; see the crate doc's Threading section.
-    #[cfg(test)]
-    pub(crate) fn make_current(&self) -> Result<(), PtxError> {
-        // SAFETY: `owner.ctx` is the primary context this context retained; it stays alive while `owner` does.
-        unsafe { result::ctx::set_current(self.owner.ctx) }?;
-        Ok(())
-    }
-
     /// Live/peak bytes and allocation count by role (Card 547a): the one memory service's view of
     /// this context.
     pub fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {
@@ -274,25 +261,12 @@ impl PtxContext {
         )
     }
 
-    /// Upload raw bf16 bytes unchanged: the native-checkpoint counterpart of the host-f32 bf16 rounding
-    /// path, so `Tensor::bf16`
-    /// bytes are not widened to f32 and narrowed again. `bytes` are little-endian, two per element, and
-    /// `elem_count` is the logical element count, not the byte length.
-    pub fn upload_bf16_bytes(&self, bytes: &[u8]) -> Result<PtxBuffer, PtxError> {
-        self.refuse_during_capture("upload_bf16_bytes")?;
-        self.upload_raw(
-            "upload_bf16_bytes",
-            bytes,
-            BufferStorage::bf16(),
-            BufferRole::Weight,
-        )
-    }
-
     /// Upload raw f16 (IEEE-754 half) bytes unchanged: a straight H2D copy, not a host-f32-to-bf16 rounding
-    /// re-encode like [`Self::upload_bf16_bytes`]'s bf16 twin used to be. Spec 135 Phase 2 residency
+    /// re-encode. Spec 135 Phase 2 residency
     /// (FR-008): the caller passes the checkpoint's little-endian bytes (`poot_eval::Tensor::f16`).
     /// `bytes.len()` must be a whole number of 2-byte elements; the returned buffer's `elem_count` is the
     /// element count, not the byte length.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn upload_f16(&self, bytes: &[u8]) -> Result<PtxBuffer, PtxError> {
         self.refuse_during_capture("upload_f16")?;
         self.upload_raw(
@@ -304,6 +278,7 @@ impl PtxContext {
     }
 
     /// Upload little-endian `bytes` as whole `element`s.
+    #[cfg(any(test, feature = "test-support"))]
     fn upload_raw(
         &self,
         op: &'static str,
@@ -392,12 +367,6 @@ impl PtxContext {
     pub fn vram_free_bytes(&self) -> Option<u64> {
         let (free, _) = self.mem_info().ok()?;
         Some(free as u64)
-    }
-
-    /// Total device memory visible to this context (bytes), from `cuMemGetInfo`. `None` if the driver call fails.
-    pub fn vram_budget_bytes(&self) -> Option<u64> {
-        let (_, total) = self.mem_info().ok()?;
-        Some(total as u64)
     }
 
     /// The device-capability descriptor the planner reads (card 522), measured once at context
@@ -723,7 +692,7 @@ impl PtxContext {
 
     /// A zero-filled device buffer holding `elems` native elements of `storage`, charged to `role`
     /// (Card 547a: the storage-typed, role-typed allocation the executor contract's memory service
-    /// needs, instead of one allocator per dtype; mirrors `poot_runtime::Context::alloc_storage`).
+    /// needs, instead of one allocator per dtype; mirrors `poot_wgpu_runtime::Context::alloc_storage`).
     pub fn alloc_storage(
         &self,
         role: BufferRole,
@@ -735,7 +704,7 @@ impl PtxContext {
     }
 
     /// Overwrite `len` bytes of `buf` from byte `offset`, dtype-agnostic (Card 547a: mirrors
-    /// `poot_runtime::Context::write_with`). `fill(range, out)` gets consecutive destination ranges
+    /// `poot_wgpu_runtime::Context::write_with`). `fill(range, out)` gets consecutive destination ranges
     /// covering `offset..offset + len` (at most [`crate::UPLOAD_CHUNK_BYTES`] each) and writes every byte of `out`,
     /// a pinned slot of the upload ring that is copied to the device asynchronously on this context's
     /// stream while the next is filled. The copies may still be running on return: the stream orders every
@@ -765,7 +734,7 @@ impl PtxContext {
     }
 
     /// Read the first `out.len()` bytes of `buf`, dtype-agnostic (Card 547a: mirrors
-    /// `poot_runtime::Context::read_bytes`). Syncs the stream first so pending writes have completed.
+    /// `poot_wgpu_runtime::Context::read_bytes`). Syncs the stream first so pending writes have completed.
     pub fn read_bytes(&self, buf: &PtxBuffer, out: &mut [u8]) -> Result<(), PtxError> {
         self.refuse_during_capture("read_bytes")?;
         let _range = crate::buffer::checked_byte_range("read_bytes", buf, 0, out.len())?;
@@ -785,6 +754,7 @@ impl PtxContext {
     /// Read a device buffer back to host i32. The bytes are unchanged, so callers may also use this for
     /// u32 kernel buffers when they need the corresponding bit pattern (for example, the global CAS
     /// counter probe). Syncs the compute stream before the copy, matching [`Self::download_f32`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn download_i32(&self, b: &PtxBuffer) -> Result<Vec<i32>, PtxError> {
         self.refuse_during_capture("download_i32")?;
         self.download_elements("download_i32", b, BufferStorage::i32())
@@ -805,7 +775,7 @@ impl PtxContext {
         &self,
         // Card 626: unused now that the legacy label-keyed Profiler is gone (its only reader); this
         // crate's `function` cache keys on the PTX text hash + entry name instead. Kept for call-site
-        // symmetry with `poot_runtime::Context::dispatch_dev`, which still uses its own `label` as a
+        // symmetry with `poot_wgpu_runtime::Context::dispatch_dev`, which still uses its own `label` as a
         // pipeline-cache key.
         _label: &str,
         kernel: &CompiledKernel,
@@ -1004,5 +974,25 @@ mod caps_tests {
             caps_from_attributes(1, &sentinel(7)).tensor_core,
             TensorCoreSupport::None
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl PtxContext {
+        /// Make this context current on the calling thread. Current-context state is per-thread: `PtxContext::new` sets
+        /// it on the constructing thread, but a launch from any other thread needs its own `cuCtxSetCurrent`, or
+        /// every driver call fails with `CUDA_ERROR_INVALID_CONTEXT`. Call once at the top of a thread that a
+        /// `PtxContext` (or a `PtxGraphExec`/`Engine<PtxDevice>` built on one) was moved into.
+        ///
+        /// `#[cfg(test)]` (card 549): no production caller moves a `PtxContext` across
+        /// threads today, so this stays test-only until one does; see the crate doc's Threading section.
+        pub(crate) fn make_current(&self) -> Result<(), PtxError> {
+            // SAFETY: `owner.ctx` is the primary context this context retained; it stays alive while `owner` does.
+            unsafe { result::ctx::set_current(self.owner.ctx) }?;
+            Ok(())
+        }
     }
 }

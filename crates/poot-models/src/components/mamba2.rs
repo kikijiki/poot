@@ -21,6 +21,7 @@ use super::linear::{Weight, WeightError, linear};
 use super::norm::{NormParams, norm};
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
+use crate::model::TraceError;
 
 /// The chunk length of the SSD scan's reference decomposition (a power of two): a sequence of at most this
 /// many positions is one [`ops::mamba2_ssd_prefill`] call, a longer one is cut into chunks that each continue
@@ -146,15 +147,15 @@ pub fn mamba2(
     x: Traced,
     w: &Mamba2Weights,
     p: &Mamba2Params,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t) = (shape.rows.get(), shape.tokens.get());
     let (h, hd, n, g) = (p.heads, p.head_dim, p.state, p.groups);
     let inner = p.inner();
 
-    let z = linear(b, x, &w.z, None);
-    let xbc = linear(b, x, &w.xbc, None);
-    let dt = linear(b, x, &w.dt, Some(&w.dt_bias));
+    let z = linear(b, x, &w.z, None)?;
+    let xbc = linear(b, x, &w.xbc, None)?;
+    let dt = linear(b, x, &w.dt, Some(&w.dt_bias))?;
 
     let conv = causal_conv(
         b,
@@ -163,39 +164,40 @@ pub fn mamba2(
         xbc,
         &w.conv,
         &p.conv,
-    );
-    let xbc = ops::silu(b, conv);
-    let x_part = b.slice(xbc, 2, 0, inner);
-    let b_part = b.slice(xbc, 2, inner, inner + g * n);
-    let c_part = b.slice(xbc, 2, inner + g * n, inner + 2 * g * n);
+    )?;
+    let xbc = ops::silu(b, conv)?;
+    let x_part = b.slice(xbc, 2, 0, inner)?;
+    let b_part = b.slice(xbc, 2, inner, inner + g * n)?;
+    let c_part = b.slice(xbc, 2, inner + g * n, inner + 2 * g * n)?;
 
     // `[rows, tokens, heads * d]` to head-major `[rows, heads, tokens, d]`.
     let head_major = |y: Traced, heads: usize, d: usize| {
-        b.transpose(b.reshape(y, vec![rows, t, heads, d]), vec![0, 2, 1, 3])
+        Ok::<_, TraceError>(b.transpose(b.reshape(y, vec![rows, t, heads, d])?, vec![0, 2, 1, 3])?)
     };
-    let x_heads = head_major(x_part, h, hd);
+    let x_heads = head_major(x_part, h, hd)?;
     // Each group's `B` and `C` serve `heads / groups` consecutive heads (`repeat_interleave`).
-    let b_heads = ops::repeat_kv(b, head_major(b_part, g, n), h / g);
-    let c_heads = ops::repeat_kv(b, head_major(c_part, g, n), h / g);
-    let delta = ops::softplus(b, head_major(dt, h, 1));
+    let b_heads = ops::repeat_kv(b, head_major(b_part, g, n)?, h / g)?;
+    let c_heads = ops::repeat_kv(b, head_major(c_part, g, n)?, h / g)?;
+    let delta = ops::softplus(b, head_major(dt, h, 1)?)?;
 
     // The rows fold into the head axis: `[1, rows * heads, ..]`, the per-head scalars tiled per row.
     let fold = |y: Traced| {
-        let mut shape = b.aval(y).shape;
+        let mut shape = b.aval(y)?.shape;
         shape.splice(0..2, [1, rows * h]);
-        b.reshape(y, shape)
+        Ok::<_, TraceError>(b.reshape(y, shape)?)
     };
     let per_head = |weight: &Weight, negate_exp: bool| {
-        let v = weight.declare_f32(b);
+        let v = weight.declare_f32(b)?;
         let v = if negate_exp {
-            b.unary(UnOp::Neg, b.unary(UnOp::Exp, v)) // A = -exp(A_log)
+            b.unary(UnOp::Neg, b.unary(UnOp::Exp, v)?)? // A = -exp(A_log)
         } else {
             v
         };
-        let tiled = b.broadcast(b.reshape(v, vec![1, h, 1, 1]), vec![rows, h, 1, 1]);
-        b.reshape(tiled, vec![1, rows * h, 1, 1])
+        let tiled = b.broadcast(b.reshape(v, vec![1, h, 1, 1])?, vec![rows, h, 1, 1])?;
+        Ok::<_, TraceError>(b.reshape(tiled, vec![1, rows * h, 1, 1])?)
     };
-    let state = step.recurrent_state(b, &format!("mamba2.l{layer}.ssm"), DType::F32, &[h, n, hd]);
+    let state =
+        step.recurrent_state(b, &format!("mamba2.l{layer}.ssm"), DType::F32, &[h, n, hd])?;
     let ScanResult {
         y,
         s_out: state_out,
@@ -206,21 +208,21 @@ pub fn mamba2(
             chunk: SSD_CHUNK,
         },
         &[
-            fold(x_heads),
-            fold(b_heads),
-            fold(c_heads),
-            fold(delta),
-            per_head(&w.a_log, true),
-            per_head(&w.d, false),
-            fold(state.current()),
+            fold(x_heads)?,
+            fold(b_heads)?,
+            fold(c_heads)?,
+            fold(delta)?,
+            per_head(&w.a_log, true)?,
+            per_head(&w.d, false)?,
+            fold(state.current())?,
         ],
-    );
-    step.carry_recurrent(b, state, b.reshape(state_out, vec![rows, h, n, hd]));
+    )?;
+    step.carry_recurrent(b, state, b.reshape(state_out, vec![rows, h, n, hd])?)?;
 
-    let y = b.reshape(y, vec![rows, h, t, hd]);
-    let y = b.reshape(b.transpose(y, vec![0, 2, 1, 3]), vec![rows, t, inner]);
-    let gated = b.binary(BinOp::Mul, y, ops::silu(b, z));
-    linear(b, norm(b, gated, &w.gate_norm, p.norm), &w.out, None)
+    let y = b.reshape(y, vec![rows, h, t, hd])?;
+    let y = b.reshape(b.transpose(y, vec![0, 2, 1, 3])?, vec![rows, t, inner])?;
+    let gated = b.binary(BinOp::Mul, y, ops::silu(b, z)?)?;
+    linear(b, norm(b, gated, &w.gate_norm, p.norm)?, &w.out, None)
 }
 
 #[cfg(test)]
@@ -286,10 +288,12 @@ mod tests {
         let p = params();
         let w = Mamba2Weights::new(&fx.map(), 0, WIDTH, &p).unwrap();
         let tokens = x.len() / WIDTH;
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All));
-        let xs = b.constant("x", poot_graph_ir::TensorType::f32(vec![1, tokens, WIDTH]));
-        let y = mamba2(&b, &step, 0, xs, &w, &p);
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All)).unwrap();
+        let xs = b
+            .constant("x", poot_graph_ir::TensorType::f32(vec![1, tokens, WIDTH]))
+            .unwrap();
+        let y = mamba2(&b, &step, 0, xs, &w, &p).unwrap();
         let g = step.finish(b, y).unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()

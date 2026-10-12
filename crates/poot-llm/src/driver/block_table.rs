@@ -286,12 +286,6 @@ impl PagedKvCache {
         self.pool.available()
     }
 
-    /// Tokens currently held by slot `s`.
-    #[cfg(test)]
-    pub(crate) fn seq_len(&self, s: usize) -> usize {
-        self.tables[s].len()
-    }
-
     /// Grow slot `s`'s sequence by `n` tokens, drawing blocks from the shared pool as boundaries are
     /// crossed. All-or-nothing: on pool exhaustion the slot is unchanged and the caller can evict + retry.
     pub fn append(&mut self, s: usize, n: usize) -> Result<(), PoolExhausted> {
@@ -605,5 +599,12 @@ mod tests {
             .admit_prefix_for(0, &p, 4, PrefixIdentity::BASE)
             .expect("admission succeeds after eviction");
         assert_eq!(skip, 0, "the evicted prefixes are gone; this admit is cold");
+    }
+
+    impl PagedKvCache {
+        /// Tokens currently held by slot `s`.
+        pub(crate) fn seq_len(&self, s: usize) -> usize {
+            self.tables[s].len()
+        }
     }
 }

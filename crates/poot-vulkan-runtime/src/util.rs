@@ -1,4 +1,5 @@
-use crate::*;
+use crate::RuntimeError;
+use ash::vk;
 
 /// The launch grid of `threads` / `wg` per axis, validated against the device's per-axis
 /// `maxComputeWorkGroupCount`, or [`RuntimeError::GridCap`] with the requested grid and the X cap.

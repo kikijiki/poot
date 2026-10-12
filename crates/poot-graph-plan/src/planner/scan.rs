@@ -11,7 +11,9 @@
 //! launch leaves the device under-filled, each column's rows shared between `split` lanes so the per-token
 //! serial chain is `rows / split` rows long. The rule reads the layout and the device's limits, nothing else.
 
-use super::*;
+use super::{BodyLimits, Capability, Eqn, KernelRequest, OpKind, PlanError, Planned, value_ids};
+use crate::planner::GraphTables;
+use crate::refusal::Site;
 use poot_graph_ir::{ScanFamily, ScanLayout};
 use poot_kernelgen::{ScanKernel, ScanPhase, ScanSpec};
 use poot_target::{Backend, DeviceCaps, Queried};

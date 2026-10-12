@@ -21,18 +21,20 @@ poot-kernel-ir = { workspace = true, features = ["serde"] }
 poot-codegen.workspace = true
 serde_json.workspace = true
 
-# poot-runtime dispatches pootc's emitted .spv in the import-and-run tests. The macro test builds
+# poot-wgpu-runtime dispatches pootc's emitted .spv in the import-and-run tests. The macro test builds
 # poot-kernel-attr itself (see tests/macro_kernel.rs), so it is not a dependency here.
 [dev-dependencies]
-poot-runtime.workspace = true
+poot-kernel-ir = { workspace = true, features = ["test-support"] }
+poot-wgpu-runtime = { workspace = true, features = ["test-support"] }
 # Card 559: `committed_assets_match_their_kernel_sources` iterates `poot_graph_plan::MANIFEST`, the one
 # kernel-asset manifest, instead of a hand-kept list duplicated here.
-poot-graph-plan.workspace = true
+poot-graph-plan = { workspace = true, features = ["test-support"] }
 # The equivalence test compiles a kernelgen Body to SPIR-V and compares its GPU output to an imported kernel.
 poot-kernelgen.workspace = true
-poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+poot-runtime-common.workspace = true
+poot-test-util.workspace = true
 # SC-002 (card 531c): dispatches pootc's emitted .ptx to prove a real Assert traps on PTX, same as
-# poot-runtime does for SpirvVulkan above.
+# poot-wgpu-runtime does for SpirvVulkan above.
 poot-ptx-runtime.workspace = true
 
 [package.metadata.rust-analyzer]

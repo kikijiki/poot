@@ -1,0 +1,56 @@
+[package]
+name = "poot-wgpu-device"
+description = "wgpu/Vulkan device backend: the poot-executor Device implementation that compiles kernel bodies for the SPIR-V target"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# ADR-0113: `WgpuDevice::has_device_timestamps`, the adapter probe the device-timing rows (here and in
+# poot-llm) skip on; no production caller. Enabled only from `[dev-dependencies]` edges.
+test-support = ["poot-wgpu-runtime/test-support"]
+
+[dependencies]
+poot-target.workspace = true
+poot-graph-plan.workspace = true
+poot-wgpu-runtime.workspace = true
+poot-runtime-common.workspace = true
+poot-executor.workspace = true
+
+[dev-dependencies]
+# This crate's own `tests/*.rs` integration binaries read the gated adapter probe.
+poot-wgpu-device = { path = ".", features = ["test-support"] }
+# The performance-bank example loads a checkpoint through the loader and hashes its plan with
+# `sha256_digest` (ADR-0113).
+poot-load = { workspace = true, features = ["test-support"] }
+bytemuck.workspace = true
+serde_json.workspace = true
+poot-executor-parity.workspace = true
+poot-test-util.workspace = true
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+# Card 671: this crate's own `tests/graph/*.rs` call
+# `is_decode_gemv`/`is_tiled_gemm`/`reassociation_class`/`per_eqn_plans_outside_compile` directly; those are
+# gated behind `test-support` in poot-graph-plan now.
+poot-graph-plan = { workspace = true, features = ["test-support"] }
+criterion.workspace = true
+# Tests build kernelgen's kernels to assert the imported ones (the on-device argmax) match.
+poot-kernelgen.workspace = true
+poot-tensor = { workspace = true, features = ["read-counter"] }
+poot-eval = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+# src/tests/imported_kernel.rs deserializes a committed offline-imported Body (.kir.json) and compiles
+# it directly against poot-codegen's on-disk kernel cache; tests/buffer_plan.rs compiles its length
+# probe the same way.
+poot-kernel-ir = { workspace = true, features = ["serde", "test-support"] }
+poot-codegen.workspace = true
+
+[[bench]]
+name = "op_dispatch"
+harness = false
+
+[lints]
+workspace = true

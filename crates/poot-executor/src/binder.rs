@@ -141,7 +141,7 @@ pub(crate) struct ConstBytes {
 impl ConstBytes {
     /// The length of the stored stream (a [`WeightWriter`]'s source), from the spans alone: a planning pass
     /// sizes an upload without reading the store.
-    pub fn stored_len(&self) -> usize {
+    pub(crate) fn stored_len(&self) -> usize {
         match self.stored {
             // Every expert's run is padded to the slab stride.
             StoredAs::PackedStackSource { slab_bytes } => self.spans.len() * slab_bytes,
@@ -202,13 +202,13 @@ pub(crate) struct WeightWriter {
 
 impl WeightWriter {
     /// The bytes the device is handed (the encoded length; what the lane holds past it is its zeros).
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         crate::lanes::encoded_len(self.encoding, &self.shape, self.data_len)
     }
 
     /// A packed-F16 weight holding an infinity or NaN is refused before any byte is written: the
     /// generated bodies decode the packed binary16 lane over its finite domain only (Card 1007).
-    pub fn check_encodable(&self) -> Result<(), EncodeError> {
+    pub(crate) fn check_encodable(&self) -> Result<(), EncodeError> {
         if self.encoding != Encoding::PackedWordsFiniteF16 {
             return Ok(());
         }
@@ -227,7 +227,7 @@ impl WeightWriter {
 
     /// Encoded bytes `range` into `out` (`out.len() == range.len()`): any sub-range, since every encoding
     /// is element- or row-local. Writes every byte of `out`.
-    pub fn fill(&self, range: Range<usize>, out: &mut [u8]) {
+    pub(crate) fn fill(&self, range: Range<usize>, out: &mut [u8]) {
         crate::lanes::encode_range(
             self.encoding,
             &self.shape,
@@ -371,7 +371,7 @@ pub(crate) struct EmbedRows {
 
 impl EmbedRows {
     /// The table's row width: a slot of `n` elements holds `n / width` tokens.
-    pub fn width(&self) -> usize {
+    pub(crate) fn width(&self) -> usize {
         self.width
     }
 }
@@ -385,14 +385,14 @@ pub(crate) struct WeightBinder {
 }
 
 impl WeightBinder {
-    pub fn new(store: Arc<WeightStore>, map: Arc<WeightMap>) -> Self {
+    pub(crate) fn new(store: Arc<WeightStore>, map: Arc<WeightMap>) -> Self {
         let ids = map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
         Self { store, map, ids }
     }
 
     /// The store's mapped checkpoint files are still the files that were loaded (one `fstat` per
     /// file): the boundary before a bind batch reads the store's views.
-    pub fn check_sources(&self) -> Result<(), LoadError> {
+    pub(crate) fn check_sources(&self) -> Result<(), LoadError> {
         Ok(self.store.check_sources()?)
     }
 
@@ -531,7 +531,7 @@ impl WeightBinder {
 
     /// The stored bytes const `name` (input `value`, declared `aval`) binds: a dense const reads its
     /// view's elements as stored, a [`PackedSourceName`] const one source of a packed view.
-    pub fn const_bytes(
+    pub(crate) fn const_bytes(
         &self,
         value: ValueId,
         name: &str,
@@ -711,7 +711,7 @@ impl WeightBinder {
     /// declares ([`poot_graph_ir::Builder::constant_ranged`]): the check that makes the declaration a
     /// fact the graph's consumers may rely on, as [`check_and_encode`] is for a slot. The first word
     /// outside is refused by its row-major index, with the range.
-    pub fn check_range(
+    pub(crate) fn check_range(
         &self,
         name: &str,
         bytes: &ConstBytes,
@@ -767,7 +767,7 @@ impl WeightBinder {
     /// The writer that lands `bytes` (a const of logical `shape`, planned in `storage`) in its device
     /// lane, a byte range at a time. A dense const with no encoding into `storage` is
     /// [`EncodeError::NoEncoding`].
-    pub fn writer(
+    pub(crate) fn writer(
         &self,
         bytes: &ConstBytes,
         shape: &[usize],
@@ -807,7 +807,7 @@ impl WeightBinder {
     /// Where the hosted embed gather named `name` (the `Slot::TokenEmbed` input `value`, declared
     /// `aval`, planned in `storage`) reads its rows: the embed view's `[rows, width]` table. A dense
     /// table's rows encode into `storage` as stored; a packed one's decode to F32 rows.
-    pub fn embed_rows(
+    pub(crate) fn embed_rows(
         &self,
         value: ValueId,
         name: &str,
@@ -864,7 +864,7 @@ impl WeightBinder {
     }
 
     /// The embed rows of `tokens`, in order, encoded into `storage`.
-    pub fn embed(
+    pub(crate) fn embed(
         &self,
         rows: &EmbedRows,
         tokens: &[i32],
@@ -961,7 +961,7 @@ mod tests {
         );
         let experts: Vec<Arc<PackedPayload>> = (0..3)
             .map(|e| {
-                Arc::new(poot_test_util::packed::random_payload(
+                Arc::new(poot_quant::test_support::packed::random_payload(
                     WeightFormat::Q8_0,
                     [3, 32],
                     17 + e,

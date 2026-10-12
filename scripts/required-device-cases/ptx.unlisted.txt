@@ -3,7 +3,9 @@
 # ptx.txt nor here fails scripts/check-required-cases.py (an exhaustive lane). Rows here are
 # not hardware coverage: each is host-only, and `just test` runs it. Sorted in canonical
 # (LC_ALL=C) order; every row must run in the lane or the gate fails.
-poot-ptx-gpu	device::tests::copy_launch_params_dispatches_the_real_elem_count_never_a_byte_capacity_word_count	pure host arithmetic on the launch parameters; opens no device. Runs under `just test` with the package's other host tests
+poot-ptx-device	device::tests::copy_launch_params_dispatches_the_real_elem_count_never_a_byte_capacity_word_count	pure host arithmetic on the launch parameters; opens no device. Runs under `just test` with the package's other host tests
+poot-ptx-device::bin/ptx-check	tests::missing_fixture_is_skipped_not_run	host-only check of the ptx-check binary's fixture handling: needs no device, and runs under `just test`
+poot-ptx-device::bin/ptx-check	tests::staged_fixture_is_run_not_skipped	host-only check of the ptx-check binary's fixture handling: needs no device, and runs under `just test`
 poot-ptx-runtime	context::caps_tests::a_pre_ampere_device_has_no_matrix_hardware_for_poots_kernels	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
 poot-ptx-runtime	context::caps_tests::every_attribute_lands_in_its_own_caps_field	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
 poot-ptx-runtime	tests::allocation_arithmetic_is_checked_before_native_allocation	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`

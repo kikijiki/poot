@@ -16,8 +16,8 @@ use poot_quant::StoredBytes;
 use poot_quant::weights::WeightStore;
 
 use crate::driver::error::{DriverError, LoadError, Unsupported};
-use crate::text::chat::{ChatTemplateOverride, CheckedChatTemplate};
-use crate::text::tokenize::TextCodec;
+use crate::driver::gguf_vocab::gguf_vocab;
+use poot_text::{ChatTemplateOverride, CheckedChatTemplate, TextCodec};
 
 /// How [`ModelHandle::load`] treats the checkpoint's files.
 #[derive(Clone, Debug, Default)]
@@ -253,26 +253,14 @@ impl ModelHandle {
         let store =
             read_gguf(&index, &file, &IdentityNames, default_workers()).map_err(LoadError::from)?;
         Self::build(family, &raw, Arc::new(store), |config| {
-            let text = TextCodec::from_gguf(&index, constraint_eos(config), config.chat)
-                .map_err(|e| LoadError::Text(Box::new(e)))?;
+            let text =
+                TextCodec::from_gguf(&gguf_vocab(&index), constraint_eos(config), config.chat)
+                    .map_err(|e| LoadError::Text(Box::new(e)))?;
             Ok(match template {
                 Some(template) => text.with_chat_template(template),
                 None => text,
             })
         })
-    }
-
-    /// Build the family `raw` names over an in-memory `store` (a test fixture), then its text services
-    /// from the model's own config. An unregistered family is [`Unsupported::Registry`], a checkpoint
-    /// the family cannot take a [`DriverError::Model`].
-    #[cfg(test)]
-    pub(crate) fn from_checkpoint(
-        raw: &RawConfig<'_>,
-        store: WeightStore,
-        registry: &Registry,
-        text: impl FnOnce(&ModelConfig) -> Result<TextCodec, LoadError>,
-    ) -> Result<Self, DriverError> {
-        Self::build(resolve(raw, registry)?, raw, Arc::new(store), text)
     }
 
     /// Build the family `raw` names over a store the caller shares: one section of a multimodal
@@ -325,5 +313,24 @@ impl ModelHandle {
 
     pub(crate) fn shared_store(&self) -> &Arc<WeightStore> {
         &self.store
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl ModelHandle {
+        /// Build the family `raw` names over an in-memory `store` (a test fixture), then its text services
+        /// from the model's own config. An unregistered family is [`Unsupported::Registry`], a checkpoint
+        /// the family cannot take a [`DriverError::Model`].
+        pub(crate) fn from_checkpoint(
+            raw: &RawConfig<'_>,
+            store: WeightStore,
+            registry: &Registry,
+            text: impl FnOnce(&ModelConfig) -> Result<TextCodec, LoadError>,
+        ) -> Result<Self, DriverError> {
+            Self::build(resolve(raw, registry)?, raw, Arc::new(store), text)
+        }
     }
 }

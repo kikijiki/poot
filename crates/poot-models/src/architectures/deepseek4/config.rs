@@ -21,7 +21,7 @@ use crate::registry::RawConfig;
 
 /// One layer's attention, from its `compress_ratios` entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerKind {
+pub(crate) enum LayerKind {
     /// Ratio `0`: the local sliding window only.
     Sliding,
     /// The compressed-sparse-attention ratio: overlapping-window compression of the keys and a
@@ -48,7 +48,7 @@ pub(super) struct AttentionDims {
 
 impl AttentionDims {
     /// The width of one output group: `heads * head_dim / o_groups`.
-    pub fn in_per_group(&self) -> usize {
+    pub(super) fn in_per_group(&self) -> usize {
         self.heads * self.head_dim / self.o_groups
     }
 }
@@ -63,7 +63,7 @@ pub(super) struct IndexerDims {
 
 /// DeepSeek-V4's config.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DeepseekV4Config {
+pub(crate) struct DeepseekV4Config {
     pub(super) vocab: usize,
     pub(super) width: usize,
     pub(super) max_positions: usize,
@@ -89,7 +89,7 @@ pub struct DeepseekV4Config {
 }
 
 impl DeepseekV4Config {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         // The family is HF-only: a GGUF never names it.
         let RawConfig::HfJson { config, .. } = raw else {
             return Err(ModelError::Config {
@@ -278,7 +278,7 @@ fn layer_kinds(
 ) -> Result<Vec<LayerKind>, ModelError> {
     const KEY: &str = "compress_ratios";
     let RawConfig::HfJson { config, .. } = fields.raw() else {
-        unreachable!("from_raw reads only an HF config")
+        return Err(fields.error(KEY, ConfigReason::Unsupported));
     };
     let ratios = config
         .get(KEY)
@@ -324,7 +324,7 @@ fn granule(
         let gcd = gcd(granule, rate);
         granule = (granule / gcd).checked_mul(rate).ok_or_else(overflow)?;
     }
-    Ok(NonZeroUsize::new(granule).expect("a product of nonzero rates"))
+    NonZeroUsize::new(granule).ok_or_else(|| fields.error("compress_rates", ConfigReason::Zero))
 }
 
 fn gcd(a: usize, b: usize) -> usize {

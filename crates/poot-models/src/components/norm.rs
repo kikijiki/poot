@@ -5,6 +5,7 @@ use poot_graph_ir::{BinOp, Builder, Traced, ops};
 use super::linear::Weight;
 use super::standard::ParamError;
 use crate::model::ConfigReason;
+use crate::model::TraceError;
 
 /// Which normalization a layer applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,26 +56,31 @@ pub struct NormWeights {
 }
 
 /// `p`'s normalization of `x` over the last axis, scaled by `w.scale` and shifted by `w.bias`.
-pub fn norm_with(b: &Builder, x: Traced, w: &NormWeights, p: NormParams) -> Traced {
-    let y = norm(b, x, &w.scale, p);
+pub fn norm_with(
+    b: &Builder,
+    x: Traced,
+    w: &NormWeights,
+    p: NormParams,
+) -> Result<Traced, TraceError> {
+    let y = norm(b, x, &w.scale, p)?;
     match &w.bias {
         Some(bias) => {
-            let shape = b.aval(y).shape;
-            b.binary(BinOp::Add, y, b.broadcast(bias.declare_f32(b), shape))
+            let shape = b.aval(y)?.shape;
+            Ok(b.binary(BinOp::Add, y, b.broadcast(bias.declare_f32(b)?, shape)?)?)
         }
-        None => y,
+        None => Ok(y),
     }
 }
 
 /// `p`'s normalization of `x` over the last axis, scaled by `w`.
-pub fn norm(b: &Builder, x: Traced, w: &Weight, p: NormParams) -> Traced {
-    let w = w.declare_f32(b);
+pub fn norm(b: &Builder, x: Traced, w: &Weight, p: NormParams) -> Result<Traced, TraceError> {
+    let w = w.declare_f32(b)?;
     match p.kind {
-        NormKind::Rms => ops::rmsnorm(b, x, w, p.eps),
-        NormKind::Layer => ops::layernorm_no_bias(b, x, w, p.eps),
+        NormKind::Rms => Ok(ops::rmsnorm(b, x, w, p.eps)?),
+        NormKind::Layer => Ok(ops::layernorm_no_bias(b, x, w, p.eps)?),
         NormKind::RmsPlusOne => {
-            let w = b.binary_scalar(BinOp::Add, w, Builder::f32(1.0));
-            ops::rmsnorm(b, x, w, p.eps)
+            let w = b.binary_scalar(BinOp::Add, w, Builder::f32(1.0))?;
+            Ok(ops::rmsnorm(b, x, w, p.eps)?)
         }
     }
 }
@@ -98,9 +104,9 @@ mod tests {
         let eps = 1e-5f32;
         let run = |fx: &Fx| {
             let weight = Weight::new(&fx.map(), id, &[w]).unwrap();
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
-            let y = norm(&b, xs, &weight, NormParams::new(eps).unwrap());
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+            let y = norm(&b, xs, &weight, NormParams::new(eps).unwrap()).unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
@@ -133,9 +139,9 @@ mod tests {
         let eps = 1e-5f32;
         let run = |fx: &Fx, kind| {
             let weight = Weight::new(&fx.map(), id, &[w]).unwrap();
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
-            let y = norm(&b, xs, &weight, NormParams::of(kind, eps).unwrap());
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+            let y = norm(&b, xs, &weight, NormParams::of(kind, eps).unwrap()).unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx, NormKind::Layer);
@@ -174,9 +180,9 @@ mod tests {
         let eps = 1e-5f32;
         let run = |fx: &Fx, kind| {
             let weight = Weight::new(&fx.map(), id, &[w]).unwrap();
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
-            let y = norm(&b, xs, &weight, NormParams::of(kind, eps).unwrap());
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+            let y = norm(&b, xs, &weight, NormParams::of(kind, eps).unwrap()).unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx, NormKind::RmsPlusOne);

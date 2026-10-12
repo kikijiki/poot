@@ -7,6 +7,9 @@
 //! traced input, and the output of every pass, so a pass that grows without reserving is still refused
 //! at its boundary.
 
+use std::num::{NonZeroU64, NonZeroUsize};
+
+use poot_graph_ir::TraceLimits;
 use poot_graph_ir::graph::{Eqn, Graph, ValueId, ValueMeta};
 
 use crate::{CompileLimits, ExpansionError, GraphResource};
@@ -15,22 +18,38 @@ use poot_graph_ir::ValueTable;
 /// The value and equation caps of one compile, as the passes spend them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GraphBudget {
-    max_values: usize,
-    max_eqns: usize,
+    max_values: NonZeroUsize,
+    max_eqns: NonZeroUsize,
+    max_literal_bytes: NonZeroU64,
+    max_owned_bytes: NonZeroU64,
 }
 
 impl GraphBudget {
     pub(crate) fn of(limits: &CompileLimits) -> Self {
         Self {
-            max_values: limits.max_intermediate_values.get(),
-            max_eqns: limits.max_intermediate_eqns.get(),
+            max_values: limits.max_intermediate_values,
+            max_eqns: limits.max_intermediate_eqns,
+            max_literal_bytes: limits.max_graph_literal_bytes,
+            max_owned_bytes: limits.max_graph_owned_bytes,
+        }
+    }
+
+    /// The limits of a tracer builder over a graph this compile reopens. A pass has no step, so the
+    /// token bound (a model trace's) is the smallest nonzero count and is never consulted.
+    pub(crate) fn trace_limits(&self) -> TraceLimits {
+        TraceLimits {
+            max_tokens: NonZeroUsize::MIN,
+            max_values: self.max_values,
+            max_eqns: self.max_eqns,
+            max_literal_bytes: self.max_literal_bytes,
+            max_owned_bytes: self.max_owned_bytes,
         }
     }
 
     fn limit(&self, resource: GraphResource) -> usize {
         match resource {
-            GraphResource::Values => self.max_values,
-            GraphResource::Eqns => self.max_eqns,
+            GraphResource::Values => self.max_values.get(),
+            GraphResource::Eqns => self.max_eqns.get(),
         }
     }
 

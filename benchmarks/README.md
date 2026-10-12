@@ -198,7 +198,7 @@ reports the rest as Unknown. Pass `--prepared-state` to declare the state.
 
 `performance-bank/` is the checked-in small bank: `cases.json` defines each case (shape, storage, numerics,
 token fixture, cache condition, schedules) once, for the validator and for the backend runners
-(`examples/performance_bank.rs` in `poot-gpu`, `poot-rocm-gpu`, `poot-ptx-gpu`). `receipts.json` claims, per
+(`examples/performance_bank.rs` in `poot-wgpu-device`, `poot-rocm-device`, `poot-ptx-device`). `receipts.json` claims, per
 case and backend, a verified baseline receipt or the case as missing/refused with its reason; planned cases
 (packed decode, long recurrence, expert routing) stay explicit missing coverage until their producers land.
 

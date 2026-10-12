@@ -4,7 +4,7 @@
 //! fixture (and its option fixtures) and the phases the fixture traces. A family registered with a
 //! fixture joins the corpus, and so the matrix, with no edit here.
 //!
-//! The `parity` rows are the dense checkpoints `poot-executor-parity` builds, at configurations the
+//! The `parity` rows are the dense checkpoints `poot_models::test_support::dense` builds, at configurations the
 //! registered fixtures do not cover (a bias, a mixed-width bf16 upload, a batched decode).
 #![allow(
     dead_code,
@@ -12,25 +12,25 @@
 )]
 use std::sync::Arc;
 
-use poot_executor_parity::dense::{Dense, Family, step};
-use poot_executor_parity::weight_map::Projections;
 use poot_graph_ir::Graph;
 use poot_models::model::{
     LogitRows, Model, ModelOutput, Phase, ShapeReason, StepShape, TraceError,
 };
 use poot_models::registry::{FamilyEntry, Registry};
+use poot_models::test_support::dense::{Dense, Family, step};
+use poot_models::test_support::weight_map::Projections;
 
 /// Layers in every dense fixture: two is the least that has a first and a later layer (dense then
 /// sparse, local then global) while keeping the expected files small.
 const LAYERS: usize = 2;
 /// Decode KV capacity, and the prefill prompt length and cache capacity.
-pub const CAP: usize = 8;
-pub const PROMPT: usize = 4;
+pub(crate) const CAP: usize = 8;
+pub(crate) const PROMPT: usize = 4;
 const BATCH: usize = 2;
 
 /// One graph of the corpus: the name its summary lines carry, and a builder (graphs are rebuilt per run
 /// so a planner pass cannot leak state from one target to the next).
-pub struct Row {
+pub(crate) struct Row {
     pub name: String,
     build: Box<dyn Fn() -> Graph>,
 }
@@ -43,7 +43,7 @@ impl Row {
         }
     }
 
-    pub fn graph(&self) -> Graph {
+    pub(crate) fn graph(&self) -> Graph {
         (self.build)()
     }
 }
@@ -51,7 +51,7 @@ impl Row {
 /// A step shape a registered fixture is traced at: one sequence of `tokens` new tokens over `capacity`
 /// positions, last-token logits.
 #[derive(Clone, Copy, Debug)]
-pub struct Shape {
+pub(crate) struct Shape {
     pub name: &'static str,
     pub phase: Phase,
     pub tokens: usize,
@@ -84,7 +84,7 @@ const ENCODE: Shape = Shape {
 };
 
 /// A registered family's fixture, built into its model.
-pub struct Fixtured {
+pub(crate) struct Fixtured {
     /// The family key, or `family/variant` for one of the family's option fixtures.
     pub label: String,
     model: Arc<dyn Model>,
@@ -103,7 +103,11 @@ impl Fixtured {
             // An encoder is one forward over the whole input. A family that fixes the token count
             // (a vision tower: one patch per token) states it in its shape refusal.
             ModelOutput::Hidden { .. } | ModelOutput::Scores { .. } => {
-                let tokens = match model.trace(ENCODE.phase, encode_step(ENCODE.tokens)) {
+                let tokens = match model.trace(
+                    ENCODE.phase,
+                    encode_step(ENCODE.tokens),
+                    poot_graph_ir::TraceLimits::for_tests(),
+                ) {
                     Err(TraceError::ShapeUnsupported {
                         reason: ShapeReason::CapacityAboveMax { max },
                         ..
@@ -125,17 +129,18 @@ impl Fixtured {
     }
 
     /// The shapes this fixture is compiled at.
-    pub fn shapes(&self) -> &[Shape] {
+    pub(crate) fn shapes(&self) -> &[Shape] {
         &self.shapes
     }
 
     /// The graph of `shape`. A fixture that cannot trace a shape its own list holds is a broken fixture.
-    pub fn trace(&self, shape: Shape) -> Graph {
+    pub(crate) fn trace(&self, shape: Shape) -> Graph {
         let traced = self
             .model
             .trace(
                 shape.phase,
                 step(1, shape.tokens, shape.capacity, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap_or_else(|e| panic!("{} {}: {e}", self.label, shape.name));
         // The driver path: the model's packed weights (a dense model has none) are bound before compile.
@@ -152,7 +157,7 @@ fn encode_step(tokens: usize) -> StepShape {
 }
 
 /// Every fixture of every family `registry` holds, in registration order.
-pub fn fixtured(registry: &Registry) -> Vec<Fixtured> {
+pub(crate) fn fixtured(registry: &Registry) -> Vec<Fixtured> {
     let mut out = Vec::new();
     for entry in registry.entries() {
         out.push(Fixtured::build(
@@ -259,7 +264,11 @@ fn parity_rows() -> Vec<Row> {
                     make()
                         .f32_model()
                         .model
-                        .trace(phase, step(batch, tokens, cap, LogitRows::Last))
+                        .trace(
+                            phase,
+                            step(batch, tokens, cap, LogitRows::Last),
+                            poot_graph_ir::TraceLimits::for_tests(),
+                        )
                         .unwrap()
                 },
             ));
@@ -273,7 +282,11 @@ fn parity_rows() -> Vec<Row> {
             dense(Family::Qwen2)
                 .build(Projections::Bf16, poot_tensor::DType::F32, None)
                 .model
-                .trace(phase, step(1, tokens, cap, LogitRows::Last))
+                .trace(
+                    phase,
+                    step(1, tokens, cap, LogitRows::Last),
+                    poot_graph_ir::TraceLimits::for_tests(),
+                )
                 .unwrap()
         }));
     }
@@ -281,7 +294,7 @@ fn parity_rows() -> Vec<Row> {
 }
 
 /// The whole corpus: the registered fixtures first, then the dense parity rows.
-pub fn corpus(registry: &Registry) -> Vec<Row> {
+pub(crate) fn corpus(registry: &Registry) -> Vec<Row> {
     let mut rows = registered_rows(registry);
     rows.extend(parity_rows());
     rows

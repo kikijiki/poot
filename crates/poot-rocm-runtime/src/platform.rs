@@ -26,7 +26,7 @@ const RTLD_GLOBAL: i32 = 0x100;
 /// A loaded shared library handle. Closing it on drop invalidates all derived function pointers, so
 /// the runtime owner behind [`RocmContext`](crate::RocmContext) keeps it alive until every resource
 /// using those symbols is gone.
-pub struct LibHandle {
+pub(crate) struct LibHandle {
     handle: *mut c_void,
 }
 
@@ -44,7 +44,7 @@ impl LibHandle {
     ///
     /// Loading a library runs its initializers; `name` must be a library whose initializers are
     /// sound to run in this process.
-    pub unsafe fn open(name: &CStr) -> Result<Self, DlError> {
+    pub(crate) unsafe fn open(name: &CStr) -> Result<Self, DlError> {
         // SAFETY: `name` is NUL-terminated and outlives the call; the caller vouches for the library.
         unsafe {
             let h = c_dlopen(name.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
@@ -61,7 +61,7 @@ impl LibHandle {
     }
 
     /// Resolve `symbol` to a raw function pointer. Returns `None` if the symbol is missing.
-    pub fn sym(&self, symbol: &CStr) -> Option<*mut c_void> {
+    pub(crate) fn sym(&self, symbol: &CStr) -> Option<*mut c_void> {
         // SAFETY: `handle` is a live `dlopen` handle (closed only in `Drop`), and `symbol` is
         // NUL-terminated and outlives the call. Using the returned address is the caller's concern.
         unsafe {
@@ -84,7 +84,7 @@ impl Drop for LibHandle {
 /// Error from `dlopen`. Carries the OS-supplied reason (e.g. "libhsa-runtime64.so.1: cannot
 /// open shared object file: No such file or directory").
 #[derive(Debug)]
-pub struct DlError(pub String);
+pub(crate) struct DlError(pub String);
 
 impl fmt::Display for DlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

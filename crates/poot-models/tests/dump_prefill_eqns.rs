@@ -1,8 +1,8 @@
 //! Throwaway diagnostic (spec 023): print the cse'd prefill graph eqns around the V-bias add (eqn 14) with their
 //! input value-ids and each input's producing eqn/op, to verify the wiring the PTX runtime executes.
-use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::Operand;
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
 
 #[test]
 #[ignore = "diagnostic"]
@@ -16,7 +16,11 @@ fn dump_eqns() {
     let model = dense.model();
     let g0 = model
         .model
-        .trace(Phase::Prefill, step(1, 864, 896, LogitRows::Last))
+        .trace(
+            Phase::Prefill,
+            step(1, 864, 896, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let g = poot_graph_plan::cse(&g0).unwrap();
     let mut producer = std::collections::HashMap::new();

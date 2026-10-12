@@ -84,7 +84,7 @@ pub(crate) fn touches_bf16(graph: &Graph, eqn: &Eqn) -> bool {
         })
 }
 
-/// The Spec 376 equation `eqn` is, if any. Admission, owner preflight, and evaluation all use this one table.
+/// The Spec 376 equation `eqn` is, if any. Admission, preflight, and evaluation all use this one table.
 pub(crate) fn classify<'a>(graph: &Graph, eqn: &'a Eqn) -> Option<Bf16Equation<'a>> {
     if !touches_bf16(graph, eqn) {
         return None;

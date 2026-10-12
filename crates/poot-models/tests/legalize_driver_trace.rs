@@ -11,17 +11,18 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
+use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
 use poot_graph_ir::{Slot, SlotKey, Storage, ValueId};
 use poot_graph_plan::{
-    CompileError, CompileLimits, CompileOptions, LegalizeError, Submission, Target, compile,
+    CompileError, CompileLimits, CompileOptions, LegalizeError, Target, compile,
+    production_plan::Submission,
 };
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
-use poot_test_util::weight_map_oracle::eval_mapped;
 
 const CAPACITY: usize = 8;
 const TOKEN: i32 = 11;
@@ -66,7 +67,13 @@ fn driver_trace() -> Driver {
         hidden: None,
     };
     Driver {
-        graph: model.trace(Phase::Decode, shape).unwrap(),
+        graph: model
+            .trace(
+                Phase::Decode,
+                shape,
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap(),
         store: fixture.store,
         map: model.weights().clone(),
     }

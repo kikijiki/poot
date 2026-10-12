@@ -1,110 +1,13 @@
 use poot_tensor::DType;
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use poot_graph_ir::{BinOp, Builder, Scalar, StateRole, TensorType, UnOp};
-use poot_load::packed_safetensors::{
-    AuthenticatedInventory, AuthenticatedSafetensorsHandleSet, ExactSourceOwner,
-    ExactSourceOwnerCache, InventoryDecision, PackedArtifactManifest, PackedOwnerCache,
-    PackedSafetensorsLimits, PackedShardManifest, TensorDisposition, sha256_digest,
-};
 
 use super::allocation::allocated_bytes;
-use super::helpers;
 use crate::{EvalBudget, EvalOptions, Value, eval};
+use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
-
-static NEXT_EXACT_I32_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
-struct ExactI32TempFixture {
-    path: PathBuf,
-}
-
-impl ExactI32TempFixture {
-    fn new() -> Self {
-        let sequence = NEXT_EXACT_I32_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("poot-exact-i32-{}-{sequence}", std::process::id()));
-        fs::create_dir(&path).unwrap();
-        Self { path }
-    }
-}
-
-impl Drop for ExactI32TempFixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-pub(super) fn authenticated_source_owner(
-    name: &str,
-    dtype: &str,
-    elements: usize,
-    payload: &[u8],
-    disposition: TensorDisposition,
-) -> Arc<ExactSourceOwner> {
-    let fixture = ExactI32TempFixture::new();
-    let config = b"{}";
-    fs::write(fixture.path.join("config.json"), config).unwrap();
-    let byte_len = payload.len();
-    let header = format!(
-        "{{\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{elements}],\"data_offsets\":[0,{byte_len}]}}}}"
-    );
-    let mut shard = Vec::new();
-    shard.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    shard.extend_from_slice(header.as_bytes());
-    shard.extend_from_slice(payload);
-    let shard_name = "model.safetensors";
-    fs::write(fixture.path.join(shard_name), &shard).unwrap();
-    let index = format!(r#"{{"weight_map":{{"{name}":"model.safetensors"}}}}"#);
-    let index = index.as_bytes();
-    fs::write(fixture.path.join("model.safetensors.index.json"), index).unwrap();
-    let manifest = PackedArtifactManifest {
-        repository: "local/exact-i32-fixture".to_string(),
-        revision: "card371".to_string(),
-        config_length: config.len(),
-        config_sha256: sha256_digest(config),
-        index_sha256: sha256_digest(index),
-        shards: vec![PackedShardManifest {
-            filename: shard_name.to_string(),
-            file_length: shard.len(),
-            file_sha256: sha256_digest(&shard),
-            header_length: header.len(),
-            header_sha256: sha256_digest(header.as_bytes()),
-        }],
-    };
-    let limits = PackedSafetensorsLimits {
-        config_bytes: 1024,
-        index_bytes: 1024,
-        header_bytes_per_shard: 1024,
-        shard_count: 1,
-        tensor_entries: 1,
-        selected_source_bytes: byte_len,
-        packed_source_bytes: 1,
-    };
-    let mut authenticated =
-        AuthenticatedSafetensorsHandleSet::authenticate(&fixture.path, manifest, limits).unwrap();
-    let mut packed_cache = PackedOwnerCache::new();
-    let mut exact_cache = ExactSourceOwnerCache::new();
-    let result = authenticated
-        .load_mixed(
-            &mut packed_cache,
-            &mut exact_cache,
-            |inventory: AuthenticatedInventory<'_>| {
-                Ok::<_, &'static str>(
-                    inventory
-                        .rows()
-                        .map(|row| InventoryDecision::new(row.key(), disposition.clone()))
-                        .collect::<Vec<_>>(),
-                )
-            },
-        )
-        .unwrap();
-    Arc::clone(&result.exact_metadata.values().next().unwrap().owner)
-}
 
 fn i32_tensor(shape: Vec<usize>, values: &[i32]) -> HostTensor {
     HostTensor::i32(shape, values.to_vec())
@@ -112,12 +15,18 @@ fn i32_tensor(shape: Vec<usize>, values: &[i32]) -> HostTensor {
 
 #[test]
 fn exact_i32_binary_uses_authoritative_words_with_scalar_and_broadcast_forms() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![2, 1], DType::I32));
-    let y = b.constant("y", TensorType::new(vec![1, 3], DType::I32));
-    let sum = b.binary(BinOp::Add, x, y);
-    let shifted = b.binary_scalar(BinOp::Sub, sum, Scalar::I32(1));
-    let out = b.binary_scalar(BinOp::Mul, shifted, Scalar::I32(-1));
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![2, 1], DType::I32))
+        .unwrap();
+    let y = b
+        .constant("y", TensorType::new(vec![1, 3], DType::I32))
+        .unwrap();
+    let sum = b.binary(BinOp::Add, x, y).unwrap();
+    let shifted = b.binary_scalar(BinOp::Sub, sum, Scalar::I32(1)).unwrap();
+    let out = b
+        .binary_scalar(BinOp::Mul, shifted, Scalar::I32(-1))
+        .unwrap();
     let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -156,12 +65,16 @@ fn exact_i32_binary_uses_authoritative_words_with_scalar_and_broadcast_forms() {
 
 #[test]
 fn signed_and_unsigned_i32_comparisons_diverge_at_the_sign_bit() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![4], DType::I32));
-    let zero = b.constant("zero", TensorType::new(vec![4], DType::I32));
-    let max = b.binary(BinOp::Max, x, zero);
-    let signed = b.binary(BinOp::Ge, x, zero);
-    let unsigned = b.binary(BinOp::GeU, x, zero);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let zero = b
+        .constant("zero", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let max = b.binary(BinOp::Max, x, zero).unwrap();
+    let signed = b.binary(BinOp::Ge, x, zero).unwrap();
+    let unsigned = b.binary(BinOp::GeU, x, zero).unwrap();
     let g = b.finish(unsigned).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -217,10 +130,14 @@ fn unsigned_remainder_matches_u32_modulus_literals_above_the_sign_bit() {
         (u32::MAX - 1).wrapping_rem(0x7fff_ffff) as i32,
         0,
     ];
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![5], DType::I32));
-    let m = b.constant("m", TensorType::new(vec![5], DType::I32));
-    let out = b.binary(BinOp::RemU, x, m);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![5], DType::I32))
+        .unwrap();
+    let m = b
+        .constant("m", TensorType::new(vec![5], DType::I32))
+        .unwrap();
+    let out = b.binary(BinOp::RemU, x, m).unwrap();
     let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), Value::from(i32_tensor(vec![5], &dividends)));
@@ -245,10 +162,14 @@ fn unsigned_remainder_matches_u32_modulus_literals_above_the_sign_bit() {
     );
 
     // Zero divisor fails closed.
-    let b0 = Builder::new();
-    let x0 = b0.constant("x", TensorType::new(vec![1], DType::I32));
-    let m0 = b0.constant("m", TensorType::new(vec![1], DType::I32));
-    let out0 = b0.binary(BinOp::RemU, x0, m0);
+    let b0 = Builder::for_tests();
+    let x0 = b0
+        .constant("x", TensorType::new(vec![1], DType::I32))
+        .unwrap();
+    let m0 = b0
+        .constant("m", TensorType::new(vec![1], DType::I32))
+        .unwrap();
+    let out0 = b0.binary(BinOp::RemU, x0, m0).unwrap();
     let g0 = b0.finish(out0).unwrap();
     let err = eval(
         &g0,
@@ -268,9 +189,11 @@ fn unsigned_remainder_matches_u32_modulus_literals_above_the_sign_bit() {
 
 #[test]
 fn i32_broadcast_preserves_words_and_bounded_index_inputs_remain_compatible() {
-    let b = Builder::new();
-    let words = b.constant("words", TensorType::new(vec![2, 1], DType::I32));
-    let out = b.broadcast(words, vec![2, 3]);
+    let b = Builder::for_tests();
+    let words = b
+        .constant("words", TensorType::new(vec![2, 1], DType::I32))
+        .unwrap();
+    let out = b.broadcast(words, vec![2, 3]).unwrap();
     let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -302,10 +225,10 @@ fn i32_broadcast_preserves_words_and_bounded_index_inputs_remain_compatible() {
     // no range check to pass or fail - the bind itself is refused). Bound authoritatively here, this
     // keeps checking the thing the name still promises: a Gather index does not need the exact-I32 word
     // lane, a plain dense I32 bind is enough.
-    let b = Builder::new();
-    let table = b.constant("table", TensorType::f32(vec![3, 2]));
-    let index = b.constant("index", TensorType::scalar(DType::I32));
-    let row = b.gather(table, 0, index);
+    let b = Builder::for_tests();
+    let table = b.constant("table", TensorType::f32(vec![3, 2])).unwrap();
+    let index = b.constant("index", TensorType::scalar(DType::I32)).unwrap();
+    let row = b.gather(table, 0, index).unwrap();
     let g = b.finish(row).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -330,9 +253,11 @@ fn i32_broadcast_preserves_words_and_bounded_index_inputs_remain_compatible() {
 
 #[test]
 fn i32_words_are_exact_and_a_non_i32_bind_is_refused() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![1], DType::I32));
-    let out = b.binary_scalar(BinOp::Add, x, Scalar::I32(1));
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![1], DType::I32))
+        .unwrap();
+    let out = b.binary_scalar(BinOp::Add, x, Scalar::I32(1)).unwrap();
     let g = b.finish(out).unwrap();
     // 2^24 + 1 is not an f32: the sum is exact only because the words are never widened.
     let mut inputs = HashMap::from([(
@@ -364,11 +289,15 @@ fn i32_words_are_exact_and_a_non_i32_bind_is_refused() {
 fn exact_concat_combines_two_authoritative_i32_parts() {
     // Concat of two I32 parts does not lose words (the unified walk requires I32 inputs to be I32
     // tensors, so there is no "legacy f32-backed" part to promote).
-    let b = Builder::new();
-    let exact = b.constant("exact", TensorType::new(vec![1], DType::I32));
-    let legacy = b.constant("legacy", TensorType::new(vec![1], DType::I32));
-    let joined = b.concat(0, &[exact, legacy]);
-    let out = b.binary_scalar(BinOp::Add, joined, Scalar::I32(0));
+    let b = Builder::for_tests();
+    let exact = b
+        .constant("exact", TensorType::new(vec![1], DType::I32))
+        .unwrap();
+    let legacy = b
+        .constant("legacy", TensorType::new(vec![1], DType::I32))
+        .unwrap();
+    let joined = b.concat(0, &[exact, legacy]).unwrap();
+    let out = b.binary_scalar(BinOp::Add, joined, Scalar::I32(0)).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = HashMap::from([
         (
@@ -402,9 +331,11 @@ fn exact_concat_combines_two_authoritative_i32_parts() {
 
 #[test]
 fn exact_i32_scalar_empty_overflow_and_error_precedence_are_total() {
-    let b = Builder::new();
-    let scalar = b.constant("scalar", TensorType::scalar(DType::I32));
-    let wrapped = b.binary_scalar(BinOp::Add, scalar, Scalar::I32(1));
+    let b = Builder::for_tests();
+    let scalar = b
+        .constant("scalar", TensorType::scalar(DType::I32))
+        .unwrap();
+    let wrapped = b.binary_scalar(BinOp::Add, scalar, Scalar::I32(1)).unwrap();
     let scalar_graph = b.finish(wrapped).unwrap();
     assert_eq!(
         eval(
@@ -441,17 +372,21 @@ fn exact_i32_scalar_empty_overflow_and_error_precedence_are_total() {
 
 #[test]
 fn exact_i32_bit_select_and_clz_match_wrapping_word_semantics() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![4], DType::I32));
-    let y = b.constant("y", TensorType::new(vec![4], DType::I32));
-    let and = b.binary(BinOp::And, x, y);
-    let or = b.binary(BinOp::Or, x, y);
-    let xor = b.binary(BinOp::Xor, x, y);
-    let shl = b.binary_scalar(BinOp::Shl, x, Scalar::I32(33));
-    let shr = b.binary(BinOp::Shr, x, y);
-    let not = b.unary(UnOp::Not, x);
-    let clz = b.unary(UnOp::Clz, x);
-    let selected = b.select(and, or, xor);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let y = b
+        .constant("y", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let and = b.binary(BinOp::And, x, y).unwrap();
+    let or = b.binary(BinOp::Or, x, y).unwrap();
+    let xor = b.binary(BinOp::Xor, x, y).unwrap();
+    let shl = b.binary_scalar(BinOp::Shl, x, Scalar::I32(33)).unwrap();
+    let shr = b.binary(BinOp::Shr, x, y).unwrap();
+    let not = b.unary(UnOp::Not, x).unwrap();
+    let clz = b.unary(UnOp::Clz, x).unwrap();
+    let selected = b.select(and, or, xor).unwrap();
     let g = b.finish(selected).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -494,9 +429,11 @@ fn exact_i32_bit_select_and_clz_match_wrapping_word_semantics() {
 
 #[test]
 fn clz_of_zero_and_sign_bit_are_defined() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![2], DType::I32));
-    let out = b.unary(UnOp::Clz, x);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![2], DType::I32))
+        .unwrap();
+    let out = b.unary(UnOp::Clz, x).unwrap();
     let g = b.finish(out).unwrap();
     let got = eval(
         &g,
@@ -512,11 +449,17 @@ fn clz_of_zero_and_sign_bit_are_defined() {
 
 #[test]
 fn select_takes_if_true_for_any_nonzero_condition_word() {
-    let b = Builder::new();
-    let cond = b.constant("cond", TensorType::new(vec![2], DType::I32));
-    let if_true = b.constant("t", TensorType::new(vec![2], DType::I32));
-    let if_false = b.constant("f", TensorType::new(vec![2], DType::I32));
-    let out = b.select(cond, if_true, if_false);
+    let b = Builder::for_tests();
+    let cond = b
+        .constant("cond", TensorType::new(vec![2], DType::I32))
+        .unwrap();
+    let if_true = b
+        .constant("t", TensorType::new(vec![2], DType::I32))
+        .unwrap();
+    let if_false = b
+        .constant("f", TensorType::new(vec![2], DType::I32))
+        .unwrap();
+    let out = b.select(cond, if_true, if_false).unwrap();
     let g = b.finish(out).unwrap();
     let got = eval(
         &g,
@@ -552,42 +495,15 @@ fn exact_i32_owner_identity_is_not_word_equality() {
 }
 
 fn exact_view<const N: usize>(shape: Vec<usize>, words: [i32; N]) -> crate::Value {
-    crate::Value::Owner(crate::ExactValue::I32(
+    crate::Value::Exact(crate::ExactValue::I32(
         crate::ExactI32TensorView::try_from_words(shape, Arc::from(words)).unwrap(),
     ))
 }
 
-/// Card 396: an owner-backed BF16 dense view over `values`, encoded as the top half of the f32 bits
-/// (as `exact_dense::decode_bf16_word` decodes). `authenticated_source_owner` runs full authentication.
-fn owner_backed_bf16_dense(name: &str, values: &[f32]) -> crate::exact_dense::DenseOwnerTensorView {
-    let bytes: Vec<u8> = values
-        .iter()
-        .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
-        .collect();
-    let owner = authenticated_source_owner(
-        name,
-        "BF16",
-        values.len(),
-        &bytes,
-        TensorDisposition::DenseBf16,
-    );
-    crate::exact_dense::DenseOwnerTensorView::new(owner).unwrap()
-}
-
-/// The F32 counterpart of [`owner_backed_bf16_dense`].
-fn owner_backed_f32_dense(name: &str, values: &[f32]) -> crate::exact_dense::DenseOwnerTensorView {
-    let bytes: Vec<u8> = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    let owner = authenticated_source_owner(
-        name,
-        "F32",
-        values.len(),
-        &bytes,
-        TensorDisposition::DenseF32,
-    );
-    crate::exact_dense::DenseOwnerTensorView::new(owner).unwrap()
+/// A BF16 host tensor over `values`, each encoded as the top half of its f32 bits.
+fn bf16_host(values: &[f32]) -> HostTensor {
+    let words = values.iter().map(|value| (value.to_bits() >> 16) as u16);
+    HostTensor::bf16(vec![values.len()], words.collect())
 }
 
 /// One `Gather(data, 0, index)` graph, `data` a 1-D constant of `rows` elements at `dtype`.
@@ -601,29 +517,29 @@ fn gather_graph(
     poot_graph_ir::Traced,
     poot_graph_ir::Traced,
 ) {
-    let builder = Builder::new();
-    let table = builder.constant("table", TensorType::new(vec![rows], dtype));
-    let index = helpers::i32_constant(&builder, "index", vec![index_count]).unwrap();
-    let output = builder.gather(table, 0, index);
+    let builder = Builder::for_tests();
+    let table = builder
+        .constant("table", TensorType::new(vec![rows], dtype))
+        .unwrap();
+    let index = graph_fixtures::i32_constant(&builder, "index", vec![index_count]).unwrap();
+    let output = builder.gather(table, 0, index).unwrap();
     (builder, table, index, output)
 }
 
-/// Card 396: a Gather over an owner-backed BF16 data source reads the right elements.
+/// Card 396: a Gather of a BF16 host table by exact-I32 index reads the right elements.
 ///
-/// Red mutation: remove the `Value::Owner(exact @ (ExactValue::Dense(_) | ExactValue::Bf16(_)))` arm in
-/// the `Gather` else-branch of `exact_i32.rs`; the source then hits
-/// `UnsupportedOperation { operation: "Gather with non-I32 exact data" }`.
+/// Red mutation: in `walk.rs::evaluate_bf16`'s `Bf16Equation::Gather` arm, read `table.word(0)` for
+/// every output element; the gathered values collapse to the first word.
 #[test]
-fn exact_i32_gather_reads_an_owner_backed_bf16_data_source() {
+fn exact_i32_gather_reads_a_bf16_data_source() {
     use crate::ExactValue;
 
     let (builder, table, index, output) = gather_graph(4, DType::BF16, 2);
     let graph = builder.finish(output).unwrap();
-    let view = owner_backed_bf16_dense("table", &[1.5, -2.25, 0.0, 8.0]);
     let result = eval(
         &graph,
         &HashMap::from([
-            (table.id(), Value::Owner(ExactValue::Dense(view))),
+            (table.id(), Value::Host(bf16_host(&[1.5, -2.25, 0.0, 8.0]))),
             (index.id(), exact_view(vec![2], [3, 1])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
@@ -633,7 +549,7 @@ fn exact_i32_gather_reads_an_owner_backed_bf16_data_source() {
     // Card 554d: a Gather of a BF16 table by I32 index is one answer now, not two - the
     // same Spec 376 admission the Exact-BF16 lane always used, keeping the result BF16-exact rather
     // than widening it the moment any I32 index touches it.
-    let Value::Owner(ExactValue::Bf16(result)) = result else {
+    let Value::Exact(ExactValue::Bf16(result)) = result else {
         panic!("expected an exact BF16 gather result, got {result:?}")
     };
     assert_eq!(
@@ -644,20 +560,20 @@ fn exact_i32_gather_reads_an_owner_backed_bf16_data_source() {
     );
 }
 
-/// Card 396: the same over the F32 dense carrier.
+/// Card 396: the same over an F32 host table.
 ///
-/// Red mutation: as above.
+/// Red mutation: in `ops::gather::gather_host`'s `HostData::F32` arm, read `d[0]` instead of `d[i]`.
 #[test]
-fn exact_i32_gather_reads_an_owner_backed_f32_data_source() {
-    use crate::ExactValue;
-
+fn exact_i32_gather_reads_an_f32_data_source() {
     let (builder, table, index, output) = gather_graph(4, DType::F32, 2);
     let graph = builder.finish(output).unwrap();
-    let view = owner_backed_f32_dense("table", &[1.5, -2.25, 0.125, 8.0]);
     let result = eval(
         &graph,
         &HashMap::from([
-            (table.id(), Value::Owner(ExactValue::Dense(view))),
+            (
+                table.id(),
+                Value::Host(HostTensor::f32(vec![4], vec![1.5, -2.25, 0.125, 8.0])),
+            ),
             (index.id(), exact_view(vec![2], [2, 0])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
@@ -670,23 +586,21 @@ fn exact_i32_gather_reads_an_owner_backed_f32_data_source() {
     assert_eq!(result.as_f32().unwrap(), &[0.125, 1.5]);
 }
 
-/// Card 396: index bounds are still checked on the owner-backed path, against the owner view's retained
-/// shape (the graph's `aval` shape is kept in agreement so only the bounds check is exercised).
+/// Card 396: index bounds are checked against the table's shape on the exact-I32 index path.
 ///
-/// Red mutation: delete the `index_at` call in the Spec-376 Gather arm (`walk::evaluate_bf16`), so an
-/// out-of-range index reads past the owner's extent.
+/// Red mutation: in the Spec-376 Gather arm (`walk::evaluate_bf16`), pass `usize::MAX` as the `index_at`
+/// extent, so an out-of-range index reads past the table's extent.
 #[test]
-fn exact_i32_gather_still_checks_bounds_on_an_owner_backed_data_source() {
+fn exact_i32_gather_still_checks_bounds_on_a_bf16_data_source() {
     use crate::ops::index_rule::IndexFaultKind;
-    use crate::{EvalError, ExactValue, Value};
+    use crate::{EvalError, Value};
 
     let (builder, table, index, output) = gather_graph(2, DType::BF16, 1);
     let graph = builder.finish(output).unwrap();
-    let view = owner_backed_bf16_dense("table", &[1.0, 2.0]);
     let result = eval(
         &graph,
         &HashMap::from([
-            (table.id(), Value::Owner(ExactValue::Dense(view))),
+            (table.id(), Value::Host(bf16_host(&[1.0, 2.0]))),
             (index.id(), exact_view(vec![1], [5])),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
@@ -702,91 +616,26 @@ fn exact_i32_gather_still_checks_bounds_on_an_owner_backed_data_source() {
     assert_eq!(fault.kind, IndexFaultKind::OutOfRange);
 }
 
-/// Card 396: the owner-backed path and the plain-`Value::Host` path agree on the same bytes.
-///
-/// Red mutation: make `gather_exact_dense` ignore `axis`; this graph's `axis` is 1, so an axis-blind read
-/// diverges from the plain-dense oracle over the identical bytes.
-#[test]
-fn exact_i32_gather_owner_backed_path_agrees_with_the_plain_dense_path() {
-    use crate::{ExactValue, Value};
-
-    let builder = Builder::new();
-    let table = builder.constant("table", TensorType::new(vec![2, 3], DType::BF16));
-    let index = helpers::i32_constant(&builder, "index", vec![2]).unwrap();
-    let output = builder.gather(table, 1, index);
-    let graph = builder.finish(output).unwrap();
-
-    // Every value is a power of two (or zero), so the BF16 round trip is exact: this checks agreement
-    // between the two read paths, not BF16 rounding.
-    let values = [1.0f32, 2.0, 4.0, 8.0, 16.0, 32.0];
-    // `authenticated_source_owner` declares a flat `[elements]` shape; reshape to the graph's `[2, 3]`.
-    let view = owner_backed_bf16_dense("table", &values)
-        .reshape(vec![2, 3])
-        .unwrap();
-    let owner_inputs = HashMap::from([
-        (table.id(), Value::Owner(ExactValue::Dense(view))),
-        (index.id(), exact_view(vec![2], [2, 0])),
-    ]);
-    let dense_inputs = HashMap::from([
-        (
-            table.id(),
-            Value::Host(crate::ops::cast::narrow_f32(vec![2, 3], &values, DType::BF16).unwrap()),
-        ),
-        (index.id(), exact_view(vec![2], [2, 0])),
-    ]);
-
-    let owner_result = eval(
-        &graph,
-        &owner_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output;
-    let dense_result = eval(
-        &graph,
-        &dense_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output;
-
-    // Card 554d: both bindings are a BF16 table by I32 index, so both now take the one
-    // Spec 376 Gather path and publish the same exact-BF16 carrier, not a dense result.
-    let (
-        Value::Owner(ExactValue::Bf16(owner_result)),
-        Value::Owner(ExactValue::Bf16(dense_result)),
-    ) = (owner_result, dense_result)
-    else {
-        panic!("expected both paths to produce an exact BF16 gather result")
-    };
-    let words = |v: &crate::exact_bf16::ExactBf16TensorView| {
-        (0..v.numel()).map(|i| v.value(i)).collect::<Vec<_>>()
-    };
-    assert_eq!(words(&owner_result), words(&dense_result));
-    assert_eq!(words(&owner_result), vec![4.0, 1.0, 32.0, 8.0]);
-}
-
-/// Card 396: gathering a few rows out of a large owner-backed source does not materialize the whole
-/// source, the falsifiable form of the memory-safety claim behind `gather_exact_dense` (Qwen3.5's
+/// Card 396: gathering a few rows out of a large BF16 source does not materialize the whole source,
+/// the falsifiable form of the memory-safety claim behind the Spec-376 Gather (Qwen3.5's
 /// `embed.weight` is 248,320 x 5,120, ~5GB as F32).
 ///
-/// Red mutation: replace `gather_exact_dense`'s lazy per-element read with
-/// `ExactValue::materialize_dense`; materializing `ROWS` BF16 words into f32 allocates ~`ROWS * 4`
-/// bytes regardless of how many are selected, failing this row's allocation bound.
+/// Red mutation: decode the whole table eagerly in `walk::evaluate_bf16`'s `Bf16Equation::Gather` arm
+/// (`(0..table.numel()).map(|f| table.value(f)).collect::<Vec<f32>>()`); that allocates ~`ROWS * 4`
+/// bytes regardless of how many rows are selected, failing this row's allocation bound.
 #[test]
-fn exact_i32_gather_does_not_materialize_the_whole_owner_backed_source() {
+fn exact_i32_gather_does_not_materialize_the_whole_bf16_source() {
     use crate::{ExactValue, Value};
 
     const ROWS: usize = 100_000;
     let mut values = vec![0.0f32; ROWS];
     values[3] = 8.0;
     values[ROWS - 1] = -16.0;
-    let view = owner_backed_bf16_dense("table", &values);
 
     let (builder, table, index, output) = gather_graph(ROWS, DType::BF16, 2);
     let graph = builder.finish(output).unwrap();
     let inputs = HashMap::from([
-        (table.id(), Value::Owner(ExactValue::Dense(view))),
+        (table.id(), Value::Host(bf16_host(&values))),
         (index.id(), exact_view(vec![2], [3, ROWS as i32 - 1])),
     ]);
 
@@ -795,7 +644,7 @@ fn exact_i32_gather_does_not_materialize_the_whole_owner_backed_source() {
     });
     // Card 554d: a BF16 table + I32 index Gather is one answer now (the Spec 376 lane),
     // which keeps the two selected rows BF16-exact rather than widening them to a dense F32 result.
-    let Value::Owner(ExactValue::Bf16(result)) = result.unwrap() else {
+    let Value::Exact(ExactValue::Bf16(result)) = result.unwrap() else {
         panic!("expected an exact BF16 gather result")
     };
     assert_eq!(
@@ -813,54 +662,19 @@ fn exact_i32_gather_does_not_materialize_the_whole_owner_backed_source() {
     );
 }
 
-/// Card 554d: the deleted exact-I32 lane's own `dense_equation` blanket fallback -
-/// silently materializing ANY owner-backed BF16 constant to F32 the moment some unrelated op touched
-/// it - is gone with no replacement. The one walk's admission rule is strict and uniform instead
-/// (`exact_dense::validate_exact_dense_bindings`, card 396's own doc): an owner view may feed only a
-/// Spec 376 BF16 equation (`resolve::classify`) or the graph's own output; a plain `Binary` is
-/// neither, so it is a refused `GraphConsumer`, not a convenience widen.
-///
-/// Red mutation: drop the `resolve::classify(g, eqn).is_some()` admission check in
-/// `validate_exact_dense_bindings`; the owner-backed constant below is then read (not refused), and
-/// this test's `unwrap_err` goes red.
-#[test]
-fn owner_backed_bf16_constant_consumed_by_a_plain_binary_is_refused() {
-    use crate::exact_dense::ExactDenseError;
-    use crate::{ExactValue, Value};
-
-    let builder = Builder::new();
-    let table = builder.constant("norm", TensorType::new(vec![2], DType::BF16));
-    let output = builder.binary_scalar(BinOp::Add, table, Scalar::F32(1.0));
-    let graph = builder.finish(output).unwrap();
-
-    let view = owner_backed_bf16_dense("norm", &[3.0, -1.0]);
-    let error = eval(
-        &graph,
-        &HashMap::from([(table.id(), Value::Owner(ExactValue::Dense(view)))]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap_err();
-    let crate::EvalError::ExactDense(ExactDenseError::GraphConsumer {
-        value_id, consumer, ..
-    }) = &error
-    else {
-        panic!("expected a refused GraphConsumer, got {error:?}")
-    };
-    assert_eq!(*value_id, table.id());
-    assert_eq!(consumer, "add");
-}
-
 #[test]
 fn exact_i32_compare_sub_select_are_wordwise() {
     use crate::Value;
 
-    let builder = Builder::new();
-    let left = helpers::i32_constant(&builder, "left", vec![2]).unwrap();
-    let right = helpers::i32_constant(&builder, "right", vec![2]).unwrap();
-    let signed = builder.binary(BinOp::Ge, left, right);
-    let unsigned = builder.binary(BinOp::GeU, left, right);
-    let difference = builder.binary_scalar(BinOp::Sub, left, Scalar::I32(-1));
-    let output = builder.select(difference, signed, unsigned);
+    let builder = Builder::for_tests();
+    let left = graph_fixtures::i32_constant(&builder, "left", vec![2]).unwrap();
+    let right = graph_fixtures::i32_constant(&builder, "right", vec![2]).unwrap();
+    let signed = builder.binary(BinOp::Ge, left, right).unwrap();
+    let unsigned = builder.binary(BinOp::GeU, left, right).unwrap();
+    let difference = builder
+        .binary_scalar(BinOp::Sub, left, Scalar::I32(-1))
+        .unwrap();
+    let output = builder.select(difference, signed, unsigned).unwrap();
     let graph = builder.finish(output).unwrap();
     let inputs = HashMap::from([
         (left.id(), exact_view(vec![2], [i32::MIN, i32::MAX])),
@@ -870,7 +684,7 @@ fn exact_i32_compare_sub_select_are_wordwise() {
         .unwrap()
         .output;
     // Card 554d: the unified walk always publishes an I32 equation's output as `Value::Host`
-    // (`HostTensor::i32`), never `Value::Owner(ExactValue::I32(..))`; the one carrier-preserving
+    // (`HostTensor::i32`), never `Value::Exact(ExactValue::I32(..))`; the one carrier-preserving
     // exception is a plain `Reshape` of an exact-I32-bound input, which this graph's `Select` output
     // is not. The deleted `ExactI32Observer` accounting assertions this test used to carry
     // (`operation_derived_i32_allocations`/`ExactI32AllocationKind`/`retained_full_f32_mirror_bytes`)
@@ -880,10 +694,10 @@ fn exact_i32_compare_sub_select_are_wordwise() {
     };
     assert_eq!(result.as_i32(), Some(&[0, 1][..]));
 
-    let builder = Builder::new();
-    let left = helpers::i32_constant(&builder, "tie.left", vec![1]).unwrap();
-    let right = helpers::i32_constant(&builder, "tie.right", vec![1]).unwrap();
-    let signed_tie = builder.binary(BinOp::Ge, left, right);
+    let builder = Builder::for_tests();
+    let left = graph_fixtures::i32_constant(&builder, "tie.left", vec![1]).unwrap();
+    let right = graph_fixtures::i32_constant(&builder, "tie.right", vec![1]).unwrap();
+    let signed_tie = builder.binary(BinOp::Ge, left, right).unwrap();
     let graph = builder.finish(signed_tie).unwrap();
     let result = eval(
         &graph,
@@ -905,10 +719,10 @@ fn exact_i32_compare_sub_select_are_wordwise() {
 fn exact_i32_gather_preserves_large_words() {
     use crate::{EvalError, Value};
 
-    let builder = Builder::new();
-    let table = helpers::i32_constant(&builder, "table", vec![3]).unwrap();
-    let index = helpers::i32_constant(&builder, "index", vec![2]).unwrap();
-    let output = builder.gather(table, 0, index);
+    let builder = Builder::for_tests();
+    let table = graph_fixtures::i32_constant(&builder, "table", vec![3]).unwrap();
+    let index = graph_fixtures::i32_constant(&builder, "index", vec![2]).unwrap();
+    let output = builder.gather(table, 0, index).unwrap();
     let graph = builder.finish(output).unwrap();
     let table_value = exact_view(vec![3], [16_777_217, -7, i32::MAX]);
     let result = eval(
@@ -963,11 +777,11 @@ fn selected_cast_checks_before_allocation() {
     // its run-time fault on the words it is handed.
     use crate::{EvalError, Value};
 
-    let builder = Builder::new();
-    let table = helpers::i32_constant(&builder, "table", vec![3]).unwrap();
-    let index = helpers::i32_constant(&builder, "index", vec![2]).unwrap();
-    let selected = builder.gather(table, 0, index);
-    let cast = builder.cast(selected, DType::F32);
+    let builder = Builder::for_tests();
+    let table = graph_fixtures::i32_constant(&builder, "table", vec![3]).unwrap();
+    let index = graph_fixtures::i32_constant(&builder, "index", vec![2]).unwrap();
+    let selected = builder.gather(table, 0, index).unwrap();
+    let cast = builder.cast(selected, DType::F32).unwrap();
     let graph = builder.finish(cast).unwrap();
     let valid_inputs = HashMap::from([
         (table.id(), exact_view(vec![3], [0, 1, 2])),
@@ -1016,14 +830,18 @@ fn a_slot_outside_its_declared_range_is_refused_before_any_equation() {
     use poot_graph_ir::{IndexRange, Slot};
 
     const VOCAB: usize = 8;
-    let builder = Builder::new();
-    let table = builder.constant("table", TensorType::f32(vec![VOCAB, 2]));
-    let token = builder.slot_ranged(
-        Slot::Token,
-        TensorType::new(vec![3], DType::I32),
-        IndexRange::below(VOCAB).unwrap(),
-    );
-    let rows = builder.gather(table, 0, token);
+    let builder = Builder::for_tests();
+    let table = builder
+        .constant("table", TensorType::f32(vec![VOCAB, 2]))
+        .unwrap();
+    let token = builder
+        .slot_ranged(
+            Slot::Token,
+            TensorType::new(vec![3], DType::I32),
+            IndexRange::below(VOCAB).unwrap(),
+        )
+        .unwrap();
+    let rows = builder.gather(table, 0, token).unwrap();
     let graph = builder.finish(rows).unwrap();
     let run = |words: [i32; 3]| {
         eval(
@@ -1088,11 +906,11 @@ fn i32_widening_to_f32_is_exact_only_within_two_pow_24() {
 fn i32_boundary_test_is_scalar_bounded() {
     use crate::EvalError;
 
-    let builder = Builder::new();
-    let table = helpers::i32_constant(&builder, "boundary.table", vec![2]).unwrap();
-    let index = helpers::i32_constant(&builder, "boundary.index", vec![2]).unwrap();
-    let selected = builder.gather(table, 0, index);
-    let cast = builder.cast(selected, DType::F32);
+    let builder = Builder::for_tests();
+    let table = graph_fixtures::i32_constant(&builder, "boundary.table", vec![2]).unwrap();
+    let index = graph_fixtures::i32_constant(&builder, "boundary.index", vec![2]).unwrap();
+    let selected = builder.gather(table, 0, index).unwrap();
+    let cast = builder.cast(selected, DType::F32).unwrap();
     let graph = builder.finish(cast).unwrap();
     let indices = exact_view(vec![2], [0, 1]);
 
@@ -1134,13 +952,13 @@ fn guarded_selector_graph(
 ) {
     use poot_graph_ir::ValidationId;
 
-    let builder = Builder::new();
-    let table = helpers::i32_constant(&builder, "route.table", vec![4]).unwrap();
-    let indices = helpers::i32_constant(&builder, "route.indices", vec![4]).unwrap();
-    let raw = builder.gather(table, 0, indices);
+    let builder = Builder::for_tests();
+    let table = graph_fixtures::i32_constant(&builder, "route.table", vec![4]).unwrap();
+    let indices = graph_fixtures::i32_constant(&builder, "route.indices", vec![4]).unwrap();
+    let raw = builder.gather(table, 0, indices).unwrap();
     let guard = builder.guard_index_bounds(raw, upper_exclusive).unwrap();
-    let selected = builder.cast(guard.guarded, DType::F32);
-    let graph = helpers::finish_with_validations(
+    let selected = builder.cast(guard.guarded, DType::F32).unwrap();
+    let graph = graph_fixtures::finish_with_validations(
         builder,
         selected,
         &[(ValidationId(3), "route.bounds", guard.witness)],
@@ -1277,15 +1095,18 @@ fn address_chain_graph(
     poot_graph_ir::ValueId,
     poot_graph_ir::ValueId,
 ) {
-    let builder = Builder::new();
-    let table = helpers::i32_constant(&builder, "address.table", vec![table_extent]).unwrap();
-    let row_ids = helpers::i32_constant(&builder, "address.rows", vec![rows]).unwrap();
-    let slot_iota = helpers::i32_constant(&builder, "address.slots", vec![slots]).unwrap();
-    let row_column = builder.reshape(row_ids, vec![rows, 1]);
-    let row_base = builder.binary_scalar(BinOp::Mul, row_column, Scalar::I32(stride));
-    let address = builder.binary(BinOp::Add, row_base, slot_iota);
-    let flat = builder.reshape(address, vec![rows * slots]);
-    let gathered = builder.gather(table, 0, flat);
+    let builder = Builder::for_tests();
+    let table =
+        graph_fixtures::i32_constant(&builder, "address.table", vec![table_extent]).unwrap();
+    let row_ids = graph_fixtures::i32_constant(&builder, "address.rows", vec![rows]).unwrap();
+    let slot_iota = graph_fixtures::i32_constant(&builder, "address.slots", vec![slots]).unwrap();
+    let row_column = builder.reshape(row_ids, vec![rows, 1]).unwrap();
+    let row_base = builder
+        .binary_scalar(BinOp::Mul, row_column, Scalar::I32(stride))
+        .unwrap();
+    let address = builder.binary(BinOp::Add, row_base, slot_iota).unwrap();
+    let flat = builder.reshape(address, vec![rows * slots]).unwrap();
+    let gathered = builder.gather(table, 0, flat).unwrap();
     (
         builder.finish(gathered).unwrap(),
         row_ids.id(),
@@ -1320,7 +1141,7 @@ fn exact_i32_reshape_is_a_view_over_the_same_words() {
 
     // Evaluator half: a reshaped address reads the rows its new shape names. Card 554d: Gather over an
     // exact-I32 table always publishes `Value::Host(HostTensor::i32(..))` now (never
-    // `Value::Owner(ExactValue::I32(..))`); the deleted `ExactI32Observer` accounting
+    // `Value::Exact(ExactValue::I32(..))`); the deleted `ExactI32Observer` accounting
     // (`operation_derived_i32_allocations`/`ExactI32AllocationKind`) that used to prove the Reshape
     // itself derived no allocation has no replacement (flagged in the migration report).
     let (graph, rows, slots, table) = address_chain_graph(2, 3, 3, 6);
@@ -1348,7 +1169,7 @@ fn exact_i32_reshape_accepts_a_dense_carrier_too() {
 
     // Card 554d: this test used to be `exact_i32_reshape_refuses_a_non_authoritative_value`, proving
     // the deleted exact-I32 lane's own rule that `Reshape` required its input to be literally
-    // `Value::Owner(ExactValue::I32(..))`, refusing a plain `Value::Host` I32 carrier (even with
+    // `Value::Exact(ExactValue::I32(..))`, refusing a plain `Value::Host` I32 carrier (even with
     // authoritative `the I32 words`) as "non-authoritative". The unified walk has no such distinction:
     // `walk.rs`'s `i32_tensor` helper reads a dense-with-ints carrier and an exact-I32 view
     // identically (both are zero-copy `Arc` reads), so `Reshape` of either now evaluates to the same
@@ -1452,13 +1273,17 @@ fn computed_gather_addresses_are_bounds_checked() {
 
     // The score arm of the flat-gather formulation: an authoritative I32 address into a dense f32 row.
     // The address is computed, so only this check stands between it and the table.
-    let builder = Builder::new();
-    let scores = builder.constant("scores", TensorType::f32(vec![6]));
-    let row_ids = helpers::i32_constant(&builder, "score.rows", vec![2]).unwrap();
-    let expert_ids = helpers::i32_constant(&builder, "score.ids", vec![2]).unwrap();
-    let row_base = builder.binary_scalar(BinOp::Mul, row_ids, Scalar::I32(3));
-    let address = builder.binary(BinOp::Add, row_base, expert_ids);
-    let gathered = builder.gather(scores, 0, address);
+    let builder = Builder::for_tests();
+    let scores = builder
+        .constant("scores", TensorType::f32(vec![6]))
+        .unwrap();
+    let row_ids = graph_fixtures::i32_constant(&builder, "score.rows", vec![2]).unwrap();
+    let expert_ids = graph_fixtures::i32_constant(&builder, "score.ids", vec![2]).unwrap();
+    let row_base = builder
+        .binary_scalar(BinOp::Mul, row_ids, Scalar::I32(3))
+        .unwrap();
+    let address = builder.binary(BinOp::Add, row_base, expert_ids).unwrap();
+    let gathered = builder.gather(scores, 0, address).unwrap();
     let graph = builder.finish(gathered).unwrap();
     let bind = |ids: [i32; 2]| {
         HashMap::from([
@@ -1507,16 +1332,22 @@ fn state_carrying_graph() -> (
     poot_graph_ir::Traced,
     poot_graph_ir::Traced,
 ) {
-    let b = Builder::new();
-    let cache = b.state_input("cache", TensorType::f32(vec![2]), StateRole::Recurrent);
-    let counter = b.state_input(
-        "counter",
-        TensorType::new(vec![2], DType::I32),
-        StateRole::Recurrent,
-    );
-    let cache_next = b.binary(BinOp::Add, cache, cache);
-    let counter_next = b.binary_scalar(BinOp::Sub, counter, Scalar::I32(-1));
-    let logits = b.binary(BinOp::Sub, cache_next, cache);
+    let b = Builder::for_tests();
+    let cache = b
+        .state_input("cache", TensorType::f32(vec![2]), StateRole::Recurrent)
+        .unwrap();
+    let counter = b
+        .state_input(
+            "counter",
+            TensorType::new(vec![2], DType::I32),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let cache_next = b.binary(BinOp::Add, cache, cache).unwrap();
+    let counter_next = b
+        .binary_scalar(BinOp::Sub, counter, Scalar::I32(-1))
+        .unwrap();
+    let logits = b.binary(BinOp::Sub, cache_next, cache).unwrap();
     let graph = b
         .finish(
             poot_graph_ir::Outputs::new(logits)
@@ -1554,7 +1385,7 @@ fn exact_i32_with_state_publishes_every_pair_in_graph_order() {
     assert_eq!(output.as_f32().unwrap(), &[3.0, -1.0]);
     assert_eq!(state.len(), 2, "one value per state pair");
     // Pair order is the graph's. Card 554d: an I32 equation (`counter_next` is a `Binary(Sub)`) now
-    // always publishes `Value::Host(HostTensor::i32(..))`, never `Value::Owner(ExactValue::I32(..))` -
+    // always publishes `Value::Host(HostTensor::i32(..))`, never `Value::Exact(ExactValue::I32(..))` -
     // and `check_state_storage` would refuse the exact carrier for I32 state even if it appeared (see
     // `exact_i32_with_state_requires_the_dense_carrier`), so both pairs publish dense now.
     let Value::Host(cache_out) = &state[0] else {
@@ -1588,17 +1419,19 @@ fn exact_i32_with_state_requires_the_dense_carrier() {
     // I32 state value to stay on the exact carrier, rejecting a plain `Value::Host` (even with
     // authoritative the I32 words) as having "left the exact lane". The unified walk's own
     // `check_state_storage` (`walk.rs`) does the reverse: its `carrier_matches` for `DType::I32` admits
-    // only `Value::Host(_)`, with no arm for `Value::Owner(ExactValue::I32(_))` at all - so an I32
-    // state value now round-trips only on the dense carrier, and a bound `Value::Owner` state value is
+    // only `Value::Host(_)`, with no arm for `Value::Exact(ExactValue::I32(_))` at all - so an I32
+    // state value now round-trips only on the dense carrier, and a bound `Value::Exact` state value is
     // the one that is refused.
-    let b = Builder::new();
-    let counter = b.state_input(
-        "counter",
-        TensorType::new(vec![2], DType::I32),
-        StateRole::Recurrent,
-    );
-    let cache = b.constant("cache", TensorType::f32(vec![2]));
-    let logits = b.binary(BinOp::Add, cache, cache);
+    let b = Builder::for_tests();
+    let counter = b
+        .state_input(
+            "counter",
+            TensorType::new(vec![2], DType::I32),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let cache = b.constant("cache", TensorType::f32(vec![2])).unwrap();
+    let logits = b.binary(BinOp::Add, cache, cache).unwrap();
     let graph = b
         .finish(poot_graph_ir::Outputs::new(logits).with_state(&[(counter, counter)]))
         .unwrap();
@@ -1645,7 +1478,7 @@ fn exact_i32_with_state_requires_the_dense_carrier() {
             &error,
             EvalError::Input {
                 value,
-                got: "Value::Owner(ExactValue::I32)",
+                got: "Value::Exact(ExactValue::I32)",
                 ..
             } if *value == counter.id()
         ),
@@ -1662,20 +1495,24 @@ fn exact_i32_with_state_publishes_shared_allocations() {
     //
     // Card 554d: the exact-I32 half of this test used to bind `counter` on the exact carrier and prove
     // its `Arc<[i32]>` was shared by `Arc::ptr_eq`. The unified walk's `check_state_storage` now
-    // refuses `Value::Owner(ExactValue::I32(_))` as an I32 state value altogether (see
+    // refuses `Value::Exact(ExactValue::I32(_))` as an I32 state value altogether (see
     // `exact_i32_with_state_requires_the_dense_carrier`), so that half is migrated onto the dense
     // carrier instead - still zero-copy, just through `the I32 words`'s own `Arc` rather than
     // `ExactI32TensorView::word_owner`. The deleted `ExactI32Observer`'s "a published owner the
     // observer already accounted costs nothing to feed back" accounting assertion has no replacement
     // (flagged in the migration report).
-    let b = Builder::new();
-    let cache = b.state_input("cache", TensorType::f32(vec![2]), StateRole::Recurrent);
-    let counter = b.state_input(
-        "counter",
-        TensorType::new(vec![2], DType::I32),
-        StateRole::Recurrent,
-    );
-    let logits = b.binary(BinOp::Add, cache, cache);
+    let b = Builder::for_tests();
+    let cache = b
+        .state_input("cache", TensorType::f32(vec![2]), StateRole::Recurrent)
+        .unwrap();
+    let counter = b
+        .state_input(
+            "counter",
+            TensorType::new(vec![2], DType::I32),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let logits = b.binary(BinOp::Add, cache, cache).unwrap();
     let graph = b
         .finish(
             poot_graph_ir::Outputs::new(logits).with_state(&[(cache, cache), (counter, counter)]),
@@ -1717,11 +1554,17 @@ fn cache_write_graph() -> (
     poot_graph_ir::Traced,
     poot_graph_ir::Traced,
 ) {
-    let b = Builder::new();
-    let cache = b.state_input("cache", TensorType::f32(vec![4, 2]), StateRole::Recurrent);
-    let update = b.constant("update", TensorType::f32(vec![1, 2]));
-    let position = b.constant("position", TensorType::scalar(DType::I32));
-    let next = b.dynamic_update_slice_dyn(cache, update, position, 0);
+    let b = Builder::for_tests();
+    let cache = b
+        .state_input("cache", TensorType::f32(vec![4, 2]), StateRole::Recurrent)
+        .unwrap();
+    let update = b.constant("update", TensorType::f32(vec![1, 2])).unwrap();
+    let position = b
+        .constant("position", TensorType::scalar(DType::I32))
+        .unwrap();
+    let next = b
+        .dynamic_update_slice_dyn(cache, update, position, 0)
+        .unwrap();
     let graph = b
         .finish(poot_graph_ir::Outputs::new(next).with_state(&[(cache, next)]))
         .unwrap();
@@ -1823,10 +1666,14 @@ fn exact_i32_dynamic_update_slice_rejects_an_out_of_range_position() {
 fn eval_i32_requires_an_i32_tensor() {
     use crate::{EvalError, Value};
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![2], DType::I32));
-    let y = b.constant("y", TensorType::new(vec![2], DType::I32));
-    let out = b.binary(BinOp::Add, x, y);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![2], DType::I32))
+        .unwrap();
+    let y = b
+        .constant("y", TensorType::new(vec![2], DType::I32))
+        .unwrap();
+    let out = b.binary(BinOp::Add, x, y).unwrap();
     let g = b.finish(out).unwrap();
     let f32_only = HostTensor::f32(vec![2], vec![1.0, 2.0]);
     let inputs = HashMap::from([

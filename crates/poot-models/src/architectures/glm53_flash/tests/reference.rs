@@ -53,9 +53,9 @@ pub(super) struct Dims {
 }
 
 impl Dims {
-    pub fn of(config: &serde_json::Value) -> Self {
+    pub(super) fn of(config: &serde_json::Value) -> Self {
         let text = &config["text_config"];
-        let n = |k: &str| text[k].as_u64().unwrap() as usize;
+        let n = |k: &str| crate::registry::Fixture::count(text, k);
         let f = |k: &str| text[k].as_f64().unwrap();
         let linear = &text["linear_attn_config"];
         let layers = n("num_hidden_layers");
@@ -181,7 +181,7 @@ struct LayerHistory {
 }
 
 impl Reference {
-    pub fn new(config: &serde_json::Value, store: &WeightStore) -> Self {
+    pub(super) fn new(config: &serde_json::Value, store: &WeightStore) -> Self {
         let d = Dims::of(config);
         let w = store
             .iter()
@@ -580,7 +580,7 @@ impl Reference {
     /// token the target chose after the prefix), one position at a time with no cache but its own
     /// history; then `k - 1` more steps, each fed the previous step's post-norm state and greedy
     /// token at the next position. Returns the logits of the `k` draft steps and the tokens drawn.
-    pub fn mtp_chain(&self, tokens: &[usize], bonus: usize, k: usize) -> MtpChain {
+    pub(super) fn mtp_chain(&self, tokens: &[usize], bonus: usize, k: usize) -> MtpChain {
         let target = self.run(tokens, tokens.len());
         let n = tokens.len();
         let mut hist = LayerHistory::default();
@@ -609,7 +609,7 @@ impl Reference {
     }
 
     /// The model over `tokens` from position 0 with a cache of `capacity` positions.
-    pub fn run(&self, tokens: &[usize], capacity: usize) -> Run {
+    pub(super) fn run(&self, tokens: &[usize], capacity: usize) -> Run {
         let d = &self.d;
         let mut hist = vec![LayerHistory::default(); d.layers];
         let mut logits = Vec::new();

@@ -277,7 +277,7 @@ mod tests {
         case_of(
             (0..EXPERTS)
                 .map(|e| {
-                    Arc::new(poot_test_util::packed::prescribed_scale_payload(
+                    Arc::new(poot_quant::test_support::packed::prescribed_scale_payload(
                         format,
                         [out, k],
                         31 + 7 * e as u64,
@@ -465,7 +465,7 @@ mod tests {
             let case = case_of(
                 (0..EXPERTS)
                     .map(|e| {
-                        Arc::new(poot_test_util::packed::e8m0_scaled_payload(
+                        Arc::new(poot_quant::test_support::packed::e8m0_scaled_payload(
                             format,
                             [out, k],
                             31 + 7 * e as u64,

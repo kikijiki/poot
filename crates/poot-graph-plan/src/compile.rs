@@ -17,20 +17,30 @@
 //!   baseline as its [`Tier2Class`], and compile fails closed when the output graph implies a looser class
 //!   than the record allows (a pass that reassociates without recording it).
 
+use crate::buffer_plan::plan_buffers;
+use crate::dtype_widen::{
+    fold_dense_bf16_row_gathers, fold_dense_contractions, lower_nonlast_reduces,
+    widen_mismatched_matmul_dtypes,
+};
+use crate::graph_validation::ValidationPacketPlan;
+use crate::planner::{plan_eqn_compiled, plan_graph};
+use crate::production_plan::Submission;
+use crate::state_commit::{StateCommitPlan, state_commit_from_plans};
+#[cfg(feature = "test-support")]
+use crate::types::{DispatchPlanError, ScratchDecl};
+use crate::types::{GraphStorage, ValueStorage};
+#[cfg(feature = "test-support")]
+use crate::{Binding, DispatchPlan};
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
-#[cfg(test)]
-use poot_graph_ir::StateRole;
-#[cfg(test)]
-use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::analysis::{
     NumericalRewriteDecline, NumericsError, NumericsProperty, PASS_DECLARATIONS, PassDeclaration,
     implied_numerics, verify_pass_numerics,
 };
 use poot_graph_ir::{
-    BoundaryId, EditError, Eqn, Export, Graph, IndexRange, OpKind, Operand, Slot, ValueId,
-    ValueTable, value_ranges,
+    BoundaryId, ContractionRows, EditError, Eqn, Export, Graph, IndexRange, OpKind, Operand, Slot,
+    ValueId, ValueTable, value_ranges,
 };
 use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType;
@@ -39,7 +49,9 @@ use crate::passes::{
     self as transform, DecomposeError, GraphBudget, LegalizeError, PackedDequantProductionError,
 };
 pub use crate::passes::{LoraError, LoraPlan};
-use crate::*;
+use crate::{
+    BufferPlan, KernelChoice, Plan, PlanError, Refusal, compute_views, device_validation, planner,
+};
 
 /// What a graph is compiled for: the target and the device's measured capabilities (card 522). Passes and
 /// the planner read it; tracers never see it.
@@ -62,10 +74,16 @@ use crate::*;
 ///
 /// ```compile_fail,E0308
 /// use poot_graph_plan::Target;
-/// use poot_target::{AieCaps, AieTargetId, Backend};
+/// use poot_target::{AieCaps, AieTargetId, Backend, Queried};
 /// let _ = Target::Gpu {
 ///     backend: AieTargetId::Xdna2,
-///     caps: AieCaps::unmeasured(AieTargetId::Xdna2),
+///     caps: AieCaps {
+///         target: AieTargetId::Xdna2,
+///         tile_local_bytes: Queried::Unknown,
+///         host_bindings: Queried::Unknown,
+///         instruction_bytes: Queried::Unknown,
+///         memory_budget_bytes: Queried::Unknown,
+///     },
 /// };
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -133,6 +151,10 @@ impl CompileOptions {
 /// - `max_intermediate_values` and `max_intermediate_eqns` cap the value table and the equation list of
 ///   every graph a pass produces, the traced input and the final program included. A pass that would
 ///   append past either returns [`CompileError::Expansion`] before the append.
+/// - `max_graph_literal_bytes` and `max_graph_owned_bytes` cap the inline scalar literals and the
+///   requested owned storage (records, names, operand lists) of the graphs a pass builds through a
+///   tracer [`Builder`](poot_graph_ir::Builder): the same two [`TraceLimits`](poot_graph_ir::TraceLimits)
+///   fields a model trace states, applied to a graph a pass reopens.
 /// - `max_body_instructions` and `max_body_locals` cap one generated kernel body (statements plus block
 ///   terminators, and locals with parameters). An over-limit request is a typed planner refusal carrying
 ///   `poot_kernelgen::KernelGenError::BodyLimit`.
@@ -144,6 +166,8 @@ impl CompileOptions {
 pub struct CompileLimits {
     pub max_intermediate_values: NonZeroUsize,
     pub max_intermediate_eqns: NonZeroUsize,
+    pub max_graph_literal_bytes: NonZeroU64,
+    pub max_graph_owned_bytes: NonZeroU64,
     pub max_body_instructions: NonZeroUsize,
     pub max_body_locals: NonZeroUsize,
     pub max_artifact_bytes: NonZeroU64,
@@ -155,6 +179,8 @@ impl CompileLimits {
     pub const STANDARD: Self = Self {
         max_intermediate_values: NonZeroUsize::new(1 << 24).unwrap(),
         max_intermediate_eqns: NonZeroUsize::new(1 << 24).unwrap(),
+        max_graph_literal_bytes: NonZeroU64::new(256 << 20).unwrap(),
+        max_graph_owned_bytes: NonZeroU64::new(4 << 30).unwrap(),
         max_body_instructions: NonZeroUsize::new(1 << 22).unwrap(),
         max_body_locals: NonZeroUsize::new(1 << 18).unwrap(),
         max_artifact_bytes: NonZeroU64::new(512 << 20).unwrap(),
@@ -225,6 +251,9 @@ pub enum CompileError {
     /// An `I32 -> F32` cast whose operand the graph does not prove exactly representable (POOT-726).
     #[error(transparent)]
     CastRange(Box<CastRangeError>),
+    /// An `IndexedMatMul` whose expert ids the graph does not prove inside `[0, E)` (POOT-1119).
+    #[error(transparent)]
+    ExpertIds(Box<ExpertIdsError>),
     /// A pass produced a graph the edit check refused: a defect of the pass, never of the input graph
     /// (every `Graph` is well formed on its own).
     #[error(transparent)]
@@ -276,6 +305,100 @@ fn refuse_unproven_i32_casts(g: &Graph) -> Result<(), CastRangeError> {
         }
     }
     Ok(())
+}
+
+/// Why an indexed contraction's ids are not admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertIdsGap {
+    /// The proven range of the ids leaves `[0, E)`.
+    OutOfRange,
+    /// The range holds only because the index guard whose condition is `guard` replaced the lanes
+    /// outside it, and no declared validation output observes that guard: a bad id would turn silently
+    /// into a valid-looking expert.
+    UnobservedGuard { guard: ValueId },
+}
+
+/// An indexed contraction (`IndexedMatMul`, or the packed `PackedContraction` over an indexed stack) whose
+/// per-row expert ids are not proven in `[0, E)` (POOT-1119). The ids are proven by
+/// [`poot_graph_ir::value_ranges`] (an `ArgTopK`, a declared slot or weight range, a `Gather` of a ranged
+/// table, an index guard) and a range that rests on a guard's clamp additionally needs that guard's witness
+/// declared as a validation output. The device kernels do not check the id they read, and `E` is the
+/// weight's own leading extent (or the stack's declared expert count): no caller supplies it.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "equation {eqn}: {op} ids {ids} are proven in {proven}, not inside [0, {experts}), the experts of its \
+     weight: {gap:?}"
+)]
+pub struct ExpertIdsError {
+    /// The contraction equation's output value.
+    pub eqn: ValueId,
+    /// The contraction's op name.
+    pub op: String,
+    /// Its ids operand.
+    pub ids: ValueId,
+    /// `E`: the leading extent of the stacked weight, or the packed stack's declared experts.
+    pub experts: usize,
+    /// What the graph proves about `ids`.
+    pub proven: IndexRange,
+    /// What is missing.
+    pub gap: ExpertIdsGap,
+}
+
+/// Refuse every indexed contraction of `g` whose ids are not proven in `[0, E)` (POOT-1119), by the ranges
+/// and guard witnesses the graph itself carries.
+///
+/// The ids consumers of an input graph are `IndexedMatMul` (`[x, w, ids]`, `E` the extent of `w`) and
+/// `PackedContraction { rows: Indexed { experts } }` (`[x, ids, carriers..]`). A `ContractionEpilogue` over an
+/// indexed head is built by the fuse pass after this check from one of those two, never traced.
+fn refuse_unproven_expert_ids(g: &Graph) -> Result<(), ExpertIdsError> {
+    let facts = value_ranges(g);
+    let producers = transform::producer_map(g);
+    for eqn in g.eqns() {
+        // `g.validate()` (run by `compile` before the adapters and this check, and by the adapter itself)
+        // infers every equation, and `OpKind::infer` gives each of these operands a rank (w rank 3, ids
+        // rank 1), so none of them is a literal.
+        let (ids, experts) = match (&eqn.op, eqn.inputs.as_slice()) {
+            (OpKind::IndexedMatMul, [_, Operand::Value(weight), Operand::Value(ids)]) => {
+                (*ids, g.aval(*weight).shape.first().copied().unwrap_or(0))
+            }
+            (
+                OpKind::PackedContraction {
+                    rows: ContractionRows::Indexed { experts },
+                    ..
+                },
+                [_, Operand::Value(ids), ..],
+            ) => (*ids, *experts),
+            (OpKind::IndexedMatMul | OpKind::PackedContraction { .. }, operands) => unreachable!(
+                "equation {}: {} has operands {operands:?}; infer gives its weight and ids a rank, \
+                 so a literal there fails validation",
+                eqn.out,
+                eqn.op.name()
+            ),
+            _ => continue,
+        };
+        let proven = facts[ids].unwrap_or(IndexRange::I32);
+        let refusal = |gap| ExpertIdsError {
+            eqn: eqn.out,
+            op: eqn.op.name(),
+            ids,
+            experts,
+            proven,
+            gap,
+        };
+        if !IndexRange::below(experts).is_some_and(|valid| proven.within(&valid)) {
+            return Err(refusal(ExpertIdsGap::OutOfRange));
+        }
+        if let Some(guard) = transform::first_unobserved_clamp(g, &producers, &facts, ids) {
+            return Err(refusal(ExpertIdsGap::UnobservedGuard { guard }));
+        }
+    }
+    Ok(())
+}
+
+impl From<ExpertIdsError> for CompileError {
+    fn from(error: ExpertIdsError) -> Self {
+        CompileError::ExpertIds(Box::new(error))
+    }
 }
 
 impl From<PlanError> for CompileError {
@@ -351,7 +474,14 @@ pub struct Program {
     /// One plan per equation of `graph`, index-aligned with `graph.eqns`.
     plans: Vec<Plan>,
     /// The kernel the planner chose for each equation, index-aligned with `plans`. The executor never
-    /// reads it.
+    /// reads it; [`Program::kernel_choice`] (test-support) is its one reader.
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(
+            dead_code,
+            reason = "read only by the test-support `kernel_choice` accessor"
+        )
+    )]
     choices: Vec<KernelChoice>,
     storage: GraphStorage,
     slots: Vec<SlotSchema>,
@@ -467,6 +597,7 @@ impl Program {
     /// The kernel the planner chose for `eqn`, an equation of [`Program::graph`]: a generated request, an
     /// imported template, or no dispatch at all. Panics if `eqn` is not an equation of this program's
     /// graph.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn kernel_choice(&self, eqn: &Eqn) -> &KernelChoice {
         let index = self
             .graph
@@ -504,20 +635,6 @@ impl Program {
     /// The per-step slots and their storage.
     pub fn slots(&self) -> &[SlotSchema] {
         &self.slots
-    }
-
-    /// The tier-2 comparison class this program publishes (ADR-0101 decision 2): the strongest of the
-    /// traced graph's baseline and the declarations of the passes that changed it. [`compile`] has already
-    /// checked that the compiled graph implies nothing looser.
-    ///
-    /// Card 546b: narrowed from `pub` (gated `any(test, feature = "test-support")`) to `pub(crate)` -
-    /// its one cross-crate reader, `poot-gpu`'s own `src/tests/decode_cache_warmth.rs`, moved off
-    /// `GpuExecutor::run_resident_kv_cached` and was deleted with it, leaving the `pub` accessor with
-    /// no caller outside this crate's own tests (dead-pub has no exemption for an `any(test, ...)`
-    /// gate); every remaining caller is this crate's own tests.
-    #[cfg(test)]
-    pub(crate) fn reassociation_class(&self) -> Tier2Class {
-        recorded_numerics(self.baseline, &self.passes).tier2_class()
     }
 
     /// Numerical rewrites withheld during canonicalization, referring to the traced value ids.
@@ -574,7 +691,7 @@ pub fn compile(
     // Every `I32 -> F32` cast is proven exact from the graph as the caller wrote it, before a pass
     // rewrites it: a pass preserves the words, so its casts are the traced ones.
     refuse_unproven_i32_casts(g)?;
-    let _scope = CompileScope::enter();
+    refuse_unproven_expert_ids(g)?;
     // The passes that fit a graph to a GPU's limits read its capabilities; an AIE target has none of them
     // (no grid, no single-buffer limit, no tensor cores, no contraction lowering), so those passes are
     // GPU stages and an AIE compile does not run them.
@@ -922,8 +1039,7 @@ fn same_operand(a: &Operand, b: &Operand) -> bool {
 fn escaped_value(error: &PackedDequantProductionError) -> ValueId {
     use PackedDequantProductionError as Error;
     match error {
-        Error::PreexistingContraction { context }
-        | Error::CarrierStorage { context, .. }
+        Error::CarrierStorage { context, .. }
         | Error::CarrierIdentity { context, .. }
         | Error::CarrierEscape { context, .. }
         | Error::CarrierConsumerCount { context, .. }
@@ -1035,8 +1151,14 @@ fn revert_unplannable_rewrites(
 
 #[cfg(test)]
 mod tests {
+    use crate::planner::test_only::{per_eqn_plans_inside_compile, per_eqn_plans_outside_compile};
     use crate::test_support::{gpu_caps, gpu_caps_mut};
-    use poot_graph_ir::{BinOp, Builder, OpKind, RedOp, Scalar, Slot, Storage, TensorType, UnOp};
+    use crate::{Capability, Dispatch, plan_eqn};
+    use poot_graph_ir::analysis::Tier2Class;
+    use poot_graph_ir::{
+        BinOp, Builder, OpKind, RedOp, Scalar, Slot, StateRole, Storage, TensorType, UnOp,
+    };
+    use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_tensor::DType;
     use poot_test_util::device_caps::default_caps_for;
 
@@ -1071,13 +1193,13 @@ mod tests {
 
     /// `exp(x * s) + b` over one row: a float pointwise chain `fuse` turns into one region.
     fn pointwise_chain() -> Graph {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4, 8]));
-        let s = b.constant("s", TensorType::f32(vec![4, 8]));
-        let bias = b.constant("bias", TensorType::f32(vec![4, 8]));
-        let scaled = b.binary(BinOp::Mul, x, s);
-        let e = b.unary(UnOp::Exp, scaled);
-        let out = b.binary(BinOp::Add, e, bias);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+        let s = b.constant("s", TensorType::f32(vec![4, 8])).unwrap();
+        let bias = b.constant("bias", TensorType::f32(vec![4, 8])).unwrap();
+        let scaled = b.binary(BinOp::Mul, x, s).unwrap();
+        let e = b.unary(UnOp::Exp, scaled).unwrap();
+        let out = b.binary(BinOp::Add, e, bias).unwrap();
         b.finish(out).unwrap()
     }
 
@@ -1100,377 +1222,13 @@ mod tests {
         assert_eq!(program.reassociation_class(), Tier2Class::Reassociating);
     }
 
-    /// The first `phase` step of the granitemoe registry fixture (two routed layers, four experts) at
-    /// `tokens` tokens: the production family's own trace, not a hand-built graph.
-    fn granitemoe_step(phase: poot_models::model::Phase, tokens: usize) -> poot_graph_ir::Graph {
-        granitemoe_step_and_weights(phase, tokens).0
-    }
-
-    /// [`granitemoe_step`] with the model's weight map and the fixture store it binds.
-    fn granitemoe_step_and_weights(
-        phase: poot_models::model::Phase,
-        tokens: usize,
-    ) -> (
-        poot_graph_ir::Graph,
-        poot_quant::weights::WeightMap,
-        poot_quant::weights::WeightStore,
-    ) {
-        registered_step_and_weights("granite", Some("granitemoe"), phase, tokens)
-    }
-
-    /// The first `phase` step of a registered family's fixture (its `variant` fixture when named) at
-    /// `tokens` tokens, with the model's weight map and the store it binds.
-    fn registered_step_and_weights(
-        family: &str,
-        variant: Option<&str>,
-        phase: poot_models::model::Phase,
-        tokens: usize,
-    ) -> (
-        poot_graph_ir::Graph,
-        poot_quant::weights::WeightMap,
-        poot_quant::weights::WeightStore,
-    ) {
-        use poot_models::model::{KvLayout, LogitRows, StepShape};
-        use std::num::NonZeroUsize;
-
-        let registry = poot_models::registry::Registry::builtin().expect("the builtin registry");
-        let entry = registry
-            .entries()
-            .iter()
-            .find(|entry| entry.family.as_str() == family)
-            .unwrap_or_else(|| panic!("{family} is registered"));
-        let fixture = match variant {
-            None => (entry.fixture)(),
-            Some(variant) => {
-                let (_, make) = entry
-                    .variants
-                    .iter()
-                    .find(|(name, _)| *name == variant)
-                    .unwrap_or_else(|| panic!("{family} ships a {variant} fixture"));
-                make()
-            }
-        };
-        let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
-        let n = |v| NonZeroUsize::new(v).unwrap();
-        let graph = model
-            .trace(
-                phase,
-                StepShape {
-                    rows: n(1),
-                    tokens: n(tokens),
-                    capacity: n(8),
-                    kv: KvLayout::Contiguous,
-                    logits: LogitRows::Last,
-                    hidden: None,
-                },
-            )
-            .expect("the fixture traces");
-        (graph, model.weights().clone(), fixture.store)
-    }
-
-    /// The CPU oracle's output for `g` over the granitemoe fixture's weights and a fixed `tokens` prompt at
-    /// positions `0..` with zeroed caches.
-    fn oracle_logits(
-        g: &poot_graph_ir::Graph,
-        map: &poot_quant::weights::WeightMap,
-        store: &poot_quant::weights::WeightStore,
-        tokens: &[i32],
-    ) -> Vec<f32> {
-        use poot_graph_ir::{Slot, SlotKey};
-        let n = tokens.len();
-        let slots = [
-            (
-                SlotKey::new(Slot::Token, None),
-                poot_tensor::HostTensor::i32(vec![1, n], tokens.to_vec()),
-            ),
-            (
-                SlotKey::new(Slot::Pos, None),
-                poot_tensor::HostTensor::i32(vec![1, n], (0..n as i32).collect()),
-            ),
-        ];
-        let zeros: Vec<poot_tensor::HostTensor> = g
-            .state()
-            .map(|(si, _)| poot_tensor::HostTensor::zeros(g.aval(si).shape.clone()))
-            .collect();
-        let (out, _) =
-            poot_test_util::weight_map_oracle::eval_mapped(g, store, map, &slots, &zeros);
-        out.as_f32().expect("f32 logits").to_vec()
-    }
-
-    /// Whether `program` ran the pass named `pass` (it changed the graph).
-    fn ran(program: &Program, pass: &str) -> bool {
-        program.passes().any(|ran| ran == pass)
-    }
-
-    const PIPELINE_PASSES: [&str; 3] = [
-        "flash_attention_capped",
-        "fuse_contraction_epilogues",
-        "fuse",
-    ];
-
-    /// SC-002 (ruling XC2-05, production presets, no synthetic `Target`): the granitemoe prefill, whose two
-    /// routers contract more than one row, runs the whole pipeline on the ROCm, PTX and wgpu presets exactly as
-    /// the decode step does, and each program computes what the traced graph computes (ADR-0101 tier 2: every
-    /// element within 1e-4 relative, NaN fails).
-    ///
-    /// Mutation (observed red, restored; see the card record): skip the three passes in `compile` whenever
-    /// `routed_expert_sites(g)` is non-empty; the prefill program loses them on every preset and this row goes
-    /// red, as would the decode step's, which is a site too.
-    #[test]
-    fn routed_expert_prefill_runs_the_full_pipeline_on_every_preset() {
-        use poot_models::model::Phase;
-        use poot_target::{AmdArch, DeviceCaps};
-
-        let presets = [
-            (
-                "ROCm",
-                Target::Gpu {
-                    backend: Backend::AmdGcn(AmdArch::gfx1151()),
-                    caps: DeviceCaps::rocm_default(),
-                },
-            ),
-            (
-                "PTX",
-                Target::Gpu {
-                    backend: Backend::Nvptx,
-                    caps: DeviceCaps::ptx_default(),
-                },
-            ),
-            ("wgpu", wgpu()),
-        ];
-        let (prefill, map, store) = granitemoe_step_and_weights(Phase::Prefill, 4);
-        let decode = granitemoe_step(Phase::Decode, 1);
-        assert!(
-            !crate::passes::routed_expert_sites(&prefill).is_empty(),
-            "prefill has a site"
-        );
-        assert!(
-            !crate::passes::routed_expert_sites(&decode).is_empty(),
-            "a decode step's router is a site as well: the pool pages it"
-        );
-
-        let prompt = [3, 17, 40, 8];
-        let want = oracle_logits(&prefill, &map, &store, &prompt);
-        for (label, target) in &presets {
-            let program = compile(&prefill, target, &REPLAY).expect("prefill compiles");
-            for pass in PIPELINE_PASSES {
-                assert!(ran(&program, pass), "{label} prefill skipped {pass}");
-            }
-            let got = oracle_logits(program.graph(), &map, &store, &prompt);
-            assert_eq!(got.len(), want.len(), "{label}: logits length");
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
-                    "{label}: logit {i} is {g}, the traced graph gives {w}"
-                );
-            }
-            let program = compile(&decode, target, &REPLAY).expect("decode compiles");
-            for pass in PIPELINE_PASSES {
-                assert!(ran(&program, pass), "{label} decode skipped {pass}");
-            }
-        }
-    }
-
-    /// POOT-742 SC-003 (ruling XC2-05): every MoE family's prefill fixture, compiled through `compile_staged`
-    /// for the ROCm preset, runs the full pass list, and `routed_expert_sites` (which POOT-746's pool transform
-    /// reads in production) finds the family's routed experts: each family routes them through `components::moe`,
-    /// never a dense broadcast over all `E` experts. (`tile_matmuls` is gone: the planner makes that choice, so
-    /// the contraction and pointwise passes are `fuse_contraction_epilogues` and `fuse`. `flash_attention_capped`
-    /// is not asserted: deepseek4's compressed-sparse and gpt_oss's sink attention have no flash form.)
-    ///
-    /// Mutation (observed red, restored; see the card record): restore deepseek3's broadcast form (the routed
-    /// experts as a dense `MatMul` over all `E`); `routed_expert_sites` finds no site in `deepseek3` and this row
-    /// goes red naming that family.
-    #[test]
-    fn every_moe_family_prefill_has_routed_expert_sites_and_runs_every_pass_on_rocm() {
-        use poot_models::model::Phase;
-        use poot_target::{AmdArch, DeviceCaps};
-
-        // (registered family, fixture variant): every family whose FFN is routed experts.
-        const MOE_FAMILIES: [(&str, Option<&str>); 11] = [
-            ("llama", Some("mixtral")),
-            ("qwen3moe", None),
-            ("olmoe", None),
-            ("deepseek2", None),
-            ("deepseek3", None),
-            ("deepseek32", None),
-            ("deepseek4", None),
-            ("glm53_flash", None),
-            ("minimax_m2", None),
-            ("gpt_oss", None),
-            ("gemma4", Some("moe")),
-        ];
-        let rocm = Target::Gpu {
-            backend: Backend::AmdGcn(AmdArch::gfx1151()),
-            caps: DeviceCaps::rocm_default(),
-        };
-        let targets = TargetSet::single(DeviceId(0), rocm);
-        let partition = Partition {
-            experts: ExpertPlacement::AllResident,
-            devices: DevicePlacement::Single(DeviceId(0)),
-        };
-        for (family, variant) in MOE_FAMILIES {
-            let prefill = registered_step_and_weights(family, variant, Phase::Prefill, 4).0;
-            assert!(
-                !crate::passes::routed_expert_sites(&prefill).is_empty(),
-                "{family}: the prefill finds no routed-expert site"
-            );
-            let staged = compile_staged(&prefill, &targets, &partition, &REPLAY)
-                .unwrap_or_else(|e| panic!("{family}: prefill compiles: {e:?}"));
-            let stages: Vec<_> = staged.stages().collect();
-            assert_eq!(stages.len(), 1, "{family}: one stage");
-            for pass in ["fuse_contraction_epilogues", "fuse"] {
-                assert!(
-                    ran(stages[0].2, pass),
-                    "{family}: ROCm prefill skipped {pass}"
-                );
-            }
-        }
-    }
-
-    /// SC-001 (POOT-575, ruling XC2-05): the Qwen3-Next prefill, whose four routers contract eight rows, compiles
-    /// for the ROCm, PTX and wgpu presets with every pass (`flash_attention_capped`, both fuses) and plans each
-    /// router contraction on a generated tiled schedule, never the one-thread-per-output serial kernel; each
-    /// compiled program computes what the traced graph computes (ADR-0101 tier 2). The decode step, whose
-    /// router has one row, runs the same passes.
-    ///
-    /// Mutation (observed red, restored; see the card record): skip the three passes in `compile` whenever
-    /// `routed_expert_sites(g)` is non-empty; the pass check fails with "ROCm prefill skipped
-    /// flash_attention_capped". The router contraction's own schedule is guarded by the serial-kernel
-    /// assertion: planning it on the one-thread-per-output kernel instead of a generated tiled schedule
-    /// fails the `routers` check.
-    #[test]
-    fn qwen3next_prefill_tiles_its_routers_and_runs_every_pass_on_every_preset() {
-        use poot_models::model::Phase;
-        use poot_target::{AmdArch, DeviceCaps};
-
-        const TOKENS: usize = 8;
-        const EXPERTS: usize = 4;
-        let presets = [
-            (
-                "ROCm",
-                Target::Gpu {
-                    backend: Backend::AmdGcn(AmdArch::gfx1151()),
-                    caps: DeviceCaps::rocm_default(),
-                },
-            ),
-            (
-                "PTX",
-                Target::Gpu {
-                    backend: Backend::Nvptx,
-                    caps: DeviceCaps::ptx_default(),
-                },
-            ),
-            ("wgpu", wgpu()),
-        ];
-        let (prefill, map, store) =
-            registered_step_and_weights("qwen3next", None, Phase::Prefill, TOKENS);
-        assert!(
-            !crate::passes::routed_expert_sites(&prefill).is_empty(),
-            "the prefill's routers contract several rows"
-        );
-        let decode = registered_step_and_weights("qwen3next", None, Phase::Decode, 1).0;
-        let prompt: Vec<i32> = (0..TOKENS as i32).map(|t| (3 * t + 1) % 48).collect();
-        let want = oracle_logits(&prefill, &map, &store, &prompt);
-        for (label, target) in &presets {
-            let program = compile(&prefill, target, &REPLAY).expect("prefill compiles");
-            for pass in PIPELINE_PASSES {
-                assert!(ran(&program, pass), "{label} prefill skipped {pass}");
-            }
-            let routers = router_choices_are_serial(&program, TOKENS, EXPERTS);
-            assert_eq!(routers.len(), 4, "{label}: one router per layer");
-            assert!(
-                routers.iter().all(|&serial| !serial),
-                "{label}: the routers take the tiled schedule: {routers:?}"
-            );
-            let got = oracle_logits(program.graph(), &map, &store, &prompt);
-            assert_eq!(got.len(), want.len(), "{label}: logits length");
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
-                    "{label}: logit {i} is {g}, the traced graph gives {w}"
-                );
-            }
-            let program = compile(&decode, target, &REPLAY).expect("decode compiles");
-            for pass in PIPELINE_PASSES {
-                assert!(ran(&program, pass), "{label} decode skipped {pass}");
-            }
-        }
-    }
-
-    /// Whether each eqn of `program` that produces the router's `[tokens, experts]` logits plans the
-    /// one-thread-per-output serial kernel (`true`) or something else, the generated tiled GEMM among them.
-    fn router_choices_are_serial(program: &Program, tokens: usize, experts: usize) -> Vec<bool> {
-        let g = program.graph();
-        g.eqns()
-            .iter()
-            .filter(|eqn| {
-                matches!(
-                    eqn.op,
-                    OpKind::MatMul
-                        | OpKind::DenseContraction { .. }
-                        | OpKind::ContractionEpilogue { .. }
-                ) && g.aval(eqn.out).shape == [tokens, experts]
-            })
-            .map(|eqn| {
-                matches!(
-                    program.kernel_choice(eqn),
-                    KernelChoice::Generated(KernelRequest::Contraction(
-                        poot_kernelgen::ContractionSpec::Serial { .. }
-                            | poot_kernelgen::ContractionSpec::DenseSerial { .. }
-                    ))
-                )
-            })
-            .collect()
-    }
-
-    /// Card 557 SC-005 and the card-575 router row: the routed prefill's router contraction takes the generated
-    /// tiled schedule on the ROCm and PTX presets as on wgpu, never the one-thread-per-output serial kernel.
-    /// Mutation: route a router `MatMul` with `L > 1` to the serial kernel in `planner/matmul.rs`; the
-    /// router plans serial and this row goes red.
-    #[test]
-    fn routed_prefill_router_takes_the_tiled_schedule_on_every_preset() {
-        use poot_models::model::Phase;
-        use poot_target::{AmdArch, DeviceCaps};
-
-        let g = granitemoe_step(Phase::Prefill, 4);
-        for (label, target) in [
-            (
-                "ROCm",
-                Target::Gpu {
-                    backend: Backend::AmdGcn(AmdArch::gfx1151()),
-                    caps: DeviceCaps::rocm_default(),
-                },
-            ),
-            (
-                "PTX",
-                Target::Gpu {
-                    backend: Backend::Nvptx,
-                    caps: DeviceCaps::ptx_default(),
-                },
-            ),
-        ] {
-            let program = compile(&g, &target, &REPLAY).expect("the routed prefill compiles");
-            let choices = router_choices_are_serial(&program, 4, 4);
-            assert_eq!(
-                choices.len(),
-                2,
-                "{label}: one router in each of the two routed layers"
-            );
-            assert!(
-                choices.iter().all(|&serial| !serial),
-                "{label}: the router takes the tiled schedule: {choices:?}"
-            );
-        }
-    }
-
     /// SC-002: a graph no pass changes publishes its own baseline. A pure reshape moves no float value, so
     /// it is compared bit for bit.
     #[test]
     fn compile_of_an_untouched_movement_graph_publishes_bit_exact() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4, 8]));
-        let out = b.reshape(x, vec![8, 4]);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+        let out = b.reshape(x, vec![8, 4]).unwrap();
         let program =
             compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY).expect("a reshape compiles");
         assert_eq!(program.passes().count(), 0);
@@ -1482,9 +1240,11 @@ mod tests {
     /// fewer workgroups than the dispatch needs.
     #[test]
     fn compile_refuses_a_dispatch_beyond_the_target_grid() {
-        let b = Builder::new();
-        let raw = b.constant("raw", TensorType::new(vec![1024, 1], DType::E4M3FN));
-        let out = b.cast(raw, DType::F32);
+        let b = Builder::for_tests();
+        let raw = b
+            .constant("raw", TensorType::new(vec![1024, 1], DType::E4M3FN))
+            .unwrap();
+        let out = b.cast(raw, DType::F32).unwrap();
         let g = b.finish(out).unwrap();
         compile(&g, &wgpu(), &REPLAY).expect("the measured wgpu grid holds the dispatch");
 
@@ -1511,9 +1271,11 @@ mod tests {
     /// u32::MAX)` in `poot-kernelgen`'s `row`); the X dispatch is 128 groups and this goes red.
     #[test]
     fn compile_folds_a_row_parallel_softmax_past_the_target_x_grid() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 8, 16, 16]));
-        let out = poot_graph_ir::ops::softmax(&b, x);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::f32(vec![1, 8, 16, 16]))
+            .unwrap();
+        let out = poot_graph_ir::ops::softmax(&b, x).unwrap();
         let g = b.finish(out).unwrap();
         for backend in [
             Backend::SpirvVulkan,
@@ -1549,17 +1311,19 @@ mod tests {
     /// this row goes red.
     #[test]
     fn compile_refuses_a_non_axis_zero_scatter_on_every_target() {
-        let b = Builder::new();
-        let src = b.constant("src", TensorType::f32(vec![4, 5]));
-        let index = b.constant("index", TensorType::new(vec![4], DType::I32));
-        let out = b.scatter(src, index);
+        let b = Builder::for_tests();
+        let src = b.constant("src", TensorType::f32(vec![4, 5])).unwrap();
+        let index = b
+            .constant("index", TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let out = b.scatter(src, index).unwrap();
         let traced = b.finish(out).unwrap();
         let scatter_idx = traced
             .eqns()
             .iter()
             .position(|eqn| matches!(eqn.op, OpKind::Scatter { .. }))
             .expect("the traced graph has one Scatter equation");
-        let g = poot_test_util::graph_fixtures::derive(&traced, |draft| {
+        let g = poot_graph_ir::test_support::graph_fixtures::derive(&traced, |draft| {
             draft.eqns_mut()[scatter_idx].op = OpKind::Scatter { axis: 1 };
         })
         .unwrap();
@@ -1585,11 +1349,15 @@ mod tests {
     /// it - so this uses a mixed-dtype `ScatterUpdate` no pass rewrites instead.)
     #[test]
     fn compile_refuses_an_equation_the_traced_graph_cannot_run() {
-        let b = Builder::new();
-        let base = b.constant("base", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let src = b.constant("src", TensorType::f32(vec![1, 5]));
-        let inverse = b.constant("inverse", TensorType::new(vec![2], DType::I32));
-        let out = b.scatter_update(base, src, inverse);
+        let b = Builder::for_tests();
+        let base = b
+            .constant("base", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
+        let src = b.constant("src", TensorType::f32(vec![1, 5])).unwrap();
+        let inverse = b
+            .constant("inverse", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let out = b.scatter_update(base, src, inverse).unwrap();
         let refusal = refusal(
             compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY),
             "E4M3FN ScatterUpdate over an f32 source",
@@ -1606,13 +1374,19 @@ mod tests {
     /// not the stored-const lanes Card 1011 owns.
     #[test]
     fn compile_keeps_the_decomposition_when_the_target_refuses_the_fused_region() {
-        let b = Builder::new();
-        let x = b.slot(Slot::Activation, TensorType::new(vec![4, 8], DType::BF16));
-        let s = b.slot(Slot::Activation, TensorType::new(vec![4, 8], DType::BF16));
-        let bias = b.slot(Slot::Activation, TensorType::new(vec![4, 8], DType::BF16));
-        let scaled = b.binary(BinOp::Mul, x, s);
-        let e = b.unary(UnOp::Exp, scaled);
-        let out = b.binary(BinOp::Add, e, bias);
+        let b = Builder::for_tests();
+        let x = b
+            .slot(Slot::Activation, TensorType::new(vec![4, 8], DType::BF16))
+            .unwrap();
+        let s = b
+            .slot(Slot::Activation, TensorType::new(vec![4, 8], DType::BF16))
+            .unwrap();
+        let bias = b
+            .slot(Slot::Activation, TensorType::new(vec![4, 8], DType::BF16))
+            .unwrap();
+        let scaled = b.binary(BinOp::Mul, x, s).unwrap();
+        let e = b.unary(UnOp::Exp, scaled).unwrap();
+        let out = b.binary(BinOp::Add, e, bias).unwrap();
         let g = b.finish(out).unwrap();
 
         let optimized = transform::fuse(&g).unwrap();
@@ -1628,7 +1402,7 @@ mod tests {
                     fused,
                     Backend::SpirvVulkan,
                     &gpu_caps(&wgpu()),
-                    &poot_test_util::graph_fixtures::roomy_body_limits()
+                    &crate::test_support::roomy_body_limits()
                 ),
                 Err(PlanError::Refused(_))
             ),
@@ -1691,7 +1465,7 @@ mod tests {
             &g.eqns()[0],
             Backend::SpirvVulkan,
             &gpu_caps(&wgpu()),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .expect("a mul plans");
         assert_eq!(per_eqn_plans_outside_compile(), before + 1);
@@ -1706,9 +1480,11 @@ mod tests {
     /// permanent red test would fail every other row in this module too).
     #[test]
     fn compile_plans_a_non_last_axis_moe_gate_reduce_on_every_backend() {
-        let b = Builder::new();
-        let logits = b.constant("expert_logits", TensorType::f32(vec![4, 2]));
-        let gate = b.reduce(RedOp::Sum, logits, 0, false);
+        let b = Builder::for_tests();
+        let logits = b
+            .constant("expert_logits", TensorType::f32(vec![4, 2]))
+            .unwrap();
+        let gate = b.reduce(RedOp::Sum, logits, 0, false).unwrap();
         let g = b.finish(gate).unwrap();
 
         let inputs = HashMap::from([(
@@ -1785,13 +1561,15 @@ mod tests {
     /// an unsplit `lm_head`-shaped weight alongside it so `dce`/`fuse` see a realistic multi-value graph
     /// and the embed table is the only thing over `limit`.
     fn embed_gather_graph(vocab: usize, hidden: usize) -> Graph {
-        let b = Builder::new();
-        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-        let embed = b.constant(
-            "model.embed_tokens.weight",
-            TensorType::f32(vec![vocab, hidden]),
-        );
-        let out = b.gather_scalar(embed, 0, token);
+        let b = Builder::for_tests();
+        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32)).unwrap();
+        let embed = b
+            .constant(
+                "model.embed_tokens.weight",
+                TensorType::f32(vec![vocab, hidden]),
+            )
+            .unwrap();
+        let out = b.gather_scalar(embed, 0, token).unwrap();
         b.finish(out).unwrap()
     }
 
@@ -1800,11 +1578,11 @@ mod tests {
     /// `legalize`'s split rewrite never looks at the activation's storage, only the weight's, so a huge
     /// `k` (forcing even one row over the limit) stays a cheap fixture.
     fn matmul_graph(x_name: &str, k: usize, w_name: &str, n: usize) -> Graph {
-        let b = Builder::new();
-        let x0 = b.constant(x_name, TensorType::f32(vec![1, 1]));
-        let x = b.broadcast(x0, vec![1, k]);
-        let w = b.constant(w_name, TensorType::f32(vec![n, k]));
-        let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let b = Builder::for_tests();
+        let x0 = b.constant(x_name, TensorType::f32(vec![1, 1])).unwrap();
+        let x = b.broadcast(x0, vec![1, k]).unwrap();
+        let w = b.constant(w_name, TensorType::f32(vec![n, k])).unwrap();
+        let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         b.finish(out).unwrap()
     }
 
@@ -2010,15 +1788,19 @@ mod tests {
     /// splits the head; the planner cannot plan the F16 chunks, so `revert_unplannable_rewrites` undoes
     /// the split and the weight is whole again after the pass pipeline.
     fn tied_f16_head_graph(vocab: usize, hidden: usize) -> Graph {
-        let b = Builder::new();
-        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-        let w = b.constant(
-            "tied.weight",
-            TensorType::new(vec![vocab, hidden], DType::F16),
-        );
-        let embedded = b.cast(b.gather_scalar(w, 0, token), DType::F32);
-        let x = b.reshape(embedded, vec![1, hidden]);
-        let head = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let b = Builder::for_tests();
+        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32)).unwrap();
+        let w = b
+            .constant(
+                "tied.weight",
+                TensorType::new(vec![vocab, hidden], DType::F16),
+            )
+            .unwrap();
+        let embedded = b
+            .cast(b.gather_scalar(w, 0, token).unwrap(), DType::F32)
+            .unwrap();
+        let x = b.reshape(embedded, vec![1, hidden]).unwrap();
+        let head = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         b.finish(head).unwrap()
     }
 
@@ -2063,12 +1845,14 @@ mod tests {
 
     fn packed_linear_graph(format: poot_quant::format::WeightFormat, m: usize) -> Graph {
         let descriptor = poot_quant::PackedWeight::try_new(format, [8, 256]).unwrap();
-        let b = Builder::new();
-        let x = b.slot_named(
-            Slot::Activation,
-            "packed-compile",
-            TensorType::f32(vec![m, 256]),
-        );
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(
+                Slot::Activation,
+                "packed-compile",
+                TensorType::f32(vec![m, 256]),
+            )
+            .unwrap();
         let out =
             poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
         b.finish(out).unwrap()
@@ -2161,13 +1945,13 @@ mod tests {
         let descriptor =
             poot_quant::PackedWeight::try_new(poot_quant::format::WeightFormat::Q8_0, [8, 64])
                 .unwrap();
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let sources: Vec<poot_graph_ir::Traced> =
             poot_graph_ir::packed_source_constants("layer", descriptor)
                 .into_iter()
-                .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type))
+                .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type).unwrap())
                 .collect();
-        let decoded = b.packed_dequant(&sources, descriptor);
+        let decoded = b.packed_dequant(&sources, descriptor).unwrap();
         let graph = b.finish(decoded).unwrap();
         match compile(&graph, &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(error)) => assert!(
@@ -2194,9 +1978,9 @@ mod tests {
         let sources: Vec<poot_graph_ir::Traced> =
             poot_graph_ir::packed_source_constants(linear_id, moe_descriptor())
                 .into_iter()
-                .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type))
+                .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type).unwrap())
                 .collect();
-        b.packed_dequant(&sources, moe_descriptor())
+        b.packed_dequant(&sources, moe_descriptor()).unwrap()
     }
 
     /// Every packed layout the engine serves a routed projection in: a plain block format, a K-quant
@@ -2225,13 +2009,18 @@ mod tests {
 
     /// `packed_indexed_linear` over `MOE_EXPERTS` stacked experts of `format`.
     fn packed_moe_graph(format: poot_quant::format::WeightFormat) -> Graph {
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, STACK_K]));
-        let selector = b.slot_named(
-            Slot::Activation,
-            "moe-ids",
-            TensorType::new(vec![3], DType::I32),
-        );
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, STACK_K]))
+            .unwrap();
+        let selector = b
+            .slot_named_ranged(
+                Slot::Activation,
+                "moe-ids",
+                TensorType::new(vec![3], DType::I32),
+                IndexRange::below(MOE_EXPERTS).unwrap(),
+            )
+            .unwrap();
         let table = poot_graph_ir::ops::PackedExpertStack {
             stack_id: "moe.experts".to_string(),
             descriptor: stack_descriptor(format),
@@ -2300,20 +2089,27 @@ mod tests {
     /// re-admit a `Concat`-fed `IndexedMatMul` in `reject_packed_dequant_escapes`; this graph compiles.
     #[test]
     fn compile_refuses_the_materializing_packed_moe_chain() {
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, MOE_K]));
-        let selector = b.slot_named(
-            Slot::Activation,
-            "moe-ids",
-            TensorType::new(vec![3], DType::I32),
-        );
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, MOE_K]))
+            .unwrap();
+        let selector = b
+            .slot_named_ranged(
+                Slot::Activation,
+                "moe-ids",
+                TensorType::new(vec![3], DType::I32),
+                IndexRange::below(2).unwrap(),
+            )
+            .unwrap();
         let branch = |id: &str| {
             let dequant = staged_dequant(&b, id);
-            let t = b.transpose(dequant, vec![1, 0]);
-            b.reshape(t, vec![1, MOE_K, MOE_OUT])
+            let t = b.transpose(dequant, vec![1, 0]).unwrap();
+            b.reshape(t, vec![1, MOE_K, MOE_OUT]).unwrap()
         };
-        let table = b.concat(0, &[branch("expert.0"), branch("expert.1")]);
-        let out = b.indexed_matmul(x, table, selector);
+        let table = b
+            .concat(0, &[branch("expert.0"), branch("expert.1")])
+            .unwrap();
+        let out = b.indexed_matmul(x, table, selector).unwrap();
         match compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(_)) => {}
             other => panic!(
@@ -2351,20 +2147,25 @@ mod tests {
     /// generator -> `Plan(I32ReadAsF32 { value: 0, reader: .. })`.
     #[test]
     fn compile_reads_an_i32_slot_on_one_lane_for_gather_and_cast() {
-        let b = Builder::new();
-        let idx = b.slot_ranged(
-            Slot::Pos,
-            TensorType::new(vec![4], DType::I32),
-            IndexRange::below(16).unwrap(),
-        );
-        let table = b.constant("table", TensorType::f32(vec![16, 8]));
-        let gathered = b.gather(table, 0, idx);
-        let q = b.cast(idx, DType::F32);
-        let out = b.binary(
-            BinOp::Add,
-            gathered,
-            b.broadcast(b.reshape(q, vec![4, 1]), vec![4, 8]),
-        );
+        let b = Builder::for_tests();
+        let idx = b
+            .slot_ranged(
+                Slot::Pos,
+                TensorType::new(vec![4], DType::I32),
+                IndexRange::below(16).unwrap(),
+            )
+            .unwrap();
+        let table = b.constant("table", TensorType::f32(vec![16, 8])).unwrap();
+        let gathered = b.gather(table, 0, idx).unwrap();
+        let q = b.cast(idx, DType::F32).unwrap();
+        let out = b
+            .binary(
+                BinOp::Add,
+                gathered,
+                b.broadcast(b.reshape(q, vec![4, 1]).unwrap(), vec![4, 8])
+                    .unwrap(),
+            )
+            .unwrap();
         let g = b.finish(out).unwrap();
 
         let program = compile(&g, &wgpu(), &REPLAY).expect("every reader reads Slice<i32>");
@@ -2413,18 +2214,30 @@ mod tests {
     /// (`planner/movement.rs`) -> `Plan(I32ReadAsF32)`.
     #[test]
     fn compile_reads_an_i32_slot_on_one_lane_for_gather_and_scatter_update() {
-        let b = Builder::new();
-        let idx = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
-        let table = b.constant("table", TensorType::f32(vec![16, 8]));
-        let rows = b.gather(table, 0, idx);
-        let late = b.cast(b.binary_scalar(BinOp::GeU, idx, Scalar::I32(3)), DType::F32);
-        let update = b.binary(
-            BinOp::Add,
-            rows,
-            b.broadcast(b.reshape(late, vec![4, 1]), vec![4, 8]),
-        );
-        let cache = b.state_input("cache", TensorType::f32(vec![4, 8]), StateRole::Recurrent);
-        let written = b.scatter_update(cache, update, idx);
+        let b = Builder::for_tests();
+        let idx = b
+            .slot(Slot::Pos, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let table = b.constant("table", TensorType::f32(vec![16, 8])).unwrap();
+        let rows = b.gather(table, 0, idx).unwrap();
+        let late = b
+            .cast(
+                b.binary_scalar(BinOp::GeU, idx, Scalar::I32(3)).unwrap(),
+                DType::F32,
+            )
+            .unwrap();
+        let update = b
+            .binary(
+                BinOp::Add,
+                rows,
+                b.broadcast(b.reshape(late, vec![4, 1]).unwrap(), vec![4, 8])
+                    .unwrap(),
+            )
+            .unwrap();
+        let cache = b
+            .state_input("cache", TensorType::f32(vec![4, 8]), StateRole::Recurrent)
+            .unwrap();
+        let written = b.scatter_update(cache, update, idx).unwrap();
         let g = b
             .finish(poot_graph_ir::Outputs::new(written).with_state(&[(cache, written)]))
             .unwrap();
@@ -2452,17 +2265,27 @@ mod tests {
     /// token history) plans on every backend, each reading the pool as I32 words.
     #[test]
     fn compile_plans_an_i32_state_pool_gathered_and_scattered_on_one_lane() {
-        let b = Builder::new();
-        let pool = b.state_input(
-            "pool",
-            TensorType::new(vec![4, 3], DType::I32),
-            StateRole::Recurrent,
-        );
-        let read = b.slot(Slot::Pos, TensorType::new(vec![2], DType::I32));
-        let write = b.slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32));
-        let x = b.slot(Slot::Activation, TensorType::new(vec![2, 3], DType::I32));
-        let next = b.binary(BinOp::Add, b.gather(pool, 0, read), x);
-        let updated = b.scatter_update(pool, next, write);
+        let b = Builder::for_tests();
+        let pool = b
+            .state_input(
+                "pool",
+                TensorType::new(vec![4, 3], DType::I32),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let read = b
+            .slot(Slot::Pos, TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let write = b
+            .slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let x = b
+            .slot(Slot::Activation, TensorType::new(vec![2, 3], DType::I32))
+            .unwrap();
+        let next = b
+            .binary(BinOp::Add, b.gather(pool, 0, read).unwrap(), x)
+            .unwrap();
+        let updated = b.scatter_update(pool, next, write).unwrap();
         let g = b
             .finish(poot_graph_ir::Outputs::new(next).with_state(&[(pool, updated)]))
             .unwrap();
@@ -2481,20 +2304,30 @@ mod tests {
     /// source reads `Slice<i32>`.
     #[test]
     fn compile_plans_an_i32_scatter_update_source_beside_a_cast_reader() {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         // The cast readers' words are proven exact: the base is an iota table and the source declares
         // its range, so the result of the scatter (one or the other) is inside `[0, 12)`.
-        let base = b.reshape(b.iota_i32(12), vec![4, 3]);
-        let src = b.slot_ranged(
-            Slot::Activation,
-            TensorType::new(vec![2, 3], DType::I32),
-            IndexRange::below(12).unwrap(),
-        );
-        let inv = b.slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32));
-        let at = b.slot(Slot::Pos, TensorType::new(vec![2], DType::I32));
-        let updated = b.scatter_update(base, src, inv);
-        let rows = b.cast(b.gather(updated, 0, at), DType::F32);
-        let out = b.binary(BinOp::Add, rows, b.cast(src, DType::F32));
+        let base = b.reshape(b.iota_i32(12).unwrap(), vec![4, 3]).unwrap();
+        let src = b
+            .slot_ranged(
+                Slot::Activation,
+                TensorType::new(vec![2, 3], DType::I32),
+                IndexRange::below(12).unwrap(),
+            )
+            .unwrap();
+        let inv = b
+            .slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let at = b
+            .slot(Slot::Pos, TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let updated = b.scatter_update(base, src, inv).unwrap();
+        let rows = b
+            .cast(b.gather(updated, 0, at).unwrap(), DType::F32)
+            .unwrap();
+        let out = b
+            .binary(BinOp::Add, rows, b.cast(src, DType::F32).unwrap())
+            .unwrap();
         let g = b.finish(out).unwrap();
         for backend in [
             Backend::SpirvVulkan,
@@ -2526,9 +2359,11 @@ mod tests {
     /// `compile`; both graphs compile and this test goes red at `unwrap_err`.
     #[test]
     fn compile_refuses_an_i32_cast_the_graph_does_not_prove_exact() {
-        let b = Builder::new();
-        let ids = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
-        let cast = b.cast(ids, DType::F32);
+        let b = Builder::for_tests();
+        let ids = b
+            .slot(Slot::Token, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let cast = b.cast(ids, DType::F32).unwrap();
         let g = b.finish(cast).unwrap();
         let error = refused_cast(compile_verdict(&g).unwrap_err());
         assert_eq!(
@@ -2542,14 +2377,18 @@ mod tests {
         );
 
         // `pos` is `[0, 16)`, so `pos + 2^24` is `[2^24, 2^24 + 16)`: one lane past the exact integers.
-        let b = Builder::new();
-        let pos = b.slot_ranged(
-            Slot::Pos,
-            TensorType::new(vec![4], DType::I32),
-            IndexRange::below(16).unwrap(),
-        );
-        let late = b.binary_scalar(BinOp::Add, pos, Scalar::I32(1 << 24));
-        let cast = b.cast(late, DType::F32);
+        let b = Builder::for_tests();
+        let pos = b
+            .slot_ranged(
+                Slot::Pos,
+                TensorType::new(vec![4], DType::I32),
+                IndexRange::below(16).unwrap(),
+            )
+            .unwrap();
+        let late = b
+            .binary_scalar(BinOp::Add, pos, Scalar::I32(1 << 24))
+            .unwrap();
+        let cast = b.cast(late, DType::F32).unwrap();
         let g = b.finish(cast).unwrap();
         let error = refused_cast(compile_verdict(&g).unwrap_err());
         assert_eq!(error.cast, cast.id());
@@ -2574,35 +2413,40 @@ mod tests {
     #[test]
     fn compile_proves_declared_positions_top_k_ids_and_guarded_selectors() {
         // A declared position.
-        let b = Builder::new();
-        let pos = b.slot_ranged(
-            Slot::Pos,
-            TensorType::new(vec![4], DType::I32),
-            IndexRange::below(1 << 20).unwrap(),
-        );
-        let out = b.cast(pos, DType::F32);
+        let b = Builder::for_tests();
+        let pos = b
+            .slot_ranged(
+                Slot::Pos,
+                TensorType::new(vec![4], DType::I32),
+                IndexRange::below(1 << 20).unwrap(),
+            )
+            .unwrap();
+        let out = b.cast(pos, DType::F32).unwrap();
         let g = b.finish(out).unwrap();
         compile_verdict(&g).expect("a declared position is exact");
 
         // `ArgTopK` ids over an extent of 16.
-        let b = Builder::new();
-        let scores = b.constant("scores", TensorType::f32(vec![2, 16]));
-        let ids = b.arg_top_k(scores, 4);
-        let out = b.cast(ids, DType::F32);
+        let b = Builder::for_tests();
+        let scores = b.constant("scores", TensorType::f32(vec![2, 16])).unwrap();
+        let ids = b.arg_top_k(scores, 4).unwrap();
+        let out = b.cast(ids, DType::F32).unwrap();
         let g = b.finish(out).unwrap();
         compile_verdict(&g).expect("top-k ids are below the extent");
 
         // A guard output over an unbounded selector, and its successor (the live length).
         for successor in [false, true] {
-            let b = Builder::new();
-            let raw = b.slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32));
+            let b = Builder::for_tests();
+            let raw = b
+                .slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32))
+                .unwrap();
             let guard = b.guard_index_bounds(raw, 4).unwrap();
             let used = if successor {
                 b.binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1))
+                    .unwrap()
             } else {
                 guard.guarded
             };
-            let out = b.cast(used, DType::F32);
+            let out = b.cast(used, DType::F32).unwrap();
             let g = b.finish(out).unwrap();
             compile_verdict(&g)
                 .unwrap_or_else(|error| panic!("guarded (successor {successor}): {error}"));
@@ -2635,12 +2479,16 @@ mod tests {
         fn guarded_selector(bound: usize) -> Graph {
             // The `exact_i32.rs` selector chain: a Gather over an I32 weight table, the guard, the
             // selector Cast as the output, the guard's flag as the validation output.
-            let b = Builder::new();
-            let table = b.constant("route.table", TensorType::new(vec![4], DType::I32));
-            let indices = b.constant("route.indices", TensorType::new(vec![4], DType::I32));
-            let raw = b.gather(table, 0, indices);
+            let b = Builder::for_tests();
+            let table = b
+                .constant("route.table", TensorType::new(vec![4], DType::I32))
+                .unwrap();
+            let indices = b
+                .constant("route.indices", TensorType::new(vec![4], DType::I32))
+                .unwrap();
+            let raw = b.gather(table, 0, indices).unwrap();
             let guard = b.guard_index_bounds(raw, bound).unwrap();
-            let selected = b.cast(guard.guarded, DType::F32);
+            let selected = b.cast(guard.guarded, DType::F32).unwrap();
             b.finish(Outputs::new(selected).with_witness(
                 ValidationId(3),
                 "route.bounds",
@@ -2654,10 +2502,16 @@ mod tests {
 
         // HostCheckedSelector: `Cast(Gather(table, index))` of an I32 weight table. The authority took
         // the caller's `expert_count`; nothing in the graph bounds the table.
-        let b = Builder::new();
-        let table = b.constant("table", TensorType::new(vec![3], DType::I32));
-        let index = b.constant("index", TensorType::new(vec![2], DType::I32));
-        let out = b.cast(b.gather(table, 0, index), DType::F32);
+        let b = Builder::for_tests();
+        let table = b
+            .constant("table", TensorType::new(vec![3], DType::I32))
+            .unwrap();
+        let index = b
+            .constant("index", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let out = b
+            .cast(b.gather(table, 0, index).unwrap(), DType::F32)
+            .unwrap();
         let g = b.finish(out).unwrap();
         rows.push((
             "host-checked selector over a weight table",
@@ -2667,10 +2521,14 @@ mod tests {
         ));
 
         // The same selector over a table the graph defines (an iota): bounded by its definition.
-        let b = Builder::new();
-        let table = b.iota_i32(3);
-        let index = b.constant("index", TensorType::new(vec![2], DType::I32));
-        let out = b.cast(b.gather(table, 0, index), DType::F32);
+        let b = Builder::for_tests();
+        let table = b.iota_i32(3).unwrap();
+        let index = b
+            .constant("index", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let out = b
+            .cast(b.gather(table, 0, index).unwrap(), DType::F32)
+            .unwrap();
         let g = b.finish(out).unwrap();
         rows.push((
             "host-checked selector over a defined table",
@@ -2696,10 +2554,12 @@ mod tests {
         ));
 
         // Witness: the guard's flag cast, `[0, 2)` from the comparison rule alone.
-        let b = Builder::new();
-        let raw = b.constant("raw", TensorType::new(vec![4], DType::I32));
-        let flag = b.binary_scalar(BinOp::GeU, raw, Scalar::I32(4));
-        let out = b.cast(flag, DType::F32);
+        let b = Builder::for_tests();
+        let raw = b
+            .constant("raw", TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let flag = b.binary_scalar(BinOp::GeU, raw, Scalar::I32(4)).unwrap();
+        let out = b.cast(flag, DType::F32).unwrap();
         let g = b.finish(out).unwrap();
         rows.push((
             "witness lane flag",
@@ -2709,10 +2569,16 @@ mod tests {
         ));
 
         // An authorized cast whose source is neither a gather nor a guard nor a comparison.
-        let b = Builder::new();
-        let left = b.constant("left", TensorType::new(vec![2], DType::I32));
-        let right = b.constant("right", TensorType::new(vec![2], DType::I32));
-        let out = b.cast(b.binary(BinOp::Sub, left, right), DType::F32);
+        let b = Builder::for_tests();
+        let left = b
+            .constant("left", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let right = b
+            .constant("right", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let out = b
+            .cast(b.binary(BinOp::Sub, left, right).unwrap(), DType::F32)
+            .unwrap();
         let g = b.finish(out).unwrap();
         rows.push((
             "difference of two weight words",
@@ -2739,20 +2605,225 @@ mod tests {
         );
     }
 
+    /// POOT-1119 rows: `IndexedMatMul(x [3, 4], w [EXPERTS, 4, 5], ids [3])` over `ids` as built by
+    /// `selector`, through the real `compile`.
+    mod expert_ids {
+        use super::*;
+        use poot_graph_ir::{BuilderError, Outputs, Traced, ValidationId};
+
+        const EXPERTS: usize = 4;
+
+        type Ids = fn(&Builder) -> Result<Traced, BuilderError>;
+
+        fn matmul(ids: impl FnOnce(&Builder) -> Result<Traced, BuilderError>) -> (Graph, Traced) {
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![3, 4])).unwrap();
+            let w = b
+                .constant("w", TensorType::f32(vec![EXPERTS, 4, 5]))
+                .unwrap();
+            let ids = ids(&b).unwrap();
+            let out = b.indexed_matmul(x, w, ids).unwrap();
+            (b.finish(out).unwrap(), out)
+        }
+
+        fn refused(error: CompileError) -> ExpertIdsError {
+            match error {
+                CompileError::ExpertIds(error) => *error,
+                other => panic!("expected an expert-ids refusal, got {other:?}"),
+            }
+        }
+
+        /// Ids that are an unbounded slot are refused, naming the equation, the ids and the proven range.
+        ///
+        /// Mutation (never left in the tree): call `refuse_unproven_expert_ids(g)` in `compile` and drop
+        /// its result; the graph compiles and this goes red at `unwrap_err`.
+        #[test]
+        fn compile_refuses_ids_the_graph_does_not_prove_inside_the_experts() {
+            let mut ids = None;
+            let (g, out) = matmul(|b| {
+                let t = b.slot_named(
+                    Slot::Activation,
+                    "ids",
+                    TensorType::new(vec![3], DType::I32),
+                )?;
+                ids = Some(t.id());
+                Ok(t)
+            });
+            let error = refused(compile_verdict(&g).unwrap_err());
+            assert_eq!(
+                error,
+                ExpertIdsError {
+                    eqn: out.id(),
+                    op: "indexed_matmul".to_owned(),
+                    ids: ids.unwrap(),
+                    experts: EXPERTS,
+                    proven: IndexRange::I32,
+                    gap: ExpertIdsGap::OutOfRange,
+                }
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("equation {}", out.id()))
+            );
+
+            // A declared range that is one expert too wide is no proof either.
+            let (g, _) = matmul(|b| {
+                b.slot_named_ranged(
+                    Slot::Activation,
+                    "ids",
+                    TensorType::new(vec![3], DType::I32),
+                    IndexRange::below(EXPERTS + 1).unwrap(),
+                )
+            });
+            let error = refused(compile_verdict(&g).unwrap_err());
+            assert_eq!(error.proven, IndexRange::below(EXPERTS + 1).unwrap());
+            assert_eq!(error.gap, ExpertIdsGap::OutOfRange);
+        }
+
+        /// A declared slot, a `Gather` of a ranged weight table, and `ArgTopK` ids are admitted, with no
+        /// caller-supplied expert count anywhere.
+        ///
+        /// Mutation (never left in the tree): make `Gather`'s rule in `range.rs` return the whole `i32`
+        /// range; the gathered-table row is refused and this goes red naming it.
+        #[test]
+        fn compile_admits_declared_gathered_and_top_k_ids() {
+            let admitted = |row: &str, ids: Ids| {
+                let (g, _) = matmul(ids);
+                compile_verdict(&g).unwrap_or_else(|error| panic!("{row}: {error}"));
+            };
+            admitted("declared slot", |b| {
+                b.slot_named_ranged(
+                    Slot::Activation,
+                    "ids",
+                    TensorType::new(vec![3], DType::I32),
+                    IndexRange::below(EXPERTS).unwrap(),
+                )
+            });
+            admitted("gather of a ranged table", |b| {
+                let table = b.constant_ranged(
+                    "route.table",
+                    TensorType::new(vec![6], DType::I32),
+                    IndexRange::below(EXPERTS).unwrap(),
+                )?;
+                let tokens = b.constant("tokens", TensorType::new(vec![3], DType::I32))?;
+                b.gather(table, 0, tokens)
+            });
+            admitted("arg top-k", |b| {
+                let scores = b.constant("scores", TensorType::f32(vec![1, EXPERTS]))?;
+                let ids = b.arg_top_k(scores, 3)?;
+                b.reshape(ids, vec![3])
+            });
+        }
+
+        /// The traced packed MoE projection (`packed_indexed_linear`, a `PackedContraction` over an indexed
+        /// stack, not an `IndexedMatMul`) is held to the same proof: unproven ids are refused with the
+        /// stack's declared expert count, and the same graph over a ranged selector compiles.
+        ///
+        /// Mutation (never left in the tree): drop the `PackedContraction` arm of
+        /// `refuse_unproven_expert_ids`; the unproven graph compiles and this goes red.
+        #[test]
+        fn a_packed_indexed_projection_needs_proven_ids_too() {
+            let build = |declared: bool| {
+                let b = Builder::for_tests();
+                let x = b
+                    .slot_named(Slot::Activation, "moe-x", TensorType::f32(vec![3, STACK_K]))
+                    .unwrap();
+                let shape = TensorType::new(vec![3], DType::I32);
+                let selector = if declared {
+                    b.slot_named_ranged(
+                        Slot::Activation,
+                        "moe-ids",
+                        shape,
+                        IndexRange::below(MOE_EXPERTS).unwrap(),
+                    )
+                } else {
+                    b.slot_named(Slot::Activation, "moe-ids", shape)
+                }
+                .unwrap();
+                let table = poot_graph_ir::ops::PackedExpertStack {
+                    stack_id: "moe.experts".to_string(),
+                    descriptor: stack_descriptor(poot_quant::format::WeightFormat::Q8_0),
+                    experts: MOE_EXPERTS,
+                };
+                let out =
+                    poot_graph_ir::ops::packed_indexed_linear(&b, x, selector, &table).unwrap();
+                (b.finish(out).unwrap(), out.id(), selector.id())
+            };
+            let (declared, ..) = build(true);
+            compile_verdict(&declared).unwrap_or_else(|error| panic!("declared ids: {error}"));
+            let (unproven, eqn, ids) = build(false);
+            let error = refused(compile_verdict(&unproven).unwrap_err());
+            assert_eq!(
+                (error.eqn, error.ids, error.experts),
+                (eqn, ids, MOE_EXPERTS)
+            );
+            assert!(error.op.starts_with("packed_contraction"), "{}", error.op);
+            assert_eq!(error.gap, ExpertIdsGap::OutOfRange);
+        }
+
+        /// A guard puts ids in `[0, E)` by replacing the lanes outside it, so it admits them only when its
+        /// witness is a declared validation output: the same graph is refused without the declaration.
+        ///
+        /// Mutation (never left in the tree): drop the `first_unobserved_clamp` check from
+        /// `refuse_unproven_expert_ids`; the undeclared row compiles and this goes red.
+        #[test]
+        fn a_guarded_id_needs_its_witness_declared() {
+            let build = |declared: bool| {
+                let b = Builder::for_tests();
+                let x = b.constant("x", TensorType::f32(vec![3, 4])).unwrap();
+                let w = b
+                    .constant("w", TensorType::f32(vec![EXPERTS, 4, 5]))
+                    .unwrap();
+                let raw = b
+                    .slot_named(
+                        Slot::Activation,
+                        "ids",
+                        TensorType::new(vec![3], DType::I32),
+                    )
+                    .unwrap();
+                let guard = b.guard_index_bounds(raw, EXPERTS).unwrap();
+                let out = b.indexed_matmul(x, w, guard.guarded).unwrap();
+                let outputs = Outputs::new(out);
+                let outputs = if declared {
+                    outputs.with_witness(ValidationId(0), "ids.bounds", guard.witness)
+                } else {
+                    outputs
+                };
+                (b.finish(outputs).unwrap(), out.id(), guard.guarded.id())
+            };
+            let (declared, ..) = build(true);
+            compile_verdict(&declared).unwrap_or_else(|error| panic!("declared witness: {error}"));
+
+            let (undeclared, matmul, ids) = build(false);
+            let error = refused(compile_verdict(&undeclared).unwrap_err());
+            assert_eq!((error.eqn, error.ids), (matmul, ids));
+            assert_eq!(error.proven, IndexRange::below(EXPERTS).unwrap());
+            assert!(
+                matches!(error.gap, ExpertIdsGap::UnobservedGuard { .. }),
+                "{error:?}"
+            );
+        }
+    }
+
     /// POOT-1074: an I32 carried value is one buffer across steps. The state `s` is read as a `Gather` index
     /// and its next value is `GeU(slot, 3)`. Both are dense I32 words on every backend.
     #[test]
     fn compile_stores_a_carried_i32_state_and_its_next_value_as_i32() {
-        let b = Builder::new();
-        let s = b.state_input(
-            "s",
-            TensorType::new(vec![4], DType::I32),
-            StateRole::Recurrent,
-        );
-        let table = b.constant("table", TensorType::f32(vec![16, 8]));
-        let gathered = b.gather(table, 0, s);
-        let pos = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
-        let next = b.binary_scalar(BinOp::GeU, pos, Scalar::I32(3));
+        let b = Builder::for_tests();
+        let s = b
+            .state_input(
+                "s",
+                TensorType::new(vec![4], DType::I32),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let table = b.constant("table", TensorType::f32(vec![16, 8])).unwrap();
+        let gathered = b.gather(table, 0, s).unwrap();
+        let pos = b
+            .slot(Slot::Pos, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let next = b.binary_scalar(BinOp::GeU, pos, Scalar::I32(3)).unwrap();
         let g = b
             .finish(poot_graph_ir::Outputs::new(gathered).with_state(&[(s, next)]))
             .unwrap();
@@ -2778,19 +2849,33 @@ mod tests {
     /// plans the slot as dense I32 for both readers.
     #[test]
     fn compile_reads_an_i32_buffer_on_one_lane_through_an_alias() {
-        let b = Builder::new();
-        let idx = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
-        let table = b.constant("table", TensorType::f32(vec![16, 8]));
-        let rows = b.gather(table, 0, idx);
-        let late = b.cast(b.binary_scalar(BinOp::GeU, idx, Scalar::I32(3)), DType::F32);
-        let update = b.binary(
-            BinOp::Add,
-            rows,
-            b.broadcast(b.reshape(late, vec![4, 1]), vec![4, 8]),
-        );
-        let cache = b.state_input("cache", TensorType::f32(vec![4, 8]), StateRole::Recurrent);
-        let inverse = b.reshape(b.reshape(idx, vec![2, 2]), vec![4]);
-        let written = b.scatter_update(cache, update, inverse);
+        let b = Builder::for_tests();
+        let idx = b
+            .slot(Slot::Pos, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let table = b.constant("table", TensorType::f32(vec![16, 8])).unwrap();
+        let rows = b.gather(table, 0, idx).unwrap();
+        let late = b
+            .cast(
+                b.binary_scalar(BinOp::GeU, idx, Scalar::I32(3)).unwrap(),
+                DType::F32,
+            )
+            .unwrap();
+        let update = b
+            .binary(
+                BinOp::Add,
+                rows,
+                b.broadcast(b.reshape(late, vec![4, 1]).unwrap(), vec![4, 8])
+                    .unwrap(),
+            )
+            .unwrap();
+        let cache = b
+            .state_input("cache", TensorType::f32(vec![4, 8]), StateRole::Recurrent)
+            .unwrap();
+        let inverse = b
+            .reshape(b.reshape(idx, vec![2, 2]).unwrap(), vec![4])
+            .unwrap();
+        let written = b.scatter_update(cache, update, inverse).unwrap();
         let g = b
             .finish(poot_graph_ir::Outputs::new(written).with_state(&[(cache, written)]))
             .unwrap();
@@ -2842,7 +2927,7 @@ mod tests {
         poot_graph_ir::Graph,
         Vec<(&'static str, poot_graph_ir::ValueId)>,
     ) {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let mut members = Vec::new();
         let out = match chain {
             PackedChain::Canonical { reshape } => {
@@ -2851,50 +2936,56 @@ mod tests {
                 } else {
                     vec![2, MOE_K]
                 };
-                let x = b.slot_named(Slot::Activation, "chain-x", TensorType::f32(shape));
+                let x = b
+                    .slot_named(Slot::Activation, "chain-x", TensorType::f32(shape))
+                    .unwrap();
                 let dequant = staged_dequant(&b, "layer");
-                let transpose = b.transpose(dequant, vec![1, 0]);
+                let transpose = b.transpose(dequant, vec![1, 0]).unwrap();
                 members.extend([("dequant", dequant), ("transpose", transpose)]);
                 let weight = if reshape {
-                    let reshaped = b.reshape(transpose, vec![1, MOE_K, MOE_OUT]);
+                    let reshaped = b.reshape(transpose, vec![1, MOE_K, MOE_OUT]).unwrap();
                     members.push(("reshape", reshaped));
                     reshaped
                 } else {
                     transpose
                 };
-                b.matmul(x, weight)
+                b.matmul(x, weight).unwrap()
             }
             PackedChain::Blocked => {
-                let x = b.slot_named(
-                    Slot::Activation,
-                    "chain-x",
-                    TensorType::f32(vec![2, 2, MOE_K]),
-                );
+                let x = b
+                    .slot_named(
+                        Slot::Activation,
+                        "chain-x",
+                        TensorType::f32(vec![2, 2, MOE_K]),
+                    )
+                    .unwrap();
                 let dequant = staged_dequant(&b, "layer");
-                let reshape = b.reshape(dequant, vec![2, MOE_OUT / 2, MOE_K]);
-                let transpose = b.transpose(reshape, vec![0, 2, 1]);
+                let reshape = b.reshape(dequant, vec![2, MOE_OUT / 2, MOE_K]).unwrap();
+                let transpose = b.transpose(reshape, vec![0, 2, 1]).unwrap();
                 members.extend([
                     ("dequant", dequant),
                     ("reshape", reshape),
                     ("transpose", transpose),
                 ]);
-                b.matmul(x, transpose)
+                b.matmul(x, transpose).unwrap()
             }
             PackedChain::Transposed { reshape } => {
-                let x = b.slot_named(Slot::Activation, "chain-x", TensorType::f32(vec![2, MOE_K]));
-                let activation_t = b.transpose(x, vec![1, 0]);
+                let x = b
+                    .slot_named(Slot::Activation, "chain-x", TensorType::f32(vec![2, MOE_K]))
+                    .unwrap();
+                let activation_t = b.transpose(x, vec![1, 0]).unwrap();
                 let dequant = staged_dequant(&b, "layer");
                 members.extend([("activation_t", activation_t), ("dequant", dequant)]);
                 let weight = if reshape {
-                    let reshaped = b.reshape(dequant, vec![MOE_OUT, MOE_K]);
+                    let reshaped = b.reshape(dequant, vec![MOE_OUT, MOE_K]).unwrap();
                     members.push(("reshape", reshaped));
                     reshaped
                 } else {
                     dequant
                 };
-                let product = b.matmul(weight, activation_t);
+                let product = b.matmul(weight, activation_t).unwrap();
                 members.push(("product", product));
-                b.transpose(product, vec![1, 0])
+                b.transpose(product, vec![1, 0]).unwrap()
             }
         };
         let witness = live.map(|(name, live)| {
@@ -2904,14 +2995,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("{chain:?} has no member {name}"));
             match live {
                 Live::Escape => member,
-                Live::Consumer => b.reduce(RedOp::Sum, member, 0, false),
+                Live::Consumer => b.reduce(RedOp::Sum, member, 0, false).unwrap(),
             }
         });
         let validations: Vec<(poot_graph_ir::ValidationId, &str, poot_graph_ir::Traced)> = witness
             .into_iter()
             .map(|witness| (poot_graph_ir::ValidationId(1), "live-member", witness))
             .collect();
-        let graph = crate::test_support::finish_with_validations(b, out, &validations).unwrap();
+        let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
+            b,
+            out,
+            &validations,
+        )
+        .unwrap();
         let members = members
             .into_iter()
             .map(|(name, member)| (name, member.id()))
@@ -3125,25 +3221,27 @@ mod tests {
         )
         .unwrap();
         for transposed in [false, true] {
-            let b = Builder::new();
-            let x = b.slot_named(
-                Slot::Activation,
-                "square-x",
-                TensorType::f32(vec![MOE_K, MOE_K]),
-            );
+            let b = Builder::for_tests();
+            let x = b
+                .slot_named(
+                    Slot::Activation,
+                    "square-x",
+                    TensorType::f32(vec![MOE_K, MOE_K]),
+                )
+                .unwrap();
             let sources: Vec<poot_graph_ir::Traced> =
                 poot_graph_ir::packed_source_constants("layer", square)
                     .into_iter()
-                    .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type))
+                    .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type).unwrap())
                     .collect();
-            let dequant = b.packed_dequant(&sources, square);
+            let dequant = b.packed_dequant(&sources, square).unwrap();
             let out = if transposed {
-                let x_t = b.transpose(x, vec![1, 0]);
-                let sum = b.binary(BinOp::Add, dequant, x_t);
-                b.transpose(sum, vec![1, 0])
+                let x_t = b.transpose(x, vec![1, 0]).unwrap();
+                let sum = b.binary(BinOp::Add, dequant, x_t).unwrap();
+                b.transpose(sum, vec![1, 0]).unwrap()
             } else {
-                let w_t = b.transpose(dequant, vec![1, 0]);
-                b.binary(BinOp::Add, x, w_t)
+                let w_t = b.transpose(dequant, vec![1, 0]).unwrap();
+                b.binary(BinOp::Add, x, w_t).unwrap()
             };
             let graph = b.finish(out).unwrap();
             match compile(&graph, &wgpu(), &REPLAY) {
@@ -3165,12 +3263,12 @@ mod tests {
     /// unclaimed activation, so `compile` refuses it as `Unmatched`.
     #[test]
     fn compile_claims_a_matmul_of_two_packed_chains_once() {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let a = staged_dequant(&b, "layer.a");
         let dequant_b = staged_dequant(&b, "layer.b");
-        let b_t = b.transpose(dequant_b, vec![1, 0]);
-        let product = b.matmul(a, b_t);
-        let out = b.transpose(product, vec![1, 0]);
+        let b_t = b.transpose(dequant_b, vec![1, 0]).unwrap();
+        let product = b.matmul(a, b_t).unwrap();
+        let out = b.transpose(product, vec![1, 0]).unwrap();
         let graph = b.finish(out).unwrap();
         match compile(&graph, &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(error))
@@ -3187,18 +3285,22 @@ mod tests {
     /// and a `State`-storage carrier is `CarrierStorage`.
     #[test]
     fn compile_refuses_a_packed_carrier_that_is_only_a_state_output() {
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "state-x", TensorType::f32(vec![2, MOE_K]));
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "state-x", TensorType::f32(vec![2, MOE_K]))
+            .unwrap();
         let constants = poot_graph_ir::packed_source_constants("layer", moe_descriptor());
         let carrier_type = constants[0].1.clone();
         let sources: Vec<poot_graph_ir::Traced> = constants
             .into_iter()
-            .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type))
+            .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type).unwrap())
             .collect();
-        let dequant = b.packed_dequant(&sources, moe_descriptor());
-        let transpose = b.transpose(dequant, vec![1, 0]);
-        let out = b.matmul(x, transpose);
-        let state_in = b.state_input("carrier.state", carrier_type, StateRole::Recurrent);
+        let dequant = b.packed_dequant(&sources, moe_descriptor()).unwrap();
+        let transpose = b.transpose(dequant, vec![1, 0]).unwrap();
+        let out = b.matmul(x, transpose).unwrap();
+        let state_in = b
+            .state_input("carrier.state", carrier_type, StateRole::Recurrent)
+            .unwrap();
         let graph = b
             .finish(poot_graph_ir::Outputs::new(out).with_state(&[(state_in, sources[0])]))
             .unwrap();
@@ -3227,20 +3329,28 @@ mod tests {
     /// `Recurrent` and fails this test's first assertion.
     #[test]
     fn compile_state_pairs_report_the_traced_roles() {
-        let b = Builder::new();
-        let pos_slot = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-        let kv_cache = b.state_input(
-            "kv.cache",
-            TensorType::f32(vec![1, 1, 4, 2]),
-            StateRole::Positional { axis: 2 },
-        );
-        let update = b.constant("update", TensorType::f32(vec![1, 1, 1, 2]));
-        let kv_out = b.dynamic_update_slice_dyn(kv_cache, update, pos_slot, 2);
-        let gdn_state = b.state_input(
-            "gdn.state",
-            TensorType::f32(vec![2, 2]),
-            StateRole::Recurrent,
-        );
+        let b = Builder::for_tests();
+        let pos_slot = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
+        let kv_cache = b
+            .state_input(
+                "kv.cache",
+                TensorType::f32(vec![1, 1, 4, 2]),
+                StateRole::Positional { axis: 2 },
+            )
+            .unwrap();
+        let update = b
+            .constant("update", TensorType::f32(vec![1, 1, 1, 2]))
+            .unwrap();
+        let kv_out = b
+            .dynamic_update_slice_dyn(kv_cache, update, pos_slot, 2)
+            .unwrap();
+        let gdn_state = b
+            .state_input(
+                "gdn.state",
+                TensorType::f32(vec![2, 2]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
         let graph = b
             .finish(
                 poot_graph_ir::Outputs::new(kv_out)
@@ -3276,8 +3386,10 @@ mod tests {
     /// A packed embedding lookup over `ids_shape` row ids (`[]` is the decode token, `[L]` a
     /// prefill).
     fn packed_embedding_graph(ids_shape: Vec<usize>) -> Graph {
-        let b = Builder::new();
-        let ids = b.slot(Slot::Token, TensorType::new(ids_shape, DType::I32));
+        let b = Builder::for_tests();
+        let ids = b
+            .slot(Slot::Token, TensorType::new(ids_shape, DType::I32))
+            .unwrap();
         let rows = poot_graph_ir::ops::packed_embedding(
             &b,
             ids,
@@ -3333,39 +3445,51 @@ mod tests {
 
     /// A former region source built from primitives. Mirrored by the wgpu acceptance fixture.
     fn former_region_chain_fixture() -> Graph {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 5]));
-        let raw = b.constant("w.weight", TensorType::new(vec![3, 5], DType::E4M3FN));
-        let decoded = b.cast(raw, DType::F32);
-        let scale = b.constant("w.weight_scale", TensorType::f32(vec![2, 3]));
-        let out_index = b.constant(
-            "w.fp8_out_block_index",
-            TensorType::new(vec![3], DType::I32),
-        );
-        let in_index = b.constant("w.fp8_in_block_index", TensorType::new(vec![5], DType::I32));
-        let rows = b.gather(scale, 0, out_index);
-        let expanded_scale = b.gather(rows, 1, in_index);
-        let scaled = b.binary(BinOp::Mul, decoded, expanded_scale);
-        let weight = b.transpose(scaled, vec![1, 0]);
-        let y = b.matmul(x, weight);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 5])).unwrap();
+        let raw = b
+            .constant("w.weight", TensorType::new(vec![3, 5], DType::E4M3FN))
+            .unwrap();
+        let decoded = b.cast(raw, DType::F32).unwrap();
+        let scale = b
+            .constant("w.weight_scale", TensorType::f32(vec![2, 3]))
+            .unwrap();
+        let out_index = b
+            .constant(
+                "w.fp8_out_block_index",
+                TensorType::new(vec![3], DType::I32),
+            )
+            .unwrap();
+        let in_index = b
+            .constant("w.fp8_in_block_index", TensorType::new(vec![5], DType::I32))
+            .unwrap();
+        let rows = b.gather(scale, 0, out_index).unwrap();
+        let expanded_scale = b.gather(rows, 1, in_index).unwrap();
+        let scaled = b.binary(BinOp::Mul, decoded, expanded_scale).unwrap();
+        let weight = b.transpose(scaled, vec![1, 0]).unwrap();
+        let y = b.matmul(x, weight).unwrap();
         b.finish(y).unwrap()
     }
 
     fn dense_decode_fixture() -> Graph {
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, 8]));
-        let w = b.constant("w", TensorType::f32(vec![8, 8]));
-        let bias = b.constant("bias", TensorType::f32(vec![8]));
-        let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, 8]))
+            .unwrap();
+        let w = b.constant("w", TensorType::f32(vec![8, 8])).unwrap();
+        let bias = b.constant("bias", TensorType::f32(vec![8])).unwrap();
+        let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias)).unwrap();
         b.finish(y).unwrap()
     }
 
     fn prefill_fixture() -> Graph {
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![8, 8]));
-        let w = b.constant("w", TensorType::f32(vec![8, 8]));
-        let bias = b.constant("bias", TensorType::f32(vec![8]));
-        let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![8, 8]))
+            .unwrap();
+        let w = b.constant("w", TensorType::f32(vec![8, 8])).unwrap();
+        let bias = b.constant("bias", TensorType::f32(vec![8])).unwrap();
+        let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias)).unwrap();
         b.finish(y).unwrap()
     }
 
@@ -3373,8 +3497,10 @@ mod tests {
         use poot_quant::PackedWeight;
         use poot_quant::format::WeightFormat;
 
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, 256]));
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, 256]))
+            .unwrap();
         let weight = PackedWeight::try_new(WeightFormat::Q8_0, [64, 256]).unwrap();
         let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", weight, None, None).unwrap();
         b.finish(y).unwrap()
@@ -3414,15 +3540,17 @@ mod tests {
     /// W16: a gather the claim does not take - along axis 1 - is still refused by the gate.
     #[test]
     fn compile_refuses_a_packed_gather_along_another_axis() {
-        let b = Builder::new();
-        let ids = b.slot(Slot::Token, TensorType::new(vec![2], DType::I32));
+        let b = Builder::for_tests();
+        let ids = b
+            .slot(Slot::Token, TensorType::new(vec![2], DType::I32))
+            .unwrap();
         let sources: Vec<poot_graph_ir::Traced> =
             poot_graph_ir::packed_source_constants("table", embedding_descriptor())
                 .into_iter()
-                .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type))
+                .map(|(name, tensor_type)| b.constant(name.as_str(), tensor_type).unwrap())
                 .collect();
-        let table = b.packed_dequant(&sources, embedding_descriptor());
-        let columns = b.gather(table, 1, ids);
+        let table = b.packed_dequant(&sources, embedding_descriptor()).unwrap();
+        let columns = b.gather(table, 1, ids).unwrap();
         match compile(&b.finish(columns).unwrap(), &wgpu(), &REPLAY) {
             Err(CompileError::PackedDequant(_)) => {}
             other => panic!(
@@ -3474,34 +3602,32 @@ mod tests {
         );
     }
 
-    /// SC-002 (card 1067), model-free, through `compile`: an id no expert of the stack holds - past the last
-    /// expert, or negative - is the same typed index fault from the split graph as from the unsplit
-    /// one (the same row): a split never turns an invalid id into a valid row.
-    /// Mutation: in `split_oversized_expert_stacks` drop the invalid-row offset (`UNHELD_ID * (1 - held)`). Red: `split
-    /// graph, id 5: HostTensor { .. }` - the invalid id reads expert 0 in every piece and the split graph evaluates.
+    /// POOT-1119, through `compile`: the split of a routed stack keeps the expert-id proof. The ids of the
+    /// unsplit graph are declared in `[0, E)`; each piece's ids (`max(id - lo, 0) % (hi - lo)`) are proven in
+    /// the piece's own `[0, hi - lo)` by the range rules, so `compile` admits the split graph, and a split
+    /// that lost the proof (ids left as shifted arithmetic) would be refused as `ExpertIds`.
+    /// Mutation: in `split_oversized_expert_stacks` replace the `RemU` by the piece length with an `Add` of
+    /// `0` (the ids stay unbounded arithmetic); the split graph is refused with `ExpertIds ... OutOfRange`
+    /// and this goes red.
     #[test]
-    fn a_split_expert_stack_keeps_invalid_ids_invalid() {
+    fn a_split_expert_stack_keeps_its_ids_proven() {
         let fixture = SplitStack::new();
-        let (split_graph, split_stacks) = fixture.oracle_split(&fixture.legalize());
-        for invalid in [5, 9, -1, i32::MIN, i32::MAX] {
-            let routed = [0, 3, invalid, 4, 1, 0, 2, 2, 3, 1, 4];
-            let unsplit = fixture
-                .run(&fixture.graph, &routed, &fixture.unsplit_stacks())
-                .expect_err("the unsplit oracle refuses an invalid id");
-            let split = fixture
-                .run(&split_graph, &routed, &split_stacks)
-                .expect_err(&format!("split graph, id {invalid}"));
-            let (poot_eval::EvalError::Index(want), poot_eval::EvalError::Index(got)) =
-                (&unsplit, &split)
-            else {
-                panic!("both refuse with an index fault: {unsplit:?} vs {split:?}");
-            };
-            assert_eq!(
-                got.position, want.position,
-                "id {invalid}: {got:?} vs {want:?}"
-            );
-            assert_eq!(got.position, 2);
-        }
+        let split = fixture.legalize();
+        let pieces = split
+            .eqns()
+            .iter()
+            .filter(|eqn| {
+                matches!(
+                    eqn.op,
+                    OpKind::PackedContraction {
+                        rows: ContractionRows::Indexed { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(pieces > 1, "the stack split into {pieces} contractions");
+        compile_verdict(&split).unwrap_or_else(|error| panic!("the split graph: {error}"));
     }
 
     /// The routed projection of a Q8_0 `[out, k]` stack of `experts` experts for one decode row.
@@ -3515,13 +3641,18 @@ mod tests {
             descriptor,
             experts,
         };
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]));
-        let ids = b.slot_named(
-            Slot::Activation,
-            "ids",
-            TensorType::new(vec![1], DType::I32),
-        );
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]))
+            .unwrap();
+        let ids = b
+            .slot_named_ranged(
+                Slot::Activation,
+                "ids",
+                TensorType::new(vec![1], DType::I32),
+                IndexRange::below(experts).unwrap(),
+            )
+            .unwrap();
         let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
         b.finish(y).unwrap()
     }
@@ -3566,7 +3697,15 @@ mod tests {
     const SPLIT_EXPERTS: usize = 5;
 
     impl SplitStack {
+        /// The routed projection with its ids declared in `[0, SPLIT_EXPERTS)`, the graph `compile` admits.
         fn new() -> Self {
+            Self::with_ids(true)
+        }
+
+        /// [`SplitStack::new`], with the ids declared or, when `declared` is false, unbounded: the oracle
+        /// then meets an invalid id as the index fault the split must preserve, not as a slot-range
+        /// fault. Such a graph is for the legalize and oracle rows, which never compile it.
+        fn with_ids(declared: bool) -> Self {
             use poot_graph_ir::ops::PackedExpertStack;
             let format = poot_quant::format::WeightFormat::Q8_0;
             let descriptor = poot_quant::PackedWeight::try_new(format, [4, 64]).unwrap();
@@ -3575,13 +3714,22 @@ mod tests {
                 descriptor,
                 experts: SPLIT_EXPERTS,
             };
-            let b = Builder::new();
-            let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![11, 64]));
-            let ids = b.slot_named(
-                Slot::Activation,
-                "ids",
-                TensorType::new(vec![11], DType::I32),
-            );
+            let b = Builder::for_tests();
+            let x = b
+                .slot_named(Slot::Activation, "x", TensorType::f32(vec![11, 64]))
+                .unwrap();
+            let ids_type = TensorType::new(vec![11], DType::I32);
+            let ids = if declared {
+                b.slot_named_ranged(
+                    Slot::Activation,
+                    "ids",
+                    ids_type,
+                    IndexRange::below(SPLIT_EXPERTS).unwrap(),
+                )
+                .unwrap()
+            } else {
+                b.slot_named(Slot::Activation, "ids", ids_type).unwrap()
+            };
             let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
             Self {
                 graph: b.finish(y).unwrap(),
@@ -3590,7 +3738,7 @@ mod tests {
                 descriptor,
                 owners: (0..SPLIT_EXPERTS)
                     .map(|e| {
-                        std::sync::Arc::new(poot_test_util::packed::random_payload(
+                        std::sync::Arc::new(poot_quant::test_support::packed::random_payload(
                             format,
                             [4, 64],
                             e as u64 * 7 + 3,
@@ -3663,7 +3811,7 @@ mod tests {
                 renames.push((id, renamed));
                 start = end;
             }
-            let graph = poot_test_util::graph_fixtures::derive(split, |draft| {
+            let graph = poot_graph_ir::test_support::graph_fixtures::derive(split, |draft| {
                 for (id, name) in &renames {
                     draft.values_mut()[*id].name = Some(name.clone());
                 }
@@ -3711,6 +3859,21 @@ mod tests {
                     .into_host()
                     .unwrap(),
             )
+        }
+    }
+
+    impl Program {
+        /// The tier-2 comparison class this program publishes (ADR-0101 decision 2): the strongest of the
+        /// traced graph's baseline and the declarations of the passes that changed it. [`compile`] has already
+        /// checked that the compiled graph implies nothing looser.
+        ///
+        /// Card 546b: narrowed from `pub` (gated `any(test, feature = "test-support")`) to `pub(crate)` -
+        /// its one cross-crate reader, `poot-wgpu-device`'s own `src/tests/decode_cache_warmth.rs`, moved off
+        /// `GpuExecutor::run_resident_kv_cached` and was deleted with it, leaving the `pub` accessor with
+        /// no caller outside this crate's own tests (dead-pub has no exemption for an `any(test, ...)`
+        /// gate); every remaining caller is this crate's own tests.
+        pub(crate) fn reassociation_class(&self) -> Tier2Class {
+            recorded_numerics(self.baseline, &self.passes).tier2_class()
         }
     }
 }

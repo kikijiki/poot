@@ -1,6 +1,21 @@
 //! Matmul and contraction-epilogue matmul planning, including the choice of the synthesized tiled GEMM.
 
-use super::*;
+use super::{
+    BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, FusedOperand,
+    FusedRegion, Graph, ImportedKernel, KernelRequest, MatmulShapes, OpKind, Operand, PlanError,
+    Planned, Scalar, Ty, ValueId, WeightLayout, fty_ty, kg, out_numel_saturating, value_ids,
+};
+use crate::dtype_widen::{
+    matmul_amd_tc_eligible, matmul_nvptx_tc_eligible, matmul_spirv_coopmat_eligible,
+};
+use crate::kernel_mapping::{check_widening_step, float_region_leaf_storage, map_fused_op};
+use crate::planner::GraphTables;
+use crate::predicates::{
+    GEMM_TILE, GEMV_WIDTH, decode_gemv_plan, elementwise_fold, indexed_matmul_lowers,
+    is_batched_tiled_gemm_in, is_decode_attn_gemv_in, is_decode_gemv_in, is_tileable_matmul_in,
+    is_tiled_gemm_in, packed_contraction_m_per_block, tiled_gemm_plan,
+};
+use crate::refusal::{FusedStepGap, Site};
 use poot_graph_ir::ContractionRows;
 use poot_target::{Backend, DeviceCaps};
 

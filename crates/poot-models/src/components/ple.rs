@@ -36,6 +36,7 @@ use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
+use crate::model::{TraceError, WiringError};
 
 /// SplitMix64's constants and the multiplier seed's prime, from the reference model's hash.
 const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -54,12 +55,12 @@ pub struct PleWitness;
 
 impl PleWitness {
     /// The validation id of the token check of the PLE on `layer`.
-    pub fn id(layer: usize) -> ValidationId {
+    pub fn id(layer: usize) -> Result<ValidationId, WiringError> {
         let layer = u32::try_from(layer)
             .ok()
             .filter(|&layer| layer < WITNESS_BASE)
-            .expect("a layer index below 2^31: no checkpoint has that many layers");
-        ValidationId(WITNESS_BASE + layer)
+            .ok_or(WiringError::LayerIndexOutOfRange { layer })?;
+        Ok(ValidationId(WITNESS_BASE + layer))
     }
 
     /// The layer of an id [`Self::id`] minted; `None` for any other id.
@@ -378,11 +379,18 @@ impl Table {
                     found: vec![start + rows, width],
                 });
             }
-            let fits = "the table's rows fit i32: checked by PleParams::new";
+            // `PleParams::new` bounds the table's rows by i32; a shard past it is the same refusal.
+            let as_i32 = |value: usize| {
+                i32::try_from(value).map_err(|_| WeightError::IndexBound {
+                    id: id(PleRole::Table),
+                    field: "rows",
+                    bound: value,
+                })
+            };
             shards.push(Shard {
                 weight,
-                start: i32::try_from(start).expect(fits),
-                rows: i32::try_from(rows).expect(fits),
+                start: as_i32(start)?,
+                rows: as_i32(rows)?,
             });
             start += rows;
         }
@@ -399,41 +407,41 @@ impl Table {
 
     /// The rows `ids` (`[..]` I32, every id below the table's row count) select, widened to F32:
     /// `[.., head_dim]`.
-    fn lookup(&self, b: &Builder, ids: Traced) -> Traced {
+    fn lookup(&self, b: &Builder, ids: Traced) -> Result<Traced, TraceError> {
         let widen = |rows: Traced| {
-            if b.aval(rows).dtype == DType::F32 {
-                rows
+            if b.aval(rows)?.dtype == DType::F32 {
+                Ok::<_, TraceError>(rows)
             } else {
-                b.cast(rows, DType::F32)
+                Ok::<_, TraceError>(b.cast(rows, DType::F32)?)
             }
         };
         match self {
-            Table::Dense(table) => widen(b.gather(table.declare(b), 0, ids)),
+            Table::Dense(table) => widen(b.gather(table.declare(b)?, 0, ids)?),
             Table::Sharded { shards, scale } => {
                 let mut picked: Option<Traced> = None;
                 for shard in shards {
                     // The shard-local row, and whether this shard does not own it: an unsigned
                     // compare sees a negative local row as past the end.
-                    let local = b.binary_scalar(BinOp::Sub, ids, Scalar::I32(shard.start));
-                    let foreign = b.binary_scalar(BinOp::GeU, local, Scalar::I32(shard.rows));
-                    let owned = b.binary_scalar(BinOp::Xor, foreign, Scalar::I32(1));
+                    let local = b.binary_scalar(BinOp::Sub, ids, Scalar::I32(shard.start))?;
+                    let foreign = b.binary_scalar(BinOp::GeU, local, Scalar::I32(shard.rows))?;
+                    let owned = b.binary_scalar(BinOp::Xor, foreign, Scalar::I32(1))?;
                     // A foreign id reads row 0, which every shard has.
-                    let row = b.binary(BinOp::Mul, local, owned);
-                    let rows = widen(b.gather(shard.weight.declare(b), 0, row));
+                    let row = b.binary(BinOp::Mul, local, owned)?;
+                    let rows = widen(b.gather(shard.weight.declare(b)?, 0, row)?)?;
                     picked = Some(match picked {
                         None => rows,
                         Some(before) => {
-                            let shape = b.aval(rows).shape;
-                            let mut flag = b.aval(foreign).shape;
+                            let shape = b.aval(rows)?.shape;
+                            let mut flag = b.aval(foreign)?.shape;
                             flag.push(1);
-                            let foreign = b.broadcast(b.reshape(foreign, flag), shape);
-                            b.select(foreign, before, rows)
+                            let foreign = b.broadcast(b.reshape(foreign, flag)?, shape)?;
+                            b.select(foreign, before, rows)?
                         }
                     });
                 }
-                let picked = picked.expect("a sharded table has at least one shard");
-                let scale = b.broadcast(scale.declare_f32(b), b.aval(picked).shape);
-                b.binary(BinOp::Mul, picked, scale)
+                let picked = picked.ok_or(WiringError::TableWithoutShards)?;
+                let scale = b.broadcast(scale.declare_f32(b)?, b.aval(picked)?.shape)?;
+                Ok(b.binary(BinOp::Mul, picked, scale)?)
             }
         }
     }
@@ -443,101 +451,114 @@ impl Table {
 /// is normalized by its own mean square, then the whole row is scaled by `1 + scale` (the
 /// reference model's `Qwen4ExpTextRMSNorm(dim, group_size)`: the scale has no group structure and is
 /// stored as an offset from one).
-pub fn grouped_norm(b: &Builder, x: Traced, scale: &Weight, groups: usize, eps: f32) -> Traced {
-    let shape = b.aval(x).shape;
+pub fn grouped_norm(
+    b: &Builder,
+    x: Traced,
+    scale: &Weight,
+    groups: usize,
+    eps: f32,
+) -> Result<Traced, TraceError> {
+    let shape = b.aval(x)?.shape;
     let width = shape[shape.len() - 1] / groups;
     let mut grouped = shape[..shape.len() - 1].to_vec();
     grouped.extend([groups, width]);
     let normed = b.reshape(
-        ops::rmsnorm_no_weight(b, b.reshape(x, grouped), eps),
+        ops::rmsnorm_no_weight(b, b.reshape(x, grouped)?, eps)?,
         shape.clone(),
-    );
-    let scale = b.binary_scalar(BinOp::Add, scale.declare_f32(b), Builder::f32(1.0));
-    b.binary(BinOp::Mul, normed, b.broadcast(scale, shape))
+    )?;
+    let scale = b.binary_scalar(BinOp::Add, scale.declare_f32(b)?, Builder::f32(1.0))?;
+    Ok(b.binary(BinOp::Mul, normed, b.broadcast(scale, shape)?)?)
 }
 
 /// The hash ids of one row's `tokens` (`[t]` I32, every id in range) from its `history`
 /// (`[context]` I32, XOR-encoded): `[t, heads]`, and the row's next history `[context]`.
-fn row_ids(b: &Builder, tokens: Traced, history: Traced, p: &PleParams) -> (Traced, Traced) {
+fn row_ids(
+    b: &Builder,
+    tokens: Traced,
+    history: Traced,
+    p: &PleParams,
+) -> Result<(Traced, Traced), TraceError> {
     let (ctx, heads) = (p.context(), p.heads());
-    let t = b.aval(tokens).shape[0];
+    let t = b.aval(tokens)?.shape[0];
     let eos = Scalar::I32(p.eos);
 
     // The decoded history, then the tokens: `H = previous_context ++ tokens`. A zero state decodes
     // as an end-of-sequence prefix.
-    let decoded = b.binary_scalar(BinOp::Xor, history, eos);
-    let h = b.concat(0, &[decoded, tokens]);
-    let s0 = b.slice(h, 0, ctx, ctx + t);
-    let s1 = b.slice(h, 0, ctx - 1, ctx - 1 + t);
+    let decoded = b.binary_scalar(BinOp::Xor, history, eos)?;
+    let h = b.concat(0, &[decoded, tokens])?;
+    let s0 = b.slice(h, 0, ctx, ctx + t)?;
+    let s1 = b.slice(h, 0, ctx - 1, ctx - 1 + t)?;
     // `s2 = (s1 == eos) ? eos : H[t - 2]`: a context that ends a segment hides what precedes it.
     // Equality is `And(GeU(s1, eos), GeU(eos, s1))`, the fill materialized to `s1`'s shape because
     // the planner rejects a literal on the left.
-    let s2 = (p.spec.ngram_size >= 3).then(|| {
-        let behind = b.slice(h, 0, ctx - 2, ctx - 2 + t);
+    let s2 = if p.spec.ngram_size >= 3 {
+        let behind = b.slice(h, 0, ctx - 2, ctx - 2 + t)?;
         let eos_like = b.binary_scalar(
             BinOp::Or,
-            b.binary_scalar(BinOp::And, s1, Scalar::I32(0)),
+            b.binary_scalar(BinOp::And, s1, Scalar::I32(0))?,
             eos,
-        );
-        let ge = b.binary_scalar(BinOp::GeU, s1, eos);
-        let le = b.binary(BinOp::GeU, eos_like, s1);
-        b.select(b.binary(BinOp::And, ge, le), eos_like, behind)
-    });
+        )?;
+        let ge = b.binary_scalar(BinOp::GeU, s1, eos)?;
+        let le = b.binary(BinOp::GeU, eos_like, s1)?;
+        Some(b.select(b.binary(BinOp::And, ge, le)?, eos_like, behind)?)
+    } else {
+        None
+    };
 
     let m = &p.tables.multipliers;
     let mixed2 = u64_xor(
         b,
-        u64_mul_i32_const(b, s0, m[0]),
-        u64_mul_i32_const(b, s1, m[1]),
-    );
-    let mixed3 = s2.map(|s2| u64_xor(b, mixed2, u64_mul_i32_const(b, s2, m[2])));
+        u64_mul_i32_const(b, s0, m[0])?,
+        u64_mul_i32_const(b, s1, m[1])?,
+    )?;
+    let mixed3 = match s2 {
+        Some(s2) => Some(u64_xor(b, mixed2, u64_mul_i32_const(b, s2, m[2])?)?),
+        None => None,
+    };
 
     let columns: Vec<Traced> = (0..heads)
         .map(|head| {
             let mixed = if head < p.spec.heads_per_ngram {
                 mixed2
             } else {
-                mixed3.expect("order-3 heads exist only when ngram_size is 3")
+                mixed3.ok_or(WiringError::NgramOrderThree)?
             };
-            let rem = u64_rem_u32(b, mixed, p.tables.head_vocab[head])
-                .expect("head primes are below 2^28: checked by PleParams::new");
-            let id = b.binary_scalar(BinOp::Add, rem, Scalar::I32(p.tables.head_offset[head]));
-            b.reshape(id, vec![t, 1])
+            let rem = u64_rem_u32(b, mixed, p.tables.head_vocab[head])?;
+            let id = b.binary_scalar(BinOp::Add, rem, Scalar::I32(p.tables.head_offset[head]))?;
+            Ok::<_, TraceError>(b.reshape(id, vec![t, 1])?)
         })
-        .collect();
+        .collect::<Result<_, TraceError>>()?;
 
     // The next history is the last `context` entries of `H`, re-encoded.
-    let next = b.binary_scalar(BinOp::Xor, b.slice(h, 0, t, t + ctx), eos);
-    (b.concat(1, &columns), next)
+    let next = b.binary_scalar(BinOp::Xor, b.slice(h, 0, t, t + ctx)?, eos)?;
+    Ok((b.concat(1, &columns)?, next))
 }
 
 /// The n-gram ids of the step's tokens, `[rows, tokens, heads]` I32; carries each row's history as
 /// the step's state `ple.l{layer}.history` and declares the token-range witness.
-fn ngram_ids(b: &Builder, step: &Step, layer: usize, p: &PleParams) -> Traced {
+fn ngram_ids(b: &Builder, step: &Step, layer: usize, p: &PleParams) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t) = (shape.rows.get(), shape.tokens.get());
     let (ctx, heads) = (p.context(), p.heads());
-    let guard = b.guard_index_bounds(step.tokens(), p.spec.vocab).expect(
-        "step tokens are ranked I32 and the vocabulary fits i32: checked by PleParams::new",
-    );
+    let guard = b.guard_index_bounds(step.tokens(), p.spec.vocab)?;
     step.validate(
-        PleWitness::id(layer),
+        PleWitness::id(layer)?,
         format!("ple_tokens_in_vocab.l{layer}"),
         guard.witness,
     );
-    let history = step.recurrent_state(b, &format!("ple.l{layer}.history"), DType::I32, &[ctx]);
+    let history = step.recurrent_state(b, &format!("ple.l{layer}.history"), DType::I32, &[ctx])?;
     let current = history.current();
     let mut ids = Vec::with_capacity(rows);
     let mut next = Vec::with_capacity(rows);
     for row in 0..rows {
-        let tokens = b.reshape(b.slice(guard.guarded, 0, row, row + 1), vec![t]);
-        let before = b.reshape(b.slice(current, 0, row, row + 1), vec![ctx]);
-        let (row_ids, row_next) = row_ids(b, tokens, before, p);
-        ids.push(b.reshape(row_ids, vec![1, t, heads]));
-        next.push(b.reshape(row_next, vec![1, ctx]));
+        let tokens = b.reshape(b.slice(guard.guarded, 0, row, row + 1)?, vec![t])?;
+        let before = b.reshape(b.slice(current, 0, row, row + 1)?, vec![ctx])?;
+        let (row_ids, row_next) = row_ids(b, tokens, before, p)?;
+        ids.push(b.reshape(row_ids, vec![1, t, heads])?);
+        next.push(b.reshape(row_next, vec![1, ctx])?);
     }
-    step.carry_recurrent(b, history, b.concat(0, &next));
-    b.concat(0, &ids)
+    step.carry_recurrent(b, history, b.concat(0, &next)?)?;
+    Ok(b.concat(0, &ids)?)
 }
 
 /// The PLE layer's contribution to the multi-stream residual `x` (`[rows, tokens, streams *
@@ -550,59 +571,59 @@ pub fn ple(
     x: Traced,
     w: &PleWeights,
     p: &PleParams,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t) = (shape.rows.get(), shape.tokens.get());
     let (streams, width) = (p.spec.streams, p.spec.width);
     let stream = p.stream_width();
     let eps = p.spec.eps;
 
-    let ids = ngram_ids(b, step, layer, p);
-    let looked = w.table.lookup(b, ids); // [rows, tokens, heads, head_dim]
-    let emb = b.reshape(looked, vec![rows, t, p.spec.embed_dim]);
+    let ids = ngram_ids(b, step, layer, p)?;
+    let looked = w.table.lookup(b, ids)?; // [rows, tokens, heads, head_dim]
+    let emb = b.reshape(looked, vec![rows, t, p.spec.embed_dim])?;
 
-    let key = grouped_norm(b, linear(b, emb, &w.key, None), &w.key_norm, streams, eps);
-    let value = linear(b, emb, &w.value, None); // [rows, tokens, width]
-    let query = grouped_norm(b, x, &w.query_norm, streams, eps);
+    let key = grouped_norm(b, linear(b, emb, &w.key, None)?, &w.key_norm, streams, eps)?;
+    let value = linear(b, emb, &w.value, None)?; // [rows, tokens, width]
+    let query = grouped_norm(b, x, &w.query_norm, streams, eps)?;
 
     let grouped = vec![rows, t, streams, width];
     let dot = b.reduce(
         RedOp::Sum,
         b.binary(
             BinOp::Mul,
-            b.reshape(key, grouped.clone()),
-            b.reshape(query, grouped),
-        ),
+            b.reshape(key, grouped.clone())?,
+            b.reshape(query, grouped)?,
+        )?,
         3,
         true,
-    ); // [rows, tokens, streams, 1]
-    let gate = b.binary_scalar(BinOp::Mul, dot, Scalar::F32(1.0 / (width as f32).sqrt()));
+    )?; // [rows, tokens, streams, 1]
+    let gate = b.binary_scalar(BinOp::Mul, dot, Scalar::F32(1.0 / (width as f32).sqrt()))?;
 
     // `sign(gate) * sqrt(max(|gate|, 1e-6))`. The IR has no `Abs` or `Sign`: `|g| = max(g, -g)`, and
     // `sign(g) = [g >= 0] - [-g >= 0]`, which is zero at zero as `torch.sign` is (both terms fire
     // there and cancel). Deriving the sign as `g / max(|g|, 1e-6)` would decay to zero for
     // `0 < |g| < 1e-6` where the reference saturates at one.
-    let negated = b.unary(UnOp::Neg, gate);
+    let negated = b.unary(UnOp::Neg, gate)?;
     let magnitude = b.unary(
         UnOp::Sqrt,
         b.binary_scalar(
             BinOp::Max,
-            b.binary(BinOp::Max, gate, negated),
+            b.binary(BinOp::Max, gate, negated)?,
             Scalar::F32(1e-6),
-        ),
-    );
+        )?,
+    )?;
     let sign = b.binary(
         BinOp::Sub,
-        b.binary_scalar(BinOp::Ge, gate, Scalar::F32(0.0)),
-        b.binary_scalar(BinOp::Ge, negated, Scalar::F32(0.0)),
-    );
-    let gate = sigmoid(b, b.binary(BinOp::Mul, magnitude, sign));
+        b.binary_scalar(BinOp::Ge, gate, Scalar::F32(0.0))?,
+        b.binary_scalar(BinOp::Ge, negated, Scalar::F32(0.0))?,
+    )?;
+    let gate = sigmoid(b, b.binary(BinOp::Mul, magnitude, sign)?)?;
     let gated = b.reshape(
-        b.binary(BinOp::Mul, gate, b.reshape(value, vec![rows, t, 1, width])),
+        b.binary(BinOp::Mul, gate, b.reshape(value, vec![rows, t, 1, width])?)?,
         vec![rows, t, stream],
-    );
+    )?;
 
-    let normed = grouped_norm(b, gated, &w.conv_norm, streams, eps);
+    let normed = grouped_norm(b, gated, &w.conv_norm, streams, eps)?;
     let conv = causal_conv(
         b,
         step,
@@ -610,8 +631,8 @@ pub fn ple(
         normed,
         &w.conv,
         &p.conv,
-    );
-    b.binary(BinOp::Add, gated, silu(b, conv))
+    )?;
+    Ok(b.binary(BinOp::Add, gated, silu(b, conv)?)?)
 }
 
 /// Plain-loop references of the PLE layer, in f64: the hash with its own table derivation and the
@@ -928,10 +949,12 @@ mod tests {
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let w = PleWeights::new(&fx.map(), LAYER, p).unwrap();
         let stream = p.stream_width();
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All));
-        let xs = b.constant("x", TensorType::f32(vec![1, tokens.len(), stream]));
-        let y = ple(&b, &step, LAYER, xs, &w, p);
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All)).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, tokens.len(), stream]))
+            .unwrap();
+        let y = ple(&b, &step, LAYER, xs, &w, p).unwrap();
         let g = step.finish(b, y).unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()
@@ -1046,10 +1069,10 @@ mod tests {
     /// The ids of `tokens` the graph computes from `history` (raw, zero-state when `None`), and the
     /// next history decoded.
     fn graph_ids(p: &PleParams, tokens: &[i32], history: Option<&[i32]>) -> (Vec<i32>, Vec<i32>) {
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All));
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All)).unwrap();
         let ids = ngram_ids(&b, &step, LAYER, p);
-        let g = step.finish(b, ids).unwrap();
+        let g = step.finish(b, ids.unwrap()).unwrap();
         let encoded: Vec<f32> = match history {
             Some(raw) => raw.iter().map(|&t| (t ^ p.eos) as f32).collect(),
             None => vec![0.0; p.context()],
@@ -1188,10 +1211,10 @@ mod tests {
     fn a_token_outside_the_vocabulary_trips_the_witness() {
         let p = PleParams::new(spec()).unwrap();
         let eval = |tokens: &[i32], witness: bool| -> Vec<f32> {
-            let b = Builder::new();
-            let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All));
+            let b = Builder::for_tests();
+            let step = Step::new(&b, step_shape(tokens.len(), CAP, LogitRows::All)).unwrap();
             let ids = ngram_ids(&b, &step, LAYER, &p);
-            let g = step.finish(b, ids).unwrap();
+            let g = step.finish(b, ids.unwrap()).unwrap();
             let outputs: Vec<_> = g
                 .witnesses()
                 .map(|witness| (witness.id, witness.value))
@@ -1413,9 +1436,11 @@ mod tests {
             ],
             scale: Weight::new(&map, id(PleRole::TableScale), &[]).unwrap(),
         };
-        let b = Builder::new();
-        let ids = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
-        let rows = table.lookup(&b, ids);
+        let b = Builder::for_tests();
+        let ids = b
+            .slot(Slot::Token, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let rows = table.lookup(&b, ids).unwrap();
         let g = b.finish(rows).unwrap();
         let wanted = [id_row, lossy, id_row + 1, 0];
         let tokens: Vec<i32> = wanted.iter().map(|&row| row as i32).collect();

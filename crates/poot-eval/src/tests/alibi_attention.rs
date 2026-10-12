@@ -1,9 +1,8 @@
 //! ALiBi (Attention with Linear Biases, spec 254) CPU-oracle tests.
 //!
-//! Two levels: (1) the `attention_masked` op fed a hand-built per-head ALiBi bias matches an
-//! independently hand-rolled reference forward pass bit-for-bit (decomposition correctness); (2) the
-//! BLOOM family's `Model::trace` decode (ALiBi attention) produces the right graph structure (no RoPE, the bias
-//! an in-graph computation) and a finite output.
+//! The `attention_masked` op and the flash attention op fed a hand-built per-head ALiBi bias match an
+//! independently hand-rolled reference forward pass (decomposition correctness). The BLOOM family's
+//! `Model::trace` decode rows live in `poot-models/tests/oracle_traces/alibi_attention.rs`.
 //!
 //! Card 557: tracers no longer emit the flash ops, so the tracer-level "flash-fused trace equals the
 //! decomposed trace" checks live with the pass that forms the op (`poot-graph-plan`'s
@@ -11,29 +10,23 @@
 
 use crate::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::AttentionAttrs;
+use poot_graph_ir::Operand;
 use poot_graph_ir::builder::{Builder, Traced};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::ops::attention_masked;
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{ComputedConst, Operand, Storage};
-use poot_models::model::{LogitRows, Model, Phase};
-use poot_models::registry::Registry;
-use poot_quant::StoredBytes;
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-use poot_tensor::DType;
 use poot_tensor::HostTensor;
 use std::collections::HashMap;
 
 use super::helpers::*;
-use super::qwen2_pipeline::{eval_step, trace_step};
-use poot_test_util::{assert_close_rel, max_abs_error, seed_of};
+use poot_test_util::{assert_close_rel, max_abs_error};
 
 /// Stage one flash-attention `op` over `[q, k, v, mask]`. Card 557: `Builder` has no method for a
 /// composite (`compile`'s `flash_attention_capped` forms it from the traced chain), so a test of the
 /// op's own eval stages it through an append plan, as `e4m3_per_channel.rs` stages a
 /// `PackedContraction`.
 fn stage_flash(b: &Builder, op: OpKind, [q, k, v, mask]: [Traced; 4]) -> Traced {
-    let mut plan = b.append_plan(0);
+    let mut plan = b.append_plan(0).unwrap();
     let out = plan
         .equation(
             op,
@@ -134,12 +127,18 @@ fn attention_masked_with_alibi_bias_matches_hand_rolled_reference() {
     let vd = fill(hkv * cap * d, 13);
     let mask_data = alibi_row_ref(&slopes, cap, pos);
 
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, hq, 1, cap]));
-    let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, hq, 1, cap]))
+        .unwrap();
+    let out = attention_masked(&b, q, k, v, n_rep, scale, mask).unwrap();
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out).unwrap();
 
@@ -183,72 +182,6 @@ fn attention_masked_with_alibi_bias_matches_hand_rolled_reference() {
         max_diff > 1e-4,
         "ALiBi bias should change attention output vs. zero-slope baseline; max_diff={max_diff:.2e}"
     );
-}
-
-/// The BLOOM family's decode (ALiBi attention, no RoPE): it declares no RoPE table (card 550:
-/// the per-head bias is a graph computation, `alibi_mask_from_pos`, over `Slot::Pos` and the family's `AlibiSlopes`
-/// computed constant), and it evaluates to finite logits of the vocabulary's shape.
-#[test]
-fn bloom_alibi_decode_skips_rope() {
-    let (model, cap) = (bloom_f32_model(), 8usize);
-    let vocab = model.config().vocab;
-    let g = trace_step(&*model, Phase::Decode, (1, 1, cap), None, LogitRows::Last);
-
-    // FR-002: no rope tables declared on the ALiBi path.
-    for id in g.inputs() {
-        let m = &g.values()[*id];
-        if let Storage::Const = m.storage {
-            let name = m.name.as_deref().unwrap_or("");
-            assert!(
-                !name.contains("rope"),
-                "an ALiBi decode must not declare rope tables, found {name}"
-            );
-        }
-    }
-
-    // The widened per-head bias is a graph computation over Slot::Pos ([1,1]) and the slopes.
-    assert!(
-        g.inputs().iter().any(|id| matches!(
-            g.values()[*id].storage,
-            Storage::Computed(ComputedConst::AlibiSlopes { .. })
-        )),
-        "an ALiBi decode graph must read the per-head slopes"
-    );
-
-    let out = eval_step(&g, &[2], &[3], None, None).logits;
-    assert_eq!(out.shape(), vec![1, 1, vocab]);
-    for &v in out.as_f32().unwrap().iter() {
-        assert!(v.is_finite(), "alibi logit {v} is not finite");
-    }
-}
-
-/// The BLOOM fixture checkpoint with every tensor held as F32 (deterministic name-seeded values), built through the
-/// registry: a graph whose consts the F32 name-seeded fill of [`eval_step`] binds.
-fn bloom_f32_model() -> Box<dyn Model> {
-    let registry = Registry::builtin().unwrap();
-    let entry = registry
-        .entries()
-        .iter()
-        .find(|e| e.family.as_str() == "bloom")
-        .expect("the bloom family is registered");
-    let fixture = (entry.fixture)();
-    let mut store = WeightStore::builder();
-    for (key, tensor) in fixture.store.iter() {
-        let shape = tensor.shape();
-        let n: usize = shape.iter().product();
-        let values: Vec<f32> = fill(n, seed_of(key.as_str()))
-            .iter()
-            .map(|v| v * 0.1)
-            .collect();
-        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense = DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap();
-        store
-            .insert(key.clone(), WeightEntry::Dense(dense))
-            .unwrap();
-    }
-    registry
-        .build(&fixture.raw(), &store.build())
-        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 // Card 259: flash attention with a per-head mask (the shape ALiBi needs).
@@ -337,11 +270,17 @@ fn flash_decode_per_head_alibi_mask_matches_reference_and_decomposition() {
     let mask_data = alibi_row_ref(&slopes, cap, pos);
 
     let run_flash = |mask_shape: Vec<usize>, mask_data: Vec<f32>| {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
-        let mask = b.constant("mask", TensorType::f32(mask_shape.clone()));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(mask_shape.clone()))
+            .unwrap();
         let out = stage_flash(&b, decode(n_rep, scale), [q, k, v, mask]);
         let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(out).unwrap();
@@ -376,12 +315,18 @@ fn flash_decode_per_head_alibi_mask_matches_reference_and_decomposition() {
     assert_close_rel(got.as_f32().unwrap(), &want, 1e-5);
 
     // (2) vs the materialized `attention_masked` decomposition with the same per-head mask.
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, hq, 1, cap]));
-    let out = attention_masked(&b, q, k, v, n_rep, scale, mask);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, hq, 1, cap]))
+        .unwrap();
+    let out = attention_masked(&b, q, k, v, n_rep, scale, mask).unwrap();
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
@@ -451,11 +396,19 @@ fn flash_decode_broadcast_mask_unchanged_batched() {
         .flat_map(|bi| (0..cap).map(move |t| if t <= bi + 1 { 0.0 } else { -1.0e9 }))
         .collect();
 
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![bsz, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![bsz, hkv, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![bsz, hkv, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![bsz, 1, 1, cap]));
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![bsz, hq, 1, d]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![bsz, hkv, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![bsz, hkv, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![bsz, 1, 1, cap]))
+        .unwrap();
     let out = stage_flash(&b, decode(n_rep, scale), [q, k, v, mask]);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out).unwrap();
@@ -522,11 +475,17 @@ fn flash_prefill_per_head_alibi_mask_matches_reference() {
     let mask_data = alibi_prefill_ref(&slopes, l);
 
     let run_flash = |mask_shape: Vec<usize>, mask_data: Vec<f32>| {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-        let mask = b.constant("mask", TensorType::f32(mask_shape.clone()));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hkv, l, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hkv, l, d]))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(mask_shape.clone()))
+            .unwrap();
         let out = stage_flash(&b, prefill(n_rep, scale), [q, k, v, mask]);
         let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
         let g = b.finish(out).unwrap();
@@ -581,11 +540,17 @@ fn flash_prefill_broadcast_mask_unchanged() {
     let vd = fill(hkv * l * d, 53);
     let causal = alibi_prefill_ref(&[0.0], l); // zero slope -> plain causal [1,L,L]
 
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, l, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, l, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, l, l]))
+        .unwrap();
     let out = stage_flash(&b, prefill(n_rep, scale), [q, k, v, mask]);
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(out).unwrap();
@@ -625,15 +590,21 @@ fn flash_prefill_broadcast_mask_unchanged() {
 #[test]
 fn flash_decode_rejects_bad_mask_head_axis() {
     let (hq, hkv, cap, d) = (4usize, 2usize, 5usize, 4usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
     let out = stage_flash(&b, decode(hq / hkv, 1.0), [q, k, v, mask]);
     let mi = mask.id();
     let g = b.finish(out).unwrap();
-    let refused = poot_test_util::graph_fixtures::derive(&g, |draft| {
+    let refused = poot_graph_ir::test_support::graph_fixtures::derive(&g, |draft| {
         draft.values_mut()[mi].aval.shape = vec![1, 2, 1, cap]; // 2 is neither 1 nor Hq=4
     })
     .unwrap_err();

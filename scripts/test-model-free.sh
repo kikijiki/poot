@@ -50,7 +50,7 @@ readonly gate_policy=(
   "poot-eval|host|"
   "poot-executor|host|"
   "poot-executor-parity|host|"
-  "poot-gpu|excluded|every test dispatches on a wgpu device"
+  "poot-wgpu-device|excluded|every test dispatches on a wgpu device"
   "poot-graph-ir|host|"
   "poot-graph-plan|host|"
   "poot-kernel-attr|host|"
@@ -63,19 +63,18 @@ readonly gate_policy=(
   "poot-models|reviewed|"
   "poot-orchestrator|host|"
   "poot-profile|host|"
-  "poot-ptx-check|host|"
-  "poot-ptx-gpu|reviewed|"
+  "poot-ptx-device|reviewed|"
   "poot-ptx-runtime|reviewed|"
   "poot-quant|host|"
-  "poot-rocm-check|host|"
-  "poot-rocm-gpu|excluded|every test dispatches on a ROCm device"
+  "poot-rocm-device|reviewed|"
   "poot-rocm-runtime|reviewed|"
-  "poot-runtime|reviewed|"
+  "poot-wgpu-runtime|reviewed|"
   "poot-runtime-common|host|"
   "poot-serve|reviewed|"
   "poot-target|host|"
   "poot-tensor|host|"
   "poot-test-util|host|"
+  "poot-text|host|"
   "poot-vulkan-device|excluded|every test dispatches on a raw Vulkan device"
   "poot-vulkan-runtime|reviewed|"
   "pootc|reviewed|"
@@ -526,7 +525,7 @@ EOF
 
   # The real gate, not the checker: a test that needs a device, moved into the model-free class, must fail the
   # lane. The candidate inventory drives the same lane invocation `run` uses, narrowed to that one test.
-  local gate_target=poot-runtime::run_add gate_test=add_runs_on_gpu
+  local gate_target=poot-wgpu-runtime::run_add gate_test=add_runs_on_gpu
   local gate_row
   gate_row=$(awk -F '\t' -v target="$gate_target" -v test="$gate_test" '
     NR > 1 && $2 == target && $4 == test && $3 == "device" { print; exit }

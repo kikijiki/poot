@@ -1,10 +1,12 @@
-use super::*;
+use super::{
+    Alloc, BasicBlock, BinOp, BlockId, Body, Constant, ELEMENTWISE_2D_WORKGROUP_SIZE, IndexAxis,
+    Layout, Local, Operand, Place, Rvalue, Statement, Terminator, Ty, copy, elem, emit_i32_shift,
+    guard, is_cmp, ld, local, row_major_strides, slice_dtype, slice_f32, view_eff_strides,
+};
 
 /// numpy-broadcasting elementwise binary `c = a op b`, fully general over static shapes, in storage dtype
 /// `dt` (f32 or bf16), computing in f32 (spec 024): bf16 operands widen on load and the result narrows on
-/// store (the casts are no-ops for `dt = Ty::F32` - the convenience that `binary_broadcast`/
-/// `binary_broadcast_dt`/`binary_broadcast_dt_views` used to expose before they moved to
-/// `poot_test_util::kernel_fixtures`, card 671, their only caller). For each output element `i`, the
+/// store (the casts are no-ops for `dt = Ty::F32`). For each output element `i`, the
 /// operand offsets are computed from `i` via the (constant) output strides and each operand's
 /// broadcast-effective strides (0 on a broadcast dim). Subsumes the same-shape case. Shapes are
 /// right-aligned (leading-1 padded), as in `poot_graph_ir`'s broadcast rule.
@@ -66,7 +68,7 @@ pub fn binary_broadcast_i32_geu_views_grid(
 /// Exact unsigned remainder over I32 storage bit patterns. Operands are bitcast to U32 for the
 /// remainder; the u32 result is bitcast back to the I32 storage pattern.
 #[allow(clippy::too_many_arguments)]
-pub fn binary_broadcast_i32_remu_views_grid(
+pub(crate) fn binary_broadcast_i32_remu_views_grid(
     name: &str,
     out_shape: &[usize],
     a_shape: &[usize],
@@ -411,71 +413,6 @@ fn binary_broadcast_typed_views_grid(
     }
 }
 
-/// Minimal `Ty::Vec` exerciser (spec 134 P1): each thread vec4-loads group `g` from `a`, adds a broadcast
-/// constant `add`, and vec4-stores to `out`: `out[4g+l] = a[4g+l] + add`, lane `l` in `0..4`. Exercises
-/// `Rvalue::VectorLoad`, `Rvalue::VectorSplat`, `BinaryOp` lanewise on `Ty::Vec`, and
-/// `Statement::VectorStore`. No bounds-check block: the dispatch is sized exactly to the buffer.
-#[cfg(test)]
-pub(crate) fn vec4_add_splat(name: &str, add: f32) -> Body {
-    // _0 ret, _1 a: &[f32], _2 out: &mut [f32], _3 i (vector-group index), _4 v (loaded vec4),
-    // _5 splat (broadcast add), _6 sum (v + splat).
-    let locals = vec![
-        ld(Ty::Unit, false),
-        ld(slice_f32(false), false),
-        ld(slice_f32(true), true),
-        ld(Ty::Usize, false),
-        ld(
-            Ty::Vec {
-                elem: Box::new(Ty::F32),
-                lanes: 4,
-            },
-            false,
-        ),
-        ld(
-            Ty::Vec {
-                elem: Box::new(Ty::F32),
-                lanes: 4,
-            },
-            false,
-        ),
-        ld(
-            Ty::Vec {
-                elem: Box::new(Ty::F32),
-                lanes: 4,
-            },
-            false,
-        ),
-    ];
-    let (a, out, i, v, splat, sum) = (local(1), local(2), local(3), local(4), local(5), local(6));
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(i),
-            dim: IndexAxis::X,
-            target: BlockId { index: 1 },
-        },
-    };
-    let bb1 = BasicBlock {
-        statements: vec![
-            Statement::Assign(Place::local(v), Rvalue::VectorLoad { place: elem(a, i) }),
-            Statement::Assign(
-                Place::local(splat),
-                Rvalue::VectorSplat(Operand::Const(Constant::F32(add))),
-            ),
-            Statement::Assign(
-                Place::local(sum),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(v)), copy(Place::local(splat))),
-            ),
-            Statement::VectorStore {
-                place: elem(out, i),
-                value: copy(Place::local(sum)),
-            },
-        ],
-        terminator: Terminator::Return,
-    };
-    Body::new(name, 2, locals, vec![bb0, bb1])
-}
-
 /// Elementwise binary `c[i] = a[i] op b[i]` over `n` elements (a, b same length as c).
 pub fn binary(name: &str, op: BinOp) -> Body {
     // _0 ret, _1 a, _2 b, _3 c, _4 i, _5 len, _6 cmp, _7 r
@@ -538,11 +475,11 @@ mod tests {
     use std::path::PathBuf;
 
     use poot_codegen::{Target, compile};
-    use poot_runtime::{Context, KernelBuffer};
+    use poot_wgpu_runtime::{Context, KernelBuffer};
 
-    use super::vec4_add_splat;
+    use super::test_only::vec4_add_splat;
 
-    fn spv(body: &poot_kernel_ir::Body, name: &str) -> poot_runtime::CompiledKernel {
+    fn spv(body: &poot_kernel_ir::Body, name: &str) -> poot_runtime_common::CompiledKernel {
         let dir: PathBuf = std::env::temp_dir().join("poot-kernelgen-test").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
@@ -571,7 +508,7 @@ mod tests {
     }
 
     /// `vec4_add_splat` end to end (SpirvVulkan only), split out of `tests/run.rs` (card 546c: its
-    /// only other caller, poot-ptx-gpu's schedule-batch atomicity test, was deleted with the resident
+    /// only other caller, poot-ptx-device's schedule-batch atomicity test, was deleted with the resident
     /// E4M3 region's `compile_schedule`/`compiled_batch` stack, which made this an external-only
     /// consumer that `pub(crate)` cannot serve): (1) `spirv-val` the module (vec4 buffer resource,
     /// splat and vec4 store must be strictly valid, not just RADV-tolerated); (2) dispatch on the
@@ -618,5 +555,75 @@ mod tests {
             &want[..],
             "vec4_add_splat: gpu output must match the scalar CPU reference lane-for-lane"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    /// Minimal `Ty::Vec` exerciser (spec 134 P1): each thread vec4-loads group `g` from `a`, adds a broadcast
+    /// constant `add`, and vec4-stores to `out`: `out[4g+l] = a[4g+l] + add`, lane `l` in `0..4`. Exercises
+    /// `Rvalue::VectorLoad`, `Rvalue::VectorSplat`, `BinaryOp` lanewise on `Ty::Vec`, and
+    /// `Statement::VectorStore`. No bounds-check block: the dispatch is sized exactly to the buffer.
+    pub(crate) fn vec4_add_splat(name: &str, add: f32) -> Body {
+        // _0 ret, _1 a: &[f32], _2 out: &mut [f32], _3 i (vector-group index), _4 v (loaded vec4),
+        // _5 splat (broadcast add), _6 sum (v + splat).
+        let locals = vec![
+            ld(Ty::Unit, false),
+            ld(slice_f32(false), false),
+            ld(slice_f32(true), true),
+            ld(Ty::Usize, false),
+            ld(
+                Ty::Vec {
+                    elem: Box::new(Ty::F32),
+                    lanes: 4,
+                },
+                false,
+            ),
+            ld(
+                Ty::Vec {
+                    elem: Box::new(Ty::F32),
+                    lanes: 4,
+                },
+                false,
+            ),
+            ld(
+                Ty::Vec {
+                    elem: Box::new(Ty::F32),
+                    lanes: 4,
+                },
+                false,
+            ),
+        ];
+        let (a, out, i, v, splat, sum) =
+            (local(1), local(2), local(3), local(4), local(5), local(6));
+        let bb0 = BasicBlock {
+            statements: vec![],
+            terminator: Terminator::ThreadIndexCall {
+                destination: Place::local(i),
+                dim: IndexAxis::X,
+                target: BlockId { index: 1 },
+            },
+        };
+        let bb1 = BasicBlock {
+            statements: vec![
+                Statement::Assign(Place::local(v), Rvalue::VectorLoad { place: elem(a, i) }),
+                Statement::Assign(
+                    Place::local(splat),
+                    Rvalue::VectorSplat(Operand::Const(Constant::F32(add))),
+                ),
+                Statement::Assign(
+                    Place::local(sum),
+                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(v)), copy(Place::local(splat))),
+                ),
+                Statement::VectorStore {
+                    place: elem(out, i),
+                    value: copy(Place::local(sum)),
+                },
+            ],
+            terminator: Terminator::Return,
+        };
+        Body::new(name, 2, locals, vec![bb0, bb1])
     }
 }

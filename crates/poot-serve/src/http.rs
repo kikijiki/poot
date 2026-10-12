@@ -104,14 +104,6 @@ pub(crate) fn configure_response_writes(
     stream.set_write_timeout(Some(timeout))
 }
 
-/// The outcome of reading a request: a parsed request, or a "too large" rejection (413 body, 431 headers).
-#[cfg(test)]
-pub(crate) enum RequestRead {
-    Parsed(ParsedRequest),
-    BodyTooLarge,
-    HeadersTooLarge,
-}
-
 pub(crate) enum RequestHeadRead {
     Parsed(ParsedRequestHead),
     HeadersTooLarge,
@@ -123,16 +115,6 @@ pub(crate) enum AuthorizationHeader {
     Missing,
     Single(String),
     Duplicate,
-}
-
-#[cfg(test)]
-impl AuthorizationHeader {
-    pub(crate) fn as_deref(&self) -> Option<&str> {
-        match self {
-            Self::Single(value) => Some(value),
-            Self::Missing | Self::Duplicate => None,
-        }
-    }
 }
 
 /// `read_line` bounded by a shared header-byte budget: reads at most `*budget` more bytes, decrements it,
@@ -161,37 +143,7 @@ pub(crate) struct ParsedRequestHead {
 pub(crate) struct ParsedRequest {
     pub(crate) method: String,
     pub(crate) path: String,
-    #[cfg(test)]
-    pub(crate) authorization: AuthorizationHeader,
     pub(crate) body: String,
-}
-
-/// Read the request line, headers (capturing `Content-Length` and `Authorization`), and the body.
-/// Returns `Ok(None)` when the declared `Content-Length` exceeds [`MAX_BODY_BYTES`] (caller responds
-/// 413), before any allocation sized off `content_length`.
-#[cfg(test)]
-pub(crate) fn read_request(stream: &mut TcpStream) -> Result<RequestRead> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    read_request_from(&mut reader)
-}
-
-/// Socket-independent request parser. Reads the request line and headers under a shared
-/// [`MAX_HEADER_BYTES`] budget, then the body under the [`MAX_BODY_BYTES`] cap.
-#[cfg(test)]
-pub(crate) fn read_request_from<R: BufRead>(reader: &mut R) -> Result<RequestRead> {
-    let head = match read_request_head_from(reader)? {
-        RequestHeadRead::Parsed(head) => head,
-        RequestHeadRead::HeadersTooLarge => return Ok(RequestRead::HeadersTooLarge),
-    };
-    let Some(body) = read_request_body_from(reader, head.content_length)? else {
-        return Ok(RequestRead::BodyTooLarge);
-    };
-    Ok(RequestRead::Parsed(ParsedRequest {
-        method: head.method,
-        path: head.path,
-        authorization: head.authorization,
-        body,
-    }))
 }
 
 /// Read only the bounded request line and headers. Must not apply the body cap or read any body byte:
@@ -330,8 +282,6 @@ pub(crate) fn read_request_for_routing(
     Ok(Some(ParsedRequest {
         method: head.method,
         path: head.path,
-        #[cfg(test)]
-        authorization: head.authorization,
         body,
     }))
 }
@@ -585,4 +535,61 @@ pub(crate) fn respond_typed_with_header(
     stream.write_all(resp.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    /// The outcome of reading a request: a parsed request, or a "too large" rejection (413 body, 431 headers).
+    pub(crate) enum RequestRead {
+        Parsed(ParsedRequestWithHead),
+        BodyTooLarge,
+        HeadersTooLarge,
+    }
+
+    /// A request the way the socket-independent parser returns it: the head's `Authorization` kept beside
+    /// the method, path and body. Production authorizes on the head before the body is read, so
+    /// [`ParsedRequest`] never carries it.
+    pub(crate) struct ParsedRequestWithHead {
+        pub(crate) method: String,
+        pub(crate) path: String,
+        pub(crate) authorization: AuthorizationHeader,
+        pub(crate) body: String,
+    }
+
+    impl AuthorizationHeader {
+        pub(crate) fn as_deref(&self) -> Option<&str> {
+            match self {
+                Self::Single(value) => Some(value),
+                Self::Missing | Self::Duplicate => None,
+            }
+        }
+    }
+
+    /// Read the request line, headers (capturing `Content-Length` and `Authorization`), and the body.
+    /// Returns `Ok(None)` when the declared `Content-Length` exceeds [`MAX_BODY_BYTES`] (caller responds
+    /// 413), before any allocation sized off `content_length`.
+    pub(crate) fn read_request(stream: &mut TcpStream) -> Result<RequestRead> {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        read_request_from(&mut reader)
+    }
+
+    /// Socket-independent request parser. Reads the request line and headers under a shared
+    /// [`MAX_HEADER_BYTES`] budget, then the body under the [`MAX_BODY_BYTES`] cap.
+    pub(crate) fn read_request_from<R: BufRead>(reader: &mut R) -> Result<RequestRead> {
+        let head = match read_request_head_from(reader)? {
+            RequestHeadRead::Parsed(head) => head,
+            RequestHeadRead::HeadersTooLarge => return Ok(RequestRead::HeadersTooLarge),
+        };
+        let Some(body) = read_request_body_from(reader, head.content_length)? else {
+            return Ok(RequestRead::BodyTooLarge);
+        };
+        Ok(RequestRead::Parsed(ParsedRequestWithHead {
+            method: head.method,
+            path: head.path,
+            authorization: head.authorization,
+            body,
+        }))
+    }
 }

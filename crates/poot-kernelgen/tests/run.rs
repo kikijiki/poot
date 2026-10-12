@@ -3,17 +3,19 @@
 
 use std::path::PathBuf;
 
+use poot_codegen::emit_llvm_ir;
 use poot_codegen::{Target, compile};
+use poot_kernel_ir::test_support::{wg_sum, workgroup_fence_spin_wait};
 use poot_kernel_ir::{
     BasicBlock, BinOp, Body, LocalDecl, MathOp, MemoryOrdering, MemoryScope, Statement, Terminator,
     Ty, UnOp,
 };
 use poot_kernelgen as kg;
-use poot_runtime::{Context, KernelBuffer};
 use poot_target::BufferStorage;
-use poot_test_util::kernel_fixtures::{
-    binary_broadcast, emit_llvm_ir, reduce_last, wg_sum, workgroup_fence_spin_wait,
-};
+use poot_wgpu_runtime::{Context, KernelBuffer};
+
+#[path = "support/attention.rs"]
+mod attention;
 
 /// The f32-element movement `op` into `out_shape`.
 fn movement(name: &str, out_shape: Vec<usize>, op: kg::MovementOp) -> Body {
@@ -25,7 +27,28 @@ fn movement(name: &str, out_shape: Vec<usize>, op: kg::MovementOp) -> Body {
     .expect("a valid movement request")
 }
 
-fn spv(body: &Body, name: &str) -> poot_runtime::CompiledKernel {
+/// The f32 numpy-broadcasting elementwise `c = a op b` over contiguous operands.
+fn binary_broadcast(
+    name: &str,
+    op: BinOp,
+    out_shape: &[usize],
+    a_shape: &[usize],
+    b_shape: &[usize],
+) -> Body {
+    kg::binary_broadcast_dt_views_grid(
+        name,
+        op,
+        Ty::F32,
+        out_shape,
+        a_shape,
+        &kg::Layout::contiguous(a_shape),
+        b_shape,
+        &kg::Layout::contiguous(b_shape),
+        None,
+    )
+}
+
+fn spv(body: &Body, name: &str) -> poot_runtime_common::CompiledKernel {
     let dir: PathBuf = std::env::temp_dir().join("poot-kernelgen-test").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
@@ -36,8 +59,8 @@ fn spv(body: &Body, name: &str) -> poot_runtime::CompiledKernel {
 
 /// The compiled SPIR-V word count of a handle `spv()` built, for callers that just want to assert a
 /// non-empty compile (card 608: `CompiledKernel` has no `len`/`is_empty` of its own).
-fn spirv_word_count(kernel: &poot_runtime::CompiledKernel) -> usize {
-    let poot_runtime::KernelCode::SpirvWords(words) = kernel.code() else {
+fn spirv_word_count(kernel: &poot_runtime_common::CompiledKernel) -> usize {
+    let poot_runtime_common::KernelCode::SpirvWords(words) = kernel.code() else {
         panic!("expected a SpirvVulkan-compiled kernel");
     };
     words.len()
@@ -208,7 +231,7 @@ fn binary_mul() {
 #[test]
 fn cross_block_fence_spin_wait_coop_compiles_to_ptx() {
     let p = ptx(
-        &poot_test_util::kernel_fixtures::cross_block_fence_spin_wait_coop("fencespinwaitc"),
+        &poot_kernel_ir::test_support::cross_block_fence_spin_wait_coop("fencespinwaitc"),
         "fencespinwaitc",
     );
     assert!(
@@ -242,7 +265,7 @@ fn fence_validates_as_spirv_both_scopes() {
     for (body, name) in [
         (workgroup_fence_spin_wait("wgfence_val", 128), "wgfence_val"),
         (
-            poot_test_util::kernel_fixtures::cross_block_fence_spin_wait_coop("devfence_val"),
+            poot_kernel_ir::test_support::cross_block_fence_spin_wait_coop("devfence_val"),
             "devfence_val",
         ),
     ] {
@@ -646,7 +669,7 @@ fn indexed_kernel(
     schedule: kg::Schedule,
     (m, k, n, experts): (usize, usize, usize, usize),
     name: &str,
-) -> (poot_runtime::CompiledKernel, kg::Launch, [u32; 3]) {
+) -> (poot_runtime_common::CompiledKernel, kg::Launch, [u32; 3]) {
     use poot_target::DeviceCaps;
     let caps = DeviceCaps::wgpu_rdna3_igpu();
     let limits = kg::BodyLimits {
@@ -676,7 +699,7 @@ fn indexed_kernel(
 /// Run the indexed kernel and return its `[M, N]` output.
 fn run_indexed(
     ctx: &Context,
-    (kernel, launch, workgroup): &(poot_runtime::CompiledKernel, kg::Launch, [u32; 3]),
+    (kernel, launch, workgroup): &(poot_runtime_common::CompiledKernel, kg::Launch, [u32; 3]),
     (x, w, ids): (&[f32], &[f32], &[i32]),
     out_len: usize,
 ) -> Vec<f32> {
@@ -906,13 +929,19 @@ fn reduce_sum_and_max() {
     let Some(ctx) = ctx() else { return };
     let x = [1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]; // 2 rows x 4 cols
     // sum
-    let s = spv(&reduce_last("rsum", BinOp::Add, 4, 0.0), "rsum");
+    let s = spv(
+        &kg::reduce_last_dt("rsum", Ty::F32, BinOp::Add, 4, 0.0),
+        "rsum",
+    );
     let mut bufs = [KernelBuffer::read_only_f32(&x), KernelBuffer::write_f32(2)];
     ctx.dispatch("test", &s, [64, 1, 1], [2, 1, 1], &mut bufs)
         .unwrap();
     assert_eq!(bufs[1].as_f32(), &[10.0, 100.0]);
     // max
-    let s = spv(&reduce_last("rmax", BinOp::Max, 4, -1e30), "rmax");
+    let s = spv(
+        &kg::reduce_last_dt("rmax", Ty::F32, BinOp::Max, 4, -1e30),
+        "rmax",
+    );
     let mut bufs = [KernelBuffer::read_only_f32(&x), KernelBuffer::write_f32(2)];
     ctx.dispatch("test", &s, [64, 1, 1], [2, 1, 1], &mut bufs)
         .unwrap();
@@ -1327,7 +1356,7 @@ fn attention_decode_validates_and_matches_cpu() {
     ) else {
         return;
     };
-    let want = poot_test_util::kernel_fixtures::attention_reference(&spec, &q, &k, &v, &mask);
+    let want = attention::attention_reference(&spec, &q, &k, &v, &mask);
     poot_test_util::assert_close(&got, &want, 1e-4);
 }
 
@@ -1351,7 +1380,7 @@ fn attention_prefill_validates_and_matches_cpu() {
     ) else {
         return;
     };
-    let want = poot_test_util::kernel_fixtures::attention_reference(&spec, &q, &k, &v, &mask);
+    let want = attention::attention_reference(&spec, &q, &k, &v, &mask);
     poot_test_util::assert_close(&got, &want, 1e-4);
 }
 
@@ -1867,7 +1896,7 @@ fn epilogue_bodies_compile_to_valid_spirv_and_nvptx() {
         }
     }
     // The narrow-head bodies hold a BF16 or F16 buffer, which SPIR-V has no scalar type for: NVPTX only here (ROCm
-    // compiles and runs them in `poot-rocm-gpu`'s cross_backend rows).
+    // compiles and runs them in `poot-rocm-device`'s cross_backend rows).
     if which("llc") {
         for dt in [Ty::BF16, Ty::F16] {
             let body = kg::matmul_batched_epilogue_dt_grid(

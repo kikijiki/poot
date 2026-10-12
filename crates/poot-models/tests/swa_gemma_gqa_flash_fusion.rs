@@ -7,10 +7,10 @@
 //! on poot-eval, so an integration test here can drive both (though this particular test needs no
 //! poot-eval API at all).
 
-use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::op::OpKind;
 use poot_graph_plan::{cse, dce, flash_attention_capped};
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
 
 #[test]
 fn swa_gqa_prefill_reaches_the_grouped_flash_path() {
@@ -26,7 +26,11 @@ fn swa_gqa_prefill_reaches_the_grouped_flash_path() {
     let n_rep = heads / kv_heads;
     let g = m
         .model
-        .trace(Phase::Prefill, step(1, 6, 6, LogitRows::Last))
+        .trace(
+            Phase::Prefill,
+            step(1, 6, 6, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
     let reps: Vec<usize> = fused

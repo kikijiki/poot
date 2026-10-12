@@ -11,7 +11,6 @@
 //! carries the E4M3FN and packed-quant executor slices.
 
 pub mod exact_bf16;
-pub mod exact_dense;
 pub mod exact_value;
 pub mod fp8;
 pub mod observer;
@@ -33,6 +32,7 @@ mod geometry;
 mod operand;
 mod ops;
 mod resolve;
+#[cfg(any(test, feature = "test-support"))]
 mod routing;
 mod value;
 mod walk;
@@ -42,9 +42,12 @@ pub use exact_value::{ExactI32TensorView, ExactValue};
 pub use ops::index_rule::{IndexFault, IndexFaultKind, IndexValue};
 #[cfg(any(test, feature = "test-support"))]
 pub use ops::movement::apply_movement;
+#[cfg(any(test, feature = "test-support"))]
 pub use routing::{top_k_gate, top_k_ids, top_k_mask};
 pub use value::{PackedEvalError, Value};
 pub use walk::{EvalBudget, EvalOptions, Evaluation, eval};
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 #[cfg(test)]
 mod tests;

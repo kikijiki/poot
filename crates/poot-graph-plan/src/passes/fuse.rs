@@ -1,12 +1,15 @@
-use super::*;
-use poot_graph_ir::ContractionRows;
-use poot_graph_ir::ValueTable;
+use super::{
+    ContractionHead, DType, EditError, Eqn, FusedOp, FusedOperand, FusedRegion, FusedStep, Graph,
+    HashMap, HashSet, OpKind, Operand, RowRegion, RowStep, TensorType, UnOp, ValueId,
+    collapse_reshape_chains, elide_noop_transposes, with_eqns,
+};
+use poot_graph_ir::{ContractionRows, ValueTable};
 /// The `f32` unaries the pointwise-fusion phase admits into a region. [`kernel_mapping::map_fused_op`]
 /// (`poot-graph-plan`) must lower every one of these inside a fused region: legality here and the
 /// kernel table are one contract (card 536b, R481-007), checked by
 /// `kernel_mapping::tests::fused_region_kernel_table_covers_every_fusable_unary` against this same
 /// list rather than a second hand-copied one.
-pub const FUSABLE_FLOAT_UNARY_OPS: &[UnOp] = &[
+pub(crate) const FUSABLE_FLOAT_UNARY_OPS: &[UnOp] = &[
     UnOp::Neg,
     UnOp::Exp,
     UnOp::Log,
@@ -304,6 +307,13 @@ fn to_i32_region_operand(o: &Operand, operand_of: &HashMap<ValueId, FusedOperand
 /// whose steps stay in `Ge`/`GeU`/`Sub`/`Add`/`Mul`, `Not`/`Clz` and `Select`, and whose packed
 /// last-axis concat is carried by the region's `pack`. The exact-I32 evaluator has a `Fused` arm for
 /// exactly that subset (`poot-eval/src/exact_i32.rs`), so the region is supported rather than dropped.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
     // First turn data-no-op transposes into (free) reshapes so they cost no dispatch on the launch-bound
     // decode; the fusion grouping below treats both as movement boundaries, so this only removes launches.
@@ -596,7 +606,7 @@ pub fn fuse(g: &Graph) -> Result<Graph, EditError> {
 /// Near misses stay as they were: a head with two consumers, a reducing or reshaping consumer, a step that
 /// changes the shape or the dtype, and a head `head_lowers` refuses (the planner has no epilogue lowering
 /// for it on the target: a tensor-core `MatMul`).
-pub fn fuse_contraction_epilogues(
+pub(crate) fn fuse_contraction_epilogues(
     g: &Graph,
     head_lowers: impl Fn(&Graph, &Eqn) -> bool,
 ) -> Result<Graph, EditError> {
@@ -1146,11 +1156,11 @@ mod tests {
     /// `FUSABLE_FLOAT_UNARY_OPS`; this assertion's step count drops and the row goes red.
     #[test]
     fn recip_tanh_erf_fuse_into_one_region() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4, 8]));
-        let g = b.unary(UnOp::Tanh, x);
-        let e = b.unary(UnOp::Erf, g);
-        let r = b.unary(UnOp::Recip, e);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+        let g = b.unary(UnOp::Tanh, x).unwrap();
+        let e = b.unary(UnOp::Erf, g).unwrap();
+        let r = b.unary(UnOp::Recip, e).unwrap();
         let graph = b.finish(r).unwrap();
 
         let fused = fuse(&graph).unwrap();
@@ -1188,11 +1198,11 @@ mod tests {
     /// `add` stays outside and this row sees two equations.
     #[test]
     fn a_producer_read_twice_inside_one_region_fuses() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4, 8]));
-        let y = b.constant("y", TensorType::f32(vec![4, 8]));
-        let sum = b.binary(poot_graph_ir::BinOp::Add, x, y);
-        let out = poot_graph_ir::ops::silu(&b, sum);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+        let y = b.constant("y", TensorType::f32(vec![4, 8])).unwrap();
+        let sum = b.binary(poot_graph_ir::BinOp::Add, x, y).unwrap();
+        let out = poot_graph_ir::ops::silu(&b, sum).unwrap();
         let graph = b.finish(out).unwrap();
 
         let fused = fuse(&graph).unwrap();
@@ -1209,12 +1219,20 @@ mod tests {
     /// `add` is absorbed although the `Reshape` still reads it, and the plain `Add` count goes to zero.
     #[test]
     fn a_producer_read_outside_the_region_does_not_fuse() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4, 8]));
-        let y = b.constant("y", TensorType::f32(vec![4, 8]));
-        let sum = b.binary(poot_graph_ir::BinOp::Add, x, y);
-        let act = b.reshape(poot_graph_ir::ops::silu(&b, sum), vec![32]);
-        let out = b.binary(poot_graph_ir::BinOp::Mul, act, b.reshape(sum, vec![32]));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+        let y = b.constant("y", TensorType::f32(vec![4, 8])).unwrap();
+        let sum = b.binary(poot_graph_ir::BinOp::Add, x, y).unwrap();
+        let act = b
+            .reshape(poot_graph_ir::ops::silu(&b, sum).unwrap(), vec![32])
+            .unwrap();
+        let out = b
+            .binary(
+                poot_graph_ir::BinOp::Mul,
+                act,
+                b.reshape(sum, vec![32]).unwrap(),
+            )
+            .unwrap();
         let graph = b.finish(out).unwrap();
 
         let fused = fuse(&graph).unwrap();

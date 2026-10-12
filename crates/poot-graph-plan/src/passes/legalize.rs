@@ -33,9 +33,9 @@ use std::collections::{HashMap, HashSet};
 
 use poot_target::DeviceCaps;
 
-use poot_graph_ir::graph::EditError;
-use poot_graph_ir::graph::LayerIndex;
-use poot_graph_ir::graph::{Eqn, Graph, Operand, Slot, Storage, ValueId, ValueMeta};
+use poot_graph_ir::graph::{
+    EditError, Eqn, Graph, LayerIndex, Operand, Slot, Storage, ValueId, ValueMeta,
+};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{BinOp, ContractionRows, PackedSourceName, Scalar};
@@ -91,6 +91,13 @@ impl From<poot_graph_ir::EditError> for LegalizeError {
 /// oversized 2D weight read by a `DenseContraction`, or through a transpose into a `MatMul`, splits into row
 /// chunks that each fit, joined by a `Concat`). Anything
 /// still over the limit after both rewrites is a typed refusal, before any device allocation (SC-002).
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn legalize(
     g: &Graph,
     caps: &DeviceCaps,
@@ -597,15 +604,10 @@ fn expert_ranges(
     )
 }
 
-/// The id every piece of a split expert stack reads for a row no expert of the stack holds: past any expert count,
-/// so the row is invalid in each piece, and exact in `i32`.
-const UNHELD_ID: i32 = 1 << 30;
-
 /// An indexed packed contraction `legalize` can split: its activation, row ids and packed source carriers (named
 /// constants, one per role), and the expert ranges of the pieces.
 struct StackSplit {
     descriptor: PackedWeight,
-    experts: usize,
     x: ValueId,
     ids: ValueId,
     carriers: Vec<ValueId>,
@@ -687,11 +689,13 @@ impl Appender<'_> {
 /// weight's row chunk). Every piece computes every row, so a row the piece does not own is neutralized instead of
 /// selected away: the piece reads the activation row times `owned` (an I32 `1` when `lo <= id < hi`, else `0`,
 /// widened to F32), which makes its output row exactly `0` for a finite activation row, and the id
-/// `(id - lo) * owned` shifted into the piece's table, or `0` for a row it does not own. A row whose id no
-/// expert of the stack holds (outside `0..E`) instead reads an id of `2^30` in every piece, so every piece
-/// outputs the NaN row of the unsplit contraction. The sum of the pieces is then the owning piece's row plus
-/// zeros. The split costs one full contraction per piece, and a non-finite activation row turns into NaN rather than
-/// whatever the unsplit contraction makes of it.
+/// `max(id - lo, 0) % (hi - lo)`: the id shifted into the piece's table for a row it owns, and some valid
+/// row of the table for a row it does not (its activation row is zero). The id is proven in `[0, hi - lo)` by
+/// the range rules alone (`Max` and `RemU`), so the split graph passes the same expert-id proof as the unsplit
+/// one; an id outside `0..E` never reaches a split (`compile` refused it, and the weight binder checks a
+/// declared range). The sum of the pieces is the owning piece's row plus zeros. The split costs one full
+/// contraction per piece, and a non-finite activation row turns into NaN rather than whatever the unsplit
+/// contraction makes of it.
 fn split_oversized_expert_stacks(
     g: &Graph,
     limit: u64,
@@ -705,7 +709,6 @@ fn split_oversized_expert_stacks(
     for eqn in g.eqns() {
         let Some(StackSplit {
             descriptor,
-            experts,
             x,
             ids,
             carriers,
@@ -728,22 +731,6 @@ fn split_oversized_expert_stacks(
             layer: eqn.layer,
         };
 
-        // `2^30` for a row no expert of the stack holds, else `0`: added to every piece's id.
-        let held = emit.indicator(ids, &ids_aval, 0..experts)?;
-        let missing = emit.push(
-            OpKind::Binary(BinOp::Sub),
-            &[Operand::Value(held), Operand::Lit(Scalar::I32(1))],
-            ids_aval.clone(),
-        )?;
-        let unheld_id = emit.push(
-            OpKind::Binary(BinOp::Mul),
-            &[
-                Operand::Value(missing),
-                Operand::Lit(Scalar::I32(-UNHELD_ID)),
-            ],
-            ids_aval.clone(),
-        )?;
-
         let mut sum: Option<ValueId> = None;
         for (index, range) in ranges.iter().enumerate() {
             let owned = emit.indicator(ids, &ids_aval, range.clone())?;
@@ -759,14 +746,17 @@ fn split_oversized_expert_stacks(
                     ids_aval.clone(),
                 )?
             };
-            let owned_ids = emit.push(
-                OpKind::Binary(BinOp::Mul),
-                &[Operand::Value(local_ids), Operand::Value(owned)],
+            let non_negative = emit.push(
+                OpKind::Binary(BinOp::Max),
+                &[Operand::Value(local_ids), Operand::Lit(Scalar::I32(0))],
                 ids_aval.clone(),
             )?;
             let piece_ids = emit.push(
-                OpKind::Binary(BinOp::Add),
-                &[Operand::Value(owned_ids), Operand::Value(unheld_id)],
+                OpKind::Binary(BinOp::RemU),
+                &[
+                    Operand::Value(non_negative),
+                    Operand::Lit(Scalar::I32(range.len() as i32)),
+                ],
                 ids_aval.clone(),
             )?;
             let owned_f32 = emit.push(
@@ -866,7 +856,6 @@ fn splittable_stack(g: &Graph, eqn: &Eqn, limit: u64) -> Option<StackSplit> {
         }))
     .then_some(StackSplit {
         descriptor: *descriptor,
-        experts: *experts,
         x,
         ids,
         carriers,
@@ -877,6 +866,7 @@ fn splittable_stack(g: &Graph, eqn: &Eqn, limit: u64) -> Option<StackSplit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use poot_graph_ir::Builder;
     use poot_graph_ir::types::TensorType;
     use poot_tensor::DType;
@@ -890,13 +880,15 @@ mod tests {
 
     /// `[vocab, hidden]` f32 embed table gathered by a scalar `Slot::Token` (the decode shape).
     fn embed_gather_graph(vocab: usize, hidden: usize) -> Graph {
-        let b = Builder::new();
-        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-        let embed = b.constant(
-            "model.embed_tokens.weight",
-            TensorType::f32(vec![vocab, hidden]),
-        );
-        let out = b.gather_scalar(embed, 0, token);
+        let b = Builder::for_tests();
+        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32)).unwrap();
+        let embed = b
+            .constant(
+                "model.embed_tokens.weight",
+                TensorType::f32(vec![vocab, hidden]),
+            )
+            .unwrap();
+        let out = b.gather_scalar(embed, 0, token).unwrap();
         b.finish(out).unwrap()
     }
 
@@ -942,12 +934,16 @@ mod tests {
     /// at compile); the rewrite must leave it, so legalize answers with the typed `OversizedConstant`.
     #[test]
     fn legalize_does_not_host_a_gather_whose_table_another_eqn_reads() {
-        let b = Builder::new();
-        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-        let embed = b.constant("tied.weight", TensorType::f32(vec![152_064, 3584]));
-        let row = b.gather_scalar(embed, 0, token);
-        let x = b.reshape(row, vec![1, 3584]);
-        let out = b.matmul(x, b.transpose(embed, vec![1, 0]));
+        let b = Builder::for_tests();
+        let token = b.slot(Slot::Token, TensorType::scalar(DType::I32)).unwrap();
+        let embed = b
+            .constant("tied.weight", TensorType::f32(vec![152_064, 3584]))
+            .unwrap();
+        let row = b.gather_scalar(embed, 0, token).unwrap();
+        let x = b.reshape(row, vec![1, 3584]).unwrap();
+        let out = b
+            .matmul(x, b.transpose(embed, vec![1, 0]).unwrap())
+            .unwrap();
         let g = b.finish(out).unwrap();
 
         let err = legalize(
@@ -1016,10 +1012,12 @@ mod tests {
     /// the split fire again and the test green.
     #[test]
     fn legalize_splits_an_oversized_matmul_weight() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 4096]));
-        let w = b.constant("big.weight", TensorType::f32(vec![200_000, 4096])); // ~3.05 GB
-        let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 4096])).unwrap();
+        let w = b
+            .constant("big.weight", TensorType::f32(vec![200_000, 4096]))
+            .unwrap(); // ~3.05 GB
+        let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
@@ -1070,14 +1068,16 @@ mod tests {
     /// `splittable_matmul`; the weight stays whole and `legalize` refuses it (`OversizedConstant`).
     #[test]
     fn legalize_splits_an_oversized_dense_contraction_weight() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 4096]));
-        let w = b.constant(
-            "big.weight",
-            TensorType::new(vec![200_000, 4096], DType::BF16),
-        );
-        let out = b.matmul(x, b.transpose(w, vec![1, 0]));
-        let g = crate::fold_dense_contractions(&b.finish(out).unwrap()).unwrap();
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 4096])).unwrap();
+        let w = b
+            .constant(
+                "big.weight",
+                TensorType::new(vec![200_000, 4096], DType::BF16),
+            )
+            .unwrap();
+        let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
+        let g = crate::dtype_widen::fold_dense_contractions(&b.finish(out).unwrap()).unwrap();
         assert!(
             g.eqns()
                 .iter()
@@ -1121,15 +1121,19 @@ mod tests {
     #[test]
     fn legalize_splits_a_transposed_matmul_weight_and_keeps_a_shared_one() {
         let build = |share: bool| {
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32(vec![1, 4]));
-            let w = b.constant("head.weight", TensorType::f32(vec![10, 4])); // 160 bytes
-            let wt = b.transpose(w, vec![1, 0]);
-            let out = b.matmul(x, wt);
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![1, 4])).unwrap();
+            let w = b
+                .constant("head.weight", TensorType::f32(vec![10, 4]))
+                .unwrap(); // 160 bytes
+            let wt = b.transpose(w, vec![1, 0]).unwrap();
+            let out = b.matmul(x, wt).unwrap();
             // a second reader of the same transpose that is not a matmul keeps it live.
             let out = if share {
-                let s = b.reduce(poot_graph_ir::op::RedOp::Sum, wt, 0, true);
-                b.binary(poot_graph_ir::op::BinOp::Add, out, s)
+                let s = b
+                    .reduce(poot_graph_ir::op::RedOp::Sum, wt, 0, true)
+                    .unwrap();
+                b.binary(poot_graph_ir::op::BinOp::Add, out, s).unwrap()
             } else {
                 out
             };
@@ -1175,10 +1179,12 @@ mod tests {
     /// would be column slices of the stored weight - so it is refused by name.
     #[test]
     fn legalize_refuses_an_oversized_weight_read_without_a_transpose() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 4]));
-        let w = b.constant("direct.weight", TensorType::f32(vec![4, 10]));
-        let out = b.matmul(x, w);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 4])).unwrap();
+        let w = b
+            .constant("direct.weight", TensorType::f32(vec![4, 10]))
+            .unwrap();
+        let out = b.matmul(x, w).unwrap();
         let g = b.finish(out).unwrap();
         let error = legalize(&g, &caps_with_limit(64), &CompileLimits::STANDARD)
             .expect_err("a direct oversized weight has no split");
@@ -1196,10 +1202,10 @@ mod tests {
     #[test]
     fn legalize_refuses_an_oversized_packed_source_instead_of_splitting_it() {
         let name = poot_graph_ir::PackedSourceName::weight("w.head").to_string();
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 4]));
-        let w = b.constant(&name, TensorType::f32(vec![10, 4]));
-        let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 4])).unwrap();
+        let w = b.constant(&name, TensorType::f32(vec![10, 4])).unwrap();
+        let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         let g = b.finish(out).unwrap();
         let error = legalize(&g, &caps_with_limit(64), &CompileLimits::STANDARD)
             .expect_err("a packed source never splits");
@@ -1213,10 +1219,12 @@ mod tests {
     /// no-op, and consts are untouched.
     #[test]
     fn legalize_leaves_a_small_matmul_weight_dense() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 64]));
-        let w = b.constant("small.weight", TensorType::f32(vec![64, 128])); // 32 KB
-        let out = b.matmul(x, w);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 64])).unwrap();
+        let w = b
+            .constant("small.weight", TensorType::f32(vec![64, 128]))
+            .unwrap(); // 32 KB
+        let out = b.matmul(x, w).unwrap();
         let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
@@ -1235,15 +1243,17 @@ mod tests {
     /// dumping the whole `Graph` in place of the expected error. Restoring the call made it green.
     #[test]
     fn legalize_refuses_a_matmul_weight_no_split_can_help() {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         // k alone (600,000,000 * 4 bytes = 2.4 GB) is over the limit, so even a single-row chunk
         // does not fit: `row_chunks` returns `None` and the split rewrite does not apply. `x` is a
         // broadcast of one real scalar, not a declared 2.4 GB constant: `splittable_matmul` never looks
         // at the activation's storage, only the weight's, so this stays a cheap fixture.
-        let x0 = b.constant("x0", TensorType::f32(vec![1, 1]));
-        let x = b.broadcast(x0, vec![1, 600_000_000]);
-        let w = b.constant("big.weight", TensorType::f32(vec![2, 600_000_000]));
-        let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let x0 = b.constant("x0", TensorType::f32(vec![1, 1])).unwrap();
+        let x = b.broadcast(x0, vec![1, 600_000_000]).unwrap();
+        let w = b
+            .constant("big.weight", TensorType::f32(vec![2, 600_000_000]))
+            .unwrap();
+        let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         let g = b.finish(out).unwrap();
 
         let caps = caps_with_limit(2_147_483_647);
@@ -1269,10 +1279,12 @@ mod tests {
     /// panicked red. Restoring the liveness filter made it green.
     #[test]
     fn legalize_ignores_a_dead_oversized_constant() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 4]));
-        let live = b.constant("live.weight", TensorType::f32(vec![4, 8]));
-        let out = b.matmul(x, live);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 4])).unwrap();
+        let live = b
+            .constant("live.weight", TensorType::f32(vec![4, 8]))
+            .unwrap();
+        let out = b.matmul(x, live).unwrap();
         let traced = b.finish(out).unwrap();
 
         // A dead oversized const: declared in `values`/`inputs`/`consts`, referenced by no eqn, no

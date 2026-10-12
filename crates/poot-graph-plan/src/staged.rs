@@ -21,6 +21,7 @@
 //!    transfer schemas are checked. Across devices the weight owners are placed and each device's exact
 //!    footprint is admitted against its budget.
 
+use crate::passes::{CutSite, StageAssignment, split_stages};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,18 +36,17 @@ use crate::multi_device::{
     TopologyError,
 };
 use crate::passes::{GraphBudget, PoolError, PoolSite, ShardError, StageSplitError, expand_ranks};
-use crate::{
-    CompileError, CompileOptions, CutSite, Program, Refusal, ShardRule, StageAssignment, Target,
-    shard, split_stages,
-};
+use crate::{CompileError, CompileOptions, Program, Refusal, ShardRule, Target, shard};
 
 mod devices;
 mod lora;
 mod pool;
 #[cfg(test)]
 mod tests;
+mod traffic;
 
 pub use devices::Unsupported;
+pub use traffic::ReadTraffic;
 
 /// One stage of a [`StagedProgram`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -254,6 +254,12 @@ impl StagedProgram {
     /// device. The footprint admission checked against each device's budget at plan time; the plan tests read it back.
     pub fn footprints(&self) -> &[(DeviceId, ByteCategories)] {
         &self.footprints
+    }
+
+    /// What one step of this program reads from weights and carried state, from the planned storage of
+    /// each value a dispatch reads (the roofline numerator; see [`ReadTraffic`]).
+    pub fn read_traffic(&self) -> ReadTraffic {
+        traffic::staged_traffic(self.stages.iter().map(|(_, _, program)| program))
     }
 
     /// How the weights are divided over the ranks, for a tensor-parallel program.

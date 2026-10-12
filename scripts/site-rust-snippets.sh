@@ -26,7 +26,7 @@ PARAMS = {
     ("compute-engine.md", 0): "",
     ("compute-engine.md", 1): "g: poot_graph_ir::Graph",
     ("compute-engine.md", 2): "g: poot_graph_ir::Graph, store: poot_quant::weights::WeightStore, map: poot_quant::weights::WeightMap",
-    ("compute-engine.md", 3): "kernel: poot_runtime::CompiledKernel",
+    ("compute-engine.md", 3): "kernel: poot_wgpu_runtime::CompiledKernel",
 }
 out = "#![allow(unused)]\ntype R = Result<(), Box<dyn std::error::Error>>;\nfn main() {}\n"
 seen = set()

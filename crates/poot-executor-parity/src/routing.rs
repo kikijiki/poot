@@ -56,9 +56,9 @@ fn arg_top_k_case(name: &'static str, rows: usize, e: usize, k: usize) -> ArgTop
         })
         .collect();
 
-    let b = Builder::new();
-    let rank_in = b.constant("rank", TensorType::f32(vec![rows, e]));
-    let ids = b.arg_top_k(rank_in, k);
+    let b = Builder::for_tests();
+    let rank_in = b.constant("rank", TensorType::f32(vec![rows, e])).unwrap();
+    let ids = b.arg_top_k(rank_in, k).unwrap();
     let graph = b.finish(ids).unwrap();
     ArgTopKCase {
         fixture: const_fixture(
@@ -123,13 +123,15 @@ fn tie_case(name: &'static str, rows: &[[f32; 5]], k: usize) -> TieCase {
         })
         .collect();
 
-    let b = Builder::new();
-    let scores_in = b.constant("scores", TensorType::f32(vec![l, e]));
-    let rank = ops::stable_descending_rank(&b, scores_in);
-    let ids = b.cast(b.arg_top_k(rank, k), poot_tensor::DType::F32);
-    let mask = ops::top_k_keep_mask(&b, rank, k);
-    let gate = ops::top_k_gate(&b, scores_in, k);
-    let out = b.concat(1, &[ids, mask, gate]);
+    let b = Builder::for_tests();
+    let scores_in = b.constant("scores", TensorType::f32(vec![l, e])).unwrap();
+    let rank = ops::stable_descending_rank(&b, scores_in).unwrap();
+    let ids = b
+        .cast(b.arg_top_k(rank, k).unwrap(), poot_tensor::DType::F32)
+        .unwrap();
+    let mask = ops::top_k_keep_mask(&b, rank, k).unwrap();
+    let gate = ops::top_k_gate(&b, scores_in, k).unwrap();
+    let out = b.concat(1, &[ids, mask, gate]).unwrap();
     let graph = b.finish(out).unwrap();
     TieCase {
         fixture: const_fixture(

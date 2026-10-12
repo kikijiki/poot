@@ -20,7 +20,7 @@ fn element_kind_of(ty: &Ty) -> Option<ElementKind> {
         Ty::F32 => Some(ElementKind::F32),
         // A packed-word buffer's native representation carries i32 and u32 payloads identically (both
         // 4-byte words the runtime copies and binds the same way; only the kernel body's own typed GEP
-        // distinguishes signed from unsigned reads). See `poot_runtime::KernelBuffer::read_only_u32`.
+        // distinguishes signed from unsigned reads). See `poot_wgpu_runtime::KernelBuffer::read_only_u32`.
         Ty::I32 | Ty::U32 => Some(ElementKind::I32),
         Ty::BF16 => Some(ElementKind::Bf16),
         Ty::F16 => Some(ElementKind::F16),

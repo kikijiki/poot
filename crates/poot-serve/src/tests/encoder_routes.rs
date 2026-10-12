@@ -36,7 +36,7 @@ fn write_encoder_checkpoint(variant: Option<&str>) -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("create the checkpoint directory");
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).expect("write config");
     std::fs::write(dir.join("tokenizer.json"), tokenizer).expect("write tokenizer");
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
     dir
 }
 

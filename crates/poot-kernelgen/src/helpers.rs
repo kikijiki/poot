@@ -159,15 +159,6 @@ pub(crate) fn slice_f32(mutable: bool) -> Ty {
         pointee: Box::new(Ty::Slice(Box::new(Ty::F32))),
     }
 }
-/// Per-thread private array element `arr[idx]` (projection `[Index]`, no Deref - distinguishing a private
-/// `Ty::Array` local from a slice param `[Deref, Index]`).
-#[cfg(test)]
-pub(crate) fn arr_elem(arr: Local, idx: Local) -> Place {
-    Place {
-        local: arr,
-        projection: vec![ProjectionElem::Index(idx)],
-    }
-}
 
 pub(crate) fn ld(ty: Ty, mutable: bool) -> LocalDecl {
     LocalDecl { ty, mutable }
@@ -296,14 +287,14 @@ impl BodyBudget {
 }
 
 /// A small local allocator for generators that mint many temporaries.
-pub struct Alloc {
+pub(crate) struct Alloc {
     pub locals: Vec<LocalDecl>,
 }
 impl Alloc {
-    pub fn new(initial: Vec<LocalDecl>) -> Self {
+    pub(crate) fn new(initial: Vec<LocalDecl>) -> Self {
         Alloc { locals: initial }
     }
-    pub fn add(&mut self, ty: Ty, mutable: bool) -> Local {
+    pub(crate) fn add(&mut self, ty: Ty, mutable: bool) -> Local {
         let i = self.locals.len() as u32;
         self.locals.push(ld(ty, mutable));
         local(i)
@@ -742,5 +733,19 @@ mod stride_tests {
             "broadcast axis 0 zeroed even though the transposed layout's stride there is nonzero"
         );
         assert_eq!(offset2, 7);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    /// Per-thread private array element `arr[idx]` (projection `[Index]`, no Deref - distinguishing a private
+    /// `Ty::Array` local from a slice param `[Deref, Index]`).
+    pub(crate) fn arr_elem(arr: Local, idx: Local) -> Place {
+        Place {
+            local: arr,
+            projection: vec![ProjectionElem::Index(idx)],
+        }
     }
 }

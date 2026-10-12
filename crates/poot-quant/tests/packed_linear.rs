@@ -716,7 +716,7 @@ fn decode_row_matches_the_scalar_decoder_bit_for_bit() {
     ];
     for (seed, format) in block_formats.into_iter().chain(planar_formats).enumerate() {
         let shape = [3, 512];
-        let payload = poot_test_util::packed::random_payload(format, shape, seed as u64);
+        let payload = poot_quant::test_support::packed::random_payload(format, shape, seed as u64);
         let descriptor = format.descriptor();
         let mut row = vec![0.0f32; shape[1]];
         let mut reference = vec![0.0f32; shape[1]];
@@ -794,8 +794,10 @@ fn gather_rows_moves_whole_stored_rows_of_every_block_format() {
         WeightFormat::Iq4_Xs,
     ];
     for (seed, format) in block_formats.into_iter().enumerate() {
-        let gate = poot_test_util::packed::random_payload(format, [4, 256], 2 * seed as u64);
-        let up = poot_test_util::packed::random_payload(format, [3, 256], 2 * seed as u64 + 1);
+        let gate =
+            poot_quant::test_support::packed::random_payload(format, [4, 256], 2 * seed as u64);
+        let up =
+            poot_quant::test_support::packed::random_payload(format, [3, 256], 2 * seed as u64 + 1);
         let stacked: Vec<Vec<u32>> = decoded_rows(&gate)
             .into_iter()
             .chain(decoded_rows(&up))
@@ -818,13 +820,13 @@ fn gather_rows_moves_whole_stored_rows_of_every_block_format() {
             Err(PackedWeightError::RowOutOfRange { row: 7, rows: 7 })
         );
     }
-    let q8 = poot_test_util::packed::random_payload(WeightFormat::Q8_0, [2, 64], 0);
-    let q4 = poot_test_util::packed::random_payload(WeightFormat::Q4_0, [2, 64], 1);
+    let q8 = poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [2, 64], 0);
+    let q4 = poot_quant::test_support::packed::random_payload(WeightFormat::Q4_0, [2, 64], 1);
     assert!(matches!(
         PackedPayload::gather_rows(&[&q8, &q4], &[0]),
         Err(PackedWeightError::RowGatherParts { .. })
     ));
-    let awq = poot_test_util::packed::random_payload(
+    let awq = poot_quant::test_support::packed::random_payload(
         WeightFormat::Awq {
             group_size: nonzero(64),
         },

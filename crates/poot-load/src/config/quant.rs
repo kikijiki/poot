@@ -1,5 +1,4 @@
-use super::super::*;
-
+use std::collections::HashMap;
 /// The `quantization_config` block. GPTQ 4-bit (sym, no act-order) and AWQ 4-bit (GEMM) are consumed
 /// today (specs 019-020).
 #[derive(Debug, Clone, serde::Deserialize)]

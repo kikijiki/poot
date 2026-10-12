@@ -4,7 +4,7 @@
 use super::*;
 use crate::builder::Builder;
 use crate::graph::{Operand, Slot};
-use crate::types::TensorType;
+use crate::types::{DType, TensorType};
 
 const UPPER: usize = 4;
 
@@ -20,11 +20,13 @@ fn r(lo: i64, hi_exclusive: i64) -> IndexRange {
 
 #[test]
 fn a_float_value_has_no_range_and_an_undeclared_i32_input_is_every_word() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2]));
-    let word = b.constant("w", TensorType::new(vec![2], DType::I32));
-    let sum = b.binary_scalar(BinOp::Add, x, Scalar::F32(1.0));
-    let out = b.cast(word, DType::F32);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2])).unwrap();
+    let word = b
+        .constant("w", TensorType::new(vec![2], DType::I32))
+        .unwrap();
+    let sum = b.binary_scalar(BinOp::Add, x, Scalar::F32(1.0)).unwrap();
+    let out = b.cast(word, DType::F32).unwrap();
     let graph = b.finish(out).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[x.id()], None);
@@ -34,37 +36,43 @@ fn a_float_value_has_no_range_and_an_undeclared_i32_input_is_every_word() {
 
 #[test]
 fn iota_argtopk_and_comparisons_are_bounded_by_their_definitions() {
-    let b = Builder::new();
-    let iota = b.iota_i32(7);
+    let b = Builder::for_tests();
+    let iota = b.iota_i32(7).unwrap();
     assert_eq!(range_of(b, iota), r(0, 7));
 
-    let b = Builder::new();
-    let scores = b.constant("scores", TensorType::f32(vec![3, 6]));
-    let ids = b.arg_top_k(scores, 2);
+    let b = Builder::for_tests();
+    let scores = b.constant("scores", TensorType::f32(vec![3, 6])).unwrap();
+    let ids = b.arg_top_k(scores, 2).unwrap();
     assert_eq!(range_of(b, ids), r(0, 6));
 
     for op in [BinOp::Ge, BinOp::GeU] {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![3], DType::I32));
-        let flag = b.binary_scalar(op, x, Scalar::I32(5));
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![3], DType::I32))
+            .unwrap();
+        let flag = b.binary_scalar(op, x, Scalar::I32(5)).unwrap();
         assert_eq!(range_of(b, flag), r(0, 2), "{op:?}");
     }
 }
 
 #[test]
 fn arithmetic_is_interval_arithmetic_and_a_possible_wrap_is_every_word() {
-    let b = Builder::new();
-    let pos = b.slot_ranged(
-        Slot::Pos,
-        TensorType::new(vec![4], DType::I32),
-        IndexRange::below(10).unwrap(),
-    );
-    let add = b.binary_scalar(BinOp::Add, pos, Scalar::I32(5));
-    let sub = b.binary_scalar(BinOp::Sub, pos, Scalar::I32(5));
-    let mul = b.binary_scalar(BinOp::Mul, pos, Scalar::I32(-3));
-    let max = b.binary_scalar(BinOp::Max, pos, Scalar::I32(7));
-    let wraps = b.binary_scalar(BinOp::Add, pos, Scalar::I32(i32::MAX));
-    let out = b.concat(0, &[add, sub, mul, max, wraps]);
+    let b = Builder::for_tests();
+    let pos = b
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![4], DType::I32),
+            IndexRange::below(10).unwrap(),
+        )
+        .unwrap();
+    let add = b.binary_scalar(BinOp::Add, pos, Scalar::I32(5)).unwrap();
+    let sub = b.binary_scalar(BinOp::Sub, pos, Scalar::I32(5)).unwrap();
+    let mul = b.binary_scalar(BinOp::Mul, pos, Scalar::I32(-3)).unwrap();
+    let max = b.binary_scalar(BinOp::Max, pos, Scalar::I32(7)).unwrap();
+    let wraps = b
+        .binary_scalar(BinOp::Add, pos, Scalar::I32(i32::MAX))
+        .unwrap();
+    let out = b.concat(0, &[add, sub, mul, max, wraps]).unwrap();
     let graph = b.finish(out).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[pos.id()], Some(r(0, 10)));
@@ -79,34 +87,44 @@ fn arithmetic_is_interval_arithmetic_and_a_possible_wrap_is_every_word() {
 
 #[test]
 fn select_is_the_union_of_its_branches_and_movement_keeps_the_range() {
-    let b = Builder::new();
-    let low = b.iota_i32(3);
-    let high = b.binary_scalar(BinOp::Add, low, Scalar::I32(10));
-    let c = b.constant("c", TensorType::new(vec![3], DType::I32));
-    let flag = b.binary_scalar(BinOp::Ge, c, Scalar::I32(1));
-    let picked = b.select(flag, low, high);
-    let moved = b.reshape(picked, vec![3, 1]);
-    let moved = b.transpose(moved, vec![1, 0]);
-    let moved = b.slice(moved, 1, 0, 2);
+    let b = Builder::for_tests();
+    let low = b.iota_i32(3).unwrap();
+    let high = b.binary_scalar(BinOp::Add, low, Scalar::I32(10)).unwrap();
+    let c = b
+        .constant("c", TensorType::new(vec![3], DType::I32))
+        .unwrap();
+    let flag = b.binary_scalar(BinOp::Ge, c, Scalar::I32(1)).unwrap();
+    let picked = b.select(flag, low, high).unwrap();
+    let moved = b.reshape(picked, vec![3, 1]).unwrap();
+    let moved = b.transpose(moved, vec![1, 0]).unwrap();
+    let moved = b.slice(moved, 1, 0, 2).unwrap();
     assert_eq!(range_of(b, moved), r(0, 13));
 }
 
 #[test]
 fn a_gather_reads_a_subset_of_its_table() {
-    let b = Builder::new();
-    let table = b.binary_scalar(BinOp::Add, b.iota_i32(4), Scalar::I32(100));
-    let index = b.constant("index", TensorType::new(vec![5], DType::I32));
-    let gathered = b.gather(table, 0, index);
+    let b = Builder::for_tests();
+    let table = b
+        .binary_scalar(BinOp::Add, b.iota_i32(4).unwrap(), Scalar::I32(100))
+        .unwrap();
+    let index = b
+        .constant("index", TensorType::new(vec![5], DType::I32))
+        .unwrap();
+    let gathered = b.gather(table, 0, index).unwrap();
     assert_eq!(range_of(b, gathered), r(100, 104));
 }
 
 #[test]
 fn the_guard_output_is_below_its_bound_without_matching_the_chain() {
-    let b = Builder::new();
-    let raw = b.constant("raw", TensorType::new(vec![6], DType::I32));
+    let b = Builder::for_tests();
+    let raw = b
+        .constant("raw", TensorType::new(vec![6], DType::I32))
+        .unwrap();
     let guard = b.guard_index_bounds(raw, UPPER).unwrap();
     // The raw selector proves nothing; the guarded one is `[0, UPPER)` and its successor `[1, UPPER]`.
-    let successor = b.binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1));
+    let successor = b
+        .binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1))
+        .unwrap();
     let (raw_id, guarded, succ) = (raw.id(), guard.guarded.id(), successor.id());
     let graph = b.finish(successor).unwrap();
     let ranges = value_ranges(&graph);
@@ -119,18 +137,24 @@ fn the_guard_output_is_below_its_bound_without_matching_the_chain() {
 /// slot or a definition does not, and a value computed from a clamped one inherits the dependency.
 #[test]
 fn clamped_ranges_name_the_guard_condition_they_rest_on() {
-    let b = Builder::new();
-    let raw = b.constant("raw", TensorType::new(vec![4], DType::I32));
+    let b = Builder::for_tests();
+    let raw = b
+        .constant("raw", TensorType::new(vec![4], DType::I32))
+        .unwrap();
     let guard = b.guard_index_bounds(raw, UPPER).unwrap();
-    let successor = b.binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1));
-    let pos = b.slot_ranged(
-        Slot::Pos,
-        TensorType::new(vec![4], DType::I32),
-        IndexRange::below(UPPER).unwrap(),
-    );
-    let declared = b.binary_scalar(BinOp::Add, pos, Scalar::I32(1));
-    let iota = b.iota_i32(UPPER);
-    let out = b.concat(0, &[successor, declared, iota]);
+    let successor = b
+        .binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![4], DType::I32),
+            IndexRange::below(UPPER).unwrap(),
+        )
+        .unwrap();
+    let declared = b.binary_scalar(BinOp::Add, pos, Scalar::I32(1)).unwrap();
+    let iota = b.iota_i32(UPPER).unwrap();
+    let out = b.concat(0, &[successor, declared, iota]).unwrap();
     let graph = b.finish(out).unwrap();
     // The guard's condition is the comparison its `Select` reads.
     let condition = graph
@@ -153,18 +177,22 @@ fn clamped_ranges_name_the_guard_condition_they_rest_on() {
 #[test]
 fn a_comparison_narrows_only_the_value_it_compares() {
     // Signed: `x < 4` where `Ge(x, 4)` is zero, `x >= 4` where it is nonzero.
-    let b = Builder::new();
-    let x = b.slot_ranged(
-        Slot::Token,
-        TensorType::new(vec![3], DType::I32),
-        r(-10, 10),
-    );
-    let other = b.constant("other", TensorType::new(vec![3], DType::I32));
-    let flag = b.binary_scalar(BinOp::Ge, x, Scalar::I32(4));
-    let clamped_below = b.select(flag, other, x);
-    let clamped_above = b.select(flag, x, other);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_ranged(
+            Slot::Token,
+            TensorType::new(vec![3], DType::I32),
+            r(-10, 10),
+        )
+        .unwrap();
+    let other = b
+        .constant("other", TensorType::new(vec![3], DType::I32))
+        .unwrap();
+    let flag = b.binary_scalar(BinOp::Ge, x, Scalar::I32(4)).unwrap();
+    let clamped_below = b.select(flag, other, x).unwrap();
+    let clamped_above = b.select(flag, x, other).unwrap();
     let (below, above) = (clamped_below.id(), clamped_above.id());
-    let out = b.concat(0, &[clamped_below, clamped_above]);
+    let out = b.concat(0, &[clamped_below, clamped_above]).unwrap();
     let graph = b.finish(out).unwrap();
     let ranges = value_ranges(&graph);
     // The other branch is unbounded, so each union is every word: only the narrowed branch is checked
@@ -173,32 +201,44 @@ fn a_comparison_narrows_only_the_value_it_compares() {
     assert_eq!(ranges[above], Some(IndexRange::I32));
 
     // `Select(GeU(x, 4), 1, x)`: the false branch is `x` under `x <u 4`.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![3], DType::I32));
-    let invalid = b.binary_scalar(BinOp::GeU, x, Scalar::I32(4));
-    let one = b.binary_scalar(BinOp::Max, b.iota_i32(3), Scalar::I32(1));
-    let picked = b.select(invalid, one, x);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![3], DType::I32))
+        .unwrap();
+    let invalid = b.binary_scalar(BinOp::GeU, x, Scalar::I32(4)).unwrap();
+    let one = b
+        .binary_scalar(BinOp::Max, b.iota_i32(3).unwrap(), Scalar::I32(1))
+        .unwrap();
+    let picked = b.select(invalid, one, x).unwrap();
     assert_eq!(range_of(b, picked), r(0, 4));
 
     // The condition compares another value than the branch: nothing is narrowed.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![3], DType::I32));
-    let y = b.constant("y", TensorType::new(vec![3], DType::I32));
-    let invalid = b.binary_scalar(BinOp::GeU, y, Scalar::I32(4));
-    let picked = b.select(invalid, b.iota_i32(3), x);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![3], DType::I32))
+        .unwrap();
+    let y = b
+        .constant("y", TensorType::new(vec![3], DType::I32))
+        .unwrap();
+    let invalid = b.binary_scalar(BinOp::GeU, y, Scalar::I32(4)).unwrap();
+    let picked = b.select(invalid, b.iota_i32(3).unwrap(), x).unwrap();
     assert_eq!(range_of(b, picked), IndexRange::I32);
 }
 
 #[test]
 fn a_slot_range_is_declared_per_slot_and_must_bound_an_i32() {
-    let b = Builder::new();
-    let ranged = b.slot_ranged(
-        Slot::Token,
-        TensorType::new(vec![2], DType::I32),
-        r(0, 32_000),
-    );
-    let plain = b.slot(Slot::Pos, TensorType::new(vec![2], DType::I32));
-    let out = b.concat(0, &[ranged, plain]);
+    let b = Builder::for_tests();
+    let ranged = b
+        .slot_ranged(
+            Slot::Token,
+            TensorType::new(vec![2], DType::I32),
+            r(0, 32_000),
+        )
+        .unwrap();
+    let plain = b
+        .slot(Slot::Pos, TensorType::new(vec![2], DType::I32))
+        .unwrap();
+    let out = b.concat(0, &[ranged, plain]).unwrap();
     let graph = b.finish(out).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[ranged.id()], Some(r(0, 32_000)));
@@ -208,10 +248,16 @@ fn a_slot_range_is_declared_per_slot_and_must_bound_an_i32() {
 }
 
 #[test]
-#[should_panic(expected = "declares a range but is f32")]
 fn a_float_slot_cannot_declare_a_range() {
-    let b = Builder::new();
-    b.slot_ranged(Slot::Token, TensorType::f32(vec![2]), r(0, 4));
+    let b = Builder::for_tests();
+    assert!(matches!(
+        b.slot_ranged(Slot::Token, TensorType::f32(vec![2]), r(0, 4)),
+        Err(crate::BuilderError::RangeNotI32 {
+            dtype: DType::F32,
+            ..
+        })
+    ));
+    assert_eq!(b.generation(), 0, "a refused declaration appends nothing");
 }
 
 #[test]
@@ -233,14 +279,18 @@ fn range_values_are_checked_against_i32_words() {
 /// table and the gathered words are every `i32` word and this row goes red.
 #[test]
 fn a_ranged_const_table_declares_its_range_and_a_gather_inherits_it() {
-    let b = Builder::new();
-    let table = b.constant_ranged(
-        "route.table",
-        TensorType::new(vec![5, 2], DType::I32),
-        r(0, 8),
-    );
-    let tokens = b.constant("tokens", TensorType::new(vec![3], DType::I32));
-    let rows = b.gather(table, 0, tokens);
+    let b = Builder::for_tests();
+    let table = b
+        .constant_ranged(
+            "route.table",
+            TensorType::new(vec![5, 2], DType::I32),
+            r(0, 8),
+        )
+        .unwrap();
+    let tokens = b
+        .constant("tokens", TensorType::new(vec![3], DType::I32))
+        .unwrap();
+    let rows = b.gather(table, 0, tokens).unwrap();
     let graph = b.finish(rows).unwrap();
     let ranges = value_ranges(&graph);
     assert_eq!(ranges[table.id()], Some(r(0, 8)));
@@ -248,8 +298,14 @@ fn a_ranged_const_table_declares_its_range_and_a_gather_inherits_it() {
 }
 
 #[test]
-#[should_panic(expected = "a range bounds I32 words")]
 fn a_ranged_const_must_be_i32() {
-    let b = Builder::new();
-    b.constant_ranged("w", TensorType::f32(vec![2]), r(0, 4));
+    let b = Builder::for_tests();
+    assert!(matches!(
+        b.constant_ranged("w", TensorType::f32(vec![2]), r(0, 4)),
+        Err(crate::BuilderError::RangeNotI32 {
+            dtype: DType::F32,
+            ..
+        })
+    ));
+    assert_eq!(b.generation(), 0, "a refused declaration appends nothing");
 }

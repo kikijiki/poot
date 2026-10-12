@@ -16,7 +16,7 @@ use crate::components::mhc::{MhcHeadWeights, MhcSite, MhcSiteWeights, mhc_post, 
 use crate::components::norm::{norm, norm_with};
 use crate::components::rope::rope_rows;
 use crate::components::standard::{StackWeights, Step};
-use crate::model::LogitRows;
+use crate::model::{LogitRows, TraceError};
 
 /// The validation id of the token-id bound. The router witnesses of layer `l` are ids `3 * l` to
 /// `3 * l + 2` ([`crate::components::witness::WitnessKind::id`]); this one is the family's own, at the
@@ -91,15 +91,15 @@ impl Layer {
         x: Traced,
         tokens: Traced,
         cfg: &DeepseekV4Config,
-    ) -> Traced {
-        let mix = self.mhc_attn.pre(b, x, &cfg.mhc);
-        let normed = norm(b, mix.collapsed, &self.attn_norm, cfg.norm);
-        let attended = self.attention(b, step, index, normed, cfg);
-        let x = mhc_post(b, mix.post, mix.comb, attended, x, &cfg.mhc);
+    ) -> Result<Traced, TraceError> {
+        let mix = self.mhc_attn.pre(b, x, &cfg.mhc)?;
+        let normed = norm(b, mix.collapsed, &self.attn_norm, cfg.norm)?;
+        let attended = self.attention(b, step, index, normed, cfg)?;
+        let x = mhc_post(b, mix.post, mix.comb, attended, x, &cfg.mhc)?;
 
-        let mix = self.mhc_ffn.pre(b, x, &cfg.mhc);
-        let normed = norm(b, mix.collapsed, &self.ffn_norm, cfg.norm);
-        let routed = self.routed.trace(b, step, index, normed, tokens, cfg);
+        let mix = self.mhc_ffn.pre(b, x, &cfg.mhc)?;
+        let normed = norm(b, mix.collapsed, &self.ffn_norm, cfg.norm)?;
+        let routed = self.routed.trace(b, step, index, normed, tokens, cfg)?;
         mhc_post(b, mix.post, mix.comb, routed, x, &cfg.mhc)
     }
 
@@ -111,16 +111,16 @@ impl Layer {
         index: usize,
         normed: Traced,
         cfg: &DeepseekV4Config,
-    ) -> Traced {
+    ) -> Result<Traced, TraceError> {
         let capacity = step.shape().capacity.get();
-        let rows = rope_rows(b, cfg.rope_of(self.kind), step.pos(), capacity);
-        let local = sliding::local(b, step, index, normed, &self.local, cfg, rows);
+        let rows = rope_rows(b, cfg.rope_of(self.kind), step.pos(), capacity)?;
+        let local = sliding::local(b, step, index, normed, &self.local, cfg, rows)?;
         let compressed: Option<Compressed> = match (self.kind, &self.compressor, &self.indexer) {
             (LayerKind::Hca, Some(compressor), _) => {
-                hca::compressed(b, step, index, normed, &local.write_at, compressor, cfg)
+                hca::compressed(b, step, index, normed, &local.write_at, compressor, cfg)?
             }
             (LayerKind::Csa, Some(compressor), Some(indexer)) => {
-                csa::compressed(b, step, index, normed, &local, compressor, indexer, cfg)
+                csa::compressed(b, step, index, normed, &local, compressor, indexer, cfg)?
             }
             _ => None,
         };
@@ -137,7 +137,7 @@ pub(super) struct Tower {
 }
 
 impl Tower {
-    pub fn new(map: &WeightMap, cfg: &DeepseekV4Config) -> Result<Self, WeightError> {
+    pub(super) fn new(map: &WeightMap, cfg: &DeepseekV4Config) -> Result<Self, WeightError> {
         Ok(Self {
             stack: StackWeights::new(map, cfg.vocab, cfg.width)?,
             collapse: MhcHeadWeights::new(map, cfg.width, &cfg.mhc)?,
@@ -152,29 +152,32 @@ impl Tower {
 
     /// The step's logits: embed, widen, every layer inside its scope, collapse the streams, the
     /// final norm and the head. Under [`LogitRows::Last`] only the last token's logits.
-    pub fn trace(&self, b: &Builder, step: &Step, cfg: &DeepseekV4Config) -> Traced {
+    pub(super) fn trace(
+        &self,
+        b: &Builder,
+        step: &Step,
+        cfg: &DeepseekV4Config,
+    ) -> Result<Traced, TraceError> {
         // The token ids, bounded by the vocabulary once: the embedding and every hash table index
         // read the bounded ids, and an id outside the vocabulary is the step's validation fault.
-        let tokens = b
-            .guard_index_bounds(step.tokens(), cfg.vocab)
-            .expect("a step's tokens are rank-two I32 and a vocabulary fits I32");
+        let tokens = b.guard_index_bounds(step.tokens(), cfg.vocab)?;
         step.validate(
             TOKEN_INDEX_IN_RANGE,
             "deepseek4.token_index".to_string(),
             tokens.witness,
         );
-        let embedded = self.stack.embed.embed(b, tokens.guarded);
-        let mut x = widen(b, embedded, &cfg.mhc);
+        let embedded = self.stack.embed.embed(b, tokens.guarded)?;
+        let mut x = widen(b, embedded, &cfg.mhc)?;
         for (l, layer) in self.layers.iter().enumerate() {
             let _scope = b.layer_scope(l);
-            x = layer.trace(b, step, l, x, tokens.guarded, cfg);
+            x = layer.trace(b, step, l, x, tokens.guarded, cfg)?;
         }
         let tokens = step.shape().tokens.get();
         if step.shape().logits == LogitRows::Last && tokens > 1 {
-            x = b.slice(x, 1, tokens - 1, tokens);
+            x = b.slice(x, 1, tokens - 1, tokens)?;
         }
-        let collapsed = self.collapse.collapse(b, x, &cfg.mhc);
-        let normed = norm_with(b, collapsed, &self.stack.final_norm, cfg.norm);
+        let collapsed = self.collapse.collapse(b, x, &cfg.mhc)?;
+        let normed = norm_with(b, collapsed, &self.stack.final_norm, cfg.norm)?;
         self.stack.head.logits(b, normed)
     }
 }

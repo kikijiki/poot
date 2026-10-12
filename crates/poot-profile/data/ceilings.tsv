@@ -1,0 +1,2 @@
+# target	gb_per_s	device	receipt
+amdgcn-gfx1151	204.0	AMD Radeon 8060S (Strix Halo, gfx1151, 128 GB LPDDR5X)	benchmarks/performance-bank/ceilings/amdgcn-gfx1151.json

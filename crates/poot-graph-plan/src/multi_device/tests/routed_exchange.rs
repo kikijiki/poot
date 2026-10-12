@@ -3,7 +3,8 @@
 //! Fails if a device's declared route counts are sorted or otherwise canonicalized. Nonmonotonic needs
 //! >=3 points per row, since any 2-element sequence is monotonic.
 
-use crate::multi_device::communication::{CommunicationError, PlanNodeId, plan_routed_exchange};
+use crate::multi_device::communication::PlanNodeId;
+use crate::multi_device::communication::test_only::{CommunicationError, plan_routed_exchange};
 use crate::multi_device::topology::DeviceId;
 
 #[test]

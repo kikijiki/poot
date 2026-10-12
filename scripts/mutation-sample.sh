@@ -44,7 +44,7 @@ readonly modules=(
   # ` in <fn>` suffix, so an `in`-anchored seed would drop exactly the mutants M4 found alive.
   "quant|poot-quant|crates/poot-quant/src/lib.rs crates/poot-quant/src/plan.rs|PackedPayload::decode_row|check_blocks|decode_blocks|scale_and_min|decode_dense"
   "packed-kernelgen|poot-kernelgen|crates/poot-kernelgen/src/packed/kernel.rs|contraction_tiled"
-  "packed-load|poot-load|crates/poot-load/src/packed_safetensors/validation.rs crates/poot-load/src/gguf/quantization.rs|validate_index_header_bijection|verify_file|update_identity_usize|f32_to_f16"
+  "packed-load|poot-load|crates/poot-load/src/packed_safetensors.rs|check_pin_reader"
   "packed-builders|poot-graph-ir|crates/poot-graph-ir/src/ops/linear.rs|packed_indexed_linear|require_operand_type"
   "packed-recognizer|poot-graph-plan|crates/poot-graph-plan/src/passes/packed.rs|recognize_|validate_packed_carriers|reject_packed_dequant_escapes"
 )
@@ -109,7 +109,7 @@ module_fixed_args() {
       ;;
     packed-load)
       printf '%s\n' --test-tool nextest -- -E \
-        'binary_id(poot-load::packed_safetensors) | test(/^packed_safetensors::tests::/) | test(/^gguf::quantization::tests::/)'
+        'test(/^packed_safetensors::tests::/)'
       ;;
     eval)
       printf '%s\n' --test-tool nextest -- -E 'not test(/real_dims/)'

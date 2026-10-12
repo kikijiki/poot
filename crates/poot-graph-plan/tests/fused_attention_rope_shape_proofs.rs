@@ -10,12 +10,12 @@ use poot_graph_ir::op::{BinOp, OpKind, UnOp};
 use poot_graph_ir::ops::{attention_masked, attention_prefill};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Graph, ValueId};
+use poot_graph_plan::test_support::plan_eqn;
 use poot_target::AmdArch;
 use poot_target::Backend;
 use poot_tensor::HostTensor;
-use poot_test_util::graph_fixtures::plan_eqn;
 
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 
 /// Deterministic inputs in `[-0.5, 0.5)`, one stream per input id.
 fn inputs(g: &Graph) -> HashMap<ValueId, Value> {
@@ -100,23 +100,31 @@ fn assert_plans_everywhere(name: &str, g: &Graph) {
 
 /// A decode attention (`ops::attention_masked`) over constant operands of the given shapes.
 fn decode_attention(q: [usize; 4], kv: [usize; 4], mask: [usize; 4], n_rep: usize) -> Graph {
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(q.to_vec()));
-    let k = b.constant("k", TensorType::f32(kv.to_vec()));
-    let v = b.constant("v", TensorType::f32(kv.to_vec()));
-    let mask = b.constant("mask", TensorType::f32(mask.to_vec()));
-    let out = attention_masked(&b, q, k, v, n_rep, 0.25, mask);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(q.to_vec())).unwrap();
+    let k = b.constant("k", TensorType::f32(kv.to_vec())).unwrap();
+    let v = b.constant("v", TensorType::f32(kv.to_vec())).unwrap();
+    let mask = b.constant("mask", TensorType::f32(mask.to_vec())).unwrap();
+    let out = attention_masked(&b, q, k, v, n_rep, 0.25, mask).unwrap();
     b.finish(out).unwrap()
 }
 
 /// A prefill attention (`ops::attention_prefill`) with `hkv` KV heads repeated `n_rep` times.
 fn prefill_attention(hkv: usize, n_rep: usize, l: usize, d: usize) -> Graph {
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hkv * n_rep, l, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, l, l]));
-    let out = attention_prefill(&b, q, k, v, n_rep, 0.25, mask);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hkv * n_rep, l, d]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, l, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, l, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, l, l]))
+        .unwrap();
+    let out = attention_prefill(&b, q, k, v, n_rep, 0.25, mask).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -143,7 +151,7 @@ fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
     ];
     for (name, q, kv, mask) in cases {
         let raw = decode_attention(q, kv, mask, 1);
-        let optimized = optimize(&raw).unwrap();
+        let optimized = passes_without_target(&raw).unwrap();
         assert_eq!(flash_ops(&optimized), Vec::<String>::new(), "{name}: fused");
         let kinds: Vec<&str> = optimized
             .eqns()
@@ -186,20 +194,24 @@ fn broadcast_kv_attention_stays_decomposed_and_matches_the_oracle() {
 /// output.
 #[test]
 fn rope_chain_that_broadcasts_x_up_optimizes_to_a_plannable_graph() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (s, d) = (3, 8);
-    let x = b.constant("x", TensorType::f32(vec![1, 1, s, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![1, 4, s, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![1, 4, s, d]));
-    let x1 = b.slice(x, 3, 0, d / 2);
-    let x2 = b.slice(x, 3, d / 2, d);
-    let neg_x2 = b.unary(UnOp::Neg, x2);
-    let rotate_half = b.concat(3, &[neg_x2, x1]);
-    let xc = b.binary(BinOp::Mul, x, cos);
-    let rs = b.binary(BinOp::Mul, rotate_half, sin);
-    let out = b.binary(BinOp::Add, xc, rs);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, s, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![1, 4, s, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![1, 4, s, d]))
+        .unwrap();
+    let x1 = b.slice(x, 3, 0, d / 2).unwrap();
+    let x2 = b.slice(x, 3, d / 2, d).unwrap();
+    let neg_x2 = b.unary(UnOp::Neg, x2).unwrap();
+    let rotate_half = b.concat(3, &[neg_x2, x1]).unwrap();
+    let xc = b.binary(BinOp::Mul, x, cos).unwrap();
+    let rs = b.binary(BinOp::Mul, rotate_half, sin).unwrap();
+    let out = b.binary(BinOp::Add, xc, rs).unwrap();
     let raw = b.finish(out).unwrap();
-    let optimized = optimize(&raw).unwrap();
+    let optimized = passes_without_target(&raw).unwrap();
     assert_plans_everywhere("rope broadcasting x", &optimized);
     assert_optimize_preserves("rope broadcasting x", &raw, &optimized);
 }
@@ -237,7 +249,7 @@ fn optimize_preserves_attention_over_head_layouts() {
         ),
     ];
     for (name, raw, fuses) in cases {
-        let optimized = optimize(&raw).unwrap();
+        let optimized = passes_without_target(&raw).unwrap();
         assert_eq!(
             flash_ops(&optimized).len(),
             usize::from(fuses),

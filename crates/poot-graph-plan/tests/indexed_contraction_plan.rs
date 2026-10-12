@@ -7,7 +7,8 @@
 use poot_graph_ir::op::{BinOp, ContractionHead, RedOp};
 use poot_graph_ir::{Builder, Graph, OpKind, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, KernelChoice, Plan, Program, Submission, Target, compile,
+    CompileLimits, CompileOptions, KernelChoice, Plan, Program, Target, compile,
+    production_plan::Submission,
 };
 use poot_kernelgen::{ContractionSpec, IndexedContraction, KernelRequest, Schedule, WeightLayout};
 use poot_target::{AmdArch, Backend, BufferStorage, DeviceCaps};
@@ -48,14 +49,24 @@ fn program(g: &Graph, backend: Backend) -> Program {
 /// `IndexedMatMul(x [m, K], w [E, K, N], ids [m])`, all f32; with `gate`, the product times `gate[m]` (`[m, 1]`
 /// after a reshape), the routed gate weighting.
 fn indexed(m: usize, gate: bool) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, K]));
-    let w = b.constant("w", TensorType::f32(vec![EXPERTS, K, N]));
-    let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
-    let mut out = b.indexed_matmul(x, w, ids);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::f32(vec![EXPERTS, K, N]))
+        .unwrap();
+    let ids = b
+        .constant_ranged(
+            "ids",
+            TensorType::new(vec![m], DType::I32),
+            poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+        )
+        .unwrap();
+    let mut out = b.indexed_matmul(x, w, ids).unwrap();
     if gate {
-        let gate = b.constant("gate", TensorType::f32(vec![m]));
-        out = b.binary(BinOp::Mul, out, b.reshape(gate, vec![m, 1]));
+        let gate = b.constant("gate", TensorType::f32(vec![m])).unwrap();
+        out = b
+            .binary(BinOp::Mul, out, b.reshape(gate, vec![m, 1]).unwrap())
+            .unwrap();
     }
     b.finish(out).unwrap()
 }
@@ -183,17 +194,25 @@ fn an_f32_id_operand_is_refused_by_inference() {
 /// With `second_consumer`, the transposed value is also summed to a scalar (last-axis `Reduce`s, which no kernel
 /// reads strided) and that scalar is added to the product.
 fn checkpoint_order(m: usize, second_consumer: bool) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, K]));
-    let w = b.constant("w", TensorType::f32(vec![EXPERTS, N, K]));
-    let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
-    let w_ekn = b.transpose(w, vec![0, 2, 1]);
-    let out = b.indexed_matmul(x, w_ekn, ids);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::f32(vec![EXPERTS, N, K]))
+        .unwrap();
+    let ids = b
+        .constant_ranged(
+            "ids",
+            TensorType::new(vec![m], DType::I32),
+            poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+        )
+        .unwrap();
+    let w_ekn = b.transpose(w, vec![0, 2, 1]).unwrap();
+    let out = b.indexed_matmul(x, w_ekn, ids).unwrap();
     if second_consumer {
-        let sum = |t, axis, keepdim| b.reduce(RedOp::Sum, t, axis, keepdim);
+        let sum = |t, axis, keepdim| b.reduce(RedOp::Sum, t, axis, keepdim).unwrap();
         let per_expert = sum(sum(w_ekn, 2, false), 1, false);
-        let total = b.reshape(sum(per_expert, 0, true), vec![1, 1]);
-        let joined = b.binary(BinOp::Add, out, total);
+        let total = b.reshape(sum(per_expert, 0, true), vec![1, 1]).unwrap();
+        let joined = b.binary(BinOp::Add, out, total).unwrap();
         return b.finish(joined).unwrap();
     }
     b.finish(out).unwrap()
@@ -275,12 +294,22 @@ fn the_ekn_orientation_plans_the_plain_layout() {
 /// view; the program compiles and this row goes red.
 #[test]
 fn a_sliced_then_transposed_weight_is_refused_by_layout() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![5, K]));
-    let w = b.constant("w", TensorType::f32(vec![EXPERTS, N, K + 3]));
-    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
-    let sliced = b.slice(w, 2, 0, K);
-    let out = b.indexed_matmul(x, b.transpose(sliced, vec![0, 2, 1]), ids);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![5, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::f32(vec![EXPERTS, N, K + 3]))
+        .unwrap();
+    let ids = b
+        .constant_ranged(
+            "ids",
+            TensorType::new(vec![5], DType::I32),
+            poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+        )
+        .unwrap();
+    let sliced = b.slice(w, 2, 0, K).unwrap();
+    let out = b
+        .indexed_matmul(x, b.transpose(sliced, vec![0, 2, 1]).unwrap(), ids)
+        .unwrap();
     let g = b.finish(out).unwrap();
     for backend in backends() {
         let error = compile(&g, &target(backend), &options())
@@ -302,13 +331,25 @@ fn a_sliced_then_transposed_weight_is_refused_by_layout() {
 fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
     for backend in backends() {
         for m in [5, 160] {
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32(vec![m, K]));
-            let w = b.constant("w", TensorType::f32(vec![EXPERTS, N, K]));
-            let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
-            let gate = b.constant("gate", TensorType::f32(vec![m]));
-            let product = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), ids);
-            let out = b.binary(BinOp::Mul, product, b.reshape(gate, vec![m, 1]));
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![m, K])).unwrap();
+            let w = b
+                .constant("w", TensorType::f32(vec![EXPERTS, N, K]))
+                .unwrap();
+            let ids = b
+                .constant_ranged(
+                    "ids",
+                    TensorType::new(vec![m], DType::I32),
+                    poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+                )
+                .unwrap();
+            let gate = b.constant("gate", TensorType::f32(vec![m])).unwrap();
+            let product = b
+                .indexed_matmul(x, b.transpose(w, vec![0, 2, 1]).unwrap(), ids)
+                .unwrap();
+            let out = b
+                .binary(BinOp::Mul, product, b.reshape(gate, vec![m, 1]).unwrap())
+                .unwrap();
             let program = program(&b.finish(out).unwrap(), backend);
             let label = format!("{backend:?} M={m}");
             assert_eq!(
@@ -334,19 +375,30 @@ fn a_checkpoint_order_weight_under_the_gate_epilogue_plans_no_transpose() {
 /// `[E, N, K]` behind a `Transpose`), optionally under the routed gate weighting. The activation, ids and output
 /// stay f32: only the stack is BF16, which is how a BF16 checkpoint loads.
 fn bf16_experts(m: usize, checkpoint_order: bool, gate: bool) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, K]));
-    let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, K])).unwrap();
+    let ids = b
+        .constant_ranged(
+            "ids",
+            TensorType::new(vec![m], DType::I32),
+            poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+        )
+        .unwrap();
     let w = if checkpoint_order {
-        let w = b.constant("w", TensorType::new(vec![EXPERTS, N, K], DType::BF16));
-        b.transpose(w, vec![0, 2, 1])
+        let w = b
+            .constant("w", TensorType::new(vec![EXPERTS, N, K], DType::BF16))
+            .unwrap();
+        b.transpose(w, vec![0, 2, 1]).unwrap()
     } else {
         b.constant("w", TensorType::new(vec![EXPERTS, K, N], DType::BF16))
+            .unwrap()
     };
-    let mut out = b.indexed_matmul(x, w, ids);
+    let mut out = b.indexed_matmul(x, w, ids).unwrap();
     if gate {
-        let gate = b.constant("gate", TensorType::f32(vec![m]));
-        out = b.binary(BinOp::Mul, out, b.reshape(gate, vec![m, 1]));
+        let gate = b.constant("gate", TensorType::f32(vec![m])).unwrap();
+        out = b
+            .binary(BinOp::Mul, out, b.reshape(gate, vec![m, 1]).unwrap())
+            .unwrap();
     }
     b.finish(out).unwrap()
 }
@@ -412,11 +464,21 @@ fn a_bf16_expert_stack_plans_the_packed_lane_without_a_widened_copy() {
 /// compiles and this row goes red.
 #[test]
 fn a_computed_bf16_expert_stack_is_refused() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![5, K]));
-    let w = b.constant("w", TensorType::f32(vec![EXPERTS, K, N]));
-    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
-    let out = b.indexed_matmul(x, b.cast(w, DType::BF16), ids);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![5, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::f32(vec![EXPERTS, K, N]))
+        .unwrap();
+    let ids = b
+        .constant_ranged(
+            "ids",
+            TensorType::new(vec![5], DType::I32),
+            poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+        )
+        .unwrap();
+    let out = b
+        .indexed_matmul(x, b.cast(w, DType::BF16).unwrap(), ids)
+        .unwrap();
     let g = b.finish(out).unwrap();
     for backend in backends() {
         let error = compile(&g, &target(backend), &options())
@@ -442,36 +504,50 @@ enum SecondReader {
 /// `Transpose` is not a view: the stack the contraction would read is a computed BF16 value with no packed upload
 /// lane.
 fn bf16_checkpoint_order_shared(reader: SecondReader) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![5, K]));
-    let w = b.constant("w", TensorType::new(vec![EXPERTS, N, K], DType::BF16));
-    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
-    let w_ekn = b.transpose(w, vec![0, 2, 1]);
-    let out = b.indexed_matmul(x, w_ekn, ids);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![5, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![EXPERTS, N, K], DType::BF16))
+        .unwrap();
+    let ids = b
+        .constant_ranged(
+            "ids",
+            TensorType::new(vec![5], DType::I32),
+            poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+        )
+        .unwrap();
+    let w_ekn = b.transpose(w, vec![0, 2, 1]).unwrap();
+    let out = b.indexed_matmul(x, w_ekn, ids).unwrap();
     let shared = match reader {
         SecondReader::Reduce => w_ekn,
-        SecondReader::Cast => b.cast(w_ekn, DType::F32),
+        SecondReader::Cast => b.cast(w_ekn, DType::F32).unwrap(),
         // A strided-capable elementwise reader: the view promotion would accept it were the dtype not a gate.
         // A cast and an elementwise step over it fuse into one region that widens its BF16 input in-register,
         // reading it flat: the one reader that would take a BF16 view without refusing it.
         SecondReader::Fused => {
-            let other = b.constant("other", TensorType::f32(vec![EXPERTS, K, N]));
-            b.binary(BinOp::Mul, b.cast(w_ekn, DType::F32), other)
+            let other = b
+                .constant("other", TensorType::f32(vec![EXPERTS, K, N]))
+                .unwrap();
+            b.binary(BinOp::Mul, b.cast(w_ekn, DType::F32).unwrap(), other)
+                .unwrap()
         }
         SecondReader::Binary => {
-            let other = b.constant("other", TensorType::new(vec![EXPERTS, K, N], DType::BF16));
-            b.cast(b.binary(BinOp::Add, w_ekn, other), DType::F32)
+            let other = b
+                .constant("other", TensorType::new(vec![EXPERTS, K, N], DType::BF16))
+                .unwrap();
+            b.cast(b.binary(BinOp::Add, w_ekn, other).unwrap(), DType::F32)
+                .unwrap()
         }
     };
-    let sum = |t, axis, keepdim| b.reduce(RedOp::Sum, t, axis, keepdim);
+    let sum = |t, axis, keepdim| b.reduce(RedOp::Sum, t, axis, keepdim).unwrap();
     let per_expert = sum(sum(shared, 2, false), 1, false);
-    let total = b.reshape(sum(per_expert, 0, true), vec![1, 1]);
+    let total = b.reshape(sum(per_expert, 0, true), vec![1, 1]).unwrap();
     // The `Reduce` form sums BF16; widen its scalar for the join with the f32 product.
     let total = match reader {
-        SecondReader::Reduce => b.cast(total, DType::F32),
+        SecondReader::Reduce => b.cast(total, DType::F32).unwrap(),
         SecondReader::Cast | SecondReader::Binary | SecondReader::Fused => total,
     };
-    let joined = b.binary(BinOp::Add, out, total);
+    let joined = b.binary(BinOp::Add, out, total).unwrap();
     b.finish(joined).unwrap()
 }
 
@@ -514,11 +590,19 @@ fn a_bf16_stack_transpose_with_a_second_reader_is_refused_on_every_backend() {
 /// `plan_indexed`; the generator refuses it with `Unsupported` instead, and the row goes red.
 #[test]
 fn an_f16_expert_stack_is_refused() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![5, K]));
-    let w = b.constant("w", TensorType::new(vec![EXPERTS, K, N], DType::F16));
-    let ids = b.constant("ids", TensorType::new(vec![5], DType::I32));
-    let out = b.indexed_matmul(x, w, ids);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![5, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![EXPERTS, K, N], DType::F16))
+        .unwrap();
+    let ids = b
+        .constant_ranged(
+            "ids",
+            TensorType::new(vec![5], DType::I32),
+            poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
+        )
+        .unwrap();
+    let out = b.indexed_matmul(x, w, ids).unwrap();
     let g = b.finish(out).unwrap();
     for backend in backends() {
         let error = compile(&g, &target(backend), &options())

@@ -8,10 +8,10 @@
 //! a poot-graph-plan pass.)
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, step};
-use poot_executor_parity::weight_map::MappedModel;
 use poot_graph_ir::{Graph, OpKind, Slot, Storage, ValueId};
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
+use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::{DType, HostTensor};
 use std::collections::HashMap as Map;
 
@@ -54,7 +54,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 
 /// A weight bound by name: a name-seeded fill scaled by 0.1.
 fn weight(name: &str, shape: &[usize]) -> HostTensor {
@@ -86,7 +86,11 @@ fn tiny_qwen2(layers: usize, max_positions: usize) -> MappedModel {
 /// square, which the flash matcher requires).
 fn trace(m: &MappedModel, phase: Phase, rows: usize, tokens: usize, cap: usize) -> Graph {
     m.model
-        .trace(phase, step(rows, tokens, cap, LogitRows::Last))
+        .trace(
+            phase,
+            step(rows, tokens, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -192,7 +196,7 @@ fn optimize_preserves_results_over_random_configs() {
 
         // --- decode: a single step, random weights + caches, raw vs optimize on identical inputs ---
         let gd = trace(&m, Phase::Decode, 1, 1, cap);
-        let ogd = optimize(&gd).unwrap();
+        let ogd = passes_without_target(&gd).unwrap();
         assert!(count(&ogd, |op| matches!(op, OpKind::Attention(_))) > 0);
         assert!(count(&ogd, |op| matches!(op, OpKind::Rope { .. })) > 0);
         assert!(
@@ -217,7 +221,7 @@ fn optimize_preserves_results_over_random_configs() {
 
         // --- prefill: a whole forward from empty caches, raw vs optimize on identical inputs ---
         let gp = trace(&m, Phase::Prefill, 1, l, l);
-        let ogp = optimize(&gp).unwrap();
+        let ogp = passes_without_target(&gp).unwrap();
         assert!(count(&ogp, |op| matches!(op, OpKind::Attention(_))) > 0);
         let (raw_p, _) = run(&gp, &bind(&gp, &tokens, 0, &zeros));
         let (opt_p, _) = run(&ogp, &bind(&ogp, &tokens, 0, &zeros));
@@ -244,7 +248,7 @@ fn optimize_is_bit_exact_on_traced_gemma2_softcap_prefill() {
         .f32_model();
     let n = 6usize;
     let g = trace(&m, Phase::Prefill, 1, n, n);
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     let softcapped = count(
         &og,
         |op| matches!(op, OpKind::Attention(attrs) if attrs.softcap.is_some()),
@@ -300,7 +304,7 @@ fn optimize_matches_oracle_on_real_qwen2_decode_configs_real_dims() {
         let m = dense.zeroed_model(DType::F32);
         let cap = 16usize;
         let g = trace(&m, Phase::Decode, 1, 1, cap);
-        let og = optimize(&g).unwrap();
+        let og = passes_without_target(&g).unwrap();
         assert!(
             og.eqns().len() < g.eqns().len(),
             "{label}: optimize should shrink the real-config decode graph ({} -> {} eqns)",
@@ -328,11 +332,11 @@ fn optimize_matches_oracle_on_real_qwen2_decode_configs_real_dims() {
 #[test]
 fn dispatch_count_regression_on_real_qwen2_decode_configs() {
     // The real-model dispatch test (`fusion_dispatch_reduction_on_real_qwen2_config`,
-    // poot-gpu/tests/qwen2.rs) runs only `cse+fuse` and asserts a direction (after < before), so a
+    // poot-llm/tests/wgpu_qwen2.rs) runs only `cse+fuse` and asserts a direction (after < before), so a
     // regression that stays below the un-fused baseline would pass. This pins `dispatch_count`
     // (static IR metric: every eqn except a pure-aliasing Reshape is one dispatch) through the full
-    // `optimize()` pipeline on the real Qwen2.5-0.5B and Qwen3-0.6B decode graphs at KV capacity 64
-    // (matching that poot-gpu test). The pins are exact, not upper bounds: a bound above the real
+    // `passes_without_target()` pipeline on the real Qwen2.5-0.5B and Qwen3-0.6B decode graphs at KV capacity 64
+    // (matching that poot-wgpu-device test). The pins are exact, not upper bounds: a bound above the real
     // count still passes with rope fusion deleted, so a change in either direction fails here and the
     // pin moves with the change.
     use poot_graph_ir::analysis::dispatch_count;
@@ -342,14 +346,14 @@ fn dispatch_count_regression_on_real_qwen2_decode_configs() {
     for (label, dense, pin) in [(label2, qwen2, PIN_QWEN2), (label3, qwen3, PIN_QWEN3)] {
         let g = trace(&dense.zeroed_model(DType::F32), Phase::Decode, 1, 1, cap);
         assert_eq!(
-            dispatch_count(&optimize(&g).unwrap()),
+            dispatch_count(&passes_without_target(&g).unwrap()),
             pin,
-            "{label} real-config optimize().unwrap() dispatch_count moved off its pin"
+            "{label} real-config passes_without_target().unwrap() dispatch_count moved off its pin"
         );
     }
 }
 
-/// `optimize()` dispatch counts of the real-config decode graphs at capacity 64, F32 weights, before the
+/// `passes_without_target()` dispatch counts of the real-config decode graphs at capacity 64, F32 weights, before the
 /// target-specific passes `compile` adds (the dense contraction fold, which is where the weight transposes go).
 /// The contraction epilogue moved them from 775 and 791: each bias and residual add folds into its projection;
 /// merging the computed constants of one payload (the per-layer RoPE tables) moved them to 537 and 681; folding
@@ -376,7 +380,7 @@ fn flash_default_cuts_prefill_dispatch_count() {
         .count();
     assert_eq!(n_flash, layers, "one Attention per layer");
     let no_flash = dispatch_count(&fuse(&cse(&g).unwrap()).unwrap());
-    let with_flash = dispatch_count(&optimize(&g).unwrap());
+    let with_flash = dispatch_count(&passes_without_target(&g).unwrap());
     assert!(
         with_flash < no_flash,
         "flash reduces prefill dispatches: {no_flash} -> {with_flash}"
@@ -395,7 +399,7 @@ fn flash_default_cuts_decode_dispatch_count() {
     let cap = 8;
     let g = trace(&tiny_qwen2(layers, 16), Phase::Decode, 1, 1, cap);
     let no_flash = dispatch_count(&fuse(&cse(&g).unwrap()).unwrap());
-    let with_flash = dispatch_count(&optimize(&g).unwrap());
+    let with_flash = dispatch_count(&passes_without_target(&g).unwrap());
     let saved = no_flash - with_flash;
     eprintln!(
         "decode dispatch count: no-flash={no_flash}, flash={with_flash} (saved {saved} over {layers} layers, {} per layer)",
@@ -445,7 +449,7 @@ fn flash_attention_shrinks_prefill_peak_memory_quadratically() {
     // transient-bytes ledger) to a graph computation (`causal_mask_from_pos`), whose own `[1,1,L,L]`
     // visibility/bias chain is inherently O(L^2) - the same bound the mask always had, now visible to
     // this measurement instead of hidden in an external buffer. This narrow `cse -> flash_attention ->
-    // dce` pipeline (unlike the full `optimize()` tested elsewhere) has no elementwise-fusion pass to
+    // dce` pipeline (unlike the full `passes_without_target()` tested elsewhere) has no elementwise-fusion pass to
     // collapse that chain's several L*L intermediates into one.
     assert!(
         f64 <= 6 * f16,

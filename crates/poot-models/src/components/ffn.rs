@@ -6,6 +6,7 @@ use poot_quant::weights::{FfnRole, WeightId, WeightMap, WeightRole};
 use super::linear::{Weight, WeightError, linear};
 use super::standard::ParamError;
 use crate::model::ConfigReason;
+use crate::model::TraceError;
 
 /// A layer's `gate`/`up` (`[inter, width]`) and `down` (`[width, inter]`) projections.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,18 +35,18 @@ impl GatedFfnWeights {
 }
 
 /// `down(silu(gate(x)) * up(x))` over `[.., width]`.
-pub fn gated_ffn(b: &Builder, x: Traced, w: &GatedFfnWeights) -> Traced {
-    let gate = linear(b, x, &w.gate, None);
-    let up = linear(b, x, &w.up, None);
-    linear(b, ops::swiglu(b, gate, up), &w.down, None)
+pub fn gated_ffn(b: &Builder, x: Traced, w: &GatedFfnWeights) -> Result<Traced, TraceError> {
+    let gate = linear(b, x, &w.gate, None)?;
+    let up = linear(b, x, &w.up, None)?;
+    linear(b, ops::swiglu(b, gate, up)?, &w.down, None)
 }
 
 /// `down(gelu_tanh(gate(x)) * up(x))` over `[.., width]` (the GeGLU block): the same weights as
 /// [`gated_ffn`] with the tanh-approximated GELU as the gate.
-pub fn geglu_ffn(b: &Builder, x: Traced, w: &GatedFfnWeights) -> Traced {
-    let gate = linear(b, x, &w.gate, None);
-    let up = linear(b, x, &w.up, None);
-    linear(b, ops::geglu(b, gate, up), &w.down, None)
+pub fn geglu_ffn(b: &Builder, x: Traced, w: &GatedFfnWeights) -> Result<Traced, TraceError> {
+    let gate = linear(b, x, &w.gate, None)?;
+    let up = linear(b, x, &w.up, None)?;
+    linear(b, ops::geglu(b, gate, up)?, &w.down, None)
 }
 
 /// The gate of a gated feed-forward block: how `gate` and `up` combine before the down projection.
@@ -86,43 +87,43 @@ impl Glu {
 }
 
 /// `min(x, limit)`: there is no Min or Clamp primitive, so `-max(-x, -limit)`.
-fn clamp_above(b: &Builder, x: Traced, limit: f32) -> Traced {
-    let negated = b.unary(UnOp::Neg, x);
-    let capped = b.binary_scalar(BinOp::Max, negated, Scalar::F32(-limit));
-    b.unary(UnOp::Neg, capped)
+fn clamp_above(b: &Builder, x: Traced, limit: f32) -> Result<Traced, TraceError> {
+    let negated = b.unary(UnOp::Neg, x)?;
+    let capped = b.binary_scalar(BinOp::Max, negated, Scalar::F32(-limit))?;
+    Ok(b.unary(UnOp::Neg, capped)?)
 }
 
 /// `gate` and `up` (same shape) combined by `glu`.
-pub fn glu(b: &Builder, gate: Traced, up: Traced, glu: &Glu) -> Traced {
+pub fn glu(b: &Builder, gate: Traced, up: Traced, glu: &Glu) -> Result<Traced, TraceError> {
     match *glu {
-        Glu::Silu => ops::swiglu(b, gate, up),
-        Glu::Gelu => ops::geglu(b, gate, up),
+        Glu::Silu => Ok(ops::swiglu(b, gate, up)?),
+        Glu::Gelu => Ok(ops::geglu(b, gate, up)?),
         Glu::ClampedSilu { limit } => {
-            let gate = clamp_above(b, gate, limit);
+            let gate = clamp_above(b, gate, limit)?;
             let up = clamp_above(
                 b,
-                b.binary_scalar(BinOp::Max, up, Scalar::F32(-limit)),
+                b.binary_scalar(BinOp::Max, up, Scalar::F32(-limit))?,
                 limit,
-            );
-            ops::swiglu(b, gate, up)
+            )?;
+            Ok(ops::swiglu(b, gate, up)?)
         }
         Glu::Clamped { alpha, limit } => {
-            let gate = clamp_above(b, gate, limit);
+            let gate = clamp_above(b, gate, limit)?;
             let up = clamp_above(
                 b,
-                b.binary_scalar(BinOp::Max, up, Scalar::F32(-limit)),
+                b.binary_scalar(BinOp::Max, up, Scalar::F32(-limit))?,
                 limit,
-            );
+            )?;
             let swish = b.binary(
                 BinOp::Mul,
                 gate,
-                ops::sigmoid(b, b.binary_scalar(BinOp::Mul, gate, Scalar::F32(alpha))),
-            );
-            b.binary(
+                ops::sigmoid(b, b.binary_scalar(BinOp::Mul, gate, Scalar::F32(alpha))?)?,
+            )?;
+            Ok(b.binary(
                 BinOp::Mul,
-                b.binary_scalar(BinOp::Add, up, Scalar::F32(1.0)),
+                b.binary_scalar(BinOp::Add, up, Scalar::F32(1.0))?,
                 swish,
-            )
+            )?)
         }
     }
 }
@@ -174,19 +175,24 @@ impl PlainMlpWeights {
 
 /// The non-gated feed-forward block with the squared-ReLU activation, `down(relu(up(x))^2)` over
 /// `[.., width]` (Nemotron-H's `relu2`): the same weights as [`plain_mlp`].
-pub fn relu2_mlp(b: &Builder, x: Traced, w: &PlainMlpWeights) -> Traced {
+pub fn relu2_mlp(b: &Builder, x: Traced, w: &PlainMlpWeights) -> Result<Traced, TraceError> {
     let bias = |i: usize| w.bias.as_ref().map(|biases| &biases[i]);
-    let relu = ops::relu(b, linear(b, x, &w.up, bias(0)));
-    linear(b, b.binary(BinOp::Mul, relu, relu), &w.down, bias(1))
+    let relu = ops::relu(b, linear(b, x, &w.up, bias(0))?)?;
+    linear(b, b.binary(BinOp::Mul, relu, relu)?, &w.down, bias(1))
 }
 
 /// The non-gated feed-forward block `down(gelu(up(x)))` over `[.., width]`.
-pub fn plain_mlp(b: &Builder, x: Traced, w: &PlainMlpWeights, gelu: Gelu) -> Traced {
+pub fn plain_mlp(
+    b: &Builder,
+    x: Traced,
+    w: &PlainMlpWeights,
+    gelu: Gelu,
+) -> Result<Traced, TraceError> {
     let bias = |i: usize| w.bias.as_ref().map(|biases| &biases[i]);
-    let up = linear(b, x, &w.up, bias(0));
+    let up = linear(b, x, &w.up, bias(0))?;
     let act = match gelu {
-        Gelu::Erf => ops::gelu_erf(b, up),
-        Gelu::Tanh => ops::gelu(b, up),
+        Gelu::Erf => ops::gelu_erf(b, up)?,
+        Gelu::Tanh => ops::gelu(b, up)?,
     };
     linear(b, act, &w.down, bias(1))
 }
@@ -226,9 +232,9 @@ mod tests {
             .collect::<Vec<_>>();
         let run = |fx: &Fx| {
             let weights = PlainMlpWeights::new(&fx.map(), 1, w, inter, biased).unwrap();
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
-            let y = plain_mlp(&b, xs, &weights, gelu);
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+            let y = plain_mlp(&b, xs, &weights, gelu).unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
@@ -308,9 +314,9 @@ mod tests {
                 .collect::<Vec<_>>();
             let run = |fx: &Fx| {
                 let weights = PlainMlpWeights::new(&fx.map(), 1, w, inter, biased).unwrap();
-                let b = Builder::new();
-                let xs = b.constant("x", TensorType::f32(vec![t, w]));
-                let y = relu2_mlp(&b, xs, &weights);
+                let b = Builder::for_tests();
+                let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+                let y = relu2_mlp(&b, xs, &weights).unwrap();
                 fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
             };
             let got = run(&fx);
@@ -368,13 +374,14 @@ mod tests {
             .into_iter()
             .map(|v| 4.0 * v)
             .collect::<Vec<_>>();
-        let run = |fx: &Fx, f: fn(&Builder, Traced, &GatedFfnWeights) -> Traced| {
-            let weights = GatedFfnWeights::new(&fx.map(), 1, w, inter).unwrap();
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
-            let y = f(&b, xs, &weights);
-            fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
-        };
+        let run =
+            |fx: &Fx, f: fn(&Builder, Traced, &GatedFfnWeights) -> Result<Traced, TraceError>| {
+                let weights = GatedFfnWeights::new(&fx.map(), 1, w, inter).unwrap();
+                let b = Builder::for_tests();
+                let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+                let y = f(&b, xs, &weights).unwrap();
+                fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
+            };
         let got = run(&fx, geglu_ffn);
         let (g, u, d) = (
             fx.values(id(FfnRole::Gate)),
@@ -425,10 +432,10 @@ mod tests {
         };
         let (gate, up) = (scaled(21), scaled(22));
         let run = |gate: &[f32], up: &[f32], limit: f32| {
-            let b = Builder::new();
-            let g = b.constant("gate", TensorType::f32(vec![n]));
-            let u = b.constant("up", TensorType::f32(vec![n]));
-            let y = glu(&b, g, u, &Glu::clamped(alpha, limit).unwrap());
+            let b = Builder::for_tests();
+            let g = b.constant("gate", TensorType::f32(vec![n])).unwrap();
+            let u = b.constant("up", TensorType::f32(vec![n])).unwrap();
+            let y = glu(&b, g, u, &Glu::clamped(alpha, limit).unwrap()).unwrap();
             Fx::new(1)
                 .eval(
                     &b.finish(y).unwrap(),
@@ -492,9 +499,9 @@ mod tests {
             .collect::<Vec<_>>();
         let run = |fx: &Fx| {
             let weights = GatedFfnWeights::new(&fx.map(), 1, w, inter).unwrap();
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
-            let y = gated_ffn(&b, xs, &weights);
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+            let y = gated_ffn(&b, xs, &weights).unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
@@ -542,10 +549,10 @@ mod tests {
         };
         let (gate, up) = (scaled(31), scaled(32));
         let run = |gate: &[f32], up: &[f32]| {
-            let b = Builder::new();
-            let g = b.constant("gate", TensorType::f32(vec![n]));
-            let u = b.constant("up", TensorType::f32(vec![n]));
-            let y = glu(&b, g, u, &Glu::clamped_silu(limit).unwrap());
+            let b = Builder::for_tests();
+            let g = b.constant("gate", TensorType::f32(vec![n])).unwrap();
+            let u = b.constant("up", TensorType::f32(vec![n])).unwrap();
+            let y = glu(&b, g, u, &Glu::clamped_silu(limit).unwrap()).unwrap();
             Fx::new(1)
                 .eval(
                     &b.finish(y).unwrap(),

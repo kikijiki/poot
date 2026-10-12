@@ -13,7 +13,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -29,6 +28,7 @@ use crate::model::{
 use crate::names::gguf::GGUF_BASE;
 use crate::names::{HF_BASE, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen2");
 
@@ -291,17 +291,16 @@ impl Model for Qwen2 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let phase = check_embeddable_step(self.family, phase, shape, p.max_positions)?;
-        let b = Builder::new();
         let step = match phase {
-            EmbeddablePhase::Prefill | EmbeddablePhase::Decode => Step::new(&b, shape),
-            EmbeddablePhase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width),
-            EmbeddablePhase::Encode => Step::new(&b, shape).returning_hidden(),
+            EmbeddablePhase::Prefill | EmbeddablePhase::Decode => Step::new(&b, shape)?,
+            EmbeddablePhase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width)?,
+            EmbeddablePhase::Encode => Step::new(&b, shape)?.returning_hidden(),
         };
         let step = if p.attention.is_sectioned() {
-            step.with_mrope(&b)
+            step.with_mrope(&b)?
         } else {
             step
         };
@@ -315,7 +314,7 @@ impl Model for Qwen2 {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
                 |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -404,6 +403,80 @@ mod tests {
         q8_0_of(store, is_projection)
     }
 
+    /// POOT-733 SC-007: the qwen2 fixture traced through `standard_stack` under finite limits that
+    /// exactly fit it produces the graph and the logits the unrestricted trace does (every element of
+    /// the output and of the carried state against the oracle's), and under `max_eqns = 2` the trace is
+    /// refused at the third attempted equation with a typed budget cause: no graph, and no equation
+    /// past the limit was appended. Mutation: create an unbudgeted nested `Builder` in `standard_stack`
+    /// (`Builder::new(TraceLimits::for_tests())` for the embedding); the restrictive row below no
+    /// longer refuses at the third equation.
+    #[test]
+    fn exact_finite_limits_preserve_the_trace_and_max_eqns_2_refuses_the_third_equation() {
+        use poot_graph_ir::{Attempted, BudgetResource, TraceLimits};
+        use std::num::NonZeroU64;
+
+        use crate::components::standard::oracle::run_shape_under;
+        use crate::components::testing::step_shape;
+
+        let fx = fixture();
+        let model = model(&fx.raw(), &fx.store);
+        let shape = step_shape(3, CAP, LogitRows::All);
+        let roomy = TraceLimits::for_tests();
+        let graph = model.trace(Phase::Prefill, shape, roomy).unwrap();
+
+        let exact = TraceLimits {
+            max_tokens: NonZeroUsize::new(3).unwrap(),
+            max_values: NonZeroUsize::new(graph.values().len()).unwrap(),
+            max_eqns: NonZeroUsize::new(graph.eqns().len()).unwrap(),
+            max_literal_bytes: NonZeroU64::new(1 << 20).unwrap(),
+            max_owned_bytes: NonZeroU64::new(1 << 30).unwrap(),
+        };
+        let under_exact = model.trace(Phase::Prefill, shape, exact).unwrap();
+        crate::components::testing::assert_same_graph(&under_exact, &graph);
+        let tokens = [5, 9, 2];
+        let want = run_shape_under(
+            roomy,
+            &*model,
+            &fx.store,
+            Phase::Prefill,
+            shape,
+            &tokens,
+            0,
+            &[],
+        );
+        let got = run_shape_under(
+            exact,
+            &*model,
+            &fx.store,
+            Phase::Prefill,
+            shape,
+            &tokens,
+            0,
+            &[],
+        );
+        assert_eq!(got.0.len(), want.0.len());
+        for (i, (g, w)) in got.0.iter().zip(&want.0).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "logit {i}");
+        }
+        assert_eq!(got.1, want.1, "every carried-state element");
+
+        let tight = TraceLimits {
+            max_eqns: NonZeroUsize::new(2).unwrap(),
+            ..roomy
+        };
+        let refused = match model.trace(Phase::Prefill, shape, tight) {
+            Err(TraceError::Budget(budget)) => budget,
+            other => panic!("expected the typed budget refusal, got {other:?}"),
+        };
+        assert_eq!(refused.resource, BudgetResource::Equations);
+        assert_eq!((refused.limit, refused.used, refused.requested), (2, 2, 1));
+        assert_eq!(
+            refused.attempted,
+            Attempted::Total(3),
+            "the third attempted equation"
+        );
+    }
+
     /// SC-002: on the fixture, the new body gives the top-five logits recorded from the legacy
     /// `trace_prefill_kv` and `trace_decode_kv_masked` at the base commit `bbd5c3232` (last prefill
     /// position and three decode steps; token ids exact, logits tier 2). Mutation: change the
@@ -477,7 +550,13 @@ mod tests {
         at: &[i32],
     ) -> Vec<f32> {
         let shape = crate::components::testing::step_shape(tokens.len(), CAP, LogitRows::All);
-        let g = model.trace(Phase::PrefillEmbeds, shape).unwrap();
+        let g = model
+            .trace(
+                Phase::PrefillEmbeds,
+                shape,
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         let state = zero_state(&g);
         let state: Vec<&[f32]> = state.iter().map(Vec::as_slice).collect();
         let pos: Vec<i32> = (0..tokens.len() as i32).collect();
@@ -718,7 +797,7 @@ mod tests {
             ),
         ];
         for (phase, shape, want) in cases {
-            match model.trace(phase, shape) {
+            match model.trace(phase, shape, poot_graph_ir::TraceLimits::for_tests()) {
                 Err(TraceError::ShapeUnsupported { reason, .. }) => assert_eq!(reason, want),
                 other => panic!("{phase:?} {shape:?}: {other:?}"),
             }
@@ -764,11 +843,9 @@ mod tests {
     fn gguf_fixture(q8_0_embedding: bool) -> (Vec<u8>, WeightStore) {
         let q8 = q8_0_store(&fixture().store);
         let embed = "model.embed_tokens.weight";
-        let q8_embed = WeightEntry::Packed(Arc::new(poot_test_util::packed::random_payload(
-            WeightFormat::Q8_0,
-            [VOCAB, 64],
-            99,
-        )));
+        let q8_embed = WeightEntry::Packed(Arc::new(
+            poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [VOCAB, 64], 99),
+        ));
         let mut tensors: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
         let mut reference = WeightStore::builder();
         for (key, entry) in q8.iter() {
@@ -932,7 +1009,13 @@ mod tests {
             logits: LogitRows::All,
             hidden: None,
         };
-        let g = model.trace(Phase::Prefill, shape).unwrap();
+        let g = model
+            .trace(
+                Phase::Prefill,
+                shape,
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         let bound =
             bind_packed_weights(&g, &WeightFormats::from_weight_map(model.weights())).unwrap();
         let claimed =

@@ -1,5 +1,14 @@
-use crate::graph::*;
-use crate::*;
+use crate::graph::{
+    GraphCore, GraphTiming, META_CHUNK_BYTES, MetaArena, MetaBlock, RecordingGraph,
+    TIMESTAMP_CAPACITY, Timestamps, TrapSlot, VulkanGraph, allocate_and_begin,
+    create_graph_resources,
+};
+use crate::{Context, DeviceBuffer, Pipeline, RuntimeError};
+use ash::vk;
+use poot_runtime_common::{BufferRole, CompiledKernel};
+use poot_target::{BufferStorage, ElementKind, LogicalDType};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Descriptor sets a pool is created for. A pool that runs out of sets or descriptors is replaced
 /// rather than grown, so a graph of thousands of dispatches needs a few dozen pools, not one per
@@ -142,7 +151,7 @@ impl Context {
 
         let n = args.len();
         let mut lengths: Vec<u8> = args.iter().flat_map(|a| a.elems.to_le_bytes()).collect();
-        lengths.extend_from_slice(&crate::x_extent(groups, wg).to_le_bytes());
+        lengths.extend_from_slice(&crate::util::x_extent(groups, wg).to_le_bytes());
         let lengths_block = graph.core.reserve_meta(self, lengths.len())?;
         let offset = lengths_block.offset;
         lengths_block.chunk.write_with_at(

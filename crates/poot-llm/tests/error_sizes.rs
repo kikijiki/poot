@@ -18,10 +18,10 @@ fn error_sizes() -> Vec<(&'static str, usize)> {
             "poot_llm::driver::error::DriverError",
             size_of::<poot_llm::driver::error::DriverError>(),
         ),
-        ("poot_llm::TextError", size_of::<poot_llm::TextError>()),
+        ("poot_text::TextError", size_of::<poot_text::TextError>()),
         (
-            "poot_ptx_gpu::PtxGpuError",
-            size_of::<poot_ptx_gpu::PtxGpuError>(),
+            "poot_ptx_device::PtxGpuError",
+            size_of::<poot_ptx_device::PtxGpuError>(),
         ),
     ];
     rows.extend(rocm_error_sizes());
@@ -33,8 +33,8 @@ fn error_sizes() -> Vec<(&'static str, usize)> {
 #[cfg(feature = "rocm")]
 fn rocm_error_sizes() -> Vec<(&'static str, usize)> {
     vec![(
-        "poot_rocm_gpu::RocmGpuError",
-        size_of::<poot_rocm_gpu::RocmGpuError>(),
+        "poot_rocm_device::RocmGpuError",
+        size_of::<poot_rocm_device::RocmGpuError>(),
     )]
 }
 
@@ -76,12 +76,12 @@ fn stage_cause() -> poot_graph_plan::CompileError {
 #[test]
 fn boxing_a_cause_does_not_change_what_an_error_prints() {
     assert_eq!(
-        poot_ptx_gpu::PtxGpuError::from(plan_cause()).to_string(),
+        poot_ptx_device::PtxGpuError::from(plan_cause()).to_string(),
         format!("plan: {PLAN_CAUSE_TEXT}")
     );
     #[cfg(feature = "rocm")]
     assert_eq!(
-        poot_rocm_gpu::RocmGpuError::from(poot_rocm_runtime::RocmError::LibraryNotFound(
+        poot_rocm_device::RocmGpuError::from(poot_rocm_runtime::RocmError::LibraryNotFound(
             "t".to_string()
         ))
         .to_string(),
@@ -94,7 +94,7 @@ fn boxing_a_cause_does_not_change_what_an_error_prints() {
 /// corresponding link goes `None`.
 #[test]
 fn boxing_a_cause_does_not_cut_the_source_chain() {
-    let ptx = poot_ptx_gpu::PtxGpuError::from(plan_cause());
+    let ptx = poot_ptx_device::PtxGpuError::from(plan_cause());
     assert_eq!(ptx.to_string(), format!("plan: {PLAN_CAUSE_TEXT}"));
 
     let plan = ptx.source().expect("PtxGpuError::Plan keeps its cause");
@@ -113,12 +113,12 @@ fn every_boxed_cause_still_converts_through_a_single_question_mark() {
     fn planner_fails() -> Result<(), poot_graph_plan::PlanError> {
         Err(plan_cause())
     }
-    fn ptx() -> Result<(), poot_ptx_gpu::PtxGpuError> {
+    fn ptx() -> Result<(), poot_ptx_device::PtxGpuError> {
         planner_fails()?;
         Ok(())
     }
 
-    assert!(matches!(ptx(), Err(poot_ptx_gpu::PtxGpuError::Plan(_))));
+    assert!(matches!(ptx(), Err(poot_ptx_device::PtxGpuError::Plan(_))));
 }
 
 /// Covers every one of the boxed-cause links (`boxing_a_cause_does_not_cut_the_source_chain`
@@ -143,26 +143,26 @@ where
 
 fn non_rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
     vec![
-        // poot_ptx_gpu::PtxGpuError (crates/poot-ptx-gpu/src/lib.rs): 4 links, all explicit `#[source]`.
+        // poot_ptx_device::PtxGpuError (crates/poot-ptx-device/src/lib.rs): 4 links, all explicit `#[source]`.
         source_row(
-            "poot_ptx_gpu::PtxGpuError::Ptx -> poot_ptx_runtime::PtxError",
+            "poot_ptx_device::PtxGpuError::Ptx -> poot_ptx_runtime::PtxError",
             poot_ptx_runtime::PtxError::CudaUnavailable("t".to_string()),
-            poot_ptx_gpu::PtxGpuError::from,
+            poot_ptx_device::PtxGpuError::from,
         ),
         source_row(
-            "poot_ptx_gpu::PtxGpuError::Codegen -> poot_codegen::CompileError",
+            "poot_ptx_device::PtxGpuError::Codegen -> poot_codegen::CompileError",
             poot_codegen::CompileError::Io(std::io::Error::other("t")),
-            poot_ptx_gpu::PtxGpuError::from,
+            poot_ptx_device::PtxGpuError::from,
         ),
         source_row(
-            "poot_ptx_gpu::PtxGpuError::Plan -> poot_graph_plan::PlanError",
+            "poot_ptx_device::PtxGpuError::Plan -> poot_graph_plan::PlanError",
             plan_cause(),
-            poot_ptx_gpu::PtxGpuError::from,
+            poot_ptx_device::PtxGpuError::from,
         ),
         source_row(
-            "poot_ptx_gpu::PtxGpuError::Stage -> poot_graph_plan::CompileError",
+            "poot_ptx_device::PtxGpuError::Stage -> poot_graph_plan::CompileError",
             stage_cause(),
-            poot_ptx_gpu::PtxGpuError::from,
+            poot_ptx_device::PtxGpuError::from,
         ),
     ]
 }
@@ -176,17 +176,17 @@ fn non_rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)>
 #[cfg(feature = "rocm")]
 fn rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
     vec![
-        // poot_rocm_gpu::RocmGpuError (crates/poot-rocm-gpu/src/error.rs): 2 links, both
+        // poot_rocm_device::RocmGpuError (crates/poot-rocm-device/src/error.rs): 2 links, both
         // explicit `#[source]`.
         source_row(
-            "poot_rocm_gpu::RocmGpuError::Rocm -> poot_rocm_runtime::RocmError",
+            "poot_rocm_device::RocmGpuError::Rocm -> poot_rocm_runtime::RocmError",
             poot_rocm_runtime::RocmError::LibraryNotFound("t".to_string()),
-            poot_rocm_gpu::RocmGpuError::from,
+            poot_rocm_device::RocmGpuError::from,
         ),
         source_row(
-            "poot_rocm_gpu::RocmGpuError::Codegen -> poot_codegen::CompileError",
+            "poot_rocm_device::RocmGpuError::Codegen -> poot_codegen::CompileError",
             poot_codegen::CompileError::Io(std::io::Error::other("t")),
-            poot_rocm_gpu::RocmGpuError::from,
+            poot_rocm_device::RocmGpuError::from,
         ),
     ]
 }

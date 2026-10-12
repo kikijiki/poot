@@ -4,11 +4,11 @@
 //! on poot-eval, so an integration test here can drive both.
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::{Graph, Slot, Storage, ValueId};
 use poot_graph_plan::{cse, dce, fuse, legalize};
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
 use poot_tensor::HostTensor;
 use poot_test_util::assert_close_rel;
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 
 /// The tiny qwen2 the pass tests trace (through the registry): the same dimensions the decomposition
 /// tests always used.
-fn tiny_qwen2() -> poot_executor_parity::weight_map::MappedModel {
+fn tiny_qwen2() -> poot_models::test_support::weight_map::MappedModel {
     Dense::new(Family::Qwen2)
         .vocab(32)
         .dims(16, 32, 2)
@@ -41,10 +41,14 @@ fn tiny_qwen2() -> poot_executor_parity::weight_map::MappedModel {
 }
 
 /// `model`'s one-token decode step over `cap` positions.
-fn decode_graph(model: &poot_executor_parity::weight_map::MappedModel, cap: usize) -> Graph {
+fn decode_graph(model: &poot_models::test_support::weight_map::MappedModel, cap: usize) -> Graph {
     model
         .model
-        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step(1, 1, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -185,7 +189,7 @@ const HIDDEN: usize = 8;
 /// A tiny qwen2 whose embed table (`vocab * hidden * 4` bytes) is strictly the largest constant the
 /// tracer declares - every projection weight fits `hidden * inter` or smaller - so a
 /// [`poot_target::DeviceCaps::max_buffer_bytes`] between the two hosts the embed table and nothing else.
-fn tiny_legalize_model() -> poot_executor_parity::weight_map::MappedModel {
+fn tiny_legalize_model() -> poot_models::test_support::weight_map::MappedModel {
     Dense::new(Family::Qwen2)
         .vocab(VOCAB)
         .dims(HIDDEN, 8, 2)
@@ -200,7 +204,11 @@ fn tiny_legalize_model() -> poot_executor_parity::weight_map::MappedModel {
 fn legalize_graph(phase: Phase, tokens: usize, cap: usize) -> Graph {
     tiny_legalize_model()
         .model
-        .trace(phase, step(1, tokens, cap, LogitRows::All))
+        .trace(
+            phase,
+            step(1, tokens, cap, LogitRows::All),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -250,7 +258,9 @@ fn without_lm_head(g: Graph) -> Graph {
     let Operand::Value(hidden) = out_eqn.inputs[0] else {
         panic!("lm_head MatMul's first operand must be a value")
     };
-    let g = poot_test_util::graph_fixtures::derive(&g, |draft| draft.set_result(hidden)).unwrap();
+    let g =
+        poot_graph_ir::test_support::graph_fixtures::derive(&g, |draft| draft.set_result(hidden))
+            .unwrap();
     let g = dce(&g).unwrap();
 
     // `dce` only prunes `eqns` ("the value table is preserved, dead entries are harmless" - true for

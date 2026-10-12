@@ -10,11 +10,56 @@
 //! `OpKind` variant fails to compile until it is assigned a family and that family handles it. A
 //! refusal is a typed [`Refusal`], built by `Site::refuse`.
 
+use crate::compile::SlotSchema;
+use crate::kernel_mapping::{finalize, finalize_aie};
+use crate::planner::kg::Layout;
+use crate::predicates::GraphTables;
+use crate::refusal::Site;
+use crate::storage_analysis::value_storage_of_plans;
+use crate::types::GraphStorage;
 use poot_kernelgen::BodyLimits;
 use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps};
 
 use crate::dtype_widen::bf16_const_is_packed;
-use crate::*;
+use crate::{
+    Binding, Capability, CompileError, ImportedKernel, Plan, PlanError, ScratchId, Sink, Source,
+    Target, compute_views, numel, value_ids,
+};
+use poot_graph_ir::Eqn;
+use poot_graph_ir::Graph;
+use poot_graph_ir::Operand;
+use poot_graph_ir::Scalar;
+use poot_graph_ir::ValueId;
+use poot_graph_ir::op::BinOp as GBinOp;
+use poot_graph_ir::op::ContractionHead;
+use poot_graph_ir::op::FusedOperand;
+use poot_graph_ir::op::FusedRegion;
+use poot_graph_ir::op::OpKind;
+use poot_graph_ir::op::RedOp;
+use poot_graph_ir::op::RowStep;
+use poot_graph_ir::op::UnOp as GUnOp;
+use poot_kernel_ir::BinOp;
+use poot_kernel_ir::Ty;
+use poot_kernel_ir::UnOp;
+use poot_kernelgen as kg;
+use poot_kernelgen::CastSpec;
+use poot_kernelgen::ContractionSpec;
+use poot_kernelgen::ElementwiseSpec;
+use poot_kernelgen::I32Binary;
+use poot_kernelgen::KernelRequest;
+use poot_kernelgen::MatmulShapes;
+use poot_kernelgen::PackedRequest;
+use poot_kernelgen::PointwiseForm;
+use poot_kernelgen::PointwiseSpec;
+use poot_kernelgen::RopeSpec;
+use poot_kernelgen::RowSpec;
+use poot_kernelgen::TopKSpec;
+use poot_kernelgen::UnaryOp;
+use poot_kernelgen::ValueBinary;
+use poot_kernelgen::ViewOperand;
+use poot_kernelgen::WeightLayout;
+use poot_tensor::DType;
+use std::collections::HashMap;
 
 /// Ops over a packed weight, planned by the descriptor-driven lowering table (`planner::packed_dequant`),
 /// never through the per-family `plan_eqn` bodies.
@@ -191,7 +236,6 @@ pub(crate) fn plan_graph(
     target: &Target,
     limits: &BodyLimits,
 ) -> Result<PlannedGraph, CompileError> {
-    let _scope = CompileScope::enter();
     let id = target.id();
     let views = compute_views(g, id);
     let (plans, choices): (Vec<_>, Vec<_>) = g
@@ -224,64 +268,17 @@ pub(crate) fn plan_graph(
 }
 
 thread_local! {
-    /// How many [`CompileScope`]s are open on this thread.
-    static COMPILE_DEPTH: Cell<usize> = const { Cell::new(0) };
-    /// Per-equation plans made on this thread while no [`CompileScope`] was open.
-    #[cfg(test)]
-    static PLANS_OUTSIDE_COMPILE: Cell<u64> = const { Cell::new(0) };
-    /// Per-equation plans made on this thread inside a [`CompileScope`].
-    #[cfg(test)]
-    static PLANS_INSIDE_COMPILE: Cell<u64> = const { Cell::new(0) };
+    /// The hook told of every per-equation plan this thread makes, with whether [`crate::compile`] made
+    /// it (`plan_graph` and the rewrite-legality probes) rather than a caller planning an equation
+    /// itself. Unset in every build that does not install one (a test), so the planner pays one load and
+    /// a branch per equation.
+    static PLAN_OBSERVER: Cell<Option<fn(bool)>> = const { Cell::new(None) };
 }
 
-/// Marks this thread as inside [`crate::compile`] while it lives, so the per-equation plans compile makes
-/// (its rewrite-legality checks and [`plan_graph`]) are told apart from a caller planning equations itself.
-pub(crate) struct CompileScope(());
-
-impl CompileScope {
-    pub(crate) fn enter() -> Self {
-        COMPILE_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        CompileScope(())
+fn observe_plan(compiled: bool) {
+    if let Some(observer) = PLAN_OBSERVER.get() {
+        observer(compiled);
     }
-}
-
-impl Drop for CompileScope {
-    fn drop(&mut self) {
-        COMPILE_DEPTH.with(|depth| depth.set(depth.get() - 1));
-    }
-}
-
-/// The number of per-equation plans made on this thread outside [`crate::compile`] so far (card 532
-/// SC-003, [`only_plans_outside_compile_are_counted`](compile::tests::only_plans_outside_compile_are_counted)).
-/// A consumer that has moved onto `compile` reaches the planner only through it, so running its path
-/// leaves this count unchanged; a direct `plan_eqn*` call, or a graph-wide check that plans every
-/// equation again (`storage_analysis`'s test-only `fixture_value_storage`, `state_commit`'s test-only
-/// `commit_for_test`), raises it.
-///
-/// Card 546b: narrowed from `pub` (gated `any(test, feature = "test-support")`) to `pub(crate)` -
-/// its one cross-crate reader, `poot-gpu`'s own `src/tests/decode_cache_warmth.rs`, moved off
-/// `GpuExecutor::run_resident_kv_cached` and was deleted with it, leaving the `pub` accessor with no
-/// caller outside this crate's own tests (dead-pub has no exemption for an `any(test, ...)` gate); the
-/// remaining caller is this crate's own `compile.rs` test, which needs no more than `pub(crate)`.
-#[cfg(test)]
-pub(crate) fn per_eqn_plans_outside_compile() -> u64 {
-    PLANS_OUTSIDE_COMPILE.with(Cell::get)
-}
-
-fn count_per_eqn_plan() {
-    #[cfg(test)]
-    if COMPILE_DEPTH.with(Cell::get) == 0 {
-        PLANS_OUTSIDE_COMPILE.with(|count| count.set(count.get() + 1));
-    } else {
-        PLANS_INSIDE_COMPILE.with(|count| count.set(count.get() + 1));
-    }
-}
-
-/// The number of per-equation plans made on this thread inside [`crate::compile`] so far: the rewrite
-/// legality probes and [`plan_graph`]'s one pass.
-#[cfg(test)]
-pub(crate) fn per_eqn_plans_inside_compile() -> u64 {
-    PLANS_INSIDE_COMPILE.with(Cell::get)
 }
 
 /// Plan one equation. `caps` is the device's measured [`DeviceCaps`] (a runtime's `Context::device_caps()`,
@@ -291,6 +288,7 @@ pub(crate) fn per_eqn_plans_inside_compile() -> u64 {
 ///
 /// A collective (`AllReduce`/`AllGather`) is refused with [`Capability::CollectiveInStage`]: it is a cut
 /// between stage programs, never an equation one plans.
+#[cfg(any(test, feature = "test-support"))]
 pub fn plan_eqn(
     g: &Graph,
     eqn: &Eqn,
@@ -328,7 +326,7 @@ pub(crate) fn fty_ty(d: DType) -> Ty {
     }
 }
 
-/// Card 546a (S46-11, moved from `poot-gpu`'s `exec.rs::eqn_work_units`, deleted as a vestigial
+/// Card 546a (S46-11, moved from `poot-wgpu-device`'s `exec.rs::eqn_work_units`, deleted as a vestigial
 /// wrapper before this card landed): one equation's watchdog work weight, the
 /// planner-owned cost `Device::dispatch`'s caller (the contract engine) carries in `Dispatch::work`
 /// to split a long run of dispatches across several submits before the device driver's TDR fires.
@@ -355,6 +353,7 @@ pub fn dispatch_work(g: &Graph, eqn: &Eqn) -> u64 {
 /// e.g. `poot_test_util::device_caps::default_caps_for`). `out_shape`/`out_numel` are graph-derived, not
 /// caller-supplied (card 525 R469-019).
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn plan_eqn_views(
     g: &Graph,
     eqn: &Eqn,
@@ -374,6 +373,7 @@ pub fn plan_eqn_views(
 /// per-equation planner entry. A GPU target plans a thread grid, an AIE target the same requests under its
 /// sequential one-core schedule; an equation whose lowering reads GPU capabilities is refused for an AIE
 /// target with [`Capability::GpuOnly`]. A planner test that asserts on the choice calls it directly.
+#[cfg(any(test, feature = "test-support"))]
 pub fn plan_eqn_choice(
     g: &Graph,
     eqn: &Eqn,
@@ -381,7 +381,7 @@ pub fn plan_eqn_choice(
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(g, eqn, target, views, limits)
+    plan_eqn_policy(g, eqn, target, views, limits, false)
 }
 
 /// The single-device per-equation plan [`crate::compile`] makes, in [`plan_graph`] and in its rewrite
@@ -393,7 +393,7 @@ pub(crate) fn plan_eqn_compiled(
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
 ) -> Result<Planned, PlanError> {
-    plan_eqn_policy(g, eqn, target, views, limits)
+    plan_eqn_policy(g, eqn, target, views, limits, true)
 }
 
 /// Whether `op` can read a BF16 const operand through a packed lane: the `Cast` kernel, and the fused regions
@@ -411,7 +411,9 @@ fn plan_eqn_policy(
     target: &Target,
     views: &HashMap<ValueId, Layout>,
     limits: &BodyLimits,
+    compiled: bool,
 ) -> Result<Planned, PlanError> {
+    observe_plan(compiled);
     let out_shape = g.aval(eqn.out).shape.clone();
     let out_numel = out_numel_saturating(&out_shape);
     // Card 1011: which operands a narrow reader (a `Cast`, or a fused region that widens its input) reads from
@@ -475,7 +477,6 @@ pub(crate) fn plan_eqn_views_impl(
     packed_operands: &[bool],
     limits: BodyLimits,
 ) -> Result<Planned, PlanError> {
-    count_per_eqn_plan();
     match target {
         Target::Gpu { backend, caps } => plan_gpu_eqn(
             g,
@@ -821,4 +822,53 @@ fn plan_gpu_eqn(
         caps,
     )?;
     Ok(planned)
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    thread_local! {
+        static PLANS_OUTSIDE_COMPILE: Cell<u64> = const { Cell::new(0) };
+        static PLANS_INSIDE_COMPILE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn count(compiled: bool) {
+        let counter = if compiled {
+            &PLANS_INSIDE_COMPILE
+        } else {
+            &PLANS_OUTSIDE_COMPILE
+        };
+        counter.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Start counting this thread's plans. Every reader calls it first, so a test's `before` read is
+    /// taken with the hook installed.
+    fn observing() {
+        PLAN_OBSERVER.set(Some(count));
+    }
+
+    /// The number of per-equation plans made on this thread outside [`crate::compile`] so far (card 532
+    /// SC-003, [`only_plans_outside_compile_are_counted`](compile::tests::only_plans_outside_compile_are_counted)).
+    /// A consumer that has moved onto `compile` reaches the planner only through it, so running its path
+    /// leaves this count unchanged; a direct `plan_eqn*` call, or a graph-wide check that plans every
+    /// equation again (`storage_analysis`'s test-only `fixture_value_storage`, `state_commit`'s test-only
+    /// `commit_for_test`), raises it.
+    ///
+    /// Card 546b: narrowed from `pub` (gated `any(test, feature = "test-support")`) to `pub(crate)` -
+    /// its one cross-crate reader, `poot-wgpu-device`'s own `src/tests/decode_cache_warmth.rs`, moved off
+    /// `GpuExecutor::run_resident_kv_cached` and was deleted with it, leaving the `pub` accessor with no
+    /// caller outside this crate's own tests (dead-pub has no exemption for an `any(test, ...)` gate); the
+    /// remaining caller is this crate's own `compile.rs` test, which needs no more than `pub(crate)`.
+    pub(crate) fn per_eqn_plans_outside_compile() -> u64 {
+        observing();
+        PLANS_OUTSIDE_COMPILE.with(Cell::get)
+    }
+
+    /// The number of per-equation plans made on this thread inside [`crate::compile`] so far: the rewrite
+    /// legality probes and [`plan_graph`]'s one pass.
+    pub(crate) fn per_eqn_plans_inside_compile() -> u64 {
+        observing();
+        PLANS_INSIDE_COMPILE.with(Cell::get)
+    }
 }

@@ -23,6 +23,7 @@ use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::norm;
 use crate::components::rope::{RopeParams, rope_strided_rows};
 use crate::components::standard::Step;
+use crate::model::TraceError;
 
 /// Additive mask for a window a query may not read: finite, so that adding it to another mask or to
 /// a score cannot overflow.
@@ -56,7 +57,7 @@ pub(super) enum Pooling {
 }
 
 impl CompressorWeights {
-    pub fn new(
+    pub(super) fn new(
         map: &WeightMap,
         layer: usize,
         owner: Owner,
@@ -121,15 +122,15 @@ pub(super) fn entries(
     pooling: Pooling,
     rope: RopeParams,
     cfg: &DeepseekV4Config,
-) -> Option<Traced> {
+) -> Result<Option<Traced>, TraceError> {
     let shape = step.shape();
     let (r, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let raw = match pooling {
         Pooling::Disjoint => entry,
         Pooling::Overlapping => 2 * entry,
     };
-    let history = |name: &str, weight: &Weight| {
-        let new = b.reshape(linear(b, normed, weight, None), vec![r, 1, t, raw]);
+    let history = |name: &str, weight: &Weight| -> Result<_, TraceError> {
+        let new = b.reshape(linear(b, normed, weight, None)?, vec![r, 1, t, raw])?;
         carried_cache(
             b,
             step,
@@ -141,60 +142,67 @@ pub(super) fn entries(
             raw,
         )
     };
-    let kv = history("kv", &w.kv);
-    let gate = history("gate", &w.gate);
+    let kv = history("kv", &w.kv)?;
+    let gate = history("gate", &w.gate)?;
 
     let n = windows_in(cap, rate);
     if n == 0 {
-        return None;
+        return Ok(None);
     }
-    let windowed = |x: Traced| b.reshape(b.slice(x, 2, 0, n * rate), vec![r, n, rate, raw]);
-    let bias = b.reshape(w.bias.declare_f32(b), vec![1, 1, rate, raw]);
-    let gate = b.binary(BinOp::Add, windowed(gate), bias);
-    let pooled = match pooling {
-        Pooling::Disjoint => softmax_pool(b, windowed(kv), gate),
-        Pooling::Overlapping => overlap_pool(b, windowed(kv), gate, entry),
+    let windowed = |x: Traced| {
+        Ok::<_, TraceError>(b.reshape(b.slice(x, 2, 0, n * rate)?, vec![r, n, rate, raw])?)
     };
-    let pooled = norm(b, pooled, &w.norm, cfg.norm);
-    let rows = rope_strided_rows(b, rope, cap, rate, n, r);
-    Some(rotate_tail(
+    let bias = b.reshape(w.bias.declare_f32(b)?, vec![1, 1, rate, raw])?;
+    let gate = b.binary(BinOp::Add, windowed(gate)?, bias)?;
+    let pooled = match pooling {
+        Pooling::Disjoint => softmax_pool(b, windowed(kv)?, gate)?,
+        Pooling::Overlapping => overlap_pool(b, windowed(kv)?, gate, entry)?,
+    };
+    let pooled = norm(b, pooled, &w.norm, cfg.norm)?;
+    let rows = rope_strided_rows(b, rope, cap, rate, n, r)?;
+    Ok(Some(rotate_tail(
         b,
-        b.reshape(pooled, vec![r, 1, n, entry]),
+        b.reshape(pooled, vec![r, 1, n, entry])?,
         &rows,
         cfg.attn.rope_dim,
-    ))
+    )?))
 }
 
 /// The softmax over the window axis (per channel) of `gate`, the weighted sum of `kv` over it:
 /// `[rows, windows, positions, channels]` to `[rows, windows, channels]`. The softmax runs on the
 /// trailing axis, so the window axis is moved there and back around it.
-pub(super) fn softmax_pool(b: &Builder, kv: Traced, gate: Traced) -> Traced {
-    let by_channel = b.transpose(gate, vec![0, 1, 3, 2]);
-    let weights = b.transpose(ops::softmax(b, by_channel), vec![0, 1, 3, 2]);
-    b.reduce(RedOp::Sum, b.binary(BinOp::Mul, kv, weights), 2, false)
+pub(super) fn softmax_pool(b: &Builder, kv: Traced, gate: Traced) -> Result<Traced, TraceError> {
+    let by_channel = b.transpose(gate, vec![0, 1, 3, 2])?;
+    let weights = b.transpose(ops::softmax(b, by_channel)?, vec![0, 1, 3, 2])?;
+    Ok(b.reduce(RedOp::Sum, b.binary(BinOp::Mul, kv, weights)?, 2, false)?)
 }
 
 /// The additive mask of which of `windows` windows each query token may read:
 /// `[rows, 1, tokens, windows]`, `0.0` once the window's last position is at or before the query's
 /// own position, [`DROPPED`] before.
-pub(super) fn complete_windows(b: &Builder, step: &Step, rate: usize, windows: usize) -> Traced {
+pub(super) fn complete_windows(
+    b: &Builder,
+    step: &Step,
+    rate: usize,
+    windows: usize,
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (r, t) = (shape.rows.get(), shape.tokens.get());
     let pos = b.reshape(
-        b.cast(step.pos(), poot_tensor::DType::F32),
+        b.cast(step.pos(), poot_tensor::DType::F32)?,
         vec![r, 1, t, 1],
-    );
+    )?;
     let last = b.binary_scalar(
         BinOp::Add,
-        b.binary_scalar(BinOp::Mul, b.iota(windows), Scalar::F32(rate as f32)),
+        b.binary_scalar(BinOp::Mul, b.iota(windows)?, Scalar::F32(rate as f32))?,
         Scalar::F32((rate - 1) as f32),
-    );
-    let visible = b.binary(BinOp::Ge, pos, b.reshape(last, vec![1, 1, 1, windows]));
-    b.binary_scalar(
+    )?;
+    let visible = b.binary(BinOp::Ge, pos, b.reshape(last, vec![1, 1, 1, windows])?)?;
+    Ok(b.binary_scalar(
         BinOp::Mul,
-        b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0)),
+        b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0))?,
         Scalar::F32(-DROPPED),
-    )
+    )?)
 }
 
 /// An HCA layer's compressed attention inputs: its disjoint-window entries and the complete-window
@@ -207,9 +215,9 @@ pub(super) fn compressed(
     write_at: &[Traced],
     w: &CompressorWeights,
     cfg: &DeepseekV4Config,
-) -> Option<Compressed> {
+) -> Result<Option<Compressed>, TraceError> {
     let rate = cfg.hca_rate;
-    let entries = entries(
+    let Some(entries) = entries(
         b,
         step,
         layer,
@@ -222,10 +230,13 @@ pub(super) fn compressed(
         Pooling::Disjoint,
         cfg.rope_of(LayerKind::Hca),
         cfg,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
     let n = windows_in(step.shape().capacity.get(), rate);
-    Some(Compressed {
+    Ok(Some(Compressed {
         entries,
-        mask: complete_windows(b, step, rate, n),
-    })
+        mask: complete_windows(b, step, rate, n)?,
+    }))
 }

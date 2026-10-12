@@ -45,7 +45,7 @@ fn unsupported<T>(what: impl std::fmt::Display) -> R<T> {
 }
 
 /// Import one `#[kernel]` item's Stable MIR into a poot [`kir::Body`].
-pub fn import_item(item: &CrateItem) -> Result<kir::Body, String> {
+pub(crate) fn import_item(item: &CrateItem) -> Result<kir::Body, String> {
     let name = item.name();
     let src = kir::naming::source_name_of_path(&name).unwrap_or_else(|| "kernel".to_string());
     let body = item.body().ok_or("item has no MIR body")?;
@@ -54,7 +54,7 @@ pub fn import_item(item: &CrateItem) -> Result<kir::Body, String> {
 
 /// Translate a kernel's Stable MIR body into poot-IR. `for` loops are detected up front and their
 /// iterator plumbing rewritten to a counter loop; everything else is a block-by-block translation.
-pub fn import_body(name: &str, body: &smir::Body) -> R<kir::Body> {
+pub(crate) fn import_body(name: &str, body: &smir::Body) -> R<kir::Body> {
     let Loops {
         loops,
         support,

@@ -29,7 +29,7 @@ pub fn require_gpu_hang_opt_in(test_name: &str) -> Option<GpuHangOptIn> {
 }
 
 /// [`require_gpu_hang_opt_in`] with an injected environment reader, for a test that sets only one variable.
-pub fn require_gpu_hang_opt_in_with(
+pub(crate) fn require_gpu_hang_opt_in_with(
     get: impl Fn(&str) -> Option<String>,
     test_name: &str,
 ) -> Option<GpuHangOptIn> {

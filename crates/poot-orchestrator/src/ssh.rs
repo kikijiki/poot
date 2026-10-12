@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 
 /// An SSH connection to a pod: public host, the mapped 22/tcp port, and the private key path.
 #[derive(Debug, Clone)]
-pub struct Endpoint {
+pub(crate) struct Endpoint {
     pub host: String,
     pub port: u16,
     pub key: String,
@@ -16,14 +16,14 @@ pub struct Endpoint {
 
 /// Result of a remote command.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Run {
+pub(crate) struct Run {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
 }
 
 impl Run {
-    pub fn ok(&self) -> bool {
+    pub(crate) fn ok(&self) -> bool {
         self.code == 0
     }
 }
@@ -31,7 +31,7 @@ impl Run {
 /// Failure of [`output_until`]: the child was killed at the deadline, or it could not
 /// be spawned/reaped. Timeouts are distinguished from other failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeadlineError {
+pub(crate) enum DeadlineError {
     Timeout,
     Spawn(String),
     Wait(String),
@@ -62,7 +62,7 @@ fn run_from_output(out: std::process::Output) -> Run {
 ///
 /// Shared by [`output_until`] (kill the whole scp/ssh tree at the deadline) and the
 /// host-local `HostCommand` terminator — one helper, not a second copy of the extern.
-pub fn kill_process_group(pgid: i32, sig: i32) {
+pub(crate) fn kill_process_group(pgid: i32, sig: i32) {
     unsafe extern "C" {
         #[link_name = "killpg"]
         fn libc_killpg(pgrp: i32, sig: i32) -> i32;
@@ -78,7 +78,7 @@ pub fn kill_process_group(pgid: i32, sig: i32) {
 /// R4/N1: long exec payloads (workflow.rs main suite, setup, HF download, GGUF
 /// conversion) must not be killed by a budget they never opted into. Deadlines belong
 /// only on [`output_until`] / the `*_until` variants.
-pub fn output_plain(cmd: &mut Command) -> Result<std::process::Output, DeadlineError> {
+pub(crate) fn output_plain(cmd: &mut Command) -> Result<std::process::Output, DeadlineError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -103,7 +103,7 @@ pub fn output_plain(cmd: &mut Command) -> Result<std::process::Output, DeadlineE
 /// tree does not outlive the deadline.
 ///
 /// Returns [`DeadlineError::Timeout`] when the kill path was taken.
-pub fn output_until(
+pub(crate) fn output_until(
     cmd: &mut Command,
     deadline: Instant,
 ) -> Result<std::process::Output, DeadlineError> {
@@ -174,7 +174,7 @@ pub fn output_until(
 }
 
 impl Endpoint {
-    pub fn new(host: impl Into<String>, port: u16, key: impl Into<String>) -> Endpoint {
+    pub(crate) fn new(host: impl Into<String>, port: u16, key: impl Into<String>) -> Endpoint {
         Endpoint {
             host: host.into(),
             port,
@@ -207,7 +207,7 @@ impl Endpoint {
     /// Does not fail on a non-zero exit; the caller inspects `code`.
     ///
     /// This is a buffered capture path: nothing streams before the command exits.
-    pub fn ssh_until(&self, cmd: &str, deadline: Instant) -> Result<Run, DeadlineError> {
+    pub(crate) fn ssh_until(&self, cmd: &str, deadline: Instant) -> Result<Run, DeadlineError> {
         if Instant::now() >= deadline {
             return Err(DeadlineError::Timeout);
         }
@@ -219,7 +219,7 @@ impl Endpoint {
     /// Run `cmd` to completion, capturing output. No deadline: long exec payloads
     /// must not be killed by a budget they never opted into (R4/N1).
     /// [`Self::ssh_until`] is the deadline variant.
-    pub fn ssh(&self, cmd: &str) -> Result<Run> {
+    pub(crate) fn ssh(&self, cmd: &str) -> Result<Run> {
         let mut c = self.ssh_command(cmd);
         let out = output_plain(&mut c).map_err(|e| anyhow!("{e}"))?;
         Ok(run_from_output(out))
@@ -239,7 +239,7 @@ impl Endpoint {
     }
 
     /// Run `cmd`; error if it exits non-zero (with stderr in the message).
-    pub fn ssh_checked(&self, cmd: &str) -> Result<String> {
+    pub(crate) fn ssh_checked(&self, cmd: &str) -> Result<String> {
         let r = self.ssh(cmd)?;
         if !r.ok() {
             return Err(anyhow!(
@@ -253,7 +253,7 @@ impl Endpoint {
 
     /// Upload `local` to `remote`. No deadline on the plain path (R4/N1).
     /// `-r` lets directories copy whole and is a no-op for regular files.
-    pub fn scp_up(&self, local: &str, remote: &str) -> Result<()> {
+    pub(crate) fn scp_up(&self, local: &str, remote: &str) -> Result<()> {
         let mut c = self.scp_up_command(local, remote);
         let st = output_plain(&mut c).map_err(|e| anyhow!("{e}"))?;
         if !st.status.success() {
@@ -279,7 +279,7 @@ impl Endpoint {
         c
     }
 
-    pub fn scp_down(&self, remote: &str, local: &str) -> Result<()> {
+    pub(crate) fn scp_down(&self, remote: &str, local: &str) -> Result<()> {
         let mut c = Command::new("scp");
         for o in self.base_opts() {
             c.arg(o);
@@ -301,7 +301,7 @@ impl Endpoint {
 
     /// Poll until an `echo` over SSH succeeds (PUBLIC_KEY injection lags the endpoint by tens of seconds),
     /// or `timeout` elapses.
-    pub fn wait_ssh(&self, timeout: Duration) -> Result<()> {
+    pub(crate) fn wait_ssh(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Ok(r) = self.ssh_until("echo ok", deadline)

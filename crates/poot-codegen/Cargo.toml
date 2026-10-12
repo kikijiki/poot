@@ -8,6 +8,11 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# ADR-0113: `test_support::scripted_toolchain` has no production caller, only the executor and compiler tests
+# above this crate (dead-pub, POOT-664).
+test-support = []
+
 [dependencies]
 poot-kernel-ir.workspace = true
 poot-runtime-common.workspace = true
@@ -16,7 +21,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+# `no_contract_probe_kernel` (`poot_kernel_ir::test_support`, ADR-0113).
+poot-kernel-ir = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

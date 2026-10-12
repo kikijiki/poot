@@ -5,12 +5,19 @@
 //! that builds a [`Plan`] and its choice together, so a plan's key, body and launch are always the ones
 //! its choice names. The executor never reads the choice.
 
+use crate::planner::Lowering;
+use crate::planner::kg::Layout;
+use crate::refusal::Site;
+use crate::types::{Launch, ScratchDecl};
 use std::fmt;
 
 use poot_kernelgen::{KernelRequest, generate};
 use poot_target::{AieTargetId, Backend, DeviceCaps, TargetId};
 
-use crate::*;
+use crate::{Binding, Capability, Dispatch, DispatchPlan, ImportedKernel, Plan, PlanError};
+use poot_graph_ir::ValueId;
+use poot_kernel_ir::Body;
+use poot_tensor::DType;
 
 /// An equation that plans no kernel launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,8 +409,11 @@ fn imported_choice(
 
 #[cfg(test)]
 mod tests {
-    use poot_graph_ir::AttentionAttrs;
-    use poot_graph_ir::{Builder, TensorType};
+    use crate::planner::{Graph, OpKind};
+
+    use crate::production_plan::Submission;
+    use crate::types::DispatchPlanError;
+    use poot_graph_ir::{AttentionAttrs, Builder, TensorType};
     use poot_kernelgen::{
         AttentionSchedule, AttentionSpec, KeyBound, KeyLayout, MaskKind, ScoreTransform,
     };
@@ -411,18 +421,26 @@ mod tests {
     use poot_test_util::device_caps::default_caps_for;
 
     use super::*;
-    use crate::{CompileError, CompileOptions, Program, Submission, Target, compile};
+    use crate::{CompileError, CompileOptions, Program, Target, compile};
 
     /// A single-sequence decode attention (`d` head dim, `scale` attention scale), traced as the
     /// primitive chain `ops::attention_masked` builds; `compile` forms the flash op from it.
     fn flash_decode_graph(d: usize, scale: f32) -> Graph {
         let (hq, cap) = (2usize, 8usize);
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::new(vec![1, hq, 1, d], DType::F32));
-        let k = b.constant("k", TensorType::new(vec![1, hq, cap, d], DType::F32));
-        let v = b.constant("v", TensorType::new(vec![1, hq, cap, d], DType::F32));
-        let mask = b.constant("mask", TensorType::new(vec![1, 1, 1, cap], DType::F32));
-        let out = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, scale, mask);
+        let b = Builder::for_tests();
+        let q = b
+            .constant("q", TensorType::new(vec![1, hq, 1, d], DType::F32))
+            .unwrap();
+        let k = b
+            .constant("k", TensorType::new(vec![1, hq, cap, d], DType::F32))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::new(vec![1, hq, cap, d], DType::F32))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::new(vec![1, 1, 1, cap], DType::F32))
+            .unwrap();
+        let out = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, scale, mask).unwrap();
         b.finish(out).unwrap()
     }
 
@@ -493,12 +511,20 @@ mod tests {
     /// A graph holding one `Attention` decode with head dim `d`, staged directly.
     fn flash_decode_composite(d: usize) -> Graph {
         let (hq, cap) = (2usize, 8usize);
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::new(vec![1, hq, 1, d], DType::F32));
-        let k = b.constant("k", TensorType::new(vec![1, hq, cap, d], DType::F32));
-        let v = b.constant("v", TensorType::new(vec![1, hq, cap, d], DType::F32));
-        let mask = b.constant("mask", TensorType::new(vec![1, 1, 1, cap], DType::F32));
-        let mut plan = b.append_plan(0);
+        let b = Builder::for_tests();
+        let q = b
+            .constant("q", TensorType::new(vec![1, hq, 1, d], DType::F32))
+            .unwrap();
+        let k = b
+            .constant("k", TensorType::new(vec![1, hq, cap, d], DType::F32))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::new(vec![1, hq, cap, d], DType::F32))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::new(vec![1, 1, 1, cap], DType::F32))
+            .unwrap();
+        let mut plan = b.append_plan(0).unwrap();
         let out = plan
             .equation(
                 OpKind::Attention(AttentionAttrs::new(1, 0.5, None)),
@@ -771,9 +797,9 @@ mod tests {
             (&g).into(),
             eqn,
             backend,
-            poot_test_util::graph_fixtures::roomy_body_limits(),
+            crate::test_support::roomy_body_limits(),
         );
-        let planned = crate::gemv_chunks(
+        let planned = crate::predicates::gemv_chunks(
             site,
             backend,
             0,

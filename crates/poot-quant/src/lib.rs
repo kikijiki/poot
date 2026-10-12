@@ -19,6 +19,8 @@ pub mod plan;
 mod planar;
 pub mod scalar;
 mod stored;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 #[cfg(test)]
 mod tests;
 pub mod weights;
@@ -460,8 +462,8 @@ impl PackedComponentRef {
 ///
 /// Key convention: the GGUF loader stores a rank-3 expert tensor `key` as one entry per expert named
 /// `{key}.{expert}`, and a stack's [`weights::WeightView::ExpertStack`] lists those keys in expert order. Test
-/// fixtures that name a stack `S` hold its experts as `S.0`, `S.1`, .. (`poot_test_util::const_weights::ConstWeights`
-/// and `weight_map_oracle::expert_owners` read that spelling).
+/// fixtures that name a stack `S` hold its experts as `S.0`, `S.1`, .. (`poot-graph-ir`'s
+/// `test_support::const_weights::ConstWeights` and `weight_map_oracle::expert_owners` read that spelling).
 #[derive(Clone, Debug)]
 pub struct PackedStack {
     weight: PackedWeight,
@@ -584,6 +586,7 @@ impl Eq for PackedStackComponentRef {}
 /// weight's source is the stored runs its view reads (whole block rows of a fused entry, or several
 /// entries back to back, Card 564), which need not be one payload's whole source. A second copy of
 /// this function anywhere else is the bug Card 546a review found and fixed.
+#[cfg(any(test, feature = "test-support"))]
 pub fn packed_source_words(bytes: &[u8]) -> Vec<u32> {
     let mut words = Vec::with_capacity(bytes.len().div_ceil(4) + 1);
     words.extend(bytes.chunks(4).map(|chunk| {

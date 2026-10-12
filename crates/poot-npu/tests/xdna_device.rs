@@ -14,6 +14,8 @@
 
 use std::fs::File;
 
+use poot_eval::test_support::StepFixture;
+use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, Engine};
 use poot_executor_parity::Fixture;
 use poot_graph_ir::{BinOp, Builder, Graph, Outputs, Slot, SlotKey, StateRole, TensorType};
@@ -21,10 +23,8 @@ use poot_npu::{XdnaConfig, XdnaDevice};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::{DType, HostTensor};
-use poot_test_util::StepFixture;
-use poot_test_util::device_skip::open_or_skip;
-use poot_test_util::weight_map_oracle::oracle_for;
 
 /// The held lock and an engine over the NPU. The lock is released when this drops.
 struct Npu {

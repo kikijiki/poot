@@ -8,12 +8,17 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# ADR-0113: `test_support` holds the packed-payload and safetensors fixtures no production code calls
+# (card 671). Enabled only from `[dev-dependencies]` edges.
+test-support = []
+
 [dependencies]
 memmap2.workspace = true
 poot-tensor.workspace = true
 
 [dev-dependencies]
-poot-test-util.workspace = true
+poot-quant = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

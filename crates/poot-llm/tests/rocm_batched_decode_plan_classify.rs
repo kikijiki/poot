@@ -9,16 +9,15 @@
 
 #![cfg(feature = "rocm")]
 
-use poot_executor_parity::dense::{Dense, Family, paged_step};
-use poot_graph_plan::{Plan, prepare_target_graph};
+use poot_graph_plan::test_support::plan_eqn;
+use poot_graph_plan::{Plan, dtype_widen::prepare_target_graph};
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_models::model::{LogitRows, Phase};
-use poot_target::AmdArch;
-use poot_target::Backend;
+use poot_models::test_support::dense::{Dense, Family, paged_step};
+use poot_target::{AmdArch, Backend};
 use poot_tensor::DType;
-use poot_test_util::graph_fixtures::plan_eqn;
 
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 use std::collections::BTreeMap;
 
 /// qwen2.5-0.5b dims (a BF16 checkpoint of zeros: only the traced graph is read).
@@ -58,12 +57,13 @@ fn rocm_batched_decode_plan_classify_qwen2_n_slots_2() {
         .trace(
             Phase::Decode,
             paged_step(n_slots, 1, cap, pool_slots, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     // The pre-`compile` passes, so the equations classified are the fused ones `compile` plans: the
     // BF16 checkpoint's dense contractions are folded and its mixed-dtype matmuls widened as `compile` does.
-    let g = prepare_target_graph(&optimize(&g).unwrap(), backend).unwrap();
+    let g = prepare_target_graph(&passes_without_target(&g).unwrap(), backend).unwrap();
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
     for eqn in g.eqns() {
         let plan = plan_eqn(

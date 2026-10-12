@@ -11,8 +11,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DevicePlacement, ExpertPlacement, Partition, StageId,
-    Submission, TargetSet, WeightFormats, bind_packed_weights, compile_staged,
+    CompileLimits, CompileOptions, WeightFormats, bind_packed_weights, production_plan::Submission,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StageId,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_llm::driver::{
     BackendChoice, Driver, DriverOptions, GenerateRequest, LoadOptions, ModelHandle,
@@ -95,7 +96,7 @@ fn write_checkpoint(
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     tokenizer().save(dir.join("tokenizer.json"), false).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), store);
 }
 
 fn options() -> DriverOptions {
@@ -105,7 +106,7 @@ fn options() -> DriverOptions {
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(8),
-        max_trace_tokens: nz(64),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(64)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
@@ -138,7 +139,8 @@ fn generate(driver: &mut Driver, prompt: &[u32], max_new: usize) -> Vec<u32> {
 /// expert); the pool serves another expert's bytes and the tokens diverge from the literals.
 fn pooled_tokens_equal_the_recorded_literals(choice: BackendChoice, backend: DeviceBackend) {
     let (handle, dir) = load();
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -214,7 +216,13 @@ fn pooled_deepseek3_stages_run_the_contraction_and_pointwise_passes() {
         logits: LogitRows::Last,
         hidden: None,
     };
-    let graph = model.trace(Phase::Decode, shape).unwrap();
+    let graph = model
+        .trace(
+            Phase::Decode,
+            shape,
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     let formats = WeightFormats::from_weight_map(model.weights());
     let graph = bind_packed_weights(&graph, &formats).unwrap();
     let presets = [
@@ -228,7 +236,7 @@ fn pooled_deepseek3_stages_run_the_contraction_and_pointwise_passes() {
     ];
     for (label, backend, caps) in presets {
         let target = poot_graph_plan::Target::Gpu { backend, caps };
-        let device = poot_graph_plan::DeviceId(0);
+        let device = poot_graph_plan::multi_device::topology::DeviceId(0);
         let compile = |experts| {
             compile_staged(
                 &graph,

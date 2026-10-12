@@ -34,7 +34,7 @@ use poot_kernel_ir::{
 };
 
 /// Copy-propagate reference/slice reborrow aliases and drop redundant Assert-derived trap edges.
-pub fn normalize(mut body: Body) -> Body {
+pub(crate) fn normalize(mut body: Body) -> Body {
     let aliases = collect_ref_aliases(&body);
     if !aliases.is_empty() {
         for bb in &mut body.blocks {

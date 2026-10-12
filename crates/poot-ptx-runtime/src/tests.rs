@@ -1,5 +1,17 @@
 use super::*;
+use crate::buffer::test_only::checked_buffer;
+use crate::buffer::{allocate_owned, checked_copy, checked_layout};
+use crate::context::{KernelArgs, require_gpu_check_with};
+use crate::driver::CudaDriver;
+use crate::graph::{CaptureRetention, ModuleConstruction, create_event_pair, instantiate_graph};
+use crate::owner::{PtxOwner, construct_owner};
 use crate::upload::UploadRing;
+use cudarc::driver::{DriverError, result, sys};
+use poot_runtime_common::BufferRole;
+use poot_target::BufferStorage;
+use poot_target::ElementKind;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 mod require_backend_tests {
     use super::require_gpu_check_with;
@@ -879,14 +891,11 @@ fn captured_graph_owns_dispatched_buffers_until_it_drops() {
 #[test]
 fn every_non_dispatch_operation_refuses_while_a_capture_is_open() {
     type Operation = fn(&PtxContext, &PtxBuffer) -> Result<(), PtxError>;
-    let operations: [(&str, Operation); 14] = [
+    let operations: [(&str, Operation); 13] = [
         ("synchronize", |ctx, _| ctx.synchronize()),
         ("upload_f32", |ctx, _| ctx.upload_f32(&[1.0]).map(drop)),
         ("upload_i32", |ctx, _| ctx.upload_i32(&[1]).map(drop)),
         ("alloc_f32", |ctx, _| ctx.alloc_f32(1).map(drop)),
-        ("upload_bf16_bytes", |ctx, _| {
-            ctx.upload_bf16_bytes(&[0, 0]).map(drop)
-        }),
         ("upload_f16", |ctx, _| ctx.upload_f16(&[0, 0]).map(drop)),
         ("update_f32", |ctx, buf| ctx.update_f32(buf, &[1.0; 4])),
         ("write_with", |ctx, buf| {
@@ -1106,7 +1115,7 @@ fn narrow_buffer_rejected_by_f32_operation_before_copy() {
 }
 
 /// Card 527 (R484-001, R471-009), mechanism-level (the production bind-path acceptance evidence is
-/// `poot-ptx-gpu`'s `bind_value_for_capture_bf16_cache_mismatch_is_a_typed_refusal`, card 527): `bf16_packed()` canonicalizes on `ElementKind::I32` (review F2), the one word PTX's packed
+/// `poot-ptx-device`'s `bind_value_for_capture_bf16_cache_mismatch_is_a_typed_refusal`, card 527): `bf16_packed()` canonicalizes on `ElementKind::I32` (review F2), the one word PTX's packed
 /// upload would use if it ever packed (it does not - Nvptx never selects `Bf16Packed`, but the shared
 /// `poot-target` type still has to compare correctly for the backends that do). A packed-BF16 value and
 /// a plain dense I32 value share native element kind; only `checked_copy`'s full `BufferStorage`
@@ -1373,7 +1382,7 @@ fn native_buffer_contract_roundtrip_ptx() {
     );
     assert_eq!(f32_buffer.elem_count(), 4);
     assert_eq!(f32_buffer.byte_capacity(), 16);
-    assert_eq!(f32_buffer.element(), BufferElement::F32);
+    assert_eq!(f32_buffer.element(), ElementKind::F32);
 
     let i32_buffer = ctx.upload_i32(&[1, 2, 3, 4]).expect("upload i32");
     assert_eq!(
@@ -1382,14 +1391,14 @@ fn native_buffer_contract_roundtrip_ptx() {
     );
     assert_eq!(i32_buffer.elem_count(), 4);
     assert_eq!(i32_buffer.byte_capacity(), 16);
-    assert_eq!(i32_buffer.element(), BufferElement::I32);
+    assert_eq!(i32_buffer.element(), ElementKind::I32);
 
     let f16 = ctx
         .upload_f16(&[0x00, 0x3c, 0x00, 0xc0])
         .expect("upload f16");
     assert_eq!(f16.elem_count(), 2);
     assert_eq!(f16.byte_capacity(), 4);
-    assert_eq!(f16.element(), BufferElement::F16);
+    assert_eq!(f16.element(), ElementKind::F16);
     assert!(matches!(
         ctx.download_f32(&f16),
         Err(PtxError::RepresentationMismatch { .. })
@@ -1414,7 +1423,7 @@ fn native_buffer_contract_roundtrip_ptx() {
 /// `n` `(a, b, c, d)` rows where `a*b - c*d` computed with two separate f32 roundings differs from the
 /// same expression with the second multiply and the subtract fused into one rounding step - i.e.
 /// genuinely FMA-sensitive rows, found by a small deterministic search (splitmix64). Mirrors
-/// `poot-runtime`'s and `poot-rocm-runtime`'s own `no_contract_fma_sensitive_rows` (kept crate-local
+/// `poot-wgpu-runtime`'s and `poot-rocm-runtime`'s own `no_contract_fma_sensitive_rows` (kept crate-local
 /// rather than shared, matching this crate's existing self-contained-fixture style).
 fn no_contract_fma_sensitive_rows(n: usize) -> Vec<(f32, f32, f32, f32)> {
     let mut state = 0x2545_F491_4F6C_DD1Du64;
@@ -1438,12 +1447,12 @@ fn no_contract_fma_sensitive_rows(n: usize) -> Vec<(f32, f32, f32, f32)> {
     rows
 }
 
-/// Compile `poot_test_util::kernel_fixtures::no_contract_probe_kernel(marked)` for `Target::Nvptx` through the
+/// Compile `poot_kernel_ir::test_support::no_contract_probe_kernel(marked)` for `Target::Nvptx` through the
 /// real production toolchain (the same `poot_codegen::compile`/`kernel_handle` pair every other backend's
-/// device test uses - `poot-runtime`'s `no_contract_tests`, `poot-rocm-runtime`'s `no_contract_*`).
+/// device test uses - `poot-wgpu-runtime`'s `no_contract_tests`, `poot-rocm-runtime`'s `no_contract_*`).
 fn no_contract_nvptx_kernel(marked: bool) -> poot_runtime_common::CompiledKernel {
     let tag = if marked { "marked" } else { "unmarked" };
-    let body = poot_test_util::kernel_fixtures::no_contract_probe_kernel(marked);
+    let body = poot_kernel_ir::test_support::no_contract_probe_kernel(marked);
     let dir = std::env::temp_dir().join("poot-ptx-runtime-no-contract-test");
     std::fs::create_dir_all(&dir).expect("create fixture artifact dir");
     let out = poot_codegen::artifact_path(

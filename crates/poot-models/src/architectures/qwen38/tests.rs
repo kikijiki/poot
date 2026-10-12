@@ -122,7 +122,7 @@ mod reference {
     impl Cfg {
         fn new(config: &serde_json::Value) -> Self {
             let t = &config["text_config"];
-            let n = |f: &str| t[f].as_u64().unwrap() as usize;
+            let n = |f: &str| crate::registry::Fixture::count(t, f);
             let head_dim = n("head_dim");
             let params = Qwen4ExpParams::from_raw(&RawConfig::HfJson {
                 config,
@@ -781,7 +781,13 @@ impl Case {
             logits: LogitRows::All,
             hidden: None,
         };
-        let g = model.trace(Phase::Prefill, shape).unwrap();
+        let g = model
+            .trace(
+                Phase::Prefill,
+                shape,
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         g.state()
             .map(|(input, _)| g.meta(input).name.clone().expect("state is named"))
             .collect()
@@ -993,7 +999,11 @@ fn a_shape_off_the_granule_is_a_typed_refusal() {
         (Phase::Prefill, 4, 7),
     ] {
         let refusal = model
-            .trace(phase, shape(tokens, capacity))
+            .trace(
+                phase,
+                shape(tokens, capacity),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .expect_err("an off-granule shape is refused");
         assert!(
             matches!(
@@ -1006,8 +1016,24 @@ fn a_shape_off_the_granule_is_a_typed_refusal() {
             "{tokens} tokens over {capacity}: {refusal:?}"
         );
     }
-    assert!(model.trace(Phase::Prefill, shape(4, 8)).is_ok());
-    assert!(model.trace(Phase::Decode, shape(1, 8)).is_ok());
+    assert!(
+        model
+            .trace(
+                Phase::Prefill,
+                shape(4, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            )
+            .is_ok()
+    );
+    assert!(
+        model
+            .trace(
+                Phase::Decode,
+                shape(1, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            )
+            .is_ok()
+    );
 }
 
 /// SC-006 (the model's half): the PLE reads the token history through the carried state. The same
@@ -1116,7 +1142,13 @@ fn an_out_of_vocabulary_token_is_a_typed_validation_fault() {
         logits: LogitRows::All,
         hidden: None,
     };
-    let g = model.trace(Phase::Prefill, shape).unwrap();
+    let g = model
+        .trace(
+            Phase::Prefill,
+            shape,
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     let witnesses: Vec<usize> = g
         .witnesses()
         .filter_map(|v| PleWitness::decode(v.id))
@@ -1145,7 +1177,13 @@ fn packed_experts_trace_as_packed_weights_and_dense_ones_as_stored_stacks() {
     };
     let analyze = |fixture: &Fixture| {
         let model = built(fixture);
-        let g = model.trace(Phase::Prefill, shape).unwrap();
+        let g = model
+            .trace(
+                Phase::Prefill,
+                shape,
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
         let bound = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
         let dequants = bound
@@ -1494,12 +1532,10 @@ fn a_checkpoint_with_sharded_ple_tables_matches_the_single_table() {
             poot_tensor::DType::F32,
             vec![],
             1.0f32.to_le_bytes().to_vec().into(),
-        );
+        )
+        .unwrap();
         store
-            .insert(
-                format!("{table}.weight_scale"),
-                WeightEntry::Dense(one.unwrap()),
-            )
+            .insert(format!("{table}.weight_scale"), WeightEntry::Dense(one))
             .unwrap();
     }
     let store = store.build();

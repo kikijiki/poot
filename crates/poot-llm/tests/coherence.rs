@@ -187,7 +187,7 @@ fn gptoss_20b_gguf_harmony_chat_template_renders() {
     };
     let bos = tok_at("tokenizer.ggml.bos_token_id");
     let eos = tok_at("tokenizer.ggml.eos_token_id");
-    let rendered = poot_llm::render_jinja_value(
+    let rendered = poot_text::render_jinja_value(
         tmpl,
         &serde_json::json!([{"role": "user", "content": "What is the capital of France?"}]),
         bos.as_deref(),

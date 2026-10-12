@@ -15,15 +15,14 @@ poot-models.workspace = true
 poot-eval.workspace = true
 poot-target.workspace = true
 poot-load.workspace = true
-poot-gpu.workspace = true
-poot-ptx-gpu.workspace = true
+poot-wgpu-device.workspace = true
+poot-ptx-device.workspace = true
 poot-vulkan-device.workspace = true
-poot-rocm-gpu = { workspace = true, optional = true }
+poot-rocm-device = { workspace = true, optional = true }
+# Tokenization, chat templates and guided constraints: the checkpoint's text services.
+poot-text.workspace = true
+# The multimodal front end loads its own tokenizer for the mrope special tokens.
 tokenizers.workspace = true
-# Guided decoding: byte-level DFA for regex-constrained generation.
-regex-automata.workspace = true
-minijinja.workspace = true
-minijinja-contrib.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image.workspace = true
@@ -50,23 +49,38 @@ poot-kernel-ir.workspace = true
 poot-profile.workspace = true
 
 [dev-dependencies]
+poot-text = { workspace = true, features = ["test-support"] }
+# The sampler tests check guided masks against a reference regex engine.
+regex-automata.workspace = true
+poot-kernel-ir = { workspace = true, features = ["test-support"] }
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+poot-kernelgen.workspace = true
+poot-graph-plan = { workspace = true, features = ["test-support"] }
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+poot-eval = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
 # The `cli` feature for this package's own tests: it builds the `poot-generate` binary, which the
 # `tests/poot_generate_cli.rs` rows spawn (`CARGO_BIN_EXE_poot-generate`), in every lane that builds the tests.
 poot-llm = { workspace = true, features = ["cli"] }
+# `write_gguf` and `sha256_digest`, the checkpoint writer and hasher the driver tests build with (ADR-0113).
+poot-load = { workspace = true, features = ["test-support"] }
+# `has_device_timestamps`, the adapter probe the staged-timing row skips on (ADR-0113).
+poot-wgpu-device = { workspace = true, features = ["test-support"] }
 # The APNG fixtures of the Qwen2.5-VL video tests are stored base64-encoded.
 base64.workspace = true
 # The examples (`examples/`) are binaries and use it directly.
 anyhow.workspace = true
-poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
-# The dense family fixtures (`poot_executor_parity::dense`): the graphs the plan and equivalence tests trace.
+poot-test-util.workspace = true
 poot-executor-parity.workspace = true
+# The dense family fixtures (`poot_models::test_support::dense`): the graphs the plan and equivalence tests trace.
+poot-models = { workspace = true, features = ["test-support"] }
 # `AmdArch` (poot-codegen) for a CPU-only `#[cfg(feature = "rocm")]` test that classifies prefill-graph
 # eqns without touching a GPU (no HSA/driver linkage).
 poot-codegen.workspace = true
 # The boxed-cause chain test constructs each backend's runtime error type to check that `source()` reaches
 # it. Already transitive dependencies of the backend crates; listed only so the test can name the types.
 # No driver linkage; construction touches no device.
-poot-runtime.workspace = true
+poot-wgpu-runtime.workspace = true
 poot-ptx-runtime.workspace = true
 poot-rocm-runtime.workspace = true
 
@@ -75,7 +89,11 @@ poot-rocm-runtime.workspace = true
 # cannot carry its own dependency).
 cli = ["dep:anyhow", "dep:clap", "dep:tracing-subscriber"]
 # ROCm/HSA GPU path.
-rocm = ["dep:poot-rocm-gpu"]
+rocm = ["dep:poot-rocm-device"]
+# ADR-0113: `Budget::with`, the budget builder poot-serve's engine-plan tests assemble device budgets with;
+# no production caller (the production budget is observed from the device). Enabled only from
+# `[dev-dependencies]` edges.
+test-support = []
 
 [lib]
 name = "poot_llm"

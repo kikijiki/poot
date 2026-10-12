@@ -1,0 +1,44 @@
+//! Card 516a F1: `--pcie-publication-receipt` sets `HSA_ALLOCATE_QUEUE_DEV_MEM` itself, so a launch
+//! without it reaches the device checks instead of failing the queue-ring provenance check. On an APU
+//! that means the documented SKIP (exit 0); on a host with no device (hidden, or no /dev/kfd) it means
+//! the binary's typed no-device exit (status 2); on a discrete GPU the receipt runs. Removing the binary's own `set_var` fails every case with the
+//! provenance conflict.
+
+use poot_test_util::contained_child::ContainChild;
+use std::process::Command;
+
+#[test]
+fn pcie_receipt_without_the_env_reaches_the_device_checks() {
+    // `std::env::var`, not `env!`: the latter bakes the path into this test binary's compiled object code
+    // at build time, and a shared compile cache (kache) that reuses that object across worktrees by
+    // source-content hash would then serve whichever worktree's path happened to compile it first
+    // (card 530's build.rs fix; card 543 review). `std::env::var` reads the environment cargo sets fresh
+    // for every test-binary invocation, so it is correct regardless of which worktree compiled the binary.
+    let output = Command::new(
+        std::env::var("CARGO_BIN_EXE_rocm-check")
+            .expect("CARGO_BIN_EXE_rocm-check must be set by cargo for test binaries"),
+    )
+    .contained()
+    .arg("--pcie-publication-receipt")
+    .env_remove("HSA_ALLOCATE_QUEUE_DEV_MEM")
+    // Required-backend switches turn the APU skip into a failure by design; this row checks the
+    // unrequired launch.
+    .env_remove("POOT_REQUIRE_ROCM")
+    .output()
+    .expect("run rocm-check");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let skipped_on_apu = output.status.success()
+        && stdout.contains("SKIP: --pcie-publication-receipt requires a discrete PCIe GPU");
+    let receipt_passed = output.status.success() && stdout.contains("OK: pcie-publication-receipt");
+    // The binary's own typed no-device exit: status 2 and the `no ROCm device:` message, which it
+    // emits for a missing HSA library, no GPU agent, or no /dev/kfd (hsa_init OUT_OF_RESOURCES).
+    let no_device = output.status.code() == Some(2) && stderr.starts_with("no ROCm device: ");
+    assert!(
+        skipped_on_apu || receipt_passed || no_device,
+        "expected the APU skip, a passing receipt, or a missing-device error; got status {:?}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+}

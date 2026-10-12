@@ -28,15 +28,20 @@ fn scalar_decay_decode(
     decay: f32,
     s_in: Traced,
 ) -> (Traced, Traced) {
-    let k = repeat_kv(b, k, n_rep);
-    let v = repeat_kv(b, v, n_rep);
-    let outer = b.matmul(b.transpose(k, vec![0, 1, 3, 2]), v);
-    let s_out = b.binary(
-        BinOp::Add,
-        b.binary_scalar(BinOp::Mul, s_in, poot_graph_ir::types::Scalar::F32(decay)),
-        outer,
-    );
-    (b.matmul(q, s_out), s_out)
+    let k = repeat_kv(b, k, n_rep).unwrap();
+    let v = repeat_kv(b, v, n_rep).unwrap();
+    let outer = b
+        .matmul(b.transpose(k, vec![0, 1, 3, 2]).unwrap(), v)
+        .unwrap();
+    let s_out = b
+        .binary(
+            BinOp::Add,
+            b.binary_scalar(BinOp::Mul, s_in, poot_graph_ir::types::Scalar::F32(decay))
+                .unwrap(),
+            outer,
+        )
+        .unwrap();
+    (b.matmul(q, s_out).unwrap(), s_out)
 }
 
 /// Stage one `Attention { softcap: None }` over `[q, k, v, mask]`. Card 557: `Builder` has no
@@ -49,7 +54,7 @@ fn stage_flash_prefill(
     n_rep: usize,
     scale: f32,
 ) -> Traced {
-    let mut plan = b.append_plan(0);
+    let mut plan = b.append_plan(0).unwrap();
     let out = plan
         .equation(
             OpKind::Attention(AttentionAttrs::new(n_rep, scale, None)),
@@ -107,17 +112,27 @@ fn linear_attention_decode_gated_fuzz_matches_recurrence() {
         }
 
         // build the one-step decode graph carrying S [1,Hq,D_k,D_v].
-        let b = Builder::new();
-        let qc = b.constant("q", TensorType::f32(vec![1, hq, 1, dk]));
-        let kc = b.constant("k", TensorType::f32(vec![1, hkv, 1, dk]));
-        let vc = b.constant("v", TensorType::f32(vec![1, hkv, 1, dv]));
-        let s_in = b.state_input(
-            "s",
-            TensorType::f32(vec![1, hq, dk, dv]),
-            StateRole::Recurrent,
-        );
-        let gc = b.constant("g", TensorType::f32(vec![1, hq, dk, 1]));
-        let (o, s_out) = linear_attention_decode_gated(&b, qc, kc, vc, n_rep, gc, s_in);
+        let b = Builder::for_tests();
+        let qc = b
+            .constant("q", TensorType::f32(vec![1, hq, 1, dk]))
+            .unwrap();
+        let kc = b
+            .constant("k", TensorType::f32(vec![1, hkv, 1, dk]))
+            .unwrap();
+        let vc = b
+            .constant("v", TensorType::f32(vec![1, hkv, 1, dv]))
+            .unwrap();
+        let s_in = b
+            .state_input(
+                "s",
+                TensorType::f32(vec![1, hq, dk, dv]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let gc = b
+            .constant("g", TensorType::f32(vec![1, hq, dk, 1]))
+            .unwrap();
+        let (o, s_out) = linear_attention_decode_gated(&b, qc, kc, vc, n_rep, gc, s_in).unwrap();
         let g = b
             .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s_in, s_out)]))
             .unwrap();
@@ -235,19 +250,23 @@ fn mamba2_ssd_decode_fuzz_matches_recurrence() {
             }
         }
 
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, hq, 1, p]));
-        let bin = b.constant("b", TensorType::f32(vec![1, hq, 1, n]));
-        let cin = b.constant("c", TensorType::f32(vec![1, hq, 1, n]));
-        let delta = b.constant("dl", TensorType::f32(vec![1, hq, 1, 1]));
-        let a = b.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
-        let dsk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
-        let h_in = b.state_input(
-            "h",
-            TensorType::f32(vec![1, hq, n, p]),
-            StateRole::Recurrent,
-        );
-        let (y, h_out) = mamba2_ssd_decode(&b, x, bin, cin, delta, a, dsk, h_in);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, hq, 1, p])).unwrap();
+        let bin = b.constant("b", TensorType::f32(vec![1, hq, 1, n])).unwrap();
+        let cin = b.constant("c", TensorType::f32(vec![1, hq, 1, n])).unwrap();
+        let delta = b
+            .constant("dl", TensorType::f32(vec![1, hq, 1, 1]))
+            .unwrap();
+        let a = b.constant("a", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+        let dsk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+        let h_in = b
+            .state_input(
+                "h",
+                TensorType::f32(vec![1, hq, n, p]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let (y, h_out) = mamba2_ssd_decode(&b, x, bin, cin, delta, a, dsk, h_in).unwrap();
         let g = b
             .finish(poot_graph_ir::Outputs::new(y).with_state(&[(h_in, h_out)]))
             .unwrap();
@@ -372,19 +391,33 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
         }
 
         // (1) decode loop, L steps from a zero state (ground truth).
-        let bd = Builder::new();
-        let xd = bd.constant("x", TensorType::f32(vec![1, hq, 1, p]));
-        let bind = bd.constant("b", TensorType::f32(vec![1, hq, 1, n]));
-        let cind = bd.constant("c", TensorType::f32(vec![1, hq, 1, n]));
-        let deltad = bd.constant("dl", TensorType::f32(vec![1, hq, 1, 1]));
-        let ad = bd.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
-        let dskd = bd.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
-        let h_ind = bd.state_input(
-            "h",
-            TensorType::f32(vec![1, hq, n, p]),
-            StateRole::Recurrent,
-        );
-        let (yd, h_outd) = mamba2_ssd_decode(&bd, xd, bind, cind, deltad, ad, dskd, h_ind);
+        let bd = Builder::for_tests();
+        let xd = bd
+            .constant("x", TensorType::f32(vec![1, hq, 1, p]))
+            .unwrap();
+        let bind = bd
+            .constant("b", TensorType::f32(vec![1, hq, 1, n]))
+            .unwrap();
+        let cind = bd
+            .constant("c", TensorType::f32(vec![1, hq, 1, n]))
+            .unwrap();
+        let deltad = bd
+            .constant("dl", TensorType::f32(vec![1, hq, 1, 1]))
+            .unwrap();
+        let ad = bd
+            .constant("a", TensorType::f32(vec![1, hq, 1, 1]))
+            .unwrap();
+        let dskd = bd
+            .constant("d", TensorType::f32(vec![1, hq, 1, 1]))
+            .unwrap();
+        let h_ind = bd
+            .state_input(
+                "h",
+                TensorType::f32(vec![1, hq, n, p]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let (yd, h_outd) = mamba2_ssd_decode(&bd, xd, bind, cind, deltad, ad, dskd, h_ind).unwrap();
         let gd = bd
             .finish(poot_graph_ir::Outputs::new(yd).with_state(&[(h_ind, h_outd)]))
             .unwrap();
@@ -442,19 +475,38 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
         let want_h = hstate.as_f32().unwrap().to_vec(); // [1,Hq,N,P] head-major already
 
         // (2) one-shot prefill graph over all L positions (head-major [1,Hq,L,*] layout).
-        let bp = Builder::new();
-        let xp = bp.constant("x", TensorType::f32(vec![1, hq, l, p]));
-        let binp = bp.constant("b", TensorType::f32(vec![1, hq, l, n]));
-        let cinp = bp.constant("c", TensorType::f32(vec![1, hq, l, n]));
-        let deltap = bp.constant("dl", TensorType::f32(vec![1, hq, l, 1]));
-        let ap = bp.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
-        let dskp = bp.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
-        let trilp = bp.constant("tr", TensorType::f32(vec![1, hq, l, l]));
-        let h0p = bp.constant("h0", TensorType::f32(vec![1, hq, n, p]));
-        let (yp, h_outp) = mamba2_ssd_prefill(&bp, xp, binp, cinp, deltap, ap, dskp, h0p, trilp);
-        let gy = bp.finish(yp).unwrap();
-        let gh = poot_test_util::graph_fixtures::derive(&gy, |draft| draft.set_result(h_outp.id()))
+        let bp = Builder::for_tests();
+        let xp = bp
+            .constant("x", TensorType::f32(vec![1, hq, l, p]))
             .unwrap();
+        let binp = bp
+            .constant("b", TensorType::f32(vec![1, hq, l, n]))
+            .unwrap();
+        let cinp = bp
+            .constant("c", TensorType::f32(vec![1, hq, l, n]))
+            .unwrap();
+        let deltap = bp
+            .constant("dl", TensorType::f32(vec![1, hq, l, 1]))
+            .unwrap();
+        let ap = bp
+            .constant("a", TensorType::f32(vec![1, hq, 1, 1]))
+            .unwrap();
+        let dskp = bp
+            .constant("d", TensorType::f32(vec![1, hq, 1, 1]))
+            .unwrap();
+        let trilp = bp
+            .constant("tr", TensorType::f32(vec![1, hq, l, l]))
+            .unwrap();
+        let h0p = bp
+            .constant("h0", TensorType::f32(vec![1, hq, n, p]))
+            .unwrap();
+        let (yp, h_outp) =
+            mamba2_ssd_prefill(&bp, xp, binp, cinp, deltap, ap, dskp, h0p, trilp).unwrap();
+        let gy = bp.finish(yp).unwrap();
+        let gh = poot_graph_ir::test_support::graph_fixtures::derive(&gy, |draft| {
+            draft.set_result(h_outp.id())
+        })
+        .unwrap();
 
         // Reindex the step-major generated data into head-major [Hq,L,*] for the prefill inputs.
         let mut x_hm = vec![0.0f32; hq * l * p];
@@ -567,15 +619,17 @@ fn causal_conv1d_decode_fuzz_matches_reference() {
             }
         }
 
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 1, c]));
-        let w = b.constant("w", TensorType::f32(vec![kk, c]));
-        let cache = b.state_input(
-            "cv",
-            TensorType::f32(vec![1, kk - 1, c]),
-            StateRole::Recurrent,
-        );
-        let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, kk);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 1, c])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![kk, c])).unwrap();
+        let cache = b
+            .state_input(
+                "cv",
+                TensorType::f32(vec![1, kk - 1, c]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, kk).unwrap();
         let g = b
             .finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, new_cache)]))
             .unwrap();
@@ -680,15 +734,17 @@ fn causal_conv1d_decode_batch_generalizes_from_batch1() {
     // --- (a) B=1 regression check: one row at a time through causal_conv1d_decode alone. ---
     let single_outputs: Vec<Vec<Vec<f32>>> = (0..b_batch)
         .map(|row| {
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32(vec![1, 1, c]));
-            let w = b.constant("w", TensorType::f32(vec![k, c]));
-            let cache = b.state_input(
-                "cache",
-                TensorType::f32(vec![1, k - 1, c]),
-                StateRole::Recurrent,
-            );
-            let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k);
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![1, 1, c])).unwrap();
+            let w = b.constant("w", TensorType::f32(vec![k, c])).unwrap();
+            let cache = b
+                .state_input(
+                    "cache",
+                    TensorType::f32(vec![1, k - 1, c]),
+                    StateRole::Recurrent,
+                )
+                .unwrap();
+            let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k).unwrap();
             let g = b
                 .finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, new_cache)]))
                 .unwrap();
@@ -734,22 +790,26 @@ fn causal_conv1d_decode_batch_generalizes_from_batch1() {
     }
 
     // --- (b) B=3 batched call: the same 3 rows, packed together into ONE call per step. ---
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![b_batch, 1, c]));
-    let w = b.constant("w", TensorType::f32(vec![k, c]));
-    let cache = b.state_input(
-        "cache",
-        TensorType::f32(vec![b_batch, k - 1, c]),
-        StateRole::Recurrent,
-    );
-    let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::f32(vec![b_batch, 1, c]))
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![k, c])).unwrap();
+    let cache = b
+        .state_input(
+            "cache",
+            TensorType::f32(vec![b_batch, k - 1, c]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k).unwrap();
     assert_eq!(
-        b.aval(out).shape,
+        b.aval(out).unwrap().shape,
         vec![b_batch, 1, c],
         "batched out shape [B,1,C]"
     );
     assert_eq!(
-        b.aval(new_cache).shape,
+        b.aval(new_cache).unwrap().shape,
         vec![b_batch, k - 1, c],
         "batched new_cache shape [B,K-1,C]"
     );
@@ -842,10 +902,12 @@ fn decay_mask_from_gates_fuzz_matches_cumprod() {
                 }
             }
         }
-        let b = Builder::new();
-        let gates = b.constant("g", TensorType::f32(vec![1, hh, 1, l]));
-        let tr = b.constant("tr", TensorType::f32(vec![1, hh, l, l]));
-        let m = decay_mask_from_gates(&b, gates, tr, hh, l);
+        let b = Builder::for_tests();
+        let gates = b.constant("g", TensorType::f32(vec![1, hh, 1, l])).unwrap();
+        let tr = b
+            .constant("tr", TensorType::f32(vec![1, hh, l, l]))
+            .unwrap();
+        let m = decay_mask_from_gates(&b, gates, tr, hh, l).unwrap();
         let g = b.finish(m).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
@@ -909,13 +971,17 @@ fn flash_prefill_matches_materialized_attention_prefill() {
             .collect();
 
         let build = |sel: u8| -> HostTensor {
-            let b = Builder::new();
-            let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
-            let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
-            let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-            let m = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
+            let b = Builder::for_tests();
+            let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+            let k = b
+                .constant("k", TensorType::f32(vec![1, hkv, l, d]))
+                .unwrap();
+            let v = b
+                .constant("v", TensorType::f32(vec![1, hkv, l, d]))
+                .unwrap();
+            let m = b.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
             let o = match sel {
-                0 => attention_prefill(&b, q, k, v, n_rep, scale, m),
+                0 => attention_prefill(&b, q, k, v, n_rep, scale, m).unwrap(),
                 _ => stage_flash_prefill(&b, [q, k, v, m], n_rep, scale),
             };
             let g = b.finish(o).unwrap();
@@ -986,13 +1052,17 @@ fn flash_attention_matches_f64_reference_at_real_head_dim_and_sink_outlier() {
         .collect();
 
     let build = |sel: u8| -> HostTensor {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-        let m = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hkv, l, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hkv, l, d]))
+            .unwrap();
+        let m = b.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
         let o = match sel {
-            0 => attention_prefill(&b, q, k, v, n_rep, scale, m),
+            0 => attention_prefill(&b, q, k, v, n_rep, scale, m).unwrap(),
             _ => stage_flash_prefill(&b, [q, k, v, m], n_rep, scale),
         };
         let g = b.finish(o).unwrap();
@@ -1089,19 +1159,29 @@ fn hybrid_model_decode_loop_matches_prefill() {
     let (l0, l1) = (lw(0), lw(1));
 
     let to_heads = |b: &Builder, t: Traced, heads: usize, tt: usize| -> Traced {
-        b.transpose(b.reshape(t, vec![1, tt, heads, d]), vec![0, 2, 1, 3])
+        b.transpose(
+            b.reshape(t, vec![1, tt, heads, d]).unwrap(),
+            vec![0, 2, 1, 3],
+        )
+        .unwrap()
     };
     let from_heads = |b: &Builder, o: Traced, tt: usize| -> Traced {
-        b.reshape(b.transpose(o, vec![0, 2, 1, 3]), vec![1, tt, qdim])
+        b.reshape(b.transpose(o, vec![0, 2, 1, 3]).unwrap(), vec![1, tt, qdim])
+            .unwrap()
     };
     // constants for one layer's weights; returns the 5 ids in order.
     let mk_w = |b: &Builder, p: &str| -> [Traced; 5] {
         [
-            b.constant(&format!("{p}n"), TensorType::f32(vec![h])),
-            b.constant(&format!("{p}q"), TensorType::f32(vec![h, qdim])),
-            b.constant(&format!("{p}k"), TensorType::f32(vec![h, kvd])),
-            b.constant(&format!("{p}v"), TensorType::f32(vec![h, kvd])),
-            b.constant(&format!("{p}o"), TensorType::f32(vec![qdim, h])),
+            b.constant(&format!("{p}n"), TensorType::f32(vec![h]))
+                .unwrap(),
+            b.constant(&format!("{p}q"), TensorType::f32(vec![h, qdim]))
+                .unwrap(),
+            b.constant(&format!("{p}k"), TensorType::f32(vec![h, kvd]))
+                .unwrap(),
+            b.constant(&format!("{p}v"), TensorType::f32(vec![h, kvd]))
+                .unwrap(),
+            b.constant(&format!("{p}o"), TensorType::f32(vec![qdim, h]))
+                .unwrap(),
         ]
     };
     type LayerW = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -1129,8 +1209,8 @@ fn hybrid_model_decode_loop_matches_prefill() {
     };
 
     // --- prefill: x[1,L,H] -> linear layer -> softmax layer -> [1,L,H] ---
-    let bp = Builder::new();
-    let xp = bp.constant("x", TensorType::f32(vec![1, l, h]));
+    let bp = Builder::for_tests();
+    let xp = bp.constant("x", TensorType::f32(vec![1, l, h])).unwrap();
     let w0 = mk_w(&bp, "a"); // layer 0 (linear)
     let w1 = mk_w(&bp, "b"); // layer 1 (softmax)
     let mut dm = vec![0.0f32; l * l]; // linear decay-causal mask
@@ -1144,30 +1224,38 @@ fn hybrid_model_decode_loop_matches_prefill() {
             }
         }
     }
-    let cmd = bp.constant("dm", TensorType::f32(vec![1, 1, l, l]));
-    let cmc = bp.constant("cm", TensorType::f32(vec![1, 1, l, l]));
+    let cmd = bp
+        .constant("dm", TensorType::f32(vec![1, 1, l, l]))
+        .unwrap();
+    let cmc = bp
+        .constant("cm", TensorType::f32(vec![1, 1, l, l]))
+        .unwrap();
     // layer 0 (linear)
-    let n0 = rmsnorm(&bp, xp, w0[0], eps);
-    let q0 = to_heads(&bp, linear(&bp, n0, w0[1], None), hq, l);
-    let k0 = to_heads(&bp, linear(&bp, n0, w0[2], None), hkv, l);
-    let v0 = to_heads(&bp, linear(&bp, n0, w0[3], None), hkv, l);
-    let o0 = linear_attention_prefill(&bp, q0, k0, v0, n_rep, cmd);
-    let x1 = bp.binary(
-        BinOp::Add,
-        xp,
-        linear(&bp, from_heads(&bp, o0, l), w0[4], None),
-    );
+    let n0 = rmsnorm(&bp, xp, w0[0], eps).unwrap();
+    let q0 = to_heads(&bp, linear(&bp, n0, w0[1], None).unwrap(), hq, l);
+    let k0 = to_heads(&bp, linear(&bp, n0, w0[2], None).unwrap(), hkv, l);
+    let v0 = to_heads(&bp, linear(&bp, n0, w0[3], None).unwrap(), hkv, l);
+    let o0 = linear_attention_prefill(&bp, q0, k0, v0, n_rep, cmd).unwrap();
+    let x1 = bp
+        .binary(
+            BinOp::Add,
+            xp,
+            linear(&bp, from_heads(&bp, o0, l), w0[4], None).unwrap(),
+        )
+        .unwrap();
     // layer 1 (softmax)
-    let n1 = rmsnorm(&bp, x1, w1[0], eps);
-    let q1 = to_heads(&bp, linear(&bp, n1, w1[1], None), hq, l);
-    let k1 = to_heads(&bp, linear(&bp, n1, w1[2], None), hkv, l);
-    let v1 = to_heads(&bp, linear(&bp, n1, w1[3], None), hkv, l);
-    let a1 = attention_prefill(&bp, q1, k1, v1, n_rep, scale, cmc);
-    let x2 = bp.binary(
-        BinOp::Add,
-        x1,
-        linear(&bp, from_heads(&bp, a1, l), w1[4], None),
-    );
+    let n1 = rmsnorm(&bp, x1, w1[0], eps).unwrap();
+    let q1 = to_heads(&bp, linear(&bp, n1, w1[1], None).unwrap(), hq, l);
+    let k1 = to_heads(&bp, linear(&bp, n1, w1[2], None).unwrap(), hkv, l);
+    let v1 = to_heads(&bp, linear(&bp, n1, w1[3], None).unwrap(), hkv, l);
+    let a1 = attention_prefill(&bp, q1, k1, v1, n_rep, scale, cmc).unwrap();
+    let x2 = bp
+        .binary(
+            BinOp::Add,
+            x1,
+            linear(&bp, from_heads(&bp, a1, l), w1[4], None).unwrap(),
+        )
+        .unwrap();
     let gp = bp.finish(x2).unwrap();
     let mut pin = HashMap::new();
     pin.insert(
@@ -1190,51 +1278,61 @@ fn hybrid_model_decode_loop_matches_prefill() {
     let mut vc = HostTensor::f32(vec![1, hkv, l, d], vec![0.0f32; hkv * l * d]);
     let mut got = vec![0.0f32; l * h];
     for pos in 0..l {
-        let b = Builder::new();
-        let xt = b.constant("x", TensorType::f32(vec![1, 1, h]));
+        let b = Builder::for_tests();
+        let xt = b.constant("x", TensorType::f32(vec![1, 1, h])).unwrap();
         let w0d = mk_w(&b, "a");
         let w1d = mk_w(&b, "b");
-        let s_in = b.state_input(
-            "s",
-            TensorType::f32(vec![1, hq, d, d]),
-            StateRole::Recurrent,
-        );
-        let kc_in = b.state_input(
-            "kc",
-            TensorType::f32(vec![1, hkv, l, d]),
-            StateRole::Recurrent,
-        );
-        let vc_in = b.state_input(
-            "vc",
-            TensorType::f32(vec![1, hkv, l, d]),
-            StateRole::Recurrent,
-        );
+        let s_in = b
+            .state_input(
+                "s",
+                TensorType::f32(vec![1, hq, d, d]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let kc_in = b
+            .state_input(
+                "kc",
+                TensorType::f32(vec![1, hkv, l, d]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let vc_in = b
+            .state_input(
+                "vc",
+                TensorType::f32(vec![1, hkv, l, d]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
         // layer 0 (linear)
-        let n0 = rmsnorm(&b, xt, w0d[0], eps);
-        let q0 = to_heads(&b, linear(&b, n0, w0d[1], None), hq, 1);
-        let k0 = to_heads(&b, linear(&b, n0, w0d[2], None), hkv, 1);
-        let v0 = to_heads(&b, linear(&b, n0, w0d[3], None), hkv, 1);
+        let n0 = rmsnorm(&b, xt, w0d[0], eps).unwrap();
+        let q0 = to_heads(&b, linear(&b, n0, w0d[1], None).unwrap(), hq, 1);
+        let k0 = to_heads(&b, linear(&b, n0, w0d[2], None).unwrap(), hkv, 1);
+        let v0 = to_heads(&b, linear(&b, n0, w0d[3], None).unwrap(), hkv, 1);
         let (o0, s_out) = scalar_decay_decode(&b, q0, k0, v0, n_rep, decay, s_in);
-        let x1 = b.binary(
-            BinOp::Add,
-            xt,
-            linear(&b, from_heads(&b, o0, 1), w0d[4], None),
-        );
+        let x1 = b
+            .binary(
+                BinOp::Add,
+                xt,
+                linear(&b, from_heads(&b, o0, 1), w0d[4], None).unwrap(),
+            )
+            .unwrap();
         // layer 1 (softmax over the KV cache up to pos)
-        let n1 = rmsnorm(&b, x1, w1d[0], eps);
-        let q1 = to_heads(&b, linear(&b, n1, w1d[1], None), hq, 1);
-        let k1 = to_heads(&b, linear(&b, n1, w1d[2], None), hkv, 1);
-        let v1 = to_heads(&b, linear(&b, n1, w1d[3], None), hkv, 1);
-        let kc_out = b.dynamic_update_slice(kc_in, k1, pos, 2);
-        let vc_out = b.dynamic_update_slice(vc_in, v1, pos, 2);
-        let kv = b.slice(kc_out, 2, 0, pos + 1);
-        let vv = b.slice(vc_out, 2, 0, pos + 1);
-        let a1 = attention(&b, q1, kv, vv, n_rep, scale);
-        let x2 = b.binary(
-            BinOp::Add,
-            x1,
-            linear(&b, from_heads(&b, a1, 1), w1d[4], None),
-        );
+        let n1 = rmsnorm(&b, x1, w1d[0], eps).unwrap();
+        let q1 = to_heads(&b, linear(&b, n1, w1d[1], None).unwrap(), hq, 1);
+        let k1 = to_heads(&b, linear(&b, n1, w1d[2], None).unwrap(), hkv, 1);
+        let v1 = to_heads(&b, linear(&b, n1, w1d[3], None).unwrap(), hkv, 1);
+        let kc_out = b.dynamic_update_slice(kc_in, k1, pos, 2).unwrap();
+        let vc_out = b.dynamic_update_slice(vc_in, v1, pos, 2).unwrap();
+        let kv = b.slice(kc_out, 2, 0, pos + 1).unwrap();
+        let vv = b.slice(vc_out, 2, 0, pos + 1).unwrap();
+        let a1 = attention(&b, q1, kv, vv, n_rep, scale).unwrap();
+        let x2 = b
+            .binary(
+                BinOp::Add,
+                x1,
+                linear(&b, from_heads(&b, a1, 1), w1d[4], None).unwrap(),
+            )
+            .unwrap();
         let g = b
             .finish(poot_graph_ir::Outputs::new(x2).with_state(&[
                 (s_in, s_out),
@@ -1300,10 +1398,12 @@ fn decay_mask_from_gates_matches_reference() {
         }
     }
     let run = |gv: &[f32]| -> HostTensor {
-        let b = Builder::new();
-        let gates = b.constant("g", TensorType::f32(vec![1, hh, 1, l]));
-        let tr = b.constant("tr", TensorType::f32(vec![1, hh, l, l]));
-        let m = decay_mask_from_gates(&b, gates, tr, hh, l);
+        let b = Builder::for_tests();
+        let gates = b.constant("g", TensorType::f32(vec![1, hh, 1, l])).unwrap();
+        let tr = b
+            .constant("tr", TensorType::f32(vec![1, hh, l, l]))
+            .unwrap();
+        let m = decay_mask_from_gates(&b, gates, tr, hh, l).unwrap();
         let g = b.finish(m).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
@@ -1374,14 +1474,20 @@ fn gated_linear_attention_prefill_with_in_graph_mask_matches_reference() {
         }
     }
 
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-    let gates = b.constant("g", TensorType::f32(vec![1, hq, 1, l]));
-    let tr = b.constant("tr", TensorType::f32(vec![1, hq, l, l]));
-    let mask = decay_mask_from_gates(&b, gates, tr, hq, l);
-    let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, l, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, l, d]))
+        .unwrap();
+    let gates = b.constant("g", TensorType::f32(vec![1, hq, 1, l])).unwrap();
+    let tr = b
+        .constant("tr", TensorType::f32(vec![1, hq, l, l]))
+        .unwrap();
+    let mask = decay_mask_from_gates(&b, gates, tr, hq, l).unwrap();
+    let o = linear_attention_prefill(&b, q, k, v, n_rep, mask).unwrap();
     let g = b.finish(o).unwrap();
     let mut inp = HashMap::new();
     inp.insert(
@@ -1457,48 +1563,54 @@ fn mamba2_block_decode_loop_matches_reference() {
     let xd = fill(l * hh, 2); // hidden states [L, H]
 
     // decode graph (one step), carrying conv cache + SSM state.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, hh]));
-    let cz = b.constant("wz", TensorType::f32(vec![hh, ch]));
-    let cxc = b.constant("wxc", TensorType::f32(vec![hh, ch]));
-    let cb = b.constant("wb", TensorType::f32(vec![hh, hq * n]));
-    let cc = b.constant("wc", TensorType::f32(vec![hh, hq * n]));
-    let cdt = b.constant("wdt", TensorType::f32(vec![hh, hq]));
-    let cdtb = b.constant("dtb", TensorType::f32(vec![hq]));
-    let cwconv = b.constant("wconv", TensorType::f32(vec![kk, ch]));
-    let ca = b.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
-    let cd = b.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
-    let cwout = b.constant("wout", TensorType::f32(vec![ch, hh]));
-    let conv_cache = b.state_input(
-        "cv",
-        TensorType::f32(vec![1, kk - 1, ch]),
-        StateRole::Recurrent,
-    );
-    let h_in = b.state_input(
-        "h",
-        TensorType::f32(vec![1, hq, n, pdim]),
-        StateRole::Recurrent,
-    );
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, hh])).unwrap();
+    let cz = b.constant("wz", TensorType::f32(vec![hh, ch])).unwrap();
+    let cxc = b.constant("wxc", TensorType::f32(vec![hh, ch])).unwrap();
+    let cb = b.constant("wb", TensorType::f32(vec![hh, hq * n])).unwrap();
+    let cc = b.constant("wc", TensorType::f32(vec![hh, hq * n])).unwrap();
+    let cdt = b.constant("wdt", TensorType::f32(vec![hh, hq])).unwrap();
+    let cdtb = b.constant("dtb", TensorType::f32(vec![hq])).unwrap();
+    let cwconv = b.constant("wconv", TensorType::f32(vec![kk, ch])).unwrap();
+    let ca = b.constant("a", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+    let cd = b.constant("d", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+    let cwout = b.constant("wout", TensorType::f32(vec![ch, hh])).unwrap();
+    let conv_cache = b
+        .state_input(
+            "cv",
+            TensorType::f32(vec![1, kk - 1, ch]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let h_in = b
+        .state_input(
+            "h",
+            TensorType::f32(vec![1, hq, n, pdim]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
     // in_proj.
-    let z = linear(&b, x, cz, None);
-    let xc = linear(&b, x, cxc, None);
-    let bproj = linear(&b, x, cb, None);
-    let cproj = linear(&b, x, cc, None);
-    let dt_raw = linear(&b, x, cdt, Some(cdtb));
+    let z = linear(&b, x, cz, None).unwrap();
+    let xc = linear(&b, x, cxc, None).unwrap();
+    let bproj = linear(&b, x, cb, None).unwrap();
+    let cproj = linear(&b, x, cc, None).unwrap();
+    let dt_raw = linear(&b, x, cdt, Some(cdtb)).unwrap();
     // conv -> silu -> heads.
-    let (conv_out, conv_cache_out) = causal_conv1d_decode(&b, xc, cwconv, conv_cache, kk);
-    let xact = poot_graph_ir::ops::silu(&b, conv_out);
-    let xheads = b.reshape(xact, vec![1, hq, 1, pdim]);
-    let delta = softplus(&b, b.reshape(dt_raw, vec![1, hq, 1, 1]));
-    let bheads = b.reshape(bproj, vec![1, hq, 1, n]);
-    let cheads = b.reshape(cproj, vec![1, hq, 1, n]);
-    let (y, h_out) = mamba2_ssd_decode(&b, xheads, bheads, cheads, delta, ca, cd, h_in);
+    let (conv_out, conv_cache_out) = causal_conv1d_decode(&b, xc, cwconv, conv_cache, kk).unwrap();
+    let xact = poot_graph_ir::ops::silu(&b, conv_out).unwrap();
+    let xheads = b.reshape(xact, vec![1, hq, 1, pdim]).unwrap();
+    let delta = softplus(&b, b.reshape(dt_raw, vec![1, hq, 1, 1]).unwrap()).unwrap();
+    let bheads = b.reshape(bproj, vec![1, hq, 1, n]).unwrap();
+    let cheads = b.reshape(cproj, vec![1, hq, 1, n]).unwrap();
+    let (y, h_out) = mamba2_ssd_decode(&b, xheads, bheads, cheads, delta, ca, cd, h_in).unwrap();
     // output gate y * silu(z), out_proj, residual.
-    let zheads = b.reshape(z, vec![1, hq, 1, pdim]);
-    let ygated = b.binary(BinOp::Mul, y, poot_graph_ir::ops::silu(&b, zheads));
-    let yflat = b.reshape(ygated, vec![1, 1, ch]);
-    let out = linear(&b, yflat, cwout, None);
-    let result = b.binary(BinOp::Add, x, out);
+    let zheads = b.reshape(z, vec![1, hq, 1, pdim]).unwrap();
+    let ygated = b
+        .binary(BinOp::Mul, y, poot_graph_ir::ops::silu(&b, zheads).unwrap())
+        .unwrap();
+    let yflat = b.reshape(ygated, vec![1, 1, ch]).unwrap();
+    let out = linear(&b, yflat, cwout, None).unwrap();
+    let result = b.binary(BinOp::Add, x, out).unwrap();
     let g = b
         .finish(
             poot_graph_ir::Outputs::new(result)
@@ -1668,12 +1780,12 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
 
     // build the q/k/v -> [1,Hq|Hkv, T, D] heads from a normed [1,T,H].
     let to_heads = |b: &Builder, t: Traced, heads: usize, tt: usize| -> Traced {
-        let r = b.reshape(t, vec![1, tt, heads, d]);
-        b.transpose(r, vec![0, 2, 1, 3]) // [1, heads, T, D]
+        let r = b.reshape(t, vec![1, tt, heads, d]).unwrap();
+        b.transpose(r, vec![0, 2, 1, 3]).unwrap() // [1, heads, T, D]
     };
     let from_heads = |b: &Builder, o: Traced, tt: usize| -> Traced {
-        let r = b.transpose(o, vec![0, 2, 1, 3]); // [1, T, Hq, D]
-        b.reshape(r, vec![1, tt, qd_dim])
+        let r = b.transpose(o, vec![0, 2, 1, 3]).unwrap(); // [1, T, Hq, D]
+        b.reshape(r, vec![1, tt, qd_dim]).unwrap()
     };
 
     // --- prefill reference: the sublayer over the whole [1,L,H] sequence ---
@@ -1683,21 +1795,21 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
             md[t * l + j] = decay.powi((t - j) as i32);
         }
     }
-    let bp = Builder::new();
-    let xp = bp.constant("x", TensorType::f32(vec![1, l, h]));
-    let cwn = bp.constant("wn", TensorType::f32(vec![h]));
-    let cwq = bp.constant("wq", TensorType::f32(vec![h, qd_dim]));
-    let cwk = bp.constant("wk", TensorType::f32(vec![h, kvd]));
-    let cwv = bp.constant("wv", TensorType::f32(vec![h, kvd]));
-    let cwo = bp.constant("wo", TensorType::f32(vec![qd_dim, h]));
-    let cmask = bp.constant("m", TensorType::f32(vec![1, 1, l, l]));
-    let normed = rmsnorm(&bp, xp, cwn, eps);
-    let q = to_heads(&bp, linear(&bp, normed, cwq, None), hq, l);
-    let k = to_heads(&bp, linear(&bp, normed, cwk, None), hkv, l);
-    let v = to_heads(&bp, linear(&bp, normed, cwv, None), hkv, l);
-    let o = linear_attention_prefill(&bp, q, k, v, n_rep, cmask);
-    let attn = linear(&bp, from_heads(&bp, o, l), cwo, None);
-    let xout_p = bp.binary(BinOp::Add, xp, attn);
+    let bp = Builder::for_tests();
+    let xp = bp.constant("x", TensorType::f32(vec![1, l, h])).unwrap();
+    let cwn = bp.constant("wn", TensorType::f32(vec![h])).unwrap();
+    let cwq = bp.constant("wq", TensorType::f32(vec![h, qd_dim])).unwrap();
+    let cwk = bp.constant("wk", TensorType::f32(vec![h, kvd])).unwrap();
+    let cwv = bp.constant("wv", TensorType::f32(vec![h, kvd])).unwrap();
+    let cwo = bp.constant("wo", TensorType::f32(vec![qd_dim, h])).unwrap();
+    let cmask = bp.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
+    let normed = rmsnorm(&bp, xp, cwn, eps).unwrap();
+    let q = to_heads(&bp, linear(&bp, normed, cwq, None).unwrap(), hq, l);
+    let k = to_heads(&bp, linear(&bp, normed, cwk, None).unwrap(), hkv, l);
+    let v = to_heads(&bp, linear(&bp, normed, cwv, None).unwrap(), hkv, l);
+    let o = linear_attention_prefill(&bp, q, k, v, n_rep, cmask).unwrap();
+    let attn = linear(&bp, from_heads(&bp, o, l), cwo, None).unwrap();
+    let xout_p = bp.binary(BinOp::Add, xp, attn).unwrap();
     let gp = bp.finish(xout_p).unwrap();
     let bindw = |inp: &mut HashMap<ValueId, Value>, ids: [ValueId; 5]| {
         inp.insert(ids[0], Value::from(HostTensor::f32(vec![h], wn.clone())));
@@ -1735,25 +1847,27 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
         .expect("linear_attention_hybrid tests evaluate dense graphs"); // [1,L,H]
 
     // --- decode loop: the same sublayer one token at a time, carrying S ---
-    let bd = Builder::new();
-    let xt = bd.constant("x", TensorType::f32(vec![1, 1, h]));
-    let dwn = bd.constant("wn", TensorType::f32(vec![h]));
-    let dwq = bd.constant("wq", TensorType::f32(vec![h, qd_dim]));
-    let dwk = bd.constant("wk", TensorType::f32(vec![h, kvd]));
-    let dwv = bd.constant("wv", TensorType::f32(vec![h, kvd]));
-    let dwo = bd.constant("wo", TensorType::f32(vec![qd_dim, h]));
-    let s_in = bd.state_input(
-        "s",
-        TensorType::f32(vec![1, hq, d, d]),
-        StateRole::Recurrent,
-    );
-    let nd = rmsnorm(&bd, xt, dwn, eps);
-    let qd_ = to_heads(&bd, linear(&bd, nd, dwq, None), hq, 1);
-    let kd_ = to_heads(&bd, linear(&bd, nd, dwk, None), hkv, 1);
-    let vd_ = to_heads(&bd, linear(&bd, nd, dwv, None), hkv, 1);
+    let bd = Builder::for_tests();
+    let xt = bd.constant("x", TensorType::f32(vec![1, 1, h])).unwrap();
+    let dwn = bd.constant("wn", TensorType::f32(vec![h])).unwrap();
+    let dwq = bd.constant("wq", TensorType::f32(vec![h, qd_dim])).unwrap();
+    let dwk = bd.constant("wk", TensorType::f32(vec![h, kvd])).unwrap();
+    let dwv = bd.constant("wv", TensorType::f32(vec![h, kvd])).unwrap();
+    let dwo = bd.constant("wo", TensorType::f32(vec![qd_dim, h])).unwrap();
+    let s_in = bd
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, hq, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let nd = rmsnorm(&bd, xt, dwn, eps).unwrap();
+    let qd_ = to_heads(&bd, linear(&bd, nd, dwq, None).unwrap(), hq, 1);
+    let kd_ = to_heads(&bd, linear(&bd, nd, dwk, None).unwrap(), hkv, 1);
+    let vd_ = to_heads(&bd, linear(&bd, nd, dwv, None).unwrap(), hkv, 1);
     let (od, s_out) = scalar_decay_decode(&bd, qd_, kd_, vd_, n_rep, decay, s_in);
-    let attnd = linear(&bd, from_heads(&bd, od, 1), dwo, None);
-    let xout_d = bd.binary(BinOp::Add, xt, attnd);
+    let attnd = linear(&bd, from_heads(&bd, od, 1), dwo, None).unwrap();
+    let xout_d = bd.binary(BinOp::Add, xt, attnd).unwrap();
     let gd = bd
         .finish(poot_graph_ir::Outputs::new(xout_d).with_state(&[(s_in, s_out)]))
         .unwrap();
@@ -1810,15 +1924,23 @@ fn linear_attention_decode_loop_matches_prefill() {
     let vd = fill(hkv * l * dv, 5); // [Hkv, L, D_v]
 
     // one-token decode graph, state S carried (s_in -> s_out).
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, dk]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, 1, dk]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, 1, dv]));
-    let s_in = b.state_input(
-        "s",
-        TensorType::f32(vec![1, hq, dk, dv]),
-        StateRole::Recurrent,
-    );
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, 1, dk]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, 1, dk]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, 1, dv]))
+        .unwrap();
+    let s_in = b
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, hq, dk, dv]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
     let (o, s_out) = scalar_decay_decode(&b, q, k, v, n_rep, decay, s_in);
     let (qi, ki, vi) = (q.id(), k.id(), v.id());
     let gd = b
@@ -1881,12 +2003,18 @@ fn linear_attention_decode_loop_matches_prefill() {
             md[t * l + j] = decay.powi((t - j) as i32);
         }
     }
-    let bp = Builder::new();
-    let pq = bp.constant("q", TensorType::f32(vec![1, hq, l, dk]));
-    let pk = bp.constant("k", TensorType::f32(vec![1, hkv, l, dk]));
-    let pv = bp.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
-    let pm = bp.constant("m", TensorType::f32(vec![1, 1, l, l]));
-    let po = linear_attention_prefill(&bp, pq, pk, pv, n_rep, pm);
+    let bp = Builder::for_tests();
+    let pq = bp
+        .constant("q", TensorType::f32(vec![1, hq, l, dk]))
+        .unwrap();
+    let pk = bp
+        .constant("k", TensorType::f32(vec![1, hkv, l, dk]))
+        .unwrap();
+    let pv = bp
+        .constant("v", TensorType::f32(vec![1, hkv, l, dv]))
+        .unwrap();
+    let pm = bp.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
+    let po = linear_attention_prefill(&bp, pq, pk, pv, n_rep, pm).unwrap();
     let (pqi, pki, pvi, pmi) = (pq.id(), pk.id(), pv.id(), pm.id());
     let gp = bp.finish(po).unwrap();
     let mut pin = HashMap::new();
@@ -1925,19 +2053,27 @@ fn mamba2_ssd_prefill_stays_finite_when_delta_a_underflows_the_gate() {
         }
     }
 
-    let b = Builder::new();
-    let xs = b.constant("x", TensorType::f32(vec![1, hq, l, p]));
-    let bs = b.constant("b", TensorType::f32(vec![1, hq, l, n]));
-    let cs = b.constant("c", TensorType::f32(vec![1, hq, l, n]));
-    let dl = b.constant("dl", TensorType::f32(vec![1, hq, l, 1]));
-    let ap = b.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
-    let dk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
-    let tr = b.constant("tr", TensorType::f32(vec![1, hq, l, l]));
-    let h = b.constant("h0", TensorType::f32(vec![1, hq, n, p]));
-    let (y, h_out) = mamba2_ssd_prefill(&b, xs, bs, cs, dl, ap, dk, h, tr);
+    let b = Builder::for_tests();
+    let xs = b.constant("x", TensorType::f32(vec![1, hq, l, p])).unwrap();
+    let bs = b.constant("b", TensorType::f32(vec![1, hq, l, n])).unwrap();
+    let cs = b.constant("c", TensorType::f32(vec![1, hq, l, n])).unwrap();
+    let dl = b
+        .constant("dl", TensorType::f32(vec![1, hq, l, 1]))
+        .unwrap();
+    let ap = b.constant("a", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+    let dk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+    let tr = b
+        .constant("tr", TensorType::f32(vec![1, hq, l, l]))
+        .unwrap();
+    let h = b
+        .constant("h0", TensorType::f32(vec![1, hq, n, p]))
+        .unwrap();
+    let (y, h_out) = mamba2_ssd_prefill(&b, xs, bs, cs, dl, ap, dk, h, tr).unwrap();
     let gy = b.finish(y).unwrap();
-    let gh =
-        poot_test_util::graph_fixtures::derive(&gy, |draft| draft.set_result(h_out.id())).unwrap();
+    let gh = poot_graph_ir::test_support::graph_fixtures::derive(&gy, |draft| {
+        draft.set_result(h_out.id())
+    })
+    .unwrap();
 
     let mut inp = HashMap::new();
     let mut put = |id, shape: Vec<usize>, data: Vec<f32>| {

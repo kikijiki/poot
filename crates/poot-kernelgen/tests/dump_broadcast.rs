@@ -4,7 +4,11 @@
 
 use poot_codegen::{Target, compile};
 use poot_kernel_ir::{BinOp, Ty};
-use poot_test_util::kernel_fixtures::{binary_broadcast, gather_axis0_dt};
+use poot_kernelgen::{Layout, binary_broadcast_dt_views_grid};
+
+#[path = "support/gather.rs"]
+mod gather;
+use gather::gather_axis0_dt;
 
 /// Emit the NVPTX IR of the embedding gather (rest=896, the embedding row size), which reads garbage (maxabs
 /// 1e9) at n=864 on PTX while wgpu is correct, to inspect the f32->i64 token-id cast and the index/data loads.
@@ -33,7 +37,17 @@ fn dump_v_bias_broadcast_nvptx() {
     let dir = std::env::temp_dir().join("poot-bcast-dump");
     std::fs::create_dir_all(&dir).unwrap();
     for (tag, n) in [("big", 864usize), ("small", 5usize)] {
-        let body = binary_broadcast("k", BinOp::Add, &[1, n, 128], &[1, n, 128], &[128]);
+        let body = binary_broadcast_dt_views_grid(
+            "k",
+            BinOp::Add,
+            Ty::F32,
+            &[1, n, 128],
+            &[1, n, 128],
+            &Layout::contiguous(&[1, n, 128]),
+            &[128],
+            &Layout::contiguous(&[128]),
+            None,
+        );
         let out = dir.join(format!("k_{tag}.ptx"));
         match compile(&body, Target::Nvptx, &out) {
             Ok(ir) => {

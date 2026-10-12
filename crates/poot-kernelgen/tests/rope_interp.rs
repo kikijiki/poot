@@ -4,8 +4,8 @@
 //! lowering for the on-device / RunPod run.
 
 use poot_kernel_ir::interp::{Buffer, run};
+use poot_kernel_ir::test_support::workgroups_covering;
 use poot_kernelgen as kg;
-use poot_test_util::kernel_fixtures::workgroups_covering;
 
 /// The half-split rotate reference (`ops::rope_partial`). `x` is `[hq, d]` flat; `cos`/`sin` are `[rot]`
 /// (one position, broadcast over the head axis). Passthrough `[rot, d)` for a partial rope.

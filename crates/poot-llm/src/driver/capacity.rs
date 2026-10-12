@@ -27,12 +27,15 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use poot_executor::{
-    BufferRole, Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, ExecError,
-    Executor, MemoryCounterSnapshot, NativeCounters, SharedKernels, SharedKernelsMismatch,
-    SupportBound, WeightUpload,
+    Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, ExecError, Executor,
+    NativeCounters, SharedKernels, SharedKernelsMismatch, SupportBound, WeightUpload,
 };
-use poot_graph_plan::{DeviceId, Submission, Target, TargetSet};
-use poot_runtime_common::{AllocGuard, CompiledKernel, MemoryCounters};
+use poot_graph_plan::{
+    Target, multi_device::topology::DeviceId, production_plan::Submission, staged::TargetSet,
+};
+use poot_runtime_common::{
+    AllocGuard, BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters,
+};
 use poot_target::BufferStorage;
 
 use super::error::DriverError;
@@ -274,6 +277,7 @@ impl Budget {
         Self::default()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with(mut self, device: DeviceId, budget: DeviceBudget) -> Self {
         self.devices.insert(device, budget);
         self
@@ -875,7 +879,7 @@ impl Collectives for PlanningDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use poot_test_util::graph_fixtures::gpu_caps_mut;
+    use poot_graph_plan::test_support::gpu_caps_mut;
 
     const D0: DeviceId = DeviceId(0);
     const D1: DeviceId = DeviceId(1);

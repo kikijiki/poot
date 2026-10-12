@@ -9,7 +9,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -25,8 +24,9 @@ use crate::model::{
 use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
 use crate::names::{HF_BASE, HF_QK_NORM, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("qwen3");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen3");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -52,7 +52,7 @@ const SPEC: DenseSpec = DenseSpec {
 
 /// qwen3's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Qwen3Params {
+pub(crate) struct Qwen3Params {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -67,7 +67,7 @@ pub struct Qwen3Params {
 }
 
 impl Qwen3Params {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
         // `attention_bias` biases the output projection too, which no weight role carries yet.
@@ -103,7 +103,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Qwen3 {
+pub(crate) struct Qwen3 {
     params: Qwen3Params,
     weights: WeightMap,
     stack: StackWeights,
@@ -159,11 +159,10 @@ impl Model for Qwen3 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -174,7 +173,7 @@ impl Model for Qwen3 {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
                 |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -483,11 +482,19 @@ mod tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(1, 2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(1, 2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }

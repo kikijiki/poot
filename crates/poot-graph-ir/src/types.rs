@@ -116,6 +116,14 @@ pub enum Scalar {
 }
 
 impl Scalar {
+    /// The bytes of the literal's inline payload: what the tracer's literal budget counts.
+    pub fn byte_len(&self) -> u64 {
+        match self {
+            Scalar::F32(_) => std::mem::size_of::<f32>() as u64,
+            Scalar::I32(_) => std::mem::size_of::<i32>() as u64,
+        }
+    }
+
     pub fn dtype(&self) -> DType {
         match self {
             Scalar::F32(_) => DType::F32,

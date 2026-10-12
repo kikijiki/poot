@@ -48,8 +48,8 @@ pub(super) struct Dims {
 }
 
 impl Dims {
-    pub fn of(config: &serde_json::Value) -> Self {
-        let n = |k: &str| config[k].as_u64().unwrap() as usize;
+    pub(super) fn of(config: &serde_json::Value) -> Self {
+        let n = |k: &str| crate::registry::Fixture::count(config, k);
         let f = |k: &str| config[k].as_f64().unwrap();
         let rate = |k: &str, default: usize| {
             config["compress_rates"][k]
@@ -178,7 +178,7 @@ struct LayerHistory {
 }
 
 impl Reference {
-    pub fn new(config: &serde_json::Value, store: &WeightStore) -> Self {
+    pub(super) fn new(config: &serde_json::Value, store: &WeightStore) -> Self {
         let d = Dims::of(config);
         let mut w = HashMap::new();
         let mut tables = HashMap::new();
@@ -587,7 +587,7 @@ impl Reference {
     }
 
     /// The model over `tokens` from position 0 with a cache of `capacity` positions.
-    pub fn run(&self, tokens: &[usize], capacity: usize) -> Run {
+    pub(super) fn run(&self, tokens: &[usize], capacity: usize) -> Run {
         let d = &self.d;
         let mut hist = vec![LayerHistory::default(); d.layers];
         let mut logits = Vec::new();

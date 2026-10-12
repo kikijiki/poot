@@ -2,12 +2,12 @@
 
 use poot_tensor::{DType, HostTensor};
 
-use crate::*;
+use crate::{
+    Cow, EvalError, ExactI32TensorView, ExactValue, PackedComponentRef, PackedStackComponentRef,
+    fp8,
+};
 
-/// The executor value: a typed host tensor, an owner-backed exact value, or a packed component.
-///
-/// The owner-backed variant makes it impossible for binding or movement code to obtain a checkpoint
-/// table's bytes through a host tensor's payload by accident.
+/// The executor value: a typed host tensor, an exact word-carrier value, or a packed component.
 ///
 /// Every executor entry and the CPU oracle bind `HashMap<ValueId, Value>` built directly; the
 /// `Tensor`-map adapter `widen_map` is gone (card 545a) and must not come back:
@@ -34,8 +34,8 @@ pub enum Value {
     /// A typed host tensor: its dtype says how to read the payload (BF16 words, I32 words, E4M3FN
     /// bytes, f32 values), and no tensor carries a second, widened copy of itself.
     Host(HostTensor),
-    /// An owner-backed exact value (checkpoint-derived BF16/F32 views, exact I32 words).
-    Owner(ExactValue),
+    /// An exact word-carrier value (derived BF16 words, exact I32 words).
+    Exact(ExactValue),
     Packed(PackedComponentRef),
     /// One source role of an expert-stacked packed table (an indexed packed contraction's carrier).
     PackedStack(PackedStackComponentRef),
@@ -45,7 +45,7 @@ impl Value {
     pub fn shape(&self) -> Cow<'_, [usize]> {
         match self {
             Value::Host(t) => Cow::Borrowed(t.shape()),
-            Value::Owner(value) => Cow::Borrowed(value.shape()),
+            Value::Exact(value) => Cow::Borrowed(value.shape()),
             Value::Packed(component) => {
                 Cow::Owned(component.weight().source_shape(component.role()).to_vec())
             }
@@ -56,13 +56,14 @@ impl Value {
         }
     }
 
-    /// The host tensor this value is, or `None` for a packed component or an owner-backed exact
+    /// The host tensor this value is, or `None` for a packed component or an exact
     /// value: the typed accessor a host-side reader of a weight uses, so it can never reinterpret
     /// packed source bytes as numbers.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn as_host(&self) -> Option<&HostTensor> {
         match self {
             Value::Host(tensor) => Some(tensor),
-            Value::Owner(_) | Value::Packed(_) | Value::PackedStack(_) => None,
+            Value::Exact(_) | Value::Packed(_) | Value::PackedStack(_) => None,
         }
     }
 
@@ -71,8 +72,8 @@ impl Value {
     pub fn into_host(self) -> Result<HostTensor, EvalError> {
         match self {
             Value::Host(tensor) => Ok(tensor),
-            Value::Owner(_) => Err(EvalError::NotHost {
-                what: "owner-backed exact value",
+            Value::Exact(_) => Err(EvalError::NotHost {
+                what: "exact value",
             }),
             Value::Packed(_) => Err(EvalError::NotHost {
                 what: "packed component",
@@ -85,7 +86,7 @@ impl Value {
 
     pub fn numel(&self) -> usize {
         match self {
-            Value::Owner(value) => value.numel(),
+            Value::Exact(value) => value.numel(),
             _ => self.shape().iter().product(),
         }
     }
@@ -98,7 +99,7 @@ impl Value {
                 fp8::PortableE4m3FnLayout::for_shape(t.shape()).device_bytes
             }
             Value::Host(t) => t.data().byte_len(),
-            Value::Owner(value) => value.physical_bytes(),
+            Value::Exact(value) => value.physical_bytes(),
             Value::Packed(component) => component.bytes().len(),
             Value::PackedStack(component) => {
                 component.stack().experts() * component.weight().slab_bytes(component.role())
@@ -113,21 +114,15 @@ impl From<HostTensor> for Value {
     }
 }
 
-impl From<exact_dense::DenseOwnerTensorView> for Value {
-    fn from(value: exact_dense::DenseOwnerTensorView) -> Self {
-        Value::Owner(value.into())
-    }
-}
-
 impl From<ExactValue> for Value {
     fn from(value: ExactValue) -> Self {
-        Value::Owner(value)
+        Value::Exact(value)
     }
 }
 
 impl From<ExactI32TensorView> for Value {
     fn from(value: ExactI32TensorView) -> Self {
-        Value::Owner(ExactValue::I32(value))
+        Value::Exact(ExactValue::I32(value))
     }
 }
 

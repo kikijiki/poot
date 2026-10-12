@@ -11,10 +11,10 @@
 use std::collections::HashMap as Map;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::{Slot, Storage, ValueId};
-use poot_graph_plan::{CompileOptions, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Target, compile, production_plan::Submission};
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
 use poot_target::Backend;
 use poot_tensor::HostTensor;
 
@@ -39,7 +39,7 @@ const HIDDEN: usize = 8;
 /// largest constant the tracer declares - every projection weight fits `hidden * inter` or smaller -
 /// so a [`poot_target::DeviceCaps::max_buffer_bytes`] between the two hosts the embed table and nothing
 /// else.
-fn tiny_legalize_model() -> poot_executor_parity::weight_map::MappedModel {
+fn tiny_legalize_model() -> poot_models::test_support::weight_map::MappedModel {
     Dense::new(Family::Qwen2)
         .vocab(VOCAB)
         .dims(HIDDEN, 8, 2)
@@ -54,7 +54,11 @@ fn tiny_legalize_model() -> poot_executor_parity::weight_map::MappedModel {
 fn trace(phase: Phase, tokens: usize, cap: usize) -> poot_graph_ir::Graph {
     tiny_legalize_model()
         .model
-        .trace(phase, step(1, tokens, cap, LogitRows::All))
+        .trace(
+            phase,
+            step(1, tokens, cap, LogitRows::All),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -96,7 +100,9 @@ fn without_lm_head(g: poot_graph_ir::Graph) -> poot_graph_ir::Graph {
     let Operand::Value(hidden) = out_eqn.inputs[0] else {
         panic!("lm_head MatMul's first operand must be a value")
     };
-    let g = poot_test_util::graph_fixtures::derive(&g, |draft| draft.set_result(hidden)).unwrap();
+    let g =
+        poot_graph_ir::test_support::graph_fixtures::derive(&g, |draft| draft.set_result(hidden))
+            .unwrap();
     let g = poot_graph_plan::dce(&g).unwrap();
 
     let referenced: std::collections::HashSet<_> = g

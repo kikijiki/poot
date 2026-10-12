@@ -1,5 +1,9 @@
 //! Whole-graph storage representation: every value's physical storage, read from one plan per equation.
 
+use crate::predicates::GraphTables;
+use crate::refusal::refusal_at;
+use crate::types::{GraphStorage, StorageKind, ValueStorage};
+use poot_kernelgen::Layout;
 use poot_tensor::DType;
 use std::collections::{HashMap, HashSet};
 
@@ -7,12 +11,14 @@ use poot_graph_ir::Storage;
 use poot_target::TargetId;
 
 use crate::dtype_widen::bf16_const_is_packed;
-use crate::*;
+use crate::{Capability, Plan, PlanError, Source, StorageGap, compute_views, value_ids};
+use poot_graph_ir::op::OpKind;
+use poot_graph_ir::{Eqn, Graph, Operand, ValueId};
 
 /// Card 526: every value's physical storage (dtype and packing) for one graph on one backend,
 /// computed once for the whole graph. Folds in the packed-vs-native distinction of a BF16 const each
 /// binder used to re-derive separately:
-/// `poot-gpu`, `poot-rocm-gpu` and `poot-ptx-gpu`'s binders read the result instead.
+/// `poot-wgpu-device`, `poot-rocm-device` and `poot-ptx-device`'s binders read the result instead.
 ///
 /// Call once per (graph, backend) after `compile`'s dtype passes have run; a const's storage dtype is its
 /// declared dtype (Card 1011: no pass retypes a const).
@@ -303,6 +309,11 @@ fn value_storage_kind(
 
 #[cfg(test)]
 mod value_storage_tests {
+
+    use crate::production_plan::Submission;
+    use crate::staged::{
+        DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet, compile_staged,
+    };
     use poot_graph_ir::{Builder, Graph, OpKind, Storage, TensorType};
     use poot_target::{AmdArch, Backend, DeviceCaps};
     use poot_tensor::DType;
@@ -335,7 +346,7 @@ mod value_storage_tests {
                     eqn,
                     backend,
                     caps,
-                    &poot_test_util::graph_fixtures::roomy_body_limits(),
+                    &crate::test_support::roomy_body_limits(),
                 )
                 .ok()
             })
@@ -346,10 +357,14 @@ mod value_storage_tests {
     /// `a x w -> f32` over two consts of the given dtypes, `m x 32 x 32`; mirrors
     /// `dtype_widen::tests::const_matmul`.
     fn const_matmul(m: usize, a_dtype: DType, w_dtype: DType) -> Graph {
-        let b = Builder::new();
-        let a = b.constant("a", TensorType::new(vec![m, 32], a_dtype));
-        let w = b.constant("w", TensorType::new(vec![32, 32], w_dtype));
-        let mm = b.matmul(a, w);
+        let b = Builder::for_tests();
+        let a = b
+            .constant("a", TensorType::new(vec![m, 32], a_dtype))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![32, 32], w_dtype))
+            .unwrap();
+        let mm = b.matmul(a, w).unwrap();
         let g = b.finish(mm).unwrap();
         let out = g
             .eqns()
@@ -357,7 +372,7 @@ mod value_storage_tests {
             .find(|e| matches!(e.op, OpKind::MatMul))
             .expect("matmul eqn")
             .out;
-        poot_test_util::graph_fixtures::derive(&g, |draft| {
+        poot_graph_ir::test_support::graph_fixtures::derive(&g, |draft| {
             draft.values_mut()[out].aval.dtype = DType::F32;
         })
         .unwrap()
@@ -420,7 +435,7 @@ mod value_storage_tests {
 
     /// One graph holding every shape of I32 consumer that used to choose a lane: a computed `Gather` index
     /// (`Binary(GeU)`), a `Slot::SlotMap` index feeding `ScatterUpdate`'s `inv` operand, and a
-    /// `Slot::Token` feeding a plain embedding `Gather` (the shape `poot-gpu`'s
+    /// `Slot::Token` feeding a plain embedding `Gather` (the shape `poot-wgpu-device`'s
     /// `qwen2_decode_gpu_resident_matches_cpu` exercises). Returns `(graph, gather_index_value_id,
     /// slotmap_value_id, token_value_id)`.
     fn gather_index_slotmap_and_token_graph() -> (
@@ -431,31 +446,47 @@ mod value_storage_tests {
     ) {
         use poot_graph_ir::Slot;
         use poot_graph_ir::op::BinOp;
-        let b = Builder::new();
+        let b = Builder::for_tests();
 
         let (rows, cols) = (8usize, 3usize);
-        let idx_a = b.constant("idx_a", TensorType::new(vec![2], DType::I32));
-        let idx_b = b.constant("idx_b", TensorType::new(vec![2], DType::I32));
-        let idx = b.binary(BinOp::GeU, idx_a, idx_b);
-        let gather_table = b.constant(
-            "gather_table",
-            TensorType::new(vec![rows, cols], DType::F32),
-        );
-        let _gathered = b.gather(gather_table, 0, idx);
+        let idx_a = b
+            .constant("idx_a", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let idx_b = b
+            .constant("idx_b", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let idx = b.binary(BinOp::GeU, idx_a, idx_b).unwrap();
+        let gather_table = b
+            .constant(
+                "gather_table",
+                TensorType::new(vec![rows, cols], DType::F32),
+            )
+            .unwrap();
+        let _gathered = b.gather(gather_table, 0, idx).unwrap();
 
         const POOL: usize = 4;
         const REST: usize = 2;
         const NSRC: usize = 2;
-        let base = b.constant("base", TensorType::new(vec![POOL, REST], DType::F32));
-        let src = b.constant("src", TensorType::new(vec![NSRC, REST], DType::F32));
-        let slot_map = b.slot(Slot::SlotMap, TensorType::new(vec![POOL], DType::I32));
-        let _scatter = b.scatter_update(base, src, slot_map);
+        let base = b
+            .constant("base", TensorType::new(vec![POOL, REST], DType::F32))
+            .unwrap();
+        let src = b
+            .constant("src", TensorType::new(vec![NSRC, REST], DType::F32))
+            .unwrap();
+        let slot_map = b
+            .slot(Slot::SlotMap, TensorType::new(vec![POOL], DType::I32))
+            .unwrap();
+        let _scatter = b.scatter_update(base, src, slot_map).unwrap();
 
         const VOCAB: usize = 8;
         const HIDDEN: usize = 4;
-        let embed = b.constant("embed", TensorType::new(vec![VOCAB, HIDDEN], DType::F32));
-        let token = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
-        let out = b.gather_scalar(embed, 0, token);
+        let embed = b
+            .constant("embed", TensorType::new(vec![VOCAB, HIDDEN], DType::F32))
+            .unwrap();
+        let token = b
+            .slot(Slot::Token, TensorType::new(vec![1], DType::I32))
+            .unwrap();
+        let out = b.gather_scalar(embed, 0, token).unwrap();
 
         let gather_index_id = idx.id();
         let slot_id = slot_map.id();
@@ -509,20 +540,20 @@ mod value_storage_tests {
         use poot_graph_ir::op::BinOp;
 
         let build = |dtype: DType| {
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::new(vec![4], dtype));
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::new(vec![4], dtype)).unwrap();
             let scalar = match dtype {
                 DType::I32 => Scalar::I32(1),
                 _ => Scalar::F32(1.0),
             };
-            let y = b.binary_scalar(BinOp::Add, x, scalar);
+            let y = b.binary_scalar(BinOp::Add, x, scalar).unwrap();
             (b.finish(y).unwrap(), x.id(), y.id())
         };
         let (f32_graph, ..) = build(DType::F32);
         let (i32_graph, x, y) = build(DType::I32);
         let backend = Backend::SpirvVulkan;
         let caps = poot_test_util::device_caps::default_caps_for(backend);
-        let limits = poot_test_util::graph_fixtures::roomy_body_limits();
+        let limits = crate::test_support::roomy_body_limits();
         let plan_of = |g: &Graph| plan_eqn(g, &g.eqns()[0], backend, &caps, &limits).unwrap();
 
         let honest = plan_of(&i32_graph);
@@ -548,14 +579,18 @@ mod value_storage_tests {
     fn storage_checks_read_params_through_the_binding() {
         use crate::{Binding, Dispatch};
 
-        let b = Builder::new();
-        let table = b.constant("table", TensorType::new(vec![8, 3], DType::F32));
-        let index = b.constant("index", TensorType::new(vec![2], DType::I32));
-        let gathered = b.gather(table, 0, index);
+        let b = Builder::for_tests();
+        let table = b
+            .constant("table", TensorType::new(vec![8, 3], DType::F32))
+            .unwrap();
+        let index = b
+            .constant("index", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let gathered = b.gather(table, 0, index).unwrap();
         let (g, index, gathered) = (b.finish(gathered).unwrap(), index.id(), gathered.id());
         let backend = Backend::SpirvVulkan;
         let caps = poot_test_util::device_caps::default_caps_for(backend);
-        let limits = poot_test_util::graph_fixtures::roomy_body_limits();
+        let limits = crate::test_support::roomy_body_limits();
         let gather = g
             .eqns()
             .iter()
@@ -608,16 +643,17 @@ mod value_storage_tests {
     fn bf16_const_reads_refuse_a_reader_without_the_lane() {
         use poot_graph_ir::Slot;
 
-        use crate::{
-            Capability, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, PlanError,
-            Submission, Target, TargetSet, compile_staged,
-        };
+        use crate::{Capability, CompileOptions, PlanError, Target};
 
-        let b = Builder::new();
-        let table = b.constant("table", TensorType::new(vec![16, 8], DType::BF16));
-        let token = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
-        let rows = b.gather(table, 0, token);
-        let neg = b.unary(poot_graph_ir::UnOp::Neg, rows);
+        let b = Builder::for_tests();
+        let table = b
+            .constant("table", TensorType::new(vec![16, 8], DType::BF16))
+            .unwrap();
+        let token = b
+            .slot(Slot::Token, TensorType::new(vec![4], DType::I32))
+            .unwrap();
+        let rows = b.gather(table, 0, token).unwrap();
+        let neg = b.unary(poot_graph_ir::UnOp::Neg, rows).unwrap();
         let g = b.finish(neg).unwrap();
         let gather = g
             .eqns()
@@ -635,7 +671,7 @@ mod value_storage_tests {
         let error = compile_staged(
             &g,
             &TargetSet::single(DeviceId(0), target),
-            &crate::Partition {
+            &crate::staged::Partition {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
@@ -667,17 +703,22 @@ mod value_storage_tests {
     fn bf16_consts_read_only_by_packed_readers_plan_packed() {
         use poot_graph_ir::Slot;
 
-        use crate::{
-            CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, Submission,
-            Target, TargetSet, compile_staged,
-        };
+        use crate::{CompileOptions, Target};
 
-        let b = Builder::new();
-        let embed = b.constant("embed", TensorType::new(vec![16, 32], DType::BF16));
-        let token = b.slot(Slot::Token, TensorType::new(vec![1, 4], DType::I32));
-        let rows = b.cast(b.gather(embed, 0, token), DType::F32);
-        let w = b.constant("w", TensorType::new(vec![8, 32], DType::BF16));
-        let out = b.matmul(rows, b.transpose(w, vec![1, 0]));
+        let b = Builder::for_tests();
+        let embed = b
+            .constant("embed", TensorType::new(vec![16, 32], DType::BF16))
+            .unwrap();
+        let token = b
+            .slot(Slot::Token, TensorType::new(vec![1, 4], DType::I32))
+            .unwrap();
+        let rows = b
+            .cast(b.gather(embed, 0, token).unwrap(), DType::F32)
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![8, 32], DType::BF16))
+            .unwrap();
+        let out = b.matmul(rows, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         let g = b.finish(out).unwrap();
         for backend in [Backend::AmdGcn(AmdArch::gfx1151()), Backend::Nvptx] {
             let target = Target::Gpu {
@@ -727,21 +768,35 @@ mod value_storage_tests {
     ) -> (Graph, poot_graph_ir::ValueId) {
         use poot_graph_ir::{BinOp, RedOp, Slot};
 
-        let b = Builder::new();
-        let table = b.constant("shard", TensorType::new(vec![rows, width], DType::E4M3FN));
-        let token = b.slot(Slot::Token, TensorType::new(vec![3], DType::I32));
-        let gathered = b.cast(b.gather(table, 0, token), DType::F32);
+        let b = Builder::for_tests();
+        let table = b
+            .constant("shard", TensorType::new(vec![rows, width], DType::E4M3FN))
+            .unwrap();
+        let token = b
+            .slot(Slot::Token, TensorType::new(vec![3], DType::I32))
+            .unwrap();
+        let gathered = b
+            .cast(b.gather(table, 0, token).unwrap(), DType::F32)
+            .unwrap();
         let out = if second_reader {
             // The table is also widened whole and summed: a reader that is not a row gather, so the
             // table cannot be the packed lane.
-            let widened = b.cast(table, DType::F32);
-            let sum = |v| b.reduce(RedOp::Sum, b.reduce(RedOp::Sum, v, 1, false), 0, false);
-            b.binary(BinOp::Add, sum(gathered), sum(widened))
+            let widened = b.cast(table, DType::F32).unwrap();
+            let sum = |v| {
+                b.reduce(
+                    RedOp::Sum,
+                    b.reduce(RedOp::Sum, v, 1, false).unwrap(),
+                    0,
+                    false,
+                )
+                .unwrap()
+            };
+            b.binary(BinOp::Add, sum(gathered), sum(widened)).unwrap()
         } else {
             gathered
         };
         (
-            crate::fold_dense_bf16_row_gathers(&b.finish(out).unwrap()).unwrap(),
+            crate::dtype_widen::fold_dense_bf16_row_gathers(&b.finish(out).unwrap()).unwrap(),
             table.id(),
         )
     }

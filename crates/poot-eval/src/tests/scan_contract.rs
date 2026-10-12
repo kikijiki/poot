@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use poot_graph_ir::ops::{
     gdn_prefill_chunked, lower_triangle, mamba2_ssd_decode, mamba2_ssd_prefill,
 };
+use poot_graph_ir::test_support::scan::{ScanFixture, ScanInputs};
 use poot_graph_ir::{Builder, OpKind, Operand, ScanAttrs, ScanFamily, StateRole, TensorType};
 use poot_tensor::HostTensor;
 use poot_test_util::assert_close;
-use poot_test_util::scan::{ScanFixture, ScanInputs};
 
 use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
 
@@ -130,8 +130,8 @@ fn the_delta_rule_scan_is_bitwise_the_pre_card_chain() {
     let inputs = fixture.inputs(5);
     let (y, s_out) = run(&fixture, &inputs).unwrap();
 
-    let b = Builder::new();
-    let seq = |name: &str, w: usize| b.constant(name, TensorType::f32(vec![1, 2, 7, w]));
+    let b = Builder::for_tests();
+    let seq = |name: &str, w: usize| b.constant(name, TensorType::f32(vec![1, 2, 7, w])).unwrap();
     let (q, k, v, g, beta) = (
         seq("q", 4),
         seq("k", 4),
@@ -139,7 +139,9 @@ fn the_delta_rule_scan_is_bitwise_the_pre_card_chain() {
         seq("g", 1),
         seq("beta", 1),
     );
-    let s = b.state_input("s", TensorType::f32(vec![1, 2, 4, 4]), StateRole::Recurrent);
+    let s = b
+        .state_input("s", TensorType::f32(vec![1, 2, 4, 4]), StateRole::Recurrent)
+        .unwrap();
     let ids = [q.id(), k.id(), v.id(), g.id(), beta.id(), s.id()];
     // The tables the component used to build and pass in.
     let (o, s_chain) = gdn_prefill_chunked(
@@ -150,10 +152,11 @@ fn the_delta_rule_scan_is_bitwise_the_pre_card_chain() {
         g,
         beta,
         s,
-        lower_triangle(&b, 4, 0.0),
-        lower_triangle(&b, 4, 1.0),
+        lower_triangle(&b, 4, 0.0).unwrap(),
+        lower_triangle(&b, 4, 1.0).unwrap(),
         4,
-    );
+    )
+    .unwrap();
     let chain = b
         .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s, s_chain)]))
         .unwrap();
@@ -194,24 +197,30 @@ fn the_ssd_scan_matches_the_decode_loop_and_the_seeded_prefill() {
         let (y, s_out) = run(&fixture, &inputs).unwrap();
 
         // The seeded whole-sequence prefill.
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let shapes = fixture.operand_shapes();
         let traced: Vec<_> = shapes[..6]
             .iter()
-            .map(|(name, shape)| b.constant(name, TensorType::f32(shape.clone())))
+            .map(|(name, shape)| b.constant(name, TensorType::f32(shape.clone())).unwrap())
             .collect();
-        let h = b.state_input(
-            "h",
-            TensorType::f32(shapes[6].1.clone()),
-            StateRole::Recurrent,
-        );
-        let tril = b.broadcast(
-            b.reshape(lower_triangle(&b, len, 0.0), vec![1, 1, len, len]),
-            vec![1, 2, len, len],
-        );
+        let h = b
+            .state_input(
+                "h",
+                TensorType::f32(shapes[6].1.clone()),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let tril = b
+            .broadcast(
+                b.reshape(lower_triangle(&b, len, 0.0).unwrap(), vec![1, 1, len, len])
+                    .unwrap(),
+                vec![1, 2, len, len],
+            )
+            .unwrap();
         let (py, ph) = mamba2_ssd_prefill(
             &b, traced[0], traced[1], traced[2], traced[3], traced[4], traced[5], h, tril,
-        );
+        )
+        .unwrap();
         let ids: Vec<_> = traced.iter().map(|t| t.id()).chain([h.id()]).collect();
         let prefill = b
             .finish(poot_graph_ir::Outputs::new(py).with_state(&[(h, ph)]))
@@ -256,17 +265,20 @@ fn the_ssd_scan_matches_the_decode_loop_and_the_seeded_prefill() {
         // The decode loop: `mamba2_ssd_decode` stepped per token from the same seed state.
         let step = ScanFixture { len: 1, ..fixture };
         let step_shapes = step.operand_shapes();
-        let d = Builder::new();
+        let d = Builder::for_tests();
         let dt: Vec<_> = step_shapes[..6]
             .iter()
-            .map(|(name, shape)| d.constant(name, TensorType::f32(shape.clone())))
+            .map(|(name, shape)| d.constant(name, TensorType::f32(shape.clone())).unwrap())
             .collect();
-        let dh = d.state_input(
-            "h",
-            TensorType::f32(step_shapes[6].1.clone()),
-            StateRole::Recurrent,
-        );
-        let (dy, dh_out) = mamba2_ssd_decode(&d, dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dh);
+        let dh = d
+            .state_input(
+                "h",
+                TensorType::f32(step_shapes[6].1.clone()),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let (dy, dh_out) =
+            mamba2_ssd_decode(&d, dt[0], dt[1], dt[2], dt[3], dt[4], dt[5], dh).unwrap();
         let ids: Vec<_> = dt.iter().map(|t| t.id()).chain([dh.id()]).collect();
         let decode = d
             .finish(poot_graph_ir::Outputs::new(dy).with_state(&[(dh, dh_out)]))

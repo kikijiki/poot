@@ -1,6 +1,9 @@
 //! Complete, valid `Body` fixtures for codegen tests: every local is declared and the body is well-typed.
 
-use crate::*;
+use crate::{
+    BasicBlock, BinOp, BlockId, Body, IndexAxis, Local, LocalDecl, Operand, Place, ProjectionElem,
+    Rvalue, Statement, SwitchTargets, Terminator, Ty,
+};
 
 fn slice_f32(mutable: bool) -> Ty {
     Ty::Ref {

@@ -9,10 +9,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use poot_executor::{BufferRole, Device, Dispatch, Engine};
-use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target};
-use poot_models::chat::ChatFormat;
+use poot_executor::{Device, Dispatch, Engine};
+use poot_graph_ir::{BinOp, Graph, StateRole, TensorType};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target, production_plan::Submission};
 use poot_models::components::standard::{HIDDEN_CARRY_STATE, Step, check_step};
 use poot_models::model::{
     FamilyKey, HiddenCarry, LogitRows, Model, ModelConfig, ModelError, ModelOutput, Phase,
@@ -20,8 +19,10 @@ use poot_models::model::{
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
+use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
+use poot_text::ChatFormat;
 
 use super::error::{DriverError, Unsupported};
 use super::tests::tiny_text;
@@ -90,33 +91,37 @@ impl Model for Carrier {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         check_step(CARRIER, phase, shape, CAPACITY)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let token = b.cast(
             b.guard_index_bounds(step.tokens(), VOCAB)
                 .expect("the step's ids are a rank-2 I32 tensor")
                 .guarded,
             DType::F32,
-        );
-        let pos = b.cast(step.pos(), DType::F32);
-        let seed = b.binary(BinOp::Add, token, pos);
+        )?;
+        let pos = b.cast(step.pos(), DType::F32)?;
+        let seed = b.binary(BinOp::Add, token, pos)?;
         // The state a position would hand on: its seed, at every position and width.
-        let hidden = b.broadcast(b.reshape(seed, vec![rows, n, 1]), vec![rows, n, WIDTH]);
+        let hidden = b.broadcast(b.reshape(seed, vec![rows, n, 1])?, vec![rows, n, WIDTH])?;
         match self.kind {
-            Kind::Kv => step.carry_hidden(&b, hidden),
+            Kind::Kv => step.carry_hidden(&b, hidden)?,
             Kind::Recurrent => {
-                let state = step.recurrent_state(&b, "toy.state", DType::F32, &[WIDTH]);
-                let last = b.slice(seed, 1, n - 1, n);
+                let state = step.recurrent_state(&b, "toy.state", DType::F32, &[WIDTH])?;
+                let last = b.slice(seed, 1, n - 1, n)?;
                 let folded = b.binary(
                     BinOp::Add,
                     state.current(),
-                    b.broadcast(last, vec![rows, WIDTH]),
-                );
-                step.carry_recurrent(&b, state, folded);
-                step.carry_hidden(&b, hidden);
+                    b.broadcast(last, vec![rows, WIDTH])?,
+                )?;
+                step.carry_recurrent(&b, state, folded)?;
+                step.carry_hidden(&b, hidden)?;
             }
             Kind::Wide => {
                 let positions = shape.hidden.map_or(1, |carry| carry.positions.get()) + 1;
@@ -124,18 +129,18 @@ impl Model for Carrier {
                     HIDDEN_CARRY_STATE,
                     TensorType::f32(vec![rows, positions, WIDTH]),
                     StateRole::Handoff,
-                );
+                )?;
                 step.carry(state, state);
             }
             Kind::Ignoring => {}
         }
         let out = if shape.logits == LogitRows::All { n } else { 1 };
-        let logits = b.broadcast(b.slice(seed, 1, n - out, n), vec![rows, out]);
+        let logits = b.broadcast(b.slice(seed, 1, n - out, n)?, vec![rows, out])?;
         let logits = b.broadcast(
-            b.reshape(logits, vec![rows, out, 1]),
+            b.reshape(logits, vec![rows, out, 1])?,
             vec![rows, out, VOCAB],
-        );
-        Ok(step.finish(b, logits).unwrap())
+        )?;
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -281,7 +286,7 @@ fn driver_of(kind: Kind, k: usize, carry: bool) -> Driver {
             decode: compile,
             capacity: nz(CAPACITY),
             prefill_chunk: nz(CHUNK),
-            max_trace_tokens: nz(CAPACITY),
+            trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(CAPACITY)),
             prepared: PreparedSetLimits {
                 max_entries: nz(64),
                 max_retained_bytes: NonZeroU64::new(1 << 40).unwrap(),
@@ -317,7 +322,11 @@ fn carry_avals(driver: &Driver) -> Vec<(super::EntryKey, Option<Vec<usize>>)> {
             let graph = driver
                 .handle
                 .model()
-                .trace(key.phase, key.shape)
+                .trace(
+                    key.phase,
+                    key.shape,
+                    poot_graph_ir::TraceLimits::for_tests(),
+                )
                 .expect("a prepared key traces");
             let shapes: Vec<Vec<usize>> = graph
                 .state_pairs()
@@ -413,7 +422,11 @@ fn the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched() {
     let schema = driver
         .handle
         .model()
-        .trace(decode.phase, decode.shape)
+        .trace(
+            decode.phase,
+            decode.shape,
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let carried: Vec<String> = schema
         .state_pairs()
@@ -425,7 +438,9 @@ fn the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched() {
         [HIDDEN_CARRY_STATE],
         "the schema declares the carry"
     );
-    let rollback = snapshot::snapshot_entries(&schema).expect("recurrent state is rolled back");
+    let rollback = snapshot::snapshot_entries(&schema, poot_graph_ir::TraceLimits::for_tests())
+        .expect("recurrent state is rolled back")
+        .unwrap();
     for graph in [&rollback.snapshot, &rollback.restore] {
         let mut names: Vec<String> = graph
             .state()

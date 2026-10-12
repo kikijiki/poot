@@ -11,7 +11,7 @@ use poot_graph_ir::{Builder, ComputedConst, Graph, IndexRange, Slot, TensorType}
 use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
 
-use poot_test_util::StepFixture;
+use poot_eval::test_support::StepFixture;
 
 use crate::{Fixture, step_fixtures, store_for};
 
@@ -24,18 +24,28 @@ const CAP: usize = 8;
 const SLOPES: [f64; HEADS] = [0.25, 0.0625, 0.015625, 0.00390625, 0.5, 0.125];
 
 fn graph(tokens: usize) -> Graph {
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, HEADS, tokens, D]));
-    let k = b.constant("k", TensorType::f32(vec![1, HEADS, CAP, D]));
-    let v = b.constant("v", TensorType::f32(vec![1, HEADS, CAP, D]));
-    let pos = b.slot_ranged(
-        Slot::Pos,
-        TensorType::new(vec![1, tokens], DType::I32),
-        IndexRange::below(CAP).expect("a nonempty cache"),
-    );
-    let slopes = b.computed(ComputedConst::AlibiSlopes { heads: HEADS });
-    let mask = alibi_mask_from_pos(&b, pos, CAP, None, slopes, HEADS);
-    let y = attention_masked(&b, q, k, v, 1, 1.0 / (D as f32).sqrt(), mask);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, HEADS, tokens, D]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, HEADS, CAP, D]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, HEADS, CAP, D]))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![1, tokens], DType::I32),
+            IndexRange::below(CAP).expect("a nonempty cache"),
+        )
+        .unwrap();
+    let slopes = b
+        .computed(ComputedConst::AlibiSlopes { heads: HEADS })
+        .unwrap();
+    let mask = alibi_mask_from_pos(&b, pos, CAP, None, slopes, HEADS).unwrap();
+    let y = attention_masked(&b, q, k, v, 1, 1.0 / (D as f32).sqrt(), mask).unwrap();
     b.finish(y).unwrap()
 }
 

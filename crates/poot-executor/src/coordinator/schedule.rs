@@ -29,11 +29,6 @@ pub(crate) struct Schedule {
 }
 
 impl Schedule {
-    #[cfg(test)]
-    pub(crate) fn rows(&self) -> &[ScheduledTransfer] {
-        &self.rows
-    }
-
     pub(crate) fn row(&self, id: PlanNodeId) -> Option<&ScheduledTransfer> {
         self.rows.iter().find(|row| row.row == id)
     }
@@ -245,5 +240,11 @@ mod tests {
             ])),
             Err(ScheduleError::DuplicateRowId(PlanNodeId(1)))
         );
+    }
+
+    impl Schedule {
+        pub(crate) fn rows(&self) -> &[ScheduledTransfer] {
+            &self.rows
+        }
     }
 }

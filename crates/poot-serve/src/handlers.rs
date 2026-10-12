@@ -72,23 +72,30 @@ pub(crate) fn stream_generation_error(
     Ok(())
 }
 
+/// A recorder around one frame write: runs `write` and returns its result. A test installs one on its
+/// handler thread to count attempts and time them; none is installed in a served build.
+type FrameRecorder = fn(&mut dyn FnMut() -> std::io::Result<()>) -> std::io::Result<()>;
+
+thread_local! {
+    static FRAME_RECORDER: std::cell::Cell<Option<FrameRecorder>> = const { std::cell::Cell::new(None) };
+}
+
 /// Write and flush one SSE data event as a single fallible operation, so a timeout or error returns
-/// immediately and no later finalization frame is attempted. One call is one write-deadline window;
-/// under a test build each call is also recorded on `sse_write_probe`, so "no later frame is
-/// attempted" is counted rather than inferred from wall time.
+/// immediately and no later finalization frame is attempted. One call is one write-deadline window; a
+/// recorder installed on the thread sees each call, so "no later frame is attempted" is counted rather
+/// than inferred from wall time.
 pub(crate) fn write_sse_data(
     stream: &mut TcpStream,
     data: &impl std::fmt::Display,
 ) -> std::io::Result<()> {
-    #[cfg(test)]
-    let result = sse_write_probe::attempt(|| write_sse_frame(stream, data));
-    #[cfg(not(test))]
-    let result = write_sse_frame(stream, data);
-    result
+    match FRAME_RECORDER.get() {
+        Some(record) => record(&mut || write_sse_frame(stream, data)),
+        None => write_sse_frame(stream, data),
+    }
 }
 
 /// The one blocking socket write behind [`write_sse_data`]: the frame bytes, then the flush that
-/// carries them. Split out so a test build can record the attempt around the whole operation.
+/// carries them. Split out so a recorder can wrap the whole operation.
 fn write_sse_frame(stream: &mut TcpStream, data: &impl std::fmt::Display) -> std::io::Result<()> {
     write!(stream, "data: {data}\n\n")?;
     stream.flush()
@@ -1033,41 +1040,36 @@ pub(crate) fn stream_receipt(
 
 /// Test-only count of response-frame write attempts, so a test can assert how many frames a handler
 /// tried after a write deadline fired instead of inferring it from wall time (which also carries work
-/// the deadline does not govern). Like `startup::select_serve_route_probe`, it is compiled out of
-/// production builds, so production keeps no seam. Thread-local because the connection handler both
-/// records and reads it, which also keeps tests that share a process under `cargo test` from seeing
-/// each other's attempts. Declared last so `clippy::items_after_test_module` stays quiet.
+/// the deadline does not govern). Installed on the handler's own thread, so tests that share a process
+/// never see each other's attempts. Declared last so `clippy::items_after_test_module` stays quiet.
 #[cfg(test)]
 pub(crate) mod sse_write_probe {
-    use std::cell::RefCell;
+    use std::cell::Cell;
     use std::time::{Duration, Instant};
 
-    #[derive(Default)]
-    struct Record {
-        /// frame writes recorded on this thread.
-        attempts: usize,
-        /// cumulative time inside those writes; a saturated attempt costs one write deadline.
-        blocked: Duration,
-    }
-
     thread_local! {
-        static RECORD: RefCell<Record> = RefCell::new(Record::default());
+        /// `(attempts, blocked)`: frame writes on this thread and the time inside them; a saturated
+        /// attempt costs one write deadline.
+        static RECORD: Cell<(usize, Duration)> = const { Cell::new((0, Duration::ZERO)) };
     }
 
-    /// Run one frame write, recording its duration on this thread, and return its result unchanged.
-    pub(crate) fn attempt(write: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    fn attempt(write: &mut dyn FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
         let started = Instant::now();
         let result = write();
         RECORD.with(|record| {
-            let mut record = record.borrow_mut();
-            record.attempts += 1;
-            record.blocked += started.elapsed();
+            let (attempts, blocked) = record.get();
+            record.set((attempts + 1, blocked + started.elapsed()));
         });
         result
     }
 
+    /// Record the frame writes the calling thread makes from now on.
+    pub(crate) fn install() {
+        super::FRAME_RECORDER.set(Some(attempt));
+    }
+
     /// `(attempts, blocked)` recorded so far on the calling thread.
     pub(crate) fn summary() -> (usize, Duration) {
-        RECORD.with(|record| (record.borrow().attempts, record.borrow().blocked))
+        RECORD.with(|record| record.get())
     }
 }

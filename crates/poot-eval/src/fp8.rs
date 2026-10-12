@@ -4,7 +4,6 @@
 
 use poot_tensor::{DType, HostData, HostTensor};
 
-use poot_load::packed_safetensors::ExactSourceKind;
 use poot_quant::scalar::e4m3fn_to_f32;
 
 use crate::EvalError;
@@ -20,13 +19,6 @@ pub enum Fp8Error {
     },
     #[error(transparent)]
     Carrier(#[from] poot_tensor::CarrierError),
-    #[error(
-        "e4m3fn tensor needs an authenticated F8_E4M3 source owner, got {kind:?} with dtype {dtype}"
-    )]
-    SourceOwnerKind {
-        kind: ExactSourceKind,
-        dtype: String,
-    },
 }
 
 /// Static layout of the normative Stage 1 portable representation.
@@ -78,25 +70,6 @@ pub fn encode_e4m3fn_tensor(shape: Vec<usize>, values: &[f32]) -> Result<HostTen
     validate_elements(&shape, values.len())?;
     let bytes = values.iter().copied().map(encode_e4m3fn).collect();
     e4m3fn_tensor(shape, bytes)
-}
-
-/// Pack each final-axis row of an E4M3FN tensor independently into little-endian u32 lanes. Newly
-/// allocated words start at zero, so all missing lanes in a ragged row remain deterministic zero
-/// padding. Test-only (card 546b): the production packer was the deleted `GpuExecutor::bind_resident`'s E4M3
-/// upload path, gone with the rest of the pre-contract executor.
-#[cfg(test)]
-pub(crate) fn pack_portable_words(tensor: &HostTensor) -> Vec<u32> {
-    let layout = PortableE4m3FnLayout::for_shape(tensor.shape());
-    let bytes = tensor.view().bytes();
-    let mut words = vec![0u32; layout.word_count];
-    for row in 0..layout.outer {
-        for col in 0..layout.logical_row_len {
-            let byte = bytes[row * layout.logical_row_len + col] as u32;
-            let word = row * layout.words_per_row + col / 4;
-            words[word] |= byte << (8 * (col % 4));
-        }
-    }
-    words
 }
 
 fn validate_elements(shape: &[usize], got: usize) -> Result<(), Fp8Error> {
@@ -307,8 +280,10 @@ mod tests {
         // this). What the one walk still refuses, categorically, is binding an E4M3FN-*declared*
         // input as a plain `Value::Host` - reinterpreting its f32 bit pattern as fp8 bytes (or vice
         // versa) instead of carrying authoritative raw bytes through `Value::E4M3Fn`.
-        let builder = Builder::new();
-        let x = builder.constant("x", TensorType::new(vec![2], DType::E4M3FN));
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("x", TensorType::new(vec![2], DType::E4M3FN))
+            .unwrap();
         let graph = builder.finish(x).unwrap();
         assert!(
             graph.eqns().is_empty(),
@@ -334,9 +309,9 @@ mod tests {
         // The positive case `generic_graph_eval_rejects_fp8_bound_as_a_plain_f32_tensor` deliberately
         // does not cover: an F32-*declared* input, bound as an ordinary `Value::Host`, cast to
         // E4M3FN. This is a real encode, not a reinterpretation, and the one walk computes it.
-        let builder = Builder::new();
-        let x = builder.constant("x", TensorType::f32(vec![2]));
-        let y = builder.cast(x, DType::E4M3FN);
+        let builder = Builder::for_tests();
+        let x = builder.constant("x", TensorType::f32(vec![2])).unwrap();
+        let y = builder.cast(x, DType::E4M3FN).unwrap();
         let graph = builder.finish(y).unwrap();
         let inputs: HashMap<_, crate::Value> = HashMap::from([(
             graph.inputs()[0],
@@ -361,9 +336,11 @@ mod tests {
 
     #[test]
     fn generic_value_cast_and_reshape_preserve_fp8_storage() {
-        let builder = Builder::new();
-        let x = builder.constant("x", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let reshaped = builder.reshape(x, vec![5, 2]);
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("x", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
+        let reshaped = builder.reshape(x, vec![5, 2]).unwrap();
         let graph = builder.finish(reshaped).unwrap();
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let inputs = HashMap::from([(
@@ -383,10 +360,10 @@ mod tests {
         assert_eq!(got.shape(), [5, 2]);
         assert_eq!(got.view().bytes(), bytes);
 
-        let builder = Builder::new();
-        let x = builder.constant("x", TensorType::f32(vec![2, 5]));
-        let encoded = builder.cast(x, DType::E4M3FN);
-        let decoded = builder.cast(encoded, DType::F32);
+        let builder = Builder::for_tests();
+        let x = builder.constant("x", TensorType::f32(vec![2, 5])).unwrap();
+        let encoded = builder.cast(x, DType::E4M3FN).unwrap();
+        let decoded = builder.cast(encoded, DType::F32).unwrap();
         let graph = builder.finish(decoded).unwrap();
         let values = vec![
             0.0,
@@ -424,9 +401,11 @@ mod tests {
 
     #[test]
     fn generic_value_same_dtype_e4m3fn_cast_aliases_authoritative_bytes() {
-        let builder = Builder::new();
-        let x = builder.constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let same_dtype = builder.cast(x, DType::E4M3FN);
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
+        let same_dtype = builder.cast(x, DType::E4M3FN).unwrap();
         let graph = builder.finish(same_dtype).unwrap();
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let raw = e4m3fn_tensor(vec![2, 5], bytes.clone()).unwrap();
@@ -453,8 +432,10 @@ mod tests {
 
     #[test]
     fn generic_value_zero_eqn_raw_identity_returns_input_without_reencoding() {
-        let builder = Builder::new();
-        let x = builder.constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN));
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
         let graph = builder.finish(x).unwrap();
         assert!(
             graph.eqns().is_empty(),
@@ -486,12 +467,14 @@ mod tests {
 
     #[test]
     fn generic_value_state_pass_through_keeps_authoritative_host_allocation() {
-        let builder = Builder::new();
-        let state = builder.state_input(
-            "raw_state",
-            TensorType::new(vec![2, 5], DType::E4M3FN),
-            StateRole::Recurrent,
-        );
+        let builder = Builder::for_tests();
+        let state = builder
+            .state_input(
+                "raw_state",
+                TensorType::new(vec![2, 5], DType::E4M3FN),
+                StateRole::Recurrent,
+            )
+            .unwrap();
         let graph = builder
             .finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
             .unwrap();
@@ -523,15 +506,23 @@ mod tests {
 
     #[test]
     fn generic_value_state_carries_two_ragged_raw_updates_without_dense_reconstruction() {
-        let builder = Builder::new();
-        let state = builder.state_input(
-            "raw_state",
-            TensorType::new(vec![2, 5], DType::E4M3FN),
-            StateRole::Recurrent,
-        );
-        let update = builder.constant("raw_update", TensorType::new(vec![2, 2], DType::E4M3FN));
-        let index = builder.constant("index", TensorType::scalar(DType::I32));
-        let state_out = builder.dynamic_update_slice_dyn(state, update, index, 1);
+        let builder = Builder::for_tests();
+        let state = builder
+            .state_input(
+                "raw_state",
+                TensorType::new(vec![2, 5], DType::E4M3FN),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let update = builder
+            .constant("raw_update", TensorType::new(vec![2, 2], DType::E4M3FN))
+            .unwrap();
+        let index = builder
+            .constant("index", TensorType::scalar(DType::I32))
+            .unwrap();
+        let state_out = builder
+            .dynamic_update_slice_dyn(state, update, index, 1)
+            .unwrap();
         let graph = builder
             .finish(poot_graph_ir::Outputs::new(state_out).with_state(&[(state, state_out)]))
             .unwrap();
@@ -589,12 +580,14 @@ mod tests {
 
     #[test]
     fn generic_value_state_rejects_a_binding_dtype_mismatch() {
-        let builder = Builder::new();
-        let state = builder.state_input(
-            "raw_state",
-            TensorType::new(vec![2, 5], DType::E4M3FN),
-            StateRole::Recurrent,
-        );
+        let builder = Builder::for_tests();
+        let state = builder
+            .state_input(
+                "raw_state",
+                TensorType::new(vec![2, 5], DType::E4M3FN),
+                StateRole::Recurrent,
+            )
+            .unwrap();
         let graph = builder
             .finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
             .unwrap();
@@ -618,9 +611,11 @@ mod tests {
 
     #[test]
     fn generic_value_transpose_preserves_raw_bytes() {
-        let builder = Builder::new();
-        let x = builder.constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let y = builder.transpose(x, vec![1, 0]);
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
+        let y = builder.transpose(x, vec![1, 0]).unwrap();
         let graph = builder.finish(y).unwrap();
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let input = e4m3fn_tensor(vec![2, 5], bytes).unwrap();
@@ -645,9 +640,11 @@ mod tests {
 
     #[test]
     fn generic_value_slice_preserves_raw_bytes() {
-        let builder = Builder::new();
-        let x = builder.constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let y = builder.slice(x, 1, 1, 4);
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("raw", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
+        let y = builder.slice(x, 1, 1, 4).unwrap();
         let graph = builder.finish(y).unwrap();
         let bytes = vec![0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5];
         let input = e4m3fn_tensor(vec![2, 5], bytes).unwrap();
@@ -669,10 +666,14 @@ mod tests {
 
     #[test]
     fn generic_value_concat_preserves_raw_bytes() {
-        let builder = Builder::new();
-        let a = builder.constant("a", TensorType::new(vec![2, 3], DType::E4M3FN));
-        let b = builder.constant("b", TensorType::new(vec![2, 2], DType::E4M3FN));
-        let output = builder.concat(1, &[a, b]);
+        let builder = Builder::for_tests();
+        let a = builder
+            .constant("a", TensorType::new(vec![2, 3], DType::E4M3FN))
+            .unwrap();
+        let b = builder
+            .constant("b", TensorType::new(vec![2, 2], DType::E4M3FN))
+            .unwrap();
+        let output = builder.concat(1, &[a, b]).unwrap();
         let graph = builder.finish(output).unwrap();
         let inputs = HashMap::from([
             (
@@ -698,10 +699,14 @@ mod tests {
 
     #[test]
     fn generic_value_gather_preserves_raw_bytes() {
-        let builder = Builder::new();
-        let x = builder.constant("raw", TensorType::new(vec![3, 5], DType::E4M3FN));
-        let index = builder.constant("index", TensorType::scalar(DType::I32));
-        let y = builder.gather(x, 0, index);
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("raw", TensorType::new(vec![3, 5], DType::E4M3FN))
+            .unwrap();
+        let index = builder
+            .constant("index", TensorType::scalar(DType::I32))
+            .unwrap();
+        let y = builder.gather(x, 0, index).unwrap();
         let graph = builder.finish(y).unwrap();
         let bytes = vec![
             0x00, 0x80, 0x01, 0x7e, 0x7f, 0xff, 0x38, 0xb8, 0x55, 0xd5, 0xff, 0x7f, 0x01, 0x02,
@@ -765,13 +770,25 @@ mod tests {
     fn generic_value_dynamic_update_slice_supports_static_and_runtime_indices() {
         let cases = [(false, 1usize), (true, 2usize)];
         for (runtime, position) in cases {
-            let builder = Builder::new();
-            let operand = builder.constant("operand", TensorType::new(vec![2, 5], DType::E4M3FN));
-            let update = builder.constant("update", TensorType::new(vec![2, 2], DType::E4M3FN));
-            let index = runtime.then(|| builder.constant("index", TensorType::scalar(DType::I32)));
+            let builder = Builder::for_tests();
+            let operand = builder
+                .constant("operand", TensorType::new(vec![2, 5], DType::E4M3FN))
+                .unwrap();
+            let update = builder
+                .constant("update", TensorType::new(vec![2, 2], DType::E4M3FN))
+                .unwrap();
+            let index = runtime.then(|| {
+                builder
+                    .constant("index", TensorType::scalar(DType::I32))
+                    .unwrap()
+            });
             let output = match index {
-                Some(index) => builder.dynamic_update_slice_dyn(operand, update, index, 1),
-                None => builder.dynamic_update_slice(operand, update, position, 1),
+                Some(index) => builder
+                    .dynamic_update_slice_dyn(operand, update, index, 1)
+                    .unwrap(),
+                None => builder
+                    .dynamic_update_slice(operand, update, position, 1)
+                    .unwrap(),
             };
             let graph = builder.finish(output).unwrap();
             let operand_bytes = vec![0x7f, 1, 2, 3, 0xff, 4, 5, 6, 7, 8];
@@ -824,11 +841,19 @@ mod tests {
     /// equation could index it; there is no implicit F32 -> I32 conversion at bind.
     #[test]
     fn generic_value_rejects_a_non_i32_index_binding_before_indexing() {
-        let builder = Builder::new();
-        let operand = builder.constant("operand", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let update = builder.constant("update", TensorType::new(vec![2, 2], DType::E4M3FN));
-        let index = builder.constant("index", TensorType::scalar(DType::I32));
-        let output = builder.dynamic_update_slice_dyn(operand, update, index, 1);
+        let builder = Builder::for_tests();
+        let operand = builder
+            .constant("operand", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
+        let update = builder
+            .constant("update", TensorType::new(vec![2, 2], DType::E4M3FN))
+            .unwrap();
+        let index = builder
+            .constant("index", TensorType::scalar(DType::I32))
+            .unwrap();
+        let output = builder
+            .dynamic_update_slice_dyn(operand, update, index, 1)
+            .unwrap();
         let graph = builder.finish(output).unwrap();
         let inputs = HashMap::from([
             (
@@ -855,11 +880,17 @@ mod tests {
         .to_string();
         assert!(message.contains("different dtype"), "{message}");
 
-        let builder = Builder::new();
-        let base = builder.constant("base", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let src = builder.constant("src", TensorType::new(vec![1, 5], DType::E4M3FN));
-        let inverse = builder.constant("inverse", TensorType::new(vec![2], DType::I32));
-        let output = builder.scatter_update(base, src, inverse);
+        let builder = Builder::for_tests();
+        let base = builder
+            .constant("base", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
+        let src = builder
+            .constant("src", TensorType::new(vec![1, 5], DType::E4M3FN))
+            .unwrap();
+        let inverse = builder
+            .constant("inverse", TensorType::new(vec![2], DType::I32))
+            .unwrap();
+        let output = builder.scatter_update(base, src, inverse).unwrap();
         let graph = builder.finish(output).unwrap();
         let inputs = HashMap::from([
             (
@@ -889,9 +920,11 @@ mod tests {
 
     #[test]
     fn generic_value_broadcast_preserves_raw_bytes() {
-        let builder = Builder::new();
-        let x = builder.constant("raw", TensorType::new(vec![1, 3], DType::E4M3FN));
-        let y = builder.broadcast(x, vec![2, 3]);
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("raw", TensorType::new(vec![1, 3], DType::E4M3FN))
+            .unwrap();
+        let y = builder.broadcast(x, vec![2, 3]).unwrap();
         let graph = builder.finish(y).unwrap();
         let input = e4m3fn_tensor(vec![1, 3], vec![0x7f, 0xff, 0x01]).unwrap();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
@@ -912,11 +945,17 @@ mod tests {
 
     #[test]
     fn generic_value_scatter_update_preserves_raw_bytes() {
-        let builder = Builder::new();
-        let base = builder.constant("base", TensorType::new(vec![3, 5], DType::E4M3FN));
-        let src = builder.constant("src", TensorType::new(vec![2, 5], DType::E4M3FN));
-        let inverse = builder.constant("inverse", TensorType::new(vec![3], DType::I32));
-        let output = builder.scatter_update(base, src, inverse);
+        let builder = Builder::for_tests();
+        let base = builder
+            .constant("base", TensorType::new(vec![3, 5], DType::E4M3FN))
+            .unwrap();
+        let src = builder
+            .constant("src", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
+        let inverse = builder
+            .constant("inverse", TensorType::new(vec![3], DType::I32))
+            .unwrap();
+        let output = builder.scatter_update(base, src, inverse).unwrap();
         let graph = builder.finish(output).unwrap();
         let base_value = e4m3fn_tensor(
             vec![3, 5],
@@ -946,5 +985,23 @@ mod tests {
             got.view().bytes(),
             [0x7f, 31, 32, 33, 34, 5, 6, 7, 8, 9, 0xff, 21, 22, 23, 24]
         );
+    }
+
+    /// Pack each final-axis row of an E4M3FN tensor independently into little-endian u32 lanes. Newly
+    /// allocated words start at zero, so all missing lanes in a ragged row remain deterministic zero
+    /// padding. Test-only (card 546b): the production packer was the deleted `GpuExecutor::bind_resident`'s E4M3
+    /// upload path, gone with the rest of the pre-contract executor.
+    pub(crate) fn pack_portable_words(tensor: &HostTensor) -> Vec<u32> {
+        let layout = PortableE4m3FnLayout::for_shape(tensor.shape());
+        let bytes = tensor.view().bytes();
+        let mut words = vec![0u32; layout.word_count];
+        for row in 0..layout.outer {
+            for col in 0..layout.logical_row_len {
+                let byte = bytes[row * layout.logical_row_len + col] as u32;
+                let word = row * layout.words_per_row + col / 4;
+                words[word] |= byte << (8 * (col % 4));
+            }
+        }
+        words
     }
 }

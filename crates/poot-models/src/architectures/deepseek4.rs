@@ -26,13 +26,13 @@ use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
 
-use crate::chat::ChatFormat;
 use crate::components::standard::{Step, check_step};
 use crate::model::{
     FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason, StepShape,
     TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 mod config;
 mod csa;
@@ -45,9 +45,9 @@ mod stack;
 #[cfg(test)]
 mod tests;
 
-pub use config::{DeepseekV4Config, LayerKind};
+pub(crate) use config::DeepseekV4Config;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("deepseek4");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek4");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -58,7 +58,7 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
 };
 
 #[derive(Debug)]
-pub struct DeepseekV4 {
+pub(crate) struct DeepseekV4 {
     params: DeepseekV4Config,
     weights: WeightMap,
     tower: stack::Tower,
@@ -97,7 +97,7 @@ impl Model for DeepseekV4 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         crate::components::moe::check_step(FAMILY, shape, &p.score_moe)?;
@@ -109,9 +109,8 @@ impl Model for DeepseekV4 {
                 reason: ShapeReason::Granule { granule },
             });
         }
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
-        let logits = self.tower.trace(&b, &step, p);
+        let step = Step::new(&b, shape)?;
+        let logits = self.tower.trace(&b, &step, p)?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -183,7 +182,7 @@ fn finetune_fixture() -> Fixture {
 
 /// Every tensor of a checkpoint of `config`'s dimensions: `(name, shape, how it is stored)`.
 pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, Stored)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, w, layers) = (n("vocab_size"), n("hidden_size"), n("num_hidden_layers"));
     let (heads, d) = (n("num_attention_heads"), n("head_dim"));
     let (ql, groups, ol) = (n("q_lora_rank"), n("o_groups"), n("o_lora_rank"));

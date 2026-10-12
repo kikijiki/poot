@@ -152,6 +152,7 @@ pub(crate) fn gerr(msg: &str) -> LoadError {
     LoadError::SafeTensors(format!("gguf: {msg}"))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn gguf_gstr_bytes(s: &str) -> Vec<u8> {
     let mut v = (s.len() as u64).to_le_bytes().to_vec();
     v.extend_from_slice(s.as_bytes());
@@ -160,6 +161,7 @@ pub(crate) fn gguf_gstr_bytes(s: &str) -> Vec<u8> {
 
 /// Serialize a [`GgufValue`] to (type-id, body-bytes) for the writer. Supports the types
 /// `Cursor::value` accepts; arrays must be homogeneous.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn gguf_encode_value(val: &GgufValue) -> (u32, Vec<u8>) {
     match val {
         GgufValue::U32(x) => (4, x.to_le_bytes().to_vec()),
@@ -182,6 +184,7 @@ pub(crate) fn gguf_encode_value(val: &GgufValue) -> (u32, Vec<u8>) {
 /// Build a GGUF v3 byte buffer from metadata KVs and tensors `(name, ggml-ne-dims, ggml_type,
 /// raw_bytes)`, the inverse of [`GgufIndex::parse`] plus [`crate::gguf::read_gguf`]. Tensor data offsets are aligned to 32. A
 /// fixture utility (poot is not a converter) for building small in-memory GGUFs in tests.
+#[cfg(any(test, feature = "test-support"))]
 pub fn write_gguf(
     kvs: &[(&str, GgufValue)],
     tensors: &[(&str, Vec<u64>, u32, Vec<u8>)],

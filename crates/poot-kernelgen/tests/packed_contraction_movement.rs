@@ -10,8 +10,8 @@
 
 use poot_kernel_ir::Ty;
 use poot_kernel_ir::interp::{Buffer, run};
+use poot_kernel_ir::test_support::workgroups_covering;
 use poot_kernelgen::{KernelGenError, MovementOp, MovementSpec, Storage, UnitWindow, UpdateIndex};
-use poot_test_util::kernel_fixtures::workgroups_covering;
 
 /// A row-major tensor of lane values.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -903,8 +903,8 @@ fn device_bank(device: &mut Device<'_>) {
 #[test]
 fn the_movement_bank_matches_the_reference_on_wgpu() {
     use poot_codegen::{Target, artifact_path, compile, kernel_handle};
-    use poot_runtime::KernelBuffer;
-    let Ok(ctx) = poot_runtime::Context::new() else {
+    use poot_wgpu_runtime::KernelBuffer;
+    let Ok(ctx) = poot_wgpu_runtime::Context::new() else {
         eprintln!("no wgpu device; skipping");
         return;
     };
@@ -947,7 +947,8 @@ fn the_movement_bank_matches_the_reference_on_wgpu() {
 /// ROCm/HSA (AMDGCN): skips with no HSA library or GPU agent. Run serial under `/tmp/poot-gpu.lock`.
 #[test]
 fn the_movement_bank_matches_the_reference_on_rocm() {
-    use poot_rocm_runtime::{BufferRole, RocmContext, RocmError};
+    use poot_rocm_runtime::{RocmContext, RocmError};
+    use poot_runtime_common::BufferRole;
     use poot_target::ElementKind;
     let ctx = match RocmContext::new() {
         Ok(ctx) => ctx,

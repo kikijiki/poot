@@ -1,16 +1,20 @@
-use super::*;
+use super::{
+    Alloc, BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Layout, LocalDecl, Operand,
+    Place, Rvalue, Statement, Terminator, Ty, copy, elem, guard, ld, local, row_major_strides,
+    slice_dtype, view_eff_strides,
+};
 
 /// Workgroup width for [`binary_broadcast_dt_views_grid`]'s 2-D-grid-fold path. Mirrors
 /// `poot-graph-plan::ELEMENTWISE_2D_WIDTH` (kernelgen sits below poot-graph-plan, so it cannot reference
 /// it). `plan_eqn` bakes `body.workgroup_size[0]` to that constant, and the two must agree for the
 /// dispatch to reconstruct the same `i`; a unit test cross-checks them.
-pub const ELEMENTWISE_2D_WORKGROUP_SIZE: usize = 256;
+pub(crate) const ELEMENTWISE_2D_WORKGROUP_SIZE: usize = 256;
 
 /// Shared one-input elementwise skeleton; `make_rv` builds the rvalue computing the result from `x[i]`.
 /// Locals: _1 x, _2 y, _3 i, _4 len, _5 cmp, _6 r.
 /// Narrow floats (bf16/f16) widen to f32, run the op, then narrow back (spec 024). F32 and I32 compute in
 /// their storage type, so an exact-I32 `Not`/`Clz` body never recasts words through f32.
-pub fn build_unary_dt(name: &str, dt: Ty, make_rv: impl Fn(Place) -> Rvalue) -> Body {
+pub(crate) fn build_unary_dt(name: &str, dt: Ty, make_rv: impl Fn(Place) -> Rvalue) -> Body {
     build_unary_dt_grid(name, dt, make_rv, None)
 }
 
@@ -19,7 +23,7 @@ pub fn build_unary_dt(name: &str, dt: Ty, make_rv: impl Fn(Place) -> Rvalue) -> 
 /// element of the full `[1,Hq,L,L]` scores tensor, which at long ISL exceeds the `65535*256` ceiling
 /// (ISL=2048, Hq=14: 58,720,256 elements, `GridCap([229376,1,1])`). `x_groups: None` keeps the flat
 /// `ThreadIndexCall(X)`.
-pub fn build_unary_dt_grid(
+pub(crate) fn build_unary_dt_grid(
     name: &str,
     dt: Ty,
     make_rv: impl Fn(Place) -> Rvalue,
@@ -179,7 +183,7 @@ pub fn build_unary_dt_grid(
 /// fold (card 181 Bug 2): `dispatch_grid`/`is_elementwise_2d` cannot see whether an operand was promoted
 /// to a view (a planning-time fact in `poot-graph-plan`'s `views` map), so both the plain and view-reading
 /// bodies must fold identically whenever `is_elementwise_2d` says so.
-pub fn build_unary_dt_views_grid(
+pub(crate) fn build_unary_dt_views_grid(
     name: &str,
     dt: Ty,
     out_shape: &[usize],

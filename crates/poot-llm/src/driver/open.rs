@@ -7,8 +7,8 @@ use std::num::NonZeroUsize;
 use poot_executor::{
     Coordinator, DetailedTiming, DeviceError, Engine, ExecError, Executor, TimingOptions,
 };
-use poot_graph_plan::DeviceId;
-use poot_ptx_gpu::device::PtxDevice;
+use poot_graph_plan::multi_device::topology::DeviceId;
+use poot_ptx_device::device::PtxDevice;
 
 use crate::driver::error::{DriverError, InvalidOptions, Unsupported};
 
@@ -92,9 +92,9 @@ fn engine<D: poot_executor::Device + 'static>(device: D, timing: Timing) -> Box<
 
 fn wgpu(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
     let device = match timing {
-        Timing::Counters => poot_gpu::device::WgpuDevice::new(),
+        Timing::Counters => poot_wgpu_device::device::WgpuDevice::new(),
         Timing::Detailed(_) => {
-            poot_gpu::device::WgpuDevice::new_with_device_timing(timing.queries())
+            poot_wgpu_device::device::WgpuDevice::new_with_device_timing(timing.queries())
         }
     }
     .map_err(|e| open_failed("wgpu", e))?;
@@ -103,8 +103,8 @@ fn wgpu(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
 
 fn ptx(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
     let device = match timing {
-        Timing::Counters => poot_ptx_gpu::device::PtxDevice::new(),
-        Timing::Detailed(_) => poot_ptx_gpu::device::PtxDevice::new_with_device_timing(),
+        Timing::Counters => poot_ptx_device::device::PtxDevice::new(),
+        Timing::Detailed(_) => poot_ptx_device::device::PtxDevice::new_with_device_timing(),
     }
     .map_err(|e| open_failed("ptx", e))?;
     Ok(engine(device, timing))
@@ -118,8 +118,8 @@ fn vulkan() -> Result<Box<dyn Executor>, DriverError> {
 #[cfg(feature = "rocm")]
 fn rocm(timing: Timing) -> Result<Box<dyn Executor>, DriverError> {
     let device = match timing {
-        Timing::Counters => poot_rocm_gpu::device::RocmDevice::new(),
-        Timing::Detailed(_) => poot_rocm_gpu::device::RocmDevice::new_with_device_timing(),
+        Timing::Counters => poot_rocm_device::device::RocmDevice::new(),
+        Timing::Detailed(_) => poot_rocm_device::device::RocmDevice::new_with_device_timing(),
     }
     .map_err(|e| open_failed("rocm", e))?;
     Ok(engine(device, timing))

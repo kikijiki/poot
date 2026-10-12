@@ -73,7 +73,7 @@ use super::{
     Driver, EntryKey, ModelRole, ServingShapes, SlotRole, StateResidency, StepData, window_wall,
 };
 use crate::core::sampler::{Sampler, SamplerFault};
-use crate::text::tokenize::TextCodec;
+use poot_text::TextCodec;
 
 /// How a driver proposes tokens for a decode row to verify. No `Default`: every driver states it.
 #[derive(Clone, Debug)]
@@ -266,10 +266,14 @@ pub(super) struct Speculation {
     seqs: HashMap<SeqId, DraftSeq>,
     /// Under [`DraftPolicy::Mtp`], each sequence's first draft of its next round.
     mtp: HashMap<SeqId, MtpNext>,
-    /// Every proposal made, in order: no stat or event carries the rejected drafts, and the oracle rows
-    /// compare them.
-    #[cfg(test)]
-    pub(super) proposed: Vec<(SeqId, Vec<u32>)>,
+    /// Told each row's proposal as it is made: no stat or event carries the rejected drafts, and the
+    /// oracle rows compare them. Absent unless the caller installs one.
+    pub(super) observer: Option<Box<dyn ProposalObserver>>,
+}
+
+/// A hook on the proposal path: the drafts the policy proposed for one row of a step, accepted or not.
+pub(super) trait ProposalObserver: Send {
+    fn proposed(&mut self, seq: SeqId, drafts: &[u32]);
 }
 
 impl Speculation {
@@ -279,8 +283,7 @@ impl Speculation {
             draft: None,
             seqs: HashMap::new(),
             mtp: HashMap::new(),
-            #[cfg(test)]
-            proposed: Vec::new(),
+            observer: None,
         }
     }
 
@@ -450,10 +453,9 @@ impl Driver {
                 }
                 plan.picks = plan.feed.len();
             }
-            #[cfg(test)]
-            self.speculation
-                .proposed
-                .push((row.seq, proposal.drafts.clone()));
+            if let Some(observer) = self.speculation.observer.as_deref_mut() {
+                observer.proposed(row.seq, &proposal.drafts);
+            }
             plan.spec = Some(SpecRow { room, proposal });
         }
         self.snapshot_rows(rows, plans)
@@ -1160,10 +1162,9 @@ impl Driver {
 /// Whether the draft model's tokenizer gives every token it has, within the target's ids, the id the
 /// target gives it. Ids beyond the target's vocabulary are the vocabulary check's.
 fn same_token_ids(draft: &TextCodec, target: &TextCodec, target_vocab: usize) -> bool {
-    let target = target.tokenizer.get_vocab(true);
+    let target = target.vocabulary();
     draft
-        .tokenizer
-        .get_vocab(true)
+        .vocabulary()
         .iter()
         .filter(|&(_, &id)| (id as usize) < target_vocab)
         .all(|(token, id)| target.get(token) == Some(id))

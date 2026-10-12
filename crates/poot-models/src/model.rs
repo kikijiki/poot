@@ -6,10 +6,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::Graph;
+use poot_graph_ir::{Builder, BuilderError, Graph, TraceBudgetExceeded, TraceLimits};
 use poot_quant::weights::{HandleFormat, WeightId, WeightMap, WeightMapError};
 
-use crate::chat::ChatFormat;
+use poot_text::ChatFormat;
 
 /// A family's display name (`"qwen2"`): for messages and receipts only; nothing dispatches on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -151,9 +151,49 @@ pub trait Model: Send + Sync + fmt::Debug {
 
     fn weights(&self) -> &WeightMap;
 
-    /// The graph of one step of `phase` at `shape`. A shape the family cannot trace is a typed
-    /// refusal, never a panic.
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError>;
+    /// The body of one traced step: trace `phase` at `shape` into `b`, a builder already charging
+    /// the caller's [`TraceLimits`]. A shape the family cannot trace is a typed refusal, never a
+    /// panic. Callers use `<dyn Model>::trace`, which checks the step's token count first; the
+    /// trait has no `trace` method a family could override, so the admission cannot be skipped.
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError>;
+}
+
+impl dyn Model + '_ {
+    /// The graph of one step of `phase` at `shape` under the caller's `limits`.
+    ///
+    /// A step of more tokens than `limits.max_tokens` is refused before the tracer body runs; every
+    /// value, equation, literal and owned allocation the body makes is charged against the same
+    /// limits, so a refusal names the exact resource and nothing past it was built. This is an
+    /// inherent method of the trait object, so no family can replace it:
+    ///
+    /// ```compile_fail
+    /// use poot_graph_ir::{Builder, Graph, TraceLimits};
+    /// use poot_models::model::{Model, ModelConfig, Phase, StepShape, TraceError};
+    /// use poot_quant::weights::WeightMap;
+    ///
+    /// #[derive(Debug)]
+    /// struct Skips;
+    /// impl Model for Skips {
+    ///     fn config(&self) -> &ModelConfig { unimplemented!() }
+    ///     fn weights(&self) -> &WeightMap { unimplemented!() }
+    ///     fn trace_into(&self, _: Phase, _: StepShape, _: Builder) -> Result<Graph, TraceError> {
+    ///         unimplemented!()
+    ///     }
+    ///     // a family cannot provide its own admission-free entry point
+    ///     fn trace(&self, _: Phase, _: StepShape, _: TraceLimits) -> Result<Graph, TraceError> {
+    ///         unimplemented!()
+    ///     }
+    /// }
+    /// ```
+    pub fn trace(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        limits: TraceLimits,
+    ) -> Result<Graph, TraceError> {
+        limits.admit_tokens(shape.tokens)?;
+        self.trace_into(phase, shape, Builder::new(limits))
+    }
 }
 
 /// Why a config field cannot configure a family.
@@ -262,6 +302,12 @@ pub enum ModelError {
         id: WeightId,
         format: HandleFormat,
     },
+    /// A guarantee the family's wiring relies on does not hold.
+    #[error("{family}: {source}")]
+    Wiring {
+        family: FamilyKey,
+        source: WiringError,
+    },
     /// A stored value the family cannot read: element `index` (row-major) of the index table `id`
     /// is `value`, outside the I32 range its tracer indexes with.
     #[error("{family}: weight {id} element {index} is {value}, outside the I32 range")]
@@ -271,6 +317,104 @@ pub enum ModelError {
         index: usize,
         value: i64,
     },
+}
+
+/// A guarantee the config reader or a step check establishes before tracing does not hold where a
+/// shared component needs it: the family's wiring is defective (a parameter block a layer kind needs
+/// is missing, a step input a phase carries is absent). Never a property of a checkpoint; reported as a
+/// value so the tracer path has no panic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WiringError {
+    /// A layer kind needs a parameter block the config reader read only for configs that have it.
+    #[error("a layer needs the {0} parameters, which the config did not read")]
+    MissingParams(ParamBlock),
+    /// A program that reads the hidden-state carry was traced for a step whose shape names none:
+    /// the phase check ([`check_mtp_step`](crate::components::standard::check_mtp_step)) refuses it.
+    #[error("the step's shape names no hidden-state carry")]
+    MissingHiddenCarry,
+    /// An MLA attention was given a key-position selector but a plain (not low-rank) query: the
+    /// family guarantees the low-rank query beside every selector.
+    #[error("a key-position selector needs the low-rank query")]
+    SelectorWithoutLowRankQuery,
+    /// A step with slot maps was traced against a contiguous KV layout.
+    #[error("a step with slot maps must be paged")]
+    SlotMapsOnContiguousStep,
+    /// A sectioned rope was traced over a step that carries no mRoPE position input.
+    #[error("a sectioned rope needs the step's mRoPE positions")]
+    SectionedRopeWithoutMrope,
+    /// `apply_rope_sectioned` was given a plain (unsectioned) rope.
+    #[error("sectioned rotation needs a sectioned RopeParams")]
+    RopeNotSectioned,
+    /// A layer index whose validation id does not fit its id space.
+    #[error("layer index {layer} has no validation id")]
+    LayerIndexOutOfRange { layer: usize },
+    /// A group-limited router over the sqrt-softplus arm, which the limit refuses at construction.
+    #[error("a group limit is not defined for the sqrt-softplus router")]
+    GroupLimitOnSqrtSoftplus,
+    /// Per-expert scores asked of a softmax router.
+    #[error("only a biased top-k router scores each expert on its own")]
+    ScoresOfSoftmaxRouter,
+    /// A hidden-state carry written with rows of another extent than the carry holds.
+    #[error("carried hidden rows are {found} wide or long where the carry holds {expected}")]
+    HiddenCarryRows { expected: usize, found: usize },
+    /// A sandwich layer built without its two post norms.
+    #[error("a sandwich layer needs its post norms")]
+    SandwichWithoutPostNorms,
+    /// A vision step whose patch count does not fit the rotary table's `u32` positions.
+    #[error("{patches} patches do not fit a rotary table of u32 positions")]
+    PatchesOutOfRange { patches: usize },
+    /// A sharded embedding table with no shard to read.
+    #[error("a sharded table has no shards")]
+    TableWithoutShards,
+    /// An order-3 n-gram head was traced for a spec that hashes only two tokens.
+    #[error("an order-3 n-gram head has no third hashed token")]
+    NgramOrderThree,
+}
+
+impl WiringError {
+    /// `block` of a family config, or the wiring defect that it is absent where a layer needs it.
+    pub fn require<T>(block: &Option<T>, name: ParamBlock) -> Result<&T, WiringError> {
+        block.as_ref().ok_or(WiringError::MissingParams(name))
+    }
+}
+
+/// A family-config parameter block that only some layer kinds need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamBlock {
+    Dense,
+    Moe,
+    Kda,
+    Dsa,
+    Indexer,
+    /// The low-rank query projection of an MLA attention.
+    LowRankQuery,
+    /// A hyper-connection layer's per-stream injection weights.
+    Injection,
+}
+
+impl fmt::Display for ParamBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ParamBlock::Dense => "dense feed-forward",
+            ParamBlock::Moe => "mixture-of-experts",
+            ParamBlock::Kda => "KDA",
+            ParamBlock::Dsa => "DSA",
+            ParamBlock::Indexer => "indexer",
+            ParamBlock::LowRankQuery => "low-rank query",
+            ParamBlock::Injection => "stream injection",
+        })
+    }
+}
+
+/// The extent of the last axis of `shape`, for `operation` to read: a rank-0 value has none.
+pub(crate) fn last_axis(operation: &'static str, shape: &[usize]) -> Result<usize, TraceError> {
+    shape.last().copied().ok_or_else(|| {
+        BuilderError::Requirement {
+            operation,
+            requirement: poot_graph_ir::Requirement::Scalar,
+        }
+        .into()
+    })
 }
 
 /// A model refused to trace a step.
@@ -284,13 +428,52 @@ pub enum TraceError {
         shape: StepShape,
         reason: ShapeReason,
     },
-    /// The traced graph is malformed: a defect of the tracer, never of the checkpoint.
-    #[error("the traced graph is malformed: {0}")]
-    Malformed(Box<poot_graph_ir::EditError>),
+    /// A rope table the step's capacity or the family's spec cannot build.
+    #[error("rope table: {0}")]
+    RopeTable(#[from] poot_graph_ir::rope_table::RopeSpecError),
+    /// An index-bounds guard the tracer emitted refused its selector or bound.
+    #[error("index guard: {0}")]
+    IndexGuard(Box<poot_graph_ir::IndexGuardError>),
+    /// A u64-hash composition refused its modulus or operand.
+    #[error("u64 hash: {0}")]
+    Hash(Box<poot_graph_ir::ops::U64HashError>),
+    /// The family's wiring is defective: see [`WiringError`].
+    #[error("the family's tracer wiring is defective: {0}")]
+    Wiring(#[from] WiringError),
+    /// The step does not fit the caller's [`TraceLimits`]: the resource, the limit and the attempted
+    /// total are in the cause. Nothing past the refusal was built.
+    #[error("the step exceeds the trace limits: {0}")]
+    Budget(#[from] TraceBudgetExceeded),
+    /// The tracer built something the graph IR refuses: a shape or dtype the operation does not
+    /// admit, a handle of another builder, or a graph that is not well formed. A defect of the
+    /// tracer, never of the checkpoint.
+    #[error("the tracer could not build the graph: {0}")]
+    Build(Box<BuilderError>),
 }
 
-impl From<poot_graph_ir::EditError> for TraceError {
-    fn from(error: poot_graph_ir::EditError) -> Self {
-        TraceError::Malformed(Box::new(error))
+impl From<poot_graph_ir::IndexGuardError> for TraceError {
+    fn from(error: poot_graph_ir::IndexGuardError) -> Self {
+        match error {
+            poot_graph_ir::IndexGuardError::Build(build) => build.into(),
+            other => TraceError::IndexGuard(Box::new(other)),
+        }
+    }
+}
+
+impl From<poot_graph_ir::ops::U64HashError> for TraceError {
+    fn from(error: poot_graph_ir::ops::U64HashError) -> Self {
+        match error {
+            poot_graph_ir::ops::U64HashError::Build(build) => build.into(),
+            other => TraceError::Hash(Box::new(other)),
+        }
+    }
+}
+
+impl From<BuilderError> for TraceError {
+    fn from(error: BuilderError) -> Self {
+        match error {
+            BuilderError::Budget(budget) => TraceError::Budget(budget),
+            other => TraceError::Build(Box::new(other)),
+        }
     }
 }

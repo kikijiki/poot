@@ -20,6 +20,8 @@ tracing.workspace = true
 cc = { workspace = true, optional = true }
 
 [dev-dependencies]
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+poot-eval = { workspace = true, features = ["test-support"] }
 poot-codegen.workspace = true
 poot-executor-parity.workspace = true
 poot-graph-ir.workspace = true
@@ -27,7 +29,7 @@ poot-kernel-ir.workspace = true
 poot-kernelgen.workspace = true
 poot-quant.workspace = true
 poot-tensor.workspace = true
-poot-test-util = { workspace = true, features = ["graph-fixtures"] }
+poot-test-util.workspace = true
 
 [features]
 # The XRT FFI and the `Device` itself. Off by default: the shim needs the XRT headers and `libxrt_coreutil`,

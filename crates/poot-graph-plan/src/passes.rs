@@ -15,8 +15,6 @@
 use std::collections::{HashMap, HashSet};
 
 use poot_graph_ir::analysis::{NumericalRewriteDecline, NumericalRewriteReason};
-#[cfg(test)]
-use poot_graph_ir::graph::StateRole;
 use poot_graph_ir::graph::{EditError, Eqn, Graph, Operand, Storage, ValueId, ValueMeta};
 use poot_graph_ir::op::{
     BinOp, ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, OpKind, RedOp,
@@ -29,7 +27,8 @@ mod attention_match;
 mod budget;
 mod cse_dce;
 mod dtype;
-mod fuse;
+pub(crate) mod fuse;
+mod guard_witness;
 mod iota;
 mod legalize;
 mod lora;
@@ -39,7 +38,7 @@ mod pool;
 mod routed_experts;
 mod sample_token_large_vocab;
 mod sharding;
-mod stage_split;
+pub(crate) mod stage_split;
 mod widen;
 
 /// `g` with its equations replaced by `eqns`, checked through the edit API: the one way a pass that
@@ -59,46 +58,60 @@ pub use sample_token_large_vocab::{DecomposeError, decompose_large_vocab_greedy}
 
 #[cfg(any(test, feature = "test-support"))]
 pub use attention_match::canonicalize;
-pub use attention_match::canonicalize_with_declines;
+pub(crate) use attention_match::canonicalize_with_declines;
+#[cfg(any(test, feature = "test-support"))]
 pub use attention_match::flash_attention_capped;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use attention_match::flash_attention_capped;
+#[cfg(any(test, feature = "test-support"))]
 pub use attention_match::rope_fusion;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use attention_match::rope_fusion;
+#[cfg(any(test, feature = "test-support"))]
 pub use cse_dce::cse;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use cse_dce::cse;
+#[cfg(any(test, feature = "test-support"))]
 pub use cse_dce::dce;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use cse_dce::dce;
 #[cfg(any(test, feature = "test-support"))]
-pub use cse_dce::dce_with_roots;
 pub use dtype::collapse_reshape_chains;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use dtype::collapse_reshape_chains;
+#[cfg(any(test, feature = "test-support"))]
 pub use dtype::elide_noop_transposes;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use dtype::elide_noop_transposes;
 #[cfg(any(test, feature = "test-support"))]
-pub use fuse::FUSABLE_FLOAT_UNARY_OPS;
-pub use fuse::{fuse, fuse_contraction_epilogues};
+pub use fuse::fuse;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use fuse::fuse;
+pub(crate) use fuse::fuse_contraction_epilogues;
+pub(crate) use guard_witness::{first_unobserved_clamp, producer_map};
+#[cfg(any(test, feature = "test-support"))]
 pub use iota::fold_iota;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use iota::fold_iota;
 pub use packed::PackedDequantErrorContext;
 pub use packed::PackedDequantProductionError;
 pub use packed::recognize_packed_contractions;
 pub use packed::recognize_packed_row_gathers;
-pub use packed::reject_packed_dequant_escapes;
-#[cfg(test)]
-pub(crate) use packed::reject_preexisting_packed_contractions;
+pub(crate) use packed::reject_packed_dequant_escapes;
 pub use packed_bind::{
     ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout, WeightFormats,
     WeightFormatsError, bind_packed_weights,
 };
 pub(crate) use pool::pool_experts;
 pub use pool::{PoolError, PoolSite, PoolSpec, PooledWeight, routed_step_demand};
-#[cfg(test)]
-pub(crate) use routed_experts::routed_expert_sites;
+#[cfg(any(test, feature = "test-support"))]
+pub use routed_experts::{RoutedExpertSite, routed_expert_sites};
 pub(crate) use sharding::expand_ranks;
 pub use sharding::{ShardError, ShardRule, ShardedGraph, shard};
 pub use stage_split::BoundaryDescriptor;
-#[cfg(test)]
-pub(crate) use stage_split::StageSplit;
 pub use stage_split::StageSplitError;
 pub(crate) use stage_split::{CutSite, StageAssignment, split_stages};
-pub use widen::{fuse_index_casts, fuse_widening_casts};
-
-#[cfg(test)]
-pub(crate) use dtype::transpose_is_noop;
+pub(crate) use widen::{fuse_index_casts, fuse_widening_casts};
 
 /// The graph-to-graph passes alone, in the order [`crate::compile`]'s pipeline runs them, without
 /// `compile`'s legalize/dtype-preparation/planning stages (which need a `Target`). The one shared

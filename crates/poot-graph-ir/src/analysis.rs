@@ -6,14 +6,20 @@
 //! cross-crate reference the other way would be a dependency cycle) and the pure functions that read
 //! a graph's ops to classify them, independent of which crate runs the pass that produced them.
 
-use crate::graph::{Graph, Operand, ValueId, ValueTable};
+use crate::graph::{Graph, ValueId};
+#[cfg(any(test, feature = "test-support"))]
+use crate::graph::{Operand, ValueTable};
 use crate::op::OpKind;
 
 mod numerics;
+#[cfg(any(test, feature = "test-support"))]
 mod stats;
 
+#[cfg(any(test, feature = "test-support"))]
+pub use numerics::Tier2Class;
 pub use numerics::{
     NumericalRewriteDecline, NumericalRewriteReason, NumericsError, NumericsProperty,
-    PASS_DECLARATIONS, PassDeclaration, Tier2Class, implied_numerics, verify_pass_numerics,
+    PASS_DECLARATIONS, PassDeclaration, implied_numerics, verify_pass_numerics,
 };
+#[cfg(any(test, feature = "test-support"))]
 pub use stats::{dispatch_count, peak_transient_bytes};

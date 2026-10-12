@@ -16,7 +16,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, ExpertProj, WeightEntry, WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::linear::WeightError;
@@ -34,8 +33,9 @@ use crate::names::{
     ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("minimax_m2");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("minimax_m2");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -91,7 +91,7 @@ const HF_MOE: MoeNames = MoeNames {
 
 /// MiniMax-M2's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MiniMaxM2Config {
+pub(crate) struct MiniMaxM2Config {
     vocab: usize,
     width: usize,
     layers: usize,
@@ -106,7 +106,7 @@ pub struct MiniMaxM2Config {
 }
 
 impl MiniMaxM2Config {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         // The family is HF-only: a GGUF never names it, so any other source is refused.
         let RawConfig::HfJson { config, .. } = raw else {
             return Err(ModelError::Config {
@@ -175,7 +175,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct MiniMaxM2 {
+pub(crate) struct MiniMaxM2 {
     params: MiniMaxM2Config,
     weights: WeightMap,
     stack: StackWeights,
@@ -239,12 +239,11 @@ impl Model for MiniMaxM2 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -255,7 +254,7 @@ impl Model for MiniMaxM2 {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
                 |b, BlockInput { block: h, .. }| moe::moe(b, &step, l, h, None, &layer.moe, &p.moe),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -307,7 +306,7 @@ fn finetune_fixture() -> Fixture {
 
 /// A BF16 checkpoint of `config`'s dimensions, one tensor per name the family reads.
 fn fixture_of(config: serde_json::Value) -> Fixture {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (h, experts, inter) = (
         n("hidden_size"),
         n("num_local_experts"),

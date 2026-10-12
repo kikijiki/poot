@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Sender};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, DriverOptions, PreparedSetLimits, open_executor, program_retention,
 };
@@ -65,7 +65,7 @@ fn vision_options(patches: usize) -> DriverOptions {
         decode: compile,
         capacity: patches,
         prefill_chunk: patches,
-        max_trace_tokens: patches,
+        trace: poot_llm::driver::serving_trace_limits(patches),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(64).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),

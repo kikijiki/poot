@@ -12,7 +12,7 @@
 //! value and writes are dropped or redirected, never memory-unsafe. Verified, not assumed (card 531c):
 //! `wgpu-hal`'s Vulkan backend (`vulkan/adapter.rs`, `PhysicalDeviceFeatures::core`) requests
 //! `robustBufferAccess` in every logical device it creates whenever the adapter advertises it, unconditionally -
-//! it is not gated behind `wgpu::Features` the way most features are, so `poot-runtime` needs no opt-in for
+//! it is not gated behind `wgpu::Features` the way most features are, so `poot-wgpu-runtime` needs no opt-in for
 //! it. `vulkaninfo` on this box's RADV/gfx1151 confirms the adapter advertises
 //! `robustBufferAccess = true` (and `robustBufferAccess2`/`robustImageAccess2 = true`, unused here). The
 //! executor discards the whole dispatch's result and raises a typed fault when it observes a nonzero error

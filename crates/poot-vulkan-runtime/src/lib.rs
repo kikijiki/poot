@@ -1,19 +1,19 @@
 //! poot-vulkan-runtime: dispatch a compiled SPIR-V kernel via raw Vulkan (`ash`), no wgpu.
 //!
 //! Spec 133 P1: device, pipeline, and single dispatch from poot's existing `Target::SpirvVulkan` `.spv`
-//! output (no naga, no re-emission). The binding ABI matches `poot-runtime`'s (wgpu) exactly, so the same
+//! output (no naga, no re-emission). The binding ABI matches `poot-wgpu-runtime`'s (wgpu) exactly, so the same
 //! `.spv` dispatches unmodified on either backend (this crate's `run_add` test cross-checks both):
 //!
 //! - Descriptor set 0. Storage buffers at bindings `0..N-1` are the kernel's data buffers in the order
 //!   the caller passes them: inputs first, then the single output last (as in
-//!   `poot_runtime::Context::dispatch`; [`Context::dispatch`] takes the same shape).
+//!   `poot_wgpu_runtime::Context::dispatch`; [`Context::dispatch`] takes the same shape).
 //! - Binding `N` is a `[u32; N]` length buffer, one element per data buffer in the same order. Poot
-//!   kernels bounds-check `i < len` against it, and `poot-runtime` builds the same buffer.
-//! - Every binding is `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`, stage `COMPUTE` only (as `poot-runtime`'s
+//!   kernels bounds-check `i < len` against it, and `poot-wgpu-runtime` builds the same buffer.
+//! - Every binding is `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`, stage `COMPUTE` only (as `poot-wgpu-runtime`'s
 //!   `storage_entry`).
 //! - The workgroup shape (`LocalSize`) is baked into the SPIR-V module; the caller supplies the matching
 //!   `wg` and per-axis `threads` (output extent), so the grid is `ceil(threads / wg)` per axis, as in
-//!   `poot-runtime::dispatch`'s `workgroup_count`.
+//!   `poot-wgpu-runtime::dispatch`'s `workgroup_count`.
 //! - The entry point is `"main"` (poot-codegen's SpirvVulkan convention).
 //!
 //! Memory model (P1, spec 133 FR-003): RADV (the dev-box AMD iGPU) exposes a unified
@@ -25,7 +25,7 @@
 //! unified heap is out of scope for P1 (see `specs/133-raw-vulkan-backend/spec.md`, "Open questions").
 //!
 //! Pipelines (spec 133 P2 slice 1, card 139): [`Context::pipeline`] builds a pipeline/module once per
-//! caller-supplied kernel key (like `poot-runtime`'s `CachedPipeline`, and the `Plan::Dispatches`
+//! caller-supplied kernel key (like `poot-wgpu-runtime`'s `CachedPipeline`, and the `Plan::Dispatches`
 //! `key` the executor loads kernels under) and returns a shared [`Pipeline`]. A later call with the same
 //! key returns the same pipeline, and is refused ([`RuntimeError::PipelineKeyConflict`]) if the kernel's
 //! code, argument schema or trap shape differs, so a key can never dispatch another body's pipeline.
@@ -65,19 +65,6 @@
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-use std::collections::HashMap;
-
-use std::ffi::c_void;
-
-use std::mem::ManuallyDrop;
-
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-
-use std::time::Duration;
-
-use ash::vk;
-
 mod buffer;
 mod context;
 mod driver;
@@ -91,20 +78,18 @@ mod spirv;
 mod util;
 mod validation;
 
-pub use buffer::*;
+use crate::owner::DeviceOwner;
+use ash::vk;
+pub use buffer::DeviceBuffer;
 pub use context::graph::Binding;
-pub(crate) use driver::*;
-pub use error::*;
-pub(crate) use features::DeviceFeatures;
+pub use error::RuntimeError;
 pub use graph::{
     DispatchTime, GraphDeviceTime, GraphTiming, KernelFault, RecordingGraph, Replay, VulkanGraph,
 };
-pub use kernel::*;
 pub use owner::Pipeline;
-pub(crate) use owner::*;
-pub(crate) use resources::*;
-pub(crate) use util::*;
-pub(crate) use validation::Validation;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 /// A Vulkan instance + compute-capable device + queue. Reusable across dispatches.
 pub struct Context {
@@ -134,7 +119,7 @@ pub struct Context {
     memory_budget: bool,
     /// Pipeline/module cache keyed by the caller's kernel key (see the module doc), used by `Context::pipeline`.
     pipeline_cache: HashMap<String, Arc<Pipeline>>,
-    /// Count of pipeline builds (cache misses) via `Context::pipeline`, like `poot-runtime`'s `pipeline_builds()`.
+    /// Count of pipeline builds (cache misses) via `Context::pipeline`, like `poot-wgpu-runtime`'s `pipeline_builds()`.
     pipeline_builds: usize,
     /// Count of `Context::end_graph` calls (command buffers finished recording); a graph captured once and replayed N times leaves this at 1.
     graphs_recorded: AtomicUsize,

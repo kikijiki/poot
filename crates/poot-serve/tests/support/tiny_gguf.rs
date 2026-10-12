@@ -5,7 +5,7 @@
 use poot_load::gguf::{GgufValue, write_gguf};
 
 /// Write the fixture to `path`. `context_length` is the GGUF's `deepseek2.context_length`.
-pub fn write_tiny_deepseek2_gguf(path: &std::path::Path, context_length: u32) {
+pub(crate) fn write_tiny_deepseek2_gguf(path: &std::path::Path, context_length: u32) {
     let (h, hq, r, kv_rank, nope, rope_d, vd) =
         (8usize, 2usize, 4usize, 4usize, 2usize, 2usize, 2usize);
     let qk_head_dim = nope + rope_d;

@@ -272,36 +272,36 @@ impl ExpertProjection {
     }
 
     /// `x[M, K]` through each row's expert (`ids[M]`): `[M, out]`.
-    fn project(&self, b: &Builder, x: Traced, ids: Traced) -> Traced {
-        let w = self.weight.declare(b);
+    fn project(&self, b: &Builder, x: Traced, ids: Traced) -> Result<Traced, TraceError> {
+        let w = self.weight.declare(b)?;
         let w = match self.orientation {
-            Orientation::OutIn => b.transpose(w, vec![0, 2, 1]),
+            Orientation::OutIn => b.transpose(w, vec![0, 2, 1])?,
             Orientation::InOut => w,
         };
-        let y = b.indexed_matmul(x, w, ids);
+        let y = b.indexed_matmul(x, w, ids)?;
         match &self.bias {
-            Some(bias) => b.binary(BinOp::Add, y, expert_rows(b, bias, ids, self.out)),
-            None => y,
+            Some(bias) => Ok(b.binary(BinOp::Add, y, expert_rows(b, bias, ids, self.out)?)?),
+            None => Ok(y),
         }
     }
 }
 
 /// `bias[ids[m]]` for every row: `[M, out]`, read through the same indexed contraction as the
 /// weights (a column of ones against each expert's bias as a `[1, out]` matrix).
-fn expert_rows(b: &Builder, bias: &Weight, ids: Traced, out: usize) -> Traced {
-    let m = b.aval(ids).shape[0];
+fn expert_rows(b: &Builder, bias: &Weight, ids: Traced, out: usize) -> Result<Traced, TraceError> {
+    let m = b.aval(ids)?.shape[0];
     let experts = bias.shape()[0];
     let one = b.binary_scalar(
         BinOp::Add,
-        b.binary_scalar(BinOp::Mul, b.iota(1), Scalar::F32(0.0)),
+        b.binary_scalar(BinOp::Mul, b.iota(1)?, Scalar::F32(0.0))?,
         Scalar::F32(1.0),
-    );
-    let ones = b.broadcast(b.reshape(one, vec![1, 1]), vec![m, 1]);
-    b.indexed_matmul(
+    )?;
+    let ones = b.broadcast(b.reshape(one, vec![1, 1])?, vec![m, 1])?;
+    Ok(b.indexed_matmul(
         ones,
-        b.reshape(bias.declare_f32(b), vec![experts, 1, out]),
+        b.reshape(bias.declare_f32(b)?, vec![experts, 1, out])?,
         ids,
-    )
+    )?)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -370,7 +370,7 @@ impl MoeWeights {
                             .or_else(|_| Weight::new(map, id, &[width]))
                     })
                     .transpose()?;
-                Ok(SharedExpert {
+                Ok::<_, WeightError>(SharedExpert {
                     gate: w(ExpertProj::Gate, [shared_inter, width])?,
                     up: w(ExpertProj::Up, [shared_inter, width])?,
                     down: w(ExpertProj::Down, [width, shared_inter])?,
@@ -398,28 +398,40 @@ pub fn moe(
     route_x: Option<Traced>,
     w: &MoeWeights,
     p: &MoeParams,
-) -> Traced {
-    let shape = b.aval(x).shape;
-    debug_assert!(
-        route_x.is_none_or(|r| b.aval(r).shape == shape),
-        "the router and the experts read one shape"
-    );
+) -> Result<Traced, TraceError> {
+    let shape = b.aval(x)?.shape;
+    if let Some(route_x) = route_x {
+        debug_assert_eq!(
+            b.aval(route_x)?.shape,
+            shape,
+            "the router and the experts read one shape"
+        );
+    }
     let width = p.width;
     let tokens = shape.iter().product::<usize>() / width;
 
-    let flat = b.reshape(x, vec![tokens, width]);
-    let route_x = route_x.map_or(flat, |r| b.reshape(r, vec![tokens, width]));
-    let routes = route(b, step, layer, route_x, &w.router, &p.router);
+    let flat = b.reshape(x, vec![tokens, width])?;
+    let route_x = match route_x {
+        Some(r) => b.reshape(r, vec![tokens, width])?,
+        None => flat,
+    };
+    let routes = route(b, step, layer, route_x, &w.router, &p.router)?;
     experts_of(b, flat, shape, routes, w, p)
 }
 
 /// The experts of a routed block over `x[.., width]`, given the `routes` of its tokens (`T` rows
 /// of `top_k` ids and weights): the same shape back. A family that chooses its experts itself (a
 /// hash router) calls this with its own routes; [`moe`] calls it with [`route`]'s.
-pub fn experts(b: &Builder, x: Traced, routes: Routes, w: &MoeWeights, p: &MoeParams) -> Traced {
-    let shape = b.aval(x).shape;
+pub fn experts(
+    b: &Builder,
+    x: Traced,
+    routes: Routes,
+    w: &MoeWeights,
+    p: &MoeParams,
+) -> Result<Traced, TraceError> {
+    let shape = b.aval(x)?.shape;
     let tokens = shape.iter().product::<usize>() / p.width;
-    experts_of(b, b.reshape(x, vec![tokens, p.width]), shape, routes, w, p)
+    experts_of(b, b.reshape(x, vec![tokens, p.width])?, shape, routes, w, p)
 }
 
 /// [`experts`] over `x` already flattened to `[tokens, width]`, returning the original `shape`.
@@ -430,59 +442,66 @@ fn experts_of(
     routes: Routes,
     w: &MoeWeights,
     p: &MoeParams,
-) -> Traced {
-    let (width, tokens) = (p.width, b.aval(x).shape[0]);
+) -> Result<Traced, TraceError> {
+    let (width, tokens) = (p.width, b.aval(x)?.shape[0]);
     let k = p.top_k();
     let rows = tokens * k;
 
-    let ids = b.reshape(routes.ids, vec![rows]);
+    let ids = b.reshape(routes.ids, vec![rows])?;
     // Row `t * k + r` is token `t` at its slot `r`.
     let x_rows = b.reshape(
-        b.broadcast(b.reshape(x, vec![tokens, 1, width]), vec![tokens, k, width]),
+        b.broadcast(
+            b.reshape(x, vec![tokens, 1, width])?,
+            vec![tokens, k, width],
+        )?,
         vec![rows, width],
-    );
+    )?;
 
     let (gate, up) = match &w.gate_up {
-        GateUp::Split { gate, up } => (gate.project(b, x_rows, ids), up.project(b, x_rows, ids)),
+        GateUp::Split { gate, up } => (gate.project(b, x_rows, ids)?, up.project(b, x_rows, ids)?),
         GateUp::Fused(both) => {
-            let fused = both.project(b, x_rows, ids);
+            let fused = both.project(b, x_rows, ids)?;
             let inter = p.inter;
             match p.gate_up {
                 GateUpForm::FusedInterleaved => {
-                    let pairs = b.reshape(fused, vec![rows, inter, 2]);
-                    let part = |i| b.reshape(b.slice(pairs, 2, i, i + 1), vec![rows, inter]);
-                    (part(0), part(1))
+                    let pairs = b.reshape(fused, vec![rows, inter, 2])?;
+                    let part = |i| {
+                        Ok::<_, TraceError>(
+                            b.reshape(b.slice(pairs, 2, i, i + 1)?, vec![rows, inter])?,
+                        )
+                    };
+                    (part(0)?, part(1)?)
                 }
                 _ => (
-                    b.slice(fused, 1, 0, inter),
-                    b.slice(fused, 1, inter, 2 * inter),
+                    b.slice(fused, 1, 0, inter)?,
+                    b.slice(fused, 1, inter, 2 * inter)?,
                 ),
             }
         }
     };
-    let hidden = glu(b, gate, up, &p.glu);
-    let out = w.down.project(b, hidden, ids);
+    let hidden = glu(b, gate, up, &p.glu)?;
+    let out = w.down.project(b, hidden, ids)?;
 
     // Weight each row, then sum each token's `k` rows (the executors reduce the last axis only).
-    let weighted = b.binary(BinOp::Mul, out, b.reshape(routes.weights, vec![rows, 1]));
-    let per_token = b.transpose(b.reshape(weighted, vec![tokens, k, width]), vec![0, 2, 1]);
-    let y = b.reshape(b.reduce(RedOp::Sum, per_token, 2, false), shape.clone());
+    let weighted = b.binary(BinOp::Mul, out, b.reshape(routes.weights, vec![rows, 1])?)?;
+    let per_token = b.transpose(b.reshape(weighted, vec![tokens, k, width])?, vec![0, 2, 1])?;
+    let y = b.reshape(b.reduce(RedOp::Sum, per_token, 2, false)?, shape.clone())?;
     match &w.shared {
         Some(shared) => {
-            let gate = linear(b, x, &shared.gate, None);
-            let up = linear(b, x, &shared.up, None);
-            let out = linear(b, glu(b, gate, up, &p.glu), &shared.down, None);
+            let gate = linear(b, x, &shared.gate, None)?;
+            let up = linear(b, x, &shared.up, None)?;
+            let out = linear(b, glu(b, gate, up, &p.glu)?, &shared.down, None)?;
             let out = match &shared.scalar {
                 Some(scalar) => {
-                    let row = b.reshape(scalar.declare_f32(b), vec![1, width]);
-                    let logit = b.matmul(x, b.transpose(row, vec![1, 0])); // [tokens, 1]
-                    b.binary(BinOp::Mul, out, ops::sigmoid(b, logit))
+                    let row = b.reshape(scalar.declare_f32(b)?, vec![1, width])?;
+                    let logit = b.matmul(x, b.transpose(row, vec![1, 0])?)?; // [tokens, 1]
+                    b.binary(BinOp::Mul, out, ops::sigmoid(b, logit)?)?
                 }
                 None => out,
             };
-            b.binary(BinOp::Add, y, b.reshape(out, shape))
+            Ok(b.binary(BinOp::Add, y, b.reshape(out, shape)?)?)
         }
-        None => y,
+        None => Ok(y),
     }
 }
 
@@ -547,7 +566,7 @@ mod tests {
                     id(MoeRole::Stack(proj)),
                     (0..EXPERTS)
                         .map(|e| {
-                            poot_test_util::packed::random_payload(
+                            poot_quant::test_support::packed::random_payload(
                                 WeightFormat::Q8_0,
                                 [out, k],
                                 100 * (proj as u64 + 1) + e as u64,
@@ -572,10 +591,12 @@ mod tests {
         let p = params().with_orientation(orientation(storage));
         let map = fx.map();
         let w = MoeWeights::new(&map, 0, &p).unwrap();
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All));
-        let xs = b.constant("x", TensorType::f32(vec![1, tokens, WIDTH]));
-        let y = moe(&b, &step, 0, xs, None, &w, &p);
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All)).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, tokens, WIDTH]))
+            .unwrap();
+        let y = moe(&b, &step, 0, xs, None, &w, &p).unwrap();
         let g = b.finish(y).unwrap();
         let ids = vec![0; tokens];
         let pos: Vec<i32> = (0..tokens as i32).collect();
@@ -717,7 +738,7 @@ mod tests {
                             } else {
                                 100 * (proj as u64 + 1) + other as u64
                             };
-                            poot_test_util::packed::random_payload(
+                            poot_quant::test_support::packed::random_payload(
                                 WeightFormat::Q8_0,
                                 [out, k],
                                 seed,
@@ -910,7 +931,7 @@ mod layout_tests {
     fn run(fx: &Fx, c: Case, x: &[f32]) -> Vec<f32> {
         let p = params(c);
         let w = MoeWeights::new(&fx.map(), LAYER, &p).unwrap();
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let step = Step::new(
             &b,
             StepShape {
@@ -921,17 +942,25 @@ mod layout_tests {
                 logits: LogitRows::All,
                 hidden: None,
             },
-        );
-        let xs = b.constant("x", TensorType::f32(vec![1, TOKENS, WIDTH]));
+        )
+        .unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, TOKENS, WIDTH]))
+            .unwrap();
         let routes = route_inputs();
         let (y, named): (_, Vec<(&str, &[f32])>) = if c.scaled_router {
-            let rs = b.constant("r", TensorType::f32(vec![1, TOKENS, WIDTH]));
+            let rs = b
+                .constant("r", TensorType::f32(vec![1, TOKENS, WIDTH]))
+                .unwrap();
             (
-                moe(&b, &step, LAYER, xs, Some(rs), &w, &p),
+                moe(&b, &step, LAYER, xs, Some(rs), &w, &p).unwrap(),
                 vec![("x", x), ("r", &routes)],
             )
         } else {
-            (moe(&b, &step, LAYER, xs, None, &w, &p), vec![("x", x)])
+            (
+                moe(&b, &step, LAYER, xs, None, &w, &p).unwrap(),
+                vec![("x", x)],
+            )
         };
         let g = step.finish(b, y).unwrap();
         let zeros = vec![0; TOKENS];

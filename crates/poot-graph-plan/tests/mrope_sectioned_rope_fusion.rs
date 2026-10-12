@@ -35,17 +35,21 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 
 #[test]
 fn rope_fusion_matches_and_is_result_preserving_on_sectioned_rope() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let d = 16usize;
     let max_pos = 16usize;
     let sections = [2usize, 3, 3];
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32));
-    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
-    let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32));
-    let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32)).unwrap();
+    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32)).unwrap();
+    let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32)).unwrap();
+    let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections).unwrap();
     let (xi, ci, si, pti, phi, pwi) = (
         x.id(),
         cos.id(),

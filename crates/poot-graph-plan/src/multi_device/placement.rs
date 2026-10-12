@@ -102,11 +102,6 @@ impl PlacementSet {
     pub fn rows(&self) -> &[PlacementRow] {
         &self.rows
     }
-
-    #[cfg(test)]
-    pub(crate) fn into_rows(self) -> Vec<PlacementRow> {
-        self.rows
-    }
 }
 
 /// Authoritative [`HostOwner`] identity of one placement row, regardless of row shape.
@@ -216,69 +211,78 @@ pub fn placement_device_bytes(row: &PlacementRow) -> HashMap<DeviceId, u64> {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum PackedResidencyError {
-    #[error(
-        "device {device:?} accounts {bytes} bytes for owner {owner:?}, at or above the forbidden fully-\
-         decoded f32 mirror size {forbidden_bytes} (logical shape [{out}, {k}])"
-    )]
-    DeviceDenseMirror {
-        device: DeviceId,
-        owner: OwnerId,
-        bytes: u64,
-        forbidden_bytes: u64,
-        out: usize,
-        k: usize,
-    },
-    #[error(
-        "communication accounts {bytes} bytes for owner {owner:?}, at or above the forbidden fully-\
-         decoded f32 mirror size {forbidden_bytes} (logical shape [{out}, {k}])"
-    )]
-    CommunicationDenseMirror {
-        owner: OwnerId,
-        bytes: u64,
-        forbidden_bytes: u64,
-        out: usize,
-        k: usize,
-    },
-}
+pub(crate) mod test_only {
+    use super::*;
 
-/// FR-011: no device or communication buffer may account bytes for a full decoded f32 mirror of a
-/// packed-quantized owner. `forbidden_bytes` is `4 * out * k`, the same size a decoded mirror of
-/// `poot_quant::PackedWeight`'s logical shape would occupy - Card 360 takes `out`/`k` from the
-/// caller's declared logical shape, never from a tensor name.
-#[cfg(test)]
-pub(crate) fn reject_dense_quant_mirror(
-    owner: OwnerId,
-    logical_out: usize,
-    logical_k: usize,
-    device_bytes: &HashMap<DeviceId, u64>,
-    communication_bytes: u64,
-) -> Result<(), PackedResidencyError> {
-    let forbidden_bytes = (logical_out as u64)
-        .checked_mul(logical_k as u64)
-        .and_then(|values| values.checked_mul(4))
-        .unwrap_or(u64::MAX);
-    for (&device, &bytes) in device_bytes {
-        if bytes >= forbidden_bytes {
-            return Err(PackedResidencyError::DeviceDenseMirror {
-                device,
+    impl PlacementSet {
+        pub(crate) fn into_rows(self) -> Vec<PlacementRow> {
+            self.rows
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+    pub(crate) enum PackedResidencyError {
+        #[error(
+            "device {device:?} accounts {bytes} bytes for owner {owner:?}, at or above the forbidden fully-\
+             decoded f32 mirror size {forbidden_bytes} (logical shape [{out}, {k}])"
+        )]
+        DeviceDenseMirror {
+            device: DeviceId,
+            owner: OwnerId,
+            bytes: u64,
+            forbidden_bytes: u64,
+            out: usize,
+            k: usize,
+        },
+        #[error(
+            "communication accounts {bytes} bytes for owner {owner:?}, at or above the forbidden fully-\
+             decoded f32 mirror size {forbidden_bytes} (logical shape [{out}, {k}])"
+        )]
+        CommunicationDenseMirror {
+            owner: OwnerId,
+            bytes: u64,
+            forbidden_bytes: u64,
+            out: usize,
+            k: usize,
+        },
+    }
+
+    /// FR-011: no device or communication buffer may account bytes for a full decoded f32 mirror of a
+    /// packed-quantized owner. `forbidden_bytes` is `4 * out * k`, the same size a decoded mirror of
+    /// `poot_quant::PackedWeight`'s logical shape would occupy - Card 360 takes `out`/`k` from the
+    /// caller's declared logical shape, never from a tensor name.
+    pub(crate) fn reject_dense_quant_mirror(
+        owner: OwnerId,
+        logical_out: usize,
+        logical_k: usize,
+        device_bytes: &HashMap<DeviceId, u64>,
+        communication_bytes: u64,
+    ) -> Result<(), PackedResidencyError> {
+        let forbidden_bytes = (logical_out as u64)
+            .checked_mul(logical_k as u64)
+            .and_then(|values| values.checked_mul(4))
+            .unwrap_or(u64::MAX);
+        for (&device, &bytes) in device_bytes {
+            if bytes >= forbidden_bytes {
+                return Err(PackedResidencyError::DeviceDenseMirror {
+                    device,
+                    owner,
+                    bytes,
+                    forbidden_bytes,
+                    out: logical_out,
+                    k: logical_k,
+                });
+            }
+        }
+        if communication_bytes >= forbidden_bytes {
+            return Err(PackedResidencyError::CommunicationDenseMirror {
                 owner,
-                bytes,
+                bytes: communication_bytes,
                 forbidden_bytes,
                 out: logical_out,
                 k: logical_k,
             });
         }
+        Ok(())
     }
-    if communication_bytes >= forbidden_bytes {
-        return Err(PackedResidencyError::CommunicationDenseMirror {
-            owner,
-            bytes: communication_bytes,
-            forbidden_bytes,
-            out: logical_out,
-            k: logical_k,
-        });
-    }
-    Ok(())
 }

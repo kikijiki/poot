@@ -5,13 +5,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use poot_codegen::emit_llvm_ir;
 use poot_codegen::{Target, compile};
+use poot_kernel_ir::test_support::{
+    e4m3fn_encode_kernel, gemv_loop_kernel, matmul_kernel, square_kernel, vadd_loop_kernel,
+};
 use poot_kernel_ir::{Ty, fixtures};
 use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
-use poot_test_util::kernel_fixtures::{
-    e4m3fn_encode_kernel, emit_llvm_ir, gemv_loop_kernel, matmul_kernel, square_kernel,
-    vadd_loop_kernel,
-};
 
 fn have(bin: &str) -> bool {
     Command::new(bin).arg("--version").output().is_ok()
@@ -118,7 +118,7 @@ fn exact_i32_arithmetic_lowers_without_float_conversion() {
             "xor i32",
         ),
         (
-            poot_test_util::kernel_fixtures::fused_i32_views(
+            poot_kernelgen::fused_i32_views_grid(
                 "exact_i32_fused_clz",
                 &[2],
                 &[&[2], &[2]],
@@ -145,6 +145,7 @@ fn exact_i32_arithmetic_lowers_without_float_conversion() {
                     ],
                     output: poot_kernelgen::FusedInput::Step(1),
                 },
+                None,
             )
             .expect("fused_i32_views precondition"),
             "fused-clz",
@@ -481,7 +482,7 @@ fn coopmat_tile_spirv_validates() {
     }
     let dir = out_dir("coopmat");
     let out = poot_codegen::artifact_path(&dir, "wmma_coopmat_tile", Target::SpirvVulkan);
-    let body = poot_test_util::kernel_fixtures::wmma_tile("wmma_coopmat_tile");
+    let body = poot_kernel_ir::test_support::wmma_tile("wmma_coopmat_tile");
     compile(&body, Target::SpirvVulkan, &out).unwrap();
     let v = Command::new("spirv-val")
         .arg("--target-env")
@@ -538,7 +539,7 @@ fn wmma_tile_behind_lane_bound(bound: u64) -> poot_kernel_ir::Body {
         BasicBlock, BinOp, BlockId, Constant, IndexAxis, LocalDecl, Operand, Place, Rvalue,
         Statement, SwitchTargets, Terminator,
     };
-    let mut body = poot_test_util::kernel_fixtures::wmma_tile("wmma_tile_behind_lane_bound");
+    let mut body = poot_kernel_ir::test_support::wmma_tile("wmma_tile_behind_lane_bound");
     let lane = poot_kernel_ir::Local {
         index: body.locals.len() as u32,
     };
@@ -626,7 +627,7 @@ fn matrix_work_under_a_lane_varying_branch_is_refused_before_codegen() {
 fn swapped_matrix_operands_are_refused_before_codegen() {
     use poot_codegen::EmitError;
     use poot_kernel_ir::{FragmentTy, Statement, VerifyErrorKind, WmmaDtype, WmmaMat, WmmaShape};
-    let mut body = poot_test_util::kernel_fixtures::wmma_tile("wmma_tile_swapped_operands");
+    let mut body = poot_kernel_ir::test_support::wmma_tile("wmma_tile_swapped_operands");
     let mma = body.blocks[0]
         .statements
         .iter_mut()
@@ -761,11 +762,11 @@ fn fence_lowers_to_amdgpu_both_scopes() {
     for (name, body) in [
         (
             "wgfence_amd",
-            poot_test_util::kernel_fixtures::workgroup_fence_spin_wait("wgfence_amd", 128),
+            poot_kernel_ir::test_support::workgroup_fence_spin_wait("wgfence_amd", 128),
         ),
         (
             "devfence_amd",
-            poot_test_util::kernel_fixtures::cross_block_fence_spin_wait_coop("devfence_amd"),
+            poot_kernel_ir::test_support::cross_block_fence_spin_wait_coop("devfence_amd"),
         ),
     ] {
         let out = poot_codegen::artifact_path(&dir, name, target);

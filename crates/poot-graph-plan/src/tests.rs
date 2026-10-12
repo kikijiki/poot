@@ -1,17 +1,42 @@
 //! Unit tests for the planner: dispatch-predicate gating, cache-key stability, strided-view promotion,
 //! real-config dispatch-count regressions.
 
-use poot_graph_ir::{AttentionAttrs, Builder, ShapeError, Storage, TensorType, ValidationId};
+use crate::dtype_widen::{bf16_const_feeds_only_packed_readers, widen_mismatched_matmul_dtypes};
+use crate::graph_validation::ValidationPacketSource;
+use crate::planner::{Planned, fty_ty};
+use crate::predicates::{
+    DenseGemvLaunch, GEMM_TILE, GEMV_WIDTH, GraphTables, SCATTER_UPDATE_WG, dense_decode_gemv_in,
+    dense_gemv_launch, is_elementwise_2d_in,
+};
+use crate::production_plan::Submission;
+use crate::refusal::RefusalDtypes;
+use crate::types::{DispatchPlanError, Launch, ScratchDecl};
+use poot_graph_ir::test_support::graph_fixtures::derive;
+use poot_graph_ir::{
+    AttentionAttrs, Builder, Eqn, Graph, OpKind, Operand, RedOp, Scalar, ShapeError, Storage,
+    TensorType, ValidationId, ValueId,
+};
+use poot_kernel_ir::{BinOp, Body, Ty};
+use poot_kernelgen::{
+    CastSpec, ContractionSpec, ElementwiseSpec, I32Binary, KernelRequest, PointwiseForm,
+    PointwiseSpec, ValueBinary,
+};
 use poot_target::{
     AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, Queried, TargetId, TensorCoreSupport,
     WatchdogBudget,
 };
 use poot_tensor::DType as GDt;
 use poot_test_util::device_caps::default_caps_for;
-use poot_test_util::graph_fixtures::derive;
+use std::collections::HashMap;
 
 use super::*;
 use crate::device_validation::ResourceRefusal;
+use crate::graph_validation::test_only::{
+    validate_graph_execution, validate_wgpu_tensor_execution,
+};
+use poot_graph_ir::op::BinOp as GBinOp;
+use poot_graph_ir::op::UnOp as GUnOp;
+use poot_kernelgen as kg;
 
 /// The one dispatch of a plan that launches one kernel and binds no metadata buffer.
 fn plain(plan: &Plan) -> &Dispatch {
@@ -84,11 +109,11 @@ fn is_elementwise_2d(
 
 #[test]
 fn validation_packet_plan_matches_layout() {
-    let b = Builder::new();
-    let primary = b.constant("primary", TensorType::f32([1]));
-    let first = b.constant("first", TensorType::f32([2]));
-    let second = b.constant("second", TensorType::f32([3]));
-    let graph = crate::test_support::finish_with_validations(
+    let b = Builder::for_tests();
+    let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+    let first = b.constant("first", TensorType::f32([2])).unwrap();
+    let second = b.constant("second", TensorType::f32([3])).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         primary,
         &[
@@ -118,64 +143,14 @@ fn validation_packet_plan_matches_layout() {
     );
 }
 
-use crate::passes_without_target as optimize;
-
-/// The graph `Model::trace` gives for one step of a real checkpoint's dimensions (zero weights: only
-/// the structure is read), as an ordinary graph.
-fn dense_graph(
-    dense: poot_executor_parity::dense::Dense,
-    phase: poot_models::model::Phase,
-    tokens: usize,
-    cap: usize,
-    logits: poot_models::model::LogitRows,
-) -> Graph {
-    use poot_executor_parity::dense::step;
-    dense
-        .zeroed_model(GDt::BF16)
-        .model
-        .trace(phase, step(1, tokens, cap, logits))
-        .expect("the family traces this step")
-}
-
-/// Qwen2.5-0.5B's dimensions (biased projections, no Q/K norm).
-fn qwen2_0_5b() -> poot_executor_parity::dense::Dense {
-    use poot_executor_parity::dense::{Dense, Family};
-    Dense::new(Family::Qwen2)
-        .vocab(151936)
-        .dims(896, 4864, 24)
-        .heads(14, 2)
-        .head_dim(64)
-        .max_positions(32768)
-}
-
-/// Qwen3-0.6B's dimensions (no bias, per-head Q/K norm, explicit head dimension).
-fn qwen3_0_6b() -> poot_executor_parity::dense::Dense {
-    use poot_executor_parity::dense::{Dense, Family};
-    Dense::new(Family::Qwen3)
-        .vocab(151936)
-        .dims(1024, 3072, 28)
-        .heads(16, 8)
-        .head_dim(128)
-        .max_positions(40960)
-}
-
-/// One decode token of a real config over `cap` positions.
-fn real_decode_graph(dense: poot_executor_parity::dense::Dense, cap: usize) -> Graph {
-    dense_graph(
-        dense,
-        poot_models::model::Phase::Decode,
-        1,
-        cap,
-        poot_models::model::LogitRows::Last,
-    )
-}
-
 // Build a single bf16/f32 matmul graph `[1,m,k] @ [k,n]`; returns (graph, the matmul eqn index).
 fn matmul_graph(m: usize, k: usize, n: usize, dt: GDt) -> Graph {
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::new(vec![1, m, k], dt));
-    let w = bld.constant("w", TensorType::new(vec![k, n], dt));
-    let mm = bld.matmul(a, w);
+    let bld = Builder::for_tests();
+    let a = bld
+        .constant("a", TensorType::new(vec![1, m, k], dt))
+        .unwrap();
+    let w = bld.constant("w", TensorType::new(vec![k, n], dt)).unwrap();
+    let mm = bld.matmul(a, w).unwrap();
     bld.finish(mm).unwrap()
 }
 
@@ -183,10 +158,12 @@ fn matmul_graph(m: usize, k: usize, n: usize, dt: GDt) -> Graph {
 /// (`matmul_nvptx_tc_eligible`) allows batch dims, unlike the AMD arm, so this is the shape needed to
 /// exercise the `tc` arm's batch factor (card 525).
 fn batched_matmul_graph(batch: usize, m: usize, k: usize, n: usize, dt: GDt) -> Graph {
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::new(vec![batch, m, k], dt));
-    let w = bld.constant("w", TensorType::new(vec![k, n], dt));
-    let mm = bld.matmul(a, w);
+    let bld = Builder::for_tests();
+    let a = bld
+        .constant("a", TensorType::new(vec![batch, m, k], dt))
+        .unwrap();
+    let w = bld.constant("w", TensorType::new(vec![k, n], dt)).unwrap();
+    let mm = bld.matmul(a, w).unwrap();
     bld.finish(mm).unwrap()
 }
 
@@ -214,7 +191,7 @@ fn planned_with_choice_caps(
             caps: *caps,
         },
         &HashMap::new(),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .map(|Planned { plan, choice }| (plan, choice))
 }
@@ -267,12 +244,20 @@ fn is_tensor_core(choice: &KernelChoice) -> bool {
 
 #[test]
 fn exact_i32_binary_plans_typed_integer_kernels_on_every_compute_backend() {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::new(vec![2, 1], GDt::I32));
-    let c = b.constant("c", TensorType::new(vec![1, 3], GDt::I32));
-    let add = b.binary(GBinOp::Add, a, c);
-    let geu = b.binary_scalar(GBinOp::GeU, add, Scalar::I32(i32::MIN));
-    let remu = b.binary_scalar(GBinOp::RemU, geu, Scalar::I32(0x7fff_ffffu32 as i32));
+    let b = Builder::for_tests();
+    let a = b
+        .constant("a", TensorType::new(vec![2, 1], GDt::I32))
+        .unwrap();
+    let c = b
+        .constant("c", TensorType::new(vec![1, 3], GDt::I32))
+        .unwrap();
+    let add = b.binary(GBinOp::Add, a, c).unwrap();
+    let geu = b
+        .binary_scalar(GBinOp::GeU, add, Scalar::I32(i32::MIN))
+        .unwrap();
+    let remu = b
+        .binary_scalar(GBinOp::RemU, geu, Scalar::I32(0x7fff_ffffu32 as i32))
+        .unwrap();
     let g = b.finish(remu).unwrap();
 
     for (eqn, expected_name) in [
@@ -342,16 +327,18 @@ fn exact_i32_binary_plans_typed_integer_kernels_on_every_compute_backend() {
 
 #[test]
 fn exact_i32_bit_select_and_closed_fusion_plan_as_i32() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = TensorType::new(vec![4], GDt::I32);
-    let x = b.constant("x", ty.clone());
-    let y = b.constant("y", ty.clone());
-    let z = b.constant("z", ty);
-    let masked = b.binary(GBinOp::And, x, y);
-    let shifted = b.binary_scalar(GBinOp::Shl, masked, Scalar::I32(33));
-    let counted = b.unary(GUnOp::Clz, shifted);
-    let inverted = b.unary(GUnOp::Not, counted);
-    let selected = b.select(inverted, y, z);
+    let x = b.constant("x", ty.clone()).unwrap();
+    let y = b.constant("y", ty.clone()).unwrap();
+    let z = b.constant("z", ty).unwrap();
+    let masked = b.binary(GBinOp::And, x, y).unwrap();
+    let shifted = b
+        .binary_scalar(GBinOp::Shl, masked, Scalar::I32(33))
+        .unwrap();
+    let counted = b.unary(GUnOp::Clz, shifted).unwrap();
+    let inverted = b.unary(GUnOp::Not, counted).unwrap();
+    let selected = b.select(inverted, y, z).unwrap();
     let g = b.finish(selected).unwrap();
 
     for eqn in g.eqns() {
@@ -422,12 +409,12 @@ fn exact_i32_bit_select_and_closed_fusion_plan_as_i32() {
 #[test]
 fn exact_i32_select_past_the_grid_ceiling_emits_a_2d_fold() {
     let over_ceiling = 65_535 * 256 + 256;
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = TensorType::new(vec![over_ceiling], GDt::I32);
-    let cond = b.constant("cond", ty.clone());
-    let if_true = b.constant("t", ty.clone());
-    let if_false = b.constant("f", ty);
-    let selected = b.select(cond, if_true, if_false);
+    let cond = b.constant("cond", ty.clone()).unwrap();
+    let if_true = b.constant("t", ty.clone()).unwrap();
+    let if_false = b.constant("f", ty).unwrap();
+    let selected = b.select(cond, if_true, if_false).unwrap();
     let g = b.finish(selected).unwrap();
     let eqn = &g.eqns()[0];
     let (planned_plan, choice) = planned_with_choice(&g, eqn, Backend::SpirvVulkan).unwrap();
@@ -462,11 +449,13 @@ fn exact_i32_select_past_the_grid_ceiling_emits_a_2d_fold() {
 /// arm; the condition parameter turns into an f32 slice and this row goes red.
 #[test]
 fn float_select_plans_a_float_pointwise_kernel_with_an_i32_condition_leaf() {
-    let b = Builder::new();
-    let cond = b.constant("cond", TensorType::new(vec![4], GDt::I32));
-    let if_true = b.constant("t", TensorType::new(vec![4], GDt::F32));
-    let if_false = b.constant("f", TensorType::new(vec![4], GDt::F32));
-    let selected = b.select(cond, if_true, if_false);
+    let b = Builder::for_tests();
+    let cond = b
+        .constant("cond", TensorType::new(vec![4], GDt::I32))
+        .unwrap();
+    let if_true = b.constant("t", TensorType::new(vec![4], GDt::F32)).unwrap();
+    let if_false = b.constant("f", TensorType::new(vec![4], GDt::F32)).unwrap();
+    let selected = b.select(cond, if_true, if_false).unwrap();
     let g = b.finish(selected).unwrap();
     let eqn = &g.eqns()[0];
     for backend in [
@@ -508,18 +497,32 @@ fn float_select_plans_a_float_pointwise_kernel_with_an_i32_condition_leaf() {
 #[test]
 fn float_select_past_the_grid_ceiling_emits_a_2d_fold() {
     let over_ceiling = 65_535 * 256 + 256;
-    let b = Builder::new();
-    let cond = b.constant("cond", TensorType::new(vec![over_ceiling], GDt::I32));
-    let if_true = b.constant("t", TensorType::new(vec![over_ceiling], GDt::F32));
-    let if_false = b.constant("f", TensorType::new(vec![over_ceiling], GDt::F32));
-    let selected = b.select(cond, if_true, if_false);
+    let b = Builder::for_tests();
+    let cond = b
+        .constant("cond", TensorType::new(vec![over_ceiling], GDt::I32))
+        .unwrap();
+    let if_true = b
+        .constant("t", TensorType::new(vec![over_ceiling], GDt::F32))
+        .unwrap();
+    let if_false = b
+        .constant("f", TensorType::new(vec![over_ceiling], GDt::F32))
+        .unwrap();
+    let selected = b.select(cond, if_true, if_false).unwrap();
     let standalone = b.finish(selected).unwrap();
     // The same select followed by a pointwise neighbour fuses into one float region.
-    let b = Builder::new();
-    let cond = b.constant("cond", TensorType::new(vec![over_ceiling], GDt::I32));
-    let if_true = b.constant("t", TensorType::new(vec![over_ceiling], GDt::F32));
-    let if_false = b.constant("f", TensorType::new(vec![over_ceiling], GDt::F32));
-    let negated = b.unary(GUnOp::Neg, b.select(cond, if_true, if_false));
+    let b = Builder::for_tests();
+    let cond = b
+        .constant("cond", TensorType::new(vec![over_ceiling], GDt::I32))
+        .unwrap();
+    let if_true = b
+        .constant("t", TensorType::new(vec![over_ceiling], GDt::F32))
+        .unwrap();
+    let if_false = b
+        .constant("f", TensorType::new(vec![over_ceiling], GDt::F32))
+        .unwrap();
+    let negated = b
+        .unary(GUnOp::Neg, b.select(cond, if_true, if_false).unwrap())
+        .unwrap();
     let fused = crate::fuse(&b.finish(negated).unwrap()).unwrap();
     assert!(matches!(fused.eqns()[..], [ref eqn] if matches!(eqn.op, OpKind::Fused(_))));
     for (what, g) in [("standalone", &standalone), ("fused", &fused)] {
@@ -559,11 +562,13 @@ fn float_select_past_the_grid_ceiling_emits_a_2d_fold() {
 /// bits) but the planner refuses it with the typed dtype-lowering refusal, never a wrong kernel.
 #[test]
 fn half_width_select_is_refused_as_a_dtype_lowering_gap() {
-    let b = Builder::new();
-    let cond = b.constant("cond", TensorType::new(vec![4], GDt::I32));
-    let if_true = b.constant("t", TensorType::new(vec![4], GDt::F16));
-    let if_false = b.constant("f", TensorType::new(vec![4], GDt::F16));
-    let selected = b.select(cond, if_true, if_false);
+    let b = Builder::for_tests();
+    let cond = b
+        .constant("cond", TensorType::new(vec![4], GDt::I32))
+        .unwrap();
+    let if_true = b.constant("t", TensorType::new(vec![4], GDt::F16)).unwrap();
+    let if_false = b.constant("f", TensorType::new(vec![4], GDt::F16)).unwrap();
+    let selected = b.select(cond, if_true, if_false).unwrap();
     let g = b.finish(selected).unwrap();
     let eqn = &g.eqns()[0];
     let refusal = refusal_of(
@@ -572,7 +577,7 @@ fn half_width_select_is_refused_as_a_dtype_lowering_gap() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "an F16 Select",
     );
@@ -584,9 +589,9 @@ fn i32_is_its_own_kernel_element_type() {
     // POOT-725: no I32 value is computed through f32. Its element type is I32 wherever it is read.
     assert_eq!(fty_ty(GDt::I32), Ty::I32);
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![2], GDt::I32));
-    let y = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::new(vec![2], GDt::I32)).unwrap();
+    let y = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1)).unwrap();
     let g = b.finish(y).unwrap();
     let eqn = &g.eqns()[0];
     let planned_plan = plan_eqn(
@@ -594,7 +599,7 @@ fn i32_is_its_own_kernel_element_type() {
         eqn,
         Backend::Nvptx,
         &default_caps_for(Backend::Nvptx),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let Dispatch { body, .. } = into_plain(planned_plan);
@@ -627,14 +632,14 @@ fn slice_element_ty(body: &Body, param: usize) -> &Ty {
 #[test]
 fn i32_movement_carries_i32_whatever_consumes_it() {
     let movement_plan = |arithmetic: bool| {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![1], GDt::I32));
-        let moved = b.broadcast(x, vec![2]);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::new(vec![1], GDt::I32)).unwrap();
+        let moved = b.broadcast(x, vec![2]).unwrap();
         let output = if arithmetic {
-            b.binary_scalar(GBinOp::Add, moved, Scalar::I32(1))
+            b.binary_scalar(GBinOp::Add, moved, Scalar::I32(1)).unwrap()
         } else {
-            let table = b.constant("table", TensorType::f32(vec![4, 1]));
-            b.gather(table, 0, moved)
+            let table = b.constant("table", TensorType::f32(vec![4, 1])).unwrap();
+            b.gather(table, 0, moved).unwrap()
         };
         let g = b.finish(output).unwrap();
         let eqn = g
@@ -671,14 +676,14 @@ fn i32_movement_carries_i32_whatever_consumes_it() {
 #[test]
 fn an_i32_binary_plans_the_same_kernel_whatever_consumes_it() {
     let binary_plan = |observed: bool| {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![2], GDt::I32));
-        let y = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::new(vec![2], GDt::I32)).unwrap();
+        let y = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1)).unwrap();
         let output = if observed {
             y
         } else {
-            let table = b.constant("table", TensorType::f32(vec![4, 1]));
-            b.gather(table, 0, y)
+            let table = b.constant("table", TensorType::f32(vec![4, 1])).unwrap();
+            b.gather(table, 0, y).unwrap()
         };
         let g = b.finish(output).unwrap();
         let eqn = g
@@ -717,19 +722,21 @@ fn an_i32_binary_plans_the_same_kernel_whatever_consumes_it() {
 #[test]
 fn gather_reads_i32_indices_through_slice_i32() {
     let gather_plan = |computed: bool, axis: usize| {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let table = if axis == 0 {
-            b.constant("table", TensorType::f32(vec![4, 2]))
+            b.constant("table", TensorType::f32(vec![4, 2])).unwrap()
         } else {
-            b.constant("table", TensorType::f32(vec![2, 4, 2]))
+            b.constant("table", TensorType::f32(vec![2, 4, 2])).unwrap()
         };
-        let index = b.constant("index", TensorType::new(vec![2], GDt::I32));
+        let index = b
+            .constant("index", TensorType::new(vec![2], GDt::I32))
+            .unwrap();
         let index = if computed {
-            b.binary_scalar(GBinOp::Add, index, Scalar::I32(1))
+            b.binary_scalar(GBinOp::Add, index, Scalar::I32(1)).unwrap()
         } else {
-            b.broadcast(index, vec![2])
+            b.broadcast(index, vec![2]).unwrap()
         };
-        let gathered = b.gather(table, axis, index);
+        let gathered = b.gather(table, axis, index).unwrap();
         let g = b.finish(gathered).unwrap();
         let eqn = g
             .eqns()
@@ -760,11 +767,15 @@ fn gather_reads_i32_indices_through_slice_i32() {
 #[test]
 fn gather_over_i32_data_reads_the_table_on_the_i32_lane() {
     for axis in [0, 1] {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let table_shape = if axis == 0 { vec![4, 2] } else { vec![2, 4, 2] };
-        let table = b.constant("table", TensorType::new(table_shape, GDt::I32));
-        let index = b.constant("index", TensorType::new(vec![3], GDt::I32));
-        let gathered = b.gather(table, axis, index);
+        let table = b
+            .constant("table", TensorType::new(table_shape, GDt::I32))
+            .unwrap();
+        let index = b
+            .constant("index", TensorType::new(vec![3], GDt::I32))
+            .unwrap();
+        let gathered = b.gather(table, axis, index).unwrap();
         let g = b.finish(gathered).unwrap();
         let eqn = g
             .eqns()
@@ -776,7 +787,7 @@ fn gather_over_i32_data_reads_the_table_on_the_i32_lane() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap()
         {
@@ -792,10 +803,14 @@ fn gather_over_i32_data_reads_the_table_on_the_i32_lane() {
 #[test]
 fn an_isolated_i32_gather_plans_the_i32_carrier_with_an_i32_index() {
     for (axis, table_shape) in [(0, vec![4, 2]), (1, vec![2, 4, 2])] {
-        let b = Builder::new();
-        let table = b.constant("table", TensorType::new(table_shape, GDt::I32));
-        let index = b.constant("index", TensorType::new(vec![3], GDt::I32));
-        let gathered = b.gather(table, axis, index);
+        let b = Builder::for_tests();
+        let table = b
+            .constant("table", TensorType::new(table_shape, GDt::I32))
+            .unwrap();
+        let index = b
+            .constant("index", TensorType::new(vec![3], GDt::I32))
+            .unwrap();
+        let gathered = b.gather(table, axis, index).unwrap();
         let g = b.finish(gathered).unwrap();
         let eqn = &g.eqns()[0];
         let (planned_plan, choice) = planned_with_choice(&g, eqn, Backend::SpirvVulkan).unwrap();
@@ -828,9 +843,9 @@ fn an_isolated_i32_gather_plans_the_i32_carrier_with_an_i32_index() {
 
 #[test]
 fn planner_rejects_literal_first_binary_locally_without_panicking() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2]));
-    let output = b.binary_scalar(GBinOp::Sub, x, Scalar::F32(1.0));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2])).unwrap();
+    let output = b.binary_scalar(GBinOp::Sub, x, Scalar::F32(1.0)).unwrap();
     let g = derive(&b.finish(output).unwrap(), |draft| {
         draft.eqns_mut()[0].inputs.swap(0, 1);
     })
@@ -841,7 +856,7 @@ fn planner_rejects_literal_first_binary_locally_without_panicking() {
             &g.eqns()[0],
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "literal-first Binary",
     );
@@ -853,8 +868,8 @@ fn planner_rejects_literal_first_binary_locally_without_panicking() {
 /// route to a planned iota.
 #[test]
 fn planner_refuses_an_unfolded_iota_with_a_typed_refusal() {
-    let b = Builder::new();
-    let output = b.cast(b.iota(4), GDt::F32);
+    let b = Builder::for_tests();
+    let output = b.cast(b.iota(4).unwrap(), GDt::F32).unwrap();
     let graph = b.finish(output).unwrap();
     let iota = graph
         .eqns()
@@ -867,7 +882,7 @@ fn planner_refuses_an_unfolded_iota_with_a_typed_refusal() {
             iota,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "unfolded Iota",
     );
@@ -876,9 +891,9 @@ fn planner_refuses_an_unfolded_iota_with_a_typed_refusal() {
 
 #[test]
 fn exact_i32_planner_rejects_static_numel_overflow() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![1], GDt::I32));
-    let output = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::new(vec![1], GDt::I32)).unwrap();
+    let output = b.binary_scalar(GBinOp::Add, x, Scalar::I32(1)).unwrap();
     let g = derive(&b.finish(output).unwrap(), |draft| {
         // The operand and the result agree, so the graph is well formed; only the element count overflows.
         draft.values_mut()[x.id()].aval.shape = vec![usize::MAX, 2];
@@ -893,7 +908,7 @@ fn exact_i32_planner_rejects_static_numel_overflow() {
         &g.eqns()[0],
         Backend::Nvptx,
         &default_caps_for(Backend::Nvptx),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap_err();
     assert!(error.to_string().contains("overflows usize"), "{error}");
@@ -911,10 +926,10 @@ fn exact_i32_planner_rejects_static_numel_overflow() {
 /// `[4,8]`. Restoring the `g.aval` read made it green again.
 #[test]
 fn plan_eqn_derives_shape_from_the_graph_not_a_caller_argument() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 8]));
-    let y = b.constant("y", TensorType::f32(vec![4, 8]));
-    let out = b.binary(GBinOp::Add, x, y);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+    let y = b.constant("y", TensorType::f32(vec![4, 8])).unwrap();
+    let out = b.binary(GBinOp::Add, x, y).unwrap();
     let g = b.finish(out).unwrap();
     let eqn = &g.eqns()[0];
     let planned_plan = plan_eqn(
@@ -922,7 +937,7 @@ fn plan_eqn_derives_shape_from_the_graph_not_a_caller_argument() {
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let Dispatch {
@@ -963,11 +978,17 @@ fn try_matmul_plan(g: &Graph, backend: Backend) -> Result<Plan, PlanError> {
 /// matmul fuses and this row goes red.
 #[test]
 fn a_biased_matmul_with_mismatched_operand_dtypes_is_not_fused_into_an_epilogue() {
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::new(vec![1, 1, 32], GDt::F32));
-    let w = bld.constant("w", TensorType::new(vec![32, 16], GDt::BF16));
-    let bias = bld.constant("bias", TensorType::new(vec![16], GDt::F32));
-    let mm = poot_graph_ir::ops::linear(&bld, a, w, Some(bias));
+    let bld = Builder::for_tests();
+    let a = bld
+        .constant("a", TensorType::new(vec![1, 1, 32], GDt::F32))
+        .unwrap();
+    let w = bld
+        .constant("w", TensorType::new(vec![32, 16], GDt::BF16))
+        .unwrap();
+    let bias = bld
+        .constant("bias", TensorType::new(vec![16], GDt::F32))
+        .unwrap();
+    let mm = poot_graph_ir::ops::linear(&bld, a, w, Some(bias)).unwrap();
     let g =
         crate::passes::fuse_contraction_epilogues(&bld.finish(mm).unwrap(), |_, _| true).unwrap();
     assert!(
@@ -995,12 +1016,22 @@ fn a_biased_checkpoint_orientation_projection_is_one_contraction_with_bias_and_n
         Backend::Nvptx,
     ] {
         for weight in [GDt::F32, GDt::BF16] {
-            let bld = Builder::new();
-            let x = bld.constant("x", TensorType::new(vec![1, 1, 32], GDt::F32));
-            let w = bld.constant("w", TensorType::new(vec![16, 32], weight));
-            let bias = bld.constant("bias", TensorType::new(vec![16], GDt::F32));
-            let projection = bld.matmul(x, bld.transpose(w, vec![1, 0]));
-            let out = bld.binary(poot_graph_ir::op::BinOp::Add, projection, bias);
+            let bld = Builder::for_tests();
+            let x = bld
+                .constant("x", TensorType::new(vec![1, 1, 32], GDt::F32))
+                .unwrap();
+            let w = bld
+                .constant("w", TensorType::new(vec![16, 32], weight))
+                .unwrap();
+            let bias = bld
+                .constant("bias", TensorType::new(vec![16], GDt::F32))
+                .unwrap();
+            let projection = bld
+                .matmul(x, bld.transpose(w, vec![1, 0]).unwrap())
+                .unwrap();
+            let out = bld
+                .binary(poot_graph_ir::op::BinOp::Add, projection, bias)
+                .unwrap();
             let g = bld.finish(out).unwrap();
             let program = compile(
                 &g,
@@ -1091,11 +1122,17 @@ fn e4m3fn_graph_execution_is_rejected_by_name_for_every_unwired_arithmetic_class
 #[test]
 fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() {
     let build = |source_rows| {
-        let builder = Builder::new();
-        let base = builder.constant("base", TensorType::new(vec![4, 2, 5], GDt::E4M3FN));
-        let src = builder.constant("src", TensorType::new(vec![source_rows, 2, 5], GDt::E4M3FN));
-        let inverse = builder.constant("inverse", TensorType::new(vec![4], GDt::I32));
-        let output = builder.scatter_update(base, src, inverse);
+        let builder = Builder::for_tests();
+        let base = builder
+            .constant("base", TensorType::new(vec![4, 2, 5], GDt::E4M3FN))
+            .unwrap();
+        let src = builder
+            .constant("src", TensorType::new(vec![source_rows, 2, 5], GDt::E4M3FN))
+            .unwrap();
+        let inverse = builder
+            .constant("inverse", TensorType::new(vec![4], GDt::I32))
+            .unwrap();
+        let output = builder.scatter_update(base, src, inverse).unwrap();
         builder.finish(output).unwrap()
     };
     let graph = build(3);
@@ -1129,7 +1166,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
         other_eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let Dispatch { key: other_key, .. } = into_plain(planned_plan);
@@ -1141,7 +1178,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
             eqn,
             Backend::Nvptx,
             &default_caps_for(Backend::Nvptx),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
+            &crate::test_support::roomy_body_limits()
         )
         .unwrap()
     ));
@@ -1152,7 +1189,7 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
             eqn,
             backend,
             &default_caps_for(backend),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN ScatterUpdate on ROCm",
     );
@@ -1160,11 +1197,17 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
     assert_eq!(refusal.op, OpKind::ScatterUpdate);
     assert_eq!(refusal.target, TargetId::Gpu(backend));
 
-    let builder = Builder::new();
-    let base = builder.constant("base_rank1", TensorType::new(vec![5], GDt::E4M3FN));
-    let src = builder.constant("src_rank1", TensorType::new(vec![3], GDt::E4M3FN));
-    let inverse = builder.constant("inverse_rank1", TensorType::new(vec![5], GDt::I32));
-    let output = builder.scatter_update(base, src, inverse);
+    let builder = Builder::for_tests();
+    let base = builder
+        .constant("base_rank1", TensorType::new(vec![5], GDt::E4M3FN))
+        .unwrap();
+    let src = builder
+        .constant("src_rank1", TensorType::new(vec![3], GDt::E4M3FN))
+        .unwrap();
+    let inverse = builder
+        .constant("inverse_rank1", TensorType::new(vec![5], GDt::I32))
+        .unwrap();
+    let output = builder.scatter_update(base, src, inverse).unwrap();
     let rank1 = builder.finish(output).unwrap();
     let rank1_eqn = &rank1.eqns()[0];
     let (planned_plan, choice) =
@@ -1196,10 +1239,14 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
 
 #[test]
 fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
-    let builder = Builder::new();
-    let operand = builder.constant("operand", TensorType::new(vec![2, 4, 5], GDt::E4M3FN));
-    let update = builder.constant("update", TensorType::new(vec![2, 2, 5], GDt::E4M3FN));
-    let output = builder.dynamic_update_slice(operand, update, 1, 1);
+    let builder = Builder::for_tests();
+    let operand = builder
+        .constant("operand", TensorType::new(vec![2, 4, 5], GDt::E4M3FN))
+        .unwrap();
+    let update = builder
+        .constant("update", TensorType::new(vec![2, 2, 5], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.dynamic_update_slice(operand, update, 1, 1).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let (planned_plan, choice) = planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
@@ -1227,11 +1274,19 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
     );
     assert_eq!(grid, [16, 1, 1]);
 
-    let builder = Builder::new();
-    let operand = builder.constant("operand", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let update = builder.constant("update", TensorType::new(vec![2, 2], GDt::E4M3FN));
-    let index = builder.constant("index", TensorType::new(vec![], GDt::I32));
-    let output = builder.dynamic_update_slice_dyn(operand, update, index, 1);
+    let builder = Builder::for_tests();
+    let operand = builder
+        .constant("operand", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let update = builder
+        .constant("update", TensorType::new(vec![2, 2], GDt::E4M3FN))
+        .unwrap();
+    let index = builder
+        .constant("index", TensorType::new(vec![], GDt::I32))
+        .unwrap();
+    let output = builder
+        .dynamic_update_slice_dyn(operand, update, index, 1)
+        .unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let (planned_plan, choice) = planned_with_choice(&graph, eqn, Backend::SpirvVulkan).unwrap();
@@ -1264,7 +1319,7 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
             eqn,
             Backend::Nvptx,
             &default_caps_for(Backend::Nvptx),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
+            &crate::test_support::roomy_body_limits()
         )
         .unwrap()
     ));
@@ -1275,7 +1330,7 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
             eqn,
             backend,
             &default_caps_for(backend),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN DynamicUpdateSlice on ROCm",
     );
@@ -1287,11 +1342,17 @@ fn e4m3fn_dynamic_update_slice_plans_static_and_runtime_exact_packed_outputs() {
 #[test]
 fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
     for (pool, source_rows) in [(0, 1), (2, 0)] {
-        let builder = Builder::new();
-        let base = builder.constant("base", TensorType::new(vec![pool, 5], GDt::E4M3FN));
-        let src = builder.constant("src", TensorType::new(vec![source_rows, 5], GDt::E4M3FN));
-        let inverse = builder.constant("inverse", TensorType::new(vec![pool], GDt::I32));
-        let output = builder.scatter_update(base, src, inverse);
+        let builder = Builder::for_tests();
+        let base = builder
+            .constant("base", TensorType::new(vec![pool, 5], GDt::E4M3FN))
+            .unwrap();
+        let src = builder
+            .constant("src", TensorType::new(vec![source_rows, 5], GDt::E4M3FN))
+            .unwrap();
+        let inverse = builder
+            .constant("inverse", TensorType::new(vec![pool], GDt::I32))
+            .unwrap();
+        let output = builder.scatter_update(base, src, inverse).unwrap();
         let graph = builder.finish(output).unwrap();
         let eqn = &graph.eqns()[0];
         let refusal = refusal_of(
@@ -1300,7 +1361,7 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
                 eqn,
                 Backend::SpirvVulkan,
                 &default_caps_for(Backend::SpirvVulkan),
-                &poot_test_util::graph_fixtures::roomy_body_limits(),
+                &crate::test_support::roomy_body_limits(),
             ),
             "empty E4M3FN ScatterUpdate",
         );
@@ -1308,11 +1369,17 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
         assert_eq!(refusal.op, OpKind::ScatterUpdate);
     }
 
-    let builder = Builder::new();
-    let base = builder.constant("base", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let src = builder.constant("src", TensorType::f32(vec![1, 5]));
-    let inverse = builder.constant("inverse", TensorType::new(vec![2], GDt::I32));
-    let output = builder.scatter_update(base, src, inverse);
+    let builder = Builder::for_tests();
+    let base = builder
+        .constant("base", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let src = builder
+        .constant("src", TensorType::f32(vec![1, 5]))
+        .unwrap();
+    let inverse = builder
+        .constant("inverse", TensorType::new(vec![2], GDt::I32))
+        .unwrap();
+    let output = builder.scatter_update(base, src, inverse).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -1321,7 +1388,7 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN ScatterUpdate over an f32 source",
     );
@@ -1358,14 +1425,24 @@ fn e4m3fn_dynamic_update_slice_cache_keys_separate_forms_axes_windows_and_layout
         axis: usize,
         index: Option<usize>,
     ) -> String {
-        let builder = Builder::new();
-        let operand = builder.constant("operand", TensorType::new(operand_shape, GDt::E4M3FN));
-        let update = builder.constant("update", TensorType::new(update_shape, GDt::E4M3FN));
+        let builder = Builder::for_tests();
+        let operand = builder
+            .constant("operand", TensorType::new(operand_shape, GDt::E4M3FN))
+            .unwrap();
+        let update = builder
+            .constant("update", TensorType::new(update_shape, GDt::E4M3FN))
+            .unwrap();
         let output = if let Some(index) = index {
-            builder.dynamic_update_slice(operand, update, index, axis)
+            builder
+                .dynamic_update_slice(operand, update, index, axis)
+                .unwrap()
         } else {
-            let index = builder.constant("index", TensorType::new(vec![], GDt::I32));
-            builder.dynamic_update_slice_dyn(operand, update, index, axis)
+            let index = builder
+                .constant("index", TensorType::new(vec![], GDt::I32))
+                .unwrap();
+            builder
+                .dynamic_update_slice_dyn(operand, update, index, axis)
+                .unwrap()
         };
         let graph = builder.finish(output).unwrap();
         let eqn = &graph.eqns()[0];
@@ -1374,7 +1451,7 @@ fn e4m3fn_dynamic_update_slice_cache_keys_separate_forms_axes_windows_and_layout
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap();
         let Dispatch { key, .. } = into_plain(planned_plan);
@@ -1398,10 +1475,14 @@ fn e4m3fn_dynamic_update_slice_cache_keys_separate_forms_axes_windows_and_layout
 
 #[test]
 fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
-    let builder = Builder::new();
-    let operand = builder.constant("operand", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let update = builder.constant("update", TensorType::new(vec![2, 2], GDt::E4M3FN));
-    let output = builder.dynamic_update_slice(operand, update, 4, 1);
+    let builder = Builder::for_tests();
+    let operand = builder
+        .constant("operand", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let update = builder
+        .constant("update", TensorType::new(vec![2, 2], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.dynamic_update_slice(operand, update, 4, 1).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -1410,7 +1491,7 @@ fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN DynamicUpdateSlice window past the axis",
     );
@@ -1424,10 +1505,14 @@ fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
     );
     assert_eq!(refusal.op, eqn.op);
 
-    let builder = Builder::new();
-    let operand = builder.constant("operand", TensorType::new(vec![0, 5], GDt::E4M3FN));
-    let update = builder.constant("update", TensorType::new(vec![0, 5], GDt::E4M3FN));
-    let output = builder.dynamic_update_slice(operand, update, 0, 0);
+    let builder = Builder::for_tests();
+    let operand = builder
+        .constant("operand", TensorType::new(vec![0, 5], GDt::E4M3FN))
+        .unwrap();
+    let update = builder
+        .constant("update", TensorType::new(vec![0, 5], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.dynamic_update_slice(operand, update, 0, 0).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -1436,7 +1521,7 @@ fn e4m3fn_dynamic_update_slice_rejects_zero_invalid_window_and_index_storage() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "zero-element E4M3FN DynamicUpdateSlice",
     );
@@ -1482,11 +1567,19 @@ fn dynamic_update_slice_runtime_index_is_i32_only() {
         }
     ));
 
-    let builder = Builder::new();
-    let operand = builder.constant("operand", TensorType::f32(vec![4, 5]));
-    let update = builder.constant("update", TensorType::f32(vec![2, 5]));
-    let index = builder.constant("index", TensorType::scalar(GDt::I32));
-    let output = builder.dynamic_update_slice_dyn(operand, update, index, 0);
+    let builder = Builder::for_tests();
+    let operand = builder
+        .constant("operand", TensorType::f32(vec![4, 5]))
+        .unwrap();
+    let update = builder
+        .constant("update", TensorType::f32(vec![2, 5]))
+        .unwrap();
+    let index = builder
+        .constant("index", TensorType::scalar(GDt::I32))
+        .unwrap();
+    let output = builder
+        .dynamic_update_slice_dyn(operand, update, index, 0)
+        .unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = graph
         .eqns()
@@ -1514,11 +1607,17 @@ fn dynamic_update_slice_runtime_index_is_i32_only() {
 
 #[test]
 fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu() {
-    let builder = Builder::new();
-    let p0 = builder.constant("p0", TensorType::new(vec![2, 2, 3], GDt::E4M3FN));
-    let p1 = builder.constant("p1", TensorType::new(vec![2, 1, 3], GDt::E4M3FN));
-    let p2 = builder.constant("p2", TensorType::new(vec![2, 3, 3], GDt::E4M3FN));
-    let output = builder.concat(1, &[p0, p1, p2]);
+    let builder = Builder::for_tests();
+    let p0 = builder
+        .constant("p0", TensorType::new(vec![2, 2, 3], GDt::E4M3FN))
+        .unwrap();
+    let p1 = builder
+        .constant("p1", TensorType::new(vec![2, 1, 3], GDt::E4M3FN))
+        .unwrap();
+    let p2 = builder
+        .constant("p2", TensorType::new(vec![2, 3, 3], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.concat(1, &[p0, p1, p2]).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let shape = graph.aval(eqn.out).shape.clone();
@@ -1549,7 +1648,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
             eqn,
             Backend::Nvptx,
             &default_caps_for(Backend::Nvptx),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
+            &crate::test_support::roomy_body_limits()
         )
         .unwrap()
     ));
@@ -1560,7 +1659,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
             eqn,
             backend,
             &default_caps_for(backend),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN Concat on ROCm",
     );
@@ -1568,10 +1667,14 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
     assert_eq!(refusal.op, eqn.op);
     assert_eq!(refusal.target, TargetId::Gpu(backend));
 
-    let builder = Builder::new();
-    let a = builder.constant("a", TensorType::new(vec![2, 3], GDt::E4M3FN));
-    let b = builder.constant("b", TensorType::new(vec![2, 2], GDt::E4M3FN));
-    let output = builder.concat(1, &[a, b]);
+    let builder = Builder::for_tests();
+    let a = builder
+        .constant("a", TensorType::new(vec![2, 3], GDt::E4M3FN))
+        .unwrap();
+    let b = builder
+        .constant("b", TensorType::new(vec![2, 2], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.concat(1, &[a, b]).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let shape = graph.aval(eqn.out).shape.clone();
@@ -1580,7 +1683,7 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let Dispatch {
@@ -1590,9 +1693,11 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
     assert_eq!(shape, [2, 5]);
     assert_eq!(grid, [4, 1, 1]);
 
-    let builder = Builder::new();
-    let only = builder.constant("only", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let output = builder.concat(1, &[only]);
+    let builder = Builder::for_tests();
+    let only = builder
+        .constant("only", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.concat(1, &[only]).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     assert!(matches!(
@@ -1600,17 +1705,21 @@ fn e4m3fn_concat_preserves_n_input_contract_and_aliases_only_one_input_on_wgpu()
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
-    &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
+    &crate::test_support::roomy_body_limits()).unwrap(),
            Plan::Alias(id) if id == only.id()
        ));
 }
 
 #[test]
 fn e4m3fn_concat_rejects_zero_element_and_mixed_storage_by_name() {
-    let builder = Builder::new();
-    let empty = builder.constant("empty", TensorType::new(vec![0, 5], GDt::E4M3FN));
-    let full = builder.constant("full", TensorType::new(vec![1, 5], GDt::E4M3FN));
-    let output = builder.concat(0, &[empty, full]);
+    let builder = Builder::for_tests();
+    let empty = builder
+        .constant("empty", TensorType::new(vec![0, 5], GDt::E4M3FN))
+        .unwrap();
+    let full = builder
+        .constant("full", TensorType::new(vec![1, 5], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.concat(0, &[empty, full]).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -1619,17 +1728,21 @@ fn e4m3fn_concat_rejects_zero_element_and_mixed_storage_by_name() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "zero-element E4M3FN Concat",
     );
     assert_eq!(refusal.missing, Capability::ZeroElementE4m3);
     assert_eq!(refusal.op, eqn.op);
 
-    let builder = Builder::new();
-    let raw = builder.constant("raw", TensorType::new(vec![1, 5], GDt::E4M3FN));
-    let dense = builder.constant("dense", TensorType::new(vec![1, 5], GDt::F32));
-    let output = builder.concat(0, &[raw, dense]);
+    let builder = Builder::for_tests();
+    let raw = builder
+        .constant("raw", TensorType::new(vec![1, 5], GDt::E4M3FN))
+        .unwrap();
+    let dense = builder
+        .constant("dense", TensorType::new(vec![1, 5], GDt::F32))
+        .unwrap();
+    let output = builder.concat(0, &[raw, dense]).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -1638,7 +1751,7 @@ fn e4m3fn_concat_rejects_zero_element_and_mixed_storage_by_name() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN Concat over a dense operand",
     );
@@ -1653,9 +1766,11 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
         (vec![2, 1, 5], vec![2, 3, 5], 12),
         (vec![1, 3], vec![2, 1, 3], 2),
     ] {
-        let builder = Builder::new();
-        let input = builder.constant("raw", TensorType::new(input_shape.clone(), GDt::E4M3FN));
-        let output = builder.broadcast(input, output_shape.clone());
+        let builder = Builder::for_tests();
+        let input = builder
+            .constant("raw", TensorType::new(input_shape.clone(), GDt::E4M3FN))
+            .unwrap();
+        let output = builder.broadcast(input, output_shape.clone()).unwrap();
         let graph = builder.finish(output).unwrap();
         let eqn = &graph.eqns()[0];
         let shape = graph.aval(eqn.out).shape.clone();
@@ -1665,7 +1780,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap();
         let Dispatch {
@@ -1679,7 +1794,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
                 eqn,
                 Backend::Nvptx,
                 &default_caps_for(Backend::Nvptx),
-                &poot_test_util::graph_fixtures::roomy_body_limits()
+                &crate::test_support::roomy_body_limits()
             )
             .unwrap()
         ));
@@ -1690,7 +1805,7 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
                 eqn,
                 backend,
                 &default_caps_for(backend),
-                &poot_test_util::graph_fixtures::roomy_body_limits(),
+                &crate::test_support::roomy_body_limits(),
             ),
             "E4M3FN Broadcast on ROCm",
         );
@@ -1699,9 +1814,11 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
         assert_eq!(refusal.target, TargetId::Gpu(backend));
     }
 
-    let builder = Builder::new();
-    let input = builder.constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let output = builder.broadcast(input, vec![2, 5]);
+    let builder = Builder::for_tests();
+    let input = builder
+        .constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.broadcast(input, vec![2, 5]).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     assert!(matches!(
@@ -1709,16 +1826,18 @@ fn e4m3fn_broadcast_materializes_expansions_and_aliases_only_identity_on_wgpu() 
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
-    &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
+    &crate::test_support::roomy_body_limits()).unwrap(),
            Plan::Alias(id) if id == input.id()
        ));
 }
 
 #[test]
 fn e4m3fn_empty_output_broadcast_is_rejected_by_name() {
-    let builder = Builder::new();
-    let input = builder.constant("raw", TensorType::new(vec![1, 5], GDt::E4M3FN));
-    let output = builder.broadcast(input, vec![0, 5]);
+    let builder = Builder::for_tests();
+    let input = builder
+        .constant("raw", TensorType::new(vec![1, 5], GDt::E4M3FN))
+        .unwrap();
+    let output = builder.broadcast(input, vec![0, 5]).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -1727,7 +1846,7 @@ fn e4m3fn_empty_output_broadcast_is_rejected_by_name() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN Broadcast to an empty output",
     );
@@ -1738,21 +1857,27 @@ fn e4m3fn_empty_output_broadcast_is_rejected_by_name() {
 #[test]
 fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
     let decode = {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![2, 5], GDt::E4M3FN));
-        let y = b.cast(x, GDt::F32);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![2, 5], GDt::E4M3FN))
+            .unwrap();
+        let y = b.cast(x, GDt::F32).unwrap();
         b.finish(y).unwrap()
     };
     let encode = {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![2, 5], GDt::F32));
-        let y = b.cast(x, GDt::E4M3FN);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![2, 5], GDt::F32))
+            .unwrap();
+        let y = b.cast(x, GDt::E4M3FN).unwrap();
         b.finish(y).unwrap()
     };
     let repack = {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![2, 5], GDt::E4M3FN));
-        let y = b.reshape(x, vec![5, 2]);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![2, 5], GDt::E4M3FN))
+            .unwrap();
+        let y = b.reshape(x, vec![5, 2]).unwrap();
         b.finish(y).unwrap()
     };
 
@@ -1764,7 +1889,7 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap();
         let Dispatch {
@@ -1782,7 +1907,7 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
                 eqn,
                 Backend::Nvptx,
                 &default_caps_for(Backend::Nvptx),
-                &poot_test_util::graph_fixtures::roomy_body_limits()
+                &crate::test_support::roomy_body_limits()
             )
             .unwrap(),
             plan if is_plain(&plan) || matches!(plan, Plan::Alias(_))
@@ -1794,7 +1919,7 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
                 eqn,
                 backend,
                 &default_caps_for(backend),
-                &poot_test_util::graph_fixtures::roomy_body_limits(),
+                &crate::test_support::roomy_body_limits(),
             ),
             "E4M3FN Cast and Reshape on ROCm",
         );
@@ -1806,21 +1931,27 @@ fn e4m3fn_cast_and_reshape_plan_only_for_spirv_wgpu_value_executor() {
 #[test]
 fn e4m3fn_materializing_cast_and_reshape_reject_zero_element_outputs() {
     let encode = {
-        let builder = Builder::new();
-        let input = builder.constant("empty", TensorType::new(vec![0, 5], GDt::F32));
-        let output = builder.cast(input, GDt::E4M3FN);
+        let builder = Builder::for_tests();
+        let input = builder
+            .constant("empty", TensorType::new(vec![0, 5], GDt::F32))
+            .unwrap();
+        let output = builder.cast(input, GDt::E4M3FN).unwrap();
         builder.finish(output).unwrap()
     };
     let decode = {
-        let builder = Builder::new();
-        let input = builder.constant("empty", TensorType::new(vec![0, 5], GDt::E4M3FN));
-        let output = builder.cast(input, GDt::F32);
+        let builder = Builder::for_tests();
+        let input = builder
+            .constant("empty", TensorType::new(vec![0, 5], GDt::E4M3FN))
+            .unwrap();
+        let output = builder.cast(input, GDt::F32).unwrap();
         builder.finish(output).unwrap()
     };
     let repack = {
-        let builder = Builder::new();
-        let input = builder.constant("empty", TensorType::new(vec![0, 5], GDt::E4M3FN));
-        let output = builder.reshape(input, vec![0, 7]);
+        let builder = Builder::for_tests();
+        let input = builder
+            .constant("empty", TensorType::new(vec![0, 5], GDt::E4M3FN))
+            .unwrap();
+        let output = builder.reshape(input, vec![0, 7]).unwrap();
         builder.finish(output).unwrap()
     };
 
@@ -1832,7 +1963,7 @@ fn e4m3fn_materializing_cast_and_reshape_reject_zero_element_outputs() {
                 eqn,
                 Backend::SpirvVulkan,
                 &default_caps_for(Backend::SpirvVulkan),
-                &poot_test_util::graph_fixtures::roomy_body_limits(),
+                &crate::test_support::roomy_body_limits(),
             ),
             "zero-element E4M3FN Cast and Reshape",
         );
@@ -1845,15 +1976,19 @@ fn e4m3fn_materializing_dispatch_rejects_a_grid_beyond_wgpu_x_limit() {
     let grid_cap = default_caps_for(Backend::SpirvVulkan).max_grid[0] as usize;
     let rows = grid_cap * 256 + 1;
     let encode = {
-        let builder = Builder::new();
-        let input = builder.constant("large", TensorType::new(vec![rows, 1], GDt::F32));
-        let output = builder.cast(input, GDt::E4M3FN);
+        let builder = Builder::for_tests();
+        let input = builder
+            .constant("large", TensorType::new(vec![rows, 1], GDt::F32))
+            .unwrap();
+        let output = builder.cast(input, GDt::E4M3FN).unwrap();
         builder.finish(output).unwrap()
     };
     let decode = {
-        let builder = Builder::new();
-        let input = builder.constant("large", TensorType::new(vec![rows, 1], GDt::E4M3FN));
-        let output = builder.cast(input, GDt::F32);
+        let builder = Builder::for_tests();
+        let input = builder
+            .constant("large", TensorType::new(vec![rows, 1], GDt::E4M3FN))
+            .unwrap();
+        let output = builder.cast(input, GDt::F32).unwrap();
         builder.finish(output).unwrap()
     };
 
@@ -1865,7 +2000,7 @@ fn e4m3fn_materializing_dispatch_rejects_a_grid_beyond_wgpu_x_limit() {
                 eqn,
                 Backend::SpirvVulkan,
                 &default_caps_for(Backend::SpirvVulkan),
-                &poot_test_util::graph_fixtures::roomy_body_limits(),
+                &crate::test_support::roomy_body_limits(),
             ),
             "E4M3FN dispatch past the wgpu x limit",
         );
@@ -1905,10 +2040,10 @@ fn sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535() {
     // overshoots this fixture's 1024 - the wg-bump to 256 lanes must fire to bring workgroups_x back
     // under 1024 (1024*64+1 div_ceil 256 = 257 <= 1024).
     let out_numel = 1024 * 64 + 1;
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::f32(vec![out_numel]));
-    let b = bld.constant("b", TensorType::f32(vec![out_numel]));
-    let y = bld.binary(GBinOp::Add, a, b);
+    let bld = Builder::for_tests();
+    let a = bld.constant("a", TensorType::f32(vec![out_numel])).unwrap();
+    let b = bld.constant("b", TensorType::f32(vec![out_numel])).unwrap();
+    let y = bld.binary(GBinOp::Add, a, b).unwrap();
     let g = bld.finish(y).unwrap();
     let eqn = &g.eqns()[0];
     let plan = plan_eqn(
@@ -1916,7 +2051,7 @@ fn sc003_grid_cap_bump_respects_custom_device_caps_not_hardcoded_65535() {
         eqn,
         Backend::SpirvVulkan,
         &small_caps,
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let planned_plan = plan;
@@ -1958,10 +2093,10 @@ fn sc003_elementwise_2d_fold_respects_custom_device_caps_not_hardcoded_65535x256
     // One past this fixture's own fold ceiling (max_grid[0] * ELEMENTWISE_2D_WIDTH = 1024*256 =
     // 262144); nowhere near the old hardcoded 65535*256 = 16,776,960 ceiling.
     let out_numel = 1024 * 256 + 1;
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::f32(vec![out_numel]));
-    let b = bld.constant("b", TensorType::f32(vec![out_numel]));
-    let y = bld.binary(GBinOp::Add, a, b);
+    let bld = Builder::for_tests();
+    let a = bld.constant("a", TensorType::f32(vec![out_numel])).unwrap();
+    let b = bld.constant("b", TensorType::f32(vec![out_numel])).unwrap();
+    let y = bld.binary(GBinOp::Add, a, b).unwrap();
     let g = bld.finish(y).unwrap();
     let eqn = &g.eqns()[0];
     let plan = plan_eqn(
@@ -1969,7 +2104,7 @@ fn sc003_elementwise_2d_fold_respects_custom_device_caps_not_hardcoded_65535x256
         eqn,
         Backend::SpirvVulkan,
         &small_caps,
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let planned_plan = plan;
@@ -1982,7 +2117,7 @@ fn sc003_elementwise_2d_fold_respects_custom_device_caps_not_hardcoded_65535x256
     let wg1 = body.workgroup_size[1].max(1) as usize;
     // `grid` is the total thread count (card 525: `types.rs`'s `Launch` doc); the executor
     // derives the dispatched workgroup count per axis by CEILING division against `workgroup_size`
-    // (`poot-runtime`'s `workgroup_count`), never a floor division that would silently truncate.
+    // (`poot-wgpu-runtime`'s `workgroup_count`), never a floor division that would silently truncate.
     let workgroups_x = (grid[0] as usize).div_ceil(wg0);
     let workgroups_y = (grid[1] as usize).div_ceil(wg1);
     assert!(
@@ -2003,9 +2138,11 @@ fn sc003_elementwise_2d_fold_respects_custom_device_caps_not_hardcoded_65535x256
 
 #[test]
 fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
-    let builder = Builder::new();
-    let x = builder.constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let same_dtype = builder.cast(x, GDt::E4M3FN);
+    let builder = Builder::for_tests();
+    let x = builder
+        .constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let same_dtype = builder.cast(x, GDt::E4M3FN).unwrap();
     let graph = builder.finish(same_dtype).unwrap();
     let eqn = &graph.eqns()[0];
 
@@ -2014,7 +2151,7 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
-    &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
+    &crate::test_support::roomy_body_limits()).unwrap(),
            Plan::Alias(id) if id == x.id()
        ));
     assert!(matches!(
@@ -2022,7 +2159,7 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
        eqn,
        Backend::Nvptx,
        &default_caps_for(Backend::Nvptx),
-    &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
+    &crate::test_support::roomy_body_limits()).unwrap(),
            Plan::Alias(id) if id == x.id()
        ));
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
@@ -2032,7 +2169,7 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
             eqn,
             backend,
             &default_caps_for(backend),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "same-dtype E4M3FN Cast on ROCm",
     );
@@ -2042,9 +2179,11 @@ fn e4m3fn_same_dtype_cast_is_an_alias_only_on_spirv_wgpu_value_path() {
 
 #[test]
 fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu() {
-    let builder = Builder::new();
-    let x = builder.constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let transposed = builder.transpose(x, vec![1, 0]);
+    let builder = Builder::for_tests();
+    let x = builder
+        .constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let transposed = builder.transpose(x, vec![1, 0]).unwrap();
     let graph = builder.finish(transposed).unwrap();
     let eqn = &graph.eqns()[0];
     let planned_plan = plan_eqn(
@@ -2052,7 +2191,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let Dispatch {
@@ -2066,7 +2205,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
             eqn,
             Backend::Nvptx,
             &default_caps_for(Backend::Nvptx),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
+            &crate::test_support::roomy_body_limits()
         )
         .unwrap()
     ));
@@ -2077,7 +2216,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
             eqn,
             backend,
             &default_caps_for(backend),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN Transpose on ROCm",
     );
@@ -2085,9 +2224,11 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
     assert_eq!(refusal.op, eqn.op);
     assert_eq!(refusal.target, TargetId::Gpu(backend));
 
-    let builder = Builder::new();
-    let x = builder.constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let identity = builder.transpose(x, vec![0, 1]);
+    let builder = Builder::for_tests();
+    let x = builder
+        .constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let identity = builder.transpose(x, vec![0, 1]).unwrap();
     let graph = builder.finish(identity).unwrap();
     let eqn = &graph.eqns()[0];
     assert!(matches!(
@@ -2095,13 +2236,15 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
-    &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
+    &crate::test_support::roomy_body_limits()).unwrap(),
            Plan::Alias(id) if id == x.id()
        ));
 
-    let builder = Builder::new();
-    let x = builder.constant("raw", TensorType::new(vec![2, 1, 5], GDt::E4M3FN));
-    let moved_unit_axis = builder.transpose(x, vec![1, 0, 2]);
+    let builder = Builder::for_tests();
+    let x = builder
+        .constant("raw", TensorType::new(vec![2, 1, 5], GDt::E4M3FN))
+        .unwrap();
+    let moved_unit_axis = builder.transpose(x, vec![1, 0, 2]).unwrap();
     let graph = builder.finish(moved_unit_axis).unwrap();
     let eqn = &graph.eqns()[0];
     assert!(is_plain(
@@ -2110,7 +2253,7 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
+            &crate::test_support::roomy_body_limits()
         )
         .unwrap()
     ));
@@ -2119,9 +2262,11 @@ fn e4m3fn_transpose_materializes_nonidentity_and_aliases_only_identity_on_wgpu()
 #[test]
 fn e4m3fn_zero_element_transpose_is_rejected_by_name() {
     for perm in [vec![1, 0], vec![0, 1]] {
-        let builder = Builder::new();
-        let x = builder.constant("raw", TensorType::new(vec![0, 5], GDt::E4M3FN));
-        let transposed = builder.transpose(x, perm);
+        let builder = Builder::for_tests();
+        let x = builder
+            .constant("raw", TensorType::new(vec![0, 5], GDt::E4M3FN))
+            .unwrap();
+        let transposed = builder.transpose(x, perm).unwrap();
         let graph = builder.finish(transposed).unwrap();
         let eqn = &graph.eqns()[0];
         let refusal = refusal_of(
@@ -2130,7 +2275,7 @@ fn e4m3fn_zero_element_transpose_is_rejected_by_name() {
                 eqn,
                 Backend::SpirvVulkan,
                 &default_caps_for(Backend::SpirvVulkan),
-                &poot_test_util::graph_fixtures::roomy_body_limits(),
+                &crate::test_support::roomy_body_limits(),
             ),
             "zero-element E4M3FN Transpose",
         );
@@ -2141,9 +2286,11 @@ fn e4m3fn_zero_element_transpose_is_rejected_by_name() {
 
 #[test]
 fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu() {
-    let builder = Builder::new();
-    let x = builder.constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let sliced = builder.slice(x, 1, 1, 4);
+    let builder = Builder::for_tests();
+    let x = builder
+        .constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let sliced = builder.slice(x, 1, 1, 4).unwrap();
     let graph = builder.finish(sliced).unwrap();
     let eqn = &graph.eqns()[0];
     let shape = graph.aval(eqn.out).shape.clone();
@@ -2152,7 +2299,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let Dispatch {
@@ -2167,7 +2314,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
             eqn,
             Backend::Nvptx,
             &default_caps_for(Backend::Nvptx),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
+            &crate::test_support::roomy_body_limits()
         )
         .unwrap()
     ));
@@ -2178,7 +2325,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
             eqn,
             backend,
             &default_caps_for(backend),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN Slice on ROCm",
     );
@@ -2186,9 +2333,11 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
     assert_eq!(refusal.op, eqn.op);
     assert_eq!(refusal.target, TargetId::Gpu(backend));
 
-    let builder = Builder::new();
-    let x = builder.constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let identity = builder.slice(x, 1, 0, 5);
+    let builder = Builder::for_tests();
+    let x = builder
+        .constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let identity = builder.slice(x, 1, 0, 5).unwrap();
     let graph = builder.finish(identity).unwrap();
     let eqn = &graph.eqns()[0];
     assert!(matches!(
@@ -2196,13 +2345,15 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
        eqn,
        Backend::SpirvVulkan,
        &default_caps_for(Backend::SpirvVulkan),
-    &poot_test_util::graph_fixtures::roomy_body_limits()).unwrap(),
+    &crate::test_support::roomy_body_limits()).unwrap(),
            Plan::Alias(id) if id == x.id()
        ));
 
-    let builder = Builder::new();
-    let x = builder.constant("raw", TensorType::new(vec![3, 5], GDt::E4M3FN));
-    let contiguous_rows = builder.slice(x, 0, 1, 3);
+    let builder = Builder::for_tests();
+    let x = builder
+        .constant("raw", TensorType::new(vec![3, 5], GDt::E4M3FN))
+        .unwrap();
+    let contiguous_rows = builder.slice(x, 0, 1, 3).unwrap();
     let graph = builder.finish(contiguous_rows).unwrap();
     let eqn = &graph.eqns()[0];
     let planned_plan = plan_eqn(
@@ -2210,7 +2361,7 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let Dispatch {
@@ -2222,9 +2373,11 @@ fn e4m3fn_slice_materializes_proper_ranges_and_aliases_only_full_range_on_wgpu()
 
 #[test]
 fn e4m3fn_empty_output_slice_is_rejected_by_name() {
-    let builder = Builder::new();
-    let x = builder.constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN));
-    let empty = builder.slice(x, 1, 2, 2);
+    let builder = Builder::for_tests();
+    let x = builder
+        .constant("raw", TensorType::new(vec![2, 5], GDt::E4M3FN))
+        .unwrap();
+    let empty = builder.slice(x, 1, 2, 2).unwrap();
     let graph = builder.finish(empty).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -2233,7 +2386,7 @@ fn e4m3fn_empty_output_slice_is_rejected_by_name() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN Slice to an empty output",
     );
@@ -2248,10 +2401,14 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
         (vec![2, 3, 5], vec![2], 1, vec![2, 2, 5], 8),
         (vec![3, 5], vec![], 0, vec![5], 2),
     ] {
-        let builder = Builder::new();
-        let data = builder.constant("raw", TensorType::new(data_shape, GDt::E4M3FN));
-        let index = builder.constant("index", TensorType::new(index_shape, GDt::I32));
-        let gathered = builder.gather(data, axis, index);
+        let builder = Builder::for_tests();
+        let data = builder
+            .constant("raw", TensorType::new(data_shape, GDt::E4M3FN))
+            .unwrap();
+        let index = builder
+            .constant("index", TensorType::new(index_shape, GDt::I32))
+            .unwrap();
+        let gathered = builder.gather(data, axis, index).unwrap();
         let graph = builder.finish(gathered).unwrap();
         let eqn = &graph.eqns()[0];
         let shape = graph.aval(eqn.out).shape.clone();
@@ -2261,7 +2418,7 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap();
         let Dispatch {
@@ -2271,10 +2428,14 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
         assert_eq!(grid, [expected_words, 1, 1]);
     }
 
-    let builder = Builder::new();
-    let data = builder.constant("raw", TensorType::new(vec![4, 5], GDt::E4M3FN));
-    let index = builder.constant("index", TensorType::new(vec![4], GDt::I32));
-    let gathered = builder.gather(data, 0, index);
+    let builder = Builder::for_tests();
+    let data = builder
+        .constant("raw", TensorType::new(vec![4, 5], GDt::E4M3FN))
+        .unwrap();
+    let index = builder
+        .constant("index", TensorType::new(vec![4], GDt::I32))
+        .unwrap();
+    let gathered = builder.gather(data, 0, index).unwrap();
     let graph = builder.finish(gathered).unwrap();
     let eqn = &graph.eqns()[0];
     assert!(is_plain(
@@ -2283,7 +2444,7 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
             eqn,
             Backend::Nvptx,
             &default_caps_for(Backend::Nvptx),
-            &poot_test_util::graph_fixtures::roomy_body_limits()
+            &crate::test_support::roomy_body_limits()
         )
         .unwrap()
     ));
@@ -2294,7 +2455,7 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
             eqn,
             backend,
             &default_caps_for(backend),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN Gather on ROCm",
     );
@@ -2305,10 +2466,14 @@ fn e4m3fn_gather_always_materializes_exact_packed_output_on_wgpu() {
 
 #[test]
 fn e4m3fn_gather_rejects_empty_output_and_non_i32_indices_by_name() {
-    let builder = Builder::new();
-    let data = builder.constant("raw", TensorType::new(vec![4, 5], GDt::E4M3FN));
-    let index = builder.constant("index", TensorType::new(vec![0], GDt::I32));
-    let gathered = builder.gather(data, 0, index);
+    let builder = Builder::for_tests();
+    let data = builder
+        .constant("raw", TensorType::new(vec![4, 5], GDt::E4M3FN))
+        .unwrap();
+    let index = builder
+        .constant("index", TensorType::new(vec![0], GDt::I32))
+        .unwrap();
+    let gathered = builder.gather(data, 0, index).unwrap();
     let graph = builder.finish(gathered).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -2317,7 +2482,7 @@ fn e4m3fn_gather_rejects_empty_output_and_non_i32_indices_by_name() {
             eqn,
             Backend::SpirvVulkan,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         ),
         "E4M3FN Gather to an empty output",
     );
@@ -2359,16 +2524,20 @@ fn e4m3fn_gather_rejects_empty_output_and_non_i32_indices_by_name() {
 #[test]
 fn e4m3fn_zero_eqn_identity_graph_is_rejected_before_executor_binding() {
     let constant_graph = {
-        let b = Builder::new();
-        let x = b.constant("raw", TensorType::new(vec![3, 5], GDt::E4M3FN));
+        let b = Builder::for_tests();
+        let x = b
+            .constant("raw", TensorType::new(vec![3, 5], GDt::E4M3FN))
+            .unwrap();
         b.finish(x).unwrap()
     };
     let slot_graph = {
-        let b = Builder::new();
-        let x = b.slot(
-            poot_graph_ir::Slot::TokenEmbed,
-            TensorType::new(vec![3, 5], GDt::E4M3FN),
-        );
+        let b = Builder::for_tests();
+        let x = b
+            .slot(
+                poot_graph_ir::Slot::TokenEmbed,
+                TensorType::new(vec![3, 5], GDt::E4M3FN),
+            )
+            .unwrap();
         b.finish(x).unwrap()
     };
 
@@ -2490,10 +2659,14 @@ fn amd_wmma_reached_only_by_mixed_bf16_in_f32_out() {
 fn attention_rank4_matmul_routes_through_batched_tiled_gemm() {
     // A prefill-attention-shaped matmul [B,H,M,K] @ [B,H,K,N] -> [B,H,M,N] (M>1) under the 2^15 workgroup
     // cap routes through the batched tiled GEMM (b_count = B*H), not the naive batched kernel.
-    let bld = Builder::new();
-    let q = bld.constant("q", TensorType::new(vec![1, 14, 64, 64], GDt::F32));
-    let kt = bld.constant("kt", TensorType::new(vec![1, 14, 64, 64], GDt::F32));
-    let mm = bld.matmul(q, kt);
+    let bld = Builder::for_tests();
+    let q = bld
+        .constant("q", TensorType::new(vec![1, 14, 64, 64], GDt::F32))
+        .unwrap();
+    let kt = bld
+        .constant("kt", TensorType::new(vec![1, 14, 64, 64], GDt::F32))
+        .unwrap();
+    let mm = bld.matmul(q, kt).unwrap();
     let g = bld.finish(mm).unwrap();
     let choice = matmul_choice(&g, Backend::SpirvVulkan);
     assert!(
@@ -2507,10 +2680,14 @@ fn attention_rank4_matmul_routes_through_batched_tiled_gemm() {
         "attention matmul should take the tiled path: {choice:?}"
     );
     // Above the 2^15 workgroup cap (very long context) it falls back to the naive batched kernel (card 095).
-    let bld2 = Builder::new();
-    let q2 = bld2.constant("q", TensorType::new(vec![1, 14, 2048, 2048], GDt::F32));
-    let k2 = bld2.constant("k", TensorType::new(vec![1, 14, 2048, 2048], GDt::F32));
-    let mm2 = bld2.matmul(q2, k2);
+    let bld2 = Builder::for_tests();
+    let q2 = bld2
+        .constant("q", TensorType::new(vec![1, 14, 2048, 2048], GDt::F32))
+        .unwrap();
+    let k2 = bld2
+        .constant("k", TensorType::new(vec![1, 14, 2048, 2048], GDt::F32))
+        .unwrap();
+    let mm2 = bld2.matmul(q2, k2).unwrap();
     let g2 = bld2.finish(mm2).unwrap();
     let choice2 = matmul_choice(&g2, Backend::SpirvVulkan);
     assert!(
@@ -2524,10 +2701,14 @@ fn decode_attn_scores_v_matmul_lowers_to_the_lds_gemv_kernel() {
     // Card 143 Lever 1b: decode `scores @ V` (M=1, Hq rows already GQA-repeat_kv-expanded on both
     // operands, cap=300 not a multiple of GEMV_WIDTH=128) takes the LDS-parallel attn-scores-v GEMV on
     // every backend that lowers WorkgroupLocalWrite/Barrier, like is_decode_gemv's M=1 gate.
-    let bld = Builder::new();
-    let probs = bld.constant("probs", TensorType::new(vec![1, 8, 1, 300], GDt::F32));
-    let v = bld.constant("v", TensorType::new(vec![1, 8, 300, 64], GDt::F32));
-    let mm = bld.matmul(probs, v);
+    let bld = Builder::for_tests();
+    let probs = bld
+        .constant("probs", TensorType::new(vec![1, 8, 1, 300], GDt::F32))
+        .unwrap();
+    let v = bld
+        .constant("v", TensorType::new(vec![1, 8, 300, 64], GDt::F32))
+        .unwrap();
+    let mm = bld.matmul(probs, v).unwrap();
     let g = bld.finish(mm).unwrap();
     for backend in [
         Backend::SpirvVulkan,
@@ -2547,11 +2728,15 @@ fn decode_attn_scores_v_matmul_lowers_to_the_lds_gemv_kernel() {
     // Q @ K^T has the same batched-M==1 shape (q[1,Hq,1,D] @ kt[1,Hq,D,cap] -> [1,Hq,1,cap]) but its
     // second operand is a Transpose eqn's direct output and must stay off this kernel (already well
     // parallelized: large output Hq*cap, short reduction D).
-    let bldq = Builder::new();
-    let q = bldq.constant("q", TensorType::new(vec![1, 8, 1, 64], GDt::F32));
-    let k = bldq.constant("k", TensorType::new(vec![1, 8, 300, 64], GDt::F32));
-    let kt = bldq.transpose(k, vec![0, 1, 3, 2]);
-    let scores = bldq.matmul(q, kt);
+    let bldq = Builder::for_tests();
+    let q = bldq
+        .constant("q", TensorType::new(vec![1, 8, 1, 64], GDt::F32))
+        .unwrap();
+    let k = bldq
+        .constant("k", TensorType::new(vec![1, 8, 300, 64], GDt::F32))
+        .unwrap();
+    let kt = bldq.transpose(k, vec![0, 1, 3, 2]).unwrap();
+    let scores = bldq.matmul(q, kt).unwrap();
     let gq = bldq.finish(scores).unwrap();
     let choice_q = matmul_choice(&gq, Backend::SpirvVulkan);
     assert!(
@@ -2563,10 +2748,14 @@ fn decode_attn_scores_v_matmul_lowers_to_the_lds_gemv_kernel() {
     );
 
     // M>1 (prefill) stays off this M=1-only path (is_batched_tiled_gemm handles it).
-    let bldp = Builder::new();
-    let probs_p = bldp.constant("probs", TensorType::new(vec![1, 8, 4, 300], GDt::F32));
-    let v_p = bldp.constant("v", TensorType::new(vec![1, 8, 300, 64], GDt::F32));
-    let mm_p = bldp.matmul(probs_p, v_p);
+    let bldp = Builder::for_tests();
+    let probs_p = bldp
+        .constant("probs", TensorType::new(vec![1, 8, 4, 300], GDt::F32))
+        .unwrap();
+    let v_p = bldp
+        .constant("v", TensorType::new(vec![1, 8, 300, 64], GDt::F32))
+        .unwrap();
+    let mm_p = bldp.matmul(probs_p, v_p).unwrap();
     let gp = bldp.finish(mm_p).unwrap();
     let choice_p = matmul_choice(&gp, Backend::SpirvVulkan);
     assert!(
@@ -2596,10 +2785,14 @@ fn gdn_decode_matmuls_route_as_expected_on_amdgcn() {
     const D: usize = 128;
 
     // kv = k[1,H,1,D] @ s_decayed[1,H,D,D] -> [1,H,1,D]
-    let bld_kv = Builder::new();
-    let k = bld_kv.constant("k", TensorType::new(vec![1, H, 1, D], GDt::F32));
-    let s_decayed = bld_kv.constant("s_decayed", TensorType::new(vec![1, H, D, D], GDt::F32));
-    let kv = bld_kv.matmul(k, s_decayed);
+    let bld_kv = Builder::for_tests();
+    let k = bld_kv
+        .constant("k", TensorType::new(vec![1, H, 1, D], GDt::F32))
+        .unwrap();
+    let s_decayed = bld_kv
+        .constant("s_decayed", TensorType::new(vec![1, H, D, D], GDt::F32))
+        .unwrap();
+    let kv = bld_kv.matmul(k, s_decayed).unwrap();
     let g_kv = bld_kv.finish(kv).unwrap();
     let choice_kv = matmul_choice(&g_kv, amd);
     assert!(
@@ -2616,10 +2809,14 @@ fn gdn_decode_matmuls_route_as_expected_on_amdgcn() {
     );
 
     // o = q_scaled[1,H,1,D] @ s_out[1,H,D,D] -> [1,H,1,D] (same shape/producer pattern as kv)
-    let bld_o = Builder::new();
-    let q_scaled = bld_o.constant("q_scaled", TensorType::new(vec![1, H, 1, D], GDt::F32));
-    let s_out = bld_o.constant("s_out", TensorType::new(vec![1, H, D, D], GDt::F32));
-    let o = bld_o.matmul(q_scaled, s_out);
+    let bld_o = Builder::for_tests();
+    let q_scaled = bld_o
+        .constant("q_scaled", TensorType::new(vec![1, H, 1, D], GDt::F32))
+        .unwrap();
+    let s_out = bld_o
+        .constant("s_out", TensorType::new(vec![1, H, D, D], GDt::F32))
+        .unwrap();
+    let o = bld_o.matmul(q_scaled, s_out).unwrap();
     let g_o = bld_o.finish(o).unwrap();
     let choice_o = matmul_choice(&g_o, amd);
     assert!(
@@ -2636,10 +2833,14 @@ fn gdn_decode_matmuls_route_as_expected_on_amdgcn() {
     );
 
     // outer = k_col[1,H,D,1] @ delta[1,H,1,D] -> [1,H,D,D]  (M=128: rank-1 state update)
-    let bld_outer = Builder::new();
-    let k_col = bld_outer.constant("k_col", TensorType::new(vec![1, H, D, 1], GDt::F32));
-    let delta = bld_outer.constant("delta", TensorType::new(vec![1, H, 1, D], GDt::F32));
-    let outer = bld_outer.matmul(k_col, delta);
+    let bld_outer = Builder::for_tests();
+    let k_col = bld_outer
+        .constant("k_col", TensorType::new(vec![1, H, D, 1], GDt::F32))
+        .unwrap();
+    let delta = bld_outer
+        .constant("delta", TensorType::new(vec![1, H, 1, D], GDt::F32))
+        .unwrap();
+    let outer = bld_outer.matmul(k_col, delta).unwrap();
     let g_outer = bld_outer.finish(outer).unwrap();
     let choice_outer = matmul_choice(&g_outer, amd);
     assert!(
@@ -2785,10 +2986,14 @@ fn mixed_dtype_matmul_rejected_when_no_tensor_core_arm_fires() {
 /// without a white-box override. This is the shape `plan_eqn`'s mixed-operand-dtype guard sees on a real
 /// decode graph.
 fn mixed_operand_matmul_graph(m: usize, k: usize, n: usize) -> Graph {
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::new(vec![1, m, k], GDt::F32));
-    let w = bld.constant("w", TensorType::new(vec![k, n], GDt::BF16));
-    let mm = bld.matmul(a, w);
+    let bld = Builder::for_tests();
+    let a = bld
+        .constant("a", TensorType::new(vec![1, m, k], GDt::F32))
+        .unwrap();
+    let w = bld
+        .constant("w", TensorType::new(vec![k, n], GDt::BF16))
+        .unwrap();
+    let mm = bld.matmul(a, w).unwrap();
     bld.finish(mm).unwrap()
 }
 
@@ -2994,9 +3199,9 @@ fn widen_preserves_cpu_oracle_numerics() {
 }
 
 fn cast_planned(in_dt: GDt, to: GDt, backend: Backend) -> Result<(Plan, KernelChoice), PlanError> {
-    let bld = Builder::new();
-    let x = bld.constant("x", TensorType::new(vec![8], in_dt));
-    let c = bld.cast(x, to);
+    let bld = Builder::for_tests();
+    let x = bld.constant("x", TensorType::new(vec![8], in_dt)).unwrap();
+    let c = bld.cast(x, to).unwrap();
     let g = bld.finish(c).unwrap();
     let eqn = g
         .eqns()
@@ -3055,12 +3260,14 @@ fn cast_arm_matches_dtype_pairs_exhaustively() {
         }
     }
     {
-        let bld = Builder::new();
-        let x = bld.slot(
-            poot_graph_ir::Slot::Activation,
-            TensorType::new(vec![8], GDt::BF16),
-        );
-        let widened = bld.cast(x, GDt::F32);
+        let bld = Builder::for_tests();
+        let x = bld
+            .slot(
+                poot_graph_ir::Slot::Activation,
+                TensorType::new(vec![8], GDt::BF16),
+            )
+            .unwrap();
+        let widened = bld.cast(x, GDt::F32).unwrap();
         let g = bld.finish(widened).unwrap();
         let eqn = g
             .eqns()
@@ -3103,9 +3310,11 @@ fn a_refusal_names_the_equation_op_dtypes_target_and_missing_capability_on_every
         Backend::Nvptx,
         Backend::AmdGcn(AmdArch::gfx1151()),
     ] {
-        let bld = Builder::new();
-        let x = bld.constant("x", TensorType::new(vec![8], GDt::BF16));
-        let c = bld.cast(x, GDt::F16);
+        let bld = Builder::for_tests();
+        let x = bld
+            .constant("x", TensorType::new(vec![8], GDt::BF16))
+            .unwrap();
+        let c = bld.cast(x, GDt::F16).unwrap();
         let g = bld.finish(c).unwrap();
         let eqn = &g.eqns()[0];
         let refusal = refusal_of(
@@ -3114,7 +3323,7 @@ fn a_refusal_names_the_equation_op_dtypes_target_and_missing_capability_on_every
                 eqn,
                 backend,
                 &default_caps_for(backend),
-                &poot_test_util::graph_fixtures::roomy_body_limits(),
+                &crate::test_support::roomy_body_limits(),
             ),
             "an unwired cast pair",
         );
@@ -3137,10 +3346,12 @@ fn a_refusal_names_the_equation_op_dtypes_target_and_missing_capability_on_every
 
 /// An I32->F32 cast of an exact-I32 source (a `GeU` output, as card 372c's guarded selector Cast reads).
 fn exact_i32_cast_planned(backend: Backend) -> Result<(Plan, KernelChoice), PlanError> {
-    let bld = Builder::new();
-    let x = bld.constant("x", TensorType::new(vec![8], GDt::I32));
-    let flag = bld.binary_scalar(GBinOp::GeU, x, Scalar::I32(0));
-    let c = bld.cast(flag, GDt::F32);
+    let bld = Builder::for_tests();
+    let x = bld
+        .constant("x", TensorType::new(vec![8], GDt::I32))
+        .unwrap();
+    let flag = bld.binary_scalar(GBinOp::GeU, x, Scalar::I32(0)).unwrap();
+    let c = bld.cast(flag, GDt::F32).unwrap();
     let g = bld.finish(c).unwrap();
     let eqn = g
         .eqns()
@@ -3211,7 +3422,7 @@ fn matmul_plan(g: &Graph, backend: Backend) -> Plan {
         eqn,
         backend,
         &default_caps_for(backend),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap()
 }
@@ -3257,10 +3468,14 @@ fn f32_matmul_request_is_the_f32_serial_kernel_after_f16_dtype_added() {
     // plans. A rank-3 weight on AmdGcn steers past every fast path (decode-GEMV and the generated tiled
     // GEMM need a rank-2 weight; the imported batched-tiled GEMM is SpirvVulkan/Nvptx-only for a plain
     // MatMul) to the naive serial fallback.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![2, 32, 32], GDt::F32));
-    let w = b.constant("w", TensorType::new(vec![2, 32, 16], GDt::F32));
-    let out = b.matmul(x, w);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![2, 32, 32], GDt::F32))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![2, 32, 16], GDt::F32))
+        .unwrap();
+    let out = b.matmul(x, w).unwrap();
     let g = b.finish(out).unwrap();
     let program = compiled(&g, Backend::AmdGcn(AmdArch::gfx1151()));
     let (_, choice) = compiled_matmul(&program);
@@ -3278,11 +3493,17 @@ fn f16_non_wired_op_rejected_with_diagnostic() {
     // its `x` operand (op.rs infer), so an F16 `x` gives an F16-typed IndexedMatMul eqn, and IndexedMatMul
     // is not in the BF16/F16 wired list (MatMul/ContractionEpilogue/Reshape/Transpose/Slice/Broadcast/Binary/
     // Unary/Gather/Concat/DynamicUpdateSlice/Reduce/Cast).
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![4, 8], GDt::F16));
-    let w = b.constant("w", TensorType::new(vec![2, 8, 16], GDt::F16));
-    let idx = b.constant("idx", TensorType::new(vec![4], GDt::I32));
-    let out = b.indexed_matmul(x, w, idx);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![4, 8], GDt::F16))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![2, 8, 16], GDt::F16))
+        .unwrap();
+    let idx = b
+        .constant("idx", TensorType::new(vec![4], GDt::I32))
+        .unwrap();
+    let out = b.indexed_matmul(x, w, idx).unwrap();
     let g = b.finish(out).unwrap();
     let eqn = g
         .eqns()
@@ -3299,7 +3520,7 @@ fn f16_non_wired_op_rejected_with_diagnostic() {
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     );
     assert!(
         res.is_err(),
@@ -3338,7 +3559,7 @@ fn only_an_f32_m_gt_1_matmul_takes_the_tiled_gemm() {
                 caps: default_caps_for(backend),
             },
             &HashMap::new(),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap_or_else(|e| panic!("{backend:?} {dtype:?} M={m}: {e:?}"));
         assert_eq!(
@@ -3370,7 +3591,7 @@ fn f16_matmul_never_reaches_tiled_region() {
             caps: default_caps_for(Backend::SpirvVulkan),
         },
         &HashMap::new(),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .expect("the F16 matmul plans");
     assert!(
@@ -3732,15 +3953,15 @@ fn a_large_tiled_matmul_keeps_its_tile_workgroup_on_amdgcn() {
 fn a_collective_inside_a_stage_graph_is_refused_by_compile() {
     let world = std::num::NonZeroU32::new(2).unwrap();
     type Collective<'a> = &'a dyn Fn(&Builder, poot_graph_ir::Traced) -> poot_graph_ir::Traced;
-    let all_reduce = |bld: &Builder, y| bld.all_reduce(y, RedOp::Sum, 1);
-    let all_gather = |bld: &Builder, y| bld.all_gather(y, 1, world);
+    let all_reduce = |bld: &Builder, y| bld.all_reduce(y, RedOp::Sum, 1).unwrap();
+    let all_gather = |bld: &Builder, y| bld.all_gather(y, 1, world).unwrap();
     let cases: [(&str, Collective); 2] = [("all_reduce", &all_reduce), ("all_gather", &all_gather)];
     for backend in [Backend::Nvptx, Backend::SpirvVulkan] {
         for (name, collective) in cases {
-            let bld = Builder::new();
-            let x = bld.constant("x", TensorType::f32(vec![2, 8]));
-            let w = bld.constant("w", TensorType::f32(vec![8, 4]));
-            let y = collective(&bld, bld.matmul(x, w));
+            let bld = Builder::for_tests();
+            let x = bld.constant("x", TensorType::f32(vec![2, 8])).unwrap();
+            let w = bld.constant("w", TensorType::f32(vec![8, 4])).unwrap();
+            let y = collective(&bld, bld.matmul(x, w).unwrap());
             let reduced = y.id();
             let g = bld.finish(y).unwrap();
             let target = Target::Gpu {
@@ -3777,10 +3998,10 @@ fn view_test_graph(
     a_shape: Vec<usize>,
     movement: impl FnOnce(&Builder, poot_graph_ir::Traced) -> poot_graph_ir::Traced,
 ) -> (Graph, ValueId, usize) {
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::f32(a_shape));
+    let bld = Builder::for_tests();
+    let a = bld.constant("a", TensorType::f32(a_shape)).unwrap();
     let t = movement(&bld, a);
-    let y = bld.binary(GBinOp::Add, t, t);
+    let y = bld.binary(GBinOp::Add, t, t).unwrap();
     let g = bld.finish(y).unwrap();
     let t_id = t.id();
     let move_eqn = g
@@ -3793,7 +4014,9 @@ fn view_test_graph(
 
 #[test]
 fn compute_views_never_promotes_validation_values() {
-    let (g, t_id, _) = view_test_graph(vec![3, 2, 4], |bld, a| bld.transpose(a, vec![2, 0, 1]));
+    let (g, t_id, _) = view_test_graph(vec![3, 2, 4], |bld, a| {
+        bld.transpose(a, vec![2, 0, 1]).unwrap()
+    });
     assert!(
         compute_views(&g, Backend::SpirvVulkan).contains_key(&t_id),
         "control: without a witness the transpose is a view"
@@ -3814,8 +4037,9 @@ fn compute_views_never_promotes_validation_values() {
 fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
     // AS-001/AS-003: a Transpose whose only consumer is a pointwise Binary emits Plan::View (no dispatch),
     // not the materialize copy.
-    let (g, t_id, move_eqn) =
-        view_test_graph(vec![3, 2, 4], |bld, a| bld.transpose(a, vec![2, 0, 1]));
+    let (g, t_id, move_eqn) = view_test_graph(vec![3, 2, 4], |bld, a| {
+        bld.transpose(a, vec![2, 0, 1]).unwrap()
+    });
     let views = compute_views(&g, Backend::SpirvVulkan);
     assert!(
         views.contains_key(&t_id),
@@ -3828,7 +4052,7 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
         Backend::SpirvVulkan,
         &views,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap()
     {
@@ -3842,7 +4066,7 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap()
     {
@@ -3855,11 +4079,11 @@ fn transpose_into_binary_add_lowers_to_view_zero_dispatch() {
 fn transpose_into_matmul_keeps_the_materialize_copy() {
     // AS-002: a Transpose feeding a MatMul (a contraction kernel, not strided-capable) keeps its one
     // materialize copy; MatMul is absent from `is_strided_capable`.
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::f32(vec![4, 3]));
-    let t = bld.transpose(a, vec![1, 0]); // [3,4]
-    let w = bld.constant("w", TensorType::f32(vec![4, 5]));
-    let mm = bld.matmul(t, w); // [3,5]
+    let bld = Builder::for_tests();
+    let a = bld.constant("a", TensorType::f32(vec![4, 3])).unwrap();
+    let t = bld.transpose(a, vec![1, 0]).unwrap(); // [3,4]
+    let w = bld.constant("w", TensorType::f32(vec![4, 5])).unwrap();
+    let mm = bld.matmul(t, w).unwrap(); // [3,5]
     let g = bld.finish(mm).unwrap();
     let t_id = t.id();
 
@@ -3875,7 +4099,7 @@ fn transpose_into_matmul_keeps_the_materialize_copy() {
         Backend::SpirvVulkan,
         &views,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap()
     {
@@ -3891,14 +4115,14 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
     // view must get a different cache key than one reading a plain contiguous buffer of the same shape,
     // else the pipeline/disk cache could dispatch the wrong shader. Build one graph with both cases (same
     // operand shapes, op, out_shape) and assert the keys and the generated Bodies differ.
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::f32(vec![3, 2])); // pre-transpose source
-    let t = bld.transpose(a, vec![1, 0]); // view candidate, shape [2,3]
-    let b = bld.constant("b", TensorType::f32(vec![2, 3])); // shared operand
-    let y_view = bld.binary(GBinOp::Add, t, b); // t (a view) + b
-    let c = bld.constant("c", TensorType::f32(vec![2, 3])); // a PLAIN buffer, same shape as t
-    let y_plain = bld.binary(GBinOp::Add, c, b); // c (plain) + b - same shapes as y_view's eqn
-    let out = bld.binary(GBinOp::Add, y_view, y_plain);
+    let bld = Builder::for_tests();
+    let a = bld.constant("a", TensorType::f32(vec![3, 2])).unwrap(); // pre-transpose source
+    let t = bld.transpose(a, vec![1, 0]).unwrap(); // view candidate, shape [2,3]
+    let b = bld.constant("b", TensorType::f32(vec![2, 3])).unwrap(); // shared operand
+    let y_view = bld.binary(GBinOp::Add, t, b).unwrap(); // t (a view) + b
+    let c = bld.constant("c", TensorType::f32(vec![2, 3])).unwrap(); // a PLAIN buffer, same shape as t
+    let y_plain = bld.binary(GBinOp::Add, c, b).unwrap(); // c (plain) + b - same shapes as y_view's eqn
+    let out = bld.binary(GBinOp::Add, y_view, y_plain).unwrap();
     let g = bld.finish(out).unwrap();
 
     let views = compute_views(&g, Backend::SpirvVulkan);
@@ -3920,7 +4144,7 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
             Backend::SpirvVulkan,
             &views,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap(),
     );
@@ -3935,7 +4159,7 @@ fn view_cache_key_never_collides_with_a_plain_buffer_of_the_same_shape() {
             Backend::SpirvVulkan,
             &views,
             &default_caps_for(Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap(),
     );
@@ -4010,8 +4234,9 @@ fn view_transpose_matches_oracle_fuzz() {
             let j = (xorshift(&mut seed) as usize) % (i + 1);
             perm.swap(i, j);
         }
-        let (g, t_id, move_eqn) =
-            view_test_graph(a_shape.clone(), |bld, a| bld.transpose(a, perm.clone()));
+        let (g, t_id, move_eqn) = view_test_graph(a_shape.clone(), |bld, a| {
+            bld.transpose(a, perm.clone()).unwrap()
+        });
         let views = compute_views(&g, Backend::SpirvVulkan);
         let layout = views
             .get(&t_id)
@@ -4047,8 +4272,9 @@ fn view_slice_matches_oracle_fuzz() {
         let len = a_shape[axis];
         let start = (xorshift(&mut seed) as usize) % len;
         let end = start + 1 + (xorshift(&mut seed) as usize) % (len - start);
-        let (g, t_id, move_eqn) =
-            view_test_graph(a_shape.clone(), |bld, a| bld.slice(a, axis, start, end));
+        let (g, t_id, move_eqn) = view_test_graph(a_shape.clone(), |bld, a| {
+            bld.slice(a, axis, start, end).unwrap()
+        });
         let views = compute_views(&g, Backend::SpirvVulkan);
         let layout = views
             .get(&t_id)
@@ -4104,7 +4330,7 @@ fn view_broadcast_matches_oracle_fuzz() {
         };
         let out_shape = vec![lead, o0, a_shape[1], o2];
         let (g, t_id, move_eqn) = view_test_graph(a_shape.clone(), |bld, a| {
-            bld.broadcast(a, out_shape.clone())
+            bld.broadcast(a, out_shape.clone()).unwrap()
         });
         let views = compute_views(&g, Backend::SpirvVulkan);
         let layout = views
@@ -4129,348 +4355,12 @@ fn view_broadcast_matches_oracle_fuzz() {
     }
 }
 
-/// Dispatches per token of the 24-layer Qwen2.5-0.5B real-config decode graph (the legacy tracer planned 415).
-/// POOT-725 made the `Cast(Slot::Pos -> F32)` of the position a kernel (368); POOT-1108 folds it into the
-/// mask region that reads it, so the launch is gone again.
-const QWEN2_0_5B_DISPATCHES: usize = 367;
-
-/// Dispatches per token of the 28-layer Qwen3-0.6B real-config decode graph (the legacy tracer planned 539).
-/// POOT-725: 484; POOT-1108: 483, the position cast folded as for Qwen2.5 above.
-const QWEN3_0_6B_DISPATCHES: usize = 483;
-
 /// Dispatches `program` runs per step: every planned equation but the free ones (an alias or a strided view).
 fn dispatches(program: &Program) -> usize {
     program
         .planned()
         .filter(|(_, plan)| !matches!(plan, Plan::Alias(_) | Plan::View { .. }))
         .count()
-}
-
-#[test]
-fn dispatch_count_planned_regression_on_real_qwen2_decode_configs() {
-    // Pins the dispatches per token of the real Qwen2.5-0.5B / Qwen3-0.6B decode graphs (`Model::trace`,
-    // one token) through `compile`, the production pipeline, on both planner families (SPIR-V and PTX).
-    // The pins are exact: a bound above the real count would still pass with a fusion pass deleted, so any
-    // change in either direction fails here and the pin is updated deliberately with the change that moved
-    // it. Weights-free: the count depends only on graph structure.
-    let cap = 64usize;
-    for (name, dense, pin) in [
-        ("qwen2_0_5b", qwen2_0_5b(), QWEN2_0_5B_DISPATCHES),
-        ("qwen3_0_6b", qwen3_0_6b(), QWEN3_0_6B_DISPATCHES),
-    ] {
-        let g = real_decode_graph(dense, cap);
-        for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
-            let program = compiled(&g, backend);
-            assert_eq!(
-                dispatches(&program),
-                pin,
-                "{name} {backend:?} dispatches per token moved off its pin"
-            );
-            // Every norm scale and bias is read narrow by the region that uses it: no cast of a weight runs.
-            let weight_casts = program
-                .graph()
-                .eqns()
-                .iter()
-                .filter(|eqn| {
-                    matches!(eqn.op, OpKind::Cast { .. })
-                        && matches!(
-                            eqn.inputs.as_slice(),
-                            [Operand::Value(src)] if program.graph().meta(*src).storage == Storage::Const
-                        )
-                })
-                .count();
-            assert_eq!(
-                weight_casts, 0,
-                "{name} {backend:?}: a weight cast still dispatches"
-            );
-        }
-    }
-}
-
-/// A copy of `g` with every named value renamed by `rename(value_index, old_name)`. Ids, shapes,
-/// storage and equations are untouched, so only the strings differ.
-fn rename_values(g: &Graph, rename: impl Fn(usize, &str) -> String) -> Graph {
-    derive(g, |draft| {
-        for (index, value) in draft.values_mut().iter_mut().enumerate() {
-            if let Some(name) = &value.name {
-                value.name = Some(rename(index, name));
-            }
-        }
-    })
-    .unwrap()
-}
-
-/// Everything the per-equation planner decides for `g` on `backend`, as comparable text: the strided
-/// views, then the plan (or typed refusal) of every equation. `Plan` carries kernel bodies and cache
-/// keys, so a different body, key, grid metadata or refusal shows up as a different string.
-fn planned_graph_summary(g: &Graph, backend: Backend) -> Vec<String> {
-    let views = compute_views(g, backend);
-    let mut view_ids: Vec<ValueId> = views.keys().copied().collect();
-    view_ids.sort();
-    let mut summary: Vec<String> = view_ids
-        .into_iter()
-        .map(|id| format!("view {id}: {:?}", views[&id]))
-        .collect();
-    for eqn in g.eqns() {
-        let plan = plan_eqn_views(
-            g,
-            eqn,
-            backend,
-            &views,
-            &default_caps_for(backend),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
-        );
-        summary.push(format!("{}: {plan:?}", eqn.out));
-    }
-    summary
-}
-
-/// SC-002 (card 520a): planning is a function of the graph's structure, never of a name. The same
-/// dense decode and prefill graphs (raw and through `optimize`) are planned on every planned backend
-/// under their tracer names and under names of other model families and role words; every equation
-/// must plan identically. Mutation observed red: the per-equation planner refuses (or plans
-/// differently) when an operand name contains "qwen".
-#[test]
-fn planning_a_graph_does_not_depend_on_its_value_names() {
-    use poot_executor_parity::dense::{Dense, Family};
-    use poot_models::model::{LogitRows, Phase};
-
-    let mut graphs = Vec::new();
-    for family in [Family::Qwen2, Family::Qwen3] {
-        let dense = Dense::new(family)
-            .vocab(32)
-            .dims(16, 32, 2)
-            .heads(4, 2)
-            .head_dim(4)
-            .max_positions(16);
-        let decode = dense_graph(dense.clone(), Phase::Decode, 1, 16, LogitRows::Last);
-        let prefill = dense_graph(dense, Phase::Prefill, 8, 16, LogitRows::Last);
-        graphs.push(optimize(&decode).unwrap());
-        graphs.push(decode);
-        graphs.push(optimize(&prefill).unwrap());
-        graphs.push(prefill);
-    }
-
-    type Naming = (&'static str, fn(usize, &str) -> String);
-    let namings: [Naming; 4] = [
-        ("qwen", |index, _| format!("qwen2.layers.{index}.weight")),
-        ("deepseek", |index, _| {
-            format!("deepseek.blocks.{index}.expert_{index}")
-        }),
-        ("role words", |index, _| {
-            format!("layer_idx.{index}.tensor_name.expert_role")
-        }),
-        ("opaque", |index, _| format!("v{index}")),
-    ];
-    let backends = [
-        Backend::SpirvVulkan,
-        Backend::AmdGcn(AmdArch::gfx1151()),
-        Backend::Nvptx,
-    ];
-
-    for (graph_index, graph) in graphs.iter().enumerate() {
-        assert!(
-            graph.values().iter().any(|value| value.name.is_some()),
-            "graph {graph_index} has no named value, so renaming would prove nothing"
-        );
-        for backend in backends {
-            let original = planned_graph_summary(graph, backend);
-            assert!(
-                original.iter().filter(|line| line.contains("Ok(")).count()
-                    > graph.eqns().len() / 2,
-                "graph {graph_index} on {backend:?} must mostly plan, or the comparison is vacuous"
-            );
-            for (family, rename) in namings {
-                let renamed = planned_graph_summary(&rename_values(graph, rename), backend);
-                assert_eq!(
-                    renamed.len(),
-                    original.len(),
-                    "graph {graph_index} on {backend:?} under {family} names: entry count"
-                );
-                // Bodies are large, so name the first differing equation and clip both sides.
-                if let Some((was, now)) = original.iter().zip(&renamed).find(|(a, b)| a != b) {
-                    let clip = |text: &str| text.chars().take(160).collect::<String>();
-                    panic!(
-                        "graph {graph_index} on {backend:?} planned differently under {family} \
-                         names:\n  tracer names: {}\n  {family} names: {}",
-                        clip(was),
-                        clip(now)
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn amdgcn_view_promotion_matches_spirv_on_real_qwen2_decode_configs() {
-    // Card 137: `compute_views`'s gate is `SpirvVulkan | AmdGcn(_)` (spec 132 phase 1). Pins that ROCm
-    // agrees exactly with wgpu on the real Qwen2.5-0.5B and Qwen3-0.6B decode graphs (same fixtures as
-    // `dispatch_count_planned_regression_on_real_qwen2_decode_configs` above): identical promoted
-    // value-id set and identical composed Layout (strides+offset) per promoted value. Also asserts the
-    // planned dispatch counts agree between backends and are strictly below the plan-independent
-    // `transform::dispatch_count`, so ROCm gets the same free-view win as wgpu.
-    //
-    // Uses the raw (pre-`transform::optimize`) traced graph: optimize's fusion passes absorb every
-    // Transpose/Slice/Broadcast before `compute_views` sees them (the fully optimized graph
-    // promotes 0 views on both configs), so only the raw graph, which keeps the movement ops as distinct
-    // eqns, exercises the promotion path.
-    use poot_graph_ir::analysis::dispatch_count;
-    let cap = 64usize;
-    let amd = Backend::AmdGcn(AmdArch::gfx1151());
-
-    for (name, cfg) in [("qwen2_0_5b", qwen2_0_5b()), ("qwen3_0_6b", qwen3_0_6b())] {
-        let g = real_decode_graph(cfg, cap);
-
-        let views_spirv = compute_views(&g, Backend::SpirvVulkan);
-        let views_amd = compute_views(&g, amd);
-
-        let mut spirv_ids: Vec<ValueId> = views_spirv.keys().copied().collect();
-        let mut amd_ids: Vec<ValueId> = views_amd.keys().copied().collect();
-        spirv_ids.sort();
-        amd_ids.sort();
-        assert_eq!(
-            spirv_ids, amd_ids,
-            "{name}: AmdGcn must promote the IDENTICAL value-id set as SpirvVulkan"
-        );
-        assert!(
-            !spirv_ids.is_empty(),
-            "{name}: this real decode graph is known to have promotable movement ops on the raw \
-             (pre-fusion) trace - an empty set would mean the test fixture stopped exercising the \
-             promotion path"
-        );
-        for id in &spirv_ids {
-            let l_spirv = &views_spirv[id];
-            let l_amd = &views_amd[id];
-            assert_eq!(
-                l_spirv.strides, l_amd.strides,
-                "{name}: value {id} strides diverge between SpirvVulkan and AmdGcn"
-            );
-            assert_eq!(
-                l_spirv.offset, l_amd.offset,
-                "{name}: value {id} offset diverges between SpirvVulkan and AmdGcn"
-            );
-        }
-
-        let n_spirv = dispatch_count_planned(&g, Backend::SpirvVulkan);
-        let n_amd = dispatch_count_planned(&g, amd);
-        assert_eq!(
-            n_amd, n_spirv,
-            "{name}: dispatch_count_planned must agree between AmdGcn and SpirvVulkan"
-        );
-        let n_unpromoted = dispatch_count(&g);
-        assert!(
-            n_amd < n_unpromoted,
-            "{name}: AmdGcn's planned dispatch count ({n_amd}) must be strictly below the \
-             unpromoted dispatch_count ({n_unpromoted}) - else the ROCm gate relaxation bought \
-             nothing on this graph"
-        );
-    }
-}
-
-/// Card 549 SC-003 (R-546-9): the same fixture plans the same number of views on Nvptx as on
-/// AmdGcn, now that `poot_codegen::capability(Nvptx).strided_views` is `true` - every
-/// `is_strided_capable` kernel body PTX dispatches is the same backend-neutral `poot-kernelgen`
-/// body wgpu/ROCm already read strided operands through, so there was never a codegen reason for
-/// PTX alone to pay the extra materialize copy. GPU-free (planning only). Mirrors
-/// `amdgcn_view_promotion_matches_spirv_on_real_qwen2_decode_configs` above, against Nvptx
-/// instead of SpirvVulkan.
-///
-/// Mutation: restore `strided_views: false` for `Target::Nvptx` in
-/// `poot-codegen/src/lib.rs::capability`; `compute_views(&g, Nvptx)` goes back to returning an
-/// empty map (its `if !codegen_capability(backend).strided_views { return views; }` early-out),
-/// so `nvptx_ids` is empty while `amd_ids` is not, and this row goes red.
-#[test]
-fn nvptx_view_promotion_matches_amdgcn_on_real_qwen2_decode_configs() {
-    let cap = 64usize;
-    let amd = Backend::AmdGcn(AmdArch::gfx1151());
-
-    for (name, cfg) in [("qwen2_0_5b", qwen2_0_5b()), ("qwen3_0_6b", qwen3_0_6b())] {
-        let g = real_decode_graph(cfg, cap);
-
-        let views_nvptx = compute_views(&g, Backend::Nvptx);
-        let views_amd = compute_views(&g, amd);
-
-        let mut nvptx_ids: Vec<ValueId> = views_nvptx.keys().copied().collect();
-        let mut amd_ids: Vec<ValueId> = views_amd.keys().copied().collect();
-        nvptx_ids.sort();
-        amd_ids.sort();
-        assert_eq!(
-            nvptx_ids, amd_ids,
-            "{name}: Nvptx must promote the IDENTICAL value-id set as AmdGcn"
-        );
-        assert!(
-            !nvptx_ids.is_empty(),
-            "{name}: this real decode graph is known to have promotable movement ops on the raw \
-             (pre-fusion) trace - an empty set would mean Nvptx fell back to the pre-549 \
-             materialize-everything behavior"
-        );
-        for id in &nvptx_ids {
-            let l_nvptx = &views_nvptx[id];
-            let l_amd = &views_amd[id];
-            assert_eq!(
-                l_nvptx.strides, l_amd.strides,
-                "{name}: value {id} strides diverge between Nvptx and AmdGcn"
-            );
-            assert_eq!(
-                l_nvptx.offset, l_amd.offset,
-                "{name}: value {id} offset diverges between Nvptx and AmdGcn"
-            );
-        }
-
-        let n_nvptx = dispatch_count_planned(&g, Backend::Nvptx);
-        let n_amd = dispatch_count_planned(&g, amd);
-        assert_eq!(
-            n_nvptx, n_amd,
-            "{name}: dispatch_count_planned must agree between Nvptx and AmdGcn"
-        );
-    }
-}
-
-/// Card 549 SC-004 (F1): the strided-view fixture plans the same copy
-/// (dispatch) count on Nvptx as on AmdGcn - a GPU-free plan-level restatement of SC-004's acceptance
-/// text ("the strided-view fixture runs on PTX without the extra copy ... the counter reads one more
-/// copy per view") as a planning-time assertion instead of a pod-measured native copy count: every
-/// view the planner promotes (`Plan::View`, no dispatch) is one fewer
-/// materialize-copy dispatch than an unpromoted plan would need, so an equal promoted-dispatch count
-/// between backends is exactly "PTX pays no extra copy for the views it shares with ROCm". Separate
-/// from `nvptx_view_promotion_matches_amdgcn_on_real_qwen2_decode_configs` above (which checks the
-/// promoted value-id SET and each one's Layout): this row isolates the one property SC-004 itself
-/// names, with its own mutation record.
-///
-/// Mutation: restore `strided_views: false` for `Target::Nvptx` in
-/// `poot-codegen/src/lib.rs::capability`. `compute_views(&g, Nvptx)` goes back to its early-out empty
-/// map while `compute_views(&g, amd)` still promotes every view, so every one of those views costs
-/// Nvptx one extra materialize-copy dispatch it does not pay today:
-/// `dispatch_count_planned(&g, Nvptx)` reads higher than `dispatch_count_planned(&g, amd)` by exactly
-/// the view count, and this row goes red. Reverted: GREEN.
-#[test]
-fn sc004_nvptx_strided_view_fixture_pays_no_extra_copy_vs_amdgcn() {
-    let cap = 64usize;
-    let amd = Backend::AmdGcn(AmdArch::gfx1151());
-
-    for (name, cfg) in [("qwen2_0_5b", qwen2_0_5b()), ("qwen3_0_6b", qwen3_0_6b())] {
-        let g = real_decode_graph(cfg, cap);
-
-        let views_nvptx = compute_views(&g, Backend::Nvptx);
-        assert!(
-            !views_nvptx.is_empty(),
-            "{name}: this fixture is known to have promotable views on Nvptx - an empty set means \
-             the mutation (or a real regression) already dropped Nvptx's promotion, which is exactly \
-             the failure this row exists to catch"
-        );
-
-        let n_nvptx = dispatch_count_planned(&g, Backend::Nvptx);
-        let n_amd = dispatch_count_planned(&g, amd);
-        assert_eq!(
-            n_nvptx,
-            n_amd,
-            "{name}: Nvptx's planned copy (dispatch) count must equal AmdGcn's - a gap here is \
-             exactly {} extra materialize-copy dispatch(es) PTX would pay per decode that ROCm does \
-             not",
-            views_nvptx.len()
-        );
-    }
 }
 
 // --- spec 132 phase 2 (view-chain composition) ---
@@ -4481,11 +4371,11 @@ fn transpose_then_slice_into_binary_add_composes_both_into_views() {
     // most the Slice; the Transpose stayed a materialize copy because its consumer, the Slice, is not
     // `is_strided_capable`. Phase 2 must promote both: the Slice is a view of a view, and the chain
     // composes into one Layout per link, both relative to the original contiguous buffer.
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::f32(vec![3, 2, 4]));
-    let t = bld.transpose(a, vec![2, 0, 1]); // [3,2,4] -> [4,3,2]
-    let s = bld.slice(t, 1, 1, 3); // axis 1 (len 3) [1,3) -> [4,2,2]
-    let y = bld.binary(GBinOp::Add, s, s);
+    let bld = Builder::for_tests();
+    let a = bld.constant("a", TensorType::f32(vec![3, 2, 4])).unwrap();
+    let t = bld.transpose(a, vec![2, 0, 1]).unwrap(); // [3,2,4] -> [4,3,2]
+    let s = bld.slice(t, 1, 1, 3).unwrap(); // axis 1 (len 3) [1,3) -> [4,2,2]
+    let y = bld.binary(GBinOp::Add, s, s).unwrap();
     let g = bld.finish(y).unwrap();
     let (t_id, s_id) = (t.id(), s.id());
 
@@ -4531,11 +4421,11 @@ fn dispatch_count_planned_chain_drops_further_than_phase_1_one_hop() {
     // total 1.
     const PHASE_1_ONE_HOP_DISPATCHES: usize = 2;
 
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::f32(vec![3, 2, 4]));
-    let t = bld.transpose(a, vec![2, 0, 1]);
-    let s = bld.slice(t, 1, 1, 3);
-    let y = bld.binary(GBinOp::Add, s, s);
+    let bld = Builder::for_tests();
+    let a = bld.constant("a", TensorType::f32(vec![3, 2, 4])).unwrap();
+    let t = bld.transpose(a, vec![2, 0, 1]).unwrap();
+    let s = bld.slice(t, 1, 1, 3).unwrap();
+    let y = bld.binary(GBinOp::Add, s, s).unwrap();
     let g = bld.finish(y).unwrap();
 
     let n = dispatch_count_planned(&g, Backend::SpirvVulkan);
@@ -4559,11 +4449,11 @@ fn view_chain_matches_oracle_fuzz() {
     // up to that link (bit exact).
     let mut seed = 0x1357_9bdf_2468_ace0u64;
     for _ in 0..300 {
-        let bld = Builder::new();
+        let bld = Builder::for_tests();
         let mut shape: Vec<usize> = (0..3)
             .map(|_| 2 + (xorshift(&mut seed) % 3) as usize)
             .collect();
-        let a = bld.constant("a", TensorType::f32(shape.clone()));
+        let a = bld.constant("a", TensorType::f32(shape.clone())).unwrap();
         let mut cur = a;
         let mut link_ids: Vec<ValueId> = Vec::new();
         let chain_len = 2 + (xorshift(&mut seed) as usize) % 2; // 2 or 3 ops
@@ -4577,7 +4467,7 @@ fn view_chain_matches_oracle_fuzz() {
                         let j = (xorshift(&mut seed) as usize) % (i + 1);
                         perm.swap(i, j);
                     }
-                    cur = bld.transpose(cur, perm.clone());
+                    cur = bld.transpose(cur, perm.clone()).unwrap();
                     shape = perm.iter().map(|&p| shape[p]).collect();
                 }
                 1 => {
@@ -4587,7 +4477,7 @@ fn view_chain_matches_oracle_fuzz() {
                     let len = shape[axis];
                     let start = (xorshift(&mut seed) as usize) % len;
                     let end = start + 1 + (xorshift(&mut seed) as usize) % (len - start);
-                    cur = bld.slice(cur, axis, start, end);
+                    cur = bld.slice(cur, axis, start, end).unwrap();
                     shape[axis] = end - start;
                 }
                 _ => {
@@ -4595,13 +4485,13 @@ fn view_chain_matches_oracle_fuzz() {
                     let lead = 2 + (xorshift(&mut seed) % 3) as usize;
                     let mut new_shape = vec![lead];
                     new_shape.extend_from_slice(&shape);
-                    cur = bld.broadcast(cur, new_shape.clone());
+                    cur = bld.broadcast(cur, new_shape.clone()).unwrap();
                     shape = new_shape;
                 }
             }
             link_ids.push(cur.id());
         }
-        let y = bld.binary(GBinOp::Add, cur, cur);
+        let y = bld.binary(GBinOp::Add, cur, cur).unwrap();
         let g = bld.finish(y).unwrap();
 
         let views = compute_views(&g, Backend::SpirvVulkan);
@@ -4653,11 +4543,15 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
     let l = 49; // a real prompt length (card 159's repro)
     let out_numel = pool_slots * hkv * d;
 
-    let b = Builder::new();
-    let base = b.constant("base", TensorType::f32(vec![pool_slots, hkv, d]));
-    let src = b.constant("src", TensorType::f32(vec![l, hkv, d]));
-    let inv = b.constant("inv", TensorType::new(vec![pool_slots], GDt::I32));
-    let out = b.scatter_update(base, src, inv);
+    let b = Builder::for_tests();
+    let base = b
+        .constant("base", TensorType::f32(vec![pool_slots, hkv, d]))
+        .unwrap();
+    let src = b.constant("src", TensorType::f32(vec![l, hkv, d])).unwrap();
+    let inv = b
+        .constant("inv", TensorType::new(vec![pool_slots], GDt::I32))
+        .unwrap();
+    let out = b.scatter_update(base, src, inv).unwrap();
     let g = b.finish(out).unwrap();
     let eqn = g
         .eqns()
@@ -4672,7 +4566,7 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let chunks = plan.dispatches();
@@ -4692,11 +4586,19 @@ fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
     // A small pool (well under the chunk budget) stays the single dispatch. card 525: plan_eqn
     // can no longer be handed a shape that disagrees with the graph, so this needs its own small
     // ScatterUpdate graph rather than replaying the large one under a fake `[4, 3]` shape.
-    let small_b = Builder::new();
-    let small_base = small_b.constant("base", TensorType::f32(vec![4, 3]));
-    let small_src = small_b.constant("src", TensorType::f32(vec![2, 3]));
-    let small_inv = small_b.constant("inv", TensorType::new(vec![4], GDt::I32));
-    let small_out = small_b.scatter_update(small_base, small_src, small_inv);
+    let small_b = Builder::for_tests();
+    let small_base = small_b
+        .constant("base", TensorType::f32(vec![4, 3]))
+        .unwrap();
+    let small_src = small_b
+        .constant("src", TensorType::f32(vec![2, 3]))
+        .unwrap();
+    let small_inv = small_b
+        .constant("inv", TensorType::new(vec![4], GDt::I32))
+        .unwrap();
+    let small_out = small_b
+        .scatter_update(small_base, small_src, small_inv)
+        .unwrap();
     let small_g = small_b.finish(small_out).unwrap();
     let small_eqn = small_g
         .eqns()
@@ -4759,7 +4661,7 @@ fn decode_gemv_chunks_on_wgpu_at_bloom_lm_head_shape() {
         eqn,
         Backend::SpirvVulkan,
         &default_caps_for(Backend::SpirvVulkan),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let chunks = plan.dispatches();
@@ -4873,7 +4775,7 @@ fn decode_gemv_chunking_follows_the_caps_watchdog_trigger_not_a_fixed_constant()
         eqn,
         Backend::SpirvVulkan,
         &low,
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     assert!(
@@ -4966,14 +4868,16 @@ impl AttentionFixture {
     fn graph(self) -> Graph {
         let hkv = self.hq / self.n_rep;
         let mask_heads = if self.per_head_mask { self.hq } else { 1 };
-        let bld = Builder::new();
-        let operand =
-            |name: &str, shape: Vec<usize>| bld.constant(name, TensorType::new(shape, GDt::F32));
+        let bld = Builder::for_tests();
+        let operand = |name: &str, shape: Vec<usize>| {
+            bld.constant(name, TensorType::new(shape, GDt::F32))
+                .unwrap()
+        };
         let q = operand("q", vec![self.batch, self.hq, self.lq, self.d]);
         let k = operand("k", vec![self.batch, hkv, self.lk, self.d]);
         let v = operand("v", vec![self.batch, hkv, self.lk, self.d]);
         let mask = operand("mask", vec![self.batch, mask_heads, self.lq, self.lk]);
-        let mut plan = bld.append_plan(0);
+        let mut plan = bld.append_plan(0).unwrap();
         let out = plan
             .equation(
                 OpKind::Attention(AttentionAttrs::new(
@@ -5340,10 +5244,12 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches_and_finalizati
 #[test]
 fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
     use poot_graph_ir::Eqn;
-    use poot_graph_ir::op::UnOp as GUnOp;
-    let bld = Builder::new();
+    use poot_graph_ir::op::{BinOp as GBinOp, UnOp as GUnOp};
+    let bld = Builder::for_tests();
     let over_ceiling = 65_535 * 256 + 256; // one workgroup past the ceiling
-    let x = bld.constant("x", TensorType::new(vec![over_ceiling], GDt::BF16));
+    let x = bld
+        .constant("x", TensorType::new(vec![over_ceiling], GDt::BF16))
+        .unwrap();
     let g = bld.finish(x).unwrap();
     let out_shape = vec![over_ceiling];
 
@@ -5546,11 +5452,17 @@ fn card298_spirv_widens_bf16_pairs_with_casts_not_retypes() {
 /// The Qwen3.8-27B LM head shape after `fold_dense_contractions`: a BF16 `[n, k]` checkpoint const
 /// contracted directly, with no transpose or widening cast.
 fn dense_contraction_graph(m: usize, k: usize, n: usize) -> Graph {
-    let bld = Builder::new();
-    let a = bld.constant("a", TensorType::new(vec![1, m, k], GDt::F32));
-    let w = bld.constant("w", TensorType::new(vec![n, k], GDt::BF16));
-    let mm = bld.matmul(a, bld.transpose(w, vec![1, 0]));
-    crate::fold_dense_contractions(&bld.finish(mm).unwrap()).unwrap()
+    let bld = Builder::for_tests();
+    let a = bld
+        .constant("a", TensorType::new(vec![1, m, k], GDt::F32))
+        .unwrap();
+    let w = bld
+        .constant("w", TensorType::new(vec![n, k], GDt::BF16))
+        .unwrap();
+    let mm = bld
+        .matmul(a, bld.transpose(w, vec![1, 0]).unwrap())
+        .unwrap();
+    crate::dtype_widen::fold_dense_contractions(&bld.finish(mm).unwrap()).unwrap()
 }
 
 fn try_dense_contraction_plan_planned(
@@ -5599,7 +5511,7 @@ fn card450_dense_contraction_plans_on_nvptx_with_the_wgpu_key() {
 
 /// Card 727: at M == 1 every backend plans the same generated dense Gemv request over the packed-BF16
 /// `[N, K]` weight: one selection and one identical request on every backend. Host-side plan
-/// evidence only; the device rows are the dense-Gemv parity rows in `poot-gpu` and `poot-rocm-gpu`.
+/// evidence only; the device rows are the dense-Gemv parity rows in `poot-wgpu-device` and `poot-rocm-device`.
 #[test]
 fn an_m1_dense_bf16_contraction_plans_the_generated_gemv_on_every_backend() {
     let g = dense_contraction_graph(1, 32, 16);
@@ -5772,14 +5684,20 @@ fn card380_bf16_const_stays_narrow_only_for_a_contraction_weight() {
 /// widened in one equation, with no cast or F32 table copy. One builder for both source dtypes, so the
 /// two plans differ only in the dtype the planner sees.
 fn dense_row_gather_graph(v: usize, r: usize, rows: usize, source: GDt) -> Graph {
-    let bld = Builder::new();
-    let table = bld.constant("embed", TensorType::new(vec![v, r], source));
-    let token = bld.slot(
-        poot_graph_ir::Slot::Token,
-        TensorType::new(vec![rows], GDt::I32),
-    );
-    let widened = bld.cast(bld.gather(table, 0, token), GDt::F32);
-    crate::fold_dense_bf16_row_gathers(&bld.finish(widened).unwrap()).unwrap()
+    let bld = Builder::for_tests();
+    let table = bld
+        .constant("embed", TensorType::new(vec![v, r], source))
+        .unwrap();
+    let token = bld
+        .slot(
+            poot_graph_ir::Slot::Token,
+            TensorType::new(vec![rows], GDt::I32),
+        )
+        .unwrap();
+    let widened = bld
+        .cast(bld.gather(table, 0, token).unwrap(), GDt::F32)
+        .unwrap();
+    crate::dtype_widen::fold_dense_bf16_row_gathers(&bld.finish(widened).unwrap()).unwrap()
 }
 
 fn try_dense_row_gather_plan_planned(
@@ -5896,13 +5814,19 @@ fn card381_bf16_const_stays_narrow_for_a_row_gather_table() {
     // The un-folded traced shape (a plain `Gather` of the BF16 table): the table is not a packed-lane
     // reader's operand, and it is never retyped to F32 (Card 1011). The storage plan refuses the gather's
     // BF16-element body against the packed lane (`bf16_const_reads_refuse_a_reader_without_the_lane`).
-    let bld = Builder::new();
-    let unfolded_table = bld.constant("embed", TensorType::new(vec![8, 4], GDt::BF16));
-    let token = bld.slot(
-        poot_graph_ir::Slot::Token,
-        TensorType::new(vec![3], GDt::I32),
-    );
-    let unfolded_widened = bld.cast(bld.gather(unfolded_table, 0, token), GDt::F32);
+    let bld = Builder::for_tests();
+    let unfolded_table = bld
+        .constant("embed", TensorType::new(vec![8, 4], GDt::BF16))
+        .unwrap();
+    let token = bld
+        .slot(
+            poot_graph_ir::Slot::Token,
+            TensorType::new(vec![3], GDt::I32),
+        )
+        .unwrap();
+    let unfolded_widened = bld
+        .cast(bld.gather(unfolded_table, 0, token).unwrap(), GDt::F32)
+        .unwrap();
     let unfolded = bld.finish(unfolded_widened).unwrap();
     let id = const_id(&unfolded, "embed");
     assert!(!bf16_const_feeds_only_packed_readers(
@@ -5946,13 +5870,15 @@ fn card381_row_gather_plan_key_names_the_source_dtype() {
 
     // The f32 table gather of the same shapes uses a different kernel and must not collide.
     let f32_gather = {
-        let bld = Builder::new();
-        let table = bld.constant("embed", TensorType::f32(vec![8, 4]));
-        let token = bld.slot(
-            poot_graph_ir::Slot::Token,
-            TensorType::new(vec![3], GDt::I32),
-        );
-        let gathered = bld.gather(table, 0, token);
+        let bld = Builder::for_tests();
+        let table = bld.constant("embed", TensorType::f32(vec![8, 4])).unwrap();
+        let token = bld
+            .slot(
+                poot_graph_ir::Slot::Token,
+                TensorType::new(vec![3], GDt::I32),
+            )
+            .unwrap();
+        let gathered = bld.gather(table, 0, token).unwrap();
         bld.finish(gathered).unwrap()
     };
     let eqn = f32_gather
@@ -6007,10 +5933,14 @@ fn card380_dense_contraction_plan_key_names_the_operand_dtype() {
 
     // An ordinary f32 matmul of the same shapes must not produce the same key.
     let f32_matmul = {
-        let bld = Builder::new();
-        let a = bld.constant("a", TensorType::new(vec![1, 1, 32], GDt::F32));
-        let w = bld.constant("w", TensorType::new(vec![32, 16], GDt::F32));
-        let mm = bld.matmul(a, w);
+        let bld = Builder::for_tests();
+        let a = bld
+            .constant("a", TensorType::new(vec![1, 1, 32], GDt::F32))
+            .unwrap();
+        let w = bld
+            .constant("w", TensorType::new(vec![32, 16], GDt::F32))
+            .unwrap();
+        let mm = bld.matmul(a, w).unwrap();
         bld.finish(mm).unwrap()
     };
     let f32_key = one_dispatch(try_matmul_plan(&f32_matmul, Backend::SpirvVulkan).unwrap())
@@ -6154,10 +6084,14 @@ fn card380_wgpu_tensor_execution_rejects_every_bf16_value() {
 
     // The other way a BF16 value reaches a prepared wgpu graph: a plain gather of a BF16 table, which would
     // otherwise fail in SPIR-V codegen with an opaque message.
-    let bld = Builder::new();
-    let table = bld.constant("table", TensorType::new(vec![4, 3], GDt::BF16));
-    let index = bld.constant("index", TensorType::new(vec![2], GDt::I32));
-    let gathered = bld.gather(table, 0, index);
+    let bld = Builder::for_tests();
+    let table = bld
+        .constant("table", TensorType::new(vec![4, 3], GDt::BF16))
+        .unwrap();
+    let index = bld
+        .constant("index", TensorType::new(vec![2], GDt::I32))
+        .unwrap();
+    let gathered = bld.gather(table, 0, index).unwrap();
     let widened =
         widen_mismatched_matmul_dtypes(&bld.finish(gathered).unwrap(), Backend::SpirvVulkan)
             .unwrap();
@@ -6234,10 +6168,14 @@ fn the_dense_gemv_arm_is_finalized() {
 /// Decode attention `scores @ V` at `hq` heads, cache length `cap` and head dim `d`: `[1, hq, 1, cap] @ [1, hq,
 /// cap, d]`, the shape `is_decode_attn_gemv_in` routes to the generated LDS-reduction GEMV.
 fn attn_scores_v_graph(hq: usize, cap: usize, d: usize) -> Graph {
-    let bld = Builder::new();
-    let scores = bld.constant("scores", TensorType::f32(vec![1, hq, 1, cap]));
-    let v = bld.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-    let out = bld.matmul(scores, v);
+    let bld = Builder::for_tests();
+    let scores = bld
+        .constant("scores", TensorType::f32(vec![1, hq, 1, cap]))
+        .unwrap();
+    let v = bld
+        .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let out = bld.matmul(scores, v).unwrap();
     bld.finish(out).unwrap()
 }
 
@@ -6246,7 +6184,7 @@ fn attn_scores_v_graph(hq: usize, cap: usize, d: usize) -> Graph {
 /// attention GEMV (`GEMV_WIDTH` lanes) on a device whose X grid holds a single workgroup, so the generic bump
 /// (raise a one-thread-per-output body to 256 lanes when `out_numel / width` passes the X cap) would fire; the
 /// plan keeps `GEMV_WIDTH` and an LDS array of exactly that many lanes. The device half (the result equals the
-/// oracle) is `a_contraction_keeps_its_lds_width_through_the_planner_*` in `poot-gpu` and `poot-rocm-gpu`.
+/// oracle) is `a_contraction_keeps_its_lds_width_through_the_planner_*` in `poot-wgpu-device` and `poot-rocm-device`.
 ///
 /// Mutation: in `kernel_mapping::shape_launch` drop the request-type exemption (`contraction = false`); the
 /// workgroup becomes 256 and this row goes red.
@@ -6289,14 +6227,20 @@ fn bf16_projection_contraction_choice(
     k: usize,
     n: usize,
 ) -> Result<KernelChoice, CompileError> {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![1, 1, k], GDt::F32));
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![1, 1, k], GDt::F32))
+        .unwrap();
     let out = if transposed {
-        let w = b.constant("w", TensorType::new(vec![n, k], GDt::BF16));
-        b.matmul(x, b.transpose(w, vec![1, 0]))
+        let w = b
+            .constant("w", TensorType::new(vec![n, k], GDt::BF16))
+            .unwrap();
+        b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap()
     } else {
-        let w = b.constant("w", TensorType::new(vec![k, n], GDt::BF16));
-        b.matmul(x, w)
+        let w = b
+            .constant("w", TensorType::new(vec![k, n], GDt::BF16))
+            .unwrap();
+        b.matmul(x, w).unwrap()
     };
     let graph = b.finish(out).unwrap();
     let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
@@ -6371,20 +6315,26 @@ fn a_k_by_n_bf16_decode_projection_is_refused_on_the_packed_lane_backends() {
 /// region and the cast), or 3 where the chain does not fuse.
 #[test]
 fn an_i32_chain_cast_and_float_scale_compile_to_one_launch_on_every_backend() {
-    let b = Builder::new();
-    let a = b.slot_named(
-        poot_graph_ir::Slot::Token,
-        "a",
-        TensorType::new(vec![2, 4], GDt::I32),
-    );
-    let c = b.slot_named(
-        poot_graph_ir::Slot::Token,
-        "c",
-        TensorType::new(vec![2, 4], GDt::I32),
-    );
-    let w = b.constant("w", TensorType::f32(vec![2, 4]));
-    let hit = b.binary(GBinOp::Ge, a, c);
-    let out = b.binary(GBinOp::Mul, b.cast(hit, GDt::F32), w);
+    let b = Builder::for_tests();
+    let a = b
+        .slot_named(
+            poot_graph_ir::Slot::Token,
+            "a",
+            TensorType::new(vec![2, 4], GDt::I32),
+        )
+        .unwrap();
+    let c = b
+        .slot_named(
+            poot_graph_ir::Slot::Token,
+            "c",
+            TensorType::new(vec![2, 4], GDt::I32),
+        )
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![2, 4])).unwrap();
+    let hit = b.binary(GBinOp::Ge, a, c).unwrap();
+    let out = b
+        .binary(GBinOp::Mul, b.cast(hit, GDt::F32).unwrap(), w)
+        .unwrap();
     let g = b.finish(out).unwrap();
     for backend in [
         Backend::SpirvVulkan,
@@ -6444,10 +6394,14 @@ fn rebound(plan: Plan, rebind: impl Fn(&Binding) -> Binding) -> Plan {
 fn a_binding_naming_an_operand_the_equation_lacks_is_refused_by_finalize() {
     use crate::kernel_mapping::finalize;
 
-    let b = Builder::new();
-    let table = b.constant("table", TensorType::new(vec![8, 3], GDt::F32));
-    let index = b.constant("index", TensorType::new(vec![2], GDt::I32));
-    let gathered = b.gather(table, 0, index);
+    let b = Builder::for_tests();
+    let table = b
+        .constant("table", TensorType::new(vec![8, 3], GDt::F32))
+        .unwrap();
+    let index = b
+        .constant("index", TensorType::new(vec![2], GDt::I32))
+        .unwrap();
+    let gathered = b.gather(table, 0, index).unwrap();
     let g = b.finish(gathered).unwrap();
     let backend = Backend::SpirvVulkan;
     let caps = default_caps_for(backend);

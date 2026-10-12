@@ -10,20 +10,20 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use poot_executor::{
-    BufferRole, Device, DeviceError, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
+    Device, DeviceError, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
     ExecutorStats, HostSync, LoadError, StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, StateRole, TensorType};
+use poot_graph_ir::{BinOp, Graph, Slot, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet,
+    CompileLimits, CompileOptions, Target, production_plan::Submission, staged::StagedProgram,
+    staged::TargetSet,
 };
-use poot_llm::driver::error::{DriverError, PreparedSetRefusal};
+use poot_llm::driver::error::{DriverError, PreparedSetRefusal, Unsupported};
 use poot_llm::driver::{
     Driver, DriverOptions, GenerateRequest, Head, Layout, ModelHandle, PoolShape,
     PreparedSetLimits, Retention, ServingShapes, SharedOwner, Warm,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::chat::ChatFormat;
 use poot_models::components::standard::Step;
 use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
@@ -31,8 +31,10 @@ use poot_models::model::{
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
+use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
+use poot_text::ChatFormat;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -69,7 +71,12 @@ impl Model for Tiny {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: TINY,
@@ -85,8 +92,7 @@ impl Model for Tiny {
             return refuse(ShapeReason::Granule { granule });
         }
         self.log.lock().unwrap().push((phase, shape));
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
             0
@@ -102,23 +108,23 @@ impl Model for Tiny {
                 1,
                 first,
                 n,
-            ),
+            )?,
             DType::F32,
-        );
-        let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
-        let seed = b.binary(BinOp::Add, token, pos);
+        )?;
+        let pos = b.cast(b.slice(step.pos(), 1, first, n)?, DType::F32)?;
+        let seed = b.binary(BinOp::Add, token, pos)?;
         if self.recurrent {
             let dims = vec![rows, 4];
             let state = b.state_input(
                 "toy.state",
                 TensorType::f32(dims.clone()),
                 StateRole::Recurrent,
-            );
-            let folded = b.binary(BinOp::Add, state, b.broadcast(seed, dims));
+            )?;
+            let folded = b.binary(BinOp::Add, state, b.broadcast(seed, dims)?)?;
             step.carry(state, folded);
         }
-        let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits).unwrap())
+        let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1])?, vec![rows, out, VOCAB])?;
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -451,7 +457,7 @@ fn rig(options: RigOptions) -> Rig {
             decode: compile,
             capacity: nz(32),
             prefill_chunk: nz(options.chunk),
-            max_trace_tokens: nz(options.max_trace_tokens),
+            trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(options.max_trace_tokens)),
             prepared: PreparedSetLimits {
                 max_entries: nz(options.max_entries),
                 max_retained_bytes: NonZeroU64::new(options.max_retained_bytes).unwrap(),
@@ -808,11 +814,11 @@ fn a_new_schema_compiles_once_and_a_warmed_set_never_compiles_again() {
     );
 }
 
-/// SC-005 (trace extent): a step above `max_trace_tokens` is refused with a typed error before the
+/// SC-005 (trace extent): a step above `max_tokens` is refused with the typed budget cause before the
 /// family traces it, and one at the limit is admitted. The family is registered outside the crate, so
 /// the bound is not a built-in's (a recurrent family serves no verify windows, so the window route
-/// that reaches an over-limit step is a plain one). Mutation: drop the extent
-/// check in `Driver::prepared`; the family is traced for 5 tokens and the trace-log assertion fails.
+/// that reaches an over-limit step is a plain one). Mutation: drop the token admission in
+/// `Model::trace`; the family is traced for 6 tokens and the trace-log assertion fails.
 #[test]
 fn a_step_above_the_trace_limit_is_refused_before_the_family_traces_it() {
     let mut rig = rig(RigOptions {
@@ -855,15 +861,12 @@ fn a_step_above_the_trace_limit_is_refused_before_the_family_traces_it() {
             adapters: &[],
         })
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            DriverError::PreparedSet(PreparedSetRefusal::TraceTokens {
-                tokens: 6,
-                limit: 4
-            })
-        ),
-        "{err:?}"
+    let DriverError::Unsupported(Unsupported::Trace(TraceError::Budget(refused))) = &err else {
+        panic!("a step above the trace limit is the typed budget refusal: {err:?}");
+    };
+    assert_eq!(
+        (refused.resource, refused.limit, refused.requested),
+        (poot_graph_ir::BudgetResource::Tokens, 4, 6)
     );
     assert_eq!(
         rig.log.lock().unwrap().len(),
@@ -913,4 +916,229 @@ fn a_prompt_over_the_trace_limit_runs_as_legal_chunks_on_one_continuing_state() 
         .collect();
     assert_eq!(shapes[..2], [(Phase::Prefill, 4), (Phase::Prefill, 2)]);
     assert_eq!(asked.resets, 1, "the state continues across chunks");
+}
+
+// ---------------------------------------------------------------------------------------------
+// POOT-733 SC-006: the shipped qwen2 family through the real `Driver`, under explicit caller limits.
+// ---------------------------------------------------------------------------------------------
+
+/// The shipped qwen2 family's synthetic checkpoint, loaded through the public loader and served by a
+/// `Driver` over the real engine with only the device faked. The caller's `trace` limits are the only
+/// policy; nothing about the family is registered from outside.
+struct Qwen2Rig {
+    driver: Driver,
+    /// The same family built straight from the registry entry: what the driver traces.
+    model: Box<dyn Model>,
+    _checkpoint: poot_test_util::UniqueTempPath,
+}
+
+fn qwen2_rig(trace: poot_graph_ir::TraceLimits) -> Qwen2Rig {
+    let registry = Registry::builtin().unwrap();
+    let entry = registry
+        .entries()
+        .iter()
+        .find(|entry| entry.family == poot_models::qwen2::model::FAMILY)
+        .copied()
+        .expect("qwen2 is a shipped family");
+    let fixture = (entry.fixture)();
+    let dir = poot_test_util::unique_temp_path("prepared_budgets_qwen2");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
+    let words = (0..48usize).map(|i| (format!("w{i}"), i as u32)).collect();
+    let model = WordLevel::builder()
+        .vocab(words)
+        .unk_token("w0".to_string())
+        .build()
+        .unwrap();
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+    tokenizer.save(dir.join("tokenizer.json"), false).unwrap();
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    let model = (entry.build)(&fixture.raw(), &fixture.store).unwrap();
+    let handle = Arc::new(
+        ModelHandle::load(&dir, &registry, &poot_llm::driver::LoadOptions::default()).unwrap(),
+    );
+    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let driver = Driver::new(
+        handle,
+        Box::new(Engine::new(FakeDevice)),
+        DriverOptions {
+            prefill: compile.clone(),
+            decode: compile,
+            capacity: nz(16),
+            prefill_chunk: nz(4),
+            trace,
+            prepared: PreparedSetLimits {
+                max_entries: nz(64),
+                max_retained_bytes: NonZeroU64::new(1 << 40).unwrap(),
+            },
+            charge: poot_llm::driver::program_retention,
+            draft: poot_llm::driver::DraftPolicy::Off,
+            hidden_window: None,
+        },
+    )
+    .unwrap();
+    Qwen2Rig {
+        driver,
+        model,
+        _checkpoint: dir,
+    }
+}
+
+fn decode_only() -> ServingShapes<'static> {
+    ServingShapes {
+        layout: Layout::Contiguous,
+        rows: &[NonZeroUsize::MIN],
+        // Raw logits: no sampling suffix extends the traced graph, so the trace limits bind the
+        // family's graph alone.
+        heads: &[Head::Logits],
+        warm: Warm::Prompts(&[]),
+        windows: &[],
+        adapters: &[],
+    }
+}
+
+fn with_window(tokens: usize) -> ServingShapes<'static> {
+    let windows: &'static [NonZeroUsize] = Box::leak(vec![nz(tokens)].into_boxed_slice());
+    ServingShapes {
+        windows,
+        ..decode_only()
+    }
+}
+
+fn trace_budget(error: &DriverError) -> poot_graph_ir::TraceBudgetExceeded {
+    match error {
+        DriverError::Unsupported(Unsupported::Trace(TraceError::Budget(budget))) => *budget,
+        other => panic!("expected the typed trace-budget cause, got {other:?}"),
+    }
+}
+
+/// SC-006: the driver passes its caller's limits to the family's tracer. Adequate limits prepare the
+/// entries a roomy policy does (the same count and the same retained bytes: the traced graphs are the
+/// same); `max_tokens = 4` refuses a 5-token window with the exact typed cause and leaves the prepared
+/// set as it was; `max_eqns = 2` refuses at the third attempted equation, publishing no entry; an owned-byte ceiling
+/// below what the tracer's records need refuses at the named allocation. Mutations: the driver traces
+/// under `TraceLimits::for_tests()` instead of its options (every refusal row goes red); a nested
+/// unbudgeted builder in the family's `Step`; the budget stringified into a plain build error (the
+/// typed-cause match fails); the equation count checked only against the finished graph (the refusal's
+/// `attempted` is the whole graph's, not the first equation past the limit).
+#[test]
+fn the_shipped_qwen2_path_consumes_the_callers_limits_and_refuses_with_the_exact_cause() {
+    use poot_graph_ir::{AllocationSite, Attempted, BudgetResource, TraceLimits};
+
+    let roomy = TraceLimits::for_tests_with_tokens(nz(8));
+    let mut reference = qwen2_rig(roomy);
+    reference.driver.prepare(&with_window(3)).unwrap();
+    let (entries, retained) = (
+        reference.driver.prepared_entries(),
+        reference.driver.retained_bytes(),
+    );
+    assert!(entries >= 2, "a decode entry and a 3-token window");
+
+    // Adequate finite limits: exactly the graphs' sizes, the same prepared set.
+    let shape = |tokens: usize| StepShape {
+        rows: NonZeroUsize::MIN,
+        tokens: nz(tokens),
+        capacity: nz(16),
+        kv: KvLayout::Contiguous,
+        logits: LogitRows::Last,
+        hidden: None,
+    };
+    let model = &reference.model;
+    let biggest = model.trace(Phase::Prefill, shape(3), roomy).unwrap();
+    let decode = model.trace(Phase::Decode, shape(1), roomy).unwrap();
+    let adequate = TraceLimits {
+        max_tokens: nz(4),
+        max_values: nz(biggest.values().len().max(decode.values().len()) + 16),
+        max_eqns: nz(biggest.eqns().len().max(decode.eqns().len()) + 16),
+        max_literal_bytes: NonZeroU64::new(1 << 20).unwrap(),
+        max_owned_bytes: NonZeroU64::new(1 << 30).unwrap(),
+    };
+    let mut adequate_rig = qwen2_rig(adequate);
+    adequate_rig.driver.prepare(&with_window(3)).unwrap();
+    assert_eq!(adequate_rig.driver.prepared_entries(), entries);
+    assert_eq!(adequate_rig.driver.retained_bytes(), retained);
+
+    // `max_tokens = 4`: a 5-token window is refused before the family traces it, and what was
+    // prepared before stays.
+    let mut rig = qwen2_rig(adequate);
+    rig.driver.prepare(&decode_only()).unwrap();
+    let held = (rig.driver.prepared_entries(), rig.driver.retained_bytes());
+    let compiles = rig.driver.stats().compiles;
+    let refused = trace_budget(&rig.driver.prepare(&with_window(5)).unwrap_err());
+    assert_eq!(
+        (refused.resource, refused.limit, refused.requested),
+        (BudgetResource::Tokens, 4, 5)
+    );
+    assert_eq!(refused.attempted, Attempted::Total(5));
+    assert_eq!(refused.site, AllocationSite::TokenRequest);
+    assert_eq!(
+        (rig.driver.prepared_entries(), rig.driver.retained_bytes()),
+        held
+    );
+    assert_eq!(rig.driver.stats().compiles, compiles, "nothing compiled");
+
+    // `max_eqns = 2`: the third attempted equation is refused where it is attempted, the driver
+    // returns the exact typed cause, nothing is published, and asking again changes nothing.
+    let mut rig = qwen2_rig(TraceLimits {
+        max_eqns: nz(2),
+        ..roomy
+    });
+    let compiles = rig.driver.stats().compiles;
+    for _ in 0..2 {
+        let refused = trace_budget(&rig.driver.prepare(&decode_only()).unwrap_err());
+        assert_eq!(refused.resource, BudgetResource::Equations);
+        assert_eq!((refused.limit, refused.used, refused.requested), (2, 2, 1));
+        assert_eq!(refused.attempted, Attempted::Total(3));
+        assert_eq!(refused.site, AllocationSite::EquationRecord);
+        assert_eq!(
+            (rig.driver.prepared_entries(), rig.driver.retained_bytes()),
+            (0, 0),
+            "the refusal published an entry"
+        );
+        assert_eq!(rig.driver.stats().compiles, compiles);
+    }
+
+    // An owned-byte ceiling below the family's records: the smallest ceiling that admits the decode
+    // step, then one byte less refuses at the allocation site the error names.
+    let admits = |ceiling: u64| {
+        let limits = TraceLimits {
+            max_owned_bytes: NonZeroU64::new(ceiling).unwrap(),
+            ..roomy
+        };
+        model.trace(Phase::Decode, shape(1), limits).map(drop)
+    };
+    let (mut low, mut high) = (1u64, 1u64 << 24);
+    assert!(admits(high).is_ok());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if admits(mid).is_ok() {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let ceiling = TraceLimits {
+        max_owned_bytes: NonZeroU64::new(low - 1).unwrap(),
+        ..roomy
+    };
+    let mut rig = qwen2_rig(ceiling);
+    let refused = trace_budget(&rig.driver.prepare(&decode_only()).unwrap_err());
+    assert_eq!(refused.resource, BudgetResource::OwnedBytes);
+    assert_eq!(refused.limit, low - 1);
+    assert!(refused.used + refused.requested > low - 1);
+    // The Driver names the same allocation the model's own trace refuses at under that ceiling.
+    let direct = model
+        .trace(Phase::Decode, shape(1), ceiling)
+        .map(drop)
+        .unwrap_err();
+    let TraceError::Budget(direct) = direct else {
+        panic!("the model's own trace refuses with the budget cause: {direct:?}");
+    };
+    assert_eq!(refused.site, direct.site);
+    assert_eq!(refused.site, AllocationSite::FinalState);
+    assert_eq!(
+        (rig.driver.prepared_entries(), rig.driver.retained_bytes()),
+        (0, 0)
+    );
 }

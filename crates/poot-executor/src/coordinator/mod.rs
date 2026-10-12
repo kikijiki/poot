@@ -26,19 +26,23 @@
 
 mod schedule;
 
+use poot_runtime_common::BufferRole;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_graph_plan::multi_device::{PlanNodeId, TopologyError};
-use poot_graph_plan::{DeviceId, StageId, StagedProgram, TargetSet, TensorParallel};
+use poot_graph_plan::{
+    multi_device::topology::DeviceId, staged::StageId, staged::StagedProgram, staged::TargetSet,
+    staged::TensorParallel,
+};
 use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::device::{Collectives, Device, DeviceTime, NativeCounters};
 use crate::engine::{Engine, EntryPart, Outgoing, StageSeams, device_error};
 use crate::error::{BindError, ExecError, LoadError};
 use crate::{
-    BufferRole, DeviceMemory, EntryId, ExecutableId, Executor, ExecutorStats, HostSync,
-    OutputSource, StageStats, StateScope, StepInputs, StepOutputs,
+    DeviceMemory, EntryId, ExecutableId, Executor, ExecutorStats, HostSync, OutputSource,
+    StageStats, StateScope, StepInputs, StepOutputs,
 };
 
 pub use schedule::ScheduleError;

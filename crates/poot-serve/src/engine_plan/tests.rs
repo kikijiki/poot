@@ -11,22 +11,24 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use poot_executor::{
-    BufferRole, Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, EntryId, ExecError,
+    Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, EntryId, ExecError,
     ExecutableId, Executor, ExecutorStats, HostSync, NativeCounters, StateScope, StepInputs,
     StepOutputs, SupportBound,
 };
-use poot_graph_plan::{Capability, StagedProgram, Submission, Target, TargetSet};
+use poot_graph_plan::{
+    Capability, Target, production_plan::Submission, staged::StagedProgram, staged::TargetSet,
+};
 use poot_llm::driver::{BackendChoice, DraftPolicy, ModelHandle};
 use poot_quant::weights::{WeightMap, WeightStore};
-use poot_runtime_common::{CompiledKernel, MemoryCounterSnapshot, MemoryCounters};
+use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried, TargetId};
 
 use super::*;
 use crate::admin::LoraAdminPolicy;
 use crate::http::{RateLimiter, handle};
 use crate::tests::{load_handle, test_metrics, write_tiny_gguf};
+use poot_graph_plan::test_support::gpu_caps_mut;
 use poot_llm::driver::capacity::{CapacityRefusal, FitError, Observation, Rejection};
-use poot_test_util::graph_fixtures::gpu_caps_mut;
 
 /// The production budget reader (`device_budget`) over a group whose devices hold exactly
 /// `capacity[rank]` bytes: the synthetic per-device budget of the admission rows below.
@@ -1343,7 +1345,7 @@ fn recurrent_handle() -> Arc<ModelHandle> {
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(0);
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
     let words: serde_json::Map<String, serde_json::Value> = (0..48)
         .map(|i| (format!("w{i}"), serde_json::json!(i)))
         .collect();
@@ -1753,7 +1755,7 @@ fn a_tensor_placement_of_an_unsplittable_model_is_a_typed_refusal() {
         matches!(
             result,
             Err(StartupError::Driver(DriverError::Unsupported(
-                Unsupported::Compile(poot_graph_plan::StagedCompileError::Shard(_))
+                Unsupported::Compile(poot_graph_plan::staged::StagedCompileError::Shard(_))
             )))
         ),
         "{:?}",

@@ -36,17 +36,25 @@ fn gated_delta_net_decode_matches_recurrence() {
     let betav: Vec<f32> = (0..h * l).map(|i| 0.5 + 0.1 * (i % 4) as f32).collect();
 
     // --- build the graph (one decode step, carries state) ---
-    let b = Builder::new();
-    let q_in = b.constant("q", TensorType::f32(vec![1, h, 1, d]));
-    let k_in = b.constant("k", TensorType::f32(vec![1, h, 1, d]));
-    let v_in = b.constant("v", TensorType::f32(vec![1, h, 1, d]));
-    let g_in = b.constant("g", TensorType::f32(vec![1, h, 1, 1]));
-    let bt_in = b.constant("beta", TensorType::f32(vec![1, h, 1, 1]));
-    let s_in = b.state_input("s", TensorType::f32(vec![1, h, d, d]), StateRole::Recurrent);
-    let (o, s_out) = gated_delta_net_decode(&b, q_in, k_in, v_in, g_in, bt_in, s_in);
+    let b = Builder::for_tests();
+    let q_in = b.constant("q", TensorType::f32(vec![1, h, 1, d])).unwrap();
+    let k_in = b.constant("k", TensorType::f32(vec![1, h, 1, d])).unwrap();
+    let v_in = b.constant("v", TensorType::f32(vec![1, h, 1, d])).unwrap();
+    let g_in = b.constant("g", TensorType::f32(vec![1, h, 1, 1])).unwrap();
+    let bt_in = b
+        .constant("beta", TensorType::f32(vec![1, h, 1, 1]))
+        .unwrap();
+    let s_in = b
+        .state_input("s", TensorType::f32(vec![1, h, d, d]), StateRole::Recurrent)
+        .unwrap();
+    let (o, s_out) = gated_delta_net_decode(&b, q_in, k_in, v_in, g_in, bt_in, s_in).unwrap();
     // check shape inference before b is consumed
-    assert_eq!(b.aval(o).shape, vec![1, h, 1, d], "output shape");
-    assert_eq!(b.aval(s_out).shape, vec![1, h, d, d], "state shape");
+    assert_eq!(b.aval(o).unwrap().shape, vec![1, h, 1, d], "output shape");
+    assert_eq!(
+        b.aval(s_out).unwrap().shape,
+        vec![1, h, d, d],
+        "state shape"
+    );
     let g = b
         .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s_in, s_out)]))
         .unwrap();
@@ -186,15 +194,19 @@ fn gated_delta_net_decode_batch_generalizes_from_batch1() {
         let single: Vec<(Vec<f32>, Vec<f32>)> = rows
             .iter()
             .map(|(q, k, v, g, beta, s_in)| {
-                let b = Builder::new();
-                let q_in = b.constant("q", TensorType::f32(vec![1, h, 1, d]));
-                let k_in = b.constant("k", TensorType::f32(vec![1, h, 1, d]));
-                let v_in = b.constant("v", TensorType::f32(vec![1, h, 1, d]));
-                let g_in = b.constant("g", TensorType::f32(vec![1, h, 1, 1]));
-                let bt_in = b.constant("beta", TensorType::f32(vec![1, h, 1, 1]));
-                let s0 =
-                    b.state_input("s", TensorType::f32(vec![1, h, d, d]), StateRole::Recurrent);
-                let (o, s_out) = gated_delta_net_decode(&b, q_in, k_in, v_in, g_in, bt_in, s0);
+                let b = Builder::for_tests();
+                let q_in = b.constant("q", TensorType::f32(vec![1, h, 1, d])).unwrap();
+                let k_in = b.constant("k", TensorType::f32(vec![1, h, 1, d])).unwrap();
+                let v_in = b.constant("v", TensorType::f32(vec![1, h, 1, d])).unwrap();
+                let g_in = b.constant("g", TensorType::f32(vec![1, h, 1, 1])).unwrap();
+                let bt_in = b
+                    .constant("beta", TensorType::f32(vec![1, h, 1, 1]))
+                    .unwrap();
+                let s0 = b
+                    .state_input("s", TensorType::f32(vec![1, h, d, d]), StateRole::Recurrent)
+                    .unwrap();
+                let (o, s_out) =
+                    gated_delta_net_decode(&b, q_in, k_in, v_in, g_in, bt_in, s0).unwrap();
                 let g_graph = b
                     .finish(poot_graph_ir::Outputs::new(o).with_state(&[(s0, s_out)]))
                     .unwrap();
@@ -230,21 +242,37 @@ fn gated_delta_net_decode_batch_generalizes_from_batch1() {
             .collect();
 
         // --- batched call: all B rows packed into ONE call. ---
-        let b = Builder::new();
-        let q_in = b.constant("q", TensorType::f32(vec![b_batch, h, 1, d]));
-        let k_in = b.constant("k", TensorType::f32(vec![b_batch, h, 1, d]));
-        let v_in = b.constant("v", TensorType::f32(vec![b_batch, h, 1, d]));
-        let g_in = b.constant("g", TensorType::f32(vec![b_batch, h, 1, 1]));
-        let bt_in = b.constant("beta", TensorType::f32(vec![b_batch, h, 1, 1]));
-        let s0 = b.state_input(
-            "s",
-            TensorType::f32(vec![b_batch, h, d, d]),
-            StateRole::Recurrent,
-        );
-        let (o, s_out) = gated_delta_net_decode(&b, q_in, k_in, v_in, g_in, bt_in, s0);
-        assert_eq!(b.aval(o).shape, vec![b_batch, h, 1, d], "batched o shape");
+        let b = Builder::for_tests();
+        let q_in = b
+            .constant("q", TensorType::f32(vec![b_batch, h, 1, d]))
+            .unwrap();
+        let k_in = b
+            .constant("k", TensorType::f32(vec![b_batch, h, 1, d]))
+            .unwrap();
+        let v_in = b
+            .constant("v", TensorType::f32(vec![b_batch, h, 1, d]))
+            .unwrap();
+        let g_in = b
+            .constant("g", TensorType::f32(vec![b_batch, h, 1, 1]))
+            .unwrap();
+        let bt_in = b
+            .constant("beta", TensorType::f32(vec![b_batch, h, 1, 1]))
+            .unwrap();
+        let s0 = b
+            .state_input(
+                "s",
+                TensorType::f32(vec![b_batch, h, d, d]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let (o, s_out) = gated_delta_net_decode(&b, q_in, k_in, v_in, g_in, bt_in, s0).unwrap();
         assert_eq!(
-            b.aval(s_out).shape,
+            b.aval(o).unwrap().shape,
+            vec![b_batch, h, 1, d],
+            "batched o shape"
+        );
+        assert_eq!(
+            b.aval(s_out).unwrap().shape,
             vec![b_batch, h, d, d],
             "batched s_out shape"
         );

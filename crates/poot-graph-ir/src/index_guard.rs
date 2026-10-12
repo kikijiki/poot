@@ -34,14 +34,23 @@
 //!
 //! The guard condition and the witness observation are the same value, so nothing has to be tied together
 //! after the fact.
+//!
+//! One emitter ([`emit_index_guard`]) writes the shape for any equation sink: [`Builder::guard_index_bounds`]
+//! appends it to a traced graph, and a graph pass appends it to the graph it rewrites. The one recognizer
+//! of a guard's witness ([`is_guard_witness`]) lives beside it and reads exactly this shape, so a consumer
+//! that must know a clamped lane is observed (the attention matcher, the expert-id check) cannot drift from
+//! the emitter.
+
+use std::collections::HashMap;
 
 use crate::builder::{Builder, Traced};
-use crate::graph::ValueId;
-use crate::op::{BinOp, RedOp};
-use crate::types::{DType, Scalar};
+use crate::error::BuilderError;
+use crate::graph::{Eqn, Graph, Operand, ValueId};
+use crate::op::{BinOp, OpKind, RedOp};
+use crate::types::{DType, Scalar, TensorType};
 
 /// Why a guard cannot be emitted for the requested selector and bound.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IndexGuardError {
     #[error("selector {raw} has dtype {dtype}; an index-bounds guard needs I32")]
     RawNotI32 { raw: ValueId, dtype: DType },
@@ -49,6 +58,8 @@ pub enum IndexGuardError {
     RawNotRanked { raw: ValueId },
     #[error("bound {upper_exclusive} does not fit in i32")]
     BoundNotRepresentable { upper_exclusive: usize },
+    #[error(transparent)]
+    Build(#[from] BuilderError),
 }
 
 /// What [`Builder::guard_index_bounds`] appended: the selector downstream work reads, and the value to
@@ -61,6 +72,108 @@ pub struct GuardedIndex {
     pub witness: Traced,
 }
 
+/// What [`emit_index_guard`] emitted, by value id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardValues {
+    /// Read this instead of the raw selector. Every lane is in `[0, upper_exclusive)`.
+    pub guarded: ValueId,
+    /// Declare this as a validation output. Zero when every lane was in range. The last equation emitted.
+    pub witness: ValueId,
+}
+
+/// Why [`emit_index_guard`] failed: the guard's own preconditions, or the sink refusing an equation.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum IndexGuardEmitError<E: std::error::Error + 'static> {
+    #[error(transparent)]
+    Guard(IndexGuardError),
+    #[error("emitting an equation of the index guard: {0}")]
+    Emit(#[source] E),
+}
+
+/// Emit the canonical guard (see the [module docs](self)) over `raw`, of type `raw_type`, through `emit`:
+/// each call appends one equation with the given operands and returns its output value. The five equations
+/// are emitted in order and the last is the witness.
+///
+/// This is the one definition of the shape; [`Builder::guard_index_bounds`] and graph passes both call it.
+pub fn emit_index_guard<E: std::error::Error + 'static>(
+    raw: ValueId,
+    raw_type: &TensorType,
+    upper_exclusive: usize,
+    mut emit: impl FnMut(OpKind, Vec<Operand>) -> Result<ValueId, E>,
+) -> Result<GuardValues, IndexGuardEmitError<E>> {
+    if raw_type.dtype != DType::I32 {
+        return Err(IndexGuardEmitError::Guard(IndexGuardError::RawNotI32 {
+            raw,
+            dtype: raw_type.dtype,
+        }));
+    }
+    let Some(axis) = raw_type.shape.len().checked_sub(1) else {
+        return Err(IndexGuardEmitError::Guard(IndexGuardError::RawNotRanked {
+            raw,
+        }));
+    };
+    let bound = i32::try_from(upper_exclusive).map_err(|_| {
+        IndexGuardEmitError::Guard(IndexGuardError::BoundNotRepresentable { upper_exclusive })
+    })?;
+    let value = Operand::Value;
+    let mut step = |op, inputs| emit(op, inputs).map_err(IndexGuardEmitError::Emit);
+    let invalid = step(
+        OpKind::Binary(BinOp::GeU),
+        vec![value(raw), Operand::Lit(Scalar::I32(bound))],
+    )?;
+    let zero = step(OpKind::Binary(BinOp::Sub), vec![value(raw), value(raw)])?;
+    let guarded = step(
+        OpKind::Select,
+        vec![value(invalid), value(zero), value(raw)],
+    )?;
+    let invalid_f32 = step(OpKind::Cast { to: DType::F32 }, vec![value(invalid)])?;
+    let witness = step(
+        OpKind::Reduce {
+            op: RedOp::Sum,
+            axis,
+            keepdim: true,
+        },
+        vec![value(invalid_f32)],
+    )?;
+    Ok(GuardValues { guarded, witness })
+}
+
+/// Whether `witness` is the witness [`emit_index_guard`] emits for the guard whose invalid flag is
+/// `condition`: a keepdim last-axis `Sum` of the F32 cast of `condition`. Anything else (a witness over
+/// another value, a reduction over another axis) does not observe every clamped lane. `producer` maps each
+/// value to its equation's index in `g`.
+pub fn is_guard_witness(
+    g: &Graph,
+    producer: &HashMap<ValueId, usize>,
+    witness: ValueId,
+    condition: ValueId,
+) -> bool {
+    let of =
+        |value: ValueId| -> Option<&Eqn> { producer.get(&value).map(|&index| &g.eqns()[index]) };
+    let Some(sum) = of(witness) else {
+        return false;
+    };
+    let (
+        OpKind::Reduce {
+            op: RedOp::Sum,
+            axis,
+            keepdim: true,
+        },
+        [Operand::Value(flag)],
+    ) = (&sum.op, sum.inputs.as_slice())
+    else {
+        return false;
+    };
+    if *axis + 1 != g.aval(*flag).shape.len() {
+        return false;
+    }
+    matches!(
+        of(*flag),
+        Some(Eqn { op: OpKind::Cast { to: DType::F32 }, inputs, .. })
+            if matches!(inputs.as_slice(), [Operand::Value(observed)] if *observed == condition)
+    )
+}
+
 impl Builder {
     /// Emit the canonical index-bounds guard for `raw` and return the guarded selector plus the witness
     /// to declare as a validation output. See the [module docs](self) for the shape and why it is forced.
@@ -69,24 +182,18 @@ impl Builder {
         raw: Traced,
         upper_exclusive: usize,
     ) -> Result<GuardedIndex, IndexGuardError> {
-        let aval = self.aval(raw);
-        if aval.dtype != DType::I32 {
-            return Err(IndexGuardError::RawNotI32 {
-                raw: raw.id(),
-                dtype: aval.dtype,
-            });
-        }
-        let Some(axis) = aval.shape.len().checked_sub(1) else {
-            return Err(IndexGuardError::RawNotRanked { raw: raw.id() });
-        };
-        let bound = i32::try_from(upper_exclusive)
-            .map_err(|_| IndexGuardError::BoundNotRepresentable { upper_exclusive })?;
-        let invalid = self.binary_scalar(BinOp::GeU, raw, Scalar::I32(bound));
-        let zero = self.binary(BinOp::Sub, raw, raw);
-        let guarded = self.select(invalid, zero, raw);
-        let invalid_f32 = self.cast(invalid, DType::F32);
-        let witness = self.reduce(RedOp::Sum, invalid_f32, axis, true);
-        Ok(GuardedIndex { guarded, witness })
+        let aval = self.aval(raw)?;
+        let values = emit_index_guard(raw.id(), &aval, upper_exclusive, |op, inputs| {
+            self.emit(op, inputs).map(|traced| traced.id())
+        })
+        .map_err(|error| match error {
+            IndexGuardEmitError::Guard(error) => error,
+            IndexGuardEmitError::Emit(error) => IndexGuardError::Build(error),
+        })?;
+        Ok(GuardedIndex {
+            guarded: self.handle(values.guarded),
+            witness: self.handle(values.witness),
+        })
     }
 }
 

@@ -44,24 +44,24 @@ fn rng_stream(seed: u64) -> impl FnMut() -> u64 {
     }
 }
 
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 
 #[test]
 fn fused_pointwise_chain_is_bit_identical_to_unfused() {
     // out = exp(a - b) * c + a (4 pointwise ops, all [1,1,8]; a appears twice as a leaf). The fused
     // graph collapses the chain to one Fused eqn; eval must be bit-identical to the un-fused chain
     // (graph-architecture.md section 5 stage 2: same ops, same order).
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let n = 8usize;
     let (a, bb, c) = (
-        b.constant("a", TensorType::f32(vec![1, 1, n])),
-        b.constant("b", TensorType::f32(vec![1, 1, n])),
-        b.constant("c", TensorType::f32(vec![1, 1, n])),
+        b.constant("a", TensorType::f32(vec![1, 1, n])).unwrap(),
+        b.constant("b", TensorType::f32(vec![1, 1, n])).unwrap(),
+        b.constant("c", TensorType::f32(vec![1, 1, n])).unwrap(),
     );
-    let t1 = b.binary(BinOp::Sub, a, bb);
-    let t2 = b.unary(UnOp::Exp, t1);
-    let t3 = b.binary(BinOp::Mul, t2, c);
-    let out = b.binary(BinOp::Add, t3, a);
+    let t1 = b.binary(BinOp::Sub, a, bb).unwrap();
+    let t2 = b.unary(UnOp::Exp, t1).unwrap();
+    let t3 = b.binary(BinOp::Mul, t2, c).unwrap();
+    let out = b.binary(BinOp::Add, t3, a).unwrap();
     let (ai, bi, ci) = (a.id(), bb.id(), c.id());
     let g = b.finish(out).unwrap();
 
@@ -102,9 +102,12 @@ fn fused_equals_unfused_over_random_pointwise_graphs() {
     let mut fused_count = 0usize;
     for seed in 0u64..400 {
         let mut rng = rng_stream(seed);
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let inputs_t: Vec<_> = (0..3)
-            .map(|i| b.constant(&format!("x{i}"), TensorType::f32(shape.clone())))
+            .map(|i| {
+                b.constant(&format!("x{i}"), TensorType::f32(shape.clone()))
+                    .unwrap()
+            })
             .collect();
         let leaf_ids: Vec<ValueId> = inputs_t.iter().map(|t| t.id()).collect();
         // `acc` is the running output (a deep dependent chain, so fusable); `pool` holds reused
@@ -116,19 +119,19 @@ fn fused_equals_unfused_over_random_pointwise_graphs() {
             match rng() % 3 {
                 0 => {
                     let op = [UnOp::Neg, UnOp::Tanh, UnOp::Erf, UnOp::Round][(rng() as usize) % 4];
-                    acc = b.unary(op, acc);
+                    acc = b.unary(op, acc).unwrap();
                 }
                 1 => {
                     let other = pool[(rng() as usize) % pool.len()];
                     let op = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Max][(rng() as usize) % 4];
-                    acc = b.binary(op, acc, other);
+                    acc = b.binary(op, acc, other).unwrap();
                 }
                 _ => {
                     // grow the pool with a reused intermediate (creates multi-use values for cse/fusion).
                     let a = pool[(rng() as usize) % pool.len()];
                     let c = pool[(rng() as usize) % pool.len()];
                     let op = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Max][(rng() as usize) % 4];
-                    pool.push(b.binary(op, a, c));
+                    pool.push(b.binary(op, a, c).unwrap());
                 }
             }
         }
@@ -214,11 +217,14 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
         let mut bshape = shape.clone();
         bshape[axis] = 1;
         let bnumel: usize = bshape.iter().product();
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let full: Vec<_> = (0..3)
-            .map(|i| b.constant(&format!("x{i}"), TensorType::f32(shape.clone())))
+            .map(|i| {
+                b.constant(&format!("x{i}"), TensorType::f32(shape.clone()))
+                    .unwrap()
+            })
             .collect();
-        let bcast = b.constant("xb", TensorType::f32(bshape.clone()));
+        let bcast = b.constant("xb", TensorType::f32(bshape.clone())).unwrap();
         let mut acc = full[(rng() as usize) % 3];
         let mut reduced = false;
         let steps = 5 + (rng() % 10) as usize;
@@ -226,17 +232,17 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
             match rng() % 5 {
                 0 => {
                     let op = [UnOp::Neg, UnOp::Tanh, UnOp::Erf][(rng() as usize) % 3];
-                    acc = b.unary(op, acc);
+                    acc = b.unary(op, acc).unwrap();
                 }
                 1 | 2 => {
                     let other = full[(rng() as usize) % 3];
                     let op = [BinOp::Add, BinOp::Sub, BinOp::Mul][(rng() as usize) % 3];
-                    acc = b.binary(op, acc, other);
+                    acc = b.binary(op, acc, other).unwrap();
                 }
                 3 => {
                     // binary against the row-broadcast leaf (broadcasts to the full row).
                     let op = [BinOp::Add, BinOp::Sub, BinOp::Mul][(rng() as usize) % 3];
-                    acc = b.binary(op, acc, bcast);
+                    acc = b.binary(op, acc, bcast).unwrap();
                 }
                 _ => {
                     // reduction region: reduce last axis (keepdim) then broadcast back to the row shape.
@@ -245,8 +251,8 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
                     } else {
                         RedOp::Max
                     };
-                    let r = b.reduce(op, acc, axis, true);
-                    acc = b.broadcast(r, shape.clone());
+                    let r = b.reduce(op, acc, axis, true).unwrap();
+                    acc = b.broadcast(r, shape.clone()).unwrap();
                     reduced = true;
                 }
             }
@@ -312,12 +318,16 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
 /// broadcast against the head axis).
 fn rope_graph_and_inputs(d: usize, rot: usize) -> (poot_graph_ir::Graph, HashMap<ValueId, Value>) {
     let (hq, max_pos) = (3usize, 16usize);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, hq, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, rot]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, rot]));
-    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let out = rope(&b, x, cos, sin, pos);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, rot]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, rot]))
+        .unwrap();
+    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
+    let out = rope(&b, x, cos, sin, pos).unwrap();
     let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
     let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
@@ -403,7 +413,7 @@ fn optimize_preserves_rope_numerics() {
     // the full pass pipeline must be eval-equivalent to the raw graph.
     for (d, rot) in [(8usize, 8usize), (8, 4)] {
         let (g, inputs) = rope_graph_and_inputs(d, rot);
-        let opt = optimize(&g).unwrap();
+        let opt = passes_without_target(&g).unwrap();
         let got_unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
             .output

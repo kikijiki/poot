@@ -10,6 +10,7 @@
 //! `DType` with an exhaustive `match` and no wildcard arm, so a new operation does not compile until it is
 //! classified.
 
+use crate::graph_validation::{ValidationPacketPlan, ValidationPacketSource};
 use poot_graph_ir::op::{BinOp, OpKind, RedOp};
 use poot_graph_ir::{Eqn, Graph, Operand, Scalar, ValidationPacketLayout, ValueId, ValueTable};
 use poot_kernel_ir::{Body, WmmaShape};
@@ -17,7 +18,7 @@ use poot_kernelgen::{BodyUse, FragmentUse, KernelRequirements, UnmeasurableLds};
 use poot_target::{DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
 use poot_tensor::DType;
 
-use crate::{PlanError, ValidationPacketPlan, ValidationPacketSource};
+use crate::PlanError;
 
 /// The largest lane magnitude a witness head may reach. Every integer up to 2^24 is exact in f32.
 pub const DEVICE_WITNESS_MAGNITUDE_BOUND: u64 = 1 << 24;

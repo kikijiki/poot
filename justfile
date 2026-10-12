@@ -64,7 +64,7 @@ test-bench-runner:
 # Fail when a test runs in no lane. A test is covered when it is model-free or real-dims (the model-free lane), a
 # checkpoint test (`just test-optional` and the checkpoint recipes, with a model), or matched by one of the
 # selections above; a device test or a test of a package outside the inventory that matches none is the gap this
-# gate exists to close (card 1058: 155 of 239 poot-gpu tests once ran nowhere).
+# gate exists to close (card 1058: 155 of 239 poot-wgpu-device tests once ran nowhere).
 test-lane-coverage:
     scripts/check-lane-coverage.py --self-test
     scripts/check-lane-coverage.py '{{wgpu_selection}}' '{{vulkan_selection}}' '{{rocm_selection}}' '{{ptx_selection}}' '{{ptx_multi_device_selection}}' '{{kernels_selection}}' '{{npu_selection}}' 'package({{isolated_package}})'
@@ -152,23 +152,23 @@ test-optional:
 # model-free lane excludes) matches none of them. Select a device crate by `package(...)`, never by listing its
 # test binaries: a binary added later is then selected without anyone remembering to list it. The kernels lane
 # runs its two packages whole, so it has no filter.
-# A `package(...)` selection also runs that package's model-free tests (poot-runtime, poot-rocm-runtime), which
+# A `package(...)` selection also runs that package's model-free tests (poot-wgpu-runtime, poot-rocm-runtime), which
 # `just test` runs too: the repeat is harmless and costs seconds.
-wgpu_selection := 'package(poot-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_wgpu$/)) | (binary_id(=poot-llm::beam) & test(/_wgpu$/)) | (binary_id(=poot-llm::timed_executor) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_wgpu$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_wgpu$/)) | (binary_id(=poot-llm::staged_timing) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | binary_id(=poot-executor::staged_pipeline) | package(poot-gpu) | binary_id(=poot-serve::bounded_drain_production) | (binary_id(=poot-serve::served_loop) & test(/_wgpu$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-serve::served_groups) & test(/_wgpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
-vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device) | (binary_id(=poot-serve::served_groups) & test(/_vulkan$/)) | (binary_id(=poot-serve::served_loop) & test(/_vulkan$/))'
-rocm_selection := 'package(poot-rocm-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_rocm$/)) | package(poot-rocm-gpu) | (binary_id(=poot-llm::beam) & test(/_rocm$/)) | (binary_id(=poot-llm::timed_executor) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_rocm$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_rocm$/)) | binary_id(=poot-llm::rocm_batched_decode_plan_classify) | (binary_id(=poot-serve::served_loop) & test(/_rocm$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-serve::served_groups) & test(/_rocm$/))'
-ptx_single_device_rows := '(binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_ptx$/)) | (binary_id(=poot-llm::staged_timing) & test(/_ptx$/)) | (binary_id(=poot-llm::timed_executor) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_ptx$/)) | (binary_id(=poot-serve::served_groups) & test(/_ptx$/)) | package(poot-ptx-gpu) | package(poot-ptx-runtime) | test(/^(wmma_tile_dispatches_and_matches_cpu_on_ptx|attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx|attention_fixture_bank_matches_cpu_on_ptx|attention_split_key_and_live_bound_match_cpu_on_ptx)$/)'
+wgpu_selection := 'package(poot-wgpu-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-llm::add_a_model) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_wgpu$/)) | (binary_id(=poot-llm::beam) & test(/_wgpu$/)) | (binary_id(=poot-llm::timed_executor) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_wgpu$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_wgpu$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate) & test(/_wgpu$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_wgpu$/)) | (binary_id(=poot-llm::staged_timing) & test(/_wgpu$/)) | binary_id(=poot-executor) | binary_id(=poot-executor::cr30_lifecycle) | binary_id(=poot-executor::staged_pipeline) | package(poot-wgpu-device) | binary_id(=poot-llm::wgpu_qwen2) | binary_id(=poot-llm::wgpu_gemma2) | binary_id(=poot-llm::wgpu_executor_contract) | binary_id(=poot-llm::wgpu_weight_map_binding) | binary_id(=poot-llm::wgpu_parity_models) | binary_id(=poot-llm::wgpu_staged_pipeline) | binary_id(=poot-serve::bounded_drain_production) | (binary_id(=poot-serve::served_loop) & test(/_wgpu$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_wgpu$/)) | (binary_id(=poot-serve::served_groups) & test(/_wgpu$/)) | test(/^prefill_kv_shared_pool_matches_contiguous$/) | test(/^qwen2_decode_gpu_matches_cpu$/)'
+vulkan_selection := 'package(poot-vulkan-runtime) | package(poot-vulkan-device) | binary_id(=poot-llm::vulkan_generate) | binary_id(=poot-llm::vulkan_cross_backend) | binary_id(=poot-llm::vulkan_parity_models) | (binary_id(=poot-serve::served_groups) & test(/_vulkan$/)) | (binary_id(=poot-serve::served_loop) & test(/_vulkan$/))'
+rocm_selection := 'package(poot-rocm-runtime) | (binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-llm::add_a_model) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_rocm$/)) | package(poot-rocm-device) | binary_id(=poot-llm::rocm_executor_contract) | binary_id(=poot-llm::rocm_executor_coverage) | binary_id(=poot-llm::rocm_routed_prefill_unguarded) | binary_id(=poot-llm::rocm_parity_models) | binary_id(=poot-llm::rocm_staged_pipeline) | binary_id(=poot-llm::rocm_weight_map_binding) | (binary_id(=poot-llm::beam) & test(/_rocm$/)) | (binary_id(=poot-llm::timed_executor) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_rocm$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_rocm$/)) | (binary_id(=poot-llm::recurrent_snapshot_cost) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate) & test(/_rocm$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_rocm$/)) | binary_id(=poot-llm::rocm_batched_decode_plan_classify) | (binary_id(=poot-serve::served_loop) & test(/_rocm$/)) | (binary_id(=poot-serve::bin/poot-serve) & test(/^tests::lifecycle::device::[a-z_0-9]+_rocm$/)) | (binary_id(=poot-serve::served_groups) & test(/_rocm$/))'
+ptx_single_device_rows := '(binary_id(=poot-llm) & test(/^driver::(device_tests|step::mtp_tests)::[a-z_0-9]+_ptx$/)) | (binary_id(=poot-llm::add_a_model) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate) & test(/_ptx$/)) | (binary_id(=poot-llm::speculate_recurrent) & test(/_ptx$/)) | (binary_id(=poot-llm::staged_timing) & test(/_ptx$/)) | (binary_id(=poot-llm::timed_executor) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_deepseek3) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3moe) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_gemma4) & test(/_ptx$/)) | (binary_id(=poot-llm::pooled_qwen3next) & test(/_ptx$/)) | (binary_id(=poot-serve::served_groups) & test(/_ptx$/)) | package(poot-ptx-device) | binary_id(=poot-llm::ptx_gemma2_geglu) | binary_id(=poot-llm::ptx_sc_acceptance) | binary_id(=poot-llm::ptx_routed_prefill_unguarded) | binary_id(=poot-llm::ptx_parity_models) | binary_id(=poot-llm::ptx_staged_pipeline) | binary_id(=poot-llm::ptx_weight_map_binding) | package(poot-ptx-runtime) | test(/^(wmma_tile_dispatches_and_matches_cpu_on_ptx|attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx|attention_fixture_bank_matches_cpu_on_ptx|attention_split_key_and_live_bound_match_cpu_on_ptx)$/)'
 # The multi-device rows (two NVIDIA GPUs, and the four-way tensor-parallel row) live in three test binaries, and a
 # binary is the property that says how many devices a row needs: every row of one opens its devices through the
 # same `open_two` / `open_devices`. `test-device-ptx` excludes them (on a one-GPU machine they fail with `invalid
 # device ordinal` instead of falling outside the lane); `test-device-ptx-2gpu` and `-4gpu` select them, split by the
 # four-way name. Multi-device rows live only in these binaries; a binary of one-device rows never holds one. The
-# selector cannot tell a multi-device row in a single-device binary (it is selected by `package(poot-ptx-gpu)` and
+# selector cannot tell a multi-device row in a single-device binary (it is selected by `package(poot-ptx-device)` and
 # fails with `invalid device ordinal` on a one-GPU machine). What catches it is the classification gate: on a
 # many-GPU machine it passes and is in neither the required list nor `ptx.unlisted.txt`, so
 # `scripts/check-required-cases.py ptx` fails on an unclassified passing row. Listing it as required would hide it,
 # so a reviewer checks that a new `ptx.txt` row is a one-device row.
-ptx_multi_device_selection := 'binary_id(=poot-ptx-gpu::multi_device_pipeline) | binary_id(=poot-ptx-gpu::tensor_parallel) | binary_id(=poot-serve::served_multi_device)'
+ptx_multi_device_selection := 'binary_id(=poot-llm::ptx_multi_device_pipeline) | binary_id(=poot-llm::ptx_tensor_parallel) | binary_id(=poot-serve::served_multi_device)'
 ptx_selection := '(' + ptx_single_device_rows + ') & not (' + ptx_multi_device_selection + ')'
 kernels_selection := 'package(pootc) | package(poot-kernelgen)'
 npu_selection := 'package(poot-npu)'
@@ -186,17 +186,17 @@ isolated_package := 'poot-bench-runner'
 # case in scripts/required-device-cases/<lane>.txt ran and passed - a skip never counts as a pass.
 
 # wgpu lane: the migrated executor-contract, packed serving/launch-widening, I32, state/capture, failure and
-# cache-identity cases, and every poot-gpu test (a test no lane selects goes red silently); wgpu device required,
+# cache-identity cases, and every poot-wgpu-device test (a test no lane selects goes red silently); wgpu device required,
 # then the required-case gate
 test-device-wgpu:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
-        {{nextest}} --profile device-wgpu -p poot-gpu -p poot-executor -p poot-llm -p poot-runtime -p poot-serve \
+        {{nextest}} --profile device-wgpu -p poot-wgpu-device -p poot-executor -p poot-llm -p poot-wgpu-runtime -p poot-serve \
         -E '{{wgpu_selection}}'
     scripts/check-required-cases.py wgpu
 
 # The poot-executor rows this lane requires (cr30_lifecycle, kernel identity) also run in `just test`;
-# poot-gpu is excluded from it (gate_policy: every test dispatches on a wgpu device), so this lane is
+# poot-wgpu-device is excluded from it (gate_policy: every test dispatches on a wgpu device), so this lane is
 # where its required cases run.
 
 # kernel GPU suites (pootc dispatches, poot-kernelgen runs) on wgpu, device required, then the required-case gate
@@ -212,17 +212,17 @@ test-device-kernels:
 test-device-vulkan:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_VULKAN env POOT_VULKAN_VALIDATION=1 \
-        {{nextest}} --profile device-vulkan -p poot-vulkan-runtime -p poot-vulkan-device -p poot-serve \
+        {{nextest}} --profile device-vulkan -p poot-vulkan-runtime -p poot-vulkan-device -p poot-llm -p poot-serve \
         -E '{{vulkan_selection}}'
     scripts/check-required-cases.py vulkan
 
 # ROCm lane: the migrated executor-contract, packed-serving and parity suites (card 548; the old
-# resident probes went with resident.rs) and every poot-rocm-gpu test (a test no lane selects goes red silently),
+# resident probes went with resident.rs) and every poot-rocm-device test (a test no lane selects goes red silently),
 # ROCm device required, then the required-case gate
 test-device-rocm:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
-        {{nextest}} --profile device-rocm -p poot-rocm-gpu -p poot-llm -p poot-rocm-runtime -p poot-serve --features poot-llm/rocm \
+        {{nextest}} --profile device-rocm -p poot-rocm-device -p poot-llm -p poot-rocm-runtime -p poot-serve --features poot-llm/rocm \
         -E '{{rocm_selection}}'
     scripts/check-required-cases.py rocm
 
@@ -300,7 +300,7 @@ test-rocm-feature:
 test-device-ptx:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_PTX \
-        {{nextest}} --profile device-ptx -p poot-ptx-gpu -p poot-ptx-runtime -p poot-kernelgen -p poot-llm -p poot-serve \
+        {{nextest}} --profile device-ptx -p poot-ptx-device -p poot-ptx-runtime -p poot-kernelgen -p poot-llm -p poot-serve \
         -E '{{ptx_selection}}'
     scripts/check-required-cases.py ptx
 
@@ -310,7 +310,7 @@ test-device-ptx:
 test-device-ptx-2gpu:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_PTX env POOT_REQUIRE_PTX_2GPU=1 \
-        {{nextest}} --profile device-ptx-2gpu -p poot-ptx-gpu -p poot-serve -E '({{ptx_multi_device_selection}}) & not test(/four_way/)'
+        {{nextest}} --profile device-ptx-2gpu -p poot-llm -p poot-serve -E '({{ptx_multi_device_selection}}) & not test(/four_way/)'
     scripts/check-required-cases.py ptx-2gpu
 
 # four-NVIDIA-GPU rows (POOT-1102: a world-four tensor-parallel decode against single-device decode, every
@@ -318,16 +318,16 @@ test-device-ptx-2gpu:
 test-device-ptx-4gpu:
     scripts/check-required-cases.py --self-test
     scripts/with-required-backend.sh POOT_REQUIRE_PTX env POOT_REQUIRE_PTX_4GPU=1 \
-        {{nextest}} --profile device-ptx-4gpu -p poot-ptx-gpu -E '({{ptx_multi_device_selection}}) & test(/four_way/)'
+        {{nextest}} --profile device-ptx-4gpu -p poot-llm -E '({{ptx_multi_device_selection}}) & test(/four_way/)'
     scripts/check-required-cases.py ptx-4gpu
 
 # Alias for the default GPU backend.
 test-gpu: test-device-wgpu
 
-# run both criterion benches: CPU decode (poot-graph-plan) and wgpu op dispatch (poot-gpu, wgpu device required)
+# run both criterion benches: CPU decode (poot-graph-plan) and wgpu op dispatch (poot-wgpu-device, wgpu device required)
 bench:
     cargo bench -p poot-graph-plan --bench decode
-    scripts/with-required-backend.sh POOT_REQUIRE_WGPU cargo bench -p poot-gpu --bench op_dispatch
+    scripts/with-required-backend.sh POOT_REQUIRE_WGPU cargo bench -p poot-wgpu-device --bench op_dispatch
 
 # ---- mutation sampling (card 538, R486-015) ----------------------------------
 

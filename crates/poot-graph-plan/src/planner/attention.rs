@@ -1,7 +1,15 @@
 //! Attention equation planning: one generated online-softmax kernel for every phase, its shape read from
 //! the equation and its lane count from the device.
 
-use super::*;
+use super::{
+    Binding, BodyLimits, Capability, Eqn, KernelRequest, OpKind, PlanError, Planned, ScratchId,
+    Sink, Source, value_ids,
+};
+use crate::graph_validation::flash_mask_per_head;
+use crate::planner::GraphTables;
+use crate::predicates::{attention_lanes, attention_splits};
+use crate::refusal::Site;
+use crate::types::ScratchDecl;
 use poot_graph_ir::{AttentionAttrs, KeyLayout, KvBound, MaskOperand};
 use poot_kernelgen::{
     AttentionCombineSpec, AttentionSchedule, AttentionSpec, KeyBound, KeyLayout as KernelKeyLayout,

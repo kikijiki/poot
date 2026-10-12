@@ -12,8 +12,11 @@ use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{geglu, gelu, gelu_erf, sigmoid, silu, softcap, softplus, swiglu};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Graph, Traced, ValueId};
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_ir::{BuilderError, Graph, Traced, ValueId};
+
+/// A unary activation as the ops module exports it.
+type ActivationFn = fn(&Builder, Traced) -> Result<Traced, BuilderError>;
+use poot_graph_plan::passes_without_target;
 use poot_tensor::HostTensor;
 
 /// The first-row value table: zeros, tiny, unit, mid, saturating and non-finite inputs.
@@ -115,16 +118,16 @@ fn eval_bits(g: &Graph, inputs: HashMap<ValueId, HostTensor>) -> Vec<u32> {
 }
 
 /// `eval(g)` and `eval(passes(g))` over `TABLE` for an elementwise activation.
-fn run_table(f: impl Fn(&Builder, Traced) -> Traced) -> (Vec<u32>, Vec<u32>) {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![TABLE.len()]));
-    let y = f(&b, x);
+fn run_table(f: impl Fn(&Builder, Traced) -> Result<Traced, BuilderError>) -> (Vec<u32>, Vec<u32>) {
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![TABLE.len()])).unwrap();
+    let y = f(&b, x).unwrap();
     let xi = x.id();
     let g = b.finish(y).unwrap();
     let input = || HashMap::from([(xi, HostTensor::f32(vec![TABLE.len()], TABLE.to_vec()))]);
     (
         eval_bits(&g, input()),
-        eval_bits(&optimize(&g).unwrap(), input()),
+        eval_bits(&passes_without_target(&g).unwrap(), input()),
     )
 }
 
@@ -141,16 +144,18 @@ fn mlp_inputs(gate: ValueId, up: ValueId) -> HashMap<ValueId, HostTensor> {
 
 /// `eval(g)` and `eval(passes(g))` of `act(gate) * up` (`swiglu` / `geglu` shape; `gelu_erf` has no GLU
 /// wrapper, so its MLP multiplies by hand).
-fn run_mlp(act: fn(&Builder, Traced) -> Traced) -> (Vec<u32>, Vec<u32>) {
-    let b = Builder::new();
-    let gate = b.constant("gate", TensorType::f32(vec![1, 1, 32]));
-    let up = b.constant("up", TensorType::f32(vec![1, 1, 32]));
-    let out = b.binary(poot_graph_ir::BinOp::Mul, act(&b, gate), up);
+fn run_mlp(act: ActivationFn) -> (Vec<u32>, Vec<u32>) {
+    let b = Builder::for_tests();
+    let gate = b.constant("gate", TensorType::f32(vec![1, 1, 32])).unwrap();
+    let up = b.constant("up", TensorType::f32(vec![1, 1, 32])).unwrap();
+    let out = b
+        .binary(poot_graph_ir::BinOp::Mul, act(&b, gate).unwrap(), up)
+        .unwrap();
     let (gi, ui) = (gate.id(), up.id());
     let g = b.finish(out).unwrap();
     (
         eval_bits(&g, mlp_inputs(gi, ui)),
-        eval_bits(&optimize(&g).unwrap(), mlp_inputs(gi, ui)),
+        eval_bits(&passes_without_target(&g).unwrap(), mlp_inputs(gi, ui)),
     )
 }
 
@@ -213,7 +218,7 @@ fn assert_tier2(name: &str, got: &[u32], want: &[u32], abs: f32, rel: f32) -> (f
 #[test]
 fn activation_compositions_match_the_pre_card_oracle() {
     for (name, f, want) in [
-        ("silu", silu as fn(&Builder, Traced) -> Traced, &SILU),
+        ("silu", silu as ActivationFn, &SILU),
         ("gelu", gelu, &GELU),
         ("sigmoid", sigmoid, &SIGMOID),
         ("softplus", softplus, &SOFTPLUS),
@@ -260,16 +265,16 @@ fn mlp_fixtures_match_the_pre_card_oracle() {
 fn glu_wrappers_equal_activation_times_up() {
     for (glu, act) in [
         (
-            swiglu as fn(&Builder, Traced, Traced) -> Traced,
-            silu as fn(&Builder, Traced) -> Traced,
+            swiglu as fn(&Builder, Traced, Traced) -> Result<Traced, BuilderError>,
+            silu as ActivationFn,
         ),
         (geglu, gelu),
     ] {
-        let b = Builder::new();
-        let gate = b.constant("gate", TensorType::f32(vec![1, 1, 32]));
-        let up = b.constant("up", TensorType::f32(vec![1, 1, 32]));
+        let b = Builder::for_tests();
+        let gate = b.constant("gate", TensorType::f32(vec![1, 1, 32])).unwrap();
+        let up = b.constant("up", TensorType::f32(vec![1, 1, 32])).unwrap();
         let (gi, ui) = (gate.id(), up.id());
-        let out = glu(&b, gate, up);
+        let out = glu(&b, gate, up).unwrap();
         let g = b.finish(out).unwrap();
         let want = run_mlp(act).0;
         assert_eq!(eval_bits(&g, mlp_inputs(gi, ui)), want);

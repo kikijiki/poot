@@ -88,8 +88,6 @@ pub const HSA_DEVICE_TYPE_GPU: u32 = 1;
 // publication go through MULTI (=0).
 
 pub const HSA_QUEUE_TYPE_MULTI: hsa_queue_type32_t = 0;
-#[cfg(test)]
-pub(crate) const HSA_QUEUE_TYPE_SINGLE: hsa_queue_type32_t = 1;
 pub const HSA_QUEUE_TYPE_COOPERATIVE: hsa_queue_type32_t = 2;
 
 // hsa.h queue feature bits
@@ -486,4 +484,11 @@ unsafe extern "C" {
         callback: hsa_executable_iterate_symbols_cb_t,
         data: *mut c_void,
     ) -> hsa_status_t;
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    pub(crate) const HSA_QUEUE_TYPE_SINGLE: hsa_queue_type32_t = 1;
 }

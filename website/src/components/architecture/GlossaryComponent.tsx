@@ -326,7 +326,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Model (trait)",
-    def: "What a model family implements: its ModelConfig, its WeightMap, and trace(phase, step shape), which builds the graph of one step. A shape or phase the family cannot trace is a typed TraceError.",
+    def: "What a model family implements: its ModelConfig, its WeightMap, and trace_into(phase, step shape, builder), which builds the graph of one step under the caller's TraceLimits. A shape or phase the family cannot trace, or a step that exceeds the limits (TraceError::Budget), is a typed TraceError.",
     see: "driver",
   },
   {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::runs::OwnerLiveness;
 
 /// The state DB is shared across worktrees, so concurrent writers need a busy timeout to avoid an
 /// instant "database is locked"; assert the connection carries it.

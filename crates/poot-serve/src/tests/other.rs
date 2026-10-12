@@ -278,7 +278,7 @@ fn resolve_forced_tools_handles_choice_modes() {
 
 #[test]
 fn deeply_nested_guided_json_is_rejected_at_the_door() {
-    // `guided_json`/`response_format` schemas are compiled by a recursive walk. serde_json caps nesting depth (~128) when the body is deserialized, so a deeply nested schema is a clean 400 before reaching the compiler (unlike the `guided_grammar` string parser, which has its own depth guard in poot_llm::grammar).
+    // `guided_json`/`response_format` schemas are compiled by a recursive walk. serde_json caps nesting depth (~128) when the body is deserialized, so a deeply nested schema is a clean 400 before reaching the compiler (unlike the `guided_grammar` string parser, which has its own depth guard in poot_text::grammar).
     let deep = format!("{}{}", "[".repeat(400), "]".repeat(400));
     let body = format!(r#"{{"prompt":"x","guided_json":{deep}}}"#);
     assert!(

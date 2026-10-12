@@ -25,11 +25,38 @@ pub enum BuilderCollection {
     Slots,
     Equations,
     NameBytes,
+    /// The outputs table (result, witnesses, exports, carried-state pairs).
+    Outputs,
 }
 
-/// A typed failure while staging, validating, or committing a graph fragment.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum BuilderAppendError {
+/// A typed failure of a tracer primitive, an `ops` composition, or a staged append: the one error the
+/// whole tracer path returns instead of panicking.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BuilderError {
+    /// A request would exceed the caller's [`crate::TraceLimits`]; nothing was allocated or appended.
+    #[error(transparent)]
+    Budget(#[from] crate::budget::TraceBudgetExceeded),
+    #[error("handle {value} was minted by another Builder and cannot be used with this one")]
+    ForeignHandle { value: ValueId },
+    #[error("literal {value} does not fit an I32 literal")]
+    LiteralOutOfRange { value: usize },
+    #[error("value {value} is not in the builder's value table")]
+    UnknownValue { value: ValueId },
+    #[error("input {name:?} declares a range but is {dtype}; a range bounds I32 words")]
+    RangeNotI32 { name: String, dtype: DType },
+    #[error(
+        "duplicate tag {tag:?} for slot {slot:?}: a per-name binder would bind both ids from one buffer"
+    )]
+    DuplicateSlotTag { slot: Slot, tag: String },
+    /// A composition's own precondition on its operands or parameters does not hold.
+    #[error("{operation}: {requirement}")]
+    Requirement {
+        operation: &'static str,
+        requirement: Requirement,
+    },
+    /// The finished graph is not well formed, or does not carry what a resumed graph carried.
+    #[error("the finished graph is invalid: {0}")]
+    Invalid(Box<crate::graph::EditError>),
     #[error("append plan belongs to a different Builder")]
     ForeignBuilder,
     #[error("{namespace:?} name must not be empty")]
@@ -115,6 +142,58 @@ pub enum BuilderAppendError {
         expected: TensorType,
         actual: TensorType,
     },
+}
+
+/// A precondition a composition in [`crate::ops`] states about its operands or parameters.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Requirement {
+    #[error("operand dtype must be {expected}, found {found}")]
+    Dtype { expected: DType, found: DType },
+    #[error("operand shape must end in [low, high], found {found:?}")]
+    TrailingWordPair { found: Vec<usize> },
+    #[error("operand must have at least {at_least} axes, found shape {found:?}")]
+    MinRank { at_least: usize, found: Vec<usize> },
+    #[error("operand must have exactly {expected} axes, found shape {found:?}")]
+    Rank { expected: usize, found: Vec<usize> },
+    #[error("operand axis {axis} must be {expected}, found shape {found:?}")]
+    Axis {
+        axis: usize,
+        expected: usize,
+        found: Vec<usize>,
+    },
+    #[error("operand shapes must match, found {left:?} and {right:?}")]
+    ShapesMatch { left: Vec<usize>, right: Vec<usize> },
+    #[error("needs at least one expert")]
+    NoExperts,
+    #[error("needs 1 <= k <= E, got k={k}, E={experts}")]
+    TopKRange { k: usize, experts: usize },
+    #[error("is the decode (one token) path, got {tokens} tokens")]
+    DecodeTokens { tokens: usize },
+    #[error("last two axes must be square, found shape {found:?}")]
+    SquareTrailingAxes { found: Vec<usize> },
+    #[error("block size {size} must be a power of two")]
+    PowerOfTwo { size: usize },
+    #[error("{value} must be a multiple of {of}")]
+    Multiple { value: usize, of: usize },
+    #[error("needs one entry per section ({expected}), got {found}")]
+    SectionCount { expected: usize, found: usize },
+    #[error("section widths must sum to {expected}, got {found}")]
+    SectionWidths { expected: usize, found: usize },
+    #[error("window must be {expected:?}, found {found:?}")]
+    WindowShape {
+        expected: Vec<usize>,
+        found: Vec<usize>,
+    },
+    #[error("{what} must be at least 1")]
+    AtLeastOne { what: &'static str },
+    #[error("operand must be a rank >= 1 tensor")]
+    Scalar,
+}
+
+impl From<crate::graph::EditError> for BuilderError {
+    fn from(error: crate::graph::EditError) -> Self {
+        BuilderError::Invalid(Box::new(error))
+    }
 }
 
 /// A structural or binding-table failure of a graph draft, reported by [`crate::GraphEdit::commit`] as

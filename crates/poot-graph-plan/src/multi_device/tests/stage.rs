@@ -21,12 +21,14 @@ fn device(id: u32) -> DeviceId {
 /// A two-stage split with one crossing value: `t0 = x + x` over `[2, 3]` F32 (6 elements, 24 bytes)
 /// is produced in stage 0 and multiplied in stage 1.
 fn two_stage_split() -> (Vec<crate::BoundaryDescriptor>, Vec<DeviceId>) {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![2, 3]));
-    let t0 = b.binary(BinOp::Add, x, x);
-    let out = b.binary(BinOp::Mul, t0, t0);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(Slot::Activation, TensorType::f32(vec![2, 3]))
+        .unwrap();
+    let t0 = b.binary(BinOp::Add, x, x).unwrap();
+    let out = b.binary(BinOp::Mul, t0, t0).unwrap();
     let graph = b.finish(out).unwrap();
-    let split = crate::test_support::split_before(&graph, &[1]).expect("the graph splits");
+    let split = crate::unit_helpers::split_before(&graph, &[1]).expect("the graph splits");
     assert_eq!(split.boundaries.len(), 1, "one value crosses this cut");
     (split.boundaries, vec![device(0), device(1)])
 }
@@ -34,14 +36,16 @@ fn two_stage_split() -> (Vec<crate::BoundaryDescriptor>, Vec<DeviceId>) {
 /// A three-stage split with one fan-out value: stage 0's `t0` is read by stage 1 (24 bytes) and
 /// directly by stage 2, and stage 1's BF16 `t1` (12 bytes) is read by stage 2.
 fn three_stage_split() -> Vec<crate::BoundaryDescriptor> {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![2, 3]));
-    let t0 = b.binary(BinOp::Add, x, x);
-    let t1 = b.cast(t0, poot_tensor::DType::BF16);
-    let back = b.cast(t1, poot_tensor::DType::F32);
-    let out = b.binary(BinOp::Add, back, t0);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(Slot::Activation, TensorType::f32(vec![2, 3]))
+        .unwrap();
+    let t0 = b.binary(BinOp::Add, x, x).unwrap();
+    let t1 = b.cast(t0, poot_tensor::DType::BF16).unwrap();
+    let back = b.cast(t1, poot_tensor::DType::F32).unwrap();
+    let out = b.binary(BinOp::Add, back, t0).unwrap();
     let graph = b.finish(out).unwrap();
-    let split = crate::test_support::split_before(&graph, &[1, 2]).expect("the graph splits");
+    let split = crate::unit_helpers::split_before(&graph, &[1, 2]).expect("the graph splits");
     assert_eq!(
         split
             .boundaries

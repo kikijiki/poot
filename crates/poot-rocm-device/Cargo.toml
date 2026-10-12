@@ -1,0 +1,41 @@
+[package]
+name = "poot-rocm-device"
+description = "ROCm/HSA device backend: the poot-executor Device implementation for the AMD Strix Halo iGPU (Radeon 8060S, gfx1151) via raw HSA"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-codegen.workspace = true
+poot-executor.workspace = true
+poot-graph-plan.workspace = true
+poot-target.workspace = true
+# `RocmDevice::copy`'s one generated copy kernel is the committed `assets/copy_words.kir.json`
+# fixture (Card 548), loaded at construction through `ImportedKernel::CopyWords` (card
+# 559) - never a parser or DSL, the fixture itself is a real `#[kernel]` fn compiled through `pootc`
+# (`just regen-kernel-assets`).
+poot-kernel-ir = { workspace = true, features = ["serde"] }
+poot-rocm-runtime.workspace = true
+poot-runtime-common.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+poot-kernel-ir = { workspace = true, features = ["test-support"] }
+poot-eval = { workspace = true, features = ["test-support"] }
+poot-executor-parity.workspace = true
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+poot-graph-plan = { workspace = true, features = ["test-support"] }
+poot-kernelgen.workspace = true
+poot-load = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
+poot-tensor.workspace = true
+poot-test-util.workspace = true
+serde_json.workspace = true
+object = { workspace = true, features = ["write"] }
+
+[lints]
+workspace = true

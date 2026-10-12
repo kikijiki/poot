@@ -33,6 +33,7 @@ use super::linear::{Weight, WeightError, linear};
 use super::norm::NormParams;
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
+use crate::model::TraceError;
 
 /// The epsilon added to the sum of squares of the L2 norm of a query or key head.
 const L2_EPS: f32 = 1e-6;
@@ -138,23 +139,23 @@ impl KdaWeights {
 }
 
 /// `x / sqrt(sum(x^2) + eps)` over the last axis.
-fn l2_norm_last(b: &Builder, x: Traced) -> Traced {
-    let last = b.aval(x).shape.len() - 1;
-    let squares = b.reduce(RedOp::Sum, b.binary(BinOp::Mul, x, x), last, true);
+fn l2_norm_last(b: &Builder, x: Traced) -> Result<Traced, TraceError> {
+    let last = b.aval(x)?.shape.len() - 1;
+    let squares = b.reduce(RedOp::Sum, b.binary(BinOp::Mul, x, x)?, last, true)?;
     let norm = b.unary(
         UnOp::Sqrt,
-        b.binary_scalar(BinOp::Add, squares, Scalar::F32(L2_EPS)),
-    );
-    b.binary(BinOp::Div, x, norm)
+        b.binary_scalar(BinOp::Add, squares, Scalar::F32(L2_EPS))?,
+    )?;
+    Ok(b.binary(BinOp::Div, x, norm)?)
 }
 
 /// `[rows, tokens, heads * d]` as `[rows, heads, tokens, d]`.
-fn heads_first(b: &Builder, y: Traced, heads: usize, d: usize) -> Traced {
-    let shape = b.aval(y).shape;
-    b.transpose(
-        b.reshape(y, vec![shape[0], shape[1], heads, d]),
+fn heads_first(b: &Builder, y: Traced, heads: usize, d: usize) -> Result<Traced, TraceError> {
+    let shape = b.aval(y)?.shape;
+    Ok(b.transpose(
+        b.reshape(y, vec![shape[0], shape[1], heads, d])?,
         vec![0, 2, 1, 3],
-    )
+    )?)
 }
 
 /// The mixer over `x` (`[rows, tokens, width]`) at layer `layer`: `[rows, tokens, width]`. The
@@ -167,7 +168,7 @@ pub fn kda(
     x: Traced,
     w: &KdaWeights,
     p: &KdaParams,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, tokens) = (shape.rows.get(), shape.tokens.get());
     let (h, d) = (p.heads, p.head_dim);
@@ -177,56 +178,59 @@ pub fn kda(
             b,
             step,
             &format!("kda.l{layer}.{name}"),
-            linear(b, x, proj, None),
+            linear(b, x, proj, None)?,
             conv,
             &p.conv,
-        );
-        heads_first(b, ops::silu(b, conv), h, d)
+        )?;
+        heads_first(b, ops::silu(b, conv)?, h, d)
     };
-    let q = l2_norm_last(b, mixed(&w.q, &w.conv_q, "conv_q"));
-    let k = l2_norm_last(b, mixed(&w.k, &w.conv_k, "conv_k"));
-    let v = mixed(&w.v, &w.conv_v, "conv_v");
-    let q = b.binary_scalar(BinOp::Mul, q, Scalar::F32(1.0 / (d as f32).sqrt()));
+    let q = l2_norm_last(b, mixed(&w.q, &w.conv_q, "conv_q")?)?;
+    let k = l2_norm_last(b, mixed(&w.k, &w.conv_k, "conv_k")?)?;
+    let v = mixed(&w.v, &w.conv_v, "conv_v")?;
+    let q = b.binary_scalar(BinOp::Mul, q, Scalar::F32(1.0 / (d as f32).sqrt()))?;
 
     // The log forget gate per head and key channel, and the decay it gives.
-    let f = linear(b, linear(b, x, &w.f_a, None), &w.f_b, None);
-    let f = heads_first(b, b.binary(BinOp::Add, f, w.dt_bias.declare_f32(b)), h, d);
-    let rate = b.reshape(b.unary(UnOp::Exp, w.a_log.declare_f32(b)), vec![1, h, 1, 1]);
-    let gate = ops::sigmoid(b, b.binary(BinOp::Mul, rate, f));
+    let f = linear(b, linear(b, x, &w.f_a, None)?, &w.f_b, None)?;
+    let f = heads_first(b, b.binary(BinOp::Add, f, w.dt_bias.declare_f32(b)?)?, h, d)?;
+    let rate = b.reshape(
+        b.unary(UnOp::Exp, w.a_log.declare_f32(b)?)?,
+        vec![1, h, 1, 1],
+    )?;
+    let gate = ops::sigmoid(b, b.binary(BinOp::Mul, rate, f)?)?;
     let decay = b.unary(
         UnOp::Exp,
-        b.binary_scalar(BinOp::Mul, gate, Scalar::F32(p.gate_lower_bound)),
-    ); // [rows, heads, tokens, d]
-    let beta = heads_first(b, ops::sigmoid(b, linear(b, x, &w.beta, None)), h, 1);
+        b.binary_scalar(BinOp::Mul, gate, Scalar::F32(p.gate_lower_bound))?,
+    )?; // [rows, heads, tokens, d]
+    let beta = heads_first(b, ops::sigmoid(b, linear(b, x, &w.beta, None)?)?, h, 1)?;
 
-    let state = step.recurrent_state(b, &format!("kda.l{layer}.state"), DType::F32, &[h, d, d]);
+    let state = step.recurrent_state(b, &format!("kda.l{layer}.state"), DType::F32, &[h, d, d])?;
     let (mut s, mut outs) = (state.current(), Vec::with_capacity(tokens));
     for t in 0..tokens {
-        let at = |y: Traced| b.slice(y, 2, t, t + 1); // [rows, heads, 1, ..]
-        let (q, k, v) = (at(q), at(k), at(v));
+        let at = |y: Traced| Ok::<_, TraceError>(b.slice(y, 2, t, t + 1)?); // [rows, heads, 1, ..]
+        let (q, k, v) = (at(q)?, at(k)?, at(v)?);
         // Row `i` of the state, the key channel, decays by `exp(g[i])`.
-        let decay = b.transpose(at(decay), vec![0, 1, 3, 2]); // [rows, heads, d, 1]
-        s = b.binary(BinOp::Mul, s, decay);
-        let read = b.matmul(k, s); // [rows, heads, 1, d]
-        let delta = b.binary(BinOp::Mul, at(beta), b.binary(BinOp::Sub, v, read));
+        let decay = b.transpose(at(decay)?, vec![0, 1, 3, 2])?; // [rows, heads, d, 1]
+        s = b.binary(BinOp::Mul, s, decay)?;
+        let read = b.matmul(k, s)?; // [rows, heads, 1, d]
+        let delta = b.binary(BinOp::Mul, at(beta)?, b.binary(BinOp::Sub, v, read)?)?;
         s = b.binary(
             BinOp::Add,
             s,
-            b.matmul(b.transpose(k, vec![0, 1, 3, 2]), delta),
-        );
-        outs.push(b.matmul(q, s));
+            b.matmul(b.transpose(k, vec![0, 1, 3, 2])?, delta)?,
+        )?;
+        outs.push(b.matmul(q, s)?);
     }
-    step.carry_recurrent(b, state, s);
+    step.carry_recurrent(b, state, s)?;
     let o = if tokens == 1 {
         outs[0]
     } else {
-        b.concat(2, &outs)
+        b.concat(2, &outs)?
     };
 
-    let o = ops::rmsnorm(b, o, w.o_norm.declare_f32(b), p.norm.eps());
-    let g = linear(b, linear(b, x, &w.g_a, None), &w.g_b, None);
-    let o = b.binary(BinOp::Mul, o, ops::sigmoid(b, heads_first(b, g, h, d)));
-    let o = b.reshape(b.transpose(o, vec![0, 2, 1, 3]), vec![rows, tokens, h * d]);
+    let o = ops::rmsnorm(b, o, w.o_norm.declare_f32(b)?, p.norm.eps())?;
+    let g = linear(b, linear(b, x, &w.g_a, None)?, &w.g_b, None)?;
+    let o = b.binary(BinOp::Mul, o, ops::sigmoid(b, heads_first(b, g, h, d)?)?)?;
+    let o = b.reshape(b.transpose(o, vec![0, 2, 1, 3])?, vec![rows, tokens, h * d])?;
     linear(b, o, &w.out, None)
 }
 
@@ -296,10 +300,12 @@ mod tests {
         let p = params();
         let w = KdaWeights::new(&fx.map(), 0, WIDTH, &p).unwrap();
         let tokens = x.len() / WIDTH;
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All));
-        let xs = b.constant("x", TensorType::f32(vec![1, tokens, WIDTH]));
-        let y = kda(&b, &step, 0, xs, &w, &p);
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All)).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, tokens, WIDTH]))
+            .unwrap();
+        let y = kda(&b, &step, 0, xs, &w, &p).unwrap();
         let g = step.finish(b, y).unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()
@@ -504,14 +510,16 @@ mod tests {
 
         let p = params();
         let w = KdaWeights::new(&fx.map(), 0, WIDTH, &p).unwrap();
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let shape = crate::model::StepShape {
             rows: std::num::NonZeroUsize::new(2).unwrap(),
             ..step_shape(TOKENS, CAP, LogitRows::All)
         };
-        let step = Step::new(&b, shape);
-        let xs = b.constant("x", TensorType::f32(vec![2, TOKENS, WIDTH]));
-        let y = kda(&b, &step, 0, xs, &w, &p);
+        let step = Step::new(&b, shape).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![2, TOKENS, WIDTH]))
+            .unwrap();
+        let y = kda(&b, &step, 0, xs, &w, &p).unwrap();
         let g = step.finish(b, y).unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()

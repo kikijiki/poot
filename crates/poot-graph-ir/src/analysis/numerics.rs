@@ -22,7 +22,7 @@
 //! declaration against the ops the pass produced: a pass that reassociates while declaring `Exact` is
 //! refused instead of publishing a tolerance that is too tight.
 
-use super::*;
+use super::{Graph, OpKind, ValueId};
 use crate::types::{DType, DTypeClass, DTypeClassExt};
 
 /// Device scheduling behavior (ADR-0101 decision 2), ordered by severity. This describes comparison
@@ -49,6 +49,7 @@ impl NumericsProperty {
     }
 
     /// The comparison class a program whose strongest property is `self` publishes.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn tier2_class(self) -> Tier2Class {
         match self {
             NumericsProperty::Exact => Tier2Class::BitExact,
@@ -64,6 +65,7 @@ impl NumericsProperty {
 /// sized by this class; [`Tier2Class::BitExact`] is the tier-1 bit-for-bit comparison, reachable only
 /// for a graph whose float arithmetic a device never executes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum Tier2Class {
     /// The graph runs no float arithmetic a device executes: compare every element bit for bit.
     BitExact,

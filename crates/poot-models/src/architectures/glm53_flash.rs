@@ -26,12 +26,12 @@ use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
 
-use crate::chat::ChatFormat;
 use crate::components::standard::{Step, check_mtp_step};
 use crate::model::{
     FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape, TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 mod config;
 mod mtp;
@@ -93,24 +93,23 @@ impl Model for Glm53Flash {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_mtp_step(FAMILY, phase, shape, p.max_positions)?;
         if let Some(moe) = &p.moe {
             crate::components::moe::check_step(FAMILY, shape, moe)?;
         }
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = match phase {
             Phase::Mtp => {
                 self.tower
-                    .trace_mtp(&b, &step, p)
+                    .trace_mtp(&b, &step, p)?
                     .ok_or(TraceError::PhaseUnsupported {
                         family: FAMILY,
                         phase,
                     })?
             }
-            _ => self.tower.trace(&b, &step, p),
+            _ => self.tower.trace(&b, &step, p)?,
         };
         Ok(step.finish(b, logits)?)
     }
@@ -230,12 +229,12 @@ pub(crate) enum Stored {
 /// Every tensor of a checkpoint of `config`'s dimensions: `(name, shape, how it is stored)`.
 pub(crate) fn tensors(config: &serde_json::Value) -> Vec<(String, Vec<usize>, Stored)> {
     let text = &config["text_config"];
-    let n = |f: &str| text[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(text, f);
     let (vocab, w, layers) = (n("vocab_size"), n("hidden_size"), n("num_hidden_layers"));
     let hc = n("hc_mult");
     let mix = (2 + hc) * hc;
     let linear = &text["linear_attn_config"];
-    let kn = |f: &str| linear[f].as_u64().unwrap() as usize;
+    let kn = |f: &str| crate::registry::Fixture::count(linear, f);
     let (kda_heads, kda_dim, kernel) = (
         kn("num_heads"),
         kn("head_dim"),

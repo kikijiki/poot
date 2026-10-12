@@ -10,15 +10,16 @@ use poot_target::{AmdArch, Backend, TargetId};
 use poot_tensor::DType;
 use poot_test_util::device_caps::default_caps_for;
 
-use crate::CollectiveKind;
 use crate::multi_device::{AccountingError, PlacementError};
-use crate::planner::per_eqn_plans_inside_compile;
+use crate::planner::test_only::per_eqn_plans_inside_compile;
+use crate::production_plan::Submission;
 use crate::staged::{
-    DevicePlacement, ExpertPlacement, Partition, StagedCompileError, TargetSet, compile_staged,
+    DeviceId, DevicePlacement, ExpertPlacement, Partition, StageId, StagedCompileError,
+    StagedProgram, TargetSet, compile_staged,
 };
 use crate::test_support::gpu_caps;
-use crate::test_support::{LAYERS, qwen2_decode};
-use crate::{Capability, CompileLimits, CompileOptions, DeviceId, StageId, Submission, Target};
+use crate::unit_helpers::{LAYERS, layered_decode};
+use crate::{Capability, CollectiveKind, CompileLimits, CompileOptions, Target};
 
 const GIB: u64 = 1 << 30;
 
@@ -59,27 +60,27 @@ fn targets(backend: Backend, budgets: &[u64]) -> TargetSet {
 /// bigger weight and layer 2 reads both `t0` and layer 1's `t1`. Every device holds a different
 /// amount: 16, 512 and 128 weight bytes.
 fn three_device_fixture() -> Graph {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
+    let b = Builder::for_tests();
+    let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
     let (t0, t1);
     {
         let _layer = b.layer_scope(0);
-        let w0 = b.constant("w0", TensorType::f32(vec![4]));
-        t0 = b.binary(BinOp::Mul, x, w0);
+        let w0 = b.constant("w0", TensorType::f32(vec![4])).unwrap();
+        t0 = b.binary(BinOp::Mul, x, w0).unwrap();
     }
     {
         let _layer = b.layer_scope(1);
-        let w1 = b.constant("w1", TensorType::f32(vec![4, 32]));
-        let row = b.reshape(t0, vec![1, 4]);
-        t1 = b.matmul(row, w1);
+        let w1 = b.constant("w1", TensorType::f32(vec![4, 32])).unwrap();
+        let row = b.reshape(t0, vec![1, 4]).unwrap();
+        t1 = b.matmul(row, w1).unwrap();
     }
     let out;
     {
         let _layer = b.layer_scope(2);
-        let w2 = b.constant("w2", TensorType::f32(vec![1, 32]));
-        let total = b.reduce(RedOp::Sum, t0, 0, true);
-        let shifted = b.binary(BinOp::Add, t1, w2);
-        out = b.binary(BinOp::Mul, shifted, total);
+        let w2 = b.constant("w2", TensorType::f32(vec![1, 32])).unwrap();
+        let total = b.reduce(RedOp::Sum, t0, 0, true).unwrap();
+        let shifted = b.binary(BinOp::Add, t1, w2).unwrap();
+        out = b.binary(BinOp::Mul, shifted, total).unwrap();
     }
     b.finish(out).unwrap()
 }
@@ -88,19 +89,19 @@ fn compile_on(
     graph: &Graph,
     targets: &TargetSet,
     partition: &Partition,
-) -> Result<crate::StagedProgram, StagedCompileError> {
+) -> Result<StagedProgram, StagedCompileError> {
     compile_staged(graph, targets, partition, &options())
 }
 
-/// SC-001: qwen2's decode step cut after layer 0 on two PTX devices, compiled with no device, has two
+/// SC-001: a layered decode step cut after layer 0 on two PTX devices, compiled with no device, has two
 /// stages, one `PointToPoint` row per crossing value and no link: every stage input a boundary names is
 /// bound by exactly one transfer, whose row is in the plan.
 ///
 /// Mutation: make `plan_stage_communication` skip its second row. The boundary that row carried is
 /// bound by neither a link nor a row, and `compile_staged` names it (`UnboundBoundary`).
 #[test]
-fn a_qwen2_pipeline_on_two_ptx_devices_binds_every_boundary_by_a_row() {
-    let graph = qwen2_decode(LAYERS);
+fn a_layered_pipeline_on_two_ptx_devices_binds_every_boundary_by_a_row() {
+    let graph = layered_decode(LAYERS);
     let program = compile_on(&graph, &targets(Backend::Nvptx, &[GIB, GIB]), &pipeline(2))
         .unwrap_or_else(|error| panic!("a 2-device PTX pipeline compiles host-only: {error}"));
 
@@ -109,7 +110,7 @@ fn a_qwen2_pipeline_on_two_ptx_devices_binds_every_boundary_by_a_row() {
     assert_eq!(stages[0].1, DeviceId(0));
     assert_eq!(stages[1].1, DeviceId(1));
 
-    let boundaries = crate::test_support::split_after_layers(&graph, &[0])
+    let boundaries = crate::unit_helpers::split_after_layers(&graph, &[0])
         .expect("the graph splits after layer 0")
         .boundaries;
     assert!(!boundaries.is_empty(), "the cut crosses values");
@@ -149,7 +150,7 @@ fn a_qwen2_pipeline_on_two_ptx_devices_binds_every_boundary_by_a_row() {
 /// wgpu and ROCm and the zero-work assertion goes red.
 #[test]
 fn a_two_device_pipeline_on_wgpu_or_rocm_is_refused_before_any_stage_is_compiled() {
-    let graph = qwen2_decode(LAYERS);
+    let graph = layered_decode(LAYERS);
     let before = per_eqn_plans_inside_compile();
     compile_on(&graph, &targets(Backend::Nvptx, &[GIB, GIB]), &pipeline(2))
         .expect("PTX carries the boundary");
@@ -188,7 +189,7 @@ fn a_two_device_pipeline_on_wgpu_or_rocm_is_refused_before_any_stage_is_compiled
 /// device crossing and not the cut.
 #[test]
 fn the_same_cut_on_one_wgpu_device_compiles() {
-    let graph = qwen2_decode(LAYERS);
+    let graph = layered_decode(LAYERS);
     let partition = Partition {
         experts: ExpertPlacement::AllResident,
         devices: DevicePlacement::Pipeline {
@@ -292,21 +293,25 @@ fn a_multi_consumer_boundary_has_a_complete_map_and_an_exact_per_device_footprin
 /// again and this goes red with a `LinkSchema` refusal.
 #[test]
 fn an_i32_boundary_read_only_as_an_index_crosses_devices() {
-    let b = Builder::new();
-    let token = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
-    let table = b.constant("table", TensorType::f32(vec![8, 4]));
+    let b = Builder::for_tests();
+    let token = b
+        .slot(Slot::Token, TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let table = b.constant("table", TensorType::f32(vec![8, 4])).unwrap();
     let (ids, rows);
     {
         let _layer = b.layer_scope(0);
-        ids = b.binary(BinOp::Add, token, token);
-        rows = b.gather(table, 0, ids);
+        ids = b.binary(BinOp::Add, token, token).unwrap();
+        rows = b.gather(table, 0, ids).unwrap();
     }
-    let k_in = b.state_input("k", TensorType::f32(vec![4, 4]), StateRole::Recurrent);
+    let k_in = b
+        .state_input("k", TensorType::f32(vec![4, 4]), StateRole::Recurrent)
+        .unwrap();
     let (k_out, out);
     {
         let _layer = b.layer_scope(1);
-        k_out = b.binary(BinOp::Add, k_in, rows);
-        out = b.gather(table, 0, ids);
+        k_out = b.binary(BinOp::Add, k_in, rows).unwrap();
+        out = b.gather(table, 0, ids).unwrap();
     }
     let graph = b
         .finish(poot_graph_ir::Outputs::new(out).with_state(&[(k_in, k_out)]))
@@ -398,19 +403,19 @@ fn a_device_with_an_unknown_budget_is_refused() {
 #[test]
 fn one_store_key_naming_two_different_tensors_is_a_duplicate_owner() {
     let build = |second: Vec<usize>| {
-        let b = Builder::new();
-        let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
+        let b = Builder::for_tests();
+        let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
         let hidden;
         {
             let _layer = b.layer_scope(0);
-            let w = b.constant("w", TensorType::f32(vec![4]));
-            hidden = b.binary(BinOp::Mul, x, w);
+            let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
+            hidden = b.binary(BinOp::Mul, x, w).unwrap();
         }
         let out;
         {
             let _layer = b.layer_scope(1);
-            let w = b.constant("w", TensorType::f32(second));
-            out = b.binary(BinOp::Add, hidden, w);
+            let w = b.constant("w", TensorType::f32(second)).unwrap();
+            out = b.binary(BinOp::Add, hidden, w).unwrap();
         }
         b.finish(out).unwrap()
     };
@@ -431,14 +436,14 @@ fn one_store_key_naming_two_different_tensors_is_a_duplicate_owner() {
     }
 }
 
-/// The derivation builds no `MissingOwner` or `OffStage` placement: every weight of a real model, cut
+/// The derivation builds no `MissingOwner` or `OffStage` placement: every weight of a layered decode graph, cut
 /// over three devices, is placed by `place_weights` and admitted, and each device's footprint holds the
 /// weights its own stages read. These two variants are structural invariants of that derivation, not
 /// `compile_staged` refusals; they are checked, with placements the derivation would never build, at
 /// `validate_stage_placement` (`multi_device_stage_placement_rejects_an_owner_placed_off_its_stage`).
 #[test]
-fn the_weight_derivation_of_a_real_model_places_every_owner_on_its_stages() {
-    let graph = qwen2_decode(LAYERS);
+fn the_weight_derivation_of_a_layered_decode_places_every_owner_on_its_stages() {
+    let graph = layered_decode(LAYERS);
     let program = compile_on(
         &graph,
         &targets(Backend::Nvptx, &[GIB, GIB, GIB]),

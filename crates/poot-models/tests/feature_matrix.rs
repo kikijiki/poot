@@ -28,7 +28,7 @@ mod corpus;
 mod targets;
 
 use corpus::{CAP, Fixtured, fixtured};
-use poot_test_util::graph_fixtures::gpu_caps_mut;
+use poot_graph_plan::test_support::gpu_caps_mut;
 use targets::{RefTarget, reference_targets};
 
 const BEGIN: &str = "<!-- generated:feature-matrix:begin -->";
@@ -192,8 +192,8 @@ fn format_name(format: WeightFormat) -> String {
 
 /// The reference dense model the weight formats are bound into: a one-layer Qwen2 checkpoint whose
 /// projection widths (256, and 128 for the key and value heads) every format's block admits.
-fn reference_dense() -> poot_executor_parity::dense::Dense {
-    use poot_executor_parity::dense::{Dense, Family};
+fn reference_dense() -> poot_models::test_support::dense::Dense {
+    use poot_models::test_support::dense::{Dense, Family};
     Dense::new(Family::Qwen2)
         .vocab(32)
         .dims(256, 256, 1)
@@ -204,10 +204,10 @@ fn reference_dense() -> poot_executor_parity::dense::Dense {
 }
 
 /// The reference dense checkpoint with every projection stored as a `format` payload from
-/// `poot_test_util::packed::random_payload` (`None`: left as the dense BF16 the checkpoint holds), traced
+/// `poot_quant::test_support::packed::random_payload` (`None`: left as the dense BF16 the checkpoint holds), traced
 /// for decode and prefill.
 fn format_graphs(format: Option<WeightFormat>) -> Vec<(&'static str, Graph)> {
-    use poot_executor_parity::weight_map::Projections;
+    use poot_models::test_support::weight_map::Projections;
     let dense = reference_dense();
     let base = dense.store(Projections::Bf16, poot_tensor::DType::F32, None);
     let mut store = WeightStore::builder();
@@ -215,7 +215,7 @@ fn format_graphs(format: Option<WeightFormat>) -> Vec<(&'static str, Graph)> {
         let entry = match format {
             Some(format) if key.as_str().ends_with("_proj.weight") => {
                 let shape = entry.shape();
-                WeightEntry::Packed(Arc::new(poot_test_util::packed::random_payload(
+                WeightEntry::Packed(Arc::new(poot_quant::test_support::packed::random_payload(
                     format,
                     [shape[0], shape[1]],
                     seed as u64 + 1,
@@ -241,7 +241,8 @@ fn format_graphs(format: Option<WeightFormat>) -> Vec<(&'static str, Graph)> {
         model
             .trace(
                 phase,
-                poot_executor_parity::dense::step(1, tokens, capacity, LogitRows::Last),
+                poot_models::test_support::dense::step(1, tokens, capacity, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap_or_else(|e| panic!("{format:?}: {e}"))
     };

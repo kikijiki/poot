@@ -6,13 +6,13 @@
     reason = "compiled once per test binary, each using a different subset"
 )]
 
-use poot_executor_parity::weight_map::MappedModel;
+use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_graph_ir::{Graph, Slot, SlotKey};
+use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::HostTensor;
-use poot_test_util::weight_map_oracle::eval_mapped;
 
 /// `Slot::Token` and `Slot::Pos` of a `[rows, tokens]` step.
-pub fn token_pos(
+pub(crate) fn token_pos(
     rows: usize,
     tokens: usize,
     ids: &[i32],
@@ -31,7 +31,7 @@ pub fn token_pos(
 }
 
 /// The two slot maps of a paged step.
-pub fn slot_maps(
+pub(crate) fn slot_maps(
     rows: usize,
     capacity: usize,
     pool_slots: usize,
@@ -51,14 +51,14 @@ pub fn slot_maps(
 }
 
 /// Zero carried state, in `g.state` order.
-pub fn zero_state(g: &Graph) -> Vec<HostTensor> {
+pub(crate) fn zero_state(g: &Graph) -> Vec<HostTensor> {
     g.state()
         .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
         .collect()
 }
 
 /// One CPU-oracle step of `g` over `m`'s weights: its logits and the carried state.
-pub fn step(
+pub(crate) fn step(
     m: &MappedModel,
     g: &Graph,
     slots: &[(SlotKey, HostTensor)],
@@ -71,9 +71,13 @@ pub fn step(
 /// prompt leaves are the same whether it is prefilled in one forward (a) or decoded token by token
 /// over the same capacity (b), within `tol` (both are f32 CPU eval of the same ops in a different
 /// composition order). `layers` is the model's layer count: the caches are K and V per layer.
-pub fn assert_prefill_fills_cache_like_token_by_token(m: &MappedModel, layers: usize, tol: f32) {
-    use poot_executor_parity::dense::step as step_shape;
+pub(crate) fn assert_prefill_fills_cache_like_token_by_token(
+    m: &MappedModel,
+    layers: usize,
+    tol: f32,
+) {
     use poot_models::model::{LogitRows, Phase};
+    use poot_models::test_support::dense::step as step_shape;
 
     let n = 5usize; // prompt length
     let cap = n + 3; // a few free slots, as a real generation would leave
@@ -83,7 +87,11 @@ pub fn assert_prefill_fills_cache_like_token_by_token(m: &MappedModel, layers: u
     // (b) token-by-token decode, replayed for pos 0..N.
     let gd = m
         .model
-        .trace(Phase::Decode, step_shape(1, 1, cap, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step_shape(1, 1, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let mut tbt_caches = zero_state(&gd);
     let mut tbt_last_logits = None;
@@ -98,7 +106,11 @@ pub fn assert_prefill_fills_cache_like_token_by_token(m: &MappedModel, layers: u
     // (a) batched prefill: one forward fills slots [0,N).
     let gp = m
         .model
-        .trace(Phase::Prefill, step_shape(1, n, cap, LogitRows::Last))
+        .trace(
+            Phase::Prefill,
+            step_shape(1, n, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let positions: Vec<i32> = (0..n as i32).collect();
     let (pf_logits, pf_caches) = step(

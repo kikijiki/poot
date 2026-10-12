@@ -77,7 +77,7 @@ pub(crate) fn value_i32_words(
     env: &ValueTable<Option<Value>>,
 ) -> Result<(Cow<'_, [i32]>, Vec<usize>), EvalError> {
     match env_value(env, id)? {
-        Value::Owner(ExactValue::I32(view)) => {
+        Value::Exact(ExactValue::I32(view)) => {
             Ok((Cow::Borrowed(view.i32_words()), view.shape().to_vec()))
         }
         Value::Host(tensor) => Ok((host_i32_words(tensor, id)?, tensor.shape().to_vec())),
@@ -108,7 +108,7 @@ pub(crate) fn host_i32_words(
     }
 }
 
-/// The BF16 operand at `position`: a derived or owner-aliased exact view, or a BF16 host tensor's own
+/// The BF16 operand at `position`: a derived exact view, or a BF16 host tensor's own
 /// words (shared, never decoded through f32).
 pub(crate) fn bf16_view(
     eqn: &Eqn,
@@ -117,8 +117,7 @@ pub(crate) fn bf16_view(
 ) -> Result<ExactBf16TensorView, EvalError> {
     let id = operand_value(eqn, position)?;
     match env_value(env, id)? {
-        Value::Owner(ExactValue::Bf16(view)) => Ok(view.clone()),
-        Value::Owner(ExactValue::Dense(view)) => Ok(ExactBf16TensorView::from_owner_view(view)?),
+        Value::Exact(ExactValue::Bf16(view)) => Ok(view.clone()),
         Value::Host(tensor) if tensor.dtype() == DType::BF16 => {
             let HostData::Half(words) = tensor.data() else {
                 unreachable!("a BF16 HostTensor holds Half words")
@@ -168,9 +167,8 @@ impl Value {
     pub(crate) fn carrier_name(&self) -> &'static str {
         match self {
             Value::Host(_) => "Value::Host",
-            Value::Owner(ExactValue::Dense(_)) => "Value::Owner(ExactValue::Dense)",
-            Value::Owner(ExactValue::Bf16(_)) => "Value::Owner(ExactValue::Bf16)",
-            Value::Owner(ExactValue::I32(_)) => "Value::Owner(ExactValue::I32)",
+            Value::Exact(ExactValue::Bf16(_)) => "Value::Exact(ExactValue::Bf16)",
+            Value::Exact(ExactValue::I32(_)) => "Value::Exact(ExactValue::I32)",
             Value::Packed(_) => "Value::Packed",
             Value::PackedStack(_) => "Value::PackedStack",
         }

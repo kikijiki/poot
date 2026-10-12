@@ -14,7 +14,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -30,8 +29,9 @@ use crate::model::{
 use crate::names::gguf::{GGUF_BASE, GGUF_FUSED_QKV_GATE_UP};
 use crate::names::{FusedDims, HF_BASE, HF_FUSED_QKV_GATE_UP, family_weights_fused};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("phi3");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("phi3");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -63,7 +63,7 @@ const GGUF_LONGROPE_FACTORS: [&str; 2] = ["rope_factors_long.weight", "rope_fact
 
 /// phi3's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Phi3Params {
+pub(crate) struct Phi3Params {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -102,7 +102,7 @@ fn rotary_dim(fields: &Fields<'_>, dims: &DenseDims) -> Result<usize, ModelError
 }
 
 impl Phi3Params {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
         for unsupported in ["attention_bias", "mlp_bias"] {
@@ -148,7 +148,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Phi3 {
+pub(crate) struct Phi3 {
     params: Phi3Params,
     weights: WeightMap,
     stack: StackWeights,
@@ -225,11 +225,10 @@ impl Model for Phi3 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -240,7 +239,7 @@ impl Model for Phi3 {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
                 |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -269,7 +268,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 /// The tensors of a phi3 checkpoint with `config`'s HF dims, by HF name: `hf_base_shapes` with
 /// each layer's separate projections replaced by the fused `qkv_proj` and `gate_up_proj`.
 pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (h, inter, heads) = (
         n("hidden_size"),
         n("intermediate_size"),
@@ -631,11 +630,19 @@ mod tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(1, 2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(1, 2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }

@@ -13,15 +13,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use poot_executor::{
-    BufferRole, Device, Dispatch, Engine, ExecError, Executor, NoSync, StateScope, StepInputs,
+    Device, Dispatch, Engine, ExecError, Executor, NoSync, StateScope, StepInputs,
 };
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
-    Submission, Target, TargetSet, compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
 
@@ -178,7 +180,7 @@ impl Device for FaultyDevice {
     }
 }
 
-/// A two-state swap-plus-increment fixture (mirrors `poot-gpu`'s own SC-007 fixture): `output = a +
+/// A two-state swap-plus-increment fixture (mirrors `poot-wgpu-device`'s own SC-007 fixture): `output = a +
 /// s`, `new_a = s + bias`, `new_s = a + bias` - three real dispatches, two non-donated commit copies
 /// (neither new state can be written in place before the other reads it), no slot inputs at all, so
 /// `step` needs nothing but `StepInputs::new()`.
@@ -187,13 +189,17 @@ fn fixture() -> (
     Arc<WeightStore>,
     Arc<poot_quant::weights::WeightMap>,
 ) {
-    let b = Builder::new();
-    let a = b.state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent);
-    let s = b.state_input("s", TensorType::f32(vec![2]), StateRole::Recurrent);
-    let bias = b.constant("bias", TensorType::f32(vec![2]));
-    let output = b.binary(BinOp::Add, a, s);
-    let new_a = b.binary(BinOp::Add, s, bias);
-    let new_s = b.binary(BinOp::Add, a, bias);
+    let b = Builder::for_tests();
+    let a = b
+        .state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent)
+        .unwrap();
+    let s = b
+        .state_input("s", TensorType::f32(vec![2]), StateRole::Recurrent)
+        .unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![2])).unwrap();
+    let output = b.binary(BinOp::Add, a, s).unwrap();
+    let new_a = b.binary(BinOp::Add, s, bias).unwrap();
+    let new_s = b.binary(BinOp::Add, a, bias).unwrap();
     let g = b
         .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, new_a), (s, new_s)]))
         .unwrap();
@@ -213,7 +219,7 @@ fn fixture() -> (
         )
         .unwrap();
     let store = Arc::new(builder.build());
-    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
     let g = names.graph(&g);
     let map = Arc::new(names.map());
     (g, store, map)
@@ -421,7 +427,7 @@ fn replay_failure_aborts_once_and_marks_needs_reset() {
 
 /// SC-015: a classifiable fault surfaces as `ExecError::Fault` from
 /// `Engine::step` itself, not just from `Device::synchronize`/`classify_fault` driven directly
-/// (`poot-gpu/tests/executor_contract.rs`'s `wgpu_device_classifies_a_kernel_assert_fault_from_
+/// (`poot-llm/tests/wgpu_executor_contract.rs`'s `wgpu_device_classifies_a_kernel_assert_fault_from_
 /// synchronize` exercises the real `WgpuDevice::classify_fault` on a real kernel-assert trap, but
 /// never calls `step`, so a mutation that made `step` wrap every synchronize error as a plain
 /// `ExecError::Device` instead of asking `classify_fault` first would not be caught there). No

@@ -52,8 +52,8 @@ A backend-neutral contract now lives in `poot-executor`: one generic `Engine<D>`
 per-backend `Device` trait implements an object-safe `Executor` (`target_set`, `load_weights`,
 `add_entry`, `step`, `reset_state`, `remove_entry`, `stats`, `unload`), so the driver above it never
 branches on a backend. `Submission::Replay` is the contract's only admitted mode; `Submission::Eager`
-is a typed refusal there. The three `Device` implementations are `poot-gpu`'s `WgpuDevice`,
-`poot-rocm-gpu`'s `RocmDevice` and `poot-ptx-gpu`'s `PtxDevice`. `load_weights` takes the weight store and a weight map, which binds each weight a graph names by its typed role; a const the map
+is a typed refusal there. The three `Device` implementations are `poot-wgpu-device`'s `WgpuDevice`,
+`poot-rocm-device`'s `RocmDevice` and `poot-ptx-device`'s `PtxDevice`. `load_weights` takes the weight store and a weight map, which binds each weight a graph names by its typed role; a const the map
 does not name is unbound, even when a store key spells its name.
 
 The `poot-llm` driver drives this contract on every backend ([Models, Registry and the

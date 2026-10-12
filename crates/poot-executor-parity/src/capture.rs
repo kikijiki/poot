@@ -11,7 +11,7 @@ use poot_graph_ir::ops::{
 use poot_graph_ir::{BinOp, Builder, IndexRange, Slot, StateRole, TensorType, UnOp};
 use poot_tensor::{DType, HostTensor};
 
-use poot_test_util::StepFixture;
+use poot_eval::test_support::StepFixture;
 
 use crate::{Fixture, store_with};
 
@@ -42,93 +42,145 @@ pub fn bias_toy_fixture() -> Fixture {
 }
 
 fn toy_fixture(name: &'static str, bias: bool) -> Fixture {
-    let b = Builder::new();
-    let token = b.slot(Slot::Token, TensorType::scalar(DType::I32));
-    let pos = b.slot_ranged(
-        Slot::Pos,
-        TensorType::scalar(DType::I32),
-        IndexRange::below(CAP).expect("a nonempty cache"),
-    );
-    let mask4 = causal_mask_from_pos(&b, b.reshape(pos, vec![1, 1]), CAP, None);
+    let b = Builder::for_tests();
+    let token = b.slot(Slot::Token, TensorType::scalar(DType::I32)).unwrap();
+    let pos = b
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::scalar(DType::I32),
+            IndexRange::below(CAP).expect("a nonempty cache"),
+        )
+        .unwrap();
+    let mask4 = causal_mask_from_pos(&b, b.reshape(pos, vec![1, 1]).unwrap(), CAP, None).unwrap();
 
-    let embed = b.constant("toy.embed", TensorType::f32(vec![VOCAB, H]));
-    let mut x = b.reshape(b.gather_scalar(embed, 0, token), vec![1, 1, H]);
+    let embed = b
+        .constant("toy.embed", TensorType::f32(vec![VOCAB, H]))
+        .unwrap();
+    let mut x = b
+        .reshape(b.gather_scalar(embed, 0, token).unwrap(), vec![1, 1, H])
+        .unwrap();
 
     // Masked full attention, one head of dim H, RoPE and a fixed-capacity KV cache.
-    let attn_norm = b.constant("attn.norm", TensorType::f32(vec![H]));
-    let xn = rmsnorm(&b, x, attn_norm, EPS);
+    let attn_norm = b.constant("attn.norm", TensorType::f32(vec![H])).unwrap();
+    let xn = rmsnorm(&b, x, attn_norm, EPS).unwrap();
     let projection = |tag: &str| {
-        let w = b.constant(&format!("attn.w{tag}"), TensorType::f32(vec![H, H]));
-        let bias = bias.then(|| b.constant(&format!("attn.b{tag}"), TensorType::f32(vec![H])));
-        b.reshape(linear(&b, xn, w, bias), vec![1, 1, 1, H])
+        let w = b
+            .constant(&format!("attn.w{tag}"), TensorType::f32(vec![H, H]))
+            .unwrap();
+        let bias = bias.then(|| {
+            b.constant(&format!("attn.b{tag}"), TensorType::f32(vec![H]))
+                .unwrap()
+        });
+        b.reshape(linear(&b, xn, w, bias).unwrap(), vec![1, 1, 1, H])
+            .unwrap()
     };
     let (q, k, v) = (projection("q"), projection("k"), projection("v"));
-    let wo = b.constant("attn.wo", TensorType::f32(vec![H, H]));
-    let cos = b.constant("attn.rope.cos", TensorType::f32(vec![MAX_POS, H]));
-    let sin = b.constant("attn.rope.sin", TensorType::f32(vec![MAX_POS, H]));
-    let (q, k) = (rope(&b, q, cos, sin, pos), rope(&b, k, cos, sin, pos));
+    let wo = b.constant("attn.wo", TensorType::f32(vec![H, H])).unwrap();
+    let cos = b
+        .constant("attn.rope.cos", TensorType::f32(vec![MAX_POS, H]))
+        .unwrap();
+    let sin = b
+        .constant("attn.rope.sin", TensorType::f32(vec![MAX_POS, H]))
+        .unwrap();
+    let (q, k) = (
+        rope(&b, q, cos, sin, pos).unwrap(),
+        rope(&b, k, cos, sin, pos).unwrap(),
+    );
     let cache = |name: &str| {
         b.state_input(
             name,
             TensorType::f32(vec![1, 1, CAP, H]),
             StateRole::Positional { axis: 2 },
         )
+        .unwrap()
     };
     let (kc, vc) = (cache("attn.k_cache"), cache("attn.v_cache"));
-    let kc_out = b.dynamic_update_slice_dyn(kc, k, pos, 2);
-    let vc_out = b.dynamic_update_slice_dyn(vc, v, pos, 2);
+    let kc_out = b.dynamic_update_slice_dyn(kc, k, pos, 2).unwrap();
+    let vc_out = b.dynamic_update_slice_dyn(vc, v, pos, 2).unwrap();
     let scale = 1.0 / (H as f32).sqrt();
-    let attn = attention_masked_softcap(&b, q, kc_out, vc_out, 1, scale, mask4, None);
-    let attn = b.reshape(attn, vec![1, 1, H]);
-    x = b.binary(BinOp::Add, x, linear(&b, attn, wo, None));
+    let attn = attention_masked_softcap(&b, q, kc_out, vc_out, 1, scale, mask4, None).unwrap();
+    let attn = b.reshape(attn, vec![1, 1, H]).unwrap();
+    x = b
+        .binary(BinOp::Add, x, linear(&b, attn, wo, None).unwrap())
+        .unwrap();
 
     // One Gated-DeltaNet layer: causal conv1d, then the delta-rule recurrence.
-    let gdn_norm = b.constant("gdn.norm", TensorType::f32(vec![H]));
-    let xn2 = rmsnorm(&b, x, gdn_norm, EPS);
-    let conv_w = b.constant("gdn.conv_w", TensorType::f32(vec![GK, H]));
-    let conv_cache = b.state_input(
-        "gdn.conv_cache",
-        TensorType::f32(vec![1, GK - 1, H]),
-        StateRole::Recurrent,
-    );
-    let (conv, conv_cache_out) = causal_conv1d_decode(&b, xn2, conv_w, conv_cache, GK);
-    let conv = silu(&b, conv);
-    let w_gdn_in = b.constant("gdn.w_in", TensorType::f32(vec![H, 3 * H + 2 * HV]));
-    let qkvgb = linear(&b, conv, w_gdn_in, None);
+    let gdn_norm = b.constant("gdn.norm", TensorType::f32(vec![H])).unwrap();
+    let xn2 = rmsnorm(&b, x, gdn_norm, EPS).unwrap();
+    let conv_w = b
+        .constant("gdn.conv_w", TensorType::f32(vec![GK, H]))
+        .unwrap();
+    let conv_cache = b
+        .state_input(
+            "gdn.conv_cache",
+            TensorType::f32(vec![1, GK - 1, H]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (conv, conv_cache_out) = causal_conv1d_decode(&b, xn2, conv_w, conv_cache, GK).unwrap();
+    let conv = silu(&b, conv).unwrap();
+    let w_gdn_in = b
+        .constant("gdn.w_in", TensorType::f32(vec![H, 3 * H + 2 * HV]))
+        .unwrap();
+    let qkvgb = linear(&b, conv, w_gdn_in, None).unwrap();
     let head_rows = |lo: usize, hi: usize, last: usize| {
-        b.reshape(b.slice(qkvgb, 2, lo, hi), vec![1, HV, 1, last])
+        b.reshape(b.slice(qkvgb, 2, lo, hi).unwrap(), vec![1, HV, 1, last])
+            .unwrap()
     };
     let (q_raw, k_raw, v_raw) = (
         head_rows(0, H, DG),
         head_rows(H, 2 * H, DG),
         head_rows(2 * H, 3 * H, DG),
     );
-    let g = b.unary(UnOp::Neg, softplus(&b, head_rows(3 * H, 3 * H + HV, 1)));
-    let beta = sigmoid(&b, head_rows(3 * H + HV, 3 * H + 2 * HV, 1));
-    let ssm = b.state_input(
-        "gdn.ssm_state",
-        TensorType::f32(vec![1, HV, DG, DG]),
-        StateRole::Recurrent,
-    );
-    let (gdn_o, ssm_out) = gated_delta_net_decode(&b, q_raw, k_raw, v_raw, g, beta, ssm);
-    let w_gdn_out = b.constant("gdn.w_out", TensorType::f32(vec![H, H]));
-    let gdn_o = b.reshape(gdn_o, vec![1, 1, H]);
-    x = b.binary(BinOp::Add, x, linear(&b, gdn_o, w_gdn_out, None));
+    let g = b
+        .unary(
+            UnOp::Neg,
+            softplus(&b, head_rows(3 * H, 3 * H + HV, 1)).unwrap(),
+        )
+        .unwrap();
+    let beta = sigmoid(&b, head_rows(3 * H + HV, 3 * H + 2 * HV, 1)).unwrap();
+    let ssm = b
+        .state_input(
+            "gdn.ssm_state",
+            TensorType::f32(vec![1, HV, DG, DG]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (gdn_o, ssm_out) = gated_delta_net_decode(&b, q_raw, k_raw, v_raw, g, beta, ssm).unwrap();
+    let w_gdn_out = b
+        .constant("gdn.w_out", TensorType::f32(vec![H, H]))
+        .unwrap();
+    let gdn_o = b.reshape(gdn_o, vec![1, 1, H]).unwrap();
+    x = b
+        .binary(BinOp::Add, x, linear(&b, gdn_o, w_gdn_out, None).unwrap())
+        .unwrap();
 
     // One MoE layer: the `ArgTopK` router feeding indexed expert matmuls.
-    let moe_norm = b.constant("moe.norm", TensorType::f32(vec![H]));
-    let xn3 = rmsnorm(&b, x, moe_norm, EPS);
-    let router = b.constant("moe.router", TensorType::f32(vec![H, EXPERTS]));
-    let w_in = b.constant("moe.w_in", TensorType::f32(vec![EXPERTS, H, 2 * H]));
-    let w_out = b.constant("moe.w_out", TensorType::f32(vec![EXPERTS, H, H]));
-    let moe = moe_grouped(&b, xn3, router, w_in, w_out, EXPERTS, TOP_K, H);
-    x = b.binary(BinOp::Add, x, b.reshape(moe, vec![1, 1, H]));
+    let moe_norm = b.constant("moe.norm", TensorType::f32(vec![H])).unwrap();
+    let xn3 = rmsnorm(&b, x, moe_norm, EPS).unwrap();
+    let router = b
+        .constant("moe.router", TensorType::f32(vec![H, EXPERTS]))
+        .unwrap();
+    let w_in = b
+        .constant("moe.w_in", TensorType::f32(vec![EXPERTS, H, 2 * H]))
+        .unwrap();
+    let w_out = b
+        .constant("moe.w_out", TensorType::f32(vec![EXPERTS, H, H]))
+        .unwrap();
+    let moe = moe_grouped(&b, xn3, router, w_in, w_out, EXPERTS, TOP_K, H).unwrap();
+    x = b
+        .binary(BinOp::Add, x, b.reshape(moe, vec![1, 1, H]).unwrap())
+        .unwrap();
 
     // Final norm and unembedding.
-    let final_norm = b.constant("final.norm", TensorType::f32(vec![H]));
-    let xf = b.reshape(rmsnorm(&b, x, final_norm, EPS), vec![1, H]);
-    let unembed = b.constant("unembed", TensorType::f32(vec![H, VOCAB]));
-    let logits = linear(&b, xf, unembed, None);
+    let final_norm = b.constant("final.norm", TensorType::f32(vec![H])).unwrap();
+    let xf = b
+        .reshape(rmsnorm(&b, x, final_norm, EPS).unwrap(), vec![1, H])
+        .unwrap();
+    let unembed = b
+        .constant("unembed", TensorType::f32(vec![H, VOCAB]))
+        .unwrap();
+    let logits = linear(&b, xf, unembed, None).unwrap();
 
     let graph = b
         .finish(poot_graph_ir::Outputs::new(logits).with_state(&[

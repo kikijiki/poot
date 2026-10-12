@@ -4,9 +4,9 @@
 //! Model-free: no GPU adapter, only real SpirV codegen to compile the fixture's kernels, which the
 //! fake device then never actually runs - this file checks the *engine's own* bookkeeping (what it
 //! asks `Device::allocate`/`Device::dispatch` for), not a backend's numeric result (that half is
-//! `poot-gpu/tests/buffer_plan.rs`, on real wgpu hardware).
+//! `poot-wgpu-device/tests/buffer_plan.rs`, on real wgpu hardware).
 //!
-//! Fixture (same shape as `poot-gpu`'s, compiled through the full pipeline: `fuse` folds `c + c` into
+//! Fixture (same shape as `poot-wgpu-device`'s, compiled through the full pipeline: `fuse` folds `c + c` into
 //! the reduce that reads it, so the program is four dispatches):
 //!
 //! ```text
@@ -22,15 +22,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use poot_executor::{Arg, BufferRole, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
+use poot_executor::{Arg, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::op::RedOp;
 use poot_graph_ir::{BinOp, Builder, TensorType};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
-    Submission, Target, TargetSet, compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
 
@@ -42,15 +44,15 @@ const REPLAY: CompileOptions =
     CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
 
 fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_quant::weights::WeightMap>) {
-    let b = Builder::new();
-    let ta = b.constant("a", TensorType::f32(vec![K]));
-    let tb = b.constant("b", TensorType::f32(vec![K]));
-    let v1 = b.binary(BinOp::Add, ta, tb);
-    let s1 = b.reduce(RedOp::Sum, v1, 0, true);
-    let tc = b.constant("c", TensorType::f32(vec![1]));
-    let v2 = b.binary(BinOp::Add, tc, tc);
-    let s2 = b.reduce(RedOp::Sum, v2, 0, true);
-    let out = b.binary(BinOp::Add, s1, s2);
+    let b = Builder::for_tests();
+    let ta = b.constant("a", TensorType::f32(vec![K])).unwrap();
+    let tb = b.constant("b", TensorType::f32(vec![K])).unwrap();
+    let v1 = b.binary(BinOp::Add, ta, tb).unwrap();
+    let s1 = b.reduce(RedOp::Sum, v1, 0, true).unwrap();
+    let tc = b.constant("c", TensorType::f32(vec![1])).unwrap();
+    let v2 = b.binary(BinOp::Add, tc, tc).unwrap();
+    let s2 = b.reduce(RedOp::Sum, v2, 0, true).unwrap();
+    let out = b.binary(BinOp::Add, s1, s2).unwrap();
     let g = b.finish(out).unwrap();
 
     let mut wb = WeightStore::builder();
@@ -65,7 +67,7 @@ fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_quant::weights::WeightMap>) {
         .unwrap();
     }
     let store = Arc::new(wb.build());
-    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
     let g = names.graph(&g);
     let map = Arc::new(names.map());
     (g, store, map)
@@ -364,23 +366,27 @@ fn two_retained_entries_have_a_planned_aggregate_equal_to_actual_retained_bytes(
 #[test]
 fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
     const K: usize = 2;
-    let b = poot_graph_ir::Builder::new();
-    let a = b.state_input(
-        "a",
-        TensorType::f32(vec![K]),
-        poot_graph_ir::StateRole::Recurrent,
-    );
-    let s = b.state_input(
-        "s",
-        TensorType::f32(vec![K]),
-        poot_graph_ir::StateRole::Recurrent,
-    );
-    let bias = b.constant("bias", TensorType::f32(vec![K]));
-    let v1 = b.binary(BinOp::Add, a, bias);
-    let new_a = b.binary(BinOp::Add, s, bias);
-    let junk = b.binary(BinOp::Add, v1, v1);
-    let new_s = b.binary(BinOp::Add, a, bias);
-    let result = b.binary(BinOp::Add, junk, new_s);
+    let b = poot_graph_ir::Builder::for_tests();
+    let a = b
+        .state_input(
+            "a",
+            TensorType::f32(vec![K]),
+            poot_graph_ir::StateRole::Recurrent,
+        )
+        .unwrap();
+    let s = b
+        .state_input(
+            "s",
+            TensorType::f32(vec![K]),
+            poot_graph_ir::StateRole::Recurrent,
+        )
+        .unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![K])).unwrap();
+    let v1 = b.binary(BinOp::Add, a, bias).unwrap();
+    let new_a = b.binary(BinOp::Add, s, bias).unwrap();
+    let junk = b.binary(BinOp::Add, v1, v1).unwrap();
+    let new_s = b.binary(BinOp::Add, a, bias).unwrap();
+    let result = b.binary(BinOp::Add, junk, new_s).unwrap();
     let g = b
         .finish(poot_graph_ir::Outputs::new(result).with_state(&[(a, new_a), (s, new_s)]))
         .unwrap();
@@ -395,7 +401,7 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
     )
     .unwrap();
     let store = Arc::new(wb.build());
-    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
     let g = names.graph(&g);
     let map = Arc::new(names.map());
 

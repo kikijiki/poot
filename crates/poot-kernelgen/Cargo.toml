@@ -19,18 +19,21 @@ poot-quant.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
 # ADR-0113: this crate's own `#[cfg(test)]` module (`emit.rs`) and its `tests/{flash,rope}_interp.rs`
 # call `poot_kernel_ir::interp::Buffer::from_f32s`/`from_u32s`/`to_f32s` directly, gated behind
 # `test-support` in poot-kernel-ir.
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
 poot-codegen.workspace = true
-poot-runtime.workspace = true
-poot-ptx-runtime.workspace = true
+poot-wgpu-runtime = { workspace = true, features = ["test-support"] }
+poot-ptx-runtime = { workspace = true, features = ["test-support"] }
 # The packed-kernel ROCm device rows (card 542a SC-004/SC-005) dispatch generated bodies on real
 # ROCm/HSA hardware, the same real-executable-path proof card 628's no_contract tests use.
 poot-rocm-runtime.workspace = true
-poot-runtime-common.workspace = true
-poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+# The AIE bind-check fixtures the NPU artifact rows drive (`check_aie_bindings`, `core_lengths`).
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+poot-test-util.workspace = true
 
 [lints]
 workspace = true

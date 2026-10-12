@@ -81,7 +81,7 @@ fn eval_every_combination(
 }
 
 /// `SampleToken{Greedy}`'s output is always an integer token index, published as either a dense I32
-/// tensor or (card 554d's exact-I32 lane) `Value::Owner(ExactValue::I32)` - this file's narrower
+/// tensor or (card 554d's exact-I32 lane) `Value::Exact(ExactValue::I32)` - this file's narrower
 /// cousin of `admission_corpus.rs`'s general `value_bits` (which also handles the F32/E4M3FN
 /// carriers) never needs either of those branches.
 fn value_bits(value: &Value) -> Vec<u32> {
@@ -92,7 +92,7 @@ fn value_bits(value: &Value) -> Vec<u32> {
             .iter()
             .map(|&i| i as u32)
             .collect(),
-        Value::Owner(ExactValue::I32(view)) => view.i32_words().iter().map(|&i| i as u32).collect(),
+        Value::Exact(ExactValue::I32(view)) => view.i32_words().iter().map(|&i| i as u32).collect(),
         other => panic!("value_bits: unexpected published carrier for SampleToken {other:?}"),
     }
 }
@@ -108,9 +108,13 @@ fn dense_inputs<const N: usize>(
 
 fn check_large_vocab_decomposition(logits: Vec<f32>) {
     let v = logits.len();
-    let b = Builder::new();
-    let x = b.constant("logits", poot_graph_ir::TensorType::f32(vec![v]));
-    let out = b.sample_token(SampleRule::Greedy, x, None, None, None);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("logits", poot_graph_ir::TensorType::f32(vec![v]))
+        .unwrap();
+    let out = b
+        .sample_token(SampleRule::Greedy, x, None, None, None)
+        .unwrap();
     let g = b.finish(out).unwrap();
     let decomposed =
         decompose_large_vocab_greedy(&g, &poot_graph_plan::CompileLimits::STANDARD).unwrap();
@@ -192,9 +196,13 @@ fn large_vocab_greedy_decomposition_matches_the_oracle_at_card_scale_b1_and_b4()
         logits[1024] = 99999.0;
         logits[v - 1] = f32::NAN;
 
-        let b = Builder::new();
-        let x = b.constant("logits", poot_graph_ir::TensorType::f32(vec![b_rows, v]));
-        let out = b.sample_token(poot_graph_ir::op::SampleRule::Greedy, x, None, None, None);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("logits", poot_graph_ir::TensorType::f32(vec![b_rows, v]))
+            .unwrap();
+        let out = b
+            .sample_token(poot_graph_ir::op::SampleRule::Greedy, x, None, None, None)
+            .unwrap();
         let g = b.finish(out).unwrap();
         let decomposed =
             decompose_large_vocab_greedy(&g, &poot_graph_plan::CompileLimits::STANDARD).unwrap();

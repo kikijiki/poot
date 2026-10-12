@@ -80,15 +80,15 @@ fn payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
 
 fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, ValueId, ValueId) {
     let descriptor = owner.weight();
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let [(weight_name, weight_type), (scale_name, scale_type)] = <[(PackedSourceName, TensorType);
         2]>::try_from(
         packed_source_constants("layer", descriptor),
     )
     .expect("a registered packed-linear format has exactly two sources");
-    let weight = b.constant(weight_name.as_str(), weight_type);
-    let scale = b.constant(scale_name.as_str(), scale_type);
-    let output = b.packed_dequant(&[weight, scale], descriptor);
+    let weight = b.constant(weight_name.as_str(), weight_type).unwrap();
+    let scale = b.constant(scale_name.as_str(), scale_type).unwrap();
+    let output = b.packed_dequant(&[weight, scale], descriptor).unwrap();
     (b.finish(output).unwrap(), weight.id(), scale.id())
 }
 

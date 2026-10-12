@@ -16,7 +16,6 @@ use poot_quant::weights::{
 };
 use poot_tensor::DType;
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionWeights, attention};
 use crate::components::ffn::{GatedFfnWeights, geglu_ffn};
 use crate::components::linear::{Weight, WeightError};
@@ -33,6 +32,7 @@ use crate::names::gguf::{
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 mod config;
 
@@ -282,7 +282,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
                                 &[p.width],
                             )
                         };
-                        Ok(Routed {
+                        Ok::<_, WeightError>(Routed {
                             pre: norm(NormRole::PreRouted)?,
                             post_dense: norm(NormRole::PostDense)?,
                             post_routed: norm(NormRole::PostRouted)?,
@@ -325,11 +325,10 @@ impl Model for Gemma4 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             let x = standard_layer(
@@ -339,9 +338,9 @@ impl Model for Gemma4 {
                 &p.layer,
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention[l]),
                 |b, input| {
-                    let dense = geglu_ffn(b, input.block, &layer.ffn);
+                    let dense = geglu_ffn(b, input.block, &layer.ffn)?;
                     let (Some(routed), Some(moe_params)) = (&layer.routed, &p.moe) else {
-                        return dense;
+                        return Ok::<_, TraceError>(dense);
                     };
                     let norm = |x, w: &Weight| norm(b, x, w, p.layer.norm());
                     // The router reads the residual stream; the experts read it normalized by
@@ -350,20 +349,20 @@ impl Model for Gemma4 {
                         b,
                         &step,
                         l,
-                        norm(input.residual, &routed.pre),
+                        norm(input.residual, &routed.pre)?,
                         Some(input.residual),
                         &routed.experts,
                         moe_params,
-                    );
-                    b.binary(
+                    )?;
+                    Ok::<_, TraceError>(b.binary(
                         BinOp::Add,
-                        norm(dense, &routed.post_dense),
-                        norm(experts, &routed.post_routed),
-                    )
+                        norm(dense, &routed.post_dense)?,
+                        norm(experts, &routed.post_routed)?,
+                    )?)
                 },
-            );
+            )?;
             layer.scale.apply(b, x)
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -430,7 +429,7 @@ pub(crate) fn fixture_config(moe: bool) -> serde_json::Value {
 /// The shape of every tensor of a Gemma 4 text tower with `config`'s dims by its HF name.
 fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
     let text = &config["text_config"];
-    let n = |f: &str| text[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(text, f);
     let (vocab, h, inter, heads) = (
         n("vocab_size"),
         n("hidden_size"),
@@ -602,7 +601,7 @@ mod tests {
         /// scaled input, the top experts' gates renormalized then scaled per expert, GeGLU
         /// experts over the residual normalized by the routed norm, and the routed output norm.
         fn routed(&self, l: usize, x1: &[f64]) -> Vec<f64> {
-            let n = |k: &str| self.text[k].as_u64().unwrap() as usize;
+            let n = |k: &str| crate::registry::Fixture::count(self.text, k);
             let (h, experts, top_k, inter) = (
                 n("hidden_size"),
                 n("num_experts"),
@@ -649,7 +648,7 @@ mod tests {
         }
 
         fn logits(&self, tokens: &[usize]) -> Vec<f64> {
-            let n = |k: &str| self.text[k].as_u64().unwrap() as usize;
+            let n = |k: &str| crate::registry::Fixture::count(self.text, k);
             let (h, heads, window) = (
                 n("hidden_size"),
                 n("num_attention_heads"),

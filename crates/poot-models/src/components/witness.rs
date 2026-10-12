@@ -10,6 +10,8 @@ use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, UnOp, ValidationId};
 use poot_tensor::DType;
 
 use super::standard::Step;
+use crate::model::TraceError;
+use crate::model::WiringError;
 
 /// The three conditions a router's run-time check observes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -47,14 +49,14 @@ impl WitnessKind {
     }
 
     /// The validation id of this condition on `layer`.
-    pub fn id(self, layer: usize) -> ValidationId {
+    pub fn id(self, layer: usize) -> Result<ValidationId, WiringError> {
         let kinds = Self::ALL.len() as u32;
-        let layer = u32::try_from(layer)
+        let id = u32::try_from(layer)
             .ok()
             .and_then(|layer| layer.checked_mul(kinds))
             .and_then(|base| base.checked_add(self.ordinal()))
-            .expect("a layer index whose witness ids fit u32: no checkpoint has 2^30 layers");
-        ValidationId(layer)
+            .ok_or(WiringError::LayerIndexOutOfRange { layer })?;
+        Ok(ValidationId(id))
     }
 
     /// `(layer, kind)` of an id [`Self::id`] minted; `None` for any other id.
@@ -68,56 +70,62 @@ impl WitnessKind {
 }
 
 /// Declare `value` as the witness of `kind` on `layer` of `step`.
-pub fn declare(step: &Step, layer: usize, kind: WitnessKind, value: Traced) {
-    step.validate(kind.id(layer), format!("{}.l{layer}", kind.label()), value);
+pub fn declare(
+    step: &Step,
+    layer: usize,
+    kind: WitnessKind,
+    value: Traced,
+) -> Result<(), WiringError> {
+    step.validate(kind.id(layer)?, format!("{}.l{layer}", kind.label()), value);
+    Ok(())
 }
 
 /// Sum every axis of `x` away, so a witness costs one validation lane.
-fn sum_to_scalar(b: &Builder, x: Traced) -> Traced {
+fn sum_to_scalar(b: &Builder, x: Traced) -> Result<Traced, TraceError> {
     let mut value = x;
-    while !b.aval(value).shape.is_empty() {
-        value = b.reduce(RedOp::Sum, value, 0, false);
+    while !b.aval(value)?.shape.is_empty() {
+        value = b.reduce(RedOp::Sum, value, 0, false)?;
     }
-    value
+    Ok(value)
 }
 
 /// `1 - indicator`, for an indicator that is already 0.0 or 1.0.
-fn logical_not(b: &Builder, indicator: Traced) -> Traced {
-    let negated = b.binary_scalar(BinOp::Mul, indicator, Scalar::F32(-1.0));
-    b.binary_scalar(BinOp::Add, negated, Scalar::F32(1.0))
+fn logical_not(b: &Builder, indicator: Traced) -> Result<Traced, TraceError> {
+    let negated = b.binary_scalar(BinOp::Mul, indicator, Scalar::F32(-1.0))?;
+    Ok(b.binary_scalar(BinOp::Add, negated, Scalar::F32(1.0))?)
 }
 
 /// The number of non-finite values of `x`. `Ge(x, x)` is false exactly for NaN and `Ge(|x|, inf)`
 /// true exactly for infinities; there is no `Abs`, so `Max(x, -x)` is the magnitude.
-pub fn nonfinite_count(b: &Builder, x: Traced) -> Traced {
-    let nan = logical_not(b, b.binary(BinOp::Ge, x, x));
-    let magnitude = b.binary(BinOp::Max, x, b.unary(UnOp::Neg, x));
-    let infinite = b.binary_scalar(BinOp::Ge, magnitude, Scalar::F32(f32::INFINITY));
-    sum_to_scalar(b, b.binary(BinOp::Add, nan, infinite))
+pub fn nonfinite_count(b: &Builder, x: Traced) -> Result<Traced, TraceError> {
+    let nan = logical_not(b, b.binary(BinOp::Ge, x, x)?)?;
+    let magnitude = b.binary(BinOp::Max, x, b.unary(UnOp::Neg, x)?)?;
+    let infinite = b.binary_scalar(BinOp::Ge, magnitude, Scalar::F32(f32::INFINITY))?;
+    sum_to_scalar(b, b.binary(BinOp::Add, nan, infinite)?)
 }
 
 /// The number of entries of `sum` that are not finite positive numbers. Comparisons keep the value
 /// on the left (the planner rejects a literal left operand) and are false for NaN.
-pub fn unusable_sum_count(b: &Builder, sum: Traced) -> Traced {
-    let negated = b.binary_scalar(BinOp::Mul, sum, Scalar::F32(-1.0));
+pub fn unusable_sum_count(b: &Builder, sum: Traced) -> Result<Traced, TraceError> {
+    let negated = b.binary_scalar(BinOp::Mul, sum, Scalar::F32(-1.0))?;
     // sum <= f32::MAX is false for +inf, sum >= f32::MIN false for -inf, sum > 0 false at zero.
-    let below_max = b.binary_scalar(BinOp::Ge, negated, Scalar::F32(-f32::MAX));
-    let above_min = b.binary_scalar(BinOp::Ge, sum, Scalar::F32(f32::MIN));
-    let positive = logical_not(b, b.binary_scalar(BinOp::Ge, negated, Scalar::F32(0.0)));
+    let below_max = b.binary_scalar(BinOp::Ge, negated, Scalar::F32(-f32::MAX))?;
+    let above_min = b.binary_scalar(BinOp::Ge, sum, Scalar::F32(f32::MIN))?;
+    let positive = logical_not(b, b.binary_scalar(BinOp::Ge, negated, Scalar::F32(0.0))?)?;
     let usable = b.binary(
         BinOp::Mul,
-        b.binary(BinOp::Mul, below_max, above_min),
+        b.binary(BinOp::Mul, below_max, above_min)?,
         positive,
-    );
-    sum_to_scalar(b, logical_not(b, usable))
+    )?;
+    sum_to_scalar(b, logical_not(b, usable)?)
 }
 
 /// The number of selected ids outside `0..experts`. The ids are I32 out of `ArgTopK`; one unsigned compare
 /// (`GeU`) is an exact I32 `0`/`1` indicator of an id at or past `experts` or negative, widened to F32, so this
 /// is an ordinary F32 witness, not an in-graph clamp.
-pub fn out_of_range_count(b: &Builder, ids: Traced, experts: usize) -> Traced {
-    let outside = b.binary_scalar(BinOp::GeU, ids, Scalar::I32(experts as i32));
-    sum_to_scalar(b, b.cast(outside, DType::F32))
+pub fn out_of_range_count(b: &Builder, ids: Traced, experts: usize) -> Result<Traced, TraceError> {
+    let outside = b.binary_scalar(BinOp::GeU, ids, Scalar::I32(experts as i32))?;
+    sum_to_scalar(b, b.cast(outside, DType::F32)?)
 }
 
 #[cfg(test)]
@@ -133,18 +141,18 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for layer in [0, 1, 7, 1000] {
             for kind in WitnessKind::ALL {
-                let id = kind.id(layer);
+                let id = kind.id(layer).unwrap();
                 assert!(seen.insert(id), "{kind:?} on layer {layer} repeats an id");
                 assert_eq!(WitnessKind::decode(id), Some((layer, kind)));
             }
         }
     }
 
-    fn eval(build: impl FnOnce(&Builder, Traced) -> Traced, x: &[f32]) -> f32 {
+    fn eval(build: impl FnOnce(&Builder, Traced) -> Result<Traced, TraceError>, x: &[f32]) -> f32 {
         let fx = Fx::new(1);
-        let b = Builder::new();
-        let xs = b.constant("x", TensorType::f32(vec![x.len()]));
-        let w = build(&b, xs);
+        let b = Builder::for_tests();
+        let xs = b.constant("x", TensorType::f32(vec![x.len()])).unwrap();
+        let w = build(&b, xs).unwrap();
         let out = fx.eval(&b.finish(w).unwrap(), &[("x", x)], &[], &[]).0;
         assert_eq!(out.len(), 1, "a witness is one lane");
         out[0]
@@ -167,9 +175,11 @@ mod tests {
         // The ids are I32, as `ArgTopK` produces them: a token slot is the oracle harness's I32 input.
         let out_of_range = |ids: &[i32]| {
             let fx = Fx::new(1);
-            let b = Builder::new();
-            let slot = b.slot(Slot::Token, TensorType::new(vec![ids.len()], DType::I32));
-            let w = out_of_range_count(&b, slot, 4);
+            let b = Builder::for_tests();
+            let slot = b
+                .slot(Slot::Token, TensorType::new(vec![ids.len()], DType::I32))
+                .unwrap();
+            let w = out_of_range_count(&b, slot, 4).unwrap();
             let out = fx
                 .eval(&b.finish(w).unwrap(), &[], &[(Slot::Token, ids)], &[])
                 .0;

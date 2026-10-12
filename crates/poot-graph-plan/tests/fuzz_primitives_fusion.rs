@@ -48,10 +48,10 @@ fn fused_equals_unfused_elementwise_chain_all_fusable() {
     let mut total = 0usize;
     for seed in 0u64..300 {
         let mut rng = rng_stream(seed ^ 0xF00D);
-        let b = Builder::new();
+        let b = Builder::for_tests();
         // Two leaf constants. Binary steps use x1 as the "other" arg so each acc is consumed once.
-        let x0 = b.constant("x0", TensorType::f32(shape.clone()));
-        let x1 = b.constant("x1", TensorType::f32(shape.clone()));
+        let x0 = b.constant("x0", TensorType::f32(shape.clone())).unwrap();
+        let x1 = b.constant("x1", TensorType::f32(shape.clone())).unwrap();
         let leaf_ids = [x0.id(), x1.id()];
         // Build a deep single-use chain: every intermediate consumed exactly once.
         let depth = 3 + (rng() % 6) as usize; // 3..8
@@ -66,7 +66,7 @@ fn fused_equals_unfused_elementwise_chain_all_fusable() {
                     3 => UnOp::Sqrt,
                     _ => UnOp::Tanh,
                 };
-                acc = b.unary(op, acc);
+                acc = b.unary(op, acc).unwrap();
             } else {
                 // binary: acc is the left operand (single-use); x0/x1 are the right leaf.
                 let other = if rng().is_multiple_of(2) { x0 } else { x1 };
@@ -75,7 +75,7 @@ fn fused_equals_unfused_elementwise_chain_all_fusable() {
                     1 => BinOp::Sub,
                     _ => BinOp::Mul,
                 };
-                acc = b.binary(op, acc, other);
+                acc = b.binary(op, acc, other).unwrap();
             }
         }
         let g = b.finish(acc).unwrap();
@@ -155,15 +155,17 @@ fn fused_equals_unfused_matmul_epilogue() {
         let mut rng = rng_stream(seed ^ 0xBEEF);
         let (m, k, n) = configs[(seed as usize) % configs.len()];
         let out_shape = vec![m, n];
-        let b = Builder::new();
-        let a = b.constant("a", TensorType::f32(vec![m, k]));
-        let w = b.constant("w", TensorType::f32(vec![k, n]));
+        let b = Builder::for_tests();
+        let a = b.constant("a", TensorType::f32(vec![m, k])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
         // matmul: the fusion barrier.
-        let mm = b.matmul(a, w); // [m, n]
+        let mm = b.matmul(a, w).unwrap(); // [m, n]
         // Epilogue: chain 2..5 fusable ops so there are always >= 2 members to fuse.
         let epilogue_len = 2 + (rng() % 4) as usize; // 2..5
-        let bias = b.constant("bias", TensorType::f32(out_shape.clone()));
-        let mut acc = b.binary(BinOp::Add, mm, bias); // bias-add (always first)
+        let bias = b
+            .constant("bias", TensorType::f32(out_shape.clone()))
+            .unwrap();
+        let mut acc = b.binary(BinOp::Add, mm, bias).unwrap(); // bias-add (always first)
         for _ in 1..epilogue_len {
             if rng().is_multiple_of(2) {
                 let op = match rng() % 3 {
@@ -171,7 +173,7 @@ fn fused_equals_unfused_matmul_epilogue() {
                     1 => UnOp::Tanh,
                     _ => UnOp::Exp,
                 };
-                acc = b.unary(op, acc);
+                acc = b.unary(op, acc).unwrap();
             } else {
                 // second leaf so the intermediate stays single-use.
                 let other = bias;
@@ -180,7 +182,7 @@ fn fused_equals_unfused_matmul_epilogue() {
                     1 => BinOp::Mul,
                     _ => BinOp::Sub,
                 };
-                acc = b.binary(op, acc, other);
+                acc = b.binary(op, acc, other).unwrap();
             }
         }
         let g = b.finish(acc).unwrap();

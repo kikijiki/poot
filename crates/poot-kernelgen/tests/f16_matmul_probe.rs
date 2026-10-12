@@ -1,6 +1,6 @@
 //! Correctness gate for a whole-graph F16 matmul (F16 operands, F16 output): (1) it compiles to valid SPIR-V
 //! and passes `spirv-val` on RADV, and (2) its GPU dispatch matches the CPU f32 oracle within f16 tolerance.
-//! [`poot_runtime::KernelBuffer`] is raw, dtype-agnostic bytes, so an f16-encoded (2 bytes/elem) buffer
+//! [`poot_wgpu_runtime::KernelBuffer`] is raw, dtype-agnostic bytes, so an f16-encoded (2 bytes/elem) buffer
 //! dispatches through the same `Context::dispatch` every other kernelgen probe uses (see `tests/run.rs`'s
 //! `binary_mul`). `matmul_batched_dt(Ty::F16, ...)` is the dtype-generic serial matmul, the kernel a whole-graph
 //! F16 matmul equation lowers to once the `is_decode_gemv`/`is_tiled_gemm`/`is_tileable_matmul` f32-only fast
@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use poot_codegen::{Target, artifact_path, compile};
 use poot_kernel_ir::Ty;
 use poot_kernelgen as kg;
-use poot_runtime::{BufferRole, BufferStorage, Context};
+use poot_runtime_common::BufferRole;
+use poot_target::BufferStorage;
+use poot_wgpu_runtime::Context;
 
 fn which(tool: &str) -> bool {
     std::process::Command::new(tool)
@@ -139,11 +141,11 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
 /// Write `bytes` at `offset` of `buf` through the context's one write primitive, `write_with` (a test helper:
 /// the contexts have no slice-taking write of their own).
 fn write_host_bytes(
-    ctx: &poot_runtime::Context,
-    buf: &poot_runtime::DeviceBuffer,
+    ctx: &poot_wgpu_runtime::Context,
+    buf: &poot_wgpu_runtime::DeviceBuffer,
     offset: usize,
     bytes: &[u8],
-) -> Result<(), poot_runtime::RuntimeError> {
+) -> Result<(), poot_wgpu_runtime::RuntimeError> {
     ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
         out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
     })

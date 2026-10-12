@@ -19,7 +19,7 @@ pub(crate) struct Model {
 
 impl Model {
     /// The directory name the weights live under (matches the harness): local_dir if set, else the id.
-    pub fn dir_name(&self) -> &str {
+    pub(crate) fn dir_name(&self) -> &str {
         self.local_dir.as_deref().unwrap_or(&self.id)
     }
 }

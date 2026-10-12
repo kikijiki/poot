@@ -41,7 +41,7 @@ a checkpoint run in separate lanes, and each device lane fails before any test r
 just test-device-wgpu      # the required migrated wgpu cases (executor contract, packed serving, launch widening, I32, cr30 failure lifecycle), wgpu device required
 just test-device-kernels   # pootc and poot-kernelgen kernel suites, wgpu device required
 just test-device-vulkan    # raw Vulkan add dispatch
-just test-device-rocm      # poot-rocm-gpu resident probes and packed-serving cases
+just test-device-rocm      # poot-rocm-device resident probes and packed-serving cases
 just test-rocm-feature     # the tests that exist only under --features rocm, in release
 just test-device-ptx       # one PTX probe, on an NVIDIA machine
 just test-real-dims        # tests named *_real_dims, in release
@@ -90,7 +90,10 @@ runs a real model or touches GPU dispatch on the hot path.
 
 Compiled kernels are cached on disk and reused across processes. The cache lives under
 `$POOT_KERNEL_CACHE_DIR` when set, else `$XDG_CACHE_HOME/poot/kernels`, else `~/.cache/poot/kernels`. Set
-`POOT_KERNEL_CACHE=0` (also `off` or `false`) to disable the shared cache and use a per-process directory.
+`POOT_KERNEL_CACHE=0` (also `off` or `false`) to disable the shared cache and use a per-process directory. When a process first opens a kernel root it prunes that root: it keeps the
+current epoch and the 8 newest others, removes an old epoch only if it has been idle for more than 24 hours
+(each cache hit refreshes the `EPOCH` sidecar's mtime, which is its last use) and removes compiler scratch
+files older than one hour.
 
 ## Running a binary outside the dev shell
 

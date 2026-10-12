@@ -123,15 +123,21 @@ fn record_large_allocations<T>(body: impl FnOnce() -> T) -> (T, Vec<(usize, usiz
 
 #[test]
 fn selected_cast_allocates_only_its_published_result() {
-    let builder = Builder::new();
-    let table =
-        poot_test_util::graph_fixtures::i32_constant(&builder, "route.table", vec![SELECTED])
-            .unwrap();
-    let index =
-        poot_test_util::graph_fixtures::i32_constant(&builder, "route.indices", vec![SELECTED])
-            .unwrap();
-    let selected = builder.gather(table, 0, index);
-    let cast = builder.cast(selected, DType::F32);
+    let builder = Builder::for_tests();
+    let table = poot_graph_ir::test_support::graph_fixtures::i32_constant(
+        &builder,
+        "route.table",
+        vec![SELECTED],
+    )
+    .unwrap();
+    let index = poot_graph_ir::test_support::graph_fixtures::i32_constant(
+        &builder,
+        "route.indices",
+        vec![SELECTED],
+    )
+    .unwrap();
+    let selected = builder.gather(table, 0, index).unwrap();
+    let cast = builder.cast(selected, DType::F32).unwrap();
     let graph = builder.finish(cast).unwrap();
 
     let table_words: Arc<[i32]> = (0..SELECTED).map(|row| (row % 3) as i32).collect();

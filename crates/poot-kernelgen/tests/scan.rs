@@ -8,6 +8,8 @@
 
 use std::num::NonZeroUsize;
 
+use poot_graph_ir::ScanFamily;
+use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_kernel_ir::Terminator;
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen::{
@@ -15,7 +17,6 @@ use poot_kernelgen::{
 };
 use poot_target::DeviceCaps;
 use poot_test_util::assert_close;
-use poot_test_util::scan::{ScanFamily, ScanFixture};
 
 fn limits(max_instructions: usize) -> BodyLimits {
     BodyLimits {

@@ -174,8 +174,8 @@ pub(crate) fn emit_read_bits(e: &mut Emit, words: Local, bit: Local, width: u32)
 #[cfg(test)]
 mod tests {
     use poot_kernel_ir::interp::{Buffer, run};
+    use poot_kernel_ir::test_support::workgroups_covering;
     use poot_kernel_ir::{BasicBlock, Body, Terminator};
-    use poot_test_util::kernel_fixtures::workgroups_covering;
 
     use super::*;
     use crate::helpers::{ld, local, slice_dtype, slice_f32};

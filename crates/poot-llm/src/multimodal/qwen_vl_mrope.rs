@@ -546,33 +546,6 @@ pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_processor_media_with_me
     })
 }
 
-/// The rendered-prompt model input of `input` over a snapshot of its model directory loaded here:
-/// what a request does in two steps (the raw-request assembler holds the snapshot across media
-/// processing), as one call for tests.
-#[cfg(test)]
-pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt<'data>(
-    input: Qwen25VlRenderedPromptMropeModelInputRequest<'_, '_, 'data>,
-) -> Result<Qwen25VlRenderedPromptMropeModelInput<'data>, Qwen25VlRenderedPromptMropeModelInputError>
-{
-    let snapshot = load_qwen_vl_mrope_metadata_snapshot(input.model_dir)?;
-    assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt_with_metadata_snapshot(
-        input, snapshot,
-    )
-}
-
-/// [`assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt`] for processor media.
-#[cfg(test)]
-pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_processor_media<'data>(
-    input: Qwen25VlProcessorMediaMropeModelInputRequest<'_, '_, 'data>,
-) -> Result<Qwen25VlProcessorMediaMropeModelInput<'data>, Qwen25VlProcessorMediaMropeModelInputError>
-{
-    let snapshot = load_qwen_vl_mrope_metadata_snapshot(input.model_dir)
-        .map_err(Qwen25VlRenderedPromptMropeModelInputError::from)?;
-    assemble_qwen2_5_vl_mrope_model_input_from_processor_media_with_metadata_snapshot(
-        input, snapshot,
-    )
-}
-
 fn validate_qwen25_processor_pixels(
     kind: Qwen25VlProcessorMediaKind,
     pixels: Option<&HostTensor>,
@@ -623,7 +596,7 @@ fn validate_qwen25_processor_pixels(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use poot_models::mrope::{MropePositionAssemblyError, MropeSpanError};
     use std::collections::HashMap;
@@ -1488,5 +1461,34 @@ mod tests {
             QwenVlMropeMetadataLoadError::Tokenizer { ref path, .. }
                 if path == &dir.join("tokenizer.json")
         ));
+    }
+
+    /// The rendered-prompt model input of `input` over a snapshot of its model directory loaded here:
+    /// what a request does in two steps (the raw-request assembler holds the snapshot across media
+    /// processing), as one call for tests.
+    pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt<'data>(
+        input: Qwen25VlRenderedPromptMropeModelInputRequest<'_, '_, 'data>,
+    ) -> Result<
+        Qwen25VlRenderedPromptMropeModelInput<'data>,
+        Qwen25VlRenderedPromptMropeModelInputError,
+    > {
+        let snapshot = load_qwen_vl_mrope_metadata_snapshot(input.model_dir)?;
+        assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt_with_metadata_snapshot(
+            input, snapshot,
+        )
+    }
+
+    /// [`assemble_qwen2_5_vl_mrope_model_input_from_rendered_prompt`] for processor media.
+    pub(crate) fn assemble_qwen2_5_vl_mrope_model_input_from_processor_media<'data>(
+        input: Qwen25VlProcessorMediaMropeModelInputRequest<'_, '_, 'data>,
+    ) -> Result<
+        Qwen25VlProcessorMediaMropeModelInput<'data>,
+        Qwen25VlProcessorMediaMropeModelInputError,
+    > {
+        let snapshot = load_qwen_vl_mrope_metadata_snapshot(input.model_dir)
+            .map_err(Qwen25VlRenderedPromptMropeModelInputError::from)?;
+        assemble_qwen2_5_vl_mrope_model_input_from_processor_media_with_metadata_snapshot(
+            input, snapshot,
+        )
     }
 }

@@ -9,7 +9,7 @@ use poot_kernel_ir::Ty;
 fn wmma_tile_nvptx() {
     let dir = std::env::temp_dir().join("poot-wmma");
     std::fs::create_dir_all(&dir).unwrap();
-    let body = poot_test_util::kernel_fixtures::wmma_tile("k");
+    let body = poot_kernel_ir::test_support::wmma_tile("k");
     let out = dir.join("wmma_tile.ptx");
     match compile(&body, Target::Nvptx, &out) {
         Ok(_ir) => {

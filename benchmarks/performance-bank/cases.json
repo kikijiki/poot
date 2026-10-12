@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "description": "The small performance bank. Each case is one shape/storage/numerics point a backend runner (examples/performance_bank.rs in poot-gpu, poot-rocm-gpu, poot-ptx-gpu) measures through the executor contract. Identities are stamped by `python3 benchmarks/harness/performance_bank.py --stamp` and verified by `python3 benchmarks/harness/performance_bank.py`.",
+  "description": "The small performance bank. Each case is one shape/storage/numerics point a backend runner (examples/performance_bank.rs in poot-wgpu-device, poot-rocm-device, poot-ptx-device) measures through the executor contract. Identities are stamped by `python3 benchmarks/harness/performance_bank.py --stamp` and verified by `python3 benchmarks/harness/performance_bank.py`.",
   "timing_policy": {
     "warmup": 3,
     "repeats": 9,

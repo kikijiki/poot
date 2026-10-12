@@ -12,8 +12,9 @@ use std::sync::Arc;
 use poot_executor::{Executor, NoSync, StepInputs};
 use poot_graph_ir::{Builder, Slot, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, LoraPlan, Partition,
-    Submission, Target, TargetSet, compile_staged,
+    CompileLimits, CompileOptions, LoraPlan, Target, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
@@ -166,25 +167,33 @@ fn run_projection(
     let weight_id = WeightId::layer(0, lora_target.weight_role());
     let bias_id = WeightId::layer(0, WeightRole::Attn(AttnRole::QBias));
     let graph = {
-        let builder = Builder::new();
-        let xs = builder.slot_named(
-            Slot::Activation,
-            "x",
-            TensorType::f32(vec![BATCH, tokens, in_dim]),
-        );
-        let w = builder.constant(
-            &weight_id.const_name(),
-            TensorType::f32(vec![out_dim, in_dim]),
-        );
-        let bias_const = builder.constant(&bias_id.const_name(), TensorType::f32(vec![out_dim]));
-        let wt = builder.transpose(w, vec![1, 0]);
-        let y = builder.matmul(xs, wt);
-        let shape = builder.aval(y).shape;
-        let y = builder.binary(
-            poot_graph_ir::BinOp::Add,
-            y,
-            builder.broadcast(bias_const, shape),
-        );
+        let builder = Builder::for_tests();
+        let xs = builder
+            .slot_named(
+                Slot::Activation,
+                "x",
+                TensorType::f32(vec![BATCH, tokens, in_dim]),
+            )
+            .unwrap();
+        let w = builder
+            .constant(
+                &weight_id.const_name(),
+                TensorType::f32(vec![out_dim, in_dim]),
+            )
+            .unwrap();
+        let bias_const = builder
+            .constant(&bias_id.const_name(), TensorType::f32(vec![out_dim]))
+            .unwrap();
+        let wt = builder.transpose(w, vec![1, 0]).unwrap();
+        let y = builder.matmul(xs, wt).unwrap();
+        let shape = builder.aval(y).unwrap().shape;
+        let y = builder
+            .binary(
+                poot_graph_ir::BinOp::Add,
+                y,
+                builder.broadcast(bias_const, shape).unwrap(),
+            )
+            .unwrap();
         builder.finish(y).unwrap()
     };
 

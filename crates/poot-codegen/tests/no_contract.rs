@@ -4,7 +4,7 @@
 //! toolchain is absent, matching `llc.rs`'s convention so `cargo test` outside the devshell stays green.
 //!
 //! The marker sits on the final **subtract**, not either multiply - a real-hardware finding (RADV/ACO,
-//! `poot-runtime`'s `no_contract_tests` module): decorating only the second multiply (`c*d`) leaves ACO
+//! `poot-wgpu-runtime`'s `no_contract_tests` module): decorating only the second multiply (`c*d`) leaves ACO
 //! free to instead fuse the *other*, undecorated multiply (`a*b`) into the subtract, still diverging from
 //! the unfused reference on the same rows, just via a different fused term. Decorating the subtract itself
 //! blocks contracting it with either producing multiply (SPIR-V's `NoContraction`: "must not be contracted
@@ -30,7 +30,7 @@
 //! SC-001 (NVPTX real-hardware FMA divergence) and the numeric half of SC-002 (RADV/ACO dispatch) need
 //! device execution this box/toolchain cannot provide from `poot-codegen` alone (no NVIDIA GPU locally;
 //! the JIT step - `ptxas` - runs on the CUDA driver, not in this crate's own toolchain; a real dispatch
-//! needs `poot-runtime`'s wgpu harness). SC-002's numeric half is proven in `poot-runtime`'s
+//! needs `poot-wgpu-runtime`'s wgpu harness). SC-002's numeric half is proven in `poot-wgpu-runtime`'s
 //! `no_contract_tests` module (real RADV/ACO dispatch, marked matches the unfused reference bit for bit,
 //! unmarked diverges on the same rows); SC-001's NVPTX device row (marked matches the unfused reference)
 //! runs on the PTX pod - there is no corresponding "unmarked diverges" acceptance row on Nvptx,
@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use poot_codegen::{Target, compile};
-use poot_test_util::kernel_fixtures::no_contract_probe_kernel;
+use poot_kernel_ir::test_support::no_contract_probe_kernel;
 
 fn have(bin: &str) -> bool {
     Command::new(bin).arg("--version").output().is_ok()

@@ -300,7 +300,7 @@ fn duplicate_escape_tail(body: &mut Body, tail: &[usize], idom: &[usize], h: usi
 /// Idempotent; only inserts goto-forwarding blocks, plus a clone of a shared region-external tail when a
 /// selection's arm escapes its own region (card 461). Returns an error naming the construct if the CFG is
 /// irreducible (FR-005), or if the pass cannot converge within its block budget.
-pub fn structurize(body: &mut Body) -> Result<(), String> {
+pub(crate) fn structurize(body: &mut Body) -> Result<(), String> {
     // Every iteration either stops or appends at least one block (a merge block, or a duplicated tail), so
     // bounding the block count bounds the loop. The bound is anchored to the body's size ON ENTRY: the old
     // `guard > blocks.len() * 8 + 256` compared the guard against a count that grows with it, so it could

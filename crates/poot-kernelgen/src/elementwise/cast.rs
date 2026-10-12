@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    BasicBlock, BinOp, BlockId, Body, IndexAxis, Place, Rvalue, Statement, Terminator, Ty, copy,
+    elem, guard, ld, local, slice_bf16, slice_dtype, slice_f32,
+};
 
 /// Card 045: cast an f32 slice to bf16 elementwise (`out[i] = bf16(in[i])`), one thread per element, with
 /// the same round-to-nearest `Rvalue::Cast` every bf16-narrowing kernel uses. Feeds bf16 activations into
@@ -213,7 +216,7 @@ pub fn cast_f16_to_f32(name: &str) -> Body {
 ///
 /// The planner's Cast arm dispatches on the (input, output) dtype pair, so this body is reachable only
 /// from an i32 source (a target-only dispatch emitted a bf16 kernel for cast(i32->f32)).
-pub fn cast_i32_to_f32(name: &str) -> Body {
+pub(crate) fn cast_i32_to_f32(name: &str) -> Body {
     let locals = vec![
         ld(Ty::Unit, false),                    // 0 ret
         ld(slice_dtype(Ty::I32, false), false), // 1 a (i32 in)

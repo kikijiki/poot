@@ -32,16 +32,24 @@ fn reshape_collapse_is_value_identical() {
     // collapse_reshape_chains (and so fuse, which runs it) only reinterprets buffers, so the executor output must be
     // bit-identical to the un-collapsed graph. Covers a bare reshape chain and the decode-attention reshape -> (no-op)
     // transpose -> reshape run that elision exposes.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 3, 4]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 3, 4])).unwrap();
     // a reshape chain feeding an elementwise op (so the result depends on layout, not just shape).
-    let r = b.reshape(b.reshape(b.reshape(x, vec![6, 4]), vec![24]), vec![4, 6]);
-    let scaled = b.binary(BinOp::Mul, r, r); // [4,6], pointwise over the reshaped layout
+    let r = b
+        .reshape(
+            b.reshape(b.reshape(x, vec![6, 4]).unwrap(), vec![24])
+                .unwrap(),
+            vec![4, 6],
+        )
+        .unwrap();
+    let scaled = b.binary(BinOp::Mul, r, r).unwrap(); // [4,6], pointwise over the reshaped layout
     // a separate decode-attention-style run: reshape -> no-op transpose -> reshape.
-    let y = b.constant("y", TensorType::f32(vec![1, 1, 24]));
-    let yt = b.transpose(b.reshape(y, vec![1, 1, 4, 6]), vec![0, 2, 1, 3]); // no-op at seq 1
-    let yr = b.reshape(yt, vec![4, 6]);
-    let out = b.binary(BinOp::Add, scaled, yr);
+    let y = b.constant("y", TensorType::f32(vec![1, 1, 24])).unwrap();
+    let yt = b
+        .transpose(b.reshape(y, vec![1, 1, 4, 6]).unwrap(), vec![0, 2, 1, 3])
+        .unwrap(); // no-op at seq 1
+    let yr = b.reshape(yt, vec![4, 6]).unwrap();
+    let out = b.binary(BinOp::Add, scaled, yr).unwrap();
     let g = b.finish(out).unwrap();
 
     let inputs = {
@@ -155,12 +163,14 @@ fn fused_equals_unfused_over_random_movement_graphs() {
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .wrapping_add(0x1234_5678)
             | 1);
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let mut pool: Vec<(Traced, Vec<usize>)> = Vec::new();
         let mut inputs = HashMap::new();
         for k in 0..2 + rng.below(2) as usize {
             let shape = rand_shape(&mut rng);
-            let t = b.constant(&format!("x{k}"), TensorType::f32(shape.clone()));
+            let t = b
+                .constant(&format!("x{k}"), TensorType::f32(shape.clone()))
+                .unwrap();
             inputs.insert(
                 t.id(),
                 Value::from(HostTensor::f32(
@@ -173,7 +183,7 @@ fn fused_equals_unfused_over_random_movement_graphs() {
         for _ in 0..5 + rng.below(8) as usize {
             let (v, vs) = pool[rng.below(pool.len() as u64) as usize].clone();
             let (nv, ns): (Traced, Vec<usize>) = match rng.below(7) {
-                0 => (b.unary(UnOp::Neg, v), vs.clone()),
+                0 => (b.unary(UnOp::Neg, v).unwrap(), vs.clone()),
                 1 => {
                     // pointwise binary with a same-shape pool partner (else with itself) - fusion fodder.
                     let partner = pool
@@ -182,25 +192,25 @@ fn fused_equals_unfused_over_random_movement_graphs() {
                         .map(|(t, _)| *t)
                         .unwrap_or(v);
                     let op = [BinOp::Add, BinOp::Sub, BinOp::Mul][rng.below(3) as usize];
-                    (b.binary(op, v, partner), vs.clone())
+                    (b.binary(op, v, partner).unwrap(), vs.clone())
                 }
                 2 => {
                     let ns = factor(&mut rng, numel(&vs));
-                    (b.reshape(v, ns.clone()), ns)
+                    (b.reshape(v, ns.clone()).unwrap(), ns)
                 }
                 3 if vs.len() >= 2 => {
                     let perm = rand_perm(&mut rng, vs.len());
                     let ns = perm.iter().map(|&p| vs[p]).collect::<Vec<_>>();
-                    (b.transpose(v, perm), ns)
+                    (b.transpose(v, perm).unwrap(), ns)
                 }
                 4 => {
                     // broadcast a size-1 axis if there is one, else a no-op-ish neg.
                     if let Some(ax) = vs.iter().position(|&d| d == 1) {
                         let mut ns = vs.clone();
                         ns[ax] = 2 + rng.below(2) as usize;
-                        (b.broadcast(v, ns.clone()), ns)
+                        (b.broadcast(v, ns.clone()).unwrap(), ns)
                     } else {
-                        (b.unary(UnOp::Neg, v), vs.clone())
+                        (b.unary(UnOp::Neg, v).unwrap(), vs.clone())
                     }
                 }
                 5 => {
@@ -210,14 +220,14 @@ fn fused_equals_unfused_over_random_movement_graphs() {
                     let end = start + 1 + rng.below((len - start) as u64) as usize;
                     let mut ns = vs.clone();
                     ns[ax] = end - start;
-                    (b.slice(v, ax, start, end), ns)
+                    (b.slice(v, ax, start, end).unwrap(), ns)
                 }
                 _ => {
                     // concat the value with itself along an axis (doubles that axis).
                     let ax = rng.below(vs.len() as u64) as usize;
                     let mut ns = vs.clone();
                     ns[ax] = vs[ax] * 2;
-                    (b.concat(ax, &[v, v]), ns)
+                    (b.concat(ax, &[v, v]).unwrap(), ns)
                 }
             };
             if numel(&ns) <= 4096 {
@@ -281,15 +291,15 @@ fn fused_multi_axis_broadcast_leaf_matches_unfused() {
     use poot_graph_plan::cse;
 
     for &(m, n, k) in &[(3usize, 4usize, 5usize), (2, 6, 3), (5, 2, 7)] {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         // leaf broadcasts from [1,N,1] to [M,N,K]: axes 0 and 2 both expand.
-        let leaf = b.constant("leaf", TensorType::f32(vec![1, n, 1]));
-        let bc = b.broadcast(leaf, vec![m, n, k]);
-        let other = b.constant("other", TensorType::f32(vec![m, n, k]));
+        let leaf = b.constant("leaf", TensorType::f32(vec![1, n, 1])).unwrap();
+        let bc = b.broadcast(leaf, vec![m, n, k]).unwrap();
+        let other = b.constant("other", TensorType::f32(vec![m, n, k])).unwrap();
         // a short pointwise chain on top so `fuse` has something to merge the broadcast read into.
-        let sum = b.binary(BinOp::Add, bc, other);
-        let out = b.unary(UnOp::Neg, sum);
-        let out = b.binary(BinOp::Mul, out, other);
+        let sum = b.binary(BinOp::Add, bc, other).unwrap();
+        let out = b.unary(UnOp::Neg, sum).unwrap();
+        let out = b.binary(BinOp::Mul, out, other).unwrap();
         let g = b.finish(out).unwrap();
 
         let mut inputs = HashMap::new();
@@ -355,14 +365,14 @@ fn fused_pointwise_over_empty_tensor_edges() {
     use poot_graph_plan::cse;
 
     for shape in [vec![2usize, 0, 3], vec![0usize, 4], vec![3usize, 0]] {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(shape.clone()));
-        let y = b.constant("y", TensorType::f32(shape.clone()));
-        let sum = b.binary(BinOp::Add, x, y);
-        let neg = b.unary(UnOp::Neg, sum);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(shape.clone())).unwrap();
+        let y = b.constant("y", TensorType::f32(shape.clone())).unwrap();
+        let sum = b.binary(BinOp::Add, x, y).unwrap();
+        let neg = b.unary(UnOp::Neg, sum).unwrap();
         // a movement op (reshape to the same numel, still 0) on top, so the fused region carries a zero-size value through a
         // shape change.
-        let reshaped = b.reshape(neg, shape.clone());
+        let reshaped = b.reshape(neg, shape.clone()).unwrap();
         let g = b.finish(reshaped).unwrap();
 
         let mut inputs = HashMap::new();
@@ -410,7 +420,9 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
     // matmul, and records it as the plan's kernel choice (the graph keeps a plain `MatMul`). A decode
     // GEMV (M==1) does not take it.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{CompileOptions, KernelChoice, Submission, Target, compile};
+    use poot_graph_plan::{
+        CompileOptions, KernelChoice, Target, compile, production_plan::Submission,
+    };
     use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_target::{AmdArch, Backend};
 
@@ -422,10 +434,10 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
     };
     let choice_of = |m: usize| {
         let (k, n) = (16usize, 8usize);
-        let b = Builder::new();
-        let a = b.constant("a", TensorType::f32(vec![m, k]));
-        let w = b.constant("w", TensorType::f32(vec![k, n]));
-        let y = b.matmul(a, w);
+        let b = Builder::for_tests();
+        let a = b.constant("a", TensorType::f32(vec![m, k])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
+        let y = b.matmul(a, w).unwrap();
         let program =
             compile(&b.finish(y).unwrap(), &target, &options).expect("the matmul compiles");
         let (eqn, _) = program

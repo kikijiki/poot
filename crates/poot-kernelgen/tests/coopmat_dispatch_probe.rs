@@ -1,7 +1,7 @@
 //! First RADV dispatch of `wmma_tile` (card 530: the target-neutral single 16x16x16 fragment tile, F16
 //! operands / F32 accumulate, lowered here to RADV coopmat config 13), compiled through the real
 //! `fix_coopmat_calls` post-process path (wired into `compile()`) and dispatched on the gfx1151 iGPU via
-//! `poot_runtime::Context::dispatch`, the same raw-KernelBuffer path `f16_matmul_probe.rs` uses. Only the
+//! `poot_wgpu_runtime::Context::dispatch`, the same raw-KernelBuffer path `f16_matmul_probe.rs` uses. Only the
 //! coopmat kernel body and oracle are new.
 //!
 //! Skips (passes) if no Vulkan adapter or `spirv-val` is absent, same convention as every other probe in this crate.
@@ -9,9 +9,11 @@
 use std::path::PathBuf;
 
 use poot_codegen::{Target, artifact_path, compile};
+use poot_kernel_ir::test_support::wmma_tile;
 use poot_kernelgen as kg;
-use poot_runtime::{BufferRole, BufferStorage, Context};
-use poot_test_util::kernel_fixtures::wmma_tile;
+use poot_runtime_common::BufferRole;
+use poot_target::BufferStorage;
+use poot_wgpu_runtime::Context;
 
 fn which(tool: &str) -> bool {
     std::process::Command::new(tool)
@@ -231,11 +233,11 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
 /// Write `bytes` at `offset` of `buf` through the context's one write primitive, `write_with` (a test helper:
 /// the contexts have no slice-taking write of their own).
 fn write_host_bytes(
-    ctx: &poot_runtime::Context,
-    buf: &poot_runtime::DeviceBuffer,
+    ctx: &poot_wgpu_runtime::Context,
+    buf: &poot_wgpu_runtime::DeviceBuffer,
     offset: usize,
     bytes: &[u8],
-) -> Result<(), poot_runtime::RuntimeError> {
+) -> Result<(), poot_wgpu_runtime::RuntimeError> {
     ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
         out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
     })

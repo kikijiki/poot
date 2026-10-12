@@ -190,13 +190,6 @@ impl BufferStorage {
         self.layout
     }
 
-    pub const fn is_packed(&self) -> bool {
-        matches!(
-            self.layout,
-            StorageLayout::Bf16Packed | StorageLayout::F16Packed | StorageLayout::E4m3Packed
-        )
-    }
-
     /// Native device elements a value of `shape` occupies in this storage (Card 547b): `None` for a lane
     /// no executor device-encodes (dense E4M3FN/RawBytes/I8 - left to the host). The one owner both
     /// `poot-graph-plan` (buffer-plan sizing) and `poot-executor` (bind-time allocation and dispatch
@@ -235,7 +228,6 @@ mod tests {
         assert_eq!(BufferStorage::f32().element(), ElementKind::F32);
         assert_eq!(BufferStorage::f32().dtype(), LogicalDType::F32);
         assert_eq!(BufferStorage::f32().layout(), StorageLayout::Dense);
-        assert!(!BufferStorage::f32().is_packed());
     }
 
     /// Same element kind, different logical dtype and layout: the case a pre-card-527 element-only check
@@ -250,7 +242,7 @@ mod tests {
         assert_ne!(packed.dtype(), dense.dtype());
         assert_ne!(packed.layout(), dense.layout());
         assert_ne!(packed, dense);
-        assert!(packed.is_packed());
+        assert_eq!(packed.layout(), StorageLayout::Bf16Packed);
     }
 
     /// Card 1007: packed F16 shares the packed-BF16 word (and so a dense I32 buffer's element kind) but
@@ -262,7 +254,6 @@ mod tests {
         assert_eq!(packed.element(), ElementKind::I32);
         assert_eq!(packed.dtype(), LogicalDType::F16);
         assert_eq!(packed.layout(), StorageLayout::F16Packed);
-        assert!(packed.is_packed());
         assert_ne!(packed, BufferStorage::bf16_packed());
         assert_ne!(packed, BufferStorage::i32());
         assert_ne!(packed, BufferStorage::f16());
@@ -279,7 +270,6 @@ mod tests {
         assert_eq!(packed.element(), ElementKind::I32);
         assert_eq!(packed.dtype(), LogicalDType::E4M3FN);
         assert_eq!(packed.layout(), StorageLayout::E4m3Packed);
-        assert!(packed.is_packed());
         assert_ne!(packed, BufferStorage::bf16_packed());
         assert_ne!(packed, BufferStorage::i32());
         assert_eq!(packed.device_elems(&[3, 8]), Some(6));

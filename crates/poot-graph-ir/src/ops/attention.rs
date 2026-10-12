@@ -1,15 +1,15 @@
-use super::*;
+use super::{BinOp, Builder, BuilderError, DType, RedOp, Scalar, Traced, UnOp, softcap};
 
 /// GQA repeat_kv: broadcast each of H_kv heads to n_rep query heads.
 /// `k[bsz,H_kv,S,D]` -> `[bsz,H_kv*n_rep,S,D]`.
-pub fn repeat_kv(b: &Builder, k: Traced, n_rep: usize) -> Traced {
+pub fn repeat_kv(b: &Builder, k: Traced, n_rep: usize) -> Result<Traced, BuilderError> {
     if n_rep == 1 {
-        return k;
+        return Ok(k);
     }
-    let s = b.aval(k).shape;
+    let s = b.aval(k)?.shape;
     let (bsz, h_kv, seq, d) = (s[0], s[1], s[2], s[3]);
-    let r = b.reshape(k, vec![bsz, h_kv, 1, seq, d]);
-    let r = b.broadcast(r, vec![bsz, h_kv, n_rep, seq, d]);
+    let r = b.reshape(k, vec![bsz, h_kv, 1, seq, d])?;
+    let r = b.broadcast(r, vec![bsz, h_kv, n_rep, seq, d])?;
     b.reshape(r, vec![bsz, h_kv * n_rep, seq, d])
 }
 
@@ -18,14 +18,14 @@ pub fn repeat_kv(b: &Builder, k: Traced, n_rep: usize) -> Traced {
 /// Gated-DeltaNet uses this to expand `num_k_heads` q/k to `num_v_heads` (llama.cpp
 /// `ggml_repeat_4d`), distinct from the blocked [`repeat_kv`] (`h -> h / n_rep`) used by standard GQA.
 /// Inserting the `n_rep` dim before the head dim gives the tile.
-pub fn repeat_kv_tiled(b: &Builder, k: Traced, n_rep: usize) -> Traced {
+pub fn repeat_kv_tiled(b: &Builder, k: Traced, n_rep: usize) -> Result<Traced, BuilderError> {
     if n_rep == 1 {
-        return k;
+        return Ok(k);
     }
-    let s = b.aval(k).shape;
+    let s = b.aval(k)?.shape;
     let (bsz, h_kv, seq, d) = (s[0], s[1], s[2], s[3]);
-    let r = b.reshape(k, vec![bsz, 1, h_kv, seq, d]);
-    let r = b.broadcast(r, vec![bsz, n_rep, h_kv, seq, d]);
+    let r = b.reshape(k, vec![bsz, 1, h_kv, seq, d])?;
+    let r = b.broadcast(r, vec![bsz, n_rep, h_kv, seq, d])?;
     b.reshape(r, vec![bsz, n_rep * h_kv, seq, d])
 }
 
@@ -48,30 +48,37 @@ pub fn attention_prefill_with_sink(
     sinks: Traced,
     hq: usize,
     l: usize,
-) -> Traced {
-    let k = repeat_kv(b, k, n_rep);
-    let v = repeat_kv(b, v, n_rep);
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D,L]
-    let scores = b.matmul(q, kt); // [1,Hq,L,L]
-    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale));
-    let scores = b.binary(BinOp::Add, scores, mask); // causal/windowed mask, broadcast over Hq
-    let last = b.aval(scores).rank() - 1;
-    let m_scores = b.reduce(RedOp::Max, scores, last, true); // [1,Hq,L,1]
-    let sinks_b = b.broadcast(b.reshape(sinks, vec![1, hq, 1, 1]), vec![1, hq, l, 1]);
-    let m = b.binary(BinOp::Max, m_scores, sinks_b); // row max INCLUDES the sink logit
-    let shifted = b.binary(BinOp::Sub, scores, m);
-    let e = b.unary(UnOp::Exp, shifted);
-    let denom_scores = b.reduce(RedOp::Sum, e, last, true);
-    let sink_shifted = b.binary(BinOp::Sub, sinks_b, m);
-    let e_sink = b.unary(UnOp::Exp, sink_shifted);
-    let denom = b.binary(BinOp::Add, denom_scores, e_sink); // sink's mass counted, never gathered into V
-    let p = b.binary(BinOp::Div, e, denom);
+) -> Result<Traced, BuilderError> {
+    let k = repeat_kv(b, k, n_rep)?;
+    let v = repeat_kv(b, v, n_rep)?;
+    let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [1,Hq,D,L]
+    let scores = b.matmul(q, kt)?; // [1,Hq,L,L]
+    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale))?;
+    let scores = b.binary(BinOp::Add, scores, mask)?; // causal/windowed mask, broadcast over Hq
+    let last = b.aval(scores)?.rank() - 1;
+    let m_scores = b.reduce(RedOp::Max, scores, last, true)?; // [1,Hq,L,1]
+    let sinks_b = b.broadcast(b.reshape(sinks, vec![1, hq, 1, 1])?, vec![1, hq, l, 1])?;
+    let m = b.binary(BinOp::Max, m_scores, sinks_b)?; // row max INCLUDES the sink logit
+    let shifted = b.binary(BinOp::Sub, scores, m)?;
+    let e = b.unary(UnOp::Exp, shifted)?;
+    let denom_scores = b.reduce(RedOp::Sum, e, last, true)?;
+    let sink_shifted = b.binary(BinOp::Sub, sinks_b, m)?;
+    let e_sink = b.unary(UnOp::Exp, sink_shifted)?;
+    let denom = b.binary(BinOp::Add, denom_scores, e_sink)?; // sink's mass counted, never gathered into V
+    let p = b.binary(BinOp::Div, e, denom)?;
     b.matmul(p, v) // [1,Hq,L,D]
 }
 
 /// Decode attention (single query token), GQA, no mask (l=1 attends all cached keys). `q[1,Hq,1,D]`,
 /// `k`/`v[1,Hkv,S,D]`. Returns `[1,Hq,1,D]`.
-pub fn attention(b: &Builder, q: Traced, k: Traced, v: Traced, n_rep: usize, scale: f32) -> Traced {
+pub fn attention(
+    b: &Builder,
+    q: Traced,
+    k: Traced,
+    v: Traced,
+    n_rep: usize,
+    scale: f32,
+) -> Result<Traced, BuilderError> {
     attention_softcap(b, q, k, v, n_rep, scale, None)
 }
 
@@ -86,22 +93,22 @@ pub fn attention_softcap(
     n_rep: usize,
     scale: f32,
     attn_logit_softcap: Option<f32>,
-) -> Traced {
-    let k = repeat_kv(b, k, n_rep);
-    let v = repeat_kv(b, v, n_rep);
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D,S]
-    let scores = b.matmul(q, kt); // [1,Hq,1,S]
-    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale));
+) -> Result<Traced, BuilderError> {
+    let k = repeat_kv(b, k, n_rep)?;
+    let v = repeat_kv(b, v, n_rep)?;
+    let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [1,Hq,D,S]
+    let scores = b.matmul(q, kt)?; // [1,Hq,1,S]
+    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale))?;
     let scores = match attn_logit_softcap {
-        Some(c) => softcap(b, scores, c),
+        Some(c) => softcap(b, scores, c)?,
         None => scores,
     };
-    let last = b.aval(scores).rank() - 1;
-    let m = b.reduce(RedOp::Max, scores, last, true);
-    let shifted = b.binary(BinOp::Sub, scores, m);
-    let e = b.unary(UnOp::Exp, shifted);
-    let denom = b.reduce(RedOp::Sum, e, last, true);
-    let p = b.binary(BinOp::Div, e, denom);
+    let last = b.aval(scores)?.rank() - 1;
+    let m = b.reduce(RedOp::Max, scores, last, true)?;
+    let shifted = b.binary(BinOp::Sub, scores, m)?;
+    let e = b.unary(UnOp::Exp, shifted)?;
+    let denom = b.reduce(RedOp::Sum, e, last, true)?;
+    let p = b.binary(BinOp::Div, e, denom)?;
     b.matmul(p, v) // [1,Hq,1,D]
 }
 
@@ -123,7 +130,7 @@ pub fn attention_masked(
     n_rep: usize,
     scale: f32,
     mask: Traced,
-) -> Traced {
+) -> Result<Traced, BuilderError> {
     attention_masked_softcap(b, q, k, v, n_rep, scale, mask, None)
 }
 
@@ -141,7 +148,7 @@ pub fn attention_masked_softcap(
     scale: f32,
     mask: Traced,
     attn_logit_softcap: Option<f32>,
-) -> Traced {
+) -> Result<Traced, BuilderError> {
     attention_over_keys(
         b,
         q,
@@ -168,6 +175,7 @@ pub enum AttentionKeys {
 /// What [`attention_live`] returns: the attention output and the length-validation witness the caller
 /// declares as a validation output.
 #[derive(Clone, Copy, Debug)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct LiveAttention {
     /// `[B,Hq,Lq,Dv]`.
     pub out: Traced,
@@ -180,6 +188,7 @@ pub struct LiveAttention {
 /// index-bounds guard ([`Builder::guard_index_bounds`] on `len - 1`), so an out-of-range length publishes
 /// nothing through the validation channel and the graph reads a valid in-range fallback.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn attention_live(
     b: &Builder,
     q: Traced,
@@ -191,10 +200,10 @@ pub fn attention_live(
     attn_logit_softcap: Option<f32>,
     len: Traced,
 ) -> Result<LiveAttention, crate::index_guard::IndexGuardError> {
-    let lk = b.aval(v).shape[2];
-    let last = b.binary_scalar(BinOp::Sub, len, Scalar::I32(1));
+    let lk = b.aval(v)?.shape[2];
+    let last = b.binary_scalar(BinOp::Sub, len, Scalar::I32(1))?;
     let guard = b.guard_index_bounds(last, lk)?;
-    let live_len = b.binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1));
+    let live_len = b.binary_scalar(BinOp::Add, guard.guarded, Scalar::I32(1))?;
     let out = attention_over_keys(
         b,
         q,
@@ -205,7 +214,7 @@ pub fn attention_live(
         mask,
         attn_logit_softcap,
         Some(live_len),
-    );
+    )?;
     Ok(LiveAttention {
         out,
         witness: guard.witness,
@@ -231,43 +240,49 @@ pub(crate) fn attention_over_keys(
     mask: Traced,
     attn_logit_softcap: Option<f32>,
     live_len: Option<Traced>,
-) -> Traced {
-    let live = live_len.map(|len| LiveKeys::new(b, len, b.aval(v).shape[2], b.aval(v).dtype));
+) -> Result<Traced, BuilderError> {
+    let live = match live_len {
+        Some(len) => {
+            let v_type = b.aval(v)?;
+            Some(LiveKeys::new(b, len, v_type.shape[2], v_type.dtype)?)
+        }
+        None => None,
+    };
     let guard_rows = |x: Traced| match &live {
         Some(live) => b.select(live.rows, x, live.zero_rows),
-        None => x,
+        None => Ok(x),
     };
     let k = match keys {
-        AttentionKeys::Single(k) => guard_rows(k),
+        AttentionKeys::Single(k) => guard_rows(k)?,
         AttentionKeys::Split { head, shared } => {
-            let head = guard_rows(head);
-            let shared = guard_rows(shared);
+            let head = guard_rows(head)?;
+            let shared = guard_rows(shared)?;
             // The shared part reaches every key head through the same `repeat_kv` chain a per-head key does.
-            let shared = repeat_kv(b, shared, b.aval(head).shape[1]);
-            b.concat(3, &[head, shared])
+            let shared = repeat_kv(b, shared, b.aval(head)?.shape[1])?;
+            b.concat(3, &[head, shared])?
         }
     };
-    let v = guard_rows(v);
-    let k = repeat_kv(b, k, n_rep);
-    let v = repeat_kv(b, v, n_rep);
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [B,Hq,D,Lk]
-    let scores = b.matmul(q, kt); // [B,Hq,Lq,Lk]
-    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale));
+    let v = guard_rows(v)?;
+    let k = repeat_kv(b, k, n_rep)?;
+    let v = repeat_kv(b, v, n_rep)?;
+    let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [B,Hq,D,Lk]
+    let scores = b.matmul(q, kt)?; // [B,Hq,Lq,Lk]
+    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale))?;
     let scores = match attn_logit_softcap {
-        Some(c) => softcap(b, scores, c),
+        Some(c) => softcap(b, scores, c)?,
         None => scores,
     };
-    let scores = b.binary(BinOp::Add, scores, mask); // additive mask, broadcast over Hq
+    let scores = b.binary(BinOp::Add, scores, mask)?; // additive mask, broadcast over Hq
     let scores = match &live {
-        Some(live) => b.select(live.columns, scores, live.neg_inf_columns),
+        Some(live) => b.select(live.columns, scores, live.neg_inf_columns)?,
         None => scores,
     };
-    let last = b.aval(scores).rank() - 1;
-    let m = b.reduce(RedOp::Max, scores, last, true);
-    let shifted = b.binary(BinOp::Sub, scores, m);
-    let e = b.unary(UnOp::Exp, shifted);
-    let denom = b.reduce(RedOp::Sum, e, last, true);
-    let p = b.binary(BinOp::Div, e, denom);
+    let last = b.aval(scores)?.rank() - 1;
+    let m = b.reduce(RedOp::Max, scores, last, true)?;
+    let shifted = b.binary(BinOp::Sub, scores, m)?;
+    let e = b.unary(UnOp::Exp, shifted)?;
+    let denom = b.reduce(RedOp::Sum, e, last, true)?;
+    let p = b.binary(BinOp::Div, e, denom)?;
     b.matmul(p, v) // [B,Hq,Lq,Dv]
 }
 
@@ -284,26 +299,26 @@ struct LiveKeys {
 }
 
 impl LiveKeys {
-    fn new(b: &Builder, len: Traced, lk: usize, dtype: DType) -> Self {
-        let batch = b.aval(len).shape[0];
-        let len = b.reshape(len, vec![batch, 1, 1, 1]);
+    fn new(b: &Builder, len: Traced, lk: usize, dtype: DType) -> Result<Self, BuilderError> {
+        let batch = b.aval(len)?.shape[0];
+        let len = b.reshape(len, vec![batch, 1, 1, 1])?;
         // `j < len` is `len >= j + 1`; the key ends `1..=Lk` are built exactly in I32, with no float round trip.
-        let ends = b.binary_scalar(BinOp::Add, b.iota_i32(lk), Scalar::I32(1)); // [Lk] i32
+        let ends = b.binary_scalar(BinOp::Add, b.iota_i32(lk)?, Scalar::I32(1))?; // [Lk] i32
         // The select fallbacks come from the F32 range scaled by zero, so they are finite zeros whatever the
         // scalar, and `-inf` is added to a zero rather than multiplied into a possible `0 * inf`.
-        let zero = b.binary_scalar(BinOp::Mul, b.iota(lk), Scalar::F32(0.0));
-        let neg_inf = b.binary_scalar(BinOp::Add, zero, Scalar::F32(f32::NEG_INFINITY));
+        let zero = b.binary_scalar(BinOp::Mul, b.iota(lk)?, Scalar::F32(0.0))?;
+        let neg_inf = b.binary_scalar(BinOp::Add, zero, Scalar::F32(f32::NEG_INFINITY))?;
         // A select's branches share one dtype: zero and `-inf` are exact in every float dtype.
         let (zero, neg_inf) = if dtype == DType::F32 {
             (zero, neg_inf)
         } else {
-            (b.cast(zero, dtype), b.cast(neg_inf, dtype))
+            (b.cast(zero, dtype)?, b.cast(neg_inf, dtype)?)
         };
-        Self {
-            rows: b.binary(BinOp::Ge, len, b.reshape(ends, vec![1, 1, lk, 1])),
-            columns: b.binary(BinOp::Ge, len, b.reshape(ends, vec![1, 1, 1, lk])),
-            zero_rows: b.reshape(zero, vec![1, 1, lk, 1]),
-            neg_inf_columns: b.reshape(neg_inf, vec![1, 1, 1, lk]),
-        }
+        Ok(Self {
+            rows: b.binary(BinOp::Ge, len, b.reshape(ends, vec![1, 1, lk, 1])?)?,
+            columns: b.binary(BinOp::Ge, len, b.reshape(ends, vec![1, 1, 1, lk])?)?,
+            zero_rows: b.reshape(zero, vec![1, 1, lk, 1])?,
+            neg_inf_columns: b.reshape(neg_inf, vec![1, 1, 1, lk])?,
+        })
     }
 }

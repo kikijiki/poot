@@ -15,16 +15,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use poot_executor::{DeviceTime, Executor, NoSync, StateScope, StepInputs};
+use poot_graph_ir::test_support::scan::{ScanFixture, ScanGraph};
 use poot_graph_ir::{Graph, ValueId};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
-    Submission, Target, TargetSet, compile_staged,
+    CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_tensor::HostTensor;
-use poot_test_util::scan::{ScanFixture, ScanGraph};
 
-use crate::weight_map::{TIER2, assert_close};
+use crate::{TIER2, assert_close};
 
 /// The oracle's evaluation of a graph over bound host tensors: its one output.
 pub type Oracle<'a> = dyn Fn(&Graph, &HashMap<ValueId, HostTensor>) -> HostTensor + 'a;
@@ -167,7 +168,7 @@ fn step_once(
     entry: poot_executor::EntryId,
     step: &ScanFixture,
     scan: &ScanGraph,
-    window: &poot_test_util::scan::ScanInputs,
+    window: &poot_graph_ir::test_support::scan::ScanInputs,
 ) -> Result<HostTensor, poot_executor::ExecError> {
     let bound = step.bind(scan, window);
     let mut step_inputs = StepInputs::new();

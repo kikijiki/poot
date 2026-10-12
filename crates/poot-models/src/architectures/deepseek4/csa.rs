@@ -23,6 +23,7 @@ use super::sliding::{Compressed, Local, rotate_tail};
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::sparse_top_k::{keep_top_k_mask, pairwise_rank};
 use crate::components::standard::Step;
+use crate::model::{ParamBlock, TraceError, WiringError};
 
 /// A CSA layer's lightning indexer: its query projection from the low-rank query, the per-head
 /// weights projection and its own compressor.
@@ -34,10 +35,12 @@ pub(super) struct IndexerWeights {
 }
 
 impl IndexerWeights {
-    pub fn new(map: &WeightMap, layer: usize, cfg: &DeepseekV4Config) -> Result<Self, WeightError> {
-        let ix = cfg
-            .indexer
-            .expect("a CSA layer exists only in a config that read the indexer's dimensions");
+    pub(super) fn new(
+        map: &WeightMap,
+        layer: usize,
+        cfg: &DeepseekV4Config,
+    ) -> Result<Self, WeightError> {
+        let ix = *WiringError::require(&cfg.indexer, ParamBlock::Indexer)?;
         let w = |role, shape: &[usize]| {
             Weight::new(map, WeightId::layer(layer, WeightRole::Dsa(role)), shape)
         };
@@ -59,36 +62,51 @@ impl IndexerWeights {
 
 /// The pooled entries of overlapping windows: `kv` and `gate` (with its position bias) are
 /// `[rows, windows, rate, 2 * entry]`; the result is `[rows, windows, entry]`, before the norm.
-pub(super) fn overlap_pool(b: &Builder, kv: Traced, gate: Traced, entry: usize) -> Traced {
-    let windows = b.aval(kv).shape[1];
-    let half = |x: Traced, i: usize| b.slice(x, 3, i * entry, (i + 1) * entry);
+pub(super) fn overlap_pool(
+    b: &Builder,
+    kv: Traced,
+    gate: Traced,
+    entry: usize,
+) -> Result<Traced, TraceError> {
+    let windows = b.aval(kv)?.shape[1];
+    let half =
+        |x: Traced, i: usize| Ok::<_, TraceError>(b.slice(x, 3, i * entry, (i + 1) * entry)?);
     // Window 0's predecessor: zero keys and a dropped gate, shaped like one window's Ca half.
-    let zero = b.binary_scalar(BinOp::Mul, b.slice(half(kv, 0), 1, 0, 1), Scalar::F32(0.0));
-    let dropped = b.binary_scalar(BinOp::Add, zero, Scalar::F32(DROPPED));
+    let zero = b.binary_scalar(
+        BinOp::Mul,
+        b.slice(half(kv, 0)?, 1, 0, 1)?,
+        Scalar::F32(0.0),
+    )?;
+    let dropped = b.binary_scalar(BinOp::Add, zero, Scalar::F32(DROPPED))?;
     let previous = |x: Traced, pad: Traced| {
         if windows > 1 {
-            b.concat(1, &[pad, b.slice(half(x, 0), 1, 0, windows - 1)])
+            Ok::<_, TraceError>(b.concat(1, &[pad, b.slice(half(x, 0)?, 1, 0, windows - 1)?])?)
         } else {
-            pad
+            Ok::<_, TraceError>(pad)
         }
     };
-    let kv = b.concat(2, &[previous(kv, zero), half(kv, 1)]);
-    let gate = b.concat(2, &[previous(gate, dropped), half(gate, 1)]);
+    let kv = b.concat(2, &[previous(kv, zero)?, half(kv, 1)?])?;
+    let gate = b.concat(2, &[previous(gate, dropped)?, half(gate, 1)?])?;
     softmax_pool(b, kv, gate)
 }
 
 /// The additive mask keeping, per query token, the `topk` best-scoring of the windows it may read
 /// (`readable`, `[rows, 1, tokens, windows]`): the scores plus `readable` are ranked, so a window the
 /// query cannot read is never picked over one it can, and `readable` stays in the result.
-fn select_top_k(b: &Builder, scores: Traced, readable: Traced, topk: usize) -> Traced {
-    let rank = pairwise_rank(b, b.binary(BinOp::Add, scores, readable));
-    let keep = keep_top_k_mask(b, rank, topk);
+fn select_top_k(
+    b: &Builder,
+    scores: Traced,
+    readable: Traced,
+    topk: usize,
+) -> Result<Traced, TraceError> {
+    let rank = pairwise_rank(b, b.binary(BinOp::Add, scores, readable)?)?;
+    let keep = keep_top_k_mask(b, rank, topk)?;
     let dropped = b.binary_scalar(
         BinOp::Mul,
-        b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0)),
+        b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0))?,
         Scalar::F32(-DROPPED),
-    );
-    b.binary(BinOp::Add, readable, dropped)
+    )?;
+    Ok(b.binary(BinOp::Add, readable, dropped)?)
 }
 
 /// A CSA layer's compressed attention inputs: its overlapping-window entries and, per query token,
@@ -103,10 +121,8 @@ pub(super) fn compressed(
     compressor: &CompressorWeights,
     indexer: &IndexerWeights,
     cfg: &DeepseekV4Config,
-) -> Option<Compressed> {
-    let ix = cfg
-        .indexer
-        .expect("a CSA layer exists only in a config that read the indexer's dimensions");
+) -> Result<Option<Compressed>, TraceError> {
+    let ix = *WiringError::require(&cfg.indexer, ParamBlock::Indexer)?;
     let shape = step.shape();
     let (r, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let rate = cfg.csa_rate;
@@ -143,42 +159,44 @@ pub(super) fn compressed(
         rope,
         cfg,
     );
-    let (keys, index_keys) = (keys?, index_keys?);
+    let (Some(keys), Some(index_keys)) = (keys?, index_keys?) else {
+        return Ok(None);
+    };
 
     // Per indexer head: the query from the low-rank query, rotated at the token's position.
-    let q = linear(b, local.q_res, &indexer.q, None);
+    let q = linear(b, local.q_res, &indexer.q, None)?;
     let q = b.transpose(
-        b.reshape(q, vec![r, t, ix.heads, ix.head_dim]),
+        b.reshape(q, vec![r, t, ix.heads, ix.head_dim])?,
         vec![0, 2, 1, 3],
-    );
-    let q = rotate_tail(b, q, &local.rows, rope_dim);
+    )?;
+    let q = rotate_tail(b, q, &local.rows, rope_dim)?;
 
     let n = windows_in(cap, rate);
-    let keys_per_head = ops::repeat_kv(b, index_keys, ix.heads);
-    let dots = b.matmul(q, b.transpose(keys_per_head, vec![0, 1, 3, 2]));
+    let keys_per_head = ops::repeat_kv(b, index_keys, ix.heads)?;
+    let dots = b.matmul(q, b.transpose(keys_per_head, vec![0, 1, 3, 2])?)?;
     let scored = b.binary_scalar(
         BinOp::Mul,
-        ops::relu(b, dots),
+        ops::relu(b, dots)?,
         Scalar::F32((ix.head_dim as f32).powf(-0.5)),
-    );
+    )?;
     let head_weights = b.binary_scalar(
         BinOp::Mul,
         b.reshape(
-            b.transpose(linear(b, normed, &indexer.weights, None), vec![0, 2, 1]),
+            b.transpose(linear(b, normed, &indexer.weights, None)?, vec![0, 2, 1])?,
             vec![r, ix.heads, t, 1],
-        ),
+        )?,
         Scalar::F32((ix.heads as f32).powf(-0.5)),
-    );
+    )?;
     let scores = b.reduce(
         RedOp::Sum,
-        b.binary(BinOp::Mul, scored, head_weights),
+        b.binary(BinOp::Mul, scored, head_weights)?,
         1,
         true,
-    );
+    )?;
 
-    let readable = complete_windows(b, step, rate, n);
-    Some(Compressed {
+    let readable = complete_windows(b, step, rate, n)?;
+    Ok(Some(Compressed {
         entries: keys,
-        mask: select_top_k(b, scores, readable, ix.topk.min(n)),
-    })
+        mask: select_top_k(b, scores, readable, ix.topk.min(n))?,
+    }))
 }

@@ -5,6 +5,7 @@
 //! Everything here is host-only planning. A placement the target set cannot carry is refused before a
 //! stage is compiled, so no device is touched.
 
+use crate::refusal::RefusalDtypes;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use poot_graph_ir::{
@@ -24,7 +25,7 @@ use crate::multi_device::{
 };
 use crate::passes::BoundaryDescriptor;
 use crate::predicates::GraphTables;
-use crate::{Capability, CollectiveKind, Program, Refusal, RefusalDtypes, ShardedGraph, Target};
+use crate::{Capability, CollectiveKind, Program, Refusal, ShardedGraph, Target};
 
 /// What the partition asked for that this slice cannot do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

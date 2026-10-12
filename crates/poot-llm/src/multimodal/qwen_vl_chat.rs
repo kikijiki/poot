@@ -21,7 +21,7 @@ use super::qwen_vl_image::{
     Qwen25VlVideoMetadata, assemble_qwen2_5_vl_raw_request_mrope_model_input,
 };
 use super::qwen_vl_mrope::{QwenVlMropeMetadataLoadError, load_qwen_vl_mrope_source_metadata};
-use crate::text::chat::{read_tokenizer_config_chat, render_jinja_value};
+use poot_text::{read_tokenizer_config_chat, render_jinja_value};
 
 const VISION_END_DELIMITER: &str = "<|vision_end|>";
 /// One typed Qwen2.5-VL chat message.

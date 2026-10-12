@@ -14,7 +14,7 @@
 
 mod common;
 
-use poot_executor_parity::dense::{Dense, Family};
+use poot_models::test_support::dense::{Dense, Family};
 
 /// Tiny GQA config (n_heads != n_kv_heads, unlike the MHA OLMo-2-1B), as in
 /// `batched_prefill.rs`, to exercise the n_rep repeat path.

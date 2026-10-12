@@ -13,6 +13,8 @@
 pub mod fixtures;
 pub mod interp;
 pub mod naming;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -514,7 +516,7 @@ ir_node! {
         /// program order by the importer; 0 is reserved to mean "no fault" in the SpirvVulkan error word
         /// below, so a real code is never 0). `codegen` lowers this to a real device trap on ROCm/PTX; on
         /// SpirvVulkan, which has no compute trap instruction, it atomically writes `code` to a reserved
-        /// per-dispatch error-word buffer and returns, and the executor (`poot-runtime`/`poot-gpu`) checks
+        /// per-dispatch error-word buffer and returns, and the executor (`poot-wgpu-runtime`/`poot-wgpu-device`) checks
         /// that word at its existing sync point and turns a nonzero value into a typed fault naming the
         /// kernel and this code (card 531c decision 3).
         Trap { code: u32 },
@@ -610,7 +612,11 @@ pub use verify::{Site, VerifyError, VerifyErrorKind};
 /// operands whose types agree with the rvalue and the place they feed, stores only through mutable buffer
 /// bindings, and no local read on a path where it was never assigned.
 mod verify {
-    use super::*;
+    use super::{
+        BasicBlock, BinOp, BlockId, Body, Constant, FRAGMENT_COLLECTIVE_LANES, FragmentTy,
+        IndexAxis, Local, Operand, Place, ProjectionElem, Rvalue, Statement, Terminator, Ty,
+        WmmaMat, WmmaShape, WorkgroupLocalDecl,
+    };
     use std::collections::HashSet;
     use std::fmt;
 
@@ -2304,10 +2310,8 @@ mod tests {
     #[test]
     fn well_formed_bodies_verify() {
         // card 671: the other fixtures this test used to cover (vadd_loop_kernel, gemv_loop_kernel,
-        // square_kernel, matmul_kernel, e4m3fn_encode/decode_kernel) moved to poot-test-util, whose own
-        // kernel_fixtures tests now verify them - poot-kernel-ir cannot dev-depend on poot-test-util for
-        // its own unit tests (poot-test-util regular-depends on poot-kernel-ir, so the lib-test unit
-        // would compile two mismatched instances of Body).
+        // square_kernel, matmul_kernel, e4m3fn_encode/decode_kernel) live in `test_support`, whose own
+        // `fixture_bodies_verify` test verifies them.
         add_body().verify().unwrap();
         let body = fixtures::add_kernel();
         body.verify()
@@ -4000,8 +4004,8 @@ mod tests {
 
     // --- card 628: BinaryOpNoContract ------------------------------------------------------------
 
-    // card 671: no_contract_probe_kernel moved to poot-test-util (see well_formed_bodies_verify's
-    // comment); poot_test_util::kernel_fixtures's own tests cover
+    // card 671: no_contract_probe_kernel lives in `test_support` (see well_formed_bodies_verify's
+    // comment); `test_support::tests::fixture_bodies_verify` covers
     // no_contract_probe_kernel(true/false).verify().
 
     /// `Body::verify` must reject a `BinaryOpNoContract` whose `op` is not `Add`/`Sub`/`Mul` (`Div` here),

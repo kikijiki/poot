@@ -16,10 +16,10 @@ use poot_executor_parity::{ConstFixture, run_once};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{AttentionAttrs, OpKind};
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission, compile};
+use poot_graph_plan::{CompileLimits, CompileOptions, compile, production_plan::Submission};
 use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::HostTensor;
-use poot_test_util::device_skip::open_or_skip;
 use poot_vulkan_device::VulkanDevice;
 use std::collections::HashMap;
 
@@ -43,13 +43,13 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
     let target = device.target();
     let (hq, l, d) = (512usize, 130usize, 4usize);
     let scale = 0.3f32;
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hq, l, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, l, d]));
-    let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+    let k = b.constant("k", TensorType::f32(vec![1, hq, l, d])).unwrap();
+    let v = b.constant("v", TensorType::f32(vec![1, hq, l, d])).unwrap();
+    let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
     let ids = [q.id(), k.id(), v.id(), mask.id()];
-    let mut plan = b.append_plan(0);
+    let mut plan = b.append_plan(0).unwrap();
     let o = plan
         .equation(
             OpKind::Attention(AttentionAttrs::new(1, scale, None)),

@@ -78,12 +78,6 @@ impl DeviceStoreFence {
     }
 }
 
-/// Cumulative architecture store fences issued through [`DeviceStoreFence::issue`].
-#[cfg(test)]
-pub(crate) fn issued_device_store_fence_count() -> usize {
-    ISSUED_DEVICE_STORE_FENCES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Swap the fence counter to zero and return the previous count (receipt / tests).
 pub fn take_issued_device_store_fence_count() -> usize {
     ISSUED_DEVICE_STORE_FENCES.swap(0, std::sync::atomic::Ordering::Relaxed)
@@ -256,7 +250,7 @@ pub(crate) trait AqlChunkSink {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::convert::Infallible;
     use std::sync::Mutex;
@@ -619,5 +613,10 @@ mod tests {
             1
         );
         assert_eq!(sink.events.last(), Some(&Event::Doorbell(375)));
+    }
+
+    /// Cumulative architecture store fences issued through [`DeviceStoreFence::issue`].
+    pub(crate) fn issued_device_store_fence_count() -> usize {
+        ISSUED_DEVICE_STORE_FENCES.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

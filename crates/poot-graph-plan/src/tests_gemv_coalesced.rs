@@ -8,6 +8,7 @@
 //! Shapes deliberately include N and K that are not multiples of `GEMV_TILE` (32) or `STRIPS` (4), so a
 //! partial-tile column or a short last K-strip is exercised.
 
+use crate::predicates::{GEMV_TILE, GEMV_WIDTH};
 use std::collections::HashMap;
 
 use poot_kernel_ir::{
@@ -15,7 +16,6 @@ use poot_kernel_ir::{
 };
 
 use crate::imported::ImportedKernel;
-use crate::{GEMV_TILE, GEMV_WIDTH};
 
 #[derive(Clone, Copy, Debug)]
 enum Val {
@@ -534,10 +534,10 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
     use poot_graph_ir::{Builder, TensorType};
 
     for n in [1usize, 31, 32, 33, 100, 4096, 70_000, 201_088] {
-        let bld = Builder::new();
-        let x = bld.constant("x", TensorType::f32(vec![1, 1]));
-        let w = bld.constant("w", TensorType::f32(vec![1, n]));
-        let y = bld.matmul(x, w);
+        let bld = Builder::for_tests();
+        let x = bld.constant("x", TensorType::f32(vec![1, 1])).unwrap();
+        let w = bld.constant("w", TensorType::f32(vec![1, n])).unwrap();
+        let y = bld.matmul(x, w).unwrap();
         let g = bld.finish(y).unwrap();
         let eqn = &g.eqns()[0];
         let plan = crate::plan_eqn(
@@ -545,7 +545,7 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
             eqn,
             poot_target::Backend::SpirvVulkan,
             &poot_test_util::device_caps::default_caps_for(poot_target::Backend::SpirvVulkan),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap();
         let grid = match plan.single() {
@@ -577,10 +577,10 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
         "this Y-spill shape must be within the SpirvVulkan-chunked range - if this ever fails, this \
          test's premise (an uncapped watchdog budget never chunks) may need revisiting too"
     );
-    let bld = Builder::new();
-    let x = bld.constant("x", TensorType::f32(vec![1, 1]));
-    let w = bld.constant("w", TensorType::f32(vec![1, n]));
-    let y = bld.matmul(x, w);
+    let bld = Builder::for_tests();
+    let x = bld.constant("x", TensorType::f32(vec![1, 1])).unwrap();
+    let w = bld.constant("w", TensorType::f32(vec![1, n])).unwrap();
+    let y = bld.matmul(x, w).unwrap();
     let g = bld.finish(y).unwrap();
     let eqn = &g.eqns()[0];
     let spirv = poot_target::Backend::SpirvVulkan;
@@ -593,7 +593,7 @@ fn gemv_coalesced_grid_matches_dispatch_formula() {
         eqn,
         spirv,
         &no_watchdog_caps,
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
     let grid = match plan.single() {

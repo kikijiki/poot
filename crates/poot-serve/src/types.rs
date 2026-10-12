@@ -6,13 +6,11 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use poot_llm::MropePositionIds;
-use poot_llm::Sampler;
-use poot_llm::TokenLogprob;
-use poot_llm::driver::ModelHandle;
 use poot_llm::driver::error::FailureClass;
-use poot_llm::driver::{AdapterRef, DriverCaps, Encoded, PromptEmbeds};
+use poot_llm::driver::{AdapterRef, DriverCaps, Encoded, ModelHandle, PromptEmbeds};
 use poot_llm::encoders::Pooling;
+use poot_llm::{Sampler, TokenLogprob};
+use poot_models::mrope::MropePositionIds;
 
 use crate::metrics::Metrics;
 use crate::vision::ImageClient;
@@ -294,6 +292,12 @@ impl GenEvent {
     }
 }
 
+thread_local! {
+    /// Told the metrics at the instant a terminal's count is published and its event not yet sent.
+    /// Installed by a test on its own thread; none in a served build.
+    static DELIVERY_RECORDER: std::cell::Cell<Option<fn(&Metrics)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Publish a terminal `Done`'s outcome count, then deliver it: the order [`GenEvent::failed`] uses for
 /// failures, so a consumer that reads the event and then scrapes `/metrics` never sees a stale count.
 /// Card 051's rule: delivered -> `requests_completed`, undelivered (the reply receiver is already gone)
@@ -305,8 +309,9 @@ impl GenEvent {
 pub(crate) fn deliver_terminal<T>(metrics: &Metrics, reply: &Sender<T>, event: T) -> bool {
     let predicted = !reply.is_disconnected();
     metrics.record_terminal(predicted);
-    #[cfg(test)]
-    terminal_delivery_probe::record(metrics);
+    if let Some(record) = DELIVERY_RECORDER.get() {
+        record(metrics);
+    }
     let delivered = reply.send(event).is_ok();
     if predicted != delivered {
         tracing::debug!(
@@ -407,17 +412,14 @@ impl GenerationError {
 }
 
 /// Test-only record of what `/metrics` would report at the instant [`deliver_terminal`] publishes a
-/// terminal outcome and sends its event. A consumer that reads the event and then scrapes
-/// `/metrics` sees exactly this snapshot, so a test can assert the count was already published at
-/// delivery instead of racing the delivering thread's next instruction; a path that bypasses
-/// `deliver_terminal` records nothing and the test's `expect` fails. Snapshots are tagged with the
-/// recording thread, so a test reads its own producer's record even when other tests record into
-/// the same process. Like `startup::select_serve_route_probe`, it compiles out of production builds.
+/// terminal outcome and sends its event. A consumer that reads the event and then scrapes `/metrics`
+/// sees exactly this snapshot, so a test can assert the count was already published at delivery
+/// instead of racing the delivering thread's next instruction; a path that bypasses `deliver_terminal`
+/// records nothing and the test's `expect` fails. One slot per thread, installed by the test.
 #[cfg(test)]
 pub(crate) mod terminal_delivery_probe {
-    use std::sync::Mutex;
+    use std::cell::Cell;
     use std::sync::atomic::Ordering;
-    use std::thread::ThreadId;
 
     use crate::metrics::Metrics;
 
@@ -428,38 +430,29 @@ pub(crate) mod terminal_delivery_probe {
         pub(crate) errored: u64,
     }
 
-    static RECORD: Mutex<Vec<(ThreadId, Snapshot)>> = Mutex::new(Vec::new());
+    thread_local! {
+        static LAST: Cell<Option<Snapshot>> = const { Cell::new(None) };
+    }
 
-    /// Record the outcome counters as they stand right now, on the calling thread.
-    pub(crate) fn record(metrics: &Metrics) {
+    fn record(metrics: &Metrics) {
         let snapshot = Snapshot {
             completed: metrics.requests_completed.load(Ordering::Relaxed),
             cancelled: metrics.requests_cancelled.load(Ordering::Relaxed),
             errored: metrics.requests_errored.load(Ordering::Relaxed),
         };
-        RECORD
-            .lock()
-            .expect("terminal delivery probe lock")
-            .push((std::thread::current().id(), snapshot));
+        LAST.with(|last| last.set(Some(snapshot)));
     }
 
-    /// The most recent snapshot `thread` recorded at a `Done` delivery.
-    pub(crate) fn at_delivery(thread: ThreadId) -> Option<Snapshot> {
-        RECORD
-            .lock()
-            .expect("terminal delivery probe lock")
-            .iter()
-            .rev()
-            .find(|(recorded, _)| *recorded == thread)
-            .map(|(_, snapshot)| *snapshot)
+    /// Record the outcome counters at each terminal delivery the calling thread makes from now on, and
+    /// drop any earlier snapshot, so a path that bypasses `deliver_terminal` yields `None` from
+    /// [`at_delivery`] instead of a stale pass.
+    pub(crate) fn reset() {
+        super::DELIVERY_RECORDER.set(Some(record));
+        LAST.with(|last| last.set(None));
     }
 
-    /// Drop every snapshot `thread` recorded, so its next delivery must record one: a path that
-    /// bypasses `deliver_done` then yields `None` from [`at_delivery`] instead of a stale pass.
-    pub(crate) fn reset(thread: ThreadId) {
-        RECORD
-            .lock()
-            .expect("terminal delivery probe lock")
-            .retain(|(recorded, _)| *recorded != thread);
+    /// The most recent snapshot the calling thread recorded at a terminal delivery.
+    pub(crate) fn at_delivery() -> Option<Snapshot> {
+        LAST.with(|last| last.get())
     }
 }

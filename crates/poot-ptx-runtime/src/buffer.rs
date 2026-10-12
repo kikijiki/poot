@@ -1,11 +1,12 @@
+use poot_runtime_common::{AllocGuard, BufferRole};
+use poot_target::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
 use std::sync::Arc;
 
 use cudarc::driver::sys;
 
-use super::error::{BufferElement, BufferStorage, LogicalDType, PtxError, StorageLayout};
+use super::error::PtxError;
 use super::owner::PtxOwner;
 use poot_runtime_common::CopyRange;
-pub use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot};
 
 /// A device-resident native buffer. Cloning shares the underlying allocation (`Arc`-backed, like the wgpu
 /// `DeviceBuffer`, R471-010); used for reshape (which aliases its input) and for carrying KV state across
@@ -42,7 +43,7 @@ impl PtxBuffer {
     }
 
     /// Immutable native element representation (card 527: the physical word of [`Self::storage`]).
-    pub fn element(&self) -> BufferElement {
+    pub fn element(&self) -> ElementKind {
         self.alloc.storage.element()
     }
 
@@ -61,21 +62,6 @@ impl PtxBuffer {
     /// layout together, set at allocation from the plan's storage record.
     pub fn storage(&self) -> BufferStorage {
         self.alloc.storage
-    }
-
-    /// Replace this buffer's recorded storage with `storage` (card 527). The low-level
-    /// `PtxContext::upload_*` methods tag a buffer by which method was called, which is right for the
-    /// common case but wrong when a caller needs to record a different logical decision than the upload
-    /// method's default; the caller, which knows the plan's real decision for this value, retags the
-    /// freshly uploaded buffer before binding it.
-    ///
-    /// Panics if this handle already has another clone (`with_storage` retags the one live allocation;
-    /// a shared buffer must be retagged before its first clone, never after).
-    pub fn with_storage(mut self, storage: BufferStorage) -> Self {
-        Arc::get_mut(&mut self.alloc)
-            .expect("with_storage: buffer already has another clone; retag before sharing it")
-            .storage = storage;
-        self
     }
 }
 
@@ -106,34 +92,6 @@ pub(crate) fn checked_layout(
             elements,
             element_bytes,
         },
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn checked_buffer(
-    ptr: sys::CUdeviceptr,
-    op: &'static str,
-    elements: usize,
-    storage: BufferStorage,
-    owner: Option<Arc<PtxOwner>>,
-) -> Result<PtxBuffer, PtxError> {
-    let (elem_count, byte_capacity) = checked_layout(op, elements, storage)?;
-    let guard = owner.as_ref().map(|owner| {
-        std::mem::ManuallyDrop::new(
-            owner
-                .memory
-                .record_alloc(BufferRole::Activation, byte_capacity as u64),
-        )
-    });
-    Ok(PtxBuffer {
-        alloc: Arc::new(PtxAlloc {
-            ptr,
-            elem_count,
-            byte_capacity,
-            storage,
-            owner,
-            guard,
-        }),
     })
 }
 
@@ -225,7 +183,7 @@ pub(crate) fn checked_copy<T>(
 
 /// Validate a byte range against `buf`'s capacity alone, with no storage/dtype check (Card 547a: the
 /// storage-typed primitive's own range check, deliberately dtype-agnostic - [`PtxContext::write_with`]/
-/// [`PtxContext::read_bytes`] serve any role's buffer, mirroring `poot_runtime::Context::write_with`'s
+/// [`PtxContext::read_bytes`] serve any role's buffer, mirroring `poot_wgpu_runtime::Context::write_with`'s
 /// lack of a storage check).
 pub(crate) fn checked_byte_range(
     op: &'static str,
@@ -259,5 +217,37 @@ impl Drop for PtxAlloc {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    pub(crate) fn checked_buffer(
+        ptr: sys::CUdeviceptr,
+        op: &'static str,
+        elements: usize,
+        storage: BufferStorage,
+        owner: Option<Arc<PtxOwner>>,
+    ) -> Result<PtxBuffer, PtxError> {
+        let (elem_count, byte_capacity) = checked_layout(op, elements, storage)?;
+        let guard = owner.as_ref().map(|owner| {
+            std::mem::ManuallyDrop::new(
+                owner
+                    .memory
+                    .record_alloc(BufferRole::Activation, byte_capacity as u64),
+            )
+        });
+        Ok(PtxBuffer {
+            alloc: Arc::new(PtxAlloc {
+                ptr,
+                elem_count,
+                byte_capacity,
+                storage,
+                owner,
+                guard,
+            }),
+        })
     }
 }

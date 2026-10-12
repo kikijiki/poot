@@ -5,7 +5,7 @@ use poot_graph_ir::ops::gdn_prefill_chunked;
 use poot_graph_ir::{Builder, Slot, StateRole, TensorType};
 use poot_tensor::HostTensor;
 
-use poot_test_util::StepFixture;
+use poot_eval::test_support::StepFixture;
 
 use crate::{Fixture, store_from_tensors};
 
@@ -73,23 +73,31 @@ fn inputs(seed: u64) -> GdnInputs {
 
 /// Two chunked prefill calls over one carried state.
 pub fn gdn_prefill_chunked_case() -> GdnChunkedCase {
-    let b = Builder::new();
-    let slot =
-        |tag: &str, shape: Vec<usize>| b.slot_named(Slot::Activation, tag, TensorType::f32(shape));
+    let b = Builder::for_tests();
+    let slot = |tag: &str, shape: Vec<usize>| {
+        b.slot_named(Slot::Activation, tag, TensorType::f32(shape))
+            .unwrap()
+    };
     let q = slot("gdn.q", vec![1, H_K, LEN, D]);
     let k = slot("gdn.k", vec![1, H_K, LEN, D]);
     let v = slot("gdn.v", vec![1, H_V, LEN, D]);
     let g = slot("gdn.g", vec![1, H_V, LEN, 1]);
     let beta = slot("gdn.beta", vec![1, H_V, LEN, 1]);
-    let state = b.state_input(
-        "gdn.state",
-        TensorType::f32(vec![1, H_V, D, D]),
-        StateRole::Recurrent,
-    );
-    let tril_incl = b.constant("gdn.tril_incl", TensorType::f32(vec![1, 1, CHUNK, CHUNK]));
-    let tril_strict = b.constant("gdn.tril_strict", TensorType::f32(vec![1, 1, CHUNK, CHUNK]));
+    let state = b
+        .state_input(
+            "gdn.state",
+            TensorType::f32(vec![1, H_V, D, D]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let tril_incl = b
+        .constant("gdn.tril_incl", TensorType::f32(vec![1, 1, CHUNK, CHUNK]))
+        .unwrap();
+    let tril_strict = b
+        .constant("gdn.tril_strict", TensorType::f32(vec![1, 1, CHUNK, CHUNK]))
+        .unwrap();
     let (out, state_out) =
-        gdn_prefill_chunked(&b, q, k, v, g, beta, state, tril_incl, tril_strict, CHUNK);
+        gdn_prefill_chunked(&b, q, k, v, g, beta, state, tril_incl, tril_strict, CHUNK).unwrap();
     let graph = b
         .finish(poot_graph_ir::Outputs::new(out).with_state(&[(state, state_out)]))
         .unwrap();

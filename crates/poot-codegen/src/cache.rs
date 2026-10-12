@@ -8,13 +8,14 @@
 //! A stable root would keep stale artifacts across toolchain bumps and emitter edits, and a stale HSACO
 //! silently runs the wrong kernel (a correctness bug), so the toolchain/codegen epoch below is mandatory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
 
 use poot_kernel_ir::Body;
 
@@ -22,7 +23,7 @@ use crate::{CompileError, Target, Toolchain, compile};
 
 /// The content fingerprint of a kernel `Body` (a hash of its `Debug` form): the Body half of every
 /// [`KernelKey`], shared by the wgpu and PTX caches.
-pub fn body_fingerprint(body: &Body) -> u64 {
+pub(crate) fn body_fingerprint(body: &Body) -> u64 {
     poot_runtime_common::fnv1a_bytes(format!("{body:?}").as_bytes())
 }
 
@@ -89,6 +90,183 @@ pub fn epoch(target: Target) -> String {
     )
 }
 
+/// How many epoch directories besides the current one a kind root keeps, newest first by [`epoch_recency`] (last use).
+/// Every emitter edit and toolchain bump mints a directory, and parallel worktrees at different codegen
+/// hashes each use their own, so the bound has to cover the lanes that run at once.
+const RETAINED_EPOCHS: usize = 8;
+
+/// An epoch directory is never removed while its `EPOCH` sidecar is younger than this, whatever its rank.
+/// The sidecar's mtime is the epoch's last use: a cache hit or an adoption at open refreshes it (at most
+/// once per [`SIDECAR_REFRESH_INTERVAL`]), so a long-running process keeps its epoch alive against another
+/// process's prune, and only an epoch idle for this long is removable.
+const EPOCH_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The sidecar is only rewritten when older than this, bounding the cost of tracking use to one `stat` per
+/// hit and one write per hour per epoch.
+const SIDECAR_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+const EPOCH_SIDECAR: &str = "EPOCH";
+
+/// A compiler scratch file (see [`is_scratch_name`]) is only removed once it is this old. A compile of one
+/// kernel takes seconds to minutes, so a file older than this belongs to a process that died.
+const SCRATCH_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// What one prune of a kind root did. Failures are counted and logged, never returned as errors: cleanup
+/// is housekeeping and must not fail the compile that triggered it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PruneReport {
+    removed_epochs: usize,
+    removed_scratch: usize,
+    failures: usize,
+}
+
+/// Whether `name` is a compiler scratch file: `<stem>.<pid>.<nonce>.<ll|tmp|out>`, as produced by
+/// `compile_scratch_paths` (the `.ll` and the temp object) and `KernelCache::scratch_path` (the staged
+/// entry and the compile output). Published entries (`k<epoch>-<fingerprint>.<ext>`) never match.
+fn is_scratch_name(name: &str) -> bool {
+    let mut parts = name.rsplitn(4, '.');
+    let (Some(ext), Some(nonce), Some(pid), Some(stem)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    matches!(ext, "ll" | "tmp" | "out") && digits(nonce) && digits(pid) && !stem.is_empty()
+}
+
+/// When epoch directory `dir` was last in use: the mtime of its `EPOCH` sidecar, which creation writes and
+/// every cache hit refreshes ([`refresh_epoch_sidecar`]). `None` if it cannot be read, which the caller
+/// treats as "keep".
+fn epoch_recency(dir: &Path) -> Option<SystemTime> {
+    std::fs::metadata(dir.join(EPOCH_SIDECAR))
+        .ok()?
+        .modified()
+        .ok()
+}
+
+/// Mark the epoch owning `sidecar` as in use: set the sidecar's mtime to now when it is older than
+/// [`SIDECAR_REFRESH_INTERVAL`]. One `stat` per call and one write per interval per epoch. Best effort: a
+/// missing sidecar (a cache at an explicit directory) is nothing to refresh, and a failed write is logged
+/// and never fails the hit.
+fn refresh_epoch_sidecar(sidecar: &Path) {
+    let Ok(modified) = std::fs::metadata(sidecar).and_then(|m| m.modified()) else {
+        return;
+    };
+    let now = SystemTime::now();
+    if age(now, modified) < SIDECAR_REFRESH_INTERVAL {
+        return;
+    }
+    if let Err(error) = std::fs::File::open(sidecar).and_then(|f| f.set_modified(now)) {
+        tracing::warn!(?sidecar, %error, "could not refresh a kernel cache epoch's last-use time");
+    }
+}
+
+fn age(now: SystemTime, modified: SystemTime) -> Duration {
+    now.duration_since(modified).unwrap_or_default()
+}
+
+/// Bound the disk a kind root (`<base>/<kind>`) holds: remove epoch directories beyond the newest
+/// [`RETAINED_EPOCHS`] that are also older than [`EPOCH_MIN_AGE`], then abandoned scratch inside the
+/// directories that remain. `current` is never removed.
+///
+/// Only a real directory (not a symlink) directly under `root` that carries a regular `EPOCH` sidecar
+/// is an epoch; anything else under the root is left alone, and every removal path is `root.join(name)`
+/// for a name read from `root` itself. A failed removal is counted and logged and the walk continues.
+fn prune_kind_root(root: &Path, current: &str, now: SystemTime) -> PruneReport {
+    let mut report = PruneReport::default();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return report;
+    };
+    let mut epochs: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| e.file_name() != current)
+        .map(|e| e.path())
+        .filter(|dir| {
+            std::fs::symlink_metadata(dir.join(EPOCH_SIDECAR))
+                .is_ok_and(|m| m.file_type().is_file())
+        })
+        .filter_map(|dir| Some((epoch_recency(&dir)?, dir)))
+        .collect();
+    // Newest first; the name breaks ties so the order is deterministic.
+    epochs.sort_by(|a, b| b.cmp(a));
+
+    let mut surviving: Vec<PathBuf> = vec![root.join(current)];
+    let mut doomed = Vec::new();
+    for (rank, (recency, dir)) in epochs.into_iter().enumerate() {
+        if rank >= RETAINED_EPOCHS && age(now, recency) >= EPOCH_MIN_AGE {
+            doomed.push(dir);
+        } else {
+            surviving.push(dir);
+        }
+    }
+    // Oldest first, so a failure part way leaves the newest directories in place.
+    for dir in doomed.into_iter().rev() {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => report.removed_epochs += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(?dir, %error, "could not remove an old kernel cache epoch");
+                report.failures += 1;
+            }
+        }
+    }
+    for epoch_dir in surviving {
+        prune_scratch(&epoch_dir, now, &mut report);
+    }
+    report
+}
+
+/// Remove scratch files older than [`SCRATCH_MIN_AGE`] from the `<mcpu>` directories of one epoch.
+fn prune_scratch(epoch_dir: &Path, now: SystemTime, report: &mut PruneReport) {
+    let Ok(arch_dirs) = std::fs::read_dir(epoch_dir) else {
+        return;
+    };
+    for arch_dir in arch_dirs
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+    {
+        let Ok(files) = std::fs::read_dir(arch_dir.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let abandoned = file.file_type().is_ok_and(|t| t.is_file())
+                && file.file_name().to_str().is_some_and(is_scratch_name)
+                && file
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|modified| age(now, modified) >= SCRATCH_MIN_AGE);
+            if !abandoned {
+                continue;
+            }
+            match std::fs::remove_file(file.path()) {
+                Ok(()) => report.removed_scratch += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(path = ?file.path(), %error, "could not remove abandoned kernel scratch");
+                    report.failures += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Prune `root` once per process: `kernel_cache_root` runs for every executor, and one walk per process is
+/// enough to bound growth across processes.
+fn prune_kind_root_once(root: &Path, current: &str) {
+    static PRUNED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+    let first = PRUNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(root.to_path_buf());
+    if first {
+        let report = prune_kind_root(root, current, SystemTime::now());
+        if report != PruneReport::default() {
+            tracing::info!(?root, ?report, "pruned the kernel cache");
+        }
+    }
+}
+
 /// `POOT_KERNEL_CACHE=0` (also `off`/`false`, case-insensitive) disables the shared cache, without a
 /// rebuild.
 fn kill_switch_active() -> bool {
@@ -129,7 +307,9 @@ fn resolve_base_dir() -> PathBuf {
 ///
 /// Returns `<base>/<kind>/<epoch>/<mcpu-or-target>`; the content-addressed filename is still
 /// `RocmGraphExecutor::artifact_name`'s job. The directory is created (best effort) with a plaintext
-/// `EPOCH` sidecar on first creation, so a mismatch can be diagnosed by hand.
+/// `EPOCH` sidecar on first creation, so a mismatch can be diagnosed by hand. The first call per process for
+/// a `<kind>` also prunes that root's old epochs and abandoned scratch ([`RETAINED_EPOCHS`],
+/// [`EPOCH_MIN_AGE`], [`SCRATCH_MIN_AGE`]), and adopting an existing epoch refreshes its last-use time; a failed removal never fails the call.
 ///
 /// `POOT_KERNEL_CACHE=0`/`off`/`false` bypasses all of this and returns a per-process directory under
 /// `temp_dir()` (still a real directory, since `compile()` needs an output path).
@@ -153,11 +333,14 @@ pub fn kernel_cache_root(kind: &str, target: Target) -> PathBuf {
 
     match std::fs::create_dir_all(&dir) {
         Ok(()) => {
-            let epoch_file = epoch_dir.join("EPOCH");
-            if !epoch_file.exists() {
+            let epoch_file = epoch_dir.join(EPOCH_SIDECAR);
+            if epoch_file.exists() {
+                refresh_epoch_sidecar(&epoch_file);
+            } else {
                 // Best effort: a diagnostic sidecar; a failed write must not stop compilation.
                 let _ = std::fs::write(&epoch_file, epoch_canonical(target));
             }
+            prune_kind_root_once(&base, &epoch_hex);
             dir
         }
         Err(error) => {
@@ -226,7 +409,7 @@ impl KernelKey {
 
 /// The one key function every backend's disk cache uses. Pure: it reads no environment and touches no disk,
 /// so the epoch and target it is given are exactly what scopes the entry.
-pub fn kernel_entry_key(epoch: &str, target: Target, fingerprint: u64) -> KernelKey {
+pub(crate) fn kernel_entry_key(epoch: &str, target: Target, fingerprint: u64) -> KernelKey {
     KernelKey {
         name: format!("k{epoch}-{fingerprint:016x}.{}", target.output_ext()),
         fingerprint,
@@ -388,6 +571,9 @@ impl KernelCache {
             return Ok(None);
         }
         bytes.drain(..ENTRY_HEADER_LEN);
+        if let Some(epoch_dir) = self.dir.parent() {
+            refresh_epoch_sidecar(&epoch_dir.join(EPOCH_SIDECAR));
+        }
         Ok(Some(bytes))
     }
 
@@ -956,5 +1142,296 @@ mod tests {
 
         unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
         let _ = std::fs::remove_dir_all(&want);
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    fn set_mtime(path: &Path, modified: SystemTime) {
+        std::fs::File::open(path)
+            .and_then(|f| f.set_modified(modified))
+            .unwrap();
+    }
+
+    /// `<root>/<name>/{EPOCH,gfx1151/entry.hsaco}`, the epoch last changed `age` before `now`. Returns the
+    /// `<mcpu>` directory.
+    fn make_epoch(root: &Path, name: &str, age: Duration, now: SystemTime) -> PathBuf {
+        let epoch_dir = root.join(name);
+        let arch = epoch_dir.join("gfx1151");
+        std::fs::create_dir_all(&arch).unwrap();
+        std::fs::write(epoch_dir.join("EPOCH"), name).unwrap();
+        std::fs::write(arch.join("entry.hsaco"), name).unwrap();
+        set_mtime(&arch, now - age);
+        set_mtime(&epoch_dir.join("EPOCH"), now - age);
+        set_mtime(&epoch_dir, now - age);
+        arch
+    }
+
+    fn write_aged(path: &Path, age: Duration, now: SystemTime) {
+        std::fs::write(path, b"scratch").unwrap();
+        set_mtime(path, now - age);
+    }
+
+    #[test]
+    fn scratch_names_are_exactly_what_the_compiler_and_the_cache_write() {
+        let artifact = Path::new("/cache/kernel_ab12.hsaco");
+        let (ll, tmp) = crate::compile_scratch_paths(artifact, 4242, 7);
+        let cache = KernelCache::at("/cache", Target::SpirvVulkan);
+        let key = kernel_entry_key("0123456789abcdef", Target::SpirvVulkan, 9);
+        for scratch in [
+            ll,
+            tmp,
+            cache.scratch_path(&key, "tmp"),
+            cache.scratch_path(&key, "out"),
+        ] {
+            let name = scratch.file_name().unwrap().to_str().unwrap();
+            assert!(
+                is_scratch_name(name),
+                "{name} must be recognised as scratch"
+            );
+        }
+        for published in [
+            key.as_str(),
+            "kernel_ab12.hsaco",
+            "EPOCH",
+            "notes.tmp",
+            "a.b.c.ll",
+        ] {
+            assert!(
+                !is_scratch_name(published),
+                "{published} must not be taken for scratch"
+            );
+        }
+    }
+
+    // SC-001
+    #[test]
+    fn prune_keeps_current_and_newest_epochs_and_only_abandoned_scratch_goes() {
+        let root = unique_tmp("prune-retention");
+        let _ = std::fs::remove_dir_all(&root);
+        let now = SystemTime::now();
+        let current = make_epoch(&root, "cur", DAY, now);
+        // RETAINED_EPOCHS + 2 older epochs, epoch `i` last used `2 + i` days ago.
+        let older: Vec<(String, PathBuf)> = (0..RETAINED_EPOCHS + 2)
+            .map(|i| {
+                let name = format!("old{i:02}");
+                let arch = make_epoch(&root, &name, DAY * (2 + i as u32), now);
+                (name, arch)
+            })
+            .collect();
+        write_aged(&current.join("k1-0000000000000001.hsaco"), 5 * DAY, now);
+        write_aged(
+            &current.join("kernel.hsaco.4242.0.ll"),
+            2 * SCRATCH_MIN_AGE,
+            now,
+        );
+        write_aged(
+            &current.join("kernel.hsaco.4242.1.tmp"),
+            2 * SCRATCH_MIN_AGE,
+            now,
+        );
+        write_aged(
+            &current.join("kernel.hsaco.4243.0.tmp"),
+            Duration::from_secs(60),
+            now,
+        );
+        write_aged(&current.join("notes.tmp"), 5 * DAY, now);
+
+        let report = prune_kind_root(&root, "cur", now);
+
+        assert_eq!(
+            report,
+            PruneReport {
+                removed_epochs: 2,
+                removed_scratch: 2,
+                failures: 0
+            }
+        );
+        assert!(root.join("cur").is_dir(), "the current epoch is kept");
+        for (i, (name, _)) in older.iter().enumerate() {
+            assert_eq!(
+                root.join(name).exists(),
+                i < RETAINED_EPOCHS,
+                "{name}: only the {RETAINED_EPOCHS} newest old epochs survive"
+            );
+        }
+        assert!(
+            current.join("kernel.hsaco.4243.0.tmp").exists(),
+            "a recent scratch file may belong to a live compiler and must stay"
+        );
+        assert!(!current.join("kernel.hsaco.4242.0.ll").exists());
+        assert!(!current.join("kernel.hsaco.4242.1.tmp").exists());
+        assert!(
+            current.join("k1-0000000000000001.hsaco").exists(),
+            "an old published entry is not scratch"
+        );
+        assert!(current.join("notes.tmp").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_epoch_used_within_the_day_survives_beyond_the_retained_count() {
+        let root = unique_tmp("prune-live-epoch");
+        let _ = std::fs::remove_dir_all(&root);
+        let now = SystemTime::now();
+        make_epoch(&root, "cur", Duration::ZERO, now);
+        let names: Vec<String> = (0..RETAINED_EPOCHS + 3)
+            .map(|i| format!("old{i:02}"))
+            .collect();
+        for name in &names {
+            make_epoch(&root, name, Duration::from_secs(3600), now);
+        }
+
+        let report = prune_kind_root(&root, "cur", now);
+
+        assert_eq!(report, PruneReport::default());
+        assert!(names.iter().all(|n| root.join(n).is_dir()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // SC-002
+    #[test]
+    fn prune_never_leaves_its_kind_root() {
+        let base = unique_tmp("prune-containment");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("rocm");
+        let now = SystemTime::now();
+        make_epoch(&root, "cur", Duration::ZERO, now);
+        for i in 0..RETAINED_EPOCHS {
+            make_epoch(&root, &format!("keep{i:02}"), DAY * (2 + i as u32), now);
+        }
+        // Past retention by name and age, but not epochs of this root.
+        let old = DAY * 90;
+        make_epoch(&root, "old-real", old, now);
+        make_epoch(&base, "old-real", old, now); // `<base>/<epoch>`: the parent of the root
+        make_epoch(&base.join("rocm-other"), "old-real", old, now); // a sibling kind
+        let outside = unique_tmp("prune-containment-outside");
+        let _ = std::fs::remove_dir_all(&outside);
+        make_epoch(&outside, "target", old, now);
+        std::os::unix::fs::symlink(outside.join("target"), root.join("linked")).unwrap();
+        // Epoch-named but without the sidecar: not ours to delete.
+        std::fs::create_dir_all(root.join("no-sidecar").join("gfx1151")).unwrap();
+        set_mtime(&root.join("no-sidecar"), now - old);
+
+        let report = prune_kind_root(&root, "cur", now);
+
+        assert_eq!(report.removed_epochs, 1, "{report:?}");
+        assert!(!root.join("old-real").exists());
+        assert!(base.join("old-real/gfx1151/entry.hsaco").exists());
+        assert!(
+            base.join("rocm-other/old-real/gfx1151/entry.hsaco")
+                .exists()
+        );
+        assert!(outside.join("target/gfx1151/entry.hsaco").exists());
+        assert!(root.join("linked").is_symlink());
+        assert!(root.join("no-sidecar/gfx1151").is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // SC-003
+    #[test]
+    fn a_removal_failure_does_not_fail_the_cache_that_triggered_the_prune() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        unset_all_cache_env();
+        let base = unique_tmp("prune-failure");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("rocm");
+        let now = SystemTime::now();
+        // The two oldest epochs are removable; the oldest cannot be (its `<mcpu>` directory is read-only,
+        // so its entry cannot be unlinked) and is pruned first.
+        let stuck = make_epoch(&root, "stuck", 90 * DAY, now);
+        make_epoch(&root, "plain", 80 * DAY, now);
+        let kept: Vec<PathBuf> = (0..RETAINED_EPOCHS)
+            .map(|i| make_epoch(&root, &format!("keep{i:02}"), DAY * (2 + i as u32), now))
+            .collect();
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+        unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &base) };
+
+        let target = Target::AmdGcn(AmdArch::gfx1151());
+        let cache = KernelCache::open(target);
+
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
+        assert!(
+            stuck.join("entry.hsaco").exists(),
+            "the fixture must really make the removal fail (a root user ignores permissions)"
+        );
+        assert!(
+            !root.join("plain").exists(),
+            "one failed removal must not stop the next"
+        );
+        assert!(kept.iter().all(|arch| arch.join("entry.hsaco").exists()));
+        let body = sample_body("prune_failure");
+        let key = cache.key(&body);
+        let built = cache
+            .load_or_build(&key, ROOMY, || Ok::<_, CompileError>(b"artifact".to_vec()))
+            .unwrap();
+        assert!(built.built);
+        assert_eq!(
+            cache.load(&key, ROOMY).unwrap().as_deref(),
+            Some(&b"artifact"[..])
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A hit refreshes the epoch's last-use time.
+    #[test]
+    fn an_idle_epoch_whose_sidecar_a_hit_refreshed_survives_the_prune() {
+        let root = unique_tmp("prune-refreshed");
+        let _ = std::fs::remove_dir_all(&root);
+        let now = SystemTime::now();
+        make_epoch(&root, "cur", Duration::ZERO, now);
+        for i in 0..RETAINED_EPOCHS {
+            make_epoch(&root, &format!("keep{i:02}"), DAY * (2 + i as u32), now);
+        }
+        let used = make_epoch(&root, "used", 30 * DAY, now);
+        make_epoch(&root, "unused", 30 * DAY, now);
+        let cache = KernelCache::at(&used, Target::SpirvVulkan);
+        let key = cache.key(&sample_body("refreshed"));
+        cache.store(&key, b"artifact").unwrap();
+        set_mtime(&root.join("used/EPOCH"), now - 30 * DAY);
+
+        assert_eq!(load(&cache, &key).as_deref(), Some(&b"artifact"[..]));
+        let report = prune_kind_root(&root, "cur", SystemTime::now());
+
+        assert!(
+            root.join("used").is_dir(),
+            "a used epoch must survive: {report:?}"
+        );
+        assert!(!root.join("unused").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hit_within_the_refresh_interval_does_not_write_the_sidecar() {
+        let root = unique_tmp("refresh-interval");
+        let _ = std::fs::remove_dir_all(&root);
+        let now = SystemTime::now();
+        let arch = make_epoch(&root, "used", Duration::ZERO, now);
+        let cache = KernelCache::at(&arch, Target::SpirvVulkan);
+        let key = cache.key(&sample_body("interval"));
+        cache.store(&key, b"artifact").unwrap();
+        let sidecar = root.join("used/EPOCH");
+        let recent = now - Duration::from_secs(10 * 60);
+        set_mtime(&sidecar, recent);
+
+        assert!(load(&cache, &key).is_some());
+        let mtime = |p: &Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime(&sidecar),
+            recent,
+            "a hit inside the interval must not write"
+        );
+
+        let stale = now - 2 * SIDECAR_REFRESH_INTERVAL;
+        set_mtime(&sidecar, stale);
+        assert!(load(&cache, &key).is_some());
+        assert!(
+            mtime(&sidecar) > stale,
+            "a hit past the interval must refresh"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

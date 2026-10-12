@@ -31,7 +31,7 @@ use crate::components::dsa::{PooledDsaWeights, pooled_dsa};
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::norm;
 use crate::components::standard::{LayerNorms, LayerParams, StackWeights, Step, standard_layer};
-use crate::model::LogitRows;
+use crate::model::{LogitRows, ParamBlock, TraceError, WiringError};
 
 /// The MTP layer's weights.
 #[derive(Debug)]
@@ -48,7 +48,7 @@ pub(super) struct MtpLayer {
 }
 
 impl MtpLayer {
-    pub fn new(
+    pub(super) fn new(
         map: &WeightMap,
         layer: usize,
         ffn: Ffn,
@@ -69,9 +69,7 @@ impl MtpLayer {
                 map,
                 layer,
                 width,
-                cfg.dsa
-                    .as_ref()
-                    .expect("a checkpoint with an MTP layer has DSA parameters"),
+                WiringError::require(&cfg.dsa, ParamBlock::Dsa)?,
             )?,
             ffn: FfnWeights::new(map, layer, ffn, cfg)?,
         })
@@ -81,45 +79,48 @@ impl MtpLayer {
     /// The step shape names the carry ([`check_mtp_step`](crate::components::standard::check_mtp_step)).
     /// The post-norm state of the last position goes back into row 0 of the carry, the row a
     /// following one-token step reads; under [`LogitRows::Last`] only that position has logits.
-    pub fn trace(
+    pub(super) fn trace(
         &self,
         b: &Builder,
         step: &Step,
         stack: &StackWeights,
         cfg: &Glm53Config,
-    ) -> Traced {
+    ) -> Result<Traced, TraceError> {
         let shape = step.shape();
         let (rows, tokens, width) = (shape.rows.get(), shape.tokens.get(), cfg.width);
         let carry = step
-            .hidden_carry(b, width)
-            .expect("check_mtp_step requires the hidden-state carry");
-        let hidden = step.carried_hidden(b, &carry);
+            .hidden_carry(b, width)?
+            .ok_or(TraceError::Wiring(WiringError::MissingHiddenCarry))?;
+        let hidden = step.carried_hidden(b, &carry)?;
 
         // The first position of a sequence has no token before it to follow: its embedding is
         // zero, whatever the row holds. The zeros come from the I32 positions (`pos * 0`, cast), not
         // from the embedding row, so a non-finite row at position 0 cannot reach the result.
-        let embedded = stack.embed.embed(b, step.tokens());
+        let embedded = stack.embed.embed(b, step.tokens())?;
         let pos = step.pos();
         let wide = |value: Traced| {
-            b.broadcast(
-                b.reshape(value, vec![rows, tokens, 1]),
+            Ok::<_, TraceError>(b.broadcast(
+                b.reshape(value, vec![rows, tokens, 1])?,
                 vec![rows, tokens, width],
-            )
+            )?)
         };
-        let zeros = b.cast(b.binary_scalar(BinOp::Mul, pos, Scalar::I32(0)), DType::F32);
-        let masked = b.select(wide(pos), embedded, wide(zeros));
+        let zeros = b.cast(
+            b.binary_scalar(BinOp::Mul, pos, Scalar::I32(0))?,
+            DType::F32,
+        )?;
+        let masked = b.select(wide(pos)?, embedded, wide(zeros)?)?;
         let fused = linear(
             b,
             b.concat(
                 2,
                 &[
-                    norm(b, masked, &self.enorm, cfg.norm),
-                    norm(b, hidden, &self.hnorm, cfg.norm),
+                    norm(b, masked, &self.enorm, cfg.norm)?,
+                    norm(b, hidden, &self.hnorm, cfg.norm)?,
                 ],
-            ),
+            )?,
             &self.eh_proj,
             None,
-        );
+        )?;
 
         let _scope = b.layer_scope(self.layer);
         let block = standard_layer(
@@ -134,15 +135,15 @@ impl MtpLayer {
                     self.layer,
                     normed,
                     &self.dsa,
-                    cfg.dsa.as_ref().expect("an MTP layer has DSA parameters"),
+                    WiringError::require(&cfg.dsa, ParamBlock::Dsa)?,
                 )
             },
             |b, input| self.ffn.trace(b, step, self.layer, input.block, cfg),
-        );
-        let normed = norm(b, block, &self.head_norm, cfg.norm);
-        step.carry_last_hidden(b, &carry, normed);
+        )?;
+        let normed = norm(b, block, &self.head_norm, cfg.norm)?;
+        step.carry_last_hidden(b, &carry, normed)?;
         let normed = if shape.logits == LogitRows::Last && tokens > 1 {
-            b.slice(normed, 1, tokens - 1, tokens)
+            b.slice(normed, 1, tokens - 1, tokens)?
         } else {
             normed
         };

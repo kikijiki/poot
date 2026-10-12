@@ -274,13 +274,6 @@ impl Driver {
         self.caps.as_ref()
     }
 
-    /// Programs compiled so far: constant across steps drawn from the prepared set. The serving rows read
-    /// it through [`Driver::stats`].
-    #[cfg(test)]
-    pub(crate) fn compile_count(&self) -> u64 {
-        self.stats.compiles
-    }
-
     /// Admit the speculation of the driver's draft policy: a verify-window entry per row count beside
     /// decode, and under a draft model its own decode and prefill entries on a second executable.
     /// The window carries the greedy suffix, and the logits head when a request samples.
@@ -492,5 +485,18 @@ fn piece_key(piece: Piece) -> (usize, LogitRows) {
     match piece {
         Piece::Prefill(n) => (n.get(), LogitRows::Last),
         Piece::Decode => (1, LogitRows::Last),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl Driver {
+        /// Programs compiled so far: constant across steps drawn from the prepared set. The serving rows read
+        /// it through [`Driver::stats`].
+        pub(crate) fn compile_count(&self) -> u64 {
+            self.stats.compiles
+        }
     }
 }

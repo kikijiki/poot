@@ -1,6 +1,7 @@
-use super::*;
-use poot_graph_ir::ContractionRows;
-use poot_graph_ir::ValueTable;
+use super::{
+    EditError, Eqn, Graph, HashMap, HashSet, OpKind, Operand, Storage, ValueId, with_eqns,
+};
+use poot_graph_ir::{ContractionRows, ValueTable};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedDequantErrorContext {
     pub value: ValueId,
@@ -30,8 +31,6 @@ impl std::fmt::Display for PackedDequantErrorContext {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PackedDequantProductionError {
-    #[error("packed contraction {context} was present before Card 355 recognition")]
-    PreexistingContraction { context: PackedDequantErrorContext },
     #[error(
         "packed dequant {context} carrier {carrier} uses {storage:?} storage; Const is required"
     )]
@@ -109,22 +108,6 @@ pub(super) fn packed_consumer_map(g: &Graph) -> ValueTable<Vec<usize>> {
 
 fn is_graph_escape(g: &Graph, value: ValueId) -> bool {
     g.liveness_roots().any(|root| root == value)
-}
-
-#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-672"))]
-pub(crate) fn reject_preexisting_packed_contractions(
-    g: &Graph,
-) -> Result<(), PackedDequantProductionError> {
-    for eqn in g.eqns() {
-        if let OpKind::PackedContraction { descriptor, .. }
-        | OpKind::PackedRowGather { descriptor } = eqn.op
-        {
-            return Err(PackedDequantProductionError::PreexistingContraction {
-                context: PackedDequantErrorContext::new(eqn.out, descriptor),
-            });
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
@@ -626,7 +609,7 @@ pub fn recognize_packed_row_gathers(g: &Graph) -> Result<Graph, EditError> {
 }
 
 /// Card 355's final production policy gate. It scans live equations only, after DCE.
-pub fn reject_packed_dequant_escapes(g: &Graph) -> Result<(), PackedDequantProductionError> {
+pub(crate) fn reject_packed_dequant_escapes(g: &Graph) -> Result<(), PackedDequantProductionError> {
     let consumers = packed_consumer_map(g);
     for (equation, eqn) in g.eqns().iter().enumerate() {
         if let OpKind::PackedRowGather { descriptor } = eqn.op {
@@ -711,6 +694,8 @@ pub fn reject_packed_dequant_escapes(g: &Graph) -> Result<(), PackedDequantProdu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::passes::DType;
+    use crate::passes::ValueMeta;
     use poot_graph_ir::Builder;
     use poot_graph_ir::types::TensorType;
     use poot_quant::PackedWeight;
@@ -723,8 +708,10 @@ mod tests {
     /// The canonical `y = x @ W^T` graph `ops::packed_linear` emits: `[0] PackedDequant, [1]
     /// Transpose([1,0]), [2] MatMul(activation, transposed)`.
     fn canonical_graph() -> Graph {
-        let b = Builder::new();
-        let activation = b.constant("activation", TensorType::f32(vec![2, 64]));
+        let b = Builder::for_tests();
+        let activation = b
+            .constant("activation", TensorType::f32(vec![2, 64]))
+            .unwrap();
         let out =
             poot_graph_ir::ops::packed_linear(&b, activation, "layer", descriptor(), None, None)
                 .unwrap();
@@ -744,7 +731,7 @@ mod tests {
         let dequant_shape = canonical.values()[dequant].aval.shape.clone();
 
         let y = canonical.result();
-        poot_test_util::graph_fixtures::derive(&canonical, |g| {
+        poot_graph_ir::test_support::graph_fixtures::derive(&canonical, |g| {
             let xt = g.values_mut().push(ValueMeta::new(
                 TensorType::f32(vec![activation_shape[1], activation_shape[0]]),
                 Storage::Device,
@@ -779,11 +766,10 @@ mod tests {
     }
 
     /// The graph-level packed-dequant production pipeline (same steps as `transform/tests.rs`'s
-    /// in-crate helper of the same name): validate, drop dead oracle-only decoding, recognize, then
+    /// in-crate helper of the same name): drop dead oracle-only decoding, recognize, then
     /// reject every remaining escape. Driving this instead of `recognize_packed_contractions` alone
     /// proves the reversed spelling survives the real production entry point, not just an isolated call.
     fn prepare_packed_dequant_production(g: &Graph) -> Result<Graph, PackedDequantProductionError> {
-        reject_preexisting_packed_contractions(g)?;
         let graph = crate::passes::cse_dce::dce_with_roots(g, &[]).unwrap();
         let graph = recognize_packed_contractions(&graph).unwrap();
         reject_packed_dequant_escapes(&graph)?;
@@ -832,7 +818,7 @@ mod tests {
             named.values().iter().any(|value| value.name.is_some()),
             "fixture has no named value, so clearing names would prove nothing"
         );
-        let g = poot_test_util::graph_fixtures::derive(&named, |draft| {
+        let g = poot_graph_ir::test_support::graph_fixtures::derive(&named, |draft| {
             for value in draft.values_mut().iter_mut() {
                 value.name = None;
             }
@@ -872,9 +858,11 @@ mod tests {
             PackedWeight::try_new(poot_quant::format::WeightFormat::Q4_0, [3, 64]).unwrap();
         assert_eq!(descriptor.sources(), vec![poot_quant::SourceRole::Blocks]);
 
-        let b = Builder::new();
-        let activation = b.constant("activation", TensorType::f32(vec![2, 64]));
-        let mut plan = b.append_plan(0);
+        let b = Builder::for_tests();
+        let activation = b
+            .constant("activation", TensorType::f32(vec![2, 64]))
+            .unwrap();
+        let mut plan = b.append_plan(0).unwrap();
         let blocks = plan
             .input(
                 "layer.packed_blocks_source",

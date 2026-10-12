@@ -7,7 +7,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use poot_executor::Executor;
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
 
 use crate::GenerationControl;
 use crate::core::sampler::Sampler;
@@ -17,9 +17,7 @@ use crate::driver::{
     Conversation, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, ModelHandle,
     PreparedSetLimits, program_retention,
 };
-use crate::error::TextError;
-use crate::text::chat::Speaker;
-use crate::text::tokenize::TextCodec;
+use poot_text::{Speaker, TextCodec, TextError};
 
 /// Tokens per prefill step at most, a multiple of the model's prefill granule ([`driver_options`]).
 const PREFILL_CHUNK: usize = 128;
@@ -195,7 +193,7 @@ fn driver_options(capacity: NonZeroUsize, granule: NonZeroUsize) -> DriverOption
         decode: compile,
         capacity,
         prefill_chunk: chunk,
-        max_trace_tokens: chunk,
+        trace: super::serving_trace_limits(chunk),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(64).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
@@ -385,12 +383,12 @@ impl ChatSession {
 
 #[cfg(test)]
 mod tests {
-    use poot_models::chat::ChatFormat;
+    use poot_text::ChatFormat;
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
 
     use super::*;
-    use crate::text::tokenize::ChatTemplate;
+    use poot_text::ChatTemplate;
 
     const TEMPLATE: &str = "{% for m in messages %}[{{ m['role'] }}:{{ m['content'] }}]{% endfor %}{% if add_generation_prompt %}[assistant:{% endif %}";
 
@@ -400,9 +398,8 @@ mod tests {
             .unk_token("<unk>".to_string())
             .build()
             .expect("build wordlevel model");
-        TextCodec::new(
+        TextCodec::with_tokenizer(
             Tokenizer::new(model),
-            None,
             None,
             0,
             ChatFormat::ChatML,

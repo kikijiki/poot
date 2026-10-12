@@ -4,7 +4,8 @@
 //! an aborted transaction can never be reused (`Poisoned`).
 
 use poot_graph_ir::{BoundaryId, SlotKey, ValidationPacketError, ValueId};
-use poot_graph_plan::{DeviceId, StageId, SyncId, Target};
+use poot_graph_plan::staged::SyncId;
+use poot_graph_plan::{Target, multi_device::topology::DeviceId, staged::StageId};
 use poot_target::BufferStorage;
 use poot_tensor::DType;
 
@@ -41,7 +42,9 @@ pub enum ExecError {
     Host(Box<dyn std::error::Error + Send + Sync>),
     /// A step reached a sync point and the host handed in [`crate::NoSync`].
     #[error("sync point {point:?} needs a host: the step was run with NoSync")]
-    NoHostSync { point: poot_graph_plan::SyncId },
+    NoHostSync {
+        point: poot_graph_plan::staged::SyncId,
+    },
     /// A coordinator refused a multi-device program or device before any device work.
     #[error(transparent)]
     Coordinator(Box<crate::CoordinatorError>),

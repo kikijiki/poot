@@ -10,16 +10,16 @@
 
 use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::device_validation::ResourceRefusal;
+use poot_graph_plan::test_support::{gpu_caps, gpu_caps_mut};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, KernelChoice, Plan, PlanError,
-    Program, Submission, Target, compile,
+    Program, Target, compile, production_plan::Submission,
 };
 use poot_kernel_ir::{Body, Ty, WmmaDtype, WmmaShape};
 use poot_kernelgen::{ContractionSpec, FragmentUse, KernelRequest};
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried, SubgroupSupport, TensorCoreSupport};
 use poot_tensor::DType;
 use poot_test_util::device_caps::default_caps_for;
-use poot_test_util::graph_fixtures::{gpu_caps, gpu_caps_mut};
 
 fn options() -> CompileOptions {
     CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
@@ -128,19 +128,19 @@ fn invocations(body: &Body) -> u64 {
 /// The generated tiled/serial contraction fixture: `[1, 8, 1024] @ [1024, 8]` f32 plans one generated
 /// contraction with static workgroup memory on NVPTX.
 fn generated_lds_graph() -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::f32(vec![1, 8, 1024]));
-    let w = b.constant("w", TensorType::f32(vec![1024, 8]));
-    let out = b.matmul(a, w);
+    let b = Builder::for_tests();
+    let a = b.constant("a", TensorType::f32(vec![1, 8, 1024])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![1024, 8])).unwrap();
+    let out = b.matmul(a, w).unwrap();
     b.finish(out).unwrap()
 }
 
 /// The imported fixture: a decode GEMV (`M = 1`) on the wgpu target plans the shipped coalesced GEMV.
 fn imported_gemv_graph() -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::f32(vec![1, 1, 256]));
-    let w = b.constant("w", TensorType::f32(vec![256, 512]));
-    let out = b.matmul(a, w);
+    let b = Builder::for_tests();
+    let a = b.constant("a", TensorType::f32(vec![1, 1, 256])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![256, 512])).unwrap();
+    let out = b.matmul(a, w).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -297,13 +297,17 @@ fn an_imported_kernel_over_the_lds_budget_is_refused_before_any_load() {
 /// A matmul whose operands are 16-aligned bf16 and whose output is f32 plans the matrix-fragment kernel
 /// on a WMMA-capable AMD arch.
 fn bf16_fragment_graph() -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::new(vec![1, 16, 32], DType::BF16));
-    let w = b.constant("w", TensorType::new(vec![32, 16], DType::BF16));
-    let out = b.matmul(a, w);
+    let b = Builder::for_tests();
+    let a = b
+        .constant("a", TensorType::new(vec![1, 16, 32], DType::BF16))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![32, 16], DType::BF16))
+        .unwrap();
+    let out = b.matmul(a, w).unwrap();
     let graph = b.finish(out).unwrap();
     let out = graph.result();
-    poot_test_util::graph_fixtures::derive(&graph, |draft| {
+    poot_graph_ir::test_support::graph_fixtures::derive(&graph, |draft| {
         draft.values_mut()[out].aval.dtype = DType::F32;
     })
     .unwrap()
@@ -400,13 +404,17 @@ fn fragment_kernels_need_the_subgroup_and_matrix_hardware_the_device_reports() {
 
 /// The wgpu cooperative-matrix kernel: one 32-lane subgroup per 16x16 tile, f16 operands.
 fn f16_coopmat_graph() -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::new(vec![1, 16, 16], DType::F16));
-    let w = b.constant("w", TensorType::new(vec![16, 16], DType::F16));
-    let out = b.matmul(a, w);
+    let b = Builder::for_tests();
+    let a = b
+        .constant("a", TensorType::new(vec![1, 16, 16], DType::F16))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![16, 16], DType::F16))
+        .unwrap();
+    let out = b.matmul(a, w).unwrap();
     let graph = b.finish(out).unwrap();
     let out = graph.result();
-    poot_test_util::graph_fixtures::derive(&graph, |draft| {
+    poot_graph_ir::test_support::graph_fixtures::derive(&graph, |draft| {
         draft.values_mut()[out].aval.dtype = DType::F32;
     })
     .unwrap()
@@ -440,10 +448,10 @@ fn the_cooperative_matrix_kernel_is_refused_without_subgroups() {
 /// `[1, h, m, k] @ [1, h, k, n]` f32: two batched operands (no shared weight), which no tiled or GEMV
 /// kernel takes, so the planner picks the one-thread-per-output serial kernel.
 fn serial_contraction_graph(h: usize, m: usize, k: usize, n: usize) -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::f32(vec![1, h, m, k]));
-    let w = b.constant("w", TensorType::f32(vec![1, h, k, n]));
-    let out = b.matmul(a, w);
+    let b = Builder::for_tests();
+    let a = b.constant("a", TensorType::f32(vec![1, h, m, k])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![1, h, k, n])).unwrap();
+    let out = b.matmul(a, w).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -499,10 +507,10 @@ fn a_long_serial_contraction_over_the_dispatch_budget_is_refused_before_dispatch
 /// `a + b` over `n` f32 elements: one thread per element, so a device whose grid cap is below
 /// `n / 64` workgroups gets its workgroup widened to 256 by `finalize`.
 fn add_graph(n: usize) -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![n]));
-    let y = b.constant("y", TensorType::f32(vec![n]));
-    let out = b.binary(poot_graph_ir::BinOp::Add, x, y);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![n])).unwrap();
+    let y = b.constant("y", TensorType::f32(vec![n])).unwrap();
+    let out = b.binary(poot_graph_ir::BinOp::Add, x, y).unwrap();
     b.finish(out).unwrap()
 }
 

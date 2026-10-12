@@ -56,7 +56,7 @@ pub use packed::{PackedKernelOp, PackedKernelSpec};
 // dispatch the planner calls none of them):
 //
 // - `poot-codegen`'s cache key fixture (`unary`) and its emitter, probe and parity tests; `pootc`'s import
-//   equivalence tests; `poot-test-util`'s `kernel-fixtures`; `poot-gpu`, `poot-rocm-gpu` and `poot-graph-ir`
+//   equivalence tests; `test_support`; `poot-wgpu-device`, `poot-rocm-device` and `poot-graph-ir`
 //   tests; this crate's own `tests/`: they build one generator's body directly to compile, run or compare
 //   it, which is the generator under test rather than planning. None is a dispatch path.
 pub use data_movement::{
@@ -84,13 +84,13 @@ pub use wmma::{matmul_tensorcore, matmul_tensorcore_coopmat};
 /// kernel builders have no cross-crate caller, so their coverage lives here rather than in `tests/`, which
 /// compiles as a separate crate and cannot see `pub(crate)` items.
 #[cfg(test)]
-pub(crate) mod test_support {
+pub(crate) mod unit_helpers {
     use std::path::PathBuf;
 
     use poot_codegen::{Target, compile};
     use poot_kernel_ir::Body;
 
-    pub(crate) fn spv(body: &Body, name: &str) -> poot_runtime::CompiledKernel {
+    pub(crate) fn spv(body: &Body, name: &str) -> poot_runtime_common::CompiledKernel {
         let dir: PathBuf = std::env::temp_dir()
             .join("poot-kernelgen-unit-test")
             .join(name);
@@ -103,8 +103,8 @@ pub(crate) mod test_support {
 
     /// The compiled SPIR-V word count of a handle [`spv`] built, for callers that just want to assert a
     /// non-empty compile (card 608: `CompiledKernel` has no `len`/`is_empty` of its own).
-    pub(crate) fn spirv_word_count(kernel: &poot_runtime::CompiledKernel) -> usize {
-        let poot_runtime::KernelCode::SpirvWords(words) = kernel.code() else {
+    pub(crate) fn spirv_word_count(kernel: &poot_runtime_common::CompiledKernel) -> usize {
+        let poot_runtime_common::KernelCode::SpirvWords(words) = kernel.code() else {
             panic!("expected a SpirvVulkan-compiled kernel");
         };
         words.len()
@@ -120,8 +120,8 @@ pub(crate) mod test_support {
         std::fs::read_to_string(&out).unwrap()
     }
 
-    pub(crate) fn ctx() -> Option<poot_runtime::Context> {
-        match poot_runtime::Context::new() {
+    pub(crate) fn ctx() -> Option<poot_wgpu_runtime::Context> {
+        match poot_wgpu_runtime::Context::new() {
             Ok(c) => Some(c),
             Err(e) => {
                 eprintln!("no GPU ({e}); skipping");
@@ -139,7 +139,7 @@ pub(crate) mod test_support {
     }
 
     /// Stage `body`'s NVPTX to `/tmp/poot-ptx-stage2/<name>.ptx`, the well-known drop point `tests/emit_nvptx.rs`
-    /// (and, downstream, `poot-ptx-check` on a real NVIDIA pod) reads from. Skips (not fails) if `llc` is
+    /// (and, downstream, `ptx-check` on a real NVIDIA pod) reads from. Skips (not fails) if `llc` is
     /// absent, matching `emit_nvptx.rs`'s own skip.
     pub(crate) fn stage_nvptx(body: &Body) {
         if std::process::Command::new("llc")

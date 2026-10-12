@@ -272,8 +272,10 @@ mod tests {
     #[test]
     fn from_safetensors_transposes_and_indexes_by_module_path() {
         let (r, in_dim, out_dim) = (2usize, 4usize, 3usize);
-        let store =
-            crate::safetensors::load_weight_store_bytes(&synthetic_adapter_safetensors()).unwrap();
+        let store = crate::safetensors::test_only::load_weight_store_bytes(
+            &synthetic_adapter_safetensors(),
+        )
+        .unwrap();
         let config = LoraAdapterConfig {
             r,
             lora_alpha: 8.0,
@@ -354,7 +356,7 @@ mod tests {
         blob.extend_from_slice(&header_bytes);
         blob.extend_from_slice(&data);
 
-        let store = crate::safetensors::load_weight_store_bytes(&blob).unwrap();
+        let store = crate::safetensors::test_only::load_weight_store_bytes(&blob).unwrap();
         let config = LoraAdapterConfig {
             r,
             lora_alpha: 4.0,
@@ -383,7 +385,7 @@ mod tests {
         blob.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
         blob.extend_from_slice(&header_bytes);
         blob.extend_from_slice(&[0u8; 32]);
-        let store = crate::safetensors::load_weight_store_bytes(&blob).unwrap();
+        let store = crate::safetensors::test_only::load_weight_store_bytes(&blob).unwrap();
         let config = LoraAdapterConfig {
             r: 2,
             lora_alpha: 4.0,

@@ -1,4 +1,4 @@
-use super::*;
+use super::LoadError;
 pub mod quant;
 pub use quant::{QuantConfig, QuantKind, QuantScheme};
 impl QuantConfig {

@@ -7,8 +7,8 @@
 
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, Operand, RedOp, StateRole, TensorType, Traced};
 use poot_graph_plan::{
-    CompileError, CompileOptions, KernelChoice, PlanError, Program, StorageGap, Submission, Target,
-    compile,
+    CompileError, CompileOptions, KernelChoice, PlanError, Program, StorageGap, Target, compile,
+    production_plan::Submission,
 };
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 use poot_target::{AmdArch, Backend, BufferStorage, DeviceCaps};
@@ -45,10 +45,10 @@ fn program(g: &Graph, backend: Backend) -> Program {
 
 /// `matmul(x, transpose(w))`, `w` an F32 `[N, K]` constant.
 fn projection(m: usize) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, K]));
-    let w = b.constant("w", TensorType::f32(vec![N, K]));
-    let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, K])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![N, K])).unwrap();
+    let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -120,14 +120,14 @@ fn checkpoint_orientation_projection_plans_one_dense_contraction_and_no_transpos
 /// second reader, no `Transpose` is planned and this row goes red.
 #[test]
 fn a_transposed_weight_with_a_second_consumer_keeps_the_transpose_and_the_matmul() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, K]));
-    let w = b.constant("w", TensorType::f32(vec![N, K]));
-    let wt = b.transpose(w, vec![1, 0]);
-    let y = b.matmul(x, wt);
-    let column_sums = b.reduce(RedOp::Sum, wt, 0, false);
-    let row_sums = b.reduce(RedOp::Sum, y, 0, false);
-    let total = b.binary(BinOp::Add, row_sums, column_sums);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, K])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![N, K])).unwrap();
+    let wt = b.transpose(w, vec![1, 0]).unwrap();
+    let y = b.matmul(x, wt).unwrap();
+    let column_sums = b.reduce(RedOp::Sum, wt, 0, false).unwrap();
+    let row_sums = b.reduce(RedOp::Sum, y, 0, false).unwrap();
+    let total = b.binary(BinOp::Add, row_sums, column_sums).unwrap();
     let g = b.finish(total).unwrap();
     for backend in backends() {
         let program = program(&g, backend);
@@ -154,12 +154,14 @@ fn a_transposed_weight_with_a_second_consumer_keeps_the_transpose_and_the_matmul
 /// reads it, no `Transpose` is planned and this row goes red.
 #[test]
 fn a_transposed_weight_that_escapes_the_graph_keeps_the_transpose_and_the_matmul() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, K]));
-    let w = b.constant("w", TensorType::f32(vec![N, K]));
-    let kept = b.state_input("kept", TensorType::f32(vec![K, N]), StateRole::Recurrent);
-    let wt = b.transpose(w, vec![1, 0]);
-    let y = b.matmul(x, wt);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, K])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![N, K])).unwrap();
+    let kept = b
+        .state_input("kept", TensorType::f32(vec![K, N]), StateRole::Recurrent)
+        .unwrap();
+    let wt = b.transpose(w, vec![1, 0]).unwrap();
+    let y = b.matmul(x, wt).unwrap();
     let g = b
         .finish(poot_graph_ir::Outputs::new(y).with_state(&[(kept, wt)]))
         .unwrap();
@@ -183,15 +185,23 @@ fn a_transposed_weight_that_escapes_the_graph_keeps_the_transpose_and_the_matmul
 
 /// The scalar sum of a rank-2 value, so two differently shaped readers can meet in one output.
 fn total_sum(b: &Builder, value: Traced) -> Traced {
-    b.reduce(RedOp::Sum, b.reduce(RedOp::Sum, value, 1, false), 0, false)
+    b.reduce(
+        RedOp::Sum,
+        b.reduce(RedOp::Sum, value, 1, false).unwrap(),
+        0,
+        false,
+    )
+    .unwrap()
 }
 
 /// `matmul(x, transpose(w))`, `w` an F16 `[N, K]` constant.
 fn f16_projection(m: usize) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, K]));
-    let w = b.constant("w", TensorType::new(vec![N, K], DType::F16));
-    let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![N, K], DType::F16))
+        .unwrap();
+    let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -273,13 +283,19 @@ fn an_f16_checkpoint_projection_plans_one_packed_dense_contraction_and_no_transp
 /// analysis refuses the shared weight (`F16PackedLanes`) and this row goes red.
 #[test]
 fn an_f16_weight_with_a_second_reader_is_not_folded() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, K]));
-    let w = b.constant("w", TensorType::new(vec![N, K], DType::F16));
-    let ids = b.constant("ids", TensorType::new(vec![3], DType::I32));
-    let rows = b.cast(b.gather(w, 0, ids), DType::F32);
-    let y = b.matmul(x, b.transpose(w, vec![1, 0]));
-    let total = b.binary(BinOp::Add, total_sum(&b, y), total_sum(&b, rows));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![N, K], DType::F16))
+        .unwrap();
+    let ids = b
+        .constant("ids", TensorType::new(vec![3], DType::I32))
+        .unwrap();
+    let rows = b.cast(b.gather(w, 0, ids).unwrap(), DType::F32).unwrap();
+    let y = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
+    let total = b
+        .binary(BinOp::Add, total_sum(&b, y), total_sum(&b, rows))
+        .unwrap();
     let g = b.finish(total).unwrap();
     let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
@@ -317,16 +333,20 @@ fn an_f16_weight_with_a_second_reader_is_not_folded() {
 /// accepts the graph and this row goes red.
 #[test]
 fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, K]));
-    let w = b.constant("w", TensorType::new(vec![N, K], DType::F16));
-    let y = b.matmul(x, b.transpose(w, vec![1, 0]));
-    let widened = b.cast(w, DType::F32);
-    let total = b.binary(BinOp::Add, total_sum(&b, y), total_sum(&b, widened));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![N, K], DType::F16))
+        .unwrap();
+    let y = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
+    let widened = b.cast(w, DType::F32).unwrap();
+    let total = b
+        .binary(BinOp::Add, total_sum(&b, y), total_sum(&b, widened))
+        .unwrap();
     let traced = b.finish(total).unwrap();
     // The contraction the fold would make of the projection, written into the graph directly: the fold itself
     // never makes this one, because `w` has a second reader. (The transpose stays, now unread.)
-    let g = poot_test_util::graph_fixtures::derive(&traced, |draft| {
+    let g = poot_graph_ir::test_support::graph_fixtures::derive(&traced, |draft| {
         let matmul = draft
             .eqns_mut()
             .iter_mut()
@@ -359,13 +379,21 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
 /// `(x @ w^T + bias) + residual`, `w` a `[N, K]` constant of dtype `weight`: the shape of a biased projection
 /// feeding a residual connection.
 fn biased_residual_projection(m: usize, weight: DType) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, K]));
-    let w = b.constant("w", TensorType::new(vec![N, K], weight));
-    let bias = b.constant("bias", TensorType::f32(vec![N]));
-    let residual = b.constant("residual", TensorType::f32(vec![m, N]));
-    let projection = b.matmul(x, b.transpose(w, vec![1, 0]));
-    let out = b.binary(BinOp::Add, b.binary(BinOp::Add, projection, bias), residual);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, K])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![N, K], weight))
+        .unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![N])).unwrap();
+    let residual = b.constant("residual", TensorType::f32(vec![m, N])).unwrap();
+    let projection = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
+    let out = b
+        .binary(
+            BinOp::Add,
+            b.binary(BinOp::Add, projection, bias).unwrap(),
+            residual,
+        )
+        .unwrap();
     b.finish(out).unwrap()
 }
 
@@ -423,13 +451,19 @@ fn a_biased_residual_dense_head_is_one_epilogue_contraction_at_every_m() {
 fn a_biased_residual_tiled_matmul_head_is_one_epilogue_contraction() {
     for backend in backends() {
         for m in [5, 160] {
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32(vec![m, K]));
-            let w = b.constant("w", TensorType::f32(vec![K, N]));
-            let bias = b.constant("bias", TensorType::f32(vec![N]));
-            let residual = b.constant("residual", TensorType::f32(vec![m, N]));
-            let head = b.matmul(x, w);
-            let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![m, K])).unwrap();
+            let w = b.constant("w", TensorType::f32(vec![K, N])).unwrap();
+            let bias = b.constant("bias", TensorType::f32(vec![N])).unwrap();
+            let residual = b.constant("residual", TensorType::f32(vec![m, N])).unwrap();
+            let head = b.matmul(x, w).unwrap();
+            let out = b
+                .binary(
+                    BinOp::Add,
+                    b.binary(BinOp::Add, head, bias).unwrap(),
+                    residual,
+                )
+                .unwrap();
             let g = b.finish(out).unwrap();
             let fused = program(&g, backend);
             let label = format!("{backend:?} M={m}: {:?}", op_names(&fused));
@@ -461,19 +495,29 @@ fn a_biased_residual_tiled_matmul_head_is_one_epilogue_contraction() {
 /// `(x @ w + bias) + residual` with `x: [xs]`, `w: [ws]` of `head_dtype` (bias and residual of the head's dtype
 /// and the output's shape), the shape of a `MatMul` head the generated tiled GEMM must not take.
 fn biased_residual_matmul(xs: Vec<usize>, ws: Vec<usize>, head_dtype: DType) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(xs.clone(), head_dtype));
-    let w = b.constant("w", TensorType::new(ws.clone(), head_dtype));
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(xs.clone(), head_dtype))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(ws.clone(), head_dtype))
+        .unwrap();
     let n = *ws.last().unwrap();
     let mut out_shape = xs;
     *out_shape.last_mut().unwrap() = n;
-    let bias = b.constant("bias", TensorType::new(vec![n], head_dtype));
-    let residual = b.constant("residual", TensorType::new(out_shape, head_dtype));
-    let out = b.binary(
-        BinOp::Add,
-        b.binary(BinOp::Add, b.matmul(x, w), bias),
-        residual,
-    );
+    let bias = b
+        .constant("bias", TensorType::new(vec![n], head_dtype))
+        .unwrap();
+    let residual = b
+        .constant("residual", TensorType::new(out_shape, head_dtype))
+        .unwrap();
+    let out = b
+        .binary(
+            BinOp::Add,
+            b.binary(BinOp::Add, b.matmul(x, w).unwrap(), bias).unwrap(),
+            residual,
+        )
+        .unwrap();
     b.finish(out).unwrap()
 }
 
@@ -581,11 +625,17 @@ fn grouped_projection(
     m: usize,
     blocks_reader: impl FnOnce(&Builder, Traced, Traced) -> Traced,
 ) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![GROUPS, m, K]));
-    let w = b.constant("w", TensorType::new(vec![GROUPS * N, K], DType::BF16));
-    let blocks = b.reshape(w, vec![GROUPS, N, K]);
-    let y = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::f32(vec![GROUPS, m, K]))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![GROUPS * N, K], DType::BF16))
+        .unwrap();
+    let blocks = b.reshape(w, vec![GROUPS, N, K]).unwrap();
+    let y = b
+        .matmul(x, b.transpose(blocks, vec![0, 2, 1]).unwrap())
+        .unwrap();
     let out = blocks_reader(&b, blocks, y);
     b.finish(out).unwrap()
 }
@@ -663,9 +713,14 @@ fn a_blocked_weight_with_a_second_consumer_is_not_folded() {
         let sum_all = |v: Traced| {
             (0..3)
                 .rev()
-                .fold(v, |v, axis| b.reduce(RedOp::Sum, v, axis, false))
+                .fold(v, |v, axis| b.reduce(RedOp::Sum, v, axis, false).unwrap())
         };
-        b.binary(BinOp::Add, sum_all(y), sum_all(b.cast(blocks, DType::F32)))
+        b.binary(
+            BinOp::Add,
+            sum_all(y),
+            sum_all(b.cast(blocks, DType::F32).unwrap()),
+        )
+        .unwrap()
     });
     let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
@@ -707,11 +762,17 @@ fn a_blocked_weight_with_a_second_consumer_is_not_folded() {
 #[test]
 fn a_grouped_weight_that_is_not_bf16_keeps_the_traced_chain() {
     for weight in [DType::F32, DType::F16] {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![GROUPS, 4, K]));
-        let w = b.constant("w", TensorType::new(vec![GROUPS * N, K], weight));
-        let blocks = b.reshape(w, vec![GROUPS, N, K]);
-        let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::f32(vec![GROUPS, 4, K]))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![GROUPS * N, K], weight))
+            .unwrap();
+        let blocks = b.reshape(w, vec![GROUPS, N, K]).unwrap();
+        let out = b
+            .matmul(x, b.transpose(blocks, vec![0, 2, 1]).unwrap())
+            .unwrap();
         let g = b.finish(out).unwrap();
         let options =
             CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);

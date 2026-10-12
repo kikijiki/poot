@@ -4,17 +4,18 @@
 
 use std::sync::Arc;
 
-use poot_executor::{ExecError, Executor, HostView, NoSync, StepInputs};
+use poot_eval::test_support::live_attention::{Inputs, LiveAttentionGraph};
+use poot_executor::{ExecError, Executor, NoSync, StepInputs};
+use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Graph, Slot, Storage};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-use poot_tensor::DType;
-use poot_test_util::const_weights::ConstWeights;
-use poot_test_util::live_attention::{Inputs, LiveAttentionGraph};
+use poot_tensor::{DType, HostView};
 
 /// `graph` compiled for `target` on the executor contract's one shape: single stage, single device,
 /// `Submission::Replay`. Its own validations stay intact, so a validation under test is not stripped.

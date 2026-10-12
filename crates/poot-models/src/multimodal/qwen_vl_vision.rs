@@ -36,16 +36,17 @@ use poot_quant::weights::{
 use poot_tensor::DType;
 
 use super::idefics3::PIXELS_SLOT;
-use crate::chat::ChatFormat;
 use crate::components::dims::{Field, Fields};
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::{NormKind, NormParams, norm};
+use crate::model::WiringError;
 use crate::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason,
     StepShape, TraceError,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen2_5_vl_vision");
 
@@ -212,8 +213,7 @@ impl Qwen25VlVisionParams {
             window_cells: window / cell,
             full_attention,
             out_width: fields.count(OUT_WIDTH, None)?,
-            norm: NormParams::of(NormKind::Rms, 1e-6)
-                .expect("a literal finite positive epsilon is valid"),
+            norm: NormParams::of(NormKind::Rms, 1e-6).map_err(|e| e.for_family(FAMILY))?,
         })
     }
 
@@ -496,63 +496,80 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
 
 /// The additive attention mask `[rows, 1, patches, patches]` of `ids` (`[rows, patches]` F32): `0`
 /// where two patches carry the same id, [`MASKED`] elsewhere.
-fn same_id_mask(b: &Builder, ids: Traced) -> Traced {
-    let [rows, patches] = b.aval(ids).shape[..] else {
-        unreachable!("ids are [rows, patches]");
+/// The refusal of a value whose rank is not the one `operation` reads.
+fn rank_error(operation: &'static str, expected: usize, found: Vec<usize>) -> TraceError {
+    poot_graph_ir::BuilderError::Requirement {
+        operation,
+        requirement: poot_graph_ir::Requirement::Rank { expected, found },
+    }
+    .into()
+}
+
+fn same_id_mask(b: &Builder, ids: Traced) -> Result<Traced, TraceError> {
+    let ids_shape = b.aval(ids)?.shape;
+    let [rows, patches] = ids_shape[..] else {
+        return Err(rank_error("same_id_mask", 2, ids_shape));
     };
     let square = vec![rows, 1, patches, patches];
-    let along_rows = b.broadcast(b.reshape(ids, vec![rows, 1, patches, 1]), square.clone());
-    let along_columns = b.broadcast(b.reshape(ids, vec![rows, 1, 1, patches]), square);
+    let along_rows = b.broadcast(b.reshape(ids, vec![rows, 1, patches, 1])?, square.clone())?;
+    let along_columns = b.broadcast(b.reshape(ids, vec![rows, 1, 1, patches])?, square)?;
     // `a == b` is `a >= b` and `b >= a`.
     let same = b.binary(
         BinOp::Mul,
-        b.binary(BinOp::Ge, along_rows, along_columns),
-        b.binary(BinOp::Ge, along_columns, along_rows),
-    );
-    let different = b.binary_scalar(BinOp::Sub, same, Scalar::F32(1.0));
-    b.binary_scalar(BinOp::Mul, different, Scalar::F32(-MASKED))
+        b.binary(BinOp::Ge, along_rows, along_columns)?,
+        b.binary(BinOp::Ge, along_columns, along_rows)?,
+    )?;
+    let different = b.binary_scalar(BinOp::Sub, same, Scalar::F32(1.0))?;
+    Ok(b.binary_scalar(BinOp::Mul, different, Scalar::F32(-MASKED))?)
 }
 
 /// `x` (`[rows, heads, patches, head_dim]`) rotated by the 2-D rotary table: the first quarter of the
 /// head's pairs rotate at the patch's grid row, the second at its grid column, the half-split pairing
 /// of the reference's `rotate_half`.
-fn rotate(b: &Builder, x: Traced, cos: Traced, sin: Traced) -> Traced {
-    let d = b.aval(x).shape[3];
+fn rotate(b: &Builder, x: Traced, cos: Traced, sin: Traced) -> Result<Traced, TraceError> {
+    let d = b.aval(x)?.shape[3];
     let half = d / 2;
-    let (x1, x2) = (b.slice(x, 3, 0, half), b.slice(x, 3, half, d));
-    let rotated = b.concat(3, &[b.unary(UnOp::Neg, x2), x1]);
-    b.binary(
+    let (x1, x2) = (b.slice(x, 3, 0, half)?, b.slice(x, 3, half, d)?);
+    let rotated = b.concat(3, &[b.unary(UnOp::Neg, x2)?, x1])?;
+    Ok(b.binary(
         BinOp::Add,
-        b.binary(BinOp::Mul, x, cos),
-        b.binary(BinOp::Mul, rotated, sin),
-    )
+        b.binary(BinOp::Mul, x, cos)?,
+        b.binary(BinOp::Mul, rotated, sin)?,
+    )?)
 }
 
 impl Qwen25VlVision {
     /// The cos and sin tables `[rows, 1, patches, head_dim]` of the patches' grid positions.
-    fn rotary(&self, b: &Builder, pos_h: Traced, pos_w: Traced) -> (Traced, Traced) {
+    fn rotary(
+        &self,
+        b: &Builder,
+        pos_h: Traced,
+        pos_w: Traced,
+    ) -> Result<(Traced, Traced), TraceError> {
         let p = &self.params;
-        let [rows, patches] = b.aval(pos_h).shape[..] else {
-            unreachable!("positions are [rows, patches]");
+        let pos_shape = b.aval(pos_h)?.shape;
+        let [rows, patches] = pos_shape[..] else {
+            return Err(rank_error("rotary", 2, pos_shape));
         };
         let quarter = p.head_dim / 4;
-        let spec = RopeSpec::new(p.head_dim / 2, ROTARY_THETA, &RopeFlavor::Plain)
-            .expect("a plain rotary table of an even width is valid");
+        let spec = RopeSpec::new(p.head_dim / 2, ROTARY_THETA, &RopeFlavor::Plain)?;
+        let positions =
+            u32::try_from(patches).map_err(|_| WiringError::PatchesOutOfRange { patches })?;
         let table = |which| {
-            let positions = u32::try_from(patches).expect("a step's patches fit a u32");
             let full = b.computed(ComputedConst::Rope {
                 table: which,
                 positions,
                 spec,
-            });
-            let axis = |pos| b.slice(b.gather(full, 0, pos), 2, 0, quarter);
-            let (h, w) = (axis(pos_h), axis(pos_w));
-            b.reshape(
-                b.concat(2, &[h, w, h, w]),
+            })?;
+            let axis =
+                |pos| Ok::<_, TraceError>(b.slice(b.gather(full, 0, pos)?, 2, 0, quarter)?);
+            let (h, w) = (axis(pos_h)?, axis(pos_w)?);
+            Ok::<_, TraceError>(b.reshape(
+                b.concat(2, &[h, w, h, w])?,
                 vec![rows, 1, patches, p.head_dim],
-            )
+            )?)
         };
-        (table(RopeTable::Cos), table(RopeTable::Sin))
+        Ok((table(RopeTable::Cos)?, table(RopeTable::Sin)?))
     }
 
     fn attention(
@@ -562,22 +579,23 @@ impl Qwen25VlVision {
         x: Traced,
         (cos, sin): (Traced, Traced),
         mask: Traced,
-    ) -> Traced {
+    ) -> Result<Traced, TraceError> {
         let p = &self.params;
-        let [rows, patches, w] = b.aval(x).shape[..] else {
-            unreachable!("activations are [rows, patches, width]");
+        let x_shape = b.aval(x)?.shape;
+        let [rows, patches, w] = x_shape[..] else {
+            return Err(rank_error("attention", 3, x_shape));
         };
-        let qkv = linear(b, x, &block.qkv, Some(&block.qkv_bias));
+        let qkv = linear(b, x, &block.qkv, Some(&block.qkv_bias))?;
         let part = |i: usize| {
-            let part = b.slice(qkv, 2, i * w, (i + 1) * w);
-            let split = b.reshape(part, vec![rows, patches, p.heads, p.head_dim]);
-            b.transpose(split, vec![0, 2, 1, 3])
+            let part = b.slice(qkv, 2, i * w, (i + 1) * w)?;
+            let split = b.reshape(part, vec![rows, patches, p.heads, p.head_dim])?;
+            Ok::<_, TraceError>(b.transpose(split, vec![0, 2, 1, 3])?)
         };
-        let (q, k, v) = (part(0), part(1), part(2));
-        let (q, k) = (rotate(b, q, cos, sin), rotate(b, k, cos, sin));
+        let (q, k, v) = (part(0)?, part(1)?, part(2)?);
+        let (q, k) = (rotate(b, q, cos, sin)?, rotate(b, k, cos, sin)?);
         let scale = 1.0 / (p.head_dim as f32).sqrt();
-        let out = ops::attention_masked(b, q, k, v, 1, scale, mask);
-        let merged = b.reshape(b.transpose(out, vec![0, 2, 1, 3]), vec![rows, patches, w]);
+        let out = ops::attention_masked(b, q, k, v, 1, scale, mask)?;
+        let merged = b.reshape(b.transpose(out, vec![0, 2, 1, 3])?, vec![rows, patches, w])?;
         linear(b, merged, &block.proj, Some(&block.proj_bias))
     }
 }
@@ -591,7 +609,7 @@ impl Model for Qwen25VlVision {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         if phase != Phase::Encode {
             return Err(TraceError::PhaseUnsupported {
@@ -615,27 +633,27 @@ impl Model for Qwen25VlVision {
                 granule: p.merge_unit(),
             });
         }
-        let b = Builder::new();
         let rows = shape.rows.get();
         let w = p.width;
-        let slot = |tag, ty: TensorType| b.slot_named(Slot::Activation, tag, ty);
+        let slot =
+            |tag, ty: TensorType| Ok::<_, TraceError>(b.slot_named(Slot::Activation, tag, ty)?);
         let pixels = slot(
             PIXELS_SLOT,
             TensorType::f32(vec![rows, patches, p.patch_dim()]),
-        );
+        )?;
         let ids = vec![rows, patches];
-        let pos_h = slot(POS_H_SLOT, TensorType::new(ids.clone(), DType::I32));
-        let pos_w = slot(POS_W_SLOT, TensorType::new(ids.clone(), DType::I32));
-        let window = slot(WINDOW_SLOT, TensorType::f32(ids.clone()));
-        let frame = slot(FRAME_SLOT, TensorType::f32(ids));
-        let window_mask = same_id_mask(&b, window);
-        let frame_mask = same_id_mask(&b, frame);
-        let rotary = self.rotary(&b, pos_h, pos_w);
+        let pos_h = slot(POS_H_SLOT, TensorType::new(ids.clone(), DType::I32))?;
+        let pos_w = slot(POS_W_SLOT, TensorType::new(ids.clone(), DType::I32))?;
+        let window = slot(WINDOW_SLOT, TensorType::f32(ids.clone()))?;
+        let frame = slot(FRAME_SLOT, TensorType::f32(ids))?;
+        let window_mask = same_id_mask(&b, window)?;
+        let frame_mask = same_id_mask(&b, frame)?;
+        let rotary = self.rotary(&b, pos_h, pos_w)?;
 
         // The 3-D convolution as a matmul: its stride is its kernel, so each patch is one dot
         // product against the flattened kernel.
-        let kernel = b.reshape(self.patch.declare_f32(&b), vec![w, p.patch_dim()]);
-        let mut x = b.matmul(pixels, b.transpose(kernel, vec![1, 0]));
+        let kernel = b.reshape(self.patch.declare_f32(&b)?, vec![w, p.patch_dim()])?;
+        let mut x = b.matmul(pixels, b.transpose(kernel, vec![1, 0])?)?;
         for (l, block) in self.blocks.iter().enumerate() {
             let _scope = b.layer_scope(l);
             let mask = if p.full_attention.contains(&l) {
@@ -646,36 +664,36 @@ impl Model for Qwen25VlVision {
             let attn = self.attention(
                 &b,
                 block,
-                norm(&b, x, &block.norm_attn, p.norm),
+                norm(&b, x, &block.norm_attn, p.norm)?,
                 rotary,
                 mask,
-            );
-            x = b.binary(BinOp::Add, x, attn);
-            let h = norm(&b, x, &block.norm_ffn, p.norm);
-            let gate = linear(&b, h, &block.gate, Some(&block.gate_bias));
-            let up = linear(&b, h, &block.up, Some(&block.up_bias));
+            )?;
+            x = b.binary(BinOp::Add, x, attn)?;
+            let h = norm(&b, x, &block.norm_ffn, p.norm)?;
+            let gate = linear(&b, h, &block.gate, Some(&block.gate_bias))?;
+            let up = linear(&b, h, &block.up, Some(&block.up_bias))?;
             let down = linear(
                 &b,
-                ops::swiglu(&b, gate, up),
+                ops::swiglu(&b, gate, up)?,
                 &block.down,
                 Some(&block.down_bias),
-            );
-            x = b.binary(BinOp::Add, x, down);
+            )?;
+            x = b.binary(BinOp::Add, x, down)?;
         }
         // The merger: normalize each patch, concatenate each cell's patches (consecutive in window
         // order), and two projections around an exact GELU.
-        let normed = norm(&b, x, &self.merger_norm, p.norm);
+        let normed = norm(&b, x, &self.merger_norm, p.norm)?;
         let cells = b.reshape(
             normed,
             vec![rows, patches / p.merge_unit(), w * p.merge_unit()],
-        );
-        let up = linear(&b, cells, &self.merger_up, Some(&self.merger_up_bias));
+        )?;
+        let up = linear(&b, cells, &self.merger_up, Some(&self.merger_up_bias))?;
         let out = linear(
             &b,
-            ops::gelu_erf(&b, up),
+            ops::gelu_erf(&b, up)?,
             &self.merger_out,
             Some(&self.merger_out_bias),
-        );
+        )?;
         Ok(b.finish(out)?)
     }
 }
@@ -704,7 +722,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 /// and 3 attending over the whole frame.
 fn fixture() -> Fixture {
     let config = fixture_config();
-    let n = |f: &str| config[f].as_u64().expect("fixture counts") as usize;
+    let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (w, inter, c, t, patch) = (
         n("hidden_size"),
         n("intermediate_size"),
@@ -960,7 +978,11 @@ mod tests {
         let params = Qwen25VlVisionParams::from_raw(&fx.raw()).unwrap();
         let geometry = params.geometry(grid).unwrap();
         let g = model
-            .trace(Phase::Encode, encode_shape(1, geometry.patches()))
+            .trace(
+                Phase::Encode,
+                encode_shape(1, geometry.patches()),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let ordered = geometry.to_window_order(pixels, params.patch_dim());
         let (rows, _) = oracle::eval_slots(
@@ -1135,21 +1157,33 @@ mod tests {
         let fx = fixture();
         let model = built(&ENTRY, &fx.raw(), &fx.store);
         assert!(matches!(
-            model.trace(Phase::Prefill, encode_shape(1, 16)),
+            model.trace(
+                Phase::Prefill,
+                encode_shape(1, 16),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::PhaseUnsupported {
                 phase: Phase::Prefill,
                 ..
             })
         ));
         assert!(matches!(
-            model.trace(Phase::Encode, encode_shape(1, 18)),
+            model.trace(
+                Phase::Encode,
+                encode_shape(1, 18),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported {
                 reason: ShapeReason::Granule { granule: 4 },
                 ..
             })
         ));
         assert!(matches!(
-            model.trace(Phase::Encode, encode_shape(1, MAX_PATCHES + 4)),
+            model.trace(
+                Phase::Encode,
+                encode_shape(1, MAX_PATCHES + 4),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported {
                 reason: ShapeReason::CapacityAboveMax { .. },
                 ..

@@ -2,19 +2,17 @@
 //!
 //! A BF16 element is one 16-bit word, decoded with the Card 370 rule. [`crate::resolve::classify`]
 //! names the closed set of equations a BF16-touching value may appear in (the admission table, moved
-//! there alongside `resolve`'s other admission logic); `walk.rs` refuses
-//! every other one before any equation runs (this file carries no walk of its
-//! own, and now no admission table either - only the carrier).
+//! there alongside `resolve`'s other admission logic); `walk.rs` refuses every other one before any
+//! equation runs (this file carries no walk of its own, and now no admission table either - only
+//! the carrier).
 
-use poot_tensor::DType;
+use poot_quant::scalar::bf16_to_f32;
 use std::sync::Arc;
 
-use crate::exact_dense::{DenseOwnerTensorView, bf16_word, decode_bf16_word};
-
-/// Row-major BF16 words, possibly permuted, over a Card 370 owner or over words an equation derived.
+/// Row-major BF16 words, possibly permuted, over words an equation derived.
 #[derive(Clone, Debug)]
 pub struct ExactBf16TensorView {
-    words: Bf16Words,
+    words: Arc<[u16]>,
     shape: Vec<usize>,
     /// Physical word stride of each logical axis.
     strides: Vec<usize>,
@@ -22,73 +20,28 @@ pub struct ExactBf16TensorView {
     contiguous: bool,
 }
 
-#[derive(Clone, Debug)]
-enum Bf16Words {
-    /// Authoritative checkpoint bytes, two little-endian bytes per word. `word_offset` is the
-    /// element index where this view starts inside the owner (nonzero for a row-sliced view such
-    /// as a vocab chunk of the LM head).
-    Owner {
-        owner: Arc<ExactSourceOwner>,
-        word_offset: usize,
-    },
-    /// Words produced by an evaluated equation.
-    Derived(Arc<[u16]>),
-}
-
-use poot_load::packed_safetensors::{ExactSourceKind, ExactSourceOwner};
-
 impl PartialEq for ExactBf16TensorView {
     fn eq(&self, other: &Self) -> bool {
-        let same_words = match (&self.words, &other.words) {
-            (
-                Bf16Words::Owner {
-                    owner: left,
-                    word_offset: lo,
-                },
-                Bf16Words::Owner {
-                    owner: right,
-                    word_offset: ro,
-                },
-            ) => Arc::ptr_eq(left, right) && lo == ro,
-            (Bf16Words::Derived(left), Bf16Words::Derived(right)) => Arc::ptr_eq(left, right),
-            _ => false,
-        };
-        same_words && self.shape == other.shape && self.strides == other.strides
+        Arc::ptr_eq(&self.words, &other.words)
+            && self.shape == other.shape
+            && self.strides == other.strides
     }
 }
 
 impl Eq for ExactBf16TensorView {}
 
 impl ExactBf16TensorView {
-    /// Alias a validated Card 370 BF16 owner view. The owner bytes are not copied or decoded.
-    /// A row-sliced view starts at its byte offset (converted to a word offset).
-    pub fn from_owner_view(view: &DenseOwnerTensorView) -> Result<Self, ExactBf16Error> {
-        if view.owner().kind() != ExactSourceKind::Bf16 {
-            return Err(ExactBf16Error::OwnerDtype {
-                dtype: view.dtype(),
-            });
-        }
-        let word_offset = view.byte_offset() / 2;
-        Self::canonical(
-            Bf16Words::Owner {
-                owner: Arc::clone(view.owner()),
-                word_offset,
-            },
-            view.shape().to_vec(),
-        )
-    }
-
-    /// A view over words an equation just derived (a gather's selected rows): no owner, no checkpoint
-    /// bytes, just this allocation.
+    /// A view over words an equation just derived (a gather's selected rows, a widened host
+    /// tensor): just this allocation.
     pub(crate) fn from_derived(
         words: Arc<[u16]>,
         shape: Vec<usize>,
     ) -> Result<Self, ExactBf16Error> {
-        Self::canonical(Bf16Words::Derived(words), shape)
+        Self::canonical(words, shape)
     }
 
     /// A row-major view of `words` with canonical strides.
-    fn canonical(words: Bf16Words, shape: Vec<usize>) -> Result<Self, ExactBf16Error> {
+    fn canonical(words: Arc<[u16]>, shape: Vec<usize>) -> Result<Self, ExactBf16Error> {
         Ok(Self {
             words,
             strides: canonical_strides(&shape)?,
@@ -107,10 +60,7 @@ impl ExactBf16TensorView {
 
     /// Bytes of the word storage this view reads, shared by every alias of that storage.
     pub fn physical_bytes(&self) -> usize {
-        match &self.words {
-            Bf16Words::Owner { owner, .. } => owner.bytes().len(),
-            Bf16Words::Derived(words) => words.len().saturating_mul(2),
-        }
+        self.words.len().saturating_mul(2)
     }
 
     /// The word at row-major logical element `flat`.
@@ -126,19 +76,12 @@ impl ExactBf16TensorView {
             }
             physical
         };
-        match &self.words {
-            Bf16Words::Owner { owner, word_offset } => {
-                let bytes = owner.bytes();
-                let index = word_offset + physical;
-                bf16_word([bytes[2 * index], bytes[2 * index + 1]])
-            }
-            Bf16Words::Derived(words) => words[physical],
-        }
+        self.words[physical]
     }
 
     /// Decoded f32 value at row-major logical element `flat`.
     pub fn value(&self, flat: usize) -> f32 {
-        decode_bf16_word(self.word(flat))
+        bf16_to_f32(self.word(flat))
     }
 
     /// Contiguous alias with another logical shape.
@@ -188,8 +131,6 @@ impl ExactBf16TensorView {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExactBf16Error {
-    #[error("exact BF16 view requires a BF16 owner, got {dtype}")]
-    OwnerDtype { dtype: DType },
     #[error("BF16 reshape {source_shape:?} -> {target_shape:?} changes the element count")]
     ReshapeElementCount {
         source_shape: Vec<usize>,

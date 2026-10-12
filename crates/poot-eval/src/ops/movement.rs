@@ -467,7 +467,7 @@ impl Value {
     pub fn reshape(&self, shape: Vec<usize>) -> Result<Self, EvalError> {
         match self {
             Value::Host(t) => Ok(reshape(t, &shape)?.into()),
-            Value::Owner(value) => value.reshape(shape).map(Value::Owner),
+            Value::Exact(value) => value.reshape(shape).map(Value::Exact),
             Value::Packed(_) | Value::PackedStack(_) => {
                 Err(EvalError::Packed(PackedEvalError::WrongConsumer {
                     operation: "Reshape",
@@ -479,7 +479,7 @@ impl Value {
     pub fn transpose(&self, perm: &[usize]) -> Result<Self, EvalError> {
         match self {
             Value::Host(t) => Ok(transpose(t, perm)?.into()),
-            Value::Owner(value) => value.transpose(perm),
+            Value::Exact(value) => value.transpose(perm),
             Value::Packed(_) | Value::PackedStack(_) => {
                 Err(EvalError::Packed(PackedEvalError::WrongConsumer {
                     operation: "Transpose",
@@ -491,7 +491,7 @@ impl Value {
     pub fn slice(&self, axis: usize, start: usize, end: usize) -> Result<Self, EvalError> {
         match self {
             Value::Host(t) => Ok(slice(t, axis, start, end)?.into()),
-            Value::Owner(value) => Err(value.unsupported("Slice")),
+            Value::Exact(value) => Err(value.unsupported("Slice")),
             Value::Packed(_) | Value::PackedStack(_) => {
                 Err(EvalError::Packed(PackedEvalError::WrongConsumer {
                     operation: "Slice",
@@ -505,7 +505,7 @@ impl Value {
             .iter()
             .map(|part| match part {
                 Value::Host(tensor) => Ok(tensor),
-                Value::Owner(value) => Err(value.unsupported("Concat")),
+                Value::Exact(value) => Err(value.unsupported("Concat")),
                 Value::Packed(_) | Value::PackedStack(_) => {
                     Err(EvalError::Packed(PackedEvalError::WrongConsumer {
                         operation: "Concat",
@@ -523,7 +523,7 @@ impl Value {
         axis: usize,
     ) -> Result<Self, EvalError> {
         match (self, update) {
-            (Value::Owner(value), _) | (_, Value::Owner(value)) => {
+            (Value::Exact(value), _) | (_, Value::Exact(value)) => {
                 Err(value.unsupported("DynamicUpdateSlice"))
             }
             (Value::Host(operand), Value::Host(update)) => {
@@ -538,7 +538,7 @@ impl Value {
     pub fn broadcast(&self, shape: Vec<usize>) -> Result<Self, EvalError> {
         match self {
             Value::Host(t) => Ok(broadcast_to(t, &shape)?.into()),
-            Value::Owner(value) => Err(value.unsupported("Broadcast")),
+            Value::Exact(value) => Err(value.unsupported("Broadcast")),
             Value::Packed(_) | Value::PackedStack(_) => {
                 Err(EvalError::Packed(PackedEvalError::WrongConsumer {
                     operation: "Broadcast",
@@ -554,7 +554,7 @@ impl Value {
         eqn: ValueId,
     ) -> Result<Self, EvalError> {
         match (self, src) {
-            (Value::Owner(value), _) | (_, Value::Owner(value)) => {
+            (Value::Exact(value), _) | (_, Value::Exact(value)) => {
                 Err(value.unsupported("ScatterUpdate"))
             }
             (Value::Host(base), Value::Host(src)) => {

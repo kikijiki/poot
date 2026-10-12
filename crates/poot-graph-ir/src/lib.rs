@@ -7,7 +7,10 @@
 //! lineage: jaxpr / DynamicJaxprTrace.
 
 pub mod analysis;
+pub mod budget;
 pub mod builder;
+#[cfg(test)]
+mod builder_budget_tests;
 /// Composite ops defined by their decomposition into primitives (Card 556, ADR-0101 tier 1).
 pub mod decompose;
 pub mod error;
@@ -22,17 +25,20 @@ pub mod packed_source;
 /// The interval analysis of I32 values and the declared slot ranges it starts from (POOT-726).
 pub mod range;
 pub mod rope_table;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod types;
 
+pub use budget::{AllocationSite, Attempted, BudgetResource, TraceBudgetExceeded, TraceLimits};
+#[cfg(any(test, feature = "test-support"))]
+pub use budget::{Charged, Ledger, LedgerEvent, Reservation};
 pub use builder::{
     Builder, BuilderAppendAccounting, BuilderAppendPlan, LayerScope, Outputs,
     PreparedBuilderAppend, ScanResult, Traced, WitnessDeclaration,
 };
 pub use error::{
-    BuilderAppendError, BuilderCollection, BuilderValueNamespace, FusedOperandReason,
-    GraphValidationError, ScanReason, ShapeError,
+    BuilderCollection, BuilderError, BuilderValueNamespace, FusedOperandReason,
+    GraphValidationError, Requirement, ScanReason, ShapeError,
 };
 pub use graph::{
     BoundaryId, ComputedConst, EditError, Eqn, ExecutionValidationFailure, Export, Graph,
@@ -41,7 +47,10 @@ pub use graph::{
     ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
     ValueTable, Witness, WitnessLedger,
 };
-pub use index_guard::{GuardedIndex, IndexGuardError};
+pub use index_guard::{
+    GuardValues, GuardedIndex, IndexGuardEmitError, IndexGuardError, emit_index_guard,
+    is_guard_witness,
+};
 pub use op::{
     AttentionAttrs, BinOp, ContractionRows, DENSE_CONTRACTION_WEIGHT_DTYPES,
     DENSE_ROW_GATHER_SOURCE_DTYPES, KeyLayout, KvBound, MaskOperand, OpClass, OpKind, RedOp,

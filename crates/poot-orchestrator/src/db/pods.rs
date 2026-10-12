@@ -1,9 +1,9 @@
-use super::*;
+use super::{Db, Result, now_iso, params};
 
 /// A pod (worker) record, spec 030. Its lifecycle is independent of any run: provisioned, `idle`,
 /// assigned to a run (`busy`), released to `idle`, eventually `terminated`. A re-run can adopt an idle pod.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct Pod {
+pub(crate) struct Pod {
     pub id: String,
     pub gpu_type: String,
     pub cloud: String,
@@ -17,7 +17,7 @@ pub struct Pod {
 }
 
 /// Pick the oldest `idle` pod with a matching image and an SSH endpoint, if any.
-pub fn pick_idle_pod<'a>(pods: &'a [Pod], image: &str) -> Option<&'a Pod> {
+pub(crate) fn pick_idle_pod<'a>(pods: &'a [Pod], image: &str) -> Option<&'a Pod> {
     pods.iter().find(|p| {
         p.status == "idle"
             && p.image == image
@@ -29,7 +29,7 @@ pub fn pick_idle_pod<'a>(pods: &'a [Pod], image: &str) -> Option<&'a Pod> {
 // --- pods (spec 030): workers with a lifecycle independent of runs. ---
 impl Db {
     /// Record a freshly created pod (status `provisioning`), called as soon as RunPod returns the id.
-    pub fn create_pod_record(
+    pub(crate) fn create_pod_record(
         &self,
         id: &str,
         gpu_type: &str,
@@ -45,7 +45,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_pod_status(&self, id: &str, status: &str) -> Result<()> {
+    pub(crate) fn set_pod_status(&self, id: &str, status: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE pods SET status=?2, updated_at=?3 WHERE id=?1",
             params![id, status, now_iso()],
@@ -53,7 +53,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn set_pod_endpoint(&self, id: &str, host: &str, port: u16) -> Result<()> {
+    pub(crate) fn set_pod_endpoint(&self, id: &str, host: &str, port: u16) -> Result<()> {
         self.conn.execute(
             "UPDATE pods SET ssh_host=?2, ssh_port=?3, updated_at=?4 WHERE id=?1",
             params![id, host, port as i64, now_iso()],
@@ -62,7 +62,7 @@ impl Db {
     }
 
     /// Mark a pod `busy` and record its holder. The run's own `pod_id` is set separately.
-    pub fn assign_pod(&self, id: &str, run_id: &str) -> Result<()> {
+    pub(crate) fn assign_pod(&self, id: &str, run_id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE pods SET status='busy', current_run=?2, updated_at=?3 WHERE id=?1",
             params![id, run_id, now_iso()],
@@ -71,7 +71,7 @@ impl Db {
     }
 
     /// Release a pod after a run: back to `idle`.
-    pub fn release_pod(&self, id: &str) -> Result<()> {
+    pub(crate) fn release_pod(&self, id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE pods SET status='idle', current_run=NULL, updated_at=?2 WHERE id=?1",
             params![id, now_iso()],
@@ -80,7 +80,7 @@ impl Db {
     }
 
     /// All pods not yet `terminated`.
-    pub fn live_pods(&self) -> Result<Vec<Pod>> {
+    pub(crate) fn live_pods(&self) -> Result<Vec<Pod>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, gpu_type, cloud, image, status, ssh_host, ssh_port, current_run, created_at, updated_at
              FROM pods WHERE status != 'terminated' ORDER BY created_at",
@@ -92,7 +92,7 @@ impl Db {
     }
 
     /// All pods (any status), newest first.
-    pub fn all_pods(&self, limit: i64) -> Result<Vec<Pod>> {
+    pub(crate) fn all_pods(&self, limit: i64) -> Result<Vec<Pod>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, gpu_type, cloud, image, status, ssh_host, ssh_port, current_run, created_at, updated_at
              FROM pods ORDER BY created_at DESC LIMIT ?1",

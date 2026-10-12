@@ -6,7 +6,7 @@
 //! device is refused with a typed placement error before anything is allocated, and a recording
 //! failure in a later stage leaves no partial entry behind. Model-free: only real SPIR-V codegen to
 //! compile the fixture's kernels, which the fake never runs. What the stages compute is the device
-//! lanes' business (`poot-executor-parity`'s pipeline rows).
+//! lanes' business (`poot_models::test_support::pipeline`'s rows).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,17 +15,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use poot_executor::{
-    BufferRole, DetailedTiming, Device, DeviceTime, Dispatch, DispatchDeviceTime, DrainPolicy,
-    Engine, ExecError, ExecutableId, Executor, LoadError, MeasuredDeviceTime, NoSync, StepInputs,
+    DetailedTiming, Device, DeviceTime, Dispatch, DispatchDeviceTime, DrainPolicy, Engine,
+    ExecError, ExecutableId, Executor, LoadError, MeasuredDeviceTime, NoSync, StepInputs,
     TimingOptions,
 };
 use poot_graph_ir::{BinOp, BoundaryId, Builder, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Link, Partition,
-    StageId, StagedParts, StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement, staged::Link,
+    staged::Partition, staged::StageId, staged::StagedParts, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostView};
 
@@ -246,21 +249,23 @@ fn new_engine_timed(timing: TimingOptions) -> (Engine<FakeDevice>, Control) {
 /// constant, and one carried state pair per block. Each block is tagged with its layer, so a cut
 /// after layer `k` lands between blocks.
 fn layered() -> (poot_graph_ir::Graph, Arc<WeightStore>, Arc<WeightMap>) {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
-    let w = b.constant("w", TensorType::f32(vec![4]));
+    let b = Builder::for_tests();
+    let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
     let mut hidden = x;
     let mut state = Vec::new();
     for layer in 0..LAYERS {
         let _scope = b.layer_scope(layer);
-        let scaled = b.binary(BinOp::Mul, hidden, w);
-        let k_in = b.state_input(
-            &format!("k{layer}"),
-            TensorType::f32(vec![4]),
-            StateRole::Recurrent,
-        );
-        let k_out = b.binary(BinOp::Add, k_in, scaled);
-        hidden = b.binary(BinOp::Add, scaled, k_out);
+        let scaled = b.binary(BinOp::Mul, hidden, w).unwrap();
+        let k_in = b
+            .state_input(
+                &format!("k{layer}"),
+                TensorType::f32(vec![4]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let k_out = b.binary(BinOp::Add, k_in, scaled).unwrap();
+        hidden = b.binary(BinOp::Add, scaled, k_out).unwrap();
         state.push((k_in, k_out));
     }
     let g = b
@@ -280,7 +285,7 @@ fn layered() -> (poot_graph_ir::Graph, Arc<WeightStore>, Arc<WeightMap>) {
         )
         .unwrap();
     let store = Arc::new(builder.build());
-    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
     let g = names.graph(&g);
     let map = Arc::new(names.map());
     (g, store, map)
@@ -717,9 +722,9 @@ fn a_link_read_before_its_producer_exported_is_unresolved() {
 fn two_stages_declaring_one_slot_differently_conflict() {
     let (g, store, map) = layered();
     let wide = {
-        let b = Builder::new();
-        let x = b.slot(Slot::Activation, TensorType::f32(vec![8]));
-        let out = b.binary(BinOp::Add, x, x);
+        let b = Builder::for_tests();
+        let x = b.slot(Slot::Activation, TensorType::f32(vec![8])).unwrap();
+        let out = b.binary(BinOp::Add, x, x).unwrap();
         b.finish(out).unwrap()
     };
     let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
@@ -744,12 +749,14 @@ fn two_stages_declaring_one_slot_differently_conflict() {
 #[test]
 fn an_export_viewing_carried_state_is_refused_at_load() {
     let (_, store, map) = layered();
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
-    let k_in = b.state_input("k", TensorType::f32(vec![4]), StateRole::Recurrent);
-    let view = b.reshape(k_in, vec![2, 2]);
-    let k_out = b.binary(BinOp::Add, k_in, x);
-    let out = b.binary(BinOp::Add, view, view);
+    let b = Builder::for_tests();
+    let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
+    let k_in = b
+        .state_input("k", TensorType::f32(vec![4]), StateRole::Recurrent)
+        .unwrap();
+    let view = b.reshape(k_in, vec![2, 2]).unwrap();
+    let k_out = b.binary(BinOp::Add, k_in, x).unwrap();
+    let out = b.binary(BinOp::Add, view, view).unwrap();
     let graph = b
         .finish(
             poot_graph_ir::Outputs::new(out)

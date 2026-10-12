@@ -1,4 +1,4 @@
-use super::*;
+use super::{Graph, OpKind, Operand, ValueId, ValueTable};
 /// Peak transient activation bytes the graph needs, by a liveness sweep over the topologically ordered
 /// eqns. Transient values are those produced by an eqn; graph inputs (weights/consts/slots) are
 /// persistent and excluded, so this measures the activation working set that fusion and flash

@@ -4,7 +4,7 @@
 use crate::multi_device::topology::{DeviceId, DeviceSpec};
 use poot_target::Backend;
 
-pub fn device(id: u32, usable_bytes: u64) -> DeviceSpec {
+pub(super) fn device(id: u32, usable_bytes: u64) -> DeviceSpec {
     DeviceSpec {
         id: DeviceId(id),
         target: Backend::SpirvVulkan.into(),

@@ -13,9 +13,9 @@
 
 use std::collections::BTreeMap;
 
-use poot_executor_parity::dense::{Dense, Family, paged_step, step};
 use poot_graph_ir::{Graph, Storage};
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 
 const LAYERS: usize = 2;
 
@@ -45,7 +45,7 @@ fn dense_trace(family: Family, phase: Phase, shape: poot_models::model::StepShap
     dense
         .f32_model()
         .model
-        .trace(phase, shape)
+        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
         .unwrap_or_else(|e| panic!("{family:?}: {e}"))
 }
 
@@ -60,7 +60,9 @@ fn registered_trace(family: &str, phase: Phase, shape: poot_models::model::StepS
     let fixture = (entry.fixture)();
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     // A routed family declares router witnesses; the corpus counts consts, which they do not touch.
-    let traced = model.trace(phase, shape).expect("the fixture traces");
+    let traced = model
+        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .expect("the fixture traces");
     let mut plain = poot_graph_ir::GraphEdit::new();
     *plain.values_mut() = traced.values().clone();
     *plain.inputs_mut() = traced.inputs().to_vec();

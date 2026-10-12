@@ -16,11 +16,11 @@ use crate::clock::now_iso;
 
 mod core;
 mod pods;
-mod runs;
+pub(crate) mod runs;
 
-pub use core::*;
-pub use pods::*;
-pub use runs::*;
+pub(crate) use core::Db;
+pub(crate) use pods::pick_idle_pod;
+pub(crate) use runs::{ExecOwner, ExecReapReport, ReapProtection, Run};
 
 /// Every pod this orchestrator creates is named `poot-orch-<state id>-<run id>-a<attempt>`.
 const POD_NAME_PREFIX: &str = "poot-orch-";
@@ -142,7 +142,7 @@ impl Db {
     /// The prefix every pod created against this database carries. The state id is committed here, before
     /// the first create call, so a pod created and then lost to a crash is still named under a prefix
     /// `reap` can find.
-    pub fn pod_owner_prefix(&self) -> Result<PodOwnerPrefix> {
+    pub(crate) fn pod_owner_prefix(&self) -> Result<PodOwnerPrefix> {
         Ok(PodOwnerPrefix(format!(
             "{POD_NAME_PREFIX}{}-",
             self.state_id()?

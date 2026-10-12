@@ -10,7 +10,7 @@ use crate::db::PodOwnerPrefix;
 
 const BASE: &str = "https://rest.runpod.io/v1";
 
-pub struct RunPod {
+pub(crate) struct RunPod {
     client: reqwest::blocking::Client,
     key: String,
     /// REST v1 origin. Production always uses [`BASE`]; host tests may point at a
@@ -22,7 +22,7 @@ pub struct RunPod {
 /// booted, so callers poll `get_pod` until `ssh_endpoint` is Some.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
-pub struct Pod {
+pub(crate) struct Pod {
     pub id: String,
     pub name: String,
     #[serde(rename = "desiredStatus")]
@@ -40,7 +40,7 @@ pub struct Pod {
 
 impl Pod {
     /// True once a host machine has been assigned (the `machine` object is non-empty).
-    pub fn machine_ready(&self) -> bool {
+    pub(crate) fn machine_ready(&self) -> bool {
         self.machine
             .as_object()
             .map(|m| !m.is_empty())
@@ -48,7 +48,7 @@ impl Pod {
     }
 
     /// (public_ip, public_port) for the exposed 22/tcp port, or None until the pod is up.
-    pub fn ssh_endpoint(&self) -> Option<(String, u16)> {
+    pub(crate) fn ssh_endpoint(&self) -> Option<(String, u16)> {
         let ip = self.public_ip.as_ref()?;
         if ip.is_empty() {
             return None;
@@ -103,7 +103,7 @@ const GPU_TYPE_NAMES: &[(&str, &str)] = &[
 
 /// Normalize a `--gpu-types` token to the display name the REST `gpuTypeIds` enum accepts.
 /// Accepts the catalog id spelling or the display name; unknown tokens pass through unchanged.
-pub fn normalize_gpu_type_id(token: &str) -> &str {
+pub(crate) fn normalize_gpu_type_id(token: &str) -> &str {
     GPU_TYPE_NAMES
         .iter()
         .find(|(id, display)| *id == token || *display == token)
@@ -115,7 +115,7 @@ pub fn normalize_gpu_type_id(token: &str) -> &str {
 ///
 /// REST v1 takes `env` as a JSON object (`{ "KEY": "value" }`), not a GraphQL-style `[{key,value}]`
 /// array. Separate function so tests can assert the wire shape without a live API.
-pub fn create_pod_body(spec: &CreateSpec<'_>) -> serde_json::Value {
+pub(crate) fn create_pod_body(spec: &CreateSpec<'_>) -> serde_json::Value {
     let mut body = serde_json::json!({
         "name": spec.owner.pod_name(spec.run_id, spec.attempt),
         "imageName": spec.image,
@@ -143,7 +143,7 @@ pub fn create_pod_body(spec: &CreateSpec<'_>) -> serde_json::Value {
 
 /// Parse a `list_pods` body: a bare `[...]` array (what `GET /pods` returns) or a `{ "pods": [...] }`
 /// wrapper.
-pub fn parse_pod_list(text: &str) -> Result<Vec<Pod>> {
+pub(crate) fn parse_pod_list(text: &str) -> Result<Vec<Pod>> {
     if let Ok(v) = serde_json::from_str::<Vec<Pod>>(text) {
         return Ok(v);
     }
@@ -157,7 +157,7 @@ pub fn parse_pod_list(text: &str) -> Result<Vec<Pod>> {
 }
 
 impl RunPod {
-    pub fn new(key: String) -> Result<RunPod> {
+    pub(crate) fn new(key: String) -> Result<RunPod> {
         Self::with_base(key, BASE)
     }
 
@@ -178,7 +178,7 @@ impl RunPod {
         rb.bearer_auth(&self.key)
     }
 
-    pub fn create_pod(&self, spec: &CreateSpec) -> Result<Pod> {
+    pub(crate) fn create_pod(&self, spec: &CreateSpec) -> Result<Pod> {
         let body = create_pod_body(spec);
         let resp = self
             .auth(self.client.post(format!("{}/pods", self.base)))
@@ -194,7 +194,7 @@ impl RunPod {
             .with_context(|| format!("parse create_pod response: {text}"))
     }
 
-    pub fn get_pod(&self, id: &str) -> Result<Pod> {
+    pub(crate) fn get_pod(&self, id: &str) -> Result<Pod> {
         let resp = self
             .auth(self.client.get(format!("{}/pods/{id}", self.base)))
             .send()
@@ -207,7 +207,7 @@ impl RunPod {
         serde_json::from_str::<Pod>(&text).with_context(|| format!("parse get_pod: {text}"))
     }
 
-    pub fn list_pods(&self) -> Result<Vec<Pod>> {
+    pub(crate) fn list_pods(&self) -> Result<Vec<Pod>> {
         let resp = self
             .auth(self.client.get(format!("{}/pods", self.base)))
             .send()
@@ -221,7 +221,7 @@ impl RunPod {
     }
 
     /// Permanently delete a pod. A 404 counts as already gone.
-    pub fn delete_pod(&self, id: &str) -> Result<()> {
+    pub(crate) fn delete_pod(&self, id: &str) -> Result<()> {
         let resp = self
             .auth(self.client.delete(format!("{}/pods/{id}", self.base)))
             .send()
@@ -240,7 +240,7 @@ impl RunPod {
 /// Classify a `DELETE /pods/{id}` status code: 2xx and 404 both mean the pod is gone
 /// (FR-015 exact-id teardown treats an already-missing pod as success). Every other
 /// status is a failure the caller must see.
-pub fn delete_status_is_gone(status: u16) -> bool {
+pub(crate) fn delete_status_is_gone(status: u16) -> bool {
     (200..300).contains(&status) || status == 404
 }
 

@@ -21,8 +21,7 @@ tracing-subscriber.workspace = true
 # SC-002/SC-003 (card 608): compiles real AMDGCN fixture kernels to exercise
 # the schema check and entry-point selection on the production dispatch path, not a hand-rolled artifact.
 poot-codegen.workspace = true
-poot-kernel-ir.workspace = true
-poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+poot-kernel-ir = { workspace = true, features = ["test-support"] }
 
 [[example]]
 name = "agent-list"

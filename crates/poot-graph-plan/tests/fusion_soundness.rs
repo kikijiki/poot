@@ -58,11 +58,11 @@ fn assert_close(a: &HostTensor, b: &HostTensor, tol: f32) {
 /// assertion (one eqn) goes red.
 #[test]
 fn recip_tanh_erf_fused_region_matches_the_oracle() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 8]));
-    let g = b.unary(UnOp::Tanh, x);
-    let e = b.unary(UnOp::Erf, g);
-    let r = b.unary(UnOp::Recip, e);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+    let g = b.unary(UnOp::Tanh, x).unwrap();
+    let e = b.unary(UnOp::Erf, g).unwrap();
+    let r = b.unary(UnOp::Recip, e).unwrap();
     let graph = b.finish(r).unwrap();
 
     let fused = fuse(&graph).unwrap();

@@ -110,8 +110,8 @@ pub fn f32_to_e4m3fn_packed(name: &str, logical_row_len: usize) -> Result<Body, 
 #[cfg(test)]
 mod tests {
     use poot_kernel_ir::interp::{Buffer, run};
+    use poot_kernel_ir::test_support::workgroups_covering;
     use poot_quant::scalar::e4m3fn_to_f32;
-    use poot_test_util::kernel_fixtures::workgroups_covering;
 
     use super::*;
 

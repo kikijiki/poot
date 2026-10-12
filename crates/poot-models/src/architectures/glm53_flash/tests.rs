@@ -7,7 +7,9 @@ mod reference;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::Slot;
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target, compile};
+use poot_graph_plan::{
+    CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
+};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_tensor::DType;
@@ -44,7 +46,11 @@ fn shape(tokens: usize, capacity: usize, logits: LogitRows) -> StepShape {
 /// The names of the state a one-token decode step carries, in carry order.
 fn state_names(model: &dyn Model, capacity: usize) -> Vec<String> {
     let g = model
-        .trace(Phase::Decode, shape(1, capacity, LogitRows::All))
+        .trace(
+            Phase::Decode,
+            shape(1, capacity, LogitRows::All),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     g.state()
         .map(|(input, _)| g.meta(input).name.clone().unwrap())
@@ -334,9 +340,11 @@ fn driver_pieces_of_four_and_two_equal_six_decode_steps() {
 #[test]
 fn step_shapes_the_family_cannot_trace_are_typed_refusals() {
     let model = model_of(&fixture());
-    let reason = |phase, tokens, capacity| match model
-        .trace(phase, shape(tokens, capacity, LogitRows::Last))
-    {
+    let reason = |phase, tokens, capacity| match model.trace(
+        phase,
+        shape(tokens, capacity, LogitRows::Last),
+        poot_graph_ir::TraceLimits::for_tests(),
+    ) {
         Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     };
@@ -355,7 +363,11 @@ fn step_shapes_the_family_cannot_trace_are_typed_refusals() {
     assert_eq!(model.config().prefill_granule.get(), 1);
     for tokens in [1, 3, 6] {
         model
-            .trace(Phase::Prefill, shape(tokens, CAPACITY, LogitRows::Last))
+            .trace(
+                Phase::Prefill,
+                shape(tokens, CAPACITY, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
     }
 }
@@ -386,7 +398,9 @@ fn two_rows_do_not_share_state() {
         ..shape(tokens, CAPACITY, LogitRows::All)
     };
     let run = |phase, tokens: usize, ids: Vec<i32>, pos: Vec<i32>, state: Vec<Vec<f32>>| {
-        let g = model.trace(phase, two(tokens)).unwrap();
+        let g = model
+            .trace(phase, two(tokens), poot_graph_ir::TraceLimits::for_tests())
+            .unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()
             .map(|(si, _)| vec![0.0; g.aval(si).numel()])
@@ -828,7 +842,11 @@ const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLi
 /// The traced and weight-bound graph of one step of `phase` at `tokens` tokens.
 fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
     let graph = model
-        .trace(phase, shape(tokens, CAPACITY, LogitRows::Last))
+        .trace(
+            phase,
+            shape(tokens, CAPACITY, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     poot_graph_plan::bind_packed_weights(
         &graph,
@@ -911,7 +929,9 @@ fn run_named(
     start: i32,
     state: &mut NamedState,
 ) -> Vec<f32> {
-    let graph = model.trace(phase, step).unwrap();
+    let graph = model
+        .trace(phase, step, poot_graph_ir::TraceLimits::for_tests())
+        .unwrap();
     let names: Vec<String> = graph
         .state()
         .map(|(input, _)| graph.meta(input).name.clone().unwrap())
@@ -1041,10 +1061,11 @@ fn the_traced_mtp_chain_over_the_carry_equals_the_from_scratch_chain_for_k_3() {
 #[test]
 fn an_mtp_step_without_a_carry_or_with_a_narrow_one_is_a_typed_refusal() {
     let model = model_of(&fixture());
-    let refusal = |shape| match model.trace(Phase::Mtp, shape) {
-        Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
-        other => panic!("expected a shape refusal, got {:?}", other.map(|_| ())),
-    };
+    let refusal =
+        |shape| match model.trace(Phase::Mtp, shape, poot_graph_ir::TraceLimits::for_tests()) {
+            Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
+            other => panic!("expected a shape refusal, got {:?}", other.map(|_| ())),
+        };
     assert_eq!(
         refusal(shape(1, CAPACITY, LogitRows::Last)),
         ShapeReason::MtpWithoutCarry
@@ -1073,7 +1094,7 @@ fn a_checkpoint_without_exactly_one_mtp_layer_refuses_the_phase_typed() {
     let step = step_shape(1, CAPACITY, LogitRows::Last, Some(carry));
     let model = model_of(&finetune_fixture());
     assert!(matches!(
-        model.trace(Phase::Mtp, step),
+        model.trace(Phase::Mtp, step, poot_graph_ir::TraceLimits::for_tests()),
         Err(TraceError::PhaseUnsupported {
             phase: Phase::Mtp,
             ..
@@ -1092,14 +1113,18 @@ fn a_checkpoint_without_exactly_one_mtp_layer_refuses_the_phase_typed() {
         &fx.store,
     );
     assert!(matches!(
-        model.trace(Phase::Mtp, step),
+        model.trace(Phase::Mtp, step, poot_graph_ir::TraceLimits::for_tests()),
         Err(TraceError::PhaseUnsupported {
             phase: Phase::Mtp,
             ..
         })
     ));
     model
-        .trace(Phase::Decode, shape(1, CAPACITY, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            shape(1, CAPACITY, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
 }
 
@@ -1120,7 +1145,7 @@ fn every_other_family_refuses_phase_mtp_typed() {
         }
         let fx = (entry.fixture)();
         let model = build(entry, &fx.raw(), &fx.store);
-        match model.trace(Phase::Mtp, step) {
+        match model.trace(Phase::Mtp, step, poot_graph_ir::TraceLimits::for_tests()) {
             Err(TraceError::PhaseUnsupported {
                 phase: Phase::Mtp, ..
             }) => refused += 1,
@@ -1151,6 +1176,7 @@ fn the_mtp_graphs_compile_for_every_backend() {
             .trace(
                 Phase::Mtp,
                 step_shape(tokens, CAPACITY, LogitRows::Last, Some(carry)),
+                poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
         let graph = poot_graph_plan::bind_packed_weights(
@@ -1217,4 +1243,54 @@ fn a_non_finite_embedding_row_at_position_zero_is_zeroed_not_propagated() {
         "the logits are finite"
     );
     close(&logits[0], &want);
+}
+
+/// POOT-569 SC-011 limit rows (moved to POOT-733): the KDA recurrence unrolls one body per token, so
+/// the step's token count is the only thing that bounded its construction before the Builder had an
+/// equation budget. A direct 6-token prefill under `max_tokens = 4` is refused before any tracer growth
+/// (the body never runs), and under `max_eqns = 6` a prefill whose recurrence would append a seventh
+/// equation is refused at it: no graph, the typed budget cause naming the equation count. Mutation:
+/// drop the budget from `Builder::emit` (the equation is appended unbudgeted); the seventh-equation
+/// row builds the whole unrolled graph and this row is red.
+#[test]
+fn the_kda_token_loop_is_bounded_by_the_callers_token_and_equation_limits() {
+    use poot_graph_ir::{Attempted, BudgetResource, TraceLimits};
+    use std::num::NonZeroU64;
+
+    let fx = fixture();
+    let model = model_of(&fx);
+    let roomy = TraceLimits::for_tests();
+    let six = shape(6, CAPACITY, LogitRows::Last);
+    let full = model.trace(Phase::Prefill, six, roomy).unwrap();
+    assert!(
+        full.eqns().len() > 6,
+        "the unrolled prefill is larger than the limit under test"
+    );
+
+    let tokens = TraceLimits {
+        max_tokens: NonZeroUsize::new(4).unwrap(),
+        max_literal_bytes: NonZeroU64::new(1 << 20).unwrap(),
+        ..roomy
+    };
+    let Err(TraceError::Budget(refused)) = model.trace(Phase::Prefill, six, tokens) else {
+        panic!("a 6-token step under max_tokens = 4 must be the typed budget refusal");
+    };
+    assert_eq!(refused.resource, BudgetResource::Tokens);
+    assert_eq!((refused.limit, refused.requested), (4, 6));
+    assert_eq!(refused.attempted, Attempted::Total(6));
+    // The exact boundary traces.
+    model
+        .trace(Phase::Prefill, shape(4, CAPACITY, LogitRows::Last), tokens)
+        .unwrap();
+
+    let equations = TraceLimits {
+        max_eqns: NonZeroUsize::new(6).unwrap(),
+        ..roomy
+    };
+    let Err(TraceError::Budget(refused)) = model.trace(Phase::Prefill, six, equations) else {
+        panic!("the seventh equation must be the typed budget refusal");
+    };
+    assert_eq!(refused.resource, BudgetResource::Equations);
+    assert_eq!((refused.limit, refused.used, refused.requested), (6, 6, 1));
+    assert_eq!(refused.attempted, Attempted::Total(7));
 }
