@@ -7,19 +7,33 @@ use std::ffi::c_void;
 /// Provenance retained for a Card 333 discrete PCIe device-ring receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceRingReceiptProvenance {
+    /// Whether `HSA_ALLOCATE_QUEUE_DEV_MEM=1` was set in the process environment when the queue was created.
     pub allocate_queue_dev_mem: bool,
+    /// The queue-creation API and environment switch that produced the device-memory ring, as a label.
     pub queue_api: &'static str,
+    /// HSA queue type passed to `hsa_queue_create` (`HSA_QUEUE_TYPE_MULTI`).
     pub queue_type_requested: u32,
+    /// HSA queue type the created queue reports.
     pub queue_type_returned: u32,
+    /// HSA queue feature bits the created queue reports.
     pub queue_features: u32,
+    /// Ring size the created queue reports, in AQL packets.
     pub queue_size: u32,
+    /// HSA agent name of the GPU.
     pub agent_name: String,
+    /// AMD product name of the GPU, falling back to the agent name when none is reported.
     pub product_name: String,
+    /// ISA name of the GPU (for example `amdgcn-amd-amdhsa--gfx1151`).
     pub isa_name: String,
+    /// PCI bus/device/function id of the GPU, when the driver reports it.
     pub bdfid: Option<u32>,
+    /// PCI domain of the GPU, when the driver reports it.
     pub pci_domain: Option<u32>,
+    /// Number of hops on the link from the host CPU agent to the GPU's memory pool.
     pub num_link_hops: u32,
+    /// HSA link-info type of each hop; must contain PCIe for this receipt to be taken.
     pub link_types: Vec<u32>,
+    /// The queue publication contract the validated ring memory and host link resolved to.
     pub contract: QueuePublicationContract,
 }
 
@@ -254,27 +268,44 @@ impl publication::AqlChunkSink for LiveAqlChunkSink<'_> {
 pub enum DispatchGeometryViolation {
     /// A grid dimension is 0: the dispatch would launch no work-items.
     #[error("grid {axis} is 0")]
-    ZeroGrid { axis: DispatchAxis },
+    ZeroGrid {
+        /// The grid dimension that is 0.
+        axis: DispatchAxis,
+    },
     /// A workgroup dimension is 0.
     #[error("workgroup {axis} is 0")]
-    ZeroBlock { axis: DispatchAxis },
+    ZeroBlock {
+        /// The workgroup dimension that is 0.
+        axis: DispatchAxis,
+    },
     /// One workgroup dimension exceeds the per-dimension ceiling.
     #[error("workgroup {axis} is {value}, above the per-dimension limit {max}")]
     BlockAxisTooLarge {
+        /// The workgroup dimension over the limit.
         axis: DispatchAxis,
+        /// The requested size of that dimension.
         value: u32,
+        /// The per-dimension ceiling (the AMDGPU workgroup invocation limit).
         max: u32,
     },
     /// The workgroup's invocation count exceeds the device ceiling.
     #[error("workgroup invocations {invocations} exceed the limit {max}")]
-    BlockInvocationsTooLarge { invocations: u64, max: u32 },
+    BlockInvocationsTooLarge {
+        /// The product of the three workgroup dimensions.
+        invocations: u64,
+        /// The device ceiling on invocations per workgroup.
+        max: u32,
+    },
 }
 
 /// A dispatch dimension, for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchAxis {
+    /// The first (fastest-varying) dimension.
     X,
+    /// The second dimension.
     Y,
+    /// The third dimension.
     Z,
 }
 

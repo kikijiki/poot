@@ -40,12 +40,25 @@ pub struct ResidencyCounters {
 /// Why the manager could not serve a sync point.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// The sync point's program names no expert-id input.
     #[error("the sync point reads no expert ids")]
     NoIds,
+    /// An id outside the site's expert range, or negative.
     #[error("expert id {id} is not one of the site's {experts} experts")]
-    ExpertId { id: i32, experts: usize },
+    ExpertId {
+        /// The offending id.
+        id: i32,
+        /// Experts the site has.
+        experts: usize,
+    },
+    /// One step selects more distinct experts than the pool has rows to hold.
     #[error("a step needs {needed} experts but the pool has {slots} rows")]
-    PoolTooSmall { needed: usize, slots: usize },
+    PoolTooSmall {
+        /// Distinct experts the step selects.
+        needed: usize,
+        /// Rows the pool has.
+        slots: usize,
+    },
 }
 
 struct Site {
@@ -115,10 +128,12 @@ pub struct ExpertResidency {
 }
 
 impl ExpertResidency {
+    /// A manager with no sites and zeroed counters.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// The counters accumulated since the last reset.
     pub fn counters(&self) -> ResidencyCounters {
         self.counters
     }

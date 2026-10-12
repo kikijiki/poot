@@ -18,8 +18,11 @@ use poot_kernel_ir::{
 /// intrinsics (exp/sqrt); Binary covers the arithmetic ops.
 #[derive(Clone, Copy, Debug)]
 pub enum FusedScalarOp {
+    /// A kernel-ir unary op.
     Unary(UnOp),
+    /// A kernel-ir math intrinsic.
     Math(MathOp),
+    /// A kernel-ir binary op.
     Binary(BinOp),
     /// Reciprocal `1 / x`. Kernel-ir `UnOp` has no Recip variant, so it is expanded inline as a division
     /// (numerator 1.0). Lets Gated-DeltaNet normalization (`x * recip(sum)`) fuse into one kernel.
@@ -206,13 +209,19 @@ pub(crate) fn emit_scalar_op(
 /// inline literal.
 #[derive(Clone, Copy, Debug)]
 pub enum FusedInput {
+    /// Leaf input `j`, read at the output element's broadcast position.
     Leaf(usize),
+    /// The register of an earlier step `s`.
     Step(usize),
+    /// An inline `f32` literal.
     Lit(f32),
+    /// An inline `i32` literal, for exact-I32 regions.
     LitI32(i32),
     /// Last-axis lane of a packed I32 leaf. The leaf's last dimension is the pack width.
     LeafLane {
+        /// Index of the packed I32 leaf.
         leaf: usize,
+        /// Which last-axis lane of that leaf's word to read.
         lane: usize,
     },
 }
@@ -220,18 +229,23 @@ pub enum FusedInput {
 /// One step of a fused region: `step[s] = op(inputs...)`, computed in a register.
 #[derive(Clone, Debug)]
 pub struct FusedStep {
+    /// The scalar operation the step computes.
     pub op: FusedScalarOp,
+    /// The operation's operands, in the operation's own argument order.
     pub inputs: Vec<FusedInput>,
 }
 
 /// The element type a fused kernel reads one leaf as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeafTy {
+    /// A 32-bit float leaf.
     F32,
+    /// A 32-bit integer leaf (a `Select` condition in a float region, any operand in an exact-I32 region).
     I32,
     /// A two-byte float leaf, read as stored. Only a `Select` step may read it (it moves the element, it
     /// never computes on it), and a float region's output may be such a `Select`.
     BF16,
+    /// A two-byte float leaf in IEEE half format, read as stored.
     F16,
 }
 
@@ -254,14 +268,18 @@ pub struct FusedKernel {
     /// The element type of each leaf, one per leaf. A float region reads F32 leaves, plus I32 leaves that
     /// only a `Select` step may read (its condition); an exact-I32 region reads I32 leaves only.
     pub leaf_tys: Vec<LeafTy>,
+    /// The scalar steps in evaluation order; a step may name only earlier steps.
     pub steps: Vec<FusedStep>,
+    /// The value written out, as a leaf, a step or a literal.
     pub output: FusedInput,
 }
 
 /// A last-axis reduction op inside a row-wise fused region.
 #[derive(Clone, Copy, Debug)]
 pub enum RowReduce {
+    /// Sum of the row.
     Sum,
+    /// Maximum of the row.
     Max,
 }
 
@@ -269,12 +287,18 @@ pub enum RowReduce {
 /// value, a per-row Scalar op otherwise) or a last-axis reduction (a row value -> a per-row scalar).
 #[derive(Clone, Debug)]
 pub enum RowOp {
+    /// A pointwise op over row values and per-row scalars.
     Pointwise {
+        /// The scalar operation the step computes.
         op: FusedScalarOp,
+        /// The operation's operands; a [`FusedInput::Leaf`] is a row value, a [`FusedInput::Step`] a row value or a per-row scalar.
         inputs: Vec<FusedInput>,
     },
+    /// A last-axis reduction of a row value to a per-row scalar.
     Reduce {
+        /// The reduction operator.
         op: RowReduce,
+        /// The row value reduced.
         input: FusedInput,
     },
 }
@@ -286,12 +310,16 @@ pub enum RowOp {
 /// chain per pass.
 #[derive(Clone, Debug)]
 pub struct RowKernel {
+    /// Number of input leaves, each a row-major tensor whose last axis is the reduction extent.
     pub n_leaves: usize,
     /// How each leaf's elements sit in its buffer, one per leaf: f32 for a leaf read as stored, packed
     /// BF16 or F16 for a narrow leaf a [`FusedScalarOp::Widen`] step widens in registers.
     pub leaf_storage: Vec<BufferStorage>,
+    /// The reduction extent `N`: the last-axis length of every leaf.
     pub n_cols: usize,
+    /// The steps in evaluation order; a step may name only earlier steps.
     pub steps: Vec<RowOp>,
+    /// The value written out, as an index into the leaves followed by the steps: `0..n_leaves` is a leaf, `n_leaves + s` is step `s`.
     pub output: usize,
 }
 

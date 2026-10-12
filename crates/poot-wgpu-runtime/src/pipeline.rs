@@ -115,8 +115,11 @@ impl DeviceTimingAccumulator {
 /// own duration, the diagnostic first-to-last span across them, and each one's own `(index,
 /// duration)` pair in replay order.
 pub struct DeviceTimingResult {
+    /// Sum of every drained dispatch's own `[start, end)` duration.
     pub sum: std::time::Duration,
+    /// Earliest start to latest end across the drained dispatches, on the device clock.
     pub span: std::time::Duration,
+    /// `(dispatch index in replay order, its own duration)` for every drained dispatch.
     pub per_dispatch: Vec<(usize, std::time::Duration)>,
 }
 

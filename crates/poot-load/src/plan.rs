@@ -89,6 +89,7 @@ impl LoadPlan {
         self.jobs.len()
     }
 
+    /// Whether the plan builds no owners.
     pub fn is_empty(&self) -> bool {
         self.jobs.is_empty()
     }

@@ -6,15 +6,20 @@ use poot_graph_ir::{ValidationPacketLayout, ValueId};
 /// One graph value copied into the canonical validation packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationPacketSource {
+    /// The graph value whose lanes are copied into the packet.
     pub value: ValueId,
+    /// Index of the packet lane the value's first element lands in.
     pub first_lane: usize,
+    /// How many packet lanes the value occupies.
     pub lane_count: usize,
 }
 
 /// Backend-neutral, declaration-ordered packet layout and source plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationPacketPlan {
+    /// The canonical packet layout: which declared validation output sits in which lane range.
     pub layout: ValidationPacketLayout,
+    /// One source per packet-resident value, in declaration order.
     pub sources: Vec<ValidationPacketSource>,
 }
 

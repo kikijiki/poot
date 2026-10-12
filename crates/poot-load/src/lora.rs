@@ -81,7 +81,9 @@ pub struct LoraWeight {
 /// `.lora_A/.lora_B[.<adapter>].weight` suffix stripped (e.g. `model.layers.0.self_attn.q_proj`).
 #[derive(Debug, Clone)]
 pub struct LoraAdapter {
+    /// The adapter's `adapter_config.json`.
     pub config: LoraAdapterConfig,
+    /// Each target module's `A`/`B` pair, keyed by module path.
     pub weights: HashMap<String, LoraWeight>,
 }
 

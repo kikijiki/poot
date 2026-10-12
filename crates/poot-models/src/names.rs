@@ -22,20 +22,27 @@ pub enum Source {
     Linear(&'static str),
     /// A per-layer tensor named `{prefix}{layer}{suffix}`.
     LayerTensor {
+        /// The text before the layer index.
         prefix: &'static str,
+        /// The text after the layer index.
         suffix: &'static str,
     },
     /// A per-layer linear projection with stem `{prefix}{layer}{stem}`, dense or packed as
     /// [`Source::Linear`].
     LayerLinear {
+        /// The text before the layer index.
         prefix: &'static str,
+        /// The text after the layer index; the projection's stem.
         stem: &'static str,
     },
     /// One part of a per-layer linear that fuses several roles' rows (phi3's `qkv_proj`, its
     /// `gate_up_proj`): the layer linear `{prefix}{layer}{stem}`, read as the rows of `part`.
     LayerFused {
+        /// The text before the layer index.
         prefix: &'static str,
+        /// The text after the layer index; the fused projection's stem.
         stem: &'static str,
+        /// Which rows of the fused projection this role reads.
         part: FusedPart,
     },
 }
@@ -45,10 +52,13 @@ pub enum Source {
 pub enum FusedPart {
     /// `q | k | v` along the rows: the query, key or value rows.
     Q,
+    /// The key rows.
     K,
+    /// The value rows.
     V,
     /// `gate | up` along the rows.
     Gate,
+    /// The up rows.
     Up,
 }
 
@@ -86,7 +96,9 @@ impl FusedDims {
 /// the map (a bias a family does not have); the family decides what an absent role means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Presence {
+    /// The checkpoint must carry the tensor; its absence is a typed missing-weight error.
     Required,
+    /// The tensor may be absent (a bias a family does not have).
     Optional,
     /// When absent, the role reads the same stored tensor as the model-level role named here (a
     /// head tied to the embedding): its own map entry over the other row's entry, so each graph
@@ -97,8 +109,11 @@ pub enum Presence {
 /// One role of a family's name table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NameRow {
+    /// The typed role this row maps.
     pub role: WeightRole,
+    /// Where the role's tensor sits in the checkpoint.
     pub source: Source,
+    /// Whether the checkpoint must carry it.
     pub presence: Presence,
 }
 

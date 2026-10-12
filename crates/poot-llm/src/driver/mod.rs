@@ -126,7 +126,9 @@ pub use suffix::Head;
 /// ([`DriverOptions::charge`]) reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreparedSetLimits {
+    /// Most prepared entries the driver holds.
     pub max_entries: NonZeroUsize,
+    /// Most host bytes those entries retain together, as [`DriverOptions::charge`] counts them.
     pub max_retained_bytes: NonZeroU64,
 }
 
@@ -135,7 +137,9 @@ pub struct PreparedSetLimits {
 /// owner, whatever copies of its data their programs carry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedOwner {
+    /// Identity of the owner: entries naming the same key hold the one owner.
     pub key: String,
+    /// Host bytes the owner holds, charged once however many entries hold it.
     pub bytes: u64,
 }
 
@@ -145,7 +149,9 @@ pub struct SharedOwner {
 /// are never charged here.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Retention {
+    /// The shared owners this entry holds, each charged once across the entries that hold it.
     pub shared: Vec<SharedOwner>,
+    /// Bytes held by this entry alone.
     pub private: u64,
 }
 
@@ -234,7 +240,9 @@ pub const fn serving_trace_limits(max_tokens: NonZeroUsize) -> poot_graph_ir::Tr
 /// Every choice the caller makes about a driver; there is no `Default`.
 #[derive(Clone, Debug)]
 pub struct DriverOptions {
+    /// Compile options of the prefill programs.
     pub prefill: CompileOptions,
+    /// Compile options of the decode programs, the one-token step included.
     pub decode: CompileOptions,
     /// The KV positions the driver's state holds. State is keyed by (name, aval) inside an executable,
     /// so one driver has one capacity; a request of more positions is refused. Capacity only sizes
@@ -248,7 +256,10 @@ pub struct DriverOptions {
     /// bytes and owned storage a step's graph may hold bound its construction. A step that exceeds one
     /// is refused with the exact resource named, before the excess is built.
     pub trace: poot_graph_ir::TraceLimits,
+    /// The bound on the prepared set: entry count and retained bytes.
     pub prepared: PreparedSetLimits,
+    /// How a compiled program's retained host bytes are measured; [`program_retention`] is the
+    /// standard measure.
     pub charge: RetentionCharge,
     /// How a decode row proposes tokens to verify ([`speculate`]).
     pub draft: DraftPolicy,
@@ -262,9 +273,14 @@ pub struct DriverOptions {
 
 /// One sequence to generate. `sampler` carries its own knobs, penalty history, constraint and seed.
 pub struct GenerateRequest {
+    /// The prompt's token ids; must not be empty.
     pub prompt: Vec<u32>,
+    /// The most new tokens to generate; the prompt plus this must fit the driver's capacity.
     pub max_new: usize,
+    /// Picks each token; its knobs, penalty history, constraint and seed live here.
     pub sampler: Sampler,
+    /// Stop strings: generation ends when the output contains one, and the returned text ends
+    /// before it.
     pub stops: Vec<String>,
     /// Keep generating through the model's end-of-sequence token (it is then an ordinary token of the
     /// output): for fixed-length measurements. A request that ends on EOS leaves this off.
@@ -304,10 +320,12 @@ impl GenerateRequest {
     }
 }
 
+/// One finished generation: its tokens, why it ended, and the optional logprobs and phase timing.
 #[derive(Debug)]
 pub struct Generation {
     /// The generated tokens, not including the end-of-sequence token that ended the run.
     pub tokens: Vec<u32>,
+    /// Why generation ended.
     pub finish: FinishReason,
     /// One record per token, when the request's sampler recorded logprobs.
     pub logprobs: Vec<TokenLogprob>,
@@ -321,7 +339,9 @@ pub struct Generation {
 /// detokenization and the sink).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhaseTiming {
+    /// Tokens the phase covered.
     pub tokens: usize,
+    /// Engine wall time of the phase's steps.
     pub wall: std::time::Duration,
     /// Weight and carried-state bytes the plan reads for this phase's steps ([`ReadTraffic`]): the
     /// engine's own count from the planned storage of each value a dispatch reads.
@@ -381,7 +401,9 @@ impl std::ops::Sub for PhaseTiming {
 /// token, so the first token belongs to prefill and decode counts the tokens that follow it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GenerationTiming {
+    /// The prompt phase, ending with the step that yields the first token.
     pub prefill: PhaseTiming,
+    /// The tokens after the first.
     pub decode: PhaseTiming,
     /// The decode phase against the device's pinned ceiling; `None` for a device without one, or a
     /// decode that took no measured time.
@@ -391,6 +413,8 @@ pub struct GenerationTiming {
 /// Receives each generated token with the text it adds. Any `FnMut(u32, &str) -> GenerationControl`
 /// is one.
 pub trait TokenSink {
+    /// Receive one generated token `id` and the `text` it adds; `Break` ends generation, `Continue`
+    /// goes on.
     fn token(&mut self, id: u32, text: &str) -> GenerationControl;
 }
 
@@ -407,10 +431,12 @@ pub struct DriverStats {
     pub compiles: u64,
     /// Entries added to the executor.
     pub entries_added: u64,
+    /// Steps run, of every kind.
     pub steps: u64,
     /// Bytes the plan reads, summed over the steps run, split by whether the step's entry was a
     /// decode entry ([`ReadTraffic`]).
     pub decode_read_bytes: u64,
+    /// Bytes the plan reads, summed over the prefill steps run.
     pub prefill_read_bytes: u64,
     /// Picks that took the host sampling path.
     pub host_picks: u64,
@@ -640,6 +666,10 @@ impl StepData {
     }
 }
 
+/// One decode loop over an executor: it owns the prepared entries, the open sequences, the paged
+/// pool and the adapter registry of one model on one target. Built from a [`ModelHandle`], an
+/// executor and [`DriverOptions`]; every method that serves a request goes through the [`step`]
+/// surface.
 pub struct Driver {
     handle: Arc<ModelHandle>,
     executor: Box<dyn Executor>,
@@ -1052,6 +1082,7 @@ impl Driver {
         self
     }
 
+    /// What the driver has done so far, with the residency manager's counters read current.
     pub fn stats(&self) -> DriverStats {
         DriverStats {
             residency: self.residency_counters(),

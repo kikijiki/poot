@@ -27,11 +27,17 @@ use poot_tensor::{DType, HostTensor, HostView};
 /// A qwen2 checkpoint's dimensions.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen2Dims {
+    /// Vocabulary size (embedding rows).
     pub vocab: usize,
+    /// Hidden width.
     pub hidden: usize,
+    /// Feed-forward width.
     pub inter: usize,
+    /// Layer count.
     pub layers: usize,
+    /// Query head count.
     pub heads: usize,
+    /// Key/value head count.
     pub kv_heads: usize,
 }
 
@@ -49,15 +55,20 @@ pub const DIMS: Qwen2Dims = Qwen2Dims {
 /// How a fixture store holds its projections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Projections {
+    /// Dense BF16 projections.
     Bf16,
+    /// Packed Q8_0 projections.
     Q8_0,
 }
 
 /// A model, the store it was built over, and its weight map.
 #[derive(Debug)]
 pub struct MappedModel {
+    /// The built model.
     pub model: Box<dyn Model>,
+    /// The store the model was built over.
     pub store: Arc<WeightStore>,
+    /// The model's weight map over that store.
     pub map: Arc<WeightMap>,
 }
 
@@ -321,8 +332,11 @@ pub fn fused(m: &MappedModel) -> (Arc<WeightStore>, Arc<WeightMap>) {
 /// One step of `tokens` new tokens from absolute position `start`.
 #[derive(Clone, Debug)]
 pub struct Step {
+    /// The phase the step traces.
     pub phase: Phase,
+    /// The new token ids.
     pub ids: Vec<i32>,
+    /// The absolute position of the first new token.
     pub start: usize,
     shape: [usize; 2],
     ids_bytes: Vec<u8>,
@@ -330,6 +344,8 @@ pub struct Step {
 }
 
 impl Step {
+    /// A single-row step of `ids` from absolute position `start`, with its token and position inputs
+    /// encoded once.
     pub fn new(phase: Phase, ids: &[i32], start: usize) -> Self {
         let pos: Vec<i32> = (start..start + ids.len()).map(|p| p as i32).collect();
         Self {
@@ -342,6 +358,7 @@ impl Step {
         }
     }
 
+    /// The step's bound token and position inputs.
     pub fn inputs(&self) -> StepInputs<'_> {
         let n = self.ids.len();
         let mut inputs = StepInputs::new();

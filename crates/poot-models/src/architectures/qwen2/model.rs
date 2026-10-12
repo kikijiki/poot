@@ -30,6 +30,7 @@ use crate::names::{HF_BASE, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
 
+/// qwen2's [`FamilyKey`].
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen2");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
@@ -84,6 +85,8 @@ pub struct Qwen2Params {
 }
 
 impl Qwen2Params {
+    /// Reads the typed config from an HF `config.json` or a GGUF index; sliding-window attention and
+    /// other fields the family cannot serve are a typed [`ModelError::Config`].
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         Self::read(raw, FAMILY).map(|(params, _)| params)
     }
@@ -220,6 +223,9 @@ struct Layer {
     ffn: GatedFfnWeights,
 }
 
+/// A built qwen2-shaped model: config, name-resolved weights, the stack-level tensors and the
+/// per-layer weights. `family` is the key its errors carry, so a family that reuses this body
+/// reports under its own name. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct Qwen2 {
     family: FamilyKey,

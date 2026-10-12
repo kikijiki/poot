@@ -22,10 +22,13 @@ use crate::helpers::{Alloc, elem, guard, ld, local, slice_dtype, slice_f32};
 /// What one generated packed kernel computes (dquant.md 3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PackedKernelSpec {
+    /// The weight format whose descriptor drives the decode.
     pub format: WeightFormat,
+    /// The operation the kernel performs on the decoded weights.
     pub op: PackedKernelOp,
 }
 
+/// The operation a generated packed kernel performs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PackedKernelOp {
     /// `out[r, :] = decode(ids[r], :)`: `Gather(axis 0)` over `PackedDequant`.
@@ -36,6 +39,7 @@ pub enum PackedKernelOp {
 /// parameter rather than baking a shape into the body (see the module docs).
 const META_K: usize = 0;
 
+/// The body of the packed kernel `spec` names, named `name`. A descriptor the decode emitter cannot state is a typed [`KernelGenError`].
 pub fn packed_kernel(name: &str, spec: PackedKernelSpec) -> Result<Body, KernelGenError> {
     match spec.op {
         PackedKernelOp::RowGather => row_gather(name, spec.format),

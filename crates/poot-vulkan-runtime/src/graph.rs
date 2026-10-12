@@ -147,6 +147,7 @@ pub(crate) struct Timestamps {
 pub struct DispatchTime {
     /// Order among the graph's recorded dispatches (copies are not counted).
     pub index: usize,
+    /// The dispatch's own device duration, from its start and end timestamps.
     pub duration: Duration,
 }
 
@@ -157,13 +158,16 @@ pub struct GraphDeviceTime {
     pub sum_of_dispatch_durations: Duration,
     /// First dispatch's start to last dispatch's end on the device clock.
     pub device_span: Duration,
+    /// Each timed dispatch's own duration, in record order.
     pub dispatches: Vec<DispatchTime>,
 }
 
 /// A kernel assert (`Assert`/`Unreachable`) that fired during a replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelFault {
+    /// Name of the kernel that asserted.
     pub kernel: String,
+    /// Body-local trap id the kernel wrote.
     pub code: u32,
 }
 

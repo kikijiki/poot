@@ -49,16 +49,26 @@ pub(super) fn state_row_gather(
 /// was not enough.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RowGraphError {
+    /// The decode program carries no state value with a leading row axis.
     #[error("the decode program carries no state with a row axis")]
     NoState,
+    /// A carried state input has no name to key a snapshot by.
     #[error("a carried state input at value {value} carries no name")]
-    UnnamedState { value: ValueId },
+    UnnamedState {
+        /// The unnamed state input's value id.
+        value: ValueId,
+    },
+    /// A state value's row axis is not the program's row count.
     #[error("state {name:?} has row axis {found:?} where the program's is {rows}")]
     RowAxis {
+        /// The state's name.
         name: String,
+        /// The row count the program has.
         rows: usize,
+        /// The row axis found, `None` when the state has no row axis.
         found: Option<usize>,
     },
+    /// The graph builder refused an equation.
     #[error(transparent)]
     Build(#[from] BuilderError),
 }

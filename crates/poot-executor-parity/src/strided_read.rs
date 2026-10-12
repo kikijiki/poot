@@ -95,13 +95,16 @@ fn read_time(measured: &MeasuredDeviceTime) -> Duration {
 /// One stride's measurement: `runs` read rates, in GB/s of granule bytes read per second of device time.
 #[derive(Clone, Debug)]
 pub struct StrideRates {
+    /// Byte distance between consecutive granule reads.
     pub stride_bytes: usize,
     /// The channels this stride reaches at the probe's one granule per row.
     pub channels: usize,
+    /// Read rate of each run, in GB/s, in run order.
     pub gbps: Vec<f64>,
 }
 
 impl StrideRates {
+    /// The middle run's rate (the upper-middle for an even count), in GB/s.
     pub fn median(&self) -> f64 {
         let mut sorted = self.gbps.clone();
         sorted.sort_by(f64::total_cmp);

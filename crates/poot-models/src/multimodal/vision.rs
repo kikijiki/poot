@@ -14,6 +14,7 @@ pub struct PreprocessConfig {
     pub rescale_factor: f32,
     /// Per-channel normalization mean / std (`image_mean` / `image_std`, e.g. `0.5`).
     pub mean: [f32; 3],
+    /// Per-channel normalization standard deviation (`image_std`).
     pub std: [f32; 3],
 }
 
@@ -103,6 +104,7 @@ pub struct Idefics3Frames {
     pub frames: Vec<Vec<f32>>,
     /// Tile grid; `(0, 0)` when the image was not split (`frames` holds a single frame).
     pub rows: usize,
+    /// Tile grid columns; `(0, 0)` rows and columns when the image was not split.
     pub cols: usize,
 }
 
@@ -267,8 +269,11 @@ pub fn idefics3_preprocess(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("an {height}x{width} RGB image has {} values, the buffer holds {len}", height.saturating_mul(*width).saturating_mul(3))]
 pub struct ImageBufferError {
+    /// The number of values the buffer holds.
     pub len: usize,
+    /// The image height in pixels.
     pub height: usize,
+    /// The image width in pixels.
     pub width: usize,
 }
 

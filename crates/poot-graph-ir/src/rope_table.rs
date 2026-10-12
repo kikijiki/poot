@@ -19,26 +19,43 @@ pub enum RopeFlavor<'a> {
     Plain,
     /// Position interpolation (HF `linear`): every inverse frequency divided by `factor`
     /// (`pos / factor * f == pos * (f / factor)`). A `factor <= 0` leaves the table plain.
-    Linear { factor: f32 },
+    Linear {
+        /// The divisor applied to every inverse frequency.
+        factor: f32,
+    },
     /// Dynamic NTK (HF `dynamic`): once `positions` exceeds `original`, the base grows as
     /// `theta * (factor * positions / original - (factor - 1))^(dim / (dim - 2))`.
-    DynamicNtk { factor: f32, original: usize },
+    DynamicNtk {
+        /// The scaling factor of the grown base.
+        factor: f32,
+        /// The position count the checkpoint was trained for; the base only grows past it.
+        original: usize,
+    },
     /// YaRN (HF `yarn`): a ramp over the correction-dimension range from `beta_fast`/`beta_slow`
     /// blends the unscaled and the `factor`-interpolated frequency, and an attention factor scales the
     /// table (`attention_factor`, or HF's `get_mscale(factor)` when `None`).
     Yarn {
+        /// The interpolation factor of the scaled frequencies.
         factor: f32,
+        /// The position count the checkpoint was trained for.
         original: usize,
+        /// The fast-rotation bound that places the high end of the correction-dimension ramp.
         beta_fast: f32,
+        /// The slow-rotation bound that places the low end of the correction-dimension ramp.
         beta_slow: f32,
+        /// An explicit attention factor, or `None` for HF's `get_mscale(factor)`.
         attention_factor: Option<f32>,
     },
     /// Llama 3 NTK-by-parts (HF `llama3`): short wavelengths kept, long ones divided by `factor`, the
     /// band between blended.
     Llama3 {
+        /// The divisor applied to the long-wavelength frequencies.
         factor: f32,
+        /// Sets the long-wavelength bound `original / low_freq_factor`: wavelengths above it are divided by `factor`.
         low_freq_factor: f32,
+        /// Sets the short-wavelength bound `original / high_freq_factor`: wavelengths below it are kept.
         high_freq_factor: f32,
+        /// The position count the checkpoint was trained for.
         original: usize,
     },
     /// LongRoPE (HF `longrope`, phi3): each inverse frequency divided by a per-frequency factor, the
@@ -46,21 +63,30 @@ pub enum RopeFlavor<'a> {
     /// table is scaled by `sqrt(1 + ln(max_positions / original) / ln(original))` when
     /// `max_positions > original`, which HF computes once from the config.
     LongRope {
+        /// The position count the checkpoint was trained for; the regime switches past it.
         original: usize,
+        /// The longest position the model supports, which sets the attention scale.
         max_positions: usize,
+        /// Per-frequency divisors of the short regime.
         short: Option<&'a [f32]>,
+        /// Per-frequency divisors of the long regime.
         long: Option<&'a [f32]>,
     },
     /// Proportional RoPE (HF `proportional`, Gemma 4's global layers): the first `rotated`
     /// frequency pairs are plain (`theta^(-2j / dim)` over the full width), every later pair has
     /// zero frequency, so those dims pass through unrotated (NoPE).
-    Proportional { rotated: usize },
+    Proportional {
+        /// The number of leading frequency pairs that rotate; every later pair is NoPE.
+        rotated: usize,
+    },
 }
 
 /// A `[positions, dim]` cos table and sin table, row-major.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RopeTables {
+    /// The cos table, `[positions, dim]` row-major.
     pub cos: Vec<f32>,
+    /// The sin table, `[positions, dim]` row-major.
     pub sin: Vec<f32>,
 }
 
@@ -258,7 +284,9 @@ fn yarn_inv_freq(
 /// Which table of a RoPE pair a [`ComputedConst::Rope`] materializes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RopeTable {
+    /// The cosine table.
     Cos,
+    /// The sine table.
     Sin,
 }
 
@@ -269,28 +297,47 @@ pub enum RopeTable {
 /// [`rope_tables`] input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RopeScaling {
+    /// [`RopeFlavor::Plain`].
     Plain,
+    /// [`RopeFlavor::Linear`].
     Linear {
+        /// `factor`'s `f32` bit pattern.
         factor_bits: u32,
     },
+    /// [`RopeFlavor::DynamicNtk`].
     DynamicNtk {
+        /// `factor`'s `f32` bit pattern.
         factor_bits: u32,
+        /// The trained position count.
         original: u32,
     },
+    /// [`RopeFlavor::Yarn`], its attention factor resolved.
     Yarn {
+        /// `factor`'s `f32` bit pattern.
         factor_bits: u32,
+        /// The trained position count.
         original: u32,
+        /// `beta_fast`'s `f32` bit pattern.
         beta_fast_bits: u32,
+        /// `beta_slow`'s `f32` bit pattern.
         beta_slow_bits: u32,
+        /// The resolved attention factor's `f32` bit pattern.
         attention_factor_bits: u32,
     },
+    /// [`RopeFlavor::Llama3`].
     Llama3 {
+        /// `factor`'s `f32` bit pattern.
         factor_bits: u32,
+        /// `low_freq_factor`'s `f32` bit pattern.
         low_freq_factor_bits: u32,
+        /// `high_freq_factor`'s `f32` bit pattern.
         high_freq_factor_bits: u32,
+        /// The trained position count.
         original: u32,
     },
+    /// [`RopeFlavor::Proportional`].
     Proportional {
+        /// The number of leading frequency pairs that rotate.
         rotated: u32,
     },
 }
@@ -307,12 +354,19 @@ pub struct RopeSpec {
 /// Why a [`RopeSpec`] or its computed constant cannot be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RopeSpecError {
+    /// The flavor is LongRoPE, whose per-frequency factor arrays cannot sit in a `Copy` spec.
     #[error(
         "LongRoPE's per-frequency factors have no scalar form, so a computed RoPE constant cannot hold them"
     )]
     FactorArrays,
+    /// A width, position count or other extent exceeds `u32`.
     #[error("RoPE {what} {value} does not fit a computed constant's u32 extent")]
-    Extent { what: &'static str, value: usize },
+    Extent {
+        /// Which extent overflowed (for example the rotary width).
+        what: &'static str,
+        /// The offending value.
+        value: usize,
+    },
 }
 
 fn extent(what: &'static str, value: usize) -> Result<u32, RopeSpecError> {
@@ -372,6 +426,7 @@ impl RopeSpec {
         self.dim as usize
     }
 
+    /// The base the inverse frequencies derive from.
     pub fn theta(self) -> f32 {
         f32::from_bits(self.theta_bits)
     }

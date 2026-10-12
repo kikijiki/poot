@@ -15,11 +15,17 @@ const G: &str = "data_movement";
 pub enum Storage {
     /// One logical element per buffer element. `carrier` is the buffer's element type (`F32`, `I32`, `F16`,
     /// `BF16`); a copy never converts, so a carrier names a bit width, not an interpretation.
-    Elements { carrier: Ty },
+    Elements {
+        /// The buffer's element type.
+        carrier: Ty,
+    },
     /// `lane_bits`-wide lanes packed little-endian into `u32` words, element `c` of a row at bit
     /// `(c % lanes) * lane_bits` of word `c / lanes`, with every row (the last axis) padded to a whole
     /// word. The padding bits are unspecified, so a movement neither reads nor requires them.
-    PackedRows { lane_bits: u32 },
+    PackedRows {
+        /// Width of one lane in bits: 8 or 16 (a 32-bit lane is one element, use `Elements`).
+        lane_bits: u32,
+    },
 }
 
 impl Storage {
@@ -93,7 +99,9 @@ pub enum UpdateIndex {
 /// that each stay under a device's watchdog budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnitWindow {
+    /// First output unit the window writes.
     pub offset: usize,
+    /// Threads (one per unit) the window launches.
     pub threads: usize,
 }
 
@@ -103,58 +111,86 @@ pub struct UnitWindow {
 pub enum MovementOp {
     /// `out[idx] = in[idx permuted]`: output axis `d` reads input axis `perm[d]`.
     Transpose {
+        /// The input's logical shape.
         in_shape: Vec<usize>,
+        /// The input axis each output axis reads: a permutation of `0..rank`.
         perm: Vec<usize>,
     },
     /// `out = in[.., start..start + out_shape[axis], ..]` along `axis`.
     Slice {
+        /// The input's logical shape.
         in_shape: Vec<usize>,
+        /// The axis the slice is taken along.
         axis: usize,
+        /// First input position on `axis` that the slice reads.
         start: usize,
     },
     /// `out` is `in` broadcast to `out_shape` (right-aligned; a broadcast axis reads the same element).
-    Broadcast { in_shape: Vec<usize> },
+    Broadcast {
+        /// The input's logical shape, right-aligned against `out_shape`.
+        in_shape: Vec<usize>,
+    },
     /// The flat logical order is unchanged and the row length changes. A `PackedRows` reshape that moves
     /// the last axis needs it because row padding is not part of the logical tensor.
-    Reshape { in_shape: Vec<usize> },
+    Reshape {
+        /// The input's logical shape (same flat order as the output).
+        in_shape: Vec<usize>,
+    },
     /// `out[.., g, ..] = in[.., index[g], ..]` along `axis`; `index` is an `I32` buffer of `index_numel`
     /// elements (a scalar index is 1).
     Gather {
+        /// The input's logical shape.
         in_shape: Vec<usize>,
+        /// The axis the index selects along.
         axis: usize,
+        /// Elements in the `I32` index buffer (`1` for a scalar index).
         index_numel: usize,
     },
     /// The inputs joined along `axis`; their extents on it sum to `out_shape[axis]`.
     Concat {
+        /// The axis the inputs are joined along.
         axis: usize,
+        /// The logical shape of each input, in join order.
         in_shapes: Vec<Vec<usize>>,
     },
     /// `out = operand` with `update` written at `[.., index..index + extent, ..]` on `axis`, where the
     /// operand has `out_shape` and the update has `update_shape`.
     UpdateSlice {
+        /// The shape of the update tensor.
         update_shape: Vec<usize>,
+        /// The axis the update is written along.
         axis: usize,
+        /// Where the update starts on `axis`.
         index: UpdateIndex,
     },
     /// `out[p, ..] = inverse[p] >= 0 ? src[inverse[p], ..] : base[p, ..]`: the paged-KV scatter, where
     /// `base` has `out_shape`, `inverse` is an `I32` buffer of `out_shape[0]` rows (`-1` keeps the base
     /// row), and `window` restricts the dispatch to part of the output.
     ScatterRows {
+        /// The shape of the source rows' tensor (rows, then the trailing axes the output shares).
         src_shape: Vec<usize>,
+        /// When set, the dispatch writes only this window of the output's units.
         window: Option<UnitWindow>,
     },
     /// `out[index[s], ..] = src[s, ..]` for an `I32` index that is a permutation of the output's rows. One
     /// thread owns one source element, so only [`Storage::Elements`] stores it.
-    PermuteRows { src_shape: Vec<usize> },
+    PermuteRows {
+        /// The source tensor's logical shape; its rows are the index's length.
+        src_shape: Vec<usize>,
+    },
 }
 
 /// A data-movement kernel: the storage its tensors share, the output shape, the index mapping and how the
 /// launch folds past the device's x-grid cap. `fold.numel` is [`MovementSpec::threads`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MovementSpec {
+    /// How every tensor of the movement is stored.
     pub storage: Storage,
+    /// The logical shape of the output.
     pub out_shape: Vec<usize>,
+    /// The index mapping from output elements to input elements.
     pub op: MovementOp,
+    /// How the launch folds past the device's x-grid cap; `fold.numel` is the thread count.
     pub fold: Fold,
 }
 

@@ -52,12 +52,14 @@ pub enum AieTargetId {
 }
 
 impl AieTargetId {
+    /// The core instruction set this target's kernels are compiled for.
     pub const fn isa(self) -> AieIsa {
         match self {
             AieTargetId::Xdna2 => AieIsa::Aie2p,
         }
     }
 
+    /// The platform whose link ABI this target's artifacts use.
     pub const fn platform(self) -> AiePlatform {
         match self {
             AieTargetId::Xdna2 => AiePlatform::Npu2,
@@ -87,6 +89,7 @@ impl AieTargetId {
 /// `Unknown`. Admission refuses a plan whose requirement it cannot bound (a limit is never guessed).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AieCaps {
+    /// The target these limits describe.
     pub target: AieTargetId,
     /// Bytes of tile-local data memory one core may reserve for its FIFO buffers and scratch. Not GPU
     /// LDS: it is a different resource with a different owner.

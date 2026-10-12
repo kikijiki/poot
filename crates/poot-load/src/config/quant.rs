@@ -1,17 +1,26 @@
+//! The serde shape of a checkpoint's `quantization_config` block and the resolved scheme (weight
+//! packing kind and group size) the loader consumes.
+
 use std::collections::HashMap;
 /// The `quantization_config` block. GPTQ 4-bit (sym, no act-order) and AWQ 4-bit (GEMM) are consumed
 /// today (specs 019-020).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct QuantConfig {
+    /// The scheme family: `"gptq"`, `"awq"`, `"compressed-tensors"` or `"fp8"`.
     pub quant_method: String,
+    /// Weight bit width (`4` for GPTQ and AWQ).
     #[serde(default)]
     pub bits: Option<u32>,
+    /// Quantization group size along the input axis; `128` when absent.
     #[serde(default)]
     pub group_size: Option<usize>,
+    /// GPTQ activation-order flag; `Some(true)` is refused.
     #[serde(default)]
     pub desc_act: Option<bool>,
+    /// GPTQ symmetric-quantization flag; `Some(false)` is refused.
     #[serde(default)]
     pub sym: Option<bool>,
+    /// AWQ packing version; only `"gemm"` is admitted.
     #[serde(default)]
     pub version: Option<String>,
     /// compressed-tensors: `"float-quantized"` for FP8.
@@ -21,6 +30,7 @@ pub struct QuantConfig {
     /// validates the single group's published JSON contract; the default dense loader is unchanged.
     #[serde(default)]
     pub config_groups: Option<HashMap<String, serde_json::Value>>,
+    /// Module names the checkpoint leaves unquantized (compressed-tensors).
     #[serde(default)]
     pub ignore: Option<Vec<String>>,
     /// DeepSeek's `quant_method: "fp8"` block-wise scheme (spec 277/281, distinct from
@@ -35,7 +45,9 @@ pub struct QuantConfig {
 /// interleave, and zero-point convention; see `dequant_gptq` / `dequant_awq`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantKind {
+    /// GPTQ 4-bit packing.
     Gptq,
+    /// AWQ 4-bit GEMM packing.
     Awq,
     /// FP8 E4M3, per-output-channel scale (compressed-tensors, float-quantized).
     Fp8,
@@ -44,6 +56,8 @@ pub enum QuantKind {
 /// A resolved, supported quantization scheme (the kind + its group size).
 #[derive(Debug, Clone, Copy)]
 pub struct QuantScheme {
+    /// Which packing the checkpoint uses.
     pub kind: QuantKind,
+    /// Quantization group size along the input axis.
     pub group_size: usize,
 }

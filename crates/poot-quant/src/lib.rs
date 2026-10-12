@@ -39,7 +39,9 @@ pub use stored::{Access, FileIdentity, MapError, SliceError, SourceChanged, Stor
 /// A logical shape axis rejected by descriptor construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogicalAxis {
+    /// The output (row) axis `out`, the first extent of `[out, K]`.
     Out,
+    /// The reduction axis `K`, the second extent of `[out, K]`.
     K,
 }
 
@@ -57,49 +59,72 @@ pub enum SourceRole {
 /// Typed failures from [`PackedWeight`] or [`PackedPayload`] construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackedWeightError {
+    /// A logical extent of the `[out, K]` shape is zero: a packed weight holds at least one value.
     ZeroExtent {
+        /// The axis whose extent was zero.
         axis: LogicalAxis,
     },
     /// A block format's `K` is not a whole number of `block_values`-value blocks.
     PartialBlock {
+        /// The block format that was requested.
         format: WeightFormat,
+        /// The logical `K` that was supplied.
         k: usize,
+        /// Values per block of `format`; `k` must be a multiple of it.
         block_values: usize,
     },
     /// `format` has no `Scale` operand (F32, F16, BF16): a packed weight always carries a scale.
     DenseFormat {
+        /// The format that has no scale operand.
         format: WeightFormat,
     },
     /// A source's shape or byte accounting overflowed `usize`.
     Layout(DecodeError),
     /// [`PackedPayload::try_new`] was not given every source [`PackedWeight::sources`] names.
     MissingSource {
+        /// The format whose source list was not satisfied.
         format: WeightFormat,
+        /// The source that was not provided.
         role: SourceRole,
     },
     /// [`PackedPayload::try_new`] was given a source `format` does not name.
     UnexpectedSource {
+        /// The format that was constructed.
         format: WeightFormat,
+        /// The provided source that `format` does not name.
         role: SourceRole,
     },
+    /// A source's byte length differs from the length the weight's shape and format require.
     SourceLengthMismatch {
+        /// The format of the payload being built.
         format: WeightFormat,
+        /// The source whose bytes have the wrong length.
         role: SourceRole,
+        /// Byte length `PackedWeight::source_bytes` gives for `role`.
         expected: usize,
+        /// Byte length of the bytes that were supplied.
         actual: usize,
     },
     /// A stored `Float`-encoded field decodes to NaN or an infinity (ADR-0101 decision 4):
     /// checked for every format, block or planar, at every stored element. GGUF's `d`/`dmin` and
     /// safetensors scales may legitimately be zero or negative; only finiteness is a fault.
     NonFiniteField {
+        /// The format of the payload being built.
         format: WeightFormat,
+        /// The source that holds the offending field.
         role: SourceRole,
+        /// The operand whose stored field is not finite.
         operand: OperandRole,
+        /// Index of the offending element within that operand's source.
         element: usize,
     },
+    /// A planar nibble-packed `Codes` source with odd `K` has a nonzero high nibble in a row's last byte: the format leaves the unused half zero, so a nonzero value is a corrupt or mispacked row.
     NonZeroUnusedHighNibble {
+        /// The logical row whose last byte is malformed.
         row: usize,
+        /// Byte index of that byte within the whole `Codes` source.
         source_index: usize,
+        /// The offending byte; its high nibble is nonzero.
         byte: u8,
     },
     /// A stored `GroupIndex` value (GPTQ act-order `g_idx[k]`) names no group: negative, or `>=`
@@ -109,14 +134,19 @@ pub enum PackedWeightError {
     /// this per element for the CPU oracle, but a device kernel has no such check
     /// (`emit_group_of` trusts the admitted domain), so the fault must be caught here instead.
     GroupIndexOutOfRange {
+        /// The GPTQ format whose `g_idx` was checked.
         format: WeightFormat,
+        /// The reduction index whose `g_idx` entry is out of range.
         k: usize,
+        /// The stored group index, negative or at or past `groups`.
         value: i64,
+        /// The format's group count: valid indices are `0..groups`.
         groups: usize,
     },
     /// [`PackedPayload::gather_rows`] over a planar format: its rows are not whole byte runs of one
     /// source (a GPTQ/AWQ code tensor is K-major), so a row gather would have to repack.
     RowGatherStorage {
+        /// The planar format that was asked to gather rows.
         format: WeightFormat,
     },
     /// [`PackedPayload::concat_rows`] was given no parts: there is no weight to stack.
@@ -125,27 +155,37 @@ pub enum PackedWeightError {
     /// one block of rows at a time (a K-major GPTQ/AWQ tensor, or a whole-axis grid): stacking the
     /// parts would have to repack it.
     RowConcatLayout {
+        /// The planar format whose parts were to be stacked.
         format: WeightFormat,
+        /// The operand whose stored rows are not out-major in blocks.
         role: OperandRole,
     },
     /// [`PackedPayload::concat_rows`] part of `rows` rows that is not a whole number of `role`'s
     /// `block_rows`-row blocks: its last block would straddle the boundary to the next part
     /// (an E4M3 128x128 scale block shared by the tail of `gate` and the head of `up`).
     RowConcatUnaligned {
+        /// The planar format whose parts were to be stacked.
         format: WeightFormat,
+        /// The operand whose scale blocks would straddle the boundary.
         role: OperandRole,
+        /// Row count of the offending part.
         rows: usize,
+        /// Rows per block of `role`; `rows` is not a multiple of it.
         block_rows: usize,
     },
     /// [`PackedPayload::gather_rows`] or [`PackedPayload::concat_rows`] parts that do not share one
     /// format and `K`.
     RowGatherParts {
+        /// The first part, whose format and `K` every other part must match.
         first: PackedWeight,
+        /// The first part that differs from `first` in format or `K`.
         other: PackedWeight,
     },
     /// [`PackedPayload::gather_rows`] named a row past the parts' stacked rows.
     RowOutOfRange {
+        /// The requested row index.
         row: usize,
+        /// Total rows stacked across the parts.
         rows: usize,
     },
     /// [`PackedStack::try_new`] was given no experts: there is no table to build.
@@ -153,7 +193,9 @@ pub enum PackedWeightError {
     /// [`PackedStack::try_new`] experts that do not share one format and shape: a stacked table has
     /// one descriptor, so the experts' slabs are all alike.
     StackParts {
+        /// The first expert, whose format and shape every other expert must match.
         first: PackedWeight,
+        /// The first expert that differs from `first`.
         other: PackedWeight,
     },
 }
@@ -306,10 +348,12 @@ impl PackedWeight {
         Ok(weight)
     }
 
+    /// The storage format of every value in this weight.
     pub const fn format(self) -> WeightFormat {
         self.format
     }
 
+    /// The logical `[out, K]` shape: `out` rows of `K` values.
     pub const fn shape(self) -> [usize; 2] {
         self.shape
     }
@@ -430,26 +474,32 @@ pub struct PackedComponentRef {
 }
 
 impl PackedComponentRef {
+    /// Bind `role` of `owner`. The role is not checked here: [`Self::bytes`] panics if it is not one of the payload's sources.
     pub fn new(owner: Arc<PackedPayload>, role: SourceRole) -> Self {
         Self { owner, role }
     }
 
+    /// The source of the payload this binding names.
     pub const fn role(&self) -> SourceRole {
         self.role
     }
 
+    /// The payload this binding keeps alive.
     pub fn owner(&self) -> &Arc<PackedPayload> {
         &self.owner
     }
 
+    /// The descriptor of the whole payload, not only of this component.
     pub fn weight(&self) -> PackedWeight {
         self.owner.weight()
     }
 
+    /// This component's source bytes, borrowed from the payload.
     pub fn bytes(&self) -> &[u8] {
         self.owner.bytes(self.role)
     }
 
+    /// Whether both bindings share one payload allocation (pointer identity, not byte equality).
     pub fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.owner, &other.owner)
     }
@@ -492,6 +542,7 @@ impl PackedStack {
         self.weight
     }
 
+    /// Number of experts in the table: the leading extent of the stacked `[experts, out, K]` weight.
     pub fn experts(&self) -> usize {
         self.owners.len()
     }
@@ -534,22 +585,27 @@ pub struct PackedStackComponentRef {
 }
 
 impl PackedStackComponentRef {
+    /// Bind `role` of `stack`. The role is not checked here.
     pub fn new(stack: Arc<PackedStack>, role: SourceRole) -> Self {
         Self { stack, role }
     }
 
+    /// The source role of every expert that this binding names.
     pub const fn role(&self) -> SourceRole {
         self.role
     }
 
+    /// The stack this binding keeps alive.
     pub fn stack(&self) -> &Arc<PackedStack> {
         &self.stack
     }
 
+    /// The one descriptor every expert of the stack shares.
     pub fn weight(&self) -> PackedWeight {
         self.stack.weight()
     }
 
+    /// Whether both bindings share one stack allocation (pointer identity, not content equality).
     pub fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.stack, &other.stack)
     }
@@ -666,6 +722,7 @@ impl PackedPayload {
         })
     }
 
+    /// The descriptor this payload's sources were validated against.
     pub const fn weight(&self) -> PackedWeight {
         self.weight
     }

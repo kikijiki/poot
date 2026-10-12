@@ -34,7 +34,9 @@ pub struct Refusal {
 /// The operand and output dtypes of a refused equation. A literal operand carries its scalar's dtype.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefusalDtypes {
+    /// The dtype of each operand, in operand order.
     pub operands: Vec<DType>,
+    /// The dtype of the equation's output.
     pub output: DType,
 }
 
@@ -67,17 +69,24 @@ pub enum Capability {
     DispatchSizeOverflow,
     /// The packed E4M3FN dispatch needs more x-workgroups than the target's grid allows.
     DispatchGridLimit {
+        /// Threads the dispatch needs.
         threads: usize,
+        /// X-workgroups those threads make at `workgroup_width`.
         workgroups_x: usize,
+        /// Threads per workgroup.
         workgroup_width: usize,
+        /// The target's x-grid limit, in workgroups.
         limit: usize,
     },
     /// A planned dispatch needs more workgroups along one grid axis than the target's grid allows. The
     /// two-stage greedy pick puts a row per Y workgroup and a row per X workgroup in its combine stage;
     /// the planner refuses rather than launching a grid the device cannot run.
     DispatchGridAxisLimit {
+        /// The grid axis (0 = x) that overflows.
         axis: usize,
+        /// Workgroups the dispatch needs along it.
         workgroups: usize,
+        /// The target's limit along it.
         limit: usize,
     },
     /// The op has no I32 kernel (reduction, row fusion, a division without total exact semantics, a unary
@@ -90,37 +99,69 @@ pub enum Capability {
     /// A step of a fused region cannot be lowered in the region's arithmetic.
     FusedStep(FusedStepGap),
     /// The equation has the wrong number of operands for its lowering.
-    OperandCount { expected: usize, actual: usize },
+    OperandCount {
+        /// Operands the lowering takes.
+        expected: usize,
+        /// Operands the equation has.
+        actual: usize,
+    },
     /// An operand's shape violates the lowering's precondition: `shape` is the offending value's actual
     /// shape, `expected` the shape the lowering required of it.
     OperandShape {
+        /// The operand whose shape is wrong.
         value: ValueId,
+        /// The operand's actual shape.
         shape: Vec<usize>,
+        /// The shape the lowering required.
         expected: Vec<usize>,
     },
     /// An operand is a strided view the lowering cannot read: only the layouts the lowering names are admitted.
-    OperandLayout { value: ValueId },
+    OperandLayout {
+        /// The strided operand.
+        value: ValueId,
+    },
     /// A literal in the first operand position, which the planner's operand grammar does not read.
     LiteralFirstOperand,
     /// The index operand is not a form the lowering reads.
     IndexOperand,
     /// A reduction over an axis other than the last has no kernel on this target.
-    NonLastAxisReduce { axis: usize },
+    NonLastAxisReduce {
+        /// The reduced axis.
+        axis: usize,
+    },
     /// `Scatter` has no kernel over an axis other than 0 on any target (Card 546a, R-546-4): the
     /// contract admits no host fallback, so this equation is refused outright rather than routed to
     /// a host step.
-    ScatterNonZeroAxis { axis: usize },
+    ScatterNonZeroAxis {
+        /// The scattered axis.
+        axis: usize,
+    },
     /// The attention kernel keeps one lane's running state (`dv` output channels and two scalars) in
     /// workgroup memory, and not even one lane's fits the device's `lds_bytes`.
-    AttentionLds { dv: usize, lds_bytes: u32 },
+    AttentionLds {
+        /// Output channels of one lane's running state.
+        dv: usize,
+        /// The device's workgroup memory, in bytes.
+        lds_bytes: u32,
+    },
     /// The scan kernel keeps one state column (`rows` floats) per lane in workgroup memory, and not even one
     /// lane's fits the device's `lds_bytes`.
-    ScanLds { rows: usize, lds_bytes: u32 },
+    ScanLds {
+        /// State rows per lane.
+        rows: usize,
+        /// The device's workgroup memory, in bytes.
+        lds_bytes: u32,
+    },
     /// A plan-local scratch buffer (`DispatchPlan::scratch`) is larger than the device's single-buffer
     /// ceiling. The split-KV attention rule chooses the streaming schedule when its scratch does not fit,
     /// so this is the backstop for a plan that reached validation anyway: a typed refusal, never a failed
     /// device allocation.
-    ScratchBytes { needed: u64, max_buffer_bytes: u64 },
+    ScratchBytes {
+        /// Size of the scratch buffer the plan needs, in bytes.
+        needed: u64,
+        /// The device's single-buffer limit, in bytes.
+        max_buffer_bytes: u64,
+    },
     /// The selected generator's own precondition on its shape or count arguments rejected this
     /// equation (card 531b): the planner chose this lowering for the equation's dtypes and target, but
     /// forwarded it a static value the generator itself refuses to build a body for.
@@ -133,7 +174,9 @@ pub enum Capability {
     /// kernel generator has not yet staged this format/op/backend combination (K-quants and planar
     /// formats are 542b/542c; a schedule a test table omits is the same gap).
     PackedLowering {
+        /// The packed format with no admitting row.
         format: poot_quant::format::WeightFormat,
+        /// The packed op with no admitting row.
         op: crate::packed_block_float::PackedKernelOpKind,
     },
     /// The plan is not an AIE sequential schedule: an AIE core runs one loop, so a plan built from a thread

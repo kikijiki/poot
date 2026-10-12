@@ -13,9 +13,13 @@ use super::MAX_VIDEO_FRAMES;
 /// `source_frames_per_second` for index selection.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen25VlVideoMetadata<'a> {
+    /// The clip's length in seconds; finite and positive, and no timestamp exceeds it.
     pub duration_seconds: f64,
+    /// The source's frame rate in frames per second; finite and positive.
     pub source_frames_per_second: f64,
+    /// The number of source frames; at least one, and equal to `frame_timestamps_seconds.len()`.
     pub frame_count: usize,
+    /// One presentation timestamp in seconds per source frame: finite, nonnegative and strictly increasing.
     pub frame_timestamps_seconds: &'a [f64],
 }
 
@@ -28,10 +32,12 @@ pub struct Qwen25VlVideoSamplePlan {
 }
 
 impl Qwen25VlVideoSamplePlan {
+    /// Source frame indices the plan selects, strictly increasing.
     pub fn frame_indices(&self) -> &[usize] {
         &self.frame_indices
     }
 
+    /// The presentation timestamp of each selected frame, in the order of [`Self::frame_indices`].
     pub fn frame_timestamps_seconds(&self) -> &[f64] {
         &self.frame_timestamps_seconds
     }
@@ -45,68 +51,137 @@ impl Qwen25VlVideoSamplePlan {
 /// Raw-video sampling provenance paired with existing processed-video output.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen25VlSampledVideo {
+    /// Which source frames were selected and at what timestamps.
     pub sample_plan: Qwen25VlVideoSamplePlan,
+    /// The selected frames after the image processor's resize, normalization and patching.
     pub processed_video: Qwen25VlProcessedVideo,
 }
 
+/// Why uniform frame sampling of a probed video is refused.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Qwen25VlVideoSamplingError {
+    /// The duration is NaN or infinite.
     #[error("Qwen2.5-VL source video duration must be finite, got {actual}")]
-    NonFiniteDuration { actual: f64 },
+    NonFiniteDuration {
+        /// The duration given.
+        actual: f64,
+    },
+    /// The duration is zero or negative.
     #[error("Qwen2.5-VL source video duration must be positive, got {actual}")]
-    NonPositiveDuration { actual: f64 },
+    NonPositiveDuration {
+        /// The duration given.
+        actual: f64,
+    },
+    /// The source frame rate is NaN or infinite.
     #[error("Qwen2.5-VL source FPS must be finite, got {actual}")]
-    NonFiniteSourceFramesPerSecond { actual: f64 },
+    NonFiniteSourceFramesPerSecond {
+        /// The frame rate given.
+        actual: f64,
+    },
+    /// The source frame rate is zero or negative.
     #[error("Qwen2.5-VL source FPS must be positive, got {actual}")]
-    NonPositiveSourceFramesPerSecond { actual: f64 },
+    NonPositiveSourceFramesPerSecond {
+        /// The frame rate given.
+        actual: f64,
+    },
+    /// The source holds no frame.
     #[error("Qwen2.5-VL source video must contain at least one frame")]
     EmptySource,
+    /// The frame count has no exact `f64` value, so the sampling arithmetic would round it.
     #[error(
         "Qwen2.5-VL source frame count {actual} cannot be represented exactly for f64 sampling"
     )]
-    FrameCountNotExactlyRepresentable { actual: usize },
+    FrameCountNotExactlyRepresentable {
+        /// The frame count given.
+        actual: usize,
+    },
+    /// The timestamp list and the frame count disagree.
     #[error("Qwen2.5-VL source has {frame_count} frames but {timestamp_count} frame timestamps")]
     TimestampCountMismatch {
+        /// The declared frame count.
         frame_count: usize,
+        /// The number of timestamps given.
         timestamp_count: usize,
     },
+    /// A timestamp is NaN or infinite.
     #[error("Qwen2.5-VL source frame timestamp {index} must be finite, got {actual}")]
-    NonFiniteTimestamp { index: usize, actual: f64 },
+    NonFiniteTimestamp {
+        /// Position of the timestamp.
+        index: usize,
+        /// The value given.
+        actual: f64,
+    },
+    /// A timestamp is negative.
     #[error("Qwen2.5-VL source frame timestamp {index} must be nonnegative, got {actual}")]
-    NegativeTimestamp { index: usize, actual: f64 },
+    NegativeTimestamp {
+        /// Position of the timestamp.
+        index: usize,
+        /// The value given.
+        actual: f64,
+    },
+    /// A timestamp is not later than the one before it.
     #[error(
         "Qwen2.5-VL source frame timestamp {index} is {actual}, not later than previous timestamp {previous}"
     )]
     NonMonotonicTimestamp {
+        /// Position of the timestamp.
         index: usize,
+        /// The preceding timestamp.
         previous: f64,
+        /// The value given.
         actual: f64,
     },
+    /// A timestamp is later than the clip's duration.
     #[error("Qwen2.5-VL source frame timestamp {index} is {actual}, after duration {duration}")]
     TimestampAfterDuration {
+        /// Position of the timestamp.
         index: usize,
+        /// The value given.
         actual: f64,
+        /// The declared duration.
         duration: f64,
     },
+    /// The sampled-frame-count arithmetic is not finite or does not fit `usize`.
     #[error("Qwen2.5-VL sampled frame-count arithmetic is not finite")]
     SampleCountArithmeticOverflow,
+    /// The requested frame rate selects no frame from this source.
     #[error("Qwen2.5-VL requested FPS selects zero frames from this source")]
     EmptySelection,
+    /// The requested frame rate selects more frames than the source has.
     #[error(
         "Qwen2.5-VL requested FPS selects {sampled_frame_count} frames from a {source_frame_count}-frame source"
     )]
     SampleCountExceedsSource {
+        /// The number of frames the request asks for.
         sampled_frame_count: usize,
+        /// The number of frames the source has.
         source_frame_count: usize,
     },
+    /// The selection exceeds the per-request video frame cap.
     #[error("Qwen2.5-VL requested FPS selects {actual} frames, exceeding the {limit}-frame cap")]
-    TooManySampledFrames { actual: usize, limit: usize },
+    TooManySampledFrames {
+        /// The selected frame count.
+        actual: usize,
+        /// The cap, `MAX_VIDEO_FRAMES`.
+        limit: usize,
+    },
+    /// Computing a source index overflows `usize`.
     #[error("Qwen2.5-VL video sampling index arithmetic overflows usize")]
     IndexOverflow,
+    /// A computed source index falls outside the source.
     #[error("Qwen2.5-VL video sampling selected source index {index} outside {frame_count} frames")]
-    IndexOutOfRange { index: usize, frame_count: usize },
+    IndexOutOfRange {
+        /// The computed index.
+        index: usize,
+        /// The source's frame count.
+        frame_count: usize,
+    },
+    /// Reserving memory for the plan failed.
     #[error("Qwen2.5-VL video sampling could not reserve memory for {stage}")]
-    Allocation { stage: &'static str },
+    Allocation {
+        /// The vector that failed to allocate.
+        stage: &'static str,
+    },
 }
 
 /// Plan cached-Transformers-compatible uniform frame sampling from already-probed metadata.

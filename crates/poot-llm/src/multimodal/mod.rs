@@ -39,8 +39,11 @@ pub struct MultimodalPrompt {
 /// flattens to). The images themselves are passed beside the turns, in the order of the turns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChatTurn<'a> {
+    /// The turn's role as the chat template names it (`"user"`, `"assistant"`, `"system"`).
     pub role: &'a str,
+    /// How many of the request's images this turn carries; they lead the turn's content.
     pub images: usize,
+    /// The turn's text, after its images.
     pub text: &'a str,
 }
 
@@ -69,8 +72,10 @@ pub enum ImageRequestError {
 /// Why an image checkpoint cannot be read or its front end opened.
 #[derive(Debug, thiserror::Error)]
 pub enum ImageCheckpointError {
+    /// The idefics3 / SmolVLM front end could not be read or opened.
     #[error(transparent)]
     Idefics3(#[from] front_end::FrontEndError),
+    /// The Qwen2.5-VL front end could not be read or opened.
     #[error(transparent)]
     Qwen25Vl(#[from] qwen_vl::Qwen25VlError),
 }

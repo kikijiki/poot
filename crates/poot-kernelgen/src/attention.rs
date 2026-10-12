@@ -52,20 +52,29 @@ use crate::request::SerialWork;
 /// bound, and the schedule that runs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttentionSpec {
+    /// Batch rows `B`.
     pub batch: usize,
+    /// Query heads `Hq`.
     pub hq: usize,
     /// Query heads per key/value head (`hq / hkv`).
     pub n_rep: usize,
+    /// Query rows per batch row and head (`1` for decode).
     pub lq: usize,
+    /// Key/value positions per batch row and head: the cache capacity for decode, `lq` for prefill.
     pub lk: usize,
     /// The query and key head width.
     pub dk: usize,
     /// The value and output head width. Independent of `dk` (MLA: `dk` 192, `dv` 128).
     pub dv: usize,
+    /// How the key operand is laid out.
     pub key: KeyLayout,
+    /// The transform from the raw dot product to a score.
     pub score: ScoreTransform,
+    /// The mask operand's head axis.
     pub mask: MaskKind,
+    /// Which keys each row visits.
     pub bound: KeyBound,
+    /// How the keys are walked and across how many workgroups.
     pub schedule: AttentionSchedule,
 }
 
@@ -119,8 +128,11 @@ impl AttentionSpec {
 pub struct AttentionCombineSpec {
     /// `batch * hq * lq` rows.
     pub rows: usize,
+    /// Splits per row that stage one wrote partials for.
     pub splits: usize,
+    /// The value and output head width.
     pub dv: usize,
+    /// The workgroup width, `lanes` threads striding over the `dv` channels.
     pub lanes: usize,
 }
 
@@ -152,9 +164,17 @@ impl AttentionCombineSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScoreTransform {
     /// `score = dot * scale`.
-    Scale { scale_bits: u32 },
+    Scale {
+        /// The `f32` bit pattern of the multiplier applied to the dot product.
+        scale_bits: u32,
+    },
     /// `score = cap * tanh(dot * scale / cap)`: Gemma2 and Grok attention-logit softcapping.
-    ScaleSoftcap { scale_bits: u32, cap_bits: u32 },
+    ScaleSoftcap {
+        /// The `f32` bit pattern of the multiplier applied to the dot product.
+        scale_bits: u32,
+        /// The `f32` bit pattern of the softcap `cap`, the transform's saturation magnitude.
+        cap_bits: u32,
+    },
 }
 
 /// The mask operand's head axis `Hm`.
@@ -173,7 +193,10 @@ pub enum KeyLayout {
     Single,
     /// `[B, Hkv, Lk, Dk - shared_dim]` followed by a `[B, 1, Lk, shared_dim]` tensor shared by every key
     /// head: the kernel's `k` parameter is the first part and `k_shared` follows `mask`.
-    Split { shared_dim: usize },
+    Split {
+        /// Width `s` of the part shared by every key head; the first part is `Dk - s` wide.
+        shared_dim: usize,
+    },
 }
 
 /// Which keys a row visits.
@@ -191,11 +214,19 @@ pub enum KeyBound {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionSchedule {
     /// One workgroup of `lanes` threads per `(batch, head, query row)`, lanes striding over the keys.
-    Streaming { lanes: usize },
+    Streaming {
+        /// Threads per workgroup, each striding over the keys.
+        lanes: usize,
+    },
     /// Stage one of split-KV attention: one workgroup of `lanes` threads per `(batch, head, query row,
     /// split)`, each walking its own contiguous `ceil(lk / splits)`-key chunk and writing a partial state
     /// to a scratch instead of the output. [`AttentionCombineSpec`] reduces the partials.
-    SplitKv { lanes: usize, splits: usize },
+    SplitKv {
+        /// Threads per workgroup, each striding over its chunk's keys.
+        lanes: usize,
+        /// Workgroups the keys of one row are divided across.
+        splits: usize,
+    },
 }
 
 impl AttentionSchedule {

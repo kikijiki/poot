@@ -29,17 +29,28 @@ pub enum SamplerFault {
     /// carries the offending value; a device suffix's readback (card 551b, R-551a-2) carries only
     /// the index, never the value - `None` there.
     #[error("non-finite logit{} at token {index}", value.map(|v| format!(" {v}")).unwrap_or_default())]
-    NonFiniteLogit { index: usize, value: Option<f32> },
+    NonFiniteLogit {
+        /// Position of the offending logit in the row (the token id).
+        index: usize,
+        /// The offending value; `None` when only the index survived the device readback.
+        value: Option<f32>,
+    },
     /// The row is empty or every logit is `-inf`, so no token can be chosen.
     #[error("no finite logit among {len} logits")]
-    NoFiniteLogit { len: usize },
+    NoFiniteLogit {
+        /// The row's length (0 for an empty row).
+        len: usize,
+    },
     /// The device-matching host draw's own graph evaluation failed (card 551b):
     /// `pick_from`'s `suffix::eval_sample_token` call is built and bound by `pick_from`
     /// itself, so a failure here (e.g. an allocation/budget limit) is not data-dependent the way
     /// the other two faults are, but it is still a real `poot_eval::eval` error the production host
     /// pick must surface through this `Result` rather than panic on.
     #[error("sampling evaluation failed: {message}")]
-    Eval { message: String },
+    Eval {
+        /// The evaluator's error, rendered.
+        message: String,
+    },
 }
 
 /// Checks that `logits` can yield a token: no NaN, no `+inf`, and at least one finite element.
@@ -100,12 +111,16 @@ pub struct Sampler {
 /// softmax over the bias/penalty-adjusted logits at the effective temperature (1.0 when greedy).
 #[derive(Clone, Debug)]
 pub struct TokenLogprob {
+    /// The sampled token id.
     pub token: u32,
+    /// Natural-log probability of `token` under the adjusted distribution.
     pub logprob: f32,
+    /// The highest-probability alternatives as `(token id, logprob)`, most probable first; at most the requested `top_logprobs`.
     pub top: Vec<(u32, f32)>,
 }
 
 impl Sampler {
+    /// A greedy sampler: temperature 0 (argmax), no truncation, no penalties, no bias, no logprob recording, fixed RNG state.
     pub fn greedy() -> Self {
         Sampler {
             temperature: 0.0,
@@ -155,6 +170,7 @@ impl Sampler {
             || !self.logit_bias.is_empty()
     }
 
+    /// A sampler at `temperature` with `top_k` and `top_p` truncation (`temperature` clamped to >= 0, `top_p` to 0..=1) and an RNG state derived from `seed`; every other knob starts as in [`Self::greedy`].
     pub fn new(temperature: f32, top_k: usize, top_p: f32, seed: u64) -> Self {
         Sampler {
             temperature: temperature.max(0.0),

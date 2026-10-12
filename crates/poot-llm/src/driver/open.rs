@@ -15,8 +15,11 @@ use crate::driver::error::{DriverError, InvalidOptions, Unsupported};
 /// Which device executes the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BackendChoice {
+    /// The wgpu backend, on whichever adapter wgpu selects.
     Wgpu,
+    /// AMD GPUs through the HSA runtime.
     Rocm,
+    /// NVIDIA GPUs: PTX kernels through the CUDA driver.
     Ptx,
     /// Raw Vulkan through `ash`, with no wgpu: the same SPIR-V kernels as [`BackendChoice::Wgpu`] on the
     /// native command-buffer replay of ADR-0043. Never chosen by [`BackendChoice::Auto`]: it is the same

@@ -20,33 +20,55 @@ pub use device::{PtxDevice, PtxKernel, PtxRecording};
 /// below and existing `?` keeps working.
 #[derive(Debug, thiserror::Error)]
 pub enum PtxGpuError {
+    /// The PTX runtime (CUDA driver, buffer or capture layer) failed.
     #[error("ptx runtime: {0}")]
     Ptx(#[source] Box<poot_ptx_runtime::PtxError>),
+    /// Generating or compiling a kernel for the `Nvptx` target failed.
     #[error("codegen: {0}")]
     Codegen(#[source] Box<poot_codegen::CompileError>),
+    /// Planning the graph for this device failed.
     #[error("plan: {0}")]
     Plan(#[source] Box<poot_graph_plan::PlanError>),
+    /// Compiling a stage of a staged or multi-device program failed.
     #[error("stage: {0}")]
     Stage(#[source] Box<poot_graph_plan::CompileError>),
+    /// A host I/O operation failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The walk read a value before any equation or input produced it; a binding bug.
     #[error("value {0} used before it was computed")]
     UseBeforeDef(ValueId),
     /// Card 642: a packed source carrier (an I8 const) was supplied a value that is not a packed
     /// component, or a packed component was supplied for a non-packed value.
     #[error("{value}: a packed source binds a packed component, and only a packed source does")]
-    PackedSourceValue { value: ValueId },
+    PackedSourceValue {
+        /// The value the mismatched binding was supplied for.
+        value: ValueId,
+    },
+    /// A graph-level refusal this backend raises as text, with no dedicated variant.
     #[error("{0}")]
     Graph(String),
     /// A validation lane of a packed walk was not exact zero. No output or state value was downloaded.
     #[error("validation: {0}")]
     Validation(#[source] Box<ExecutionValidationFailure>),
+    /// The validation packet's lane count differs from the graph's declared validations.
     #[error("validation packet has {actual} lanes; the graph declares {expected}")]
-    ValidationPacketLength { expected: usize, actual: usize },
+    ValidationPacketLength {
+        /// Lanes the graph declares.
+        expected: usize,
+        /// Lanes the packet carries.
+        actual: usize,
+    },
     #[error(
         "validation {id:?} reads {value} through a strided view; a packet source must be materialized"
     )]
-    ValidationPacketSource { id: ValidationId, value: ValueId },
+    /// A validation packet source is read through a strided view; the source must be materialized.
+    ValidationPacketSource {
+        /// The validation whose packet source is strided.
+        id: ValidationId,
+        /// The strided value the packet reads.
+        value: ValueId,
+    },
 }
 
 impl From<poot_ptx_runtime::PtxError> for PtxGpuError {

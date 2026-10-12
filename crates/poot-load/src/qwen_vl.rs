@@ -5,16 +5,23 @@
 
 use std::path::{Path, PathBuf};
 
+/// The Qwen-VL generations whose `config.json` schema this loader reads, keyed by `model_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QwenVlModelType {
+    /// `model_type: "qwen2_vl"`.
     Qwen2Vl,
+    /// `model_type: "qwen2_5_vl"`.
     Qwen25Vl,
 }
 
+/// The marker tokens a Qwen-VL prompt template uses around and inside visual input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QwenVlSpecialTokenRole {
+    /// Opens a visual span.
     VisionStart,
+    /// The placeholder repeated for each image position.
     ImagePad,
+    /// The placeholder repeated for each video position.
     VideoPad,
 }
 
@@ -43,11 +50,13 @@ pub struct QwenVlHfMetadata {
 }
 
 impl QwenVlHfMetadata {
+    /// Parse a Qwen-VL `config.json` from its bytes.
     pub fn from_slice(json: &[u8]) -> Result<Self, QwenVlHfMetadataError> {
         let metadata: QwenVlConfigJson = serde_json::from_slice(json)?;
         metadata.try_into()
     }
 
+    /// Read and parse the `config.json` at `path`; a failure names the path.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, QwenVlHfMetadataError> {
         let path = path.as_ref();
         let bytes = std::fs::read(path).map_err(|source| QwenVlHfMetadataError::ReadConfig {
@@ -63,26 +72,32 @@ impl QwenVlHfMetadata {
         })
     }
 
+    /// Which Qwen-VL generation the config declares.
     pub const fn model_type(&self) -> QwenVlModelType {
         self.model_type
     }
 
+    /// The `rope_scaling.mrope_section` split of the rotary dimensions (temporal, height, width); each part is positive and the sum fits `usize`.
     pub const fn mrope_section(&self) -> [usize; 3] {
         self.mrope_section
     }
 
+    /// Token id of the vision-start marker.
     pub const fn vision_start_token_id(&self) -> u32 {
         self.vision_start_token_id
     }
 
+    /// Token id of the image placeholder.
     pub const fn image_token_id(&self) -> u32 {
         self.image_token_id
     }
 
+    /// Token id of the video placeholder.
     pub const fn video_token_id(&self) -> u32 {
         self.video_token_id
     }
 
+    /// `vision_config.tokens_per_second` for Qwen2.5-VL when the config carries it; always `None` for Qwen2-VL.
     pub const fn temporal_tokens_per_second(&self) -> Option<f64> {
         self.temporal_tokens_per_second
     }
@@ -99,6 +114,7 @@ pub struct QwenVlProcessorSpecialTokenStrings {
 }
 
 impl QwenVlProcessorSpecialTokenStrings {
+    /// Read the marker strings from the bytes of a `tokenizer_config.json`, resolving each against `config`'s marker token ids.
     pub fn from_tokenizer_config_slice(
         json: &[u8],
         config: &QwenVlHfMetadata,
@@ -107,6 +123,7 @@ impl QwenVlProcessorSpecialTokenStrings {
         Self::from_tokenizer_config(raw, config)
     }
 
+    /// Read `tokenizer_config.json` from `dir` and resolve its marker strings as [`Self::from_tokenizer_config_slice`] does.
     pub fn load_from_dir(
         dir: impl AsRef<Path>,
         config: &QwenVlHfMetadata,
@@ -126,6 +143,7 @@ impl QwenVlProcessorSpecialTokenStrings {
         })
     }
 
+    /// The marker string for `role`.
     pub fn token(&self, role: QwenVlSpecialTokenRole) -> &str {
         match role {
             QwenVlSpecialTokenRole::VisionStart => &self.vision_start,
@@ -161,63 +179,113 @@ impl QwenVlProcessorSpecialTokenStrings {
     }
 }
 
+/// Why a tokenizer config could not yield the Qwen-VL marker strings.
 #[derive(Debug, thiserror::Error)]
 pub enum QwenVlProcessorMetadataError {
+    /// Reading the tokenizer config failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The tokenizer config is not valid JSON.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// `tokenizer_config.json` could not be read from disk.
     #[error("read tokenizer_config.json {path:?}: {source}")]
     ReadTokenizerConfig {
+        /// The file that failed to read.
         path: PathBuf,
+        /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// `tokenizer_config.json` was read but is not valid JSON.
     #[error("parse tokenizer_config.json {path:?}: {source}")]
     ParseTokenizerConfig {
+        /// The file that failed to parse.
         path: PathBuf,
+        /// The JSON error.
         source: serde_json::Error,
     },
+    /// Neither an explicit marker nor an `added_tokens_decoder` entry for the config's token id supplies the marker string.
     #[error(
         "Qwen-VL tokenizer_config.json has no processor marker for {role} at token id {token_id}"
     )]
     MissingProcessorMarker {
+        /// Which marker is missing.
         role: QwenVlSpecialTokenRole,
+        /// The token id looked up in `added_tokens_decoder`.
         token_id: u32,
     },
 }
 
+/// Why a Qwen-VL `config.json` could not yield its metadata.
 #[derive(Debug, thiserror::Error)]
 pub enum QwenVlHfMetadataError {
+    /// Reading the config failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The config is not valid JSON.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// `config.json` could not be read from disk.
     #[error("read config.json {path:?}: {source}")]
     ReadConfig {
+        /// The file that failed to read.
         path: PathBuf,
+        /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// `config.json` was read but is not valid JSON.
     #[error("parse config.json {path:?}: {source}")]
     ParseConfig {
+        /// The file that failed to parse.
         path: PathBuf,
+        /// The JSON error.
         source: serde_json::Error,
     },
+    /// `model_type` is neither `qwen2_vl` nor `qwen2_5_vl`.
     #[error("unsupported Qwen-VL model_type {model_type:?}")]
-    UnsupportedModelType { model_type: String },
+    UnsupportedModelType {
+        /// The `model_type` string the config carries.
+        model_type: String,
+    },
+    /// A required config field is absent.
     #[error("Qwen-VL config is missing required field {field}")]
-    MissingField { field: &'static str },
+    MissingField {
+        /// The missing field's dotted name.
+        field: &'static str,
+    },
+    /// `mrope_section` does not hold exactly three entries.
     #[error("Qwen-VL rope_scaling.mrope_section must have length 3, got {actual}")]
-    WrongMropeSectionLength { actual: usize },
+    WrongMropeSectionLength {
+        /// The entry count found.
+        actual: usize,
+    },
+    /// An `mrope_section` entry is zero.
     #[error("Qwen-VL rope_scaling.mrope_section[{index}] must be positive")]
-    NonPositiveMropeSection { index: usize },
+    NonPositiveMropeSection {
+        /// Which entry (0-based) is zero.
+        index: usize,
+    },
+    /// An `mrope_section` entry does not fit `usize`.
     #[error(
         "Qwen-VL rope_scaling.mrope_section[{index}] value {value} is outside the host usize range"
     )]
-    MropeSectionOutOfRange { index: usize, value: u64 },
+    MropeSectionOutOfRange {
+        /// Which entry (0-based) is too large.
+        index: usize,
+        /// The entry's value.
+        value: u64,
+    },
+    /// The `mrope_section` entries sum past `usize::MAX`.
     #[error("Qwen-VL rope_scaling.mrope_section sum exceeds the host usize range")]
     MropeSectionSumOverflow,
+    /// A marker token id does not fit `u32`.
     #[error("Qwen-VL {field} value {value} is outside the u32 token-id range")]
-    SpecialTokenIdOutOfRange { field: &'static str, value: u64 },
+    SpecialTokenIdOutOfRange {
+        /// The config field holding the id.
+        field: &'static str,
+        /// The id the config carries.
+        value: u64,
+    },
 }
 
 #[derive(serde::Deserialize)]

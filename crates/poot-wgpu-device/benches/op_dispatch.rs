@@ -243,12 +243,20 @@ fn bench_unary(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_elementwise,
-    bench_matmul,
-    bench_reduce,
-    bench_rmsnorm,
-    bench_unary,
-);
+// `criterion_group!` emits a `pub fn` it cannot document, so it lives in a private module where the
+// bench binary's `missing_docs` lint cannot see it.
+mod group {
+    use super::{
+        bench_elementwise, bench_matmul, bench_reduce, bench_rmsnorm, bench_unary, criterion_group,
+    };
+    criterion_group!(
+        benches,
+        bench_elementwise,
+        bench_matmul,
+        bench_reduce,
+        bench_rmsnorm,
+        bench_unary,
+    );
+}
+use group::benches;
 criterion_main!(benches);

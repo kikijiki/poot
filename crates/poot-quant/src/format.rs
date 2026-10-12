@@ -130,30 +130,47 @@ use std::num::NonZeroUsize;
     reason = "the GGUF formats keep ggml's type names (Q4_0, Q4_K, ...)"
 )]
 pub enum WeightFormat {
+    /// Dense IEEE binary32, stored as one-value blocks.
     F32,
+    /// Dense IEEE binary16, stored as one-value blocks.
     F16,
+    /// Dense bfloat16, stored as one-value blocks.
     Bf16,
+    /// GGUF `Q4_0` (ggml type 2): 32-value blocks of one f16 scale and 4-bit codes, `y = (q - 8) * d`.
     Q4_0,
+    /// GGUF `Q4_1` (ggml type 3): 32-value blocks of an f16 scale and min with 4-bit codes, `y = q*d + m`.
     Q4_1,
+    /// GGUF `Q5_0` (ggml type 6): 32-value blocks of an f16 scale and 5-bit codes split into a nibble and a high bit.
     Q5_0,
+    /// GGUF `Q5_1` (ggml type 7): `Q5_0`'s 5-bit codes with an f16 min added, `y = q*d + m`.
     Q5_1,
+    /// GGUF `Q8_0` (ggml type 8): 32-value blocks of an f16 scale and signed 8-bit codes.
     Q8_0,
+    /// GGUF `Q2_K` (ggml type 10): 256-value super-blocks of 2-bit codes with 4-bit sub-block scales and mins.
     Q2_K,
+    /// GGUF `Q3_K` (ggml type 11): 256-value super-blocks of 3-bit codes (2 low bits plus a high mask) with 6-bit sub-block scales.
     Q3_K,
+    /// GGUF `Q4_K` (ggml type 12): 256-value super-blocks of 4-bit codes with 6-bit sub-block scales and mins.
     Q4_K,
+    /// GGUF `Q5_K` (ggml type 13): 256-value super-blocks of 5-bit codes with 6-bit sub-block scales and mins.
     Q5_K,
+    /// GGUF `Q6_K` (ggml type 14): 256-value super-blocks of 6-bit codes with signed 8-bit sub-block scales.
     Q6_K,
+    /// GGUF `IQ4_NL` (ggml type 20): 32-value blocks of 4-bit codes read through the `kvalues_iq4nl` codebook.
     Iq4_Nl,
+    /// GGUF `IQ4_XS` (ggml type 23): 256-value super-blocks of 4-bit codebook codes with 6-bit sub-block scales.
     Iq4_Xs,
     /// GGUF MXFP4 (ggml type 39): 32-value blocks, element `j` in the low nibble of byte `j` and
     /// element `j + 16` in its high nibble.
     Mxfp4,
     /// Safetensors `F8_E4M3` with one scale per output row.
     E4m3PerChannel {
+        /// How the per-row scale tensor is stored.
         scale: ScaleEncoding,
     },
     /// Safetensors `F8_E4M3` with one scale per 128x128 `[out, K]` block.
     E4m3Block128 {
+        /// How the per-block scale tensor is stored.
         scale: ScaleEncoding,
     },
     /// Safetensors E2M1 with one E8M0 scale per 32 K values; adjacent K values share a byte (even
@@ -161,10 +178,12 @@ pub enum WeightFormat {
     E2m1Row32,
     /// GPTQ int4 (AutoGPTQ): `w = scale * (q - (z + 1))`.
     Gptq {
+        /// How a K index selects its group: contiguous runs, or the `g_idx` operand under act-order.
         groups: GroupMap,
     },
     /// AWQ int4 (AutoAWQ GEMM): `w = scale * (q - z)`.
     Awq {
+        /// K values per quantization group; groups are contiguous.
         group_size: NonZeroUsize,
     },
 }
@@ -172,8 +191,11 @@ pub enum WeightFormat {
 /// The encoding of a planar scale tensor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScaleEncoding {
+    /// IEEE binary32 scales.
     F32,
+    /// bfloat16 scales.
     Bf16,
+    /// OCP E8M0 scales: exponent only, `2^(e - 127)` (`MXFP4`/E2M1 block scaling).
     E8m0,
 }
 
@@ -181,10 +203,16 @@ pub enum ScaleEncoding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GroupMap {
     /// Group `k / size`.
-    Contiguous { size: NonZeroUsize },
+    Contiguous {
+        /// K values per group.
+        size: NonZeroUsize,
+    },
     /// Group `g_idx[k]`, read from the [`OperandRole::GroupIndex`] operand (GPTQ act-order), with
     /// this many groups.
-    Indexed { groups: NonZeroUsize },
+    Indexed {
+        /// Number of groups `g_idx` entries may name.
+        groups: NonZeroUsize,
+    },
 }
 
 /// A named operand of the value formula (see the module docs).
@@ -210,7 +238,9 @@ pub enum OperandRole {
 /// `x = d*sc*q - dmin*m`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MinSign {
+    /// `x = d*q + m`.
     Add,
+    /// `x = d*sc*q - dmin*m`.
     Subtract,
 }
 
@@ -229,8 +259,11 @@ pub enum ValueMap {
 /// The narrow float formats a code or scale can be stored in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FloatFormat {
+    /// IEEE binary32.
     F32,
+    /// IEEE binary16.
     F16,
+    /// bfloat16: the top 16 bits of an f32.
     Bf16,
     /// OCP E4M3FN: no infinities, `0x7f`/`0xff` are NaN.
     E4m3Fn,
@@ -276,7 +309,9 @@ impl FloatFormat {
 /// The stored patterns of a [`FloatFormat`] that are NaN or infinite: `bits & mask == pattern`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NonFinite {
+    /// The bits of the stored pattern that are compared.
     pub mask: u32,
+    /// The value `bits & mask` takes for a non-finite stored pattern.
     pub pattern: u32,
 }
 
@@ -291,7 +326,10 @@ impl NonFinite {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FieldEncoding {
     /// An unsigned integer plus a constant offset (`Q4_0` codes: `offset = -8`).
-    Unsigned { offset: i32 },
+    Unsigned {
+        /// Constant added to the unsigned value (`Q4_0` codes: `-8`).
+        offset: i32,
+    },
     /// A two's-complement integer of the field's width.
     Signed,
     /// A float of this format.
@@ -301,7 +339,9 @@ pub enum FieldEncoding {
 /// One digit of a [`BitLayout`]: its extent and the bit stride it contributes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Digit {
+    /// How many values this digit takes: the digit ranges over `0..extent`.
     pub extent: u32,
+    /// Bits the offset advances per unit of this digit.
     pub stride: u32,
 }
 
@@ -311,7 +351,9 @@ pub struct Digit {
 /// block's value count. `bit(i) = base + sum(digit_n(i) * stride_n)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BitLayout {
+    /// Bit offset of element 0 from the start of the block.
     pub base: u32,
+    /// The digits, most significant first; empty for a single-element layout.
     pub digits: &'static [Digit],
 }
 
@@ -345,14 +387,18 @@ impl BitLayout {
 /// `width` bits at the offset a [`BitLayout`] gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Piece {
+    /// Where the piece's bits sit: the bit offset of each in-block element index.
     pub layout: BitLayout,
+    /// Number of bits the piece contributes to the field.
     pub width: u32,
 }
 
 /// A number read from a block: its pieces concatenated low bits first, then decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Field {
+    /// The pieces whose bits are concatenated, low bits first.
     pub pieces: &'static [Piece],
+    /// How the concatenated bits become a number.
     pub encoding: FieldEncoding,
 }
 
@@ -372,17 +418,22 @@ impl Field {
 /// One operand of a block format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockField {
+    /// The operand of the value formula this field supplies.
     pub role: OperandRole,
     /// The field's name in ggml's block struct (`d`, `scales`, `qs`), for messages and docs.
     pub name: &'static str,
+    /// Where the operand's bits sit in the block and how they decode.
     pub field: Field,
 }
 
 /// A GGUF block format: `values` consecutive K values stored in `bytes` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockLayout {
+    /// Consecutive K values one block holds.
     pub values: usize,
+    /// Bytes one block occupies.
     pub bytes: usize,
+    /// The block's operand fields, in ggml's struct order.
     pub fields: &'static [BlockField],
 }
 
@@ -420,7 +471,9 @@ pub enum Extent {
 /// The logical axis of `[out, K]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Axis {
+    /// The `out` (row) axis.
     Out,
+    /// The reduction axis `K`.
     K,
 }
 
@@ -455,22 +508,30 @@ impl LaneOrder {
 /// Sub-byte values packed into little-endian words along one axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Packing {
+    /// Values packed into one word.
     pub values_per_word: usize,
+    /// Bytes of one word.
     pub word_bytes: usize,
+    /// The logical axis along which a word's values are adjacent.
     pub axis: Axis,
+    /// Which lane of the word each value occupies.
     pub lanes: LaneOrder,
 }
 
 /// One source tensor of a planar format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlanarOperand {
+    /// The operand of the value formula this tensor supplies.
     pub role: OperandRole,
+    /// How a stored value's bits become a number.
     pub encoding: FieldEncoding,
     /// Stored width of one value in bits.
     pub bits: u32,
     /// Logical values per stored element along `[out, K]`.
     pub grid: [Extent; 2],
+    /// The sub-byte packing; `None` when each stored element is one whole value.
     pub packing: Option<Packing>,
+    /// The order of the stored element grid.
     pub major: Major,
 }
 
@@ -488,21 +549,27 @@ impl PlanarOperand {
 /// A safetensors format: one source tensor per operand role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlanarLayout {
+    /// One entry per source tensor, in the order of [`crate::PackedWeight::sources`].
     pub operands: &'static [PlanarOperand],
 }
 
 /// Where a format's operands are stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Storage {
+    /// One GGUF buffer holding every block, each carrying all of its operand fields.
     Blocks(BlockLayout),
+    /// One safetensors tensor per operand role.
     Planar(PlanarLayout),
 }
 
 /// The complete storage and value description of one [`WeightFormat`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FormatDescriptor {
+    /// The format this descriptor describes.
     pub format: WeightFormat,
+    /// Where the format's operands are stored.
     pub storage: Storage,
+    /// How the `Codes` operand becomes the value the scale multiplies.
     pub value: ValueMap,
     /// Whether the min term is added or subtracted; `None` when the format has no `Min` operand.
     pub min_sign: Option<MinSign>,

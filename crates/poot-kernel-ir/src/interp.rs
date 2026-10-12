@@ -137,6 +137,7 @@ impl Buffer {
     // dev-dependency); this crate's own unit tests use them too. Gated so a default build never has them,
     // instead of leaving them unconditionally `pub` with poot-test-util as the only non-test "caller"
     // keeping them off the dead-pub scanner.
+    /// A buffer of `f32` elements holding `values`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_f32s(values: &[f32]) -> Self {
         Buffer {
@@ -145,6 +146,7 @@ impl Buffer {
         }
     }
 
+    /// A buffer of `u32` elements holding `values`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_u32s(values: &[u32]) -> Self {
         Buffer {
@@ -153,6 +155,7 @@ impl Buffer {
         }
     }
 
+    /// A buffer of `i32` elements holding `values`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_i32s(values: &[i32]) -> Self {
         Buffer {
@@ -204,20 +207,44 @@ impl Buffer {
 #[derive(Clone, PartialEq, Debug, thiserror::Error)]
 pub enum Fault {
     #[error("{what} index {index} is out of bounds for length {len}")]
+    /// A buffer, private array or LDS access past the end.
     OutOfBounds {
+        /// Which storage was indexed.
         what: &'static str,
+        /// The index used.
         index: usize,
+        /// The storage's length.
         len: usize,
     },
     #[error("{what} element {index} is read before it is written")]
-    Uninitialized { what: &'static str, index: usize },
+    /// An element was read before any write to it.
+    Uninitialized {
+        /// Which storage was read.
+        what: &'static str,
+        /// The element's index.
+        index: usize,
+    },
+    /// An integer division or remainder by zero.
     #[error("integer division by zero")]
     DivideByZero,
     #[error("shift amount {amount} is outside 0..{bits}")]
-    ShiftOutOfRange { amount: i128, bits: u32 },
+    /// A shift amount at or past the operand's bit width.
+    ShiftOutOfRange {
+        /// The shift amount.
+        amount: i128,
+        /// The operand's bit width.
+        bits: u32,
+    },
     #[error("cannot reinterpret {from:?} as {to:?}")]
-    InvalidBitcast { from: Ty, to: Ty },
+    /// A bitcast between types of different widths or classes.
+    InvalidBitcast {
+        /// The operand's type.
+        from: Ty,
+        /// The requested type.
+        to: Ty,
+    },
     #[error("{0}: the reference interpreter does not model it")]
+    /// An operation the interpreter does not model, by name.
     Unsupported(&'static str),
     /// A soundness backstop, not a live path: [`Body::verify`]'s static divergence analysis (card 618, a
     /// must-reach post-dominator check, hardened by its review) rejects every body that could produce
@@ -229,37 +256,60 @@ pub enum Fault {
     /// See [`Fault::BarrierDeadlock`]: reachable only if [`Body::verify`]'s static check is unsound.
     #[error("lanes parked at different barriers in one round: bb{}, bb{}", .0, .1)]
     DivergentBarrier(u32, u32),
+    /// The lanes executed more basic blocks than the step limit allows.
     #[error("more than {STEP_LIMIT} basic blocks executed: the body does not terminate")]
     StepLimit,
     #[error("ill-typed operation that the verifier accepts: {0}")]
+    /// An operation whose operand types the verifier accepted but the interpreter cannot evaluate.
     IllTyped(&'static str),
     #[error("kernel trap: a failed Assert or a reached Unreachable terminator ran (code {0})")]
+    /// A lane reached a [`Terminator::Trap`] with this code.
     Trap(u32),
 }
 
+/// Why [`run`] did not complete.
 #[derive(Clone, PartialEq, Debug, thiserror::Error)]
 pub enum InterpError {
+    /// The body failed [`Body::verify`].
     #[error(transparent)]
     Invalid(#[from] VerifyError),
     #[error("the body has {params} buffer params, {buffers} buffers were given")]
-    BufferCount { params: usize, buffers: usize },
+    /// The launch gave a different number of buffers than the body has buffer parameters.
+    BufferCount {
+        /// Buffer parameters the body declares.
+        params: usize,
+        /// Buffers the launch gave.
+        buffers: usize,
+    },
     #[error("buffer for param _{param} holds {found:?}, the body declares {expected:?}")]
+    /// A buffer's element type differs from its parameter's.
     BufferType {
+        /// The parameter's position.
         param: usize,
+        /// The element type the body declares.
         expected: Ty,
+        /// The element type of the buffer given.
         found: Ty,
     },
     #[error("expected an f32 buffer, found {0:?} elements")]
+    /// A buffer read back as `f32` holds another element type.
     NotF32(Ty),
     #[error("expected a u32 buffer, found {0:?} elements")]
+    /// A buffer read back as `u32` holds another element type.
     NotU32(Ty),
     #[error("expected an i32 buffer, found {0:?} elements")]
+    /// A buffer read back as `i32` holds another element type.
     NotI32(Ty),
     #[error("workgroup {workgroup:?} lane {lane} at {site}: {fault}")]
+    /// A lane faulted.
     Fault {
+        /// The workgroup the lane belongs to.
         workgroup: [u32; 3],
+        /// The lane's index within its workgroup.
         lane: u32,
+        /// Where in the body the lane faulted.
         site: Site,
+        /// What went wrong.
         fault: Fault,
     },
 }

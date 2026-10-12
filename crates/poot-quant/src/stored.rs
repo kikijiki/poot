@@ -31,12 +31,17 @@ use mapping::MappedFile;
 /// `ctime` is compared only while the link count is the one recorded at map time ([`Self::same_file_as`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileIdentity {
+    /// Device number (`st_dev`) the file lives on.
     pub dev: u64,
+    /// Inode number (`st_ino`).
     pub ino: u64,
+    /// File length in bytes (`st_size`) at observation time.
     pub len: u64,
+    /// Hard-link count (`st_nlink`); a change excuses a moved `ctime`.
     pub nlink: u64,
     /// Nanoseconds since the epoch, saturating outside the range `i64` holds (about 1678 to 2262).
     pub mtime_ns: i64,
+    /// Inode change time in nanoseconds since the epoch, saturating like `mtime_ns`; user space cannot set it.
     pub ctime_ns: i64,
 }
 
@@ -55,16 +60,20 @@ impl FileIdentity {
 /// A paging hint over a view ([`StoredBytes::advise`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
+    /// Pages will be read front to back, so the kernel may read ahead and drop behind.
     Sequential,
+    /// The range will be needed soon, so the kernel may start paging it in.
     WillNeed,
 }
 
 /// [`StoredBytes::map`] refused a file.
 #[derive(Debug)]
 pub enum MapError {
+    /// Reading the file's metadata or mapping it failed.
     Io(std::io::Error),
     /// Not a regular file (a directory, FIFO or device): its length is not a stable extent to map.
     NotRegularFile {
+        /// The file's `st_mode` bits, as returned by `stat`.
         mode: u32,
     },
 }
@@ -95,7 +104,9 @@ impl std::error::Error for MapError {
 /// [`StoredBytes::slice`] asked for a range outside the view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SliceError {
+    /// The requested byte range, relative to the view.
     pub range: Range<usize>,
+    /// Length of the view the range was checked against.
     pub len: usize,
 }
 
@@ -115,7 +126,9 @@ impl std::error::Error for SliceError {}
 /// place, replaced under the descriptor, or can no longer be stat-ed (`now` is `None`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceChanged {
+    /// The identity recorded when the file was mapped.
     pub was: FileIdentity,
+    /// The identity observed now, or `None` when the descriptor can no longer be stat-ed.
     pub now: Option<FileIdentity>,
 }
 
@@ -190,14 +203,17 @@ impl StoredBytes {
         })
     }
 
+    /// The view's bytes. For a mapped region the borrow is only as stable as the file; see [`Self::check_unchanged`].
     pub fn as_slice(&self) -> &[u8] {
         &self.region.bytes()[self.range.clone()]
     }
 
+    /// Length of the view in bytes.
     pub fn len(&self) -> usize {
         self.range.len()
     }
 
+    /// Whether the view holds no bytes.
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
     }

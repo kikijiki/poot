@@ -41,7 +41,9 @@ pub enum KernelChoice {
     /// parameter, in binding order); the shape ABI the body is linked against is derived from them, so
     /// the body and its ABI come from one generation.
     Sequential {
+        /// The request that was generated.
         request: KernelRequest,
+        /// What the generator proved of each body parameter, in binding order.
         bindings: Box<[poot_kernelgen::SequentialBinding]>,
     },
     /// A shipped template body, bound with a metadata buffer of `meta_schema` words (zero for none). The
@@ -50,8 +52,11 @@ pub enum KernelChoice {
     /// body reads an F32 and an I32 index identically, but they are different bindings and must never
     /// share a plan key (R469-005).
     Imported {
+        /// The shipped template.
         kernel: ImportedKernel,
+        /// Number of words in the metadata buffer bound with the template; zero for none.
         meta_schema: u32,
+        /// Element type of the runtime index operand the equation binds, if the template reads one.
         index: Option<DType>,
     },
     /// No launch at all.
@@ -112,7 +117,9 @@ impl fmt::Display for ChoiceDigest {
 
 /// One equation's [`Plan`] with the [`KernelChoice`] that produced it.
 pub struct Planned {
+    /// The plan the equation lowers to.
     pub plan: Plan,
+    /// The kernel choice that produced `plan`.
     pub choice: KernelChoice,
 }
 

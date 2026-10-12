@@ -47,8 +47,11 @@ use super::{
 /// One beam search to run. `width` beams are kept; the search generates at most `max_new` tokens.
 #[derive(Clone, Debug)]
 pub struct BeamRequest {
+    /// The prompt's token ids; must not be empty.
     pub prompt: Vec<u32>,
+    /// The most new tokens to generate.
     pub max_new: usize,
+    /// Beams kept alive at every step.
     pub width: NonZeroUsize,
     /// The exponent `seq_len` is raised to in the score: 1 is plain length normalization, 0 ranks by
     /// the raw cumulative log-probability.
@@ -77,12 +80,22 @@ pub struct Beam {
 pub enum BeamError {
     /// Beam search resets and overwrites contiguous state, which an open sequence may be using.
     #[error("beam search needs a driver with no open sequence; {open} are open")]
-    Busy { open: usize },
+    Busy {
+        /// Sequences currently open on the driver.
+        open: usize,
+    },
+    /// The length penalty is NaN or infinite.
     #[error("the length penalty {0} is not finite")]
     LengthPenalty(f32),
     /// A beam's logits held a NaN or no finite value, so no ranking of its continuations exists.
     #[error("the logits of beam {beam} at generated token {step} are not finite")]
-    NonFiniteLogits { beam: usize, step: usize },
+    NonFiniteLogits {
+        /// Index of the beam whose logits were not finite.
+        beam: usize,
+        /// Generated-token index at which it happened.
+        step: usize,
+    },
+    /// Prefill, compile or device failure of the driver under the search.
     #[error(transparent)]
     Driver(#[from] DriverError),
 }

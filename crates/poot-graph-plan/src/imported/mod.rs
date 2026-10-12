@@ -34,7 +34,9 @@ pub(crate) fn parse_once(cell: &'static OnceLock<Body>, json: &str, name: &str) 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(test, feature = "test-support"))]
 pub enum AssetDest {
+    /// The asset lives in this crate's own `assets/` directory.
     GraphPlan,
+    /// The asset lives in another crate's asset directory, a path from the workspace's `crates/` directory.
     Crate(&'static str),
 }
 
@@ -65,6 +67,7 @@ pub struct AssetEntry {
     pub entry: &'static str,
     /// The kernel's expected parameter count (buffers + metadata), checked against the parsed body.
     pub params: u32,
+    /// Which crate's asset directory holds the committed `.kir.json`.
     pub dest: AssetDest,
     /// The kernel this row ships, so a consumer walks the variants through the one manifest.
     pub kernel: ImportedKernel,
@@ -165,29 +168,50 @@ mod sampling;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportedKernel {
     // contraction.rs
+    /// Decode GEMV over an f32 `[K, N]` weight: a workgroup owns a tile of output columns and adjacent lanes read adjacent columns.
     GemvCoalesced,
+    /// The coalesced decode GEMV over B rows that share one weight.
     GemvBatchedCoalesced,
+    /// Thread-coarsened workgroup-tiled GEMM; shapes ride in `dims = [M, K, N]`.
     TiledGemm,
+    /// Tiled GEMM with a weight per batch entry (per-expert MoE GEMM, per-head attention matmuls); shapes ride in `dims = [E, M, K, N]`.
     TiledGemmBatched,
     // packed.rs
+    /// Packs four signed-int8 codes of f32 input into each i32 word along the last axis (the I8 KV-cache pack).
     PackI8,
+    /// The inverse of [`ImportedKernel::PackI8`]: unpacks i32 words to f32 int8 codes.
     UnpackI8,
+    /// Axis-0 embedding gather over a dense BF16 table read as packed `u32` lanes, widened to F32 in the kernel.
     PackedBf16RowGather,
+    /// The `Cast(BF16 -> F32)` of a BF16 const read from its packed `u32` lanes.
     PackedBf16ToF32,
+    /// Axis-0 embedding gather over a dense E4M3FN table read as packed `u32` lanes, widened to F32 in the kernel.
     PackedE4m3RowGather,
     // sampling.rs
+    /// Greedy sampling stage 1: one workgroup per (row, chunk) reduces a chunk of logits to a partial `(value, index, bad index)`.
     ArgmaxChunk,
+    /// Greedy sampling stage 2: reduces a row's chunk partials to the row's `(token, non_finite_index)`.
     ArgmaxCombine,
+    /// Temperature and min-p sampling by the Gumbel-max trick, one workgroup per row (`SampleRule::Gumbel`).
     SampleGumbelArgmaxBatched,
+    /// Top-k, temperature and min-p sampling: the Gumbel-max pass behind a top-k threshold bisection (`SampleRule::GumbelTopK`).
     SampleTruncatedGumbelArgmaxBatched,
+    /// Top-p, top-k, temperature and min-p sampling in one dispatch (`SampleRule::GumbelTopKTopP`).
     SampleToppGumbelArgmaxBatched,
+    /// Exact uniform noise for `OpKind::RandomUniform`, one thread per output element.
     RandomUniform,
     // probe.rs
+    /// Probe: a reachable bounds-check `Assert`, to prove it lowers to a real device trap.
     AssertTrap,
+    /// Probe: every lane atomically adds 1 into one `u32` counter, an exact order-independent reduction.
     AtomicAddSumSmoke,
+    /// Probe: a raw word-for-word copy, the kernel behind ROCm's `Device::copy`.
     CopyWords,
+    /// Probe: a finite busy-spin of a caller-chosen length, used to force a real completion-wait timeout.
     SpinBusy,
+    /// Probe: row sums over a constant column count, a loop with a compile-time bound.
     RowsumFor,
+    /// Probe: RMSNorm whose hidden width is a runtime value from `dims`.
     RmsnormDyn,
 }
 

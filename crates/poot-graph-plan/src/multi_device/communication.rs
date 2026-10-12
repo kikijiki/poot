@@ -20,13 +20,16 @@ pub struct PlanNodeId(pub u32);
 /// participants, byte accounting, and explicit upstream/downstream dependency edges.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommunicationRow {
+    /// This row's identity in the dependency graph.
     pub id: PlanNodeId,
+    /// Which transfer, gather, reduction or exchange the row performs.
     pub kind: CollectiveKind,
     /// Meaningful for `AllReduce` only: the reduction the row combines with.
     pub op: RedOp,
     /// Ordered device group. For `PointToPoint` this is exactly `[from, to]`; for `AllGather`/
     /// `AllReduce`/`AllToAll` it is every participating device.
     pub participants: Vec<DeviceId>,
+    /// Payload size of the row, in bytes.
     pub byte_len: usize,
     /// Bounded temporary storage this row needs beyond its participants' resident buffers (FR-005).
     pub temp_bytes: usize,
@@ -43,13 +46,16 @@ pub struct CommunicationRow {
 /// A caller-declared set of communication rows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommunicationPlan {
+    /// The rows, in the order the caller declared them.
     pub rows: Vec<CommunicationRow>,
 }
 
 /// One directed dependency edge: `from` must complete before `to` starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DependencyEdge {
+    /// The node that must complete first.
     pub from: PlanNodeId,
+    /// The node that waits for `from`.
     pub to: PlanNodeId,
 }
 
@@ -78,11 +84,15 @@ pub fn communication_dependency_edges(plan: &CommunicationPlan) -> Vec<Dependenc
     edges
 }
 
+/// No accepted link-capability row admits a row's operation between two of its participants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("no accepted capability row for {from:?} -> {to:?} performing {kind:?}")]
 pub struct CapabilityError {
+    /// The source device of the unadmitted hop.
     pub from: DeviceId,
+    /// The target device of the unadmitted hop.
     pub to: DeviceId,
+    /// The operation the row performs.
     pub kind: CollectiveKind,
 }
 

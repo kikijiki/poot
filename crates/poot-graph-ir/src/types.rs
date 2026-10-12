@@ -37,6 +37,7 @@ pub enum DTypeClass {
 /// `.class()` method-call syntax for [`DType`], kept local to this crate (the classification is
 /// graph semantics; `poot-tensor` stays a rank-0 leaf with no knowledge of it).
 pub trait DTypeClassExt {
+    /// The class of this dtype.
     fn class(self) -> DTypeClass;
 }
 
@@ -64,32 +65,41 @@ impl DTypeClassExt for DType {
 /// carries one, computed host-side by [`crate::op::OpKind::infer`].
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct TensorType {
+    /// The extents, outermost axis first; empty for a scalar.
     pub shape: Vec<usize>,
+    /// The element storage dtype.
     pub dtype: DType,
 }
 
 impl TensorType {
+    /// A type of `shape` and `dtype`.
     pub fn new(shape: impl Into<Vec<usize>>, dtype: DType) -> Self {
         TensorType {
             shape: shape.into(),
             dtype,
         }
     }
+    /// An F32 type of `shape`.
     pub fn f32(shape: impl Into<Vec<usize>>) -> Self {
         TensorType::new(shape, DType::F32)
     }
+    /// A BF16 type of `shape`.
     pub fn bf16(shape: impl Into<Vec<usize>>) -> Self {
         TensorType::new(shape, DType::BF16)
     }
+    /// An F16 type of `shape`.
     pub fn f16(shape: impl Into<Vec<usize>>) -> Self {
         TensorType::new(shape, DType::F16)
     }
+    /// A rank-0 type of `dtype`.
     pub fn scalar(dtype: DType) -> Self {
         TensorType::new(Vec::new(), dtype)
     }
+    /// The number of axes.
     pub fn rank(&self) -> usize {
         self.shape.len()
     }
+    /// The number of elements: the product of the extents, 1 for a scalar.
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
     }
@@ -111,7 +121,9 @@ impl fmt::Display for TensorType {
 /// An inline scalar constant (the jaxpr `Literal`): eps, a scale, 1/N, an index bound, etc.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Scalar {
+    /// A 32-bit float literal.
     F32(f32),
+    /// A 32-bit signed integer literal.
     I32(i32),
 }
 
@@ -124,12 +136,14 @@ impl Scalar {
         }
     }
 
+    /// The dtype the literal has: F32 or I32.
     pub fn dtype(&self) -> DType {
         match self {
             Scalar::F32(_) => DType::F32,
             Scalar::I32(_) => DType::I32,
         }
     }
+    /// The rank-0 type of the literal.
     pub fn ty(&self) -> TensorType {
         TensorType::scalar(self.dtype())
     }

@@ -20,7 +20,9 @@ pub struct OwnerId(pub u64);
 /// identity only; it never inspects or duplicates the owner's authoritative bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostOwner {
+    /// The owner's stable identity.
     pub owner: OwnerId,
+    /// The owner's whole logical extent, in bytes.
     pub total_bytes: usize,
     /// Bytes per encoding-defined unit (e.g. one packed row); a partition boundary must land on a
     /// multiple of this, or on `total_bytes` itself. `1` means no encoding constraint - not every Card
@@ -31,15 +33,19 @@ pub struct HostOwner {
 /// A half-open byte range `[start, end)` in one owner's logical extent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteRange {
+    /// First byte of the range, inclusive.
     pub start: usize,
+    /// One past the last byte of the range, exclusive.
     pub end: usize,
 }
 
 impl ByteRange {
+    /// Number of bytes in the range; zero when `end` does not exceed `start`.
     pub fn len(self) -> usize {
         self.end.saturating_sub(self.start)
     }
 
+    /// Whether the range holds no bytes.
     pub fn is_empty(self) -> bool {
         self.end <= self.start
     }
@@ -49,41 +55,72 @@ impl ByteRange {
 /// extent is split into exact disjoint device-owned ranges.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlacementRow {
+    /// Every listed device holds a full copy of the owner.
     Replicated {
+        /// The owner that is replicated.
         owner: HostOwner,
+        /// The devices holding a replica.
         residents: Vec<DeviceId>,
     },
+    /// The owner's extent is split into disjoint device-owned ranges.
     Partitioned {
+        /// The owner that is partitioned.
         owner: HostOwner,
+        /// Each device with the range of the owner it holds.
         ranges: Vec<(DeviceId, ByteRange)>,
     },
 }
 
+/// Why a placement is not admitted.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PlacementError {
+    /// A partition boundary falls inside an encoding unit of the owner.
     #[error(
         "owner {owner:?} range [{start}, {end}) does not align to its {unit}-byte encoding unit"
     )]
     IllegalEncodingSplit {
+        /// The owner whose range is misaligned.
         owner: OwnerId,
+        /// Start of the misaligned range, in bytes.
         start: usize,
+        /// End of the misaligned range, in bytes.
         end: usize,
+        /// The owner's `encoding_unit_bytes`.
         unit: usize,
     },
+    /// An owner appears in more than one placement row.
     #[error("owner {owner:?} appears in placement rows {indices:?}")]
-    DuplicateOwner { owner: OwnerId, indices: Vec<usize> },
+    DuplicateOwner {
+        /// The owner that is listed more than once.
+        owner: OwnerId,
+        /// Indices of the rows that name it.
+        indices: Vec<usize>,
+    },
+    /// An owner the caller expects has no placement row.
     #[error("expected owner {owner:?} has no placement row")]
-    MissingOwner { owner: OwnerId },
+    MissingOwner {
+        /// The owner with no row.
+        owner: OwnerId,
+    },
+    /// A placement row names an owner outside the expected set.
     #[error("placement row {index} names owner {owner:?}, which is not in the expected set")]
-    UnexpectedOwner { owner: OwnerId, index: usize },
+    UnexpectedOwner {
+        /// The unexpected owner.
+        owner: OwnerId,
+        /// Index of the row that names it.
+        index: usize,
+    },
     /// The placement puts bytes of `owner` on `device`, which hosts none of the stages that read it. The
     /// first reading stage is `stage`.
     #[error(
         "owner {owner:?} is placed on device {device:?}, which runs none of its stages (first reader: stage {stage})"
     )]
     OffStage {
+        /// The owner placed on the foreign device.
         owner: OwnerId,
+        /// The device that hosts none of the owner's reading stages.
         device: DeviceId,
+        /// The first stage that reads the owner.
         stage: usize,
     },
 }
@@ -99,6 +136,7 @@ pub struct PlacementSet {
 }
 
 impl PlacementSet {
+    /// The validated rows.
     pub fn rows(&self) -> &[PlacementRow] {
         &self.rows
     }

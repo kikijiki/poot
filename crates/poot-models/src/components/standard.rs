@@ -51,11 +51,14 @@ pub const HIDDEN_CARRY_STATE: &str = "hidden_carry";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("parameter {field}: {reason:?}")]
 pub struct ParamError {
+    /// The config field or parameter name.
     pub field: &'static str,
+    /// Why the value was refused.
     pub reason: ConfigReason,
 }
 
 impl ParamError {
+    /// A refusal of `field` for `reason`.
     pub const fn new(field: &'static str, reason: ConfigReason) -> Self {
         Self { field, reason }
     }
@@ -246,10 +249,12 @@ impl Step {
         self.paged
     }
 
+    /// The step's shape: rows, tokens and cache capacity.
     pub fn shape(&self) -> StepShape {
         self.shape
     }
 
+    /// The token ids of the step, `[rows, tokens]` I32.
     pub fn tokens(&self) -> Traced {
         self.tokens
     }
@@ -471,12 +476,16 @@ impl Step {
 /// block's output ([`LayerNorms::sandwich`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerNorms {
+    /// The norm before (or, under [`NormPlacement::Post`], after) the token mixer.
     pub attn: NormWeights,
+    /// The norm before (or after) the feed-forward block.
     pub ffn: NormWeights,
     post: Option<[Weight; 2]>,
 }
 
 impl LayerNorms {
+    /// Resolves layer `layer`'s two unbiased norm scales from `map`; a missing or mis-shaped tensor
+    /// is a typed [`WeightError`].
     pub fn new(map: &WeightMap, layer: usize, width: usize) -> Result<Self, WeightError> {
         Self::read(map, layer, width, false)
     }
@@ -535,10 +544,13 @@ impl LayerNorms {
 pub struct LayerScale(Weight);
 
 impl LayerScale {
+    /// Resolves layer `layer`'s `[1]` scalar from `map`; a missing or mis-shaped tensor is a typed
+    /// [`WeightError`].
     pub fn new(map: &WeightMap, layer: usize) -> Result<Self, WeightError> {
         Weight::new(map, WeightId::layer(layer, WeightRole::LayerScale), &[1]).map(Self)
     }
 
+    /// `x` times the scalar.
     pub fn apply(&self, b: &Builder, x: Traced) -> Result<Traced, TraceError> {
         Ok(b.binary(BinOp::Mul, x, self.0.declare_f32(b)?)?)
     }
@@ -566,6 +578,7 @@ pub struct LayerParams {
 }
 
 impl LayerParams {
+    /// Pre-norm placement with no residual scale.
     pub fn new(norm: NormParams) -> Self {
         Self {
             norm,
@@ -574,6 +587,7 @@ impl LayerParams {
         }
     }
 
+    /// Where the layer's norms sit.
     pub fn with_placement(self, placement: NormPlacement) -> Self {
         Self { placement, ..self }
     }
@@ -592,6 +606,7 @@ impl LayerParams {
         })
     }
 
+    /// The norm the layer applies.
     pub fn norm(&self) -> NormParams {
         self.norm
     }
@@ -621,7 +636,9 @@ pub fn standard_layer(
 /// 4's routed feed-forward also routes on `residual` and normalizes it with its own norm.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockInput {
+    /// The value the block computes over.
     pub block: Traced,
+    /// The residual stream the block's output is added to.
     pub residual: Traced,
 }
 
@@ -657,14 +674,19 @@ fn residual_block(
 /// The model-level weights around the layers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StackWeights {
+    /// The token embedding table.
     pub embed: Embedding,
+    /// The norm applied after the last layer.
     pub final_norm: NormWeights,
     /// A LayerNorm over the embedded tokens, before the first layer (BLOOM).
     pub embed_norm: Option<NormWeights>,
+    /// The output projection.
     pub head: Head,
 }
 
 impl StackWeights {
+    /// Resolves the embedding, the unbiased final norm and the head from `map`; a missing or
+    /// mis-shaped tensor is a typed [`WeightError`].
     pub fn new(map: &WeightMap, vocab: usize, width: usize) -> Result<Self, WeightError> {
         Ok(Self {
             embed: Embedding::new(map, vocab, width)?,
@@ -710,6 +732,7 @@ pub struct StackParams {
 }
 
 impl StackParams {
+    /// The final norm with no embedding multiplier, logit divisor or softcap.
     pub fn new(norm: NormParams) -> Self {
         Self {
             norm,
@@ -746,6 +769,7 @@ impl StackParams {
         })
     }
 
+    /// The final norm.
     pub fn norm(&self) -> NormParams {
         self.norm
     }
@@ -858,9 +882,13 @@ pub fn check_step(
 /// so the family's match over the phase has no arm for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmbeddablePhase {
+    /// A token prefill ([`Phase::Prefill`]).
     Prefill,
+    /// A decode step ([`Phase::Decode`]).
     Decode,
+    /// A prefill over supplied embeddings ([`Phase::PrefillEmbeds`]).
     PrefillEmbeds,
+    /// An encoder pass ([`Phase::Encode`]).
     Encode,
 }
 

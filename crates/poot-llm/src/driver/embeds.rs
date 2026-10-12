@@ -31,6 +31,7 @@ impl PromptEmbeds {
         })
     }
 
+    /// The width of one embedding row, in values: the model's embedding width.
     pub fn width(&self) -> usize {
         self.width
     }

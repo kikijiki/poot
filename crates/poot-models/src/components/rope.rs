@@ -52,6 +52,8 @@ fn nonzero(field: &'static str, value: usize) -> Result<usize, ParamError> {
 }
 
 impl RopeParams {
+    /// Checks a rotation of `rotary_dim` leading dims (non-zero and even) at base `theta` (finite and
+    /// positive) under `flavor`; a violation is a typed [`ParamError`] naming the field.
     pub fn new(rotary_dim: usize, theta: f32, flavor: &RopeFlavor<'_>) -> Result<Self, ParamError> {
         nonzero("rotary_dim", rotary_dim)?;
         if !rotary_dim.is_multiple_of(2) {

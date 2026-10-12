@@ -44,46 +44,57 @@ impl Default for Qwen25VlImageProcessorConfig {
 }
 
 impl Qwen25VlImageProcessorConfig {
+    /// Whether the processor resizes an image to the smart-resize grid before patching.
     pub fn do_resize(&self) -> bool {
         self.do_resize
     }
 
+    /// Whether pixel values are multiplied by [`Self::rescale_factor`] (`u8` range to `[0, 1]`).
     pub fn do_rescale(&self) -> bool {
         self.do_rescale
     }
 
+    /// Whether rescaled values are normalized by [`Self::image_mean`] and [`Self::image_std`].
     pub fn do_normalize(&self) -> bool {
         self.do_normalize
     }
 
+    /// Lower bound of the resized image's pixel count (`height * width`); at least `1`.
     pub fn min_pixels(&self) -> usize {
         self.min_pixels
     }
 
+    /// Upper bound of the resized image's pixel count (`height * width`); at least `(patch_size * merge_size)^2`.
     pub fn max_pixels(&self) -> usize {
         self.max_pixels
     }
 
+    /// Side of one vision patch in pixels.
     pub fn patch_size(&self) -> usize {
         self.patch_size
     }
 
+    /// Frames merged into one temporal patch; an image is repeated to fill it.
     pub fn temporal_patch_size(&self) -> usize {
         self.temporal_patch_size
     }
 
+    /// Side, in patches, of the square the patch merger folds into one visual token.
     pub fn merge_size(&self) -> usize {
         self.merge_size
     }
 
+    /// The factor raw `u8` pixels are multiplied by when rescaling (`1/255` by default).
     pub fn rescale_factor(&self) -> f64 {
         self.rescale_factor
     }
 
+    /// Per-channel mean (R, G, B) subtracted when normalizing.
     pub fn image_mean(&self) -> [f32; 3] {
         self.mean
     }
 
+    /// Per-channel standard deviation (R, G, B) the normalized values are divided by; never zero.
     pub fn image_std(&self) -> [f32; 3] {
         self.std
     }
@@ -287,56 +298,113 @@ fn resolve_channels(
     Ok(resolved)
 }
 
+/// Why an image processor configuration is refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Qwen25VlImageProcessorConfigValidationError {
+    /// A size field that must be nonzero is zero.
     #[error("Qwen2.5-VL image processor {field} must be nonzero")]
-    ZeroValue { field: &'static str },
+    ZeroValue {
+        /// The offending field's name.
+        field: &'static str,
+    },
+    /// `min_pixels` exceeds `max_pixels`, so no image size satisfies both.
     #[error("Qwen2.5-VL image processor min_pixels {min_pixels} exceeds max_pixels {max_pixels}")]
     InvalidPixelRange {
+        /// The configured lower pixel bound.
         min_pixels: usize,
+        /// The configured upper pixel bound.
         max_pixels: usize,
     },
+    /// Computing a derived quantity overflows `usize`.
     #[error("Qwen2.5-VL image processor arithmetic overflows usize while computing {stage}")]
-    ArithmeticOverflow { stage: &'static str },
+    ArithmeticOverflow {
+        /// The quantity being computed.
+        stage: &'static str,
+    },
+    /// `max_pixels` is smaller than one resize factor squared, so even the smallest grid exceeds it.
     #[error(
         "Qwen2.5-VL image processor max_pixels {max_pixels} is below resize factor {factor} squared"
     )]
-    MaxPixelsBelowFactorArea { max_pixels: usize, factor: usize },
+    MaxPixelsBelowFactorArea {
+        /// The configured upper pixel bound.
+        max_pixels: usize,
+        /// `patch_size * merge_size`, the side every resized dimension is a multiple of.
+        factor: usize,
+    },
+    /// A float field is NaN or infinite.
     #[error("Qwen2.5-VL image processor {field} must be finite")]
-    NonFiniteValue { field: &'static str },
+    NonFiniteValue {
+        /// The offending field's name.
+        field: &'static str,
+    },
+    /// A mean or std channel is NaN or infinite.
     #[error("Qwen2.5-VL image processor {field}[{index}] must be finite")]
-    NonFiniteChannelValue { field: &'static str, index: usize },
+    NonFiniteChannelValue {
+        /// `image_mean` or `image_std`.
+        field: &'static str,
+        /// The channel (0..3).
+        index: usize,
+    },
+    /// A std channel is zero, which normalization would divide by.
     #[error("Qwen2.5-VL image processor image_std[{index}] must be nonzero")]
-    ZeroStd { index: usize },
+    ZeroStd {
+        /// The channel (0..3).
+        index: usize,
+    },
+    /// Some `u8` input would produce a non-finite value in this channel after rescale and normalize.
     #[error("Qwen2.5-VL image processor channel {channel} can produce non-finite RGB8 output")]
-    NonFiniteOutputRange { channel: usize },
+    NonFiniteOutputRange {
+        /// The channel (0..3).
+        channel: usize,
+    },
+    /// A mean or std array has a length other than one or three.
     #[error("Qwen2.5-VL image processor {field} has {actual} channels; expected one or three")]
-    ChannelCount { field: &'static str, actual: usize },
+    ChannelCount {
+        /// `image_mean` or `image_std`.
+        field: &'static str,
+        /// The length given.
+        actual: usize,
+    },
+    /// The `resample` filter is not Pillow BICUBIC, the only one implemented.
     #[error(
         "Qwen2.5-VL image processor resample {actual} is unsupported; expected Pillow BICUBIC 3"
     )]
-    UnsupportedResample { actual: u32 },
+    UnsupportedResample {
+        /// The Pillow resample code given.
+        actual: u32,
+    },
+    /// `do_convert_rgb` is false; only the RGB8 boundary is implemented.
     #[error("Qwen2.5-VL image processor do_convert_rgb=false is unsupported for the RGB8 boundary")]
     RgbConversionDisabled,
 }
 
+/// Why the persisted image processor configuration could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlImageProcessorConfigError {
+    /// `preprocessor_config.json` could not be read.
     #[error("read Qwen2.5-VL image processor config {path:?}: {source}")]
     Read {
+        /// The file that failed.
         path: PathBuf,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
+    /// `preprocessor_config.json` is not valid JSON of the expected field types.
     #[error("parse Qwen2.5-VL image processor config {path:?}: {source}")]
     Parse {
+        /// The file that failed.
         path: PathBuf,
+        /// The underlying parse error.
         #[source]
         source: serde_json::Error,
     },
+    /// The parsed overrides describe a configuration that is refused.
     #[error("validate Qwen2.5-VL image processor config {path:?}: {source}")]
     Validate {
+        /// The file that failed.
         path: PathBuf,
+        /// Which validation rule failed.
         #[source]
         source: Qwen25VlImageProcessorConfigValidationError,
     },

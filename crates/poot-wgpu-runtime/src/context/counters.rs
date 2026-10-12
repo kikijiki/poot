@@ -161,14 +161,23 @@ impl Context {
 /// blocking device polls. Dispatches count encoded compute workgroups calls, not graph equations.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeCounterSnapshot {
+    /// Compute pipelines built on a cache miss; zero on a warm replay.
     pub pipeline_builds: usize,
+    /// Logical submissions (one per encoded run of dispatches).
     pub submits: usize,
+    /// `create_buffer` calls for graph-visible allocations.
     pub buffer_allocs: usize,
+    /// `create_bind_group` calls.
     pub bind_group_creates: usize,
+    /// Length/meta buffers created (`create_buffer_init`).
     pub length_buffer_creates: usize,
+    /// Device-to-host readbacks, each with its own staging buffer.
     pub readbacks: usize,
+    /// `queue.submit` calls actually made, readback and copy submissions included.
     pub native_submits: usize,
+    /// Blocking device polls.
     pub waits: usize,
+    /// Encoded dispatch calls (compute workgroup launches), not graph equations.
     pub dispatches: usize,
     /// Actual calls beginning a compute pass, independent of its dispatch count.
     pub compute_passes: usize,
@@ -191,6 +200,8 @@ pub struct RuntimeCounters {
 }
 
 impl RuntimeCounters {
+    /// Reads every counter at this instant into a plain value; two snapshots subtract to the work done
+    /// between them.
     pub fn snapshot(&self) -> RuntimeCounterSnapshot {
         RuntimeCounterSnapshot {
             pipeline_builds: self.pipeline_builds.get(),
@@ -208,6 +219,8 @@ impl RuntimeCounters {
 }
 
 impl Context {
+    /// A read-only handle sharing this context's counters, usable while the context itself is mutably
+    /// borrowed.
     pub fn counters(&self) -> RuntimeCounters {
         RuntimeCounters {
             pipeline_builds: self.pipeline_builds.clone(),

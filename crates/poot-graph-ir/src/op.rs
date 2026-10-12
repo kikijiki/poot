@@ -27,12 +27,16 @@ use crate::types::{DType, DTypeClass, DTypeClassExt, Scalar, TensorType, broadca
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum UnOp {
+    /// Negation, `-x`.
     Neg,
+    /// Natural exponential, `e^x`.
     Exp,
     /// Natural log (a primitive IR op). Needed by softplus (`log(1+exp(x))`, Mamba's Delta) and log-space cumulative
     /// products. NVPTX uses the hardware `lg2.approx` scaled by `ln(2)`, like Exp.
     Log,
+    /// Square root.
     Sqrt,
+    /// Reciprocal, `1 / x`.
     Recip,
     /// Round to nearest integer (ties away from zero), `llvm.round.f32` (a primitive IR op).
     Round,
@@ -56,12 +60,18 @@ pub enum UnOp {
     Clz,
 }
 
+/// A binary elementwise primitive; operands broadcast numpy-style and share one dtype.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum BinOp {
+    /// Addition.
     Add,
+    /// Subtraction, `a - b`.
     Sub,
+    /// Multiplication.
     Mul,
+    /// Division, `a / b`.
     Div,
+    /// Elementwise maximum.
     Max,
     /// Elementwise `a >= b -> 1.0` else `0.0` (the comparison/indicator primitive). Output dtype follows the
     /// operands like the arithmetic ops. All other comparisons derive from it: `gt(a,b) = 1 - ge(b,a)`,
@@ -90,9 +100,12 @@ pub enum BinOp {
     Shr,
 }
 
+/// The combiner of a last-axis style reduction ([`OpKind::Reduce`], [`OpKind::AllReduce`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum RedOp {
+    /// Sum of the reduced elements.
     Sum,
+    /// Maximum of the reduced elements.
     Max,
 }
 
@@ -121,7 +134,9 @@ pub enum SampleRule {
 /// inputs lowers to one kernel that keeps every intermediate in registers.
 #[derive(Clone, Copy, PartialEq, Debug, Hash)]
 pub enum FusedOp {
+    /// A [`UnOp`] step.
     Unary(UnOp),
+    /// A [`BinOp`] step.
     Binary(BinOp),
     /// Pointwise `Select(cond, if_true, if_false)` with three operands: the bit pattern of `if_true` where the
     /// I32 condition word is nonzero, else of `if_false`. A select, never arithmetic: a NaN, Inf or `-0.0`
@@ -131,6 +146,7 @@ pub enum FusedOp {
     /// in registers, so a norm scale or a bias that a region reads as F32 is never a separate dispatch and
     /// never an f32 copy of the stored weight.
     Cast {
+        /// The dtype the operand is converted to.
         to: DType,
     },
 }
@@ -153,12 +169,16 @@ impl FusedOp {
 /// order); locals `n_inputs + j` are the result of step `j`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum FusedOperand {
+    /// A local value: an external input (`0..n_inputs`) or an earlier step's result.
     Local(usize),
+    /// An inline scalar literal captured from the source graph.
     Lit(Scalar),
     /// Last-axis lane of an external packed I32 input. The input tensor's last dimension is the pack
     /// width; this operand has a trailing unit axis.
     PackLane {
+        /// The external packed input read.
         input: usize,
+        /// The lane (index along the input's last axis) taken.
         lane: usize,
     },
 }
@@ -166,7 +186,9 @@ pub enum FusedOperand {
 /// One straight-line step of a fused region: `local[n_inputs + j] = op(inputs...)`.
 #[derive(Clone, PartialEq, Debug)]
 pub struct FusedStep {
+    /// The pointwise operation this step computes.
     pub op: FusedOp,
+    /// The step's operands, in the operation's operand order.
     pub inputs: Vec<FusedOperand>,
 }
 
@@ -177,8 +199,11 @@ pub struct FusedStep {
 /// inputs may broadcast on read.
 #[derive(Clone, PartialEq, Debug)]
 pub struct FusedRegion {
+    /// The number of external inputs, which are locals `0..n_inputs`.
     pub n_inputs: usize,
+    /// The steps in execution order; step `j` defines local `n_inputs + j`.
     pub steps: Vec<FusedStep>,
+    /// The local that is the region's result.
     pub output: usize,
     /// When non-empty, the equation output is the last-axis concatenation of these locals, each of
     /// which has a trailing unit axis. Empty means the single [`Self::output`] local.
@@ -308,12 +333,20 @@ fn pack_lane_ty(source: &TensorType, input: usize, lane: usize) -> Result<Tensor
 /// op on per-row reduction results - the synthesizer tells them apart by shape) or a last-axis reduction.
 #[derive(Clone, PartialEq, Debug)]
 pub enum RowStep {
+    /// A pointwise step.
     Pointwise {
+        /// The pointwise operation.
         op: FusedOp,
+        /// The operands, in the operation's operand order.
         inputs: Vec<FusedOperand>,
     },
     /// A `keepdim` reduction over the region's last (row) axis: a row `[.,N]` value -> a scalar `[.,1]`.
-    Reduce { op: RedOp, input: FusedOperand },
+    Reduce {
+        /// The reduction combiner.
+        op: RedOp,
+        /// The row value reduced.
+        input: FusedOperand,
+    },
 }
 
 /// A row-wise (reduction-rooted) fused region (G5b): all values are rows `[.,N]` over the reduction axis or
@@ -323,10 +356,13 @@ pub enum RowStep {
 /// is the no-reduction case.
 #[derive(Clone, PartialEq, Debug)]
 pub struct RowRegion {
+    /// The number of external inputs, which are locals `0..n_inputs`.
     pub n_inputs: usize,
     /// the reduction axis (the last axis of the row shape); reductions keep it as size 1.
     pub axis: usize,
+    /// The steps in execution order; step `j` defines local `n_inputs + j`.
     pub steps: Vec<RowStep>,
+    /// The local that is the region's result.
     pub output: usize,
 }
 
@@ -443,7 +479,10 @@ pub enum ContractionRows {
     /// carriers..]`, each carrier the expert-stacked, word-padded source `[experts, slab_bytes]`
     /// ([`crate::packed_source::packed_stack_source_type`]). An id outside `0..experts`, or not an integer, makes
     /// that row NaN (R-632-4), as for [`OpKind::IndexedMatMul`].
-    Indexed { experts: usize },
+    Indexed {
+        /// The number of experts stacked in the table; row ids index `0..experts`.
+        experts: usize,
+    },
 }
 
 impl ContractionRows {
@@ -471,12 +510,17 @@ pub enum ContractionHead {
     /// [`OpKind::MatMul`] over `A[.., M, K]` and `B[.., K, N]`.
     MatMul,
     /// [`OpKind::DenseContraction`] over an activation and a `[N, K]` weight of dtype `weight`.
-    Dense { weight: DType },
+    Dense {
+        /// The weight's storage dtype, one of [`DENSE_CONTRACTION_WEIGHT_DTYPES`].
+        weight: DType,
+    },
     /// [`OpKind::PackedContraction`] over an f32 activation and the carriers of the packed weight
     /// `descriptor`, its rows selected as `rows` says. Its result is f32, so the head applies no
     /// narrowing before the region reads it.
     Packed {
+        /// The packed weight the activation is contracted against.
         descriptor: PackedWeight,
+        /// How activation rows meet weight rows.
         rows: ContractionRows,
     },
     /// [`OpKind::IndexedMatMul`] over an activation `x [M, K]`, a stacked weight `W [E, K, N]` and the per-row
@@ -560,7 +604,10 @@ pub enum KeyLayout {
     /// The key is two operands concatenated on the head axis: `k_head [B,Hkv,Lk,D - shared_dim]` and
     /// `k_shared [B,1,Lk,shared_dim]`, the latter broadcast over every key head (MLA's `k_nope` and the
     /// rotary `k_pe`). The shared operand follows `mask` in the operand list.
-    Split { shared_dim: usize },
+    Split {
+        /// The width `s` of the shared operand's last axis; the head part is `D - s` wide.
+        shared_dim: usize,
+    },
 }
 
 /// Which keys [`AttentionAttrs`]'s kernel visits.
@@ -578,39 +625,58 @@ pub enum KvBound {
 /// Orthogonal tensor algebra. The whole transformer composes from these (graph-architecture.md 3.2).
 #[derive(Clone, PartialEq, Debug)]
 pub enum OpKind {
+    /// Elementwise [`UnOp`] over one operand.
     Unary(UnOp),
+    /// Elementwise [`BinOp`] over two operands with numpy broadcasting.
     Binary(BinOp),
     /// Pointwise select, `out = cond != 0 ? if_true : if_false`, as a bit-pattern select and never arithmetic:
     /// a NaN, Inf or `-0.0` in the unselected branch cannot reach `out`, and the selected one passes through bit
     /// for bit. Inputs are `cond` (I32), `if_true`, `if_false`; the branches share one I32, F32, F16 or BF16
     /// dtype, which is `out`'s. Every executor and the oracle share this one definition.
     Select,
+    /// Reduce one axis with a [`RedOp`] combiner.
     Reduce {
+        /// The reduction combiner.
         op: RedOp,
+        /// The axis reduced.
         axis: usize,
+        /// Whether the reduced axis stays as extent 1.
         keepdim: bool,
     },
+    /// Broadcast the operand to `shape`: trailing axes align and extent-1 axes expand, never shrinking.
     Broadcast {
+        /// The target shape.
         shape: Vec<usize>,
     },
     /// Cast a tensor to another storage dtype (same shape). f32 -> bf16 rounds to bf16 precision (bf16 is the top
     /// 16 bits of an f32); a widening/same-dtype cast is the identity. Feeds bf16 operands into the tensor-core
     /// matmul path (card 045).
     Cast {
+        /// The dtype the operand is converted to.
         to: DType,
     },
+    /// Reinterpret the operand's elements under a new shape of the same element count.
     Reshape {
+        /// The target shape.
         shape: Vec<usize>,
     },
+    /// Permute the operand's axes.
     Transpose {
+        /// Output axis `i` is input axis `perm[i]`.
         perm: Vec<usize>,
     },
+    /// Take `start..end` along one axis.
     Slice {
+        /// The axis sliced.
         axis: usize,
+        /// The first index kept.
         start: usize,
+        /// One past the last index kept.
         end: usize,
     },
+    /// Concatenate the operands along one axis; the operands agree on dtype and every other axis.
     Concat {
+        /// The concatenation axis.
         axis: usize,
     },
     /// A nullary range `[0, 1, .., len)`, shape `[len]`, in `dtype` (F32 or I32): the explicit iota primitive that
@@ -621,12 +687,15 @@ pub enum OpKind {
     /// An I32 range is exact for every `len` an `i32` holds; an F32 one only below 2^24 (any other `dtype`,
     /// or an I32 `len` above `i32::MAX`, is a shape error).
     Iota {
+        /// The number of elements.
         len: usize,
+        /// The element dtype.
         dtype: DType,
     },
     /// Gather rows of `data` (input 0) along `axis` by an index (input 1). Scalar-index case only for now
     /// (embedding lookup, RoPE cos/sin row): drops `axis` from the result.
     Gather {
+        /// The axis the rows are taken along.
         axis: usize,
     },
     /// Scatter rows of `src` (input 0) along `axis` by a `[N]` permutation index (input 1), the inverse of an
@@ -634,6 +703,7 @@ pub enum OpKind {
     /// permutation of `0..N` (N = `src.shape[axis]`); used for argtop-k expert indices in sparse MoE dispatch
     /// (card 034: scatter `iota` by the per-expert rank to invert it). Axis 0 only.
     Scatter {
+        /// The axis scattered along; axis 0 only.
         axis: usize,
     },
     /// Scatter-update rows into a base (card 059, the multi-token paged KV write): `out[p, ..] =
@@ -651,6 +721,7 @@ pub enum OpKind {
     /// format has one (`Blocks`), a registered E4M3/E2M1 cell has two (`Codes`, `Scale`), and GPTQ or
     /// AWQ have three or four (`Codes`, `Zero`, `Scale`, and `GroupIndex` for GPTQ act-order).
     PackedDequant {
+        /// The packed weight whose payload is decoded.
         descriptor: PackedWeight,
     },
     /// Compiler-only replacement for activation matmul against a packed weight. Builders do not expose it; Card 356
@@ -666,7 +737,9 @@ pub enum OpKind {
     /// (the routed MoE projection, [`crate::ops::packed_indexed_linear`]); one field, not a second variant,
     /// because both are the same index map over the same descriptor-driven decode.
     PackedContraction {
+        /// The packed weight the activation is contracted against.
         descriptor: PackedWeight,
+        /// How activation rows meet weight rows.
         rows: ContractionRows,
     },
     /// Compiler-only replacement for an axis-0 `Gather` of a packed weight's rows (card 642/545a,
@@ -675,6 +748,7 @@ pub enum OpKind {
     /// shape); the output is `ids.shape ++ [K]` F32. Builders do not expose it: the claim pass rewrites
     /// `Gather { axis: 0 }(PackedDequant(..), ids)` into it, so no `[out, K]` table is ever materialized.
     PackedRowGather {
+        /// The packed weight whose rows are gathered.
         descriptor: PackedWeight,
     },
     /// Compiler-only replacement for an activation matmul against a dense weight (BF16, F32 or F16) held in checkpoint
@@ -689,6 +763,7 @@ pub enum OpKind {
     /// `weight` is an admitted-dtype table: [`OpKind::infer`] rejects anything outside
     /// [`DENSE_CONTRACTION_WEIGHT_DTYPES`] (BF16, F32 and F16).
     DenseContraction {
+        /// The weight's storage dtype, one of [`DENSE_CONTRACTION_WEIGHT_DTYPES`].
         weight: DType,
     },
     /// Compiler-only grouped sibling of [`OpKind::DenseContraction`]: `groups` independent contractions, each over
@@ -702,7 +777,9 @@ pub enum OpKind {
     /// spelling of a grouped projection (DeepSeek V4's `wo_a`), so the weight stays one resident const in its
     /// checkpoint dtype instead of a widened F32 copy.
     GroupedDenseContraction {
+        /// The weight's storage dtype; BF16 is the only admitted one.
         weight: DType,
+        /// The number of independent groups `G`.
         groups: usize,
     },
     /// Gather rows from a dense narrow-float table along axis 0 and widen them to F32 in one equation:
@@ -721,6 +798,7 @@ pub enum OpKind {
     /// `source` is an admitted-dtype table: [`OpKind::infer`] rejects anything outside
     /// [`DENSE_ROW_GATHER_SOURCE_DTYPES`].
     DenseRowGather {
+        /// The table's storage dtype, one of [`DENSE_ROW_GATHER_SOURCE_DTYPES`].
         source: DType,
     },
     /// A contraction followed by a pointwise chain: the head's result, then `region`'s steps with local 0 bound to
@@ -735,7 +813,9 @@ pub enum OpKind {
     /// rounds once at the head, exactly as the unfused program stores it; a lowering keeps that rounding inside the
     /// kernel.
     ContractionEpilogue {
+        /// The contraction that produces local 0.
         head: ContractionHead,
+        /// The pointwise chain applied to the head's result.
         region: FusedRegion,
     },
     /// Batched argtop-k index extraction (spec 136, grouped-MoE prefill routing): `rank [..,E] -> [..,k]` expert
@@ -746,6 +826,7 @@ pub enum OpKind {
     /// trace-time constant (static shape, capture-safe). This op inverts rank and has no score-order or tie-break
     /// semantic of its own.
     ArgTopK {
+        /// The number of indices extracted per row.
         k: usize,
     },
     /// Indexed matmul (card 088, sparse-MoE gather-free GEMM): `out[m,n] = sum_k x[m,k] * W[idx[m],k,n]`. Inputs are
@@ -760,6 +841,7 @@ pub enum OpKind {
     /// `operand[.., index..index+update.shape[axis], ..] = update`. Result type == `operand`'s type. The index is
     /// typically an inline literal (the decode graph is pos-specialized).
     DynamicUpdateSlice {
+        /// The axis the update is written along.
         axis: usize,
     },
     /// Pack int8 codes (f32 in `[-127, 127]`) into i32 words, 4 codes per word along the last axis (spec 048): output
@@ -770,6 +852,7 @@ pub enum OpKind {
     /// Unpack int8 codes from i32 words (inverse of [`OpKind::PackI8`]): output dtype `F32`, last dim -> `len` (the original
     /// code count, which the word count alone does not determine). Each byte is read as a signed i8 widened to f32.
     UnpackI8 {
+        /// The number of int8 codes to unpack, which the word count alone does not determine.
         len: usize,
     },
     /// A fused elementwise region (G5): a composition of pointwise steps lowered to one kernel. The eqn's
@@ -797,6 +880,7 @@ pub enum OpKind {
     /// the slice/slice/neg/concat/mul/mul/add chain (~6-8 dispatches per rope call). GPT-NeoX / HF convention
     /// (non-interleaved); GGUF weights are deinterleaved to half-split at load.
     Rope {
+        /// The rotary width: how many leading elements of the last axis are rotated, even and at most `D`.
         rot: usize,
     },
     /// A bounded recurrence over the sequence axis (POOT-634): the gated delta rule (GDN) or the Mamba2
@@ -819,6 +903,7 @@ pub enum OpKind {
     /// The oracle evaluates one rank: the identity (`AllReduce(x)` over one replica is `x`). A collective is a cut
     /// point between stage programs, never an equation a stage program plans (`compile` refuses it).
     AllReduce {
+        /// The combiner applied across replicas.
         op: RedOp,
         /// The shard (contraction) axis this collective collapses across replicas. Metadata only for this slice; the
         /// ring-allreduce lowering (card 049b) uses it for buffer sizing.
@@ -846,6 +931,7 @@ pub enum OpKind {
     /// always in `[2^-24, 1 - 2^-24]` and a double `log` of it never diverges. See
     /// [`crate::ops::sampling::hash32`] and [`crate::ops::sampling::random_uniform`].
     RandomUniform {
+        /// The number of noise columns per seed: the last extent of the output.
         cols: usize,
     },
     /// Pick one token per row (card 551a, R472-007, R-551a-2, deval.md section 8): fixes the three
@@ -859,6 +945,7 @@ pub enum OpKind {
     /// 551b) never commits a faulted row's token. F32 logits only (every other dtype is a typed
     /// `ShapeError`); see [`crate::ops::sampling::sample_head`].
     SampleToken {
+        /// Which sampler the operand list and semantics follow.
         rule: SampleRule,
     },
 }
@@ -2203,6 +2290,7 @@ impl ScanFamily {
 /// The attributes of [`OpKind::Scan`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct ScanAttrs {
+    /// Which recurrence the scan computes.
     pub family: ScanFamily,
     /// The chunk length (a power of two) of the reference decomposition. A device schedule is free to
     /// differ; the semantics do not depend on it beyond rounding.
@@ -2213,9 +2301,13 @@ pub struct ScanAttrs {
 /// `y [1,heads,len,width]` first, then the carried state `s_out [1,heads,state_rows,width]`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct ScanLayout {
+    /// The head count `H`.
     pub heads: usize,
+    /// The sequence length `L`.
     pub len: usize,
+    /// The rows of the carried state per head.
     pub state_rows: usize,
+    /// The head width, the last axis.
     pub width: usize,
 }
 

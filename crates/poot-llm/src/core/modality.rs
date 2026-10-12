@@ -3,9 +3,13 @@
 /// A kind of request input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Modality {
+    /// Plain text; every model takes it.
     Text,
+    /// A still image (PNG or JPEG bytes), lowered through an image front end.
     Image,
+    /// A video clip, sampled to frames and lowered through a video-capable front end.
     Video,
+    /// Audio samples, for a model with an audio tower.
     Audio,
 }
 

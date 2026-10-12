@@ -15,65 +15,99 @@ use crate::scalar::float_to_f32;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// The operation needs the other storage shape (blocks versus planar tensors).
-    WrongStorage { format: WeightFormat },
+    WrongStorage {
+        /// The format that was asked for the wrong storage shape.
+        format: WeightFormat,
+    },
     /// A block slice has the wrong length.
     BlockLength {
+        /// The format whose block was handed in.
         format: WeightFormat,
+        /// Byte length one block of `format` occupies.
         expected: usize,
+        /// Length of the slice that was supplied.
         actual: usize,
     },
     /// An in-block element index is outside the block.
     ElementIndex {
+        /// The format whose block was indexed.
         format: WeightFormat,
+        /// The requested in-block element index.
         index: usize,
+        /// Values per block; valid indices are `0..values`.
         values: usize,
     },
     /// Source bytes do not hold the requested values in whole blocks.
     RowLength {
+        /// The format whose row was being decoded.
         format: WeightFormat,
+        /// Length of the source byte run.
         bytes: usize,
+        /// Number of values the caller asked to decode from it.
         values: usize,
     },
     /// A logical coordinate is outside the `[out, K]` shape.
     Coordinate {
+        /// The format of the weight that was addressed.
         format: WeightFormat,
+        /// The requested logical `[row, column]` coordinate.
         coordinate: [usize; 2],
+        /// The weight's logical `[out, K]` shape.
         shape: [usize; 2],
     },
     /// A row decode's output slice does not hold exactly one logical row of `K` values.
     RowOutput {
+        /// The format of the weight whose row was being decoded.
         format: WeightFormat,
+        /// The row length `K`: the number of values the output must hold.
         k: usize,
+        /// Length of the output slice that was supplied.
         len: usize,
     },
     /// A planar operand the format needs was not supplied.
     MissingOperand {
+        /// The format that needs the operand.
         format: WeightFormat,
+        /// The role of the operand that was not supplied.
         role: OperandRole,
     },
     /// A planar operand's source has the wrong byte length for the shape.
     OperandLength {
+        /// The format that owns the operand.
         format: WeightFormat,
+        /// The role of the operand whose source is the wrong size.
         role: OperandRole,
+        /// Byte length the operand's shape and encoding require.
         expected: usize,
+        /// Byte length of the source that was supplied.
         actual: usize,
     },
     /// A GPTQ `g_idx` entry names no group.
     GroupIndex {
+        /// The GPTQ format whose `g_idx` was read.
         format: WeightFormat,
+        /// The reduction index whose `g_idx` entry is out of range.
         k: usize,
+        /// The stored group index: negative, or at or past the format's group count.
         group: i64,
     },
     /// Deriving a planar operand's extent overflowed `usize`.
-    Overflow { format: WeightFormat },
+    Overflow {
+        /// The format whose operand extent overflowed.
+        format: WeightFormat,
+    },
     /// A `Float` field whose stored bits the content check cannot locate as whole bytes.
     UnsupportedFloatField {
+        /// The format that owns the field.
         format: WeightFormat,
+        /// The operand whose `Float` field cannot be located as whole bytes.
         role: OperandRole,
     },
     /// A stored operand is NaN (E8M0 `0xff`, E4M3FN `0x7f`, a NaN float).
     NotANumber {
+        /// The format that owns the operand.
         format: WeightFormat,
+        /// The operand whose stored value is NaN.
         role: OperandRole,
     },
 }

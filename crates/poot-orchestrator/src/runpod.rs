@@ -63,15 +63,23 @@ pub struct CreateSpec<'a> {
     /// The state database's pod prefix. The pod's cloud name is built from it, so `reap` finds every pod
     /// this create call makes.
     pub owner: &'a PodOwnerPrefix,
+    /// The orchestrator run this pod serves; part of the pod's cloud name.
     pub run_id: &'a str,
     /// The provisioning attempt of `run_id` this pod is.
     pub attempt: u32,
+    /// The container image the pod boots.
     pub image: &'a str,
+    /// The RunPod GPU type id to rent.
     pub gpu_type_id: &'a str,
-    pub cloud_type: &'a str, // COMMUNITY | SECURE | ALL
+    /// Which RunPod cloud to rent from: `COMMUNITY`, `SECURE` or `ALL`.
+    pub cloud_type: &'a str,
+    /// How many GPUs the pod gets.
     pub gpu_count: u32,
+    /// Size of the pod's container disk, in GB.
     pub container_disk_gb: u32,
-    pub ports: &'a [&'a str], // e.g. ["22/tcp"]
+    /// Ports the pod exposes, in RunPod's `port/proto` form, e.g. `22/tcp`.
+    pub ports: &'a [&'a str],
+    /// Environment variables set in the container.
     pub env: &'a HashMap<String, String>,
     /// Network volume to attach at /workspace (the model-weight cache). Pins the pod to the volume's
     /// datacenter, so `data_center_ids` should match it.

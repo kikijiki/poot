@@ -1,3 +1,6 @@
+//! Safetensors checkpoint loading: map a directory's weight files, validate each header against its file,
+//! and build the [`WeightStore`] (dense tensors as stored, quantized linears packed).
+
 use poot_tensor::DType;
 use std::collections::HashSet;
 use std::fs::File;

@@ -39,6 +39,7 @@ pub fn value_ids(eqn: &Eqn) -> Vec<ValueId> {
         .collect()
 }
 
+/// Element count of a tensor of `shape`: the product of its extents, floored at one so a scalar (`[]`) and a zero-extent shape both count as a single element.
 pub fn numel(shape: &[usize]) -> usize {
     shape.iter().product::<usize>().max(1)
 }

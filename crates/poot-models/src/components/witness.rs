@@ -26,6 +26,7 @@ pub enum WitnessKind {
 }
 
 impl WitnessKind {
+    /// Every kind, in ordinal order (the order ids are minted in).
     pub const ALL: [Self; 3] = [
         Self::RouterLogitsFinite,
         Self::SelectedSumUsable,
@@ -40,6 +41,7 @@ impl WitnessKind {
         }
     }
 
+    /// The stable name of the condition, for receipts and failure messages.
     pub const fn label(self) -> &'static str {
         match self {
             Self::RouterLogitsFinite => "router_logits_finite",

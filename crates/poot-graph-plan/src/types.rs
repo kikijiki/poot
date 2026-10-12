@@ -9,6 +9,7 @@ use poot_tensor::DType;
 use crate::{KernelChoice, Refusal, StorageGap};
 use poot_kernel_ir::Body;
 
+/// Why the planner produced no [`Plan`] for an equation or a graph.
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
     /// The planner built dispatches whose bindings are not a valid [`DispatchPlan`].
@@ -22,8 +23,11 @@ pub enum PlanError {
     /// check is graph-wide and runs before any equation is planned, so it names a value, not an equation.
     #[error("{value} ({dtype}) cannot bind to this executor entry point: {gap}")]
     UnrepresentableValue {
+        /// The value that cannot be represented.
         value: ValueId,
+        /// Its dtype.
         dtype: DType,
+        /// What about the dtype the executor entry point cannot carry.
         gap: StorageGap,
     },
     /// The op is valid but a static shape it depends on violates its precondition (e.g. an `ArgTopK`
@@ -35,12 +39,20 @@ pub enum PlanError {
     /// read through a `Plan::Alias`/`Plan::View` chain counts as a read of it. The reader is named by its
     /// output.
     #[error("I32 {value} is read through a Slice<f32> param by the equation defining {reader}")]
-    I32ReadAsF32 { value: ValueId, reader: ValueId },
+    I32ReadAsF32 {
+        /// The buffer's root value, whose I32 words are read as `f32`.
+        value: ValueId,
+        /// The value defined by the reading equation.
+        reader: ValueId,
+    },
     /// A device executor admits only witness heads whose computation is exact on the device.
     #[error("validation {id:?} {value} is not a canonical device witness: {reason}")]
     ValidationWitnessNotCanonical {
+        /// The validation's id.
         id: ValidationId,
+        /// The graph value the validation reads.
         value: ValueId,
+        /// Why the value is not a canonical device witness.
         reason: DeviceWitnessRejection,
     },
     /// `state_commit_from_plans` donated `state_input`, but a native transaction's rollback journal needs
@@ -50,7 +62,12 @@ pub enum PlanError {
     #[error(
         "state {state_input} is donated by {op}, whose overwrite region a native transaction cannot statically recover for rollback"
     )]
-    UnrecoverableDonation { state_input: ValueId, op: String },
+    UnrecoverableDonation {
+        /// The state input that was donated.
+        state_input: ValueId,
+        /// Name of the op that produces the state's new value.
+        op: String,
+    },
 }
 
 /// Which cross-device operation a communication row carries (`multi_device`). A collective is a cut
@@ -110,6 +127,7 @@ impl Dispatch {
         }
     }
 
+    /// The kernel body.
     pub fn body(&self) -> &Body {
         &self.body
     }
@@ -119,10 +137,12 @@ impl Dispatch {
         &self.key
     }
 
+    /// The kernel's display label.
     pub fn label(&self) -> &str {
         &self.label
     }
 
+    /// The launch geometry and metadata.
     pub fn launch(&self) -> &Launch {
         &self.launch
     }
@@ -160,10 +180,12 @@ impl Dispatch {
 pub struct ScratchId(u32);
 
 impl ScratchId {
+    /// The scratch with the given index among the plan's declarations.
     pub fn new(index: u32) -> Self {
         Self(index)
     }
 
+    /// The scratch's index among the plan's declarations.
     pub fn index(self) -> u32 {
         self.0
     }
@@ -187,6 +209,7 @@ impl ScratchDecl {
         Self { storage, elems }
     }
 
+    /// The storage lane the scratch lives in.
     pub fn storage(&self) -> poot_target::BufferStorage {
         self.storage
     }
@@ -228,6 +251,7 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// A binding that reads `reads` in param order and writes `write`.
     pub fn new(reads: Vec<Source>, write: Sink) -> Self {
         Self { reads, write }
     }
@@ -238,10 +262,12 @@ impl Binding {
         Self::new((0..arity).map(Source::Operand).collect(), Sink::Out)
     }
 
+    /// The data reads, in param order.
     pub fn reads(&self) -> &[Source] {
         &self.reads
     }
 
+    /// The one write.
     pub fn write(&self) -> Sink {
         self.write
     }
@@ -250,50 +276,93 @@ impl Binding {
 /// Why a set of dispatches is not a [`DispatchPlan`]. Each variant names the dispatch by its index.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DispatchPlanError {
+    /// The plan has no dispatch.
     #[error("a dispatch plan needs at least one dispatch")]
     Empty,
+    /// A dispatch binds a different number of params than its kernel has.
     #[error(
         "dispatch {dispatch} binds {bound} params (reads, metadata, write) but its kernel has {params}"
     )]
     ParamCount {
+        /// Index of the dispatch within the plan.
         dispatch: usize,
+        /// Params the binding supplies (reads, metadata, write).
         bound: usize,
+        /// Params the kernel declares.
         params: usize,
     },
+    /// A scratch is declared in a raw-byte lane, which the executors cannot allocate as an intermediate.
     #[error(
         "scratch {scratch:?} is declared in a raw-byte lane, which the executors cannot allocate as an intermediate"
     )]
-    ScratchRawBytes { scratch: ScratchId },
+    ScratchRawBytes {
+        /// The scratch.
+        scratch: ScratchId,
+    },
+    /// A scratch declares no elements.
     #[error("scratch {scratch:?} declares no elements")]
-    ScratchEmpty { scratch: ScratchId },
+    ScratchEmpty {
+        /// The scratch.
+        scratch: ScratchId,
+    },
+    /// A dispatch binds a scratch the plan does not declare.
     #[error("dispatch {dispatch} binds scratch {scratch:?}, but the plan declares {declared}")]
     ScratchOutOfRange {
+        /// Index of the dispatch within the plan.
         dispatch: usize,
+        /// The scratch it binds.
         scratch: ScratchId,
+        /// Number of scratch buffers the plan declares.
         declared: usize,
     },
+    /// A dispatch reads a scratch no earlier dispatch wrote.
     #[error("dispatch {dispatch} reads scratch {scratch:?} that no earlier dispatch wrote")]
-    ScratchReadBeforeWrite { dispatch: usize, scratch: ScratchId },
+    ScratchReadBeforeWrite {
+        /// Index of the dispatch within the plan.
+        dispatch: usize,
+        /// The scratch it reads.
+        scratch: ScratchId,
+    },
+    /// A dispatch reads and writes the same scratch.
     #[error("dispatch {dispatch} both reads and writes scratch {scratch:?}")]
-    ScratchReadAndWritten { dispatch: usize, scratch: ScratchId },
+    ScratchReadAndWritten {
+        /// Index of the dispatch within the plan.
+        dispatch: usize,
+        /// The scratch it reads and writes.
+        scratch: ScratchId,
+    },
+    /// A param's mutability disagrees with whether its binding writes it.
     #[error(
         "dispatch {dispatch} param {param} is {}, but its binding {}",
         if *kernel_mutable { "mutable" } else { "read-only" },
         if *kernel_mutable { "reads it" } else { "writes it" }
     )]
     MutabilityMismatch {
+        /// Index of the dispatch within the plan.
         dispatch: usize,
+        /// Index of the param among the dispatch's params.
         param: usize,
+        /// Whether the kernel declares the param mutable.
         kernel_mutable: bool,
     },
+    /// A dispatch reads an operand after an earlier dispatch wrote the output.
     #[error(
         "dispatch {dispatch} reads operand {operand} after an earlier dispatch wrote the output; a plan with scratch reads every operand before its first output write"
     )]
-    OperandReadAfterOutWrite { dispatch: usize, operand: usize },
+    OperandReadAfterOutWrite {
+        /// Index of the dispatch within the plan.
+        dispatch: usize,
+        /// Index of the operand.
+        operand: usize,
+    },
+    /// A dispatch reads an operand the equation does not have.
     #[error("dispatch {dispatch} reads operand {operand} but the equation has {operands}")]
     OperandOutOfRange {
+        /// Index of the dispatch within the plan.
         dispatch: usize,
+        /// The operand index it reads.
         operand: usize,
+        /// Number of value operands the equation has.
         operands: usize,
     },
 }
@@ -482,8 +551,11 @@ pub enum Plan {
     /// consumer can read a strided input (`is_strided_capable`); see `compute_views`. Reshape still lowers
     /// to `Plan::Alias`; this variant is for Transpose/Slice/Broadcast.
     View {
+        /// The value whose buffer the view reads.
         src: ValueId,
+        /// Element strides of the view, per output axis.
         strides: Vec<usize>,
+        /// Element offset of the view's first element in the source buffer.
         offset: usize,
     },
 }
@@ -492,8 +564,11 @@ pub enum Plan {
 /// cannot run the plan it was given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlanKind {
+    /// The equation plans as one or more kernel dispatches.
     Dispatches,
+    /// The output aliases an input's buffer.
     Alias,
+    /// The output is a strided view of a source buffer.
     View,
 }
 
@@ -523,6 +598,7 @@ impl Plan {
         }
     }
 
+    /// Which variant of [`Plan`] this is, without its payload.
     pub fn kind(&self) -> PlanKind {
         match self {
             Plan::Dispatches(_) => PlanKind::Dispatches,

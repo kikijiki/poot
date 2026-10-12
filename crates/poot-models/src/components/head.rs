@@ -17,18 +17,21 @@ pub enum HeadKind {
     Hidden,
 }
 
+/// The `[vocab, width]` output projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Head {
     weight: Weight,
 }
 
 impl Head {
+    /// Resolves the model's head tensor and checks it is `[vocab, width]`.
     pub fn new(map: &WeightMap, vocab: usize, width: usize) -> Result<Self, WeightError> {
         Ok(Self {
             weight: Weight::new(map, WeightId::model(WeightRole::Head), &[vocab, width])?,
         })
     }
 
+    /// The head weight, for a caller that reads its storage rather than tracing the projection.
     pub fn weight(&self) -> &Weight {
         &self.weight
     }

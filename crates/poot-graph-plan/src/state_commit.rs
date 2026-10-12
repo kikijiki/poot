@@ -14,7 +14,9 @@ use crate::{Plan, PlanError, value_ids};
 /// One explicit state assignment that the backend must commit after graph equations finish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateCommitCopy {
+    /// The graph input the state is read from.
     pub state_input: ValueId,
+    /// The graph value that holds the state's next contents.
     pub state_output: ValueId,
 }
 
@@ -22,7 +24,9 @@ pub struct StateCommitCopy {
 /// `copies` retains graph value ids so each backend can resolve the final buffers after aliases are bound.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateCommitPlan {
+    /// Materializing equation output mapped to the state input it overwrites in place.
     pub inplace: HashMap<ValueId, ValueId>,
+    /// Assignments that cannot be made in place and are copied after the equations finish.
     pub copies: Vec<StateCommitCopy>,
     /// The primary output aliases a destination that explicit commit overwrites and must be snapshotted.
     pub preserve_output: bool,

@@ -169,7 +169,12 @@ pub enum AttentionKeys {
     Single(Traced),
     /// `head [B,Hkv,Lk,D - s]` and `shared [B,1,Lk,s]`: the key is `concat(head, broadcast(shared))` on the
     /// last axis (MLA's `k_nope` and rotary `k_pe`).
-    Split { head: Traced, shared: Traced },
+    Split {
+        /// The per-head part of the key.
+        head: Traced,
+        /// The part shared across heads, broadcast over `Hkv` and concatenated after `head`.
+        shared: Traced,
+    },
 }
 
 /// What [`attention_live`] returns: the attention output and the length-validation witness the caller

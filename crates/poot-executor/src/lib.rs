@@ -151,8 +151,11 @@ impl SyncReads {
 /// in the table's planned lane, never a re-encode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowFill {
+    /// Index into the sync point's [`SyncPoint::site`] weights naming the table to fill.
     pub table: usize,
+    /// First pool row written; the experts land in consecutive rows from here.
     pub first_row: usize,
+    /// Global expert indices to make resident, in row order.
     pub experts: Vec<usize>,
 }
 
@@ -160,6 +163,7 @@ pub struct RowFill {
 /// it writes any byte, then writes the rows and then the map.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SyncWrites {
+    /// Pool rows to fill, applied before `map`.
     pub rows: Vec<RowFill>,
     /// The site's whole `[E]` map: the pool row of each global expert, `-1` when absent.
     pub map: Option<Vec<i32>>,
@@ -169,6 +173,7 @@ pub struct SyncWrites {
 /// called once per point, after the stage before it completed, with the values the point reads. Its
 /// writes land before the next stage is replayed.
 pub trait HostSync {
+    /// Decide residency at `point` from `reads`, returning the row fills and map to write before the next stage replays.
     fn sync(&mut self, point: &SyncPoint, reads: &SyncReads) -> Result<SyncWrites, ExecError>;
 }
 
@@ -186,7 +191,9 @@ impl HostSync for NoSync {
 /// SC-012/SC-006).
 #[derive(Clone, Copy, Debug)]
 pub struct StepValue<'a> {
+    /// The caller-declared shape, checked against the slot's aval.
     pub shape: &'a [usize],
+    /// The typed bytes, checked for element count and dtype lane.
     pub view: HostView<'a>,
 }
 
@@ -197,10 +204,12 @@ pub struct StepInputs<'a> {
 }
 
 impl<'a> StepInputs<'a> {
+    /// An empty input set; bind each slot of the entry's schema with [`StepInputs::push`].
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Bind `view`, declared as `shape`, to the slot `key`.
     pub fn push(&mut self, key: SlotKey, shape: &'a [usize], view: HostView<'a>) {
         self.values.push((key, StepValue { shape, view }));
     }
@@ -217,7 +226,9 @@ impl<'a> StepInputs<'a> {
 /// construction.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExecutorStats {
+    /// Recordings made, summed over every executable.
     pub recordings: u64,
+    /// Replays submitted, summed over every executable.
     pub replays: u64,
     /// Recordings and replays of each stage of each entry (a stage records once and replays every
     /// step).
@@ -225,6 +236,7 @@ pub struct ExecutorStats {
     /// Bytes the host wrote to device buffers while binding steps: the caller's inputs and hosted
     /// embeds. A link between stages is a shared device buffer, never a host write.
     pub host_write_bytes: u64,
+    /// The device's own live bytes by role ([`Device::memory`]).
     pub memory: Vec<(BufferRole, MemoryCounterSnapshot)>,
     /// Bytes read from the weight store and encoded for upload, summed over every weight upload. A
     /// [`WeightUpload::SizeOnly`] device reads none.
@@ -237,6 +249,7 @@ pub struct ExecutorStats {
     pub sync_read_bytes: u64,
     /// Pool rows refilled and the stored bytes they wrote, summed over every sync.
     pub pool_rows_written: u64,
+    /// Stored bytes those rows wrote.
     pub pool_refill_bytes: u64,
     /// Kernels this engine took through the kernel cache (a disk load or a codegen run), once per distinct
     /// kernel. An engine built over [`SharedKernels`] does not count a kernel another engine of that
@@ -251,10 +264,15 @@ pub struct ExecutorStats {
 /// One stage's recording and replay counts (see [`ExecutorStats::stages`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StageStats {
+    /// The executable the stage belongs to.
     pub exe: ExecutableId,
+    /// The entry program the stage belongs to.
     pub entry: EntryId,
+    /// The stage within the entry's staged program.
     pub stage: StageId,
+    /// Times this stage was recorded.
     pub recordings: u64,
+    /// Times this stage was replayed.
     pub replays: u64,
 }
 
@@ -262,6 +280,7 @@ pub struct StageStats {
 /// against its own plan and budget, so a total over devices is never a substitute.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceMemory {
+    /// The device the figures describe.
     pub device: DeviceId,
     /// What the device's runtime could still allocate ([`Device::free_memory_bytes`]); `None` where it
     /// cannot say.
@@ -272,6 +291,7 @@ pub struct DeviceMemory {
 
 /// The object-safe executor the driver holds as `Box<dyn Executor>`.
 pub trait Executor {
+    /// The devices and targets this executor drives.
     fn target_set(&self) -> TargetSet;
     /// Each device's own free memory and live bytes by role, in rank order. The default is the one
     /// device of a single-device executor, from [`Executor::free_memory_bytes`] and its counters; an
@@ -322,10 +342,13 @@ pub trait Executor {
         inputs: &StepInputs<'_>,
         sync: &mut dyn HostSync,
     ) -> Result<StepOutputs<'_>, ExecError>;
+    /// Zero the carried state of `exe` selected by `scope`.
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError>;
     /// Drops `entry`'s recording and arena; the executable's shared state is untouched (R-546-3).
     fn remove_entry(&mut self, exe: ExecutableId, entry: EntryId) -> Result<(), ExecError>;
+    /// Counters aggregated over every executable this executor holds.
     fn stats(&self) -> ExecutorStats;
+    /// Drop `exe`, its entries and its state; its [`ExecutableId`] is invalid afterwards.
     fn unload(&mut self, exe: ExecutableId) -> Result<(), ExecError>;
 }
 
@@ -396,6 +419,7 @@ impl<'a> StepOutputs<'a> {
         Ok(HostTensor::from_le_bytes(dtype, shape, &bytes)?)
     }
 
+    /// The device time of the step that produced these outputs.
     pub fn device_time(&self) -> DeviceTime {
         self.time.clone()
     }

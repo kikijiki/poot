@@ -32,6 +32,7 @@ impl NormParams {
         Self::of(NormKind::Rms, eps)
     }
 
+    /// A norm of `kind` with epsilon `eps`; a non-finite or non-positive `eps` is a typed [`ParamError`].
     pub fn of(kind: NormKind, eps: f32) -> Result<Self, ParamError> {
         if !(eps.is_finite() && eps > 0.0) {
             return Err(ParamError::new("eps", ConfigReason::NotFinitePositive));
@@ -39,10 +40,12 @@ impl NormParams {
         Ok(Self { eps, kind })
     }
 
+    /// The epsilon added under the root.
     pub fn eps(self) -> f32 {
         self.eps
     }
 
+    /// Which normalization this is.
     pub fn kind(self) -> NormKind {
         self.kind
     }
@@ -51,7 +54,9 @@ impl NormParams {
 /// A norm's scale and, for a LayerNorm that has one, its bias (both `[width]`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormWeights {
+    /// The scale `[width]`, applied as stored or as `1 + scale` per [`NormKind`].
     pub scale: Weight,
+    /// The bias `[width]`, for a LayerNorm that has one.
     pub bias: Option<Weight>,
 }
 

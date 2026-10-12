@@ -41,6 +41,7 @@ use crate::names::{ExpertNames, MoeNames, SharedNames, map_moe_layer};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
 
+/// Qwen3-Next's [`FamilyKey`].
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen3next");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
@@ -116,6 +117,8 @@ pub struct Qwen3NextParams {
 }
 
 impl Qwen3NextParams {
+    /// Reads the typed config from an HF `config.json` or a GGUF index (`qwen35moe`); a field the family
+    /// cannot serve is a typed [`ModelError::Config`] naming it.
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read_with_inter(&fields, &SPEC, EXPERT_INTER)?;
@@ -547,6 +550,8 @@ struct Layer {
     moe: MoeWeights,
 }
 
+/// The built Qwen3-Next model: config, name-resolved weights and the hybrid GDN / full-attention
+/// layer stack with its routed experts. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct Qwen3Next {
     params: Qwen3NextParams,

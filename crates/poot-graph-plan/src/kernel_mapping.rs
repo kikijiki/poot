@@ -301,16 +301,25 @@ pub enum AieLimitRefusal {
     /// The artifact was linked for another target than the limits describe.
     #[error("the artifact was linked for {artifact:?}, the limits describe {caps:?}")]
     Target {
+        /// The target the artifact was linked for.
         artifact: AieTargetId,
+        /// The target the limits describe.
         caps: AieTargetId,
     },
     /// The target's limit is not measured, so the artifact's need of it cannot be admitted.
     #[error("the target's {limit} is not measured")]
-    Unknown { limit: &'static str },
+    Unknown {
+        /// Name of the unmeasured limit.
+        limit: &'static str,
+    },
+    /// The artifact needs more of a measured resource than the target offers.
     #[error("{resource}: needed {needed}, the target offers {available}")]
     Exceeded {
+        /// Name of the resource that is over its limit.
         resource: &'static str,
+        /// What the artifact needs, in the resource's own unit.
         needed: u64,
+        /// What the target offers, in the same unit.
         available: u64,
     },
 }
@@ -411,8 +420,10 @@ pub fn aie_shape_abi(choice: &KernelChoice) -> Result<AieShapeAbi, AieAbiRefusal
 /// Why a plan has no AIE shape ABI.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum AieAbiRefusal {
+    /// The plan's kernel choice is not an AIE sequential schedule, so it has no shape ABI.
     #[error("the plan's choice is not an AIE sequential schedule")]
     NotSequential,
+    /// The linked artifact's ABI could not be derived.
     #[error(transparent)]
     Abi(#[from] AieArtifactError),
 }

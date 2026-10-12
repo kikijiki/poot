@@ -74,6 +74,7 @@ impl PleWitness {
 pub struct PleSpec {
     /// The model's hidden width, and how many parallel streams the residual carries.
     pub width: usize,
+    /// How many parallel streams the residual carries.
     pub streams: usize,
     /// The width of the concatenated per-head n-gram embedding.
     pub embed_dim: usize,
@@ -89,9 +90,11 @@ pub struct PleSpec {
     pub vocab_divisible_by: usize,
     /// The seed of the hash multipliers.
     pub seed: u64,
+    /// The vocabulary size the n-gram hash reduces token ids against.
     pub vocab: usize,
     /// The end-of-sequence id: the fill of the hash's out-of-segment context.
     pub eos: u32,
+    /// The epsilon of the layer's norms.
     pub eps: f32,
     /// This layer's position among the model's PLE layers: it salts the head primes and the
     /// multipliers, so two PLE layers hash differently.
@@ -121,6 +124,8 @@ pub struct PleParams {
 }
 
 impl PleParams {
+    /// Checks the spec (zero counts, an n-gram order outside 2 or 3, an invalid epsilon) and derives
+    /// the hash tables from it; a violation is a typed [`ParamError`] naming the field.
     pub fn new(spec: PleSpec) -> Result<Self, ParamError> {
         let zero = |field| ParamError::new(field, ConfigReason::Zero);
         for (field, value) in [
@@ -208,6 +213,7 @@ impl PleParams {
         self.tables.padded_rows
     }
 
+    /// The spec these parameters were checked from.
     pub fn spec(&self) -> &PleSpec {
         &self.spec
     }

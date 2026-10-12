@@ -55,6 +55,9 @@ pub struct PtxRecording {
     exec: PtxGraphExec,
 }
 
+/// The NVIDIA/PTX implementation of [`poot_executor::Device`]: owns one [`PtxContext`] (one CUDA
+/// context on one GPU), records a step as a CUDA graph and replays it. A multi-device program holds
+/// one per GPU.
 pub struct PtxDevice {
     ctx: PtxContext,
     /// This device's own kernel cache for [`Self::copy`]'s generated copy kernel, entirely separate
@@ -68,6 +71,7 @@ pub struct PtxDevice {
 }
 
 impl PtxDevice {
+    /// A device on the default GPU, with no device timing; see [`Self::open`] for a chosen ordinal.
     pub fn new() -> Result<Self, PtxGpuError> {
         Ok(Self::with_context(PtxContext::new()?))
     }

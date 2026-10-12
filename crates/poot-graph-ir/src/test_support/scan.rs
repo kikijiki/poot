@@ -14,21 +14,30 @@ use crate::{Builder, Graph, ScanAttrs, ScanFamily, Slot, StateRole, TensorType, 
 /// `D` for the delta rule (ignored: it equals `width`) and `N` for SSD.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanFixture {
+    /// Which recurrence the scan runs.
     pub family: ScanFamily,
+    /// Number of heads.
     pub heads: usize,
+    /// Sequence length in tokens.
     pub len: usize,
+    /// Head width: `D` for the delta rule, `P` for SSD.
     pub width: usize,
+    /// Rows of the carried state: `D` for the delta rule, `N` for SSD.
     pub state_rows: usize,
+    /// Chunk length of the chunked definition under test.
     pub chunk: usize,
 }
 
 /// The operands of one scan call, flattened row-major, in the family's operand order (the state last).
 #[derive(Clone, Debug)]
 pub struct ScanInputs {
+    /// One flattened row-major buffer per operand, in the family's operand order.
     pub operands: Vec<Vec<f32>>,
 }
 
+/// A built scan fixture graph: the one `OpKind::Scan` equation with `y` as the graph output and `s_out` as the carried state.
 pub struct ScanGraph {
+    /// The finished graph.
     pub graph: Graph,
     /// The operand ids in the family's operand order; the last is the carried state.
     pub operands: Vec<ValueId>,
@@ -42,6 +51,7 @@ enum Inputs {
 }
 
 impl ScanFixture {
+    /// A delta-rule scan of `heads` heads over `len` tokens with head width `d`, processed in chunks of `chunk`.
     pub fn delta_rule(heads: usize, len: usize, d: usize, chunk: usize) -> Self {
         Self {
             family: ScanFamily::DeltaRule,
@@ -53,6 +63,7 @@ impl ScanFixture {
         }
     }
 
+    /// An SSD scan of `heads` heads over `len` tokens with head width `p` and state size `n`, processed in chunks of `chunk`.
     pub fn ssd(heads: usize, len: usize, p: usize, n: usize, chunk: usize) -> Self {
         Self {
             family: ScanFamily::Ssd,

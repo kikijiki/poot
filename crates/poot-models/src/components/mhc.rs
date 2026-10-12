@@ -59,6 +59,7 @@ impl MhcParams {
         })
     }
 
+    /// The number of parallel residual streams.
     pub fn streams(&self) -> usize {
         self.streams
     }
@@ -244,11 +245,15 @@ pub struct MhcSiteWeights {
 /// Which of a layer's two sites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MhcSite {
+    /// The site around the layer's token mixer.
     Attn,
+    /// The site around the layer's feed-forward block.
     Ffn,
 }
 
 impl MhcSiteWeights {
+    /// Resolves layer `layer`'s projection, base and scale for `site` from `map` and checks each shape
+    /// against `p` and the model `width`; a missing or mis-shaped tensor is a typed [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,
@@ -293,6 +298,8 @@ pub struct MhcHeadWeights {
 }
 
 impl MhcHeadWeights {
+    /// Resolves the model's closing projection, base and scale from `map` and checks each shape
+    /// against `p` and the model `width`; a missing or mis-shaped tensor is a typed [`WeightError`].
     pub fn new(map: &WeightMap, width: usize, p: &MhcParams) -> Result<Self, WeightError> {
         let w =
             |role, shape: &[usize]| Weight::new(map, WeightId::model(WeightRole::Mhc(role)), shape);

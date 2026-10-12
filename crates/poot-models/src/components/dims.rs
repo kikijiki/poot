@@ -20,11 +20,14 @@ use crate::registry::RawConfig;
 /// One config fact: its HF `config.json` key and its GGUF metadata key (`""` when GGUF has none).
 #[derive(Clone, Copy, Debug)]
 pub struct Field {
+    /// The HF `config.json` key.
     pub hf: &'static str,
+    /// The GGUF metadata key, or `""` when GGUF has none.
     pub gguf: &'static str,
 }
 
 impl Field {
+    /// A fact both formats carry, under its HF key and its GGUF key.
     pub const fn new(hf: &'static str, gguf: &'static str) -> Self {
         Self { hf, gguf }
     }
@@ -43,18 +46,22 @@ pub struct Fields<'a> {
 }
 
 impl<'a> Fields<'a> {
+    /// A reader over `raw` that reports every error under `family`.
     pub fn new(raw: &'a RawConfig<'a>, family: FamilyKey) -> Self {
         Self { raw, family }
     }
 
+    /// The family errors are reported under.
     pub fn family(&self) -> FamilyKey {
         self.family
     }
 
+    /// The raw config being read.
     pub fn raw(&self) -> &'a RawConfig<'a> {
         self.raw
     }
 
+    /// A [`ModelError::Config`] for `field` under this reader's family.
     pub fn error(&self, field: &'static str, reason: ConfigReason) -> ModelError {
         ModelError::Config {
             family: self.family,
@@ -146,10 +153,12 @@ impl<'a> Fields<'a> {
         Ok(n)
     }
 
+    /// A float; absent is `default`, a non-number `WrongType`.
     pub fn float(&self, field: Field, default: f32) -> Result<f32, ModelError> {
         Ok(self.opt_f32(field)?.unwrap_or(default))
     }
 
+    /// A boolean; absent is `default`, a non-boolean `WrongType`.
     pub fn flag(&self, field: Field, default: bool) -> Result<bool, ModelError> {
         Ok(self.opt_bool(field)?.unwrap_or(default))
     }
@@ -190,6 +199,7 @@ impl<'a> Fields<'a> {
         Ok(eos)
     }
 
+    /// The beginning-of-sequence token id, when the config names one.
     pub fn bos(&self) -> Result<Option<u32>, ModelError> {
         self.token(Field::new("bos_token_id", "tokenizer.ggml.bos_token_id"))
     }
@@ -221,19 +231,33 @@ impl<'a> Fields<'a> {
 /// The GGUF keys of a decoder family under its architecture prefix (`"qwen2"`, `"llama"`).
 #[derive(Clone, Copy, Debug)]
 pub struct DenseKeys {
+    /// GGUF key of the hidden width.
     pub width: &'static str,
+    /// GGUF key of the feed-forward width.
     pub inter: &'static str,
+    /// GGUF key of the layer count.
     pub layers: &'static str,
+    /// GGUF key of the attention head count.
     pub heads: &'static str,
+    /// GGUF key of the key/value head count.
     pub kv_heads: &'static str,
+    /// GGUF key of the per-head width (`key_length`).
     pub head_dim: &'static str,
+    /// GGUF key of the RMSNorm epsilon.
     pub eps: &'static str,
+    /// GGUF key of the context length.
     pub max_positions: &'static str,
+    /// GGUF key of the RoPE base frequency.
     pub theta: &'static str,
+    /// GGUF key of the RoPE scaling type (`none`, `linear`, `yarn`).
     pub rope_scaling_type: &'static str,
+    /// GGUF key of the RoPE scaling factor.
     pub rope_scaling_factor: &'static str,
+    /// GGUF key of the context length the checkpoint was trained at before scaling.
     pub rope_scaling_original: &'static str,
+    /// GGUF key of the YaRN fast-ramp beta.
     pub yarn_beta_fast: &'static str,
+    /// GGUF key of the YaRN slow-ramp beta.
     pub yarn_beta_slow: &'static str,
 }
 
@@ -264,11 +288,17 @@ pub(crate) use dense_keys;
 /// checkpoint may omit (HF's config-class defaults, llama.cpp's GGUF defaults).
 #[derive(Clone, Copy, Debug)]
 pub struct DenseSpec {
+    /// The family errors are reported under.
     pub family: FamilyKey,
+    /// The family's GGUF keys.
     pub gguf: DenseKeys,
+    /// The RoPE base an HF config that names none gets.
     pub hf_theta: f32,
+    /// The RoPE base a GGUF that names none gets.
     pub gguf_theta: f32,
+    /// The RMSNorm epsilon a checkpoint that names none gets.
     pub eps: f32,
+    /// The end-of-sequence id a checkpoint that declares none gets, if the family has one.
     pub eos: Option<u32>,
 }
 
@@ -276,24 +306,39 @@ pub struct DenseSpec {
 /// unless the config states `head_dim`, `kv_heads` dividing `heads`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DenseDims {
+    /// Vocabulary size (embedding rows).
     pub vocab: usize,
+    /// Hidden width.
     pub width: usize,
+    /// Feed-forward width (per expert for a routed family).
     pub inter: usize,
+    /// Decoder layer count.
     pub layers: usize,
+    /// Query head count.
     pub heads: usize,
+    /// Key/value head count; divides `heads`.
     pub kv_heads: usize,
+    /// Per-head width.
     pub head_dim: usize,
+    /// RMSNorm epsilon.
     pub eps: f32,
+    /// Context length in positions; fits `u32`.
     pub max_positions: usize,
+    /// RoPE base frequency.
     pub theta: f32,
+    /// RoPE scaling flavor (plain when the checkpoint declares none).
     pub flavor: RopeFlavor<'static>,
     /// The checkpoint must carry its own head: HF `tie_word_embeddings: false`.
     pub head_required: bool,
+    /// End-of-sequence token ids.
     pub eos: BTreeSet<u32>,
+    /// Beginning-of-sequence token id, when the checkpoint names one.
     pub bos: Option<u32>,
 }
 
 impl DenseDims {
+    /// Reads the dimensions from `fields` under `spec`; a missing, zero or inconsistent value is a
+    /// typed [`ModelError::Config`] naming the key the checkpoint used.
     pub fn read(fields: &Fields<'_>, spec: &DenseSpec) -> Result<Self, ModelError> {
         Self::read_with_inter(
             fields,

@@ -390,44 +390,82 @@ unsafe fn resolve_fn<T: Copy>(lib: &LibHandle, name: &CStr) -> Option<T> {
 /// All HSA entry points used, resolved once at [`Hsa::load`]. Each dispatch is one load plus an
 /// indirect call, with no `dlsym` per call.
 pub struct Funcs {
+    /// `hsa_init`: initialises the HSA runtime (reference-counted).
     pub hsa_init: HsaInit,
+    /// `hsa_shut_down`: releases one `hsa_init` reference.
     pub hsa_shut_down: HsaShutDown,
+    /// `hsa_iterate_agents`: enumerates the CPU and GPU agents through a callback.
     pub hsa_iterate_agents: HsaIterateAgents,
+    /// `hsa_agent_get_info`: reads an `HSA_AGENT_INFO_*` attribute of an agent.
     pub hsa_agent_get_info: HsaAgentGetInfo,
+    /// `hsa_isa_get_info_alt`: reads an `HSA_ISA_INFO_*` attribute of an ISA.
     pub hsa_isa_get_info_alt: HsaIsaGetInfoAlt,
+    /// `hsa_system_get_info`: reads an `HSA_SYSTEM_INFO_*` attribute (timestamp frequency).
     pub hsa_system_get_info: HsaSystemGetInfo,
+    /// `hsa_amd_profiling_set_profiler_enabled`: turns dispatch timestamping on or off for a queue.
     pub hsa_amd_profiling_set_profiler_enabled: HsaAmdProfilingSetProfilerEnabled,
+    /// `hsa_amd_profiling_get_dispatch_time`: reads a completed dispatch's start and end ticks from its signal.
     pub hsa_amd_profiling_get_dispatch_time: HsaAmdProfilingGetDispatchTime,
+    /// `hsa_signal_create`: creates a completion signal with an initial value.
     pub hsa_signal_create: HsaSignalCreate,
+    /// `hsa_signal_destroy`: destroys a signal.
     pub hsa_signal_destroy: HsaSignalDestroy,
+    /// `hsa_signal_store_release`: stores a signal value with release ordering.
     pub hsa_signal_store_release: HsaSignalStoreRelease,
+    /// `hsa_signal_load_relaxed`: loads a signal value with relaxed ordering.
     pub hsa_signal_load_relaxed: HsaSignalLoadRelaxed,
+    /// `hsa_signal_wait_scacquire`: waits on a signal condition with system-scope acquire ordering, bounded by a timeout.
     pub hsa_signal_wait_scacquire: HsaSignalWaitScacquire,
+    /// `hsa_queue_create`: creates an AQL queue on an agent.
     pub hsa_queue_create: HsaQueueCreate,
+    /// `hsa_queue_destroy`: destroys a queue.
     pub hsa_queue_destroy: HsaQueueDestroy,
+    /// `hsa_queue_load_read_index_scacquire`: loads the queue read index with acquire ordering.
     pub hsa_queue_load_read_index_scacquire: HsaQueueLoadReadIndexScacquire,
+    /// `hsa_queue_load_read_index_relaxed`: loads the queue read index with relaxed ordering.
     pub hsa_queue_load_read_index_relaxed: HsaQueueLoadReadIndexRelaxed,
+    /// `hsa_queue_add_write_index_relaxed`: reserves packet slots by advancing the write index, relaxed.
     pub hsa_queue_add_write_index_relaxed: HsaQueueAddWriteIndexRelaxed,
+    /// `hsa_queue_add_write_index_acq_rel`: reserves packet slots by advancing the write index, acquire-release.
     pub hsa_queue_add_write_index_acq_rel: HsaQueueAddWriteIndexAcqRel,
+    /// `hsa_queue_store_write_index_relaxed`: stores the queue write index, relaxed.
     pub hsa_queue_store_write_index_relaxed: HsaQueueStoreWriteIndexRelaxed,
+    /// `hsa_amd_agent_iterate_memory_pools`: enumerates an agent's memory pools through a callback.
     pub hsa_amd_agent_iterate_memory_pools: HsaAmdAgentIterateMemoryPools,
+    /// `hsa_amd_memory_pool_get_info`: reads an `HSA_AMD_MEMORY_POOL_INFO_*` attribute of a pool.
     pub hsa_amd_memory_pool_get_info: HsaAmdMemoryPoolGetInfo,
+    /// `hsa_amd_agent_memory_pool_get_info`: reads an agent-to-pool attribute (link hops, link info).
     pub hsa_amd_agent_memory_pool_get_info: HsaAmdAgentMemoryPoolGetInfo,
+    /// `hsa_amd_memory_pool_allocate`: allocates memory from a pool.
     pub hsa_amd_memory_pool_allocate: HsaAmdMemoryPoolAllocate,
+    /// `hsa_amd_memory_pool_free`: frees pool memory.
     pub hsa_amd_memory_pool_free: HsaAmdMemoryPoolFree,
+    /// `hsa_amd_memory_async_copy`: starts an asynchronous (DMA) copy between agents, completing on a signal.
     pub hsa_amd_memory_async_copy: HsaAmdMemoryAsyncCopy,
+    /// `hsa_amd_memory_fill`: fills device memory with a 32-bit pattern.
     pub hsa_amd_memory_fill: HsaAmdMemoryFill,
+    /// `hsa_amd_memory_lock`: pins host memory and maps it for agent access.
     pub hsa_amd_memory_lock: HsaAmdMemoryLock,
+    /// `hsa_amd_memory_unlock`: unpins memory pinned by `hsa_amd_memory_lock`.
     pub hsa_amd_memory_unlock: HsaAmdMemoryUnlock,
     // code-object + executable + symbols + signals
+    /// `hsa_code_object_reader_create_from_memory`: creates a code-object reader over an in-memory image.
     pub hsa_code_object_reader_create_from_memory: HsaCodeObjectReaderCreateFromMemory,
+    /// `hsa_code_object_reader_destroy`: destroys a code-object reader.
     pub hsa_code_object_reader_destroy: HsaCodeObjectReaderDestroy,
+    /// `hsa_executable_create_alt`: creates an executable with a profile and rounding mode.
     pub hsa_executable_create_alt: HsaExecutableCreateAlt,
+    /// `hsa_executable_load_agent_code_object`: loads a code object into an executable for one agent.
     pub hsa_executable_load_agent_code_object: HsaExecutableLoadAgentCodeObject,
+    /// `hsa_executable_freeze`: freezes an executable so its symbols can be queried.
     pub hsa_executable_freeze: HsaExecutableFreeze,
+    /// `hsa_executable_destroy`: destroys an executable.
     pub hsa_executable_destroy: HsaExecutableDestroy,
+    /// `hsa_executable_get_symbol_by_name`: looks a symbol up by name for an agent.
     pub hsa_executable_get_symbol_by_name: HsaExecutableGetSymbolByName,
+    /// `hsa_executable_symbol_get_info`: reads an `HSA_EXECUTABLE_SYMBOL_INFO_*` attribute of a symbol.
     pub hsa_executable_symbol_get_info: HsaExecutableSymbolGetInfo,
+    /// `hsa_executable_iterate_symbols`: enumerates an executable's symbols through a callback.
     pub hsa_executable_iterate_symbols: HsaExecutableIterateSymbols,
 }
 
@@ -495,6 +533,7 @@ impl Funcs {
 
 // `pub`, not `pub(crate)`: reachable through the public `RocmError::MissingSymbol` variant, so it
 // must be as visible as `RocmError`.
+/// An HSA symbol `dlsym` could not resolve in the loaded runtime library; carries the symbol name.
 #[derive(Debug)]
 pub struct MissingSymbol(pub &'static str);
 

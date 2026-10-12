@@ -21,15 +21,24 @@ const BLOCK_VALUES: usize = 32;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EncodeError {
     /// `format` has no reference encoder (a dense, planar or K-quant/IQ format).
-    UnsupportedFormat { format: WeightFormat },
+    UnsupportedFormat {
+        /// The format that was requested.
+        format: WeightFormat,
+    },
     /// `values` does not hold exactly `rows * cols` values.
     ValueCount {
+        /// Requested row count (`out`).
         rows: usize,
+        /// Requested row length (`K`).
         cols: usize,
+        /// Number of values that were supplied.
         actual: usize,
     },
     /// A NaN or infinite input value: block formats store finite values only.
-    NonFiniteValue { index: usize },
+    NonFiniteValue {
+        /// Position in the input of the first value that is NaN or infinite.
+        index: usize,
+    },
     /// The `[rows, cols]` shape is not a valid packed weight of the format.
     Weight(PackedWeightError),
 }

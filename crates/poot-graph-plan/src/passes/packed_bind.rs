@@ -40,7 +40,10 @@ pub enum PackedLayout {
     /// The constant is an expert stack `[experts, out, K]` in checkpoint order: `experts` packed weights of
     /// one descriptor, read by an indexed matmul through `Transpose([0, 2, 1])`. One expert is a one-expert
     /// stack, `[1, out, K]`.
-    ExpertRows { experts: usize },
+    ExpertRows {
+        /// Number of experts in the stack.
+        experts: usize,
+    },
 }
 
 /// The packed storage of one dense constant a tracer declares.
@@ -51,6 +54,7 @@ pub struct PackedConst {
     pub linear_id: String,
     /// The owner's descriptor (for a stack, each expert's: one shape and format for the whole stack).
     pub weight: poot_quant::PackedWeight,
+    /// How the stored decode is oriented relative to the constant the graph reads.
     pub layout: PackedLayout,
 }
 
@@ -76,8 +80,12 @@ pub struct WeightFormats {
 /// A packed-storage record that contradicts another.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WeightFormatsError {
+    /// The constant is recorded packed more than once.
     #[error("constant {name} is recorded packed twice")]
-    Duplicate { name: String },
+    Duplicate {
+        /// Name of the constant.
+        name: String,
+    },
 }
 
 impl WeightFormats {
@@ -121,14 +129,17 @@ impl WeightFormats {
         Ok(())
     }
 
+    /// The packed record of constant `name`, if one is recorded.
     pub fn get(&self, name: &str) -> Option<&PackedConst> {
         self.consts.get(name)
     }
 
+    /// Whether no constant is recorded packed.
     pub fn is_empty(&self) -> bool {
         self.consts.is_empty()
     }
 
+    /// Every recorded constant with its packed record, in name order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &PackedConst)> {
         self.consts
             .iter()
@@ -139,32 +150,47 @@ impl WeightFormats {
 /// Why a traced graph cannot take a model's packed storage.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PackedBindError {
+    /// The graph declares the packed constant with a dtype other than F32.
     #[error(
         "constant {name} is stored packed ({format:?}) but the graph declares it {dtype:?}; a packed \
          weight decodes to F32"
     )]
     Dtype {
+        /// Name of the constant.
         name: String,
+        /// The format the constant is stored in.
         format: poot_quant::format::WeightFormat,
+        /// The dtype the graph declares.
         dtype: DType,
     },
+    /// The graph declares the packed constant with a shape that is not the stored one.
     #[error(
         "constant {name} is stored packed as {expected:?} ({format:?}) but the graph declares {declared:?}"
     )]
     Shape {
+        /// Name of the constant.
         name: String,
+        /// The format the constant is stored in.
         format: poot_quant::format::WeightFormat,
+        /// The shape the graph declares.
         declared: Vec<usize>,
+        /// The shape the stored format decodes to.
         expected: Vec<usize>,
     },
+    /// A packed expert stack is read in a way that cannot become one indexed packed contraction.
     #[error("constant {name} is a packed expert stack, but {reason}")]
     ExpertStack {
+        /// Name of the constant.
         name: String,
+        /// Why the use is refused.
         reason: ExpertStackRefusal,
     },
+    /// The rewrite produced a graph the edit check refused.
     #[error("binding packed constant {name} produced an invalid graph: {source}")]
     Graph {
+        /// Name of the constant.
         name: String,
+        /// The editor's refusal.
         #[source]
         source: Box<EditError>,
     },
@@ -173,16 +199,33 @@ pub enum PackedBindError {
 /// Why a packed expert stack's use cannot become one indexed packed contraction.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ExpertStackRefusal {
+    /// The stack has other than one consumer.
     #[error(
         "it has {consumers} consumers; a stack is read by exactly one transposed indexed matmul"
     )]
-    Consumers { consumers: usize },
+    Consumers {
+        /// Number of consumers it has.
+        consumers: usize,
+    },
+    /// The stack's consumer is not a `Transpose([0, 2, 1])`.
     #[error("its consumer is `{op}`, not Transpose([0, 2, 1]) into an indexed matmul")]
-    NotTransposed { op: String },
+    NotTransposed {
+        /// Name of the consumer's op.
+        op: String,
+    },
+    /// The transposed stack has other than one consumer.
     #[error("its transpose has {consumers} consumers; the table is read by one indexed matmul")]
-    TransposeConsumers { consumers: usize },
+    TransposeConsumers {
+        /// Number of consumers the transpose has.
+        consumers: usize,
+    },
+    /// The transpose does not feed an indexed matmul.
     #[error("its transpose feeds `{op}`, not an indexed matmul")]
-    NotIndexed { op: String },
+    NotIndexed {
+        /// Name of the op it feeds.
+        op: String,
+    },
+    /// The stack or its transpose is a graph output, validation output or carried state.
     #[error("it, or its transpose, is a graph output, validation output or carried state")]
     Escapes,
 }

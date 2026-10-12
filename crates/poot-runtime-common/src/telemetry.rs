@@ -49,7 +49,9 @@ pub struct CallCounts {
 /// Transfer direction for byte/operation counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransferDirection {
+    /// An upload.
     HostToDevice,
+    /// A readback.
     DeviceToHost,
 }
 
@@ -58,6 +60,7 @@ pub enum TransferDirection {
 pub struct TransferCounts {
     /// Distinct transfer operations (one `copy`/`write`/`read` call, independent of its byte size).
     pub operations: u64,
+    /// Total bytes moved.
     pub bytes: u64,
 }
 
@@ -82,10 +85,12 @@ pub struct ExecutionCounters {
 }
 
 impl ExecutionCounters {
+    /// The submit and wait counts recorded for `purpose` (zero if none).
     pub fn calls(&self, purpose: CallPurpose) -> CallCounts {
         self.calls.get(&purpose).copied().unwrap_or_default()
     }
 
+    /// The transfer counts recorded for `purpose` and `direction` (zero if none).
     pub fn transfer(&self, purpose: CallPurpose, direction: TransferDirection) -> TransferCounts {
         self.transfers
             .get(&(purpose, direction))
@@ -123,6 +128,7 @@ impl ExecutionCounters {
         self.calls.values().map(|c| c.submits).sum()
     }
 
+    /// Blocking waits summed over every purpose.
     #[cfg(any(test, feature = "test-support"))]
     pub fn total_waits(&self) -> u64 {
         self.calls.values().map(|c| c.waits).sum()
@@ -140,16 +146,27 @@ pub enum Coverage {
     Complete,
     /// Sampling was configured on: only `sampled` of `total` eligible records were ever collected,
     /// by policy (not because of a resource bound).
-    Unsampled { sampled: u64, total: u64 },
+    Unsampled {
+        /// Records collected.
+        sampled: u64,
+        /// Eligible records.
+        total: u64,
+    },
     /// A record/byte/in-flight-resource bound was hit: `dropped` records beyond `retained` were
     /// evicted or never retained, not sampled out by policy.
-    Truncated { retained: u64, dropped: u64 },
+    Truncated {
+        /// Records kept.
+        retained: u64,
+        /// Records evicted or never retained.
+        dropped: u64,
+    },
     /// No detail was collected for this window at all (counters-only mode, or the device/backend
     /// cannot measure it).
     Unavailable,
 }
 
 impl Coverage {
+    /// Whether the window is a complete per-dispatch account.
     pub fn is_complete(self) -> bool {
         matches!(self, Coverage::Complete)
     }

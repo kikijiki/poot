@@ -13,6 +13,7 @@ use crate::{Fixture, const_fixture};
 /// One `ArgTopK` case: `rank [rows, e] -> ids [rows, k]`, `ids[l, r]` the index `i` with
 /// `rank[l, i] == r`.
 pub struct ArgTopKCase {
+    /// The `ArgTopK` program and the rank input of each step.
     pub fixture: Fixture,
     /// The `[rows, k]` ids `fixture` must produce, row-major.
     pub expected: Vec<i32>,
@@ -73,7 +74,9 @@ fn arg_top_k_case(name: &'static str, rows: usize, e: usize, k: usize) -> ArgTop
 
 /// One tied-routing case: the router scores of `rows` tokens over `e` experts, routed top-`k`.
 pub struct TieCase {
+    /// The routing program over the tied router scores.
     pub fixture: Fixture,
+    /// Number of experts routed per token.
     pub k: usize,
     /// The `[rows, k]` expert ids a stable descending order selects, row-major: tied experts in
     /// ascending index order.

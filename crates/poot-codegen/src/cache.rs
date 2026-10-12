@@ -433,6 +433,7 @@ fn entry_digest(key: &KernelKey, artifact: &[u8]) -> u64 {
 pub struct ArtifactTooLarge {
     /// The artifact's length, or the first length past the limit when the source was read bounded.
     pub bytes: u64,
+    /// The byte limit the artifact was checked against.
     pub limit: u64,
 }
 
@@ -475,7 +476,9 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, Arti
 /// A kernel artifact and whether this call had to build it (a compile, as opposed to a verified hit).
 #[derive(Debug)]
 pub struct Artifact {
+    /// The artifact's contents: SPIR-V, PTX or an HSACO image, as the target emits.
     pub bytes: Vec<u8>,
+    /// `true` when this call ran the compiler, `false` when a verified cache entry was served.
     pub built: bool,
 }
 
@@ -510,6 +513,7 @@ impl KernelCache {
         Self { dir, epoch, target }
     }
 
+    /// The directory the cache's entries and scratch files live in.
     pub fn dir(&self) -> &Path {
         &self.dir
     }

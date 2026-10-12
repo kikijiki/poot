@@ -267,6 +267,9 @@ pub struct PooledDsaWeights {
 }
 
 impl PooledDsaWeights {
+    /// Resolves the layer's latent-attention, indexer and pooling tensors from `map` and checks each
+    /// shape against `p` and the model `width`; a missing or mis-shaped tensor is a typed
+    /// [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,

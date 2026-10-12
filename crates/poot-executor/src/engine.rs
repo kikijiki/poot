@@ -48,6 +48,9 @@ use crate::{
     StageStats, StateScope, StepInputs, StepOutputs, SyncReads, SyncWrites, TableIdentity,
 };
 
+/// The one executor over every backend: it owns one [`Device`], the executables loaded onto it, and
+/// the kernel, residency and timing state they share. It implements the object-safe [`Executor`]
+/// contract; everything backend-specific stays behind `D`.
 pub struct Engine<D: Device> {
     // Field order is drop order: executables (and their recordings and buffers) drop before the
     // device, and the device drops before nothing (it is last).
@@ -587,6 +590,7 @@ impl<D: Device> Engine<D> {
         Ok(self)
     }
 
+    /// The device this engine drives, for a caller that needs the backend's own handle or counters.
     pub fn device(&self) -> &D {
         &self.device
     }

@@ -284,5 +284,12 @@ fn decode_benches(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, decode_benches, prefill_benches);
-criterion_main!(benches);
+/// `criterion_group!` emits its group as an undocumented `pub fn` that cannot take a doc comment, so
+/// it lives in a private module where `missing_docs` does not reach it.
+mod group {
+    use super::{criterion_group, decode_benches, prefill_benches};
+
+    criterion_group!(benches, decode_benches, prefill_benches);
+}
+
+criterion_main!(group::benches);

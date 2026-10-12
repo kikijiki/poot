@@ -19,6 +19,7 @@ pub struct DispatchDeviceTime {
     /// walked in, including when sampling leaves gaps: a partial sample keeps its real index rather
     /// than shifting to stay contiguous, Card 552 scope).
     pub index: usize,
+    /// This dispatch's own `[start, end)` device duration.
     pub duration: Duration,
 }
 
@@ -44,8 +45,10 @@ pub struct MeasuredDeviceTime {
 /// reported only once the device actually attempted to measure this step.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum DeviceTime {
+    /// The device reported no timestamps for the step: not a zero duration.
     #[default]
     Unknown,
+    /// The device attempted to measure the step; each measure inside may still be absent.
     Measured(MeasuredDeviceTime),
 }
 
@@ -57,7 +60,9 @@ pub enum DeviceTime {
 /// arena slot's buffer (Card 547b) is sized to its largest occupant, so a smaller value sharing it
 /// would otherwise let a kernel read or write past its own operand.
 pub struct Arg<'a, D: Device + ?Sized> {
+    /// The device buffer the kernel reads or writes.
     pub buffer: &'a D::Buffer,
+    /// Native device-element count of this value (lane-encoded words for a packed source), not the buffer's capacity.
     pub elems: u32,
 }
 
@@ -70,7 +75,9 @@ pub enum LaunchKind {
     /// A thread grid: `threads` is the plan's total thread grid (Card 525); the device divides it by
     /// `workgroup`.
     Grid {
+        /// Total thread grid per axis, in threads (not workgroups).
         threads: [u32; 3],
+        /// Threads per workgroup per axis; `threads` is divided by it.
         workgroup: [u32; 3],
     },
     /// One finite run of a loaded AIE kernel's instruction stream over the dispatch's host buffer objects.
@@ -114,10 +121,15 @@ impl AieInvocation {
 /// instruction stream). `work` is the planner-owned watchdog weight: the device uses it to decide when a
 /// long run of dispatches must flush to a new submit before the driver's TDR fires.
 pub struct Dispatch<'a, D: Device + ?Sized> {
+    /// The loaded kernel to run.
     pub kernel: &'a D::Kernel,
+    /// Read operands in the kernel's parameter order, including any metadata buffer.
     pub inputs: &'a [Arg<'a, D>],
+    /// The written operand.
     pub output: Arg<'a, D>,
+    /// How the kernel launches: a thread grid or an AIE instruction stream.
     pub launch: LaunchKind,
+    /// Planner-owned watchdog weight, used to flush a long run of dispatches to a new submit before the driver's TDR fires.
     pub work: u64,
 }
 
@@ -145,8 +157,10 @@ pub trait Device {
     type Kernel: 'static;
     /// A recorded step: replayable without re-walking the program.
     type Recording: 'static;
+    /// The device's failure type; the engine wraps it into [`crate::DeviceError`].
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// The compile target this device executes.
     fn target(&self) -> Target;
 
     /// What this device does with weight bytes. Every executing device takes them; only a recording-only
@@ -190,6 +204,7 @@ pub trait Device {
     /// directly, outside the contract (`poot-llm/tests/wgpu_executor_contract.rs`'s SC-015 fault probe
     /// does exactly that).
     fn begin(&mut self, submission: Submission) -> Result<(), Self::Error>;
+    /// Record one kernel launch into the open recording, ordered after every earlier call of this step.
     fn dispatch(&mut self, dispatch: Dispatch<'_, Self>) -> Result<(), Self::Error>;
     /// Copy all of `src` into `dst` (same byte length), ordered after every earlier call of this step.
     fn copy(&mut self, src: &Self::Buffer, dst: &Self::Buffer) -> Result<(), Self::Error>;
@@ -233,6 +248,7 @@ pub trait Device {
     fn read(&mut self, src: &Self::Buffer, out: &mut [u8]) -> Result<(), Self::Error>;
     /// Wait for the submitted work and raise any staged kernel-assert fault (Card 531c).
     fn synchronize(&mut self) -> Result<(), Self::Error>;
+    /// The device time of the last synchronized step; [`DeviceTime::Unknown`] when the device cannot measure.
     fn device_time(&self) -> DeviceTime;
 
     /// Abort a scoped transaction after an unsuccessful `begin`/`dispatch`/`copy`/`finish`: publish no
@@ -305,8 +321,10 @@ pub trait Collectives: Device {
     /// A cross-device ordering point: recorded by the device that created it, waited for by another.
     type Event: 'static;
 
+    /// The native objects this device created and the replays it issued, counted by its runtime.
     fn native_counters(&self) -> NativeCounters;
 
+    /// The conservative byte bound this device states for each native object a recording session creates.
     fn support_bound(&self) -> SupportBound;
 
     /// Admit the directed route from this device to `peer`, outside any recording. A route that would

@@ -27,8 +27,11 @@ use std::time::Duration;
 /// overlaps host wait time must never show up as a smaller `other`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct HostTiming {
+    /// Time spent encoding and submitting work for the step.
     pub encode: Duration,
+    /// Time spent blocked on the device for the step.
     pub wait: Duration,
+    /// Total wall time of the step; the other two fields partition it.
     pub wall: Duration,
 }
 
@@ -79,10 +82,13 @@ pub struct MeasuredDevice {
     pub device_span: Option<Duration>,
 }
 
+/// Whether a step's device time was measured at all: `Unknown` is never a zero-duration measurement.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum DeviceCoverage {
+    /// The device reported no timestamps for this step (or the backend cannot).
     #[default]
     Unknown,
+    /// At least one of the two device-time measures in [`MeasuredDevice`] is available.
     Measured(MeasuredDevice),
 }
 
@@ -102,7 +108,9 @@ pub struct StepTiming {
     pub replay: u64,
     /// Which device/backend produced this record (a debug label, e.g. `"SpirvVulkan"`).
     pub device_label: String,
+    /// Host wall time partitioned into encode, wait and wall.
     pub host: HostTiming,
+    /// Device-time coverage of this step.
     pub device: DeviceCoverage,
     /// Per-dispatch detail, in dispatch order; empty unless the collecting `TimingOptions` requested
     /// detailed per-dispatch retention for this step.
@@ -119,8 +127,11 @@ pub struct StepTiming {
 /// ring has since dropped.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EntryCounters {
+    /// Number of steps recorded for the entry since the collector was created.
     pub steps: u64,
+    /// Number of per-dispatch records those steps carried (zero in counters-only mode).
     pub dispatches: u64,
+    /// Sum of every step's host timing for the entry.
     pub host: HostTiming,
     /// Sum of every step's `sum_of_dispatch_durations`, only across steps where it was measured;
     /// `None` if this entry has never had a measured step (Card 552 SC-004: never defaults to zero).
@@ -279,6 +290,7 @@ impl TimingSnapshot {
         }
     }
 
+    /// The exact, never-evicted counters of `entry`; all zero for an entry the collector has not seen.
     pub fn cumulative(&self, entry: u64) -> EntryCounters {
         entry_counters_for(&self.cumulative, entry)
     }
@@ -313,6 +325,7 @@ impl Default for TimingSnapshot {
 /// One `kind_name` bucket's aggregated detail within a window.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OpBucket {
+    /// Number of dispatches of this kind in the window.
     pub dispatch_count: u64,
     /// `None` only if not a single contributing dispatch had a measured device duration.
     pub device: Option<Duration>,
@@ -338,13 +351,18 @@ pub struct DeviceWindow {
 /// implied.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowReport {
+    /// The entry identities the window was built over, as passed to [`Report::window`].
     pub entries: Vec<u64>,
+    /// Exact number of steps in the window, independent of how much detail is retained.
     pub steps: u64,
+    /// Exact host-time sums for the window.
     pub host: HostTiming,
+    /// Device-time totals for the window, with their own coverage.
     pub device: DeviceWindow,
     /// Coverage of `buckets`/per-dispatch detail specifically (the cumulative totals above are
     /// always exact regardless of this value).
     pub detail: Coverage,
+    /// Per-`kind_name` aggregation of the retained per-dispatch records, keyed by the op's semantic report key.
     pub buckets: BTreeMap<&'static str, OpBucket>,
     /// Card 552: true when any retained step in this window changed submission grouping
     /// to collect its detail. A caller must not present this window's per-token device-time
@@ -439,6 +457,7 @@ impl WindowReport {
     }
 }
 
+/// Namespace type for windowing over a [`TimingSnapshot`]: it has no state, only [`Report::window`].
 pub struct Report;
 
 impl Report {

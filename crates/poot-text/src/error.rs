@@ -28,11 +28,16 @@ pub enum ChatTemplateError {
     #[error(
         "`{name}` is not a jinja template, and poot has no built-in chat templates by name: pass the template text, or a template file"
     )]
-    UnknownBuiltin { name: String },
+    UnknownBuiltin {
+        /// The value that was given as a template name.
+        name: String,
+    },
     /// The template file could not be read.
     #[error("chat template file {path}: {source}")]
     Unreadable {
+        /// The template file that could not be read.
         path: std::path::PathBuf,
+        /// The underlying I/O failure.
         #[source]
         source: std::io::Error,
     },

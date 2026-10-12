@@ -25,7 +25,9 @@ use poot_quant::PackedWeight;
 /// operand values to `operands` and evaluates `graph`.
 #[derive(Debug, Clone)]
 pub struct Decomposition {
+    /// The primitive graph; its single output is the composite's result.
     pub graph: Graph,
+    /// The constants of `graph` standing for the composite's equation operands, one per operand in operand order.
     pub operands: Vec<ValueId>,
 }
 

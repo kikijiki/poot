@@ -294,10 +294,12 @@ impl ModelHandle {
         Ok(Self { model, store, text })
     }
 
+    /// The model's configuration.
     pub fn config(&self) -> &ModelConfig {
         self.model.config()
     }
 
+    /// The tokenizer and chat template built from the checkpoint.
     pub fn text(&self) -> &TextCodec {
         &self.text
     }

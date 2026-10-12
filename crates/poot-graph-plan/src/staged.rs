@@ -60,8 +60,11 @@ pub struct SyncId(pub u32);
 /// that stage exported), may write the resident slots of `site`, and only then the next stage runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncPoint {
+    /// The sync's identity within the step.
     pub id: SyncId,
+    /// The stage whose completion triggers the sync.
     pub after: StageId,
+    /// The exported boundary values the host reads at the sync.
     pub reads: Vec<BoundaryId>,
     /// The routed selection whose experts the host makes resident here.
     pub site: PoolSite,
@@ -74,6 +77,7 @@ pub struct TargetSet {
 }
 
 impl TargetSet {
+    /// A target set of exactly one device.
     pub fn single(device: DeviceId, target: Target) -> Self {
         Self {
             devices: vec![(device, target)],
@@ -91,6 +95,7 @@ impl TargetSet {
         Ok(Self { devices })
     }
 
+    /// Every device with its target, in the order the set was built.
     pub fn devices(&self) -> &[(DeviceId, Target)] {
         &self.devices
     }
@@ -99,10 +104,12 @@ impl TargetSet {
 /// Where routed experts live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpertPlacement {
+    /// Every routed expert table stays resident; nothing is paged.
     AllResident,
     /// Every routed expert table is paged through a pool of `slots_per_layer` rows per selection:
     /// the experts each step needs are made resident at a [`SyncPoint`] before they are read.
     Pooled {
+        /// Rows of the pool for each routed selection.
         slots_per_layer: usize,
     },
 }
@@ -115,15 +122,20 @@ pub enum DevicePlacement {
     /// A layer pipeline: stage `i` runs on `devices[i]`, cut after each of `after_layers`. Stages on
     /// distinct devices exchange their boundary values over communication rows.
     Pipeline {
+        /// Layers after which the graph is cut.
         after_layers: Vec<usize>,
+        /// The device of each stage, in stage order.
         devices: Vec<DeviceId>,
     },
     /// Tensor parallelism: every device is one rank of the group and runs every layer over its share
     /// of the weights, which `rule` assigns by the roles `weights` names. Ranks exchange what a
     /// collective carries over communication rows.
     Tensor {
+        /// How weights are divided over the ranks.
         rule: ShardRule,
+        /// The device of each rank, in rank order.
         devices: Vec<DeviceId>,
+        /// The weight map the rule assigns shares from, by role.
         weights: Arc<WeightMap>,
     },
 }
@@ -131,7 +143,9 @@ pub enum DevicePlacement {
 /// How a graph is cut into stages. Stated by the caller; no `Default` (ADR-0104).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Partition {
+    /// Where routed experts live.
     pub experts: ExpertPlacement,
+    /// How the stages are placed on devices.
     pub devices: DevicePlacement,
 }
 
@@ -139,9 +153,13 @@ pub struct Partition {
 /// travels in the producer's buffer: the consumer binds it with no copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
+    /// The boundary value's name: its id in the uncut graph.
     pub id: BoundaryId,
+    /// The value's dtype and shape.
     pub aval: TensorType,
+    /// The stage that exports the value.
     pub from: StageId,
+    /// The stage that reads it.
     pub to: StageId,
 }
 
@@ -150,9 +168,13 @@ pub struct Link {
 /// moves `bytes` of the exported value's planned storage into the consumer device's own buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transfer {
+    /// The boundary value's name: its id in the uncut graph.
     pub id: BoundaryId,
+    /// The value's dtype and shape.
     pub aval: TensorType,
+    /// The stage that exports the value.
     pub from: StageId,
+    /// The stage that reads it, on another device.
     pub to: StageId,
     /// The row of [`StagedProgram::comm`] that carries it.
     pub row: PlanNodeId,
@@ -171,7 +193,9 @@ pub struct Transfer {
 /// ([`WeightMap::rank_view`] builds that view); every other weight is read whole.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorParallel {
+    /// The device of each rank, in rank order.
     pub devices: Vec<DeviceId>,
+    /// Each weight the rank views cut, with the axis of its mapped logical shape that is divided.
     pub shares: Vec<(WeightId, usize)>,
 }
 
@@ -202,6 +226,7 @@ impl StagedProgram {
         }
     }
 
+    /// Every stage with its device and program, in stage order.
     pub fn stages(&self) -> impl Iterator<Item = (StageId, DeviceId, &Program)> {
         self.stages.iter().map(|(s, d, p)| (*s, *d, p))
     }
@@ -277,69 +302,105 @@ impl StagedProgram {
 #[cfg(feature = "test-support")]
 #[derive(Debug)]
 pub struct StagedParts {
+    /// Every stage with its device and program.
     pub stages: Vec<(StageId, DeviceId, Program)>,
+    /// The links between stages on one device.
     pub links: Vec<Link>,
+    /// The host sync points of a step.
     pub sync_points: Vec<SyncPoint>,
 }
 
 /// The representation of one side of a link: what [`StagedCompileError::LinkSchema`] compares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundarySchema {
+    /// The boundary value's dtype and shape.
     pub aval: TensorType,
+    /// The storage the stage compiled the value into.
     pub storage: BufferStorage,
 }
 
 /// Why [`compile_staged`] produced no staged program.
 #[derive(Debug, thiserror::Error)]
 pub enum StagedCompileError {
+    /// The LoRA rewrite or a stage's own compile failed.
     #[error(transparent)]
     Compile(#[from] CompileError),
+    /// The expert pool pass refused the graph.
     #[error(transparent)]
     Pool(#[from] PoolError),
+    /// The sharding pass refused the graph.
     #[error(transparent)]
     Shard(#[from] ShardError),
+    /// Cutting the graph into stages failed.
     #[error(transparent)]
     Split(Box<StageSplitError>),
+    /// The partition names a device the target set does not contain.
     #[error("partition names device {0:?}, which the target set does not contain")]
     UnknownDevice(DeviceId),
+    /// A pipeline partition names a device count that is not its stage count.
     #[error(
         "a pipeline cut after {cuts} layer(s) has {stages} stage(s) but names {devices} device(s)"
     )]
     DeviceCount {
+        /// Number of layer cuts.
         cuts: usize,
+        /// Number of stages those cuts make.
         stages: usize,
+        /// Number of devices the partition names.
         devices: usize,
     },
+    /// The partition is a combination the compiler does not support.
     #[error("unsupported partition: {0:?}")]
     Unsupported(Unsupported),
     /// The target set cannot carry a stage cut: the value the refused equation produces crosses devices
     /// and no link of the target set performs the operation. Raised before any stage is compiled.
     #[error(transparent)]
     Refused(Box<Refusal>),
+    /// Planning the communication rows between devices failed.
     #[error(transparent)]
     Communication(#[from] StagePlanError),
+    /// Placing the weight owners across devices failed.
     #[error(transparent)]
     Placement(#[from] PlacementError),
+    /// A device's footprint does not fit its budget.
     #[error(transparent)]
     Capacity(AccountingError),
+    /// The device reported no memory budget.
     #[error("device {0:?} has no measured memory budget, so its footprint cannot be admitted")]
     UnknownBudget(DeviceId),
     /// A boundary hop is bound by neither a link nor a communication row.
     #[error("boundary {id:?} read by stage {stage:?} is bound by neither a link nor a row")]
-    UnboundBoundary { id: BoundaryId, stage: StageId },
+    UnboundBoundary {
+        /// The boundary value's name.
+        id: BoundaryId,
+        /// The stage that reads it.
+        stage: StageId,
+    },
+    /// A boundary's two sides compiled to different representations.
     #[error(
         "boundary {id:?} is compiled to a different representation by stage {from:?} than stage \
          {to:?} reads: {producer:?} vs {consumer:?}"
     )]
     LinkSchema {
+        /// The boundary value's name.
         id: BoundaryId,
+        /// The stage that exports it.
         from: StageId,
+        /// The stage that reads it.
         to: StageId,
+        /// The producer's representation.
         producer: Box<BoundarySchema>,
+        /// The consumer's representation.
         consumer: Box<BoundarySchema>,
     },
+    /// A stage's compiled program no longer holds a boundary value.
     #[error("stage {stage:?} lost the program value of boundary {id:?} in compilation")]
-    BoundaryLost { id: BoundaryId, stage: StageId },
+    BoundaryLost {
+        /// The boundary value's name.
+        id: BoundaryId,
+        /// The stage that lost it.
+        stage: StageId,
+    },
     /// A boundary is, after planning, a view of a carried-state input the stage commits: a later
     /// stage would read the committed value, not the one the uncut graph reads.
     #[error(
@@ -347,8 +408,11 @@ pub enum StagedCompileError {
          stage commits"
     )]
     BoundaryAliasesState {
+        /// The boundary value's name.
         id: BoundaryId,
+        /// The stage that exports it.
         stage: StageId,
+        /// The carried-state input the boundary views.
         state: poot_graph_ir::ValueId,
     },
 }

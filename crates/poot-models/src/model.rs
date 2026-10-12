@@ -16,10 +16,12 @@ use poot_text::ChatFormat;
 pub struct FamilyKey(&'static str);
 
 impl FamilyKey {
+    /// A key displaying as `name`.
     pub const fn new(name: &'static str) -> Self {
         Self(name)
     }
 
+    /// The display name.
     pub const fn as_str(self) -> &'static str {
         self.0
     }
@@ -34,16 +36,20 @@ impl fmt::Display for FamilyKey {
 /// What a traced step returns per row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelOutput {
+    /// A vocabulary logit vector per position ([`Phase::Prefill`], [`Phase::Decode`], [`Phase::Mtp`]).
     Logits {
+        /// The vocabulary size: the logit vector's width.
         vocab: usize,
     },
     /// The final hidden state of every position, `width` wide ([`Phase::Encode`]).
     Hidden {
+        /// The model's hidden width.
         width: usize,
     },
     /// One `labels`-wide score vector per row, read at the first position: a cross-encoder's
     /// classifier ([`Phase::Encode`]).
     Scores {
+        /// The classifier's label count.
         labels: usize,
     },
 }
@@ -51,8 +57,12 @@ pub enum ModelOutput {
 /// The family-neutral facts the driver needs about a model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelConfig {
+    /// The family's key.
     pub family: FamilyKey,
+    /// Vocabulary size: the embedding table's rows and, for a logits model, the output width.
     pub vocab: usize,
+    /// The longest context the checkpoint declares, in positions; also the largest cache capacity a
+    /// step may ask for.
     pub max_positions: usize,
     /// Every token id that ends generation: the union of `config.json`'s and
     /// `generation_config.json`'s `eos_token_id` for an HF checkpoint, read by
@@ -64,6 +74,7 @@ pub struct ModelConfig {
     /// mandatory BOS (Gemma 2 and 3). A family without one leaves its prompts as the tokenizer encodes
     /// them.
     pub prompt_bos: Option<u32>,
+    /// What a traced step returns per row.
     pub output: ModelOutput,
     /// Semantic alignment of a prefill step: a prefill's token count is a multiple of it (1 except
     /// for compressed attention). It never limits how large a step may be.
@@ -73,9 +84,13 @@ pub struct ModelConfig {
     pub chat: ChatFormat,
 }
 
+/// Which program of a model a step traces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Phase {
+    /// New prompt tokens continuing from the absolute positions already cached; the step writes its
+    /// KV (and recurrent state) and returns logits per [`LogitRows`].
     Prefill,
+    /// One new token per row against the cache: the same body as prefill with `tokens = 1`.
     Decode,
     /// A prefill whose step inputs are the prompt's tokens with caller-computed embedding rows
     /// scattered over some positions (`StepInput::TokensWithEmbeds`): a multimodal prompt's image
@@ -110,7 +125,9 @@ pub enum KvLayout {
     /// one row per sequence the pool serves (`seqs`), which a step's rows address through the
     /// `state_read` and `state_write` index inputs (`Step::recurrent`).
     Paged {
+        /// Slots in each layer's KV pool.
         pool_slots: NonZeroUsize,
+        /// Sequences the recurrent state pool serves: one state row each.
         seqs: NonZeroUsize,
     },
 }
@@ -118,7 +135,9 @@ pub enum KvLayout {
 /// Which positions of a step produce logits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LogitRows {
+    /// Only each row's last position, the one a sampler reads.
     Last,
+    /// Every position of the step (a speculative verify, a perplexity pass).
     All,
 }
 
@@ -126,10 +145,15 @@ pub enum LogitRows {
 /// cache of `capacity` positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StepShape {
+    /// Sequences in the step.
     pub rows: NonZeroUsize,
+    /// New tokens each sequence contributes.
     pub tokens: NonZeroUsize,
+    /// Cache positions each sequence can hold; an upper bound on its position after the step.
     pub capacity: NonZeroUsize,
+    /// How the KV cache is laid out.
     pub kv: KvLayout,
+    /// Which positions produce logits.
     pub logits: LogitRows,
     /// The hidden-state carry the step also writes, when its caller asks for one.
     pub hidden: Option<HiddenCarry>,
@@ -142,13 +166,17 @@ pub struct StepShape {
 /// larger), so every program of an executable declares the same aval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HiddenCarry {
+    /// The carry's position extent.
     pub positions: NonZeroUsize,
 }
 
 /// One model behind the driver: its config, its weights and its tracer.
 pub trait Model: Send + Sync + fmt::Debug {
+    /// The family-neutral facts the driver needs.
     fn config(&self) -> &ModelConfig;
 
+    /// The model's weight map: every typed weight id the tracer declares, with its handle (shape and
+    /// format).
     fn weights(&self) -> &WeightMap;
 
     /// The body of one traced step: trace `phase` at `shape` into `b`, a builder already charging
@@ -199,26 +227,36 @@ impl dyn Model + '_ {
 /// Why a config field cannot configure a family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigReason {
+    /// The field is absent and has no default.
     Missing,
+    /// The field is present with a value of another JSON/GGUF type.
     WrongType,
+    /// A count that must be positive is zero.
     Zero,
+    /// The value is not a multiple of `by`.
     NotDivisible {
+        /// The divisor the value must be a multiple of.
         by: usize,
     },
     /// Above the largest value the field admits.
     Exceeds {
+        /// The largest value the field admits.
         max: usize,
     },
     /// A float that must be finite and positive (an epsilon, a RoPE base or factor).
     NotFinitePositive,
+    /// A value this family does not serve (a variant the checkpoint selects, an option it sets).
     Unsupported,
     /// A per-layer list or string whose length is not the layer count.
     Length {
+        /// The layer count the list or string had to match.
         expected: usize,
     },
     /// A value that must equal a width the rest of the config fixes (a head width, a rotary width).
     Mismatch {
+        /// The width the rest of the config fixes.
         expected: usize,
+        /// The width the field carries.
         found: usize,
     },
     /// A sum or product that does not fit `usize`.
@@ -228,13 +266,19 @@ pub enum ConfigReason {
 /// Why a family refuses a step shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeReason {
+    /// A [`Phase::Decode`] step of other than one token.
     DecodeTokens,
+    /// The step's cache capacity exceeds the checkpoint's `max_positions`.
     CapacityAboveMax {
+        /// The checkpoint's `max_positions`.
         max: usize,
     },
     /// A step of more new tokens than its cache holds.
     TokensAboveCapacity,
+    /// A prefill whose token count is not a multiple of the family's prefill granule
+    /// ([`ModelConfig::prefill_granule`]).
     Granule {
+        /// The granule the token count had to be a multiple of.
         granule: usize,
     },
     /// A carried state value whose leading axis is not its row axis: its leading axis has `leading`
@@ -242,18 +286,23 @@ pub enum ShapeReason {
     /// state's one row per sequence the pool serves). A paged KV pool is the one exception, and only as
     /// the pooled `Positional` cache on axis 0.
     StateRowAxis {
+        /// The leading axis the value has.
         leading: usize,
+        /// The row count it should have.
         rows: usize,
     },
     /// A routed step whose `rows * tokens * top_k` expert rows exceed what the expert chain
     /// indexes exactly.
     RoutedRows {
+        /// The most expert rows the chain indexes exactly.
         max: usize,
     },
     /// A hidden-state carry with fewer positions than the step has tokens: the step would write
     /// positions the carry does not have.
     HiddenCarryNarrow {
+        /// The carry's position extent.
         positions: usize,
+        /// The step's token count.
         tokens: usize,
     },
     /// A step that asked for a hidden-state carry and whose program carries none: the family does
@@ -265,7 +314,9 @@ pub enum ShapeReason {
     /// A hidden-state carry of `found` positions where the step asked for `expected`: the readers of
     /// the carry would bind another buffer than the writers.
     HiddenCarryPositions {
+        /// The extent the carry has.
         found: usize,
+        /// The extent the step asked for.
         expected: usize,
     },
     /// A hidden-state carry written by a step that asked for none.
@@ -278,43 +329,65 @@ pub enum ShapeReason {
 /// A model could not be built from its config and weights.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
+    /// A config field the family cannot serve.
     #[error("{family}: config field {field}: {reason:?}")]
     Config {
+        /// The family that refused.
         family: FamilyKey,
+        /// The key the checkpoint used.
         field: &'static str,
+        /// Why the value was refused.
         reason: ConfigReason,
     },
+    /// A weight could not be mapped from the checkpoint store.
     #[error("{family}: {source}")]
     Weight {
+        /// The family that refused.
         family: FamilyKey,
+        /// The map builder's refusal.
         source: WeightMapError,
     },
+    /// A mapped weight has another shape than the family needs.
     #[error("{family}: weight {id} has shape {found:?}, expected {expected:?}")]
     WeightShape {
+        /// The family that refused.
         family: FamilyKey,
+        /// The weight asked for.
         id: WeightId,
+        /// The shape the family needs.
         expected: Vec<usize>,
+        /// The shape the checkpoint stores.
         found: Vec<usize>,
     },
+    /// A mapped weight is stored in a format the family cannot read.
     #[error("{family}: weight {id} is stored as {format:?}, which this family cannot trace")]
     WeightFormat {
+        /// The family that refused.
         family: FamilyKey,
+        /// The weight asked for.
         id: WeightId,
+        /// The format the checkpoint stores it in.
         format: HandleFormat,
     },
     /// A guarantee the family's wiring relies on does not hold.
     #[error("{family}: {source}")]
     Wiring {
+        /// The family whose wiring is defective.
         family: FamilyKey,
+        /// The guarantee that does not hold.
         source: WiringError,
     },
     /// A stored value the family cannot read: element `index` (row-major) of the index table `id`
     /// is `value`, outside the I32 range its tracer indexes with.
     #[error("{family}: weight {id} element {index} is {value}, outside the I32 range")]
     WeightValue {
+        /// The family that refused.
         family: FamilyKey,
+        /// The index table.
         id: WeightId,
+        /// The row-major element that is out of range.
         index: usize,
+        /// The stored value.
         value: i64,
     },
 }
@@ -347,7 +420,10 @@ pub enum WiringError {
     RopeNotSectioned,
     /// A layer index whose validation id does not fit its id space.
     #[error("layer index {layer} has no validation id")]
-    LayerIndexOutOfRange { layer: usize },
+    LayerIndexOutOfRange {
+        /// The layer index.
+        layer: usize,
+    },
     /// A group-limited router over the sqrt-softplus arm, which the limit refuses at construction.
     #[error("a group limit is not defined for the sqrt-softplus router")]
     GroupLimitOnSqrtSoftplus,
@@ -356,13 +432,21 @@ pub enum WiringError {
     ScoresOfSoftmaxRouter,
     /// A hidden-state carry written with rows of another extent than the carry holds.
     #[error("carried hidden rows are {found} wide or long where the carry holds {expected}")]
-    HiddenCarryRows { expected: usize, found: usize },
+    HiddenCarryRows {
+        /// The extent the carry holds.
+        expected: usize,
+        /// The extent the rows have.
+        found: usize,
+    },
     /// A sandwich layer built without its two post norms.
     #[error("a sandwich layer needs its post norms")]
     SandwichWithoutPostNorms,
     /// A vision step whose patch count does not fit the rotary table's `u32` positions.
     #[error("{patches} patches do not fit a rotary table of u32 positions")]
-    PatchesOutOfRange { patches: usize },
+    PatchesOutOfRange {
+        /// The step's patch count.
+        patches: usize,
+    },
     /// A sharded embedding table with no shard to read.
     #[error("a sharded table has no shards")]
     TableWithoutShards,
@@ -381,10 +465,15 @@ impl WiringError {
 /// A family-config parameter block that only some layer kinds need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParamBlock {
+    /// The dense feed-forward block's parameters.
     Dense,
+    /// The routed mixture-of-experts block's parameters.
     Moe,
+    /// Kimi Delta Attention's parameters.
     Kda,
+    /// DeepSeek sparse attention's parameters.
     Dsa,
+    /// The sparse-attention indexer's parameters.
     Indexer,
     /// The low-rank query projection of an MLA attention.
     LowRankQuery,
@@ -421,11 +510,21 @@ pub(crate) fn last_axis(operation: &'static str, shape: &[usize]) -> Result<usiz
 #[derive(Debug, thiserror::Error)]
 pub enum TraceError {
     #[error("{family} does not trace phase {phase:?}")]
-    PhaseUnsupported { family: FamilyKey, phase: Phase },
+    /// The family does not trace `phase`.
+    PhaseUnsupported {
+        /// The family that refused.
+        family: FamilyKey,
+        /// The refused phase.
+        phase: Phase,
+    },
+    /// The family cannot trace this step shape.
     #[error("{family} cannot trace shape {shape:?}: {reason:?}")]
     ShapeUnsupported {
+        /// The family that refused.
         family: FamilyKey,
+        /// The refused shape.
         shape: StepShape,
+        /// Why the shape is refused.
         reason: ShapeReason,
     },
     /// A rope table the step's capacity or the family's spec cannot build.

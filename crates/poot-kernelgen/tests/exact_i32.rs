@@ -1,3 +1,7 @@
+//! Exact-I32 generation: the scalar, compare, shift, remainder and fused bodies keep I32 buffers, literals
+//! and arithmetic as I32 (unsigned operations bitcast through U32), and a packed I32 leaf is read lane by
+//! lane. These check the emitted `Body` structure; no external tool runs.
+
 use poot_kernel_ir::{BinOp, Rvalue, Statement, Ty};
 
 #[test]

@@ -14,16 +14,27 @@ const HASH_BUFFER_BYTES: usize = 4096;
 /// A failed integrity check.
 #[derive(Debug, thiserror::Error)]
 pub enum PackedSafetensorsError {
+    /// Reading a pinned file failed.
     #[error("{file}: I/O failed: {error}")]
     Io {
+        /// The file's name.
         file: String,
+        /// The underlying I/O error.
         #[source]
         error: std::io::Error,
     },
+    /// The file's SHA-256 digest differs from its pin.
     #[error("{file}: digest mismatch")]
-    DigestMismatch { file: String },
+    DigestMismatch {
+        /// The file's name.
+        file: String,
+    },
+    /// The file's length differs from its pin, or it changed while it was being checked.
     #[error("authenticated artifact changed before publication: {file}")]
-    ArtifactChanged { file: String },
+    ArtifactChanged {
+        /// The file's name.
+        file: String,
+    },
 }
 
 /// An exact SHA-256 digest.
@@ -31,10 +42,12 @@ pub enum PackedSafetensorsError {
 pub struct Sha256Digest([u8; 32]);
 
 impl Sha256Digest {
+    /// Wrap the 32 digest bytes.
     pub const fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
+    /// The 32 digest bytes.
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0
     }
@@ -61,7 +74,9 @@ pub fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
 /// caller applies to its bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilePin {
+    /// The file's exact length in bytes.
     pub length: usize,
+    /// The file's SHA-256 digest.
     pub sha256: Sha256Digest,
 }
 

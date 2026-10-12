@@ -180,11 +180,13 @@ impl Target {
     }
 }
 
+/// Why a kernel body could not be emitted for a target. Raised before any external tool runs.
 #[derive(Debug, thiserror::Error)]
 pub enum EmitError {
     /// The body failed [`poot_kernel_ir::Body::verify`]: it is malformed, not merely unsupported on this target.
     #[error(transparent)]
     InvalidBody(#[from] poot_kernel_ir::VerifyError),
+    /// The body uses a construct this target's emitter does not implement.
     #[error("unsupported in kernel codegen: {0}")]
     Unsupported(String),
     /// Control-flow structurization failed: an irreducible CFG, or a fixpoint that blew its block budget.
@@ -194,10 +196,13 @@ pub enum EmitError {
     Structurize(String),
 }
 
+/// Why compiling a kernel body to a loadable artifact failed.
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
+    /// The body could not be emitted; no external tool ran.
     #[error(transparent)]
     Emit(#[from] EmitError),
+    /// Reading or writing the temporary or cache files failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     /// The toolchain that produces a loadable object for `target` is not configured. AMDGCN needs the AMD clang:
@@ -208,13 +213,19 @@ pub enum CompileError {
          object is rejected by the HSA loader (AIE: Peano, which the system llc cannot stand in for)"
     )]
     ToolchainMissing {
+        /// The target the toolchain was required for.
         target: Target,
+        /// Name of the environment variable that should name the tool.
         variable: &'static str,
     },
+    /// `llc` ran and exited unsuccessfully.
     #[error("llc failed for {target:?} (status {status}):\n{stderr}")]
     Llc {
+        /// The target `llc` was compiling for.
         target: Target,
+        /// `llc`'s exit status as the process library renders it (an exit code or the terminating signal).
         status: String,
+        /// `llc`'s captured standard error.
         stderr: String,
     },
     /// `spirv_postprocess::fix_no_contraction` could not place the `Rvalue::BinaryOpNoContract` markers

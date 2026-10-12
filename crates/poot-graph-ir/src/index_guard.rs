@@ -52,12 +52,27 @@ use crate::types::{DType, Scalar, TensorType};
 /// Why a guard cannot be emitted for the requested selector and bound.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IndexGuardError {
+    /// The selector is not I32, the only dtype the guard's compare and clamp operate on.
     #[error("selector {raw} has dtype {dtype}; an index-bounds guard needs I32")]
-    RawNotI32 { raw: ValueId, dtype: DType },
+    RawNotI32 {
+        /// The selector value that was refused.
+        raw: ValueId,
+        /// The dtype it has.
+        dtype: DType,
+    },
+    /// The selector is a scalar, so it has no axis to reduce the out-of-range count over.
     #[error("selector {raw} is rank 0; an index-bounds guard needs an axis to reduce")]
-    RawNotRanked { raw: ValueId },
+    RawNotRanked {
+        /// The rank-0 selector value that was refused.
+        raw: ValueId,
+    },
+    /// The exclusive upper bound exceeds `i32::MAX`, so it cannot be written as the I32 literal the guard compares against.
     #[error("bound {upper_exclusive} does not fit in i32")]
-    BoundNotRepresentable { upper_exclusive: usize },
+    BoundNotRepresentable {
+        /// The requested exclusive upper bound.
+        upper_exclusive: usize,
+    },
+    /// Appending one of the guard's equations failed.
     #[error(transparent)]
     Build(#[from] BuilderError),
 }
@@ -84,8 +99,10 @@ pub struct GuardValues {
 /// Why [`emit_index_guard`] failed: the guard's own preconditions, or the sink refusing an equation.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IndexGuardEmitError<E: std::error::Error + 'static> {
+    /// The selector or bound cannot be guarded.
     #[error(transparent)]
     Guard(IndexGuardError),
+    /// The caller's `emit` callback refused one of the guard's equations.
     #[error("emitting an equation of the index guard: {0}")]
     Emit(#[source] E),
 }

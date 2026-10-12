@@ -27,22 +27,39 @@ pub struct Weight {
 /// Why a mapped weight cannot serve the component that asked for it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WeightError {
+    /// The map has no handle for `id`.
     #[error("weight {id} is not in the weight map")]
-    Unmapped { id: WeightId },
+    Unmapped {
+        /// The weight asked for.
+        id: WeightId,
+    },
+    /// `id`'s handle has a different shape than the component needs.
     #[error("weight {id} has shape {found:?}, expected {expected:?}")]
     Shape {
+        /// The weight asked for.
         id: WeightId,
+        /// The shape the component needs.
         expected: Vec<usize>,
+        /// The shape the map holds.
         found: Vec<usize>,
     },
+    /// `id` is stored in a format a float contraction or gather cannot read.
     #[error("weight {id} is stored as {format:?}, which is not a float weight")]
-    Format { id: WeightId, format: HandleFormat },
+    Format {
+        /// The weight asked for.
+        id: WeightId,
+        /// The format the map stores it in.
+        format: HandleFormat,
+    },
     /// The config field `field` (`bound` of it) cannot bound the I32 words of the index table `id`:
     /// zero leaves no word to hold, and a bound past `2^31` is not a range of I32 words.
     #[error("weight {id}: config field {field} = {bound} cannot bound its I32 index words")]
     IndexBound {
+        /// The index table asked for.
         id: WeightId,
+        /// The config field that bounds the table's ids.
         field: &'static str,
+        /// The value of that field.
         bound: usize,
     },
     /// A layer kind needs a parameter block the config did not read.
@@ -129,10 +146,12 @@ impl Weight {
         })
     }
 
+    /// The id this weight was mapped under.
     pub fn id(&self) -> WeightId {
         self.id
     }
 
+    /// The weight's checkpoint-orientation shape (`[out, in]` for a projection).
     pub fn shape(&self) -> &[usize] {
         &self.handle.shape
     }

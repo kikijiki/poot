@@ -35,14 +35,18 @@ pub struct AdapterSource(pub NonZeroU64);
 /// One adapter of a set: its logical name and the factor shape its entry is compiled for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AdapterSpec {
+    /// The adapter's logical name.
     pub name: String,
+    /// The adapter's factor shape.
     pub shape: Vec<usize>,
 }
 
 /// An adapter set as captured: what a generation is keyed on.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AdapterSet {
+    /// The adapters of the set, in index order: `LoraIdx` 1 names the first.
     pub adapters: Vec<AdapterSpec>,
+    /// The identity of what the weights were read from.
     pub source: AdapterSource,
 }
 
@@ -55,10 +59,12 @@ pub struct GenerationId(NonZeroU32);
 pub struct LoraIdx(NonZeroU32);
 
 impl LoraIdx {
+    /// The reference for `index`, or `None` for 0, which is the base weights.
     pub fn new(index: u32) -> Option<Self> {
         NonZeroU32::new(index).map(Self)
     }
 
+    /// The index as an integer, at least 1.
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -67,10 +73,14 @@ impl LoraIdx {
 /// Which weights a sequence runs under.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AdapterRef {
+    /// The base model's weights, no adapter.
     #[default]
     Base,
+    /// One adapter of a loaded generation.
     Adapter {
+        /// The adapter-set generation the adapter belongs to.
         generation: GenerationId,
+        /// The adapter's index within the generation.
         index: LoraIdx,
     },
 }
@@ -107,20 +117,28 @@ impl AdapterRef {
 /// Why the registry refuses an adapter operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoraError {
+    /// No loaded generation has this id.
     #[error("adapter generation {0:?} is not loaded")]
     UnknownGeneration(GenerationId),
+    /// The adapter index is beyond the generation's adapters.
     #[error("generation {generation:?} holds {adapters} adapters; index {index} is out of range")]
     IndexOutOfRange {
+        /// The generation named.
         generation: GenerationId,
+        /// The index asked for.
         index: u32,
+        /// Adapters the generation holds.
         adapters: usize,
     },
     /// A live request holds the generation: unloading it would free weights a sequence still runs.
     #[error("generation {generation:?} is held by {live} live sequences")]
     InUse {
+        /// The generation named.
         generation: GenerationId,
+        /// Live sequences holding it.
         live: usize,
     },
+    /// The generation ids are all used up.
     #[error("the registry has issued every generation id")]
     Exhausted,
 }
@@ -254,16 +272,23 @@ fn prefix_identity(generation: GenerationId, index: u32) -> PrefixIdentity {
 /// Why a set of adapters cannot be stacked for the model they are captured against.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AdapterError {
+    /// The set holds no adapter.
     #[error("an adapter set holds no adapter")]
     Empty,
     /// A module path the adapter targets is not a projection this build can adapt.
     #[error("adapter module `{module}` is not a targetable projection")]
-    UnknownModule { module: String },
+    UnknownModule {
+        /// The module path as the adapter named it.
+        module: String,
+    },
     /// The model has no weight for a projection the adapter targets.
     #[error("adapter `{adapter}` targets layer {layer} {target:?}, which the model does not have")]
     NoWeight {
+        /// Index of the adapter in the set.
         adapter: usize,
+        /// The layer the module belongs to.
         layer: usize,
+        /// The projection the adapter targets.
         target: LoraTarget,
     },
     /// An adapter's factors do not fit the base weight they correct.
@@ -271,32 +296,48 @@ pub enum AdapterError {
         "adapter {adapter} layer {layer} {target:?}: factors {a:?} and {b:?} do not fit a base weight of [{out}, {inner}]"
     )]
     Shape {
+        /// Index of the adapter in the set.
         adapter: usize,
+        /// The layer the module belongs to.
         layer: usize,
+        /// The projection the adapter targets.
         target: LoraTarget,
+        /// Shape of the A factor.
         a: Vec<usize>,
+        /// Shape of the B factor.
         b: Vec<usize>,
+        /// The base weight's output dimension.
         out: usize,
+        /// The base weight's inner (input) dimension.
         inner: usize,
     },
+    /// The adapter weight map was malformed.
     #[error(transparent)]
     Weights(#[from] WeightMapError),
     /// An adapter holds the same projection twice, under two module paths.
     #[error("adapter {adapter} names layer {layer} {target:?} twice")]
     DuplicateModule {
+        /// Index of the adapter in the set.
         adapter: usize,
+        /// The layer the module belongs to.
         layer: usize,
+        /// The projection named twice.
         target: LoraTarget,
     },
     /// A factor is not F32 data.
     #[error("adapter {adapter} layer {layer} {target:?}: a factor is not F32")]
     NotF32 {
+        /// Index of the adapter in the set.
         adapter: usize,
+        /// The layer the module belongs to.
         layer: usize,
+        /// The projection the adapter targets.
         target: LoraTarget,
     },
+    /// A stacked adapter tensor could not be built.
     #[error("a stacked adapter tensor: {0}")]
     Tensor(#[from] DenseWeightError),
+    /// The generation's weight store holds a duplicate key.
     #[error("the generation's store: {0}")]
     Store(#[from] DuplicateWeightKey),
 }

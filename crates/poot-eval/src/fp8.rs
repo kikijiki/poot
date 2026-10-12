@@ -9,14 +9,20 @@ use poot_quant::scalar::e4m3fn_to_f32;
 use crate::EvalError;
 use crate::ops::index_rule::{IndexValue, index_at};
 
+/// Why an E4M3FN tensor could not be built.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Fp8Error {
+    /// The byte or value count is not `shape`'s element count.
     #[error("e4m3fn payload for shape {shape:?} needs {expected} elements, got {got}")]
     ElementCount {
+        /// The requested shape.
         shape: Vec<usize>,
+        /// Element count the shape implies.
         expected: usize,
+        /// Element count supplied.
         got: usize,
     },
+    /// The host-tensor carrier refused the payload, carried through unchanged.
     #[error(transparent)]
     Carrier(#[from] poot_tensor::CarrierError),
 }
@@ -24,15 +30,22 @@ pub enum Fp8Error {
 /// Static layout of the normative Stage 1 portable representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortableE4m3FnLayout {
+    /// Product of every axis but the last (`1` for a scalar or vector).
     pub outer: usize,
+    /// Length of the last axis in elements (`1` for a scalar).
     pub logical_row_len: usize,
+    /// Packed `u32` words per row: `logical_row_len` rounded up to a multiple of four bytes.
     pub words_per_row: usize,
+    /// Total packed `u32` words: `outer * words_per_row`.
     pub word_count: usize,
+    /// Device allocation in bytes: four per word, tail padding included.
     pub device_bytes: usize,
+    /// Host payload in bytes: one per element, unpadded.
     pub host_bytes: usize,
 }
 
 impl PortableE4m3FnLayout {
+    /// The layout of a tensor of `shape`; a rank-0 shape is one row of one element.
     pub fn for_shape(shape: &[usize]) -> Self {
         let logical_row_len = shape.last().copied().unwrap_or(1);
         let outer = if shape.is_empty() {

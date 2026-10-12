@@ -32,10 +32,16 @@ pub enum Placement {
     /// The whole model on the executor's one device.
     Single,
     /// A layer pipeline: one stage per device, in rank order, cut after each of `after_layers`.
-    Pipeline { after_layers: Vec<usize> },
+    Pipeline {
+        /// The layers each stage ends after: `n` cuts make `n + 1` stages.
+        after_layers: Vec<usize>,
+    },
     /// Tensor parallelism: every device is one rank and runs every layer over its share of the weights,
     /// divided by `rule`.
-    Tensor { rule: ShardRule },
+    Tensor {
+        /// How each weight is divided across ranks.
+        rule: ShardRule,
+    },
 }
 
 /// A [`Placement`] resolved against the devices an executor drives.
@@ -192,20 +198,33 @@ fn owner_of(id: WeightId) -> Owner {
 /// Why no balanced pipeline exists.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BalanceError {
+    /// No device to pipeline over.
     #[error("a layer pipeline needs at least one device")]
     NoDevices,
+    /// More devices than layers: some device would run no layer.
     #[error("{devices} devices cannot each run a layer of a {layers}-layer model")]
-    MoreDevicesThanLayers { devices: usize, layers: usize },
+    MoreDevicesThanLayers {
+        /// Devices offered.
+        devices: usize,
+        /// Layers the model has.
+        layers: usize,
+    },
+    /// The device topology is invalid.
     #[error(transparent)]
     Devices(#[from] TopologyError),
+    /// The layer byte arithmetic overflowed `u64`.
     #[error("layer byte arithmetic overflowed u64")]
     Overflow,
+    /// A device's contiguous block of layers needs more bytes than the device has usable.
     #[error(
         "device {device:?} would hold {required} bytes of weights, over its {usable} usable bytes"
     )]
     DeviceTooSmall {
+        /// The device that is over.
         device: DeviceId,
+        /// Bytes its weights need.
         required: u64,
+        /// Bytes it can use.
         usable: u64,
     },
 }

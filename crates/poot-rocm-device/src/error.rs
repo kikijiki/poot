@@ -11,10 +11,13 @@ use thiserror::Error;
 /// on the cause chain depth.
 #[derive(Debug, Error)]
 pub enum RocmGpuError {
+    /// The ROCm runtime (HSA, queue, buffer or code-object layer) failed.
     #[error("rocm runtime: {0}")]
     Rocm(#[source] Box<RocmError>),
+    /// Generating or compiling the device's copy kernel failed.
     #[error("copy kernel codegen: {0}")]
     Codegen(#[source] Box<CompileError>),
+    /// A host I/O operation failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     /// A dispatch or copy this device cannot express: a kernarg segment too small for its argument

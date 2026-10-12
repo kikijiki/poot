@@ -55,6 +55,7 @@ pub enum Layout {
 /// The shapes one `prepare` call admits. Every field is explicit: there is no default.
 #[derive(Clone, Copy, Debug)]
 pub struct ServingShapes<'a> {
+    /// The KV layout every admitted entry uses.
     pub layout: Layout,
     /// Row counts to compile; one (`1`) under [`Layout::Contiguous`]. A step runs on the smallest
     /// admitted count holding its rows; the rows beyond the live ones are masked, so composition never
@@ -75,7 +76,10 @@ pub struct ServingShapes<'a> {
 /// folds every token into a value the driver cannot roll back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateResidency {
+    /// Carried state is positional KV only: a rejected token's write is overwritten and harmless.
     KvOnly,
+    /// Some carried state folds every token into one value, so a rejected token must be rolled back
+    /// by a snapshot.
     Recurrent,
 }
 
@@ -92,7 +96,9 @@ pub struct HeadSet {
 /// One admitted verify window: `width` positions on an entry of `rows` rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowCap {
+    /// Rows of the entry the window runs on.
     pub rows: NonZeroUsize,
+    /// Positions the window verifies: the query token plus its drafts.
     pub width: NonZeroUsize,
 }
 
@@ -127,16 +133,22 @@ pub struct DriverCaps {
     pub widths: Vec<NonZeroUsize>,
     /// Positions a sequence may hold (prompt plus generated).
     pub max_seq: NonZeroUsize,
+    /// How the KV cache is laid out.
     pub kv: KvLayout,
+    /// Blocks in the paged pool; 0 under the contiguous layout.
     pub kv_blocks: usize,
+    /// Whether the carried state is positional KV only or recurrent.
     pub state: StateResidency,
+    /// Which sampling heads have prepared entries.
     pub heads: HeadSet,
+    /// Adapter coverage; `None` when no adapter generation is compiled.
     pub lora: Option<LoraCaps>,
     /// Verify windows with prepared entries, per row count: a window is admitted only on the row
     /// counts a `prepare` call listed beside it.
     pub windows: Vec<WindowCap>,
     /// The speculation the driver's draft policy serves; `None` under `DraftPolicy::Off`.
     pub speculation: Option<SpeculationCaps>,
+    /// Which input kinds the driver accepts.
     pub inputs: InputSet,
 }
 

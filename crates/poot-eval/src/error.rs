@@ -13,7 +13,9 @@ use crate::ops::index_rule::IndexFault;
 /// A cast's source or result value, literal, for a [`CastFault`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CastOperand {
+    /// An `I32` word, printed as the integer.
     I32(i32),
+    /// An `F32` value, printed with Rust's shortest round-trip float format.
     F32(f32),
 }
 
@@ -31,10 +33,15 @@ impl std::fmt::Display for CastOperand {
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 #[error("cast {eqn} ({from} -> {to}) word {index} value {value} does not round-trip")]
 pub struct CastFault {
+    /// The `Cast` equation that refused the value.
     pub eqn: ValueId,
+    /// Source dtype of the cast.
     pub from: DType,
+    /// Result dtype of the cast.
     pub to: DType,
+    /// Row-major element index of the offending word in the cast's operand.
     pub index: usize,
+    /// The offending source word, as the literal it held.
     pub value: CastOperand,
 }
 
@@ -44,35 +51,59 @@ pub struct CastFault {
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 #[error("input {value} word {index} is {word}, outside its declared range {range}")]
 pub struct SlotRangeFault {
+    /// The slot input value whose bound words broke the declaration.
     pub value: ValueId,
+    /// Row-major element index of the offending word within the bound input.
     pub index: usize,
+    /// The offending word.
     pub word: i32,
+    /// The range the graph declares for the slot.
     pub range: IndexRange,
 }
 
 /// One evaluator, one error type. Every walk refusal is one of these.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
+    /// The execution-validation packet failed; the failure is carried through unchanged.
     #[error(transparent)]
     Validation(#[from] ExecutionValidationFailure),
+    /// A validation output is bound to something other than a complete dense f32 host tensor.
     #[error("validation output {value} is not a complete dense f32 tensor")]
-    ValidationValueNotHost { value: ValueId },
+    ValidationValueNotHost {
+        /// The validation output value.
+        value: ValueId,
+    },
+    /// A validation output has a shape other than the one its declaration requires.
     #[error("validation output {value} has shape {actual:?}; expected {expected:?}")]
     ValidationShape {
+        /// The validation output value.
         value: ValueId,
+        /// Shape the declaration requires.
         expected: Vec<usize>,
+        /// Shape the walk produced.
         actual: Vec<usize>,
     },
+    /// The validation packet's lane count disagrees with the graph's validation layout.
     #[error("validation packet has {actual} lanes; the graph layout requires {expected}")]
-    ValidationPacketLength { expected: usize, actual: usize },
+    ValidationPacketLength {
+        /// Lane count the graph's validation layout requires.
+        expected: usize,
+        /// Lane count the packet holds.
+        actual: usize,
+    },
+    /// A graph input (const or slot) was not bound by the caller.
     #[error("no value bound for input {0}")]
     MissingInput(ValueId),
+    /// An equation read an operand the walk had not computed yet (an ill-ordered graph).
     #[error("operand {0} used before it was computed")]
     UseBeforeDef(ValueId),
+    /// A packed-carrier refusal, carried through unchanged.
     #[error(transparent)]
     Packed(#[from] PackedEvalError),
+    /// An exact BF16 carrier refusal, carried through unchanged.
     #[error(transparent)]
     ExactBf16(#[from] crate::exact_bf16::ExactBf16Error),
+    /// An E4M3FN carrier refusal, carried through unchanged.
     #[error(transparent)]
     Fp8(#[from] crate::fp8::Fp8Error),
     /// The one index-validity refusal (deval 4): `Gather`, `Scatter`, `ScatterUpdate`'s
@@ -85,10 +116,17 @@ pub enum EvalError {
     /// check every `element_count`/`row_major_strides`/`checked_numel` call site shares, instead of
     /// a per-lane copy that mislabels the overflow as its own lane's error).
     #[error("shape {shape:?} overflows the host element count")]
-    ElementCountOverflow { shape: Vec<usize> },
+    ElementCountOverflow {
+        /// The shape whose element count overflowed.
+        shape: Vec<usize>,
+    },
     /// `Value::into_host` asked for a host tensor, but the carrier is another kind.
     #[error("the {what} is not a host tensor")]
-    NotHost { what: &'static str },
+    NotHost {
+        /// Which carrier the value was (`"exact value"`, `"packed component"`, ...).
+        what: &'static str,
+    },
+    /// A host-tensor carrier refusal (dtype/payload mismatch), carried through unchanged.
     #[error(transparent)]
     Carrier(#[from] poot_tensor::CarrierError),
     /// `resolve` found no admitted function for this equation's `(op, in dtypes, out dtype)` (the
@@ -98,16 +136,22 @@ pub enum EvalError {
     /// depth).
     #[error("eqn {eqn} ({op}): {detail}")]
     Unsupported {
+        /// The refused equation (`0` when no equation id was in scope).
         eqn: ValueId,
+        /// The op's name, as `OpKind::name` reports it.
         op: &'static str,
+        /// What exactly is not admitted or not defined.
         detail: String,
     },
     /// The decomposition a composite is evaluated through could not be built: the tracer refused it
     /// (it does not fit the decomposition limits, or its definition is defective).
     #[error("eqn {eqn} ({op}): its decomposition could not be built: {source}")]
     Decomposition {
+        /// The composite equation whose decomposition failed.
         eqn: ValueId,
+        /// The composite's op name.
         op: &'static str,
+        /// The tracer's refusal.
         source: Box<poot_graph_ir::BuilderError>,
     },
     /// A bind-time fail-closed check: the bound carrier does not match what `expected` requires
@@ -115,18 +159,26 @@ pub enum EvalError {
     /// consumed by a non-admitted equation, ...).
     #[error("input {value} expected {expected}, got {got}")]
     Input {
+        /// The input value the bind check refused.
         value: ValueId,
+        /// The type the graph declares for that input.
         expected: TensorType,
+        /// What the caller bound instead.
         got: &'static str,
     },
+    /// A cast whose value cannot round-trip; boxed to keep the error small.
     #[error(transparent)]
     Cast(Box<CastFault>),
     /// A `PackedContraction`/packed table read, or a materialization, exceeded `EvalOptions`'s budget.
     #[error("eqn {eqn} needs {needed} {resource}, budget allows {limit}")]
     Budget {
+        /// The equation (the enclosing composite, inside a decomposition) that exceeded the budget.
         eqn: ValueId,
+        /// Which budget was exceeded: `"elements"` or `"bytes"`.
         resource: &'static str,
+        /// What the equation asked for, in `resource`'s unit.
         needed: usize,
+        /// What the budget allows, in `resource`'s unit.
         limit: usize,
     },
     /// A slot input holds a word outside the range its graph declares for it (POOT-726): the same

@@ -33,7 +33,9 @@ use crate::core::sampler::{Sampler, SamplerFault};
 /// appended suffix, read back as `[rows, 2]` I32 `(token, non_finite_index)` through [`read_tokens`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Head {
+    /// The raw logits graph, with no sampling suffix.
     Logits,
+    /// The graph with the sampling suffix of this rule appended.
     Sample(SampleRule),
 }
 

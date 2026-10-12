@@ -177,6 +177,8 @@ impl Gemma4Params {
         Ok(())
     }
 
+    /// Reads the typed config from an HF multimodal wrapper (the `text_config` tower) or a GGUF index;
+    /// a field the family cannot serve is a typed [`ModelError::Config`] naming it.
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         match raw {
             RawConfig::HfJson { config, generation } => {

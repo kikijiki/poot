@@ -61,9 +61,13 @@ impl Traced {
 /// Checked accounting for a prepared transactional append.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuilderAppendAccounting {
+    /// Values (input binders and equation results) the plan staged.
     pub staged_values: usize,
+    /// Equations the plan staged.
     pub staged_equations: usize,
+    /// Packed weight rows the plan's constants carry; checked against the packed-row limit before the append commits.
     pub packed_rows: usize,
+    /// Bytes of staged names whose length was checked and charged.
     pub checked_name_bytes: usize,
 }
 
@@ -562,6 +566,7 @@ impl BuilderAppendPlan {
         Ok(())
     }
 
+    /// The type of `value`: a value the base graph already held, or one this plan staged. `None` when the id is in neither.
     pub fn type_of(&self, value: ValueId) -> Option<&TensorType> {
         match value.index().checked_sub(self.base_value_count) {
             None => self.base_types.get(value),
@@ -585,6 +590,7 @@ pub struct PreparedBuilderAppend {
 }
 
 impl PreparedBuilderAppend {
+    /// The checked counts this append staged, as validated by `prepare`.
     pub fn accounting(&self) -> BuilderAppendAccounting {
         self.accounting
     }
@@ -722,14 +728,19 @@ pub struct Builder {
 /// everything that graph published, rehydrated as [`Traced`] so a caller can append new equations
 /// that read it and finish the graph again.
 pub struct Resumed {
+    /// A builder over the finished graph, ready to append equations that read its values.
     pub builder: Builder,
+    /// What the finished graph published, as handles of `builder`.
     pub outputs: Outputs,
 }
 
 /// A validation witness declared at [`Builder::finish`].
 pub struct WitnessDeclaration {
+    /// The witness's identity in the graph's validation table.
     pub id: ValidationId,
+    /// The human-readable name the witness is published under.
     pub name: String,
+    /// The value whose contents the witness exposes.
     pub value: Traced,
 }
 
@@ -738,10 +749,13 @@ pub struct WitnessDeclaration {
 ///
 /// A bare [`Traced`] converts to the outputs of a stateless graph with that result.
 pub struct Outputs {
+    /// The graph's primary result.
     pub result: Traced,
     /// `(the State input binder, the updated value)` per cache buffer.
     pub state: Vec<(Traced, Traced)>,
+    /// The validation witnesses the graph exposes alongside its result.
     pub witnesses: Vec<WitnessDeclaration>,
+    /// The exported values, each under its boundary id.
     pub exports: Vec<(BoundaryId, Traced)>,
 }
 
@@ -1977,10 +1991,12 @@ impl Builder {
         Ok(self.handle(out))
     }
 
+    /// Elementwise unary `op` over `x`; the output has `x`'s type.
     pub fn unary(&self, op: crate::op::UnOp, x: Traced) -> Result<Traced, BuilderError> {
         self.emit(OpKind::Unary(op), vec![self.operand(x)?])
     }
 
+    /// Elementwise binary `op` over two values with numpy broadcasting; both operands must share one dtype.
     pub fn binary(
         &self,
         op: crate::op::BinOp,
@@ -2040,6 +2056,7 @@ impl Builder {
         )
     }
 
+    /// Reduce `x` over `axis` with `op`. `keepdim` keeps the reduced axis as extent 1 instead of removing it.
     pub fn reduce(
         &self,
         op: crate::op::RedOp,
@@ -2050,6 +2067,7 @@ impl Builder {
         self.emit(OpKind::Reduce { op, axis, keepdim }, vec![self.operand(x)?])
     }
 
+    /// Broadcast `x` to `shape` (numpy semantics: trailing axes align, extent-1 axes expand).
     pub fn broadcast(&self, x: Traced, shape: Vec<usize>) -> Result<Traced, BuilderError> {
         self.emit(OpKind::Broadcast { shape }, vec![self.operand(x)?])
     }
@@ -2128,6 +2146,7 @@ impl Builder {
         Ok(ScanResult { packed, y, s_out })
     }
 
+    /// Reinterpret `x` with `shape`, which must hold the same number of elements.
     pub fn reshape(&self, x: Traced, shape: Vec<usize>) -> Result<Traced, BuilderError> {
         self.emit(OpKind::Reshape { shape }, vec![self.operand(x)?])
     }
@@ -2138,10 +2157,12 @@ impl Builder {
         self.emit(OpKind::Cast { to }, vec![self.operand(x)?])
     }
 
+    /// Permute `x`'s axes: output axis `i` is input axis `perm[i]`.
     pub fn transpose(&self, x: Traced, perm: Vec<usize>) -> Result<Traced, BuilderError> {
         self.emit(OpKind::Transpose { perm }, vec![self.operand(x)?])
     }
 
+    /// Take `start..end` along `axis` of `x`, keeping the other axes whole.
     pub fn slice(
         &self,
         x: Traced,
@@ -2152,6 +2173,7 @@ impl Builder {
         self.emit(OpKind::Slice { axis, start, end }, vec![self.operand(x)?])
     }
 
+    /// Concatenate `parts` along `axis`; the parts agree on dtype and on every other axis.
     pub fn concat(&self, axis: usize, parts: &[Traced]) -> Result<Traced, BuilderError> {
         let mut operands = Vec::new();
         reserve(parts.len(), BuilderCollection::Values, |n| {
@@ -2287,6 +2309,7 @@ impl Builder {
         )
     }
 
+    /// Batched matrix product `a[.., M, K] x b[.., K, N] -> [.., M, N]`, batch dims broadcasting.
     pub fn matmul(&self, a: Traced, b: Traced) -> Result<Traced, BuilderError> {
         self.emit(OpKind::MatMul, vec![self.operand(a)?, self.operand(b)?])
     }
@@ -2355,6 +2378,7 @@ impl Builder {
     }
 
     // convenience scalar makers (kept here so models do not import types directly).
+    /// An F32 scalar literal for [`Builder::binary_scalar`] and the other literal-taking calls.
     pub fn f32(v: f32) -> Scalar {
         Scalar::F32(v)
     }

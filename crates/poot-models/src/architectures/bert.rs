@@ -32,6 +32,7 @@ use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
 
+/// BERT's [`FamilyKey`]: the name its errors and receipts carry.
 pub const FAMILY: FamilyKey = FamilyKey::new("bert");
 
 /// The name of the `Slot::Activation` input holding every token's segment id, `[rows, tokens]` I32
@@ -240,6 +241,9 @@ fn is_classifier(config: &serde_json::Value) -> bool {
 }
 
 impl BertParams {
+    /// Reads the typed config from an HF `config.json` (BERT has no GGUF form: a GGUF is refused as
+    /// `Unsupported`); a width the head count does not divide, an unknown activation or a missing
+    /// count is a typed [`ModelError::Config`].
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let RawConfig::HfJson { config, .. } = raw else {
             return Err(ModelError::Config {
@@ -372,6 +376,8 @@ struct Classifier {
     head_bias: Weight,
 }
 
+/// The built BERT encoder: its config, the name-resolved weights and the per-layer projections,
+/// ready to trace a [`Phase::Encode`] step. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct Bert {
     params: BertParams,

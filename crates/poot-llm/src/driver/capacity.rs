@@ -46,9 +46,13 @@ use super::{Driver, DriverOptions, ModelHandle, ServingShapes};
 /// are the same allocation (a shared weight, a shared state), whatever number of entries reference it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllocationOwner {
+    /// The allocation's identity, unique within a device.
     pub id: String,
+    /// The device the allocation lives on.
     pub device: DeviceId,
+    /// What the allocation is for: weights, state, arena and so on.
     pub role: BufferRole,
+    /// The allocation's size in bytes.
     pub bytes: u64,
 }
 
@@ -61,15 +65,25 @@ pub enum CapacityError {
         "allocation owner {id:?} on {device:?} is declared as {first_bytes} bytes ({first_role:?}) and again as {second_bytes} bytes ({second_role:?})"
     )]
     ConflictingOwner {
+        /// The identity declared twice.
         id: String,
+        /// The device it lives on.
         device: DeviceId,
+        /// The role of the first declaration.
         first_role: BufferRole,
+        /// The size of the first declaration.
         first_bytes: u64,
+        /// The role of the second declaration.
         second_role: BufferRole,
+        /// The size of the second declaration.
         second_bytes: u64,
     },
+    /// The sum of the bytes a device owns does not fit in `u64`.
     #[error("the bytes owned on {device:?} overflow u64")]
-    Overflow { device: DeviceId },
+    Overflow {
+        /// The device whose total overflowed.
+        device: DeviceId,
+    },
 }
 
 /// The allocation owners a plan retains, composed: a shared owner once, distinct live owners summed.
@@ -79,6 +93,7 @@ pub struct Footprint {
 }
 
 impl Footprint {
+    /// An empty footprint.
     pub fn new() -> Self {
         Self::default()
     }
@@ -104,6 +119,7 @@ impl Footprint {
         }
     }
 
+    /// Every owner, ordered by device then identity.
     pub fn owners(&self) -> impl Iterator<Item = &AllocationOwner> {
         self.owners.values()
     }
@@ -152,7 +168,12 @@ pub enum DeviceBudget {
     Unknown,
     /// `bytes` the process may allocate, of which `reserve` is kept for runtime-private allocations
     /// (recordings, staging, driver state) that no plan can see.
-    Known { bytes: u64, reserve: u64 },
+    Known {
+        /// The bytes the process may allocate on the device.
+        bytes: u64,
+        /// Bytes of `bytes` kept for allocations no plan sees.
+        reserve: u64,
+    },
 }
 
 /// What an executor reports about each device's memory at one moment, read when asked: the input of every
@@ -160,13 +181,16 @@ pub enum DeviceBudget {
 /// is the runtime's answer now.
 #[derive(Clone, Debug)]
 pub struct Observation {
+    /// One entry per device the executor drives.
     pub devices: Vec<DeviceObservation>,
 }
 
 /// One device's memory as its runtime reports it now.
 #[derive(Clone, Debug)]
 pub struct DeviceObservation {
+    /// The device the figures are for.
     pub device: DeviceId,
+    /// The device's target.
     pub target: Target,
     /// [`poot_executor::DeviceMemory::free_bytes`]: what the device could still allocate, or `None` where
     /// its runtime cannot say.
@@ -227,6 +251,7 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// Bytes still charged against `device`; 0 for a device never charged.
     pub fn charged(&self, device: DeviceId) -> u64 {
         self.charged.get(&device).copied().unwrap_or(0)
     }
@@ -246,37 +271,58 @@ impl Ledger {
 /// Why a footprint is not admitted.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CapacityRefusal {
+    /// The device's runtime could not say how much it may allocate.
     #[error("the memory budget of {device:?} is unknown")]
-    UnknownBudget { device: DeviceId },
+    UnknownBudget {
+        /// The device whose budget is unknown.
+        device: DeviceId,
+    },
+    /// The footprint touches a device the budget has no entry for.
     #[error("{device:?} has no budget entry")]
-    UnknownDevice { device: DeviceId },
+    UnknownDevice {
+        /// The device with no entry.
+        device: DeviceId,
+    },
+    /// A device's owned bytes plus what the ledger still charges are over its budget less its
+    /// reserve.
     #[error(
         "{device:?} needs {required} bytes plus {charged} still charged, over the {available} bytes available"
     )]
     OverBudget {
+        /// The device that is over.
         device: DeviceId,
+        /// Bytes the footprint owns on it.
         required: u64,
+        /// Bytes the ledger still charges it.
         charged: u64,
+        /// Bytes its budget leaves after the reserve.
         available: u64,
     },
     /// A role holds more live bytes than its plan allocated: the plan under-counted, so its admission
     /// proved nothing.
     #[error("{role:?} holds {actual} live bytes on {device:?}, over the {planned} planned")]
     Underestimated {
+        /// The device the role is on.
         device: DeviceId,
+        /// The role that is over.
         role: BufferRole,
+        /// Bytes the plan allocated for the role.
         planned: u64,
+        /// Live bytes the role actually holds.
         actual: u64,
     },
+    /// The footprint itself could not be composed.
     #[error(transparent)]
     Footprint(#[from] CapacityError),
 }
 
 impl Budget {
+    /// An empty budget: every device is unknown until one is inserted.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Insert `budget` for `device`, replacing the previous entry.
     #[cfg(any(test, feature = "test-support"))]
     pub fn with(mut self, device: DeviceId, budget: DeviceBudget) -> Self {
         self.devices.insert(device, budget);
@@ -379,32 +425,47 @@ pub enum PlanFailure<E> {
 /// Why a candidate was not chosen.
 #[derive(Debug)]
 pub enum Rejection<E> {
+    /// The candidate's footprint was refused by the budget.
     Capacity(CapacityRefusal),
+    /// The model refused the candidate's shape.
     Shape(E),
 }
 
+/// A candidate the search passed over, with the reason.
 #[derive(Debug)]
 pub struct Rejected<C, E> {
+    /// The candidate the search passed over.
     pub candidate: C,
+    /// Why it was passed over.
     pub why: Rejection<E>,
 }
 
 /// The candidate [`fit`] chose, with every candidate it passed over to reach it.
 #[derive(Debug)]
 pub struct Fit<C, E> {
+    /// The first candidate whose footprint fit.
     pub chosen: C,
+    /// The footprint that fit.
     pub footprint: Footprint,
+    /// Candidates passed over before it, in domain order.
     pub rejected: Vec<Rejected<C, E>>,
+    /// The residue every attempt, fitting or not, left charged.
     pub ledger: Ledger,
 }
 
+/// Why [`fit`] chose no candidate.
 #[derive(Debug, thiserror::Error)]
 pub enum FitError<C: std::fmt::Debug, E: std::fmt::Debug + std::error::Error + 'static> {
     /// Every candidate of the declared domain was refused.
     #[error("no candidate of the declared domain fits: {} refused", rejected.len())]
-    NoCandidateFits { rejected: Vec<Rejected<C, E>> },
+    NoCandidateFits {
+        /// Every candidate of the domain with its reason.
+        rejected: Vec<Rejected<C, E>>,
+    },
+    /// The planner failed for a reason no other candidate escapes.
     #[error("planning failed: {0}")]
     Plan(#[source] E),
+    /// A footprint could not be composed.
     #[error(transparent)]
     Footprint(#[from] CapacityError),
 }
@@ -562,8 +623,10 @@ pub enum PlanError {
     /// The production `prepare` refused the candidate: the typed driver error, unflattened.
     #[error(transparent)]
     Driver(#[from] DriverError),
+    /// A footprint could not be composed.
     #[error(transparent)]
     Footprint(#[from] CapacityError),
+    /// The shared kernel cache belongs to another model or target.
     #[error(transparent)]
     SharedKernels(#[from] SharedKernelsMismatch),
 }

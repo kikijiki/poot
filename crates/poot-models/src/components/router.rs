@@ -23,7 +23,10 @@ pub enum RouterKind {
     /// Softmax over all experts, then the `top_k` probabilities (qwen3-MoE, OLMoE). With
     /// `renormalize` they are divided by their own sum (`norm_topk_prob`); without, they are the
     /// full-softmax probabilities and do not sum to one.
-    SoftmaxTopK { renormalize: bool },
+    SoftmaxTopK {
+        /// Divide the selected probabilities by their sum (`norm_topk_prob`).
+        renormalize: bool,
+    },
     /// The `top_k` logits, then a softmax over just those (Mixtral, granite-MoE, gpt-oss). The
     /// shared normalizer cancels, so this equals `SoftmaxTopK { renormalize: true }`.
     TopKSoftmax,
@@ -112,6 +115,8 @@ pub struct RouterParams {
 }
 
 impl RouterParams {
+    /// `top_k` of `experts`, scored by `kind`, with no bias, scaling or group limit; zero counts or a
+    /// `top_k` past `experts` is a typed [`ParamError`].
     pub fn new(experts: usize, top_k: usize, kind: RouterKind) -> Result<Self, ParamError> {
         if experts == 0 {
             return Err(ParamError::new("experts", ConfigReason::Zero));
@@ -253,10 +258,12 @@ impl RouterParams {
         self.bias.is_some()
     }
 
+    /// The expert count the router scores.
     pub fn experts(&self) -> usize {
         self.experts
     }
 
+    /// How many experts each token selects.
     pub fn top_k(&self) -> usize {
         self.top_k
     }
@@ -277,6 +284,8 @@ pub struct RouterWeights {
 }
 
 impl RouterWeights {
+    /// Resolves layer `layer`'s router projection and the optional bias and scales `p` names from
+    /// `map`; a missing or mis-shaped tensor is a typed [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,
@@ -318,7 +327,9 @@ impl RouterWeights {
 /// weight of each. Both `[T, top_k]` F32 (ids are exact small integers).
 #[derive(Clone, Copy, Debug)]
 pub struct Routes {
+    /// The selected expert ids per token, best first, `[T, top_k]`.
     pub ids: Traced,
+    /// The gate weight of each selected expert, `[T, top_k]`.
     pub weights: Traced,
 }
 

@@ -1,3 +1,7 @@
+//! Resolving a checkpoint's `quantization_config` into a supported [`QuantScheme`], or a typed refusal.
+//!
+//! The serde shape of the block lives in [`quant`]; model hyperparameters are not read here.
+
 use super::LoadError;
 pub mod quant;
 pub use quant::{QuantConfig, QuantKind, QuantScheme};

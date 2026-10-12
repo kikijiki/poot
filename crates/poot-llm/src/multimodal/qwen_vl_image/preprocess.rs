@@ -18,6 +18,7 @@ use super::video_sampling::{
 };
 use super::{MAX_IMAGE_PIXELS, MAX_VIDEO_FRAMES};
 
+/// An image as row-major interleaved RGB8, `height * width * 3` bytes, with both dimensions nonzero and within the pixel cap. The fields are checked at construction ([`Self::from_rgb8`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen25VlDecodedImage {
     pub(super) height: usize,
@@ -36,154 +37,291 @@ impl Qwen25VlDecodedImage {
         Ok(Self { height, width, rgb })
     }
 
+    /// Rows of pixels.
     pub fn height(&self) -> usize {
         self.height
     }
 
+    /// Pixels per row.
     pub fn width(&self) -> usize {
         self.width
     }
 
+    /// The pixels, row-major, three bytes (R, G, B) each.
     pub fn rgb(&self) -> &[u8] {
         &self.rgb
     }
 }
 
+/// Why bytes or pixels are refused as a decoded RGB8 image.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Qwen25VlImageDecodeError {
+    /// A dimension is zero.
     #[error("Qwen2.5-VL image dimensions must be nonzero, got {height}x{width}")]
-    ZeroDimension { height: usize, width: usize },
+    ZeroDimension {
+        /// Image height in pixels.
+        height: usize,
+        /// Image width in pixels.
+        width: usize,
+    },
+    /// A dimension does not fit the decoder's `u32` range.
     #[error("Qwen2.5-VL image dimensions {height}x{width} exceed the RGB decoder range")]
-    DimensionOutOfRange { height: usize, width: usize },
+    DimensionOutOfRange {
+        /// Image height in pixels.
+        height: usize,
+        /// Image width in pixels.
+        width: usize,
+    },
+    /// `height * width` overflows `usize`.
     #[error("Qwen2.5-VL image {height}x{width} pixel count overflows usize")]
-    PixelCountOverflow { height: usize, width: usize },
+    PixelCountOverflow {
+        /// Image height in pixels.
+        height: usize,
+        /// Image width in pixels.
+        width: usize,
+    },
+    /// The image has more pixels than the cap.
     #[error(
         "Qwen2.5-VL image {height}x{width} has {pixels} pixels, exceeding the {limit}-pixel cap"
     )]
     TooManyPixels {
+        /// Image height in pixels.
         height: usize,
+        /// Image width in pixels.
         width: usize,
+        /// `height * width`.
         pixels: usize,
+        /// The cap, `MAX_IMAGE_PIXELS`.
         limit: usize,
     },
+    /// The RGB8 buffer is not `height * width * 3` bytes.
     #[error("Qwen2.5-VL RGB8 payload has {actual} bytes; dimensions require {expected}")]
-    PixelDataLen { expected: usize, actual: usize },
+    PixelDataLen {
+        /// Bytes the dimensions require.
+        expected: usize,
+        /// Bytes given.
+        actual: usize,
+    },
+    /// The container format could not be identified from the bytes.
     #[error("identify Qwen2.5-VL image bytes: {message}")]
-    Identify { message: String },
+    Identify {
+        /// The decoder's error, rendered.
+        message: String,
+    },
+    /// The container is neither PNG nor JPEG.
     #[error("Qwen2.5-VL image format {format} is unsupported; expected PNG or JPEG")]
-    UnsupportedFormat { format: String },
+    UnsupportedFormat {
+        /// The detected format's name.
+        format: String,
+    },
+    /// The decoder failed.
     #[error("decode Qwen2.5-VL image: {message}")]
-    Decode { message: String },
+    Decode {
+        /// The decoder's error, rendered.
+        message: String,
+    },
+    /// The decoded dimensions differ from the header's, so the pixel cap checked against the header did not bound the decode.
     #[error(
         "decoded Qwen2.5-VL image dimensions changed from header {header_height}x{header_width} to {decoded_height}x{decoded_width}"
     )]
     DimensionMismatch {
+        /// Header height in pixels.
         header_height: usize,
+        /// Header width in pixels.
         header_width: usize,
+        /// Decoded height in pixels.
         decoded_height: usize,
+        /// Decoded width in pixels.
         decoded_width: usize,
     },
 }
 
+/// Why an image batch cannot be resized and patched.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Qwen25VlImagePreprocessError {
+    /// An edge is smaller than `patch_size * merge_size`, the smallest side smart-resize can produce.
     #[error("Qwen2.5-VL image {height}x{width} has an edge below smart-resize factor {factor}")]
     EdgeBelowFactor {
+        /// Image height in pixels.
         height: usize,
+        /// Image width in pixels.
         width: usize,
+        /// The resize factor, `patch_size * merge_size`.
         factor: usize,
     },
+    /// The longer side is more than 200 times the shorter.
     #[error(
         "Qwen2.5-VL image {height}x{width} has an aspect ratio above the supported maximum 200"
     )]
-    AspectRatioTooLarge { height: usize, width: usize },
+    AspectRatioTooLarge {
+        /// Image height in pixels.
+        height: usize,
+        /// Image width in pixels.
+        width: usize,
+    },
+    /// An intermediate size computation overflows `usize`.
     #[error("Qwen2.5-VL image preprocessing arithmetic overflows usize while computing {stage}")]
-    ArithmeticOverflow { stage: &'static str },
+    ArithmeticOverflow {
+        /// The quantity being computed.
+        stage: &'static str,
+    },
+    /// The resized dimensions do not fit the resampler's `u32` range.
     #[error("Qwen2.5-VL image preprocessing cannot represent resized dimensions {height}x{width}")]
-    ResizedDimensionOutOfRange { height: usize, width: usize },
+    ResizedDimensionOutOfRange {
+        /// Image height in pixels.
+        height: usize,
+        /// Image width in pixels.
+        width: usize,
+    },
+    /// The resized output has a zero dimension.
     #[error("Qwen2.5-VL image processor resolved an empty output of {height}x{width}")]
-    ZeroOutputDimension { height: usize, width: usize },
+    ZeroOutputDimension {
+        /// Image height in pixels.
+        height: usize,
+        /// Image width in pixels.
+        width: usize,
+    },
+    /// Resizing is disabled and a dimension is not a multiple of the resize factor.
     #[error(
         "Qwen2.5-VL image {height}x{width} must be divisible by factor {factor} when resize is disabled"
     )]
     NonDivisibleWithoutResize {
+        /// Image height in pixels.
         height: usize,
+        /// Image width in pixels.
         width: usize,
+        /// The resize factor, `patch_size * merge_size`.
         factor: usize,
     },
+    /// The resized image has more pixels than the cap.
     #[error(
         "Qwen2.5-VL resized image {height}x{width} has {pixels} pixels, exceeding the {limit}-pixel cap"
     )]
     TooManyOutputPixels {
+        /// Resized height in pixels.
         height: usize,
+        /// Resized width in pixels.
         width: usize,
+        /// `height * width`.
         pixels: usize,
+        /// The cap, `MAX_IMAGE_PIXELS`.
         limit: usize,
     },
+    /// The batch holds no image.
     #[error("Qwen2.5-VL image batch must contain at least one image")]
     EmptyBatch,
+    /// Reserving memory failed.
     #[error("Qwen2.5-VL image preprocessing could not reserve memory for {stage}")]
-    Allocation { stage: &'static str },
+    Allocation {
+        /// The buffer that failed to allocate.
+        stage: &'static str,
+    },
 }
 
+/// Why decoded video frames cannot be padded, resized and patched.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Qwen25VlVideoPreprocessError {
+    /// The video has no sampled frame.
     #[error("Qwen2.5-VL video must contain at least one sampled frame")]
     EmptyFrames,
+    /// The video has more sampled frames than the cap.
     #[error("Qwen2.5-VL video has {actual} sampled frames, exceeding the {limit}-frame cap")]
-    TooManyFrames { actual: usize, limit: usize },
+    TooManyFrames {
+        /// Frames given.
+        actual: usize,
+        /// The cap, `MAX_VIDEO_FRAMES`.
+        limit: usize,
+    },
+    /// A frame's size differs from the first frame's.
     #[error(
         "Qwen2.5-VL video frame {index} has dimensions {actual_height}x{actual_width}; expected {expected_height}x{expected_width}"
     )]
     FrameDimensionsMismatch {
+        /// Index of the frame among the video's sampled frames.
         index: usize,
+        /// The first frame's height.
         expected_height: usize,
+        /// The first frame's width.
         expected_width: usize,
+        /// This frame's height.
         actual_height: usize,
+        /// This frame's width.
         actual_width: usize,
     },
+    /// Padding the frame count to a temporal patch multiple gives a count the processor's reshape cannot group.
     #[error(
         "Qwen2.5-VL video frame count {frame_count} with temporal patch size {temporal_patch_size} pads to {padded_frame_count}, which the cached Transformers 4.49.0 reshape cannot group"
     )]
     IncompatibleTemporalPadding {
+        /// Sampled frames.
         frame_count: usize,
+        /// Frames merged into one temporal patch.
         temporal_patch_size: usize,
+        /// The padded count derived.
         padded_frame_count: usize,
     },
+    /// The padded frame count exceeds the cap.
     #[error(
         "Qwen2.5-VL video has {sampled_frame_count} sampled frames and {padded_frame_count} frames after temporal padding, exceeding the {limit}-frame cap"
     )]
     TooManyPaddedFrames {
+        /// Sampled frames.
         sampled_frame_count: usize,
+        /// The padded count derived.
         padded_frame_count: usize,
+        /// The cap, `MAX_VIDEO_FRAMES`.
         limit: usize,
     },
+    /// All frames together have more pixels than the image pixel cap.
     #[error(
         "Qwen2.5-VL processed video has {pixels} frame pixels, exceeding the {limit}-pixel cap"
     )]
-    TooManyOutputPixels { pixels: usize, limit: usize },
+    TooManyOutputPixels {
+        /// Pixels summed over the frames.
+        pixels: usize,
+        /// The cap, `MAX_IMAGE_PIXELS`.
+        limit: usize,
+    },
+    /// An intermediate size computation overflows `usize`.
     #[error("Qwen2.5-VL video preprocessing arithmetic overflows usize while computing {stage}")]
-    ArithmeticOverflow { stage: &'static str },
+    ArithmeticOverflow {
+        /// The quantity being computed.
+        stage: &'static str,
+    },
+    /// Reserving memory failed.
     #[error("Qwen2.5-VL video preprocessing could not reserve memory for {stage}")]
-    Allocation { stage: &'static str },
+    Allocation {
+        /// The buffer that failed to allocate.
+        stage: &'static str,
+    },
+    /// A frame failed image preprocessing.
     #[error(transparent)]
     Image(#[from] Qwen25VlImagePreprocessError),
+    /// The frame rate does not give valid grid timing.
     #[error(transparent)]
     Timing(#[from] MropeProcessorTimingError),
 }
 
+/// Why a raw video cannot be sampled, decoded and preprocessed.
+/// `E` is the caller's frame source error.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlRawVideoPreprocessError<E: std::error::Error + 'static> {
+    /// The sampler refused the video's metadata or the requested frame rate.
     #[error(transparent)]
     Sampling(#[from] Qwen25VlVideoSamplingError),
+    /// The caller's frame source failed on a selected frame.
     #[error("decode Qwen2.5-VL source frame {frame_index}: {source}")]
     Decode {
+        /// Source frame index that failed.
         frame_index: usize,
+        /// The frame source's error.
         #[source]
         source: E,
     },
+    /// Reserving memory for the decoded frames failed.
     #[error("Qwen2.5-VL raw video could not reserve memory for decoded frames")]
     Allocation,
+    /// The decoded frames failed video preprocessing.
     #[error(transparent)]
     Preprocess(#[from] Qwen25VlVideoPreprocessError),
 }

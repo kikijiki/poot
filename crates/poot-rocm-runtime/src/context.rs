@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 ///   write is undefined behavior, so transfers use `hsa_amd_memory_async_copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadStrategy {
+    /// Host-visible pool: transfers are a plain host write.
     HostWrite,
+    /// Pool not host-visible: transfers go through an HSA asynchronous DMA copy.
     Dma,
 }
 
@@ -196,7 +198,9 @@ impl Default for RocmContextOptions {
 /// Only the difference between two instants of this clock means anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DispatchSpan {
+    /// Start of the dispatch's device execution, on the system-timestamp clock.
     pub start: std::time::Duration,
+    /// End of the dispatch's device execution, on the same clock.
     pub end: std::time::Duration,
 }
 

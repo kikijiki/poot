@@ -24,19 +24,31 @@ pub use host::{CarrierError, HostData, HostTensor, StorageClass};
 /// map keys (residency, state-sharing) and error messages uniformly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum DType {
+    /// One-byte boolean.
     Bool,
+    /// Signed 8-bit integer.
     I8,
+    /// Unsigned 8-bit integer.
     U8,
+    /// Signed 16-bit integer.
     I16,
+    /// Unsigned 16-bit integer.
     U16,
+    /// Signed 32-bit integer.
     I32,
+    /// Unsigned 32-bit integer.
     U32,
+    /// Signed 64-bit integer.
     I64,
+    /// Unsigned 64-bit integer.
     U64,
+    /// IEEE binary16 float.
     F16,
     /// bfloat16 (spec 024). Storage is bf16; arithmetic accumulates in f32.
     BF16,
+    /// IEEE binary32 float.
     F32,
+    /// IEEE binary64 float.
     F64,
     /// OCP E4M3FN FP8 storage (spec 149 Stage 1): a logical storage dtype, not an arithmetic type.
     E4M3FN,
@@ -138,9 +150,13 @@ pub struct HostView<'a> {
 /// `HostView::new` was given a byte slice whose length does not equal `elems * dtype.byte_size()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostViewLengthError {
+    /// The view's dtype.
     pub dtype: DType,
+    /// The element count the view was asked to cover.
     pub elems: usize,
+    /// Bytes `elems` of `dtype` occupy.
     pub expected_bytes: usize,
+    /// Bytes the slice holds.
     pub actual_bytes: usize,
 }
 
@@ -185,14 +201,17 @@ impl<'a> HostView<'a> {
         }
     }
 
+    /// The view's element type.
     pub fn dtype(&self) -> DType {
         self.dtype
     }
 
+    /// The element count.
     pub fn elems(&self) -> usize {
         self.elems
     }
 
+    /// The borrowed bytes, `elems * dtype.byte_size()` long.
     pub fn bytes(&self) -> &'a [u8] {
         self.bytes
     }

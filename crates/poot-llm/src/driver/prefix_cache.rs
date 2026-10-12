@@ -46,8 +46,10 @@ fn chain_hash(prev: u64, block: &[u32]) -> u64 {
 pub enum PrefixOutcome {
     /// The prompt's filled full blocks are cached under the sequence's identity: `tokens` of them.
     Registered {
+        /// Prompt tokens covered by the registered blocks.
         tokens: usize,
     },
+    /// Nothing was registered, for this reason.
     Skipped(PrefixSkip),
 }
 
@@ -87,6 +89,7 @@ pub struct PrefixCache {
 }
 
 impl PrefixCache {
+    /// An empty cache.
     pub fn new() -> Self {
         Self::default()
     }
@@ -96,6 +99,7 @@ impl PrefixCache {
         self.cached.len()
     }
 
+    /// Whether no prefix block is cached.
     pub fn is_empty(&self) -> bool {
         self.cached.is_empty()
     }

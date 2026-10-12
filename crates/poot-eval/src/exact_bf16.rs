@@ -50,10 +50,12 @@ impl ExactBf16TensorView {
         })
     }
 
+    /// The logical shape, row-major.
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
 
+    /// The logical element count (the product of [`Self::shape`]).
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
     }
@@ -129,20 +131,31 @@ impl ExactBf16TensorView {
     }
 }
 
+/// Why an exact BF16 view could not be built or reshaped.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExactBf16Error {
+    /// A reshape whose target shape has a different element count.
     #[error("BF16 reshape {source_shape:?} -> {target_shape:?} changes the element count")]
     ReshapeElementCount {
+        /// Shape of the view being reshaped.
         source_shape: Vec<usize>,
+        /// Requested shape.
         target_shape: Vec<usize>,
     },
+    /// A reshape of a permuted view: the target needs the words in row-major order, which this alias is not.
     #[error("BF16 reshape {source_shape:?} -> {target_shape:?} needs a contiguous alias")]
     NonContiguousReshape {
+        /// Shape of the view being reshaped.
         source_shape: Vec<usize>,
+        /// Requested shape.
         target_shape: Vec<usize>,
     },
+    /// An element count or stride product overflowed `usize`.
     #[error("exact BF16 arithmetic overflowed {field}")]
-    ArithmeticOverflow { field: &'static str },
+    ArithmeticOverflow {
+        /// The quantity that overflowed (`"element count"`, ...).
+        field: &'static str,
+    },
 }
 
 /// Row-major strides of `shape`, routed through the one lane-neutral overflow check

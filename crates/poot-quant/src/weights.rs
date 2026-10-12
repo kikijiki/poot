@@ -48,10 +48,12 @@ use crate::{PackedPayload, PackedWeight, SourceChanged, SourceRole, StoredBytes}
 pub struct WeightKey(Arc<str>);
 
 impl WeightKey {
+    /// A key for `name`; an `Arc<str>` is shared, not copied.
     pub fn new(name: impl Into<Arc<str>>) -> Self {
         Self(name.into())
     }
 
+    /// The name as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -116,14 +118,20 @@ pub enum DenseWeightError {
     /// `shape`'s element count, or that count times `dtype`'s stored element width, overflows
     /// `usize`.
     ShapeOverflow {
+        /// The stored element dtype.
         dtype: poot_tensor::DType,
+        /// The logical shape whose element count or byte size overflowed.
         shape: Vec<usize>,
     },
     /// `bytes.len()` does not equal `shape`'s element count times `dtype`'s stored element width.
     ByteLength {
+        /// The stored element dtype.
         dtype: poot_tensor::DType,
+        /// The logical shape the buffer was supposed to fill.
         shape: Vec<usize>,
+        /// Byte length `shape` and `dtype` require.
         expected: usize,
+        /// Length of the buffer that was supplied.
         actual: usize,
     },
 }
@@ -198,14 +206,17 @@ impl DenseWeight {
         })
     }
 
+    /// The checkpoint's own element dtype of this tensor.
     pub fn dtype(&self) -> poot_tensor::DType {
         self.dtype
     }
 
+    /// The logical shape, one extent per axis (empty for a scalar).
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
 
+    /// The tensor's bytes as the checkpoint stored them; their length is `shape`'s element count times `dtype`'s element width.
     pub fn bytes(&self) -> &StoredBytes {
         &self.bytes
     }
@@ -214,6 +225,7 @@ impl DenseWeight {
 /// A dense tensor's stored dtype has no f32 decode (an integer or boolean tensor, or f64).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UndecodableDtype {
+    /// The stored dtype that has no f32 decode.
     pub dtype: poot_tensor::DType,
 }
 
@@ -268,7 +280,9 @@ impl DenseWeight {
 /// facts every entry reports uniformly.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WeightEntry {
+    /// A stored tensor named by its checkpoint dtype.
     Dense(DenseWeight),
+    /// A packed weight's source bytes, shared by `Arc` with whoever else reads the payload.
     Packed(Arc<PackedPayload>),
 }
 
@@ -312,6 +326,7 @@ pub struct WeightStoreBuilder {
 }
 
 impl WeightStoreBuilder {
+    /// An empty builder.
     pub fn new() -> Self {
         Self::default()
     }
@@ -352,6 +367,7 @@ impl WeightStoreBuilder {
         Ok(())
     }
 
+    /// Freezes the entries inserted so far into a read-only store.
     pub fn build(self) -> WeightStore {
         WeightStore {
             entries: self.entries,
@@ -381,10 +397,12 @@ impl PartialEq for WeightStore {
 }
 
 impl WeightStore {
+    /// An empty [`WeightStoreBuilder`].
     pub fn builder() -> WeightStoreBuilder {
         WeightStoreBuilder::new()
     }
 
+    /// The entry stored under `key`, if any.
     pub fn get(&self, key: &str) -> Option<&WeightEntry> {
         self.entries.get(key).map(|owned| &owned.entry)
     }
@@ -395,22 +413,27 @@ impl WeightStore {
         self.entries.get(key).map(|owned| owned.generation)
     }
 
+    /// Whether the store holds an entry under `key`.
     pub fn contains(&self, key: &str) -> bool {
         self.entries.contains_key(key)
     }
 
+    /// Number of entries.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether the store holds no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Every key, in key order.
     pub fn keys(&self) -> impl Iterator<Item = &WeightKey> {
         self.entries.keys()
     }
 
+    /// Every `(key, entry)` pair, in key order.
     pub fn iter(&self) -> impl Iterator<Item = (&WeightKey, &WeightEntry)> {
         self.entries.iter().map(|(key, owned)| (key, &owned.entry))
     }
@@ -464,12 +487,19 @@ impl WeightStore {
 /// their checkpoint names onto these roles; a family card adds the sub-roles it needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WeightRole {
+    /// The token embedding table.
     Embed,
+    /// The output head: the projection from the final hidden state to the output logits.
     Head,
+    /// The norm scale applied after the last layer, before the head.
     FinalNorm,
+    /// A projection, bias or norm of a layer's attention.
     Attn(AttnRole),
+    /// A projection or bias of a layer's dense feed-forward.
     Ffn(FfnRole),
+    /// A per-layer norm scale or bias.
     Norm(NormRole),
+    /// A weight of a layer's routed mixture-of-experts block.
     Moe(MoeRole),
     /// The multi-head latent attention projections beside [`AttnRole::Q`] and [`AttnRole::O`].
     Mla(MlaRole),
@@ -500,28 +530,34 @@ pub enum WeightRole {
     FinalNormBias,
     /// A LayerNorm over the embedded tokens, before the first layer (BLOOM), and its bias.
     EmbedNorm,
+    /// The bias of [`WeightRole::EmbedNorm`].
     EmbedNormBias,
     /// The scalar a layer multiplies its output by (Gemma 4's `layer_scalar`), `[1]`.
     LayerScale,
     /// A learned absolute position table `[positions, width]` (BERT, a vision tower), and BERT's
     /// token-type table `[types, width]`.
     PosEmbed,
+    /// BERT's token-type table `[types, width]`.
     TypeEmbed,
     /// BERT's `[CLS]` pooler projection `[width, width]` and its bias.
     Pooler,
+    /// The bias of [`WeightRole::Pooler`].
     PoolerBias,
     /// The bias of the output head (a classifier's), `[out]`.
     HeadBias,
     /// A vision tower's patch embedding, the stored convolution `[width, channels, patch, patch]`,
     /// and its bias.
     Patch,
+    /// The bias of [`WeightRole::Patch`].
     PatchBias,
     /// A modality connector's projection `[text_width, vision_width * scale^2]`.
     Connector,
     /// A two-layer connector's first projection's bias, and its second projection and bias (a
     /// Qwen2.5-VL patch merger's `mlp.0` bias, `mlp.2` and its bias).
     ConnectorBias,
+    /// The second projection of a two-layer connector.
     ConnectorOut,
+    /// The bias of [`WeightRole::ConnectorOut`].
     ConnectorOutBias,
     /// The stacked LoRA adapter tensors the compile-time LoRA pass reads beside the base weights.
     Lora(LoraRole),
@@ -530,12 +566,19 @@ pub enum WeightRole {
 /// A projection a LoRA adapter can target: the four attention projections and the three gated-MLP ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LoraTarget {
+    /// The attention query projection ([`AttnRole::Q`]).
     AttnQ,
+    /// The attention key projection ([`AttnRole::K`]).
     AttnK,
+    /// The attention value projection ([`AttnRole::V`]).
     AttnV,
+    /// The attention output projection ([`AttnRole::O`]).
     AttnO,
+    /// The gated MLP's gate projection ([`FfnRole::Gate`]).
     FfnGate,
+    /// The gated MLP's up projection ([`FfnRole::Up`]).
     FfnUp,
+    /// The gated MLP's down projection ([`FfnRole::Down`]).
     FfnDown,
 }
 
@@ -578,8 +621,11 @@ impl LoraTarget {
 /// `[adapters + 1]` per-adapter `lora_alpha / r`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LoraRole {
+    /// The stacked `[adapters + 1, in, r]` factor of the adapter for this projection.
     A(LoraTarget),
+    /// The stacked `[adapters + 1, r, out]` factor of the adapter for this projection.
     B(LoraTarget),
+    /// The model-level `[adapters + 1]` per-adapter `lora_alpha / r`.
     Scale,
 }
 
@@ -606,15 +652,25 @@ impl LoraRole {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// The weights of one layer's attention: its projections, biases and QK norms.
 pub enum AttnRole {
+    /// The query projection.
     Q,
+    /// The key projection.
     K,
+    /// The value projection.
     V,
+    /// The output projection.
     O,
+    /// The query projection's bias.
     QBias,
+    /// The key projection's bias.
     KBias,
+    /// The value projection's bias.
     VBias,
+    /// The norm scale applied to the query (QK-norm).
     QNorm,
+    /// The norm scale applied to the key (QK-norm).
     KNorm,
     /// The output projection's bias.
     OBias,
@@ -622,6 +678,7 @@ pub enum AttnRole {
     /// order is the family's: BLOOM interleaves per head (`q_h, k_h, v_h` for each head), a Qwen2.5-VL
     /// vision block stacks `q | k | v`. A family that has one reads it instead of `Q`/`K`/`V`.
     Qkv,
+    /// The bias of the fused QKV projection ([`AttnRole::Qkv`]).
     QkvBias,
     /// The per-query-head attention sink logits (gpt-oss), `[heads]`.
     Sinks,
@@ -632,14 +689,20 @@ pub enum AttnRole {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// The projections and biases of one layer's dense feed-forward block.
 pub enum FfnRole {
+    /// The gate projection of a gated MLP.
     Gate,
+    /// The up projection of a gated or plain MLP.
     Up,
+    /// The down projection of a gated or plain MLP.
     Down,
     /// The biases of a plain MLP's two projections, and of a gated MLP's gate (a Qwen2.5-VL vision
     /// block's three).
     UpBias,
+    /// The down projection's bias.
     DownBias,
+    /// The gate projection's bias.
     GateBias,
 }
 
@@ -647,9 +710,13 @@ pub enum FfnRole {
 /// a checkpoint stores as a single tensor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExpertProj {
+    /// The gate projection of one expert.
     Gate,
+    /// The up projection of one expert.
     Up,
+    /// The gate and up projections fused into one tensor.
     GateUp,
+    /// The down projection of one expert.
     Down,
 }
 
@@ -700,16 +767,20 @@ pub enum MlaRole {
     /// The low-rank query's down projection `[q_lora_rank, width]`, its norm scale and its up
     /// projection `[heads * (nope + rope), q_lora_rank]`.
     QA,
+    /// The norm scale over the query latent.
     QANorm,
+    /// The query up projection out of the latent.
     QB,
     /// The shared KV latent's down projection `[kv_lora_rank + rope, width]` and its norm scale.
     KvA,
+    /// The norm scale over the KV latent.
     KvANorm,
     /// HF's one up projection `[heads * (nope + v), kv_lora_rank]`, viewed per head in the graph.
     KvB,
     /// llama.cpp's split up projections, stored per head: the key's `[heads, kv_lora_rank, nope]`
     /// and the value's `[heads, v, kv_lora_rank]`.
     KB,
+    /// llama.cpp's per-head value up projection.
     VB,
 }
 
@@ -720,17 +791,23 @@ pub enum Mamba2Role {
     /// The three row ranges of the fused input projection: the output gate `z`, the conv input
     /// `xBC` and the timestep `dt`.
     Z,
+    /// The conv-input (`xBC`) rows of the fused input projection.
     Xbc,
+    /// The timestep (`dt`) rows of the fused input projection.
     Dt,
+    /// The bias added to `dt`.
     DtBias,
     /// The depthwise conv kernel `[K, channels]` and its bias.
     Conv,
+    /// The depthwise conv's bias.
     ConvBias,
     /// `log(-A)` per head and the skip `D` per head.
     ALog,
+    /// The per-head skip connection `D`.
     D,
     /// The gated RMSNorm scale before the output projection, and the output projection.
     GateNorm,
+    /// The output projection.
     Out,
 }
 
@@ -741,14 +818,17 @@ pub enum GdnRole {
     /// The mixed query, key and value projection `[2 * key_dim + value_dim, width]` and the output
     /// gate `z` projection `[value_dim, width]`, each separate (a GGUF; Qwen3.5).
     Qkv,
+    /// The output gate `z` projection.
     Z,
     /// The per-value-head beta and decay (`alpha`) projections `[value_heads, width]`, separate.
     Beta,
+    /// The per-value-head decay (`alpha`) projection.
     Alpha,
     /// The fused projections of an HF `qwen3_next` checkpoint, whose rows group per key head:
     /// `[key_heads * (2 * head_dim + 2 * value_heads / key_heads * head_dim), width]` for `q|k|v|z`
     /// and `[2 * value_heads, width]` for `b|a`.
     Qkvz,
+    /// The fused `b` and `a` (beta and alpha) projection of an HF checkpoint.
     Ba,
     /// The bias added to `alpha` before its softplus, `[value_heads]`.
     DtBias,
@@ -759,6 +839,7 @@ pub enum GdnRole {
     A,
     /// The gated RMSNorm scale over each value head's `head_dim`, and the output projection.
     GateNorm,
+    /// The output projection.
     Out,
 }
 
@@ -769,28 +850,36 @@ pub enum GdnRole {
 pub enum KdaRole {
     /// The query, key and value projections `[heads * head_dim, width]`.
     Q,
+    /// The key projection.
     K,
+    /// The value projection.
     V,
     /// The depthwise conv kernels over the query, key and value channels, `[heads * head_dim, 1, K]`.
     ConvQ,
+    /// The depthwise conv kernel over the key channels.
     ConvK,
+    /// The depthwise conv kernel over the value channels.
     ConvV,
     /// The low-rank forget-gate projections: `FA` `[gate_rank, width]` and `FB`
     /// `[heads * head_dim, gate_rank]`.
     FA,
+    /// The forget gate's up projection out of the low-rank bottleneck.
     FB,
     /// The per-head beta projection `[heads, width]`.
     Beta,
     /// The low-rank output-gate projections, shaped as `FA` and `FB`.
     GA,
+    /// The output gate's up projection out of the low-rank bottleneck.
     GB,
     /// The per-head log decay rate `[heads]` and the bias added to the forget gate's argument,
     /// `[heads * head_dim]`.
     ALog,
+    /// The bias added to the forget gate's argument.
     DtBias,
     /// The RMSNorm scale over each head's `head_dim`, and the output projection `[width, heads *
     /// head_dim]`.
     ONorm,
+    /// The output projection.
     Out,
 }
 
@@ -816,7 +905,9 @@ pub enum DsaRole {
     Q,
     /// The key projection `[dim, width]`, its LayerNorm scale and bias.
     K,
+    /// The LayerNorm scale over the key.
     KNorm,
+    /// The LayerNorm bias over the key.
     KNormBias,
     /// The per-head weights projection `[heads, width]`.
     Weights,
@@ -831,7 +922,9 @@ pub enum QsaRole {
     Q,
     /// The shared key projection `[dim, width]`.
     K,
+    /// The scale of the norm over each query head's `dim`.
     QNorm,
+    /// The scale of the norm over the key's `dim`.
     KNorm,
 }
 
@@ -853,6 +946,7 @@ pub enum HyperRole {
     Norm,
     /// The low-rank gate projections `[rank, streams * width]` and `[streams * width, rank]`.
     MixDown,
+    /// The low-rank gate's up projection.
     MixUp,
     /// The per-stream injection weights `[streams, streams * width]` (not on the final mixer).
     Inject,
@@ -871,10 +965,13 @@ pub enum PleRole {
     TableScale,
     /// The key projection `[streams * width, embed_dim]` and value projection `[width, embed_dim]`.
     Key,
+    /// The value projection.
     Value,
     /// The grouped norm scales over the key, the query (the stream) and the gated value.
     KeyNorm,
+    /// The grouped norm scale over the query (the stream).
     QueryNorm,
+    /// The grouped norm scale over the gated value.
     ConvNorm,
     /// The dilated depthwise conv kernel `[streams * width, 1, K]`.
     Conv,
@@ -884,14 +981,23 @@ pub enum PleRole {
 /// collapse; each site is a projection `[mix, streams * width]`, a base `[mix]` and a scale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MhcRole {
+    /// The attention site's projection `[mix, streams * width]`.
     AttnFn,
+    /// The attention site's base `[mix]`.
     AttnBase,
+    /// The attention site's scale.
     AttnScale,
+    /// The feed-forward site's projection `[mix, streams * width]`.
     FfnFn,
+    /// The feed-forward site's base `[mix]`.
     FfnBase,
+    /// The feed-forward site's scale.
     FfnScale,
+    /// The model-level head collapse's projection `[mix, streams * width]`.
     HeadFn,
+    /// The model-level head collapse's base `[mix]`.
     HeadBase,
+    /// The model-level head collapse's scale.
     HeadScale,
 }
 
@@ -900,33 +1006,46 @@ pub enum MhcRole {
 /// entry. The `Indexer` rows are the same four for the lightning indexer's own compressor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CompressRole {
+    /// The key/value projection of the layer's compressed branch.
     Kv,
+    /// The gate projection of the layer's compressed branch.
     Gate,
+    /// The learned position bias added to the compressor's gate.
     PositionBias,
+    /// The norm scale of the pooled entry.
     Norm,
+    /// The key/value projection of the lightning indexer's compressor.
     IndexerKv,
+    /// The gate projection of the lightning indexer's compressor.
     IndexerGate,
+    /// The position bias added to the indexer compressor's gate.
     IndexerPositionBias,
+    /// The norm scale of the indexer compressor's pooled entry.
     IndexerNorm,
 }
 
 /// The per-layer norms around a block (the model-level output norm is [`WeightRole::FinalNorm`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NormRole {
+    /// The norm before the layer's mixer (attention or recurrent).
     Attn,
+    /// The norm before the layer's feed-forward.
     Ffn,
     /// The norms applied to a block's output before it joins the residual (a sandwich layer's
     /// post-attention and post-feed-forward norms).
     PostAttn,
+    /// The norm applied to the feed-forward's output before it joins the residual.
     PostFfn,
     /// The biases of a LayerNorm's [`NormRole::Attn`] and [`NormRole::Ffn`] scales.
     AttnBias,
+    /// The bias of the [`NormRole::Ffn`] LayerNorm.
     FfnBias,
     /// The norm before a routed block that sits beside a dense feed-forward (Gemma 4's MoE
     /// layers): the dense block reads [`NormRole::Ffn`], the routed experts read this one.
     PreRouted,
     /// The norms applied to the dense and the routed block's outputs before they are summed.
     PostDense,
+    /// The norm applied to the routed block's output before the sum.
     PostRouted,
 }
 
@@ -1135,15 +1254,19 @@ impl MoeRole {
 /// The typed identity of one model weight: its layer (`None` for a model-level weight) and role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WeightId {
+    /// The layer index, or `None` for a model-level weight.
     pub layer: Option<usize>,
+    /// What the weight is for.
     pub role: WeightRole,
 }
 
 impl WeightId {
+    /// The identity of a model-level weight (no layer).
     pub const fn model(role: WeightRole) -> Self {
         Self { layer: None, role }
     }
 
+    /// The identity of the `role` weight of layer `layer`.
     pub const fn layer(layer: usize, role: WeightRole) -> Self {
         Self {
             layer: Some(layer),
@@ -1184,7 +1307,9 @@ pub enum WeightView {
     ExpertStack(Vec<WeightKey>),
     /// A leading-axis row range of one entry (a slice of a fused `qkv`).
     RowRange {
+        /// The entry the rows are cut from.
         key: WeightKey,
+        /// The half-open row range of the entry's leading axis.
         rows: std::ops::Range<usize>,
     },
     /// An index table stored as I64, read as I32 (DeepSeek-V4's `tid2eid`): every value is
@@ -1196,8 +1321,11 @@ pub enum WeightView {
     /// factor. A packed `[out, K]` payload is cut on whole encoding blocks of its `K` axis only: a range
     /// off a block boundary, or of a planar format, is refused when the view is built.
     BlockColumns {
+        /// The entry the columns are cut from.
         key: WeightKey,
+        /// The axis cut; at least 1.
         axis: usize,
+        /// The half-open range along `axis`.
         cols: std::ops::Range<usize>,
     },
 }
@@ -1219,14 +1347,18 @@ impl WeightView {
 /// formats). A dense entry names its stored dtype; a packed one its quantized `[out, K]` weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HandleFormat {
+    /// A dense entry: its stored dtype.
     Dense(poot_tensor::DType),
+    /// A packed entry: its quantized `[out, K]` weight.
     Packed(crate::PackedWeight),
 }
 
 /// What a tracer may see of a weight: its stored format and logical shape. No bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WeightHandle {
+    /// The stored format of the weight.
     pub format: HandleFormat,
+    /// The logical shape: the entry's full shape when dense, `[out, K]` when packed.
     pub shape: Vec<usize>,
 }
 
@@ -1250,95 +1382,165 @@ impl WeightHandle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WeightMapError {
     /// The view names a key the store does not hold.
-    Missing { id: WeightId, key: WeightKey },
+    Missing {
+        /// The weight being mapped.
+        id: WeightId,
+        /// The key the view names that the store lacks.
+        key: WeightKey,
+    },
     /// `id` was mapped twice.
-    Duplicate { id: WeightId },
+    Duplicate {
+        /// The weight that was mapped twice.
+        id: WeightId,
+    },
     /// [`WeightMap::materialize`] was asked for an `id` the map does not hold.
-    Unmapped { id: WeightId },
+    Unmapped {
+        /// The weight that is not in the map.
+        id: WeightId,
+    },
     /// A [`WeightView::RowStack`] with no parts.
-    EmptyStack { id: WeightId },
+    EmptyStack {
+        /// The weight being mapped.
+        id: WeightId,
+    },
     /// A row view over a rank-0 dense entry: there is no row axis.
-    NoRowAxis { id: WeightId, key: WeightKey },
+    NoRowAxis {
+        /// The weight being mapped.
+        id: WeightId,
+        /// The rank-0 entry.
+        key: WeightKey,
+    },
     /// A [`WeightView::RowRange`] that is empty or reaches past the entry's rows.
     RowRangeOutOfBounds {
+        /// The weight being mapped.
         id: WeightId,
+        /// The requested row range.
         rows: std::ops::Range<usize>,
+        /// Rows the entry has.
         available: usize,
     },
     /// [`WeightView::RowStack`] parts that do not share one format and one row shape.
     MixedParts {
+        /// The weight being mapped.
         id: WeightId,
+        /// The first part's handle, which the others must match.
         first: Box<WeightHandle>,
+        /// The first part that differs.
         other: Box<WeightHandle>,
     },
     /// The packed payload refuses the row view (a planar format whose rows are not byte runs).
     Packed {
+        /// The weight being mapped.
         id: WeightId,
+        /// The packed payload's own refusal.
         source: Box<crate::PackedWeightError>,
     },
     /// A [`WeightView::IndexNarrow`] over an entry that is not a dense I64 or I32 table.
     NotAnIndexTable {
+        /// The weight being mapped.
         id: WeightId,
+        /// The entry the view names.
         key: WeightKey,
+        /// What the entry actually is.
         found: Box<WeightHandle>,
     },
     /// A [`WeightView::IndexNarrow`] table holding a value outside I32: element `index` (row-major)
     /// of `key` is `value`.
     IndexOutOfRange {
+        /// The weight being mapped.
         id: WeightId,
+        /// The index table's entry.
         key: WeightKey,
+        /// Row-major element index of the offending value.
         index: usize,
+        /// The value that does not fit I32.
         value: i64,
     },
     /// A [`WeightView::ExpertStack`] over an entry whose format (dense dtype or packed format) or
     /// shape differs from the first part's.
     NotStackable {
+        /// The weight being mapped.
         id: WeightId,
+        /// The entry that differs from the first part.
         key: WeightKey,
+        /// The first part's handle, which the others must match.
         first: Box<WeightHandle>,
+        /// The handle of the differing entry.
         other: Box<WeightHandle>,
     },
     /// [`WeightMap::materialize`] over a packed [`WeightView::ExpertStack`]: its experts are separate
     /// payloads, read with [`WeightMap::materialize_stack`], never one entry.
-    PackedStackIsNotOneEntry { id: WeightId },
+    PackedStackIsNotOneEntry {
+        /// The packed expert stack that was asked for as one entry.
+        id: WeightId,
+    },
     /// [`WeightMap::materialize_stack`] over a view that is not a packed expert stack.
-    NotAPackedStack { id: WeightId },
+    NotAPackedStack {
+        /// The weight whose view is not a packed expert stack.
+        id: WeightId,
+    },
     /// A [`WeightView::BlockColumns`] over axis 0 (that is [`WeightView::RowRange`]) or past the entry's
     /// rank.
     ColumnAxis {
+        /// The weight being mapped.
         id: WeightId,
+        /// The entry the view cuts.
         key: WeightKey,
+        /// The requested axis.
         axis: usize,
+        /// The entry's rank.
         rank: usize,
     },
     /// A [`WeightView::BlockColumns`] range that is empty or reaches past its axis.
     ColumnRangeOutOfBounds {
+        /// The weight being mapped.
         id: WeightId,
+        /// The axis cut.
         axis: usize,
+        /// The requested column range.
         cols: std::ops::Range<usize>,
+        /// Extent of `axis`.
         available: usize,
     },
     /// A column range of a packed weight that does not start and end on whole encoding blocks of
     /// `block_values` values, so a block would be cut in two.
     ColumnsOffBlock {
+        /// The weight being mapped.
         id: WeightId,
+        /// The packed entry the view cuts.
         key: WeightKey,
+        /// The requested column range.
         cols: std::ops::Range<usize>,
+        /// Values per encoding block; the range must start and end on multiples of it.
         block_values: usize,
     },
     /// A column range of a packed weight whose format is not stored as one run of blocks per row (a
     /// planar format), or of a packed axis other than its `K`.
-    ColumnsOfPlanar { id: WeightId, key: WeightKey },
+    ColumnsOfPlanar {
+        /// The weight being mapped.
+        id: WeightId,
+        /// The packed entry the view cuts.
+        key: WeightKey,
+    },
     /// [`WeightMap::rank_view`] over an axis whose extent `world` does not divide.
     ShareNotDivisible {
+        /// The weight being cut.
         id: WeightId,
+        /// The axis being divided.
         axis: usize,
+        /// Extent of `axis`.
         extent: usize,
+        /// Number of ranks `extent` must divide by.
         world: u32,
     },
     /// [`WeightMap::rank_view`] over a weight whose view cannot be cut further on `axis`: a stack, an
     /// index table, or a range already cut on another axis.
-    ShareOfView { id: WeightId, axis: usize },
+    ShareOfView {
+        /// The weight being cut.
+        id: WeightId,
+        /// The axis the cut was requested on.
+        axis: usize,
+    },
 }
 
 impl fmt::Display for WeightMapError {
@@ -1475,6 +1677,7 @@ pub struct LoadReport {
 }
 
 impl WeightMap {
+    /// A builder over `store` that starts from an empty map.
     pub fn builder(store: &WeightStore) -> WeightMapBuilder<'_> {
         WeightMapBuilder {
             store,
@@ -1492,24 +1695,29 @@ impl WeightMap {
         }
     }
 
+    /// What a tracer may see of `id`: its stored format and logical shape; `None` when `id` is unmapped.
     pub fn handle(&self, id: WeightId) -> Option<&WeightHandle> {
         self.entries.get(&id).map(|(_, handle)| handle)
     }
 
+    /// How `id` reads its bytes out of the store; `None` when `id` is unmapped.
     pub fn view(&self, id: WeightId) -> Option<&WeightView> {
         self.entries.get(&id).map(|(view, _)| view)
     }
 
+    /// Every mapped weight with its view and handle, in [`WeightId`] order.
     pub fn iter(&self) -> impl Iterator<Item = (WeightId, &WeightView, &WeightHandle)> {
         self.entries
             .iter()
             .map(|(id, (view, handle))| (*id, view, handle))
     }
 
+    /// Number of mapped weights.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether no weight is mapped.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1676,6 +1884,7 @@ impl WeightMapBuilder<'_> {
         self
     }
 
+    /// Finishes the map.
     pub fn build(self) -> WeightMap {
         self.map
     }

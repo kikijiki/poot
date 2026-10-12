@@ -51,44 +51,71 @@ pub use schedule::ScheduleError;
 /// of the refused operation.
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
+    /// The coordinator was opened over an empty device list.
     #[error("a coordinator needs at least one device")]
     NoDevices,
+    /// The device topology the coordinator was opened over is invalid.
     #[error(transparent)]
     Topology(#[from] TopologyError),
+    /// A stage is placed on a device that is not one of the coordinator's.
     #[error("stage {stage:?} is placed on {device:?}, which this coordinator does not drive")]
-    UnknownDevice { stage: StageId, device: DeviceId },
+    UnknownDevice {
+        /// The stage whose placement is refused.
+        stage: StageId,
+        /// The device it names.
+        device: DeviceId,
+    },
+    /// The program's communication rows were refused admission.
     #[error(transparent)]
     Schedule(#[from] ScheduleError),
+    /// A boundary transfer between stages does not match the communication row that describes it.
     #[error(
         "boundary transfer {row:?} from stage {from:?} to stage {to:?} disagrees with its \
          communication row: {why}"
     )]
     RowMismatch {
+        /// The communication row.
         row: PlanNodeId,
+        /// The producing stage of the transfer.
         from: StageId,
+        /// The consuming stage of the transfer.
         to: StageId,
+        /// Which property of the transfer disagrees with the row.
         why: &'static str,
     },
+    /// A boundary transfer is read by a stage that does not run after its producer.
     #[error("boundary transfer {row:?} is read by stage {to:?}, which does not follow {from:?}")]
     StageOrder {
+        /// The communication row.
         row: PlanNodeId,
+        /// The producing stage.
         from: StageId,
+        /// The consuming stage, which must come later in stage order.
         to: StageId,
     },
+    /// The program has host sync points, which a multi-device program cannot have; carries their count.
     #[error("the program has {0} host sync point(s); a multi-device program has none")]
     HostSync(usize),
+    /// The device refused to open the directed route a transfer needs.
     #[error("route {from:?} -> {to:?} is not available: {source}")]
     Route {
+        /// The sending device.
         from: DeviceId,
+        /// The receiving device.
         to: DeviceId,
+        /// The device's own refusal.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// An entry's recording support does not fit in the device's free memory.
     #[error(
         "device {device:?}: recording support is bounded at {need} bytes and only {free} are free"
     )]
     SupportBound {
+        /// The device that cannot hold the support allocations.
         device: DeviceId,
+        /// The conservative byte bound of the entry's support allocations.
         need: u64,
+        /// Free device memory the runtime reported.
         free: u64,
     },
     /// The device cannot report how much memory is free, so the entry's support allocations cannot be
@@ -96,7 +123,10 @@ pub enum CoordinatorError {
     #[error(
         "device {device:?} cannot report its free memory, so recording support cannot be bounded"
     )]
-    UnknownFreeMemory { device: DeviceId },
+    UnknownFreeMemory {
+        /// The device that cannot report its free memory.
+        device: DeviceId,
+    },
 }
 
 impl From<CoordinatorError> for ExecError {
@@ -108,6 +138,7 @@ impl From<CoordinatorError> for ExecError {
 /// What one device did for the coordinator's entries, by independent counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceCounters {
+    /// The device these counters describe.
     pub device: DeviceId,
     /// Recording sessions: once per entry that has stages on this device, when the entry first
     /// records. A step of an unchanged entry adds none.
@@ -124,8 +155,10 @@ pub struct DeviceCounters {
     pub native: NativeCounters,
 }
 
+/// A coordinator's counters over all its devices: one [`DeviceCounters`] each, plus the steps it ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoordinatorCounters {
+    /// One entry per device, in rank order.
     pub devices: Vec<DeviceCounters>,
     /// Steps completed.
     pub steps: u64,
@@ -155,10 +188,14 @@ pub struct SupportActual {
     pub graph_instantiations: u64,
 }
 
+/// One device's recording support for an entry: what was planned against what was allocated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceSupport {
+    /// The device the figures describe.
     pub device: DeviceId,
+    /// The bound and exact counts admission checked.
     pub planned: SupportPlan,
+    /// What the device's own counters recorded while the entry loaded and recorded.
     pub actual: SupportActual,
 }
 

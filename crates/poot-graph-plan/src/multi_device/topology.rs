@@ -14,7 +14,9 @@ pub struct DeviceId(pub u32);
 /// One device's stable identity, target, and usable capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceSpec {
+    /// The device's stable identity.
     pub id: DeviceId,
+    /// The compile target the device runs.
     pub target: TargetId,
     /// Usable bytes on this device, after any reserve the caller already excluded. The
     /// [`crate::multi_device::accounting`] reserve category is separate.
@@ -27,22 +29,30 @@ pub struct DeviceSpec {
 /// carried by [`DeviceSpec::target`]; every cross-device capability is a link row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LinkCapability {
+    /// The device that performs the operation.
     pub from: DeviceId,
+    /// The device the operation targets.
     pub to: DeviceId,
+    /// The operation the link admits.
     pub kind: CollectiveKind,
 }
 
 /// A caller-declared, model-neutral device topology.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Topology {
+    /// Every device, each declared exactly once.
     pub devices: Vec<DeviceSpec>,
+    /// Every accepted cross-device capability row.
     pub links: Vec<LinkCapability>,
 }
 
+/// Why a declared topology is not well-formed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TopologyError {
+    /// The same device id is declared twice.
     #[error("device {0:?} is declared more than once in the topology")]
     DuplicateDevice(DeviceId),
+    /// A link names a device the topology does not declare.
     #[error("link names unknown device {0:?}")]
     UnknownDeviceInLink(DeviceId),
 }

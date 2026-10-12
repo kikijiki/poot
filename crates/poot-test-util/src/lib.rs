@@ -168,10 +168,12 @@ pub fn model_path_with(
     Some(path)
 }
 
+/// `v` as little-endian bytes.
 pub fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// `n` deterministic pseudo-random values in `[-1, 1)` from an xorshift stream seeded by `seed`.
 pub fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -184,6 +186,7 @@ pub fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// Reference `x @ w` for one row: `x` is `in_dim` long, `w` is `[in_dim, out_dim]` row-major.
 pub fn linear_ref(x: &[f32], w: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; out_dim];
     for o in 0..out_dim {
@@ -336,12 +339,15 @@ pub fn max_abs_error_f64(actual: &[f32], expected: &[f64]) -> f64 {
     worst.error
 }
 
+/// Reference RMS norm of the first `n` elements of `x` with scale `w` and epsilon `eps`.
 pub fn rmsnorm_ref(x: &[f32], w: &[f32], n: usize, eps: f32) -> Vec<f32> {
     let ms: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
     let den = (ms + eps).sqrt();
     (0..n).map(|i| x[i] / den * w[i]).collect()
 }
 
+/// Reference half-split rotary embedding of one `d`-wide `row` at position `pos`, from `[pos, d]` cos and
+/// sin tables.
 pub fn rope_ref(row: &[f32], cos: &[f32], sin: &[f32], pos: usize, d: usize) -> Vec<f32> {
     let c = &cos[pos * d..(pos + 1) * d];
     let s = &sin[pos * d..(pos + 1) * d];
@@ -363,6 +369,7 @@ pub fn seed_of(name: &str) -> u64 {
     })
 }
 
+/// One blocking HTTP/1.1 request to `addr`: the response's status code (0 if unparsable) and body.
 pub fn http_request(
     addr: &str,
     method: &str,
@@ -392,6 +399,7 @@ pub fn http_request(
     Ok((status, resp[split..].to_string()))
 }
 
+/// `s` without ANSI escape sequences.
 pub fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -410,6 +418,7 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Polls `GET /health` on `addr` until it answers 200 or `deadline` passes; whether it answered.
 pub fn wait_ready(addr: &str, deadline: Instant) -> bool {
     while Instant::now() < deadline {
         if let Ok((200, _)) = http_request(addr, "GET", "/health", None, Duration::from_secs(5)) {

@@ -11,7 +11,9 @@ use poot_target::Backend;
 /// the format, so it cannot change whether a row admits a format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PackedKernelOpKind {
+    /// Gathers whole rows of a packed table by index (an embedding lookup).
     RowGather,
+    /// Contracts an activation against a packed weight.
     Contraction,
 }
 
@@ -29,8 +31,11 @@ impl From<poot_kernelgen::PackedKernelOp> for PackedKernelOpKind {
 /// detected at runtime, never a compile-time constant).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PackedLoweringBackend {
+    /// The SPIR-V family: the Vulkan and wgpu backends.
     SpirvVulkan,
+    /// The AMD GCN family: the ROCm backend, whatever the attached part.
     AmdGcn,
+    /// The NVIDIA PTX family.
     Nvptx,
 }
 
@@ -48,8 +53,11 @@ impl From<Backend> for PackedLoweringBackend {
 /// descriptor PREDICATE, never a list of scheme names (the 539a rule applied to planning): a new
 /// format that satisfies an existing predicate needs no new row.
 pub struct PackedLoweringRow {
+    /// The kernel op the row lowers.
     pub op: PackedKernelOpKind,
+    /// The backend families the row lowers on.
     pub backends: &'static [PackedLoweringBackend],
+    /// The descriptor predicate a format must satisfy for the row to admit it.
     pub admits: fn(&poot_quant::format::FormatDescriptor) -> bool,
 }
 

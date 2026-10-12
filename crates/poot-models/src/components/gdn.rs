@@ -180,18 +180,22 @@ impl GdnParams {
         self.dims.conv_channels()
     }
 
+    /// The width of all value heads together: `value_heads * head_dim`.
     pub fn value_dim(&self) -> usize {
         self.dims.value_dim()
     }
 
+    /// The value head count.
     pub fn value_heads(&self) -> usize {
         self.dims.value_heads
     }
 
+    /// The key (and query) head count; divides `value_heads`.
     pub fn key_heads(&self) -> usize {
         self.dims.key_heads
     }
 
+    /// The per-head width, shared by keys and values.
     pub fn head_dim(&self) -> usize {
         self.dims.head_dim
     }
@@ -225,6 +229,9 @@ pub struct GdnWeights {
 }
 
 impl GdnWeights {
+    /// Resolves layer `layer`'s projections, conv, decay, gate norm and output tensors from `map` and
+    /// checks each shape against `p` and the model `width`; a missing or mis-shaped tensor is a typed
+    /// [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,

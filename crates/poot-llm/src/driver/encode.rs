@@ -25,14 +25,26 @@ use super::{Driver, EntryKey, ModelRole, SlotRole, StepData};
 pub enum EncodeRow<'a> {
     /// A token sequence, with each token's segment id (`types` is empty for all-zero ids; a
     /// cross-encoder's second sentence carries ones).
-    Tokens { ids: &'a [u32], types: &'a [u32] },
+    Tokens {
+        /// Token ids of the row.
+        ids: &'a [u32],
+        /// Segment id of each token, or empty for all zeros.
+        types: &'a [u32],
+    },
     /// One image frame of a vision tower: its normalized pixels, channel first, and the positions
     /// (patches) the tower traces per frame.
-    Frame { pixels: &'a [f32], positions: usize },
+    Frame {
+        /// Normalized pixel values, channel first.
+        pixels: &'a [f32],
+        /// Positions (patches) the tower traces for the frame.
+        positions: usize,
+    },
     /// One image or video of a windowed vision tower: its patches in the tower's window order
     /// (`patch_dim` values each) and the grid facts the tower attends and rotates by.
     Patches {
+        /// The patches' pixel values in the tower's window order.
         pixels: &'a [f32],
+        /// Grid facts the tower attends and rotates by.
         geometry: &'a PatchGeometry,
     },
 }
@@ -40,6 +52,7 @@ pub enum EncodeRow<'a> {
 /// What one [`Driver::encode`] step runs: every row of one kind.
 #[derive(Clone, Copy, Debug)]
 pub struct EncodeRequest<'a> {
+    /// The rows of the step; every row is one kind.
     pub rows: &'a [EncodeRow<'a>],
 }
 

@@ -23,6 +23,7 @@ const PRODUCTION_VOCAB: usize = 151_936;
 
 /// One `[rows, vocab]` logits fixture and the `[rows, 2]` pairs its greedy pick must produce.
 pub struct GreedyCase {
+    /// The logits program; the greedy pick is its `[rows, 2]` output.
     pub fixture: Fixture,
     /// `(token, non_finite_index)` per row, as [`greedy_pair`] defines them.
     pub expected: Vec<(i32, i32)>,

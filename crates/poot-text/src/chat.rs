@@ -192,7 +192,9 @@ impl TextCodec {
 /// Who said a turn of a conversation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Speaker {
+    /// The human side of the conversation.
     User,
+    /// The model's side of the conversation.
     Assistant,
 }
 
@@ -211,7 +213,9 @@ impl Speaker {
 /// [`ChatFormat::turn_end`] on the fallback path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedChat {
+    /// The model-ready prompt text.
     pub prompt: String,
+    /// The turn-end markers generation stops or truncates at.
     pub stops: Vec<String>,
 }
 

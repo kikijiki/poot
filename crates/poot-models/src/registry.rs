@@ -21,7 +21,9 @@ use crate::model::{ConfigReason, FamilyKey, Model, ModelError};
 pub enum RawConfig<'a> {
     /// An HF checkpoint: `config.json`, and `generation_config.json` when the checkpoint ships one.
     HfJson {
+        /// The parsed `config.json`.
         config: &'a serde_json::Value,
+        /// The parsed `generation_config.json`, when present.
         generation: Option<&'a serde_json::Value>,
     },
     /// A GGUF checkpoint's metadata.
@@ -58,6 +60,7 @@ impl fmt::Debug for RawConfig<'_> {
 }
 
 impl RawConfig<'_> {
+    /// Which config format this is, and so which key names the family.
     pub fn source(&self) -> ConfigSource {
         match self {
             RawConfig::HfJson { .. } => ConfigSource::HfModelType,
@@ -128,8 +131,11 @@ impl RawConfig<'_> {
 /// [`RawConfig`] borrows.
 #[derive(Clone, Debug)]
 pub struct Fixture {
+    /// The HF `config.json` the family parses.
     pub config: serde_json::Value,
+    /// The `generation_config.json`, when the fixture ships one.
     pub generation: Option<serde_json::Value>,
+    /// The synthetic weights, shaped from `config`.
     pub store: WeightStore,
 }
 
@@ -183,6 +189,7 @@ impl Fixture {
         }
     }
 
+    /// The fixture as a [`RawConfig`] borrowing its config and generation config.
     pub fn raw(&self) -> RawConfig<'_> {
         RawConfig::HfJson {
             config: &self.config,
@@ -200,9 +207,13 @@ pub type FixtureVariant = (&'static str, fn() -> Fixture);
 /// One family, as data: the config keys that name it, how to build it and its test fixture.
 #[derive(Clone, Copy)]
 pub struct FamilyEntry {
+    /// The family's key.
     pub family: FamilyKey,
+    /// The config keys that name this family, each with the config source it is read from.
     pub keys: &'static [(ConfigSource, &'static str)],
+    /// Builds the family's [`Model`].
     pub build: BuildModel,
+    /// The family's base test fixture.
     pub fixture: fn() -> Fixture,
     /// More fixtures of the same family, one per option a key can select (llama's Mixtral experts,
     /// granite's `granitemoe` experts), by name.
@@ -218,21 +229,35 @@ impl fmt::Debug for FamilyEntry {
     }
 }
 
+/// Why a family could not be registered or resolved.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RegistryError {
     #[error(
         "no family is registered for {origin} {key:?}: a family must be added with Registry::register before a checkpoint naming it can load"
     )]
-    Unregistered { origin: ConfigSource, key: String },
+    /// No registered family is named by this key.
+    Unregistered {
+        /// The config source the key was read from.
+        origin: ConfigSource,
+        /// The key the config carries.
+        key: String,
+    },
+    /// Two families name the same config key.
     #[error("{origin} {key:?} is registered by both {first} and {second}")]
     DuplicateKey {
+        /// The config source the key is read from.
         origin: ConfigSource,
+        /// The contested key.
         key: String,
+        /// The family that already owns the key.
         first: FamilyKey,
+        /// The family that tried to register it.
         second: FamilyKey,
     },
+    /// The family is already registered.
     #[error("family {0} is already registered")]
     DuplicateFamily(FamilyKey),
+    /// The config has no key naming a family.
     #[error("the config has no {0} key")]
     NoKey(ConfigSource),
 }
@@ -240,8 +265,10 @@ pub enum RegistryError {
 /// A checkpoint could not be built into a model: its family is unknown, or the family refused it.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadModelError {
+    /// The registry could not resolve or register the family.
     #[error(transparent)]
     Registry(#[from] RegistryError),
+    /// The family refused the checkpoint.
     #[error(transparent)]
     Model(#[from] ModelError),
 }
@@ -254,6 +281,7 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// A registry with no families; [`Registry::builtin`] is the one a driver's caller wants.
     pub fn empty() -> Self {
         Self::default()
     }
@@ -321,6 +349,7 @@ impl Registry {
         Ok((entry.build)(raw, store)?)
     }
 
+    /// Every registered family, in registration order.
     pub fn entries(&self) -> &[FamilyEntry] {
         &self.entries
     }

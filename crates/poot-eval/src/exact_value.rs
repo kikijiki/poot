@@ -27,6 +27,7 @@ impl PartialEq for ExactI32TensorView {
 impl Eq for ExactI32TensorView {}
 
 impl ExactI32TensorView {
+    /// Build a view over `words`, refusing a word count that is not `shape`'s element count.
     pub fn try_from_words(shape: Vec<usize>, words: Arc<[i32]>) -> Result<Self, EvalError> {
         let expected: usize = shape.iter().product();
         if expected != words.len() {
@@ -41,18 +42,22 @@ impl ExactI32TensorView {
         Ok(Self { shape, words })
     }
 
+    /// The logical shape, row-major.
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
 
+    /// The element count, which is the word count.
     pub fn numel(&self) -> usize {
         self.words.len()
     }
 
+    /// The authoritative words, in row-major order.
     pub fn i32_words(&self) -> &[i32] {
         &self.words
     }
 
+    /// The shared allocation behind the words, for identity comparison and zero-copy hand-off.
     pub fn word_owner(&self) -> &Arc<[i32]> {
         &self.words
     }
@@ -96,13 +101,16 @@ impl ExactI32TensorView {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ExactValue {
+    /// Exact BF16 words (a derived or bound BF16 value).
     Bf16(ExactBf16TensorView),
+    /// Exact I32 words (an index, token or position value).
     I32(ExactI32TensorView),
 }
 
 impl Eq for ExactValue {}
 
 impl ExactValue {
+    /// The element dtype: `BF16` or `I32`.
     pub fn dtype(&self) -> DType {
         match self {
             Self::Bf16(_) => DType::BF16,
@@ -110,6 +118,7 @@ impl ExactValue {
         }
     }
 
+    /// The logical shape, row-major.
     pub fn shape(&self) -> &[usize] {
         match self {
             Self::Bf16(view) => view.shape(),
@@ -117,6 +126,7 @@ impl ExactValue {
         }
     }
 
+    /// The logical element count.
     pub fn numel(&self) -> usize {
         match self {
             Self::Bf16(view) => view.numel(),
@@ -124,6 +134,7 @@ impl ExactValue {
         }
     }
 
+    /// Bytes of word storage the value reads: two per BF16 element, four per I32 element.
     pub fn physical_bytes(&self) -> usize {
         match self {
             Self::Bf16(view) => view.physical_bytes(),

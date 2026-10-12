@@ -45,24 +45,36 @@ use poot_text::TextCodec;
 /// Why a Qwen2.5-VL checkpoint cannot load or a request cannot run.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlError {
+    /// A checkpoint JSON file could not be parsed.
     #[error("{path}: {source}")]
     Json {
+        /// The file that failed.
         path: PathBuf,
+        /// The underlying parse error.
         #[source]
         source: serde_json::Error,
     },
+    /// A checkpoint file could not be read.
     #[error("{path}: {source}")]
     Io {
+        /// The file that failed.
         path: PathBuf,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
     /// `config.json` has no `vision_config` object.
     #[error("{path}: vision_config is missing or not an object")]
-    NoVisionConfig { path: PathBuf },
+    NoVisionConfig {
+        /// The `config.json` that lacks it.
+        path: PathBuf,
+    },
+    /// An image or video grid the vision tower cannot take.
     #[error("image or video grid {grid:?}: {source}")]
     Grid {
+        /// The grid as `[t, h, w]` patch counts.
         grid: [usize; 3],
+        /// Why the tower refuses the grid.
         #[source]
         source: GridError,
     },
@@ -71,14 +83,22 @@ pub enum Qwen25VlError {
         "the processed {kind} patches do not match their grids and the tower's {patch_dim}-value patch"
     )]
     Patches {
+        /// Whether the offending patches belong to an image or a video.
         kind: MropeVisualKind,
+        /// The values per patch the tower expects.
         patch_dim: usize,
     },
     /// The tower returned a different number of rows than the prompt has placeholders.
     #[error(
         "the prompt holds {placeholders} image and video placeholders but the media give {rows} rows"
     )]
-    Placeholders { placeholders: usize, rows: usize },
+    Placeholders {
+        /// Image and video placeholder tokens in the prompt.
+        placeholders: usize,
+        /// Rows the vision tower produced.
+        rows: usize,
+    },
+    /// The vision driver failed encoding the media, or the text driver failed generating.
     #[error(transparent)]
     Driver(#[from] DriverError),
 }
@@ -86,15 +106,19 @@ pub enum Qwen25VlError {
 /// Why a chat request cannot run: it does not assemble, or what it assembled does not.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlChatError<E: std::error::Error + 'static> {
+    /// The request did not assemble into patches, grids, a prompt and positions.
     #[error(transparent)]
     Assemble(Qwen25VlChatRequestError<E>),
+    /// The assembled request could not run.
     #[error(transparent)]
     Run(#[from] Qwen25VlError),
 }
 
 /// What to generate from an assembled request.
 pub struct Qwen25VlGenerate {
+    /// The cap on generated tokens.
     pub max_new: usize,
+    /// The sampling configuration, greedy or otherwise.
     pub sampler: Sampler,
 }
 
@@ -131,7 +155,9 @@ pub struct Qwen25VlFrontEnd {
 /// sectioned positions are not optional.
 #[derive(Clone, Debug)]
 pub struct Qwen25VlPrompt {
+    /// The prompt's token ids, the image and video placeholders included.
     pub prompt: Vec<u32>,
+    /// The embedding rows that replace the placeholders.
     pub embeds: PromptEmbeds,
     /// Where every prompt token rotates (`Slot::MropePosition`).
     pub mrope: MropePositionIds,

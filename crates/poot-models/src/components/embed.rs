@@ -14,12 +14,14 @@ pub struct Embedding {
 }
 
 impl Embedding {
+    /// Resolves the model's embedding table and checks it is `[vocab, width]`.
     pub fn new(map: &WeightMap, vocab: usize, width: usize) -> Result<Self, WeightError> {
         Ok(Self {
             table: Weight::new(map, WeightId::model(WeightRole::Embed), &[vocab, width])?,
         })
     }
 
+    /// The table itself, for a tied head that reuses it as the output projection.
     pub fn table(&self) -> &Weight {
         &self.table
     }

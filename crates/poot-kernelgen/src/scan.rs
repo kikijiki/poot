@@ -33,7 +33,9 @@ use crate::request::SerialWork;
 /// Which recurrence a scan kernel runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanKernel {
+    /// The delta-rule recurrence, `rows == width == D`, over six operands.
     DeltaRule,
+    /// The SSD (Mamba-2) recurrence, `rows == N`, `width == P`, over seven operands.
     Ssd,
 }
 
@@ -50,14 +52,18 @@ impl ScanKernel {
 /// carried state from the state operand; every later one reads it from the packed result's state rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanPhase {
+    /// First token of the range.
     pub start: usize,
+    /// Tokens in the range.
     pub count: usize,
 }
 
 /// What the planner asks the scan generator for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanSpec {
+    /// Which recurrence the kernel runs.
     pub kernel: ScanKernel,
+    /// Heads, each with its own independent state.
     pub heads: usize,
     /// The whole sequence length (the packed result's layout), of which `phase` runs a part.
     pub len: usize,
@@ -74,6 +80,7 @@ pub struct ScanSpec {
     /// rule and one for SSD. The split reassociates each dot product, so its result differs from the
     /// unsplit one in f32 rounding only.
     pub row_split: usize,
+    /// The token range this launch covers.
     pub phase: ScanPhase,
 }
 
@@ -83,10 +90,12 @@ impl ScanSpec {
         self.cols / self.row_split
     }
 
+    /// Workgroups along the state-column axis per head: the columns divided into workgroup-sized blocks.
     pub fn col_blocks(&self) -> usize {
         self.width.div_ceil(self.state_cols())
     }
 
+    /// Workgroups the launch needs: one per head per column block.
     pub fn workgroups(&self) -> usize {
         self.heads * self.col_blocks()
     }

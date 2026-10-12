@@ -65,9 +65,13 @@ use poot_tensor::{DType, HostTensor};
 /// One parity fixture: a graph, the weight store it binds, and the input values for its first few
 /// steps (enough to exercise the record-then-replay boundary at least twice).
 pub struct Fixture {
+    /// Fixture name, used in assertion messages and to pick a row out of a table.
     pub name: &'static str,
+    /// The traced program the executor compiles.
     pub graph: Graph,
+    /// The weight store binding the graph's `Storage::Const` inputs by name.
     pub store: WeightStore,
+    /// Per-step input rows: `steps[i]` binds the slot inputs of step `i`, in step order.
     pub steps: Vec<Vec<StepFixture>>,
 }
 
@@ -97,6 +101,7 @@ fn const_data(name: &str, shape: &[usize]) -> Vec<f32> {
     fill(n, seed)
 }
 
+/// The deterministic weight store for `g`: one dense F32 entry per named `Storage::Const` input, filled by a fixed seed derived from the constant's name (the causal mask is generated, not random).
 pub fn store_for(g: &Graph) -> WeightStore {
     store_with(g, |_, _| {})
 }
@@ -121,6 +126,7 @@ pub fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
     builder.build()
 }
 
+/// The slot inputs for one step of `g`: `Token` rows from `tokens` and `Pos` rows counting up from `start`. Panics on any other slot kind.
 pub fn step_fixtures(g: &Graph, tokens: &[u32], start: usize) -> Vec<StepFixture> {
     g.inputs()
         .iter()
@@ -501,7 +507,9 @@ fn tensors_close(a: &HostTensor, b: &HostTensor, rel: f32) -> bool {
 /// const input declares (`meta.name`) and its typed host tensor (matching [`StepFixture`]'s
 /// `Storage::Slot` row shape).
 pub struct ConstFixture {
+    /// The checkpoint-style name of the `Storage::Const` input this row binds.
     pub name: &'static str,
+    /// The constant's value, typed to match the input's aval.
     pub tensor: HostTensor,
 }
 

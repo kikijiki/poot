@@ -26,22 +26,30 @@ use poot_text::{read_tokenizer_config_chat, render_jinja_value};
 const VISION_END_DELIMITER: &str = "<|vision_end|>";
 /// One typed Qwen2.5-VL chat message.
 pub struct Qwen25VlChatMessage<'a> {
+    /// The role the chat template renders (`"user"`, `"assistant"`, `"system"`); must not be empty.
     pub role: &'a str,
+    /// The message's content, text or ordered typed parts.
     pub content: Qwen25VlChatMessageContent<'a>,
 }
 
 /// Message content: a plain string or ordered typed parts.
 pub enum Qwen25VlChatMessageContent<'a> {
+    /// The whole content as one string.
     Text(&'a str),
+    /// Ordered parts; the order of the media parts is the media order of the request.
     Parts(Vec<Qwen25VlChatContent<'a>>),
 }
 
 /// One content part. Images are already decoded or a local PNG/JPEG path; videos are already probed.
 #[derive(Clone, Copy)]
 pub enum Qwen25VlChatContent<'a> {
+    /// Literal text.
     Text(&'a str),
+    /// An image already decoded.
     Image(&'a Qwen25VlDecodedImage),
+    /// A local PNG or JPEG file, decoded when the request is assembled.
     ImagePath(&'a Path),
+    /// A video already probed; its frames come from the caller's frame source.
     Video(Qwen25VlVideoMetadata<'a>),
 }
 
@@ -53,49 +61,85 @@ pub(crate) struct Qwen25VlChatRequestMropeModelInputRequest<'dir, 'msg, 'data, '
     pub video_sources: &'sources mut [S],
 }
 
+/// Why a chat request does not assemble into a raw rendered request.
+/// `E` is the caller's video frame source error.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlChatRequestError<E: std::error::Error + 'static> {
+    /// The request carried no message.
     #[error("Qwen2.5-VL chat request has no messages")]
     EmptyMessages,
+    /// A message has no role.
     #[error("Qwen2.5-VL chat message {message_index} is missing a role")]
-    MissingRole { message_index: usize },
+    MissingRole {
+        /// Index of the message in the request.
+        message_index: usize,
+    },
+    /// A message has an empty role string.
     #[error("Qwen2.5-VL chat message {message_index} has an empty role")]
-    EmptyRole { message_index: usize },
+    EmptyRole {
+        /// Index of the message in the request.
+        message_index: usize,
+    },
+    /// An image part names an empty path.
     #[error(
         "Qwen2.5-VL chat message {message_index} image part {part_index} has an empty image path"
     )]
     EmptyImagePath {
+        /// Index of the message in the request.
         message_index: usize,
+        /// Index of the part in that message's content.
         part_index: usize,
     },
+    /// A local image file could not be read or decoded.
     #[error(
         "load Qwen2.5-VL chat image file {path:?} at message {message_index} part {part_index}"
     )]
     ImageFile {
+        /// Index of the message in the request.
         message_index: usize,
+        /// Index of the part in that message's content.
         part_index: usize,
+        /// The path that failed.
         path: PathBuf,
+        /// Whether the read or the decode failed.
         #[source]
         source: Qwen25VlChatImageFileError,
     },
+    /// The request carries more media items than the raw assembler's cap.
     #[error("Qwen2.5-VL chat request has {actual} media items, exceeding the {limit}-item cap")]
-    TooManyMediaItems { actual: usize, limit: usize },
+    TooManyMediaItems {
+        /// Media items (images and videos) in the request.
+        actual: usize,
+        /// The cap, `QWEN2_5_VL_MAX_RAW_MEDIA_ITEMS`.
+        limit: usize,
+    },
+    /// The checkpoint's processor and mrope metadata could not be loaded.
     #[error(transparent)]
     Metadata(#[from] QwenVlMropeMetadataLoadError),
+    /// The checkpoint is a Qwen vision-language model of another type than Qwen2.5-VL.
     #[error("Qwen2.5-VL chat request does not support model type {model_type:?}")]
-    UnsupportedModelType { model_type: QwenVlModelType },
+    UnsupportedModelType {
+        /// The model type the checkpoint declares.
+        model_type: QwenVlModelType,
+    },
+    /// The checkpoint's tokenizer config has no chat template.
     #[error("Qwen2.5-VL chat request is missing a chat template")]
     MissingChatTemplate,
+    /// Rendering the chat template failed; carries the renderer's message.
     #[error("render Qwen2.5-VL chat template: {0}")]
     ChatTemplate(String),
+    /// The rendered request did not assemble (media, markers, frames or grids).
     #[error(transparent)]
     RawRequest(Qwen25VlRawRequestAssemblyError<E>),
 }
 
+/// Why a local image file of a chat part could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlChatImageFileError {
+    /// The file could not be read.
     #[error("read Qwen2.5-VL image file: {0}")]
     Read(#[from] std::io::Error),
+    /// The file's bytes did not decode to an image.
     #[error(transparent)]
     Decode(#[from] Qwen25VlImageDecodeError),
 }

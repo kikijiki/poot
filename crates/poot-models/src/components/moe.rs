@@ -190,10 +190,12 @@ impl MoeParams {
         }
     }
 
+    /// The routed expert count.
     pub fn experts(&self) -> usize {
         self.router.experts()
     }
 
+    /// How many experts each token selects.
     pub fn top_k(&self) -> usize {
         self.router.top_k()
     }
@@ -340,6 +342,8 @@ impl MoeWeights {
         &self.router
     }
 
+    /// Resolves layer `layer`'s router, expert projections and shared expert from `map` and checks
+    /// each shape against `p`; a missing or mis-shaped tensor is a typed [`WeightError`].
     pub fn new(map: &WeightMap, layer: usize, p: &MoeParams) -> Result<Self, WeightError> {
         let (width, inter) = (p.width, p.inter);
         let projection = |proj, out, k| ExpertProjection::new(map, layer, proj, p, out, k);

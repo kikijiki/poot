@@ -464,6 +464,7 @@ pub fn apply_movement(op: &OpKind, ins: &[HostTensor]) -> Result<HostTensor, Eva
 /// The storage-aware walk's movement over every carrier: host tensors through the functions above
 /// (every dtype, in its own storage class), and a refusal for exact and packed carriers.
 impl Value {
+    /// Reshape a host or exact value to `shape`; a packed carrier is refused.
     pub fn reshape(&self, shape: Vec<usize>) -> Result<Self, EvalError> {
         match self {
             Value::Host(t) => Ok(reshape(t, &shape)?.into()),
@@ -476,6 +477,7 @@ impl Value {
         }
     }
 
+    /// Permute the axes by `perm`; a packed carrier is refused.
     pub fn transpose(&self, perm: &[usize]) -> Result<Self, EvalError> {
         match self {
             Value::Host(t) => Ok(transpose(t, perm)?.into()),
@@ -488,6 +490,7 @@ impl Value {
         }
     }
 
+    /// Slice `start..end` along `axis`; only a host tensor is admitted.
     pub fn slice(&self, axis: usize, start: usize, end: usize) -> Result<Self, EvalError> {
         match self {
             Value::Host(t) => Ok(slice(t, axis, start, end)?.into()),
@@ -500,6 +503,7 @@ impl Value {
         }
     }
 
+    /// Concatenate `parts` along `axis`; only host tensors are admitted.
     pub fn concat(parts: &[&Self], axis: usize) -> Result<Self, EvalError> {
         let tensors = parts
             .iter()
@@ -516,6 +520,7 @@ impl Value {
         Ok(concat(&tensors, axis)?.into())
     }
 
+    /// Overwrite the window of `self` at `index` along `axis` with `update`; only host tensors are admitted.
     pub fn dynamic_update_slice(
         &self,
         update: &Self,
@@ -535,6 +540,7 @@ impl Value {
         }
     }
 
+    /// Broadcast to `shape`; only a host tensor is admitted.
     pub fn broadcast(&self, shape: Vec<usize>) -> Result<Self, EvalError> {
         match self {
             Value::Host(t) => Ok(broadcast_to(t, &shape)?.into()),
@@ -547,6 +553,7 @@ impl Value {
         }
     }
 
+    /// Write `src` rows into `self` at the positions `inverse` names; only host tensors are admitted.
     pub fn scatter_update(
         &self,
         src: &Self,
