@@ -2,7 +2,7 @@
 //!
 //! The mechanism under test (research note 2026-10-12, section 2): DRAM channels are selected by address bits
 //! [11:8], a 256 B granule over 16 channels, so a read whose row stride is `stride_bytes` reaches
-//! `16 / gcd(stride_bytes / 256, 16)` channels (`poot_test_util::dram_channels::alias_factor`). The probe
+//! `16 / gcd(stride_bytes / 256, 16)` channels (`poot_target::dram_channels::alias_factor`). The probe
 //! reads exactly one granule from each row of a `[rows, stride / 4]` f32 activation slot (a slice of the
 //! first `GRANULE_BYTES / 4` columns, reduced along the row), so the only thing that changes between two
 //! measurements is the row stride.
@@ -16,8 +16,8 @@ use poot_executor::{DeviceTime, Executor, MeasuredDeviceTime, NoSync, StepInputs
 use poot_graph_ir::op::RedOp;
 use poot_graph_ir::{Builder, Graph, Slot, TensorType};
 use poot_graph_plan::Target;
+use poot_target::dram_channels::{CHANNELS, GRANULE_BYTES, alias_factor};
 use poot_tensor::HostTensor;
-use poot_test_util::dram_channels::{CHANNELS, GRANULE_BYTES, alias_factor};
 
 use crate::scan::load_graph_entry;
 

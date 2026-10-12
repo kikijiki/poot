@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use poot_executor::ExecError;
+use poot_graph_ir::SlotMapError;
 use poot_graph_plan::{Refusal, staged::StagedCompileError};
 use poot_models::model::{ModelError, Phase, StepShape, TraceError};
 use poot_models::registry::RegistryError;
@@ -579,6 +580,10 @@ pub enum DriverError {
     /// The text codec could not decode the generated tokens.
     #[error("detokenization: {0}")]
     Text(#[source] Box<TextError>),
+    /// A step's write map names a pool slot twice or one outside the pool: the block table handed two
+    /// tokens one slot, so the step was not run.
+    #[error("the step's write map is not one owner per slot: {0}")]
+    WriteMap(#[from] SlotMapError),
 }
 
 /// How a [`DriverError`] relates to the request that met it and to the driver's state, which is what
@@ -616,6 +621,7 @@ impl DriverError {
             DriverError::Model(_)
             | DriverError::Device(_)
             | DriverError::Load(_)
+            | DriverError::WriteMap(_)
             | DriverError::Text(_) => FailureClass::Fault,
         }
     }

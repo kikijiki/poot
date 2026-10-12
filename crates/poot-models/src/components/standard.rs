@@ -11,7 +11,8 @@
 //! A recurrent component (a conv window, a GDN or SSM matrix) keeps one state row per sequence:
 //! [`Step::recurrent_state`] hands it the rows this step continues and [`Step::carry_recurrent`] writes
 //! them back. Under [`KvLayout::Paged`] the state is a pool of one row per sequence the pool serves,
-//! addressed through two `Slot::Activation` index inputs (`state_read`, `state_write`), so a sequence
+//! addressed through two index inputs (`state_read`, a `Slot::Activation`; `state_write`, a
+//! `Slot::WriteMap`), so a sequence
 //! keeps its row whichever step row it occupies; under [`KvLayout::Contiguous`] the one row is the step's.
 //!
 //! A step whose shape carries a [`crate::model::HiddenCarry`] also writes its final hidden state at every position
@@ -40,7 +41,7 @@ use poot_graph_ir::Requirement;
 
 /// `Slot::Activation` tag of a paged step's `[rows]` state read index.
 pub const STATE_READ_SLOT: &str = "state_read";
-/// `Slot::Activation` tag of a paged step's `[seqs]` state write map.
+/// `Slot::WriteMap` tag of a paged step's `[rows]` state write map.
 pub const STATE_WRITE_SLOT: &str = "state_write";
 /// The state name of the hidden-state carry ([`Step::carry_hidden`]): one f32
 /// `[seqs, positions, width]` value, the same aval in every program of an executable.
@@ -125,23 +126,24 @@ fn hidden_dims(b: &Builder, hidden: Traced) -> Result<(usize, usize), TraceError
     Ok((tokens, width))
 }
 
-/// The two slot maps of a [`KvLayout::Paged`] step, both I32 `Slot::SlotMap` inputs.
+/// The two slot maps of a [`KvLayout::Paged`] step, both I32 inputs.
 #[derive(Clone, Copy, Debug)]
 pub struct PagedMaps {
-    /// `[rows, capacity]`: row `r`'s logical position to the pool slot holding its K/V.
+    /// `Slot::SlotMap` `[rows, capacity]`: row `r`'s logical position to the pool slot holding its K/V.
     pub read: Traced,
-    /// `[pool_slots]`: pool slot to the flat `[rows * tokens]` index of the token whose K/V this step
-    /// writes there, or -1 to keep the slot as it is.
+    /// `Slot::WriteMap` `[rows * tokens]`: the pool slot the K/V of flat token `r * tokens + i` is
+    /// written to, or -1 for a padding token. Each slot is named at most once (a `ForwardSlotMap`).
     pub write: Traced,
 }
 
-/// The two index inputs of a paged step's recurrent state pool, both `Slot::Activation` I32.
+/// The two index inputs of a paged step's recurrent state pool, both I32: `read` a `Slot::Activation`,
+/// `write` a `Slot::WriteMap`.
 #[derive(Clone, Copy, Debug)]
 struct StateRows {
     /// `[rows]`: the pool row each step row continues. A masked row (beyond the live ones) reads row 0.
     read: Traced,
-    /// `[seqs]`: pool row to the step row whose result it takes, or -1 to keep it. A masked row is
-    /// named by no entry, so its result is dropped.
+    /// `Slot::WriteMap` `[rows]`: the pool row each step row's result is written to. A masked row is
+    /// -1, so its result is dropped.
     write: Traced,
 }
 
@@ -167,15 +169,16 @@ impl Step {
         let paged = match shape.kv {
             KvLayout::Contiguous => None,
             KvLayout::Paged { pool_slots, .. } => Some(PagedMaps {
-                read: b.slot_named(
-                    Slot::SlotMap,
+                read: b.read_map(
                     "read",
-                    TensorType::new(vec![shape.rows.get(), shape.capacity.get()], DType::I32),
+                    shape.rows.get(),
+                    shape.capacity.get(),
+                    pool_slots.get(),
                 )?,
-                write: b.slot_named(
-                    Slot::SlotMap,
+                write: b.write_map(
                     "write",
-                    TensorType::new(vec![pool_slots.get()], DType::I32),
+                    shape.rows.get() * shape.tokens.get(),
+                    pool_slots.get(),
                 )?,
             }),
         };
@@ -316,7 +319,8 @@ impl Step {
     }
 
     /// Carry `next` (`[rows, ..row_shape]`) as the new value of `state`'s rows. Under a paged layout
-    /// it is written into the pool rows `state_write` names and every other row passes through.
+    /// row `r` is written into the pool row `state_write[r]` names (a masked row, -1, writes nothing) and
+    /// every other pool row passes through.
     pub fn carry_recurrent(
         &self,
         b: &Builder,
@@ -445,11 +449,7 @@ impl Step {
                 STATE_READ_SLOT,
                 TensorType::new(vec![self.shape.rows.get()], DType::I32),
             )?,
-            write: b.slot_named(
-                Slot::Activation,
-                STATE_WRITE_SLOT,
-                TensorType::new(vec![seqs], DType::I32),
-            )?,
+            write: b.write_map(STATE_WRITE_SLOT, self.shape.rows.get(), seqs)?,
         };
         *declared = Some(rows);
         Ok(rows)
@@ -1183,7 +1183,7 @@ pub(crate) mod oracle {
             eval(g, &self.store(), &self.map(), consts, slots, state)
         }
 
-        /// [`Fx::eval`] with `named` slots (a [`Slot::SlotMap`]'s `"read"`/`"write"` tags) bound by
+        /// [`Fx::eval`] with `named` slots (`Slot::SlotMap` `"read"`, `Slot::WriteMap` `"write"`) bound by
         /// their key spelling.
         pub(crate) fn eval_named(
             &self,

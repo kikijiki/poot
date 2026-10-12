@@ -622,6 +622,58 @@ fn release_skips_recurrent_state_and_registers_dense_prefixes() {
     );
 }
 
+/// POOT-1148: the KV write map is forward: one entry per flat token (`rows * width`), the pool slot the
+/// token's position reads through the same step's read map, and -1 for a masked row, so the append costs the
+/// tokens and not the pool. Two live rows step in a three-row entry, at positions 0 and then 1, and in
+/// swapped order.
+/// Mutation: write token `t` at the slot of the NEXT position (`map[position + 1]` in
+/// `Driver::run_plans`): the entries differ from `read[row * CAP + position]` and the first assert goes red.
+#[test]
+fn the_kv_write_map_names_each_tokens_slot_and_pads_masked_rows() {
+    const CAP: usize = 64;
+    let mut rig = paged_rig(RigOptions::default());
+    let rows = [nz(1), nz(3)];
+    rig.driver
+        .prepare(&shapes(pool(8, 3), &rows, &[Head::GREEDY], &[]))
+        .unwrap();
+    let a = open_one(&mut rig, &[1], AdapterRef::Base);
+    let b = open_one(&mut rig, &[2], AdapterRef::Base);
+
+    // The read map of the last step: row `r`'s `CAP` logical positions to pool slots, three rows.
+    let read_of = |rig: &Rig| -> Vec<i32> {
+        last_step_inputs(rig)
+            .into_iter()
+            .find(|words| words.len() == 3 * CAP)
+            .expect("the step binds its read map")
+    };
+    let check = |rig: &Rig, positions: [usize; 2]| {
+        let read = read_of(rig);
+        let want = vec![read[positions[0]], read[CAP + positions[1]], -1];
+        let inputs = last_step_inputs(rig);
+        assert!(
+            inputs.contains(&want),
+            "write map {want:?} (token -> slot of its position, masked row -1) not in {inputs:?}"
+        );
+    };
+
+    step_rows(
+        &mut rig,
+        &mut [(a, PREFILL1, plain()), (b, PREFILL1, plain())],
+    )
+    .unwrap();
+    check(&rig, [0, 0]);
+    step_rows(&mut rig, &mut [(a, DECODE, plain()), (b, DECODE, plain())]).unwrap();
+    check(&rig, [1, 1]);
+    // Swapped rows: the map follows the step's row order, not the sequences' slots.
+    step_rows(&mut rig, &mut [(b, DECODE, plain()), (a, DECODE, plain())]).unwrap();
+    let read = read_of(&rig);
+    let want = vec![read[2], read[CAP + 2], -1];
+    assert!(
+        last_step_inputs(&rig).contains(&want),
+        "swapped rows: {want:?}"
+    );
+}
+
 /// POOT-1074 SC-001: admitting a sequence into a recurrent model zeroes that sequence's state row,
 /// through `reset_state(Row(slot))`, and writes nothing else into the state. The fake's `toy.state` is
 /// `[1, 4]` f32 per slot: sixteen bytes at the slot's offset.
@@ -662,7 +714,7 @@ fn last_step_inputs(rig: &Rig) -> Vec<Vec<i32>> {
 
 /// POOT-1074 SC-002: a recurrent model serves several sequences in one step. A sequence keeps the pool
 /// row of its slot whichever step row it occupies: `state_read` names each row's slot and
-/// `state_write` the step row whose result each slot takes (-1: none, so a masked row writes nothing).
+/// `state_write` the pool row each step row's result is written to (-1: a masked row writes nothing).
 /// Releasing a sequence and admitting another reuses its slot and zeroes exactly that row.
 /// Mutation: bind `state_read[i] = i` (the row index, not the sequence's slot); the swapped step reads
 /// slots `[0, 1]` instead of `[2, 0]`.
@@ -700,8 +752,8 @@ fn recurrent_rows_address_their_slots_and_a_readmitted_slot_zeroes_only_its_row(
         "state_read names slots [2, 0] and the masked row reads 0: {inputs:?}"
     );
     assert!(
-        inputs.contains(&vec![1, -1, 0, -1]),
-        "state_write: slot 0 takes row 1, slot 2 takes row 0, the rest keep: {inputs:?}"
+        inputs.contains(&vec![2, 0, -1]),
+        "state_write: row 0 writes slot 2, row 1 writes slot 0, the masked row writes nothing: {inputs:?}"
     );
 
     // B's slot is freed and re-used: only row 1 is zeroed.

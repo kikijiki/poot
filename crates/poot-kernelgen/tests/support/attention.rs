@@ -15,27 +15,45 @@ pub(crate) fn attention_reference(
     v: &[f32],
     mask: &[f32],
 ) -> Vec<f32> {
-    attention_reference_keys(spec, q, k, None, v, mask, None)
+    attention_reference_keys(spec, q, k, v, mask, KeyExtras::default())
+}
+
+/// The operands beyond `q`, `k`, `v` and `mask` that a key layout or bound adds; each is `None` when the spec
+/// does not read it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct KeyExtras<'a> {
+    /// The shared part of a split key, `[B,1,Lk,s]`.
+    pub(crate) k_shared: Option<&'a [f32]>,
+    /// The live length of each batch row.
+    pub(crate) len: Option<&'a [i32]>,
+    /// The `[B,Lk]` slot map of a paged key.
+    pub(crate) read: Option<&'a [i32]>,
 }
 
 /// [`attention_reference`] over a split key (`k` the first `dk - s` channels of each key, `k_shared [B,1,Lk,s]`
 /// the last `s`, shared by every head) and a live bound (`len [B]`: batch row `b` visits only its first
 /// `clamp(len[b], 0, Lk)` keys, an empty row being `0 / 0`, NaN). `v` is `[B,Hkv,Lk,Dv]` and the output
-/// `[B,Hq,Lq,Dv]`. Keys past a row's bound are never read, so poison there cannot reach the result.
+/// `[B,Hq,Lq,Dv]`. Keys past a row's bound are never read, so poison there cannot reach the result. A paged
+/// key (`read [B,Lk]`, a slot per position) reads `k [S,Hkv,Dk]` and `v [S,Hkv,Dv]` as pools: key `t` of row `b`
+/// and key head `g` is pool row `read[b * Lk + t] * Hkv + g`.
 pub(crate) fn attention_reference_keys(
     spec: &AttentionSpec,
     q: &[f32],
     k: &[f32],
-    k_shared: Option<&[f32]>,
     v: &[f32],
     mask: &[f32],
-    len: Option<&[i32]>,
+    extras: KeyExtras<'_>,
 ) -> Vec<f32> {
+    let KeyExtras {
+        k_shared,
+        len,
+        read,
+    } = extras;
     use poot_kernelgen::{KeyLayout, MaskKind, ScoreTransform};
     let (hq, lq, lk, dk, dv) = (spec.hq, spec.lq, spec.lk, spec.dk, spec.dv);
     let hkv = hq / spec.n_rep;
     let shared_dim = match spec.key {
-        KeyLayout::Single => 0,
+        KeyLayout::Single | KeyLayout::Paged => 0,
         KeyLayout::Split { shared_dim } => shared_dim,
     };
     let head_dim = dk - shared_dim;
@@ -54,7 +72,13 @@ pub(crate) fn attention_reference_keys(
     for b in 0..spec.batch {
         let keys = len.map_or(lk, |len| len[b].clamp(0, lk as i32) as usize);
         for h in 0..hq {
-            let kv_row = (b * hkv + h / spec.n_rep) * lk;
+            let kv_head = h / spec.n_rep;
+            let kv_row = (b * hkv + kv_head) * lk;
+            // Row `t` of this head's keys and of its values: the dense plane, or the pool row of its slot.
+            let key_at = |t: usize| match read {
+                Some(read) => read[b * lk + t] as usize * hkv + kv_head,
+                None => kv_row + t,
+            };
             let mask_plane = (b * mask_heads + if mask_heads == 1 { 0 } else { h }) * lq * lk;
             for i in 0..lq {
                 let q_row = ((b * hq + h) * lq + i) * dk;
@@ -62,7 +86,7 @@ pub(crate) fn attention_reference_keys(
                     .map(|t| {
                         let mut dot: f64 = (0..head_dim)
                             .map(|c| {
-                                f64::from(q[q_row + c]) * f64::from(k[(kv_row + t) * head_dim + c])
+                                f64::from(q[q_row + c]) * f64::from(k[key_at(t) * head_dim + c])
                             })
                             .sum();
                         if let Some(shared) = k_shared {
@@ -87,7 +111,7 @@ pub(crate) fn attention_reference_keys(
                 let out_row = ((b * hq + h) * lq + i) * dv;
                 for c in 0..dv {
                     let acc: f64 = (0..keys)
-                        .map(|t| weights[t] * f64::from(v[(kv_row + t) * dv + c]))
+                        .map(|t| weights[t] * f64::from(v[key_at(t) * dv + c]))
                         .sum();
                     out[out_row + c] = (acc / denominator) as f32;
                 }

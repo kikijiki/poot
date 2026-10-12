@@ -218,13 +218,23 @@ struct Launch {
 /// A backend that runs one movement and returns the output buffer's words.
 type Device<'a> = dyn FnMut(&Launch) -> Vec<u32> + 'a;
 
-/// The launch of `spec` over `inputs` and `index`, with an all-ones output buffer.
+/// The launch of `spec` over `inputs` and `index`, with an all-ones output buffer. A row scatter writes in
+/// place: its first input is the base, which becomes the output buffer's initial words (the kernel never
+/// reads it), and only the rest are the kernel's data inputs.
 fn launch(kind: Kind, spec: &MovementSpec, inputs: &[Tensor], index: Option<&[i32]>) -> Launch {
+    let in_place = matches!(spec.op, MovementOp::ScatterRows { .. });
+    let (seed, data) = match inputs.split_first() {
+        Some((base, rest)) if in_place => (Some(base), rest),
+        _ => (None, inputs),
+    };
     Launch {
         spec: spec.clone(),
-        data: inputs.iter().map(|t| kind.words(t)).collect(),
+        data: data.iter().map(|t| kind.words(t)).collect(),
         index: index.map(|words| words.iter().map(|&w| w as u32).collect()),
-        out: kind.blank(&spec.out_shape),
+        out: match seed {
+            Some(base) => kind.words(base),
+            None => kind.blank(&spec.out_shape),
+        },
     }
 }
 
@@ -340,14 +350,17 @@ fn update(operand: &Tensor, update: &Tensor, axis: usize, start: usize) -> Tenso
     })
 }
 
-fn scatter_rows(base: &Tensor, src: &Tensor, inverse: &[i32]) -> Tensor {
-    build(&base.shape, |c| match inverse[c[0]] {
-        row if row >= 0 => {
-            let mut source = c.to_vec();
-            source[0] = row as usize;
-            src.at(&source)
+/// `base` with source row `t` written at pool slot `slots[t]` (`-1`: the row writes nothing).
+fn scatter_rows(base: &Tensor, src: &Tensor, slots: &[i32]) -> Tensor {
+    build(&base.shape, |c| {
+        match slots.iter().position(|&slot| slot == c[0] as i32) {
+            Some(row) => {
+                let mut source = c.to_vec();
+                source[0] = row;
+                src.at(&source)
+            }
+            None => base.at(c),
         }
-        _ => base.at(c),
     })
 }
 
@@ -548,24 +561,30 @@ fn bank(width: u32) -> Vec<Case> {
         });
     }
 
-    for (name, base_shape, src_shape, inverse) in [
-        ("scatter rows", vec![4, 3], vec![2, 3], vec![1, -1, 0, -1]),
+    for (name, base_shape, src_shape, slots) in [
+        ("scatter rows", vec![4, 3], vec![2, 3], vec![2, 0]),
         (
             "scatter rows, odd width",
             vec![4, 5],
             vec![3, 5],
-            vec![-1, 2, 0, 1],
+            vec![2, 3, 1],
         ),
         (
-            "scatter keeps every row",
+            "scatter rows, a padding row",
+            vec![4, 5],
+            vec![3, 5],
+            vec![3, -1, 0],
+        ),
+        (
+            "scatter of only padding keeps every row",
             vec![3, 2],
             vec![1, 2],
-            vec![-1, -1, -1],
+            vec![-1],
         ),
     ] {
         let base = t(&base_shape, 30);
         let src = t(&src_shape, 31);
-        let expected = scatter_rows(&base, &src, &inverse);
+        let expected = scatter_rows(&base, &src, &slots);
         cases.push(Case {
             name,
             out_shape: base_shape.clone(),
@@ -574,7 +593,7 @@ fn bank(width: u32) -> Vec<Case> {
                 window: None,
             },
             inputs: vec![base.clone(), src.clone()],
-            index: Some(inverse.clone()),
+            index: Some(slots.clone()),
             expected: expected.clone(),
         });
     }
@@ -717,23 +736,23 @@ fn fp8_special_encodings_move_as_raw_bits_and_decode_like_dense_movement() {
     fp8_raw_bits_on(&mut interpret);
 }
 
-/// A scatter split into windows writes the same output as the unsplit scatter: each window writes its own unit
-/// range of the output, and the windows together cover it.
+/// A scatter split into windows writes the same output as the unsplit scatter: each window writes its own
+/// range of the source units into the one pool buffer in turn, and the windows together cover every source
+/// unit.
 fn windowed_scatter_on(kind: Kind, device: &mut Device<'_>) {
     let base = Tensor::counting(&[6, 5], 40, kind.width());
-    let src = Tensor::counting(&[2, 5], 41, kind.width());
-    let inverse = [-1, 1, -1, 0, -1, -1];
-    let expected = scatter_rows(&base, &src, &inverse);
-    let units = kind.storage().units(&[6, 5]);
-    let index: Vec<i32> = inverse.to_vec();
-    let mut merged = vec![0u32; units];
+    let src = Tensor::counting(&[3, 5], 41, kind.width());
+    let slots = [4, -1, 1];
+    let expected = scatter_rows(&base, &src, &slots);
+    let units = kind.storage().units(&[3, 5]);
     let cut = units / 2 + 1;
+    let mut pool = base;
     for (offset, threads) in [(0, cut), (cut, units - cut)] {
         let spec = MovementSpec::new(
             kind.storage(),
             vec![6, 5],
             MovementOp::ScatterRows {
-                src_shape: vec![2, 5],
+                src_shape: vec![3, 5],
                 window: Some(UnitWindow { offset, threads }),
             },
         );
@@ -741,16 +760,12 @@ fn windowed_scatter_on(kind: Kind, device: &mut Device<'_>) {
         let out = device(&launch(
             kind,
             &spec,
-            &[base.clone(), src.clone()],
-            Some(&index),
+            &[pool.clone(), src.clone()],
+            Some(&slots),
         ));
-        merged[offset..offset + threads].copy_from_slice(&out[offset..offset + threads]);
+        pool = kind.tensor(&out, &[6, 5]);
     }
-    assert_eq!(
-        kind.tensor(&merged, &[6, 5]),
-        expected,
-        "windowed scatter on {kind:?}"
-    );
+    assert_eq!(pool, expected, "windowed scatter on {kind:?}");
 }
 
 #[test]
@@ -903,7 +918,6 @@ fn device_bank(device: &mut Device<'_>) {
 #[test]
 fn the_movement_bank_matches_the_reference_on_wgpu() {
     use poot_codegen::{Target, artifact_path, compile, kernel_handle};
-    use poot_wgpu_runtime::KernelBuffer;
     let Ok(ctx) = poot_wgpu_runtime::Context::new() else {
         eprintln!("no wgpu device; skipping");
         return;
@@ -922,25 +936,31 @@ fn the_movement_bank_matches_the_reference_on_wgpu() {
             poot_codegen::GpuTarget::SpirvVulkan,
             std::fs::read(&path).unwrap(),
         );
-        let mut buffers: Vec<KernelBuffer> = launch
-            .data
-            .iter()
-            .map(|w| KernelBuffer::read_only_u32(w))
-            .collect();
+        // Resident buffers, so the output starts as `launch.out` (an in-place scatter updates the pool
+        // it is handed; every other op overwrites every word).
+        let mut owned: Vec<_> = launch.data.iter().map(|w| ctx.upload_u32(w)).collect();
         if let Some(words) = &launch.index {
-            buffers.push(KernelBuffer::read_only_u32(words));
+            owned.push(ctx.upload_u32(words));
         }
-        buffers.push(KernelBuffer::write_i32(launch.out.len()));
-        ctx.dispatch(
+        let refs: Vec<_> = owned.iter().collect();
+        let out = ctx.upload_u32(&launch.out);
+        ctx.dispatch_dev(
             &name,
             &kernel,
             body.workgroup_size,
             [launch.spec.threads() as u32, 1, 1],
-            &mut buffers,
+            &refs,
+            &out,
         )
         .unwrap_or_else(|e| panic!("{name}: dispatch: {e}"));
-        let out = buffers.pop().unwrap();
-        out.as_i32().iter().map(|&w| w as u32).collect()
+        let mut bytes = vec![0u8; launch.out.len() * 4];
+        ctx.read_bytes(&out, &mut bytes).unwrap();
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect()
     });
 }
 
@@ -989,10 +1009,9 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
             owned.push(upload(words));
         }
         let inputs = owned.len();
-        owned.push(
-            ctx.allocate_f32(launch.out.len(), BufferRole::Output)
-                .unwrap(),
-        );
+        // The output starts as `launch.out`: an in-place scatter updates the pool it is handed.
+        let seed: Vec<f32> = launch.out.iter().map(|&w| f32::from_bits(w)).collect();
+        owned.push(ctx.upload_f32(&seed, BufferRole::Output).unwrap());
         let mut elements = vec![ElementKind::I32; inputs];
         elements.push(ElementKind::F32);
         let kernarg = ctx
@@ -1054,7 +1073,9 @@ fn the_movement_bank_matches_the_reference_on_ptx() {
         }
         let lengths: Vec<u32> = owned.iter().map(|b| b.elem_count()).collect();
         let refs: Vec<_> = owned.iter().collect();
-        let out = ctx.alloc_f32(launch.out.len()).unwrap();
+        // The output starts as `launch.out`: an in-place scatter updates the pool it is handed.
+        let seed: Vec<f32> = launch.out.iter().map(|&w| f32::from_bits(w)).collect();
+        let out = ctx.upload_f32(&seed).unwrap();
         ctx.dispatch_dev(
             &name,
             &kernel,

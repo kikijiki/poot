@@ -94,9 +94,9 @@ pub enum UpdateIndex {
     Runtime,
 }
 
-/// A window of a scatter's output units one dispatch writes: the unit `offset` the window starts at and the
-/// `threads` it launches. Consecutive windows cover one output, so a wide scatter splits into dispatches
-/// that each stay under a device's watchdog budget.
+/// A window of a scatter's source units one dispatch writes: the unit `offset` the window starts at and the
+/// `threads` it launches. Consecutive windows cover every source unit once, so a wide scatter splits into
+/// dispatches that each stay under a device's watchdog budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnitWindow {
     /// First output unit the window writes.
@@ -163,9 +163,12 @@ pub enum MovementOp {
         /// Where the update starts on `axis`.
         index: UpdateIndex,
     },
-    /// `out[p, ..] = inverse[p] >= 0 ? src[inverse[p], ..] : base[p, ..]`: the paged-KV scatter, where
-    /// `base` has `out_shape`, `inverse` is an `I32` buffer of `out_shape[0]` rows (`-1` keeps the base
-    /// row), and `window` restricts the dispatch to part of the output.
+    /// `out[slots[t], ..] = src[t, ..]` for each source row `t` with `slots[t] >= 0`: the paged-KV append,
+    /// written in place. The kernel's output buffer is the pool itself (it already holds the base), so only
+    /// the `src` rows and the `I32` `slots` buffer of `src_shape[0]` entries are inputs; `out_shape` is the
+    /// pool's. One thread owns one source unit, so the launch is `O(src)`, not `O(out)`. `window`
+    /// restricts the dispatch to part of the source units. The slots must be distinct (the graph's
+    /// `ForwardSlotMap`): two rows naming one slot race.
     ScatterRows {
         /// The shape of the source rows' tensor (rows, then the trailing axes the output shares).
         src_shape: Vec<usize>,
@@ -217,8 +220,9 @@ impl MovementSpec {
         self
     }
 
-    /// Threads the dispatch launches: one per output buffer unit (one per source element for
-    /// [`MovementOp::PermuteRows`], one per window thread for a windowed scatter).
+    /// Threads the dispatch launches: one per output buffer unit (one per source unit for
+    /// [`MovementOp::PermuteRows`] and [`MovementOp::ScatterRows`], one per window thread for a windowed
+    /// scatter).
     pub fn threads(&self) -> usize {
         match &self.op {
             MovementOp::PermuteRows { src_shape, .. } => src_shape.iter().product(),
@@ -226,6 +230,10 @@ impl MovementSpec {
                 window: Some(window),
                 ..
             } => window.threads,
+            MovementOp::ScatterRows {
+                src_shape,
+                window: None,
+            } => self.storage.units(src_shape),
             _ => self.storage.units(&self.out_shape),
         }
     }
@@ -442,6 +450,15 @@ impl MovementSpec {
             MovementOp::ScatterRows { src_shape, window } => {
                 same_rank("src_shape", src_shape)?;
                 nonempty("src_shape", src_shape)?;
+                // A thread copies one whole unit to the same offset of the named slot, which only holds
+                // when a slot is a whole number of units. Packed lanes share a word along the last axis,
+                // so a rank-1 pool (one lane per slot) has no such unit.
+                if matches!(self.storage, Storage::PackedRows { .. }) && rank == 1 {
+                    return Err(KernelGenError::Unsupported {
+                        request: G,
+                        reason: "a packed row scatter writes whole words, so a rank-1 pool (one lane per slot) has no unit to copy",
+                    });
+                }
                 if rank == 0 || src_shape[1..] != self.out_shape[1..] {
                     return Err(KernelGenError::ShapeMismatch {
                         generator: G,
@@ -450,7 +467,7 @@ impl MovementSpec {
                         b: self.out_shape.clone(),
                     });
                 }
-                let units = self.storage.units(&self.out_shape);
+                let units = self.storage.units(src_shape);
                 if let Some(window) = window
                     && window.offset >= units
                 {

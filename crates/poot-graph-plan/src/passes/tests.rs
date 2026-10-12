@@ -2829,6 +2829,157 @@ fn a_split_key_with_a_narrower_value_matches_as_a_split_attention() {
     );
 }
 
+/// How a paged attention graph declares its slot map(s).
+#[derive(Clone, Copy)]
+enum ReadMap {
+    /// One map declared in `[0, pool_slots)`, the production declaration ([`Builder::read_map`]).
+    InPool,
+    /// One map with no declared range: nothing proves its words are slots of the pool.
+    Unranged,
+    /// One map declared in `[0, pool_slots + 1)`: its words may name a slot past the pool.
+    OnePastThePool,
+    /// The value pool is read through a second map, declared like the production one.
+    TwoMaps,
+}
+
+/// A decode over a paged cache as the production tracer emits it ([`poot_graph_ir::ops::paged_view`] of each
+/// pool through the read map, then the one attention composite): batch 2, two key heads shared by four
+/// query heads, 12 pool slots, 6 positions. Returns the graph with its `[k_pool, v_pool, read]` values.
+fn paged_attention_graph(map: ReadMap, live: bool) -> (poot_graph_ir::Graph, [ValueId; 3]) {
+    let (batch, hq, hkv, cap, d, slots) = (2usize, 4usize, 2usize, 6usize, 8usize, 12usize);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![batch, hq, 1, d]))
+        .unwrap();
+    let k_pool = b
+        .constant("k_pool", TensorType::f32(vec![slots, hkv, d]))
+        .unwrap();
+    let v_pool = b
+        .constant("v_pool", TensorType::f32(vec![slots, hkv, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![batch, 1, 1, cap]))
+        .unwrap();
+    let map_type = TensorType::new(vec![batch, cap], poot_tensor::DType::I32);
+    let read = match map {
+        ReadMap::InPool | ReadMap::TwoMaps => b.read_map("read", batch, cap, slots).unwrap(),
+        ReadMap::Unranged => b
+            .slot_named(poot_graph_ir::Slot::SlotMap, "read", map_type.clone())
+            .unwrap(),
+        ReadMap::OnePastThePool => b
+            .slot_named_ranged(
+                poot_graph_ir::Slot::SlotMap,
+                "read",
+                map_type.clone(),
+                poot_graph_ir::IndexRange::below(slots + 1).unwrap(),
+            )
+            .unwrap(),
+    };
+    let v_read = match map {
+        ReadMap::TwoMaps => b.read_map("read_v", batch, cap, slots).unwrap(),
+        _ => read,
+    };
+    let k = poot_graph_ir::ops::paged_view(&b, k_pool, read).unwrap();
+    let v = poot_graph_ir::ops::paged_view(&b, v_pool, v_read).unwrap();
+    let outputs = if live {
+        let len = b
+            .constant("len", TensorType::new(vec![batch], poot_tensor::DType::I32))
+            .unwrap();
+        let attention = poot_graph_ir::ops::attention_live(
+            &b,
+            q,
+            poot_graph_ir::ops::AttentionKeys::Single(k),
+            v,
+            hq / hkv,
+            0.25,
+            mask,
+            None,
+            len,
+        )
+        .unwrap();
+        poot_graph_ir::Outputs::new(attention.out).with_witness(
+            poot_graph_ir::ValidationId(1),
+            "attention.len",
+            attention.witness,
+        )
+    } else {
+        poot_graph_ir::Outputs::new(
+            attention_masked_softcap(&b, q, k, v, hq / hkv, 0.25, mask, None).unwrap(),
+        )
+    };
+    (
+        b.finish(outputs).unwrap(),
+        [k_pool.id(), v_pool.id(), read.id()],
+    )
+}
+
+/// The attention match of `graph`'s output equation.
+fn matched_attention(graph: &poot_graph_ir::Graph) -> attention_match::AttnMatch {
+    match_attention(
+        graph,
+        &producer_map(graph),
+        &value_ranges(graph),
+        output_eqn(graph),
+    )
+    .unwrap_or_else(|decline| panic!("the attention chain must match, declined {decline:?}"))
+}
+
+/// A key and value that are the paged views of two pools through one slot map, whose declared range is the
+/// pool, fuse to a `Paged` attention that reads the pools and the map themselves: no gather, no transpose, and
+/// the live bound rides along. Mutation: drop the `peel_paged_kv` call in `match_attention`; the key stays the
+/// transposed gather and the match is `Single`.
+#[test]
+fn the_paged_views_of_two_pools_fuse_to_an_attention_over_the_pools() {
+    for live in [false, true] {
+        let (graph, [k_pool, v_pool, read]) = paged_attention_graph(ReadMap::InPool, live);
+        let matched = matched_attention(&graph);
+        assert_eq!(matched.key, KeyLayout::Paged, "live={live}");
+        assert_eq!(
+            (matched.k, matched.v, matched.read),
+            (k_pool, v_pool, Some(read)),
+            "live={live}"
+        );
+        let operands = matched.operands();
+        let wanted_tail = if live {
+            vec![matched.read.unwrap(), matched.len.expect("a live length")]
+        } else {
+            vec![read]
+        };
+        assert_eq!(operands[1..3], [k_pool, v_pool], "live={live}");
+        assert_eq!(operands[4..], wanted_tail[..], "live={live}");
+        let OpKind::Attention(attrs) = matched.op() else {
+            panic!("the match collapses to an attention op")
+        };
+        assert_eq!(attrs.key, KeyLayout::Paged);
+        assert_eq!(
+            attrs.bound,
+            if live {
+                KvBound::Live
+            } else {
+                KvBound::Capacity
+            }
+        );
+    }
+}
+
+/// A paged view that the graph does not prove in-pool, or that the key and value do not share, stays the dense
+/// attention over the gathered view: fusing it would hand the kernel a pool read it cannot trust. Mutation:
+/// skip the range proof in `peel_paged_kv`; the unranged and the one-past rows fuse to `Paged`.
+#[test]
+fn a_paged_view_without_a_proved_pool_range_or_a_shared_map_stays_the_gathered_attention() {
+    for (what, map) in [
+        ("an undeclared slot map", ReadMap::Unranged),
+        ("a map one slot past the pool", ReadMap::OnePastThePool),
+        ("two maps", ReadMap::TwoMaps),
+    ] {
+        let (graph, [k_pool, ..]) = paged_attention_graph(map, false);
+        let matched = matched_attention(&graph);
+        assert_eq!(matched.key, KeyLayout::Single, "{what}");
+        assert_eq!(matched.read, None, "{what}");
+        assert_ne!(matched.k, k_pool, "{what}: the key is the gathered view");
+    }
+}
+
 /// A live-capacity decode over `cap` keys, built by the one composite ([`ops::attention_live`]): batch 2, two
 /// key heads shared by four query heads, an additive mask, an optional softcap, a split key when `split`,
 /// and the raw I32 `len`. The length witness is declared as a validation output when `validated`.

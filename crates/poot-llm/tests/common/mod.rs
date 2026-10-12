@@ -30,11 +30,11 @@ pub(crate) fn token_pos(
     ]
 }
 
-/// The two slot maps of a paged step.
+/// The two slot maps of a paged step: `read` `[rows, capacity]` and the forward `write` map, one pool slot
+/// per new token (`-1` for padding).
 pub(crate) fn slot_maps(
     rows: usize,
     capacity: usize,
-    pool_slots: usize,
     read: Vec<i32>,
     write: Vec<i32>,
 ) -> Vec<(SlotKey, HostTensor)> {
@@ -44,8 +44,8 @@ pub(crate) fn slot_maps(
             HostTensor::i32(vec![rows, capacity], read),
         ),
         (
-            SlotKey::new(Slot::SlotMap, Some("write")),
-            HostTensor::i32(vec![pool_slots], write),
+            SlotKey::new(Slot::WriteMap, Some("write")),
+            HostTensor::i32(vec![write.len()], write),
         ),
     ]
 }

@@ -75,7 +75,7 @@ use poot_executor::{
     Collectives, Coordinator, Device, EntryId, ExecError, ExecutableId, Executor, HostSync, NoSync,
     StepInputs,
 };
-use poot_graph_ir::{Graph, Slot, SlotKey, StateRole};
+use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey, StateRole};
 use poot_graph_plan::{
     CompileOptions, ShardRule, WeightFormats, bind_packed_weights, shard, staged::ExpertPlacement,
     staged::ReadTraffic, staged::StagedCompileError, staged::StagedProgram, staged::TensorParallel,
@@ -544,7 +544,7 @@ enum SlotRole {
     MropePosition,
     /// `Slot::SlotMap` `"read"`: each row's logical position to pool slot.
     MapRead,
-    /// `Slot::SlotMap` `"write"`: pool slot to the flat token index writing it, or -1.
+    /// `Slot::WriteMap` `"write"`: each flat token's pool slot, or -1 for padding.
     MapWrite,
     LoraIdx,
     Seed,
@@ -562,7 +562,8 @@ enum SlotRole {
     Pixels,
     /// `Slot::Activation` `"state_read"`: the recurrent state pool row each step row continues.
     StateRead,
-    /// `Slot::Activation` `"state_write"`: recurrent pool row to the step row whose result it takes, or -1.
+    /// `Slot::WriteMap` `"state_write"`: the recurrent pool row each step row's result is written to, or -1
+    /// for a masked row.
     StateWrite,
     /// `Slot::Activation` `"pos_h"`, `"pos_w"`, `"window"` and `"frame"`: the grid facts of a
     /// windowed vision tower's patches ([`PatchGeometry`](poot_models::qwen_vl_vision::PatchGeometry)).
@@ -586,7 +587,7 @@ impl Prepared {
                 SlotRole::MropePosition,
             ),
             (named(Slot::SlotMap, "read"), SlotRole::MapRead),
-            (named(Slot::SlotMap, "write"), SlotRole::MapWrite),
+            (named(Slot::WriteMap, "write"), SlotRole::MapWrite),
             (SlotKey::new(Slot::LoraIdx, None), SlotRole::LoraIdx),
             (sampler_slot("seed"), SlotRole::Seed),
             (sampler_slot("params"), SlotRole::Params),
@@ -600,7 +601,10 @@ impl Prepared {
             ),
             (activation_slot(PIXELS_SLOT), SlotRole::Pixels),
             (activation_slot(STATE_READ_SLOT), SlotRole::StateRead),
-            (activation_slot(STATE_WRITE_SLOT), SlotRole::StateWrite),
+            (
+                named(Slot::WriteMap, STATE_WRITE_SLOT),
+                SlotRole::StateWrite,
+            ),
             (activation_slot(POS_H_SLOT), SlotRole::PosH),
             (activation_slot(POS_W_SLOT), SlotRole::PosW),
             (activation_slot(WINDOW_SLOT), SlotRole::Window),
@@ -637,7 +641,8 @@ struct StepData {
     tokens: Vec<i32>,
     pos: Vec<i32>,
     read: Vec<i32>,
-    write: Vec<i32>,
+    /// `Slot::WriteMap` `"write"`: only a checked map reaches the bind.
+    write: ForwardSlotMap,
     lora: Vec<i32>,
     seed: Vec<i32>,
     params: Vec<f32>,
@@ -648,7 +653,8 @@ struct StepData {
     attention_mask: Vec<i32>,
     pixels: Vec<f32>,
     state_read: Vec<i32>,
-    state_write: Vec<i32>,
+    /// `Slot::WriteMap` `"state_write"`.
+    state_write: ForwardSlotMap,
     pos_h: Vec<i32>,
     pos_w: Vec<i32>,
     window: Vec<f32>,
@@ -1438,17 +1444,25 @@ impl Driver {
         entry: &Prepared,
         data: &StepData,
     ) -> Result<poot_executor::StepOutputs<'_>, DriverError> {
-        let tensors: Vec<(&SlotKey, HostTensor)> = entry
+        // What one slot binds: a tensor view, or a write map, which binds only as its checked type.
+        enum Bound<'a> {
+            Tensor(HostTensor),
+            WriteMap(&'a ForwardSlotMap),
+        }
+        let bound: Vec<(&SlotKey, Bound<'_>)> = entry
             .slots
             .iter()
             .map(|spec| {
                 let shape = spec.shape.clone();
                 let tensor = match spec.role {
+                    SlotRole::MapWrite => return (&spec.key, Bound::WriteMap(&data.write)),
+                    SlotRole::StateWrite => {
+                        return (&spec.key, Bound::WriteMap(&data.state_write));
+                    }
                     SlotRole::Token => HostTensor::i32(shape, data.tokens.clone()),
                     SlotRole::Pos => HostTensor::i32(shape, data.pos.clone()),
                     SlotRole::MropePosition => HostTensor::i32(shape, data.mrope()),
                     SlotRole::MapRead => HostTensor::i32(shape, data.read.clone()),
-                    SlotRole::MapWrite => HostTensor::i32(shape, data.write.clone()),
                     SlotRole::LoraIdx => HostTensor::i32(shape, data.lora.clone()),
                     SlotRole::Seed => HostTensor::i32(shape, data.seed.clone()),
                     SlotRole::Params => HostTensor::f32(shape, data.params.clone()),
@@ -1459,19 +1473,21 @@ impl Driver {
                     SlotRole::AttentionMask => HostTensor::i32(shape, data.attention_mask.clone()),
                     SlotRole::Pixels => HostTensor::f32(shape, data.pixels.clone()),
                     SlotRole::StateRead => HostTensor::i32(shape, data.state_read.clone()),
-                    SlotRole::StateWrite => HostTensor::i32(shape, data.state_write.clone()),
                     SlotRole::PosH => HostTensor::i32(shape, data.pos_h.clone()),
                     SlotRole::PosW => HostTensor::i32(shape, data.pos_w.clone()),
                     SlotRole::Window => HostTensor::f32(shape, data.window.clone()),
                     SlotRole::Frame => HostTensor::f32(shape, data.frame.clone()),
                     SlotRole::BeamRows => HostTensor::i32(shape, data.beam_rows.clone()),
                 };
-                (&spec.key, tensor)
+                (&spec.key, Bound::Tensor(tensor))
             })
             .collect();
         let mut inputs = StepInputs::new();
-        for (key, tensor) in &tensors {
-            inputs.push((*key).clone(), tensor.shape(), tensor.view());
+        for (key, bound) in &bound {
+            match bound {
+                Bound::Tensor(tensor) => inputs.push((*key).clone(), tensor.shape(), tensor.view()),
+                Bound::WriteMap(map) => inputs.push_write_map((*key).clone(), map),
+            }
         }
         self.stats.steps += 1;
         // A token at position `p` attends `p + 1` cached positions: the plan's KV bytes per position

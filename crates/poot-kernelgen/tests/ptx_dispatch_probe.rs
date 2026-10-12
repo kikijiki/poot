@@ -16,7 +16,7 @@ use poot_ptx_runtime::PtxContext;
 
 #[path = "support/attention.rs"]
 mod attention;
-use attention::{attention_reference, attention_reference_keys};
+use attention::{KeyExtras, attention_reference, attention_reference_keys};
 
 /// Encode f32 -> f16 bytes (little-endian), reusing the loader's own f32->f16 narrowing
 /// (`poot_quant::scalar::f32_to_f16`), matching `coopmat_dispatch_probe.rs`'s helper.
@@ -434,7 +434,18 @@ fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
         Some(&k_shared),
         Some(&len),
     );
-    let want = attention_reference_keys(&spec, &q, &k, Some(&k_shared), &v, &mask, Some(&len));
+    let want = attention_reference_keys(
+        &spec,
+        &q,
+        &k,
+        &v,
+        &mask,
+        KeyExtras {
+            k_shared: Some(&k_shared),
+            len: Some(&len),
+            ..KeyExtras::default()
+        },
+    );
     let row = hq * dv;
     for (b, &live) in len.iter().enumerate() {
         let (got, want) = (&got[b * row..(b + 1) * row], &want[b * row..(b + 1) * row]);

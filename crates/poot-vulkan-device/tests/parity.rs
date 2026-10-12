@@ -480,6 +480,22 @@ fn split_kv_decode_matches_the_oracle_on_vulkan() {
         .unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// A paged decode attention reads the K and V pools in place through the `[B, Lk]` read map: the plan holds one
+/// attention over the pools (no gather, no transpose), and two steps with different scattered maps over the
+/// same pools match the CPU oracle's evaluation of the gathered views, the second as a pure replay.
+/// Mutation: in `poot-kernelgen`'s `attention_body`, address a paged key by the position instead of the slot it
+/// names (`read[b * lk + t]` becomes `t` in `KeyRows::Paged`); both steps go red against the oracle.
+#[test]
+fn paged_attention_reads_the_pools_in_place_and_matches_the_oracle_on_vulkan() {
+    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
+        return;
+    };
+    let t = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::attention::assert_paged_attention_matches_the_oracle(exec.as_mut(), t)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// POOT-1113: the split-KV decode stepped through its live lengths twice over one entry: the second pass
 /// replays the captured two-launch plan, and every step's output equals the first pass's bit for bit.
 #[test]

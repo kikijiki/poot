@@ -19,7 +19,8 @@ use poot_target::{Backend, BufferStorage, DeviceCaps};
 
 /// Plan one attention equation and record the kernel it takes.
 ///
-/// `q[B,Hq,Lq,Dk]`, `k[B,Hkv,Lk,Dk]` (or its split parts), `v[B,Hkv,Lk,Dv]`, `mask[B,Hm,Lq,Lk]`: `Lq` and `Lk` are
+/// `q[B,Hq,Lq,Dk]`, `k[B,Hkv,Lk,Dk]` (or its split parts), `v[B,Hkv,Lk,Dv]` (or the `[S,Hkv,D]` pools a paged key
+/// reads through its `[B,Lk]` slot map), `mask[B,Hm,Lq,Lk]`: `Lq` and `Lk` are
 /// independent (decode `Lq == 1`, prefill `Lq == Lk`, prefill into a cache `1 < Lq < Lk`), and all are the same
 /// request. A live bound reads the `len [B]` operand at run time; the grid never depends on it. The streaming
 /// schedule runs one workgroup of `lanes` threads per `(b, h, i)`; `lanes` is the widest power of two whose
@@ -49,13 +50,16 @@ pub(super) fn plan(
     let [batch, hq, lq, dk] = q[..] else {
         unreachable!("`infer` types attention over a rank-4 query")
     };
-    let lk = k[2];
+    // A dense key carries the extents itself; a paged one is `[S,Hkv,D]` pools and the `[B,Lk]` slot map.
+    let (lk, dv) = match key {
+        KeyLayout::Paged => (shape(4)[1], v[2]),
+        KeyLayout::Single | KeyLayout::Split { .. } => (k[2], v[3]),
+    };
     let mask_kind = if flash_mask_per_head(&mask, hq, "attention")? {
         MaskKind::PerHead
     } else {
         MaskKind::Broadcast
     };
-    let dv = v[3];
     let lanes = attention_lanes(dv, caps).ok_or_else(|| {
         site.refuse(Capability::AttentionLds {
             dv,
@@ -84,6 +88,7 @@ pub(super) fn plan(
             KeyLayout::Split { shared_dim } => KernelKeyLayout::Split {
                 shared_dim: *shared_dim,
             },
+            KeyLayout::Paged => KernelKeyLayout::Paged,
         },
         score,
         mask: mask_kind,

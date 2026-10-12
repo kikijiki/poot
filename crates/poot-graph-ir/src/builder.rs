@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::budget::{AllocationSite, Charge, HeldCharge, Meter, TraceLimits};
-use crate::error::{BuilderCollection, BuilderError, BuilderValueNamespace};
+use crate::error::{BuilderCollection, BuilderError, BuilderValueNamespace, Requirement};
 use crate::graph::{
     BoundaryId, ComputedConst, EditError, Eqn, Export, Graph, GraphEdit, GraphOutput, LayerIndex,
     Operand, Slot, SlotKey, StateRole, Storage, ValidationId, ValueId, ValueMeta, ValueTable,
@@ -2238,19 +2238,70 @@ impl Builder {
         )
     }
 
-    /// Scatter-update (card 059): `out[p] = inv[p] >= 0 ? src[inv[p]] : base[p]`. `base [POOL,..rest]`,
-    /// `src [N,..rest]`, `[POOL]` inverse map `inv` (the src row that writes slot `p`, or `-1`). Writes the N mapped
-    /// rows and passes the rest through: the scattered analog of `dynamic_update_slice`. See
-    /// [`OpKind::ScatterUpdate`].
+    /// Scatter-update: `out = base` with `src[t]` written at pool slot `slots[t]` (`-1`: row `t` writes
+    /// nothing). `base [POOL,..rest]`, `src [N,..rest]`, `[N]` forward map `slots`. Writes the N named rows and
+    /// passes the rest through: the scattered analog of `dynamic_update_slice`. See [`OpKind::ScatterUpdate`]
+    /// and, for declaring the map, [`Builder::write_map`].
     pub fn scatter_update(
         &self,
         base: Traced,
         src: Traced,
-        inv: Traced,
+        slots: Traced,
     ) -> Result<Traced, BuilderError> {
         self.emit(
             OpKind::ScatterUpdate,
-            vec![self.operand(base)?, self.operand(src)?, self.operand(inv)?],
+            vec![
+                self.operand(base)?,
+                self.operand(src)?,
+                self.operand(slots)?,
+            ],
+        )
+    }
+
+    /// Declare the forward write map `tag` of `rows` source rows over a pool of `pool_slots` slots: a
+    /// [`Slot::WriteMap`] I32 `[rows]` input whose words are declared in `[-1, pool_slots)`, so the bound
+    /// range is a checked fact. The input is bound as a [`crate::ForwardSlotMap`].
+    pub fn write_map(
+        &self,
+        tag: &str,
+        rows: usize,
+        pool_slots: usize,
+    ) -> Result<Traced, BuilderError> {
+        let range = i64::try_from(pool_slots)
+            .ok()
+            .and_then(|pool| IndexRange::new(-1, pool))
+            .ok_or(BuilderError::Requirement {
+                operation: "write map",
+                requirement: Requirement::AtLeastOne { what: "pool slots" },
+            })?;
+        self.slot_named_ranged(
+            Slot::WriteMap,
+            tag,
+            TensorType::new(vec![rows], DType::I32),
+            range,
+        )
+    }
+
+    /// Declare the read map `tag` of a paged KV pool of `pool_slots` slots: a [`Slot::SlotMap`] I32
+    /// `[rows, capacity]` input mapping row `r`'s logical position to the pool slot holding its K/V. Its
+    /// words are declared in `[0, pool_slots)`, so the bound range is a checked fact: a word outside the pool
+    /// is refused at the bind, and attention reads the pool through the map in place on the strength of it.
+    pub fn read_map(
+        &self,
+        tag: &str,
+        rows: usize,
+        capacity: usize,
+        pool_slots: usize,
+    ) -> Result<Traced, BuilderError> {
+        let range = IndexRange::below(pool_slots).ok_or(BuilderError::Requirement {
+            operation: "read map",
+            requirement: Requirement::AtLeastOne { what: "pool slots" },
+        })?;
+        self.slot_named_ranged(
+            Slot::SlotMap,
+            tag,
+            TensorType::new(vec![rows, capacity], DType::I32),
+            range,
         )
     }
 

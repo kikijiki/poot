@@ -2,6 +2,7 @@
 //! query/key-value head layouts (multi-head, multi-query) the shared qwen2 decode fixture does not
 //! cover.
 
+use poot_eval::test_support::StepFixture;
 use poot_executor::Executor;
 use poot_graph_ir::ops::{attention_masked, attention_prefill_softcap};
 use poot_graph_ir::{Builder, TensorType};
@@ -161,6 +162,120 @@ fn alibi_prefill_case(name: &'static str, softcap: Option<f32>) -> AlibiCase {
         per_head: build(name, HQ, mask),
         flash_op: "attention",
     }
+}
+
+// ---- Paged attention reads the KV pools in place ----
+
+/// Batch rows, pool slots and positions of the paged fixture. The pool holds more slots than the rows
+/// together read, so a slot map that addressed the pool by position would read the wrong rows.
+const PAGED_BATCH: usize = 2;
+const PAGED_SLOTS: usize = 12;
+const PAGED_CAP: usize = 6;
+
+/// A GQA decode (four query heads over two key heads, two batch rows) over the `[12, 2, 4]` K and V pools of
+/// a paged cache, read through the production `[2, 6]` read map ([`Builder::read_map`]) the way the models
+/// trace it. Two steps bind two different scattered maps over the same pools, so the second is a replay that
+/// must follow the new map, not the one the recording read. Row 1 sees all six positions, row 0 only four;
+/// the positions past a row's length name slot 0, as the engine's map does for a position not written yet.
+/// The program must plan one attention equation over the pools themselves: no gather, no transpose.
+pub fn paged_attention_fixture() -> Fixture {
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![PAGED_BATCH, HQ, 1, D]))
+        .unwrap();
+    let k_pool = b
+        .constant("k_pool", TensorType::f32(vec![PAGED_SLOTS, HKV, D]))
+        .unwrap();
+    let v_pool = b
+        .constant("v_pool", TensorType::f32(vec![PAGED_SLOTS, HKV, D]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![PAGED_BATCH, 1, 1, PAGED_CAP]))
+        .unwrap();
+    let read = b
+        .read_map("read", PAGED_BATCH, PAGED_CAP, PAGED_SLOTS)
+        .unwrap();
+    let k = poot_graph_ir::ops::paged_view(&b, k_pool, read).unwrap();
+    let v = poot_graph_ir::ops::paged_view(&b, v_pool, read).unwrap();
+    let y = attention_masked(&b, q, k, v, HQ / HKV, 1.0 / (D as f32).sqrt(), mask).unwrap();
+    let read = read.id();
+    let graph = b.finish(y).unwrap();
+    let key = graph.meta(read).slot_key().unwrap().clone();
+    let mut visible = vec![0.0f32; PAGED_BATCH * PAGED_CAP];
+    visible[4..PAGED_CAP].fill(-1.0e9);
+    let mut fixture = const_fixture(
+        "paged_attention",
+        graph,
+        vec![
+            (
+                "q",
+                HostTensor::f32(
+                    vec![PAGED_BATCH, HQ, 1, D],
+                    centered(1, PAGED_BATCH * HQ * D),
+                ),
+            ),
+            (
+                "k_pool",
+                HostTensor::f32(
+                    vec![PAGED_SLOTS, HKV, D],
+                    centered(2, PAGED_SLOTS * HKV * D),
+                ),
+            ),
+            (
+                "v_pool",
+                HostTensor::f32(
+                    vec![PAGED_SLOTS, HKV, D],
+                    centered(3, PAGED_SLOTS * HKV * D),
+                ),
+            ),
+            (
+                "mask",
+                HostTensor::f32(vec![PAGED_BATCH, 1, 1, PAGED_CAP], visible),
+            ),
+        ],
+        0,
+    );
+    let maps: [[i32; PAGED_BATCH * PAGED_CAP]; 2] = [
+        [3, 7, 1, 10, 0, 0, 2, 5, 8, 11, 4, 9],
+        [9, 4, 11, 6, 0, 0, 10, 1, 7, 3, 5, 2],
+    ];
+    fixture.steps = maps
+        .iter()
+        .map(|words| {
+            vec![StepFixture {
+                key: key.clone(),
+                tensor: HostTensor::i32(vec![PAGED_BATCH, PAGED_CAP], words.to_vec()),
+            }]
+        })
+        .collect();
+    fixture
+}
+
+/// [`paged_attention_fixture`] on `exec` at `target`: the program must plan the attention equation over the
+/// pools themselves (no gather, no transpose of a materialized view), and each of its two steps must match the
+/// CPU oracle's evaluation of the materialized gathered view, within the parity tolerance.
+pub fn assert_paged_attention_matches_the_oracle(
+    exec: &mut dyn Executor,
+    target: poot_graph_plan::Target,
+) -> Result<(), String> {
+    let fixture = paged_attention_fixture();
+    let ops = crate::planned_ops(&fixture, target);
+    if !ops.iter().any(|op| op.contains("key=Paged")) {
+        return Err(format!(
+            "paged attention: no attention reads the pools through the slot map: {ops:?}"
+        ));
+    }
+    if let Some(movement) = ops
+        .iter()
+        .find(|op| op.starts_with("gather") || op.starts_with("transpose"))
+    {
+        return Err(format!(
+            "paged attention: the plan still materializes the gathered view ({movement}): {ops:?}"
+        ));
+    }
+    let mut oracle =
+        poot_eval::test_support::weight_map_oracle::oracle_for(&fixture.graph, &fixture.store);
+    crate::run_parity(exec, target, &fixture, &mut oracle)
 }
 
 // ---- Split-KV decode attention (POOT-1113) ----

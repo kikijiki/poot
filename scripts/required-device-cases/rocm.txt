@@ -276,6 +276,7 @@ poot-rocm-device::parity	checkpoint_orientation_projection_matches_the_oracle_on
 poot-rocm-device::parity	dense_gemv::the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_rocm
 poot-rocm-device::parity	f16_checkpoint_orientation_projection_matches_the_oracle_on_rocm
 poot-rocm-device::parity	greedy_sample_token_is_exact_on_rocm
+poot-rocm-device::parity	paged_attention_reads_the_pools_in_place_and_matches_the_oracle_on_rocm
 poot-rocm-device::parity	select_is_bitwise_on_rocm
 poot-rocm-device::parity	split_kv_decode_matches_the_oracle_on_rocm
 poot-rocm-device::parity	split_kv_decode_replay_equals_the_recording_step_on_rocm

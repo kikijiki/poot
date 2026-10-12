@@ -188,11 +188,15 @@ pub(crate) fn canonicalize_with_declines(
 /// A matched materialized softmax-attention subgraph (the operands of the fused op it collapses to).
 pub(super) struct AttnMatch {
     pub(super) q: ValueId,
-    pub(super) k: ValueId, // pre-GQA-repeat key (the per-head part of a split key)
+    /// The pre-GQA-repeat key (the per-head part of a split key), or the key pool of a paged one.
+    pub(super) k: ValueId,
     /// The part of a split key shared by every key head, before its repeat chain.
     pub(super) k_shared: Option<ValueId>,
+    /// The `[B, Lk]` slot map of a paged key, which reads `k` and `v` as pools.
+    pub(super) read: Option<ValueId>,
     pub(super) key: KeyLayout,
-    pub(super) v: ValueId, // pre-GQA-repeat value
+    /// The pre-GQA-repeat value, or the value pool of a paged one.
+    pub(super) v: ValueId,
     pub(super) mask: ValueId,
     /// The proved live length `[B]`, when the chain is the guarded live-capacity composite.
     pub(super) len: Option<ValueId>,
@@ -413,6 +417,63 @@ fn peel_key(
             guards,
         }),
     }
+}
+
+/// A key or value view of a paged pool, as [`poot_graph_ir::ops::paged_view`] traces it.
+struct PagedView {
+    pool: ValueId,
+    read: ValueId,
+}
+
+/// Peel `view` as `transpose(reshape(gather(pool, 0, reshape(read))))`, the logical `[B, Hkv, Lk, D]` view of a
+/// `[S, Hkv, D]` pool through the I32 `[B, Lk]` slot map `read`. `None` for any other chain: its shapes are
+/// checked, not just its op sequence, so a lookalike movement chain is not a paged view.
+fn peel_paged_view(g: &Graph, prod: &HashMap<ValueId, usize>, view: ValueId) -> Option<PagedView> {
+    let eqn = prod.get(&view).map(|&i| &g.eqns()[i])?;
+    let (OpKind::Transpose { perm }, [Operand::Value(rows_first)]) =
+        (&eqn.op, eqn.inputs.as_slice())
+    else {
+        return None;
+    };
+    if perm.as_slice() != [0, 2, 1, 3] {
+        return None;
+    }
+    let &[rows, hkv, cap, d] = g.aval(view).shape.as_slice() else {
+        return None;
+    };
+    let gathered = reshaped_from(g, prod, *rows_first, &[rows, cap, hkv, d])?;
+    let gather = prod.get(&gathered).map(|&i| &g.eqns()[i])?;
+    let (OpKind::Gather { axis: 0 }, [Operand::Value(pool), Operand::Value(slots)]) =
+        (&gather.op, gather.inputs.as_slice())
+    else {
+        return None;
+    };
+    let read = reshaped_from(g, prod, *slots, &[rows * cap])?;
+    let read_type = g.aval(read);
+    let pool_type = g.aval(*pool);
+    (read_type.dtype == DType::I32
+        && read_type.shape == [rows, cap]
+        && pool_type.shape.len() == 3
+        && pool_type.shape[1..] == [hkv, d])
+    .then_some(PagedView { pool: *pool, read })
+}
+
+/// The key and value of a paged cache: both views of pools through one slot map, whose declared range proves
+/// every word a slot of the pools. The proof is what the kernel's unchecked pool read stands on, so a map
+/// that is not proved stays the gather it is.
+fn peel_paged_kv(
+    g: &Graph,
+    prod: &HashMap<ValueId, usize>,
+    facts: &RangeFacts,
+    k: ValueId,
+    v: ValueId,
+) -> Option<(PagedView, PagedView)> {
+    let (k, v) = (peel_paged_view(g, prod, k)?, peel_paged_view(g, prod, v)?);
+    let slots = g.aval(k.pool).shape[0];
+    let in_pool = IndexRange::below(slots)
+        .zip(facts[k.read])
+        .is_some_and(|(pool, proved)| proved.within(&pool));
+    (k.read == v.read && g.aval(v.pool).shape[0] == slots && in_pool).then_some((k, v))
 }
 
 /// Peel a `repeat_kv(x, n_rep)` chain (`reshape(broadcast(reshape(x)))`) back to `(x, n_rep)`. If `v` is not
@@ -707,15 +768,26 @@ pub(super) fn match_attention(
     }
 
     let decode = g.aval(q).shape.get(2).copied() == Some(1);
+    // A key and value that are views of one paged pool read it in place.
+    let paged = match key.shared {
+        None => peel_paged_kv(g, prod, facts, key.head, v),
+        Some(_) => None,
+    };
+    let (k, v, read) = match paged {
+        Some((k, v)) => (k.pool, v.pool, Some(k.read)),
+        None => (key.head, v, None),
+    };
     let m = AttnMatch {
         q,
-        k: key.head,
+        k,
         k_shared: key.shared,
-        key: match key.shared {
-            Some(shared) => KeyLayout::Split {
+        read,
+        key: match (key.shared, read) {
+            (Some(shared), _) => KeyLayout::Split {
                 shared_dim: g.aval(shared).shape[3],
             },
-            None => KeyLayout::Single,
+            (None, Some(_)) => KeyLayout::Paged,
+            (None, None) => KeyLayout::Single,
         },
         v,
         mask,
@@ -774,11 +846,13 @@ impl AttnMatch {
         })
     }
 
-    /// The fused op's operands: `[q, k, v, mask]`, then the shared key part, then the live length.
+    /// The fused op's operands: `[q, k, v, mask]`, then the shared key part or the slot map, then the live
+    /// length.
     pub(super) fn operands(&self) -> Vec<ValueId> {
         [self.q, self.k, self.v, self.mask]
             .into_iter()
             .chain(self.k_shared)
+            .chain(self.read)
             .chain(self.len)
             .collect()
     }

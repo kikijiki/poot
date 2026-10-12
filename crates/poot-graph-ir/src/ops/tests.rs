@@ -581,3 +581,53 @@ fn a_live_attention_bound_types_at_every_float_dtype() {
         );
     }
 }
+
+/// `paged_view` over a read map or a pool of the wrong rank is a typed builder refusal naming the expected
+/// rank, not an index panic; the well-formed pair builds the `[B, Hkv, Lk, D]` view.
+///
+/// Mutation: require a rank-3 read map in the `let &[rows, cap]` guard; the well-formed row is refused with
+/// `Rank { expected: 2, found: [2, 3] }`.
+#[test]
+fn a_paged_view_over_a_mis_ranked_map_or_pool_is_a_typed_refusal() {
+    use crate::types::TensorType;
+    let b = Builder::for_tests();
+    let pool = b.constant("pool", TensorType::f32(vec![8, 2, 4])).unwrap();
+    let flat_pool = b
+        .constant("flat_pool", TensorType::f32(vec![8, 8]))
+        .unwrap();
+    let i32_map = |name: &str, shape: Vec<usize>| {
+        b.constant(name, TensorType::new(shape, DType::I32))
+            .unwrap()
+    };
+    let read = i32_map("read", vec![2, 3]);
+    let flat_read = i32_map("flat_read", vec![6]);
+
+    let view = paged_view(&b, pool, read).expect("a rank-3 pool and a rank-2 map build a view");
+    assert_eq!(b.aval(view).unwrap().shape, [2, 2, 3, 4]);
+    for (what, result, expected, found) in [
+        (
+            "a rank-1 read map",
+            paged_view(&b, pool, flat_read),
+            2,
+            vec![6],
+        ),
+        (
+            "a rank-2 pool",
+            paged_view(&b, flat_pool, read),
+            3,
+            vec![8, 8],
+        ),
+    ] {
+        match result {
+            Err(BuilderError::Requirement {
+                operation: "paged view",
+                requirement:
+                    Requirement::Rank {
+                        expected: want,
+                        found: got,
+                    },
+            }) => assert_eq!((want, got), (expected, found), "{what}"),
+            other => panic!("{what}: expected a typed rank refusal, got {other:?}"),
+        }
+    }
+}

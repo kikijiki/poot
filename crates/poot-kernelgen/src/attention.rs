@@ -29,7 +29,9 @@
 //! Operands are dense: `q [B, Hq, Lq, Dk]`, `k [B, Hkv, Lk, Dk]` and `v [B, Hkv, Lk, Dv]`, `mask [B, Hm, Lq, Lk]`
 //! (additive), `out [B, Hq, Lq, Dv]`, GQA through `kv_head = head / n_rep`. A [`KeyLayout::Split`] key
 //! is `k [B, Hkv, Lk, Dk - s]` plus `k_shared [B, 1, Lk, s]`, the shared part read by every key head, and
-//! the dot product runs over the two parts in turn. A [`KeyBound::Live`] row visits only the first `len[b]`
+//! the dot product runs over the two parts in turn. A [`KeyLayout::Paged`] key and value are read in place
+//! from `[S, Hkv, D]` pools through an `I32 [B, Lk]` slot map, the same loop with a different address. A
+//! [`KeyBound::Live`] row visits only the first `len[b]`
 //! keys, `len` an `I32 [B]` operand clamped into `0..=Lk` before it bounds the loop: a length outside that
 //! range cannot reach memory past the buffers, and (like the decomposition) selects no key at all, or every
 //! key. The grid and the recorded launch never see `len`. A position whose score is `-inf` (every
@@ -197,6 +199,11 @@ pub enum KeyLayout {
         /// Width `s` of the part shared by every key head; the first part is `Dk - s` wide.
         shared_dim: usize,
     },
+    /// The keys and values stay in their paged pools: `k` is a `[S, Hkv, Dk]` pool, `v` a `[S, Hkv, Dv]` pool,
+    /// and the `I32 [B, Lk]` `read` parameter that follows `mask` names the pool slot of each position. Key
+    /// `t` of batch row `b` and key head `g` is row `(read[b * Lk + t] * Hkv + g)` of its pool. Every word of
+    /// `read` must be a slot of the pool: the kernel does not clamp it.
+    Paged,
 }
 
 /// Which keys a row visits.
@@ -406,10 +413,27 @@ pub(crate) fn count_to(
     );
 }
 
+/// Where a row's keys and values start in their operands.
+#[derive(Clone, Copy)]
+enum KeyRows {
+    /// Dense operands: the element offsets of the row's `(batch, head)` plane in `k`, `k_shared` and `v`.
+    Dense {
+        k: poot_kernel_ir::Local,
+        shared: poot_kernel_ir::Local,
+        v: poot_kernel_ir::Local,
+    },
+    /// Pools read through the slot map parameter `read`, whose words for this batch row start at `read_base`.
+    Paged {
+        read: poot_kernel_ir::Local,
+        read_base: poot_kernel_ir::Local,
+    },
+}
+
 /// Build the attention kernel `spec` describes. The launch is `spec.workgroups()` workgroups of `lanes`
 /// threads laid over a 2-D grid `x_groups` workgroups across: `gi = GroupY * x_groups + GroupX` is the flat
 /// `(batch, head, row)` index, and a workgroup past `workgroups()` (the fold's remainder) returns.
-/// Parameters: `q`, `k`, `v`, `mask`, then `k_shared` for a split key, then `len` for a live bound, then `out`
+/// Parameters: `q`, `k`, `v`, `mask`, then `k_shared` for a split key or `read` for a paged one, then `len` for a
+/// live bound, then `out`
 /// (the partial-state scratch under [`AttentionSchedule::SplitKv`]: the `x_groups`/`gi` index then runs over
 /// `(row, split)`, `gi = row * splits + split`).
 pub(crate) fn attention_body(
@@ -457,8 +481,12 @@ pub(crate) fn attention_body(
         }
     };
     let k_shared = match key {
-        KeyLayout::Single => None,
+        KeyLayout::Single | KeyLayout::Paged => None,
         KeyLayout::Split { .. } => Some(next_param(ld(slice_f32(false), false))),
+    };
+    let read = match key {
+        KeyLayout::Single | KeyLayout::Split { .. } => None,
+        KeyLayout::Paged => Some(next_param(ld(slice_dtype(Ty::I32, false), false))),
     };
     let len = match bound {
         KeyBound::Static => None,
@@ -473,7 +501,7 @@ pub(crate) fn attention_body(
     );
     let mut c = Cfg::new(params);
     let shared_dim = match key {
-        KeyLayout::Single => 0,
+        KeyLayout::Single | KeyLayout::Paged => 0,
         KeyLayout::Split { shared_dim } => shared_dim,
     };
     let head_dim = dk - shared_dim;
@@ -504,9 +532,19 @@ pub(crate) fn attention_body(
             let by_batch = uc(c, BinOp::Mul, b, hkv);
             ubin(c, BinOp::Add, by_batch, kv_head)
         };
-        let kbase = uc(c, BinOp::Mul, kv_row, lk * head_dim);
-        let shared_base = uc(c, BinOp::Mul, b, lk * shared_dim);
-        let vbase = uc(c, BinOp::Mul, kv_row, lk * dv);
+        // A dense key's rows start at its `(batch, head)` plane; a paged key has no plane: its slot map starts
+        // at the batch row and the pool row of key `t` comes from the slot it names.
+        let rows = match read {
+            None => KeyRows::Dense {
+                k: uc(c, BinOp::Mul, kv_row, lk * head_dim),
+                shared: uc(c, BinOp::Mul, b, lk * shared_dim),
+                v: uc(c, BinOp::Mul, kv_row, lk * dv),
+            },
+            Some(read) => KeyRows::Paged {
+                read,
+                read_base: uc(c, BinOp::Mul, b, lk),
+            },
+        };
         let maskbase = {
             let plane = match mask_kind {
                 MaskKind::Broadcast => uc(c, BinOp::Mul, b, mask_heads),
@@ -596,15 +634,37 @@ pub(crate) fn attention_body(
                     c.assign(Place::local(dot), Rvalue::Use(local_op(sum)));
                 });
             };
-            let key_row = {
-                let by_key = uc(c, BinOp::Mul, t, head_dim);
-                ubin(c, BinOp::Add, kbase, by_key)
+            // The row of the key and of the value in their operands: dense rows follow the plane, a paged
+            // key's operands share the pool row `slot * hkv + kv_head`.
+            let (key_row, value_row) = match rows {
+                KeyRows::Dense { k, v, .. } => {
+                    let key = uc(c, BinOp::Mul, t, head_dim);
+                    let value = uc(c, BinOp::Mul, t, dv);
+                    (ubin(c, BinOp::Add, k, key), ubin(c, BinOp::Add, v, value))
+                }
+                KeyRows::Paged { read, read_base } => {
+                    let at = ubin(c, BinOp::Add, read_base, t);
+                    let word = c.let_(Ty::I32, Rvalue::Use(copy(elem(read, at))));
+                    let slot = c.let_(
+                        Ty::Usize,
+                        Rvalue::Cast {
+                            to: Ty::Usize,
+                            operand: local_op(word),
+                        },
+                    );
+                    let by_slot = uc(c, BinOp::Mul, slot, hkv);
+                    let pool_row = ubin(c, BinOp::Add, by_slot, kv_head);
+                    (
+                        uc(c, BinOp::Mul, pool_row, head_dim),
+                        uc(c, BinOp::Mul, pool_row, dv),
+                    )
+                }
             };
             accumulate(c, k, key_row, head_dim, 0);
-            if let Some(k_shared) = k_shared {
+            if let (Some(k_shared), KeyRows::Dense { shared, .. }) = (k_shared, rows) {
                 let shared_row = {
                     let by_key = uc(c, BinOp::Mul, t, shared_dim);
-                    ubin(c, BinOp::Add, shared_base, by_key)
+                    ubin(c, BinOp::Add, shared, by_key)
                 };
                 accumulate(c, k_shared, shared_row, shared_dim, head_dim);
             }
@@ -637,10 +697,6 @@ pub(crate) fn attention_body(
             let l_next = fbin(c, BinOp::Add, decayed, weight);
             c.assign(Place::local(l), Rvalue::Use(local_op(l_next)));
 
-            let value_row = {
-                let by_key = uc(c, BinOp::Mul, t, dv);
-                ubin(c, BinOp::Add, vbase, by_key)
-            };
             count(c, cu(0), dv, 1, |c, channel| {
                 let slot = ubin(c, BinOp::Add, lane_slot, channel);
                 let vi = ubin(c, BinOp::Add, value_row, channel);

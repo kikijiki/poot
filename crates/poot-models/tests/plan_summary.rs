@@ -115,6 +115,7 @@ fn attention_detail(eqn: &Eqn, choice: &KernelChoice, dispatch: &Dispatch) -> St
     let key = match spec.key {
         poot_kernelgen::KeyLayout::Single => "single".to_string(),
         poot_kernelgen::KeyLayout::Split { shared_dim } => format!("split({shared_dim})"),
+        poot_kernelgen::KeyLayout::Paged => "paged".to_string(),
     };
     let bound = match (spec.bound, eqn.inputs.last()) {
         (poot_kernelgen::KeyBound::Static, _) => "capacity".to_string(),

@@ -22,8 +22,8 @@ Replay needs the same dispatches with the same parameters every token, so the de
 a constant shape. poot uses **fixed-capacity KV with masking**:
 
 - K and V are `Storage::State` buffers preallocated to a capacity `cap` per layer.
-- Each step writes the new K/V at `pos` (`DynamicUpdateSlice`, or `ScatterUpdate` through a slot map
-  for paged KV).
+- Each step writes the new K/V at `pos` (`DynamicUpdateSlice`, or `ScatterUpdate` through a
+  `Slot::WriteMap` for paged KV).
 - Attention always sweeps `[cap]`; a mask hides positions after `pos`. That mask is a graph
   computation over `Slot::Pos` against an `Iota`; no slot carries it.
 
@@ -31,7 +31,7 @@ Grids and buffer addresses stay constant, so one capture serves every position u
 
 ## Slot buffers
 
-Per-step inputs (`Slot::Token`, `Slot::Pos`, and `Slot::SlotMap` for paged KV) live in device buffers at stable addresses. The
+Per-step inputs (`Slot::Token`, `Slot::Pos`, and `Slot::SlotMap` and `Slot::WriteMap` for paged KV) live in device buffers at stable addresses. The
 recorded kernel arguments point at them, and the host rewrites their contents before each replay. The
 planner binds any scalar that depends on a slot to the slot buffer rather than baking it into the
 capture, which would replay a stale value.

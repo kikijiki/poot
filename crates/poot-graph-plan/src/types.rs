@@ -68,6 +68,17 @@ pub enum PlanError {
         /// Name of the op that produces the state's new value.
         op: String,
     },
+    /// A `ScatterUpdate` writes only the rows its slot map names, into the buffer of its base: the kernel
+    /// never copies the rest. Its output must therefore be donated to the base's own state buffer, which
+    /// needs the base to be a carried state whose old value nothing else reads. The graph is refused
+    /// instead of leaving its unnamed rows uninitialized.
+    #[error(
+        "{value} is a ScatterUpdate whose output is not donated to its base's state buffer: the kernel writes only the rows its slot map names, so its base must be a carried state whose old value nothing else reads"
+    )]
+    ScatterNotInPlace {
+        /// The scatter's output value.
+        value: ValueId,
+    },
 }
 
 /// Which cross-device operation a communication row carries (`multi_device`). A collective is a cut

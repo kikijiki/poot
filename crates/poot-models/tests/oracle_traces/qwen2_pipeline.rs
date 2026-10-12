@@ -3,7 +3,7 @@
 //! the oracle, never inside it - POOT-1130.)
 
 use poot_eval::{EvalBudget, EvalOptions, Value};
-use poot_graph_ir::{Graph, Slot, Storage, ValueId};
+use poot_graph_ir::{ForwardSlotMap, Graph, Slot, Storage, ValueId};
 use poot_models::model::{LogitRows, Model, Phase};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_tensor::HostTensor;
@@ -68,8 +68,8 @@ pub(super) struct PagedRow<'a> {
 }
 
 /// The `(read, write)` slot maps of a paged step of `tokens` new tokens per row: `read` is each
-/// row's `capacity` slots; `write` sends the pool slot of row `r`'s token `i` (position
-/// `start + i`) to the flat token index `r * tokens + i`, and every other slot to -1.
+/// row's `capacity` slots; `write` is the forward map of the flat token `r * tokens + i` (row `r`'s
+/// position `start + i`) to its pool slot. `pool` is the pool the map is checked against.
 pub(super) fn paged_maps(
     pool: usize,
     rows: &[PagedRow<'_>],
@@ -79,13 +79,13 @@ pub(super) fn paged_maps(
         .iter()
         .flat_map(|row| row.slots.iter().map(|&s| s as i32))
         .collect();
-    let mut write = vec![-1i32; pool];
-    for (r, row) in rows.iter().enumerate() {
-        for i in 0..tokens {
-            write[row.slots[row.start + i]] = (r * tokens + i) as i32;
-        }
-    }
-    (read, write)
+    let write = rows
+        .iter()
+        .flat_map(|row| (0..tokens).map(|i| row.slots[row.start + i] as i32))
+        .collect();
+    let write =
+        ForwardSlotMap::new(write, pool).expect("the test's slots are distinct and in the pool");
+    (read, write.as_slice().to_vec())
 }
 
 /// One evaluated step: its logits and the carried state, in `Graph::state` order.
@@ -111,13 +111,12 @@ pub(super) fn eval_step(
             Storage::Slot(Slot::Token) => HostTensor::i32(m.aval.shape.clone(), tokens.to_vec()),
             Storage::Slot(Slot::Pos) => HostTensor::i32(m.aval.shape.clone(), pos.to_vec()),
             Storage::Slot(Slot::SlotMap) => {
-                let (read, write) = maps.expect("a paged step binds its slot maps");
-                let values = match m.slot_key().unwrap().to_string().as_str() {
-                    "slotmap.read" => read,
-                    "slotmap.write" => write,
-                    other => panic!("unexpected slot map {other}"),
-                };
-                HostTensor::i32(m.aval.shape.clone(), values.to_vec())
+                let (read, _) = maps.expect("a paged step binds its slot maps");
+                HostTensor::i32(m.aval.shape.clone(), read.to_vec())
+            }
+            Storage::Slot(Slot::WriteMap) => {
+                let (_, write) = maps.expect("a paged step binds its slot maps");
+                HostTensor::i32(m.aval.shape.clone(), write.to_vec())
             }
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
             Storage::Const => named_weight(m.name.as_deref().unwrap(), &m.aval.shape),
@@ -841,5 +840,74 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode() {
             pool_err < 1e-5,
             "state pair {i}: chunk vs stepped-decode pool differ: max abs err {pool_err}"
         );
+    }
+}
+
+/// The paged write's contract on the pool itself (POOT-1148 pin): a step of two rows of two tokens, the
+/// second row's first token padding, over a pool that already holds values. A mapped token's K/V lands in
+/// its slot; a padding token writes nothing; every slot the step does not name keeps the value it held. The
+/// first layer's K/V rows depend only on the token and its position, so the written rows must equal the
+/// ones a zeroed pool receives. Mutation: let a padding token write its slot (the unmapped row gets the
+/// written values); or write every slot (the untouched pool rows change).
+#[test]
+fn paged_write_lands_mapped_tokens_and_keeps_padding_and_unnamed_slots() {
+    let model = tiny_qwen2(32, 16, 24, 32);
+    let (rows, tokens, cap, pool_slots) = (2usize, 2usize, 3usize, 12usize);
+    let g = trace_step(
+        &*model,
+        Phase::Prefill,
+        (rows, tokens, cap),
+        Some(pool_slots),
+        LogitRows::Last,
+    );
+    // Row 0 reads slots [7, 2, 9]; row 1 reads [4, 11, 0]. Row 0 writes positions 0 and 1; row 1's token
+    // 0 is padding and its token 1 writes position 1 (slot 11).
+    let slots = [[7usize, 2, 9], [4, 11, 0]];
+    let read: Vec<i32> = slots.iter().flatten().map(|&s| s as i32).collect();
+    let write = vec![
+        slots[0][0] as i32,
+        slots[0][1] as i32,
+        -1,
+        slots[1][1] as i32,
+    ];
+    let written: [usize; 3] = [slots[0][0], slots[0][1], slots[1][1]];
+    let step_tokens = [5, 11, 3, 20];
+    let step_pos = [0, 1, 0, 1];
+
+    let fresh = eval_step(&g, &step_tokens, &step_pos, Some((&read, &write)), None);
+    let seeded: Vec<HostTensor> = g
+        .state()
+        .map(|(input, _)| {
+            let shape = g.aval(input).shape.clone();
+            let n = shape.iter().product::<usize>();
+            HostTensor::f32(shape, (0..n).map(|i| 1.0 + i as f32).collect())
+        })
+        .collect();
+    let again = eval_step(
+        &g,
+        &step_tokens,
+        &step_pos,
+        Some((&read, &write)),
+        Some(&seeded),
+    );
+
+    // The first layer's K and V pools: `[pool_slots, kv_heads, head_dim]`.
+    for pair in 0..2 {
+        let row_len: usize = fresh.state[pair].shape()[1..].iter().product();
+        let fresh_pool = fresh.state[pair].as_f32().unwrap();
+        let seeded_in = seeded[pair].as_f32().unwrap();
+        let after = again.state[pair].as_f32().unwrap();
+        for slot in 0..pool_slots {
+            let range = slot * row_len..(slot + 1) * row_len;
+            if written.contains(&slot) {
+                assert_close_rel(&after[range.clone()], &fresh_pool[range], 1e-5);
+            } else {
+                assert_eq!(
+                    &after[range.clone()],
+                    &seeded_in[range],
+                    "pair {pair} slot {slot}: a slot the step does not write keeps its value"
+                );
+            }
+        }
     }
 }

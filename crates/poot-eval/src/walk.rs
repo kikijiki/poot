@@ -1185,7 +1185,7 @@ fn evaluate_e4m3(
             let [
                 IrOperand::Value(base_id),
                 IrOperand::Value(src_id),
-                IrOperand::Value(inverse_id),
+                IrOperand::Value(slots_id),
             ] = eqn.inputs.as_slice()
             else {
                 return Err(EvalError::Unsupported {
@@ -1195,9 +1195,9 @@ fn evaluate_e4m3(
                 });
             };
             let src = env_value(env, *src_id)?.clone();
-            let inverse = host_tensor(eqn, 2, env)?;
-            let _ = inverse_id;
-            env_value(env, *base_id)?.scatter_update(&src, inverse, eqn.out)
+            let slots = host_tensor(eqn, 2, env)?;
+            let _ = slots_id;
+            env_value(env, *base_id)?.scatter_update(&src, slots, eqn.out)
         }
         other => Err(EvalError::Unsupported {
             eqn: eqn.out,
@@ -1374,8 +1374,8 @@ fn evaluate_dense(
         OpKind::ScatterUpdate => {
             let base = get(&eqn.inputs[0])?;
             let src = get(&eqn.inputs[1])?;
-            let inverse = get(&eqn.inputs[2])?;
-            ops::movement::scatter_update(&base, &src, &inverse, &out_shape, eqn.out)?
+            let slots = get(&eqn.inputs[2])?;
+            ops::movement::scatter_update(&base, &src, &slots, &out_shape, eqn.out)?
         }
         OpKind::ArgTopK { k } => ops::index::arg_top_k(&get(&eqn.inputs[0])?, *k, eqn.out)?,
         OpKind::PackI8 => ops::index::pack_i8(&get(&eqn.inputs[0])?, &out_shape)?,

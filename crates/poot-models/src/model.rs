@@ -118,10 +118,10 @@ pub enum KvLayout {
     /// first position. Every row of a step carries the same token count.
     Contiguous,
     /// One `[pool_slots, kv_heads, head_dim]` pool per layer shared by every row. Each row reads and
-    /// writes through per-step slot maps bound as `Slot::SlotMap` (`"read"`: logical position to pool
-    /// slot, `[rows, capacity]`; `"write"`: pool slot to the step's flat token index or -1,
-    /// `[pool_slots]`), so a row's blocks may sit anywhere in the pool and a token whose write map
-    /// entry is -1 (a padding token) leaves the pool untouched. Recurrent state is pooled the same way:
+    /// writes through per-step slot maps (`Slot::SlotMap` `"read"`: logical position to pool slot,
+    /// `[rows, capacity]`; `Slot::WriteMap` `"write"`: the step's flat token index to its pool slot or
+    /// -1, `[rows * tokens]`), so a row's blocks may sit anywhere in the pool and a token whose write
+    /// map entry is -1 (a padding token) leaves the pool untouched. Recurrent state is pooled the same way:
     /// one row per sequence the pool serves (`seqs`), which a step's rows address through the
     /// `state_read` and `state_write` index inputs (`Step::recurrent`).
     Paged {

@@ -1,4 +1,5 @@
 use super::{BinOp, Builder, BuilderError, DType, RedOp, Scalar, Traced, UnOp, softcap};
+use crate::error::Requirement;
 
 /// GQA repeat_kv: broadcast each of H_kv heads to n_rep query heads.
 /// `k[bsz,H_kv,S,D]` -> `[bsz,H_kv*n_rep,S,D]`.
@@ -160,6 +161,31 @@ pub fn attention_masked_softcap(
         attn_logit_softcap,
         None,
     )
+}
+
+/// The `[B,Hkv,Lk,D]` view of the `[S,Hkv,D]` KV `pool` through the `[B,Lk]` I32 slot map `read`: position `t`
+/// of batch row `b` is pool slot `read[b,t]`. It is the one definition of a paged cache's logical view: the
+/// models trace it, and [`crate::KeyLayout::Paged`] attention is its fusion into the attention kernel, which
+/// reads the pool through `read` instead of materializing the view.
+pub fn paged_view(b: &Builder, pool: Traced, read: Traced) -> Result<Traced, BuilderError> {
+    let rank = |expected: usize, shape: Vec<usize>| BuilderError::Requirement {
+        operation: "paged view",
+        requirement: Requirement::Rank {
+            expected,
+            found: shape,
+        },
+    };
+    let read_shape = b.aval(read)?.shape.clone();
+    let &[rows, cap] = read_shape.as_slice() else {
+        return Err(rank(2, read_shape));
+    };
+    let pool_shape = b.aval(pool)?.shape.clone();
+    let &[_, hkv, d] = pool_shape.as_slice() else {
+        return Err(rank(3, pool_shape));
+    };
+    let slots = b.reshape(read, vec![rows * cap])?;
+    let rows_first = b.reshape(b.gather(pool, 0, slots)?, vec![rows, cap, hkv, d])?;
+    b.transpose(rows_first, vec![0, 2, 1, 3])
 }
 
 /// The key operand of the attention composite: one dense tensor, or the two parts of a split key.

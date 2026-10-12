@@ -52,7 +52,7 @@ use std::sync::Arc;
 use poot_eval::test_support::StepFixture;
 use poot_executor::{Executor, NoSync, StateScope, StepInputs};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
-use poot_graph_ir::{Graph, Slot, Storage, TensorType};
+use poot_graph_ir::{ForwardSlotMap, Graph, Slot, Storage, TensorType};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
     staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
@@ -424,12 +424,52 @@ fn const_fixture(
     }
 }
 
-fn view(step: &[StepFixture]) -> StepInputs<'_> {
-    let mut inputs = StepInputs::new();
-    for v in step {
-        inputs.push(v.key.clone(), v.tensor.shape(), v.tensor.view());
+/// One step's fixture values prepared for an executor: every tensor is a raw view, except a
+/// [`Slot::WriteMap`] one, which only binds as a checked [`ForwardSlotMap`]. The map is checked against the
+/// pool `g` declares for the slot (the upper end of its declared range), so a fixture with a repeated or
+/// out-of-pool slot is refused here, by the one constructor, before any executor sees it.
+struct BoundStep<'a> {
+    values: &'a [StepFixture],
+    maps: Vec<(poot_graph_ir::SlotKey, ForwardSlotMap)>,
+}
+
+impl<'a> BoundStep<'a> {
+    fn new(g: &Graph, values: &'a [StepFixture]) -> Result<Self, String> {
+        let mut maps = Vec::new();
+        for v in values.iter().filter(|v| v.key.role() == Slot::WriteMap) {
+            let pool = g
+                .inputs()
+                .iter()
+                .map(|&id| g.meta(id))
+                .find(|meta| meta.slot_key() == Some(&v.key))
+                .and_then(|meta| meta.range())
+                .map(|range| range.hi_exclusive() as usize)
+                .ok_or_else(|| format!("write map {} declares no pool range", v.key))?;
+            let words = v
+                .tensor
+                .as_i32()
+                .ok_or_else(|| format!("write map {} is not I32", v.key))?;
+            let map = ForwardSlotMap::new(words.to_vec(), pool)
+                .map_err(|e| format!("write map {}: {e}", v.key))?;
+            maps.push((v.key.clone(), map));
+        }
+        Ok(Self { values, maps })
     }
-    inputs
+
+    fn inputs(&self) -> StepInputs<'_> {
+        let mut inputs = StepInputs::new();
+        for v in self
+            .values
+            .iter()
+            .filter(|v| v.key.role() != Slot::WriteMap)
+        {
+            inputs.push(v.key.clone(), v.tensor.shape(), v.tensor.view());
+        }
+        for (key, map) in &self.maps {
+            inputs.push_write_map(key.clone(), map);
+        }
+        inputs
+    }
 }
 
 /// `fixture`'s graph with each const named by a weight id, and the map over `fixture.store` that
@@ -582,7 +622,12 @@ pub fn run_once(
         .add_entry(exe, &staged)
         .map_err(|e| format!("run_once: add_entry: {e}"))?;
     let output = exec
-        .step(exe, entry, &view(slots), &mut NoSync)
+        .step(
+            exe,
+            entry,
+            &BoundStep::new(&g, slots)?.inputs(),
+            &mut NoSync,
+        )
         .map_err(|e| format!("run_once: step: {e}"))?
         .to_host()
         .map_err(|e| format!("run_once: read: {e}"))?;
@@ -613,7 +658,12 @@ pub fn run_parity(
     for (i, step) in fixture.steps.iter().enumerate() {
         let expected = oracle(step);
         let got = exec
-            .step(exe, entry, &view(step), &mut NoSync)
+            .step(
+                exe,
+                entry,
+                &BoundStep::new(&fixture.graph, step)?.inputs(),
+                &mut NoSync,
+            )
             .map_err(|e| format!("{}: step {i}: {e}", fixture.name))?
             .to_host()
             .map_err(|e| format!("{}: read {i}: {e}", fixture.name))?;
@@ -631,7 +681,12 @@ pub fn run_parity(
     let first = &fixture.steps[0];
     let expected = oracle(first);
     let got = exec
-        .step(exe, entry, &view(first), &mut NoSync)
+        .step(
+            exe,
+            entry,
+            &BoundStep::new(&fixture.graph, first)?.inputs(),
+            &mut NoSync,
+        )
         .map_err(|e| format!("{}: repeat step: {e}", fixture.name))?
         .to_host()
         .map_err(|e| format!("{}: repeat read: {e}", fixture.name))?;
@@ -667,10 +722,15 @@ pub fn run_outputs(
     let mut outputs = Vec::with_capacity(fixture.steps.len());
     for (i, step) in fixture.steps.iter().enumerate() {
         outputs.push(
-            exec.step(exe, entry, &view(step), &mut NoSync)
-                .map_err(|e| format!("{}: step {i}: {e}", fixture.name))?
-                .to_host()
-                .map_err(|e| format!("{}: read {i}: {e}", fixture.name))?,
+            exec.step(
+                exe,
+                entry,
+                &BoundStep::new(&fixture.graph, step)?.inputs(),
+                &mut NoSync,
+            )
+            .map_err(|e| format!("{}: step {i}: {e}", fixture.name))?
+            .to_host()
+            .map_err(|e| format!("{}: read {i}: {e}", fixture.name))?,
         );
     }
     exec.unload(exe)
@@ -701,7 +761,12 @@ pub fn run_capture_replay(
     for (i, step) in fixture.steps.iter().enumerate() {
         let expected = oracle(step);
         let got = exec
-            .step(exe, entry, &view(step), &mut NoSync)
+            .step(
+                exe,
+                entry,
+                &BoundStep::new(&fixture.graph, step)?.inputs(),
+                &mut NoSync,
+            )
             .map_err(|e| format!("{}: step {i}: {e}", fixture.name))?
             .to_host()
             .map_err(|e| format!("{}: read {i}: {e}", fixture.name))?;
@@ -721,7 +786,12 @@ pub fn run_capture_replay(
         .map_err(|e| format!("{}: reset_state: {e}", fixture.name))?;
     for (i, (step, recorded)) in fixture.steps.iter().zip(&first_pass).enumerate() {
         let replayed = exec
-            .step(exe, entry, &view(step), &mut NoSync)
+            .step(
+                exe,
+                entry,
+                &BoundStep::new(&fixture.graph, step)?.inputs(),
+                &mut NoSync,
+            )
             .map_err(|e| format!("{}: replay step {i}: {e}", fixture.name))?
             .to_host()
             .map_err(|e| format!("{}: replay read {i}: {e}", fixture.name))?;

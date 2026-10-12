@@ -17,6 +17,7 @@
 //! every runtime's buffer handle and by the planner's per-value storage record (card 527).
 
 pub mod aie;
+pub mod dram_channels;
 pub mod storage;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
