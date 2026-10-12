@@ -27,15 +27,20 @@ const PREFILL_CHUNK: usize = 128;
 pub struct Sampling {
     /// 0 is greedy, the exact-token convention.
     pub temperature: f32,
+    /// Keep only the `top_k` most likely tokens; 0 is off.
     pub top_k: usize,
+    /// Nucleus mass kept; 1 is off.
     pub top_p: f32,
+    /// Drop tokens below this fraction of the top probability; 0 is off.
     pub min_p: f32,
     /// The multiplicative repetition penalty over the prompt and the output; 1 is off.
     pub repeat_penalty: f32,
+    /// The sampler seed; one seed gives one output.
     pub seed: u64,
 }
 
 impl Sampling {
+    /// Greedy decoding: temperature 0, no truncation, no penalty.
     pub const GREEDY: Self = Self {
         temperature: 0.0,
         top_k: 0,
@@ -55,6 +60,7 @@ impl Sampling {
 /// What to generate from.
 #[derive(Clone, Debug)]
 pub struct TextRequest {
+    /// The prompt text.
     pub prompt: String,
     /// A system turn ahead of the prompt; needs the chat template, so it is refused when the prompt is
     /// used as written.
@@ -68,28 +74,40 @@ pub struct TextRequest {
     /// The window, in positions, that the prompt and the new tokens must fit, and the capacity the
     /// driver is sized to; `None` is the model's `max_positions`.
     pub ctx: Option<usize>,
+    /// How the next token is chosen.
     pub sampling: Sampling,
     /// Keep going through the model's end-of-sequence token.
     pub ignore_eos: bool,
 }
 
+/// Why a one-shot generation failed before or while running.
 #[derive(Debug, thiserror::Error)]
 pub enum OneShotError {
+    /// The prompt could not be tokenized.
     #[error("encoding the prompt: {0}")]
     Encode(#[source] TextError),
     /// The chat template given in place of the model's own failed to render the conversation.
     #[error("rendering the chat: {0}")]
     Render(#[source] TextError),
+    /// A system prompt was given without a chat template to carry it.
     #[error(
         "a system prompt needs the model's chat template, and this prompt is used as written (the model ships no template, or the template was switched off)"
     )]
     SystemWithoutTemplate,
+    /// A conversation was given for a model that ships no chat template.
     #[error(
         "a conversation needs the model's chat template, and this model ships none (a base model)"
     )]
     ConversationWithoutTemplate,
+    /// The requested window is larger than the model's positions.
     #[error("a context of {asked} positions is not within the model's {max}")]
-    Window { asked: usize, max: usize },
+    Window {
+        /// Positions requested.
+        asked: usize,
+        /// Positions the model has.
+        max: usize,
+    },
+    /// The driver refused or failed the generation.
     #[error(transparent)]
     Driver(DriverError),
 }

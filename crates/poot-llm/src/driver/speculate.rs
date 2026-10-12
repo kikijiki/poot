@@ -83,13 +83,17 @@ pub enum DraftPolicy {
     /// Propose the tokens that followed the most recent earlier occurrence of the sequence's last
     /// `ngram` tokens ([`propose_lookup`]).
     PromptLookup {
+        /// Length of the sequence's trailing n-gram to look up.
         ngram: NonZeroUsize,
+        /// Most drafts proposed per round.
         k: NonZeroUsize,
     },
     /// Propose with a second model, `k` tokens a round. Its vocabulary must agree with the target's
     /// and its state must be positional.
     DraftModel {
+        /// The model drafts are proposed with.
         handle: Arc<ModelHandle>,
+        /// Most drafts proposed per round.
         k: NonZeroUsize,
     },
     /// Propose with the served model's own multi-token-prediction layer (`Phase::Mtp`), `k` tokens a
@@ -98,7 +102,10 @@ pub enum DraftPolicy {
     /// measuring, so no value is the default. The layer runs on the target's executable, reads the
     /// hidden-state carry the target's programs write ([`DriverOptions::hidden_window`], which
     /// [`DraftPolicy::carry_window`] derives) and keeps a cache of its own.
-    Mtp { k: NonZeroUsize },
+    Mtp {
+        /// Most drafts proposed per round.
+        k: NonZeroUsize,
+    },
 }
 
 impl DraftPolicy {
@@ -133,7 +140,9 @@ impl DraftPolicy {
 /// positions (the query token plus the drafts).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpeculationCaps {
+    /// Most drafts per round.
     pub k: NonZeroUsize,
+    /// Positions of the verify window: `k + 1`.
     pub window: NonZeroUsize,
 }
 
@@ -145,7 +154,12 @@ pub enum RowSpeculation {
     NotApplicable,
     /// `proposed` drafts were verified and `accepted` of them kept; the row's result is the accepted
     /// drafts and one more token.
-    Verified { proposed: usize, accepted: usize },
+    Verified {
+        /// Drafts verified.
+        proposed: usize,
+        /// Drafts the target kept.
+        accepted: usize,
+    },
     /// The row decoded one token under a draft policy, for this reason.
     NotSpeculated(NotSpeculated),
 }
@@ -207,7 +221,9 @@ impl SpeculationStats {
 /// executor measured for them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StepTime {
+    /// Rollback steps run.
     pub steps: u64,
+    /// Engine wall time of those steps.
     pub wall: std::time::Duration,
 }
 
@@ -218,8 +234,11 @@ pub struct StepTime {
 /// phase of [`GenerationTiming`](super::GenerationTiming).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RollbackTiming {
+    /// Snapshot copies taken before a window.
     pub snapshots: StepTime,
+    /// Restore copies after a rejecting window.
     pub restores: StepTime,
+    /// Replay chunks that re-feed the kept prefix.
     pub replays: StepTime,
 }
 

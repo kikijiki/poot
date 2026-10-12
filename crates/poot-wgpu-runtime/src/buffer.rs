@@ -27,6 +27,7 @@ impl KernelBuffer {
         }
     }
 
+    /// A read-only buffer holding a copy of `data`, for a kernel param the body declares as `Slice<f32>`.
     pub fn read_only_f32(data: &[f32]) -> Self {
         Self::new(bytemuck::cast_slice(data).to_vec(), ElementKind::F32, false)
     }
@@ -44,6 +45,8 @@ impl KernelBuffer {
     pub fn read_only_u32(data: &[u32]) -> Self {
         Self::new(bytemuck::cast_slice(data).to_vec(), ElementKind::I32, false)
     }
+    /// A writable, zero-filled buffer of `len` f32 elements, read back into this buffer after the
+    /// dispatch.
     pub fn write_f32(len: usize) -> Self {
         Self::new(vec![0u8; len * 4], ElementKind::F32, true)
     }
@@ -53,6 +56,7 @@ impl KernelBuffer {
     pub fn write_i32(len: usize) -> Self {
         Self::new(vec![0u8; len * 4], ElementKind::I32, true)
     }
+    /// Read this buffer's bytes as f32 elements (the [`Self::write_f32`] counterpart).
     pub fn as_f32(&self) -> &[f32] {
         bytemuck::cast_slice(&self.bytes)
     }

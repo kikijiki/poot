@@ -72,8 +72,11 @@ fn arg_schema(body: &Body) -> Box<[ArgSchema]> {
 /// [`kernel_handle`] takes this type and a byte artifact can never be presented as an AIE kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GpuTarget {
+    /// Vulkan compute, emitted as SPIR-V.
     SpirvVulkan,
+    /// NVIDIA, emitted as PTX.
     Nvptx,
+    /// AMD, emitted as an HSACO for the given GCN/RDNA architecture.
     AmdGcn(poot_target::AmdArch),
 }
 

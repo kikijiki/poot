@@ -2,10 +2,14 @@ use super::{
     EditError, Eqn, Graph, HashMap, HashSet, OpKind, Operand, Storage, ValueId, with_eqns,
 };
 use poot_graph_ir::{ContractionRows, ValueTable};
+/// Names the packed equation a [`PackedDequantProductionError`] is about, for its message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedDequantErrorContext {
+    /// The equation's output value.
     pub value: ValueId,
+    /// The packed weight format of the equation's descriptor.
     pub format: poot_quant::format::WeightFormat,
+    /// The dense `[out, k]` shape the descriptor stands for.
     pub logical_shape: [usize; 2],
 }
 
@@ -29,69 +33,117 @@ impl std::fmt::Display for PackedDequantErrorContext {
     }
 }
 
+/// Why a graph is refused by the final production gate: a packed equation survives that no packed contraction claimed, or its carriers or internal values break the single-consumer, constant-storage and no-escape rules.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PackedDequantProductionError {
+    /// A carrier operand is not constant storage.
     #[error(
         "packed dequant {context} carrier {carrier} uses {storage:?} storage; Const is required"
     )]
     CarrierStorage {
+        /// The packed equation the refusal is about.
         context: PackedDequantErrorContext,
+        /// The offending carrier value.
         carrier: ValueId,
+        /// The carrier's actual storage.
         storage: Storage,
     },
+    /// Two source roles resolved to the same graph value.
     #[error(
         "packed dequant {context} {roles:?} carrier {carrier} has invalid identity {name:?}: two distinct source roles resolved to the same graph value"
     )]
     CarrierIdentity {
+        /// The packed equation the refusal is about.
         context: PackedDequantErrorContext,
+        /// The value both roles resolved to.
         carrier: ValueId,
+        /// The two roles that collided.
         roles: (poot_quant::SourceRole, poot_quant::SourceRole),
+        /// The carrier's declared name, if it has one.
         name: Option<String>,
     },
+    /// A carrier is also the graph output, a validation output or carried state.
     #[error("packed dequant {context} carrier {carrier} escapes through {destination}")]
     CarrierEscape {
+        /// The packed equation the refusal is about.
         context: PackedDequantErrorContext,
+        /// The offending carrier value.
         carrier: ValueId,
+        /// Which output the carrier escapes through.
         destination: &'static str,
     },
+    /// A carrier has a consumer other than the equation that claims it.
     #[error(
         "packed dequant {context} carrier {carrier} has {consumers} equation consumers; only its claimed candidate is allowed"
     )]
     CarrierConsumerCount {
+        /// The packed equation the refusal is about.
         context: PackedDequantErrorContext,
+        /// The offending carrier value.
         carrier: ValueId,
+        /// How many equations consume the carrier.
         consumers: usize,
     },
+    /// The equation's carrier operands are not exactly the descriptor's source values.
     #[error(
         "packed dequant {context} carriers are not exactly the descriptor's own source graph values"
     )]
-    CarrierOperands { context: PackedDequantErrorContext },
+    CarrierOperands {
+        /// The packed equation the refusal is about.
+        context: PackedDequantErrorContext,
+    },
+    /// The dequantized value is also the graph output.
     #[error("packed dequant {context} escapes as the graph output")]
-    GraphOutput { context: PackedDequantErrorContext },
+    GraphOutput {
+        /// The packed equation the refusal is about.
+        context: PackedDequantErrorContext,
+    },
+    /// The dequantized value is also a validation output.
     #[error("packed dequant {context} escapes as a validation output")]
-    ValidationOutput { context: PackedDequantErrorContext },
+    ValidationOutput {
+        /// The packed equation the refusal is about.
+        context: PackedDequantErrorContext,
+    },
+    /// The equation's result is also a carried-state output.
     #[error("packed dequant {context} has an internal value that escapes as carried-state output")]
-    StateOutput { context: PackedDequantErrorContext },
+    StateOutput {
+        /// The packed equation the refusal is about.
+        context: PackedDequantErrorContext,
+    },
+    /// A dequant's result or its transpose has other than one consumer.
     #[error(
         "packed dequant {context} internal {internal} has {consumers} equation consumers; exactly one is required"
     )]
     ConsumerCount {
+        /// The packed equation the refusal is about.
         context: PackedDequantErrorContext,
+        /// The value with the wrong consumer count.
         internal: ValueId,
+        /// How many equations consume it.
         consumers: usize,
     },
+    /// A dequant is followed by a transpose that is not `[1, 0]`.
     #[error("packed dequant {context} has transpose permutation {perm:?}; expected [1, 0]")]
     TransposePermutation {
+        /// The packed equation the refusal is about.
         context: PackedDequantErrorContext,
+        /// The transpose permutation found.
         perm: Vec<usize>,
     },
+    /// A dequant feeds a data-movement op the packed chains do not express.
     #[error("packed dequant {context} reaches unsupported movement {operation}")]
     Movement {
+        /// The packed equation the refusal is about.
         context: PackedDequantErrorContext,
+        /// Name of the movement op.
         operation: String,
     },
+    /// A dequant survived the contraction pass: no packed contraction claimed it.
     #[error("reachable packed dequant {context} was not claimed by a contraction")]
-    Unmatched { context: PackedDequantErrorContext },
+    Unmatched {
+        /// The packed equation the refusal is about.
+        context: PackedDequantErrorContext,
+    },
 }
 
 pub(super) fn packed_consumer_map(g: &Graph) -> ValueTable<Vec<usize>> {

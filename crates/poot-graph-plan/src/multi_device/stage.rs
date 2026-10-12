@@ -44,10 +44,20 @@ pub(crate) struct StageTransfer {
 /// Typed failure of `plan_stage_communication`.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StagePlanError {
+    /// A stage has no device in the placement.
     #[error("stage {stage} has no device in a placement of {count}")]
-    StageUnplaced { stage: usize, count: usize },
+    StageUnplaced {
+        /// The stage index.
+        stage: usize,
+        /// How many devices the placement has.
+        count: usize,
+    },
+    /// The plan needs more nodes than a `u32` plan node id can number.
     #[error("the stage plan needs {nodes} plan nodes, more than u32::MAX can carry")]
-    PlanNodeIdOverflow { nodes: usize },
+    PlanNodeIdOverflow {
+        /// The node count the plan needs.
+        nodes: usize,
+    },
 }
 
 /// Build one transfer row per boundary hop from `boundaries` under `stage_devices`.

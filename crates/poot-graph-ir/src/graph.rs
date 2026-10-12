@@ -64,12 +64,14 @@ pub struct ValueTable<T> {
 }
 
 impl<T> ValueTable<T> {
+    /// An empty table.
     pub const fn new() -> Self {
         ValueTable {
             entries: Vec::new(),
         }
     }
 
+    /// An empty table with room for `capacity` entries, so a known-size fill does not reallocate.
     pub fn with_capacity(capacity: usize) -> Self {
         ValueTable {
             entries: Vec::with_capacity(capacity),
@@ -86,10 +88,12 @@ impl<T> ValueTable<T> {
         }
     }
 
+    /// The number of entries, which is also the next id's index.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether the table holds no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -123,22 +127,27 @@ impl<T> ValueTable<T> {
         }
     }
 
+    /// The entry `id` addresses, or `None` when `id` is past the end.
     pub fn get(&self, id: ValueId) -> Option<&T> {
         self.entries.get(id.index())
     }
 
+    /// The entry `id` addresses, mutably, or `None` when `id` is past the end.
     pub fn get_mut(&mut self, id: ValueId) -> Option<&mut T> {
         self.entries.get_mut(id.index())
     }
 
+    /// Whether `id` addresses an entry of this table.
     pub fn contains(&self, id: ValueId) -> bool {
         id.index() < self.entries.len()
     }
 
+    /// Every entry, in id order.
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.entries.iter()
     }
 
+    /// Every entry, mutably, in id order.
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
         self.entries.iter_mut()
     }
@@ -156,10 +165,12 @@ impl<T> ValueTable<T> {
         (0..self.entries.len() as u32).map(ValueId)
     }
 
+    /// Drop every entry from index `len` on; ids at or past `len` stop addressing anything.
     pub fn truncate(&mut self, len: usize) {
         self.entries.truncate(len);
     }
 
+    /// Reserve room for `additional` more entries, reporting allocation failure instead of aborting.
     pub fn try_reserve(
         &mut self,
         additional: usize,
@@ -247,18 +258,26 @@ pub struct LayerRuns {
 /// Why a graph's layer tags are not one run per layer in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LayerTagError {
+    /// An equation without a layer tag sits between the first and last tagged equations.
     #[error(
         "equation {equation} is untagged between the first and last layer-tagged equation; a \
          layer-cut split will not guess which side it belongs to"
     )]
-    Untagged { equation: usize },
+    Untagged {
+        /// The index of the untagged equation.
+        equation: usize,
+    },
+    /// Layer tags are not one contiguous run per layer in ascending order.
     #[error(
         "equation {equation} is tagged layer {layer}, breaking the one-run-per-layer order the \
          layer cuts map onto (expected layer {expected})"
     )]
     NonContiguous {
+        /// The index of the equation that breaks the order.
         equation: usize,
+        /// The layer it is tagged with.
         layer: usize,
+        /// The layer the order required at that point.
         expected: usize,
     },
 }
@@ -288,40 +307,67 @@ impl BoundaryId {
 /// Several exports may resolve to one value (CSE merges them); each keeps its own id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Export {
+    /// The name the consuming side resolves the value by.
     pub id: BoundaryId,
+    /// The exported value.
     pub value: ValueId,
 }
 
+/// The most bytes one validation packet may occupy: the budget the packet layout is checked against.
 pub const MAX_VALIDATION_PACKET_BYTES: usize = 4096;
 
+/// Where one validation witness sits in the packet a program returns: its lanes are the f32 words
+/// `first_lane..first_lane + lane_count`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationPacketEntry {
+    /// The witness's stable key.
     pub id: ValidationId,
+    /// The witness's published name.
     pub name: String,
+    /// Index of the witness's first lane in the packet.
     pub first_lane: usize,
+    /// Number of f32 lanes the witness occupies.
     pub lane_count: usize,
 }
 
+/// The layout of one validation packet: every witness's lanes, in declaration order, laid end to end.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationPacketLayout {
+    /// One entry per witness, in lane order.
     pub entries: Vec<ValidationPacketEntry>,
+    /// Total f32 lanes of the packet.
     pub lane_count: usize,
+    /// Total bytes of the packet; bounded by [`MAX_VALIDATION_PACKET_BYTES`].
     pub byte_len: usize,
 }
 
+/// A validation witness lane that held anything but a signed zero when a program ran: a witness reads zero
+/// when every check passed.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 #[error("validation {name} ({id:?}) lane {lane} failed with f32 bits 0x{observed_bits:08x}")]
 pub struct ExecutionValidationFailure {
+    /// The failing witness's stable key.
     pub id: ValidationId,
+    /// The failing witness's published name.
     pub name: String,
+    /// The lane of the witness that failed.
     pub lane: usize,
+    /// The f32 bit pattern the lane held.
     pub observed_bits: u32,
 }
 
+/// Why a returned validation packet is not a clean pass.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidationPacketError {
+    /// The packet's lane count differs from the layout's.
     #[error("validation packet has {actual} lanes; expected {expected}")]
-    Length { expected: usize, actual: usize },
+    Length {
+        /// Lanes the layout declares.
+        expected: usize,
+        /// Lanes the packet held.
+        actual: usize,
+    },
+    /// A witness lane failed.
     #[error(transparent)]
     Failure(#[from] ExecutionValidationFailure),
 }
@@ -329,7 +375,9 @@ pub enum ValidationPacketError {
 /// An operand: an SSA value reference or an inline literal (the jaxpr `Atom`).
 #[derive(Clone, Copy, Debug)]
 pub enum Operand {
+    /// A value of the graph, by id.
     Value(ValueId),
+    /// An inline scalar literal, broadcast as a rank-0 value.
     Lit(Scalar),
 }
 
@@ -338,12 +386,14 @@ pub enum Operand {
 /// `Activation` is an explicitly named standalone boundary, not a model-engine slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Slot {
+    /// The current step's token id, a scalar per token row.
     Token,
     /// A caller-supplied dense activation for a standalone graph boundary. Unlike [`Slot::Token`], it is not a
     /// token id and has no model-engine binding convention. Declare it with [`crate::builder::Builder::slot_named`]
     /// and bind it by value id or name through a caller-owned contract, such as the driver-adjacent resident E4M3
     /// linear handoff.
     Activation,
+    /// The current step's position id, a scalar per token row; the attention mask is computed from it in-graph.
     Pos,
     /// Card 152 / spec 267: one atomically-bound temporal/height/width position tuple for sectioned multimodal RoPE.
     /// Shape `[3,N]` for the `N = rows * tokens` positions of a step (`[3,L]` for prefill, `[3,B]` for statically
@@ -429,10 +479,15 @@ impl Slot {
 /// its paired `state_out` (see [`Graph::state`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Storage {
+    /// An intermediate living in a device buffer the planner assigns.
     Device,
+    /// A weight or table bound at graph close, uploaded once.
     Const,
+    /// A constant the compiler materializes from its own definition; nothing binds it.
     Computed(ComputedConst),
+    /// A per-step input routed through a stable device buffer.
     Slot(Slot),
+    /// A persistent buffer carried across steps and overwritten by its paired `state_out`.
     State,
 }
 
@@ -453,19 +508,30 @@ impl Storage {
 pub enum ComputedConst {
     /// The range `[0, 1, .., len)`, shape `[len]`, in `dtype` (F32 or I32; an I32 range is exact for every
     /// `len` a graph shape can hold, an F32 one only below 2^24).
-    Iota { len: usize, dtype: DType },
+    Iota {
+        /// The number of elements.
+        len: usize,
+        /// The element dtype, F32 or I32.
+        dtype: DType,
+    },
     /// One table of a RoPE pair, shape `[positions, spec.dim()]`, from
     /// [`crate::rope_table::rope_tables`]. `positions` is the entry's capacity, not the model's
     /// maximum context.
     Rope {
+        /// Which of the pair this constant is.
         table: RopeTable,
+        /// The number of rows: the highest position the table serves, plus one.
         positions: u32,
+        /// The rotary width, base and scaling the table derives from.
         spec: RopeSpec,
     },
     /// The ALiBi (Press et al.) per-head slopes of a model with `heads` attention heads, shape
     /// `[heads]`: `2^(-8 (i + 1) / n)` for `n` the largest power of two not above `heads`, then the
     /// odd-indexed slopes of the `2n` series for the remaining heads (BLOOM's and MPT's rule).
-    AlibiSlopes { heads: usize },
+    AlibiSlopes {
+        /// The model's attention head count.
+        heads: usize,
+    },
 }
 
 fn alibi_series(n: usize) -> impl Iterator<Item = f32> {
@@ -575,7 +641,10 @@ impl ComputedConst {
 pub enum StateRole {
     /// Written at the live position along `axis`; a stale write past the committed length is
     /// harmless. The `[1, Hkv, cap, D]` architecture KV caches carry the position on axis 2.
-    Positional { axis: u8 },
+    Positional {
+        /// The axis along which the live position indexes the buffer.
+        axis: u8,
+    },
     /// Folds every token into its value: conv windows, GDN/KDA/SSM matrices, ring buffers written at
     /// `pos % w`, and the pooled `[pool_slots, hkv, d]` caches (position on axis 0). The safe default
     /// every existing state pair is traced with; `Positional` is declared only by `components::attention`
@@ -594,15 +663,23 @@ pub enum StateRole {
 /// alongside it. Built by [`Graph::state_pairs`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatePair {
+    /// The `State` input binder the step reads.
     pub input: ValueId,
+    /// The value the step overwrites the state with.
     pub output: ValueId,
+    /// The role declared on `input`.
     pub role: StateRole,
 }
 
+/// What a graph records about one SSA value: its abstract type, how it is stored, and the optional
+/// name and construction-time facts (slot key, state role, declared range) binders and passes read.
 #[derive(Clone, Debug)]
 pub struct ValueMeta {
+    /// The value's shape and dtype, computed host-side at construction.
     pub aval: TensorType,
+    /// How the value is stored.
     pub storage: Storage,
+    /// The value's name: the lookup key of a `Const`, the wire spelling of a `Slot`, a label otherwise.
     pub name: Option<String>,
     /// The structured identity of a [`Storage::Slot`] input, set once at construction
     /// ([`crate::builder::Builder::slot`], `slot_named`, `exact_i32_slot`) and never rebuilt from
@@ -748,8 +825,11 @@ pub(crate) enum InputKey {
 /// One SSA instruction: `out = op(inputs)`. Multi-output ops are reserved (single output for now).
 #[derive(Clone, Debug)]
 pub struct Eqn {
+    /// The operation this equation applies.
     pub op: OpKind,
+    /// The operands, in the operation's operand order.
     pub inputs: Vec<Operand>,
+    /// The value this equation defines.
     pub out: ValueId,
     /// The decoder layer that emitted this equation, set by [`crate::Builder::layer_scope`] for
     /// every equation emitted inside the scope. `None` outside a scope, and `None` for an equation
@@ -768,26 +848,39 @@ pub enum OutputKind {
     Result,
     /// A bounded F32 validation witness, checked before the result or state is published. The value
     /// remains an ordinary F32 graph value.
-    Witness { id: ValidationId, name: String },
+    Witness {
+        /// The witness's stable key.
+        id: ValidationId,
+        /// The witness's published name.
+        name: String,
+    },
     /// A value handed to another stage of a split program, named by `BoundaryId`.
     Export(BoundaryId),
     /// The value a [`Storage::State`] input is overwritten with at the end of the step (the jax
     /// `donate_argnums` / XLA `input_output_aliases` contract).
-    StateNext { input: ValueId },
+    StateNext {
+        /// The `State` input this value overwrites.
+        input: ValueId,
+    },
 }
 
 /// One entry of a graph's output list: what it publishes, and the value it publishes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphOutput {
+    /// What the entry publishes.
     pub kind: OutputKind,
+    /// The published value.
     pub value: ValueId,
 }
 
 /// One validation witness, borrowed from the output list it is declared in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Witness<'g> {
+    /// The witness's stable key.
     pub id: ValidationId,
+    /// The witness's published name.
     pub name: &'g str,
+    /// The F32 value the witness checks.
     pub value: ValueId,
 }
 
@@ -802,29 +895,53 @@ pub enum EditError {
     /// The edit changed the type of the primary result: a rewrite preserves what the graph computes.
     #[error("the edit changes the result type from {before} to {after}")]
     ResultRetyped {
+        /// The result type of the graph the edit was opened from.
         before: TensorType,
+        /// The result type of the draft.
         after: TensorType,
     },
     /// The edit lost a validation witness: a graph that publishes fewer checks than the one it
     /// replaces would run unverified.
     #[error("the edit drops validation witness {id:?} ({name:?})")]
-    WitnessDropped { id: ValidationId, name: String },
+    WitnessDropped {
+        /// The dropped witness's key.
+        id: ValidationId,
+        /// The dropped witness's name.
+        name: String,
+    },
     /// The edit declares a witness the graph it was opened from does not carry.
     #[error("the edit adds validation witness {id:?} ({name:?})")]
-    WitnessAdded { id: ValidationId, name: String },
+    WitnessAdded {
+        /// The added witness's key.
+        id: ValidationId,
+        /// The added witness's name.
+        name: String,
+    },
     /// The edit names a witness as added that is not a new witness of the draft: absent from it, or
     /// already carried by the graph it was opened from.
     #[error("witness {id:?} is named as added but is not a new witness of the edit")]
-    WitnessNotAdded { id: ValidationId },
+    WitnessNotAdded {
+        /// The witness the edit named as added.
+        id: ValidationId,
+    },
     /// The edit lost an export: a later stage would wait for a value no stage produces.
     #[error("the edit drops export {id:?}")]
-    ExportDropped { id: BoundaryId },
+    ExportDropped {
+        /// The dropped export's boundary id.
+        id: BoundaryId,
+    },
     /// The edit lost a carried-state pair: the buffer would stop being carried across steps.
     #[error("the edit drops the carried-state pair of input {input}")]
-    StateDropped { input: ValueId },
+    StateDropped {
+        /// The `State` input that lost its pair.
+        input: ValueId,
+    },
     /// A piece of a split claims a witness the split graph does not carry.
     #[error("witness {id:?} is not a witness of the split graph")]
-    WitnessNotClaimable { id: ValidationId },
+    WitnessNotClaimable {
+        /// The witness the piece claimed.
+        id: ValidationId,
+    },
 }
 
 /// The interface of the graph an edit was opened from: what a rewrite must preserve.
@@ -883,6 +1000,7 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// The table of every value's [`ValueMeta`], addressed by [`ValueId`].
     pub fn values(&self) -> &ValueTable<ValueMeta> {
         &self.values
     }
@@ -902,6 +1020,7 @@ impl Graph {
         &self.slots
     }
 
+    /// The equations in SSA order: each reads only inputs and the outputs of earlier equations.
     pub fn eqns(&self) -> &[Eqn] {
         &self.eqns
     }
@@ -994,9 +1113,11 @@ impl Graph {
         })
     }
 
+    /// The abstract type of `id`. Panics when `id` is not a value of this graph.
     pub fn aval(&self, id: ValueId) -> &TensorType {
         &self.values[id].aval
     }
+    /// The [`ValueMeta`] of `id`. Panics when `id` is not a value of this graph.
     pub fn meta(&self, id: ValueId) -> &ValueMeta {
         &self.values[id]
     }
@@ -1041,11 +1162,13 @@ impl Graph {
             .chain(self.exports().map(|export| export.value))
     }
 
+    /// The values that must stay alive for the graph to be complete: every observable value and the next value of each carried-state pair.
     pub fn liveness_roots(&self) -> impl Iterator<Item = ValueId> + '_ {
         self.observable_values()
             .chain(self.state().map(|(_, output)| output))
     }
 
+    /// The liveness roots plus every `State` input binder: the values that must survive any rewrite.
     pub fn pinned_values(&self) -> impl Iterator<Item = ValueId> + '_ {
         self.liveness_roots()
             .chain(self.state().map(|(input, _)| input))
@@ -1153,14 +1276,17 @@ impl GraphEdit {
         &mut self.draft.eqns
     }
 
+    /// The draft's input binder list, in declaration order.
     pub fn inputs_mut(&mut self) -> &mut Vec<ValueId> {
         &mut self.draft.inputs
     }
 
+    /// The draft's constant binder list, the subset of the inputs that are weights or tables.
     pub fn consts_mut(&mut self) -> &mut Vec<ValueId> {
         &mut self.draft.consts
     }
 
+    /// The draft's slot binder list, each input with its [`Slot`] kind.
     pub fn slots_mut(&mut self) -> &mut Vec<(ValueId, Slot)> {
         &mut self.draft.slots
     }
@@ -1872,6 +1998,7 @@ impl ValidationPacketLayout {
         })
     }
 
+    /// Check the f32 bit patterns of a returned packet against this layout. Fails on a lane-count mismatch or on the first failing witness lane.
     pub fn validate_f32_bits(&self, bits: &[u32]) -> Result<(), ValidationPacketError> {
         if bits.len() != self.lane_count {
             return Err(ValidationPacketError::Length {

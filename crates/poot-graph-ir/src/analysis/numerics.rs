@@ -136,8 +136,11 @@ pub fn implied_numerics(g: &Graph) -> NumericsProperty {
 /// set [`verify_pass_numerics`] reads the graph for).
 #[derive(Clone, Copy, Debug)]
 pub struct PassDeclaration {
+    /// The pass's name as `compile` reports it.
     pub pass: &'static str,
+    /// The numerics property the pass declares for the ops it produces.
     pub property: NumericsProperty,
+    /// Whether an op is one the pass produces; [`verify_pass_numerics`] checks the declaration against these ops in the output graph.
     pub produces: fn(&OpKind) -> bool,
 }
 
@@ -198,7 +201,9 @@ pub enum NumericalRewriteReason {
 /// A retained primitive candidate and the numerical condition preventing its rewrite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NumericalRewriteDecline {
+    /// The value the declined rewrite would have produced.
     pub value: ValueId,
+    /// The numerical condition that makes the rewrite unsound.
     pub reason: NumericalRewriteReason,
 }
 
@@ -325,13 +330,17 @@ pub const PASS_DECLARATIONS: &[PassDeclaration] = &[
 /// Why a pass's declaration is too weak for the graph it produced.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NumericsError {
+    /// The pass declared a property weaker than its output exhibits.
     #[error(
         "pass {pass:?} declares {declared:?} but produced ops that imply {implied:?}, so the program's \
          tier-2 tolerance would be too tight"
     )]
     UnderDeclared {
+        /// The pass whose declaration is too weak.
         pass: &'static str,
+        /// The property the pass declared.
         declared: NumericsProperty,
+        /// The strongest property the produced ops exhibit.
         implied: NumericsProperty,
     },
 }

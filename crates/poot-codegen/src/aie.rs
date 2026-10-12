@@ -92,26 +92,50 @@ impl std::fmt::Display for AieStage {
 /// The body and the shape ABI do not describe the same kernel, or the ABI cannot be linked.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AieAbiMismatch {
+    /// Body parameter `index` is not a flat buffer slice of a runtime element type.
     #[error("body parameter {index} is not a flat buffer slice of a runtime element type")]
-    Parameter { index: usize },
+    Parameter {
+        /// Position of the offending parameter in the body's signature.
+        index: usize,
+    },
+    /// The body and the shape ABI disagree on how many buffers the kernel takes.
     #[error("the body takes {body} buffers and the shape ABI binds {abi}")]
-    Count { body: usize, abi: usize },
+    Count {
+        /// Buffer parameters the body declares.
+        body: usize,
+        /// Bindings the shape ABI declares.
+        abi: usize,
+    },
+    /// Binding `index` has one element kind in the body and another in the shape ABI.
     #[error("binding {index}: the body's element is {body}, the shape ABI's is {abi}")]
     Element {
+        /// Binding position, shared by the body parameter list and the ABI's bindings.
         index: usize,
+        /// Element kind the body's parameter declares.
         body: ElementKind,
+        /// Element kind the shape ABI's binding declares.
         abi: ElementKind,
     },
+    /// Binding `index` is written by one side and read-only on the other.
     #[error("binding {index}: the body writes it = {body_writes}, the shape ABI says {abi_writes}")]
     Access {
+        /// Binding position, shared by the body parameter list and the ABI's bindings.
         index: usize,
+        /// Whether the body writes the buffer.
         body_writes: bool,
+        /// Whether the shape ABI declares the binding as written.
         abi_writes: bool,
     },
+    /// The body contains a trap; the AIE ABI binds no error word to report it through.
     #[error("the body can trap, and the AIE ABI has no error word")]
     Trap,
+    /// A binding's storage is not dense row-major, the only layout the sequential schedule moves.
     #[error("a binding is not dense row-major storage")]
-    Layout { index: usize },
+    Layout {
+        /// Position of the offending binding.
+        index: usize,
+    },
+    /// The summed tile-local FIFO bytes of the recipe overflow `u64`.
     #[error("the recipe's tile-local byte total overflows")]
     TileLocalOverflow,
 }
@@ -119,41 +143,64 @@ pub enum AieAbiMismatch {
 /// Why an AIE compilation produced no artifact. Every variant leaves nothing published.
 #[derive(Debug, thiserror::Error)]
 pub enum AieCompileError {
+    /// The kernel body could not be emitted for the Peano stage.
     #[error(transparent)]
     Emit(#[from] EmitError),
+    /// The body and shape ABI do not describe one kernel, or the ABI cannot be linked.
     #[error(transparent)]
     Abi(#[from] AieAbiMismatch),
     /// A required tool is not configured (`variable` unset) or not found/runnable at its configured path.
     #[error("the {stage} toolchain is unavailable: ${variable} is unset or names no runnable tool")]
     ToolchainMissing {
+        /// Which stage's tool is missing.
         stage: AieStage,
+        /// Name of the environment variable that should name the tool.
         variable: &'static str,
     },
     /// The tool runs but does not support `target` (no `aie2p` backend, or no such platform).
     #[error("the {stage} toolchain does not support {target:?}")]
     ToolchainUnsupportedTarget {
+        /// Which stage's tool lacks support.
         stage: AieStage,
+        /// The AIE target the tool was asked to build for.
         target: AieTargetId,
     },
+    /// A toolchain stage ran and exited unsuccessfully.
     #[error("{stage} failed (status {status}):\n{stderr}")]
     Tool {
+        /// Which stage failed.
         stage: AieStage,
+        /// The tool's exit status as the process library renders it (an exit code or the terminating signal).
         status: String,
+        /// The tool's captured standard error.
         stderr: String,
     },
+    /// The Peano output is not an ELF object defining the kernel symbol.
     #[error("the core object is not an ELF carrying the symbol `{symbol}`")]
-    CoreObject { symbol: String },
+    CoreObject {
+        /// The symbol the recipe names and the object was expected to define.
+        symbol: String,
+    },
+    /// The IRON driver exited 0 but left one of its two output files unwritten.
     #[error("the IRON driver reported success but wrote no {output}")]
-    LinkOutput { output: &'static str },
+    LinkOutput {
+        /// Which output is missing (the xclbin or the instruction stream).
+        output: &'static str,
+    },
     /// The linked bundle failed the artifact validator.
     #[error(transparent)]
     Artifact(#[from] AieArtifactError),
+    /// The linked bundle exceeds the cache's artifact size limit.
     #[error(transparent)]
     TooLarge(#[from] ArtifactTooLarge),
     /// A cache entry under this identity describes a different kernel than the request (a stale or
     /// colliding entry): it is refused, never loaded.
     #[error("the cached artifact's {what} differs from the request")]
-    StaleEntry { what: &'static str },
+    StaleEntry {
+        /// Which recorded property of the entry differs from the request.
+        what: &'static str,
+    },
+    /// Reading, writing or publishing a file in the cache or scratch directory failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -161,19 +208,24 @@ pub enum AieCompileError {
 /// Whether a FIFO feeds the core from the host or drains it back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FifoDirection {
+    /// Data moves from the host buffer into the core (a read binding).
     HostToTile,
+    /// Data moves from the core back to the host buffer (a written binding).
     TileToHost,
 }
 
 /// One object FIFO of a link recipe: the host binding it moves, its direction, depth and element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AieFifo {
+    /// Index of the host binding in the shape ABI this FIFO moves.
     pub binding: usize,
+    /// Whether the FIFO feeds the core or drains it.
     pub direction: FifoDirection,
     /// Buffers the FIFO holds in flight.
     pub depth: u32,
     /// Elements per FIFO buffer (a whole binding, in the sequential schedule).
     pub elements: u64,
+    /// Element kind of the buffers the FIFO carries.
     pub element: ElementKind,
 }
 
@@ -241,18 +293,22 @@ impl AieLinkRecipe {
         self.target
     }
 
+    /// The kernel symbol the one core runs.
     pub fn symbol(&self) -> &str {
         &self.symbol
     }
 
+    /// The FIFOs of the schedule, one per host binding, in binding order.
     pub fn fifos(&self) -> &[AieFifo] {
         &self.fifos
     }
 
+    /// The shape ABI the recipe was built for.
     pub fn abi(&self) -> &AieShapeAbi {
         &self.abi
     }
 
+    /// How many times the core runs its loop (one, in the sequential schedule).
     pub fn invocations(&self) -> u64 {
         self.invocations
     }
@@ -349,15 +405,20 @@ pub(crate) fn check_body_abi(body: &Body, abi: &AieShapeAbi) -> Result<(), AieAb
 /// path and version line alone cannot see a binary replaced under the same name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AieToolIdentity {
+    /// Filesystem path the tool was resolved to.
     pub path: String,
+    /// First line of the tool's `--version` output.
     pub version: String,
+    /// FNV-1a hash of the tool binary's bytes.
     pub content: u64,
 }
 
 /// The two tools an AIE compilation needs, resolved and checked against the target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AieTools {
+    /// The Peano `llc` that builds the core object.
     pub peano: AieToolIdentity,
+    /// The IRON link driver that produces the xclbin and instruction stream.
     pub iron: AieToolIdentity,
 }
 
@@ -530,10 +591,12 @@ impl AieIdentity {
         Self { core, link }
     }
 
+    /// FNV-1a digest of the core object's canonical identity text.
     pub fn core_digest(&self) -> u64 {
         poot_runtime_common::fnv1a_bytes(self.core.as_bytes())
     }
 
+    /// FNV-1a digest of the link's canonical identity text.
     pub fn link_digest(&self) -> u64 {
         poot_runtime_common::fnv1a_bytes(self.link.as_bytes())
     }
@@ -676,8 +739,11 @@ impl Drop for Scratch {
 /// A linked AIE artifact and whether this call built it.
 #[derive(Debug)]
 pub struct AieCompiled {
+    /// The validated xclbin and instruction stream.
     pub artifact: AieLinkedArtifact,
+    /// Whether this call ran the toolchain (`true`) or served the artifact from the cache (`false`).
     pub built: bool,
+    /// The canonical core and link identities that name the cache entry.
     pub identity: AieIdentity,
 }
 

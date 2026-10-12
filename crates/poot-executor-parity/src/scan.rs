@@ -219,7 +219,9 @@ pub fn timed_step(
 /// backend reports it, the device time of its dispatches.
 #[derive(Clone, Copy, Debug)]
 pub struct StepTime {
+    /// Host wall milliseconds of the step, inputs staged and output read back.
     pub wall_ms: f64,
+    /// Device milliseconds of the step's dispatches, or `None` when the backend reports no device time.
     pub device_ms: Option<f64>,
 }
 

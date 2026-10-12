@@ -36,9 +36,13 @@ pub fn gumbel(b: &Builder, u: Traced) -> Result<Traced, BuilderError> {
 /// (`"sampler.seed"`, `"sampler.params"`, `"sampler.top_k"`); card 551b's driver wires that through
 /// 550's binder instead of exposing these fields.
 pub struct SampleHead {
+    /// The `[.., 2]` I32 `(token, non_finite)` result of the suffix.
     pub out: Traced,
+    /// The `sampler.seed` input; `None` for greedy sampling.
     pub seed: Option<Traced>,
+    /// The `sampler.params` input; `None` for greedy sampling.
     pub params: Option<Traced>,
+    /// The `sampler.top_k` input; only the two top-k rules declare it.
     pub top_k: Option<Traced>,
 }
 

@@ -39,7 +39,10 @@ pub enum RocmError {
     /// [`RocmContext::load_hsaco`] was given a [`poot_runtime_common::CompiledKernel`] compiled for a
     /// different backend (card 608): this runtime only ever loads an `AmdGcn`-compiled kernel.
     #[error("ROCm load_hsaco requires an AmdGcn-compiled kernel, got one compiled for {actual:?}")]
-    WrongKernelTarget { actual: poot_target::TargetId },
+    WrongKernelTarget {
+        /// The target the kernel was actually compiled for.
+        actual: poot_target::TargetId,
+    },
     /// The buffers a ROCm dispatch packed into its kernarg segment did not meet the compiled kernel's
     /// argument schema (card 608, SC-002): a typed release-build error before
     /// any submission, checked against the schema `load_hsaco`/`lookup_kernel` carried from the
@@ -55,15 +58,23 @@ pub enum RocmError {
     /// An earlier bounded wait timed out, so its packet may still be in flight and its resources were
     /// leaked instead of freed. The context refuses every later submission before touching the queue.
     #[error("{op} refused: an earlier GPU wait timed out, so this ROCm context is poisoned")]
-    ContextPoisoned { op: &'static str },
+    ContextPoisoned {
+        /// The runtime entry point that refused.
+        op: &'static str,
+    },
     /// A dispatch whose grid or workgroup size no well-formed AQL packet can carry, refused before any
     /// ring slot was reserved.
     #[error("{op} refused dispatch {dispatch} (grid {grid:?}, workgroup {block:?}): {violation}")]
     InvalidDispatchGeometry {
+        /// The runtime entry point that refused.
         op: &'static str,
+        /// Index of the offending dispatch within the submitted list.
         dispatch: usize,
+        /// Requested grid size in work-items per dimension.
         grid: (u32, u32, u32),
+        /// Requested workgroup size per dimension.
         block: (u32, u32, u32),
+        /// Which packet-format rule the geometry broke.
         violation: DispatchGeometryViolation,
     },
     /// The queue returned by HSA does not satisfy the requested type/features/size contract.
@@ -75,8 +86,11 @@ pub enum RocmError {
         "queue role {role:?} conflicts with HSA_ALLOCATE_QUEUE_DEV_MEM provenance (at first HSA load: {override_at_load}, now: {override_now})"
     )]
     QueueRingProvenanceConflict {
+        /// The queue role the context was opened for.
         role: QueueRole,
+        /// Whether `HSA_ALLOCATE_QUEUE_DEV_MEM=1` was set when this crate first loaded HSA.
         override_at_load: bool,
+        /// Whether it is set now.
         override_now: bool,
     },
     /// Restricted replay unexpectedly produced a number of physical submissions other than one.
@@ -84,12 +98,20 @@ pub enum RocmError {
     RestrictedReplaySubmissions(usize),
     /// A logical element count cannot be represented by the native u32 kernel-length ABI.
     #[error("{op} element count {elements} exceeds the native u32 kernel-length ABI")]
-    ElementCountTooLarge { op: &'static str, elements: usize },
+    ElementCountTooLarge {
+        /// The runtime entry point that refused.
+        op: &'static str,
+        /// The element count that does not fit in `u32`.
+        elements: usize,
+    },
     /// Element-to-byte conversion overflowed before allocation or transfer.
     #[error("{op} byte size overflow: {elements} elements * {element_bytes} bytes")]
     ByteSizeOverflow {
+        /// The runtime entry point that refused.
         op: &'static str,
+        /// Element count of the request.
         elements: usize,
+        /// Bytes per element.
         element_bytes: usize,
     },
     /// A typed transfer was requested against a differently represented allocation (card 527: checked
@@ -97,15 +119,21 @@ pub enum RocmError {
     /// element kind).
     #[error("{op} requires {expected} storage, but the buffer stores {actual}")]
     RepresentationMismatch {
+        /// The runtime entry point that refused.
         op: &'static str,
+        /// The storage the operation requires.
         expected: BufferStorage,
+        /// The storage the buffer holds.
         actual: BufferStorage,
     },
     /// A whole-buffer transfer had the wrong logical element count.
     #[error("{op} size mismatch: buffer has {have} elements, got {got}")]
     SizeMismatch {
+        /// The runtime entry point that refused.
         op: &'static str,
+        /// Elements the buffer holds.
         have: usize,
+        /// Elements the caller supplied.
         got: usize,
     },
     /// A checked byte range exceeded the immutable allocation capacity.
@@ -113,23 +141,33 @@ pub enum RocmError {
         "{op} range [{byte_offset}, {byte_end}) exceeds the buffer's {byte_capacity}-byte capacity"
     )]
     RangeOutOfBounds {
+        /// The runtime entry point that refused.
         op: &'static str,
+        /// Inclusive start of the requested range, in bytes.
         byte_offset: usize,
+        /// Exclusive end of the requested range, in bytes.
         byte_end: usize,
+        /// The allocation's capacity, in bytes.
         byte_capacity: usize,
     },
     /// Offset or length arithmetic overflowed before pointer arithmetic.
     #[error("{op} byte range overflow at element offset {element_offset} with {elements} elements")]
     RangeOverflow {
+        /// The runtime entry point that refused.
         op: &'static str,
+        /// Requested start, in elements.
         element_offset: usize,
+        /// Requested length, in elements.
         elements: usize,
     },
     /// A native narrow payload ended in a partial element.
     #[error("{op} got {bytes} bytes, which is not a whole number of {element_bytes}-byte elements")]
     InvalidByteLength {
+        /// The runtime entry point that refused.
         op: &'static str,
+        /// Length of the payload, in bytes.
         bytes: usize,
+        /// Bytes per element of the buffer.
         element_bytes: usize,
     },
     /// A dispatch received a kernarg allocation whose capacity does not match the kernel ABI.
@@ -137,8 +175,11 @@ pub enum RocmError {
         "{op} kernarg size mismatch: kernel requires {expected} bytes, buffer has {actual} bytes"
     )]
     KernargSizeMismatch {
+        /// The runtime entry point that refused.
         op: &'static str,
+        /// Kernarg segment size the kernel ABI requires, in bytes.
         expected: usize,
+        /// Capacity of the supplied kernarg allocation, in bytes.
         actual: usize,
     },
     /// The queue's packet-ring memory and host-link facts could not be validated into a safe
@@ -155,7 +196,12 @@ pub enum RocmError {
     #[error(
         "CPU-to-GPU memory-pool link is not PCIe (num_hops={num_hops}, link_types={link_types:?})"
     )]
-    HostLinkNotPcie { num_hops: u32, link_types: Vec<u32> },
+    HostLinkNotPcie {
+        /// Number of hops on the CPU-to-GPU pool path.
+        num_hops: u32,
+        /// HSA link-info type of each hop; none was PCIe.
+        link_types: Vec<u32>,
+    },
     /// Card 333 PCIe receipt path: ROCr rejected device-memory queue creation (often Large BAR).
     #[error("device-memory AQL ring queue creation failed: {0}")]
     DeviceRingQueueCreate(HsaStatus),
@@ -164,6 +210,7 @@ pub enum RocmError {
 /// Human-readable HSA status. `Display` prints the textual name (static table) and the raw hex code.
 #[derive(Debug, Clone, Copy)]
 pub struct HsaStatus {
+    /// The raw `hsa_status_t` returned by the failing HSA call.
     pub code: hsa_status_t,
 }
 

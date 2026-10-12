@@ -54,14 +54,18 @@ impl DType {
 /// storage class ([`DType::storage_class`]); the tensor's dtype says how to read it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostData {
+    /// 32-bit float elements.
     F32(Arc<[f32]>),
+    /// 32-bit signed integer elements.
     I32(Arc<[i32]>),
     /// Half-width float bit patterns (`F16` or `BF16`).
     Half(Arc<[u16]>),
+    /// Raw bytes: the packed or narrow dtypes (bool, 8-bit, FP8, 64-bit and so on).
     Bytes(Arc<[u8]>),
 }
 
 impl HostData {
+    /// The storage class this payload variant is.
     pub fn class(&self) -> StorageClass {
         match self {
             HostData::F32(_) => StorageClass::F32,
@@ -95,26 +99,49 @@ impl HostData {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CarrierError {
     #[error("{dtype} is stored as {expected:?}, got a {got:?} payload")]
+    /// The payload variant is not the storage class the dtype requires.
     StorageClass {
+        /// The tensor's dtype.
         dtype: DType,
+        /// The class the dtype is stored as.
         expected: StorageClass,
+        /// The class of the payload supplied.
         got: StorageClass,
     },
     #[error(
         "{dtype} tensor of shape {shape:?} needs {expected_bytes} payload bytes, got {actual_bytes}"
     )]
+    /// The payload's byte length does not match `shape` and `dtype`.
     PayloadLength {
+        /// The tensor's dtype.
         dtype: DType,
+        /// The tensor's shape.
         shape: Vec<usize>,
+        /// Bytes the shape and dtype require.
         expected_bytes: usize,
+        /// Bytes the payload holds.
         actual_bytes: usize,
     },
     #[error("shape {shape:?} overflows the element count")]
-    ShapeOverflow { shape: Vec<usize> },
+    /// The product of the shape's dimensions overflows `usize`.
+    ShapeOverflow {
+        /// The offending shape.
+        shape: Vec<usize>,
+    },
     #[error("{dtype} has no f32 widening")]
-    NotWidenable { dtype: DType },
+    /// The dtype has no exact f32 widening.
+    NotWidenable {
+        /// The dtype that cannot be widened.
+        dtype: DType,
+    },
     #[error("i32 word {value} at element {index} is outside f32's exact integer range")]
-    I32NotExact { index: usize, value: i32 },
+    /// An i32 word is outside the range f32 represents exactly.
+    I32NotExact {
+        /// Element index of the word.
+        index: usize,
+        /// The word's value.
+        value: i32,
+    },
 }
 
 /// The largest magnitude below which every integer is exactly an f32 (2^24).
@@ -255,18 +282,22 @@ impl HostTensor {
         Self::new(dtype, shape, data).unwrap_or_else(|error| panic!("HostTensor: {error}"))
     }
 
+    /// The tensor's element type.
     pub fn dtype(&self) -> DType {
         self.dtype
     }
 
+    /// The tensor's shape.
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
 
+    /// The element count (the product of the shape).
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
     }
 
+    /// The payload, by storage class.
     pub fn data(&self) -> &HostData {
         &self.data
     }

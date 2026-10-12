@@ -263,10 +263,15 @@ pub(crate) const NO_CONTRACT_MARKER: &str = "__poot_no_contract";
 /// fails at `body.verify()` earlier).
 #[derive(Debug, thiserror::Error)]
 pub enum NoContractionError {
+    /// The module has no `OpDecorate`/`OpMemberDecorate` to place the new decoration after.
     #[error("no existing OpDecorate/OpMemberDecorate to anchor the new decoration after")]
     NoAnchor,
+    /// A marker call has the wrong number of operands.
     #[error("a no-contraction marker call has {operands} operand(s), expected one")]
-    MalformedMarkerCall { operands: usize },
+    MalformedMarkerCall {
+        /// Operands the call carries; the marker stub takes exactly one.
+        operands: usize,
+    },
 }
 
 /// Decorate every marked float binop `NoContraction` (card 628) and remove the markers.

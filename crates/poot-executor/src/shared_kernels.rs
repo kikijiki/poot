@@ -28,10 +28,18 @@ pub struct SharedKernels {
 pub enum SharedKernelsMismatch {
     /// The table is bound to another target than the engine's.
     #[error("shared kernels are bound to {table:?}; this engine drives {engine:?}")]
-    Target { table: TargetId, engine: TargetId },
+    Target {
+        /// The target the table was created for.
+        table: TargetId,
+        /// The target of the engine that was refused.
+        engine: TargetId,
+    },
     /// The table holds byte artifacts, and an AIE engine's kernels are linked artifacts.
     #[error("shared kernels hold byte artifacts; the AIE engine for {engine:?} links its kernels")]
-    LinkedArtifacts { engine: TargetId },
+    LinkedArtifacts {
+        /// The AIE target of the engine that was refused.
+        engine: TargetId,
+    },
 }
 
 impl SharedKernels {
@@ -43,6 +51,7 @@ impl SharedKernels {
         }
     }
 
+    /// The target this table's artifacts were compiled for.
     pub fn target(&self) -> TargetId {
         self.target
     }

@@ -34,6 +34,7 @@ use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
 
+/// The idefics3 vision tower's [`FamilyKey`]: a family of its own beside the text tower's.
 pub const FAMILY: FamilyKey = FamilyKey::new("idefics3_vision");
 
 /// The name of the `Slot::Activation` input holding the frames, `[rows, channels, size, size]` F32:
@@ -153,6 +154,9 @@ pub struct Idefics3Params {
 }
 
 impl Idefics3Params {
+    /// Reads the typed config from the checkpoint's `vision_config` (plus the caller-added
+    /// `scale_factor` and `text_hidden_size`); a missing or inconsistent field is a typed
+    /// [`ModelError::Config`].
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let RawConfig::HfJson { config, .. } = raw else {
             return Err(ModelError::Config {
@@ -228,6 +232,8 @@ struct Layer {
     ffn: PlainMlpWeights,
 }
 
+/// The built idefics3 vision tower: config, name-resolved weights, the SigLIP encoder layers and
+/// the connector. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct Idefics3Vision {
     params: Idefics3Params,

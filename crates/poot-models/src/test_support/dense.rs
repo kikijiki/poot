@@ -45,15 +45,23 @@ pub type Values = dyn Fn(&str, &[usize]) -> Vec<f32>;
 /// One dense checkpoint's dimensions and config.
 #[derive(Clone, Debug)]
 pub struct Dense {
+    /// Which dense family's config and tensor names the checkpoint takes.
     pub family: Family,
+    /// Vocabulary size (embedding rows).
     pub vocab: usize,
+    /// Hidden width.
     pub hidden: usize,
+    /// Feed-forward width.
     pub inter: usize,
+    /// Layer count.
     pub layers: usize,
+    /// Query head count.
     pub heads: usize,
+    /// Key/value head count.
     pub kv_heads: usize,
     /// The explicit head dimension; `None` is `hidden / heads`.
     pub head_dim: Option<usize>,
+    /// The config's context length in positions.
     pub max_positions: usize,
     config: serde_json::Map<String, serde_json::Value>,
 }
@@ -134,26 +142,31 @@ impl Dense {
         self
     }
 
+    /// The vocabulary size.
     pub fn vocab(mut self, vocab: usize) -> Self {
         self.vocab = vocab;
         self
     }
 
+    /// The hidden width, feed-forward width and layer count.
     pub fn dims(mut self, hidden: usize, inter: usize, layers: usize) -> Self {
         (self.hidden, self.inter, self.layers) = (hidden, inter, layers);
         self
     }
 
+    /// The query and key/value head counts.
     pub fn heads(mut self, heads: usize, kv_heads: usize) -> Self {
         (self.heads, self.kv_heads) = (heads, kv_heads);
         self
     }
 
+    /// An explicit head dimension in place of `hidden / heads`.
     pub fn head_dim(mut self, head_dim: usize) -> Self {
         self.head_dim = Some(head_dim);
         self
     }
 
+    /// The config's context length in positions.
     pub fn max_positions(mut self, max_positions: usize) -> Self {
         self.max_positions = max_positions;
         self

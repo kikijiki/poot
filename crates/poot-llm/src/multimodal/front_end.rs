@@ -43,53 +43,94 @@ const MAX_FRAMES: usize = 512;
 /// Why a multimodal request or checkpoint is refused.
 #[derive(Debug, thiserror::Error)]
 pub enum FrontEndError {
+    /// The bytes are not a decodable PNG or JPEG.
     #[error("decode image: {0}")]
     Image(#[from] image::ImageError),
+    /// The header's dimensions exceed the pixel cap; refused before any pixel is decoded.
     #[error("image {width}x{height} ({pixels} pixels) exceeds the {MAX_IMAGE_PIXELS}-pixel cap")]
     ImageTooLarge {
+        /// Header width in pixels.
         width: u32,
+        /// Header height in pixels.
         height: u32,
+        /// `width * height`, the count compared against the cap.
         pixels: u64,
     },
+    /// A caption request carried no image.
     #[error("a caption needs at least one image")]
     NoImage,
+    /// The decoded pixels do not form a valid image buffer for the preprocessor.
     #[error(transparent)]
     ImageBuffer(#[from] poot_models::vision::ImageBufferError),
+    /// The turns declare a different number of images than the request carries.
     #[error("the turns carry {turns} images but {images} were given")]
-    TurnImages { turns: usize, images: usize },
+    TurnImages {
+        /// The image count the turns declare.
+        turns: usize,
+        /// The image count the request carries.
+        images: usize,
+    },
+    /// The rendered conversation holds a different number of `<image>` marks than there are images (a turn's text spelled `<image>`).
     #[error(
         "the rendered conversation holds {marks} <image> marks for {images} images: a turn's text must not spell <image>"
     )]
-    ImageMarks { marks: usize, images: usize },
+    ImageMarks {
+        /// `<image>` marks in the rendered conversation.
+        marks: usize,
+        /// Images the request carries.
+        images: usize,
+    },
+    /// The request's image count tiles to more frames than the per-request cap.
     #[error(
         "too many image frames ({frames}+); at most {MAX_FRAMES} (idefics3 tiles each image into 17 to 34 frames)"
     )]
-    TooManyFrames { frames: usize },
+    TooManyFrames {
+        /// The frame count reached when the cap was crossed (a lower bound).
+        frames: usize,
+    },
+    /// The prompt's `<image>` placeholder tokens do not match the rows the encoded frames produce.
     #[error("the prompt holds {placeholders} <image> tokens but the frames give {rows} rows")]
-    Placeholders { placeholders: usize, rows: usize },
+    Placeholders {
+        /// `<image>` placeholder tokens in the prompt.
+        placeholders: usize,
+        /// Embedding rows the encoded frames produced.
+        rows: usize,
+    },
+    /// A checkpoint file could not be read.
     #[error("{path}: {source}")]
     Io {
+        /// The file that failed.
         path: PathBuf,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
+    /// A checkpoint JSON file could not be parsed.
     #[error("{path}: {source}")]
     Json {
+        /// The file that failed.
         path: PathBuf,
+        /// The underlying parse error.
         #[source]
         source: serde_json::Error,
     },
     /// A field of the checkpoint's config the front end reads is missing or malformed.
     #[error("{path}: {field} is missing or not {expected}")]
     Config {
+        /// The config file the field was read from.
         path: PathBuf,
+        /// The missing or malformed field's name.
         field: &'static str,
+        /// The JSON type or shape that was expected.
         expected: &'static str,
     },
+    /// The weights could not be loaded.
     #[error(transparent)]
     Load(#[from] LoadError),
+    /// A driver step (tower encode, prefill, decode) failed.
     #[error(transparent)]
     Driver(#[from] DriverError),
+    /// Tokenizing or rendering text failed.
     #[error(transparent)]
     Text(#[from] TextError),
 }
@@ -97,8 +138,11 @@ pub enum FrontEndError {
 /// An image as interleaved RGB in `[0, 255]`, `height * width * 3` values.
 #[derive(Clone, Copy, Debug)]
 pub struct Image<'a> {
+    /// Interleaved RGB values in `[0, 255]`, `height * width * 3` of them.
     pub rgb: &'a [f32],
+    /// Rows of pixels.
     pub height: usize,
+    /// Pixels per row.
     pub width: usize,
 }
 
@@ -122,12 +166,16 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage, FrontEndError> {
 /// A decoded image that owns its pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedImage {
+    /// Interleaved RGB values in `[0, 255]`, `height * width * 3` of them.
     pub rgb: Vec<f32>,
+    /// Rows of pixels.
     pub height: usize,
+    /// Pixels per row.
     pub width: usize,
 }
 
 impl DecodedImage {
+    /// Borrow the pixels as an [`Image`].
     pub fn as_image(&self) -> Image<'_> {
         Image {
             rgb: &self.rgb,
@@ -382,8 +430,11 @@ fn section(store: &WeightStore, prefix: &str, to: &str, keep: &[&str]) -> Weight
 /// The images of a conversation to caption, and the turns that carry them.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptionRequest<'a> {
+    /// The images, in the order of the turns that carry them.
     pub images: &'a [Image<'a>],
+    /// The conversation's turns; the turns' image counts sum to `images.len()`.
     pub turns: &'a [ChatTurn<'a>],
+    /// The cap on generated tokens.
     pub max_new: usize,
 }
 
@@ -589,7 +640,9 @@ impl Idefics3FrontEnd {
 
 /// A loaded SmolVLM: the image side and the text tower, each on its own driver.
 pub struct Idefics3 {
+    /// The vision side: preprocessing and the vision tower's driver.
     pub images: Idefics3FrontEnd,
+    /// The text tower's driver, which generates with the image rows as step inputs.
     pub text: Driver,
 }
 

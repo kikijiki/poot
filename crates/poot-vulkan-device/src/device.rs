@@ -58,6 +58,9 @@ impl OpenStep {
     }
 }
 
+/// The raw-Vulkan [`Device`]: owns one [`Context`], records each step as a [`VulkanGraph`] of command
+/// buffers and replays it with fence waits. Single-threaded like the contract; see the module docs for
+/// how a recording is cut into submissions.
 pub struct VulkanDevice {
     ctx: Context,
     timing: GraphTiming,

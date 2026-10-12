@@ -33,6 +33,7 @@ use crate::model::{
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
 
+/// Nemotron-H's [`FamilyKey`].
 pub const FAMILY: FamilyKey = FamilyKey::new("nemotron_h");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
@@ -95,6 +96,9 @@ pub struct NemotronHConfig {
 }
 
 impl NemotronHConfig {
+    /// Reads the typed config from an HF `config.json`, expanding `hybrid_override_pattern` into one
+    /// layer kind per layer; an unknown pattern character or a length that is not the layer count is a
+    /// typed [`ModelError::Config`].
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let count = |key: &'static str| fields.count(Field::hf(key), None);
@@ -289,6 +293,8 @@ struct Layer {
     mixer: Mixer,
 }
 
+/// The built Nemotron-H model: config, name-resolved weights, the stack-level tensors and one
+/// Mamba2 / attention / MLP layer each. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct NemotronH {
     params: NemotronHConfig,

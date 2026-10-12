@@ -61,8 +61,11 @@ pub enum LegalizeError {
          (DeviceCaps::max_buffer_bytes), and legalize has no rewrite for its use"
     )]
     OversizedConstant {
+        /// Name of the oversized constant.
         name: String,
+        /// The constant's size, in bytes.
         bytes: u64,
+        /// The target's single-buffer limit, in bytes.
         limit: u64,
     },
     /// Splitting an oversized weight would grow the graph past the caller's [`CompileLimits`].

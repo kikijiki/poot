@@ -26,26 +26,68 @@ pub const DEVICE_WITNESS_MAGNITUDE_BOUND: u64 = 1 << 24;
 /// Why a validation value is not a canonical device witness.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum DeviceWitnessRejection {
+    /// The value is a graph input, which no device kernel computes.
     #[error("{value} is a graph input, not a device computation")]
-    GraphInput { value: ValueId },
+    GraphInput {
+        /// The witness value that was rejected.
+        value: ValueId,
+    },
+    /// The value's dtype cannot hold an exact count.
     #[error("{value} has dtype {dtype}, which cannot hold an exact count")]
-    Dtype { value: ValueId, dtype: DType },
+    Dtype {
+        /// The witness value that was rejected.
+        value: ValueId,
+        /// The offending dtype.
+        dtype: DType,
+    },
+    /// The value's producing op has no exact witness-head role.
     #[error("{value} is produced by {op}, which has no exact witness-head role")]
-    UnsupportedOp { value: ValueId, op: String },
+    UnsupportedOp {
+        /// The witness value that was rejected.
+        value: ValueId,
+        /// Display name of the producing op.
+        op: String,
+    },
+    /// A cast between dtypes other than F32 and I32.
     #[error("{value} casts {from} to {to}; only F32 and I32 counts are exact")]
     CastDtype {
+        /// The witness value that was rejected.
         value: ValueId,
+        /// The operand dtype of the cast.
         from: DType,
+        /// The result dtype of the cast.
         to: DType,
     },
+    /// The value uses a literal that is not an integer of magnitude at most 2^24.
     #[error("{value} uses literal {literal:?}, which is not an integer of magnitude at most 2^24")]
-    Literal { value: ValueId, literal: Scalar },
+    Literal {
+        /// The witness value that was rejected.
+        value: ValueId,
+        /// The offending literal.
+        literal: Scalar,
+    },
+    /// The value's proven magnitude exceeds [`DEVICE_WITNESS_MAGNITUDE_BOUND`].
     #[error("{value} can reach magnitude {bound}, above the exact bound 2^24")]
-    Bound { value: ValueId, bound: u64 },
+    Bound {
+        /// The witness value that was rejected.
+        value: ValueId,
+        /// The proven upper bound on the value's lane magnitude.
+        bound: u64,
+    },
+    /// Computing the value's magnitude bound overflowed `u64`.
     #[error("the magnitude bound of {value} overflowed u64")]
-    BoundOverflow { value: ValueId },
+    BoundOverflow {
+        /// The witness value that was rejected.
+        value: ValueId,
+    },
+    /// The value reduces an axis its operand does not have.
     #[error("{value} reduces axis {axis}, which its operand does not have")]
-    ReduceAxis { value: ValueId, axis: usize },
+    ReduceAxis {
+        /// The witness value that was rejected.
+        value: ValueId,
+        /// The out-of-range axis.
+        axis: usize,
+    },
 }
 
 /// The role one operation plays in a witness head.
@@ -339,47 +381,107 @@ pub(crate) fn validation_packet_plan(graph: &Graph) -> ValidationPacketPlan {
 /// than the device's [`DeviceCaps`] state, or need something the caps cannot confirm.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum ResourceRefusal {
+    /// The body's workgroup memory cannot be measured, so no limit can be proven.
     #[error(transparent)]
     UnmeasurableLds(#[from] UnmeasurableLds),
+    /// The body uses a matrix fragment without declaring a subgroup requirement.
     #[error("the body uses the {fragment:?} matrix fragment but declares no subgroup requirement")]
-    FragmentWithoutSubgroup { fragment: FragmentUse },
+    FragmentWithoutSubgroup {
+        /// The fragment the body uses.
+        fragment: FragmentUse,
+    },
+    /// The device's matrix hardware does not run the fragment the body uses.
     #[error("the device's {tensor_core:?} matrix hardware does not run the {fragment:?} fragment")]
     FragmentUnsupported {
+        /// The fragment the body uses.
         fragment: FragmentUse,
+        /// What the device reports about its matrix hardware.
         tensor_core: TensorCoreSupport,
     },
+    /// The device does not expose its matrix hardware through its API, so the fragment is unproven.
     #[error(
         "the device's matrix hardware is not exposed by its API, so the {fragment:?} fragment is unproven"
     )]
-    FragmentCapabilityUnknown { fragment: FragmentUse },
+    FragmentCapabilityUnknown {
+        /// The fragment the body uses.
+        fragment: FragmentUse,
+    },
+    /// The kernel needs subgroups but the device has no subgroup support.
     #[error("the kernel needs {lanes}-lane subgroups and the device has no subgroup support")]
-    SubgroupAbsent { lanes: u32 },
+    SubgroupAbsent {
+        /// The subgroup width the kernel needs, in lanes.
+        lanes: u32,
+    },
+    /// The kernel needs subgroups and the device's subgroup support is not exposed by its API.
     #[error(
         "the kernel needs {lanes}-lane subgroups and the device's subgroup support is not exposed by its API"
     )]
-    SubgroupUnknown { lanes: u32 },
+    SubgroupUnknown {
+        /// The subgroup width the kernel needs, in lanes.
+        lanes: u32,
+    },
+    /// The kernel's subgroup width is outside the range the device runs.
     #[error("the kernel needs {lanes}-lane subgroups; the device runs {min_size} to {max_size}")]
     SubgroupSize {
+        /// The subgroup width the kernel needs, in lanes.
         lanes: u32,
+        /// The smallest subgroup width the device runs, in lanes.
         min_size: u32,
+        /// The largest subgroup width the device runs, in lanes.
         max_size: u32,
     },
+    /// The workgroup is not a whole number of subgroups.
     #[error(
         "the {invocations}-invocation workgroup is not a whole number of {lanes}-lane subgroups"
     )]
-    WorkgroupNotSubgroupMultiple { invocations: u64, lanes: u32 },
+    WorkgroupNotSubgroupMultiple {
+        /// The workgroup's total invocation count.
+        invocations: u64,
+        /// The subgroup width, in lanes.
+        lanes: u32,
+    },
+    /// A workgroup axis has extent zero.
     #[error("workgroup axis {axis} has extent zero")]
-    WorkgroupExtentZero { axis: usize },
+    WorkgroupExtentZero {
+        /// The zero-extent axis.
+        axis: usize,
+    },
+    /// A workgroup axis exceeds the device's per-axis limit.
     #[error("workgroup axis {axis} extent {size} exceeds the device limit {limit}")]
-    WorkgroupDimension { axis: usize, size: u32, limit: u32 },
+    WorkgroupDimension {
+        /// The offending axis.
+        axis: usize,
+        /// The kernel's extent on that axis.
+        size: u32,
+        /// The device's limit for that axis.
+        limit: u32,
+    },
+    /// The workgroup's total invocations exceed the device limit.
     #[error("the {invocations}-invocation workgroup exceeds the device limit {limit}")]
-    WorkgroupInvocations { invocations: u64, limit: u32 },
+    WorkgroupInvocations {
+        /// The workgroup's total invocation count.
+        invocations: u64,
+        /// The device's limit on invocations per workgroup.
+        limit: u32,
+    },
+    /// The body's static workgroup memory exceeds what the device offers.
     #[error(
         "the body declares {needed} bytes of static workgroup memory; the device offers {available}"
     )]
-    StaticLds { needed: u64, available: u32 },
+    StaticLds {
+        /// Bytes of static workgroup memory the body declares.
+        needed: u64,
+        /// Bytes of workgroup memory the device offers.
+        available: u32,
+    },
+    /// One dispatch carries more serial steps than the device's calibrated bound.
     #[error("one dispatch carries {work} serial steps; the device bounds a dispatch at {budget}")]
-    DispatchWork { work: u64, budget: u64 },
+    DispatchWork {
+        /// Serial steps one dispatch carries.
+        work: u64,
+        /// The device's bound on serial steps per dispatch.
+        budget: u64,
+    },
 }
 
 /// Check one kernel against `caps` before any loader sees it. `body` states the resources the kernel

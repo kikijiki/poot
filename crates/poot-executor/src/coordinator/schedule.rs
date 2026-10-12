@@ -34,16 +34,35 @@ impl Schedule {
     }
 }
 
+/// Why a program's communication rows were refused admission. The whole plan is refused: no row of
+/// it is scheduled.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ScheduleError {
+    /// Two rows of the plan carry the same id.
     #[error("communication row id {0:?} is declared more than once")]
     DuplicateRowId(PlanNodeId),
+    /// The rows' dependency edges contain a cycle, so no order puts every row after its inputs.
     #[error("communication-row dependency subgraph contains a cycle among rows {rows:?}")]
-    Cycle { rows: Vec<PlanNodeId> },
+    Cycle {
+        /// The rows that are part of the cycle.
+        rows: Vec<PlanNodeId>,
+    },
+    /// A row does not name exactly two participants (one sender, one receiver).
     #[error("communication row {row:?} has {actual} participants; a transfer has exactly 2")]
-    ParticipantCount { row: PlanNodeId, actual: usize },
+    ParticipantCount {
+        /// The offending row.
+        row: PlanNodeId,
+        /// How many participants it names.
+        actual: usize,
+    },
+    /// A row names the same device as both sender and receiver.
     #[error("communication row {row:?} names participant {device:?} more than once")]
-    DuplicateParticipant { row: PlanNodeId, device: DeviceId },
+    DuplicateParticipant {
+        /// The offending row.
+        row: PlanNodeId,
+        /// The device named more than once.
+        device: DeviceId,
+    },
 }
 
 /// Admit every row of `plan`, or refuse the whole plan.

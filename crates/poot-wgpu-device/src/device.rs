@@ -48,6 +48,9 @@ pub struct WgpuRecording {
     items: Vec<Recorded>,
 }
 
+/// The wgpu [`Device`]: owns one [`Context`], buffers each step as a re-encode list of cached dispatches
+/// and submits it on `replay`. Single-threaded like the contract; see the module docs for the recording
+/// model.
 pub struct WgpuDevice {
     ctx: Context,
     /// The open step's recording so far; `Some` between `begin` and `finish`.
@@ -55,6 +58,8 @@ pub struct WgpuDevice {
 }
 
 impl WgpuDevice {
+    /// A device in counters-only mode: replays request no timestamps and [`Device::device_time`] is
+    /// `Unknown`. Fails with the runtime's adapter or device-init error when no adapter can be opened.
     pub fn new() -> Result<Self, RuntimeError> {
         Ok(Self {
             ctx: Context::new()?,

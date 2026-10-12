@@ -76,6 +76,7 @@ impl PackedSourceName {
         }
     }
 
+    /// The source name of `linear_id`'s component `role`: the linear id followed by that role's [`PackedSourceName::suffix`].
     pub fn new(linear_id: &str, role: SourceRole) -> Self {
         Self {
             text: format!("{linear_id}{}", Self::suffix(role)),
@@ -84,10 +85,12 @@ impl PackedSourceName {
         }
     }
 
+    /// The name of `linear_id`'s weight codes source, the `Codes` planar role.
     pub fn weight(linear_id: &str) -> Self {
         Self::new(linear_id, SourceRole::Planar(OperandRole::Codes))
     }
 
+    /// The name of `linear_id`'s scale source, the `Scale` planar role.
     pub fn scale(linear_id: &str) -> Self {
         Self::new(linear_id, SourceRole::Planar(OperandRole::Scale))
     }
@@ -110,14 +113,17 @@ impl PackedSourceName {
         })
     }
 
+    /// The source role this name carries.
     pub const fn role(&self) -> SourceRole {
         self.role
     }
 
+    /// The linear id this name was built from: the name without its role suffix.
     pub fn linear_id(&self) -> &str {
         &self.text[..self.linear_id_len]
     }
 
+    /// The full constant name as staged in a graph.
     pub fn as_str(&self) -> &str {
         &self.text
     }

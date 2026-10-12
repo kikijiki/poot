@@ -112,6 +112,7 @@ impl MlaParams {
         })
     }
 
+    /// The attention head count.
     pub fn heads(&self) -> usize {
         self.heads
     }
@@ -121,6 +122,7 @@ impl MlaParams {
         self.nope + self.rope_dim
     }
 
+    /// The rank of the low-rank query bottleneck, or `None` when Q is one plain projection.
     pub fn q_rank(&self) -> Option<usize> {
         self.q_rank
     }
@@ -163,6 +165,9 @@ pub struct MlaWeights {
 }
 
 impl MlaWeights {
+    /// Resolves layer `layer`'s query, latent KV, up-projection and output tensors from `map` and
+    /// checks each shape against `p` and the model `width`; a missing or mis-shaped tensor is a typed
+    /// [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,

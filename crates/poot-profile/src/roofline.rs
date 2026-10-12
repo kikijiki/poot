@@ -77,12 +77,15 @@ impl Ceiling {
 /// One decode run against its ceiling.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Roofline {
+    /// Bytes the compiled plan reads per generated token.
     pub bytes_per_token: f64,
+    /// Measured wall milliseconds per generated token.
     pub ms_per_token: f64,
     /// `bytes_per_token / ms_per_token` in decimal GB/s.
     pub achieved_gb_per_s: f64,
     /// `achieved_gb_per_s / ceiling.gb_per_s`.
     pub fraction_of_ceiling: f64,
+    /// The ceiling the fraction is taken against.
     pub ceiling: Ceiling,
 }
 
@@ -124,8 +127,11 @@ impl Roofline {
 /// the per-token cost that does not scale with bytes (dispatch, sampling, the fixed term).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Fit {
+    /// Slope `a`: marginal milliseconds per decimal gigabyte read.
     pub ms_per_gb: f64,
+    /// Intercept `b`: milliseconds per token that do not scale with bytes.
     pub fixed_ms: f64,
+    /// Coefficient of determination of the fit, in `[0, 1]` for a non-degenerate set of points.
     pub r2: f64,
 }
 

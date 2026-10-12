@@ -12,7 +12,12 @@ pub enum VulkanGpuError {
     /// A kernel's `Assert`/`Unreachable` fired during the last replay: a program result, raised at
     /// `synchronize` (the contract's fault point), not a device failure.
     #[error("kernel {kernel:?} asserted (code {code})")]
-    Fault { kernel: String, code: u32 },
+    Fault {
+        /// Name of the kernel that asserted.
+        kernel: String,
+        /// Body-local trap id the kernel wrote.
+        code: u32,
+    },
 }
 
 impl From<RuntimeError> for VulkanGpuError {

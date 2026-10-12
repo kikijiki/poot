@@ -9,11 +9,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// spike's `device.rs`, Card 546a).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BufferRole {
+    /// A model weight.
     Weight,
+    /// Carried state: KV cache or recurrent state.
     State,
+    /// An intermediate value of a plan.
     Activation,
+    /// A buffer the caller writes before a dispatch.
     Input,
+    /// A buffer the caller reads back after a dispatch.
     Output,
+    /// Length, dimension and kernel-argument metadata.
     Meta,
     /// Direct result/validation readback staging and timestamp buffers (Card 547a scope: "include
     /// direct result/validation staging, timestamp buffers and allocator pools, not only `alloc_f32`").
@@ -95,6 +101,7 @@ impl Default for MemoryCounters {
 }
 
 impl MemoryCounters {
+    /// A counter set with every role at zero.
     pub fn new() -> Self {
         Self {
             roles: Arc::new(Default::default()),

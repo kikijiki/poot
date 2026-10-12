@@ -39,12 +39,19 @@ ir_node! {
     /// A MIR local. `_0` is the return place, `_1..=param_count` are the params in order, the rest are
     /// temporaries.
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-    pub struct Local { pub index: u32 }
+    pub struct Local {
+        /// Position in [`Body::locals`].
+        pub index: u32,
+    }
 }
 
 ir_node! {
+    /// A basic block, by position in [`Body::blocks`].
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-    pub struct BlockId { pub index: u32 }
+    pub struct BlockId {
+        /// Position in [`Body::blocks`].
+        pub index: u32,
+    }
 }
 
 // --- types --------------------------------------------------------------------------------------
@@ -53,28 +60,53 @@ ir_node! {
     /// The tiny type lattice poot lowers. The u8/i8/u16/i16/u64/i64 widths are out of subset and rejected at import.
     #[derive(Clone, PartialEq, Eq, Debug, Hash)]
     pub enum Ty {
+        /// The zero-sized unit type, the return type of a kernel.
         Unit,
+        /// A boolean.
         Bool,
+        /// The index type: a slice length or element index.
         Usize,
+        /// IEEE binary16 float.
         F16,
         /// bfloat16 (LLVM `bfloat`, spec 024). Arithmetic widens to f32 and accumulates in f32, narrowing to bf16 on store.
         BF16,
+        /// IEEE binary32 float.
         F32,
+        /// IEEE binary64 float.
         F64,
+        /// Signed 32-bit integer.
         I32,
+        /// Unsigned 32-bit integer.
         U32,
-        Ref { mutable: bool, pointee: Box<Ty> },
+        /// A reference to `pointee`; a kernel buffer parameter is a reference to a [`Ty::Slice`].
+        Ref {
+            /// Whether the reference is `&mut`.
+            mutable: bool,
+            /// The referenced type.
+            pointee: Box<Ty>,
+        },
+        /// A slice of the element type; the buffer a kernel parameter binds.
         Slice(Box<Ty>),
         /// A fixed-size private (per-thread) array, e.g. flash attention's `o[head_dim]` accumulator.
         /// Lowers to an `alloca [len x elem]` on NVPTX; the LLVM SPIR-V backend crashes on a
         /// dynamically-indexed private array (poot-legacy spec-076), so SpirvVulkan rejects it.
-        Array { elem: Box<Ty>, len: u32 },
+        Array {
+            /// The element type.
+            elem: Box<Ty>,
+            /// The fixed element count.
+            len: u32,
+        },
         /// A fixed-lane SIMD vector (spec 134 P1): `lanes` is 2 or 4, `elem` a scalar numeric type.
         /// Backend-neutral (no wave width baked in). `poot-codegen` lowers it to LLVM `<lanes x elem>`;
         /// only SpirvVulkan is implemented (NVPTX/AMDGCN emit a named `Unsupported` diagnostic, see
         /// emit.rs). `Rvalue::VectorLoad`/`Statement::VectorStore` read/write a scalar-element slice
         /// `lanes` elements at a time.
-        Vec { elem: Box<Ty>, lanes: u32 },
+        Vec {
+            /// The scalar element type.
+            elem: Box<Ty>,
+            /// The lane count, 2 or 4.
+            lanes: u32,
+        },
         /// A subgroup-collective matrix fragment (spec 025/154, cards 530/663): one opaque value spread across
         /// the lanes of a [`FRAGMENT_COLLECTIVE_LANES`]-lane group, never a scalar. The declared type is the
         /// fragment's whole identity (role, operand dtype, tile); the verifier checks every producer and
@@ -89,6 +121,7 @@ ir_node! {
 pub const FRAGMENT_COLLECTIVE_LANES: u32 = 32;
 
 impl Ty {
+    /// Whether the type is a float scalar, or a vector of one.
     pub fn is_float(&self) -> bool {
         match self {
             Ty::F16 | Ty::BF16 | Ty::F32 | Ty::F64 => true,
@@ -96,6 +129,7 @@ impl Ty {
             _ => false,
         }
     }
+    /// Whether the type is a signed integer scalar, or a vector of one.
     pub fn is_signed_int(&self) -> bool {
         match self {
             Ty::I32 => true,
@@ -112,20 +146,26 @@ ir_node! {
     /// `[Deref, Index(i)]`.
     #[derive(Clone, PartialEq, Eq, Debug)]
     pub enum ProjectionElem {
+        /// Dereference the reference or slice the place currently names.
         Deref,
+        /// Index the array or slice by the value of a local.
         Index(Local),
     }
 }
 
 ir_node! {
+    /// A memory location: a local plus a projection.
     #[derive(Clone, PartialEq, Eq, Debug)]
     pub struct Place {
+        /// The base local.
         pub local: Local,
+        /// The projection steps applied to the base, in order.
         pub projection: Vec<ProjectionElem>,
     }
 }
 
 impl Place {
+    /// The place naming `local` itself, with no projection.
     pub fn local(local: Local) -> Self {
         Place {
             local,
@@ -135,22 +175,33 @@ impl Place {
 }
 
 ir_node! {
+    /// A scalar constant.
     #[derive(Clone, PartialEq, Debug)]
     pub enum Constant {
+        /// A boolean.
         Bool(bool),
+        /// An index-sized unsigned integer.
         Usize(u64),
+        /// A signed 32-bit integer.
         I32(i32),
+        /// An unsigned 32-bit integer.
         U32(u32),
+        /// A 32-bit float.
         F32(f32),
+        /// A 64-bit float.
         F64(f64),
     }
 }
 
 ir_node! {
+    /// A value read: a place or a constant.
     #[derive(Clone, PartialEq, Debug)]
     pub enum Operand {
+        /// Read the place, leaving it valid.
         Copy(Place),
+        /// Read the place, which is dead afterwards.
         Move(Place),
+        /// A constant.
         Const(Constant),
     }
 }
@@ -161,17 +212,52 @@ ir_node! {
     /// Binary operators. Signedness (sdiv/udiv, etc.) is taken from the operand `Ty` at emit time.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum BinOp {
-        Add, Sub, Mul, Div, Rem,
-        BitAnd, BitOr, BitXor, Shl, Shr,
-        Min, Max,
-        Lt, Le, Gt, Ge, Eq, Ne,
+        /// Addition.
+        Add,
+        /// Subtraction.
+        Sub,
+        /// Multiplication.
+        Mul,
+        /// Division.
+        Div,
+        /// Remainder.
+        Rem,
+        /// Bitwise and.
+        BitAnd,
+        /// Bitwise or.
+        BitOr,
+        /// Bitwise exclusive or.
+        BitXor,
+        /// Left shift.
+        Shl,
+        /// Right shift (arithmetic for signed operands).
+        Shr,
+        /// The smaller operand.
+        Min,
+        /// The larger operand.
+        Max,
+        /// Less than.
+        Lt,
+        /// Less than or equal.
+        Le,
+        /// Greater than.
+        Gt,
+        /// Greater than or equal.
+        Ge,
+        /// Equal.
+        Eq,
+        /// Not equal.
+        Ne,
     }
 }
 
 ir_node! {
+    /// Unary operators.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum UnOp {
+        /// Arithmetic negation.
         Neg,
+        /// Logical not on a `Bool`, bitwise not on an integer.
         Not,
     }
 }
@@ -181,8 +267,26 @@ ir_node! {
     /// backend in `poot-codegen` (NVPTX approx intrinsics vs SPIR-V GLSL.std.450); the IR stays abstract.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MathOp {
-        Sqrt, Abs, Floor, Ceil, Trunc, Round,
-        Exp, Log, Sin, Cos,
+        /// Square root.
+        Sqrt,
+        /// Absolute value.
+        Abs,
+        /// Round toward negative infinity.
+        Floor,
+        /// Round toward positive infinity.
+        Ceil,
+        /// Round toward zero.
+        Trunc,
+        /// Round to nearest, ties away from zero.
+        Round,
+        /// Natural exponential.
+        Exp,
+        /// Natural logarithm.
+        Log,
+        /// Sine.
+        Sin,
+        /// Cosine.
+        Cos,
     }
 }
 
@@ -191,6 +295,7 @@ ir_node! {
     /// target instructions and physical packing stay below this IR.
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub enum Fp8Format {
+        /// OCP E4M3FN: 4 exponent bits, 3 mantissa bits, finite-only.
         E4M3Fn,
     }
 }
@@ -199,16 +304,33 @@ ir_node! {
     /// Integer bit ops on u32 (per-backend lowering split in `poot-codegen`).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum IntScalarOp {
+        /// Number of set bits.
         CountOnes,
+        /// Number of leading zero bits.
         LeadingZeros,
+        /// Number of trailing zero bits.
         TrailingZeros,
     }
 }
 
 ir_node! {
+    /// Read-modify-write operations of an atomic.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum AtomicOp {
-        Add, Min, Max, And, Or, Xor, Exchange,
+        /// Atomic add.
+        Add,
+        /// Atomic minimum.
+        Min,
+        /// Atomic maximum.
+        Max,
+        /// Atomic bitwise and.
+        And,
+        /// Atomic bitwise or.
+        Or,
+        /// Atomic bitwise exclusive or.
+        Xor,
+        /// Atomic exchange: store the operand, return the old value.
+        Exchange,
     }
 }
 
@@ -219,7 +341,9 @@ ir_node! {
     /// global store is otherwise only guaranteed L1-local).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum MemoryScope {
+        /// Visible to the calling thread's workgroup.
         Workgroup,
+        /// Visible to every workgroup on the device.
         Device,
     }
 }
@@ -230,8 +354,11 @@ ir_node! {
     /// `SequentiallyConsistent` (same reason `fix_barrier_semantics` strips it from the workgroup barrier).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum MemoryOrdering {
+        /// Later accesses may not move before the fence.
         Acquire,
+        /// Earlier accesses may not move after the fence.
         Release,
+        /// Both acquire and release.
         AcqRel,
     }
 }
@@ -242,7 +369,9 @@ ir_node! {
     /// The instruction set (the right-hand side of an `Assign`), limited to the supported kernel subset.
     #[derive(Clone, PartialEq, Debug)]
     pub enum Rvalue {
+        /// The operand itself.
         Use(Operand),
+        /// `op` applied to two operands of one type.
         BinaryOp(BinOp, Operand, Operand),
         /// A float `Add`/`Sub`/`Mul` marked to forbid fused multiply-add contraction with any op it
         /// produces or consumes (card 628; dquant.md section 7, R1). A backend compiler
@@ -256,49 +385,98 @@ ir_node! {
         /// `Rvalue::BinaryOp` keeps today's contraction-eligible codegen (no across-the-board performance
         /// change) - only the packed-dequant decode formula (dquant.md 3.3) opts in.
         BinaryOpNoContract(BinOp, Operand, Operand),
+        /// `op` applied to one operand.
         UnaryOp(UnOp, Operand),
+        /// A float math function of one operand.
         MathUnary(MathOp, Operand),
+        /// A `u32` bit operation of one operand.
         IntScalarUnary(IntScalarOp, Operand),
         /// Slice length (`c.len()`), mirrors MIR `Rvalue::Len`.
         Len(Place),
         /// Value-converting numeric cast.
-        Cast { to: Ty, operand: Operand },
+        Cast {
+            /// The type converted to.
+            to: Ty,
+            /// The value converted.
+            operand: Operand,
+        },
         /// Bit reinterpret (`f32::from_bits`), no value conversion.
-        Bitcast { to: Ty, operand: Operand },
+        Bitcast {
+            /// The type reinterpreted as.
+            to: Ty,
+            /// The value reinterpreted.
+            operand: Operand,
+        },
         /// `if condition { if_true } else { if_false }` over a scalar of any type, as a hardware select: the
         /// chosen operand moves to the result bit for bit and the other is never read as a number, so a NaN
         /// payload, an infinity or `-0.0` passes through (or stays out) unchanged at every width, including
         /// the two-byte floats that have no integer type here to mask through. `condition` is a `Bool`; the
         /// two branches have one scalar type, which is the result's.
         Select {
+            /// The `Bool` that picks the branch.
             condition: Operand,
+            /// The result when `condition` holds.
             if_true: Operand,
+            /// The result when `condition` does not hold.
             if_false: Operand,
         },
         /// Encode an f32 to the low 8 bits of a `U32` byte carrier using `format` semantics. Packed-word
         /// lane insertion happens outside this rvalue. FP8 is never a scalar `Ty`.
-        Fp8Encode { format: Fp8Format, operand: Operand },
+        Fp8Encode {
+            /// The FP8 format encoded to.
+            format: Fp8Format,
+            /// The f32 value encoded.
+            operand: Operand,
+        },
         /// Read element `idx` of workgroup-local (LDS) array `array`.
-        WorkgroupLocalRead { idx: Operand, array: u8 },
+        WorkgroupLocalRead {
+            /// The element index.
+            idx: Operand,
+            /// Which workgroup-local array.
+            array: u8,
+        },
         /// Atomic on workgroup-local array `array` at `idx`.
-        WorkgroupLocalAtomic { idx: Operand, value: Operand, op: AtomicOp, array: u8 },
+        WorkgroupLocalAtomic {
+            /// The element index.
+            idx: Operand,
+            /// The operand of the atomic.
+            value: Operand,
+            /// The atomic operation.
+            op: AtomicOp,
+            /// Which workgroup-local array.
+            array: u8,
+        },
         /// Atomic on a global slice element.
-        GlobalAtomic { place: Place, value: Operand, op: AtomicOp },
+        GlobalAtomic {
+            /// The slice element operated on.
+            place: Place,
+            /// The operand of the atomic.
+            value: Operand,
+            /// The atomic operation.
+            op: AtomicOp,
+        },
         /// Compare-and-swap on workgroup-local (LDS) array `array` at `idx`: replace the cell with `desired`
         /// if it holds `expected`, returning the old value (spec 138). Separate from `AtomicOp` because CAS
         /// takes two value operands. Integer-only in codegen (LLVM `cmpxchg` rejects float; Vulkan has no
         /// float `OpAtomicCompareExchange`).
         WorkgroupLocalCompareExchange {
+            /// The element index.
             idx: Operand,
+            /// The value the cell must hold for the swap to happen.
             expected: Operand,
+            /// The value stored on a match.
             desired: Operand,
+            /// Which workgroup-local array.
             array: u8,
         },
         /// Compare-and-swap on a global slice element: replace `place` with `desired` if it holds
         /// `expected`, returning the old value (spec 138). Integer-only in codegen (see `WorkgroupLocalCompareExchange`).
         GlobalCompareExchange {
+            /// The slice element operated on.
             place: Place,
+            /// The value the element must hold for the swap to happen.
             expected: Operand,
+            /// The value stored on a match.
             desired: Operand,
         },
         /// Load `lanes` contiguous elements of a scalar-element slice as one `Ty::Vec` value (spec 134,
@@ -307,7 +485,10 @@ ir_node! {
         /// the destination local's declared `Ty::Vec`. Alignment (FR-003) is a builder obligation; codegen
         /// only stamps `align`. SpirvVulkan-only: a body must not mix scalar and vector access to one param
         /// (the two-binding mechanism, FR-004b, is not implemented).
-        VectorLoad { place: Place },
+        VectorLoad {
+            /// The slice element group loaded.
+            place: Place,
+        },
         /// Broadcast a scalar operand to every lane of the destination's declared `Ty::Vec` type.
         VectorSplat(Operand),
     }
@@ -319,7 +500,9 @@ ir_node! {
     /// Which input matrix a WMMA load fills (the `a` or `b` fragment), spec 025.
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub enum WmmaMat {
+        /// The left multiplicand.
         A,
+        /// The right multiplicand.
         B,
     }
 }
@@ -329,7 +512,9 @@ ir_node! {
     /// elements are always f32, whatever the operand dtype).
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub enum FragmentRole {
+        /// An operand matrix fragment.
         Matrix(WmmaMat),
+        /// The f32 accumulator fragment.
         Accumulator,
     }
 }
@@ -340,13 +525,17 @@ ir_node! {
     /// tile it covers.
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub struct FragmentTy {
+        /// Which matrix the fragment holds.
         pub role: FragmentRole,
+        /// The operand element dtype.
         pub dtype: WmmaDtype,
+        /// The tile shape.
         pub shape: WmmaShape,
     }
 }
 
 impl FragmentTy {
+    /// The declared type of an `A` or `B` operand fragment.
     pub const fn matrix(which: WmmaMat, dtype: WmmaDtype, shape: WmmaShape) -> Self {
         FragmentTy {
             role: FragmentRole::Matrix(which),
@@ -355,6 +544,7 @@ impl FragmentTy {
         }
     }
 
+    /// The declared type of the accumulator fragment for `dtype` operands.
     pub const fn accumulator(dtype: WmmaDtype, shape: WmmaShape) -> Self {
         FragmentTy {
             role: FragmentRole::Accumulator,
@@ -379,7 +569,9 @@ ir_node! {
     /// `poot_codegen::emit`'s `wmma_check_target`).
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub enum WmmaDtype {
+        /// bfloat16 operands.
         Bf16,
+        /// IEEE binary16 operands.
         F16,
     }
 }
@@ -390,13 +582,17 @@ ir_node! {
     /// new codegen arm and a typed refusal for targets that lack it.
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
     pub struct WmmaShape {
+        /// Rows of the output tile.
         pub m: u16,
+        /// Columns of the output tile.
         pub n: u16,
+        /// The reduction extent.
         pub k: u16,
     }
 }
 
 impl WmmaShape {
+    /// The 16x16x16 tile, the only shape every target lowers.
     pub const M16N16K16: WmmaShape = WmmaShape {
         m: 16,
         n: 16,
@@ -405,27 +601,50 @@ impl WmmaShape {
 }
 
 ir_node! {
+    /// A non-branching instruction of a basic block.
     #[derive(Clone, PartialEq, Debug)]
     pub enum Statement {
+        /// Evaluate the rvalue and store it to the place.
         Assign(Place, Rvalue),
+        /// The local's storage begins here.
         StorageLive(Local),
+        /// The local's storage ends here.
         StorageDead(Local),
-        WorkgroupLocalWrite { idx: Operand, value: Operand, array: u8 },
+        /// Store `value` to element `idx` of workgroup-local array `array`.
+        WorkgroupLocalWrite {
+            /// The element index.
+            idx: Operand,
+            /// The value stored.
+            value: Operand,
+            /// Which workgroup-local array.
+            array: u8,
+        },
         /// Store a `Ty::Vec` operand as `lanes` contiguous elements of a scalar-element slice at `place`'s
         /// vector-group index (counterpart of `Rvalue::VectorLoad`; same indexing and FR-004b caveat).
         /// `lanes`/`elem` come from `value`'s type.
-        VectorStore { place: Place, value: Operand },
+        VectorStore {
+            /// The slice element group stored to.
+            place: Place,
+            /// The `Ty::Vec` value stored.
+            value: Operand,
+        },
         /// Warp/subgroup-collective matrix-fragment load (spec 025/154, card 530): one target-neutral op,
         /// lowered per target by `poot_codegen::emit` (AMDGCN/NVPTX WMMA, SPIR-V cooperative matrix). `dst`
         /// is a fragment local declared `Ty::Fragment(FragmentTy::matrix(which, dtype, shape))`; the
         /// verifier rejects any other declaration. `tile` is the address of the tile's first element (a
         /// slice element place); `stride` the row stride in elements.
         WmmaLoad {
+            /// Whether `dst` is the `A` or `B` fragment.
             which: WmmaMat,
+            /// The operand element dtype.
             dtype: WmmaDtype,
+            /// The tile shape.
             shape: WmmaShape,
+            /// The slice element place of the tile's first element.
             tile: Place,
+            /// The row stride, in elements.
             stride: u32,
+            /// The fragment local filled.
             dst: Local,
         },
         /// `dst = a * b + c` (fused). `a`/`b` are declared A/B fragments of `dtype`, `c`/`dst` the f32
@@ -433,18 +652,30 @@ ir_node! {
         /// WMMA/coopmat instruction for `dtype`). `c` and `dst` may be one local: the in-place accumulation of
         /// a K-loop, which every target carries across the back-edge in the fragment's variable.
         WmmaMma {
+            /// The operand element dtype.
             dtype: WmmaDtype,
+            /// The tile shape.
             shape: WmmaShape,
+            /// The `A` fragment.
             a: Local,
+            /// The `B` fragment.
             b: Local,
+            /// The accumulator added to the product.
             c: Local,
+            /// The accumulator fragment written.
             dst: Local,
         },
+        /// Store the f32 accumulator fragment `src` to a slice tile.
         WmmaStore {
+            /// The operand element dtype.
             dtype: WmmaDtype,
+            /// The tile shape.
             shape: WmmaShape,
+            /// The slice element place of the tile's first element.
             tile: Place,
+            /// The row stride, in elements.
             stride: u32,
+            /// The accumulator fragment stored.
             src: Local,
         },
         /// Seed a zero-valued f32 accumulator fragment (card 154, extended to every target by card 530): a
@@ -453,31 +684,54 @@ ir_node! {
         /// `SPV_KHR_cooperative_matrix` to broadcast a scalar into every component) and a zero vector/struct
         /// constant on AMDGCN/NVPTX (no device instruction; the fragment register group starts as literal
         /// zero bits).
-        WmmaZero { dtype: WmmaDtype, shape: WmmaShape, dst: Local },
+        WmmaZero {
+            /// The operand element dtype.
+            dtype: WmmaDtype,
+            /// The tile shape.
+            shape: WmmaShape,
+            /// The accumulator fragment zeroed.
+            dst: Local,
+        },
         /// Load an A/B fragment from a workgroup-local (LDS) `array` (base index 0) with row `stride`. LDS
         /// analog of `WmmaLoad`, used by the bf16 tensor-core dequant gemm (spec 026). NVPTX-only.
         WmmaLoadLds {
+            /// Whether `dst` is the `A` or `B` fragment.
             which: WmmaMat,
+            /// The operand element dtype.
             dtype: WmmaDtype,
+            /// The tile shape.
             shape: WmmaShape,
+            /// Which workgroup-local array.
             array: u8,
+            /// The row stride, in elements.
             stride: u32,
+            /// The fragment local filled.
             dst: Local,
         },
         /// Store the f32 D fragment to a workgroup-local (LDS) `array` (base index 0) with row `stride`. Used
         /// by the bf16 tensor-core gemm epilogue (store to LDS, barrier, narrow-copy to bf16). NVPTX-only.
         WmmaStoreLds {
+            /// The operand element dtype.
             dtype: WmmaDtype,
+            /// The tile shape.
             shape: WmmaShape,
+            /// Which workgroup-local array.
             array: u8,
+            /// The row stride, in elements.
             stride: u32,
+            /// The accumulator fragment stored.
             src: Local,
         },
         /// A scoped memory-ordering fence with no control-flow effect (spec 138), hence a `Statement`.
         /// Lowers to one LLVM `fence` scoped by `scope`/`ordering`; see `emit_statement`'s
         /// `Statement::Fence` arm for the per-target syncscope mapping. AieCore rejects it by name (one AIE
         /// core has nothing to fence against, like Barrier/CAS).
-        Fence { scope: MemoryScope, ordering: MemoryOrdering },
+        Fence {
+            /// How far the fence's effects are visible.
+            scope: MemoryScope,
+            /// The ordering established.
+            ordering: MemoryOrdering,
+        },
     }
 }
 
@@ -485,30 +739,69 @@ ir_node! {
     /// A dispatch-id axis. The only "call" in the subset is `thread_index*()`, hence a dedicated terminator.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum IndexAxis {
-        X, Y, Z,
-        LocalX, LocalY, LocalZ,
-        GroupX, GroupY, GroupZ,
+        /// The global thread id, x.
+        X,
+        /// The global thread id, y.
+        Y,
+        /// The global thread id, z.
+        Z,
+        /// The thread id within its workgroup, x.
+        LocalX,
+        /// The thread id within its workgroup, y.
+        LocalY,
+        /// The thread id within its workgroup, z.
+        LocalZ,
+        /// The workgroup id, x.
+        GroupX,
+        /// The workgroup id, y.
+        GroupY,
+        /// The workgroup id, z.
+        GroupZ,
     }
 }
 
 ir_node! {
+    /// The branches of a [`Terminator::SwitchInt`].
     #[derive(Clone, PartialEq, Eq, Debug)]
     pub struct SwitchTargets {
         /// `(value, target)` pairs.
         pub branches: Vec<(u128, BlockId)>,
+        /// The block taken when no branch value matches.
         pub otherwise: BlockId,
     }
 }
 
 ir_node! {
+    /// How control leaves a basic block.
     #[derive(Clone, PartialEq, Debug)]
     pub enum Terminator {
-        Goto { target: BlockId },
-        SwitchInt { discr: Operand, targets: SwitchTargets },
+        /// Unconditional jump.
+        Goto {
+            /// The block jumped to.
+            target: BlockId,
+        },
+        /// Branch on an integer or boolean value.
+        SwitchInt {
+            /// The value switched on.
+            discr: Operand,
+            /// The branches and the fall-through block.
+            targets: SwitchTargets,
+        },
         /// Write the dispatch id for `dim` into `destination`, then go to `target`.
-        ThreadIndexCall { destination: Place, dim: IndexAxis, target: BlockId },
+        ThreadIndexCall {
+            /// Where the dispatch id is written.
+            destination: Place,
+            /// Which dispatch-id axis.
+            dim: IndexAxis,
+            /// The block continued in.
+            target: BlockId,
+        },
         /// Workgroup barrier, then `target`.
-        Barrier { target: BlockId },
+        Barrier {
+            /// The block continued in once every lane arrived.
+            target: BlockId,
+        },
+        /// Return from the kernel.
         Return,
         /// An unrecoverable kernel-subset fault (a failed `Assert` or a reached `Unreachable`): the device
         /// aborts instead of continuing with whatever the kernel had computed so far (card 531c).
@@ -519,16 +812,22 @@ ir_node! {
         /// per-dispatch error-word buffer and returns, and the executor (`poot-wgpu-runtime`/`poot-wgpu-device`) checks
         /// that word at its existing sync point and turns a nonzero value into a typed fault naming the
         /// kernel and this code (card 531c decision 3).
-        Trap { code: u32 },
+        Trap {
+            /// The body-local, 1-based id of this trap site.
+            code: u32,
+        },
     }
 }
 
 // --- the body -----------------------------------------------------------------------------------
 
 ir_node! {
+    /// A local's declared type and mutability.
     #[derive(Clone, PartialEq, Eq, Debug)]
     pub struct LocalDecl {
+        /// The local's type.
         pub ty: Ty,
+        /// Whether the local is declared `mut`.
         pub mutable: bool,
     }
 }
@@ -538,15 +837,20 @@ ir_node! {
     /// scratch cannot share one array).
     #[derive(Clone, PartialEq, Eq, Debug)]
     pub struct WorkgroupLocalDecl {
+        /// The element type.
         pub elem_ty: Ty,
+        /// The element count.
         pub len: u32,
     }
 }
 
 ir_node! {
+    /// A straight-line run of statements ending in one terminator.
     #[derive(Clone, PartialEq, Debug)]
     pub struct BasicBlock {
+        /// The straight-line statements, in order.
         pub statements: Vec<Statement>,
+        /// How control leaves the block.
         pub terminator: Terminator,
     }
 }
@@ -555,13 +859,17 @@ ir_node! {
     /// One lowered `#[kernel]` function.
     #[derive(Clone, PartialEq, Debug)]
     pub struct Body {
+        /// The kernel function's name.
         pub name: String,
         /// Number of kernel parameters (locals `_1..=param_count`).
         pub param_count: u32,
+        /// Every local, indexed by [`Local::index`]; `_0` is the return place.
         pub locals: Vec<LocalDecl>,
+        /// Every basic block, indexed by [`BlockId::index`]; block 0 is the entry.
         pub blocks: Vec<BasicBlock>,
         /// Workgroup shape (x, y, z); defaults to (64, 1, 1).
         pub workgroup_size: [u32; 3],
+        /// The workgroup-local (LDS) arrays.
         pub workgroup_locals: Vec<WorkgroupLocalDecl>,
     }
 }
@@ -589,6 +897,7 @@ impl Body {
         (1..=self.param_count).map(|i| Local { index: i })
     }
 
+    /// The declared type of `l`.
     pub fn local_ty(&self, l: Local) -> &Ty {
         &self.locals[l.index as usize].ty
     }
@@ -625,68 +934,114 @@ mod verify {
     pub enum Site {
         /// The signature: params, locals, blocks, workgroup shape.
         Signature,
+        /// A statement of a block.
         Statement {
+            /// The block.
             block: BlockId,
+            /// The statement's position in the block.
             index: usize,
         },
+        /// The terminator of a block.
         Terminator {
+            /// The block.
             block: BlockId,
         },
     }
 
     #[derive(Clone, PartialEq, Debug, thiserror::Error)]
+    /// What is wrong with the body.
     pub enum VerifyErrorKind {
         /// The body has no blocks, so there is no entry.
         #[error("the body has no blocks")]
         NoBlocks,
         /// `param_count` needs `_0` plus one local per param.
         #[error("param_count {param_count} needs {} locals (_0 and the params), found {locals}", u64::from(*param_count) + 1)]
-        ParamsExceedLocals { param_count: u32, locals: usize },
+        ParamsExceedLocals {
+            /// The declared parameter count.
+            param_count: u32,
+            /// The locals the body declares.
+            locals: usize,
+        },
         /// A kernel param must bind a buffer: `&[T]` or `&mut [T]`.
         #[error("param _{} has type {ty:?}, expected a buffer binding (&[T] or &mut [T])", local.index)]
-        ParamNotBuffer { local: Local, ty: Ty },
+        ParamNotBuffer {
+            /// The parameter local.
+            local: Local,
+            /// Its declared type.
+            ty: Ty,
+        },
         #[error("workgroup size {size:?} has a zero dimension")]
-        ZeroWorkgroupDim { size: [u32; 3] },
+        /// The workgroup shape has a zero dimension.
+        ZeroWorkgroupDim {
+            /// The declared shape.
+            size: [u32; 3],
+        },
         #[error("local _{} is not declared", .0.index)]
+        /// A statement names a local the body does not declare.
         UndeclaredLocal(Local),
         #[error("workgroup-local array {0} is not declared")]
+        /// A statement names a workgroup-local array the body does not declare.
         UndeclaredWorkgroupArray(u8),
         #[error("block bb{} does not exist", .0.index)]
+        /// A terminator names a block the body does not have.
         UndefinedBlock(BlockId),
         /// A place projection codegen cannot lower: only `[]`, `[Index]` on a private array, and
         /// `[Deref, Index]` on a param buffer are places.
         #[error("malformed place {place:?}: {reason}")]
-        MalformedPlace { place: Place, reason: &'static str },
+        MalformedPlace {
+            /// The offending place.
+            place: Place,
+            /// Why it is not lowerable.
+            reason: &'static str,
+        },
         /// The local is read on a path from the entry that has not assigned it.
         #[error("local _{} is read before it is assigned on some path", .0.index)]
         UseBeforeDefinition(Local),
         #[error("{what}: expected {expected:?}, found {found:?}")]
+        /// An operand's type disagrees with what its use requires.
         TypeMismatch {
+            /// The operation or operand checked.
             what: &'static str,
+            /// The type the use requires.
             expected: Ty,
+            /// The type found.
             found: Ty,
         },
         /// The operand type is outside what the operation accepts (a float shift amount, a `Ref` cast).
         #[error("{what}: operand type {found:?} is not accepted")]
-        InvalidOperandType { what: &'static str, found: Ty },
+        InvalidOperandType {
+            /// The operation or operand checked.
+            what: &'static str,
+            /// The type found.
+            found: Ty,
+        },
         /// A store or atomic through a `&[T]` binding (the buffer is read-only).
         #[error("write through the read-only buffer binding _{}", param.index)]
-        WriteThroughSharedBuffer { param: Local },
+        WriteThroughSharedBuffer {
+            /// The read-only buffer parameter.
+            param: Local,
+        },
         /// A matrix-fragment op's `shape` is not one every codegen target implements (card 530). Only `M16N16K16` is implemented today; this is the IR-level half of the check
         /// (`poot_codegen::emit`'s `wmma_check_shape` is the target-lowering half) so a malformed shape is
         /// caught before any codegen sees it, matching every other well-formedness check here.
         #[error(
             "matrix-fragment shape {shape:?} is not implemented (only WmmaShape::M16N16K16 lowers today)"
         )]
-        UnsupportedWmmaShape { shape: WmmaShape },
+        UnsupportedWmmaShape {
+            /// The shape the op carries.
+            shape: WmmaShape,
+        },
         /// A matrix-fragment op's local is not declared as the fragment type the op needs (cards 530/663): the
         /// role (A, B or accumulator), operand dtype and tile are all part of the declared [`Ty::Fragment`], so
         /// a swapped A/B, an accumulator where a matrix belongs, a dtype or tile that disagrees with the
         /// operation, or a scalar-typed local all land here.
         #[error("fragment _{}: expected {expected:?}, declared {found:?}", local.index)]
         FragmentTypeMismatch {
+            /// The fragment local.
             local: Local,
+            /// The fragment type the op needs.
             expected: FragmentTy,
+            /// The type the local is declared as.
             found: Ty,
         },
         /// A matrix-fragment op is reachable under control flow that can split its collective subgroup
@@ -703,8 +1058,11 @@ mod verify {
             reconverge_desc(*reconverge)
         )]
         DivergentFragmentParticipation {
+            /// The divergent branch's block.
             branch: BlockId,
+            /// The block holding the matrix-fragment op.
             op: BlockId,
+            /// The branch's reconvergence block, if its arms reunite.
             reconverge: Option<BlockId>,
         },
         /// `Rvalue::BinaryOpNoContract`'s `op` is not `Add`, `Sub` or `Mul` (card 628): the no-contraction
@@ -713,7 +1071,10 @@ mod verify {
         #[error(
             "BinaryOpNoContract op {op:?} is not implemented (only Add, Sub and Mul carry the no-contraction marker)"
         )]
-        UnsupportedNoContractOp { op: BinOp },
+        UnsupportedNoContractOp {
+            /// The operator that was marked.
+            op: BinOp,
+        },
         /// A `SwitchInt` whose discriminant can differ between lanes of the same workgroup reaches a
         /// [`Terminator::Barrier`] before its arms are guaranteed to reconverge (card 618, hardened by
         /// its review): real hardware runs a barrier in lockstep, so a workgroup whose lanes disagree on
@@ -730,8 +1091,11 @@ mod verify {
             reconverge_desc(*reconverge)
         )]
         DivergentBarrierReachability {
+            /// The divergent branch's block.
             branch: BlockId,
+            /// The block holding the barrier.
             barrier: BlockId,
+            /// The branch's reconvergence block, if its arms reunite.
             reconverge: Option<BlockId>,
         },
     }
@@ -748,7 +1112,9 @@ mod verify {
     #[derive(Clone, PartialEq, Debug, thiserror::Error)]
     #[error("invalid kernel body at {site}: {kind}")]
     pub struct VerifyError {
+        /// Where the violation sits.
         pub site: Site,
+        /// What the violation is.
         pub kind: VerifyErrorKind,
     }
 

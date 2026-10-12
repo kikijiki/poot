@@ -13,10 +13,15 @@ use super::{BinOp, Builder, BuilderError, DType, Requirement, Scalar, Traced};
 /// Why a u64-hash graph cannot be built for the requested modulus.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum U64HashError {
+    /// The modulus is outside `1..2^28`, the range for which the base-16 Horner remainder stays within a u32 lane.
     #[error(
         "u64_rem_u32 modulus must be in 1..2^28 so Horner intermediates stay below 2^32; got {modulus}"
     )]
-    ModulusOutOfRange { modulus: u32 },
+    ModulusOutOfRange {
+        /// The refused modulus.
+        modulus: u32,
+    },
+    /// Appending one of the hash graph's equations failed.
     #[error(transparent)]
     Build(#[from] BuilderError),
 }

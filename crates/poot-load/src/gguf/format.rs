@@ -10,18 +10,31 @@ use crate::LoadError;
 /// A GGUF metadata value (the 13 GGUF value types; `Array` holds a homogeneous list).
 #[derive(Debug, Clone, PartialEq)]
 pub enum GgufValue {
+    /// An unsigned 8-bit integer.
     U8(u8),
+    /// A signed 8-bit integer.
     I8(i8),
+    /// An unsigned 16-bit integer.
     U16(u16),
+    /// A signed 16-bit integer.
     I16(i16),
+    /// An unsigned 32-bit integer.
     U32(u32),
+    /// A signed 32-bit integer.
     I32(i32),
+    /// An unsigned 64-bit integer.
     U64(u64),
+    /// A signed 64-bit integer.
     I64(i64),
+    /// A 32-bit float.
     F32(f32),
+    /// A 64-bit float.
     F64(f64),
+    /// A boolean.
     Bool(bool),
+    /// A UTF-8 string.
     Str(String),
+    /// A homogeneous list of values.
     Array(Vec<GgufValue>),
 }
 
@@ -40,6 +53,7 @@ impl GgufValue {
             _ => None,
         }
     }
+    /// The value as f32 when it is an `F32` or `F64` (the latter narrowed); `None` for every other type.
     pub fn as_f32(&self) -> Option<f32> {
         match self {
             GgufValue::F32(v) => Some(*v),
@@ -47,18 +61,21 @@ impl GgufValue {
             _ => None,
         }
     }
+    /// The string when the value is a `Str`.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             GgufValue::Str(s) => Some(s),
             _ => None,
         }
     }
+    /// The boolean when the value is a `Bool`.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             GgufValue::Bool(b) => Some(*b),
             _ => None,
         }
     }
+    /// The elements when the value is an `Array`.
     pub fn as_array(&self) -> Option<&[GgufValue]> {
         match self {
             GgufValue::Array(v) => Some(v),
@@ -71,8 +88,11 @@ impl GgufValue {
 /// REVERSE of the logical row-major shape); `offset` is relative to the tensor-data section start.
 #[derive(Debug, Clone)]
 pub struct GgufTensorInfo {
+    /// Extents in ggml `ne` order, fastest-varying first.
     pub dims: Vec<u64>,
+    /// The ggml tensor type id (see [`crate::gguf::weight_format_of`]).
     pub ggml_type: u32,
+    /// Byte offset of the tensor's data from the start of the tensor-data section.
     pub offset: u64,
 }
 
@@ -372,8 +392,11 @@ pub fn weight_format_of(ggml_type: u32) -> Option<WeightFormat> {
 /// [`crate::gguf::read_gguf`] slices each tensor's bytes out of the same [`StoredBytes`] using
 /// [`Self::data_start`]; nothing here copies file contents.
 pub struct GgufIndex {
+    /// The GGUF format version the header declares.
     pub version: u32,
+    /// Metadata key-value table, keyed by the dotted key (`general.architecture`, ...).
     pub metadata: HashMap<String, GgufValue>,
+    /// Tensor directory, keyed by tensor name.
     pub tensors: HashMap<String, GgufTensorInfo>,
     data_start: usize,
 }
@@ -392,6 +415,7 @@ impl GgufIndex {
         })
     }
 
+    /// The metadata value for `key`, if the file has one.
     pub fn get(&self, key: &str) -> Option<&GgufValue> {
         self.metadata.get(key)
     }

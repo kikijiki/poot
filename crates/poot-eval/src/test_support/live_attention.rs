@@ -22,15 +22,21 @@ use poot_test_util::fill;
 /// The shape of one live-capacity attention decode.
 #[derive(Clone, Copy, Debug)]
 pub struct LiveAttentionFixture {
+    /// Batch rows.
     pub batch: usize,
+    /// Query heads.
     pub hq: usize,
+    /// Key/value heads (`hq` is a multiple of it).
     pub hkv: usize,
+    /// Key/value capacity: the extent of the key axis, of which only the live prefix is read.
     pub cap: usize,
     /// The query and key width (a split key's per-head part and shared part together).
     pub dk: usize,
+    /// The value width.
     pub dv: usize,
     /// `Some(s)`: the key is `k_head [.., dk - s]` plus `k_shared [B,1,Lk,s]`.
     pub shared_dim: Option<usize>,
+    /// `Some(c)` applies a tanh soft cap of `c` to the scores.
     pub softcap: Option<f32>,
     /// The dtype the attention computes in. The operands and the output stay F32 so every executor binds and
     /// reads them the same way: a narrow fixture narrows each operand (and the mask) with a `Cast` first and
@@ -49,12 +55,17 @@ fn cast_to(b: &Builder, x: Traced, dtype: DType) -> Traced {
 
 /// The built graph and the value ids its operands bind to.
 pub struct LiveAttentionGraph {
+    /// The graph to compile and run.
     pub graph: Graph,
+    /// The query input.
     pub q: ValueId,
     /// The key, or the per-head part of a split key.
     pub k: ValueId,
+    /// The shared part of a split key, when the fixture has one.
     pub k_shared: Option<ValueId>,
+    /// The value input.
     pub v: ValueId,
+    /// The `Slot::Pos` input the live length derives from.
     pub pos: ValueId,
 }
 

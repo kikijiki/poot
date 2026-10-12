@@ -1,5 +1,10 @@
+//! The loader's one error type, [`LoadError`]: every refusal names the file, tensor or config field that
+//! produced it.
+
+/// Why loading a checkpoint failed: reading or mapping a file, parsing its container or config, or a tensor that cannot become a weight.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
+    /// Reading a checkpoint file or directory failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     /// A checkpoint file could not be mapped (not a regular file, or the mapping failed).
@@ -9,70 +14,136 @@ pub enum LoadError {
     /// being loaded (ADR-0103 amendment): the validated bytes are no longer the file's bytes.
     #[error("{0}")]
     SourceChanged(#[from] poot_quant::SourceChanged),
+    /// A JSON document (`config.json`, a safetensors header, an index) did not parse.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// The safetensors container or a tensor's metadata is malformed; the message names the defect.
     #[error("safetensors: {0}")]
     SafeTensors(String),
+    /// A safetensors header names a dtype this loader has no `DType` for.
     #[error("unrecognized checkpoint dtype {name:?}")]
-    UnknownCheckpointDtype { name: String },
+    UnknownCheckpointDtype {
+        /// The dtype string as the file spells it.
+        name: String,
+    },
+    /// A checkpoint dtype is known but has no f32 decoding.
     #[error("checkpoint dtype {name:?} has no f32 decode")]
-    UndecodableCheckpointDtype { name: String },
+    UndecodableCheckpointDtype {
+        /// The dtype string as the file spells it.
+        name: String,
+    },
+    /// An FP8 block-wise linear has two scale tensors that could both apply, so which one is meant is ambiguous.
     #[error("{prefix}: FP8 block-wise scale is ambiguous because both {first} and {second} exist")]
     Fp8AmbiguousScale {
+        /// The linear's tensor-name prefix.
         prefix: String,
+        /// One scale tensor name that exists.
         first: String,
+        /// The other scale tensor name that exists.
         second: String,
     },
+    /// Two tensors in one checkpoint share a name.
     #[error("duplicate safetensors tensor name {name:?} {scope}")]
-    DuplicateTensorName { name: String, scope: String },
+    DuplicateTensorName {
+        /// The repeated tensor name.
+        name: String,
+        /// Where the repeat was found (`"within one header"` or `"across model shards"`).
+        scope: String,
+    },
+    /// `config.json` has no `rope_theta` and the model type has no reference default to fall back to.
     #[error("config has no rope_theta and model_type {model_type:?} has no reference default")]
-    MissingRopeTheta { model_type: String },
+    MissingRopeTheta {
+        /// The config's `model_type`.
+        model_type: String,
+    },
+    /// `config.json` carries a `rope_theta` that is not a positive finite number.
     #[error(
         "config rope_theta {value} for model_type {model_type:?} is not a positive finite number"
     )]
-    InvalidRopeTheta { model_type: String, value: f32 },
+    InvalidRopeTheta {
+        /// The config's `model_type`.
+        model_type: String,
+        /// The rejected `rope_theta`.
+        value: f32,
+    },
+    /// `config.json` has no `eos_token_id` and the model type has no reference default to fall back to.
     #[error("config has no eos_token_id and model_type {model_type:?} has no reference default")]
-    MissingEosTokenId { model_type: String },
+    MissingEosTokenId {
+        /// The config's `model_type`.
+        model_type: String,
+    },
     /// [`crate::gguf::weight_format_of`] has no [`poot_quant::format::WeightFormat`] for this ggml
     /// type: a removed legacy id, or a real ggml scheme with no packed path (ADR-0103 decision 2).
     #[error("gguf tensor {tensor:?}: unsupported ggml type {ggml_type}")]
-    UnsupportedGgufType { tensor: String, ggml_type: u32 },
+    UnsupportedGgufType {
+        /// The GGUF tensor name.
+        tensor: String,
+        /// The ggml type id the file declares.
+        ggml_type: u32,
+    },
     /// [`crate::gguf::read_gguf`] found a quantized tensor of a rank it has no owner shape for
     /// (2 for a plain weight, 3 for stacked experts).
     #[error("gguf tensor {tensor:?}: unsupported rank {rank} for a quantized tensor")]
-    UnsupportedGgufTensorRank { tensor: String, rank: usize },
+    UnsupportedGgufTensorRank {
+        /// The GGUF tensor name.
+        tensor: String,
+        /// The tensor's rank.
+        rank: usize,
+    },
     /// A GGUF tensor's bytes end before its declared shape does.
     #[error("gguf tensor data truncated: {need} bytes needed, {have} present")]
-    GgufTensorTruncated { need: usize, have: usize },
+    GgufTensorTruncated {
+        /// Bytes the declared shape needs.
+        need: usize,
+        /// Bytes the file holds from the tensor's offset.
+        have: usize,
+    },
     /// A planned job's byte range lies outside its checkpoint file (a plan bug: each reader checks its ranges
     /// against the container before planning, so this is the pipeline's own guard).
     #[error("tensor {tensor:?}: bytes {need} needed, file holds {have}")]
     TensorOutsideFile {
+        /// Name of the tensor whose range is outside the file.
         tensor: String,
+        /// Bytes of file the planned range requires.
         need: usize,
+        /// Bytes the file holds.
         have: usize,
     },
+    /// A GGUF quantized tensor's bytes were refused as a packed weight.
     #[error("gguf packed weight: {0}")]
     GgufPackedWeight(#[from] poot_quant::PackedWeightError),
+    /// A GGUF dense tensor's bytes were refused as a dense weight.
     #[error("gguf dense weight: {0}")]
     GgufDenseWeight(#[from] poot_quant::weights::DenseWeightError),
+    /// Two GGUF tensors resolved to one weight-store key.
     #[error("gguf weight store: {0}")]
     GgufDuplicateWeightKey(#[from] poot_quant::weights::DuplicateWeightKey),
     /// A quantized safetensors linear whose tensors do not form the packed weight its scheme
     /// describes (card 545a): a missing or mistyped part, or a shape the format cannot hold.
     #[error("quantized linear tensor {tensor}: {reason}")]
-    QuantizedLinearLayout { tensor: String, reason: String },
+    QuantizedLinearLayout {
+        /// The linear's tensor name or prefix.
+        tensor: String,
+        /// What is missing, mistyped or mis-shaped.
+        reason: String,
+    },
     /// A `QuantScheme` config field (from the checkpoint's `quantization_config`, not any one
     /// tensor) fails its own precondition (card 545b): `field` names the config
     /// key, `value` the rejected value it carried.
     #[error("quant config {field} = {value}: invalid")]
-    InvalidQuantConfig { field: &'static str, value: usize },
+    InvalidQuantConfig {
+        /// The `quantization_config` key.
+        field: &'static str,
+        /// The rejected value.
+        value: usize,
+    },
     /// A quantized safetensors linear's bytes refused by the packed payload's content checks
     /// (lengths, finiteness, group-index range).
     #[error("quantized linear {linear}: {source}")]
     QuantizedLinearPayload {
         /// The packed weight's key (`{prefix}.weight`); `source` names the offending role.
         linear: String,
+        /// The packed payload's content-check refusal.
         #[source]
         source: poot_quant::PackedWeightError,
     },

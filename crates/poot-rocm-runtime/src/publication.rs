@@ -94,7 +94,10 @@ pub enum QueuePublicationContract {
     /// The device ring is reached through a link with proven coherent ordering.
     CoherentDeviceMemory,
     /// The device ring is reached over PCIe and uses the selected host fence.
-    PcieDeviceMemory { fence: DeviceStoreFence },
+    PcieDeviceMemory {
+        /// The host fence that orders stores into the device ring before the doorbell.
+        fence: DeviceStoreFence,
+    },
 }
 
 /// Typed failure to establish safe AQL publication ordering.
@@ -105,8 +108,11 @@ pub enum QueuePublicationError {
         "unknown AQL queue publication facts: ring={ring_memory:?}, link={host_link:?}, host={host_target}"
     )]
     Unknown {
+        /// The ring's memory placement, when it was reported.
         ring_memory: Option<QueueRingMemory>,
+        /// The host-to-device link kind, when it was reported.
         host_link: Option<QueueHostLink>,
+        /// The host the process runs on, which selects the candidate fence.
         host_target: QueueHostTarget,
     },
     /// The host target has no proven fence for this device-ring/link combination.
@@ -114,8 +120,11 @@ pub enum QueuePublicationError {
         "unsupported AQL queue publication ordering: ring={ring_memory:?}, link={host_link:?}, host={host_target}"
     )]
     UnsupportedOrdering {
+        /// The ring's memory placement.
         ring_memory: QueueRingMemory,
+        /// The host-to-device link kind.
         host_link: QueueHostLink,
+        /// The host the process runs on, which has no proven fence for this combination.
         host_target: QueueHostTarget,
     },
 }

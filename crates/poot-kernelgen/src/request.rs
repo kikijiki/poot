@@ -68,7 +68,9 @@ fn product(shape: &[usize]) -> u64 {
 /// takes between its data inputs and its output (param order `[data inputs.., meta, out]`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Launch {
+    /// Total threads `[x, y, z]`; a caller divides by the body's workgroup size to get dispatch counts.
     pub grid: [u32; 3],
+    /// Contents of the read-only `u32` metadata buffer, or `None` when the body takes none.
     pub meta: Option<Vec<u32>>,
 }
 
@@ -85,7 +87,9 @@ impl Launch {
 /// What [`generate`] returns: the kernel body and the launch that shapes it.
 #[derive(Clone, Debug)]
 pub struct Generated {
+    /// The kernel body.
     pub body: Body,
+    /// The launch that shapes it.
     pub launch: Launch,
 }
 
@@ -95,11 +99,14 @@ pub struct Generated {
 /// batches into submits by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SerialWork {
+    /// Invocations launched.
     pub threads: u64,
+    /// Dependent steps each invocation runs (a contraction's `K` loop).
     pub steps_per_thread: u64,
 }
 
 impl SerialWork {
+    /// `threads * steps_per_thread`, saturating: the conservative cost of one dispatch.
     pub fn total(self) -> u64 {
         self.threads.saturating_mul(self.steps_per_thread)
     }
@@ -121,7 +128,9 @@ pub struct KernelRequirements {
 /// One matrix-fragment shape and operand dtype a body uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FragmentUse {
+    /// The operand dtype of the fragment.
     pub dtype: WmmaDtype,
+    /// The fragment's matrix shape.
     pub shape: WmmaShape,
 }
 
@@ -133,6 +142,7 @@ pub struct BodyUse {
     /// arrays are laid out back to back), and the sum saturates, so an overflow reads as "too large" and
     /// is refused, never wrapped.
     pub lds_bytes: u64,
+    /// The workgroup size `[x, y, z]` the body declares.
     pub workgroup: [u32; 3],
     /// Every distinct matrix fragment, in first-use order.
     pub fragments: Vec<FragmentUse>,
@@ -142,7 +152,9 @@ pub struct BodyUse {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("workgroup-local array {array} has element type {elem:?}, which has no static byte width")]
 pub struct UnmeasurableLds {
+    /// Index of the workgroup-local array in the body's declarations.
     pub array: usize,
+    /// The array's element type.
     pub elem: Ty,
 }
 
@@ -206,8 +218,11 @@ pub fn fold_groups(total: usize, max_x: u32) -> (usize, usize) {
 /// device); the body's `x_groups` and the launch grid both follow from it here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fold {
+    /// Output elements the kernel computes, one thread each.
     pub numel: usize,
+    /// Whether the kernel folds onto a 2-D grid; decided by the planner from the device's grid cap.
     pub two_d: bool,
+    /// Threads per workgroup.
     pub width: usize,
 }
 
@@ -241,24 +256,36 @@ impl Fold {
 /// A shape read through a physical [`Layout`] (a strided view, or the row-major default).
 #[derive(Clone, Debug)]
 pub struct ViewOperand {
+    /// The logical shape read.
     pub shape: Vec<usize>,
+    /// The physical layout the shape is read through (strides and offset).
     pub layout: Layout,
 }
 
 /// One generation request. See the module docs.
 #[derive(Clone, Debug)]
 pub enum KernelRequest {
+    /// A one- or two-operand per-element kernel, a scalar-literal kernel or a dtype cast.
     Elementwise(ElementwiseSpec),
+    /// A fused pointwise region over leaves.
     Pointwise(PointwiseSpec),
+    /// A row-wise fused region or a last-axis reduction.
     Row(RowSpec),
+    /// A matmul or GEMV in one of its schedules.
     Contraction(ContractionSpec),
+    /// The online-softmax attention generator, in its streaming or split-KV stage-one schedule.
     Attention(AttentionSpec),
     /// The combine stage of a split-KV attention ([`AttentionSchedule::SplitKv`]).
     AttentionCombine(AttentionCombineSpec),
+    /// A streaming recurrence over the sequence axis (delta rule or SSD).
     Scan(ScanSpec),
+    /// A pure index-mapping copy: transpose, slice, broadcast, reshape, gather, concat, update, scatter.
     Movement(MovementSpec),
+    /// A packed-weight kernel that is not a contraction.
     Packed(PackedRequest),
+    /// Rotary position embedding over the leading `rot` channels of the head dim.
     Rope(RopeSpec),
+    /// Batched argtop-k index extraction.
     TopK(TopKSpec),
 }
 
@@ -353,10 +380,15 @@ impl KernelRequest {
 /// A unary kernel's operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {
+    /// A kernel-ir unary operation.
     Basic(UnOp),
+    /// Reciprocal `1 / x`.
     Recip,
+    /// A kernel-ir math intrinsic.
     Math(MathOp),
+    /// Hyperbolic tangent.
     Tanh,
+    /// Error function.
     Erf,
     /// Leading-zero count of an I32 word.
     ClzI32,
@@ -365,8 +397,11 @@ pub enum UnaryOp {
 /// A binary kernel's operation over exact I32 storage with a literal operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum I32Binary {
+    /// Unsigned `>=` over the I32 words, writing I32 0 or 1.
     GeU,
+    /// Unsigned remainder over the I32 words.
     RemU,
+    /// A kernel-ir binary operation, in I32 arithmetic.
     Basic(BinOp),
 }
 
@@ -375,70 +410,104 @@ pub enum I32Binary {
 pub enum ValueBinary {
     /// The element type the operation runs in (`Ty::I32` for an exact-I32 value).
     Basic(BinOp, Ty),
+    /// Unsigned `>=` over the I32 words, writing I32 0 or 1.
     GeU,
+    /// Unsigned remainder over the I32 words.
     RemU,
 }
 
 /// A dtype cast between two storage types.
 #[derive(Clone, Debug)]
 pub enum CastSpec {
+    /// `f32` to `bf16`, one thread per element.
     F32ToBf16 {
+        /// Elements converted.
         numel: usize,
     },
+    /// `f32` to IEEE half, one thread per element.
     F32ToF16 {
+        /// Elements converted.
         numel: usize,
     },
+    /// IEEE half to `f32`, one thread per element.
     F16ToF32 {
+        /// Elements converted.
         numel: usize,
     },
+    /// `bf16` to `f32`, one thread per element.
     Bf16ToF32 {
+        /// Elements converted.
         numel: usize,
     },
+    /// `i32` to `f32`, one thread per element.
     I32ToF32 {
+        /// Elements converted.
         numel: usize,
     },
     /// Pack f32 rows into E4M3FN words; one thread per packed output word.
     F32ToE4m3 {
+        /// Logical shape of the `f32` input and the packed output (row-major, the last axis is the row).
         out_shape: Vec<usize>,
+        /// Length of a row: the last-axis extent, packed to a whole number of words per row.
         row_len: usize,
     },
     /// Widen packed E4M3FN rows to f32; one thread per output element.
     E4m3ToF32 {
+        /// Length of an output row (the last-axis extent); the packed input rows are padded to whole words.
         row_len: usize,
+        /// Output elements, one thread each.
         numel: usize,
     },
 }
 
+/// A per-element kernel over one or two operands.
 #[derive(Clone, Debug)]
 pub enum ElementwiseSpec {
     /// One operand, optionally read through a view of `view.shape` (the output shape).
     Unary {
+        /// The operation.
         op: UnaryOp,
+        /// The element type the operation runs in.
         dt: Ty,
+        /// A view the operand is read through, or `None` for a dense row-major operand.
         view: Option<ViewOperand>,
+        /// How the launch folds past the device's x-grid cap.
         fold: Fold,
     },
     /// `value op literal` in float arithmetic; `lit_bits` is the literal's `f32` bits.
     ScalarFloat {
+        /// The binary operation.
         op: BinOp,
+        /// The element type the operation runs in.
         dt: Ty,
+        /// The literal operand's `f32` bit pattern.
         lit_bits: u32,
+        /// How the launch folds past the device's x-grid cap.
         fold: Fold,
     },
     /// `value op literal` over exact I32 storage.
     ScalarI32 {
+        /// The operation.
         op: I32Binary,
+        /// The literal operand.
         lit: i32,
+        /// How the launch folds past the device's x-grid cap.
         fold: Fold,
     },
     /// `a op b` with broadcasting, each operand read through its layout.
     Binary {
+        /// The operation and its element type.
         op: ValueBinary,
+        /// The broadcast output shape.
         out_shape: Vec<usize>,
+        /// The left operand and the layout it is read through.
         a: ViewOperand,
+        /// The right operand and the layout it is read through.
         b: ViewOperand,
+        /// How the launch folds past the device's x-grid cap.
         fold: Fold,
     },
+    /// A dtype cast between two storage types.
     Cast(CastSpec),
 }
 
@@ -446,39 +515,65 @@ pub enum ElementwiseSpec {
 #[derive(Clone, Debug)]
 pub enum PointwiseForm {
     /// Float arithmetic (`fused_views`) on the elementwise 2-D fold, one thread per output element.
-    Float { fold: Fold },
+    Float {
+        /// How the launch folds past the device's x-grid cap.
+        fold: Fold,
+    },
     /// A single exact-I32 step on the elementwise 2-D fold (the `Select` equation).
-    ExactI32 { fold: Fold },
+    ExactI32 {
+        /// How the launch folds past the device's x-grid cap.
+        fold: Fold,
+    },
     /// An exact-I32 region; `pack` (empty for none) lists the lanes a row-folded pack writes, one thread
     /// per packed word.
-    ExactI32Packed { pack: Vec<FusedInput> },
+    ExactI32Packed {
+        /// The lanes one packed word is built from; empty for an unpacked region.
+        pack: Vec<FusedInput>,
+    },
 }
 
+/// A fused pointwise region: its output shape, leaves, steps and the form it computes in.
 #[derive(Clone, Debug)]
 pub struct PointwiseSpec {
+    /// The output's logical shape.
     pub out_shape: Vec<usize>,
+    /// Output elements; a packed region launches one thread per packed word of them.
     pub numel: usize,
+    /// The leaves, each with its shape and the layout it is read through.
     pub leaves: Vec<ViewOperand>,
+    /// The region's steps and which value is written out.
     pub kernel: FusedKernel,
+    /// Which element form the region computes in.
     pub form: PointwiseForm,
 }
 
+/// A row-wise fused region or a last-axis reduction.
 #[derive(Clone, Debug)]
 pub enum RowSpec {
     /// A row-wise fused region: one workgroup of `width` lanes per row.
     Fused {
+        /// The output's logical shape.
         out_shape: Vec<usize>,
+        /// Output elements; the row count is `numel / kernel.n_cols`.
         numel: usize,
+        /// The leaves, each with its shape and the layout it is read through.
         leaves: Vec<ViewOperand>,
+        /// The region's steps and which value is written out.
         kernel: RowKernel,
+        /// Lanes per workgroup, one workgroup per row.
         width: usize,
     },
     /// A last-axis reduction over `cols`, one thread per output element.
     ReduceLast {
+        /// The element type reduced.
         dt: Ty,
+        /// The reduction operator.
         op: BinOp,
+        /// The last-axis extent reduced per output element.
         cols: usize,
+        /// The `f32` bit pattern of the reduction's initial value.
         init_bits: u32,
+        /// Output elements, one thread each.
         numel: usize,
     },
 }
@@ -486,39 +581,63 @@ pub enum RowSpec {
 /// The dtype and shapes of a batched matmul.
 #[derive(Clone, Debug)]
 pub struct MatmulShapes {
+    /// The output's shape: batch dimensions then `[M, N]`.
     pub out_shape: Vec<usize>,
+    /// The left operand's shape: batch dimensions then `[M, K]`.
     pub a_shape: Vec<usize>,
+    /// The right operand's shape: batch dimensions then `[K, N]`, or `[N, K]` for a checkpoint-order weight.
     pub b_shape: Vec<usize>,
 }
 
+/// A contraction request: which schedule and which operand storage computes one matmul or GEMV.
 #[derive(Clone, Debug)]
 pub enum ContractionSpec {
     /// The one-thread-per-output reference kernel, with `epilogue` applied to each output before the store.
     Serial {
+        /// The element type of the operands and result.
         dt: Ty,
+        /// Pointwise steps applied to each output before the store, if any.
         epilogue: Option<Epilogue>,
+        /// The matmul's shapes.
         shapes: MatmulShapes,
+        /// How the launch folds past the device's x-grid cap.
         fold: Fold,
     },
     /// The one-thread-per-output kernel over a weight in checkpoint `[N, K]` order (`shapes.b_shape` is `[N, K]`):
     /// `DenseContraction` where the tiled GEMM is not taken. The activation and output are f32; `weight` is the
     /// weight's planned storage, `BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`.
     DenseSerial {
+        /// The weight's planned storage: `BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`.
         weight: BufferStorage,
+        /// The matmul's shapes; `b_shape` is `[N, K]`.
         shapes: MatmulShapes,
+        /// How the launch folds past the device's x-grid cap.
         fold: Fold,
     },
     /// Matrix-core fragments (WMMA m16n16k16): one 256-thread block per 16x16 output tile per batch.
-    TensorCore { dt: Ty, shapes: MatmulShapes },
+    TensorCore {
+        /// The element type of the fragments.
+        dt: Ty,
+        /// The matmul's shapes; the output extents are multiples of 16.
+        shapes: MatmulShapes,
+    },
     /// RADV cooperative matrix: one 32-invocation subgroup per 16x16 output tile.
-    Coopmat { shapes: MatmulShapes },
+    Coopmat {
+        /// The matmul's shapes; the output extents are multiples of 16.
+        shapes: MatmulShapes,
+    },
     /// One range of a watchdog-split decode GEMV: `elems` workgroups of `width` lanes starting at output
     /// element `offset`.
     GemvChunk {
+        /// Reduction length (the `[K, N]` weight's rows).
         k: usize,
+        /// Output columns of the `[K, N]` weight.
         n: usize,
+        /// Lanes per workgroup.
         width: usize,
+        /// Workgroups in this range, one per output element.
         elems: usize,
+        /// First output element of the range.
         offset: usize,
     },
     /// The `DenseContraction` decode GEMV (`M == 1`): `schedule` (a [`Schedule::Gemv`]) over an `[N, K]` weight
@@ -558,40 +677,64 @@ pub enum ContractionSpec {
     /// };
     /// ```
     DenseGemv {
+        /// The weight's planned storage: `BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`.
         weight: BufferStorage,
+        /// The Gemv loop nest (a [`Schedule::Gemv`]).
         schedule: Schedule,
+        /// The reduction length, the weight row length.
         k: usize,
+        /// Output columns, the weight's rows.
         n: usize,
+        /// Pointwise steps applied to each column's sum before the store, if any.
         epilogue: Option<Epilogue>,
     },
     /// Decode attention `scores @ V`: an LDS-parallel reduction over `cap`, `width` lanes per output.
     AttnScoresVGemv {
+        /// Reduction length: the cache capacity.
         cap: usize,
+        /// Output width per row.
         d: usize,
+        /// Lanes per output, reducing over `cap` through workgroup memory.
         width: usize,
+        /// Outputs, one workgroup each.
         numel: usize,
     },
     /// The synthesized tiled GEMM: `groups` workgroups of `tile * tile` lanes starting at tile `offset`, with
     /// `epilogue` (f32) applied to each output element's sum before its store.
     TiledRegion {
+        /// Activation rows.
         m: usize,
+        /// Reduction length.
         k: usize,
+        /// Output columns.
         n: usize,
+        /// The tile edge; a workgroup is `tile * tile` lanes.
         tile: usize,
+        /// First tile of this range, in the grid's tile order.
         offset: usize,
+        /// Workgroups in this range.
         groups: usize,
+        /// Pointwise steps applied to each output before the store, if any.
         epilogue: Option<Epilogue>,
     },
     /// [`ContractionSpec::TiledRegion`] reading its weight in checkpoint `[N, K]` order: the `DenseContraction`
     /// prefill GEMM. `weight` as in [`ContractionSpec::DenseSerial`].
     DenseTiled {
+        /// Activation rows.
         m: usize,
+        /// Reduction length.
         k: usize,
+        /// Output columns, the weight's rows.
         n: usize,
+        /// The tile edge; a workgroup is `tile * tile` lanes.
         tile: usize,
+        /// First tile of this range, in the grid's tile order.
         offset: usize,
+        /// Workgroups in this range.
         groups: usize,
+        /// The weight's planned storage: `BufferStorage::f32()`, `f16_packed()` or `bf16_packed()`.
         weight: BufferStorage,
+        /// Pointwise steps applied to each output before the store, if any.
         epilogue: Option<Epilogue>,
     },
     /// A contraction over a packed weight: the descriptor-driven decode of `format` served to the planner's
@@ -627,12 +770,17 @@ impl ContractionSpec {
 /// and `meta` ride in the request.
 #[derive(Clone, Debug)]
 pub struct PackedContraction {
+    /// The weight's format, whose descriptor drives the decode.
     pub format: WeightFormat,
     /// How output rows meet weight rows: one weight (block-diagonal or dense), or an expert-stacked table.
     pub rows: PackedRows,
+    /// The loop nest the decode is served to.
     pub schedule: Schedule,
+    /// Pointwise steps applied to each column's sum before the store, if any.
     pub epilogue: Option<Epilogue>,
+    /// Total threads `[x, y, z]` the planner chose for the launch.
     pub grid: [u32; 3],
+    /// The metadata buffer's contents (`K`, `N` and further shape facts, by schedule).
     pub meta: Vec<u32>,
 }
 
@@ -666,14 +814,18 @@ impl PackedRows {
 /// launch (the grid folded and checked against the device's limits) and the metadata `[K, N, E, M, x_groups]`.
 #[derive(Clone, Debug)]
 pub struct IndexedContraction {
+    /// [`Schedule::Gemv`] for decode or [`Schedule::Tiled`] for prefill.
     pub schedule: Schedule,
     /// How each expert slab of the weight is stored: [`WeightLayout::Kn`] `[K, N]` or [`WeightLayout::Nk`] `[N, K]`.
     pub layout: WeightLayout,
     /// The weight buffer's planned storage: `BufferStorage::f32()` or `BufferStorage::bf16_packed()`. Part of the
     /// request, so a body built for one storage is never served for another.
     pub weight: BufferStorage,
+    /// Pointwise steps applied to each output element's sum before the store, if any.
     pub epilogue: Option<Epilogue>,
+    /// Total threads `[x, y, z]` the planner chose for the launch.
     pub grid: [u32; 3],
+    /// The metadata buffer's contents: `[K, N, E, M, x_groups]`.
     pub meta: Vec<u32>,
 }
 
@@ -681,25 +833,39 @@ pub struct IndexedContraction {
 /// planner validates and chooses the launch, so it rides in the request.
 #[derive(Clone, Debug)]
 pub struct PackedRequest {
+    /// Name the generated body carries.
     pub name: &'static str,
+    /// Which packed kernel to generate.
     pub spec: PackedKernelSpec,
+    /// Total threads `[x, y, z]` the planner chose for the launch.
     pub grid: [u32; 3],
+    /// The metadata buffer's contents.
     pub meta: Vec<u32>,
 }
 
+/// Rotary position embedding in half-split (GPT-NeoX) form, over the leading `rot` channels of the head dim.
 #[derive(Clone, Debug)]
 pub struct RopeSpec {
+    /// The storage element type of `x`, `cos`, `sin` and the output.
     pub dt: Ty,
+    /// The shape of `x`, which is also the output's.
     pub x_shape: Vec<usize>,
+    /// The shape of `cos` and `sin`, broadcast into `x` over the leading axes.
     pub cos_shape: Vec<usize>,
+    /// Channels of the head dim that are rotated; the rest pass through.
     pub rot: usize,
+    /// Output elements, one thread each.
     pub numel: usize,
 }
 
+/// Batched argtop-k index extraction: `rank [rows, e]` to `out [rows, k]`.
 #[derive(Clone, Debug)]
 pub struct TopKSpec {
+    /// Entries per row of `rank`.
     pub e: usize,
+    /// Indices extracted per row.
     pub k: usize,
+    /// Output elements (`rows * k`), one thread each.
     pub numel: usize,
 }
 
@@ -1326,7 +1492,9 @@ struct SequentialBinary {
 /// shape it would read past.
 #[derive(Clone, Debug)]
 pub struct SequentialGenerated {
+    /// The kernel body.
     pub body: Body,
+    /// Loop iterations one invocation runs.
     pub iterations: u64,
     /// One entry per body parameter, in binding order.
     pub bindings: Box<[SequentialBinding]>,
@@ -1336,8 +1504,11 @@ pub struct SequentialGenerated {
 /// leading elements the loop touches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SequentialBinding {
+    /// Logical dimensions of the buffer.
     pub dims: Vec<u64>,
+    /// Whether the loop writes the buffer.
     pub writes: bool,
+    /// Leading elements the loop reads or writes.
     pub accessed: u64,
 }
 

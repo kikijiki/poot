@@ -44,8 +44,11 @@ const STAGE: &str = "pool_experts";
 /// resident slot that stands in for it, and that slot's type, `[P, ..]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PooledWeight {
+    /// The replaced const's name, the key the weight map finds the stored experts by.
     pub name: String,
+    /// The resident slot that stands in for the const.
     pub slot: SlotKey,
+    /// The slot's tensor type, `[P, ..]`.
     pub pool: TensorType,
 }
 
@@ -69,6 +72,7 @@ pub struct PoolSite {
 /// What the pool pass did to a graph: its sites in cut order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolSpec {
+    /// The sites, in the order the pass cut them.
     pub sites: Vec<PoolSite>,
 }
 
@@ -90,13 +94,21 @@ pub enum PoolError {
         "the routed selection of layer {layer:?} can need {demand} experts in one step, over the pool's {slots} rows"
     )]
     CapacityBelowStepDemand {
+        /// The decoder layer of the site, when the tracer tagged one.
         layer: Option<usize>,
+        /// Distinct experts one step can need: the site's id count.
         demand: usize,
+        /// Rows the pool holds.
         slots: usize,
     },
     /// A pool as large as the expert table pages nothing: serve the table resident.
     #[error("a pool of {slots} rows is not smaller than the {experts} experts it would page")]
-    CapacityNotBelowExperts { slots: usize, experts: usize },
+    CapacityNotBelowExperts {
+        /// Rows the pool holds.
+        slots: usize,
+        /// Experts in each table.
+        experts: usize,
+    },
     /// The graph has no routed selection, so there is nothing to page.
     #[error("the graph has no routed expert selection to pool")]
     NoRoutedExperts,
@@ -104,17 +116,33 @@ pub enum PoolError {
     #[error(
         "equation {eqn}: the expert table behind {value} is not a named const the pool can page"
     )]
-    TableNotPageable { eqn: usize, value: ValueId },
+    TableNotPageable {
+        /// Index of the contraction's equation.
+        eqn: usize,
+        /// The table operand that cannot be paged.
+        value: ValueId,
+    },
     /// A table is read by something other than its site's contractions, so shrinking it would change
     /// that reader.
     #[error("expert table {name} is also read outside its routed contractions")]
-    TableReadOutsideSite { name: String },
+    TableReadOutsideSite {
+        /// Name of the table.
+        name: String,
+    },
     /// One table is indexed by two different selections.
     #[error("expert table {name} is indexed by more than one routed selection")]
-    TableSharedAcrossSites { name: String },
+    TableSharedAcrossSites {
+        /// Name of the table.
+        name: String,
+    },
     /// The tables of one selection do not agree on how many experts they hold.
     #[error("the tables of one routed selection hold {first} and {second} experts")]
-    ExpertCountMismatch { first: usize, second: usize },
+    ExpertCountMismatch {
+        /// Expert count of the site's first table.
+        first: usize,
+        /// Expert count of the table that disagrees.
+        second: usize,
+    },
     /// The index guard of a site's translated rows cannot be emitted: the pool's row count is past the
     /// `i32` words of a row id, or the translated rows are not an I32 selector.
     #[error(transparent)]
@@ -122,8 +150,10 @@ pub enum PoolError {
     /// An equation of a site's row guard does not type-check over the translated rows.
     #[error("an equation of a site's row guard does not type-check: {0}")]
     RowGuardShape(ShapeError),
+    /// Growing the graph for the pooled tables and row guard would pass the compile's limits.
     #[error(transparent)]
     Expansion(Box<ExpansionError>),
+    /// The graph editor refused a rewrite the pass issued.
     #[error(transparent)]
     Edit(Box<poot_graph_ir::EditError>),
 }

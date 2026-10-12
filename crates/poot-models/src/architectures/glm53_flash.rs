@@ -43,6 +43,7 @@ mod tests;
 
 pub use config::{Ffn, Glm53Config, LayerKind, Mixer};
 
+/// GLM-5.3-Flash's [`FamilyKey`].
 pub const FAMILY: FamilyKey = FamilyKey::new("glm53_flash");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
@@ -53,6 +54,8 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     variants: &[("finetune", finetune_fixture)],
 };
 
+/// The built GLM-5.3-Flash model: config, name-resolved weights, the layer tower and the routed
+/// experts. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct Glm53Flash {
     params: Glm53Config,

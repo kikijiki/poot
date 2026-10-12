@@ -33,6 +33,7 @@ pub struct Qwen25VlApng<'a> {
 }
 
 impl Qwen25VlApng<'_> {
+    /// The clip's metadata in the form the frame sampler takes: duration, average frame rate, frame count and per-frame timestamps.
     pub fn metadata(&self) -> Qwen25VlVideoMetadata<'_> {
         Qwen25VlVideoMetadata {
             duration_seconds: self.duration_seconds,
@@ -42,10 +43,12 @@ impl Qwen25VlApng<'_> {
         }
     }
 
+    /// Canvas width in pixels.
     pub const fn width(&self) -> usize {
         self.width
     }
 
+    /// Canvas height in pixels.
     pub const fn height(&self) -> usize {
         self.height
     }
@@ -151,77 +154,154 @@ impl<'a> Qwen25VlApng<'a> {
     }
 }
 
+/// Why an APNG could not be probed or one of its frames could not be produced.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Qwen25VlApngError {
+    /// The encoded file is larger than the byte cap.
     #[error("Qwen2.5-VL APNG has {actual} encoded bytes, exceeding the {limit}-byte cap")]
-    TooManyEncodedBytes { actual: usize, limit: usize },
+    TooManyEncodedBytes {
+        /// Encoded size in bytes.
+        actual: usize,
+        /// The cap in bytes.
+        limit: usize,
+    },
+    /// The PNG has no `acTL` animation control chunk.
     #[error("Qwen2.5-VL PNG is static; an acTL animation control chunk is required")]
     StaticPng,
+    /// The animation iterator yielded no frame.
     #[error("Qwen2.5-VL APNG animation iterator returned no frames")]
     EmptyAnimation,
+    /// The running frame count overflowed `usize`.
     #[error("Qwen2.5-VL APNG frame count overflows usize")]
     FrameCountOverflow,
+    /// The animation has more frames than the video frame cap.
     #[error("Qwen2.5-VL APNG decoded {actual} frames, exceeding the {limit}-frame cap")]
-    TooManyFrames { actual: usize, limit: usize },
+    TooManyFrames {
+        /// Frames decoded when the cap was crossed.
+        actual: usize,
+        /// The cap, `MAX_VIDEO_FRAMES`.
+        limit: usize,
+    },
+    /// `frames * canvas pixels` overflowed `usize`.
     #[error("Qwen2.5-VL APNG decoded-pixel count overflows usize")]
     DecodedPixelCountOverflow,
+    /// All frames together decode to more pixels than the image pixel cap.
     #[error(
         "Qwen2.5-VL APNG decoded {pixels} canvas-frame pixels, exceeding the {limit}-pixel cap"
     )]
-    TooManyDecodedPixels { pixels: usize, limit: usize },
+    TooManyDecodedPixels {
+        /// Canvas pixels summed over the frames decoded so far.
+        pixels: usize,
+        /// The cap, `MAX_IMAGE_PIXELS`.
+        limit: usize,
+    },
+    /// A frame's RGB8 conversion or dimension check failed.
     #[error(transparent)]
     Image(#[from] Qwen25VlImageDecodeError),
+    /// The PNG decoder could not be initialized.
     #[error("initialize Qwen2.5-VL APNG {stage}: {message}")]
     Decoder {
+        /// The initialization step that failed.
         stage: &'static str,
+        /// The decoder's error, rendered.
         message: String,
     },
+    /// A second pass over the file decoded a different canvas size than the probe saw.
     #[error(
         "Qwen2.5-VL APNG source dimensions changed from metadata {metadata_height}x{metadata_width} to decoder {decoded_height}x{decoded_width}"
     )]
     SourceDimensionMismatch {
+        /// Canvas height the probe recorded.
         metadata_height: usize,
+        /// Canvas width the probe recorded.
         metadata_width: usize,
+        /// Canvas height the new decoder reports.
         decoded_height: usize,
+        /// Canvas width the new decoder reports.
         decoded_width: usize,
     },
+    /// The decoder failed on a frame.
     #[error("decode Qwen2.5-VL APNG frame {frame_index}: {message}")]
-    FrameDecode { frame_index: usize, message: String },
+    FrameDecode {
+        /// Index of the frame in the animation.
+        frame_index: usize,
+        /// The decoder's error, rendered.
+        message: String,
+    },
+    /// A frame's size differs from the first frame's canvas.
     #[error(
         "Qwen2.5-VL APNG frame {frame_index} is {actual_height}x{actual_width}; canvas is {expected_height}x{expected_width}"
     )]
     FrameDimensionMismatch {
+        /// Index of the frame in the animation.
         frame_index: usize,
+        /// Canvas height.
         expected_height: usize,
+        /// Canvas width.
         expected_width: usize,
+        /// The frame's height.
         actual_height: usize,
+        /// The frame's width.
         actual_width: usize,
     },
+    /// A decoded frame's RGBA buffer is not `height * width * 4` bytes.
     #[error(
         "Qwen2.5-VL APNG frame {frame_index} has {actual} RGBA bytes; dimensions require {expected}"
     )]
     FramePixelDataLen {
+        /// Index of the frame in the animation.
         frame_index: usize,
+        /// Bytes the frame's dimensions require.
         expected: usize,
+        /// Bytes the buffer holds.
         actual: usize,
     },
+    /// A frame's delay numerator is zero, so timestamps would not increase.
     #[error("Qwen2.5-VL APNG frame {frame_index} has a zero delay numerator")]
-    ZeroFrameDelay { frame_index: usize },
+    ZeroFrameDelay {
+        /// Index of the frame in the animation.
+        frame_index: usize,
+    },
+    /// A frame's delay, a timestamp or the running duration is not a finite positive number.
     #[error("Qwen2.5-VL APNG timing arithmetic failed at frame {frame_index}")]
-    TimingArithmetic { frame_index: usize },
+    TimingArithmetic {
+        /// Index of the frame in the animation.
+        frame_index: usize,
+    },
+    /// The average frame rate `frame_count / duration` is not finite and positive.
     #[error("Qwen2.5-VL APNG average source-FPS arithmetic failed")]
     SourceFramesPerSecondArithmetic,
+    /// Reserving memory failed.
     #[error("Qwen2.5-VL APNG could not reserve memory for {stage}")]
-    Allocation { stage: &'static str },
+    Allocation {
+        /// The buffer that failed to allocate.
+        stage: &'static str,
+    },
+    /// A requested frame index is at or past the frame count.
     #[error("Qwen2.5-VL APNG frame index {requested} is outside {frame_count} frames")]
     FrameIndexOutOfRange {
+        /// The index asked for.
         requested: usize,
+        /// The animation's frame count.
         frame_count: usize,
     },
+    /// A requested index is not later than the previous request; the source is one-pass.
     #[error("Qwen2.5-VL APNG frame index {requested} is not later than prior request {previous}")]
-    FrameIndexNotIncreasing { previous: usize, requested: usize },
+    FrameIndexNotIncreasing {
+        /// The previous request's index.
+        previous: usize,
+        /// The index asked for.
+        requested: usize,
+    },
+    /// The animation ended before the requested frame.
     #[error("Qwen2.5-VL APNG ended after {decoded} frames before requested frame {requested}")]
-    UnexpectedFrameEnd { requested: usize, decoded: usize },
+    UnexpectedFrameEnd {
+        /// The index asked for.
+        requested: usize,
+        /// Frames the decoder produced.
+        decoded: usize,
+    },
+    /// An earlier failure left the one-pass decoder in an unknown position; the source refuses further requests.
     #[error("Qwen2.5-VL APNG frame source is poisoned by an earlier failure")]
     PoisonedFrameSource,
 }
@@ -411,7 +491,9 @@ fn composited_apng_frame_to_rgb8(
 
 /// Caller-owned codec/container boundary used to decode only selected source frames.
 pub trait Qwen25VlDecodedFrameSource {
+    /// What the source fails with.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Decode source frame `frame_index` to RGB8. Callers ask for strictly increasing indices.
     fn decode_frame(&mut self, frame_index: usize) -> Result<Qwen25VlDecodedImage, Self::Error>;
 }

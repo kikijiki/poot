@@ -48,6 +48,7 @@ mod mtp_tests;
 pub struct SeqId(NonZeroU64);
 
 impl SeqId {
+    /// The id as an integer, for logs and wire formats.
     pub fn get(self) -> u64 {
         self.0.get()
     }
@@ -56,10 +57,12 @@ impl SeqId {
 /// A sequence to admit.
 #[derive(Clone, Copy, Debug)]
 pub struct SeqRequest<'a> {
+    /// The prompt's token ids.
     pub prompt: &'a [u32],
     /// The most tokens the caller will commit after the prompt; the blocks for them are reserved at
     /// admission.
     pub max_new: usize,
+    /// The weights the sequence runs under: the base model or one adapter.
     pub adapter: AdapterRef,
 }
 
@@ -67,10 +70,18 @@ pub struct SeqRequest<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
     /// `reused` leading prompt tokens are already resident: prefill resumes at that position.
-    Opened { seq: SeqId, reused: usize },
+    Opened {
+        /// The admitted sequence.
+        seq: SeqId,
+        /// Leading prompt tokens already resident through the prefix cache.
+        reused: usize,
+    },
     /// The pool cannot hold the request (`needed_blocks` more blocks), or every sequence slot is taken
     /// (`needed_blocks` is 0): the caller preempts a sequence or waits.
-    NoRoom { needed_blocks: usize },
+    NoRoom {
+        /// Blocks short; 0 when every sequence slot is taken.
+        needed_blocks: usize,
+    },
 }
 
 /// What one row does this step.
@@ -79,13 +90,22 @@ pub enum RowWork<'a> {
     /// Feed prompt tokens up to position `upto` (exclusive). The driver feeds the largest prepared
     /// piece of the remainder and reports how many tokens it consumed; the row picks only when this
     /// step reaches the end of the prompt.
-    Prefill { upto: usize },
+    Prefill {
+        /// Prompt position to feed up to, exclusive.
+        upto: usize,
+    },
     /// Feed the sequence's last committed token followed by `ahead` (verify-window drafts), and pick
     /// at every fed position: `ahead.len() + 1` tokens, the model's choice after each prefix, by
     /// `pick`. With nothing ahead it is a plain decode step and the row's own sampler picks; under a
     /// draft policy it is a speculative step, and the row returns the accepted drafts and one more
     /// (`1..=k+1` tokens).
-    Decode { ahead: &'a [u32], pick: PickPolicy },
+    Decode {
+        /// Verify-window draft tokens to feed after the last committed token; empty for a plain
+        /// decode.
+        ahead: &'a [u32],
+        /// How each position of the window picks.
+        pick: PickPolicy,
+    },
 }
 
 /// How a verify window picks at each of its positions. Only the greedy argmax is accepted today; a
@@ -94,19 +114,24 @@ pub enum RowWork<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PickPolicy {
+    /// The argmax at every position.
     Greedy,
 }
 
 /// One row of a step: a sequence, its work and the sampler its pick goes through.
 pub struct StepRow<'a> {
+    /// The sequence the row steps.
     pub seq: SeqId,
+    /// What the row does this step.
     pub work: RowWork<'a>,
+    /// The sampler the row's pick goes through.
     pub sampler: &'a mut Sampler,
 }
 
 /// What a row produced.
 #[derive(Debug)]
 pub struct RowResult {
+    /// The sequence the result belongs to.
     pub seq: SeqId,
     /// Prompt tokens a `Prefill` row consumed; zero for a `Decode` row.
     pub consumed: usize,
@@ -123,6 +148,7 @@ pub struct RowResult {
 /// Why a sequence is released.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Release {
+    /// The sequence is done and its state is dropped.
     Finished,
     /// The sequence will be recomputed. One opened with `open_with_embeds` must be reopened with it.
     Preempted,

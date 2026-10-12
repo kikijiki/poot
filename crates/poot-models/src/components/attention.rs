@@ -296,14 +296,18 @@ impl AttentionParams {
         self.value_from_key
     }
 
+    /// The query head count.
     pub fn heads(&self) -> usize {
         self.heads
     }
 
+    /// The key/value head count (equal to `heads` for plain multi-head attention, a divisor of it for
+    /// grouped-query attention).
     pub fn kv_heads(&self) -> usize {
         self.kv_heads
     }
 
+    /// The width of one head, shared by Q, K and V.
     pub fn head_dim(&self) -> usize {
         self.head_dim
     }
@@ -312,10 +316,13 @@ impl AttentionParams {
 /// Three separate Q/K/V projections with their optional biases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeparateQkv {
+    /// The query projection `[heads * head_dim, width]` (doubled rows when the layer has an output gate).
     pub q: Weight,
+    /// The key projection `[kv_heads * head_dim, width]`.
     pub k: Weight,
     /// `None` when the parameters read V from the K projection.
     pub v: Option<Weight>,
+    /// The Q, K and V biases in that order, when the parameters have a QKV bias.
     pub bias: Option<[Weight; 3]>,
 }
 
@@ -323,8 +330,15 @@ pub struct SeparateQkv {
 /// per-head-interleaved weight (see [`AttentionParams::with_fused_qkv`]) with its optional bias.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QkvWeights {
+    /// Three separate projections.
     Separate(Box<SeparateQkv>),
-    Fused { qkv: Weight, bias: Option<Weight> },
+    /// The fused per-head-interleaved projection.
+    Fused {
+        /// The fused weight `[3 * heads * head_dim, width]`.
+        qkv: Weight,
+        /// The fused bias `[3 * heads * head_dim]`, when the parameters have a QKV bias.
+        bias: Option<Weight>,
+    },
 }
 
 /// A layer's projections: Q `[heads * head_dim, width]`, K/V `[kv_heads * head_dim, width]` (or the
@@ -332,15 +346,21 @@ pub enum QkvWeights {
 /// parameters have one, and the Q/K norm scales when the parameters normalize.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttentionWeights {
+    /// The Q/K/V projections.
     pub qkv: QkvWeights,
+    /// The output projection `[width, heads * head_dim]`.
     pub o: Weight,
+    /// The output projection's bias `[width]`, when the parameters have one.
     pub o_bias: Option<Weight>,
+    /// The Q and K norm scales in that order, when the parameters normalize Q and K.
     pub qk_norm: Option<[Weight; 2]>,
     /// The per-head sink logits `[heads]`, when the parameters have sinks.
     pub sinks: Option<Weight>,
 }
 
 impl AttentionWeights {
+    /// Resolves the layer's attention tensors from `map` and checks each shape against `p` and the model
+    /// `width`; a missing or mis-shaped tensor is a typed [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,

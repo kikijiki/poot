@@ -75,6 +75,7 @@ pub enum AllocationSite {
 /// The total a refused request would have reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attempted {
+    /// The total `used + requested` the request would have reached, in the resource's own unit.
     Total(u64),
     /// `used + requested` does not fit `u64`: reported as such, never saturated.
     Overflow,
@@ -96,11 +97,17 @@ impl fmt::Display for Attempted {
      (attempted {attempted}) at {site:?}"
 )]
 pub struct TraceBudgetExceeded {
+    /// The limit that refused the request.
     pub resource: BudgetResource,
+    /// The configured cap for `resource`, in its own unit (tokens, values, equations or bytes).
     pub limit: u64,
+    /// What the meter already held for `resource` when the request arrived.
     pub used: u64,
+    /// The amount the refused request asked for on top of `used`.
     pub requested: u64,
+    /// `used + requested`, or [`Attempted::Overflow`] when that sum does not fit `u64`.
     pub attempted: Attempted,
+    /// The allocation site that made the request.
     pub site: AllocationSite,
 }
 
@@ -194,9 +201,13 @@ impl Charge {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Charged {
+    /// Values (input binders and equation results) currently charged.
     pub values: u64,
+    /// Equations currently charged.
     pub equations: u64,
+    /// Bytes of inline scalar literals currently charged.
     pub literal_bytes: u64,
+    /// Bytes of owned construction storage currently charged.
     pub owned_bytes: u64,
 }
 
@@ -204,10 +215,15 @@ pub struct Charged {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reservation {
+    /// The allocation site the reservation was made for.
     pub site: AllocationSite,
+    /// Values reserved.
     pub values: u64,
+    /// Equations reserved.
     pub equations: u64,
+    /// Bytes of inline scalar literals reserved.
     pub literal_bytes: u64,
+    /// Bytes of owned construction storage reserved.
     pub owned_bytes: u64,
 }
 
@@ -215,7 +231,9 @@ pub struct Reservation {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LedgerEvent {
+    /// A reservation the meter granted.
     Reserved(Reservation),
+    /// A charge given back to the meter, for example when a staged fragment is dropped.
     Released(Charged),
 }
 

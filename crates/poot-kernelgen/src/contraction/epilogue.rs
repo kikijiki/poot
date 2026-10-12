@@ -40,7 +40,9 @@ pub enum EpilogueInput {
 /// One pointwise step: `step[s] = op(inputs...)`, rounded through the epilogue's dtype.
 #[derive(Clone, Debug)]
 pub struct EpilogueStep {
+    /// The pointwise operation the step computes.
     pub op: FusedScalarOp,
+    /// The operation's operands, in the operation's own argument order.
     pub inputs: Vec<EpilogueInput>,
 }
 
@@ -48,6 +50,7 @@ pub struct EpilogueStep {
 /// pointwise ops do, and how its elements sit in its buffer.
 #[derive(Clone, Debug)]
 pub struct EpilogueLeaf {
+    /// The leaf's shape, right-aligned against the head's output shape (missing leading axes broadcast).
     pub shape: Vec<usize>,
     /// `None` reads the leaf as the epilogue's `dt` elements; `Some(storage)` reads a narrow packed leaf and
     /// widens it to f32, which needs an f32 epilogue.
@@ -64,10 +67,15 @@ pub struct EpilogueLeaf {
 /// which the region runs over; `leaves[j]` is extra input `j`.
 #[derive(Clone, Debug)]
 pub struct Epilogue {
+    /// The dtype of the head, every step, the result and every leaf read as stored.
     pub dt: Ty,
+    /// The head's output shape, which the region runs over.
     pub out_shape: Vec<usize>,
+    /// The extra inputs, indexed by [`EpilogueInput::Leaf`].
     pub leaves: Vec<EpilogueLeaf>,
+    /// The pointwise steps in evaluation order; a step may name only earlier steps.
     pub steps: Vec<EpilogueStep>,
+    /// Which operand is the region's result.
     pub output: EpilogueInput,
 }
 

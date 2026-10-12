@@ -146,8 +146,11 @@ pub fn packed_block_diagonal_linear(
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct PackedExpertStack {
+    /// The stack's own weight name; each source role's carrier constant is named after it.
     pub stack_id: String,
+    /// The packed layout every expert in the stack shares.
     pub descriptor: poot_quant::PackedWeight,
+    /// The number of experts stacked along the carrier's leading axis.
     pub experts: usize,
 }
 

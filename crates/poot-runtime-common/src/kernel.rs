@@ -32,7 +32,9 @@ use poot_target::{AieTargetId, BufferStorage, ElementKind, TargetId};
 /// Whether a kernel argument is read, or written back to the caller's buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgAccess {
+    /// The kernel only reads the buffer.
     Read,
+    /// The kernel writes the buffer; the caller reads it back after the dispatch.
     Write,
 }
 
@@ -46,14 +48,17 @@ pub struct ArgSchema {
 }
 
 impl ArgSchema {
+    /// A schema entry for an argument of native `element` kind accessed as `access`.
     pub const fn new(element: ElementKind, access: ArgAccess) -> Self {
         Self { element, access }
     }
 
+    /// The native word format the compiled code reads or writes.
     pub const fn element(&self) -> ElementKind {
         self.element
     }
 
+    /// Whether the kernel writes the argument back.
     pub const fn access(&self) -> ArgAccess {
         self.access
     }
@@ -139,14 +144,17 @@ impl CompiledKernel {
         }
     }
 
+    /// The target this kernel was compiled for.
     pub fn target(&self) -> TargetId {
         self.target
     }
 
+    /// The entry-point name the runtime launches.
     pub fn entry_point(&self) -> &str {
         &self.entry_point
     }
 
+    /// The compiled code, in the form the target's runtime loads.
     pub fn code(&self) -> &KernelCode {
         &self.code
     }
@@ -168,11 +176,19 @@ impl CompiledKernel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelArgError {
     /// The caller bound a different number of buffers than the schema declares.
-    Count { expected: usize, actual: usize },
+    Count {
+        /// Buffers the schema declares.
+        expected: usize,
+        /// Buffers the dispatch bound.
+        actual: usize,
+    },
     /// Argument `index`'s bound buffer has a different native element kind than the schema declares.
     ElementKind {
+        /// The argument position.
         index: usize,
+        /// The element kind the schema declares.
         expected: ElementKind,
+        /// The element kind of the bound buffer.
         actual: ElementKind,
     },
 }
@@ -254,28 +270,46 @@ pub fn check_kernel_args(
 /// the artifact validator, before a loader or XRT sees any byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AieArtifactError {
+    /// The xclbin does not start with the `xclbin2` file magic.
     XclbinMagic,
+    /// The instruction stream is empty or not a whole number of 4-byte words.
     InstructionStream {
+        /// The stream's length in bytes.
         bytes: usize,
     },
+    /// The artifact names no entry kernel.
     NoEntry,
+    /// The artifact carries no toolchain identity.
     NoToolchain,
+    /// The shape ABI has no binding, or no written binding.
     NoBindings,
+    /// A binding's storage is not a dense F32/I32 word buffer.
     Storage {
+        /// The binding position.
         index: usize,
+        /// The storage the binding declared.
         storage: BufferStorage,
     },
+    /// A binding has a zero dimension.
     ZeroDimension {
+        /// The binding position.
         index: usize,
     },
+    /// A binding's element count or byte extent overflows.
     ExtentOverflow {
+        /// The binding position.
         index: usize,
     },
+    /// The compiler-proved access count exceeds the binding's declared elements.
     AccessOutOfRange {
+        /// The binding position.
         index: usize,
+        /// Elements the compiler proved the kernel touches.
         accessed: u64,
+        /// Elements the binding declares.
         elements: u64,
     },
+    /// The serialized artifact is truncated or malformed.
     Malformed(&'static str),
 }
 
@@ -383,14 +417,17 @@ impl AieBinding {
         })
     }
 
+    /// The exact physical and logical storage the bound buffer must have.
     pub const fn storage(&self) -> BufferStorage {
         self.storage
     }
 
+    /// Whether the kernel writes the binding.
     pub const fn access(&self) -> ArgAccess {
         self.access
     }
 
+    /// The logical dimensions the kernel was compiled for.
     pub fn dims(&self) -> &[u64] {
         &self.dims
     }
@@ -400,6 +437,7 @@ impl AieBinding {
         self.elements
     }
 
+    /// Leading elements the compiler proved the kernel touches.
     pub const fn accessed_elements(&self) -> u64 {
         self.accessed_elements
     }
@@ -412,6 +450,7 @@ pub struct AieShapeAbi {
 }
 
 impl AieShapeAbi {
+    /// The ABI of `bindings`; refuses an empty list or one with no written binding.
     pub fn new(bindings: Vec<AieBinding>) -> Result<Self, AieArtifactError> {
         let writes = bindings
             .iter()
@@ -424,6 +463,7 @@ impl AieShapeAbi {
         })
     }
 
+    /// The bindings, in host-buffer order.
     pub fn bindings(&self) -> &[AieBinding] {
         &self.bindings
     }
@@ -489,22 +529,27 @@ impl AieLinkedArtifact {
         })
     }
 
+    /// The xclbin image the loader hands to XRT.
     pub fn xclbin(&self) -> &[u8] {
         &self.xclbin
     }
 
+    /// The transfer-descriptor instruction stream.
     pub fn instructions(&self) -> &[u8] {
         &self.instructions
     }
 
+    /// The entry kernel's name.
     pub fn entry(&self) -> &str {
         &self.entry
     }
 
+    /// The shape and argument ABI.
     pub fn abi(&self) -> &AieShapeAbi {
         &self.abi
     }
 
+    /// The AIE target the artifact was built for.
     pub const fn target(&self) -> AieTargetId {
         self.target
     }
@@ -645,8 +690,11 @@ impl<'a> Reader<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(any(test, feature = "test-support"))]
 pub struct AieBound<'a> {
+    /// The buffer's storage record.
     pub storage: BufferStorage,
+    /// The buffer's logical dimensions.
     pub dims: &'a [u64],
+    /// Whether the runtime may let the kernel write it.
     pub writable: bool,
 }
 
@@ -655,23 +703,35 @@ pub struct AieBound<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(any(test, feature = "test-support"))]
 pub enum AieBindError {
+    /// The dispatch bound a different number of buffers than the ABI declares.
     Count {
+        /// Bindings the ABI declares.
         expected: usize,
+        /// Buffers the dispatch bound.
         actual: usize,
     },
+    /// A bound buffer's storage record differs from the ABI's.
     Storage {
+        /// The binding position.
         index: usize,
+        /// The storage the ABI declares.
         expected: BufferStorage,
+        /// The storage of the bound buffer.
         actual: BufferStorage,
     },
+    /// The kernel writes the binding but the bound buffer is not writable.
     ReadOnlyWritten {
+        /// The binding position.
         index: usize,
     },
     /// The bound buffer's dimensions are not the shape the kernel was compiled for (equal element counts
     /// under different dimensions are different shapes).
     Dims {
+        /// The binding position.
         index: usize,
+        /// The dimensions the kernel was compiled for.
         expected: Box<[u64]>,
+        /// The dimensions of the bound buffer.
         actual: Box<[u64]>,
     },
 }

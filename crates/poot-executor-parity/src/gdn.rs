@@ -12,19 +12,28 @@ use crate::{Fixture, store_from_tensors};
 /// The toy scale of the chunked prefill: `LEN` positions in `CHUNK`-position chunks, `H_K` key heads
 /// repeated (tiled, `hv % H_K`) to `H_V` value heads, each of head dim `D`.
 pub const LEN: usize = 8;
+/// Positions per chunk; `LEN / CHUNK` chunks are chained in one program.
 pub const CHUNK: usize = 4;
+/// Number of key (and query) heads, before they are tiled up to `H_V`.
 pub const H_K: usize = 2;
+/// Number of value heads; a multiple of `H_K`.
 pub const H_V: usize = 4;
+/// Head dimension shared by keys, queries and values.
 pub const D: usize = 3;
 
 /// One call's raw inputs, row-major: `q`, `k` are `[H_K, LEN, D]` (L2-normalized, unscaled), `v` is
 /// `[H_V, LEN, D]`, `g` (the log-domain forget gate, negative) and `beta` (the delta weight, in
 /// `(0, 1)`) are `[H_V, LEN]`.
 pub struct GdnInputs {
+    /// Query rows, `[H_K, LEN, D]`, L2-normalized per row.
     pub q: Vec<f32>,
+    /// Key rows, `[H_K, LEN, D]`, L2-normalized per row.
     pub k: Vec<f32>,
+    /// Value rows, `[H_V, LEN, D]`.
     pub v: Vec<f32>,
+    /// Log-domain forget gate, `[H_V, LEN]`, negative.
     pub g: Vec<f32>,
+    /// Delta-rule write weight, `[H_V, LEN]`, in `(0, 1)`.
     pub beta: Vec<f32>,
 }
 
@@ -32,7 +41,9 @@ pub struct GdnInputs {
 /// 0 left, which is nonzero, so both state-dependent cross terms of the chunked algebra are exercised
 /// from step 1 on.
 pub struct GdnChunkedCase {
+    /// The program and weight store; its steps are bound from `inputs`.
     pub fixture: Fixture,
+    /// Raw inputs of each step, in step order; the recurrent state carries from one to the next.
     pub inputs: Vec<GdnInputs>,
 }
 

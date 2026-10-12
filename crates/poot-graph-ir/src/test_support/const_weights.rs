@@ -26,6 +26,7 @@ pub struct ConstWeights<'s> {
 }
 
 impl<'s> ConstWeights<'s> {
+    /// An empty id table over `store`; ids are handed out in first-use order as graphs name store entries.
     pub fn new(store: &'s WeightStore) -> Self {
         Self {
             store,

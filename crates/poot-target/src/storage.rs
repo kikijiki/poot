@@ -12,9 +12,13 @@
 /// PTX's, with different variant sets and neither shared with wgpu or Vulkan).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ElementKind {
+    /// 32-bit IEEE float.
     F32,
+    /// 32-bit signed integer.
     I32,
+    /// bfloat16.
     Bf16,
+    /// 16-bit IEEE float.
     F16,
     /// Opaque bytes with no fixed per-element width the runtime interprets: kernel-argument segments,
     /// length/dims metadata, and the packed-byte payload of an I8 or E4M3FN [`LogicalDType`]. Copies and
@@ -46,9 +50,13 @@ impl std::fmt::Display for ElementKind {
 /// [`ElementKind::I32`] (canonical, [`BufferStorage::bf16_packed`]) and logical dtype `Bf16`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum LogicalDType {
+    /// 32-bit IEEE float.
     F32,
+    /// bfloat16.
     Bf16,
+    /// 16-bit IEEE float.
     F16,
+    /// 32-bit signed integer.
     I32,
     /// Signed quantized-KV codes, or another opaque one-byte-per-element carrier.
     I8,
@@ -108,6 +116,8 @@ pub struct BufferStorage {
 }
 
 impl BufferStorage {
+    /// A storage from its three parts. Prefer the named constructors, which fix the combinations the
+    /// executors support.
     pub const fn new(element: ElementKind, dtype: LogicalDType, layout: StorageLayout) -> Self {
         Self {
             element,
@@ -159,15 +169,19 @@ impl BufferStorage {
         )
     }
 
+    /// Dense F32.
     pub const fn f32() -> Self {
         Self::dense(ElementKind::F32, LogicalDType::F32)
     }
+    /// Dense I32.
     pub const fn i32() -> Self {
         Self::dense(ElementKind::I32, LogicalDType::I32)
     }
+    /// Dense BF16, one value per 16-bit element.
     pub const fn bf16() -> Self {
         Self::dense(ElementKind::Bf16, LogicalDType::Bf16)
     }
+    /// Dense F16.
     pub const fn f16() -> Self {
         Self::dense(ElementKind::F16, LogicalDType::F16)
     }
@@ -186,6 +200,7 @@ impl BufferStorage {
         self.dtype
     }
 
+    /// How logical elements are arranged in the physical words.
     pub const fn layout(&self) -> StorageLayout {
         self.layout
     }

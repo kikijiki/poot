@@ -192,14 +192,18 @@ pub(crate) fn guard(cmp: Local, zero_target: u32, otherwise: u32) -> Terminator 
 /// [`KernelGenError::BodyLimit`], never a truncated or oversized body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyLimits {
+    /// Most statements plus block terminators a body may hold.
     pub max_instructions: NonZeroUsize,
+    /// Most locals, parameters included, a body may hold.
     pub max_locals: NonZeroUsize,
 }
 
 /// A body's size in the units [`BodyLimits`] caps.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BodySize {
+    /// Statements plus block terminators.
     pub instructions: usize,
+    /// Locals, parameters included.
     pub locals: usize,
 }
 
@@ -243,6 +247,7 @@ pub struct BodyBudget {
 }
 
 impl BodyBudget {
+    /// A fresh budget over `limits` with nothing reserved.
     pub fn new(limits: BodyLimits) -> Self {
         Self {
             limits,
@@ -355,7 +360,9 @@ pub(crate) fn broadcast_eff_strides(out: &[usize], operand: &[usize]) -> Vec<usi
 /// `fused_row`, `fused_row_parallel`) need the type. `poot-graph-plan` re-exports it as `poot_graph_plan::Layout`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
+    /// Element stride of each axis of the viewed value, in the value's own axis order.
     pub strides: Vec<usize>,
+    /// Element offset of the value's first element in the source buffer.
     pub offset: usize,
 }
 

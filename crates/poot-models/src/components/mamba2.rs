@@ -83,6 +83,7 @@ impl Mamba2Params {
         self.heads * self.head_dim
     }
 
+    /// The SSM head count.
     pub fn heads(&self) -> usize {
         self.heads
     }
@@ -109,6 +110,9 @@ pub struct Mamba2Weights {
 }
 
 impl Mamba2Weights {
+    /// Resolves layer `layer`'s `in_proj` row ranges, conv, per-head scalars, gate norm and output
+    /// tensors from `map` and checks each shape against `p` and the model `width`; a missing or
+    /// mis-shaped tensor is a typed [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,

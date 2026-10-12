@@ -65,19 +65,32 @@ pub enum LoraError {
     /// A contraction's activation is not F32: the stacked factors are, and `IndexedMatMul` contracts
     /// operands of one dtype.
     #[error("{weight}: the activation is {dtype:?}; the LoRA correction contracts F32 activations")]
-    Activation { weight: String, dtype: DType },
+    Activation {
+        /// Name of the contracted weight.
+        weight: String,
+        /// The activation's dtype.
+        dtype: DType,
+    },
     /// A contraction's activation rows are not a whole number of tokens per step row.
     #[error("{weight}: {elements} activation rows do not split over {rows} step rows")]
     Rows {
+        /// Name of the contracted weight.
         weight: String,
+        /// Number of activation rows the contraction reads.
         elements: usize,
+        /// Number of rows in one step.
         rows: usize,
     },
     /// The adapter stack has more entries than the `i32` words of an adapter index.
     #[error("an adapter stack of {entries} entries is past the i32 adapter indices")]
-    StackNotIndexable { entries: usize },
+    StackNotIndexable {
+        /// Number of entries in the adapter stack.
+        entries: usize,
+    },
+    /// Growing the graph for the correction would pass the compile's limits.
     #[error(transparent)]
     Expansion(#[from] ExpansionError),
+    /// The graph editor refused a rewrite the pass issued.
     #[error(transparent)]
     Edit(Box<poot_graph_ir::EditError>),
     /// The tracer refused a declaration: it does not fit the compile's graph limits, or the graph

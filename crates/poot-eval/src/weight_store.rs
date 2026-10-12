@@ -10,19 +10,34 @@ use poot_tensor::{CarrierError, DType, HostTensor};
 /// Why a stored dense tensor did not materialize.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum MaterializeError {
+    /// The store has no tensor of that name.
     #[error("missing tensor {name}")]
-    Missing { name: String },
+    Missing {
+        /// The requested tensor name.
+        name: String,
+    },
+    /// The entry is packed, not dense.
     #[error("{name}: expected a dense stored tensor, found a packed entry")]
-    Packed { name: String },
+    Packed {
+        /// The tensor name.
+        name: String,
+    },
+    /// The stored bytes did not form a host tensor of the stored dtype.
     #[error("dense {dtype} tensor {name}: {source}")]
     Carrier {
+        /// Tensor name.
         name: String,
+        /// Stored dtype.
         dtype: DType,
+        /// The carrier's refusal.
         source: CarrierError,
     },
+    /// The stored dtype has no f32 decoding.
     #[error("tensor {name}: {source}")]
     Undecodable {
+        /// Tensor name.
         name: String,
+        /// The decoder's refusal.
         source: UndecodableDtype,
     },
 }

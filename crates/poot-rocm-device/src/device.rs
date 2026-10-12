@@ -61,10 +61,15 @@ struct CapturedAql {
 /// One flattened entry of [`poot_rocm_runtime::RocmContext::enqueue_graph_batched`]'s dispatch list.
 type BatchedDispatch = (KernelHandle, RocmBuffer, (u32, u32, u32), (u32, u32, u32));
 
+/// A recorded step: the AQL packets captured between `begin` and `finish`, which `replay` re-enqueues
+/// on the context's queue.
 pub struct RocmRecording {
     aqls: Vec<CapturedAql>,
 }
 
+/// The ROCm (HSA/AQL) implementation of [`poot_executor::Device`]: owns one [`RocmContext`], records a
+/// step as a list of captured AQL dispatch packets and replays it. A multi-device program holds one
+/// per GPU.
 pub struct RocmDevice {
     ctx: RocmContext,
     arch: AmdArch,
@@ -79,6 +84,7 @@ pub struct RocmDevice {
 }
 
 impl RocmDevice {
+    /// A device on the default GPU, with no device timing; see [`Self::new_with_device_timing`].
     pub fn new() -> Result<Self, RocmGpuError> {
         Self::from_context(RocmContext::new()?)
     }
@@ -94,6 +100,8 @@ impl RocmDevice {
         })?)
     }
 
+    /// A device over an already-opened `ctx`: derives the GPU architecture from the context's ISA name
+    /// (falling back to gfx1151 when it is unrecognized) and compiles the one generated copy kernel.
     pub fn from_context(ctx: RocmContext) -> Result<Self, RocmGpuError> {
         let arch = AmdArch::from_isa_name(ctx.isa_name(), ctx.wavefront())
             .unwrap_or_else(|_| AmdArch::gfx1151());

@@ -1,3 +1,7 @@
+//! The `--write-timeout-secs` flag through the production `poot-serve` binary: an invalid value is refused
+//! at the process boundary, before any model loader runs. Nothing of the parser is reimplemented here;
+//! the rows read the exit status and what the process printed.
+
 /// `CARGO_BIN_EXE_poot-serve`, read at runtime (not baked via `env!`): the compile-time macro's value is
 /// embedded into this test binary's compiled object code at build time, and a shared compile cache (kache)
 /// that reuses that object across worktrees by source-content hash would then serve whichever worktree's

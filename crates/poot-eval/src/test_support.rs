@@ -14,6 +14,8 @@ pub mod weight_map_oracle;
 /// shared CPU oracle ([`weight_map_oracle::oracle_for`]) that takes it, so `poot-executor-parity`, `poot_models::test_support`
 /// and the device crates name one type.
 pub struct StepFixture {
+    /// The slot the tensor binds to.
     pub key: poot_graph_ir::SlotKey,
+    /// The slot's value for the step.
     pub tensor: poot_tensor::HostTensor,
 }

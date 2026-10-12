@@ -87,9 +87,19 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Target {
     /// A GPU lowering backend and what its device measured.
-    Gpu { backend: Backend, caps: DeviceCaps },
+    Gpu {
+        /// The lowering backend the program is generated for.
+        backend: Backend,
+        /// What the device measured: the limits and features the planner consults.
+        caps: DeviceCaps,
+    },
     /// An AMD XDNA target and the limits its runtime reports (unmeasured until POOT-641).
-    Aie { target: AieTargetId, caps: AieCaps },
+    Aie {
+        /// The XDNA part the program is generated for.
+        target: AieTargetId,
+        /// The limits the part's runtime reports.
+        caps: AieCaps,
+    },
 }
 
 impl Target {
@@ -162,12 +172,19 @@ impl CompileOptions {
 /// Wall time is telemetry, not a limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompileLimits {
+    /// Most values one graph's value table may hold, for every graph a pass produces.
     pub max_intermediate_values: NonZeroUsize,
+    /// Most equations one graph may hold, for every graph a pass produces.
     pub max_intermediate_eqns: NonZeroUsize,
+    /// Most bytes of inline scalar literals a pass-built graph may carry.
     pub max_graph_literal_bytes: NonZeroU64,
+    /// Most bytes of owned storage (records, names, operand lists) a pass-built graph may request.
     pub max_graph_owned_bytes: NonZeroU64,
+    /// Most instructions (statements plus block terminators) in one generated kernel body.
     pub max_body_instructions: NonZeroUsize,
+    /// Most locals (parameters included) in one generated kernel body.
     pub max_body_locals: NonZeroUsize,
+    /// Most bytes of one compiled kernel artifact an executor loads or caches.
     pub max_artifact_bytes: NonZeroU64,
 }
 
@@ -196,8 +213,10 @@ impl CompileLimits {
 /// What a graph is limited in, for [`ExpansionError`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GraphResource {
+    /// The graph's value table.
     #[error("values")]
     Values,
+    /// The graph's equation list.
     #[error("equations")]
     Eqns,
 }
@@ -211,10 +230,15 @@ pub enum GraphResource {
     "{stage}: the graph's {resource} would reach {attempted} (holding {held}), over the limit of {limit}"
 )]
 pub struct ExpansionError {
+    /// The compile stage (pass name) that attempted the growth.
     pub stage: &'static str,
+    /// Which of the graph's tables would have overflowed.
     pub resource: GraphResource,
+    /// How many entries of `resource` the graph held when the stage began.
     pub held: usize,
+    /// How many entries the stage would have left the graph holding.
     pub attempted: usize,
+    /// The configured cap on `resource`, from [`CompileLimits`].
     pub limit: usize,
 }
 
@@ -313,7 +337,10 @@ pub enum ExpertIdsGap {
     /// The range holds only because the index guard whose condition is `guard` replaced the lanes
     /// outside it, and no declared validation output observes that guard: a bad id would turn silently
     /// into a valid-looking expert.
-    UnobservedGuard { guard: ValueId },
+    UnobservedGuard {
+        /// The guard's condition value; nothing in the declared validation outputs reads it.
+        guard: ValueId,
+    },
 }
 
 /// An indexed contraction (`IndexedMatMul`, or the packed `PackedContraction` over an indexed stack) whose
@@ -450,8 +477,11 @@ impl From<PackedDequantProductionError> for CompileError {
 /// One slot the executor writes every step: the value, its slot kind and the storage the plan chose for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotSchema {
+    /// The value the executor writes into the slot.
     pub value: ValueId,
+    /// Which slot kind the value is written through.
     pub slot: Slot,
+    /// The storage the plan chose for the value.
     pub storage: ValueStorage,
 }
 

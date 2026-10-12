@@ -41,6 +41,7 @@ pub use config::Gemma4Params;
 /// The Gemma vocabulary's `<bos>` id, for a config that names none.
 const GEMMA_BOS: u32 = 2;
 
+/// Gemma 4's [`FamilyKey`], shared with its config reader.
 pub const FAMILY: FamilyKey = config::FAMILY;
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
@@ -224,6 +225,8 @@ struct Layer {
     scale: LayerScale,
 }
 
+/// The built Gemma 4 text model: config, name-resolved weights, the stack-level tensors and one
+/// weight bundle per layer. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct Gemma4 {
     params: Gemma4Params,

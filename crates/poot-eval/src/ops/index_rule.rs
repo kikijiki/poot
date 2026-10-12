@@ -11,7 +11,9 @@ use crate::EvalError;
 /// inverts (an integral count computed by float arithmetic, never pre-rounded). No index operand is F32.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IndexValue {
+    /// An I32 index word, the one index dtype.
     I32(i32),
+    /// The F32 rank value `ArgTopK` inverts.
     F32(f32),
 }
 
@@ -46,10 +48,15 @@ pub enum IndexFaultKind {
 #[derive(Clone, Copy, Debug, PartialEq, thiserror::Error)]
 #[error("index {eqn} position {position} value {value} is not a valid row of 0..{len} ({kind:?})")]
 pub struct IndexFault {
+    /// The equation that read the index.
     pub eqn: ValueId,
+    /// Position within the index operand, row-major.
     pub position: usize,
+    /// The refused value.
     pub value: IndexValue,
+    /// The selectable row count: valid values are `0..len`.
     pub len: usize,
+    /// Which check the value failed.
     pub kind: IndexFaultKind,
 }
 

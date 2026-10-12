@@ -29,6 +29,7 @@ use super::preprocess::{
 };
 use super::video_sampling::{Qwen25VlVideoMetadata, Qwen25VlVideoSamplePlan};
 
+/// The most media items (images and videos together) one raw request may carry.
 pub const QWEN2_5_VL_MAX_RAW_MEDIA_ITEMS: usize = 64;
 
 /// One item in an already-rendered Qwen2.5-VL request's explicit raw media order.
@@ -37,11 +38,14 @@ pub const QWEN2_5_VL_MAX_RAW_MEDIA_ITEMS: usize = 64;
 /// source is supplied separately in video order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Qwen25VlRawMediaInput<'a> {
+    /// A decoded image.
     Image(Qwen25VlDecodedImage),
+    /// A probed video; its frames come from the matching decoded-frame source.
     Video(Qwen25VlVideoMetadata<'a>),
 }
 
 impl Qwen25VlRawMediaInput<'_> {
+    /// Whether this item is an image or a video.
     pub const fn kind(&self) -> MropeVisualKind {
         match self {
             Self::Image(_) => MropeVisualKind::Image,
@@ -55,10 +59,15 @@ impl Qwen25VlRawMediaInput<'_> {
 /// `video_sources` follows video-only order within `media`. All sources share one caller-selected
 /// error type (an enum can keep distinct codec errors).
 pub struct Qwen25VlRawRequestMropeModelInputRequest<'dir, 'prompt, 'data, 'sources, S> {
+    /// The checkpoint directory holding `config.json`, the tokenizer files and the processor config.
     pub model_dir: &'dir Path,
+    /// The chat-template output, with one pad marker per visual item and not yet expanded.
     pub rendered_prompt: &'prompt str,
+    /// The images and videos in the order their markers appear in `rendered_prompt`.
     pub media: Vec<Qwen25VlRawMediaInput<'data>>,
+    /// The per-video processor frame rates; required when `media` holds a video and refused when it holds none.
     pub fps: Option<MropeProcessorFpsInput<'data>>,
+    /// One decoded-frame source per video, in video-only order within `media`.
     pub video_sources: &'sources mut [S],
 }
 
@@ -68,28 +77,37 @@ pub struct Qwen25VlRawRequestMropeModelInputRequest<'dir, 'prompt, 'data, 'sourc
 /// self-referential handoff.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen25VlRawRequestMropeModelInput {
+    /// The tokenized prompt with every pad expanded to its merged-grid token count.
     pub prompt_token_ids: Vec<u32>,
+    /// The processed images and videos: patches, grids and per-video timing.
     pub media: Qwen25VlProcessedMedia,
+    /// The vision tower's spatial merge size the grids were counted with.
     pub spatial_merge_size: usize,
+    /// The checkpoint's marker strings, token ids and model type the request was assembled against.
     pub metadata: QwenVlMropeMetadata,
+    /// Where every prompt token rotates (`Slot::MropePosition`).
     pub mrope_positions: MropePositionIds,
     media_order: Vec<MropeVisualKind>,
     video_sample_plans: Vec<Qwen25VlVideoSamplePlan>,
 }
 
 impl Qwen25VlRawRequestMropeModelInput {
+    /// The processed media in the form the mrope model-input assembler takes.
     pub fn processor_media(&self) -> Qwen25VlProcessorMedia<'_> {
         self.media.processor_media()
     }
 
+    /// The per-video processor frame rates the request resolved to.
     pub fn processor_fps_input(&self) -> MropeProcessorFpsInput<'_> {
         self.media.processor_fps_input()
     }
 
+    /// The kind of each media item, in the order their markers appear in the prompt.
     pub fn media_order(&self) -> &[MropeVisualKind] {
         &self.media_order
     }
 
+    /// The frame selection of each video, in video order.
     pub fn video_sample_plans(&self) -> &[Qwen25VlVideoSamplePlan] {
         &self.video_sample_plans
     }
@@ -121,26 +139,40 @@ impl Qwen25VlMropeModelInputView for Qwen25VlRawRequestMropeModelInput {
     }
 }
 
+/// Why a rendered prompt's pad markers cannot be expanded to the processed grids.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Qwen25VlPadExpansionError {
+    /// The checkpoint's pad marker for this kind is the empty string.
     #[error("Qwen2.5-VL {kind} pad marker is empty")]
-    EmptyPadMarker { kind: MropeVisualKind },
+    EmptyPadMarker {
+        /// Whether the pad is the image pad or the video pad.
+        kind: MropeVisualKind,
+    },
+    /// The prompt holds a different number of pads than the media have grids.
     #[error(
         "Qwen2.5-VL rendered prompt has {actual} {kind} pads; processed media has {expected} {kind} grids"
     )]
     PadCountMismatch {
+        /// Whether the pad is the image pad or the video pad.
         kind: MropeVisualKind,
+        /// Grids of this kind the processed media have.
         expected: usize,
+        /// Pads of this kind the prompt holds.
         actual: usize,
     },
+    /// Repeating the placeholder for one grid overflows or cannot be reserved.
     #[error(
         "Qwen2.5-VL {kind} pad expansion at grid {index} overflows repeating {count} placeholders"
     )]
     ReplacementOverflow {
+        /// Whether the pad is the image pad or the video pad.
         kind: MropeVisualKind,
+        /// Index of the grid of this kind.
         index: usize,
+        /// The merged-token count that was being repeated.
         count: usize,
     },
+    /// A grid cannot be counted into merged tokens.
     #[error(transparent)]
     Grid(#[from] MropePositionError),
 }
@@ -229,67 +261,113 @@ pub(crate) fn expand_qwen2_5_vl_rendered_pads(
     )
 }
 
+/// Why a rendered request and its raw media do not assemble into a model input.
+/// `E` is the caller's video frame source error.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlRawRequestAssemblyError<E: std::error::Error + 'static> {
+    /// The checkpoint's processor and mrope metadata could not be loaded.
     #[error(transparent)]
     Metadata(#[from] QwenVlMropeMetadataLoadError),
+    /// The checkpoint is a Qwen vision-language model of another type than Qwen2.5-VL.
     #[error("Qwen2.5-VL raw request does not support model type {model_type:?}")]
-    UnsupportedModelType { model_type: QwenVlModelType },
+    UnsupportedModelType {
+        /// The model type the checkpoint declares.
+        model_type: QwenVlModelType,
+    },
+    /// The image processor configuration could not be loaded or is refused.
     #[error(transparent)]
     ProcessorConfig(#[from] Qwen25VlImageProcessorConfigError),
+    /// The request carries more media items than the cap.
     #[error("Qwen2.5-VL raw request has {actual} media items, exceeding the {limit}-item cap")]
-    TooManyMediaItems { actual: usize, limit: usize },
+    TooManyMediaItems {
+        /// Media items in the request.
+        actual: usize,
+        /// The cap, `QWEN2_5_VL_MAX_RAW_MEDIA_ITEMS`.
+        limit: usize,
+    },
+    /// The number of frame sources is not the number of videos.
     #[error(
         "Qwen2.5-VL raw request has {video_count} videos but {source_count} decoded-frame sources"
     )]
     VideoSourceCountMismatch {
+        /// Videos in `media`.
         video_count: usize,
+        /// Frame sources supplied.
         source_count: usize,
     },
+    /// The request holds videos but supplies no frame rates.
     #[error("Qwen2.5-VL raw request with {video_count} videos requires explicit FPS")]
-    MissingVideoFps { video_count: usize },
+    MissingVideoFps {
+        /// Videos in `media`.
+        video_count: usize,
+    },
+    /// Frame rates were supplied but the request holds no video.
     #[error("Qwen2.5-VL raw request without videos must not supply FPS")]
     UnexpectedVideoFps,
+    /// The supplied frame rates do not resolve to per-video timings.
     #[error(transparent)]
     VideoTiming(#[from] MropeProcessorTimingError),
+    /// One image failed preprocessing.
     #[error("preprocess Qwen2.5-VL raw image source {source_index}: {source}")]
     ImagePreprocess {
+        /// Index of the media item in request order.
         source_index: usize,
+        /// The preprocessing error.
         #[source]
         source: Qwen25VlImagePreprocessError,
     },
+    /// The batch of images failed preprocessing as a whole.
     #[error("preprocess Qwen2.5-VL raw image batch: {0}")]
     ImageBatchPreprocess(#[source] Qwen25VlImagePreprocessError),
+    /// One video failed sampling or preprocessing.
     #[error("process Qwen2.5-VL raw video source {source_index} (video {video_index}): {source}")]
     VideoPreprocess {
+        /// Index of the media item in request order.
         source_index: usize,
+        /// Index of the video among the videos.
         video_index: usize,
+        /// The sampling, decode or preprocessing error.
         #[source]
         source: Qwen25VlRawVideoPreprocessError<E>,
     },
+    /// The processed media do not assemble (grids, patches or timings).
     #[error(transparent)]
     ProcessedMedia(#[from] Qwen25VlProcessedMediaAssemblyError),
+    /// The prompt, grids and metadata do not assemble into a model input.
     #[error(transparent)]
     ModelInput(#[from] Qwen25VlProcessorMediaMropeModelInputError),
+    /// The markers of the expanded prompt could not be located again.
     #[error("rediscover Qwen2.5-VL raw request marker order: {0}")]
     MarkerSpan(#[source] MropeSpanError),
+    /// The order of the prompt's visual markers differs from the order of `media`.
     #[error(
         "Qwen2.5-VL rendered marker {marker_index} is {actual}; raw media source order requires {expected}"
     )]
     MediaOrderMismatch {
+        /// Position of the marker in the prompt.
         marker_index: usize,
+        /// The kind of the media item at that position.
         expected: MropeVisualKind,
+        /// The kind of the marker found there.
         actual: MropeVisualKind,
     },
+    /// The prompt holds a different number of visual markers than the request has media items.
     #[error(
         "Qwen2.5-VL rendered prompt has {marker_count} visual markers; raw request has {raw_count} media sources"
     )]
     MediaCountMismatch {
+        /// Media items in the request.
         raw_count: usize,
+        /// Visual markers in the rendered prompt.
         marker_count: usize,
     },
+    /// Reserving memory failed.
     #[error("Qwen2.5-VL raw request could not reserve memory for {stage}")]
-    Allocation { stage: &'static str },
+    Allocation {
+        /// The buffer that failed to allocate.
+        stage: &'static str,
+    },
+    /// Expanding the pad markers failed.
     #[error(transparent)]
     PadExpansion(#[from] Qwen25VlPadExpansionError),
 }

@@ -40,7 +40,9 @@ pub enum Ffn {
 /// One layer's kinds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayerKind {
+    /// The layer's token mixer.
     pub mixer: Mixer,
+    /// The layer's feed-forward block.
     pub ffn: Ffn,
 }
 
@@ -105,6 +107,8 @@ fn text_config(config: &serde_json::Value) -> Result<serde_json::Value, ModelErr
 }
 
 impl Glm53Config {
+    /// Reads the typed config from an HF `config.json` (the family is HF-only: a GGUF is refused as
+    /// `Unsupported`); the per-layer schedule comes from `layer_types` and the dense-layer prefix.
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         // The family is HF-only: a GGUF never names it.
         let RawConfig::HfJson { config, generation } = raw else {

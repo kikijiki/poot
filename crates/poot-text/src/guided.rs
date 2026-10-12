@@ -132,6 +132,7 @@ impl TextCodec {
 ///   the dead state, and EOS is allowed in a match state). Built by [`TextCodec::build_regex_constraint`].
 #[derive(Clone)]
 pub enum Constraint {
+    /// The completion is one of a fixed set of token sequences.
     Choices {
         /// the allowed choices, each as its token-id sequence (no BOS).
         choices: Vec<Vec<u32>>,
@@ -140,12 +141,15 @@ pub enum Constraint {
         /// the model's EOS id, permitted once the generated tokens complete a choice.
         eos: u32,
     },
+    /// The completion matches a regex, tracked by a byte-level DFA.
     Regex {
+        /// the compiled byte-level DFA of the pattern (shared across requests with the same pattern).
         dfa: std::sync::Arc<regex_automata::dfa::dense::DFA<Vec<u32>>>,
         /// the current DFA state (advances as tokens are observed).
         state: regex_automata::util::primitives::StateID,
         /// per-token UTF-8 bytes, indexed by token id (shared from the runner).
         bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        /// the model's EOS id, permitted in a match state.
         eos: u32,
     },
     /// The completion must be a single well-formed JSON value of any shape and nesting depth
@@ -158,6 +162,7 @@ pub enum Constraint {
         acc: JsonAcceptor,
         /// per-token UTF-8 bytes, indexed by token id (shared from the runner).
         bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        /// the model's EOS id, permitted once a complete top-level value is held.
         eos: u32,
     },
     /// The completion must be a sentence of a user-supplied GBNF grammar (`guided_grammar`). Like
@@ -169,6 +174,7 @@ pub enum Constraint {
         state: grammar::GrammarState,
         /// per-token UTF-8 bytes, indexed by token id (shared from the runner).
         bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        /// the model's EOS id, permitted once some parse is complete.
         eos: u32,
     },
 }
@@ -350,6 +356,7 @@ impl Constraint {
         }
     }
 
+    /// The model's EOS id this constraint permits once the completion is complete.
     pub fn eos(&self) -> u32 {
         match self {
             Constraint::Choices { eos, .. }

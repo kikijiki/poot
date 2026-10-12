@@ -25,6 +25,8 @@ pub struct ConvParams {
 }
 
 impl ConvParams {
+    /// Checks the parameters: zero `channels` or `dilation`, or a `kernel` below 2, is a typed
+    /// [`ParamError`] naming the field.
     pub fn new(channels: usize, kernel: usize, dilation: usize) -> Result<Self, ParamError> {
         if channels == 0 {
             return Err(ParamError::new("conv_channels", ConfigReason::Zero));
@@ -43,6 +45,7 @@ impl ConvParams {
         })
     }
 
+    /// The number of channels the conv runs over (it is depthwise: each channel has its own taps).
     pub fn channels(&self) -> usize {
         self.channels
     }

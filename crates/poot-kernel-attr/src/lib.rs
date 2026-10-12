@@ -31,6 +31,8 @@ use syn::Ident;
 use syn::{FnArg, Pat, Type};
 use syn::{ItemFn, parse_macro_input};
 
+/// Marks a function as a poot kernel. Device pass: renames it into the reserved kernel namespace and makes it
+/// `pub` so `pootc` finds it in MIR (see the crate doc).
 #[cfg(feature = "device-pass")]
 #[proc_macro_attribute]
 pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -38,6 +40,8 @@ pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
     device_fn(func).into()
 }
 
+/// Marks a function as a poot kernel. Host pass: replaces it with a typed launch wrapper of the same name
+/// that dispatches the kernel `pootc` compiled (see the crate doc).
 #[cfg(not(feature = "device-pass"))]
 #[proc_macro_attribute]
 pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {

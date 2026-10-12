@@ -15,7 +15,9 @@ use crate::multimodal::qwen_vl_mrope::Qwen25VlProcessorMedia;
 /// Ordered Qwen2.5-VL image processor output, concatenated in processor item order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen25VlProcessedImages {
+    /// Patches of every image, `[rows, feature_width]` (`feature_width = channels * temporal_patch_size * patch_size^2`), images in order.
     pub pixel_values: HostTensor,
+    /// One `[temporal, height, width]` patch grid per image, in the order of the rows.
     pub grids: Vec<MropeGrid>,
 }
 
@@ -34,12 +36,19 @@ impl Qwen25VlProcessedImages {
 /// Processor-compatible output for one ordered set of caller-sampled decoded video frames.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen25VlProcessedVideo {
+    /// This video's patches, `[rows, feature_width]`, after temporal padding.
     pub pixel_values_videos: HostTensor,
+    /// The video's patch grid.
     pub grid: MropeGrid,
+    /// The frame rate the frames were sampled at, as the processor reports it.
     pub sampled_frames_per_second: MropeSampledFramesPerSecond,
+    /// Seconds one temporal grid step spans, `temporal_patch_size / sampled_frames_per_second`.
     pub seconds_per_grid_step: MropeSecondsPerGridStep,
+    /// Frames merged into one temporal patch.
     pub temporal_patch_size: MropeTemporalPatchSize,
+    /// Frames the sampler selected.
     pub sampled_frame_count: usize,
+    /// Frames after repeating the last one up to a multiple of `temporal_patch_size`.
     pub padded_frame_count: usize,
 }
 
@@ -68,9 +77,13 @@ impl Qwen25VlProcessedVideo {
 /// prompt and marker-span validation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen25VlProcessedMedia {
+    /// Patches of every image, `[rows, feature_width]`; `None` when the request has no image.
     pub pixel_values: Option<HostTensor>,
+    /// One patch grid per image, in the order of the rows of `pixel_values`.
     pub image_grids: Vec<MropeGrid>,
+    /// Patches of every video concatenated in video order; `None` when the request has no video.
     pub pixel_values_videos: Option<HostTensor>,
+    /// One patch grid per video, in the order of the rows of `pixel_values_videos`.
     pub video_grids: Vec<MropeGrid>,
     pub(crate) temporal_patch_size: MropeTemporalPatchSize,
     pub(crate) sampled_frames_per_second: Vec<f64>,
@@ -92,135 +105,220 @@ impl Qwen25VlProcessedMedia {
         MropeProcessorFpsInput::PerVideo(&self.sampled_frames_per_second)
     }
 
+    /// Frames merged into one temporal patch by the processor config these media were processed with.
     pub fn temporal_patch_size(&self) -> MropeTemporalPatchSize {
         self.temporal_patch_size
     }
 
+    /// The sampled frame rate of each video, in video order.
     pub fn sampled_frames_per_second(&self) -> &[f64] {
         &self.sampled_frames_per_second
     }
 }
 
+/// Why already-processed images and videos do not assemble into one processor output.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Qwen25VlProcessedMediaAssemblyError {
+    /// The processor's feature width overflows `usize`.
     #[error("Qwen2.5-VL processed-media feature width overflows usize")]
     FeatureWidthOverflow,
+    /// The image batch's tensor and grids are inconsistent.
     #[error("invalid Qwen2.5-VL processed image batch: {0}")]
     ImageMedia(#[source] crate::multimodal::qwen_vl_mrope::Qwen25VlProcessorMediaError),
+    /// The image tensor's feature width is not the one the processor config implies.
     #[error(
         "Qwen2.5-VL processed image feature width is {actual}; processor config requires {expected}"
     )]
-    ImageFeatureWidth { expected: usize, actual: usize },
+    ImageFeatureWidth {
+        /// `channels * temporal_patch_size * patch_size^2` from the config.
+        expected: usize,
+        /// The tensor's second dimension.
+        actual: usize,
+    },
+    /// An image grid is not a valid patch grid.
     #[error("invalid Qwen2.5-VL processed image grid {index}: {source}")]
     ImageGrid {
+        /// Index of the image grid among the images.
         index: usize,
+        /// Why the grid is refused.
         #[source]
         source: MropePositionError,
     },
+    /// An image grid has a temporal dimension other than one.
     #[error("Qwen2.5-VL processed image grid {index} has temporal dimension {actual}; expected 1")]
-    ImageGridTemporal { index: usize, actual: usize },
+    ImageGridTemporal {
+        /// Index of the image grid among the images.
+        index: usize,
+        /// The grid's temporal dimension.
+        actual: usize,
+    },
+    /// A video's tensor and grid are inconsistent.
     #[error("invalid Qwen2.5-VL processed video {index}: {source}")]
     VideoMedia {
+        /// Index of the video among the videos.
         index: usize,
+        /// What is inconsistent.
         #[source]
         source: crate::multimodal::qwen_vl_mrope::Qwen25VlProcessorMediaError,
     },
+    /// A video tensor's feature width is not the one the processor config implies.
     #[error(
         "Qwen2.5-VL processed video {index} feature width is {actual}; processor config requires {expected}"
     )]
     VideoFeatureWidth {
+        /// Index of the video among the videos.
         index: usize,
+        /// `channels * temporal_patch_size * patch_size^2` from the config.
         expected: usize,
+        /// The tensor's second dimension.
         actual: usize,
     },
+    /// A video was processed with a different temporal patch size than the config's.
     #[error(
         "Qwen2.5-VL processed video {index} temporal patch size is {actual}; processor config requires {expected}"
     )]
     VideoTemporalPatchSize {
+        /// Index of the video among the videos.
         index: usize,
+        /// The config's temporal patch size.
         expected: usize,
+        /// The video's temporal patch size.
         actual: usize,
     },
+    /// A video has no sampled frame.
     #[error("Qwen2.5-VL processed video {index} has no sampled frames")]
-    VideoEmptySampledFrames { index: usize },
+    VideoEmptySampledFrames {
+        /// Index of the video among the videos.
+        index: usize,
+    },
+    /// A video has more sampled frames than the cap.
     #[error(
         "Qwen2.5-VL processed video {index} has {actual} sampled frames, exceeding the {limit}-frame cap"
     )]
     VideoTooManySampledFrames {
+        /// Index of the video among the videos.
         index: usize,
+        /// The video's sampled frame count.
         actual: usize,
+        /// The cap, `MAX_VIDEO_FRAMES`.
         limit: usize,
     },
+    /// Padding a video's frame count to a temporal patch multiple overflows `usize`.
     #[error("Qwen2.5-VL processed video {index} padded frame count overflows usize")]
-    VideoPaddedFrameCountOverflow { index: usize },
+    VideoPaddedFrameCountOverflow {
+        /// Index of the video among the videos.
+        index: usize,
+    },
+    /// A video's padded frame count is not a multiple of its temporal patch size, or is smaller than its sampled count.
     #[error(
         "Qwen2.5-VL processed video {index} sampled count {sampled_frame_count} with temporal patch size {temporal_patch_size} pads to incompatible count {padded_frame_count}"
     )]
     VideoIncompatibleTemporalPadding {
+        /// Index of the video among the videos.
         index: usize,
+        /// Frames the sampler selected.
         sampled_frame_count: usize,
+        /// Frames merged into one temporal patch.
         temporal_patch_size: usize,
+        /// The padded frame count found.
         padded_frame_count: usize,
     },
+    /// A video's padded frame count exceeds the frame cap.
     #[error(
         "Qwen2.5-VL processed video {index} has {sampled_frame_count} sampled frames and derived padded count {padded_frame_count}, exceeding the {limit}-frame cap"
     )]
     VideoTooManyPaddedFrames {
+        /// Index of the video among the videos.
         index: usize,
+        /// Frames the sampler selected.
         sampled_frame_count: usize,
+        /// The padded frame count derived from it.
         padded_frame_count: usize,
+        /// The cap, `MAX_VIDEO_FRAMES`.
         limit: usize,
     },
+    /// A video records a padded frame count that differs from the one its sampled count and temporal patch size give.
     #[error(
         "Qwen2.5-VL processed video {index} records padded frame count {actual}; sampled count and temporal patch size require {expected}"
     )]
     VideoPaddedFrameCount {
+        /// Index of the video among the videos.
         index: usize,
+        /// The padded frame count derived.
         expected: usize,
+        /// The padded frame count the video records.
         actual: usize,
     },
+    /// A video's grid is not a valid patch grid.
     #[error("invalid Qwen2.5-VL processed video grid {index}: {source}")]
     VideoGrid {
+        /// Index of the video among the videos.
         index: usize,
+        /// Why the grid is refused.
         #[source]
         source: MropePositionError,
     },
+    /// A video grid's temporal dimension differs from the padded frame count over the temporal patch size.
     #[error(
         "Qwen2.5-VL processed video {index} grid temporal dimension is {actual}; padded frame count requires {expected}"
     )]
     VideoGridTemporal {
+        /// Index of the video among the videos.
         index: usize,
+        /// The temporal dimension the padded frame count requires.
         expected: usize,
+        /// The grid's temporal dimension.
         actual: usize,
     },
+    /// A video's frame rate and temporal patch size do not form valid timing.
     #[error("validate Qwen2.5-VL processed video {index} timing: {source}")]
     VideoTiming {
+        /// Index of the video among the videos.
         index: usize,
+        /// Why the timing is refused.
         #[source]
         source: MropeProcessorTimingError,
     },
+    /// A video's recorded seconds-per-grid-step is not the value its temporal patch size and sampled frame rate give.
     #[error(
         "Qwen2.5-VL processed video {index} seconds per grid step has bits {actual:#018x}; expected {expected:#018x} from temporal patch size and sampled FPS"
     )]
     VideoSecondsPerGridStep {
+        /// Index of the video among the videos.
         index: usize,
+        /// IEEE-754 bits of the expected value.
         expected: u64,
+        /// IEEE-754 bits of the recorded value.
         actual: u64,
     },
+    /// Summing the videos' rows overflows `usize`.
     #[error("Qwen2.5-VL combined processed-video row count overflows usize at video {index}")]
-    VideoRowCountOverflow { index: usize },
+    VideoRowCountOverflow {
+        /// The video at which the sum overflowed.
+        index: usize,
+    },
+    /// The combined videos' element count overflows `usize`.
     #[error("Qwen2.5-VL combined processed-video element count overflows usize")]
     VideoElementCountOverflow,
+    /// The combined videos' byte size overflows `usize`.
     #[error("Qwen2.5-VL combined processed-video byte count overflows usize")]
     VideoByteCountOverflow,
+    /// A video's tensor has a dtype other than the first video's.
     #[error("Qwen2.5-VL processed video {index} has dtype {actual}; expected {expected}")]
     VideoDtypeMismatch {
+        /// Index of the video among the videos.
         index: usize,
+        /// The dtype of the first video's tensor.
         expected: DType,
+        /// The dtype of this video's tensor.
         actual: DType,
     },
+    /// Reserving memory for the combined tensor failed.
     #[error("Qwen2.5-VL processed-media assembly could not reserve memory for {stage}")]
-    Allocation { stage: &'static str },
+    Allocation {
+        /// The buffer that failed to allocate.
+        stage: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

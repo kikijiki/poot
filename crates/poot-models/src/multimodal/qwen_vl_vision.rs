@@ -48,6 +48,7 @@ use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
 
+/// The Qwen2.5-VL vision tower's [`FamilyKey`]: a family of its own beside the text tower's.
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen2_5_vl_vision");
 
 /// The `Slot::Activation` inputs of a step beside [`PIXELS_SLOT`] (`[rows, patches, patch_dim]` F32,
@@ -55,8 +56,11 @@ pub const FAMILY: FamilyKey = FamilyKey::new("qwen2_5_vl_vision");
 /// row and column (`[rows, patches]` I32), its attention window and its frame (`[rows, patches]` F32
 /// ids, equal ids attend to each other).
 pub const POS_H_SLOT: &str = "pos_h";
+/// The grid column of each patch, `[rows, patches]` I32 (the width-axis rotary position).
 pub const POS_W_SLOT: &str = "pos_w";
+/// The attention window id of each patch, `[rows, patches]` F32.
 pub const WINDOW_SLOT: &str = "window";
+/// The frame id of each patch, `[rows, patches]` F32 (the mask of the full-attention blocks).
 pub const FRAME_SLOT: &str = "frame";
 
 /// The base of the vision tower's rotary frequencies (`VisionRotaryEmbedding`'s default).
@@ -164,6 +168,8 @@ pub struct Qwen25VlVisionParams {
 }
 
 impl Qwen25VlVisionParams {
+    /// Reads the typed config from the checkpoint's `vision_config`; a missing or inconsistent
+    /// field, or a full-attention block index past the layer count, is a typed [`ModelError::Config`].
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let RawConfig::HfJson { config, .. } = raw else {
             return Err(ModelError::Config {
@@ -232,6 +238,7 @@ impl Qwen25VlVisionParams {
         self.merge * self.merge
     }
 
+    /// The side of the merge cell: `merge_unit` is its square.
     pub fn spatial_merge_size(&self) -> usize {
         self.merge
     }
@@ -271,10 +278,17 @@ fn full_attention_blocks(
 /// Why an image grid has no geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GridError {
+    /// A grid with a zero dimension.
     #[error("a grid dimension of {0:?} is zero")]
     Zero([usize; 3]),
+    /// A grid whose height or width is not a multiple of the merge size.
     #[error("grid {grid:?}: height and width must be multiples of the merge size {merge}")]
-    NotMergeable { grid: [usize; 3], merge: usize },
+    NotMergeable {
+        /// The refused `[t, h, w]` grid.
+        grid: [usize; 3],
+        /// The spatial merge size.
+        merge: usize,
+    },
 }
 
 /// The grid facts one image's step binds, in window order (see the module docs): the order of the
@@ -357,18 +371,22 @@ impl PatchGeometry {
         self.pos_h.len()
     }
 
+    /// Each patch's grid row, in window order: the height-axis rotary position.
     pub fn pos_h(&self) -> &[i32] {
         &self.pos_h
     }
 
+    /// Each patch's grid column, in window order: the width-axis rotary position.
     pub fn pos_w(&self) -> &[i32] {
         &self.pos_w
     }
 
+    /// Each patch's attention window id, in window order; equal ids attend to each other.
     pub fn window(&self) -> &[f32] {
         &self.window
     }
 
+    /// Each patch's frame id, in window order; equal ids attend to each other.
     pub fn frame(&self) -> &[f32] {
         &self.frame
     }
@@ -412,6 +430,8 @@ struct Block {
     down_bias: Weight,
 }
 
+/// The built Qwen2.5-VL vision tower: config, name-resolved weights, the patch embedding, the
+/// transformer blocks and the merger. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct Qwen25VlVision {
     params: Qwen25VlVisionParams,

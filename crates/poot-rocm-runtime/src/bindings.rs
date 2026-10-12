@@ -28,6 +28,7 @@ pub const HSA_STATUS_SUCCESS: hsa_status_t = 0;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct hsa_agent_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
     pub handle: u64,
 }
 
@@ -36,6 +37,7 @@ pub struct hsa_agent_t {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct hsa_isa_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
     pub handle: u64,
 }
 
@@ -43,6 +45,7 @@ pub struct hsa_isa_t {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct hsa_signal_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
     pub handle: u64,
 }
 
@@ -57,6 +60,7 @@ pub struct hsa_queue_t {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct hsa_amd_memory_pool_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
     pub handle: u64,
 }
 
@@ -68,18 +72,25 @@ pub type hsa_queue_type32_t = u32;
 
 // hsa.h agent info attribute ids
 
+/// `hsa_agent_get_info` attribute: the agent's name, a NUL-terminated string.
 pub const HSA_AGENT_INFO_NAME: u32 = 0;
+/// `hsa_agent_get_info` attribute: the agent's vendor name, a NUL-terminated string.
 pub const HSA_AGENT_INFO_VENDOR_NAME: u32 = 1;
+/// `hsa_agent_get_info` attribute: the largest queue the agent supports, in packets (`uint32_t`).
 pub const HSA_AGENT_INFO_QUEUE_MAX_SIZE: u32 = 14;
+/// `hsa_agent_get_info` attribute: the agent's wavefront width in work-items (`uint32_t`).
 pub const HSA_AGENT_INFO_WAVEFRONT_SIZE: u32 = 6;
 /// Returns an `hsa_device_type_t` (CPU=0, GPU=1, DSP=2). Query this for device type, not
 /// `HSA_AGENT_INFO_FEATURE` (a feature bitmask).
 pub const HSA_AGENT_INFO_DEVICE: u32 = 17;
+/// `hsa_agent_get_info` attribute: the agent's first ISA, an [`hsa_isa_t`].
 pub const HSA_AGENT_INFO_ISA: u32 = 19;
 
 // hsa.h device types
 
+/// `hsa_device_type_t` value of a CPU agent.
 pub const HSA_DEVICE_TYPE_CPU: u32 = 0;
+/// `hsa_device_type_t` value of a GPU agent.
 pub const HSA_DEVICE_TYPE_GPU: u32 = 1;
 
 // hsa.h queue types
@@ -87,25 +98,34 @@ pub const HSA_DEVICE_TYPE_GPU: u32 = 1;
 // `COOPERATIVE = 2`). Do not swap MULTI/SINGLE: ROCr's device-memory ring path and ordinary
 // publication go through MULTI (=0).
 
+/// Queue type: several producers may enqueue (ROCr's ordinary queue).
 pub const HSA_QUEUE_TYPE_MULTI: hsa_queue_type32_t = 0;
+/// Queue type: a cooperative queue (GWS-capable), required by persistent cooperative kernels.
 pub const HSA_QUEUE_TYPE_COOPERATIVE: hsa_queue_type32_t = 2;
 
 // hsa.h queue feature bits
 
+/// Queue feature bit: the queue accepts kernel-dispatch AQL packets.
 pub const HSA_QUEUE_FEATURE_KERNEL_DISPATCH: u32 = 1;
 
 // hsa.h ISA info attribute ids
 
+/// `hsa_isa_get_info` attribute: the ISA name's length in bytes (`uint32_t`).
 pub const HSA_ISA_INFO_NAME_LENGTH: u32 = 0;
+/// `hsa_isa_get_info` attribute: the ISA name string (for example `amdgcn-amd-amdhsa--gfx1151`).
 pub const HSA_ISA_INFO_NAME: u32 = 1;
 
 // hsa_ext_amd.h agent info attribute ids (extension range)
 
 /// The agent's compute-unit count (`uint32_t`).
 pub const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
+/// AMD agent attribute: the PCI bus/device/function id (`uint32_t`).
 pub const HSA_AMD_AGENT_INFO_BDFID: u32 = 0xA006;
+/// AMD agent attribute: the marketing product name, a NUL-terminated string.
 pub const HSA_AMD_AGENT_INFO_PRODUCT_NAME: u32 = 0xA009;
+/// AMD agent attribute: the PCI domain (`uint32_t`).
 pub const HSA_AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
+/// AMD agent attribute: whether the agent supports cooperative queues (`bool`).
 pub const HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES: u32 = 0xA010;
 /// Bit-mask (`uint8_t[8]`) of agent memory properties. Test bits with `hsa_flag_isset64` using
 /// [`HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU`] as the bit index (the enum value is `1 << 0`, not a
@@ -122,47 +142,70 @@ pub const HSA_AMD_AGENT_INFO_MEMORY_AVAIL: u32 = 0xA015;
 
 // hsa_ext_amd.h memory pool info attribute ids
 
+/// Memory-pool attribute: the pool's `hsa_amd_segment_t` (`HSA_AMD_SEGMENT_GLOBAL` for device-visible pools).
 pub const HSA_AMD_MEMORY_POOL_INFO_SEGMENT: u32 = 0;
+/// Memory-pool attribute: the pool's `HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_*` bitmask (`uint32_t`).
 pub const HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS: u32 = 1;
 /// Size of this pool in bytes (`size_t` in the header, read as `u64`; ROCm/HSA is 64-bit only).
 /// Summed over every `HSA_AMD_SEGMENT_GLOBAL` pool of the GPU agent, this is the "total" half of the
 /// VRAM metric (used = total - `HSA_AMD_AGENT_INFO_MEMORY_AVAIL`).
 pub const HSA_AMD_MEMORY_POOL_INFO_SIZE: u32 = 2;
+/// Memory-pool attribute: the pool's `HSA_AMD_MEMORY_POOL_LOCATION_*` value (`uint32_t`).
 pub const HSA_AMD_MEMORY_POOL_INFO_LOCATION: u32 = 17;
+/// Memory-pool attribute: whether the application may allocate from the pool (`bool`).
 pub const HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED: u32 = 5;
 
 // hsa_ext_amd.h segment + location enum values
 
+/// `hsa_amd_segment_t` value of a global-segment pool.
 pub const HSA_AMD_SEGMENT_GLOBAL: u32 = 0;
+/// Pool location value: memory attached to a CPU.
 pub const HSA_AMD_MEMORY_POOL_LOCATION_CPU: u32 = 0;
+/// Pool location value: memory attached to a GPU.
 pub const HSA_AMD_MEMORY_POOL_LOCATION_GPU: u32 = 1;
 
 // hsa_ext_amd.h global-flag bitmasks
 
+/// Pool global flag: the pool may hold kernel-argument segments.
 pub const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1;
+/// Pool global flag: fine-grained pool (host and device coherent).
 pub const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 2;
+/// Pool global flag: coarse-grained pool (coherence only at synchronisation points).
 pub const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 4;
+/// Pool global flag: fine-grained across the extended (system) scope.
 pub const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED: u32 = 8;
 
 // hsa_ext_amd.h agent<->pool relationship attrs + link types
 
+/// Agent-to-pool attribute: the number of link hops on the path (`uint32_t`).
 pub const HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS: u32 = 1;
+/// Agent-to-pool attribute: an array of [`hsa_amd_memory_pool_link_info_t`], one per hop.
 pub const HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO: u32 = 2;
 
+/// `link_type` value of a PCIe hop.
 pub const HSA_AMD_LINK_INFO_TYPE_PCIE: u32 = 2;
 
 /// One hop on the path from an agent to a foreign memory pool (`hsa_amd_memory_pool_link_info_t`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct hsa_amd_memory_pool_link_info_t {
+    /// Minimum latency across the hop, in nanoseconds.
     pub min_latency: u32,
+    /// Maximum latency across the hop, in nanoseconds.
     pub max_latency: u32,
+    /// Minimum bandwidth across the hop, in MB/s.
     pub min_bandwidth: u32,
+    /// Maximum bandwidth across the hop, in MB/s.
     pub max_bandwidth: u32,
+    /// Whether 32-bit atomics are supported across the hop.
     pub atomic_support_32bit: bool,
+    /// Whether 64-bit atomics are supported across the hop.
     pub atomic_support_64bit: bool,
+    /// Whether the hop keeps both ends coherent.
     pub coherent_support: bool,
+    /// The hop's `HSA_AMD_LINK_INFO_TYPE_*` value.
     pub link_type: u32,
+    /// NUMA distance across the hop.
     pub numa_distance: u32,
 }
 
@@ -199,23 +242,39 @@ pub type hsa_kernel_dispatch_packet_setup_t = u16;
 //
 // Including `reserved1` makes the struct 72 bytes, so writing a packet overflows 8 bytes into the
 // next queue slot and the second dispatch fails with `HSA_STATUS_ERROR_INVALID_PACKET_FORMAT`.
+/// A 64-byte AQL kernel-dispatch packet (HSA_LARGE_MODEL layout, see the layout table above).
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct hsa_kernel_dispatch_packet_t {
+    /// Packet header: type, barrier bit and acquire/release fence scopes. Published last.
     pub header: hsa_packet_header_t,
+    /// Dimension count minus one in bits 0..1.
     pub setup: hsa_kernel_dispatch_packet_setup_t,
+    /// Workgroup size along x, in work-items.
     pub workgroup_size_x: u16,
+    /// Workgroup size along y, in work-items.
     pub workgroup_size_y: u16,
+    /// Workgroup size along z, in work-items.
     pub workgroup_size_z: u16,
+    /// Reserved by the spec; zero.
     pub reserved0: u16,
+    /// Grid size along x, in work-items (not workgroups).
     pub grid_size_x: u32,
+    /// Grid size along y, in work-items.
     pub grid_size_y: u32,
+    /// Grid size along z, in work-items.
     pub grid_size_z: u32,
+    /// Per-work-item scratch (private) segment size, in bytes.
     pub private_segment_size: u32,
+    /// Per-workgroup group (LDS) segment size, in bytes.
     pub group_segment_size: u32,
+    /// The kernel's code handle (`HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT`).
     pub kernel_object: u64,
+    /// Address of the kernel-argument segment the kernel reads its arguments from.
     pub kernarg_address: *mut c_void,
+    /// Reserved by the spec; zero.
     pub reserved2: u64,
+    /// Signal decremented when the dispatch completes; handle 0 means none.
     pub completion_signal: hsa_signal_t,
 }
 
@@ -246,6 +305,7 @@ pub type HsaQueueCreateCb =
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct hsa_code_object_reader_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
     pub handle: u64,
 }
 
@@ -254,6 +314,7 @@ pub struct hsa_code_object_reader_t {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct hsa_executable_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
     pub handle: u64,
 }
 
@@ -262,6 +323,7 @@ pub struct hsa_executable_t {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct hsa_loaded_code_object_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
     pub handle: u64,
 }
 
@@ -271,6 +333,7 @@ pub type hsa_default_float_rounding_mode_t = u32;
 
 /// Profile: `HSA_PROFILE_FULL = 1` (only full profile is supported for amdgcn kernels).
 pub const HSA_PROFILE_FULL: u32 = 1;
+/// `hsa_default_float_rounding_mode_t` value: the default mode (round-to-nearest-even).
 pub const HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT: u32 = 1;
 
 /// `hsa_profile_t` enum, aliased to u32 for the C ABI.
@@ -280,16 +343,23 @@ pub type hsa_profile_t = u32;
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct hsa_executable_symbol_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
     pub handle: u64,
 }
 
 /// Executable symbol info attributes queried.
 pub const HSA_EXECUTABLE_SYMBOL_INFO_TYPE: u32 = 0;
+/// Symbol attribute: the symbol name's length in bytes (`uint32_t`).
 pub const HSA_EXECUTABLE_SYMBOL_INFO_NAME_LENGTH: u32 = 1;
+/// Symbol attribute: the symbol name string.
 pub const HSA_EXECUTABLE_SYMBOL_INFO_NAME: u32 = 2;
+/// Symbol attribute: the kernel's code handle for a dispatch packet's `kernel_object` (`uint64_t`).
 pub const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT: u32 = 22;
+/// Symbol attribute: the kernel-argument segment size, in bytes (`uint32_t`).
 pub const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE: u32 = 11;
+/// Symbol attribute: the kernel's static group (LDS) segment size, in bytes (`uint32_t`).
 pub const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE: u32 = 13;
+/// Symbol attribute: the kernel's per-work-item private segment size, in bytes (`uint32_t`).
 pub const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE: u32 = 14;
 
 /// Symbol kinds (returned by `HSA_EXECUTABLE_SYMBOL_INFO_TYPE`): `HSA_SYMBOL_KIND_VARIABLE = 0`,
@@ -303,6 +373,7 @@ pub type hsa_executable_iterate_symbols_cb_t = Option<
 
 // hsa.h signal wait conditions (for hsa_signal_wait_scacquire's condition arg)
 
+/// Signal wait condition: wait while the value is less than the compare value.
 pub const HSA_SIGNAL_CONDITION_LT: u32 = 0;
 
 // hsa.h system info attribute ids (for hsa_system_get_info)
@@ -315,23 +386,34 @@ pub const HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY: u32 = 3;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct hsa_amd_profiling_dispatch_time_t {
+    /// Dispatch start, in system-timestamp ticks.
     pub start: u64,
+    /// Dispatch end, in system-timestamp ticks.
     pub end: u64,
 }
 
 // hsa.h wait states (for hsa_signal_wait_scacquire's state_hint arg)
 
+/// Wait-state hint: the waiter may block (sleep) rather than spin.
 pub const HSA_WAIT_STATE_BLOCKED: u32 = 1;
 
 // C enum parameter types (each an `int`-sized enum in the headers)
 
+/// C enum parameter type of an `hsa_agent_get_info` attribute id.
 pub type hsa_agent_info_t = u32;
+/// C enum parameter type of an `hsa_isa_get_info` attribute id.
 pub type hsa_isa_info_t = u32;
+/// C enum parameter type of an `hsa_system_get_info` attribute id.
 pub type hsa_system_info_t = u32;
+/// C enum parameter type of a signal wait condition.
 pub type hsa_signal_condition_t = u32;
+/// C enum parameter type of a signal wait-state hint.
 pub type hsa_wait_state_t = u32;
+/// C enum parameter type of a memory-pool attribute id.
 pub type hsa_amd_memory_pool_info_t = u32;
+/// C enum parameter type of an agent-to-pool attribute id.
 pub type hsa_amd_agent_memory_pool_info_t = u32;
+/// C enum parameter type of an executable-symbol attribute id.
 pub type hsa_executable_symbol_info_t = u32;
 
 // Header declarations of every HSA function the crate calls, transcribed from ROCm 7.2.3

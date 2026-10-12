@@ -28,9 +28,19 @@ pub enum Schedule {
     /// `width / cols` lanes per column; each lane reads `unroll` contiguous `K` elements per trip,
     /// and one LDS tree folds each column's lanes. `cols` is the launch-grid knob the
     /// planner picks per shape; `width` must be a multiple of `cols`.
-    Gemv { width: u32, cols: u32, unroll: u32 },
+    Gemv {
+        /// Lanes in the workgroup; a multiple of `cols`.
+        width: u32,
+        /// Adjacent output columns the workgroup owns.
+        cols: u32,
+        /// Contiguous `K` elements each lane reads per trip.
+        unroll: u32,
+    },
     /// `M > 1`: LDS-staged tiles (542b), for a contraction with no block-diagonal split.
-    Tiled { tile: TileSize },
+    Tiled {
+        /// The edge of the square output tile one workgroup computes.
+        tile: TileSize,
+    },
 }
 
 /// The tile edge of a [`Schedule::Tiled`] contraction, built only by [`TileSize::new`]. Card 658: a
@@ -54,6 +64,7 @@ impl TileSize {
         Ok(Self(tile))
     }
 
+    /// The tile edge, at least 1.
     pub const fn get(self) -> u32 {
         self.0
     }

@@ -72,7 +72,9 @@ const EXPECTED_I32: [f32; 4] = [10.0, 20.0, 10.0, 4_194_304.0];
 
 /// The case names, in the order of [`select_fixtures`].
 pub const STANDALONE_F32: &str = "select_f32_standalone_poisoned";
+/// The F32 select over the same poisoned words, placed so the planner fuses it into a region rather than leaving it a standalone `Select`.
 pub const FUSED_F32: &str = "select_f32_fused_region_poisoned";
+/// The select whose condition is an I32 slot holding nonzero words other than 1 (`2`, `-1`), which must all pick `if_true`.
 pub const STANDALONE_I32: &str = "select_i32_nonzero_condition";
 
 fn f32_tensor(bits: &[u32]) -> HostTensor {

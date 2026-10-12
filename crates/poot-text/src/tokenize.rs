@@ -48,15 +48,20 @@ pub struct GgufVocab {
 /// family's [`ChatFormat`].
 #[derive(Clone, Debug, Default)]
 pub struct ChatTemplate {
+    /// The jinja template text.
     pub template: Option<String>,
+    /// The string `{{ bos_token }}` renders to.
     pub bos_token: Option<String>,
+    /// The string `{{ eos_token }}` renders to.
     pub eos_token: Option<String>,
 }
 
 /// One encoder row's tokens: the ids and each token's segment id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncoderTokens {
+    /// Token ids.
     pub ids: Vec<u32>,
+    /// Each token's segment id.
     pub types: Vec<u32>,
 }
 
@@ -225,6 +230,7 @@ impl TextCodec {
         self.tokenizer.get_vocab(true)
     }
 
+    /// `prompt` as token ids, framed with the model's BOS (exactly one) and EOS-suffix where it has them.
     pub fn encode(&self, prompt: &str) -> Result<Vec<u32>> {
         // SentencePiece GGUFs use the correct SP-BPE encoder; everything else the HF tokenizer.
         let mut ids = match &self.spm {
@@ -282,6 +288,7 @@ impl TextCodec {
         })
     }
 
+    /// Token ids back to text, special tokens included.
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.tokenizer
             .decode(ids, false)

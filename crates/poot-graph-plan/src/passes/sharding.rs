@@ -71,20 +71,33 @@ pub enum ShardRule {
 pub enum ShardError {
     /// Equation `eqn` (`op`) reads a value split on `axis` and no propagation rule covers it.
     #[error("equation {eqn} ({op}) has no sharding rule for an operand split on axis {axis}")]
-    Unpropagatable { eqn: usize, op: String, axis: usize },
+    Unpropagatable {
+        /// Index of the equation.
+        eqn: usize,
+        /// Name of the equation's op.
+        op: String,
+        /// The axis the operand is split on.
+        axis: usize,
+    },
     /// The graph reads weight `weight` and the rule has no split for its role: multi-head latent
     /// attention, routed experts, mixers.
     #[error("weight {weight} ({role:?}) has no {rule:?} sharding rule")]
     NoRule {
+        /// The weight no rule covers.
         weight: WeightId,
+        /// The weight's role.
         role: WeightRole,
+        /// The rule that has no split for the role.
         rule: ShardRule,
     },
     /// An extent the split divides does not divide over the ranks.
     #[error("{what}: extent {extent} does not divide over {world} ranks")]
     NotDivisible {
+        /// What was being divided, for the message.
         what: String,
+        /// The extent that must divide.
         extent: usize,
+        /// The number of ranks.
         world: u32,
     },
     /// A packed weight's share would cut an encoding block, or the format has no per-row blocks.
@@ -92,25 +105,40 @@ pub enum ShardError {
         "weight {weight}: splitting {format:?} {shape:?} on axis {axis} cuts an encoding block"
     )]
     IllegalEncodingSplit {
+        /// The weight being split.
         weight: WeightId,
+        /// The weight's packed format.
         format: poot_quant::format::WeightFormat,
+        /// The weight's logical `[out, in]` shape.
         shape: [usize; 2],
+        /// The axis the rule splits.
         axis: usize,
     },
     /// A const names a weight of the map in a form the map does not store it in (a packed source of a
     /// dense weight, or a dense const of a packed one): its share cannot be sized.
     #[error("const {name} reads weight {weight} in a form it is not stored in")]
-    WeightForm { weight: WeightId, name: String },
+    WeightForm {
+        /// The weight the const reads.
+        weight: WeightId,
+        /// Name of the const.
+        name: String,
+    },
     /// A carried value is written with a layout it was not read with, or never decided.
     #[error("carried state {name}: written {written:?} but read {read:?}")]
     StateLayout {
+        /// Name of the carried value.
         name: String,
+        /// The layout it is read with.
         read: String,
+        /// The layout it is written with.
         written: String,
     },
     /// A validation witness, the output or an export is not the same on every rank.
     #[error("{what} is split across ranks")]
-    SplitResult { what: &'static str },
+    SplitResult {
+        /// What is split across ranks.
+        what: &'static str,
+    },
     /// The final stage of the lowered program does not hold the graph's output.
     #[error("the output is not computed by the final stage of the rank program")]
     OutputNotLast,
@@ -134,6 +162,7 @@ pub struct ShardedGraph {
     pub weights: Vec<(WeightId, usize)>,
     /// The result of every collective equation, in equation order.
     pub collectives: Vec<ValueId>,
+    /// The number of ranks the graph was sharded for.
     pub world: NonZeroU32,
 }
 

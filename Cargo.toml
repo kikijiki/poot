@@ -80,6 +80,7 @@ wildcard_imports = "deny"
 # Every crate inherits this table via `[lints] workspace = true`; no crate may declare its own `[lints]` table.
 [workspace.lints.rust]
 dead_code = "deny"
+missing_docs = "deny"
 deprecated = "deny"
 unfulfilled_lint_expectations = "deny"
 unreachable_pub = "deny"

@@ -13,14 +13,23 @@ use crate::multi_device::topology::{DeviceId, DeviceSpec};
 /// is for, only that the categories add up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ByteCategories {
+    /// Bytes the caller accounts to the source (or the carrier it is held in) on this device.
     pub source_or_carrier: u64,
+    /// Bytes the caller accounts to padding that only the transport needs.
     pub transport_padding: u64,
+    /// Bytes the caller accounts to dense constants resident on this device.
     pub dense_constants: u64,
+    /// Bytes the caller accounts to persistent state resident on this device.
     pub state: u64,
+    /// Bytes the caller accounts to activations on this device.
     pub activations: u64,
+    /// Bytes the caller accounts to kernel workspace on this device.
     pub workspace: u64,
+    /// Bytes the caller accounts to communication buffers on this device.
     pub communication: u64,
+    /// Bytes the caller accounts to program outputs held on this device.
     pub outputs: u64,
+    /// Bytes the caller holds back on purpose, outside every other category.
     pub reserve: u64,
 }
 
@@ -43,14 +52,23 @@ impl ByteCategories {
     }
 }
 
+/// Why a device's byte categories were not admitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AccountingError {
+    /// A device's categories sum past `u64::MAX`.
     #[error("device {device:?} byte categories overflowed u64")]
-    Overflow { device: DeviceId },
+    Overflow {
+        /// The device whose categories overflowed.
+        device: DeviceId,
+    },
+    /// A device's checked total is more than its usable capacity.
     #[error("device {device:?} needs {required} bytes but has {usable} usable")]
     CapacityExceeded {
+        /// The device that is over capacity.
         device: DeviceId,
+        /// The device's checked total across all categories, in bytes.
         required: u64,
+        /// The device's `usable_bytes`.
         usable: u64,
     },
 }

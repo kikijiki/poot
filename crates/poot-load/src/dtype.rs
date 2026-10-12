@@ -1,3 +1,6 @@
+//! Safetensors header helpers shared by the single-file and sharded readers: dtype-string parsing, header
+//! length bounds and the missing-field error.
+
 use super::LoadError;
 use poot_tensor::DType;
 

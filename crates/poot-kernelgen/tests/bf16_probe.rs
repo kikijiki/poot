@@ -1,3 +1,7 @@
+//! Compile-only probes that the target-neutral WMMA tile and tensor-core matmul bodies lower to NVPTX
+//! tensor-core instructions. Both are `#[ignore]`d: they write PTX to a temp directory for inspection and
+//! need no GPU (runtime correctness is a pod probe, not a row here).
+
 use poot_codegen::{Target, compile};
 use poot_kernel_ir::Ty;
 

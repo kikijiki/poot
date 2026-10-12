@@ -94,6 +94,7 @@ pub struct BlockTable {
 }
 
 impl BlockTable {
+    /// An empty table: no blocks, no tokens.
     pub fn new() -> Self {
         Self::default()
     }
@@ -103,6 +104,7 @@ impl BlockTable {
         self.len
     }
 
+    /// Whether no token is stored.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

@@ -36,12 +36,14 @@ pub enum Value {
     Host(HostTensor),
     /// An exact word-carrier value (derived BF16 words, exact I32 words).
     Exact(ExactValue),
+    /// A packed weight component, readable only by a packed consumer.
     Packed(PackedComponentRef),
     /// One source role of an expert-stacked packed table (an indexed packed contraction's carrier).
     PackedStack(PackedStackComponentRef),
 }
 
 impl Value {
+    /// The logical shape: the carrier's own for host and exact values, the source shape for a packed component, `[experts, slab bytes]` for a stack.
     pub fn shape(&self) -> Cow<'_, [usize]> {
         match self {
             Value::Host(t) => Cow::Borrowed(t.shape()),
@@ -84,6 +86,7 @@ impl Value {
         }
     }
 
+    /// The logical element count (for a packed carrier, the product of [`Self::shape`]).
     pub fn numel(&self) -> usize {
         match self {
             Value::Exact(value) => value.numel(),
@@ -138,22 +141,46 @@ impl From<PackedComponentRef> for Value {
     }
 }
 
+/// Why a packed carrier could not be consumed or decoded by the CPU oracle.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PackedEvalError {
+    /// A packed component reached an operation that does not read packed weights.
     #[error("packed component cannot be consumed by {operation}")]
-    WrongConsumer { operation: &'static str },
+    WrongConsumer {
+        /// The operation that was handed a packed component.
+        operation: &'static str,
+    },
+    /// A packed binding disagrees with the component it should match.
     #[error("packed binding {field} mismatch")]
-    Binding { field: &'static str },
+    Binding {
+        /// The binding field that disagrees.
+        field: &'static str,
+    },
+    /// The weight and its scale bindings are not backed by one shared payload allocation.
     #[error("packed weight and scale bindings do not share one Arc<PackedPayload>")]
     OwnerIdentity,
+    /// A packed row failed to decode.
     #[error("packed row decode failed at row {row}: {detail}")]
-    Decode { row: usize, detail: String },
+    Decode {
+        /// Row index within the packed table.
+        row: usize,
+        /// The decoder's refusal.
+        detail: String,
+    },
+    /// Oracle arithmetic over a packed table overflowed.
     #[error("packed CPU oracle arithmetic overflowed {field}")]
-    OracleArithmeticOverflow { field: &'static str },
+    OracleArithmeticOverflow {
+        /// The quantity that overflowed.
+        field: &'static str,
+    },
+    /// A packed read or materialization exceeded the oracle's own limit.
     #[error("packed CPU oracle {resource} budget exceeded: {requested} > {limit}")]
     OracleLimit {
+        /// What was limited.
         resource: &'static str,
+        /// What was asked for, in the resource's unit.
         requested: usize,
+        /// The limit, in the resource's unit.
         limit: usize,
     },
 }

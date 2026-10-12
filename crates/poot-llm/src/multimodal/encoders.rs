@@ -25,10 +25,13 @@ use poot_text::TextError;
 /// Why an encoder request is refused.
 #[derive(Debug, thiserror::Error)]
 pub enum EncoderError {
+    /// The driver refused or failed the `Encode` step.
     #[error(transparent)]
     Driver(#[from] DriverError),
+    /// Tokenizing the text for the encoder failed.
     #[error(transparent)]
     Text(#[from] TextError),
+    /// The text tokenizes to no token at all, so there is no row to pool or score.
     #[error("cannot embed empty text")]
     EmptyText,
 }
@@ -144,10 +147,12 @@ impl SentenceEncoder {
         })
     }
 
+    /// The pooling this encoder applies, read from the checkpoint's `1_Pooling` module at load.
     pub fn pooling(&self) -> Pooling {
         self.pooling
     }
 
+    /// The driver the encoder runs its `Encode` steps on.
     pub fn driver(&self) -> &Driver {
         &self.driver
     }
@@ -209,6 +214,7 @@ impl CrossEncoder {
         Ok(Self { driver, handle })
     }
 
+    /// The driver the cross-encoder runs its `Encode` steps on.
     pub fn driver(&self) -> &Driver {
         &self.driver
     }

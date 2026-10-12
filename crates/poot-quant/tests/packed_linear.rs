@@ -1,3 +1,6 @@
+//! Integration tests of [`PackedWeight`] and [`PackedPayload`] construction through the public API:
+//! shape validation, per-scheme source layouts, and the typed refusals of a malformed payload.
+
 use std::num::NonZeroUsize;
 
 use poot_quant::decode::DecodeError;

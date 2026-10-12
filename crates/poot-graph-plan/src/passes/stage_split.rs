@@ -222,6 +222,7 @@ pub struct BoundaryDescriptor {
     pub aval: TensorType,
     /// `aval.numel() * aval.dtype.byte_size()`, checked - the transfer size of this value.
     pub byte_len: usize,
+    /// Index of the stage that defines the value.
     pub producing_stage: usize,
     /// Ascending, deduplicated stages that read the value.
     pub consuming_stages: Vec<usize>,
@@ -543,60 +544,109 @@ fn tensor_byte_len(aval: &TensorType, value: ValueId) -> Result<usize, StageSpli
 /// classify a bad split without parsing diagnostics.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StageSplitError {
+    /// The stage assignment does not have one entry per equation.
     #[error("stage assignment covers {assigned} equations but the graph has {eqn_count}")]
-    AssignmentLength { assigned: usize, eqn_count: usize },
+    AssignmentLength {
+        /// Number of entries in the assignment.
+        assigned: usize,
+        /// Number of equations in the graph.
+        eqn_count: usize,
+    },
+    /// The stage assignment names no stage.
     #[error("stage assignment is empty")]
     EmptyAssignment,
+    /// An equation's stage is not the next in a contiguous, ascending run of stages.
     #[error(
         "equation {equation} assigns stage {stage}, which is not one contiguous run per stage in \
          order (expected stage {expected})"
     )]
     NonContiguousStage {
+        /// Index of the equation.
         equation: usize,
+        /// The stage the equation is assigned.
         stage: usize,
+        /// The stage the run required there.
         expected: usize,
     },
+    /// A cut position is not strictly inside the equation list.
     #[error("cut {index} is {cut}, outside the 1..{eqn_count} equation range")]
     CutOutOfRange {
+        /// Index of the cut in the cut list.
         index: usize,
+        /// The cut's equation position.
         cut: usize,
+        /// Number of equations in the graph.
         eqn_count: usize,
     },
+    /// A cut is not after the cut before it.
     #[error("cut {index} is {cut}, not after the previous cut {previous}")]
     CutOutOfOrder {
+        /// Index of the cut in the cut list.
         index: usize,
+        /// The cut's equation position.
         cut: usize,
+        /// The previous cut's equation position.
         previous: usize,
     },
+    /// The graph's layer tags are inconsistent, so layer cuts cannot be placed.
     #[error(transparent)]
     LayerTags(#[from] LayerTagError),
+    /// An `after_layer` cut names a layer past the last tagged one.
     #[error(
         "after_layer cut {cut} has no layer after it: the graph tags {layers} layer(s), so a cut \
          past the last layer would produce an empty stage"
     )]
-    LayerCutOutOfRange { cut: usize, layers: usize },
+    LayerCutOutOfRange {
+        /// The layer the cut names.
+        cut: usize,
+        /// Number of layers the graph tags.
+        layers: usize,
+    },
+    /// A boundary value's byte length does not fit `usize`.
     #[error("byte length of {value} overflows usize")]
-    ByteLenOverflow { value: ValueId },
+    ByteLenOverflow {
+        /// The value whose byte length overflowed.
+        value: ValueId,
+    },
+    /// A carried state pair would be split across two stages.
     #[error(
         "state pair {pair} ({state_input} -> {state_output}) spans stages {first_stage} and \
          {second_stage}; carried state must stay with one stage"
     )]
     StatePairSplit {
+        /// Index of the pair in the graph's state list.
         pair: usize,
+        /// The pair's state input value.
         state_input: ValueId,
+        /// The pair's state output value.
         state_output: ValueId,
+        /// The stage holding one side of the pair.
         first_stage: usize,
+        /// The stage holding the other side.
         second_stage: usize,
     },
+    /// A stage defines no value a later stage reads.
     #[error("stage {stage} produces no boundary value, so it cannot feed a later stage")]
-    StageWithoutExit { stage: usize },
+    StageWithoutExit {
+        /// The stage with no exit.
+        stage: usize,
+    },
+    /// The final stage neither defines nor binds the graph output.
     #[error(
         "stage {stage} is the final stage but neither defines nor binds the graph output {output}"
     )]
-    FinalStageMissingOutput { stage: usize, output: ValueId },
+    FinalStageMissingOutput {
+        /// Index of the final stage.
+        stage: usize,
+        /// The graph's output value.
+        output: ValueId,
+    },
+    /// A stage's cut-out graph failed the edit check.
     #[error("stage {stage} graph is invalid: {source}")]
     InvalidStage {
+        /// Index of the stage.
         stage: usize,
+        /// The editor's refusal.
         #[source]
         source: EditError,
     },

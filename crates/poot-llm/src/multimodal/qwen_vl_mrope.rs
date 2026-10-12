@@ -23,15 +23,22 @@ use poot_models::mrope::{
 use poot_tensor::HostTensor;
 use tokenizers::Tokenizer;
 
+/// What a checkpoint directory declares before its markers are reconciled: the model type, the mRoPE
+/// config, the processor's three marker strings and the tokenizer's id for each, where the vocabulary
+/// has one.
 #[derive(Clone, Debug)]
 pub struct QwenVlMropeSourceMetadata {
+    /// The model type `config.json` declares.
     pub model_type: QwenVlModelType,
+    /// The mRoPE configuration `config.json` declares: section widths, marker token ids and, when present,
+    /// temporal tokens per second.
     pub config: MropeConfigMetadata,
     processor_tokens: QwenVlProcessorSpecialTokenStrings,
     tokenizer_ids: [Option<u32>; 3],
 }
 
 impl QwenVlMropeSourceMetadata {
+    /// The processor's three marker strings (vision start, image pad, video pad) tagged with their kind, for pad expansion and marker discovery.
     pub fn processor_special_tokens(&self) -> [MropeProcessorSpecialToken<'_>; 3] {
         [
             MropeProcessorSpecialToken::new(
@@ -52,6 +59,7 @@ impl QwenVlMropeSourceMetadata {
         ]
     }
 
+    /// The markers the tokenizer actually has, as `(string, id)` pairs; a marker the vocabulary lacks is left out.
     pub fn tokenizer_special_tokens(&self) -> Vec<MropeTokenizerSpecialToken<'_>> {
         let roles = [
             QwenVlSpecialTokenRole::VisionStart,
@@ -68,10 +76,15 @@ impl QwenVlMropeSourceMetadata {
     }
 }
 
+/// The checkpoint facts mRoPE assembly needs, with the marker token ids already reconciled between
+/// `config.json` and the tokenizer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QwenVlMropeMetadata {
+    /// The model type `config.json` declares.
     pub model_type: QwenVlModelType,
+    /// The checkpoint's mRoPE configuration.
     pub config: MropeConfigMetadata,
+    /// The vision-start, image and video token ids, reconciled between the config and the tokenizer.
     pub special_tokens: MropeSpecialTokenIds,
 }
 
@@ -101,56 +114,95 @@ impl QwenVlMropeMetadataSnapshot {
     }
 }
 
+/// Why a checkpoint's mRoPE and processor metadata cannot be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum QwenVlMropeMetadataLoadError {
+    /// `config.json` has no usable mRoPE configuration.
     #[error(transparent)]
     Config(#[from] MropeConfigMetadataError),
+    /// The processor metadata (marker strings) could not be read.
     #[error(transparent)]
     Processor(#[from] QwenVlProcessorMetadataError),
+    /// The tokenizer file could not be loaded.
     #[error("load tokenizer {path:?}: {message}")]
-    Tokenizer { path: PathBuf, message: String },
+    Tokenizer {
+        /// The `tokenizer.json` that failed.
+        path: PathBuf,
+        /// The tokenizer library's error, rendered.
+        message: String,
+    },
+    /// The config's special token ids and the tokenizer's disagree.
     #[error(transparent)]
     SpecialTokens(#[from] MropeSpecialTokenReconcileError),
 }
 
+/// A request's token ids, grids and positions, with the grids borrowed from the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen25VlMropeModelInput<'a> {
+    /// The prompt's token ids, markers expanded.
     pub prompt_token_ids: &'a [u32],
+    /// One patch grid per image, in prompt order.
     pub image_grids: &'a [MropeGrid],
+    /// One patch grid per video, in prompt order.
     pub video_grids: &'a [MropeGrid],
+    /// The vision tower's spatial merge size the grids are counted with.
     pub spatial_merge_size: usize,
+    /// The checkpoint facts the positions were assembled with.
     pub metadata: QwenVlMropeMetadata,
+    /// Where every prompt token rotates (`Slot::MropePosition`).
     pub mrope_positions: MropePositionIds,
 }
 
+/// Why a model input cannot be assembled from prompt ids and grids.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlMropeModelInputError {
+    /// The checkpoint metadata could not be loaded.
     #[error(transparent)]
     Metadata(#[from] QwenVlMropeMetadataLoadError),
+    /// The checkpoint is a Qwen vision-language model of another type than Qwen2.5-VL.
     #[error("Qwen2.5-VL mRoPE model input does not support model type {model_type:?}")]
-    UnsupportedModelType { model_type: QwenVlModelType },
+    UnsupportedModelType {
+        /// The model type the checkpoint declares.
+        model_type: QwenVlModelType,
+    },
+    /// The positions could not be assembled from the prompt and grids.
     #[error(transparent)]
     PositionAssembly(#[from] MropePositionAssemblyError),
 }
 
+/// What an mRoPE model input is assembled from: a rendered prompt, the grids its media produced and the checkpoint directory.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen25VlRenderedPromptMropeModelInputRequest<'dir, 'prompt, 'data> {
+    /// The checkpoint directory holding `config.json`, `tokenizer.json` and the processor config.
     pub model_dir: &'dir Path,
+    /// The chat-template output with its pads already expanded to the merged-grid counts.
     pub rendered_prompt: &'prompt str,
+    /// One patch grid per image, in prompt order.
     pub image_grids: &'data [MropeGrid],
+    /// One patch grid per video, in prompt order.
     pub video_grids: &'data [MropeGrid],
+    /// The vision tower's spatial merge size the grids are counted with.
     pub spatial_merge_size: usize,
+    /// Frames merged into one temporal patch.
     pub temporal_patch_size: MropeTemporalPatchSize,
+    /// The per-video processor frame rates; required when `video_grids` is not empty.
     pub fps: Option<MropeProcessorFpsInput<'data>>,
 }
 
+/// The tokenized prompt, grids and positions of one request, with the grids borrowed from the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen25VlRenderedPromptMropeModelInput<'a> {
+    /// The prompt's token ids.
     pub prompt_token_ids: Vec<u32>,
+    /// One patch grid per image, in prompt order.
     pub image_grids: &'a [MropeGrid],
+    /// One patch grid per video, in prompt order.
     pub video_grids: &'a [MropeGrid],
+    /// The vision tower's spatial merge size the grids are counted with.
     pub spatial_merge_size: usize,
+    /// The checkpoint facts the positions were assembled with.
     pub metadata: QwenVlMropeMetadata,
+    /// Where every prompt token rotates (`Slot::MropePosition`).
     pub mrope_positions: MropePositionIds,
 }
 
@@ -159,11 +211,17 @@ pub struct Qwen25VlRenderedPromptMropeModelInput<'a> {
 /// Owned-token adapters implement this so splice and prefill helpers need no copied prompt or
 /// position object.
 pub trait Qwen25VlMropeModelInputView {
+    /// The prompt's token ids, the visual placeholders included.
     fn prompt_token_ids(&self) -> &[u32];
+    /// One patch grid per image, in prompt order.
     fn image_grids(&self) -> &[MropeGrid];
+    /// One patch grid per video, in prompt order.
     fn video_grids(&self) -> &[MropeGrid];
+    /// The vision tower's spatial merge size the grids are counted with.
     fn spatial_merge_size(&self) -> usize;
+    /// The checkpoint facts the positions were assembled with.
     fn metadata(&self) -> &QwenVlMropeMetadata;
+    /// Where every prompt token rotates (`Slot::MropePosition`).
     fn mrope_positions(&self) -> &MropePositionIds;
 }
 
@@ -200,19 +258,31 @@ macro_rules! impl_qwen25_vl_mrope_model_input_view {
 impl_qwen25_vl_mrope_model_input_view!(Qwen25VlMropeModelInput<'_>);
 impl_qwen25_vl_mrope_model_input_view!(Qwen25VlRenderedPromptMropeModelInput<'_>);
 
+/// Why a rendered prompt cannot be tokenized and positioned.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlRenderedPromptMropeModelInputError {
+    /// The checkpoint metadata could not be loaded.
     #[error(transparent)]
     Metadata(#[from] QwenVlMropeMetadataLoadError),
+    /// The tokenizer rejected the rendered prompt.
     #[error("tokenize rendered Qwen2.5-VL prompt with {path:?}: {message}")]
-    Tokenize { path: PathBuf, message: String },
+    Tokenize {
+        /// The `tokenizer.json` that was used.
+        path: PathBuf,
+        /// The tokenizer's error, rendered.
+        message: String,
+    },
+    /// The token ids and grids do not assemble into a model input.
     #[error(transparent)]
     ModelInput(#[from] Qwen25VlMropeModelInputError),
 }
 
+/// Which kind of visual media a processor tensor or grid list belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Qwen25VlProcessorMediaKind {
+    /// Still images.
     Image,
+    /// Video clips.
     Video,
 }
 
@@ -231,28 +301,45 @@ impl std::fmt::Display for Qwen25VlProcessorMediaKind {
 /// separate, in rendered-prompt order.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen25VlProcessorMedia<'a> {
+    /// The images' patches, `[rows, feature_width]`, concatenated in prompt order; `None` when there is no image.
     pub pixel_values: Option<&'a HostTensor>,
+    /// One patch grid per image, in the order of the rows of `pixel_values`.
     pub image_grids: &'a [MropeGrid],
+    /// The videos' patches, `[rows, feature_width]`, concatenated in prompt order; `None` when there is no video.
     pub pixel_values_videos: Option<&'a HostTensor>,
+    /// One patch grid per video, in the order of the rows of `pixel_values_videos`.
     pub video_grids: &'a [MropeGrid],
 }
 
+/// What a model input is assembled from when the media are already processed: a rendered prompt, the processed media and the checkpoint directory.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen25VlProcessorMediaMropeModelInputRequest<'dir, 'prompt, 'data> {
+    /// The checkpoint directory holding `config.json`, `tokenizer.json` and the processor config.
     pub model_dir: &'dir Path,
+    /// The chat-template output with its pads already expanded to the merged-grid counts.
     pub rendered_prompt: &'prompt str,
+    /// The processed images and videos.
     pub media: Qwen25VlProcessorMedia<'data>,
+    /// The vision tower's spatial merge size the grids are counted with.
     pub spatial_merge_size: usize,
+    /// Frames merged into one temporal patch.
     pub temporal_patch_size: MropeTemporalPatchSize,
+    /// The per-video processor frame rates; required when `media` holds a video.
     pub fps: Option<MropeProcessorFpsInput<'data>>,
 }
 
+/// A tokenized prompt, the processed media it refers to and the positions of its tokens; the media are borrowed from the request.
 #[derive(Clone, Debug)]
 pub struct Qwen25VlProcessorMediaMropeModelInput<'a> {
+    /// The prompt's token ids.
     pub prompt_token_ids: Vec<u32>,
+    /// The processed images and videos the prompt's placeholders stand for.
     pub media: Qwen25VlProcessorMedia<'a>,
+    /// The vision tower's spatial merge size the grids are counted with.
     pub spatial_merge_size: usize,
+    /// The checkpoint facts the positions were assembled with.
     pub metadata: QwenVlMropeMetadata,
+    /// Where every prompt token rotates (`Slot::MropePosition`).
     pub mrope_positions: MropePositionIds,
 }
 
@@ -282,46 +369,79 @@ impl Qwen25VlMropeModelInputView for Qwen25VlProcessorMediaMropeModelInput<'_> {
     }
 }
 
+/// Why processed media are not a consistent set of pixel tensors and grids.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Qwen25VlProcessorMediaError {
+    /// Grids exist for a kind but its pixel tensor is absent.
     #[error("Qwen2.5-VL processor {kind} grids require a pixel tensor")]
-    MissingPixels { kind: Qwen25VlProcessorMediaKind },
+    MissingPixels {
+        /// Whether the offending tensor and grids are the image or the video ones.
+        kind: Qwen25VlProcessorMediaKind,
+    },
+    /// A pixel tensor exists for a kind but has no grid.
     #[error("Qwen2.5-VL processor {kind} pixel tensor has no grids")]
-    UnexpectedPixels { kind: Qwen25VlProcessorMediaKind },
+    UnexpectedPixels {
+        /// Whether the offending tensor and grids are the image or the video ones.
+        kind: Qwen25VlProcessorMediaKind,
+    },
+    /// A pixel tensor is not rank 2.
     #[error("Qwen2.5-VL processor {kind} pixel tensor has shape {actual:?}; expected rank 2")]
     PixelRank {
+        /// Whether the offending tensor and grids are the image or the video ones.
         kind: Qwen25VlProcessorMediaKind,
+        /// The tensor's shape.
         actual: Vec<usize>,
     },
+    /// A pixel tensor's feature width is zero.
     #[error("Qwen2.5-VL processor {kind} pixel tensor feature width must be nonzero")]
-    ZeroFeatureWidth { kind: Qwen25VlProcessorMediaKind },
+    ZeroFeatureWidth {
+        /// Whether the offending tensor and grids are the image or the video ones.
+        kind: Qwen25VlProcessorMediaKind,
+    },
+    /// Summing the grids' patch counts overflows `usize`.
     #[error("Qwen2.5-VL processor {kind} raw grid row count overflows usize")]
-    GridRowCountOverflow { kind: Qwen25VlProcessorMediaKind },
+    GridRowCountOverflow {
+        /// Whether the offending tensor and grids are the image or the video ones.
+        kind: Qwen25VlProcessorMediaKind,
+    },
+    /// The pixel tensor's row count differs from the patches its grids describe.
     #[error(
         "Qwen2.5-VL processor {kind} pixel tensor has {actual} rows; raw grids require {expected}"
     )]
     PixelRowCount {
+        /// Whether the offending tensor and grids are the image or the video ones.
         kind: Qwen25VlProcessorMediaKind,
+        /// Rows the grids require.
         expected: usize,
+        /// Rows the tensor has.
         actual: usize,
     },
+    /// The pixel tensor's dtype is not f32, bf16 or f16.
     #[error(
         "Qwen2.5-VL processor {kind} pixel tensor has dtype {actual}; expected f32, bf16 or f16"
     )]
     PixelDtype {
+        /// Whether the offending tensor and grids are the image or the video ones.
         kind: Qwen25VlProcessorMediaKind,
+        /// The tensor's dtype.
         actual: DType,
     },
 }
 
+/// Why processed media and a rendered prompt do not assemble into a model input.
 #[derive(Debug, thiserror::Error)]
 pub enum Qwen25VlProcessorMediaMropeModelInputError {
+    /// The prompt could not be tokenized or positioned.
     #[error(transparent)]
     ModelInput(#[from] Qwen25VlRenderedPromptMropeModelInputError),
+    /// The processed media are inconsistent.
     #[error(transparent)]
     Media(#[from] Qwen25VlProcessorMediaError),
 }
 
+/// Read the checkpoint directory `dir`'s mRoPE configuration, processor marker strings and the
+/// tokenizer's ids for them. Fails when `config.json`, the processor config or `tokenizer.json` cannot
+/// be read or is invalid; it does not reconcile the config's ids with the tokenizer's.
 pub fn load_qwen_vl_mrope_source_metadata(
     dir: impl AsRef<Path>,
 ) -> Result<QwenVlMropeSourceMetadata, QwenVlMropeMetadataLoadError> {

@@ -43,6 +43,7 @@ impl EvalBudget {
         max_alloc_bytes: None,
     };
 
+    /// A budget with finite ceilings, for tests that need the budget refusal itself.
     #[cfg(any(test, feature = "test-support"))]
     pub const fn bounded(max_work_elements: u64, max_alloc_bytes: u64) -> Self {
         EvalBudget {
@@ -67,6 +68,7 @@ pub struct EvalOptions<'a> {
 }
 
 impl<'a> EvalOptions<'a> {
+    /// Options with `budget`, no observer, and no kept environment.
     pub fn new(budget: EvalBudget) -> Self {
         EvalOptions {
             budget,
@@ -77,6 +79,7 @@ impl<'a> EvalOptions<'a> {
         }
     }
 
+    /// Attach an observer that sees each allocation the walk charges.
     pub fn observer(mut self, observer: &'a mut dyn EvalObserver) -> Self {
         self.observer = Some(observer);
         self
@@ -130,6 +133,7 @@ impl<'a> EvalOptions<'a> {
 /// The result of one [`eval`] call.
 #[derive(Debug, Clone)]
 pub struct Evaluation {
+    /// The graph's output value.
     pub output: Value,
     /// State outputs in [`Graph::state`] order.
     pub state: Vec<Value>,

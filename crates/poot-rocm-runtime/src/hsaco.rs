@@ -908,10 +908,12 @@ impl RocmContext {
         Arc::clone(&self.batch_waits)
     }
 
+    /// What the context's sole HSA queue was created for.
     pub fn queue_role(&self) -> QueueRole {
         self.queue_role
     }
 
+    /// How the context's packet ring was created (its memory placement and host link).
     pub fn queue_ring_provenance(&self) -> QueueRingProvenance {
         self.queue_ring_provenance
     }
@@ -1016,6 +1018,7 @@ pub(crate) fn validate_kernarg_buffer(
 /// pool, is freed when its last [`RocmBuffer`] handle drops, and is initialized through the context's
 /// selected host-write or DMA strategy.
 impl RocmContext {
+    /// Allocate a zeroed kernarg buffer of `size` bytes; see the impl-level note on its pool and lifetime.
     pub fn allocate_kernarg(&self, size: usize) -> Result<RocmBuffer, RocmError> {
         self.allocate_zeroed(
             "allocate_kernarg",

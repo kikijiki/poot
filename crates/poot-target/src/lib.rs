@@ -34,7 +34,9 @@ pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
+    /// NVIDIA GPUs, lowered to PTX.
     Nvptx,
+    /// Any Vulkan device, lowered to SPIR-V (the wgpu and raw-Vulkan executors).
     SpirvVulkan,
     /// ROCm/AMDGPU executor. Carries the per-device arch (gfx code, wavefront, tensor-core family) so
     /// `plan_eqn` can gate the WMMA path on `TensorCoreSupport::Wmma16x16x16Rdna3` (spec 130).
@@ -45,6 +47,7 @@ pub enum Backend {
 /// capability descriptor that goes with it is the compiler's `Target`; this is the tag without the limits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetId {
+    /// A GPU lowering backend.
     Gpu(Backend),
     /// An AMD XDNA NPU: one core runs a sequential loop and a typed link recipe moves the data (POOT-664).
     /// Its limits are [`AieCaps`], not [`DeviceCaps`].
@@ -206,6 +209,7 @@ impl GfxCode {
             len: bytes.len() as u8,
         }
     }
+    /// The gfx code as text, e.g. `gfx1151`.
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("")
     }
@@ -231,6 +235,7 @@ pub struct AmdArch {
 /// Error classifying a runtime ISA name into an [`AmdArch`].
 #[derive(Debug, thiserror::Error)]
 pub enum ArchError {
+    /// The ISA name carries no `gfx` token to classify.
     #[error("could not find a gfx code in AMD ISA name {0:?}")]
     NoGfxCode(String),
 }
@@ -287,6 +292,7 @@ fn parse_gfx(isa: &str) -> Option<&str> {
 /// it cannot prove rather than assume a value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Queried<T> {
+    /// The measured (or API-guaranteed) value.
     Known(T),
     /// This API gives no way to read the property on this device.
     Unknown,
@@ -298,7 +304,12 @@ pub enum SubgroupSupport {
     /// Queried and confirmed absent.
     Absent,
     /// A subgroup has between `min_size` and `max_size` lanes (equal where the size is fixed).
-    Present { min_size: u32, max_size: u32 },
+    Present {
+        /// The smallest subgroup the device can run.
+        min_size: u32,
+        /// The largest subgroup the device can run.
+        max_size: u32,
+    },
 }
 
 /// The iGPU display watchdog can kill a dispatch that runs too long (Strix Halo RADV, card 163); no

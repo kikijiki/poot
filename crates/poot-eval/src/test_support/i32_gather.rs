@@ -17,6 +17,7 @@ use poot_tensor::{DType, HostTensor};
 
 /// One gather: its traced graph, the table it reads and the index slot's payload.
 pub struct GatherCase {
+    /// Case label, for failure messages.
     pub name: String,
     /// The traced graph. A backend compiles it for its own target.
     pub graph: Graph,

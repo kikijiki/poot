@@ -81,6 +81,7 @@ pub struct StopScanner {
 }
 
 impl StopScanner {
+    /// A scanner for `strings`; empty strings are dropped.
     pub fn new(strings: Vec<String>) -> Self {
         Self {
             strings: strings.into_iter().filter(|s| !s.is_empty()).collect(),

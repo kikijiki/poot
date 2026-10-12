@@ -11,12 +11,17 @@ use crate::model::TraceError;
 /// A layer's `gate`/`up` (`[inter, width]`) and `down` (`[width, inter]`) projections.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatedFfnWeights {
+    /// The gate projection `[inter, width]`, passed through the activation.
     pub gate: Weight,
+    /// The up projection `[inter, width]`, multiplied with the activated gate.
     pub up: Weight,
+    /// The down projection `[width, inter]`.
     pub down: Weight,
 }
 
 impl GatedFfnWeights {
+    /// Resolves layer `layer`'s gate, up and down tensors from `map` and checks each shape against
+    /// `width` and `inter`; a missing or mis-shaped tensor is a typed [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,
@@ -58,9 +63,17 @@ pub enum Glu {
     Gelu,
     /// gpt-oss's clamped swish GLU: `gate` clamped above at `limit`, `up` clamped to
     /// `[-limit, limit]`, then `gate * sigmoid(alpha * gate) * (up + 1)`.
-    Clamped { alpha: f32, limit: f32 },
+    Clamped {
+        /// The swish slope inside the sigmoid.
+        alpha: f32,
+        /// The clamp bound applied to `gate` (above) and `up` (both sides).
+        limit: f32,
+    },
     /// DeepSeek-V4's clamped SwiGLU: `silu(min(gate, limit)) * clamp(up, -limit, limit)`.
-    ClampedSilu { limit: f32 },
+    ClampedSilu {
+        /// The clamp bound applied to `gate` (above) and `up` (both sides).
+        limit: f32,
+    },
 }
 
 impl Glu {
@@ -141,12 +154,18 @@ pub enum Gelu {
 /// their biases when the model has them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlainMlpWeights {
+    /// The up projection `[inter, width]`.
     pub up: Weight,
+    /// The down projection `[width, inter]`.
     pub down: Weight,
+    /// The up and down biases (`[inter]`, `[width]`) in that order, when the model has them.
     pub bias: Option<[Weight; 2]>,
 }
 
 impl PlainMlpWeights {
+    /// Resolves layer `layer`'s up and down tensors (and their biases when `biased`) from `map` and
+    /// checks each shape against `width` and `inter`; a missing or mis-shaped tensor is a typed
+    /// [`WeightError`].
     pub fn new(
         map: &WeightMap,
         layer: usize,

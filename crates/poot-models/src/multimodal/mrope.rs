@@ -11,16 +11,23 @@
 /// through that mirror, so accepting a larger host position would make source verification lossy.
 pub const MAX_EXACT_MROPE_POSITION: usize = 1 << 24;
 
+/// Which kind of visual input a placeholder span carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MropeVisualKind {
+    /// A still image: a one-step temporal grid.
     Image,
+    /// A video: a multi-step temporal grid.
     Video,
 }
 
+/// The semantic role of a special token the span discovery recognizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MropeSpecialTokenKind {
+    /// The delimiter that opens a visual placeholder span.
     VisionStart,
+    /// The placeholder repeated once per merged image token.
     Image,
+    /// The placeholder repeated once per merged video token.
     Video,
 }
 
@@ -38,12 +45,16 @@ impl std::fmt::Display for MropeSpecialTokenKind {
 /// ids from its tokenizer/config; span discovery deliberately does not assign ids to token strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MropeSpecialTokenIds {
+    /// The id of the vision-start delimiter.
     pub vision_start: u32,
+    /// The id of the image placeholder.
     pub image: u32,
+    /// The id of the video placeholder.
     pub video: u32,
 }
 
 impl MropeSpecialTokenIds {
+    /// The three ids as given, unchecked; [`Self::try_new`] refuses a duplicate.
     pub const fn new(vision_start: u32, image: u32, video: u32) -> Self {
         Self {
             vision_start,
@@ -104,11 +115,14 @@ const MROPE_SPECIAL_TOKEN_ROLE_ORDER: [MropeSpecialTokenKind; 3] = [
 /// The tokenizer, not this record, maps the string to a token ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MropeProcessorSpecialToken<'a> {
+    /// The semantic role the marker plays.
     pub role: MropeSpecialTokenKind,
+    /// The marker string, as the processor or chat template spells it.
     pub token: &'a str,
 }
 
 impl<'a> MropeProcessorSpecialToken<'a> {
+    /// A marker record for `role`.
     pub const fn new(role: MropeSpecialTokenKind, token: &'a str) -> Self {
         Self { role, token }
     }
@@ -120,54 +134,86 @@ impl<'a> MropeProcessorSpecialToken<'a> {
 /// is representable. A live `tokenizers::Tokenizer::token_to_id` adapter can instead synthesize unique records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MropeTokenizerSpecialToken<'a> {
+    /// The marker string.
     pub token: &'a str,
+    /// The id the tokenizer assigns it.
     pub id: u32,
 }
 
 impl<'a> MropeTokenizerSpecialToken<'a> {
+    /// A tokenizer record mapping `token` to `id`.
     pub const fn new(token: &'a str, id: u32) -> Self {
         Self { token, id }
     }
 }
 
+/// Why processor markers, tokenizer ids and config ids do not reconcile into one marker set.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MropeSpecialTokenReconcileError {
+    /// The processor metadata names no marker for `role`.
     #[error("mRoPE processor metadata is missing {role} special token")]
-    MissingProcessorSpecialToken { role: MropeSpecialTokenKind },
+    MissingProcessorSpecialToken {
+        /// The role with no marker.
+        role: MropeSpecialTokenKind,
+    },
+    /// The processor metadata names more than one marker for `role`.
     #[error("mRoPE processor metadata has duplicate {role} special-token records")]
-    DuplicateProcessorSpecialToken { role: MropeSpecialTokenKind },
+    DuplicateProcessorSpecialToken {
+        /// The role with several markers.
+        role: MropeSpecialTokenKind,
+    },
+    /// Two roles share one marker string.
     #[error("mRoPE processor marker {token:?} is assigned to both {first} and {second}")]
     DuplicateProcessorMarker {
+        /// The shared marker string.
         token: String,
+        /// The first role carrying it.
         first: MropeSpecialTokenKind,
+        /// The second role carrying it.
         second: MropeSpecialTokenKind,
     },
+    /// The tokenizer has no id for a role's marker string.
     #[error("mRoPE tokenizer has no ID for {role} marker {token:?}")]
     UnknownTokenizerSpecialToken {
+        /// The role whose marker is unknown.
         role: MropeSpecialTokenKind,
+        /// The marker string.
         token: String,
     },
     #[error(
         "mRoPE tokenizer has duplicate records for marker {token:?}: IDs {first_id} and {second_id}"
     )]
+    /// The tokenizer carries two records for one marker string, with different ids.
     DuplicateTokenizerSpecialToken {
+        /// The marker string.
         token: String,
+        /// The first record's id.
         first_id: u32,
+        /// The second record's id.
         second_id: u32,
     },
+    /// Two roles resolve to the same tokenizer id.
     #[error("mRoPE tokenizer ID {token_id} is assigned to both {first} and {second}")]
     DuplicateTokenizerSpecialTokenId {
+        /// The shared id.
         token_id: u32,
+        /// The first role carrying it.
         first: MropeSpecialTokenKind,
+        /// The second role carrying it.
         second: MropeSpecialTokenKind,
     },
     #[error(
         "mRoPE {role} marker {token:?} resolves to tokenizer ID {tokenizer_id}, but config metadata declares {config_id}"
     )]
+    /// The tokenizer's id for a role disagrees with the id `config.json` declares.
     ConfigSpecialTokenMismatch {
+        /// The role that disagrees.
         role: MropeSpecialTokenKind,
+        /// The marker string.
         token: String,
+        /// The id the tokenizer resolves the marker to.
         tokenizer_id: u32,
+        /// The id the config declares.
         config_id: u32,
     },
 }
@@ -321,14 +367,17 @@ pub struct MropeConfigMetadata {
 }
 
 impl MropeConfigMetadata {
+    /// The per-axis rotary section widths `[temporal, height, width]`, in rotary pairs.
     pub const fn mrope_section(&self) -> [usize; 3] {
         self.mrope_section
     }
 
+    /// The marker ids the config declares.
     pub const fn special_token_ids(&self) -> MropeSpecialTokenIds {
         self.special_token_ids
     }
 
+    /// The temporal position tokens per second, when the config states them (Qwen2.5-VL).
     pub const fn temporal_tokens_per_second(&self) -> Option<MropeTemporalTokensPerSecond> {
         self.temporal_tokens_per_second
     }
@@ -355,12 +404,16 @@ impl TryFrom<poot_load::qwen_vl::QwenVlHfMetadata> for MropeConfigMetadata {
     }
 }
 
+/// Why `config.json`'s mRoPE metadata cannot become a [`MropeConfigMetadata`].
 #[derive(Debug, thiserror::Error)]
 pub enum MropeConfigMetadataError {
+    /// The loader could not read the metadata.
     #[error(transparent)]
     Load(#[from] poot_load::qwen_vl::QwenVlHfMetadataError),
+    /// The declared marker ids are not distinct.
     #[error(transparent)]
     SpecialTokenIds(#[from] MropeSpanError),
+    /// The declared temporal token rate is not a positive finite number.
     #[error(transparent)]
     Timing(#[from] MropePositionError),
 }
@@ -377,12 +430,16 @@ impl std::fmt::Display for MropeVisualKind {
 /// Raw vision-grid dimensions before the spatial merge performed by the vision connector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MropeGrid {
+    /// Temporal steps.
     pub temporal: usize,
+    /// Patches along the height, before the spatial merge.
     pub height: usize,
+    /// Patches along the width, before the spatial merge.
     pub width: usize,
 }
 
 impl MropeGrid {
+    /// A grid of `temporal` steps over `height` by `width` patches.
     pub const fn new(temporal: usize, height: usize, width: usize) -> Self {
         Self {
             temporal,
@@ -404,9 +461,12 @@ impl MropeGrid {
     }
 }
 
+/// The unit a timing value is expressed in, named in errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MropeTimingUnit {
+    /// Seconds one temporal grid step covers.
     SecondsPerGridStep,
+    /// Temporal position tokens per second.
     TemporalTokensPerSecond,
 }
 
@@ -429,11 +489,13 @@ pub struct MropeSecondsPerGridStep(f64);
 impl Eq for MropeSecondsPerGridStep {}
 
 impl MropeSecondsPerGridStep {
+    /// Seconds per grid step; a non-finite or non-positive value is a typed error.
     pub fn new(value: f64) -> Result<Self, MropePositionError> {
         validate_timing(value, MropeTimingUnit::SecondsPerGridStep)?;
         Ok(Self(value))
     }
 
+    /// The value in seconds.
     pub const fn get(self) -> f64 {
         self.0
     }
@@ -455,6 +517,7 @@ impl MropeSecondsPerGridStep {
 pub struct MropeTemporalPatchSize(usize);
 
 impl MropeTemporalPatchSize {
+    /// A patch size in frames; zero is a typed error.
     pub fn new(value: usize) -> Result<Self, MropeProcessorTimingError> {
         if value == 0 {
             return Err(MropeProcessorTimingError::ZeroTemporalPatchSize);
@@ -462,6 +525,7 @@ impl MropeTemporalPatchSize {
         Ok(Self(value))
     }
 
+    /// The patch size in sampled frames.
     pub const fn get(self) -> usize {
         self.0
     }
@@ -477,6 +541,7 @@ pub struct MropeSampledFramesPerSecond(f64);
 impl Eq for MropeSampledFramesPerSecond {}
 
 impl MropeSampledFramesPerSecond {
+    /// A frame rate; a non-finite or non-positive value is a typed error.
     pub fn new(value: f64) -> Result<Self, MropeProcessorTimingError> {
         if !value.is_finite() {
             return Err(MropeProcessorTimingError::NonFiniteSampledFramesPerSecond);
@@ -487,6 +552,7 @@ impl MropeSampledFramesPerSecond {
         Ok(Self(value))
     }
 
+    /// The rate in frames per second.
     pub const fn get(self) -> f64 {
         self.0
     }
@@ -497,7 +563,9 @@ impl MropeSampledFramesPerSecond {
 /// This type assigns no processor default. `PerVideo` values remain in processor order.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MropeProcessorFpsInput<'a> {
+    /// One rate for every video.
     Scalar(f64),
+    /// One rate per video, in processor order.
     PerVideo(&'a [f64]),
 }
 
@@ -511,11 +579,13 @@ pub struct MropeTemporalTokensPerSecond(f64);
 impl Eq for MropeTemporalTokensPerSecond {}
 
 impl MropeTemporalTokensPerSecond {
+    /// Tokens per second; a non-finite or non-positive value is a typed error.
     pub fn new(value: f64) -> Result<Self, MropePositionError> {
         validate_timing(value, MropeTimingUnit::TemporalTokensPerSecond)?;
         Ok(Self(value))
     }
 
+    /// The rate in temporal position tokens per second.
     pub const fn get(self) -> f64 {
         self.0
     }
@@ -524,11 +594,14 @@ impl MropeTemporalTokensPerSecond {
 /// Complete already-resolved Qwen2.5-VL temporal scaling metadata for one video grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MropeVideoTiming {
+    /// Seconds one temporal grid step of the video covers.
     pub seconds_per_grid_step: MropeSecondsPerGridStep,
+    /// The model's temporal position tokens per second.
     pub temporal_tokens_per_second: MropeTemporalTokensPerSecond,
 }
 
 impl MropeVideoTiming {
+    /// The timing of one video from its two resolved values.
     pub const fn new(
         seconds_per_grid_step: MropeSecondsPerGridStep,
         temporal_tokens_per_second: MropeTemporalTokensPerSecond,
@@ -629,22 +702,34 @@ pub fn assemble_qwen2_5_vl_video_timings_with_default(
 /// metadata is used for the model's temporal-token rate when video timings are needed.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen25VlMropePositionInput<'a> {
+    /// The tokenized prompt.
     pub tokens: &'a [u32],
+    /// The marker ids reconciled for this tokenizer and config.
     pub special_tokens: MropeSpecialTokenIds,
+    /// One grid per image, in marker order.
     pub image_grids: &'a [MropeGrid],
+    /// One grid per video, in marker order.
     pub video_grids: &'a [MropeGrid],
+    /// The vision connector's spatial merge size.
     pub spatial_merge_size: usize,
+    /// The processor's temporal patch size.
     pub temporal_patch_size: MropeTemporalPatchSize,
+    /// The explicit sampled frame rate input, or `None` for the processor default.
     pub fps: Option<MropeProcessorFpsInput<'a>>,
+    /// The model's mRoPE metadata.
     pub config: &'a MropeConfigMetadata,
 }
 
+/// Why mRoPE positions could not be assembled from a tokenized prompt.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MropePositionAssemblyError {
+    /// Span discovery refused the prompt.
     #[error(transparent)]
     Span(#[from] MropeSpanError),
+    /// A video's processor timing could not be resolved.
     #[error(transparent)]
     ProcessorTiming(#[from] MropeProcessorTimingError),
+    /// The position constructor refused a segment.
     #[error(transparent)]
     Position(#[from] MropePositionError),
     /// Span discovery found more videos than timings were assembled for.
@@ -698,25 +783,34 @@ pub fn assemble_qwen2_5_vl_mrope_positions(
 /// processor-specific delimiter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MropeSegment {
+    /// A run of this many text tokens, advancing all three axes together.
     Text(usize),
+    /// An image placeholder run over this grid.
     Image(MropeGrid),
     /// Qwen2-VL compatibility path. Temporal positions have unit stride.
     Video(MropeGrid),
     /// Qwen2.5-VL path. The caller has already resolved timing and model-rate metadata.
     TimestampedVideo {
+        /// The video's raw grid.
         grid: MropeGrid,
+        /// The video's resolved timing.
         timing: MropeVideoTiming,
     },
 }
 
+/// One token's position on the three rotary axes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MropePosition {
+    /// The temporal axis position.
     pub temporal: i32,
+    /// The height axis position.
     pub height: i32,
+    /// The width axis position.
     pub width: i32,
 }
 
 impl MropePosition {
+    /// A text token's position: all three axes at `position`.
     pub const fn collapsed(position: i32) -> Self {
         Self {
             temporal: position,
@@ -725,12 +819,15 @@ impl MropePosition {
         }
     }
 
+    /// The position as `[temporal, height, width]`.
     #[cfg(any(test, feature = "test-support"))]
     pub const fn packed(self) -> [i32; 3] {
         [self.temporal, self.height, self.width]
     }
 }
 
+/// The three axes' positions for every token of a prompt, and the position the next generated
+/// text token takes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MropePositionIds {
     axes: [Vec<i32>; 3],
@@ -738,14 +835,17 @@ pub struct MropePositionIds {
 }
 
 impl MropePositionIds {
+    /// The number of prompt tokens.
     pub fn len(&self) -> usize {
         self.axes[0].len()
     }
 
+    /// Whether the prompt has no tokens.
     pub fn is_empty(&self) -> bool {
         self.axes[0].is_empty()
     }
 
+    /// The temporal, height and width position lists, one entry per prompt token.
     pub fn axes(&self) -> [&[i32]; 3] {
         [&self.axes[0], &self.axes[1], &self.axes[2]]
     }
@@ -760,6 +860,7 @@ impl MropePositionIds {
         packed
     }
 
+    /// The three axes' positions of prompt token `index`; out of range is a typed error.
     pub fn position(&self, index: usize) -> Result<MropePosition, MropePositionError> {
         if index >= self.len() {
             return Err(MropePositionError::IndexOutOfBounds {
@@ -781,115 +882,205 @@ impl MropePositionIds {
     }
 }
 
+/// Why a grid, a timing or a position request is refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MropePositionError {
+    /// The spatial merge size is zero.
     #[error("mRoPE spatial merge size must be nonzero")]
     ZeroSpatialMerge,
+    /// A grid dimension is zero.
     #[error("mRoPE {kind} grid dimension {axis} must be nonzero")]
     ZeroGridDimension {
+        /// Whether the grid is an image or a video.
         kind: MropeVisualKind,
+        /// Which dimension (`temporal`, `height` or `width`).
         axis: &'static str,
     },
     #[error(
         "mRoPE {kind} grid {axis} dimension {dimension} is not divisible by spatial merge size {merge}"
     )]
+    /// A grid's height or width is not a multiple of the spatial merge size.
     NonDivisibleGrid {
+        /// Whether the grid is an image or a video.
         kind: MropeVisualKind,
+        /// Which dimension.
         axis: &'static str,
+        /// Its extent.
         dimension: usize,
+        /// The spatial merge size.
         merge: usize,
     },
+    /// The merged token count does not fit `usize`.
     #[error("mRoPE token-count calculation overflowed")]
     TokenCountOverflow,
+    /// A timing value is not finite.
     #[error("mRoPE {unit} must be finite")]
-    NonFiniteTiming { unit: MropeTimingUnit },
+    NonFiniteTiming {
+        /// The unit the value was given in.
+        unit: MropeTimingUnit,
+    },
+    /// A timing value is not positive.
     #[error("mRoPE {unit} must be positive")]
-    NonPositiveTiming { unit: MropeTimingUnit },
+    NonPositiveTiming {
+        /// The unit the value was given in.
+        unit: MropeTimingUnit,
+    },
     #[error(
         "mRoPE timestamp-scaled temporal position at grid index {temporal_index} exceeds the CPU-oracle exact integer limit {MAX_EXACT_MROPE_POSITION}"
     )]
-    TemporalPositionOverflow { temporal_index: usize },
+    /// A timestamp-scaled temporal position passes the largest exactly representable position.
+    TemporalPositionOverflow {
+        /// The grid step whose position overflows.
+        temporal_index: usize,
+    },
     #[error(
         "mRoPE position {position} exceeds the CPU-oracle exact integer limit {MAX_EXACT_MROPE_POSITION}"
     )]
-    PositionOverflow { position: usize },
+    /// A position passes the largest exactly representable position.
+    PositionOverflow {
+        /// The refused position.
+        position: usize,
+    },
+    /// The layout covers another number of tokens than the graph expects.
     #[error("mRoPE position length mismatch: graph expects {expected} tokens, layout has {actual}")]
-    LengthMismatch { expected: usize, actual: usize },
+    LengthMismatch {
+        /// The token count the graph expects.
+        expected: usize,
+        /// The token count the layout has.
+        actual: usize,
+    },
+    /// A decode position index past the prompt's positions.
     #[error("mRoPE decode position index {index} is out of bounds for {len} prompt positions")]
-    IndexOutOfBounds { index: usize, len: usize },
+    IndexOutOfBounds {
+        /// The requested index.
+        index: usize,
+        /// The number of prompt positions.
+        len: usize,
+    },
 }
 
+/// Why the Qwen2.5-VL processor's timing inputs cannot become video timings.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MropeProcessorTimingError {
+    /// The temporal patch size is zero.
     #[error("mRoPE processor temporal patch size must be nonzero")]
     ZeroTemporalPatchSize,
+    /// A sampled frame rate is not finite.
     #[error("mRoPE processor sampled frames per second must be finite")]
     NonFiniteSampledFramesPerSecond,
+    /// A sampled frame rate is not positive.
     #[error("mRoPE processor sampled frames per second must be positive")]
     NonPositiveSampledFramesPerSecond,
     #[error(
         "mRoPE processor FPS count mismatch: expected {expected} values for the videos, got {actual}"
     )]
-    SampledFramesPerSecondCountMismatch { expected: usize, actual: usize },
+    /// A per-video rate list whose length is not the video count.
+    SampledFramesPerSecondCountMismatch {
+        /// The video count.
+        expected: usize,
+        /// The list's length.
+        actual: usize,
+    },
+    /// The model's config states no temporal tokens per second.
     #[error("mRoPE config metadata has no temporal tokens per second")]
     MissingTemporalTokensPerSecond,
+    /// The derived seconds per grid step is not a positive finite number.
     #[error(transparent)]
     SecondsPerGridStep(#[from] MropePositionError),
 }
 
+/// Why a tokenized prompt's visual marker spans are refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MropeSpanError {
+    /// Two marker roles share one token id.
     #[error("mRoPE special-token id {token_id} is assigned to both {first} and {second}")]
     DuplicateSpecialTokenId {
+        /// The shared id.
         token_id: u32,
+        /// The first role carrying it.
         first: MropeSpecialTokenKind,
+        /// The second role carrying it.
         second: MropeSpecialTokenKind,
     },
+    /// An image or video placeholder outside a vision span.
     #[error("mRoPE {marker} token at index {index} is outside a vision span")]
     MarkerOutsideSpan {
+        /// The stray marker's role.
         marker: MropeSpecialTokenKind,
+        /// Its token index.
         index: usize,
     },
     #[error(
         "mRoPE vision span starting at index {start_index} contains a nested vision start at index {index}"
     )]
-    NestedVisionStart { start_index: usize, index: usize },
+    /// A vision start inside an open vision span.
+    NestedVisionStart {
+        /// The opening vision start.
+        start_index: usize,
+        /// The nested one.
+        index: usize,
+    },
     #[error(
         "mRoPE vision start at index {start_index} has no image or video marker at index {index}"
     )]
-    MissingVisualMarker { start_index: usize, index: usize },
+    /// A vision start not followed by an image or video placeholder.
+    MissingVisualMarker {
+        /// The vision start.
+        start_index: usize,
+        /// Where the placeholder was expected.
+        index: usize,
+    },
     #[error(
         "mRoPE vision span starting at index {start_index} mixes {expected} and {actual} placeholders at index {index}"
     )]
+    /// A span that mixes image and video placeholders.
     MixedVisualMarkers {
+        /// The span's vision start.
         start_index: usize,
+        /// The kind the span opened with.
         expected: MropeVisualKind,
+        /// The kind found.
         actual: MropeVisualKind,
+        /// Where the other kind was found.
         index: usize,
     },
     #[error(
         "mRoPE {kind} span starting at index {start_index} has no grid at {kind} grid index {grid_index}"
     )]
+    /// A span with no grid left for its kind.
     MissingGrid {
+        /// The span's kind.
         kind: MropeVisualKind,
+        /// The span's vision start.
         start_index: usize,
+        /// The grid index the span needed.
         grid_index: usize,
     },
+    /// Grids the prompt's spans never consumed.
     #[error("mRoPE has extra {kind} grids: first unused index {first_unused}, total {total}")]
     ExtraGrids {
+        /// The grids' kind.
         kind: MropeVisualKind,
+        /// The first grid index no span used.
         first_unused: usize,
+        /// The number of grids supplied.
         total: usize,
     },
     #[error(
         "mRoPE {kind} span starting at index {start_index} has {actual} placeholders; grid requires {expected}"
     )]
+    /// A span whose placeholder count is not the grid's merged token count.
     PlaceholderCountMismatch {
+        /// The span's kind.
         kind: MropeVisualKind,
+        /// The span's vision start.
         start_index: usize,
+        /// The count the grid requires.
         expected: usize,
+        /// The count found.
         actual: usize,
     },
+    /// The span's grid or the spatial merge size is invalid.
     #[error(transparent)]
     Grid(#[from] MropePositionError),
 }
