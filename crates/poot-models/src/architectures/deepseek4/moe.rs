@@ -17,6 +17,7 @@ use crate::components::moe::{self, MoeWeights};
 use crate::components::router::{RouterKind, Routes, scores};
 use crate::components::standard::Step;
 use crate::components::witness::{self, WitnessKind};
+use crate::model::TraceError;
 
 /// A hash-routed layer's table of the experts each token id selects.
 #[derive(Debug)]
@@ -29,7 +30,7 @@ pub(super) struct HashTable {
 }
 
 impl HashTable {
-    pub fn new(
+    pub(super) fn new(
         map: &WeightMap,
         layer: usize,
         vocab: usize,
@@ -66,14 +67,14 @@ impl HashTable {
 
     /// The expert ids of each token of the step, `[rows * tokens, top_k]`, as the I32 words the
     /// router's selector reads: the tokens gather rows of the I32 table exactly.
-    fn ids(&self, b: &Builder, tokens: Traced) -> Traced {
+    fn ids(&self, b: &Builder, tokens: Traced) -> Result<Traced, TraceError> {
         let table = b.constant_ranged(
             &self.id.const_name(),
             TensorType::new(vec![self.vocab, self.top_k], DType::I32),
             self.experts,
-        );
-        let flat = b.reshape(tokens, vec![b.aval(tokens).numel()]);
-        b.gather(table, 0, flat)
+        )?;
+        let flat = b.reshape(tokens, vec![b.aval(tokens)?.numel()])?;
+        Ok(b.gather(table, 0, flat)?)
     }
 }
 
@@ -86,7 +87,11 @@ pub(super) struct RoutedWeights {
 }
 
 impl RoutedWeights {
-    pub fn new(map: &WeightMap, layer: usize, cfg: &DeepseekV4Config) -> Result<Self, WeightError> {
+    pub(super) fn new(
+        map: &WeightMap,
+        layer: usize,
+        cfg: &DeepseekV4Config,
+    ) -> Result<Self, WeightError> {
         let hash = cfg.is_hash_routed(layer);
         Ok(Self {
             moe: MoeWeights::new(
@@ -111,7 +116,7 @@ impl RoutedWeights {
     /// The routed block over `x` (`[rows, tokens, width]`) of layer `layer`. `tokens` are the
     /// step's token ids bounded by the vocabulary ([`super::stack::Tower::trace`]), which a hash
     /// layer indexes its table with.
-    pub fn trace(
+    pub(super) fn trace(
         &self,
         b: &Builder,
         step: &Step,
@@ -119,11 +124,11 @@ impl RoutedWeights {
         x: Traced,
         tokens: Traced,
         cfg: &DeepseekV4Config,
-    ) -> Traced {
+    ) -> Result<Traced, TraceError> {
         match &self.table {
             None => moe::moe(b, step, layer, x, None, &self.moe, &cfg.score_moe),
             Some(table) => {
-                let routes = hash_routes(b, step, layer, x, tokens, &self.moe, table, cfg);
+                let routes = hash_routes(b, step, layer, x, tokens, &self.moe, table, cfg)?;
                 moe::experts(b, x, routes, &self.moe, &cfg.hash_moe)
             }
         }
@@ -143,65 +148,65 @@ fn hash_routes(
     weights: &MoeWeights,
     table: &HashTable,
     cfg: &DeepseekV4Config,
-) -> Routes {
+) -> Result<Routes, TraceError> {
     let experts = cfg.hash_moe.experts();
     let k = table.top_k;
     let width = cfg.width;
     let shape = step.shape();
     let count = shape.rows.get() * shape.tokens.get();
 
-    let x = b.reshape(x, vec![count, width]);
-    let logits = linear(b, x, weights.router().weight(), None);
+    let x = b.reshape(x, vec![count, width])?;
+    let logits = linear(b, x, weights.router().weight(), None)?;
     witness::declare(
         step,
         layer,
         WitnessKind::RouterLogitsFinite,
-        witness::nonfinite_count(b, logits),
-    );
-    let ids = table.ids(b, tokens);
+        witness::nonfinite_count(b, logits)?,
+    )?;
+    let ids = table.ids(b, tokens)?;
     witness::declare(
         step,
         layer,
         WitnessKind::SelectorInRange,
-        witness::out_of_range_count(b, ids, experts),
-    );
+        witness::out_of_range_count(b, ids, experts)?,
+    )?;
 
     // The score of each selected expert: a one-hot over the expert axis, an exact I32 `0`/`1` that
     // widens to F32. Canonical scores keep an overflowing one finite, so an unselected expert's
     // `0 * score` is never NaN.
     let scores =
-        ops::canonical_router_scores(b, scores(b, logits, RouterKind::SqrtSoftplusBiasedTopK));
+        ops::canonical_router_scores(b, scores(b, logits, RouterKind::SqrtSoftplusBiasedTopK)?)?;
     let experts_row = b.broadcast(
-        b.reshape(b.iota_i32(experts), vec![1, 1, experts]),
+        b.reshape(b.iota_i32(experts)?, vec![1, 1, experts])?,
         vec![count, k, experts],
-    );
-    let ids_grid = b.broadcast(b.reshape(ids, vec![count, k, 1]), vec![count, k, experts]);
+    )?;
+    let ids_grid = b.broadcast(b.reshape(ids, vec![count, k, 1])?, vec![count, k, experts])?;
     let one_hot = b.cast(
         b.binary(
             BinOp::Mul,
-            b.binary(BinOp::Ge, ids_grid, experts_row),
-            b.binary(BinOp::Ge, experts_row, ids_grid),
-        ),
+            b.binary(BinOp::Ge, ids_grid, experts_row)?,
+            b.binary(BinOp::Ge, experts_row, ids_grid)?,
+        )?,
         DType::F32,
-    );
+    )?;
     let scores = b.broadcast(
-        b.reshape(scores, vec![count, 1, experts]),
+        b.reshape(scores, vec![count, 1, experts])?,
         vec![count, k, experts],
-    );
-    let selected = b.reduce(RedOp::Sum, b.binary(BinOp::Mul, one_hot, scores), 2, false);
-    let sum = b.reduce(RedOp::Sum, selected, 1, true);
+    )?;
+    let selected = b.reduce(RedOp::Sum, b.binary(BinOp::Mul, one_hot, scores)?, 2, false)?;
+    let sum = b.reduce(RedOp::Sum, selected, 1, true)?;
     witness::declare(
         step,
         layer,
         WitnessKind::SelectedSumUsable,
-        witness::unusable_sum_count(b, sum),
-    );
-    Routes {
+        witness::unusable_sum_count(b, sum)?,
+    )?;
+    Ok(Routes {
         ids,
         weights: b.binary_scalar(
             BinOp::Mul,
-            b.binary(BinOp::Div, selected, sum),
+            b.binary(BinOp::Div, selected, sum)?,
             Scalar::F32(cfg.route_scale),
-        ),
-    }
+        )?,
+    })
 }

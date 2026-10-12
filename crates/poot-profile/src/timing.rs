@@ -16,10 +16,9 @@
 //! step/host/device-sum totals for a window, and separately and honestly reports whether the
 //! per-dispatch detail for that window is still fully retained ([`Coverage`]).
 
+use poot_runtime_common::Coverage;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
-
-pub use poot_runtime_common::Coverage;
 
 /// Host wall time partitioned into the intervals the engine itself measures: encoding/submitting
 /// work (`encode`), blocking on the device (`wait`), and the step's total wall (`wall`). `other` (the
@@ -534,6 +533,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poot_runtime_common::Coverage;
 
     fn host(encode_ms: u64, wait_ms: u64, wall_ms: u64) -> HostTiming {
         HostTiming {

@@ -11,7 +11,7 @@
 //! (32-wide heads) fall back, the fused count drops to the local layers' and each row fails.
 
 use poot_graph_ir::op::OpKind;
-use poot_graph_plan::{CompileOptions, Plan, Submission, Target, compile};
+use poot_graph_plan::{CompileOptions, Plan, Target, compile, production_plan::Submission};
 use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
 use poot_models::registry::Registry;
 use poot_target::{AmdArch, Backend};
@@ -60,7 +60,9 @@ fn attention_dispatches(
     phase: Phase,
     shape: StepShape,
 ) -> Vec<usize> {
-    let graph = model.trace(phase, shape).unwrap();
+    let graph = model
+        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .unwrap();
     let target = Target::Gpu {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),

@@ -18,7 +18,6 @@ use poot_quant::weights::{
 };
 use poot_tensor::DType;
 
-use crate::chat::ChatFormat;
 use crate::components::dims::{Field, Fields};
 use crate::components::embed::Embedding;
 use crate::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
@@ -31,6 +30,7 @@ use crate::model::{
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 pub const FAMILY: FamilyKey = FamilyKey::new("bert");
 
@@ -330,7 +330,7 @@ impl Projection {
         })
     }
 
-    pub(crate) fn apply(&self, b: &Builder, x: Traced) -> Traced {
+    pub(crate) fn apply(&self, b: &Builder, x: Traced) -> Result<Traced, TraceError> {
         linear(b, x, &self.weight, Some(&self.bias))
     }
 }
@@ -344,23 +344,23 @@ pub(crate) fn bidirectional_attention(
     [q, k, v, o]: [&Projection; 4],
     (heads, head_dim): (usize, usize),
     mask: Option<Traced>,
-) -> Traced {
-    let shape = b.aval(x).shape;
+) -> Result<Traced, TraceError> {
+    let shape = b.aval(x)?.shape;
     let (rows, tokens) = (shape[0], shape[1]);
     let split = |proj: &Projection| {
-        let y = b.reshape(proj.apply(b, x), vec![rows, tokens, heads, head_dim]);
-        b.transpose(y, vec![0, 2, 1, 3])
+        let y = b.reshape(proj.apply(b, x)?, vec![rows, tokens, heads, head_dim])?;
+        Ok::<_, TraceError>(b.transpose(y, vec![0, 2, 1, 3])?)
     };
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let (q, k, v) = (split(q), split(k), split(v));
+    let (q, k, v) = (split(q)?, split(k)?, split(v)?);
     let out = match mask {
-        Some(mask) => ops::attention_masked(b, q, k, v, 1, scale, mask),
-        None => ops::attention(b, q, k, v, 1, scale),
+        Some(mask) => ops::attention_masked(b, q, k, v, 1, scale, mask)?,
+        None => ops::attention(b, q, k, v, 1, scale)?,
     };
     let merged = b.reshape(
-        b.transpose(out, vec![0, 2, 1, 3]),
+        b.transpose(out, vec![0, 2, 1, 3])?,
         vec![rows, tokens, heads * head_dim],
-    );
+    )?;
     o.apply(b, merged)
 }
 
@@ -469,12 +469,12 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
 }
 
 /// The F32 rows of `table` (`[n, width]`) at `ids` (`[rows, tokens]` I32): `[rows, tokens, width]`.
-fn table_rows(b: &Builder, table: &Weight, ids: Traced) -> Traced {
-    let rows = b.gather(table.declare(b), 0, ids);
-    if b.aval(rows).dtype == DType::F32 {
-        rows
+fn table_rows(b: &Builder, table: &Weight, ids: Traced) -> Result<Traced, TraceError> {
+    let rows = b.gather(table.declare(b)?, 0, ids)?;
+    if b.aval(rows)?.dtype == DType::F32 {
+        Ok(rows)
     } else {
-        b.cast(rows, DType::F32)
+        Ok(b.cast(rows, DType::F32)?)
     }
 }
 
@@ -487,7 +487,7 @@ impl Model for Bert {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         if phase != Phase::Encode {
             return Err(TraceError::PhaseUnsupported {
@@ -504,38 +504,33 @@ impl Model for Bert {
                 },
             });
         }
-        let b = Builder::new();
-        let step = Step::new(&b, shape).returning_hidden();
+        let step = Step::new(&b, shape)?.returning_hidden();
         let (rows, tokens) = (shape.rows.get(), shape.tokens.get());
         let ids = TensorType::new(vec![rows, tokens], DType::I32);
-        let types = b.slot_named(Slot::Activation, TOKEN_TYPE_SLOT, ids.clone());
+        let types = b.slot_named(Slot::Activation, TOKEN_TYPE_SLOT, ids.clone())?;
         // A key is real (1) or padding (0): declared so the mask's `I32 -> F32` cast is proven exact.
-        let real = b.slot_named_ranged(
-            Slot::Activation,
-            ATTENTION_MASK_SLOT,
-            ids,
-            IndexRange::below(2).expect("a two-word range"),
-        );
+        let real =
+            b.slot_named_ranged(Slot::Activation, ATTENTION_MASK_SLOT, ids, IndexRange::FLAG)?;
         // 0 for a real key, -1e9 for padding: the additive key mask every query shares.
         let mask = b.reshape(
             b.binary_scalar(
                 BinOp::Mul,
-                b.binary_scalar(BinOp::Sub, b.cast(real, DType::F32), Builder::f32(1.0)),
+                b.binary_scalar(BinOp::Sub, b.cast(real, DType::F32)?, Builder::f32(1.0))?,
                 Builder::f32(1.0e9),
-            ),
+            )?,
             vec![rows, 1, 1, tokens],
-        );
+        )?;
 
         let embedded = b.binary(
             BinOp::Add,
             b.binary(
                 BinOp::Add,
-                self.word.embed(&b, step.tokens()),
-                table_rows(&b, &self.positions, step.pos()),
-            ),
-            table_rows(&b, &self.types, types),
-        );
-        let mut x = norm_with(&b, embedded, &self.embed_norm, p.norm);
+                self.word.embed(&b, step.tokens())?,
+                table_rows(&b, &self.positions, step.pos())?,
+            )?,
+            table_rows(&b, &self.types, types)?,
+        )?;
+        let mut x = norm_with(&b, embedded, &self.embed_norm, p.norm)?;
         for (l, layer) in self.layers.iter().enumerate() {
             let _scope = b.layer_scope(l);
             let attn = bidirectional_attention(
@@ -544,17 +539,22 @@ impl Model for Bert {
                 [&layer.q, &layer.k, &layer.v, &layer.o],
                 (p.heads, p.head_dim),
                 Some(mask),
-            );
-            x = norm_with(&b, b.binary(BinOp::Add, x, attn), &layer.norms.attn, p.norm);
-            let ffn = plain_mlp(&b, x, &layer.ffn, p.gelu);
-            x = norm_with(&b, b.binary(BinOp::Add, x, ffn), &layer.norms.ffn, p.norm);
+            )?;
+            x = norm_with(
+                &b,
+                b.binary(BinOp::Add, x, attn)?,
+                &layer.norms.attn,
+                p.norm,
+            )?;
+            let ffn = plain_mlp(&b, x, &layer.ffn, p.gelu)?;
+            x = norm_with(&b, b.binary(BinOp::Add, x, ffn)?, &layer.norms.ffn, p.norm)?;
         }
         let out = match &self.classifier {
             None => x,
             Some(c) => {
-                let cls = b.slice(x, 1, 0, 1);
-                let pooled = ops::tanh(&b, c.pooler.apply(&b, cls));
-                linear(&b, pooled, &c.head, Some(&c.head_bias))
+                let cls = b.slice(x, 1, 0, 1)?;
+                let pooled = ops::tanh(&b, c.pooler.apply(&b, cls)?)?;
+                linear(&b, pooled, &c.head, Some(&c.head_bias))?
             }
         };
         Ok(step.finish(b, out)?)
@@ -584,7 +584,7 @@ pub(crate) fn encoder_shapes(
     config: &serde_json::Value,
     prefix: &str,
 ) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, w, inter) = (n("vocab_size"), n("hidden_size"), n("intermediate_size"));
     let (positions, types) = (n("max_position_embeddings"), n("type_vocab_size"));
     let name = |s: &str| format!("{prefix}{s}");
@@ -715,7 +715,7 @@ mod tests {
     /// checkpoint's own values: the final hidden state of every position `[t, width]`.
     fn reference(store: &WeightStore, prefix: &str, ids: &[i32], types: &[i32]) -> Vec<f64> {
         let config = fixture_config();
-        let n = |f: &str| config[f].as_u64().unwrap() as usize;
+        let n = |f: &str| crate::registry::Fixture::count(&config, f);
         let (w, heads, layers, inter) = (
             n("hidden_size"),
             n("num_attention_heads"),
@@ -845,7 +845,11 @@ mod tests {
             .collect();
         let pos: Vec<i32> = rows.iter().flat_map(|_| 0..tokens as i32).collect();
         let g = model
-            .trace(Phase::Encode, encode_shape(rows.len(), tokens))
+            .trace(
+                Phase::Encode,
+                encode_shape(rows.len(), tokens),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         oracle::eval_named(
             &g,
@@ -947,14 +951,22 @@ mod tests {
         let fx = fixture();
         let model = built(&ENTRY, &fx.raw(), &fx.store);
         assert!(matches!(
-            model.trace(Phase::Encode, encode_shape(1, 17)),
+            model.trace(
+                Phase::Encode,
+                encode_shape(1, 17),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported {
                 reason: ShapeReason::CapacityAboveMax { max: 16 },
                 ..
             })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, encode_shape(1, 4)),
+            model.trace(
+                Phase::Prefill,
+                encode_shape(1, 4),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::PhaseUnsupported {
                 phase: Phase::Prefill,
                 ..

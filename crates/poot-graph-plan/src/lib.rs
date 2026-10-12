@@ -21,30 +21,6 @@
 //! The `compile_fail` doctests that prove it live in `poot-llm`'s crate docs (SC-001), a consumer
 //! crate, which is where a bypass would have to be written.
 
-use poot_tensor::DType;
-use std::collections::HashMap;
-
-use poot_graph_ir::op::{
-    BinOp as GBinOp, ContractionHead, FusedOp, FusedOperand, FusedRegion, OpKind, RedOp, RowStep,
-    UnOp as GUnOp,
-};
-
-use poot_graph_ir::{Eqn, Graph, Operand, Scalar, ValidationPacketLayout, ValueId};
-
-use poot_kernel_ir::{BinOp, Body, MathOp, Ty, UnOp};
-
-use poot_kernelgen as kg;
-use poot_kernelgen::{
-    CastSpec, ContractionSpec, ElementwiseSpec, I32Binary, KernelRequest, MatmulShapes,
-    PackedRequest, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, TopKSpec, UnaryOp, ValueBinary,
-    ViewOperand, WeightLayout,
-};
-
-// `Layout` (strided views, spec 132) is defined in poot-kernelgen, the lower crate the generated kernel
-// bodies read through, and re-exported here for callers that depend only on poot-graph-plan (poot-gpu,
-// tests). See `compute_views` for how a value earns a non-contiguous one.
-pub use poot_kernelgen::Layout;
-
 /// Card 375b device witness admission: the structural classifier behind `plan_device_validation`.
 pub mod device_validation;
 
@@ -87,43 +63,6 @@ mod types;
 /// Buffer-plan lifetimes and arena slots: allocation follows the buffer plan, not one buffer per
 /// value (Card 547b).
 mod buffer_plan;
-
-pub use buffer_plan::{ArenaSlotId, BufferPlan};
-// `compile.rs`'s pipeline is this function's only caller (Card 547b, mirroring `dtype_widen`'s
-// `pub(crate)` passes above): no crate outside `poot-graph-plan` plans buffer lifetimes itself.
-pub(crate) use buffer_plan::plan_buffers;
-pub use device_validation::{DEVICE_WITNESS_MAGNITUDE_BOUND, DeviceWitnessRejection};
-
-pub use dtype_widen::{
-    bf16_const_feeds_only_packed_readers, matmul_amd_tc_eligible, matmul_bf16_column_gemv,
-    matmul_nvptx_tc_eligible, matmul_spirv_coopmat_eligible, matmul_tensor_core_eligible,
-    prepare_target_graph, widen_mismatched_matmul_dtypes,
-};
-// `compile.rs`'s pipeline runs these directly (Card 534a): `pub(crate)`, not `pub`,
-// so no crate outside `poot-graph-plan` - `poot-gpu`/`poot-rocm-gpu`/`poot-ptx-gpu` included - can name
-// or sequence them itself (SC-001). `prepare_target_graph`/`widen_mismatched_matmul_dtypes` above are the only
-// sanctioned entry points.
-pub(crate) use dtype_widen::{
-    fold_dense_bf16_row_gathers, fold_dense_contractions, lower_nonlast_reduces,
-};
-
-pub use packed_block_float::*;
-
-pub use predicates::*;
-
-pub use production_plan::*;
-
-pub use staged::*;
-pub use state_commit::*;
-
-pub use types::*;
-
-// `pootc` (a dev-dependency, card 559) reads `MANIFEST` to prove every committed asset matches its
-// manifest entry and regenerates byte-identical to its kernel source. `ImportedKernel` is `pub` too:
-// the `probe` family's kernels are each consumed by a different crate (`poot-rocm-gpu`'s `Device::copy`
-// and executor-contract fixtures, `poot-gpu`'s importer-capability probes), through this one accessor.
-pub use imported::{AssetDest, AssetEntry, ImportedKernel, MANIFEST};
-
 mod compile;
 mod graph_validation;
 mod kernel_mapping;
@@ -135,43 +74,45 @@ mod planner;
 mod refusal;
 mod storage_analysis;
 
-pub use compile::*;
-pub use graph_validation::*;
-pub(crate) use kernel_mapping::*;
+pub use buffer_plan::{ArenaSlotId, BufferPlan};
+pub use compile::{
+    CastRangeError, CompileError, CompileLimits, CompileOptions, ExpansionError, ExpertIdsError,
+    ExpertIdsGap, GraphResource, LoraError, LoraPlan, Program, SlotSchema, Target, compile,
+};
+pub use imported::ImportedKernel;
+#[cfg(any(test, feature = "test-support"))]
+pub use imported::{AssetDest, AssetEntry, MANIFEST};
 pub use kernel_mapping::{
     AieAbiRefusal, AieLimitRefusal, aie_shape_abi, validate_linked_artifact,
     validate_recipe_tile_local,
 };
 pub use passes::{
-    BoundaryDescriptor, ExpertStackRefusal, PackedBindError, PackedConst, PackedLayout, PoolError,
+    BoundaryDescriptor, DecomposeError, ExpertStackRefusal, LegalizeError, PackedBindError,
+    PackedConst, PackedDequantErrorContext, PackedDequantProductionError, PackedLayout, PoolError,
     PoolSite, PoolSpec, PooledWeight, ShardError, ShardRule, ShardedGraph, StageSplitError,
-    WeightFormats, WeightFormatsError, bind_packed_weights, routed_step_demand, shard,
+    WeightFormats, WeightFormatsError, bind_packed_weights, recognize_packed_contractions,
+    recognize_packed_row_gathers, routed_step_demand, shard,
 };
-// `poot-llm`'s CPU oracle (`core/cpu_oracle.rs`) claims a traced graph's packed contractions/row
-// gathers the same way `compile` does, so its eval matches what the device plans - a real production
-// cross-crate caller, not a test. `reject_packed_dequant_escapes` has no such caller (only `compile`'s
-// own escape gate), so it stays sealed below.
-pub use passes::{recognize_packed_contractions, recognize_packed_row_gathers};
-// Card 626 (SC-001): `compile` alone runs these in production - `passes` is a private module, so a
-// default build has no way to name or sequence one (`poot_graph_plan::passes::cse` does not resolve at
-// all). Gated here (not sealed with the rest, ADR-0113 point 3: no forwarder, consumers call the real
-// thing through this feature edge) because pass-soundness and plan-shape tests across the workspace
-// drive an individual pass directly - this crate's own `tests/*.rs` and every crate that already
-// enables `poot-test-util/graph-fixtures` (which carries `poot-graph-plan/test-support` back here) see
-// these; a default build does not.
-pub(crate) use passes::{CutSite, StageAssignment, split_stages};
+// Card 626 (SC-001): `compile` alone runs the graph passes in production - `passes` is a private module, so a
+// default build has no way to name or sequence one. Gated here (ADR-0113 point 3: no forwarder, consumers
+// call the real thing through this feature edge) because pass-soundness and plan-shape tests across the
+// workspace drive an individual pass directly.
+pub use graph_validation::{ValidationPacketPlan, ValidationPacketSource};
 #[cfg(any(test, feature = "test-support"))]
 pub use passes::{
-    DecomposeError, FUSABLE_FLOAT_UNARY_OPS, LegalizeError, PackedDequantErrorContext,
-    PackedDequantProductionError, canonicalize, canonicalize_with_declines,
-    collapse_reshape_chains, cse, dce, dce_with_roots, decompose_large_vocab_greedy,
-    elide_noop_transposes, flash_attention_capped, fold_iota, fuse, fuse_contraction_epilogues,
-    fuse_index_casts, fuse_widening_casts, legalize, passes_without_target,
-    reject_packed_dequant_escapes, rope_fusion,
+    RoutedExpertSite, canonicalize, collapse_reshape_chains, cse, dce,
+    decompose_large_vocab_greedy, elide_noop_transposes, flash_attention_capped, fold_iota, fuse,
+    legalize, passes_without_target, rope_fusion, routed_expert_sites,
 };
-pub use planner::*;
-pub use refusal::*;
-pub(crate) use storage_analysis::*;
+pub use planner::{KernelChoice, NoDispatch, Planned, dispatch_work};
+#[cfg(any(test, feature = "test-support"))]
+pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views};
+pub use predicates::{compute_views, numel, value_ids};
+pub use refusal::{Capability, FusedStepGap, Refusal, RefusalDtypes, StorageGap};
+pub use types::{
+    Binding, CollectiveKind, Dispatch, DispatchPlan, DispatchPlanError, GraphStorage, Launch, Plan,
+    PlanError, PlanKind, ScratchDecl, ScratchId, Sink, Source, ValueStorage,
+};
 
 #[cfg(test)]
 mod tests;
@@ -180,5 +121,7 @@ mod tests;
 #[cfg(test)]
 mod tests_gemv_coalesced;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 #[cfg(test)]
-mod test_support;
+mod unit_helpers;

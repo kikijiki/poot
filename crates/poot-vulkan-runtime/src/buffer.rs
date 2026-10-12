@@ -1,9 +1,9 @@
-use crate::*;
-
-pub use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot};
-/// Element kind, logical dtype and layout (card 527): the storage contract every runtime's buffer
-/// handle now carries. See [`poot_target::BufferStorage`].
-pub use poot_target::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
+use crate::resources::BufferResources;
+use crate::{DeviceOwner, RuntimeError};
+use ash::vk;
+use poot_runtime_common::{AllocGuard, BufferRole};
+use poot_target::{BufferStorage, ElementKind, StorageLayout};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A persistent, host-visible+coherent Vulkan buffer (see the module doc's "Memory model"), mapped for
 /// its whole lifetime. [`DeviceBuffer::read_f32`] copies from the mapped pointer into owned host data.
@@ -115,30 +115,6 @@ impl DeviceBuffer {
         Arc::ptr_eq(&self.inner.owner, owner)
     }
 
-    /// Validate a copy against this buffer's full storage contract (card 527, R484-001/R471-009): a
-    /// release check on element kind, logical dtype and layout together, not element kind alone (which
-    /// a packed or widened value can share with a buffer of a different logical meaning; see
-    /// [`poot_target::BufferStorage`]). Card 547a: `read_bytes`/`write_with` (this crate's
-    /// storage-typed primitives, like `poot_runtime::Context::read_bytes`/`write_with`) are
-    /// deliberately dtype-agnostic and do not call this; it stays as this crate's own test evidence
-    /// that the full storage contract (not element kind alone) is what a real binder must check.
-    #[cfg(test)]
-    pub(crate) fn check_storage(
-        &self,
-        op: &'static str,
-        expected: BufferStorage,
-    ) -> Result<(), RuntimeError> {
-        let actual = self.storage();
-        if actual != expected {
-            return Err(RuntimeError::RepresentationMismatch {
-                op,
-                expected,
-                actual,
-            });
-        }
-        Ok(())
-    }
-
     /// The underlying `VkBuffer` handle, for binding into a descriptor set. `pub(crate)`: outside callers only pass `&DeviceBuffer` to the dispatch methods.
     pub(crate) fn vk_buffer(&self) -> vk::Buffer {
         self.inner.buffer
@@ -146,7 +122,7 @@ impl DeviceBuffer {
 
     /// Read the first `out.len()` bytes of this buffer's `HOST_COHERENT` mapping into `out`, dtype-agnostic
     /// (Card 547a: the storage-typed read the executor contract's memory service needs, instead of one
-    /// reader per dtype; mirrors `poot_runtime::Context::read_bytes`). No invalidate is needed once the
+    /// reader per dtype; mirrors `poot_wgpu_runtime::Context::read_bytes`). No invalidate is needed once the
     /// writing submission has been fence-waited (see [`Context::dispatch`]). Refused with
     /// [`RuntimeError::Poisoned`] once a lost submission may still be writing the memory, and with
     /// [`RuntimeError::WriteCapacity`] if `out` is longer than the buffer.
@@ -272,6 +248,37 @@ impl Drop for DeviceBufferInner {
         // non-poisoned path above.
         unsafe {
             std::mem::ManuallyDrop::drop(&mut self.guard);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+    use poot_target::BufferStorage;
+
+    impl DeviceBuffer {
+        /// Validate a copy against this buffer's full storage contract (card 527, R484-001/R471-009): a
+        /// release check on element kind, logical dtype and layout together, not element kind alone (which
+        /// a packed or widened value can share with a buffer of a different logical meaning; see
+        /// [`poot_target::BufferStorage`]). Card 547a: `read_bytes`/`write_with` (this crate's
+        /// storage-typed primitives, like `poot_wgpu_runtime::Context::read_bytes`/`write_with`) are
+        /// deliberately dtype-agnostic and do not call this; it stays as this crate's own test evidence
+        /// that the full storage contract (not element kind alone) is what a real binder must check.
+        pub(crate) fn check_storage(
+            &self,
+            op: &'static str,
+            expected: BufferStorage,
+        ) -> Result<(), RuntimeError> {
+            let actual = self.storage();
+            if actual != expected {
+                return Err(RuntimeError::RepresentationMismatch {
+                    op,
+                    expected,
+                    actual,
+                });
+            }
+            Ok(())
         }
     }
 }

@@ -1,27 +1,25 @@
 //! `Gather`: one generic function over `T: Copy`, shared by every data carrier (the dense f32/i32
-//! lanes, the exact-I32 word lane, the owner-backed lazy checkpoint read, the Spec-376 BF16 table and
-//! E4M3FN), and one index rule ([`index_at`]) shared with every other index-consuming op.
+//! lanes, the exact-I32 word lane and E4M3FN), and one index rule ([`index_at`]) shared with every
+//! other index-consuming op.
 //!
 //! `out = data[..axis] ++ index.shape ++ data[axis+1..]`. A scalar index drops the axis
 //! (embedding/RoPE-row lookup); a vector index `[L]` replaces the axis with `L` (a whole prompt's
 //! embeddings).
 
-use poot_tensor::{DType, HostData, HostTensor};
+use poot_tensor::{HostData, HostTensor};
 use std::sync::Arc;
 
 use poot_graph_ir::ValueId;
 
 use super::index_rule::{IndexValue, index_at};
 use super::{element_count, row_major_strides};
-use crate::exact_bf16::ExactBf16TensorView;
-use crate::exact_value::ExactValue;
 use crate::operand::initialized_arc_slice;
 use crate::{EvalError, gather_source_flat};
 
 /// `out[flat] = data_at(source)`, `source` the row-major element of a conceptual tensor of
 /// `data_shape` that `index` selects. Both `data_at` and `index_at_pos` are read lazily, once per
-/// *output*/*index* element respectively, never once per source element: an owner-backed source far
-/// larger than the gathered rows (a checkpoint's embedding table) is never materialized just to
+/// *output*/*index* element respectively, never once per source element: a source far
+/// larger than the gathered rows (an embedding table) is never materialized just to
 /// select a handful of them (card 396), and `index_at_pos` reads straight from the caller's own I32 or
 /// F32 slice - no intermediate `Vec<IndexValue>` the size of `index` (card 554c
 /// allocation bound). Every index value is checked against `data_shape[axis]` through [`index_at`]
@@ -136,7 +134,7 @@ pub(crate) fn gather_host(
 
 impl crate::Value {
     /// The `Gather` entry point outside the walk's own equation loop (tests, and any future caller
-    /// with no equation id in scope): every carrier `OpKind::Gather` admits except [`ExactValue`],
+    /// with no equation id in scope): every carrier `OpKind::Gather` admits except [`crate::ExactValue`],
     /// whose row-selecting lanes only exist inside the walk's own I32-index dispatch
     /// (`walk::evaluate_gather`). `eqn` reads as `0` (the `EvalError::unsupported` convention).
     ///
@@ -152,77 +150,12 @@ impl crate::Value {
                         .into(),
                 )
             }
-            crate::Value::Owner(value) => Err(value.unsupported("Gather")),
+            crate::Value::Exact(value) => Err(value.unsupported("Gather")),
             crate::Value::Packed(_) | crate::Value::PackedStack(_) => {
                 Err(EvalError::Packed(crate::PackedEvalError::WrongConsumer {
                     operation: "Gather",
                 }))
             }
-        }
-    }
-}
-
-/// [`gather`] over an owner-backed exact source (an F32 or BF16 checkpoint tensor read lazily through
-/// its zero-copy view): the counterpart that keeps card 396's "never materialize the whole source"
-/// property for the exact-I32 lane's large embedding-table reads.
-pub(crate) fn gather_owner(
-    source: &ExactValue,
-    index_at_pos: impl Fn(usize) -> IndexValue,
-    index_len: usize,
-    index_shape: &[usize],
-    axis: usize,
-    eqn: ValueId,
-) -> Result<Arc<[f32]>, EvalError> {
-    match source {
-        ExactValue::Bf16(view) => gather(
-            |flat| view.value(flat),
-            view.shape(),
-            index_at_pos,
-            index_len,
-            index_shape,
-            axis,
-            eqn,
-        ),
-        ExactValue::Dense(view) if view.dtype() == DType::BF16 => {
-            // Cheap alias, not a decode: `from_owner_view` only wraps the same `Arc<ExactSourceOwner>`.
-            let bf16 = ExactBf16TensorView::from_owner_view(view).expect(
-                "DenseOwnerTensorView::new only ever pairs dtype BF16 with an owner of \
-                 ExactSourceKind::Bf16",
-            );
-            gather(
-                |flat| bf16.value(flat),
-                view.shape(),
-                index_at_pos,
-                index_len,
-                index_shape,
-                axis,
-                eqn,
-            )
-        }
-        ExactValue::Dense(view) => {
-            debug_assert_eq!(
-                view.dtype(),
-                DType::F32,
-                "DenseOwnerTensorView::new only admits BF16 or F32"
-            );
-            let bytes = view.bytes();
-            gather(
-                |flat| {
-                    let start = flat * 4;
-                    f32::from_le_bytes(bytes[start..start + 4].try_into().expect(
-                        "DenseOwnerTensorView::new already validated byte length against numel",
-                    ))
-                },
-                view.shape(),
-                index_at_pos,
-                index_len,
-                index_shape,
-                axis,
-                eqn,
-            )
-        }
-        ExactValue::I32(_) => {
-            unreachable!("gather_owner is never called for ExactValue::I32")
         }
     }
 }

@@ -8,7 +8,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_graph_ir::Slot;
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target, compile};
+use poot_graph_plan::{
+    CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
+};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{AmdArch, Backend, DeviceCaps};
@@ -51,7 +53,11 @@ fn shape(tokens: usize, capacity: usize, logits: LogitRows) -> StepShape {
 /// The names of the state a one-token decode step carries, in carry order.
 fn state_names(model: &dyn Model, capacity: usize) -> Vec<String> {
     let g = model
-        .trace(Phase::Decode, shape(1, capacity, LogitRows::All))
+        .trace(
+            Phase::Decode,
+            shape(1, capacity, LogitRows::All),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     g.state()
         .map(|(input, _)| g.meta(input).name.clone().unwrap())
@@ -304,7 +310,11 @@ fn the_hash_table_is_declared_in_the_expert_range() {
     let fx = fixture();
     let model = model_of(&fx);
     let g = model
-        .trace(Phase::Decode, shape(1, CAPACITY, LogitRows::All))
+        .trace(
+            Phase::Decode,
+            shape(1, CAPACITY, LogitRows::All),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let tables: Vec<_> = g
         .inputs()
@@ -371,9 +381,11 @@ fn an_expert_count_that_cannot_bound_the_hash_table_is_a_typed_config_refusal() 
 #[test]
 fn step_shapes_the_family_cannot_trace_are_typed_refusals() {
     let model = model_of(&fixture());
-    let reason = |phase, tokens, capacity| match model
-        .trace(phase, shape(tokens, capacity, LogitRows::Last))
-    {
+    let reason = |phase, tokens, capacity| match model.trace(
+        phase,
+        shape(tokens, capacity, LogitRows::Last),
+        poot_graph_ir::TraceLimits::for_tests(),
+    ) {
         Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     };
@@ -395,7 +407,11 @@ fn step_shapes_the_family_cannot_trace_are_typed_refusals() {
     );
     for tokens in [4, 8] {
         model
-            .trace(Phase::Prefill, shape(tokens, CAPACITY, LogitRows::Last))
+            .trace(
+                Phase::Prefill,
+                shape(tokens, CAPACITY, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
     }
 }
@@ -427,7 +443,9 @@ fn two_rows_do_not_share_state() {
         ..shape(tokens, CAPACITY, LogitRows::All)
     };
     let run = |phase, tokens: usize, ids: Vec<i32>, pos: Vec<i32>, state: Vec<Vec<f32>>| {
-        let g = model.trace(phase, two(tokens)).unwrap();
+        let g = model
+            .trace(phase, two(tokens), poot_graph_ir::TraceLimits::for_tests())
+            .unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()
             .map(|(si, _)| vec![0.0; g.aval(si).numel()])
@@ -710,9 +728,9 @@ fn a_real_dims_fp4_expert_projection_equals_the_hand_decoded_column_real_dims() 
     fx.packed(id, payload);
     let map: WeightMap = fx.map();
     let w = Weight::new(&map, id, &[out, k]).unwrap();
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, k]));
-    let y = linear(&b, x, &w, None);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, k])).unwrap();
+    let y = linear(&b, x, &w, None).unwrap();
     let g = b.finish(y).unwrap();
     let formats = poot_graph_plan::WeightFormats::from_weight_map(&map);
     let g = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
@@ -805,7 +823,11 @@ const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLi
 /// The traced and weight-bound graph of one step of `phase` at `tokens` tokens.
 fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
     let graph = model
-        .trace(phase, shape(tokens, CAPACITY, LogitRows::Last))
+        .trace(
+            phase,
+            shape(tokens, CAPACITY, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     poot_graph_plan::bind_packed_weights(
         &graph,
@@ -1036,7 +1058,11 @@ fn a_real_dims_layer_fixture_compiles_for_every_backend_real_dims() {
     let capacity = 256;
     for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 128)] {
         let graph = model
-            .trace(phase, shape(tokens, capacity, LogitRows::Last))
+            .trace(
+                phase,
+                shape(tokens, capacity, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let graph = poot_graph_plan::bind_packed_weights(
             &graph,

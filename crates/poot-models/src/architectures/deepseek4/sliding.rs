@@ -16,6 +16,7 @@ use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::norm;
 use crate::components::rope::{RopeRows, apply_rope};
 use crate::components::standard::Step;
+use crate::model::{TraceError, last_axis};
 
 /// One layer's attention weights (the compressed layers' extras are [`super::hca`] and
 /// [`super::csa`]'s).
@@ -32,7 +33,11 @@ pub(super) struct LocalWeights {
 }
 
 impl LocalWeights {
-    pub fn new(map: &WeightMap, layer: usize, cfg: &DeepseekV4Config) -> Result<Self, WeightError> {
+    pub(super) fn new(
+        map: &WeightMap,
+        layer: usize,
+        cfg: &DeepseekV4Config,
+    ) -> Result<Self, WeightError> {
         let (width, a) = (cfg.width, &cfg.attn);
         let w = |role, shape: &[usize]| Weight::new(map, WeightId::layer(layer, role), shape);
         let heads_width = a.heads * a.head_dim;
@@ -73,14 +78,19 @@ pub(super) struct Local {
 
 /// Rotate the trailing `rotary` dims of `x` (`[rows, heads, tokens, dim]`) with `rows`: the leading
 /// dims pass through. `rows` must have been made for a rotary width of `rotary`.
-pub(super) fn rotate_tail(b: &Builder, x: Traced, rows: &RopeRows, rotary: usize) -> Traced {
-    let dim = *b.aval(x).shape.last().expect("a head axis");
+pub(super) fn rotate_tail(
+    b: &Builder,
+    x: Traced,
+    rows: &RopeRows,
+    rotary: usize,
+) -> Result<Traced, TraceError> {
+    let dim = last_axis("rotate_tail", &b.aval(x)?.shape)?;
     if dim == rotary {
         return apply_rope(b, x, rows);
     }
-    let head = b.slice(x, 3, 0, dim - rotary);
-    let tail = b.slice(x, 3, dim - rotary, dim);
-    b.concat(3, &[head, apply_rope(b, tail, rows)])
+    let head = b.slice(x, 3, 0, dim - rotary)?;
+    let tail = b.slice(x, 3, dim - rotary, dim)?;
+    Ok(b.concat(3, &[head, apply_rope(b, tail, rows)?])?)
 }
 
 /// The local branch of layer `layer` over the normalized block input `normed` (`[rows, tokens,
@@ -93,40 +103,40 @@ pub(super) fn local(
     w: &LocalWeights,
     cfg: &DeepseekV4Config,
     rows: RopeRows,
-) -> Local {
+) -> Result<Local, TraceError> {
     let shape = step.shape();
     let (r, t) = (shape.rows.get(), shape.tokens.get());
     let a = &cfg.attn;
 
-    let q_res = norm(b, linear(b, normed, &w.q_a, None), &w.q_norm, cfg.norm);
-    let q = linear(b, q_res, &w.q_b, None);
+    let q_res = norm(b, linear(b, normed, &w.q_a, None)?, &w.q_norm, cfg.norm)?;
+    let q = linear(b, q_res, &w.q_b, None)?;
     let q = b.transpose(
-        b.reshape(q, vec![r, t, a.heads, a.head_dim]),
+        b.reshape(q, vec![r, t, a.heads, a.head_dim])?,
         vec![0, 2, 1, 3],
-    );
+    )?;
     let q = rotate_tail(
         b,
-        ops::rmsnorm_no_weight(b, q, cfg.norm.eps()),
+        ops::rmsnorm_no_weight(b, q, cfg.norm.eps())?,
         &rows,
         a.rope_dim,
-    );
+    )?;
 
-    let kv = norm(b, linear(b, normed, &w.kv, None), &w.kv_norm, cfg.norm);
+    let kv = norm(b, linear(b, normed, &w.kv, None)?, &w.kv_norm, cfg.norm)?;
     let kv = rotate_tail(
         b,
-        b.reshape(kv, vec![r, 1, t, a.head_dim]),
+        b.reshape(kv, vec![r, 1, t, a.head_dim])?,
         &rows,
         a.rope_dim,
-    );
-    let write_at = first_writes(b, step);
-    let cache = carried_cache(b, step, &write_at, layer, "kv", kv, 1, a.head_dim);
-    Local {
+    )?;
+    let write_at = first_writes(b, step)?;
+    let cache = carried_cache(b, step, &write_at, layer, "kv", kv, 1, a.head_dim)?;
+    Ok(Local {
         q,
         q_res,
         cache,
         rows,
         write_at,
-    }
+    })
 }
 
 /// The compressed entries a layer's queries also attend to: `[rows, 1, windows, head_dim]` keys
@@ -146,16 +156,16 @@ pub(super) fn attend(
     compressed: Option<&Compressed>,
     w: &LocalWeights,
     cfg: &DeepseekV4Config,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (r, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let a = &cfg.attn;
-    let window = ops::causal_mask_from_pos(b, step.pos(), cap, Some(a.window));
+    let window = ops::causal_mask_from_pos(b, step.pos(), cap, Some(a.window))?;
     let (keys, mask) = match compressed {
         None => (local.cache, window),
         Some(c) => (
-            b.concat(2, &[local.cache, c.entries]),
-            b.concat(3, &[window, c.mask]),
+            b.concat(2, &[local.cache, c.entries])?,
+            b.concat(3, &[window, c.mask])?,
         ),
     };
     let out = ops::attention_prefill_with_sink(
@@ -166,28 +176,28 @@ pub(super) fn attend(
         a.heads,
         a.scale,
         mask,
-        w.sinks.declare_f32(b),
+        w.sinks.declare_f32(b)?,
         a.heads,
         t,
-    );
+    )?;
     // Undo the rotation the value picked up from the key it shares.
-    let out = rotate_tail(b, out, &local.rows.inverse(b), a.rope_dim);
-    let out = b.transpose(out, vec![0, 2, 1, 3]);
+    let out = rotate_tail(b, out, &local.rows.inverse(b)?, a.rope_dim)?;
+    let out = b.transpose(out, vec![0, 2, 1, 3])?;
 
     // Grouped first stage: `o_groups` independent `[in_per_group] -> [o_lora]` projections, the
     // stored `[groups * o_lora, in_per_group]` read as `groups` blocks of rows.
     let groups = b.transpose(
-        b.reshape(out, vec![r * t, a.o_groups, a.in_per_group()]),
+        b.reshape(out, vec![r * t, a.o_groups, a.in_per_group()])?,
         vec![1, 0, 2],
-    );
+    )?;
     let blocks = b.reshape(
-        w.o_a.declare(b),
+        w.o_a.declare(b)?,
         vec![a.o_groups, a.o_lora, a.in_per_group()],
-    );
-    let projected = b.matmul(groups, b.transpose(blocks, vec![0, 2, 1]));
+    )?;
+    let projected = b.matmul(groups, b.transpose(blocks, vec![0, 2, 1])?)?;
     let mixed = b.reshape(
-        b.transpose(projected, vec![1, 0, 2]),
+        b.transpose(projected, vec![1, 0, 2])?,
         vec![r, t, a.o_groups * a.o_lora],
-    );
+    )?;
     linear(b, mixed, &w.o_b, None)
 }

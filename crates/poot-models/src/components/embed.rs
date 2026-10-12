@@ -5,6 +5,7 @@ use poot_quant::weights::{WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
 
 use super::linear::{Weight, WeightError};
+use crate::model::TraceError;
 
 /// The model's `[vocab, width]` embedding table.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,12 +25,12 @@ impl Embedding {
     }
 
     /// The F32 rows of `tokens` (I32, any shape `[..]`): `[.., width]`.
-    pub fn embed(&self, b: &Builder, tokens: Traced) -> Traced {
-        let rows = b.gather(self.table.declare(b), 0, tokens);
-        if b.aval(rows).dtype == DType::F32 {
-            rows
+    pub fn embed(&self, b: &Builder, tokens: Traced) -> Result<Traced, TraceError> {
+        let rows = b.gather(self.table.declare(b)?, 0, tokens)?;
+        if b.aval(rows)?.dtype == DType::F32 {
+            Ok(rows)
         } else {
-            b.cast(rows, DType::F32)
+            Ok(b.cast(rows, DType::F32)?)
         }
     }
 }
@@ -51,27 +52,32 @@ pub struct EmbedInputs {
 
 impl EmbedInputs {
     /// Declare the two inputs for a `[rows, tokens]` step of embedding width `width`.
-    pub fn declare(b: &Builder, rows: usize, tokens: usize, width: usize) -> Self {
-        Self {
+    pub fn declare(
+        b: &Builder,
+        rows: usize,
+        tokens: usize,
+        width: usize,
+    ) -> Result<Self, TraceError> {
+        Ok(Self {
             rows: b.slot_named(
                 Slot::Activation,
                 EMBEDS_SLOT,
                 TensorType::f32(vec![rows, tokens, width]),
-            ),
+            )?,
             at: b.slot_named(
                 Slot::Activation,
                 EMBEDS_AT_SLOT,
                 TensorType::new(vec![rows, tokens], DType::I32),
-            ),
-        }
+            )?,
+        })
     }
 
     /// `x` (`[rows, tokens, width]`, F32) with the caller's rows where [`EMBEDS_AT_SLOT`] is set. A
     /// select, so the unused rows of the input (zeros at the other positions) never reach the result.
-    pub fn scatter(&self, b: &Builder, x: Traced) -> Traced {
-        let shape = b.aval(x).shape;
-        let at = b.reshape(self.at, vec![shape[0], shape[1], 1]);
-        b.select(b.broadcast(at, shape), self.rows, x)
+    pub fn scatter(&self, b: &Builder, x: Traced) -> Result<Traced, TraceError> {
+        let shape = b.aval(x)?.shape;
+        let at = b.reshape(self.at, vec![shape[0], shape[1], 1])?;
+        Ok(b.select(b.broadcast(at, shape)?, self.rows, x)?)
     }
 }
 
@@ -93,10 +99,12 @@ mod tests {
         let tokens = [5, 2, 2, 0];
         let run = |fx: &Fx| {
             let e = Embedding::new(&fx.map(), vocab, w).unwrap();
-            let b = Builder::new();
-            let ids = b.slot(Slot::Token, TensorType::new(vec![1, 4], DType::I32));
-            let y = e.embed(&b, ids);
-            assert_eq!(b.aval(y).shape, vec![1, 4, w]);
+            let b = Builder::for_tests();
+            let ids = b
+                .slot(Slot::Token, TensorType::new(vec![1, 4], DType::I32))
+                .unwrap();
+            let y = e.embed(&b, ids).unwrap();
+            assert_eq!(b.aval(y).unwrap().shape, vec![1, 4, w]);
             fx.eval(&b.finish(y).unwrap(), &[], &[(Slot::Token, &tokens)], &[])
                 .0
         };

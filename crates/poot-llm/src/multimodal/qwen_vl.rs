@@ -34,13 +34,13 @@ use super::{
     MultimodalPrompt,
 };
 use crate::core::sampler::Sampler;
-use crate::driver::error::{DriverError, InvalidRequest, LoadError, PreparedSetRefusal};
+use crate::driver::error::{DriverError, InvalidRequest, LoadError};
 use crate::driver::{
     Driver, DriverOptions, EncodeRequest, EncodeRow, GenerateRequest, Generation, LoadOptions,
     ModelHandle, PromptEmbeds, TokenSink,
 };
-use crate::text::tokenize::TextCodec;
 use poot_models::mrope::{MropePositionIds, MropeProcessorFpsInput, MropeVisualKind};
+use poot_text::TextCodec;
 
 /// Why a Qwen2.5-VL checkpoint cannot load or a request cannot run.
 #[derive(Debug, thiserror::Error)]
@@ -401,11 +401,9 @@ impl ImageFrontEnd for Qwen25VlFrontEnd {
         let prompt = self.prepare_input(&input).map_err(|error| match error {
             // An image of more patches than the tower takes is refused by the tower's own bound or by the
             // driver's trace limit set to it.
-            Qwen25VlError::Grid { .. }
-            | Qwen25VlError::Driver(
-                DriverError::Unsupported(_)
-                | DriverError::PreparedSet(PreparedSetRefusal::TraceTokens { .. }),
-            ) => ImageRequestError::Refused(error.to_string()),
+            Qwen25VlError::Grid { .. } | Qwen25VlError::Driver(DriverError::Unsupported(_)) => {
+                ImageRequestError::Refused(error.to_string())
+            }
             other => ImageRequestError::Failed(Box::new(other)),
         })?;
         Ok(prompt.into())
@@ -536,12 +534,12 @@ pub(crate) mod fixture {
     use std::collections::HashMap;
     use std::num::NonZeroUsize;
 
+    use poot_eval::test_support::weight_map_oracle::eval_mapped;
     use poot_graph_ir::{Slot, SlotKey};
     use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
     use poot_models::mrope::MropeVisualKind;
     use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
     use poot_tensor::HostTensor;
-    use poot_test_util::weight_map_oracle::eval_mapped;
     use tokenizers::AddedToken;
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -631,7 +629,10 @@ pub(crate) mod fixture {
         {
             store.insert(key.clone(), entry.clone()).unwrap();
         }
-        poot_test_util::safetensors::write(&dir.join("model.safetensors"), &store.build());
+        poot_quant::test_support::safetensors::write(
+            &dir.join("model.safetensors"),
+            &store.build(),
+        );
 
         let mut config = text.config.clone();
         let mut vision_config = vision.config.clone();
@@ -798,6 +799,7 @@ pub(crate) mod fixture {
                         logits: LogitRows::All,
                         hidden: None,
                     },
+                    poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
             let ordered =
@@ -886,6 +888,7 @@ pub(crate) mod fixture {
                     logits: LogitRows::Last,
                     hidden: None,
                 },
+                poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
         let state: Vec<HostTensor> = graph

@@ -604,26 +604,26 @@ pub enum StageSplitError {
 
 #[cfg(test)]
 mod tests {
-    //! POOT-578 SC-002: a real qwen2 decode step (carried KV state) cut after every layer `k`.
+    //! POOT-578 SC-002: a layered decode step (carried KV state) cut after every layer `k`. The real qwen2
+    //! trace through `compile_staged` is poot-models' `staged_qwen2_oracle.rs`.
 
+    use poot_eval::test_support::stage_chain::{bind_decode, bits, chain};
     use poot_eval::{EvalBudget, EvalOptions, eval};
 
-    use crate::test_support::{LAYERS, bind_decode, bits, qwen2_decode};
+    use crate::unit_helpers::{LAYERS, layered_decode};
 
     /// Splitting after layer `k` and chaining the stages (each stage bound to the original inputs it
     /// reads plus the boundary values the earlier stages produced) reproduces every logit and every
     /// carried-state output of the whole graph bit for bit.
     #[test]
-    fn qwen2_decode_split_after_every_layer_chains_to_the_whole_graph() {
-        let graph = qwen2_decode(LAYERS);
-        let runs = graph
-            .layer_runs()
-            .expect("the qwen2 tracer tags its layers");
+    fn a_layered_decode_split_after_every_layer_chains_to_the_whole_graph() {
+        let graph = layered_decode(LAYERS);
+        let runs = graph.layer_runs().expect("the fixture tags its layers");
         assert_eq!(runs.layers, LAYERS);
         let lengths: Vec<usize> = runs.runs.iter().map(|run| run.len()).collect();
         assert!(
             lengths.windows(2).all(|pair| pair[0] == pair[1]),
-            "qwen2's layers are identical, so each owns the same number of equations: {lengths:?}"
+            "the fixture's layers are identical, so each owns the same number of equations: {lengths:?}"
         );
 
         let inputs = bind_decode(&graph);
@@ -641,12 +641,12 @@ mod tests {
         );
 
         for k in 0..LAYERS - 1 {
-            let split = crate::test_support::split_after_layers(&graph, &[k])
+            let split = crate::unit_helpers::split_after_layers(&graph, &[k])
                 .unwrap_or_else(|error| panic!("cut after layer {k}: {error}"));
             assert_eq!(split.stages.len(), 2);
             assert!(!split.boundaries.is_empty(), "cut {k} crosses a value");
 
-            let chained = crate::test_support::chain(
+            let chained = chain(
                 &graph,
                 &split.stages.iter().map(|s| &s.graph).collect::<Vec<_>>(),
                 &inputs,

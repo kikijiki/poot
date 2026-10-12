@@ -53,7 +53,7 @@ fn graph_over(
     inputs: &[HostTensor],
     body: impl FnOnce(&Builder, &[Traced]) -> Traced,
 ) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let traced: Vec<Traced> = inputs
         .iter()
         .enumerate()
@@ -62,6 +62,7 @@ fn graph_over(
                 &format!("input.{position}"),
                 TensorType::new(tensor.shape().to_vec(), tensor.dtype()),
             )
+            .unwrap()
         })
         .collect();
     let out = body(&b, &traced);
@@ -77,7 +78,7 @@ fn graph_over(
 /// method for one), so it is staged through an append plan.
 fn one_equation(op: OpKind, inputs: &[HostTensor]) -> (Graph, HashMap<ValueId, Value>) {
     graph_over(inputs, |b, traced| {
-        let mut plan = b.append_plan(0);
+        let mut plan = b.append_plan(0).unwrap();
         let operands = traced.iter().map(|t| Operand::Value(t.id())).collect();
         let out = plan.equation(op, operands).expect("the composite types");
         plan.declare_result(out).expect("declare the result");
@@ -147,7 +148,7 @@ fn flash_decode_composite_is_the_traced_masked_attention() {
         "flash decode",
         OpKind::Attention(AttentionAttrs::new(n_rep, scale, None)),
         &inputs,
-        |b, t| ops::attention_masked(b, t[0], t[1], t[2], n_rep, scale, t[3]),
+        |b, t| ops::attention_masked(b, t[0], t[1], t[2], n_rep, scale, t[3]).unwrap(),
     );
 }
 
@@ -178,7 +179,7 @@ fn flash_prefill_composite_is_the_traced_prefill_attention() {
         "flash prefill",
         OpKind::Attention(AttentionAttrs::new(n_rep, scale, None)),
         &inputs,
-        |b, t| ops::attention_prefill(b, t[0], t[1], t[2], n_rep, scale, t[3]),
+        |b, t| ops::attention_prefill(b, t[0], t[1], t[2], n_rep, scale, t[3]).unwrap(),
     );
 }
 
@@ -200,7 +201,10 @@ fn softcapped_flash_prefill_composite_is_the_traced_softcapped_prefill() {
         "softcapped flash prefill",
         OpKind::Attention(AttentionAttrs::new(n_rep, scale, Some(cap))),
         &inputs,
-        |b, t| ops::attention_prefill_softcap(b, t[0], t[1], t[2], n_rep, scale, t[3], Some(cap)),
+        |b, t| {
+            ops::attention_prefill_softcap(b, t[0], t[1], t[2], n_rep, scale, t[3], Some(cap))
+                .unwrap()
+        },
     );
 }
 
@@ -219,7 +223,7 @@ fn rope_composite_is_the_traced_half_split_rotation() {
             &format!("rope rot={rot}"),
             OpKind::Rope { rot },
             &inputs,
-            |b, t| ops::rope_partial(b, t[0], t[1], t[2], d, rot, 3),
+            |b, t| ops::rope_partial(b, t[0], t[1], t[2], d, rot, 3).unwrap(),
         );
     }
 }
@@ -254,9 +258,10 @@ fn contraction_epilogue_composite_is_the_traced_matmul_then_chain() {
         region,
     };
     assert_composite_matches_chain("contraction_epilogue", op, &inputs, |b, t| {
-        let biased = ops::linear(b, t[0], t[1], Some(t[2]));
-        let summed = b.binary(BinOp::Add, biased, t[3]);
+        let biased = ops::linear(b, t[0], t[1], Some(t[2])).unwrap();
+        let summed = b.binary(BinOp::Add, biased, t[3]).unwrap();
         b.binary_scalar(BinOp::Mul, summed, Scalar::F32(0.5))
+            .unwrap()
     });
 }
 
@@ -283,8 +288,8 @@ fn fused_composite_is_the_traced_pointwise_chain() {
     };
     let inputs = [data(&[3, 7], 27, 3.0), data(&[3, 7], 28, 1.0)];
     assert_composite_matches_chain("fused swiglu", OpKind::Fused(region), &inputs, |b, t| {
-        let silu = ops::silu(b, t[0]);
-        b.binary(BinOp::Mul, silu, t[1])
+        let silu = ops::silu(b, t[0]).unwrap();
+        b.binary(BinOp::Mul, silu, t[1]).unwrap()
     });
 }
 
@@ -328,12 +333,12 @@ fn i32_fused_composite_with_pack_lanes_is_the_traced_word_chain() {
         OpKind::Fused(region),
         &[packed, other],
         |b, t| {
-            let first = b.slice(t[0], 1, 0, 1);
-            let second = b.slice(t[0], 1, 1, 2);
-            let sum = b.binary(BinOp::Add, first, second);
-            let scaled = b.binary_scalar(BinOp::Mul, sum, Scalar::I32(3));
-            let difference = b.binary(BinOp::Sub, scaled, t[1]);
-            b.concat(1, &[sum, difference])
+            let first = b.slice(t[0], 1, 0, 1).unwrap();
+            let second = b.slice(t[0], 1, 1, 2).unwrap();
+            let sum = b.binary(BinOp::Add, first, second).unwrap();
+            let scaled = b.binary_scalar(BinOp::Mul, sum, Scalar::I32(3)).unwrap();
+            let difference = b.binary(BinOp::Sub, scaled, t[1]).unwrap();
+            b.concat(1, &[sum, difference]).unwrap()
         },
     );
 }
@@ -366,7 +371,7 @@ fn fused_row_composite_is_the_traced_softmax() {
         "fused-row softmax",
         OpKind::FusedRow(region),
         &inputs,
-        |b, t| ops::softmax(b, t[0]),
+        |b, t| ops::softmax(b, t[0]).unwrap(),
     );
 }
 
@@ -394,7 +399,7 @@ fn every_rope_entry_point_agrees_bit_for_bit() {
         let batched = evaluate(
             &graph_over(
                 &[x.clone(), cos.clone(), sin.clone(), pos.clone()],
-                |b, t| ops::rope_batched(b, t[0], t[1], t[2], t[3], batch),
+                |b, t| ops::rope_batched(b, t[0], t[1], t[2], t[3], batch).unwrap(),
             ),
             EvalBudget::UNBOUNDED,
         )
@@ -404,7 +409,7 @@ fn every_rope_entry_point_agrees_bit_for_bit() {
                 &[x.clone(), cos.clone(), sin.clone(), pos.clone()],
                 |b, t| {
                     let pos = vec![t[3]; sections.len()];
-                    ops::rope_sectioned_batched(b, t[0], t[1], t[2], &pos, sections, batch)
+                    ops::rope_sectioned_batched(b, t[0], t[1], t[2], &pos, sections, batch).unwrap()
                 },
             ),
             EvalBudget::UNBOUNDED,
@@ -426,7 +431,7 @@ fn every_rope_entry_point_agrees_bit_for_bit() {
             let rope = evaluate(
                 &graph_over(
                     &[x_row.clone(), cos.clone(), sin.clone(), scalar.clone()],
-                    |b, t| ops::rope(b, t[0], t[1], t[2], t[3]),
+                    |b, t| ops::rope(b, t[0], t[1], t[2], t[3]).unwrap(),
                 ),
                 EvalBudget::UNBOUNDED,
             )
@@ -434,7 +439,7 @@ fn every_rope_entry_point_agrees_bit_for_bit() {
             let sectioned = evaluate(
                 &graph_over(&[x_row, cos.clone(), sin.clone(), scalar], |b, t| {
                     let pos = vec![t[3]; sections.len()];
-                    ops::rope_sectioned(b, t[0], t[1], t[2], &pos, sections)
+                    ops::rope_sectioned(b, t[0], t[1], t[2], &pos, sections).unwrap()
                 }),
                 EvalBudget::UNBOUNDED,
             )
@@ -484,7 +489,7 @@ fn prefill_composite_scores_are_charged_to_the_budget() {
     let unbounded = evaluate(&graph, EvalBudget::UNBOUNDED).expect("unbounded evaluates");
     let traced = evaluate(
         &graph_over(&inputs, |b, t| {
-            ops::attention_prefill(b, t[0], t[1], t[2], 1, scale, t[3])
+            ops::attention_prefill(b, t[0], t[1], t[2], 1, scale, t[3]).unwrap()
         }),
         EvalBudget::UNBOUNDED,
     )
@@ -589,8 +594,8 @@ fn a_narrow_head_rounds_before_its_residual_in_the_composite_and_the_chain() {
         let composite = evaluate(&one_equation(op, &inputs), EvalBudget::UNBOUNDED).unwrap();
         let chain = evaluate(
             &graph_over(&inputs, |b, t| {
-                let head = b.matmul(t[0], t[1]);
-                b.binary(BinOp::Add, head, t[2])
+                let head = b.matmul(t[0], t[1]).unwrap();
+                b.binary(BinOp::Add, head, t[2]).unwrap()
             }),
             EvalBudget::UNBOUNDED,
         )

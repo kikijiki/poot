@@ -15,10 +15,10 @@ use std::collections::HashMap;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use poot_eval::{EvalBudget, EvalOptions, Value};
-use poot_executor_parity::dense::{Dense, Family, step};
-use poot_executor_parity::weight_map::MappedModel;
 use poot_graph_ir::{Graph, Slot, Storage, ValueId};
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
+use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::HostTensor;
 
 use poot_graph_plan as transform;
@@ -37,7 +37,11 @@ fn model() -> MappedModel {
 /// `m`'s step graph: one sequence of `tokens` new tokens over `cap` positions.
 fn trace(m: &MappedModel, phase: Phase, tokens: usize, cap: usize) -> poot_graph_ir::Graph {
     m.model
-        .trace(phase, step(1, tokens, cap, LogitRows::Last))
+        .trace(
+            phase,
+            step(1, tokens, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 

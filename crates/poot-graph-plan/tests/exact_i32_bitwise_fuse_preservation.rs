@@ -17,21 +17,25 @@ fn ints(value: Value) -> Option<Vec<i32>> {
 
 #[test]
 fn fuse_preserves_the_exact_i32_bit_select_and_clz_chain() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![4], DType::I32));
-    let y = b.constant("y", TensorType::new(vec![4], DType::I32));
-    let and = b.binary(BinOp::And, x, y);
-    let or = b.binary(BinOp::Or, x, y);
-    let xor = b.binary(BinOp::Xor, x, y);
-    let shl = b.binary_scalar(BinOp::Shl, x, Scalar::I32(33));
-    let shr = b.binary(BinOp::Shr, x, y);
-    let not = b.unary(UnOp::Not, x);
-    let clz = b.unary(UnOp::Clz, x);
-    let selected = b.select(and, or, xor);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let y = b
+        .constant("y", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let and = b.binary(BinOp::And, x, y).unwrap();
+    let or = b.binary(BinOp::Or, x, y).unwrap();
+    let xor = b.binary(BinOp::Xor, x, y).unwrap();
+    let shl = b.binary_scalar(BinOp::Shl, x, Scalar::I32(33)).unwrap();
+    let shr = b.binary(BinOp::Shr, x, y).unwrap();
+    let not = b.unary(UnOp::Not, x).unwrap();
+    let clz = b.unary(UnOp::Clz, x).unwrap();
+    let selected = b.select(and, or, xor).unwrap();
     // Every intermediate feeds the output, so each op is live in the region `fuse` rewrites.
     let mut out = selected;
     for term in [shl, shr, not, clz] {
-        out = b.binary(BinOp::Or, out, term);
+        out = b.binary(BinOp::Or, out, term).unwrap();
     }
     let g = b.finish(out).unwrap();
 

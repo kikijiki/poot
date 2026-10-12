@@ -16,16 +16,16 @@
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::{Graph, OpKind, Operand, ValueId};
+use poot_graph_plan::test_support::gpu_caps_mut;
 use poot_graph_plan::{
-    CompileError, CompileLimits, CompileOptions, LegalizeError, Submission, Target, WeightFormats,
-    bind_packed_weights, compile, prepare_target_graph,
+    CompileError, CompileLimits, CompileOptions, LegalizeError, Target, WeightFormats,
+    bind_packed_weights, compile, dtype_widen::prepare_target_graph, production_plan::Submission,
 };
 use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
 use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::{WeightId, WeightRole};
 use poot_target::{AmdArch, Backend};
 use poot_tensor::DType;
-use poot_test_util::graph_fixtures::gpu_caps_mut;
 
 /// The KV positions of every traced step.
 const CAPACITY: usize = 8;
@@ -72,7 +72,13 @@ fn shape(tokens: usize) -> StepShape {
 
 /// The family's decode graph, as the planner receives it.
 fn decode_graph(model: &dyn Model) -> Graph {
-    let traced = model.trace(Phase::Decode, shape(1)).expect("decode traces");
+    let traced = model
+        .trace(
+            Phase::Decode,
+            shape(1),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .expect("decode traces");
     bind_packed_weights(&traced, &WeightFormats::from_weight_map(model.weights()))
         .expect("the weights bind")
 }
@@ -275,7 +281,8 @@ fn ptx_and_rocm_preparation_is_untouched_by_this_card() {
     let (model, _) = qwen35();
     let traced = decode_graph(&*model);
     for backend in [Backend::Nvptx, Backend::AmdGcn(AmdArch::gfx1151())] {
-        let prepared = poot_graph_plan::widen_mismatched_matmul_dtypes(&traced, backend).unwrap();
+        let prepared =
+            poot_graph_plan::dtype_widen::widen_mismatched_matmul_dtypes(&traced, backend).unwrap();
         assert!(
             !prepared
                 .eqns()
@@ -339,7 +346,13 @@ fn qwen35_decode_and_prefill_plan_on_every_backend() {
         let formats = WeightFormats::from_weight_map(model.weights());
         for backend in backends() {
             for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
-                let traced = model.trace(phase, shape(tokens)).unwrap();
+                let traced = model
+                    .trace(
+                        phase,
+                        shape(tokens),
+                        poot_graph_ir::TraceLimits::for_tests(),
+                    )
+                    .unwrap();
                 let graph = bind_packed_weights(&traced, &formats).unwrap();
                 compile(&graph, &target(backend), &options()).unwrap_or_else(|e| {
                     panic!("{stored_as:?} {phase:?} does not compile for {backend:?}: {e}")

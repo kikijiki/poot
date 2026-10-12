@@ -1,40 +1,18 @@
 //! Test helpers that were copy-pasted across the workspace test modules: deterministic pseudo-random
-//! fills and name-derived seeds, plain-Rust reference kernels, and small comparison helpers. Dev-dependency only.
+//! fills and name-derived seeds, plain-Rust reference kernels, and small comparison helpers. Dev-dependency
+//! only, plus the optional dependency behind `poot-graph-ir`'s and `poot-eval`'s `test-support` features.
+//!
+//! This is the rank-1 base: it depends on nothing above `poot-target`. A fixture that builds a graph, a packed
+//! payload, a planner input or a kernel body lives in the crate that owns that type, under that crate's
+//! `test-support` feature (ADR-0113): `poot_graph_ir::test_support`, `poot_graph_plan::test_support`,
+//! `poot_eval::test_support`, `poot_quant::test_support`, `poot_kernel_ir::test_support`,
+//! `poot_codegen::test_support` and `poot_runtime_common::device_skip`.
 
-#[cfg(feature = "kernel-fixtures")]
-pub mod aie_fixtures;
 pub mod checkpoints;
-pub mod const_weights;
 pub mod contained_child;
 pub mod device_caps;
-pub mod device_skip;
-#[cfg(feature = "graph-fixtures")]
-pub mod graph_fixtures;
 mod hang_guard;
-#[cfg(feature = "graph-fixtures")]
-pub mod i32_gather;
-#[cfg(feature = "graph-fixtures")]
-pub mod i32_slot_gather;
-#[cfg(feature = "graph-fixtures")]
-pub mod i32_table_gather;
-#[cfg(feature = "kernel-fixtures")]
-pub mod kernel_fixtures;
-#[cfg(feature = "graph-fixtures")]
-pub mod live_attention;
-pub mod packed;
-pub mod safetensors;
-pub mod scan;
 pub mod smolvlm;
-#[cfg(feature = "graph-fixtures")]
-pub mod weight_map_oracle;
-
-/// One step's slot value for a fixture graph: the slot's key and its typed host tensor. Defined here, not in
-/// `poot-executor-parity`, so the shared CPU oracle ([`weight_map_oracle::oracle_for`]) can take it while that
-/// crate depends on this one.
-pub struct StepFixture {
-    pub key: poot_graph_ir::SlotKey,
-    pub tensor: poot_tensor::HostTensor,
-}
 
 pub use hang_guard::{ALLOW_GPU_HANG_VARIABLE, GpuHangOptIn, require_gpu_hang_opt_in};
 

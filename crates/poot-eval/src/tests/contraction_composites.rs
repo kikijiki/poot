@@ -404,13 +404,15 @@ fn packed_contraction(
     activation: HostTensor,
 ) -> (Graph, HashMap<ValueId, Value>) {
     let descriptor = owner.weight();
-    let b = Builder::new();
-    let x = b.slot_named(
-        Slot::Activation,
-        "x",
-        TensorType::f32(activation.shape().to_vec()),
-    );
-    let mut plan = b.append_plan(0);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(
+            Slot::Activation,
+            "x",
+            TensorType::f32(activation.shape().to_vec()),
+        )
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
     let mut operands = vec![Operand::Value(x.id())];
     let mut inputs = HashMap::from([(x.id(), Value::Host(activation))]);
     for (name, ty) in packed_source_constants("layer", descriptor) {
@@ -546,13 +548,17 @@ const DENSE_WEIGHT_F16: [u16; 12] = [
 ];
 
 fn dense_contraction(weight: HostTensor) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![2, 4]));
-    let w = b.constant(
-        "w",
-        TensorType::new(weight.shape().to_vec(), weight.dtype()),
-    );
-    let mut plan = b.append_plan(0);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![2, 4]))
+        .unwrap();
+    let w = b
+        .constant(
+            "w",
+            TensorType::new(weight.shape().to_vec(), weight.dtype()),
+        )
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
     let output = plan
         .equation(
             OpKind::DenseContraction {
@@ -572,17 +578,21 @@ fn dense_contraction(weight: HostTensor) -> (Graph, HashMap<ValueId, Value>) {
 }
 
 fn dense_row_gather(table: HostTensor, ids: Vec<i32>) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
-    let t = b.constant(
-        "table",
-        TensorType::new(table.shape().to_vec(), table.dtype()),
-    );
-    let index = b.slot_named(
-        Slot::Token,
-        "ids",
-        TensorType::new(vec![ids.len()], DType::I32),
-    );
-    let mut plan = b.append_plan(0);
+    let b = Builder::for_tests();
+    let t = b
+        .constant(
+            "table",
+            TensorType::new(table.shape().to_vec(), table.dtype()),
+        )
+        .unwrap();
+    let index = b
+        .slot_named(
+            Slot::Token,
+            "ids",
+            TensorType::new(vec![ids.len()], DType::I32),
+        )
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
     let output = plan
         .equation(
             OpKind::DenseRowGather {
@@ -952,10 +962,14 @@ fn a_grouped_dense_contraction_equals_each_groups_own_block_product() {
         .map(|i| ((i * 7 + 3) % 13) as f32 / 4.0 - 1.5)
         .collect();
     let x = activation(&[groups, m, k]);
-    let b = Builder::new();
-    let xs = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![groups, m, k]));
-    let w = b.constant("w", TensorType::new(vec![groups * n, k], DType::BF16));
-    let mut plan = b.append_plan(0);
+    let b = Builder::for_tests();
+    let xs = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![groups, m, k]))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![groups * n, k], DType::BF16))
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
     let output = plan
         .equation(
             OpKind::GroupedDenseContraction {

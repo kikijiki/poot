@@ -18,7 +18,7 @@ use crate::components::mhc::{MhcSite, MhcSiteWeights, mhc_post, widen};
 use crate::components::moe::{MoeWeights, moe};
 use crate::components::norm::{norm, norm_with};
 use crate::components::standard::{StackWeights, Step};
-use crate::model::LogitRows;
+use crate::model::{LogitRows, ParamBlock, TraceError, WiringError};
 
 #[derive(Debug)]
 enum MixerWeights {
@@ -46,15 +46,12 @@ impl FfnWeights {
                 map,
                 layer,
                 cfg.width,
-                cfg.dense
-                    .as_ref()
-                    .expect("a dense layer has dense dimensions")
-                    .inter,
+                WiringError::require(&cfg.dense, ParamBlock::Dense)?.inter,
             )?)),
             Ffn::Sparse => Self::Sparse(Box::new(MoeWeights::new(
                 map,
                 layer,
-                cfg.moe.as_ref().expect("a sparse layer has MoE parameters"),
+                WiringError::require(&cfg.moe, ParamBlock::Moe)?,
             )?)),
         })
     }
@@ -67,15 +64,13 @@ impl FfnWeights {
         index: usize,
         normed: Traced,
         cfg: &Glm53Config,
-    ) -> Traced {
+    ) -> Result<Traced, TraceError> {
         match self {
             Self::Dense(w) => dense_ffn(
                 b,
                 normed,
                 w,
-                cfg.dense
-                    .as_ref()
-                    .expect("a dense layer has dense dimensions"),
+                WiringError::require(&cfg.dense, ParamBlock::Dense)?,
             ),
             Self::Sparse(w) => moe(
                 b,
@@ -84,7 +79,7 @@ impl FfnWeights {
                 normed,
                 None,
                 w,
-                cfg.moe.as_ref().expect("a sparse layer has MoE parameters"),
+                WiringError::require(&cfg.moe, ParamBlock::Moe)?,
             ),
         }
     }
@@ -127,13 +122,13 @@ impl Layer {
                     map,
                     layer,
                     cfg.width,
-                    cfg.kda.as_ref().expect("a KDA layer has KDA parameters"),
+                    WiringError::require(&cfg.kda, ParamBlock::Kda)?,
                 )?)),
                 Mixer::Dsa => MixerWeights::Dsa(Box::new(PooledDsaWeights::new(
                     map,
                     layer,
                     cfg.width,
-                    cfg.dsa.as_ref().expect("a DSA layer has DSA parameters"),
+                    WiringError::require(&cfg.dsa, ParamBlock::Dsa)?,
                 )?)),
             },
             ffn: FfnWeights::new(map, layer, ffn, cfg)?,
@@ -149,9 +144,9 @@ impl Layer {
         index: usize,
         x: Traced,
         cfg: &Glm53Config,
-    ) -> Traced {
-        let mix = self.mhc_attn.pre(b, x, &cfg.mhc);
-        let normed = norm(b, mix.collapsed, &self.attn_norm, cfg.norm);
+    ) -> Result<Traced, TraceError> {
+        let mix = self.mhc_attn.pre(b, x, &cfg.mhc)?;
+        let normed = norm(b, mix.collapsed, &self.attn_norm, cfg.norm)?;
         let mixed = match &self.mixer {
             MixerWeights::Kda(w) => kda(
                 b,
@@ -159,31 +154,36 @@ impl Layer {
                 index,
                 normed,
                 w,
-                cfg.kda.as_ref().expect("a KDA layer has KDA parameters"),
-            ),
+                WiringError::require(&cfg.kda, ParamBlock::Kda)?,
+            )?,
             MixerWeights::Dsa(w) => pooled_dsa(
                 b,
                 step,
                 index,
                 normed,
                 w,
-                cfg.dsa.as_ref().expect("a DSA layer has DSA parameters"),
-            ),
+                WiringError::require(&cfg.dsa, ParamBlock::Dsa)?,
+            )?,
         };
-        let x = mhc_post(b, mix.post, mix.comb, mixed, x, &cfg.mhc);
+        let x = mhc_post(b, mix.post, mix.comb, mixed, x, &cfg.mhc)?;
 
-        let mix = self.mhc_ffn.pre(b, x, &cfg.mhc);
-        let normed = norm(b, mix.collapsed, &self.ffn_norm, cfg.norm);
-        let out = self.ffn.trace(b, step, index, normed, cfg);
+        let mix = self.mhc_ffn.pre(b, x, &cfg.mhc)?;
+        let normed = norm(b, mix.collapsed, &self.ffn_norm, cfg.norm)?;
+        let out = self.ffn.trace(b, step, index, normed, cfg)?;
         mhc_post(b, mix.post, mix.comb, out, x, &cfg.mhc)
     }
 }
 
 /// The dense block: `down(glu(gate(x), up(x)))` with the family's clamped SwiGLU.
-fn dense_ffn(b: &Builder, x: Traced, w: &GatedFfnWeights, dims: &DenseDims) -> Traced {
-    let gate = linear(b, x, &w.gate, None);
-    let up = linear(b, x, &w.up, None);
-    linear(b, glu(b, gate, up, &dims.glu), &w.down, None)
+fn dense_ffn(
+    b: &Builder,
+    x: Traced,
+    w: &GatedFfnWeights,
+    dims: &DenseDims,
+) -> Result<Traced, TraceError> {
+    let gate = linear(b, x, &w.gate, None)?;
+    let up = linear(b, x, &w.up, None)?;
+    linear(b, glu(b, gate, up, &dims.glu)?, &w.down, None)
 }
 
 /// Every weight of the tower: the embedding, the layers, the closing norm and head.
@@ -196,7 +196,7 @@ pub(super) struct Tower {
 }
 
 impl Tower {
-    pub fn new(map: &WeightMap, cfg: &Glm53Config) -> Result<Self, WeightError> {
+    pub(super) fn new(map: &WeightMap, cfg: &Glm53Config) -> Result<Self, WeightError> {
         Ok(Self {
             stack: StackWeights::new(map, cfg.vocab, cfg.width)?,
             layers: cfg
@@ -213,40 +213,51 @@ impl Tower {
     }
 
     /// The step's logits of a [`Phase::Mtp`] step; `None` when the checkpoint stores no MTP layer.
-    pub fn trace_mtp(&self, b: &Builder, step: &Step, cfg: &Glm53Config) -> Option<Traced> {
+    pub(super) fn trace_mtp(
+        &self,
+        b: &Builder,
+        step: &Step,
+        cfg: &Glm53Config,
+    ) -> Result<Option<Traced>, TraceError> {
         self.mtp
             .as_ref()
             .filter(|_| cfg.mtp.is_some_and(|mtp| mtp.count == 1))
             .map(|mtp| mtp.trace(b, step, &self.stack, cfg))
+            .transpose()
     }
 
     /// The step's logits: embed, widen, every layer inside its scope, the mean of the streams, the
     /// final norm and the head. Under [`LogitRows::Last`] only the last token's logits. A step that
     /// asks for the hidden-state carry writes the closing norm's output at every position first
     /// ([`Step::carry_hidden`]); the head then reads its last position.
-    pub fn trace(&self, b: &Builder, step: &Step, cfg: &Glm53Config) -> Traced {
-        let embedded = self.stack.embed.embed(b, step.tokens());
-        let mut x = widen(b, embedded, &cfg.mhc);
+    pub(super) fn trace(
+        &self,
+        b: &Builder,
+        step: &Step,
+        cfg: &Glm53Config,
+    ) -> Result<Traced, TraceError> {
+        let embedded = self.stack.embed.embed(b, step.tokens())?;
+        let mut x = widen(b, embedded, &cfg.mhc)?;
         for (l, layer) in self.layers.iter().enumerate() {
             let _scope = b.layer_scope(l);
-            x = layer.trace(b, step, l, x, cfg);
+            x = layer.trace(b, step, l, x, cfg)?;
         }
         let tokens = step.shape().tokens.get();
         let last_only = step.shape().logits == LogitRows::Last && tokens > 1;
         let carried = step.shape().hidden.is_some();
         if last_only && !carried {
-            x = b.slice(x, 1, tokens - 1, tokens);
+            x = b.slice(x, 1, tokens - 1, tokens)?;
         }
         let streams = cfg.mhc.streams();
         let mean = b.binary_scalar(
             BinOp::Mul,
-            b.reduce(RedOp::Sum, x, 2, false),
+            b.reduce(RedOp::Sum, x, 2, false)?,
             Scalar::F32(1.0 / streams as f32),
-        );
-        let mut normed = norm_with(b, mean, &self.stack.final_norm, cfg.norm);
-        step.carry_hidden(b, normed);
+        )?;
+        let mut normed = norm_with(b, mean, &self.stack.final_norm, cfg.norm)?;
+        step.carry_hidden(b, normed)?;
         if last_only && carried {
-            normed = b.slice(normed, 1, tokens - 1, tokens);
+            normed = b.slice(normed, 1, tokens - 1, tokens)?;
         }
         self.stack.head.logits(b, normed)
     }

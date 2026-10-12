@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::multi_device::placement::{PackedResidencyError, reject_dense_quant_mirror};
+use crate::multi_device::placement::test_only::{PackedResidencyError, reject_dense_quant_mirror};
 use crate::multi_device::topology::DeviceId;
 
 #[test]

@@ -6,6 +6,7 @@ use poot_graph_ir::{Builder, Traced};
 use poot_quant::weights::{WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
+use crate::model::TraceError;
 
 /// What a stack's graph returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +34,7 @@ impl Head {
     }
 
     /// `[.., width]` hidden states to `[.., vocab]` logits.
-    pub fn logits(&self, b: &Builder, x: Traced) -> Traced {
+    pub fn logits(&self, b: &Builder, x: Traced) -> Result<Traced, TraceError> {
         linear(b, x, &self.weight, None)
     }
 }
@@ -47,9 +48,9 @@ mod tests {
 
     fn logits(fx: &Fx, x: &[f32], t: usize, vocab: usize, w: usize) -> Vec<f32> {
         let head = Head::new(&fx.map(), vocab, w).unwrap();
-        let b = Builder::new();
-        let xs = b.constant("x", TensorType::f32(vec![t, w]));
-        let y = head.logits(&b, xs);
+        let b = Builder::for_tests();
+        let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
+        let y = head.logits(&b, xs).unwrap();
         fx.eval(&b.finish(y).unwrap(), &[("x", x)], &[], &[]).0
     }
 

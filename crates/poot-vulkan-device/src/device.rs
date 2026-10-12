@@ -18,11 +18,10 @@
 //! `copy` is `vkCmdCopyBuffer` in the same command stream, ordered by the barrier every command carries.
 
 use poot_executor::{
-    Arg, BufferRole, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind,
-    MeasuredDeviceTime, MemoryCounterSnapshot,
+    Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
 };
-use poot_graph_plan::{Submission, Target};
-use poot_runtime_common::CompiledKernel;
+use poot_graph_plan::{Target, production_plan::Submission};
+use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
 use poot_target::{Backend, BufferStorage, TargetId};
 use poot_vulkan_runtime::{
     Binding, Context, DeviceBuffer, GraphTiming, KernelFault, Pipeline, RecordingGraph,

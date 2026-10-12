@@ -37,10 +37,11 @@ use crate::handlers::{
     account_generation_error, handle_chat, sse_write_probe, stream_chat, stream_completion,
     stream_receipt,
 };
+use crate::http::test_only::{RequestRead, read_request, read_request_from};
 use crate::http::{
-    ConnGuard, MAX_BODY_BYTES, MAX_HEADER_BYTES, RateLimiter, RequestRead, body_len_ok,
-    configure_response_writes, error_body, handle, model_object, read_request,
-    read_request_for_routing, read_request_from, respond, respond_error, respond_typed,
+    ConnGuard, MAX_BODY_BYTES, MAX_HEADER_BYTES, RateLimiter, body_len_ok,
+    configure_response_writes, error_body, handle, model_object, read_request_for_routing, respond,
+    respond_error, respond_typed,
 };
 use crate::lifecycle::{
     CANCELLATION_SETTLE_TIMEOUT, GenerationRequest, WorkerRegistry, deadline_after,

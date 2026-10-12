@@ -28,13 +28,16 @@
 //! index, so a scratch never shares a slot with them; it does share with any earlier or later
 //! equation's scratch or temporary.
 
+use crate::graph_validation::ValidationPacketPlan;
+use crate::state_commit::StateCommitPlan;
+use crate::types::GraphStorage;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use poot_graph_ir::{Graph, ValueId, ValueTable};
 use poot_target::BufferStorage;
 
-use crate::{GraphStorage, Plan, ScratchId, StateCommitPlan, ValidationPacketPlan, value_ids};
+use crate::{Plan, ScratchId, value_ids};
 
 /// One arena slot: a device buffer reused by every locally-computed value assigned to it (never two
 /// at once - their lifetimes are disjoint by construction), sized to the largest.
@@ -116,6 +119,7 @@ impl BufferPlan {
 
     /// `slot`'s byte size (SC-001/SC-003): `slot_elems` native elements at `slot_storage`'s own
     /// element width.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn slot_bytes(&self, slot: ArenaSlotId) -> usize {
         self.slots[slot.index()].byte_size()
     }

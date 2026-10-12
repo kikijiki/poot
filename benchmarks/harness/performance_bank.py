@@ -27,7 +27,11 @@ BANK_ROOT = Path(__file__).resolve().parents[1] / "performance-bank"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 BACKENDS = ("wgpu", "rocm", "ptx")
-BACKEND_PACKAGES = {"wgpu": "poot-gpu", "rocm": "poot-rocm-gpu", "ptx": "poot-ptx-gpu"}
+BACKEND_PACKAGES = {"wgpu": "poot-wgpu-device", "rocm": "poot-rocm-device", "ptx": "poot-ptx-device"}
+# Packages renamed after receipts were recorded (POOT-758). A receipt's `command` is the historical record of
+# how it was measured and is never rewritten, so the claimed command is compared after mapping a recorded
+# package name to the package that exists now.
+RENAMED_PACKAGES = {"poot-gpu": "poot-wgpu-device", "poot-rocm-gpu": "poot-rocm-device", "poot-ptx-gpu": "poot-ptx-device"}
 RUNNABLE = "runnable"
 PLANNED = "planned"
 CASE_STATUSES = (RUNNABLE, PLANNED)
@@ -149,6 +153,11 @@ def bank_command(bank, case, backend):
     ]
 
 
+def current_command(recorded):
+    """A recorded command with each renamed package replaced by the package that exists now."""
+    return [RENAMED_PACKAGES.get(part, part) for part in recorded or []]
+
+
 def bank_errors(bank):
     """Why the case definitions are not a sound bank: stale identities, dangling references, bad fields."""
     errors = []
@@ -216,7 +225,7 @@ def receipt_errors(bank, case, backend, receipt):
         errors.append("parent_revision must be the 40-digit git sha the baseline was built from")
     if not _is_sha256(receipt.get("binary_sha256")):
         errors.append("binary_sha256 must be the 64-digit digest of the measuring binary")
-    if receipt.get("command") != bank_command(bank, case, backend):
+    if current_command(receipt.get("command")) != bank_command(bank, case, backend):
         errors.append("command is not the checked-in bank command for this case and backend")
 
     errors.extend(observed_errors(bank, case, receipt.get("observed", {})))
@@ -311,7 +320,7 @@ def _verified_errors(bank, case, backend, entry, root):
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != entry.get("receipt_sha256"):
         return ["receipt_sha256 does not match the receipt file"]
-    if entry.get("command") != bank_command(bank, case, backend):
+    if current_command(entry.get("command")) != bank_command(bank, case, backend):
         return ["the claimed command is not the checked-in bank command for this case and backend"]
     receipt = json.loads(data)
     errors = receipt_errors(bank, case, backend, receipt)

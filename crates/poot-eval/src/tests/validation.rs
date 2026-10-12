@@ -12,19 +12,19 @@ use poot_graph_ir::{
     ValueId,
 };
 
-use super::helpers;
 use crate::fp8::encode_e4m3fn_tensor;
-use crate::walk::publication_probe;
+use crate::observer::{EvalObserver, Publication};
 use crate::{EvalBudget, EvalError, EvalOptions, ExactI32TensorView, Value, eval};
+use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
 
 type ValueFixture = fn(f32) -> (Graph, HashMap<ValueId, Value>);
 
 fn stateless_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
-    let primary = b.constant("primary", TensorType::f32([1]));
-    let witness = b.constant("witness", TensorType::f32([2]));
-    let graph = helpers::finish_with_validations(
+    let b = Builder::for_tests();
+    let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+    let witness = b.constant("witness", TensorType::f32([2])).unwrap();
+    let graph = graph_fixtures::finish_with_validations(
         b,
         primary,
         &[(ValidationId(17), "synthetic-check", witness)],
@@ -39,13 +39,15 @@ fn stateless_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
 
 /// A dense graph with one computed primary output and one computed state update.
 fn stateful_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
-    let state = b.state_input("state", TensorType::f32([2]), StateRole::Recurrent);
-    let x = b.constant("x", TensorType::f32([2]));
-    let witness = b.constant("witness", TensorType::f32([2]));
-    let primary = b.binary(BinOp::Mul, x, state);
-    let next = b.binary(BinOp::Add, x, state);
-    let graph = helpers::finish_with_state_and_validations(
+    let b = Builder::for_tests();
+    let state = b
+        .state_input("state", TensorType::f32([2]), StateRole::Recurrent)
+        .unwrap();
+    let x = b.constant("x", TensorType::f32([2])).unwrap();
+    let witness = b.constant("witness", TensorType::f32([2])).unwrap();
+    let primary = b.binary(BinOp::Mul, x, state).unwrap();
+    let next = b.binary(BinOp::Add, x, state).unwrap();
+    let graph = graph_fixtures::finish_with_state_and_validations(
         b,
         primary,
         &[(state, next)],
@@ -63,12 +65,17 @@ fn stateful_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
 /// A graph that touches E4M3FN: the one walk dispatches its equations through the storage-aware path
 /// instead of the plain dense one.
 fn storage_aware_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
-    let raw = b.constant("raw", TensorType::new([2], DType::E4M3FN));
-    let witness = b.constant("witness", TensorType::f32([2]));
-    let graph =
-        helpers::finish_with_validations(b, raw, &[(ValidationId(17), "synthetic-check", witness)])
-            .unwrap();
+    let b = Builder::for_tests();
+    let raw = b
+        .constant("raw", TensorType::new([2], DType::E4M3FN))
+        .unwrap();
+    let witness = b.constant("witness", TensorType::f32([2])).unwrap();
+    let graph = graph_fixtures::finish_with_validations(
+        b,
+        raw,
+        &[(ValidationId(17), "synthetic-check", witness)],
+    )
+    .unwrap();
     let inputs = HashMap::from([
         (raw.id(), e4m3_value()),
         (witness.id(), dense_value(vec![0.0, value])),
@@ -78,12 +85,16 @@ fn storage_aware_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
 
 /// Storage-aware (E4M3FN) and stateful: the state update is an ordinary dense equation.
 fn storage_aware_stateful_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
-    let raw = b.constant("raw", TensorType::new([2], DType::E4M3FN));
-    let state = b.state_input("state", TensorType::f32([2]), StateRole::Recurrent);
-    let witness = b.constant("witness", TensorType::f32([2]));
-    let next = b.binary(BinOp::Add, state, state);
-    let graph = helpers::finish_with_state_and_validations(
+    let b = Builder::for_tests();
+    let raw = b
+        .constant("raw", TensorType::new([2], DType::E4M3FN))
+        .unwrap();
+    let state = b
+        .state_input("state", TensorType::f32([2]), StateRole::Recurrent)
+        .unwrap();
+    let witness = b.constant("witness", TensorType::f32([2])).unwrap();
+    let next = b.binary(BinOp::Add, state, state).unwrap();
+    let graph = graph_fixtures::finish_with_state_and_validations(
         b,
         raw,
         &[(state, next)],
@@ -101,17 +112,21 @@ fn storage_aware_stateful_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>
 /// An exact-I32 graph with carried state (card 371's carrier). The counter's update is an exact I32
 /// equation, so the walk keeps the exact carrier through to publication.
 fn exact_i32_stateful_fixture(value: f32) -> (Graph, HashMap<ValueId, Value>) {
-    let b = Builder::new();
-    let counter = b.state_input(
-        "counter",
-        TensorType::new([2], DType::I32),
-        StateRole::Recurrent,
-    );
-    let x = b.constant("x", TensorType::f32([2]));
-    let witness = b.constant("witness", TensorType::f32([2]));
-    let primary = b.binary(BinOp::Add, x, x);
-    let next = b.binary_scalar(BinOp::Sub, counter, Scalar::I32(-1));
-    let graph = helpers::finish_with_state_and_validations(
+    let b = Builder::for_tests();
+    let counter = b
+        .state_input(
+            "counter",
+            TensorType::new([2], DType::I32),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let x = b.constant("x", TensorType::f32([2])).unwrap();
+    let witness = b.constant("witness", TensorType::f32([2])).unwrap();
+    let primary = b.binary(BinOp::Add, x, x).unwrap();
+    let next = b
+        .binary_scalar(BinOp::Sub, counter, Scalar::I32(-1))
+        .unwrap();
+    let graph = graph_fixtures::finish_with_state_and_validations(
         b,
         primary,
         &[(counter, next)],
@@ -201,11 +216,13 @@ fn eval_rejects_the_same_lane_regardless_of_options() {
 #[test]
 fn empty_validation_graph_is_compatible() {
     fn build() -> (Graph, Graph, HashMap<ValueId, Value>) {
-        let b = Builder::new();
-        let state = b.state_input("state", TensorType::f32([1]), StateRole::Recurrent);
-        let x = b.constant("x", TensorType::f32([1]));
-        let primary = b.binary(BinOp::Mul, x, state);
-        let next = b.binary(BinOp::Add, x, state);
+        let b = Builder::for_tests();
+        let state = b
+            .state_input("state", TensorType::f32([1]), StateRole::Recurrent)
+            .unwrap();
+        let x = b.constant("x", TensorType::f32([1])).unwrap();
+        let primary = b.binary(BinOp::Mul, x, state).unwrap();
+        let next = b.binary(BinOp::Add, x, state).unwrap();
         let inputs = HashMap::from([
             (state.id(), dense_value(vec![3.0])),
             (x.id(), dense_value(vec![5.0])),
@@ -229,37 +246,45 @@ fn empty_validation_graph_is_compatible() {
     assert_eq!(empty_result.state, plain_result.state);
 }
 
-/// Validation must be checked before any value is copied into a caller-visible result. The probe
-/// counts the publication helpers that perform that copy: zero on failure, and on success equal to the
+/// Counts the publications the walk reports through [`EvalObserver::published`].
+#[derive(Default)]
+struct PublicationCount(usize);
+
+impl EvalObserver for PublicationCount {
+    fn published(&mut self, _: Publication) {
+        self.0 += 1;
+    }
+}
+
+/// Validation must be checked before any value is copied into a caller-visible result. The observer
+/// counts the publications that perform that copy: zero on failure, and on success equal to the
 /// number of caller-visible values (primary output plus every state output, plus one more if
-/// `keep_environment` was set), so the walk publishes through the probed helpers on every success and
+/// `keep_environment` was set), so the walk publishes through the observed helpers on every success and
 /// nothing is counted while validation is still pending.
 #[test]
-fn cpu_publication_probe_stays_untouched_on_failure() {
-    type OptsCombo = (&'static str, fn() -> EvalOptions<'static>, usize);
-    let combos: [OptsCombo; 2] = [
-        ("default", || EvalOptions::new(EvalBudget::UNBOUNDED), 0),
-        (
-            "keep_environment",
-            || EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-            1,
-        ),
-    ];
+fn cpu_publication_observer_stays_untouched_on_failure() {
+    let combos: [(&str, bool, usize); 2] = [("default", false, 0), ("keep_environment", true, 1)];
 
     let dense_cases: [(&str, ValueFixture, usize); 2] = [
         ("stateless", stateless_fixture, 1),
         ("stateful", stateful_fixture, 2),
     ];
-    for (combo_name, make_opts, extra) in combos {
+    for (combo_name, keep_environment, extra) in combos {
         for (shape, fixture, state_values) in dense_cases {
             for (witness, passes) in [(1.0, false), (0.0, true)] {
                 let (graph, values) = fixture(witness);
-                assert_probe(
+                assert_publications(
                     &format!("{shape} {combo_name}"),
                     witness,
                     passes,
                     state_values + extra,
-                    || eval(&graph, &values, make_opts()).map(drop),
+                    |observer| {
+                        let mut opts = EvalOptions::new(EvalBudget::UNBOUNDED).observer(observer);
+                        if keep_environment {
+                            opts = opts.keep_environment();
+                        }
+                        eval(&graph, &values, opts).map(drop)
+                    },
                 );
             }
         }
@@ -273,28 +298,29 @@ fn cpu_publication_probe_stays_untouched_on_failure() {
     for (shape, fixture, expected) in storage_cases {
         for (witness, passes) in [(1.0, false), (0.0, true)] {
             let (graph, values) = fixture(witness);
-            assert_probe(shape, witness, passes, expected, || {
-                eval(&graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).map(drop)
+            assert_publications(shape, witness, passes, expected, |observer| {
+                let opts = EvalOptions::new(EvalBudget::UNBOUNDED).observer(observer);
+                eval(&graph, &values, opts).map(drop)
             });
         }
     }
 }
 
-fn assert_probe(
+fn assert_publications(
     case: &str,
     witness: f32,
     passes: bool,
     expected_on_success: usize,
-    run: impl FnOnce() -> Result<(), EvalError>,
+    run: impl FnOnce(&mut dyn EvalObserver) -> Result<(), EvalError>,
 ) {
-    publication_probe::take();
-    let result = run();
-    let publications = publication_probe::take();
+    let mut count = PublicationCount::default();
+    let result = run(&mut count);
+    let publications = count.0;
     if passes {
         assert!(result.is_ok(), "{case}: {result:?}");
         assert_eq!(
             publications, expected_on_success,
-            "{case} did not publish every caller-visible value exactly once through the probed helper"
+            "{case} did not publish every caller-visible value exactly once through the observer"
         );
     } else {
         assert_same_failure(result.unwrap_err(), witness.to_bits());

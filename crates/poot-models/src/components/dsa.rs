@@ -26,6 +26,7 @@ use super::rope::{RopeParams, apply_rope, rope_rows};
 use super::sparse_top_k::{keep_top_k_mask, pairwise_rank};
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
+use crate::model::TraceError;
 
 /// Additive penalty for a position the selection drops: not `f32::MIN` or `-inf`, so it zeroes
 /// out after the softmax and summing it with the causal mask's own penalty does not overflow.
@@ -122,34 +123,34 @@ pub fn dsa_scores(
     qr: Traced,
     w: &DsaWeights,
     p: &DsaParams,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let (hi, di) = (p.heads, p.dim);
-    let rope = rope_rows(b, p.rope, step.pos(), cap);
+    let rope = rope_rows(b, p.rope, step.pos(), cap)?;
 
-    let q = linear(b, qr, &w.q, None);
-    let q = b.transpose(b.reshape(q, vec![rows, t, hi, di]), vec![0, 2, 1, 3]); // [rows, hi, t, di]
-    let q = apply_rope(b, q, &rope);
+    let q = linear(b, qr, &w.q, None)?;
+    let q = b.transpose(b.reshape(q, vec![rows, t, hi, di])?, vec![0, 2, 1, 3])?; // [rows, hi, t, di]
+    let q = apply_rope(b, q, &rope)?;
 
     let k = ops::layernorm(
         b,
-        linear(b, x, &w.k, None),
-        w.k_norm.declare_f32(b),
-        w.k_norm_bias.declare_f32(b),
+        linear(b, x, &w.k, None)?,
+        w.k_norm.declare_f32(b)?,
+        w.k_norm_bias.declare_f32(b)?,
         K_NORM_EPS,
-    );
-    let k = apply_rope(b, b.reshape(k, vec![rows, 1, t, di]), &rope);
-    let write_at = first_writes(b, step);
-    let keys = carried_cache(b, step, &write_at, layer, "index", k, 1, di); // [rows, 1, cap, di]
+    )?;
+    let k = apply_rope(b, b.reshape(k, vec![rows, 1, t, di])?, &rope)?;
+    let write_at = first_writes(b, step)?;
+    let keys = carried_cache(b, step, &write_at, layer, "index", k, 1, di)?; // [rows, 1, cap, di]
 
-    let weights = linear(b, x, &w.weights, None); // [rows, t, hi]
-    let weights = b.reshape(b.transpose(weights, vec![0, 2, 1]), vec![rows, hi, t, 1]);
+    let weights = linear(b, x, &w.weights, None)?; // [rows, t, hi]
+    let weights = b.reshape(b.transpose(weights, vec![0, 2, 1])?, vec![rows, hi, t, 1])?;
 
     // The head axis reduced, kept at size one so it adds onto the `[rows, 1, t, cap]` mask.
-    let dots = b.matmul(q, b.transpose(keys, vec![0, 1, 3, 2])); // [rows, hi, t, cap]
-    let scored = b.binary(BinOp::Mul, ops::relu(b, dots), weights);
-    b.reduce(RedOp::Sum, scored, 1, true)
+    let dots = b.matmul(q, b.transpose(keys, vec![0, 1, 3, 2])?)?; // [rows, hi, t, cap]
+    let scored = b.binary(BinOp::Mul, ops::relu(b, dots)?, weights)?;
+    Ok(b.reduce(RedOp::Sum, scored, 1, true)?)
 }
 
 /// The mask of the sparse attention of `layer`: `sel.mask` plus a [`DROPPED`] penalty on every
@@ -163,16 +164,16 @@ pub fn dsa_select(
     sel: Selection,
     w: &DsaWeights,
     p: &DsaParams,
-) -> Traced {
-    let scores = dsa_scores(b, step, layer, x, sel.qr, w, p);
-    let ranked = b.binary(BinOp::Add, scores, sel.mask);
-    let keep = keep_top_k_mask(b, pairwise_rank(b, ranked), p.topk); // 1.0 kept, 0.0 dropped
+) -> Result<Traced, TraceError> {
+    let scores = dsa_scores(b, step, layer, x, sel.qr, w, p)?;
+    let ranked = b.binary(BinOp::Add, scores, sel.mask)?;
+    let keep = keep_top_k_mask(b, pairwise_rank(b, ranked)?, p.topk)?; // 1.0 kept, 0.0 dropped
     let drop = b.binary_scalar(
         BinOp::Mul,
-        b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0)),
+        b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0))?,
         Scalar::F32(-DROPPED),
-    ); // 0 kept, DROPPED dropped
-    b.binary(BinOp::Add, sel.mask, drop)
+    )?; // 0 kept, DROPPED dropped
+    Ok(b.binary(BinOp::Add, sel.mask, drop)?)
 }
 
 /// The pooled indexer's key LayerNorm epsilon.
@@ -325,7 +326,7 @@ fn pooled_keep(
     qr: Traced,
     w: &PooledDsaWeights,
     p: &PooledDsaParams,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let (hi, di, pool) = (p.index_heads, p.index_dim, p.pool);
@@ -334,124 +335,134 @@ fn pooled_keep(
 
     let key = ops::layernorm(
         b,
-        linear(b, x, &ix.k, None),
-        ix.k_norm.declare_f32(b),
-        ix.k_norm_bias.declare_f32(b),
+        linear(b, x, &ix.k, None)?,
+        ix.k_norm.declare_f32(b)?,
+        ix.k_norm_bias.declare_f32(b)?,
         POOLED_K_NORM_EPS,
-    );
-    let gate = linear(b, x, &w.pool_gate, None);
-    let new = b.reshape(b.concat(2, &[key, gate]), vec![rows, 1, t, 2 * di]);
+    )?;
+    let gate = linear(b, x, &w.pool_gate, None)?;
+    let new = b.reshape(b.concat(2, &[key, gate])?, vec![rows, 1, t, 2 * di])?;
     // `[rows, 1, cap, 2 * dim]`: the key and the gate of every cached position.
-    let cached = carried_cache(b, step, write_at, layer, "index", new, 1, 2 * di);
+    let cached = carried_cache(b, step, write_at, layer, "index", new, 1, 2 * di)?;
 
     // The position of every token and of every cached slot, as exact F32 integers.
-    let pos = b.reshape(b.cast(step.pos(), DType::F32), vec![rows, t, 1]);
-    let slots = b.broadcast(b.reshape(b.iota(cap), vec![1, 1, cap]), vec![rows, t, cap]);
-    let visible = b.binary(BinOp::Ge, b.broadcast(pos, vec![rows, t, cap]), slots);
+    let pos = b.reshape(b.cast(step.pos(), DType::F32)?, vec![rows, t, 1])?;
+    let slots = b.broadcast(
+        b.reshape(b.iota(cap)?, vec![1, 1, cap])?,
+        vec![rows, t, cap],
+    )?;
+    let visible = b.binary(BinOp::Ge, b.broadcast(pos, vec![rows, t, cap])?, slots)?;
 
     // The positions after the last complete pool, and the positions of the pools kept.
     let (tail_from, kept) = if pools == 0 {
-        (b.binary_scalar(BinOp::Mul, pos, Scalar::F32(0.0)), None)
+        (b.binary_scalar(BinOp::Mul, pos, Scalar::F32(0.0))?, None)
     } else {
         // Pool `j` ends at position `(j + 1) * pool - 1`: complete once the token reaches it.
         let ends = b.binary_scalar(
             BinOp::Add,
-            b.binary_scalar(BinOp::Mul, b.iota(pools), Scalar::F32(pool as f32)),
+            b.binary_scalar(BinOp::Mul, b.iota(pools)?, Scalar::F32(pool as f32))?,
             Scalar::F32(pool as f32 - 1.0),
-        );
+        )?;
         let complete = b.binary(
             BinOp::Ge,
-            b.broadcast(pos, vec![rows, t, pools]),
-            b.broadcast(b.reshape(ends, vec![1, 1, pools]), vec![rows, t, pools]),
-        ); // [rows, t, pools]
+            b.broadcast(pos, vec![rows, t, pools])?,
+            b.broadcast(b.reshape(ends, vec![1, 1, pools])?, vec![rows, t, pools])?,
+        )?; // [rows, t, pools]
         let tail_from = b.binary_scalar(
             BinOp::Mul,
-            b.reduce(RedOp::Sum, complete, 2, true),
+            b.reduce(RedOp::Sum, complete, 2, true)?,
             Scalar::F32(pool as f32),
-        );
+        )?;
 
         // Each pool's key: the cached keys weighted by the softmax of the gates over the pool.
         let block = b.reshape(
-            b.slice(cached, 2, 0, pools * pool),
+            b.slice(cached, 2, 0, pools * pool)?,
             vec![rows, pools, pool, 2 * di],
-        );
-        let keys = b.slice(block, 3, 0, di);
+        )?;
+        let keys = b.slice(block, 3, 0, di)?;
         let bias = b.broadcast(
-            b.reshape(w.pool_bias.declare_f32(b), vec![1, 1, pool, di]),
+            b.reshape(w.pool_bias.declare_f32(b)?, vec![1, 1, pool, di])?,
             vec![rows, pools, pool, di],
-        );
-        let gates = b.binary(BinOp::Add, b.slice(block, 3, di, 2 * di), bias);
-        let weights = ops::softmax(b, b.transpose(gates, vec![0, 1, 3, 2])); // [rows, pools, di, pool]
+        )?;
+        let gates = b.binary(BinOp::Add, b.slice(block, 3, di, 2 * di)?, bias)?;
+        let weights = ops::softmax(b, b.transpose(gates, vec![0, 1, 3, 2])?)?; // [rows, pools, di, pool]
         let pooled = b.reduce(
             RedOp::Sum,
-            b.binary(BinOp::Mul, weights, b.transpose(keys, vec![0, 1, 3, 2])),
+            b.binary(BinOp::Mul, weights, b.transpose(keys, vec![0, 1, 3, 2])?)?,
             3,
             false,
-        ); // [rows, pools, di]
+        )?; // [rows, pools, di]
 
         let q = b.transpose(
-            b.reshape(linear(b, qr, &ix.q, None), vec![rows, t, hi, di]),
+            b.reshape(linear(b, qr, &ix.q, None)?, vec![rows, t, hi, di])?,
             vec![0, 2, 1, 3],
-        ); // [rows, hi, t, di]
-        let pooled = b.reshape(b.transpose(pooled, vec![0, 2, 1]), vec![rows, 1, di, pools]);
+        )?; // [rows, hi, t, di]
+        let pooled = b.reshape(
+            b.transpose(pooled, vec![0, 2, 1])?,
+            vec![rows, 1, di, pools],
+        )?;
         let dots = b.binary_scalar(
             BinOp::Mul,
-            ops::relu(b, b.matmul(q, pooled)),
+            ops::relu(b, b.matmul(q, pooled)?)?,
             Scalar::F32(1.0 / (di as f32).sqrt()),
-        ); // [rows, hi, t, pools]
+        )?; // [rows, hi, t, pools]
         let head_weights = b.binary_scalar(
             BinOp::Mul,
-            linear(b, x, &ix.weights, None),
+            linear(b, x, &ix.weights, None)?,
             Scalar::F32(1.0 / (hi as f32).sqrt()),
-        );
+        )?;
         let head_weights = b.reshape(
-            b.transpose(head_weights, vec![0, 2, 1]),
+            b.transpose(head_weights, vec![0, 2, 1])?,
             vec![rows, hi, t, 1],
-        );
+        )?;
         let scores = b.reduce(
             RedOp::Sum,
-            b.binary(BinOp::Mul, dots, head_weights),
+            b.binary(BinOp::Mul, dots, head_weights)?,
             1,
             false,
-        );
+        )?;
 
-        let rank = stable_descending_rank_masked(b, scores, complete); // [rows, t, pools]
-        let chosen = b.binary(BinOp::Mul, keep_top_k_mask(b, rank, p.pool_topk), complete);
+        let rank = stable_descending_rank_masked(b, scores, complete)?; // [rows, t, pools]
+        let chosen = b.binary(BinOp::Mul, keep_top_k_mask(b, rank, p.pool_topk)?, complete)?;
         // Spread each pool's flag over its positions: `[pools, cap]` ones where slot `s` is in pool `j`.
         let starts = b.broadcast(
             b.reshape(
-                b.binary_scalar(BinOp::Mul, b.iota(pools), Scalar::F32(pool as f32)),
+                b.binary_scalar(BinOp::Mul, b.iota(pools)?, Scalar::F32(pool as f32))?,
                 vec![pools, 1],
-            ),
+            )?,
             vec![pools, cap],
-        );
-        let slot_row = b.broadcast(b.reshape(b.iota(cap), vec![1, cap]), vec![pools, cap]);
+        )?;
+        let slot_row = b.broadcast(b.reshape(b.iota(cap)?, vec![1, cap])?, vec![pools, cap])?;
         let in_pool = b.binary(
             BinOp::Mul,
-            b.binary(BinOp::Ge, slot_row, starts),
+            b.binary(BinOp::Ge, slot_row, starts)?,
             b.binary(
                 BinOp::Ge,
-                b.binary_scalar(BinOp::Add, starts, Scalar::F32(pool as f32 - 1.0)),
+                b.binary_scalar(BinOp::Add, starts, Scalar::F32(pool as f32 - 1.0))?,
                 slot_row,
-            ),
-        );
-        (tail_from, Some(b.matmul(chosen, in_pool))) // [rows, t, cap]
+            )?,
+        )?;
+        (tail_from, Some(b.matmul(chosen, in_pool)?)) // [rows, t, cap]
     };
     let tail = b.binary(
         BinOp::Mul,
-        b.binary(BinOp::Ge, slots, b.broadcast(tail_from, vec![rows, t, cap])),
+        b.binary(
+            BinOp::Ge,
+            slots,
+            b.broadcast(tail_from, vec![rows, t, cap])?,
+        )?,
         visible,
-    );
+    )?;
     let keep = match kept {
-        Some(kept) => b.binary(BinOp::Add, kept, tail),
+        Some(kept) => b.binary(BinOp::Add, kept, tail)?,
         None => tail,
     };
     let drop = b.binary_scalar(
         BinOp::Mul,
-        b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0)),
+        b.binary_scalar(BinOp::Sub, keep, Scalar::F32(1.0))?,
         Scalar::F32(-DROPPED),
-    ); // 0 kept, DROPPED dropped
-    b.reshape(drop, vec![rows, 1, t, cap])
+    )?; // 0 kept, DROPPED dropped
+    Ok(b.reshape(drop, vec![rows, 1, t, cap])?)
 }
 
 /// GLM-5.3-Flash's DSA layer over `x` (`[rows, tokens, width]`) at layer `layer`: `[rows, tokens,
@@ -466,37 +477,40 @@ pub fn pooled_dsa(
     x: Traced,
     w: &PooledDsaWeights,
     p: &PooledDsaParams,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let (h, qk, vd, rank) = (p.heads, p.qk_dim, p.v_dim, p.kv_rank);
 
-    let qr = norm(b, linear(b, x, &w.q_a, None), &w.q_a_norm, p.norm);
+    let qr = norm(b, linear(b, x, &w.q_a, None)?, &w.q_a_norm, p.norm)?;
     let q = b.transpose(
-        b.reshape(linear(b, qr, &w.q_b, None), vec![rows, t, h, qk]),
+        b.reshape(linear(b, qr, &w.q_b, None)?, vec![rows, t, h, qk])?,
         vec![0, 2, 1, 3],
-    );
+    )?;
 
-    let latent = norm(b, linear(b, x, &w.kv_a, None), &w.kv_a_norm, p.norm);
-    let write_at = first_writes(b, step);
+    let latent = norm(b, linear(b, x, &w.kv_a, None)?, &w.kv_a_norm, p.norm)?;
+    let write_at = first_writes(b, step)?;
     let c = carried_cache(
         b,
         step,
         &write_at,
         layer,
         "c",
-        b.reshape(latent, vec![rows, 1, t, rank]),
+        b.reshape(latent, vec![rows, 1, t, rank])?,
         1,
         rank,
-    );
+    )?;
     // Every head's keys and values from the whole cached latent.
-    let kv = linear(b, b.reshape(c, vec![rows, cap, rank]), &w.kv_b, None);
-    let kv = b.transpose(b.reshape(kv, vec![rows, cap, h, qk + vd]), vec![0, 2, 1, 3]);
-    let (k, v) = (b.slice(kv, 3, 0, qk), b.slice(kv, 3, qk, qk + vd));
+    let kv = linear(b, b.reshape(c, vec![rows, cap, rank])?, &w.kv_b, None)?;
+    let kv = b.transpose(
+        b.reshape(kv, vec![rows, cap, h, qk + vd])?,
+        vec![0, 2, 1, 3],
+    )?;
+    let (k, v) = (b.slice(kv, 3, 0, qk)?, b.slice(kv, 3, qk, qk + vd)?);
 
-    let mask = pooled_keep(b, step, &write_at, layer, x, qr, w, p);
-    let out = ops::attention_masked(b, q, k, v, 1, 1.0 / (qk as f32).sqrt(), mask);
-    let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3]), vec![rows, t, h * vd]);
+    let mask = pooled_keep(b, step, &write_at, layer, x, qr, w, p)?;
+    let out = ops::attention_masked(b, q, k, v, 1, 1.0 / (qk as f32).sqrt(), mask)?;
+    let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3])?, vec![rows, t, h * vd])?;
     linear(b, out, &w.out, None)
 }
 
@@ -542,15 +556,17 @@ mod tests {
     fn run(fx: &Fx, topk: usize, x: &[f32], qr: &[f32], select: bool) -> Vec<f32> {
         let p = params(topk);
         let w = DsaWeights::new(&fx.map(), 0, WIDTH, Q_RANK, &p).unwrap();
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(T, CAP, LogitRows::All));
-        let xs = b.constant("x", TensorType::f32(vec![1, T, WIDTH]));
-        let qrs = b.constant("qr", TensorType::f32(vec![1, T, Q_RANK]));
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(T, CAP, LogitRows::All)).unwrap();
+        let xs = b.constant("x", TensorType::f32(vec![1, T, WIDTH])).unwrap();
+        let qrs = b
+            .constant("qr", TensorType::f32(vec![1, T, Q_RANK]))
+            .unwrap();
         let out = if select {
-            let mask = ops::causal_mask_from_pos(&b, step.pos(), CAP, None);
-            dsa_select(&b, &step, 0, xs, Selection { qr: qrs, mask }, &w, &p)
+            let mask = ops::causal_mask_from_pos(&b, step.pos(), CAP, None).unwrap();
+            dsa_select(&b, &step, 0, xs, Selection { qr: qrs, mask }, &w, &p).unwrap()
         } else {
-            dsa_scores(&b, &step, 0, xs, qrs, &w, &p)
+            dsa_scores(&b, &step, 0, xs, qrs, &w, &p).unwrap()
         };
         let g = step.finish(b, out).unwrap();
         let zeros: Vec<Vec<f32>> = g
@@ -791,10 +807,12 @@ mod tests {
             p.pool_topk = topk_pools;
             let w = PooledDsaWeights::new(&fx.map(), 0, WIDTH, &p).unwrap();
             let tokens = x.len() / WIDTH;
-            let b = Builder::new();
-            let step = Step::new(&b, step_shape(tokens, CAPACITY, LogitRows::All));
-            let xs = b.constant("x", TensorType::f32(vec![1, tokens, WIDTH]));
-            let y = pooled_dsa(&b, &step, 0, xs, &w, &p);
+            let b = Builder::for_tests();
+            let step = Step::new(&b, step_shape(tokens, CAPACITY, LogitRows::All)).unwrap();
+            let xs = b
+                .constant("x", TensorType::f32(vec![1, tokens, WIDTH]))
+                .unwrap();
+            let y = pooled_dsa(&b, &step, 0, xs, &w, &p).unwrap();
             let g = step.finish(b, y).unwrap();
             let zeros: Vec<Vec<f32>> = g
                 .state()

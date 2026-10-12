@@ -8,6 +8,7 @@
 //! fixture graph's kernels, which the fake device never actually executes (same pattern as
 //! `tests/cr30_lifecycle.rs`'s `FaultyDevice`).
 
+use crate::BufferRole;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,11 +16,12 @@ use std::time::{Duration, Instant};
 
 use crate::device::{DeviceTime, DispatchDeviceTime, MeasuredDeviceTime};
 use crate::timing::{DetailedTiming, TimingOptions};
-use crate::{BufferRole, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
+use crate::{Device, Dispatch, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, UnOp};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
-    Submission, Target, TargetSet, compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::WeightStore;
@@ -171,11 +173,13 @@ fn fixture() -> (
     use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_tensor::DType;
 
-    let b = Builder::new();
-    let a = b.state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent);
-    let bias = b.constant("bias", TensorType::f32(vec![2]));
-    let sum = b.binary(BinOp::Add, a, bias);
-    let output = b.unary(UnOp::Neg, sum);
+    let b = Builder::for_tests();
+    let a = b
+        .state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent)
+        .unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![2])).unwrap();
+    let sum = b.binary(BinOp::Add, a, bias).unwrap();
+    let output = b.unary(UnOp::Neg, sum).unwrap();
     let g = b
         .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, sum)]))
         .unwrap();
@@ -195,7 +199,7 @@ fn fixture() -> (
         )
         .unwrap();
     let store = Arc::new(builder.build());
-    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
     let g = names.graph(&g);
     let map = Arc::new(names.map());
     (g, store, map)
@@ -255,14 +259,18 @@ fn fixture_shared_kind_different_keys() -> (
     use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_tensor::DType;
 
-    let b = Builder::new();
-    let a = b.state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent);
-    let bias2 = b.constant("bias2", TensorType::f32(vec![2]));
-    let sum_a = b.binary(BinOp::Add, a, bias2); // Add #1, shape [2]
-    let c = b.state_input("c", TensorType::f32(vec![3]), StateRole::Recurrent);
-    let bias3 = b.constant("bias3", TensorType::f32(vec![3]));
-    let sum_c = b.binary(BinOp::Add, c, bias3); // Add #2, shape [3] -> a different kernel key
-    let output = b.unary(UnOp::Neg, sum_a);
+    let b = Builder::for_tests();
+    let a = b
+        .state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent)
+        .unwrap();
+    let bias2 = b.constant("bias2", TensorType::f32(vec![2])).unwrap();
+    let sum_a = b.binary(BinOp::Add, a, bias2).unwrap(); // Add #1, shape [2]
+    let c = b
+        .state_input("c", TensorType::f32(vec![3]), StateRole::Recurrent)
+        .unwrap();
+    let bias3 = b.constant("bias3", TensorType::f32(vec![3])).unwrap();
+    let sum_c = b.binary(BinOp::Add, c, bias3).unwrap(); // Add #2, shape [3] -> a different kernel key
+    let output = b.unary(UnOp::Neg, sum_a).unwrap();
     let g = b
         .finish(poot_graph_ir::Outputs::new(output).with_state(&[(a, sum_a), (c, sum_c)]))
         .unwrap();
@@ -299,7 +307,7 @@ fn fixture_shared_kind_different_keys() -> (
         )
         .unwrap();
     let store = Arc::new(builder.build());
-    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
     let g = names.graph(&g);
     let map = Arc::new(names.map());
     (g, store, map)

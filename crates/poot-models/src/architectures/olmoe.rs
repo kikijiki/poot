@@ -10,7 +10,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::linear::WeightError;
@@ -29,8 +28,9 @@ use crate::names::{
     ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("olmoe");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("olmoe");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -113,7 +113,7 @@ const GGUF_MOE: MoeNames = MoeNames {
 
 /// OLMoE's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OlmoeConfig {
+pub(crate) struct OlmoeConfig {
     vocab: usize,
     width: usize,
     layers: usize,
@@ -128,7 +128,7 @@ pub struct OlmoeConfig {
 }
 
 impl OlmoeConfig {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         // `intermediate_size` is the per-expert width: every layer routes.
         let dims = DenseDims::read(&fields, &SPEC)?;
@@ -174,7 +174,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Olmoe {
+pub(crate) struct Olmoe {
     params: OlmoeConfig,
     weights: WeightMap,
     stack: StackWeights,
@@ -242,12 +242,11 @@ impl Model for Olmoe {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -258,7 +257,7 @@ impl Model for Olmoe {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
                 |b, BlockInput { block: h, .. }| moe::moe(b, &step, l, h, None, &layer.moe, &p.moe),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -287,7 +286,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 fn fixture() -> Fixture {
     let config = fixture_config();
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (h, experts, inter) = (n("hidden_size"), n("num_experts"), n("intermediate_size"));
     let heads = n("num_attention_heads");
     let (q, kv) = (h, h / heads * n("num_key_value_heads"));
@@ -354,6 +353,7 @@ pub(crate) mod moe_support {
                 .trace(
                     Phase::Prefill,
                     step_shape(prompt.len(), CAP, LogitRows::All),
+                    poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
             let packed = model
@@ -483,7 +483,9 @@ pub(crate) mod moe_support {
 #[cfg(test)]
 mod family_tests {
     use poot_graph_ir::OpKind;
-    use poot_graph_plan::{CompileLimits, CompileOptions, Plan, Submission, Target, compile};
+    use poot_graph_plan::{
+        CompileLimits, CompileOptions, Plan, Target, compile, production_plan::Submission,
+    };
     use poot_load::gguf::GgufValue;
     use poot_quant::weights::{MoeRole, WeightRole};
     use poot_target::{AmdArch, Backend, DeviceCaps};
@@ -642,7 +644,13 @@ mod family_tests {
             kv: KvLayout::Contiguous,
             ..step_shape(1, CAP, LogitRows::Last)
         };
-        let graph = model.trace(Phase::Decode, shape).unwrap();
+        let graph = model
+            .trace(
+                Phase::Decode,
+                shape,
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         let graph = poot_graph_plan::bind_packed_weights(
             &graph,
             &poot_graph_plan::WeightFormats::from_weight_map(model.weights()),

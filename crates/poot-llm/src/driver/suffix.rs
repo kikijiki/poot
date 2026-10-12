@@ -17,7 +17,11 @@ use poot_eval::{EvalBudget, EvalOptions, Value};
 use poot_graph_ir::builder::Resumed;
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::ops::sampling::sample_head;
-use poot_graph_ir::{Builder, EditError, Graph, Outputs, Slot, TensorType, ValueId};
+use std::num::{NonZeroU64, NonZeroUsize};
+
+use poot_graph_ir::{
+    Builder, BuilderError, Graph, Outputs, Slot, TensorType, TraceLimits, ValueId,
+};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
 
@@ -42,12 +46,12 @@ impl Head {
 /// (`Builder::resume`), appends [`sample_head`]'s suffix, and finishes again over the same state
 /// pairs. The resumed builder keeps every witness `g` declares, and the suffix only appends values,
 /// so a validation-bearing graph keeps its checks. `Logits` is a no-op (the raw graph, unchanged).
-pub(crate) fn with_head(g: Graph, head: Head) -> Result<Graph, EditError> {
+pub(crate) fn with_head(g: Graph, head: Head, limits: TraceLimits) -> Result<Graph, BuilderError> {
     match head {
         Head::Logits => Ok(g),
         Head::Sample(rule) => {
-            let Resumed { builder, outputs } = Builder::resume(g);
-            let sh = sample_head(&builder, outputs.result, rule);
+            let Resumed { builder, outputs } = Builder::resume(g, limits)?;
+            let sh = sample_head(&builder, outputs.result, rule)?;
             builder.finish(Outputs {
                 result: sh.out,
                 ..outputs
@@ -174,6 +178,31 @@ pub(crate) fn read_tokens(bytes: &[u8]) -> std::result::Result<u32, SamplerFault
     Ok(token as u32)
 }
 
+/// What the standalone graph of one host draw may build. The suffix [`sample_head`] emits is a fixed
+/// handful of equations whatever the vocabulary (its extents are in the types, not the equation
+/// count): a few dozen values and equations, no literal beyond the rule's scalars. The caps are an
+/// order of magnitude above that and far below anything a host notices; `max_tokens` is a model
+/// trace's bound and has no meaning for a one-row graph.
+const HOST_SAMPLE_LIMITS: TraceLimits = TraceLimits {
+    max_tokens: NonZeroUsize::MIN,
+    max_values: NonZeroUsize::new(1 << 10).unwrap(),
+    max_eqns: NonZeroUsize::new(1 << 10).unwrap(),
+    max_literal_bytes: NonZeroU64::new(1 << 12).unwrap(),
+    max_owned_bytes: NonZeroU64::new(1 << 20).unwrap(),
+};
+
+/// Why a host draw's standalone graph could not be built or evaluated.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum HostSampleError {
+    #[error(transparent)]
+    Build(#[from] BuilderError),
+    #[error(transparent)]
+    Eval(#[from] poot_eval::EvalError),
+    /// The evaluated suffix did not publish the I32 `(token, non-finite)` pair `SampleToken` defines.
+    #[error("the sampling suffix did not publish an I32 (token, non-finite) pair")]
+    Output,
+}
+
 /// Evaluate `SampleToken(rule)` over one row of already-adjusted `logits` (bias/penalties/the
 /// guided-decoding mask: the caller's job, as [`Sampler::pick`] does before ever reaching this) on
 /// the host, through a standalone graph run by `poot-eval`'s own walk (the identical
@@ -193,17 +222,17 @@ pub(crate) fn eval_sample_token(
     min_p: f32,
     top_k: usize,
     top_p: f32,
-) -> Result<(i32, i32), poot_eval::EvalError> {
+) -> Result<(i32, i32), HostSampleError> {
     debug_assert_ne!(
         rule,
         SampleRule::Greedy,
         "eval_sample_token: Greedy has a closed-form host answer (argmax), call that instead"
     );
-    let b = Builder::new();
+    let b = Builder::new(HOST_SAMPLE_LIMITS);
     let vocab = logits.len();
-    let logits_in = b.slot(Slot::Activation, TensorType::new(vec![vocab], DType::F32));
-    let head = sample_head(&b, logits_in, rule);
-    let g = b.finish(head.out).unwrap();
+    let logits_in = b.slot(Slot::Activation, TensorType::new(vec![vocab], DType::F32))?;
+    let head = sample_head(&b, logits_in, rule)?;
+    let g = b.finish(head.out)?;
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     inputs.insert(
@@ -232,8 +261,8 @@ pub(crate) fn eval_sample_token(
 
     let result = poot_eval::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?;
     let out = result.output.into_host()?;
-    let ints = out
-        .as_i32()
-        .expect("SampleToken's output is always the I32 side payload");
-    Ok((ints[0], ints[1]))
+    match out.as_i32() {
+        Some([token, non_finite, ..]) => Ok((*token, *non_finite)),
+        _ => Err(HostSampleError::Output),
+    }
 }

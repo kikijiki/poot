@@ -4,6 +4,10 @@
 //! match is the completeness check ADR-0074 keeps (a drift test, not a support list). The driver and
 //! the loader take a `&Registry`; there is no global registry.
 
+use crate::architectures::{
+    bloom, deepseek2, deepseek3, deepseek4, deepseek32, gemma2, gemma3, gpt_oss, granite, llama,
+    minimax_m2, mpt, olmo2, olmoe, phi3, qwen3, qwen3moe, qwen38, qwen38_27b, smollm3,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
@@ -130,6 +134,17 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    /// The count `field` of a fixture's literal config. A fixture derives its tensor shapes from the
+    /// config it builds beside them, so a missing or non-integer field is an inconsistent literal in
+    /// the fixture's own source: a defect of the test data, never an input.
+    #[track_caller]
+    pub(crate) fn count(config: &serde_json::Value, field: &str) -> usize {
+        match config[field].as_u64().map(usize::try_from) {
+            Some(Ok(count)) => count,
+            _ => panic!("fixture config field {field:?} is not a count"),
+        }
+    }
+
     /// A tiny deterministic BF16 checkpoint of `config` holding one tensor per `(key, shape)`:
     /// norm scales (keys containing `norm`) near 1, everything else small and centred, so a greedy
     /// decode does not echo its input. The same seed every call.
@@ -385,71 +400,34 @@ impl Family {
     pub(crate) const fn entry(self) -> FamilyEntry {
         match self {
             Family::Qwen2 => crate::qwen2::model::ENTRY,
-            Family::Llama => crate::llama::ENTRY,
-            Family::Qwen3 => crate::qwen3::ENTRY,
-            Family::Olmo2 => crate::olmo2::ENTRY,
-            Family::Phi3 => crate::phi3::ENTRY,
-            Family::Smollm3 => crate::smollm3::ENTRY,
-            Family::Granite => crate::granite::ENTRY,
-            Family::Mpt => crate::mpt::ENTRY,
-            Family::Bloom => crate::bloom::ENTRY,
-            Family::Gemma3 => crate::gemma3::ENTRY,
-            Family::Gemma2 => crate::gemma2::ENTRY,
-            Family::Qwen3Moe => crate::qwen3moe::ENTRY,
-            Family::GptOss => crate::gpt_oss::ENTRY,
-            Family::Olmoe => crate::olmoe::ENTRY,
+            Family::Llama => llama::ENTRY,
+            Family::Qwen3 => qwen3::ENTRY,
+            Family::Olmo2 => olmo2::ENTRY,
+            Family::Phi3 => phi3::ENTRY,
+            Family::Smollm3 => smollm3::ENTRY,
+            Family::Granite => granite::ENTRY,
+            Family::Mpt => mpt::ENTRY,
+            Family::Bloom => bloom::ENTRY,
+            Family::Gemma3 => gemma3::ENTRY,
+            Family::Gemma2 => gemma2::ENTRY,
+            Family::Qwen3Moe => qwen3moe::ENTRY,
+            Family::GptOss => gpt_oss::ENTRY,
+            Family::Olmoe => olmoe::ENTRY,
             Family::Gemma4 => crate::gemma4::ENTRY,
-            Family::MiniMaxM2 => crate::minimax_m2::ENTRY,
-            Family::Deepseek2 => crate::deepseek2::ENTRY,
-            Family::Deepseek3 => crate::deepseek3::ENTRY,
-            Family::Deepseek32 => crate::deepseek32::ENTRY,
+            Family::MiniMaxM2 => minimax_m2::ENTRY,
+            Family::Deepseek2 => deepseek2::ENTRY,
+            Family::Deepseek3 => deepseek3::ENTRY,
+            Family::Deepseek32 => deepseek32::ENTRY,
             Family::NemotronH => crate::nemotron_h::ENTRY,
-            Family::DeepseekV4 => crate::deepseek4::ENTRY,
+            Family::DeepseekV4 => deepseek4::ENTRY,
             Family::Bert => crate::bert::ENTRY,
             Family::Idefics3Vision => crate::idefics3::ENTRY,
             Family::Qwen3Next => crate::qwen3next::ENTRY,
-            Family::Qwen35 => crate::qwen38_27b::ENTRY,
-            Family::Qwen4Exp => crate::qwen38::ENTRY,
+            Family::Qwen35 => qwen38_27b::ENTRY,
+            Family::Qwen4Exp => qwen38::ENTRY,
             Family::Glm53Flash => crate::glm53_flash::ENTRY,
             Family::Qwen25VlText => crate::qwen2::model::VL_ENTRY,
             Family::Qwen25VlVision => crate::qwen_vl_vision::ENTRY,
-        }
-    }
-
-    /// Dense 0-based position in [`Self::ALL`]. Exhaustive (no `_` arm), so a new variant needs one.
-    /// `cfg(test)`: it exists for the drift test.
-    #[cfg(test)]
-    const fn index(self) -> usize {
-        match self {
-            Family::Qwen2 => 0,
-            Family::Llama => 1,
-            Family::Qwen3 => 2,
-            Family::Olmo2 => 3,
-            Family::Phi3 => 4,
-            Family::Smollm3 => 5,
-            Family::Granite => 6,
-            Family::Mpt => 7,
-            Family::Bloom => 8,
-            Family::Gemma3 => 9,
-            Family::Gemma2 => 10,
-            Family::Qwen3Moe => 11,
-            Family::GptOss => 12,
-            Family::Olmoe => 13,
-            Family::Gemma4 => 14,
-            Family::MiniMaxM2 => 15,
-            Family::Deepseek2 => 16,
-            Family::Deepseek3 => 17,
-            Family::Deepseek32 => 18,
-            Family::NemotronH => 19,
-            Family::DeepseekV4 => 20,
-            Family::Bert => 21,
-            Family::Idefics3Vision => 22,
-            Family::Qwen3Next => 23,
-            Family::Qwen35 => 24,
-            Family::Qwen4Exp => 25,
-            Family::Glm53Flash => 26,
-            Family::Qwen25VlText => 27,
-            Family::Qwen25VlVision => 28,
         }
     }
 }
@@ -457,11 +435,11 @@ impl Family {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::ChatFormat;
     use crate::model::{ModelConfig, ModelOutput, Phase, StepShape, TraceError};
     use poot_graph_ir::Graph;
     use poot_quant::StoredBytes;
     use poot_quant::weights::WeightMap;
+    use poot_text::ChatFormat;
     use std::num::NonZeroUsize;
 
     /// SC-001: `Family::ALL` lists every variant exactly once, in index order, and the built-in
@@ -581,7 +559,12 @@ mod tests {
         fn weights(&self) -> &WeightMap {
             unreachable!("never built")
         }
-        fn trace(&self, _: Phase, _: StepShape) -> Result<Graph, TraceError> {
+        fn trace_into(
+            &self,
+            _: Phase,
+            _: StepShape,
+            _: poot_graph_ir::Builder,
+        ) -> Result<Graph, TraceError> {
             unreachable!("never built")
         }
     }
@@ -740,5 +723,43 @@ mod tests {
             raw.eos_token_ids(FamilyKey::new("qwen2")).unwrap(),
             BTreeSet::from([151645])
         );
+    }
+
+    impl Family {
+        /// Dense 0-based position in [`Self::ALL`]. Exhaustive (no `_` arm), so a new variant needs one.
+        /// `cfg(test)`: it exists for the drift test.
+        const fn index(self) -> usize {
+            match self {
+                Family::Qwen2 => 0,
+                Family::Llama => 1,
+                Family::Qwen3 => 2,
+                Family::Olmo2 => 3,
+                Family::Phi3 => 4,
+                Family::Smollm3 => 5,
+                Family::Granite => 6,
+                Family::Mpt => 7,
+                Family::Bloom => 8,
+                Family::Gemma3 => 9,
+                Family::Gemma2 => 10,
+                Family::Qwen3Moe => 11,
+                Family::GptOss => 12,
+                Family::Olmoe => 13,
+                Family::Gemma4 => 14,
+                Family::MiniMaxM2 => 15,
+                Family::Deepseek2 => 16,
+                Family::Deepseek3 => 17,
+                Family::Deepseek32 => 18,
+                Family::NemotronH => 19,
+                Family::DeepseekV4 => 20,
+                Family::Bert => 21,
+                Family::Idefics3Vision => 22,
+                Family::Qwen3Next => 23,
+                Family::Qwen35 => 24,
+                Family::Qwen4Exp => 25,
+                Family::Glm53Flash => 26,
+                Family::Qwen25VlText => 27,
+                Family::Qwen25VlVision => 28,
+            }
+        }
     }
 }

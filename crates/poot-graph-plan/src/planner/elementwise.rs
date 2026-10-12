@@ -1,6 +1,19 @@
 //! Elementwise, reduction, fused-region and fused-RoPE equation planning.
 
-use super::*;
+use super::{
+    BinOp, BodyLimits, Capability, ContractionHead, DType, ElementwiseSpec, Eqn, GBinOp, GUnOp,
+    HashMap, I32Binary, KernelRequest, Lowering, OpKind, Operand, PlanError, Planned,
+    PointwiseForm, PointwiseSpec, RedOp, RopeSpec, RowSpec, RowStep, Scalar, Ty, UnOp, UnaryOp,
+    ValueBinary, ValueId, ViewOperand, fty_ty, kg, value_ids,
+};
+use crate::kernel_mapping::{
+    check_widening_step, float_region_leaf_storage, map_binop, map_fused_input,
+    map_fused_input_i32, map_fused_local, map_fused_op, map_mixed_input_i32, map_pointwise_step,
+    map_unary,
+};
+use crate::planner::{GraphTables, Layout};
+use crate::predicates::{ELEMENTWISE_2D_WIDTH, elementwise_fold, row_parallel_width};
+use crate::refusal::Site;
 use poot_target::Backend;
 
 /// Plan one elementwise-family equation (Binary/Select/Unary/Rope/Reduce/Fused/FusedRow).

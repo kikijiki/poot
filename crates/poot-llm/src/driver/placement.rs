@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use poot_graph_plan::multi_device::{DeviceSpec, Topology, TopologyError, validate_topology};
 use poot_graph_plan::{
-    DeviceId, DevicePlacement, ExpertPlacement, Partition, ShardRule, TargetSet,
+    ShardRule, multi_device::topology::DeviceId, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::TargetSet,
 };
 use poot_quant::weights::{WeightId, WeightMap, WeightRole, WeightView};
 

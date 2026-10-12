@@ -20,15 +20,16 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{
-    BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
+    Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor, ExecutorStats, HostSync,
+    StateScope, StepInputs, StepOutputs,
 };
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{Slot, SlotKey};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet, WeightFormats,
-    bind_packed_weights, compile,
+    CompileLimits, CompileOptions, Target, WeightFormats, bind_packed_weights, compile,
+    production_plan::Submission, staged::StagedProgram, staged::TargetSet,
 };
 use poot_llm::driver::error::{DriverError, InvalidOptions, Unsupported};
 use poot_llm::driver::step::PickPolicy;
@@ -38,14 +39,13 @@ use poot_llm::driver::{
     SeqRequest, ServingShapes, StepRow, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
+use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape, TraceError};
 use poot_models::registry::{ConfigSource, Fixture, Registry, RegistryError};
 use poot_quant::weights::{WeightMap, WeightStore};
-use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_tensor::HostTensor;
 use poot_test_util::device_caps::default_caps_for;
-use poot_test_util::weight_map_oracle::eval_mapped;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -95,7 +95,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
     tokenizer().save(dir.join("tokenizer.json"), false).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
 }
 
 /// The built-in families plus the fixture family, registered from outside the production crates.
@@ -135,7 +135,9 @@ fn oracle_step(
     state: &mut Vec<HostTensor>,
 ) -> Vec<f32> {
     let n = tokens.len();
-    let graph = model.trace(phase, shape(n)).unwrap();
+    let graph = model
+        .trace(phase, shape(n), poot_graph_ir::TraceLimits::for_tests())
+        .unwrap();
     if state.is_empty() {
         *state = graph
             .state()
@@ -264,7 +266,13 @@ fn the_fixture_family_registers_loads_and_compiles_for_every_reference_target() 
     let formats = WeightFormats::from_weight_map(model.weights());
     for (name, target) in &targets {
         for (phase, tokens) in [(Phase::Prefill, 4), (Phase::Decode, 1)] {
-            let graph = model.trace(phase, shape(tokens)).unwrap();
+            let graph = model
+                .trace(
+                    phase,
+                    shape(tokens),
+                    poot_graph_ir::TraceLimits::for_tests(),
+                )
+                .unwrap();
             let graph = bind_packed_weights(&graph, &formats).unwrap();
             compile(&graph, target, &options)
                 .unwrap_or_else(|e| panic!("{phase:?} does not compile for {name}: {e}"));
@@ -521,7 +529,7 @@ fn driver_options(chunk: usize, max_trace_tokens: usize) -> DriverOptions {
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(chunk),
-        max_trace_tokens: nz(max_trace_tokens),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(max_trace_tokens)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
@@ -594,8 +602,29 @@ fn the_driver_prepares_the_fixture_family_with_no_family_branch() {
     assert_eq!(stats.entries_added, 6);
 }
 
-// SC-004 max_eqns row (a family whose third equation the common Builder refuses): deferred to POOT-733, which
-// adds TraceLimits to the Builder; there is no equation budget to drive yet and a test-only one is not allowed.
+/// SC-004 (max_eqns): a driver whose caller limits allow two equations refuses the fixture family's
+/// third attempted equation, raised by the common `Builder` through the family's shared components, as
+/// the typed budget cause: the driver publishes no entry and compiles nothing. The same family under
+/// roomy limits prepares. Mutation: the driver traces under `TraceLimits::for_tests()` instead of its
+/// options; the refusal row is red.
+#[test]
+fn the_fixture_familys_third_equation_is_refused_under_max_eqns_2() {
+    use poot_graph_ir::{Attempted, BudgetResource};
+
+    let mut options = driver_options(4, 64);
+    options.trace.max_eqns = nz(2);
+    let (driver, _, _dir) = fake_driver(options);
+    let mut driver = driver.unwrap();
+    let refused = warm_admitted(&mut driver, &[GREEDY]).unwrap_err();
+    let DriverError::Unsupported(Unsupported::Trace(TraceError::Budget(budget))) = &refused else {
+        panic!("expected the typed trace-budget cause: {refused:?}");
+    };
+    assert_eq!(budget.resource, BudgetResource::Equations);
+    assert_eq!((budget.limit, budget.used, budget.requested), (2, 2, 1));
+    assert_eq!(budget.attempted, Attempted::Total(3));
+    assert_eq!(driver.prepared_entries(), 0, "no entry was published");
+    assert_eq!(driver.stats().compiles, 0, "nothing was compiled");
+}
 
 /// SC-004 (trace limit): a 6-token chunk is aligned to the family's granule, and a driver whose
 /// trace limit is 4 tokens refuses it with the typed error before it loads any executable; the same
@@ -681,7 +710,8 @@ fn replaying_the_prepared_set_compiles_nothing_as_positions_and_seeds_change() {
 /// oracle's, which are the pinned list. The device skips cleanly when absent (and fails when the lane
 /// requires it).
 fn assert_generate_matches_the_oracle(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -783,6 +813,7 @@ fn oracle_paged_step(
                 logits: LogitRows::Last,
                 hidden: None,
             },
+            poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     if state.is_empty() {
@@ -892,11 +923,13 @@ fn four_paged_rows_equal_four_single_row_runs_on_the_oracle() {
 /// rows, and each produces the tokens of its own single-row `generate`. Mutation: bind KV as one row (every
 /// row reads row 0's block table); the other rows decode against row 0's K/V and the tokens differ.
 fn assert_four_paged_rows_equal_single_row_runs(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
-    let Some(reference) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(reference) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };

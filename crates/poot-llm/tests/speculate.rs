@@ -18,32 +18,32 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{
-    BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
+    Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor, ExecutorStats, HostSync,
+    StateScope, StepInputs, StepOutputs,
 };
 use poot_graph_ir::{Slot, SlotKey};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, StagedProgram, Submission, Target, TargetSet,
+    CompileLimits, CompileOptions, Target, production_plan::Submission, staged::StagedProgram,
+    staged::TargetSet,
 };
-use poot_llm::driver::AdapterRef;
 use poot_llm::driver::error::{DraftMismatch, DriverError, SpeculationRefusal, Unsupported};
 use poot_llm::driver::speculate::{DRAFT_STREAM_SALT, propose_lookup, spec_sample_round};
 use poot_llm::driver::step::PickPolicy;
 use poot_llm::driver::{
-    Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Head, Layout,
-    LoadOptions, ModelHandle, PreparedSetLimits, Release, RowResult, RowWork, SeqRequest,
-    ServingShapes, StepRow, Warm, open_executor, program_retention,
+    AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest,
+    Head, Layout, LoadOptions, ModelHandle, NotSpeculated, PoolShape, PreparedSetLimits, Release,
+    RowResult, RowSpeculation, RowWork, SeqRequest, ServingShapes, SpeculationStats, StepRow, Warm,
+    open_executor, program_retention,
 };
-use poot_llm::driver::{NotSpeculated, PoolShape, RowSpeculation, SpeculationStats};
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
-use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::HostTensor;
-use poot_test_util::weight_map_oracle::eval_mapped;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -93,7 +93,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture, tokenizer: &Tokenizer) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
     tokenizer.save(dir.join("tokenizer.json"), false).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
 }
 
 /// The built-in families plus the fixture family, registered from outside the production crates.
@@ -294,7 +294,7 @@ fn options(draft: DraftPolicy) -> DriverOptions {
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(8),
-        max_trace_tokens: nz(64),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(64)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
@@ -585,7 +585,13 @@ fn oracle_rows(store: &WeightStore, tokens: &[u32]) -> Vec<Vec<f32>> {
         logits: LogitRows::All,
         hidden: None,
     };
-    let graph = model.trace(Phase::Prefill, shape).unwrap();
+    let graph = model
+        .trace(
+            Phase::Prefill,
+            shape,
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     let state: Vec<HostTensor> = graph
         .state()
         .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
@@ -751,7 +757,8 @@ fn oracle_greedy(store: &WeightStore, prompt: &[u32], new: usize) -> Vec<u32> {
 /// `DraftPolicy::Off` on a device generates the oracle's greedy tokens, for both prompts of the
 /// speculation rows below: the reference they are compared with is what `Off` produces.
 fn assert_off_equals_the_oracle(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -793,7 +800,8 @@ fn assert_greedy_speculation_equals_off(
     policy: impl FnOnce() -> (DraftPolicy, Option<poot_test_util::UniqueTempPath>),
     prompt: &[u32],
 ) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -984,7 +992,8 @@ fn assert_sampled_speculation_matches_the_host_replay(
     choice: BackendChoice,
     backend: DeviceBackend,
 ) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -1035,7 +1044,8 @@ fn sampled_draft_model_matches_the_host_replay_ptx() {
 /// exactly the sum of what the rows reported. Mutation: make `speculation_sampler_ok` accept every
 /// sampler; the penalty row verifies instead and the first assertion is red.
 fn assert_rows_report_why_they_did_not_speculate(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -1162,7 +1172,8 @@ fn a_row_that_does_not_speculate_says_why_ptx() {
 /// the step is refused at bind (`slot pos: word 64 at index 2 is outside its declared range [0, 64)`) and
 /// this row is red. Either clause alone is covered by the other.
 fn assert_a_speculating_sequence_fills_its_capacity(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -1172,7 +1183,7 @@ fn assert_a_speculating_sequence_fills_its_capacity(choice: BackendChoice, backe
     // The same device without speculation: `Off` equals the oracle (`off_generate_equals_the_oracle_*`),
     // and unlike the oracle it has no near-tie margin guard to trip on the fixture's late tokens.
     let Some(reference_executor) =
-        poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -1225,7 +1236,8 @@ fn assert_a_window_past_the_capacity_is_refused_at_plan_time(
 ) {
     use poot_llm::driver::error::InvalidRequest;
 
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -1312,7 +1324,8 @@ fn assert_sampled_prompt_lookup_matches_the_host_replay(
     choice: BackendChoice,
     backend: DeviceBackend,
 ) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -1485,7 +1498,8 @@ const REPETITIVE_2: [u32; 12] = [1, 6, 12, 3, 1, 6, 12, 3, 1, 6, 12, 3];
 /// other still prefills. Mutation: read every row's picks from the first row's offset in the greedy
 /// suffix readback (`run_plans`: drop `i * positions`); the second row decodes the first row's tokens.
 fn assert_two_paged_greedy_rows_equal_off(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };
@@ -1538,7 +1552,8 @@ fn two_paged_greedy_rows_equal_off_ptx() {
 /// settle every row at the longest sequence's length (`step`: `committed` from the longest open
 /// sequence); the tokens diverge from the replay.
 fn assert_paged_mixed_draft_rows_match(choice: BackendChoice, backend: DeviceBackend) {
-    let Some(executor) = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    let Some(executor) =
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
     else {
         return;
     };

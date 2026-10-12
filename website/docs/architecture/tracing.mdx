@@ -16,18 +16,19 @@ computation, JIT-compilation, or another transformation.
 
 `poot_graph_ir::Builder` records equations. A `Traced` value is a type-only handle: a
 `ValueId` plus a brand identifying the builder that minted it, with no data; its host-computed
-`TensorType` is read through `Builder::aval`. Using a handle with a different builder panics (a
-tracer bug, not a recoverable condition). Model code creates inputs with
+`TensorType` is read through `Builder::aval`. Using a handle with a different builder is a typed
+`BuilderError` (`ForeignHandle`), not a panic. Every builder call returns a `Result`, and so does every
+helper in `poot_graph_ir::ops`. Model code creates inputs with
 `Builder::constant` (weights and tables), `Builder::slot` / `slot_named` (per-step inputs),
 and `Builder::state_input` (the KV cache), then calls the composite helpers in
 `poot_graph_ir::ops`:
 
 ```rust
-let h  = ops::rmsnorm(b, x, attn_norm, eps);
-let q  = ops::linear(b, h, q_proj, q_bias);
-let q  = ops::rope(b, q, cos_table, sin_table, pos);
-let o  = ops::attention_masked(b, q, k_cache, v_cache, n_rep, scale, mask);
-let ff = ops::swiglu(b, gate, up);
+let h  = ops::rmsnorm(b, x, attn_norm, eps)?;
+let q  = ops::linear(b, h, q_proj, q_bias)?;
+let q  = ops::rope(b, q, cos_table, sin_table, pos)?;
+let o  = ops::attention_masked(b, q, k_cache, v_cache, n_rep, scale, mask)?;
+let ff = ops::swiglu(b, gate, up)?;
 ```
 
 Each helper appends primitive eqns; none of them is an opcode. `Builder::finish(out)` closes the graph; to carry
@@ -36,21 +37,21 @@ finished `Graph` is always well formed, and a pass changes it only through an ed
 
 ## From a family to a step
 
-A model family lives in `poot-models` and implements the `Model` trait. Its `trace(phase, shape)` builds the
-graph of one step: a `StepShape` gives the rows, the new tokens per row, the cache capacity, the KV layout
+A model family lives in `poot-models` and implements the `Model` trait. Its `trace_into(phase, shape, builder)` builds the
+graph of one step (callers use `trace(phase, shape, limits)`, which checks the token count before the body runs and hands it a builder that charges the caller's limits): a `StepShape` gives the rows, the new tokens per row, the cache capacity, the KV layout
 (contiguous or paged), whether logits come back for the last token or every token and, when asked, a
 hidden-state carry. A dense decoder is a
 short call of the shared residual pair in `poot_models::components::standard`:
 
 ```rust
-let step = Step::new(&b, shape);
+let step = Step::new(&b, shape)?;
 let logits = standard_stack(&b, &step, &stack, &params, layers, |b, l, x| {
     standard_layer(
         b, x, &layers[l].norms, &layer_params,
         |b, h| attention(b, &step, l, h, &layers[l].attn, &attn_params),   // the mixer
         |b, input| gated_ffn(b, input.block, &layers[l].ffn),              // the feed-forward
     )
-});
+})?;
 step.finish(b, logits)?
 ```
 
@@ -120,8 +121,8 @@ count with `Reshape`, `Broadcast`, `Reshape` before the score matmul:
 
 ```rust
 // k: [1, H_kv, cap, D]  ->  [1, H_kv * n_rep, cap, D]
-let r = b.reshape(k, vec![bsz, h_kv, 1, seq, d]);
-let r = b.broadcast(r, vec![bsz, h_kv, n_rep, seq, d]);
+let r = b.reshape(k, vec![bsz, h_kv, 1, seq, d])?;
+let r = b.broadcast(r, vec![bsz, h_kv, n_rep, seq, d])?;
 b.reshape(r, vec![bsz, h_kv * n_rep, seq, d])
 ```
 

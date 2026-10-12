@@ -18,9 +18,12 @@ poot-executor.workspace = true
 poot-profile.workspace = true
 poot-graph-plan.workspace = true
 poot-target.workspace = true
+poot-runtime-common.workspace = true
 # LoRA administration loads a PEFT adapter directory; the synthetic GGUF writer of the startup and
 # handler fixtures (`tests/support/tiny_gguf.rs`) uses it too.
 poot-load.workspace = true
+# The chat format and the text services the OpenAI front end renders prompts and constraints with.
+poot-text.workspace = true
 clap.workspace = true
 # `encoding_format: base64` embeddings.
 base64.workspace = true
@@ -36,13 +39,17 @@ sysinfo.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+poot-graph-plan = { workspace = true, features = ["test-support"] }
+# `Budget::with` and `write_gguf`, the fixtures the engine-plan rows build budgets and checkpoints with.
+poot-llm = { workspace = true, features = ["test-support"] }
+poot-load = { workspace = true, features = ["test-support"] }
 poot-test-util.workspace = true
 # The fixture device of the engine-plan rows counts allocations the way a runtime does.
-poot-runtime-common.workspace = true
-poot-quant.workspace = true
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
 # The dtype of the synthetic LoRA adapter the device rows write.
 poot-tensor.workspace = true
-poot-graph-ir.workspace = true
+poot-graph-ir = { workspace = true, features = ["test-support"] }
 # The image the served VLM row sends is a PNG it encodes.
 image.workspace = true
 

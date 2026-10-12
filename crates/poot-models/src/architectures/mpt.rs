@@ -5,7 +5,7 @@
 //!
 //! **Fused QKV layout.** MPT's `Wqkv` output (`[3*hidden, hidden]`) is split by `MultiheadAttention.forward` via a
 //! contiguous `qkv.split([d_model, kv_n_heads*head_dim, kv_n_heads*head_dim], dim=2)` (HF: `chunk(3, dim=2)`):
-//! block-concatenated (`[all_q | all_k | all_v]`), not BLOOM's per-head-interleaved layout (`crate::bloom`). A
+//! block-concatenated (`[all_q | all_k | all_v]`), not BLOOM's per-head-interleaved layout (`crate::architectures::bloom`). A
 //! loader must not reuse BLOOM's `split_qkv_weight`/`split_qkv_bias`; a contiguous 3-way `row_slice` (the phi3
 //! precedent, `crates/poot-llm/src/runner.rs`'s `is_phi3()`) is correct. This tracer declares three separate
 //! `attn.{q,k,v}_proj.weight` constants, as BLOOM's does (splitting is the loader's job).
@@ -39,7 +39,7 @@
 //! **Tied lm_head.** `MPTForCausalLM` ties `lm_head` to `wte` by default (`config.tie_word_embeddings`) on every
 //! public checkpoint; reused transposed, as BLOOM/gemma4.
 //!
-//! Structural template: `crate::bloom`. Primitive composition only (AGENTS.md): every op is an existing
+//! Structural template: `crate::architectures::bloom`. Primitive composition only (AGENTS.md): every op is an existing
 //! `poot_graph_ir::ops` composition (`layernorm_no_bias`/`linear`/`attention_masked`/`attention_prefill`).
 
 use std::collections::BTreeSet;
@@ -49,7 +49,6 @@ use poot_graph_ir::rope_table::RopeFlavor;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{Field, Fields};
 use crate::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
@@ -67,11 +66,12 @@ use crate::model::{
 use crate::names::gguf::GGUF_MPT;
 use crate::names::{FusedDims, FusedPart, NameRow, Presence, Source, family_weights_fused};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 // The `mpt` family behind [`Model`]: bias-free LayerNorm blocks, ALiBi attention over a fused
 // contiguous `Wqkv`, and a plain exact-GELU MLP, in the standard stack and layer.
 
-pub const FAMILY: FamilyKey = FamilyKey::new("mpt");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("mpt");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -163,7 +163,7 @@ const GGUF_POSITIONS: &str = "position_embd.weight";
 
 /// mpt's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MptParams {
+pub(crate) struct MptParams {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -188,7 +188,7 @@ fn attn_config<'a>(raw: &'a RawConfig<'_>, key: &str) -> Option<&'a serde_json::
 }
 
 impl MptParams {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let unsupported = |field| fields.error(field, ConfigReason::Unsupported);
         // This family is the bias-free, ALiBi, plain-MHA MPT every public checkpoint is.
@@ -284,7 +284,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Mpt {
+pub(crate) struct Mpt {
     params: MptParams,
     weights: WeightMap,
     stack: StackWeights,
@@ -355,11 +355,10 @@ impl Model for Mpt {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -370,7 +369,7 @@ impl Model for Mpt {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
                 |b, BlockInput { block: h, .. }| plain_mlp(b, h, &layer.ffn, Gelu::Erf),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -396,7 +395,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The `[out, in]` (or `[n]`) shape of every tensor an MPT checkpoint with `config`'s dims carries.
 pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, h) = (n("vocab_size"), n("d_model"));
     let inter = h * n("expansion_ratio");
     let mut shapes = vec![

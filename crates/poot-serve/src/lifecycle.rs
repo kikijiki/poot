@@ -217,19 +217,6 @@ impl WorkerRegistry {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn notify_completion_for_test(&self) {
-        self.completed_tx.send(()).unwrap();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn joins_in_flight_for_test(&self) -> usize {
-        self.workers
-            .iter()
-            .filter(|worker| worker.join.is_none())
-            .count()
-    }
-
     /// A handle can report finished while thread-local destructors still run, so even a guarded join
     /// can block; it therefore runs on the reaper, not the shutdown controller.
     fn dispatch_finished_joins(&mut self) {
@@ -479,5 +466,23 @@ pub(crate) fn submit_admin(
     match next_reply(&rx, &|| false) {
         Ok(outcome) => outcome,
         Err(_) => Err(AdminError::EngineUnavailable),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl WorkerRegistry {
+        pub(crate) fn notify_completion_for_test(&self) {
+            self.completed_tx.send(()).unwrap();
+        }
+
+        pub(crate) fn joins_in_flight_for_test(&self) -> usize {
+            self.workers
+                .iter()
+                .filter(|worker| worker.join.is_none())
+                .count()
+        }
     }
 }

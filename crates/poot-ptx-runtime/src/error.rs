@@ -1,4 +1,5 @@
 use cudarc::driver::DriverError;
+use poot_target::BufferStorage;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PtxError {
@@ -74,10 +75,3 @@ pub enum PtxError {
     #[error("copy_to_peer refused: direct access to the destination's device was not enabled")]
     PeerNotEnabled,
 }
-
-/// Native element representation retained by a PTX allocation (card 527: moved to `poot-target`, the
-/// shared type every runtime's buffer handle now uses, so ROCm and PTX no longer keep independent
-/// copies; `BufferElement` stays the name this crate's callers use). See [`poot_target::BufferStorage`]
-/// for the fuller element-kind + logical-dtype + layout contract [`crate::PtxBuffer`] now carries.
-pub use poot_target::ElementKind as BufferElement;
-pub use poot_target::{BufferStorage, LogicalDType, StorageLayout};

@@ -8,7 +8,7 @@ use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::op::{BinOp, FusedOp, OpKind, UnOp};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Builder, Eqn, Graph, Operand, Slot, ValueId};
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 use poot_tensor::{DType, HostTensor};
 
 fn output_bits(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Vec<u32> {
@@ -62,18 +62,28 @@ fn cast_steps(eqn: &Eqn) -> usize {
 #[test]
 fn a_position_cast_becomes_a_step_of_the_mask_region_that_reads_it() {
     let n = 8usize;
-    let b = Builder::new();
-    let pos = b.slot(Slot::Pos, TensorType::new(vec![1], DType::I32));
-    let x = b.constant("x", TensorType::f32(vec![1, n]));
-    let pos_f = b.broadcast(b.reshape(b.cast(pos, DType::F32), vec![1, 1]), vec![1, n]);
-    let cols = b.reshape(b.iota(n), vec![1, n]);
-    let keep = b.binary(BinOp::Ge, pos_f, cols);
-    let mask = b.binary_scalar(BinOp::Sub, keep, poot_graph_ir::Scalar::F32(1.0));
-    let out = b.binary(BinOp::Add, x, mask);
+    let b = Builder::for_tests();
+    let pos = b
+        .slot(Slot::Pos, TensorType::new(vec![1], DType::I32))
+        .unwrap();
+    let x = b.constant("x", TensorType::f32(vec![1, n])).unwrap();
+    let pos_f = b
+        .broadcast(
+            b.reshape(b.cast(pos, DType::F32).unwrap(), vec![1, 1])
+                .unwrap(),
+            vec![1, n],
+        )
+        .unwrap();
+    let cols = b.reshape(b.iota(n).unwrap(), vec![1, n]).unwrap();
+    let keep = b.binary(BinOp::Ge, pos_f, cols).unwrap();
+    let mask = b
+        .binary_scalar(BinOp::Sub, keep, poot_graph_ir::Scalar::F32(1.0))
+        .unwrap();
+    let out = b.binary(BinOp::Add, x, mask).unwrap();
     let (pos_id, x_id) = (pos.id(), x.id());
     let g = b.finish(out).unwrap();
 
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&g), 1);
     assert_eq!(
         casts(&og),
@@ -109,15 +119,21 @@ fn a_position_cast_becomes_a_step_of_the_mask_region_that_reads_it() {
 /// the cast). The I32 producer writes the f32 result itself.
 #[test]
 fn an_i32_producer_writes_the_f32_the_cast_would_have_made() {
-    let b = Builder::new();
-    let a = b.slot_named(Slot::Token, "a", TensorType::new(vec![2, 3], DType::I32));
-    let c = b.slot_named(Slot::Token, "c", TensorType::new(vec![2, 3], DType::I32));
-    let flag = b.cast(b.binary(BinOp::GeU, a, c), DType::F32);
-    let out = b.transpose(flag, vec![1, 0]);
+    let b = Builder::for_tests();
+    let a = b
+        .slot_named(Slot::Token, "a", TensorType::new(vec![2, 3], DType::I32))
+        .unwrap();
+    let c = b
+        .slot_named(Slot::Token, "c", TensorType::new(vec![2, 3], DType::I32))
+        .unwrap();
+    let flag = b
+        .cast(b.binary(BinOp::GeU, a, c).unwrap(), DType::F32)
+        .unwrap();
+    let out = b.transpose(flag, vec![1, 0]).unwrap();
     let (a_id, c_id) = (a.id(), c.id());
     let g = b.finish(out).unwrap();
 
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&g), 1);
     assert_eq!(casts(&og), 0);
     let producer = regions(&og);
@@ -141,20 +157,28 @@ fn an_i32_producer_writes_the_f32_the_cast_would_have_made() {
 /// whole chain computed in f32.
 #[test]
 fn an_i32_chain_its_cast_and_the_float_arithmetic_after_it_are_one_region() {
-    let b = Builder::new();
-    let a = b.slot_named(Slot::Token, "a", TensorType::new(vec![2, 4], DType::I32));
-    let c = b.slot_named(Slot::Token, "c", TensorType::new(vec![2, 4], DType::I32));
-    let w = b.constant("w", TensorType::f32(vec![2, 4]));
-    let hit = b.binary(
-        BinOp::Mul,
-        b.binary(BinOp::Ge, a, c),
-        b.binary(BinOp::Ge, c, a),
-    );
-    let out = b.binary(BinOp::Mul, b.cast(hit, DType::F32), w);
+    let b = Builder::for_tests();
+    let a = b
+        .slot_named(Slot::Token, "a", TensorType::new(vec![2, 4], DType::I32))
+        .unwrap();
+    let c = b
+        .slot_named(Slot::Token, "c", TensorType::new(vec![2, 4], DType::I32))
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![2, 4])).unwrap();
+    let hit = b
+        .binary(
+            BinOp::Mul,
+            b.binary(BinOp::Ge, a, c).unwrap(),
+            b.binary(BinOp::Ge, c, a).unwrap(),
+        )
+        .unwrap();
+    let out = b
+        .binary(BinOp::Mul, b.cast(hit, DType::F32).unwrap(), w)
+        .unwrap();
     let (a_id, c_id, w_id) = (a.id(), c.id(), w.id());
     let g = b.finish(out).unwrap();
 
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&og), 0);
     let all = regions(&og);
     assert_eq!(
@@ -181,22 +205,29 @@ fn an_i32_chain_its_cast_and_the_float_arithmetic_after_it_are_one_region() {
 #[test]
 fn a_cast_read_by_lone_pointwise_equations_folds_into_each() {
     let n = 6usize;
-    let b = Builder::new();
-    let pos = b.slot(Slot::Pos, TensorType::new(vec![n], DType::I32));
-    let cols = b.iota(n);
-    let pos_f = b.cast(pos, DType::F32);
-    let keep = b.binary(BinOp::Ge, pos_f, cols);
-    let scaled = b.binary_scalar(BinOp::Mul, pos_f, poot_graph_ir::Scalar::F32(0.5));
+    let b = Builder::for_tests();
+    let pos = b
+        .slot(Slot::Pos, TensorType::new(vec![n], DType::I32))
+        .unwrap();
+    let cols = b.iota(n).unwrap();
+    let pos_f = b.cast(pos, DType::F32).unwrap();
+    let keep = b.binary(BinOp::Ge, pos_f, cols).unwrap();
+    let scaled = b
+        .binary_scalar(BinOp::Mul, pos_f, poot_graph_ir::Scalar::F32(0.5))
+        .unwrap();
     // A reduce keeps the two readers from becoming one region.
-    let out = b.binary(
-        BinOp::Add,
-        b.reduce(poot_graph_ir::RedOp::Sum, keep, 0, true),
-        b.reduce(poot_graph_ir::RedOp::Sum, scaled, 0, true),
-    );
+    let out = b
+        .binary(
+            BinOp::Add,
+            b.reduce(poot_graph_ir::RedOp::Sum, keep, 0, true).unwrap(),
+            b.reduce(poot_graph_ir::RedOp::Sum, scaled, 0, true)
+                .unwrap(),
+        )
+        .unwrap();
     let pos_id = pos.id();
     let g = b.finish(out).unwrap();
 
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&og), 0);
     assert_eq!(
         regions(&og).iter().filter(|e| cast_steps(e) == 1).count(),
@@ -213,36 +244,42 @@ fn a_cast_read_by_lone_pointwise_equations_folds_into_each() {
 #[test]
 fn a_cast_no_pointwise_kernel_can_absorb_stays_a_cast() {
     // A contraction reads the cast: it has no I32 lane, so the cast stays a launch.
-    let b = Builder::new();
-    let pos = b.slot(Slot::Pos, TensorType::new(vec![1, 4], DType::I32));
-    let w = b.constant("w", TensorType::f32(vec![4, 3]));
-    let out = b.matmul(b.cast(pos, DType::F32), w);
+    let b = Builder::for_tests();
+    let pos = b
+        .slot(Slot::Pos, TensorType::new(vec![1, 4], DType::I32))
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4, 3])).unwrap();
+    let out = b.matmul(b.cast(pos, DType::F32).unwrap(), w).unwrap();
     let g = b.finish(out).unwrap();
     assert_eq!(
-        casts(&optimize(&g).unwrap()),
+        casts(&passes_without_target(&g).unwrap()),
         1,
         "a matmul operand keeps its cast"
     );
 
     // The graph output is the cast itself: its value is read from outside, with no reader to fold into.
-    let b = Builder::new();
-    let pos = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
-    let out = b.cast(pos, DType::F32);
+    let b = Builder::for_tests();
+    let pos = b
+        .slot(Slot::Pos, TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let out = b.cast(pos, DType::F32).unwrap();
     let g = b.finish(out).unwrap();
     assert_eq!(
-        casts(&optimize(&g).unwrap()),
+        casts(&passes_without_target(&g).unwrap()),
         1,
         "a cast that is the output stays"
     );
 
     // The select's condition is the I32 word, its branch the cast of the same word: one leaf, two meanings.
-    let b = Builder::new();
-    let pos = b.slot(Slot::Pos, TensorType::new(vec![4], DType::I32));
-    let x = b.constant("x", TensorType::f32(vec![4]));
+    let b = Builder::for_tests();
+    let pos = b
+        .slot(Slot::Pos, TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
     let (pos_id, x_id) = (pos.id(), x.id());
-    let out = b.select(pos, b.cast(pos, DType::F32), x);
+    let out = b.select(pos, b.cast(pos, DType::F32).unwrap(), x).unwrap();
     let g = b.finish(out).unwrap();
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&og), 1, "a reader of the word itself keeps the cast");
     let inputs = HashMap::from([
         (pos_id, i32_value(vec![4], vec![0, 2, 0, -3])),
@@ -254,19 +291,27 @@ fn a_cast_no_pointwise_kernel_can_absorb_stays_a_cast() {
 /// A producer with another reader keeps its I32 words for them: the cast folds into the float reader only.
 #[test]
 fn a_producer_another_equation_reads_is_not_rewritten() {
-    let b = Builder::new();
-    let a = b.slot_named(Slot::Token, "a", TensorType::new(vec![4], DType::I32));
-    let c = b.slot_named(Slot::Token, "c", TensorType::new(vec![4], DType::I32));
-    let w = b.constant("w", TensorType::f32(vec![4]));
-    let flag = b.binary(BinOp::GeU, a, c);
-    let scaled = b.binary(BinOp::Mul, b.cast(flag, DType::F32), w);
+    let b = Builder::for_tests();
+    let a = b
+        .slot_named(Slot::Token, "a", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let c = b
+        .slot_named(Slot::Token, "c", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
+    let flag = b.binary(BinOp::GeU, a, c).unwrap();
+    let scaled = b
+        .binary(BinOp::Mul, b.cast(flag, DType::F32).unwrap(), w)
+        .unwrap();
     // The same I32 flag, summed as words by an exact-I32 op the cast does not touch.
-    let other = b.cast(b.unary(UnOp::Not, flag), DType::F32);
-    let out = b.binary(BinOp::Add, scaled, other);
+    let other = b
+        .cast(b.unary(UnOp::Not, flag).unwrap(), DType::F32)
+        .unwrap();
+    let out = b.binary(BinOp::Add, scaled, other).unwrap();
     let (a_id, c_id, w_id) = (a.id(), c.id(), w.id());
     let g = b.finish(out).unwrap();
 
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&og), 0);
     let inputs = HashMap::from([
         (a_id, i32_value(vec![4], vec![1, 5, 2, -1])),

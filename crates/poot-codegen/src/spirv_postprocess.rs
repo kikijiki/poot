@@ -23,7 +23,7 @@ const VULKAN_WG_BARRIER_SEMANTICS: u32 = 0x108;
 /// Rewrite `OpControlBarrier` memory semantics from SequentiallyConsistent to AcquireRelease |
 /// WorkgroupMemory so the module is valid Vulkan SPIR-V. No-op if there are no barriers; non-SPIR-V input is
 /// returned untouched.
-pub fn fix_barrier_semantics(words: Vec<u32>) -> Vec<u32> {
+pub(crate) fn fix_barrier_semantics(words: Vec<u32>) -> Vec<u32> {
     if words.len() < 5 || words[0] != MAGIC {
         return words;
     }
@@ -133,7 +133,7 @@ pub fn fix_barrier_semantics(words: Vec<u32>) -> Vec<u32> {
 /// `memoryBarrierBuffer()` does the same). An unresolved or `CrossDevice`(0) scope gets both bits (safe
 /// over-fencing). No-op if the Semantics constant already has a storage-class bit, so it is idempotent and
 /// leaves hand-authored modules alone. Everything else is copied verbatim.
-pub fn fix_fence_semantics(words: Vec<u32>) -> Vec<u32> {
+pub(crate) fn fix_fence_semantics(words: Vec<u32>) -> Vec<u32> {
     if words.len() < 5 || words[0] != MAGIC {
         return words;
     }
@@ -287,7 +287,7 @@ pub enum NoContractionError {
 /// has no decoration to anchor on, or a marker call is malformed: a silently missing decoration is the bug
 /// this pass exists to prevent, so a malformed module is a loud, typed failure. No-op for a module with no
 /// marker, or non-SPIR-V input.
-pub fn fix_no_contraction(words: Vec<u32>) -> Result<Vec<u32>, NoContractionError> {
+pub(crate) fn fix_no_contraction(words: Vec<u32>) -> Result<Vec<u32>, NoContractionError> {
     if words.len() < 5 || words[0] != MAGIC {
         return Ok(words);
     }
@@ -473,7 +473,7 @@ fn decode_string(words: &[u32], start: usize, end: usize) -> String {
 ///
 /// Called from `fixup_spirv_barriers` in `lib.rs`, so every SpirvVulkan compile gets it; a no-op unless the
 /// IR contains a coopmat builtin call (see `wmma_check_target`/`emit_wmma_*_coopmat` in `emit.rs`).
-pub fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
+pub(crate) fn fix_coopmat_calls(words: Vec<u32>) -> Vec<u32> {
     if words.len() < 5 || words[0] != MAGIC {
         return words;
     }

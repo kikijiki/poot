@@ -2,24 +2,21 @@
 //! per-equation planner, an individual pass through the test-support surface) with limits small enough
 //! that the contract's two sides differ, and reads the typed refusal. The limits here are test limits,
 //! not production defaults ([`CompileLimits::STANDARD`] is the production policy).
-//!
-//! What moved: the trace-side rows (a `Model` traced under `TraceLimits`) belong to the card that makes
-//! tracing fallible; this file covers the compiler half only.
 
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, RedOp, TensorType, UnOp};
+use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, DecomposeError, ExpansionError,
-    GraphResource, KernelChoice, PlanError, Submission, Target, compile,
-    decompose_large_vocab_greedy, plan_eqn_choice,
+    GraphResource, KernelChoice, PlanError, Target, compile, decompose_large_vocab_greedy,
+    plan_eqn_choice, production_plan::Submission,
 };
 use poot_kernelgen::{BodyLimits, BodyResource, BodyStage, KernelGenError, KernelRequest};
 use poot_target::Backend;
 use poot_test_util::device_caps::default_caps_for;
-use poot_test_util::graph_fixtures::{gpu_backend, gpu_caps};
 
 const DECOMPOSE: &str = "decompose_large_vocab_greedy";
 
@@ -67,9 +64,11 @@ fn expansion(result: Result<impl std::fmt::Debug, CompileError>, what: &str) -> 
 /// two-stage reduction of about thirty equations, which is the transform fixture the limits are read
 /// against.
 fn greedy_over(vocab: usize) -> Graph {
-    let b = Builder::new();
-    let logits = b.constant("logits", TensorType::f32(vec![vocab]));
-    let out = b.sample_token(SampleRule::Greedy, logits, None, None, None);
+    let b = Builder::for_tests();
+    let logits = b.constant("logits", TensorType::f32(vec![vocab])).unwrap();
+    let out = b
+        .sample_token(SampleRule::Greedy, logits, None, None, None)
+        .unwrap();
     b.finish(out).unwrap()
 }
 
@@ -153,10 +152,10 @@ fn the_value_table_is_capped_independently_of_the_equation_list() {
 fn a_traced_graph_over_the_caps_is_refused_before_any_pass_runs() {
     let g = greedy_over(16);
     assert_eq!(g.eqns().len(), 1);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4]));
-    let y = b.binary(BinOp::Add, x, x);
-    let z = b.binary(BinOp::Mul, y, y);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let y = b.binary(BinOp::Add, x, x).unwrap();
+    let z = b.binary(BinOp::Mul, y, y).unwrap();
     let three = b.finish(z).unwrap();
     assert_eq!(three.eqns().len(), 2);
     let refusal = expansion(
@@ -182,9 +181,9 @@ fn a_traced_graph_over_the_caps_is_refused_before_any_pass_runs() {
 /// runs and the post-pass admission refuses the finished graph with three held, not one.
 #[test]
 fn a_pass_sized_ahead_of_time_is_refused_before_it_runs() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 8]));
-    let out = b.reduce(RedOp::Sum, x, 0, true);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+    let out = b.reduce(RedOp::Sum, x, 0, true).unwrap();
     let g = b.finish(out).unwrap();
     assert_eq!(g.eqns().len(), 1);
 
@@ -212,11 +211,11 @@ fn a_pass_sized_ahead_of_time_is_refused_before_it_runs() {
 /// instead of refusing.
 #[test]
 fn the_dtype_widening_is_sized_before_it_runs() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![3, 5]));
-    let w = b.constant("w", TensorType::f32(vec![5, 4]));
-    let out = b.matmul(x, w);
-    let g = poot_test_util::graph_fixtures::derive(&b.finish(out).unwrap(), |draft| {
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![3, 5])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![5, 4])).unwrap();
+    let out = b.matmul(x, w).unwrap();
+    let g = poot_graph_ir::test_support::graph_fixtures::derive(&b.finish(out).unwrap(), |draft| {
         draft.values_mut()[w.id()].aval.dtype = poot_tensor::DType::BF16;
     })
     .unwrap();
@@ -242,17 +241,20 @@ fn the_dtype_widening_is_sized_before_it_runs() {
 /// `exp(x * s) + b` repeated: a float pointwise chain `fuse` turns into one fused region of `depth * 2`
 /// steps.
 fn pointwise_chain(depth: usize) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 8]));
-    let s = b.constant("s", TensorType::f32(vec![4, 8]));
-    let bias = b.constant("bias", TensorType::f32(vec![4, 8]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+    let s = b.constant("s", TensorType::f32(vec![4, 8])).unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![4, 8])).unwrap();
     let mut v = x;
     for _ in 0..depth {
-        v = b.binary(
-            BinOp::Add,
-            b.unary(UnOp::Exp, b.binary(BinOp::Mul, v, s)),
-            bias,
-        );
+        v = b
+            .binary(
+                BinOp::Add,
+                b.unary(UnOp::Exp, b.binary(BinOp::Mul, v, s).unwrap())
+                    .unwrap(),
+                bias,
+            )
+            .unwrap();
     }
     b.finish(v).unwrap()
 }
@@ -365,9 +367,9 @@ fn a_real_fused_region_is_refused_before_it_is_generated_under_small_body_limits
 /// body-limit error. Mutation: map the generator's error to an unrelated capability; the match fails.
 #[test]
 fn a_kernel_over_the_body_limits_with_no_smaller_form_is_a_typed_planner_refusal() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 8]));
-    let out = b.unary(UnOp::Exp, x);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+    let out = b.unary(UnOp::Exp, x).unwrap();
     let g = b.finish(out).unwrap();
     let refusal = match compile(&g, &wgpu(), &options(body_limits(2, 2))) {
         Err(CompileError::Plan(error)) => match *error {

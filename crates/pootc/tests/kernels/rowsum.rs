@@ -1,6 +1,5 @@
 //! A looping kernel: per-row sum over COLS columns via a `while` loop (the serial-reduce shape, like
-//! `poot_test_util::kernel_fixtures::reduce_last`, a thin f32 wrapper over kernelgen's own
-//! `reduce_last_dt`). Tests that the importer handles a loop (header SwitchInt + back-edge
+//! `poot_kernelgen::reduce_last_dt` at `Ty::F32`). Tests that the importer handles a loop (header SwitchInt + back-edge
 //! Goto + an accumulator) without the `for`-range iterator machinery.
 
 #![crate_type = "lib"]

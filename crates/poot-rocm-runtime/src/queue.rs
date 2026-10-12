@@ -1,12 +1,16 @@
-use crate::*;
+use crate::bindings::{
+    HSA_QUEUE_FEATURE_KERNEL_DISPATCH, HSA_QUEUE_TYPE_COOPERATIVE, HSA_QUEUE_TYPE_MULTI,
+    hsa_queue_t,
+};
+use crate::{QueueHostLink, QueueRingMemory, RocmError, bindings};
+use std::ffi::{OsString, c_void};
+use std::sync::OnceLock;
 
 /// Immutable purpose of the context's sole HSA queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueRole {
     /// Runtime-owned GWS queue required by persistent cooperative kernels.
     Cooperative,
-    /// Ordinary user queue reserved for retained AQL graph replay.
-    RecordedReplay,
     /// Receipt-only ordinary queue with a forced PCIe device-memory ring.
     PcieDeviceRingReceipt,
 }
@@ -16,8 +20,6 @@ pub enum QueueRole {
 pub enum QueueRingProvenance {
     /// ROCr's cooperative GWS creator with its explicit system-memory-ring flag.
     CooperativeGwsSystemMemory,
-    /// Ordinary `hsa_queue_create` with the device-memory-ring override absent.
-    OrdinarySystemMemory,
     /// Card 333's receipt-only ordinary queue with the device-memory-ring override enabled.
     PcieDeviceMemoryReceipt,
 }
@@ -57,14 +59,6 @@ pub(crate) fn cooperative_gws_publication_facts() -> (Option<QueueRingMemory>, O
     (Some(QueueRingMemory::HostCoherent), None)
 }
 
-/// ROCr's ordinary queue creator defaults to a system-memory ring when the process-wide
-/// `HSA_ALLOCATE_QUEUE_DEV_MEM` override was absent before the runtime was loaded.
-#[cfg(test)]
-pub(crate) fn ordinary_system_publication_facts() -> (Option<QueueRingMemory>, Option<QueueHostLink>)
-{
-    (Some(QueueRingMemory::HostCoherent), None)
-}
-
 pub(crate) fn device_ring_override_present(get: impl Fn(&str) -> Option<OsString>) -> bool {
     get("HSA_ALLOCATE_QUEUE_DEV_MEM").is_some()
 }
@@ -78,8 +72,6 @@ pub(crate) fn validate_queue_plan_provenance(
 ) -> Result<(), RocmError> {
     let valid = match plan {
         QueueCreationPlan::CooperativeGws => true,
-        #[cfg(test)]
-        QueueCreationPlan::RecordedReplay => !override_at_load && !override_now,
         QueueCreationPlan::PcieDeviceMemoryRingReceipt => override_at_load && override_now,
     };
     if valid {
@@ -101,8 +93,6 @@ pub(crate) fn validate_queue_plan_provenance(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueueCreationPlan {
     CooperativeGws,
-    #[cfg(test)]
-    RecordedReplay,
     PcieDeviceMemoryRingReceipt,
 }
 
@@ -110,8 +100,6 @@ impl QueueCreationPlan {
     pub(crate) const fn role(self) -> QueueRole {
         match self {
             Self::CooperativeGws => QueueRole::Cooperative,
-            #[cfg(test)]
-            Self::RecordedReplay => QueueRole::RecordedReplay,
             Self::PcieDeviceMemoryRingReceipt => QueueRole::PcieDeviceRingReceipt,
         }
     }
@@ -119,8 +107,6 @@ impl QueueCreationPlan {
     pub(crate) const fn provenance(self) -> QueueRingProvenance {
         match self {
             Self::CooperativeGws => QueueRingProvenance::CooperativeGwsSystemMemory,
-            #[cfg(test)]
-            Self::RecordedReplay => QueueRingProvenance::OrdinarySystemMemory,
             Self::PcieDeviceMemoryRingReceipt => QueueRingProvenance::PcieDeviceMemoryReceipt,
         }
     }
@@ -130,8 +116,6 @@ pub(crate) fn queue_request(plan: QueueCreationPlan, agent_max_queue_size: u32) 
     QueueRequest {
         queue_type: match plan {
             QueueCreationPlan::CooperativeGws => HSA_QUEUE_TYPE_COOPERATIVE,
-            #[cfg(test)]
-            QueueCreationPlan::RecordedReplay => HSA_QUEUE_TYPE_MULTI,
             QueueCreationPlan::PcieDeviceMemoryRingReceipt => HSA_QUEUE_TYPE_MULTI,
         },
         size: agent_max_queue_size,

@@ -1,16 +1,16 @@
 //! Golden-IR tests for `poot_codegen::emit` (moved from `src/emit.rs`'s own `#[cfg(test)]` module, card
-//! 671): that module called `poot_test_util::kernel_fixtures::emit_llvm_ir`, and `poot-test-util` depends on
-//! `poot-codegen` (for the real, still-pub `emit_llvm_ir` the golden-IR helper re-exports), so building it
-//! as part of poot-codegen's own lib-test unit compiled two different instances of `poot-codegen` into one
-//! binary (`Target`/`EmitError` each becoming two distinct, mismatched types). An integration test under
-//! `tests/` always treats its own crate as an ordinary external dependency, which has no such cycle.
+//! 671): the golden-IR tests need `poot-kernelgen`'s generators, and building them as part of poot-codegen's
+//! own lib-test unit would compile two instances of `poot-codegen` into one binary (`Target`/`EmitError`
+//! each becoming two distinct, mismatched types). An integration test under `tests/` treats its own crate
+//! as an ordinary external dependency, which has no such cycle.
 
+use poot_codegen::emit_llvm_ir;
 use poot_codegen::{CompileError, EmitError, Target, artifact_path, compile};
 use poot_kernel_ir::fixtures;
-use poot_target::AmdArch;
-use poot_test_util::kernel_fixtures::{
-    e4m3fn_encode_kernel, emit_llvm_ir, gemv_loop_kernel, vadd_loop_kernel, wmma_tile,
+use poot_kernel_ir::test_support::{
+    e4m3fn_encode_kernel, gemv_loop_kernel, vadd_loop_kernel, wmma_tile,
 };
+use poot_target::AmdArch;
 
 #[test]
 fn add_nvptx_shape() {
@@ -485,7 +485,7 @@ fn exp_aie_emits_software_exp() {
 /// Card 530 SC-001: one generator (`wmma_tile`) produces one fragment `Body`, and that same `Body`
 /// lowers on every implemented target - AMDGCN WMMA, NVPTX `mma.sync`/`wmma`, and SPIR-V cooperative
 /// matrix - with no per-target `Body` variant. Real device evidence (not just this compile-time check)
-/// is `poot-kernelgen`'s `coopmat_dispatch_probe` (RADV coopmat) and `poot-rocm-gpu`'s
+/// is `poot-kernelgen`'s `coopmat_dispatch_probe` (RADV coopmat) and `poot-rocm-device`'s
 /// `tests::resident::probe_*_wmma_rocm` (AMDGCN WMMA), both of which dispatch this same generator (or
 /// its production `matmul_tensorcore` sibling) on real hardware and compare against the CPU oracle.
 #[test]

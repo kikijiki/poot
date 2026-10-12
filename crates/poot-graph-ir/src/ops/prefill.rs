@@ -1,28 +1,35 @@
-use super::*;
+use super::{
+    BinOp, Builder, BuilderError, DType, RedOp, Requirement, Scalar, Traced, UnOp, repeat_kv,
+    repeat_kv_tiled,
+};
+#[cfg(any(test, feature = "test-support"))]
+use super::{rope_partial, softcap};
 
 // --- prefill variants (process the whole prompt in one forward; causal mask + per-position RoPE) ---
 
 /// RoPE for a full sequence `x[.., L, D]` at positions `0..L`. cos/sin are `[max_pos, D]`; rows `0..L`
 /// are sliced and broadcast over the head/batch axes.
+#[cfg(any(test, feature = "test-support"))]
 pub fn rope_prefill(
     b: &Builder,
     x: Traced,
     cos_table: Traced,
     sin_table: Traced,
     seq_len: usize,
-) -> Traced {
-    let shape = b.aval(x).shape;
-    let d = *shape.last().expect("rope on a scalar");
+) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
+    let d = super::last_axis("rope", &shape)?;
     let last = shape.len() - 1;
-    let rot = *b.aval(cos_table).shape.last().expect("rope table rank>=1");
-    let cos = b.slice(cos_table, 0, 0, seq_len); // [L, rot]
-    let sin = b.slice(sin_table, 0, 0, seq_len);
+    let rot = super::last_axis("rope", &b.aval(cos_table)?.shape)?;
+    let cos = b.slice(cos_table, 0, 0, seq_len)?; // [L, rot]
+    let sin = b.slice(sin_table, 0, 0, seq_len)?;
     rope_partial(b, x, cos, sin, d, rot, last)
 }
 
 /// Prefill attention over a full sequence: `q[1,Hq,L,D]`, `k`/`v[1,Hkv,L,D]`, additive causal `mask`
 /// (`[1,1,L,L]`, 0 on/below the diagonal, large-negative above) added before softmax. Returns
 /// `[1,Hq,L,D]`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn attention_prefill(
     b: &Builder,
     q: Traced,
@@ -31,7 +38,7 @@ pub fn attention_prefill(
     n_rep: usize,
     scale: f32,
     mask: Traced,
-) -> Traced {
+) -> Result<Traced, BuilderError> {
     attention_prefill_softcap(b, q, k, v, n_rep, scale, mask, None)
 }
 
@@ -39,6 +46,7 @@ pub fn attention_prefill(
 /// `c * tanh(scores / c)` ([`softcap`]) to the scaled `Q K^T` scores BEFORE the causal mask and softmax;
 /// `None` is byte-identical to [`attention_prefill`] (no extra eqns). One definition.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn attention_prefill_softcap(
     b: &Builder,
     q: Traced,
@@ -48,32 +56,32 @@ pub fn attention_prefill_softcap(
     scale: f32,
     mask: Traced,
     attn_logit_softcap: Option<f32>,
-) -> Traced {
-    let k = repeat_kv(b, k, n_rep);
-    let v = repeat_kv(b, v, n_rep);
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D,L]
-    let scores = b.matmul(q, kt); // [1,Hq,L,L]
-    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale));
+) -> Result<Traced, BuilderError> {
+    let k = repeat_kv(b, k, n_rep)?;
+    let v = repeat_kv(b, v, n_rep)?;
+    let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [1,Hq,D,L]
+    let scores = b.matmul(q, kt)?; // [1,Hq,L,L]
+    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale))?;
     let scores = match attn_logit_softcap {
-        Some(c) => softcap(b, scores, c),
+        Some(c) => softcap(b, scores, c)?,
         None => scores,
     };
-    let scores = b.binary(BinOp::Add, scores, mask); // causal mask, broadcast over Hq
-    let last = b.aval(scores).rank() - 1;
-    let m = b.reduce(RedOp::Max, scores, last, true);
-    let shifted = b.binary(BinOp::Sub, scores, m);
-    let e = b.unary(UnOp::Exp, shifted);
-    let denom = b.reduce(RedOp::Sum, e, last, true);
-    let p = b.binary(BinOp::Div, e, denom);
+    let scores = b.binary(BinOp::Add, scores, mask)?; // causal mask, broadcast over Hq
+    let last = b.aval(scores)?.rank() - 1;
+    let m = b.reduce(RedOp::Max, scores, last, true)?;
+    let shifted = b.binary(BinOp::Sub, scores, m)?;
+    let e = b.unary(UnOp::Exp, shifted)?;
+    let denom = b.reduce(RedOp::Sum, e, last, true)?;
+    let p = b.binary(BinOp::Div, e, denom)?;
     b.matmul(p, v) // [1,Hq,L,D]
 }
 
 /// Two-pass softmax over the LAST axis of `x` (card 099a reference): `exp(x - max) / sum(exp(x - max))`.
-pub fn softmax(b: &Builder, x: Traced) -> Traced {
-    let last = b.aval(x).rank() - 1;
-    let m = b.reduce(RedOp::Max, x, last, true); // [.., 1]
-    let e = b.unary(UnOp::Exp, b.binary(BinOp::Sub, x, m)); // [.., W]
-    let denom = b.reduce(RedOp::Sum, e, last, true); // [.., 1]
+pub fn softmax(b: &Builder, x: Traced) -> Result<Traced, BuilderError> {
+    let last = b.aval(x)?.rank() - 1;
+    let m = b.reduce(RedOp::Max, x, last, true)?; // [.., 1]
+    let e = b.unary(UnOp::Exp, b.binary(BinOp::Sub, x, m)?)?; // [.., W]
+    let denom = b.reduce(RedOp::Sum, e, last, true)?; // [.., 1]
     b.binary(BinOp::Div, e, denom)
 }
 
@@ -96,9 +104,14 @@ pub fn softmax(b: &Builder, x: Traced) -> Traced {
 /// written at position `j`). A `Cast(I32 -> F32)` plus a signed `Ge` compare against `iota(cap)`, not a
 /// gather: `pos` is cast once to F32 ([`Builder::cast`] lowers `I32 -> F32` on every backend) and
 /// compared against `iota(cap)` ([`Builder::iota`], card 558a) with [`BinOp::Ge`].
-pub fn causal_mask_from_pos(b: &Builder, pos: Traced, cap: usize, window: Option<usize>) -> Traced {
-    let (visible, ..) = mask_visibility(b, pos, cap, window);
-    let bias = b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0)); // 0.0 visible, -1.0 masked
+pub fn causal_mask_from_pos(
+    b: &Builder,
+    pos: Traced,
+    cap: usize,
+    window: Option<usize>,
+) -> Result<Traced, BuilderError> {
+    let (visible, ..) = mask_visibility(b, pos, cap, window)?;
+    let bias = b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0))?; // 0.0 visible, -1.0 masked
     b.binary_scalar(BinOp::Mul, bias, Scalar::F32(1.0e9)) // 0.0 visible, -1.0e9 masked
 }
 
@@ -116,17 +129,17 @@ pub fn alibi_mask_from_pos(
     window: Option<usize>,
     slopes: Traced,
     n_heads: usize,
-) -> Traced {
-    let (visible, pos_col, keys_row) = mask_visibility(b, pos, cap, window);
+) -> Result<Traced, BuilderError> {
+    let (visible, pos_col, keys_row) = mask_visibility(b, pos, cap, window)?;
     let base = b.binary_scalar(
         BinOp::Mul,
-        b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0)),
+        b.binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0))?,
         Scalar::F32(1.0e9),
-    ); // [rows,1,tokens,cap]: 0.0 visible, -1.0e9 masked
-    let distance = b.binary(BinOp::Sub, pos_col, keys_row); // [rows,1,tokens,cap] = pos[r,i] - j
-    let neg_slopes = b.reshape(b.unary(UnOp::Neg, slopes), vec![1, n_heads, 1, 1]);
-    let term = b.binary(BinOp::Mul, neg_slopes, distance); // [rows,n_heads,tokens,cap]
-    let term = b.binary(BinOp::Mul, term, visible); // zeroed wherever masked
+    )?; // [rows,1,tokens,cap]: 0.0 visible, -1.0e9 masked
+    let distance = b.binary(BinOp::Sub, pos_col, keys_row)?; // [rows,1,tokens,cap] = pos[r,i] - j
+    let neg_slopes = b.reshape(b.unary(UnOp::Neg, slopes)?, vec![1, n_heads, 1, 1])?;
+    let term = b.binary(BinOp::Mul, neg_slopes, distance)?; // [rows,n_heads,tokens,cap]
+    let term = b.binary(BinOp::Mul, term, visible)?; // zeroed wherever masked
     b.binary(BinOp::Add, base, term) // base broadcasts over the n_heads axis
 }
 
@@ -139,29 +152,33 @@ fn mask_visibility(
     pos: Traced,
     cap: usize,
     window: Option<usize>,
-) -> (Traced, Traced, Traced) {
-    let pos_shape = b.aval(pos).shape;
-    assert_eq!(
-        pos_shape.len(),
-        2,
-        "causal_mask_from_pos: Slot::Pos must be [rows, tokens], got shape {pos_shape:?}"
-    );
+) -> Result<(Traced, Traced, Traced), BuilderError> {
+    let pos_shape = b.aval(pos)?.shape;
+    if pos_shape.len() != 2 {
+        return Err(BuilderError::Requirement {
+            operation: "causal_mask_from_pos",
+            requirement: Requirement::MinRank {
+                at_least: 2,
+                found: pos_shape,
+            },
+        });
+    }
     let (rows, tokens) = (pos_shape[0], pos_shape[1]);
-    let pos_f = b.cast(pos, DType::F32); // [rows, tokens]
-    let pos_col = b.reshape(pos_f, vec![rows, 1, tokens, 1]); // query abs pos, broadcasts over cap
-    let keys = b.iota(cap); // [cap] f32: 0..cap-1
-    let keys_row = b.reshape(keys, vec![1, 1, 1, cap]); // key abs pos, broadcasts over rows/tokens
-    let visible = b.binary(BinOp::Ge, pos_col, keys_row); // [rows,1,tokens,cap]: j <= pos
+    let pos_f = b.cast(pos, DType::F32)?; // [rows, tokens]
+    let pos_col = b.reshape(pos_f, vec![rows, 1, tokens, 1])?; // query abs pos, broadcasts over cap
+    let keys = b.iota(cap)?; // [cap] f32: 0..cap-1
+    let keys_row = b.reshape(keys, vec![1, 1, 1, cap])?; // key abs pos, broadcasts over rows/tokens
+    let visible = b.binary(BinOp::Ge, pos_col, keys_row)?; // [rows,1,tokens,cap]: j <= pos
     let visible = match window {
         None => visible,
         Some(w) => {
             // also require pos - j < w, i.e. j > pos - w, i.e. j >= pos - (w - 1).
-            let lower_bound = b.binary_scalar(BinOp::Sub, pos_col, Scalar::F32((w - 1) as f32));
-            let in_window = b.binary(BinOp::Ge, keys_row, lower_bound);
-            b.binary(BinOp::Mul, visible, in_window)
+            let lower_bound = b.binary_scalar(BinOp::Sub, pos_col, Scalar::F32((w - 1) as f32))?;
+            let in_window = b.binary(BinOp::Ge, keys_row, lower_bound)?;
+            b.binary(BinOp::Mul, visible, in_window)?
         }
     };
-    (visible, pos_col, keys_row)
+    Ok((visible, pos_col, keys_row))
 }
 
 /// Prefill (whole-prompt) linear attention (card 038), the parallel quadratic form of the decode
@@ -190,12 +207,12 @@ pub fn linear_attention_prefill(
     v: Traced,
     n_rep: usize,
     mask: Traced,
-) -> Traced {
-    let k = repeat_kv(b, k, n_rep);
-    let v = repeat_kv(b, v, n_rep);
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D_k,L]
-    let scores = b.matmul(q, kt); // [1,Hq,L,L] = Q K^T
-    let weighted = b.binary(BinOp::Mul, scores, mask); // multiplicative decay-causal mask, broadcast over Hq
+) -> Result<Traced, BuilderError> {
+    let k = repeat_kv(b, k, n_rep)?;
+    let v = repeat_kv(b, v, n_rep)?;
+    let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [1,Hq,D_k,L]
+    let scores = b.matmul(q, kt)?; // [1,Hq,L,L] = Q K^T
+    let weighted = b.binary(BinOp::Mul, scores, mask)?; // multiplicative decay-causal mask, broadcast over Hq
     b.matmul(weighted, v) // [1,Hq,L,D_v]
 }
 
@@ -226,19 +243,25 @@ pub fn linear_attention_prefill(
 /// `Neg`, `Sub` (the zero trick), and `Concat` (the top-right block is zero, so
 /// `out = concat_rows(concat_cols(A_inv, zeros), concat_cols(neg_DBA, D_inv))`). No new `OpKind`
 /// (FR-002/FR-003).
-pub fn unit_lower_triangular_inverse(b: &Builder, attn: Traced) -> Traced {
-    let shape = b.aval(attn).shape;
+pub fn unit_lower_triangular_inverse(b: &Builder, attn: Traced) -> Result<Traced, BuilderError> {
+    let shape = b.aval(attn)?.shape;
     let rank = shape.len();
-    assert!(
-        rank >= 2,
-        "unit_lower_triangular_inverse: attn must be at least rank 2, got shape {shape:?}"
-    );
+    if rank < 2 {
+        return Err(BuilderError::Requirement {
+            operation: "unit_lower_triangular_inverse",
+            requirement: Requirement::MinRank {
+                at_least: 2,
+                found: shape,
+            },
+        });
+    }
     let c = shape[rank - 1];
-    assert_eq!(
-        shape[rank - 2],
-        c,
-        "unit_lower_triangular_inverse: last two axes must be square (C,C), got shape {shape:?}"
-    );
+    if shape[rank - 2] != c {
+        return Err(BuilderError::Requirement {
+            operation: "unit_lower_triangular_inverse",
+            requirement: Requirement::SquareTrailingAxes { found: shape },
+        });
+    }
     ut_inverse_neumann_doubling(b, attn, c, rank)
 }
 
@@ -264,33 +287,34 @@ pub(crate) fn ut_inverse_neumann_doubling(
     attn: Traced,
     c: usize,
     rank: usize,
-) -> Traced {
+) -> Result<Traced, BuilderError> {
     if c == 1 {
         // a strictly-lower 1x1 block is structurally [0], so M = [1] and T = [1]. zero-of-the-right-batch
         // -shape via attn - attn, then + 1 (the same host-constant-free trick as identity_like's seed).
-        let zero = b.binary(BinOp::Sub, attn, attn);
+        let zero = b.binary(BinOp::Sub, attn, attn)?;
         return b.binary_scalar(BinOp::Add, zero, Scalar::F32(1.0));
     }
-    assert_eq!(
-        c & (c - 1),
-        0,
-        "unit_lower_triangular_inverse: Neumann doubling needs C a power of two (got block size {c})"
-    );
-    let ident = identity_like(b, attn, c, rank); // I of the same [.., C, C] shape/dtype as attn
-    let p1 = b.unary(UnOp::Neg, attn); // P_1 = (-N)^1 = -attn
+    if c & (c - 1) != 0 {
+        return Err(BuilderError::Requirement {
+            operation: "unit_lower_triangular_inverse",
+            requirement: Requirement::PowerOfTwo { size: c },
+        });
+    }
+    let ident = identity_like(b, attn, c, rank)?; // I of the same [.., C, C] shape/dtype as attn
+    let p1 = b.unary(UnOp::Neg, attn)?; // P_1 = (-N)^1 = -attn
     // level 1 folded: S_2 = I + P_1 @ I = I + P_1; P_2 = P_1 @ P_1.
-    let mut s = b.binary(BinOp::Add, ident, p1); // S_2
-    let mut p = b.matmul(p1, p1); // P_2
+    let mut s = b.binary(BinOp::Add, ident, p1)?; // S_2
+    let mut p = b.matmul(p1, p1)?; // P_2
     let mut k = 2usize;
     while k < c {
-        let ps = b.matmul(p, s); // P_k @ S_k
-        s = b.binary(BinOp::Add, s, ps); // S_{2k} = S_k + P_k @ S_k
+        let ps = b.matmul(p, s)?; // P_k @ S_k
+        s = b.binary(BinOp::Add, s, ps)?; // S_{2k} = S_k + P_k @ S_k
         k *= 2;
         if k < c {
-            p = b.matmul(p, p); // P_{2k} = P_k @ P_k (unused at the last level, so skipped there)
+            p = b.matmul(p, p)?; // P_{2k} = P_k @ P_k (unused at the last level, so skipped there)
         }
     }
-    s // S_C = T
+    Ok(s) // S_C = T
 }
 
 /// Build a `[.., c, c]` identity matrix with the same batch dims and dtype as `like` (a `[.., C, C]`
@@ -300,21 +324,26 @@ pub(crate) fn ut_inverse_neumann_doubling(
 /// corners of a `[.., 2s, 2s]` block with zero off-diagonal blocks (`zeros = ident - ident`),
 /// assembled by two column-concats and one row-concat. `c` must be a power of two. ~`4*log2(c) + 4`
 /// eqns (28 at `c=64`).
-pub(crate) fn identity_like(b: &Builder, like: Traced, c: usize, rank: usize) -> Traced {
+pub(crate) fn identity_like(
+    b: &Builder,
+    like: Traced,
+    c: usize,
+    rank: usize,
+) -> Result<Traced, BuilderError> {
     let (ax0, ax1) = (rank - 2, rank - 1);
     // [.., 1, 1] one-block seed: reuse `like`'s batch shape/dtype, no external data.
-    let cell = b.slice(b.slice(like, ax0, 0, 1), ax1, 0, 1); // [.., 1, 1]
-    let zero1 = b.binary(BinOp::Sub, cell, cell); // exact 0
-    let mut ident = b.binary_scalar(BinOp::Add, zero1, Scalar::F32(1.0)); // I_1 = [1]
+    let cell = b.slice(b.slice(like, ax0, 0, 1)?, ax1, 0, 1)?; // [.., 1, 1]
+    let zero1 = b.binary(BinOp::Sub, cell, cell)?; // exact 0
+    let mut ident = b.binary_scalar(BinOp::Add, zero1, Scalar::F32(1.0))?; // I_1 = [1]
     let mut s = 1usize;
     while s < c {
-        let zeros = b.binary(BinOp::Sub, ident, ident); // [.., s, s] zero block
-        let top = b.concat(ax1, &[ident, zeros]); // [.., s, 2s]
-        let bottom = b.concat(ax1, &[zeros, ident]); // [.., s, 2s]
-        ident = b.concat(ax0, &[top, bottom]); // [.., 2s, 2s]
+        let zeros = b.binary(BinOp::Sub, ident, ident)?; // [.., s, s] zero block
+        let top = b.concat(ax1, &[ident, zeros])?; // [.., s, 2s]
+        let bottom = b.concat(ax1, &[zeros, ident])?; // [.., s, 2s]
+        ident = b.concat(ax0, &[top, bottom])?; // [.., 2s, 2s]
         s *= 2;
     }
-    ident
+    Ok(ident)
 }
 
 /// Zero-pad `x` along `axis` by `pad` positions (FR-005 / spec 139 review C9). There is no `Pad`
@@ -322,15 +351,20 @@ pub(crate) fn identity_like(b: &Builder, like: Traced, c: usize, rank: usize) ->
 /// [`unit_lower_triangular_inverse`]'s base case): slice one position of `x`, subtract it from
 /// itself, and [`Builder::broadcast`] the size-1 axis up to `pad`. Concat appends it after `x`. A
 /// no-op when `pad == 0`.
-pub(crate) fn zero_pad_seq(b: &Builder, x: Traced, axis: usize, pad: usize) -> Traced {
+pub(crate) fn zero_pad_seq(
+    b: &Builder,
+    x: Traced,
+    axis: usize,
+    pad: usize,
+) -> Result<Traced, BuilderError> {
     if pad == 0 {
-        return x;
+        return Ok(x);
     }
-    let one = b.slice(x, axis, 0, 1); // [..,1,..] - reuses x's own shape/dtype, no external data needed
-    let zero = b.binary(BinOp::Sub, one, one); // exact zero, same shape as `one`
-    let mut target = b.aval(one).shape;
+    let one = b.slice(x, axis, 0, 1)?; // [..,1,..] - reuses x's own shape/dtype, no external data needed
+    let zero = b.binary(BinOp::Sub, one, one)?; // exact zero, same shape as `one`
+    let mut target = b.aval(one)?.shape;
     target[axis] = pad;
-    let zero_pad = b.broadcast(zero, target); // [..,pad,..]
+    let zero_pad = b.broadcast(zero, target)?; // [..,pad,..]
     b.concat(axis, &[x, zero_pad])
 }
 
@@ -352,23 +386,27 @@ pub(crate) fn zero_pad_seq(b: &Builder, x: Traced, axis: usize, pad: usize) -> T
 /// giving exactly `0`) recover the correct local difference, which `gdn_prefill_chunked` relies on
 /// for its masked-diagonal and state-carry terms. This function only tightens the precision of `G_i`;
 /// `gdn_prefill_chunked` keeps its subtract-then-mask-then-exp-once structure.
-pub fn cumulative_log_decay_scan(b: &Builder, g: Traced, chunk: usize) -> Traced {
+pub fn cumulative_log_decay_scan(
+    b: &Builder,
+    g: Traced,
+    chunk: usize,
+) -> Result<Traced, BuilderError> {
     let axis = 2; // the C (position) axis, matching gdn_prefill_chunked's [1,H_v,C,1] convention
     let mut x = g;
     let mut d = 1usize;
     while d < chunk {
         // shifted[i] = x[i-d] for i>=d, else 0.0 (the sum identity - a no-op addend).
-        let keep = b.slice(x, axis, 0, chunk - d); // [..,C-d,..]
-        let one_slice = b.slice(x, axis, 0, 1); // reuses x's shape/dtype, no external data needed
-        let zero = b.binary(BinOp::Sub, one_slice, one_slice); // exact 0, same shape as `one_slice`
-        let mut pad_shape = b.aval(zero).shape;
+        let keep = b.slice(x, axis, 0, chunk - d)?; // [..,C-d,..]
+        let one_slice = b.slice(x, axis, 0, 1)?; // reuses x's shape/dtype, no external data needed
+        let zero = b.binary(BinOp::Sub, one_slice, one_slice)?; // exact 0, same shape as `one_slice`
+        let mut pad_shape = b.aval(zero)?.shape;
         pad_shape[axis] = d;
-        let pad = b.broadcast(zero, pad_shape); // [..,d,..] of exact 0.0
-        let shifted = b.concat(axis, &[pad, keep]); // [..,C,..]
-        x = b.binary(BinOp::Add, x, shifted);
+        let pad = b.broadcast(zero, pad_shape)?; // [..,d,..] of exact 0.0
+        let shifted = b.concat(axis, &[pad, keep])?; // [..,C,..]
+        x = b.binary(BinOp::Add, x, shifted)?;
         d *= 2;
     }
-    x
+    Ok(x)
 }
 
 /// Chunked prefill for Qwen3-Next's Gated-DeltaNet (GDN) delta-rule recurrence (spec 139 / card 153
@@ -429,49 +467,53 @@ pub fn gdn_prefill_chunked(
     tril_incl: Traced,   // [1,1,C,C] lower-triangular ones INCLUDING the diagonal
     tril_strict: Traced, // [1,1,C,C] STRICTLY lower-triangular ones (zero diagonal)
     chunk: usize,
-) -> (Traced, Traced) {
-    let qshape = b.aval(q).shape;
+) -> Result<(Traced, Traced), BuilderError> {
+    let qshape = b.aval(q)?.shape;
     let (h_k, l, d) = (qshape[1], qshape[2], qshape[3]);
-    let h_v = b.aval(v).shape[1];
-    assert_eq!(
-        h_v % h_k,
-        0,
-        "gdn_prefill_chunked: H_v ({h_v}) must be a multiple of H_k ({h_k})"
-    );
+    let h_v = b.aval(v)?.shape[1];
+    if h_k == 0 || h_v % h_k != 0 {
+        return Err(BuilderError::Requirement {
+            operation: "gdn_prefill_chunked",
+            requirement: Requirement::Multiple {
+                value: h_v,
+                of: h_k,
+            },
+        });
+    }
     let n_rep = h_v / h_k;
 
     // FR-004: tiled GQA repeat q/k from H_k to H_v (NOT the blocked repeat_kv, card 140).
-    let q = repeat_kv_tiled(b, q, n_rep); // [1,H_v,L,D]
-    let k = repeat_kv_tiled(b, k, n_rep); // [1,H_v,L,D]
+    let q = repeat_kv_tiled(b, q, n_rep)?; // [1,H_v,L,D]
+    let k = repeat_kv_tiled(b, k, n_rep)?; // [1,H_v,L,D]
 
     // S4: the query scale lives INSIDE this fn (the oracle applies it internally too).
-    let q = b.binary_scalar(BinOp::Mul, q, Scalar::F32(1.0 / (d as f32).sqrt()));
+    let q = b.binary_scalar(BinOp::Mul, q, Scalar::F32(1.0 / (d as f32).sqrt()))?;
 
     // FR-005: zero-pad every per-position input to a whole number of chunks.
     let n_chunks = l.div_ceil(chunk);
     let lp = n_chunks * chunk;
     let pad = lp - l;
-    let q = zero_pad_seq(b, q, 2, pad);
-    let k = zero_pad_seq(b, k, 2, pad);
-    let v = zero_pad_seq(b, v, 2, pad);
-    let g = zero_pad_seq(b, g, 2, pad);
-    let beta = zero_pad_seq(b, beta, 2, pad);
+    let q = zero_pad_seq(b, q, 2, pad)?;
+    let k = zero_pad_seq(b, k, 2, pad)?;
+    let v = zero_pad_seq(b, v, 2, pad)?;
+    let g = zero_pad_seq(b, g, 2, pad)?;
+    let beta = zero_pad_seq(b, beta, 2, pad)?;
 
     let mut s_state = s_in; // carried per-chunk state [1,H_v,D,D]
     let mut outs: Vec<Traced> = Vec::with_capacity(n_chunks);
     for r in 0..n_chunks {
         let (lo, hi) = (r * chunk, (r + 1) * chunk);
-        let qr = b.slice(q, 2, lo, hi); // [1,H_v,C,D]
-        let kr = b.slice(k, 2, lo, hi); // [1,H_v,C,D]
-        let vr = b.slice(v, 2, lo, hi); // [1,H_v,C,D]
-        let gr = b.slice(g, 2, lo, hi); // [1,H_v,C,1] already log-domain
-        let br = b.slice(beta, 2, lo, hi); // [1,H_v,C,1]
+        let qr = b.slice(q, 2, lo, hi)?; // [1,H_v,C,D]
+        let kr = b.slice(k, 2, lo, hi)?; // [1,H_v,C,D]
+        let vr = b.slice(v, 2, lo, hi)?; // [1,H_v,C,D]
+        let gr = b.slice(g, 2, lo, hi)?; // [1,H_v,C,1] already log-domain
+        let br = b.slice(beta, 2, lo, hi)?; // [1,H_v,C,1]
 
         // S3 (card 158 fix): within-chunk cumulative log-decay G_i = cumsum(g)[i] via the Hillis-Steele
         // additive scan (see `cumulative_log_decay_scan` for why it stays in log space).
-        let cumlog = cumulative_log_decay_scan(b, gr, chunk); // [1,H_v,C,1] = G_i
-        let cum_row = b.reshape(cumlog, vec![1, h_v, 1, chunk]); // [1,H_v,1,C] = G_j (same values, moved axis)
-        let diff = b.binary(BinOp::Sub, cumlog, cum_row); // diff[i,j] = G_i - G_j (exactly 0 on the diagonal)
+        let cumlog = cumulative_log_decay_scan(b, gr, chunk)?; // [1,H_v,C,1] = G_i
+        let cum_row = b.reshape(cumlog, vec![1, h_v, 1, chunk])?; // [1,H_v,1,C] = G_j (same values, moved axis)
+        let diff = b.binary(BinOp::Sub, cumlog, cum_row)?; // diff[i,j] = G_i - G_j (exactly 0 on the diagonal)
         // Mask the exponent additively before exp, not the result after. In the upper triangle (i<j)
         // diff = G_i - G_j is positive and grows with the chunk's cumulative magnitude; past ~88,
         // exp(diff) overflows to +Inf and a post-exp mask multiply gives Inf * 0.0 = NaN, poisoning the
@@ -481,53 +523,53 @@ pub fn gdn_prefill_chunked(
         // `(tril_incl - 1) * 1e30` is 0 on/below and -1e30 above.
         let upper_bias = b.binary_scalar(
             BinOp::Mul,
-            b.binary_scalar(BinOp::Add, tril_incl, Scalar::F32(-1.0)),
+            b.binary_scalar(BinOp::Add, tril_incl, Scalar::F32(-1.0))?,
             Scalar::F32(1.0e30),
-        );
-        let diff_masked = b.binary(BinOp::Add, diff, upper_bias);
-        let ratio = b.unary(UnOp::Exp, diff_masked); // exp(G_i - G_j) on/below diag, 0 strictly above
-        let decay_incl = b.binary(BinOp::Mul, ratio, tril_incl); // S2: lower-incl-diag (the OUTPUT mask)
-        let decay_strict = b.binary(BinOp::Mul, decay_incl, tril_strict); // S2: strictly-lower (the SOLVE mask)
-        let a_cum = b.unary(UnOp::Exp, cumlog); // [1,H_v,C,1] = A_i = exp(G_i)
+        )?;
+        let diff_masked = b.binary(BinOp::Add, diff, upper_bias)?;
+        let ratio = b.unary(UnOp::Exp, diff_masked)?; // exp(G_i - G_j) on/below diag, 0 strictly above
+        let decay_incl = b.binary(BinOp::Mul, ratio, tril_incl)?; // S2: lower-incl-diag (the OUTPUT mask)
+        let decay_strict = b.binary(BinOp::Mul, decay_incl, tril_strict)?; // S2: strictly-lower (the SOLVE mask)
+        let a_cum = b.unary(UnOp::Exp, cumlog)?; // [1,H_v,C,1] = A_i = exp(G_i)
 
         // B1 product 1/3: attn = tril_strict (.) (beta_row (.) (decay (.) (K @ K^T))).
-        let krt = b.transpose(kr, vec![0, 1, 3, 2]); // [1,H_v,D,C]
-        let kk = b.matmul(kr, krt); // [1,H_v,C,C] = K @ K^T
-        let kk_decayed = b.binary(BinOp::Mul, kk, decay_strict); // decays folded, already strictly masked
-        let attn = b.binary(BinOp::Mul, kk_decayed, br); // beta on the ROW index (broadcast over columns)
-        let t = unit_lower_triangular_inverse(b, attn); // [1,H_v,C,C] the UT-transform
+        let krt = b.transpose(kr, vec![0, 1, 3, 2])?; // [1,H_v,D,C]
+        let kk = b.matmul(kr, krt)?; // [1,H_v,C,C] = K @ K^T
+        let kk_decayed = b.binary(BinOp::Mul, kk, decay_strict)?; // decays folded, already strictly masked
+        let attn = b.binary(BinOp::Mul, kk_decayed, br)?; // beta on the ROW index (broadcast over columns)
+        let t = unit_lower_triangular_inverse(b, attn)?; // [1,H_v,C,C] the UT-transform
 
         // B1 product 2/3: v_pseudo = T @ (beta (.) V); k_cumdecay = T @ (beta (.) A (.) K) (T folded once,
         // valid by matmul associativity: T@(k_cumdecay_raw@S) == (T@k_cumdecay_raw)@S).
-        let bv = b.binary(BinOp::Mul, vr, br); // [1,H_v,C,D]
-        let v_pseudo = b.matmul(t, bv); // [1,H_v,C,D]
-        let kg_raw = b.binary(BinOp::Mul, b.binary(BinOp::Mul, kr, br), a_cum); // beta*A*K, [1,H_v,C,D]
-        let k_cumdecay = b.matmul(t, kg_raw); // [1,H_v,C,D]
-        let kcd_s = b.matmul(k_cumdecay, s_state); // [1,H_v,C,D]
-        let v_new = b.binary(BinOp::Sub, v_pseudo, kcd_s); // B1 product 3 input: the inter-chunk correction
+        let bv = b.binary(BinOp::Mul, vr, br)?; // [1,H_v,C,D]
+        let v_pseudo = b.matmul(t, bv)?; // [1,H_v,C,D]
+        let kg_raw = b.binary(BinOp::Mul, b.binary(BinOp::Mul, kr, br)?, a_cum)?; // beta*A*K, [1,H_v,C,D]
+        let k_cumdecay = b.matmul(t, kg_raw)?; // [1,H_v,C,D]
+        let kcd_s = b.matmul(k_cumdecay, s_state)?; // [1,H_v,C,D]
+        let v_new = b.binary(BinOp::Sub, v_pseudo, kcd_s)?; // B1 product 3 input: the inter-chunk correction
 
         // B1 product 3/3 (the output term): intra-chunk (post-update, diag-inclusive) + inter-chunk (S2).
-        let q_scores = b.matmul(qr, krt); // [1,H_v,C,C] = Q @ K^T
-        let masked_scores = b.binary(BinOp::Mul, q_scores, decay_incl); // S2: diag-INCLUSIVE
-        let intra_out = b.matmul(masked_scores, v_new); // [1,H_v,C,D]
-        let q_scaled_a = b.binary(BinOp::Mul, qr, a_cum); // Q (.) A, [1,H_v,C,D]
-        let inter_out = b.matmul(q_scaled_a, s_state); // [1,H_v,C,D]
-        let o_chunk = b.binary(BinOp::Add, intra_out, inter_out);
+        let q_scores = b.matmul(qr, krt)?; // [1,H_v,C,C] = Q @ K^T
+        let masked_scores = b.binary(BinOp::Mul, q_scores, decay_incl)?; // S2: diag-INCLUSIVE
+        let intra_out = b.matmul(masked_scores, v_new)?; // [1,H_v,C,D]
+        let q_scaled_a = b.binary(BinOp::Mul, qr, a_cum)?; // Q (.) A, [1,H_v,C,D]
+        let inter_out = b.matmul(q_scaled_a, s_state)?; // [1,H_v,C,D]
+        let o_chunk = b.binary(BinOp::Add, intra_out, inter_out)?;
         outs.push(o_chunk);
 
         // Gated state carry: S_out = S_in*exp(g_last) + k_gdiff^T @ v_new, k_gdiff = K (.) exp(g_last - G).
-        let g_last = b.slice(cumlog, 2, chunk - 1, chunk); // [1,H_v,1,1] = G_{C-1}, the chunk's total log-decay
-        let g_last_exp = b.unary(UnOp::Exp, g_last); // [1,H_v,1,1], broadcasts over s_state's [1,H_v,D,D]
-        let g_diff = b.binary(BinOp::Sub, g_last, cumlog); // [1,H_v,C,1] = g_last - G_i, broadcast g_last over C
-        let k_gdiff = b.binary(BinOp::Mul, kr, b.unary(UnOp::Exp, g_diff)); // [1,H_v,C,D]
-        let k_gdiff_t = b.transpose(k_gdiff, vec![0, 1, 3, 2]); // [1,H_v,D,C]
-        let kgv = b.matmul(k_gdiff_t, v_new); // [1,H_v,D,D]
-        s_state = b.binary(BinOp::Add, b.binary(BinOp::Mul, s_state, g_last_exp), kgv);
+        let g_last = b.slice(cumlog, 2, chunk - 1, chunk)?; // [1,H_v,1,1] = G_{C-1}, the chunk's total log-decay
+        let g_last_exp = b.unary(UnOp::Exp, g_last)?; // [1,H_v,1,1], broadcasts over s_state's [1,H_v,D,D]
+        let g_diff = b.binary(BinOp::Sub, g_last, cumlog)?; // [1,H_v,C,1] = g_last - G_i, broadcast g_last over C
+        let k_gdiff = b.binary(BinOp::Mul, kr, b.unary(UnOp::Exp, g_diff)?)?; // [1,H_v,C,D]
+        let k_gdiff_t = b.transpose(k_gdiff, vec![0, 1, 3, 2])?; // [1,H_v,D,C]
+        let kgv = b.matmul(k_gdiff_t, v_new)?; // [1,H_v,D,D]
+        s_state = b.binary(BinOp::Add, b.binary(BinOp::Mul, s_state, g_last_exp)?, kgv)?;
     }
 
-    let o_full = b.concat(2, &outs); // [1,H_v,Lp,D]
-    let o = b.slice(o_full, 2, 0, l); // FR-005: truncate the padded tail back to L
-    (o, s_state)
+    let o_full = b.concat(2, &outs)?; // [1,H_v,Lp,D]
+    let o = b.slice(o_full, 2, 0, l)?; // FR-005: truncate the padded tail back to L
+    Ok((o, s_state))
 }
 
 /// The packed definition of `OpKind::Scan` over [`ScanFamily::DeltaRule`](crate::ScanFamily): the result is
@@ -544,7 +586,7 @@ pub fn scan_delta_rule_packed(
     beta: Traced,
     s_in: Traced,
     chunk: usize,
-) -> Traced {
+) -> Result<Traced, BuilderError> {
     let (o, s_out) = gdn_prefill_chunked(
         b,
         q,
@@ -553,18 +595,18 @@ pub fn scan_delta_rule_packed(
         g,
         beta,
         s_in,
-        lower_triangle(b, chunk, 0.0),
-        lower_triangle(b, chunk, 1.0),
+        lower_triangle(b, chunk, 0.0)?,
+        lower_triangle(b, chunk, 1.0)?,
         chunk,
-    );
+    )?;
     b.concat(2, &[o, s_out])
 }
 
 /// The lower triangle (`row >= col + shift`, as F32 ones) as `[1, 1, c, c]`, computed from `Iota`.
-pub fn lower_triangle(b: &Builder, c: usize, shift: f32) -> Traced {
-    let ramp = b.iota(c);
-    let row = b.broadcast(b.reshape(ramp, vec![c, 1]), vec![c, c]);
-    let col = b.broadcast(b.reshape(ramp, vec![1, c]), vec![c, c]);
-    let col = b.binary_scalar(BinOp::Add, col, Scalar::F32(shift));
-    b.reshape(b.binary(BinOp::Ge, row, col), vec![1, 1, c, c])
+pub fn lower_triangle(b: &Builder, c: usize, shift: f32) -> Result<Traced, BuilderError> {
+    let ramp = b.iota(c)?;
+    let row = b.broadcast(b.reshape(ramp, vec![c, 1])?, vec![c, c])?;
+    let col = b.broadcast(b.reshape(ramp, vec![1, c])?, vec![c, c])?;
+    let col = b.binary_scalar(BinOp::Add, col, Scalar::F32(shift))?;
+    b.reshape(b.binary(BinOp::Ge, row, col)?, vec![1, 1, c, c])
 }

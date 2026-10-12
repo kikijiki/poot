@@ -35,7 +35,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::rope_table::RopeFlavor;
 use poot_quant::weights::{AttnRole, FfnRole, NormRole, WeightMap, WeightRole, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{Field, Fields};
 use crate::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
@@ -53,6 +52,7 @@ use crate::model::{
 use crate::names::gguf::GGUF_BLOOM;
 use crate::names::{FusedDims, NameRow, Presence, Source, family_weights_fused};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 // The `bloom` family behind [`Model`]: LayerNorm blocks with biases, an embedding LayerNorm,
 // ALiBi attention over a fused QKV projection and a plain tanh-GELU MLP with biases, in the
@@ -60,7 +60,7 @@ use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 // (`AttnRole::Qkv`) the attention component splits in the graph; llama.cpp's converter
 // re-packs it block-concatenated, so a GGUF's is read as three row ranges.
 
-pub const FAMILY: FamilyKey = FamilyKey::new("bloom");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("bloom");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -217,7 +217,7 @@ const FFN: Field = Field::new("", "bloom.feed_forward_length");
 
 /// bloom's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct BloomParams {
+pub(crate) struct BloomParams {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -231,7 +231,7 @@ pub struct BloomParams {
 }
 
 impl BloomParams {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let vocab = fields.vocab()?;
         let width = fields.count(hf_alias(&fields, WIDTH_HF, "bloom.embedding_length"), None)?;
@@ -296,7 +296,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Bloom {
+pub(crate) struct Bloom {
     params: BloomParams,
     weights: WeightMap,
     stack: StackWeights,
@@ -362,11 +362,10 @@ impl Model for Bloom {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -377,7 +376,7 @@ impl Model for Bloom {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
                 |b, BlockInput { block: h, .. }| plain_mlp(b, h, &layer.ffn, Gelu::Tanh),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -400,7 +399,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The shape of every tensor a BLOOM checkpoint with `config`'s dims carries, by HF name.
 pub(crate) fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, h) = (n("vocab_size"), n("hidden_size"));
     let inter = 4 * h;
     let mut shapes = vec![

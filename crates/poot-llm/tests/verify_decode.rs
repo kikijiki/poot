@@ -7,11 +7,11 @@
 mod common;
 
 use common::{slot_maps, step, token_pos, zero_state};
-use poot_executor_parity::dense::{Dense, Family, paged_step, step as step_shape};
-use poot_executor_parity::weight_map::MappedModel;
 use poot_graph_ir::Graph;
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, paged_step, step as step_shape};
+use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::HostTensor;
 
 const VOCAB: usize = 32;
@@ -38,14 +38,22 @@ fn tiny() -> MappedModel {
 /// The one-token decode graph over `cap` positions.
 fn decode_graph(m: &MappedModel, cap: usize) -> Graph {
     m.model
-        .trace(Phase::Decode, step_shape(1, 1, cap, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step_shape(1, 1, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
 /// The verify graph: an `l`-token query with logits at every row, over `cap` positions.
 fn verify_graph(m: &MappedModel, l: usize, cap: usize) -> Graph {
     m.model
-        .trace(Phase::Prefill, step_shape(1, l, cap, LogitRows::All))
+        .trace(
+            Phase::Prefill,
+            step_shape(1, l, cap, LogitRows::All),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -83,7 +91,11 @@ fn paged_decode_matches_contiguous_decode_cpu() {
     let cont = decode_graph(&m, cap);
     let paged = m
         .model
-        .trace(Phase::Decode, paged_step(1, 1, cap, cap, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            paged_step(1, 1, cap, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let read: Vec<i32> = (0..cap as i32).map(|t| cap as i32 - 1 - t).collect();
 
@@ -333,14 +345,14 @@ fn verify_forward_is_causally_invariant_to_later_draft_tokens() {
 /// K/V is the full `[.,.,cap,.]` carried cache (`cap > L` once a prefix exists) with a `[L,cap]` mask,
 /// so the fused `Attention` op must index its keys by their own length, not by the query's `L`: a kernel
 /// that attended only the first `L` cache slots corrupted every row (including row 0) once any prefix
-/// existed. This test pins that `optimize(verify graph)` computes the raw graph's logits.
+/// existed. This test pins that `passes_without_target(verify graph)` computes the raw graph's logits.
 #[test]
 fn optimize_preserves_verify_forward_semantics() {
     let m = tiny();
     let (p, l, cap) = (3usize, 4usize, 12usize);
     let dg = decode_graph(&m, cap);
     let vg = verify_graph(&m, l, cap);
-    let vg_opt = optimize(&vg).unwrap();
+    let vg_opt = passes_without_target(&vg).unwrap();
 
     // A non-empty prefix cache (cap=12 > l=4) exposes the bug; an empty-cache verify at pos=0 can
     // have cap==l and would not.
@@ -350,14 +362,16 @@ fn optimize_preserves_verify_forward_semantics() {
     let query: Vec<i32> = vec![9, 13, 4, 21];
     let positions: Vec<i32> = (0..l).map(|i| (p + i) as i32).collect();
     let slots = token_pos(1, l, &query, &positions);
-    let (logits_raw, _) =
-        poot_test_util::weight_map_oracle::eval_mapped(&vg, &m.store, &m.map, &slots, &caches);
-    let (logits_opt, _) =
-        poot_test_util::weight_map_oracle::eval_mapped(&vg_opt, &m.store, &m.map, &slots, &caches);
+    let (logits_raw, _) = poot_eval::test_support::weight_map_oracle::eval_mapped(
+        &vg, &m.store, &m.map, &slots, &caches,
+    );
+    let (logits_opt, _) = poot_eval::test_support::weight_map_oracle::eval_mapped(
+        &vg_opt, &m.store, &m.map, &slots, &caches,
+    );
 
     assert_eq!(logits_raw.shape(), vec![1, l, VOCAB]);
     assert_eq!(logits_opt.shape(), vec![1, l, VOCAB]);
-    // A panic here means optimize() changes verify semantics.
+    // A panic here means passes_without_target() changes verify semantics.
     poot_test_util::assert_close(
         logits_raw.as_f32().unwrap(),
         logits_opt.as_f32().unwrap(),

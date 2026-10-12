@@ -1,23 +1,11 @@
 use poot_tensor::DType;
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use poot_graph_ir::{Builder, Graph, OpKind, ShapeError, Slot, TensorType, ValueId};
-use poot_load::packed_safetensors::{
-    AuthenticatedSafetensorsHandleSet, ExactSourceOwner, ExactSourceOwnerCache, InventoryDecision,
-    PackedArtifactManifest, PackedOwnerCache, PackedSafetensorsLimits, PackedShardManifest,
-    TensorDisposition, sha256_digest,
-};
 
-use super::helpers;
-use crate::exact_dense::{DenseOwnerTensorView, ExactDenseError};
 use crate::{EvalBudget, EvalError, EvalOptions, ExactBf16Error, ExactValue, Value, eval};
+use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
-
-static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 /// Card 534a: `fold_dense_contractions`/`fold_dense_bf16_row_gathers` moved
 /// into `poot-graph-plan`, `pub(crate)` there, reachable only through `prepare_target_graph`. This
@@ -31,7 +19,7 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 fn as_dense_contraction(g: Graph, x: ValueId, weight: ValueId) -> Graph {
     let dtype = g.aval(weight).dtype;
     let out = g.result();
-    poot_test_util::graph_fixtures::derive(&g, |draft| {
+    poot_graph_ir::test_support::graph_fixtures::derive(&g, |draft| {
         *draft.eqns_mut() = vec![poot_graph_ir::Eqn {
             op: OpKind::DenseContraction { weight: dtype },
             inputs: vec![
@@ -51,7 +39,7 @@ fn as_dense_contraction(g: Graph, x: ValueId, weight: ValueId) -> Graph {
 fn as_dense_row_gather(g: Graph, table: ValueId, index: ValueId) -> Graph {
     let dtype = g.aval(table).dtype;
     let out = g.result();
-    poot_test_util::graph_fixtures::derive(&g, |draft| {
+    poot_graph_ir::test_support::graph_fixtures::derive(&g, |draft| {
         *draft.eqns_mut() = vec![poot_graph_ir::Eqn {
             op: OpKind::DenseRowGather { source: dtype },
             inputs: vec![
@@ -78,115 +66,11 @@ const WORDS: [(u16, f32); 8] = [
     (0xbe80, -0.25),
 ];
 
-struct Fixture {
-    path: PathBuf,
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Load authenticated owners for `(name, dtype, shape, bytes)` rows.
-fn owners(rows: &[(&str, &str, &[usize], Vec<u8>)]) -> HashMap<String, Arc<ExactSourceOwner>> {
-    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-    let fixture = Fixture {
-        path: std::env::temp_dir()
-            .join(format!("poot-exact-bf16-{}-{sequence}", std::process::id())),
-    };
-    fs::create_dir(&fixture.path).unwrap();
-    let config = b"{}";
-    fs::write(fixture.path.join("config.json"), config).unwrap();
-    let mut header = String::from("{");
-    let mut data = Vec::new();
-    for (ordinal, (name, dtype, shape, bytes)) in rows.iter().enumerate() {
-        let start = data.len();
-        data.extend_from_slice(bytes);
-        if ordinal > 0 {
-            header.push(',');
-        }
-        header.push_str(&format!(
-            r#""{name}":{{"dtype":"{dtype}","shape":{shape:?},"data_offsets":[{start},{}]}}"#,
-            data.len()
-        ));
-    }
-    header.push('}');
-    let header = header.into_bytes();
-    let mut shard = (header.len() as u64).to_le_bytes().to_vec();
-    shard.extend_from_slice(&header);
-    shard.extend_from_slice(&data);
-    fs::write(fixture.path.join("model.safetensors"), &shard).unwrap();
-    let index = format!(
-        r#"{{"weight_map":{{{}}}}}"#,
-        rows.iter()
-            .map(|(name, ..)| format!(r#""{name}":"model.safetensors""#))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-    .into_bytes();
-    fs::write(fixture.path.join("model.safetensors.index.json"), &index).unwrap();
-    let manifest = PackedArtifactManifest {
-        repository: "local/exact-bf16-fixture".to_string(),
-        revision: "card376".to_string(),
-        config_length: config.len(),
-        config_sha256: sha256_digest(config),
-        index_sha256: sha256_digest(&index),
-        shards: vec![PackedShardManifest {
-            filename: "model.safetensors".to_string(),
-            file_length: shard.len(),
-            file_sha256: sha256_digest(&shard),
-            header_length: header.len(),
-            header_sha256: sha256_digest(&header),
-        }],
-    };
-    let limits = PackedSafetensorsLimits {
-        config_bytes: 1024,
-        index_bytes: 4096,
-        header_bytes_per_shard: 4096,
-        shard_count: 1,
-        tensor_entries: rows.len(),
-        selected_source_bytes: 4096,
-        packed_source_bytes: 1,
-    };
-    let mut authenticated =
-        AuthenticatedSafetensorsHandleSet::authenticate(&fixture.path, manifest, limits).unwrap();
-    let result = authenticated
-        .load_mixed(
-            &mut PackedOwnerCache::new(),
-            &mut ExactSourceOwnerCache::new(),
-            |inventory| {
-                inventory
-                    .rows()
-                    .map(|row| {
-                        let disposition = match row.dtype() {
-                            "BF16" => TensorDisposition::DenseBf16,
-                            "F32" => TensorDisposition::DenseF32,
-                            _ => return Err("unexpected fixture dtype"),
-                        };
-                        Ok(InventoryDecision::new(row.key(), disposition))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            },
-        )
-        .unwrap();
-    result
-        .exact_metadata
-        .into_iter()
-        .map(|(name, meta)| (name, meta.owner))
-        .collect()
-}
-
-fn bf16_bytes(words: impl IntoIterator<Item = u16>) -> Vec<u8> {
-    words.into_iter().flat_map(u16::to_le_bytes).collect()
-}
-
-/// One BF16 constant named `table` holding `WORDS[i]` at element `i`.
-fn table(shape: &[usize]) -> DenseOwnerTensorView {
+/// One BF16 host tensor holding `WORDS[i]` at element `i`.
+fn table(shape: &[usize]) -> HostTensor {
     let numel = shape.iter().product::<usize>();
-    let bytes = bf16_bytes(WORDS[..numel].iter().map(|&(word, _)| word));
-    let owners = owners(&[("table", "BF16", shape, bytes)]);
-    DenseOwnerTensorView::new(Arc::clone(&owners["table"])).unwrap()
+    let words = WORDS[..numel].iter().map(|&(word, _)| word).collect();
+    HostTensor::bf16(shape.to_vec(), words)
 }
 
 fn dense_bits(value: &Value) -> Vec<u32> {
@@ -202,13 +86,14 @@ fn dense_bits(value: &Value) -> Vec<u32> {
 }
 
 #[test]
-fn bf16_cast_decodes_owner_words_bit_exactly() {
-    let words = [0x3f80, 0xc000, 0x0000, 0x8000, 0x7fc1, 0xff80];
-    let owners = owners(&[("source", "BF16", &[2, 3], bf16_bytes(words))]);
-    let view = DenseOwnerTensorView::new(Arc::clone(&owners["source"])).unwrap();
-    let builder = Builder::new();
-    let source = builder.constant("source", TensorType::new([2, 3], DType::BF16));
-    let widened = builder.cast(source, DType::F32);
+fn bf16_cast_decodes_words_bit_exactly() {
+    let words = vec![0x3f80, 0xc000, 0x0000, 0x8000, 0x7fc1, 0xff80];
+    let view = HostTensor::bf16(vec![2, 3], words);
+    let builder = Builder::for_tests();
+    let source = builder
+        .constant("source", TensorType::new([2, 3], DType::BF16))
+        .unwrap();
+    let widened = builder.cast(source, DType::F32).unwrap();
     let graph = builder.finish(widened).unwrap();
 
     let output = eval(
@@ -216,7 +101,8 @@ fn bf16_cast_decodes_owner_words_bit_exactly() {
         &HashMap::from([(source.id(), Value::from(view))]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
-    .map(|r| r.output);
+    .map(|r| r.output)
+    .unwrap();
     let expected = [
         1.0f32.to_bits(),
         (-2.0f32).to_bits(),
@@ -225,16 +111,20 @@ fn bf16_cast_decodes_owner_words_bit_exactly() {
         0x7fc1_0000,
         f32::NEG_INFINITY.to_bits(),
     ];
-    assert_eq!(dense_bits(&output.unwrap()), expected);
+    assert_eq!(dense_bits(&output), expected);
 }
 
 #[test]
 fn bf16_gather_reads_the_selected_rows() {
-    let builder = Builder::new();
-    let source = builder.constant("table", TensorType::new([4, 2], DType::BF16));
-    let token = builder.slot(Slot::Token, TensorType::new([3], DType::I32));
-    let rows = builder.gather(source, 0, token);
-    let widened = builder.cast(rows, DType::F32);
+    let builder = Builder::for_tests();
+    let source = builder
+        .constant("table", TensorType::new([4, 2], DType::BF16))
+        .unwrap();
+    let token = builder
+        .slot(Slot::Token, TensorType::new([3], DType::I32))
+        .unwrap();
+    let rows = builder.gather(source, 0, token).unwrap();
+    let widened = builder.cast(rows, DType::F32).unwrap();
     let graph = builder.finish(widened).unwrap();
     let inputs = |ids: Vec<i32>| {
         HashMap::from([
@@ -248,11 +138,12 @@ fn bf16_gather_reads_the_selected_rows() {
         &inputs(vec![2, 0, 3]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
-    .map(|r| r.output);
+    .map(|r| r.output)
+    .unwrap();
     let expected = [
         WORDS[4].1, WORDS[5].1, WORDS[0].1, WORDS[1].1, WORDS[6].1, WORDS[7].1,
     ];
-    assert_eq!(dense_bits(&output.unwrap()), expected.map(f32::to_bits));
+    assert_eq!(dense_bits(&output), expected.map(f32::to_bits));
 
     for (ids, position, index, kind) in [
         (
@@ -285,10 +176,16 @@ fn bf16_gather_reads_the_selected_rows() {
     }
 
     // A non-leading axis selects columns.
-    let builder = Builder::new();
-    let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
-    let token = builder.slot(Slot::Token, TensorType::new([2], DType::I32));
-    let columns = builder.cast(builder.gather(source, 1, token), DType::F32);
+    let builder = Builder::for_tests();
+    let source = builder
+        .constant("table", TensorType::new([2, 3], DType::BF16))
+        .unwrap();
+    let token = builder
+        .slot(Slot::Token, TensorType::new([2], DType::I32))
+        .unwrap();
+    let columns = builder
+        .cast(builder.gather(source, 1, token).unwrap(), DType::F32)
+        .unwrap();
     let graph = builder.finish(columns).unwrap();
     let output = eval(
         &graph,
@@ -301,19 +198,24 @@ fn bf16_gather_reads_the_selected_rows() {
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
-    .map(|r| r.output);
+    .map(|r| r.output)
+    .unwrap();
     let expected = [WORDS[2].1, WORDS[0].1, WORDS[5].1, WORDS[3].1];
-    assert_eq!(dense_bits(&output.unwrap()), expected.map(f32::to_bits));
+    assert_eq!(dense_bits(&output), expected.map(f32::to_bits));
 }
 
 /// The Qwen3.8 LM head: an F32 activation times a transposed BF16 weight, with an F32 product.
 #[test]
 fn bf16_weight_matmul_decodes_the_weight_and_keeps_f32_precision() {
-    let builder = Builder::new();
-    let weight = builder.constant("table", TensorType::new([2, 3], DType::BF16));
-    let x = builder.slot(Slot::Activation, TensorType::f32(vec![1, 3]));
-    let transposed = builder.transpose(weight, vec![1, 0]);
-    let logits = builder.matmul(x, transposed);
+    let builder = Builder::for_tests();
+    let weight = builder
+        .constant("table", TensorType::new([2, 3], DType::BF16))
+        .unwrap();
+    let x = builder
+        .slot(Slot::Activation, TensorType::f32(vec![1, 3]))
+        .unwrap();
+    let transposed = builder.transpose(weight, vec![1, 0]).unwrap();
+    let logits = builder.matmul(x, transposed).unwrap();
     let graph = builder.finish(logits).unwrap();
     // 0.5 + 7/1024 is not a BF16 value, so narrowing the activation or the product would change the result.
     let activation = vec![0.5 + 7.0 / 1024.0, -0.5, 2.0];
@@ -322,32 +224,17 @@ fn bf16_weight_matmul_decodes_the_weight_and_keeps_f32_precision() {
         &graph,
         &HashMap::from([
             (weight.id(), Value::from(table(&[2, 3]))),
-            (
-                x.id(),
-                Value::Host(HostTensor::f32(vec![1, 3], activation.clone())),
-            ),
+            (x.id(), Value::Host(HostTensor::f32(vec![1, 3], activation))),
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
-    .map(|r| r.output);
+    .map(|r| r.output)
+    .unwrap();
     // W = [[1, -2, 0.5], [3, -0.75, 1.5]], so x W^T is exact in f32:
     // row 0: 519/1024 + 1 + 1, row 1: 1557/1024 + 0.375 + 3.
     let expected = [2.0f32 + 519.0 / 1024.0, 3.375 + 1557.0 / 1024.0];
-    let actual = dense_bits(&output.unwrap());
+    let actual = dense_bits(&output);
     assert_eq!(actual, expected.map(f32::to_bits));
-
-    // A host BF16 weight of the same words gives the same bits as the owner-backed weight.
-    let words = WORDS[..6].iter().map(|&(word, _)| word).collect();
-    let dense: HashMap<_, Value> = HashMap::from([
-        (weight.id(), HostTensor::bf16(vec![2, 3], words).into()),
-        (x.id(), HostTensor::f32(vec![1, 3], activation).into()),
-    ]);
-    let dense = eval(&graph, &dense, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
-    assert_eq!(dense_bits(&Value::Host(dense)), actual);
 }
 
 /// Card 380 FR-006. The same LM head after `fold_dense_contractions`: one `DenseContraction` reading
@@ -355,11 +242,15 @@ fn bf16_weight_matmul_decodes_the_weight_and_keeps_f32_precision() {
 /// literals as the matmul form, not compared against another poot evaluation.
 #[test]
 fn dense_contraction_matches_the_mixed_matmul_definition() {
-    let builder = Builder::new();
-    let weight = builder.constant("table", TensorType::new([2, 3], DType::BF16));
-    let x = builder.slot(Slot::Activation, TensorType::f32(vec![1, 3]));
-    let transposed = builder.transpose(weight, vec![1, 0]);
-    let logits = builder.matmul(x, transposed);
+    let builder = Builder::for_tests();
+    let weight = builder
+        .constant("table", TensorType::new([2, 3], DType::BF16))
+        .unwrap();
+    let x = builder
+        .slot(Slot::Activation, TensorType::f32(vec![1, 3]))
+        .unwrap();
+    let transposed = builder.transpose(weight, vec![1, 0]).unwrap();
+    let logits = builder.matmul(x, transposed).unwrap();
     let graph = as_dense_contraction(builder.finish(logits).unwrap(), x.id(), weight.id());
 
     assert!(
@@ -390,11 +281,12 @@ fn dense_contraction_matches_the_mixed_matmul_definition() {
         ]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
-    .map(|r| r.output);
+    .map(|r| r.output)
+    .unwrap();
     // W = [[1, -2, 0.5], [3, -0.75, 1.5]] in checkpoint order, so out[n] = sum_k x[k] * W[n, k]:
     // row 0: 519/1024 + 1 + 1, row 1: 1557/1024 + 0.375 + 3.
     let expected = [2.0f32 + 519.0 / 1024.0, 3.375 + 1557.0 / 1024.0];
-    assert_eq!(dense_bits(&output.unwrap()), expected.map(f32::to_bits));
+    assert_eq!(dense_bits(&output), expected.map(f32::to_bits));
 }
 
 // Card 554d: `dense_eval_rejects_both_packed_bf16_readers_by_name` (Card 381 FR-007)
@@ -412,11 +304,15 @@ fn dense_contraction_matches_the_mixed_matmul_definition() {
 /// `bf16_gather_reads_the_selected_rows` asserts, not compared against another poot evaluation.
 #[test]
 fn dense_row_gather_matches_gather_then_widen() {
-    let builder = Builder::new();
-    let source = builder.constant("table", TensorType::new([4, 2], DType::BF16));
-    let token = builder.slot(Slot::Token, TensorType::new([3], DType::I32));
-    let rows = builder.gather(source, 0, token);
-    let widened = builder.cast(rows, DType::F32);
+    let builder = Builder::for_tests();
+    let source = builder
+        .constant("table", TensorType::new([4, 2], DType::BF16))
+        .unwrap();
+    let token = builder
+        .slot(Slot::Token, TensorType::new([3], DType::I32))
+        .unwrap();
+    let rows = builder.gather(source, 0, token).unwrap();
+    let widened = builder.cast(rows, DType::F32).unwrap();
     let graph = as_dense_row_gather(builder.finish(widened).unwrap(), source.id(), token.id());
 
     assert!(
@@ -445,11 +341,12 @@ fn dense_row_gather_matches_gather_then_widen() {
         &inputs(vec![2, 0, 3]),
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
-    .map(|r| r.output);
+    .map(|r| r.output)
+    .unwrap();
     let expected = [
         WORDS[4].1, WORDS[5].1, WORDS[0].1, WORDS[1].1, WORDS[6].1, WORDS[7].1,
     ];
-    assert_eq!(dense_bits(&output.unwrap()), expected.map(f32::to_bits));
+    assert_eq!(dense_bits(&output), expected.map(f32::to_bits));
 
     // The bounds check is the gather's own, unchanged.
     for (ids, position, index, kind) in [
@@ -484,16 +381,22 @@ fn dense_row_gather_matches_gather_then_widen() {
 
     // The Qwen3.8-27B chain has a reshape between the gather and the cast. The fold rebuilds it over F32,
     // so the same six values come back under the traced `[1, 3, 2]` shape.
-    let builder = Builder::new();
-    let source = builder.constant("table", TensorType::new([4, 2], DType::BF16));
-    let token = builder.slot(Slot::Token, TensorType::new([3], DType::I32));
-    let shaped = builder.reshape(builder.gather(source, 0, token), vec![1, 3, 2]);
-    let widened = builder.cast(shaped, DType::F32);
+    let builder = Builder::for_tests();
+    let source = builder
+        .constant("table", TensorType::new([4, 2], DType::BF16))
+        .unwrap();
+    let token = builder
+        .slot(Slot::Token, TensorType::new([3], DType::I32))
+        .unwrap();
+    let shaped = builder
+        .reshape(builder.gather(source, 0, token).unwrap(), vec![1, 3, 2])
+        .unwrap();
+    let widened = builder.cast(shaped, DType::F32).unwrap();
     let traced = builder.finish(widened).unwrap();
     // Hand-rewrite to the post-fold shape for a `Reshape` link (Card 381 FR-004): the row gather
     // writes the ungathered `[3, 2]` F32 rows at a fresh id, and the same reshape, rebuilt over F32,
     // reads it and writes `widened.id`.
-    let graph = poot_test_util::graph_fixtures::derive(&traced, |draft| {
+    let graph = poot_graph_ir::test_support::graph_fixtures::derive(&traced, |draft| {
         let gathered_f32 = draft
             .values_mut()
             .push(poot_graph_ir::graph::ValueMeta::new(
@@ -546,9 +449,11 @@ fn dense_row_gather_matches_gather_then_widen() {
 
 #[test]
 fn bf16_reshape_aliases_contiguous_views_only() {
-    let builder = Builder::new();
-    let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
-    let reshaped = builder.reshape(source, vec![3, 2]);
+    let builder = Builder::for_tests();
+    let source = builder
+        .constant("table", TensorType::new([2, 3], DType::BF16))
+        .unwrap();
+    let reshaped = builder.reshape(source, vec![3, 2]).unwrap();
     let graph = builder.finish(reshaped).unwrap();
     let view = table(&[2, 3]);
     let output = eval(
@@ -557,7 +462,7 @@ fn bf16_reshape_aliases_contiguous_views_only() {
         EvalOptions::new(EvalBudget::UNBOUNDED),
     )
     .map(|r| r.output);
-    let Value::Owner(ExactValue::Bf16(output)) = output.unwrap() else {
+    let Value::Exact(ExactValue::Bf16(output)) = output.unwrap() else {
         panic!("reshape must stay exact BF16");
     };
     assert_eq!(output.shape(), [3, 2]);
@@ -570,9 +475,13 @@ fn bf16_reshape_aliases_contiguous_views_only() {
     );
     assert_eq!(output.physical_bytes(), 12);
 
-    let builder = Builder::new();
-    let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
-    let reshaped = builder.reshape(builder.transpose(source, vec![1, 0]), vec![6]);
+    let builder = Builder::for_tests();
+    let source = builder
+        .constant("table", TensorType::new([2, 3], DType::BF16))
+        .unwrap();
+    let reshaped = builder
+        .reshape(builder.transpose(source, vec![1, 0]).unwrap(), vec![6])
+        .unwrap();
     let graph = builder.finish(reshaped).unwrap();
     let output = eval(
         &graph,
@@ -618,54 +527,6 @@ fn matmul_rejects_bf16_weight_on_the_left_at_infer_time() {
     ));
 }
 
-/// `MatMul(F32, BF16)` admits an F32 operand, but an F32 owner view there is still a closed consumer.
-#[test]
-fn f32_owner_view_is_rejected_as_a_matmul_activation_before_execution() {
-    let owners = owners(&[
-        (
-            "activation",
-            "F32",
-            &[1, 2],
-            vec![0, 0, 0x80, 0x3f, 0, 0, 0, 0x40],
-        ),
-        (
-            "table",
-            "BF16",
-            &[2, 3],
-            bf16_bytes(WORDS[..6].iter().map(|&(w, _)| w)),
-        ),
-        ("other", "BF16", &[2], bf16_bytes([WORDS[6].0, WORDS[7].0])),
-    ]);
-    let view =
-        |name: &str| Value::from(DenseOwnerTensorView::new(Arc::clone(&owners[name])).unwrap());
-    let builder = Builder::new();
-    let other = builder.constant("other", TensorType::new([2], DType::BF16));
-    let activation = builder.constant("activation", TensorType::f32(vec![1, 2]));
-    let weight = builder.constant("table", TensorType::new([2, 3], DType::BF16));
-    // This widening runs first if preflight lets the F32 owner through, and records an allocation.
-    let _earlier = builder.cast(other, DType::F32);
-    let product = builder.matmul(activation, weight);
-    let graph = builder.finish(product).unwrap();
-    let output = eval(
-        &graph,
-        &HashMap::from([
-            (other.id(), view("other")),
-            (activation.id(), view("activation")),
-            (weight.id(), view("table")),
-        ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .map(|r| r.output);
-    assert!(
-        matches!(
-            output,
-            Err(EvalError::ExactDense(ExactDenseError::GraphConsumer { value_id, .. }))
-                if value_id == activation.id()
-        ),
-        "{output:?}"
-    );
-}
-
 // Card 554d: `bf16_reservation_failure_publishes_nothing` deleted. It forced a
 // fallible BF16-table allocation failure via `observer.bf16_mut().force_reservation_failure()` and
 // asserted `ExactBf16Error::Reservation`. Both the hook and the error variant are gone: BF16-table
@@ -674,26 +535,41 @@ fn f32_owner_view_is_rejected_as_a_matmul_activation_before_execution() {
 // hook (would require editing `walk.rs`/`operand.rs`, outside this file and outside a mechanical
 // migration's authority).
 
-/// SC-008 (second clause): an owner-backed BF16 table consumed by a non-`Gather` equation (the
-/// widening `Cast(BF16, F32)`) above `EvalBudget`'s `max_alloc_bytes` is `EvalError::Budget`.
+/// SC-008 (second clause): a derived BF16 value (a gathered table row set) consumed by a non-`Gather`
+/// equation (the widening `Cast(BF16, F32)`) above `EvalBudget`'s `max_alloc_bytes` is
+/// `EvalError::Budget`. (A plain `Value::Host` BF16 widens exactly with no charge, so the row reads
+/// the derived carrier.)
 ///
 /// Mutation: drop the `opts.charge(...)` call in `walk.rs::evaluate_cast`'s `(DType::BF16,
 /// DType::F32)` arm; the bounded call stops erroring and this test goes red.
 #[test]
 fn bf16_widening_cast_above_budget_is_refused() {
-    let builder = Builder::new();
-    let source = builder.constant("table", TensorType::new([2, 3], DType::BF16));
-    let widened = builder.cast(source, DType::F32);
+    let builder = Builder::for_tests();
+    let source = builder
+        .constant("table", TensorType::new([4, 2], DType::BF16))
+        .unwrap();
+    let token = builder
+        .slot(Slot::Token, TensorType::new([3], DType::I32))
+        .unwrap();
+    let rows = builder.gather(source, 0, token).unwrap();
+    let widened = builder.cast(rows, DType::F32).unwrap();
     let graph = builder.finish(widened).unwrap();
-    let inputs = HashMap::from([(source.id(), Value::from(table(&[2, 3])))]);
+    let inputs = HashMap::from([
+        (source.id(), Value::from(table(&[4, 2]))),
+        (
+            token.id(),
+            Value::Host(HostTensor::i32(vec![3], vec![2, 0, 3])),
+        ),
+    ]);
 
-    // 6 elements decode to 24 F32 bytes; a 20-byte ceiling must refuse before any byte is written.
+    // 6 gathered elements decode to 24 F32 bytes; a 20-byte ceiling must refuse before any byte is
+    // written (the 12-byte BF16 gather itself fits).
     let bounded = eval(
         &graph,
         &inputs,
         EvalOptions::new(EvalBudget::bounded(1_000, 20)),
     )
-    .expect_err("a BF16 table widened past max_alloc_bytes must refuse");
+    .expect_err("a derived BF16 value widened past max_alloc_bytes must refuse");
     assert!(
         matches!(
             bounded,
@@ -735,19 +611,25 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
         poot_graph_ir::Traced,
         poot_graph_ir::Traced,
     ) {
-        let bf16_table = b.constant("table", TensorType::new([4, 2], DType::BF16));
-        let idx = b.slot(Slot::Token, TensorType::new([2], DType::I32));
-        let gathered = b.gather(bf16_table, 0, idx);
-        let widened = b.cast(gathered, DType::F32);
+        let bf16_table = b
+            .constant("table", TensorType::new([4, 2], DType::BF16))
+            .unwrap();
+        let idx = b
+            .slot(Slot::Token, TensorType::new([2], DType::I32))
+            .unwrap();
+        let gathered = b.gather(bf16_table, 0, idx).unwrap();
+        let widened = b.cast(gathered, DType::F32).unwrap();
 
-        let cond = helpers::i32_constant(b, "cond", vec![2]).unwrap();
-        let zero = helpers::i32_constant(b, "zero", vec![2]).unwrap();
-        let one = helpers::i32_constant(b, "one", vec![2]).unwrap();
-        let binary_cond = b.binary(poot_graph_ir::BinOp::GeU, cond, zero);
-        let selected = b.select(binary_cond, one, zero);
-        let selected_f32 = b.cast(selected, DType::F32);
+        let cond = graph_fixtures::i32_constant(b, "cond", vec![2]).unwrap();
+        let zero = graph_fixtures::i32_constant(b, "zero", vec![2]).unwrap();
+        let one = graph_fixtures::i32_constant(b, "one", vec![2]).unwrap();
+        let binary_cond = b.binary(poot_graph_ir::BinOp::GeU, cond, zero).unwrap();
+        let selected = b.select(binary_cond, one, zero).unwrap();
+        let selected_f32 = b.cast(selected, DType::F32).unwrap();
 
-        let sum = b.binary(poot_graph_ir::BinOp::Add, widened, selected_f32);
+        let sum = b
+            .binary(poot_graph_ir::BinOp::Add, widened, selected_f32)
+            .unwrap();
         (bf16_table, idx, cond, zero, one, sum)
     };
 
@@ -763,7 +645,7 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
         };
 
     // Graph A: the chain alone.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (bf16_table, idx, cond, zero, one, sum) = chain(&b);
     let graph_a = b.finish(sum).unwrap();
     let inputs_a = common_inputs(bf16_table.id(), idx.id(), cond.id(), zero.id(), one.id());
@@ -774,12 +656,12 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
     // Graph B: the same chain, plus an unrelated F32 -> E4M3FN -> F32 branch added into the same
     // output (0.0 round-trips through E4M3FN exactly, so it changes nothing numerically - only
     // whether the equation exists in the graph at all).
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (bf16_table, idx, cond, zero, one, sum) = chain(&b);
-    let e4m3_in = b.constant("e4m3_in", TensorType::f32(vec![2]));
-    let e4m3_mid = b.cast(e4m3_in, DType::E4M3FN);
-    let e4m3_out = b.cast(e4m3_mid, DType::F32);
-    let output_b = b.binary(poot_graph_ir::BinOp::Add, sum, e4m3_out);
+    let e4m3_in = b.constant("e4m3_in", TensorType::f32(vec![2])).unwrap();
+    let e4m3_mid = b.cast(e4m3_in, DType::E4M3FN).unwrap();
+    let e4m3_out = b.cast(e4m3_mid, DType::F32).unwrap();
+    let output_b = b.binary(poot_graph_ir::BinOp::Add, sum, e4m3_out).unwrap();
     let graph_b = b.finish(output_b).unwrap();
     let mut inputs_b = common_inputs(bf16_table.id(), idx.id(), cond.id(), zero.id(), one.id());
     inputs_b.insert(

@@ -1,17 +1,16 @@
-//! In-crate test module (moved from `tests/`): `reject_preexisting_packed_contractions` is held
-//! non-`pub` for Card 672 (dead-pub W10 form), which an integration test could not reach.
+//! In-crate test module (moved from `tests/`).
 
+use crate::passes::cse_dce::dce_with_roots;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
-    PackedDequantProductionError, dce_with_roots, recognize_packed_contractions,
-    reject_packed_dequant_escapes, reject_preexisting_packed_contractions,
+    PackedDequantProductionError, recognize_packed_contractions, reject_packed_dequant_escapes,
 };
 use poot_graph_ir::ops::{packed_block_diagonal_linear, packed_linear};
 use poot_graph_ir::{
-    Builder, BuilderAppendError, Graph, OpKind, Operand, PackedSourceName, Slot, TensorType,
-    ValueId, packed_source_constants,
+    Builder, BuilderError, Graph, OpKind, Operand, PackedSourceName, Slot, TensorType, ValueId,
+    packed_source_constants,
 };
 use poot_quant::StoredBytes;
 use poot_quant::format::{ScaleEncoding, Storage, WeightFormat};
@@ -93,11 +92,10 @@ use allocation::allocated_bytes;
 /// live and still tested: `packed_dequant_oracle_rejects_an_overflowing_activation_shape` below.
 const PACKED_ORACLE_MAX_ELEMENTS: usize = 8 * 1024 * 1024;
 
-/// Validate, eliminate dead oracle-only decoding, recognize dense contractions, then reject every
+/// Eliminate dead oracle-only decoding, recognize dense contractions, then reject every
 /// remaining escape: the graph-level packed-dequant preparation the planner's production entry
 /// extends with block-float claims.
 fn prepare_packed_dequant_production(g: &Graph) -> Result<Graph, PackedDequantProductionError> {
-    reject_preexisting_packed_contractions(g)?;
     let graph = dce_with_roots(g, &[]).unwrap();
     let graph = recognize_packed_contractions(&graph).unwrap();
     reject_packed_dequant_escapes(&graph)?;
@@ -173,15 +171,15 @@ fn payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
 
 fn primitive_graph(owner: &Arc<PackedPayload>) -> (poot_graph_ir::Graph, ValueId, ValueId) {
     let descriptor = owner.weight();
-    let b = Builder::new();
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
     let [(weight_name, weight_type), (scale_name, scale_type)] = <[(PackedSourceName, TensorType);
         2]>::try_from(
         packed_source_constants("layer", descriptor),
     )
     .expect("a registered packed-linear format has exactly two sources");
-    let weight = b.constant(weight_name.as_str(), weight_type);
-    let scale = b.constant(scale_name.as_str(), scale_type);
-    let output = b.packed_dequant(&[weight, scale], descriptor);
+    let weight = b.constant(weight_name.as_str(), weight_type).unwrap();
+    let scale = b.constant(scale_name.as_str(), scale_type).unwrap();
+    let output = b.packed_dequant(&[weight, scale], descriptor).unwrap();
     (b.finish(output).unwrap(), weight.id(), scale.id())
 }
 
@@ -361,16 +359,18 @@ fn packed_dequant_binding_reuses_payload_owner() {
 }
 
 #[test]
-fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderAppendError> {
+fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderError> {
     for activation_shape in [vec![2, 35], vec![1, 2, 35]] {
         let owner = payload(WeightFormat::E2m1Row32, [3, 35]);
         let descriptor = owner.weight();
-        let b = Builder::new();
-        let activation = b.slot_named(
-            Slot::Activation,
-            "packed-test",
-            TensorType::f32(activation_shape.clone()),
-        );
+        let b = Builder::for_tests();
+        let activation = b
+            .slot_named(
+                Slot::Activation,
+                "packed-test",
+                TensorType::f32(activation_shape.clone()),
+            )
+            .unwrap();
         let output = packed_linear(&b, activation, "layer", descriptor, None, None)?;
         let graph = b.finish(output).unwrap();
         let fused = prepare_packed_dequant_production(&graph).unwrap();
@@ -477,13 +477,17 @@ fn indexed_graph(
         descriptor,
         experts: experts.len(),
     };
-    let b = Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
-    let selector = b.slot_named(
-        Slot::Activation,
-        "selector",
-        TensorType::new(vec![m], DType::I32),
-    );
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]))
+        .unwrap();
+    let selector = b
+        .slot_named(
+            Slot::Activation,
+            "selector",
+            TensorType::new(vec![m], DType::I32),
+        )
+        .unwrap();
     let output = packed_indexed_linear(&b, x, selector, &table).unwrap();
     let graph = b.finish(output).unwrap();
     let stack = Arc::new(PackedStack::try_new(experts.to_vec()).unwrap());
@@ -616,11 +620,15 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
             }
         }
     }
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, k]));
-    let w = b.constant("w", TensorType::f32(vec![experts.len(), k, out]));
-    let ids = b.constant("ids", TensorType::new(vec![m], DType::I32));
-    let y = b.indexed_matmul(x, w, ids);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+    let w = b
+        .constant("w", TensorType::f32(vec![experts.len(), k, out]))
+        .unwrap();
+    let ids = b
+        .constant("ids", TensorType::new(vec![m], DType::I32))
+        .unwrap();
+    let y = b.indexed_matmul(x, w, ids).unwrap();
     let dense = b.finish(y).unwrap();
     let dense_inputs: HashMap<ValueId, Value> = [
         (x.id(), HostTensor::f32(vec![m, k], x_data.clone())),
@@ -679,19 +687,21 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
 /// own comment names. Runs the square case first so a reversed-operand mutation is caught here, not
 /// merely declined by the second (non-square) case before this assertion runs.
 #[test]
-fn transposed_packed_contraction_fused_and_unfused_compositions_match()
--> Result<(), BuilderAppendError> {
+fn transposed_packed_contraction_fused_and_unfused_compositions_match() -> Result<(), BuilderError>
+{
     for activation_shape in [vec![4usize, 4], vec![2, 4]] {
         let owner = payload(WeightFormat::E2m1Row32, [3, 4]);
         let descriptor = owner.weight();
-        let b = Builder::new();
-        let activation = b.slot_named(
-            Slot::Activation,
-            "transposed-packed-test",
-            TensorType::f32(activation_shape.clone()),
-        );
+        let b = Builder::for_tests();
+        let activation = b
+            .slot_named(
+                Slot::Activation,
+                "transposed-packed-test",
+                TensorType::f32(activation_shape.clone()),
+            )
+            .unwrap();
 
-        let mut plan = b.append_plan(0);
+        let mut plan = b.append_plan(0).unwrap();
         let [(weight_name, weight_type), (scale_name, scale_type)] =
             <[(PackedSourceName, TensorType); 2]>::try_from(packed_source_constants(
                 "transposed-packed-test",
@@ -806,17 +816,18 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match()
 /// path (not a second hand-written reference). A wrong axis order in the fused path (e.g. reading
 /// `weight[j, block_base + output]` instead of `weight[block_base + output, j]`) diverges from the unfused result.
 #[test]
-fn blocked_packed_contraction_fused_and_unfused_compositions_match()
--> Result<(), BuilderAppendError> {
+fn blocked_packed_contraction_fused_and_unfused_compositions_match() -> Result<(), BuilderError> {
     for activation_shape in [vec![4, 5, 35], vec![4, 1, 35]] {
         let owner = payload(WeightFormat::E2m1Row32, [8, 35]);
         let descriptor = owner.weight();
-        let b = Builder::new();
-        let activation = b.slot_named(
-            Slot::Activation,
-            "blocked-packed-test",
-            TensorType::f32(activation_shape.clone()),
-        );
+        let b = Builder::for_tests();
+        let activation = b
+            .slot_named(
+                Slot::Activation,
+                "blocked-packed-test",
+                TensorType::f32(activation_shape.clone()),
+            )
+            .unwrap();
         let output =
             packed_block_diagonal_linear(&b, activation, "blocked-layer", descriptor, 4, None)?;
         let graph = b.finish(output).unwrap();
@@ -886,66 +897,6 @@ fn blocked_packed_contraction_fused_and_unfused_compositions_match()
     Ok(())
 }
 
-#[test]
-fn packed_dequant_production_rejects_valid_preexisting_candidate() -> Result<(), BuilderAppendError>
-{
-    let owner = payload(WeightFormat::E2m1Row32, [3, 35]);
-    let descriptor = owner.weight();
-    let builder = Builder::new();
-    let activation = builder.slot_named(
-        Slot::Activation,
-        "direct-candidate",
-        TensorType::f32(vec![2, 35]),
-    );
-    let output = packed_linear(&builder, activation, "direct.layer", descriptor, None, None)?;
-    let source = builder.finish(output).unwrap();
-    let direct = prepare_packed_dequant_production(&source).unwrap();
-    assert!(matches!(
-        direct.eqns(),
-        [poot_graph_ir::Eqn {
-            op: poot_graph_ir::OpKind::PackedContraction {
-                descriptor: actual,
-                rows: poot_graph_ir::ContractionRows::Blocks(1)
-            },
-            ..
-        }] if *actual == descriptor
-    ));
-
-    let candidate = &direct.eqns()[0];
-    let [
-        _,
-        poot_graph_ir::Operand::Value(weight_id),
-        poot_graph_ir::Operand::Value(scale_id),
-    ] = candidate.inputs.as_slice()
-    else {
-        panic!("candidate must retain activation, weight, and scale values");
-    };
-    let weight =
-        PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(OperandRole::Codes));
-    let scale = PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(OperandRole::Scale));
-    assert!(weight.same_owner(&scale));
-    let inputs = HashMap::from([
-        (
-            activation.id(),
-            Value::Host(HostTensor::f32(
-                vec![2, 35],
-                (0..70).map(|index| index as f32 / 17.0).collect(),
-            )),
-        ),
-        (*weight_id, Value::Packed(weight)),
-        (*scale_id, Value::Packed(scale)),
-    ]);
-    assert!(matches!(
-        eval(&direct, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output),
-        Ok(Value::Host(_))
-    ));
-    assert!(matches!(
-        prepare_packed_dequant_production(&direct),
-        Err(PackedDequantProductionError::PreexistingContraction { .. })
-    ));
-    Ok(())
-}
-
 /// Evaluate one `OpKind::PackedContraction { blocks: 1 }` of `activation` (`[m, K]`) against
 /// `owner` through the graph oracle: `[m, out]`, the activation times the packed weight's
 /// transpose.
@@ -953,15 +904,17 @@ fn contract_through_the_oracle(
     label: &str,
     owner: &Arc<PackedPayload>,
     activation: HostTensor,
-) -> Result<HostTensor, BuilderAppendError> {
+) -> Result<HostTensor, BuilderError> {
     let weight = owner.weight();
-    let b = Builder::new();
-    let activation_value = b.slot_named(
-        Slot::Activation,
-        label,
-        TensorType::f32(activation.shape().to_vec()),
-    );
-    let mut plan = b.append_plan(0);
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+    let activation_value = b
+        .slot_named(
+            Slot::Activation,
+            label,
+            TensorType::f32(activation.shape().to_vec()),
+        )
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
     let mut operands = vec![Operand::Value(activation_value.id())];
     let mut source_ids = Vec::new();
     for (name, ty) in packed_source_constants(label, weight) {
@@ -1008,7 +961,7 @@ fn contract_through_the_oracle(
 /// `block_q4_K`'s `dmin` follows), contracted with an identity activation, must give each row's
 /// own `decode_blocks` values.
 #[test]
-fn packed_dequant_oracle_matches_decode_blocks_per_row() -> Result<(), BuilderAppendError> {
+fn packed_dequant_oracle_matches_decode_blocks_per_row() -> Result<(), BuilderError> {
     use poot_quant::format::Storage;
 
     const D: [u16; 3] = [0x3c00, 0x4000, 0xb800];
@@ -1090,7 +1043,7 @@ fn packed_dequant_oracle_matches_decode_blocks_per_row() -> Result<(), BuilderAp
 /// 1045592064, right: 3160440832`). Restored.
 #[test]
 fn packed_dequant_oracle_matches_the_539a_literal_reference_for_every_scheme()
--> Result<(), BuilderAppendError> {
+-> Result<(), BuilderError> {
     use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
 
     fn nonzero(value: usize) -> std::num::NonZeroUsize {
@@ -1945,7 +1898,7 @@ fn gguf_payload(format: WeightFormat, shape: [usize; 2]) -> Arc<PackedPayload> {
 /// per-element `owner.decode([row, c])` loop; Q8_0 `PackedDequant` at K=512 allocated 4211363 bytes
 /// against the 32768 budget (green: 17059).
 #[test]
-fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> {
+fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderError> {
     // Generous per-logical-value budget for a linear oracle (output, row buffer, bookkeeping); the
     // per-element path spends `4 * K` bytes per value, over 100x this at both widths.
     const LINEAR_BYTES_PER_VALUE: usize = 16;
@@ -1976,13 +1929,13 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
 
             let owner = gguf_payload(format, [out, k]);
             let descriptor = owner.weight();
-            let b = Builder::new();
+            let b = Builder::for_tests();
             let [(name, source_type)] = <[(PackedSourceName, TensorType); 1]>::try_from(
                 packed_source_constants("layer", descriptor),
             )
             .expect("a GGUF block format has exactly one source");
-            let source = b.constant(name.as_str(), source_type);
-            let decoded = b.packed_dequant(&[source], descriptor);
+            let source = b.constant(name.as_str(), source_type).unwrap();
+            let decoded = b.packed_dequant(&[source], descriptor).unwrap();
             let graph = b.finish(decoded).unwrap();
             let inputs = packed_inputs(&graph, &owner);
             let (result, dequant_bytes) = allocated_bytes(|| {
@@ -1990,8 +1943,10 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
             });
             assert!(matches!(result.unwrap(), Value::Host(_)));
 
-            let b = Builder::new();
-            let activation = b.slot_named(Slot::Activation, "work", TensorType::f32(vec![2, k]));
+            let b = Builder::for_tests();
+            let activation = b
+                .slot_named(Slot::Activation, "work", TensorType::f32(vec![2, k]))
+                .unwrap();
             let output = packed_linear(&b, activation, "layer", descriptor, None, None)?;
             let graph = prepare_packed_dequant_production(&b.finish(output).unwrap()).unwrap();
             let mut inputs = packed_inputs(&graph, &owner);
@@ -2032,7 +1987,7 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderAppendError> 
 /// `block * block_out + output` in `PackedPayload::decode_row`'s caller (`decode_packed_row`); the
 /// block-diagonal Q8_0 case goes red.
 #[test]
-fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), BuilderAppendError> {
+fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), BuilderError> {
     for (format, blocks) in [
         (WeightFormat::Q8_0, 1),
         (WeightFormat::Q8_0, 2),
@@ -2047,12 +2002,14 @@ fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), Build
         } else {
             vec![blocks, rows_per_block, k]
         };
-        let b = Builder::new();
-        let activation = b.slot_named(
-            Slot::Activation,
-            "gguf-row-test",
-            TensorType::f32(activation_shape.clone()),
-        );
+        let b = Builder::for_tests();
+        let activation = b
+            .slot_named(
+                Slot::Activation,
+                "gguf-row-test",
+                TensorType::f32(activation_shape.clone()),
+            )
+            .unwrap();
         let output = if blocks == 1 {
             packed_linear(&b, activation, "gguf", descriptor, None, None)?
         } else {
@@ -2151,8 +2108,10 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
         PackedPayload::try_new(descriptor, [(SourceRole::Blocks, StoredBytes::from(bytes))])
             .unwrap(),
     );
-    let b = Builder::new();
-    let ids = b.slot(Slot::Token, TensorType::new(vec![3], DType::I32));
+    let b = Builder::for_tests();
+    let ids = b
+        .slot(Slot::Token, TensorType::new(vec![3], DType::I32))
+        .unwrap();
     let out = poot_graph_ir::ops::packed_embedding(&b, ids, "embed", descriptor).unwrap();
     let graph = recognize_packed_row_gathers(&b.finish(out).unwrap()).unwrap();
     assert!(matches!(
@@ -2274,8 +2233,10 @@ fn a_packed_projection_past_the_oracle_cap_evaluates() {
     assert!(out * k > PACKED_ORACLE_MAX_ELEMENTS);
     let owner = distinct_row_q8_0(out, k);
 
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![1, k]));
+    let b = Builder::for_tests();
+    let x = b
+        .slot(Slot::Activation, TensorType::f32(vec![1, k]))
+        .unwrap();
     let y = packed_linear(&b, x, "proj", owner.weight(), None, None).unwrap();
     let graph = recognize_packed_contractions(&b.finish(y).unwrap()).unwrap();
     assert!(
@@ -2324,16 +2285,17 @@ fn a_packed_projection_past_the_oracle_cap_evaluates() {
 /// Mutation: drop the `opts.charge(...)` of `walk.rs::evaluate_composite`'s loop; the bounded row stops
 /// erroring and this test goes red.
 #[test]
-fn packed_contraction_above_budget_is_refused_unbounded_evaluates() -> Result<(), BuilderAppendError>
-{
+fn packed_contraction_above_budget_is_refused_unbounded_evaluates() -> Result<(), BuilderError> {
     let owner = payload(WeightFormat::E2m1Row32, [3, 35]);
     let descriptor = owner.weight();
-    let builder = Builder::new();
-    let activation = builder.slot_named(
-        Slot::Activation,
-        "budget-candidate",
-        TensorType::f32(vec![2, 35]),
-    );
+    let builder = Builder::for_tests();
+    let activation = builder
+        .slot_named(
+            Slot::Activation,
+            "budget-candidate",
+            TensorType::f32(vec![2, 35]),
+        )
+        .unwrap();
     let output = packed_linear(&builder, activation, "budget.layer", descriptor, None, None)?;
     let source = builder.finish(output).unwrap();
     let direct = prepare_packed_dequant_production(&source).unwrap();

@@ -8,7 +8,8 @@
 //! dispatch); there is no separate large-vocabulary two-stage schedule here (out of scope for this card -
 //! see the card's final report).
 
-use super::*;
+use super::{ContractionHead, DType, Eqn, ImportedKernel, OpKind, PlanError, Planned, value_ids};
+use crate::planner::GraphTables;
 use poot_graph_ir::op::SampleRule;
 use poot_target::{Backend, DeviceCaps};
 

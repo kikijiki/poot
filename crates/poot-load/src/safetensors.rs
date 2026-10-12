@@ -1,5 +1,7 @@
 use poot_tensor::DType;
 use std::collections::HashSet;
+use std::fs::File;
+use std::path::Path;
 use std::sync::Arc;
 
 use std::num::NonZeroUsize;
@@ -7,7 +9,7 @@ use std::num::NonZeroUsize;
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 
-use super::*;
+use super::{LoadError, QuantKind, QuantScheme, checked_header_end, miss, parse_dtype};
 use crate::plan::{Container, JobKind, LoadPlan, TensorJob, build_store, default_workers};
 
 struct UniqueSafetensorsHeader(serde_json::Map<String, serde_json::Value>);
@@ -627,14 +629,6 @@ pub fn pack_quantized_linears(
     Ok(builder.build())
 }
 
-/// Parse a SafeTensors archive from bytes in memory (same format as a file) into a [`WeightStore`]. See
-/// [`load_weight_store`]. Only this crate's tests build an archive in memory.
-#[cfg(test)]
-pub(crate) fn load_weight_store_bytes(bytes: &[u8]) -> Result<WeightStore, LoadError> {
-    let files = [(String::new(), StoredBytes::from(bytes.to_vec()))];
-    build_store(safetensors_plan(&files)?, default_workers())
-}
-
 /// Load one safetensors file (not a model directory: no sharding, no fixed `model.safetensors`
 /// name) into a [`WeightStore`]. Used by loaders whose single archive has its own name (the LoRA
 /// adapter loader's `adapter_model.safetensors`, e.g.). See [`load_weight_store`].
@@ -653,5 +647,17 @@ pub fn dense_bytes<'a>(store: &'a WeightStore, name: &str) -> Result<&'a DenseWe
             "{name}: expected a dense stored tensor, found a packed entry"
         ))),
         None => Err(LoadError::SafeTensors(format!("missing tensor {name}"))),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    /// Parse a SafeTensors archive from bytes in memory (same format as a file) into a [`WeightStore`]. See
+    /// [`load_weight_store`]. Only this crate's tests build an archive in memory.
+    pub(crate) fn load_weight_store_bytes(bytes: &[u8]) -> Result<WeightStore, LoadError> {
+        let files = [(String::new(), StoredBytes::from(bytes.to_vec()))];
+        build_store(safetensors_plan(&files)?, default_workers())
     }
 }

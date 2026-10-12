@@ -16,14 +16,14 @@
 use poot_tensor::DType;
 use std::collections::BTreeSet;
 
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 
-use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::{Eqn, Graph, OpKind, Operand, Storage, ValueId};
-use poot_graph_plan::{PlanError, prepare_target_graph};
+use poot_graph_plan::test_support::plan_eqn;
+use poot_graph_plan::{PlanError, dtype_widen::prepare_target_graph};
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
 use poot_target::Backend;
-use poot_test_util::graph_fixtures::plan_eqn;
 
 /// olmo2-1b proportions with vocab/layers shrunk; hidden, heads, head_dim and inter are real. The
 /// checkpoint is natively BF16 (zeros: only the traced graph is read).
@@ -40,7 +40,11 @@ fn olmo2_like(family: Family) -> Dense {
 fn traced(dense: &Dense, phase: Phase, tokens: usize, cap: usize) -> Graph {
     let m = dense.zeroed_model(DType::BF16);
     m.model
-        .trace(phase, step(1, tokens, cap, LogitRows::Last))
+        .trace(
+            phase,
+            step(1, tokens, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -137,15 +141,16 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
     let graphs = [
         (
             "olmo2 prefill",
-            optimize(&traced(&olmo2, Phase::Prefill, n, cap)).unwrap(),
+            passes_without_target(&traced(&olmo2, Phase::Prefill, n, cap)).unwrap(),
         ),
         (
             "olmo2 decode",
-            optimize(&traced(&olmo2, Phase::Decode, 1, cap)).unwrap(),
+            passes_without_target(&traced(&olmo2, Phase::Decode, 1, cap)).unwrap(),
         ),
         (
             "qwen2 prefill",
-            optimize(&traced(&olmo2_like(Family::Qwen2), Phase::Prefill, n, cap)).unwrap(),
+            passes_without_target(&traced(&olmo2_like(Family::Qwen2), Phase::Prefill, n, cap))
+                .unwrap(),
         ),
     ];
 

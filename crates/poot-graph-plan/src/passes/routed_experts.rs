@@ -16,7 +16,14 @@ use poot_graph_ir::op::{ContractionRows, OpKind};
 
 /// One routed-expert site, as equation indices into the graph's `eqns`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RoutedExpertSite {
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
+pub struct RoutedExpertSite {
     /// The router-logits contraction (`MatMul`).
     pub router: usize,
     /// The `ArgTopK` selecting each row's experts from the router's scores.
@@ -34,7 +41,14 @@ fn value_inputs(inputs: &[Operand]) -> impl Iterator<Item = ValueId> + '_ {
 }
 
 /// Every routed-expert site of `g`.
-pub(crate) fn routed_expert_sites(g: &Graph) -> Vec<RoutedExpertSite> {
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
+pub fn routed_expert_sites(g: &Graph) -> Vec<RoutedExpertSite> {
     let producer: HashMap<ValueId, usize> = g
         .eqns()
         .iter()
@@ -139,19 +153,24 @@ mod tests {
     /// `rows` tokens of width 4 through a router over 3 experts, the `ArgTopK` of its ranks as per-row
     /// expert ids; `consume` decides whether an indexed contraction reads them.
     fn routed(rows: usize, consume: bool) -> Graph {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![rows, 4]));
-        let router = b.constant("router", TensorType::f32(vec![4, 3]));
-        let logits = b.matmul(x, router);
-        let ids = b.reshape(
-            b.arg_top_k(ops::stable_descending_rank(&b, logits), 1),
-            vec![rows],
-        );
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![rows, 4])).unwrap();
+        let router = b.constant("router", TensorType::f32(vec![4, 3])).unwrap();
+        let logits = b.matmul(x, router).unwrap();
+        let ids = b
+            .reshape(
+                b.arg_top_k(ops::stable_descending_rank(&b, logits).unwrap(), 1)
+                    .unwrap(),
+                vec![rows],
+            )
+            .unwrap();
         let out = if consume {
-            let experts = b.constant("experts", TensorType::f32(vec![3, 4, 2]));
-            b.indexed_matmul(x, experts, ids)
+            let experts = b
+                .constant("experts", TensorType::f32(vec![3, 4, 2]))
+                .unwrap();
+            b.indexed_matmul(x, experts, ids).unwrap()
         } else {
-            b.reshape(ids, vec![rows, 1])
+            b.reshape(ids, vec![rows, 1]).unwrap()
         };
         b.finish(out).unwrap()
     }
@@ -176,9 +195,9 @@ mod tests {
             "the selection feeds nothing indexed"
         );
 
-        let b = Builder::new();
-        let scores = b.constant("scores", TensorType::f32(vec![4, 3]));
-        let ids = b.arg_top_k(scores, 1);
+        let b = Builder::for_tests();
+        let scores = b.constant("scores", TensorType::f32(vec![4, 3])).unwrap();
+        let ids = b.arg_top_k(scores, 1).unwrap();
         assert_eq!(
             sites(&b.finish(ids).unwrap()),
             0,

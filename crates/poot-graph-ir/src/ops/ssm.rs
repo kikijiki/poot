@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BinOp, Builder, BuilderError, Requirement, Scalar, Traced, UnOp, decay_mask_from_cumlog,
+    linear_attention_prefill,
+};
+#[cfg(any(test, feature = "test-support"))]
+use super::{RedOp, repeat_kv};
 
 /// Gated linear-attention decode (card 038), the decode step of linear attention (Qwen3.5 /
 /// MiniMax-style recurrence): each head carries a fixed-size recurrent state matrix
@@ -15,6 +20,7 @@ use super::*;
 /// `q[1,Hq,1,D_k]`, `k`/`v[1,Hkv,1,D_k|D_v]` (GQA via `repeat_kv`), `s_in[1,Hq,D_k,D_v]`. Returns
 /// `(o[1,Hq,1,D_v], s_out[1,Hq,D_k,D_v])`; the caller wires `s_out` back as the carried state
 /// (`finish_with_state`), like the KV cache. Pure primitive composition.
+#[cfg(any(test, feature = "test-support"))]
 pub fn linear_attention_decode_gated(
     b: &Builder,
     q: Traced,
@@ -23,15 +29,15 @@ pub fn linear_attention_decode_gated(
     n_rep: usize,
     gate: Traced,
     s_in: Traced,
-) -> (Traced, Traced) {
-    let k = repeat_kv(b, k, n_rep); // [1,Hq,1,D_k]
-    let v = repeat_kv(b, v, n_rep); // [1,Hq,1,D_v]
-    let kt = b.transpose(k, vec![0, 1, 3, 2]); // [1,Hq,D_k,1]
-    let kv = b.matmul(kt, v); // outer product [1,Hq,D_k,D_v]
-    let s_gated = b.binary(BinOp::Mul, s_in, gate); // gate [1,Hq,D_k,1] broadcasts over D_v
-    let s_out = b.binary(BinOp::Add, s_gated, kv); // S_t = g_t*S + k^T v
-    let o = b.matmul(q, s_out); // q @ S_t -> [1,Hq,1,D_v]
-    (o, s_out)
+) -> Result<(Traced, Traced), BuilderError> {
+    let k = repeat_kv(b, k, n_rep)?; // [1,Hq,1,D_k]
+    let v = repeat_kv(b, v, n_rep)?; // [1,Hq,1,D_v]
+    let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [1,Hq,D_k,1]
+    let kv = b.matmul(kt, v)?; // outer product [1,Hq,D_k,D_v]
+    let s_gated = b.binary(BinOp::Mul, s_in, gate)?; // gate [1,Hq,D_k,1] broadcasts over D_v
+    let s_out = b.binary(BinOp::Add, s_gated, kv)?; // S_t = g_t*S + k^T v
+    let o = b.matmul(q, s_out)?; // q @ S_t -> [1,Hq,1,D_v]
+    Ok((o, s_out))
 }
 
 /// Mamba2 / SSD decode step (card 038): a selective SSM step is a gated linear-attention step, so
@@ -52,6 +58,7 @@ pub fn linear_attention_decode_gated(
 /// per-head A / D), `h_in[1,Hq,N,P]` (carried SSM state). Returns `(y[1,Hq,1,P], h_out[1,Hq,N,P])`.
 /// Pure primitive composition; the SSM block for nemotron_h / Mamba2 hybrid layers.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn mamba2_ssd_decode(
     b: &Builder,
     x: Traced,
@@ -61,13 +68,13 @@ pub fn mamba2_ssd_decode(
     a_param: Traced,
     d_skip: Traced,
     h_in: Traced,
-) -> (Traced, Traced) {
-    let a_bar = b.unary(UnOp::Exp, b.binary(BinOp::Mul, delta, a_param)); // exp(Delta * A) [1,Hq,1,1]
-    let b_bar = b.binary(BinOp::Mul, delta, b_in); // Delta * B [1,Hq,1,N]
-    let (o, h_out) = linear_attention_decode_gated(b, c_in, b_bar, x, 1, a_bar, h_in);
-    let skip = b.binary(BinOp::Mul, d_skip, x); // D * x [1,Hq,1,P]
-    let y = b.binary(BinOp::Add, o, skip);
-    (y, h_out)
+) -> Result<(Traced, Traced), BuilderError> {
+    let a_bar = b.unary(UnOp::Exp, b.binary(BinOp::Mul, delta, a_param)?)?; // exp(Delta * A) [1,Hq,1,1]
+    let b_bar = b.binary(BinOp::Mul, delta, b_in)?; // Delta * B [1,Hq,1,N]
+    let (o, h_out) = linear_attention_decode_gated(b, c_in, b_bar, x, 1, a_bar, h_in)?;
+    let skip = b.binary(BinOp::Mul, d_skip, x)?; // D * x [1,Hq,1,P]
+    let y = b.binary(BinOp::Add, o, skip)?;
+    Ok((y, h_out))
 }
 
 /// Mamba2 / SSD over a chunk of `L` positions continuing a carried state `h_in`: the whole-chunk twin
@@ -108,35 +115,35 @@ pub fn mamba2_ssd_prefill(
     d_skip: Traced,
     h_in: Traced,
     tril: Traced,
-) -> (Traced, Traced) {
-    let shape = b.aval(x).shape;
+) -> Result<(Traced, Traced), BuilderError> {
+    let shape = b.aval(x)?.shape;
     let (hq, l) = (shape[1], shape[2]);
 
-    let log_gate = b.binary(BinOp::Mul, delta, a_param); // log Abar = Delta * A [1,Hq,L,1]
-    let b_bar = b.binary(BinOp::Mul, delta, b_in); // Delta * B [1,Hq,L,N]
+    let log_gate = b.binary(BinOp::Mul, delta, a_param)?; // log Abar = Delta * A [1,Hq,L,1]
+    let b_bar = b.binary(BinOp::Mul, delta, b_in)?; // Delta * B [1,Hq,L,N]
 
     // One prefix sum of the log gates serves the mask and the seed decay, with no exp/log round
     // trip: a very negative `Delta * A` stays finite here instead of reaching `log(0) = -inf`.
-    let cumlog = b.matmul(tril, log_gate); // [1,Hq,L,1]
-    let mask = decay_mask_from_cumlog(b, cumlog, tril, hq, l); // [1,Hq,L,L]
+    let cumlog = b.matmul(tril, log_gate)?; // [1,Hq,L,1]
+    let mask = decay_mask_from_cumlog(b, cumlog, tril, hq, l)?; // [1,Hq,L,L]
 
-    let y_lin = linear_attention_prefill(b, c_in, b_bar, x, 1, mask); // [1,Hq,L,P]
+    let y_lin = linear_attention_prefill(b, c_in, b_bar, x, 1, mask)?; // [1,Hq,L,P]
 
     // P_t = exp(prefix sum of the log gates): the decay the seed state has suffered by position t.
-    let seed_decay = b.unary(UnOp::Exp, cumlog); // [1,Hq,L,1]
-    let from_seed = b.binary(BinOp::Mul, b.matmul(c_in, h_in), seed_decay); // [1,Hq,L,P]
-    let skip = b.binary(BinOp::Mul, d_skip, x); // D * x [1,Hq,L,P], d_skip broadcasts over L
-    let y = b.binary(BinOp::Add, b.binary(BinOp::Add, y_lin, from_seed), skip);
+    let seed_decay = b.unary(UnOp::Exp, cumlog)?; // [1,Hq,L,1]
+    let from_seed = b.binary(BinOp::Mul, b.matmul(c_in, h_in)?, seed_decay)?; // [1,Hq,L,P]
+    let skip = b.binary(BinOp::Mul, d_skip, x)?; // D * x [1,Hq,L,P], d_skip broadcasts over L
+    let y = b.binary(BinOp::Add, b.binary(BinOp::Add, y_lin, from_seed)?, skip)?;
 
     // h_out = P_{L-1} h_in + sum_j weight_j * Bbar_j^T x_j, weight_j = mask's own last row (t=L-1).
-    let weight_row = b.slice(mask, 2, l - 1, l); // [1,Hq,1,L]
-    let weight_col = b.reshape(weight_row, vec![1, hq, l, 1]); // same L-major order, now column-shaped
-    let weighted_b = b.binary(BinOp::Mul, b_bar, weight_col); // [1,Hq,L,N], broadcast over N
-    let weighted_b_t = b.transpose(weighted_b, vec![0, 1, 3, 2]); // [1,Hq,N,L]
-    let seeded = b.binary(BinOp::Mul, h_in, b.slice(seed_decay, 2, l - 1, l)); // [1,Hq,N,P]
-    let h_out = b.binary(BinOp::Add, b.matmul(weighted_b_t, x), seeded); // [1,Hq,N,P]
+    let weight_row = b.slice(mask, 2, l - 1, l)?; // [1,Hq,1,L]
+    let weight_col = b.reshape(weight_row, vec![1, hq, l, 1])?; // same L-major order, now column-shaped
+    let weighted_b = b.binary(BinOp::Mul, b_bar, weight_col)?; // [1,Hq,L,N], broadcast over N
+    let weighted_b_t = b.transpose(weighted_b, vec![0, 1, 3, 2])?; // [1,Hq,N,L]
+    let seeded = b.binary(BinOp::Mul, h_in, b.slice(seed_decay, 2, l - 1, l)?)?; // [1,Hq,N,P]
+    let h_out = b.binary(BinOp::Add, b.matmul(weighted_b_t, x)?, seeded)?; // [1,Hq,N,P]
 
-    (y, h_out)
+    Ok((y, h_out))
 }
 
 /// The packed definition of `OpKind::Scan` over [`ScanFamily::Ssd`](crate::ScanFamily): the sequence cut into
@@ -156,8 +163,8 @@ pub fn scan_ssd_packed(
     d_skip: Traced,
     h_in: Traced,
     chunk: usize,
-) -> Traced {
-    let shape = b.aval(x).shape;
+) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
     let (hq, l) = (shape[1], shape[2]);
     let mut state = h_in;
     let mut ys = Vec::with_capacity(l.div_ceil(chunk));
@@ -165,18 +172,12 @@ pub fn scan_ssd_packed(
         let end = (start + chunk).min(l);
         let len = end - start;
         let part = |t: Traced| b.slice(t, 2, start, end);
-        let tril = b.broadcast(super::lower_triangle(b, len, 0.0), vec![1, hq, len, len]);
+        let (x_part, b_part, c_part, delta_part) =
+            (part(x)?, part(b_in)?, part(c_in)?, part(delta)?);
+        let tril = b.broadcast(super::lower_triangle(b, len, 0.0)?, vec![1, hq, len, len])?;
         let (y, next) = mamba2_ssd_prefill(
-            b,
-            part(x),
-            part(b_in),
-            part(c_in),
-            part(delta),
-            a_param,
-            d_skip,
-            state,
-            tril,
-        );
+            b, x_part, b_part, c_part, delta_part, a_param, d_skip, state, tril,
+        )?;
         ys.push(y);
         state = next;
     }
@@ -192,26 +193,27 @@ pub fn scan_ssd_packed(
 /// read off `x`; rows are independent (as in [`gated_delta_net_decode`]). Pure primitive composition
 /// (concat, broadcast multiply, reduce, slice); Mamba's bias + SiLU are the caller's. `k` is the
 /// kernel size.
+#[cfg(any(test, feature = "test-support"))]
 pub fn causal_conv1d_decode(
     b: &Builder,
     x: Traced,
     w: Traced,
     cache: Traced,
     k: usize,
-) -> (Traced, Traced) {
-    let x_shape = b.aval(x).shape;
+) -> Result<(Traced, Traced), BuilderError> {
+    let x_shape = b.aval(x)?.shape;
     let batch = x_shape[0];
-    let c = *x_shape.last().expect("conv input is at least 1-D");
-    let window = b.concat(1, &[cache, x]); // [B, K, C] = last K-1 inputs ++ current
+    let c = super::last_axis("causal_conv1d", &x_shape)?;
+    let window = b.concat(1, &[cache, x])?; // [B, K, C] = last K-1 inputs ++ current
     // sum the length-K window per channel. Reduce over the LAST axis (move K there): a non-last-axis reduce
     // is unreliable, so transpose [B,K,C] -> [B,C,K], multiply by the (transposed) kernel, reduce axis 2.
-    let window_t = b.transpose(window, vec![0, 2, 1]); // [B, C, K]
-    let wk = b.transpose(b.reshape(w, vec![1, k, c]), vec![0, 2, 1]); // [1, C, K], broadcasts over B
-    let weighted = b.binary(BinOp::Mul, wk, window_t); // [B, C, K]
-    let summed = b.reduce(RedOp::Sum, weighted, 2, true); // [B, C, 1]
-    let out = b.reshape(summed, vec![batch, 1, c]); // [B, 1, C]
-    let new_cache = b.slice(window, 1, 1, k); // drop the oldest -> [B,K-1,C]
-    (out, new_cache)
+    let window_t = b.transpose(window, vec![0, 2, 1])?; // [B, C, K]
+    let wk = b.transpose(b.reshape(w, vec![1, k, c])?, vec![0, 2, 1])?; // [1, C, K], broadcasts over B
+    let weighted = b.binary(BinOp::Mul, wk, window_t)?; // [B, C, K]
+    let summed = b.reduce(RedOp::Sum, weighted, 2, true)?; // [B, C, 1]
+    let out = b.reshape(summed, vec![batch, 1, c])?; // [B, 1, C]
+    let new_cache = b.slice(window, 1, 1, k)?; // drop the oldest -> [B,K-1,C]
+    Ok((out, new_cache))
 }
 
 /// Batched causal depthwise conv1d over a chunk of `L` positions that starts from zeros: the
@@ -220,7 +222,13 @@ pub fn causal_conv1d_decode(
 /// `out[t,c] = sum_{j=0..K-1} w[j,c] * x[t-(K-1)+j,c]`, with `x[<0,c] = 0`, matching
 /// [`causal_conv1d_decode`] per position (`causal_conv1d_prefill_matches_decode`). No bias, no
 /// activation; the caller applies SiLU (e.g. the Gated DeltaNet mixer).
-pub fn causal_conv1d_prefill(b: &Builder, x: Traced, w: Traced, k: usize) -> Traced {
+#[cfg(any(test, feature = "test-support"))]
+pub fn causal_conv1d_prefill(
+    b: &Builder,
+    x: Traced,
+    w: Traced,
+    k: usize,
+) -> Result<Traced, BuilderError> {
     causal_conv1d_prefill_dilated(b, x, w, k, 1)
 }
 
@@ -230,14 +238,15 @@ pub fn causal_conv1d_prefill(b: &Builder, x: Traced, w: Traced, k: usize) -> Tra
 /// Needed by `Qwen4ExpTextPLELayer._short_conv` (`modeling_qwen4_exp.py`), a depthwise and dilated
 /// `nn.Conv1d` (`ple_conv_kernel_size = 4`, `ngram_size = 3`, so the causal left pad is
 /// `(K-1)*dilation = 9`).
+#[cfg(any(test, feature = "test-support"))]
 pub fn causal_conv1d_prefill_dilated(
     b: &Builder,
     x: Traced,
     w: Traced,
     k: usize,
     dilation: usize,
-) -> Traced {
-    let shape = b.aval(x).shape;
+) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
     let (batch, l, c) = (shape[0], shape[1], shape[2]);
     let pad = (k - 1) * dilation;
     // The zero window is `x`'s own first time-slice times 0, broadcast, rather than a host constant
@@ -245,10 +254,10 @@ pub fn causal_conv1d_prefill_dilated(
     let x_ext = if pad == 0 {
         x
     } else {
-        let first = b.slice(x, 1, 0, 1); // [B, 1, C]
-        let zero_slice = b.binary_scalar(BinOp::Mul, first, Scalar::F32(0.0)); // [B, 1, C] zeros
-        let zeros = b.broadcast(zero_slice, vec![batch, pad, c]); // [B, pad, C]
-        b.concat(1, &[zeros, x])
+        let first = b.slice(x, 1, 0, 1)?; // [B, 1, C]
+        let zero_slice = b.binary_scalar(BinOp::Mul, first, Scalar::F32(0.0))?; // [B, 1, C] zeros
+        let zeros = b.broadcast(zero_slice, vec![batch, pad, c])?; // [B, pad, C]
+        b.concat(1, &[zeros, x])?
     };
     conv_taps(b, x_ext, w, l, k, dilation)
 }
@@ -266,37 +275,59 @@ pub fn causal_conv1d_windowed(
     window: Traced,
     k: usize,
     dilation: usize,
-) -> (Traced, Traced) {
-    let shape = b.aval(x).shape;
+) -> Result<(Traced, Traced), BuilderError> {
+    let shape = b.aval(x)?.shape;
     let (batch, l, c) = (shape[0], shape[1], shape[2]);
     let pad = (k - 1) * dilation;
-    assert_eq!(
-        b.aval(window).shape,
-        vec![batch, pad, c],
-        "the conv window is [B, (K-1)*dilation, C]"
-    );
-    let x_ext = b.concat(1, &[window, x]);
-    let out = conv_taps(b, x_ext, w, l, k, dilation);
-    (out, b.slice(x_ext, 1, l, pad + l))
+    let window_shape = b.aval(window)?.shape;
+    if window_shape != [batch, pad, c] {
+        return Err(BuilderError::Requirement {
+            operation: "causal_conv1d_windowed",
+            requirement: Requirement::WindowShape {
+                expected: vec![batch, pad, c],
+                found: window_shape,
+            },
+        });
+    }
+    let x_ext = b.concat(1, &[window, x])?;
+    let out = conv_taps(b, x_ext, w, l, k, dilation)?;
+    Ok((out, b.slice(x_ext, 1, l, pad + l)?))
 }
 
 /// The `K` taps over the extended input `x_ext[B, (K-1)*dilation + L, C]` (a static constant,
 /// unrolled at trace time).
-fn conv_taps(b: &Builder, x_ext: Traced, w: Traced, l: usize, k: usize, dilation: usize) -> Traced {
-    assert!(dilation >= 1, "dilation must be >= 1");
-    let c = b.aval(x_ext).shape[2];
+fn conv_taps(
+    b: &Builder,
+    x_ext: Traced,
+    w: Traced,
+    l: usize,
+    k: usize,
+    dilation: usize,
+) -> Result<Traced, BuilderError> {
+    if dilation == 0 {
+        return Err(BuilderError::Requirement {
+            operation: "causal_conv1d",
+            requirement: Requirement::AtLeastOne { what: "dilation" },
+        });
+    }
+    let c = b.aval(x_ext)?.shape[2];
     let mut acc: Option<Traced> = None;
     for j in 0..k {
         let off = j * dilation;
-        let tap = b.slice(x_ext, 1, off, off + l); // [B, L, C] = x_ext[j*dilation ..][..L]
-        let wj = b.reshape(b.slice(w, 0, j, j + 1), vec![1, 1, c]); // [1, 1, C] = w[j, :]
-        let term = b.binary(BinOp::Mul, tap, wj); // broadcast wj over B and L
+        let tap = b.slice(x_ext, 1, off, off + l)?; // [B, L, C] = x_ext[j*dilation ..][..L]
+        let wj = b.reshape(b.slice(w, 0, j, j + 1)?, vec![1, 1, c])?; // [1, 1, C] = w[j, :]
+        let term = b.binary(BinOp::Mul, tap, wj)?; // broadcast wj over B and L
         acc = Some(match acc {
             None => term,
-            Some(prev) => b.binary(BinOp::Add, prev, term),
+            Some(prev) => b.binary(BinOp::Add, prev, term)?,
         });
     }
-    acc.expect("k >= 1")
+    acc.ok_or(BuilderError::Requirement {
+        operation: "causal_conv1d",
+        requirement: Requirement::AtLeastOne {
+            what: "kernel width",
+        },
+    })
 }
 
 /// Gated delta-net decode step (card 135c): the per-token recurrence of Qwen3-Next (qwen35moe) hybrid
@@ -331,27 +362,27 @@ pub fn gated_delta_net_decode(
     g: Traced,    // [1, H, 1, 1]  forget-gate arg (exp(g) gives the per-head decay in (0,1))
     beta: Traced, // [1, H, 1, 1]  delta-rule weight in (0,1)
     s_in: Traced, // [1, H, D, D]  recurrent state (carried across decode steps)
-) -> (Traced, Traced) {
-    let d = b.aval(q).shape[3];
+) -> Result<(Traced, Traced), BuilderError> {
+    let d = b.aval(q)?.shape[3];
     // 1. Scale query by 1/sqrt(D).
-    let q_scaled = b.binary_scalar(BinOp::Mul, q, Scalar::F32(1.0 / (d as f32).sqrt())); // [1,H,1,D]
+    let q_scaled = b.binary_scalar(BinOp::Mul, q, Scalar::F32(1.0 / (d as f32).sqrt()))?; // [1,H,1,D]
     // 2. Per-head scalar decay = exp(g); g is negative in the model so decay is in (0,1).
-    let decay = b.unary(UnOp::Exp, g); // [1,H,1,1]
+    let decay = b.unary(UnOp::Exp, g)?; // [1,H,1,1]
     // 3. Forget: decay the whole D x D state. decay [1,H,1,1] broadcasts over [1,H,D,D].
-    let s_decayed = b.binary(BinOp::Mul, s_in, decay); // [1,H,D,D]
+    let s_decayed = b.binary(BinOp::Mul, s_in, decay)?; // [1,H,D,D]
     // 4. kv = k @ S  (equivalent to S^T k, treating k as a 1-row matrix).
     //    [1,H,1,D] @ [1,H,D,D] = [1,H,1,D].
-    let kv = b.matmul(k, s_decayed); // [1,H,1,D]
+    let kv = b.matmul(k, s_decayed)?; // [1,H,1,D]
     // 5. Delta-rule correction: beta * (v - S^T k).
-    let residual = b.binary(BinOp::Sub, v, kv); // [1,H,1,D]
-    let delta = b.binary(BinOp::Mul, beta, residual); // [1,H,1,D]
+    let residual = b.binary(BinOp::Sub, v, kv)?; // [1,H,1,D]
+    let delta = b.binary(BinOp::Mul, beta, residual)?; // [1,H,1,D]
     // 6. Rank-1 outer-product update outer(k, delta) = k^col @ delta^row.
     //    k_col = transpose(k, [0,1,3,2]) = [1,H,D,1]; outer = [1,H,D,1] @ [1,H,1,D] = [1,H,D,D].
-    let k_col = b.transpose(k, vec![0, 1, 3, 2]); // [1,H,D,1]
-    let outer = b.matmul(k_col, delta); // [1,H,D,D]
+    let k_col = b.transpose(k, vec![0, 1, 3, 2])?; // [1,H,D,1]
+    let outer = b.matmul(k_col, delta)?; // [1,H,D,D]
     // 7. New state.
-    let s_out = b.binary(BinOp::Add, s_decayed, outer); // [1,H,D,D]
+    let s_out = b.binary(BinOp::Add, s_decayed, outer)?; // [1,H,D,D]
     // 8. Output: q_scaled @ S_new  (equivalent to S_new^T q, since q @ S = S^T q as a vector).
-    let o = b.matmul(q_scaled, s_out); // [1,H,1,D]
-    (o, s_out)
+    let o = b.matmul(q_scaled, s_out)?; // [1,H,1,D]
+    Ok((o, s_out))
 }

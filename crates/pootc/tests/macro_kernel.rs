@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use poot_kernel_ir::Body;
-use poot_runtime::{Context, KernelBuffer};
+use poot_wgpu_runtime::{Context, KernelBuffer};
 
 /// `CARGO_MANIFEST_DIR`, read at runtime (not baked via `env!`): the compile-time macro's value is
 /// embedded into this test binary's compiled object code at build time, and a shared compile cache (kache)
@@ -232,14 +232,14 @@ fn kernel_attribute_is_discovered_by_pootc() {
     eprintln!("#[kernel] fn add authored in Rust -> pootc -> SPIR-V -> GPU = a+b");
 }
 
-/// Build `poot-runtime`, `poot-codegen` and `poot-kernel-ir` (with its `serde` feature) into an isolated
+/// Build `poot-wgpu-runtime`, `poot-codegen` and `poot-kernel-ir` (with its `serde` feature) into an isolated
 /// scratch target directory, keyed like `build_proc_macro`'s (see its doc: a shared `deps/` can hand back
 /// another worktree's rlib for the same crate name), and return every rlib, rmeta and proc-macro library cargo reports, keyed
 /// by crate name (cargo builds rlibs without embedded metadata, so a dependent needs both: the `.rmeta`
 /// carries the metadata, the `.rlib` the code to link). `--tests` also builds their dev-dependencies, since `serde_json` (needed by the generated
-/// `poot_kernel_body`) is only a dev-dependency of `poot-runtime`/`poot-kernel-ir`, not a regular one. Card
+/// `poot_kernel_body`) is only a dev-dependency of `poot-wgpu-runtime`/`poot-kernel-ir`, not a regular one. Card
 /// 608 host-pass probe below `--extern`-links its generated wrapper's
-/// `poot_runtime`/`poot_codegen`/`poot_kernel_ir`/`serde_json` (transitive) references against these.
+/// `poot_wgpu_runtime`/`poot_codegen`/`poot_kernel_ir`/`serde_json` (transitive) references against these.
 fn build_host_pass_rlibs() -> HashMap<String, Vec<PathBuf>> {
     let manifest_dir = manifest_dir();
     let mut checkout = DefaultHasher::new();
@@ -253,7 +253,7 @@ fn build_host_pass_rlibs() -> HashMap<String, Vec<PathBuf>> {
             "--tests",
             "--message-format=json-render-diagnostics",
             "-p",
-            "poot-runtime",
+            "poot-wgpu-runtime",
             "-p",
             "poot-codegen",
             "-p",
@@ -265,7 +265,7 @@ fn build_host_pass_rlibs() -> HashMap<String, Vec<PathBuf>> {
         .arg(&target_dir)
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .output()
-        .expect("build poot-runtime/poot-codegen/poot-kernel-ir for the host-pass probe");
+        .expect("build poot-wgpu-runtime/poot-codegen/poot-kernel-ir for the host-pass probe");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -369,7 +369,7 @@ include!("poot_cache.rs");
 pub fn add(a: &[f32], b: &[f32], c: &mut [f32]) {}
 
 fn main() {
-    let ctx = match poot_runtime::Context::new() {
+    let ctx = match poot_wgpu_runtime::Context::new() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("no GPU ({e}); skipping the dispatch");
@@ -394,7 +394,7 @@ fn main() {
     let short_b = [10.0f32, 20.0, 30.0];
     let mut wide_c = [0.0f32; 6];
     match add(&ctx, &short_a, &short_b, &mut wide_c) {
-        Err(poot_runtime::RuntimeError::KernelAssertFailed { .. }) => {}
+        Err(poot_wgpu_runtime::RuntimeError::KernelAssertFailed { .. }) => {}
         other => panic!(
             "expected the host-pass wrapper to report the compiled Body's real bounds trap, got {other:?}"
         ),
@@ -428,7 +428,7 @@ fn main() {
             .arg(format!("dependency={}", dir.display()));
     }
     for name in [
-        "poot_runtime",
+        "poot_wgpu_runtime",
         "poot_codegen",
         "poot_kernel_ir",
         "serde_json",

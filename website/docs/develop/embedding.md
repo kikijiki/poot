@@ -82,7 +82,10 @@ let options = DriverOptions {
     decode: compile,
     capacity: NonZeroUsize::new(512).unwrap(),      // KV positions: prompt plus new tokens
     prefill_chunk: NonZeroUsize::new(128).unwrap(), // new tokens per prefill step
-    max_trace_tokens: NonZeroUsize::new(128).unwrap(),
+    // The finite limits every traced step runs under; `max_tokens` is the most new tokens a step may
+    // carry. `serving_trace_limits` is the measured profile of this crate's own workloads (see its
+    // docs); state your own `TraceLimits` for another workload.
+    trace: poot_llm::driver::serving_trace_limits(NonZeroUsize::new(128).unwrap()),
     prepared: PreparedSetLimits {
         max_entries: NonZeroUsize::new(64).unwrap(),
         max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),

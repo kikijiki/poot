@@ -268,7 +268,7 @@ pub(crate) fn apply_guided(
     if let Some(forced) = resolve_forced_tools(tools, tool_choice)?
         && matches!(
             handle.text().chat_format(),
-            poot_models::chat::ChatFormat::ChatML | poot_models::chat::ChatFormat::Granite
+            poot_text::ChatFormat::ChatML | poot_text::ChatFormat::Granite
         )
     {
         return Ok(sampler.with_constraint(handle.text().build_tool_call_constraint(&forced)?));

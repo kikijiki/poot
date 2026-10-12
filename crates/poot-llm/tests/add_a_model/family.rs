@@ -16,9 +16,8 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
+use poot_graph_ir::Graph;
 use poot_graph_ir::rope_table::RopeFlavor;
-use poot_graph_ir::{Builder, Graph};
-use poot_models::chat::ChatFormat;
 use poot_models::components::attention::{AttentionParams, AttentionWeights, attention};
 use poot_models::components::dims::{Field, Fields};
 use poot_models::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
@@ -39,14 +38,15 @@ use poot_quant::weights::{
     WeightRole, WeightStore, WeightView,
 };
 use poot_tensor::DType;
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("poot_fixture_neoxish");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("poot_fixture_neoxish");
 
 /// The HF `model_type` that names the family.
 const MODEL_TYPE: &str = "poot_fixture_neoxish";
 
 /// The registry entry: what `Registry::register` takes.
-pub const ENTRY: FamilyEntry = FamilyEntry {
+pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
     keys: &[(ConfigSource::HfModelType, MODEL_TYPE)],
     build,
@@ -55,8 +55,8 @@ pub const ENTRY: FamilyEntry = FamilyEntry {
 };
 
 /// The vocabulary of the fixture checkpoint, and its end-of-sequence id.
-pub const VOCAB: usize = 48;
-pub const EOS: u32 = 47;
+pub(crate) const VOCAB: usize = 48;
+pub(crate) const EOS: u32 = 47;
 
 /// The typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
@@ -114,12 +114,12 @@ impl NeoxishParams {
 
 /// The checkpoint's tensor name table: where each role of the model sits in a GPT-NeoX checkpoint.
 mod names {
-    pub const EMBED: &str = "gpt_neox.embed_in.weight";
-    pub const FINAL_NORM: &str = "gpt_neox.final_layer_norm.weight";
-    pub const FINAL_NORM_BIAS: &str = "gpt_neox.final_layer_norm.bias";
-    pub const HEAD: &str = "embed_out.weight";
+    pub(super) const EMBED: &str = "gpt_neox.embed_in.weight";
+    pub(super) const FINAL_NORM: &str = "gpt_neox.final_layer_norm.weight";
+    pub(super) const FINAL_NORM_BIAS: &str = "gpt_neox.final_layer_norm.bias";
+    pub(super) const HEAD: &str = "embed_out.weight";
 
-    pub fn layer(l: usize, tail: &str) -> String {
+    pub(super) fn layer(l: usize, tail: &str) -> String {
         format!("gpt_neox.layers.{l}.{tail}")
     }
 }
@@ -253,11 +253,15 @@ impl Model for Neoxish {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -268,14 +272,14 @@ impl Model for Neoxish {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention),
                 |b, BlockInput { block: h, .. }| plain_mlp(b, h, &layer.mlp, Gelu::Erf),
             )
-        });
-        Ok(step.finish(b, logits).unwrap())
+        })?;
+        Ok(step.finish(b, logits)?)
     }
 }
 
 /// The fixture's config: two layers of four 16-wide heads (RoPE over 4 dims of each), the 48-word
 /// vocabulary of [`VOCAB`].
-pub fn fixture_config() -> serde_json::Value {
+pub(crate) fn fixture_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": MODEL_TYPE,
         "vocab_size": VOCAB,
@@ -344,7 +348,7 @@ const QKV_SPREAD: f32 = 2.0;
 
 /// The synthetic checkpoint `ENTRY` ships for tests: BF16 tensors of deterministic pseudo-random
 /// values (one xorshift stream over every tensor in order), sized by [`magnitude`].
-pub fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     let config = fixture_config();
     let mut store = WeightStore::builder();
     let mut seed = 0x9e37_79b9u32;

@@ -30,8 +30,8 @@ pub const fn bf16_to_f32(bits: u16) -> f32 {
 /// f32 -> IEEE-754 binary16 bits, round to nearest with ties to even (ADR-0101 decision 4). Subnormal
 /// results are kept, overflow rounds to infinity, and a NaN stays a NaN (sign and top payload bits carry
 /// through; the quiet bit is forced so a payload confined to the dropped low bits cannot collapse to
-/// infinity). The one host f16 encoder: `poot-eval`'s Cast oracle and the resident uploads of `poot-gpu` and
-/// `poot-ptx-gpu` narrow with it, as does [`crate::encode`] for every f16 block scale.
+/// infinity). The one host f16 encoder: `poot-eval`'s Cast oracle and the resident uploads of `poot-wgpu-device` and
+/// `poot-ptx-device` narrow with it, as does [`crate::encode`] for every f16 block scale.
 pub fn f32_to_f16(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;

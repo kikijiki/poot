@@ -14,7 +14,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, geglu_ffn};
@@ -31,11 +30,12 @@ use crate::model::{
 use crate::names::gguf::{GGUF_BASE, GGUF_SANDWICH_NORMS};
 use crate::names::{HF_BASE, HF_SANDWICH_NORMS, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 /// The Gemma vocabulary's `<bos>` id, for a config that names none.
 const GEMMA_BOS: u32 = 2;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("gemma2");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("gemma2");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -75,7 +75,7 @@ const GGUF_27B_LAYERS: usize = 46;
 
 /// Gemma 2's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Gemma2Params {
+pub(crate) struct Gemma2Params {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -127,7 +127,7 @@ fn sliding_layers(fields: &Fields<'_>, layers: usize) -> Result<Vec<bool>, Model
 }
 
 impl Gemma2Params {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let mut dims = DenseDims::read(&fields, &SPEC)?;
         let hf = matches!(raw, RawConfig::HfJson { .. });
@@ -203,7 +203,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Gemma2 {
+pub(crate) struct Gemma2 {
     params: Gemma2Params,
     weights: WeightMap,
     stack: StackWeights,
@@ -260,11 +260,10 @@ impl Model for Gemma2 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -275,7 +274,7 @@ impl Model for Gemma2 {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention[l]),
                 |b, BlockInput { block: h, .. }| geglu_ffn(b, h, &layer.ffn),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -411,7 +410,11 @@ mod family_tests {
         };
         let trace = |config: &serde_json::Value| {
             model_of(config, &fx.store)
-                .trace(Phase::Prefill, step_shape(3, CAP, LogitRows::All))
+                .trace(
+                    Phase::Prefill,
+                    step_shape(3, CAP, LogitRows::All),
+                    poot_graph_ir::TraceLimits::for_tests(),
+                )
                 .unwrap()
         };
         let [s, f] = ["sliding_attention", "full_attention"];
@@ -701,11 +704,19 @@ mod family_tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(1, 2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(1, 2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }
@@ -734,7 +745,7 @@ mod family_tests {
             "bos_token_id": 2,
         });
         config["attn_logit_softcapping"] = json!(softcap);
-        let n_of = |f: &str| config[f].as_u64().unwrap() as usize;
+        let n_of = |f: &str| crate::registry::Fixture::count(&config, f);
         let h = n_of("hidden_size");
         let mut shapes = hf_base_shapes(&config, false);
         for l in 0..n_of("num_hidden_layers") {
@@ -757,7 +768,11 @@ mod family_tests {
         }
         let model = model_of(&config, &store.build());
         model
-            .trace(Phase::Prefill, step_shape(n, n, LogitRows::Last))
+            .trace(
+                Phase::Prefill,
+                step_shape(n, n, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap()
     }
 
@@ -771,7 +786,7 @@ mod family_tests {
     fn prefill_with_the_real_softcap_flash_fuses_every_layer() {
         let n = 2048;
         let g = real_shape_prefill(Some(50.0), n);
-        let opt = crate::test_support::optimize(&g).unwrap();
+        let opt = poot_graph_plan::passes_without_target(&g).unwrap();
         let softcaps: Vec<Option<f32>> = opt
             .eqns()
             .iter()
@@ -793,7 +808,7 @@ mod family_tests {
     #[test]
     fn prefill_without_a_softcap_flash_fuses_every_layer() {
         let n = 2048;
-        let opt = crate::test_support::optimize(&real_shape_prefill(None, n)).unwrap();
+        let opt = poot_graph_plan::passes_without_target(&real_shape_prefill(None, n)).unwrap();
         let fused = opt
             .eqns()
             .iter()

@@ -134,7 +134,7 @@ fn exact_i32_shr_bitcasts_through_u32_for_logical_shift() {
 
 #[test]
 fn exact_i32_fused_body_keeps_i32_locals_and_literals() {
-    let body = poot_test_util::kernel_fixtures::fused_i32_views(
+    let body = poot_kernelgen::fused_i32_views_grid(
         "k",
         &[2],
         &[&[2], &[2]],
@@ -159,6 +159,7 @@ fn exact_i32_fused_body_keeps_i32_locals_and_literals() {
             ],
             output: poot_kernelgen::FusedInput::Step(1),
         },
+        None,
     )
     .expect("fused_i32_views precondition");
     for local in &body.locals[1..=3] {

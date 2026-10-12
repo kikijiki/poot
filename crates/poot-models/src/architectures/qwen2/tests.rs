@@ -60,7 +60,7 @@ fn dims(model: &dyn Model, family: &str) -> (usize, usize, usize, usize) {
         .find(|e| e.family.as_str() == family)
         .unwrap();
     let config = (entry.fixture)().config;
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let head_dim = config["head_dim"]
         .as_u64()
         .map_or(n("hidden_size") / n("num_attention_heads"), |d| d as usize);
@@ -88,7 +88,13 @@ fn assert_contiguous_state(g: &Graph, family: &str, rows: usize, cap: usize) {
 #[test]
 fn decode_traces_and_validates() {
     let m = fixture_model("qwen2");
-    let g = m.trace(Phase::Decode, contiguous(1, 1, 16)).unwrap();
+    let g = m
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     // structural well-formedness: every operand defined before use, stored avals match infer.
     assert!(g.eqns().len() > 100);
     assert_eq!(g.aval(g.result()).shape, vec![1, 1, 48]);
@@ -99,7 +105,13 @@ fn prefill_traces_and_validates_both_archs() {
     // qwen2 (bias, no QK-norm) and qwen3 (no bias, QK-norm) are two registry families.
     for family in ["qwen2", "qwen3"] {
         let m = fixture_model(family);
-        let g = m.trace(Phase::Prefill, contiguous(1, 5, 8)).unwrap();
+        let g = m
+            .trace(
+                Phase::Prefill,
+                contiguous(1, 5, 8),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         assert_eq!(g.aval(g.result()).shape, vec![1, 1, m.config().vocab]);
     }
 }
@@ -107,7 +119,11 @@ fn prefill_traces_and_validates_both_archs() {
 #[test]
 fn gemma3_decode_traces_with_state_pairs() {
     let g = fixture_model("gemma3")
-        .trace(Phase::Decode, contiguous(1, 1, 16))
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     assert_contiguous_state(&g, "gemma3", 1, 16);
 }
@@ -116,7 +132,11 @@ fn gemma3_decode_traces_with_state_pairs() {
 fn gemma3_prefill_traces_with_state_pairs() {
     // the batched prefill must carry the SAME state pairs as the decode graph.
     let g = fixture_model("gemma3")
-        .trace(Phase::Prefill, contiguous(1, 5, 16))
+        .trace(
+            Phase::Prefill,
+            contiguous(1, 5, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     assert_contiguous_state(&g, "gemma3", 1, 16);
 }
@@ -134,7 +154,11 @@ fn optimize_fuses_flash_prefill_gemma_no_materialized_scores() {
 #[test]
 fn decode_traces_with_state_pairs() {
     let g = fixture_model("qwen2")
-        .trace(Phase::Decode, contiguous(1, 1, 16))
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     assert_contiguous_state(&g, "qwen2", 1, 16);
 }
@@ -149,7 +173,13 @@ fn rope_fusion_collapses_every_rope_in_the_decode_graph() {
     // which the matcher does not read, so no rope fused on any registry body.
     let m = fixture_model("qwen2");
     let (layers, _, head_dim, _) = dims(&*m, "qwen2");
-    let g = m.trace(Phase::Decode, contiguous(1, 1, 16)).unwrap();
+    let g = m
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     let base = dce(&cse(&g).unwrap()).unwrap();
     let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
     let ropes: Vec<usize> = fused
@@ -202,7 +232,11 @@ fn collapse_reshape_chains_shrinks_the_decode_graph() {
     // keep the graph valid (value-equivalence is covered by poot-eval's
     // reshape_collapse_is_value_identical and the fusion-equivalence fuzzers).
     let g = fixture_model("qwen2")
-        .trace(Phase::Decode, contiguous(1, 1, 16))
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let elided = elide_noop_transposes(&g).unwrap();
     let collapsed = collapse_reshape_chains(&elided).unwrap();
@@ -225,7 +259,11 @@ fn prefill_traces_with_state_pairs_both_archs() {
     // the masked decode it must match, for qwen2 (bias) and qwen3 (QK-norm).
     for family in ["qwen2", "qwen3"] {
         let g = fixture_model(family)
-            .trace(Phase::Prefill, contiguous(1, 5, 8))
+            .trace(
+                Phase::Prefill,
+                contiguous(1, 5, 8),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         assert_contiguous_state(&g, family, 1, 8);
     }
@@ -236,10 +274,22 @@ fn batched_decode_traces_with_state_pairs() {
     // the batched decode at B>1 carries [B,n_kv_heads,cap,head_dim] per-row caches and yields
     // [B,1,vocab] logits. Structural only.
     let m = fixture_model("qwen2");
-    let g = m.trace(Phase::Decode, contiguous(3, 1, 16)).unwrap();
+    let g = m
+        .trace(
+            Phase::Decode,
+            contiguous(3, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     assert_contiguous_state(&g, "qwen2", 3, 16);
     // B=1 must reduce to the same output shape as the scalar decode.
-    let g1 = m.trace(Phase::Decode, contiguous(1, 1, 16)).unwrap();
+    let g1 = m
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     assert_eq!(g1.aval(g1.result()).shape, vec![1, 1, 48]);
 }
 
@@ -247,7 +297,11 @@ fn batched_decode_traces_with_state_pairs() {
 fn decode_handles_qwen3() {
     // arch-general: qwen3 (no bias, QK-norm) traces too.
     let g = fixture_model("qwen3")
-        .trace(Phase::Decode, contiguous(1, 1, 8))
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 8),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     assert_eq!(g.state().count(), 2 * 2);
 }
@@ -256,7 +310,11 @@ fn decode_handles_qwen3() {
 fn exactly_two_slots() {
     // A contiguous step declares `Slot::Token` and `Slot::Pos` and nothing else.
     let g = fixture_model("qwen2")
-        .trace(Phase::Decode, contiguous(1, 1, 16))
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     assert_eq!(g.slots().len(), 2);
     let mut kinds: Vec<Slot> = g.slots().iter().map(|(_, s)| *s).collect();
@@ -267,7 +325,11 @@ fn exactly_two_slots() {
 #[test]
 fn inputs_are_const_slot_or_state() {
     let g = fixture_model("qwen2")
-        .trace(Phase::Decode, contiguous(1, 1, 16))
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     for &id in g.inputs() {
         assert!(matches!(
@@ -288,9 +350,13 @@ fn assert_flash_fused_prefill(family: &str, kv: KvLayout) {
     let m = model(family, |c| c["max_position_embeddings"] = 4096.into());
     let (layers, ..) = dims(&*m, family);
     let g = m
-        .trace(Phase::Prefill, shape(1, n, n, kv, LogitRows::Last))
+        .trace(
+            Phase::Prefill,
+            shape(1, n, n, kv, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
-    let opt = crate::test_support::optimize(&g).unwrap();
+    let opt = poot_graph_plan::passes_without_target(&g).unwrap();
 
     let flash_prefill = opt
         .eqns()
@@ -340,9 +406,10 @@ fn optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores() {
         .trace(
             Phase::PrefillEmbeds,
             shape(1, n, n, KvLayout::Contiguous, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
-    let opt = crate::test_support::optimize(&g).unwrap();
+    let opt = poot_graph_plan::passes_without_target(&g).unwrap();
 
     let flash_prefill = opt
         .eqns()
@@ -373,7 +440,13 @@ fn optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores() {
 fn cse_only_leaves_naive_materialized_scores() {
     let n = 2048usize;
     let m = model("qwen2", |c| c["max_position_embeddings"] = 4096.into());
-    let g = m.trace(Phase::Prefill, contiguous(1, n, n)).unwrap();
+    let g = m
+        .trace(
+            Phase::Prefill,
+            contiguous(1, n, n),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     let g = poot_graph_plan::cse(&g).unwrap();
     let has_naive_scores = g.eqns().iter().any(|e| {
         matches!(e.op, OpKind::MatMul) && g.aval(e.out).shape.iter().product::<usize>() >= n * n
@@ -406,9 +479,21 @@ fn olmo2_prefill_traces_with_state_pairs() {
     // the olmo2 batched prefill must carry the same state pairs (names, order, shapes) as its
     // decode, so the filled cache drops into that decode loop (card 190).
     let m = fixture_model("olmo2");
-    let g = m.trace(Phase::Prefill, contiguous(1, 5, 16)).unwrap();
+    let g = m
+        .trace(
+            Phase::Prefill,
+            contiguous(1, 5, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     assert_contiguous_state(&g, "olmo2", 1, 16);
-    let decode = m.trace(Phase::Decode, contiguous(1, 1, 16)).unwrap();
+    let decode = m
+        .trace(
+            Phase::Decode,
+            contiguous(1, 1, 16),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     let shapes = |g: &Graph| -> Vec<Vec<usize>> {
         g.state().map(|(si, _)| g.aval(si).shape.clone()).collect()
     };
@@ -658,7 +743,11 @@ mod vl {
         state: &[Vec<f32>],
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let g = model
-            .trace(phase, step_shape(tokens.len(), CAP, LogitRows::All))
+            .trace(
+                phase,
+                step_shape(tokens.len(), CAP, LogitRows::All),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let zeros = state
             .is_empty()
@@ -767,6 +856,7 @@ mod vl {
             .trace(
                 Phase::Prefill,
                 step_shape(PROMPT.len(), CAP, LogitRows::All),
+                poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
         let zeros: Vec<Vec<f32>> = g

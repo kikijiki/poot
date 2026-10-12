@@ -24,7 +24,6 @@ use poot_quant::format::{OperandRole, ScaleEncoding, WeightFormat};
 use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
 use poot_quant::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
 
-use crate::chat::ChatFormat;
 use crate::components::linear::WeightError;
 use crate::components::moe;
 use crate::components::standard::{Step, check_step};
@@ -33,18 +32,19 @@ use crate::model::{
     TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 mod config;
 mod gated_residual;
 mod qsa;
 mod trace;
 
-pub use config::Qwen4ExpParams;
+pub(crate) use config::Qwen4ExpParams;
 
 #[cfg(test)]
 mod tests;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("qwen4exp");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen4exp");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -56,7 +56,7 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
 
 /// One layer's mixer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayerKind {
+pub(crate) enum LayerKind {
     /// Gated DeltaNet linear attention.
     LinearAttention,
     /// Gated attention under the QSA block selection.
@@ -64,7 +64,7 @@ pub enum LayerKind {
 }
 
 #[derive(Debug)]
-pub struct Qwen4Exp {
+pub(crate) struct Qwen4Exp {
     params: Qwen4ExpParams,
     weights: WeightMap,
     body: trace::Weights,
@@ -105,7 +105,7 @@ impl Model for Qwen4Exp {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
@@ -120,9 +120,8 @@ impl Model for Qwen4Exp {
                 reason: ShapeReason::Granule { granule },
             });
         }
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
-        let logits = trace::trace_step(&b, &step, &self.body, p);
+        let step = Step::new(&b, shape)?;
+        let logits = trace::trace_step(&b, &step, &self.body, p)?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -187,7 +186,7 @@ pub(crate) enum Experts {
 /// stored form `experts` names.
 pub(crate) fn hf_shapes(config: &serde_json::Value, experts: Experts) -> Vec<(String, Vec<usize>)> {
     let text = &config["text_config"];
-    let n = |f: &str| text[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(text, f);
     let params = Qwen4ExpParams::from_raw(&RawConfig::HfJson {
         config,
         generation: None,
@@ -353,7 +352,7 @@ fn packed_fixture() -> Fixture {
     let config = fixture_config();
     let base = Fixture::bf16(config.clone(), hf_shapes(&config, Experts::PackedE4m3));
     let text = &config["text_config"];
-    let n = |f: &str| text[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(text, f);
     let (w, inter, experts) = (
         n("hidden_size"),
         n("moe_intermediate_size"),

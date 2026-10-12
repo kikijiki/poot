@@ -10,15 +10,17 @@ use crate::types::{DType, Scalar, TensorType};
 const UPPER: usize = 4;
 
 fn i32_input(builder: &Builder, name: &str, shape: Vec<usize>) -> Traced {
-    builder.constant(name, TensorType::new(shape, DType::I32))
+    builder
+        .constant(name, TensorType::new(shape, DType::I32))
+        .unwrap()
 }
 
 /// A graph whose primary output is the guarded selector and whose only validation output is the witness.
 fn guarded_graph() -> (crate::Graph, ValueId, ValueId, ValueId) {
-    let builder = Builder::new();
+    let builder = Builder::for_tests();
     let raw = i32_input(&builder, "raw", vec![4]);
     let guard = builder.guard_index_bounds(raw, UPPER).unwrap();
-    let graph = crate::test_support::finish_with_validations(
+    let graph = crate::test_support::graph_fixtures::finish_with_validations(
         builder,
         guard.guarded,
         &[(ValidationId(7), "bounds", guard.witness)],
@@ -92,8 +94,8 @@ fn guard_helper_emits_the_documented_chain() {
 
 #[test]
 fn guard_helper_rejects_a_selector_it_cannot_guard() {
-    let builder = Builder::new();
-    let float = builder.constant("x", TensorType::f32(vec![4]));
+    let builder = Builder::for_tests();
+    let float = builder.constant("x", TensorType::f32(vec![4])).unwrap();
     assert_eq!(
         builder.guard_index_bounds(float, UPPER).unwrap_err(),
         IndexGuardError::RawNotI32 {
@@ -115,4 +117,71 @@ fn guard_helper_rejects_a_selector_it_cannot_guard() {
             upper_exclusive: usize::MAX
         }
     );
+}
+
+/// The recognizer reads exactly what the emitter writes: the witness of the emitted guard observes its
+/// invalid flag, and observes no other value.
+///
+/// Mutation (never left in the tree): make `emit_index_guard` reduce with `keepdim: false`; the first
+/// assertion goes red.
+#[test]
+fn the_recognizer_accepts_the_emitted_witness_and_only_that_one() {
+    let (graph, raw, guarded, witness) = guarded_graph();
+    let producers: std::collections::HashMap<ValueId, usize> = graph
+        .eqns()
+        .iter()
+        .enumerate()
+        .map(|(index, eqn)| (eqn.out, index))
+        .collect();
+    let Operand::Value(invalid) = producer(&graph, guarded).inputs[0] else {
+        panic!("the Select reads its condition as a value")
+    };
+    assert!(is_guard_witness(&graph, &producers, witness, invalid));
+    assert!(!is_guard_witness(&graph, &producers, witness, raw));
+    assert!(!is_guard_witness(&graph, &producers, guarded, invalid));
+}
+
+/// The graph-level emitter writes the five equations in order, ends on the witness, and surfaces a sink
+/// that refuses an equation as `Emit`, never a panic.
+#[test]
+fn the_emitter_orders_its_equations_and_surfaces_a_refusing_sink() {
+    #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+    #[error("sink full")]
+    struct Full;
+
+    let raw = ValueId::new(0);
+    let ty = TensorType::new(vec![4], DType::I32);
+    let mut ops = Vec::new();
+    let values = emit_index_guard::<Full>(raw, &ty, UPPER, |op, _| {
+        ops.push(op);
+        Ok(ValueId::new(ops.len() as u32))
+    })
+    .unwrap();
+    assert_eq!(values.witness, ValueId::new(5));
+    assert_eq!(values.guarded, ValueId::new(3));
+    assert!(matches!(
+        ops.as_slice(),
+        [
+            OpKind::Binary(BinOp::GeU),
+            OpKind::Binary(BinOp::Sub),
+            OpKind::Select,
+            OpKind::Cast { to: DType::F32 },
+            OpKind::Reduce {
+                op: RedOp::Sum,
+                keepdim: true,
+                ..
+            }
+        ]
+    ));
+
+    let mut accepted = 0u32;
+    let refused = emit_index_guard(raw, &ty, UPPER, |_, _| {
+        accepted += 1;
+        if accepted == 3 {
+            Err(Full)
+        } else {
+            Ok(ValueId::new(accepted))
+        }
+    });
+    assert_eq!(refused, Err(IndexGuardEmitError::Emit(Full)));
 }

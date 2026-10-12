@@ -1,6 +1,6 @@
 use poot_graph_ir::graph::ComputedConst;
 
-use super::*;
+use super::{EditError, Eqn, Graph, HashMap, Operand, Storage, ValueId, with_eqns};
 use poot_graph_ir::ValueTable;
 
 /// Common-subexpression elimination: collapse structurally identical eqns (same op + same operands)
@@ -14,6 +14,13 @@ use poot_graph_ir::ValueTable;
 ///
 /// The rest of the value table is preserved (dead entries are harmless); the eqn list shrinks and the
 /// output is remapped to its canonical value.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn cse(g: &Graph) -> Result<Graph, EditError> {
     let mut remap: HashMap<ValueId, ValueId> = HashMap::new(); // old value id -> canonical id
     let mut computed: HashMap<ComputedConst, ValueId> = HashMap::new();
@@ -63,6 +70,13 @@ pub fn cse(g: &Graph) -> Result<Graph, EditError> {
 
 /// Dead-code elimination: drop eqns whose output is never (transitively) used by the graph output.
 /// Eqns are topologically ordered, so a single reverse liveness sweep suffices.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn dce(g: &Graph) -> Result<Graph, EditError> {
     dce_with_roots(g, &[])
 }
@@ -71,7 +85,7 @@ pub fn dce(g: &Graph) -> Result<Graph, EditError> {
 ///
 /// Extra roots are a transform hint only. They do not change [`Graph::output`] or carried-state
 /// semantics and must be re-proved by the caller after this pass.
-pub fn dce_with_roots(g: &Graph, extra_roots: &[ValueId]) -> Result<Graph, EditError> {
+pub(crate) fn dce_with_roots(g: &Graph, extra_roots: &[ValueId]) -> Result<Graph, EditError> {
     let mut live = ValueTable::filled(g.values().len(), false);
     for root in g.liveness_roots() {
         live[root] = true;

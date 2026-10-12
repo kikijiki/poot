@@ -21,13 +21,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::packed::packed_consumer_map;
-use super::*;
-use poot_graph_ir::ContractionRows;
-use poot_graph_ir::ValueTable;
+use super::{EditError, Eqn, Graph, OpKind, Operand, Storage, ValueId, ValueMeta};
 use poot_graph_ir::packed_source::{
     PackedSourceName, packed_source_type, packed_stack_source_constants,
 };
 use poot_graph_ir::types::TensorType;
+use poot_graph_ir::{ContractionRows, ValueTable};
 use poot_quant::weights::{HandleFormat, WeightMap, WeightView};
 use poot_tensor::DType;
 
@@ -371,6 +370,9 @@ fn expert_stack_use(
 
 #[cfg(test)]
 mod tests {
+    use crate::passes::BinOp;
+    use crate::passes::reject_packed_dequant_escapes;
+    use crate::{recognize_packed_contractions, recognize_packed_row_gathers};
     use poot_quant::format::WeightFormat;
     use poot_quant::{PackedWeight, SourceRole};
 
@@ -408,10 +410,12 @@ mod tests {
     /// an input. Mutation: bind a `Columns` constant without its transpose; the claim finds nothing.
     #[test]
     fn a_packed_projection_binds_to_the_claimable_contraction_chain() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 64]));
-        let w = b.constant("layer.weight", TensorType::f32(vec![64, 8]));
-        let y = b.matmul(x, w);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 64])).unwrap();
+        let w = b
+            .constant("layer.weight", TensorType::f32(vec![64, 8]))
+            .unwrap();
+        let y = b.matmul(x, w).unwrap();
         let g = b.finish(y).unwrap();
         let bound = bind_packed_weights(&g, &formats(&[("layer.weight", column(8, 64))])).unwrap();
         assert_eq!(
@@ -451,7 +455,8 @@ mod tests {
             WeightId::layer(0, WeightRole::Attn(AttnRole::Q)),
             WeightId::layer(0, WeightRole::Attn(AttnRole::K)),
         );
-        let payload = poot_test_util::packed::random_payload(WeightFormat::Q8_0, [8, 64], 3);
+        let payload =
+            poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [8, 64], 3);
         let mut store = WeightStore::builder();
         store
             .insert("q", WeightEntry::Packed(std::sync::Arc::new(payload)))
@@ -475,10 +480,12 @@ mod tests {
             ["w.l0.attn.q"]
         );
 
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 64]));
-        let w = b.constant(&q.const_name(), TensorType::f32(vec![8, 64]));
-        let y = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 64])).unwrap();
+        let w = b
+            .constant(&q.const_name(), TensorType::f32(vec![8, 64]))
+            .unwrap();
+        let y = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         let bound = bind_packed_weights(&b.finish(y).unwrap(), &formats).unwrap();
         assert_eq!(
             ops(&bound),
@@ -497,11 +504,13 @@ mod tests {
     /// of the bias) keeps its bias outside the claimed contraction, the output keeping its value id.
     #[test]
     fn a_biased_packed_projection_keeps_its_bias_outside_the_contraction() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 64]));
-        let w = b.constant("layer.weight", TensorType::f32(vec![64, 8]));
-        let bias = b.constant("layer.bias", TensorType::f32(vec![8]));
-        let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 64])).unwrap();
+        let w = b
+            .constant("layer.weight", TensorType::f32(vec![64, 8]))
+            .unwrap();
+        let bias = b.constant("layer.bias", TensorType::f32(vec![8])).unwrap();
+        let y = poot_graph_ir::ops::linear(&b, x, w, Some(bias)).unwrap();
         let g = b.finish(y).unwrap();
         let bound = bind_packed_weights(&g, &formats(&[("layer.weight", column(8, 64))])).unwrap();
         assert_eq!(bound.result(), g.result());
@@ -529,9 +538,11 @@ mod tests {
     /// and the escape gate (`compile`'s) refuses it rather than materializing the whole decode.
     #[test]
     fn a_packed_weight_read_outside_a_contraction_is_left_for_the_gate() {
-        let b = Builder::new();
-        let w = b.constant("layer.weight", TensorType::f32(vec![64, 8]));
-        let y = b.unary(poot_graph_ir::op::UnOp::Exp, w);
+        let b = Builder::for_tests();
+        let w = b
+            .constant("layer.weight", TensorType::f32(vec![64, 8]))
+            .unwrap();
+        let y = b.unary(poot_graph_ir::op::UnOp::Exp, w).unwrap();
         let g = b.finish(y).unwrap();
         let bound = bind_packed_weights(&g, &formats(&[("layer.weight", column(8, 64))])).unwrap();
         let claimed =
@@ -543,13 +554,17 @@ mod tests {
     /// over it is the row-gather claim's shape.
     #[test]
     fn a_packed_embedding_binds_to_the_claimable_row_gather() {
-        let b = Builder::new();
-        let ids = b.slot(
-            poot_graph_ir::Slot::Token,
-            TensorType::new(vec![3], poot_tensor::DType::I32),
-        );
-        let table = b.constant("embed.weight", TensorType::f32(vec![16, 64]));
-        let rows = b.gather(table, 0, ids);
+        let b = Builder::for_tests();
+        let ids = b
+            .slot(
+                poot_graph_ir::Slot::Token,
+                TensorType::new(vec![3], poot_tensor::DType::I32),
+            )
+            .unwrap();
+        let table = b
+            .constant("embed.weight", TensorType::f32(vec![16, 64]))
+            .unwrap();
+        let rows = b.gather(table, 0, ids).unwrap();
         let g = b.finish(rows).unwrap();
         let bound = bind_packed_weights(
             &g,
@@ -581,11 +596,17 @@ mod tests {
     #[test]
     fn a_packed_expert_stack_binds_to_one_indexed_contraction() {
         for experts in [1usize, 2] {
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32(vec![3, 64]));
-            let sel = b.constant("sel", TensorType::new(vec![3], DType::I32));
-            let w = b.constant("experts.weight", TensorType::f32(vec![experts, 8, 64]));
-            let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), sel);
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![3, 64])).unwrap();
+            let sel = b
+                .constant("sel", TensorType::new(vec![3], DType::I32))
+                .unwrap();
+            let w = b
+                .constant("experts.weight", TensorType::f32(vec![experts, 8, 64]))
+                .unwrap();
+            let y = b
+                .indexed_matmul(x, b.transpose(w, vec![0, 2, 1]).unwrap(), sel)
+                .unwrap();
             let g = b.finish(y).unwrap();
             let bound = bind_packed_weights(&g, &formats(&[("experts.weight", stack(experts))]))
                 .unwrap_or_else(|error| panic!("{experts} experts: {error}"));
@@ -659,37 +680,51 @@ mod tests {
             ),
         };
         let build = |f: &dyn Fn(&Builder, Traced, Traced, Traced) -> Traced| {
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32(vec![3, 64]));
-            let sel = b.constant("sel", TensorType::new(vec![3], DType::I32));
-            let w = b.constant("experts.weight", TensorType::f32(vec![2, 64, 64]));
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![3, 64])).unwrap();
+            let sel = b
+                .constant("sel", TensorType::new(vec![3], DType::I32))
+                .unwrap();
+            let w = b
+                .constant("experts.weight", TensorType::f32(vec![2, 64, 64]))
+                .unwrap();
             let y = f(&b, x, sel, w);
             b.finish(y).unwrap()
         };
         // No transpose: the stack `[E, out, K]` read where the matmul wants `[E, K, out]`.
-        let g = build(&|b, x, sel, w| b.indexed_matmul(x, b.transpose(w, vec![0, 1, 2]), sel));
+        let g = build(&|b, x, sel, w| {
+            b.indexed_matmul(x, b.transpose(w, vec![0, 1, 2]).unwrap(), sel)
+                .unwrap()
+        });
         assert!(matches!(
             refusal(&g),
             ExpertStackRefusal::NotTransposed { .. }
         ));
         // A second consumer of the stack.
         let g = build(&|b, x, sel, w| {
-            let y = b.indexed_matmul(x, b.transpose(w, vec![0, 2, 1]), sel);
-            b.concat(0, &[y, b.reduce(RedOp::Sum, w, 0, false)])
+            let y = b
+                .indexed_matmul(x, b.transpose(w, vec![0, 2, 1]).unwrap(), sel)
+                .unwrap();
+            b.concat(0, &[y, b.reduce(RedOp::Sum, w, 0, false).unwrap()])
+                .unwrap()
         });
         assert_eq!(refusal(&g), ExpertStackRefusal::Consumers { consumers: 2 });
         // A second consumer of the transposed table.
         let g = build(&|b, x, sel, w| {
-            let wt = b.transpose(w, vec![0, 2, 1]);
-            let y = b.indexed_matmul(x, wt, sel);
-            b.concat(0, &[y, b.reduce(RedOp::Sum, wt, 0, false)])
+            let wt = b.transpose(w, vec![0, 2, 1]).unwrap();
+            let y = b.indexed_matmul(x, wt, sel).unwrap();
+            b.concat(0, &[y, b.reduce(RedOp::Sum, wt, 0, false).unwrap()])
+                .unwrap()
         });
         assert_eq!(
             refusal(&g),
             ExpertStackRefusal::TransposeConsumers { consumers: 2 }
         );
         // A transposed table read by something that is not an indexed matmul.
-        let g = build(&|b, _, _, w| b.reduce(RedOp::Sum, b.transpose(w, vec![0, 2, 1]), 1, false));
+        let g = build(&|b, _, _, w| {
+            b.reduce(RedOp::Sum, b.transpose(w, vec![0, 2, 1]).unwrap(), 1, false)
+                .unwrap()
+        });
         assert!(matches!(refusal(&g), ExpertStackRefusal::NotIndexed { .. }));
     }
 
@@ -702,19 +737,25 @@ mod tests {
             weight: q8(8, 64),
             layout: PackedLayout::Columns,
         };
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 8]));
-        let w = b.constant("layer.weight", TensorType::f32(vec![8, 64]));
-        let y = b.matmul(x, w);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 8])).unwrap();
+        let w = b
+            .constant("layer.weight", TensorType::f32(vec![8, 64]))
+            .unwrap();
+        let y = b.matmul(x, w).unwrap();
         let g = b.finish(y).unwrap();
         assert!(matches!(
             bind_packed_weights(&g, &formats(&[("layer.weight", packed.clone())])),
             Err(PackedBindError::Shape { ref name, .. }) if name == "layer.weight"
         ));
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![2, 64], DType::BF16));
-        let w = b.constant("layer.weight", TensorType::new(vec![64, 8], DType::BF16));
-        let y = b.matmul(x, w);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![2, 64], DType::BF16))
+            .unwrap();
+        let w = b
+            .constant("layer.weight", TensorType::new(vec![64, 8], DType::BF16))
+            .unwrap();
+        let y = b.matmul(x, w).unwrap();
         let g = b.finish(y).unwrap();
         assert!(matches!(
             bind_packed_weights(&g, &formats(&[("layer.weight", packed)])),

@@ -7,8 +7,19 @@ use poot_tensor::DType;
 
 use crate::Value;
 
-/// A caller hook into one evaluation. Both methods default to doing nothing, so a caller that only
-/// wants `allocation` (an accounting test) need not implement `value`, and vice versa.
+/// What the walk hands the caller once validation has passed: the one set of copies that leave the walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Publication {
+    /// The graph's primary result.
+    Output(ValueId),
+    /// A carried state output.
+    State(ValueId),
+    /// The whole environment, under `EvalOptions::keep_environment`.
+    Environment,
+}
+
+/// A caller hook into one evaluation. Every method defaults to doing nothing, so a caller that only
+/// wants `allocation` (an accounting test) need not implement the others.
 pub trait EvalObserver {
     /// An equation's output was reserved: `eqn` is its position in `Graph::eqns`, `out` its value id.
     ///
@@ -33,6 +44,12 @@ pub trait EvalObserver {
     /// refuses to publish anything.
     fn value(&mut self, eqn: usize, out: ValueId, value: &Value) {
         let _ = (eqn, out, value);
+    }
+
+    /// A value was copied out into the caller-visible result. Fires only after the validation gate
+    /// passed (ADR-0090), so a failed validation reports no publication.
+    fn published(&mut self, publication: Publication) {
+        let _ = publication;
     }
 }
 

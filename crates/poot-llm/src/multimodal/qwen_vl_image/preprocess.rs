@@ -275,14 +275,6 @@ pub(super) fn validate_decoded_dimensions(
     Ok(expected)
 }
 
-/// Preprocess and concatenate a nonempty ordered image list with the released defaults.
-#[cfg(test)]
-pub(crate) fn preprocess_qwen2_5_vl_images(
-    images: &[Qwen25VlDecodedImage],
-) -> Result<Qwen25VlProcessedImages, Qwen25VlImagePreprocessError> {
-    preprocess_qwen2_5_vl_images_with_config(images, &Qwen25VlImageProcessorConfig::default())
-}
-
 /// Preprocess and concatenate a nonempty ordered image list with one validated configuration.
 pub fn preprocess_qwen2_5_vl_images_with_config(
     images: &[Qwen25VlDecodedImage],
@@ -336,21 +328,6 @@ pub fn preprocess_qwen2_5_vl_images_with_config(
     })
 }
 
-/// Sample, decode, and preprocess one raw video with the released processor defaults.
-#[cfg(test)]
-pub(crate) fn preprocess_qwen2_5_vl_raw_video<S: Qwen25VlDecodedFrameSource>(
-    metadata: Qwen25VlVideoMetadata<'_>,
-    requested_frames_per_second: MropeSampledFramesPerSecond,
-    source: &mut S,
-) -> Result<Qwen25VlSampledVideo, Qwen25VlRawVideoPreprocessError<S::Error>> {
-    preprocess_qwen2_5_vl_raw_video_with_config(
-        metadata,
-        requested_frames_per_second,
-        source,
-        &Qwen25VlImageProcessorConfig::default(),
-    )
-}
-
 /// Sample, decode, and preprocess one raw video with a validated processor configuration.
 pub fn preprocess_qwen2_5_vl_raw_video_with_config<S: Qwen25VlDecodedFrameSource>(
     metadata: Qwen25VlVideoMetadata<'_>,
@@ -381,19 +358,6 @@ pub fn preprocess_qwen2_5_vl_raw_video_with_config<S: Qwen25VlDecodedFrameSource
         sample_plan,
         processed_video,
     })
-}
-
-/// Preprocess one ordered nonempty sampled-frame sequence with the released defaults.
-#[cfg(test)]
-pub(crate) fn preprocess_qwen2_5_vl_video(
-    frames: &[Qwen25VlDecodedImage],
-    sampled_frames_per_second: MropeSampledFramesPerSecond,
-) -> Result<Qwen25VlProcessedVideo, Qwen25VlVideoPreprocessError> {
-    preprocess_qwen2_5_vl_video_with_config(
-        frames,
-        sampled_frames_per_second,
-        &Qwen25VlImageProcessorConfig::default(),
-    )
 }
 
 /// Preprocess one ordered nonempty sampled-frame sequence with a validated processor configuration.
@@ -929,4 +893,42 @@ fn process_rgb8_value(value: u8, channel: usize, config: &Qwen25VlImageProcessor
         processed = (processed - config.mean[channel]) / config.std[channel];
     }
     processed
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    /// Preprocess and concatenate a nonempty ordered image list with the released defaults.
+    pub(crate) fn preprocess_qwen2_5_vl_images(
+        images: &[Qwen25VlDecodedImage],
+    ) -> Result<Qwen25VlProcessedImages, Qwen25VlImagePreprocessError> {
+        preprocess_qwen2_5_vl_images_with_config(images, &Qwen25VlImageProcessorConfig::default())
+    }
+
+    /// Sample, decode, and preprocess one raw video with the released processor defaults.
+    pub(crate) fn preprocess_qwen2_5_vl_raw_video<S: Qwen25VlDecodedFrameSource>(
+        metadata: Qwen25VlVideoMetadata<'_>,
+        requested_frames_per_second: MropeSampledFramesPerSecond,
+        source: &mut S,
+    ) -> Result<Qwen25VlSampledVideo, Qwen25VlRawVideoPreprocessError<S::Error>> {
+        preprocess_qwen2_5_vl_raw_video_with_config(
+            metadata,
+            requested_frames_per_second,
+            source,
+            &Qwen25VlImageProcessorConfig::default(),
+        )
+    }
+
+    /// Preprocess one ordered nonempty sampled-frame sequence with the released defaults.
+    pub(crate) fn preprocess_qwen2_5_vl_video(
+        frames: &[Qwen25VlDecodedImage],
+        sampled_frames_per_second: MropeSampledFramesPerSecond,
+    ) -> Result<Qwen25VlProcessedVideo, Qwen25VlVideoPreprocessError> {
+        preprocess_qwen2_5_vl_video_with_config(
+            frames,
+            sampled_frames_per_second,
+            &Qwen25VlImageProcessorConfig::default(),
+        )
+    }
 }

@@ -1,5 +1,5 @@
 //! Atomic counters and workgroup atomic smoke kernels (this crate's own tests; the cross-block fence kernels are
-//! `poot_test_util::kernel_fixtures`).
+//! `poot_kernel_ir::test_support`).
 
 use crate::helpers::{copy, elem, ld, local, slice_dtype, slice_f32};
 use poot_kernel_ir::WorkgroupLocalDecl;
@@ -122,10 +122,10 @@ fn workgroup_compare_exchange_smoke(name: &str) -> Body {
 #[cfg(test)]
 mod tests {
     use poot_codegen::{Target, compile};
-    use poot_runtime::KernelBuffer;
+    use poot_wgpu_runtime::KernelBuffer;
 
     use super::*;
-    use crate::test_support::{ctx, ptx, spirv_word_count, spv, which};
+    use crate::unit_helpers::{ctx, ptx, spirv_word_count, spv, which};
 
     #[test]
     fn workgroup_local_atomic_compiles_to_both_backends() {

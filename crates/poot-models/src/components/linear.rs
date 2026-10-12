@@ -14,6 +14,7 @@ use poot_quant::weights::{HandleFormat, WeightHandle, WeightId, WeightMap, Weigh
 use poot_tensor::DType;
 
 use crate::model::{ConfigReason, FamilyKey, ModelError};
+use crate::model::{TraceError, WiringError};
 
 /// One weight a component reads: its typed id and handle, checked against the shape the component
 /// needs when it is made, so tracing with it cannot fail.
@@ -44,6 +45,9 @@ pub enum WeightError {
         field: &'static str,
         bound: usize,
     },
+    /// A layer kind needs a parameter block the config did not read.
+    #[error(transparent)]
+    Wiring(#[from] WiringError),
 }
 
 impl WeightError {
@@ -65,6 +69,7 @@ impl WeightError {
                 found,
             },
             WeightError::Format { id, format } => ModelError::WeightFormat { family, id, format },
+            WeightError::Wiring(source) => ModelError::Wiring { family, source },
             WeightError::IndexBound { field, bound, .. } => ModelError::Config {
                 family,
                 field,
@@ -134,39 +139,44 @@ impl Weight {
 
     /// Declare the weight as a graph const at its logical dtype: a dense entry's stored dtype, F32
     /// for a packed one (the packed-weight transform replaces the const with its decode).
-    pub fn declare(&self, b: &Builder) -> Traced {
+    pub fn declare(&self, b: &Builder) -> Result<Traced, TraceError> {
         let dtype = match self.handle.format {
             HandleFormat::Dense(dtype) => dtype,
             HandleFormat::Packed(_) => DType::F32,
         };
-        b.constant(
+        Ok(b.constant(
             &self.id.const_name(),
             TensorType::new(self.handle.shape.clone(), dtype),
-        )
+        )?)
     }
 
     /// Declare the weight read as F32 by elementwise arithmetic (a norm scale, a bias).
-    pub fn declare_f32(&self, b: &Builder) -> Traced {
-        let w = self.declare(b);
-        if b.aval(w).dtype == DType::F32 {
-            w
+    pub fn declare_f32(&self, b: &Builder) -> Result<Traced, TraceError> {
+        let w = self.declare(b)?;
+        if b.aval(w)?.dtype == DType::F32 {
+            Ok(w)
         } else {
-            b.cast(w, DType::F32)
+            Ok(b.cast(w, DType::F32)?)
         }
     }
 }
 
 /// `x @ w^T (+ bias)` for an `[out, in]` weight: `x` is `[.., in]`, the result `[.., out]`.
-pub fn linear(b: &Builder, x: Traced, w: &Weight, bias: Option<&Weight>) -> Traced {
-    let wt = b.transpose(w.declare(b), vec![1, 0]);
-    let y = b.matmul(x, wt);
+pub fn linear(
+    b: &Builder,
+    x: Traced,
+    w: &Weight,
+    bias: Option<&Weight>,
+) -> Result<Traced, TraceError> {
+    let wt = b.transpose(w.declare(b)?, vec![1, 0])?;
+    let y = b.matmul(x, wt)?;
     match bias {
         Some(bias) => {
-            let shape = b.aval(y).shape;
-            let bias = b.broadcast(bias.declare_f32(b), shape);
-            b.binary(BinOp::Add, y, bias)
+            let shape = b.aval(y)?.shape;
+            let bias = b.broadcast(bias.declare_f32(b)?, shape)?;
+            Ok(b.binary(BinOp::Add, y, bias)?)
         }
-        None => y,
+        None => Ok(y),
     }
 }
 
@@ -192,9 +202,9 @@ mod tests {
             let map = fx.map();
             let w = Weight::new(&map, w_id, &[n, k]).unwrap();
             let bias = Weight::new(&map, b_id, &[n]).unwrap();
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![m, k]));
-            let y = linear(&b, xs, &w, Some(&bias));
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+            let y = linear(&b, xs, &w, Some(&bias)).unwrap();
             let g = b.finish(y).unwrap();
             fx.eval(&g, &[("x", &x)], &[], &[]).0
         };
@@ -232,13 +242,13 @@ mod tests {
         let mut fx = Fx::new(1);
         fx.packed(
             id,
-            poot_test_util::packed::random_payload(WeightFormat::Q8_0, [n, k], 17),
+            poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [n, k], 17),
         );
         let map = fx.map();
         let w = Weight::new(&map, id, &[n, k]).unwrap();
-        let b = Builder::new();
-        let xs = b.constant("x", TensorType::f32(vec![m, k]));
-        let y = linear(&b, xs, &w, None);
+        let b = Builder::for_tests();
+        let xs = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+        let y = linear(&b, xs, &w, None).unwrap();
         let g = b.finish(y).unwrap();
         let declared = g.aval(g.inputs()[1]);
         assert_eq!(

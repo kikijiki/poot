@@ -12,9 +12,13 @@
 //! buffer and its signal (the device may still be reading it) and the context is poisoned, as for any
 //! other DMA ([`RocmContext::wait_completion_bounded`]).
 
+use crate::buffer::Pool;
+use crate::context::{Held, StagingBuffer};
+use crate::error::check;
 use std::ops::Range;
 
-use crate::*;
+use crate::{RocmContext, RocmError, bindings};
+use std::ffi::c_void;
 
 /// Slots in the ring.
 const RING_SLOTS: usize = 4;
@@ -65,18 +69,6 @@ impl Default for UploadRing {
 }
 
 impl UploadRing {
-    /// The pinned bytes the ring holds.
-    #[cfg(test)]
-    pub(crate) fn pinned_bytes(&self) -> usize {
-        self.slots
-            .iter()
-            .map(|slot| match slot {
-                SlotState::Ready(staging) | SlotState::Busy(staging, _) => staging.len(),
-                SlotState::Empty | SlotState::Abandoned => 0,
-            })
-            .sum()
-    }
-
     /// A slot whose copy was never proven complete must not free its pinned memory: if a drain failed,
     /// the staging buffers of the copies still in flight are leaked rather than dropped.
     pub(crate) fn forget_in_flight(&mut self) {
@@ -316,5 +308,23 @@ impl crate::owner::HsaRuntimeOwner {
                 },
             )
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl UploadRing {
+        /// The pinned bytes the ring holds.
+        pub(crate) fn pinned_bytes(&self) -> usize {
+            self.slots
+                .iter()
+                .map(|slot| match slot {
+                    SlotState::Ready(staging) | SlotState::Busy(staging, _) => staging.len(),
+                    SlotState::Empty | SlotState::Abandoned => 0,
+                })
+                .sum()
+        }
     }
 }

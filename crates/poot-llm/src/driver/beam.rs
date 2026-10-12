@@ -341,14 +341,15 @@ impl Driver {
         let graph = self
             .handle
             .model()
-            .trace(decode.phase, decode.shape)
+            .trace(decode.phase, decode.shape, self.options.trace)
             .map_err(Unsupported::Trace)?;
-        let graph = reorder::reorder_graph(&graph);
+        let graph = reorder::reorder_graph(&graph, self.options.trace)
+            .map_err(|error| Unsupported::RowGraph(Box::new(error)))?;
         let slots = Prepared::slots_of(&graph)?;
         let output = graph.aval(graph.result()).shape.clone();
         let program = self.compile(&graph, &self.options.decode.clone())?;
         let reservation = self.admit(&program)?;
-        let entry = self.add_entry(self.exe, &program, reservation, slots, output)?;
+        let entry = self.add_entry(self.exe, &program, reservation, slots, output, decode.phase)?;
         self.reorders.insert(rows, entry);
         Ok(())
     }

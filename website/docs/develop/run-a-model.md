@@ -71,8 +71,8 @@ poot has **three production backends** and a fourth, lower-priority one (`--back
 
 `poot-serve`, `poot-embed` and `poot-caption` take `--backend wgpu|rocm|ptx|vulkan|auto`; the benchmark runner
 takes `--backend ptx|rocm|wgpu` and has no raw Vulkan mode. Build ROCm with `--features rocm`. In
-library code you select the backend by wiring the matching executor crate (`poot-gpu`,
-`poot-rocm-gpu`, `poot-ptx-gpu`, or `poot-vulkan-device`). See [Picking a backend](../serve/choosing-a-backend.md) for
+library code you select the backend by wiring the matching executor crate (`poot-wgpu-device`,
+`poot-rocm-device`, `poot-ptx-device`, or `poot-vulkan-device`). See [Picking a backend](../serve/choosing-a-backend.md) for
 tradeoffs.
 
 :::note

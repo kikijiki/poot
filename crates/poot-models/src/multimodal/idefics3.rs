@@ -21,7 +21,6 @@ use poot_quant::weights::{
 };
 
 use crate::architectures::bert::{Projection, bidirectional_attention};
-use crate::chat::ChatFormat;
 use crate::components::dims::{Field, Fields};
 use crate::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
 use crate::components::linear::{Weight, WeightError, linear};
@@ -33,6 +32,7 @@ use crate::model::{
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 pub const FAMILY: FamilyKey = FamilyKey::new("idefics3_vision");
 
@@ -309,16 +309,22 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
 /// Pixel shuffle: `[rows, seq, embed]` over a square `grid x grid` patch grid to
 /// `[rows, seq / scale^2, embed * scale^2]`, grouping each `scale x scale` block of patches into the
 /// channel axis (idefics3's connector `pixel_shuffle`: view, permute, reshape).
-fn pixel_shuffle(b: &Builder, x: Traced, grid: usize, embed: usize, scale: usize) -> Traced {
-    let rows = b.aval(x).shape[0];
+fn pixel_shuffle(
+    b: &Builder,
+    x: Traced,
+    grid: usize,
+    embed: usize,
+    scale: usize,
+) -> Result<Traced, TraceError> {
+    let rows = b.aval(x)?.shape[0];
     let s = scale;
     // Regroup each row of the grid, `[w, embed]`, into `[w / s, embed * s]`.
-    let x = b.reshape(x, vec![rows, grid, grid / s, embed * s]);
-    let x = b.transpose(x, vec![0, 2, 1, 3]);
+    let x = b.reshape(x, vec![rows, grid, grid / s, embed * s])?;
+    let x = b.transpose(x, vec![0, 2, 1, 3])?;
     // Then regroup each column the same way and bring the grid axes back to reading order.
-    let x = b.reshape(x, vec![rows, grid / s, grid / s, embed * s * s]);
-    let x = b.transpose(x, vec![0, 2, 1, 3]);
-    b.reshape(x, vec![rows, grid * grid / (s * s), embed * s * s])
+    let x = b.reshape(x, vec![rows, grid / s, grid / s, embed * s * s])?;
+    let x = b.transpose(x, vec![0, 2, 1, 3])?;
+    Ok(b.reshape(x, vec![rows, grid * grid / (s * s), embed * s * s])?)
 }
 
 impl Model for Idefics3Vision {
@@ -330,7 +336,7 @@ impl Model for Idefics3Vision {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         if phase != Phase::Encode {
             return Err(TraceError::PhaseUnsupported {
@@ -345,7 +351,6 @@ impl Model for Idefics3Vision {
                 reason: ShapeReason::CapacityAboveMax { max: p.patches() },
             });
         }
-        let b = Builder::new();
         let rows = shape.rows.get();
         let (c, s, patch) = (p.channels, p.image_size, p.patch_size);
         let grid = s / patch;
@@ -353,52 +358,55 @@ impl Model for Idefics3Vision {
             Slot::Activation,
             PIXELS_SLOT,
             TensorType::f32(vec![rows, c, s, s]),
-        );
+        )?;
         // The strided convolution as an im2col: each patch flattened in `[channel, i, j]` order, the
         // convolution weight's own layout, then one projection.
-        let split = b.reshape(pixels, vec![rows, c, grid, patch, grid, patch]);
+        let split = b.reshape(pixels, vec![rows, c, grid, patch, grid, patch])?;
         let patches = b.reshape(
-            b.transpose(split, vec![0, 2, 4, 1, 3, 5]),
+            b.transpose(split, vec![0, 2, 4, 1, 3, 5])?,
             vec![rows, grid * grid, c * patch * patch],
-        );
-        let conv = b.reshape(self.patch.declare_f32(&b), vec![p.width, c * patch * patch]);
-        let embedded = b.matmul(patches, b.transpose(conv, vec![1, 0]));
+        )?;
+        let conv = b.reshape(
+            self.patch.declare_f32(&b)?,
+            vec![p.width, c * patch * patch],
+        )?;
+        let embedded = b.matmul(patches, b.transpose(conv, vec![1, 0])?)?;
         let embedded = b.binary(
             BinOp::Add,
             embedded,
             b.broadcast(
-                self.patch_bias.declare_f32(&b),
+                self.patch_bias.declare_f32(&b)?,
                 vec![rows, grid * grid, p.width],
-            ),
-        );
+            )?,
+        )?;
         let positions = b.broadcast(
-            self.positions.declare_f32(&b),
+            self.positions.declare_f32(&b)?,
             vec![rows, grid * grid, p.width],
-        );
-        let mut x = b.binary(BinOp::Add, embedded, positions);
+        )?;
+        let mut x = b.binary(BinOp::Add, embedded, positions)?;
         for (l, layer) in self.layers.iter().enumerate() {
             let _scope = b.layer_scope(l);
             let attn = bidirectional_attention(
                 &b,
-                norm_with(&b, x, &layer.norms.attn, p.norm),
+                norm_with(&b, x, &layer.norms.attn, p.norm)?,
                 [&layer.q, &layer.k, &layer.v, &layer.o],
                 (p.heads, p.head_dim),
                 None,
-            );
-            x = b.binary(BinOp::Add, x, attn);
+            )?;
+            x = b.binary(BinOp::Add, x, attn)?;
             let ffn = plain_mlp(
                 &b,
-                norm_with(&b, x, &layer.norms.ffn, p.norm),
+                norm_with(&b, x, &layer.norms.ffn, p.norm)?,
                 &layer.ffn,
                 p.gelu,
-            );
-            x = b.binary(BinOp::Add, x, ffn);
+            )?;
+            x = b.binary(BinOp::Add, x, ffn)?;
         }
-        let features = norm_with(&b, x, &self.post_norm, p.norm);
-        let shuffled = pixel_shuffle(&b, features, grid, p.width, p.scale);
-        let visual = linear(&b, shuffled, &self.connector, None);
+        let features = norm_with(&b, x, &self.post_norm, p.norm)?;
+        let shuffled = pixel_shuffle(&b, features, grid, p.width, p.scale)?;
+        let visual = linear(&b, shuffled, &self.connector, None)?;
         debug_assert_eq!(
-            b.aval(visual).shape,
+            b.aval(visual)?.shape,
             vec![rows, p.visual_tokens(), p.text_width]
         );
         // The tower is stateless: the graph carries nothing to the next step.
@@ -427,7 +435,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 fn fixture() -> Fixture {
     let config = fixture_config();
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(&config, f);
     let (w, inter, c, patch) = (
         n("hidden_size"),
         n("intermediate_size"),
@@ -644,7 +652,13 @@ mod tests {
     }
 
     fn run(model: &dyn Model, store: &WeightStore, rows: usize, pixels: &[f32]) -> Vec<f32> {
-        let g = model.trace(Phase::Encode, encode_shape(rows, 16)).unwrap();
+        let g = model
+            .trace(
+                Phase::Encode,
+                encode_shape(rows, 16),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         oracle::eval_slots(
             &g,
             store,
@@ -687,11 +701,19 @@ mod tests {
         let fx = fixture();
         let model = built(&ENTRY, &fx.raw(), &fx.store);
         assert!(matches!(
-            model.trace(Phase::Encode, encode_shape(1, 15)),
+            model.trace(
+                Phase::Encode,
+                encode_shape(1, 15),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, encode_shape(1, 16)),
+            model.trace(
+                Phase::Prefill,
+                encode_shape(1, 16),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::PhaseUnsupported {
                 phase: Phase::Prefill,
                 ..

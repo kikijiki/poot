@@ -24,8 +24,13 @@ bytemuck.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+poot-kernelgen.workspace = true
+poot-graph-plan = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+poot-codegen = { workspace = true, features = ["test-support"] }
 # SC-024's two-distinct-bodies-same-display-key fixture: ready-made Body constructors, nothing else.
-poot-test-util = { workspace = true, features = ["kernel-fixtures", "graph-fixtures"] }
+poot-test-util.workspace = true
 
 [lints]
 workspace = true

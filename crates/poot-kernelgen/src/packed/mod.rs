@@ -25,10 +25,10 @@ mod float_decode_tests {
     //! (tier 1, GPU-free).
 
     use poot_kernel_ir::interp::{Buffer, run};
+    use poot_kernel_ir::test_support::workgroups_covering;
     use poot_kernel_ir::{BasicBlock, Body, Operand, Rvalue, Terminator, Ty};
     use poot_quant::format::FloatFormat;
     use poot_quant::scalar::float_to_f32;
-    use poot_test_util::kernel_fixtures::workgroups_covering;
 
     use super::float_decode::emit_float_decode;
     use crate::emit::{Emit, copy, cu};
@@ -571,7 +571,7 @@ mod row_gather_tests {
     //! selects the same rows `poot_quant::plan::decode_blocks` decodes (tier 1, GPU-free).
 
     use poot_kernel_ir::interp::{Buffer, run};
-    use poot_test_util::kernel_fixtures::workgroups_covering;
+    use poot_kernel_ir::test_support::workgroups_covering;
 
     use super::fixtures::{BLOCK32, KQUANT, fixture, pack_words};
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
@@ -634,8 +634,8 @@ mod row_gather_tests {
                 op: PackedKernelOp::RowGather,
             };
             let body = packed_kernel(&format!("row_gather_kquant_{format:?}"), spec).unwrap();
-            let _ = crate::test_support::spv(&body, &format!("row_gather_kquant_{format:?}_spv"));
-            let _ = crate::test_support::ptx(&body, &format!("row_gather_kquant_{format:?}_ptx"));
+            let _ = crate::unit_helpers::spv(&body, &format!("row_gather_kquant_{format:?}_spv"));
+            let _ = crate::unit_helpers::ptx(&body, &format!("row_gather_kquant_{format:?}_ptx"));
         }
     }
 
@@ -663,7 +663,7 @@ mod row_gather_tests {
     #[test]
     fn row_gather_matches_decode_blocks_rows_on_wgpu_kquant() {
         use poot_codegen::{Target, artifact_path, compile, kernel_handle};
-        use poot_runtime::{Context, KernelBuffer};
+        use poot_wgpu_runtime::{Context, KernelBuffer};
 
         let ctx = match Context::new() {
             Ok(ctx) => ctx,
@@ -790,8 +790,8 @@ mod row_gather_tests {
                 op: PackedKernelOp::RowGather,
             };
             let body = packed_kernel(&format!("row_gather_{format:?}"), spec).unwrap();
-            let _ = crate::test_support::spv(&body, &format!("row_gather_{format:?}_spv"));
-            let _ = crate::test_support::ptx(&body, &format!("row_gather_{format:?}_ptx"));
+            let _ = crate::unit_helpers::spv(&body, &format!("row_gather_{format:?}_spv"));
+            let _ = crate::unit_helpers::ptx(&body, &format!("row_gather_{format:?}_ptx"));
         }
     }
 
@@ -821,7 +821,7 @@ mod row_gather_tests {
     #[test]
     fn row_gather_matches_decode_blocks_rows_on_wgpu() {
         use poot_codegen::{Target, artifact_path, compile, kernel_handle};
-        use poot_runtime::{Context, KernelBuffer};
+        use poot_wgpu_runtime::{Context, KernelBuffer};
 
         let ctx = match Context::new() {
             Ok(ctx) => ctx,
@@ -898,7 +898,7 @@ mod contraction_tests {
     //! (wgpu/ROCm/PTX) are separate, real-hardware evidence (the card's final report).
 
     use poot_kernel_ir::interp::{Buffer, run};
-    use poot_test_util::kernel_fixtures::workgroups_covering;
+    use poot_kernel_ir::test_support::workgroups_covering;
 
     use super::fixtures::{
         BLOCK32, GEMV_SCHEDULES, KQUANT, assert_close, contraction_fixture, pack_words,
@@ -1263,8 +1263,8 @@ mod contraction_tests {
                 let body =
                     packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
                         .unwrap();
-                let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
-                let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
+                let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
+                let _ = crate::unit_helpers::ptx(&body, &format!("{name}_ptx"));
                 let dir = std::env::temp_dir()
                     .join("poot-kernelgen-unit-test")
                     .join(format!("{name}_amdgcn"));
@@ -1290,8 +1290,8 @@ mod contraction_tests {
                 let body =
                     packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
                         .unwrap();
-                let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
-                let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
+                let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
+                let _ = crate::unit_helpers::ptx(&body, &format!("{name}_ptx"));
                 let dir = std::env::temp_dir()
                     .join("poot-kernelgen-unit-test")
                     .join(format!("{name}_amdgcn"));
@@ -1309,8 +1309,8 @@ mod contraction_tests {
             let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
             let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
                 .unwrap();
-            let _ = crate::test_support::spv(&body, &format!("{name}_spv"));
-            let _ = crate::test_support::ptx(&body, &format!("{name}_ptx"));
+            let _ = crate::unit_helpers::spv(&body, &format!("{name}_spv"));
+            let _ = crate::unit_helpers::ptx(&body, &format!("{name}_ptx"));
             let dir = std::env::temp_dir()
                 .join("poot-kernelgen-unit-test")
                 .join(format!("{name}_amdgcn"));
@@ -1324,7 +1324,7 @@ mod contraction_tests {
     /// SC-005 (card 542a, device tier 2): `Contraction` (Gemv, blocks
     /// 1 and 2) is within tier-2 tolerance of the reference on the local wgpu (SPIR-V/RADV) device.
     fn run_wgpu_case(
-        ctx: &poot_runtime::Context,
+        ctx: &poot_wgpu_runtime::Context,
         format: poot_quant::format::WeightFormat,
         schedule: Schedule,
         blocks: usize,
@@ -1332,7 +1332,7 @@ mod contraction_tests {
         out_per_block: usize,
     ) {
         use poot_codegen::{Target, artifact_path, compile, kernel_handle};
-        use poot_runtime::KernelBuffer;
+        use poot_wgpu_runtime::KernelBuffer;
 
         let (k, bytes, activation, expected) =
             contraction_fixture(format, blocks, m_per_block, out_per_block);
@@ -1388,7 +1388,7 @@ mod contraction_tests {
 
     #[test]
     fn contraction_gemv_matches_reference_blocks_1_and_2_on_wgpu() {
-        let ctx = match poot_runtime::Context::new() {
+        let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
                 eprintln!("no GPU ({error}); skipping");
@@ -1405,7 +1405,7 @@ mod contraction_tests {
 
     #[test]
     fn contraction_gemv_matches_reference_blocks_1_and_2_on_wgpu_kquant() {
-        let ctx = match poot_runtime::Context::new() {
+        let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
                 eprintln!("no GPU ({error}); skipping");
@@ -1425,7 +1425,7 @@ mod contraction_tests {
     /// `contraction_tiled_matches_reference_aligned_and_ragged` (`blocks == 1` only; see its doc).
     #[test]
     fn contraction_tiled_matches_reference_aligned_and_ragged_on_wgpu() {
-        let ctx = match poot_runtime::Context::new() {
+        let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
                 eprintln!("no GPU ({error}); skipping");
@@ -1464,7 +1464,7 @@ mod contraction_tests {
     /// bounded and correct on real hardware.
     #[test]
     fn contraction_tiled_matches_reference_block_diagonal_ragged_on_wgpu() {
-        let ctx = match poot_runtime::Context::new() {
+        let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
                 eprintln!("no GPU ({error}); skipping");
@@ -1500,7 +1500,7 @@ mod contraction_tests {
     /// fold's second row (`GroupY == 1`), which the mutated body never reaches. Restored; green again.
     #[test]
     fn contraction_tiled_folded_grid_matches_reference_on_wgpu() {
-        let ctx = match poot_runtime::Context::new() {
+        let ctx = match poot_wgpu_runtime::Context::new() {
             Ok(ctx) => ctx,
             Err(error) => {
                 eprintln!("no GPU ({error}); skipping");
@@ -1545,10 +1545,10 @@ mod contraction_tests {
             let rows = blocks * m_per_block;
             let out_len = rows * out_per_block;
             let mut buffers = [
-                poot_runtime::KernelBuffer::read_only_f32(&activation),
-                poot_runtime::KernelBuffer::read_only_u32(&words),
-                poot_runtime::KernelBuffer::read_only_u32(&metadata),
-                poot_runtime::KernelBuffer::write_f32(out_len),
+                poot_wgpu_runtime::KernelBuffer::read_only_f32(&activation),
+                poot_wgpu_runtime::KernelBuffer::read_only_u32(&words),
+                poot_wgpu_runtime::KernelBuffer::read_only_u32(&metadata),
+                poot_wgpu_runtime::KernelBuffer::write_f32(out_len),
             ];
             let threads_x = x_groups * (ts * ts) as u32;
             ctx.dispatch(
@@ -1578,7 +1578,7 @@ mod planar_contraction_tests {
     //! counterpart of `contraction_tests`.
 
     use poot_kernel_ir::interp::{Buffer, run};
-    use poot_test_util::kernel_fixtures::workgroups_covering;
+    use poot_kernel_ir::test_support::workgroups_covering;
 
     use super::fixtures::{GEMV_SCHEDULES, assert_close};
     use super::kernel::packed_contraction;
@@ -1784,8 +1784,8 @@ mod rocm_tests {
     //! `poot-rocm-runtime`'s own device tests; run serial under `/tmp/poot-gpu.lock`.
 
     use poot_kernel_ir::Body;
-    use poot_rocm_runtime::{BufferRole, HsacoModule, RocmBuffer, RocmContext, RocmError};
-    use poot_runtime_common::CompiledKernel;
+    use poot_rocm_runtime::{HsacoModule, RocmBuffer, RocmContext, RocmError};
+    use poot_runtime_common::{BufferRole, CompiledKernel};
     use poot_target::ElementKind;
 
     use super::fixtures::{

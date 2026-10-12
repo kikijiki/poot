@@ -1,3 +1,4 @@
+use crate::multimodal::qwen_vl_image::config::PREPROCESSOR_CONFIG_FILE;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -11,11 +12,14 @@ use poot_models::mrope::{
 };
 use poot_tensor::HostTensor;
 
+use super::preprocess::test_only::{
+    preprocess_qwen2_5_vl_images, preprocess_qwen2_5_vl_raw_video, preprocess_qwen2_5_vl_video,
+};
 use super::*;
+use crate::multimodal::qwen_vl_mrope::tests::assemble_qwen2_5_vl_mrope_model_input_from_processor_media;
 use crate::multimodal::qwen_vl_mrope::{
     Qwen25VlMropeModelInputView, Qwen25VlProcessorMedia, Qwen25VlProcessorMediaKind,
     Qwen25VlProcessorMediaMropeModelInputRequest, QwenVlMropeMetadataLoadError,
-    assemble_qwen2_5_vl_mrope_model_input_from_processor_media,
 };
 
 /// One image through the batch preprocessing the request path runs, as the single image the

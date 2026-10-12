@@ -235,14 +235,6 @@ impl RegistryV2Resolver {
         })
     }
 
-    /// Loopback fixture origin; the image ref still names registry/repo/tag for path shape.
-    #[cfg(test)]
-    pub(crate) fn with_base(base: impl Into<String>) -> Result<Self, ImageResolveError> {
-        let mut this = Self::new()?;
-        this.base_override = Some(base.into().trim_end_matches('/').to_owned());
-        Ok(this)
-    }
-
     fn origin(&self, registry: &str) -> String {
         match &self.base_override {
             Some(base) => base.clone(),
@@ -670,5 +662,14 @@ mod tests {
             matches!(err, ImageResolveError::MissingDigestHeader { status: 200 }),
             "got {err:?}"
         );
+    }
+
+    impl RegistryV2Resolver {
+        /// Loopback fixture origin; the image ref still names registry/repo/tag for path shape.
+        pub(crate) fn with_base(base: impl Into<String>) -> Result<Self, ImageResolveError> {
+            let mut this = Self::new()?;
+            this.base_override = Some(base.into().trim_end_matches('/').to_owned());
+            Ok(this)
+        }
     }
 }

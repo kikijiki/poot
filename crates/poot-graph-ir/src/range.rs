@@ -43,6 +43,12 @@ impl IndexRange {
         hi_exclusive: i32::MAX as i64 + 1,
     };
 
+    /// The words `0` and `1`: an I32 flag (a real key against padding).
+    pub const FLAG: IndexRange = IndexRange {
+        lo: 0,
+        hi_exclusive: 2,
+    };
+
     /// The integers an `f32` represents exactly, `[-2^24, 2^24]`: the range a `Cast(I32 -> F32)`
     /// operand must be proven inside.
     pub const F32_EXACT: IndexRange = IndexRange {

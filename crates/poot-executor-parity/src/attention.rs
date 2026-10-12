@@ -7,8 +7,7 @@ use poot_graph_ir::ops::{attention_masked, attention_prefill_softcap};
 use poot_graph_ir::{Builder, TensorType};
 use poot_tensor::HostTensor;
 
-use crate::dense::{Dense, Family};
-use crate::{Fixture, const_fixture, decode_fixture, store_for};
+use crate::{Fixture, const_fixture};
 
 const HQ: usize = 4;
 const HKV: usize = 2;
@@ -67,12 +66,18 @@ fn alibi_decode_case() -> AlibiCase {
         })
         .collect();
     let build = |name: &'static str, mask_heads: usize, mask: Vec<f32>| {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, HQ, 1, D]));
-        let k = b.constant("k", TensorType::f32(vec![1, HKV, cap, D]));
-        let v = b.constant("v", TensorType::f32(vec![1, HKV, cap, D]));
-        let m = b.constant("mask", TensorType::f32(vec![1, mask_heads, 1, cap]));
-        let y = attention_masked(&b, q, k, v, HQ / HKV, 1.0 / (D as f32).sqrt(), m);
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, HQ, 1, D])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, HKV, cap, D]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, HKV, cap, D]))
+            .unwrap();
+        let m = b
+            .constant("mask", TensorType::f32(vec![1, mask_heads, 1, cap]))
+            .unwrap();
+        let y = attention_masked(&b, q, k, v, HQ / HKV, 1.0 / (D as f32).sqrt(), m).unwrap();
         let graph = b.finish(y).unwrap();
         const_fixture(
             name,
@@ -115,13 +120,20 @@ fn alibi_prefill_case(name: &'static str, softcap: Option<f32>) -> AlibiCase {
         })
         .collect();
     let build = |name: &'static str, mask_heads: usize, mask: Vec<f32>| {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, HQ, l, D]));
-        let k = b.constant("k", TensorType::f32(vec![1, HKV, l, D]));
-        let v = b.constant("v", TensorType::f32(vec![1, HKV, l, D]));
-        let m = b.constant("m", TensorType::f32(vec![1, mask_heads, l, l]));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, HQ, l, D])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, HKV, l, D]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, HKV, l, D]))
+            .unwrap();
+        let m = b
+            .constant("m", TensorType::f32(vec![1, mask_heads, l, l]))
+            .unwrap();
         let y =
-            attention_prefill_softcap(&b, q, k, v, HQ / HKV, 1.0 / (D as f32).sqrt(), m, softcap);
+            attention_prefill_softcap(&b, q, k, v, HQ / HKV, 1.0 / (D as f32).sqrt(), m, softcap)
+                .unwrap();
         let graph = b.finish(y).unwrap();
         const_fixture(
             name,
@@ -151,33 +163,12 @@ fn alibi_prefill_case(name: &'static str, softcap: Option<f32>) -> AlibiCase {
     }
 }
 
-/// A qwen2 decode over `n_heads` query heads sharing `n_kv_heads` key-value heads: `4 x 2` (the
-/// grouped-query layout) is [`crate::qwen2_decode_fixture`]; these add multi-head (`2 x 2`, every
-/// query head its own key-value head) and multi-query (`2 x 1`, one key-value head shared by all).
-pub fn head_layout_decode_fixtures(cap: usize) -> Vec<Fixture> {
-    [
-        ("qwen2_decode_multi_head", 2, 2),
-        ("qwen2_decode_multi_query", 2, 1),
-    ]
-    .into_iter()
-    .map(|(name, n_heads, n_kv_heads)| {
-        let dense = Dense::new(Family::Qwen2)
-            .vocab(32)
-            .dims(16, 32, 2)
-            .heads(n_heads, n_kv_heads)
-            .head_dim(4)
-            .max_positions(16);
-        decode_fixture(name, &dense, cap, store_for)
-    })
-    .collect()
-}
-
 // ---- Split-KV decode attention (POOT-1113) ----
 
 /// Two query rows against a 1024-key cache of one key/value head: the low-head decode a 40-compute-unit
 /// device leaves almost idle, which the planner splits into eight 128-key chunks.
-fn split_kv_fixture() -> poot_test_util::live_attention::LiveAttentionFixture {
-    poot_test_util::live_attention::LiveAttentionFixture {
+fn split_kv_fixture() -> poot_eval::test_support::live_attention::LiveAttentionFixture {
+    poot_eval::test_support::live_attention::LiveAttentionFixture {
         batch: 1,
         hq: 2,
         hkv: 1,
@@ -204,7 +195,7 @@ pub const SPLIT_KV_LIVE_LENGTHS: [i32; 5] = [1024, 5, 400, 1, 1024];
 /// kernel-level rows in `poot-kernelgen` compare the two schedules, and the device rows compare the split
 /// plan with an independent evaluation.)
 pub fn attention_launches(
-    built: &poot_test_util::live_attention::LiveAttentionGraph,
+    built: &poot_eval::test_support::live_attention::LiveAttentionGraph,
     target: poot_graph_plan::Target,
 ) -> (usize, usize) {
     let program = crate::live_attention::compile_live(&built.graph, target);
@@ -332,12 +323,14 @@ fn split_kv_pipeline_graph() -> (poot_graph_ir::Graph, Vec<(&'static str, HostTe
 
     let f = split_kv_fixture();
     let (hq, hkv, cap, dk, dv) = (f.hq, f.hkv, f.cap, f.dk, f.dv);
-    let b = Builder::new();
-    let pos = b.slot_ranged(
-        Slot::Pos,
-        TensorType::new(vec![1, 1], poot_tensor::DType::I32),
-        IndexRange::F32_EXACT,
-    );
+    let b = Builder::for_tests();
+    let pos = b
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+            IndexRange::F32_EXACT,
+        )
+        .unwrap();
     let mut tensors = Vec::new();
     let mut witnesses = Vec::new();
     let mut previous = None;
@@ -347,9 +340,13 @@ fn split_kv_pipeline_graph() -> (poot_graph_ir::Graph, Vec<(&'static str, HostTe
     {
         let seed = 10 * layer as u64;
         let [qn, kn, vn] = names;
-        let q = b.constant(qn, TensorType::f32(vec![1, hq, 1, dk]));
-        let k = b.constant(kn, TensorType::f32(vec![1, hkv, cap, dk]));
-        let v = b.constant(vn, TensorType::f32(vec![1, hkv, cap, dv]));
+        let q = b.constant(qn, TensorType::f32(vec![1, hq, 1, dk])).unwrap();
+        let k = b
+            .constant(kn, TensorType::f32(vec![1, hkv, cap, dk]))
+            .unwrap();
+        let v = b
+            .constant(vn, TensorType::f32(vec![1, hkv, cap, dv]))
+            .unwrap();
         tensors.push((
             qn,
             HostTensor::f32(vec![1, hq, 1, dk], fill(hq * dk, 1 + seed)),
@@ -363,8 +360,10 @@ fn split_kv_pipeline_graph() -> (poot_graph_ir::Graph, Vec<(&'static str, HostTe
             HostTensor::f32(vec![1, hkv, cap, dv], fill(hkv * cap * dv, 3 + seed)),
         ));
         let _layer = b.layer_scope(layer);
-        let mask = causal_mask_from_pos(&b, pos, cap, None);
-        let len = b.binary_scalar(BinOp::Add, b.reshape(pos, vec![1]), Scalar::I32(1));
+        let mask = causal_mask_from_pos(&b, pos, cap, None).unwrap();
+        let len = b
+            .binary_scalar(BinOp::Add, b.reshape(pos, vec![1]).unwrap(), Scalar::I32(1))
+            .unwrap();
         let live = attention_live(
             &b,
             q,
@@ -379,7 +378,7 @@ fn split_kv_pipeline_graph() -> (poot_graph_ir::Graph, Vec<(&'static str, HostTe
         .expect("the live composite builds");
         witnesses.push((ValidationId(layer as u32 + 1), live.witness));
         previous = Some(match previous {
-            Some(earlier) => b.binary(BinOp::Add, live.out, earlier),
+            Some(earlier) => b.binary(BinOp::Add, live.out, earlier).unwrap(),
             None => live.out,
         });
     }
@@ -402,19 +401,20 @@ fn split_kv_pipeline_graph() -> (poot_graph_ir::Graph, Vec<(&'static str, HostTe
 /// the staged program), `targets` names every device it owns.
 pub fn assert_split_kv_pipeline_matches_the_oracle(
     exec: &mut dyn Executor,
-    targets: &poot_graph_plan::TargetSet,
-    devices: [poot_graph_plan::DeviceId; 2],
+    targets: &poot_graph_plan::staged::TargetSet,
+    devices: [poot_graph_plan::multi_device::topology::DeviceId; 2],
 ) -> Result<(), String> {
-    use poot_executor::{HostView, NoSync, StepInputs};
+    use poot_eval::test_support::live_attention::Inputs;
+    use poot_executor::{NoSync, StepInputs};
+    use poot_graph_ir::test_support::const_weights::ConstWeights;
     use poot_graph_ir::{Slot, Storage};
     use poot_graph_plan::{
-        CompileLimits, CompileOptions, DevicePlacement, ExpertPlacement, Partition, Submission,
-        compile_staged,
+        CompileLimits, CompileOptions, production_plan::Submission, staged::DevicePlacement,
+        staged::ExpertPlacement, staged::Partition, staged::compile_staged,
     };
     use poot_quant::StoredBytes;
     use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-    use poot_test_util::const_weights::ConstWeights;
-    use poot_test_util::live_attention::Inputs;
+    use poot_tensor::HostView;
 
     let (graph, tensors) = split_kv_pipeline_graph();
     let mut store = WeightStore::builder();

@@ -14,6 +14,7 @@
 //! abort poisons the whole engine (`Device::abort` itself can never run again once poisoned - one
 //! engine drives one device, so there is nothing left to recover).
 
+use poot_runtime_common::BufferRole;
 use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::Range;
@@ -25,8 +26,9 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::multi_device::PlanNodeId;
 use poot_graph_plan::{
-    DeviceId, KernelChoice, Link, Plan, PoolSite, Program, Sink, Source, StageId, StagedProgram,
-    Submission, SyncPoint, Target, TargetSet, Transfer, aie_shape_abi, dispatch_work,
+    KernelChoice, Plan, PoolSite, Program, Sink, Source, Target, aie_shape_abi, dispatch_work,
+    multi_device::topology::DeviceId, production_plan::Submission, staged::Link, staged::StageId,
+    staged::StagedProgram, staged::SyncPoint, staged::TargetSet, staged::Transfer,
     validate_linked_artifact, validate_recipe_tile_local, value_ids,
 };
 use poot_kernel_ir::Body;
@@ -37,9 +39,7 @@ use poot_target::{AieCaps, AieTargetId, Backend, BufferStorage, TargetId};
 use poot_tensor::DType;
 
 use crate::binder::{self, BoundSlot, EmbedRows, StoredAs, WeightBinder};
-use crate::device::{
-    AieInvocation, Arg, BufferRole, Device, DeviceTime, Dispatch, LaunchKind, WeightUpload,
-};
+use crate::device::{AieInvocation, Arg, Device, DeviceTime, Dispatch, LaunchKind, WeightUpload};
 use crate::error::{BindError, DeviceError, ExecError, LoadError};
 use crate::shared_kernels::{SharedKernels, SharedKernelsMismatch};
 use crate::timing::TimingOptions;
@@ -585,13 +585,6 @@ impl<D: Device> Engine<D> {
         }
         self.shared_kernels = Some(kernels);
         Ok(self)
-    }
-
-    /// This engine links AIE kernels with `toolchain` instead of the process environment's.
-    #[cfg(test)]
-    fn with_toolchain(mut self, toolchain: poot_codegen::Toolchain) -> Self {
-        self.toolchain = toolchain;
-        self
     }
 
     pub fn device(&self) -> &D {
@@ -2481,7 +2474,7 @@ impl<D: Device> Engine<D> {
 /// `commit_plan` donates this output in place, or its arena slot otherwise (Card 547b).
 struct OutLocArgs<'a> {
     out: ValueId,
-    commit_plan: &'a poot_graph_plan::StateCommitPlan,
+    commit_plan: &'a poot_graph_plan::state_commit::StateCommitPlan,
     buffer_plan: &'a poot_graph_plan::BufferPlan,
     /// Where this stage's arena slots start in the entry's shared arena.
     arena_base: usize,
@@ -3073,6 +3066,7 @@ mod kernel_identity_tests {
     use super::*;
     use crate::device::DeviceTime;
     use poot_codegen::ArtifactTooLarge;
+    use poot_runtime_common::BufferRole;
 
     struct NoopDevice;
 
@@ -3151,14 +3145,16 @@ mod kernel_identity_tests {
     /// first body's index instead of compiling its own, and the row goes red.
     #[test]
     fn colliding_display_keys_with_different_bodies_never_alias_in_either_order() {
-        let body_a = poot_test_util::kernel_fixtures::reduce_last(
+        let body_a = poot_kernelgen::reduce_last_dt(
             "shared_key",
+            poot_kernel_ir::Ty::F32,
             poot_kernel_ir::BinOp::Add,
             4,
             0.0,
         );
-        let body_b = poot_test_util::kernel_fixtures::reduce_last(
+        let body_b = poot_kernelgen::reduce_last_dt(
             "shared_key",
+            poot_kernel_ir::Ty::F32,
             poot_kernel_ir::BinOp::Add,
             8,
             0.0,
@@ -3252,8 +3248,9 @@ mod kernel_identity_tests {
     /// engine loads the oversize artifact and this row goes red.
     #[test]
     fn a_shared_hit_is_checked_against_the_callers_artifact_limit() {
-        let body = poot_test_util::kernel_fixtures::reduce_last(
+        let body = poot_kernelgen::reduce_last_dt(
             "limit",
+            poot_kernel_ir::Ty::F32,
             poot_kernel_ir::BinOp::Add,
             4,
             0.0,
@@ -3300,6 +3297,7 @@ mod kernel_identity_tests {
 mod arena_slot_alloc_tests {
     use super::*;
     use crate::device::DeviceTime;
+    use poot_runtime_common::BufferRole;
 
     /// Records every `elems` a call actually reached `Device::allocate` with (never recomputes one).
     #[derive(Default)]
@@ -3410,13 +3408,14 @@ mod f16_packed_weight_upload_tests {
     use crate::Executor;
     use poot_graph_ir::Builder;
     use poot_graph_plan::{
-        CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
-        compile_staged,
+        CompileOptions, multi_device::topology::DeviceId, staged::DevicePlacement,
+        staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
     };
     use poot_quant::StoredBytes;
     use poot_quant::weights::{
         AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightView,
     };
+    use poot_runtime_common::BufferRole;
 
     const PROJECTION_INPUT: WeightId = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
     const PROJECTION_WEIGHT: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
@@ -3559,13 +3558,17 @@ mod f16_packed_weight_upload_tests {
         store: Arc<WeightStore>,
         declared: DType,
     ) -> Result<EntryId, ExecError> {
-        let b = Builder::new();
-        let x = b.constant(&PROJECTION_INPUT.const_name(), TensorType::f32(vec![4, K]));
-        let w = b.constant(
-            &PROJECTION_WEIGHT.const_name(),
-            TensorType::new(vec![N, K], declared),
-        );
-        let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let b = Builder::for_tests();
+        let x = b
+            .constant(&PROJECTION_INPUT.const_name(), TensorType::f32(vec![4, K]))
+            .unwrap();
+        let w = b
+            .constant(
+                &PROJECTION_WEIGHT.const_name(),
+                TensorType::new(vec![N, K], declared),
+            )
+            .unwrap();
+        let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         let g = b.finish(out).unwrap();
         let mut weights = WeightMap::builder(&store);
         for id in [PROJECTION_INPUT, PROJECTION_WEIGHT] {
@@ -3835,21 +3838,24 @@ mod f16_packed_weight_upload_tests {
 #[cfg(test)]
 mod weight_source_tests {
     use super::*;
+    use poot_runtime_common::BufferRole;
+
     use crate::{NoSync, StepInputs};
+    use poot_graph_ir::test_support::const_weights::ConstWeights;
     use poot_graph_ir::{BinOp, Builder, Graph, IndexRange};
+
     use poot_graph_plan::{
-        CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
-        WeightFormats, bind_packed_weights, compile_staged,
+        CompileOptions, WeightFormats, bind_packed_weights, multi_device::topology::DeviceId,
+        staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
+        staged::compile_staged,
     };
-    use poot_quant::StoredBytes;
     use poot_quant::format::WeightFormat;
     use poot_quant::weights::{
         AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole,
         WeightView,
     };
-    use poot_quant::{PackedPayload, SourceRole};
+    use poot_quant::{PackedPayload, SourceRole, StoredBytes};
     use poot_runtime_common::MemoryCounters;
-    use poot_test_util::const_weights::ConstWeights;
     use std::ops::Range;
 
     /// Records every allocation (role, storage, native elements) and every write by buffer index,
@@ -4011,10 +4017,10 @@ mod weight_source_tests {
 
     /// `out = a + b`, both F32 `[N, K]` consts named `a` and `b`; returns the graph and `b`'s id.
     fn sum_of(a: &str, b_name: &str) -> (Graph, ValueId) {
-        let b = Builder::new();
-        let x = b.constant(a, TensorType::f32(vec![N, K]));
-        let y = b.constant(b_name, TensorType::f32(vec![N, K]));
-        let out = b.binary(BinOp::Add, x, y);
+        let b = Builder::for_tests();
+        let x = b.constant(a, TensorType::f32(vec![N, K])).unwrap();
+        let y = b.constant(b_name, TensorType::f32(vec![N, K])).unwrap();
+        let out = b.binary(BinOp::Add, x, y).unwrap();
         (b.finish(out).unwrap(), y.id())
     }
 
@@ -4202,14 +4208,18 @@ mod weight_source_tests {
 
     /// `x @ w^T` for each of `ids`' weights, `[N, K]` each, summed; `x` is an activation slot.
     fn projections(ids: &[WeightId], formats: &WeightFormats) -> Graph {
-        let b = Builder::new();
-        let x = b.slot(Slot::Activation, TensorType::f32(vec![2, K]));
+        let b = Builder::for_tests();
+        let x = b
+            .slot(Slot::Activation, TensorType::f32(vec![2, K]))
+            .unwrap();
         let mut out = None;
         for id in ids {
-            let w = b.constant(&id.const_name(), TensorType::f32(vec![N, K]));
-            let y = b.matmul(x, b.transpose(w, vec![1, 0]));
+            let w = b
+                .constant(&id.const_name(), TensorType::f32(vec![N, K]))
+                .unwrap();
+            let y = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
             out = Some(match out {
-                Some(acc) => b.binary(BinOp::Add, acc, y),
+                Some(acc) => b.binary(BinOp::Add, acc, y).unwrap(),
                 None => y,
             });
         }
@@ -4299,13 +4309,18 @@ mod weight_source_tests {
             &weights,
             vec![(table, WeightView::IndexNarrow("tid2eid".into()))],
         );
-        let b = Builder::new();
-        let tokens = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
-        let rows = b.gather(
-            b.constant(&table.const_name(), TensorType::new(vec![2, 2], DType::I32)),
-            0,
-            tokens,
-        );
+        let b = Builder::for_tests();
+        let tokens = b
+            .slot(Slot::Token, TensorType::new(vec![1], DType::I32))
+            .unwrap();
+        let rows = b
+            .gather(
+                b.constant(&table.const_name(), TensorType::new(vec![2, 2], DType::I32))
+                    .unwrap(),
+                0,
+                tokens,
+            )
+            .unwrap();
         // The gathered words are the output as they are: the table's range is not declared, so no
         // `I32 -> F32` cast of it is provable (POOT-726).
         let g = b.finish(rows).unwrap();
@@ -4349,17 +4364,22 @@ mod weight_source_tests {
                 &weights,
                 vec![(table, WeightView::IndexNarrow("tid2eid".into()))],
             );
-            let b = Builder::new();
-            let tokens = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
-            let rows = b.gather(
-                b.constant_ranged(
-                    &table.const_name(),
-                    TensorType::new(vec![2, 2], DType::I32),
-                    IndexRange::below(EXPERTS).unwrap(),
-                ),
-                0,
-                tokens,
-            );
+            let b = Builder::for_tests();
+            let tokens = b
+                .slot(Slot::Token, TensorType::new(vec![1], DType::I32))
+                .unwrap();
+            let rows = b
+                .gather(
+                    b.constant_ranged(
+                        &table.const_name(),
+                        TensorType::new(vec![2, 2], DType::I32),
+                        IndexRange::below(EXPERTS).unwrap(),
+                    )
+                    .unwrap(),
+                    0,
+                    tokens,
+                )
+                .unwrap();
             let g = b.finish(rows).unwrap();
             let mut engine = Engine::new(Recorder::default());
             let program = compile(&engine, &g);
@@ -4400,14 +4420,18 @@ mod weight_source_tests {
     #[test]
     fn a_cast_of_a_gathered_ranged_table_compiles_and_an_undeclared_one_is_refused() {
         let graph = |range: Option<IndexRange>| {
-            let b = Builder::new();
-            let tokens = b.slot(Slot::Token, TensorType::new(vec![1], DType::I32));
+            let b = Builder::for_tests();
+            let tokens = b
+                .slot(Slot::Token, TensorType::new(vec![1], DType::I32))
+                .unwrap();
             let aval = TensorType::new(vec![2, 2], DType::I32);
             let table = match range {
-                Some(range) => b.constant_ranged("hash.table", aval, range),
-                None => b.constant("hash.table", aval),
+                Some(range) => b.constant_ranged("hash.table", aval, range).unwrap(),
+                None => b.constant("hash.table", aval).unwrap(),
             };
-            let out = b.cast(b.gather(table, 0, tokens), DType::F32);
+            let out = b
+                .cast(b.gather(table, 0, tokens).unwrap(), DType::F32)
+                .unwrap();
             b.finish(out).unwrap()
         };
         let engine = Engine::new(Recorder::default());
@@ -4430,7 +4454,7 @@ mod weight_source_tests {
         assert!(
             matches!(
                 refused,
-                poot_graph_plan::StagedCompileError::Compile(
+                poot_graph_plan::staged::StagedCompileError::Compile(
                     poot_graph_plan::CompileError::CastRange(_)
                 )
             ),
@@ -4447,10 +4471,11 @@ mod weight_source_tests {
     /// bytes and this row goes red.
     #[test]
     fn packed_row_views_upload_whole_block_rows() {
-        let fused = poot_test_util::packed::random_payload(WeightFormat::Q8_0, [3 * N, K], 7);
+        let fused =
+            poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [3 * N, K], 7);
         let parts = [
-            poot_test_util::packed::random_payload(WeightFormat::Q8_0, [N / 2, K], 8),
-            poot_test_util::packed::random_payload(WeightFormat::Q8_0, [N / 2, K], 9),
+            poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [N / 2, K], 8),
+            poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [N / 2, K], 9),
         ];
         let blocks = fused.bytes(SourceRole::Blocks).to_vec();
         let row_bytes = blocks.len() / (3 * N);
@@ -4538,11 +4563,13 @@ mod weight_source_tests {
             cap: Some((rows * K * 4 - 1) as u64),
             ..Recorder::default()
         });
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let embed = WeightId::model(WeightRole::Embed).const_name();
-        let table = b.constant(&embed, TensorType::f32(vec![rows, K]));
-        let ids = b.slot(Slot::Token, TensorType::new(vec![1, tokens], DType::I32));
-        let out = b.gather(table, 0, ids);
+        let table = b.constant(&embed, TensorType::f32(vec![rows, K])).unwrap();
+        let ids = b
+            .slot(Slot::Token, TensorType::new(vec![1, tokens], DType::I32))
+            .unwrap();
+        let out = b.gather(table, 0, ids).unwrap();
         let program = compile(&engine, &b.finish(out).unwrap());
         let (_, _, stage) = program.stages().next().unwrap();
         assert!(
@@ -4581,8 +4608,8 @@ mod weight_source_tests {
         let ids = [5, 0, 3, 5];
         let dense = [f32_entry(vec![3, K], 1), f32_entry(vec![3, K], 2)];
         let packed = [
-            poot_test_util::packed::random_payload(WeightFormat::Q8_0, [3, K], 3),
-            poot_test_util::packed::random_payload(WeightFormat::Q8_0, [3, K], 4),
+            poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [3, K], 3),
+            poot_quant::test_support::packed::random_payload(WeightFormat::Q8_0, [3, K], 4),
         ];
         let packed_entries = packed
             .iter()
@@ -4645,10 +4672,14 @@ mod weight_source_tests {
             cap: Some(CAP),
             ..Recorder::default()
         });
-        let b = Builder::new();
-        let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]));
-        let w = b.constant(&head.const_name(), TensorType::f32(vec![ROWS, K]));
-        let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]))
+            .unwrap();
+        let w = b
+            .constant(&head.const_name(), TensorType::f32(vec![ROWS, K]))
+            .unwrap();
+        let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
         let program = compile(&engine, &b.finish(out).unwrap());
         let exe = engine.load_weights(Arc::clone(&weights), mapped).unwrap();
         engine.add_entry(exe, &program).unwrap();
@@ -4762,24 +4793,32 @@ mod weight_source_tests {
     /// position `p` runs the tables of weight layers `layers[p]`, so the tables a position pages need
     /// not be the ones its number suggests, and one layer can hold two sites.
     fn routed_decode_over(layers: &[Vec<usize>]) -> Graph {
-        let b = Builder::new();
-        let mut x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, 1, WIDTH]));
+        let b = Builder::for_tests();
+        let mut x = b
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, 1, WIDTH]))
+            .unwrap();
         for (position, weights) in layers.iter().enumerate() {
             let _scope = b.layer_scope(position);
             for &layer in weights {
                 let [router, gate_up, down] = moe_roles(layer);
-                let router =
-                    b.constant(&router.const_name(), TensorType::f32(vec![WIDTH, EXPERTS]));
-                let gate_up = b.constant(
-                    &gate_up.const_name(),
-                    TensorType::f32(vec![EXPERTS, WIDTH, 2 * INTER]),
-                );
-                let down = b.constant(
-                    &down.const_name(),
-                    TensorType::f32(vec![EXPERTS, INTER, WIDTH]),
-                );
-                let y = poot_graph_ir::ops::moe(&b, x, router, gate_up, down, EXPERTS, 2, INTER);
-                x = b.binary(BinOp::Add, x, y);
+                let router = b
+                    .constant(&router.const_name(), TensorType::f32(vec![WIDTH, EXPERTS]))
+                    .unwrap();
+                let gate_up = b
+                    .constant(
+                        &gate_up.const_name(),
+                        TensorType::f32(vec![EXPERTS, WIDTH, 2 * INTER]),
+                    )
+                    .unwrap();
+                let down = b
+                    .constant(
+                        &down.const_name(),
+                        TensorType::f32(vec![EXPERTS, INTER, WIDTH]),
+                    )
+                    .unwrap();
+                let y = poot_graph_ir::ops::moe(&b, x, router, gate_up, down, EXPERTS, 2, INTER)
+                    .unwrap();
+                x = b.binary(BinOp::Add, x, y).unwrap();
             }
         }
         b.finish(x).unwrap()
@@ -4829,14 +4868,14 @@ mod weight_source_tests {
     /// A host that logs each call into the device's own event log and answers every sync with `writes`.
     struct LoggingHost {
         log: Arc<std::sync::Mutex<Vec<&'static str>>>,
-        calls: Vec<(poot_graph_plan::SyncId, crate::SiteIdentity)>,
+        calls: Vec<(poot_graph_plan::staged::SyncId, crate::SiteIdentity)>,
         writes: crate::SyncWrites,
     }
 
     impl HostSync for LoggingHost {
         fn sync(
             &mut self,
-            point: &poot_graph_plan::SyncPoint,
+            point: &poot_graph_plan::staged::SyncPoint,
             reads: &crate::SyncReads,
         ) -> Result<crate::SyncWrites, ExecError> {
             self.log.lock().unwrap().push("host");
@@ -5230,7 +5269,7 @@ mod weight_source_tests {
     impl HostSync for FixedHost {
         fn sync(
             &mut self,
-            _point: &poot_graph_plan::SyncPoint,
+            _point: &poot_graph_plan::staged::SyncPoint,
             _reads: &crate::SyncReads,
         ) -> Result<crate::SyncWrites, ExecError> {
             Ok(self.0.clone())
@@ -5466,8 +5505,8 @@ mod weight_source_tests {
     /// A graph whose output is the F32 `[N, K]` const `name` itself, so a step's output reads that
     /// const's resident upload back.
     fn identity_of(name: &str) -> Graph {
-        let b = Builder::new();
-        let w = b.constant(name, TensorType::f32(vec![N, K]));
+        let b = Builder::for_tests();
+        let w = b.constant(name, TensorType::f32(vec![N, K])).unwrap();
         b.finish(w).unwrap()
     }
 
@@ -5800,12 +5839,22 @@ mod aie_engine_tests {
     use crate::{Executor, NoSync};
     use poot_graph_ir::Builder;
     use poot_graph_plan::{
-        CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
-        compile_staged,
+        CompileOptions, multi_device::topology::DeviceId, staged::DevicePlacement,
+        staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
     };
     use poot_quant::weights::{
         AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightView,
     };
+    use poot_runtime_common::BufferRole;
+    use poot_target::Queried;
+
+    impl<D: Device> Engine<D> {
+        /// This engine links AIE kernels with `toolchain` instead of the process environment's.
+        fn with_toolchain(mut self, toolchain: poot_codegen::Toolchain) -> Self {
+            self.toolchain = toolchain;
+            self
+        }
+    }
 
     const A: WeightId = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
     const B: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
@@ -5906,7 +5955,13 @@ mod aie_engine_tests {
 
     fn caps() -> AieCaps {
         // SYNTHETIC limits, roomy for a `[2, 3]` add: not a device measurement.
-        AieCaps::synthetic(AieTargetId::Xdna2, 1 << 16, 8, 1 << 20, 1 << 30)
+        AieCaps {
+            target: AieTargetId::Xdna2,
+            tile_local_bytes: Queried::Known(1 << 16),
+            host_bindings: Queried::Known(8),
+            instruction_bytes: Queried::Known(1 << 20),
+            memory_budget_bytes: Queried::Known(1 << 30),
+        }
     }
 
     /// `a + b` over two F32 `[2, 3]` weights, compiled for the recorder's AIE target and added as an entry.
@@ -5924,10 +5979,14 @@ mod aie_engine_tests {
                 .unwrap();
         }
         let store = Arc::new(store.build());
-        let b = Builder::new();
-        let x = b.constant(&A.const_name(), TensorType::f32(vec![2, 3]));
-        let y = b.constant(&B.const_name(), TensorType::f32(vec![2, 3]));
-        let sum = b.binary(poot_graph_ir::BinOp::Add, x, y);
+        let b = Builder::for_tests();
+        let x = b
+            .constant(&A.const_name(), TensorType::f32(vec![2, 3]))
+            .unwrap();
+        let y = b
+            .constant(&B.const_name(), TensorType::f32(vec![2, 3]))
+            .unwrap();
+        let sum = b.binary(poot_graph_ir::BinOp::Add, x, y).unwrap();
         let g = b.finish(sum).unwrap();
         let mut weights = WeightMap::builder(&store);
         for id in [A, B] {
@@ -5957,7 +6016,7 @@ mod aie_engine_tests {
             seen: Seen::default(),
             buffers: 0,
         })
-        .with_toolchain(poot_test_util::aie_fixtures::scripted_toolchain(
+        .with_toolchain(poot_codegen::test_support::scripted_toolchain(
             dir, with_iron,
         ))
     }

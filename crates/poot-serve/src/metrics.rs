@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use poot_llm::driver::RowSpeculation;
-use poot_profile::{Coverage, HostTiming, Mark, Report, TimingSnapshot};
+use poot_profile::{HostTiming, Mark, Report, TimingSnapshot};
+use poot_runtime_common::Coverage;
 
 use crate::config::TelemetryConfig;
 

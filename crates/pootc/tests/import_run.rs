@@ -14,7 +14,8 @@ use poot_test_util::contained_child::ContainChild;
 use std::process::Command;
 
 use poot_kernel_ir::Body;
-use poot_runtime::{CompiledKernel, Context, KernelBuffer};
+use poot_runtime_common::CompiledKernel;
+use poot_wgpu_runtime::{Context, KernelBuffer};
 
 /// Serialize GPU access within this test binary: the Intel Arc Vulkan driver segfaults when several tests
 /// create/use wgpu devices on it concurrently. Poison-tolerant. Hold for the dispatch.
@@ -283,8 +284,8 @@ fn regenerate_asset(entry: &poot_graph_plan::AssetEntry) -> String {
 /// apart unnoticed.
 const KNOWN_ASSET_DIRS: &[&str] = &[
     "poot-graph-plan/assets",
-    "poot-rocm-gpu/assets",
-    "poot-gpu/src/tests/assets",
+    "poot-rocm-device/assets",
+    "poot-wgpu-device/src/tests/assets",
 ];
 
 #[test]
@@ -641,7 +642,7 @@ fn assert_trap_reports_the_spirv_error_word_on_wgpu() {
         .expect_err(
             "idx[2] == 4 is out of range for a 4-element data buffer; the assert must trap",
         );
-    let poot_runtime::RuntimeError::KernelAssertFailed { kernel, code } = err else {
+    let poot_wgpu_runtime::RuntimeError::KernelAssertFailed { kernel, code } = err else {
         panic!("expected KernelAssertFailed, got {err:?}");
     };
     assert_eq!(kernel, "assert_trap_fault");
@@ -666,7 +667,7 @@ fn assert_trap_reports_the_spirv_error_word_on_wgpu() {
 /// itself always succeeds (it is asynchronous), and the fault surfaces as `Err` from the next
 /// synchronizing call (`ctx.synchronize()` below); the context is then unusable, but the process does not
 /// abort. This differs from ROCm's default async-error handler, which DOES abort the process for the
-/// equivalent hardware exception (`imported_assert_trap_traps_on_rocm` in `poot-rocm-gpu`, empirically
+/// equivalent hardware exception (`imported_assert_trap_traps_on_rocm` in `poot-rocm-device`, empirically
 /// confirmed on this box's gfx1151). This box has no NVIDIA device, so the PTX half has not been run on
 /// real hardware; the next PTX-pod batch (531c/558a/527) should run
 /// `cargo test -p pootc --test import_run -- assert_trap_traps_on_ptx --test-threads=1 --nocapture` and
@@ -1220,7 +1221,8 @@ fn imported_kernel_matches_kernelgen_reduce_last() {
         let rows = x.len() / cols;
 
         // kernelgen's per-shape reduce_last -> SPIR-V.
-        let body = poot_test_util::kernel_fixtures::reduce_last("rl", BinOp::Add, cols, 0.0);
+        let body =
+            poot_kernelgen::reduce_last_dt("rl", poot_kernel_ir::Ty::F32, BinOp::Add, cols, 0.0);
         let kg_path = std::env::temp_dir().join(format!("pootc_kg_rl_{cols}.spv"));
         poot_codegen::compile(&body, Target::SpirvVulkan, &kg_path)
             .expect("compile kernelgen reduce_last");
@@ -1338,7 +1340,7 @@ fn imported_lds_reduction_matches_kernelgen() {
     );
 
     // kernelgen's wg_sum, run the same way; must match.
-    let kg = poot_test_util::kernel_fixtures::wg_sum("kg_wg_sum", 64);
+    let kg = poot_kernel_ir::test_support::wg_sum("kg_wg_sum", 64);
     let kg_path = std::env::temp_dir().join("pootc_kg_wg_sum.spv");
     poot_codegen::compile(&kg, Target::SpirvVulkan, &kg_path).expect("compile kernelgen wg_sum");
     let kg_spv = std::fs::read(&kg_path).unwrap();
@@ -1358,7 +1360,7 @@ fn imported_lds_reduction_matches_kernelgen() {
 
 #[test]
 fn imported_argmax_matches_host_argmax() {
-    // card 044 / card 657: the greedy argmax poot-gpu uses for on-device decode, authored in ordinary Rust
+    // card 044 / card 657: the greedy argmax poot-wgpu-device uses for on-device decode, authored in ordinary Rust
     // and imported from MIR as two kernels, `argmax_partials` (one `(value, index)` partial per workgroup)
     // and `argmax_finalize` (one workgroup reducing the partials), matching the host argmax on the GPU.
     // Exercises multi-array LDS (values + indices), the barrier, a chunked strided scan across workgroups
@@ -2197,7 +2199,7 @@ fn imported_sample_topp_gumbel_argmax_batched_matches_cpu_oracle() {
 /// marker is ADR 0114's hedge against a future regression in that `.rn` guarantee, not a divergence this
 /// toolchain can reproduce today. Per card 675, this IR/PTX-text contract is now the card's SC-002; SC-001 is the real-hardware bit-exact dispatch, which
 /// runs the production asset on a pod and is enforced by the PTX lane -
-/// `crates/poot-ptx-gpu/tests/sample_gumbel_no_contract.rs`'s
+/// `crates/poot-ptx-device/tests/sample_gumbel_no_contract.rs`'s
 /// `gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle` (not here: this crate's test binary has
 /// no cargo/rustc on a pod to re-import through `pootc`, so it stays model-free).
 ///

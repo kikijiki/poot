@@ -40,19 +40,6 @@ pub struct CommunicationRow {
     pub route_counts: Vec<Vec<usize>>,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum CommunicationError {
-    #[error("routed exchange has {participant_count} participants but a {rows}x{cols} route table")]
-    RouteShapeMismatch {
-        participant_count: usize,
-        rows: usize,
-        cols: usize,
-    },
-    #[error("routed exchange total byte length overflowed")]
-    ByteLenOverflow,
-}
-
 /// A caller-declared set of communication rows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommunicationPlan {
@@ -89,53 +76,6 @@ pub fn communication_dependency_edges(plan: &CommunicationPlan) -> Vec<Dependenc
         }
     }
     edges
-}
-
-/// Build the `AllToAll` row for one caller-declared routed exchange (FR-004/FR-005). `route_counts` is
-/// carried exactly as supplied: it may be empty, uneven between participants, repeated, or nonmonotonic
-/// in either axis, and this function never reorders, sorts, or aggregates it before storing it on the
-/// returned row.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub(crate) fn plan_routed_exchange(
-    id: PlanNodeId,
-    participants: Vec<DeviceId>,
-    route_counts: Vec<Vec<usize>>,
-    byte_len_per_item: usize,
-    temp_bytes: usize,
-    producers: Vec<PlanNodeId>,
-    consumers: Vec<PlanNodeId>,
-) -> Result<CommunicationRow, CommunicationError> {
-    if route_counts.len() != participants.len()
-        || route_counts
-            .iter()
-            .any(|row| row.len() != participants.len())
-    {
-        return Err(CommunicationError::RouteShapeMismatch {
-            participant_count: participants.len(),
-            rows: route_counts.len(),
-            cols: route_counts.first().map_or(0, Vec::len),
-        });
-    }
-    let total_items = route_counts
-        .iter()
-        .flatten()
-        .try_fold(0usize, |total, &count| total.checked_add(count))
-        .ok_or(CommunicationError::ByteLenOverflow)?;
-    let byte_len = total_items
-        .checked_mul(byte_len_per_item)
-        .ok_or(CommunicationError::ByteLenOverflow)?;
-    Ok(CommunicationRow {
-        id,
-        kind: CollectiveKind::AllToAll,
-        op: RedOp::Sum,
-        participants,
-        byte_len,
-        temp_bytes,
-        producers,
-        consumers,
-        route_counts,
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -196,5 +136,70 @@ fn admit_directed(
         Ok(())
     } else {
         Err(CapabilityError { from, to, kind })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+    pub(crate) enum CommunicationError {
+        #[error(
+            "routed exchange has {participant_count} participants but a {rows}x{cols} route table"
+        )]
+        RouteShapeMismatch {
+            participant_count: usize,
+            rows: usize,
+            cols: usize,
+        },
+        #[error("routed exchange total byte length overflowed")]
+        ByteLenOverflow,
+    }
+
+    /// Build the `AllToAll` row for one caller-declared routed exchange (FR-004/FR-005). `route_counts` is
+    /// carried exactly as supplied: it may be empty, uneven between participants, repeated, or nonmonotonic
+    /// in either axis, and this function never reorders, sorts, or aggregates it before storing it on the
+    /// returned row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_routed_exchange(
+        id: PlanNodeId,
+        participants: Vec<DeviceId>,
+        route_counts: Vec<Vec<usize>>,
+        byte_len_per_item: usize,
+        temp_bytes: usize,
+        producers: Vec<PlanNodeId>,
+        consumers: Vec<PlanNodeId>,
+    ) -> Result<CommunicationRow, CommunicationError> {
+        if route_counts.len() != participants.len()
+            || route_counts
+                .iter()
+                .any(|row| row.len() != participants.len())
+        {
+            return Err(CommunicationError::RouteShapeMismatch {
+                participant_count: participants.len(),
+                rows: route_counts.len(),
+                cols: route_counts.first().map_or(0, Vec::len),
+            });
+        }
+        let total_items = route_counts
+            .iter()
+            .flatten()
+            .try_fold(0usize, |total, &count| total.checked_add(count))
+            .ok_or(CommunicationError::ByteLenOverflow)?;
+        let byte_len = total_items
+            .checked_mul(byte_len_per_item)
+            .ok_or(CommunicationError::ByteLenOverflow)?;
+        Ok(CommunicationRow {
+            id,
+            kind: CollectiveKind::AllToAll,
+            op: RedOp::Sum,
+            participants,
+            byte_len,
+            temp_bytes,
+            producers,
+            consumers,
+            route_counts,
+        })
     }
 }

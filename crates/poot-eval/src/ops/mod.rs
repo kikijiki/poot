@@ -35,8 +35,8 @@ pub(crate) fn i32_lane<'a>(t: &'a HostTensor, op: &'static str) -> Result<&'a [i
 }
 
 /// Row-major element count of `shape`, refusing an overflowing product. One lane-neutral helper
-/// (554c, 554d): `tensor::checked_numel`, `exact_bf16::checked_numel`
-/// and `exact_dense::checked_numel` used to restate this with their own typed overflow, so the dense
+/// (554c, 554d): `tensor::checked_numel` and `exact_bf16::checked_numel`
+/// used to restate this with their own typed overflow, so the dense
 /// walk's I32 `Binary`/`Select` shape overflow used to come back mislabeled as one lane's error, with
 /// a bogus equation id (`EvalError::Unsupported { eqn: 0, .. }`); the typed, eqn-free
 /// `EvalError::ElementCountOverflow` names the real defect instead.

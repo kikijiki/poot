@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Alloc, BasicBlock, BinOp, BlockId, Body, Constant, ELEMENTWISE_2D_WORKGROUP_SIZE, IndexAxis,
+    Operand, Place, Rvalue, Statement, Terminator, Ty, copy, elem, emit_i32_shift, guard, is_cmp,
+    ld, local, slice_dtype,
+};
 
 /// Elementwise binary with a baked scalar literal: `c[i] = a[i] op lit`.
 pub fn binary_scalar(name: &str, op: BinOp, lit: f32) -> Body {
@@ -7,14 +11,14 @@ pub fn binary_scalar(name: &str, op: BinOp, lit: f32) -> Body {
 
 /// `binary_scalar` in storage dtype `dt`, computing in f32 (spec 024): bf16 input widens, the op runs in
 /// f32 against the literal, the result narrows to `dt`.
-pub fn binary_scalar_dt(name: &str, op: BinOp, dt: Ty, lit: f32) -> Body {
+pub(crate) fn binary_scalar_dt(name: &str, op: BinOp, dt: Ty, lit: f32) -> Body {
     binary_scalar_dt_grid(name, op, dt, lit, None)
 }
 
 /// [`binary_scalar_dt`] with an optional 2-D grid fold; see [`build_unary_dt_grid`] (card 181 Bug 2: the
 /// attention-score `scores * scale` hits the same over-cap grid at long ISL as the `Exp` after it).
 /// `x_groups: None` is identical to [`binary_scalar_dt`].
-pub fn binary_scalar_dt_grid(
+pub(crate) fn binary_scalar_dt_grid(
     name: &str,
     op: BinOp,
     dt: Ty,

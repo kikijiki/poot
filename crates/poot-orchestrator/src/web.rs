@@ -32,7 +32,7 @@ fn query_param(q: &str, key: &str) -> Option<String> {
     })
 }
 
-pub fn serve(db: Db, addr: &str) -> Result<()> {
+pub(crate) fn serve(db: Db, addr: &str) -> Result<()> {
     // Single-threaded request loop, so the non-Send Connection in `db` is fine. Only the image build
     // (POST /api/build) runs detached.
     let server = Server::http(addr).map_err(|e| anyhow!("bind {addr}: {e}"))?;

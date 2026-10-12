@@ -8,9 +8,10 @@ use std::path::PathBuf;
 
 use poot_codegen::{Target, compile, kernel_handle};
 use poot_kernel_ir::fixtures;
+use poot_kernel_ir::test_support::square_kernel;
 use poot_runtime_common::{BufferRole, CompiledKernel};
-use poot_test_util::kernel_fixtures::square_kernel;
-use poot_vulkan_runtime::{BufferStorage, Context, DeviceBuffer};
+use poot_target::BufferStorage;
+use poot_vulkan_runtime::{Context, DeviceBuffer};
 
 /// Upload `data` as f32 through the storage-typed [`Context::alloc_storage`]/[`DeviceBuffer::write_with`]
 /// primitives (Card 547a: this crate has no `upload_f32`/`alloc_f32`/`read_f32` family, since it has no

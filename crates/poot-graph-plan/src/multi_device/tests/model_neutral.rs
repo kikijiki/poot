@@ -14,7 +14,7 @@
 //!   name, so two namings of the same graph plan differently.
 
 use crate::BoundaryDescriptor;
-use crate::test_support::split_after_layers;
+use crate::unit_helpers::split_after_layers;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::BinOp;
 use poot_graph_ir::types::TensorType;
@@ -33,21 +33,25 @@ use crate::multi_device::{CommunicationRow, PlanNodeId, plan_stage_communication
 /// 24 bytes: the boundary size tells which layer annotation the cut followed. `weight_name(layer)`
 /// names each layer's weight constant and is the only thing the callers vary between namings.
 fn four_layer_graph(weight_name: impl Fn(usize) -> String) -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let mut h = b.slot(Slot::Activation, TensorType::f32(vec![2, 3]));
+    let b = Builder::for_tests();
+    let mut h = b
+        .slot(Slot::Activation, TensorType::f32(vec![2, 3]))
+        .unwrap();
     for layer in 0..4 {
         let _scope = b.layer_scope(layer);
-        let weight = b.constant(&weight_name(layer), TensorType::f32(vec![2, 3]));
+        let weight = b
+            .constant(&weight_name(layer), TensorType::f32(vec![2, 3]))
+            .unwrap();
         h = match layer {
-            0 => b.binary(BinOp::Add, h, weight),
-            1 => b.binary(BinOp::Mul, h, weight),
+            0 => b.binary(BinOp::Add, h, weight).unwrap(),
+            1 => b.binary(BinOp::Mul, h, weight).unwrap(),
             2 => {
-                let sum = b.binary(BinOp::Add, h, weight);
-                b.cast(sum, DType::BF16)
+                let sum = b.binary(BinOp::Add, h, weight).unwrap();
+                b.cast(sum, DType::BF16).unwrap()
             }
             _ => {
-                let wide = b.cast(h, DType::F32);
-                b.binary(BinOp::Add, wide, weight)
+                let wide = b.cast(h, DType::F32).unwrap();
+                b.binary(BinOp::Add, wide, weight).unwrap()
             }
         };
     }

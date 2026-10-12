@@ -16,6 +16,13 @@ use poot_graph_ir::op::OpKind;
 ///
 /// A graph with no `Iota` is returned unchanged (a clone-cost no-op callers still pay; the pass is
 /// written for the pipeline's simple `Graph -> Graph` shape).
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn fold_iota(g: &Graph) -> Result<Graph, EditError> {
     let mut folded: Vec<(ValueId, ComputedConst)> = Vec::new();
     for eqn in g.eqns() {
@@ -70,10 +77,10 @@ mod tests {
     /// merge two calls with the same length, and only those. `optimize` runs `cse` before `fold_iota`.
     #[test]
     fn cse_merges_identical_iotas_and_keeps_distinct_lengths() {
-        let b = Builder::new();
-        let a = b.iota(4);
-        let c = b.iota(4);
-        let out = b.binary(BinOp::Add, a, c);
+        let b = Builder::for_tests();
+        let a = b.iota(4).unwrap();
+        let c = b.iota(4).unwrap();
+        let out = b.binary(BinOp::Add, a, c).unwrap();
         let graph = b.finish(out).unwrap();
 
         let merged = crate::passes::cse(&graph).unwrap();
@@ -98,10 +105,10 @@ mod tests {
             "cse then fold_iota yields one computed constant"
         );
 
-        let b = Builder::new();
-        let a = b.iota(4);
-        let c = b.iota(5);
-        let out = b.concat(0, &[a, c]);
+        let b = Builder::for_tests();
+        let a = b.iota(4).unwrap();
+        let c = b.iota(5).unwrap();
+        let out = b.concat(0, &[a, c]).unwrap();
         let graph = b.finish(out).unwrap();
 
         let merged = crate::passes::cse(&graph).unwrap();

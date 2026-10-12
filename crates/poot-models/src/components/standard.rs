@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 
 use poot_graph_ir::{
-    BinOp, Builder, EditError, Graph, IndexRange, Outputs, Slot, StateRole, TensorType, Traced,
+    BinOp, Builder, BuilderError, Graph, IndexRange, Outputs, Slot, StateRole, TensorType, Traced,
     ValidationId, ops,
 };
 use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
@@ -31,10 +31,12 @@ use super::embed::{EmbedInputs, Embedding};
 use super::head::{Head, HeadKind};
 use super::linear::{Weight, WeightError};
 use super::norm::{NormParams, NormWeights, norm, norm_with};
+use crate::model::WiringError;
 use crate::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, ModelError, Phase, ShapeReason, StepShape,
     TraceError,
 };
+use poot_graph_ir::Requirement;
 
 /// `Slot::Activation` tag of a paged step's `[rows]` state read index.
 pub const STATE_READ_SLOT: &str = "state_read";
@@ -95,16 +97,29 @@ pub struct HiddenCarryState {
 }
 
 /// `(tokens, width)` of a hidden state about to be carried: `[rows, tokens, width]` F32.
-fn hidden_dims(b: &Builder, hidden: Traced) -> (usize, usize) {
-    let aval = b.aval(hidden);
+fn hidden_dims(b: &Builder, hidden: Traced) -> Result<(usize, usize), TraceError> {
+    let aval = b.aval(hidden)?;
     let [_, tokens, width] = aval.shape[..] else {
-        panic!(
-            "a hidden state is [rows, tokens, width], not {:?}",
-            aval.shape
-        );
+        return Err(BuilderError::Requirement {
+            operation: "hidden-state carry",
+            requirement: Requirement::Rank {
+                expected: 3,
+                found: aval.shape,
+            },
+        }
+        .into());
     };
-    assert_eq!(aval.dtype, DType::F32, "the hidden-state carry is f32");
-    (tokens, width)
+    if aval.dtype != DType::F32 {
+        return Err(BuilderError::Requirement {
+            operation: "hidden-state carry",
+            requirement: Requirement::Dtype {
+                expected: DType::F32,
+                found: aval.dtype,
+            },
+        }
+        .into());
+    }
+    Ok((tokens, width))
 }
 
 /// The two slot maps of a [`KvLayout::Paged`] step, both I32 `Slot::SlotMap` inputs.
@@ -144,7 +159,7 @@ impl RecurrentState {
 impl Step {
     /// Declare the step's inputs on `b`: the token ids and their absolute positions, both
     /// `[rows, tokens]` I32, and under a paged layout the two slot maps.
-    pub fn new(b: &Builder, shape: StepShape) -> Self {
+    pub fn new(b: &Builder, shape: StepShape) -> Result<Self, TraceError> {
         let ids = TensorType::new(vec![shape.rows.get(), shape.tokens.get()], DType::I32);
         let paged = match shape.kv {
             KvLayout::Contiguous => None,
@@ -153,17 +168,17 @@ impl Step {
                     Slot::SlotMap,
                     "read",
                     TensorType::new(vec![shape.rows.get(), shape.capacity.get()], DType::I32),
-                ),
+                )?,
                 write: b.slot_named(
                     Slot::SlotMap,
                     "write",
                     TensorType::new(vec![pool_slots.get()], DType::I32),
-                ),
+                )?,
             }),
         };
-        Self {
+        Ok(Self {
             shape,
-            tokens: b.slot(Slot::Token, ids.clone()),
+            tokens: b.slot(Slot::Token, ids.clone())?,
             // A position is below the cache capacity: declared here so the range is a checked bind
             // fact, which proves the `I32 -> F32` casts of the position arithmetic exact. Token ids
             // stay undeclared: a family bounds them in-graph (`guard_index_bounds`, a witness).
@@ -171,7 +186,7 @@ impl Step {
                 Slot::Pos,
                 ids,
                 IndexRange::below(shape.capacity.get()).unwrap_or(IndexRange::I32),
-            ),
+            )?,
             mrope: None,
             embeds: None,
             head: HeadKind::Logits,
@@ -179,30 +194,30 @@ impl Step {
             state_rows: RefCell::new(None),
             state: RefCell::new(Vec::new()),
             validations: RefCell::new(Vec::new()),
-        }
+        })
     }
 
     /// A step whose inputs are tokens with caller-computed embedding rows over some positions
     /// ([`EmbedInputs`]): the two extra inputs are declared after the token and position inputs.
     /// `width` is the model's embedding width.
-    pub fn with_embeds(b: &Builder, shape: StepShape, width: usize) -> Self {
-        let mut step = Self::new(b, shape);
+    pub fn with_embeds(b: &Builder, shape: StepShape, width: usize) -> Result<Self, TraceError> {
+        let mut step = Self::new(b, shape)?;
         step.embeds = Some(EmbedInputs::declare(
             b,
             shape.rows.get(),
             shape.tokens.get(),
             width,
-        ));
-        step
+        )?);
+        Ok(step)
     }
 
     /// A step whose attention rotates by sectioned positions: `Slot::MropePosition`, `[3, rows * tokens]`
     /// I32 (temporal, height, width, axis-major), declared after the token, position and embedding
     /// inputs. `Slot::Pos` still carries the absolute positions the cache and the mask use.
-    pub fn with_mrope(mut self, b: &Builder) -> Self {
+    pub fn with_mrope(mut self, b: &Builder) -> Result<Self, TraceError> {
         let n = self.shape.rows.get() * self.shape.tokens.get();
-        self.mrope = Some(b.slot(Slot::MropePosition, TensorType::new(vec![3, n], DType::I32)));
-        self
+        self.mrope = Some(b.slot(Slot::MropePosition, TensorType::new(vec![3, n], DType::I32))?);
+        Ok(self)
     }
 
     /// The sectioned positions of a [`Self::with_mrope`] step.
@@ -259,7 +274,7 @@ impl Step {
         name: &str,
         dtype: DType,
         row_shape: &[usize],
-    ) -> RecurrentState {
+    ) -> Result<RecurrentState, TraceError> {
         self.pooled_state(b, name, dtype, row_shape, StateRole::Recurrent)
     }
 
@@ -272,47 +287,59 @@ impl Step {
         dtype: DType,
         row_shape: &[usize],
         role: StateRole,
-    ) -> RecurrentState {
+    ) -> Result<RecurrentState, TraceError> {
         let rows = self.shape.rows.get();
         let pooled = |leading: usize| {
             let mut shape = vec![leading];
             shape.extend_from_slice(row_shape);
-            b.state_input(name, TensorType::new(shape, dtype), role)
+            Ok::<_, TraceError>(b.state_input(name, TensorType::new(shape, dtype), role)?)
         };
         match self.shape.kv {
             KvLayout::Contiguous => {
-                let pool = pooled(rows);
-                RecurrentState {
+                let pool = pooled(rows)?;
+                Ok(RecurrentState {
                     pool,
                     current: pool,
-                }
+                })
             }
             KvLayout::Paged { seqs, .. } => {
-                let pool = pooled(seqs.get());
-                let current = b.gather(pool, 0, self.state_rows(b, seqs.get()).read);
-                RecurrentState { pool, current }
+                let pool = pooled(seqs.get())?;
+                let current = b.gather(pool, 0, self.state_rows(b, seqs.get())?.read)?;
+                Ok(RecurrentState { pool, current })
             }
         }
     }
 
     /// Carry `next` (`[rows, ..row_shape]`) as the new value of `state`'s rows. Under a paged layout
     /// it is written into the pool rows `state_write` names and every other row passes through.
-    pub fn carry_recurrent(&self, b: &Builder, state: RecurrentState, next: Traced) {
+    pub fn carry_recurrent(
+        &self,
+        b: &Builder,
+        state: RecurrentState,
+        next: Traced,
+    ) -> Result<(), TraceError> {
         let carried = match self.shape.kv {
             KvLayout::Contiguous => next,
             KvLayout::Paged { seqs, .. } => {
-                let rows = self.state_rows(b, seqs.get());
-                b.scatter_update(state.pool, next, rows.write)
+                let rows = self.state_rows(b, seqs.get())?;
+                b.scatter_update(state.pool, next, rows.write)?
             }
         };
         self.carry(state.pool, carried);
+        Ok(())
     }
 
     /// The hidden-state carry the step's shape names, declared once with rows of `width`; `None` for
     /// a step that names none. A step reads it ([`Self::carried_hidden`]) and writes it
     /// ([`Self::carry_hidden`], [`Self::carry_last_hidden`]) through the one handle.
-    pub fn hidden_carry(&self, b: &Builder, width: usize) -> Option<HiddenCarryState> {
-        let carry = self.shape.hidden?;
+    pub fn hidden_carry(
+        &self,
+        b: &Builder,
+        width: usize,
+    ) -> Result<Option<HiddenCarryState>, TraceError> {
+        let Some(carry) = self.shape.hidden else {
+            return Ok(None);
+        };
         let positions = carry.positions.get();
         let state = self.pooled_state(
             b,
@@ -320,24 +347,28 @@ impl Step {
             DType::F32,
             &[positions, width],
             StateRole::Handoff,
-        );
-        Some(HiddenCarryState {
+        )?;
+        Ok(Some(HiddenCarryState {
             state,
             positions,
             width,
-        })
+        }))
     }
 
     /// The first `tokens` rows of `carry` as this step's rows continue them, `[rows, tokens, width]`
     /// F32: the hidden states of the window or chunk an earlier program of the driver step wrote at
     /// the carry's first positions.
-    pub fn carried_hidden(&self, b: &Builder, carry: &HiddenCarryState) -> Traced {
-        b.slice(
+    pub fn carried_hidden(
+        &self,
+        b: &Builder,
+        carry: &HiddenCarryState,
+    ) -> Result<Traced, TraceError> {
+        Ok(b.slice(
             carry.state.current,
             1,
             0,
             self.shape.tokens.get().min(carry.positions),
-        )
+        )?)
     }
 
     /// Write `hidden`, the step's final hidden state `[rows, tokens, width]` F32 at every position,
@@ -347,54 +378,76 @@ impl Step {
     /// wrote, so a reader of the carry must know the length of the last window or chunk and read only
     /// that many rows.
     /// Call it before any last-token slice: the head may stay last-only, the carry does not.
-    pub fn carry_hidden(&self, b: &Builder, hidden: Traced) {
-        let (tokens, width) = hidden_dims(b, hidden);
-        let Some(carry) = self.hidden_carry(b, width) else {
-            return;
+    pub fn carry_hidden(&self, b: &Builder, hidden: Traced) -> Result<(), TraceError> {
+        let (tokens, width) = hidden_dims(b, hidden)?;
+        let Some(carry) = self.hidden_carry(b, width)? else {
+            return Ok(());
         };
-        assert_eq!(tokens, self.shape.tokens.get(), "one hidden row per token");
+        if tokens != self.shape.tokens.get() {
+            return Err(WiringError::HiddenCarryRows {
+                expected: self.shape.tokens.get(),
+                found: tokens,
+            }
+            .into());
+        }
         let next = if tokens == carry.positions {
             hidden
         } else {
-            let kept = b.slice(carry.state.current, 1, tokens, carry.positions);
-            b.concat(1, &[hidden, kept])
+            let kept = b.slice(carry.state.current, 1, tokens, carry.positions)?;
+            b.concat(1, &[hidden, kept])?
         };
-        self.carry_recurrent(b, carry.state, next);
+        self.carry_recurrent(b, carry.state, next)?;
+        Ok(())
     }
 
     /// Write the last position of `hidden` (`[rows, tokens, width]` F32) into row 0 of `carry` and
     /// keep rows `1..positions`: the row a following one-token step of a chain reads. The
     /// [`Phase::Mtp`] program's write, the layer recycling its own output.
-    pub fn carry_last_hidden(&self, b: &Builder, carry: &HiddenCarryState, hidden: Traced) {
-        let (tokens, width) = hidden_dims(b, hidden);
-        assert_eq!(width, carry.width, "the carry's rows are `width` wide");
-        let last = b.slice(hidden, 1, tokens - 1, tokens);
+    pub fn carry_last_hidden(
+        &self,
+        b: &Builder,
+        carry: &HiddenCarryState,
+        hidden: Traced,
+    ) -> Result<(), TraceError> {
+        let (tokens, width) = hidden_dims(b, hidden)?;
+        if width != carry.width {
+            return Err(WiringError::HiddenCarryRows {
+                expected: carry.width,
+                found: width,
+            }
+            .into());
+        }
+        let last = b.slice(hidden, 1, tokens - 1, tokens)?;
         let next = if carry.positions == 1 {
             last
         } else {
-            let kept = b.slice(carry.state.current, 1, 1, carry.positions);
-            b.concat(1, &[last, kept])
+            let kept = b.slice(carry.state.current, 1, 1, carry.positions)?;
+            b.concat(1, &[last, kept])?
         };
-        self.carry_recurrent(b, carry.state, next);
+        self.carry_recurrent(b, carry.state, next)?;
+        Ok(())
     }
 
     /// The pool's index inputs, declared once per step.
-    fn state_rows(&self, b: &Builder, seqs: usize) -> StateRows {
-        *self
-            .state_rows
-            .borrow_mut()
-            .get_or_insert_with(|| StateRows {
-                read: b.slot_named(
-                    Slot::Activation,
-                    STATE_READ_SLOT,
-                    TensorType::new(vec![self.shape.rows.get()], DType::I32),
-                ),
-                write: b.slot_named(
-                    Slot::Activation,
-                    STATE_WRITE_SLOT,
-                    TensorType::new(vec![seqs], DType::I32),
-                ),
-            })
+    fn state_rows(&self, b: &Builder, seqs: usize) -> Result<StateRows, TraceError> {
+        let mut declared = self.state_rows.borrow_mut();
+        if let Some(rows) = *declared {
+            return Ok(rows);
+        }
+        let rows = StateRows {
+            read: b.slot_named(
+                Slot::Activation,
+                STATE_READ_SLOT,
+                TensorType::new(vec![self.shape.rows.get()], DType::I32),
+            )?,
+            write: b.slot_named(
+                Slot::Activation,
+                STATE_WRITE_SLOT,
+                TensorType::new(vec![seqs], DType::I32),
+            )?,
+        };
+        *declared = Some(rows);
+        Ok(rows)
     }
 
     /// Declare `value`, a bounded F32 witness, as validation root `id` named `name`: the executor
@@ -405,7 +458,7 @@ impl Step {
 
     /// The step's graph: `out` plus every carried state pair, in carry order, and every declared
     /// validation root, in declaration order.
-    pub fn finish(self, b: Builder, out: Traced) -> Result<Graph, EditError> {
+    pub fn finish(self, b: Builder, out: Traced) -> Result<Graph, BuilderError> {
         let outputs = self.validations.into_inner().into_iter().fold(
             Outputs::new(out).with_state(&self.state.into_inner()),
             |outputs, (id, name, value)| outputs.with_witness(id, name, value),
@@ -447,7 +500,7 @@ impl LayerNorms {
             )
         };
         let norm = |scale, bias| {
-            Ok(NormWeights {
+            Ok::<_, WeightError>(NormWeights {
                 scale: weight(scale)?,
                 bias: if biased { Some(weight(bias)?) } else { None },
             })
@@ -486,8 +539,8 @@ impl LayerScale {
         Weight::new(map, WeightId::layer(layer, WeightRole::LayerScale), &[1]).map(Self)
     }
 
-    pub fn apply(&self, b: &Builder, x: Traced) -> Traced {
-        b.binary(BinOp::Mul, x, self.0.declare_f32(b))
+    pub fn apply(&self, b: &Builder, x: Traced) -> Result<Traced, TraceError> {
+        Ok(b.binary(BinOp::Mul, x, self.0.declare_f32(b)?)?)
     }
 }
 
@@ -553,13 +606,13 @@ pub fn standard_layer(
     x: Traced,
     norms: &LayerNorms,
     p: &LayerParams,
-    mixer: impl FnOnce(&Builder, Traced) -> Traced,
-    ffn: impl FnOnce(&Builder, BlockInput) -> Traced,
-) -> Traced {
+    mixer: impl FnOnce(&Builder, Traced) -> Result<Traced, TraceError>,
+    ffn: impl FnOnce(&Builder, BlockInput) -> Result<Traced, TraceError>,
+) -> Result<Traced, TraceError> {
     let post = |i: usize| norms.post.as_ref().map(|post| &post[i]);
     let x = residual_block(b, x, &norms.attn, post(0), p, |b, input| {
         mixer(b, input.block)
-    });
+    })?;
     residual_block(b, x, &norms.ffn, post(1), p, ffn)
 }
 
@@ -578,22 +631,27 @@ fn residual_block(
     w: &NormWeights,
     post: Option<&Weight>,
     p: &LayerParams,
-    block: impl FnOnce(&Builder, BlockInput) -> Traced,
-) -> Traced {
+    block: impl FnOnce(&Builder, BlockInput) -> Result<Traced, TraceError>,
+) -> Result<Traced, TraceError> {
     let input = |block| BlockInput { block, residual: x };
     let out = match p.placement {
-        NormPlacement::Pre => block(b, input(norm_with(b, x, w, p.norm))),
-        NormPlacement::Post => norm_with(b, block(b, input(x)), w, p.norm),
+        NormPlacement::Pre => block(b, input(norm_with(b, x, w, p.norm)?))?,
+        NormPlacement::Post => norm_with(b, block(b, input(x))?, w, p.norm)?,
         NormPlacement::Sandwich => {
-            let post = post.expect("a Sandwich layer is built with LayerNorms::sandwich");
-            norm(b, block(b, input(norm_with(b, x, w, p.norm))), post, p.norm)
+            let post = post.ok_or(WiringError::SandwichWithoutPostNorms)?;
+            norm(
+                b,
+                block(b, input(norm_with(b, x, w, p.norm)?))?,
+                post,
+                p.norm,
+            )?
         }
     };
     let out = match p.residual_scale {
-        Some(scale) => b.binary_scalar(BinOp::Mul, out, Builder::f32(scale)),
+        Some(scale) => b.binary_scalar(BinOp::Mul, out, Builder::f32(scale))?,
         None => out,
     };
-    b.binary(BinOp::Add, x, out)
+    Ok(b.binary(BinOp::Add, x, out)?)
 }
 
 /// The model-level weights around the layers.
@@ -710,52 +768,52 @@ pub fn standard_stack(
     w: &StackWeights,
     p: &StackParams,
     layers: usize,
-    mut layer: impl FnMut(&Builder, usize, Traced) -> Traced,
-) -> Traced {
-    let mut x = w.embed.embed(b, step.tokens());
+    mut layer: impl FnMut(&Builder, usize, Traced) -> Result<Traced, TraceError>,
+) -> Result<Traced, TraceError> {
+    let mut x = w.embed.embed(b, step.tokens())?;
     if let Some(scale) = p.embed_scale {
-        x = b.binary_scalar(BinOp::Mul, x, Builder::f32(scale));
+        x = b.binary_scalar(BinOp::Mul, x, Builder::f32(scale))?;
     }
     if let Some(embed_norm) = &w.embed_norm {
-        x = norm_with(b, x, embed_norm, p.norm);
+        x = norm_with(b, x, embed_norm, p.norm)?;
     }
     // The caller's rows are the layer input itself: they replace the embedded tokens, after the
     // embedding's own scale and norm.
     if let Some(embeds) = step.embeds() {
-        x = embeds.scatter(b, x);
+        x = embeds.scatter(b, x)?;
     }
     for l in 0..layers {
         let _scope = b.layer_scope(l);
-        x = layer(b, l, x);
+        x = layer(b, l, x)?;
     }
     let tokens = step.shape().tokens.get();
     let last_only = step.shape().logits == LogitRows::Last && tokens > 1;
     let x = if step.shape().hidden.is_some() {
         // The carry takes every position's normed state; only then does the head narrow to the last.
-        let normed = norm_with(b, x, &w.final_norm, p.norm);
-        step.carry_hidden(b, normed);
+        let normed = norm_with(b, x, &w.final_norm, p.norm)?;
+        step.carry_hidden(b, normed)?;
         if last_only {
-            b.slice(normed, 1, tokens - 1, tokens)
+            b.slice(normed, 1, tokens - 1, tokens)?
         } else {
             normed
         }
     } else {
         if last_only {
-            x = b.slice(x, 1, tokens - 1, tokens);
+            x = b.slice(x, 1, tokens - 1, tokens)?;
         }
-        norm_with(b, x, &w.final_norm, p.norm)
+        norm_with(b, x, &w.final_norm, p.norm)?
     };
     if step.head() == HeadKind::Hidden {
-        return x;
+        return Ok(x);
     }
-    let logits = w.head.logits(b, x);
+    let logits = w.head.logits(b, x)?;
     let logits = match p.logit_divisor {
-        Some(divisor) => b.binary_scalar(BinOp::Div, logits, Builder::f32(divisor)),
+        Some(divisor) => b.binary_scalar(BinOp::Div, logits, Builder::f32(divisor))?,
         None => logits,
     };
     match p.softcap {
-        Some(cap) => ops::softcap(b, logits, cap),
-        None => logits,
+        Some(cap) => Ok(ops::softcap(b, logits, cap)?),
+        None => Ok(logits),
     }
 }
 
@@ -1350,8 +1408,32 @@ pub(crate) mod oracle {
         start: i32,
         state: &[Vec<f32>],
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        run_shape_under(
+            poot_graph_ir::TraceLimits::for_tests(),
+            model,
+            store,
+            phase,
+            shape,
+            tokens,
+            start,
+            state,
+        )
+    }
+
+    /// [`run_shape`] with the step traced under the caller's `limits`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_shape_under(
+        limits: poot_graph_ir::TraceLimits,
+        model: &dyn crate::model::Model,
+        store: &WeightStore,
+        phase: crate::model::Phase,
+        shape: StepShape,
+        tokens: &[i32],
+        start: i32,
+        state: &[Vec<f32>],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
         assert_eq!(shape.tokens.get(), tokens.len(), "one token per position");
-        let g = model.trace(phase, shape).unwrap();
+        let g = model.trace(phase, shape, limits).unwrap();
         let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
         let g = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
         let zeros: Vec<Vec<f32>> = g
@@ -1448,8 +1530,8 @@ mod tests {
                 Weight::new(&map, mix, &[w, w]).unwrap(),
                 Weight::new(&map, feed, &[w, w]).unwrap(),
             );
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
             let y = standard_layer(
                 &b,
                 xs,
@@ -1457,7 +1539,8 @@ mod tests {
                 &LayerParams::new(NormParams::new(eps as f32).unwrap()),
                 |b, h| super::super::linear::linear(b, h, &m, None),
                 |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
-            );
+            )
+            .unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
@@ -1509,16 +1592,17 @@ mod tests {
                 logits,
                 hidden: None,
             };
-            let b = Builder::new();
-            let step = Step::new(&b, shape);
+            let b = Builder::for_tests();
+            let step = Step::new(&b, shape).unwrap();
             let out = standard_stack(
                 &b,
                 &step,
                 &sw,
                 &StackParams::new(NormParams::new(eps).unwrap()),
                 2,
-                |_, _, x| x,
-            );
+                |_, _, x| Ok(x),
+            )
+            .unwrap();
             let g = step.finish(b, out).unwrap();
             assert_eq!(g.state().count(), 0);
             fx.eval(
@@ -1581,16 +1665,17 @@ mod tests {
                     positions: NonZeroUsize::new(positions).unwrap(),
                 }),
             };
-            let b = Builder::new();
-            let step = Step::new(&b, shape);
+            let b = Builder::for_tests();
+            let step = Step::new(&b, shape).unwrap();
             let out = standard_stack(
                 &b,
                 &step,
                 &sw,
                 &StackParams::new(NormParams::new(eps).unwrap()),
                 2,
-                |_, _, x| x,
-            );
+                |_, _, x| Ok(x),
+            )
+            .unwrap();
             let g = step.finish(b, out).unwrap();
             let pos: Vec<i32> = (start..).take(tokens.len()).collect();
             let zeros = vec![vec![0.0; positions * w]];
@@ -1698,8 +1783,8 @@ mod tests {
                 .with_placement(placement)
                 .with_residual_scale(scale)
                 .unwrap();
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
             let y = standard_layer(
                 &b,
                 xs,
@@ -1707,7 +1792,8 @@ mod tests {
                 &params,
                 |b, h| super::super::linear::linear(b, h, &m, None),
                 |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
-            );
+            )
+            .unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx, NormPlacement::Post);
@@ -1761,9 +1847,9 @@ mod tests {
                 logits: LogitRows::All,
                 hidden: None,
             };
-            let b = Builder::new();
-            let step = Step::new(&b, shape);
-            let out = standard_stack(&b, &step, &sw, &params, 1, |_, _, x| x);
+            let b = Builder::for_tests();
+            let step = Step::new(&b, shape).unwrap();
+            let out = standard_stack(&b, &step, &sw, &params, 1, |_, _, x| Ok(x)).unwrap();
             fx.eval(
                 &step.finish(b, out).unwrap(),
                 &[],
@@ -1840,8 +1926,8 @@ mod tests {
                 NormParams::of(super::super::norm::NormKind::RmsPlusOne, eps).unwrap(),
             )
             .with_placement(NormPlacement::Sandwich);
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
             let y = standard_layer(
                 &b,
                 xs,
@@ -1849,7 +1935,8 @@ mod tests {
                 &params,
                 |b, h| super::super::linear::linear(b, h, &m, None),
                 |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
-            );
+            )
+            .unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
@@ -1944,8 +2031,8 @@ mod tests {
                 Weight::new(&map, feed, &[w, w]).unwrap(),
             );
             let params = LayerParams::new(NormParams::of(NormKind::Layer, eps).unwrap());
-            let b = Builder::new();
-            let xs = b.constant("x", TensorType::f32(vec![t, w]));
+            let b = Builder::for_tests();
+            let xs = b.constant("x", TensorType::f32(vec![t, w])).unwrap();
             let y = standard_layer(
                 &b,
                 xs,
@@ -1953,7 +2040,8 @@ mod tests {
                 &params,
                 |b, h| super::super::linear::linear(b, h, &m, None),
                 |b, BlockInput { block: h, .. }| super::super::linear::linear(b, h, &f, None),
-            );
+            )
+            .unwrap();
             fx.eval(&b.finish(y).unwrap(), &[("x", &x)], &[], &[]).0
         };
         let got = run(&fx);
@@ -2025,10 +2113,10 @@ mod tests {
                 logits: LogitRows::All,
                 hidden: None,
             };
-            let b = Builder::new();
-            let step = Step::new(&b, shape);
+            let b = Builder::for_tests();
+            let step = Step::new(&b, shape).unwrap();
             let params = StackParams::new(NormParams::of(NormKind::Layer, eps).unwrap());
-            let out = standard_stack(&b, &step, &sw, &params, 1, |_, _, x| x);
+            let out = standard_stack(&b, &step, &sw, &params, 1, |_, _, x| Ok(x)).unwrap();
             fx.eval(
                 &step.finish(b, out).unwrap(),
                 &[],

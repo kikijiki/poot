@@ -15,7 +15,7 @@ use super::linear::{Weight, WeightError, linear};
 use super::norm::NormParams;
 use super::standard::{ParamError, Step};
 use super::witness::{self, WitnessKind};
-use crate::model::ConfigReason;
+use crate::model::{ConfigReason, TraceError, WiringError};
 
 /// How the selected experts' scores become weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,7 +292,12 @@ impl RouterWeights {
                 .transpose()?,
             scaled_input: p
                 .scaled_input
-                .map(|norm| Ok((norm, Weight::new(map, id(MoeRole::RouterScale), &[width])?)))
+                .map(|norm| {
+                    Ok::<_, WeightError>((
+                        norm,
+                        Weight::new(map, id(MoeRole::RouterScale), &[width])?,
+                    ))
+                })
                 .transpose()?,
             expert_scale: p
                 .expert_scale
@@ -325,27 +330,31 @@ pub fn route(
     x: Traced,
     w: &RouterWeights,
     p: &RouterParams,
-) -> Routes {
+) -> Result<Routes, TraceError> {
     let added = w
         .bias
         .as_ref()
         .filter(|_| p.bias == Some(RouterBias::AddedToLogits));
-    let logits = linear(b, scaled_input(b, x, w), &w.weight, added);
+    let logits = linear(b, scaled_input(b, x, w)?, &w.weight, added)?;
     witness::declare(
         step,
         layer,
         WitnessKind::RouterLogitsFinite,
-        witness::nonfinite_count(b, logits),
-    );
+        witness::nonfinite_count(b, logits)?,
+    )?;
 
     // The values the selection ranks, and the router's own decision of what a group scores.
     let selection = match p.kind {
         RouterKind::SigmoidBiasedTopK(_) | RouterKind::SqrtSoftplusBiasedTopK => {
-            let scores = scores(b, logits, p.kind);
+            let scores = scores(b, logits, p.kind)?;
             match (&w.bias, p.bias) {
                 (Some(bias), Some(RouterBias::SelectionOnly)) => {
-                    let shape = b.aval(scores).shape;
-                    b.binary(BinOp::Add, scores, b.broadcast(bias.declare_f32(b), shape))
+                    let shape = b.aval(scores)?.shape;
+                    b.binary(
+                        BinOp::Add,
+                        scores,
+                        b.broadcast(bias.declare_f32(b)?, shape)?,
+                    )?
                 }
                 _ => scores,
             }
@@ -353,68 +362,69 @@ pub fn route(
         RouterKind::SoftmaxTopK { .. } | RouterKind::TopKSoftmax => logits,
     };
     let rank = match p.group_limit {
-        None => ops::stable_descending_rank(b, selection),
+        None => ops::stable_descending_rank(b, selection)?,
         Some(limit) => {
-            let eligible = group_eligible(b, selection, p.kind, limit, p.experts);
-            ops::stable_descending_rank_masked(b, selection, eligible)
+            let eligible = group_eligible(b, selection, p.kind, limit, p.experts)?;
+            ops::stable_descending_rank_masked(b, selection, eligible)?
         }
     };
-    let ids = b.arg_top_k(rank, p.top_k);
+    let ids = b.arg_top_k(rank, p.top_k)?;
     witness::declare(
         step,
         layer,
         WitnessKind::SelectorInRange,
-        witness::out_of_range_count(b, ids, p.experts),
-    );
+        witness::out_of_range_count(b, ids, p.experts)?,
+    )?;
 
     let gate = match p.kind {
         RouterKind::SoftmaxTopK { renormalize } => {
-            softmax_top_k(b, logits, rank, p.top_k, renormalize)
+            softmax_top_k(b, logits, rank, p.top_k, renormalize)?
         }
-        RouterKind::TopKSoftmax => softmax_top_k(b, logits, rank, p.top_k, true),
+        RouterKind::TopKSoftmax => softmax_top_k(b, logits, rank, p.top_k, true)?,
         RouterKind::SigmoidBiasedTopK(SigmoidTopK { renormalize }) => {
-            biased_top_k(b, logits, p.kind, rank, p.top_k, renormalize)
+            biased_top_k(b, logits, p.kind, rank, p.top_k, renormalize)?
         }
-        RouterKind::SqrtSoftplusBiasedTopK => biased_top_k(b, logits, p.kind, rank, p.top_k, true),
+        RouterKind::SqrtSoftplusBiasedTopK => biased_top_k(b, logits, p.kind, rank, p.top_k, true)?,
     };
     witness::declare(
         step,
         layer,
         WitnessKind::SelectedSumUsable,
-        witness::unusable_sum_count(b, gate.denominator),
-    );
+        witness::unusable_sum_count(b, gate.denominator)?,
+    )?;
     let weights = match &w.expert_scale {
         Some(scale) => {
-            let shape = b.aval(gate.weights).shape;
-            let scale = b.broadcast(b.reshape(scale.declare_f32(b), vec![1, p.experts]), shape);
-            b.binary(BinOp::Mul, gate.weights, scale)
+            let shape = b.aval(gate.weights)?.shape;
+            let scale =
+                b.broadcast(b.reshape(scale.declare_f32(b)?, vec![1, p.experts])?, shape)?;
+            b.binary(BinOp::Mul, gate.weights, scale)?
         }
         None => gate.weights,
     };
-    let weights = by_slot(b, rank, weights, p.top_k);
-    Routes {
+    let weights = by_slot(b, rank, weights, p.top_k)?;
+    Ok(Routes {
         ids,
         weights: match p.scale {
-            Some(scale) => b.binary_scalar(BinOp::Mul, weights, Scalar::F32(scale)),
+            Some(scale) => b.binary_scalar(BinOp::Mul, weights, Scalar::F32(scale))?,
             None => weights,
         },
-    }
+    })
 }
 
 /// The router's input: `x`, or with a scaled input `rmsnorm(x) * scale / sqrt(width)`.
-fn scaled_input(b: &Builder, x: Traced, w: &RouterWeights) -> Traced {
+fn scaled_input(b: &Builder, x: Traced, w: &RouterWeights) -> Result<Traced, TraceError> {
     let Some((norm, scale)) = &w.scaled_input else {
-        return x;
+        return Ok(x);
     };
-    let shape = b.aval(x).shape;
+    let shape = b.aval(x)?.shape;
     let width = shape[shape.len() - 1];
-    let normed = ops::rmsnorm_no_weight(b, x, norm.eps());
-    let scaled = b.binary(BinOp::Mul, normed, scale.declare_f32(b));
-    b.binary_scalar(
+    let normed = ops::rmsnorm_no_weight(b, x, norm.eps())?;
+    let scaled = b.binary(BinOp::Mul, normed, scale.declare_f32(b)?)?;
+    Ok(b.binary_scalar(
         BinOp::Mul,
         scaled,
         Builder::f32(1.0 / (width as f32).sqrt()),
-    )
+    )?)
 }
 
 /// `1.0` for the experts of the `limit.keep` best groups of each token, `0.0` elsewhere `[T, E]`. A
@@ -427,36 +437,36 @@ fn group_eligible(
     kind: RouterKind,
     limit: GroupLimit,
     experts: usize,
-) -> Traced {
-    let t = b.aval(selection).shape[0];
+) -> Result<Traced, TraceError> {
+    let t = b.aval(selection)?.shape[0];
     let size = experts / limit.groups;
-    let scores = ops::canonical_router_scores(b, selection);
-    let grouped = b.reshape(scores, vec![t, limit.groups, size]);
+    let scores = ops::canonical_router_scores(b, selection)?;
+    let grouped = b.reshape(scores, vec![t, limit.groups, size])?;
     let score = match kind {
         RouterKind::SigmoidBiasedTopK(_) => {
-            let rank = ops::stable_descending_rank(b, grouped);
-            let two_best = ops::top_k_keep_mask(b, rank, 2);
+            let rank = ops::stable_descending_rank(b, grouped)?;
+            let two_best = ops::top_k_keep_mask(b, rank, 2)?;
             b.reduce(
                 RedOp::Sum,
-                b.binary(BinOp::Mul, grouped, two_best),
+                b.binary(BinOp::Mul, grouped, two_best)?,
                 2,
                 false,
-            )
+            )?
         }
         RouterKind::SoftmaxTopK { .. } | RouterKind::TopKSoftmax => {
-            b.reduce(RedOp::Max, grouped, 2, false)
+            b.reduce(RedOp::Max, grouped, 2, false)?
         }
         RouterKind::SqrtSoftplusBiasedTopK => {
-            unreachable!("RouterParams::with_group_limit refuses the sqrt-softplus arm")
+            return Err(WiringError::GroupLimitOnSqrtSoftplus.into());
         }
     }; // [T, groups]
-    let rank = ops::stable_descending_rank(b, score);
-    let keep = ops::top_k_keep_mask(b, rank, limit.keep); // [T, groups]
+    let rank = ops::stable_descending_rank(b, score)?;
+    let keep = ops::top_k_keep_mask(b, rank, limit.keep)?; // [T, groups]
     let keep = b.broadcast(
-        b.reshape(keep, vec![t, limit.groups, 1]),
+        b.reshape(keep, vec![t, limit.groups, 1])?,
         vec![t, limit.groups, size],
-    );
-    b.reshape(keep, vec![t, experts])
+    )?;
+    Ok(b.reshape(keep, vec![t, experts])?)
 }
 
 /// The gate of every expert (`0` outside the selection) and the softmax denominator it divides by.
@@ -476,35 +486,35 @@ fn softmax_top_k(
     rank: Traced,
     top_k: usize,
     renormalize: bool,
-) -> Gate {
-    let last = b.aval(logits).shape.len() - 1;
-    let scores = ops::canonical_router_scores(b, logits);
-    let keep = ops::top_k_keep_mask(b, rank, top_k);
+) -> Result<Gate, TraceError> {
+    let last = b.aval(logits)?.shape.len() - 1;
+    let scores = ops::canonical_router_scores(b, logits)?;
+    let keep = ops::top_k_keep_mask(b, rank, top_k)?;
     // The best expert is selected for every `top_k >= 1`, so the maximum is shared by the
     // selection and the full sum, and every denominator holds at least `exp(0) = 1`.
-    let max = b.reduce(RedOp::Max, scores, last, true);
-    let exp = b.unary(UnOp::Exp, b.binary(BinOp::Sub, scores, max));
-    let selected = b.binary(BinOp::Mul, exp, keep);
+    let max = b.reduce(RedOp::Max, scores, last, true)?;
+    let exp = b.unary(UnOp::Exp, b.binary(BinOp::Sub, scores, max)?)?;
+    let selected = b.binary(BinOp::Mul, exp, keep)?;
     let denominator = if renormalize {
-        b.reduce(RedOp::Sum, selected, last, true)
+        b.reduce(RedOp::Sum, selected, last, true)?
     } else {
-        b.reduce(RedOp::Sum, exp, last, true)
+        b.reduce(RedOp::Sum, exp, last, true)?
     };
-    Gate {
-        weights: b.binary(BinOp::Div, selected, denominator),
+    Ok(Gate {
+        weights: b.binary(BinOp::Div, selected, denominator)?,
         denominator,
-    }
+    })
 }
 
 /// The score of every expert for a biased top-k router: the per-expert value the selection bias
 /// is added to and the gates are taken from. Not the logits themselves, and not defined for the
 /// softmax arms.
-pub fn scores(b: &Builder, logits: Traced, kind: RouterKind) -> Traced {
+pub fn scores(b: &Builder, logits: Traced, kind: RouterKind) -> Result<Traced, TraceError> {
     match kind {
-        RouterKind::SigmoidBiasedTopK(_) => ops::sigmoid(b, logits),
-        RouterKind::SqrtSoftplusBiasedTopK => b.unary(UnOp::Sqrt, ops::softplus(b, logits)),
+        RouterKind::SigmoidBiasedTopK(_) => Ok(ops::sigmoid(b, logits)?),
+        RouterKind::SqrtSoftplusBiasedTopK => Ok(b.unary(UnOp::Sqrt, ops::softplus(b, logits)?)?),
         RouterKind::SoftmaxTopK { .. } | RouterKind::TopKSoftmax => {
-            unreachable!("only a biased top-k router scores each expert on its own")
+            Err(WiringError::ScoresOfSoftmaxRouter.into())
         }
     }
 }
@@ -519,35 +529,35 @@ fn biased_top_k(
     rank: Traced,
     top_k: usize,
     renormalize: bool,
-) -> Gate {
-    let last = b.aval(logits).shape.len() - 1;
-    let scores = ops::canonical_router_scores(b, scores(b, logits, kind));
-    let keep = ops::top_k_keep_mask(b, rank, top_k);
-    let selected = b.binary(BinOp::Mul, scores, keep);
-    let denominator = b.reduce(RedOp::Sum, selected, last, true);
-    Gate {
+) -> Result<Gate, TraceError> {
+    let last = b.aval(logits)?.shape.len() - 1;
+    let scores = ops::canonical_router_scores(b, scores(b, logits, kind)?)?;
+    let keep = ops::top_k_keep_mask(b, rank, top_k)?;
+    let selected = b.binary(BinOp::Mul, scores, keep)?;
+    let denominator = b.reduce(RedOp::Sum, selected, last, true)?;
+    Ok(Gate {
         weights: if renormalize {
-            b.binary(BinOp::Div, selected, denominator)
+            b.binary(BinOp::Div, selected, denominator)?
         } else {
             selected
         },
         denominator,
-    }
+    })
 }
 
 /// `gate[T, E]` read at each token's slots: `out[t, r]` is the gate of the expert ranked `r`, a sum
 /// over the expert axis of `(rank == r) * gate` (the rank is an exact integer permutation).
-fn by_slot(b: &Builder, rank: Traced, gate: Traced, top_k: usize) -> Traced {
-    let shape = b.aval(rank).shape;
+fn by_slot(b: &Builder, rank: Traced, gate: Traced, top_k: usize) -> Result<Traced, TraceError> {
+    let shape = b.aval(rank)?.shape;
     let (t, e) = (shape[0], shape[1]);
-    let slots = b.slice(b.iota(e), 0, 0, top_k);
-    let rank = b.broadcast(b.reshape(rank, vec![t, 1, e]), vec![t, top_k, e]);
-    let slots = b.broadcast(b.reshape(slots, vec![1, top_k, 1]), vec![t, top_k, e]);
-    let at_least = b.binary(BinOp::Ge, rank, slots);
-    let at_most = b.binary(BinOp::Ge, slots, rank);
-    let is_slot = b.binary(BinOp::Mul, at_least, at_most);
-    let gate = b.broadcast(b.reshape(gate, vec![t, 1, e]), vec![t, top_k, e]);
-    b.reduce(RedOp::Sum, b.binary(BinOp::Mul, is_slot, gate), 2, false)
+    let slots = b.slice(b.iota(e)?, 0, 0, top_k)?;
+    let rank = b.broadcast(b.reshape(rank, vec![t, 1, e])?, vec![t, top_k, e])?;
+    let slots = b.broadcast(b.reshape(slots, vec![1, top_k, 1])?, vec![t, top_k, e])?;
+    let at_least = b.binary(BinOp::Ge, rank, slots)?;
+    let at_most = b.binary(BinOp::Ge, slots, rank)?;
+    let is_slot = b.binary(BinOp::Mul, at_least, at_most)?;
+    let gate = b.broadcast(b.reshape(gate, vec![t, 1, e])?, vec![t, top_k, e])?;
+    Ok(b.reduce(RedOp::Sum, b.binary(BinOp::Mul, is_slot, gate)?, 2, false)?)
 }
 
 #[cfg(test)]
@@ -603,10 +613,10 @@ mod tests {
         let eval = |pick: fn(&Routes) -> Traced| {
             let map = fx.map();
             let w = RouterWeights::new(&map, 0, WIDTH, p).unwrap();
-            let b = Builder::new();
-            let step = Step::new(&b, step_shape(T, CAP, LogitRows::All));
-            let xs = b.constant("x", TensorType::f32(vec![T, WIDTH]));
-            let routes = route(&b, &step, 0, xs, &w, p);
+            let b = Builder::for_tests();
+            let step = Step::new(&b, step_shape(T, CAP, LogitRows::All)).unwrap();
+            let xs = b.constant("x", TensorType::f32(vec![T, WIDTH])).unwrap();
+            let routes = route(&b, &step, 0, xs, &w, p).unwrap();
             let g = b.finish(pick(&routes)).unwrap();
             let tokens = vec![0; T];
             let pos: Vec<i32> = (0..T as i32).collect();
@@ -987,12 +997,14 @@ mod tests {
             .collect::<Vec<_>>();
         let bias = fx.values(bias_id());
         let reference = |pick: fn((Traced, Traced)) -> Traced| {
-            let b = Builder::new();
-            let l = b.constant("l", TensorType::f32(vec![T, EXPERTS]));
-            let bs = b.constant("bias", TensorType::f32(vec![EXPERTS]));
-            let out = pick(crate::deepseek3::deepseek3_router_gate_and_ids(
-                &b, l, bs, TOP_K, 3, 2, 2.5,
-            ));
+            let b = Builder::for_tests();
+            let l = b.constant("l", TensorType::f32(vec![T, EXPERTS])).unwrap();
+            let bs = b.constant("bias", TensorType::f32(vec![EXPERTS])).unwrap();
+            let out = pick(
+                crate::architectures::deepseek3::tests::deepseek3_router_gate_and_ids(
+                    &b, l, bs, TOP_K, 3, 2, 2.5,
+                ),
+            );
             let g = b.finish(out).unwrap();
             fx.eval(&g, &[("l", &logits), ("bias", &bias)], &[], &[]).0
         };

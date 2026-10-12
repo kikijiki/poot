@@ -2,7 +2,7 @@
 //! [`OpKind::RandomUniform`] and the oracle share), the Gumbel-noise composition, and [`sample_head`],
 //! the suffix a driver (card 551b) appends after a graph's raw logits.
 
-use super::*;
+use super::{Builder, BuilderError, DType, TensorType, Traced, UnOp};
 use crate::graph::Slot;
 use crate::op::SampleRule;
 
@@ -25,9 +25,9 @@ pub const fn hash32(seed: u32, idx: u32) -> u32 {
 /// an ordinary composition of [`UnOp::Log`] and [`UnOp::Neg`] that `fuse` folds into the rest of the
 /// sampler suffix's elementwise kernel. Device-versus-oracle agreement on this transform is tier 2
 /// (ADR-0101): exact only when both sides are handed the identical `u`.
-pub fn gumbel(b: &Builder, u: Traced) -> Traced {
-    let neg_log_u = b.unary(UnOp::Neg, b.unary(UnOp::Log, u));
-    b.unary(UnOp::Neg, b.unary(UnOp::Log, neg_log_u))
+pub fn gumbel(b: &Builder, u: Traced) -> Result<Traced, BuilderError> {
+    let neg_log_u = b.unary(UnOp::Neg, b.unary(UnOp::Log, u)?)?;
+    b.unary(UnOp::Neg, b.unary(UnOp::Log, neg_log_u)?)
 }
 
 /// A finished sampler suffix (card 551a, R-551a-3/R-551a-4): the `[.., 2]` I32 `(token, non_finite)`
@@ -50,28 +50,30 @@ pub struct SampleHead {
 /// with [`gumbel`]; `sample_token` then maximizes `logits[i]*inv_temp + noise_scale*noise[i]` inside the
 /// kept set (deval.md section 8.1). One call declares at most one occurrence of each tag, so a graph
 /// with more than one sampler suffix (none does today) would need distinct tags - out of scope here.
-pub fn sample_head(b: &Builder, logits: Traced, rule: SampleRule) -> SampleHead {
+pub fn sample_head(
+    b: &Builder,
+    logits: Traced,
+    rule: SampleRule,
+) -> Result<SampleHead, BuilderError> {
     if matches!(rule, SampleRule::Greedy) {
-        let out = b.sample_token(rule, logits, None, None, None);
-        return SampleHead {
+        let out = b.sample_token(rule, logits, None, None, None)?;
+        return Ok(SampleHead {
             out,
             seed: None,
             params: None,
             top_k: None,
-        };
+        });
     }
-    let shape = b.aval(logits).shape;
+    let shape = b.aval(logits)?.shape;
     let rank = shape.len();
     let leading = shape[..rank - 1].to_vec();
-    let vocab = *shape
-        .last()
-        .expect("sample_head: logits needs a vocab axis");
+    let vocab = super::last_axis("sample_head", &shape)?;
 
     let seed = b.slot_named(
         Slot::Sampler,
         "seed",
         TensorType::new(leading.clone(), DType::I32),
-    );
+    )?;
     let params_cols = if matches!(rule, SampleRule::GumbelTopKTopP) {
         4
     } else {
@@ -83,24 +85,24 @@ pub fn sample_head(b: &Builder, logits: Traced, rule: SampleRule) -> SampleHead 
         Slot::Sampler,
         "params",
         TensorType::new(params_shape, DType::F32),
-    );
+    )?;
     let top_k = if matches!(rule, SampleRule::GumbelTopK | SampleRule::GumbelTopKTopP) {
         Some(b.slot_named(
             Slot::Sampler,
             "top_k",
             TensorType::new(leading.clone(), DType::I32),
-        ))
+        )?)
     } else {
         None
     };
 
-    let u = b.random_uniform(seed, vocab); // [leading.., vocab] == logits' shape
-    let noise = gumbel(b, u);
-    let out = b.sample_token(rule, logits, Some(noise), Some(params), top_k);
-    SampleHead {
+    let u = b.random_uniform(seed, vocab)?; // [leading.., vocab] == logits' shape
+    let noise = gumbel(b, u)?;
+    let out = b.sample_token(rule, logits, Some(noise), Some(params), top_k)?;
+    Ok(SampleHead {
         out,
         seed: Some(seed),
         params: Some(params),
         top_k,
-    }
+    })
 }

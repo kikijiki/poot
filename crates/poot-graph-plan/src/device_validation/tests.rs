@@ -10,12 +10,17 @@ const MAX: f32 = f32::MAX;
 
 /// `1 - Ge(x, -MAX) * Ge(-x, -MAX)`: one invalid flag per lane, 1 for NaN and both infinities.
 fn nonfinite_flags(b: &Builder, x: Traced) -> Traced {
-    let not_below = b.binary_scalar(BinOp::Ge, x, Scalar::F32(-MAX));
-    let negated = b.unary(UnOp::Neg, x);
-    let not_above = b.binary_scalar(BinOp::Ge, negated, Scalar::F32(-MAX));
-    let finite = b.binary(BinOp::Mul, not_below, not_above);
-    let negative = b.binary_scalar(BinOp::Mul, finite, Scalar::F32(-1.0));
+    let not_below = b.binary_scalar(BinOp::Ge, x, Scalar::F32(-MAX)).unwrap();
+    let negated = b.unary(UnOp::Neg, x).unwrap();
+    let not_above = b
+        .binary_scalar(BinOp::Ge, negated, Scalar::F32(-MAX))
+        .unwrap();
+    let finite = b.binary(BinOp::Mul, not_below, not_above).unwrap();
+    let negative = b
+        .binary_scalar(BinOp::Mul, finite, Scalar::F32(-1.0))
+        .unwrap();
     b.binary_scalar(BinOp::Add, negative, Scalar::F32(1.0))
+        .unwrap()
 }
 
 fn rejection(result: Result<(), PlanError>) -> (ValidationId, ValueId, DeviceWitnessRejection) {
@@ -27,32 +32,42 @@ fn rejection(result: Result<(), PlanError>) -> (ValidationId, ValueId, DeviceWit
 
 #[test]
 fn device_witness_admits_spec_recipes() {
-    let b = Builder::new();
-    let weight = b.constant("weight", TensorType::f32(vec![4, 3]));
-    let activation = b.constant("activation", TensorType::f32(vec![2, 4]));
-    let logits = b.matmul(activation, weight);
+    let b = Builder::for_tests();
+    let weight = b.constant("weight", TensorType::f32(vec![4, 3])).unwrap();
+    let activation = b
+        .constant("activation", TensorType::f32(vec![2, 4]))
+        .unwrap();
+    let logits = b.matmul(activation, weight).unwrap();
 
     // Nonfinite router logits, reduced to one lane.
     let flags = nonfinite_flags(&b, logits);
-    let flat = b.reshape(flags, vec![6]);
-    let nonfinite = b.reduce(RedOp::Max, flat, 0, true);
+    let flat = b.reshape(flags, vec![6]).unwrap();
+    let nonfinite = b.reduce(RedOp::Max, flat, 0, true).unwrap();
 
     // A nonpositive selected-score sum: Ge(-sum, 0).
-    let sum = b.reduce(RedOp::Sum, logits, 1, false);
-    let negated = b.unary(UnOp::Neg, sum);
-    let nonpositive = b.binary_scalar(BinOp::Ge, negated, Scalar::F32(0.0));
+    let sum = b.reduce(RedOp::Sum, logits, 1, false).unwrap();
+    let negated = b.unary(UnOp::Neg, sum).unwrap();
+    let nonpositive = b
+        .binary_scalar(BinOp::Ge, negated, Scalar::F32(0.0))
+        .unwrap();
 
     // Exact I32 selector bounds for 3 experts, cast to F32 before the count is reduced.
-    let raw = b.constant("raw", TensorType::new(vec![4], DType::I32));
-    let at_least_zero = b.binary_scalar(BinOp::Ge, raw, Scalar::I32(0));
-    let too_large = b.binary_scalar(BinOp::Ge, raw, Scalar::I32(3));
-    let flipped = b.binary_scalar(BinOp::Mul, at_least_zero, Scalar::I32(-1));
-    let below_zero = b.binary_scalar(BinOp::Add, flipped, Scalar::I32(1));
-    let either = b.select(at_least_zero, too_large, below_zero);
-    let as_f32 = b.cast(either, DType::F32);
-    let bounds = b.reduce(RedOp::Sum, as_f32, 0, true);
+    let raw = b
+        .constant("raw", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let at_least_zero = b.binary_scalar(BinOp::Ge, raw, Scalar::I32(0)).unwrap();
+    let too_large = b.binary_scalar(BinOp::Ge, raw, Scalar::I32(3)).unwrap();
+    let flipped = b
+        .binary_scalar(BinOp::Mul, at_least_zero, Scalar::I32(-1))
+        .unwrap();
+    let below_zero = b
+        .binary_scalar(BinOp::Add, flipped, Scalar::I32(1))
+        .unwrap();
+    let either = b.select(at_least_zero, too_large, below_zero).unwrap();
+    let as_f32 = b.cast(either, DType::F32).unwrap();
+    let bounds = b.reduce(RedOp::Sum, as_f32, 0, true).unwrap();
 
-    let graph = crate::test_support::finish_with_validations(
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         logits,
         &[
@@ -83,7 +98,7 @@ fn device_witness_rejects_noncanonical_heads() {
     let cases: [(&str, Build, Expect); 7] = [
         (
             "exact float difference",
-            |b, h, _| b.binary(BinOp::Sub, h, h),
+            |b, h, _| b.binary(BinOp::Sub, h, h).unwrap(),
             |reason, _, h| matches!(reason, DeviceWitnessRejection::UnsupportedOp { value, .. } if *value == h),
         ),
         (
@@ -94,55 +109,62 @@ fn device_witness_rejects_noncanonical_heads() {
         (
             "fractional literal",
             |b, h, _| {
-                let flag = b.binary_scalar(BinOp::Ge, h, Scalar::F32(0.0));
-                b.binary_scalar(BinOp::Mul, flag, Scalar::F32(0.5))
+                let flag = b.binary_scalar(BinOp::Ge, h, Scalar::F32(0.0)).unwrap();
+                b.binary_scalar(BinOp::Mul, flag, Scalar::F32(0.5)).unwrap()
             },
             |reason, witness, _| matches!(reason, DeviceWitnessRejection::Literal { value, .. } if *value == witness),
         ),
         (
             "product above the bound",
             |b, h, _| {
-                let flag = b.binary_scalar(BinOp::Ge, h, Scalar::F32(0.0));
-                let at_bound = b.binary_scalar(BinOp::Mul, flag, Scalar::F32(16_777_216.0));
+                let flag = b.binary_scalar(BinOp::Ge, h, Scalar::F32(0.0)).unwrap();
+                let at_bound = b
+                    .binary_scalar(BinOp::Mul, flag, Scalar::F32(16_777_216.0))
+                    .unwrap();
                 b.binary_scalar(BinOp::Mul, at_bound, Scalar::F32(2.0))
+                    .unwrap()
             },
             |reason, witness, _| matches!(reason, DeviceWitnessRejection::Bound { value, bound } if *value == witness && *bound == 1 << 25),
         ),
         (
             "sum over an extent above the bound",
             |b, _, _| {
-                let wide = b.constant("wide", TensorType::f32(vec![(1 << 24) + 1]));
-                let flag = b.binary_scalar(BinOp::Ge, wide, Scalar::F32(0.0));
-                b.reduce(RedOp::Sum, flag, 0, true)
+                let wide = b
+                    .constant("wide", TensorType::f32(vec![(1 << 24) + 1]))
+                    .unwrap();
+                let flag = b.binary_scalar(BinOp::Ge, wide, Scalar::F32(0.0)).unwrap();
+                b.reduce(RedOp::Sum, flag, 0, true).unwrap()
             },
             |reason, witness, _| matches!(reason, DeviceWitnessRejection::Bound { value, bound } if *value == witness && *bound == (1 << 24) + 1),
         ),
         (
             "narrowing cast",
             |b, h, _| {
-                let flag = b.binary_scalar(BinOp::Ge, h, Scalar::F32(0.0));
-                let narrow = b.cast(flag, DType::BF16);
-                b.cast(narrow, DType::F32)
+                let flag = b.binary_scalar(BinOp::Ge, h, Scalar::F32(0.0)).unwrap();
+                let narrow = b.cast(flag, DType::BF16).unwrap();
+                b.cast(narrow, DType::F32).unwrap()
             },
             |reason, witness, _| matches!(reason, DeviceWitnessRejection::CastDtype { value, from: DType::BF16, to: DType::F32 } if *value == witness),
         ),
         (
             "division",
             |b, h, _| {
-                let flag = b.binary_scalar(BinOp::Ge, h, Scalar::F32(0.0));
-                b.binary(BinOp::Div, flag, flag)
+                let flag = b.binary_scalar(BinOp::Ge, h, Scalar::F32(0.0)).unwrap();
+                b.binary(BinOp::Div, flag, flag).unwrap()
             },
             |reason, witness, _| matches!(reason, DeviceWitnessRejection::UnsupportedOp { value, .. } if *value == witness),
         ),
     ];
     for (name, build, expect) in cases {
-        let b = Builder::new();
-        let weight = b.constant("weight", TensorType::f32(vec![1, 1]));
-        let activation = b.constant("activation", TensorType::f32(vec![1, 1]));
-        let h = b.matmul(activation, weight);
-        let input = b.constant("input", TensorType::f32(vec![1]));
+        let b = Builder::for_tests();
+        let weight = b.constant("weight", TensorType::f32(vec![1, 1])).unwrap();
+        let activation = b
+            .constant("activation", TensorType::f32(vec![1, 1]))
+            .unwrap();
+        let h = b.matmul(activation, weight).unwrap();
+        let input = b.constant("input", TensorType::f32(vec![1])).unwrap();
         let witness = build(&b, h, input);
-        let graph = crate::test_support::finish_with_validations(
+        let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
             b,
             h,
             &[(ValidationId(9), "witness", witness)],
@@ -204,10 +226,10 @@ fn device_witness_rejects_a_narrow_intermediate() {
 
 #[test]
 fn device_witness_reports_the_first_declaration() {
-    let b = Builder::new();
-    let first = b.constant("first", TensorType::f32(vec![1]));
-    let second = b.constant("second", TensorType::f32(vec![1]));
-    let graph = crate::test_support::finish_with_validations(
+    let b = Builder::for_tests();
+    let first = b.constant("first", TensorType::f32(vec![1])).unwrap();
+    let second = b.constant("second", TensorType::f32(vec![1])).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         first,
         &[
@@ -224,10 +246,12 @@ fn device_witness_reports_the_first_declaration() {
 fn device_witness_admits_the_selector_bounds_chain() {
     // Card 372c's exact chain, emitted by the builder helper rather than rebuilt here, so this row
     // tracks the shape the authorization admits.
-    let b = Builder::new();
-    let raw = b.constant("raw", TensorType::new(vec![4], DType::I32));
+    let b = Builder::for_tests();
+    let raw = b
+        .constant("raw", TensorType::new(vec![4], DType::I32))
+        .unwrap();
     let guard = b.guard_index_bounds(raw, 3).unwrap();
-    let graph = crate::test_support::finish_with_validations(
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         guard.guarded,
         &[(ValidationId(0), "bounds", guard.witness)],
@@ -249,10 +273,12 @@ fn device_witness_rejects_the_chain_above_the_exact_bound() {
     // The same chain over more lanes than an f32 can count exactly. The reduce is what grows the bound,
     // so this is the row that fails if the axis extent stops multiplying it.
     let lanes = (1usize << 24) + 1;
-    let b = Builder::new();
-    let raw = b.constant("raw", TensorType::new(vec![lanes], DType::I32));
+    let b = Builder::for_tests();
+    let raw = b
+        .constant("raw", TensorType::new(vec![lanes], DType::I32))
+        .unwrap();
     let guard = b.guard_index_bounds(raw, 3).unwrap();
-    let graph = crate::test_support::finish_with_validations(
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         guard.guarded,
         &[(ValidationId(0), "bounds", guard.witness)],

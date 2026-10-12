@@ -94,6 +94,7 @@ fn write_deadline_bounds_production_stream_after_a_piece_saturates() {
     let (served, job_rx) = served_over(runner, 1);
     let (done_tx, done_rx) = mpsc::channel();
     let handler = std::thread::spawn(move || {
+        sse_write_probe::install();
         let result = {
             let _guard = ConnGuard(handler_connections);
             let mut server = server;

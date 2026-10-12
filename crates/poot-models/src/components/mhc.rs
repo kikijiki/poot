@@ -18,6 +18,9 @@ use poot_quant::weights::{MhcRole, WeightId, WeightMap, WeightRole};
 use super::linear::{Weight, WeightError};
 use super::standard::ParamError;
 use crate::model::ConfigReason;
+use crate::model::TraceError;
+use poot_graph_ir::BuilderError;
+use poot_graph_ir::Requirement;
 
 /// Checked mHC parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -80,36 +83,51 @@ pub struct MhcMix {
 }
 
 /// `x` is `[rows, tokens, streams, width]`; the shape's extents.
-fn dims(b: &Builder, x: Traced, p: &MhcParams) -> (usize, usize, usize) {
-    let shape = b.aval(x).shape;
-    assert_eq!(
-        (shape.len(), shape.get(2).copied()),
-        (4, Some(p.streams)),
-        "mHC reads [rows, tokens, {}, width] streams, got {shape:?}",
-        p.streams
-    );
-    (shape[0], shape[1], shape[3])
+fn dims(b: &Builder, x: Traced, p: &MhcParams) -> Result<(usize, usize, usize), TraceError> {
+    let shape = b.aval(x)?.shape;
+    let [rows, tokens, streams, width] = shape[..] else {
+        return Err(BuilderError::Requirement {
+            operation: "mhc",
+            requirement: Requirement::Rank {
+                expected: 4,
+                found: shape,
+            },
+        }
+        .into());
+    };
+    if streams != p.streams {
+        return Err(BuilderError::Requirement {
+            operation: "mhc",
+            requirement: Requirement::Axis {
+                axis: 2,
+                expected: p.streams,
+                found: shape,
+            },
+        }
+        .into());
+    }
+    Ok((rows, tokens, width))
 }
 
 /// The projection of the normalized streams: `[rows, tokens, streams * width]` against the
 /// `[streams * width, out]` weight.
-fn mix_of(b: &Builder, x: Traced, projection: Traced, p: &MhcParams) -> Traced {
-    let (rows, tokens, width) = dims(b, x, p);
-    let flat = b.reshape(x, vec![rows, tokens, p.streams * width]);
-    b.matmul(ops::rmsnorm_no_weight(b, flat, p.eps), projection)
+fn mix_of(b: &Builder, x: Traced, projection: Traced, p: &MhcParams) -> Result<Traced, TraceError> {
+    let (rows, tokens, width) = dims(b, x, p)?;
+    let flat = b.reshape(x, vec![rows, tokens, p.streams * width])?;
+    Ok(b.matmul(ops::rmsnorm_no_weight(b, flat, p.eps)?, projection)?)
 }
 
 /// `streams` weighted by `pre` (`[rows, tokens, streams]`) and summed over the streams.
-fn collapse(b: &Builder, x: Traced, pre: Traced, p: &MhcParams) -> Traced {
-    let (rows, tokens, _) = dims(b, x, p);
-    let pre = b.reshape(pre, vec![rows, tokens, p.streams, 1]);
-    b.reduce(RedOp::Sum, b.binary(BinOp::Mul, pre, x), 2, false)
+fn collapse(b: &Builder, x: Traced, pre: Traced, p: &MhcParams) -> Result<Traced, TraceError> {
+    let (rows, tokens, _) = dims(b, x, p)?;
+    let pre = b.reshape(pre, vec![rows, tokens, p.streams, 1])?;
+    Ok(b.reduce(RedOp::Sum, b.binary(BinOp::Mul, pre, x)?, 2, false)?)
 }
 
 /// Sum over the stream axis that precedes the last, keeping it as an axis of one.
-fn sum_over_rows(b: &Builder, x: Traced) -> Traced {
-    let rank = b.aval(x).shape.len();
-    b.reduce(RedOp::Sum, x, rank - 2, true)
+fn sum_over_rows(b: &Builder, x: Traced) -> Result<Traced, TraceError> {
+    let rank = b.aval(x)?.shape.len();
+    Ok(b.reduce(RedOp::Sum, x, rank - 2, true)?)
 }
 
 /// One site's mapping of the widened streams `x[rows, tokens, streams, width]`. `projection` is
@@ -122,48 +140,48 @@ pub fn mhc_pre(
     base: Traced,
     scale: Traced,
     p: &MhcParams,
-) -> MhcMix {
-    let (rows, tokens, _) = dims(b, x, p);
+) -> Result<MhcMix, TraceError> {
+    let (rows, tokens, _) = dims(b, x, p)?;
     let (hc, eps) = (p.streams, p.hc_eps);
-    let mix = mix_of(b, x, projection, p);
+    let mix = mix_of(b, x, projection, p)?;
 
-    let mixes = |lo: usize, hi: usize| b.slice(mix, 2, lo, hi);
-    let bases = |lo: usize, hi: usize| b.slice(base, 0, lo, hi);
+    let mixes = |lo: usize, hi: usize| Ok::<_, TraceError>(b.slice(mix, 2, lo, hi)?);
+    let bases = |lo: usize, hi: usize| Ok::<_, TraceError>(b.slice(base, 0, lo, hi)?);
     let scaled = |w: Traced, scale_ix: usize, base: Traced| {
-        let s = b.slice(scale, 0, scale_ix, scale_ix + 1);
-        b.binary(BinOp::Add, b.binary(BinOp::Mul, w, s), base)
+        let s = b.slice(scale, 0, scale_ix, scale_ix + 1)?;
+        Ok::<_, TraceError>(b.binary(BinOp::Add, b.binary(BinOp::Mul, w, s)?, base)?)
     };
 
-    let pre_logits = scaled(mixes(0, hc), 0, bases(0, hc));
-    let pre = b.binary_scalar(BinOp::Add, ops::sigmoid(b, pre_logits), Scalar::F32(eps));
+    let pre_logits = scaled(mixes(0, hc)?, 0, bases(0, hc)?)?;
+    let pre = b.binary_scalar(BinOp::Add, ops::sigmoid(b, pre_logits)?, Scalar::F32(eps))?;
 
-    let post_logits = scaled(mixes(hc, 2 * hc), 1, bases(hc, 2 * hc));
-    let post = b.binary_scalar(BinOp::Mul, ops::sigmoid(b, post_logits), Scalar::F32(2.0));
+    let post_logits = scaled(mixes(hc, 2 * hc)?, 1, bases(hc, 2 * hc)?)?;
+    let post = b.binary_scalar(BinOp::Mul, ops::sigmoid(b, post_logits)?, Scalar::F32(2.0))?;
 
-    let comb_w = b.reshape(mixes(2 * hc, (2 + hc) * hc), vec![rows, tokens, hc, hc]);
-    let comb_b = b.reshape(bases(2 * hc, (2 + hc) * hc), vec![hc, hc]);
-    let comb_logits = scaled(comb_w, 2, comb_b);
-    let comb = b.binary_scalar(BinOp::Add, ops::softmax(b, comb_logits), Scalar::F32(eps));
+    let comb_w = b.reshape(mixes(2 * hc, (2 + hc) * hc)?, vec![rows, tokens, hc, hc])?;
+    let comb_b = b.reshape(bases(2 * hc, (2 + hc) * hc)?, vec![hc, hc])?;
+    let comb_logits = scaled(comb_w, 2, comb_b)?;
+    let comb = b.binary_scalar(BinOp::Add, ops::softmax(b, comb_logits)?, Scalar::F32(eps))?;
 
     // One column normalization, then `sinkhorn_iters - 1` rounds of rows and columns.
     let divide_by = |m: Traced, sum: Traced| {
-        b.binary(
+        Ok::<_, TraceError>(b.binary(
             BinOp::Div,
             m,
-            b.binary_scalar(BinOp::Add, sum, Scalar::F32(eps)),
-        )
+            b.binary_scalar(BinOp::Add, sum, Scalar::F32(eps))?,
+        )?)
     };
-    let mut comb = divide_by(comb, sum_over_rows(b, comb));
+    let mut comb = divide_by(comb, sum_over_rows(b, comb)?)?;
     for _ in 1..p.sinkhorn_iters {
-        comb = divide_by(comb, b.reduce(RedOp::Sum, comb, 3, true));
-        comb = divide_by(comb, sum_over_rows(b, comb));
+        comb = divide_by(comb, b.reduce(RedOp::Sum, comb, 3, true)?)?;
+        comb = divide_by(comb, sum_over_rows(b, comb)?)?;
     }
 
-    MhcMix {
+    Ok(MhcMix {
         post,
         comb,
-        collapsed: collapse(b, x, pre, p),
-    }
+        collapsed: collapse(b, x, pre, p)?,
+    })
 }
 
 /// The widened streams after a block: `post * output` on every stream plus `comb`'s mix of the old
@@ -177,13 +195,13 @@ pub fn mhc_post(
     output: Traced,
     residual: Traced,
     p: &MhcParams,
-) -> Traced {
-    let (rows, tokens, width) = dims(b, residual, p);
-    let post = b.reshape(post, vec![rows, tokens, p.streams, 1]);
-    let output = b.reshape(output, vec![rows, tokens, 1, width]);
-    let placed = b.binary(BinOp::Mul, post, output);
-    let comb_t = b.transpose(comb, vec![0, 1, 3, 2]);
-    b.binary(BinOp::Add, placed, b.matmul(comb_t, residual))
+) -> Result<Traced, TraceError> {
+    let (rows, tokens, width) = dims(b, residual, p)?;
+    let post = b.reshape(post, vec![rows, tokens, p.streams, 1])?;
+    let output = b.reshape(output, vec![rows, tokens, 1, width])?;
+    let placed = b.binary(BinOp::Mul, post, output)?;
+    let comb_t = b.transpose(comb, vec![0, 1, 3, 2])?;
+    Ok(b.binary(BinOp::Add, placed, b.matmul(comb_t, residual)?)?)
 }
 
 /// The model's closing collapse of the widened streams `x[rows, tokens, streams, width]` into
@@ -196,21 +214,21 @@ pub fn mhc_head(
     base: Traced,
     scale: Traced,
     p: &MhcParams,
-) -> Traced {
-    let mixes = mix_of(b, x, projection, p);
-    let logits = b.binary(BinOp::Add, b.binary(BinOp::Mul, mixes, scale), base);
-    let pre = b.binary_scalar(BinOp::Add, ops::sigmoid(b, logits), Scalar::F32(p.hc_eps));
+) -> Result<Traced, TraceError> {
+    let mixes = mix_of(b, x, projection, p)?;
+    let logits = b.binary(BinOp::Add, b.binary(BinOp::Mul, mixes, scale)?, base)?;
+    let pre = b.binary_scalar(BinOp::Add, ops::sigmoid(b, logits)?, Scalar::F32(p.hc_eps))?;
     collapse(b, x, pre, p)
 }
 
 /// A mapped weight as the F32 `[in, out]` operand of [`mhc_pre`] and [`mhc_head`]: the stored
 /// `[out, in]` projection widened and transposed, or an F32 vector as stored.
-fn operand(b: &Builder, w: &Weight, transpose: bool) -> Traced {
-    let value = w.declare_f32(b);
+fn operand(b: &Builder, w: &Weight, transpose: bool) -> Result<Traced, TraceError> {
+    let value = w.declare_f32(b)?;
     if transpose {
-        b.transpose(value, vec![1, 0])
+        Ok(b.transpose(value, vec![1, 0])?)
     } else {
-        value
+        Ok(value)
     }
 }
 
@@ -253,13 +271,13 @@ impl MhcSiteWeights {
     }
 
     /// [`mhc_pre`] of `x` over these weights.
-    pub fn pre(&self, b: &Builder, x: Traced, p: &MhcParams) -> MhcMix {
+    pub fn pre(&self, b: &Builder, x: Traced, p: &MhcParams) -> Result<MhcMix, TraceError> {
         mhc_pre(
             b,
             x,
-            operand(b, &self.projection, true),
-            operand(b, &self.base, false),
-            operand(b, &self.scale, false),
+            operand(b, &self.projection, true)?,
+            operand(b, &self.base, false)?,
+            operand(b, &self.scale, false)?,
             p,
         )
     }
@@ -286,24 +304,24 @@ impl MhcHeadWeights {
     }
 
     /// [`mhc_head`] of `x` over these weights.
-    pub fn collapse(&self, b: &Builder, x: Traced, p: &MhcParams) -> Traced {
+    pub fn collapse(&self, b: &Builder, x: Traced, p: &MhcParams) -> Result<Traced, TraceError> {
         mhc_head(
             b,
             x,
-            operand(b, &self.projection, true),
-            operand(b, &self.base, false),
-            operand(b, &self.scale, false),
+            operand(b, &self.projection, true)?,
+            operand(b, &self.base, false)?,
+            operand(b, &self.scale, false)?,
             p,
         )
     }
 }
 
 /// The widened streams of `embedded` (`[rows, tokens, width]`): every stream starts as a copy.
-pub fn widen(b: &Builder, embedded: Traced, p: &MhcParams) -> Traced {
-    let shape = b.aval(embedded).shape;
+pub fn widen(b: &Builder, embedded: Traced, p: &MhcParams) -> Result<Traced, TraceError> {
+    let shape = b.aval(embedded)?.shape;
     let (rows, tokens, width) = (shape[0], shape[1], shape[2]);
-    let one = b.reshape(embedded, vec![rows, tokens, 1, width]);
-    b.broadcast(one, vec![rows, tokens, p.streams, width])
+    let one = b.reshape(embedded, vec![rows, tokens, 1, width])?;
+    Ok(b.broadcast(one, vec![rows, tokens, p.streams, width])?)
 }
 
 #[cfg(test)]
@@ -473,19 +491,24 @@ mod tests {
         for iters in [1, 3, 20] {
             let p = params(iters);
             let run = |pick: fn(&MhcMix) -> Traced| {
-                let b = Builder::new();
-                let xs = b.constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH]));
+                let b = Builder::for_tests();
+                let xs = b
+                    .constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH]))
+                    .unwrap();
                 let mix = mhc_pre(
                     &b,
                     xs,
                     b.constant(
                         "projection",
                         TensorType::f32(vec![HC * WIDTH, (2 + HC) * HC]),
-                    ),
-                    b.constant("base", TensorType::f32(vec![(2 + HC) * HC])),
-                    b.constant("scale", TensorType::f32(vec![3])),
+                    )
+                    .unwrap(),
+                    b.constant("base", TensorType::f32(vec![(2 + HC) * HC]))
+                        .unwrap(),
+                    b.constant("scale", TensorType::f32(vec![3])).unwrap(),
                     &p,
-                );
+                )
+                .unwrap();
                 let out = pick(&mix);
                 Fx::new(0)
                     .eval(
@@ -548,15 +571,20 @@ mod tests {
             .map(|i| 0.1 + 0.05 * (i % 7) as f32)
             .collect();
         let out = oracle::random(ROWS * TOKENS * WIDTH, 6);
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let y = mhc_post(
             &b,
-            b.constant("post", TensorType::f32(vec![ROWS, TOKENS, HC])),
-            b.constant("comb", TensorType::f32(vec![ROWS, TOKENS, HC, HC])),
-            b.constant("out", TensorType::f32(vec![ROWS, TOKENS, WIDTH])),
-            b.constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH])),
+            b.constant("post", TensorType::f32(vec![ROWS, TOKENS, HC]))
+                .unwrap(),
+            b.constant("comb", TensorType::f32(vec![ROWS, TOKENS, HC, HC]))
+                .unwrap(),
+            b.constant("out", TensorType::f32(vec![ROWS, TOKENS, WIDTH]))
+                .unwrap(),
+            b.constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH]))
+                .unwrap(),
             &params(2),
-        );
+        )
+        .unwrap();
         let got = Fx::new(0)
             .eval(
                 &b.finish(y).unwrap(),
@@ -600,15 +628,18 @@ mod tests {
         let (x, ..) = inputs();
         let projection = oracle::random(HC * WIDTH * HC, 7);
         let (base, scale) = (oracle::random(HC, 8), [0.7f32]);
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let y = mhc_head(
             &b,
-            b.constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH])),
-            b.constant("projection", TensorType::f32(vec![HC * WIDTH, HC])),
-            b.constant("base", TensorType::f32(vec![HC])),
-            b.constant("scale", TensorType::f32(vec![1])),
+            b.constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH]))
+                .unwrap(),
+            b.constant("projection", TensorType::f32(vec![HC * WIDTH, HC]))
+                .unwrap(),
+            b.constant("base", TensorType::f32(vec![HC])).unwrap(),
+            b.constant("scale", TensorType::f32(vec![1])).unwrap(),
             &params(1),
-        );
+        )
+        .unwrap();
         let got = Fx::new(0)
             .eval(
                 &b.finish(y).unwrap(),
@@ -645,9 +676,11 @@ mod tests {
         let p = params(3);
         let w = MhcSiteWeights::new(&fx.map(), 0, MhcSite::Attn, WIDTH, &p).unwrap();
         let (x, ..) = inputs();
-        let b = Builder::new();
-        let xs = b.constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH]));
-        let collapsed = w.pre(&b, xs, &p).collapsed;
+        let b = Builder::for_tests();
+        let xs = b
+            .constant("x", TensorType::f32(vec![ROWS, TOKENS, HC, WIDTH]))
+            .unwrap();
+        let collapsed = w.pre(&b, xs, &p).unwrap().collapsed;
         let got = fx
             .eval(&b.finish(collapsed).unwrap(), &[("x", &x)], &[], &[])
             .0;

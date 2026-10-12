@@ -4,7 +4,8 @@
 //! silent pass), a messenger counts every warning and error the layer reports, and dropping the last
 //! owner of the device panics if the count is not zero. Execution is otherwise unchanged.
 
-use crate::*;
+use ash::vk;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The messages the layer reported (warnings and errors), shared with the native callback.
 pub(crate) struct Validation {

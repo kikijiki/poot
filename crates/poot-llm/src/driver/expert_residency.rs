@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use poot_executor::{ExecError, HostSync, RowFill, SiteIdentity, SyncReads, SyncWrites};
-use poot_graph_plan::SyncPoint;
+use poot_graph_plan::staged::SyncPoint;
 
 /// What the manager has done since its last reset: its own count of the syncs it served, kept as a
 /// cross-check on the engine's. The source of truth for refill traffic is

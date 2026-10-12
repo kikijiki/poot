@@ -14,6 +14,7 @@ use poot_tensor::DType;
 use super::linear::{Weight, WeightError};
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
+use crate::model::TraceError;
 
 /// Checked conv parameters: `kernel >= 2` taps `dilation` positions apart over `channels`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,22 +95,22 @@ pub fn causal_conv(
     x: Traced,
     w: &ConvWeights,
     p: &ConvParams,
-) -> Traced {
-    let window = step.recurrent_state(b, state_name, DType::F32, &[p.window(), p.channels]);
+) -> Result<Traced, TraceError> {
+    let window = step.recurrent_state(b, state_name, DType::F32, &[p.window(), p.channels])?;
     // `[C, 1, K]` -> the op's `[K, C]` taps.
     let taps = b.transpose(
-        b.reshape(w.kernel.declare_f32(b), vec![p.channels, p.kernel]),
+        b.reshape(w.kernel.declare_f32(b)?, vec![p.channels, p.kernel])?,
         vec![1, 0],
-    );
+    )?;
     let (out, next) =
-        ops::causal_conv1d_windowed(b, x, taps, window.current(), p.kernel, p.dilation);
-    step.carry_recurrent(b, window, next);
+        ops::causal_conv1d_windowed(b, x, taps, window.current(), p.kernel, p.dilation)?;
+    step.carry_recurrent(b, window, next)?;
     match &w.bias {
         Some(bias) => {
-            let shape = b.aval(out).shape;
-            b.binary(BinOp::Add, out, b.broadcast(bias.declare_f32(b), shape))
+            let shape = b.aval(out)?.shape;
+            Ok(b.binary(BinOp::Add, out, b.broadcast(bias.declare_f32(b)?, shape)?)?)
         }
-        None => out,
+        None => Ok(out),
     }
 }
 
@@ -149,10 +150,12 @@ mod tests {
         let p = ConvParams::new(C, K, dilation).unwrap();
         let w = ConvWeights::new(&fx.map(), kernel_id(), Some(bias_id()), &p).unwrap();
         let tokens = x.len() / C;
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All));
-        let xs = b.constant("x", TensorType::f32(vec![1, tokens, C]));
-        let y = causal_conv(&b, &step, "conv.window", xs, &w, &p);
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All)).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, tokens, C]))
+            .unwrap();
+        let y = causal_conv(&b, &step, "conv.window", xs, &w, &p).unwrap();
         let g = step.finish(b, y).unwrap();
         let zeros = vec![0.0; p.window() * C];
         let state = if state.is_empty() { &zeros[..] } else { state };

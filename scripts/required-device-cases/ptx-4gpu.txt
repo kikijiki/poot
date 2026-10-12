@@ -6,4 +6,4 @@
 #
 # The captured coordinator across four NVIDIA GPUs: a world-four tensor-parallel qwen2 decode against
 # single-device decode, every rank folding the partials of all four.
-poot-ptx-gpu::tensor_parallel	qwen2_four_way_tensor_parallel_decode_matches_single_device_on_ptx
+poot-llm::ptx_tensor_parallel	qwen2_four_way_tensor_parallel_decode_matches_single_device_on_ptx

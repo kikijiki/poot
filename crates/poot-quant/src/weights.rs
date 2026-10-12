@@ -36,7 +36,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{PackedPayload, PackedStack, PackedWeight, SourceChanged, SourceRole, StoredBytes};
+#[cfg(any(test, feature = "test-support"))]
+use crate::PackedStack;
+use crate::{PackedPayload, PackedWeight, SourceChanged, SourceRole, StoredBytes};
 
 /// The name a loader assigned one stored weight: the checkpoint tensor name for a dense entry, or
 /// the loader's linear id (built from that weight's several source tensors - `weight` and `scale`
@@ -449,6 +451,7 @@ impl WeightStore {
     /// Every entry's [`WeightEntry::stored_bytes`], summed: the store's whole stored footprint,
     /// wired into a loader's own byte accounting (the mixed loader's `MixedLoadReport`) instead of
     /// that reader keeping a second, possibly-disagreeing count.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn total_stored_bytes(&self) -> usize {
         self.entries
             .values()
@@ -1538,6 +1541,7 @@ impl WeightMap {
     /// [`WeightView::Stored`], or the stacked / sliced rows copied byte for byte (a packed block
     /// format's rows are whole runs of blocks, so no decode is involved). The result's handle is
     /// the map's handle for `id`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn materialize(
         &self,
         id: WeightId,
@@ -1552,6 +1556,7 @@ impl WeightMap {
 
     /// The experts of a packed [`WeightView::ExpertStack`] `id`, each its own payload, as one
     /// [`PackedStack`]. Fails for any other view.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn materialize_stack(
         &self,
         id: WeightId,

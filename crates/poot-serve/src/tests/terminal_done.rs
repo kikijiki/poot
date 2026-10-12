@@ -24,8 +24,7 @@ fn the_loops_terminal_done_publishes_its_count_before_the_event_is_delivered() {
     for branch in [TerminalBranch::Eos, TerminalBranch::MaxNew] {
         for receiver_alive in [true, false] {
             let label = format!("loop {branch:?} receiver_alive={receiver_alive}");
-            let me = std::thread::current().id();
-            terminal_delivery_probe::reset(me);
+            terminal_delivery_probe::reset();
             let mut engine = RecordingEngine::new(1).picking(move |_, _| match branch {
                 TerminalBranch::Eos => vec![99],
                 TerminalBranch::MaxNew => vec![1],
@@ -38,7 +37,7 @@ fn the_loops_terminal_done_publishes_its_count_before_the_event_is_delivered() {
             drop(tx);
             let metrics = test_metrics(&label);
             run_engine(&mut engine, &rx, &metrics);
-            let at_delivery = terminal_delivery_probe::at_delivery(me).unwrap_or_else(|| {
+            let at_delivery = terminal_delivery_probe::at_delivery().unwrap_or_else(|| {
                 panic!(
                     "{label}: the terminal must be delivered through GenEvent::deliver_done, which is \
                      what publishes the outcome count before the event exists"
@@ -79,13 +78,12 @@ fn deliver_terminal_publishes_the_outcome_before_the_event_is_delivered() {
         ("Done delivered", true, (1u64, 0u64, 0u64)),
         ("Done undelivered", false, (0, 1, 0)),
     ] {
-        let me = std::thread::current().id();
-        terminal_delivery_probe::reset(me);
+        terminal_delivery_probe::reset();
         let metrics = test_metrics(label);
         let (reply, rx) = mpsc::channel::<&'static str>();
         let rx = receiver_alive.then_some(rx);
         let delivered = deliver_terminal(&metrics, &reply, "terminal");
-        let at_delivery = terminal_delivery_probe::at_delivery(me).unwrap_or_else(|| {
+        let at_delivery = terminal_delivery_probe::at_delivery().unwrap_or_else(|| {
             panic!(
                 "{label}: the terminal must go through deliver_terminal, which publishes the count \
                  before the event exists"

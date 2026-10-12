@@ -22,12 +22,12 @@ use poot_quant::weights::{HyperRole, WeightId, WeightMap};
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::ple::grouped_norm;
 use crate::components::standard::ParamError;
-use crate::model::ConfigReason;
+use crate::model::{ConfigReason, ParamBlock, TraceError, WiringError};
 
 /// Checked Hyper-Connections parameters: the stream width, the stream count, the gate's low rank
 /// and the norm epsilon.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HyperParams {
+pub(super) struct HyperParams {
     width: usize,
     streams: usize,
     rank: usize,
@@ -35,7 +35,12 @@ pub struct HyperParams {
 }
 
 impl HyperParams {
-    pub fn new(width: usize, streams: usize, rank: usize, eps: f32) -> Result<Self, ParamError> {
+    pub(super) fn new(
+        width: usize,
+        streams: usize,
+        rank: usize,
+        eps: f32,
+    ) -> Result<Self, ParamError> {
         for (field, value) in [
             ("hidden_size", width),
             ("hc_count", streams),
@@ -59,7 +64,7 @@ impl HyperParams {
         })
     }
 
-    pub fn streams(&self) -> usize {
+    pub(super) fn streams(&self) -> usize {
         self.streams
     }
 
@@ -69,8 +74,8 @@ impl HyperParams {
 
     /// The embedding widened to every stream: `[.., width]` tiled `streams` times along the last
     /// axis.
-    pub fn widen(&self, b: &Builder, x: Traced) -> Traced {
-        let shape = b.aval(x).shape;
+    pub(super) fn widen(&self, b: &Builder, x: Traced) -> Result<Traced, TraceError> {
+        let shape = b.aval(x)?.shape;
         let n = shape.len();
         let mut single = shape.clone();
         single.insert(n - 1, 1);
@@ -78,16 +83,16 @@ impl HyperParams {
         wide.insert(n - 1, self.streams);
         let mut flat = shape;
         flat[n - 1] = self.stream_width();
-        b.reshape(b.broadcast(b.reshape(x, single), wide), flat)
+        Ok(b.reshape(b.broadcast(b.reshape(x, single)?, wide)?, flat)?)
     }
 
     /// `[.., streams * width]` as `[.., streams, width]`.
-    fn grouped(&self, b: &Builder, x: Traced) -> Traced {
-        let mut shape = b.aval(x).shape;
+    fn grouped(&self, b: &Builder, x: Traced) -> Result<Traced, TraceError> {
+        let mut shape = b.aval(x)?.shape;
         let n = shape.len();
         shape[n - 1] = self.streams;
         shape.push(self.width);
-        b.reshape(x, shape)
+        Ok(b.reshape(x, shape)?)
     }
 }
 
@@ -95,7 +100,7 @@ impl HyperParams {
 /// `[rank, streams * width]` and `[streams * width, rank]`, and for a layer's gate the injection
 /// projection `[streams, streams * width]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HyperWeights {
+pub(super) struct HyperWeights {
     norm: Weight,
     down: Weight,
     up: Weight,
@@ -103,7 +108,7 @@ pub struct HyperWeights {
 }
 
 impl HyperWeights {
-    pub fn new(
+    pub(super) fn new(
         map: &WeightMap,
         id: impl Fn(HyperRole) -> WeightId,
         p: &HyperParams,
@@ -123,59 +128,76 @@ impl HyperWeights {
 }
 
 /// The normed stream and the gated mean of it: `([.., streams * width], [.., width])`.
-fn mixed(b: &Builder, x: Traced, w: &HyperWeights, p: &HyperParams) -> (Traced, Traced) {
-    let normed = grouped_norm(b, x, &w.norm, p.streams, p.eps);
+fn mixed(
+    b: &Builder,
+    x: Traced,
+    w: &HyperWeights,
+    p: &HyperParams,
+) -> Result<(Traced, Traced), TraceError> {
+    let normed = grouped_norm(b, x, &w.norm, p.streams, p.eps)?;
     let down = b.binary_scalar(
         BinOp::Mul,
-        linear(b, normed, &w.down, None),
+        linear(b, normed, &w.down, None)?,
         Scalar::F32(1.0 / p.streams as f32),
-    );
-    let gate = sigmoid(b, linear(b, silu(b, down), &w.up, None));
-    let weighted = b.binary(BinOp::Mul, p.grouped(b, gate), p.grouped(b, normed));
-    let axis = b.aval(weighted).shape.len() - 2;
+    )?;
+    let gate = sigmoid(b, linear(b, silu(b, down)?, &w.up, None)?)?;
+    let weighted = b.binary(BinOp::Mul, p.grouped(b, gate)?, p.grouped(b, normed)?)?;
+    let axis = b.aval(weighted)?.shape.len() - 2;
     let mean = b.binary_scalar(
         BinOp::Mul,
-        b.reduce(RedOp::Sum, weighted, axis, false),
+        b.reduce(RedOp::Sum, weighted, axis, false)?,
         Scalar::F32(1.0 / p.streams as f32),
-    );
-    (normed, mean)
+    )?;
+    Ok((normed, mean))
 }
 
 /// A layer block's input `[.., width]` from the stream `x`, and the per-stream injection weights
 /// `[.., streams]` to hand to [`inject`] with the block's output.
-pub fn input(b: &Builder, x: Traced, w: &HyperWeights, p: &HyperParams) -> (Traced, Traced) {
-    let (normed, mean) = mixed(b, x, w, p);
-    let inject = w
-        .inject
-        .as_ref()
-        .expect("a layer's gate is built with its injection weights");
+pub(super) fn input(
+    b: &Builder,
+    x: Traced,
+    w: &HyperWeights,
+    p: &HyperParams,
+) -> Result<(Traced, Traced), TraceError> {
+    let (normed, mean) = mixed(b, x, w, p)?;
+    let inject = WiringError::require(&w.inject, ParamBlock::Injection)?;
     let logit = b.binary_scalar(
         BinOp::Mul,
-        linear(b, normed, inject, None),
+        linear(b, normed, inject, None)?,
         Scalar::F32(1.0 / p.streams as f32),
-    );
-    (
+    )?;
+    Ok((
         mean,
-        b.binary_scalar(BinOp::Mul, sigmoid(b, logit), Scalar::F32(2.0)),
-    )
+        b.binary_scalar(BinOp::Mul, sigmoid(b, logit)?, Scalar::F32(2.0))?,
+    ))
 }
 
 /// The stream `x` plus a block's output `[.., width]` written into every stream by its injection
 /// weights.
-pub fn inject(b: &Builder, x: Traced, block: Traced, weights: Traced) -> Traced {
-    let mut row = b.aval(block).shape;
+pub(super) fn inject(
+    b: &Builder,
+    x: Traced,
+    block: Traced,
+    weights: Traced,
+) -> Result<Traced, TraceError> {
+    let mut row = b.aval(block)?.shape;
     row.insert(row.len() - 1, 1); // [.., 1, width]
-    let mut column = b.aval(weights).shape;
+    let mut column = b.aval(weights)?.shape;
     column.push(1); // [.., streams, 1]
     let injection = b.binary(
         BinOp::Mul,
-        b.reshape(block, row),
-        b.reshape(weights, column),
-    );
-    b.binary(BinOp::Add, x, b.reshape(injection, b.aval(x).shape))
+        b.reshape(block, row)?,
+        b.reshape(weights, column)?,
+    )?;
+    Ok(b.binary(BinOp::Add, x, b.reshape(injection, b.aval(x)?.shape)?)?)
 }
 
 /// The model-level mixer: the streams collapsed to one `[.., width]` before the head.
-pub fn collapse(b: &Builder, x: Traced, w: &HyperWeights, p: &HyperParams) -> Traced {
-    mixed(b, x, w, p).1
+pub(super) fn collapse(
+    b: &Builder,
+    x: Traced,
+    w: &HyperWeights,
+    p: &HyperParams,
+) -> Result<Traced, TraceError> {
+    Ok(mixed(b, x, w, p)?.1)
 }

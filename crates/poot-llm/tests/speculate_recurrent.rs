@@ -21,14 +21,16 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{
-    BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, NoSync, StateScope, StepInputs, StepOutputs,
+    Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor, ExecutorStats, HostSync,
+    NoSync, StateScope, StepInputs, StepOutputs,
 };
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
 };
 use poot_llm::Sampler;
 use poot_llm::driver::block_table::BLOCK_SIZE;
@@ -40,7 +42,6 @@ use poot_llm::driver::{
     LoadOptions, ModelHandle, PoolShape, PreparedSetLimits, Release, RowResult, RowSpeculation,
     RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm, open_executor, program_retention,
 };
-use poot_models::chat::ChatFormat;
 use poot_models::components::standard::{Step, check_step};
 use poot_models::model::{
     FamilyKey, HiddenCarry, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
@@ -48,10 +49,10 @@ use poot_models::model::{
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
-use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
-use poot_test_util::weight_map_oracle::eval_mapped;
+use poot_text::ChatFormat;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -103,7 +104,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.json"), fixture.config.to_string()).unwrap();
     tokenizer().save(dir.join("tokenizer.json"), false).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
 }
 
 /// A family's shipped fixture checkpoint, loaded.
@@ -122,7 +123,7 @@ fn options(draft: DraftPolicy) -> DriverOptions {
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(4),
-        max_trace_tokens: nz(CAPACITY),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(CAPACITY)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 40).unwrap(),
@@ -217,10 +218,14 @@ impl Model for Recurrentish {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         check_step(RECURRENT, phase, shape, self.config.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
             0
@@ -236,23 +241,23 @@ impl Model for Recurrentish {
                 1,
                 first,
                 n,
-            ),
+            )?,
             DType::F32,
-        );
-        let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
-        let seed = b.binary(BinOp::Add, token, pos);
+        )?;
+        let pos = b.cast(b.slice(step.pos(), 1, first, n)?, DType::F32)?;
+        let seed = b.binary(BinOp::Add, token, pos)?;
         let dims = vec![rows, 4];
         let state = b.state_input(
             "toy.state",
             TensorType::f32(dims.clone()),
             StateRole::Recurrent,
-        );
+        )?;
         // The state folds the step's last token, whatever width the step has.
-        let last = b.slice(seed, 1, out - 1, out);
-        let folded = b.binary(BinOp::Add, state, b.broadcast(last, dims));
+        let last = b.slice(seed, 1, out - 1, out)?;
+        let folded = b.binary(BinOp::Add, state, b.broadcast(last, dims)?)?;
         step.carry(state, folded);
-        let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits).unwrap())
+        let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1])?, vec![rows, out, VOCAB])?;
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -613,7 +618,7 @@ fn device_driver(
     backend: DeviceBackend,
     draft: DraftPolicy,
 ) -> Option<Driver> {
-    let executor = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))?;
+    let executor = poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))?;
     Some(Driver::new(Arc::clone(handle), executor, options(draft)).unwrap())
 }
 
@@ -758,8 +763,10 @@ impl Probed {
         if let Some(&entry) = self.shared.borrow().entries.get(name) {
             return Ok(entry);
         }
-        let b = Builder::new();
-        let state = b.state_input(name, aval.clone(), StateRole::Recurrent);
+        let b = Builder::for_tests();
+        let state = b
+            .state_input(name, aval.clone(), StateRole::Recurrent)
+            .unwrap();
         let graph = b
             .finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
             .unwrap();
@@ -883,6 +890,7 @@ fn probe_schema(
                 logits: LogitRows::Last,
                 hidden: hidden.map(|positions| HiddenCarry { positions }),
             },
+            poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     let role = if hidden.is_some() {
@@ -912,7 +920,7 @@ fn probing_driver(
     kv: KvLayout,
     hidden: Option<NonZeroUsize>,
 ) -> Option<Probing> {
-    let executor = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))?;
+    let executor = poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))?;
     let shared = Rc::new(RefCell::new(ProbeShared::default()));
     let probed = Probed {
         inner: executor,
@@ -1406,7 +1414,13 @@ fn oracle_rows(family: FamilyKey, tokens: &[u32]) -> Vec<Vec<f32>> {
         logits: LogitRows::All,
         hidden: None,
     };
-    let graph = model.trace(Phase::Prefill, shape).unwrap();
+    let graph = model
+        .trace(
+            Phase::Prefill,
+            shape,
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
     let state: Vec<HostTensor> = graph
         .state()
         .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
@@ -1748,6 +1762,7 @@ fn shadow_state_share_of_the_state_budget() {
                         logits: LogitRows::Last,
                         hidden: None,
                     },
+                    poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
             let (mut recurrent, mut positional) = (0u64, 0u64);

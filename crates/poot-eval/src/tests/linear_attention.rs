@@ -18,14 +18,18 @@ use poot_test_util::{assert_close_rel, max_abs_error, max_abs_error_f64};
 #[test]
 fn attention_matches_direct() {
     // decode attention: 1 query token, Hq=2, Hkv=1 (n_rep=2), S=4, D=4.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (hq, hkv, s, d) = (2usize, 1usize, 4usize, 4usize);
     let n_rep = hq / hkv;
     let scale = 1.0 / (d as f32).sqrt();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, s, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, s, d]));
-    let out = attention(&b, q, k, v, n_rep, scale);
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, s, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, s, d]))
+        .unwrap();
+    let out = attention(&b, q, k, v, n_rep, scale).unwrap();
     let (qi, ki, vi) = (q.id(), k.id(), v.id());
     let g = b.finish(out).unwrap();
 
@@ -111,13 +115,23 @@ fn linear_attention_decode_gated_matches_direct() {
     }
 
     let eval_out = |pick_state: bool| -> HostTensor {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, dk]));
-        let k = b.constant("k", TensorType::f32(vec![1, hkv, 1, dk]));
-        let v = b.constant("v", TensorType::f32(vec![1, hkv, 1, dv]));
-        let gate = b.constant("g", TensorType::f32(vec![1, hq, dk, 1]));
-        let s = b.constant("s", TensorType::f32(vec![1, hq, dk, dv]));
-        let (o, s_out) = linear_attention_decode_gated(&b, q, k, v, n_rep, gate, s);
+        let b = Builder::for_tests();
+        let q = b
+            .constant("q", TensorType::f32(vec![1, hq, 1, dk]))
+            .unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hkv, 1, dk]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hkv, 1, dv]))
+            .unwrap();
+        let gate = b
+            .constant("g", TensorType::f32(vec![1, hq, dk, 1]))
+            .unwrap();
+        let s = b
+            .constant("s", TensorType::f32(vec![1, hq, dk, dv]))
+            .unwrap();
+        let (o, s_out) = linear_attention_decode_gated(&b, q, k, v, n_rep, gate, s).unwrap();
         let (qi, ki, vi, gi, si) = (q.id(), k.id(), v.id(), gate.id(), s.id());
         let g = b.finish(if pick_state { s_out } else { o }).unwrap();
         let mut inputs = HashMap::new();
@@ -174,12 +188,18 @@ fn linear_attention_prefill_matches_recurrence() {
         }
     }
 
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, l, dk]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, l, dk]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
-    let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-    let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, l, dk]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, l, dk]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, l, dv]))
+        .unwrap();
+    let mask = b.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
+    let o = linear_attention_prefill(&b, q, k, v, n_rep, mask).unwrap();
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(o).unwrap();
     let mut inputs = HashMap::new();
@@ -249,10 +269,14 @@ fn ut_transform_inverse_reconstructs_identity() {
     let c = 8usize;
     let attn = random_strictly_lower_triangular(c, 11);
 
-    let b = Builder::new();
-    let attn_t = b.constant("attn", TensorType::f32(vec![c, c]));
-    let t = unit_lower_triangular_inverse(&b, attn_t);
-    assert_eq!(b.aval(t).shape, vec![c, c], "T keeps the [C,C] shape");
+    let b = Builder::for_tests();
+    let attn_t = b.constant("attn", TensorType::f32(vec![c, c])).unwrap();
+    let t = unit_lower_triangular_inverse(&b, attn_t).unwrap();
+    assert_eq!(
+        b.aval(t).unwrap().shape,
+        vec![c, c],
+        "T keeps the [C,C] shape"
+    );
     let g = b.finish(t).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -320,9 +344,9 @@ fn ut_transform_inverse_reconstructs_identity_c64() {
     let c = 64usize;
     let attn = realistic_gdn_attn(c, 32, 23);
 
-    let b = Builder::new();
-    let attn_t = b.constant("attn", TensorType::f32(vec![c, c]));
-    let t = unit_lower_triangular_inverse(&b, attn_t);
+    let b = Builder::for_tests();
+    let attn_t = b.constant("attn", TensorType::f32(vec![c, c])).unwrap();
+    let t = unit_lower_triangular_inverse(&b, attn_t).unwrap();
     let g = b.finish(t).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -387,9 +411,9 @@ fn ut_transform_inverse_matches_forward_substitution_under_adversarial_input() {
     let c = 64usize;
     let attn = random_strictly_lower_triangular(c, 23);
 
-    let b = Builder::new();
-    let attn_t = b.constant("attn", TensorType::f32(vec![c, c]));
-    let t = unit_lower_triangular_inverse(&b, attn_t);
+    let b = Builder::for_tests();
+    let attn_t = b.constant("attn", TensorType::f32(vec![c, c])).unwrap();
+    let t = unit_lower_triangular_inverse(&b, attn_t).unwrap();
     let g = b.finish(t).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -441,10 +465,10 @@ fn ut_transform_inverse_reconstructs_identity_batched() {
         attn[head * c * c..(head + 1) * c * c].copy_from_slice(&block);
     }
 
-    let b = Builder::new();
-    let attn_t = b.constant("attn", TensorType::f32(vec![h, c, c]));
-    let t = unit_lower_triangular_inverse(&b, attn_t);
-    assert_eq!(b.aval(t).shape, vec![h, c, c]);
+    let b = Builder::for_tests();
+    let attn_t = b.constant("attn", TensorType::f32(vec![h, c, c])).unwrap();
+    let t = unit_lower_triangular_inverse(&b, attn_t).unwrap();
+    assert_eq!(b.aval(t).unwrap().shape, vec![h, c, c]);
     let g = b.finish(t).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -544,18 +568,30 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
     let kv = tile(&kd);
 
     // --- sequential decode-recurrence reference (H_v heads, state carried across L steps) ---
-    let db = Builder::new();
-    let q_in = db.constant("q", TensorType::f32(vec![1, h_v, 1, d]));
-    let k_in = db.constant("k", TensorType::f32(vec![1, h_v, 1, d]));
-    let v_in = db.constant("v", TensorType::f32(vec![1, h_v, 1, d]));
-    let g_in = db.constant("g", TensorType::f32(vec![1, h_v, 1, 1]));
-    let bt_in = db.constant("beta", TensorType::f32(vec![1, h_v, 1, 1]));
-    let ds_in = db.state_input(
-        "s",
-        TensorType::f32(vec![1, h_v, d, d]),
-        StateRole::Recurrent,
-    );
-    let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
+    let db = Builder::for_tests();
+    let q_in = db
+        .constant("q", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let k_in = db
+        .constant("k", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let v_in = db
+        .constant("v", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let g_in = db
+        .constant("g", TensorType::f32(vec![1, h_v, 1, 1]))
+        .unwrap();
+    let bt_in = db
+        .constant("beta", TensorType::f32(vec![1, h_v, 1, 1]))
+        .unwrap();
+    let ds_in = db
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, h_v, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in).unwrap();
     let dg = db
         .finish(poot_graph_ir::Outputs::new(o).with_state(&[(ds_in, s_out)]))
         .unwrap();
@@ -638,19 +674,35 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
         }
     }
 
-    let cb = Builder::new();
-    let cq = cb.constant("q", TensorType::f32(vec![1, h_k, l, d]));
-    let ck = cb.constant("k", TensorType::f32(vec![1, h_k, l, d]));
-    let cv = cb.constant("v", TensorType::f32(vec![1, h_v, l, d]));
-    let cg = cb.constant("g", TensorType::f32(vec![1, h_v, l, 1]));
-    let cbeta = cb.constant("beta", TensorType::f32(vec![1, h_v, l, 1]));
-    let cs_in = cb.state_input(
-        "s",
-        TensorType::f32(vec![1, h_v, d, d]),
-        StateRole::Recurrent,
-    );
-    let ctril_incl = cb.constant("tril_incl", TensorType::f32(vec![1, 1, c, c]));
-    let ctril_strict = cb.constant("tril_strict", TensorType::f32(vec![1, 1, c, c]));
+    let cb = Builder::for_tests();
+    let cq = cb
+        .constant("q", TensorType::f32(vec![1, h_k, l, d]))
+        .unwrap();
+    let ck = cb
+        .constant("k", TensorType::f32(vec![1, h_k, l, d]))
+        .unwrap();
+    let cv = cb
+        .constant("v", TensorType::f32(vec![1, h_v, l, d]))
+        .unwrap();
+    let cg = cb
+        .constant("g", TensorType::f32(vec![1, h_v, l, 1]))
+        .unwrap();
+    let cbeta = cb
+        .constant("beta", TensorType::f32(vec![1, h_v, l, 1]))
+        .unwrap();
+    let cs_in = cb
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, h_v, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let ctril_incl = cb
+        .constant("tril_incl", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
+    let ctril_strict = cb
+        .constant("tril_strict", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
     let (co, cs_out) = gdn_prefill_chunked(
         &cb,
         cq,
@@ -662,14 +714,15 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
         ctril_incl,
         ctril_strict,
         c,
-    );
+    )
+    .unwrap();
     assert_eq!(
-        cb.aval(co).shape,
+        cb.aval(co).unwrap().shape,
         vec![1, h_v, l, d],
         "gdn_prefill_chunked output shape [1,H_v,L,D]"
     );
     assert_eq!(
-        cb.aval(cs_out).shape,
+        cb.aval(cs_out).unwrap().shape,
         vec![1, h_v, d, d],
         "gdn_prefill_chunked state shape [1,H_v,D,D]"
     );
@@ -837,37 +890,65 @@ fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
     }
 
     // Build the chunked-prefill graph once (inputs vary per decay level).
-    let cb = Builder::new();
-    let cq = cb.constant("q", TensorType::f32(vec![1, h_k, l, d]));
-    let ck = cb.constant("k", TensorType::f32(vec![1, h_k, l, d]));
-    let cv = cb.constant("v", TensorType::f32(vec![1, h_v, l, d]));
-    let cg = cb.constant("g", TensorType::f32(vec![1, h_v, l, 1]));
-    let cbeta = cb.constant("beta", TensorType::f32(vec![1, h_v, l, 1]));
-    let cs_in = cb.state_input(
-        "s",
-        TensorType::f32(vec![1, h_v, d, d]),
-        StateRole::Recurrent,
-    );
-    let cti = cb.constant("tril_incl", TensorType::f32(vec![1, 1, c, c]));
-    let cts = cb.constant("tril_strict", TensorType::f32(vec![1, 1, c, c]));
-    let (co, cs_out) = gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs_in, cti, cts, c);
+    let cb = Builder::for_tests();
+    let cq = cb
+        .constant("q", TensorType::f32(vec![1, h_k, l, d]))
+        .unwrap();
+    let ck = cb
+        .constant("k", TensorType::f32(vec![1, h_k, l, d]))
+        .unwrap();
+    let cv = cb
+        .constant("v", TensorType::f32(vec![1, h_v, l, d]))
+        .unwrap();
+    let cg = cb
+        .constant("g", TensorType::f32(vec![1, h_v, l, 1]))
+        .unwrap();
+    let cbeta = cb
+        .constant("beta", TensorType::f32(vec![1, h_v, l, 1]))
+        .unwrap();
+    let cs_in = cb
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, h_v, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let cti = cb
+        .constant("tril_incl", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
+    let cts = cb
+        .constant("tril_strict", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
+    let (co, cs_out) = gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs_in, cti, cts, c).unwrap();
     let cgraph = cb
         .finish(poot_graph_ir::Outputs::new(co).with_state(&[(cs_in, cs_out)]))
         .unwrap();
 
     // Sequential decode-recurrence reference graph (single step, H_v heads).
-    let db = Builder::new();
-    let q_in = db.constant("q", TensorType::f32(vec![1, h_v, 1, d]));
-    let k_in = db.constant("k", TensorType::f32(vec![1, h_v, 1, d]));
-    let v_in = db.constant("v", TensorType::f32(vec![1, h_v, 1, d]));
-    let g_in = db.constant("g", TensorType::f32(vec![1, h_v, 1, 1]));
-    let bt_in = db.constant("beta", TensorType::f32(vec![1, h_v, 1, 1]));
-    let ds_in = db.state_input(
-        "s",
-        TensorType::f32(vec![1, h_v, d, d]),
-        StateRole::Recurrent,
-    );
-    let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
+    let db = Builder::for_tests();
+    let q_in = db
+        .constant("q", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let k_in = db
+        .constant("k", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let v_in = db
+        .constant("v", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let g_in = db
+        .constant("g", TensorType::f32(vec![1, h_v, 1, 1]))
+        .unwrap();
+    let bt_in = db
+        .constant("beta", TensorType::f32(vec![1, h_v, 1, 1]))
+        .unwrap();
+    let ds_in = db
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, h_v, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in).unwrap();
     let dg = db
         .finish(poot_graph_ir::Outputs::new(o).with_state(&[(ds_in, s_out)]))
         .unwrap();
@@ -1083,20 +1164,37 @@ fn gdn_decode_continuation_one_level(
     }
 
     // Chunked-prefill state (H_v heads directly; GQA repeat is covered by the sweep above).
-    let cb = Builder::new();
-    let cq = cb.constant("q", TensorType::f32(vec![1, h_v, l, d]));
-    let ck = cb.constant("k", TensorType::f32(vec![1, h_v, l, d]));
-    let cv = cb.constant("v", TensorType::f32(vec![1, h_v, l, d]));
-    let cg = cb.constant("g", TensorType::f32(vec![1, h_v, l, 1]));
-    let cbeta = cb.constant("beta", TensorType::f32(vec![1, h_v, l, 1]));
-    let cs_in = cb.state_input(
-        "s",
-        TensorType::f32(vec![1, h_v, d, d]),
-        StateRole::Recurrent,
-    );
-    let cti = cb.constant("tril_incl", TensorType::f32(vec![1, 1, c, c]));
-    let cts = cb.constant("tril_strict", TensorType::f32(vec![1, 1, c, c]));
-    let (_co, cs_out) = gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs_in, cti, cts, c);
+    let cb = Builder::for_tests();
+    let cq = cb
+        .constant("q", TensorType::f32(vec![1, h_v, l, d]))
+        .unwrap();
+    let ck = cb
+        .constant("k", TensorType::f32(vec![1, h_v, l, d]))
+        .unwrap();
+    let cv = cb
+        .constant("v", TensorType::f32(vec![1, h_v, l, d]))
+        .unwrap();
+    let cg = cb
+        .constant("g", TensorType::f32(vec![1, h_v, l, 1]))
+        .unwrap();
+    let cbeta = cb
+        .constant("beta", TensorType::f32(vec![1, h_v, l, 1]))
+        .unwrap();
+    let cs_in = cb
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, h_v, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let cti = cb
+        .constant("tril_incl", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
+    let cts = cb
+        .constant("tril_strict", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
+    let (_co, cs_out) =
+        gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs_in, cti, cts, c).unwrap();
     let cgraph = cb
         .finish(poot_graph_ir::Outputs::new(_co).with_state(&[(cs_in, cs_out)]))
         .unwrap();
@@ -1152,18 +1250,30 @@ fn gdn_decode_continuation_one_level(
 
     // Sequential decode-recurrence reference graph, used for the post-prefill "want" state (L steps) and the
     // 10 continuation steps.
-    let db = Builder::new();
-    let q_in = db.constant("q", TensorType::f32(vec![1, h_v, 1, d]));
-    let k_in = db.constant("k", TensorType::f32(vec![1, h_v, 1, d]));
-    let v_in = db.constant("v", TensorType::f32(vec![1, h_v, 1, d]));
-    let g_in = db.constant("g", TensorType::f32(vec![1, h_v, 1, 1]));
-    let bt_in = db.constant("beta", TensorType::f32(vec![1, h_v, 1, 1]));
-    let ds_in = db.state_input(
-        "s",
-        TensorType::f32(vec![1, h_v, d, d]),
-        StateRole::Recurrent,
-    );
-    let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
+    let db = Builder::for_tests();
+    let q_in = db
+        .constant("q", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let k_in = db
+        .constant("k", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let v_in = db
+        .constant("v", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let g_in = db
+        .constant("g", TensorType::f32(vec![1, h_v, 1, 1]))
+        .unwrap();
+    let bt_in = db
+        .constant("beta", TensorType::f32(vec![1, h_v, 1, 1]))
+        .unwrap();
+    let ds_in = db
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, h_v, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in).unwrap();
     let dg = db
         .finish(poot_graph_ir::Outputs::new(o).with_state(&[(ds_in, s_out)]))
         .unwrap();
@@ -1317,10 +1427,14 @@ fn cumulative_log_decay_scan_at_least_as_precise_as_matmul_cumsum() {
             ti[i * c + j] = 1.0;
         }
     }
-    let mb = Builder::new();
-    let mg = mb.constant("g", TensorType::f32(vec![1, hv, c, 1]));
-    let mt = mb.constant("ti", TensorType::f32(vec![1, 1, c, c]));
-    let mcum = mb.matmul(mt, mg);
+    let mb = Builder::for_tests();
+    let mg = mb
+        .constant("g", TensorType::f32(vec![1, hv, c, 1]))
+        .unwrap();
+    let mt = mb
+        .constant("ti", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
+    let mcum = mb.matmul(mt, mg).unwrap();
     let mgraph = mb.finish(mcum).unwrap();
     let mut minp = HashMap::new();
     minp.insert(
@@ -1335,9 +1449,11 @@ fn cumulative_log_decay_scan_at_least_as_precise_as_matmul_cumsum() {
         .expect("linear_attention tests evaluate dense graphs");
 
     // Hillis-Steele scan.
-    let sb = Builder::new();
-    let sg = sb.constant("g", TensorType::f32(vec![1, hv, c, 1]));
-    let scum = poot_graph_ir::ops::cumulative_log_decay_scan(&sb, sg, c);
+    let sb = Builder::for_tests();
+    let sg = sb
+        .constant("g", TensorType::f32(vec![1, hv, c, 1]))
+        .unwrap();
+    let scum = poot_graph_ir::ops::cumulative_log_decay_scan(&sb, sg, c).unwrap();
     let sgraph = sb.finish(scum).unwrap();
     let mut sinp = HashMap::new();
     sinp.insert(
@@ -1424,20 +1540,36 @@ fn gdn_prefill_chunked_matches_decode_at_extreme_within_chunk_decay_step() {
             }
         }
     }
-    let cb = Builder::new();
-    let cq = cb.constant("q", TensorType::f32(vec![1, h_k, l, d]));
-    let ck = cb.constant("k", TensorType::f32(vec![1, h_k, l, d]));
-    let cv = cb.constant("v", TensorType::f32(vec![1, h_v, l, d]));
-    let cg = cb.constant("g", TensorType::f32(vec![1, h_v, l, 1]));
-    let cbeta = cb.constant("beta", TensorType::f32(vec![1, h_v, l, 1]));
-    let cs = cb.state_input(
-        "s",
-        TensorType::f32(vec![1, h_v, d, d]),
-        StateRole::Recurrent,
-    );
-    let cti = cb.constant("ti", TensorType::f32(vec![1, 1, c, c]));
-    let cts = cb.constant("ts", TensorType::f32(vec![1, 1, c, c]));
-    let (co, cso) = gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs, cti, cts, c);
+    let cb = Builder::for_tests();
+    let cq = cb
+        .constant("q", TensorType::f32(vec![1, h_k, l, d]))
+        .unwrap();
+    let ck = cb
+        .constant("k", TensorType::f32(vec![1, h_k, l, d]))
+        .unwrap();
+    let cv = cb
+        .constant("v", TensorType::f32(vec![1, h_v, l, d]))
+        .unwrap();
+    let cg = cb
+        .constant("g", TensorType::f32(vec![1, h_v, l, 1]))
+        .unwrap();
+    let cbeta = cb
+        .constant("beta", TensorType::f32(vec![1, h_v, l, 1]))
+        .unwrap();
+    let cs = cb
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, h_v, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let cti = cb
+        .constant("ti", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
+    let cts = cb
+        .constant("ts", TensorType::f32(vec![1, 1, c, c]))
+        .unwrap();
+    let (co, cso) = gdn_prefill_chunked(&cb, cq, ck, cv, cg, cbeta, cs, cti, cts, c).unwrap();
     let cgraph = cb
         .finish(poot_graph_ir::Outputs::new(co).with_state(&[(cs, cso)]))
         .unwrap();
@@ -1485,18 +1617,30 @@ fn gdn_prefill_chunked_matches_decode_at_extreme_within_chunk_decay_step() {
         .unwrap();
 
     // sequential reference.
-    let db = Builder::new();
-    let q_in = db.constant("q", TensorType::f32(vec![1, h_v, 1, d]));
-    let k_in = db.constant("k", TensorType::f32(vec![1, h_v, 1, d]));
-    let v_in = db.constant("v", TensorType::f32(vec![1, h_v, 1, d]));
-    let g_in = db.constant("g", TensorType::f32(vec![1, h_v, 1, 1]));
-    let bt_in = db.constant("beta", TensorType::f32(vec![1, h_v, 1, 1]));
-    let ds_in = db.state_input(
-        "s",
-        TensorType::f32(vec![1, h_v, d, d]),
-        StateRole::Recurrent,
-    );
-    let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
+    let db = Builder::for_tests();
+    let q_in = db
+        .constant("q", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let k_in = db
+        .constant("k", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let v_in = db
+        .constant("v", TensorType::f32(vec![1, h_v, 1, d]))
+        .unwrap();
+    let g_in = db
+        .constant("g", TensorType::f32(vec![1, h_v, 1, 1]))
+        .unwrap();
+    let bt_in = db
+        .constant("beta", TensorType::f32(vec![1, h_v, 1, 1]))
+        .unwrap();
+    let ds_in = db
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, h_v, d, d]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in).unwrap();
     let dg = db
         .finish(poot_graph_ir::Outputs::new(o).with_state(&[(ds_in, s_out)]))
         .unwrap();
@@ -1580,10 +1724,14 @@ fn causal_conv1d_prefill_vs_decode_real_dims() {
     let wd = fill(k * conv_dim, 88); // [K, conv_dim]
 
     // batched prefill conv.
-    let pb = Builder::new();
-    let px = pb.constant("x", TensorType::f32(vec![1, l, conv_dim]));
-    let pw = pb.constant("w", TensorType::f32(vec![k, conv_dim]));
-    let po = causal_conv1d_prefill(&pb, px, pw, k);
+    let pb = Builder::for_tests();
+    let px = pb
+        .constant("x", TensorType::f32(vec![1, l, conv_dim]))
+        .unwrap();
+    let pw = pb
+        .constant("w", TensorType::f32(vec![k, conv_dim]))
+        .unwrap();
+    let po = causal_conv1d_prefill(&pb, px, pw, k).unwrap();
     let pg = pb.finish(po).unwrap();
     let mut pin = HashMap::new();
     pin.insert(
@@ -1602,15 +1750,21 @@ fn causal_conv1d_prefill_vs_decode_real_dims() {
     assert_eq!(got.shape(), vec![1, l, conv_dim]);
 
     // L sequential decode-conv steps from a fresh zero cache.
-    let db = Builder::new();
-    let dx = db.constant("x", TensorType::f32(vec![1, 1, conv_dim]));
-    let dw = db.constant("w", TensorType::f32(vec![k, conv_dim]));
-    let dc = db.state_input(
-        "c",
-        TensorType::f32(vec![1, k - 1, conv_dim]),
-        StateRole::Recurrent,
-    );
-    let (dout, dcout) = causal_conv1d_decode(&db, dx, dw, dc, k);
+    let db = Builder::for_tests();
+    let dx = db
+        .constant("x", TensorType::f32(vec![1, 1, conv_dim]))
+        .unwrap();
+    let dw = db
+        .constant("w", TensorType::f32(vec![k, conv_dim]))
+        .unwrap();
+    let dc = db
+        .state_input(
+            "c",
+            TensorType::f32(vec![1, k - 1, conv_dim]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (dout, dcout) = causal_conv1d_decode(&db, dx, dw, dc, k).unwrap();
     let dgg = db
         .finish(poot_graph_ir::Outputs::new(dout).with_state(&[(dc, dcout)]))
         .unwrap();
@@ -1678,12 +1832,18 @@ fn linear_attention_prefill_per_head_gate_matches_recurrence() {
         }
     }
 
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, l, dk]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, l, dk]));
-    let v = b.constant("v", TensorType::f32(vec![1, hkv, l, dv]));
-    let mask = b.constant("m", TensorType::f32(vec![1, hq, l, l])); // PER-HEAD mask (not broadcast)
-    let o = linear_attention_prefill(&b, q, k, v, n_rep, mask);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, l, dk]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, l, dk]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hkv, l, dv]))
+        .unwrap();
+    let mask = b.constant("m", TensorType::f32(vec![1, hq, l, l])).unwrap(); // PER-HEAD mask (not broadcast)
+    let o = linear_attention_prefill(&b, q, k, v, n_rep, mask).unwrap();
     let (qi, ki, vi, mi) = (q.id(), k.id(), v.id(), mask.id());
     let g = b.finish(o).unwrap();
     let mut inputs = HashMap::new();
@@ -1739,9 +1899,9 @@ fn reduce_over_non_last_axis_keepdim_is_correct() {
     use poot_graph_ir::op::RedOp;
     let (a, b_, c) = (2usize, 3usize, 4usize);
     let xd: Vec<f32> = (0..a * b_ * c).map(|i| i as f32 * 0.5 - 3.0).collect();
-    let bld = Builder::new();
-    let x = bld.constant("x", TensorType::f32(vec![a, b_, c]));
-    let r = bld.reduce(RedOp::Sum, x, 1, true); // [a,1,c]
+    let bld = Builder::for_tests();
+    let x = bld.constant("x", TensorType::f32(vec![a, b_, c])).unwrap();
+    let r = bld.reduce(RedOp::Sum, x, 1, true).unwrap(); // [a,1,c]
     let g = bld.finish(r).unwrap();
     let mut inp = HashMap::new();
     inp.insert(
@@ -1774,15 +1934,17 @@ fn causal_conv1d_decode_loop_matches_reference() {
     let wd = fill(k * c, 22);
 
     // decode graph: x[1,1,C], cache[1,K-1,C] carried.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, c]));
-    let w = b.constant("w", TensorType::f32(vec![k, c]));
-    let cache = b.state_input(
-        "cache",
-        TensorType::f32(vec![1, k - 1, c]),
-        StateRole::Recurrent,
-    );
-    let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, c])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![k, c])).unwrap();
+    let cache = b
+        .state_input(
+            "cache",
+            TensorType::f32(vec![1, k - 1, c]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (out, new_cache) = causal_conv1d_decode(&b, x, w, cache, k).unwrap();
     let g = b
         .finish(poot_graph_ir::Outputs::new(out).with_state(&[(cache, new_cache)]))
         .unwrap();
@@ -1848,15 +2010,17 @@ fn causal_conv1d_prefill_matches_decode() {
     let wd = fill(k * c, 32); // [K, C]
 
     // --- sequential decode reference: L calls, cache carried, starting from a zero cache. ---
-    let db = Builder::new();
-    let dx = db.constant("x", TensorType::f32(vec![1, 1, c]));
-    let dw = db.constant("w", TensorType::f32(vec![k, c]));
-    let dcache = db.state_input(
-        "cache",
-        TensorType::f32(vec![1, k - 1, c]),
-        StateRole::Recurrent,
-    );
-    let (dout, dcache_out) = causal_conv1d_decode(&db, dx, dw, dcache, k);
+    let db = Builder::for_tests();
+    let dx = db.constant("x", TensorType::f32(vec![1, 1, c])).unwrap();
+    let dw = db.constant("w", TensorType::f32(vec![k, c])).unwrap();
+    let dcache = db
+        .state_input(
+            "cache",
+            TensorType::f32(vec![1, k - 1, c]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (dout, dcache_out) = causal_conv1d_decode(&db, dx, dw, dcache, k).unwrap();
     let dg = db
         .finish(poot_graph_ir::Outputs::new(dout).with_state(&[(dcache, dcache_out)]))
         .unwrap();
@@ -1897,12 +2061,12 @@ fn causal_conv1d_prefill_matches_decode() {
     }
 
     // --- batched prefill: ONE call over all L positions. ---
-    let pb = Builder::new();
-    let px = pb.constant("x", TensorType::f32(vec![1, l, c]));
-    let pw = pb.constant("w", TensorType::f32(vec![k, c]));
-    let pout = causal_conv1d_prefill(&pb, px, pw, k);
+    let pb = Builder::for_tests();
+    let px = pb.constant("x", TensorType::f32(vec![1, l, c])).unwrap();
+    let pw = pb.constant("w", TensorType::f32(vec![k, c])).unwrap();
+    let pout = causal_conv1d_prefill(&pb, px, pw, k).unwrap();
     assert_eq!(
-        pb.aval(pout).shape,
+        pb.aval(pout).unwrap().shape,
         vec![1, l, c],
         "causal_conv1d_prefill output shape [1,L,C]"
     );

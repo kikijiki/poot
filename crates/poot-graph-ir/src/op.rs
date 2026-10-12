@@ -4,12 +4,11 @@
 //! [`crate::ops`]). Each variant carries its by-value params (the jaxpr eqn `params`); tensor operands are passed
 //! separately to `infer`.
 
+use poot_quant::PackedWeight;
 use std::num::NonZeroU32;
 
 use crate::error::{FusedOperandReason, ScanReason, ShapeError};
 use crate::types::{DType, DTypeClass, DTypeClassExt, Scalar, TensorType, broadcast_shapes};
-pub use poot_quant::format::{ScaleEncoding, WeightFormat};
-pub use poot_quant::{OperandRole, PackedWeight, SourceRole};
 
 /// Unary primitives. The transcendentals are `Exp`, `Log`, `Sqrt`, `Recip`, `Tanh` and `Erf`; every
 /// activation (`silu`, `gelu`, `gelu_erf`, `sigmoid`, `softplus`) is an [`crate::ops`] composition over them,
@@ -864,42 +863,6 @@ pub enum OpKind {
     },
 }
 
-/// Fold one fused-region operand into a hasher. A literal hashes its dtype tag and bit pattern, so `1.0`,
-/// `-0.0` versus `0.0` and distinct NaN payloads all stay distinct. `#[cfg(test)]` alongside
-/// [`OpKind::hash_params`], its only caller.
-#[cfg(test)]
-fn hash_fused_operand<H: std::hash::Hasher>(operand: &FusedOperand, h: &mut H) {
-    use std::hash::Hash;
-    match operand {
-        FusedOperand::Local(id) => {
-            0u8.hash(h);
-            id.hash(h);
-        }
-        FusedOperand::Lit(Scalar::F32(v)) => {
-            1u8.hash(h);
-            v.to_bits().hash(h);
-        }
-        FusedOperand::Lit(Scalar::I32(v)) => {
-            2u8.hash(h);
-            v.hash(h);
-        }
-        FusedOperand::PackLane { input, lane } => {
-            3u8.hash(h);
-            input.hash(h);
-            lane.hash(h);
-        }
-    }
-}
-
-#[cfg(test)]
-fn hash_fused_operands<H: std::hash::Hasher>(operands: &[FusedOperand], h: &mut H) {
-    use std::hash::Hash;
-    operands.len().hash(h);
-    for operand in operands {
-        hash_fused_operand(operand, h);
-    }
-}
-
 /// Card 529 (R466-011): reject a `DTypeClass::StorageOnly` or `DTypeClass::Packed` operand of an
 /// arithmetic op (`Unary`, `Binary`, `Reduce`). Only `Cast` and the movement ops, which never read a
 /// value's bit pattern, admit those dtypes; `DTypeClass::Index` (I32) stays admitted here alongside
@@ -957,130 +920,6 @@ fn matmul_operand_dtypes_allowed(a: DType, b: DType) -> bool {
 }
 
 impl OpKind {
-    /// Fold this op's own parameters (not just its discriminant) into a hasher, allocation-free (no `Debug` or
-    /// `format!`). `OpKind` cannot derive `Hash` because `Attention` etc. carry an `f32 scale`,
-    /// which is not `Eq`/`Hash` under IEEE NaN semantics; every f32 field hashes its bit pattern instead. Hashing
-    /// only the discriminant cannot distinguish two eqns of the same op kind with different params (a `Slice` at
-    /// a different offset, a `DynamicUpdateSlice` on a different axis, a different `DType`).
-    ///
-    /// `Fused`/`FusedRow` hash their full region description: every step's op and operands (local ids, literal
-    /// bit patterns, pack lanes), the output local, the pack list and the row axis. A fused region is the whole
-    /// program of one synthesized kernel, so two regions that differ anywhere (`x + 1` versus `x * 2`) must hash
-    /// differently.
-    ///
-    /// `pub(crate)`/test-only (card 546b): the production consumer was `poot-gpu`'s `GraphIdentity`
-    /// (guarding `CseMemo`/`DecodeCache` reuse), gone with the rest of the pre-contract executor.
-    #[cfg(test)]
-    pub(crate) fn hash_params<H: std::hash::Hasher>(&self, h: &mut H) {
-        use std::hash::Hash;
-        std::mem::discriminant(self).hash(h);
-        match self {
-            OpKind::Unary(op) => op.hash(h),
-            OpKind::Binary(op) => op.hash(h),
-            OpKind::Reduce { op, axis, keepdim } => {
-                op.hash(h);
-                axis.hash(h);
-                keepdim.hash(h);
-            }
-            OpKind::Broadcast { shape } => shape.hash(h),
-            OpKind::Cast { to } => to.hash(h),
-            OpKind::Reshape { shape } => shape.hash(h),
-            OpKind::Transpose { perm } => perm.hash(h),
-            OpKind::Slice { axis, start, end } => {
-                axis.hash(h);
-                start.hash(h);
-                end.hash(h);
-            }
-            OpKind::Concat { axis } => axis.hash(h),
-            OpKind::Iota { len, dtype } => {
-                len.hash(h);
-                dtype.hash(h);
-            }
-            OpKind::Gather { axis } => axis.hash(h),
-            OpKind::Scatter { axis } => axis.hash(h),
-            OpKind::Select
-            | OpKind::ScatterUpdate
-            | OpKind::MatMul
-            | OpKind::IndexedMatMul
-            | OpKind::PackI8 => {} // no params beyond the discriminant already hashed
-            OpKind::ContractionEpilogue { head, region } => {
-                head.hash(h);
-                region.n_inputs.hash(h);
-                region.steps.len().hash(h);
-                for step in &region.steps {
-                    step.op.hash(h);
-                    hash_fused_operands(&step.inputs, h);
-                }
-                region.output.hash(h);
-            }
-            OpKind::PackedDequant { descriptor } => descriptor.hash(h),
-            OpKind::PackedContraction { descriptor, rows } => {
-                descriptor.hash(h);
-                rows.hash(h);
-            }
-            OpKind::PackedRowGather { descriptor } => descriptor.hash(h),
-            OpKind::DenseContraction { weight } => weight.hash(h),
-            OpKind::GroupedDenseContraction { weight, groups } => {
-                weight.hash(h);
-                groups.hash(h);
-            }
-            OpKind::DenseRowGather { source } => source.hash(h),
-            OpKind::ArgTopK { k } => k.hash(h),
-            OpKind::DynamicUpdateSlice { axis } => axis.hash(h),
-            OpKind::UnpackI8 { len } => len.hash(h),
-            OpKind::Fused(region) => {
-                region.n_inputs.hash(h);
-                region.steps.len().hash(h);
-                for step in &region.steps {
-                    step.op.hash(h);
-                    hash_fused_operands(&step.inputs, h);
-                }
-                region.output.hash(h);
-                region.pack.hash(h);
-            }
-            OpKind::FusedRow(region) => {
-                region.n_inputs.hash(h);
-                region.axis.hash(h);
-                region.steps.len().hash(h);
-                for step in &region.steps {
-                    match step {
-                        RowStep::Pointwise { op, inputs } => {
-                            0u8.hash(h);
-                            op.hash(h);
-                            hash_fused_operands(inputs, h);
-                        }
-                        RowStep::Reduce { op, input } => {
-                            1u8.hash(h);
-                            op.hash(h);
-                            hash_fused_operand(input, h);
-                        }
-                    }
-                }
-                region.output.hash(h);
-            }
-            OpKind::Attention(attrs) => {
-                attrs.n_rep.hash(h);
-                attrs.scale.to_bits().hash(h);
-                attrs.softcap.map(f32::to_bits).hash(h);
-                attrs.mask.hash(h);
-                attrs.key.hash(h);
-                attrs.bound.hash(h);
-            }
-            OpKind::Rope { rot } => rot.hash(h),
-            OpKind::Scan(attrs) => attrs.hash(h),
-            OpKind::AllReduce { op, axis } => {
-                op.hash(h);
-                axis.hash(h);
-            }
-            OpKind::AllGather { axis, world } => {
-                axis.hash(h);
-                world.hash(h);
-            }
-            OpKind::RandomUniform { cols } => cols.hash(h),
-            OpKind::SampleToken { rule } => rule.hash(h),
-        }
-    }
-
     /// Infer the output type from the operand types. Pure, host-only, no data. The single source of
     /// truth for every eqn's result shape/dtype.
     #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -2036,6 +1875,78 @@ impl OpKind {
         }
     }
 
+    /// The bytes of heap storage this operation's attributes own beyond its inline size: the shape
+    /// and permutation lists, and the step lists of a fused region. `None` when the sum overflows
+    /// `u64`. The tracer's owned-byte budget charges this with the record that holds the operation.
+    pub(crate) fn owned_heap_bytes(&self) -> Option<u64> {
+        const WORD: u64 = std::mem::size_of::<usize>() as u64;
+        fn list(len: usize, element: usize) -> Option<u64> {
+            (len as u64).checked_mul(element as u64)
+        }
+        fn fused(region: &FusedRegion) -> Option<u64> {
+            let mut total = list(region.pack.len(), std::mem::size_of::<usize>())?;
+            total =
+                total.checked_add(list(region.steps.len(), std::mem::size_of::<FusedStep>())?)?;
+            for step in &region.steps {
+                total = total.checked_add(list(
+                    step.inputs.len(),
+                    std::mem::size_of::<FusedOperand>(),
+                )?)?;
+            }
+            Some(total)
+        }
+        match self {
+            OpKind::Broadcast { shape } | OpKind::Reshape { shape } => {
+                (shape.len() as u64).checked_mul(WORD)
+            }
+            OpKind::Transpose { perm } => (perm.len() as u64).checked_mul(WORD),
+            OpKind::Fused(region) => fused(region),
+            OpKind::ContractionEpilogue { region, .. } => fused(region),
+            OpKind::FusedRow(region) => {
+                let mut total = list(region.steps.len(), std::mem::size_of::<RowStep>())?;
+                for step in &region.steps {
+                    if let RowStep::Pointwise { inputs, .. } = step {
+                        total = total.checked_add(list(
+                            inputs.len(),
+                            std::mem::size_of::<FusedOperand>(),
+                        )?)?;
+                    }
+                }
+                Some(total)
+            }
+            OpKind::Unary(_)
+            | OpKind::Binary(_)
+            | OpKind::Select
+            | OpKind::Reduce { .. }
+            | OpKind::Cast { .. }
+            | OpKind::Slice { .. }
+            | OpKind::Concat { .. }
+            | OpKind::Iota { .. }
+            | OpKind::Gather { .. }
+            | OpKind::Scatter { .. }
+            | OpKind::ScatterUpdate
+            | OpKind::MatMul
+            | OpKind::PackedDequant { .. }
+            | OpKind::PackedContraction { .. }
+            | OpKind::PackedRowGather { .. }
+            | OpKind::DenseContraction { .. }
+            | OpKind::GroupedDenseContraction { .. }
+            | OpKind::DenseRowGather { .. }
+            | OpKind::ArgTopK { .. }
+            | OpKind::IndexedMatMul
+            | OpKind::DynamicUpdateSlice { .. }
+            | OpKind::PackI8
+            | OpKind::UnpackI8 { .. }
+            | OpKind::Attention(_)
+            | OpKind::Rope { .. }
+            | OpKind::Scan(_)
+            | OpKind::AllReduce { .. }
+            | OpKind::AllGather { .. }
+            | OpKind::RandomUniform { .. }
+            | OpKind::SampleToken { .. } => Some(0),
+        }
+    }
+
     /// The short name shown in a graph dump.
     pub fn name(&self) -> String {
         match self {
@@ -2623,6 +2534,7 @@ mod tests {
     use super::*;
     use crate::types::DType;
     use poot_quant::format::ScaleEncoding;
+    use poot_quant::format::WeightFormat;
     use poot_quant::{OperandRole, PackedWeight, SourceRole};
 
     fn f(shape: &[usize]) -> TensorType {
@@ -4382,5 +4294,164 @@ mod tests {
             .infer(&[TensorType::new(vec![3], DType::I32)])
             .unwrap();
         assert_eq!(out, TensorType::new(vec![3, 5], DType::F32));
+    }
+
+    /// Fold one fused-region operand into a hasher. A literal hashes its dtype tag and bit pattern, so `1.0`,
+    /// `-0.0` versus `0.0` and distinct NaN payloads all stay distinct. `#[cfg(test)]` alongside
+    /// [`OpKind::hash_params`], its only caller.
+    fn hash_fused_operand<H: std::hash::Hasher>(operand: &FusedOperand, h: &mut H) {
+        use std::hash::Hash;
+        match operand {
+            FusedOperand::Local(id) => {
+                0u8.hash(h);
+                id.hash(h);
+            }
+            FusedOperand::Lit(Scalar::F32(v)) => {
+                1u8.hash(h);
+                v.to_bits().hash(h);
+            }
+            FusedOperand::Lit(Scalar::I32(v)) => {
+                2u8.hash(h);
+                v.hash(h);
+            }
+            FusedOperand::PackLane { input, lane } => {
+                3u8.hash(h);
+                input.hash(h);
+                lane.hash(h);
+            }
+        }
+    }
+
+    fn hash_fused_operands<H: std::hash::Hasher>(operands: &[FusedOperand], h: &mut H) {
+        use std::hash::Hash;
+        operands.len().hash(h);
+        for operand in operands {
+            hash_fused_operand(operand, h);
+        }
+    }
+
+    impl OpKind {
+        /// Fold this op's own parameters (not just its discriminant) into a hasher, allocation-free (no `Debug` or
+        /// `format!`). `OpKind` cannot derive `Hash` because `Attention` etc. carry an `f32 scale`,
+        /// which is not `Eq`/`Hash` under IEEE NaN semantics; every f32 field hashes its bit pattern instead. Hashing
+        /// only the discriminant cannot distinguish two eqns of the same op kind with different params (a `Slice` at
+        /// a different offset, a `DynamicUpdateSlice` on a different axis, a different `DType`).
+        ///
+        /// `Fused`/`FusedRow` hash their full region description: every step's op and operands (local ids, literal
+        /// bit patterns, pack lanes), the output local, the pack list and the row axis. A fused region is the whole
+        /// program of one synthesized kernel, so two regions that differ anywhere (`x + 1` versus `x * 2`) must hash
+        /// differently.
+        ///
+        /// `pub(crate)`/test-only (card 546b): the production consumer was `poot-wgpu-device`'s `GraphIdentity`
+        /// (guarding `CseMemo`/`DecodeCache` reuse), gone with the rest of the pre-contract executor.
+        pub(crate) fn hash_params<H: std::hash::Hasher>(&self, h: &mut H) {
+            use std::hash::Hash;
+            std::mem::discriminant(self).hash(h);
+            match self {
+                OpKind::Unary(op) => op.hash(h),
+                OpKind::Binary(op) => op.hash(h),
+                OpKind::Reduce { op, axis, keepdim } => {
+                    op.hash(h);
+                    axis.hash(h);
+                    keepdim.hash(h);
+                }
+                OpKind::Broadcast { shape } => shape.hash(h),
+                OpKind::Cast { to } => to.hash(h),
+                OpKind::Reshape { shape } => shape.hash(h),
+                OpKind::Transpose { perm } => perm.hash(h),
+                OpKind::Slice { axis, start, end } => {
+                    axis.hash(h);
+                    start.hash(h);
+                    end.hash(h);
+                }
+                OpKind::Concat { axis } => axis.hash(h),
+                OpKind::Iota { len, dtype } => {
+                    len.hash(h);
+                    dtype.hash(h);
+                }
+                OpKind::Gather { axis } => axis.hash(h),
+                OpKind::Scatter { axis } => axis.hash(h),
+                OpKind::Select
+                | OpKind::ScatterUpdate
+                | OpKind::MatMul
+                | OpKind::IndexedMatMul
+                | OpKind::PackI8 => {} // no params beyond the discriminant already hashed
+                OpKind::ContractionEpilogue { head, region } => {
+                    head.hash(h);
+                    region.n_inputs.hash(h);
+                    region.steps.len().hash(h);
+                    for step in &region.steps {
+                        step.op.hash(h);
+                        hash_fused_operands(&step.inputs, h);
+                    }
+                    region.output.hash(h);
+                }
+                OpKind::PackedDequant { descriptor } => descriptor.hash(h),
+                OpKind::PackedContraction { descriptor, rows } => {
+                    descriptor.hash(h);
+                    rows.hash(h);
+                }
+                OpKind::PackedRowGather { descriptor } => descriptor.hash(h),
+                OpKind::DenseContraction { weight } => weight.hash(h),
+                OpKind::GroupedDenseContraction { weight, groups } => {
+                    weight.hash(h);
+                    groups.hash(h);
+                }
+                OpKind::DenseRowGather { source } => source.hash(h),
+                OpKind::ArgTopK { k } => k.hash(h),
+                OpKind::DynamicUpdateSlice { axis } => axis.hash(h),
+                OpKind::UnpackI8 { len } => len.hash(h),
+                OpKind::Fused(region) => {
+                    region.n_inputs.hash(h);
+                    region.steps.len().hash(h);
+                    for step in &region.steps {
+                        step.op.hash(h);
+                        hash_fused_operands(&step.inputs, h);
+                    }
+                    region.output.hash(h);
+                    region.pack.hash(h);
+                }
+                OpKind::FusedRow(region) => {
+                    region.n_inputs.hash(h);
+                    region.axis.hash(h);
+                    region.steps.len().hash(h);
+                    for step in &region.steps {
+                        match step {
+                            RowStep::Pointwise { op, inputs } => {
+                                0u8.hash(h);
+                                op.hash(h);
+                                hash_fused_operands(inputs, h);
+                            }
+                            RowStep::Reduce { op, input } => {
+                                1u8.hash(h);
+                                op.hash(h);
+                                hash_fused_operand(input, h);
+                            }
+                        }
+                    }
+                    region.output.hash(h);
+                }
+                OpKind::Attention(attrs) => {
+                    attrs.n_rep.hash(h);
+                    attrs.scale.to_bits().hash(h);
+                    attrs.softcap.map(f32::to_bits).hash(h);
+                    attrs.mask.hash(h);
+                    attrs.key.hash(h);
+                    attrs.bound.hash(h);
+                }
+                OpKind::Rope { rot } => rot.hash(h),
+                OpKind::Scan(attrs) => attrs.hash(h),
+                OpKind::AllReduce { op, axis } => {
+                    op.hash(h);
+                    axis.hash(h);
+                }
+                OpKind::AllGather { axis, world } => {
+                    axis.hash(h);
+                    world.hash(h);
+                }
+                OpKind::RandomUniform { cols } => cols.hash(h),
+                OpKind::SampleToken { rule } => rule.hash(h),
+            }
+        }
     }
 }

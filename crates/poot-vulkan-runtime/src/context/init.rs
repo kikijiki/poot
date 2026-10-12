@@ -1,4 +1,14 @@
-use crate::*;
+use crate::driver::AshResourceDispatch;
+use crate::features::DeviceFeatures;
+use crate::resources::require_gpu_check;
+use crate::util::{bytemuck_cast_i8_to_u8, find_memory_type};
+use crate::validation::Validation;
+use crate::{Context, DeviceOwner, RuntimeError, validation};
+use ash::vk;
+use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 impl Context {
     /// Create a Vulkan instance (no surface/swapchain), pick the first physical device with a
@@ -238,7 +248,7 @@ impl Context {
         let (max_buffer_bytes, watchdog_budget, known_miscompiles) = if is_amd_radv {
             let d = poot_target::DeviceCaps::wgpu_rdna3_igpu();
             (
-                measured_max_buffer.min(poot_runtime::AMD_RADV_SAFE_MAX_BUFFER_BYTES),
+                measured_max_buffer.min(poot_wgpu_runtime::AMD_RADV_SAFE_MAX_BUFFER_BYTES),
                 d.watchdog_budget,
                 d.known_miscompiles,
             )
@@ -252,9 +262,10 @@ impl Context {
         // Card 653: AMD's shader-core properties where the driver exposes them, else
         // the RDNA3 default, as the wgpu runtime does.
         // SAFETY: `physical_device` is from this instance's own enumeration.
-        let compute_units =
-            unsafe { poot_runtime::amd_vulkan_compute_units(&owner.instance, physical_device) }
-                .unwrap_or(poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units);
+        let compute_units = unsafe {
+            poot_wgpu_runtime::amd_vulkan_compute_units(&owner.instance, physical_device)
+        }
+        .unwrap_or(poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units);
         // SAFETY: `physical_device` is from this instance's own enumeration; the extension list was
         // read from the same device.
         let subgroup = unsafe {
@@ -362,9 +373,9 @@ impl Context {
     /// and `max_buffer_bytes` is the smallest of the largest `DEVICE_LOCAL` memory heap, the
     /// Maintenance3 `maxMemoryAllocationSize` and `maxStorageBufferRange` (a single buffer must be one
     /// allocation a descriptor can bind whole; Card 553, R-553-1). This crate dispatches the same SPIR-V through the same Vulkan driver
-    /// as `poot-runtime` (wgpu), so an AMD Vulkan (RADV) device shares its RADV gfx-ring wedge
+    /// as `poot-wgpu-runtime` (wgpu), so an AMD Vulkan (RADV) device shares its RADV gfx-ring wedge
     /// (`max_buffer_bytes`), display-watchdog budget and card-095 tiled-GEMM miscompile ceiling; both are
-    /// the same vendor-scoped default ([`poot_target::DeviceCaps::wgpu_rdna3_igpu`]) `poot-runtime`
+    /// the same vendor-scoped default ([`poot_target::DeviceCaps::wgpu_rdna3_igpu`]) `poot-wgpu-runtime`
     /// reports there, not a device query (neither is exposed by any driver API). `tensor_core` is the
     /// `VK_KHR_cooperative_matrix` query measured once at construction (card 522 review), never parsed
     /// from `device_name()`'s marketing codename string.

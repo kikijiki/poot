@@ -1802,6 +1802,7 @@ dependencies = [
  "poot-models",
  "poot-profile",
  "poot-quant",
+ "poot-runtime-common",
  "serde_json",
 ]
 
@@ -1812,7 +1813,6 @@ dependencies = [
  "poot-kernel-ir",
  "poot-runtime-common",
  "poot-target",
- "poot-test-util",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -1822,15 +1822,11 @@ name = "poot-eval"
 version = "0.0.0"
 dependencies = [
  "libm",
- "poot-executor-parity",
  "poot-graph-ir",
- "poot-load",
- "poot-models",
  "poot-quant",
  "poot-target",
  "poot-tensor",
  "poot-test-util",
- "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -1843,6 +1839,7 @@ dependencies = [
  "poot-graph-ir",
  "poot-graph-plan",
  "poot-kernel-ir",
+ "poot-kernelgen",
  "poot-profile",
  "poot-quant",
  "poot-runtime-common",
@@ -1856,44 +1853,15 @@ dependencies = [
 name = "poot-executor-parity"
 version = "0.0.0"
 dependencies = [
- "bytemuck",
- "poot-executor",
- "poot-graph-ir",
- "poot-graph-plan",
- "poot-models",
- "poot-profile",
- "poot-quant",
- "poot-runtime-common",
- "poot-target",
- "poot-tensor",
- "poot-test-util",
- "serde_json",
-]
-
-[[package]]
-name = "poot-gpu"
-version = "0.0.0"
-dependencies = [
- "bytemuck",
- "criterion",
- "poot-codegen",
  "poot-eval",
  "poot-executor",
- "poot-executor-parity",
  "poot-graph-ir",
  "poot-graph-plan",
- "poot-kernel-ir",
- "poot-kernelgen",
- "poot-load",
- "poot-models",
- "poot-profile",
  "poot-quant",
- "poot-runtime",
  "poot-runtime-common",
  "poot-target",
  "poot-tensor",
  "poot-test-util",
- "serde_json",
 ]
 
 [[package]]
@@ -1902,6 +1870,7 @@ version = "0.0.0"
 dependencies = [
  "poot-quant",
  "poot-tensor",
+ "poot-test-util",
  "thiserror 2.0.18",
 ]
 
@@ -1912,11 +1881,10 @@ dependencies = [
  "blake3",
  "poot-codegen",
  "poot-eval",
- "poot-executor-parity",
  "poot-graph-ir",
+ "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
- "poot-models",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",
@@ -1954,14 +1922,15 @@ name = "poot-kernelgen"
 version = "0.0.0"
 dependencies = [
  "poot-codegen",
+ "poot-graph-ir",
  "poot-kernel-ir",
  "poot-ptx-runtime",
  "poot-quant",
  "poot-rocm-runtime",
- "poot-runtime",
  "poot-runtime-common",
  "poot-target",
  "poot-test-util",
+ "poot-wgpu-runtime",
  "thiserror 2.0.18",
 ]
 
@@ -1974,31 +1943,31 @@ dependencies = [
  "bytemuck",
  "clap",
  "image",
- "minijinja",
- "minijinja-contrib",
  "poot-codegen",
  "poot-eval",
  "poot-executor",
  "poot-executor-parity",
- "poot-gpu",
  "poot-graph-ir",
  "poot-graph-plan",
  "poot-kernel-ir",
+ "poot-kernelgen",
  "poot-llm",
  "poot-load",
  "poot-models",
  "poot-profile",
- "poot-ptx-gpu",
+ "poot-ptx-device",
  "poot-ptx-runtime",
  "poot-quant",
- "poot-rocm-gpu",
+ "poot-rocm-device",
  "poot-rocm-runtime",
- "poot-runtime",
  "poot-runtime-common",
  "poot-target",
  "poot-tensor",
  "poot-test-util",
+ "poot-text",
  "poot-vulkan-device",
+ "poot-wgpu-device",
+ "poot-wgpu-runtime",
  "regex-automata",
  "serde",
  "serde_json",
@@ -2012,6 +1981,7 @@ dependencies = [
 name = "poot-load"
 version = "0.0.0"
 dependencies = [
+ "poot-load",
  "poot-quant",
  "poot-tensor",
  "poot-test-util",
@@ -2025,19 +1995,24 @@ dependencies = [
 name = "poot-models"
 version = "0.0.0"
 dependencies = [
+ "bytemuck",
  "criterion",
  "poot-eval",
+ "poot-executor",
  "poot-executor-parity",
  "poot-graph-ir",
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
  "poot-load",
+ "poot-models",
+ "poot-profile",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",
  "poot-tensor",
  "poot-test-util",
+ "poot-text",
  "serde_json",
  "thiserror 2.0.18",
 ]
@@ -2048,6 +2023,7 @@ version = "0.0.0"
 dependencies = [
  "cc",
  "poot-codegen",
+ "poot-eval",
  "poot-executor",
  "poot-executor-parity",
  "poot-graph-ir",
@@ -2087,16 +2063,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "poot-ptx-check"
-version = "0.0.0"
-dependencies = [
- "poot-ptx-runtime",
- "poot-runtime-common",
- "poot-target",
-]
-
-[[package]]
-name = "poot-ptx-gpu"
+name = "poot-ptx-device"
 version = "0.0.0"
 dependencies = [
  "bytemuck",
@@ -2109,7 +2076,6 @@ dependencies = [
  "poot-kernel-ir",
  "poot-kernelgen",
  "poot-load",
- "poot-models",
  "poot-ptx-runtime",
  "poot-quant",
  "poot-runtime-common",
@@ -2129,7 +2095,6 @@ dependencies = [
  "poot-kernel-ir",
  "poot-runtime-common",
  "poot-target",
- "poot-test-util",
  "thiserror 2.0.18",
 ]
 
@@ -2138,25 +2103,12 @@ name = "poot-quant"
 version = "0.0.0"
 dependencies = [
  "memmap2",
+ "poot-quant",
  "poot-tensor",
- "poot-test-util",
 ]
 
 [[package]]
-name = "poot-rocm-check"
-version = "0.0.0"
-dependencies = [
- "poot-codegen",
- "poot-kernel-ir",
- "poot-rocm-runtime",
- "poot-runtime-common",
- "poot-target",
- "poot-test-util",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "poot-rocm-gpu"
+name = "poot-rocm-device"
 version = "0.0.0"
 dependencies = [
  "object",
@@ -2164,13 +2116,11 @@ dependencies = [
  "poot-eval",
  "poot-executor",
  "poot-executor-parity",
- "poot-gpu",
  "poot-graph-ir",
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
  "poot-load",
- "poot-models",
  "poot-quant",
  "poot-rocm-runtime",
  "poot-runtime-common",
@@ -2190,28 +2140,9 @@ dependencies = [
  "poot-kernel-ir",
  "poot-runtime-common",
  "poot-target",
- "poot-test-util",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "poot-runtime"
-version = "0.0.0"
-dependencies = [
- "ash",
- "bytemuck",
- "pollster",
- "poot-codegen",
- "poot-kernel-ir",
- "poot-runtime-common",
- "poot-target",
- "poot-test-util",
- "serde_json",
- "thiserror 2.0.18",
- "wgpu",
- "wgpu-hal",
 ]
 
 [[package]]
@@ -2242,6 +2173,7 @@ dependencies = [
  "poot-target",
  "poot-tensor",
  "poot-test-util",
+ "poot-text",
  "ring",
  "serde",
  "serde_json",
@@ -2273,16 +2205,21 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "libc",
- "poot-codegen",
- "poot-eval",
- "poot-graph-ir",
- "poot-graph-plan",
- "poot-kernel-ir",
- "poot-kernelgen",
- "poot-quant",
- "poot-runtime-common",
  "poot-target",
- "poot-tensor",
+ "serde_json",
+]
+
+[[package]]
+name = "poot-text"
+version = "0.0.0"
+dependencies = [
+ "minijinja",
+ "minijinja-contrib",
+ "regex-automata",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tracing",
 ]
 
 [[package]]
@@ -2293,13 +2230,10 @@ dependencies = [
  "poot-eval",
  "poot-executor",
  "poot-executor-parity",
- "poot-gpu",
  "poot-graph-ir",
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
- "poot-llm",
- "poot-models",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",
@@ -2318,11 +2252,53 @@ dependencies = [
  "ash",
  "poot-codegen",
  "poot-kernel-ir",
- "poot-runtime",
  "poot-runtime-common",
  "poot-target",
- "poot-test-util",
+ "poot-wgpu-runtime",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "poot-wgpu-device"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "criterion",
+ "poot-codegen",
+ "poot-eval",
+ "poot-executor",
+ "poot-executor-parity",
+ "poot-graph-ir",
+ "poot-graph-plan",
+ "poot-kernel-ir",
+ "poot-kernelgen",
+ "poot-load",
+ "poot-quant",
+ "poot-runtime-common",
+ "poot-target",
+ "poot-tensor",
+ "poot-test-util",
+ "poot-wgpu-device",
+ "poot-wgpu-runtime",
+ "serde_json",
+]
+
+[[package]]
+name = "poot-wgpu-runtime"
+version = "0.0.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "pollster",
+ "poot-codegen",
+ "poot-kernel-ir",
+ "poot-runtime-common",
+ "poot-target",
+ "poot-wgpu-runtime",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wgpu",
+ "wgpu-hal",
 ]
 
 [[package]]
@@ -2334,8 +2310,9 @@ dependencies = [
  "poot-kernel-ir",
  "poot-kernelgen",
  "poot-ptx-runtime",
- "poot-runtime",
+ "poot-runtime-common",
  "poot-test-util",
+ "poot-wgpu-runtime",
  "serde_json",
 ]
 

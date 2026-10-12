@@ -12,14 +12,14 @@
 //!   macro does no codegen, defines no DSL.
 //! - **Host pass** (this crate's default build, what an ordinary `cargo build` links): emit a typed launch
 //!   wrapper with the original name and signature plus a leading `&Context`, that dispatches the kernel's
-//!   cached SPIR-V via `poot_runtime::Context::launch`. The body is not re-emitted, so kernel bodies need
+//!   cached SPIR-V via `poot_wgpu_runtime::Context::launch`. The body is not re-emitted, so kernel bodies need
 //!   not be host-compatible. The wrapper builds its `CompiledKernel` with `poot_codegen::kernel_handle`
 //!   from the kernel-IR `Body` the device pass compiled (card 608):
 //!   `poot-codegen` stays the only place that constructs a `CompiledKernel`, so a `#[kernel]`'s schema and
 //!   trap flag always come from the verified `Body`, never guessed from the Rust signature. The wrapper
 //!   looks the SPIR-V and `Body` up by name via `crate::poot_kernel_spv`/`crate::poot_kernel_body` (the
 //!   host crate `include!`s the pootc-generated `poot_cache.rs` at its crate root, and so needs
-//!   `poot-codegen`, `poot-kernel-ir` and `serde_json` as dependencies alongside `poot-runtime`). The
+//!   `poot-codegen`, `poot-kernel-ir` and `serde_json` as dependencies alongside `poot-wgpu-runtime`). The
 //!   kernel's writable `&mut [T]` output must be its last parameter (the binding order).
 
 use proc_macro::TokenStream;
@@ -132,9 +132,9 @@ fn host_wrapper(func: &ItemFn) -> syn::Result<TokenStream2> {
     })?;
     Ok(quote! {
         pub fn #name(
-            ctx: &::poot_runtime::Context,
+            ctx: &::poot_wgpu_runtime::Context,
             #(#params),*
-        ) -> ::core::result::Result<(), ::poot_runtime::RuntimeError> {
+        ) -> ::core::result::Result<(), ::poot_wgpu_runtime::RuntimeError> {
             // Card 608: the handle comes from `poot_codegen::kernel_handle`
             // against the device pass's own cached `Body`, exactly like `poot-codegen`'s other callers, so
             // this wrapper never constructs a `CompiledKernel` itself and the schema/trap flag can never
@@ -172,12 +172,12 @@ mod card537_no_env_input_tests {
     /// `if std::env::var_os("POOT_KERNEL_BUILD").is_some() { return Ok(quote!(mod
     /// poot_kernel_build_mutation_marker {})); }` guard back into `host_wrapper` made the two expansions
     /// below differ depending on which call ran with the var set - red (`assert_eq!` failed: left
-    /// `"mod poot_kernel_build_mutation_marker { }"`, right `"pub fn add (ctx : & :: poot_runtime ::
+    /// `"mod poot_kernel_build_mutation_marker { }"`, right `"pub fn add (ctx : & :: poot_wgpu_runtime ::
     /// Context , ..."`); deleting the guard made it green.
     #[test]
     fn host_wrapper_expansion_is_independent_of_poot_kernel_build_env() {
         // SAFETY: test-only env mutation of a process-global; cargo-nextest gives every #[test] its own
-        // process (poot-gpu/poot-runtime/poot-llm's card 537 tests use the same pattern).
+        // process (poot-wgpu-device/poot-wgpu-runtime/poot-llm's card 537 tests use the same pattern).
         unsafe {
             std::env::remove_var("POOT_KERNEL_BUILD");
         }

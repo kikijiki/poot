@@ -19,8 +19,8 @@
 //! constructor is `unsafe`, called only by `poot-codegen`, so safe code here cannot mint one.
 //!
 //! ```compile_fail,E0133
-//! fn from_any_bytes(bytes: &[u8]) -> poot_rocm_runtime::CompiledKernel {
-//!     poot_rocm_runtime::CompiledKernel::new(
+//! fn from_any_bytes(bytes: &[u8]) -> poot_runtime_common::CompiledKernel {
+//!     poot_runtime_common::CompiledKernel::new(
 //!         poot_target::TargetId::Gpu(poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151())),
 //!         "add",
 //!         poot_runtime_common::KernelCode::Hsaco(bytes.to_vec().into_boxed_slice()),
@@ -31,8 +31,8 @@
 //! ```
 //!
 //! ```compile_fail,E0451
-//! fn forge(code: poot_runtime_common::KernelCode) -> poot_rocm_runtime::CompiledKernel {
-//!     poot_rocm_runtime::CompiledKernel {
+//! fn forge(code: poot_runtime_common::KernelCode) -> poot_runtime_common::CompiledKernel {
+//!     poot_runtime_common::CompiledKernel {
 //!         target: poot_target::TargetId::Gpu(poot_target::Backend::AmdGcn(poot_target::AmdArch::gfx1151())),
 //!         entry_point: "add".into(),
 //!         code,
@@ -52,48 +52,6 @@ mod platform;
 
 mod publication;
 
-pub use publication::{
-    DeviceStoreFence, QueueHostLink, QueueHostTarget, QueuePublicationContract,
-    QueuePublicationError, QueueRingMemory, take_issued_device_store_fence_count,
-};
-pub use upload::UPLOAD_CHUNK_BYTES;
-
-use std::ffi::{OsString, c_char, c_void};
-
-use std::sync::atomic::Ordering;
-
-use std::sync::{Arc, Mutex, OnceLock};
-
-use tracing::info;
-
-use crate::bindings::{
-    HSA_AGENT_INFO_DEVICE, HSA_AGENT_INFO_ISA, HSA_AGENT_INFO_NAME, HSA_AGENT_INFO_QUEUE_MAX_SIZE,
-    HSA_AGENT_INFO_VENDOR_NAME, HSA_AGENT_INFO_WAVEFRONT_SIZE, HSA_AMD_AGENT_INFO_BDFID,
-    HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT, HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES,
-    HSA_AMD_AGENT_INFO_DOMAIN, HSA_AMD_AGENT_INFO_MEMORY_AVAIL,
-    HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES, HSA_AMD_AGENT_INFO_PRODUCT_NAME,
-    HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO, HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS,
-    HSA_AMD_LINK_INFO_TYPE_PCIE, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED,
-    HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED,
-    HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT,
-    HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, HSA_AMD_MEMORY_POOL_INFO_LOCATION,
-    HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED, HSA_AMD_MEMORY_POOL_INFO_SEGMENT,
-    HSA_AMD_MEMORY_POOL_INFO_SIZE, HSA_AMD_MEMORY_POOL_LOCATION_CPU,
-    HSA_AMD_MEMORY_POOL_LOCATION_GPU, HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU, HSA_AMD_SEGMENT_GLOBAL,
-    HSA_DEVICE_TYPE_CPU, HSA_DEVICE_TYPE_GPU, HSA_ISA_INFO_NAME, HSA_ISA_INFO_NAME_LENGTH,
-    HSA_QUEUE_FEATURE_KERNEL_DISPATCH, HSA_QUEUE_TYPE_COOPERATIVE, HSA_QUEUE_TYPE_MULTI,
-    hsa_agent_t, hsa_amd_memory_pool_link_info_t, hsa_amd_memory_pool_t, hsa_isa_t, hsa_queue_t,
-    hsa_status_t,
-};
-
-use object::read::elf::ElfFile;
-
-use object::{LittleEndian, Object, ObjectSection, ObjectSymbol};
-
-pub use crate::ffi::Funcs;
-
-use crate::ffi::Hsa;
-
 mod aql;
 mod buffer;
 mod context;
@@ -106,17 +64,17 @@ mod replay;
 mod transfer;
 mod upload;
 
-pub use aql::*;
-pub use buffer::*;
-pub use context::*;
-pub use discovery::*;
-pub use error::*;
-pub use hsaco::*;
-pub(crate) use owner::*;
-/// The compiler-produced kernel handle [`RocmContext::load_hsaco`] takes (card 608): re-exported so
-/// callers need not depend on `poot-runtime-common` directly just to name the type.
-pub use poot_runtime_common::CompiledKernel;
-pub use queue::*;
+pub use aql::{DeviceRingReceiptProvenance, DispatchAxis, DispatchGeometryViolation};
+pub use buffer::RocmBuffer;
+pub use context::{DispatchSpan, RocmContext, RocmContextOptions, UploadStrategy};
+pub use error::{HsaStatus, RocmError};
+pub use hsaco::{HsacoModule, KernelHandle};
+pub use publication::{
+    DeviceStoreFence, QueueHostLink, QueueHostTarget, QueuePublicationContract,
+    QueuePublicationError, QueueRingMemory, take_issued_device_store_fence_count,
+};
+pub use queue::{QueueRingProvenance, QueueRole};
+pub use upload::UPLOAD_CHUNK_BYTES;
 
 #[cfg(test)]
 mod tests;

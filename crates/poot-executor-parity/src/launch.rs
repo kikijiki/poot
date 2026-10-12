@@ -4,17 +4,19 @@
 use poot_graph_ir::{Builder, Slot, TensorType};
 use poot_tensor::{DType, HostTensor};
 
-use poot_test_util::StepFixture;
+use poot_eval::test_support::StepFixture;
 
 use crate::{Fixture, fill, store_from_tensors, store_with};
 
 /// A `[m, k] x [k, n]` f32 matmul: `x` is an activation slot (two steps with different data), `w` a
 /// constant.
 fn matmul_fixture(name: &'static str, m: usize, k: usize, n: usize) -> Fixture {
-    let b = Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
-    let w = b.constant("w", TensorType::f32(vec![k, n]));
-    let out = b.matmul(x, w);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]))
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
+    let out = b.matmul(x, w).unwrap();
     let graph = b.finish(out).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
@@ -68,14 +70,22 @@ fn small_integers(n: usize, seed: u64, range: i32) -> Vec<i32> {
 /// `|w| <= 2`), so every product and sum is exact in the bf16 operands and the f32 accumulator, and the
 /// device's result equals the oracle's bit for bit whatever its summation order.
 fn wmma_fixture(name: &'static str, s: usize) -> Fixture {
-    let b = Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![s, s]));
-    let w = b.constant("w", TensorType::new(vec![s, s], DType::BF16));
-    let out = b.matmul(b.cast(x, DType::BF16), w);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![s, s]))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![s, s], DType::BF16))
+        .unwrap();
+    let out = b.matmul(b.cast(x, DType::BF16).unwrap(), w).unwrap();
     let graph = b.finish(out).unwrap();
     let accumulated = TensorType::new(graph.aval(out.id()).shape.clone(), DType::F32);
-    let graph =
-        poot_test_util::graph_fixtures::with_declared_type(&graph, out.id(), accumulated).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::with_declared_type(
+        &graph,
+        out.id(),
+        accumulated,
+    )
+    .unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
         .map(|step| {
@@ -127,21 +137,29 @@ const WMMA_N: usize = 32;
 /// from the wrong batch element moves every output element by at least 16 against a parity tolerance orders
 /// of magnitude smaller; every product and sum is exact in the operand type and the f32 accumulator.
 fn wmma_batched_fixture(name: &'static str, operand: DType) -> Fixture {
-    let b = Builder::new();
-    let x = b.slot_named(
-        Slot::Activation,
-        "x",
-        TensorType::f32(vec![WMMA_BATCH, WMMA_M, WMMA_K]),
-    );
-    let w = b.constant(
-        "w",
-        TensorType::new(vec![WMMA_BATCH, WMMA_K, WMMA_N], operand),
-    );
-    let out = b.matmul(b.cast(x, operand), w);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(
+            Slot::Activation,
+            "x",
+            TensorType::f32(vec![WMMA_BATCH, WMMA_M, WMMA_K]),
+        )
+        .unwrap();
+    let w = b
+        .constant(
+            "w",
+            TensorType::new(vec![WMMA_BATCH, WMMA_K, WMMA_N], operand),
+        )
+        .unwrap();
+    let out = b.matmul(b.cast(x, operand).unwrap(), w).unwrap();
     let graph = b.finish(out).unwrap();
     let accumulated = TensorType::new(graph.aval(out.id()).shape.clone(), DType::F32);
-    let graph =
-        poot_test_util::graph_fixtures::with_declared_type(&graph, out.id(), accumulated).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::with_declared_type(
+        &graph,
+        out.id(),
+        accumulated,
+    )
+    .unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2usize)
         .map(|step| {
@@ -201,14 +219,20 @@ pub const WIDE_GRID_ELEMENTS: usize = 70_001;
 /// grid needs `workgroup_id.x > 255`.
 pub fn wide_grid_fixture() -> Fixture {
     let n = WIDE_GRID_ELEMENTS;
-    let b = Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![n]));
-    let y = b.slot_named(Slot::Activation, "y", TensorType::f32(vec![n]));
-    let out = b.binary(
-        poot_graph_ir::BinOp::Add,
-        b.binary(poot_graph_ir::BinOp::Mul, x, y),
-        x,
-    );
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![n]))
+        .unwrap();
+    let y = b
+        .slot_named(Slot::Activation, "y", TensorType::f32(vec![n]))
+        .unwrap();
+    let out = b
+        .binary(
+            poot_graph_ir::BinOp::Add,
+            b.binary(poot_graph_ir::BinOp::Mul, x, y).unwrap(),
+            x,
+        )
+        .unwrap();
     let graph = b.finish(out).unwrap();
     let (kx, ky) = (
         graph.meta(x.id()).slot_key().unwrap().clone(),

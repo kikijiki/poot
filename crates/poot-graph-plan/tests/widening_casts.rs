@@ -9,7 +9,7 @@ use poot_graph_ir::op::{BinOp, FusedOp, OpKind, RowStep, UnOp};
 use poot_graph_ir::ops::rmsnorm;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Builder, Graph, ValueId};
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 use poot_tensor::{DType, HostTensor};
 
 /// BF16 bit patterns of `n` small values, and the f32 values they widen to.
@@ -61,14 +61,16 @@ fn only(g: &Graph, pick: impl Fn(&OpKind) -> bool) -> &poot_graph_ir::Eqn {
 #[test]
 fn a_norm_scale_cast_folds_into_the_row_region_and_evaluates_identically() {
     let n = 8usize;
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::new(vec![n], DType::BF16));
-    let out = rmsnorm(&b, x, b.cast(w, DType::F32), 1e-6);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![n], DType::BF16))
+        .unwrap();
+    let out = rmsnorm(&b, x, b.cast(w, DType::F32).unwrap(), 1e-6).unwrap();
     let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out).unwrap();
 
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&g), 1);
     assert_eq!(casts(&og), 0, "the widening cast is a step, not an eqn");
     let row = only(&og, |op| matches!(op, OpKind::FusedRow(_)));
@@ -109,13 +111,17 @@ fn a_norm_scale_cast_folds_into_the_row_region_and_evaluates_identically() {
 #[test]
 fn a_bias_cast_folds_into_the_contraction_epilogue_and_evaluates_identically() {
     let (k, n) = (8usize, 4usize);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, k]));
-    let w = b.constant("w", TensorType::f32(vec![k, n]));
-    let bias = b.constant("bias", TensorType::new(vec![n], DType::BF16));
-    let y = b.matmul(x, w);
-    let bias = b.broadcast(b.cast(bias, DType::F32), vec![1, 1, n]);
-    let out = b.binary(BinOp::Add, y, bias);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, k])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
+    let bias = b
+        .constant("bias", TensorType::new(vec![n], DType::BF16))
+        .unwrap();
+    let y = b.matmul(x, w).unwrap();
+    let bias = b
+        .broadcast(b.cast(bias, DType::F32).unwrap(), vec![1, 1, n])
+        .unwrap();
+    let out = b.binary(BinOp::Add, y, bias).unwrap();
     let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out).unwrap();
     let bias_const = g
@@ -125,7 +131,7 @@ fn a_bias_cast_folds_into_the_contraction_epilogue_and_evaluates_identically() {
         .map(|(id, _)| id)
         .expect("the bias const");
 
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&og), 0, "the widening cast is a step, not an eqn");
     let epilogue = only(&og, |op| matches!(op, OpKind::ContractionEpilogue { .. }));
     let OpKind::ContractionEpilogue { region, .. } = &epilogue.op else {
@@ -159,35 +165,49 @@ fn a_bias_cast_folds_into_the_contraction_epilogue_and_evaluates_identically() {
 fn a_cast_nothing_else_may_see_stays_a_cast() {
     let n = 8usize;
     // The narrow const has a second reader: it must stay a buffer every reader can read.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::new(vec![n], DType::BF16));
-    let scale = b.cast(w, DType::F32);
-    let normed = rmsnorm(&b, x, scale, 1e-6);
-    let other = b.cast(b.reshape(w, vec![1, 1, n]), DType::F32);
-    let out = b.binary(BinOp::Add, normed, other);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![n], DType::BF16))
+        .unwrap();
+    let scale = b.cast(w, DType::F32).unwrap();
+    let normed = rmsnorm(&b, x, scale, 1e-6).unwrap();
+    let other = b
+        .cast(b.reshape(w, vec![1, 1, n]).unwrap(), DType::F32)
+        .unwrap();
+    let out = b.binary(BinOp::Add, normed, other).unwrap();
     let g = b.finish(out).unwrap();
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&og), 2, "a const with a second reader folds nothing");
 
     // The cast result has a second reader: the widened f32 value is still needed outside the region.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::new(vec![n], DType::BF16));
-    let scale = b.cast(w, DType::F32);
-    let normed = rmsnorm(&b, x, scale, 1e-6);
-    let out = b.binary(BinOp::Add, normed, b.reshape(scale, vec![1, 1, n]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![n], DType::BF16))
+        .unwrap();
+    let scale = b.cast(w, DType::F32).unwrap();
+    let normed = rmsnorm(&b, x, scale, 1e-6).unwrap();
+    let out = b
+        .binary(BinOp::Add, normed, b.reshape(scale, vec![1, 1, n]).unwrap())
+        .unwrap();
     let g = b.finish(out).unwrap();
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&og), 1, "a cast with a second reader stays a cast");
 
     // A pointwise region's kernels read every leaf as f32: its cast is not folded.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::new(vec![n], DType::BF16));
-    let widened = b.broadcast(b.cast(w, DType::F32), vec![1, 1, n]);
-    let out = b.binary(BinOp::Add, b.unary(UnOp::Neg, x), widened);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![n], DType::BF16))
+        .unwrap();
+    let widened = b
+        .broadcast(b.cast(w, DType::F32).unwrap(), vec![1, 1, n])
+        .unwrap();
+    let out = b
+        .binary(BinOp::Add, b.unary(UnOp::Neg, x).unwrap(), widened)
+        .unwrap();
     let g = b.finish(out).unwrap();
-    let og = optimize(&g).unwrap();
+    let og = passes_without_target(&g).unwrap();
     assert_eq!(casts(&og), 1, "a pointwise region keeps its widening cast");
 }

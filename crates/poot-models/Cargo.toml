@@ -8,28 +8,56 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# ADR-0113: the tracer-built fixtures (`test_support::{dense, weight_map, pipeline, fixtures}`) the crates above
+# the executor contract run their tests on. The dependencies below are present only under this feature.
+test-support = [
+    "dep:poot-executor",
+    "dep:poot-executor-parity",
+    "dep:poot-graph-plan",
+    "dep:poot-profile",
+    "dep:poot-runtime-common",
+    "dep:poot-target",
+    "dep:bytemuck",
+    "poot-graph-ir/test-support",
+    "poot-graph-plan/test-support",
+    "poot-quant/test-support",
+]
+
 [dependencies]
 poot-graph-ir.workspace = true
 poot-tensor.workspace = true
+# `ChatFormat`, the fallback chat-prompt family each `ModelConfig` names.
+poot-text.workspace = true
 poot-load.workspace = true
 # `Model::weights` returns a `WeightMap`; `RawConfig::HfJson` carries the parsed `config.json`
 # and `generation_config.json`.
 poot-quant.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+poot-executor = { workspace = true, optional = true }
+poot-executor-parity = { workspace = true, optional = true }
+poot-graph-plan = { workspace = true, optional = true }
+poot-profile = { workspace = true, optional = true }
+poot-runtime-common = { workspace = true, optional = true }
+poot-target = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 
 [dev-dependencies]
-# `graph-fixtures`: the reimplemented `plan_eqn` wrapper and `default_caps_for`; it also carries
-# `poot-graph-plan/test-support` (`reassociation_class`, `per_eqn_plans_outside_compile`, ADR-0113) to the
-# integration tests that trace models through `compile`.
-poot-test-util = { workspace = true, features = ["graph-fixtures", "kernel-fixtures"] }
-poot-eval.workspace = true
-poot-executor-parity.workspace = true
+# Turns the feature on for this crate's own tests, benches and examples.
+poot-models = { path = ".", features = ["test-support"] }
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
+# `write_gguf`, the in-memory GGUF writer the family tests build checkpoints with (ADR-0113).
+poot-load = { workspace = true, features = ["test-support"] }
+# `default_caps_for` for the integration tests that trace models through `compile`.
+poot-test-util.workspace = true
+poot-eval = { workspace = true, features = ["test-support"] }
 poot-runtime-common.workspace = true
 # Card 534a: fold_dense_bf16_row_gathers is pub(crate) in poot-graph-plan now,
 # reachable only through prepare_target_graph. The planner's pass-soundness tests that trace models live
 # here (POOT-755): a model crate sits above the planner, never the reverse.
-poot-graph-plan.workspace = true
+poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-kernel-ir.workspace = true
 poot-kernelgen.workspace = true
 poot-target.workspace = true

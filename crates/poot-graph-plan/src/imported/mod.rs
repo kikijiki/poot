@@ -29,14 +29,16 @@ pub(crate) fn parse_once(cell: &'static OnceLock<Body>, json: &str, name: &str) 
 
 /// Where a manifest entry's committed `.kir.json` lives: `poot-graph-plan`'s own `assets/`, or another
 /// crate's asset directory (a path from the workspace's `crates/` directory, e.g.
-/// `"poot-rocm-gpu/assets"` or `"poot-gpu/src/tests/assets"` - poot-gpu's probe assets live under its
+/// `"poot-rocm-device/assets"` or `"poot-wgpu-device/src/tests/assets"` - poot-wgpu-device's probe assets live under its
 /// own `src/tests/`, not a crate-root `assets/`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub enum AssetDest {
     GraphPlan,
     Crate(&'static str),
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl AssetDest {
     /// The destination directory, relative to the workspace's `crates/` directory.
     pub fn dir(self) -> &'static str {
@@ -50,6 +52,7 @@ impl AssetDest {
 /// One manifest row: a committed asset, the kernel source it is regenerated from, the kernel's own
 /// entry-point name (its `body.name` once imported) and parameter count, and which crate ships it.
 #[derive(Clone, Copy, Debug)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct AssetEntry {
     /// The asset's file stem (`<name>.kir.json`) and, for every entry but the coarsened tiled-GEMM
     /// family, the kernel source's file stem too.
@@ -63,10 +66,13 @@ pub struct AssetEntry {
     /// The kernel's expected parameter count (buffers + metadata), checked against the parsed body.
     pub params: u32,
     pub dest: AssetDest,
+    /// The kernel this row ships, so a consumer walks the variants through the one manifest.
+    pub kernel: ImportedKernel,
 }
 
 /// `AssetDest::GraphPlan` or `AssetDest::Crate(dir)` from the same `GraphPlan`/`Crate(..)` token shape
 /// [`kernel_assets!`] matches, so there is exactly one place a manifest entry's destination is written.
+#[cfg(any(test, feature = "test-support"))]
 macro_rules! kernel_asset_dest {
     (GraphPlan) => {
         $crate::imported::AssetDest::GraphPlan
@@ -75,6 +81,7 @@ macro_rules! kernel_asset_dest {
         $crate::imported::AssetDest::Crate($dir)
     };
 }
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use kernel_asset_dest;
 
 /// The committed asset's `include_str!` path, built from the same `dest`/`name` tokens the manifest
@@ -92,8 +99,8 @@ macro_rules! kernel_asset_json {
 pub(crate) use kernel_asset_json;
 
 /// Define one family's [`ImportedKernel`] variants, their [`AssetEntry`] table, and the family's
-/// `ImportedKernel::body_<family>` arm, plus the family's own equivalence tests (entry/param-count
-/// match, parse-once caching, pairwise-distinct bodies). `family` names the generated method
+/// `ImportedKernel::body_<family>` arm (the entry/param-count, parse-once and pairwise-distinct body
+/// checks over every family's entries live in `needs_tests`). `family` names the generated method
 /// (`body_contraction`, `body_probe`, ...), dispatched from [`ImportedKernel::body`] below. `dest` is
 /// `GraphPlan` or `Crate("<dir>")` (bare tokens, not `AssetDest::..`): [`kernel_asset_dest`] and
 /// [`kernel_asset_json`] both build from it, so the entry's `dest` and its embedded JSON's path can
@@ -111,6 +118,7 @@ macro_rules! kernel_assets {
             }
         ),+ $(,)?
     ) => {
+        #[cfg(any(test, feature = "test-support"))]
         pub(crate) const ENTRIES: &[$crate::imported::AssetEntry] = &[
             $(
                 $crate::imported::AssetEntry {
@@ -119,16 +127,9 @@ macro_rules! kernel_assets {
                     entry: $entry,
                     params: $params,
                     dest: $crate::imported::kernel_asset_dest!($dest_kind $(($dir))?),
+                    kernel: $crate::imported::ImportedKernel::$variant,
                 }
             ),+
-        ];
-
-        /// The variants this family owns, in the same order as [`ENTRIES`] (card 559's own tests zip
-        /// the two tables; a macro-generated pair can never drift out of step by construction). Test-only:
-        /// nothing outside this family's own equivalence tests needs the variant list as data.
-        #[cfg(test)]
-        pub(crate) const VARIANTS: &[$crate::imported::ImportedKernel] = &[
-            $( $crate::imported::ImportedKernel::$variant ),+
         ];
 
         impl $crate::imported::ImportedKernel {
@@ -149,53 +150,6 @@ macro_rules! kernel_assets {
                 }
             }
         }
-
-        #[cfg(test)]
-        mod tests {
-            use super::{ENTRIES, VARIANTS};
-
-            #[test]
-            fn each_body_matches_its_manifest_entry() {
-                for (entry, variant) in ENTRIES.iter().zip(VARIANTS.iter()) {
-                    let body = variant.body();
-                    assert_eq!(body.name, entry.entry, "asset {}", entry.name);
-                    assert_eq!(
-                        body.params().count() as u32,
-                        entry.params,
-                        "asset {}",
-                        entry.name
-                    );
-                    assert!(!body.blocks.is_empty(), "{} has no blocks", entry.name);
-                }
-            }
-
-            #[test]
-            fn each_body_is_parsed_once_and_static() {
-                for variant in VARIANTS {
-                    assert!(
-                        ::std::ptr::eq(variant.body(), variant.body()),
-                        "{variant:?} reparsed"
-                    );
-                }
-            }
-
-            #[test]
-            fn bodies_do_not_share_a_cell_or_a_kernel_name() {
-                for (i, a) in VARIANTS.iter().enumerate() {
-                    for b in &VARIANTS[i + 1..] {
-                        assert!(
-                            !::std::ptr::eq(a.body(), b.body()),
-                            "{a:?} and {b:?} share a Body"
-                        );
-                        assert_ne!(
-                            a.body().name,
-                            b.body().name,
-                            "{a:?} and {b:?} share a kernel name"
-                        );
-                    }
-                }
-            }
-        }
     };
 }
 
@@ -206,7 +160,7 @@ mod sampling;
 
 /// The one kernel-authoring accessor: `ImportedKernel::GemvCoalesced.body()`. One variant per shipped
 /// kernel, contributed by its family file's `kernel_assets!` invocation. `pub`, not `pub(crate)`: the
-/// `probe` family's kernels are each consumed by a different crate (`poot-rocm-gpu`, `poot-gpu`), never
+/// `probe` family's kernels are each consumed by a different crate (`poot-rocm-device`, `poot-wgpu-device`), never
 /// by this crate's own planner, so this is the one route every crate reaches a shipped kernel through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportedKernel {
@@ -354,6 +308,7 @@ impl ImportedKernel {
 /// `pootc/tests/import_run.rs::committed_assets_match_their_kernel_sources` iterates it to prove every
 /// destination `assets/` directory holds exactly these files, byte-identical to regenerating each entry
 /// from its `pootc/kernels/<family>/<source>.rs`.
+#[cfg(any(test, feature = "test-support"))]
 pub const MANIFEST: &[&[AssetEntry]] = &[
     contraction::ENTRIES,
     packed::ENTRIES,
@@ -363,6 +318,7 @@ pub const MANIFEST: &[&[AssetEntry]] = &[
 
 #[cfg(test)]
 mod needs_tests {
+
     use std::collections::HashMap;
 
     use poot_graph_ir::op::{OpKind, SampleRule};
@@ -513,7 +469,7 @@ mod needs_tests {
     /// longer matches and this fails naming it.
     #[test]
     fn a_sampling_declaration_matches_the_loops_of_its_body() {
-        for kernel in sampling::VARIANTS {
+        for kernel in sampling::ENTRIES.iter().map(|entry| entry.kernel) {
             let SerialLoop::RowVocab { passes } = kernel.needs().serial else {
                 continue;
             };
@@ -526,15 +482,53 @@ mod needs_tests {
     }
 
     fn all_kernels() -> impl Iterator<Item = ImportedKernel> {
-        [
-            contraction::VARIANTS,
-            packed::VARIANTS,
-            sampling::VARIANTS,
-            probe::VARIANTS,
-        ]
-        .into_iter()
-        .flatten()
-        .copied()
+        MANIFEST
+            .iter()
+            .flat_map(|family| family.iter().map(|entry| entry.kernel))
+    }
+
+    /// Every manifest row's body is the entry point and arity the row declares, with blocks.
+    #[test]
+    fn each_body_matches_its_manifest_entry() {
+        for entry in MANIFEST.iter().flat_map(|family| family.iter()) {
+            let body = entry.kernel.body();
+            assert_eq!(body.name, entry.entry, "asset {}", entry.name);
+            assert_eq!(
+                body.params().count() as u32,
+                entry.params,
+                "asset {}",
+                entry.name
+            );
+            assert!(!body.blocks.is_empty(), "{} has no blocks", entry.name);
+        }
+    }
+
+    #[test]
+    fn each_body_is_parsed_once_and_static() {
+        for kernel in all_kernels() {
+            assert!(
+                std::ptr::eq(kernel.body(), kernel.body()),
+                "{kernel:?} reparsed"
+            );
+        }
+    }
+
+    #[test]
+    fn bodies_do_not_share_a_cell_or_a_kernel_name() {
+        let kernels: Vec<_> = all_kernels().collect();
+        for (i, a) in kernels.iter().enumerate() {
+            for b in &kernels[i + 1..] {
+                assert!(
+                    !std::ptr::eq(a.body(), b.body()),
+                    "{a:?} and {b:?} share a Body"
+                );
+                assert_ne!(
+                    a.body().name,
+                    b.body().name,
+                    "{a:?} and {b:?} share a kernel name"
+                );
+            }
+        }
     }
 
     /// A shipped kernel and a graph equation the planner lowers to it.
@@ -546,10 +540,14 @@ mod needs_tests {
     }
 
     fn matmul_graph(batch: usize, m: usize, k: usize, n: usize, weight: DType) -> Graph {
-        let b = Builder::new();
-        let a = b.constant("a", TensorType::new(vec![batch, m, k], DType::F32));
-        let w = b.constant("w", TensorType::new(vec![k, n], weight));
-        let out = poot_graph_ir::ops::linear(&b, a, w, None);
+        let b = Builder::for_tests();
+        let a = b
+            .constant("a", TensorType::new(vec![batch, m, k], DType::F32))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![k, n], weight))
+            .unwrap();
+        let out = poot_graph_ir::ops::linear(&b, a, w, None).unwrap();
         b.finish(out).unwrap()
     }
 
@@ -566,30 +564,39 @@ mod needs_tests {
 
     /// A `[SAMPLE_ROWS, SAMPLE_VOCAB]` sampling equation of `rule`, with the operands the rule takes.
     fn sample_graph(rule: SampleRule) -> Graph {
-        let b = Builder::new();
-        let logits = b.constant(
-            "logits",
-            TensorType::new(vec![SAMPLE_ROWS, SAMPLE_VOCAB], DType::F32),
-        );
-        let out = if rule == SampleRule::Greedy {
-            b.sample_token(rule, logits, None, None, None)
-        } else {
-            let noise = b.constant(
-                "noise",
+        let b = Builder::for_tests();
+        let logits = b
+            .constant(
+                "logits",
                 TensorType::new(vec![SAMPLE_ROWS, SAMPLE_VOCAB], DType::F32),
-            );
+            )
+            .unwrap();
+        let out = if rule == SampleRule::Greedy {
+            b.sample_token(rule, logits, None, None, None).unwrap()
+        } else {
+            let noise = b
+                .constant(
+                    "noise",
+                    TensorType::new(vec![SAMPLE_ROWS, SAMPLE_VOCAB], DType::F32),
+                )
+                .unwrap();
             let param_cols = if rule == SampleRule::GumbelTopKTopP {
                 4
             } else {
                 3
             };
-            let params = b.constant(
-                "params",
-                TensorType::new(vec![SAMPLE_ROWS, param_cols], DType::F32),
-            );
-            let top_k = (rule != SampleRule::Gumbel)
-                .then(|| b.constant("top_k", TensorType::new(vec![SAMPLE_ROWS], DType::I32)));
+            let params = b
+                .constant(
+                    "params",
+                    TensorType::new(vec![SAMPLE_ROWS, param_cols], DType::F32),
+                )
+                .unwrap();
+            let top_k = (rule != SampleRule::Gumbel).then(|| {
+                b.constant("top_k", TensorType::new(vec![SAMPLE_ROWS], DType::I32))
+                    .unwrap()
+            });
             b.sample_token(rule, logits, Some(noise), Some(params), top_k)
+                .unwrap()
         };
         b.finish(out).unwrap()
     }
@@ -626,12 +633,12 @@ mod needs_tests {
             let plan = |budget: u64| {
                 let mut caps = default_caps_for(backend);
                 caps.max_dispatch_work = Queried::Known(budget);
-                crate::plan_eqn_compiled(
+                crate::planner::plan_eqn_compiled(
                     &graph,
                     eqn,
                     &Target::Gpu { backend, caps },
                     &HashMap::new(),
-                    &poot_test_util::graph_fixtures::roomy_body_limits(),
+                    &crate::test_support::roomy_body_limits(),
                 )
             };
             let work = SAMPLE_ROWS as u64 * SAMPLER_LANES * passes * lane_steps;
@@ -691,10 +698,14 @@ mod needs_tests {
             }),
         );
         let attention_scores = {
-            let b = Builder::new();
-            let q = b.constant("q", TensorType::new(vec![1, 14, 64, 64], DType::F32));
-            let kt = b.constant("kt", TensorType::new(vec![1, 14, 64, 64], DType::F32));
-            let out = b.matmul(q, kt);
+            let b = Builder::for_tests();
+            let q = b
+                .constant("q", TensorType::new(vec![1, 14, 64, 64], DType::F32))
+                .unwrap();
+            let kt = b
+                .constant("kt", TensorType::new(vec![1, 14, 64, 64], DType::F32))
+                .unwrap();
+            let out = b.matmul(q, kt).unwrap();
             b.finish(out).unwrap()
         };
         // A batched decode projection past the NVPTX GEMV's width gate: not a decode GEMV, and its
@@ -746,12 +757,12 @@ mod needs_tests {
                 .find(|e| is_eqn(&e.op))
                 .unwrap_or_else(|| panic!("{kernel:?}: fixture has no matching equation"));
             let plan = |caps: DeviceCaps| {
-                crate::plan_eqn_compiled(
+                crate::planner::plan_eqn_compiled(
                     &graph,
                     eqn,
                     &Target::Gpu { backend, caps },
                     &HashMap::new(),
-                    &poot_test_util::graph_fixtures::roomy_body_limits(),
+                    &crate::test_support::roomy_body_limits(),
                 )
             };
             let roomy = default_caps_for(backend);

@@ -34,43 +34,78 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
 
     for &dt_scale in &[1.0f32, 8.0] {
         // Front-end graph outputting q(H_k), k(H_k), v(H_v), g(H_v per pos), beta(H_v per pos).
-        let fb = Builder::new();
-        let x = fb.constant("x", TensorType::f32(vec![1, l, h]));
-        let w_qkv = fb.constant("w_qkv", TensorType::f32(vec![h, conv_dim]));
-        let w_conv = fb.constant("w_conv", TensorType::f32(vec![ck, conv_dim]));
-        let w_beta = fb.constant("w_beta", TensorType::f32(vec![h, hv]));
-        let w_alpha = fb.constant("w_alpha", TensorType::f32(vec![h, hv]));
-        let dt_bias = fb.constant("dt_bias", TensorType::f32(vec![hv]));
-        let ssm_a = fb.constant("ssm_a", TensorType::f32(vec![hv]));
-        let qkv_mixed = linear(&fb, x, w_qkv, None);
-        let conv_out =
-            poot_graph_ir::ops::silu(&fb, causal_conv1d_prefill(&fb, qkv_mixed, w_conv, ck));
-        let q_flat = fb.slice(conv_out, 2, 0, key_dim);
-        let k_flat = fb.slice(conv_out, 2, key_dim, 2 * key_dim);
-        let v_flat = fb.slice(conv_out, 2, 2 * key_dim, conv_dim);
-        let q = fb.transpose(fb.reshape(q_flat, vec![1, l, hk, d]), vec![0, 2, 1, 3]);
-        let k = fb.transpose(fb.reshape(k_flat, vec![1, l, hk, d]), vec![0, 2, 1, 3]);
-        let v = fb.transpose(fb.reshape(v_flat, vec![1, l, hv, d]), vec![0, 2, 1, 3]);
+        let fb = Builder::for_tests();
+        let x = fb.constant("x", TensorType::f32(vec![1, l, h])).unwrap();
+        let w_qkv = fb
+            .constant("w_qkv", TensorType::f32(vec![h, conv_dim]))
+            .unwrap();
+        let w_conv = fb
+            .constant("w_conv", TensorType::f32(vec![ck, conv_dim]))
+            .unwrap();
+        let w_beta = fb.constant("w_beta", TensorType::f32(vec![h, hv])).unwrap();
+        let w_alpha = fb
+            .constant("w_alpha", TensorType::f32(vec![h, hv]))
+            .unwrap();
+        let dt_bias = fb.constant("dt_bias", TensorType::f32(vec![hv])).unwrap();
+        let ssm_a = fb.constant("ssm_a", TensorType::f32(vec![hv])).unwrap();
+        let qkv_mixed = linear(&fb, x, w_qkv, None).unwrap();
+        let conv_out = poot_graph_ir::ops::silu(
+            &fb,
+            causal_conv1d_prefill(&fb, qkv_mixed, w_conv, ck).unwrap(),
+        )
+        .unwrap();
+        let q_flat = fb.slice(conv_out, 2, 0, key_dim).unwrap();
+        let k_flat = fb.slice(conv_out, 2, key_dim, 2 * key_dim).unwrap();
+        let v_flat = fb.slice(conv_out, 2, 2 * key_dim, conv_dim).unwrap();
+        let q = fb
+            .transpose(
+                fb.reshape(q_flat, vec![1, l, hk, d]).unwrap(),
+                vec![0, 2, 1, 3],
+            )
+            .unwrap();
+        let k = fb
+            .transpose(
+                fb.reshape(k_flat, vec![1, l, hk, d]).unwrap(),
+                vec![0, 2, 1, 3],
+            )
+            .unwrap();
+        let v = fb
+            .transpose(
+                fb.reshape(v_flat, vec![1, l, hv, d]).unwrap(),
+                vec![0, 2, 1, 3],
+            )
+            .unwrap();
         // l2 norm of q,k over the last axis.
         let l2 = |t| {
-            let sq = fb.binary(BinOp::Mul, t, t);
-            let ss = fb.reduce(RedOp::Sum, sq, 3, true);
-            let nrm = fb.unary(
-                UnOp::Sqrt,
-                fb.binary_scalar(BinOp::Add, ss, Scalar::F32(eps)),
-            );
-            fb.binary(BinOp::Div, t, nrm)
+            let sq = fb.binary(BinOp::Mul, t, t).unwrap();
+            let ss = fb.reduce(RedOp::Sum, sq, 3, true).unwrap();
+            let nrm = fb
+                .unary(
+                    UnOp::Sqrt,
+                    fb.binary_scalar(BinOp::Add, ss, Scalar::F32(eps)).unwrap(),
+                )
+                .unwrap();
+            fb.binary(BinOp::Div, t, nrm).unwrap()
         };
         let q = l2(q);
         let k = l2(k);
-        let beta = sigmoid(&fb, linear(&fb, x, w_beta, None));
+        let beta = sigmoid(&fb, linear(&fb, x, w_beta, None).unwrap()).unwrap();
         let alpha = softplus(
             &fb,
-            fb.binary(BinOp::Add, linear(&fb, x, w_alpha, None), dt_bias),
-        );
-        let g = fb.binary(BinOp::Mul, alpha, ssm_a);
-        let g4 = fb.transpose(fb.reshape(g, vec![1, l, hv, 1]), vec![0, 2, 1, 3]); // [1,Hv,L,1]
-        let beta4 = fb.transpose(fb.reshape(beta, vec![1, l, hv, 1]), vec![0, 2, 1, 3]);
+            fb.binary(BinOp::Add, linear(&fb, x, w_alpha, None).unwrap(), dt_bias)
+                .unwrap(),
+        )
+        .unwrap();
+        let g = fb.binary(BinOp::Mul, alpha, ssm_a).unwrap();
+        let g4 = fb
+            .transpose(fb.reshape(g, vec![1, l, hv, 1]).unwrap(), vec![0, 2, 1, 3])
+            .unwrap(); // [1,Hv,L,1]
+        let beta4 = fb
+            .transpose(
+                fb.reshape(beta, vec![1, l, hv, 1]).unwrap(),
+                vec![0, 2, 1, 3],
+            )
+            .unwrap();
         // Multiple outputs via eval_all and reading ids.
         let fg = fb.finish(q).unwrap(); // primary irrelevant; use eval_all to read every tap.
         let mut fin = HashMap::new();
@@ -141,18 +176,31 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
         let kv = tile(&kd);
 
         // Sequential core (chunk-independent reference), computed first so the chunk sweep can diff against it.
-        let db = Builder::new();
-        let q_in = db.constant("q", TensorType::f32(vec![1, hv, 1, d]));
-        let k_in = db.constant("k", TensorType::f32(vec![1, hv, 1, d]));
-        let v_in = db.constant("v", TensorType::f32(vec![1, hv, 1, d]));
-        let g_in = db.constant("g", TensorType::f32(vec![1, hv, 1, 1]));
-        let bt_in = db.constant("beta", TensorType::f32(vec![1, hv, 1, 1]));
-        let ds_in = db.state_input(
-            "s",
-            TensorType::f32(vec![1, hv, d, d]),
-            StateRole::Recurrent,
-        );
-        let (_o, s_out) = gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in);
+        let db = Builder::for_tests();
+        let q_in = db
+            .constant("q", TensorType::f32(vec![1, hv, 1, d]))
+            .unwrap();
+        let k_in = db
+            .constant("k", TensorType::f32(vec![1, hv, 1, d]))
+            .unwrap();
+        let v_in = db
+            .constant("v", TensorType::f32(vec![1, hv, 1, d]))
+            .unwrap();
+        let g_in = db
+            .constant("g", TensorType::f32(vec![1, hv, 1, 1]))
+            .unwrap();
+        let bt_in = db
+            .constant("beta", TensorType::f32(vec![1, hv, 1, 1]))
+            .unwrap();
+        let ds_in = db
+            .state_input(
+                "s",
+                TensorType::f32(vec![1, hv, d, d]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let (_o, s_out) =
+            gated_delta_net_decode(&db, q_in, k_in, v_in, g_in, bt_in, ds_in).unwrap();
         let dg = db
             .finish(poot_graph_ir::Outputs::new(_o).with_state(&[(ds_in, s_out)]))
             .unwrap();
@@ -215,20 +263,37 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
                     }
                 }
             }
-            let cb = Builder::new();
-            let cq = cb.constant("q", TensorType::f32(vec![1, hk, l, d]));
-            let ckk = cb.constant("k", TensorType::f32(vec![1, hk, l, d]));
-            let cv = cb.constant("v", TensorType::f32(vec![1, hv, l, d]));
-            let cg = cb.constant("g", TensorType::f32(vec![1, hv, l, 1]));
-            let cbeta = cb.constant("beta", TensorType::f32(vec![1, hv, l, 1]));
-            let cs = cb.state_input(
-                "s",
-                TensorType::f32(vec![1, hv, d, d]),
-                StateRole::Recurrent,
-            );
-            let cti = cb.constant("ti", TensorType::f32(vec![1, 1, c, c]));
-            let cts = cb.constant("ts", TensorType::f32(vec![1, 1, c, c]));
-            let (co, cso) = gdn_prefill_chunked(&cb, cq, ckk, cv, cg, cbeta, cs, cti, cts, c);
+            let cb = Builder::for_tests();
+            let cq = cb
+                .constant("q", TensorType::f32(vec![1, hk, l, d]))
+                .unwrap();
+            let ckk = cb
+                .constant("k", TensorType::f32(vec![1, hk, l, d]))
+                .unwrap();
+            let cv = cb
+                .constant("v", TensorType::f32(vec![1, hv, l, d]))
+                .unwrap();
+            let cg = cb
+                .constant("g", TensorType::f32(vec![1, hv, l, 1]))
+                .unwrap();
+            let cbeta = cb
+                .constant("beta", TensorType::f32(vec![1, hv, l, 1]))
+                .unwrap();
+            let cs = cb
+                .state_input(
+                    "s",
+                    TensorType::f32(vec![1, hv, d, d]),
+                    StateRole::Recurrent,
+                )
+                .unwrap();
+            let cti = cb
+                .constant("ti", TensorType::f32(vec![1, 1, c, c]))
+                .unwrap();
+            let cts = cb
+                .constant("ts", TensorType::f32(vec![1, 1, c, c]))
+                .unwrap();
+            let (co, cso) =
+                gdn_prefill_chunked(&cb, cq, ckk, cv, cg, cbeta, cs, cti, cts, c).unwrap();
             let cgraph = cb
                 .finish(poot_graph_ir::Outputs::new(co).with_state(&[(cs, cso)]))
                 .unwrap();
@@ -305,30 +370,36 @@ fn mamba_core_path_decode_loop_matches_reference() {
     let silu = |x: f32| x / (1.0 + (-x).exp());
 
     // Decode graph (one step), carrying conv cache + SSM state.
-    let b = Builder::new();
-    let xc = b.constant("xc", TensorType::f32(vec![1, 1, ch])); // conv input
-    let wc = b.constant("wc", TensorType::f32(vec![kk, ch])); // conv kernel
-    let bb = b.constant("b", TensorType::f32(vec![1, hq, 1, n]));
-    let cc = b.constant("c", TensorType::f32(vec![1, hq, 1, n]));
-    let dt = b.constant("dt", TensorType::f32(vec![1, hq, 1, 1])); // pre-softplus
-    let ap = b.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
-    let dsk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
-    let conv_cache = b.state_input(
-        "cv",
-        TensorType::f32(vec![1, kk - 1, ch]),
-        StateRole::Recurrent,
-    );
-    let h_in = b.state_input(
-        "h",
-        TensorType::f32(vec![1, hq, n, pdim]),
-        StateRole::Recurrent,
-    );
+    let b = Builder::for_tests();
+    let xc = b.constant("xc", TensorType::f32(vec![1, 1, ch])).unwrap(); // conv input
+    let wc = b.constant("wc", TensorType::f32(vec![kk, ch])).unwrap(); // conv kernel
+    let bb = b.constant("b", TensorType::f32(vec![1, hq, 1, n])).unwrap();
+    let cc = b.constant("c", TensorType::f32(vec![1, hq, 1, n])).unwrap();
+    let dt = b
+        .constant("dt", TensorType::f32(vec![1, hq, 1, 1]))
+        .unwrap(); // pre-softplus
+    let ap = b.constant("a", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+    let dsk = b.constant("d", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+    let conv_cache = b
+        .state_input(
+            "cv",
+            TensorType::f32(vec![1, kk - 1, ch]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let h_in = b
+        .state_input(
+            "h",
+            TensorType::f32(vec![1, hq, n, pdim]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
     // conv -> silu, reshape [1,1,ch] -> [1,Hq,1,P]
-    let (conv_out, conv_cache_out) = causal_conv1d_decode(&b, xc, wc, conv_cache, kk);
-    let xact = poot_graph_ir::ops::silu(&b, conv_out);
-    let xheads = b.reshape(xact, vec![1, hq, 1, pdim]);
-    let delta = softplus(&b, dt); // Delta = softplus(dt)
-    let (y, h_out) = mamba2_ssd_decode(&b, xheads, bb, cc, delta, ap, dsk, h_in);
+    let (conv_out, conv_cache_out) = causal_conv1d_decode(&b, xc, wc, conv_cache, kk).unwrap();
+    let xact = poot_graph_ir::ops::silu(&b, conv_out).unwrap();
+    let xheads = b.reshape(xact, vec![1, hq, 1, pdim]).unwrap();
+    let delta = softplus(&b, dt).unwrap(); // Delta = softplus(dt)
+    let (y, h_out) = mamba2_ssd_decode(&b, xheads, bb, cc, delta, ap, dsk, h_in).unwrap();
     let g = b
         .finish(
             poot_graph_ir::Outputs::new(y)
@@ -460,19 +531,23 @@ fn mamba2_ssd_decode_matches_recurrence() {
     let dv = |h: usize| 0.2 + 0.1 * h as f32; // skip D
 
     // build the decode graph (one step), carry h.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, hq, 1, p]));
-    let bin = b.constant("b", TensorType::f32(vec![1, hq, 1, n]));
-    let cin = b.constant("c", TensorType::f32(vec![1, hq, 1, n]));
-    let delta = b.constant("dl", TensorType::f32(vec![1, hq, 1, 1]));
-    let a_param = b.constant("a", TensorType::f32(vec![1, hq, 1, 1]));
-    let d_skip = b.constant("d", TensorType::f32(vec![1, hq, 1, 1]));
-    let h_in = b.state_input(
-        "h",
-        TensorType::f32(vec![1, hq, n, p]),
-        StateRole::Recurrent,
-    );
-    let (y, h_out) = mamba2_ssd_decode(&b, x, bin, cin, delta, a_param, d_skip, h_in);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, hq, 1, p])).unwrap();
+    let bin = b.constant("b", TensorType::f32(vec![1, hq, 1, n])).unwrap();
+    let cin = b.constant("c", TensorType::f32(vec![1, hq, 1, n])).unwrap();
+    let delta = b
+        .constant("dl", TensorType::f32(vec![1, hq, 1, 1]))
+        .unwrap();
+    let a_param = b.constant("a", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+    let d_skip = b.constant("d", TensorType::f32(vec![1, hq, 1, 1])).unwrap();
+    let h_in = b
+        .state_input(
+            "h",
+            TensorType::f32(vec![1, hq, n, p]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (y, h_out) = mamba2_ssd_decode(&b, x, bin, cin, delta, a_param, d_skip, h_in).unwrap();
     let g = b
         .finish(poot_graph_ir::Outputs::new(y).with_state(&[(h_in, h_out)]))
         .unwrap();

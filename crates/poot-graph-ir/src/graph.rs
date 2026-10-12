@@ -112,6 +112,17 @@ impl<T> ValueTable<T> {
         id
     }
 
+    /// [`ValueTable::push`] that hands `entry` back when the `u32` id space is full.
+    pub fn try_push(&mut self, entry: T) -> Result<ValueId, T> {
+        match self.next_id() {
+            Some(id) => {
+                self.entries.push(entry);
+                Ok(id)
+            }
+            None => Err(entry),
+        }
+    }
+
     pub fn get(&self, id: ValueId) -> Option<&T> {
         self.entries.get(id.index())
     }
@@ -541,6 +552,14 @@ impl ComputedConst {
         }
     }
 
+    /// The rank of [`Self::shape`], known without allocating it.
+    pub(crate) fn rank(self) -> usize {
+        match self {
+            ComputedConst::Iota { .. } | ComputedConst::AlibiSlopes { .. } => 1,
+            ComputedConst::Rope { .. } => 2,
+        }
+    }
+
     /// The shape of the value this constant materializes into.
     pub fn shape(self) -> Vec<usize> {
         match self {
@@ -556,7 +575,7 @@ impl ComputedConst {
 /// The write pattern of one state pair's per-step overwrite (plan-562-565.md section 3).
 ///
 /// Declared once, on the state input's [`ValueMeta`], at [`crate::builder::Builder::state_input`]. The
-/// graph identity does not include it: it changes no kernel, buffer, or binding, so `poot-gpu`'s cache
+/// graph identity does not include it: it changes no kernel, buffer, or binding, so `poot-wgpu-device`'s cache
 /// key (hashed from `Graph::state` and the storage tag) is untouched by a role change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StateRole {
@@ -649,6 +668,7 @@ impl ValueMeta {
     /// A `Storage::State` input's `ValueMeta`, carrying its declared `role`. The only constructor
     /// that can produce a `State` meta (R-644-1): [`Graph::validate`] rejects a `Storage::State`
     /// value built any other way (it would carry no role).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_state(aval: TensorType, name: Option<String>, role: StateRole) -> Self {
         ValueMeta {
             aval,
@@ -798,6 +818,10 @@ pub enum EditError {
     /// The edit declares a witness the graph it was opened from does not carry.
     #[error("the edit adds validation witness {id:?} ({name:?})")]
     WitnessAdded { id: ValidationId, name: String },
+    /// The edit names a witness as added that is not a new witness of the draft: absent from it, or
+    /// already carried by the graph it was opened from.
+    #[error("witness {id:?} is named as added but is not a new witness of the edit")]
+    WitnessNotAdded { id: ValidationId },
     /// The edit lost an export: a later stage would wait for a value no stage produces.
     #[error("the edit drops export {id:?}")]
     ExportDropped { id: BoundaryId },
@@ -1147,6 +1171,14 @@ impl GraphEdit {
         &mut self.draft.slots
     }
 
+    /// Reserve room for `additional` output declarations (result, witnesses, exports, state pairs).
+    pub fn try_reserve_outputs(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.draft.outputs.try_reserve(additional)
+    }
+
     /// Declare the primary result, replacing the previous one.
     pub fn set_result(&mut self, value: ValueId) {
         match self
@@ -1240,6 +1272,7 @@ impl GraphEdit {
     /// Drop the witnesses the predicate rejects, keeping the survivors in declaration order. A
     /// rewrite that drops a witness is refused at [`GraphEdit::commit`]; a split accounts the
     /// dropped ones through a [`WitnessLedger`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn retain_witnesses(&mut self, mut keep: impl FnMut(Witness<'_>) -> bool) {
         self.draft.outputs.retain(|output| match &output.kind {
             OutputKind::Witness { id, name } => keep(Witness {
@@ -1262,6 +1295,7 @@ impl GraphEdit {
     }
 
     /// Remove every export. A rewrite that drops one is refused at [`GraphEdit::commit`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn clear_exports(&mut self) {
         self.draft
             .outputs
@@ -1341,9 +1375,17 @@ impl GraphEdit {
     /// conservation error ([`EditError::WitnessDropped`], [`EditError::ResultRetyped`], ...) when it
     /// loses part of the interface of the graph it was opened from.
     pub fn commit(self) -> Result<Graph, EditError> {
+        self.commit_adding_witnesses(&[])
+    }
+
+    /// [`GraphEdit::commit`] for a rewrite that declares witnesses of its own (a pass that publishes a
+    /// failure of its own making, such as the expert pool's row guard): each id in `added` must be a
+    /// witness the draft carries and the graph it was opened from did not. Every other witness is still
+    /// conserved, and an added witness not named here is still [`EditError::WitnessAdded`].
+    pub fn commit_adding_witnesses(self, added: &[ValidationId]) -> Result<Graph, EditError> {
         self.draft.check()?;
         if let Some(interface) = &self.interface {
-            self.draft.conserves(interface)?;
+            self.draft.conserves(interface, added)?;
         }
         Ok(self.draft)
     }
@@ -1360,7 +1402,7 @@ impl GraphEdit {
 
 impl Graph {
     /// Whether `self`, a rewrite of the graph `interface` describes, still publishes all of it.
-    fn conserves(&self, interface: &Interface) -> Result<(), EditError> {
+    fn conserves(&self, interface: &Interface, added: &[ValidationId]) -> Result<(), EditError> {
         let after = self.aval(self.result());
         if *after != interface.result {
             return Err(EditError::ResultRetyped {
@@ -1376,8 +1418,17 @@ impl Graph {
                 });
             }
         }
+        for id in added {
+            if !self.witnesses().any(|witness| witness.id == *id)
+                || interface.witnesses.iter().any(|(known, _)| known == id)
+            {
+                return Err(EditError::WitnessNotAdded { id: *id });
+            }
+        }
         for witness in self.witnesses() {
-            if !interface.witnesses.iter().any(|(id, _)| *id == witness.id) {
+            if !interface.witnesses.iter().any(|(id, _)| *id == witness.id)
+                && !added.contains(&witness.id)
+            {
                 return Err(EditError::WitnessAdded {
                     id: witness.id,
                     name: witness.name.to_owned(),
@@ -1996,29 +2047,37 @@ mod tests {
     }
 
     fn binding_fixture() -> (super::Graph, BindingFixtureIds) {
-        let b = Builder::new();
-        let weight = b.constant("weight", TensorType::f32(vec![1]));
-        let first_pool = b.slot_named(
-            Slot::ExpertPoolMap,
-            "layer_0",
-            TensorType::new(vec![1], DType::I32),
-        );
-        let _second_pool = b.slot_named(
-            Slot::ExpertPoolMap,
-            "layer_1",
-            TensorType::new(vec![1], DType::I32),
-        );
-        let first_state = b.state_input(
-            "first_state",
-            TensorType::f32(vec![1]),
-            StateRole::Recurrent,
-        );
-        let second_state = b.state_input(
-            "second_state",
-            TensorType::f32(vec![1]),
-            StateRole::Recurrent,
-        );
-        let output = b.binary(BinOp::Add, first_state, second_state);
+        let b = Builder::for_tests();
+        let weight = b.constant("weight", TensorType::f32(vec![1])).unwrap();
+        let first_pool = b
+            .slot_named(
+                Slot::ExpertPoolMap,
+                "layer_0",
+                TensorType::new(vec![1], DType::I32),
+            )
+            .unwrap();
+        let _second_pool = b
+            .slot_named(
+                Slot::ExpertPoolMap,
+                "layer_1",
+                TensorType::new(vec![1], DType::I32),
+            )
+            .unwrap();
+        let first_state = b
+            .state_input(
+                "first_state",
+                TensorType::f32(vec![1]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let second_state = b
+            .state_input(
+                "second_state",
+                TensorType::f32(vec![1]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let output = b.binary(BinOp::Add, first_state, second_state).unwrap();
         let graph = b
             .finish(
                 crate::Outputs::new(output)
@@ -2038,20 +2097,20 @@ mod tests {
 
     #[test]
     fn validate_accepts_a_well_formed_graph() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4]));
-        let out = b.binary(BinOp::Mul, x, x);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+        let out = b.binary(BinOp::Mul, x, x).unwrap();
         let g = b.finish(out).unwrap();
         crate::test_support::verdict(&g).expect("a well-formed graph must validate");
     }
 
     #[test]
     fn validation_layout_is_ordered_and_bounded() {
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let pair = b.constant("pair", TensorType::f32([2]));
-        let scalar = b.constant("scalar", TensorType::f32([]));
-        let graph = crate::test_support::finish_with_validations(
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+        let pair = b.constant("pair", TensorType::f32([2])).unwrap();
+        let scalar = b.constant("scalar", TensorType::f32([])).unwrap();
+        let graph = crate::test_support::graph_fixtures::finish_with_validations(
             b,
             primary,
             &[
@@ -2093,10 +2152,10 @@ mod tests {
 
     #[test]
     fn validation_bits_accept_only_signed_zero() {
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let witness = b.constant("witness", TensorType::f32([2]));
-        let graph = crate::test_support::finish_with_validations(
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+        let witness = b.constant("witness", TensorType::f32([2])).unwrap();
+        let graph = crate::test_support::graph_fixtures::finish_with_validations(
             b,
             primary,
             &[(ValidationId(7), "check", witness)],
@@ -2128,8 +2187,8 @@ mod tests {
 
     #[test]
     fn validation_declarations_and_packet_bound_are_checked() {
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
         let mut graph = b.finish(primary).unwrap().into_draft();
         graph.push_witness(ValidationId(1), "range", ValueId::new(u32::MAX));
         assert!(matches!(
@@ -2196,11 +2255,13 @@ mod tests {
             GraphValidationError::DuplicateValidationName { ref name } if name == "same"
         ));
 
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let witness = b.constant("invalid", TensorType::new([1], DType::I32));
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+        let witness = b
+            .constant("invalid", TensorType::new([1], DType::I32))
+            .unwrap();
         assert!(matches!(
-            crate::test_support::finish_with_validations(b, primary, &[(ValidationId(1), "invalid", witness)]),
+            crate::test_support::graph_fixtures::finish_with_validations(b, primary, &[(ValidationId(1), "invalid", witness)]),
             Err(GraphValidationError::ValidationDtype {
                 id: ValidationId(1),
                 value,
@@ -2208,12 +2269,12 @@ mod tests {
             }) if value == witness.id()
         ));
 
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let first = b.constant("first", TensorType::f32([usize::MAX]));
-        let second = b.constant("second", TensorType::f32([1]));
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+        let first = b.constant("first", TensorType::f32([usize::MAX])).unwrap();
+        let second = b.constant("second", TensorType::f32([1])).unwrap();
         assert!(matches!(
-            crate::test_support::finish_with_validations(
+            crate::test_support::graph_fixtures::finish_with_validations(
                 b,
                 primary,
                 &[
@@ -2224,14 +2285,16 @@ mod tests {
             Err(GraphValidationError::ValidationPacketLaneOverflow)
         ));
 
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let witness = b.constant(
-            "byte-overflow",
-            TensorType::f32([usize::MAX / std::mem::size_of::<f32>() + 1]),
-        );
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+        let witness = b
+            .constant(
+                "byte-overflow",
+                TensorType::f32([usize::MAX / std::mem::size_of::<f32>() + 1]),
+            )
+            .unwrap();
         assert!(matches!(
-            crate::test_support::finish_with_validations(
+            crate::test_support::graph_fixtures::finish_with_validations(
                 b,
                 primary,
                 &[(ValidationId(1), "byte-overflow", witness)]
@@ -2239,22 +2302,24 @@ mod tests {
             Err(GraphValidationError::ValidationPacketByteOverflow)
         ));
 
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let witness = b.constant("invalid", TensorType::f32([0]));
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+        let witness = b.constant("invalid", TensorType::f32([0])).unwrap();
         assert!(matches!(
-            crate::test_support::finish_with_validations(b, primary, &[(ValidationId(1), "invalid", witness)]),
+            crate::test_support::graph_fixtures::finish_with_validations(b, primary, &[(ValidationId(1), "invalid", witness)]),
             Err(GraphValidationError::EmptyValidationValue {
                 id: ValidationId(1),
                 value,
             }) if value == witness.id()
         ));
 
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let witness = b.constant("invalid", TensorType::f32([usize::MAX, 2]));
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+        let witness = b
+            .constant("invalid", TensorType::f32([usize::MAX, 2]))
+            .unwrap();
         assert!(matches!(
-            crate::test_support::finish_with_validations(b, primary, &[(ValidationId(1), "invalid", witness)]),
+            crate::test_support::graph_fixtures::finish_with_validations(b, primary, &[(ValidationId(1), "invalid", witness)]),
             Err(GraphValidationError::ValidationShapeOverflow {
                 id: ValidationId(1),
                 value,
@@ -2262,23 +2327,23 @@ mod tests {
             }) if value == witness.id()
         ));
 
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
         // Spec 375 fixes the payload at 4,096 bytes: 1,024 f32 lanes pass and 1,025 do not. Literal lane
         // counts keep this test sensitive to a change of the bound itself.
-        let witness = b.constant("bounded", TensorType::f32([1024]));
-        crate::test_support::finish_with_validations(
+        let witness = b.constant("bounded", TensorType::f32([1024])).unwrap();
+        crate::test_support::graph_fixtures::finish_with_validations(
             b,
             primary,
             &[(ValidationId(1), "bounded", witness)],
         )
         .unwrap();
 
-        let b = Builder::new();
-        let primary = b.constant("primary", TensorType::f32([1]));
-        let witness = b.constant("too-large", TensorType::f32([1025]));
+        let b = Builder::for_tests();
+        let primary = b.constant("primary", TensorType::f32([1])).unwrap();
+        let witness = b.constant("too-large", TensorType::f32([1025])).unwrap();
         assert!(matches!(
-            crate::test_support::finish_with_validations(
+            crate::test_support::graph_fixtures::finish_with_validations(
                 b,
                 primary,
                 &[(ValidationId(1), "too-large", witness)]
@@ -2314,10 +2379,14 @@ mod tests {
             ("identity", [(0, 0), (1, 1)]),
             ("shared source", [(0, 0), (1, 0)]),
         ] {
-            let b = Builder::new();
-            let first = b.state_input("first", TensorType::f32(vec![1]), StateRole::Recurrent);
-            let second = b.state_input("second", TensorType::f32(vec![1]), StateRole::Recurrent);
-            let output = b.binary(BinOp::Add, first, second);
+            let b = Builder::for_tests();
+            let first = b
+                .state_input("first", TensorType::f32(vec![1]), StateRole::Recurrent)
+                .unwrap();
+            let second = b
+                .state_input("second", TensorType::f32(vec![1]), StateRole::Recurrent)
+                .unwrap();
+            let output = b.binary(BinOp::Add, first, second).unwrap();
             let values = [first, second];
             let state = state.map(|(destination, source)| (values[destination], values[source]));
             let graph = b
@@ -2484,8 +2553,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_out_of_range_graph_input_id() {
-        let b = Builder::new();
-        let output = b.constant("output", TensorType::f32(vec![1]));
+        let b = Builder::for_tests();
+        let output = b.constant("output", TensorType::f32(vec![1])).unwrap();
         let mut graph = b.finish(output).unwrap().into_draft();
         graph.inputs_mut().push(ValueId::new(u32::MAX));
 
@@ -2587,9 +2656,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_state_input_absent_from_inputs_and_consts() {
-        let b = Builder::new();
-        let state = b.state_input("state", TensorType::f32(vec![1]), StateRole::Recurrent);
-        let output = b.constant("output", TensorType::f32(vec![1]));
+        let b = Builder::for_tests();
+        let state = b
+            .state_input("state", TensorType::f32(vec![1]), StateRole::Recurrent)
+            .unwrap();
+        let output = b.constant("output", TensorType::f32(vec![1])).unwrap();
         let mut graph = b
             .finish(crate::Outputs::new(output).with_state(&[(state, output)]))
             .unwrap()
@@ -2605,30 +2676,34 @@ mod tests {
 
     #[test]
     fn validate_rejects_positional_axis_out_of_range_for_rank() {
-        let b = Builder::new();
-        let state = b.state_input(
-            "state",
-            TensorType::f32(vec![1, 2, 3, 4]),
-            StateRole::Positional { axis: 4 },
-        );
-        let output = b.constant("output", TensorType::f32(vec![1]));
+        let b = Builder::for_tests();
+        let state = b
+            .state_input(
+                "state",
+                TensorType::f32(vec![1, 2, 3, 4]),
+                StateRole::Positional { axis: 4 },
+            )
+            .unwrap();
+        let output = b.constant("output", TensorType::f32(vec![1])).unwrap();
         let refused = b.finish(crate::Outputs::new(output).with_state(&[(state, state)]));
 
         assert_eq!(
             refused.err(),
-            Some(EditError::Invalid(GraphValidationError::StateRoleAxis {
-                value: state.id(),
-                axis: 4,
-                rank: 4,
-            }))
+            Some(crate::BuilderError::from(EditError::Invalid(
+                GraphValidationError::StateRoleAxis {
+                    value: state.id(),
+                    axis: 4,
+                    rank: 4,
+                }
+            )))
         );
     }
 
     #[test]
     fn validate_rejects_out_of_range_eqn_output_without_panicking() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4]));
-        let out = b.binary(BinOp::Mul, x, x);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+        let out = b.binary(BinOp::Mul, x, x).unwrap();
         let mut g = b.finish(out).unwrap().into_draft();
         // Corrupt an equation's output id to point past the value table. validate() must return an Err, not panic on
         // the out-of-bounds `self.values[eqn.out]` index.
@@ -2647,10 +2722,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_a_duplicate_ssa_producer() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4]));
-        let internal = b.binary(BinOp::Mul, x, x);
-        let out = b.binary(BinOp::Mul, internal, internal);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+        let internal = b.binary(BinOp::Mul, x, x).unwrap();
+        let out = b.binary(BinOp::Mul, internal, internal).unwrap();
         let mut g = b.finish(out).unwrap().into_draft();
         let first = g.eqns()[0].clone();
         g.eqns_mut().push(first);
@@ -2667,13 +2742,17 @@ mod tests {
 
     #[test]
     fn validate_rejects_state_const_missing_from_input_binders() {
-        let b = Builder::new();
-        let state = b.state_input(
-            "state",
-            TensorType::new(vec![2, 5], DType::E4M3FN),
-            StateRole::Recurrent,
-        );
-        let replacement = b.constant("replacement", TensorType::new(vec![2, 5], DType::E4M3FN));
+        let b = Builder::for_tests();
+        let state = b
+            .state_input(
+                "state",
+                TensorType::new(vec![2, 5], DType::E4M3FN),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let replacement = b
+            .constant("replacement", TensorType::new(vec![2, 5], DType::E4M3FN))
+            .unwrap();
         let mut g = b
             .finish(crate::Outputs::new(replacement).with_state(&[(state, replacement)]))
             .unwrap()
@@ -2688,9 +2767,11 @@ mod tests {
 
     #[test]
     fn validate_preserves_literal_first_binary_contract() {
-        let b = Builder::new();
-        let float = b.constant("float", TensorType::f32(vec![2]));
-        let out = b.binary_scalar(BinOp::Add, float, Scalar::F32(1.0));
+        let b = Builder::for_tests();
+        let float = b.constant("float", TensorType::f32(vec![2])).unwrap();
+        let out = b
+            .binary_scalar(BinOp::Add, float, Scalar::F32(1.0))
+            .unwrap();
         let mut g = b.finish(out).unwrap().into_draft();
         g.eqns_mut()[0].inputs.swap(0, 1);
         // Card 149 deliberately makes literal-first Binary graph-valid. Consumers with a narrower operand
@@ -2703,10 +2784,12 @@ mod tests {
 
     #[test]
     fn validate_rejects_mismatched_binary_value_operands_including_scalars() {
-        let b = Builder::new();
-        let float = b.constant("float", TensorType::scalar(DType::F32));
-        let int = b.constant("int", TensorType::scalar(DType::I32));
-        let out = b.binary_scalar(BinOp::Add, float, Scalar::F32(1.0));
+        let b = Builder::for_tests();
+        let float = b.constant("float", TensorType::scalar(DType::F32)).unwrap();
+        let int = b.constant("int", TensorType::scalar(DType::I32)).unwrap();
+        let out = b
+            .binary_scalar(BinOp::Add, float, Scalar::F32(1.0))
+            .unwrap();
         let mut g = b.finish(out).unwrap().into_draft();
         g.eqns_mut()[0].inputs = vec![Operand::Value(float.id()), Operand::Value(int.id())];
 
@@ -2728,10 +2811,14 @@ mod tests {
     #[test]
     fn validate_rejects_arithmetic_on_a_packed_or_storage_only_dtype() {
         for dtype in [DType::I8, DType::E4M3FN] {
-            let b = Builder::new();
-            let float = b.constant("float", TensorType::f32(vec![2]));
-            let packed = b.constant("packed", TensorType::new(vec![2], dtype));
-            let out = b.binary_scalar(BinOp::Add, float, Scalar::F32(1.0));
+            let b = Builder::for_tests();
+            let float = b.constant("float", TensorType::f32(vec![2])).unwrap();
+            let packed = b
+                .constant("packed", TensorType::new(vec![2], dtype))
+                .unwrap();
+            let out = b
+                .binary_scalar(BinOp::Add, float, Scalar::F32(1.0))
+                .unwrap();
             let mut g = b.finish(out).unwrap().into_draft();
             g.eqns_mut()[0].inputs = vec![Operand::Value(packed.id()), Operand::Value(packed.id())];
 
@@ -2766,8 +2853,8 @@ mod tests {
     #[test]
     fn input_key_is_structured_not_debug_formatted_and_not_by_value_id() {
         let token_graph = || {
-            let b = Builder::new();
-            let t = b.slot(Slot::Token, TensorType::scalar(DType::I32));
+            let b = Builder::for_tests();
+            let t = b.slot(Slot::Token, TensorType::scalar(DType::I32)).unwrap();
             b.finish(t).unwrap()
         };
         let g1 = token_graph();
@@ -2784,8 +2871,8 @@ mod tests {
             "two graphs built the same way must key their Token input equal"
         );
 
-        let b = Builder::new();
-        let p = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
+        let b = Builder::for_tests();
+        let p = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
         let g3 = b.finish(p).unwrap();
         assert_eq!(
             g3.slots[0].0, token_id,
@@ -2811,10 +2898,14 @@ mod tests {
     /// tag: None }))`). Restored, re-run green.
     #[test]
     fn input_key_distinguishes_same_role_tagged_slots() {
-        let b = Builder::new();
-        let layer0 = b.slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]));
-        let layer1 = b.slot_named(Slot::ExpertPoolMap, "layer_1", TensorType::f32(vec![4]));
-        let out = b.binary(BinOp::Add, layer0, layer0);
+        let b = Builder::for_tests();
+        let layer0 = b
+            .slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]))
+            .unwrap();
+        let layer1 = b
+            .slot_named(Slot::ExpertPoolMap, "layer_1", TensorType::f32(vec![4]))
+            .unwrap();
+        let out = b.binary(BinOp::Add, layer0, layer0).unwrap();
         let g = b.finish(out).unwrap();
 
         let key0 = g.input_key(layer0.id()).expect("declared slot input");
@@ -2840,8 +2931,10 @@ mod tests {
     /// green.
     #[test]
     fn input_key_reads_the_stored_key_never_the_name_string() {
-        let b = Builder::new();
-        let layer0 = b.slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]));
+        let b = Builder::for_tests();
+        let layer0 = b
+            .slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]))
+            .unwrap();
         let mut g = b.finish(layer0).unwrap().into_draft();
         let original = g.input_key(layer0.id()).expect("declared slot input");
 

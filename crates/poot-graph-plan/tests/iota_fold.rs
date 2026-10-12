@@ -16,14 +16,19 @@ use poot_graph_plan::fold_iota;
 
 /// The bound-range graph the pre-card convention produced and the computed-iota graph must match.
 fn bound_range_graph() -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let out = b.cast(b.constant("range", TensorType::f32(vec![6])), DType::F32);
+    let b = Builder::for_tests();
+    let out = b
+        .cast(
+            b.constant("range", TensorType::f32(vec![6])).unwrap(),
+            DType::F32,
+        )
+        .unwrap();
     b.finish(out).unwrap()
 }
 
 fn computed_iota_graph() -> poot_graph_ir::Graph {
-    let b = Builder::new();
-    let out = b.iota(6);
+    let b = Builder::for_tests();
+    let out = b.iota(6).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -98,8 +103,8 @@ fn iota_matches_the_bound_range_oracle_and_folds_to_the_same_values() {
 /// the dtype assertion fails.
 #[test]
 fn the_i32_iota_is_exact_through_the_oracle_and_the_folded_constant() {
-    let b = Builder::new();
-    let out = b.iota_i32(6);
+    let b = Builder::for_tests();
+    let out = b.iota_i32(6).unwrap();
     let graph = b.finish(out).unwrap();
     let run = |g: &poot_graph_ir::Graph| {
         eval(g, &HashMap::new(), EvalOptions::new(EvalBudget::UNBOUNDED))

@@ -9,22 +9,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, ExactI32TensorView, ExactValue, Value, eval};
+use poot_graph_ir::test_support::graph_fixtures as helpers;
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, UnOp, ValidationId, ValueId};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
-use poot_test_util::graph_fixtures as helpers;
 
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 
 fn exact_i32(shape: Vec<usize>, words: Vec<i32>) -> Value {
-    Value::Owner(ExactValue::I32(
+    Value::Exact(ExactValue::I32(
         ExactI32TensorView::try_from_words(shape, Arc::from(words)).unwrap(),
     ))
 }
 
 fn words(value: &Value) -> Vec<i32> {
     match value {
-        Value::Owner(ExactValue::I32(view)) => view.i32_words().to_vec(),
+        Value::Exact(ExactValue::I32(view)) => view.i32_words().to_vec(),
         Value::Host(tensor) => tensor
             .as_i32()
             .expect("a dense I32 publication carries I32 words")
@@ -49,22 +49,24 @@ fn i32_inputs(entries: &[(ValueId, Vec<usize>, Vec<i32>)]) -> HashMap<ValueId, V
 /// test goes red.
 #[test]
 fn optimized_exact_i32_region_matches_the_unoptimized_graph() {
-    let b = Builder::new();
-    let history = b.state_input(
-        "history",
-        TensorType::new(vec![4], DType::I32),
-        StateRole::Recurrent,
-    );
+    let b = Builder::for_tests();
+    let history = b
+        .state_input(
+            "history",
+            TensorType::new(vec![4], DType::I32),
+            StateRole::Recurrent,
+        )
+        .unwrap();
     let zero = helpers::i32_constant(&b, "zero", vec![4]).unwrap();
     let ones = helpers::i32_constant(&b, "ones", vec![4]).unwrap();
-    let decremented = b.binary(BinOp::Sub, history, ones);
-    let nonnegative = b.binary(BinOp::Ge, history, zero);
-    let selected = b.select(nonnegative, decremented, history);
+    let decremented = b.binary(BinOp::Sub, history, ones).unwrap();
+    let nonnegative = b.binary(BinOp::Ge, history, zero).unwrap();
+    let selected = b.select(nonnegative, decremented, history).unwrap();
     let graph = b
         .finish(poot_graph_ir::Outputs::new(selected).with_state(&[(history, selected)]))
         .unwrap();
 
-    let optimized = optimize(&graph).unwrap();
+    let optimized = passes_without_target(&graph).unwrap();
     assert!(
         optimized.eqns().iter().any(|eqn| {
             matches!(eqn.op, poot_graph_ir::OpKind::Fused(_))
@@ -125,15 +127,17 @@ fn optimized_exact_i32_region_matches_the_unoptimized_graph() {
 /// "exact-I32 fused operand storage" and this test goes red.
 #[test]
 fn exact_i32_pack_region_replays_its_concat() {
-    let b = Builder::new();
-    let packed_source = b.constant("packed", TensorType::new(vec![2, 2], DType::I32));
-    let lane0 = b.slice(packed_source, 1, 0, 1);
-    let lane1 = b.slice(packed_source, 1, 1, 2);
-    let not0 = b.unary(UnOp::Not, lane0);
-    let not1 = b.unary(UnOp::Not, lane1);
-    let concatenated = b.concat(1, &[not0, not1]);
+    let b = Builder::for_tests();
+    let packed_source = b
+        .constant("packed", TensorType::new(vec![2, 2], DType::I32))
+        .unwrap();
+    let lane0 = b.slice(packed_source, 1, 0, 1).unwrap();
+    let lane1 = b.slice(packed_source, 1, 1, 2).unwrap();
+    let not0 = b.unary(UnOp::Not, lane0).unwrap();
+    let not1 = b.unary(UnOp::Not, lane1).unwrap();
+    let concatenated = b.concat(1, &[not0, not1]).unwrap();
     let graph = b.finish(concatenated).unwrap();
-    let optimized = optimize(&graph).unwrap();
+    let optimized = passes_without_target(&graph).unwrap();
 
     assert_eq!(
         optimized
@@ -177,13 +181,15 @@ fn exact_i32_pack_region_replays_its_concat() {
 /// commit is refused with `EditError::WitnessDropped` and this row goes red.
 #[test]
 fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
-    let b = Builder::new();
-    let cache = b.state_input("cache", TensorType::f32([4]), StateRole::Recurrent);
-    let update = b.constant("update", TensorType::f32([1]));
-    let written = b.dynamic_update_slice(cache, update, 1, 0);
+    let b = Builder::for_tests();
+    let cache = b
+        .state_input("cache", TensorType::f32([4]), StateRole::Recurrent)
+        .unwrap();
+    let update = b.constant("update", TensorType::f32([1])).unwrap();
+    let written = b.dynamic_update_slice(cache, update, 1, 0).unwrap();
     // A validation witness is an error flag: every lane must observe a clean zero, so the recipe
     // checks the written value against itself.
-    let witness = b.binary(BinOp::Sub, written, written);
+    let witness = b.binary(BinOp::Sub, written, written).unwrap();
     let graph = helpers::finish_with_state_and_validations(
         b,
         written,
@@ -192,7 +198,7 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
     )
     .unwrap();
 
-    let optimized = optimize(&graph).unwrap();
+    let optimized = passes_without_target(&graph).unwrap();
     assert!(
         optimized.witnesses().eq(graph.witnesses()),
         "optimize must keep the witness declaration"
@@ -306,17 +312,17 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
 /// the kept environment refuses with "UseBeforeDef" instead of comparing.
 #[test]
 fn pipeline_witness_output_survives_every_pass() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([4]));
-    let y = b.constant("y", TensorType::f32([4]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([4])).unwrap();
+    let y = b.constant("y", TensorType::f32([4])).unwrap();
     // A validation witness is an error flag: every lane must observe a clean zero.
-    let witness = b.binary(BinOp::Sub, x, x);
-    let neighbouring = b.binary(BinOp::Mul, y, y);
-    let primary = b.binary(BinOp::Add, witness, neighbouring);
+    let witness = b.binary(BinOp::Sub, x, x).unwrap();
+    let neighbouring = b.binary(BinOp::Mul, y, y).unwrap();
+    let primary = b.binary(BinOp::Add, witness, neighbouring).unwrap();
     let graph =
         helpers::finish_with_validations(b, primary, &[(ValidationId(533), "neighbour", witness)])
             .unwrap();
-    let optimized = optimize(&graph).unwrap();
+    let optimized = passes_without_target(&graph).unwrap();
     assert!(
         optimized
             .eqns()

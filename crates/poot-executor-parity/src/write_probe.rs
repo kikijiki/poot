@@ -8,7 +8,8 @@
 
 use std::ops::Range;
 
-use poot_executor::{BufferRole, Device};
+use poot_executor::Device;
+use poot_runtime_common::BufferRole;
 use poot_target::BufferStorage;
 
 /// The byte every correct write puts at device byte `address` for write `seed`.

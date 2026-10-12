@@ -1,5 +1,5 @@
-//! The performance bank's measurement, shared by the backend examples (`performance_bank.rs` in poot-gpu,
-//! poot-rocm-gpu and poot-ptx-gpu include this file by path; each supplies only its device).
+//! The performance bank's measurement, shared by the backend examples (`performance_bank.rs` in poot-wgpu-device,
+//! poot-rocm-device and poot-ptx-device include this file by path; each supplies only its device).
 //!
 //! One invocation measures one case of `cases.json` through the executor contract: it builds the case's
 //! graph and deterministic inputs, loads and compiles it for the device's target, adds one entry per weight
@@ -13,17 +13,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use poot_executor::{Device, Engine, Executor, HostView, NoSync, StepInputs};
+use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
+use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Builder, Graph, TensorType, ops};
-use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
-    Submission, Target, TargetSet, compile_staged,
+use poot_graph_plan::production_plan::Submission;
+use poot_graph_plan::staged::{
+    DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram, TargetSet, compile_staged,
 };
+use poot_graph_plan::{CompileOptions, Target};
 use poot_load::packed_safetensors::sha256_digest;
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-use poot_tensor::HostTensor;
-use poot_test_util::const_weights::ConstWeights;
+use poot_tensor::{HostTensor, HostView};
 use serde_json::{Value, json};
 
 /// Largest `|got - want|` allowed against the f64 reference, relative to `1 + |want|`: f32 accumulation
@@ -135,10 +136,10 @@ fn dense_matmul(bank: &Value, case: &Value) -> Result<Prepared, String> {
         }
         references.push(want);
         let name = format!("w{copy}");
-        let b = Builder::new();
-        let xi = b.constant("x", TensorType::f32(vec![m, k]));
-        let wi = b.constant(&name, TensorType::f32(vec![k, n]));
-        let y = b.matmul(xi, wi);
+        let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+        let xi = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+        let wi = b.constant(&name, TensorType::f32(vec![k, n])).unwrap();
+        let y = b.matmul(xi, wi).unwrap();
         graphs.push(b.finish(y).unwrap());
         consts.push((name, HostTensor::f32(vec![k, n], w)));
     }
@@ -217,10 +218,14 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
                 / total;
         }
     }
-    let b = Builder::new();
-    let qi = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let ki = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
-    let vi = b.constant("v", TensorType::f32(vec![1, hkv, cap, d]));
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
+    let qi = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let ki = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let vi = b
+        .constant("v", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
     let mut consts = vec![
         ("q".into(), HostTensor::f32(vec![1, hq, 1, d], q)),
         ("k".into(), HostTensor::f32(vec![1, hkv, cap, d], k)),
@@ -228,19 +233,23 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
     ];
     let mut slots = Vec::new();
     let graph = if live.is_some() {
-        let pos = b.slot_ranged(
-            poot_graph_ir::Slot::Pos,
-            TensorType::new(vec![1, 1], poot_tensor::DType::I32),
-            // The position is declared in `0..cap`, which every binder checks: the guarded composite then
-            // needs no validation witness to fuse to the live attention (the serving decode graphs' form).
-            poot_graph_ir::IndexRange::below(cap).ok_or("cap must be non-zero")?,
-        );
-        let mask = ops::causal_mask_from_pos(&b, pos, cap, None);
-        let len = b.binary_scalar(
-            poot_graph_ir::BinOp::Add,
-            b.reshape(pos, vec![1]),
-            poot_graph_ir::Scalar::I32(1),
-        );
+        let pos = b
+            .slot_ranged(
+                poot_graph_ir::Slot::Pos,
+                TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+                // The position is declared in `0..cap`, which every binder checks: the guarded composite then
+                // needs no validation witness to fuse to the live attention (the serving decode graphs' form).
+                poot_graph_ir::IndexRange::below(cap).ok_or("cap must be non-zero")?,
+            )
+            .unwrap();
+        let mask = ops::causal_mask_from_pos(&b, pos, cap, None).unwrap();
+        let len = b
+            .binary_scalar(
+                poot_graph_ir::BinOp::Add,
+                b.reshape(pos, vec![1]).unwrap(),
+                poot_graph_ir::Scalar::I32(1),
+            )
+            .unwrap();
         let composite = ops::attention_live(
             &b,
             qi,
@@ -266,12 +275,14 @@ fn attention_decode(bank: &Value, case: &Value) -> Result<Prepared, String> {
         ));
         graph
     } else {
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+            .unwrap();
         consts.push((
             "mask".into(),
             HostTensor::f32(vec![1, 1, 1, cap], vec![0.0; cap]),
         ));
-        let y = ops::attention_masked(&b, qi, ki, vi, n_rep, scale, mask);
+        let y = ops::attention_masked(&b, qi, ki, vi, n_rep, scale, mask).unwrap();
         b.finish(y).unwrap()
     };
     let mut shape_json = json!({ "hq": hq, "hkv": hkv, "d": d, "cap": cap });
@@ -366,28 +377,32 @@ fn ssd_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
             }
         }
     }
-    let b = Builder::new();
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
     let x_ty = vec![1, heads, len, p];
     let bc_ty = vec![1, heads, len, n];
     let delta_ty = vec![1, heads, len, 1];
     let head_ty = vec![1, heads, 1, 1];
     let state_ty = vec![1, heads, n, p];
     let operands = [
-        b.constant("x", TensorType::f32(x_ty.clone())),
-        b.constant("b", TensorType::f32(bc_ty.clone())),
-        b.constant("c", TensorType::f32(bc_ty.clone())),
-        b.constant("delta", TensorType::f32(delta_ty.clone())),
-        b.constant("a", TensorType::f32(head_ty.clone())),
-        b.constant("d", TensorType::f32(head_ty.clone())),
-        b.constant("s_in", TensorType::f32(state_ty.clone())),
+        b.constant("x", TensorType::f32(x_ty.clone())).unwrap(),
+        b.constant("b", TensorType::f32(bc_ty.clone())).unwrap(),
+        b.constant("c", TensorType::f32(bc_ty.clone())).unwrap(),
+        b.constant("delta", TensorType::f32(delta_ty.clone()))
+            .unwrap(),
+        b.constant("a", TensorType::f32(head_ty.clone())).unwrap(),
+        b.constant("d", TensorType::f32(head_ty.clone())).unwrap(),
+        b.constant("s_in", TensorType::f32(state_ty.clone()))
+            .unwrap(),
     ];
-    let scan = b.scan(
-        poot_graph_ir::ScanAttrs {
-            family: poot_graph_ir::ScanFamily::Ssd,
-            chunk: 64,
-        },
-        &operands,
-    );
+    let scan = b
+        .scan(
+            poot_graph_ir::ScanAttrs {
+                family: poot_graph_ir::ScanFamily::Ssd,
+                chunk: 64,
+            },
+            &operands,
+        )
+        .unwrap();
     Ok(Prepared {
         graphs: vec![b.finish(scan.packed).unwrap()],
         consts: vec![
@@ -467,24 +482,28 @@ fn delta_rule_scan(bank: &Value, case: &Value) -> Result<Prepared, String> {
             }
         }
     }
-    let b = Builder::new();
+    let b = Builder::new(poot_graph_ir::TraceLimits::for_tests());
     let sequence = vec![1, heads, len, d];
     let per_token = vec![1, heads, len, 1];
     let operands = [
-        b.constant("q", TensorType::f32(sequence.clone())),
-        b.constant("k", TensorType::f32(sequence.clone())),
-        b.constant("v", TensorType::f32(sequence.clone())),
-        b.constant("g", TensorType::f32(per_token.clone())),
-        b.constant("beta", TensorType::f32(per_token.clone())),
-        b.constant("s_in", TensorType::f32(vec![1, heads, d, d])),
+        b.constant("q", TensorType::f32(sequence.clone())).unwrap(),
+        b.constant("k", TensorType::f32(sequence.clone())).unwrap(),
+        b.constant("v", TensorType::f32(sequence.clone())).unwrap(),
+        b.constant("g", TensorType::f32(per_token.clone())).unwrap(),
+        b.constant("beta", TensorType::f32(per_token.clone()))
+            .unwrap(),
+        b.constant("s_in", TensorType::f32(vec![1, heads, d, d]))
+            .unwrap(),
     ];
-    let scan = b.scan(
-        poot_graph_ir::ScanAttrs {
-            family: poot_graph_ir::ScanFamily::DeltaRule,
-            chunk: 64,
-        },
-        &operands,
-    );
+    let scan = b
+        .scan(
+            poot_graph_ir::ScanAttrs {
+                family: poot_graph_ir::ScanFamily::DeltaRule,
+                chunk: 64,
+            },
+            &operands,
+        )
+        .unwrap();
     Ok(Prepared {
         graphs: vec![b.finish(scan.packed).unwrap()],
         consts: vec![
@@ -692,7 +711,7 @@ where
 }
 
 /// The example's whole `main`: measure the case `--case` of `--bank` on `device` and write `--out`.
-pub fn run<D>(backend: &str, device: D) -> Result<(), String>
+pub(crate) fn run<D>(backend: &str, device: D) -> Result<(), String>
 where
     D: Device + 'static,
 {

@@ -7,15 +7,15 @@
 //! first into NaN and rounds the second. One case runs the select standalone, one inside a fused float
 //! region (`Neg(Neg(select))`, which is the identity on bits), so the two lowerings share one expectation.
 
+use poot_eval::test_support::StepFixture;
+use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::Executor;
 use poot_graph_ir::op::FusedOp;
 use poot_graph_ir::{Builder, IndexRange, OpKind, Slot, TensorType, Traced, UnOp};
-use poot_graph_plan::{Submission, Target};
+use poot_graph_plan::{Target, production_plan::Submission};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
-use poot_test_util::StepFixture;
-use poot_test_util::weight_map_oracle::oracle_for;
 
 use crate::Fixture;
 
@@ -91,17 +91,20 @@ fn slot_fixture(
     branch: (Slot, DType),
     inputs: [HostTensor; 3],
 ) -> Fixture {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let n = inputs[0].numel();
-    let cond = b.slot_named(Slot::Token, "cond", TensorType::new(vec![n], DType::I32));
+    let cond = b
+        .slot_named(Slot::Token, "cond", TensorType::new(vec![n], DType::I32))
+        .unwrap();
     // An I32 branch is read back through a cast to F32: its slot declares the exact f32 integers, which
     // `compile` needs to prove that cast and the binder checks.
     let branch_slot = |tag: &str| {
         let aval = TensorType::new(vec![n], branch.1);
         if branch.1 == DType::I32 {
             b.slot_named_ranged(branch.0, tag, aval, IndexRange::F32_EXACT)
+                .unwrap()
         } else {
-            b.slot_named(branch.0, tag, aval)
+            b.slot_named(branch.0, tag, aval).unwrap()
         }
     };
     let if_true = branch_slot("if_true");
@@ -135,11 +138,12 @@ fn float_select(name: &'static str, fused: bool) -> Fixture {
     slot_fixture(
         name,
         |b, [cond, if_true, if_false]| {
-            let selected = b.select(cond, if_true, if_false);
+            let selected = b.select(cond, if_true, if_false).unwrap();
             // `Neg(Neg(x))` flips the sign bit twice: the identity on bits, and enough pointwise neighbours
             // for `fuse` to put the select inside one float region.
             if fused {
-                b.unary(UnOp::Neg, b.unary(UnOp::Neg, selected))
+                b.unary(UnOp::Neg, b.unary(UnOp::Neg, selected).unwrap())
+                    .unwrap()
             } else {
                 selected
             }
@@ -157,7 +161,10 @@ fn i32_select() -> Fixture {
     let n = I32_CONDITION.len();
     slot_fixture(
         STANDALONE_I32,
-        |b, [cond, if_true, if_false]| b.cast(b.select(cond, if_true, if_false), DType::F32),
+        |b, [cond, if_true, if_false]| {
+            b.cast(b.select(cond, if_true, if_false).unwrap(), DType::F32)
+                .unwrap()
+        },
         (Slot::Token, DType::I32),
         [
             HostTensor::i32(vec![n], I32_CONDITION.to_vec()),
@@ -332,11 +339,17 @@ fn two_byte_cases() -> Vec<(Fixture, Vec<u16>)> {
                 _ => "select_f16_poisoned",
             };
             let n = CONDITION.len();
-            let b = Builder::new();
-            let cond = b.slot_named(Slot::Token, "cond", TensorType::new(vec![n], DType::I32));
-            let on = b.constant("if_true", TensorType::new(vec![n], dtype));
-            let off = b.constant("if_false", TensorType::new(vec![n], dtype));
-            let selected = b.select(cond, on, off);
+            let b = Builder::for_tests();
+            let cond = b
+                .slot_named(Slot::Token, "cond", TensorType::new(vec![n], DType::I32))
+                .unwrap();
+            let on = b
+                .constant("if_true", TensorType::new(vec![n], dtype))
+                .unwrap();
+            let off = b
+                .constant("if_false", TensorType::new(vec![n], dtype))
+                .unwrap();
+            let selected = b.select(cond, on, off).unwrap();
             let graph = b.finish(selected).unwrap();
             let bytes = |words: &[u16]| -> StoredBytes {
                 words

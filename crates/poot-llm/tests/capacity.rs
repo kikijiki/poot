@@ -9,16 +9,18 @@ use std::collections::{BTreeSet, HashMap};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use poot_executor::{BufferRole, Device, Dispatch, Engine};
-use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
-use poot_graph_plan::{CompileLimits, CompileOptions, DeviceId, Submission, Target};
+use poot_executor::{Device, Dispatch, Engine};
+use poot_graph_ir::{BinOp, Graph, StateRole, TensorType};
+use poot_graph_plan::{
+    CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
+    production_plan::Submission,
+};
 use poot_llm::driver::capacity::Planner;
 use poot_llm::driver::placement::Placement;
 use poot_llm::driver::{
     Driver, DriverOptions, Head, Layout, ModelHandle, PoolShape, PreparedSetLimits, ServingShapes,
     Warm,
 };
-use poot_models::chat::ChatFormat;
 use poot_models::components::standard::Step;
 use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
@@ -26,9 +28,10 @@ use poot_models::model::{
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
-use poot_runtime_common::MemoryCounters;
+use poot_runtime_common::{BufferRole, MemoryCounters};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
+use poot_text::ChatFormat;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
@@ -78,7 +81,12 @@ impl Model for Tiny {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: FAMILY,
@@ -89,8 +97,7 @@ impl Model for Tiny {
         if phase == Phase::Decode && shape.tokens.get() != 1 {
             return refuse(ShapeReason::DecodeTokens);
         }
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
             0
@@ -106,11 +113,11 @@ impl Model for Tiny {
                 1,
                 first,
                 n,
-            ),
+            )?,
             DType::F32,
-        );
-        let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
-        let seed = b.binary(BinOp::Add, token, pos);
+        )?;
+        let pos = b.cast(b.slice(step.pos(), 1, first, n)?, DType::F32)?;
+        let seed = b.binary(BinOp::Add, token, pos)?;
         let (dims, role) = match (self.variant, shape.kv) {
             (Variant::Dense, KvLayout::Paged { pool_slots, .. }) => {
                 (vec![pool_slots.get(), 4], StateRole::Positional { axis: 0 })
@@ -125,7 +132,7 @@ impl Model for Tiny {
             ),
             (Variant::Recurrent, _) => (vec![rows, 4], StateRole::Recurrent),
         };
-        let state = b.state_input("toy.state", TensorType::f32(dims.clone()), role);
+        let state = b.state_input("toy.state", TensorType::f32(dims.clone()), role)?;
         // The state folds the last position's value; one row, so the folded scalar reshapes to ones.
         let last = b.binary(
             BinOp::Add,
@@ -137,15 +144,15 @@ impl Model for Tiny {
                     1,
                     n - 1,
                     n,
-                ),
+                )?,
                 DType::F32,
-            ),
-            b.cast(b.slice(step.pos(), 1, n - 1, n), DType::F32),
-        );
-        let spread = b.broadcast(b.reshape(last, vec![1; dims.len()]), dims);
-        step.carry(state, b.binary(BinOp::Add, state, spread));
-        let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
-        Ok(step.finish(b, logits).unwrap())
+            )?,
+            b.cast(b.slice(step.pos(), 1, n - 1, n)?, DType::F32)?,
+        )?;
+        let spread = b.broadcast(b.reshape(last, vec![1; dims.len()])?, dims)?;
+        step.carry(state, b.binary(BinOp::Add, state, spread)?);
+        let logits = b.broadcast(b.reshape(seed, vec![rows, out, 1])?, vec![rows, out, VOCAB])?;
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -325,7 +332,7 @@ fn options(capacity: usize) -> DriverOptions {
         decode: compile,
         capacity: nz(capacity),
         prefill_chunk: nz(4),
-        max_trace_tokens: nz(64),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(64)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 40).unwrap(),

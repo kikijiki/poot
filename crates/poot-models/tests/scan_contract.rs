@@ -2,19 +2,19 @@
 //! body does not grow with the sequence, a launch count bounded by `max_dispatch_work`, distinct buffers for
 //! `y` and `s_out`, and `s_out` published as state. No device.
 
-use poot_executor_parity::dense::step;
+use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_graph_ir::{Graph, OpKind};
 use poot_graph_plan::device_validation::ResourceRefusal;
+use poot_graph_plan::test_support::{gpu_backend, gpu_caps, gpu_caps_mut};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, KernelChoice, Plan, PlanError,
-    Program, Submission, Target, compile,
+    Program, Target, compile, production_plan::Submission,
 };
 use poot_kernelgen::{KernelRequest, ScanKernel, ScanSpec};
 use poot_models::model::{LogitRows, Phase};
 use poot_models::registry::Registry;
+use poot_models::test_support::dense::step;
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried};
-use poot_test_util::graph_fixtures::{gpu_backend, gpu_caps, gpu_caps_mut};
-use poot_test_util::scan::ScanFixture;
 
 fn targets() -> [(&'static str, Target); 3] {
     [
@@ -429,7 +429,11 @@ fn registered(family: &str, phase: Phase, rows: usize, tokens: usize, cap: usize
     let model =
         (entry.build)(&fixture.raw(), &fixture.store).unwrap_or_else(|e| panic!("{family}: {e}"));
     model
-        .trace(phase, step(rows, tokens, cap, LogitRows::Last))
+        .trace(
+            phase,
+            step(rows, tokens, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap_or_else(|e| panic!("{family}: {e}"))
 }
 

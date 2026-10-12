@@ -37,7 +37,7 @@ impl<'a> Emitter<'a> {
                     self.declares.insert(format!("declare i32 @{gintrin}(i32)"));
                     let gy = self.fresh();
                     let _ = writeln!(w, "  {gy} = tail call i32 @{gintrin}(i32 {gaxis})");
-                    // lengths[param_count] is the X-thread extent (see poot-runtime's length ABI).
+                    // lengths[param_count] is the X-thread extent (see poot-wgpu-runtime's length ABI).
                     let slot = self.body.param_count;
                     let (bufty, mangle) = self.spirv_len_buf();
                     let p = self.fresh();

@@ -12,16 +12,18 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, paged_step, step};
-use poot_executor_parity::weight_map::{MappedModel, TIER2, assert_close};
+use poot_executor_parity::{TIER2, assert_close};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::{ComputedConst, Graph, Slot, SlotKey, Storage, TensorType, ValueId};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, LoraPlan, Partition,
-    ShardError, ShardRule, StagedCompileError, StagedProgram, Submission, Target, TargetSet,
-    compile_staged, shard,
+    CompileLimits, CompileOptions, LoraPlan, ShardError, ShardRule, Target,
+    multi_device::topology::DeviceId, production_plan::Submission, shard, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedCompileError, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, paged_step, step};
+use poot_models::test_support::weight_map::MappedModel;
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{
     AttnRole, DenseWeight, LoraRole, LoraTarget, MlaRole, WeightEntry, WeightId, WeightMap,
@@ -102,7 +104,11 @@ fn tiny_qwen2() -> MappedModel {
 fn decode_graph(mapped: &MappedModel, rows: usize) -> Graph {
     mapped
         .model
-        .trace(Phase::Decode, step(rows, 1, 6, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step(rows, 1, 6, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .expect("the fixture traces a decode step")
 }
 
@@ -113,6 +119,7 @@ fn paged_decode_graph(mapped: &MappedModel, rows: usize, pool_slots: usize) -> G
         .trace(
             Phase::Decode,
             paged_step(rows, 1, CAPACITY, pool_slots, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the fixture traces a paged decode step")
 }
@@ -557,11 +564,15 @@ fn dense_linear(id: WeightId, out: usize, input: usize) -> (Graph, WeightMap, We
     let mut map = WeightMap::builder(&store);
     map.map(id, WeightView::Stored("w".into())).unwrap();
     let map = map.build();
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![1, 1, input]));
-    let w = b.constant(&id.const_name(), TensorType::f32(vec![out, input]));
-    let wt = b.transpose(w, vec![1, 0]);
-    let y = b.matmul(x, wt);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(Slot::Activation, TensorType::f32(vec![1, 1, input]))
+        .unwrap();
+    let w = b
+        .constant(&id.const_name(), TensorType::f32(vec![out, input]))
+        .unwrap();
+    let wt = b.transpose(w, vec![1, 0]).unwrap();
+    let y = b.matmul(x, wt).unwrap();
     (b.finish(y).unwrap(), map, store)
 }
 
@@ -613,11 +624,15 @@ fn shard_refuses_a_q4_k_column_split_mid_block() {
         map.map(q, WeightView::Stored("q".into())).unwrap();
         map.map(id, WeightView::Stored("o".into())).unwrap();
         let map = map.build();
-        let b = Builder::new();
-        let x = b.slot(Slot::Activation, TensorType::f32(vec![1, 8]));
-        let wq = b.constant(&q.const_name(), TensorType::f32(vec![k, 8]));
-        let wq = b.transpose(wq, vec![1, 0]);
-        let h = b.matmul(x, wq);
+        let b = Builder::for_tests();
+        let x = b
+            .slot(Slot::Activation, TensorType::f32(vec![1, 8]))
+            .unwrap();
+        let wq = b
+            .constant(&q.const_name(), TensorType::f32(vec![k, 8]))
+            .unwrap();
+        let wq = b.transpose(wq, vec![1, 0]).unwrap();
+        let h = b.matmul(x, wq).unwrap();
         let weight = PackedWeight::try_new(WeightFormat::Q4_K, [4, k]).unwrap();
         let y = poot_graph_ir::ops::packed_linear(&b, h, &id.const_name(), weight, None, None)
             .expect("a packed linear");
@@ -847,12 +862,16 @@ fn a_split_output_is_gathered_and_the_ranks_slices_concatenate_in_rank_order() {
 fn an_op_with_no_rule_on_a_split_axis_is_refused_by_name() {
     let id = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
     let (_, map, _) = dense_linear(id, 8, 6);
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![1, 1, 6]));
-    let w = b.constant(&id.const_name(), TensorType::f32(vec![8, 6]));
-    let wt = b.transpose(w, vec![1, 0]);
-    let y = b.matmul(x, wt);
-    let cut = b.slice(y, 2, 0, 4);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(Slot::Activation, TensorType::f32(vec![1, 1, 6]))
+        .unwrap();
+    let w = b
+        .constant(&id.const_name(), TensorType::f32(vec![8, 6]))
+        .unwrap();
+    let wt = b.transpose(w, vec![1, 0]).unwrap();
+    let y = b.matmul(x, wt).unwrap();
+    let cut = b.slice(y, 2, 0, 4).unwrap();
     let graph = b.finish(cut).unwrap();
     let refusal = shard(
         &graph,

@@ -30,12 +30,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, ValueEnum};
-use poot_llm::ChatTemplateOverride;
 use poot_llm::driver::{
-    BackendChoice, ChatOptions, ChatSession, Generation, ModelHandle, PhaseTiming, Sampling,
-    TextRequest, generate_text, open_executor,
+    BackendChoice, ChatOptions, ChatSession, Generation, GenerationTiming, ModelHandle,
+    PhaseTiming, Sampling, TextRequest, generate_text, open_executor,
 };
 use poot_models::registry::Registry;
+use poot_text::ChatTemplateOverride;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Backend {
@@ -298,11 +298,28 @@ fn report(phase: &str, timing: PhaseTiming) {
     }
 }
 
+/// The decode phase's `ms/token`, bytes read per token and fraction of the device's pinned ceiling,
+/// every figure the engine produced (`GenerationTiming`), none derived here.
+fn report_roofline(timing: &GenerationTiming) {
+    let decode = timing.decode;
+    match (decode.ms_per_token(), decode.bytes_per_token()) {
+        (Some(ms), Some(bytes)) => {
+            eprintln!("decode: {ms:.3} ms/token, {:.1} MB/token read", bytes / 1e6);
+        }
+        _ => return,
+    }
+    match &timing.decode_roofline {
+        Some(roofline) => eprintln!("decode: {}", roofline.render()),
+        None => eprintln!("decode: no calibrated bandwidth ceiling pinned for this device"),
+    }
+}
+
 fn report_timings(generation: &Generation) {
     // `generate_text` always runs a driver that measures its phases.
     if let Some(timing) = generation.timing {
         report("prefill", timing.prefill);
         report("decode", timing.decode);
+        report_roofline(&timing);
     }
 }
 

@@ -1,0 +1,40 @@
+[package]
+name = "poot-wgpu-runtime"
+description = "poot GPU runtime: dispatch a compiled SPIR-V kernel on wgpu (Vulkan)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# ADR-0113: the host upload/download and allocation entry points the dispatch-level tests of other crates
+# (poot-kernelgen, pootc) drive a `Context` through. No production caller exists: the executors reach the
+# device through `Device`. Enabled only from `[dev-dependencies]` edges.
+test-support = []
+
+[dependencies]
+poot-runtime-common.workspace = true
+poot-target.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+# wgpu-hal + ash (pinned to wgpu's versions): used only to query device VRAM through the Vulkan
+# runtime (VK_EXT_memory_budget) for the GPU-memory metric (no sysfs/CLI).
+wgpu-hal.workspace = true
+ash.workspace = true
+
+[dev-dependencies]
+# This crate's own `tests/*.rs` integration binaries drive a `Context` through the gated upload/download API.
+poot-wgpu-runtime = { path = ".", features = ["test-support"] }
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+poot-codegen.workspace = true
+# "serde": the pending-fault test deserializes poot-rocm-device's committed assert_trap.kir.json fixture
+# (card 531c) instead of hand-building a Body.
+poot-kernel-ir = { workspace = true, features = ["serde", "test-support"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

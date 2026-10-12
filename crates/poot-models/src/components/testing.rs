@@ -86,7 +86,7 @@ pub(crate) fn q8_0_store(store: &WeightStore, is_projection: impl Fn(&str) -> bo
     for (i, (key, entry)) in store.iter().enumerate() {
         let entry = if is_projection(key.as_str()) {
             let shape = entry.shape();
-            WeightEntry::Packed(Arc::new(poot_test_util::packed::random_payload(
+            WeightEntry::Packed(Arc::new(poot_quant::test_support::packed::random_payload(
                 WeightFormat::Q8_0,
                 [shape[0], shape[1]],
                 i as u64,
@@ -242,6 +242,7 @@ pub(crate) fn assert_bf16_and_q8_0_trace_through_the_packed_transform(
             .trace(
                 Phase::Prefill,
                 step_shape(prompt.len(), CAP, LogitRows::All),
+                poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
         assert_packed_binding(&*model, &g, &projections, label == "q8_0", label);
@@ -389,7 +390,11 @@ pub(crate) fn assert_gguf_resolves_and_traces_packed(
         }
     }
     let g = model
-        .trace(Phase::Prefill, step_shape(4, CAP, LogitRows::All))
+        .trace(
+            Phase::Prefill,
+            step_shape(4, CAP, LogitRows::All),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     assert_packed_binding(&*model, &g, &consts, true, "gguf");
     model

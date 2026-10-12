@@ -5,13 +5,13 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_eval::{EvalBudget, EvalError, EvalOptions, Value, eval};
-use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::{
     BinOp, Eqn, ExecutionValidationFailure, Graph, MAX_VALIDATION_PACKET_BYTES, OpKind, Operand,
     Storage, ValidationId, ValueId, ValueMeta, ValueTable,
 };
 use poot_graph_plan::{collapse_reshape_chains, cse, dce, elide_noop_transposes, fuse};
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
 use poot_tensor::HostTensor;
 
 /// A tiny qwen2 decode graph: `layers` layers over a cache of `cap` positions.
@@ -19,7 +19,11 @@ fn qwen2_decode(dense: &Dense, cap: usize) -> Graph {
     dense
         .f32_model()
         .model
-        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step(1, 1, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .expect("the qwen2 decode traces")
 }
 

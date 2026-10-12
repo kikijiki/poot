@@ -6,25 +6,27 @@
 //! fake also keeps the one log all of a coordinator's devices write to, so these rows see the order
 //! of recordings, copies, event records and waits, the completion waits, and when each buffer and
 //! event is finally released. What the kernels compute is the device lanes' business
-//! (`poot-ptx-gpu`'s two-device rows).
+//! (`poot-ptx-device`'s two-device rows).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use poot_executor::{
-    BufferRole, Collectives, Coordinator, CoordinatorError, Device, DeviceTime, Dispatch, Engine,
-    ExecError, ExecutableId, Executor, NativeCounters, NoSync, StepInputs, SupportBound,
+    Collectives, Coordinator, CoordinatorError, Device, DeviceTime, Dispatch, Engine, ExecError,
+    ExecutableId, Executor, NativeCounters, NoSync, StepInputs, SupportBound,
 };
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition,
-    StagedProgram, Submission, Target, TargetSet, compile_staged,
+    CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
     DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightStore, WeightView,
 };
+use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostView};
 
@@ -495,21 +497,23 @@ fn device(world: &Rc<World>, index: usize) -> FakeDevice {
 /// `LAYERS` blocks in the shape a pipeline partition cuts: one activation slot, one shared
 /// constant and one carried state pair per block, each block tagged with its layer.
 fn layered() -> (Graph, Arc<WeightStore>, Arc<WeightMap>) {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
-    let w = b.constant("w", TensorType::f32(vec![4]));
+    let b = Builder::for_tests();
+    let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
     let mut hidden = x;
     let mut state = Vec::new();
     for layer in 0..LAYERS {
         let _scope = b.layer_scope(layer);
-        let scaled = b.binary(BinOp::Mul, hidden, w);
-        let k_in = b.state_input(
-            &format!("k{layer}"),
-            TensorType::f32(vec![4]),
-            StateRole::Recurrent,
-        );
-        let k_out = b.binary(BinOp::Add, k_in, scaled);
-        hidden = b.binary(BinOp::Add, scaled, k_out);
+        let scaled = b.binary(BinOp::Mul, hidden, w).unwrap();
+        let k_in = b
+            .state_input(
+                &format!("k{layer}"),
+                TensorType::f32(vec![4]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let k_out = b.binary(BinOp::Add, k_in, scaled).unwrap();
+        hidden = b.binary(BinOp::Add, scaled, k_out).unwrap();
         state.push((k_in, k_out));
     }
     let g = b
@@ -529,7 +533,7 @@ fn layered() -> (Graph, Arc<WeightStore>, Arc<WeightMap>) {
         )
         .unwrap();
     let store = Arc::new(builder.build());
-    let mut names = poot_test_util::const_weights::ConstWeights::new(&store);
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
     let g = names.graph(&g);
     let map = Arc::new(names.map());
     (g, store, map)
@@ -563,8 +567,10 @@ fn pipeline(g: &Graph, devices: &[u32]) -> StagedProgram {
 
 /// A graph whose sole output is one named carried value: reads state through a production entry.
 fn state_probe(name: &str) -> Graph {
-    let b = Builder::new();
-    let state = b.state_input(name, TensorType::f32(vec![4]), StateRole::Recurrent);
+    let b = Builder::for_tests();
+    let state = b
+        .state_input(name, TensorType::f32(vec![4]), StateRole::Recurrent)
+        .unwrap();
     b.finish(poot_graph_ir::Outputs::new(state).with_state(&[(state, state)]))
         .unwrap()
 }
@@ -1151,12 +1157,20 @@ const INTER: usize = 16;
 fn tensor_mlp() -> (Graph, Arc<WeightStore>, Arc<WeightMap>) {
     let gate = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
     let down = WeightId::layer(0, WeightRole::Ffn(FfnRole::Down));
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![1, HIDDEN]));
-    let wg = b.constant(&gate.const_name(), TensorType::f32(vec![INTER, HIDDEN]));
-    let wd = b.constant(&down.const_name(), TensorType::f32(vec![HIDDEN, INTER]));
-    let hidden = b.matmul(x, b.transpose(wg, vec![1, 0]));
-    let y = b.matmul(hidden, b.transpose(wd, vec![1, 0]));
+    let b = Builder::for_tests();
+    let x = b
+        .slot(Slot::Activation, TensorType::f32(vec![1, HIDDEN]))
+        .unwrap();
+    let wg = b
+        .constant(&gate.const_name(), TensorType::f32(vec![INTER, HIDDEN]))
+        .unwrap();
+    let wd = b
+        .constant(&down.const_name(), TensorType::f32(vec![HIDDEN, INTER]))
+        .unwrap();
+    let hidden = b.matmul(x, b.transpose(wg, vec![1, 0]).unwrap()).unwrap();
+    let y = b
+        .matmul(hidden, b.transpose(wd, vec![1, 0]).unwrap())
+        .unwrap();
     let g = b.finish(y).unwrap();
 
     let entry = |rows: usize, cols: usize, seed: f32| {

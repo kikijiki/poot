@@ -29,6 +29,7 @@ use crate::components::moe::{self, MoeWeights};
 use crate::components::ple::{PleWeights, ple};
 use crate::components::standard::Step;
 use crate::model::LogitRows;
+use crate::model::TraceError;
 
 /// A full-attention layer's mixer: the gated GQA attention and the indexer that narrows it.
 #[derive(Debug)]
@@ -113,18 +114,23 @@ impl Weights {
 }
 
 /// The step's logits: `[rows, tokens, vocab]`, or the last token's under [`LogitRows::Last`].
-pub(super) fn trace_step(b: &Builder, step: &Step, w: &Weights, p: &Qwen4ExpParams) -> Traced {
+pub(super) fn trace_step(
+    b: &Builder,
+    step: &Step,
+    w: &Weights,
+    p: &Qwen4ExpParams,
+) -> Result<Traced, TraceError> {
     let hyper = &p.hyper;
-    let mut x = hyper.widen(b, w.embed.embed(b, step.tokens()));
+    let mut x = hyper.widen(b, w.embed.embed(b, step.tokens())?)?;
     for (l, layer) in w.layers.iter().enumerate() {
         let _scope = b.layer_scope(l);
         // The PLE reads the raw multi-stream state, before the layer's first gate.
         if let (Some(weights), Some(params)) = (&layer.ple, &p.ple[l]) {
-            x = b.binary(BinOp::Add, x, ple(b, step, l, x, weights, params));
+            x = b.binary(BinOp::Add, x, ple(b, step, l, x, weights, params)?)?;
         }
-        let (input, weights) = gated_residual::input(b, x, &layer.attn_gate, hyper);
+        let (input, weights) = gated_residual::input(b, x, &layer.attn_gate, hyper)?;
         let mixed = match &layer.mixer {
-            Mixer::Gdn(gdn_weights) => gdn(b, step, l, input, gdn_weights, &p.gdn),
+            Mixer::Gdn(gdn_weights) => gdn(b, step, l, input, gdn_weights, &p.gdn)?,
             Mixer::Full(full) => attention_selecting(
                 b,
                 step,
@@ -133,17 +139,17 @@ pub(super) fn trace_step(b: &Builder, step: &Step, w: &Weights, p: &Qwen4ExpPara
                 &full.attention,
                 &p.attention,
                 &|b, causal| qsa_mask(b, step, l, input, causal, &full.qsa, &p.qsa),
-            ),
+            )?,
         };
-        x = gated_residual::inject(b, x, mixed, weights);
-        let (input, weights) = gated_residual::input(b, x, &layer.mlp_gate, hyper);
-        let routed = moe::moe(b, step, l, input, None, &layer.moe, &p.moe);
-        x = gated_residual::inject(b, x, routed, weights);
+        x = gated_residual::inject(b, x, mixed, weights)?;
+        let (input, weights) = gated_residual::input(b, x, &layer.mlp_gate, hyper)?;
+        let routed = moe::moe(b, step, l, input, None, &layer.moe, &p.moe)?;
+        x = gated_residual::inject(b, x, routed, weights)?;
     }
     let tokens = step.shape().tokens.get();
     if step.shape().logits == LogitRows::Last && tokens > 1 {
-        x = b.slice(x, 1, tokens - 1, tokens);
+        x = b.slice(x, 1, tokens - 1, tokens)?;
     }
     w.head
-        .logits(b, gated_residual::collapse(b, x, &w.collapse, hyper))
+        .logits(b, gated_residual::collapse(b, x, &w.collapse, hyper)?)
 }

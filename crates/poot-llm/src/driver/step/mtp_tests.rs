@@ -9,12 +9,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use poot_executor::{BufferRole, Device, Dispatch, Engine};
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey};
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target};
-use poot_models::chat::ChatFormat;
+use poot_executor::{Device, Dispatch, Engine};
+use poot_graph_ir::{BinOp, Graph, Slot, SlotKey};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target, production_plan::Submission};
 use poot_models::components::standard::{Step, check_mtp_step};
 use poot_models::model::{
     FamilyKey, HiddenCarry, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
@@ -22,8 +21,10 @@ use poot_models::model::{
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::{DType, HostTensor};
+use poot_text::ChatFormat;
 
 use crate::core::sampler::Sampler;
 use crate::driver::block_table::BLOCK_SIZE;
@@ -31,7 +32,7 @@ use crate::driver::device_tests::{NO_EOS, fixture_text, nz, open, options};
 use crate::driver::error::{
     DriverError, EmbedsError, InvalidOptions, InvalidRequest, SpeculationRefusal, Unsupported,
 };
-use crate::driver::speculate::NotSpeculated;
+use crate::driver::speculate::{NotSpeculated, ProposalObserver};
 use crate::driver::step::PickPolicy;
 use crate::driver::tests::tiny_text;
 use crate::driver::{
@@ -99,58 +100,62 @@ impl Model for Toy {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         if self.kind == Kind::NoMtp && phase == Phase::Mtp {
             return Err(TraceError::PhaseUnsupported { family: TOY, phase });
         }
         check_mtp_step(TOY, phase, shape, TOY_CAPACITY)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let token = b.cast(
             b.guard_index_bounds(step.tokens(), TOY_VOCAB)
                 .expect("the step's ids are a rank-2 I32 tensor")
                 .guarded,
             DType::F32,
-        );
-        let seed = b.binary(BinOp::Add, token, b.cast(step.pos(), DType::F32));
-        let hidden = b.broadcast(b.reshape(seed, vec![rows, n, 1]), vec![rows, n, TOY_WIDTH]);
+        )?;
+        let seed = b.binary(BinOp::Add, token, b.cast(step.pos(), DType::F32)?)?;
+        let hidden = b.broadcast(b.reshape(seed, vec![rows, n, 1])?, vec![rows, n, TOY_WIDTH])?;
         let state = if phase == Phase::Mtp {
             let carry = step
-                .hidden_carry(&b, TOY_WIDTH)
+                .hidden_carry(&b, TOY_WIDTH)?
                 .expect("check_mtp_step requires the carry");
-            let read = step.carried_hidden(&b, &carry);
+            let read = step.carried_hidden(&b, &carry)?;
             if self.kind == Kind::RecurrentMtp {
-                let own = step.recurrent_state(&b, "toy.mtp", DType::F32, &[TOY_WIDTH]);
-                let last = b.slice(seed, 1, n - 1, n);
+                let own = step.recurrent_state(&b, "toy.mtp", DType::F32, &[TOY_WIDTH])?;
+                let last = b.slice(seed, 1, n - 1, n)?;
                 let folded = b.binary(
                     BinOp::Add,
                     own.current(),
-                    b.broadcast(last, vec![rows, TOY_WIDTH]),
-                );
-                step.carry_recurrent(&b, own, folded);
+                    b.broadcast(last, vec![rows, TOY_WIDTH])?,
+                )?;
+                step.carry_recurrent(&b, own, folded)?;
             }
-            let mixed = b.binary(BinOp::Add, read, hidden);
-            step.carry_last_hidden(&b, &carry, mixed);
+            let mixed = b.binary(BinOp::Add, read, hidden)?;
+            step.carry_last_hidden(&b, &carry, mixed)?;
             mixed
         } else {
             if self.kind == Kind::RecurrentTarget {
-                let own = step.recurrent_state(&b, "toy.target", DType::F32, &[TOY_WIDTH]);
-                let last = b.slice(seed, 1, n - 1, n);
+                let own = step.recurrent_state(&b, "toy.target", DType::F32, &[TOY_WIDTH])?;
+                let last = b.slice(seed, 1, n - 1, n)?;
                 let folded = b.binary(
                     BinOp::Add,
                     own.current(),
-                    b.broadcast(last, vec![rows, TOY_WIDTH]),
-                );
-                step.carry_recurrent(&b, own, folded);
+                    b.broadcast(last, vec![rows, TOY_WIDTH])?,
+                )?;
+                step.carry_recurrent(&b, own, folded)?;
             }
-            step.carry_hidden(&b, hidden);
+            step.carry_hidden(&b, hidden)?;
             hidden
         };
         let out = if shape.logits == LogitRows::All { n } else { 1 };
-        let column = b.slice(state, 2, 0, 1);
-        let logits = b.broadcast(b.slice(column, 1, n - out, n), vec![rows, out, TOY_VOCAB]);
-        Ok(step.finish(b, logits).unwrap())
+        let column = b.slice(state, 2, 0, 1)?;
+        let logits = b.broadcast(b.slice(column, 1, n - out, n)?, vec![rows, out, TOY_VOCAB])?;
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -298,7 +303,7 @@ fn toy_options(draft: DraftPolicy) -> DriverOptions {
         decode: compile,
         capacity: nz(TOY_CAPACITY),
         prefill_chunk: nz(BLOCK_SIZE),
-        max_trace_tokens: nz(BLOCK_SIZE),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(BLOCK_SIZE)),
         prepared: PreparedSetLimits {
             max_entries: nz(256),
             max_retained_bytes: NonZeroU64::new(1 << 40).unwrap(),
@@ -361,6 +366,25 @@ fn open_prefilled(driver: &mut Driver, prompt: &[u32], max_new: usize) -> (SeqId
     }
     driver.commit(seq, 1, &mut sampler).unwrap();
     (seq, reused)
+}
+
+/// Every proposal the driver's policy made, in order, as the observer was told them.
+type ProposalLog = Arc<Mutex<Vec<(SeqId, Vec<u32>)>>>;
+
+struct RecordProposals(ProposalLog);
+
+impl ProposalObserver for RecordProposals {
+    fn proposed(&mut self, seq: SeqId, drafts: &[u32]) {
+        self.0.lock().unwrap().push((seq, drafts.to_vec()));
+    }
+}
+
+/// Install a proposal recorder on `driver`; the oracle rows compare what was proposed, which no stat or
+/// event carries.
+fn log_proposals(driver: &mut Driver) -> ProposalLog {
+    let log = ProposalLog::default();
+    driver.speculation.observer = Some(Box::new(RecordProposals(Arc::clone(&log))));
+    log
 }
 
 fn decode(driver: &mut Driver, seq: SeqId, sampler: &mut Sampler) -> RowResult {
@@ -719,7 +743,9 @@ fn oracle_drafts(handle: &ModelHandle, tokens: &[u32], k: usize) -> Vec<u32> {
             logits: LogitRows::Last,
             hidden: Some(carry),
         };
-        let graph = model.trace(phase, shape).unwrap();
+        let graph = model
+            .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+            .unwrap();
         let graph = poot_graph_plan::bind_packed_weights(&graph, &formats).unwrap();
         let slots = [
             (
@@ -751,7 +777,7 @@ fn oracle_drafts(handle: &ModelHandle, tokens: &[u32], k: usize) -> Vec<u32> {
                 })
             })
             .collect();
-        let (logits, next) = poot_test_util::weight_map_oracle::eval_mapped(
+        let (logits, next) = poot_eval::test_support::weight_map_oracle::eval_mapped(
             &graph,
             handle.store(),
             model.weights(),
@@ -806,6 +832,7 @@ fn prepare(driver: &mut Driver, prompts: &[usize], layout: Layout, rows: &[NonZe
 /// recurrent row's state holds its folded kept prefix). `proposals` pairs each round's proposed
 /// drafts with the committed tokens it followed.
 fn serve(driver: &mut Driver, prompt: &[u32], sampler: &mut Sampler) -> Served {
+    let log = log_proposals(driver);
     prepare(
         driver,
         &[prompt.len()],
@@ -850,10 +877,9 @@ fn serve(driver: &mut Driver, prompt: &[u32], sampler: &mut Sampler) -> Served {
         if tokens.len() == NEW {
             break;
         }
-        let before = driver.speculation.proposed.len();
         first = decode(driver, seq, sampler);
-        for (_, drafts) in &driver.speculation.proposed[before..] {
-            proposals.push((committed.clone(), drafts.clone()));
+        for (_, drafts) in log.lock().unwrap().drain(..) {
+            proposals.push((committed.clone(), drafts));
         }
     }
     driver.release(seq, Release::Finished).unwrap();
@@ -996,6 +1022,7 @@ fn mtp_two_rows_equal_off(choice: BackendChoice) {
     });
     let rows = [nz(1), nz(2)];
     let serve_pair = |driver: &mut Driver| -> Pair {
+        let log = log_proposals(driver);
         prepare(driver, &[PROMPT.len(), OTHER_PROMPT.len()], layout, &rows);
         let mut seqs = Vec::new();
         for prompt in [&PROMPT[..], &OTHER_PROMPT[..]] {
@@ -1018,7 +1045,6 @@ fn mtp_two_rows_equal_off(choice: BackendChoice) {
         // Each proposal paired with the tokens its sequence had committed when it was made.
         let mut proposals = Vec::new();
         while out.iter().any(|tokens| tokens.len() < NEW) {
-            let logged = driver.speculation.proposed.len();
             let held: Vec<Vec<u32>> = (0..2)
                 .map(|i| prompts[i].iter().chain(&out[i]).copied().collect())
                 .collect();
@@ -1046,13 +1072,13 @@ fn mtp_two_rows_equal_off(choice: BackendChoice) {
             }
             let results = driver.step(&mut work).unwrap();
             drop(work);
-            for (seq, drafts) in &driver.speculation.proposed[logged..] {
+            for (seq, drafts) in log.lock().unwrap().drain(..) {
                 let i = seqs
                     .iter()
-                    .position(|(s, _)| s == seq)
+                    .position(|(s, _)| *s == seq)
                     .expect("a stepped row");
                 if !drafts.is_empty() {
-                    proposals.push((held[i].clone(), drafts.clone()));
+                    proposals.push((held[i].clone(), drafts));
                 }
             }
             for (&i, result) in live.iter().zip(results) {

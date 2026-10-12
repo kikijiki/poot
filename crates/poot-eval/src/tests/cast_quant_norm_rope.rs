@@ -10,6 +10,7 @@ use poot_tensor::HostTensor;
 use std::collections::HashMap;
 
 use super::helpers::*;
+use poot_graph_ir::test_support::graph_fixtures::i32_constant;
 use poot_test_util::{assert_close_rel, max_abs_error_f64};
 
 /// Card 045: `cast(x, BF16)` infers dtype BF16 (same shape) and rounds each value to bf16 precision
@@ -25,11 +26,15 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
         let bias = 0x7FFF + ((bits >> 16) & 1);
         f32::from_bits((bits.wrapping_add(bias)) & 0xFFFF_0000)
     };
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![6]));
-    let y = b.cast(x, DType::BF16);
-    assert_eq!(b.aval(y).dtype, DType::BF16, "cast retypes to BF16");
-    assert_eq!(b.aval(y).shape, vec![6], "cast keeps the shape");
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![6])).unwrap();
+    let y = b.cast(x, DType::BF16).unwrap();
+    assert_eq!(
+        b.aval(y).unwrap().dtype,
+        DType::BF16,
+        "cast retypes to BF16"
+    );
+    assert_eq!(b.aval(y).unwrap().shape, vec![6], "cast keeps the shape");
     let g = b.finish(y).unwrap();
     let vals = vec![1.0f32, 0.1, 3.13159, -2.73828, 12345.678, 1e-7];
     let mut inputs = HashMap::new();
@@ -59,10 +64,12 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
     }
 
     // cast to F32 (widening) is the identity.
-    let b2 = Builder::new();
-    let x2 = b2.constant("x", TensorType::new(vec![3], DType::BF16));
-    let y2 = b2.cast(x2, DType::F32);
-    assert_eq!(b2.aval(y2).dtype, DType::F32);
+    let b2 = Builder::for_tests();
+    let x2 = b2
+        .constant("x", TensorType::new(vec![3], DType::BF16))
+        .unwrap();
+    let y2 = b2.cast(x2, DType::F32).unwrap();
+    assert_eq!(b2.aval(y2).unwrap().dtype, DType::F32);
     let g2 = b2.finish(y2).unwrap();
     let mut in2 = HashMap::new();
     in2.insert(
@@ -85,11 +92,11 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
 #[test]
 fn cast_f32_to_f16_rounds_and_infers_dtype() {
     let ref_f16 = |f: f32| poot_quant::scalar::f16_to_f32(poot_quant::scalar::f32_to_f16(f));
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![6]));
-    let y = b.cast(x, DType::F16);
-    assert_eq!(b.aval(y).dtype, DType::F16, "cast retypes to F16");
-    assert_eq!(b.aval(y).shape, vec![6], "cast keeps the shape");
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![6])).unwrap();
+    let y = b.cast(x, DType::F16).unwrap();
+    assert_eq!(b.aval(y).unwrap().dtype, DType::F16, "cast retypes to F16");
+    assert_eq!(b.aval(y).unwrap().shape, vec![6], "cast keeps the shape");
     let g = b.finish(y).unwrap();
     let vals = vec![1.0f32, 0.1, 3.13159, -2.73828, 1234.5, 1e-5];
     let mut inputs = HashMap::new();
@@ -113,10 +120,12 @@ fn cast_f32_to_f16_rounds_and_infers_dtype() {
     }
 
     // cast to F32 (widening) is the identity.
-    let b2 = Builder::new();
-    let x2 = b2.constant("x", TensorType::new(vec![3], DType::F16));
-    let y2 = b2.cast(x2, DType::F32);
-    assert_eq!(b2.aval(y2).dtype, DType::F32);
+    let b2 = Builder::for_tests();
+    let x2 = b2
+        .constant("x", TensorType::new(vec![3], DType::F16))
+        .unwrap();
+    let y2 = b2.cast(x2, DType::F32).unwrap();
+    assert_eq!(b2.aval(y2).unwrap().dtype, DType::F32);
     let g2 = b2.finish(y2).unwrap();
     let mut in2 = HashMap::new();
     in2.insert(
@@ -140,11 +149,19 @@ fn cast_f32_to_f16_rounds_and_infers_dtype() {
 /// and GPU kernels that store f16 on write; otherwise results diverge by up to 1 f16 ULP.
 #[test]
 fn matmul_f16_output_narrows_the_accumulator() {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::new(vec![1, 2, 3], DType::F16));
-    let w = b.constant("w", TensorType::new(vec![3, 2], DType::F16));
-    let mm = b.matmul(a, w);
-    assert_eq!(b.aval(mm).dtype, DType::F16, "matmul keeps the F16 dtype");
+    let b = Builder::for_tests();
+    let a = b
+        .constant("a", TensorType::new(vec![1, 2, 3], DType::F16))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![3, 2], DType::F16))
+        .unwrap();
+    let mm = b.matmul(a, w).unwrap();
+    assert_eq!(
+        b.aval(mm).unwrap().dtype,
+        DType::F16,
+        "matmul keeps the F16 dtype"
+    );
     let g = b.finish(mm).unwrap();
     let mut inputs = HashMap::new();
     inputs.insert(
@@ -197,14 +214,14 @@ fn pack_unpack_i8_graph_round_trips() {
 
     let rows = 3usize;
     let cols = 10usize; // not a multiple of 4 -> the tail word zero-pads.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![rows, cols]));
-    let packed = b.pack_i8(x);
-    let unpacked = b.unpack_i8(packed, cols);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![rows, cols])).unwrap();
+    let packed = b.pack_i8(x).unwrap();
+    let unpacked = b.unpack_i8(packed, cols).unwrap();
     // the packed value is I32 with last dim ceil(10/4) = 3.
-    assert_eq!(b.aval(packed).dtype, DType::I32);
-    assert_eq!(b.aval(packed).shape, vec![rows, cols.div_ceil(4)]);
-    assert_eq!(b.aval(unpacked).dtype, DType::F32);
+    assert_eq!(b.aval(packed).unwrap().dtype, DType::I32);
+    assert_eq!(b.aval(packed).unwrap().shape, vec![rows, cols.div_ceil(4)]);
+    assert_eq!(b.aval(unpacked).unwrap().dtype, DType::F32);
     let xi = x.id();
 
     // codes in [-127, 127], including the extremes and negatives.
@@ -228,9 +245,9 @@ fn pack_unpack_i8_graph_round_trips() {
     assert_eq!(packed_t.shape(), vec![rows, cols.div_ceil(4)]);
 
     // round-trip via a fresh graph (the builder consumed `packed` into gp).
-    let b2 = Builder::new();
-    let x2 = b2.constant("x", TensorType::f32(vec![rows, cols]));
-    let rt = b2.unpack_i8(b2.pack_i8(x2), cols);
+    let b2 = Builder::for_tests();
+    let x2 = b2.constant("x", TensorType::f32(vec![rows, cols])).unwrap();
+    let rt = b2.unpack_i8(b2.pack_i8(x2).unwrap(), cols).unwrap();
     let x2i = x2.id();
     let g = b2.finish(rt).unwrap();
     let mut in2 = HashMap::new();
@@ -260,11 +277,15 @@ fn packed_i8_survives_copy_ops_in_eval() {
         .collect();
 
     // gather: pack -> gather(axis 0, reverse permutation) -> unpack must give the reverse-row-permuted codes.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![rows, cols]));
-    let packed = b.pack_i8(x);
-    let idx = b.constant("idx", TensorType::new(vec![rows], DType::I32));
-    let rt = b.unpack_i8(b.gather(packed, 0, idx), cols);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![rows, cols])).unwrap();
+    let packed = b.pack_i8(x).unwrap();
+    let idx = b
+        .constant("idx", TensorType::new(vec![rows], DType::I32))
+        .unwrap();
+    let rt = b
+        .unpack_i8(b.gather(packed, 0, idx).unwrap(), cols)
+        .unwrap();
     let (xi, ii) = (x.id(), idx.id());
     let g = b.finish(rt).unwrap();
     let mut inputs = HashMap::new();
@@ -294,12 +315,12 @@ fn packed_i8_survives_copy_ops_in_eval() {
     }
 
     // transpose: pack -> transpose -> transpose-back -> unpack must round-trip exactly.
-    let b2 = Builder::new();
-    let x2 = b2.constant("x", TensorType::f32(vec![rows, cols]));
-    let p = b2.pack_i8(x2); // [rows, w] i32
-    let t = b2.transpose(p, vec![1, 0]); // [w, rows]
-    let back = b2.transpose(t, vec![1, 0]); // [rows, w]
-    let rt2 = b2.unpack_i8(back, cols);
+    let b2 = Builder::for_tests();
+    let x2 = b2.constant("x", TensorType::f32(vec![rows, cols])).unwrap();
+    let p = b2.pack_i8(x2).unwrap(); // [rows, w] i32
+    let t = b2.transpose(p, vec![1, 0]).unwrap(); // [w, rows]
+    let back = b2.transpose(t, vec![1, 0]).unwrap(); // [rows, w]
+    let rt2 = b2.unpack_i8(back, cols).unwrap();
     let x2i = x2.id();
     let g2 = b2.finish(rt2).unwrap();
     let mut in2 = HashMap::new();
@@ -323,13 +344,13 @@ fn packed_i8_survives_copy_ops_in_eval() {
 fn layernorm_matches_direct() {
     // spec 049: LayerNorm = (x - mean)/sqrt(var + eps) * w + b over the last axis, vs a direct computation.
     use poot_graph_ir::ops::layernorm;
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let n = 16usize;
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::f32(vec![n]));
-    let bias = b.constant("b", TensorType::f32(vec![n]));
+    let x = b.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![n])).unwrap();
+    let bias = b.constant("b", TensorType::f32(vec![n])).unwrap();
     let eps = 1e-6f32;
-    let out = layernorm(&b, x, w, bias, eps);
+    let out = layernorm(&b, x, w, bias, eps).unwrap();
     let (xi, wi, bi) = (x.id(), w.id(), bias.id());
     let g = b.finish(out).unwrap();
 
@@ -360,12 +381,12 @@ fn layernorm_matches_direct() {
 
 #[test]
 fn rmsnorm_matches_direct() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let n = 16usize;
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::f32(vec![n]));
+    let x = b.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![n])).unwrap();
     let eps = 1e-6f32;
-    let out = rmsnorm(&b, x, w, eps);
+    let out = rmsnorm(&b, x, w, eps).unwrap();
     let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out).unwrap();
 
@@ -401,10 +422,10 @@ fn rmsnorm_and_layernorm_stay_accurate_at_real_hidden_dim_with_outlier_channels(
     let wd: Vec<f32> = fill(n, 42).iter().map(|v| v * 0.5 + 1.0).collect(); // weights near 1.0
 
     // RMSNorm.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::f32(vec![n]));
-    let out = rmsnorm(&b, x, w, eps);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![n])).unwrap();
+    let out = rmsnorm(&b, x, w, eps).unwrap();
     let (xi, wi) = (x.id(), w.id());
     let g = b.finish(out).unwrap();
     let mut inputs = HashMap::new();
@@ -431,11 +452,11 @@ fn rmsnorm_and_layernorm_stay_accurate_at_real_hidden_dim_with_outlier_channels(
 
     // LayerNorm (same activations/eps; also has a bias vector).
     let bd: Vec<f32> = fill(n, 43).iter().map(|v| v * 0.1).collect();
-    let bl = Builder::new();
-    let xl = bl.constant("x", TensorType::f32(vec![1, 1, n]));
-    let wl = bl.constant("w", TensorType::f32(vec![n]));
-    let bias = bl.constant("b", TensorType::f32(vec![n]));
-    let outl = layernorm(&bl, xl, wl, bias, eps);
+    let bl = Builder::for_tests();
+    let xl = bl.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let wl = bl.constant("w", TensorType::f32(vec![n])).unwrap();
+    let bias = bl.constant("b", TensorType::f32(vec![n])).unwrap();
+    let outl = layernorm(&bl, xl, wl, bias, eps).unwrap();
     let (xli, wli, bli) = (xl.id(), wl.id(), bias.id());
     let gl = bl.finish(outl).unwrap();
     let mut inl = HashMap::new();
@@ -474,11 +495,11 @@ fn rmsnorm_and_layernorm_stay_accurate_at_real_hidden_dim_with_outlier_channels(
 
 #[test]
 fn swiglu_matches_direct() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let n = 16usize;
-    let gate = b.constant("gate", TensorType::f32(vec![1, 1, n]));
-    let up = b.constant("up", TensorType::f32(vec![1, 1, n]));
-    let out = swiglu(&b, gate, up);
+    let gate = b.constant("gate", TensorType::f32(vec![1, 1, n])).unwrap();
+    let up = b.constant("up", TensorType::f32(vec![1, 1, n])).unwrap();
+    let out = swiglu(&b, gate, up).unwrap();
     let (gi, ui) = (gate.id(), up.id());
     let g = b.finish(out).unwrap();
 
@@ -504,14 +525,18 @@ fn swiglu_matches_direct() {
 #[test]
 fn rope_matches_direct() {
     // single head, D=8, pos=3.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let d = 8usize;
     let max_pos = 16usize;
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let out = rope(&b, x, cos, sin, pos);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
+    let out = rope(&b, x, cos, sin, pos).unwrap();
     let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
     let g = b.finish(out).unwrap();
 
@@ -558,14 +583,18 @@ fn rope_matches_direct() {
 fn rope_partial_matches_direct() {
     // phi3 partial rotary: head_dim D=8 but only the first ROT=4 dims rotate; [4,8) pass through.
     // The cos/sin tables are ROT-wide ([max_pos, 4]); the op infers the rotary width from them.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (d, rot) = (8usize, 4usize);
     let max_pos = 16usize;
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, rot]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, rot]));
-    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let out = rope(&b, x, cos, sin, pos);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, rot]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, rot]))
+        .unwrap();
+    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
+    let out = rope(&b, x, cos, sin, pos).unwrap();
     let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
     let g = b.finish(out).unwrap();
 
@@ -622,9 +651,9 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
     use crate::{CastFault, CastOperand, EvalError};
 
     // Cast(I32, F32) of 16_777_217 (one past F32_EXACT_I32_MAX).
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let x = i32_constant(&b, "x", vec![2]).unwrap();
-    let y = b.cast(x, poot_tensor::DType::F32);
+    let y = b.cast(x, poot_tensor::DType::F32).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
@@ -647,9 +676,9 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
     assert_eq!(to, poot_tensor::DType::F32);
 
     // Cast(F32, I32) of a non-integer value.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2]));
-    let y = b.cast(x, poot_tensor::DType::I32);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2])).unwrap();
+    let y = b.cast(x, poot_tensor::DType::I32).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
@@ -665,9 +694,9 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
     );
 
     // Cast(F32, I32) of NaN.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1]));
-    let y = b.cast(x, poot_tensor::DType::I32);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1])).unwrap();
+    let y = b.cast(x, poot_tensor::DType::I32).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
@@ -684,9 +713,9 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
     assert!(got.is_nan(), "{got}");
 
     // Cast(I32, I8) of a value outside -128..=127.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let x = i32_constant(&b, "x", vec![2]).unwrap();
-    let y = b.cast(x, poot_tensor::DType::I8);
+    let y = b.cast(x, poot_tensor::DType::I8).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
@@ -715,9 +744,9 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
 #[test]
 fn cast_table_literal_bits_sc002() {
     fn cast_bits(from: DType, to: DType, bits: u32) -> u32 {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![1], from));
-        let y = b.cast(x, to);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::new(vec![1], from)).unwrap();
+        let y = b.cast(x, to).unwrap();
         let g = b.finish(y).unwrap();
         let inputs = HashMap::from([(
             x.id(),
@@ -762,9 +791,11 @@ fn cast_table_literal_bits_sc002() {
     // against `poot_quant::scalar` directly: that would pin only the codec, not the cast table's own
     // routing to it.
     let decode_via_cast = |byte: u8| -> f32 {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![1], DType::E4M3FN));
-        let y = b.cast(x, DType::F32);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![1], DType::E4M3FN))
+            .unwrap();
+        let y = b.cast(x, DType::F32).unwrap();
         let g = b.finish(y).unwrap();
         let inputs = HashMap::from([(
             x.id(),
@@ -781,9 +812,9 @@ fn cast_table_literal_bits_sc002() {
     assert_eq!(decode_via_cast(0x7E), 448.0);
     assert!(decode_via_cast(0x7F).is_nan());
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1]));
-    let y = b.cast(x, DType::E4M3FN);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1])).unwrap();
+    let y = b.cast(x, DType::E4M3FN).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(
         x.id(),
@@ -798,9 +829,9 @@ fn cast_table_literal_bits_sc002() {
     assert_eq!(encoded.view().bytes(), [0x7E]);
 
     // I32 127 -> I8 127: the carded literal row for the existing X3 range-checked widen.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let x = i32_constant(&b, "x", vec![1]).unwrap();
-    let y = b.cast(x, DType::I8);
+    let y = b.cast(x, DType::I8).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(x.id(), Value::from(HostTensor::i32(vec![1], vec![127])))]);
     let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))

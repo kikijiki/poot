@@ -19,7 +19,6 @@ use poot_quant::weights::{
     WeightRole, WeightStore, WeightView,
 };
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{Field, Fields};
 use crate::components::ffn::{PlainMlpWeights, relu2_mlp};
@@ -32,6 +31,7 @@ use crate::model::{
     TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 pub const FAMILY: FamilyKey = FamilyKey::new("nemotron_h");
 
@@ -366,11 +366,10 @@ impl Model for NemotronH {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(
             &b,
             &step,
@@ -379,15 +378,15 @@ impl Model for NemotronH {
             p.kinds.len(),
             |b, l, x| {
                 let layer = &self.layers[l];
-                let h = norm(b, x, &layer.norm, p.norm);
+                let h = norm(b, x, &layer.norm, p.norm)?;
                 let y = match &layer.mixer {
-                    Mixer::Mamba(w) => mamba2(b, &step, l, h, w, &p.mamba),
-                    Mixer::Attention(w) => attention(b, &step, l, h, w, &p.attention),
-                    Mixer::Mlp(w) => relu2_mlp(b, h, w),
+                    Mixer::Mamba(w) => mamba2(b, &step, l, h, w, &p.mamba)?,
+                    Mixer::Attention(w) => attention(b, &step, l, h, w, &p.attention)?,
+                    Mixer::Mlp(w) => relu2_mlp(b, h, w)?,
                 };
-                b.binary(BinOp::Add, x, y)
+                Ok::<_, TraceError>(b.binary(BinOp::Add, x, y)?)
             },
-        );
+        )?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -419,7 +418,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The tensors of a Nemotron-H checkpoint of `config`, by HF name.
 pub(crate) fn hf_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, w, inter) = (n("vocab_size"), n("hidden_size"), n("intermediate_size"));
     let (heads, hd, state, groups, kernel) = (
         n("mamba_num_heads"),
@@ -522,7 +521,11 @@ mod tests {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
         let g = model
-            .trace(Phase::Decode, step_shape(1, CAP, LogitRows::Last))
+            .trace(
+                Phase::Decode,
+                step_shape(1, CAP, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let names: Vec<String> = g
             .state()
@@ -557,7 +560,13 @@ mod tests {
             rows: std::num::NonZeroUsize::new(2).unwrap(),
             ..step_shape(3, CAP, LogitRows::All)
         };
-        let g = model.trace(Phase::Prefill, shape).unwrap();
+        let g = model
+            .trace(
+                Phase::Prefill,
+                shape,
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         let g = bind_packed_weights(&g, &WeightFormats::from_weight_map(model.weights())).unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()

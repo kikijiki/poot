@@ -5,8 +5,10 @@
 //!
 //! Depends on std only.
 
+mod roofline;
 mod timing;
+pub use roofline::{Ceiling, Fit, GB, Roofline};
 pub use timing::{
-    Coverage, DeviceCoverage, DeviceWindow, DispatchTiming, EntryCounters, HostTiming, Mark,
-    MeasuredDevice, OpBucket, Report, StepTiming, TimingSnapshot, WindowReport,
+    DeviceCoverage, DeviceWindow, DispatchTiming, EntryCounters, HostTiming, Mark, MeasuredDevice,
+    OpBucket, Report, StepTiming, TimingSnapshot, WindowReport,
 };

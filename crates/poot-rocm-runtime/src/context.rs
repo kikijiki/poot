@@ -1,4 +1,17 @@
-use crate::*;
+use crate::aql::DeviceRingReceiptProvenance;
+use crate::bindings::{
+    HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED, HSA_AMD_MEMORY_POOL_LOCATION_CPU,
+    hsa_agent_t, hsa_amd_memory_pool_t, hsa_queue_t,
+};
+use crate::buffer::Pool;
+use crate::error::check;
+use crate::owner::HsaRuntimeOwner;
+use crate::queue::{QueueLayout, QueueRingProvenance, QueueRole, take_queue_reference};
+use crate::{RocmBuffer, RocmError, bindings, ffi, publication};
+use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot};
+use std::ffi::c_void;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 /// Card 125 (spec 120 FR-004/SC-004): whether a host<->device transfer into/out of
 /// [`RocmContext::fine_pool`] (where every buffer + kernarg lives) can use a raw CPU pointer write or
@@ -25,7 +38,7 @@ pub enum UploadStrategy {
 /// doc on the coarse/fine-alias pair). Plain `FINE_GRAINED` on a GPU-located pool only guarantees
 /// device coherency and does not imply the pointer is valid in the host address space: CDNA's
 /// coherent multi-GPU fabric can mark VRAM `FINE_GRAINED` without it being host-mappable.
-pub fn upload_strategy_for_pool(location: u32, flags: u32) -> UploadStrategy {
+pub(crate) fn upload_strategy_for_pool(location: u32, flags: u32) -> UploadStrategy {
     let host_visible = location == HSA_AMD_MEMORY_POOL_LOCATION_CPU
         || flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED != 0;
     if host_visible {
@@ -211,7 +224,7 @@ pub(crate) struct DeviceTiming {
 
 /// `POOT_REQUIRE_ROCM=1` turns the "no ROCm device -> tests skip cleanly" convention into a loud
 /// failure: a failed context open panics instead of returning the Err that skip guards convert into a
-/// silent PASS (`just test-device-rocm` sets it). Mirrors `poot-runtime::require_gpu_check`.
+/// silent PASS (`just test-device-rocm` sets it). Mirrors `poot-wgpu-runtime::require_gpu_check`.
 pub(crate) fn require_gpu_check<E: std::fmt::Display>(e: E) -> E {
     require_gpu_check_with(|name| std::env::var(name).ok(), e)
 }
@@ -460,18 +473,6 @@ impl TimeoutLeaks {
             destroy(queue);
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn abandoned(&self) -> std::sync::MutexGuard<'_, Vec<Abandoned>> {
-        self.abandoned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retired_queues(&self) -> &[*mut hsa_queue_t] {
-        &self.queues
-    }
 }
 
 impl Drop for TimeoutLeaks {
@@ -706,5 +707,22 @@ mod caps_tests {
             DeviceCaps::rocm_default().max_buffer_bytes
         );
         assert_eq!(caps.compute_units, DeviceCaps::rocm_default().compute_units);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl TimeoutLeaks {
+        pub(crate) fn abandoned(&self) -> std::sync::MutexGuard<'_, Vec<Abandoned>> {
+            self.abandoned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        pub(crate) fn retired_queues(&self) -> &[*mut hsa_queue_t] {
+            &self.queues
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! Typed exact-value carrier: BF16/F32 checkpoint owner views, the exact-I32 word view, and the one
+//! Typed exact-value carrier: the exact BF16 word view, the exact-I32 word view, and the one
 //! `ExactValue` enum every walk path over a non-f32-tensor carrier matches on.
 
 use poot_tensor::DType;
@@ -6,12 +6,11 @@ use std::sync::Arc;
 
 use crate::EvalError;
 use crate::exact_bf16::ExactBf16TensorView;
-use crate::exact_dense::{DenseOwnerTensorView, ExactDenseError};
 use poot_tensor::HostTensor;
 
-/// Row-major authoritative I32 words (spec 048): a checkpoint-derived or equation-derived view, never
+/// Row-major authoritative I32 words (spec 048): an equation-derived or caller-bound view, never
 /// the lossy `i32 as f32` mirror. Moved here from the deleted `exact_i32.rs`: the walk's
-/// I32 handling is one path over `Value::Host`/`Value::Owner(ExactValue::I32)` (`operand.rs`), not a
+/// I32 handling is one path over `Value::Host`/`Value::Exact(ExactValue::I32)` (`operand.rs`), not a
 /// separate lane.
 #[derive(Clone, Debug)]
 pub struct ExactI32TensorView {
@@ -76,7 +75,7 @@ impl ExactI32TensorView {
 ///
 /// fn admits(value: &ExactValue) -> bool {
 ///     match value {
-///         ExactValue::Dense(_) | ExactValue::I32(_) => true,
+///         ExactValue::Bf16(_) | ExactValue::I32(_) => true,
 ///         _ => false,
 ///     }
 /// }
@@ -89,15 +88,14 @@ impl ExactI32TensorView {
 ///
 /// fn admits(value: &ExactValue) -> bool {
 ///     match value {
-///         ExactValue::Dense(_) | ExactValue::I32(_) => true,
-///         ExactValue::Bf16(_) => false,
+///         ExactValue::Bf16(_) => true,
+///         ExactValue::I32(_) => false,
 ///     }
 /// }
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ExactValue {
-    Dense(DenseOwnerTensorView),
     Bf16(ExactBf16TensorView),
     I32(ExactI32TensorView),
 }
@@ -107,7 +105,6 @@ impl Eq for ExactValue {}
 impl ExactValue {
     pub fn dtype(&self) -> DType {
         match self {
-            Self::Dense(view) => view.dtype(),
             Self::Bf16(_) => DType::BF16,
             Self::I32(_) => DType::I32,
         }
@@ -115,7 +112,6 @@ impl ExactValue {
 
     pub fn shape(&self) -> &[usize] {
         match self {
-            Self::Dense(view) => view.shape(),
             Self::Bf16(view) => view.shape(),
             Self::I32(view) => view.shape(),
         }
@@ -123,7 +119,6 @@ impl ExactValue {
 
     pub fn numel(&self) -> usize {
         match self {
-            Self::Dense(view) => view.numel(),
             Self::Bf16(view) => view.numel(),
             Self::I32(view) => view.numel(),
         }
@@ -131,7 +126,6 @@ impl ExactValue {
 
     pub fn physical_bytes(&self) -> usize {
         match self {
-            Self::Dense(view) => view.source_byte_len(),
             Self::Bf16(view) => view.physical_bytes(),
             Self::I32(view) => view.numel().saturating_mul(std::mem::size_of::<i32>()),
         }
@@ -142,33 +136,10 @@ impl ExactValue {
     /// [`ExactI32TensorView::i32_words`].
     ///
     /// Do not call this from `Gather`'s data operand or any site whose source may be a large
-    /// checkpoint table read by few rows: it decodes the whole source (Qwen3.5's `embed.weight` is
-    /// 248,320 x 5,120, ~5GB as F32). `ops::gather::gather_owner` exists for that case.
+    /// table read by few rows: it decodes the whole source (Qwen3.5's `embed.weight` is
+    /// 248,320 x 5,120, ~5GB as F32). The Spec 376 `Bf16Equation::Gather` reads the words lazily.
     pub(crate) fn materialize_dense(&self) -> HostTensor {
         match self {
-            Self::Dense(view) => {
-                let numel: usize = view.shape().iter().product();
-                let data: Vec<f32> = match view.dtype() {
-                    DType::BF16 => {
-                        let bf16 = ExactBf16TensorView::from_owner_view(view).expect(
-                            "DenseOwnerTensorView::new only ever pairs dtype BF16 with an owner of \
-                             ExactSourceKind::Bf16",
-                        );
-                        (0..numel).map(|flat| bf16.value(flat)).collect()
-                    }
-                    DType::F32 => view
-                        .bytes()
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|word| f32::from_le_bytes(*word))
-                        .collect(),
-                    other => unreachable!(
-                        "DenseOwnerTensorView::new only admits BF16 or F32, got {other:?}"
-                    ),
-                };
-                HostTensor::f32(view.shape().to_vec(), data)
-            }
             Self::Bf16(view) => {
                 let data: Vec<f32> = (0..view.numel()).map(|flat| view.value(flat)).collect();
                 HostTensor::f32(view.shape().to_vec(), data)
@@ -186,13 +157,6 @@ impl ExactValue {
             HostTensor::bf16(view.shape().to_vec(), words)
         };
         match self {
-            Self::Dense(view) if view.dtype() == DType::BF16 => {
-                bf16_words(&ExactBf16TensorView::from_owner_view(view).expect(
-                    "DenseOwnerTensorView::new only ever pairs dtype BF16 with an owner of \
-                     ExactSourceKind::Bf16",
-                ))
-            }
-            Self::Dense(_) => self.materialize_dense(),
             Self::Bf16(view) => bf16_words(view),
             Self::I32(_) => unreachable!("materialize_stored is never called for ExactValue::I32"),
         }
@@ -200,7 +164,6 @@ impl ExactValue {
 
     pub(crate) fn reshape(&self, shape: Vec<usize>) -> Result<Self, EvalError> {
         match self {
-            Self::Dense(view) => view.reshape(shape).map(Self::Dense).map_err(Into::into),
             Self::Bf16(view) => view.reshape(shape).map(Self::Bf16).map_err(Into::into),
             // A view over authoritative words: the word allocation is shared, so this is a metadata
             // relabel, not a re-materialization (card 383).
@@ -208,18 +171,17 @@ impl ExactValue {
         }
     }
 
-    /// `Transpose` of an exact value: only a BF16 owner/derived view supports it (the Spec 376 table);
-    /// an I32 or dense-owner carrier has no permuted-stride form.
+    /// `Transpose` of an exact value: only a BF16 view supports it (the Spec 376 table);
+    /// an I32 carrier has no permuted-stride form.
     pub(crate) fn transpose(&self, perm: &[usize]) -> Result<crate::Value, EvalError> {
         match self {
-            Self::Bf16(view) => Ok(crate::Value::Owner(Self::Bf16(view.transpose(perm)))),
-            Self::Dense(_) | Self::I32(_) => Err(self.unsupported("Transpose")),
+            Self::Bf16(view) => Ok(crate::Value::Exact(Self::Bf16(view.transpose(perm)))),
+            Self::I32(_) => Err(self.unsupported("Transpose")),
         }
     }
 
     pub(crate) fn unsupported(&self, consumer: &'static str) -> EvalError {
         match self {
-            Self::Dense(_) => ExactDenseError::ClosedSurface { consumer }.into(),
             Self::Bf16(_) => {
                 EvalError::unsupported(consumer, "exact BF16 carrier does not support this op")
             }
@@ -227,12 +189,6 @@ impl ExactValue {
                 EvalError::unsupported(consumer, "exact I32 carrier does not support this op")
             }
         }
-    }
-}
-
-impl From<DenseOwnerTensorView> for ExactValue {
-    fn from(value: DenseOwnerTensorView) -> Self {
-        Self::Dense(value)
     }
 }
 

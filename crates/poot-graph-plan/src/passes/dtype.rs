@@ -1,4 +1,4 @@
-use super::*;
+use super::{EditError, Eqn, Graph, OpKind, Operand, dce, with_eqns};
 use poot_graph_ir::ValueTable;
 
 /// A `Transpose` is a pure data no-op (the row-major flat buffer is unchanged) iff its non-unit input dims
@@ -29,6 +29,13 @@ pub(crate) fn transpose_is_noop(in_shape: &[usize], perm: &[usize]) -> bool {
 /// (and the `transpose -> reshape` on the output) becomes `reshape -> reshape` once the no-op transpose
 /// is a reshape, in every layer. Reshapes are free buffer aliases, so this removes no dispatches; it
 /// cuts node count, and so the per-token host capture/plan work, on the launch-bound decode path.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn collapse_reshape_chains(g: &Graph) -> Result<Graph, EditError> {
     let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
     for (i, e) in g.eqns().iter().enumerate() {
@@ -76,6 +83,13 @@ pub fn collapse_reshape_chains(g: &Graph) -> Result<Graph, EditError> {
 /// dispatch) where a `Transpose` is a Compute dispatch, so this cuts launch overhead on the
 /// launch-bound wgpu decode (the seq-1 attention transposes move no data). Shape- and
 /// value-preserving, so it composes anywhere.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn elide_noop_transposes(g: &Graph) -> Result<Graph, EditError> {
     let eqns: Vec<Eqn> = g
         .eqns()

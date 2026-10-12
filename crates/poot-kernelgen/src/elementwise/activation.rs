@@ -1,13 +1,16 @@
-use super::*;
+use super::{
+    Alloc, BasicBlock, BinOp, BlockId, Body, FusedScalarOp, IndexAxis, Place, Rvalue, Statement,
+    Terminator, Ty, copy, elem, emit_scalar_op, guard, ld, local, slice_dtype,
+};
 
 /// Hyperbolic tangent in storage dtype `dt`, computing in f32; the shared [`FusedScalarOp::Tanh`]
 /// expansion.
-pub fn tanh_dt(name: &str, dt: Ty) -> Body {
+pub(crate) fn tanh_dt(name: &str, dt: Ty) -> Body {
     scalar_expansion_dt(name, dt, FusedScalarOp::Tanh)
 }
 
 /// Error function in storage dtype `dt`, computing in f32; the shared [`FusedScalarOp::Erf`] expansion.
-pub fn erf_dt(name: &str, dt: Ty) -> Body {
+pub(crate) fn erf_dt(name: &str, dt: Ty) -> Body {
     scalar_expansion_dt(name, dt, FusedScalarOp::Erf)
 }
 

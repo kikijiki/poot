@@ -4,17 +4,12 @@
 //! group-limited selection by the sum of each group's two best biased scores, the selected
 //! unbiased scores renormalized (`norm_topk_prob`) and scaled by `routed_scaling_factor`.
 
-#[cfg(test)]
-use poot_graph_ir::ops::sigmoid;
-#[cfg(test)]
-use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced};
-
 use super::deepseek2::{Kind, Scoring, build_family, hf_shapes};
 use crate::model::{FamilyKey, Model, ModelError};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_quant::weights::WeightStore;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("deepseek3");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek3");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -86,110 +81,12 @@ fn fixture() -> Fixture {
 
 // ---- test references ---------------------------------------------------------------------------
 
-/// DeepSeek-V3's routed-expert gate (`topk_method: "noaux_tc"`, `scoring_func: "sigmoid"`, with
-/// group-limited routing) and the rank-ordered expert ids: the independent reference the router
-/// component's sigmoid arm is compared against. The family itself routes through
-/// `components::router`.
 #[cfg(test)]
-pub(crate) fn deepseek3_router_gate_and_ids(
-    b: &Builder,
-    logits: Traced,
-    bias: Traced,
-    k: usize,
-    n_group: usize,
-    topk_group: usize,
-    routed_scaling_factor: f32,
-) -> (Traced, Traced) {
-    let (p, rank) = deepseek3_router_rank(b, logits, bias, n_group, topk_group);
-    let ids = b.arg_top_k(rank, k);
-    (
-        deepseek3_router_weights(b, p, rank, k, routed_scaling_factor),
-        ids,
-    )
-}
-
-/// The router's unbiased sigmoid scores and the stable rank of the group-masked biased scores.
-#[cfg(test)]
-fn deepseek3_router_rank(
-    b: &Builder,
-    logits: Traced,
-    bias: Traced,
-    n_group: usize,
-    topk_group: usize,
-) -> (Traced, Traced) {
-    let shape = b.aval(logits).shape;
-    let e = *shape.last().expect("router logits have an expert axis");
-    let last = shape.len() - 1;
-    assert!(
-        n_group > 0 && e.is_multiple_of(n_group),
-        "n_routed_experts ({e}) must be evenly divisible by n_group ({n_group})"
-    );
-    let group_size = e / n_group;
-
-    let p = sigmoid(b, logits); // [.., E] - the UNBIASED score used for the final weight
-
-    let mut bias_shape = vec![1usize; shape.len()];
-    bias_shape[last] = e;
-    let bias_r = b.reshape(bias, bias_shape);
-    let bias_b = b.broadcast(bias_r, shape.clone());
-    let sc = b.binary(BinOp::Add, p, bias_b); // scores_for_choice: selection-only
-
-    // group_scores = sc.view(.., n_group, group_size).topk(2, -1)[0].sum(-1) (MoEGate.forward)
-    let mut group_shape = shape.clone();
-    group_shape[last] = n_group;
-    group_shape.push(group_size); // [.., n_group, group_size]
-    let sc_grouped = b.reshape(sc, group_shape.clone());
-    let in_group_rank = poot_graph_ir::ops::stable_descending_rank(b, sc_grouped);
-    let top2 = poot_graph_ir::ops::top_k_keep_mask(b, in_group_rank, 2);
-    let top2_vals = b.binary(BinOp::Mul, sc_grouped, top2);
-    let group_scores = b.reduce(RedOp::Sum, top2_vals, last + 1, false); // [.., n_group]
-
-    // group_idx = group_scores.topk(topk_group, -1)[1]; mask scores_for_choice to the selected groups.
-    let group_rank = poot_graph_ir::ops::stable_descending_rank(b, group_scores);
-    let group_keep = poot_graph_ir::ops::top_k_keep_mask(b, group_rank, topk_group);
-
-    let mut group_keep_shape = shape.clone();
-    group_keep_shape[last] = n_group;
-    group_keep_shape.push(1);
-    let group_keep_r = b.reshape(group_keep, group_keep_shape);
-    let group_keep_b = b.broadcast(group_keep_r, group_shape);
-    let expert_keep = b.reshape(group_keep_b, shape.clone()); // [.., E], 1.0 iff expert's group is selected
-
-    let not_keep = b.binary_scalar(BinOp::Mul, expert_keep, Scalar::F32(-1.0));
-    let not_keep = b.binary_scalar(BinOp::Add, not_keep, Scalar::F32(1.0));
-    let group_drop = b.binary_scalar(BinOp::Mul, not_keep, Scalar::F32(-1.0e30));
-    let sc_group_masked = b.binary(BinOp::Add, sc, group_drop); // -1e30 outside the selected groups
-
-    // topk(top_k) over the group-masked scores -> topk_idx
-    let rank = poot_graph_ir::ops::stable_descending_rank(b, sc_group_masked); // [.., E]
-    (p, rank)
-}
-
-/// Keep the top-`k` unbiased scores by rank, renormalize them, and apply the routed scaling factor.
-#[cfg(test)]
-fn deepseek3_router_weights(
-    b: &Builder,
-    p: Traced,
-    rank: Traced,
-    k: usize,
-    routed_scaling_factor: f32,
-) -> Traced {
-    let last = b.aval(p).shape.len() - 1;
-    let keep = poot_graph_ir::ops::top_k_keep_mask(b, rank, k);
-
-    let masked_p = b.binary(BinOp::Mul, p, keep); // UNBIASED score, zeroed outside top-k
-
-    let denom = b.reduce(RedOp::Sum, masked_p, last, true);
-    let denom = b.binary_scalar(BinOp::Add, denom, Scalar::F32(1e-20));
-    let normed = b.binary(BinOp::Div, masked_p, denom); // renormalized to sum to 1.0 over the kept experts
-
-    b.binary_scalar(BinOp::Mul, normed, Scalar::F32(routed_scaling_factor))
-}
-
-#[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::deepseek2::family_tests::*;
     use super::*;
+    use poot_graph_ir::ops::sigmoid;
+    use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced};
 
     #[test]
     fn a_missing_required_tensor_is_named_before_any_trace() {
@@ -246,5 +143,111 @@ mod tests {
                 2, 20,
             ],
         );
+    }
+
+    /// DeepSeek-V3's routed-expert gate (`topk_method: "noaux_tc"`, `scoring_func: "sigmoid"`, with
+    /// group-limited routing) and the rank-ordered expert ids: the independent reference the router
+    /// component's sigmoid arm is compared against. The family itself routes through
+    /// `components::router`.
+    pub(crate) fn deepseek3_router_gate_and_ids(
+        b: &Builder,
+        logits: Traced,
+        bias: Traced,
+        k: usize,
+        n_group: usize,
+        topk_group: usize,
+        routed_scaling_factor: f32,
+    ) -> (Traced, Traced) {
+        let (p, rank) = deepseek3_router_rank(b, logits, bias, n_group, topk_group);
+        let ids = b.arg_top_k(rank, k).unwrap();
+        (
+            deepseek3_router_weights(b, p, rank, k, routed_scaling_factor),
+            ids,
+        )
+    }
+
+    /// The router's unbiased sigmoid scores and the stable rank of the group-masked biased scores.
+    fn deepseek3_router_rank(
+        b: &Builder,
+        logits: Traced,
+        bias: Traced,
+        n_group: usize,
+        topk_group: usize,
+    ) -> (Traced, Traced) {
+        let shape = b.aval(logits).unwrap().shape;
+        let e = *shape.last().expect("router logits have an expert axis");
+        let last = shape.len() - 1;
+        assert!(
+            n_group > 0 && e.is_multiple_of(n_group),
+            "n_routed_experts ({e}) must be evenly divisible by n_group ({n_group})"
+        );
+        let group_size = e / n_group;
+
+        let p = sigmoid(b, logits).unwrap(); // [.., E] - the UNBIASED score used for the final weight
+
+        let mut bias_shape = vec![1usize; shape.len()];
+        bias_shape[last] = e;
+        let bias_r = b.reshape(bias, bias_shape).unwrap();
+        let bias_b = b.broadcast(bias_r, shape.clone()).unwrap();
+        let sc = b.binary(BinOp::Add, p, bias_b).unwrap(); // scores_for_choice: selection-only
+
+        // group_scores = sc.view(.., n_group, group_size).topk(2, -1)[0].sum(-1) (MoEGate.forward)
+        let mut group_shape = shape.clone();
+        group_shape[last] = n_group;
+        group_shape.push(group_size); // [.., n_group, group_size]
+        let sc_grouped = b.reshape(sc, group_shape.clone()).unwrap();
+        let in_group_rank = poot_graph_ir::ops::stable_descending_rank(b, sc_grouped).unwrap();
+        let top2 = poot_graph_ir::ops::top_k_keep_mask(b, in_group_rank, 2).unwrap();
+        let top2_vals = b.binary(BinOp::Mul, sc_grouped, top2).unwrap();
+        let group_scores = b.reduce(RedOp::Sum, top2_vals, last + 1, false).unwrap(); // [.., n_group]
+
+        // group_idx = group_scores.topk(topk_group, -1)[1]; mask scores_for_choice to the selected groups.
+        let group_rank = poot_graph_ir::ops::stable_descending_rank(b, group_scores).unwrap();
+        let group_keep = poot_graph_ir::ops::top_k_keep_mask(b, group_rank, topk_group).unwrap();
+
+        let mut group_keep_shape = shape.clone();
+        group_keep_shape[last] = n_group;
+        group_keep_shape.push(1);
+        let group_keep_r = b.reshape(group_keep, group_keep_shape).unwrap();
+        let group_keep_b = b.broadcast(group_keep_r, group_shape).unwrap();
+        let expert_keep = b.reshape(group_keep_b, shape.clone()).unwrap(); // [.., E], 1.0 iff expert's group is selected
+
+        let not_keep = b
+            .binary_scalar(BinOp::Mul, expert_keep, Scalar::F32(-1.0))
+            .unwrap();
+        let not_keep = b
+            .binary_scalar(BinOp::Add, not_keep, Scalar::F32(1.0))
+            .unwrap();
+        let group_drop = b
+            .binary_scalar(BinOp::Mul, not_keep, Scalar::F32(-1.0e30))
+            .unwrap();
+        let sc_group_masked = b.binary(BinOp::Add, sc, group_drop).unwrap(); // -1e30 outside the selected groups
+
+        // topk(top_k) over the group-masked scores -> topk_idx
+        let rank = poot_graph_ir::ops::stable_descending_rank(b, sc_group_masked).unwrap(); // [.., E]
+        (p, rank)
+    }
+
+    /// Keep the top-`k` unbiased scores by rank, renormalize them, and apply the routed scaling factor.
+    fn deepseek3_router_weights(
+        b: &Builder,
+        p: Traced,
+        rank: Traced,
+        k: usize,
+        routed_scaling_factor: f32,
+    ) -> Traced {
+        let last = b.aval(p).unwrap().shape.len() - 1;
+        let keep = poot_graph_ir::ops::top_k_keep_mask(b, rank, k).unwrap();
+
+        let masked_p = b.binary(BinOp::Mul, p, keep).unwrap(); // UNBIASED score, zeroed outside top-k
+
+        let denom = b.reduce(RedOp::Sum, masked_p, last, true).unwrap();
+        let denom = b
+            .binary_scalar(BinOp::Add, denom, Scalar::F32(1e-20))
+            .unwrap();
+        let normed = b.binary(BinOp::Div, masked_p, denom).unwrap(); // renormalized to sum to 1.0 over the kept experts
+
+        b.binary_scalar(BinOp::Mul, normed, Scalar::F32(routed_scaling_factor))
+            .unwrap()
     }
 }

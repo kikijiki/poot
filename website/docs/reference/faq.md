@@ -35,8 +35,11 @@ Compilation and the driver's prepared-entry set are bounded, and every bound is 
 than an out-of-memory failure. A pass that would grow a graph past `CompileLimits` returns
 `CompileError::Expansion`, a generated kernel over the instruction or local limit is a planner refusal
 (`BodyLimit`), and a compiled artifact over `max_artifact_bytes` is refused before it is loaded or
-cached. A driver also refuses a new prepared entry past its entry count or retained-byte limit, and a
-step above `max_trace_tokens` before the model traces it; a longer prompt runs as legal chunks. The
+cached. A driver also refuses a new prepared entry past its entry count or retained-byte limit. Tracing
+is bounded the same way by the caller's `TraceLimits`: a step above `max_tokens` is refused before the
+model traces it (a longer prompt runs as legal chunks), and a trace that would build more values,
+equations, scalar-literal bytes or owned records than the limits allow is refused with the exact resource
+and total (`TraceError::Budget`), before the excess is allocated or appended. The
 retained-byte count is host metadata the driver can measure: it is not device memory, and the
 artifact limit does not bound the external compiler's own memory or time.
 

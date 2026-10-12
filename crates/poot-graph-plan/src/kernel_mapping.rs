@@ -5,6 +5,13 @@
 //! generated and imported kernels alike are checked against the measured [`DeviceCaps`] by
 //! [`validate_kernel_resources`], so no plan that cannot run reaches a loader.
 
+use crate::planner::Planned;
+use crate::predicates::{
+    ELEMENTWISE_2D_WIDTH, GraphTables, is_batched_tiled_gemm_in, is_decode_gemv_in,
+    is_elementwise_2d_in, is_tiled_gemm_in,
+};
+use crate::refusal::{FusedStepGap, Site, refusal_at};
+use crate::types::{DispatchPlanError, Launch};
 use poot_kernelgen::{KernelRequirements, SerialWork};
 use poot_runtime_common::{
     AieArtifactError, AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess,
@@ -13,7 +20,22 @@ use poot_target::{AieCaps, AieTargetId, Backend, BufferStorage, DeviceCaps, Quer
 
 use crate::device_validation::validate_kernel_resources;
 use crate::imported::{SAMPLER_LANES, SerialLoop};
-use crate::*;
+use crate::{Capability, KernelChoice, Plan, PlanError, Source, value_ids};
+use poot_graph_ir::Eqn;
+use poot_graph_ir::Operand;
+use poot_graph_ir::Scalar;
+use poot_graph_ir::op::BinOp as GBinOp;
+use poot_graph_ir::op::FusedOp;
+use poot_graph_ir::op::FusedOperand;
+use poot_graph_ir::op::OpKind;
+use poot_graph_ir::op::UnOp as GUnOp;
+use poot_kernel_ir::BinOp;
+use poot_kernel_ir::MathOp;
+use poot_kernel_ir::UnOp;
+use poot_kernelgen as kg;
+use poot_kernelgen::KernelRequest;
+use poot_kernelgen::UnaryOp;
+use poot_tensor::DType;
 
 /// A region-local id -> a fused-kernel operand: `< n_inputs` is a leaf, otherwise a prior step.
 pub(crate) fn map_fused_local(id: usize, n_inputs: usize) -> kg::FusedInput {
@@ -637,7 +659,8 @@ fn shape_launch(
 
 #[cfg(test)]
 mod tests {
-    use crate::{FUSABLE_FLOAT_UNARY_OPS, fuse};
+    use crate::fuse;
+    use crate::fuse::FUSABLE_FLOAT_UNARY_OPS;
     use poot_graph_ir::{Builder, OpKind, UnOp};
     use poot_target::{AmdArch, Backend};
     use poot_test_util::device_caps::default_caps_for;
@@ -661,10 +684,12 @@ mod tests {
         for &op in FUSABLE_FLOAT_UNARY_OPS {
             // A two-step chain (`Neg` then `op`) so `fuse()` forms an actual `OpKind::Fused` region
             // (a lone unary stays unfused - fusion needs >= 2 members).
-            let b = Builder::new();
-            let x = b.constant("x", poot_graph_ir::TensorType::f32(vec![4]));
-            let n = b.unary(UnOp::Neg, x);
-            let y = b.unary(op, n);
+            let b = Builder::for_tests();
+            let x = b
+                .constant("x", poot_graph_ir::TensorType::f32(vec![4]))
+                .unwrap();
+            let n = b.unary(UnOp::Neg, x).unwrap();
+            let y = b.unary(op, n).unwrap();
             let graph = b.finish(y).unwrap();
             let fused = fuse(&graph).unwrap();
             let eqn = fused
@@ -678,7 +703,7 @@ mod tests {
                     eqn,
                     backend,
                     &default_caps_for(backend),
-                    &poot_test_util::graph_fixtures::roomy_body_limits(),
+                    &crate::test_support::roomy_body_limits(),
                 )
                 .unwrap_or_else(|e| {
                     panic!(
@@ -714,24 +739,41 @@ mod tests {
 
     fn aie_caps() -> AieCaps {
         // SYNTHETIC limits: roomy enough for a [2,3] kernel, not a device measurement.
-        AieCaps::synthetic(AieTargetId::Xdna2, 1 << 16, 8, 1 << 20, 1 << 30)
+        AieCaps {
+            target: AieTargetId::Xdna2,
+            tile_local_bytes: Queried::Known(1 << 16),
+            host_bindings: Queried::Known(8),
+            instruction_bytes: Queried::Known(1 << 20),
+            memory_budget_bytes: Queried::Known(1 << 30),
+        }
+    }
+
+    /// A target nobody has measured: every bound unknown, so no plan that needs one is admitted.
+    fn unmeasured_caps() -> AieCaps {
+        AieCaps {
+            tile_local_bytes: Queried::Unknown,
+            host_bindings: Queried::Unknown,
+            instruction_bytes: Queried::Unknown,
+            memory_budget_bytes: Queried::Unknown,
+            ..aie_caps()
+        }
     }
 
     fn limits() -> poot_kernelgen::BodyLimits {
-        poot_test_util::graph_fixtures::roomy_body_limits()
+        crate::test_support::roomy_body_limits()
     }
 
     fn graph_of(build: impl FnOnce(&Builder) -> poot_graph_ir::Traced) -> Graph {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let out = build(&b);
         b.finish(out).unwrap()
     }
 
     fn add_graph(a_shape: Vec<usize>, b_shape: Vec<usize>, dtype: DType) -> Graph {
         graph_of(|b| {
-            let x = b.constant("a", TensorType::new(a_shape, dtype));
-            let y = b.constant("b", TensorType::new(b_shape, dtype));
-            b.binary(poot_graph_ir::BinOp::Add, x, y)
+            let x = b.constant("a", TensorType::new(a_shape, dtype)).unwrap();
+            let y = b.constant("b", TensorType::new(b_shape, dtype)).unwrap();
+            b.binary(poot_graph_ir::BinOp::Add, x, y).unwrap()
         })
     }
 
@@ -740,7 +782,7 @@ mod tests {
     }
 
     /// The ordinary planner entry for an AIE target carrying `caps`.
-    fn plan_aie_with(g: &Graph, caps: AieCaps) -> Result<crate::Planned, PlanError> {
+    fn plan_aie_with(g: &Graph, caps: AieCaps) -> Result<crate::planner::Planned, PlanError> {
         let target = Target::Aie {
             target: AieTargetId::Xdna2,
             caps,
@@ -748,7 +790,7 @@ mod tests {
         crate::plan_eqn_choice(g, last_eqn(g), &target, &HashMap::new(), &limits())
     }
 
-    fn plan_aie(g: &Graph) -> Result<crate::Planned, PlanError> {
+    fn plan_aie(g: &Graph) -> Result<crate::planner::Planned, PlanError> {
         plan_aie_with(g, aie_caps())
     }
 
@@ -794,7 +836,7 @@ mod tests {
         }
 
         let dir = scratch("positive");
-        let tc = poot_test_util::aie_fixtures::scripted_toolchain(&dir, true);
+        let tc = poot_codegen::test_support::scripted_toolchain(&dir, true);
         let cache = KernelCache::at(dir.join("cache"), CodegenTarget::AieCore);
         let compiled = compile_aie(
             &dispatch.body,
@@ -840,8 +882,8 @@ mod tests {
             other => panic!("expected a generator refusal, got {other:?}"),
         };
         let neg = graph_of(|b| {
-            let x = b.constant("x", TensorType::f32(vec![4]));
-            b.unary(poot_graph_ir::UnOp::Neg, x)
+            let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+            b.unary(poot_graph_ir::UnOp::Neg, x).unwrap()
         });
         assert_eq!(kernel_gen(aie_refusal(&neg)).0, "elementwise");
         let broadcast = add_graph(vec![2, 3], vec![1, 3], DType::F32);
@@ -849,15 +891,15 @@ mod tests {
         let ints = add_graph(vec![2, 3], vec![2, 3], DType::I32);
         assert_eq!(kernel_gen(aie_refusal(&ints)).0, "elementwise");
         let max = graph_of(|b| {
-            let x = b.constant("x", TensorType::f32(vec![4]));
-            let y = b.constant("y", TensorType::f32(vec![4]));
-            b.binary(poot_graph_ir::BinOp::Max, x, y)
+            let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+            let y = b.constant("y", TensorType::f32(vec![4])).unwrap();
+            b.binary(poot_graph_ir::BinOp::Max, x, y).unwrap()
         });
         assert_eq!(kernel_gen(aie_refusal(&max)).0, "sequential_binary");
         // A collective is a cut between stage programs on every target.
         let reduce = graph_of(|b| {
-            let x = b.constant("x", TensorType::f32(vec![2, 3]));
-            b.all_reduce(x, RedOp::Sum, 0)
+            let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+            b.all_reduce(x, RedOp::Sum, 0).unwrap()
         });
         assert!(matches!(
             aie_refusal(&reduce),
@@ -874,14 +916,16 @@ mod tests {
     #[test]
     fn a_gpu_only_lowering_is_a_typed_refusal_for_an_aie_target() {
         let template = graph_of(|b| {
-            let seed = b.constant("seed", TensorType::new(vec![2], DType::I32));
-            b.random_uniform(seed, 4)
+            let seed = b
+                .constant("seed", TensorType::new(vec![2], DType::I32))
+                .unwrap();
+            b.random_uniform(seed, 4).unwrap()
         });
         assert_eq!(aie_refusal(&template), Capability::GpuOnly);
         let contraction = graph_of(|b| {
-            let x = b.constant("x", TensorType::f32(vec![2, 3]));
-            let w = b.constant("w", TensorType::f32(vec![3, 4]));
-            b.matmul(x, w)
+            let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+            let w = b.constant("w", TensorType::f32(vec![3, 4])).unwrap();
+            b.matmul(x, w).unwrap()
         });
         assert_eq!(aie_refusal(&contraction), Capability::GpuOnly);
     }
@@ -898,7 +942,7 @@ mod tests {
             other => panic!("expected a typed refusal, got {:?}", other.map(|_| ())),
         };
         assert_eq!(
-            refusal(AieCaps::unmeasured(AieTargetId::Xdna2)),
+            refusal(unmeasured_caps()),
             Capability::AieLimit(AieLimitRefusal::Unknown {
                 limit: "host bindings"
             })
@@ -931,14 +975,14 @@ mod tests {
         let compiled = compile_aie(
             &body,
             &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
-            &poot_test_util::aie_fixtures::scripted_toolchain(&dir, true),
+            &poot_codegen::test_support::scripted_toolchain(&dir, true),
             &KernelCache::at(dir.join("cache"), CodegenTarget::AieCore),
             NonZeroU64::new(1 << 20).unwrap(),
         )
         .unwrap();
         let artifact = &compiled.artifact;
         assert_eq!(validate_linked_artifact(artifact, &aie_caps()), Ok(()));
-        let unmeasured = AieCaps::unmeasured(AieTargetId::Xdna2);
+        let unmeasured = unmeasured_caps();
         assert_eq!(
             validate_linked_artifact(artifact, &unmeasured),
             Err(AieLimitRefusal::Unknown {
@@ -997,7 +1041,7 @@ mod tests {
         let error = compile_aie(
             &body,
             &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
-            &poot_test_util::aie_fixtures::scripted_toolchain(&dir, false),
+            &poot_codegen::test_support::scripted_toolchain(&dir, false),
             &cache,
             NonZeroU64::new(1 << 20).unwrap(),
         )

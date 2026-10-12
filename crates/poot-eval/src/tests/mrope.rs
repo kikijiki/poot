@@ -57,17 +57,21 @@ fn sectioned_reference(
 fn mrope_matches_direct_reference_with_distinct_section_positions() {
     // full rotary (rot == d == 16), 3 sections [2,3,3] summing to half=8, three distinct position ids (the general
     // multimodal case: temporal/height/width all differ).
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let d = 16usize;
     let max_pos = 16usize;
     let sections = [2usize, 3, 3];
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32));
-    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
-    let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32));
-    let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32)).unwrap();
+    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32)).unwrap();
+    let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32)).unwrap();
+    let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections).unwrap();
     let (xi, ci, si, pti, phi, pwi) = (
         x.id(),
         cos.id(),
@@ -110,18 +114,31 @@ fn mrope_matches_direct_reference_with_distinct_section_positions() {
 
 #[test]
 fn mrope_batched_matches_independent_per_row_reference() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let batch = 2usize;
     let d = 16usize;
     let max_pos = 16usize;
     let sections = [2usize, 3, 3];
-    let x = b.constant("x", TensorType::f32(vec![batch, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos_t = b.constant("pos_t", TensorType::new(vec![batch], DType::I32));
-    let pos_h = b.constant("pos_h", TensorType::new(vec![batch], DType::I32));
-    let pos_w = b.constant("pos_w", TensorType::new(vec![batch], DType::I32));
-    let out = rope_sectioned_batched(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections, batch);
+    let x = b
+        .constant("x", TensorType::f32(vec![batch, 1, 1, d]))
+        .unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos_t = b
+        .constant("pos_t", TensorType::new(vec![batch], DType::I32))
+        .unwrap();
+    let pos_h = b
+        .constant("pos_h", TensorType::new(vec![batch], DType::I32))
+        .unwrap();
+    let pos_w = b
+        .constant("pos_w", TensorType::new(vec![batch], DType::I32))
+        .unwrap();
+    let out =
+        rope_sectioned_batched(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections, batch).unwrap();
     let (xi, ci, si, pti, phi, pwi) = (
         x.id(),
         cos.id(),
@@ -203,14 +220,18 @@ fn mrope_matches_rope_bit_exact_when_section_positions_equal_decode() {
     let posv = 5usize;
 
     let got_sectioned = {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-        let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-        let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-        let p0 = b.constant("p0", TensorType::scalar(DType::I32));
-        let p1 = b.constant("p1", TensorType::scalar(DType::I32));
-        let p2 = b.constant("p2", TensorType::scalar(DType::I32));
-        let out = rope_sectioned(&b, x, cos, sin, &[p0, p1, p2], &sections);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+        let cos = b
+            .constant("cos", TensorType::f32(vec![max_pos, d]))
+            .unwrap();
+        let sin = b
+            .constant("sin", TensorType::f32(vec![max_pos, d]))
+            .unwrap();
+        let p0 = b.constant("p0", TensorType::scalar(DType::I32)).unwrap();
+        let p1 = b.constant("p1", TensorType::scalar(DType::I32)).unwrap();
+        let p2 = b.constant("p2", TensorType::scalar(DType::I32)).unwrap();
+        let out = rope_sectioned(&b, x, cos, sin, &[p0, p1, p2], &sections).unwrap();
         let (xi, ci, si, p0i, p1i, p2i) = (x.id(), cos.id(), sin.id(), p0.id(), p1.id(), p2.id());
         let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
@@ -237,12 +258,16 @@ fn mrope_matches_rope_bit_exact_when_section_positions_equal_decode() {
     };
 
     let got_rope = {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-        let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-        let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-        let pos = b.constant("pos", TensorType::scalar(DType::I32));
-        let out = rope(&b, x, cos, sin, pos);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+        let cos = b
+            .constant("cos", TensorType::f32(vec![max_pos, d]))
+            .unwrap();
+        let sin = b
+            .constant("sin", TensorType::f32(vec![max_pos, d]))
+            .unwrap();
+        let pos = b.constant("pos", TensorType::scalar(DType::I32)).unwrap();
+        let out = rope(&b, x, cos, sin, pos).unwrap();
         let (xi, ci, si, pi) = (x.id(), cos.id(), sin.id(), pos.id());
         let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
@@ -299,14 +324,24 @@ fn mrope_matches_rope_prefill_bit_exact_when_section_positions_equal_whole_seque
     let posv: Vec<i32> = (0..l).map(|i| i as i32).collect();
 
     let got_sectioned = {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 1, l, d]));
-        let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-        let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-        let p0 = b.constant("p0", TensorType::new(vec![l], DType::I32));
-        let p1 = b.constant("p1", TensorType::new(vec![l], DType::I32));
-        let p2 = b.constant("p2", TensorType::new(vec![l], DType::I32));
-        let out = rope_sectioned(&b, x, cos, sin, &[p0, p1, p2], &sections);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 1, l, d])).unwrap();
+        let cos = b
+            .constant("cos", TensorType::f32(vec![max_pos, d]))
+            .unwrap();
+        let sin = b
+            .constant("sin", TensorType::f32(vec![max_pos, d]))
+            .unwrap();
+        let p0 = b
+            .constant("p0", TensorType::new(vec![l], DType::I32))
+            .unwrap();
+        let p1 = b
+            .constant("p1", TensorType::new(vec![l], DType::I32))
+            .unwrap();
+        let p2 = b
+            .constant("p2", TensorType::new(vec![l], DType::I32))
+            .unwrap();
+        let out = rope_sectioned(&b, x, cos, sin, &[p0, p1, p2], &sections).unwrap();
         let (xi, ci, si, p0i, p1i, p2i) = (x.id(), cos.id(), sin.id(), p0.id(), p1.id(), p2.id());
         let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
@@ -333,11 +368,15 @@ fn mrope_matches_rope_prefill_bit_exact_when_section_positions_equal_whole_seque
     };
 
     let got_prefill = {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 1, l, d]));
-        let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-        let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-        let out = rope_prefill(&b, x, cos, sin, l);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 1, l, d])).unwrap();
+        let cos = b
+            .constant("cos", TensorType::f32(vec![max_pos, d]))
+            .unwrap();
+        let sin = b
+            .constant("sin", TensorType::f32(vec![max_pos, d]))
+            .unwrap();
+        let out = rope_prefill(&b, x, cos, sin, l).unwrap();
         let (xi, ci, si) = (x.id(), cos.id(), sin.id());
         let g = b.finish(out).unwrap();
         let mut inputs = HashMap::new();
@@ -383,16 +422,20 @@ fn mrope_matches_rope_prefill_bit_exact_when_section_positions_equal_whole_seque
 fn mrope_partial_rotary_passes_through_untouched_dims() {
     // phi3-style partial rotary composed with sectioning: head_dim d=12, only the leading rot=8 dims rotate (sections
     // partition rot/2=4, not d/2), [rot,d) passes through unrotated, as `rope_partial`.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (d, rot) = (12usize, 8usize);
     let max_pos = 16usize;
     let sections = [1usize, 3];
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, rot]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, rot]));
-    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32));
-    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
-    let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h], &sections);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, rot]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, rot]))
+        .unwrap();
+    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32)).unwrap();
+    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32)).unwrap();
+    let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h], &sections).unwrap();
     let (xi, ci, si, pti, phi) = (x.id(), cos.id(), sin.id(), pos_t.id(), pos_h.id());
     let g = b.finish(out).unwrap();
 
@@ -438,17 +481,21 @@ fn mrope_zero_width_section_traces_and_is_inert() {
     // `rope_sectioned` gathers every section's position id unconditionally (FR-005), even for width 0, so the position id
     // must still be in-bounds for `cos_table`/`sin_table` or eval panics on the gather. Production callers
     // (`trace_prefill_mrope`/`trace_decode_mrope`) always supply an in-range id per section.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let d = 16usize;
     let max_pos = 16usize;
     let sections = [0usize, 3, 5]; // sums to half=8; section 0 is empty
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32));
-    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
-    let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32));
-    let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32)).unwrap();
+    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32)).unwrap();
+    let pos_w = b.constant("pos_w", TensorType::scalar(DType::I32)).unwrap();
+    let out = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h, pos_w], &sections).unwrap();
     let (xi, ci, si, pti, phi, pwi) = (
         x.id(),
         cos.id(),
@@ -503,30 +550,58 @@ fn mrope_zero_width_section_traces_and_is_inert() {
 }
 
 #[test]
-#[should_panic(expected = "section widths must sum to rot/2")]
-fn mrope_panics_when_section_widths_do_not_sum_to_half_rot() {
-    let b = Builder::new();
+fn mrope_refuses_when_section_widths_do_not_sum_to_half_rot() {
+    let b = Builder::for_tests();
     let d = 16usize;
     let max_pos = 4usize;
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32));
-    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32));
-    // sections sum to 5, half is 8: must panic before any eval.
-    let _ = rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h], &[2, 3]);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32)).unwrap();
+    let pos_h = b.constant("pos_h", TensorType::scalar(DType::I32)).unwrap();
+    // sections sum to 5, half is 8: a typed refusal before anything is appended or evaluated.
+    let generation = b.generation();
+    assert_eq!(
+        rope_sectioned(&b, x, cos, sin, &[pos_t, pos_h], &[2, 3]),
+        Err(poot_graph_ir::BuilderError::Requirement {
+            operation: "rope_sectioned_partial",
+            requirement: poot_graph_ir::Requirement::SectionWidths {
+                expected: 8,
+                found: 5,
+            },
+        })
+    );
+    assert_eq!(b.generation(), generation, "a refusal appends nothing");
 }
 
 #[test]
-#[should_panic(expected = "one position id per section")]
-fn mrope_panics_when_position_count_does_not_match_section_count() {
-    let b = Builder::new();
+fn mrope_refuses_when_position_count_does_not_match_section_count() {
+    let b = Builder::for_tests();
     let d = 16usize;
     let max_pos = 4usize;
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32));
-    // 1 position for 3 declared sections: must panic before any eval.
-    let _ = rope_sectioned(&b, x, cos, sin, &[pos_t], &[2, 3, 3]);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos_t = b.constant("pos_t", TensorType::scalar(DType::I32)).unwrap();
+    // 1 position for 3 declared sections: a typed refusal before anything is appended or evaluated.
+    let generation = b.generation();
+    assert_eq!(
+        rope_sectioned(&b, x, cos, sin, &[pos_t], &[2, 3, 3]),
+        Err(poot_graph_ir::BuilderError::Requirement {
+            operation: "rope_sectioned",
+            requirement: poot_graph_ir::Requirement::SectionCount {
+                expected: 3,
+                found: 1,
+            },
+        })
+    );
+    assert_eq!(b.generation(), generation, "a refusal appends nothing");
 }

@@ -2,10 +2,6 @@
 //! stored, quantized tensors packed) and of an HF `config.json`. A dense entry widens to f32 through
 //! `poot_quant::weights::DenseWeight::decode_f32`.
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::path::Path;
-
 pub mod gguf;
 pub mod lora;
 pub mod packed_safetensors;

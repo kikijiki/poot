@@ -9,9 +9,9 @@
 mod common;
 
 use common::{slot_maps, step, token_pos, zero_state};
-use poot_executor_parity::dense::{Dense, Family, paged_step, step as step_shape};
-use poot_executor_parity::weight_map::MappedModel;
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, paged_step, step as step_shape};
+use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::HostTensor;
 
 const VOCAB: usize = 32;
@@ -69,13 +69,18 @@ fn assert_paged_matches_contiguous(
     let toks = token_stream(n_steps);
     let cont = m
         .model
-        .trace(Phase::Decode, step_shape(BATCH, 1, CAP, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step_shape(BATCH, 1, CAP, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let paged = m
         .model
         .trace(
             Phase::Decode,
             paged_step(BATCH, 1, CAP, pool_slots, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     // The paged state is smaller than the per-row caches only when the pool is sized for live usage.
@@ -156,11 +161,19 @@ fn batched_decode_rows_equal_batch1_decodes() {
     let pos = [2, 5, 0];
     let gb = m
         .model
-        .trace(Phase::Decode, step_shape(BATCH, 1, CAP, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step_shape(BATCH, 1, CAP, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let g1 = m
         .model
-        .trace(Phase::Decode, step_shape(1, 1, CAP, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step_shape(1, 1, CAP, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     assert_eq!(gb.state().count(), g1.state().count());
 

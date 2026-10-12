@@ -14,27 +14,23 @@ rust-version.workspace = true
 # 132) is its only remaining caller, a dev-dependent crate reached through this feature edge, never a
 # forwarder. (Literal crate name omitted here: `poot_eval_does_not_depend_on_graph_plan` string-matches
 # this file for it - the dependency runs the other way, a dev-only cycle Cargo allows.)
-test-support = []
+test-support = ["dep:poot-test-util", "poot-graph-ir/test-support", "poot-quant/test-support"]
 
 [dependencies]
 poot-graph-ir.workspace = true
 poot-quant.workspace = true
 poot-tensor.workspace = true
-# The exact route's owner-backed sources (`ExactSourceOwner`, `ExactSourceKind`) are loader vocabulary; POOT-755's
-# direction check lists this edge in FORBIDDEN_NORMAL until the exact route stops naming them.
-poot-load.workspace = true
 libm.workspace = true
+# `fill`, the seeded fill the live-attention fixture draws its operands from; present only under `test-support`.
+poot-test-util = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
-poot-executor-parity.workspace = true
-poot-models.workspace = true
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+# `WeightMap::materialize`/`materialize_stack`, the weight-map oracle's reference decode (ADR-0113).
+poot-quant = { workspace = true, features = ["test-support"] }
 poot-target.workspace = true
-poot-test-util = { workspace = true, features = ["graph-fixtures"] }
-# Card 405: tests/dense_row_gather_e4m3.rs writes a minimal safetensors checkpoint (as
-# poot-models/src/test_safetensors.rs does) to get a Card 359 owner-backed E4M3 table through the
-# authenticated loading path; ExactSourceOwner's fields are private outside poot-load.
-serde_json.workspace = true
+poot-test-util.workspace = true
 
 [lints]
 workspace = true

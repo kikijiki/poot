@@ -1,16 +1,19 @@
 //! Emit NVPTX `.ptx` for a representative set of generated kernels to /tmp/poot-ptx-stage2, so they can be
-//! verified on a real NVIDIA GPU via poot-ptx-check (exp ex2.approx, the silu composition, div/rem, cast
+//! verified on a real NVIDIA GPU via ptx-check (exp ex2.approx, the silu composition, div/rem, cast
 //! f32->usize, the index-math kernels). Run inside `nix develop` (needs llc). Asserts only that llc accepts the
 //! output; the check is the on-GPU run.
 
 use std::path::PathBuf;
 
 use poot_codegen::{Target, compile};
+use poot_kernel_ir::test_support::{matmul_kernel, square_kernel, wg_sum};
 use poot_kernel_ir::{BinOp, Ty, fixtures};
 use poot_kernelgen as kg;
-use poot_test_util::kernel_fixtures::{
-    gather_axis0_dt, matmul_kernel, reduce_last, square_kernel, wg_sum,
-};
+use poot_kernelgen::reduce_last_dt;
+
+#[path = "support/gather.rs"]
+mod gather;
+use gather::gather_axis0_dt;
 
 /// The f32-element movement `op` into `out_shape`.
 fn movement(name: &str, out_shape: Vec<usize>, op: kg::MovementOp) -> poot_kernel_ir::Body {
@@ -51,7 +54,7 @@ fn attention_decode_body() -> poot_kernel_ir::Body {
     )
     .expect("the attention request generates")
     .body;
-    // The PTX entry and the staged file carry the body's name; `poot-ptx-check` runs `attention_decode`.
+    // The PTX entry and the staged file carry the body's name; `ptx-check` runs `attention_decode`.
     body.name = "attention_decode".to_string();
     body
 }
@@ -89,7 +92,7 @@ fn emit_nvptx_kernel_set() {
     // `fused_row`/`fused_row_parallel_views` (rmsnorm+softmax row kernels), `math_unary_dt` (transcendental
     // exp), `reduce_last_lds` and `array_sum_probe` are this crate's own `#[cfg(test)]`-only kernels (card
     // 622: no cross-crate caller), so their NVPTX staging to this same `/tmp/poot-ptx-stage2` drop point
-    // lives in their own in-crate unit tests (`test_support::stage_nvptx`) instead of here.
+    // lives in their own in-crate unit tests (`unit_helpers::stage_nvptx`) instead of here.
     let fused_unary = |name: &str, op| {
         kg::fused(
             name,
@@ -109,7 +112,7 @@ fn emit_nvptx_kernel_set() {
     let bodies = [
         fused_unary("tanh", kg::FusedScalarOp::Tanh),
         fused_unary("erf", kg::FusedScalarOp::Erf),
-        reduce_last("reduce", BinOp::Add, 4, 0.0),
+        reduce_last_dt("reduce", Ty::F32, BinOp::Add, 4, 0.0),
         movement(
             "bcast",
             vec![2, 3],
@@ -131,7 +134,7 @@ fn emit_nvptx_kernel_set() {
         // the attention kernel (online softmax, LDS partials): a GQA decode, Hq=4, n_rep=2, 6 keys, D=8, over 4
         // lanes.
         attention_decode_body(),
-        // base codegen fixtures, so this one emit also stages everything poot-ptx-check needs (one dir).
+        // base codegen fixtures, so this one emit also stages everything ptx-check needs (one dir).
         fixtures::add_kernel(),
         square_kernel(),
         matmul_kernel(2, 3, 4),

@@ -8,7 +8,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -29,13 +28,14 @@ use crate::names::{
     hf_base_shapes,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 // The `granite` family behind [`Model`]: the standard stack and layer with Granite's four scalar
 // multipliers as options of the shared components, and `granitemoe`'s experts as the feed-forward
 // when the config states an expert count. The legacy dense tracers at the end of this file are the
 // tests' independent reference.
 
-pub const FAMILY: FamilyKey = FamilyKey::new("granite");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("granite");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -160,7 +160,7 @@ fn scalar(fields: &Fields<'_>, field: Field) -> Result<f32, ModelError> {
 
 /// granite's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct GraniteConfig {
+pub(crate) struct GraniteConfig {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -178,7 +178,7 @@ pub struct GraniteConfig {
 }
 
 impl GraniteConfig {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let keys = keys_of(raw);
         let dims = DenseDims::read(&fields, &keys.spec)?;
@@ -257,7 +257,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Granite {
+pub(crate) struct Granite {
     params: GraniteConfig,
     weights: WeightMap,
     stack: StackWeights,
@@ -331,14 +331,13 @@ impl Model for Granite {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         if let Some(params) = &p.moe {
             moe::check_step(FAMILY, shape, params)?;
         }
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -352,7 +351,7 @@ impl Model for Granite {
                     Ffn::Routed(w, params) => moe::moe(b, &step, l, h, None, w, params),
                 },
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -727,15 +726,15 @@ mod moe_tests {
     use serde_json::json;
 
     use super::*;
+    use crate::architectures::olmoe::moe_support::{
+        GgufName, assert_bf16_and_q8_0_experts_trace_and_match, gguf_checkpoint,
+    };
     use crate::components::standard::oracle::run_step;
     use crate::components::testing::{
         CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
         close, f32_entry, gguf_dense_kvs, gguf_name_with_head, values,
     };
     use crate::model::Phase;
-    use crate::olmoe::moe_support::{
-        GgufName, assert_bf16_and_q8_0_experts_trace_and_match, gguf_checkpoint,
-    };
     use crate::registry::{LoadModelError, Registry};
 
     use super::{FIXTURE_EXPERTS as EXPERTS, FIXTURE_INTER as INTER, FIXTURE_WIDTH as WIDTH};
@@ -865,7 +864,7 @@ mod moe_tests {
             }
         }
         let payload = |seed: u64, shape: [usize; 2]| {
-            Arc::new(poot_test_util::packed::random_payload(
+            Arc::new(poot_quant::test_support::packed::random_payload(
                 WeightFormat::Q8_0,
                 shape,
                 seed,

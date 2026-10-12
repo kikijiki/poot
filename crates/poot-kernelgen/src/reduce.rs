@@ -1,335 +1,12 @@
-#[cfg(test)]
-use crate::helpers::{Alloc, arr_elem, slice_f32};
 use crate::helpers::{copy, elem, guard, ld, local, slice_dtype};
-#[cfg(test)]
-use poot_kernel_ir::Local;
-#[cfg(test)]
-use poot_kernel_ir::WorkgroupLocalDecl;
 use poot_kernel_ir::{
     BasicBlock, BinOp, BlockId, Body, Constant, IndexAxis, Operand, Place, Rvalue, Statement,
     Terminator, Ty,
 };
 
-/// Parallel last-axis reduction via LDS: one workgroup of `w` lanes per row. Each lane reduces a strided
-/// subset of the row into a register partial, writes it to LDS, a barrier, then lane 0 combines the `w`
-/// partials and writes `out[row]`. The parallel-then-small-serial-combine shape generalizes a plain
-/// workgroup-sum over a single row's first `w` elements. `op`/`init` select sum (Add, 0) or max (Max,
-/// -inf). The reduction order differs from the serial [`reduce_last_dt`], so results are close to it, not
-/// bit-identical. Launch `num_rows * w` threads with `wg = [w, 1, 1]`.
-#[cfg(test)]
-fn reduce_last_lds(name: &str, op: BinOp, cols: usize, init: f32, w: usize) -> Body {
-    let mut al = Alloc::new(vec![
-        ld(Ty::Unit, false),
-        ld(slice_f32(false), false), // 1 in
-        ld(slice_f32(true), true),   // 2 out
-    ]);
-    let (inp, out) = (local(1), local(2));
-    let row = al.add(Ty::Usize, false);
-    let lane = al.add(Ty::Usize, false);
-    let partial = al.add(Ty::F32, true);
-    let j = al.add(Ty::Usize, true);
-    let j_lt = al.add(Ty::Bool, false);
-    let idx = al.add(Ty::Usize, true);
-    let v = al.add(Ty::F32, false);
-    let part_new = al.add(Ty::F32, false);
-    let j_new = al.add(Ty::Usize, false);
-    let cmp0 = al.add(Ty::Bool, false);
-    let acc = al.add(Ty::F32, true);
-    let k = al.add(Ty::Usize, true);
-    let k_lt = al.add(Ty::Bool, false);
-    let lv = al.add(Ty::F32, false);
-    let acc_new = al.add(Ty::F32, false);
-    let k_new = al.add(Ty::Usize, false);
-    let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
-    let cf = |x: f32| Operand::Const(Constant::F32(x));
-    let goto = |b: u32| Terminator::Goto {
-        target: BlockId { index: b },
-    };
-    let red = |dst: Local, a: Local, b: Local| {
-        Statement::Assign(
-            Place::local(dst),
-            Rvalue::BinaryOp(op, copy(Place::local(a)), copy(Place::local(b))),
-        )
-    };
-
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(row),
-            dim: IndexAxis::GroupX,
-            target: BlockId { index: 1 },
-        },
-    };
-    let bb1 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(lane),
-            dim: IndexAxis::LocalX,
-            target: BlockId { index: 2 },
-        },
-    };
-    // bb2: partial = init; j = lane -> bb3
-    let bb2 = BasicBlock {
-        statements: vec![
-            Statement::Assign(Place::local(partial), Rvalue::Use(cf(init))),
-            Statement::Assign(Place::local(j), Rvalue::Use(copy(Place::local(lane)))),
-        ],
-        terminator: goto(3),
-    };
-    // bb3 (acc hdr): j_lt = j < cols; if j_lt==0 (j>=cols) -> write LDS(5), else body(4)
-    let bb3 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(j_lt),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(j)), cu(cols)),
-        )],
-        terminator: guard(j_lt, 5, 4),
-    };
-    // bb4 (acc body): idx = row*cols + j; partial op= in[idx]; j += w -> bb3
-    let bb4 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(idx),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(row)), cu(cols)),
-            ),
-            Statement::Assign(
-                Place::local(idx),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(idx)), copy(Place::local(j))),
-            ),
-            Statement::Assign(Place::local(v), Rvalue::Use(copy(elem(inp, idx)))),
-            red(part_new, partial, v),
-            Statement::Assign(
-                Place::local(partial),
-                Rvalue::Use(copy(Place::local(part_new))),
-            ),
-            Statement::Assign(
-                Place::local(j_new),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(j)), cu(w)),
-            ),
-            Statement::Assign(Place::local(j), Rvalue::Use(copy(Place::local(j_new)))),
-        ],
-        terminator: goto(3),
-    };
-    // bb5: LDS[lane] = partial; barrier -> bb6
-    let bb5 = BasicBlock {
-        statements: vec![Statement::WorkgroupLocalWrite {
-            idx: copy(Place::local(lane)),
-            value: copy(Place::local(partial)),
-            array: 0,
-        }],
-        terminator: Terminator::Barrier {
-            target: BlockId { index: 6 },
-        },
-    };
-    // bb6: cmp0 = (lane == 0); if cmp0==0 (lane != 0) -> ret(11), else combine(7)
-    let bb6 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(cmp0),
-            Rvalue::BinaryOp(BinOp::Eq, copy(Place::local(lane)), cu(0)),
-        )],
-        terminator: guard(cmp0, 11, 7),
-    };
-    // bb7: acc = init; k = 0 -> bb8
-    let bb7 = BasicBlock {
-        statements: vec![
-            Statement::Assign(Place::local(acc), Rvalue::Use(cf(init))),
-            Statement::Assign(Place::local(k), Rvalue::Use(cu(0))),
-        ],
-        terminator: goto(8),
-    };
-    // bb8 (combine hdr): k_lt = k < w; if k_lt==0 -> store(10), else body(9)
-    let bb8 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(k_lt),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(k)), cu(w)),
-        )],
-        terminator: guard(k_lt, 10, 9),
-    };
-    // bb9 (combine body): acc op= LDS[k]; k += 1 -> bb8
-    let bb9 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(lv),
-                Rvalue::WorkgroupLocalRead {
-                    idx: copy(Place::local(k)),
-                    array: 0,
-                },
-            ),
-            red(acc_new, acc, lv),
-            Statement::Assign(Place::local(acc), Rvalue::Use(copy(Place::local(acc_new)))),
-            Statement::Assign(
-                Place::local(k_new),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(k)), cu(1)),
-            ),
-            Statement::Assign(Place::local(k), Rvalue::Use(copy(Place::local(k_new)))),
-        ],
-        terminator: goto(8),
-    };
-    // bb10 (store): out[row] = acc; return
-    let bb10 = BasicBlock {
-        statements: vec![Statement::Assign(
-            elem(out, row),
-            Rvalue::Use(copy(Place::local(acc))),
-        )],
-        terminator: Terminator::Return,
-    };
-    let bb11 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::Return,
-    };
-    let mut body = Body::new(
-        name,
-        2,
-        al.locals,
-        vec![bb0, bb1, bb2, bb3, bb4, bb5, bb6, bb7, bb8, bb9, bb10, bb11],
-    );
-    body.workgroup_size = [w as u32, 1, 1];
-    body.workgroup_locals = vec![WorkgroupLocalDecl {
-        elem_ty: Ty::F32,
-        len: w as u32,
-    }];
-    body
-}
-
-/// Probe for the private fixed-size array (the flash-attention foundation): each thread fills
-/// a per-thread `arr[n]` from its row of `in` (doubling), then reads it back to sum into `out[t]`. Both the
-/// store and the load are dynamically indexed - the exact pattern that lowers on NVPTX (`alloca [n x f32]`)
-/// but crashes the LLVM SPIR-V backend, so `compile(.., SpirvVulkan)` rejects it.
-#[cfg(test)]
-fn array_sum_probe(name: &str, n: usize) -> Body {
-    let mut al = Alloc::new(vec![
-        ld(Ty::Unit, false),
-        ld(slice_f32(false), false), // 1 in
-        ld(slice_f32(true), true),   // 2 out
-    ]);
-    let (inp, out) = (local(1), local(2));
-    let arr = al.add(
-        Ty::Array {
-            elem: Box::new(Ty::F32),
-            len: n as u32,
-        },
-        true,
-    );
-    let t = al.add(Ty::Usize, false);
-    let i = al.add(Ty::Usize, true);
-    let cmp = al.add(Ty::Bool, false);
-    let idx = al.add(Ty::Usize, true);
-    let v = al.add(Ty::F32, false);
-    let v2 = al.add(Ty::F32, false);
-    let acc = al.add(Ty::F32, true);
-    let av = al.add(Ty::F32, false);
-    let i_new = al.add(Ty::Usize, false);
-    let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
-    let goto = |b: u32| Terminator::Goto {
-        target: BlockId { index: b },
-    };
-
-    // bb0: t = thread X -> bb1
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(t),
-            dim: IndexAxis::X,
-            target: BlockId { index: 1 },
-        },
-    };
-    // bb1: i = 0 -> bb2
-    let bb1 = BasicBlock {
-        statements: vec![Statement::Assign(Place::local(i), Rvalue::Use(cu(0)))],
-        terminator: goto(2),
-    };
-    // bb2 (fill hdr): cmp = i<n; if cmp==0 -> sum-init(4), else fill-body(3)
-    let bb2 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(cmp),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(i)), cu(n)),
-        )],
-        terminator: guard(cmp, 4, 3),
-    };
-    // bb3 (fill body): idx = t*n + i; v = in[idx]; arr[i] = v*2; i += 1 -> bb2
-    let bb3 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(idx),
-                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(t)), cu(n)),
-            ),
-            Statement::Assign(
-                Place::local(idx),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(idx)), copy(Place::local(i))),
-            ),
-            Statement::Assign(Place::local(v), Rvalue::Use(copy(elem(inp, idx)))),
-            Statement::Assign(
-                Place::local(v2),
-                Rvalue::BinaryOp(
-                    BinOp::Mul,
-                    copy(Place::local(v)),
-                    Operand::Const(Constant::F32(2.0)),
-                ),
-            ),
-            Statement::Assign(arr_elem(arr, i), Rvalue::Use(copy(Place::local(v2)))),
-            Statement::Assign(
-                Place::local(i_new),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(i)), cu(1)),
-            ),
-            Statement::Assign(Place::local(i), Rvalue::Use(copy(Place::local(i_new)))),
-        ],
-        terminator: goto(2),
-    };
-    // bb4 (sum init): acc = 0; i = 0 -> bb5
-    let bb4 = BasicBlock {
-        statements: vec![
-            Statement::Assign(
-                Place::local(acc),
-                Rvalue::Use(Operand::Const(Constant::F32(0.0))),
-            ),
-            Statement::Assign(Place::local(i), Rvalue::Use(cu(0))),
-        ],
-        terminator: goto(5),
-    };
-    // bb5 (sum hdr): cmp = i<n; if cmp==0 -> store(7), else sum-body(6)
-    let bb5 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(cmp),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(i)), cu(n)),
-        )],
-        terminator: guard(cmp, 7, 6),
-    };
-    // bb6 (sum body): av = arr[i]; acc += av; i += 1 -> bb5
-    let bb6 = BasicBlock {
-        statements: vec![
-            Statement::Assign(Place::local(av), Rvalue::Use(copy(arr_elem(arr, i)))),
-            Statement::Assign(
-                Place::local(acc),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(acc)), copy(Place::local(av))),
-            ),
-            Statement::Assign(
-                Place::local(i_new),
-                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(i)), cu(1)),
-            ),
-            Statement::Assign(Place::local(i), Rvalue::Use(copy(Place::local(i_new)))),
-        ],
-        terminator: goto(5),
-    };
-    // bb7 (store): out[t] = acc -> return
-    let bb7 = BasicBlock {
-        statements: vec![Statement::Assign(
-            elem(out, t),
-            Rvalue::Use(copy(Place::local(acc))),
-        )],
-        terminator: Terminator::Return,
-    };
-    Body::new(
-        name,
-        2,
-        al.locals,
-        vec![bb0, bb1, bb2, bb3, bb4, bb5, bb6, bb7],
-    )
-}
-
 /// Serial reduce over the last axis: `out[r] = reduce_j x[r*cols + j]` for `cols` columns, storage dtype
 /// `dt`, accumulating in f32 (spec 024): each bf16 element widens to f32, the reduce runs in an f32
-/// accumulator, the result narrows to `dt` on store (byte-identical for `dt = Ty::F32`, the convenience
-/// that `reduce_last` used to expose before it moved to `poot_test_util::kernel_fixtures`, card 671, its
-/// only caller). `op` is the reduce op (`Add` for sum, `Max`). `init` seeds the accumulator (0.0 for sum,
+/// accumulator, the result narrows to `dt` on store (byte-identical for `dt = Ty::F32`). `op` is the reduce op (`Add` for sum, `Max`). `init` seeds the accumulator (0.0 for sum,
 /// a large negative for max). The output length (rows) comes from `Len(out)`; `cols` is baked in (the
 /// reduced extent).
 pub fn reduce_last_dt(name: &str, dt: Ty, op: BinOp, cols: usize, init: f32) -> Body {
@@ -461,10 +138,13 @@ pub fn reduce_last_dt(name: &str, dt: Ty, op: BinOp, cols: usize, init: f32) -> 
 #[cfg(test)]
 mod tests {
     use poot_codegen::{Target, compile};
-    use poot_runtime::KernelBuffer;
+    use poot_wgpu_runtime::KernelBuffer;
 
     use super::*;
-    use crate::test_support::{ctx, spv, stage_nvptx};
+    use crate::helpers::test_only::arr_elem;
+    use crate::helpers::{Alloc, slice_f32};
+    use crate::unit_helpers::{ctx, spv, stage_nvptx};
+    use poot_kernel_ir::{Local, WorkgroupLocalDecl};
 
     #[test]
     fn reduce_last_lds_parallel() {
@@ -551,5 +231,318 @@ mod tests {
             msg.contains("private array") && msg.contains("NVPTX-only"),
             "unexpected rejection message: {msg}"
         );
+    }
+
+    /// Parallel last-axis reduction via LDS: one workgroup of `w` lanes per row. Each lane reduces a strided
+    /// subset of the row into a register partial, writes it to LDS, a barrier, then lane 0 combines the `w`
+    /// partials and writes `out[row]`. The parallel-then-small-serial-combine shape generalizes a plain
+    /// workgroup-sum over a single row's first `w` elements. `op`/`init` select sum (Add, 0) or max (Max,
+    /// -inf). The reduction order differs from the serial [`reduce_last_dt`], so results are close to it, not
+    /// bit-identical. Launch `num_rows * w` threads with `wg = [w, 1, 1]`.
+    fn reduce_last_lds(name: &str, op: BinOp, cols: usize, init: f32, w: usize) -> Body {
+        let mut al = Alloc::new(vec![
+            ld(Ty::Unit, false),
+            ld(slice_f32(false), false), // 1 in
+            ld(slice_f32(true), true),   // 2 out
+        ]);
+        let (inp, out) = (local(1), local(2));
+        let row = al.add(Ty::Usize, false);
+        let lane = al.add(Ty::Usize, false);
+        let partial = al.add(Ty::F32, true);
+        let j = al.add(Ty::Usize, true);
+        let j_lt = al.add(Ty::Bool, false);
+        let idx = al.add(Ty::Usize, true);
+        let v = al.add(Ty::F32, false);
+        let part_new = al.add(Ty::F32, false);
+        let j_new = al.add(Ty::Usize, false);
+        let cmp0 = al.add(Ty::Bool, false);
+        let acc = al.add(Ty::F32, true);
+        let k = al.add(Ty::Usize, true);
+        let k_lt = al.add(Ty::Bool, false);
+        let lv = al.add(Ty::F32, false);
+        let acc_new = al.add(Ty::F32, false);
+        let k_new = al.add(Ty::Usize, false);
+        let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
+        let cf = |x: f32| Operand::Const(Constant::F32(x));
+        let goto = |b: u32| Terminator::Goto {
+            target: BlockId { index: b },
+        };
+        let red = |dst: Local, a: Local, b: Local| {
+            Statement::Assign(
+                Place::local(dst),
+                Rvalue::BinaryOp(op, copy(Place::local(a)), copy(Place::local(b))),
+            )
+        };
+
+        let bb0 = BasicBlock {
+            statements: vec![],
+            terminator: Terminator::ThreadIndexCall {
+                destination: Place::local(row),
+                dim: IndexAxis::GroupX,
+                target: BlockId { index: 1 },
+            },
+        };
+        let bb1 = BasicBlock {
+            statements: vec![],
+            terminator: Terminator::ThreadIndexCall {
+                destination: Place::local(lane),
+                dim: IndexAxis::LocalX,
+                target: BlockId { index: 2 },
+            },
+        };
+        // bb2: partial = init; j = lane -> bb3
+        let bb2 = BasicBlock {
+            statements: vec![
+                Statement::Assign(Place::local(partial), Rvalue::Use(cf(init))),
+                Statement::Assign(Place::local(j), Rvalue::Use(copy(Place::local(lane)))),
+            ],
+            terminator: goto(3),
+        };
+        // bb3 (acc hdr): j_lt = j < cols; if j_lt==0 (j>=cols) -> write LDS(5), else body(4)
+        let bb3 = BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(j_lt),
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(j)), cu(cols)),
+            )],
+            terminator: guard(j_lt, 5, 4),
+        };
+        // bb4 (acc body): idx = row*cols + j; partial op= in[idx]; j += w -> bb3
+        let bb4 = BasicBlock {
+            statements: vec![
+                Statement::Assign(
+                    Place::local(idx),
+                    Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(row)), cu(cols)),
+                ),
+                Statement::Assign(
+                    Place::local(idx),
+                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(idx)), copy(Place::local(j))),
+                ),
+                Statement::Assign(Place::local(v), Rvalue::Use(copy(elem(inp, idx)))),
+                red(part_new, partial, v),
+                Statement::Assign(
+                    Place::local(partial),
+                    Rvalue::Use(copy(Place::local(part_new))),
+                ),
+                Statement::Assign(
+                    Place::local(j_new),
+                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(j)), cu(w)),
+                ),
+                Statement::Assign(Place::local(j), Rvalue::Use(copy(Place::local(j_new)))),
+            ],
+            terminator: goto(3),
+        };
+        // bb5: LDS[lane] = partial; barrier -> bb6
+        let bb5 = BasicBlock {
+            statements: vec![Statement::WorkgroupLocalWrite {
+                idx: copy(Place::local(lane)),
+                value: copy(Place::local(partial)),
+                array: 0,
+            }],
+            terminator: Terminator::Barrier {
+                target: BlockId { index: 6 },
+            },
+        };
+        // bb6: cmp0 = (lane == 0); if cmp0==0 (lane != 0) -> ret(11), else combine(7)
+        let bb6 = BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(cmp0),
+                Rvalue::BinaryOp(BinOp::Eq, copy(Place::local(lane)), cu(0)),
+            )],
+            terminator: guard(cmp0, 11, 7),
+        };
+        // bb7: acc = init; k = 0 -> bb8
+        let bb7 = BasicBlock {
+            statements: vec![
+                Statement::Assign(Place::local(acc), Rvalue::Use(cf(init))),
+                Statement::Assign(Place::local(k), Rvalue::Use(cu(0))),
+            ],
+            terminator: goto(8),
+        };
+        // bb8 (combine hdr): k_lt = k < w; if k_lt==0 -> store(10), else body(9)
+        let bb8 = BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(k_lt),
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(k)), cu(w)),
+            )],
+            terminator: guard(k_lt, 10, 9),
+        };
+        // bb9 (combine body): acc op= LDS[k]; k += 1 -> bb8
+        let bb9 = BasicBlock {
+            statements: vec![
+                Statement::Assign(
+                    Place::local(lv),
+                    Rvalue::WorkgroupLocalRead {
+                        idx: copy(Place::local(k)),
+                        array: 0,
+                    },
+                ),
+                red(acc_new, acc, lv),
+                Statement::Assign(Place::local(acc), Rvalue::Use(copy(Place::local(acc_new)))),
+                Statement::Assign(
+                    Place::local(k_new),
+                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(k)), cu(1)),
+                ),
+                Statement::Assign(Place::local(k), Rvalue::Use(copy(Place::local(k_new)))),
+            ],
+            terminator: goto(8),
+        };
+        // bb10 (store): out[row] = acc; return
+        let bb10 = BasicBlock {
+            statements: vec![Statement::Assign(
+                elem(out, row),
+                Rvalue::Use(copy(Place::local(acc))),
+            )],
+            terminator: Terminator::Return,
+        };
+        let bb11 = BasicBlock {
+            statements: vec![],
+            terminator: Terminator::Return,
+        };
+        let mut body = Body::new(
+            name,
+            2,
+            al.locals,
+            vec![bb0, bb1, bb2, bb3, bb4, bb5, bb6, bb7, bb8, bb9, bb10, bb11],
+        );
+        body.workgroup_size = [w as u32, 1, 1];
+        body.workgroup_locals = vec![WorkgroupLocalDecl {
+            elem_ty: Ty::F32,
+            len: w as u32,
+        }];
+        body
+    }
+
+    /// Probe for the private fixed-size array (the flash-attention foundation): each thread fills
+    /// a per-thread `arr[n]` from its row of `in` (doubling), then reads it back to sum into `out[t]`. Both the
+    /// store and the load are dynamically indexed - the exact pattern that lowers on NVPTX (`alloca [n x f32]`)
+    /// but crashes the LLVM SPIR-V backend, so `compile(.., SpirvVulkan)` rejects it.
+    fn array_sum_probe(name: &str, n: usize) -> Body {
+        let mut al = Alloc::new(vec![
+            ld(Ty::Unit, false),
+            ld(slice_f32(false), false), // 1 in
+            ld(slice_f32(true), true),   // 2 out
+        ]);
+        let (inp, out) = (local(1), local(2));
+        let arr = al.add(
+            Ty::Array {
+                elem: Box::new(Ty::F32),
+                len: n as u32,
+            },
+            true,
+        );
+        let t = al.add(Ty::Usize, false);
+        let i = al.add(Ty::Usize, true);
+        let cmp = al.add(Ty::Bool, false);
+        let idx = al.add(Ty::Usize, true);
+        let v = al.add(Ty::F32, false);
+        let v2 = al.add(Ty::F32, false);
+        let acc = al.add(Ty::F32, true);
+        let av = al.add(Ty::F32, false);
+        let i_new = al.add(Ty::Usize, false);
+        let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
+        let goto = |b: u32| Terminator::Goto {
+            target: BlockId { index: b },
+        };
+
+        // bb0: t = thread X -> bb1
+        let bb0 = BasicBlock {
+            statements: vec![],
+            terminator: Terminator::ThreadIndexCall {
+                destination: Place::local(t),
+                dim: IndexAxis::X,
+                target: BlockId { index: 1 },
+            },
+        };
+        // bb1: i = 0 -> bb2
+        let bb1 = BasicBlock {
+            statements: vec![Statement::Assign(Place::local(i), Rvalue::Use(cu(0)))],
+            terminator: goto(2),
+        };
+        // bb2 (fill hdr): cmp = i<n; if cmp==0 -> sum-init(4), else fill-body(3)
+        let bb2 = BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(cmp),
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(i)), cu(n)),
+            )],
+            terminator: guard(cmp, 4, 3),
+        };
+        // bb3 (fill body): idx = t*n + i; v = in[idx]; arr[i] = v*2; i += 1 -> bb2
+        let bb3 = BasicBlock {
+            statements: vec![
+                Statement::Assign(
+                    Place::local(idx),
+                    Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(t)), cu(n)),
+                ),
+                Statement::Assign(
+                    Place::local(idx),
+                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(idx)), copy(Place::local(i))),
+                ),
+                Statement::Assign(Place::local(v), Rvalue::Use(copy(elem(inp, idx)))),
+                Statement::Assign(
+                    Place::local(v2),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        copy(Place::local(v)),
+                        Operand::Const(Constant::F32(2.0)),
+                    ),
+                ),
+                Statement::Assign(arr_elem(arr, i), Rvalue::Use(copy(Place::local(v2)))),
+                Statement::Assign(
+                    Place::local(i_new),
+                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(i)), cu(1)),
+                ),
+                Statement::Assign(Place::local(i), Rvalue::Use(copy(Place::local(i_new)))),
+            ],
+            terminator: goto(2),
+        };
+        // bb4 (sum init): acc = 0; i = 0 -> bb5
+        let bb4 = BasicBlock {
+            statements: vec![
+                Statement::Assign(
+                    Place::local(acc),
+                    Rvalue::Use(Operand::Const(Constant::F32(0.0))),
+                ),
+                Statement::Assign(Place::local(i), Rvalue::Use(cu(0))),
+            ],
+            terminator: goto(5),
+        };
+        // bb5 (sum hdr): cmp = i<n; if cmp==0 -> store(7), else sum-body(6)
+        let bb5 = BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(cmp),
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(i)), cu(n)),
+            )],
+            terminator: guard(cmp, 7, 6),
+        };
+        // bb6 (sum body): av = arr[i]; acc += av; i += 1 -> bb5
+        let bb6 = BasicBlock {
+            statements: vec![
+                Statement::Assign(Place::local(av), Rvalue::Use(copy(arr_elem(arr, i)))),
+                Statement::Assign(
+                    Place::local(acc),
+                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(acc)), copy(Place::local(av))),
+                ),
+                Statement::Assign(
+                    Place::local(i_new),
+                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(i)), cu(1)),
+                ),
+                Statement::Assign(Place::local(i), Rvalue::Use(copy(Place::local(i_new)))),
+            ],
+            terminator: goto(5),
+        };
+        // bb7 (store): out[t] = acc -> return
+        let bb7 = BasicBlock {
+            statements: vec![Statement::Assign(
+                elem(out, t),
+                Rvalue::Use(copy(Place::local(acc))),
+            )],
+            terminator: Terminator::Return,
+        };
+        Body::new(
+            name,
+            2,
+            al.locals,
+            vec![bb0, bb1, bb2, bb3, bb4, bb5, bb6, bb7],
+        )
     }
 }

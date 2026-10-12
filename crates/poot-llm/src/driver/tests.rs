@@ -13,12 +13,13 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use poot_executor::{
-    BufferRole, Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor,
-    ExecutorStats, HostSync, StateScope, StepInputs, StepOutputs,
+    Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor, ExecutorStats, HostSync,
+    StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
-use poot_graph_plan::{CompileOptions, StagedProgram, Submission, Target, TargetSet};
-use poot_models::chat::ChatFormat;
+use poot_graph_ir::{BinOp, Graph, StateRole, TensorType};
+use poot_graph_plan::{
+    CompileOptions, Target, production_plan::Submission, staged::StagedProgram, staged::TargetSet,
+};
 use poot_models::components::linear::{Weight, linear};
 use poot_models::components::standard::Step;
 use poot_models::model::{
@@ -31,8 +32,10 @@ use poot_quant::weights::{
     AttnRole, DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore,
     WeightView,
 };
+use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps, ElementKind};
 use poot_tensor::DType;
+use poot_text::ChatFormat;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 
@@ -45,9 +48,7 @@ use crate::driver::{
     Driver, DriverOptions, FinishReason, GenerateRequest, Generation, Head, Layout, LoadOptions,
     ModelHandle, PreparedSetLimits, Retention, ServingShapes, Warm,
 };
-use crate::error::ChatTemplateError;
-use crate::text::chat::ChatTemplateOverride;
-use crate::text::tokenize::{ChatTemplate, TextCodec};
+use poot_text::{ChatTemplate, ChatTemplateError, ChatTemplateOverride, TextCodec};
 
 /// The fake model's vocabulary: `<unk>` and `a` .. `k`, ids 0 ..= 11.
 const VOCAB: usize = 12;
@@ -77,6 +78,9 @@ pub(super) enum Variant {
     BadRowAxis,
     /// One `w.l0.attn.q` projection `[VOCAB, 4]` the LoRA pass can adapt, added into the logits.
     Lora,
+    /// The projection of [`Variant::Lora`] and one `StateRole::Positional` `[rows, 2, capacity, 4]` cache
+    /// the step folds in place: the weights and the cache a read-traffic row counts.
+    Positional,
 }
 
 impl Variant {
@@ -86,6 +90,7 @@ impl Variant {
             Some("recurrent") => Self::Recurrent,
             Some("bad_row_axis") => Self::BadRowAxis,
             Some("lora") => Self::Lora,
+            Some("positional") => Self::Positional,
             Some(_) => return None,
         })
     }
@@ -96,7 +101,13 @@ impl Variant {
             Self::Recurrent => "recurrent",
             Self::BadRowAxis => "bad_row_axis",
             Self::Lora => "lora",
+            Self::Positional => "positional",
         }
+    }
+
+    /// Whether the family's checkpoint holds the `[VOCAB, 4]` projection.
+    fn has_projection(self) -> bool {
+        matches!(self, Self::Lora | Self::Positional)
     }
 }
 
@@ -117,7 +128,12 @@ impl Model for Tiny {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(
+        &self,
+        phase: Phase,
+        shape: StepShape,
+        b: poot_graph_ir::Builder,
+    ) -> Result<Graph, TraceError> {
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: TINY,
@@ -141,8 +157,7 @@ impl Model for Tiny {
             return refuse(ShapeReason::TokensAboveCapacity);
         }
         self.log.lock().unwrap().push((phase, shape));
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         // The logits rows the shape asks for: every position under `All`, else the last.
         let first = if shape.logits == LogitRows::All {
@@ -159,19 +174,19 @@ impl Model for Tiny {
                 1,
                 first,
                 n,
-            ),
+            )?,
             DType::F32,
-        );
-        let pos = b.cast(b.slice(step.pos(), 1, first, n), DType::F32);
-        let seed = b.binary(BinOp::Add, token, pos);
+        )?;
+        let pos = b.cast(b.slice(step.pos(), 1, first, n)?, DType::F32)?;
+        let seed = b.binary(BinOp::Add, token, pos)?;
         match self.variant {
             Variant::Plain => {}
             Variant::Recurrent => {
-                let state = step.recurrent_state(&b, "toy.state", DType::F32, &[4]);
+                let state = step.recurrent_state(&b, "toy.state", DType::F32, &[4])?;
                 // The last position's seed, whatever width the step has.
-                let spread = b.broadcast(b.slice(seed, 1, out - 1, out), vec![rows, 4]);
-                let folded = b.binary(BinOp::Add, state.current(), spread);
-                step.carry_recurrent(&b, state, folded);
+                let spread = b.broadcast(b.slice(seed, 1, out - 1, out)?, vec![rows, 4])?;
+                let folded = b.binary(BinOp::Add, state.current(), spread)?;
+                step.carry_recurrent(&b, state, folded)?;
             }
             Variant::BadRowAxis => {
                 let dims = vec![4, rows];
@@ -179,21 +194,30 @@ impl Model for Tiny {
                     "toy.state",
                     TensorType::f32(dims.clone()),
                     StateRole::Recurrent,
-                );
-                let spread = b.broadcast(b.reshape(seed, vec![1, rows]), dims);
-                let folded = b.binary(BinOp::Add, state, spread);
+                )?;
+                let spread = b.broadcast(b.reshape(seed, vec![1, rows])?, dims)?;
+                let folded = b.binary(BinOp::Add, state, spread)?;
                 step.carry(state, folded);
             }
             Variant::Lora => {}
+            Variant::Positional => {
+                let cache = b.state_input(
+                    "toy.kv",
+                    TensorType::f32(vec![rows, 2, shape.capacity.get(), 4]),
+                    StateRole::Positional { axis: 2 },
+                )?;
+                step.carry(cache, b.binary(BinOp::Mul, cache, cache)?);
+            }
         }
-        let mut logits = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, VOCAB]);
-        if self.variant == Variant::Lora {
+        let mut logits =
+            b.broadcast(b.reshape(seed, vec![rows, out, 1])?, vec![rows, out, VOCAB])?;
+        if self.variant.has_projection() {
             let q = Weight::new(&self.weights, tiny_projection(), &[VOCAB, 4])
                 .expect("the lora variant's store holds its projection");
-            let inputs = b.broadcast(b.reshape(seed, vec![rows, out, 1]), vec![rows, out, 4]);
-            logits = b.binary(BinOp::Add, logits, linear(&b, inputs, &q, None));
+            let inputs = b.broadcast(b.reshape(seed, vec![rows, out, 1])?, vec![rows, out, 4])?;
+            logits = b.binary(BinOp::Add, logits, linear(&b, inputs, &q, None)?)?;
         }
-        Ok(step.finish(b, logits).unwrap())
+        Ok(step.finish(b, logits)?)
     }
 }
 
@@ -265,7 +289,7 @@ fn tiny_projection() -> WeightId {
 /// The checkpoint of the fake family: empty, except the lora variant's `[VOCAB, 4]` projection.
 fn tiny_store(variant: Variant) -> WeightStore {
     let mut builder = WeightStore::builder();
-    if variant == Variant::Lora {
+    if variant.has_projection() {
         let values: Vec<u8> = (0..VOCAB * 4)
             .flat_map(|i| (((i * 7) % 11) as f32 / 11.0 - 0.4).to_le_bytes())
             .collect();
@@ -284,7 +308,7 @@ fn tiny_store(variant: Variant) -> WeightStore {
 
 fn tiny_weights(variant: Variant, store: &WeightStore) -> WeightMap {
     let mut map = WeightMap::builder(store);
-    if variant == Variant::Lora {
+    if variant.has_projection() {
         map.map(tiny_projection(), WeightView::Stored(WeightKey::from("q")))
             .unwrap();
     }
@@ -320,9 +344,8 @@ pub(super) fn tiny_text() -> TextCodec {
     tokenizer.with_pre_tokenizer(Some(
         tokenizers::pre_tokenizers::whitespace::WhitespaceSplit,
     ));
-    TextCodec::new(
+    TextCodec::with_tokenizer(
         tokenizer,
-        None,
         None,
         EOS,
         ChatFormat::ChatML,
@@ -802,7 +825,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
             decode: compile,
             capacity: nz(options.capacity),
             prefill_chunk: nz(options.chunk),
-            max_trace_tokens: nz(64),
+            trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(64)),
             prepared: PreparedSetLimits {
                 max_entries: nz(options.max_entries),
                 max_retained_bytes: NonZeroU64::new(options.max_retained_bytes).unwrap(),
@@ -1210,11 +1233,14 @@ fn the_entry_limit_refuses_the_third_and_keeps_the_first_two() {
     // the first admitted candidate is prefill(4): a 4-token prompt replays it.
     let before = rig.driver.stats();
     let steps_before = rig.world.borrow().steps.len();
-    let out = rig.driver.generate(
-        request(&[1; 4], 1, Sampler::greedy()),
-        &mut |_: u32, _: &str| GenerationControl::Continue(()),
-    );
-    assert_eq!(out.unwrap().tokens, [1]);
+    let out = rig
+        .driver
+        .generate(
+            request(&[1; 4], 1, Sampler::greedy()),
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap();
+    assert_eq!(out.tokens, [1]);
     let after = rig.driver.stats();
     assert_eq!(
         after.compiles, before.compiles,
@@ -1392,9 +1418,9 @@ fn a_hf_directory_loads_through_the_registry() {
         serde_json::json!({"eos_token_id": [46, 47]}).to_string(),
     )
     .unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
     tiny_text()
-        .tokenizer
+        .tokenizer()
         .save(dir.join("tokenizer.json"), false)
         .unwrap();
 
@@ -1434,10 +1460,10 @@ fn pinned_hf_directory(
     let weights_path = dir.join("model.safetensors");
     match weights {
         Some(bytes) => std::fs::write(&weights_path, bytes).unwrap(),
-        None => poot_test_util::safetensors::write(&weights_path, &fixture.store),
+        None => poot_quant::test_support::safetensors::write(&weights_path, &fixture.store),
     }
     tiny_text()
-        .tokenizer
+        .tokenizer()
         .save(dir.join("tokenizer.json"), false)
         .unwrap();
     let bytes = std::fs::read(&weights_path).unwrap();
@@ -1628,7 +1654,7 @@ fn an_override_that_fails_to_render_is_an_error_not_a_fallback() {
     assert!(
         matches!(
             err,
-            crate::TextError::ChatTemplate(ChatTemplateError::Render(ref reason))
+            poot_text::TextError::ChatTemplate(ChatTemplateError::Render(ref reason))
                 if reason.contains("no such conversation")
         ),
         "{err:?}"
@@ -2187,4 +2213,40 @@ fn a_pooled_driver_keeps_graphs_without_routed_experts_resident() {
     });
     run(&mut rig, request(&[1, 2, 3], 3, Sampler::greedy()))
         .expect("a dense graph compiles resident under a pool");
+}
+
+/// The driver counts what the plan reads: each decode step streams the projection once and reads the
+/// cache once per attended position (`pos + 1` for a token at `pos`), and prefill steps count in their
+/// own counter. The expected figure is rebuilt from the positions the fake device recorded for each
+/// step. Mutations: count `pos` for `pos + 1`; swap the decode and prefill counters.
+#[test]
+fn read_bytes_are_the_weights_per_step_plus_the_cache_per_attended_position() {
+    let mut rig = build_rig(
+        RigOptions {
+            variant: Variant::Positional,
+            ..RigOptions::default()
+        },
+        logits_script(vec![favoring(1)]),
+    )
+    .unwrap();
+    run(&mut rig, request(&[1, 2, 3], 4, Sampler::greedy())).unwrap();
+    let weights = (VOCAB * 4 * 4) as u64;
+    let per_position = (2 * 4 * 4) as u64;
+    let expected = |decode: bool| {
+        rig.world
+            .borrow()
+            .steps
+            .iter()
+            .filter(|step| (step.phase == Some(Phase::Decode)) == decode)
+            .map(|step| {
+                let attended: i64 = step.positions.iter().map(|&p| i64::from(p) + 1).sum();
+                weights + per_position * attended as u64
+            })
+            .sum::<u64>()
+    };
+    let (decode, prefill) = (expected(true), expected(false));
+    assert!(decode > 0 && prefill > 0, "the run took both kinds of step");
+    let stats = rig.driver.stats();
+    assert_eq!(stats.decode_read_bytes, decode);
+    assert_eq!(stats.prefill_read_bytes, prefill);
 }

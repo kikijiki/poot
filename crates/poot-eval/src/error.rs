@@ -7,8 +7,8 @@
 use poot_graph_ir::{ExecutionValidationFailure, IndexRange, TensorType, ValueId};
 use poot_tensor::DType;
 
+use crate::PackedEvalError;
 use crate::ops::index_rule::IndexFault;
-use crate::{PackedEvalError, exact_dense};
 
 /// A cast's source or result value, literal, for a [`CastFault`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,8 +72,6 @@ pub enum EvalError {
     #[error(transparent)]
     Packed(#[from] PackedEvalError),
     #[error(transparent)]
-    ExactDense(#[from] exact_dense::ExactDenseError),
-    #[error(transparent)]
     ExactBf16(#[from] crate::exact_bf16::ExactBf16Error),
     #[error(transparent)]
     Fp8(#[from] crate::fp8::Fp8Error),
@@ -103,6 +101,14 @@ pub enum EvalError {
         eqn: ValueId,
         op: &'static str,
         detail: String,
+    },
+    /// The decomposition a composite is evaluated through could not be built: the tracer refused it
+    /// (it does not fit the decomposition limits, or its definition is defective).
+    #[error("eqn {eqn} ({op}): its decomposition could not be built: {source}")]
+    Decomposition {
+        eqn: ValueId,
+        op: &'static str,
+        source: Box<poot_graph_ir::BuilderError>,
     },
     /// A bind-time fail-closed check: the bound carrier does not match what `expected` requires
     /// (an I32 input without authoritative words, an E4M3FN input bound as dense, an owner view

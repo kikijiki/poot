@@ -1,7 +1,11 @@
-use super::*;
-use poot_graph_ir::ValueTable;
+use super::guard_witness::{first_unobserved_clamp, producer_map};
+use super::{
+    BinOp, DType, EditError, Eqn, Graph, HashMap, HashSet, NumericalRewriteDecline,
+    NumericalRewriteReason, OpKind, Operand, RedOp, Scalar, Storage, UnOp, ValueId, with_eqns,
+};
 use poot_graph_ir::{
-    AttentionAttrs, ComputedConst, IndexRange, KeyLayout, KvBound, RangeFacts, value_ranges,
+    AttentionAttrs, ComputedConst, IndexRange, KeyLayout, KvBound, RangeFacts, ValueTable,
+    value_ranges,
 };
 
 /// Why the attention matcher did not fuse a candidate equation, in the order the checks run. The pass
@@ -76,15 +80,6 @@ pub(super) enum RopeDecline {
     TableWidth,
 }
 
-/// The producer index of every value defined by an equation.
-pub(super) fn producer_map(g: &Graph) -> HashMap<ValueId, usize> {
-    g.eqns()
-        .iter()
-        .enumerate()
-        .map(|(index, eqn)| (eqn.out, index))
-        .collect()
-}
-
 /// The equation indices that consume each value.
 fn consumer_map(g: &Graph) -> ValueTable<Vec<usize>> {
     let mut consumers = ValueTable::filled(g.values().len(), Vec::new());
@@ -129,7 +124,7 @@ pub fn canonicalize(g: &Graph) -> Result<Graph, EditError> {
 
 /// The canonical graph and typed explanations of numerical rewrites that were withheld. Value ids
 /// identify the original candidate's result; a declined optimization does not refuse compilation.
-pub fn canonicalize_with_declines(
+pub(crate) fn canonicalize_with_declines(
     g: &Graph,
 ) -> Result<(Graph, Vec<NumericalRewriteDecline>), EditError> {
     let producers = producer_map(g);
@@ -762,42 +757,7 @@ fn live_length_proved(
         .ok()
         .and_then(|lk| IndexRange::new(1, lk + 1));
     let in_range = live.is_some_and(|live| facts[len].is_some_and(|proved| proved.within(&live)));
-    in_range
-        && facts
-            .clamps(len)
-            .iter()
-            .all(|&condition| guard_witnessed(g, prod, condition))
-}
-
-/// Whether a declared validation output counts the lanes where `condition` is set: a keepdim last-axis
-/// `Sum` of its F32 cast, the shape `Builder::guard_index_bounds` declares for its witness. Anything else
-/// (a witness over another value, a reduction over another axis) does not observe every clamped lane.
-fn guard_witnessed(g: &Graph, prod: &HashMap<ValueId, usize>, condition: ValueId) -> bool {
-    let producer = |value: ValueId| prod.get(&value).map(|&index| &g.eqns()[index]);
-    g.witnesses().any(|validation| {
-        let Some(sum) = producer(validation.value) else {
-            return false;
-        };
-        let (
-            OpKind::Reduce {
-                op: RedOp::Sum,
-                axis,
-                keepdim: true,
-            },
-            [Operand::Value(flag)],
-        ) = (&sum.op, sum.inputs.as_slice())
-        else {
-            return false;
-        };
-        if *axis + 1 != g.aval(*flag).shape.len() {
-            return false;
-        }
-        matches!(
-            producer(*flag),
-            Some(Eqn { op: OpKind::Cast { to: DType::F32 }, inputs, .. })
-                if matches!(inputs.as_slice(), [Operand::Value(observed)] if *observed == condition)
-        )
-    })
+    in_range && first_unobserved_clamp(g, prod, facts, len).is_none()
 }
 
 impl AttnMatch {
@@ -835,6 +795,13 @@ impl AttnMatch {
 /// gets flash without a separate `_flash` variant. Best run on a `cse`'d graph. `compile` passes its own
 /// measured `target.caps.max_grid[0]` (wgpu's `gridDim.x` caps at 65535 and has no plan-time fallback
 /// from the op to the decomposition).
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn flash_attention_capped(
     g: &Graph,
     max_prefill_groups: Option<usize>,
@@ -1055,6 +1022,13 @@ fn rope_types_as(
 /// `Add` core dead. Conservative and result-preserving (one semantic definition shared by tracing, the oracle and every lowering). Run on a `cse`'d graph, before
 /// flash/fuse; the dead intermediates need a following `dce`. It only rewrites the q/k rope, so it is
 /// independent of the flash-attention match.
+#[cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(
+        unreachable_pub,
+        reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
+    )
+)]
 pub fn rope_fusion(g: &Graph) -> Result<Graph, EditError> {
     let mut prod: HashMap<ValueId, usize> = HashMap::new();
     for (i, e) in g.eqns().iter().enumerate() {

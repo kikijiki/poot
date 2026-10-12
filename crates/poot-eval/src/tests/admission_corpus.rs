@@ -33,11 +33,11 @@ use std::num::NonZeroU32;
 use poot_graph_ir::op::{ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep};
 use poot_graph_ir::{BinOp, Builder, OpKind, Operand, RedOp, StateRole, TensorType, UnOp};
 
-use super::helpers;
 use crate::exact_value::ExactValue;
 use crate::observer::EvalObserver;
 use crate::ops;
 use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
 
 /// A no-op observer that proves the walk tolerates one being attached without changing any bit it
@@ -144,13 +144,13 @@ fn assert_digest(label: &str, value: &Value, bits: &[u32]) {
 /// A representation-agnostic comparison of one value's published bits (ADR-0101: every element),
 /// dtype-semantic so a row's recorded digest is independent of the carrier's storage class: I32 words
 /// as `u32`, F32/BF16/F16 values widened to f32 (`to_f32` is exact) as their bits, E4M3FN as its raw
-/// bytes. Every `Value::Owner` kind too: the Spec-376 BF16 lane and the
-/// exact-I32 lane both publish `Value::Owner`, not just `Value::Host`.
+/// bytes. Every `Value::Exact` kind too: the Spec-376 BF16 lane and the
+/// exact-I32 lane both publish `Value::Exact`, not just `Value::Host`.
 fn value_bits(value: &Value) -> Vec<u32> {
     match value {
         Value::Host(tensor) => host_bits(tensor),
-        Value::Owner(ExactValue::I32(view)) => view.i32_words().iter().map(|&i| i as u32).collect(),
-        Value::Owner(exact) => host_bits(&exact.materialize_dense()),
+        Value::Exact(ExactValue::I32(view)) => view.i32_words().iter().map(|&i| i as u32).collect(),
+        Value::Exact(exact) => host_bits(&exact.materialize_dense()),
         other => panic!("value_bits: unexpected published carrier {other:?}"),
     }
 }
@@ -214,9 +214,9 @@ fn f16_host(shape: Vec<usize>, values: &[f32]) -> HostTensor {
 #[test]
 fn unary_admits_f32_and_i32_word_forms() {
     // F32 arithmetic unary (Neg): admitted for every arithmetic dtype, not just F32.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![3]));
-    let y = b.unary(UnOp::Neg, x);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![3])).unwrap();
+    let y = b.unary(UnOp::Neg, x).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![3], vec![1.0, -2.0, 0.0]))]);
     let out = eval_every_combination("unary f32 neg", &g, &inputs).unwrap();
@@ -227,9 +227,9 @@ fn unary_admits_f32_and_i32_word_forms() {
     assert_eq!(t.as_f32().unwrap(), &[-1.0, 2.0, -0.0]);
 
     // I32 word unary (Not): admitted only for I32, and only Not/Clz.
-    let b = Builder::new();
-    let x = helpers::i32_constant(&b, "x", vec![2]).unwrap();
-    let y = b.unary(UnOp::Not, x);
+    let b = Builder::for_tests();
+    let x = graph_fixtures::i32_constant(&b, "x", vec![2]).unwrap();
+    let y = b.unary(UnOp::Not, x).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![2], vec![0, -1]))]);
     let out = eval_every_combination("unary i32 not", &g, &inputs).unwrap();
@@ -242,10 +242,10 @@ fn unary_admits_f32_and_i32_word_forms() {
 
 #[test]
 fn binary_admits_f32_arithmetic_and_i32_word_forms() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2]));
-    let y = b.constant("y", TensorType::f32(vec![2]));
-    let z = b.binary(BinOp::Add, x, y);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2])).unwrap();
+    let y = b.constant("y", TensorType::f32(vec![2])).unwrap();
+    let z = b.binary(BinOp::Add, x, y).unwrap();
     let g = b.finish(z).unwrap();
     let inputs = dense_inputs([
         (x.id(), HostTensor::f32(vec![2], vec![1.0, 2.0])),
@@ -263,10 +263,10 @@ fn binary_admits_f32_arithmetic_and_i32_word_forms() {
         (BinOp::GeU, [-1, 1], [1, -1], [1, 0]),
         (BinOp::RemU, [7, -7], [3, 3], [1, 0]),
     ] {
-        let b = Builder::new();
-        let x = helpers::i32_constant(&b, "x", vec![2]).unwrap();
-        let y = helpers::i32_constant(&b, "y", vec![2]).unwrap();
-        let z = b.binary(op, x, y);
+        let b = Builder::for_tests();
+        let x = graph_fixtures::i32_constant(&b, "x", vec![2]).unwrap();
+        let y = graph_fixtures::i32_constant(&b, "y", vec![2]).unwrap();
+        let z = b.binary(op, x, y).unwrap();
         let g = b.finish(z).unwrap();
         let inputs = dense_inputs([
             (x.id(), HostTensor::i32(vec![2], a.to_vec())),
@@ -282,11 +282,11 @@ fn binary_admits_f32_arithmetic_and_i32_word_forms() {
 
 #[test]
 fn select_evaluates_i32_branches_through_every_binding() {
-    let b = Builder::new();
-    let cond = helpers::i32_constant(&b, "cond", vec![2]).unwrap();
-    let t = helpers::i32_constant(&b, "t", vec![2]).unwrap();
-    let f = helpers::i32_constant(&b, "f", vec![2]).unwrap();
-    let out = b.select(cond, t, f);
+    let b = Builder::for_tests();
+    let cond = graph_fixtures::i32_constant(&b, "cond", vec![2]).unwrap();
+    let t = graph_fixtures::i32_constant(&b, "t", vec![2]).unwrap();
+    let f = graph_fixtures::i32_constant(&b, "f", vec![2]).unwrap();
+    let out = b.select(cond, t, f).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (cond.id(), HostTensor::i32(vec![2], vec![1, 0])),
@@ -306,9 +306,9 @@ fn select_evaluates_i32_branches_through_every_binding() {
 
 #[test]
 fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 3]));
-    let out = b.reduce(RedOp::Sum, x, 1, false);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+    let out = b.reduce(RedOp::Sum, x, 1, false).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(
         x.id(),
@@ -317,17 +317,17 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let out = eval_every_combination("reduce sum", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[6.0, 15.0]);
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1]));
-    let out = b.broadcast(x, vec![3]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1])).unwrap();
+    let out = b.broadcast(x, vec![3]).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![1], vec![7.0]))]);
     let out = eval_every_combination("broadcast", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[7.0, 7.0, 7.0]);
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 3]));
-    let out = b.reshape(x, vec![3, 2]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+    let out = b.reshape(x, vec![3, 2]).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(
         x.id(),
@@ -336,9 +336,9 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let out = eval_every_combination("reshape", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().shape(), vec![3, 2]);
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 3]));
-    let out = b.transpose(x, vec![1, 0]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+    let out = b.transpose(x, vec![1, 0]).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(
         x.id(),
@@ -347,18 +347,18 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
     let out = eval_every_combination("transpose", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().shape(), vec![3, 2]);
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4]));
-    let out = b.slice(x, 0, 1, 3);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let out = b.slice(x, 0, 1, 3).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]))]);
     let out = eval_every_combination("slice", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[2.0, 3.0]);
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2]));
-    let y = b.constant("y", TensorType::f32(vec![2]));
-    let out = b.concat(0, &[x, y]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2])).unwrap();
+    let y = b.constant("y", TensorType::f32(vec![2])).unwrap();
+    let out = b.concat(0, &[x, y]).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (x.id(), HostTensor::f32(vec![2], vec![1.0, 2.0])),
@@ -370,8 +370,8 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
         &[1.0, 2.0, 3.0, 4.0]
     );
 
-    let b = Builder::new();
-    let out = b.iota(4);
+    let b = Builder::for_tests();
+    let out = b.iota(4).unwrap();
     let g = b.finish(out).unwrap();
     let out = eval_every_combination("iota", &g, &HashMap::new()).unwrap();
     assert_eq!(
@@ -387,10 +387,10 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
 
 #[test]
 fn gather_scatter_scatter_update_evaluate() {
-    let b = Builder::new();
-    let table = b.constant("table", TensorType::f32(vec![3, 2]));
-    let index = helpers::i32_constant(&b, "index", vec![2]).unwrap();
-    let out = b.gather(table, 0, index);
+    let b = Builder::for_tests();
+    let table = b.constant("table", TensorType::f32(vec![3, 2])).unwrap();
+    let index = graph_fixtures::i32_constant(&b, "index", vec![2]).unwrap();
+    let out = b.gather(table, 0, index).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (
@@ -405,10 +405,10 @@ fn gather_scatter_scatter_update_evaluate() {
         &[5.0, 6.0, 1.0, 2.0]
     );
 
-    let b = Builder::new();
-    let src = b.constant("src", TensorType::f32(vec![2, 2]));
-    let index = helpers::i32_constant(&b, "index", vec![2]).unwrap();
-    let out = b.scatter(src, index);
+    let b = Builder::for_tests();
+    let src = b.constant("src", TensorType::f32(vec![2, 2])).unwrap();
+    let index = graph_fixtures::i32_constant(&b, "index", vec![2]).unwrap();
+    let out = b.scatter(src, index).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (
@@ -423,11 +423,11 @@ fn gather_scatter_scatter_update_evaluate() {
         &[3.0, 4.0, 1.0, 2.0]
     );
 
-    let b = Builder::new();
-    let base = b.constant("base", TensorType::f32(vec![3, 1]));
-    let src = b.constant("src", TensorType::f32(vec![2, 1]));
-    let inv = helpers::i32_constant(&b, "inv", vec![3]).unwrap();
-    let out = b.scatter_update(base, src, inv);
+    let b = Builder::for_tests();
+    let base = b.constant("base", TensorType::f32(vec![3, 1])).unwrap();
+    let src = b.constant("src", TensorType::f32(vec![2, 1])).unwrap();
+    let inv = graph_fixtures::i32_constant(&b, "inv", vec![3]).unwrap();
+    let out = b.scatter_update(base, src, inv).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (base.id(), HostTensor::f32(vec![3, 1], vec![0.0, 0.0, 0.0])),
@@ -440,10 +440,10 @@ fn gather_scatter_scatter_update_evaluate() {
 
 #[test]
 fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::f32(vec![1, 2]));
-    let w = b.constant("w", TensorType::f32(vec![2, 2]));
-    let out = b.matmul(a, w);
+    let b = Builder::for_tests();
+    let a = b.constant("a", TensorType::f32(vec![1, 2])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![2, 2])).unwrap();
+    let out = b.matmul(a, w).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (a.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
@@ -455,13 +455,13 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
     let out = eval_every_combination("matmul", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[1.0, 2.0]);
 
-    let b = Builder::new();
-    let a = b.constant("a", TensorType::f32(vec![1, 2]));
-    let w = b.constant("w", TensorType::f32(vec![2, 2]));
-    let bias = b.constant("bias", TensorType::f32(vec![2]));
+    let b = Builder::for_tests();
+    let a = b.constant("a", TensorType::f32(vec![1, 2])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![2, 2])).unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![2])).unwrap();
     // `ContractionEpilogue` is compiler-only (the fuse rule forms it), so this row stages it through an
     // append plan to evaluate the op itself: the matmul, then `head + bias`.
-    let mut plan = b.append_plan(0);
+    let mut plan = b.append_plan(0).unwrap();
     let staged = plan
         .equation(
             OpKind::ContractionEpilogue {
@@ -498,11 +498,11 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
     let out = eval_every_combination("contraction_epilogue", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[11.0, 22.0]);
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 2]));
-    let w = b.constant("w", TensorType::f32(vec![2, 2, 2]));
-    let idx = helpers::i32_constant(&b, "idx", vec![1]).unwrap();
-    let out = b.indexed_matmul(x, w, idx);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 2])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![2, 2, 2])).unwrap();
+    let idx = graph_fixtures::i32_constant(&b, "idx", vec![1]).unwrap();
+    let out = b.indexed_matmul(x, w, idx).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (x.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
@@ -518,10 +518,10 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
 
 #[test]
 fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
-    let b = Builder::new();
-    let base = b.constant("base", TensorType::f32(vec![4]));
-    let update = b.constant("update", TensorType::f32(vec![2]));
-    let out = b.dynamic_update_slice(base, update, 1, 0);
+    let b = Builder::for_tests();
+    let base = b.constant("base", TensorType::f32(vec![4])).unwrap();
+    let update = b.constant("update", TensorType::f32(vec![2])).unwrap();
+    let out = b.dynamic_update_slice(base, update, 1, 0).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (
@@ -536,18 +536,18 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
         &[0.0, 9.0, 8.0, 0.0]
     );
 
-    let b = Builder::new();
-    let x = helpers::i32_constant(&b, "x", vec![4]).unwrap();
-    let packed = b.pack_i8(x);
+    let b = Builder::for_tests();
+    let x = graph_fixtures::i32_constant(&b, "x", vec![4]).unwrap();
+    let packed = b.pack_i8(x).unwrap();
     let g = b.finish(packed).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
     let out = eval_every_combination("pack_i8", &g, &inputs).unwrap();
     assert!(out.as_host().unwrap().as_i32().is_some());
 
-    let b = Builder::new();
-    let x = helpers::i32_constant(&b, "x", vec![4]).unwrap();
-    let packed = b.pack_i8(x);
-    let out = b.unpack_i8(packed, 4);
+    let b = Builder::for_tests();
+    let x = graph_fixtures::i32_constant(&b, "x", vec![4]).unwrap();
+    let packed = b.pack_i8(x).unwrap();
+    let out = b.unpack_i8(packed, 4).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
     let out = eval_every_combination("unpack_i8", &g, &inputs).unwrap();
@@ -559,9 +559,9 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
     // ArgTopK's input is a precomputed per-element RANK (0 = best), not a raw score: `out[r] = i` for
     // every element `i` whose rank `r` is `< k`. Element 1 has rank 0 and element 3 has rank 1, so
     // `out = [1, 3]`.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4]));
-    let out = b.arg_top_k(x, 2);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let out = b.arg_top_k(x, 2).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![4], vec![2.0, 0.0, 3.0, 1.0]))]);
     let out = eval_every_combination("arg_top_k", &g, &inputs).unwrap();
@@ -570,17 +570,17 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
 
 #[test]
 fn all_reduce_all_gather_are_the_single_rank_identity() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![3]));
-    let out = b.all_reduce(x, RedOp::Sum, 0);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![3])).unwrap();
+    let out = b.all_reduce(x, RedOp::Sum, 0).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![3], vec![1.0, 2.0, 3.0]))]);
     let out = eval_every_combination("all_reduce", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[1.0, 2.0, 3.0]);
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![3]));
-    let out = b.all_gather(x, 0, NonZeroU32::MIN);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![3])).unwrap();
+    let out = b.all_gather(x, 0, NonZeroU32::MIN).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![3], vec![1.0, 2.0, 3.0]))]);
     let out = eval_every_combination("all_gather", &g, &inputs).unwrap();
@@ -591,9 +591,9 @@ fn all_reduce_all_gather_are_the_single_rank_identity() {
 /// refusal on every option combination, never the input returned as if it were the gathered tensor.
 #[test]
 fn all_gather_over_more_than_one_rank_is_refused() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![3]));
-    let out = b.all_gather(x, 0, NonZeroU32::new(2).unwrap());
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![3])).unwrap();
+    let out = b.all_gather(x, 0, NonZeroU32::new(2).unwrap()).unwrap();
     let eqn = out.id();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![3], vec![1.0, 2.0, 3.0]))]);
@@ -614,9 +614,9 @@ fn all_gather_over_more_than_one_rank_is_refused() {
 /// `import_run.rs` device rows); this corpus entry only proves every rule type-checks and evaluates.
 #[test]
 fn random_uniform_and_sample_token_evaluate() {
-    let b = Builder::new();
-    let seed = helpers::i32_constant(&b, "seed", vec![2]).unwrap();
-    let out = b.random_uniform(seed, 3);
+    let b = Builder::for_tests();
+    let seed = graph_fixtures::i32_constant(&b, "seed", vec![2]).unwrap();
+    let out = b.random_uniform(seed, 3).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(seed.id(), HostTensor::i32(vec![2], vec![1, 2]))]);
     let out = eval_every_combination("random_uniform", &g, &inputs).unwrap();
@@ -626,15 +626,17 @@ fn random_uniform_and_sample_token_evaluate() {
         assert!(u > 0.0 && u < 1.0, "u={u} must stay strictly inside (0,1)");
     }
 
-    let b = Builder::new();
-    let logits = b.constant("logits", TensorType::f32(vec![2, 5]));
-    let out = b.sample_token(
-        poot_graph_ir::op::SampleRule::Greedy,
-        logits,
-        None,
-        None,
-        None,
-    );
+    let b = Builder::for_tests();
+    let logits = b.constant("logits", TensorType::f32(vec![2, 5])).unwrap();
+    let out = b
+        .sample_token(
+            poot_graph_ir::op::SampleRule::Greedy,
+            logits,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(
         logits.id(),
@@ -653,20 +655,24 @@ fn random_uniform_and_sample_token_evaluate() {
         (poot_graph_ir::op::SampleRule::GumbelTopK, 3),
         (poot_graph_ir::op::SampleRule::GumbelTopKTopP, 4),
     ] {
-        let b = Builder::new();
-        let logits = b.constant("logits", TensorType::f32(vec![1, 4]));
-        let noise = b.constant("noise", TensorType::f32(vec![1, 4]));
-        let params = b.constant("params", TensorType::f32(vec![1, cols]));
+        let b = Builder::for_tests();
+        let logits = b.constant("logits", TensorType::f32(vec![1, 4])).unwrap();
+        let noise = b.constant("noise", TensorType::f32(vec![1, 4])).unwrap();
+        let params = b
+            .constant("params", TensorType::f32(vec![1, cols]))
+            .unwrap();
         let top_k = if matches!(
             rule,
             poot_graph_ir::op::SampleRule::GumbelTopK
                 | poot_graph_ir::op::SampleRule::GumbelTopKTopP
         ) {
-            Some(helpers::i32_constant(&b, "top_k", vec![1]).unwrap())
+            Some(graph_fixtures::i32_constant(&b, "top_k", vec![1]).unwrap())
         } else {
             None
         };
-        let out = b.sample_token(rule, logits, Some(noise), Some(params), top_k);
+        let out = b
+            .sample_token(rule, logits, Some(noise), Some(params), top_k)
+            .unwrap();
         let g = b.finish(out).unwrap();
         let mut params_data = vec![1.0f32, 0.0, 1.0];
         if cols == 4 {
@@ -707,19 +713,22 @@ fn random_uniform_and_sample_token_evaluate() {
 /// card's named mutation "resume drops the state pairs; the second step diverges").
 #[test]
 fn resume_appends_a_greedy_sample_head_and_keeps_state_unchanged() {
-    let b = Builder::new();
-    let logits = b.constant("logits", TensorType::f32(vec![4]));
-    let cache_in = b.state_input("cache", TensorType::f32(vec![4]), StateRole::Recurrent);
+    let b = Builder::for_tests();
+    let logits = b.constant("logits", TensorType::f32(vec![4])).unwrap();
+    let cache_in = b
+        .state_input("cache", TensorType::f32(vec![4]), StateRole::Recurrent)
+        .unwrap();
     let g = b
         .finish(poot_graph_ir::Outputs::new(logits).with_state(&[(cache_in, cache_in)]))
         .unwrap();
 
-    let resumed = Builder::resume(g);
+    let resumed = Builder::resume(g, poot_graph_ir::TraceLimits::for_tests()).unwrap();
     let head = poot_graph_ir::ops::sampling::sample_head(
         &resumed.builder,
         resumed.outputs.result,
         poot_graph_ir::op::SampleRule::Greedy,
-    );
+    )
+    .unwrap();
     let g2 = resumed
         .builder
         .finish(poot_graph_ir::Outputs::new(head.out).with_state(&resumed.outputs.state))
@@ -864,9 +873,9 @@ fn cast_sweeps_every_admitted_dtype_pair() {
             if REFUSED_AT_INFER.contains(&(from, to)) {
                 continue;
             }
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::new(vec![1], from));
-            let y = b.cast(x, to);
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::new(vec![1], from)).unwrap();
+            let y = b.cast(x, to).unwrap();
             let g = b.finish(y).unwrap();
             let inputs: HashMap<_, Value> = HashMap::from([(x.id(), literal_input(from))]);
             let label = format!("cast {from:?} -> {to:?}");
@@ -894,10 +903,10 @@ fn cast_i8_source_chain_rows_evaluate() {
         (DType::F16, [127.0, -3.0]),
         (DType::I32, [127.0, -3.0]),
     ] {
-        let b = Builder::new();
-        let x = helpers::i32_constant(&b, "x", vec![2]).unwrap();
-        let i8 = b.cast(x, DType::I8);
-        let y = b.cast(i8, to);
+        let b = Builder::for_tests();
+        let x = graph_fixtures::i32_constant(&b, "x", vec![2]).unwrap();
+        let i8 = b.cast(x, DType::I8).unwrap();
+        let y = b.cast(i8, to).unwrap();
         let g = b.finish(y).unwrap();
         let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![2], vec![127, -3]))]);
         let label = format!("I32 -> I8 -> {to:?}");
@@ -923,10 +932,10 @@ fn cast_i8_source_chain_rows_evaluate() {
 /// operands the rest of this file's rows use.
 #[test]
 fn cast_bf16_to_e4m3fn_evaluates_a_walk_published_bf16() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2]));
-    let bf16 = b.cast(x, DType::BF16);
-    let y = b.cast(bf16, DType::E4M3FN);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2])).unwrap();
+    let bf16 = b.cast(x, DType::BF16).unwrap();
+    let y = b.cast(bf16, DType::E4M3FN).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![2], vec![1.0, 2.0]))]);
     let Value::Host(got) = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -951,17 +960,19 @@ fn cast_bf16_to_e4m3fn_evaluates_a_walk_published_bf16() {
 /// named mutation - comment out its match arm, since a `-D dead-code`-clean literal deletion needs
 /// the same no-op edit); the BF16-table/I32-index row below still evaluates (the I32-index Gather
 /// fallback made robust to a narrowed table), but publishes
-/// `Value::Host` instead of the Spec-376 lane's `Value::Owner(ExactValue::Bf16(_))` - a different
+/// `Value::Host` instead of the Spec-376 lane's `Value::Exact(ExactValue::Bf16(_))` - a different
 /// carrier for the same bits, so the `matches!` assertion goes red even though the bits agree.
 #[test]
 fn every_infer_admitted_pair_evaluates() {
     // Spec-376 lane: a BF16 table (narrowed at bind time from a plain f32 const)
     // gathered by I32 ids matches `resolve::classify`'s `Gather` row and publishes the exact
     // Bf16 carrier, never a materialized `Dense` fallback.
-    let b = Builder::new();
-    let table = b.constant("table", TensorType::new(vec![3, 2], DType::BF16));
-    let index = helpers::i32_constant(&b, "index", vec![2]).unwrap();
-    let out = b.gather(table, 0, index);
+    let b = Builder::for_tests();
+    let table = b
+        .constant("table", TensorType::new(vec![3, 2], DType::BF16))
+        .unwrap();
+    let index = graph_fixtures::i32_constant(&b, "index", vec![2]).unwrap();
+    let out = b.gather(table, 0, index).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (
@@ -973,7 +984,7 @@ fn every_infer_admitted_pair_evaluates() {
     let out =
         eval_every_combination("gather bf16 table, i32 index (spec-376)", &g, &inputs).unwrap();
     assert!(
-        matches!(out, Value::Owner(ExactValue::Bf16(_))),
+        matches!(out, Value::Exact(ExactValue::Bf16(_))),
         "expected the Spec-376 exact Bf16 carrier, got {out:?}"
     );
     assert_eq!(
@@ -989,10 +1000,12 @@ fn every_infer_admitted_pair_evaluates() {
     // Probe: an F16 table (never in the Spec-376 admission table, which only matches
     // BF16) gathered by I32 ids falls to the dense `Value::Host` arm of `walk::evaluate_gather`
     // (`ops::gather::gather` over its f32 lane), which must decode through `to_f32` too.
-    let b = Builder::new();
-    let table = b.constant("table", TensorType::new(vec![3, 2], DType::F16));
-    let index = helpers::i32_constant(&b, "index", vec![2]).unwrap();
-    let out = b.gather(table, 0, index);
+    let b = Builder::for_tests();
+    let table = b
+        .constant("table", TensorType::new(vec![3, 2], DType::F16))
+        .unwrap();
+    let index = graph_fixtures::i32_constant(&b, "index", vec![2]).unwrap();
+    let out = b.gather(table, 0, index).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (
@@ -1010,10 +1023,12 @@ fn every_infer_admitted_pair_evaluates() {
 
     // Probe: a BF16 `src` for axis-0 `Scatter` (no `Scatter` row exists in the Spec-376
     // table at all) must decode through `ops::movement::scatter_axis0`'s `f32_view` read.
-    let b = Builder::new();
-    let src = b.constant("src", TensorType::new(vec![2, 2], DType::BF16));
-    let index = helpers::i32_constant(&b, "index", vec![2]).unwrap();
-    let out = b.scatter(src, index);
+    let b = Builder::for_tests();
+    let src = b
+        .constant("src", TensorType::new(vec![2, 2], DType::BF16))
+        .unwrap();
+    let index = graph_fixtures::i32_constant(&b, "index", vec![2]).unwrap();
+    let out = b.scatter(src, index).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (src.id(), bf16_host(vec![2, 2], &[1.0, 2.0, 3.0, 4.0])),
@@ -1028,11 +1043,13 @@ fn every_infer_admitted_pair_evaluates() {
 
     // Probe: `IndexedMatMul` has no Spec-376 row either, so an F32 activation times a
     // BF16 weight must decode the weight through `to_f32` in `ops::contraction::indexed_matmul`.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 2]));
-    let w = b.constant("w", TensorType::new(vec![2, 2, 2], DType::BF16));
-    let idx = helpers::i32_constant(&b, "idx", vec![1]).unwrap();
-    let out = b.indexed_matmul(x, w, idx);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 2])).unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![2, 2, 2], DType::BF16))
+        .unwrap();
+    let idx = graph_fixtures::i32_constant(&b, "idx", vec![1]).unwrap();
+    let out = b.indexed_matmul(x, w, idx).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (x.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
@@ -1047,9 +1064,9 @@ fn every_infer_admitted_pair_evaluates() {
 
     // Probe: `PackI8`'s input declared I32 (rather than its usual F32 quantization
     // result): `ops::index::pack_i8` must read the I32 words.
-    let b = Builder::new();
-    let x = helpers::i32_constant(&b, "x", vec![4]).unwrap();
-    let packed = b.pack_i8(x);
+    let b = Builder::for_tests();
+    let x = graph_fixtures::i32_constant(&b, "x", vec![4]).unwrap();
+    let packed = b.pack_i8(x).unwrap();
     let g = b.finish(packed).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
     let out = eval_every_combination("pack_i8 exact i32 (words only)", &g, &inputs).unwrap();
@@ -1063,9 +1080,11 @@ fn every_infer_admitted_pair_evaluates() {
     // Probe: an F32 tensor bound to an F16-declared input is a bind-time
     // `EvalError::Input` (`walk::preflight_bindings`): the walk never converts at bind, so `Reshape`
     // can never relabel a payload of the wrong dtype.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![4], DType::F16));
-    let out = b.reshape(x, vec![4]);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![4], DType::F16))
+        .unwrap();
+    let out = b.reshape(x, vec![4]).unwrap();
     let g = b.finish(out).unwrap();
     let wrong_dtype = HostTensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
     let inputs = dense_inputs([(x.id(), wrong_dtype)]);
@@ -1077,9 +1096,11 @@ fn every_infer_admitted_pair_evaluates() {
     assert!(error.to_string().contains("different dtype"), "{error}");
 
     // The same op on a real F16 tensor: `Reshape` must publish the values, never an empty payload.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::new(vec![4], DType::F16));
-    let out = b.reshape(x, vec![2, 2]);
+    let b = Builder::for_tests();
+    let x = b
+        .constant("x", TensorType::new(vec![4], DType::F16))
+        .unwrap();
+    let out = b.reshape(x, vec![2, 2]).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), f16_host(vec![4], &[1.0, 2.0, 3.0, 4.0]))]);
     let out = eval_every_combination("reshape f16 (legitimately narrowed)", &g, &inputs).unwrap();
@@ -1100,9 +1121,9 @@ fn every_infer_admitted_pair_evaluates() {
 /// later in an operand read instead of `EvalError::Input`.
 #[test]
 fn f32_declared_input_bound_as_a_bf16_tensor_is_refused_at_bind_time() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4]));
-    let out = b.reshape(x, vec![4]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let out = b.reshape(x, vec![4]).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::bf16(vec![4], vec![0u16; 4]))]);
     let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
@@ -1134,16 +1155,16 @@ fn gather_index_faults_cover_every_data_dtype() {
     }
 
     fn run(data: Data, bad: i32) -> Result<Value, EvalError> {
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let table_ty = match data {
             Data::F32 => TensorType::f32(vec![3]),
             Data::Bf16 => TensorType::new(vec![3], DType::BF16),
             Data::I32 => TensorType::new(vec![3], DType::I32),
             Data::E4m3Fn => TensorType::new(vec![3], DType::E4M3FN),
         };
-        let table = b.constant("table", table_ty);
-        let index = helpers::i32_constant(&b, "index", vec![]).unwrap();
-        let out = b.gather(table, 0, index);
+        let table = b.constant("table", table_ty).unwrap();
+        let index = graph_fixtures::i32_constant(&b, "index", vec![]).unwrap();
+        let out = b.gather(table, 0, index).unwrap();
         let g = b.finish(out).unwrap();
 
         let table_value = match data {
@@ -1462,11 +1483,11 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
 
     // ScatterUpdate: inverse `-1` keeps the base row; `-2` and `pool` (== src rows) fault.
     {
-        let b = Builder::new();
-        let base = b.constant("base", TensorType::f32(vec![3, 1]));
-        let src = b.constant("src", TensorType::f32(vec![2, 1]));
-        let inv = helpers::i32_constant(&b, "inv", vec![3]).unwrap();
-        let out = b.scatter_update(base, src, inv);
+        let b = Builder::for_tests();
+        let base = b.constant("base", TensorType::f32(vec![3, 1])).unwrap();
+        let src = b.constant("src", TensorType::f32(vec![2, 1])).unwrap();
+        let inv = graph_fixtures::i32_constant(&b, "inv", vec![3]).unwrap();
+        let out = b.scatter_update(base, src, inv).unwrap();
         let g = b.finish(out).unwrap();
         let base_value = HostTensor::f32(vec![3, 1], vec![7.0, 8.0, 9.0]);
         let src_value = HostTensor::f32(vec![2, 1], vec![1.0, 2.0]);
@@ -1507,11 +1528,13 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
     // DynamicUpdateSlice: a runtime start past the window and a negative start both fault; a valid
     // runtime start still writes.
     {
-        let b = Builder::new();
-        let operand = b.constant("operand", TensorType::f32(vec![4]));
-        let update = b.constant("update", TensorType::f32(vec![2]));
-        let index = helpers::i32_constant(&b, "index", vec![]).unwrap();
-        let out = b.dynamic_update_slice_dyn(operand, update, index, 0);
+        let b = Builder::for_tests();
+        let operand = b.constant("operand", TensorType::f32(vec![4])).unwrap();
+        let update = b.constant("update", TensorType::f32(vec![2])).unwrap();
+        let index = graph_fixtures::i32_constant(&b, "index", vec![]).unwrap();
+        let out = b
+            .dynamic_update_slice_dyn(operand, update, index, 0)
+            .unwrap();
         let g = b.finish(out).unwrap();
         let operand_value = HostTensor::f32(vec![4], vec![0.0, 0.0, 0.0, 0.0]);
         let update_value = HostTensor::f32(vec![2], vec![9.0, 8.0]);
@@ -1547,11 +1570,11 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
 
     // IndexedMatMul: an expert id of `E` (the expert count) faults.
     {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 2]));
-        let w = b.constant("w", TensorType::f32(vec![2, 2, 2]));
-        let idx = helpers::i32_constant(&b, "idx", vec![1]).unwrap();
-        let out = b.indexed_matmul(x, w, idx);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 2])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![2, 2, 2])).unwrap();
+        let idx = graph_fixtures::i32_constant(&b, "idx", vec![1]).unwrap();
+        let out = b.indexed_matmul(x, w, idx).unwrap();
         let g = b.finish(out).unwrap();
         let inputs = dense_inputs([
             (x.id(), HostTensor::f32(vec![1, 2], vec![1.0, 2.0])),
@@ -1571,9 +1594,9 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
 
     // ArgTopK: a non-integral rank faults.
     {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4]));
-        let out = b.arg_top_k(x, 2);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+        let out = b.arg_top_k(x, 2).unwrap();
         let g = b.finish(out).unwrap();
         let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![4], vec![2.0, 0.5, 3.0, 1.0]))]);
         let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();

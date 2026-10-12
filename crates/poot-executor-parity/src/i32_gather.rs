@@ -1,12 +1,12 @@
-//! POOT-725 SC-001 on a device: every [`poot_test_util::i32_gather`] case compiled for the device's target,
+//! POOT-725 SC-001 on a device: every [`poot_eval::test_support::i32_gather`] case compiled for the device's target,
 //! run through the executor contract and compared word for word with the CPU oracle and the plain-Rust
 //! ground truth. One row per backend calls [`check`]; the cases and their comparison live in the fixture.
 
+use poot_eval::test_support::StepFixture;
+use poot_eval::test_support::i32_gather::{GatherCase, run_all};
 use poot_executor::Executor;
 use poot_graph_ir::Storage;
 use poot_graph_plan::Target;
-use poot_test_util::StepFixture;
-use poot_test_util::i32_gather::{GatherCase, run_all};
 
 use crate::{ConstFixture, run_once};
 

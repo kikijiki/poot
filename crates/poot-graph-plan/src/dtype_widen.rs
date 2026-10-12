@@ -28,10 +28,10 @@ use poot_graph_ir::graph::{Storage, ValueMeta};
 use poot_graph_ir::op::{ContractionHead, OpKind};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{EditError, Eqn, Graph, GraphEdit, Operand, ValueId, ValueTable};
+use poot_kernelgen::Layout;
 use poot_target::{Backend, TargetId, TensorCoreSupport};
 use poot_tensor::DType;
 
-use crate::Layout;
 use std::collections::{HashMap, HashSet};
 
 /// Whether `OpKind::MatMul`'s AMD WMMA tensor-core arm (`plan_eqn`'s local `amd_tc`)
@@ -265,6 +265,7 @@ pub fn bf16_const_feeds_only_packed_readers(
 /// bit-exact arithmetic that walk's contract requires. One function for every caller closes the R481-003
 /// drift: wgpu's copy ran `lower_nonlast_reduces`, ROCm's and PTX's did not, so a MiniMax-M2 decode graph
 /// planned on wgpu and refused on ROCm and PTX for a pass gap, not a real capability difference.
+#[cfg(any(test, feature = "test-support"))]
 pub fn prepare_target_graph(g: &Graph, backend: Backend) -> Result<Graph, EditError> {
     let folded = fold_dense_contractions(g)?;
     let folded = fold_dense_bf16_row_gathers(&folded)?;
@@ -300,7 +301,7 @@ fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
 }
 
 /// Card 380 (Card 534a: moved out of `poot-graph-ir`, whose `pub mod transform` let every crate that
-/// depends on it - `poot-gpu`, `poot-rocm-gpu`, `poot-ptx-gpu` included - name and sequence this pass
+/// depends on it - `poot-wgpu-device`, `poot-rocm-device`, `poot-ptx-device` included - name and sequence this pass
 /// itself, defeating SC-001; Card 534a). Rewrite `MatMul(a, Transpose([1, 0], w))`
 /// over a weight of an admitted dtype into one [`poot_graph_ir::OpKind::DenseContraction`] that reads `w` in checkpoint
 /// `[N, K]` order, so the binder never materializes a widened F32 copy of it, when:
@@ -324,7 +325,7 @@ fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
 ///
 /// `pub(crate)`: reachable only through [`prepare_target_graph`] (Card 534a SC-001).
 ///
-/// ```compile_fail,E0603
+/// ```compile_fail,E0425
 /// let g = poot_graph_ir::Graph::default();
 /// let _ = poot_graph_plan::fold_dense_contractions(&g);
 /// ```
@@ -499,7 +500,7 @@ pub(crate) fn fold_dense_contractions(g: &Graph) -> Result<Graph, EditError> {
 ///
 /// `pub(crate)`: reachable only through [`prepare_target_graph`] (Card 534a SC-001).
 ///
-/// ```compile_fail,E0603
+/// ```compile_fail,E0425
 /// let g = poot_graph_ir::Graph::default();
 /// let _ = poot_graph_plan::fold_dense_bf16_row_gathers(&g);
 /// ```
@@ -660,7 +661,7 @@ pub(crate) fn fold_dense_bf16_row_gathers(g: &Graph) -> Result<Graph, EditError>
 ///
 /// `pub(crate)`: reachable only through [`prepare_target_graph`] (Card 534a SC-001).
 ///
-/// ```compile_fail,E0603
+/// ```compile_fail,E0425
 /// let g = poot_graph_ir::Graph::default();
 /// let _ = poot_graph_plan::lower_nonlast_reduces(&g);
 /// ```
@@ -931,9 +932,9 @@ pub fn widen_mismatched_matmul_dtypes(g: &Graph, backend: Backend) -> Result<Gra
 
 #[cfg(test)]
 mod tests {
+    use poot_graph_ir::test_support::graph_fixtures::derive;
     use poot_graph_ir::{Builder, Graph, OpKind, Storage, TensorType};
     use poot_target::AmdArch;
-    use poot_test_util::graph_fixtures::derive;
 
     use poot_target::Backend;
     use poot_tensor::DType;
@@ -942,10 +943,14 @@ mod tests {
 
     /// `a x w -> f32` over two consts of the given dtypes, `m x 32 x 32`.
     fn const_matmul(m: usize, a_dtype: DType, w_dtype: DType) -> Graph {
-        let b = Builder::new();
-        let a = b.constant("a", TensorType::new(vec![m, 32], a_dtype));
-        let w = b.constant("w", TensorType::new(vec![32, 32], w_dtype));
-        let mm = b.matmul(a, w);
+        let b = Builder::for_tests();
+        let a = b
+            .constant("a", TensorType::new(vec![m, 32], a_dtype))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![32, 32], w_dtype))
+            .unwrap();
+        let mm = b.matmul(a, w).unwrap();
         let g = b.finish(mm).unwrap();
         let out = g
             .eqns()
@@ -1009,11 +1014,14 @@ mod tests {
     }
 }
 
-/// Card 278, moved from `poot-ptx-gpu` in Card 534a: the tensor-core choice keeps a BF16 matmul weight
+/// Card 278, moved from `poot-ptx-device` in Card 534a: the tensor-core choice keeps a BF16 matmul weight
 /// narrow and inserts no widening cast.
 #[cfg(test)]
 mod tensor_core_weight_tests {
+    use crate::KernelChoice;
+    use crate::planner::Planned;
     use poot_graph_ir::{Builder, Slot, TensorType};
+    use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_target::Backend;
     use poot_tensor::DType;
 
@@ -1021,10 +1029,14 @@ mod tensor_core_weight_tests {
 
     #[test]
     fn card278_existing_tensor_core_choice_keeps_eligible_bf16_weight_narrow() {
-        let b = Builder::new();
-        let x = b.slot(Slot::TokenEmbed, TensorType::new(vec![16, 16], DType::BF16));
-        let weight = b.constant("weight", TensorType::new(vec![16, 16], DType::BF16));
-        let out = b.matmul(x, weight);
+        let b = Builder::for_tests();
+        let x = b
+            .slot(Slot::TokenEmbed, TensorType::new(vec![16, 16], DType::BF16))
+            .unwrap();
+        let weight = b
+            .constant("weight", TensorType::new(vec![16, 16], DType::BF16))
+            .unwrap();
+        let out = b.matmul(x, weight).unwrap();
         let g = b.finish(out).unwrap();
 
         let widened = widen_mismatched_matmul_dtypes(&g, Backend::Nvptx).unwrap();
@@ -1048,16 +1060,16 @@ mod tensor_core_weight_tests {
                 caps: poot_test_util::device_caps::default_caps_for(Backend::Nvptx),
             },
             &std::collections::HashMap::new(),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .expect("eligible BF16 matmul plans")
         {
-            crate::Planned {
+            Planned {
                 plan,
                 choice:
-                    crate::KernelChoice::Generated(crate::KernelRequest::Contraction(
-                        crate::ContractionSpec::TensorCore { .. },
-                    )),
+                    KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::TensorCore {
+                        ..
+                    })),
             } if plan.single().is_some() => {}
             other => panic!("eligible BF16 matmul chose {:?}", other.choice),
         }
@@ -1071,8 +1083,7 @@ mod tensor_core_weight_tests {
 #[cfg(test)]
 mod prepare_target_graph_tests {
     use poot_graph_ir::{Builder, OpKind, RedOp, TensorType};
-    use poot_target::AmdArch;
-    use poot_target::Backend;
+    use poot_target::{AmdArch, Backend};
     use poot_tensor::DType;
 
     use super::prepare_target_graph;
@@ -1080,9 +1091,11 @@ mod prepare_target_graph_tests {
     /// A tiny MoE-router-shaped graph: `top_k`-style expert weights summed on axis 0 (a non-last-axis
     /// reduce), the same shape MiniMax-M2's gating sum traces.
     fn moe_gate_reduce_graph() -> poot_graph_ir::Graph {
-        let b = Builder::new();
-        let weights = b.constant("expert_weights", TensorType::f32(vec![4, 3]));
-        let out = b.reduce(RedOp::Sum, weights, 0, false);
+        let b = Builder::for_tests();
+        let weights = b
+            .constant("expert_weights", TensorType::f32(vec![4, 3]))
+            .unwrap();
+        let out = b.reduce(RedOp::Sum, weights, 0, false).unwrap();
         b.finish(out).unwrap()
     }
 
@@ -1116,10 +1129,14 @@ mod prepare_target_graph_tests {
     /// `Cast{BF16 -> F32}` equation in front of the matmul, which a packed or native cast body reads.
     #[test]
     fn a_bf16_weight_stays_bf16_and_is_cast_in_the_graph() {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::new(vec![4, 8], DType::F32));
-        let weight = b.constant("weight", TensorType::new(vec![8, 16], DType::BF16));
-        let out = b.matmul(x, weight);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::new(vec![4, 8], DType::F32))
+            .unwrap();
+        let weight = b
+            .constant("weight", TensorType::new(vec![8, 16], DType::BF16))
+            .unwrap();
+        let out = b.matmul(x, weight).unwrap();
         let g = b.finish(out).unwrap();
 
         for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
@@ -1142,19 +1159,25 @@ mod prepare_target_graph_tests {
 #[cfg(test)]
 mod fold_dense_bf16_tests {
     use poot_graph_ir::graph::{Eqn, Operand, Storage, ValueMeta};
+    use poot_graph_ir::test_support::graph_fixtures::derive;
     use poot_graph_ir::{Builder, Graph, OpKind, Slot, TensorType, ValueId};
     use poot_tensor::DType;
-    use poot_test_util::graph_fixtures::derive;
 
     use super::{fold_dense_bf16_row_gathers, fold_dense_contractions};
 
     /// The Qwen3.8-27B LM head shape: a BF16 `[N, K]` checkpoint constant, transposed in the graph,
     /// then used as a matmul weight against an F32 activation.
     fn lm_head_shaped_graph(weight_dtype: DType) -> Graph {
-        let b = Builder::new();
-        let x = b.constant("activation", TensorType::f32(vec![1, 2, 5]));
-        let weight = b.constant("lm_head.weight", TensorType::new(vec![7, 5], weight_dtype));
-        let logits = poot_graph_ir::ops::linear(&b, x, b.transpose(weight, vec![1, 0]), None);
+        let b = Builder::for_tests();
+        let x = b
+            .constant("activation", TensorType::f32(vec![1, 2, 5]))
+            .unwrap();
+        let weight = b
+            .constant("lm_head.weight", TensorType::new(vec![7, 5], weight_dtype))
+            .unwrap();
+        let logits =
+            poot_graph_ir::ops::linear(&b, x, b.transpose(weight, vec![1, 0]).unwrap(), None)
+                .unwrap();
         b.finish(logits).unwrap()
     }
 
@@ -1187,11 +1210,17 @@ mod fold_dense_bf16_tests {
 
     /// `matmul(x [3, 2, 5], transpose(reshape(w [12, 5], [3, 4, 5]), [0, 2, 1]))`: a grouped projection.
     fn grouped_graph(weight_dtype: DType) -> Graph {
-        let b = Builder::new();
-        let x = b.constant("activation", TensorType::f32(vec![3, 2, 5]));
-        let w = b.constant("w", TensorType::new(vec![12, 5], weight_dtype));
-        let blocks = b.reshape(w, vec![3, 4, 5]);
-        let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
+        let b = Builder::for_tests();
+        let x = b
+            .constant("activation", TensorType::f32(vec![3, 2, 5]))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![12, 5], weight_dtype))
+            .unwrap();
+        let blocks = b.reshape(w, vec![3, 4, 5]).unwrap();
+        let out = b
+            .matmul(x, b.transpose(blocks, vec![0, 2, 1]).unwrap())
+            .unwrap();
         b.finish(out).unwrap()
     }
 
@@ -1298,10 +1327,16 @@ mod fold_dense_bf16_tests {
         // An F16 weight that is not a const cannot be stored packed (its producer writes it natively), so the
         // composition is left exactly as traced.
         let computed_f16 = {
-            let b = Builder::new();
-            let x = b.constant("activation", TensorType::f32(vec![1, 2, 5]));
-            let weight = b.slot(Slot::Activation, TensorType::new(vec![7, 5], DType::F16));
-            let logits = poot_graph_ir::ops::linear(&b, x, b.transpose(weight, vec![1, 0]), None);
+            let b = Builder::for_tests();
+            let x = b
+                .constant("activation", TensorType::f32(vec![1, 2, 5]))
+                .unwrap();
+            let weight = b
+                .slot(Slot::Activation, TensorType::new(vec![7, 5], DType::F16))
+                .unwrap();
+            let logits =
+                poot_graph_ir::ops::linear(&b, x, b.transpose(weight, vec![1, 0]).unwrap(), None)
+                    .unwrap();
             b.finish(logits).unwrap()
         };
         assert_eq!(
@@ -1412,15 +1447,19 @@ mod fold_dense_bf16_tests {
     /// The Qwen3.8-27B token-embedding shape: a BF16 `[V, R]` checkpoint constant gathered along axis 0 by
     /// an I32 token id, reshaped, then widened to F32.
     fn embedding_shaped_graph(table_dtype: DType) -> Graph {
-        let b = Builder::new();
-        let table = b.constant(
-            "model.language_model.embed_tokens.weight",
-            TensorType::new(vec![7, 5], table_dtype),
-        );
-        let token = b.constant("token", TensorType::new(vec![3], DType::I32));
-        let rows = b.gather(table, 0, token);
-        let shaped = b.reshape(rows, vec![1, 3, 5]);
-        let widened = b.cast(shaped, DType::F32);
+        let b = Builder::for_tests();
+        let table = b
+            .constant(
+                "model.language_model.embed_tokens.weight",
+                TensorType::new(vec![7, 5], table_dtype),
+            )
+            .unwrap();
+        let token = b
+            .constant("token", TensorType::new(vec![3], DType::I32))
+            .unwrap();
+        let rows = b.gather(table, 0, token).unwrap();
+        let shaped = b.reshape(rows, vec![1, 3, 5]).unwrap();
+        let widened = b.cast(shaped, DType::F32).unwrap();
         b.finish(widened).unwrap()
     }
 
@@ -1570,15 +1609,19 @@ mod fold_dense_bf16_tests {
     /// and the walk admits exactly what production graphs contain.
     #[test]
     fn fold_declines_a_non_reshape_link() {
-        let b = Builder::new();
-        let table = b.constant(
-            "model.language_model.embed_tokens.weight",
-            TensorType::new(vec![7, 5], DType::BF16),
-        );
-        let token = b.constant("token", TensorType::new(vec![3], DType::I32));
-        let rows = b.gather(table, 0, token);
-        let moved = b.transpose(rows, vec![1, 0]);
-        let widened = b.cast(moved, DType::F32);
+        let b = Builder::for_tests();
+        let table = b
+            .constant(
+                "model.language_model.embed_tokens.weight",
+                TensorType::new(vec![7, 5], DType::BF16),
+            )
+            .unwrap();
+        let token = b
+            .constant("token", TensorType::new(vec![3], DType::I32))
+            .unwrap();
+        let rows = b.gather(table, 0, token).unwrap();
+        let moved = b.transpose(rows, vec![1, 0]).unwrap();
+        let widened = b.cast(moved, DType::F32).unwrap();
         let graph = b.finish(widened).unwrap();
         assert_eq!(
             eqn_summary(&fold_dense_bf16_row_gathers(&graph).unwrap()),
@@ -1603,9 +1646,9 @@ mod lower_nonlast_reduces_tests {
     #[test]
     fn lower_nonlast_reduces_moves_a_non_last_reduce_to_the_last_axis() {
         // keepdim = false: [2, 4] --sum axis 0--> [4].
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 4]));
-        let reduced = b.reduce(RedOp::Sum, x, 0, false);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 4])).unwrap();
+        let reduced = b.reduce(RedOp::Sum, x, 0, false).unwrap();
         let graph = b.finish(reduced).unwrap();
         assert_eq!(graph.aval(graph.result()).shape, vec![4]);
 
@@ -1649,9 +1692,9 @@ mod lower_nonlast_reduces_tests {
         );
 
         // A last-axis reduce is never rewritten.
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 4]));
-        let reduced = b.reduce(RedOp::Sum, x, 1, false);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 4])).unwrap();
+        let reduced = b.reduce(RedOp::Sum, x, 1, false).unwrap();
         let last_axis = b.finish(reduced).unwrap();
         assert_eq!(
             lower_nonlast_reduces(&last_axis).unwrap().eqns().len(),
@@ -1660,9 +1703,9 @@ mod lower_nonlast_reduces_tests {
         );
 
         // keepdim = true: the size-1 axis stays where the reduced axis was, so a Reshape returns it.
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 4]));
-        let reduced = b.reduce(RedOp::Max, x, 0, true);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 4])).unwrap();
+        let reduced = b.reduce(RedOp::Max, x, 0, true).unwrap();
         let graph = b.finish(reduced).unwrap();
         assert_eq!(graph.aval(graph.result()).shape, vec![1, 4]);
 
@@ -1734,16 +1777,16 @@ mod lower_nonlast_reduces_tests {
             (RedOp::Max, true),
         ] {
             // Bare axis-0 reduce: [3, 4] -> [4] (or [1, 4] under keepdim).
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32(vec![3, 4]));
-            let reduced = b.reduce(op, x, 0, keepdim);
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![3, 4])).unwrap();
+            let reduced = b.reduce(op, x, 0, keepdim).unwrap();
             let bare = b.finish(reduced).unwrap();
 
             // With a consumer, so a wrong lowered value would surface downstream too.
-            let b = Builder::new();
-            let x = b.constant("x", TensorType::f32(vec![3, 4]));
-            let reduced = b.reduce(op, x, 0, keepdim);
-            let consumed = b.binary(BinOp::Add, reduced, reduced);
+            let b = Builder::for_tests();
+            let x = b.constant("x", TensorType::f32(vec![3, 4])).unwrap();
+            let reduced = b.reduce(op, x, 0, keepdim).unwrap();
+            let consumed = b.binary(BinOp::Add, reduced, reduced).unwrap();
             let graph = b.finish(consumed).unwrap();
 
             for original in [bare, graph] {
@@ -1786,107 +1829,6 @@ mod lower_nonlast_reduces_tests {
                     "lowering changed values (op={op:?}, keepdim={keepdim})"
                 );
             }
-        }
-    }
-}
-
-/// POOT-651: the tied lm_head of a BF16 checkpoint plans on the dense BF16 Gemv over its BF16-resident weight.
-#[cfg(test)]
-mod tied_head_tests {
-    use poot_executor_parity::dense::{Dense, Family, step};
-    use poot_graph_ir::{OpKind, Operand, Storage};
-    use poot_kernelgen::{ContractionSpec, KernelRequest};
-    use poot_models::model::{LogitRows, Phase};
-    use poot_target::{AmdArch, Backend, BufferStorage};
-    use poot_tensor::DType;
-    use poot_test_util::device_caps::default_caps_for;
-
-    use crate::{CompileLimits, CompileOptions, KernelChoice, Submission, Target, compile, numel};
-
-    const VOCAB: usize = 151936;
-    const HIDDEN: usize = 896;
-
-    /// Qwen2.5-0.5B's dimensions over a natively BF16 checkpoint; the head is tied, so it is its own `w.head`
-    /// const of the embedding's values.
-    fn qwen2_5_0_5b_decode() -> poot_graph_ir::Graph {
-        let dense = Dense::new(Family::Qwen2)
-            .vocab(VOCAB)
-            .dims(HIDDEN, 4864, 24)
-            .heads(14, 2)
-            .head_dim(64)
-            .max_positions(32768);
-        dense
-            .zeroed_model(DType::BF16)
-            .model
-            .trace(Phase::Decode, step(1, 1, 64, LogitRows::Last))
-            .unwrap()
-    }
-
-    /// POOT-651 SC-001, at planning, through `compile` on wgpu and ROCm: the head contraction is the dense Gemv over
-    /// the `[vocab, hidden]` weight in checkpoint order, reading packed BF16 storage, and the program's constants
-    /// hold no F32 buffer of the head's element count: the head's residency is `vocab * hidden * 2` bytes.
-    ///
-    /// Mutation: in `fold_dense_contractions`, skip the fold for a BF16 weight (`continue` before the
-    /// `DENSE_CONTRACTION_WEIGHT_DTYPES` check); the head stays a `Transpose` and a mixed-dtype `MatMul` over the BF16
-    /// weight, which no backend lowers (no pass retypes a const), so `compile` refuses it and this row goes red.
-    #[test]
-    fn the_tied_head_decode_runs_the_bf16_gemv_over_bf16_resident_weight() {
-        let graph = qwen2_5_0_5b_decode();
-        let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
-        for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
-            let target = Target::Gpu {
-                backend,
-                caps: default_caps_for(backend),
-            };
-            let program = compile(&graph, &target, &options).expect("the decode graph compiles");
-            let (eqn, _) = program
-                .planned()
-                .find(|(eqn, _)| program.graph().aval(eqn.out).shape.last() == Some(&VOCAB))
-                .expect("the head contraction is planned");
-            assert_eq!(
-                eqn.op,
-                OpKind::DenseContraction {
-                    weight: DType::BF16
-                },
-                "{backend:?}: the head reads the weight in checkpoint order"
-            );
-            let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::DenseGemv {
-                weight,
-                n,
-                ..
-            })) = program.kernel_choice(eqn)
-            else {
-                panic!(
-                    "{backend:?}: the head is the dense Gemv, got {:?}",
-                    program.kernel_choice(eqn)
-                );
-            };
-            assert_eq!(*n, VOCAB, "{backend:?}");
-            assert_eq!(*weight, BufferStorage::bf16_packed(), "{backend:?}");
-
-            let Operand::Value(head) = eqn.inputs[1] else {
-                panic!("the head weight is a value");
-            };
-            assert_eq!(
-                program.storage().storage(head).buffer_storage(),
-                BufferStorage::bf16_packed(),
-                "{backend:?}: the head weight is resident as packed BF16"
-            );
-            let g = program.graph();
-            let head_elems = VOCAB * HIDDEN;
-            assert!(
-                g.values().iter_enumerated().all(|(id, meta)| {
-                    meta.storage != Storage::Const
-                        || g.aval(id).dtype != DType::F32
-                        || numel(&g.aval(id).shape) < head_elems
-                }),
-                "{backend:?}: no F32 constant is as large as the head weight"
-            );
-            assert_eq!(
-                (g.aval(head).dtype, g.aval(head).shape.as_slice()),
-                (DType::BF16, [VOCAB, HIDDEN].as_slice()),
-                "{backend:?}: the head weight is the BF16 [vocab, hidden] const"
-            );
         }
     }
 }

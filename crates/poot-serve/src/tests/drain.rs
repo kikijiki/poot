@@ -2,9 +2,9 @@ use super::*;
 use crate::lifecycle::MAX_DRAIN_TIMEOUT_SECS;
 use crate::startup::sigint_handler;
 
-pub static DRAIN_FIXTURE_RELEASE: AtomicBool = AtomicBool::new(false);
+pub(super) static DRAIN_FIXTURE_RELEASE: AtomicBool = AtomicBool::new(false);
 
-pub extern "C" fn drain_fixture_release_handler(_: libc::c_int) {
+pub(super) extern "C" fn drain_fixture_release_handler(_: libc::c_int) {
     DRAIN_FIXTURE_RELEASE.store(true, Ordering::SeqCst);
 }
 

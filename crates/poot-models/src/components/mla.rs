@@ -31,6 +31,7 @@ use super::norm::{NormParams, norm};
 use super::rope::{RopeParams, apply_rope, rope_rows};
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
+use crate::model::{TraceError, WiringError};
 
 /// How the per-head keys and values are stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,7 +202,7 @@ impl MlaWeights {
 }
 
 /// Replaces the causal mask of the attention with the one a selector builds from [`Selection`].
-pub type Selector<'a> = &'a dyn Fn(&Builder, Selection) -> Traced;
+pub type Selector<'a> = &'a dyn Fn(&Builder, Selection) -> Result<Traced, TraceError>;
 
 /// What a selector sees of the attention it narrows.
 #[derive(Clone, Copy, Debug)]
@@ -224,67 +225,69 @@ pub fn mla(
     w: &MlaWeights,
     p: &MlaParams,
     select: Option<Selector<'_>>,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
     let (h, qk, nope, rd, vd, rank) = (p.heads, p.qk_dim(), p.nope, p.rope_dim, p.v_dim, p.kv_rank);
-    let rope = rope_rows(b, p.rope, step.pos(), cap);
+    let rope = rope_rows(b, p.rope, step.pos(), cap)?;
 
     // Q: the whole per-head query, its trailing slice rotated.
     let (q, qr) = match &w.q {
-        Query::Plain(q) => (linear(b, x, q, None), None),
+        Query::Plain(q) => (linear(b, x, q, None)?, None),
         Query::LowRank { a, a_norm, b: up } => {
-            let qr = norm(b, linear(b, x, a, None), a_norm, p.norm);
-            (linear(b, qr, up, None), Some(qr))
+            let qr = norm(b, linear(b, x, a, None)?, a_norm, p.norm)?;
+            (linear(b, qr, up, None)?, Some(qr))
         }
     };
-    let q = b.transpose(b.reshape(q, vec![rows, t, h, qk]), vec![0, 2, 1, 3]);
-    let q_pe = apply_rope(b, b.slice(q, 3, nope, qk), &rope);
-    let q = b.concat(3, &[b.slice(q, 3, 0, nope), q_pe]);
+    let q = b.transpose(b.reshape(q, vec![rows, t, h, qk])?, vec![0, 2, 1, 3])?;
+    let q_pe = apply_rope(b, b.slice(q, 3, nope, qk)?, &rope)?;
+    let q = b.concat(3, &[b.slice(q, 3, 0, nope)?, q_pe])?;
 
     // The shared latent and rotated key slice of the new tokens.
-    let kv_a = linear(b, x, &w.kv_a, None);
-    let c_new = norm(b, b.slice(kv_a, 2, 0, rank), &w.kv_a_norm, p.norm);
-    let c_new = b.reshape(c_new, vec![rows, 1, t, rank]);
-    let k_pe_new = b.reshape(b.slice(kv_a, 2, rank, rank + rd), vec![rows, 1, t, rd]);
-    let k_pe_new = apply_rope(b, k_pe_new, &rope);
+    let kv_a = linear(b, x, &w.kv_a, None)?;
+    let c_new = norm(b, b.slice(kv_a, 2, 0, rank)?, &w.kv_a_norm, p.norm)?;
+    let c_new = b.reshape(c_new, vec![rows, 1, t, rank])?;
+    let k_pe_new = b.reshape(b.slice(kv_a, 2, rank, rank + rd)?, vec![rows, 1, t, rd])?;
+    let k_pe_new = apply_rope(b, k_pe_new, &rope)?;
 
-    let write_at = first_writes(b, step);
-    let c = carried_cache(b, step, &write_at, layer, "c", c_new, 1, rank);
-    let k_pe = carried_cache(b, step, &write_at, layer, "rope", k_pe_new, 1, rd);
+    let write_at = first_writes(b, step)?;
+    let c = carried_cache(b, step, &write_at, layer, "c", c_new, 1, rank)?;
+    let k_pe = carried_cache(b, step, &write_at, layer, "rope", k_pe_new, 1, rd)?;
 
     // Every head's keys and values from the whole cached latent.
     let (k_nope, v) = match &w.kv_up {
         KvUp::Fused(up) => {
-            let c = b.reshape(c, vec![rows, cap, rank]);
-            let kv = linear(b, c, up, None);
+            let c = b.reshape(c, vec![rows, cap, rank])?;
+            let kv = linear(b, c, up, None)?;
             let kv = b.transpose(
-                b.reshape(kv, vec![rows, cap, h, nope + vd]),
+                b.reshape(kv, vec![rows, cap, h, nope + vd])?,
                 vec![0, 2, 1, 3],
-            );
-            (b.slice(kv, 3, 0, nope), b.slice(kv, 3, nope, nope + vd))
+            )?;
+            (b.slice(kv, 3, 0, nope)?, b.slice(kv, 3, nope, nope + vd)?)
         }
         KvUp::Split { k, v } => {
             // `c [rows, 1, cap, rank]` against each head's `k_b [rank, nope]` as stored and
             // `v_b [v, rank]` transposed: `[rows, heads, cap, ..]`.
-            let k = b.reshape(k.declare_f32(b), vec![1, h, rank, nope]);
+            let k = b.reshape(k.declare_f32(b)?, vec![1, h, rank, nope])?;
             let v = b.transpose(
-                b.reshape(v.declare_f32(b), vec![1, h, vd, rank]),
+                b.reshape(v.declare_f32(b)?, vec![1, h, vd, rank])?,
                 vec![0, 1, 3, 2],
-            );
-            (b.matmul(c, k), b.matmul(c, v))
+            )?;
+            (b.matmul(c, k)?, b.matmul(c, v)?)
         }
     };
-    let k = b.concat(3, &[k_nope, ops::repeat_kv(b, k_pe, h)]);
+    let k = b.concat(3, &[k_nope, ops::repeat_kv(b, k_pe, h)?])?;
 
-    let mask = ops::causal_mask_from_pos(b, step.pos(), cap, None);
+    let mask = ops::causal_mask_from_pos(b, step.pos(), cap, None)?;
     let mask = match (select, qr) {
-        (Some(select), Some(qr)) => select(b, Selection { qr, mask }),
-        (Some(_), None) => unreachable!("a selector needs the low-rank query"),
+        (Some(select), Some(qr)) => select(b, Selection { qr, mask })?,
+        (Some(_), None) => {
+            return Err(WiringError::SelectorWithoutLowRankQuery.into());
+        }
         (None, _) => mask,
     };
-    let out = ops::attention_masked(b, q, k, v, 1, p.scale, mask);
-    let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3]), vec![rows, t, h * vd]);
+    let out = ops::attention_masked(b, q, k, v, 1, p.scale, mask)?;
+    let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3])?, vec![rows, t, h * vd])?;
     linear(b, out, &w.o, None)
 }
 
@@ -398,10 +401,12 @@ mod tests {
     fn run(fx: &Fx, p: &MlaParams, x: &[f32], start: i32, state: &[Vec<f32>]) -> Run {
         let w = weights(fx, p);
         let tokens = x.len() / WIDTH;
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All));
-        let xs = b.constant("x", TensorType::f32(vec![1, tokens, WIDTH]));
-        let y = mla(&b, &step, 0, xs, &w, p, None);
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All)).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, tokens, WIDTH]))
+            .unwrap();
+        let y = mla(&b, &step, 0, xs, &w, p, None).unwrap();
         let g = step.finish(b, y).unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()

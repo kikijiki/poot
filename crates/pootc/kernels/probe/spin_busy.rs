@@ -1,6 +1,6 @@
 //! A controllable-duration busy-spin kernel: `n[0]` serial dependent-chain iterations per lane,
 //! finite (it always eventually completes) but with no upper bound the host can predict from
-//! outside. Used by `poot-rocm-gpu`'s Card 548 acceptance to force a real, deterministic HSA
+//! outside. Used by `poot-rocm-device`'s Card 548 acceptance to force a real, deterministic HSA
 //! completion-wait timeout (a tiny `RocmContextOptions::wait_timeout` against a real in-flight
 //! dispatch), rather than reaching into private queue internals to fake one.
 

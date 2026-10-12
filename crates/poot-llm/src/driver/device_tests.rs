@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileOptions, Submission};
+use poot_graph_plan::{CompileOptions, production_plan::Submission};
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
@@ -25,7 +25,7 @@ use crate::driver::{
     ModelHandle, PoolShape, PrefixOutcome, PrefixSkip, PreparedSetLimits, Release, RowWork, SeqId,
     SeqRequest, ServingShapes, StepRow, Warm, open_executor,
 };
-use crate::text::tokenize::{ChatTemplate, TextCodec};
+use poot_text::{ChatTemplate, TextCodec};
 
 pub(super) const VOCAB: usize = 48;
 /// The fixture's declared end-of-sequence id, and one outside its vocabulary for rows that must not
@@ -61,12 +61,11 @@ fn text_of(vocab: usize, chat_template: ChatTemplate) -> TextCodec {
         .unwrap();
     let mut tokenizer = Tokenizer::new(model);
     tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
-    TextCodec::new(
+    TextCodec::with_tokenizer(
         tokenizer,
         None,
-        None,
         FIXTURE_EOS,
-        poot_models::chat::ChatFormat::ChatML,
+        poot_text::ChatFormat::ChatML,
         chat_template,
     )
 }
@@ -166,7 +165,7 @@ pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
         decode: compile,
         capacity: nz(capacity),
         prefill_chunk: nz(chunk),
-        max_trace_tokens: nz(64),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(64)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
@@ -185,7 +184,7 @@ pub(super) fn open(choice: BackendChoice) -> Option<Box<dyn poot_executor::Execu
         BackendChoice::Vulkan => DeviceBackend::Vulkan,
         BackendChoice::Auto => unreachable!("rows name their backend"),
     };
-    poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
 }
 
 fn driver(
@@ -704,7 +703,7 @@ fn chunked_prefill_equals_token_by_token(choice: BackendChoice) {
             .executor_stats()
             .memory
             .iter()
-            .find(|(role, _)| *role == poot_executor::BufferRole::Weight)
+            .find(|(role, _)| *role == poot_runtime_common::BufferRole::Weight)
             .map(|(_, snapshot)| snapshot.allocations)
             .unwrap()
     };
@@ -1461,7 +1460,7 @@ fn write_hf_checkpoint(
     archive.extend_from_slice(&data);
     std::fs::write(dir.join("model.safetensors"), archive).unwrap();
     fixture_text()
-        .tokenizer
+        .tokenizer()
         .save(dir.join("tokenizer.json"), false)
         .unwrap();
     dir
@@ -1915,8 +1914,11 @@ fn packed_gguf(
     // Packed tensors in GGUF dims order (`[k, out]`), seeded by their position.
     let mut packed =
         |tensors: &mut Vec<(String, Vec<u64>, u32, Vec<u8>)>, name: &str, out: usize, k: usize| {
-            let payload =
-                poot_test_util::packed::random_payload(format, [out, k], (stored.len() + 1) as u64);
+            let payload = poot_quant::test_support::packed::random_payload(
+                format,
+                [out, k],
+                (stored.len() + 1) as u64,
+            );
             tensors.push((
                 name.to_string(),
                 vec![k as u64, out as u64],
@@ -2694,7 +2696,7 @@ mod checkpoint {
         choice: BackendChoice,
         prompt: &str,
         max_new: usize,
-        build: impl FnOnce(&TextCodec) -> crate::Result<crate::Constraint>,
+        build: impl FnOnce(&TextCodec) -> poot_text::Result<poot_text::Constraint>,
     ) -> Option<(String, usize)> {
         let handle = load(path);
         let mut driver = open_driver(&handle, choice)?;
@@ -4213,14 +4215,16 @@ const GLM53_FLASH_REFERENCE_MTP_LOGITS: &str =
 /// concatenation order in `glm53_flash::mtp::MtpLayer::trace`; the first logit row leaves the reference
 /// and the row goes red.
 fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
-    use poot_executor::{HostView, NoSync, StepInputs};
+    use poot_executor::{NoSync, StepInputs};
     use poot_graph_ir::{Slot, SlotKey};
     use poot_graph_plan::{
-        DeviceId, DevicePlacement, ExpertPlacement, Partition, WeightFormats, bind_packed_weights,
-        compile_staged,
+        WeightFormats, bind_packed_weights, multi_device::topology::DeviceId,
+        staged::DevicePlacement, staged::ExpertPlacement, staged::Partition,
+        staged::compile_staged,
     };
     use poot_models::components::standard::HIDDEN_CARRY_STATE;
     use poot_models::model::{HiddenCarry, KvLayout, LogitRows, Phase, StepShape};
+    use poot_tensor::HostView;
 
     const PREFIX: [i32; 6] = [3, 17, 40, 8, 25, 9];
     const BONUS: i32 = 31;
@@ -4259,7 +4263,13 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
         .unwrap();
     // One entry per program, all on the one executable: the carry is shared by its name and aval.
     let mut entry = |phase: Phase, tokens: usize| {
-        let graph = model.trace(phase, shape(tokens)).unwrap();
+        let graph = model
+            .trace(
+                phase,
+                shape(tokens),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
         assert!(
             graph
                 .state()
@@ -4414,7 +4424,9 @@ fn oracle_step_logits(
             logits: LogitRows::Last,
             hidden: None,
         };
-        let graph = model.trace(phase, shape).unwrap();
+        let graph = model
+            .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+            .unwrap();
         let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
         let graph = poot_graph_plan::bind_packed_weights(&graph, &formats).unwrap();
         let ids: Vec<i32> = tokens[start..start + len]
@@ -4446,7 +4458,7 @@ fn oracle_step_logits(
                 })
                 .collect();
         }
-        let (logits, next) = poot_test_util::weight_map_oracle::eval_mapped(
+        let (logits, next) = poot_eval::test_support::weight_map_oracle::eval_mapped(
             &graph,
             handle.store(),
             model.weights(),
@@ -4584,11 +4596,11 @@ moe_oracle_rows! {
 // POOT-739: `Driver::encode` and prompts with embedding rows, on a device against the CPU oracle.
 // ---------------------------------------------------------------------------------------------
 
+use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_graph_ir::{Slot, SlotKey};
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 use poot_models::registry::Fixture;
 use poot_tensor::HostTensor;
-use poot_test_util::weight_map_oracle::eval_mapped;
 
 use crate::driver::{EncodeRequest, EncodeRow, PromptEmbeds};
 
@@ -4626,7 +4638,9 @@ fn oracle(
     slots: &[(SlotKey, HostTensor)],
 ) -> Vec<f32> {
     let model = handle.model();
-    let graph = model.trace(phase, shape).unwrap();
+    let graph = model
+        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .unwrap();
     let state: Vec<HostTensor> = graph
         .state()
         .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
@@ -4968,19 +4982,19 @@ per_backend!(
 /// The ids of the SmolVLM fixture tokenizer: letters and digits first (`b c d` is the question),
 /// then the idefics3 markers the front end's prompt names, then a filler up to the vocabulary.
 mod smolvlm_ids {
-    pub const QUESTION: [u32; 3] = [1, 2, 3];
-    pub const USER: u32 = 36;
-    pub const ASSISTANT: u32 = 37;
-    pub const IM_START: u32 = 38;
-    pub const END_OF_UTTERANCE: u32 = 39;
-    pub const FAKE: u32 = 40;
-    pub const GLOBAL: u32 = 41;
-    pub const IMAGE: u32 = 42;
+    pub(super) const QUESTION: [u32; 3] = [1, 2, 3];
+    pub(super) const USER: u32 = 36;
+    pub(super) const ASSISTANT: u32 = 37;
+    pub(super) const IM_START: u32 = 38;
+    pub(super) const END_OF_UTTERANCE: u32 = 39;
+    pub(super) const FAKE: u32 = 40;
+    pub(super) const GLOBAL: u32 = 41;
+    pub(super) const IMAGE: u32 = 42;
     /// `<row_1_col_1>`, `<row_1_col_2>`, `<row_2_col_1>`, `<row_2_col_2>`: a 2x2 tile grid.
-    pub const fn tile(row: usize, col: usize) -> u32 {
+    pub(super) const fn tile(row: usize, col: usize) -> u32 {
         43 + (row * 2 + col) as u32
     }
-    pub const VOCAB: usize = 48;
+    pub(super) const VOCAB: usize = 48;
 }
 
 /// The SmolVLM fixture tokenizer: [`smolvlm_ids`]' words, with every marker a special token so the
@@ -5141,7 +5155,7 @@ fn smolvlm_request(
     use poot_models::vision::idefics3_preprocess;
     use smolvlm_ids as ids;
 
-    let split = idefics3_preprocess(rgb, 16, 16, preprocess);
+    let split = idefics3_preprocess(rgb, 16, 16, preprocess).unwrap();
     assert_eq!(
         (split.rows, split.cols),
         (2, 2),
@@ -5941,7 +5955,7 @@ fn resident_weights(driver: &Driver) -> (u64, u64) {
         .executor_stats()
         .memory
         .iter()
-        .find(|(role, _)| *role == poot_executor::BufferRole::Weight)
+        .find(|(role, _)| *role == poot_runtime_common::BufferRole::Weight)
         .map(|(_, snapshot)| (snapshot.allocations, snapshot.live_bytes))
         .unwrap()
 }
@@ -6264,7 +6278,7 @@ fn weight_counters(driver: &Driver) -> (u64, u64) {
     let (_, weights) = stats
         .memory
         .iter()
-        .find(|(role, _)| *role == poot_executor::BufferRole::Weight)
+        .find(|(role, _)| *role == poot_runtime_common::BufferRole::Weight)
         .expect("the executor counts weights");
     (weights.live_bytes, weights.allocations)
 }
@@ -6712,7 +6726,7 @@ fn qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal(choice: BackendChoic
             vision,
             // The driver's own trace bound is out of the way: the refusal is the tower's.
             DriverOptions {
-                max_trace_tokens: nz(8192),
+                trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(8192)),
                 ..options(4096, 4096)
             },
         ),
@@ -6951,7 +6965,7 @@ struct TwoTurns {
 }
 
 fn two_turns(template: &str, choice: BackendChoice) -> Option<TwoTurns> {
-    use crate::Speaker;
+    use poot_text::Speaker;
     let handle = chat_handle(template);
     let mut session =
         crate::driver::ChatSession::new(&handle, open(choice)?, chat_options()).unwrap();

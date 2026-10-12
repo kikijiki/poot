@@ -19,12 +19,12 @@ const NEGATIVE_INFINITY: u32 = 0xFF80_0000;
 const NEGATIVE_ZERO: u32 = 0x8000_0000;
 
 fn select_f32_bits(shape: &[usize], cond: &[i32], if_true: &[u32], if_false: &[u32]) -> Vec<u32> {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = |dtype| TensorType::new(shape.to_vec(), dtype);
-    let c = b.constant("cond", ty(DType::I32));
-    let t = b.constant("if_true", ty(DType::F32));
-    let f = b.constant("if_false", ty(DType::F32));
-    let out = b.select(c, t, f);
+    let c = b.constant("cond", ty(DType::I32)).unwrap();
+    let t = b.constant("if_true", ty(DType::F32)).unwrap();
+    let f = b.constant("if_false", ty(DType::F32)).unwrap();
+    let out = b.select(c, t, f).unwrap();
     let g = b.finish(out).unwrap();
     let floats = |bits: &[u32]| {
         HostTensor::f32(
@@ -121,11 +121,17 @@ fn float_select_keeps_a_poisoned_unselected_branch_out_of_the_result() {
 /// A condition of `[2, 1]` broadcasts across `[2, 3]` branches.
 #[test]
 fn float_select_broadcasts_the_condition() {
-    let b = Builder::new();
-    let c = b.constant("cond", TensorType::new(vec![2, 1], DType::I32));
-    let t = b.constant("if_true", TensorType::new(vec![2, 3], DType::F32));
-    let f = b.constant("if_false", TensorType::new(vec![3], DType::F32));
-    let out = b.select(c, t, f);
+    let b = Builder::for_tests();
+    let c = b
+        .constant("cond", TensorType::new(vec![2, 1], DType::I32))
+        .unwrap();
+    let t = b
+        .constant("if_true", TensorType::new(vec![2, 3], DType::F32))
+        .unwrap();
+    let f = b
+        .constant("if_false", TensorType::new(vec![3], DType::F32))
+        .unwrap();
+    let out = b.select(c, t, f).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = HashMap::from([
         (c.id(), Value::from(HostTensor::i32(vec![2, 1], vec![1, 0]))),
@@ -168,12 +174,12 @@ fn float_select_broadcasts_the_condition() {
 /// exactly, and the unselected NaN stays out.
 #[test]
 fn bf16_select_passes_half_width_bits_through() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = |dtype| TensorType::new(vec![4], dtype);
-    let c = b.constant("cond", ty(DType::I32));
-    let t = b.constant("if_true", ty(DType::BF16));
-    let f = b.constant("if_false", ty(DType::BF16));
-    let out = b.select(c, t, f);
+    let c = b.constant("cond", ty(DType::I32)).unwrap();
+    let t = b.constant("if_true", ty(DType::BF16)).unwrap();
+    let f = b.constant("if_false", ty(DType::BF16)).unwrap();
+    let out = b.select(c, t, f).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = HashMap::from([
         (
@@ -222,7 +228,7 @@ fn half_tensor(dtype: DType, shape: Vec<usize>, words: Vec<u16>) -> HostTensor {
 
 /// POOT-1041: `Select` over two-byte floats is the same bit-moving select as the F32 and I32 forms, for a
 /// branch that comes straight from an input AND for one that went through the movement ops that carry an
-/// owner-backed view (reshape, transpose) or a materialized copy (broadcast, slice, concat). The expectations
+/// exact view (reshape, transpose) or a materialized copy (broadcast, slice, concat). The expectations
 /// are hand-written words: the signaling NaN keeps its payload (a trip through F32 would quiet it) and the
 /// unselected branch's NaN stays out. Mutation: read the movement operands through `get` instead of `stored`
 /// in `evaluate_dense`; the BF16 concat refuses mixed lanes.
@@ -230,28 +236,43 @@ fn half_tensor(dtype: DType, shape: Vec<usize>, words: Vec<u16>) -> HostTensor {
 fn narrow_select_moves_exact_words_through_movement_ops() {
     for dtype in [DType::BF16, DType::F16] {
         let words = half_patterns(dtype);
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let ty = |shape: &[usize], dtype| TensorType::new(shape.to_vec(), dtype);
-        let cond = b.constant("cond", ty(&[6], DType::I32));
-        let on = b.constant("if_true", ty(&[6], dtype));
-        let off = b.constant("if_false", ty(&[6], dtype));
-        // The true branch: the words reshaped to [2,3] and transposed twice (owner-backed views), then split
+        let cond = b.constant("cond", ty(&[6], DType::I32)).unwrap();
+        let on = b.constant("if_true", ty(&[6], dtype)).unwrap();
+        let off = b.constant("if_false", ty(&[6], dtype)).unwrap();
+        // The true branch: the words reshaped to [2,3] and transposed twice (exact views), then split
         // along the last axis and re-joined.
-        let moved = b.transpose(
-            b.transpose(b.reshape(on, vec![2, 3]), vec![1, 0]),
-            vec![1, 0],
-        );
-        let joined = b.reshape(
-            b.concat(1, &[b.slice(moved, 1, 0, 1), b.slice(moved, 1, 1, 3)]),
-            vec![6],
-        );
+        let moved = b
+            .transpose(
+                b.transpose(b.reshape(on, vec![2, 3]).unwrap(), vec![1, 0])
+                    .unwrap(),
+                vec![1, 0],
+            )
+            .unwrap();
+        let joined = b
+            .reshape(
+                b.concat(
+                    1,
+                    &[
+                        b.slice(moved, 1, 0, 1).unwrap(),
+                        b.slice(moved, 1, 1, 3).unwrap(),
+                    ],
+                )
+                .unwrap(),
+                vec![6],
+            )
+            .unwrap();
         // The false branch: a broadcast of the same words from a leading axis, reshaped back.
-        let widened = b.reshape(
-            b.broadcast(b.reshape(off, vec![1, 6]), vec![2, 6]),
-            vec![12],
-        );
-        let other = b.slice(widened, 0, 6, 12);
-        let out = b.select(cond, joined, other);
+        let widened = b
+            .reshape(
+                b.broadcast(b.reshape(off, vec![1, 6]).unwrap(), vec![2, 6])
+                    .unwrap(),
+                vec![12],
+            )
+            .unwrap();
+        let other = b.slice(widened, 0, 6, 12).unwrap();
+        let out = b.select(cond, joined, other).unwrap();
         let g = b.finish(out).unwrap();
         let inputs = HashMap::from([
             (

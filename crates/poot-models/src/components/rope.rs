@@ -13,6 +13,9 @@ use poot_quant::weights::WeightEntry;
 use poot_tensor::DType;
 
 use super::standard::ParamError;
+use crate::model::TraceError;
+use crate::model::WiringError;
+use crate::model::last_axis;
 use crate::model::{ConfigReason, FamilyKey, ModelError};
 
 /// Which dims a rotation pairs: the two halves of the rotary width (HF checkpoints), or adjacent
@@ -388,24 +391,26 @@ pub struct RopeRows {
 
 /// Gather the step's rows of `p`'s tables over `capacity` positions at `pos` (`[rows, tokens]`
 /// I32 absolute positions, each below `capacity`).
-pub fn rope_rows(b: &Builder, p: RopeParams, pos: Traced, capacity: usize) -> RopeRows {
-    let shape = b.aval(pos).shape;
+pub fn rope_rows(
+    b: &Builder,
+    p: RopeParams,
+    pos: Traced,
+    capacity: usize,
+) -> Result<RopeRows, TraceError> {
+    let shape = b.aval(pos)?.shape;
     let (rows, tokens) = (shape[0], shape[1]);
     let rotary = p.rotary();
     let table = |table| {
-        let computed = p
-            .spec
-            .computed(table, capacity)
-            .expect("a step's capacity fits a u32: StepShape capacities are checked by the model");
-        let full = b.computed(computed);
-        b.reshape(b.gather(full, 0, pos), vec![rows, 1, tokens, rotary])
+        let computed = p.spec.computed(table, capacity)?;
+        let full = b.computed(computed)?;
+        Ok::<_, TraceError>(b.reshape(b.gather(full, 0, pos)?, vec![rows, 1, tokens, rotary])?)
     };
-    RopeRows {
-        cos: table(RopeTable::Cos),
-        sin: table(RopeTable::Sin),
+    Ok(RopeRows {
+        cos: table(RopeTable::Cos)?,
+        sin: table(RopeTable::Sin)?,
         rotary,
         pairing: p.pairing,
-    }
+    })
 }
 
 /// Rotate `x` (`[rows, heads, tokens, head_dim]`) by `p`'s sectioned rotation at the three axes of
@@ -418,30 +423,29 @@ pub fn apply_rope_sectioned(
     x: Traced,
     mrope: Traced,
     capacity: usize,
-) -> Traced {
-    let sections = p
-        .sections
-        .expect("apply_rope_sectioned needs a sectioned RopeParams");
-    let shape = b.aval(x).shape;
+) -> Result<Traced, TraceError> {
+    let sections = p.sections.ok_or(WiringError::RopeNotSectioned)?;
+    let shape = b.aval(x)?.shape;
     let (rows, tokens) = (shape[0], shape[2]);
     let table = |table| {
-        let computed = p
-            .spec
-            .computed(table, capacity)
-            .expect("a step's capacity fits a u32: StepShape capacities are checked by the model");
-        b.computed(computed)
+        let computed = p.spec.computed(table, capacity)?;
+        Ok::<_, TraceError>(b.computed(computed)?)
     };
     let axes: Vec<Traced> = (0..3)
-        .map(|axis| b.reshape(b.slice(mrope, 0, axis, axis + 1), vec![rows, 1, tokens]))
-        .collect();
-    ops::rope_sectioned(
+        .map(|axis| {
+            Ok::<_, TraceError>(
+                b.reshape(b.slice(mrope, 0, axis, axis + 1)?, vec![rows, 1, tokens])?,
+            )
+        })
+        .collect::<Result<_, TraceError>>()?;
+    Ok(ops::rope_sectioned(
         b,
         x,
-        table(RopeTable::Cos),
-        table(RopeTable::Sin),
+        table(RopeTable::Cos)?,
+        table(RopeTable::Sin)?,
         &axes,
         &sections,
-    )
+    )?)
 }
 
 /// The rows of `p`'s tables at positions `0, stride, 2 * stride, ..`, `count` of them, for `rows`
@@ -455,88 +459,89 @@ pub fn rope_strided_rows(
     stride: usize,
     count: usize,
     rows: usize,
-) -> RopeRows {
+) -> Result<RopeRows, TraceError> {
     let rotary = p.rotary();
     let table = |table| {
-        let computed = p
-            .spec
-            .computed(table, capacity)
-            .expect("a step's capacity fits a u32: StepShape capacities are checked by the model");
-        let full = b.computed(computed);
+        let computed = p.spec.computed(table, capacity)?;
+        let full = b.computed(computed)?;
         let tiles = b.reshape(
-            b.slice(full, 0, 0, count * stride),
+            b.slice(full, 0, 0, count * stride)?,
             vec![count, stride, rotary],
-        );
-        let starts = b.reshape(b.slice(tiles, 1, 0, 1), vec![1, 1, count, rotary]);
-        b.broadcast(starts, vec![rows, 1, count, rotary])
+        )?;
+        let starts = b.reshape(b.slice(tiles, 1, 0, 1)?, vec![1, 1, count, rotary])?;
+        Ok::<_, TraceError>(b.broadcast(starts, vec![rows, 1, count, rotary])?)
     };
-    RopeRows {
-        cos: table(RopeTable::Cos),
-        sin: table(RopeTable::Sin),
+    Ok(RopeRows {
+        cos: table(RopeTable::Cos)?,
+        sin: table(RopeTable::Sin)?,
         rotary,
         pairing: p.pairing,
-    }
+    })
 }
 
 impl RopeRows {
     /// The inverse rotation: the same rows with `sin` negated, so [`apply_rope`] undoes the
     /// rotation by the same positions (DeepSeek-V4 derotates its attention output, which picked up
     /// the rotation of the shared key it reads as a value).
-    pub fn inverse(self, b: &Builder) -> Self {
-        Self {
-            sin: b.unary(UnOp::Neg, self.sin),
+    pub fn inverse(self, b: &Builder) -> Result<Self, TraceError> {
+        Ok(Self {
+            sin: b.unary(UnOp::Neg, self.sin)?,
             ..self
-        }
+        })
     }
 }
 
 /// Rotate the leading `rotary` dims of `x` (`[rows, heads, tokens, head_dim]`): half-split,
 /// `x * cos + concat(-x2, x1) * sin`, or interleaved, each adjacent pair `(a, b)` to
 /// `(a cos - b sin, b cos + a sin)`; the trailing dims pass through.
-pub fn apply_rope(b: &Builder, x: Traced, r: &RopeRows) -> Traced {
-    let d = *b.aval(x).shape.last().expect("rope input has a head axis");
+pub fn apply_rope(b: &Builder, x: Traced, r: &RopeRows) -> Result<Traced, TraceError> {
+    let d = last_axis("apply_rope", &b.aval(x)?.shape)?;
     let (rot, half) = (r.rotary, r.rotary / 2);
     let axis = 3;
     let part = if rot == d {
         x
     } else {
-        b.slice(x, axis, 0, rot)
+        b.slice(x, axis, 0, rot)?
     };
     let out = match r.pairing {
         RopePairing::HalfSplit => {
-            let x1 = b.slice(part, axis, 0, half);
-            let x2 = b.slice(part, axis, half, rot);
-            let neg_x2 = b.unary(UnOp::Neg, x2);
-            let rotated = b.concat(axis, &[neg_x2, x1]);
+            let x1 = b.slice(part, axis, 0, half)?;
+            let x2 = b.slice(part, axis, half, rot)?;
+            let neg_x2 = b.unary(UnOp::Neg, x2)?;
+            let rotated = b.concat(axis, &[neg_x2, x1])?;
             b.binary(
                 BinOp::Add,
-                b.binary(BinOp::Mul, part, r.cos),
-                b.binary(BinOp::Mul, rotated, r.sin),
-            )
+                b.binary(BinOp::Mul, part, r.cos)?,
+                b.binary(BinOp::Mul, rotated, r.sin)?,
+            )?
         }
         RopePairing::Interleaved => {
-            let shape = b.aval(part).shape;
+            let shape = b.aval(part)?.shape;
             let pairs = vec![shape[0], shape[1], shape[2], half, 2];
-            let part = b.reshape(part, pairs);
+            let part = b.reshape(part, pairs)?;
             let lane = |i| {
-                let v = b.slice(part, 4, i, i + 1);
-                b.reshape(v, vec![shape[0], shape[1], shape[2], half])
+                let v = b.slice(part, 4, i, i + 1)?;
+                Ok::<_, TraceError>(b.reshape(v, vec![shape[0], shape[1], shape[2], half])?)
             };
-            let (even, odd) = (lane(0), lane(1));
+            let (even, odd) = (lane(0)?, lane(1)?);
             // The tables repeat each frequency in both halves; the first half is one per pair.
-            let (cos, sin) = (b.slice(r.cos, axis, 0, half), b.slice(r.sin, axis, 0, half));
-            let mul = |a, c| b.binary(BinOp::Mul, a, c);
-            let new_even = b.binary(BinOp::Sub, mul(even, cos), mul(odd, sin));
-            let new_odd = b.binary(BinOp::Add, mul(odd, cos), mul(even, sin));
-            let pair = |v| b.reshape(v, vec![shape[0], shape[1], shape[2], half, 1]);
-            let joined = b.concat(4, &[pair(new_even), pair(new_odd)]);
-            b.reshape(joined, vec![shape[0], shape[1], shape[2], rot])
+            let (cos, sin) = (
+                b.slice(r.cos, axis, 0, half)?,
+                b.slice(r.sin, axis, 0, half)?,
+            );
+            let mul = |a, c| Ok::<_, TraceError>(b.binary(BinOp::Mul, a, c)?);
+            let new_even = b.binary(BinOp::Sub, mul(even, cos)?, mul(odd, sin)?)?;
+            let new_odd = b.binary(BinOp::Add, mul(odd, cos)?, mul(even, sin)?)?;
+            let pair =
+                |v| Ok::<_, TraceError>(b.reshape(v, vec![shape[0], shape[1], shape[2], half, 1])?);
+            let joined = b.concat(4, &[pair(new_even)?, pair(new_odd)?])?;
+            b.reshape(joined, vec![shape[0], shape[1], shape[2], rot])?
         }
     };
     if rot == d {
-        out
+        Ok(out)
     } else {
-        b.concat(axis, &[out, b.slice(x, axis, rot, d)])
+        Ok(b.concat(axis, &[out, b.slice(x, axis, rot, d)?])?)
     }
 }
 
@@ -559,11 +564,15 @@ mod tests {
         let x = oracle::random(heads * t * d, 21);
         for rotary in [d, 4] {
             let p = RopeParams::new(rotary, theta, &RopeFlavor::Plain).unwrap();
-            let b = Builder::new();
-            let ps = b.slot(Slot::Pos, TensorType::new(vec![1, t], DType::I32));
-            let xs = b.constant("x", TensorType::f32(vec![1, heads, t, d]));
-            let rows = rope_rows(&b, p, ps, cap);
-            let y = apply_rope(&b, xs, &rows);
+            let b = Builder::for_tests();
+            let ps = b
+                .slot(Slot::Pos, TensorType::new(vec![1, t], DType::I32))
+                .unwrap();
+            let xs = b
+                .constant("x", TensorType::f32(vec![1, heads, t, d]))
+                .unwrap();
+            let rows = rope_rows(&b, p, ps, cap).unwrap();
+            let y = apply_rope(&b, xs, &rows).unwrap();
             let got = Fx::new(0)
                 .eval(
                     &b.finish(y).unwrap(),
@@ -606,10 +615,14 @@ mod tests {
             .unwrap()
             .sectioned(sections)
             .unwrap();
-        let b = Builder::new();
-        let ms = b.slot(Slot::MropePosition, TensorType::new(vec![3, t], DType::I32));
-        let xs = b.constant("x", TensorType::f32(vec![1, heads, t, d]));
-        let y = apply_rope_sectioned(&b, p, xs, ms, cap);
+        let b = Builder::for_tests();
+        let ms = b
+            .slot(Slot::MropePosition, TensorType::new(vec![3, t], DType::I32))
+            .unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, heads, t, d]))
+            .unwrap();
+        let y = apply_rope_sectioned(&b, p, xs, ms, cap).unwrap();
         let got = Fx::new(0)
             .eval(
                 &b.finish(y).unwrap(),
@@ -679,11 +692,15 @@ mod tests {
         let pos = [5, 6, 11];
         let x = oracle::random(heads * t * d, 22);
         let run = |p: RopeParams, x: &[f32]| {
-            let b = Builder::new();
-            let ps = b.slot(Slot::Pos, TensorType::new(vec![1, t], DType::I32));
-            let xs = b.constant("x", TensorType::f32(vec![1, heads, t, d]));
-            let rows = rope_rows(&b, p, ps, cap);
-            let y = apply_rope(&b, xs, &rows);
+            let b = Builder::for_tests();
+            let ps = b
+                .slot(Slot::Pos, TensorType::new(vec![1, t], DType::I32))
+                .unwrap();
+            let xs = b
+                .constant("x", TensorType::f32(vec![1, heads, t, d]))
+                .unwrap();
+            let rows = rope_rows(&b, p, ps, cap).unwrap();
+            let y = apply_rope(&b, xs, &rows).unwrap();
             Fx::new(0)
                 .eval(
                     &b.finish(y).unwrap(),
@@ -945,17 +962,21 @@ mod tests {
             // `which`: 0 rows at the strided positions, 1 rows gathered at those positions, 2
             // the strided rotation undone by its inverse.
             let run = |which: u8| {
-                let b = Builder::new();
-                let xs = b.constant("x", TensorType::f32(vec![rows, heads, count, d]));
+                let b = Builder::for_tests();
+                let xs = b
+                    .constant("x", TensorType::f32(vec![rows, heads, count, d]))
+                    .unwrap();
                 let r = if which == 1 {
-                    let ps = b.slot(Slot::Pos, TensorType::new(vec![rows, count], DType::I32));
-                    rope_rows(&b, p, ps, cap)
+                    let ps = b
+                        .slot(Slot::Pos, TensorType::new(vec![rows, count], DType::I32))
+                        .unwrap();
+                    rope_rows(&b, p, ps, cap).unwrap()
                 } else {
-                    rope_strided_rows(&b, p, cap, stride, count, rows)
+                    rope_strided_rows(&b, p, cap, stride, count, rows).unwrap()
                 };
-                let y = apply_rope(&b, xs, &r);
+                let y = apply_rope(&b, xs, &r).unwrap();
                 let out = if which == 2 {
-                    apply_rope(&b, y, &r.inverse(&b))
+                    apply_rope(&b, y, &r.inverse(&b).unwrap()).unwrap()
                 } else {
                     y
                 };

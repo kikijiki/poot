@@ -224,21 +224,21 @@ def check(
     return 0
 
 
-FIXTURE_LIST_AB = "poot-gpu::fixture\talpha_case\npoot-gpu::fixture\tbeta_case\n"
+FIXTURE_LIST_AB = "poot-wgpu-device::fixture\talpha_case\npoot-wgpu-device::fixture\tbeta_case\n"
 
 FIXTURE_GREEN = """<?xml version="1.0" encoding="UTF-8"?>
 <testsuites name="fixture" tests="2" failures="0" errors="0">
-  <testsuite name="poot-gpu::fixture" tests="2" disabled="0" errors="0" failures="0">
-    <testcase name="alpha_case" classname="poot-gpu::fixture" time="0.001"/>
-    <testcase name="beta_case" classname="poot-gpu::fixture" time="0.001"/>
+  <testsuite name="poot-wgpu-device::fixture" tests="2" disabled="0" errors="0" failures="0">
+    <testcase name="alpha_case" classname="poot-wgpu-device::fixture" time="0.001"/>
+    <testcase name="beta_case" classname="poot-wgpu-device::fixture" time="0.001"/>
   </testsuite>
 </testsuites>
 """
 
 FIXTURE_ALPHA_ONLY = """<?xml version="1.0" encoding="UTF-8"?>
 <testsuites name="fixture" tests="1" failures="0" errors="0">
-  <testsuite name="poot-gpu::fixture" tests="1" disabled="0" errors="0" failures="0">
-    <testcase name="alpha_case" classname="poot-gpu::fixture" time="0.001"/>
+  <testsuite name="poot-wgpu-device::fixture" tests="1" disabled="0" errors="0" failures="0">
+    <testcase name="alpha_case" classname="poot-wgpu-device::fixture" time="0.001"/>
   </testsuite>
 </testsuites>
 """
@@ -248,11 +248,11 @@ def fixture_with_alpha(body: str) -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<testsuites name="fixture" tests="2" failures="0" errors="0">\n'
-        '  <testsuite name="poot-gpu::fixture" tests="2" disabled="0" errors="0" failures="0">\n'
-        f'    <testcase name="alpha_case" classname="poot-gpu::fixture" time="0.001">\n'
+        '  <testsuite name="poot-wgpu-device::fixture" tests="2" disabled="0" errors="0" failures="0">\n'
+        f'    <testcase name="alpha_case" classname="poot-wgpu-device::fixture" time="0.001">\n'
         f"{body}\n"
         "    </testcase>\n"
-        '    <testcase name="beta_case" classname="poot-gpu::fixture" time="0.001"/>\n'
+        '    <testcase name="beta_case" classname="poot-wgpu-device::fixture" time="0.001"/>\n'
         "  </testsuite>\n"
         "</testsuites>\n"
     )
@@ -310,37 +310,37 @@ def self_test() -> int:
     cases = [
         (
             "required case absent from the results",
-            "required case did not run: poot-gpu::fixture beta_case",
+            "required case did not run: poot-wgpu-device::fixture beta_case",
             FIXTURE_LIST_AB,
             FIXTURE_ALPHA_ONLY,
         ),
         (
             "runtime skip reported on stderr",
-            "required case skipped: poot-gpu::fixture alpha_case: SKIP: wgpu device unavailable: no adapter",
+            "required case skipped: poot-wgpu-device::fixture alpha_case: SKIP: wgpu device unavailable: no adapter",
             FIXTURE_LIST_AB,
             fixture_with_alpha("      <system-err>SKIP: wgpu device unavailable: no adapter\n</system-err>"),
         ),
         (
             "runtime skip reported in the lowercase form",
-            "required case skipped: poot-gpu::fixture alpha_case: skip: no wgpu adapter",
+            "required case skipped: poot-wgpu-device::fixture alpha_case: skip: no wgpu adapter",
             FIXTURE_LIST_AB,
             fixture_with_alpha("      <system-err>skip: no wgpu adapter\n</system-err>"),
         ),
         (
             "runtime skip reported on stdout",
-            "required case skipped: poot-gpu::fixture alpha_case: SKIP case (no GPU agent)",
+            "required case skipped: poot-wgpu-device::fixture alpha_case: SKIP case (no GPU agent)",
             FIXTURE_LIST_AB,
             fixture_with_alpha("      <system-out>SKIP case (no GPU agent)\n</system-out>"),
         ),
         (
             "testcase the runner skipped",
-            "required case skipped: poot-gpu::fixture alpha_case: reported skipped by the runner",
+            "required case skipped: poot-wgpu-device::fixture alpha_case: reported skipped by the runner",
             FIXTURE_LIST_AB,
             fixture_with_alpha("      <skipped/>"),
         ),
         (
             "required case failed",
-            "required case failed: poot-gpu::fixture alpha_case: assertion left == right failed",
+            "required case failed: poot-wgpu-device::fixture alpha_case: assertion left == right failed",
             FIXTURE_LIST_AB,
             fixture_with_alpha(
                 '      <failure type="test failure">assertion left == right failed\n</failure>'
@@ -360,20 +360,20 @@ def self_test() -> int:
         ),
         (
             "duplicate required row",
-            "required-case list has a duplicate row: poot-gpu::fixture alpha_case",
-            "poot-gpu::fixture\talpha_case\npoot-gpu::fixture\talpha_case\n",
+            "required-case list has a duplicate row: poot-wgpu-device::fixture alpha_case",
+            "poot-wgpu-device::fixture\talpha_case\npoot-wgpu-device::fixture\talpha_case\n",
             FIXTURE_GREEN,
         ),
         (
             "unsorted required rows",
             "required-case list is not in canonical sorted order",
-            "poot-gpu::fixture\tbeta_case\npoot-gpu::fixture\talpha_case\n",
+            "poot-wgpu-device::fixture\tbeta_case\npoot-wgpu-device::fixture\talpha_case\n",
             FIXTURE_GREEN,
         ),
         (
             "malformed required row",
             "required-case list malformed at line 1",
-            "poot-gpu::fixture alpha_case\n",
+            "poot-wgpu-device::fixture alpha_case\n",
             FIXTURE_GREEN,
         ),
     ]
@@ -382,8 +382,8 @@ def self_test() -> int:
             return 1
 
     # Exhaustive classification (card 1125): the same two-row results, with only alpha required.
-    only_alpha = "poot-gpu::fixture\talpha_case\n"
-    beta_unlisted = "poot-gpu::fixture\tbeta_case\thost-only fixture row\n"
+    only_alpha = "poot-wgpu-device::fixture\talpha_case\n"
+    beta_unlisted = "poot-wgpu-device::fixture\tbeta_case\thost-only fixture row\n"
     status, output = run_fixture(only_alpha, FIXTURE_GREEN, beta_unlisted)
     if status != 0:
         print("required-case check rejected a fully classified fixture", file=sys.stderr)
@@ -400,31 +400,31 @@ def self_test() -> int:
         ),
         (
             "unlisted row that did not run",
-            "unlisted case did not run: poot-gpu::fixture beta_case",
+            "unlisted case did not run: poot-wgpu-device::fixture beta_case",
             only_alpha,
             FIXTURE_ALPHA_ONLY,
             beta_unlisted,
         ),
         (
             "row both required and unlisted",
-            "row is both required and unlisted: poot-gpu::fixture alpha_case",
+            "row is both required and unlisted: poot-wgpu-device::fixture alpha_case",
             FIXTURE_LIST_AB,
             FIXTURE_GREEN,
-            "poot-gpu::fixture\talpha_case\treason\n",
+            "poot-wgpu-device::fixture\talpha_case\treason\n",
         ),
         (
             "unlisted row without a reason",
             "unlisted-case list malformed at line 1",
             only_alpha,
             FIXTURE_GREEN,
-            "poot-gpu::fixture\tbeta_case\n",
+            "poot-wgpu-device::fixture\tbeta_case\n",
         ),
         (
             "unlisted row with an empty reason",
             "unlisted-case list malformed at line 1",
             only_alpha,
             FIXTURE_GREEN,
-            "poot-gpu::fixture\tbeta_case\t \n",
+            "poot-wgpu-device::fixture\tbeta_case\t \n",
         ),
     ]
     for label, needle, list_text, results_xml, unlisted_text in classification:

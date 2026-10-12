@@ -11,7 +11,9 @@
 //! whose state row `i` takes. The snapshot and restore entries ([`super::snapshot`]) build on the same
 //! [`row_index`] and [`state_row_gather`], so beam reorder and snapshot cannot drift (R-647-2).
 
-use poot_graph_ir::{Builder, Graph, Slot, SlotKey, TensorType, Traced};
+use poot_graph_ir::{
+    Builder, BuilderError, Graph, Slot, SlotKey, TensorType, TraceLimits, Traced, ValueId,
+};
 use poot_tensor::DType;
 
 /// The tag of the row-index activation slot.
@@ -23,7 +25,7 @@ pub(super) fn beam_rows_slot() -> SlotKey {
 }
 
 /// Declare the row-index slot: `I32 [rows]`, bound by name as [`beam_rows_slot`].
-pub(super) fn row_index(b: &Builder, rows: usize) -> Traced {
+pub(super) fn row_index(b: &Builder, rows: usize) -> Result<Traced, BuilderError> {
     b.slot_named(
         Slot::Activation,
         BEAM_ROWS_TAG,
@@ -34,37 +36,63 @@ pub(super) fn row_index(b: &Builder, rows: usize) -> Traced {
 /// The rows of `source` that `index` names, along the leading (row) axis. A reorder gathers a state
 /// value by itself; a snapshot gathers from the concatenation of two state values, so an index at or
 /// past the row count reaches the second.
-pub(super) fn state_row_gather(b: &Builder, source: Traced, index: Traced) -> Traced {
+pub(super) fn state_row_gather(
+    b: &Builder,
+    source: Traced,
+    index: Traced,
+) -> Result<Traced, BuilderError> {
     b.gather(source, 0, index)
 }
 
+/// Why a reorder or snapshot graph over a decode program's carried state cannot be built. The driver
+/// checks every state pair's row axis before it reorders; these are the typed causes when that check
+/// was not enough.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RowGraphError {
+    #[error("the decode program carries no state with a row axis")]
+    NoState,
+    #[error("a carried state input at value {value} carries no name")]
+    UnnamedState { value: ValueId },
+    #[error("state {name:?} has row axis {found:?} where the program's is {rows}")]
+    RowAxis {
+        name: String,
+        rows: usize,
+        found: Option<usize>,
+    },
+    #[error(transparent)]
+    Build(#[from] BuilderError),
+}
+
 /// The reorder graph over `decode`'s state pairs: each state value becomes its own rows gathered by
-/// `row_index`. Panics if `decode` carries no state or a state value has no leading row axis of the
-/// common length; the driver checks the row axis of every state pair before it reorders.
-pub(super) fn reorder_graph(decode: &Graph) -> Graph {
-    let b = Builder::new();
+/// `row_index`. Refused when `decode` carries no state or a state value has no leading row axis of the
+/// common length.
+pub(super) fn reorder_graph(decode: &Graph, limits: TraceLimits) -> Result<Graph, RowGraphError> {
+    let b = Builder::new(limits);
     let mut pairs = decode.state_pairs().peekable();
     let rows = pairs
         .peek()
         .and_then(|pair| decode.aval(pair.input).shape.first().copied())
-        .expect("a decode program carries state with a row axis");
-    let index = row_index(&b, rows);
+        .ok_or(RowGraphError::NoState)?;
+    let index = row_index(&b, rows)?;
     let mut moved = Vec::new();
     for pair in pairs {
         let meta = decode.meta(pair.input);
         let name = meta
             .name
             .as_deref()
-            .expect("a state input carries its name");
-        assert_eq!(
-            meta.aval.shape.first(),
-            Some(&rows),
-            "state {name:?} has a different row axis"
-        );
-        let state = b.state_input(name, meta.aval.clone(), pair.role);
-        moved.push((state, state_row_gather(&b, state, index)));
+            .ok_or(RowGraphError::UnnamedState { value: pair.input })?;
+        if meta.aval.shape.first() != Some(&rows) {
+            return Err(RowGraphError::RowAxis {
+                name: name.to_string(),
+                rows,
+                found: meta.aval.shape.first().copied(),
+            });
+        }
+        let state = b.state_input(name, meta.aval.clone(), pair.role)?;
+        moved.push((state, state_row_gather(&b, state, index)?));
     }
-    let (_, out) = moved[0];
-    b.finish(poot_graph_ir::Outputs::new(out).with_state(&moved))
-        .unwrap()
+    let Some(&(_, out)) = moved.first() else {
+        return Err(RowGraphError::NoState);
+    };
+    Ok(b.finish(poot_graph_ir::Outputs::new(out).with_state(&moved))?)
 }

@@ -21,13 +21,6 @@ pub fn thread_index() -> usize {
     0
 }
 
-/// The global dispatch index along X. Same axis as [`thread_index`].
-#[cfg(test)]
-#[inline(never)]
-pub(crate) fn thread_index_x() -> usize {
-    0
-}
-
 /// The lane's position within its workgroup along X (`0..workgroup_size[0]`), used to address per-lane
 /// workgroup-local (LDS) slots (spec 054). Alias of [`local_index_x`].
 #[inline(never)]
@@ -35,24 +28,10 @@ pub fn local_index() -> usize {
     0
 }
 
-/// The lane's position within its workgroup along X. Same axis as [`local_index`].
-#[cfg(test)]
-#[inline(never)]
-pub(crate) fn local_index_x() -> usize {
-    0
-}
-
 /// The workgroup's index along X (the row a per-row workgroup reduction owns). Alias of
 /// [`group_index_x`].
 #[inline(never)]
 pub fn group_index() -> usize {
-    0
-}
-
-/// The workgroup's index along X. Same axis as [`group_index`].
-#[cfg(test)]
-#[inline(never)]
-pub(crate) fn group_index_x() -> usize {
     0
 }
 
@@ -98,12 +77,28 @@ pub fn no_contract_add(a: f32, b: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn axis_aliases_match_their_documented_default() {
         assert_eq!(thread_index_x(), 0);
         assert_eq!(local_index_x(), 0);
         assert_eq!(group_index_x(), 0);
+    }
+
+    /// The global dispatch index along X. Same axis as [`thread_index`].
+    #[inline(never)]
+    pub(crate) fn thread_index_x() -> usize {
+        0
+    }
+
+    /// The lane's position within its workgroup along X. Same axis as [`local_index`].
+    #[inline(never)]
+    pub(crate) fn local_index_x() -> usize {
+        0
+    }
+
+    /// The workgroup's index along X. Same axis as [`group_index`].
+    #[inline(never)]
+    pub(crate) fn group_index_x() -> usize {
+        0
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! SC-004 drives a literal-word table through the one `eval`, with I32 inputs bound once as a dense
 //! `HostTensor::i32` (`Value::Host`) and once as an authoritative `ExactI32TensorView`
-//! (`Value::Owner(ExactValue::I32)`). The expectations are hand-written literals, not one binding
+//! (`Value::Exact(ExactValue::I32)`). The expectations are hand-written literals, not one binding
 //! compared with the other: a mutation of the shared `ops::elementwise` word function turns both
 //! bindings red, where a carrier that still held its own arm would stay green. The second test is the
 //! Reproduction: an I32 `Add` published as the graph output (card 383's deleted gather-address
@@ -13,23 +13,23 @@ use std::sync::Arc;
 
 use poot_graph_ir::{BinOp, Builder, Graph, Traced, ValueId};
 
-use super::helpers;
 use crate::{EvalBudget, EvalOptions, ExactI32TensorView, ExactValue, Value, eval};
+use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
 
 /// The graph `build(inputs)` over one `[n]` I32 constant per entry of `inputs`, evaluated through the
-/// one `eval`, once with each operand bound `Value::Host` and once bound `Value::Owner(ExactValue::I32)`;
+/// one `eval`, once with each operand bound `Value::Host` and once bound `Value::Exact(ExactValue::I32)`;
 /// returns `(dense-bound words, exact-bound words)`.
 fn words_through_both_bindings(
     inputs: &[&[i32]],
     build: impl Fn(&Builder, &[Traced]) -> Traced,
 ) -> (Vec<i32>, Vec<i32>) {
-    let builder = Builder::new();
+    let builder = Builder::for_tests();
     let constants: Vec<Traced> = inputs
         .iter()
         .enumerate()
         .map(|(position, words)| {
-            helpers::i32_constant(&builder, &format!("operand{position}"), vec![words.len()])
+            graph_fixtures::i32_constant(&builder, &format!("operand{position}"), vec![words.len()])
                 .unwrap()
         })
         .collect();
@@ -70,7 +70,7 @@ fn exact_bound_words(graph: &Graph, ids: &[ValueId], inputs: &[&[i32]]) -> Vec<i
         .map(|(&id, words)| {
             let view =
                 ExactI32TensorView::try_from_words(vec![words.len()], Arc::from(*words)).unwrap();
-            (id, Value::Owner(ExactValue::I32(view)))
+            (id, Value::Exact(ExactValue::I32(view)))
         })
         .collect();
     let out = eval(graph, &bound, EvalOptions::new(EvalBudget::UNBOUNDED))
@@ -95,7 +95,7 @@ fn assert_both(row: &str, words: (Vec<i32>, Vec<i32>), expected: &[i32]) {
 
 #[test]
 fn i32_literal_word_table_is_one_semantics_through_both_entries() {
-    let binary = |op: BinOp| move |b: &Builder, x: &[Traced]| b.binary(op, x[0], x[1]);
+    let binary = |op: BinOp| move |b: &Builder, x: &[Traced]| b.binary(op, x[0], x[1]).unwrap();
 
     // Modulo-2^32: i32::MAX + 1 wraps to i32::MIN; -1 + 1 is 0.
     assert_both(
@@ -139,7 +139,7 @@ fn i32_literal_word_table_is_one_semantics_through_both_entries() {
                 &[10, 10, 10, i32::MAX],
                 &[20, 20, 20, i32::MIN],
             ],
-            |b: &Builder, x: &[Traced]| b.select(x[0], x[1], x[2]),
+            |b: &Builder, x: &[Traced]| b.select(x[0], x[1], x[2]).unwrap(),
         ),
         &[10, 20, 10, i32::MAX],
     );
@@ -150,13 +150,13 @@ fn i32_literal_word_table_is_one_semantics_through_both_entries() {
 /// evaluates to the wrapped words.
 #[test]
 fn exact_i32_add_published_as_the_output_evaluates_to_wrapped_words() {
-    let builder = Builder::new();
-    let left = helpers::i32_constant(&builder, "left", vec![2]).unwrap();
-    let right = helpers::i32_constant(&builder, "right", vec![2]).unwrap();
-    let sum = builder.binary(BinOp::Add, left, right);
+    let builder = Builder::for_tests();
+    let left = graph_fixtures::i32_constant(&builder, "left", vec![2]).unwrap();
+    let right = graph_fixtures::i32_constant(&builder, "right", vec![2]).unwrap();
+    let sum = builder.binary(BinOp::Add, left, right).unwrap();
     let graph = builder.finish(sum).unwrap();
     let view = |words: [i32; 2]| {
-        Value::Owner(ExactValue::I32(
+        Value::Exact(ExactValue::I32(
             ExactI32TensorView::try_from_words(vec![2], Arc::from(words)).unwrap(),
         ))
     };

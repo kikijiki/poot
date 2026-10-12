@@ -1,4 +1,7 @@
 use super::*;
+use crate::multimodal::qwen_vl_image::config::PREPROCESSOR_CONFIG_FILE;
+use crate::multimodal::qwen_vl_image::raw_request::expand_qwen2_5_vl_rendered_pads;
+use crate::multimodal::qwen_vl_image::raw_request::validate_qwen2_5_vl_raw_media_order;
 
 const RAW_VISION_START: &str = "<|vision_start|>";
 

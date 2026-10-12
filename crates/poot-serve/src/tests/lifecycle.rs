@@ -1410,7 +1410,7 @@ mod device {
     use std::num::{NonZeroU64, NonZeroUsize};
 
     use poot_executor::Executor;
-    use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+    use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
     use poot_llm::driver::{
         AdapterRef, BackendChoice, DraftPolicy, Driver, DriverOptions, EncodeRequest,
         EncodeRow as DriverRow, GenerateRequest, PreparedSetLimits, PromptEmbeds, open_executor,
@@ -1475,7 +1475,7 @@ mod device {
 
     /// The device, or `None` after printing the skip (a required device panics instead).
     fn open(choice: BackendChoice) -> Option<Box<dyn Executor>> {
-        poot_test_util::device_skip::open_or_skip(backend_of(choice), open_executor(choice))
+        poot_runtime_common::device_skip::open_or_skip(backend_of(choice), open_executor(choice))
     }
 
     fn options(chunk: usize, capacity: usize) -> DriverOptions {
@@ -1485,7 +1485,7 @@ mod device {
             decode: compile,
             capacity: nz(capacity),
             prefill_chunk: nz(chunk),
-            max_trace_tokens: nz(64),
+            trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(64)),
             prepared: PreparedSetLimits {
                 max_entries: nz(64),
                 max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
@@ -1518,7 +1518,10 @@ mod device {
         std::fs::create_dir_all(&dir).expect("create the checkpoint directory");
         std::fs::write(dir.join("config.json"), fixture.config.to_string()).expect("write config");
         std::fs::write(dir.join("tokenizer.json"), tokenizer).expect("write tokenizer");
-        poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+        poot_quant::test_support::safetensors::write(
+            &dir.join("model.safetensors"),
+            &fixture.store,
+        );
         (dir, fixture)
     }
 
@@ -1850,7 +1853,7 @@ mod device {
             "r": RANK, "lora_alpha": alpha, "target_modules": targets, "use_rslora": false,
         });
         std::fs::write(dir.join("adapter_config.json"), config.to_string()).expect("write config");
-        poot_test_util::safetensors::write(
+        poot_quant::test_support::safetensors::write(
             &dir.join("adapter_model.safetensors"),
             &adapter.build(),
         );

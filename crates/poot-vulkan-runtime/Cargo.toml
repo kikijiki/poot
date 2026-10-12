@@ -8,6 +8,12 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# ADR-0113: `ReplayGraph::segment_count`, which poot-vulkan-device's executor-contract test reads; no production
+# caller.
+# Enabled only from `[dev-dependencies]` edges.
+test-support = []
+
 [dependencies]
 # Dynamically loaded (`Entry::load` dlopens libvulkan.so.1, the default "loaded" feature), so this
 # crate builds without the Vulkan SDK or headers (spec 133 FR-001, as poot-rocm-runtime does for libhsa).
@@ -19,11 +25,11 @@ thiserror.workspace = true
 # are ordinary dependencies because a `[[bin]]` target cannot use `[dev-dependencies]`.
 poot-codegen.workspace = true
 poot-kernel-ir.workspace = true
-poot-runtime.workspace = true
+poot-wgpu-runtime.workspace = true
 poot-runtime-common.workspace = true
 
 [dev-dependencies]
-poot-test-util = { workspace = true, features = ["kernel-fixtures"] }
+poot-kernel-ir = { workspace = true, features = ["test-support"] }
 
 [[bin]]
 name = "poot-vulkan-check"

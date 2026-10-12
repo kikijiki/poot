@@ -1,13 +1,16 @@
 //! Backend-neutral helpers shared by poot GPU runtimes.
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod device_skip;
 mod kernel;
 mod memory;
 pub mod telemetry;
 pub use kernel::{
-    AieArtifactError, AieBindError, AieBinding, AieBound, AieLinkedArtifact, AieShapeAbi,
-    ArgAccess, ArgSchema, CompiledKernel, KernelArgError, KernelCode, check_aie_bindings,
-    check_element_schema, check_kernel_args,
+    AieArtifactError, AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess, ArgSchema,
+    CompiledKernel, KernelArgError, KernelCode, check_element_schema, check_kernel_args,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use kernel::{AieBindError, AieBound, check_aie_bindings};
 pub use memory::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 pub use telemetry::{
     CallCounts, CallPurpose, Coverage, ExecutionCounters, TransferCounts, TransferDirection,
@@ -110,19 +113,19 @@ pub fn checked_copy_range(
 /// (no driver, wrong shell, no GPU) reports green while running nothing. `POOT_REQUIRE_<BACKEND>=1`
 /// turns that skip into a panic. This type is the one place that reads the switch: context opens
 /// ([`Self::fail_if_required`]) decide through [`Self::required`]; device tests build their own skip
-/// path on top of [`Self::fail_if_required`] (see `poot_test_util::device_skip`, card 671 - this
+/// path on top of [`Self::fail_if_required`] (see `poot_runtime_common::device_skip`, card 671 - this
 /// crate's own `skip_unavailable`/`open_or_skip` had no production caller, only that device-test
 /// pattern).
 /// `scripts/with-required-backend.sh` sets exactly one backend's variable per lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceBackend {
-    /// The wgpu executor (`poot-gpu`, `poot-runtime`).
+    /// The wgpu executor (`poot-wgpu-device`, `poot-wgpu-runtime`).
     Wgpu,
     /// The Vulkan runtime (`poot-vulkan-runtime`).
     Vulkan,
-    /// The ROCm/HSA runtime (`poot-rocm-runtime`, `poot-rocm-gpu`).
+    /// The ROCm/HSA runtime (`poot-rocm-runtime`, `poot-rocm-device`).
     Rocm,
-    /// The NVIDIA PTX runtime (`poot-ptx-runtime`, `poot-ptx-gpu`).
+    /// The NVIDIA PTX runtime (`poot-ptx-runtime`, `poot-ptx-device`).
     Ptx,
     /// The AMD XDNA2 NPU over XRT (`poot-npu`).
     Npu,
@@ -157,12 +160,6 @@ impl DeviceBackend {
     /// Whether this backend is required: its own variable is `1`.
     pub fn required(self, get: impl Fn(&str) -> Option<String>) -> bool {
         get(self.variable()).is_some_and(|value| value == "1")
-    }
-
-    /// [`Self::required`] read from the process environment.
-    #[cfg(test)]
-    pub(crate) fn required_in_env(self) -> bool {
-        self.required(|name| std::env::var(name).ok())
     }
 
     /// Panic when this backend is required. The one place the failure message is written.
@@ -400,6 +397,13 @@ mod tests {
         // Non-1-D with a legal X: unchanged even when Z > 1.
         assert_eq!(fold_grid([10, 1, 4], L, L), Some([10, 1, 4]));
     }
+
+    impl DeviceBackend {
+        /// [`Self::required`] read from the process environment.
+        pub(crate) fn required_in_env(self) -> bool {
+            self.required(|name| std::env::var(name).ok())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -457,7 +461,7 @@ mod device_backend_tests {
     // card 671: the three tests that used to live here (a device that opened is returned even when
     // required, a missing device skips when not required, skip_unavailable panics only when
     // required) exercised skip_unavailable_with/open_or_skip_with directly - both deleted (dead
-    // production code, moved to poot_test_util::device_skip, whose own tests now cover this
+    // production code, moved to poot_runtime_common::device_skip, whose own tests now cover this
     // Option-wrapping/skip-printing behavior). The panic-when-required half of that behavior is
     // fail_if_required's, covered below by fail_if_required_passes_the_error_through_unless_required.
 

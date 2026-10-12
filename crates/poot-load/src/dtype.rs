@@ -1,4 +1,4 @@
-use super::*;
+use super::LoadError;
 use poot_tensor::DType;
 
 pub(crate) fn miss(name: &str, field: &str) -> LoadError {
@@ -23,22 +23,12 @@ pub(crate) fn parse_dtype(dtype: &str) -> Result<DType, LoadError> {
     })
 }
 
-/// The stored byte width of one element for a safetensors header `dtype` string, or `None` when
-/// the string names no dtype this crate recognizes ([`parse_dtype`]). The one width table
-/// `SafeTensors::load_ranges_opts`'s byte-count check and `packed_safetensors::validation::parse_header_entries`
-/// both read (R484-006): mutating [`DType::byte_size`] moves both call sites'
-/// expectations together.
-pub(crate) fn element_width_bytes(dtype: &str) -> Option<usize> {
-    DType::parse(dtype).ok().map(DType::byte_size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// SC-001: every dtype `DType` names has one element width. `element_width_bytes` (the
-    /// `&str` entry point `SafeTensors`'s reader and `packed_safetensors::validation::parse_header_entries`
-    /// both call) must agree with it for every recognized string.
+    /// SC-001: every dtype `DType` names has one element width, read through `parse_dtype` for every
+    /// recognized string.
     #[test]
     fn every_recognized_dtype_string_has_one_element_width() {
         let cases: &[(&str, usize)] = &[
@@ -64,11 +54,6 @@ mod tests {
                 width,
                 "DType::byte_size({dtype})"
             );
-            assert_eq!(
-                element_width_bytes(dtype),
-                Some(width),
-                "element_width_bytes({dtype})"
-            );
         }
     }
 
@@ -79,6 +64,5 @@ mod tests {
             parse_dtype("COMPLEX64"),
             Err(LoadError::UnknownCheckpointDtype { name }) if name == "COMPLEX64"
         ));
-        assert_eq!(element_width_bytes("COMPLEX64"), None);
     }
 }

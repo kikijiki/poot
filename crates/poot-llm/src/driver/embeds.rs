@@ -40,12 +40,6 @@ impl PromptEmbeds {
         &self.positions
     }
 
-    /// The rows of entries `entries` (indices into [`Self::positions`]), row-major.
-    #[cfg(test)]
-    pub(super) fn rows_for(&self, entries: std::ops::Range<usize>) -> Vec<f32> {
-        self.rows[entries.start * self.width..entries.end * self.width].to_vec()
-    }
-
     /// Check the rows against a prompt of `prompt` tokens: ascending and inside it.
     pub(super) fn check_prompt(&self, prompt: usize) -> Result<(), EmbedsError> {
         let mut previous = None;
@@ -106,5 +100,12 @@ mod tests {
         assert_eq!(embeds.row_at(2), None);
         assert!(embeds.covers(0, 2) && embeds.covers(3, 9) && !embeds.covers(4, 9));
         assert!(!embeds.covers(2, 3));
+    }
+
+    impl PromptEmbeds {
+        /// The rows of entries `entries` (indices into [`Self::positions`]), row-major.
+        pub(in crate::driver) fn rows_for(&self, entries: std::ops::Range<usize>) -> Vec<f32> {
+            self.rows[entries.start * self.width..entries.end * self.width].to_vec()
+        }
     }
 }

@@ -24,12 +24,7 @@ const ROW0_BYTE: u8 = 0x38;
 /// Row 1's byte. Decodes to `2.0`.
 const ROW1_BYTE: u8 = 0x40;
 
-/// A `[rows, row_width]` E4M3 table from raw bytes, row-major. Card 554d:
-/// `fp8::the E4M3FN checkpoint-owner constructor` - the zero-copy checkpoint-owner constructor this
-/// fixture used to build (a one-shard safetensors file, authenticated, classified
-/// `TensorDisposition::StandaloneE4m3`, then loaded through the full `poot-load` pipeline just to get
-/// an `Arc<ExactSourceOwner>` to wrap) - had no production caller anywhere in `poot-llm`/`poot-models`
-/// and is deleted; this fixture now builds the carrier directly from the bytes it already has.
+/// A `[rows, row_width]` E4M3 table from raw bytes, row-major.
 fn e4m3_table(shape: Vec<usize>, bytes: Vec<u8>) -> HostTensor {
     e4m3fn_tensor(shape, bytes).expect("fixture bytes match the declared shape")
 }
@@ -124,10 +119,10 @@ fn dense_tensor(value: Value) -> HostTensor {
 /// `table.bytes()[source_flat]` in `gather_host`'s `HostData::Bytes` arm (`ops/gather.rs`; the
 /// `DenseRowGather` decomposition is `Gather { axis: 0 }` then `Cast { to: F32 }`). Not yet run.
 #[test]
-fn dense_row_gather_e4m3_reads_owner_backed_rows() {
+fn dense_row_gather_e4m3_reads_exact_rows() {
     let row0 = e4m3fn_to_f32(ROW0_BYTE);
     let row1 = e4m3fn_to_f32(ROW1_BYTE);
-    eprintln!("dense_row_gather_e4m3_reads_owner_backed_rows: row0={row0} row1={row1}");
+    eprintln!("dense_row_gather_e4m3_reads_exact_rows: row0={row0} row1={row1}");
     assert_eq!(
         row0, 1.0,
         "byte 0x38 must decode to exactly 1.0, see module doc"
@@ -199,9 +194,9 @@ fn dense_row_gather_e4m3_still_checks_bounds() {
 ///
 /// Required red mutations, each run once and recorded (not asserted here, since they need production edits):
 /// (a) mutate only the `Mul` scale literal in `build_graph` (e.g. `0.5` -> `0.75`): only this test's composed
-///     assertion may change; `dense_row_gather_e4m3_reads_owner_backed_rows` must not, since it has no scale.
+///     assertion may change; `dense_row_gather_e4m3_reads_exact_rows` must not, since it has no scale.
 /// (b) mutate only the gather index (swap `ROW0_BYTE`/`ROW1_BYTE`, or the row `Gather { axis: 0 }` selects): both this
-///     test and `dense_row_gather_e4m3_reads_owner_backed_rows` must change, since both read through the gather.
+///     test and `dense_row_gather_e4m3_reads_exact_rows` must change, since both read through the gather.
 /// Not yet run.
 #[test]
 fn dense_row_gather_e4m3_composes_with_downstream_scale() {

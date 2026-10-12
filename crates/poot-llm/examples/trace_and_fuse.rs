@@ -5,10 +5,10 @@
 //!
 //! Run: `cargo run -p poot-llm --example trace_and_fuse` (CPU only, no GPU or weights needed).
 
-use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::OpKind;
 use poot_graph_plan as transform;
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
 
 fn main() {
     // Tiny dims, same structure as Qwen2.5.
@@ -24,7 +24,11 @@ fn main() {
     // trace one constant-shape masked decode step into the primitive graph (G2/G3d shape).
     let g = model
         .model
-        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step(1, 1, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .expect("trace the decode step");
     println!(
         "traced decode (cap={cap}): {} primitive eqns, {} inputs, {} carried KV-state pairs",

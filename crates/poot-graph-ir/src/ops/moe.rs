@@ -1,13 +1,15 @@
-use super::*;
+use super::{
+    BinOp, Builder, BuilderError, RedOp, Requirement, Scalar, Traced, UnOp, linear, swiglu,
+};
 
 /// Canonicalize router scores before ranking or weighting. Every finite `f32` is unchanged, NaN and
 /// negative infinity become `f32::MIN`, and positive infinity becomes `f32::MAX`. `BinOp::Max` has
 /// max-number semantics in the eager evaluator and LLVM lowering, so this stays backend-neutral and makes
 /// every score participating in the route finite.
-pub fn canonical_router_scores(b: &Builder, x: Traced) -> Traced {
-    let lower = b.binary_scalar(BinOp::Max, x, Scalar::F32(f32::MIN));
-    let neg = b.binary_scalar(BinOp::Mul, lower, Scalar::F32(-1.0));
-    let neg_capped = b.binary_scalar(BinOp::Max, neg, Scalar::F32(f32::MIN));
+pub fn canonical_router_scores(b: &Builder, x: Traced) -> Result<Traced, BuilderError> {
+    let lower = b.binary_scalar(BinOp::Max, x, Scalar::F32(f32::MIN))?;
+    let neg = b.binary_scalar(BinOp::Mul, lower, Scalar::F32(-1.0))?;
+    let neg_capped = b.binary_scalar(BinOp::Max, neg, Scalar::F32(f32::MIN))?;
     b.binary_scalar(BinOp::Mul, neg_capped, Scalar::F32(-1.0))
 }
 
@@ -15,48 +17,51 @@ pub fn canonical_router_scores(b: &Builder, x: Traced) -> Traced {
 /// `rank[..,i]` counts scores strictly greater than score `i`, plus equal scores at lower expert indices.
 /// The result is therefore a permutation of `0..E` for every row, including tied and canonicalized
 /// non-finite inputs. An `iota` range (card 558a) supplies the index tie-break.
-pub fn stable_descending_rank(b: &Builder, x: Traced) -> Traced {
-    let shape = b.aval(x).shape;
-    let e = *shape
-        .last()
-        .expect("stable_descending_rank input has an expert axis");
-    assert!(e > 0, "stable_descending_rank needs at least one expert");
+pub fn stable_descending_rank(b: &Builder, x: Traced) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
+    let e = super::last_axis("stable_descending_rank", &shape)?;
+    if e == 0 {
+        return Err(BuilderError::Requirement {
+            operation: "stable_descending_rank",
+            requirement: Requirement::NoExperts,
+        });
+    }
     let last = shape.len() - 1;
-    let scores = canonical_router_scores(b, x);
+    let scores = canonical_router_scores(b, x)?;
 
     // Pairwise scores: P[..,i,j] = score_i, Q[..,i,j] = score_j.
     let mut pair_shape = shape.clone();
     pair_shape.push(e); // [.., E, E]
     let mut p_shape = shape.clone();
     p_shape.push(1); // [.., E, 1]
-    let p = b.broadcast(b.reshape(scores, p_shape.clone()), pair_shape.clone());
+    let p = b.broadcast(b.reshape(scores, p_shape.clone())?, pair_shape.clone())?;
     let mut q_shape = shape.clone();
     q_shape[last] = 1;
     q_shape.push(e); // [.., 1, E]
-    let q = b.broadcast(b.reshape(scores, q_shape.clone()), pair_shape.clone());
+    let q = b.broadcast(b.reshape(scores, q_shape.clone())?, pair_shape.clone())?;
 
     // q > p = (q >= p) and not (p >= q). Equality is both comparisons true.
-    let pgeq = b.binary(BinOp::Ge, p, q);
-    let qgep = b.binary(BinOp::Ge, q, p);
-    let not_pgeq = b.binary_scalar(BinOp::Mul, pgeq, Scalar::F32(-1.0));
-    let not_pgeq = b.binary_scalar(BinOp::Add, not_pgeq, Scalar::F32(1.0));
-    let greater = b.binary(BinOp::Mul, qgep, not_pgeq);
-    let equal = b.binary(BinOp::Mul, pgeq, qgep);
+    let pgeq = b.binary(BinOp::Ge, p, q)?;
+    let qgep = b.binary(BinOp::Ge, q, p)?;
+    let not_pgeq = b.binary_scalar(BinOp::Mul, pgeq, Scalar::F32(-1.0))?;
+    let not_pgeq = b.binary_scalar(BinOp::Add, not_pgeq, Scalar::F32(1.0))?;
+    let greater = b.binary(BinOp::Mul, qgep, not_pgeq)?;
+    let equal = b.binary(BinOp::Mul, pgeq, qgep)?;
 
     // On equal scores, expert j precedes expert i iff j < i. Indices are exact, finite, and distinct.
     // Card 558a: compute the range with `iota` (no bound named-constant range). The F32 iota is rank
     // arithmetic (it is compared with the F32 rank counts), never an index: an index operand is I32.
-    let iota = b.iota(e);
+    let iota = b.iota(e)?;
     let mut iota_shape = vec![1usize; shape.len()];
     iota_shape[last] = e;
-    let iota = b.broadcast(b.reshape(iota, iota_shape), shape);
-    let i_idx = b.broadcast(b.reshape(iota, p_shape), pair_shape.clone());
-    let j_idx = b.broadcast(b.reshape(iota, q_shape), pair_shape);
-    let jgei = b.binary(BinOp::Ge, j_idx, i_idx);
-    let j_lt_i = b.binary_scalar(BinOp::Mul, jgei, Scalar::F32(-1.0));
-    let j_lt_i = b.binary_scalar(BinOp::Add, j_lt_i, Scalar::F32(1.0));
-    let earlier_equal = b.binary(BinOp::Mul, equal, j_lt_i);
-    let precedes = b.binary(BinOp::Add, greater, earlier_equal);
+    let iota = b.broadcast(b.reshape(iota, iota_shape)?, shape)?;
+    let i_idx = b.broadcast(b.reshape(iota, p_shape)?, pair_shape.clone())?;
+    let j_idx = b.broadcast(b.reshape(iota, q_shape)?, pair_shape)?;
+    let jgei = b.binary(BinOp::Ge, j_idx, i_idx)?;
+    let j_lt_i = b.binary_scalar(BinOp::Mul, jgei, Scalar::F32(-1.0))?;
+    let j_lt_i = b.binary_scalar(BinOp::Add, j_lt_i, Scalar::F32(1.0))?;
+    let earlier_equal = b.binary(BinOp::Mul, equal, j_lt_i)?;
+    let precedes = b.binary(BinOp::Add, greater, earlier_equal)?;
     b.reduce(RedOp::Sum, precedes, last + 1, false)
 }
 
@@ -65,22 +70,31 @@ pub fn stable_descending_rank(b: &Builder, x: Traced) -> Traced {
 /// break ties within each class. The result remains a permutation of `0..E`; this is the group-limited MoE
 /// equivalent of setting excluded softmax probabilities to zero, without relying on an additive sentinel
 /// that can collide with `f32::MIN`.
-pub fn stable_descending_rank_masked(b: &Builder, x: Traced, eligible: Traced) -> Traced {
-    let shape = b.aval(x).shape;
-    assert_eq!(
-        b.aval(eligible).shape,
-        shape,
-        "stable_descending_rank_masked needs score and mask shapes to match"
-    );
-    let e = *shape
-        .last()
-        .expect("stable_descending_rank_masked input has an expert axis");
-    assert!(
-        e > 0,
-        "stable_descending_rank_masked needs at least one expert"
-    );
+pub fn stable_descending_rank_masked(
+    b: &Builder,
+    x: Traced,
+    eligible: Traced,
+) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
+    let eligible_shape = b.aval(eligible)?.shape;
+    if eligible_shape != shape {
+        return Err(BuilderError::Requirement {
+            operation: "stable_descending_rank_masked",
+            requirement: Requirement::ShapesMatch {
+                left: shape,
+                right: eligible_shape,
+            },
+        });
+    }
+    let e = super::last_axis("stable_descending_rank_masked", &shape)?;
+    if e == 0 {
+        return Err(BuilderError::Requirement {
+            operation: "stable_descending_rank_masked",
+            requirement: Requirement::NoExperts,
+        });
+    }
     let last = shape.len() - 1;
-    let scores = canonical_router_scores(b, x);
+    let scores = canonical_router_scores(b, x)?;
 
     let mut pair_shape = shape.clone();
     pair_shape.push(e);
@@ -90,53 +104,56 @@ pub fn stable_descending_rank_masked(b: &Builder, x: Traced, eligible: Traced) -
     q_shape[last] = 1;
     q_shape.push(e);
 
-    let p = b.broadcast(b.reshape(scores, p_shape.clone()), pair_shape.clone());
-    let q = b.broadcast(b.reshape(scores, q_shape.clone()), pair_shape.clone());
-    let pgeq = b.binary(BinOp::Ge, p, q);
-    let qgep = b.binary(BinOp::Ge, q, p);
-    let not_pgeq = b.binary_scalar(BinOp::Mul, pgeq, Scalar::F32(-1.0));
-    let not_pgeq = b.binary_scalar(BinOp::Add, not_pgeq, Scalar::F32(1.0));
-    let greater = b.binary(BinOp::Mul, qgep, not_pgeq);
-    let equal = b.binary(BinOp::Mul, pgeq, qgep);
+    let p = b.broadcast(b.reshape(scores, p_shape.clone())?, pair_shape.clone())?;
+    let q = b.broadcast(b.reshape(scores, q_shape.clone())?, pair_shape.clone())?;
+    let pgeq = b.binary(BinOp::Ge, p, q)?;
+    let qgep = b.binary(BinOp::Ge, q, p)?;
+    let not_pgeq = b.binary_scalar(BinOp::Mul, pgeq, Scalar::F32(-1.0))?;
+    let not_pgeq = b.binary_scalar(BinOp::Add, not_pgeq, Scalar::F32(1.0))?;
+    let greater = b.binary(BinOp::Mul, qgep, not_pgeq)?;
+    let equal = b.binary(BinOp::Mul, pgeq, qgep)?;
 
     // Card 558a: computed via `iota`, not a bound named-constant range - see `stable_descending_rank`.
-    let iota = b.iota(e);
+    let iota = b.iota(e)?;
     let mut iota_shape = vec![1usize; shape.len()];
     iota_shape[last] = e;
-    let iota = b.broadcast(b.reshape(iota, iota_shape), shape.clone());
-    let i_idx = b.broadcast(b.reshape(iota, p_shape.clone()), pair_shape.clone());
-    let j_idx = b.broadcast(b.reshape(iota, q_shape.clone()), pair_shape.clone());
-    let jgei = b.binary(BinOp::Ge, j_idx, i_idx);
-    let j_lt_i = b.binary_scalar(BinOp::Mul, jgei, Scalar::F32(-1.0));
-    let j_lt_i = b.binary_scalar(BinOp::Add, j_lt_i, Scalar::F32(1.0));
-    let earlier_equal = b.binary(BinOp::Mul, equal, j_lt_i);
-    let score_precedes = b.binary(BinOp::Add, greater, earlier_equal);
+    let iota = b.broadcast(b.reshape(iota, iota_shape)?, shape.clone())?;
+    let i_idx = b.broadcast(b.reshape(iota, p_shape.clone())?, pair_shape.clone())?;
+    let j_idx = b.broadcast(b.reshape(iota, q_shape.clone())?, pair_shape.clone())?;
+    let jgei = b.binary(BinOp::Ge, j_idx, i_idx)?;
+    let j_lt_i = b.binary_scalar(BinOp::Mul, jgei, Scalar::F32(-1.0))?;
+    let j_lt_i = b.binary_scalar(BinOp::Add, j_lt_i, Scalar::F32(1.0))?;
+    let earlier_equal = b.binary(BinOp::Mul, equal, j_lt_i)?;
+    let score_precedes = b.binary(BinOp::Add, greater, earlier_equal)?;
 
-    let p_keep = b.broadcast(b.reshape(eligible, p_shape), pair_shape.clone());
-    let q_keep = b.broadcast(b.reshape(eligible, q_shape), pair_shape);
-    let pgeq = b.binary(BinOp::Ge, p_keep, q_keep);
-    let qgep = b.binary(BinOp::Ge, q_keep, p_keep);
-    let same_class = b.binary(BinOp::Mul, pgeq, qgep);
-    let not_p_keep = b.binary_scalar(BinOp::Mul, p_keep, Scalar::F32(-1.0));
-    let not_p_keep = b.binary_scalar(BinOp::Add, not_p_keep, Scalar::F32(1.0));
-    let eligible_precedes = b.binary(BinOp::Mul, q_keep, not_p_keep);
-    let within_class = b.binary(BinOp::Mul, same_class, score_precedes);
-    let precedes = b.binary(BinOp::Add, eligible_precedes, within_class);
+    let p_keep = b.broadcast(b.reshape(eligible, p_shape)?, pair_shape.clone())?;
+    let q_keep = b.broadcast(b.reshape(eligible, q_shape)?, pair_shape)?;
+    let pgeq = b.binary(BinOp::Ge, p_keep, q_keep)?;
+    let qgep = b.binary(BinOp::Ge, q_keep, p_keep)?;
+    let same_class = b.binary(BinOp::Mul, pgeq, qgep)?;
+    let not_p_keep = b.binary_scalar(BinOp::Mul, p_keep, Scalar::F32(-1.0))?;
+    let not_p_keep = b.binary_scalar(BinOp::Add, not_p_keep, Scalar::F32(1.0))?;
+    let eligible_precedes = b.binary(BinOp::Mul, q_keep, not_p_keep)?;
+    let within_class = b.binary(BinOp::Mul, same_class, score_precedes)?;
+    let precedes = b.binary(BinOp::Add, eligible_precedes, within_class)?;
     b.reduce(RedOp::Sum, precedes, last + 1, false)
 }
 
 /// Exact `0.0`/`1.0` mask for the first `k` positions of a stable rank tensor.
-pub fn top_k_keep_mask(b: &Builder, rank: Traced, k: usize) -> Traced {
-    let rge = b.binary_scalar(BinOp::Ge, rank, Scalar::F32(k as f32));
-    let keep = b.binary_scalar(BinOp::Mul, rge, Scalar::F32(-1.0));
+pub fn top_k_keep_mask(b: &Builder, rank: Traced, k: usize) -> Result<Traced, BuilderError> {
+    let rge = b.binary_scalar(BinOp::Ge, rank, Scalar::F32(k as f32))?;
+    let keep = b.binary_scalar(BinOp::Mul, rge, Scalar::F32(-1.0))?;
     b.binary_scalar(BinOp::Add, keep, Scalar::F32(1.0))
 }
 
-pub(crate) fn assert_valid_top_k(e: usize, k: usize, op: &str) {
-    assert!(
-        (1..=e).contains(&k),
-        "{op} needs 1 <= k <= E, got k={k}, E={e}"
-    );
+pub(crate) fn check_top_k(e: usize, k: usize, operation: &'static str) -> Result<(), BuilderError> {
+    if (1..=e).contains(&k) {
+        return Ok(());
+    }
+    Err(BuilderError::Requirement {
+        operation,
+        requirement: Requirement::TopKRange { k, experts: e },
+    })
 }
 
 pub(crate) fn normalized_top_k_gate_from_rank(
@@ -144,19 +161,19 @@ pub(crate) fn normalized_top_k_gate_from_rank(
     x: Traced,
     rank: Traced,
     k: usize,
-) -> Traced {
-    let shape = b.aval(x).shape;
+) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
     let last = shape.len() - 1;
-    let scores = canonical_router_scores(b, x);
-    let keep = top_k_keep_mask(b, rank, k);
+    let scores = canonical_router_scores(b, x)?;
+    let keep = top_k_keep_mask(b, rank, k)?;
 
     // The global maximum is selected for every valid k. Multiplication by the exact mask makes dropped
     // terms exactly zero and the denominator contains exactly the selected k terms.
-    let m = b.reduce(RedOp::Max, scores, last, true);
-    let shifted = b.binary(BinOp::Sub, scores, m);
-    let ex = b.unary(UnOp::Exp, shifted);
-    let selected = b.binary(BinOp::Mul, ex, keep);
-    let denom = b.reduce(RedOp::Sum, selected, last, true);
+    let m = b.reduce(RedOp::Max, scores, last, true)?;
+    let shifted = b.binary(BinOp::Sub, scores, m)?;
+    let ex = b.unary(UnOp::Exp, shifted)?;
+    let selected = b.binary(BinOp::Mul, ex, keep)?;
+    let denom = b.reduce(RedOp::Sum, selected, last, true)?;
     b.binary(BinOp::Div, selected, denom)
 }
 
@@ -164,11 +181,12 @@ pub(crate) fn normalized_top_k_gate_from_rank(
 /// `[.., E]`. Scores rank descending with lower expert index first on ties. Exactly `k` distinct experts
 /// are selected for `1 <= k <= E`; only those terms enter the softmax denominator and every other weight
 /// is exactly zero. See [`canonical_router_scores`] for the explicit non-finite policy.
-pub fn top_k_gate(b: &Builder, x: Traced, k: usize) -> Traced {
-    let shape = b.aval(x).shape;
-    let e = *shape.last().expect("top_k_gate input has an expert axis");
-    assert_valid_top_k(e, k, "top_k_gate");
-    let rank = stable_descending_rank(b, x);
+#[cfg(any(test, feature = "test-support"))]
+pub fn top_k_gate(b: &Builder, x: Traced, k: usize) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
+    let e = super::last_axis("top_k_gate", &shape)?;
+    check_top_k(e, k, "top_k_gate")?;
+    let rank = stable_descending_rank(b, x)?;
     normalized_top_k_gate_from_rank(b, x, rank, k)
 }
 
@@ -197,11 +215,11 @@ pub fn moe(
     n_experts: usize,
     k: usize,
     inter: usize,
-) -> Traced {
+) -> Result<Traced, BuilderError> {
     // Decode (L=1): gather-free sparse form (card 088). Prefill (L>1): grouped form (spec 136),
     // flattening to `M = L*k` rows over the same `indexed_matmul`. `moe_dense` is kept only as the
     // CPU-eval correctness oracle. L is static here.
-    let shape = b.aval(x).shape;
+    let shape = b.aval(x)?.shape;
     let l = shape[shape.len() - 2];
     if l == 1 {
         moe_sparse(b, x, router_w, w_in, w_out, n_experts, k, inter)
@@ -216,6 +234,7 @@ pub fn moe(
 /// oracle that [`moe_grouped`] is checked against (`moe_grouped_matches_dense`), since the grouped
 /// summation order differs (`~1e-5`, not bit-exact).
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn moe_dense(
     b: &Builder,
     x: Traced,
@@ -225,30 +244,30 @@ pub fn moe_dense(
     n_experts: usize,
     k: usize,
     inter: usize,
-) -> Traced {
-    let shape = b.aval(x).shape;
+) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
     let (h, l) = (shape[shape.len() - 1], shape[shape.len() - 2]);
-    let xm = b.reshape(x, vec![l, h]);
+    let xm = b.reshape(x, vec![l, h])?;
 
     // route: logits [L, E] -> per-row top-k softmax gate weights [L, E].
-    let logits = linear(b, xm, router_w, None);
-    let gate = top_k_gate(b, logits, k); // [L, E]
+    let logits = linear(b, xm, router_w, None)?;
+    let gate = top_k_gate(b, logits, k)?; // [L, E]
 
     // every expert's swiglu FFN, batched over the expert axis (broadcast the tokens across experts).
-    let x_e = b.broadcast(b.reshape(xm, vec![1, l, h]), vec![n_experts, l, h]); // [E, L, H]
-    let gu = b.matmul(x_e, w_in); // [E, L, 2I]
-    let g_part = b.slice(gu, 2, 0, inter); // [E, L, I]
-    let u_part = b.slice(gu, 2, inter, 2 * inter); // [E, L, I]
-    let act = swiglu(b, g_part, u_part); // [E, L, I]
-    let out = b.matmul(act, w_out); // [E, L, H]
+    let x_e = b.broadcast(b.reshape(xm, vec![1, l, h])?, vec![n_experts, l, h])?; // [E, L, H]
+    let gu = b.matmul(x_e, w_in)?; // [E, L, 2I]
+    let g_part = b.slice(gu, 2, 0, inter)?; // [E, L, I]
+    let u_part = b.slice(gu, 2, inter, 2 * inter)?; // [E, L, I]
+    let act = swiglu(b, g_part, u_part)?; // [E, L, I]
+    let out = b.matmul(act, w_out)?; // [E, L, H]
 
     // weight each expert's output by its gate value and sum over the expert axis. Experts move to the
     // LAST axis first ([E,L,H] -> [L,H,E]) because the GPU executor only reduces the last axis; the
     // result equals an axis-0 reduce.
-    let gate_w = b.reshape(b.transpose(gate, vec![1, 0]), vec![n_experts, l, 1]); // [E, L, 1]
-    let weighted = b.binary(BinOp::Mul, out, gate_w); // [E, L, H]
-    let weighted_t = b.transpose(weighted, vec![1, 2, 0]); // [L, H, E]
-    let y = b.reduce(RedOp::Sum, weighted_t, 2, false); // [L, H]
+    let gate_w = b.reshape(b.transpose(gate, vec![1, 0])?, vec![n_experts, l, 1])?; // [E, L, 1]
+    let weighted = b.binary(BinOp::Mul, out, gate_w)?; // [E, L, H]
+    let weighted_t = b.transpose(weighted, vec![1, 2, 0])?; // [L, H, E]
+    let y = b.reduce(RedOp::Sum, weighted_t, 2, false)?; // [L, H]
     b.reshape(y, vec![1, l, h])
 }
 
@@ -269,30 +288,32 @@ pub fn moe_sparse(
     n_experts: usize,
     k: usize,
     inter: usize,
-) -> Traced {
-    let shape = b.aval(x).shape;
+) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
     let (h, l) = (shape[shape.len() - 1], shape[shape.len() - 2]);
-    assert_eq!(
-        l, 1,
-        "moe_sparse is the decode (L=1) path; use moe for prefill"
-    );
+    if l != 1 {
+        return Err(BuilderError::Requirement {
+            operation: "moe_sparse",
+            requirement: Requirement::DecodeTokens { tokens: l },
+        });
+    }
     let e = n_experts;
-    let xm = b.reshape(x, vec![1, h]); // [1, H]
-    let logits = linear(b, xm, router_w, None); // [1, E]
-    let (x_rep, idx_k, gate_k) = moe_grouped_prep(b, xm, logits, e, k);
+    let xm = b.reshape(x, vec![1, h])?; // [1, H]
+    let logits = linear(b, xm, router_w, None)?; // [1, E]
+    let (x_rep, idx_k, gate_k) = moe_grouped_prep(b, xm, logits, e, k)?;
 
     // run the k FFNs: each of the k rows is the SAME token x, routed to its OWN selected expert via idx_k.
-    let gu = b.indexed_matmul(x_rep, w_in, idx_k); // [k, 2I]: row t = x @ w_in[idx_k[t]]
-    let g_part = b.slice(gu, 1, 0, inter); // [k, I]
-    let u_part = b.slice(gu, 1, inter, 2 * inter); // [k, I]
-    let act = swiglu(b, g_part, u_part); // [k, I]
-    let out = b.indexed_matmul(act, w_out, idx_k); // [k, H]: row t = act[t] @ w_out[idx_k[t]]
+    let gu = b.indexed_matmul(x_rep, w_in, idx_k)?; // [k, 2I]: row t = x @ w_in[idx_k[t]]
+    let g_part = b.slice(gu, 1, 0, inter)?; // [k, I]
+    let u_part = b.slice(gu, 1, inter, 2 * inter)?; // [k, I]
+    let act = swiglu(b, g_part, u_part)?; // [k, I]
+    let out = b.indexed_matmul(act, w_out, idx_k)?; // [k, H]: row t = act[t] @ w_out[idx_k[t]]
 
     // weight by the selected gate values and sum over the k experts (move k to the last axis for the reduce).
-    let gate_kw = b.reshape(gate_k, vec![k, 1]); // [k, 1]
-    let weighted = b.binary(BinOp::Mul, out, gate_kw); // [k, H]
-    let weighted_t = b.transpose(weighted, vec![1, 0]); // [H, k]
-    let y = b.reduce(RedOp::Sum, weighted_t, 1, false); // [H]
+    let gate_kw = b.reshape(gate_k, vec![k, 1])?; // [k, 1]
+    let weighted = b.binary(BinOp::Mul, out, gate_kw)?; // [k, H]
+    let weighted_t = b.transpose(weighted, vec![1, 0])?; // [H, k]
+    let y = b.reduce(RedOp::Sum, weighted_t, 1, false)?; // [H]
     b.reshape(y, vec![1, 1, h])
 }
 
@@ -324,43 +345,43 @@ pub fn moe_grouped_prep(
     logits: Traced,
     n_experts: usize,
     k: usize,
-) -> (Traced, Traced, Traced) {
-    let xm_shape = b.aval(xm).shape;
+) -> Result<(Traced, Traced, Traced), BuilderError> {
+    let xm_shape = b.aval(xm)?.shape;
     let (l, h) = (xm_shape[0], xm_shape[1]);
     let e = n_experts;
-    assert_valid_top_k(e, k, "moe_grouped_prep");
+    check_top_k(e, k, "moe_grouped_prep")?;
 
     // 1. Stable descending rank shared by every normalized route.
-    let rank = stable_descending_rank(b, logits); // [L, E]
+    let rank = stable_descending_rank(b, logits)?; // [L, E]
 
     // 2. per-token top-k expert ids, rank-ordered (fork a: rank-in; fork c: F32 ids).
-    let idx = b.arg_top_k(rank, k); // [L, k]
+    let idx = b.arg_top_k(rank, k)?; // [L, k]
 
     // 3. Exact selected-only normalization on the same rank.
-    let gate = normalized_top_k_gate_from_rank(b, logits, rank, k); // [L, E]
+    let gate = normalized_top_k_gate_from_rank(b, logits, rank, k)?; // [L, E]
 
     // 4. B1: gate_sorted[l,r] = sum_e eq(rank[l,e],r) * gate[l,e], via a one-hot over the shared rank.
     //    `r` ranges over 0..k; compute it with `iota` (card 558a), sliced to its first k entries.
-    let iota_e = b.iota(e);
-    let r_iota = b.slice(iota_e, 0, 0, k); // [k]: 0..k
-    let rank_b = b.broadcast(b.reshape(rank, vec![l, 1, e]), vec![l, k, e]); // [L,k,E]: rank[l,e]
-    let r_b = b.broadcast(b.reshape(r_iota, vec![1, k, 1]), vec![l, k, e]); // [L,k,E]: r
-    let ge1 = b.binary(BinOp::Ge, rank_b, r_b); // rank[l,e] >= r
-    let ge2 = b.binary(BinOp::Ge, r_b, rank_b); // r >= rank[l,e]
-    let eq = b.binary(BinOp::Mul, ge1, ge2); // eq(rank[l,e], r): exact for integer-valued rank
-    let gate_b = b.broadcast(b.reshape(gate, vec![l, 1, e]), vec![l, k, e]); // [L,k,E]: gate[l,e]
-    let sel = b.binary(BinOp::Mul, eq, gate_b); // [L,k,E]
-    let gate_sorted = b.reduce(RedOp::Sum, sel, 2, false); // [L, k]: gate value at (token l, slot r)
+    let iota_e = b.iota(e)?;
+    let r_iota = b.slice(iota_e, 0, 0, k)?; // [k]: 0..k
+    let rank_b = b.broadcast(b.reshape(rank, vec![l, 1, e])?, vec![l, k, e])?; // [L,k,E]: rank[l,e]
+    let r_b = b.broadcast(b.reshape(r_iota, vec![1, k, 1])?, vec![l, k, e])?; // [L,k,E]: r
+    let ge1 = b.binary(BinOp::Ge, rank_b, r_b)?; // rank[l,e] >= r
+    let ge2 = b.binary(BinOp::Ge, r_b, rank_b)?; // r >= rank[l,e]
+    let eq = b.binary(BinOp::Mul, ge1, ge2)?; // eq(rank[l,e], r): exact for integer-valued rank
+    let gate_b = b.broadcast(b.reshape(gate, vec![l, 1, e])?, vec![l, k, e])?; // [L,k,E]: gate[l,e]
+    let sel = b.binary(BinOp::Mul, eq, gate_b)?; // [L,k,E]
+    let gate_sorted = b.reduce(RedOp::Sum, sel, 2, false)?; // [L, k]: gate value at (token l, slot r)
 
     // 5. flatten (token, slot) -> M = L*k rows, row l*k+s consistently across idx/x/gate (all reshape a
     //    shared [L,k,..] leading shape row-major, so row l*k+s always means (token l, slot s)).
     let m_rows = l * k;
-    let idx_flat = b.reshape(idx, vec![m_rows]); // [M]
-    let x_rep = b.broadcast(b.reshape(xm, vec![l, 1, h]), vec![l, k, h]); // [L,k,H]: token l repeated k times
-    let x_flat = b.reshape(x_rep, vec![m_rows, h]); // [M, H]
-    let gate_flat = b.reshape(gate_sorted, vec![m_rows]); // [M]
+    let idx_flat = b.reshape(idx, vec![m_rows])?; // [M]
+    let x_rep = b.broadcast(b.reshape(xm, vec![l, 1, h])?, vec![l, k, h])?; // [L,k,H]: token l repeated k times
+    let x_flat = b.reshape(x_rep, vec![m_rows, h])?; // [M, H]
+    let gate_flat = b.reshape(gate_sorted, vec![m_rows])?; // [M]
 
-    (x_flat, idx_flat, gate_flat)
+    Ok((x_flat, idx_flat, gate_flat))
 }
 
 /// Grouped MoE prefill (spec 136 Tier 1, card 146): the FLOPs-reduced form of [`moe`] for `L > 1`
@@ -384,27 +405,27 @@ pub fn moe_grouped(
     n_experts: usize,
     k: usize,
     inter: usize,
-) -> Traced {
-    let shape = b.aval(x).shape;
+) -> Result<Traced, BuilderError> {
+    let shape = b.aval(x)?.shape;
     let (h, l) = (shape[shape.len() - 1], shape[shape.len() - 2]);
-    let xm = b.reshape(x, vec![l, h]); // [L, H]
-    let logits = linear(b, xm, router_w, None); // [L, E]
-    let (x_flat, idx_flat, gate_flat) = moe_grouped_prep(b, xm, logits, n_experts, k);
+    let xm = b.reshape(x, vec![l, h])?; // [L, H]
+    let logits = linear(b, xm, router_w, None)?; // [L, E]
+    let (x_flat, idx_flat, gate_flat) = moe_grouped_prep(b, xm, logits, n_experts, k)?;
 
     // 6. the gather-free indexed FFN, over all M rows at once (same primitive as moe_sparse, batched).
-    let gu = b.indexed_matmul(x_flat, w_in, idx_flat); // [M, 2I]: row m = x_flat[m] @ w_in[idx_flat[m]]
-    let g_part = b.slice(gu, 1, 0, inter); // [M, I]
-    let u_part = b.slice(gu, 1, inter, 2 * inter); // [M, I]
-    let act = swiglu(b, g_part, u_part); // [M, I]
-    let out = b.indexed_matmul(act, w_out, idx_flat); // [M, H]: row m = act[m] @ w_out[idx_flat[m]]
+    let gu = b.indexed_matmul(x_flat, w_in, idx_flat)?; // [M, 2I]: row m = x_flat[m] @ w_in[idx_flat[m]]
+    let g_part = b.slice(gu, 1, 0, inter)?; // [M, I]
+    let u_part = b.slice(gu, 1, inter, 2 * inter)?; // [M, I]
+    let act = swiglu(b, g_part, u_part)?; // [M, I]
+    let out = b.indexed_matmul(act, w_out, idx_flat)?; // [M, H]: row m = act[m] @ w_out[idx_flat[m]]
 
     // 7. weight by the selected gate, reshape to [L,k,H], and reduce over k via transpose-to-last-axis (S3)
     //    since the GPU executor only reduces the last axis.
     let m_rows = l * k;
-    let gate_w = b.reshape(gate_flat, vec![m_rows, 1]); // [M, 1]
-    let weighted = b.binary(BinOp::Mul, out, gate_w); // [M, H]
-    let weighted3 = b.reshape(weighted, vec![l, k, h]); // [L, k, H]
-    let weighted_t = b.transpose(weighted3, vec![0, 2, 1]); // [L, H, k]
-    let y = b.reduce(RedOp::Sum, weighted_t, 2, false); // [L, H]
+    let gate_w = b.reshape(gate_flat, vec![m_rows, 1])?; // [M, 1]
+    let weighted = b.binary(BinOp::Mul, out, gate_w)?; // [M, H]
+    let weighted3 = b.reshape(weighted, vec![l, k, h])?; // [L, k, H]
+    let weighted_t = b.transpose(weighted3, vec![0, 2, 1])?; // [L, H, k]
+    let y = b.reduce(RedOp::Sum, weighted_t, 2, false)?; // [L, H]
     b.reshape(y, vec![1, l, h])
 }

@@ -10,22 +10,23 @@ Which crate owns which layer, and the few constraints that span several pages.
 
 ## Crate map
 
-| Layer            | Crate(s)                                                                                              | Role                                                                                                    |
-| ---------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Graph IR         | `poot-graph-ir`                                                                                       | Primitive graph, `Builder`, `ops` compositions (attention, norms, MoE, ...), and the `transform` passes |
-| CPU oracle       | `poot-eval`                                                                                           | Reference evaluator; test-side correctness ground truth                                                 |
-| Planning         | `poot-graph-plan`                                                                                     | `compile`: passes, plans, storage, slots and numerics; typed refusals                                   |
-| Kernel import    | `poot-kernel-attr`, `pootc`                                                                           | `#[kernel]` attribute; rustc driver that imports kernels from Stable MIR                                |
-| Kernel IR, synth | `poot-kernel-ir`, `poot-kernelgen`                                                                    | Kernel body IR; synthesized bodies (elementwise, reduction, tiled GEMM, flash, dequant)                 |
-| Codegen          | `poot-codegen`                                                                                        | Kernel IR to LLVM IR to SPIR-V, PTX, AMDGCN code objects or AIE                                         |
-| Runtimes         | `poot-runtime`, `poot-rocm-runtime`, `poot-ptx-runtime`, `poot-vulkan-runtime`, `poot-runtime-common` | Devices, buffers, transfers; mechanism only                                                             |
-| Executors        | `poot-gpu` (wgpu), `poot-rocm-gpu`, `poot-ptx-gpu`, `poot-vulkan-device`                                                 | Load, bind, capture, replay and read back a plan                                                        |
-| NPU device       | `poot-npu`                                                                                            | Experimental XDNA2 `Device` over XRT (`xdna` feature); F32 add, sub and mul only                        |
-| Models           | `poot-models`                                                                                         | The `Model` trait, the family registry, per-family tracers over shared components                       |
-| Loading          | `poot-load`, `poot-quant`                                                                             | Safetensors and GGUF readers; packed quantization descriptors shared by loader, IR and planner          |
-| Generation       | `poot-llm`                                                                                            | `ModelHandle` and the driver: token loop, sampling suffix, KV slots                                     |
-| Serving          | `poot-serve`                                                                                          | OpenAI-compatible HTTP server: one scheduling loop over the driver's step                              |
-| Tooling          | `poot-orchestrator`, `poot-profile`, `poot-ptx-check`, `poot-rocm-check`, `poot-test-util`            | Pod runs, profiling, hardware smoke checks, test helpers                                                |
+| Layer            | Crate(s)                                                                                                   | Role                                                                                                    |
+| ---------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Graph IR         | `poot-graph-ir`                                                                                            | Primitive graph, `Builder`, `ops` compositions (attention, norms, MoE, ...), and the `transform` passes |
+| CPU oracle       | `poot-eval`                                                                                                | Reference evaluator; test-side correctness ground truth                                                 |
+| Planning         | `poot-graph-plan`                                                                                          | `compile`: passes, plans, storage, slots and numerics; typed refusals                                   |
+| Kernel import    | `poot-kernel-attr`, `pootc`                                                                                | `#[kernel]` attribute; rustc driver that imports kernels from Stable MIR                                |
+| Kernel IR, synth | `poot-kernel-ir`, `poot-kernelgen`                                                                         | Kernel body IR; synthesized bodies (elementwise, reduction, tiled GEMM, flash, dequant)                 |
+| Codegen          | `poot-codegen`                                                                                             | Kernel IR to LLVM IR to SPIR-V, PTX, AMDGCN code objects or AIE                                         |
+| Runtimes         | `poot-wgpu-runtime`, `poot-rocm-runtime`, `poot-ptx-runtime`, `poot-vulkan-runtime`, `poot-runtime-common` | Devices, buffers, transfers; mechanism only                                                             |
+| Executors        | `poot-wgpu-device` (wgpu), `poot-rocm-device`, `poot-ptx-device`, `poot-vulkan-device`                     | Load, bind, capture, replay and read back a plan                                                        |
+| NPU device       | `poot-npu`                                                                                                 | Experimental XDNA2 `Device` over XRT (`xdna` feature); F32 add, sub and mul only                        |
+| Models           | `poot-models`                                                                                              | The `Model` trait, the family registry, per-family tracers over shared components                       |
+| Loading          | `poot-load`, `poot-quant`                                                                                  | Safetensors and GGUF readers; packed quantization descriptors shared by loader, IR and planner          |
+| Text             | `poot-text`                                                                                                | Tokenizer, chat templates and guided-decoding constraints; needs no model and no device                 |
+| Generation       | `poot-llm`                                                                                                 | `ModelHandle` and the driver: token loop, sampling suffix, KV slots                                     |
+| Serving          | `poot-serve`                                                                                               | OpenAI-compatible HTTP server: one scheduling loop over the driver's step                               |
+| Tooling          | `poot-orchestrator`, `poot-profile`, `poot-test-util`                                                      | Pod runs, profiling, hardware smoke checks, test helpers                                                |
 
 ## Cross-cutting notes
 

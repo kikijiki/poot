@@ -1,5 +1,39 @@
+use crate::aql::DeviceRingReceiptProvenance;
+use crate::bindings::{
+    HSA_AGENT_INFO_QUEUE_MAX_SIZE, HSA_AMD_AGENT_INFO_BDFID, HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT,
+    HSA_AMD_AGENT_INFO_DOMAIN, HSA_AMD_LINK_INFO_TYPE_PCIE, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
+    HSA_AMD_MEMORY_POOL_INFO_LOCATION, HSA_QUEUE_TYPE_MULTI, hsa_agent_t, hsa_amd_memory_pool_t,
+    hsa_queue_t, hsa_status_t,
+};
+use crate::buffer::{Pool, RocmAlloc, checked_byte_range, checked_copy, checked_layout};
+use crate::context::{
+    Held, HsaShutdownGuard, StagingBuffer, TimeoutLeaks, UploadStrategy, require_gpu_check,
+    upload_strategy_for_pool,
+};
+use crate::discovery::{
+    GpuPicker, PoolState, agent_isa_name, agent_name, agent_vendor, agent_wavefront_size,
+    amd_agent_is_apu, amd_agent_memory_avail, amd_agent_product_name, amd_agent_u32_info,
+    amd_cooperative_queues, amd_pool_size, cpu_to_pool_link_types, enable_device_timing,
+    first_cpu_agent,
+};
+use crate::error::check;
+use crate::ffi::{Funcs, Hsa};
+use crate::owner::{HsaRuntimeOwner, ResourceOwner};
+use crate::queue::{
+    DEVICE_RING_OVERRIDE_AT_FIRST_HSA_LOAD, QueueCreationPlan, QueueLayout, QueueProperties,
+    cooperative_gws_publication_facts, destroy_queue_reference, device_ring_override_present,
+    queue_request, validate_created_queue, validate_queue_plan_provenance,
+};
 use crate::replay::replay_graph_chunk_size;
-use crate::*;
+use crate::{
+    HsaStatus, QueueHostLink, QueueHostTarget, QueuePublicationContract, QueueRingMemory,
+    RocmBuffer, RocmContext, RocmContextOptions, RocmError, bindings, publication,
+};
+use poot_runtime_common::BufferRole;
+use poot_target::BufferStorage;
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
+use tracing::info;
 
 impl RocmContext {
     /// Initialize HSA, pick the first GPU agent, walk its memory pools, and create one cooperative GWS
@@ -169,11 +203,6 @@ impl RocmContext {
                 // ROCr builds the cooperative GWS queue through CreateInterceptibleQueue with the explicit
                 // HSA_AMD_QUEUE_CREATE_SYSTEM_MEM allocation flag.
                 let (ring_memory, host_link) = cooperative_gws_publication_facts();
-                (ring_memory, host_link, None)
-            }
-            #[cfg(test)]
-            QueueCreationPlan::RecordedReplay => {
-                let (ring_memory, host_link) = ordinary_system_publication_facts();
                 (ring_memory, host_link, None)
             }
             QueueCreationPlan::PcieDeviceMemoryRingReceipt => {
@@ -366,17 +395,6 @@ impl RocmContext {
         }
         // SAFETY: discovery contract: the context keeps its runtime initialized.
         unsafe { amd_agent_memory_avail(&self.hsa.funcs, self.gpu_agent) }.ok()
-    }
-
-    /// Total memory of the GPU agent's device pool (bytes): the coarse-grained pool's
-    /// `HSA_AMD_MEMORY_POOL_INFO_SIZE`, cached at construction (capacity is fixed for the process
-    /// lifetime). `None` if the one-time SIZE query failed.
-    pub fn vram_budget_bytes(&self) -> Option<u64> {
-        if self.vram_total_bytes == 0 {
-            None
-        } else {
-            Some(self.vram_total_bytes)
-        }
     }
 
     /// Card 125 (FR-004/SC-004): a device DMA transfer (`hsa_amd_memory_async_copy` + completion
@@ -684,7 +702,7 @@ impl RocmContext {
     /// native pool backs it: `Weight`/`Activation`/`State` resolve to the coarse-grained device pool,
     /// so a later write bridges through a staged DMA ([`Self::ring_copy`]); `Input`/`Output`/`Meta`/
     /// `Staging` resolve to the fine-grained system pool, so a later write on Strix Halo (APU, HMM) is
-    /// a plain host `ptr::copy_nonoverlapping`. Callers on the hot per-token path (`poot-rocm-gpu`'s
+    /// a plain host `ptr::copy_nonoverlapping`. Callers on the hot per-token path (`poot-rocm-device`'s
     /// per-step Token/Pos/Mask/SlotMap/TokenEmbed slots) must pass `BufferRole::Input` to
     /// get that plain write; passing `Activation` there pays a staged-DMA per token instead.
     pub fn allocate_f32(&self, elems: usize, role: BufferRole) -> Result<RocmBuffer, RocmError> {
@@ -720,86 +738,6 @@ impl RocmContext {
             )?;
         }
         Ok(buf)
-    }
-
-    /// Upload `data` (i32 slice) into a fresh native-I32 buffer charged to `role` (Card 547a F1/F4: caller-stated role; metadata buffers, e.g. a launch's metadata dims, pass `BufferRole::Meta`),
-    /// copying the i32 bytes directly. The bit pattern is identical to u32 for small non-negative
-    /// values.
-    pub fn upload_i32(&self, data: &[i32], role: BufferRole) -> Result<RocmBuffer, RocmError> {
-        let buf = self.allocate_uninit("upload_i32", data.len(), BufferStorage::i32(), role)?;
-        // SAFETY: `buf` is a fresh allocation of exactly `size_of_val(data)` bytes, and `data` is
-        // readable for that many.
-        unsafe {
-            self.upload_bytes_role_aware(
-                buf.pool(),
-                data.as_ptr() as *const u8,
-                buf.alloc.as_ptr(),
-                std::mem::size_of_val(data),
-            )?;
-        }
-        Ok(buf)
-    }
-
-    /// Upload raw bf16 bytes unchanged into a native two-byte-per-element buffer charged to `role`
-    /// (Card 547a review F1/F4: caller-stated role).
-    pub fn upload_bf16_bytes(
-        &self,
-        bytes: &[u8],
-        role: BufferRole,
-    ) -> Result<RocmBuffer, RocmError> {
-        if !bytes
-            .len()
-            .is_multiple_of(poot_target::ElementKind::Bf16.byte_width())
-        {
-            return Err(RocmError::InvalidByteLength {
-                op: "upload_bf16_bytes",
-                bytes: bytes.len(),
-                element_bytes: poot_target::ElementKind::Bf16.byte_width(),
-            });
-        }
-        let elements = bytes.len() / poot_target::ElementKind::Bf16.byte_width();
-        let buf =
-            self.allocate_uninit("upload_bf16_bytes", elements, BufferStorage::bf16(), role)?;
-        // SAFETY: `buf` is a fresh allocation of exactly `bytes.len()` bytes (whole elements).
-        unsafe {
-            self.upload_bytes_role_aware(
-                buf.pool(),
-                bytes.as_ptr(),
-                buf.alloc.as_ptr(),
-                bytes.len(),
-            )?;
-        }
-        Ok(buf)
-    }
-
-    /// Overwrite an existing device buffer in place, through whichever pool it was allocated from
-    /// (Card 547a: pool-aware, `buf.pool()`). On Strix Halo (HMM/SVM) a fine-pool buffer (`Input`/
-    /// `Output`/`Meta`/`Staging`, Card 547a review F1/F4) gets the same host `ptr::copy_nonoverlapping`
-    /// as before; a coarse-pool buffer (`Weight`/`Activation`/`State`) always bridges through a pinned
-    /// host staging copy ([`Self::ring_copy`]). `poot-rocm-gpu`'s `decode_step` refreshes the Token,
-    /// Pos, and Mask slot buffers between steps without re-allocating through this; those slots are
-    /// allocated with `BufferRole::Input`, so this is the unchanged plain host write on the hot
-    /// per-token path - a caller that allocates a per-step slot under `Activation` instead pays a
-    /// staged DMA on every token (the regression this guards against).
-    pub fn update_f32(&self, buf: &RocmBuffer, data: &[f32]) -> Result<(), RocmError> {
-        checked_copy(
-            buf,
-            "update_f32",
-            BufferStorage::f32(),
-            0,
-            data.len(),
-            true,
-            // SAFETY: `checked_copy` proved `data` covers the whole buffer, so `byte_len` bytes are
-            // readable from `data` and writable at the start of the live allocation.
-            |range| unsafe {
-                self.upload_bytes_role_aware(
-                    buf.pool(),
-                    data.as_ptr() as *const u8,
-                    buf.alloc.as_ptr(),
-                    range.byte_len,
-                )
-            },
-        )
     }
 
     /// Write raw bytes into an owned kernarg allocation, through whichever pool it was allocated from
@@ -840,32 +778,6 @@ impl RocmContext {
             buf,
             "download_f32",
             BufferStorage::f32(),
-            0,
-            out.len(),
-            true,
-            |range| {
-                self.synchronize()?;
-                // SAFETY: `checked_copy` proved `out` covers the whole live allocation, so `byte_len`
-                // bytes are readable from it and writable into `out`; the queue is drained.
-                unsafe {
-                    self.download_bytes_role_aware(
-                        buf.pool(),
-                        buf.alloc.as_ptr() as *const c_void,
-                        out.as_mut_ptr() as *mut u8,
-                        range.byte_len,
-                    )
-                }
-            },
-        )
-    }
-
-    /// Download packed i32/u32 words without changing their bit representation. Through whichever
-    /// pool `buf` was allocated from (Card 547a).
-    pub fn download_i32(&self, buf: &RocmBuffer, out: &mut [i32]) -> Result<(), RocmError> {
-        checked_copy(
-            buf,
-            "download_i32",
-            BufferStorage::i32(),
             0,
             out.len(),
             true,
@@ -1037,5 +949,67 @@ impl RocmContext {
     /// How host<->device transfers reach this context's buffer pool, decided at construction.
     pub fn upload_strategy(&self) -> UploadStrategy {
         self.upload_strategy
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl RocmContext {
+        /// Total memory of the GPU agent's device pool (bytes): the coarse-grained pool's
+        /// `HSA_AMD_MEMORY_POOL_INFO_SIZE`, cached at construction (capacity is fixed for the process
+        /// lifetime). `None` if the one-time SIZE query failed.
+        pub fn vram_budget_bytes(&self) -> Option<u64> {
+            if self.vram_total_bytes == 0 {
+                None
+            } else {
+                Some(self.vram_total_bytes)
+            }
+        }
+
+        /// Upload `data` (i32 slice) into a fresh native-I32 buffer charged to `role` (Card 547a F1/F4: caller-stated role; metadata buffers, e.g. a launch's metadata dims, pass `BufferRole::Meta`),
+        /// copying the i32 bytes directly. The bit pattern is identical to u32 for small non-negative
+        /// values.
+        pub fn upload_i32(&self, data: &[i32], role: BufferRole) -> Result<RocmBuffer, RocmError> {
+            let buf = self.allocate_uninit("upload_i32", data.len(), BufferStorage::i32(), role)?;
+            // SAFETY: `buf` is a fresh allocation of exactly `size_of_val(data)` bytes, and `data` is
+            // readable for that many.
+            unsafe {
+                self.upload_bytes_role_aware(
+                    buf.pool(),
+                    data.as_ptr() as *const u8,
+                    buf.alloc.as_ptr(),
+                    std::mem::size_of_val(data),
+                )?;
+            }
+            Ok(buf)
+        }
+
+        /// Download packed i32/u32 words without changing their bit representation. Through whichever
+        /// pool `buf` was allocated from (Card 547a).
+        pub fn download_i32(&self, buf: &RocmBuffer, out: &mut [i32]) -> Result<(), RocmError> {
+            checked_copy(
+                buf,
+                "download_i32",
+                BufferStorage::i32(),
+                0,
+                out.len(),
+                true,
+                |range| {
+                    self.synchronize()?;
+                    // SAFETY: `checked_copy` proved `out` covers the whole live allocation, so `byte_len`
+                    // bytes are readable from it and writable into `out`; the queue is drained.
+                    unsafe {
+                        self.download_bytes_role_aware(
+                            buf.pool(),
+                            buf.alloc.as_ptr() as *const c_void,
+                            out.as_mut_ptr() as *mut u8,
+                            range.byte_len,
+                        )
+                    }
+                },
+            )
+        }
     }
 }

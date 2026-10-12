@@ -14,7 +14,7 @@ There are two entry points:
 1. **Graph IR**: build a primitive tensor graph, optionally fuse it, run it on the CPU oracle or on a
    GPU through the executor contract.
 2. **Imported kernels**: write ordinary Rust `#[kernel]` functions and dispatch them through
-   `poot-runtime` (see [Authoring kernels](./authoring-kernels.md)).
+   `poot-wgpu-runtime` (see [Authoring kernels](./authoring-kernels.md)).
 
 LLM generation uses the same engine: trace a model into a graph, then run that graph with capture/replay.
 
@@ -25,10 +25,10 @@ LLM generation uses the same engine: trace a model into a graph, then run that g
 | `poot-graph-ir`                  | `Builder`, `ops::*`, `Graph`                                     |
 | `poot-eval`                      | CPU oracle: `eval(&graph, &inputs, EvalOptions) -> Evaluation`   |
 | `poot-executor`                  | Executor contract: `Engine<D>` over a per-backend `Device` trait |
-| `poot-gpu`                       | wgpu/Vulkan: `WgpuDevice`, the contract's wgpu `Device`          |
-| `poot-ptx-gpu` / `poot-rocm-gpu` | NVIDIA / AMD: `PtxDevice` / `RocmDevice` on the same contract    |
+| `poot-wgpu-device`                       | wgpu/Vulkan: `WgpuDevice`, the contract's wgpu `Device`          |
+| `poot-ptx-device` / `poot-rocm-device` | NVIDIA / AMD: `PtxDevice` / `RocmDevice` on the same contract    |
 | `poot-kernel-attr` + `pootc`     | `#[kernel]` import: `pootc` lowers marked fns to GPU code        |
-| `poot-runtime`                   | Host `Context` + typed launchers for imported kernels            |
+| `poot-wgpu-runtime`                   | Host `Context` + typed launchers for imported kernels            |
 
 `poot-graph-plan::compile` owns optimization, legalization and planning. It returns a `Program` for a
 typed target. The executor contract consumes that program: `compile_staged` wraps `compile` for one
@@ -42,16 +42,24 @@ an LLM checkpoint to use them:
 
 ```rust
 use std::collections::HashMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_graph_ir::{Builder, TensorType, ops};
+use poot_graph_ir::{Builder, TensorType, TraceLimits, ops};
 use poot_tensor::HostTensor;
 
 let n = 8usize;
-let b = Builder::new();
-let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-let w = b.constant("w", TensorType::f32(vec![n]));
-let out = ops::rmsnorm(&b, x, w, 1e-6);
+let limits = TraceLimits {
+    max_tokens: NonZeroUsize::MIN, // a model trace's per-step bound; a bare builder never reads it
+    max_values: NonZeroUsize::new(1 << 10).unwrap(),
+    max_eqns: NonZeroUsize::new(1 << 10).unwrap(),
+    max_literal_bytes: NonZeroU64::new(1 << 12).unwrap(),
+    max_owned_bytes: NonZeroU64::new(1 << 20).unwrap(),
+};
+let b = Builder::new(limits);
+let x = b.constant("x", TensorType::f32(vec![1, 1, n]))?;
+let w = b.constant("w", TensorType::f32(vec![n]))?;
+let out = ops::rmsnorm(&b, x, w, 1e-6)?;
 let g = b.finish(out)?;
 
 let mut inputs = HashMap::new();
@@ -59,6 +67,13 @@ inputs.insert(x.id(), Value::from(HostTensor::f32(vec![1, 1, n], vec![1.0; n])))
 inputs.insert(w.id(), Value::from(HostTensor::f32(vec![n], vec![1.0; n])));
 let y = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?;
 ```
+
+A `Builder` is created with the limits its caller states (`TraceLimits`: values, equations, bytes of scalar
+literals and of owned storage; there is no default and no unlimited builder), and every builder call and every
+op composition returns a typed `BuilderError`: a shape or dtype an operation does not admit, a handle from
+another builder, or a request past a limit. A request past a limit is refused before it allocates or appends,
+and the error names the resource, the limit and the attempted total. The limits bound the storage the
+builder itself requests, not allocator overhead or device memory.
 
 `Builder::constant` registers a named const/input binder. At eval time you supply a `HashMap<ValueId,
 Value>` keyed by those ids (`Value::from(HostTensor::f32(shape, data))` for an F32 tensor). A bound tensor must have exactly the
@@ -79,7 +94,7 @@ Use the compiler entry instead of assembling a production pass sequence:
 ```rust
 use poot_executor::Device;
 use poot_graph_plan::{compile, CompileLimits, CompileOptions, Submission, Target};
-use poot_gpu::device::WgpuDevice;
+use poot_wgpu_device::device::WgpuDevice;
 
 let device = WgpuDevice::new()?;
 let target: Target = device.target(); // a GPU target: backend plus measured DeviceCaps
@@ -111,7 +126,7 @@ The wgpu backend runs the same contract as PTX and ROCm: build a `WgpuDevice`, w
 use std::sync::Arc;
 
 use poot_executor::{Device, Engine, Executor, HostView, NoSync, StepInputs};
-use poot_gpu::device::WgpuDevice;
+use poot_wgpu_device::device::WgpuDevice;
 use poot_graph_plan::{
     compile_staged, CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement,
     Partition, Submission, TargetSet,
@@ -154,10 +169,10 @@ that is the engine the `poot-llm` driver runs on.
 
 ## Direct `#[kernel]` dispatch
 
-When you do not want a graph at all, author a kernel and launch it with a `poot_runtime::Context`:
+When you do not want a graph at all, author a kernel and launch it with a `poot_wgpu_runtime::Context`:
 
 ```rust
-use poot_runtime::{Context, KernelBuffer};
+use poot_wgpu_runtime::{Context, KernelBuffer};
 
 let ctx = Context::new()?;
 let a = [1.0f32, 2.0, 3.0];

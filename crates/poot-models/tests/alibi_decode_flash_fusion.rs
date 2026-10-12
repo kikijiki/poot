@@ -8,12 +8,12 @@
 //! dev-depends on poot-eval, so an integration test here can drive both.
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::dense::step;
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::{Graph, Slot, Storage};
 use poot_graph_plan::{cse, dce, flash_attention_capped};
 use poot_models::model::{LogitRows, Phase};
 use poot_models::registry::Registry;
+use poot_models::test_support::dense::step;
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
@@ -87,7 +87,11 @@ fn mpt_graph(phase: Phase, tokens: usize, cap: usize) -> Graph {
         .build(&fixture.raw(), &f32_store.build())
         .expect("the mpt fixture builds");
     model
-        .trace(phase, step(1, tokens, cap, LogitRows::Last))
+        .trace(
+            phase,
+            step(1, tokens, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -144,7 +148,7 @@ const SLOPES: &str = "alibi.slopes";
 
 /// `g` with its computed ALiBi slopes turned into a constant input, so a test can bind other values.
 fn slopes_as_input(g: &Graph) -> Graph {
-    poot_test_util::graph_fixtures::derive(g, |draft| {
+    poot_graph_ir::test_support::graph_fixtures::derive(g, |draft| {
         for &id in g.inputs() {
             if matches!(g.values()[id].storage, Storage::Computed(_)) {
                 draft.values_mut()[id].storage = Storage::Const;

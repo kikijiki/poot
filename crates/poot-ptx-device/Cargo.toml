@@ -1,0 +1,44 @@
+[package]
+name = "poot-ptx-device"
+description = "PTX device backend: the poot-executor Device implementation for NVIDIA, device-resident"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+poot-graph-ir.workspace = true
+poot-graph-plan.workspace = true
+poot-executor.workspace = true
+poot-target.workspace = true
+poot-kernel-ir.workspace = true
+poot-kernelgen.workspace = true
+poot-codegen.workspace = true
+poot-ptx-runtime.workspace = true
+poot-runtime-common.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+poot-graph-plan = { workspace = true, features = ["test-support"] }
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+poot-runtime-common = { workspace = true, features = ["test-support"] }
+poot-test-util.workspace = true
+poot-eval = { workspace = true, features = ["test-support"] }
+poot-executor-parity.workspace = true
+poot-quant = { workspace = true, features = ["test-support"] }
+poot-tensor.workspace = true
+# The performance-bank example loads a checkpoint through the loader and hashes its plan with
+# `sha256_digest` (ADR-0113).
+poot-load = { workspace = true, features = ["test-support"] }
+# `download_i32`, the sampler no-contract test's readback (ADR-0113).
+poot-ptx-runtime = { workspace = true, features = ["test-support"] }
+bytemuck.workspace = true
+serde_json.workspace = true
+# Deserializing the committed sampler-kernel `Body` assets (card 675's SC-001 PTX dispatch) needs
+# `Body: Deserialize`, test-only (the production `[dependencies]` poot-kernel-ir above stays serde-free).
+poot-kernel-ir = { workspace = true, features = ["serde", "test-support"] }
+
+[lints]
+workspace = true

@@ -2,8 +2,7 @@
 
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -292,7 +291,7 @@ fn retain_dead_engine(engine: DriverEngine, health: &EngineHealth) {
 fn new_metrics(
     model_name: String,
     plan: &EnginePlan,
-    driver_bytes: &[(poot_executor::BufferRole, u64)],
+    driver_bytes: &[(poot_runtime_common::BufferRole, u64)],
     telemetry: TelemetryConfig,
 ) -> Metrics {
     let live = |role| {
@@ -320,8 +319,8 @@ fn new_metrics(
         model: model_name,
         sys: Mutex::new(sysinfo::System::new()),
         cache: CacheMetrics {
-            gpu_weight_bytes: AtomicU64::new(live(poot_executor::BufferRole::Weight)),
-            gpu_kv_bytes: AtomicU64::new(live(poot_executor::BufferRole::State)),
+            gpu_weight_bytes: AtomicU64::new(live(poot_runtime_common::BufferRole::Weight)),
+            gpu_kv_bytes: AtomicU64::new(live(poot_runtime_common::BufferRole::State)),
             kv_total_blocks: AtomicU64::new(plan.caps.kv_blocks as u64),
             gpu_vram_total_bytes: AtomicU64::new(plan.budget.available_bytes().unwrap_or(0)),
             ..CacheMetrics::default()

@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, LoadOptions, ModelHandle,
     PreparedSetLimits, open_executor, program_retention,
@@ -195,7 +195,7 @@ fn write_fixture(fixture: Fixture) -> poot_test_util::UniqueTempPath {
     let tokenizer = tokenizer_json(vocab_of(&config));
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
     dir
 }
 
@@ -232,7 +232,7 @@ fn driver_options() -> DriverOptions {
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(8),
-        max_trace_tokens: nz(CAPACITY),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(CAPACITY)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
@@ -252,7 +252,7 @@ fn references(
     prompt: &[u32],
     samplers: Vec<Sampler>,
 ) -> Option<Vec<Reference>> {
-    let executor = poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))?;
+    let executor = poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))?;
     let mut driver = Driver::new(load(dir), executor, driver_options()).expect("a driver");
     Some(
         samplers
@@ -754,7 +754,7 @@ fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
     backend: DeviceBackend,
     flag: &str,
 ) {
-    if poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
+    if poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
         return;
     }
     let dir = write_checkpoint("qwen2");
@@ -832,7 +832,7 @@ fn draft_with_a_larger_vocabulary_refuses_startup(
     backend: DeviceBackend,
     flag: &str,
 ) {
-    if poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
+    if poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
         return;
     }
     let target_dir = write_checkpoint("qwen2");
@@ -1161,7 +1161,10 @@ mod smolvlm {
             .to_string(),
         )
         .unwrap();
-        poot_test_util::safetensors::write(&dir.join("model.safetensors"), &store.build());
+        poot_quant::test_support::safetensors::write(
+            &dir.join("model.safetensors"),
+            &store.build(),
+        );
         dir
     }
 }
@@ -1216,11 +1219,10 @@ impl Server {
 /// 400, not a dropped image. Mutation: zero the rows in `vision::ImageClient::prepare`; the served
 /// caption is the zero-row continuation, equal for both images, and the row goes red.
 fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
-    use poot_llm::ChatTurn;
-    use poot_llm::ImageCheckpoint as _;
     use poot_llm::front_end::{
         CaptionRequest, DecodedImage, Idefics3, Idefics3Checkpoint, decode_image,
     };
+    use poot_llm::{ChatTurn, ImageCheckpoint as _};
 
     let dir = smolvlm::write_checkpoint(NO_EOS);
     let black = png_of(|_, _| 0);
@@ -1232,12 +1234,12 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
         let mut options = driver_options();
         options.capacity = nz(capacity);
         options.prefill_chunk = nz(capacity);
-        options.max_trace_tokens = nz(capacity);
+        options.trace.max_tokens = nz(capacity);
         options
     };
     let (Some(vision), Some(text)) = (
-        poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)),
-        poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)),
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)),
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)),
     ) else {
         return;
     };
@@ -1468,7 +1470,10 @@ mod qwen_vl {
         {
             store.insert(key.clone(), entry.clone()).unwrap();
         }
-        poot_test_util::safetensors::write(&dir.join("model.safetensors"), &store.build());
+        poot_quant::test_support::safetensors::write(
+            &dir.join("model.safetensors"),
+            &store.build(),
+        );
         let mut config = text.config.clone();
         let mut vision_config = vision.config.clone();
         vision_config.as_object_mut().unwrap().remove("model_type");
@@ -1520,10 +1525,9 @@ fn small_png_of(fill: impl Fn(u32, u32) -> u8) -> Vec<u8> {
 /// positions with zeros where `DriverEngine::open` hands them to `open_with_mrope`; the served generation
 /// leaves the reference's and the row goes red.
 fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
-    use poot_llm::ImageCheckpoint as _;
     use poot_llm::qwen_vl::{Qwen25Vl, Qwen25VlCheckpoint, Qwen25VlGenerate};
     use poot_llm::{
-        Qwen25VlApngFrameSource, Qwen25VlChatContent, Qwen25VlChatMessage,
+        ImageCheckpoint as _, Qwen25VlApngFrameSource, Qwen25VlChatContent, Qwen25VlChatMessage,
         Qwen25VlChatMessageContent, decode_qwen2_5_vl_image,
     };
 
@@ -1541,12 +1545,12 @@ fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
         let mut options = driver_options();
         options.capacity = nz(capacity);
         options.prefill_chunk = nz(chunk);
-        options.max_trace_tokens = nz(capacity);
+        options.trace.max_tokens = nz(capacity);
         options
     };
     let (Some(vision), Some(text)) = (
-        poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)),
-        poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)),
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)),
+        poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)),
     ) else {
         return;
     };
@@ -1646,7 +1650,7 @@ fn served_qwen_vl_caption_rocm() {
 /// the row goes red.
 fn served_qwen_vl_refusals(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
     // The refusals are the server's, not the device's: skip when the backend is absent.
-    if poot_test_util::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
+    if poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
         return;
     }
     let dir = qwen_vl::write_checkpoint(2.0, NO_EOS);

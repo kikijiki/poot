@@ -68,9 +68,11 @@ fn run_case(x_shape: Vec<usize>, x_data: Vec<f32>, bytes: Vec<Vec<u8>>, scales: 
         .expect("valid E4m3PerChannel payload"),
     );
 
-    let b = Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(x_shape.clone()));
-    let mut plan = b.append_plan(0);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(x_shape.clone()))
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
     let mut operands = vec![Operand::Value(x.id())];
     let mut source_ids = Vec::new();
     for (name, ty) in packed_source_constants("layer", descriptor) {

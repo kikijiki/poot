@@ -2,7 +2,13 @@
 //! inversion.
 
 use super::matmul::{FoldedTileGrid, folded_tile_grid};
-use super::*;
+use super::{
+    BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, HashMap, KernelRequest,
+    OpKind, PlanError, Planned, TopKSpec, ValueId, kg, matmul, value_ids,
+};
+use crate::planner::{GraphTables, Layout, finalize};
+use crate::predicates::{GEMM_TILE, indexed_gemv_in, indexed_matmul_lowers, view_source};
+use crate::refusal::Site;
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 
 /// Plan one MoE-family equation (IndexedMatMul, its `ContractionEpilogue`, or ArgTopK).

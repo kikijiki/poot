@@ -118,10 +118,12 @@ impl ExecutionCounters {
     /// Total native submissions across every purpose: the one physical-submission total (Card 552
     /// SC-007's "a known mixed-purpose submission counts once in the total" holds by construction,
     /// since every call site records into exactly one purpose bucket, never several).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn total_submits(&self) -> u64 {
         self.calls.values().map(|c| c.submits).sum()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn total_waits(&self) -> u64 {
         self.calls.values().map(|c| c.waits).sum()
     }

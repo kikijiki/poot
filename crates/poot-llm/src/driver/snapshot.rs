@@ -15,9 +15,9 @@
 //! positional KV needs no restore, since a write beyond the committed position is overwritten or masked.
 //! The side a graph does not write is an alias pair `(x, x)`, which validates and copies nothing.
 
-use poot_graph_ir::{Builder, Graph, StateRole, TensorType};
+use poot_graph_ir::{Builder, Graph, StateRole, TensorType, TraceLimits};
 
-use super::reorder::{row_index, state_row_gather};
+use super::reorder::{RowGraphError, row_index, state_row_gather};
 
 /// The shadow of the carried state value `name`.
 fn shadow_name(name: &str) -> String {
@@ -39,33 +39,46 @@ pub(super) struct SnapshotEntries {
 }
 
 /// The snapshot and restore graphs over the `Recurrent` pairs of `schema` (a decode program), or `None`
-/// for a program that carries no recurrent state. Panics if the recurrent values disagree on their row
-/// axis; the driver checks every state pair's row axis before it compiles the program.
-pub(super) fn snapshot_entries(schema: &Graph) -> Option<SnapshotEntries> {
-    let carried: Vec<Carried> = schema
+/// for a program that carries no recurrent state. Refused when the recurrent values disagree on their
+/// row axis; the driver checks every state pair's row axis before it compiles the program.
+pub(super) fn snapshot_entries(
+    schema: &Graph,
+    limits: TraceLimits,
+) -> Result<Option<SnapshotEntries>, RowGraphError> {
+    let mut carried: Vec<Carried> = Vec::new();
+    for pair in schema
         .state_pairs()
         .filter(|pair| pair.role == StateRole::Recurrent)
-        .map(|pair| {
-            let meta = schema.meta(pair.input);
-            Carried {
-                name: meta.name.clone().expect("a state input carries its name"),
-                aval: meta.aval.clone(),
-            }
-        })
-        .collect();
-    let rows = carried.first()?.aval.shape.first().copied()?;
-    for value in &carried {
-        assert_eq!(
-            value.aval.shape.first(),
-            Some(&rows),
-            "state {:?} has a different row axis",
-            value.name
-        );
+    {
+        let meta = schema.meta(pair.input);
+        let name = meta
+            .name
+            .clone()
+            .ok_or(RowGraphError::UnnamedState { value: pair.input })?;
+        carried.push(Carried {
+            name,
+            aval: meta.aval.clone(),
+        });
     }
-    Some(SnapshotEntries {
-        snapshot: copy_graph(&carried, rows, Copy::LiveToShadow),
-        restore: copy_graph(&carried, rows, Copy::ShadowToLive),
-    })
+    let Some(rows) = carried
+        .first()
+        .and_then(|value| value.aval.shape.first().copied())
+    else {
+        return Ok(None);
+    };
+    for value in &carried {
+        if value.aval.shape.first() != Some(&rows) {
+            return Err(RowGraphError::RowAxis {
+                name: value.name.clone(),
+                rows,
+                found: value.aval.shape.first().copied(),
+            });
+        }
+    }
+    Ok(Some(SnapshotEntries {
+        snapshot: copy_graph(&carried, rows, Copy::LiveToShadow, limits)?,
+        restore: copy_graph(&carried, rows, Copy::ShadowToLive, limits)?,
+    }))
 }
 
 /// Which way a copy graph moves rows.
@@ -75,27 +88,32 @@ enum Copy {
     ShadowToLive,
 }
 
-fn copy_graph(carried: &[Carried], rows: usize, direction: Copy) -> Graph {
-    let b = Builder::new();
-    let index = row_index(&b, rows);
+fn copy_graph(
+    carried: &[Carried],
+    rows: usize,
+    direction: Copy,
+    limits: TraceLimits,
+) -> Result<Graph, RowGraphError> {
+    let b = Builder::new(limits);
+    let index = row_index(&b, rows)?;
     let mut pairs = Vec::with_capacity(2 * carried.len());
     let mut last = None;
     for value in carried {
-        let live = b.state_input(&value.name, value.aval.clone(), StateRole::Recurrent);
+        let live = b.state_input(&value.name, value.aval.clone(), StateRole::Recurrent)?;
         let shadow = b.state_input(
             &shadow_name(&value.name),
             value.aval.clone(),
             StateRole::Recurrent,
-        );
+        )?;
         let copied = match direction {
             Copy::LiveToShadow => {
-                let copied = state_row_gather(&b, b.concat(0, &[shadow, live]), index);
+                let copied = state_row_gather(&b, b.concat(0, &[shadow, live])?, index)?;
                 pairs.push((live, live));
                 pairs.push((shadow, copied));
                 copied
             }
             Copy::ShadowToLive => {
-                let copied = state_row_gather(&b, b.concat(0, &[live, shadow]), index);
+                let copied = state_row_gather(&b, b.concat(0, &[live, shadow])?, index)?;
                 pairs.push((live, copied));
                 pairs.push((shadow, shadow));
                 copied
@@ -103,11 +121,10 @@ fn copy_graph(carried: &[Carried], rows: usize, direction: Copy) -> Graph {
         };
         last = Some(copied);
     }
-    b.finish(
-        poot_graph_ir::Outputs::new(last.expect("a recurrent program carries state"))
-            .with_state(&pairs),
-    )
-    .unwrap()
+    let Some(last) = last else {
+        return Err(RowGraphError::NoState);
+    };
+    Ok(b.finish(poot_graph_ir::Outputs::new(last).with_state(&pairs))?)
 }
 
 /// The row index of a copy: `slots` take their row from the source, every other row keeps its own.

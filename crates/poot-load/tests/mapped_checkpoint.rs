@@ -156,7 +156,7 @@ fn mb1_mapped_safetensors_equals_a_positional_read() {
     let dir = poot_test_util::unique_temp_path("mb1_shard");
     std::fs::create_dir_all(&*dir).unwrap();
     let shard = dir.join("model.safetensors");
-    poot_test_util::safetensors::write(&shard, &fixture.build());
+    poot_quant::test_support::safetensors::write(&shard, &fixture.build());
 
     let store = poot_load::safetensors::load_weight_store(&*dir).unwrap();
     let raw = std::fs::read(&shard).unwrap();
@@ -384,7 +384,7 @@ fn mb5_a_truncated_safetensors_shard_is_refused_at_the_end_of_load() {
     let dir = poot_test_util::unique_temp_path("mb5_shard");
     std::fs::create_dir_all(&*dir).unwrap();
     let shard = dir.join("model.safetensors");
-    poot_test_util::safetensors::write(&shard, &fixture.build());
+    poot_quant::test_support::safetensors::write(&shard, &fixture.build());
     let files = poot_load::safetensors::map_weight_files(&*dir).unwrap();
     assert!(files[0].1.len() < 4096);
 

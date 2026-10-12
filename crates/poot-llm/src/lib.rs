@@ -29,20 +29,6 @@
 //! use poot_llm::Runner; // deleted
 //! ```
 
-/// `TextError::Msg(format!(...))`. Same argument shape as `anyhow::anyhow!(...)`. Defined at the
-/// crate root so it is textually in scope for the child modules declared below.
-macro_rules! err {
-    ($($arg:tt)*) => { $crate::TextError::Msg(format!($($arg)*)) };
-}
-
-/// `return Err(TextError::Msg(format!(...)))`. Same argument shape as `bail!(...)`.
-macro_rules! bail {
-    ($($arg:tt)*) => { return Err($crate::TextError::Msg(format!($($arg)*))) };
-}
-
-mod error;
-pub use error::{ChatTemplateError, OptionExt, Result, TextError};
-
 /// Shared control result for every single-sequence text-piece callback.
 ///
 /// [`std::ops::ControlFlow::Continue`] continues generation. [`std::ops::ControlFlow::Break`], returned
@@ -53,13 +39,11 @@ pub type GenerationControl = std::ops::ControlFlow<()>;
 mod core;
 pub mod driver;
 mod multimodal;
-mod text;
 
 pub use multimodal::{
     ChatTurn, ImageCheckpoint, ImageCheckpointError, ImageFrontEnd, ImageRequestError,
     MultimodalPrompt, encoders, front_end, qwen_vl, read_image_checkpoint,
 };
-pub use text::grammar;
 
 pub use core::modality::Modality;
 pub use core::sampler::{Sampler, SamplerFault, TokenLogprob};
@@ -91,22 +75,3 @@ pub use multimodal::qwen_vl_mrope::{
     QwenVlMropeMetadata, QwenVlMropeMetadataLoadError, QwenVlMropeSourceMetadata,
     load_qwen_vl_mrope_source_metadata,
 };
-pub use poot_load::qwen_vl::QwenVlModelType;
-pub use poot_models::mrope::{
-    MropeConfigMetadata, MropeConfigMetadataError, MropeGrid, MropePosition,
-    MropePositionAssemblyError, MropePositionError, MropePositionIds, MropeProcessorFpsInput,
-    MropeProcessorSpecialToken, MropeProcessorTimingError, MropeSampledFramesPerSecond,
-    MropeSecondsPerGridStep, MropeSegment, MropeSpanError, MropeSpecialTokenIds,
-    MropeSpecialTokenKind, MropeSpecialTokenReconcileError, MropeTemporalPatchSize,
-    MropeTemporalTokensPerSecond, MropeTimingUnit, MropeTokenizerSpecialToken, MropeVideoTiming,
-    QWEN2_5_VL_PROCESSOR_DEFAULT_FPS, Qwen25VlMropePositionInput,
-    assemble_qwen2_5_vl_mrope_positions, assemble_qwen2_5_vl_video_timings,
-    assemble_qwen2_5_vl_video_timings_with_default, build_mrope_position_ids,
-    discover_mrope_segments, reconcile_mrope_special_token_ids,
-};
-pub use text::chat::{
-    ChatTemplateOverride, CheckedChatTemplate, RenderedChat, Speaker, derive_jinja_stops,
-    render_jinja_value,
-};
-pub use text::guided::{Constraint, JsonAcceptor, json_schema_to_regex, tool_call_regex};
-pub use text::tokenize::{ChatTemplate, TextCodec};

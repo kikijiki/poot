@@ -1,5 +1,5 @@
 //! Device timing across the stages of one step (POOT-745, SC-006), on the device twins the staged
-//! pipeline rows share (`poot_executor_parity::pipeline`). One `replay` per stage, one timing per
+//! pipeline rows share (`poot_models::test_support::pipeline`). One `replay` per stage, one timing per
 //! step: a three-stage step reports every stage's dispatches (wgpu, per dispatch) or one span around
 //! all its launches (PTX), never only the last stage's.
 //!
@@ -8,14 +8,14 @@
 use std::num::NonZeroUsize;
 
 use poot_executor::{DetailedTiming, Device, DrainPolicy, Engine, TimingOptions};
-use poot_executor_parity::pipeline::{
+use poot_models::test_support::pipeline::{
     Counting, assert_detailed_timing_reports_every_stage,
     assert_pipeline_step_reports_a_device_span,
 };
-use poot_gpu::device::WgpuDevice;
-use poot_ptx_gpu::PtxDevice;
+use poot_ptx_device::PtxDevice;
 use poot_runtime_common::DeviceBackend;
-use poot_test_util::device_skip::open_or_skip;
+use poot_runtime_common::device_skip::open_or_skip;
+use poot_wgpu_device::device::WgpuDevice;
 
 /// Mutation: discard the device timing in `WgpuDevice::replay`, as before the step hook; only the
 /// last stage's records survive and the pipeline's per-kind dispatch counts fall short.

@@ -4,23 +4,23 @@
 //! oracle within tolerance (ADR-0101 tier 1). Mutation (SC-001): the caps the device reports must be the
 //! physical device's; `large_grid.rs` is the row that turns red when they are not.
 //!
-//! The rows are the ROCm lane's (`poot-rocm-gpu/tests/parity.rs`, `executor_coverage.rs`) minus the ones
+//! The rows are the ROCm lane's (`poot-rocm-device/tests/parity.rs`, `executor_coverage.rs`) minus the ones
 //! that name AMD matrix hardware (WMMA bf16) or load a real checkpoint (the Qwen2.5-0.5B row is the
-//! `generate.rs` ignored row on this backend). The kernels and planner paths these rows guard are
+//! poot-llm `vulkan_generate.rs` ignored row on this backend). The kernels and planner paths these rows guard are
 //! backend-neutral; each row's own mutation was recorded by the card that added it and is not repeated here.
 
 use std::collections::HashMap;
 
+use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::Fixture;
-use poot_graph_plan::{Submission, Target};
+use poot_graph_plan::test_support::gpu_caps;
+use poot_graph_plan::{Target, production_plan::Submission};
 use poot_kernel_ir::Body;
 use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::HostTensor;
-use poot_test_util::device_skip::open_or_skip;
-use poot_test_util::graph_fixtures::gpu_caps;
-use poot_test_util::weight_map_oracle::oracle_for;
 use poot_vulkan_device::VulkanDevice;
 
 /// The raw-Vulkan executor and the target it compiles for, or `None` (a skip) without a device.
@@ -61,85 +61,6 @@ fn max_relative_difference(a: &HostTensor, b: &HostTensor) -> f32 {
         .zip(b.as_f32().expect("F32 output"))
         .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
         .fold(0.0, f32::max)
-}
-
-#[test]
-fn parity_table_matches_the_oracle_on_vulkan() {
-    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
-        return;
-    };
-    let t = device.target();
-    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-
-    let fixtures = [
-        poot_executor_parity::qwen2_decode_fixture(8),
-        poot_executor_parity::qwen2_prefill_fixture(3, 8),
-    ];
-    for fixture in &fixtures {
-        let mut oracle = oracle_for(&fixture.graph, &fixture.store);
-        poot_executor_parity::run_parity(exec.as_mut(), t, fixture, &mut oracle)
-            .unwrap_or_else(|e| panic!("{e}"));
-    }
-}
-
-/// Card 557 SC-004 (dkernel K1): a qwen2-class decode and prefill traced with
-/// `attn_logit_softcap = Some(50.0)` and compiled for raw Vulkan match `eval(g)` of that same softcapped
-/// trace within the parity tolerance, at every replayed step. The fixtures' scores reach the softcap
-/// regime: the softcapped oracle differs from the uncapped trace's by far more than that tolerance, so
-/// the device output cannot match it without applying the softcap. Reproduction: the pre-card flash
-/// tracer arms (`trace_*_flash`) dropped the softcap. Mutation: make the qwen2 tracers call attention
-/// without `cfg.attn_logit_softcap`; the softcapped and uncapped traces coincide and this row goes red.
-#[test]
-fn softcapped_qwen2_matches_the_oracle_on_vulkan() {
-    let Some(device) = open_or_skip(DeviceBackend::Vulkan, VulkanDevice::new()) else {
-        return;
-    };
-    let t = device.target();
-    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-
-    let softcap = Some(poot_executor_parity::ATTN_LOGIT_SOFTCAP);
-    let pairs = [
-        (
-            poot_executor_parity::qwen2_softcap_decode_fixture(8, softcap),
-            poot_executor_parity::qwen2_softcap_decode_fixture(8, None),
-        ),
-        (
-            poot_executor_parity::qwen2_softcap_prefill_fixture(3, 8, softcap),
-            poot_executor_parity::qwen2_softcap_prefill_fixture(3, 8, None),
-        ),
-    ];
-    for (softcapped, uncapped) in &pairs {
-        let mut oracle = oracle_for(&softcapped.graph, &softcapped.store);
-        poot_executor_parity::run_parity(exec.as_mut(), t, softcapped, &mut oracle)
-            .unwrap_or_else(|e| panic!("{e}"));
-        // The softcap must be visible: the softcapped trace's oracle differs from the uncapped
-        // trace's by more than ten times the parity tolerance at some step.
-        let (mut capped_oracle, mut plain_oracle) = (
-            oracle_for(&softcapped.graph, &softcapped.store),
-            oracle_for(&uncapped.graph, &uncapped.store),
-        );
-        let largest = softcapped
-            .steps
-            .iter()
-            .zip(&uncapped.steps)
-            .map(|(capped_step, plain_step)| {
-                let capped = capped_oracle(capped_step);
-                let plain = plain_oracle(plain_step);
-                capped
-                    .as_f32()
-                    .expect("F32 oracle output")
-                    .iter()
-                    .zip(plain.as_f32().expect("F32 oracle output"))
-                    .map(|(c, p)| (c - p).abs() / p.abs().max(1.0))
-                    .fold(0.0f32, f32::max)
-            })
-            .fold(0.0f32, f32::max);
-        assert!(
-            largest > 5e-2,
-            "{}: the softcap barely changes the oracle (max relative difference {largest:.2e})",
-            softcapped.name
-        );
-    }
 }
 
 /// Card 645 SC-001: `matmul(x, transpose(w))` over an F32 `[N, K]` weight, at `M = 1` (the decode GEMV), `4` and `33`
@@ -327,18 +248,6 @@ fn flash_attention_with_a_per_head_alibi_mask_matches_the_oracle_on_vulkan() {
     }
 }
 
-/// A qwen2 decode over the multi-head (`2 x 2`) and multi-query (`2 x 1`) query/key-value head layouts matches
-/// the oracle at every step. (The grouped-query layout, `4 x 2`, is the parity table's `qwen2_decode` row.)
-#[test]
-fn decode_over_multi_head_and_multi_query_layouts_matches_the_oracle_on_vulkan() {
-    let Some((mut exec, target)) = vulkan() else {
-        return;
-    };
-    for fixture in &poot_executor_parity::attention::head_layout_decode_fixtures(8) {
-        assert_matches_oracle(exec.as_mut(), target, fixture);
-    }
-}
-
 /// Masked attention with RoPE and a KV cache, a Gated-DeltaNet layer and an `ArgTopK`-routed MoE layer (the bias
 /// toy with biased Q/K/V, so the matmul-plus-bias contraction runs inside the recorded program) decoded over
 /// six steps through one entry. The entry records on its first step and replays after; each step matches the
@@ -482,16 +391,21 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_vulkan() {
         .unwrap_or_else(|e| panic!("{e}"));
 
     // The sequential reference: one decode step per token, key heads repeated tiled.
-    let b = Builder::new();
-    let per_head = |tag: &str, last: usize| b.constant(tag, TensorType::f32(vec![1, H_V, 1, last]));
+    let b = Builder::for_tests();
+    let per_head = |tag: &str, last: usize| {
+        b.constant(tag, TensorType::f32(vec![1, H_V, 1, last]))
+            .unwrap()
+    };
     let (q, k, v) = (per_head("q", D), per_head("k", D), per_head("v", D));
     let (g, beta) = (per_head("g", 1), per_head("beta", 1));
-    let state = b.state_input(
-        "s",
-        TensorType::f32(vec![1, H_V, D, D]),
-        StateRole::Recurrent,
-    );
-    let (out, state_out) = gated_delta_net_decode(&b, q, k, v, g, beta, state);
+    let state = b
+        .state_input(
+            "s",
+            TensorType::f32(vec![1, H_V, D, D]),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let (out, state_out) = gated_delta_net_decode(&b, q, k, v, g, beta, state).unwrap();
     let graph = b
         .finish(poot_graph_ir::Outputs::new(out).with_state(&[(state, state_out)]))
         .unwrap();

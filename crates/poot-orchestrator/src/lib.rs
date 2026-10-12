@@ -672,7 +672,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
         db.set_exec_owner("exec-123", &ExecOwner::current().unwrap())
             .unwrap();
         assert_eq!(
-            db.abort_stale_execs_with(false, |_| db::OwnerLiveness::Dead)
+            db.abort_stale_execs_with(false, |_| db::runs::OwnerLiveness::Dead)
                 .unwrap()
                 .aborted,
             1
@@ -716,7 +716,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
         assert_eq!(w.pod_id, "pod-warm");
         assert_eq!((w.host.as_str(), w.port), ("1.2.3.4", 40000));
         assert_eq!(
-            db.abort_stale_execs_with(false, |_| db::OwnerLiveness::Dead)
+            db.abort_stale_execs_with(false, |_| db::runs::OwnerLiveness::Dead)
                 .unwrap()
                 .aborted,
             0,
@@ -729,7 +729,7 @@ frameworks.transformers = { support = true, precision = "bf16" }
         // Expired warm: abort_stale_execs finalizes it, freeing its pod for reaping.
         db.set_warm("exec-warm", &iso_in_minutes(0)).unwrap(); // warm_until == ~now, not strictly > now
         assert_eq!(
-            db.abort_stale_execs_with(false, |_| db::OwnerLiveness::Dead)
+            db.abort_stale_execs_with(false, |_| db::runs::OwnerLiveness::Dead)
                 .unwrap()
                 .aborted,
             1,

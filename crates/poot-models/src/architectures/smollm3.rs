@@ -18,7 +18,7 @@
 //! `layer_types`/`use_sliding_window`/`sliding_window` exist in the config schema but the 3B checkpoint disables
 //! them (`"full_attention"`/`false`/`null`); not implemented (spec 260 "Out of scope").
 //!
-//! **No from-scratch loader.** Unlike BLOOM/MPT (`crate::bloom`/`crate::mpt`), SmolLM3's weight names and shapes
+//! **No from-scratch loader.** Unlike BLOOM/MPT (`crate::architectures::bloom`/`crate::architectures::mpt`), SmolLM3's weight names and shapes
 //! match what the llama/qwen2/mistral families already name (`model.embed_tokens.weight`, `model.layers.{li}.self_attn.{q,k,v,o}_proj.weight`,
 //! `model.layers.{li}.{input_layernorm,post_attention_layernorm}.weight`, `model.layers.{li}.mlp.{gate,up,down}_proj.weight`,
 //! `model.norm.weight`, tied `lm_head.weight`, one shared `rope.cos`/`rope.sin`). This tracer uses the same names,
@@ -38,7 +38,6 @@ use std::num::NonZeroUsize;
 
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -54,8 +53,9 @@ use crate::model::{
 use crate::names::gguf::GGUF_BASE;
 use crate::names::{HF_BASE, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("smollm3");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("smollm3");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -84,7 +84,7 @@ const DEFAULT_NO_ROPE_INTERVAL: usize = 4;
 
 /// smollm3's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Smollm3Params {
+pub(crate) struct Smollm3Params {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -135,7 +135,7 @@ fn rotates(fields: &Fields<'_>, layers: usize) -> Result<Vec<bool>, ModelError> 
 }
 
 impl Smollm3Params {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
         for unsupported in ["attention_bias", "mlp_bias", "use_sliding_window"] {
@@ -179,7 +179,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Smollm3 {
+pub(crate) struct Smollm3 {
     params: Smollm3Params,
     weights: WeightMap,
     stack: StackWeights,
@@ -235,11 +235,10 @@ impl Model for Smollm3 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -250,7 +249,7 @@ impl Model for Smollm3 {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention[l]),
                 |b, BlockInput { block: h, .. }| gated_ffn(b, h, &layer.ffn),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -284,7 +283,7 @@ fn fixture() -> Fixture {
 
 /// A SmolLM3 decoder config; field names/values match `HuggingFaceTB/SmolLM3-3B`'s `config.json`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Smollm3Config {
+pub(crate) struct Smollm3Config {
     pub vocab: usize,
     pub hidden: usize,
     /// MLP intermediate width (`intermediate_size`; `11008` on the 3B checkpoint, not `4*hidden`).
@@ -305,15 +304,10 @@ pub struct Smollm3Config {
 }
 
 impl Smollm3Config {
-    /// `hidden / n_heads`; no released checkpoint has an explicit `head_dim` key.
-    pub fn head_dim(&self) -> usize {
-        self.hidden / self.n_heads
-    }
-
     /// `configuration_smollm3.py`'s default `no_rope_layers` formula (for configs that omit the array): layer `li`
     /// (0-indexed) is NoPE iff `(li + 1) % interval == 0`. For the 3B checkpoint's `interval = 4`, layers 3, 7,
     /// 11, ... are NoPE (checked against the published `no_rope_layers` array).
-    pub fn no_rope_pattern(layers: usize, interval: usize) -> Vec<bool> {
+    pub(crate) fn no_rope_pattern(layers: usize, interval: usize) -> Vec<bool> {
         (0..layers).map(|li| (li + 1) % interval != 0).collect()
     }
 }
@@ -628,11 +622,19 @@ mod family_tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(1, 2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(1, 2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }

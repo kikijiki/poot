@@ -40,16 +40,16 @@ use anyhow::Context;
 use serde_json::{json, Value};
 
 use poot_executor::DetailedTiming;
-use poot_graph_plan::{CompileOptions, Submission};
+use poot_graph_plan::{production_plan::Submission, CompileOptions};
 use poot_llm::driver::error::DriverError;
-#[cfg(test)]
-use poot_llm::driver::error::Unsupported;
 use poot_llm::driver::{
     open_executor, open_timed_executor, BackendChoice, Driver, DriverOptions, DriverStats,
-    GenerateRequest, Head, Layout, ModelHandle, PreparedSetLimits, ServingShapes, Warm,
+    GenerateRequest, Head, Layout, ModelHandle, PhaseTiming, PreparedSetLimits, ServingShapes,
+    Warm,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
+use poot_profile::{Ceiling, Fit, GB};
 use poot_quant::weights::WeightEntry;
 
 /// The git sha this binary was built from (`build.rs`); the harness records it with every result.
@@ -191,6 +191,8 @@ struct Config {
     prefill: bool,
     json: bool,
     profile: bool,
+    /// Report each cell's roofline: the driver then times its phases, which a plain cell does not pay for.
+    roofline: bool,
     mode: Mode,
     isl_list: Vec<usize>,
     osl: usize,
@@ -201,13 +203,16 @@ struct Config {
 
 enum Invocation {
     Version,
+    /// `--roofline-fit <result lines...>`: the cross-model fit over lines earlier runs printed.
+    RooflineFit(Vec<String>),
     Run(Config),
 }
 
 /// Options that take a value and switches that do not. Everything else is an error: a flag the runner
 /// ignores would report a measurement the caller did not ask for. `--synthetic` is part of the suite's
 /// runner contract (the harness passes it to every runner); decode-curve contexts are always synthetic.
-const VALUE_FLAGS: [&str; 12] = [
+const VALUE_FLAGS: [&str; 13] = [
+    "--roofline-fit",
     "--model-dir",
     "--gguf",
     "--prompt-file",
@@ -221,7 +226,8 @@ const VALUE_FLAGS: [&str; 12] = [
     "--osl",
     "--prepared-state",
 ];
-const SWITCHES: [&str; 5] = [
+const SWITCHES: [&str; 6] = [
+    "--roofline",
     "--prefill",
     "--json",
     "--profile",
@@ -247,6 +253,11 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
     }
     if switches.contains("--version") {
         return Ok(Invocation::Version);
+    }
+    if let Some(files) = values.get("--roofline-fit") {
+        return Ok(Invocation::RooflineFit(
+            files.split(',').map(str::to_string).collect(),
+        ));
     }
 
     let number = |flag: &str, default: usize| -> anyhow::Result<usize> {
@@ -290,6 +301,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
         prefill: switches.contains("--prefill"),
         json: switches.contains("--json"),
         profile: switches.contains("--profile"),
+        roofline: switches.contains("--roofline"),
         mode: Mode::parse(values.get("--mode").copied().unwrap_or("single"))?,
         isl_list,
         osl: number("--osl", 128)?,
@@ -383,8 +395,93 @@ trait Generate {
         PreparationCounters::default()
     }
 
+    /// The decode work this engine has done so far, as it counted it: tokens, its own step-clock wall
+    /// and the bytes its plan read ([`PhaseTiming`]). A window's roofline is the difference of two
+    /// readings. Zero for an engine that counts none.
+    fn decode_phase(&self) -> PhaseTiming {
+        PhaseTiming::default()
+    }
+
+    /// The pinned bandwidth ceiling of the device this engine runs on; `None` for a device nobody
+    /// calibrated.
+    fn ceiling(&self) -> Option<Ceiling> {
+        None
+    }
+
     /// What generates.
     fn engine(&self) -> Engine;
+}
+
+/// `ms_per_token = a * GB_per_token + b` over the measured rooflines in `rooflines` (a decode-curve's
+/// points, or the single-mode lines of a set of models): how the decode step's time grows with the bytes
+/// it reads, as the engine produced both axes ([`Fit::over`]). The typed `unknown` below two measured
+/// points or with no spread in bytes.
+fn roofline_fit<'a>(rooflines: impl IntoIterator<Item = &'a Value>) -> Value {
+    let points: Vec<(f64, f64)> = rooflines
+        .into_iter()
+        .filter_map(|roofline| {
+            Some((
+                roofline["bytes_per_token"].as_f64()? / GB,
+                roofline["ms_per_token"].as_f64()?,
+            ))
+        })
+        .collect();
+    match Fit::over(&points) {
+        Some(fit) => json!({
+            "kind": "measured",
+            "points": points.len(),
+            "ms_per_gb": fit.ms_per_gb,
+            "fixed_ms": fit.fixed_ms,
+            "r2": fit.r2,
+        }),
+        None => json!({
+            "kind": "unknown",
+            "reason": "fewer than two measured points or no spread in bytes",
+        }),
+    }
+}
+
+/// The cross-model fit over result lines earlier runs printed (`--roofline-fit a.json,b.json`): each
+/// file's last line is one result line, whose `roofline` is the model's measured decode window.
+fn fit_over_result_files(files: &[String]) -> anyhow::Result<Value> {
+    let mut rooflines = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(file).with_context(|| format!("read {file}"))?;
+        let line = text
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .with_context(|| format!("{file} holds no result line"))?;
+        let value: Value = serde_json::from_str(line)
+            .with_context(|| format!("{file}: the last line is not a result line"))?;
+        rooflines.push(value["roofline"].clone());
+    }
+    Ok(roofline_fit(&rooflines))
+}
+
+/// The roofline of the decode work between two readings of [`Generate::decode_phase`], as the result
+/// line carries it: the engine's own `ms_per_token` and bytes per token, and the fraction of the
+/// device's pinned ceiling those amount to. The typed `unknown` of a window with no decoded token, no
+/// byte count or an uncalibrated device: never a zero and never a figure from another clock.
+fn roofline_receipt(engine: &dyn Generate, before: PhaseTiming) -> Value {
+    let window = engine.decode_phase() - before;
+    let Some(ceiling) = engine.ceiling() else {
+        return json!({ "kind": "unknown", "reason": "no pinned ceiling for this device" });
+    };
+    match window.roofline(ceiling) {
+        Some(roofline) => json!({
+            "kind": "measured",
+            "decode_tokens": window.tokens,
+            "ms_per_token": roofline.ms_per_token,
+            "bytes_per_token": roofline.bytes_per_token,
+            "achieved_gb_per_s": roofline.achieved_gb_per_s,
+            "fraction_of_ceiling": roofline.fraction_of_ceiling,
+            "ceiling_gb_per_s": roofline.ceiling.gb_per_s,
+            "ceiling_target": roofline.ceiling.target,
+            "ceiling_receipt": roofline.ceiling.receipt,
+        }),
+        None => json!({ "kind": "unknown", "reason": "no decoded token or no measured time" }),
+    }
 }
 
 /// The driver engine on one backend (Card 734): [`Driver::generate`] behind the same [`Generate`] seam, so
@@ -400,6 +497,8 @@ struct DriverCell {
     initial: PreparationCounters,
     /// The executor's timing snapshot when `reset_profile` last ran: the start of the profiled window.
     mark: Option<poot_profile::Mark>,
+    /// The decode phases of every generation so far, as the driver timed them.
+    decode: PhaseTiming,
 }
 
 /// The preparation layers the driver and its executor count.
@@ -425,7 +524,7 @@ fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<Driver
         decode: compile,
         capacity,
         prefill_chunk: NonZeroUsize::new(chunk).context("a prefill chunk holds a token")?,
-        max_trace_tokens: capacity,
+        trace: poot_llm::driver::serving_trace_limits(capacity),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(64).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(8 << 30).expect("nonzero"),
@@ -451,10 +550,13 @@ impl DriverCell {
             stops: Vec::new(),
             ignore_eos,
         };
-        self.driver.generate(request, &mut |_: u32, piece: &str| {
+        let generation = self.driver.generate(request, &mut |_: u32, piece: &str| {
             on_token(piece);
             GenerationControl::Continue(())
         })?;
+        if let Some(timing) = generation.timing {
+            self.decode = self.decode + timing.decode;
+        }
         Ok(())
     }
 }
@@ -497,6 +599,14 @@ impl Generate for DriverCell {
             text: window.render(tokens, wall),
             device_time: device_time_receipt(&window),
         })
+    }
+
+    fn decode_phase(&self) -> PhaseTiming {
+        self.decode
+    }
+
+    fn ceiling(&self) -> Option<Ceiling> {
+        self.driver.ceiling()
     }
 
     fn engine(&self) -> Engine {
@@ -584,12 +694,17 @@ fn open_driver(
         open_executor(backend)
     }
     .context("open the executor")?;
-    let mut driver = Driver::new(
+    let driver = Driver::new(
         Arc::clone(&handle),
         executor,
         driver_options(capacity, chunk)?,
     )
     .context("open the driver")?;
+    let mut driver = if config.roofline {
+        driver.with_phase_timing()
+    } else {
+        driver
+    };
     let initial = driver_counters(&driver);
     // Every entry the cell's prompts plan to is compiled and added before the first timed token.
     driver
@@ -608,6 +723,7 @@ fn open_driver(
             driver,
             initial,
             mark: None,
+            decode: PhaseTiming::default(),
         }),
         precision,
     ))
@@ -1033,6 +1149,7 @@ fn measure_single(
     }
 
     let mut runs = Vec::with_capacity(config.iters);
+    let decode_before = engine.decode_phase();
     let timed_start = Instant::now();
     for it in 0..config.iters {
         let run = run_once(engine)?;
@@ -1051,6 +1168,9 @@ fn measure_single(
     }
     let timed_wall = timed_start.elapsed();
     probe.repeated(&*engine);
+    let roofline = config
+        .roofline
+        .then(|| roofline_receipt(&*engine, decode_before));
 
     let device_time = if config.profile {
         let tokens = runs.iter().map(|run| run.tokens).sum();
@@ -1072,6 +1192,7 @@ fn measure_single(
         "gen_tokens": runs.last().map_or(0, |run| run.tokens),
         "iterations": config.iters,
         "device_time": device_time,
+        "roofline": roofline,
         "ttft_ms": round3(median(&ttft)),
         "tpot_ms": round3(median(&column(Run::tpot_ms))),
         "e2e_ms": round3(median(&column(|run| Some(run.e2e_ms)))),
@@ -1112,6 +1233,7 @@ fn measure_isl(
     if config.profile {
         engine.reset_profile();
     }
+    let decode_before = engine.decode_phase();
     let timed_start = Instant::now();
     let mut iters = Vec::with_capacity(config.iters);
     for _ in 0..config.iters {
@@ -1119,6 +1241,9 @@ fn measure_isl(
         iters.push(run.receipt());
     }
     probe.repeated(&*engine);
+    let roofline = config
+        .roofline
+        .then(|| roofline_receipt(&*engine, decode_before));
     let device_time = if config.profile {
         let tokens: usize = iters
             .iter()
@@ -1135,6 +1260,7 @@ fn measure_isl(
         "warmup_runs": warmup_runs,
         "iters": iters,
         "device_time": device_time,
+        "roofline": roofline,
     }))
 }
 
@@ -1209,7 +1335,10 @@ fn measure_curve(
             }
         }
     }
-    Ok(json!({ "osl": config.osl, "caveats": caveats, "curve": curve }))
+    let fit = config
+        .roofline
+        .then(|| roofline_fit(curve.iter().map(|point| &point["roofline"])));
+    Ok(json!({ "osl": config.osl, "caveats": caveats, "curve": curve, "roofline_fit": fit }))
 }
 
 /// Print the window and return its device time for the result line (`null` when nothing was profiled).
@@ -1305,6 +1434,10 @@ fn run(config: &Config) -> anyhow::Result<Value> {
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let config = match parse_args(&args)? {
+        Invocation::RooflineFit(files) => {
+            println!("{}", fit_over_result_files(&files)?);
+            return Ok(());
+        }
         Invocation::Version => {
             println!("poot-bench-runner {BUILD_SHA}");
             return Ok(());
@@ -1352,6 +1485,8 @@ mod tests {
     use std::cell::RefCell;
     use std::io::Write;
     use std::process::{Command, Stdio};
+
+    use poot_llm::driver::error::Unsupported;
 
     use super::*;
 
@@ -1487,7 +1622,7 @@ mod tests {
         let args: Vec<String> = args.into_iter().map(String::from).collect();
         match parse_args(&args).expect("test arguments parse") {
             Invocation::Run(config) => config,
-            Invocation::Version => unreachable!("no --version"),
+            Invocation::Version | Invocation::RooflineFit(_) => unreachable!("no --version"),
         }
     }
 
@@ -1510,7 +1645,7 @@ mod tests {
                 sum_of_dispatch_durations: sum,
                 device_span: span,
             },
-            detail: poot_profile::Coverage::Unavailable,
+            detail: poot_runtime_common::Coverage::Unavailable,
             buckets: Default::default(),
             perturbed: false,
         }
@@ -2022,7 +2157,7 @@ mod tests {
         let gguf_dir = ["poot-bench-runner", "--model-dir", "/m/model.gguf"].map(String::from);
         match parse_args(&gguf_dir).unwrap() {
             Invocation::Run(config) => assert!(matches!(config.weights, Weights::Gguf(_))),
-            Invocation::Version => unreachable!(),
+            Invocation::Version | Invocation::RooflineFit(_) => unreachable!(),
         }
 
         // These used to fall back to the default silently and measure something else.
@@ -2282,7 +2417,7 @@ mod preparation_tests {
         let args: Vec<String> = args.into_iter().map(String::from).collect();
         match parse_args(&args).expect("test arguments parse") {
             Invocation::Run(config) => config,
-            Invocation::Version => unreachable!("no --version"),
+            Invocation::Version | Invocation::RooflineFit(_) => unreachable!("no --version"),
         }
     }
 
@@ -2478,5 +2613,156 @@ mod preparation_tests {
             json!(PreparedState::ALL.map(PreparedState::label))
         );
         assert_eq!(harness[1], json!(PREPARATION_LAYERS));
+    }
+}
+
+#[cfg(test)]
+mod roofline_tests {
+    use super::*;
+
+    /// An engine with a settled decode window and (maybe) a pinned ceiling; nothing else is read.
+    struct Timed {
+        decode: PhaseTiming,
+        ceiling: Option<Ceiling>,
+    }
+
+    impl Generate for Timed {
+        fn encode(&self, _text: &str) -> anyhow::Result<Vec<u32>> {
+            unreachable!("the roofline receipt reads the decode window only")
+        }
+
+        fn generate_context(
+            &mut self,
+            _context: &[u32],
+            _max_new: usize,
+            _on_token: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<()> {
+            unreachable!("the roofline receipt reads the decode window only")
+        }
+
+        fn generate_prompt(
+            &mut self,
+            _prompt: &str,
+            _max_new: usize,
+            _prefill: bool,
+            _on_token: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<()> {
+            unreachable!("the roofline receipt reads the decode window only")
+        }
+
+        fn reset_profile(&mut self) {}
+
+        fn profile_report(&self, _tokens: usize, _wall: Duration) -> Option<Profile> {
+            None
+        }
+
+        fn steps(&self) -> u64 {
+            0
+        }
+
+        fn decode_phase(&self) -> PhaseTiming {
+            self.decode
+        }
+
+        fn ceiling(&self) -> Option<Ceiling> {
+            self.ceiling
+        }
+
+        fn engine(&self) -> Engine {
+            Engine::Driver
+        }
+    }
+
+    fn ceiling() -> Ceiling {
+        Ceiling::pinned("amdgcn-gfx1151").expect("the checked-in table pins gfx1151")
+    }
+
+    fn window(tokens: usize, ms: u64, bytes: u64) -> PhaseTiming {
+        PhaseTiming {
+            tokens,
+            wall: Duration::from_millis(ms),
+            bytes,
+        }
+    }
+
+    fn kind(value: &Value) -> &str {
+        value["kind"].as_str().expect("a typed receipt")
+    }
+
+    /// A window the engine measured is `measured` with the engine's own figures; an uncalibrated
+    /// device, a window with no decoded token and one with no bytes are each the typed `unknown`, never
+    /// a zero. Mutation: report `measured` whenever a ceiling exists.
+    #[test]
+    fn the_roofline_receipt_is_measured_only_for_a_measured_window_on_a_calibrated_device() {
+        // 10 tokens, 100 ms, 1 GB: 10 ms/token and 100 MB/token = 10 GB/s.
+        let measured = Timed {
+            decode: window(10, 100, 1_000_000_000),
+            ceiling: Some(ceiling()),
+        };
+        let receipt = roofline_receipt(&measured, PhaseTiming::default());
+        assert_eq!(kind(&receipt), "measured");
+        assert_eq!(receipt["decode_tokens"], 10);
+        assert!((receipt["ms_per_token"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+        assert!((receipt["achieved_gb_per_s"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+
+        let uncalibrated = Timed {
+            ceiling: None,
+            ..measured
+        };
+        assert_eq!(
+            kind(&roofline_receipt(&uncalibrated, PhaseTiming::default())),
+            "unknown"
+        );
+        // The window is the difference of two readings: nothing decoded since `before`.
+        let before = window(10, 100, 1_000_000_000);
+        assert_eq!(kind(&roofline_receipt(&measured, before)), "unknown");
+        let no_bytes = Timed {
+            decode: window(10, 100, 0),
+            ceiling: Some(ceiling()),
+        };
+        assert_eq!(
+            kind(&roofline_receipt(&no_bytes, PhaseTiming::default())),
+            "unknown"
+        );
+    }
+
+    /// The fit is measured over two or more spread points and unknown otherwise (one point, no spread in
+    /// bytes, a point with no roofline). Mutation: report `measured` for a single point.
+    #[test]
+    fn the_fit_is_measured_over_spread_points_and_unknown_otherwise() {
+        let point = |gb: f64, ms: f64| json!({ "bytes_per_token": gb * GB, "ms_per_token": ms });
+        let line = [point(1.0, 5.0), point(2.0, 8.0), point(4.0, 14.0)];
+        let fit = roofline_fit(&line);
+        assert_eq!(kind(&fit), "measured");
+        assert_eq!(fit["points"], 3);
+        assert!((fit["ms_per_gb"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+        assert!((fit["fixed_ms"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+        assert!((fit["r2"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+
+        assert_eq!(kind(&roofline_fit(&line[..1])), "unknown");
+        let flat = [point(1.0, 5.0), point(1.0, 6.0)];
+        assert_eq!(kind(&roofline_fit(&flat)), "unknown");
+        let unmeasured = [point(1.0, 5.0), json!({ "kind": "unknown" })];
+        assert_eq!(kind(&roofline_fit(&unmeasured)), "unknown");
+    }
+
+    /// `--roofline-fit` reads each file's last result line and fits their rooflines: two models on a
+    /// known line `ms = 3 * GB + 2` recover it. Mutation: read the first line of each file.
+    #[test]
+    fn the_fit_producer_reads_the_last_result_line_of_each_file() {
+        let dir = std::env::temp_dir().join(format!("poot-roofline-fit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, gb: f64, ms: f64| {
+            let path = dir.join(name);
+            let line = json!({ "roofline": { "bytes_per_token": gb * GB, "ms_per_token": ms } });
+            std::fs::write(&path, format!("{{\"log\": \"not a result\"}}\n{line}\n")).unwrap();
+            path.display().to_string()
+        };
+        let files = [write("a.json", 1.0, 5.0), write("b.json", 3.0, 11.0)];
+        let fit = fit_over_result_files(&files).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(kind(&fit), "measured");
+        assert!((fit["ms_per_gb"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+        assert!((fit["fixed_ms"].as_f64().unwrap() - 2.0).abs() < 1e-9);
     }
 }

@@ -17,8 +17,8 @@ use std::sync::{Arc, RwLock};
 use poot_executor::{Collectives, Coordinator, Device, Executor, SharedKernelsMismatch};
 use poot_graph_plan::multi_device::DeviceSpec;
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, DeviceId, DevicePlacement, Refusal, ShardRule, Submission,
-    TargetSet,
+    CompileLimits, CompileOptions, Refusal, ShardRule, multi_device::topology::DeviceId,
+    production_plan::Submission, staged::DevicePlacement, staged::TargetSet,
 };
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_llm::driver::capacity::{
@@ -288,16 +288,6 @@ impl EngineHealth {
         )
     }
 
-    /// A health already `Serving`, for the routes that need an engine in the state they run in.
-    #[cfg(test)]
-    pub(crate) fn serving_for_test(backend: &str, rows: usize, max_seq: usize) -> Self {
-        Self(Arc::new(RwLock::new(EngineState::Serving {
-            backend: backend.to_string(),
-            rows,
-            max_seq,
-        })))
-    }
-
     /// Publish `Serving` for `plan`. Called after `prepare` and the live accounting, never before.
     fn serving(&self, plan: &EnginePlan) {
         let max_seq = match plan.workload {
@@ -424,7 +414,7 @@ fn driver_options(
         decode: compile,
         capacity: max_seq,
         prefill_chunk: chunk,
-        max_trace_tokens: chunk,
+        trace: poot_llm::driver::serving_trace_limits(chunk),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(MAX_ENTRIES).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(MAX_RETAINED_BYTES).expect("nonzero"),
@@ -750,3 +740,19 @@ fn fit_and_prepare(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl EngineHealth {
+        /// A health already `Serving`, for the routes that need an engine in the state they run in.
+        pub(crate) fn serving_for_test(backend: &str, rows: usize, max_seq: usize) -> Self {
+            Self(Arc::new(RwLock::new(EngineState::Serving {
+                backend: backend.to_string(),
+                rows,
+                max_seq,
+            })))
+        }
+    }
+}

@@ -1,13 +1,13 @@
 //! Split-KV decode attention through the production planner (POOT-1113): the scratch contract, the buffer
 //! plan that colors it, and the fall back to the streaming schedule when the split does not fit. No device:
-//! the device rows (`poot-gpu`, `poot-rocm-gpu`) run the same graphs through each executor.
+//! the device rows (`poot-wgpu-device`, `poot-rocm-device`) run the same graphs through each executor.
 //!
 //! Every row drives `compile` over a traced decode graph; none builds a `DispatchPlan` by hand.
 
 use poot_graph_ir::{AttentionAttrs, Builder, Graph, OpKind, Slot, TensorType};
 use poot_graph_plan::{
     CompileError, CompileOptions, DispatchPlan, KernelChoice, Plan, PlanError, Program, ScratchId,
-    Sink, Source, Submission, Target, compile, value_ids,
+    Sink, Source, Target, compile, production_plan::Submission, value_ids,
 };
 use poot_kernelgen::{AttentionSchedule, AttentionSpec, KernelRequest};
 use poot_target::{AmdArch, Backend, DeviceCaps};
@@ -35,21 +35,29 @@ fn targets() -> Vec<(&'static str, Target)> {
 /// of width `d` against a `cap`-key cache each. K and V are activation inputs, so they are not bound by
 /// the constant size gate and a device whose buffer limit is below the cache still plans the graph.
 fn decode_chain(layers: usize, hq: usize, cap: usize, d: usize) -> Graph {
-    let b = Builder::new();
-    let mut q = b.slot_named(Slot::Activation, "q", TensorType::f32(vec![1, hq, 1, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
+    let b = Builder::for_tests();
+    let mut q = b
+        .slot_named(Slot::Activation, "q", TensorType::f32(vec![1, hq, 1, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
     for layer in 0..layers {
-        let k = b.slot_named(
-            Slot::Activation,
-            &format!("k{layer}"),
-            TensorType::f32(vec![1, hq, cap, d]),
-        );
-        let v = b.slot_named(
-            Slot::Activation,
-            &format!("v{layer}"),
-            TensorType::f32(vec![1, hq, cap, d]),
-        );
-        q = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, 0.125, mask);
+        let k = b
+            .slot_named(
+                Slot::Activation,
+                &format!("k{layer}"),
+                TensorType::f32(vec![1, hq, cap, d]),
+            )
+            .unwrap();
+        let v = b
+            .slot_named(
+                Slot::Activation,
+                &format!("v{layer}"),
+                TensorType::f32(vec![1, hq, cap, d]),
+            )
+            .unwrap();
+        q = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, 0.125, mask).unwrap();
     }
     b.finish(q).unwrap()
 }
@@ -129,21 +137,29 @@ fn a_live_decode_over_a_declared_position_slot_plans_the_split_schedule() {
     use poot_graph_ir::ops::{AttentionKeys, attention_live, causal_mask_from_pos};
 
     let (hq, cap, d) = (2usize, 1024usize, 64usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-    let pos = b.slot_ranged(
-        Slot::Pos,
-        TensorType::new(vec![1, 1], poot_tensor::DType::I32),
-        IndexRange::below(cap).expect("a non-empty range"),
-    );
-    let mask = causal_mask_from_pos(&b, pos, cap, None);
-    let len = b.binary_scalar(
-        poot_graph_ir::BinOp::Add,
-        b.reshape(pos, vec![1]),
-        poot_graph_ir::Scalar::I32(1),
-    );
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let pos = b
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![1, 1], poot_tensor::DType::I32),
+            IndexRange::below(cap).expect("a non-empty range"),
+        )
+        .unwrap();
+    let mask = causal_mask_from_pos(&b, pos, cap, None).unwrap();
+    let len = b
+        .binary_scalar(
+            poot_graph_ir::BinOp::Add,
+            b.reshape(pos, vec![1]).unwrap(),
+            poot_graph_ir::Scalar::I32(1),
+        )
+        .unwrap();
     let live = attention_live(
         &b,
         q,
@@ -260,12 +276,20 @@ fn the_scratch_is_colored_with_the_values_and_reused_across_layers() {
 /// One `Attention` equation staged directly (not recognized from primitives), so a planner refusal is the
 /// typed error `compile` returns and not a fusion pass quietly reverting to the decomposed chain.
 fn staged_decode(hq: usize, cap: usize, d: usize) -> Graph {
-    let b = Builder::new();
-    let q = b.slot_named(Slot::Activation, "q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.slot_named(Slot::Activation, "k", TensorType::f32(vec![1, hq, cap, d]));
-    let v = b.slot_named(Slot::Activation, "v", TensorType::f32(vec![1, hq, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-    let mut plan = b.append_plan(0);
+    let b = Builder::for_tests();
+    let q = b
+        .slot_named(Slot::Activation, "q", TensorType::f32(vec![1, hq, 1, d]))
+        .unwrap();
+    let k = b
+        .slot_named(Slot::Activation, "k", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let v = b
+        .slot_named(Slot::Activation, "v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
+    let mut plan = b.append_plan(0).unwrap();
     let out = plan
         .equation(
             OpKind::Attention(AttentionAttrs::new(1, 0.125, None)),

@@ -13,7 +13,6 @@ use std::num::NonZeroUsize;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -36,8 +35,9 @@ use crate::names::{
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_quant::weights::ExpertProj;
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("llama");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("llama");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -126,7 +126,7 @@ const TOP_K: Field = Field::new("num_experts_per_tok", "llama.expert_used_count"
 
 /// llama's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct LlamaParams {
+pub(crate) struct LlamaParams {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -145,7 +145,7 @@ pub struct LlamaParams {
 }
 
 impl LlamaParams {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
         // `attention_bias` biases the output projection too, which no weight role carries yet.
@@ -224,7 +224,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Llama {
+pub(crate) struct Llama {
     params: LlamaParams,
     weights: WeightMap,
     stack: StackWeights,
@@ -306,17 +306,16 @@ impl Model for Llama {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         let phase = check_embeddable_step(FAMILY, phase, shape, p.max_positions)?;
         if let Some(params) = &p.moe {
             moe::check_step(FAMILY, shape, params)?;
         }
-        let b = Builder::new();
         let step = match phase {
-            EmbeddablePhase::Prefill | EmbeddablePhase::Decode => Step::new(&b, shape),
-            EmbeddablePhase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width),
-            EmbeddablePhase::Encode => Step::new(&b, shape).returning_hidden(),
+            EmbeddablePhase::Prefill | EmbeddablePhase::Decode => Step::new(&b, shape)?,
+            EmbeddablePhase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width)?,
+            EmbeddablePhase::Encode => Step::new(&b, shape)?.returning_hidden(),
         };
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
@@ -331,7 +330,7 @@ impl Model for Llama {
                     Ffn::Routed(w, params) => moe::moe(b, &step, l, h, None, w, params),
                 },
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -566,7 +565,11 @@ mod tests {
             let model = registry.build(&raw, &fx.store).unwrap();
             graphs.push(
                 model
-                    .trace(Phase::Prefill, step_shape(3, CAP, LogitRows::All))
+                    .trace(
+                        Phase::Prefill,
+                        step_shape(3, CAP, LogitRows::All),
+                        poot_graph_ir::TraceLimits::for_tests(),
+                    )
                     .unwrap(),
             );
         }
@@ -896,11 +899,19 @@ mod tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(1, 2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(1, 2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }
@@ -914,6 +925,9 @@ mod moe_tests {
     use serde_json::json;
 
     use super::*;
+    use crate::architectures::olmoe::moe_support::{
+        GgufName, assert_bf16_and_q8_0_experts_trace_and_match, gguf_checkpoint,
+    };
     use crate::components::standard::oracle::run_step;
     use crate::components::testing::{
         CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
@@ -921,9 +935,6 @@ mod moe_tests {
         read_back_owned, values,
     };
     use crate::model::Phase;
-    use crate::olmoe::moe_support::{
-        GgufName, assert_bf16_and_q8_0_experts_trace_and_match, gguf_checkpoint,
-    };
     use crate::registry::{LoadModelError, Registry};
 
     use super::FIXTURE_EXPERTS as EXPERTS;

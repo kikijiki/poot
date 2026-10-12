@@ -25,8 +25,8 @@ diverge late, in three places:
   packets; PTX replays CUDA graphs through [cudarc](https://github.com/coreylowman/cudarc).
 
 All backends implement the backend-neutral executor contract (`poot-executor`: one generic
-`Engine<D>` over a thin `Device` trait): `poot-gpu`'s `WgpuDevice`, `poot-rocm-gpu`'s `RocmDevice`,
-`poot-ptx-gpu`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice` (raw Vulkan, verified on AMD RADV only). A dev-only table-driven parity crate (`poot-executor-parity`) runs
+`Engine<D>` over a thin `Device` trait): `poot-wgpu-device`'s `WgpuDevice`, `poot-rocm-device`'s `RocmDevice`,
+`poot-ptx-device`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice` (raw Vulkan, verified on AMD RADV only). A dev-only table-driven parity crate (`poot-executor-parity`) runs
 the same fixture programs through the `Executor` on any `Device`. See [Execution](./execution) for
 the contract's shape.
 
@@ -98,5 +98,5 @@ grids, tensor-core matmul, compute dtype) are in its
 ## Correctness across backends
 
 Every backend is checked against the CPU oracle (`poot-eval`): per-backend executor tests dispatch
-kernels with identical inputs and compare to the oracle, and `poot-ptx-check` and `poot-rocm-check` do
-the same on real hardware. See [Execution](./execution#verification).
+kernels with identical inputs and compare to the oracle, and the `ptx-check` and `rocm-check`
+binaries of the PTX and ROCm device crates do the same on real hardware. See [Execution](./execution#verification).

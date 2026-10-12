@@ -340,6 +340,7 @@ impl FormatDescriptor {
 
     /// Decode logical coordinate `[o, k]` of a planar weight of `shape` from its source tensors.
     /// Every operand the format has must be in `sources` with its exact byte length.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn decode_planar_value(
         &self,
         shape: [usize; 2],

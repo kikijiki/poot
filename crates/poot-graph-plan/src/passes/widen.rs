@@ -1,7 +1,10 @@
 use poot_graph_ir::op::{FusedOp, FusedOperand, FusedStep};
 
 use super::fuse::{is_i32_pointwise, lone_pointwise_region};
-use super::*;
+use super::{
+    DType, EditError, Eqn, FusedRegion, Graph, HashMap, HashSet, OpKind, Operand, RowRegion,
+    RowStep, Storage, ValueId, with_eqns,
+};
 use poot_graph_ir::ValueTable;
 use poot_graph_ir::graph::GraphEdit;
 
@@ -19,7 +22,7 @@ use poot_graph_ir::graph::GraphEdit;
 /// reader and is not pinned, and the BF16 const it widens has the cast as its one reader, so the const's
 /// every reader is a packed reader ([`crate::bf16_const_feeds_only_packed_readers`]). Pointwise
 /// [`OpKind::Fused`] regions are left as they are: their kernels read every leaf as f32.
-pub fn fuse_widening_casts(g: &Graph) -> Result<Graph, EditError> {
+pub(crate) fn fuse_widening_casts(g: &Graph) -> Result<Graph, EditError> {
     let mut producer: ValueTable<Option<usize>> = ValueTable::filled(g.values().len(), None);
     let mut uses: ValueTable<usize> = ValueTable::filled(g.values().len(), 0);
     for (e, eqn) in g.eqns().iter().enumerate() {
@@ -185,7 +188,7 @@ fn widen_row_input(region: &mut RowRegion, input: usize, to: DType) {
 /// computes what it computed over the stored value. A producer fold needs the cast to be the producer's one
 /// reader and the producer's output unpinned; the cast's own result may be pinned (it reuses the region's
 /// output). A consumer fold needs the cast's result and each view's unpinned.
-pub fn fuse_index_casts(g: &Graph) -> Result<Graph, EditError> {
+pub(crate) fn fuse_index_casts(g: &Graph) -> Result<Graph, EditError> {
     let mut folded = g.edit();
     while let Some(next) = fold_one_index_cast(&folded) {
         folded = next;

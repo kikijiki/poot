@@ -1,5 +1,12 @@
-/// The pre-`compile` IR passes alone, in the former `optimize()` pipeline's
-/// order (deleted with card 626 - `poot_graph_plan::compile` is the one pipeline now, but it also
-/// needs a `Target`, which this crate's own fusion/flash-shape tests never had). Backend-free.
-#[cfg(test)]
-pub(crate) use poot_graph_plan::passes_without_target as optimize;
+//! Fixtures built through the shipped tracers, for the tests, benches and examples of every crate above the
+//! tracers (ADR-0113: a fixture lives in the crate that owns what it exercises; `poot-executor-parity` sits
+//! below this crate and holds only the model-free parity machinery).
+
+#[cfg(feature = "test-support")]
+pub mod dense;
+#[cfg(feature = "test-support")]
+pub mod fixtures;
+#[cfg(feature = "test-support")]
+pub mod pipeline;
+#[cfg(feature = "test-support")]
+pub mod weight_map;

@@ -1,9 +1,9 @@
 //! Dispatch poot-emitted NVPTX kernels on NVIDIA via cudarc's raw driver API (G3a).
 //!
-//! The CUDA analogue of `poot-runtime`'s wgpu surface, used by the PTX graph executor (G3b) and
+//! The CUDA analogue of `poot-wgpu-runtime`'s wgpu surface, used by the PTX graph executor (G3b) and
 //! capture/replay (G3c). Intermediates stay on the GPU across dispatches: upload inputs once, dispatch
 //! reading/writing persistent [`PtxBuffer`]s, download only the final output. The kernel ABI matches
-//! poot-codegen's NVPTX emitter and `poot-ptx-check`: each slice param lowers to `(ptr addrspace(1), i64 len)`
+//! poot-codegen's NVPTX emitter and `ptx-check`: each slice param lowers to `(ptr addrspace(1), i64 len)`
 //! in declaration order, inputs first and the single writable output last.
 //!
 //! cudarc uses `dynamic-loading` (it dlopens `libcuda.so.1`), so this builds without a CUDA toolkit and only
@@ -32,8 +32,8 @@
 //! constructor is `unsafe`, called only by `poot-codegen`, so safe code here cannot mint one.
 //!
 //! ```compile_fail,E0133
-//! fn from_any_text(text: &str) -> poot_ptx_runtime::CompiledKernel {
-//!     poot_ptx_runtime::CompiledKernel::new(
+//! fn from_any_text(text: &str) -> poot_runtime_common::CompiledKernel {
+//!     poot_runtime_common::CompiledKernel::new(
 //!         poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
 //!         "add",
 //!         poot_runtime_common::KernelCode::Ptx(text.into()),
@@ -44,8 +44,8 @@
 //! ```
 //!
 //! ```compile_fail,E0451
-//! fn forge(code: poot_runtime_common::KernelCode) -> poot_ptx_runtime::CompiledKernel {
-//!     poot_ptx_runtime::CompiledKernel {
+//! fn forge(code: poot_runtime_common::KernelCode) -> poot_runtime_common::CompiledKernel {
+//!     poot_runtime_common::CompiledKernel {
 //!         target: poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
 //!         entry_point: "add".into(),
 //!         code,
@@ -65,29 +65,12 @@ mod graph;
 mod owner;
 mod upload;
 
-pub use buffer::{AllocGuard, BufferRole, MemoryCounterSnapshot, PtxBuffer};
+pub use buffer::PtxBuffer;
 pub use context::PtxContext;
-pub use error::{BufferElement, BufferStorage, LogicalDType, PtxError, StorageLayout};
+pub use error::PtxError;
 pub use graph::{PtxGraphExec, PtxSpan, PtxSyncEvent};
 pub use owner::NativeCounters;
-/// The compiler-produced kernel handle every dispatch takes (card 608): re-exported so callers need not
-/// depend on `poot-runtime-common` directly just to name the type.
-pub use poot_runtime_common::CompiledKernel;
 pub use upload::UPLOAD_CHUNK_BYTES;
-
-#[cfg(test)]
-pub(crate) use {
-    buffer::{allocate_owned, checked_buffer, checked_copy, checked_layout},
-    cudarc::driver::{DriverError, result, sys},
-    driver::CudaDriver,
-    graph::{CaptureRetention, ModuleConstruction, create_event_pair, instantiate_graph},
-    owner::{PtxOwner, construct_owner},
-    std::collections::HashMap,
-    std::sync::Arc,
-};
-
-#[cfg(test)]
-pub(crate) use context::{KernelArgs, require_gpu_check_with};
 
 #[cfg(test)]
 mod tests;

@@ -6,9 +6,11 @@
 
 use poot_tensor::{DType, HostData, HostTensor};
 use std::collections::HashMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use poot_graph_ir::TraceLimits;
 use poot_graph_ir::decompose::{Decomposition, decompose};
 use poot_graph_ir::{
     ComputedConst, Eqn, Graph, OpClass, OpKind, Operand as IrOperand, ScanAttrs, TensorType,
@@ -16,9 +18,8 @@ use poot_graph_ir::{
 };
 
 use crate::exact_bf16::{self, ExactBf16TensorView};
-use crate::exact_dense;
 use crate::exact_value::ExactValue;
-use crate::observer::EvalObserver;
+use crate::observer::{EvalObserver, Publication};
 use crate::operand::{e4m3_tensor, env_value, host_tensor, i32_words, value_i32_words};
 use crate::ops::elementwise::{I32Operand, LaneOperand, SelectLane};
 use crate::resolve::Bf16Equation;
@@ -42,6 +43,7 @@ impl EvalBudget {
         max_alloc_bytes: None,
     };
 
+    #[cfg(any(test, feature = "test-support"))]
     pub const fn bounded(max_work_elements: u64, max_alloc_bytes: u64) -> Self {
         EvalBudget {
             max_work_elements: Some(max_work_elements),
@@ -169,18 +171,20 @@ pub fn eval(
 
     validate_environment(g, &env)?;
 
+    let observer = &mut opts.observer;
+    notify_published(observer, Publication::Output(g.result()));
     let output = publish_value(&env, g.result())?;
     let state = g
         .state()
         .map(|(state_in, state_out)| {
+            notify_published(observer, Publication::State(state_out));
             let value = publish_value(&env, state_out)?;
             check_state_storage(g, state_in, state_out, &value)?;
             Ok(value)
         })
         .collect::<Result<Vec<_>, EvalError>>()?;
     let environment = opts.keep_environment.then(|| {
-        #[cfg(test)]
-        publication_probe::record();
+        notify_published(&mut opts.observer, Publication::Environment);
         env.clone()
     });
 
@@ -191,11 +195,16 @@ pub fn eval(
     })
 }
 
+/// Tell the caller's observer, if any, what the walk is about to copy out.
+fn notify_published(observer: &mut Option<&mut dyn EvalObserver>, publication: Publication) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.published(publication);
+    }
+}
+
 /// Copy one value out of the completed environment for publication: the one place every output and
 /// state value leaves the walk, always after [`validate_environment`] has gated it.
 fn publish_value(env: &ValueTable<Option<Value>>, value: ValueId) -> Result<Value, EvalError> {
-    #[cfg(test)]
-    publication_probe::record();
     env.get(value)
         .and_then(Option::as_ref)
         .cloned()
@@ -251,8 +260,8 @@ fn check_state_storage(
     let expected = g.aval(state_in);
     let carrier_matches = match value {
         Value::Host(tensor) => tensor.dtype() == expected.dtype,
-        Value::Owner(ExactValue::Bf16(_)) => expected.dtype == DType::BF16,
-        Value::Owner(_) | Value::Packed(_) | Value::PackedStack(_) => false,
+        Value::Exact(ExactValue::Bf16(_)) => expected.dtype == DType::BF16,
+        Value::Exact(_) | Value::Packed(_) | Value::PackedStack(_) => false,
     };
     if !carrier_matches || value.shape().as_ref() != expected.shape.as_slice() {
         return Err(EvalError::Input {
@@ -284,11 +293,8 @@ fn check_published(g: &Graph, eqn: &Eqn, value: &Value) -> Result<(), EvalError>
     let shape_ok = value.shape().as_ref() == expected.shape.as_slice();
     let class_ok = match value {
         Value::Host(tensor) => tensor.dtype() == expected.dtype,
-        Value::Owner(ExactValue::Bf16(_)) => expected.dtype == DType::BF16,
-        Value::Owner(ExactValue::I32(_)) => expected.dtype == DType::I32,
-        Value::Owner(ExactValue::Dense(_)) => {
-            matches!(expected.dtype, DType::BF16 | DType::F32)
-        }
+        Value::Exact(ExactValue::Bf16(_)) => expected.dtype == DType::BF16,
+        Value::Exact(ExactValue::I32(_)) => expected.dtype == DType::I32,
         Value::Packed(_) | Value::PackedStack(_) => false,
     };
     debug_assert!(
@@ -315,7 +321,7 @@ fn check_published(g: &Graph, eqn: &Eqn, value: &Value) -> Result<(), EvalError>
 
 /// Fail-closed checks every bound input must pass before any equation runs: a host tensor must be of
 /// exactly the declared dtype and shape (a payload cannot disagree with its dtype, so no narrowing or
-/// widening happens at bind), and a non-output owner-backed exact-dense view must be consumed by an
+/// widening happens at bind), and a non-output exact-dense view must be consumed by an
 /// equation that actually reads it.
 fn preflight_bindings(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Result<(), EvalError> {
     for &id in g.inputs() {
@@ -340,10 +346,8 @@ fn preflight_bindings(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Result<(),
                     got: "Value::Host of a different dtype",
                 });
             }
-            (DType::F32 | DType::BF16 | DType::F16, Value::Owner(ExactValue::Dense(view)))
-                if view.dtype() == aval.dtype => {}
-            (DType::BF16, Value::Owner(ExactValue::Bf16(_))) => {}
-            (DType::I32, Value::Owner(ExactValue::I32(_))) => {}
+            (DType::BF16, Value::Exact(ExactValue::Bf16(_))) => {}
+            (DType::I32, Value::Exact(ExactValue::I32(_))) => {}
             (DType::I8, Value::Packed(_) | Value::PackedStack(_)) => {}
             (_, other) => {
                 return Err(EvalError::Input {
@@ -357,10 +361,7 @@ fn preflight_bindings(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Result<(),
             check_declared_range(id, value, range)?;
         }
     }
-    // Card 396: a BF16/F32 owner view may feed only a Spec 376 BF16 equation (via `classify`), else it
-    // is a refused `GraphConsumer`; every owner view not consumed by one, and not the graph's output,
-    // is an unconsumed non-output binding.
-    exact_dense::validate_exact_dense_bindings(g, inputs)
+    Ok(())
 }
 
 /// A slot's declared range is a fact its consumers use ([`poot_graph_ir::value_ranges`]), so the bound
@@ -372,7 +373,7 @@ fn check_declared_range(
     range: poot_graph_ir::IndexRange,
 ) -> Result<(), EvalError> {
     let words = match value {
-        Value::Owner(ExactValue::I32(view)) => std::borrow::Cow::Borrowed(view.i32_words()),
+        Value::Exact(ExactValue::I32(view)) => std::borrow::Cow::Borrowed(view.i32_words()),
         Value::Host(tensor) => crate::operand::host_i32_words(tensor, id)?,
         other => {
             return Err(EvalError::Input {
@@ -497,6 +498,18 @@ fn evaluate_equation(
 // Composite: evaluated through its decomposition (ADR-0101 tier 1, Card 556)
 // ---------------------------------------------------------------------------------------------
 
+/// What the decomposition of one composite equation may construct. The largest a real graph needs is a
+/// scan unrolled over its chunks (a few thousand equations for a 4096-token prefill); these caps are far
+/// above that and far below what exhausts a host. `max_tokens` is the bound a model trace applies to its
+/// step and means nothing to a decomposition, which has no steps.
+const DECOMPOSITION_LIMITS: TraceLimits = TraceLimits {
+    max_tokens: NonZeroUsize::MIN,
+    max_values: NonZeroUsize::new(1 << 20).unwrap(),
+    max_eqns: NonZeroUsize::new(1 << 20).unwrap(),
+    max_literal_bytes: NonZeroU64::new(1 << 26).unwrap(),
+    max_owned_bytes: NonZeroU64::new(1 << 30).unwrap(),
+};
+
 /// The decompositions one [`eval`] call has built, by operand types and then op: a qwen2 decode graph
 /// holds hundreds of `Fused` equations, most of them one of a few regions over the same types, so each
 /// distinct (op, operand types) is decomposed once per call.
@@ -506,18 +519,26 @@ struct Decompositions {
 }
 
 impl Decompositions {
-    fn get(&mut self, op: &OpKind, operands: Vec<TensorType>) -> Option<Rc<Decomposition>> {
+    /// The decomposition of `op` over `operands`: `Ok(None)` when the operation has none.
+    fn get(
+        &mut self,
+        op: &OpKind,
+        operands: Vec<TensorType>,
+    ) -> Result<Option<Rc<Decomposition>>, poot_graph_ir::BuilderError> {
         if let Some(built) = self.by_operand_types.get(&operands)
             && let Some((_, decomposition)) = built.iter().find(|(built_op, _)| built_op == op)
         {
-            return Some(Rc::clone(decomposition));
+            return Ok(Some(Rc::clone(decomposition)));
         }
-        let decomposition = Rc::new(decompose(op, &operands)?);
+        let Some(decomposition) = decompose(op, &operands, DECOMPOSITION_LIMITS)? else {
+            return Ok(None);
+        };
+        let decomposition = Rc::new(decomposition);
         self.by_operand_types
             .entry(operands)
             .or_default()
             .push((op.clone(), Rc::clone(&decomposition)));
-        Some(decomposition)
+        Ok(Some(decomposition))
     }
 }
 
@@ -568,10 +589,17 @@ fn evaluate_composite(
         }
         op => decompositions
             .get(op, operand_types)
-            .ok_or_else(|| EvalError::Unsupported {
+            .map_err(|source| EvalError::Decomposition {
                 eqn: eqn.out,
                 op: resolve::op_label(op),
-                detail: "the composite has no decomposition for its operand types".into(),
+                source: Box::new(source),
+            })
+            .and_then(|decomposition| {
+                decomposition.ok_or_else(|| EvalError::Unsupported {
+                    eqn: eqn.out,
+                    op: resolve::op_label(op),
+                    detail: "the composite has no decomposition for its operand types".into(),
+                })
             })
             .and_then(|decomposition| {
                 run_decomposition(&decomposition, bound, idx, opts, decompositions)
@@ -662,14 +690,18 @@ fn evaluate_scan(
                 value.clone()
             });
         }
-        let decomposition =
-            decompositions
-                .get(&eqn.op, window_types)
-                .ok_or_else(|| EvalError::Unsupported {
-                    eqn: eqn.out,
-                    op: "scan",
-                    detail: "the scan has no decomposition for its chunk window".into(),
-                })?;
+        let decomposition = decompositions
+            .get(&eqn.op, window_types)
+            .map_err(|source| EvalError::Decomposition {
+                eqn: eqn.out,
+                op: "scan",
+                source: Box::new(source),
+            })?
+            .ok_or_else(|| EvalError::Unsupported {
+                eqn: eqn.out,
+                op: "scan",
+                detail: "the scan has no decomposition for its chunk window".into(),
+            })?;
         let packed = run_decomposition(&decomposition, window, idx, opts, decompositions)?;
         let len = end - start;
         parts.push(packed.slice(2, 0, len)?);
@@ -767,7 +799,7 @@ fn evaluate_cast(
         }
         (DType::BF16, DType::F32) => {
             if let Value::Host(tensor) = env_value(env, input_id)? {
-                // An explicit (non-owner) BF16 value: its words widen exactly; no owner table to
+                // A plain host BF16 value: its words widen exactly; no exact view to
                 // materialize, so no budget charge.
                 return Ok(Value::Host(HostTensor::f32(
                     out_shape.clone(),
@@ -780,7 +812,7 @@ fn evaluate_cast(
             let data = crate::operand::initialized_arc_slice(elements, |flat| view.value(flat));
             Ok(Value::Host(HostTensor::f32_arc(out_shape.clone(), data)))
         }
-        // F16 has no owner/exact carrier (unlike BF16): its words widen exactly.
+        // F16 has no exact carrier (unlike BF16): its words widen exactly.
         (DType::F16, DType::F32) => {
             let tensor = host_tensor(eqn, 0, env)?;
             Ok(Value::Host(HostTensor::f32(
@@ -919,7 +951,7 @@ fn evaluate_cast(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Gather: data-carrier-aware (I32 index over I32/dense/owner data; E4M3FN)
+// Gather: data-carrier-aware (I32 index over I32/dense/exact data; E4M3FN)
 // ---------------------------------------------------------------------------------------------
 
 fn evaluate_gather(
@@ -959,7 +991,7 @@ fn evaluate_gather(
             axis,
             eqn.out,
         )?)),
-        Value::Owner(ExactValue::I32(view)) => {
+        Value::Exact(ExactValue::I32(view)) => {
             let words = view.i32_words();
             let out = ops::gather::gather(
                 |i| words[i],
@@ -972,17 +1004,12 @@ fn evaluate_gather(
             )?;
             Ok(Value::Host(HostTensor::i32_arc(out_shape, out)))
         }
-        Value::Owner(exact @ (ExactValue::Dense(_) | ExactValue::Bf16(_))) => {
-            let out = ops::gather::gather_owner(
-                exact,
-                index_at_pos,
-                index_len,
-                &index_shape,
-                axis,
-                eqn.out,
-            )?;
-            Ok(Value::Host(HostTensor::f32_arc(out_shape, out)))
-        }
+        // A `Value::Exact(Bf16)` is only ever bound to, or produced for, a BF16-typed value
+        // (`preflight_bindings` and the Spec 376 equations), `Gather` infers only I32 ids, and
+        // `classify` routes every such `Gather` through `evaluate_bf16` above.
+        Value::Exact(ExactValue::Bf16(_)) => unreachable!(
+            "a Gather of a BF16 table is the Spec 376 Gather equation, classified before this match"
+        ),
         Value::Packed(_) | Value::PackedStack(_) => {
             Err(EvalError::Packed(crate::PackedEvalError::WrongConsumer {
                 operation: "Gather",
@@ -1046,12 +1073,12 @@ fn evaluate_bf16(
                 table.word(source_flat(flat))
             });
             let view = ExactBf16TensorView::from_derived(words, out_shape.clone())?;
-            Ok(Value::Owner(ExactValue::Bf16(view)))
+            Ok(Value::Exact(ExactValue::Bf16(view)))
         }
-        Bf16Equation::Reshape { shape } => Ok(Value::Owner(ExactValue::Bf16(
+        Bf16Equation::Reshape { shape } => Ok(Value::Exact(ExactValue::Bf16(
             crate::operand::bf16_view(eqn, 0, env)?.reshape(shape.to_vec())?,
         ))),
-        Bf16Equation::Transpose { perm } => Ok(Value::Owner(ExactValue::Bf16(
+        Bf16Equation::Transpose { perm } => Ok(Value::Exact(ExactValue::Bf16(
             crate::operand::bf16_view(eqn, 0, env)?.transpose(perm),
         ))),
         Bf16Equation::WeightMatMul => {
@@ -1060,7 +1087,7 @@ fn evaluate_bf16(
             let elements: usize = out_shape.iter().product();
             opts.charge(eqn.out, idx, DType::F32, elements, elements * 4)?;
             let mut data = crate::operand::initialized_arc_slice(elements, |_| 0.0f32);
-            // The weight is a BF16 host tensor or an owner-backed view; both read through the same
+            // The weight is a BF16 host tensor or an exact view; both read through the same
             // exact BF16 view, never widened ahead of the contraction.
             let weight = crate::operand::bf16_view(eqn, 1, env)?;
             ops::contraction::matmul_accumulate(
@@ -1185,7 +1212,7 @@ fn evaluate_e4m3(
 fn i32_tensor(id: ValueId, env: &ValueTable<Option<Value>>) -> Result<HostTensor, EvalError> {
     match env_value(env, id)? {
         Value::Host(tensor) => Ok(tensor.clone()),
-        Value::Owner(ExactValue::I32(view)) => Ok(HostTensor::i32_arc(
+        Value::Exact(ExactValue::I32(view)) => Ok(HostTensor::i32_arc(
             view.shape().to_vec(),
             Arc::clone(view.word_owner()),
         )),
@@ -1221,7 +1248,7 @@ fn evaluate_dense(
             }
         }
     };
-    // The operand a site that only moves elements reads: an owner-backed BF16 view (what a reshape or
+    // The operand a site that only moves elements reads: an exact BF16 view (what a reshape or
     // transpose of a BF16 value is) materializes as its own two-byte words, never as the F32 values
     // arithmetic reads, so a NaN payload reaches the output unchanged and the parts of a concat agree.
     let stored = |operand: &IrOperand| match operand {
@@ -1447,21 +1474,19 @@ fn evaluate_dense(
     Ok(Value::Host(result))
 }
 
-/// An F32-lane reading of operand `id`: a plain `Value::Host`, or an owner-backed exact BF16/F32
+/// An F32-lane reading of operand `id`: a plain `Value::Host`, or an exact BF16/F32
 /// view materialized once (card 396's "one-equation dense bridge", folded into the common dense path
 /// now that every equation dispatches on its own operands, not a graph-wide switch). Never the large
-/// embedding-table case: a `Gather`/`DenseRowGather` data operand reads its owner lazily instead
-/// (`evaluate_gather`), so this is reached only for an ordinary activation-sized operand (a norm
-/// weight, a small table) bound as an owner view instead of eagerly loaded.
+/// embedding-table case: a `Gather`/`DenseRowGather` data operand reads the exact view lazily
+/// instead (`evaluate_gather`), so this is reached only for an ordinary activation-sized operand (a
+/// norm weight, a small table) bound as an exact view instead of eagerly loaded.
 fn dense_tensor_or_materialize(
     id: ValueId,
     env: &ValueTable<Option<Value>>,
 ) -> Result<HostTensor, EvalError> {
     match env_value(env, id)? {
         Value::Host(tensor) => Ok(tensor.clone()),
-        Value::Owner(exact @ (ExactValue::Dense(_) | ExactValue::Bf16(_))) => {
-            Ok(exact.materialize_dense())
-        }
+        Value::Exact(exact @ ExactValue::Bf16(_)) => Ok(exact.materialize_dense()),
         other => Err(EvalError::Input {
             value: id,
             expected: poot_graph_ir::TensorType::new(Vec::new(), DType::F32),
@@ -1470,16 +1495,14 @@ fn dense_tensor_or_materialize(
     }
 }
 
-/// [`dense_tensor_or_materialize`] keeping the value's stored dtype and bits: an owner-backed BF16 view
+/// [`dense_tensor_or_materialize`] keeping the value's stored dtype and bits: an exact BF16 view
 /// materializes as BF16 words.
 fn stored_tensor_or_materialize(
     id: ValueId,
     env: &ValueTable<Option<Value>>,
 ) -> Result<HostTensor, EvalError> {
     match env_value(env, id)? {
-        Value::Owner(exact @ (ExactValue::Dense(_) | ExactValue::Bf16(_))) => {
-            Ok(exact.materialize_stored())
-        }
+        Value::Exact(exact @ ExactValue::Bf16(_)) => Ok(exact.materialize_stored()),
         _ => dense_tensor_or_materialize(id, env),
     }
 }
@@ -1503,26 +1526,4 @@ fn select_lanes<W: SelectLane>(
                 ),
             )
         })
-}
-
-/// Test-only counter of calls to the publication helpers on this thread, so a test can prove a failed
-/// validation publishes nothing (ADR-0090). Internal single-equation evaluation (the storage-aware
-/// E4M3FN movement arms) bypasses this; only the walk's own output/state/environment publication at
-/// the end of [`eval`] is counted.
-#[cfg(test)]
-pub(crate) mod publication_probe {
-    use std::cell::Cell;
-
-    thread_local! {
-        static PUBLICATIONS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    pub(crate) fn record() {
-        PUBLICATIONS.with(|count| count.set(count.get() + 1));
-    }
-
-    /// Return the count since the last call and reset it.
-    pub(crate) fn take() -> usize {
-        PUBLICATIONS.with(|count| count.replace(0))
-    }
 }

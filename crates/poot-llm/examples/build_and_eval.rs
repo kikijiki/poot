@@ -6,21 +6,38 @@
 //! Run: `cargo run -p poot-llm --example build_and_eval` (CPU only).
 
 use std::collections::HashMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_graph_ir::{Builder, TensorType, ops};
+use poot_graph_ir::{Builder, TensorType, TraceLimits, ops};
 use poot_tensor::HostTensor;
 
 fn main() {
     let n = 8usize;
     let eps = 1e-6f32;
 
+    // A `Builder` charges every value, equation, scalar literal and owned record against the limits its
+    // caller states; there is no unlimited builder. These are far above what one RMSNorm needs.
+    let limits = TraceLimits {
+        max_tokens: NonZeroUsize::MIN, // a model trace's per-step token bound; a bare builder never reads it
+        max_values: NonZeroUsize::new(1 << 10).unwrap(),
+        max_eqns: NonZeroUsize::new(1 << 10).unwrap(),
+        max_literal_bytes: NonZeroU64::new(1 << 12).unwrap(),
+        max_owned_bytes: NonZeroU64::new(1 << 20).unwrap(),
+    };
+
     // trace `rmsnorm(x, w)` into the graph. `x`/`w` are graph inputs (bound at eval by their value id).
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::f32(vec![n]));
-    let out = ops::rmsnorm(&b, x, w, eps);
-    let g = b.finish(out).unwrap();
+    // Every builder call is fallible: a shape the operation does not admit, or a request past the
+    // limits, is a typed `BuilderError`.
+    let b = Builder::new(limits);
+    let x = b
+        .constant("x", TensorType::f32(vec![1, 1, n]))
+        .expect("within the limits");
+    let w = b
+        .constant("w", TensorType::f32(vec![n]))
+        .expect("within the limits");
+    let out = ops::rmsnorm(&b, x, w, eps).expect("a well-typed RMSNorm within the limits");
+    let g = b.finish(out).expect("a well-formed graph");
     println!(
         "rmsnorm traced to {} primitive eqns (mul, reduce-sum, scalar mul/add, sqrt, div, mul)",
         g.eqns().len()

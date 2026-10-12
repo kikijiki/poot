@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use poot_executor::DetailedTiming;
-use poot_llm::ChatTemplateOverride;
 use poot_llm::driver::{BackendChoice, LoadOptions};
+use poot_text::ChatTemplateOverride;
 
 use crate::admin::{AdminKey, LoraAdminPolicy};
 use crate::lifecycle::ServerDrainTimeout;

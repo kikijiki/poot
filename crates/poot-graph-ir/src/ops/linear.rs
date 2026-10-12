@@ -1,18 +1,34 @@
-use super::*;
+#[cfg(any(test, feature = "test-support"))]
+use crate::builder::BuilderAppendPlan;
+use crate::builder::{Builder, Traced};
+use crate::error::BuilderError;
+#[cfg(any(test, feature = "test-support"))]
+use crate::graph::{Operand, Storage};
+use crate::op::BinOp;
+#[cfg(any(test, feature = "test-support"))]
+use crate::packed_source::packed_source_constants;
+#[cfg(any(test, feature = "test-support"))]
+use crate::types::{DType, TensorType};
 
 /// Linear: matmul against a `[in, out]` weight, with an optional `[out]` bias broadcast-add. `compile`'s
 /// contraction-epilogue fuse rule folds the add into the matmul kernel (Card 557); the trace states only
 /// the primitives.
-pub fn linear(b: &Builder, x: Traced, w: Traced, bias: Option<Traced>) -> Traced {
-    let y = b.matmul(x, w);
+pub fn linear(
+    b: &Builder,
+    x: Traced,
+    w: Traced,
+    bias: Option<Traced>,
+) -> Result<Traced, BuilderError> {
+    let y = b.matmul(x, w)?;
     match bias {
         Some(bias) => b.binary(BinOp::Add, y, bias),
-        None => y,
+        None => Ok(y),
     }
 }
 
 /// Shared rank-2 packed linear composition. Bias remains an ordinary Binary(Add) outside
 /// the packed-contraction candidate.
+#[cfg(any(test, feature = "test-support"))]
 pub fn packed_linear(
     b: &Builder,
     x: Traced,
@@ -20,11 +36,11 @@ pub fn packed_linear(
     descriptor: poot_quant::PackedWeight,
     alias_weight_shape: Option<Vec<usize>>,
     bias: Option<Traced>,
-) -> Result<Traced, BuilderAppendError> {
+) -> Result<Traced, BuilderError> {
     if linear_id.is_empty() {
-        return Err(BuilderAppendError::EmptyPackedLinearId { index: 0 });
+        return Err(BuilderError::EmptyPackedLinearId { index: 0 });
     }
-    let mut plan = b.append_plan(0);
+    let mut plan = b.append_plan(0)?;
     let weight = stage_packed_dequant(&mut plan, linear_id, descriptor)?;
     let weight = plan.equation(
         crate::op::OpKind::Transpose { perm: vec![1, 0] },
@@ -52,16 +68,17 @@ pub fn packed_linear(
 /// packed `[rows, K]` weight (a quantized GGUF `token_embd`). `ids` is any-shape I32 row ids; the
 /// result is `ids.shape ++ [K]`. `compile` claims the `PackedDequant -> Gather` pair as one
 /// `PackedRowGather`, so only the gathered rows are ever decoded.
+#[cfg(any(test, feature = "test-support"))]
 pub fn packed_embedding(
     b: &Builder,
     ids: Traced,
     linear_id: &str,
     descriptor: poot_quant::PackedWeight,
-) -> Result<Traced, BuilderAppendError> {
+) -> Result<Traced, BuilderError> {
     if linear_id.is_empty() {
-        return Err(BuilderAppendError::EmptyPackedLinearId { index: 0 });
+        return Err(BuilderError::EmptyPackedLinearId { index: 0 });
     }
-    let mut plan = b.append_plan(0);
+    let mut plan = b.append_plan(0)?;
     let table = stage_packed_dequant(&mut plan, linear_id, descriptor)?;
     let rows = plan.equation(
         crate::op::OpKind::Gather { axis: 0 },
@@ -81,6 +98,7 @@ pub fn packed_embedding(
 /// First target: DeepSeek-V4's `attn.wo_a`, an E4M3/E8M0 packed pair stored
 /// `[o_groups*o_lora_rank, in_per_group]` whose block contracts against
 /// `[o_groups, in_per_group, o_lora_rank]`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn packed_block_diagonal_linear(
     b: &Builder,
     x: Traced,
@@ -88,16 +106,16 @@ pub fn packed_block_diagonal_linear(
     descriptor: poot_quant::PackedWeight,
     blocks: usize,
     bias: Option<Traced>,
-) -> Result<Traced, BuilderAppendError> {
+) -> Result<Traced, BuilderError> {
     if linear_id.is_empty() {
-        return Err(BuilderAppendError::EmptyPackedLinearId { index: 0 });
+        return Err(BuilderError::EmptyPackedLinearId { index: 0 });
     }
     let [out, k] = descriptor.shape();
     if blocks == 0 || out % blocks != 0 {
-        return Err(BuilderAppendError::PackedBlockDiagonalBlocks { out, blocks });
+        return Err(BuilderError::PackedBlockDiagonalBlocks { out, blocks });
     }
     let block_out = out / blocks;
-    let mut plan = b.append_plan(0);
+    let mut plan = b.append_plan(0)?;
     let weight = stage_packed_dequant(&mut plan, linear_id, descriptor)?;
     let weight = plan.equation(
         crate::op::OpKind::Reshape {
@@ -126,6 +144,7 @@ pub fn packed_block_diagonal_linear(
 /// carrier constant per source role named after `stack_id` (the stack's own `WeightId::const_name`), each
 /// `[experts, slab_bytes]` ([`crate::packed_source::packed_stack_source_type`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct PackedExpertStack {
     pub stack_id: String,
     pub descriptor: poot_quant::PackedWeight,
@@ -136,27 +155,28 @@ pub struct PackedExpertStack {
 /// `table`, `[M, out]`. One claimed [`crate::op::OpKind::PackedContraction`] with
 /// [`crate::op::ContractionRows::Indexed`] over one stacked carrier per source role: no expert is dequantized
 /// outside the contraction, and a row reads only its own expert's blocks.
+#[cfg(any(test, feature = "test-support"))]
 pub fn packed_indexed_linear(
     b: &Builder,
     x: Traced,
     selector: Traced,
     table: &PackedExpertStack,
-) -> Result<Traced, BuilderAppendError> {
+) -> Result<Traced, BuilderError> {
     if table.stack_id.is_empty() {
-        return Err(BuilderAppendError::EmptyPackedLinearId { index: 0 });
+        return Err(BuilderError::EmptyPackedLinearId { index: 0 });
     }
-    let mut plan = b.append_plan(0);
+    let mut plan = b.append_plan(0)?;
     let [_, k] = table.descriptor.shape();
     let x_type = plan
         .type_of(x.id())
         .cloned()
-        .ok_or(BuilderAppendError::InvalidOperand {
+        .ok_or(BuilderError::InvalidOperand {
             equation: 0,
             operation: "packed_indexed_linear".to_string(),
             value: x.id(),
         })?;
     if x_type.dtype != DType::F32 || x_type.shape.len() != 2 || x_type.shape[1] != k {
-        return Err(BuilderAppendError::OperandType {
+        return Err(BuilderError::OperandType {
             value: x.id(),
             expected: TensorType::f32(vec![x_type.shape.first().copied().unwrap_or(0), k]),
             actual: x_type,
@@ -188,11 +208,12 @@ pub fn packed_indexed_linear(
     finish_packed_plan(b, plan, output)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn finish_packed_plan(
     b: &Builder,
     mut plan: BuilderAppendPlan,
     output: Traced,
-) -> Result<Traced, BuilderAppendError> {
+) -> Result<Traced, BuilderError> {
     plan.declare_result(output)?;
     let mut prepared = b.preflight_append(plan)?;
     b.commit_append(&mut prepared)
@@ -201,11 +222,12 @@ pub(crate) fn finish_packed_plan(
 /// Stage every source constant of one packed weight and emit its `PackedDequant` over them, in
 /// [`poot_quant::PackedWeight::sources`] role order: one carrier for a block format (GGUF), one per
 /// planar operand otherwise (AWQ three, GPTQ four, the E4M3/E2M1 cells two).
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn stage_packed_dequant(
     plan: &mut BuilderAppendPlan,
     linear_id: &str,
     descriptor: poot_quant::PackedWeight,
-) -> Result<Traced, BuilderAppendError> {
+) -> Result<Traced, BuilderError> {
     let mut sources = Vec::new();
     for (name, tensor_type) in packed_source_constants(linear_id, descriptor) {
         let source = plan.input(name, tensor_type, Storage::Const)?;
@@ -214,21 +236,22 @@ pub(crate) fn stage_packed_dequant(
     plan.equation(crate::op::OpKind::PackedDequant { descriptor }, sources)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn require_operand_type(
     plan: &BuilderAppendPlan,
     value: Traced,
     expected: TensorType,
-) -> Result<(), BuilderAppendError> {
+) -> Result<(), BuilderError> {
     let actual = plan
         .type_of(value.id())
         .cloned()
-        .ok_or(BuilderAppendError::InvalidOperand {
+        .ok_or(BuilderError::InvalidOperand {
             equation: 0,
             operation: "packed_linear operand".to_string(),
             value: value.id(),
         })?;
     if actual != expected {
-        return Err(BuilderAppendError::OperandType {
+        return Err(BuilderError::OperandType {
             value: value.id(),
             expected,
             actual,
@@ -237,12 +260,13 @@ pub(crate) fn require_operand_type(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn plan_binary(
     plan: &mut BuilderAppendPlan,
     op: BinOp,
     left: Traced,
     right: Traced,
-) -> Result<Traced, BuilderAppendError> {
+) -> Result<Traced, BuilderError> {
     plan.equation(
         crate::op::OpKind::Binary(op),
         vec![Operand::Value(left.id()), Operand::Value(right.id())],

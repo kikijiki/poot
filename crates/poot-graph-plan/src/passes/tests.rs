@@ -1,49 +1,53 @@
+use super::dtype::transpose_is_noop;
 use super::*;
+use crate::passes::cse_dce::dce_with_roots;
 use poot_graph_ir::Builder;
 use poot_graph_ir::analysis::{
     NumericsError, NumericsProperty, PASS_DECLARATIONS, PassDeclaration, Tier2Class,
     dispatch_count, implied_numerics, peak_transient_bytes, verify_pass_numerics,
 };
+use poot_graph_ir::graph::StateRole;
 use poot_graph_ir::op::{BinOp, RedOp};
 use poot_graph_ir::ops::{attention_masked, attention_masked_softcap};
+use poot_graph_ir::test_support::graph_fixtures::derive;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{KeyLayout, KvBound, value_ranges};
 use poot_graph_ir::{LayerIndex, LayerTagError};
 use poot_quant::PackedWeight;
 use poot_quant::format::WeightFormat;
-use poot_test_util::graph_fixtures::derive;
 
 /// A new program derived from `graph` with `change` applied to its draft: the fixture shape for a
 /// near miss whose operands the matcher must decline (well formed, so the edit check accepts it).
 fn mutated(graph: &Graph, change: impl FnOnce(&mut poot_graph_ir::GraphEdit)) -> Graph {
     derive(graph, |draft| {
         change(draft);
-        poot_test_util::graph_fixtures::reinfer(draft);
+        poot_graph_ir::test_support::graph_fixtures::reinfer(draft);
     })
     .expect("the near miss is a well-formed graph")
 }
 
-/// The graph-level packed-dequant preparation these tests exercise: validate, eliminate dead
+/// The graph-level packed-dequant preparation these tests exercise: eliminate dead
 /// oracle-only decoding, recognize dense contractions, then reject every remaining escape. The planner's
 /// production entry adds block-float claims on top of the same passes.
 fn prepare_packed_dequant_production(g: &Graph) -> Result<Graph, PackedDequantProductionError> {
-    reject_preexisting_packed_contractions(g)?;
     let graph = dce_with_roots(g, &[]).unwrap();
     let graph = recognize_packed_contractions(&graph).unwrap();
     reject_packed_dequant_escapes(&graph)?;
     Ok(graph)
 }
 
-fn packed_graph() -> Result<Graph, poot_graph_ir::BuilderAppendError> {
+fn packed_graph() -> Result<Graph, poot_graph_ir::BuilderError> {
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [3, 35]).unwrap();
-    let b = Builder::new();
-    let activation = b.constant("activation", TensorType::f32(vec![2, 35]));
+    let b = Builder::for_tests();
+    let activation = b
+        .constant("activation", TensorType::f32(vec![2, 35]))
+        .unwrap();
     let output =
         poot_graph_ir::ops::packed_linear(&b, activation, "layer", descriptor, None, None)?;
     Ok(b.finish(output).unwrap())
 }
 
-fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderAppendError> {
+fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderError> {
     let base = packed_graph()?;
     let mut graph = base.edit();
     let dequant = base.eqns()[0].out;
@@ -78,7 +82,7 @@ fn packed_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderApp
     Ok(graph.commit().unwrap())
 }
 
-fn packed_graph_with_extra_carrier_consumer() -> Result<Graph, poot_graph_ir::BuilderAppendError> {
+fn packed_graph_with_extra_carrier_consumer() -> Result<Graph, poot_graph_ir::BuilderError> {
     let base = packed_graph()?;
     let mut graph = base.edit();
     let weight = match base.eqns()[0].inputs[0] {
@@ -165,8 +169,7 @@ fn wrong_permutation(g: &Graph) -> Graph {
 }
 
 #[test]
-fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir::BuilderAppendError>
-{
+fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir::BuilderError> {
     let graph = packed_graph()?;
     let fused = prepare_packed_dequant_production(&graph).unwrap();
     assert_eq!(fused.eqns().len(), 1);
@@ -176,8 +179,10 @@ fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir
     ));
 
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [3, 35]).unwrap();
-    let builder = Builder::new();
-    let activation = builder.constant("alias.activation", TensorType::f32(vec![2, 35]));
+    let builder = Builder::for_tests();
+    let activation = builder
+        .constant("alias.activation", TensorType::f32(vec![2, 35]))
+        .unwrap();
     let output = poot_graph_ir::ops::packed_linear(
         &builder,
         activation,
@@ -211,13 +216,15 @@ fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir
 
 #[test]
 fn packed_block_diagonal_chain_is_recognized_as_one_contraction()
--> Result<(), poot_graph_ir::BuilderAppendError> {
+-> Result<(), poot_graph_ir::BuilderError> {
     // out=8, k=35, blocks=4 -> block_out=2. Card 385: `ops::packed_block_diagonal_linear`'s
     // Reshape-before-Transpose chain must fold like the canonical chain; an unrecognized packed
     // dequant is a compile-time escape rejection, not a silently slow fallback.
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [8, 35]).unwrap();
-    let builder = Builder::new();
-    let activation = builder.constant("blocked.activation", TensorType::f32(vec![4, 5, 35]));
+    let builder = Builder::for_tests();
+    let activation = builder
+        .constant("blocked.activation", TensorType::f32(vec![4, 5, 35]))
+        .unwrap();
     let output = poot_graph_ir::ops::packed_block_diagonal_linear(
         &builder, activation, "blocked", descriptor, 4, None,
     )?;
@@ -235,10 +242,12 @@ fn packed_block_diagonal_chain_is_recognized_as_one_contraction()
     Ok(())
 }
 
-fn packed_block_diagonal_graph() -> Result<Graph, poot_graph_ir::BuilderAppendError> {
+fn packed_block_diagonal_graph() -> Result<Graph, poot_graph_ir::BuilderError> {
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [8, 35]).unwrap();
-    let b = Builder::new();
-    let activation = b.constant("blocked.activation", TensorType::f32(vec![4, 5, 35]));
+    let b = Builder::for_tests();
+    let activation = b
+        .constant("blocked.activation", TensorType::f32(vec![4, 5, 35]))
+        .unwrap();
     let output = poot_graph_ir::ops::packed_block_diagonal_linear(
         &b, activation, "blocked", descriptor, 4, None,
     )?;
@@ -248,8 +257,7 @@ fn packed_block_diagonal_graph() -> Result<Graph, poot_graph_ir::BuilderAppendEr
 /// A second full branch off the same `PackedDequant` output (reshape/transpose/matmul cloned from
 /// the original, then summed into the graph's output). This gives the dequant a second live consumer
 /// without hand-computing any new tensor shape.
-fn packed_block_diagonal_graph_with_extra_consumer()
--> Result<Graph, poot_graph_ir::BuilderAppendError> {
+fn packed_block_diagonal_graph_with_extra_consumer() -> Result<Graph, poot_graph_ir::BuilderError> {
     let base = packed_block_diagonal_graph()?;
     let mut graph = base.edit();
     let dequant = base.eqns()[0].out;
@@ -297,7 +305,7 @@ fn packed_block_diagonal_graph_with_extra_consumer()
 
 #[test]
 fn packed_block_diagonal_production_rejects_extra_dequant_consumer()
--> Result<(), poot_graph_ir::BuilderAppendError> {
+-> Result<(), poot_graph_ir::BuilderError> {
     // The recognizer's admission of the blocked chain must still respect the single-consumer rule
     // every packed chain shares: a second live consumer off the same dequant is a graph escape, not a
     // second contraction to fold.
@@ -311,7 +319,7 @@ fn packed_block_diagonal_production_rejects_extra_dequant_consumer()
 
 #[test]
 fn packed_dequant_production_rejects_live_extra_carrier_consumer()
--> Result<(), poot_graph_ir::BuilderAppendError> {
+-> Result<(), poot_graph_ir::BuilderError> {
     let graph = packed_graph_with_extra_carrier_consumer()?;
     assert!(matches!(
         prepare_packed_dequant_production(&graph),
@@ -321,8 +329,8 @@ fn packed_dequant_production_rejects_live_extra_carrier_consumer()
 }
 
 #[test]
-fn packed_recognition_keeps_validation_observed_members()
--> Result<(), poot_graph_ir::BuilderAppendError> {
+fn packed_recognition_keeps_validation_observed_members() -> Result<(), poot_graph_ir::BuilderError>
+{
     let base = packed_graph()?;
     let dequant = base.eqns()[0].out;
     let graph = derive(&base, |draft| {
@@ -357,8 +365,7 @@ fn packed_recognition_keeps_validation_observed_members()
 }
 
 #[test]
-fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir::BuilderAppendError>
-{
+fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir::BuilderError> {
     let base = packed_graph()?;
     let dequant = base.eqns()[0].out;
     let transpose = base.eqns()[1].out;
@@ -389,34 +396,6 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
     cases.push(("state carrier", state_carrier, |error| {
         matches!(error, PackedDequantProductionError::CarrierStorage { .. })
     }));
-
-    let recognized = prepare_packed_dequant_production(&base).unwrap();
-    let direct_weight = match recognized.eqns()[0].inputs[1] {
-        Operand::Value(value) => value,
-        Operand::Lit(_) => unreachable!(),
-    };
-    let direct_storage = derive(&recognized, |draft| as_state(draft, direct_weight)).unwrap();
-    cases.push(("direct candidate state carrier", direct_storage, |error| {
-        matches!(
-            error,
-            PackedDequantProductionError::PreexistingContraction { .. }
-        )
-    }));
-
-    let direct_identity = derive(&recognized, |draft| {
-        draft.values_mut()[direct_weight].name = Some("layer.not_a_packed_weight".into());
-    })
-    .unwrap();
-    cases.push((
-        "direct candidate carrier identity",
-        direct_identity,
-        |error| {
-            matches!(
-                error,
-                PackedDequantProductionError::PreexistingContraction { .. }
-            )
-        },
-    ));
 
     cases.push(("live-out", packed_graph_with_extra_consumer()?, |error| {
         matches!(error, PackedDequantProductionError::ConsumerCount { .. })
@@ -490,15 +469,17 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
     }
 
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [3, 35]).unwrap();
-    let builder = Builder::new();
-    let output = builder.constant("ordinary.output", TensorType::f32(vec![2, 3]));
+    let builder = Builder::for_tests();
+    let output = builder
+        .constant("ordinary.output", TensorType::f32(vec![2, 3]))
+        .unwrap();
     // `Builder::packed_component_constants` is `#[cfg(test)]` to `poot-graph-ir` itself (invisible to
     // this crate's tests); inlined here from its own small body.
     let sources: Vec<_> = poot_graph_ir::packed_source_constants("dead", descriptor)
         .into_iter()
-        .map(|(name, tensor_type)| builder.constant(name.as_str(), tensor_type))
+        .map(|(name, tensor_type)| builder.constant(name.as_str(), tensor_type).unwrap())
         .collect();
-    let _dead = builder.packed_dequant(&sources, descriptor);
+    let _dead = builder.packed_dequant(&sources, descriptor).unwrap();
     let dead_graph = builder.finish(output).unwrap();
     let prepared = prepare_packed_dequant_production(&dead_graph).unwrap();
     assert!(prepared.eqns().is_empty(), "DCE removes oracle-only decode");
@@ -509,12 +490,14 @@ fn production_rejects_packed_dequant_escape_table() -> Result<(), poot_graph_ir:
 /// `dv` wide. Mutation: require `dv == dk` again in `infer_attention`; the chain stays decomposed.
 #[test]
 fn flash_attention_fuses_a_distinct_value_head_width() {
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3]));
-    let k = b.constant("k", TensorType::f32(vec![1, 2, 5, 3]));
-    let v = b.constant("v", TensorType::f32(vec![1, 2, 5, 2]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, 5]));
-    let out = attention_masked(&b, q, k, v, 1, 1.0, mask);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3])).unwrap();
+    let k = b.constant("k", TensorType::f32(vec![1, 2, 5, 3])).unwrap();
+    let v = b.constant("v", TensorType::f32(vec![1, 2, 5, 2])).unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, 5]))
+        .unwrap();
+    let out = attention_masked(&b, q, k, v, 1, 1.0, mask).unwrap();
     let g = b.finish(out).unwrap();
     let optimized = flash_attention_capped(&g, None).unwrap();
 
@@ -552,12 +535,12 @@ fn flash_attention_declines_broadcast_kv() {
         ),
     ];
     for (name, qs, kvs, ms) in cases {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(qs.to_vec()));
-        let k = b.constant("k", TensorType::f32(kvs.to_vec()));
-        let v = b.constant("v", TensorType::f32(kvs.to_vec()));
-        let mask = b.constant("mask", TensorType::f32(ms.to_vec()));
-        let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(qs.to_vec())).unwrap();
+        let k = b.constant("k", TensorType::f32(kvs.to_vec())).unwrap();
+        let v = b.constant("v", TensorType::f32(kvs.to_vec())).unwrap();
+        let mask = b.constant("mask", TensorType::f32(ms.to_vec())).unwrap();
+        let out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
         let optimized = flash_attention_capped(&b.finish(out).unwrap(), None).unwrap();
         let flash: Vec<String> = optimized
             .eqns()
@@ -578,15 +561,23 @@ fn flash_graph(decode: bool) -> (Graph, [ValueId; 3]) {
     } else {
         (1, 4, 3, 3, 8)
     };
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![bsz, hq, m, d]));
-    let k = b.constant("k", TensorType::f32(vec![bsz, hq, t, d]));
-    let v = b.constant("v", TensorType::f32(vec![bsz, hq, t, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![bsz, 1, m, t]));
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![bsz, hq, m, d]))
+        .unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![bsz, hq, t, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![bsz, hq, t, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![bsz, 1, m, t]))
+        .unwrap();
     let out = if decode {
-        poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, 0.25, mask)
+        poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap()
     } else {
-        poot_graph_ir::ops::attention_prefill(&b, q, k, v, 1, 0.25, mask)
+        poot_graph_ir::ops::attention_prefill(&b, q, k, v, 1, 0.25, mask).unwrap()
     };
     // A tracer states attention as primitives; the flash op is the matcher's.
     let g = dce(&flash_attention_capped(&b.finish(out).unwrap(), None).unwrap()).unwrap();
@@ -646,19 +637,21 @@ fn validate_rejects_flash_ops_with_inconsistent_kv_or_mask() {
 /// Hand-built `ops::rope_partial` rotate-half chain with free x and cos/sin shapes (full rotary).
 fn rope_chain(x_shape: Vec<usize>, table_shape: Vec<usize>) -> Graph {
     use poot_graph_ir::op::UnOp;
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let last = x_shape.len() - 1;
     let d = x_shape[last];
-    let x = b.constant("x", TensorType::f32(x_shape));
-    let cos = b.constant("cos", TensorType::f32(table_shape.clone()));
-    let sin = b.constant("sin", TensorType::f32(table_shape));
-    let x1 = b.slice(x, last, 0, d / 2);
-    let x2 = b.slice(x, last, d / 2, d);
-    let neg_x2 = b.unary(UnOp::Neg, x2);
-    let rotate_half = b.concat(last, &[neg_x2, x1]);
-    let xc = b.binary(BinOp::Mul, x, cos);
-    let rs = b.binary(BinOp::Mul, rotate_half, sin);
-    let out = b.binary(BinOp::Add, xc, rs);
+    let x = b.constant("x", TensorType::f32(x_shape)).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(table_shape.clone()))
+        .unwrap();
+    let sin = b.constant("sin", TensorType::f32(table_shape)).unwrap();
+    let x1 = b.slice(x, last, 0, d / 2).unwrap();
+    let x2 = b.slice(x, last, d / 2, d).unwrap();
+    let neg_x2 = b.unary(UnOp::Neg, x2).unwrap();
+    let rotate_half = b.concat(last, &[neg_x2, x1]).unwrap();
+    let xc = b.binary(BinOp::Mul, x, cos).unwrap();
+    let rs = b.binary(BinOp::Mul, rotate_half, sin).unwrap();
+    let out = b.binary(BinOp::Add, xc, rs).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -715,10 +708,10 @@ fn rope_infer_rejects_a_table_that_grows_x() {
 
 #[test]
 fn dce_drops_dead_eqns() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4]));
-    let _dead = b.binary(BinOp::Add, x, x); // never used
-    let out = b.binary(BinOp::Mul, x, x);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let _dead = b.binary(BinOp::Add, x, x).unwrap(); // never used
+    let out = b.binary(BinOp::Mul, x, x).unwrap();
     let g = b.finish(out).unwrap();
     let d = dce(&g).unwrap();
     assert!(
@@ -734,11 +727,11 @@ fn peak_transient_bytes_counts_the_live_working_set() {
     // live (the current output + the one feeding it), so the peak is 2*N*4 - NOT the sum of all four. The
     // const input x is persistent, not transient, so it is excluded.
     let n = 100usize;
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![n]));
-    let a = b.unary(poot_graph_ir::op::UnOp::Neg, x);
-    let bb = b.unary(poot_graph_ir::op::UnOp::Neg, a);
-    let c = b.unary(poot_graph_ir::op::UnOp::Neg, bb);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![n])).unwrap();
+    let a = b.unary(poot_graph_ir::op::UnOp::Neg, x).unwrap();
+    let bb = b.unary(poot_graph_ir::op::UnOp::Neg, a).unwrap();
+    let c = b.unary(poot_graph_ir::op::UnOp::Neg, bb).unwrap();
     let g = b.finish(c).unwrap();
     // a born (live={a}=N), b born (live={a,b}=2N) then a freed, c born (live={b,c}=2N) then b freed.
     assert_eq!(peak_transient_bytes(&g), 2 * n * 4);
@@ -747,11 +740,11 @@ fn peak_transient_bytes_counts_the_live_working_set() {
 #[test]
 fn dispatch_count_excludes_reshape_aliases() {
     // reshape is a buffer-aliasing view (no dispatch); the binary + the transpose are real dispatches.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 3]));
-    let r = b.reshape(x, vec![3, 2]); // alias - not a dispatch
-    let t = b.transpose(r, vec![1, 0]); // a real kernel
-    let out = b.binary(BinOp::Add, t, t); // a real kernel
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+    let r = b.reshape(x, vec![3, 2]).unwrap(); // alias - not a dispatch
+    let t = b.transpose(r, vec![1, 0]).unwrap(); // a real kernel
+    let out = b.binary(BinOp::Add, t, t).unwrap(); // a real kernel
     let g = b.finish(out).unwrap();
     assert_eq!(g.eqns().len(), 3, "reshape + transpose + add");
     assert_eq!(dispatch_count(&g), 2, "reshape aliases, so 2 dispatches");
@@ -760,11 +753,11 @@ fn dispatch_count_excludes_reshape_aliases() {
 #[test]
 fn cse_folds_duplicate_eqns_and_stays_valid() {
     // two structurally-identical adds collapse to one; the mul rewires to the canonical value.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4]));
-    let a1 = b.binary(BinOp::Add, x, x);
-    let a2 = b.binary(BinOp::Add, x, x); // a duplicate of a1
-    let out = b.binary(BinOp::Mul, a1, a2);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let a1 = b.binary(BinOp::Add, x, x).unwrap();
+    let a2 = b.binary(BinOp::Add, x, x).unwrap(); // a duplicate of a1
+    let out = b.binary(BinOp::Mul, a1, a2).unwrap();
     let g = b.finish(out).unwrap();
     let c = cse(&g).unwrap();
     assert!(
@@ -778,11 +771,11 @@ fn cse_folds_duplicate_eqns_and_stays_valid() {
 
 #[test]
 fn cse_is_idempotent() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4]));
-    let a1 = b.binary(BinOp::Add, x, x);
-    let a2 = b.binary(BinOp::Add, x, x);
-    let out = b.binary(BinOp::Mul, a1, a2);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let a1 = b.binary(BinOp::Add, x, x).unwrap();
+    let a2 = b.binary(BinOp::Add, x, x).unwrap();
+    let out = b.binary(BinOp::Mul, a1, a2).unwrap();
     let g = b.finish(out).unwrap();
     let c1 = cse(&g).unwrap();
     let c2 = cse(&c1).unwrap();
@@ -794,18 +787,21 @@ fn cse_merges_computed_constants_of_one_payload_and_drops_the_duplicate_binder()
     // A tracer that declares the same computed table per use (a RoPE table per layer) still gathers it
     // once: two declarations of one payload are one value, and only the first stays a graph input.
     // A different payload stays a separate constant.
-    let b = Builder::new();
-    let pos = b.constant("pos", TensorType::new(vec![1, 1], poot_tensor::DType::I32));
+    let b = Builder::for_tests();
+    let pos = b
+        .constant("pos", TensorType::new(vec![1, 1], poot_tensor::DType::I32))
+        .unwrap();
     let table = |len| {
         b.computed(poot_graph_ir::ComputedConst::Iota {
             len,
             dtype: poot_tensor::DType::F32,
         })
+        .unwrap()
     };
     let (first, second, other) = (table(8), table(8), table(9));
-    let rows = |t| b.gather(t, 0, pos);
-    let out = b.binary(BinOp::Add, rows(first), rows(second));
-    let out = b.binary(BinOp::Add, out, rows(other));
+    let rows = |t| b.gather(t, 0, pos).unwrap();
+    let out = b.binary(BinOp::Add, rows(first), rows(second)).unwrap();
+    let out = b.binary(BinOp::Add, out, rows(other)).unwrap();
     let g = b.finish(out).unwrap();
     let c = cse(&g).unwrap();
     let gathers = |g: &Graph| {
@@ -821,16 +817,16 @@ fn cse_merges_computed_constants_of_one_payload_and_drops_the_duplicate_binder()
 }
 
 fn f(b: &Builder, shape: &[usize]) -> poot_graph_ir::builder::Traced {
-    b.constant("x", TensorType::f32(shape.to_vec()))
+    b.constant("x", TensorType::f32(shape.to_vec())).unwrap()
 }
 
 #[test]
 fn fuse_collapses_pointwise_chain() {
     // out = (a + b) * c, all [1,1,8] -> two eqns (add, mul) collapse to one Fused eqn over 3 leaves.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (a, c, d) = (f(&b, &[1, 1, 8]), f(&b, &[1, 1, 8]), f(&b, &[1, 1, 8]));
-    let t = b.binary(BinOp::Add, a, c);
-    let out = b.binary(BinOp::Mul, t, d);
+    let t = b.binary(BinOp::Add, a, c).unwrap();
+    let out = b.binary(BinOp::Mul, t, d).unwrap();
     let g = b.finish(out).unwrap();
     assert_eq!(g.eqns().len(), 2);
     let fg = fuse(&g).unwrap();
@@ -856,17 +852,17 @@ fn fuse_fuses_a_multi_use_value_read_only_inside_the_region() {
     // t never escapes and fuses with them: 4 eqns -> 1 (Card 630's diamond rule; before it, t stayed a
     // standalone add). A value that is also read outside the region stays materialized: see
     // `fuse::tests::a_producer_read_outside_the_region_does_not_fuse`.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (a, bb, c, d) = (
         f(&b, &[1, 4]),
         f(&b, &[1, 4]),
         f(&b, &[1, 4]),
         f(&b, &[1, 4]),
     );
-    let t = b.binary(BinOp::Add, a, bb);
-    let u = b.binary(BinOp::Mul, t, c);
-    let v = b.binary(BinOp::Sub, t, d);
-    let out = b.binary(BinOp::Add, u, v);
+    let t = b.binary(BinOp::Add, a, bb).unwrap();
+    let u = b.binary(BinOp::Mul, t, c).unwrap();
+    let v = b.binary(BinOp::Sub, t, d).unwrap();
+    let out = b.binary(BinOp::Add, u, v).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     assert_eq!(fg.eqns().len(), 1, "t joins the region that reads it twice");
@@ -876,9 +872,9 @@ fn fuse_fuses_a_multi_use_value_read_only_inside_the_region() {
 #[test]
 fn fuse_does_not_wrap_a_singleton() {
     // a lone pointwise eqn has no fusable single-use producer: it stays a plain Binary, not Fused.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (a, c) = (f(&b, &[3]), f(&b, &[3]));
-    let out = b.binary(BinOp::Add, a, c);
+    let out = b.binary(BinOp::Add, a, c).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     assert_eq!(fg.eqns().len(), 1);
@@ -887,12 +883,14 @@ fn fuse_does_not_wrap_a_singleton() {
 
 #[test]
 fn fuse_collapses_exact_i32_pointwise_chain() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = TensorType::new(vec![4], poot_tensor::DType::I32);
-    let x = b.constant("x", ty.clone());
-    let y = b.constant("y", ty);
-    let sum = b.binary(BinOp::Add, x, y);
-    let out = b.binary_scalar(BinOp::GeU, sum, poot_graph_ir::types::Scalar::I32(-1));
+    let x = b.constant("x", ty.clone()).unwrap();
+    let y = b.constant("y", ty).unwrap();
+    let sum = b.binary(BinOp::Add, x, y).unwrap();
+    let out = b
+        .binary_scalar(BinOp::GeU, sum, poot_graph_ir::types::Scalar::I32(-1))
+        .unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     assert_eq!(fg.eqns().len(), 1, "same-shape I32 Add+GeU should fuse");
@@ -904,15 +902,15 @@ fn fuse_collapses_exact_i32_pointwise_chain() {
 
 #[test]
 fn fuse_i32_closed_dag_absorbs_non_escaping_multi_use() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = TensorType::new(vec![4], poot_tensor::DType::I32);
-    let x = b.constant("x", ty.clone());
-    let y = b.constant("y", ty.clone());
-    let z = b.constant("z", ty);
-    let t = b.binary(BinOp::And, x, y);
-    let u = b.binary(BinOp::Or, t, z);
-    let v = b.unary(UnOp::Not, t);
-    let out = b.select(u, v, t);
+    let x = b.constant("x", ty.clone()).unwrap();
+    let y = b.constant("y", ty.clone()).unwrap();
+    let z = b.constant("z", ty).unwrap();
+    let t = b.binary(BinOp::And, x, y).unwrap();
+    let u = b.binary(BinOp::Or, t, z).unwrap();
+    let v = b.unary(UnOp::Not, t).unwrap();
+    let out = b.select(u, v, t).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     assert_eq!(fg.eqns().len(), 1);
@@ -934,12 +932,14 @@ fn fuse_i32_closed_dag_absorbs_non_escaping_multi_use() {
 /// equation, which a float region cannot hold) is a region input leaf, and the select is a step.
 #[test]
 fn fuse_float_select_is_a_step_of_a_float_region_with_the_condition_as_a_leaf() {
-    let b = Builder::new();
-    let cond = b.constant("cond", TensorType::new(vec![4], poot_tensor::DType::I32));
-    let if_true = b.constant("t", TensorType::f32(vec![4]));
-    let if_false = b.constant("f", TensorType::f32(vec![4]));
-    let selected = b.select(cond, if_true, if_false);
-    let out = b.unary(UnOp::Neg, selected);
+    let b = Builder::for_tests();
+    let cond = b
+        .constant("cond", TensorType::new(vec![4], poot_tensor::DType::I32))
+        .unwrap();
+    let if_true = b.constant("t", TensorType::f32(vec![4])).unwrap();
+    let if_false = b.constant("f", TensorType::f32(vec![4])).unwrap();
+    let selected = b.select(cond, if_true, if_false).unwrap();
+    let out = b.unary(UnOp::Neg, selected).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     assert_eq!(fg.eqns().len(), 1);
@@ -976,16 +976,18 @@ fn fuse_float_select_is_a_step_of_a_float_region_with_the_condition_as_a_leaf() 
 /// row goes red.
 #[test]
 fn fuse_keeps_a_float_select_out_of_row_regions() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 4]));
-    let cond = b.constant("cond", TensorType::new(vec![2, 4], poot_tensor::DType::I32));
-    let floor = b.constant("floor", TensorType::f32(vec![2, 4]));
-    let max = b.reduce(RedOp::Max, x, 1, true);
-    let shifted = b.binary(BinOp::Sub, x, max);
-    let masked = b.select(cond, shifted, floor);
-    let exp = b.unary(UnOp::Exp, masked);
-    let sum = b.reduce(RedOp::Sum, exp, 1, true);
-    let out = b.binary(BinOp::Div, exp, sum);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 4])).unwrap();
+    let cond = b
+        .constant("cond", TensorType::new(vec![2, 4], poot_tensor::DType::I32))
+        .unwrap();
+    let floor = b.constant("floor", TensorType::f32(vec![2, 4])).unwrap();
+    let max = b.reduce(RedOp::Max, x, 1, true).unwrap();
+    let shifted = b.binary(BinOp::Sub, x, max).unwrap();
+    let masked = b.select(cond, shifted, floor).unwrap();
+    let exp = b.unary(UnOp::Exp, masked).unwrap();
+    let sum = b.reduce(RedOp::Sum, exp, 1, true).unwrap();
+    let out = b.binary(BinOp::Div, exp, sum).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     let mut selects = 0;
@@ -1017,14 +1019,14 @@ fn fuse_keeps_a_float_select_out_of_row_regions() {
 
 #[test]
 fn fuse_i32_pack_concat_keeps_shared_operands_in_one_region() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = TensorType::new(vec![1], poot_tensor::DType::I32);
-    let x = b.constant("x", ty.clone());
-    let y = b.constant("y", ty);
-    let shared = b.binary(BinOp::And, x, y);
-    let low = b.binary(BinOp::Or, shared, x);
-    let high = b.binary(BinOp::Xor, shared, y);
-    let packed = b.concat(0, &[low, high]);
+    let x = b.constant("x", ty.clone()).unwrap();
+    let y = b.constant("y", ty).unwrap();
+    let shared = b.binary(BinOp::And, x, y).unwrap();
+    let low = b.binary(BinOp::Or, shared, x).unwrap();
+    let high = b.binary(BinOp::Xor, shared, y).unwrap();
+    let packed = b.concat(0, &[low, high]).unwrap();
     let g = b.finish(packed).unwrap();
     let fg = fuse(&g).unwrap();
     assert_eq!(fg.eqns().len(), 1);
@@ -1039,17 +1041,17 @@ fn fuse_i32_pack_concat_keeps_shared_operands_in_one_region() {
 
 #[test]
 fn fuse_i32_pack_concat_absorbs_unit_last_axis_unpack_slices() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = TensorType::new(vec![1], poot_tensor::DType::I32);
-    let x = b.constant("x", ty.clone());
-    let y = b.constant("y", ty);
-    let low = b.binary(BinOp::Or, x, y);
-    let high = b.binary(BinOp::Xor, x, y);
-    let packed = b.concat(0, &[low, high]);
-    let left = b.slice(packed, 0, 0, 1);
-    let right = b.slice(packed, 0, 1, 2);
-    let masked = b.binary(BinOp::And, left, right);
-    let out = b.binary(BinOp::Or, masked, left);
+    let x = b.constant("x", ty.clone()).unwrap();
+    let y = b.constant("y", ty).unwrap();
+    let low = b.binary(BinOp::Or, x, y).unwrap();
+    let high = b.binary(BinOp::Xor, x, y).unwrap();
+    let packed = b.concat(0, &[low, high]).unwrap();
+    let left = b.slice(packed, 0, 0, 1).unwrap();
+    let right = b.slice(packed, 0, 1, 2).unwrap();
+    let masked = b.binary(BinOp::And, left, right).unwrap();
+    let out = b.binary(BinOp::Or, masked, left).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     assert!(
@@ -1079,17 +1081,17 @@ fn fuse_i32_pack_concat_absorbs_unit_last_axis_unpack_slices() {
 
 #[test]
 fn fuse_i32_pack_concat_keeps_a_pinned_unpack_slice() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let ty = TensorType::new(vec![1], poot_tensor::DType::I32);
-    let x = b.constant("x", ty.clone());
-    let y = b.constant("y", ty);
-    let low = b.binary(BinOp::Or, x, y);
-    let high = b.binary(BinOp::Xor, x, y);
-    let packed = b.concat(0, &[low, high]);
-    let left = b.slice(packed, 0, 0, 1);
-    let right = b.slice(packed, 0, 1, 2);
-    let masked = b.binary(BinOp::And, left, right);
-    let _keep = b.binary(BinOp::Or, masked, left);
+    let x = b.constant("x", ty.clone()).unwrap();
+    let y = b.constant("y", ty).unwrap();
+    let low = b.binary(BinOp::Or, x, y).unwrap();
+    let high = b.binary(BinOp::Xor, x, y).unwrap();
+    let packed = b.concat(0, &[low, high]).unwrap();
+    let left = b.slice(packed, 0, 0, 1).unwrap();
+    let right = b.slice(packed, 0, 1, 2).unwrap();
+    let masked = b.binary(BinOp::And, left, right).unwrap();
+    let _keep = b.binary(BinOp::Or, masked, left).unwrap();
     let g = b.finish(left).unwrap();
     let fg = fuse(&g).expect("pinned unpack slice must remain a produced graph output");
     assert_eq!(fg.result(), left.id());
@@ -1102,13 +1104,13 @@ fn fuse_i32_pack_concat_keeps_a_pinned_unpack_slice() {
 #[test]
 fn fuse_does_not_cross_a_matmul_boundary() {
     // add -> matmul -> add: the matmul is a forced boundary, so the two adds do not fuse together.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (a, c) = (f(&b, &[1, 4]), f(&b, &[1, 4]));
-    let w = b.constant("w", TensorType::f32(vec![4, 4]));
-    let s = b.binary(BinOp::Add, a, c); // [1,4]
-    let m = b.matmul(s, w); // [1,4], a boundary
+    let w = b.constant("w", TensorType::f32(vec![4, 4])).unwrap();
+    let s = b.binary(BinOp::Add, a, c).unwrap(); // [1,4]
+    let m = b.matmul(s, w).unwrap(); // [1,4], a boundary
     let e = f(&b, &[1, 4]);
-    let out = b.binary(BinOp::Add, m, e);
+    let out = b.binary(BinOp::Add, m, e).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     // matmul stays; neither add fuses with anything (each is a singleton across the boundary).
@@ -1121,11 +1123,11 @@ fn fuse_forms_a_rmsnorm_row_region() {
     // the whole RMSNorm decomposition (sq -> sum -> *1/n -> +eps -> sqrt -> x/den -> *w) fuses to ONE
     // reduction-rooted FusedRow eqn.
     use poot_graph_ir::ops::rmsnorm;
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let n = 8usize;
-    let x = b.constant("x", TensorType::f32(vec![1, 1, n]));
-    let w = b.constant("w", TensorType::f32(vec![n]));
-    let out = rmsnorm(&b, x, w, 1e-6);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, n])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![n])).unwrap();
+    let out = rmsnorm(&b, x, w, 1e-6).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     let rows = fg
@@ -1172,10 +1174,10 @@ fn fuse_does_not_form_a_reduced_output_row_region() {
     };
 
     // (a) bare reduce of a pointwise: sum(x + x) over the last axis -> output [1,4,1].
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 4, 8]));
-    let s = b.binary(BinOp::Add, x, x);
-    let r = b.reduce(RedOp::Sum, s, 2, true);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 4, 8])).unwrap();
+    let s = b.binary(BinOp::Add, x, x).unwrap();
+    let r = b.reduce(RedOp::Sum, s, 2, true).unwrap();
     let fg = fuse(&b.finish(r).unwrap()).unwrap();
     assert!(
         !has_row(&fg),
@@ -1184,10 +1186,12 @@ fn fuse_does_not_form_a_reduced_output_row_region() {
     assert!(has_reduce(&fg), "the reduce stays a plain Reduce op");
 
     // (b) scalar pointwise after a reduce (the quant_scale_kv shape): reduce_max(x) * (1/127) -> [1,4,1].
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 4, 8]));
-    let m = b.reduce(RedOp::Max, x, 2, true);
-    let sc = b.binary_scalar(BinOp::Mul, m, Scalar::F32(1.0 / 127.0));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 4, 8])).unwrap();
+    let m = b.reduce(RedOp::Max, x, 2, true).unwrap();
+    let sc = b
+        .binary_scalar(BinOp::Mul, m, Scalar::F32(1.0 / 127.0))
+        .unwrap();
     let fg = fuse(&b.finish(sc).unwrap()).unwrap();
     assert!(
         !has_row(&fg),
@@ -1198,10 +1202,10 @@ fn fuse_does_not_form_a_reduced_output_row_region() {
 
 #[test]
 fn fuse_is_idempotent() {
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (a, c, d) = (f(&b, &[1, 1, 8]), f(&b, &[1, 1, 8]), f(&b, &[1, 1, 8]));
-    let t = b.binary(BinOp::Add, a, c);
-    let out = b.binary(BinOp::Mul, t, d);
+    let t = b.binary(BinOp::Add, a, c).unwrap();
+    let out = b.binary(BinOp::Mul, t, d).unwrap();
     let g = b.finish(out).unwrap();
     let f1 = fuse(&g).unwrap();
     let f2 = fuse(&f1).unwrap();
@@ -1220,9 +1224,9 @@ fn elide_noop_transpose_unit() {
 #[test]
 fn elide_noop_transposes_rewrites_only_noops() {
     // a seq-1 attention-style transpose [1,H,1,D] -> [1,1,H,D] is rewritten to a (free) reshape.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 4, 1, 8]));
-    let t = b.transpose(x, vec![0, 2, 1, 3]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 4, 1, 8])).unwrap();
+    let t = b.transpose(x, vec![0, 2, 1, 3]).unwrap();
     let g = elide_noop_transposes(&b.finish(t).unwrap()).unwrap();
     assert!(
         g.eqns()
@@ -1237,9 +1241,9 @@ fn elide_noop_transposes_rewrites_only_noops() {
         "no transpose dispatch remains"
     );
     // a genuine data-moving transpose is left intact.
-    let b2 = Builder::new();
-    let y = b2.constant("y", TensorType::f32(vec![3, 5]));
-    let ty = b2.transpose(y, vec![1, 0]);
+    let b2 = Builder::for_tests();
+    let y = b2.constant("y", TensorType::f32(vec![3, 5])).unwrap();
+    let ty = b2.transpose(y, vec![1, 0]).unwrap();
     let g2 = elide_noop_transposes(&b2.finish(ty).unwrap()).unwrap();
     assert!(
         g2.eqns()
@@ -1253,11 +1257,11 @@ fn elide_noop_transposes_rewrites_only_noops() {
 fn collapse_reshape_chains_merges_a_chain() {
     // reshape -> reshape -> reshape collapses to ONE reshape reading straight from the source, with the
     // final shape preserved; the two dead intermediates are DCE'd.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 3, 4]));
-    let r1 = b.reshape(x, vec![6, 4]);
-    let r2 = b.reshape(r1, vec![24]);
-    let r3 = b.reshape(r2, vec![4, 6]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 3, 4])).unwrap();
+    let r1 = b.reshape(x, vec![6, 4]).unwrap();
+    let r2 = b.reshape(r1, vec![24]).unwrap();
+    let r3 = b.reshape(r2, vec![4, 6]).unwrap();
     let g = b.finish(r3).unwrap();
     assert_eq!(g.eqns().len(), 3);
     let c = collapse_reshape_chains(&g).unwrap();
@@ -1278,12 +1282,14 @@ fn collapse_reshape_chains_merges_a_chain() {
 fn collapse_keeps_a_still_used_intermediate() {
     // if an intermediate reshape feeds another live consumer, it must stay (only the second reshape's
     // input is rewired past it); the graph stays valid and both outputs resolve.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 4]));
-    let r1 = b.reshape(x, vec![16]); // used by r2 AND by add
-    let r2 = b.reshape(r1, vec![2, 8]);
-    let add = b.binary(BinOp::Add, r1, r1); // second consumer of r1 -> r1 stays live
-    let out = b.binary(BinOp::Add, b.reshape(r2, vec![16]), add);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 4])).unwrap();
+    let r1 = b.reshape(x, vec![16]).unwrap(); // used by r2 AND by add
+    let r2 = b.reshape(r1, vec![2, 8]).unwrap();
+    let add = b.binary(BinOp::Add, r1, r1).unwrap(); // second consumer of r1 -> r1 stays live
+    let out = b
+        .binary(BinOp::Add, b.reshape(r2, vec![16]).unwrap(), add)
+        .unwrap();
     let g = b.finish(out).unwrap();
     let c = collapse_reshape_chains(&g).unwrap();
     assert!(
@@ -1296,11 +1302,11 @@ fn collapse_keeps_a_still_used_intermediate() {
 fn fuse_collapses_the_reshape_after_eliding_a_noop_transpose() {
     // the decode attention shape: reshape -> (no-op) transpose -> reshape. elide turns the transpose into
     // a reshape, then collapse merges the run, so `fuse` emits a single reshape (no transpose, no chain).
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 32]));
-    let r1 = b.reshape(x, vec![1, 1, 4, 8]);
-    let t = b.transpose(r1, vec![0, 2, 1, 3]); // [1,4,1,8] - no-op at seq 1
-    let out = b.reshape(t, vec![1, 4, 8]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 32])).unwrap();
+    let r1 = b.reshape(x, vec![1, 1, 4, 8]).unwrap();
+    let t = b.transpose(r1, vec![0, 2, 1, 3]).unwrap(); // [1,4,1,8] - no-op at seq 1
+    let out = b.reshape(t, vec![1, 4, 8]).unwrap();
     let g = b.finish(out).unwrap();
     let fg = fuse(&g).unwrap();
     assert!(
@@ -1326,13 +1332,17 @@ fn rope_fusion_full_collapses_the_rotate_half_chain() {
     use poot_graph_ir::op::UnOp;
     use poot_tensor::DType;
     // full rotary (rot == D): the whole slice/slice/neg/concat/mul/mul/add chain -> one Rope op.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (d, max_pos) = (8usize, 16usize);
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
+    let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos).unwrap();
     let g = b.finish(out).unwrap();
     let before = dispatch_count(&g);
     let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
@@ -1372,13 +1382,17 @@ fn rope_fusion_partial_absorbs_passthrough() {
     use poot_graph_ir::op::UnOp;
     use poot_tensor::DType;
     // partial rotary (rot < D): the outer slice/concat passthrough is absorbed too - Rope over the FULL x.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (d, rot, max_pos) = (8usize, 4usize, 16usize);
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, rot]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, rot]));
-    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, rot]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, rot]))
+        .unwrap();
+    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
+    let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos).unwrap();
     let g = b.finish(out).unwrap();
     let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
     let ropes: Vec<&Eqn> = fused
@@ -1420,13 +1434,17 @@ fn optimize_fuses_the_rope_chain_into_one_rope_op() {
     use poot_graph_ir::graph::Slot;
     use poot_graph_ir::op::UnOp;
     use poot_tensor::DType;
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (d, max_pos) = (8usize, 16usize);
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d]));
-    let cos = b.constant("cos", TensorType::f32(vec![max_pos, d]));
-    let sin = b.constant("sin", TensorType::f32(vec![max_pos, d]));
-    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32));
-    let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos);
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1, d])).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let sin = b
+        .constant("sin", TensorType::f32(vec![max_pos, d]))
+        .unwrap();
+    let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
+    let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos).unwrap();
     let g = b.finish(out).unwrap();
     let optimized = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
     assert_eq!(
@@ -1450,12 +1468,12 @@ fn optimize_fuses_the_rope_chain_into_one_rope_op() {
 #[test]
 fn rope_fusion_ignores_a_non_rope_add_of_two_muls() {
     // legality guard: a plain `a*b + c*d` (no rotate-half concat) must NOT match.
-    let b = Builder::new();
-    let p = b.constant("p", TensorType::f32(vec![4]));
-    let q = b.constant("q", TensorType::f32(vec![4]));
-    let m0 = b.binary(BinOp::Mul, p, q);
-    let m1 = b.binary(BinOp::Mul, q, p);
-    let out = b.binary(BinOp::Add, m0, m1);
+    let b = Builder::for_tests();
+    let p = b.constant("p", TensorType::f32(vec![4])).unwrap();
+    let q = b.constant("q", TensorType::f32(vec![4])).unwrap();
+    let m0 = b.binary(BinOp::Mul, p, q).unwrap();
+    let m1 = b.binary(BinOp::Mul, q, p).unwrap();
+    let out = b.binary(BinOp::Add, m0, m1).unwrap();
     let g = b.finish(out).unwrap();
     let fused = rope_fusion(&cse(&g).unwrap()).unwrap();
     assert!(
@@ -1471,12 +1489,12 @@ fn rope_fusion_ignores_a_non_rope_add_of_two_muls() {
 fn cse_remaps_validation_roots() {
     use poot_graph_ir::ValidationId;
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([4]));
-    let y = b.constant("y", TensorType::f32([4]));
-    let primary = b.binary(BinOp::Add, x, y);
-    let duplicate = b.binary(BinOp::Add, x, y);
-    let graph = crate::test_support::finish_with_validations(
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([4])).unwrap();
+    let y = b.constant("y", TensorType::f32([4])).unwrap();
+    let primary = b.binary(BinOp::Add, x, y).unwrap();
+    let duplicate = b.binary(BinOp::Add, x, y).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         primary,
         &[(ValidationId(3), "duplicate", duplicate)],
@@ -1495,12 +1513,12 @@ fn cse_remaps_validation_roots() {
 fn dce_keeps_validation_only_producer() {
     use poot_graph_ir::ValidationId;
 
-    let b = Builder::new();
-    let primary = b.constant("primary", TensorType::f32([4]));
-    let x = b.constant("x", TensorType::f32([4]));
-    let y = b.constant("y", TensorType::f32([4]));
-    let witness = b.binary(BinOp::Mul, x, y);
-    let graph = crate::test_support::finish_with_validations(
+    let b = Builder::for_tests();
+    let primary = b.constant("primary", TensorType::f32([4])).unwrap();
+    let x = b.constant("x", TensorType::f32([4])).unwrap();
+    let y = b.constant("y", TensorType::f32([4])).unwrap();
+    let witness = b.binary(BinOp::Mul, x, y).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         primary,
         &[(ValidationId(3), "dce", witness)],
@@ -1515,12 +1533,12 @@ fn dce_keeps_validation_only_producer() {
 fn fusion_pins_validation_packet_values() {
     use poot_graph_ir::ValidationId;
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([4]));
-    let y = b.constant("y", TensorType::f32([4]));
-    let witness = b.binary(BinOp::Mul, x, y);
-    let primary = b.binary(BinOp::Add, witness, y);
-    let graph = crate::test_support::finish_with_validations(
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([4])).unwrap();
+    let y = b.constant("y", TensorType::f32([4])).unwrap();
+    let witness = b.binary(BinOp::Mul, x, y).unwrap();
+    let primary = b.binary(BinOp::Add, witness, y).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         primary,
         &[(ValidationId(3), "fusion", witness)],
@@ -1538,12 +1556,12 @@ fn fusion_pins_validation_packet_values() {
 fn movement_cleanup_preserves_validation_only_root() {
     use poot_graph_ir::ValidationId;
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([1, 2, 1]));
-    let witness = b.transpose(x, vec![0, 2, 1]);
-    let reshaped = b.reshape(witness, vec![2]);
-    let primary = b.reshape(reshaped, vec![1, 2]);
-    let graph = crate::test_support::finish_with_validations(
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([1, 2, 1])).unwrap();
+    let witness = b.transpose(x, vec![0, 2, 1]).unwrap();
+    let reshaped = b.reshape(witness, vec![2]).unwrap();
+    let primary = b.reshape(reshaped, vec![1, 2]).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         primary,
         &[(ValidationId(6), "movement", witness)],
@@ -1566,23 +1584,27 @@ fn movement_cleanup_preserves_validation_only_root() {
 /// A `layers`-block graph: one Activation input, one carried state pair per block, and one shared
 /// constant. Three equations per block, so block `l` owns equations `3l..3l + 3`.
 fn stage_split_layered_graph(layers: usize) -> Graph {
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
-    let w = b.constant("w", TensorType::f32(vec![4]));
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
     let mut hidden = x;
     let mut state = Vec::new();
     for layer in 0..layers {
-        let scaled = b.binary(BinOp::Mul, hidden, w);
-        let k_in = b.state_input(
-            &format!("k{layer}"),
-            TensorType::f32(vec![4]),
-            StateRole::Recurrent,
-        );
-        let k_out = b.binary(BinOp::Add, k_in, scaled);
-        let next = b.binary(BinOp::Add, scaled, k_out);
+        let scaled = b.binary(BinOp::Mul, hidden, w).unwrap();
+        let k_in = b
+            .state_input(
+                &format!("k{layer}"),
+                TensorType::f32(vec![4]),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let k_out = b.binary(BinOp::Add, k_in, scaled).unwrap();
+        let next = b.binary(BinOp::Add, scaled, k_out).unwrap();
         state.push((k_in, k_out));
         hidden = next;
     }
@@ -1600,7 +1622,7 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
         (vec![3usize, 6], 2usize, vec![vec![0], vec![1], vec![2]]),
     ] {
         let assignment =
-            crate::test_support::assignment_before(&graph, &cuts).expect("the cuts are legal");
+            crate::unit_helpers::assignment_before(&graph, &cuts).expect("the cuts are legal");
         let split = split_stages(&graph, &assignment).expect("the graph splits");
         assert_eq!(split.stages.len(), cuts.len() + 1);
         assert_eq!(split.boundaries.len(), expected_boundaries);
@@ -1704,27 +1726,29 @@ fn adr0099_s2_stage_graphs_partition_every_equation_and_validate() {
 
 #[test]
 fn adr0099_s2_boundary_descriptors_carry_dtype_shape_and_byte_len() {
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![3, 4]),
-    );
-    let dense = b.binary(BinOp::Add, x, x);
-    let bf16 = b.cast(dense, DType::BF16);
-    let i32 = b.cast(dense, DType::I32);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![3, 4]),
+        )
+        .unwrap();
+    let dense = b.binary(BinOp::Add, x, x).unwrap();
+    let bf16 = b.cast(dense, DType::BF16).unwrap();
+    let i32 = b.cast(dense, DType::I32).unwrap();
     // F32 -> I8 directly is refused at `infer` time (card 555): go through the I32 value
     // already produced above, same as every other I32 -> I8 cast in the IR.
-    let i8 = b.cast(i32, DType::I8);
-    let back_bf16 = b.cast(bf16, DType::F32);
-    let back_i32 = b.cast(i32, DType::F32);
-    let back_i8 = b.cast(i8, DType::F32);
-    let mixed = b.binary(BinOp::Add, back_bf16, back_i32);
-    let out = b.binary(BinOp::Add, mixed, back_i8);
+    let i8 = b.cast(i32, DType::I8).unwrap();
+    let back_bf16 = b.cast(bf16, DType::F32).unwrap();
+    let back_i32 = b.cast(i32, DType::F32).unwrap();
+    let back_i8 = b.cast(i8, DType::F32).unwrap();
+    let mixed = b.binary(BinOp::Add, back_bf16, back_i32).unwrap();
+    let out = b.binary(BinOp::Add, mixed, back_i8).unwrap();
     let graph = b.finish(out).unwrap();
     assert_eq!(graph.eqns().len(), 9);
 
     let assignment =
-        crate::test_support::assignment_before(&graph, &[4]).expect("the cut is legal");
+        crate::unit_helpers::assignment_before(&graph, &[4]).expect("the cut is legal");
     let split = split_stages(&graph, &assignment).expect("the graph splits");
 
     // Four values are produced in stage 0, but `dense` is read only there, so exactly three cross -
@@ -1761,21 +1785,25 @@ fn adr0099_s2_boundary_descriptors_carry_dtype_shape_and_byte_len() {
 
 #[test]
 fn adr0099_s2_state_pair_split_across_stages_is_rejected() {
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
-    let k_in = b.state_input("k", TensorType::f32(vec![4]), StateRole::Recurrent);
-    let early = b.binary(BinOp::Add, x, k_in);
-    let mid = b.binary(BinOp::Mul, early, early);
-    let k_out = b.binary(BinOp::Add, mid, mid);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
+    let k_in = b
+        .state_input("k", TensorType::f32(vec![4]), StateRole::Recurrent)
+        .unwrap();
+    let early = b.binary(BinOp::Add, x, k_in).unwrap();
+    let mid = b.binary(BinOp::Mul, early, early).unwrap();
+    let k_out = b.binary(BinOp::Add, mid, mid).unwrap();
     let graph = b
         .finish(poot_graph_ir::Outputs::new(k_out).with_state(&[(k_in, k_out)]))
         .unwrap();
 
     let assignment =
-        crate::test_support::assignment_before(&graph, &[1]).expect("the cut is legal");
+        crate::unit_helpers::assignment_before(&graph, &[1]).expect("the cut is legal");
     assert_eq!(
         split_stages(&graph, &assignment).expect_err("the pair spans both stages"),
         StageSplitError::StatePairSplit {
@@ -1790,14 +1818,16 @@ fn adr0099_s2_state_pair_split_across_stages_is_rejected() {
 
 /// Four chained equations, for cut-position errors.
 fn four_eqn_graph() -> Graph {
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
     let mut hidden = x;
     for _ in 0..4 {
-        hidden = b.binary(BinOp::Add, hidden, x);
+        hidden = b.binary(BinOp::Add, hidden, x).unwrap();
     }
     b.finish(hidden).unwrap()
 }
@@ -1835,7 +1865,7 @@ fn adr0099_s2_assignment_must_be_contiguous_and_cover_the_graph() {
         }
     );
     assert_eq!(
-        crate::test_support::assignment_before(&four_eqn_graph(), &[0])
+        crate::unit_helpers::assignment_before(&four_eqn_graph(), &[0])
             .expect_err("a cut at 0 empties the first stage"),
         StageSplitError::CutOutOfRange {
             index: 0,
@@ -1844,7 +1874,7 @@ fn adr0099_s2_assignment_must_be_contiguous_and_cover_the_graph() {
         }
     );
     assert_eq!(
-        crate::test_support::assignment_before(&four_eqn_graph(), &[4])
+        crate::unit_helpers::assignment_before(&four_eqn_graph(), &[4])
             .expect_err("a cut at the end empties the last stage"),
         StageSplitError::CutOutOfRange {
             index: 0,
@@ -1853,7 +1883,7 @@ fn adr0099_s2_assignment_must_be_contiguous_and_cover_the_graph() {
         }
     );
     assert_eq!(
-        crate::test_support::assignment_before(&four_eqn_graph(), &[2, 2])
+        crate::unit_helpers::assignment_before(&four_eqn_graph(), &[2, 2])
             .expect_err("cuts must strictly increase"),
         StageSplitError::CutOutOfOrder {
             index: 1,
@@ -1875,18 +1905,20 @@ fn adr0099_s2_assignment_must_be_contiguous_and_cover_the_graph() {
 
 #[test]
 fn adr0099_s2_a_stage_that_hands_off_nothing_is_rejected() {
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
-    let t0 = b.binary(BinOp::Add, x, x);
-    let _d1 = b.binary(BinOp::Mul, t0, t0);
-    let out = b.binary(BinOp::Mul, t0, t0);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
+    let t0 = b.binary(BinOp::Add, x, x).unwrap();
+    let _d1 = b.binary(BinOp::Mul, t0, t0).unwrap();
+    let out = b.binary(BinOp::Mul, t0, t0).unwrap();
     let graph = b.finish(out).unwrap();
 
     let assignment =
-        crate::test_support::assignment_before(&graph, &[1, 2]).expect("the cuts are legal");
+        crate::unit_helpers::assignment_before(&graph, &[1, 2]).expect("the cuts are legal");
     assert_eq!(
         split_stages(&graph, &assignment)
             .expect_err("stage 1 reads only its own results, so it never feeds stage 2"),
@@ -1896,18 +1928,20 @@ fn adr0099_s2_a_stage_that_hands_off_nothing_is_rejected() {
 
 #[test]
 fn adr0099_s2_a_final_stage_that_never_sees_the_output_is_rejected() {
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
-    let t0 = b.binary(BinOp::Add, x, x);
-    let t1 = b.binary(BinOp::Mul, t0, t0);
-    let _after_t1 = b.binary(BinOp::Mul, t1, t1);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
+    let t0 = b.binary(BinOp::Add, x, x).unwrap();
+    let t1 = b.binary(BinOp::Mul, t0, t0).unwrap();
+    let _after_t1 = b.binary(BinOp::Mul, t1, t1).unwrap();
     let graph = b.finish(t0).unwrap();
 
     let assignment =
-        crate::test_support::assignment_before(&graph, &[1, 2]).expect("the cuts are legal");
+        crate::unit_helpers::assignment_before(&graph, &[1, 2]).expect("the cuts are legal");
     assert_eq!(
         split_stages(&graph, &assignment)
             .expect_err("the output is defined in stage 0 and reaches no later stage"),
@@ -1922,16 +1956,18 @@ fn adr0099_s2_a_final_stage_that_never_sees_the_output_is_rejected() {
 fn adr0099_s2_each_stage_keeps_only_the_witnesses_it_defines() {
     use poot_graph_ir::ValidationId;
 
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
-    let t0 = b.binary(BinOp::Add, x, x);
-    let w0 = b.binary(BinOp::Mul, x, x);
-    let t1 = b.binary(BinOp::Mul, t0, t0);
-    let w1 = b.binary(BinOp::Sub, t1, t1);
-    let graph = crate::test_support::finish_with_validations(
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
+    let t0 = b.binary(BinOp::Add, x, x).unwrap();
+    let w0 = b.binary(BinOp::Mul, x, x).unwrap();
+    let t1 = b.binary(BinOp::Mul, t0, t0).unwrap();
+    let w1 = b.binary(BinOp::Sub, t1, t1).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         t1,
         &[
@@ -1942,7 +1978,7 @@ fn adr0099_s2_each_stage_keeps_only_the_witnesses_it_defines() {
     .expect("the witness values are f32 tensors");
 
     let assignment =
-        crate::test_support::assignment_before(&graph, &[2]).expect("the cut is legal");
+        crate::unit_helpers::assignment_before(&graph, &[2]).expect("the cut is legal");
     let split = split_stages(&graph, &assignment).expect("the graph splits");
 
     // Stage graphs renumber their values, so a witness is identified by what computes it: the
@@ -2006,22 +2042,24 @@ fn adr0099_s2_each_stage_keeps_only_the_witnesses_it_defines() {
 /// of that `Mul` (CSE folds it), a dead `Add` (DCE drops it), and the `Add` that carries the
 /// hidden state forward.
 fn layer_scoped_graph() -> Graph {
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
-    let w = b.constant("w", TensorType::f32(vec![4]));
-    let _preamble = b.binary(BinOp::Add, x, x);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
+    let _preamble = b.binary(BinOp::Add, x, x).unwrap();
     let mut hidden = x;
     for layer in 0..3usize {
         let _layer_scope = b.layer_scope(layer);
-        let scaled = b.binary(BinOp::Mul, hidden, w);
-        let duplicate = b.binary(BinOp::Mul, hidden, w);
-        let _dead = b.binary(BinOp::Add, duplicate, duplicate);
-        hidden = b.binary(BinOp::Add, scaled, x);
+        let scaled = b.binary(BinOp::Mul, hidden, w).unwrap();
+        let duplicate = b.binary(BinOp::Mul, hidden, w).unwrap();
+        let _dead = b.binary(BinOp::Add, duplicate, duplicate).unwrap();
+        hidden = b.binary(BinOp::Add, scaled, x).unwrap();
     }
-    let out = b.binary(BinOp::Mul, hidden, hidden);
+    let out = b.binary(BinOp::Mul, hidden, hidden).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -2059,7 +2097,7 @@ fn adr0099_s2_layer_scope_tags_equations_and_layer_cuts_split_between_layers() {
 
     // `after_layer = [0, 1]` is the cut list a three-device plan records; each cut lands on the
     // first equation of the next layer, so the preamble rides stage 0 and the head the last stage.
-    let split = crate::test_support::split_after_layers(&graph, &[0, 1])
+    let split = crate::unit_helpers::split_after_layers(&graph, &[0, 1])
         .expect("both cuts map onto a boundary");
     let per_stage: Vec<Vec<Option<usize>>> = split
         .stages
@@ -2085,7 +2123,7 @@ fn adr0099_s2_layer_scope_tags_equations_and_layer_cuts_split_between_layers() {
     );
 
     // A single cut after layer 0: stage 0 holds layer 0, stage 1 everything from layer 1 on.
-    let two = crate::test_support::split_after_layers(&graph, &[0]).expect("after_layer 0 maps");
+    let two = crate::unit_helpers::split_after_layers(&graph, &[0]).expect("after_layer 0 maps");
     assert_eq!(two.stages.len(), 2);
     assert_eq!(
         layer_tags(&two.stages[0].graph),
@@ -2111,46 +2149,50 @@ fn adr0099_s2_layer_scope_tags_equations_and_layer_cuts_split_between_layers() {
 #[test]
 fn adr0099_s2_layer_cut_errors_are_typed() {
     // An untagged equation between two tagged layers: which side would a cut give it?
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
     let in_layer_zero = {
         let _layer_scope = b.layer_scope(0);
-        b.binary(BinOp::Mul, x, x)
+        b.binary(BinOp::Mul, x, x).unwrap()
     };
-    let hole = b.binary(BinOp::Add, x, x);
+    let hole = b.binary(BinOp::Add, x, x).unwrap();
     let in_layer_one = {
         let _layer_scope = b.layer_scope(1);
-        b.binary(BinOp::Mul, hole, hole)
+        b.binary(BinOp::Mul, hole, hole).unwrap()
     };
     let holey = b.finish(in_layer_one).unwrap();
     let _ = in_layer_zero;
     assert_eq!(
-        crate::test_support::assignment_after_layers(&holey, &[0]),
+        crate::unit_helpers::assignment_after_layers(&holey, &[0]),
         Err(StageSplitError::LayerTags(LayerTagError::Untagged {
             equation: 1
         }))
     );
 
     // A skipped layer id: layer 2 appears where layer 1 should start.
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
     {
         let _layer_scope = b.layer_scope(0);
-        b.binary(BinOp::Mul, x, x);
+        b.binary(BinOp::Mul, x, x).unwrap();
     }
     let skipped = {
         let _layer_scope = b.layer_scope(2);
-        b.binary(BinOp::Mul, x, x)
+        b.binary(BinOp::Mul, x, x).unwrap()
     };
     let skipped = b.finish(skipped).unwrap();
     assert_eq!(
-        crate::test_support::assignment_after_layers(&skipped, &[0]),
+        crate::unit_helpers::assignment_after_layers(&skipped, &[0]),
         Err(StageSplitError::LayerTags(LayerTagError::NonContiguous {
             equation: 1,
             layer: 2,
@@ -2159,18 +2201,20 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     );
 
     // A graph whose first tagged equation is not layer 0 never had a layer 0.
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
     let started_at_one = {
         let _layer_scope = b.layer_scope(1);
-        b.binary(BinOp::Mul, x, x)
+        b.binary(BinOp::Mul, x, x).unwrap()
     };
     let started_at_one = b.finish(started_at_one).unwrap();
     assert_eq!(
-        crate::test_support::assignment_after_layers(&started_at_one, &[0]),
+        crate::unit_helpers::assignment_after_layers(&started_at_one, &[0]),
         Err(StageSplitError::LayerTags(LayerTagError::NonContiguous {
             equation: 0,
             layer: 1,
@@ -2181,26 +2225,28 @@ fn adr0099_s2_layer_cut_errors_are_typed() {
     // A cut past the last layer would produce an empty stage, and a cut on an untagged graph has
     // no layer to land on at all. (A cut at layer 1 of three is legal - it separates 1 from 2.)
     let tagged = layer_scoped_graph();
-    assert!(crate::test_support::assignment_after_layers(&tagged, &[1]).is_ok());
+    assert!(crate::unit_helpers::assignment_after_layers(&tagged, &[1]).is_ok());
     assert_eq!(
-        crate::test_support::assignment_after_layers(&tagged, &[2]),
+        crate::unit_helpers::assignment_after_layers(&tagged, &[2]),
         Err(StageSplitError::LayerCutOutOfRange { cut: 2, layers: 3 })
     );
-    let b = Builder::new();
-    let x = b.slot(
-        poot_graph_ir::graph::Slot::Activation,
-        TensorType::f32(vec![4]),
-    );
-    let untagged_value = b.binary(BinOp::Add, x, x);
+    let b = Builder::for_tests();
+    let x = b
+        .slot(
+            poot_graph_ir::graph::Slot::Activation,
+            TensorType::f32(vec![4]),
+        )
+        .unwrap();
+    let untagged_value = b.binary(BinOp::Add, x, x).unwrap();
     let untagged = b.finish(untagged_value).unwrap();
     assert_eq!(
-        crate::test_support::assignment_after_layers(&untagged, &[0]),
+        crate::unit_helpers::assignment_after_layers(&untagged, &[0]),
         Err(StageSplitError::LayerCutOutOfRange { cut: 0, layers: 0 })
     );
 
     // Cuts must also strictly increase, the same contract an equation cut enforces.
     assert_eq!(
-        crate::test_support::assignment_after_layers(&tagged, &[0, 0]),
+        crate::unit_helpers::assignment_after_layers(&tagged, &[0, 0]),
         Err(StageSplitError::CutOutOfOrder {
             index: 1,
             cut: 5,
@@ -2246,7 +2292,7 @@ fn adr0099_s2_cse_and_dce_preserve_layer_tags() {
 
     // Preserved tags mean a layer cut still maps on the transformed graphs.
     for (label, transformed) in [("cse", &folded), ("dce", &trimmed)] {
-        let split = crate::test_support::split_after_layers(transformed, &[0, 1])
+        let split = crate::unit_helpers::split_after_layers(transformed, &[0, 1])
             .unwrap_or_else(|error| panic!("{label} must keep the tags a cut maps onto: {error}"));
         assert_eq!(split.stages.len(), 3, "{label} keeps three layers");
         assert_eq!(
@@ -2273,12 +2319,12 @@ fn card533_optimize_passes_keep_witness_outputs() {
     use poot_graph_ir::ValidationId;
     type PassFn = fn(&Graph) -> Result<Graph, poot_graph_ir::EditError>;
 
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([4]));
-    let y = b.constant("y", TensorType::f32([4]));
-    let witness = b.binary(BinOp::Mul, x, y);
-    let primary = b.binary(BinOp::Add, witness, y);
-    let graph = crate::test_support::finish_with_validations(
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([4])).unwrap();
+    let y = b.constant("y", TensorType::f32([4])).unwrap();
+    let witness = b.binary(BinOp::Mul, x, y).unwrap();
+    let primary = b.binary(BinOp::Add, witness, y).unwrap();
+    let graph = poot_graph_ir::test_support::graph_fixtures::finish_with_validations(
         b,
         primary,
         &[(ValidationId(533), "card533", witness)],
@@ -2320,11 +2366,11 @@ fn card533_optimize_passes_keep_witness_outputs() {
 /// returns `UnderDeclared { pass: "fuse", declared: Exact, implied: Reassociating }` and this test goes red.
 #[test]
 fn card533_pass_numerics_are_checked_against_produced_ops() {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([4]));
-    let y = b.constant("y", TensorType::f32([4]));
-    let product = b.binary(BinOp::Mul, x, y);
-    let sum = b.binary(BinOp::Add, product, y);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([4])).unwrap();
+    let y = b.constant("y", TensorType::f32([4])).unwrap();
+    let product = b.binary(BinOp::Mul, x, y).unwrap();
+    let sum = b.binary(BinOp::Add, product, y).unwrap();
     let graph = b.finish(sum).unwrap();
 
     let fused = fuse(&graph).unwrap();
@@ -2363,10 +2409,10 @@ fn card533_pass_numerics_are_checked_against_produced_ops() {
 /// class must be the unfused hardware baseline, not `BitExact`.
 #[test]
 fn card533_unfused_decode_matmul_is_not_bit_exact() {
-    let b = Builder::new();
-    let activation = b.constant("activation", TensorType::f32([1, 8]));
-    let weight = b.constant("weight", TensorType::f32([8, 8]));
-    let out = b.matmul(activation, weight);
+    let b = Builder::for_tests();
+    let activation = b.constant("activation", TensorType::f32([1, 8])).unwrap();
+    let weight = b.constant("weight", TensorType::f32([8, 8])).unwrap();
+    let out = b.matmul(activation, weight).unwrap();
     let graph = b.finish(out).unwrap();
     assert!(
         matches!(
@@ -2382,9 +2428,9 @@ fn card533_unfused_decode_matmul_is_not_bit_exact() {
 
     // BitExact stays reachable for a graph that runs no device-executed float arithmetic: movement
     // only, bit-preserving.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32([2, 2]));
-    let moved = b.reshape(x, vec![4]);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32([2, 2])).unwrap();
+    let moved = b.reshape(x, vec![4]).unwrap();
     let movement = b.finish(moved).unwrap();
     assert_eq!(
         implied_numerics(&movement).tier2_class(),
@@ -2400,8 +2446,9 @@ fn card533_unfused_decode_matmul_is_not_bit_exact() {
 // `crates/poot-graph-ir/tests/transform_soundness.rs`, which cannot see these `pub(super)` items
 // (it's a separate crate - see that file's header for why it has to be one).
 use super::attention_match::{
-    AttentionDecline, RopeDecline, canonicalize, match_attention, match_rope_core, producer_map,
+    AttentionDecline, RopeDecline, canonicalize, match_attention, match_rope_core,
 };
+use super::guard_witness::producer_map;
 
 fn output_eqn(g: &Graph) -> &Eqn {
     g.eqns()
@@ -2412,24 +2459,26 @@ fn output_eqn(g: &Graph) -> &Eqn {
 
 /// A full-rotary rotate-half rope with free `x`/`cos`/`sin` shapes; `commute` writes `Mul(cos, x)`.
 fn hand_rope(x_shape: Vec<usize>, cos_shape: Vec<usize>, commute: bool) -> Graph {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(x_shape.clone()));
-    let cos = b.constant("cos", TensorType::f32(cos_shape.clone()));
-    let sin = b.constant("sin", TensorType::f32(cos_shape));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(x_shape.clone())).unwrap();
+    let cos = b
+        .constant("cos", TensorType::f32(cos_shape.clone()))
+        .unwrap();
+    let sin = b.constant("sin", TensorType::f32(cos_shape)).unwrap();
     let last = x_shape.len() - 1;
     let d = x_shape[last];
     let half = d / 2;
-    let x1 = b.slice(x, last, 0, half);
-    let x2 = b.slice(x, last, half, d);
-    let neg_x2 = b.unary(UnOp::Neg, x2);
-    let rotate_half = b.concat(last, &[neg_x2, x1]);
+    let x1 = b.slice(x, last, 0, half).unwrap();
+    let x2 = b.slice(x, last, half, d).unwrap();
+    let neg_x2 = b.unary(UnOp::Neg, x2).unwrap();
+    let rotate_half = b.concat(last, &[neg_x2, x1]).unwrap();
     let xc = if commute {
-        b.binary(BinOp::Mul, cos, x)
+        b.binary(BinOp::Mul, cos, x).unwrap()
     } else {
-        b.binary(BinOp::Mul, x, cos)
+        b.binary(BinOp::Mul, x, cos).unwrap()
     };
-    let rs = b.binary(BinOp::Mul, rotate_half, sin);
-    let out = b.binary(BinOp::Add, xc, rs);
+    let rs = b.binary(BinOp::Mul, rotate_half, sin).unwrap();
+    let out = b.binary(BinOp::Add, xc, rs).unwrap();
     b.finish(out).unwrap()
 }
 
@@ -2445,12 +2494,18 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     // Axis: the row softmax reduces the wrong axis.
     let wrong_axis = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-        let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+            .unwrap();
+        let out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
         b.finish(out).unwrap()
     };
     let wrong_axis = mutated(&wrong_axis, |draft| {
@@ -2465,12 +2520,18 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     // Scale: a softcap chain whose two constants are not reciprocals.
     let wrong_softcap = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-        let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+            .unwrap();
+        let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0)).unwrap();
         b.finish(out).unwrap()
     };
     let mut rewrote = false;
@@ -2495,12 +2556,18 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     // arity, but not a tanh. Mutation: drop the `Tanh` check in `match_pre_mask`; this fuses.
     let not_tanh = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-        let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+            .unwrap();
+        let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(2.0)).unwrap();
         b.finish(out).unwrap()
     };
     let mut swapped = 0;
@@ -2522,12 +2589,14 @@ fn card536a_attention_near_misses_decline_with_a_reason() {
     // Type gate: a shared single-head key the decomposition merely broadcasts (MQA written by broadcasting
     // instead of `repeat_kv`); the fused op indexes one key head per group, so its typing rule refuses.
     let broadcast_key = {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3]));
-        let k = b.constant("k", TensorType::f32(vec![1, 1, 5, 3]));
-        let v = b.constant("v", TensorType::f32(vec![1, 1, 5, 2]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, 5]));
-        let out = attention_masked(&b, q, k, v, 1, 1.0, mask);
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 3])).unwrap();
+        let k = b.constant("k", TensorType::f32(vec![1, 1, 5, 3])).unwrap();
+        let v = b.constant("v", TensorType::f32(vec![1, 1, 5, 2])).unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, 5]))
+            .unwrap();
+        let out = attention_masked(&b, q, k, v, 1, 1.0, mask).unwrap();
         b.finish(out).unwrap()
     };
     cases.push((
@@ -2604,12 +2673,18 @@ fn card536a_guards_have_killing_reasons() {
     // decode-softcap decline in `match_attention`; this match fails with that decline.
     let decode_softcap = {
         let (hq, cap, d) = (4usize, 6usize, 16usize);
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-        let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(30.0));
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+        let k = b
+            .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let v = b
+            .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+            .unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+            .unwrap();
+        let out = attention_masked_softcap(&b, q, k, v, 1, 0.25, mask, Some(30.0)).unwrap();
         b.finish(out).unwrap()
     };
     let matched = match_attention(
@@ -2628,21 +2703,36 @@ fn card536a_guards_have_killing_reasons() {
     // GQA repeat cross-check: k is repeated by 2, v is not. The chain stays a valid decomposition
     // (V keeps four heads) but the repeated K carries a different factor.
     let (hq, cap, d, hkv) = (4usize, 6usize, 16usize, 2usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hkv, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-    let kt = b.transpose(poot_graph_ir::ops::repeat_kv(&b, k, 2), vec![0, 1, 3, 2]);
-    let scores = b.matmul(q, kt);
-    let scores = b.binary_scalar(BinOp::Mul, scores, poot_graph_ir::Scalar::F32(0.25));
-    let scores = b.binary(BinOp::Add, scores, mask);
-    let last = b.aval(scores).rank() - 1;
-    let m = b.reduce(RedOp::Max, scores, last, true);
-    let e = b.unary(UnOp::Exp, b.binary(BinOp::Sub, scores, m));
-    let denom = b.reduce(RedOp::Sum, e, last, true);
-    let p = b.binary(BinOp::Div, e, denom);
-    let gqa_out = b.matmul(p, v);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hkv, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
+    let kt = b
+        .transpose(
+            poot_graph_ir::ops::repeat_kv(&b, k, 2).unwrap(),
+            vec![0, 1, 3, 2],
+        )
+        .unwrap();
+    let scores = b.matmul(q, kt).unwrap();
+    let scores = b
+        .binary_scalar(BinOp::Mul, scores, poot_graph_ir::Scalar::F32(0.25))
+        .unwrap();
+    let scores = b.binary(BinOp::Add, scores, mask).unwrap();
+    let last = b.aval(scores).unwrap().rank() - 1;
+    let m = b.reduce(RedOp::Max, scores, last, true).unwrap();
+    let e = b
+        .unary(UnOp::Exp, b.binary(BinOp::Sub, scores, m).unwrap())
+        .unwrap();
+    let denom = b.reduce(RedOp::Sum, e, last, true).unwrap();
+    let p = b.binary(BinOp::Div, e, denom).unwrap();
+    let gqa_out = b.matmul(p, v).unwrap();
     let gqa = b.finish(gqa_out).unwrap();
     assert_eq!(
         match_attention(
@@ -2662,12 +2752,14 @@ fn card536a_guards_have_killing_reasons() {
 #[test]
 fn a_wide_head_dim_still_matches() {
     let build = |m: usize, d: usize| {
-        let b = Builder::new();
-        let q = b.constant("q", TensorType::f32(vec![1, 2, m, d]));
-        let k = b.constant("k", TensorType::f32(vec![1, 2, 5, d]));
-        let v = b.constant("v", TensorType::f32(vec![1, 2, 5, d]));
-        let mask = b.constant("mask", TensorType::f32(vec![1, 1, m, 5]));
-        let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
+        let b = Builder::for_tests();
+        let q = b.constant("q", TensorType::f32(vec![1, 2, m, d])).unwrap();
+        let k = b.constant("k", TensorType::f32(vec![1, 2, 5, d])).unwrap();
+        let v = b.constant("v", TensorType::f32(vec![1, 2, 5, d])).unwrap();
+        let mask = b
+            .constant("mask", TensorType::f32(vec![1, 1, m, 5]))
+            .unwrap();
+        let out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
         b.finish(out).unwrap()
     };
     for m in [1, 3] {
@@ -2693,14 +2785,29 @@ fn a_wide_head_dim_still_matches() {
 #[test]
 fn a_split_key_with_a_narrower_value_matches_as_a_split_attention() {
     let (hq, cap, nope, rope, dv) = (2usize, 5usize, 6usize, 4usize, 3usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, nope + rope]));
-    let k_nope = b.constant("k_nope", TensorType::f32(vec![1, hq, cap, nope]));
-    let k_pe = b.constant("k_pe", TensorType::f32(vec![1, 1, cap, rope]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, dv]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-    let k = b.concat(3, &[k_nope, poot_graph_ir::ops::repeat_kv(&b, k_pe, hq)]);
-    let out = attention_masked(&b, q, k, v, 1, 0.25, mask);
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![1, hq, 1, nope + rope]))
+        .unwrap();
+    let k_nope = b
+        .constant("k_nope", TensorType::f32(vec![1, hq, cap, nope]))
+        .unwrap();
+    let k_pe = b
+        .constant("k_pe", TensorType::f32(vec![1, 1, cap, rope]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, dv]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
+    let k = b
+        .concat(
+            3,
+            &[k_nope, poot_graph_ir::ops::repeat_kv(&b, k_pe, hq).unwrap()],
+        )
+        .unwrap();
+    let out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
     let graph = b.finish(out).unwrap();
     let matched = match_attention(
         &graph,
@@ -2727,19 +2834,32 @@ fn a_split_key_with_a_narrower_value_matches_as_a_split_attention() {
 /// and the raw I32 `len`. The length witness is declared as a validation output when `validated`.
 fn live_attention_graph(split: bool, validated: bool) -> poot_graph_ir::Graph {
     let (batch, hq, hkv, cap, d, dv) = (2usize, 4usize, 2usize, 6usize, 8usize, 5usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![batch, hq, 1, d]));
-    let v = b.constant("v", TensorType::f32(vec![batch, hkv, cap, dv]));
-    let mask = b.constant("mask", TensorType::f32(vec![batch, 1, 1, cap]));
-    let len = b.constant("len", TensorType::new(vec![batch], poot_tensor::DType::I32));
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![batch, hq, 1, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![batch, hkv, cap, dv]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![batch, 1, 1, cap]))
+        .unwrap();
+    let len = b
+        .constant("len", TensorType::new(vec![batch], poot_tensor::DType::I32))
+        .unwrap();
     let keys = if split {
         poot_graph_ir::ops::AttentionKeys::Split {
-            head: b.constant("k_head", TensorType::f32(vec![batch, hkv, cap, d - 3])),
-            shared: b.constant("k_shared", TensorType::f32(vec![batch, 1, cap, 3])),
+            head: b
+                .constant("k_head", TensorType::f32(vec![batch, hkv, cap, d - 3]))
+                .unwrap(),
+            shared: b
+                .constant("k_shared", TensorType::f32(vec![batch, 1, cap, 3]))
+                .unwrap(),
         }
     } else {
         poot_graph_ir::ops::AttentionKeys::Single(
-            b.constant("k", TensorType::f32(vec![batch, hkv, cap, d])),
+            b.constant("k", TensorType::f32(vec![batch, hkv, cap, d]))
+                .unwrap(),
         )
     };
     let live =
@@ -2958,11 +3078,13 @@ fn live_near_misses_decline_with_a_reason() {
 #[test]
 fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
     for scale in [0.25, 1.0] {
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![1, 4, 8]));
-        let w = b.constant("w", TensorType::f32(vec![8, 5]));
-        let scaled = b.binary_scalar(BinOp::Mul, x, poot_graph_ir::Scalar::F32(scale));
-        let output = b.matmul(scaled, w);
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1, 4, 8])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![8, 5])).unwrap();
+        let scaled = b
+            .binary_scalar(BinOp::Mul, x, poot_graph_ir::Scalar::F32(scale))
+            .unwrap();
+        let output = b.matmul(scaled, w).unwrap();
         let graph = b.finish(output).unwrap();
         let (canonical, declines) = canonicalize_with_declines(&graph).unwrap();
         let root = canonical.eqns().last().unwrap();
@@ -2989,11 +3111,11 @@ fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
             format!("{:?}", canonical.eqns())
         );
     }
-    let b = Builder::new();
-    let e = b.constant("e", TensorType::f32(vec![3, 4]));
-    let denom = b.constant("denom", TensorType::f32(vec![3, 1]));
-    let recip = b.unary(UnOp::Recip, denom);
-    let mul = b.binary(BinOp::Mul, e, recip);
+    let b = Builder::for_tests();
+    let e = b.constant("e", TensorType::f32(vec![3, 4])).unwrap();
+    let denom = b.constant("denom", TensorType::f32(vec![3, 1])).unwrap();
+    let recip = b.unary(UnOp::Recip, denom).unwrap();
+    let mul = b.binary(BinOp::Mul, e, recip).unwrap();
     let graph = b.finish(mul).unwrap();
     let (canonical, declines) = canonicalize_with_declines(&graph).unwrap();
     assert_eq!(
@@ -3015,22 +3137,30 @@ fn canonicalize_preserves_unproved_spellings_and_removes_identity() {
 #[test]
 fn card536a_scale_as_a_runtime_value_declines() {
     let (hq, cap, d) = (4usize, 6usize, 16usize);
-    let b = Builder::new();
-    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d]));
-    let k = b.constant("k", TensorType::f32(vec![1, hq, cap, d]));
-    let v = b.constant("v", TensorType::f32(vec![1, hq, cap, d]));
-    let mask = b.constant("mask", TensorType::f32(vec![1, 1, 1, cap]));
-    let scale = b.constant("scale", TensorType::f32(vec![1]));
-    let kt = b.transpose(k, vec![0, 1, 3, 2]);
-    let qk = b.matmul(q, kt);
-    let scores = b.binary(BinOp::Mul, scale, qk);
-    let scores = b.binary(BinOp::Add, scores, mask);
-    let last = b.aval(scores).rank() - 1;
-    let m = b.reduce(RedOp::Max, scores, last, true);
-    let e = b.unary(UnOp::Exp, b.binary(BinOp::Sub, scores, m));
-    let denom = b.reduce(RedOp::Sum, e, last, true);
-    let p = b.binary(BinOp::Div, e, denom);
-    let graph_out = b.matmul(p, v);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
+    let scale = b.constant("scale", TensorType::f32(vec![1])).unwrap();
+    let kt = b.transpose(k, vec![0, 1, 3, 2]).unwrap();
+    let qk = b.matmul(q, kt).unwrap();
+    let scores = b.binary(BinOp::Mul, scale, qk).unwrap();
+    let scores = b.binary(BinOp::Add, scores, mask).unwrap();
+    let last = b.aval(scores).unwrap().rank() - 1;
+    let m = b.reduce(RedOp::Max, scores, last, true).unwrap();
+    let e = b
+        .unary(UnOp::Exp, b.binary(BinOp::Sub, scores, m).unwrap())
+        .unwrap();
+    let denom = b.reduce(RedOp::Sum, e, last, true).unwrap();
+    let p = b.binary(BinOp::Div, e, denom).unwrap();
+    let graph_out = b.matmul(p, v).unwrap();
     let graph = b.finish(graph_out).unwrap();
 
     assert_eq!(
@@ -3060,11 +3190,11 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
     use poot_tensor::HostTensor;
 
     let (m, k, n) = (3usize, 5usize, 4usize);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, k]));
-    let w = b.constant("w", TensorType::f32(vec![k, n]));
-    let bias = b.constant("bias", TensorType::f32(vec![n]));
-    let out = poot_graph_ir::ops::linear(&b, x, w, Some(bias));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![n])).unwrap();
+    let out = poot_graph_ir::ops::linear(&b, x, w, Some(bias)).unwrap();
     let traced = b.finish(out).unwrap();
     assert!(
         traced
@@ -3184,17 +3314,23 @@ fn eval_bits(g: &Graph) -> Vec<u32> {
 fn contraction_epilogue_near_misses_stay_unfused() {
     let (m, k, n) = (3usize, 5usize, 4usize);
     let linear = |b: &Builder| {
-        let x = b.constant("x", TensorType::f32(vec![m, k]));
-        let w = b.constant("w", TensorType::f32(vec![k, n]));
-        let bias = b.constant("bias", TensorType::f32(vec![n]));
-        (b.matmul(x, w), bias)
+        let x = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+        let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
+        let bias = b.constant("bias", TensorType::f32(vec![n])).unwrap();
+        (b.matmul(x, w).unwrap(), bias)
     };
 
     // The fixture that does fuse: head, bias, residual.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (head, bias) = linear(&b);
-    let residual = b.constant("residual", TensorType::f32(vec![m, n]));
-    let out = b.binary(BinOp::Add, b.binary(BinOp::Add, head, bias), residual);
+    let residual = b.constant("residual", TensorType::f32(vec![m, n])).unwrap();
+    let out = b
+        .binary(
+            BinOp::Add,
+            b.binary(BinOp::Add, head, bias).unwrap(),
+            residual,
+        )
+        .unwrap();
     let fused_case = b.finish(out).unwrap();
     let fused = fuse_contraction_epilogues(&fused_case, |_, _| true).unwrap();
     assert_eq!(epilogues_of(&fused).len(), 1, "{:?}", fused.eqns());
@@ -3202,23 +3338,25 @@ fn contraction_epilogue_near_misses_stay_unfused() {
     assert_eq!(eval_bits(&fused), eval_bits(&fused_case), "fused fixture");
 
     // A head read twice: the add and a second consumer.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (head, bias) = linear(&b);
-    let out = b.binary(BinOp::Mul, b.binary(BinOp::Add, head, bias), head);
+    let out = b
+        .binary(BinOp::Mul, b.binary(BinOp::Add, head, bias).unwrap(), head)
+        .unwrap();
     let two_consumers = b.finish(out).unwrap();
     // A reducing consumer.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (head, _) = linear(&b);
-    let out = b.reduce(RedOp::Sum, head, 1, true);
+    let out = b.reduce(RedOp::Sum, head, 1, true).unwrap();
     let reducing = b.finish(out).unwrap();
     // A step whose output is larger than the head: a leaf of another shape broadcast against it.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (head, _) = linear(&b);
-    let wide = b.constant("wide", TensorType::f32(vec![2, m, n]));
-    let out = b.binary(BinOp::Add, head, wide);
+    let wide = b.constant("wide", TensorType::f32(vec![2, m, n])).unwrap();
+    let out = b.binary(BinOp::Add, head, wide).unwrap();
     let shape_changing = b.finish(out).unwrap();
     // The head is the graph output, so a step beyond it cannot absorb it.
-    let b = Builder::new();
+    let b = Builder::for_tests();
     let (head, _) = linear(&b);
     let pinned = b.finish(head).unwrap();
     for (name, graph) in [
@@ -3246,12 +3384,14 @@ fn contraction_epilogue_near_misses_stay_unfused() {
 #[test]
 fn a_single_use_bias_broadcast_folds_into_the_epilogue_leaf() {
     let (m, k, n) = (3usize, 5usize, 4usize);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, k]));
-    let w = b.constant("w", TensorType::f32(vec![k, n]));
-    let bias = b.constant("bias", TensorType::f32(vec![n]));
-    let expanded = b.broadcast(bias, vec![m, n]);
-    let out = b.binary(BinOp::Add, b.matmul(x, w), expanded);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![n])).unwrap();
+    let expanded = b.broadcast(bias, vec![m, n]).unwrap();
+    let out = b
+        .binary(BinOp::Add, b.matmul(x, w).unwrap(), expanded)
+        .unwrap();
     let traced = b.finish(out).unwrap();
     let fused = fuse_contraction_epilogues(&traced, |_, _| true).unwrap();
     let epilogues = epilogues_of(&fused);
@@ -3274,16 +3414,19 @@ fn a_single_use_bias_broadcast_folds_into_the_epilogue_leaf() {
     assert_eq!(eval_bits(&fused), eval_bits(&traced));
 
     // The same broadcast read by a second equation is not folded away.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, k]));
-    let w = b.constant("w", TensorType::f32(vec![k, n]));
-    let bias = b.constant("bias", TensorType::f32(vec![n]));
-    let expanded = b.broadcast(bias, vec![m, n]);
-    let out = b.binary(
-        BinOp::Mul,
-        b.binary(BinOp::Add, b.matmul(x, w), expanded),
-        expanded,
-    );
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![k, n])).unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![n])).unwrap();
+    let expanded = b.broadcast(bias, vec![m, n]).unwrap();
+    let out = b
+        .binary(
+            BinOp::Mul,
+            b.binary(BinOp::Add, b.matmul(x, w).unwrap(), expanded)
+                .unwrap(),
+            expanded,
+        )
+        .unwrap();
     let shared = b.finish(out).unwrap();
     let after = fuse_contraction_epilogues(&shared, |_, _| true).unwrap();
     assert!(
@@ -3302,11 +3445,13 @@ fn a_single_use_bias_broadcast_folds_into_the_epilogue_leaf() {
 /// `implied_op_numerics`; the graph reads `Unfused` and this row goes red.
 #[test]
 fn float_select_is_exact_not_float_arithmetic() {
-    let b = Builder::new();
-    let cond = b.constant("cond", TensorType::new(vec![4], poot_tensor::DType::I32));
-    let if_true = b.constant("t", TensorType::f32(vec![4]));
-    let if_false = b.constant("f", TensorType::f32(vec![4]));
-    let selected = b.select(cond, if_true, if_false);
+    let b = Builder::for_tests();
+    let cond = b
+        .constant("cond", TensorType::new(vec![4], poot_tensor::DType::I32))
+        .unwrap();
+    let if_true = b.constant("t", TensorType::f32(vec![4])).unwrap();
+    let if_false = b.constant("f", TensorType::f32(vec![4])).unwrap();
+    let selected = b.select(cond, if_true, if_false).unwrap();
     let graph = b.finish(selected).unwrap();
     assert!(matches!(graph.eqns(), [eqn] if matches!(eqn.op, OpKind::Select)));
     assert_eq!(implied_numerics(&graph), NumericsProperty::Exact);

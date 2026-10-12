@@ -7,16 +7,18 @@
 //! tier 2. `OpKind::class() == Composite` exactly when [`decompose`] returns `Some` for the op's operand
 //! types (the consistency row in this file's tests).
 
+use crate::budget::TraceLimits;
 use crate::builder::{Builder, BuilderAppendPlan, Traced};
-use crate::error::BuilderAppendError;
+use crate::error::BuilderError;
 use crate::graph::{Graph, Operand, ValueId};
 use crate::op::{
     ContractionHead, ContractionRows, FusedOperand, FusedRegion, KeyLayout, KvBound, OpKind,
-    PackedWeight, RowRegion, RowStep, ScanFamily,
+    RowRegion, RowStep, ScanFamily,
 };
 use crate::ops;
 use crate::packed_source::packed_source_constants;
 use crate::types::{DType, TensorType};
+use poot_quant::PackedWeight;
 
 /// A composite's primitive definition: `graph` computes the composite's result as its output from the
 /// constants `operands`, one per equation operand, in operand order. An evaluator binds the equation's
@@ -48,9 +50,19 @@ pub struct Decomposition {
 ///   replaces.
 /// - `Fused(region)` / `FusedRow(region)`: the region's steps as equations, operands in place (a
 ///   `PackLane` leaf is the unit `Slice` of its packed input, a non-empty `pack` the last-axis `Concat`).
-pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> {
-    let out = op.infer(operands).ok()?;
-    let b = Builder::new();
+///
+/// `Ok(None)` is "this operation has no decomposition (or its operands do not type)". `Err` is a
+/// failure to build the one that exists: a decomposition that does not fit `limits`, or a defect of the
+/// definition itself.
+pub fn decompose(
+    op: &OpKind,
+    operands: &[TensorType],
+    limits: TraceLimits,
+) -> Result<Option<Decomposition>, BuilderError> {
+    let Ok(out) = op.infer(operands) else {
+        return Ok(None);
+    };
+    let b = Builder::new(limits);
     // A packed carrier is bound by its role-carrying source name, which the evaluator checks.
     let carrier_names: Vec<String> = match op {
         OpKind::PackedContraction { descriptor, .. } => {
@@ -71,10 +83,12 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
             };
             b.constant(&name, ty.clone())
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     let result = match op {
         OpKind::Attention(attrs) => {
-            let (&[q, k, v, mask], extra) = inputs.split_first_chunk::<4>()?;
+            let Some((&[q, k, v, mask], extra)) = inputs.split_first_chunk::<4>() else {
+                return Ok(None);
+            };
             let (shared, len) = match (attrs.key, attrs.bound, extra) {
                 (KeyLayout::Single, KvBound::Capacity, []) => (None, None),
                 (KeyLayout::Split { .. }, KvBound::Capacity, &[shared]) => (Some(shared), None),
@@ -82,7 +96,7 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
                 (KeyLayout::Split { .. }, KvBound::Live, &[shared, len]) => {
                     (Some(shared), Some(len))
                 }
-                _ => return None,
+                _ => return Ok(None),
             };
             let keys = match shared {
                 Some(shared) => ops::AttentionKeys::Split { head: k, shared },
@@ -98,70 +112,82 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
                 mask,
                 attrs.softcap,
                 len,
-            )
+            )?
         }
         OpKind::Rope { rot } => {
             let &[x, cos, sin] = inputs.as_slice() else {
-                return None;
+                return Ok(None);
             };
             let shape = &operands[0].shape;
             let last = shape.len() - 1;
-            ops::rope_partial(&b, x, cos, sin, shape[last], *rot, last)
+            ops::rope_partial(&b, x, cos, sin, shape[last], *rot, last)?
         }
         OpKind::Scan(attrs) => {
             // The definition unrolls one chunk body per chunk; the CPU oracle never evaluates it whole but one
             // chunk window at a time (`poot_eval`), so the sequence length has no ceiling there.
-            attrs.layout(operands).ok()?;
+            if attrs.layout(operands).is_err() {
+                return Ok(None);
+            }
             match (attrs.family, inputs.as_slice()) {
                 (ScanFamily::DeltaRule, &[q, k, v, g, beta, s_in]) => {
-                    ops::scan_delta_rule_packed(&b, q, k, v, g, beta, s_in, attrs.chunk)
+                    ops::scan_delta_rule_packed(&b, q, k, v, g, beta, s_in, attrs.chunk)?
                 }
                 (ScanFamily::Ssd, &[x, b_in, c_in, delta, a, d, h_in]) => {
-                    ops::scan_ssd_packed(&b, x, b_in, c_in, delta, a, d, h_in, attrs.chunk)
+                    ops::scan_ssd_packed(&b, x, b_in, c_in, delta, a, d, h_in, attrs.chunk)?
                 }
-                _ => return None,
+                _ => return Ok(None),
             }
         }
         OpKind::ContractionEpilogue { head, region } => {
             let (head_operands, extras) = inputs.split_at(head.operands());
-            contraction_epilogue(&b, *head, region, head_operands, extras).ok()??
+            let staged = contraction_epilogue(&b, *head, region, head_operands, extras);
+            match ill_typed_is_none(staged)? {
+                Some(result) => result,
+                None => return Ok(None),
+            }
         }
-        OpKind::Fused(region) => fused(&b, region, &inputs).ok()??,
-        OpKind::FusedRow(region) => fused_row(&b, region, &inputs).ok()??,
+        OpKind::Fused(region) => match ill_typed_is_none(fused(&b, region, &inputs))? {
+            Some(result) => result,
+            None => return Ok(None),
+        },
+        OpKind::FusedRow(region) => match ill_typed_is_none(fused_row(&b, region, &inputs))? {
+            Some(result) => result,
+            None => return Ok(None),
+        },
         OpKind::PackedContraction {
             descriptor,
             rows: ContractionRows::Blocks(blocks),
         } => {
             let [activation, carriers @ ..] = inputs.as_slice() else {
-                return None;
+                return Ok(None);
             };
-            packed_contraction(&b, *descriptor, *blocks, *activation, carriers)
+            packed_contraction(&b, *descriptor, *blocks, *activation, carriers)?
         }
         OpKind::PackedContraction {
             rows: ContractionRows::Indexed { .. },
             ..
-        } => return None,
+        } => return Ok(None),
         OpKind::DenseContraction { .. } => {
             let &[activation, weight] = inputs.as_slice() else {
-                return None;
+                return Ok(None);
             };
-            b.matmul(activation, b.transpose(weight, vec![1, 0]))
+            b.matmul(activation, b.transpose(weight, vec![1, 0])?)?
         }
         OpKind::GroupedDenseContraction { groups, .. } => {
             let &[activation, weight] = inputs.as_slice() else {
-                return None;
+                return Ok(None);
             };
-            let [rows, k] = b.aval(weight).shape[..] else {
-                return None;
+            let [rows, k] = b.aval(weight)?.shape[..] else {
+                return Ok(None);
             };
-            let blocks = b.reshape(weight, vec![*groups, rows / groups, k]);
-            b.matmul(activation, b.transpose(blocks, vec![0, 2, 1]))
+            let blocks = b.reshape(weight, vec![*groups, rows / groups, k])?;
+            b.matmul(activation, b.transpose(blocks, vec![0, 2, 1])?)?
         }
         OpKind::DenseRowGather { .. } => {
             let &[table, index] = inputs.as_slice() else {
-                return None;
+                return Ok(None);
             };
-            b.cast(b.gather(table, 0, index), DType::F32)
+            b.cast(b.gather(table, 0, index)?, DType::F32)?
         }
         OpKind::Unary(_)
         | OpKind::Binary(_)
@@ -188,17 +214,34 @@ pub fn decompose(op: &OpKind, operands: &[TensorType]) -> Option<Decomposition> 
         | OpKind::AllReduce { .. }
         | OpKind::AllGather { .. }
         | OpKind::RandomUniform { .. }
-        | OpKind::SampleToken { .. } => return None,
+        | OpKind::SampleToken { .. } => return Ok(None),
     };
     // The composite's typing rule and its definition must agree, or the evaluator would publish a value
     // of another type than the equation declares.
-    if b.aval(result) != out {
-        return None;
+    if b.aval(result)? != out {
+        return Ok(None);
     }
-    Some(Decomposition {
+    Ok(Some(Decomposition {
         operands: inputs.iter().map(|input| input.id()).collect(),
-        graph: b.finish(result).unwrap(),
-    })
+        graph: b.finish(result)?,
+    }))
+}
+
+/// A fragment that does not stage because the composite is ill typed has no decomposition (`Ok(None)`);
+/// a request the budget or an allocation refused is a failure the caller must see.
+fn ill_typed_is_none(
+    staged: Result<Option<Traced>, BuilderError>,
+) -> Result<Option<Traced>, BuilderError> {
+    match staged {
+        Err(
+            error @ (BuilderError::Budget(_)
+            | BuilderError::Reserve { .. }
+            | BuilderError::SizeOverflow { .. }
+            | BuilderError::GenerationOverflow),
+        ) => Err(error),
+        Err(_) => Ok(None),
+        Ok(result) => Ok(result),
+    }
 }
 
 /// A packed contraction: the weight dequantized to `[out, k]` F32, then the activation contracted against
@@ -213,14 +256,14 @@ fn packed_contraction(
     blocks: usize,
     activation: Traced,
     carriers: &[Traced],
-) -> Traced {
-    let weight = b.packed_dequant(carriers, descriptor);
+) -> Result<Traced, BuilderError> {
+    let weight = b.packed_dequant(carriers, descriptor)?;
     let [out, k] = descriptor.shape();
     let weight = if blocks == 1 {
-        b.transpose(weight, vec![1, 0])
+        b.transpose(weight, vec![1, 0])?
     } else {
-        let grouped = b.reshape(weight, vec![blocks, out / blocks, k]);
-        b.transpose(grouped, vec![0, 2, 1])
+        let grouped = b.reshape(weight, vec![blocks, out / blocks, k])?;
+        b.transpose(grouped, vec![0, 2, 1])?
     };
     b.matmul(activation, weight)
 }
@@ -230,7 +273,7 @@ fn region_operand(
     plan: &mut BuilderAppendPlan,
     locals: &[Traced],
     operand: &FusedOperand,
-) -> Result<Option<Operand>, BuilderAppendError> {
+) -> Result<Option<Operand>, BuilderError> {
     Ok(Some(match operand {
         FusedOperand::Local(local) => {
             let Some(value) = locals.get(*local) else {
@@ -264,12 +307,9 @@ fn region_operand(
 fn commit_region(
     b: &Builder,
     inputs: &[Traced],
-    stage: impl FnOnce(
-        &mut BuilderAppendPlan,
-        &mut Vec<Traced>,
-    ) -> Result<Option<Traced>, BuilderAppendError>,
-) -> Result<Option<Traced>, BuilderAppendError> {
-    let mut plan = b.append_plan(0);
+    stage: impl FnOnce(&mut BuilderAppendPlan, &mut Vec<Traced>) -> Result<Option<Traced>, BuilderError>,
+) -> Result<Option<Traced>, BuilderError> {
+    let mut plan = b.append_plan(0)?;
     let mut locals = inputs.to_vec();
     let Some(result) = stage(&mut plan, &mut locals)? else {
         return Ok(None);
@@ -288,7 +328,7 @@ fn stage_region(
     plan: &mut BuilderAppendPlan,
     locals: &mut Vec<Traced>,
     region: &FusedRegion,
-) -> Result<Option<Traced>, BuilderAppendError> {
+) -> Result<Option<Traced>, BuilderError> {
     for step in &region.steps {
         let mut operands = Vec::with_capacity(step.inputs.len());
         for operand in &step.inputs {
@@ -323,7 +363,7 @@ fn fused(
     b: &Builder,
     region: &FusedRegion,
     inputs: &[Traced],
-) -> Result<Option<Traced>, BuilderAppendError> {
+) -> Result<Option<Traced>, BuilderError> {
     commit_region(b, inputs, |plan, locals| stage_region(plan, locals, region))
 }
 
@@ -336,8 +376,8 @@ fn contraction_epilogue(
     region: &FusedRegion,
     head_operands: &[Traced],
     extras: &[Traced],
-) -> Result<Option<Traced>, BuilderAppendError> {
-    let mut plan = b.append_plan(0);
+) -> Result<Option<Traced>, BuilderError> {
+    let mut plan = b.append_plan(0)?;
     let operands = head_operands
         .iter()
         .map(|operand| Operand::Value(operand.id()))
@@ -358,7 +398,7 @@ fn fused_row(
     b: &Builder,
     region: &RowRegion,
     inputs: &[Traced],
-) -> Result<Option<Traced>, BuilderAppendError> {
+) -> Result<Option<Traced>, BuilderError> {
     commit_region(b, inputs, |plan, locals| {
         for step in &region.steps {
             let (op, step_operands) = match step {
@@ -388,11 +428,10 @@ fn fused_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::op::{
-        AttentionAttrs, BinOp, FusedOp, FusedStep, OpClass, PackedWeight, RedOp, SampleRule, UnOp,
-        WeightFormat,
-    };
+    use crate::op::{AttentionAttrs, BinOp, FusedOp, FusedStep, OpClass, RedOp, SampleRule, UnOp};
     use crate::types::{DType, Scalar};
+    use poot_quant::PackedWeight;
+    use poot_quant::format::WeightFormat;
 
     fn f32(shape: &[usize]) -> TensorType {
         TensorType::f32(shape.to_vec())
@@ -757,7 +796,7 @@ mod tests {
             let declared = op.infer(operands).unwrap_or_else(|error| {
                 panic!("{}: canonical operands must type: {error}", op.name())
             });
-            let decomposition = decompose(op, operands);
+            let decomposition = decompose(op, operands, TraceLimits::for_tests()).unwrap();
             assert_eq!(
                 op.class() == OpClass::Composite,
                 decomposition.is_some(),
@@ -804,19 +843,35 @@ mod tests {
     #[test]
     fn an_ill_typed_composite_has_no_decomposition() {
         let rope = OpKind::Rope { rot: 4 };
-        assert!(decompose(&rope, &[f32(&[1, 2, 3, 8]), f32(&[3, 6]), f32(&[3, 6])]).is_none());
+        assert!(
+            decompose(
+                &rope,
+                &[f32(&[1, 2, 3, 8]), f32(&[3, 6]), f32(&[3, 6])],
+                TraceLimits::for_tests()
+            )
+            .unwrap()
+            .is_none()
+        );
         let i32_rope = [
             typed(&[3, 8], DType::I32),
             typed(&[3, 4], DType::I32),
             typed(&[3, 4], DType::I32),
         ];
-        assert!(decompose(&rope, &i32_rope).is_none());
+        assert!(
+            decompose(&rope, &i32_rope, TraceLimits::for_tests())
+                .unwrap()
+                .is_none()
+        );
         // A bias of width 5 does not broadcast against the head's `[2, 4]` result.
         let epilogue = OpKind::ContractionEpilogue {
             head: ContractionHead::MatMul,
             region: bias_residual_region(),
         };
         let wide_bias = [f32(&[2, 3]), f32(&[3, 4]), f32(&[5]), f32(&[2, 4])];
-        assert!(decompose(&epilogue, &wide_bias).is_none());
+        assert!(
+            decompose(&epilogue, &wide_bias, TraceLimits::for_tests())
+                .unwrap()
+                .is_none()
+        );
     }
 }

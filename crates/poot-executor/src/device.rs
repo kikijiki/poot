@@ -3,13 +3,13 @@
 //! donated state updates in place on every backend, decided by the engine from the state-commit plan,
 //! never asked of the device.
 
+use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::time::Duration;
 
-use poot_graph_plan::{Submission, Target};
+use poot_graph_plan::{Target, production_plan::Submission};
 use poot_runtime_common::CompiledKernel;
-pub use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use poot_target::{AieTargetId, BufferStorage};
 
 /// One dispatch's device duration within a step's recording, in replay order.
@@ -187,7 +187,7 @@ pub trait Device {
     /// later submits, regardless of `submission`'s value. `submission` names the contract's
     /// admitted mode (`Engine::add_entry` refuses `Submission::Eager` before `begin` ever runs); no
     /// current `Device` impl gives `Eager` a different meaning here, including a caller driving one
-    /// directly, outside the contract (`poot-gpu/tests/executor_contract.rs`'s SC-015 fault probe
+    /// directly, outside the contract (`poot-llm/tests/wgpu_executor_contract.rs`'s SC-015 fault probe
     /// does exactly that).
     fn begin(&mut self, submission: Submission) -> Result<(), Self::Error>;
     fn dispatch(&mut self, dispatch: Dispatch<'_, Self>) -> Result<(), Self::Error>;

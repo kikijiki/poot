@@ -22,7 +22,6 @@ use poot_quant::weights::{
     WeightRole, WeightStore, WeightView,
 };
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::gdn::{GdnHeadOrder, GdnParams, GdnWeights, gdn};
@@ -40,6 +39,7 @@ use crate::model::{
 };
 use crate::names::{ExpertNames, MoeNames, SharedNames, map_moe_layer};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen3next");
 
@@ -616,12 +616,11 @@ impl Model for Qwen3Next {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(
             &b,
             &step,
@@ -644,7 +643,7 @@ impl Model for Qwen3Next {
                     },
                 )
             },
-        );
+        )?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -685,7 +684,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The tensors of a Qwen3-Next checkpoint of `config`, by HF name.
 pub(crate) fn hf_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, w) = (n("vocab_size"), n("hidden_size"));
     let (heads, kv, hd) = (
         n("num_attention_heads"),
@@ -815,7 +814,11 @@ mod tests {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
         let g = model
-            .trace(Phase::Decode, step_shape(1, CAP, LogitRows::Last))
+            .trace(
+                Phase::Decode,
+                step_shape(1, CAP, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let names: Vec<String> = g
             .state()
@@ -1096,7 +1099,7 @@ mod tests {
     type GgufTensor = (String, Vec<u64>, u32, Vec<u8>);
 
     fn gguf_of(fx: &Fixture) -> (Vec<(String, GgufValue)>, Vec<GgufTensor>) {
-        let n = |f: &str| fx.config[f].as_u64().unwrap() as usize;
+        let n = |f: &str| crate::registry::Fixture::count(&fx.config, f);
         let (w, hd) = (n("hidden_size"), n("linear_key_head_dim"));
         let (hk, hv) = (n("linear_num_key_heads"), n("linear_num_value_heads"));
         let rep = hv / hk;

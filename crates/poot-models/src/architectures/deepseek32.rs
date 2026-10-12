@@ -9,7 +9,7 @@ use crate::model::{FamilyKey, Model, ModelError};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_quant::weights::WeightStore;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("deepseek32");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek32");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,

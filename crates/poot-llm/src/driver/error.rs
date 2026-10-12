@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use poot_executor::ExecError;
-use poot_graph_plan::{Refusal, StagedCompileError};
+use poot_graph_plan::{Refusal, staged::StagedCompileError};
 use poot_models::model::{ModelError, Phase, StepShape, TraceError};
 use poot_models::registry::RegistryError;
 
@@ -13,7 +13,7 @@ use crate::core::sampler::SamplerFault;
 use crate::driver::lora::{AdapterError, GenerationId, LoraError};
 use crate::driver::step::SeqId;
 use crate::driver::suffix::Head;
-use crate::error::{ChatTemplateError, TextError};
+use poot_text::{ChatTemplateError, TextError};
 
 /// Why the driver cannot serve something: the model, the registry or the planner has no way to.
 #[derive(Debug, thiserror::Error)]
@@ -31,9 +31,13 @@ pub enum Unsupported {
     /// The traced graph cannot take the checkpoint's packed storage.
     #[error(transparent)]
     PackedBind(poot_graph_plan::PackedBindError),
-    /// Extending the traced graph (the sampling suffix) produced a malformed graph.
+    /// Extending the traced graph (the sampling suffix) failed: the tracer refused the suffix or it
+    /// produced a malformed graph.
     #[error(transparent)]
-    Graph(Box<poot_graph_ir::EditError>),
+    Graph(Box<poot_graph_ir::BuilderError>),
+    /// A rollback or reorder graph over the program's carried state could not be built.
+    #[error(transparent)]
+    RowGraph(Box<crate::driver::reorder::RowGraphError>),
     /// No registered family names the checkpoint's config.
     #[error(transparent)]
     Registry(RegistryError),
@@ -350,10 +354,6 @@ pub enum PreparedSetRefusal {
         would_retain: u64,
         limit: u64,
     },
-    /// A step of more tokens than the driver's `max_trace_tokens` is never traced: the set admits no
-    /// entry of that extent, and a longer prompt runs as legal chunks instead.
-    #[error("a step of {tokens} tokens is above the trace limit of {limit} tokens per step")]
-    TraceTokens { tokens: usize, limit: usize },
     /// A step needs an entry `prepare` never admitted: new static schemas are admitted explicitly,
     /// never compiled by a step.
     #[error("no prepared entry for {phase:?} {shape:?} {head:?} (adapters {adapters:?})")]

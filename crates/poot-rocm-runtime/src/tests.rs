@@ -1,4 +1,33 @@
+use crate::aql::{
+    AQL_PACKET_HEADER_INVALID, AqlRingWriter, DispatchAxis, DispatchGeometry,
+    DispatchGeometryViolation, KernargAddress, write_kernel_dispatch_packet_body,
+};
+use crate::bindings::{
+    HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED,
+    HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED,
+    HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT,
+    HSA_AMD_MEMORY_POOL_LOCATION_CPU, HSA_AMD_MEMORY_POOL_LOCATION_GPU, hsa_queue_t,
+};
+use crate::buffer::{Pool, RocmAlloc, checked_copy, checked_layout};
+use crate::context::{
+    DevicePoison, Held, StagingBuffer, TimeoutLeaks, UploadStrategy, require_gpu_check_with,
+    ticks_to_duration, upload_strategy_for_pool,
+};
+use crate::discovery::agent_isa_name;
+use crate::error::{check, describe};
+use crate::hsaco::{ModuleConstruction, kernel_symbol_matches, validate_kernarg_buffer};
+use crate::owner::ResourceOwner;
+use crate::queue::{
+    QueueCreationPlan, QueueProperties, QueueRequest, QueueRingProvenance, QueueRole,
+    cooperative_gws_publication_facts, destroy_queue_reference, device_ring_override_present,
+    queue_request, validate_created_queue, validate_queue_plan_provenance,
+};
+use poot_runtime_common::{BufferRole, MemoryCounters, fnv1a};
+use poot_target::{BufferStorage, ElementKind};
 use std::cell::Cell;
+use std::ffi::{OsString, c_void};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::hsaco::await_below_one;
@@ -6,81 +35,76 @@ use crate::hsaco::await_below_one;
 #[test]
 fn hsa_queue_constants_match_the_public_abi() {
     assert_eq!(bindings::HSA_QUEUE_TYPE_MULTI, 0);
-    assert_eq!(bindings::HSA_QUEUE_TYPE_SINGLE, 1);
+    assert_eq!(bindings::test_only::HSA_QUEUE_TYPE_SINGLE, 1);
     assert_eq!(bindings::HSA_QUEUE_TYPE_COOPERATIVE, 2);
     assert_eq!(bindings::HSA_QUEUE_FEATURE_KERNEL_DISPATCH, 1);
 }
 
 #[test]
 fn queue_role_and_ring_provenance_are_independent_contracts() {
+    let cooperative = QueueCreationPlan::CooperativeGws;
     assert_eq!(
-        queue_request(QueueCreationPlan::CooperativeGws, 16_384),
+        queue_request(cooperative, 16_384),
         QueueRequest {
             queue_type: 2,
             size: 16_384,
         }
     );
+    assert_eq!(cooperative.role(), QueueRole::Cooperative);
     assert_eq!(
-        queue_request(QueueCreationPlan::RecordedReplay, 16_384),
+        cooperative.provenance(),
+        QueueRingProvenance::CooperativeGwsSystemMemory
+    );
+
+    let receipt = QueueCreationPlan::PcieDeviceMemoryRingReceipt;
+    assert_eq!(
+        queue_request(receipt, 16_384),
         QueueRequest {
             queue_type: 0,
             size: 16_384,
         }
     );
+    assert_eq!(receipt.role(), QueueRole::PcieDeviceRingReceipt);
     assert_eq!(
-        queue_request(QueueCreationPlan::PcieDeviceMemoryRingReceipt, 16_384),
-        QueueRequest {
-            queue_type: 0,
-            size: 16_384,
-        }
-    );
-    assert_eq!(
-        QueueCreationPlan::RecordedReplay.provenance(),
-        QueueRingProvenance::OrdinarySystemMemory
-    );
-    assert_eq!(
-        QueueCreationPlan::PcieDeviceMemoryRingReceipt.provenance(),
+        receipt.provenance(),
         QueueRingProvenance::PcieDeviceMemoryReceipt
     );
 }
 
 #[test]
-fn ordinary_ring_provenance_fails_closed_on_any_device_override() {
+fn device_ring_provenance_fails_closed_unless_the_override_held_throughout() {
     assert!(!device_ring_override_present(|_| None));
     assert!(device_ring_override_present(|_| Some("1".into())));
     assert!(device_ring_override_present(|_| Some("0".into())));
     assert!(device_ring_override_present(|_| Some(OsString::new())));
 
-    validate_queue_plan_provenance(QueueCreationPlan::RecordedReplay, false, false).unwrap();
-    for (override_at_load, override_now) in [(true, true), (true, false), (false, true)] {
+    let receipt = QueueCreationPlan::PcieDeviceMemoryRingReceipt;
+    validate_queue_plan_provenance(receipt, true, true).unwrap();
+    for (override_at_load, override_now) in [(false, false), (true, false), (false, true)] {
         assert!(matches!(
-            validate_queue_plan_provenance(
-                QueueCreationPlan::RecordedReplay,
-                override_at_load,
-                override_now,
-            ),
+            validate_queue_plan_provenance(receipt, override_at_load, override_now),
             Err(RocmError::QueueRingProvenanceConflict {
-                role: QueueRole::RecordedReplay,
+                role: QueueRole::PcieDeviceRingReceipt,
                 ..
             })
         ));
     }
 
-    validate_queue_plan_provenance(QueueCreationPlan::PcieDeviceMemoryRingReceipt, true, true)
-        .unwrap();
-    assert!(
+    for (override_at_load, override_now) in
+        [(false, false), (true, true), (true, false), (false, true)]
+    {
         validate_queue_plan_provenance(
-            QueueCreationPlan::PcieDeviceMemoryRingReceipt,
-            false,
-            true,
+            QueueCreationPlan::CooperativeGws,
+            override_at_load,
+            override_now,
         )
-        .is_err()
-    );
+        .unwrap();
+    }
 }
 
 #[test]
 fn returned_queue_contract_is_validated_before_use() {
-    let request = queue_request(QueueCreationPlan::RecordedReplay, 16_384);
+    let request = queue_request(QueueCreationPlan::PcieDeviceMemoryRingReceipt, 16_384);
     validate_created_queue(
         request,
         QueueProperties {
@@ -600,8 +624,8 @@ fn narrow_buffer_rejected_by_f32_operation_before_copy() {
 }
 
 /// Card 527, mechanism-level (the production bind-path acceptance evidence is
-/// `poot-rocm-gpu`'s `bind_bf16_packed_cache_mismatch_is_a_typed_refusal`, card 527):
-/// `bf16_packed()` canonicalizes on `BufferElement::I32` (review F2), the one word ROCm's packed upload
+/// `poot-rocm-device`'s `bind_bf16_packed_cache_mismatch_is_a_typed_refusal`, card 527):
+/// `bf16_packed()` canonicalizes on `ElementKind::I32` (review F2), the one word ROCm's packed upload
 /// actually uses (`upload_i32`). A packed-BF16 value and a plain dense I32 value share native element
 /// kind; only `checked_copy`'s full `BufferStorage` comparison (not element kind alone) tells them
 /// apart.
@@ -736,7 +760,7 @@ fn native_buffer_contract_roundtrip_rocm() {
         .expect("download f32");
     assert_eq!(f32_out, [1.0, 2.0, 3.0, 4.0]);
     assert_eq!(f32_buffer.byte_capacity(), 16);
-    assert_eq!(f32_buffer.element(), BufferElement::F32);
+    assert_eq!(f32_buffer.element(), ElementKind::F32);
 
     let i32_buffer = ctx
         .upload_i32(&[1, 2, 3, 4], BufferRole::Activation)
@@ -745,18 +769,7 @@ fn native_buffer_contract_roundtrip_rocm() {
     ctx.download_i32(&i32_buffer, &mut i32_out)
         .expect("download i32");
     assert_eq!(i32_out, [1, 2, 3, 4]);
-    assert_eq!(i32_buffer.element(), BufferElement::I32);
-
-    let bf16_buffer = ctx
-        .upload_bf16_bytes(&[0, 0, 0x80, 0x3f], BufferRole::Activation)
-        .expect("upload bf16 bytes");
-    assert_eq!(bf16_buffer.elem_count(), 2);
-    assert_eq!(bf16_buffer.byte_capacity(), 4);
-    assert_eq!(bf16_buffer.element(), BufferElement::Bf16);
-    assert!(matches!(
-        ctx.update_f32(&bf16_buffer, &[0.0, 1.0]),
-        Err(RocmError::RepresentationMismatch { .. })
-    ));
+    assert_eq!(i32_buffer.element(), ElementKind::I32);
 }
 
 #[test]
@@ -1922,12 +1935,12 @@ fn ring_writer_device_store_fence_issues_the_architecture_fence() {
         ring: ring.as_mut_ptr(),
         header: 0,
     };
-    let fences_before = publication::issued_device_store_fence_count();
+    let fences_before = publication::tests::issued_device_store_fence_count();
 
     writer.device_store_fence(DeviceStoreFence::X86StoreFence);
 
     assert_eq!(
-        publication::issued_device_store_fence_count() - fences_before,
+        publication::tests::issued_device_store_fence_count() - fences_before,
         1,
         "one device_store_fence call must issue exactly one architecture fence"
     );
@@ -2156,7 +2169,7 @@ fn dispatch_rejects_buffers_that_do_not_meet_the_compiled_schema() {
     let wrong_count = ctx.dispatch(
         &kernel,
         &kernarg,
-        &[BufferElement::F32, BufferElement::F32],
+        &[ElementKind::F32, ElementKind::F32],
         grid,
         block,
     );
@@ -2177,7 +2190,7 @@ fn dispatch_rejects_buffers_that_do_not_meet_the_compiled_schema() {
     let wrong_kind = ctx.dispatch(
         &kernel,
         &kernarg,
-        &[BufferElement::F32, BufferElement::F32, BufferElement::Bf16],
+        &[ElementKind::F32, ElementKind::F32, ElementKind::Bf16],
         grid,
         block,
     );
@@ -2187,8 +2200,8 @@ fn dispatch_rejects_buffers_that_do_not_meet_the_compiled_schema() {
             Err(RocmError::KernelArgs(
                 poot_runtime_common::KernelArgError::ElementKind {
                     index: 2,
-                    expected: BufferElement::F32,
-                    actual: BufferElement::Bf16,
+                    expected: ElementKind::F32,
+                    actual: ElementKind::Bf16,
                 }
             ))
         ),
@@ -2199,7 +2212,7 @@ fn dispatch_rejects_buffers_that_do_not_meet_the_compiled_schema() {
     ctx.dispatch(
         &kernel,
         &kernarg,
-        &[BufferElement::F32, BufferElement::F32, BufferElement::F32],
+        &[ElementKind::F32, ElementKind::F32, ElementKind::F32],
         grid,
         block,
     )
@@ -2230,7 +2243,7 @@ fn lookup_kernel_rejects_a_mismatched_entry_point_and_dispatches_the_right_kerne
     let (square_module, square_compiled) = compile_and_load(
         &ctx,
         "square",
-        &poot_test_util::kernel_fixtures::square_kernel(),
+        &poot_kernel_ir::test_support::square_kernel(),
     );
 
     // Red: add's module does not contain square's entry point (and vice versa) - rejected, not
@@ -2264,7 +2277,7 @@ fn lookup_kernel_rejects_a_mismatched_entry_point_and_dispatches_the_right_kerne
     ctx.dispatch(
         &add_kernel,
         &add_kernarg,
-        &[BufferElement::F32, BufferElement::F32, BufferElement::F32],
+        &[ElementKind::F32, ElementKind::F32, ElementKind::F32],
         (3, 1, 1),
         (3, 1, 1),
     )
@@ -2293,7 +2306,7 @@ fn lookup_kernel_rejects_a_mismatched_entry_point_and_dispatches_the_right_kerne
     ctx.dispatch(
         &square_kernel,
         &square_kernarg,
-        &[BufferElement::F32, BufferElement::F32],
+        &[ElementKind::F32, ElementKind::F32],
         (3, 1, 1),
         (3, 1, 1),
     )
@@ -2308,7 +2321,7 @@ fn lookup_kernel_rejects_a_mismatched_entry_point_and_dispatches_the_right_kerne
 /// `n` `(a, b, c, d)` rows where `a*b - c*d` computed with two separate f32 roundings differs from the
 /// same expression with the second multiply and the subtract fused into one rounding step - i.e.
 /// genuinely FMA-sensitive rows, found by a small deterministic search (splitmix64). Mirrors
-/// `poot-runtime`'s `no_contract_tests::fma_sensitive_rows` (kept crate-local rather than shared, matching
+/// `poot-wgpu-runtime`'s `no_contract_tests::fma_sensitive_rows` (kept crate-local rather than shared, matching
 /// this file's existing self-contained-fixture style).
 fn no_contract_fma_sensitive_rows(n: usize) -> Vec<(f32, f32, f32, f32)> {
     let mut state = 0x2545_F491_4F6C_DD1Du64;
@@ -2369,7 +2382,7 @@ fn dispatch_no_contract_probe(
     let (module, compiled) = compile_and_load(
         ctx,
         &format!("no_contract_{tag}"),
-        &poot_test_util::kernel_fixtures::no_contract_probe_kernel(marked),
+        &poot_kernel_ir::test_support::no_contract_probe_kernel(marked),
     );
     let kernel = ctx
         .lookup_kernel(&module, compiled.entry_point())
@@ -2394,11 +2407,11 @@ fn dispatch_no_contract_probe(
         &kernel,
         &kernarg,
         &[
-            BufferElement::F32,
-            BufferElement::F32,
-            BufferElement::F32,
-            BufferElement::F32,
-            BufferElement::F32,
+            ElementKind::F32,
+            ElementKind::F32,
+            ElementKind::F32,
+            ElementKind::F32,
+            ElementKind::F32,
         ],
         (n, 1, 1),
         (n, 1, 1),
@@ -2410,7 +2423,7 @@ fn dispatch_no_contract_probe(
     got
 }
 
-/// Card 628: the AMDGCN counterpart of `poot-runtime`'s `no_contract_tests` (RADV/ACO) -
+/// Card 628: the AMDGCN counterpart of `poot-wgpu-runtime`'s `no_contract_tests` (RADV/ACO) -
 /// the marked packed-dequant-style `a*b - c*d` kernel dispatched on real ROCm/HSA hardware (gfx1151),
 /// checked against the unfused scalar reference bit for bit on FMA-sensitive rows. AMDGCN's compiled HSACO
 /// is the device's final ISA (ahead-of-time, no further JIT), so a passing dispatch is a complete

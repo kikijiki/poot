@@ -6,8 +6,11 @@
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernelgen as kg;
 use poot_target::DeviceCaps;
-use poot_test_util::kernel_fixtures::{attention_reference, attention_reference_keys};
 use poot_test_util::{assert_close, max_abs_error};
+
+#[path = "support/attention.rs"]
+mod attention;
+use attention::{attention_reference, attention_reference_keys};
 
 fn spec(
     batch: usize,

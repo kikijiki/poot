@@ -24,9 +24,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use poot_graph_ir::graph::ValueMeta;
-use poot_graph_ir::graph::{BoundaryId, Eqn, Graph, Operand, Slot, SlotKey, Storage, ValueId};
+use poot_graph_ir::graph::{
+    BoundaryId, Eqn, Graph, GraphEdit, Operand, Slot, SlotKey, Storage, ValidationId, ValueId,
+};
 use poot_graph_ir::op::{ContractionRows, OpKind};
 use poot_graph_ir::types::TensorType;
+use poot_graph_ir::{
+    GuardValues, IndexGuardEmitError, IndexGuardError, ShapeError, emit_index_guard,
+};
 use poot_tensor::DType;
 
 use super::GraphBudget;
@@ -110,6 +115,13 @@ pub enum PoolError {
     /// The tables of one selection do not agree on how many experts they hold.
     #[error("the tables of one routed selection hold {first} and {second} experts")]
     ExpertCountMismatch { first: usize, second: usize },
+    /// The index guard of a site's translated rows cannot be emitted: the pool's row count is past the
+    /// `i32` words of a row id, or the translated rows are not an I32 selector.
+    #[error(transparent)]
+    RowGuard(IndexGuardError),
+    /// An equation of a site's row guard does not type-check over the translated rows.
+    #[error("an equation of a site's row guard does not type-check: {0}")]
+    RowGuardShape(ShapeError),
     #[error(transparent)]
     Expansion(Box<ExpansionError>),
     #[error(transparent)]
@@ -183,8 +195,11 @@ pub(crate) fn pool_experts(
 
     let mut pooled = g.edit();
     let mut sites = Vec::with_capacity(found.len());
-    // `(original equation the gather goes before, the gather)`, in ascending position.
-    let mut gathers: Vec<(usize, Eqn)> = Vec::with_capacity(found.len());
+    // `(original equation the gather goes before, the gather and the guard on its output)`, in ascending
+    // position.
+    let mut gathers: Vec<(usize, Vec<Eqn>)> = Vec::with_capacity(found.len());
+    // The row-guard witnesses this pass declares, one per site.
+    let mut added: Vec<ValidationId> = Vec::with_capacity(found.len());
     for (ordinal, site) in found.iter().enumerate() {
         let first = site.eqns[0];
         let layer = g.eqns()[first].layer;
@@ -195,18 +210,31 @@ pub(crate) fn pool_experts(
             TensorType::new(vec![site.experts], DType::I32),
         );
         let ids_aval = g.aval(site.ids).clone();
-        let translated = pooled
+        let raw = pooled
             .values_mut()
             .push(ValueMeta::new(ids_aval, Storage::Device, None));
-        gathers.push((
-            first,
-            Eqn {
-                op: OpKind::Gather { axis: 0 },
-                inputs: vec![Operand::Value(map), Operand::Value(site.ids)],
-                out: translated,
-                layer,
-            },
-        ));
+        let mut chain = vec![Eqn {
+            op: OpKind::Gather { axis: 0 },
+            inputs: vec![Operand::Value(map), Operand::Value(site.ids)],
+            out: raw,
+            layer,
+        }];
+        // The map holds `-1` for an expert that is not resident. The host makes every selected expert
+        // resident before this stage runs, so such a lane is a sync that did not hold: the canonical index
+        // guard (`Builder::guard_index_bounds`) replaces it with row 0 and its witness counts it, declared
+        // as a validation output, so the step publishes a failure instead of a wrong expert's product.
+        let guard = guard_rows(&mut pooled, &mut chain, raw, slots, layer)?;
+        let id = ValidationId(
+            pooled
+                .witnesses()
+                .map(|witness| witness.id.0 + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        pooled.push_witness(id, format!("pool.{tag}.resident"), guard.witness);
+        added.push(id);
+        gathers.push((first, chain));
+        let translated = guard.guarded;
         for &e in &site.eqns {
             let eqn = &mut pooled.eqns_mut()[e];
             let position = match eqn.op {
@@ -276,13 +304,14 @@ pub(crate) fn pool_experts(
     for (ordinal, site) in found.iter().enumerate() {
         opens.insert(site.eqns[0], ordinal);
     }
-    let mut gathers: Vec<Option<Eqn>> = gathers.into_iter().map(|(_, g)| Some(g)).collect();
+    let mut gathers: Vec<Option<Vec<Eqn>>> =
+        gathers.into_iter().map(|(_, chain)| Some(chain)).collect();
     let mut cuts = Vec::with_capacity(found.len());
     let mut eqns = Vec::with_capacity(original.len() + found.len());
     for (index, eqn) in original.iter().enumerate() {
         if let Some(&ordinal) = opens.get(&index) {
             cuts.push(eqns.len());
-            eqns.push(gathers[ordinal].take().expect("one gather per site"));
+            eqns.extend(gathers[ordinal].take().expect("one gather per site"));
             eqns.extend(found[ordinal].views.iter().map(|&v| original[v].clone()));
         }
         if !moved.contains(&index) {
@@ -292,9 +321,46 @@ pub(crate) fn pool_experts(
     *pooled.eqns_mut() = eqns;
 
     Ok(Pooled {
-        graph: pooled.commit()?,
+        graph: pooled.commit_adding_witnesses(&added)?,
         spec: PoolSpec { sites },
         cuts,
+    })
+}
+
+/// Append the canonical index guard ([`emit_index_guard`]) of `raw` (the translated rows of one site) to
+/// `chain`: its equations go after the gather, in the stage that reads the pool. Returns the guarded rows and
+/// the witness.
+fn guard_rows(
+    g: &mut GraphEdit,
+    chain: &mut Vec<Eqn>,
+    raw: ValueId,
+    rows: usize,
+    layer: Option<poot_graph_ir::graph::LayerIndex>,
+) -> Result<GuardValues, PoolError> {
+    let raw_type = g.aval(raw).clone();
+    emit_index_guard(raw, &raw_type, rows, |op: OpKind, inputs: Vec<Operand>| {
+        let types: Vec<TensorType> = inputs
+            .iter()
+            .map(|operand| match operand {
+                Operand::Value(value) => g.aval(*value).clone(),
+                Operand::Lit(scalar) => scalar.ty(),
+            })
+            .collect();
+        let aval = op.infer(&types)?;
+        let out = g
+            .values_mut()
+            .push(ValueMeta::new(aval, Storage::Device, None));
+        chain.push(Eqn {
+            op,
+            inputs,
+            out,
+            layer,
+        });
+        Ok::<_, ShapeError>(out)
+    })
+    .map_err(|error| match error {
+        IndexGuardEmitError::Guard(error) => PoolError::RowGuard(error),
+        IndexGuardEmitError::Emit(error) => PoolError::RowGuardShape(error),
     })
 }
 

@@ -29,12 +29,14 @@ A family implements `poot_models::model::Model`:
 pub trait Model: Send + Sync {
     fn config(&self) -> &ModelConfig;     // vocab, eos ids, output kind, chat format
     fn weights(&self) -> &WeightMap;      // which checkpoint tensors feed which typed role
-    fn trace(&self, phase: Phase, shape: StepShape)
-        -> Result<Graph, TraceError>;
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder)
+        -> Result<Graph, TraceError>;     // the family's tracer body
+    fn trace(&self, phase: Phase, shape: StepShape, limits: TraceLimits)
+        -> Result<Graph, TraceError>;     // provided: admits the token count, then calls trace_into
 }
 ```
 
-- `trace` builds the graph of one step. A `StepShape` is the semantic shape of that step: `rows`
+- `trace` builds the graph of one step under the caller's `TraceLimits`. A `StepShape` is the semantic shape of that step: `rows`
   sequences of `tokens` new tokens each over a cache of `capacity` positions, a KV layout (contiguous, or
   paged over a pool of slots), whether logits come back for the last token or all of them and, when
   asked, a hidden-state carry.
@@ -45,7 +47,11 @@ pub trait Model: Send + Sync {
   other family refuses it with a typed error). Prefill and decode are one body: token
   and position inputs are typed slots and positions are absolute, so a prefill is a step that continues from
   a position.
-- A shape or phase a family cannot trace is a typed `TraceError`, never a panic. A routed model's graph also
+- A shape or phase a family cannot trace is a typed `TraceError`, never a panic, and so is a step that
+  does not fit the caller's limits: `TraceError::Budget` names the exhausted resource (tokens, values,
+  equations, scalar-literal bytes or owned bytes), the limit and the attempted total. The token count is
+  checked before the tracer body runs and every other resource before the request it covers is allocated or
+  appended, so a refused step builds nothing past the limit and publishes no graph. A routed model's graph also
   declares its router witnesses as validation outputs, which the executor checks before any readback.
 - The graph holds consts named by the weight map, not by checkpoint tensor names. The checkpoint's spelling
   lives in the family's name table; KV layout, batching and weight format are not the tracer's business.

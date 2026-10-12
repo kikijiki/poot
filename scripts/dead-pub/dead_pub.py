@@ -11,24 +11,38 @@ impl) is dead when its name is referenced nowhere except:
 
 - its own definition and the impl blocks that define it,
 - `pub use` re-exports (a re-export is not a use),
-- test code of the crate that declares it -- `#[cfg(test)]` items and the out-of-line modules they declare, and
-  that crate's own `tests/`, `examples/` and `benches/` targets -- which needs no `pub` and cannot by itself keep
-  an item alive,
 - code inside another dead item (a dead item keeps nothing alive; the scan runs to a fixpoint).
 
-Every other reference counts: the crate's own `src/bin`, another workspace crate, or another crate's integration
-test, example or bench needs the item to be `pub`, and the crate's own non-test code needs it to exist.
-`poot-test-util` is used that way.
+A reference from test code is never a use (ruling DP1), in any crate. Test code is a `#[cfg(test)]` item or the
+out-of-line modules it declares, an item gated by `feature = "test-support"` (POOT-ADR-0113: the sanctioned gate
+for test-only API that needs private state), and every `tests/`, `examples/` and `benches/` target, `#[ignore]`d
+tests included. A crate that every workspace dependent takes only as a dev-dependency (`poot-test-util`, the
+parity fixtures) is test infrastructure: its own source is test code for the crates it references, and a test
+that uses one of its items keeps that item alive.
 
-The scan is name based: a name shared with another item reads as used, so it can miss a dead item but never
-invents one. Only whole identifier tokens count; comments and string contents are not references. Items marked
-`#[kernel]`, `#[test]`, `#[no_mangle]` and the like are reachable by other means and are skipped.
+Every other reference counts: a crate's non-test code, its `src/bin`, a build script, or another production
+crate. The scan is name based: a name shared with another item reads as used, so it can miss a dead item but
+never invents one. Only whole identifier tokens count; comments and string contents are not references. Items
+marked `#[kernel]`, `#[test]`, `#[no_mangle]` and the like are reachable by other means and are skipped.
+
+Two more checks fail the scan:
+
+- a bare `#[cfg(test)]` item (or `cfg(all(test, ...))`) outside a test-module tree: `#[cfg(test)]` code lives in
+  a `#[cfg(test)] mod`, whose file and submodules are the tree (raudit2 R9). `cfg(any(test, ...))` and
+  `feature = "test-support"` gates are not bare.
+- a bare `#[cfg(test)]` below item level in a production file: on an enum variant, a struct field, a match arm
+  or a statement (`let`, expression) of a production fn. Such code compiles in the tested build and not in the
+  shipped one, so production would differ from what the tests exercise. Make the code identical in both and
+  inject the test behaviour through a trait or a test-support type; scaffolding that is genuinely test-only
+  moves into a `#[cfg(test)] mod` tree. The gate is the bare `cfg(test)` only: an ADR-0113 `test-support`
+  gate is the sanctioned one and is not reported here either.
+- a `test-support` feature reachable from a normal or build edge of a production crate (`cargo tree`), which
+  would put test-only API into a release build (POOT-ADR-0113).
 
 Limits, all toward missing a dead item: an item whose name is common (`new`, `run`, `len`, ...) reads as used
 because some other item shares the name; enum variants, struct fields, trait methods, `pub(crate)` items and
 `pub use` glob targets are not examined; a name that appears only in a macro-generated identifier is not seen.
-`#[cfg(any(test, ...))]` and `#[cfg(not(test))]` code counts as production code, so only `cfg(test)` and
-`cfg(all(test, ...))` hide a reference.
+`#[cfg(any(test, feature = "x"))]` and `#[cfg(not(test))]` code counts as production code.
 
 There is no allow-list and no exemption: every dead `pub` item the scan finds fails the check.
 
@@ -220,22 +234,50 @@ class SourceFile:
     impls: list[ImplBlock] = field(default_factory=list)
     mods: list[ModDecl] = field(default_factory=list)
     items: list[Item] = field(default_factory=list)
+    build_script: bool = False  # a build script is compiled and run by cargo: its references are uses
+    bare_cfg_test: list[tuple[int, str]] = field(default_factory=list)  # (line, "kind name") outside a test tree
+    # (line, shape) of a test-only `cfg` attribute below item level in production code: an enum variant, a struct
+    # field, a match arm, a statement. Filled by `scan_member_cfg_test` once `test_ranges` is known.
+    member_cfg_test: list[tuple[int, str]] = field(default_factory=list)
 
 
 def attr_text(toks: list[Tok], open_i: int, close_i: int) -> list[str]:
     return [t.text for t in toks[open_i + 1 : close_i] if t.kind == "id"]
 
 
-def is_cfg_test(words: list[str]) -> bool:
-    """`cfg(test)` and `cfg(all(test, ...))` only: `any(test, ...)` and `not(test)` also compile outside tests.
-
-    `words` are the identifiers of the attribute, so `cfg(all(test, feature = "x"))` is [cfg, all, test, feature].
-    """
-    if len(words) < 2 or words[0] != "cfg":
+def cfg_test_only(toks: list[Tok], open_i: int, close_i: int) -> bool:
+    """Whether the `#[cfg(...)]` attribute in toks[open_i + 1 : close_i] compiles only in test code: `test` or
+    `feature = "test-support"` (ADR-0113), through `all` (one operand suffices) and `any` (every operand
+    must). `not(...)` and any other predicate compile outside tests."""
+    i = open_i + 1
+    if close_i - i < 3 or toks[i].text != "cfg" or toks[i + 1].text != "(":
         return False
-    if words[1] == "test":
-        return True
-    return words[1] == "all" and "test" in words and "any" not in words and "not" not in words
+
+    def predicate(i: int) -> tuple[bool, int]:
+        t = toks[i]
+        if t.text in ("all", "any", "not") and toks[i + 1].text == "(":
+            operands: list[bool] = []
+            i += 2
+            while toks[i].text != ")":
+                value, i = predicate(i)
+                operands.append(value)
+                if toks[i].text == ",":
+                    i += 1
+            i += 1
+            if t.text == "all":
+                return any(operands), i
+            return (t.text == "any" and bool(operands) and all(operands)), i
+        if t.text == "test":
+            return True, i + 1
+        if toks[i + 1].text == "=" and toks[i + 2].kind == "s":
+            return (t.text == "feature" and toks[i + 2].text == "test-support"), i + 3
+        return False, i + 1
+
+    return predicate(i + 2)[0]
+
+
+def mentions_test_support(toks: list[Tok], open_i: int, close_i: int) -> bool:
+    return any(t.kind == "s" and t.text == "test-support" for t in toks[open_i + 1 : close_i])
 
 
 def is_export_attr(words: list[str]) -> bool:
@@ -286,6 +328,7 @@ def parse_zone(
     toks = f.toks
     while i < end:
         attrs: list[list[str]] = []
+        gates: list[str] = []  # per attribute: "bare" (cfg(test)), "support" (test-support gate) or ""
         first = i
         while i < end and toks[i].text == "#":
             j = i + 1
@@ -293,9 +336,13 @@ def parse_zone(
             j += inner
             if j < end and toks[j].text == "[":
                 words = attr_text(toks, j, match[j])
-                if inner and zone == "file" and is_cfg_test(words):
+                gate = ""
+                if cfg_test_only(toks, j, match[j]):
+                    gate = "support" if mentions_test_support(toks, j, match[j]) else "bare"
+                if inner and zone == "file" and gate:
                     f.is_test = True
                 attrs.append(words)
+                gates.append(gate)
                 i = match[j] + 1
             else:
                 break
@@ -341,9 +388,11 @@ def parse_zone(
         else:
             item_end = terminator
 
-        test = in_test or any(is_cfg_test(a) or (a and a[0] == "test") for a in attrs)
+        test = in_test or any(gates) or any(a and a[0] == "test" for a in attrs)
         if test:
             f.test_ranges.append((first, item_end))
+        if "bare" in gates and not in_test and keyword != "mod":
+            f.bare_cfg_test.append((toks[head].line, f"{keyword or 'item'} {name}".strip()))
 
         if keyword == "use" and is_pub:
             f.reexport_ranges.append((head, item_end))
@@ -375,6 +424,75 @@ def parse_zone(
                     )
                 )
         i = item_end + 1
+
+
+ITEM_START = ITEM_KEYWORDS | {"use", "mod", "impl", "macro_rules", "extern"}
+
+
+def enclosing_openers(toks: list[Tok], match: dict[int, int]) -> dict[int, int]:
+    """Token index -> index of the innermost bracket that encloses it (absent at file level)."""
+    parent: dict[int, int] = {}
+    stack: list[int] = []
+    closers = set(match.values())
+    for i, t in enumerate(toks):
+        if stack:
+            parent[i] = stack[-1]
+        if i in closers and stack:
+            stack.pop()
+            parent[i] = stack[-1] if stack else -1
+        elif i in match:
+            stack.append(i)
+    return {i: p for i, p in parent.items() if p >= 0}
+
+
+def header_words(toks: list[Tok], opener: int) -> set[str]:
+    """The identifiers between the previous statement or block boundary and the bracket at `opener`."""
+    words: set[str] = set()
+    j = opener - 1
+    while j >= 0 and toks[j].text not in (";", "{", "}"):
+        if toks[j].kind == "id":
+            words.add(toks[j].text)
+        j -= 1
+    return words
+
+
+def member_shape(toks: list[Tok], match: dict[int, int], parent: dict[int, int], idx: int) -> str:
+    """What the attribute at toks[idx] decorates, below item level: `match arm`, `enum variant`, `struct field`,
+    `statement` (a `let`, an expression or an item written in a block), or `parameter or argument`."""
+    j = idx
+    while j < len(toks) and toks[j].text == "#" and toks[j + 1].text == "[":
+        j = match[j + 1] + 1
+    k = j  # the element after its attributes: an arm ends at `=>` before any `,` or `;`
+    while k < len(toks) and toks[k].text not in (",", ";", "=>", "}", ")", "]"):
+        k = match[k] + 1 if toks[k].text in ("{", "(", "[") and k in match else k + 1
+    if k < len(toks) and toks[k].text == "=>":
+        return "match arm"
+    opener = parent.get(idx)
+    if opener is not None:
+        words = header_words(toks, opener)
+        if toks[opener].text == "{" and "enum" in words:
+            return "enum variant"
+        if "struct" in words or "union" in words:
+            return "struct field"
+        if toks[opener].text == "(":
+            return "parameter or argument"
+    return "statement"
+
+
+def scan_member_cfg_test(f: SourceFile, match: dict[int, int]) -> None:
+    """Every bare test-only `#[cfg(...)]` (no `test-support` gate: ADR-0113 sanctions that) that parse_zone did not
+    see as an item attribute: an enum variant, a struct field, a match arm or a statement of a production file. Such code compiles in the tested build and not in the
+    shipped one, so production would differ from what the tests exercise. Item attributes sit inside a recorded
+    test range, so only what lies outside every range is a member."""
+    toks = f.toks
+    parent = enclosing_openers(toks, match)
+    i = 0
+    while i + 1 < len(toks):
+        if toks[i].text == "#" and toks[i + 1].text == "[" and not in_ranges(f.test_ranges, i):
+            if cfg_test_only(toks, i + 1, match[i + 1]) and not mentions_test_support(toks, i + 1, match[i + 1]):
+                f.member_cfg_test.append((toks[i].line, member_shape(toks, match, parent, i)))
+            i = match[i + 1]
+        i += 1
 
 
 def mod_path_attr(toks: list[Tok], first: int, head: int) -> str | None:
@@ -448,34 +566,78 @@ def transitive_closure(direct: dict[str, set[str]]) -> dict[str, set[str]]:
     return closure
 
 
-def cargo_metadata_direct_deps(root: Path) -> dict[str, set[str]]:
-    """Each workspace crate's direct dependency names (normal, dev and build), read from `cargo metadata`
-    rather than a hand parse of each `Cargo.toml`: a manifest table key is the dependency's local alias, not
-    necessarily its real crate name (`foo = { package = "real-name", ... }`), and a `[target.'cfg(...)'.
-    dependencies]` table sits outside the three top-level tables a manual TOML walk checks. `cargo metadata`
-    resolves both for free (`dependencies[].name` is always the real name; `--no-deps` still reports each
-    workspace member's own declared dependencies, target-gated ones included, without resolving or fetching
-    the external graph)."""
+@dataclass
+class Graph:
+    """The workspace's crate graph, read from `cargo metadata` rather than a hand parse of each `Cargo.toml`: a
+    manifest table key is the dependency's local alias, not necessarily its real crate name (`foo = { package =
+    "real-name", ... }`), and a `[target.'cfg(...)'.dependencies]` table sits outside the three top-level tables
+    a manual TOML walk checks. `dependencies[].name` is always the real name; `--no-deps` still reports each
+    workspace member's own declared dependencies, target-gated ones included, without resolving or fetching the
+    external graph."""
+
+    direct: dict[str, set[str]]  # every direct dependency name (normal, dev and build)
+    # (dependent, dependency) -> the kinds of the edge that count as production: "normal" or "build". A dev
+    # edge, and an optional dependency only a `test-support` feature enables, are test edges and are absent.
+    production_edges: set[tuple[str, str]]
+
+    def dev_only(self) -> set[str]:
+        """Test infrastructure: crates with workspace dependents that no production crate takes as a normal or
+        build dependency. A dev-only crate's own normal edges do not make its dependencies production (the
+        greatest fixpoint: `poot-executor-parity` is dev-only and so is the `poot-test-util` it depends on)."""
+        dependents = {d for deps in self.direct.values() for d in deps if d in self.direct}
+        dev = set(dependents)
+        changed = True
+        while changed:
+            changed = False
+            for dependent, dependency in self.production_edges:
+                if dependency in dev and dependent not in dev:
+                    dev.discard(dependency)
+                    changed = True
+        return dev
+
+
+def cargo_metadata_graph(root: Path) -> Graph:
     out = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path", str(root / "Cargo.toml")],
         capture_output=True,
         text=True,
         check=True,
     )
-    data = json.loads(out.stdout)
-    return {
-        pkg["name"]: {dep["name"] for dep in pkg["dependencies"]}
-        for pkg in data["packages"]
-    }
+    packages = json.loads(out.stdout)["packages"]
+    names = {pkg["name"] for pkg in packages}
+    direct: dict[str, set[str]] = {}
+    production: set[tuple[str, str]] = set()
+    for pkg in packages:
+        name = pkg["name"]
+        features: dict[str, list[str]] = pkg["features"]
+        direct[name] = {dep["name"] for dep in pkg["dependencies"]}
+        for dep in pkg["dependencies"]:
+            if dep["kind"] == "dev" or dep["name"] not in names or dep["name"] == name:
+                continue
+            alias = dep.get("rename") or dep["name"]
+            if dep["optional"] and optional_only_for_test_support(features, alias):
+                continue
+            production.add((name, dep["name"]))
+    return Graph(direct, production)
 
 
-def load_workspace(root: Path) -> tuple[list[SourceFile], dict[str, set[str]]]:
+def optional_only_for_test_support(features: dict[str, list[str]], alias: str) -> bool:
+    """Whether every feature that enables the optional dependency `alias` is the `test-support` feature."""
+    enablers = [
+        feature
+        for feature, values in features.items()
+        if any(v in (alias, f"dep:{alias}") or v.startswith(f"{alias}/") or v.startswith(f"{alias}?/") for v in values)
+    ]
+    return bool(enablers) and all(feature == "test-support" for feature in enablers)
+
+
+def load_workspace(root: Path) -> tuple[list[SourceFile], Graph]:
     """Every source file cargo compiles in the workspace (each target root and the modules it declares),
     and each workspace crate's dependency closure (direct + transitive, from `cargo metadata`): a same-named
     item in a crate that never depends on the declaring crate cannot be what keeps it alive (F7)."""
     workspace = tomllib.loads((root / "Cargo.toml").read_text())
     files: dict[Path, SourceFile] = {}
-    direct_deps = cargo_metadata_direct_deps(root)
+    graph = cargo_metadata_graph(root)
     for member in workspace["workspace"]["members"]:
         crate_dir = root / member
         manifest = tomllib.loads((crate_dir / "Cargo.toml").read_text())
@@ -487,8 +649,18 @@ def load_workspace(root: Path) -> tuple[list[SourceFile], dict[str, set[str]]]:
             if path in files:
                 continue
             rel = str(path.relative_to(root.resolve()))
-            f = SourceFile(crate, path, rel, target, tokenize(path.read_text(encoding="utf-8")), exports=api)
-            parse_zone(f, match_brackets(f.toks), 0, len(f.toks), "file", False, mdir)
+            f = SourceFile(
+                crate,
+                path,
+                rel,
+                target,
+                tokenize(path.read_text(encoding="utf-8")),
+                exports=api,
+                build_script=target.name == "build.rs",
+            )
+            brackets = match_brackets(f.toks)
+            parse_zone(f, brackets, 0, len(f.toks), "file", False, mdir)
+            scan_member_cfg_test(f, brackets)
             files[path] = f
             for decl in f.mods:
                 for child, child_dir in resolve_mod(f, decl):
@@ -507,7 +679,7 @@ def load_workspace(root: Path) -> tuple[list[SourceFile], dict[str, set[str]]]:
             )
     ordered = sorted(files.values(), key=lambda f: f.rel)
     propagate_test_files(ordered)
-    return ordered, transitive_closure(direct_deps)
+    return ordered, graph
 
 
 def resolve_mod(f: SourceFile, decl: ModDecl) -> list[tuple[Path, Path]]:
@@ -544,7 +716,9 @@ def in_ranges(ranges: list[tuple[int, int]], idx: int) -> bool:
     return any(a <= idx <= b for a, b in ranges)
 
 
-def find_dead(files: list[SourceFile], depends: dict[str, set[str]]) -> list[Item]:
+def find_dead(files: list[SourceFile], graph: Graph) -> list[Item]:
+    depends = transitive_closure(graph.direct)
+    dev_only = graph.dev_only()
     occurrences: dict[str, list[tuple[int, int]]] = {}
     for fi, f in enumerate(files):
         for ti, t in enumerate(f.toks):
@@ -573,8 +747,15 @@ def find_dead(files: list[SourceFile], depends: dict[str, set[str]]) -> list[Ite
                 continue  # the declaration of another item with the same name
             if in_ranges(f.reexport_ranges, ti) or in_ranges(dead_spans.get(ofi, ()), ti):
                 continue
-            if f.crate == files[fi].crate and (not f.exports or f.is_test or in_ranges(f.test_ranges, ti)):
-                continue  # this crate's own test code: unit tests, or its own tests/examples/benches targets
+            in_test_code = (
+                f.is_test
+                or in_ranges(f.test_ranges, ti)
+                or (not f.exports and not f.build_script and f.crate != KERNEL_SOURCE_CRATE)
+            )
+            if in_test_code and (it.crate not in dev_only or f.crate == it.crate):
+                continue  # a test reference is never a use: only a test-infrastructure crate's items live on it
+            if f.crate in dev_only and it.crate not in dev_only:
+                continue  # test infrastructure referencing production API: a test reference
             if (
                 f.crate != it.crate
                 and f.crate != KERNEL_SOURCE_CRATE
@@ -597,19 +778,80 @@ def find_dead(files: list[SourceFile], depends: dict[str, set[str]]) -> list[Ite
     return sorted(dead.values(), key=lambda it: (it.path, it.line))
 
 
+TEST_SUPPORT_NODE = re.compile(r'([A-Za-z0-9_-]+) feature "test-support"')
+
+
+def test_support_leaks(root: Path, graph: Graph) -> list[str]:
+    """Production crates whose normal or build dependency graph enables a `test-support` feature (ADR-0113: the
+    feature is enabled only from `[dev-dependencies]` edges and from test infrastructure). One `cargo tree` per
+    production crate: a workspace-wide tree unifies the features its roots enable."""
+    leaks: list[str] = []
+    for crate in sorted(set(graph.direct) - graph.dev_only()):
+        out = subprocess.run(
+            [
+                "cargo", "tree", "--manifest-path", str(root / "Cargo.toml"), "--offline",
+                "-p", crate, "-e", "features", "--edges", "normal,build",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        owners = sorted({m.group(1) for m in TEST_SUPPORT_NODE.finditer(out.stdout)})
+        leaks += [
+            f"{crate}: the `test-support` feature of `{owner}` is enabled by a normal or build dependency edge"
+            for owner in owners
+        ]
+    return leaks
+
+
+def bare_cfg_test_violations(files: list[SourceFile]) -> list[str]:
+    return [
+        f"{f.rel}:{line}: bare #[cfg(test)] {what} outside a test-module tree ({f.crate}): move it into a "
+        "`#[cfg(test)] mod`, or gate it `cfg(any(test, feature = \"test-support\"))` (ADR-0113) if another crate's tests need it"
+        for f in files
+        if f.exports and not f.is_test
+        for line, what in f.bare_cfg_test
+    ]
+
+
+def member_cfg_test_violations(files: list[SourceFile]) -> list[str]:
+    return [
+        f"{f.rel}:{line}: test-only cfg ({shape}) in production code ({f.crate}): the shipped build and the "
+        "tested build differ. Make the code identical in both and inject the test behaviour through a trait or a "
+        "test-support type; genuine test scaffolding moves into a `#[cfg(test)] mod` tree"
+        for f in files
+        if f.exports and not f.is_test
+        for line, shape in f.member_cfg_test
+    ]
+
+
 def check(root: Path) -> int:
-    files, depends = load_workspace(root)
-    dead = find_dead(files, depends)
+    files, graph = load_workspace(root)
+    dead = find_dead(files, graph)
+    bare = bare_cfg_test_violations(files) + member_cfg_test_violations(files)
+    leaks = test_support_leaks(root, graph)
     for it in dead:
-        print(f"{it.path}:{it.line}: dead pub {it.kind} `{it.name}` ({it.crate}): used by no other crate target and by no non-test code of its own crate")
+        print(
+            f"{it.path}:{it.line}: dead pub {it.kind} `{it.name}` ({it.crate}): used by no production code "
+            "of any crate; a test reference is not a use"
+        )
+    for line in bare + leaks:
+        print(line)
     if dead:
         print(
-            f"dead-pub: {len(dead)} dead pub item(s). "
-            "Delete the dead item, or if planned work will use it, mark it held "
-            '(`#[expect(dead_code, reason = "held for <tag>")]`, naming the planned work).'
+            f"dead-pub: {len(dead)} dead pub item(s). Each must be deleted, made non-pub, or moved into a "
+            "test module tree (`poot-test-util` for a cross-crate fixture); an item another crate's tests "
+            "need that is not public API stays "
+            '`#[cfg(any(test, feature = "test-support"))]` (ADR-0113). There is no hold: an '
+            "`expect(dead_code)` attribute does not exempt a dead pub item."
         )
+    if bare:
+        print(f"dead-pub: {len(bare)} bare #[cfg(test)] item(s) or member(s) outside a test-module tree.")
+    if leaks:
+        print(f"dead-pub: {len(leaks)} `test-support` feature leak(s) into a normal or build edge.")
+    if dead or bare or leaks:
         return 1
-    print("dead-pub: no dead pub items")
+    print("dead-pub: no dead pub items, no bare cfg(test) outside a test tree, no test-support leak")
     return 0
 
 
@@ -623,30 +865,23 @@ def write_fixture(root: Path, files: dict[str, str]) -> None:
         p.write_text(text)
 
 
-def self_test() -> int:
-    manifest = '[package]\nname = "{}"\nversion = "0.0.0"\n'
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        write_fixture(
-            root,
-            {
-                "Cargo.toml": '[workspace]\nmembers = ["crates/a", "crates/b", "crates/c"]\n',
-                "crates/a/Cargo.toml": manifest.format("a"),
-                "crates/b/Cargo.toml": manifest.format("b") + '[dependencies]\na = { path = "../a" }\n',
-                "crates/c/Cargo.toml": manifest.format("c"),
-                "crates/a/src/lib.rs": """
+A_LIB = """
 pub mod inner;
 pub use inner::ReexportedOnly;
 pub fn used_by_b() {}
 pub fn used_inside() {}
 pub fn only_own_test() {}
-pub fn used_by_b_integration_test() {}
+pub fn used_by_b_integration_test() {} // another crate's test: not a use (DP1)
 pub fn only_cfg_test() {}
 pub fn only_unit_test_mod() {}
 pub fn used_under_any_test_or_feature() {}
 pub fn used_under_all_test_and_feature() {}
 pub fn unused_probe() {}
+#[cfg_attr(not(test), expect(dead_code, reason = "held for POOT-1"))]
+pub fn held_but_dead() {} // a hold attribute exempts nothing: there is no allow-list
 pub fn used_only_by_kernel_source() {}
+pub fn used_only_by_build_script() {}
+pub fn used_only_by_test_infrastructure() {} // `t` is a dev-only crate: its source is test code
 pub fn cross_crate_shadow() {} // F7: dead, but `c` (which does not depend on `a`) has a same-named fn
 pub const DEAD_CONST: u32 = 1; // used only by this crate's own integration test: still dead
 pub const USED_CONST: u32 = 2;
@@ -673,6 +908,8 @@ mod tests;
 #[cfg(test)]
 mod inline_tests {
     fn t() { super::only_cfg_test(); }
+    #[cfg(test)]
+    fn inside_the_tree() {} // a test-module tree may nest cfg(test)
 }
 #[cfg(any(test, feature = "x"))]
 mod any_tests {
@@ -682,19 +919,104 @@ mod any_tests {
 mod all_tests {
     fn t() { super::used_under_all_test_and_feature(); }
 }
-""",
+#[cfg(test)]
+fn bare_test_helper() {} // R9: a bare cfg(test) fn in production code
+#[cfg(all(test, feature = "x"))]
+pub(crate) struct BareAllTest; // R9
+#[cfg(any(test, feature = "test-support"))]
+pub fn sanctioned_support() {} // ADR-0113: not bare, and not a production `pub` item
+mod prod {
+    #[cfg(test)]
+    pub(super) fn nested_bare() {} // R9, in an inline production module
+    pub struct Holder;
+    impl Holder {
+        #[cfg(test)]
+        pub(crate) fn bare_method(&self) {} // R9, in an inherent impl
+    }
+}
+enum Shaped {
+    Plain,
+    #[cfg(test)]
+    OnlyTested, // POOT-1135: a variant that exists only in the tested build
+    #[cfg(not(test))]
+    OnlyShipped, // compiles outside tests: production code
+    #[cfg(any(test, feature = "x"))]
+    Either,
+}
+struct Fielded {
+    plain: u32,
+    #[cfg(test)]
+    probe: u32, // POOT-1135: a field that exists only in the tested build
+    #[cfg(any(test, feature = "test-support"))]
+    sanctioned: u32, // ADR-0113: the sanctioned gate, not a bare cfg(test)
+}
+fn shaped_fn(s: Shaped) -> u32 {
+    #[cfg(test)]
+    let tested = 1; // POOT-1135: a `let` that exists only in the tested build
+    #[cfg(test)]
+    bump(); // POOT-1135: an expression statement
+    #[cfg(not(test))]
+    let shipped = 1;
+    match s {
+        Shaped::Plain => 0,
+        #[cfg(test)]
+        Shaped::OnlyTested => 1, // POOT-1135: an arm that exists only in the tested build
+        #[cfg(test)]
+        Shaped::Struct { .. } => 3, // an arm whose pattern holds braces
+        _ => 2,
+    }
+}
+fn takes(#[cfg(test)] extra: u32, plain: u32) {} // POOT-1135: a parameter that exists only in the tested build
+macro_rules! scaffold {
+    () => {
+        #[cfg(test)]
+        let from_macro = 1; // POOT-1135: a macro body expands into production code
+    };
+}
+#[cfg(test)]
+mod member_tests {
+    enum InTree {
+        #[cfg(test)]
+        A, // inside a test-module tree: not production code
+    }
+}
+"""
+
+
+def self_test() -> int:
+    manifest = '[package]\nname = "{}"\nversion = "0.0.0"\n'
+    features = '[features]\ntest-support = []\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write_fixture(
+            root,
+            {
+                "Cargo.toml": '[workspace]\nmembers = ["crates/a", "crates/b", "crates/c", "crates/t"]\n',
+                "crates/a/Cargo.toml": manifest.format("a") + features,
+                # `b` takes `a` as a normal dependency, and `a`'s test-support feature from a dev edge only.
+                "crates/b/Cargo.toml": manifest.format("b")
+                + '[dependencies]\na = { path = "../a" }\n'
+                + '[dev-dependencies]\na = { path = "../a", features = ["test-support"] }\nt = { path = "../t" }\n',
+                "crates/c/Cargo.toml": manifest.format("c"),
+                # `t` is test infrastructure: only `b` takes it, as a dev-dependency. Its own normal edge
+                # may enable `a`'s test-support feature.
+                "crates/t/Cargo.toml": manifest.format("t")
+                + '[dependencies]\na = { path = "../a", features = ["test-support"] }\n',
+                "crates/a/src/lib.rs": A_LIB,
+                "crates/a/build.rs": "fn main() { used_only_by_build_script(); }\n",
                 "crates/a/src/inner.rs": "pub struct ReexportedOnly;\n",
-                "crates/a/src/tests.rs": "fn t() { super::only_unit_test_mod(); }\n",
+                "crates/a/src/tests.rs": "fn t() { super::only_unit_test_mod(); }\n#[cfg(test)]\nfn helper() {}\n",
                 "crates/a/tests/it.rs": "fn t() { a::only_own_test(); a::DEAD_CONST; }\n",
                 "crates/a/tests/kernels/probe.rs": "fn t() { a::used_only_by_kernel_source(); }\n",
                 "crates/b/src/main.rs": "fn main() { a::used_by_b(); a::live_method(); let _ = a::USED_CONST; a::LiveType.live_method(); }\n",
-                "crates/b/tests/it.rs": "fn t() { a::used_by_b_integration_test(); }\n",
+                "crates/b/tests/it.rs": "fn t() { a::used_by_b_integration_test(); t::fixture_used_by_b_test(); }\n",
                 # `c` depends on neither `a` nor `b`: its own same-named fn must not keep `a::cross_crate_shadow` alive.
                 "crates/c/src/lib.rs": "fn cross_crate_shadow() {}\nfn caller() { cross_crate_shadow(); }\n",
+                "crates/t/src/lib.rs": "pub fn fixture_used_by_b_test() { a::used_only_by_test_infrastructure(); }\npub fn fixture_nobody_uses() {}\n",
             },
         )
-        files, depends = load_workspace(root)
-        dead = {it.key() for it in find_dead(files, depends)}
+        files, graph = load_workspace(root)
+        dead = {it.key() for it in find_dead(files, graph)}
         expected = {
             "crates/a/src/lib.rs fn only_own_test",
             "crates/a/src/lib.rs fn cross_crate_shadow",
@@ -702,7 +1024,10 @@ mod all_tests {
             "crates/a/src/lib.rs fn only_cfg_test",
             "crates/a/src/lib.rs fn only_unit_test_mod",
             "crates/a/src/lib.rs fn used_under_all_test_and_feature",
+            "crates/a/src/lib.rs fn used_by_b_integration_test",
+            "crates/a/src/lib.rs fn used_only_by_test_infrastructure",
             "crates/a/src/lib.rs fn unused_probe",
+            "crates/a/src/lib.rs fn held_but_dead",
             "crates/a/src/lib.rs struct DeadType",
             "crates/a/src/lib.rs method new",
             "crates/a/src/lib.rs method recurse",
@@ -711,22 +1036,85 @@ mod all_tests {
             "crates/a/src/lib.rs fn chain_leaf",
             "crates/a/src/lib.rs fn text_only",
             "crates/a/src/inner.rs struct ReexportedOnly",
+            "crates/a/src/lib.rs struct Holder",
+            "crates/t/src/lib.rs fn fixture_nobody_uses",
         }
         # `new` on a type nothing uses is dead even though `new` is a common name
-        ok = dead == expected
-        if not ok:
-            print("self-test FAILED")
+        if dead != expected:
+            print("self-test FAILED: dead items")
             print("  unexpected:", sorted(dead - expected))
             print("  missing:   ", sorted(expected - dead))
             return 1
-        write_fixture(root, {"crates/a/src/lib.rs": (root / "crates/a/src/lib.rs").read_text() + "pub fn probe_added() {}\n"})
-        files, depends = load_workspace(root)
-        dead2 = {it.key() for it in find_dead(files, depends)}
+        bare = sorted(bare_cfg_test_violations(files))
+        wanted = [
+            ("crates/a/src/lib.rs", "fn bare_test_helper"),
+            ("crates/a/src/lib.rs", "struct BareAllTest"),
+            ("crates/a/src/lib.rs", "fn nested_bare"),
+            ("crates/a/src/lib.rs", "fn bare_method"),
+        ]
+        got = sorted((m.group(1), m.group(2)) for m in (re.match(r"([^:]+):\d+: bare #\[cfg\(test\)\] (.+?) outside", v) for v in bare))
+        if got != sorted(wanted):
+            print("self-test FAILED: bare cfg(test) items")
+            print("  unexpected:", sorted(set(got) - set(wanted)))
+            print("  missing:   ", sorted(set(wanted) - set(got)))
+            return 1
+        # POOT-1135: a bare cfg(test) below item level is reported by shape; each shape has its own row, so
+        # dropping one shape's detection reds the self-test (the others still pass).
+        shapes = sorted(
+            m.group(1)
+            for v in member_cfg_test_violations(files)
+            if (m := re.search(r"test-only cfg \((.+?)\) in production code", v))
+        )
+        wanted_shapes = sorted(
+            [
+                "enum variant",
+                "struct field",
+                "statement",
+                "statement",
+                "statement",  # the one in the macro_rules body
+                "match arm",
+                "match arm",
+                "parameter or argument",
+            ]
+        )
+        if shapes != wanted_shapes:
+            print("self-test FAILED: member-level cfg(test) shapes")
+            print("  got:   ", shapes)
+            print("  wanted:", wanted_shapes)
+            return 1
+        leaks = test_support_leaks(root, graph)
+        if leaks:
+            print("self-test FAILED: a dev edge and a dev-only crate's normal edge are not leaks:", leaks)
+            return 1
+        # the same feature on a normal edge of a production crate is a leak
+        write_fixture(
+            root,
+            {
+                "crates/b/Cargo.toml": manifest.format("b")
+                + '[dependencies]\na = { path = "../a", features = ["test-support"] }\n'
+                + '[dev-dependencies]\nt = { path = "../t" }\n'
+            },
+        )
+        files, graph = load_workspace(root)
+        leaks = test_support_leaks(root, graph)
+        if len(leaks) != 1 or not leaks[0].startswith("b: the `test-support` feature of `a`"):
+            print("self-test FAILED: a test-support feature on a normal edge must be reported once:", leaks)
+            return 1
+        write_fixture(
+            root,
+            {
+                "crates/b/Cargo.toml": manifest.format("b")
+                + '[dependencies]\na = { path = "../a" }\n'
+                + '[dev-dependencies]\na = { path = "../a", features = ["test-support"] }\nt = { path = "../t" }\n'
+            },
+        )
+        write_fixture(root, {"crates/a/src/lib.rs": A_LIB + "pub fn probe_added() {}\n"})
+        files, graph = load_workspace(root)
+        dead2 = {it.key() for it in find_dead(files, graph)}
         if "crates/a/src/lib.rs fn probe_added" not in dead2:
             print("self-test FAILED: an added unused pub fn was not reported")
             return 1
-        files, depends = load_workspace(root)
-        keys = sorted({it.key() for it in find_dead(files, depends)})
+        keys = sorted({it.key() for it in find_dead(files, graph)})
         # An allow.txt beside the fixture names every dead item. The check has no allow-list, so it ignores
         # the file and still fails, naming the items.
         (root / "allow.txt").write_text(
@@ -736,7 +1124,12 @@ mod all_tests {
         with contextlib.redirect_stdout(out):
             rc = check(root)
         text = out.getvalue()
-        if rc != 1 or "dead pub fn `probe_added`" not in text:
+        if (
+            rc != 1
+            or "dead pub fn `probe_added`" not in text
+            or "bare #[cfg(test)] fn bare_test_helper" not in text
+            or "test-only cfg (enum variant) in production code" not in text
+        ):
             print(f"self-test FAILED: a present allow.txt must be ignored, rc={rc}")
             return 1
     print("self-test ok")

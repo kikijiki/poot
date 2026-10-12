@@ -16,7 +16,13 @@
 //! has no kernel: nothing materializes a packed weight.
 
 use super::matmul::{FoldedTileGrid, folded_tile_grid};
-use super::*;
+use super::{
+    BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, FusedRegion,
+    KernelRequest, OpKind, PackedRequest, PlanError, Planned, matmul, value_ids,
+};
+use crate::planner::{GraphTables, finalize};
+use crate::predicates::{GEMM_TILE, INDEXED_GEMV_MAX_ROWS, packed_contraction_m_per_block};
+use crate::refusal::Site;
 use poot_graph_ir::ContractionRows;
 use poot_kernelgen::{PackedContraction, PackedKernelOp, PackedRows, Schedule};
 use poot_target::{Backend, DeviceCaps};
@@ -384,6 +390,8 @@ fn packed_indexed_gemv(m: usize, n: usize, caps: &DeviceCaps) -> Option<Schedule
 
 #[cfg(test)]
 mod tests {
+    use crate::production_plan::Submission;
+    use crate::types::Launch;
     use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
     use poot_kernelgen::{ContractionSpec, KernelRequest, PackedContraction, Schedule};
     use poot_quant::PackedWeight;
@@ -392,9 +400,7 @@ mod tests {
 
     use crate::{Capability, PlanError};
 
-    use crate::{
-        CompileError, CompileOptions, Dispatch, KernelChoice, Launch, Submission, Target, compile,
-    };
+    use crate::{CompileError, CompileOptions, Dispatch, KernelChoice, Target, compile};
 
     /// SC-003 (card 653): a decode (`M == 1`) packed contraction compiled for a device with a
     /// fixture `DeviceCaps::compute_units` plans the Gemv launch of `gemv_schedule`'s table - 16
@@ -416,8 +422,10 @@ mod tests {
             (4, 896, 16),
         ] {
             let what = format!("compute_units={compute_units} N={n}");
-            let builder = Builder::new();
-            let x = builder.slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]));
+            let builder = Builder::for_tests();
+            let x = builder
+                .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]))
+                .unwrap();
             let weight = PackedWeight::try_new(WeightFormat::Q8_0, [n, k]).unwrap();
             let out = poot_graph_ir::ops::packed_linear(&builder, x, "layer", weight, None, None)
                 .unwrap();
@@ -485,12 +493,14 @@ mod tests {
         let (blocks, m_per_block, out_per_block, k) = (4usize, 5usize, 2usize, 35usize);
         let out = blocks * out_per_block;
         let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [out, k]).unwrap();
-        let builder = Builder::new();
-        let x = builder.slot_named(
-            Slot::Activation,
-            "x",
-            TensorType::f32(vec![blocks, m_per_block, k]),
-        );
+        let builder = Builder::for_tests();
+        let x = builder
+            .slot_named(
+                Slot::Activation,
+                "x",
+                TensorType::f32(vec![blocks, m_per_block, k]),
+            )
+            .unwrap();
         let out_value = poot_graph_ir::ops::packed_block_diagonal_linear(
             &builder, x, "layer", descriptor, blocks, None,
         )
@@ -555,12 +565,14 @@ mod tests {
         let k = 32;
         let out = blocks * out_per_block;
         let descriptor = PackedWeight::try_new(WeightFormat::Q4_0, [out, k]).unwrap();
-        let builder = Builder::new();
-        let x = builder.slot_named(
-            Slot::Activation,
-            "x",
-            TensorType::f32(vec![blocks, m_per_block, k]),
-        );
+        let builder = Builder::for_tests();
+        let x = builder
+            .slot_named(
+                Slot::Activation,
+                "x",
+                TensorType::f32(vec![blocks, m_per_block, k]),
+            )
+            .unwrap();
         let out_value = poot_graph_ir::ops::packed_block_diagonal_linear(
             &builder, x, "layer", descriptor, blocks, None,
         )
@@ -603,7 +615,7 @@ mod tests {
             eqn,
             Backend::SpirvVulkan,
             &tiny_grid_caps(),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap();
         let Some(Dispatch {
@@ -646,7 +658,7 @@ mod tests {
             eqn,
             Backend::SpirvVulkan,
             &tiny_grid_caps(),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .err()
         .unwrap_or_else(|| panic!("expected a refusal, plan_eqn succeeded"));
@@ -681,12 +693,14 @@ mod tests {
         let (blocks, m_per_block, out_per_block, k) = (2usize, 200usize, 8usize, 32usize);
         let descriptor =
             PackedWeight::try_new(WeightFormat::Q4_0, [blocks * out_per_block, k]).unwrap();
-        let builder = Builder::new();
-        let x = builder.slot_named(
-            Slot::Activation,
-            "x",
-            TensorType::f32(vec![blocks, m_per_block, k]),
-        );
+        let builder = Builder::for_tests();
+        let x = builder
+            .slot_named(
+                Slot::Activation,
+                "x",
+                TensorType::f32(vec![blocks, m_per_block, k]),
+            )
+            .unwrap();
         let out_value = poot_graph_ir::ops::packed_block_diagonal_linear(
             &builder, x, "layer", descriptor, blocks, None,
         )
@@ -741,13 +755,17 @@ mod tests {
             descriptor,
             experts,
         };
-        let builder = Builder::new();
-        let x = builder.slot_named(Slot::Activation, "x", TensorType::f32(vec![rows, k]));
-        let ids = builder.slot_named(
-            Slot::Activation,
-            "ids",
-            TensorType::new(vec![rows], poot_tensor::DType::I32),
-        );
+        let builder = Builder::for_tests();
+        let x = builder
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![rows, k]))
+            .unwrap();
+        let ids = builder
+            .slot_named(
+                Slot::Activation,
+                "ids",
+                TensorType::new(vec![rows], poot_tensor::DType::I32),
+            )
+            .unwrap();
         let y = poot_graph_ir::ops::packed_indexed_linear(&builder, x, ids, &table).unwrap();
         let graph = builder.finish(y).unwrap();
         let index = graph
@@ -768,7 +786,7 @@ mod tests {
             &graph.eqns()[index],
             Backend::SpirvVulkan,
             caps,
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
     }
 
@@ -869,7 +887,7 @@ mod tests {
             eqn,
             Backend::SpirvVulkan,
             &DeviceCaps::wgpu_rdna3_igpu(),
-            &poot_test_util::graph_fixtures::roomy_body_limits(),
+            &crate::test_support::roomy_body_limits(),
         )
         .unwrap_or_else(|error| panic!("expected a bounded plan, got a refusal: {error}"));
         let Some(Dispatch {

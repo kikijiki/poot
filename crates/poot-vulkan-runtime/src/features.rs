@@ -1,6 +1,6 @@
 use std::ffi::{CStr, c_char};
 
-use crate::*;
+use ash::vk;
 
 /// The shader and storage features a physical device supports out of those poot's SPIR-V can declare:
 /// the `Float16`/`Int8`/`Int16`/`Int64`/`Float64` arithmetic capabilities, 8- and 16-bit storage-buffer

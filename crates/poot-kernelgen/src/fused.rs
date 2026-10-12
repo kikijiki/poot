@@ -726,8 +726,7 @@ pub fn fused_views(
 /// Typed-I32 fused elementwise kernel. Locals, buffers, and literals stay I32; comparison steps write
 /// I32 0/1. This is the exact-word counterpart of [`fused_views`], with the same optional 2-D grid fold
 /// as [`crate::binary_broadcast_dt_views_grid`] (`x_groups: None` keeps the original flat
-/// `ThreadIndexCall(X)` body - the convenience `fused_i32_views` used to expose before it moved to
-/// `poot_test_util::kernel_fixtures`, card 671, its only caller; `Some(xg)` must match
+/// `ThreadIndexCall(X)` body; `Some(xg)` must match
 /// the launch's `x_groups` (`kg::fold_groups`), and the caller must bake `workgroup_size[0] =
 /// ELEMENTWISE_2D_WORKGROUP_SIZE`).
 pub fn fused_i32_views_grid(
@@ -1480,327 +1479,6 @@ fn local_for_leaf(j: usize) -> Local {
     local((j + 1) as u32)
 }
 
-/// Synthesize one row-wise kernel for a reduction-rooted region: one thread per row computes each last-axis
-/// reduction into a register (recomputing the pointwise chain that feeds it), threads the per-row scalar chain,
-/// then writes the output row (the one-pass RMSNorm / fused softmax shape). Serial over the row (like
-/// `reduce_last`), so it lowers on both backends with no private array. The launch grid is the output numel;
-/// threads with `row >= num_rows` no-op via the baked guard.
-///
-/// Only this crate's own tests call the serial form directly today; the production path is the parallel
-/// twin, [`fused_row_parallel_views`].
-#[cfg(test)]
-fn fused_row(
-    name: &str,
-    out_shape: &[usize],
-    leaf_shapes: &[&[usize]],
-    k: &RowKernel,
-) -> Result<Body, KernelGenError> {
-    let layouts: Vec<Layout> = leaf_shapes.iter().map(|s| Layout::contiguous(s)).collect();
-    fused_row_views(name, out_shape, leaf_shapes, &layouts, k)
-}
-
-/// [`fused_row`] reading each leaf through its own physical [`Layout`]. Byte-identical to `fused_row` when every
-/// layout is `Layout::contiguous`.
-#[cfg(test)]
-fn fused_row_views(
-    name: &str,
-    out_shape: &[usize],
-    leaf_shapes: &[&[usize]],
-    leaf_layouts: &[Layout],
-    k: &RowKernel,
-) -> Result<Body, KernelGenError> {
-    if leaf_shapes.len() != k.n_leaves {
-        return Err(KernelGenError::CountMismatch {
-            generator: "fused_row_views",
-            what: "leaf shape count".to_string(),
-            expected: k.n_leaves,
-            actual: leaf_shapes.len(),
-        });
-    }
-    if leaf_layouts.len() != k.n_leaves {
-        return Err(KernelGenError::CountMismatch {
-            generator: "fused_row_views",
-            what: "leaf layout count".to_string(),
-            expected: k.n_leaves,
-            actual: leaf_layouts.len(),
-        });
-    }
-    let lanes = row_lanes("fused_row_views", k)?;
-    let n = k.n_leaves;
-    let n_cols = k.n_cols;
-    let out_numel: usize = out_shape.iter().product::<usize>().max(1);
-    let num_rows = out_numel / n_cols.max(1);
-    let out_strides = row_major_strides(out_shape);
-    let (leaf_eff, leaf_base): (Vec<Vec<usize>>, Vec<usize>) = leaf_shapes
-        .iter()
-        .zip(leaf_layouts.iter())
-        .map(|(s, layout)| view_eff_strides(out_shape, s, layout))
-        .unzip();
-
-    // classify each region-local as Row (per-element) or Scalar (per-row).
-    let total = n + k.steps.len();
-    let mut kind = vec![RowKind::Row; total];
-    for (s, step) in k.steps.iter().enumerate() {
-        kind[n + s] = match step {
-            RowOp::Reduce { .. } => RowKind::Scalar,
-            RowOp::Pointwise { inputs, .. } => {
-                let any_row = inputs.iter().any(|i| match i {
-                    FusedInput::Leaf(_) => true,
-                    FusedInput::Step(st) => kind[n + *st] == RowKind::Row,
-                    FusedInput::Lit(_) | FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
-                        false
-                    }
-                });
-                if any_row {
-                    RowKind::Row
-                } else {
-                    RowKind::Scalar
-                }
-            }
-        };
-    }
-
-    // params: leaves are locals 1..=n, the output is local n+1.
-    let mut locals = vec![ld(Ty::Unit, false)];
-    for lane in &lanes {
-        locals.push(lane.param());
-    }
-    locals.push(ld(slice_f32(true), true));
-    let mut al = Alloc::new(locals);
-    let out_local = local((n + 1) as u32);
-    let row = al.add(Ty::Usize, false);
-    let cmp = al.add(Ty::Bool, false);
-    let j = al.add(Ty::Usize, true);
-    let i_local = al.add(Ty::Usize, false);
-    let base = al.add(Ty::Usize, false);
-    let j_new = al.add(Ty::Usize, false);
-    let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
-
-    // scalar registers: an acc local per Reduce, a result local per Scalar Pointwise. Pre-allocate.
-    let mut scalar_reg: Vec<Option<Local>> = vec![None; total];
-    for (s, step) in k.steps.iter().enumerate() {
-        let id = n + s;
-        if kind[id] == RowKind::Scalar {
-            scalar_reg[id] = Some(al.add(Ty::F32, true));
-        } else {
-            let _ = step;
-        }
-    }
-
-    // helper to read a scalar operand (already-computed register or a literal).
-    let scalar_operand = |inp: &FusedInput, scalar_reg: &[Option<Local>]| -> Operand {
-        match inp {
-            FusedInput::Step(s) => copy(Place::local(scalar_reg[n + *s].expect("scalar ready"))),
-            FusedInput::Lit(c) => Operand::Const(Constant::F32(*c)),
-            FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
-                panic!("f32 fused kernel cannot carry an I32 packed lane or literal")
-            }
-            FusedInput::Leaf(_) => unreachable!("a scalar step cannot take a row leaf operand"),
-        }
-    };
-
-    // build the passes. `blocks` starts at id 2 (bb0/bb1 are the prologue); `pending` holds straight-line
-    // scalar assignments waiting to be placed at the head of the next pass.
-    let mut blocks: Vec<BasicBlock> = Vec::new(); // body blocks, ids 2..
-    let mut pending: Vec<Statement> = Vec::new();
-    let bid = |body_idx: usize| (2 + body_idx) as u32; // body block index -> absolute block id
-
-    // emit i = row*n_cols + j at the top of a col-loop body, into i_local.
-    let emit_i = |stmts: &mut Vec<Statement>| {
-        stmts.push(Statement::Assign(
-            Place::local(base),
-            Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(row)), cu(n_cols)),
-        ));
-        stmts.push(Statement::Assign(
-            Place::local(i_local),
-            Rvalue::BinaryOp(BinOp::Add, copy(Place::local(base)), copy(Place::local(j))),
-        ));
-    };
-
-    let ctx_kind = kind.clone();
-    let ctx_leaf_eff = leaf_eff.clone();
-    let ctx_leaf_base = leaf_base.clone();
-
-    for (s, step) in k.steps.iter().enumerate() {
-        match step {
-            RowOp::Pointwise { op, inputs } if kind[n + s] == RowKind::Scalar => {
-                // a per-row scalar op: straight-line, queued into `pending`.
-                let operands: Vec<Operand> = inputs
-                    .iter()
-                    .map(|i| scalar_operand(i, &scalar_reg))
-                    .collect();
-                let dst = scalar_reg[n + s].unwrap();
-                emit_scalar_op(dst, *op, &operands, &mut al, &mut pending);
-            }
-            RowOp::Pointwise { .. } => { /* a Map: recomputed on demand, nothing to emit here */ }
-            RowOp::Reduce { op, input } => {
-                let (init, bop) = match op {
-                    RowReduce::Sum => (0.0f32, BinOp::Add),
-                    RowReduce::Max => (f32::NEG_INFINITY, BinOp::Max),
-                };
-                let acc = scalar_reg[n + s].unwrap();
-                let pre = blocks.len();
-                let hdr = pre + 1;
-                let bodyb = pre + 2;
-                let next = pre + 3;
-                // pre: pending + acc=init + j=0 -> hdr
-                let mut pre_stmts = std::mem::take(&mut pending);
-                pre_stmts.push(Statement::Assign(
-                    Place::local(acc),
-                    Rvalue::Use(Operand::Const(Constant::F32(init))),
-                ));
-                pre_stmts.push(Statement::Assign(Place::local(j), Rvalue::Use(cu(0))));
-                blocks.push(BasicBlock {
-                    statements: pre_stmts,
-                    terminator: Terminator::Goto {
-                        target: BlockId { index: bid(hdr) },
-                    },
-                });
-                // hdr: cmp = j < n_cols; if false -> next, else body
-                blocks.push(BasicBlock {
-                    statements: vec![Statement::Assign(
-                        Place::local(cmp),
-                        Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(j)), cu(n_cols)),
-                    )],
-                    terminator: guard(cmp, bid(next), bid(bodyb)),
-                });
-                // body: i = row*N+j; v = row_value(input); acc = acc bop v; j += 1 -> hdr
-                let ctx = RowCtx {
-                    k,
-                    kind: &ctx_kind,
-                    leaf_eff: &ctx_leaf_eff,
-                    leaf_base: &ctx_leaf_base,
-                    lanes: &lanes,
-                    out_strides: &out_strides,
-                    out_shape,
-                    scalar_reg: &scalar_reg,
-                };
-                let mut body_stmts: Vec<Statement> = Vec::new();
-                emit_i(&mut body_stmts);
-                let mut memo = std::collections::HashMap::new();
-                let in_local = match input {
-                    FusedInput::Leaf(jx) => {
-                        emit_row_value(&ctx, *jx, i_local, &mut al, &mut body_stmts, &mut memo)
-                    }
-                    FusedInput::Step(st) => {
-                        emit_row_value(&ctx, n + *st, i_local, &mut al, &mut body_stmts, &mut memo)
-                    }
-                    FusedInput::Lit(_) | FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
-                        unreachable!("reduce over a literal")
-                    }
-                };
-                let acc_new = al.add(Ty::F32, false);
-                body_stmts.push(Statement::Assign(
-                    Place::local(acc_new),
-                    Rvalue::BinaryOp(bop, copy(Place::local(acc)), copy(Place::local(in_local))),
-                ));
-                body_stmts.push(Statement::Assign(
-                    Place::local(acc),
-                    Rvalue::Use(copy(Place::local(acc_new))),
-                ));
-                body_stmts.push(Statement::Assign(
-                    Place::local(j_new),
-                    Rvalue::BinaryOp(BinOp::Add, copy(Place::local(j)), cu(1)),
-                ));
-                body_stmts.push(Statement::Assign(
-                    Place::local(j),
-                    Rvalue::Use(copy(Place::local(j_new))),
-                ));
-                blocks.push(BasicBlock {
-                    statements: body_stmts,
-                    terminator: Terminator::Goto {
-                        target: BlockId { index: bid(hdr) },
-                    },
-                });
-            }
-        }
-    }
-
-    // the output pass: pending (any trailing scalar steps) + j=0 -> hdr; hdr loops; body stores out[i].
-    let pre = blocks.len();
-    let hdr = pre + 1;
-    let bodyb = pre + 2;
-    let output_hdr_block = hdr;
-    let mut pre_stmts = std::mem::take(&mut pending);
-    pre_stmts.push(Statement::Assign(Place::local(j), Rvalue::Use(cu(0))));
-    blocks.push(BasicBlock {
-        statements: pre_stmts,
-        terminator: Terminator::Goto {
-            target: BlockId { index: bid(hdr) },
-        },
-    });
-    // hdr: placeholder `next` target patched to the exit block after we know its id.
-    blocks.push(BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(cmp),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(j)), cu(n_cols)),
-        )],
-        terminator: guard(cmp, 0, bid(bodyb)), // zero_target patched below
-    });
-    // body: i = row*N+j; v = row_value(output); out[i] = v; j += 1 -> hdr
-    let ctx = RowCtx {
-        k,
-        kind: &ctx_kind,
-        leaf_eff: &ctx_leaf_eff,
-        leaf_base: &ctx_leaf_base,
-        lanes: &lanes,
-        out_strides: &out_strides,
-        out_shape,
-        scalar_reg: &scalar_reg,
-    };
-    let mut body_stmts: Vec<Statement> = Vec::new();
-    emit_i(&mut body_stmts);
-    let mut memo = std::collections::HashMap::new();
-    let out_val = emit_row_value(&ctx, k.output, i_local, &mut al, &mut body_stmts, &mut memo);
-    body_stmts.push(Statement::Assign(
-        elem(out_local, i_local),
-        Rvalue::Use(copy(Place::local(out_val))),
-    ));
-    body_stmts.push(Statement::Assign(
-        Place::local(j_new),
-        Rvalue::BinaryOp(BinOp::Add, copy(Place::local(j)), cu(1)),
-    ));
-    body_stmts.push(Statement::Assign(
-        Place::local(j),
-        Rvalue::Use(copy(Place::local(j_new))),
-    ));
-    blocks.push(BasicBlock {
-        statements: body_stmts,
-        terminator: Terminator::Goto {
-            target: BlockId { index: bid(hdr) },
-        },
-    });
-
-    // the exit block (after all body blocks) + the prologue (bb0 row=tid, bb1 num_rows guard).
-    let exit_id = bid(blocks.len());
-    // patch the output loop header's exit target.
-    if let Terminator::SwitchInt { targets, .. } = &mut blocks[output_hdr_block].terminator {
-        targets.branches[0].1 = BlockId { index: exit_id };
-    }
-    let bb0 = BasicBlock {
-        statements: vec![],
-        terminator: Terminator::ThreadIndexCall {
-            destination: Place::local(row),
-            dim: IndexAxis::X,
-            target: BlockId { index: 1 },
-        },
-    };
-    let bb1 = BasicBlock {
-        statements: vec![Statement::Assign(
-            Place::local(cmp),
-            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(row)), cu(num_rows)),
-        )],
-        terminator: guard(cmp, exit_id, bid(0)), // row >= num_rows -> exit, else first pass
-    };
-    let mut all = vec![bb0, bb1];
-    all.append(&mut blocks);
-    all.push(BasicBlock {
-        statements: vec![],
-        terminator: Terminator::Return,
-    });
-    Ok(Body::new(name, (n + 1) as u32, al.locals, all))
-}
-
 /// The parallel twin of [`fused_row`]: one workgroup of `w` lanes per output row. Each `Reduce` step is an LDS
 /// reduction: lanes stride the row into a per-lane partial, the `w` partials are combined by
 /// [`emit_lds_tree_blocks_at`]'s log2-tree (`bop`: `Sum` or `Max`), and every lane reads the result from `LDS[0]`
@@ -2210,10 +1888,10 @@ pub fn fused_row_parallel_views(
 
 #[cfg(test)]
 mod tests {
-    use poot_runtime::KernelBuffer;
+    use poot_wgpu_runtime::KernelBuffer;
 
     use super::*;
-    use crate::test_support::{ctx, spv, stage_nvptx};
+    use crate::unit_helpers::{ctx, spv, stage_nvptx};
 
     /// Build the one-pass RMSNorm RowKernel (leaves x, w) for `n_cols` columns. Shared by the serial and
     /// parallel equivalence test.
@@ -2421,7 +2099,10 @@ mod tests {
         let s_ser = spv(&serial, "rms_ser");
         let s_par = spv(&parallel, "rms_par");
 
-        let run = |s: &poot_runtime::CompiledKernel, wg: [u32; 3], threads: [u32; 3]| -> Vec<f32> {
+        let run = |s: &poot_runtime_common::CompiledKernel,
+                   wg: [u32; 3],
+                   threads: [u32; 3]|
+         -> Vec<f32> {
             let mut bufs = [
                 KernelBuffer::read_only_f32(&x),
                 KernelBuffer::read_only_f32(&wt),
@@ -2481,7 +2162,10 @@ mod tests {
             .expect("fused_row_parallel_views precondition");
         let s_ser = spv(&serial, "sm_ser");
         let s_par = spv(&parallel, "sm_par");
-        let run = |s: &poot_runtime::CompiledKernel, wg: [u32; 3], threads: [u32; 3]| -> Vec<f32> {
+        let run = |s: &poot_runtime_common::CompiledKernel,
+                   wg: [u32; 3],
+                   threads: [u32; 3]|
+         -> Vec<f32> {
             let mut bufs = [
                 KernelBuffer::read_only_f32(&scores),
                 KernelBuffer::write_f32(num_rows * sz),
@@ -2745,5 +2429,338 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Synthesize one row-wise kernel for a reduction-rooted region: one thread per row computes each last-axis
+    /// reduction into a register (recomputing the pointwise chain that feeds it), threads the per-row scalar chain,
+    /// then writes the output row (the one-pass RMSNorm / fused softmax shape). Serial over the row (like
+    /// `reduce_last`), so it lowers on both backends with no private array. The launch grid is the output numel;
+    /// threads with `row >= num_rows` no-op via the baked guard.
+    ///
+    /// Only this crate's own tests call the serial form directly today; the production path is the parallel
+    /// twin, [`fused_row_parallel_views`].
+    fn fused_row(
+        name: &str,
+        out_shape: &[usize],
+        leaf_shapes: &[&[usize]],
+        k: &RowKernel,
+    ) -> Result<Body, KernelGenError> {
+        let layouts: Vec<Layout> = leaf_shapes.iter().map(|s| Layout::contiguous(s)).collect();
+        fused_row_views(name, out_shape, leaf_shapes, &layouts, k)
+    }
+
+    /// [`fused_row`] reading each leaf through its own physical [`Layout`]. Byte-identical to `fused_row` when every
+    /// layout is `Layout::contiguous`.
+    fn fused_row_views(
+        name: &str,
+        out_shape: &[usize],
+        leaf_shapes: &[&[usize]],
+        leaf_layouts: &[Layout],
+        k: &RowKernel,
+    ) -> Result<Body, KernelGenError> {
+        if leaf_shapes.len() != k.n_leaves {
+            return Err(KernelGenError::CountMismatch {
+                generator: "fused_row_views",
+                what: "leaf shape count".to_string(),
+                expected: k.n_leaves,
+                actual: leaf_shapes.len(),
+            });
+        }
+        if leaf_layouts.len() != k.n_leaves {
+            return Err(KernelGenError::CountMismatch {
+                generator: "fused_row_views",
+                what: "leaf layout count".to_string(),
+                expected: k.n_leaves,
+                actual: leaf_layouts.len(),
+            });
+        }
+        let lanes = row_lanes("fused_row_views", k)?;
+        let n = k.n_leaves;
+        let n_cols = k.n_cols;
+        let out_numel: usize = out_shape.iter().product::<usize>().max(1);
+        let num_rows = out_numel / n_cols.max(1);
+        let out_strides = row_major_strides(out_shape);
+        let (leaf_eff, leaf_base): (Vec<Vec<usize>>, Vec<usize>) = leaf_shapes
+            .iter()
+            .zip(leaf_layouts.iter())
+            .map(|(s, layout)| view_eff_strides(out_shape, s, layout))
+            .unzip();
+
+        // classify each region-local as Row (per-element) or Scalar (per-row).
+        let total = n + k.steps.len();
+        let mut kind = vec![RowKind::Row; total];
+        for (s, step) in k.steps.iter().enumerate() {
+            kind[n + s] = match step {
+                RowOp::Reduce { .. } => RowKind::Scalar,
+                RowOp::Pointwise { inputs, .. } => {
+                    let any_row = inputs.iter().any(|i| match i {
+                        FusedInput::Leaf(_) => true,
+                        FusedInput::Step(st) => kind[n + *st] == RowKind::Row,
+                        FusedInput::Lit(_)
+                        | FusedInput::LitI32(_)
+                        | FusedInput::LeafLane { .. } => false,
+                    });
+                    if any_row {
+                        RowKind::Row
+                    } else {
+                        RowKind::Scalar
+                    }
+                }
+            };
+        }
+
+        // params: leaves are locals 1..=n, the output is local n+1.
+        let mut locals = vec![ld(Ty::Unit, false)];
+        for lane in &lanes {
+            locals.push(lane.param());
+        }
+        locals.push(ld(slice_f32(true), true));
+        let mut al = Alloc::new(locals);
+        let out_local = local((n + 1) as u32);
+        let row = al.add(Ty::Usize, false);
+        let cmp = al.add(Ty::Bool, false);
+        let j = al.add(Ty::Usize, true);
+        let i_local = al.add(Ty::Usize, false);
+        let base = al.add(Ty::Usize, false);
+        let j_new = al.add(Ty::Usize, false);
+        let cu = |x: usize| Operand::Const(Constant::Usize(x as u64));
+
+        // scalar registers: an acc local per Reduce, a result local per Scalar Pointwise. Pre-allocate.
+        let mut scalar_reg: Vec<Option<Local>> = vec![None; total];
+        for (s, step) in k.steps.iter().enumerate() {
+            let id = n + s;
+            if kind[id] == RowKind::Scalar {
+                scalar_reg[id] = Some(al.add(Ty::F32, true));
+            } else {
+                let _ = step;
+            }
+        }
+
+        // helper to read a scalar operand (already-computed register or a literal).
+        let scalar_operand = |inp: &FusedInput, scalar_reg: &[Option<Local>]| -> Operand {
+            match inp {
+                FusedInput::Step(s) => {
+                    copy(Place::local(scalar_reg[n + *s].expect("scalar ready")))
+                }
+                FusedInput::Lit(c) => Operand::Const(Constant::F32(*c)),
+                FusedInput::LitI32(_) | FusedInput::LeafLane { .. } => {
+                    panic!("f32 fused kernel cannot carry an I32 packed lane or literal")
+                }
+                FusedInput::Leaf(_) => unreachable!("a scalar step cannot take a row leaf operand"),
+            }
+        };
+
+        // build the passes. `blocks` starts at id 2 (bb0/bb1 are the prologue); `pending` holds straight-line
+        // scalar assignments waiting to be placed at the head of the next pass.
+        let mut blocks: Vec<BasicBlock> = Vec::new(); // body blocks, ids 2..
+        let mut pending: Vec<Statement> = Vec::new();
+        let bid = |body_idx: usize| (2 + body_idx) as u32; // body block index -> absolute block id
+
+        // emit i = row*n_cols + j at the top of a col-loop body, into i_local.
+        let emit_i = |stmts: &mut Vec<Statement>| {
+            stmts.push(Statement::Assign(
+                Place::local(base),
+                Rvalue::BinaryOp(BinOp::Mul, copy(Place::local(row)), cu(n_cols)),
+            ));
+            stmts.push(Statement::Assign(
+                Place::local(i_local),
+                Rvalue::BinaryOp(BinOp::Add, copy(Place::local(base)), copy(Place::local(j))),
+            ));
+        };
+
+        let ctx_kind = kind.clone();
+        let ctx_leaf_eff = leaf_eff.clone();
+        let ctx_leaf_base = leaf_base.clone();
+
+        for (s, step) in k.steps.iter().enumerate() {
+            match step {
+                RowOp::Pointwise { op, inputs } if kind[n + s] == RowKind::Scalar => {
+                    // a per-row scalar op: straight-line, queued into `pending`.
+                    let operands: Vec<Operand> = inputs
+                        .iter()
+                        .map(|i| scalar_operand(i, &scalar_reg))
+                        .collect();
+                    let dst = scalar_reg[n + s].unwrap();
+                    emit_scalar_op(dst, *op, &operands, &mut al, &mut pending);
+                }
+                RowOp::Pointwise { .. } => { /* a Map: recomputed on demand, nothing to emit here */
+                }
+                RowOp::Reduce { op, input } => {
+                    let (init, bop) = match op {
+                        RowReduce::Sum => (0.0f32, BinOp::Add),
+                        RowReduce::Max => (f32::NEG_INFINITY, BinOp::Max),
+                    };
+                    let acc = scalar_reg[n + s].unwrap();
+                    let pre = blocks.len();
+                    let hdr = pre + 1;
+                    let bodyb = pre + 2;
+                    let next = pre + 3;
+                    // pre: pending + acc=init + j=0 -> hdr
+                    let mut pre_stmts = std::mem::take(&mut pending);
+                    pre_stmts.push(Statement::Assign(
+                        Place::local(acc),
+                        Rvalue::Use(Operand::Const(Constant::F32(init))),
+                    ));
+                    pre_stmts.push(Statement::Assign(Place::local(j), Rvalue::Use(cu(0))));
+                    blocks.push(BasicBlock {
+                        statements: pre_stmts,
+                        terminator: Terminator::Goto {
+                            target: BlockId { index: bid(hdr) },
+                        },
+                    });
+                    // hdr: cmp = j < n_cols; if false -> next, else body
+                    blocks.push(BasicBlock {
+                        statements: vec![Statement::Assign(
+                            Place::local(cmp),
+                            Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(j)), cu(n_cols)),
+                        )],
+                        terminator: guard(cmp, bid(next), bid(bodyb)),
+                    });
+                    // body: i = row*N+j; v = row_value(input); acc = acc bop v; j += 1 -> hdr
+                    let ctx = RowCtx {
+                        k,
+                        kind: &ctx_kind,
+                        leaf_eff: &ctx_leaf_eff,
+                        leaf_base: &ctx_leaf_base,
+                        lanes: &lanes,
+                        out_strides: &out_strides,
+                        out_shape,
+                        scalar_reg: &scalar_reg,
+                    };
+                    let mut body_stmts: Vec<Statement> = Vec::new();
+                    emit_i(&mut body_stmts);
+                    let mut memo = std::collections::HashMap::new();
+                    let in_local = match input {
+                        FusedInput::Leaf(jx) => {
+                            emit_row_value(&ctx, *jx, i_local, &mut al, &mut body_stmts, &mut memo)
+                        }
+                        FusedInput::Step(st) => emit_row_value(
+                            &ctx,
+                            n + *st,
+                            i_local,
+                            &mut al,
+                            &mut body_stmts,
+                            &mut memo,
+                        ),
+                        FusedInput::Lit(_)
+                        | FusedInput::LitI32(_)
+                        | FusedInput::LeafLane { .. } => {
+                            unreachable!("reduce over a literal")
+                        }
+                    };
+                    let acc_new = al.add(Ty::F32, false);
+                    body_stmts.push(Statement::Assign(
+                        Place::local(acc_new),
+                        Rvalue::BinaryOp(
+                            bop,
+                            copy(Place::local(acc)),
+                            copy(Place::local(in_local)),
+                        ),
+                    ));
+                    body_stmts.push(Statement::Assign(
+                        Place::local(acc),
+                        Rvalue::Use(copy(Place::local(acc_new))),
+                    ));
+                    body_stmts.push(Statement::Assign(
+                        Place::local(j_new),
+                        Rvalue::BinaryOp(BinOp::Add, copy(Place::local(j)), cu(1)),
+                    ));
+                    body_stmts.push(Statement::Assign(
+                        Place::local(j),
+                        Rvalue::Use(copy(Place::local(j_new))),
+                    ));
+                    blocks.push(BasicBlock {
+                        statements: body_stmts,
+                        terminator: Terminator::Goto {
+                            target: BlockId { index: bid(hdr) },
+                        },
+                    });
+                }
+            }
+        }
+
+        // the output pass: pending (any trailing scalar steps) + j=0 -> hdr; hdr loops; body stores out[i].
+        let pre = blocks.len();
+        let hdr = pre + 1;
+        let bodyb = pre + 2;
+        let output_hdr_block = hdr;
+        let mut pre_stmts = std::mem::take(&mut pending);
+        pre_stmts.push(Statement::Assign(Place::local(j), Rvalue::Use(cu(0))));
+        blocks.push(BasicBlock {
+            statements: pre_stmts,
+            terminator: Terminator::Goto {
+                target: BlockId { index: bid(hdr) },
+            },
+        });
+        // hdr: placeholder `next` target patched to the exit block after we know its id.
+        blocks.push(BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(cmp),
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(j)), cu(n_cols)),
+            )],
+            terminator: guard(cmp, 0, bid(bodyb)), // zero_target patched below
+        });
+        // body: i = row*N+j; v = row_value(output); out[i] = v; j += 1 -> hdr
+        let ctx = RowCtx {
+            k,
+            kind: &ctx_kind,
+            leaf_eff: &ctx_leaf_eff,
+            leaf_base: &ctx_leaf_base,
+            lanes: &lanes,
+            out_strides: &out_strides,
+            out_shape,
+            scalar_reg: &scalar_reg,
+        };
+        let mut body_stmts: Vec<Statement> = Vec::new();
+        emit_i(&mut body_stmts);
+        let mut memo = std::collections::HashMap::new();
+        let out_val = emit_row_value(&ctx, k.output, i_local, &mut al, &mut body_stmts, &mut memo);
+        body_stmts.push(Statement::Assign(
+            elem(out_local, i_local),
+            Rvalue::Use(copy(Place::local(out_val))),
+        ));
+        body_stmts.push(Statement::Assign(
+            Place::local(j_new),
+            Rvalue::BinaryOp(BinOp::Add, copy(Place::local(j)), cu(1)),
+        ));
+        body_stmts.push(Statement::Assign(
+            Place::local(j),
+            Rvalue::Use(copy(Place::local(j_new))),
+        ));
+        blocks.push(BasicBlock {
+            statements: body_stmts,
+            terminator: Terminator::Goto {
+                target: BlockId { index: bid(hdr) },
+            },
+        });
+
+        // the exit block (after all body blocks) + the prologue (bb0 row=tid, bb1 num_rows guard).
+        let exit_id = bid(blocks.len());
+        // patch the output loop header's exit target.
+        if let Terminator::SwitchInt { targets, .. } = &mut blocks[output_hdr_block].terminator {
+            targets.branches[0].1 = BlockId { index: exit_id };
+        }
+        let bb0 = BasicBlock {
+            statements: vec![],
+            terminator: Terminator::ThreadIndexCall {
+                destination: Place::local(row),
+                dim: IndexAxis::X,
+                target: BlockId { index: 1 },
+            },
+        };
+        let bb1 = BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::local(cmp),
+                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(row)), cu(num_rows)),
+            )],
+            terminator: guard(cmp, exit_id, bid(0)), // row >= num_rows -> exit, else first pass
+        };
+        let mut all = vec![bb0, bb1];
+        all.append(&mut blocks);
+        all.push(BasicBlock {
+            statements: vec![],
+            terminator: Terminator::Return,
+        });
+        Ok(Body::new(name, (n + 1) as u32, al.locals, all))
     }
 }

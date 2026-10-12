@@ -8,10 +8,21 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# ADR-0113: `test_support` holds the graph fixtures no production code calls (card 671), shared by the graph,
+# planner, executor and device tests above this crate, and `TraceLimits::for_tests` with the budget
+# introspection a limit test reads. Enabled only from `[dev-dependencies]` edges.
+test-support = ["dep:poot-test-util"]
+
 [dependencies]
 poot-tensor.workspace = true
 poot-quant.workspace = true
+# `fill`, the seeded fill the scan fixture draws its operands from; present only under `test-support`.
+poot-test-util = { workspace = true, optional = true }
 thiserror.workspace = true
+
+[dev-dependencies]
+poot-test-util.workspace = true
 
 [lints]
 workspace = true

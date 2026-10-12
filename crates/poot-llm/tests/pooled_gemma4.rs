@@ -12,7 +12,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, LoadOptions, ModelHandle,
     PreparedSetLimits, open_executor, program_retention,
@@ -69,7 +69,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
     tokenizer().save(dir.join("tokenizer.json"), false).unwrap();
-    poot_test_util::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
+    poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
 }
 
 /// The Gemma4 MoE fixture (`gemma4`'s `moe` variant: eight experts, two per token) as a loaded handle.
@@ -97,7 +97,7 @@ fn options() -> DriverOptions {
         decode: compile,
         capacity: nz(CAPACITY),
         prefill_chunk: nz(8),
-        max_trace_tokens: nz(64),
+        trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(64)),
         prepared: PreparedSetLimits {
             max_entries: nz(64),
             max_retained_bytes: NonZeroU64::new(1 << 32).unwrap(),
@@ -116,7 +116,7 @@ fn open(choice: BackendChoice) -> Option<Box<dyn poot_executor::Executor>> {
         BackendChoice::Vulkan => DeviceBackend::Vulkan,
         BackendChoice::Auto => unreachable!("rows name their backend"),
     };
-    poot_test_util::device_skip::open_or_skip(backend, open_executor(choice))
+    poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
 }
 
 fn generate(driver: &mut Driver, prompt: &[u32], max_new: usize) -> Vec<u32> {

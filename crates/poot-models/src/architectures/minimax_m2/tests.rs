@@ -7,7 +7,9 @@
 
 use std::num::NonZeroUsize;
 
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission, Target, compile};
+use poot_graph_plan::{
+    CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
+};
 use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_target::{AmdArch, Backend, DeviceCaps};
 
@@ -39,7 +41,7 @@ struct Dims {
 
 impl Dims {
     fn of(config: &serde_json::Value) -> Self {
-        let n = |f: &str| config[f].as_u64().unwrap() as usize;
+        let n = |f: &str| crate::registry::Fixture::count(config, f);
         let x = |f: &str| config[f].as_f64().unwrap();
         Self {
             hidden: n("hidden_size"),
@@ -339,7 +341,7 @@ fn chunked_prefill_continuing_from_pos_equals_token_by_token_decode() {
 /// The fixture's store with every projection and expert weight Q8_0, the router and norms dense.
 #[test]
 fn bf16_and_q8_0_experts_trace_through_the_one_body_and_match_the_decoded_reference() {
-    crate::olmoe::moe_support::assert_bf16_and_q8_0_experts_trace_and_match(
+    crate::architectures::olmoe::moe_support::assert_bf16_and_q8_0_experts_trace_and_match(
         &ENTRY,
         &fixture(),
         |key| {
@@ -482,7 +484,11 @@ fn a_step_above_the_cache_is_a_typed_refusal() {
     let fx = fixture();
     let model = model_of(&fx.config, &fx.store);
     let shape = step_shape(CAP + 1, CAP, LogitRows::All);
-    match model.trace(Phase::Prefill, shape) {
+    match model.trace(
+        Phase::Prefill,
+        shape,
+        poot_graph_ir::TraceLimits::for_tests(),
+    ) {
         Err(TraceError::ShapeUnsupported { reason, .. }) => {
             assert_eq!(reason, ShapeReason::TokensAboveCapacity)
         }
@@ -519,7 +525,9 @@ fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::
         logits: LogitRows::Last,
         hidden: None,
     };
-    let graph = model.trace(phase, shape).unwrap();
+    let graph = model
+        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .unwrap();
     poot_graph_plan::bind_packed_weights(
         &graph,
         &poot_graph_plan::WeightFormats::from_weight_map(model.weights()),

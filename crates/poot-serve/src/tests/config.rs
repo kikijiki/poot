@@ -6,8 +6,8 @@ use std::path::Path;
 
 use clap::Parser;
 use poot_executor::DetailedTiming;
-use poot_llm::ChatTemplateOverride;
 use poot_llm::driver::{BackendChoice, DraftPolicy};
+use poot_text::ChatTemplateOverride;
 
 use super::*;
 use crate::admin::{LoraAdminDenial, LoraAdminPolicyMode};

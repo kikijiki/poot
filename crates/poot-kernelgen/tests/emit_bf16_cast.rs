@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use poot_codegen::Target;
+use poot_codegen::emit_llvm_ir;
 use poot_target::AmdArch;
-use poot_test_util::kernel_fixtures::emit_llvm_ir;
 
 /// Run the straight-line f32 -> bf16 cast sequence of the emitted AmdGcn IR on `x` and return the bf16
 /// bits. The interpreter knows only the handful of integer ops the lowering uses and panics on any other,

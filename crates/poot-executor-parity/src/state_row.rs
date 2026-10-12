@@ -12,12 +12,12 @@
 
 use std::sync::Arc;
 
+use poot_eval::test_support::StepFixture;
 use poot_executor::{BindError, ExecError, Executor, NoSync, StateScope, StepInputs};
 use poot_graph_ir::{BinOp, Builder, Graph, Scalar, Slot, SlotKey, StateRole, TensorType};
-use poot_graph_plan::{Submission, Target};
+use poot_graph_plan::{Target, production_plan::Submission};
 use poot_quant::weights::WeightStore;
 use poot_tensor::{DType, HostTensor};
-use poot_test_util::StepFixture;
 
 use crate::{Fixture, fixture_weights, staged};
 
@@ -35,48 +35,60 @@ const COUNTER_ROWS: usize = 5;
 const EXACT_BASE: i32 = 16_777_216;
 
 fn fixture(dtype: DType) -> Fixture {
-    let b = Builder::new();
-    let pool = b.state_input(
-        "pool",
-        TensorType::new(vec![SLOTS, WIDTH], dtype),
-        StateRole::Recurrent,
-    );
-    let counter = b.state_input(
-        "counter",
-        TensorType::new(vec![COUNTER_ROWS, WIDTH], dtype),
-        StateRole::Positional { axis: 0 },
-    );
-    let read = b.slot_named(
-        Slot::Activation,
-        "state_read",
-        TensorType::new(vec![ROWS], DType::I32),
-    );
-    let write = b.slot_named(
-        Slot::Activation,
-        "state_write",
-        TensorType::new(vec![SLOTS], DType::I32),
-    );
-    let x = b.slot_named(
-        Slot::Activation,
-        "x",
-        TensorType::new(vec![ROWS, WIDTH], dtype),
-    );
+    let b = Builder::for_tests();
+    let pool = b
+        .state_input(
+            "pool",
+            TensorType::new(vec![SLOTS, WIDTH], dtype),
+            StateRole::Recurrent,
+        )
+        .unwrap();
+    let counter = b
+        .state_input(
+            "counter",
+            TensorType::new(vec![COUNTER_ROWS, WIDTH], dtype),
+            StateRole::Positional { axis: 0 },
+        )
+        .unwrap();
+    let read = b
+        .slot_named(
+            Slot::Activation,
+            "state_read",
+            TensorType::new(vec![ROWS], DType::I32),
+        )
+        .unwrap();
+    let write = b
+        .slot_named(
+            Slot::Activation,
+            "state_write",
+            TensorType::new(vec![SLOTS], DType::I32),
+        )
+        .unwrap();
+    let x = b
+        .slot_named(
+            Slot::Activation,
+            "x",
+            TensorType::new(vec![ROWS, WIDTH], dtype),
+        )
+        .unwrap();
     let one = match dtype {
         DType::I32 => Scalar::I32(1),
         _ => Scalar::F32(1.0),
     };
-    let current = b.gather(pool, 0, read);
-    let next = b.binary(BinOp::Add, current, x);
-    let updated = b.scatter_update(pool, next, write);
-    let counted = b.binary_scalar(BinOp::Add, counter, one);
+    let current = b.gather(pool, 0, read).unwrap();
+    let next = b.binary(BinOp::Add, current, x).unwrap();
+    let updated = b.scatter_update(pool, next, write).unwrap();
+    let counted = b.binary_scalar(BinOp::Add, counter, one).unwrap();
     // The output is the state's own type: an I32 state is read back as I32 words (a cast of carried
     // words to F32 is not provable from the graph, POOT-726). The I32 result is still shifted down by
     // 2^24, so the rows show the small integers the model computes.
     let shown = match dtype {
-        DType::I32 => b.binary_scalar(BinOp::Sub, next, Scalar::I32(EXACT_BASE)),
+        DType::I32 => b
+            .binary_scalar(BinOp::Sub, next, Scalar::I32(EXACT_BASE))
+            .unwrap(),
         _ => next,
     };
-    let out = b.concat(0, &[shown, counted]);
+    let out = b.concat(0, &[shown, counted]).unwrap();
     let graph: Graph = b
         .finish(poot_graph_ir::Outputs::new(out).with_state(&[(pool, updated), (counter, counted)]))
         .unwrap();

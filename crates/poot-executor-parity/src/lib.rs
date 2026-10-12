@@ -1,15 +1,15 @@
 //! Dev-only table-driven parity fixtures for the executor contract: one
 //! table of fixture programs, run through the object-safe `Executor` on whichever `Device` the
-//! caller built, with the oracle passed in by the caller rather than depended on here - this crate
-//! takes `poot-models` (for the fixture graphs) but never `poot-eval`, so `poot-executor` stays free
-//! of it transitively too.
+//! caller built, with the oracle passed in by the caller rather than depended on here. The crate
+//! sits below `poot-models` (the fixtures that trace a model live in `poot_models::test_support`)
+//! and takes no model; `poot-executor` stays free of the oracle transitively too.
 //!
 //! SC-002: for each fixture, every step's replayed output (the entry's first step, which records
 //! then replays in one call, and every later pure-replay step) matches an independently-computed
 //! CPU oracle, within float tolerance (ADR-0101 tier 1).
 //!
 //! The oracle is supplied by the caller as a per-step callback (`run_parity`'s `oracle` parameter):
-//! this crate never depends on `poot-eval`, so the caller (`poot-gpu/src/tests/parity.rs`, which
+//! this crate never depends on `poot-eval`, so the caller (`poot-wgpu-device/src/tests/parity.rs`, which
 //! already does) computes each step's expected bytes from `fixture.graph`/`fixture.store` and feeds
 //! them back in the same order `run_parity` steps the device, including the final repeat of step
 //! 0's inputs. Comparing every step against an independent computation (not just a later replay of
@@ -32,37 +32,33 @@ pub mod alibi;
 pub mod attention;
 pub mod bf16_cast;
 pub mod capture;
-pub mod dense;
 pub mod gdn;
 pub mod i32_gather;
 pub mod launch;
 pub mod live_attention;
 pub mod lora;
 pub mod packed;
-pub mod pipeline;
 pub mod routing;
 pub mod scan;
 pub mod select;
 pub mod state_row;
-pub mod weight_map;
 pub mod write_probe;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::dense::{Dense, Family, step};
+use poot_eval::test_support::StepFixture;
 use poot_executor::{Executor, NoSync, StateScope, StepInputs};
+use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Graph, Slot, Storage, TensorType};
 use poot_graph_plan::{
-    CompileOptions, DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram,
-    Submission, Target, TargetSet, compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
-use poot_models::model::{LogitRows, Phase};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
-use poot_test_util::StepFixture;
-use poot_test_util::const_weights::ConstWeights;
 
 /// One parity fixture: a graph, the weight store it binds, and the input values for its first few
 /// steps (enough to exercise the record-then-replay boundary at least twice).
@@ -99,12 +95,12 @@ fn const_data(name: &str, shape: &[usize]) -> Vec<f32> {
     fill(n, seed)
 }
 
-fn store_for(g: &Graph) -> WeightStore {
+pub fn store_for(g: &Graph) -> WeightStore {
     store_with(g, |_, _| {})
 }
 
 /// [`store_for`] with each named constant's data rewritten in place by `adjust(name, data)`.
-fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
+pub fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
     let mut entries: HashMap<String, Vec<usize>> = HashMap::new();
     for &id in g.inputs() {
         let meta = g.meta(id);
@@ -123,7 +119,7 @@ fn store_with(g: &Graph, adjust: impl Fn(&str, &mut [f32])) -> WeightStore {
     builder.build()
 }
 
-fn step_fixtures(g: &Graph, tokens: &[u32], start: usize) -> Vec<StepFixture> {
+pub fn step_fixtures(g: &Graph, tokens: &[u32], start: usize) -> Vec<StepFixture> {
     g.inputs()
         .iter()
         .filter_map(|&id| {
@@ -155,142 +151,6 @@ fn step_fixtures(g: &Graph, tokens: &[u32], start: usize) -> Vec<StepFixture> {
         .collect()
 }
 
-/// The qwen2 dimensions of the decode and prefill fixtures.
-fn fixture_dense(family: Family) -> Dense {
-    Dense::new(family)
-        .vocab(32)
-        .dims(16, 32, 2)
-        .heads(4, 2)
-        .head_dim(4)
-        .max_positions(16)
-}
-
-/// A qwen2 decode fixture: `cap` decode steps at increasing positions, enough to see at least one
-/// recorded step followed by a replayed one with different inputs, plus a repeat of step 0's inputs
-/// later to test record-vs-replay bit-exactness directly.
-pub fn qwen2_decode_fixture(cap: usize) -> Fixture {
-    decode_fixture(
-        "qwen2_decode",
-        &fixture_dense(Family::Qwen2),
-        cap,
-        store_for,
-    )
-}
-
-/// A decode fixture of `dense` over `cap` positions: `cap` one-token steps, the store from `store`.
-pub(crate) fn decode_fixture(
-    name: &'static str,
-    dense: &Dense,
-    cap: usize,
-    store: impl Fn(&Graph) -> WeightStore,
-) -> Fixture {
-    let m = dense.f32_model();
-    let g = m
-        .model
-        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
-        .unwrap();
-    let store = store(&g);
-    let steps = (0..cap)
-        .map(|pos| step_fixtures(&g, &[((pos * 7 + 3) % 32) as u32], pos))
-        .collect();
-    Fixture {
-        name,
-        graph: g,
-        store,
-        steps,
-    }
-}
-
-/// A prefill fixture of `dense`: one `n`-token forward over `cap` positions.
-fn prefill_fixture(
-    name: &'static str,
-    dense: &Dense,
-    n: usize,
-    cap: usize,
-    store: impl Fn(&Graph) -> WeightStore,
-) -> Fixture {
-    let m = dense.f32_model();
-    let g = m
-        .model
-        .trace(Phase::Prefill, step(1, n, cap, LogitRows::Last))
-        .unwrap();
-    let store = store(&g);
-    let prompt: Vec<u32> = (0..n as u32).map(|t| (t * 11 + 2) % 32).collect();
-    let steps = vec![step_fixtures(&g, &prompt, 0)];
-    Fixture {
-        name,
-        graph: g,
-        store,
-        steps,
-    }
-}
-
-/// A qwen2 prefill fixture: one `n`-token forward.
-pub fn qwen2_prefill_fixture(n: usize, cap: usize) -> Fixture {
-    prefill_fixture(
-        "qwen2_prefill",
-        &fixture_dense(Family::Qwen2),
-        n,
-        cap,
-        store_for,
-    )
-}
-
-/// The Gemma2/Grok attention-logit softcap the softcap fixtures trace (Card 557 SC-004).
-pub const ATTN_LOGIT_SOFTCAP: f32 = 50.0;
-
-/// The dimensions of the softcap fixtures: a Gemma 2 whose window no position reaches and whose
-/// final logits are not capped, so the attention-logit softcap is the only cap in the graph.
-fn softcap_dense(softcap: Option<f32>) -> Dense {
-    fixture_dense(Family::Gemma2)
-        .with("attn_logit_softcapping", softcap)
-        .with("final_logit_softcapping", serde_json::Value::Null)
-        .with("sliding_window", 1 << 20)
-}
-
-/// The softcap fixtures' weights. Softmax is shift-invariant and `50 * tanh(s / 50)` is not: large Q
-/// and K projections put the scores where tanh compresses them, so a dropped softcap moves the
-/// softmax weights. Small scores leave the softcap the identity; either way a dropped softcap would
-/// be invisible. The path from the attention output to the logits (V and O projections, the norms,
-/// the LM head) is scaled so the logits are order one and the difference reaches them above the
-/// parity tolerance.
-fn softcap_weights(name: &str, data: &mut [f32]) {
-    let gain = if name.ends_with(".attn.q") || name.ends_with(".attn.k") {
-        30.0
-    } else if name.contains("norm")
-        || name.ends_with(".attn.v")
-        || name.ends_with(".attn.o")
-        || name == "w.head"
-    {
-        10.0
-    } else {
-        1.0
-    };
-    data.iter_mut().for_each(|value| *value *= gain);
-}
-
-/// Card 557 SC-004: [`qwen2_decode_fixture`] over a Gemma 2 body traced with `softcap` as its
-/// attention-logit softcap. A softcapped decode stays the attention decomposition (the matcher does not
-/// fuse a softcapped decode yet), with the softcap in the graph.
-pub fn qwen2_softcap_decode_fixture(cap: usize, softcap: Option<f32>) -> Fixture {
-    decode_fixture("qwen2_softcap_decode", &softcap_dense(softcap), cap, |g| {
-        store_with(g, softcap_weights)
-    })
-}
-
-/// Card 557 SC-004: [`qwen2_prefill_fixture`] over a Gemma 2 body traced with `softcap`. `compile`
-/// fuses a softcapped prefill into `Attention { softcap }`, which the planner lowers to the generated
-/// attention kernel with its softcap score transform.
-pub fn qwen2_softcap_prefill_fixture(n: usize, cap: usize, softcap: Option<f32>) -> Fixture {
-    prefill_fixture(
-        "qwen2_softcap_prefill",
-        &softcap_dense(softcap),
-        n,
-        cap,
-        |g| store_with(g, softcap_weights),
-    )
-}
-
 /// Card 645: a projection against an F32 weight held in checkpoint `[N, K]` orientation,
 /// `matmul(x, transpose(w))` with `x` an `[m, k]` activation slot. `compile` folds the pair into one
 /// `DenseContraction` that reads `w` as stored, so no device `transpose` runs. Two steps with different
@@ -305,10 +165,14 @@ fn checkpoint_projection_fixture(
     n: usize,
     weight: DType,
 ) -> Fixture {
-    let b = poot_graph_ir::Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]));
-    let w = b.constant("w", TensorType::new(vec![n, k], weight));
-    let out = b.matmul(x, b.transpose(w, vec![1, 0]));
+    let b = poot_graph_ir::Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![n, k], weight))
+        .unwrap();
+    let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
     let graph = b.finish(out).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
@@ -422,11 +286,17 @@ fn grouped_projection_fixture(
     k: usize,
     n: usize,
 ) -> Fixture {
-    let b = poot_graph_ir::Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![groups, m, k]));
-    let w = b.constant("w", TensorType::new(vec![groups * n, k], DType::BF16));
-    let blocks = b.reshape(w, vec![groups, n, k]);
-    let out = b.matmul(x, b.transpose(blocks, vec![0, 2, 1]));
+    let b = poot_graph_ir::Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![groups, m, k]))
+        .unwrap();
+    let w = b
+        .constant("w", TensorType::new(vec![groups * n, k], DType::BF16))
+        .unwrap();
+    let blocks = b.reshape(w, vec![groups, n, k]).unwrap();
+    let out = b
+        .matmul(x, b.transpose(blocks, vec![0, 2, 1]).unwrap())
+        .unwrap();
     let graph = b.finish(out).unwrap();
     let key = graph.meta(x.id()).slot_key().unwrap().clone();
     let steps = (0..2u64)
@@ -555,7 +425,7 @@ fn view(step: &[StepFixture]) -> StepInputs<'_> {
 }
 
 /// `fixture`'s graph with each const named by a weight id, and the map over `fixture.store` that
-/// binds those names (see [`poot_test_util::const_weights::ConstWeights`]). Deterministic: every
+/// binds those names (see [`poot_graph_ir::test_support::const_weights::ConstWeights`]). Deterministic: every
 /// call names the same consts the same way, so [`staged`] and [`fixture_weights`] agree.
 fn bound(fixture: &Fixture) -> (Graph, poot_quant::weights::WeightMap) {
     let mut weights = ConstWeights::new(&fixture.store);
@@ -591,6 +461,25 @@ pub fn staged(fixture: &Fixture, target: Target, submission: Submission) -> Stag
 /// that step's expected output tensor.
 pub type Oracle<'a> = dyn FnMut(&[StepFixture]) -> HostTensor + 'a;
 
+/// ADR-0101 tier 2: every element of `got` within `tol * (1 + |want|)` of `want`; NaN fails.
+pub fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
+    assert_eq!(got.len(), want.len(), "{label}: element count");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (g - w).abs() <= tol * (1.0 + w.abs()),
+            "{label}: element {i}: got {g}, want {w}"
+        );
+    }
+}
+
+/// The tier-2 tolerance of a device step against the CPU oracle: `TIER2 * (1 + |want|)` per element.
+/// ADR-0101 (Backstage `adr/0101.md`, "Decision", item 2, "Tier 2, stated tolerance") derives the
+/// tolerance from the program's reassociation class and states no number; these programs are
+/// `Tier2Class::NarrowStorage` (`poot-graph-ir/src/analysis/numerics.rs`: BF16 and Q8_0 weights read
+/// by `DenseContraction`/`PackedContraction`, plus fused rows and RoPE), the widest class, and no
+/// class-to-tolerance table exists in the tree yet, so this stated bound is the row's own.
+pub const TIER2: f32 = 1e-3;
+
 /// Two F32 tensors agree in dtype and shape and within relative tolerance `rel` elementwise (CPU vs.
 /// GPU float ops are not bit-identical, so an oracle comparison needs tolerance; record-then-replay
 /// bit-exactness is a separate, narrower claim this function does not make). A NaN never agrees.
@@ -624,12 +513,12 @@ pub struct ConstFixture {
 ///
 /// ```ignore
 /// // before (GpuExecutor, deleted):
-/// let mut gpu = poot_gpu::GpuExecutor::new()?; // deleted
+/// let mut gpu = poot_wgpu_device::GpuExecutor::new()?; // deleted
 /// let got = gpu.run(&g, &inputs)?; // inputs: HashMap<ValueId, poot_eval::Value>, Const rows and
 ///                                  // Slot rows mixed together by ValueId.
 ///
 /// // after (the executor contract, via this crate):
-/// let device = poot_gpu::device::WgpuDevice::new()?;
+/// let device = poot_wgpu_device::device::WgpuDevice::new()?;
 /// let target = device.target();
 /// let mut exec: Box<dyn poot_executor::Executor> = Box::new(poot_executor::Engine::new(device));
 /// let got = poot_executor_parity::run_once(&mut *exec, target, &g, &consts, &slots)?;

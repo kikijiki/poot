@@ -165,9 +165,9 @@ fn fuzz_reduce_all_axes_and_keepdim() {
                     let op = if is_sum { RedOp::Sum } else { RedOp::Max };
 
                     // poot-eval path.
-                    let b = Builder::new();
-                    let x = b.constant("x", TensorType::f32(shape.to_vec()));
-                    let r = b.reduce(op, x, axis, keepdim);
+                    let b = Builder::for_tests();
+                    let x = b.constant("x", TensorType::f32(shape.to_vec())).unwrap();
+                    let r = b.reduce(op, x, axis, keepdim).unwrap();
                     let g = b.finish(r).unwrap();
                     let mut inp = HashMap::new();
                     inp.insert(
@@ -240,10 +240,14 @@ fn fuzz_matmul_random_shapes() {
         let ad = fill(na, seed);
         let bd = fill(nb, seed + 1);
 
-        let bld = Builder::new();
-        let av = bld.constant("a", TensorType::f32(a_shape.to_vec()));
-        let bv = bld.constant("b", TensorType::f32(b_shape.to_vec()));
-        let out = bld.matmul(av, bv);
+        let bld = Builder::for_tests();
+        let av = bld
+            .constant("a", TensorType::f32(a_shape.to_vec()))
+            .unwrap();
+        let bv = bld
+            .constant("b", TensorType::f32(b_shape.to_vec()))
+            .unwrap();
+        let out = bld.matmul(av, bv).unwrap();
         let g = bld.finish(out).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
@@ -320,9 +324,9 @@ fn fuzz_transpose_correctness() {
         let numel: usize = shape.iter().product();
         let xd = fill(numel, ci as u64 * 31 + 0xBEEF);
 
-        let bld = Builder::new();
-        let x = bld.constant("x", TensorType::f32(shape.to_vec()));
-        let t = bld.transpose(x, perm.to_vec());
+        let bld = Builder::for_tests();
+        let x = bld.constant("x", TensorType::f32(shape.to_vec())).unwrap();
+        let t = bld.transpose(x, perm.to_vec()).unwrap();
         let g = bld.finish(t).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
@@ -386,9 +390,11 @@ fn fuzz_broadcast_correctness() {
         let numel_in: usize = in_shape.iter().product::<usize>().max(1);
         let xd = fill(numel_in, ci as u64 * 41 + 0xCAFE);
 
-        let bld = Builder::new();
-        let x = bld.constant("x", TensorType::f32(in_shape.to_vec()));
-        let y = bld.broadcast(x, out_shape.to_vec());
+        let bld = Builder::for_tests();
+        let x = bld
+            .constant("x", TensorType::f32(in_shape.to_vec()))
+            .unwrap();
+        let y = bld.broadcast(x, out_shape.to_vec()).unwrap();
         let g = bld.finish(y).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
@@ -435,9 +441,9 @@ fn fuzz_elementwise_correctness() {
 
         // Neg: exact negation, bit-identical.
         {
-            let bld = Builder::new();
-            let x = bld.constant("x", TensorType::f32(vec![width]));
-            let y = bld.unary(UnOp::Neg, x);
+            let bld = Builder::for_tests();
+            let x = bld.constant("x", TensorType::f32(vec![width])).unwrap();
+            let y = bld.unary(UnOp::Neg, x).unwrap();
             let g = bld.finish(y).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
@@ -463,9 +469,9 @@ fn fuzz_elementwise_correctness() {
 
         // Exp: same formula, bit-identical.
         {
-            let bld = Builder::new();
-            let x = bld.constant("x", TensorType::f32(vec![width]));
-            let y = bld.unary(UnOp::Exp, x);
+            let bld = Builder::for_tests();
+            let x = bld.constant("x", TensorType::f32(vec![width])).unwrap();
+            let y = bld.unary(UnOp::Exp, x).unwrap();
             let g = bld.finish(y).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
@@ -498,9 +504,9 @@ fn fuzz_elementwise_correctness() {
             ),
             ("erf", UnOp::Erf, |v| libm::erf(v as f64) as f32),
         ] {
-            let bld = Builder::new();
-            let x = bld.constant("x", TensorType::f32(vec![width]));
-            let y = bld.unary(op, x);
+            let bld = Builder::for_tests();
+            let x = bld.constant("x", TensorType::f32(vec![width])).unwrap();
+            let y = bld.unary(op, x).unwrap();
             let g = bld.finish(y).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
@@ -537,10 +543,10 @@ fn fuzz_elementwise_correctness() {
             let ad = fill(width, seed);
             let bd = fill(width, seed + 1);
 
-            let bld = Builder::new();
-            let av = bld.constant("a", TensorType::f32(vec![width]));
-            let bv = bld.constant("b", TensorType::f32(vec![width]));
-            let r = bld.binary(*op, av, bv);
+            let bld = Builder::for_tests();
+            let av = bld.constant("a", TensorType::f32(vec![width])).unwrap();
+            let bv = bld.constant("b", TensorType::f32(vec![width])).unwrap();
+            let r = bld.binary(*op, av, bv).unwrap();
             let g = bld.finish(r).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
@@ -597,9 +603,9 @@ fn fuzz_softmax_vs_independent_formula() {
         let n_rows = numel / n_last;
         let xd = fill(numel, ci as u64 * 7 + 0x9999);
 
-        let bld = Builder::new();
-        let x = bld.constant("x", TensorType::f32(shape.to_vec()));
-        let s = softmax(&bld, x);
+        let bld = Builder::for_tests();
+        let x = bld.constant("x", TensorType::f32(shape.to_vec())).unwrap();
+        let s = softmax(&bld, x).unwrap();
         let g = bld.finish(s).unwrap();
         let mut inp = HashMap::new();
         inp.insert(
@@ -656,9 +662,9 @@ fn softmax_stays_accurate_at_extreme_score_magnitude() {
     let want: Vec<f64> = exps64.iter().map(|&e| e / sum64).collect();
 
     // two-pass softmax (poot's `softmax` op).
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![l]));
-    let s = softmax(&b, x);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![l])).unwrap();
+    let s = softmax(&b, x).unwrap();
     let g = b.finish(s).unwrap();
     let mut inp = HashMap::new();
     inp.insert(

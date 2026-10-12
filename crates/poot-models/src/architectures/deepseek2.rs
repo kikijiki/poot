@@ -27,7 +27,6 @@ use poot_quant::weights::{
     AttnRole, DsaRole, ExpertProj, FfnRole, MlaRole, NormRole, WeightMap, WeightRole, WeightStore,
 };
 
-use crate::chat::ChatFormat;
 use crate::components::dims::{Field, Fields};
 use crate::components::dsa::{DsaParams, DsaWeights, dsa_select};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
@@ -42,15 +41,16 @@ use crate::components::standard::{
     standard_layer, standard_stack,
 };
 use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, ParamBlock, Phase,
+    StepShape, TraceError, WiringError,
 };
 use crate::names::{
     ExpertNames, MoeLayers, MoeNames, NameRow, Presence, SharedNames, Source, family_weights_routed,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("deepseek2");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek2");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -840,7 +840,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Deepseek {
+pub(crate) struct Deepseek {
     params: DeepseekConfig,
     weights: WeightMap,
     stack: StackWeights,
@@ -904,14 +904,16 @@ pub(crate) fn build_family(
             Ok(Layer {
                 norms: LayerNorms::new(&weights, l, p.width)?,
                 mla: MlaWeights::new(&weights, l, p.width, &p.mla)?,
-                dsa: p
-                    .dsa
-                    .as_ref()
-                    .map(|dsa| {
-                        let q_rank = p.mla.q_rank().expect("DSA needs the low-rank query");
-                        DsaWeights::new(&weights, l, p.width, q_rank, dsa)
-                    })
-                    .transpose()?,
+                dsa: match &p.dsa {
+                    Some(dsa) => {
+                        let q_rank = p
+                            .mla
+                            .q_rank()
+                            .ok_or(WiringError::MissingParams(ParamBlock::LowRankQuery))?;
+                        Some(DsaWeights::new(&weights, l, p.width, q_rank, dsa)?)
+                    }
+                    None => None,
+                },
                 ffn,
             })
         })
@@ -947,12 +949,11 @@ impl Model for Deepseek {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(self.family, phase, shape, p.max_positions)?;
         moe::check_step(self.family, shape, &p.moe)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -973,7 +974,7 @@ impl Model for Deepseek {
                     Ffn::Routed(w) => moe::moe(b, &step, l, h, None, w, &p.moe),
                 },
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -1030,7 +1031,7 @@ pub(crate) fn hf_shapes(
     bias: bool,
     indexer: bool,
 ) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (vocab, w) = (n("vocab_size"), n("hidden_size"));
     let (heads, nope, rope, v) = (
         n("num_attention_heads"),
@@ -1178,6 +1179,7 @@ pub(crate) mod family_tests {
                 .trace(
                     Phase::Prefill,
                     step_shape(prompt.len(), CAP, LogitRows::All),
+                    poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
             let packed = model

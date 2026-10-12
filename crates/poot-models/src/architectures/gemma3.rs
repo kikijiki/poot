@@ -14,7 +14,6 @@ use poot_graph_ir::rope_table::RopeFlavor;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{WeightMap, WeightStore};
 
-use crate::chat::ChatFormat;
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, geglu_ffn};
@@ -32,11 +31,12 @@ use crate::model::{
 use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM, GGUF_SANDWICH_NORMS};
 use crate::names::{HF_BASE, HF_QK_NORM, HF_SANDWICH_NORMS, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_text::ChatFormat;
 
 /// The Gemma vocabulary's `<bos>` id, for a config that names none.
 const GEMMA_BOS: u32 = 2;
 
-pub const FAMILY: FamilyKey = FamilyKey::new("gemma3");
+pub(crate) const FAMILY: FamilyKey = FamilyKey::new("gemma3");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -72,7 +72,7 @@ const DEFAULT_PATTERN: usize = 6;
 
 /// Gemma 3's typed config: every value checked once, here, so tracing cannot fail on it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Gemma3Params {
+pub(crate) struct Gemma3Params {
     vocab: usize,
     width: usize,
     inter: usize,
@@ -111,7 +111,7 @@ fn global_layers(fields: &Fields<'_>, layers: usize) -> Result<Vec<bool>, ModelE
 }
 
 impl Gemma3Params {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let mut dims = DenseDims::read(&fields, &SPEC)?;
         let hf = matches!(raw, RawConfig::HfJson { .. });
@@ -186,7 +186,7 @@ struct Layer {
 }
 
 #[derive(Debug)]
-pub struct Gemma3 {
+pub(crate) struct Gemma3 {
     params: Gemma3Params,
     weights: WeightMap,
     stack: StackWeights,
@@ -243,11 +243,10 @@ impl Model for Gemma3 {
         &self.weights
     }
 
-    fn trace(&self, phase: Phase, shape: StepShape) -> Result<Graph, TraceError> {
+    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
         check_step(FAMILY, phase, shape, p.max_positions)?;
-        let b = Builder::new();
-        let step = Step::new(&b, shape);
+        let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
             standard_layer(
@@ -258,7 +257,7 @@ impl Model for Gemma3 {
                 |b, h| attention(b, &step, l, h, &layer.attn, &p.attention[l]),
                 |b, BlockInput { block: h, .. }| geglu_ffn(b, h, &layer.ffn),
             )
-        });
+        })?;
         Ok(step.finish(b, logits)?)
     }
 }
@@ -292,7 +291,7 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 /// The `[out, in]` (or `[n]`) shape of every tensor of a Gemma 3 checkpoint with `config`'s dims
 /// by its HF name.
 fn fixture_shapes(config: &serde_json::Value) -> Vec<(String, Vec<usize>)> {
-    let n = |f: &str| config[f].as_u64().unwrap() as usize;
+    let n = |f: &str| crate::registry::Fixture::count(config, f);
     let (h, d) = (n("hidden_size"), n("head_dim"));
     let mut shapes = hf_base_shapes(config, false);
     for l in 0..n("num_hidden_layers") {
@@ -471,7 +470,11 @@ mod tests {
         open.as_object_mut().unwrap().remove("sliding_window");
         let trace = |config: &serde_json::Value| {
             model_of(config, &fx.store)
-                .trace(Phase::Prefill, step_shape(3, CAP, LogitRows::All))
+                .trace(
+                    Phase::Prefill,
+                    step_shape(3, CAP, LogitRows::All),
+                    poot_graph_ir::TraceLimits::for_tests(),
+                )
                 .unwrap()
         };
         // Local layers would still rotate with the local base, so compare a window-free model whose
@@ -740,11 +743,19 @@ mod tests {
             ..step_shape(1, 1, LogitRows::Last)
         };
         assert!(matches!(
-            model.trace(Phase::Decode, shape(1, 2, 8)),
+            model.trace(
+                Phase::Decode,
+                shape(1, 2, 8),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
-            model.trace(Phase::Prefill, shape(1, 1, 65)),
+            model.trace(
+                Phase::Prefill,
+                shape(1, 1, 65),
+                poot_graph_ir::TraceLimits::for_tests()
+            ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
     }

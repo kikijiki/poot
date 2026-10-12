@@ -1,4 +1,5 @@
 use super::*;
+use crate::multimodal::qwen_vl_image::preprocess::smart_resize;
 
 #[test]
 fn qwen25_vl_configured_image_preprocessing_honors_independent_toggles() {

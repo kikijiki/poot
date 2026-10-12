@@ -1,4 +1,19 @@
-use crate::*;
+use crate::aql::{AqlRingWriter, DeviceRingReceiptProvenance, DispatchGeometry, LiveAqlChunkSink};
+use crate::context::{
+    Abandoned, DevicePoison, DeviceTiming, Held, PendingSubmission, ticks_to_duration,
+};
+use crate::error::check;
+use crate::owner::ResourceOwner;
+use crate::queue::{QueueRingProvenance, QueueRole};
+use crate::{
+    DispatchSpan, QueuePublicationContract, RocmBuffer, RocmContext, RocmError, bindings, ffi,
+};
+use object::read::elf::ElfFile;
+use object::{LittleEndian, Object, ObjectSection, ObjectSymbol};
+use poot_runtime_common::BufferRole;
+use poot_target::BufferStorage;
+use std::ffi::c_void;
+use std::sync::Arc;
 
 /// How long [`RocmContext::wait_completion_bounded`] polls a completion signal before it falls back to
 /// blocked waits. Covers a decode step's replay (~7ms for a 924-packet granite MoE step) and every
@@ -567,7 +582,7 @@ impl RocmContext {
     /// `elements` is `kernarg`'s packed buffers' native element kinds, in kernarg slot order (card 608,
     /// SC-002): checked against `kernel.args()` before any submission, since a
     /// ROCm kernarg is one opaque byte blob by this point - the caller that flattened it into `kernarg`
-    /// (e.g. `poot-rocm-gpu`'s `build_flat_kernarg`) is the one place that still knows what each slot is.
+    /// (e.g. `poot-rocm-device`'s `build_flat_kernarg`) is the one place that still knows what each slot is.
     pub fn dispatch(
         &self,
         kernel: &KernelHandle,
@@ -947,26 +962,6 @@ pub struct KernelHandle {
 }
 
 impl KernelHandle {
-    /// A synthetic handle for tests that exercise AQL packet building or kernarg validation without a
-    /// real HSA load. Not `pub`: production code only ever gets one from
-    /// [`RocmContext::lookup_kernel`].
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        kernel_object: u64,
-        kernarg_size: u32,
-        group_segment_size: u32,
-        private_segment_size: u32,
-        args: &[poot_runtime_common::ArgSchema],
-    ) -> Self {
-        KernelHandle {
-            kernel_object,
-            kernarg_size,
-            group_segment_size,
-            private_segment_size,
-            args: Arc::from(args),
-        }
-    }
-
     /// The AQL packet's `kernel_object` field.
     pub fn kernel_object(&self) -> u64 {
         self.kernel_object
@@ -1028,5 +1023,31 @@ impl RocmContext {
             BufferStorage::raw_bytes(),
             BufferRole::Meta,
         )
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl KernelHandle {
+        /// A synthetic handle for tests that exercise AQL packet building or kernarg validation without a
+        /// real HSA load. Not `pub`: production code only ever gets one from
+        /// [`RocmContext::lookup_kernel`].
+        pub(crate) fn for_test(
+            kernel_object: u64,
+            kernarg_size: u32,
+            group_segment_size: u32,
+            private_segment_size: u32,
+            args: &[poot_runtime_common::ArgSchema],
+        ) -> Self {
+            KernelHandle {
+                kernel_object,
+                kernarg_size,
+                group_segment_size,
+                private_segment_size,
+                args: Arc::from(args),
+            }
+        }
     }
 }

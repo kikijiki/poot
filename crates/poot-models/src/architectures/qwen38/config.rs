@@ -69,7 +69,7 @@ const DEFAULT_SEED: u64 = 1234;
 
 /// Qwen4Exp's typed config.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Qwen4ExpParams {
+pub(crate) struct Qwen4ExpParams {
     pub(super) vocab: usize,
     pub(super) width: usize,
     pub(super) max_positions: usize,
@@ -111,7 +111,7 @@ fn text_config(config: &serde_json::Value) -> Result<serde_json::Value, ModelErr
 }
 
 impl Qwen4ExpParams {
-    pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let RawConfig::HfJson { config, generation } = raw else {
             return Err(ModelError::Config {
                 family: FAMILY,
@@ -196,7 +196,8 @@ impl Qwen4ExpParams {
             .filter(|v| !v.is_null());
         let ple = ple_params(&text, own_eos, &fields, &dims, &kinds, hyper.streams())?;
 
-        let ratio = NonZeroUsize::new(ratio).expect("counted non-zero above");
+        let ratio = NonZeroUsize::new(ratio)
+            .ok_or_else(|| fields.error(INDEX_RATIO.hf, ConfigReason::Zero))?;
         Ok(Self {
             vocab: dims.vocab,
             width: dims.width,

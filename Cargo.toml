@@ -6,6 +6,7 @@ resolver = "3"
 members = [
     "crates/poot-graph-ir",
     "crates/poot-tensor",
+    "crates/poot-text",
     "crates/poot-executor",
     "crates/poot-executor-parity",
     "crates/poot-models",
@@ -18,20 +19,18 @@ members = [
     "crates/poot-profile",
     "crates/poot-test-util",
     "crates/poot-quant",
-    "crates/poot-runtime",
+    "crates/poot-wgpu-runtime",
     "crates/poot-runtime-common",
     "crates/poot-ptx-runtime",
-    "crates/poot-ptx-check",
     "crates/poot-rocm-runtime",
-    "crates/poot-rocm-check",
-    "crates/poot-rocm-gpu",
+    "crates/poot-rocm-device",
     "crates/poot-vulkan-runtime",
     "crates/poot-vulkan-device",
     "crates/poot-kernelgen",
     "crates/poot-target",
     "crates/poot-graph-plan",
-    "crates/poot-gpu",
-    "crates/poot-ptx-gpu",
+    "crates/poot-wgpu-device",
+    "crates/poot-ptx-device",
     "crates/poot-npu",
     "crates/pootc",
     "crates/poot-kernel-attr",
@@ -57,8 +56,24 @@ repository = "https://github.com/kikijiki/poot"
 rust-version = "1.101"
 
 # A bare `#[ignore]` hides why a test is skipped. Every crate opts in with `[lints] workspace = true`.
+#
+# Facade rule (POOT-756, ADR-0096): a crate root names what other crates use, one `pub use` entry per item
+# or `pub mod` per domain; no glob re-export, no prelude, no re-export of another crate's item. `wildcard_imports`
+# stops `use crate::*` from rebuilding a flat namespace inside a crate; `unreachable_pub` turns an item that
+# no path leaves the crate into `pub(crate)`, so the root is the whole public surface. Prior art, retrieved
+# 2026-10-12:
+# - Rust API Guidelines, C-HIDDEN: rustdoc shows no unhelpful implementation details.
+#   https://rust-lang.github.io/api-guidelines/checklist.html
+# - tokio's crate root (tokio/src/lib.rs): 13 `pub mod` domains and 9 `pub use` lines, all macros and `spawn`;
+#   every other item is reached through its module path.
+#   https://github.com/tokio-rs/tokio/blob/master/tokio/src/lib.rs
+# - rustc lint `unreachable_pub` and clippy `wildcard_imports`, the two lints this table enables.
+#   https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html#unreachable-pub
+#   https://rust-lang.github.io/rust-clippy/master/index.html#wildcard_imports
+# The cargo and rustc crate roots were not fetched; no claim is made about them.
 [workspace.lints.clippy]
 ignore_without_reason = "deny"
+wildcard_imports = "deny"
 
 # A held `#[expect(dead_code, reason = "held for POOT-N")]` must fail once its item gains a caller: the
 # expectation is then unfulfilled, and `unfulfilled_lint_expectations` is warn-by-default. Deny it everywhere.
@@ -67,11 +82,13 @@ ignore_without_reason = "deny"
 dead_code = "deny"
 deprecated = "deny"
 unfulfilled_lint_expectations = "deny"
+unreachable_pub = "deny"
 
 [workspace.dependencies]
 # internal
 poot-graph-ir = { path = "crates/poot-graph-ir" }
 poot-tensor = { path = "crates/poot-tensor" }
+poot-text = { path = "crates/poot-text" }
 poot-executor = { path = "crates/poot-executor" }
 poot-executor-parity = { path = "crates/poot-executor-parity" }
 poot-models = { path = "crates/poot-models" }
@@ -81,19 +98,19 @@ poot-profile = { path = "crates/poot-profile" }
 poot-quant = { path = "crates/poot-quant" }
 poot-target = { path = "crates/poot-target" }
 poot-graph-plan = { path = "crates/poot-graph-plan" }
-poot-runtime = { path = "crates/poot-runtime" }
+poot-wgpu-runtime = { path = "crates/poot-wgpu-runtime" }
 poot-runtime-common = { path = "crates/poot-runtime-common" }
 poot-ptx-runtime = { path = "crates/poot-ptx-runtime" }
 poot-rocm-runtime = { path = "crates/poot-rocm-runtime" }
-poot-rocm-gpu = { path = "crates/poot-rocm-gpu" }
+poot-rocm-device = { path = "crates/poot-rocm-device" }
 poot-vulkan-runtime = { path = "crates/poot-vulkan-runtime" }
 poot-vulkan-device = { path = "crates/poot-vulkan-device" }
 poot-eval = { path = "crates/poot-eval" }
-poot-gpu = { path = "crates/poot-gpu" }
+poot-wgpu-device = { path = "crates/poot-wgpu-device" }
 poot-kernelgen = { path = "crates/poot-kernelgen" }
 poot-llm = { path = "crates/poot-llm" }
 poot-load = { path = "crates/poot-load" }
-poot-ptx-gpu = { path = "crates/poot-ptx-gpu" }
+poot-ptx-device = { path = "crates/poot-ptx-device" }
 poot-test-util = { path = "crates/poot-test-util" }
 
 # external (libraries use typed errors + tracing; binaries may use anyhow)
@@ -140,7 +157,7 @@ subtle = "2.6"
 libc = "0.2"
 # Correctly rounded libm functions for the CPU oracle's transcendental ops (poot-eval).
 libm = "0.2.16"
-# Vulkan device-memory budget query (poot-runtime), pinned to the versions wgpu 29 itself uses.
+# Vulkan device-memory budget query (poot-wgpu-runtime), pinned to the versions wgpu 29 itself uses.
 ash = "0.38"
 wgpu-hal = { version = "29.0.3", features = ["vulkan"] }
 # Guided decoding: byte-level DFA for regex-constrained generation (same 0.4 line as tokenizers/regex).

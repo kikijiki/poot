@@ -6,6 +6,9 @@
 //! a chunked [`Plan`] for ops whose dispatch can exceed a single-launch cap (RADV 2^15-tile miscompile,
 //! iGPU display-watchdog TDR; see each function's doc).
 
+use crate::planner::Planned;
+use crate::refusal::Site;
+use poot_kernelgen::Layout;
 use poot_tensor::DType;
 use std::collections::HashMap;
 
@@ -14,8 +17,9 @@ use poot_graph_ir::{Eqn, Graph, Operand, TensorType, ValueId, ValueMeta, ValueTa
 use poot_kernelgen as kg;
 use poot_target::{Backend, DeviceCaps, TargetId, TensorCoreSupport};
 
-use crate::imported::*;
-use crate::{ContractionSpec, KernelRequest, Layout, PlanError, Planned, Site};
+use crate::PlanError;
+use crate::imported::ImportedKernel;
+use poot_kernelgen::{ContractionSpec, KernelRequest};
 
 /// The codegen capability query for the target (card 522, R468-014). `Backend`'s `AmdGcn` payload already
 /// carries the same `AmdArch` `poot_codegen::Target::AmdGcn` takes, so the conversion is a bare re-tag, not
@@ -253,14 +257,14 @@ pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId,
 /// Workgroup width (lanes per output column) for the wgpu LDS decode-GEMV (`kernelgen::gemv_lds`), used by
 /// `plan_eqn` for both the `[w,1,1]` workgroup and the planned `N*GEMV_WIDTH`-thread grid. 128 measured
 /// best on RADV STRIX_HALO (Qwen2.5-0.5B decode, fused ms/tok: w=32 50.9, w=64 53.7, w=128 39.8, w=256 45.6).
-pub const GEMV_WIDTH: usize = 128;
+pub(crate) const GEMV_WIDTH: usize = 128;
 
 /// Output columns owned by one workgroup of the coalesced imported decode-GEMV
 /// (`pootc/tests/kernels/gemv_coalesced.rs`), used by `plan_eqn`: the body bakes `GEMV_TILE = 32` and its
 /// tiled grid arm plans one workgroup per `GEMV_TILE` columns. 32 = one wave32's contiguous
 /// `W[k, col0:col0+32]` run; `STRIPS = GEMV_WIDTH/GEMV_TILE = 4` K-stripes fold through LDS. The
 /// kernelgen chunk body (`kg::gemv_lds`) is still one workgroup per output element and does not use this.
-pub const GEMV_TILE: usize = 32;
+pub(crate) const GEMV_TILE: usize = 32;
 
 /// Does this MatMul take the decode-GEMV path (`kernelgen::gemv_lds`)? Requires M==1 (`out_shape[-2]==1`)
 /// and a rank-2 `[K,N]` weight (`inputs[1]`), which separates a projection GEMV (`a[B,1,K] @ W[K,N]`) from
@@ -314,7 +318,7 @@ pub(crate) fn is_decode_gemv_in(
 /// own measured cap, never a baked wgpu-specific literal) and the remainder spills onto Y, so a
 /// ~150k-vocab `lm_head` fits. For `out_numel <= caps.max_grid[0]` this is `(out_numel, 1)`. Used by
 /// `plan_eqn`, which bakes `x_groups` into the kernel and the planned grid.
-pub fn gemv_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
+pub(crate) fn gemv_grid(out_numel: usize, caps: &DeviceCaps) -> (usize, usize) {
     kg::fold_groups(out_numel, caps.max_grid[0])
 }
 
@@ -456,7 +460,7 @@ pub(crate) fn dense_gemv_launch(n: usize, compute_units: u32) -> DenseGemvLaunch
 /// Workgroup width of a one-thread-per-element kernel folded onto a 2-D grid: always 256 (the portable
 /// Vulkan max). A folded body derives its global index from this width, so the dispatch must not use the
 /// generic 64-or-256 wg-bump.
-pub const ELEMENTWISE_2D_WIDTH: usize = 256;
+pub(crate) const ELEMENTWISE_2D_WIDTH: usize = 256;
 
 /// LDS tile edge for the wgpu prefill tiled GEMM (`tiled_gemm`). A workgroup of
 /// `GEMM_TILE*GEMM_TILE` lanes computes a `(2*GEMM_TILE) x GEMM_TILE` output tile (each lane computes 2
@@ -464,7 +468,7 @@ pub const ELEMENTWISE_2D_WIDTH: usize = 256;
 /// stack (upper waves' LDS writes are not visible after the barrier; output rows come back ~0) even
 /// though the SPIR-V is valid. A bigger tile needs that bug fixed. Used by `plan_eqn` for the body and the
 /// planned grid.
-pub const GEMM_TILE: usize = 8;
+pub(crate) const GEMM_TILE: usize = 8;
 
 /// The workgroup width a scatter-update chunk is sized in: a generated body's default width, so a chunk's
 /// thread count and its dispatch agree.
@@ -475,7 +479,7 @@ pub(crate) const SCATTER_UPDATE_WG: usize = 64;
 /// overwritten from `src`. At or below `caps.watchdog_budget`'s `scatter_update_work` units, or on a device
 /// with no watchdog budget, it is one dispatch. Otherwise it splits into dispatches over disjoint unit
 /// windows of the same output (card 159: a `pool_slots~=1025, Hkv=16, D=256` scatter is ~4.2M elements,
-/// over `poot-gpu`'s 4M `flush_work` cap alone; the batched gemma4-dense pool prefill's per-layer KV write
+/// over `poot-wgpu-device`'s 4M `flush_work` cap alone; the batched gemma4-dense pool prefill's per-layer KV write
 /// reaches millions of elements twice per layer x 60 layers, so the box's own wgpu/RADV device keeps each
 /// chunk to 1M, a small fraction of that cap, so chunks batch with their neighbors).
 pub(crate) fn scatter_update_plan(
@@ -1019,6 +1023,6 @@ pub(crate) fn elementwise_fold(
 
 /// Workgroup width (lanes per row) for the parallel [`OpKind::FusedRow`] kernel: at most 128, and no more
 /// than the row width. Shared by `plan_eqn` and the `FusedRow` launch grid it bakes alongside it.
-pub fn row_parallel_width(n_cols: usize) -> usize {
+pub(crate) fn row_parallel_width(n_cols: usize) -> usize {
     n_cols.clamp(1, 128)
 }

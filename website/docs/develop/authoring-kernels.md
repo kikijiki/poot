@@ -55,7 +55,7 @@ dispatches it on a GPU. It skips the dispatch if no GPU is present.
 
 Running an imported kernel with nothing else around it is not available as a standalone example (the example that demonstrated it was removed). The same import-and-dispatch path (an imported
 kernel body loaded and run on the GPU, matching the engine's hand-built kernel byte-for-byte) is exercised
-by `poot-gpu`'s own test suite instead.
+by `poot-wgpu-device`'s own test suite instead.
 
 ## Accepted Rust subset
 

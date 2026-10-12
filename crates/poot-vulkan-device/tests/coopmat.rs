@@ -21,11 +21,11 @@ use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::types::TensorType;
 use poot_graph_plan::Target;
+use poot_graph_plan::test_support::gpu_caps;
 use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_target::{Backend, TensorCoreSupport};
 use poot_tensor::{DType, HostTensor};
-use poot_test_util::device_skip::open_or_skip;
-use poot_test_util::graph_fixtures::gpu_caps;
 use poot_vulkan_device::VulkanDevice;
 
 fn f16_tensor(shape: Vec<usize>, data: &[f32]) -> HostTensor {
@@ -39,10 +39,14 @@ fn f16_tensor(shape: Vec<usize>, data: &[f32]) -> HostTensor {
 
 /// `a[1, m, k] @ w[k, n]` over F16 operands with the output retagged F32.
 fn f16_in_f32_out_matmul_graph(m: usize, k: usize, n: usize) -> poot_graph_ir::Graph {
-    let builder = Builder::new();
-    let a = builder.constant("a", TensorType::new(vec![1, m, k], DType::F16));
-    let w = builder.constant("w", TensorType::new(vec![k, n], DType::F16));
-    let product = builder.matmul(a, w);
+    let builder = Builder::for_tests();
+    let a = builder
+        .constant("a", TensorType::new(vec![1, m, k], DType::F16))
+        .unwrap();
+    let w = builder
+        .constant("w", TensorType::new(vec![k, n], DType::F16))
+        .unwrap();
+    let product = builder.matmul(a, w).unwrap();
     let graph = builder.finish(product).unwrap();
     let out = graph
         .eqns()
@@ -50,7 +54,7 @@ fn f16_in_f32_out_matmul_graph(m: usize, k: usize, n: usize) -> poot_graph_ir::G
         .find(|e| matches!(e.op, OpKind::MatMul))
         .expect("a matmul eqn")
         .out;
-    poot_test_util::graph_fixtures::derive(&graph, |draft| {
+    poot_graph_ir::test_support::graph_fixtures::derive(&graph, |draft| {
         draft.values_mut()[out].aval.dtype = DType::F32;
     })
     .unwrap()
@@ -83,7 +87,7 @@ fn coopmat_matmul_plans_the_coopmat_arm_and_matches_the_cpu_product_on_vulkan() 
             caps: gpu_caps(&target),
         },
         &std::collections::HashMap::new(),
-        &poot_test_util::graph_fixtures::roomy_body_limits(),
+        &poot_graph_plan::test_support::roomy_body_limits(),
     )
     .expect("the coopmat-eligible matmul plans on SpirvVulkan");
     assert!(

@@ -2,24 +2,23 @@
 //! oracle (ADR-0101 tier 1: a cut graph chained stage by stage equals the uncut graph bit for bit).
 //! The executor and the device lanes check the same programs run.
 
+use crate::production_plan::Submission;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_graph_ir::{
     BinOp, Builder, Graph, Scalar, Slot, SlotKey, StateRole, Storage, TensorType, UnOp,
     ValidationId, ValueId,
 };
-use poot_quant::weights::LoraTarget;
 use poot_target::Backend;
 use poot_tensor::{DType, HostTensor};
 use poot_test_util::device_caps::default_caps_for;
 
 use super::*;
-use crate::test_support::{
-    LAYERS, bind_decode, bits, chain, fill, qwen2_decode, qwen2_decode_rows,
-};
-use crate::{CompileLimits, LoraPlan, Submission};
+use poot_eval::test_support::stage_chain::{bind_decode, bits, chain};
+use poot_test_util::fill;
+
+use crate::CompileLimits;
 
 fn target() -> Target {
     Target::Gpu {
@@ -72,72 +71,50 @@ fn uncut(g: &Graph, inputs: &HashMap<ValueId, Value>) -> poot_eval::Evaluation {
     .expect("the uncut graph evaluates")
 }
 
-/// SC-001 (oracle half): qwen2's decode step cut after layers 0 and 1, compiled stage by stage and
-/// chained, equals the uncut traced graph on the logits and on every carried KV pair, bit for bit.
-#[test]
-fn a_qwen2_pipeline_cut_after_layers_zero_and_one_equals_the_uncut_oracle() {
-    let graph = qwen2_decode(LAYERS);
-    let inputs = bind_decode(&graph);
-    let whole = uncut(&graph, &inputs);
-
-    let program = staged(&graph, pipeline(&[0, 1]), &options());
-    assert_eq!(program.stages().count(), 3);
-    assert!(
-        !program.links().is_empty(),
-        "the cuts cross values, or this row proves nothing"
-    );
-    let chained = chain(&graph, &stage_graphs(&program), &inputs);
-    assert_eq!(bits(&chained.output), bits(&whole.output));
-    assert_eq!(chained.state.len(), graph.state().count());
-    for (pair, (got, expected)) in graph.state().zip(chained.state.iter().zip(&whole.state)) {
-        assert_eq!(
-            bits(got),
-            bits(expected),
-            "carried state {} -> {} differs",
-            pair.0,
-            pair.1
-        );
-    }
-}
-
 /// A graph whose boundaries stress what the exports must survive: four independent values leave
 /// layer 0 (`a`, a structural duplicate `a2` that CSE merges into `a`, `c`, and `d`), `c` fans out to
 /// both later stages, layer 0's carried state is fed by a boundary value, and a validation witness
 /// hangs off another boundary.
 fn export_fixture() -> Graph {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
-    let w = b.constant("w", TensorType::f32(vec![4]));
-    let v = b.constant("v", TensorType::f32(vec![4]));
+    let b = Builder::for_tests();
+    let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
+    let v = b.constant("v", TensorType::f32(vec![4])).unwrap();
     let (a, a2, c, d, witness);
     let (k0_in, k0_out);
     {
         let _layer = b.layer_scope(0);
-        a = b.binary(BinOp::Mul, x, w);
-        a2 = b.binary(BinOp::Mul, x, w);
-        c = b.binary(BinOp::Add, a, v);
-        d = b.binary(BinOp::Sub, a, v);
-        k0_in = b.state_input("k0", TensorType::f32(vec![4]), StateRole::Recurrent);
-        k0_out = b.binary(BinOp::Add, k0_in, c);
-        let total = b.reduce(poot_graph_ir::RedOp::Sum, d, 0, true);
-        let negated = b.unary(UnOp::Neg, total);
-        witness = b.binary_scalar(BinOp::Ge, negated, Scalar::F32(1.0e9));
+        a = b.binary(BinOp::Mul, x, w).unwrap();
+        a2 = b.binary(BinOp::Mul, x, w).unwrap();
+        c = b.binary(BinOp::Add, a, v).unwrap();
+        d = b.binary(BinOp::Sub, a, v).unwrap();
+        k0_in = b
+            .state_input("k0", TensorType::f32(vec![4]), StateRole::Recurrent)
+            .unwrap();
+        k0_out = b.binary(BinOp::Add, k0_in, c).unwrap();
+        let total = b.reduce(poot_graph_ir::RedOp::Sum, d, 0, true).unwrap();
+        let negated = b.unary(UnOp::Neg, total).unwrap();
+        witness = b
+            .binary_scalar(BinOp::Ge, negated, Scalar::F32(1.0e9))
+            .unwrap();
     }
     let (k1_in, k1_out, g);
     {
         let _layer = b.layer_scope(1);
-        let e = b.binary(BinOp::Mul, a, a2);
-        let f = b.binary(BinOp::Add, e, c);
-        g = b.binary(BinOp::Mul, f, d);
-        k1_in = b.state_input("k1", TensorType::f32(vec![4]), StateRole::Recurrent);
-        k1_out = b.binary(BinOp::Add, k1_in, g);
+        let e = b.binary(BinOp::Mul, a, a2).unwrap();
+        let f = b.binary(BinOp::Add, e, c).unwrap();
+        g = b.binary(BinOp::Mul, f, d).unwrap();
+        k1_in = b
+            .state_input("k1", TensorType::f32(vec![4]), StateRole::Recurrent)
+            .unwrap();
+        k1_out = b.binary(BinOp::Add, k1_in, g).unwrap();
     }
     let out;
     {
         let _layer = b.layer_scope(2);
-        out = b.binary(BinOp::Add, g, c);
+        out = b.binary(BinOp::Add, g, c).unwrap();
     }
-    crate::test_support::finish_with_state_and_validations(
+    poot_graph_ir::test_support::graph_fixtures::finish_with_state_and_validations(
         b,
         out,
         &[(k0_in, k0_out), (k1_in, k1_out)],
@@ -237,15 +214,15 @@ fn exports_survive_cse_dce_and_renumbering_and_every_consumer_sees_its_value() {
 /// A chain of `blocks` blocks, three equations each, tagged by layer, with one shared constant and one
 /// shared activation slot read by every block.
 fn long_chain(blocks: usize) -> Graph {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
-    let w = b.constant("w", TensorType::f32(vec![4]));
+    let b = Builder::for_tests();
+    let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4])).unwrap();
     let mut hidden = x;
     for layer in 0..blocks {
         let _scope = b.layer_scope(layer);
-        let scaled = b.binary(BinOp::Mul, hidden, w);
-        let shifted = b.binary(BinOp::Add, scaled, x);
-        hidden = b.binary(BinOp::Mul, shifted, scaled);
+        let scaled = b.binary(BinOp::Mul, hidden, w).unwrap();
+        let shifted = b.binary(BinOp::Add, scaled, x).unwrap();
+        hidden = b.binary(BinOp::Mul, shifted, scaled).unwrap();
     }
     b.finish(hidden).unwrap()
 }
@@ -269,7 +246,7 @@ fn stage_metadata_is_linear_in_the_graph_plus_links_not_stages_times_values() {
     let replicated = 2;
     for stages in [2usize, 4, 8, 16, 32] {
         let cuts: Vec<usize> = (1..stages).map(|s| s * blocks / stages - 1).collect();
-        let split = crate::test_support::split_after_layers(&graph, &cuts).unwrap();
+        let split = crate::unit_helpers::split_after_layers(&graph, &cuts).unwrap();
         assert_eq!(split.stages.len(), stages);
         let owned: usize = split.stages.iter().map(|s| s.graph.values().len()).sum();
         let links: usize = split
@@ -298,126 +275,31 @@ fn stage_metadata_is_linear_in_the_graph_plus_links_not_stages_times_values() {
     }
 }
 
-/// SC-005 (oracle half): a nonzero LoRA stack applied once to the whole graph, then cut after
-/// layer 0 on one device, equals the same adapted graph compiled as one stage on every output and
-/// carried-state element, and both differ from the unadapted graph (the adapter matters).
-///
-/// Mutation: compile each stage with the caller's options instead of the LoRA-free copy
-/// (`compile_staged` stage compile): the correction is applied a second time to every
-/// stage and the chain disagrees with the single stage.
-#[test]
-fn a_lora_graph_cut_across_stages_equals_the_unpartitioned_adapted_graph() {
-    let rows = 2;
-    let graph = qwen2_decode_rows(2, rows);
-    let inputs = bind_decode(&graph);
-    let lora = LoraPlan {
-        rows: NonZeroUsize::new(rows).unwrap(),
-        adapters: NonZeroUsize::new(1).unwrap(),
-        rank: NonZeroUsize::new(2).unwrap(),
-        projections: LoraTarget::ALL.to_vec(),
-    };
-    let with_lora = options().with_lora(lora);
-
-    let single = staged(&graph, DevicePlacement::Single(DeviceId(0)), &with_lora);
-    let cut = staged(&graph, pipeline(&[0]), &with_lora);
-
-    // The adapted graph is the one the oracle evaluates, so bind its inputs by declared identity.
-    let single_graph = stage_graphs(&single)[0];
-    let adapted_inputs: HashMap<ValueId, Value> = single_graph
-        .inputs()
-        .iter()
-        .map(|&id| (id, adapted_input(single_graph, id, &graph, &inputs)))
-        .collect();
-    let one = eval(
-        single_graph,
-        &adapted_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .expect("the adapted graph evaluates");
-
-    let chained = chain(single_graph, &stage_graphs(&cut), &adapted_inputs);
-    assert_eq!(
-        bits(&chained.output),
-        bits(&one.output),
-        "the cut adapted graph's logits"
-    );
-    for (got, expected) in chained.state.iter().zip(&one.state) {
-        assert_eq!(bits(got), bits(expected), "the cut adapted graph's state");
-    }
-
-    let unadapted = uncut(&graph, &inputs);
-    assert_ne!(
-        bits(&one.output),
-        bits(&unadapted.output),
-        "the adapters change the logits, or this row proves nothing"
-    );
-}
-
-/// A binder of the compiled adapted graph: the uncut graph's own value where it has one, else a
-/// seeded fill (the stacked adapter factors and scale exist only in the adapted graph).
-fn adapted_input(
-    adapted: &Graph,
-    id: ValueId,
-    original: &Graph,
-    inputs: &HashMap<ValueId, Value>,
-) -> Value {
-    let meta = adapted.meta(id);
-    let found = original.inputs().iter().find(|&&candidate| {
-        let theirs = original.meta(candidate);
-        theirs.storage == meta.storage
-            && theirs.name == meta.name
-            && theirs.slot_key() == meta.slot_key()
-    });
-    if let Some(&other) = found {
-        return inputs[&other].clone();
-    }
-    match meta.storage {
-        poot_graph_ir::Storage::Slot(Slot::LoraIdx) => {
-            let numel = meta.aval.numel();
-            Value::from(HostTensor::i32(
-                meta.aval.shape.clone(),
-                (0..numel).map(|row| i32::from(row == 0)).collect(),
-            ))
-        }
-        poot_graph_ir::Storage::Computed(payload) => Value::from(payload.tensor()),
-        poot_graph_ir::Storage::Const => {
-            let name = meta.name.as_deref().unwrap();
-            let seed = name
-                .bytes()
-                .fold(7u64, |h, c| (h ^ u64::from(c)).wrapping_mul(1099511628211));
-            Value::from(HostTensor::f32(
-                meta.aval.shape.clone(),
-                fill(meta.aval.numel(), seed)
-                    .iter()
-                    .map(|v| v * 0.3)
-                    .collect(),
-            ))
-        }
-        other => panic!("no binding for {other:?} {:?}", meta.name),
-    }
-}
-
 /// `ids = token + token` in layer 0, which layer 0 also reads as the index of a gather, then handed to
 /// layer 1. Layer 1 either only gathers by it or does arithmetic on it that is itself the graph output.
 fn i32_boundary(consumer_does_arithmetic: bool) -> Graph {
-    let b = Builder::new();
-    let token = b.slot(Slot::Token, TensorType::new(vec![4], DType::I32));
-    let table = b.constant("table", TensorType::f32(vec![8, 4]));
+    let b = Builder::for_tests();
+    let token = b
+        .slot(Slot::Token, TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let table = b.constant("table", TensorType::f32(vec![8, 4])).unwrap();
     let (ids, rows);
     {
         let _layer = b.layer_scope(0);
-        ids = b.binary(BinOp::Add, token, token);
-        rows = b.gather(table, 0, ids);
+        ids = b.binary(BinOp::Add, token, token).unwrap();
+        rows = b.gather(table, 0, ids).unwrap();
     }
-    let k_in = b.state_input("k", TensorType::f32(vec![4, 4]), StateRole::Recurrent);
+    let k_in = b
+        .state_input("k", TensorType::f32(vec![4, 4]), StateRole::Recurrent)
+        .unwrap();
     let (k_out, out);
     {
         let _layer = b.layer_scope(1);
-        k_out = b.binary(BinOp::Add, k_in, rows);
+        k_out = b.binary(BinOp::Add, k_in, rows).unwrap();
         out = if consumer_does_arithmetic {
-            b.binary(BinOp::Add, ids, ids)
+            b.binary(BinOp::Add, ids, ids).unwrap()
         } else {
-            b.gather(table, 0, ids)
+            b.gather(table, 0, ids).unwrap()
         };
     }
     b.finish(poot_graph_ir::Outputs::new(out).with_state(&[(k_in, k_out)]))
@@ -493,19 +375,21 @@ fn unsupported_partitions_are_typed_refusals() {
 /// this goes red.
 #[test]
 fn a_boundary_that_views_carried_state_is_refused_at_compile() {
-    let b = Builder::new();
-    let x = b.slot(Slot::Activation, TensorType::f32(vec![4]));
-    let k_in = b.state_input("k", TensorType::f32(vec![4]), StateRole::Recurrent);
+    let b = Builder::for_tests();
+    let x = b.slot(Slot::Activation, TensorType::f32(vec![4])).unwrap();
+    let k_in = b
+        .state_input("k", TensorType::f32(vec![4]), StateRole::Recurrent)
+        .unwrap();
     let (view, k_out);
     {
         let _layer = b.layer_scope(0);
-        view = b.reshape(k_in, vec![2, 2]);
-        k_out = b.binary(BinOp::Add, k_in, x);
+        view = b.reshape(k_in, vec![2, 2]).unwrap();
+        k_out = b.binary(BinOp::Add, k_in, x).unwrap();
     }
     let out;
     {
         let _layer = b.layer_scope(1);
-        out = b.binary(BinOp::Add, view, view);
+        out = b.binary(BinOp::Add, view, view).unwrap();
     }
     let graph = b
         .finish(poot_graph_ir::Outputs::new(out).with_state(&[(k_in, k_out)]))
@@ -541,25 +425,33 @@ const INTER: usize = 3;
 /// checkpoint's `[E, N, K]` orientation and read through the transpose tracers spell, its down
 /// projection as the logical `[E, K, N]` stack.
 fn moe_model(tokens: usize, layers: usize) -> Graph {
-    let b = Builder::new();
-    let mut x = b.slot(Slot::Activation, TensorType::f32(vec![1, tokens, HIDDEN]));
+    let b = Builder::for_tests();
+    let mut x = b
+        .slot(Slot::Activation, TensorType::f32(vec![1, tokens, HIDDEN]))
+        .unwrap();
     for layer in 0..layers {
         let _scope = b.layer_scope(layer);
-        let router = b.constant(
-            &format!("w.l{layer}.router"),
-            TensorType::f32(vec![HIDDEN, EXPERTS]),
-        );
-        let stored_in = b.constant(
-            &format!("w.l{layer}.moe.in"),
-            TensorType::f32(vec![EXPERTS, 2 * INTER, HIDDEN]),
-        );
-        let w_in = b.transpose(stored_in, vec![0, 2, 1]);
-        let w_out = b.constant(
-            &format!("w.l{layer}.moe.out"),
-            TensorType::f32(vec![EXPERTS, INTER, HIDDEN]),
-        );
-        let y = poot_graph_ir::ops::moe(&b, x, router, w_in, w_out, EXPERTS, TOP_K, INTER);
-        x = b.binary(BinOp::Add, x, y);
+        let router = b
+            .constant(
+                &format!("w.l{layer}.router"),
+                TensorType::f32(vec![HIDDEN, EXPERTS]),
+            )
+            .unwrap();
+        let stored_in = b
+            .constant(
+                &format!("w.l{layer}.moe.in"),
+                TensorType::f32(vec![EXPERTS, 2 * INTER, HIDDEN]),
+            )
+            .unwrap();
+        let w_in = b.transpose(stored_in, vec![0, 2, 1]).unwrap();
+        let w_out = b
+            .constant(
+                &format!("w.l{layer}.moe.out"),
+                TensorType::f32(vec![EXPERTS, INTER, HIDDEN]),
+            )
+            .unwrap();
+        let y = poot_graph_ir::ops::moe(&b, x, router, w_in, w_out, EXPERTS, TOP_K, INTER).unwrap();
+        x = b.binary(BinOp::Add, x, y).unwrap();
     }
     b.finish(x).unwrap()
 }
@@ -589,6 +481,9 @@ struct PoolHost<'g> {
     graph: &'g Graph,
     /// Experts made resident per sync, for the rows that need to see eviction.
     resident: Vec<Vec<usize>>,
+    /// A sync that does not hold: the lowest selected expert is left out of the pool (its map entry stays
+    /// `-1`), as a host that mis-counted the step's selection would.
+    leave_out_lowest: bool,
 }
 
 impl PoolHost<'_> {
@@ -597,6 +492,9 @@ impl PoolHost<'_> {
         needed.sort_unstable();
         needed.dedup();
         assert!(needed.len() <= point.site.slots);
+        if self.leave_out_lowest {
+            needed.remove(0);
+        }
         self.resident.push(needed.clone());
         let mut map = vec![-1i32; point.site.experts];
         for (row, &expert) in needed.iter().enumerate() {
@@ -633,6 +531,21 @@ fn eval_pooled(
     graph: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> (Value, Vec<Vec<usize>>) {
+    eval_pooled_syncing(program, graph, inputs, false)
+        .unwrap_or_else(|(stage, error)| panic!("stage {stage:?} did not evaluate: {error}"))
+}
+
+/// The output of a pooled run and the experts each sync made resident.
+type PooledRun = (Value, Vec<Vec<usize>>);
+
+/// [`eval_pooled`], with the stage that fails and why returned. With `leave_out_lowest` the host's syncs do
+/// not hold: the lowest selected expert is never made resident.
+fn eval_pooled_syncing(
+    program: &StagedProgram,
+    graph: &Graph,
+    inputs: &HashMap<ValueId, Value>,
+    leave_out_lowest: bool,
+) -> Result<PooledRun, (StageId, poot_eval::EvalError)> {
     let mut by_name: HashMap<String, Value> = HashMap::new();
     let mut tables = HashMap::new();
     let mut activations: HashMap<SlotKey, Value> = HashMap::new();
@@ -663,11 +576,12 @@ fn eval_pooled(
         tables,
         graph,
         resident: Vec::new(),
+        leave_out_lowest,
     };
     let mut resident_slots: HashMap<SlotKey, Value> = HashMap::new();
     let mut boundaries: HashMap<SlotKey, Value> = HashMap::new();
     let mut output = None;
-    for (index, (stage, _, program_stage)) in program.stages().enumerate() {
+    for (stage, _, program_stage) in program.stages() {
         let g = program_stage.graph();
         let stage_inputs: HashMap<ValueId, Value> = g
             .inputs()
@@ -698,7 +612,7 @@ fn eval_pooled(
             &stage_inputs,
             EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
         )
-        .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
+        .map_err(|error| (stage, error))?;
         let environment = result.environment.expect("the environment was kept");
         for export in g.exports() {
             boundaries.insert(
@@ -720,7 +634,7 @@ fn eval_pooled(
         }
         output = Some(result.output);
     }
-    (output.expect("a stage ran"), host.resident)
+    Ok((output.expect("a stage ran"), host.resident))
 }
 
 /// SC-001 (oracle half): the pooled program's cut graphs, with a host that makes the selected experts
@@ -762,6 +676,52 @@ fn a_pooled_moe_program_equals_the_unpooled_oracle_bit_for_bit() {
     }
 }
 
+/// POOT-1119: the translated ids of every pooled site pass through the canonical index guard `[0, P)`, whose
+/// witness is declared as a validation output of the stage that reads the pool. A host whose sync does not
+/// hold (a selected expert left at map entry `-1`) therefore fails that stage's validation instead of
+/// reading a wrong expert's row; the exact sync passes.
+///
+/// Mutation (observed red): in `pool_experts` point the contractions at `raw` (the unguarded gather) and
+/// drop the `pooled.push_witness(..)` call with its `added.push(id)`. `compile_pooled` itself fails,
+/// `Compile(ExpertIds(.. op: "indexed_matmul" .. OutOfRange))`: the proof refuses the unguarded ids before
+/// the declarations assertion is reached. Dropping only the `push_witness` + `added.push(id)` pair (ids
+/// still guarded) leaves the declarations assertion red instead.
+#[test]
+fn a_pooled_selection_not_made_resident_is_a_validation_failure() {
+    let graph = moe_model(2, 3);
+    let inputs = bind_decode(&graph);
+    let program = compile_pooled(&graph, 4).expect("the pool fits the step's demand");
+
+    // One witness per site, in the stage that follows its sync.
+    for (layer, point) in program.sync_points().iter().enumerate() {
+        let stage = program
+            .stages()
+            .find(|(id, ..)| id.0 as usize == layer + 1)
+            .map(|(_, _, program)| program)
+            .expect("the stage after the sync");
+        let names: Vec<&str> = stage
+            .graph()
+            .witnesses()
+            .map(|witness| witness.name)
+            .collect();
+        assert_eq!(
+            names,
+            [format!("pool.site.{layer}.resident")],
+            "stage after sync {layer}"
+        );
+        assert_eq!(point.after, StageId(layer as u32));
+    }
+
+    eval_pooled_syncing(&program, &graph, &inputs, false).expect("an exact sync validates");
+    let (stage, error) = eval_pooled_syncing(&program, &graph, &inputs, true)
+        .expect_err("a selected expert that is not resident must fail validation");
+    assert_eq!(stage, StageId(1), "the stage after the first sync");
+    assert!(
+        error.to_string().contains("pool.site.0.resident"),
+        "the failure names the witness: {error}"
+    );
+}
+
 /// SC-003 (compile half): a step whose selection can need more experts than the pool holds, and a pool
 /// that is not smaller than the experts, are the two typed refusals from `compile_staged`.
 ///
@@ -793,4 +753,100 @@ fn a_pool_below_the_step_demand_or_not_below_the_experts_is_a_typed_refusal() {
             other.map(|_| ())
         ),
     }
+}
+
+// ---- POOT-1140: the plan's read traffic ------------------------------------------------------
+
+const TRAFFIC_VOCAB: usize = 16;
+const TRAFFIC_HIDDEN: usize = 8;
+const TRAFFIC_KV_HEADS: usize = 2;
+const TRAFFIC_CAPACITY: usize = 8;
+const TRAFFIC_HEAD_DIM: usize = 4;
+
+/// A one-layer decode shape: a tied embedding (`embed` is both gathered by token and read, transposed,
+/// as the logits head), an untied table only a gather reads, one projection, and a positional cache the
+/// step folds in place. f32 throughout, so every expected byte count is a product of the dims.
+fn traffic_fixture() -> Graph {
+    let b = Builder::for_tests();
+    let token = b.slot(Slot::Token, TensorType::scalar(DType::I32)).unwrap();
+    let embed = b
+        .constant(
+            "embed",
+            TensorType::f32(vec![TRAFFIC_VOCAB, TRAFFIC_HIDDEN]),
+        )
+        .unwrap();
+    let side = b
+        .constant(
+            "side_table",
+            TensorType::f32(vec![TRAFFIC_VOCAB, TRAFFIC_HIDDEN]),
+        )
+        .unwrap();
+    let proj = b
+        .constant(
+            "proj",
+            TensorType::f32(vec![TRAFFIC_HIDDEN, TRAFFIC_HIDDEN]),
+        )
+        .unwrap();
+    let cache_in = b
+        .state_input(
+            "kv",
+            TensorType::f32(vec![
+                1,
+                TRAFFIC_KV_HEADS,
+                TRAFFIC_CAPACITY,
+                TRAFFIC_HEAD_DIM,
+            ]),
+            StateRole::Positional { axis: 2 },
+        )
+        .unwrap();
+    let row = b.gather(embed, 0, token).unwrap();
+    let side_row = b.gather(side, 0, token).unwrap();
+    let x = b
+        .reshape(
+            b.binary(BinOp::Add, row, side_row).unwrap(),
+            vec![1, TRAFFIC_HIDDEN],
+        )
+        .unwrap();
+    // The projection is read through a reshape, which plans as an alias of its buffer.
+    let flat = b
+        .reshape(proj, vec![TRAFFIC_HIDDEN * TRAFFIC_HIDDEN])
+        .unwrap();
+    let proj = b
+        .reshape(flat, vec![TRAFFIC_HIDDEN, TRAFFIC_HIDDEN])
+        .unwrap();
+    let hidden = b.matmul(x, proj).unwrap();
+    let head = b
+        .transpose(embed, vec![1, 0])
+        .expect("the tied head is the embedding transposed");
+    let logits = b.matmul(hidden, head).unwrap();
+    let cache_out = b.binary(BinOp::Mul, cache_in, cache_in).unwrap();
+    b.finish(poot_graph_ir::Outputs::new(logits).with_state(&[(cache_in, cache_out)]))
+        .expect("the fixture validates")
+}
+
+/// The traffic of a decode step is what its dispatches read: the tied embedding once at its stored
+/// width (read both as a gathered row and as the head, so counted whole once), the projection read
+/// through an aliasing reshape, and the cache per attended position; a table only a gather reads
+/// contributes nothing. Mutations: count the head's weight as f32 beside the stored embedding
+/// (`weight_bytes += vocab * hidden * 4`), count a gather-only table whole, or stop resolving aliases to
+/// their buffer.
+#[test]
+fn read_traffic_counts_each_streamed_weight_once_and_the_cache_per_position() {
+    let program = staged(&traffic_fixture(), pipeline(&[]), &options());
+    let traffic = program.read_traffic();
+    let f32_bytes = 4;
+    let embed = TRAFFIC_VOCAB * TRAFFIC_HIDDEN * f32_bytes;
+    let proj = TRAFFIC_HIDDEN * TRAFFIC_HIDDEN * f32_bytes;
+    assert_eq!(
+        traffic.weight_bytes,
+        (embed + proj) as u64,
+        "the tied head and the gathered embedding are one weight, the gather-only table none"
+    );
+    assert_eq!(traffic.recurrent_state_bytes, 0);
+    let per_position = TRAFFIC_KV_HEADS * TRAFFIC_HEAD_DIM * f32_bytes;
+    assert_eq!(traffic.kv_bytes_per_position, per_position as u64);
+    assert_eq!(
+        traffic.step_bytes(5),
+        (embed + proj + 5 * per_position) as u64
+    );
 }

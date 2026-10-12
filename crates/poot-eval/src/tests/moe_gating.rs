@@ -18,10 +18,12 @@ use poot_test_util::assert_close_rel;
 fn scatter_axis0_inverts_a_permutation() {
     // Scatter (card 034): out[index[j], ..] = src[j, ..]. With src = iota rows and index a permutation, the result is the
     // inverse permutation, the argtop-k index inversion sparse MoE needs.
-    let b = Builder::new();
-    let src = b.constant("src", TensorType::f32(vec![3, 2]));
-    let idx = b.constant("idx", TensorType::new(vec![3], DType::I32));
-    let s = b.scatter(src, idx);
+    let b = Builder::for_tests();
+    let src = b.constant("src", TensorType::f32(vec![3, 2])).unwrap();
+    let idx = b
+        .constant("idx", TensorType::new(vec![3], DType::I32))
+        .unwrap();
+    let s = b.scatter(src, idx).unwrap();
     let (si, ii) = (src.id(), idx.id());
     let g = b.finish(s).unwrap();
 
@@ -49,10 +51,12 @@ fn scatter_axis0_inverts_a_permutation() {
     );
 
     // scalar-row case: scatter iota [0,1,2,3] by a reverse permutation -> reversed (its own inverse here).
-    let b2 = Builder::new();
-    let src2 = b2.constant("s", TensorType::f32(vec![4]));
-    let idx2 = b2.constant("i", TensorType::new(vec![4], DType::I32));
-    let sc = b2.scatter(src2, idx2);
+    let b2 = Builder::for_tests();
+    let src2 = b2.constant("s", TensorType::f32(vec![4])).unwrap();
+    let idx2 = b2
+        .constant("i", TensorType::new(vec![4], DType::I32))
+        .unwrap();
+    let sc = b2.scatter(src2, idx2).unwrap();
     let (s2, i2) = (src2.id(), idx2.id());
     let g2 = b2.finish(sc).unwrap();
     let mut in2 = HashMap::new();
@@ -80,10 +84,12 @@ fn scatter_refuses_an_index_outside_the_rows() {
         (vec![2, 3, 0], 1, IndexFaultKind::OutOfRange),
         (vec![2, 0, -1], 2, IndexFaultKind::Negative),
     ] {
-        let b = Builder::new();
-        let src = b.constant("src", TensorType::f32(vec![3, 2]));
-        let idx = b.constant("idx", TensorType::new(vec![3], DType::I32));
-        let scattered = b.scatter(src, idx);
+        let b = Builder::for_tests();
+        let src = b.constant("src", TensorType::f32(vec![3, 2])).unwrap();
+        let idx = b
+            .constant("idx", TensorType::new(vec![3], DType::I32))
+            .unwrap();
+        let scattered = b.scatter(src, idx).unwrap();
         let (si, ii) = (src.id(), idx.id());
         let g = b.finish(scattered).unwrap();
         let mut inputs = HashMap::new();
@@ -122,15 +128,21 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
 
     // rank_i = #{j : logit_j > logit_i}, batched over L rows (the pairwise-Ge composition `moe_sparse`/`top_k_gate` use).
     // p[l,i,j] = logit[l,i], q[l,i,j] = logit[l,j]; gt = 1 - (p>=q); rank[l,i] = sum_j gt[l,i,j].
-    let br = Builder::new();
-    let lg = br.constant("logits", TensorType::f32(vec![l, e]));
-    let p = br.broadcast(br.reshape(lg, vec![l, e, 1]), vec![l, e, e]);
-    let qsrc = br.reshape(lg, vec![l, 1, e]);
-    let q = br.broadcast(qsrc, vec![l, e, e]);
-    let ge = br.binary(BinOp::Ge, p, q);
-    let gt = br.binary_scalar(BinOp::Mul, ge, poot_graph_ir::types::Scalar::F32(-1.0));
-    let gt = br.binary_scalar(BinOp::Add, gt, poot_graph_ir::types::Scalar::F32(1.0));
-    let rank = br.reduce(RedOp::Sum, gt, 2, false); // [L, E]
+    let br = Builder::for_tests();
+    let lg = br.constant("logits", TensorType::f32(vec![l, e])).unwrap();
+    let p = br
+        .broadcast(br.reshape(lg, vec![l, e, 1]).unwrap(), vec![l, e, e])
+        .unwrap();
+    let qsrc = br.reshape(lg, vec![l, 1, e]).unwrap();
+    let q = br.broadcast(qsrc, vec![l, e, e]).unwrap();
+    let ge = br.binary(BinOp::Ge, p, q).unwrap();
+    let gt = br
+        .binary_scalar(BinOp::Mul, ge, poot_graph_ir::types::Scalar::F32(-1.0))
+        .unwrap();
+    let gt = br
+        .binary_scalar(BinOp::Add, gt, poot_graph_ir::types::Scalar::F32(1.0))
+        .unwrap();
+    let rank = br.reduce(RedOp::Sum, gt, 2, false).unwrap(); // [L, E]
     let lgi = lg.id();
     let gr = br.finish(rank).unwrap();
     let mut rank_inputs = HashMap::new();
@@ -143,16 +155,16 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
     assert_eq!(rank_t.shape(), vec![l, e]);
 
     // Feed the concrete rank tensor into ArgTopK (its input contract is the rank tensor, not logits).
-    let ba = Builder::new();
-    let rk = ba.constant("rank", TensorType::f32(vec![l, e]));
-    let out = ba.arg_top_k(rk, k);
+    let ba = Builder::for_tests();
+    let rk = ba.constant("rank", TensorType::f32(vec![l, e])).unwrap();
+    let out = ba.arg_top_k(rk, k).unwrap();
     assert_eq!(
-        ba.aval(out).shape,
+        ba.aval(out).unwrap().shape,
         vec![l, k],
         "ArgTopK shape rule: [..,E] -> [..,k]"
     );
     assert_eq!(
-        ba.aval(out).dtype,
+        ba.aval(out).unwrap().dtype,
         DType::I32,
         "ArgTopK ids are I32, the one index dtype"
     );
@@ -219,10 +231,10 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
 fn ge_indicator_with_broadcast() {
     // The `Ge` primitive (card 061): `a >= b -> 1.0 else 0.0`, `b` broadcast over rows. Exact tie `a == b` gives 1.0.
     // All other comparisons derive from this op.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 3]));
-    let y = b.constant("y", TensorType::f32(vec![3]));
-    let g = b.binary(BinOp::Ge, x, y);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+    let y = b.constant("y", TensorType::f32(vec![3])).unwrap();
+    let g = b.binary(BinOp::Ge, x, y).unwrap();
     let (xi, yi) = (x.id(), y.id());
     let g = b.finish(g).unwrap();
 
@@ -250,9 +262,9 @@ fn ge_indicator_with_broadcast() {
 #[test]
 fn top_k_gate_selects_topk_and_normalizes() {
     // Two rows of 4 expert logits; k=2 keeps the two largest per row, softmaxes over them, zeros the rest.
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 4]));
-    let g = top_k_gate(&b, x, 2);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 4])).unwrap();
+    let g = top_k_gate(&b, x, 2).unwrap();
     let xi = x.id();
     let g = b.finish(g).unwrap();
 
@@ -280,10 +292,10 @@ fn top_k_gate_composition_matches_sort_reference() {
     // card 061/308: the stable-rank + selected-only gate composition matches the sort-based reference oracle
     // (`crate::top_k_gate`) on distinct logits: 6 rows, E=8, k=3.
     let (rows, e, k) = (6usize, 8usize, 3usize);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![rows, e]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![rows, e])).unwrap();
     let xi = x.id();
-    let gate = top_k_gate(&b, x, k);
+    let gate = top_k_gate(&b, x, k).unwrap();
     let g = b.finish(gate).unwrap();
 
     // distinct pseudo-random logits (a cheap hash, scaled), no ties.
@@ -320,12 +332,14 @@ fn moe_matches_reference() {
     // (`moe` dispatches L=1 to the sparse path, covered by moe_sparse_matches_dense).
     use poot_graph_ir::ops::moe_dense;
     let (e, k, h, i, l) = (3usize, 2usize, 2usize, 2usize, 1usize);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, l, h]));
-    let router = b.constant("router", TensorType::f32(vec![h, e]));
-    let w_in = b.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
-    let w_out = b.constant("w_out", TensorType::f32(vec![e, i, h]));
-    let out = moe_dense(&b, x, router, w_in, w_out, e, k, i);
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, l, h])).unwrap();
+    let router = b.constant("router", TensorType::f32(vec![h, e])).unwrap();
+    let w_in = b
+        .constant("w_in", TensorType::f32(vec![e, h, 2 * i]))
+        .unwrap();
+    let w_out = b.constant("w_out", TensorType::f32(vec![e, i, h])).unwrap();
+    let out = moe_dense(&b, x, router, w_in, w_out, e, k, i).unwrap();
     let (xi, ri, wii, woi) = (x.id(), router.id(), w_in.id(), w_out.id());
     let g = b.finish(out).unwrap();
 
@@ -412,12 +426,16 @@ fn moe_sparse_matches_dense() {
         inputs
     };
 
-    let bd = Builder::new();
-    let xd = bd.constant("x", TensorType::f32(vec![1, 1, h]));
-    let rd = bd.constant("router", TensorType::f32(vec![h, e]));
-    let wid = bd.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
-    let wod = bd.constant("w_out", TensorType::f32(vec![e, i, h]));
-    let dense_out = moe_dense(&bd, xd, rd, wid, wod, e, k, i);
+    let bd = Builder::for_tests();
+    let xd = bd.constant("x", TensorType::f32(vec![1, 1, h])).unwrap();
+    let rd = bd.constant("router", TensorType::f32(vec![h, e])).unwrap();
+    let wid = bd
+        .constant("w_in", TensorType::f32(vec![e, h, 2 * i]))
+        .unwrap();
+    let wod = bd
+        .constant("w_out", TensorType::f32(vec![e, i, h]))
+        .unwrap();
+    let dense_out = moe_dense(&bd, xd, rd, wid, wod, e, k, i).unwrap();
     let gd = bd.finish(dense_out).unwrap();
     let dense = eval(
         &gd,
@@ -429,12 +447,16 @@ fn moe_sparse_matches_dense() {
     .into_host()
     .expect("moe_gating tests evaluate dense graphs");
 
-    let bs = Builder::new();
-    let xs = bs.constant("x", TensorType::f32(vec![1, 1, h]));
-    let rs = bs.constant("router", TensorType::f32(vec![h, e]));
-    let wis = bs.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
-    let wos = bs.constant("w_out", TensorType::f32(vec![e, i, h]));
-    let sparse_out = moe_sparse(&bs, xs, rs, wis, wos, e, k, i);
+    let bs = Builder::for_tests();
+    let xs = bs.constant("x", TensorType::f32(vec![1, 1, h])).unwrap();
+    let rs = bs.constant("router", TensorType::f32(vec![h, e])).unwrap();
+    let wis = bs
+        .constant("w_in", TensorType::f32(vec![e, h, 2 * i]))
+        .unwrap();
+    let wos = bs
+        .constant("w_out", TensorType::f32(vec![e, i, h]))
+        .unwrap();
+    let sparse_out = moe_sparse(&bs, xs, rs, wis, wos, e, k, i).unwrap();
     let gs = bs.finish(sparse_out).unwrap();
     let sparse = eval(
         &gs,
@@ -480,12 +502,16 @@ fn moe_grouped_matches_dense() {
         inputs
     };
 
-    let bd = Builder::new();
-    let xd = bd.constant("x", TensorType::f32(vec![1, l, h]));
-    let rd = bd.constant("router", TensorType::f32(vec![h, e]));
-    let wid = bd.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
-    let wod = bd.constant("w_out", TensorType::f32(vec![e, i, h]));
-    let dense_out = moe_dense(&bd, xd, rd, wid, wod, e, k, i);
+    let bd = Builder::for_tests();
+    let xd = bd.constant("x", TensorType::f32(vec![1, l, h])).unwrap();
+    let rd = bd.constant("router", TensorType::f32(vec![h, e])).unwrap();
+    let wid = bd
+        .constant("w_in", TensorType::f32(vec![e, h, 2 * i]))
+        .unwrap();
+    let wod = bd
+        .constant("w_out", TensorType::f32(vec![e, i, h]))
+        .unwrap();
+    let dense_out = moe_dense(&bd, xd, rd, wid, wod, e, k, i).unwrap();
     let gd = bd.finish(dense_out).unwrap();
     let dense = eval(
         &gd,
@@ -497,12 +523,16 @@ fn moe_grouped_matches_dense() {
     .into_host()
     .expect("moe_gating tests evaluate dense graphs");
 
-    let bg = Builder::new();
-    let xg = bg.constant("x", TensorType::f32(vec![1, l, h]));
-    let rg = bg.constant("router", TensorType::f32(vec![h, e]));
-    let wig = bg.constant("w_in", TensorType::f32(vec![e, h, 2 * i]));
-    let wog = bg.constant("w_out", TensorType::f32(vec![e, i, h]));
-    let grouped_out = moe_grouped(&bg, xg, rg, wig, wog, e, k, i);
+    let bg = Builder::for_tests();
+    let xg = bg.constant("x", TensorType::f32(vec![1, l, h])).unwrap();
+    let rg = bg.constant("router", TensorType::f32(vec![h, e])).unwrap();
+    let wig = bg
+        .constant("w_in", TensorType::f32(vec![e, h, 2 * i]))
+        .unwrap();
+    let wog = bg
+        .constant("w_out", TensorType::f32(vec![e, i, h]))
+        .unwrap();
+    let grouped_out = moe_grouped(&bg, xg, rg, wig, wog, e, k, i).unwrap();
     let gg = bg.finish(grouped_out).unwrap();
     let grouped = eval(
         &gg,
@@ -548,9 +578,9 @@ fn eval_tied_route(route: RouteKind, scores: &[f32], k: usize, w_in: &[f32], w_o
     use poot_graph_ir::ops::{moe_dense, moe_grouped, moe_sparse};
 
     let e = scores.len();
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![1, 1, 1]));
-    let router = b.constant("router", TensorType::f32(vec![1, e]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 1, 1])).unwrap();
+    let router = b.constant("router", TensorType::f32(vec![1, e])).unwrap();
     let mut named = HashMap::from([
         ("x".to_string(), HostTensor::f32(vec![1, 1, 1], vec![1.0])),
         (
@@ -559,8 +589,8 @@ fn eval_tied_route(route: RouteKind, scores: &[f32], k: usize, w_in: &[f32], w_o
         ),
     ]);
 
-    let wi = b.constant("w_in", TensorType::f32(vec![e, 1, 2]));
-    let wo = b.constant("w_out", TensorType::f32(vec![e, 1, 1]));
+    let wi = b.constant("w_in", TensorType::f32(vec![e, 1, 2])).unwrap();
+    let wo = b.constant("w_out", TensorType::f32(vec![e, 1, 1])).unwrap();
     named.insert(
         "w_in".to_string(),
         HostTensor::f32(vec![e, 1, 2], w_in.to_vec()),
@@ -570,9 +600,9 @@ fn eval_tied_route(route: RouteKind, scores: &[f32], k: usize, w_in: &[f32], w_o
         HostTensor::f32(vec![e, 1, 1], w_out.to_vec()),
     );
     let out = match route {
-        RouteKind::Dense => moe_dense(&b, x, router, wi, wo, e, k, 1),
-        RouteKind::Sparse => moe_sparse(&b, x, router, wi, wo, e, k, 1),
-        RouteKind::Grouped => moe_grouped(&b, x, router, wi, wo, e, k, 1),
+        RouteKind::Dense => moe_dense(&b, x, router, wi, wo, e, k, 1).unwrap(),
+        RouteKind::Sparse => moe_sparse(&b, x, router, wi, wo, e, k, 1).unwrap(),
+        RouteKind::Grouped => moe_grouped(&b, x, router, wi, wo, e, k, 1).unwrap(),
     };
     let graph = b.finish(out).unwrap();
     let inputs = graph
@@ -748,12 +778,12 @@ fn deterministic_moe_routes_match_stable_sort_table() {
         let sum: f32 = oracle.as_f32().unwrap().iter().sum();
         assert!((sum - 1.0).abs() <= 1e-6, "{}: gate sum {sum}", case.name);
 
-        let b = Builder::new();
-        let scores = b.constant("scores", TensorType::f32(vec![1, 5]));
-        let rank = poot_graph_ir::ops::stable_descending_rank(&b, scores);
-        let mask = poot_graph_ir::ops::top_k_keep_mask(&b, rank, case.k);
-        let gate = top_k_gate(&b, scores, case.k);
-        let route = b.concat(1, &[mask, gate]);
+        let b = Builder::for_tests();
+        let scores = b.constant("scores", TensorType::f32(vec![1, 5])).unwrap();
+        let rank = poot_graph_ir::ops::stable_descending_rank(&b, scores).unwrap();
+        let mask = poot_graph_ir::ops::top_k_keep_mask(&b, rank, case.k).unwrap();
+        let gate = top_k_gate(&b, scores, case.k).unwrap();
+        let route = b.concat(1, &[mask, gate]).unwrap();
         let graph = b.finish(route).unwrap();
         let inputs = graph
             .inputs()
@@ -816,11 +846,14 @@ fn deterministic_moe_routes_match_stable_sort_table() {
             );
         }
 
-        let b = Builder::new();
-        let xm = b.constant("x", TensorType::f32(vec![1, 1]));
-        let logits = b.constant("scores", TensorType::f32(vec![1, 5]));
-        let (_, ids, weights) = poot_graph_ir::ops::moe_grouped_prep(&b, xm, logits, 5, case.k);
-        let route = b.concat(0, &[b.cast(ids, DType::F32), weights]);
+        let b = Builder::for_tests();
+        let xm = b.constant("x", TensorType::f32(vec![1, 1])).unwrap();
+        let logits = b.constant("scores", TensorType::f32(vec![1, 5])).unwrap();
+        let (_, ids, weights) =
+            poot_graph_ir::ops::moe_grouped_prep(&b, xm, logits, 5, case.k).unwrap();
+        let route = b
+            .concat(0, &[b.cast(ids, DType::F32).unwrap(), weights])
+            .unwrap();
         let (xm_id, logits_id) = (xm.id(), logits.id());
         let graph = b.finish(route).unwrap();
         let inputs: HashMap<_, _> = graph
@@ -882,9 +915,9 @@ fn deterministic_moe_routes_match_stable_sort_table() {
 
     for invalid_k in [0, 6] {
         let result = std::panic::catch_unwind(|| {
-            let b = Builder::new();
-            let scores = b.constant("scores", TensorType::f32(vec![1, 5]));
-            let _ = top_k_gate(&b, scores, invalid_k);
+            let b = Builder::for_tests();
+            let scores = b.constant("scores", TensorType::f32(vec![1, 5])).unwrap();
+            let _ = top_k_gate(&b, scores, invalid_k).unwrap();
         });
         assert!(
             result.is_err(),

@@ -6,11 +6,11 @@
 //!
 //! Run: `cargo run -p poot-llm --example flash_attention_fusion` (CPU only, no GPU or weights needed).
 
-use poot_executor_parity::dense::{Dense, Family, step};
 use poot_graph_ir::OpKind;
 use poot_models::model::{LogitRows, Phase};
+use poot_models::test_support::dense::{Dense, Family, step};
 
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 
 const LAYERS: usize = 4;
 
@@ -26,14 +26,18 @@ fn main() {
     let cap = 16;
     let g = model
         .model
-        .trace(Phase::Decode, step(1, 1, cap, LogitRows::Last))
+        .trace(
+            Phase::Decode,
+            step(1, 1, cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .expect("trace the decode step");
 
     // Default pipeline without flash (cse + pointwise/row fusion) vs with it (`optimize` = cse ->
     // flash_attention -> dce -> fuse). flash_attention collapses each layer's materialized attention chain
     // (transpose K, QKt matmul, scale, mask add, softmax, PV matmul) into one Attention op.
     let no_flash = poot_graph_plan::fuse(&poot_graph_plan::cse(&g).unwrap()).unwrap();
-    let with_flash = optimize(&g).unwrap();
+    let with_flash = passes_without_target(&g).unwrap();
 
     let n_flash = with_flash
         .eqns()

@@ -8,7 +8,7 @@
 
 mod common;
 
-use poot_executor_parity::dense::{Dense, Family};
+use poot_models::test_support::dense::{Dense, Family};
 
 #[test]
 fn batched_prefill_fills_cache_identically_to_token_by_token() {

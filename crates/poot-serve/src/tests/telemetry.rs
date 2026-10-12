@@ -4,7 +4,8 @@
 
 use std::time::Duration;
 
-use poot_profile::{Coverage, DeviceCoverage, HostTiming, MeasuredDevice, TimingSnapshot};
+use poot_profile::{DeviceCoverage, HostTiming, MeasuredDevice, TimingSnapshot};
+use poot_runtime_common::Coverage;
 
 use super::recording_engine::{JobSpec, RecordingEngine};
 use super::*;

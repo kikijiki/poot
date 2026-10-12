@@ -1,4 +1,9 @@
-use crate::*;
+use crate::resources::allocate_buffer_resources;
+use crate::util::find_memory_type;
+use crate::{Context, DeviceBuffer, RuntimeError};
+use ash::vk;
+use poot_runtime_common::BufferRole;
+use poot_target::BufferStorage;
 
 impl Context {
     pub(crate) fn alloc_buffer(
@@ -30,7 +35,7 @@ impl Context {
     /// `storage`, charged to `role` (Card 547a: the storage-typed, role-typed allocation the executor
     /// contract's memory service needs, instead of one allocator per dtype - the Vulkan per-dtype
     /// family this replaces had no consumer outside this crate's own tests; mirrors
-    /// `poot_runtime::Context::alloc_storage`). `elems == 0` is refused with
+    /// `poot_wgpu_runtime::Context::alloc_storage`). `elems == 0` is refused with
     /// [`RuntimeError::ZeroSizeBuffer`] (`allocate_buffer_resources`'s own check). The allocation is
     /// rounded up to whole 4-byte words (a kernel addresses storage by word), so `elems` of a
     /// narrower element can leave padding at the end.

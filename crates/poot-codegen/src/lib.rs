@@ -31,6 +31,8 @@ mod emit;
 mod handle;
 mod spirv_postprocess;
 mod structurize;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use std::path::Path;
 use std::process::Command;
@@ -40,12 +42,13 @@ pub use aie::{
     AieToolIdentity, AieTools, FifoDirection, compile_aie,
 };
 pub use cache::{
-    Artifact, ArtifactTooLarge, KernelCache, KernelKey, body_fingerprint,
-    epoch as kernel_cache_epoch, kernel_cache_root, kernel_entry_key,
+    Artifact, ArtifactTooLarge, KernelCache, KernelKey, epoch as kernel_cache_epoch,
+    kernel_cache_root,
 };
 pub use emit::emit_llvm_ir;
 pub use handle::{GpuTarget, NotAByteTarget, aie_kernel_handle, kernel_handle};
 use poot_target::AmdArch;
+pub use spirv_postprocess::NoContractionError;
 
 /// A codegen backend target.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -343,6 +346,8 @@ fn compile_with(
 /// content-addressed `out`. `out`'s file name is kept as a prefix; the `{pid}.{nonce}` suffix makes them
 /// unique across concurrent compiles (see the nonce in [`compile`]). Both live in `out`'s parent so the
 /// final rename is same-filesystem and atomic. Pure, so uniqueness is unit-testable without a toolchain.
+/// `cache::is_scratch_name` recognises exactly these names (and `KernelCache::scratch_path`'s) when the cache
+/// prunes scratch a dead compiler left behind, so a change to the naming here changes that predicate.
 fn compile_scratch_paths(
     out: &Path,
     pid: u32,

@@ -12,10 +12,9 @@ rust-version.workspace = true
 # the normalized Body can be serialized (cache / golden tests / a future CPU interpreter)
 serde = ["dep:serde"]
 # Card 671: `Buffer::from_f32s`/`from_u32s`/`to_f32s` have no production caller anywhere in the workspace -
-# every reference is test code, and the one non-test reference is poot-test-util's own forwarder. Gating them
-# behind this feature (enabled only by poot-test-util's optional dependency below) means a default/production
-# build never compiles them in at all, instead of leaving them unconditionally `pub` with poot-test-util as
-# their sole non-test "caller" - the gate would otherwise treat that as a real use and never flag them.
+# every reference is test code. Gating them behind this feature (enabled only from `[dev-dependencies]` edges)
+# means a default/production build never compiles them in at all. `test_support` holds the kernel-body fixtures
+# the kernel tests across the workspace share.
 test-support = []
 
 [dependencies]

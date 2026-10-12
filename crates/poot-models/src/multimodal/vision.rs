@@ -220,8 +220,14 @@ pub fn idefics3_preprocess(
     h: usize,
     w: usize,
     cfg: &PreprocessConfig,
-) -> Idefics3Frames {
-    assert_eq!(rgb.len(), h * w * 3, "rgb must be h*w*3 interleaved");
+) -> Result<Idefics3Frames, ImageBufferError> {
+    if h.checked_mul(w).and_then(|px| px.checked_mul(3)) != Some(rgb.len()) {
+        return Err(ImageBufferError {
+            len: rgb.len(),
+            height: h,
+            width: w,
+        });
+    }
     let tile = cfg.image_size;
     let (rh, rw) = idefics3_resize_longest(h, w, cfg.longest_edge);
     let (eh, ew) = idefics3_resize_for_encoder(rh, rw, tile);
@@ -231,7 +237,7 @@ pub fn idefics3_preprocess(
     let mut frames = Vec::new();
     if rows == 0 && cols == 0 {
         frames.push(normalize_frame(&resized, tile, cfg));
-        return Idefics3Frames { frames, rows, cols };
+        return Ok(Idefics3Frames { frames, rows, cols });
     }
     // Tiles, row-major (n_h outer, n_w inner) - matching the reference frame/prompt order.
     for nh in 0..rows {
@@ -254,45 +260,16 @@ pub fn idefics3_preprocess(
     // Global thumbnail LAST: the whole encoder-resized image squashed to tile x tile.
     let global = resize_lanczos(&resized, eh, ew, tile, tile);
     frames.push(normalize_frame(&global, tile, cfg));
-    Idefics3Frames { frames, rows, cols }
+    Ok(Idefics3Frames { frames, rows, cols })
 }
 
-/// Bilinear-sample channel `c` of an interleaved RGB image (`rgb[(y*w + x)*3 + c]`) at fractional
-/// `(sx, sy)`, clamping to the image bounds.
-#[cfg(test)]
-fn sample_bilinear(rgb: &[f32], h: usize, w: usize, sx: f32, sy: f32, c: usize) -> f32 {
-    let x0 = sx.floor().clamp(0.0, (w - 1) as f32) as usize;
-    let y0 = sy.floor().clamp(0.0, (h - 1) as f32) as usize;
-    let x1 = (x0 + 1).min(w - 1);
-    let y1 = (y0 + 1).min(h - 1);
-    let fx = (sx - x0 as f32).clamp(0.0, 1.0);
-    let fy = (sy - y0 as f32).clamp(0.0, 1.0);
-    let px = |x: usize, y: usize| rgb[(y * w + x) * 3 + c];
-    let top = px(x0, y0) * (1.0 - fx) + px(x1, y0) * fx;
-    let bot = px(x0, y1) * (1.0 - fx) + px(x1, y1) * fx;
-    top * (1.0 - fy) + bot * fy
-}
-
-/// Preprocess a decoded `h x w` interleaved-RGB image (values in `[0, 255]`, row-major) into the vision encoder's
-/// channel-first pixel tensor `[3, image_size, image_size]` (spec 049 slice 1, FR-001/FR-002): bilinear resize to
-/// a square, rescale by `rescale_factor`, then per-channel `(x - mean) / std`. A single resized frame, no tiling.
-#[cfg(test)]
-fn preprocess_image(rgb: &[f32], h: usize, w: usize, cfg: &PreprocessConfig) -> Vec<f32> {
-    assert_eq!(rgb.len(), h * w * 3, "rgb must be h*w*3 interleaved");
-    let s = cfg.image_size;
-    let mut out = vec![0.0f32; 3 * s * s];
-    for oy in 0..s {
-        // half-pixel-centered source coordinate (the standard resize convention).
-        let sy = (oy as f32 + 0.5) * (h as f32 / s as f32) - 0.5;
-        for ox in 0..s {
-            let sx = (ox as f32 + 0.5) * (w as f32 / s as f32) - 0.5;
-            for c in 0..3 {
-                let v = sample_bilinear(rgb, h, w, sx, sy, c);
-                out[c * s * s + oy * s + ox] = (v * cfg.rescale_factor - cfg.mean[c]) / cfg.std[c];
-            }
-        }
-    }
-    out
+/// An interleaved-RGB buffer whose length is not `height * width * 3`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("an {height}x{width} RGB image has {} values, the buffer holds {len}", height.saturating_mul(*width).saturating_mul(3))]
+pub struct ImageBufferError {
+    pub len: usize,
+    pub height: usize,
+    pub width: usize,
 }
 
 #[cfg(test)]
@@ -403,7 +380,7 @@ mod tests {
             ((300, 100), (4, 2, 9)),
         ];
         for ((h, w), want) in cases {
-            let out = idefics3_preprocess(&vec![100.0; h * w * 3], h, w, &cfg);
+            let out = idefics3_preprocess(&vec![100.0; h * w * 3], h, w, &cfg).unwrap();
             let got = (out.rows, out.cols, out.frames.len());
             assert_eq!(got, want, "geometry for {h}x{w}");
         }
@@ -414,13 +391,13 @@ mod tests {
         // A non-square image is not forced to a square tile grid: a landscape image yields cols > rows and a portrait
         // rows > cols.
         let cfg = smolvlm();
-        let wide = idefics3_preprocess(&vec![100.0; 512 * 1536 * 3], 512, 1536, &cfg);
+        let wide = idefics3_preprocess(&vec![100.0; 512 * 1536 * 3], 512, 1536, &cfg).unwrap();
         let (lr, lc) = (wide.rows, wide.cols);
         assert!(
             lc > lr,
             "landscape must have more columns than rows: {lr}x{lc}"
         );
-        let tall = idefics3_preprocess(&vec![100.0; 1536 * 512 * 3], 1536, 512, &cfg);
+        let tall = idefics3_preprocess(&vec![100.0; 1536 * 512 * 3], 1536, 512, &cfg).unwrap();
         let (pr, pc) = (tall.rows, tall.cols);
         assert!(
             pr > pc,
@@ -450,7 +427,7 @@ mod tests {
                 rgb[p + 2] = 64.0;
             }
         }
-        let out = idefics3_preprocess(&rgb, h, w, &cfg);
+        let out = idefics3_preprocess(&rgb, h, w, &cfg).unwrap();
         assert_eq!((out.rows, out.cols), (2, 4));
         assert_eq!(out.frames.len(), 2 * 4 + 1, "8 tiles + 1 global");
         for (i, f) in out.frames.iter().enumerate() {
@@ -500,7 +477,7 @@ mod tests {
             (7, 129),
         ] {
             let rgb: Vec<f32> = (0..h * w * 3).map(|i| (i % 256) as f32).collect();
-            let out = idefics3_preprocess(&rgb, h, w, &cfg);
+            let out = idefics3_preprocess(&rgb, h, w, &cfg).unwrap();
             let n_frames = if out.rows == 0 && out.cols == 0 {
                 1
             } else {
@@ -519,5 +496,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Bilinear-sample channel `c` of an interleaved RGB image (`rgb[(y*w + x)*3 + c]`) at fractional
+    /// `(sx, sy)`, clamping to the image bounds.
+    fn sample_bilinear(rgb: &[f32], h: usize, w: usize, sx: f32, sy: f32, c: usize) -> f32 {
+        let x0 = sx.floor().clamp(0.0, (w - 1) as f32) as usize;
+        let y0 = sy.floor().clamp(0.0, (h - 1) as f32) as usize;
+        let x1 = (x0 + 1).min(w - 1);
+        let y1 = (y0 + 1).min(h - 1);
+        let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        let px = |x: usize, y: usize| rgb[(y * w + x) * 3 + c];
+        let top = px(x0, y0) * (1.0 - fx) + px(x1, y0) * fx;
+        let bot = px(x0, y1) * (1.0 - fx) + px(x1, y1) * fx;
+        top * (1.0 - fy) + bot * fy
+    }
+
+    /// Preprocess a decoded `h x w` interleaved-RGB image (values in `[0, 255]`, row-major) into the vision encoder's
+    /// channel-first pixel tensor `[3, image_size, image_size]` (spec 049 slice 1, FR-001/FR-002): bilinear resize to
+    /// a square, rescale by `rescale_factor`, then per-channel `(x - mean) / std`. A single resized frame, no tiling.
+    fn preprocess_image(rgb: &[f32], h: usize, w: usize, cfg: &PreprocessConfig) -> Vec<f32> {
+        assert_eq!(rgb.len(), h * w * 3, "rgb must be h*w*3 interleaved");
+        let s = cfg.image_size;
+        let mut out = vec![0.0f32; 3 * s * s];
+        for oy in 0..s {
+            // half-pixel-centered source coordinate (the standard resize convention).
+            let sy = (oy as f32 + 0.5) * (h as f32 / s as f32) - 0.5;
+            for ox in 0..s {
+                let sx = (ox as f32 + 0.5) * (w as f32 / s as f32) - 0.5;
+                for c in 0..3 {
+                    let v = sample_bilinear(rgb, h, w, sx, sy, c);
+                    out[c * s * s + oy * s + ox] =
+                        (v * cfg.rescale_factor - cfg.mean[c]) / cfg.std[c];
+                }
+            }
+        }
+        out
     }
 }

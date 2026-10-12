@@ -1,14 +1,16 @@
 use super::*;
+use crate::Operand;
+use crate::Storage;
 use crate::op::OpKind;
 use crate::packed_source::PackedSourceName;
 use poot_quant::PackedWeight;
 use poot_quant::format::WeightFormat;
 
 /// The equation kinds `f` emits over one `[2, 3]` input, in trace order.
-fn trace_kinds(f: fn(&Builder, Traced) -> Traced) -> Vec<OpKind> {
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 3]));
-    let out = f(&b, x);
+fn trace_kinds(f: fn(&Builder, Traced) -> Result<Traced, BuilderError>) -> Vec<OpKind> {
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+    let out = f(&b, x).unwrap();
     b.finish(out)
         .unwrap()
         .eqns()
@@ -55,16 +57,16 @@ fn activations_are_compositions_over_the_transcendental_primitives() {
 fn swiglu_and_geglu_emit_activation_then_mul() {
     let cases = [
         (
-            silu as fn(&Builder, Traced) -> Traced,
-            swiglu as fn(&Builder, Traced, Traced) -> Traced,
+            silu as fn(&Builder, Traced) -> Result<Traced, BuilderError>,
+            swiglu as fn(&Builder, Traced, Traced) -> Result<Traced, BuilderError>,
         ),
         (gelu, geglu),
     ];
     for (act, f) in cases {
-        let b = Builder::new();
-        let gate = b.constant("gate", TensorType::f32(vec![2, 3]));
-        let up = b.constant("up", TensorType::f32(vec![2, 3]));
-        let out = f(&b, gate, up);
+        let b = Builder::for_tests();
+        let gate = b.constant("gate", TensorType::f32(vec![2, 3])).unwrap();
+        let up = b.constant("up", TensorType::f32(vec![2, 3])).unwrap();
+        let out = f(&b, gate, up).unwrap();
         let kinds: Vec<OpKind> = b
             .finish(out)
             .unwrap()
@@ -79,11 +81,11 @@ fn swiglu_and_geglu_emit_activation_then_mul() {
 }
 
 #[test]
-fn packed_linear_append_is_transactional() -> Result<(), BuilderAppendError> {
+fn packed_linear_append_is_transactional() -> Result<(), BuilderError> {
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [3, 35]).unwrap();
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![2, 35]));
-    let bias = b.constant("bias", TensorType::f32(vec![3]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![2, 35])).unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![3])).unwrap();
     let output = packed_linear(&b, x, "layer", descriptor, None, Some(bias))?;
     let graph = b.finish(output).unwrap();
     assert_eq!(graph.values().len(), 8);
@@ -131,7 +133,7 @@ fn packed_linear_append_is_transactional() -> Result<(), BuilderAppendError> {
 /// in reverse; the AWQ row goes red (`PackedDequantOperand { role: Planar(Codes), field: "shape" }`,
 /// the op's own role-typed inference refuses the swapped carriers).
 #[test]
-fn packed_linear_stages_every_source_in_role_order() -> Result<(), BuilderAppendError> {
+fn packed_linear_stages_every_source_in_role_order() -> Result<(), BuilderError> {
     use std::num::NonZeroUsize;
     let nz = |n| NonZeroUsize::new(n).unwrap();
     let cases = [
@@ -146,8 +148,8 @@ fn packed_linear_stages_every_source_in_role_order() -> Result<(), BuilderAppend
     ];
     for (format, source_count) in cases {
         let descriptor = PackedWeight::try_new(format, [8, 256]).unwrap();
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![2, 256]));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 256])).unwrap();
         let output = packed_linear(&b, x, "layer", descriptor, None, None)?;
         let graph = b.finish(output).unwrap();
         let roles = descriptor.sources();
@@ -191,14 +193,18 @@ fn packed_linear_stages_every_source_in_role_order() -> Result<(), BuilderAppend
 fn packed_linear_error_preserves_graph() {
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [3, 35]).unwrap();
 
-    let collision_builder = Builder::new();
-    let x = collision_builder.constant("x", TensorType::f32(vec![2, 35]));
+    let collision_builder = Builder::for_tests();
+    let x = collision_builder
+        .constant("x", TensorType::f32(vec![2, 35]))
+        .unwrap();
     let taken = PackedSourceName::scale("layer");
-    collision_builder.constant(taken.as_str(), TensorType::new(vec![1, 1], DType::I8));
+    collision_builder
+        .constant(taken.as_str(), TensorType::new(vec![1, 1], DType::I8))
+        .unwrap();
     let before = collision_builder.generation();
     assert!(matches!(
         packed_linear(&collision_builder, x, "layer", descriptor, None, None),
-        Err(BuilderAppendError::NameCollision {
+        Err(BuilderError::NameCollision {
             name,
             requested: crate::BuilderValueNamespace::Constant,
             existing: crate::BuilderValueNamespace::Constant,
@@ -212,8 +218,10 @@ fn packed_linear_error_preserves_graph() {
     assert!(graph.slots().is_empty());
     assert!(graph.eqns().is_empty());
 
-    let inference_builder = Builder::new();
-    let wrong_x = inference_builder.constant("wrong_x", TensorType::f32(vec![2, 34]));
+    let inference_builder = Builder::for_tests();
+    let wrong_x = inference_builder
+        .constant("wrong_x", TensorType::f32(vec![2, 34]))
+        .unwrap();
     let before = inference_builder.generation();
     assert!(matches!(
         packed_linear(
@@ -224,7 +232,7 @@ fn packed_linear_error_preserves_graph() {
             None,
             None,
         ),
-        Err(BuilderAppendError::Inference {
+        Err(BuilderError::Inference {
             operation,
             source: crate::ShapeError::MatMulContract { .. },
             ..
@@ -245,12 +253,12 @@ fn packed_linear_late_error_reaches_caller() {
 }
 
 #[test]
-fn packed_block_diagonal_linear_builds_expected_chain() -> Result<(), BuilderAppendError> {
+fn packed_block_diagonal_linear_builds_expected_chain() -> Result<(), BuilderError> {
     // out=8, k=35, blocks=4 -> block_out=2 (mirrors the real attn.wo_a geometry at a small scale:
     // o_groups*o_lora_rank stored rows, a stored k, grouped into o_groups blocks).
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [8, 35]).unwrap();
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![4, 5, 35]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4, 5, 35])).unwrap();
     let output = packed_block_diagonal_linear(&b, x, "layer", descriptor, 4, None)?;
     let graph = b.finish(output).unwrap();
     assert_eq!(graph.aval(graph.result()).shape, vec![4, 5, 2]);
@@ -269,12 +277,12 @@ fn packed_block_diagonal_linear_builds_expected_chain() -> Result<(), BuilderApp
 #[test]
 fn packed_block_diagonal_linear_rejects_indivisible_blocks() {
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [8, 35]).unwrap();
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![3, 5, 35]));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![3, 5, 35])).unwrap();
     let before = b.generation();
     assert!(matches!(
         packed_block_diagonal_linear(&b, x, "layer", descriptor, 3, None),
-        Err(BuilderAppendError::PackedBlockDiagonalBlocks { out: 8, blocks: 3 })
+        Err(BuilderError::PackedBlockDiagonalBlocks { out: 8, blocks: 3 })
     ));
     assert_eq!(
         b.generation(),
@@ -300,7 +308,7 @@ fn operand_value(eqn: &crate::Eqn, position: usize) -> crate::ValueId {
 /// and the carrier shapes go red.
 #[test]
 fn packed_indexed_linear_is_one_claimed_contraction_over_stacked_carriers()
--> Result<(), BuilderAppendError> {
+-> Result<(), BuilderError> {
     use poot_quant::format::GroupMap;
     use std::num::NonZeroUsize;
     let formats = [
@@ -327,9 +335,11 @@ fn packed_indexed_linear_is_one_claimed_contraction_over_stacked_carriers()
             descriptor,
             experts: 3,
         };
-        let b = Builder::new();
-        let x = b.constant("x", TensorType::f32(vec![4, k]));
-        let selector = b.constant("selector", TensorType::new(vec![4], DType::I32));
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, k])).unwrap();
+        let selector = b
+            .constant("selector", TensorType::new(vec![4], DType::I32))
+            .unwrap();
         let output = packed_indexed_linear(&b, x, selector, &table)?;
         let graph = b.finish(output).unwrap();
 
@@ -379,9 +389,11 @@ fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
         experts: 2,
     };
     let (m, k) = (4, 32);
-    let b = Builder::new();
-    let x = b.constant("x", TensorType::f32(vec![m, k]));
-    let selector = b.constant("selector", TensorType::new(vec![m], DType::I32));
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![m, k])).unwrap();
+    let selector = b
+        .constant("selector", TensorType::new(vec![m], DType::I32))
+        .unwrap();
     let before = b.generation();
     let unnamed = PackedExpertStack {
         stack_id: String::new(),
@@ -389,7 +401,7 @@ fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
     };
     assert!(matches!(
         packed_indexed_linear(&b, x, selector, &unnamed),
-        Err(BuilderAppendError::EmptyPackedLinearId { index: 0 })
+        Err(BuilderError::EmptyPackedLinearId { index: 0 })
     ));
     let empty = PackedExpertStack {
         experts: 0,
@@ -435,12 +447,12 @@ fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
         ),
     ];
     for (label, x_type, selector_type, x_is_wrong) in &cases {
-        let b = Builder::new();
-        let x = b.constant("x", x_type.clone());
-        let selector = b.constant("selector", selector_type.clone());
+        let b = Builder::for_tests();
+        let x = b.constant("x", x_type.clone()).unwrap();
+        let selector = b.constant("selector", selector_type.clone()).unwrap();
         let wrong = if *x_is_wrong { x.id() } else { selector.id() };
         match packed_indexed_linear(&b, x, selector, &table) {
-            Err(BuilderAppendError::OperandType { value, .. }) if value == wrong => {}
+            Err(BuilderError::OperandType { value, .. }) if value == wrong => {}
             other => panic!("{label}: expected OperandType on {wrong}, got {other:?}"),
         }
     }
@@ -451,8 +463,8 @@ fn packed_indexed_linear_refuses_a_bad_table_or_operand_without_mutation() {
 /// Neumann-doubling implementation.
 fn ut_inverse_block_recursive(b: &Builder, attn: Traced, c: usize, rank: usize) -> Traced {
     if c == 1 {
-        let zero = b.binary(BinOp::Sub, attn, attn);
-        return b.binary_scalar(BinOp::Add, zero, Scalar::F32(1.0));
+        let zero = b.binary(BinOp::Sub, attn, attn).unwrap();
+        return b.binary_scalar(BinOp::Add, zero, Scalar::F32(1.0)).unwrap();
     }
     assert_eq!(
         c % 2,
@@ -461,20 +473,26 @@ fn ut_inverse_block_recursive(b: &Builder, attn: Traced, c: usize, rank: usize) 
     );
     let half = c / 2;
     let (ax0, ax1) = (rank - 2, rank - 1);
-    let a_attn = b.slice(b.slice(attn, ax0, 0, half), ax1, 0, half);
-    let d_attn = b.slice(b.slice(attn, ax0, half, c), ax1, half, c);
-    let b_block = b.slice(b.slice(attn, ax0, half, c), ax1, 0, half);
+    let a_attn = b
+        .slice(b.slice(attn, ax0, 0, half).unwrap(), ax1, 0, half)
+        .unwrap();
+    let d_attn = b
+        .slice(b.slice(attn, ax0, half, c).unwrap(), ax1, half, c)
+        .unwrap();
+    let b_block = b
+        .slice(b.slice(attn, ax0, half, c).unwrap(), ax1, 0, half)
+        .unwrap();
 
     let a_inv = ut_inverse_block_recursive(b, a_attn, half, rank);
     let d_inv = ut_inverse_block_recursive(b, d_attn, half, rank);
-    let ba = b.matmul(b_block, a_inv);
-    let dba = b.matmul(d_inv, ba);
-    let neg_dba = b.unary(UnOp::Neg, dba);
-    let zeros = b.binary(BinOp::Sub, a_inv, a_inv);
+    let ba = b.matmul(b_block, a_inv).unwrap();
+    let dba = b.matmul(d_inv, ba).unwrap();
+    let neg_dba = b.unary(UnOp::Neg, dba).unwrap();
+    let zeros = b.binary(BinOp::Sub, a_inv, a_inv).unwrap();
 
-    let top = b.concat(ax1, &[a_inv, zeros]);
-    let bottom = b.concat(ax1, &[neg_dba, d_inv]);
-    b.concat(ax0, &[top, bottom])
+    let top = b.concat(ax1, &[a_inv, zeros]).unwrap();
+    let bottom = b.concat(ax1, &[neg_dba, d_inv]).unwrap();
+    b.concat(ax0, &[top, bottom]).unwrap()
 }
 
 /// The Neumann-doubling UT-transform (the default) keeps eqn count logarithmic in C where
@@ -483,9 +501,9 @@ fn ut_inverse_block_recursive(b: &Builder, attn: Traced, c: usize, rank: usize) 
 #[test]
 fn ut_transform_neumann_doubling_is_log_op_count() {
     for (c, max_eqns) in [(8usize, 30), (16, 40), (32, 45), (64, 55)] {
-        let b = Builder::new();
-        let attn = b.constant("attn", TensorType::f32(vec![c, c]));
-        let t = unit_lower_triangular_inverse(&b, attn);
+        let b = Builder::for_tests();
+        let attn = b.constant("attn", TensorType::f32(vec![c, c])).unwrap();
+        let t = unit_lower_triangular_inverse(&b, attn).unwrap();
         let g = b.finish(t).unwrap();
         assert!(
             g.eqns().len() <= max_eqns,
@@ -494,8 +512,8 @@ fn ut_transform_neumann_doubling_is_log_op_count() {
         );
     }
     // and the old block-recursive (kept as a cross-check) is still ~20x heavier at C=64.
-    let b = Builder::new();
-    let attn = b.constant("attn", TensorType::f32(vec![64, 64]));
+    let b = Builder::for_tests();
+    let attn = b.constant("attn", TensorType::f32(vec![64, 64])).unwrap();
     let t = ut_inverse_block_recursive(&b, attn, 64, 2);
     let g = b.finish(t).unwrap();
     assert!(

@@ -1,4 +1,7 @@
-use crate::*;
+use crate::{DeviceBuffer, DeviceOwner, Pipeline, RuntimeError};
+use ash::vk;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 pub(crate) struct GraphResources {
     pub(crate) command_pool: vk::CommandPool,
@@ -270,6 +273,7 @@ impl VulkanGraph {
     }
 
     /// Number of command buffers a replay submits, one fence wait after each.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn segment_count(&self) -> usize {
         self.core.segments.len()
     }

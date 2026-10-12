@@ -150,8 +150,8 @@ crashes on kernels with in-loop barriers.
 ## .kir.json assets and drift guarding
 
 Each imported kernel has a committed `.kir.json` under its consuming crate's `assets/`
-(`poot-graph-plan/assets/` for every kernel the planner chooses between; `poot-rocm-gpu/assets/` and
-`poot-gpu/src/tests/assets/` for the handful a backend crate loads directly), generated from a source
+(`poot-graph-plan/assets/` for every kernel the planner chooses between; `poot-rocm-device/assets/` and
+`poot-wgpu-device/src/tests/assets/` for the handful a backend crate loads directly), generated from a source
 under `crates/pootc/kernels/<family>/`. One manifest table lists every asset, its source and its
 destination; a test regenerates each asset from its source and checks it byte-for-byte against the
 committed one, and separately checks that each destination directory holds exactly its manifest's

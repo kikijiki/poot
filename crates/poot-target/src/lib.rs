@@ -51,6 +51,19 @@ pub enum TargetId {
     Aie(AieTargetId),
 }
 
+impl TargetId {
+    /// The stable name a calibration table keys a device class by: `nvptx`, `spirv-vulkan`,
+    /// `amdgcn-<gfx code>`. `None` for a target with no memory-bandwidth ceiling to calibrate (an NPU).
+    pub fn calibration_label(self) -> Option<String> {
+        match self {
+            TargetId::Gpu(Backend::Nvptx) => Some("nvptx".to_string()),
+            TargetId::Gpu(Backend::SpirvVulkan) => Some("spirv-vulkan".to_string()),
+            TargetId::Gpu(Backend::AmdGcn(arch)) => Some(format!("amdgcn-{}", arch.mcpu())),
+            TargetId::Aie(_) => None,
+        }
+    }
+}
+
 impl From<Backend> for TargetId {
     fn from(backend: Backend) -> Self {
         TargetId::Gpu(backend)
@@ -320,7 +333,7 @@ pub struct KnownMiscompiles {
 pub struct DeviceCaps {
     /// The largest single buffer allocation this device and its driver are safe to use, in bytes. Not
     /// always the raw device maximum: a driver can wedge below its own advertised limit (RADV; see
-    /// `poot-runtime`'s `AMD_RADV_SAFE_MAX_BUFFER_BYTES`).
+    /// `poot-wgpu-runtime`'s `AMD_RADV_SAFE_MAX_BUFFER_BYTES`).
     pub max_buffer_bytes: u64,
     /// Workgroup-local (LDS/shared-memory) budget, in bytes, one dispatch may use.
     pub lds_bytes: u32,
@@ -402,7 +415,7 @@ impl DeviceCaps {
     /// tests and the plan-summary corpus (card 599).
     pub fn wgpu_rdna3_igpu() -> Self {
         DeviceCaps {
-            max_buffer_bytes: 1_342_177_280, // poot-runtime::AMD_RADV_SAFE_MAX_BUFFER_BYTES (1.25 GiB)
+            max_buffer_bytes: 1_342_177_280, // poot-wgpu-runtime::AMD_RADV_SAFE_MAX_BUFFER_BYTES (1.25 GiB)
             lds_bytes: 16_352,               // wgpu downlevel_defaults() workgroup-storage limit
             // The wgpu runtime raises x and the invocation count to the adapter maximum (RADV: 1024);
             // y and z stay at `downlevel_defaults()`.
@@ -479,6 +492,25 @@ impl DeviceCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A calibration table keys a device class by this label: each GPU backend has its own, an AMD part
+    /// carries its gfx code, and an NPU has none. Mutation: drop the arch from the amdgcn label.
+    #[test]
+    fn calibration_labels_name_the_backend_and_the_amd_gfx_code() {
+        assert_eq!(
+            TargetId::from(Backend::AmdGcn(AmdArch::gfx1151())).calibration_label(),
+            Some("amdgcn-gfx1151".to_string())
+        );
+        assert_eq!(
+            TargetId::from(Backend::Nvptx).calibration_label(),
+            Some("nvptx".to_string())
+        );
+        assert_eq!(
+            TargetId::from(Backend::SpirvVulkan).calibration_label(),
+            Some("spirv-vulkan".to_string())
+        );
+        assert_eq!(TargetId::from(AieTargetId::Xdna2).calibration_label(), None);
+    }
 
     #[test]
     fn device_name_classification_finds_the_gfx_token_in_an_hsa_isa_string() {

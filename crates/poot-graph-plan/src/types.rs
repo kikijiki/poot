@@ -2,10 +2,11 @@
 //! moved to `poot-target` (card 522 review): callers import it from there directly.
 //! Re-exported at the crate root.
 
+use crate::device_validation::DeviceWitnessRejection;
 use poot_graph_ir::{ValidationId, ValueId, ValueTable};
 use poot_tensor::DType;
 
-use crate::{DeviceWitnessRejection, KernelChoice, Refusal, StorageGap};
+use crate::{KernelChoice, Refusal, StorageGap};
 use poot_kernel_ir::Body;
 
 #[derive(Debug, thiserror::Error)]
@@ -422,12 +423,6 @@ impl DispatchPlan {
         })
     }
 
-    /// The dispatches by value, for a test that takes a plan apart.
-    #[cfg(test)]
-    pub(crate) fn into_dispatches(self) -> Vec<Dispatch> {
-        self.dispatches
-    }
-
     /// The scratch buffers the plan declares, indexed by [`ScratchId`].
     pub fn scratch(&self) -> &[ScratchDecl] {
         &self.scratch
@@ -539,7 +534,7 @@ impl Plan {
 
 /// How [`ValueStorage`] packs its dtype into a device buffer (card 526).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StorageKind {
+pub(crate) enum StorageKind {
     /// One buffer element per value element, at `dtype`'s natural width (f32/i32 four bytes,
     /// bf16/f16 native two bytes).
     Dense(DType),
@@ -946,11 +941,17 @@ mod tests {
     fn value_storage_dtype_and_packed() {
         let dense = ValueStorage::new(StorageKind::Dense(DType::F32));
         assert_eq!(dense.dtype(), DType::F32);
-        assert!(!dense.buffer_storage().is_packed());
+        assert_eq!(
+            dense.buffer_storage().layout(),
+            poot_target::StorageLayout::Dense
+        );
 
         let packed = ValueStorage::new(StorageKind::Bf16Packed);
         assert_eq!(packed.dtype(), DType::BF16);
-        assert!(packed.buffer_storage().is_packed());
+        assert_eq!(
+            packed.buffer_storage().layout(),
+            poot_target::StorageLayout::Bf16Packed
+        );
 
         let packed_f16 = ValueStorage::new(StorageKind::F16Packed);
         assert_eq!(packed_f16.dtype(), DType::F16);
@@ -962,7 +963,7 @@ mod tests {
 
     /// Card 527: `ValueStorage`'s private field is `poot_target::BufferStorage` (this crate's own
     /// `DType`-keyed [`StorageKind`] is converted once, in `ValueStorage::new`), the same leaf-crate
-    /// vocabulary every runtime's buffer handle carries. `dtype()`/`buffer_storage().is_packed()`
+    /// vocabulary every runtime's buffer handle carries. `dtype()`/`buffer_storage().layout()`
     /// round-trip through it without loss, and a packed record shares its element kind with a
     /// same-width dense record while differing in dtype and layout - the same-element,
     /// different-meaning case R484-001 describes.
@@ -992,5 +993,12 @@ mod tests {
         let dense_i32 = ValueStorage::new(StorageKind::Dense(DType::I32));
         assert_eq!(packed.storage.element(), dense_i32.storage.element());
         assert_ne!(packed.storage, dense_i32.storage);
+    }
+
+    impl DispatchPlan {
+        /// The dispatches by value, for a test that takes a plan apart.
+        pub(crate) fn into_dispatches(self) -> Vec<Dispatch> {
+            self.dispatches
+        }
     }
 }

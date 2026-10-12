@@ -25,14 +25,22 @@ fn card158_arg_top_k_ties_stay_in_range() {
 
     // Compute rank[E] from logits with the pairwise-Ge composition moe_grouped_prep uses.
     let rank_of = |logits: &[f32]| -> Vec<f32> {
-        let br = Builder::new();
-        let lg = br.constant("logits", TensorType::f32(vec![1, e]));
-        let p = br.broadcast(br.reshape(lg, vec![1, e, 1]), vec![1, e, e]);
-        let q = br.broadcast(br.reshape(lg, vec![1, 1, e]), vec![1, e, e]);
-        let ge = br.binary(BinOp::Ge, p, q);
-        let gt = br.binary_scalar(BinOp::Mul, ge, poot_graph_ir::types::Scalar::F32(-1.0));
-        let gt = br.binary_scalar(BinOp::Add, gt, poot_graph_ir::types::Scalar::F32(1.0));
-        let rank = br.reduce(RedOp::Sum, gt, 2, false);
+        let br = Builder::for_tests();
+        let lg = br.constant("logits", TensorType::f32(vec![1, e])).unwrap();
+        let p = br
+            .broadcast(br.reshape(lg, vec![1, e, 1]).unwrap(), vec![1, e, e])
+            .unwrap();
+        let q = br
+            .broadcast(br.reshape(lg, vec![1, 1, e]).unwrap(), vec![1, e, e])
+            .unwrap();
+        let ge = br.binary(BinOp::Ge, p, q).unwrap();
+        let gt = br
+            .binary_scalar(BinOp::Mul, ge, poot_graph_ir::types::Scalar::F32(-1.0))
+            .unwrap();
+        let gt = br
+            .binary_scalar(BinOp::Add, gt, poot_graph_ir::types::Scalar::F32(1.0))
+            .unwrap();
+        let rank = br.reduce(RedOp::Sum, gt, 2, false).unwrap();
         let lgi = lg.id();
         let g = br.finish(rank).unwrap();
         let mut inp = HashMap::new();
@@ -80,9 +88,9 @@ fn card158_arg_top_k_ties_stay_in_range() {
     };
     // Eval oracle arg_top_k (scatter out[rank[i]]=i, last-wins); the fixed kernel must equal this.
     let oracle = |rank_data: &[f32]| -> Vec<usize> {
-        let ba = Builder::new();
-        let rk = ba.constant("rank", TensorType::f32(vec![1, e]));
-        let out = ba.arg_top_k(rk, k);
+        let ba = Builder::for_tests();
+        let rk = ba.constant("rank", TensorType::f32(vec![1, e])).unwrap();
+        let out = ba.arg_top_k(rk, k).unwrap();
         let rki = rk.id();
         let g = ba.finish(out).unwrap();
         let mut inp = HashMap::new();

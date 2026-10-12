@@ -35,6 +35,7 @@ use super::linear::{Weight, WeightError, linear};
 use super::norm::NormParams;
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
+use crate::model::TraceError;
 
 /// How a Gated DeltaNet layer pairs its `H_k` query/key heads with its `H_v` value heads.
 ///
@@ -53,10 +54,10 @@ pub enum GdnHeadOrder {
 
 impl GdnHeadOrder {
     /// Expand per-head query or key values `[B, H_k, L, D]` to `[B, H_k * n_rep, L, D]`.
-    fn expand(self, b: &Builder, x: Traced, n_rep: usize) -> Traced {
+    fn expand(self, b: &Builder, x: Traced, n_rep: usize) -> Result<Traced, TraceError> {
         match self {
-            Self::Tiled => ops::repeat_kv_tiled(b, x, n_rep),
-            Self::Grouped => ops::repeat_kv(b, x, n_rep),
+            Self::Tiled => Ok(ops::repeat_kv_tiled(b, x, n_rep)?),
+            Self::Grouped => Ok(ops::repeat_kv(b, x, n_rep)?),
         }
     }
 }
@@ -155,20 +156,6 @@ impl GdnParams {
             fused_projections: false,
             log_decay: false,
         })
-    }
-
-    /// The chunk length of the chunked recurrence, in place of the default 64: a power of two (the
-    /// UT-transform's triangular inverse doubles). A test shortens it to run several chunks over a
-    /// few tokens.
-    #[cfg(test)]
-    pub(crate) fn with_chunk(self, chunk: usize) -> Result<Self, ParamError> {
-        if chunk == 0 {
-            return Err(ParamError::new("gdn_chunk", ConfigReason::Zero));
-        }
-        if !chunk.is_power_of_two() {
-            return Err(ParamError::new("gdn_chunk", ConfigReason::Unsupported));
-        }
-        Ok(Self { chunk, ..self })
     }
 
     /// The layer stores `in_proj_qkvz` and `in_proj_ba` (HF `qwen3_next`), whose rows group per key
@@ -284,47 +271,49 @@ struct Projected {
 /// `[key_heads, 2 * head_dim + 2 * n_rep * head_dim]` for `q|k|v|z` and `[key_heads, 2 * n_rep]` for
 /// `b|a`: they are split on the projected activations, and each value part lands in grouped head
 /// order.
-fn project(b: &Builder, x: Traced, w: &GdnWeights, d: &GdnDims) -> Projected {
+fn project(b: &Builder, x: Traced, w: &GdnWeights, d: &GdnDims) -> Result<Projected, TraceError> {
     match &w.projections {
         Projections::Split {
             qkv,
             z,
             beta,
             alpha,
-        } => Projected {
-            qkv: linear(b, x, qkv, None),
-            z: linear(b, x, z, None),
-            beta: linear(b, x, beta, None),
-            alpha: linear(b, x, alpha, None),
-        },
+        } => Ok(Projected {
+            qkv: linear(b, x, qkv, None)?,
+            z: linear(b, x, z, None)?,
+            beta: linear(b, x, beta, None)?,
+            alpha: linear(b, x, alpha, None)?,
+        }),
         Projections::Fused { qkvz, ba } => {
-            let shape = b.aval(x).shape;
+            let shape = b.aval(x)?.shape;
             let (rows, t) = (shape[0], shape[1]);
             let (hk, hd, rep) = (d.key_heads, d.head_dim, d.n_rep());
             let grouped = b.reshape(
-                linear(b, x, qkvz, None),
+                linear(b, x, qkvz, None)?,
                 vec![rows, t, hk, 2 * hd + 2 * rep * hd],
-            );
+            )?;
             let part = |from: usize, len: usize, width: usize| {
-                b.reshape(b.slice(grouped, 3, from, from + len), vec![rows, t, width])
-            };
-            let q = part(0, hd, hk * hd);
-            let k = part(hd, hd, hk * hd);
-            let v = part(2 * hd, rep * hd, d.value_dim());
-            let z = part(2 * hd + rep * hd, rep * hd, d.value_dim());
-            let pairs = b.reshape(linear(b, x, ba, None), vec![rows, t, hk, 2 * rep]);
-            let gate = |from: usize| {
-                b.reshape(
-                    b.slice(pairs, 3, from, from + rep),
-                    vec![rows, t, d.value_heads],
+                Ok::<_, TraceError>(
+                    b.reshape(b.slice(grouped, 3, from, from + len)?, vec![rows, t, width])?,
                 )
             };
-            Projected {
-                qkv: b.concat(2, &[q, k, v]),
+            let q = part(0, hd, hk * hd)?;
+            let k = part(hd, hd, hk * hd)?;
+            let v = part(2 * hd, rep * hd, d.value_dim())?;
+            let z = part(2 * hd + rep * hd, rep * hd, d.value_dim())?;
+            let pairs = b.reshape(linear(b, x, ba, None)?, vec![rows, t, hk, 2 * rep])?;
+            let gate = |from: usize| {
+                Ok::<_, TraceError>(b.reshape(
+                    b.slice(pairs, 3, from, from + rep)?,
+                    vec![rows, t, d.value_heads],
+                )?)
+            };
+            Ok(Projected {
+                qkv: b.concat(2, &[q, k, v])?,
                 z,
-                beta: gate(0),
-                alpha: gate(rep),
-            }
+                beta: gate(0)?,
+                alpha: gate(rep)?,
+            })
         }
     }
 }
@@ -337,36 +326,36 @@ pub(crate) fn gdn_gates(
     alpha_raw: Traced,
     dt_bias: Traced,
     decay: Traced,
-) -> (Traced, Traced) {
-    let beta = ops::sigmoid(b, beta_raw);
-    let alpha = ops::softplus(b, b.binary(BinOp::Add, alpha_raw, dt_bias));
-    (beta, b.binary(BinOp::Mul, alpha, decay))
+) -> Result<(Traced, Traced), TraceError> {
+    let beta = ops::sigmoid(b, beta_raw)?;
+    let alpha = ops::softplus(b, b.binary(BinOp::Add, alpha_raw, dt_bias)?)?;
+    Ok((beta, b.binary(BinOp::Mul, alpha, decay)?))
 }
 
 /// `x / sqrt(sum(x^2) + eps)` over the last axis: ggml's `l2_norm`, which differs from an RMSNorm
 /// in having no scale and in adding `eps` to the sum, not the mean.
-fn l2_norm_last(b: &Builder, x: Traced, eps: f32) -> Traced {
-    let last = b.aval(x).shape.len() - 1;
+fn l2_norm_last(b: &Builder, x: Traced, eps: f32) -> Result<Traced, TraceError> {
+    let last = b.aval(x)?.shape.len() - 1;
     let squares = b.reduce(
         poot_graph_ir::RedOp::Sum,
-        b.binary(BinOp::Mul, x, x),
+        b.binary(BinOp::Mul, x, x)?,
         last,
         true,
-    );
+    )?;
     let norm = b.unary(
         UnOp::Sqrt,
-        b.binary_scalar(BinOp::Add, squares, Builder::f32(eps)),
-    );
-    b.binary(BinOp::Div, x, norm)
+        b.binary_scalar(BinOp::Add, squares, Builder::f32(eps))?,
+    )?;
+    Ok(b.binary(BinOp::Div, x, norm)?)
 }
 
 /// `[rows, tokens, heads * d]` as `[rows, heads, tokens, d]`.
-fn heads_first(b: &Builder, y: Traced, heads: usize, d: usize) -> Traced {
-    let shape = b.aval(y).shape;
-    b.transpose(
-        b.reshape(y, vec![shape[0], shape[1], heads, d]),
+fn heads_first(b: &Builder, y: Traced, heads: usize, d: usize) -> Result<Traced, TraceError> {
+    let shape = b.aval(y)?.shape;
+    Ok(b.transpose(
+        b.reshape(y, vec![shape[0], shape[1], heads, d])?,
         vec![0, 2, 1, 3],
-    )
+    )?)
 }
 
 /// What a [`gdn_scan`] reads besides the carried state.
@@ -404,7 +393,7 @@ fn gdn_scan(
     inputs: ScanInputs,
     state: Traced,
     recurrence: &Recurrence,
-) -> (Traced, Traced) {
+) -> Result<(Traced, Traced), TraceError> {
     let ScanInputs {
         conv_out,
         z,
@@ -419,30 +408,30 @@ fn gdn_scan(
         chunk,
     } = *recurrence;
     let d = &d;
-    let shape = b.aval(conv_out).shape;
+    let shape = b.aval(conv_out)?.shape;
     let (rows, t) = (shape[0], shape[1]);
     let (hk, hv, hd) = (d.key_heads, d.value_heads, d.head_dim);
     let (key_dim, value_dim) = (d.key_dim(), d.value_dim());
 
-    let q = b.slice(conv_out, 2, 0, key_dim);
-    let k = b.slice(conv_out, 2, key_dim, 2 * key_dim);
-    let v = b.slice(conv_out, 2, 2 * key_dim, d.conv_channels());
+    let q = b.slice(conv_out, 2, 0, key_dim)?;
+    let k = b.slice(conv_out, 2, key_dim, 2 * key_dim)?;
+    let v = b.slice(conv_out, 2, 2 * key_dim, d.conv_channels())?;
     let q = order.expand(
         b,
-        l2_norm_last(b, heads_first(b, q, hk, hd), eps),
+        l2_norm_last(b, heads_first(b, q, hk, hd)?, eps)?,
         d.n_rep(),
-    );
+    )?;
     let k = order.expand(
         b,
-        l2_norm_last(b, heads_first(b, k, hk, hd), eps),
+        l2_norm_last(b, heads_first(b, k, hk, hd)?, eps)?,
         d.n_rep(),
-    );
-    let v = heads_first(b, v, hv, hd);
-    let g = heads_first(b, g, hv, 1);
-    let beta = heads_first(b, beta, hv, 1);
+    )?;
+    let v = heads_first(b, v, hv, hd)?;
+    let g = heads_first(b, g, hv, 1)?;
+    let beta = heads_first(b, beta, hv, 1)?;
 
     let (o, next) = if t == 1 {
-        ops::gated_delta_net_decode(b, q, k, v, g, beta, state)
+        ops::gated_delta_net_decode(b, q, k, v, g, beta, state)?
     } else {
         // The chunk is a power of two (the triangular inverse doubles); a prompt shorter than it
         // runs one chunk of the next power of two and the op zero-pads the tail.
@@ -450,11 +439,11 @@ fn gdn_scan(
         // One row is already `[1, heads, ..]`: only several rows fold.
         let fold = |y: Traced| {
             if rows == 1 {
-                return y;
+                return Ok::<_, TraceError>(y);
             }
-            let mut shape = b.aval(y).shape;
+            let mut shape = b.aval(y)?.shape;
             shape.splice(0..2, [1, rows * hv]);
-            b.reshape(y, shape)
+            Ok::<_, TraceError>(b.reshape(y, shape)?)
         };
         let ScanResult {
             y: o, s_out: next, ..
@@ -463,26 +452,33 @@ fn gdn_scan(
                 family: ScanFamily::DeltaRule,
                 chunk: c,
             },
-            &[fold(q), fold(k), fold(v), fold(g), fold(beta), fold(state)],
-        );
+            &[
+                fold(q)?,
+                fold(k)?,
+                fold(v)?,
+                fold(g)?,
+                fold(beta)?,
+                fold(state)?,
+            ],
+        )?;
         if rows == 1 {
             (o, next)
         } else {
             (
-                b.reshape(o, vec![rows, hv, t, hd]),
-                b.reshape(next, vec![rows, hv, hd, hd]),
+                b.reshape(o, vec![rows, hv, t, hd])?,
+                b.reshape(next, vec![rows, hv, hd, hd])?,
             )
         }
     };
 
-    let normed = ops::rmsnorm(b, o, norm_scale, eps);
-    let gate = ops::silu(b, heads_first(b, z, hv, hd));
-    let gated = b.binary(BinOp::Mul, normed, gate);
+    let normed = ops::rmsnorm(b, o, norm_scale, eps)?;
+    let gate = ops::silu(b, heads_first(b, z, hv, hd)?)?;
+    let gated = b.binary(BinOp::Mul, normed, gate)?;
     let flat = b.reshape(
-        b.transpose(gated, vec![0, 2, 1, 3]),
+        b.transpose(gated, vec![0, 2, 1, 3])?,
         vec![rows, t, value_dim],
-    );
-    (flat, next)
+    )?;
+    Ok((flat, next))
 }
 
 /// The mixer over `x` (`[rows, tokens, width]`) at layer `layer`: `[rows, tokens, width]`. The
@@ -495,12 +491,12 @@ pub fn gdn(
     x: Traced,
     w: &GdnWeights,
     p: &GdnParams,
-) -> Traced {
+) -> Result<Traced, TraceError> {
     let d = &p.dims;
-    let projected = project(b, x, w, d);
-    let decay = w.decay.declare_f32(b);
+    let projected = project(b, x, w, d)?;
+    let decay = w.decay.declare_f32(b)?;
     let decay = if p.log_decay {
-        b.unary(UnOp::Neg, b.unary(UnOp::Exp, decay)) // decay = -exp(A_log)
+        b.unary(UnOp::Neg, b.unary(UnOp::Exp, decay)?)? // decay = -exp(A_log)
     } else {
         decay
     };
@@ -508,9 +504,9 @@ pub fn gdn(
         b,
         projected.beta,
         projected.alpha,
-        w.dt_bias.declare_f32(b),
+        w.dt_bias.declare_f32(b)?,
         decay,
-    );
+    )?;
     let conv = causal_conv(
         b,
         step,
@@ -518,21 +514,21 @@ pub fn gdn(
         projected.qkv,
         &w.conv,
         &p.conv,
-    );
+    )?;
     let state = step.recurrent_state(
         b,
         &format!("gdn.l{layer}.ssm"),
         DType::F32,
         &[d.value_heads, d.head_dim, d.head_dim],
-    );
+    )?;
     let (mixed, next) = gdn_scan(
         b,
         ScanInputs {
-            conv_out: ops::silu(b, conv),
+            conv_out: ops::silu(b, conv)?,
             z: projected.z,
             beta,
             g,
-            norm_scale: w.gate_norm.declare_f32(b),
+            norm_scale: w.gate_norm.declare_f32(b)?,
         },
         state.current(),
         &Recurrence {
@@ -541,8 +537,8 @@ pub fn gdn(
             eps: p.norm.eps(),
             chunk: p.chunk,
         },
-    );
-    step.carry_recurrent(b, state, next);
+    )?;
+    step.carry_recurrent(b, state, next)?;
     linear(b, mixed, &w.out, None)
 }
 
@@ -688,10 +684,12 @@ mod tests {
         let p = params(c);
         let w = GdnWeights::new(&fx.map(), 0, WIDTH, &p).unwrap();
         let tokens = x.len() / WIDTH;
-        let b = Builder::new();
-        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All));
-        let xs = b.constant("x", TensorType::f32(vec![1, tokens, WIDTH]));
-        let y = gdn(&b, &step, 0, xs, &w, &p);
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All)).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![1, tokens, WIDTH]))
+            .unwrap();
+        let y = gdn(&b, &step, 0, xs, &w, &p).unwrap();
         let g = step.finish(b, y).unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()
@@ -916,14 +914,16 @@ mod tests {
 
         let p = params(c);
         let w = GdnWeights::new(&fx.map(), 0, WIDTH, &p).unwrap();
-        let b = Builder::new();
+        let b = Builder::for_tests();
         let shape = crate::model::StepShape {
             rows: std::num::NonZeroUsize::new(2).unwrap(),
             ..step_shape(TOKENS, CAP, LogitRows::All)
         };
-        let step = Step::new(&b, shape);
-        let xs = b.constant("x", TensorType::f32(vec![2, TOKENS, WIDTH]));
-        let y = gdn(&b, &step, 0, xs, &w, &p);
+        let step = Step::new(&b, shape).unwrap();
+        let xs = b
+            .constant("x", TensorType::f32(vec![2, TOKENS, WIDTH]))
+            .unwrap();
+        let y = gdn(&b, &step, 0, xs, &w, &p).unwrap();
         let g = step.finish(b, y).unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()
@@ -984,5 +984,20 @@ mod tests {
             params(GGUF).with_chunk(6),
             Err(ParamError::new("gdn_chunk", ConfigReason::Unsupported))
         );
+    }
+
+    impl GdnParams {
+        /// The chunk length of the chunked recurrence, in place of the default 64: a power of two (the
+        /// UT-transform's triangular inverse doubles). A test shortens it to run several chunks over a
+        /// few tokens.
+        pub(crate) fn with_chunk(self, chunk: usize) -> Result<Self, ParamError> {
+            if chunk == 0 {
+                return Err(ParamError::new("gdn_chunk", ConfigReason::Zero));
+            }
+            if !chunk.is_power_of_two() {
+                return Err(ParamError::new("gdn_chunk", ConfigReason::Unsupported));
+            }
+            Ok(Self { chunk, ..self })
+        }
     }
 }

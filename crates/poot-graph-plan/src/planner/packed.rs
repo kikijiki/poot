@@ -1,7 +1,16 @@
 //! Packed block-float / dense reader equation planning: the dense contraction (BF16 and F32 weights), the
 //! packed BF16 and E4M3FN row gathers, and the i8 pack/unpack pair.
 
-use super::*;
+use super::{
+    BodyLimits, Capability, ContractionHead, ContractionSpec, DType, Eqn, ImportedKernel,
+    KernelRequest, MatmulShapes, OpKind, PlanError, Planned, ValueId, WeightLayout, kg, matmul,
+    value_ids,
+};
+use crate::planner::{GraphTables, finalize};
+use crate::predicates::{dense_decode_gemv_in, elementwise_fold};
+use crate::refusal::Site;
+use crate::storage_analysis::dense_contraction_weight_storage;
+use crate::types::{StorageKind, ValueStorage};
 use poot_target::{Backend, DeviceCaps};
 
 /// Plan one packed-reader equation (DenseContraction/DenseRowGather/PackI8/UnpackI8).
@@ -159,10 +168,10 @@ pub(super) fn plan(
         // one-thread-per-output grid (the wg-bump below still applies).
         //
         // AmdGcn is the ROCm typed packed walk's lane (card 450 ROCm): it uploads the same packed u32
-        // lanes through `poot_rocm_gpu::upload_typed_input`, so the very body runs there. Its receipt
+        // lanes through `poot_rocm_device::upload_typed_input`, so the very body runs there. Its receipt
         // is the DeepSeek-V4 decode CPU-oracle parity row, which walks this kernel on the iGPU.
         //
-        // Nvptx is the PTX typed packed walk's lane (card 450 PTX): `poot_ptx_gpu::upload_typed_input`
+        // Nvptx is the PTX typed packed walk's lane (card 450 PTX): `poot_ptx_device::upload_typed_input`
         // uploads the same packed u32 lanes, so the identical body and key run on NVPTX, with its
         // receipt in the DeepSeek-V4 decode CPU-oracle parity row on the PTX device.
         OpKind::DenseRowGather {

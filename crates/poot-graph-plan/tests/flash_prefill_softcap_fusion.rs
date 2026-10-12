@@ -33,7 +33,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-use poot_graph_plan::passes_without_target as optimize;
+use poot_graph_plan::passes_without_target;
 
 #[test]
 fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
@@ -57,17 +57,21 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
         .collect();
 
     // `materialized(softcap_opt)` traces the plain decomposition and evals it as traced (the CPU oracle).
-    // `autofused(softcap_opt)` runs the same decomposition through `optimize()` above, the pass pipeline
+    // `autofused(softcap_opt)` runs the same decomposition through `passes_without_target()` above, the pass pipeline
     // every real tracer goes through (fusion is always automatic, per AGENTS.md), exercising
     // `match_attention` on the softcap chain and the fused op's eval numerics end to end.
     let trace =
         |softcap_opt: Option<f32>| -> (poot_graph_ir::graph::Graph, HashMap<ValueId, Value>) {
-            let b = Builder::new();
-            let q = b.constant("q", TensorType::f32(vec![1, hq, l, d]));
-            let k = b.constant("k", TensorType::f32(vec![1, hkv, l, d]));
-            let v = b.constant("v", TensorType::f32(vec![1, hkv, l, d]));
-            let m = b.constant("m", TensorType::f32(vec![1, 1, l, l]));
-            let o = attention_prefill_softcap(&b, q, k, v, n_rep, scale, m, softcap_opt);
+            let b = Builder::for_tests();
+            let q = b.constant("q", TensorType::f32(vec![1, hq, l, d])).unwrap();
+            let k = b
+                .constant("k", TensorType::f32(vec![1, hkv, l, d]))
+                .unwrap();
+            let v = b
+                .constant("v", TensorType::f32(vec![1, hkv, l, d]))
+                .unwrap();
+            let m = b.constant("m", TensorType::f32(vec![1, 1, l, l])).unwrap();
+            let o = attention_prefill_softcap(&b, q, k, v, n_rep, scale, m, softcap_opt).unwrap();
             let g = b.finish(o).unwrap();
             let mut inp = HashMap::new();
             inp.insert(
@@ -98,7 +102,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
     };
     let autofused = |softcap_opt: Option<f32>| -> HostTensor {
         let (g, inp) = trace(softcap_opt);
-        let opt = optimize(&g).unwrap();
+        let opt = passes_without_target(&g).unwrap();
         // Structural check that fusion fired: exactly one flash-prefill op, carrying the same softcap passed in.
         let flash_ops: Vec<&poot_graph_ir::op::OpKind> = opt
             .eqns()
@@ -109,7 +113,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
         assert_eq!(
             flash_ops.len(),
             1,
-            "expected optimize().unwrap() to fuse this attention_prefill_softcap chain into exactly one flash op"
+            "expected passes_without_target().unwrap() to fuse this attention_prefill_softcap chain into exactly one flash op"
         );
         let got_softcap = match flash_ops[0] {
             poot_graph_ir::op::OpKind::Attention(attrs) => attrs.softcap,

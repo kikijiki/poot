@@ -1,4 +1,7 @@
 use super::*;
+use crate::multimodal::qwen_vl_image::assembly::qwen25_vl_combined_video_layout;
+use crate::multimodal::qwen_vl_image::preprocess::Qwen25VlTemporalLayoutError;
+use crate::multimodal::qwen_vl_image::preprocess::qwen25_vl_temporal_layout;
 use poot_tensor::DType;
 
 #[test]
