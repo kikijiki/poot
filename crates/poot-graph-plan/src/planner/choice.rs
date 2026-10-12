@@ -308,15 +308,15 @@ impl Planned {
     }
 
     /// One dispatch of a split plan that runs a shipped template; `meta` is its metadata, and the grid is
-    /// `groups` workgroups of the template's own workgroup size.
+    /// `groups[0]` workgroups of the template's own workgroup size along X and `groups[1]` along Y.
     pub(crate) fn imported_split_dispatch(
         kernel: ImportedKernel,
         backend: Backend,
         meta: Vec<u32>,
-        groups: usize,
+        groups: [usize; 2],
     ) -> PlannedDispatch {
         let [x, y, z] = kernel.body().workgroup_size;
-        let grid = [groups as u32 * x, y, z];
+        let grid = [groups[0] as u32 * x, groups[1] as u32 * y, z];
         Self::imported_dispatch(kernel, backend, Some(meta), grid, None)
     }
 

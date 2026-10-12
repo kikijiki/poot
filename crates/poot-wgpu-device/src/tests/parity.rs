@@ -311,3 +311,27 @@ fn split_kv_decode_replay_equals_the_recording_step_on_wgpu() {
     )
     .unwrap_or_else(|e| panic!("{e}"));
 }
+
+/// POOT-1146: the greedy `SampleToken` pick is exact on wgpu: over `[rows, vocab]` logits at a vocabulary that
+/// leaves a partial last chunk, a single chunk and the production width, the pair `(token, non_finite_index)`
+/// of every row equals the one the contract defines (lowest index among equal maxima across chunk and
+/// workgroup seams, signed zeros equal, any non-finite value forces token 0 and names its lowest index), at
+/// the recording step and the replay.
+/// Mutations (each with a fresh `POOT_KERNEL_CACHE_DIR`; a kernel edit needs
+/// `cargo test -p pootc --test import_run regen_kernel_assets -- --ignored` to regenerate
+/// `argmax_chunk.kir.json` / `argmax_combine.kir.json`, which the planner embeds): in
+/// `pootc/kernels/sampling/argmax_combine.rs` break ties to the larger index (`ci < best_idx` to
+/// `ci > best_idx` in the lane loop and `ci < bi` to `ci > bi` in the lane-0 fold); the tie rows go red.
+/// In `argmax_chunk.rs` drop the `bad_idx` update of the non-finite branch; the non-finite rows go red.
+/// In `planner/sampling.rs` plan `groups = vocab / ARGMAX_CHUNK` (dropping the partial last chunk); the
+/// rows whose maximum sits in the last chunk go red.
+#[test]
+fn greedy_sample_token_is_exact_on_wgpu() {
+    let Ok(device) = WgpuDevice::new() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    poot_executor_parity::sample_token::assert_greedy_pick_is_exact(exec.as_mut(), t);
+}

@@ -66,7 +66,8 @@ the active backend.
 Examples of ops handled by imported kernels:
 
 - Decode `MatMul` over an f32 `[K, N]` weight -> `gemv_coalesced.rs`, `gemv_batched_coalesced.rs`
-- Greedy and batched samplers -> `argmax_batched.rs`, `sample_*_gumbel_argmax_batched.rs`
+- Greedy (two stages) and batched samplers -> `argmax_chunk.rs`, `argmax_combine.rs`,
+  `sample_*_gumbel_argmax_batched.rs`
 - Packed row gathers -> `packed_bf16_row_gather.rs`, `packed_e4m3_row_gather.rs`
 
 Sources live under `crates/pootc/kernels/<family>/` (one subdirectory per family: contraction,

@@ -23,9 +23,13 @@ export POOT_MODEL_FREE_ACTIVE=$mode
 
 # The model-free gate covers every workspace member. `gate_policy` is the only place a package is placed in
 # or out of it, and `check` fails when a workspace member is missing from it or a row names a package that is
-# gone. Fields: package | policy | reason (excluded policy only).
+# gone. Fields: package | policy | reason (excluded and isolated policies only).
 #
 #   host      every active test needs no model and no device, so the inventory derives its class: model-free.
+#   isolated  every active test needs no model and no device, so the class is derived (model-free) as for `host`,
+#             but the package's dependencies turn on a feature (poot-bench-runner enables poot-llm/rocm) that
+#             must not unify into the default lane's builds: its tests are discovered and run in their own cargo
+#             invocation (`run-isolated`, `just test-bench-runner`). It is bin-only and has no real-dims lane.
 #   reviewed  the package holds tests that need a device or a checkpoint next to host-only ones, so each test's
 #             class is chosen by hand in the inventory and a new test has no default class: model-free; checkpoint
 #             (loads a model, runs in `just test-optional`); or device (dispatches, and `just test-lane-coverage`
@@ -33,9 +37,8 @@ export POOT_MODEL_FREE_ACTIVE=$mode
 #             every device required and hidden, so a device test classed model-free fails the lane (see
 #             `lane_environment`).
 #   excluded  not in the default lane, for the reason given: the package's tests dispatch on a device and run
-#             in the `just test-device-*` lanes, or its dependencies change feature unification and it runs in its
-#             own invocation (`run-isolated`). `just test-lane-coverage` requires every test of an excluded package
-#             to match a lane selection.
+#             in the `just test-device-*` lanes. `just test-lane-coverage` requires every test of an excluded
+#             package to match a lane selection.
 #
 # `real_dims_pattern` is a naming contract, not detection: a test that builds real model dimensions is named
 # `*_real_dims`, and a test so named is class real-dims, never model-free; it runs in the release-profile lane
@@ -45,7 +48,7 @@ export POOT_MODEL_FREE_ACTIVE=$mode
 readonly test_targets=(--lib --bins --tests)
 
 readonly gate_policy=(
-  "poot-bench-runner|excluded|host-only tests, run by just test-bench-runner: it enables poot-llm rocm, which would unify into the lane builds"
+  "poot-bench-runner|isolated|host-only tests, run by just test-bench-runner: it enables poot-llm rocm, which would unify into the lane builds"
   "poot-codegen|host|"
   "poot-eval|host|"
   "poot-executor|host|"
@@ -97,8 +100,17 @@ for row in "${gate_policy[@]}"; do
   printf '%s\t%s\t%s\n' "$package" "$policy" "$reason"
 done | LC_ALL=C sort >"$policy_table"
 
-lane_packages() {
+# Every package that has inventory rows, and the subset the default lane builds and runs in one invocation.
+inventoried_packages() {
   awk -F '\t' '$2 != "excluded" { print $1 }' "$policy_table"
+}
+
+lane_packages() {
+  awk -F '\t' '$2 != "excluded" && $2 != "isolated" { print $1 }' "$policy_table"
+}
+
+isolated_package_args() {
+  awk -F '\t' '$2 == "isolated" { printf "%s\0%s\0", "-p", $1 }' "$policy_table"
 }
 
 lane_package_args() {
@@ -134,18 +146,26 @@ discover_tests() {
   while IFS= read -r -d '' arg; do
     package_args+=("$arg")
   done < <(lane_package_args)
+  local isolated_json="$tmp_dir/list-isolated.json"
+  local -a isolated_args=()
+  while IFS= read -r -d '' arg; do
+    isolated_args+=("$arg")
+  done < <(isolated_package_args)
   cargo nextest list "${test_targets[@]}" "${package_args[@]}" --message-format json >"$json"
+  # An isolated package is listed in its own invocation (bin-only, so no `--lib`): listing it with the lane's
+  # packages would unify its features into them.
+  cargo nextest list --bins "${isolated_args[@]}" --message-format json >"$isolated_json"
   jq -r '
     .["rust-suites"] | to_entries[]
     | [.value["package-name"], .key] | @tsv
-  ' "$json" | LC_ALL=C sort -u >"$discovered_targets"
+  ' "$json" "$isolated_json" | LC_ALL=C sort -u >"$discovered_targets"
   jq -r '
     .["rust-suites"] | to_entries[]
     | .value["package-name"] as $package | .key as $target
     | .value.testcases | to_entries[]
     | [$package, $target, (if .value.ignored then "ignored" else "active" end), .key]
     | @tsv
-  ' "$json" | LC_ALL=C sort >"$discovered_inventory"
+  ' "$json" "$isolated_json" | LC_ALL=C sort >"$discovered_inventory"
 }
 
 # The inventory the test binaries and the policy imply. A `reviewed` package keeps the class already in
@@ -170,7 +190,7 @@ derive_inventory() {
       {
         key = $1 "\t" $2 "\t" $4
         if ($4 ~ real_dims) class = "real-dims"
-        else if (policy[$1] == "host") class = "model-free"
+        else if (policy[$1] == "host" || policy[$1] == "isolated") class = "model-free"
         else if (key in kept) class = kept[key]
         else class = "unclassified"
         print $1, $2, class, $4
@@ -196,6 +216,7 @@ validate_inventory() {
       close(targets)
       while ((getline line < policy_file) > 0) {
         split(line, f, "\t")
+        policy[f[1]] = f[2]
         if (f[2] != "excluded") allowed_package[f[1]] = 1
       }
     }
@@ -218,6 +239,10 @@ validate_inventory() {
       }
       if ($3 != "model-free" && $3 != "checkpoint" && $3 != "device" && $3 != "real-dims") {
         print "inventory class mismatch at line " NR ": " $3 " for " $1 "\t" $2 "\t" $4
+        bad = 1
+      }
+      if ($3 == "real-dims" && policy[$1] == "isolated") {
+        print "inventory real-dims mismatch at line " NR ": " $1 " is isolated and has no real-dims lane: " $4
         bad = 1
       }
       if ($4 == "" || $4 !~ /^[A-Za-z0-9_:.-]+$/) {
@@ -325,7 +350,7 @@ print_summary() {
     ignored=$(awk -F '\t' -v p="$package" '$1 == p && $3 == "ignored" { n++ } END { print n + 0 }' "$discovered_inventory")
     targets=$(tail -n +2 "$inventory" | awk -F '\t' -v p="$package" '$1 == p { print $2 }' | LC_ALL=C sort -u | wc -l)
     echo "model-free inventory: $package: $free selected, $optional checkpoint/device optional, $slow real-dims, $ignored ignored, $targets targets"
-  done < <(lane_packages)
+  done < <(inventoried_packages)
   awk -F '\t' '$2 == "excluded" { print "model-free inventory: " $1 ": excluded (" $3 ")" }' "$policy_table"
 }
 
@@ -404,16 +429,25 @@ run_real_dims() {
   cargo nextest run --no-tests=fail --no-fail-fast "${test_targets[@]}" "${package_args[@]}" -E "$selected" "$@"
 }
 
-# The tests of an `excluded` package that is host-only, in the lane's environment but its own cargo invocation: the
-# package's dependencies turn on a feature (poot-bench-runner enables poot-llm/rocm) that must not unify into the
-# lane's builds. The package must be one `gate_policy` excludes. The package is bin-only (`--lib` is an error for it), so this selects `--bins`.
+# The tests of an `isolated` package, in the lane's environment but its own cargo invocation: the package's
+# dependencies turn on a feature (poot-bench-runner enables poot-llm/rocm) that must not unify into the lane's
+# builds. The inventory is complete (`check` ran first), so the run is its model-free rows, and a run that selects
+# no test fails. The package is bin-only (`--lib` is an error for it), so this selects `--bins`.
 run_isolated() {
-  local package=$1
-  awk -F '\t' -v p="$package" '$1 == p && $2 == "excluded" { found = 1 } END { exit !found }' "$policy_table" || {
-    echo "$package is not an excluded package in gate_policy" >&2
+  local inventory=$1
+  local package=$2
+  awk -F '\t' -v p="$package" '$1 == p && $2 == "isolated" { found = 1 } END { exit !found }' "$policy_table" || {
+    echo "$package is not an isolated package in gate_policy" >&2
     return 1
   }
-  lane_environment cargo nextest run --no-tests=fail --no-fail-fast --bins -p "$package"
+  local selected
+  selected=$(awk -F '\t' -v p="$package" '
+    NR > 1 && $1 == p && $3 == "model-free" {
+      printf "%s(binary_id(=%s) & test(=%s))", sep, $2, $4
+      sep = " | "
+    }
+  ' "$inventory")
+  lane_environment cargo nextest run --no-tests=fail --no-fail-fast --bins -p "$package" -E "${selected:-none()}"
 }
 
 expect_mutation_failure() {
@@ -444,7 +478,7 @@ sorted_with_header() {
 }
 
 run_self_test() {
-  local host_row real_dims_row second
+  local host_row real_dims_row isolated_row second
   host_row=$(awk -F '\t' -v policy_file="$policy_table" '
     BEGIN {
       while ((getline line < policy_file) > 0) { split(line, f, "\t"); policy[f[1]] = f[2] }
@@ -452,11 +486,18 @@ run_self_test() {
     NR > 1 && $3 == "model-free" && policy[$1] == "host" { print; exit }
   ' "$checked_inventory")
   real_dims_row=$(awk -F '\t' 'NR > 1 && $3 == "real-dims" { print; exit }' "$checked_inventory")
+  isolated_row=$(awk -F '\t' -v policy_file="$policy_table" '
+    BEGIN {
+      while ((getline line < policy_file) > 0) { split(line, f, "\t"); policy[f[1]] = f[2] }
+    }
+    NR > 1 && $3 == "model-free" && policy[$1] == "isolated" { print; exit }
+  ' "$checked_inventory")
   second=$(sed -n '3p' "$checked_inventory")
   local host_test=${host_row##*$'\t'}
   local real_dims_test=${real_dims_row##*$'\t'}
-  if [[ -z "$host_row" || -z "$real_dims_row" ]]; then
-    echo "self-test needs a host and a real-dims row in $checked_inventory" >&2
+  local isolated_test=${isolated_row##*$'\t'}
+  if [[ -z "$host_row" || -z "$real_dims_row" || -z "$isolated_row" ]]; then
+    echo "self-test needs a host, an isolated and a real-dims row in $checked_inventory" >&2
     return 1
   fi
 
@@ -464,6 +505,7 @@ run_self_test() {
   local remove="$tmp_dir/mutation-remove.tsv"
   local duplicate="$tmp_dir/mutation-duplicate.tsv"
   local rename="$tmp_dir/mutation-rename.tsv"
+  local remove_isolated="$tmp_dir/mutation-remove-isolated.tsv"
   local reclassify_host="$tmp_dir/mutation-reclassify-host.tsv"
   local real_dims_as_model_free="$tmp_dir/mutation-real-dims.tsv"
   local reorder="$tmp_dir/mutation-reorder.tsv"
@@ -473,6 +515,7 @@ run_self_test() {
 
   { cat "$checked_inventory"; printf 'poot-load\tpoot-load\tmodel-free\tmutation_added_test\n'; } | sorted_with_header >"$add"
   awk -v drop="$host_row" 'NR == 1 || $0 != drop' "$checked_inventory" >"$remove"
+  awk -v drop="$isolated_row" 'NR == 1 || $0 != drop' "$checked_inventory" >"$remove_isolated"
   { cat "$checked_inventory"; printf '%s\n' "$host_row"; } | sorted_with_header >"$duplicate"
   sed "s/${host_test}/${host_test}_renamed/" "$checked_inventory" | sorted_with_header >"$rename"
   awk -F '\t' -v OFS='\t' -v row="$host_row" '$0 == row { $3 = "device" } { print }' "$checked_inventory" \
@@ -487,6 +530,7 @@ run_self_test() {
   done <<EOF
 add|mutation_added_test|$add
 remove|$host_test|$remove
+remove an isolated package's row|$isolated_test|$remove_isolated
 duplicate|$host_test|$duplicate
 rename|${host_test}_renamed|$rename
 reclassify a derived class|$host_test|$reclassify_host
@@ -622,5 +666,5 @@ elif [[ "$mode" == "run" ]]; then
 elif [[ "$mode" == "run-real-dims" ]]; then
   run_real_dims "$checked_inventory" "$@"
 elif [[ "$mode" == "run-isolated" ]]; then
-  run_isolated "$1"
+  run_isolated "$checked_inventory" "$1"
 fi

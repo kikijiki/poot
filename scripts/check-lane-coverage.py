@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Fail when a test runs in no lane (card 1058).
 
-`just test-lane-coverage` passes the union of the lane selections defined in the justfile (the device lanes'
-nextest filtersets and the isolated package) as arguments. This gate asks nextest for the whole workspace's
-active tests with that union as the filter, so nextest itself decides which tests a selection matches, and
+`just test-lane-coverage` passes the union of the device lane selections defined in the justfile as
+arguments. This gate asks nextest for the whole workspace's active tests with that union as the filter, so
+nextest itself decides which tests a selection matches, and
 classes every test that matches nothing:
 
   model-free, real-dims   run by the model-free lane (`just test`); not this gate's concern
   checkpoint              loads a model, so it runs in `just test-optional`; never a hardware test
   device                  dispatches on a device: it MUST match a lane selection
   not in the inventory    a test of a package the model-free lane excludes (poot-wgpu-device, poot-rocm-device, poot-npu,
-                          poot-vulkan-device, poot-bench-runner), or one that exists only under a feature
+                          poot-vulkan-device), or one that exists only under a feature
                           (poot-llm/rocm): it MUST match a lane selection
 
 The classes are scripts/test-model-free-inventory.tsv's. An ignored test is not an active one and is never

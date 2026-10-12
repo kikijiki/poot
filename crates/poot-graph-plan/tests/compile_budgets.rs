@@ -10,15 +10,15 @@ use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, RedOp, TensorType, UnOp};
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{
-    Capability, CompileError, CompileLimits, CompileOptions, DecomposeError, ExpansionError,
-    GraphResource, KernelChoice, PlanError, Target, compile, decompose_large_vocab_greedy,
-    plan_eqn_choice, production_plan::Submission,
+    Capability, CompileError, CompileLimits, CompileOptions, ExpansionError, GraphResource,
+    KernelChoice, LegalizeError, PlanError, Target, compile, legalize, plan_eqn_choice,
+    production_plan::Submission,
 };
 use poot_kernelgen::{BodyLimits, BodyResource, BodyStage, KernelGenError, KernelRequest};
 use poot_target::Backend;
 use poot_test_util::device_caps::default_caps_for;
 
-const DECOMPOSE: &str = "decompose_large_vocab_greedy";
+const LEGALIZE: &str = "legalize";
 
 fn wgpu() -> Target {
     Target::Gpu {
@@ -56,13 +56,15 @@ fn body_limits(instructions: usize, locals: usize) -> CompileLimits {
 fn expansion(result: Result<impl std::fmt::Debug, CompileError>, what: &str) -> ExpansionError {
     match result {
         Err(CompileError::Expansion(error)) => *error,
+        Err(CompileError::Legalize(error)) => match *error {
+            LegalizeError::Expansion(error) => error,
+            other => panic!("{what}: expected an expansion refusal, got {other:?}"),
+        },
         other => panic!("{what}: expected a typed expansion refusal, got {other:?}"),
     }
 }
 
-/// `argmax` over one `[vocab]` row: above the decomposition threshold it expands into a chunked
-/// two-stage reduction of about thirty equations, which is the transform fixture the limits are read
-/// against.
+/// `argmax` over one `[vocab]` row: a one-equation graph.
 fn greedy_over(vocab: usize) -> Graph {
     let b = Builder::for_tests();
     let logits = b.constant("logits", TensorType::f32(vec![vocab])).unwrap();
@@ -72,10 +74,29 @@ fn greedy_over(vocab: usize) -> Graph {
     b.finish(out).unwrap()
 }
 
-/// SC-001 (transform expansion): with `max_intermediate_eqns = 8` the decomposition is refused when it
-/// would append its ninth equation: the pass reports 8 held, 9 attempted, and `compile` publishes no
-/// program. The cap is the same one at the exact fit and one under it: the full expansion of this
-/// fixture is accepted at its own length and refused at one less, at the equation it cannot append.
+/// The single-buffer limit of [`oversized_weight`]'s target, in bytes: an eighth of the `[16, 4]` F32 weight.
+const BUFFER_LIMIT_BYTES: u64 = 32;
+
+/// `x[1, 4] @ transpose(w[16, 4])` for a target whose single-buffer limit is an eighth of `w`: `legalize`
+/// splits the weight into eight row chunks (a chunk constant, a transpose and a matmul each) joined by a
+/// `Concat`. This is the transform fixture the expansion limits are read against: a rewrite that appends
+/// equations and values one at a time.
+fn oversized_weight() -> (Graph, Target) {
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![1, 4])).unwrap();
+    let w = b.constant("w", TensorType::f32(vec![16, 4])).unwrap();
+    let out = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
+    let Target::Gpu { backend, mut caps } = wgpu() else {
+        unreachable!("wgpu() is a GPU target")
+    };
+    caps.max_buffer_bytes = BUFFER_LIMIT_BYTES;
+    (b.finish(out).unwrap(), Target::Gpu { backend, caps })
+}
+
+/// SC-001 (transform expansion): with `max_intermediate_eqns = 8` the split is refused when it would
+/// append its ninth equation: the pass reports 8 held, 9 attempted, and `compile` publishes no program.
+/// The cap is the same one at the exact fit and one under it: the full expansion of this fixture is
+/// accepted at its own length and refused at one less, at the equation it cannot append.
 ///
 /// Mutation: check after the push instead of before (`GraphBudget::push_eqn` pushes, then compares);
 /// the refusal then reports 9 held, and the held assertions fail. Mutation: drop the reservation
@@ -83,16 +104,17 @@ fn greedy_over(vocab: usize) -> Graph {
 /// of the ninth equation.
 #[test]
 fn a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it() {
-    let g = greedy_over(3000);
+    let (g, target) = oversized_weight();
+    let caps = gpu_caps(&target);
 
     let refusal = expansion(
-        compile(&g, &wgpu(), &options(graph_limits(1 << 20, 8))),
+        compile(&g, &target, &options(graph_limits(1 << 20, 8))),
         "compile",
     );
     assert_eq!(
         refusal,
         ExpansionError {
-            stage: DECOMPOSE,
+            stage: LEGALIZE,
             resource: GraphResource::Eqns,
             held: 8,
             attempted: 9,
@@ -101,20 +123,21 @@ fn a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it
         "the ninth equation is never appended"
     );
 
-    let whole = decompose_large_vocab_greedy(&g, &CompileLimits::STANDARD).unwrap();
-    let n = whole.eqns().len();
+    let whole = legalize(&g, &caps, &CompileLimits::STANDARD).unwrap();
+    // The pass appends the original transpose too; dead-code elimination drops it from the result.
+    let n = whole.eqns().len() + 1;
     assert!(n > 9, "the fixture expands past the card's limit: {n}");
-    let fits = decompose_large_vocab_greedy(&g, &graph_limits(1 << 20, n)).unwrap();
+    let fits = legalize(&g, &caps, &graph_limits(1 << 20, n)).unwrap();
     assert_eq!(
         fits.eqns().len(),
-        n,
+        n - 1,
         "a cap equal to the expansion admits it"
     );
     assert!(
         matches!(
-            decompose_large_vocab_greedy(&g, &graph_limits(1 << 20, n - 1)).unwrap_err(),
-            DecomposeError::Expansion(error) if error == ExpansionError {
-                stage: DECOMPOSE,
+            legalize(&g, &caps, &graph_limits(1 << 20, n - 1)).unwrap_err(),
+            LegalizeError::Expansion(error) if error == ExpansionError {
+                stage: LEGALIZE,
                 resource: GraphResource::Eqns,
                 held: n - 1,
                 attempted: n,
@@ -123,7 +146,7 @@ fn a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it
         ),
         "the cap one short of the expansion refuses it, naming the equation count"
     );
-    compile(&g, &wgpu(), &options(CompileLimits::STANDARD))
+    compile(&g, &target, &options(CompileLimits::STANDARD))
         .expect("the production limits compile it");
 }
 
@@ -131,17 +154,18 @@ fn a_transform_that_would_append_a_ninth_equation_is_refused_before_appending_it
 /// caps in `GraphBudget::limit`; the resource and held assertions name the wrong resource.
 #[test]
 fn the_value_table_is_capped_independently_of_the_equation_list() {
-    let g = greedy_over(3000);
+    let (g, target) = oversized_weight();
+    let held = g.values().len();
     let refusal = expansion(
-        compile(&g, &wgpu(), &options(graph_limits(6, 1 << 20))),
+        compile(&g, &target, &options(graph_limits(held, 1 << 20))),
         "compile",
     );
     assert_eq!(refusal.resource, GraphResource::Values);
-    assert_eq!(refusal.stage, DECOMPOSE);
+    assert_eq!(refusal.stage, LEGALIZE);
     assert_eq!(
         (refusal.held, refusal.attempted, refusal.limit),
-        (6, 7, 6),
-        "the seventh value is never appended"
+        (held, held + 1, held),
+        "the first value past the cap is never appended"
     );
 }
 

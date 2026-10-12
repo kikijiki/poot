@@ -45,9 +45,7 @@ use poot_graph_ir::{
 use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps, Queried, TargetId};
 use poot_tensor::DType;
 
-use crate::passes::{
-    self as transform, DecomposeError, GraphBudget, LegalizeError, PackedDequantProductionError,
-};
+use crate::passes::{self as transform, GraphBudget, LegalizeError, PackedDequantProductionError};
 pub use crate::passes::{LoraError, LoraPlan};
 use crate::{
     BufferPlan, KernelChoice, Plan, PlanError, Refusal, compute_views, device_validation, planner,
@@ -437,15 +435,6 @@ impl From<EditError> for CompileError {
     }
 }
 
-impl From<DecomposeError> for CompileError {
-    fn from(error: DecomposeError) -> Self {
-        match error {
-            DecomposeError::Expansion(error) => error.into(),
-            DecomposeError::Edit(error) => (*error).into(),
-        }
-    }
-}
-
 impl From<CastRangeError> for CompileError {
     fn from(error: CastRangeError) -> Self {
         CompileError::CastRange(Box::new(error))
@@ -753,15 +742,6 @@ pub fn compile(
     // witness is refused with the planner's typed `PlanError::ValidationWitnessNotCanonical`, naming
     // the witness, before any executor allocates.
     device_validation::admit_device_witnesses(pipeline.graph())?;
-    // Card 551a (SC-009): a graph decomposition, not a new Plan variant or executor mechanism
-    // (ADR 0100/0112) - rewrites `SampleToken{Greedy}` over a large vocab into a chunked two-stage
-    // reduction (parallel per-chunk workgroups instead of one workgroup's long serial scan). Runs
-    // before `fuse` so the elementwise chains it introduces (the padding, the masking, the chunk
-    // combine) fold into as few dispatches as `fuse`'s own patterns allow, the same reason
-    // `rope_fusion` precedes it.
-    pipeline.try_run("decompose_large_vocab_greedy", |g| {
-        transform::decompose_large_vocab_greedy(g, &options.limits)
-    })?;
     // The contraction epilogue rule runs on the typed, dtype-prepared graph, right before `fuse` would claim
     // the same pointwise chains for a standalone region: a head fuses only where the planner's generated
     // lowering carries an epilogue (`epilogue_head_lowers`), so no head trades a faster schedule for it. Like

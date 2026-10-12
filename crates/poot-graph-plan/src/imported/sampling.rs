@@ -1,18 +1,26 @@
 //! On-device sampler imported kernels (card 551a, R472-007; card 447's original consolidation, deleted
 //! with the old wgpu cached decode by card 546b and recreated on the contract path): one workgroup of 64
-//! lanes per row for the four `SampleToken` bodies (shape-generic over `[rows, vocab]`, `dims =
-//! [vocab]`), one thread per output element for `RandomUniform` (shape-generic over `[rows, cols]`,
-//! `dims = [cols]`). Authored in Rust (`pootc/kernels/sampling/*.rs`); `poot-wgpu-device` lowers each to SPIR-V,
+//! lanes per row for the three stochastic `SampleToken` bodies (shape-generic over `[rows, vocab]`, `dims =
+//! [vocab]`), the greedy pick as two stages (`ArgmaxChunk` reduces each chunk of a row in its own
+//! workgroup into a partial, `ArgmaxCombine` reduces a row's partials; POOT-1146), one thread per output
+//! element for `RandomUniform` (shape-generic over `[rows, cols]`, `dims = [cols]`). Authored in Rust (`pootc/kernels/sampling/*.rs`); `poot-wgpu-device` lowers each to SPIR-V,
 //! `poot-ptx-device` to NVPTX and `poot-rocm-device` to AMDGCN, so there is one kernel definition and one copy
 //! of each asset. See `planner::sampling` for their metadata-launch lowering.
 
 kernel_assets! {
     family = body_sampling;
 
-    ArgmaxBatched {
-        name: "argmax_batched",
-        source: "argmax_batched",
-        entry: "__poot_kernel_argmax_batched",
+    ArgmaxChunk {
+        name: "argmax_chunk",
+        source: "argmax_chunk",
+        entry: "__poot_kernel_argmax_chunk",
+        params: 3,
+        dest: GraphPlan,
+    },
+    ArgmaxCombine {
+        name: "argmax_combine",
+        source: "argmax_combine",
+        entry: "__poot_kernel_argmax_combine",
         params: 3,
         dest: GraphPlan,
     },

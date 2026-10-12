@@ -100,7 +100,7 @@ fn run_steps(
 
     let scan = step.packed_slot_graph();
     let oracle = step.packed_graph();
-    let (exe, entry) = load_entry(exec, target, &scan, label);
+    let (exe, entry) = load_graph_entry(exec, target, &scan.graph, label);
 
     let layout_rows = step.len + step.state_rows_of();
     let mut oracle_state = inputs.operands.last().unwrap().clone();
@@ -135,20 +135,19 @@ fn run_steps(
     results
 }
 
-/// Load an executable with no weights and one entry for `scan` compiled for `target`.
-fn load_entry(
+/// Load an executable with no weights and one entry for `graph` compiled for `target`. A fixture graph
+/// built here binds no weights: its operands are activation slots and carried state.
+pub(crate) fn load_graph_entry(
     exec: &mut dyn Executor,
     target: Target,
-    scan: &ScanGraph,
+    graph: &Graph,
     label: &str,
 ) -> (poot_executor::ExecutableId, poot_executor::EntryId) {
-    let graph = scan.graph.clone();
-    // The scan graph binds no weights: its operands are activation slots and the carried state.
     let store = WeightStore::builder().build();
     let map = WeightMap::builder(&store).build();
     let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
     let staged = compile_staged(
-        &graph,
+        graph,
         &TargetSet::single(DeviceId(0), target),
         &Partition {
             experts: ExpertPlacement::AllResident,
@@ -156,7 +155,7 @@ fn load_entry(
         },
         &OPTIONS,
     )
-    .unwrap_or_else(|e| panic!("{label}: the scan compiles: {e}"));
+    .unwrap_or_else(|e| panic!("{label}: the graph compiles: {e}"));
     let entry = exec.add_entry(exe, &staged).unwrap();
     (exe, entry)
 }
@@ -199,7 +198,7 @@ pub fn timed_step(
     fixture: &ScanFixture,
 ) -> (DeviceTime, Vec<f32>) {
     let scan = fixture.packed_slot_graph();
-    let (exe, entry) = load_entry(exec, target, &scan, "device time");
+    let (exe, entry) = load_graph_entry(exec, target, &scan.graph, "device time");
     let bound = fixture.bind(&scan, &fixture.inputs(7));
     let mut step_inputs = StepInputs::new();
     for &id in &scan.operands[..scan.operands.len() - 1] {
@@ -232,7 +231,7 @@ pub fn measure(
     runs: usize,
 ) -> StepTime {
     let scan = fixture.packed_slot_graph();
-    let (exe, entry) = load_entry(exec, target, &scan, "measure");
+    let (exe, entry) = load_graph_entry(exec, target, &scan.graph, "measure");
     let inputs = fixture.inputs(7);
     let bound = fixture.bind(&scan, &inputs);
     let mut samples = Vec::new();

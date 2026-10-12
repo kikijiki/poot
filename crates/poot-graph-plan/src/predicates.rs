@@ -721,7 +721,7 @@ pub(crate) fn tiled_gemm_plan(
                 kernel,
                 backend,
                 vec![mrows as u32, kk as u32, nn as u32, offset as u32],
-                (groups - offset).min(chunk),
+                [(groups - offset).min(chunk), 1],
             )
         })
         .collect();

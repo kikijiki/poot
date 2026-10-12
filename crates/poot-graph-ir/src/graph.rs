@@ -160,12 +160,6 @@ impl<T> ValueTable<T> {
         self.entries.truncate(len);
     }
 
-    /// Remove the newest entry and return it with the id it was addressed by.
-    pub fn pop_last(&mut self) -> Option<(ValueId, T)> {
-        let entry = self.entries.pop()?;
-        Some((ValueId(self.entries.len() as u32), entry))
-    }
-
     pub fn try_reserve(
         &mut self,
         additional: usize,

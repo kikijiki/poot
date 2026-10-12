@@ -186,16 +186,6 @@ fn produces_legalize_ops(op: &OpKind) -> bool {
     matches!(op, OpKind::MatMul | OpKind::Concat { .. })
 }
 
-/// `decompose_large_vocab_greedy`'s (`poot-graph-plan`) rewrite shapes: the chunked two-stage
-/// `SampleToken` reduction and the ops its own tests gate on - see that pass's own
-/// `produces_decompose_large_vocab_greedy_ops` doc for why only these four are listed.
-fn produces_decompose_large_vocab_greedy_ops(op: &OpKind) -> bool {
-    matches!(
-        op,
-        OpKind::SampleToken { .. } | OpKind::Reduce { .. } | OpKind::Binary(_) | OpKind::Unary(_)
-    )
-}
-
 /// An arithmetic rewrite withheld because the graph supplies no exact numerical proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumericalRewriteReason {
@@ -329,13 +319,6 @@ pub const PASS_DECLARATIONS: &[PassDeclaration] = &[
         pass: "legalize",
         property: NumericsProperty::Unfused,
         produces: produces_legalize_ops,
-    },
-    // Card 551a (SC-009): `compile`-specific, like `legalize`; `compile` runs it between
-    // `admit_device_witnesses` and `fuse`.
-    PassDeclaration {
-        pass: "decompose_large_vocab_greedy",
-        property: NumericsProperty::Unfused,
-        produces: produces_decompose_large_vocab_greedy_ops,
     },
 ];
 

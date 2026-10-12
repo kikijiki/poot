@@ -55,7 +55,8 @@ test-model-free: dead-pub machete docs-paths aie-link-driver crates-stale-names 
     scripts/test-model-free.sh run
 
 # The bench runner's host tests, which the model-free lane cannot carry (its dependency on poot-llm turns the rocm
-# feature on for every poot-llm build in the same invocation). Devices and checkpoints are hidden and required
+# feature on for every poot-llm build in the same invocation). They are rows of the model-free inventory like any
+# other, so a removed or unlisted test fails the inventory check. Devices and checkpoints are hidden and required
 # here exactly as in that lane. The script's POOT_MODEL_FREE_ACTIVE re-entry guard stops a recipe that
 # re-enters itself.
 test-bench-runner:
@@ -67,7 +68,7 @@ test-bench-runner:
 # gate exists to close (card 1058: 155 of 239 poot-wgpu-device tests once ran nowhere).
 test-lane-coverage:
     scripts/check-lane-coverage.py --self-test
-    scripts/check-lane-coverage.py '{{wgpu_selection}}' '{{vulkan_selection}}' '{{rocm_selection}}' '{{ptx_selection}}' '{{ptx_multi_device_selection}}' '{{kernels_selection}}' '{{npu_selection}}' 'package({{isolated_package}})'
+    scripts/check-lane-coverage.py '{{wgpu_selection}}' '{{vulkan_selection}}' '{{rocm_selection}}' '{{ptx_selection}}' '{{ptx_multi_device_selection}}' '{{kernels_selection}}' '{{npu_selection}}'
 
 # The add-a-model standing test (ADR-0104 rule 3), host half: a family defined inside the test (a config type, a
 # checkpoint-name table, a tracer over `standard_stack` and `standard_layer`) registers through the public
@@ -174,7 +175,7 @@ kernels_selection := 'package(pootc) | package(poot-kernelgen)'
 npu_selection := 'package(poot-npu)'
 
 # poot-bench-runner builds poot-llm with the rocm feature, which cannot unify into the model-free lane, so
-# its host tests run in `test-bench-runner`.
+# its host tests (inventory rows of the `isolated` policy, class model-free) run in `test-bench-runner`.
 isolated_package := 'poot-bench-runner'
 
 # Required small-device lanes. Each runs through scripts/with-required-backend.sh, which clears every

@@ -1,0 +1,649 @@
+graph	target	buffer	role	dtype	shape	axis	stride_bytes	alias	bytes
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l0.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn18:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l0.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn19:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l1.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn42:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l1.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn43:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l2.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn63:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l2.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn64:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l3.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn84:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l3.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn85:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l4.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn105:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l4.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn106:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l5.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn126:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l5.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn127:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l6.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn147:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l6.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn148:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l7.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn168:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l7.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn169:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l8.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn189:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l8.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn190:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l9.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn210:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l9.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn211:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l10.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn231:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l10.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn232:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l11.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn252:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l11.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn253:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l12.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn273:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l12.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn274:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l13.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn294:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l13.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn295:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l14.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn315:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l14.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn316:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l15.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn336:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l15.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn337:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l16.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn357:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l16.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn358:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l17.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn378:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l17.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn379:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l18.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn399:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l18.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn400:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l19.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn420:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l19.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn421:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l20.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn441:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l20.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn442:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l21.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn462:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l21.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn463:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l22.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn483:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l22.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn484:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l23.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn504:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l23.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn505:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l24.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn525:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l24.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn526:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l25.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn546:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l25.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn547:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l26.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn567:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l26.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn568:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l27.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn588:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	kv.l27.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	spirv_vulkan	eqn589:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l0.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn18:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l0.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn19:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l1.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn42:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l1.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn43:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l2.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn63:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l2.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn64:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l3.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn84:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l3.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn85:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l4.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn105:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l4.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn106:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l5.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn126:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l5.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn127:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l6.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn147:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l6.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn148:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l7.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn168:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l7.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn169:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l8.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn189:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l8.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn190:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l9.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn210:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l9.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn211:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l10.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn231:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l10.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn232:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l11.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn252:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l11.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn253:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l12.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn273:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l12.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn274:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l13.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn294:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l13.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn295:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l14.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn315:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l14.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn316:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l15.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn336:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l15.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn337:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l16.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn357:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l16.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn358:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l17.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn378:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l17.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn379:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l18.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn399:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l18.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn400:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l19.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn420:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l19.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn421:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l20.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn441:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l20.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn442:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l21.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn462:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l21.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn463:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l22.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn483:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l22.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn484:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l23.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn504:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l23.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn505:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l24.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn525:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l24.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn526:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l25.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn546:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l25.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn547:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l26.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn567:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l26.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn568:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l27.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn588:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	kv.l27.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	amd_gcn	eqn589:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l0.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn18:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l0.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn19:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l1.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn42:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l1.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn43:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l2.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn63:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l2.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn64:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l3.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn84:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l3.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn85:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l4.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn105:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l4.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn106:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l5.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn126:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l5.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn127:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l6.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn147:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l6.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn148:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l7.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn168:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l7.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn169:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l8.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn189:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l8.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn190:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l9.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn210:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l9.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn211:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l10.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn231:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l10.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn232:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l11.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn252:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l11.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn253:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l12.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn273:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l12.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn274:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l13.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn294:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l13.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn295:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l14.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn315:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l14.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn316:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l15.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn336:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l15.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn337:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l16.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn357:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l16.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn358:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l17.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn378:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l17.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn379:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l18.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn399:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l18.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn400:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l19.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn420:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l19.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn421:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l20.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn441:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l20.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn442:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l21.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn462:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l21.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn463:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l22.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn483:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l22.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn484:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l23.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn504:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l23.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn505:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l24.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn525:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l24.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn526:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l25.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn546:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l25.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn547:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l26.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn567:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l26.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn568:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l27.k	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn588:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	kv.l27.v	state	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen3_0_6b.decode.cap2048	nvptx	eqn589:dyn_update_slice ax=2	computed	F32	[1, 8, 2048, 128]	1	1048576	16	8388608
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l0.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn16:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l0.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn17:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l1.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn38:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l1.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn39:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l2.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn57:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l2.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn58:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l3.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn76:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l3.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn77:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l4.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn95:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l4.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn96:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l5.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn114:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l5.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn115:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l6.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn133:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l6.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn134:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l7.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn152:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l7.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn153:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l8.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn171:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l8.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn172:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l9.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn190:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l9.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn191:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l10.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn209:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l10.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn210:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l11.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn228:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l11.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn229:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l12.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn247:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l12.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn248:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l13.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn266:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l13.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn267:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l14.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn285:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l14.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn286:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l15.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn304:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l15.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn305:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l16.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn323:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l16.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn324:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l17.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn342:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l17.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn343:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l18.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn361:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l18.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn362:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l19.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn380:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l19.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn381:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l20.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn399:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l20.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn400:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l21.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn418:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l21.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn419:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l22.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn437:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l22.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn438:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l23.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn456:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	kv.l23.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	spirv_vulkan	eqn457:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l0.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn16:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l0.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn17:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l1.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn38:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l1.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn39:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l2.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn57:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l2.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn58:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l3.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn76:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l3.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn77:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l4.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn95:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l4.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn96:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l5.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn114:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l5.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn115:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l6.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn133:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l6.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn134:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l7.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn152:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l7.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn153:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l8.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn171:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l8.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn172:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l9.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn190:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l9.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn191:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l10.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn209:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l10.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn210:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l11.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn228:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l11.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn229:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l12.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn247:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l12.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn248:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l13.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn266:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l13.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn267:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l14.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn285:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l14.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn286:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l15.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn304:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l15.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn305:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l16.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn323:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l16.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn324:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l17.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn342:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l17.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn343:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l18.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn361:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l18.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn362:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l19.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn380:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l19.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn381:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l20.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn399:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l20.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn400:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l21.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn418:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l21.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn419:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l22.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn437:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l22.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn438:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l23.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn456:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	kv.l23.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	amd_gcn	eqn457:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l0.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn16:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l0.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn17:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l1.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn38:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l1.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn39:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l2.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn57:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l2.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn58:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l3.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn76:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l3.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn77:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l4.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn95:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l4.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn96:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l5.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn114:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l5.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn115:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l6.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn133:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l6.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn134:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l7.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn152:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l7.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn153:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l8.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn171:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l8.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn172:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l9.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn190:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l9.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn191:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l10.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn209:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l10.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn210:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l11.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn228:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l11.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn229:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l12.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn247:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l12.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn248:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l13.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn266:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l13.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn267:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l14.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn285:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l14.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn286:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l15.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn304:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l15.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn305:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l16.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn323:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l16.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn324:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l17.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn342:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l17.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn343:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l18.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn361:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l18.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn362:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l19.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn380:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l19.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn381:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l20.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn399:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l20.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn400:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l21.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn418:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l21.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn419:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l22.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn437:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l22.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn438:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l23.k	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn456:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	kv.l23.v	state	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+real.qwen2_0_5b.decode.cap2048	nvptx	eqn457:dyn_update_slice ax=2	computed	F32	[1, 2, 2048, 64]	1	524288	16	1048576
+gpt_oss.decode	spirv_vulkan	eqn25:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	spirv_vulkan	eqn28:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	spirv_vulkan	eqn124:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	spirv_vulkan	eqn127:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	spirv_vulkan	eqn28:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	spirv_vulkan	eqn31:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	spirv_vulkan	eqn132:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	spirv_vulkan	eqn135:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	amd_gcn	eqn25:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	amd_gcn	eqn28:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	amd_gcn	eqn124:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	amd_gcn	eqn127:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	amd_gcn	eqn28:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	amd_gcn	eqn31:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	amd_gcn	eqn131:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	amd_gcn	eqn134:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	nvptx	eqn25:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	nvptx	eqn28:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	nvptx	eqn124:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.decode	nvptx	eqn127:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	nvptx	eqn28:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	nvptx	eqn31:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	nvptx	eqn132:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096
+gpt_oss.prefill_kv	nvptx	eqn135:broadcast [1, 2, 2, 8, 32]	computed	F32	[1, 2, 2, 8, 32]	1	2048	8	4096

@@ -39,9 +39,11 @@ pub mod live_attention;
 pub mod lora;
 pub mod packed;
 pub mod routing;
+pub mod sample_token;
 pub mod scan;
 pub mod select;
 pub mod state_row;
+pub mod strided_read;
 pub mod write_probe;
 
 use std::collections::HashMap;
