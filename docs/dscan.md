@@ -93,8 +93,10 @@ whole-sequence prefill within tier 2 (bitwise when the sequence fits one chunk).
 - No production `DeviceCaps` carries a calibrated `max_dispatch_work`; the multi-launch split is exercised by the
   planner (synthetic caps) and the kernel interpreter, never by a real device.
 - KDA's per-channel gate is not covered: GLM-5.3 has no prefill and keeps its primitive decode.
-- The sampling kernels (`ArgmaxBatched` and the three Gumbel rules) run one 64-lane workgroup per row, and each
-  lane strides the row's vocabulary once per pass (1, 2, 32 and 63 passes by rule, counting each bisection
-  step). `max_dispatch_work` bounds that as `rows * 64` threads of `passes * ceil(vocab / 64)` steps. A row's
+- The three Gumbel sampling kernels run one 64-lane workgroup per row, and each lane strides the row's
+  vocabulary once per pass (2, 32 and 63 passes by rule, counting each bisection step). `max_dispatch_work` bounds that as `rows * 64` threads of `passes * ceil(vocab / 64)` steps. A row's
   reduction cannot cross launches, so an over-budget sampling dispatch is refused with the typed `DispatchWork`
-  resource refusal, not split. Only synthetic caps carry a bound today, so no device row exercises it.
+  resource refusal, not split. Only synthetic caps carry a bound today, so no device row exercises it. The
+  greedy pick is not one of these: it runs as two dispatches (`ArgmaxChunk` over 1024-logit chunks, then
+  `ArgmaxCombine` per row) whose per-lane loops are bounded by `vocab / 1024`, so they carry no
+  `DispatchWork` bound.

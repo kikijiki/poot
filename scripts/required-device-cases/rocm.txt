@@ -275,6 +275,7 @@ poot-rocm-device::parity	bf16_grouped_projection_matches_the_oracle_on_rocm
 poot-rocm-device::parity	checkpoint_orientation_projection_matches_the_oracle_on_rocm
 poot-rocm-device::parity	dense_gemv::the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_rocm
 poot-rocm-device::parity	f16_checkpoint_orientation_projection_matches_the_oracle_on_rocm
+poot-rocm-device::parity	greedy_sample_token_is_exact_on_rocm
 poot-rocm-device::parity	select_is_bitwise_on_rocm
 poot-rocm-device::parity	split_kv_decode_matches_the_oracle_on_rocm
 poot-rocm-device::parity	split_kv_decode_replay_equals_the_recording_step_on_rocm
@@ -284,6 +285,7 @@ poot-rocm-device::scan_contract	delta_rule_scan_matches_the_oracle_on_rocm
 poot-rocm-device::scan_contract	long_scan_agrees_with_the_oracle_and_with_stepped_pieces_on_rocm
 poot-rocm-device::scan_contract	ssd_scan_matches_the_oracle_on_rocm
 poot-rocm-device::schedule_policy	scan_schedules_match_the_oracle_in_every_regime_on_rocm
+poot-rocm-device::strided_read	read_rate_rises_with_the_dram_channels_a_stride_reaches
 poot-rocm-runtime	context::caps_tests::a_live_agent_reports_the_workgroup_ceiling_the_caps_document
 poot-rocm-runtime	tests::a_freed_buffer_with_copies_in_flight_does_not_dirty_the_next_allocation
 poot-rocm-runtime	tests::a_small_write_pins_a_small_ring_slot

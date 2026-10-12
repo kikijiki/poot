@@ -36,7 +36,6 @@ mod packed;
 mod packed_bind;
 mod pool;
 mod routed_experts;
-mod sample_token_large_vocab;
 mod sharding;
 pub(crate) mod stage_split;
 mod widen;
@@ -54,7 +53,6 @@ pub(crate) use legalize::refuse_oversized_constants;
 pub use legalize::{LegalizeError, legalize};
 pub(crate) use lora::apply_lora;
 pub use lora::{LoraError, LoraPlan};
-pub use sample_token_large_vocab::{DecomposeError, decompose_large_vocab_greedy};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use attention_match::canonicalize;

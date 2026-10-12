@@ -39,7 +39,8 @@ crate's `assets/`). The plan carries the imported body and the executor dispatch
 SPIR-V/PTX/AMDGPU artifact. Imported kernels cover the shapes the synthesizer does not:
 
 - Decode `MatMul` (M=1) over an f32 `[K, N]` weight, and its batched variant (`gemv_coalesced*.rs`)
-- Greedy argmax and the batched samplers (`argmax_batched.rs`, `sample_*_gumbel_argmax_batched.rs`)
+- Greedy argmax as two stages and the batched samplers (`argmax_chunk.rs`, `argmax_combine.rs`,
+  `sample_*_gumbel_argmax_batched.rs`)
 
 Data movement (`Gather`, `Scatter`, `Slice`, `Concat`, `Transpose`, `Broadcast`, `DynamicUpdateSlice`) is
 not imported: one generated movement kernel covers every op and every storage, including packed byte

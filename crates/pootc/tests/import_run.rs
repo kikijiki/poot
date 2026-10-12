@@ -1450,22 +1450,31 @@ fn host_sample_token_greedy(row: &[f32]) -> (i32, i32) {
 }
 
 #[test]
-fn imported_argmax_batched_matches_host_argmax() {
-    // card 551a (R472-007, fixing the three bugs the Card 447 consolidation carried): the batched
-    // greedy sampler (`argmax_batched.rs`) grids one workgroup per row (`group_index()`) over a flat
-    // `[B, vocab]` logits buffer, output `[B, 2]` I32 `(token, non_finite_index)`. Covers: an ordinary
-    // row, a row whose logits are all very negative (exercising the old buggy `-1.0e30` sentinel, SC-002),
-    // two ties at row 0's max (SC-005: the new tie rule picks the lower index deterministically, unlike
-    // the old lane-order-dependent reduce) - a per-lane tie (indices 5 and 5+64, same lane 5 two groups
-    // over, already resolved before the cross-lane fold ever sees it) and a cross-lane tie (indices 1
-    // and 64, different lanes, the case the fold's tie-break exists for) - and one NaN/+inf/-inf logit
-    // each on the batch's last row (SC-007; the same row as the ties only when b=1, so the override
-    // can't mask whether the tie-break itself picked the right index).
-    let kernel = manifest_path("kernels/sampling/argmax_batched.rs");
-    let (compiled_kernel, params, _needs_error_word) = pootc_compile(kernel, "argmax_batched");
+fn imported_argmax_chunk_and_combine_match_host_argmax() {
+    // POOT-1146 (card 551a, R472-007 before it): the batched greedy sampler is two shipped kernels.
+    // `argmax_chunk.rs` grids one workgroup per (row, chunk) (`group_index()` the chunk,
+    // `group_index_y()` the row) over a flat `[B, vocab]` logits buffer and writes one `(value, index,
+    // bad_index)` partial each; `argmax_combine.rs` grids one workgroup per row over the partials and
+    // writes `[B, 2]` I32 `(token, non_finite_index)`. The chunk is 64 here (the planner ships 1024),
+    // so every row spans several chunks and the cross-chunk seams are exercised. Covers: an ordinary
+    // row, a row whose logits are all very negative (exercising the old buggy `-1.0e30` sentinel,
+    // SC-002), two ties at row 0's max (SC-005: the lower index wins deterministically) - a per-lane
+    // tie (indices 5 and 5+64: lane 5 of chunks 0 and 1, resolved only by the combine) and a
+    // cross-lane tie (indices 1 and 64: different lanes and different chunks) - and one NaN/+inf/-inf
+    // logit each on the batch's last row (SC-007; the same row as the ties only when b=1, so the
+    // override can't mask whether the tie-break itself picked the right index).
+    let (chunk_kernel, chunk_params, _) = pootc_compile(
+        manifest_path("kernels/sampling/argmax_chunk.rs"),
+        "argmax_chunk",
+    );
+    let (combine_kernel, combine_params, _) = pootc_compile(
+        manifest_path("kernels/sampling/argmax_combine.rs"),
+        "argmax_combine",
+    );
     assert_eq!(
-        params, 3,
-        "argmax_batched has 3 slice params (logits, dims, out)"
+        (chunk_params, combine_params),
+        (3, 3),
+        "both stages have 3 slice params (input, dims, output)"
     );
 
     let _gpu_guard = gpu_lock();
@@ -1477,8 +1486,11 @@ fn imported_argmax_batched_matches_host_argmax() {
         }
     };
 
-    // (batch, vocab): a single row, a small batch, and a vocab not a multiple of 64 (a remainder lane).
+    const CHUNK: usize = 64;
+    // (batch, vocab): a single row, a small batch, and a vocab not a multiple of the chunk (a partial
+    // last chunk) or of 64 (a remainder lane).
     for (b, vocab) in [(1usize, 100usize), (3, 130), (5, 257)] {
+        let groups = vocab.div_ceil(CHUNK).max(1);
         let mut logits = vec![0f32; b * vocab];
         for row in 0..b {
             for i in 0..vocab {
@@ -1488,64 +1500,67 @@ fn imported_argmax_batched_matches_host_argmax() {
             }
         }
         if vocab > 64 {
-            // row 0: force two ties at the row max, SC-005 (the new tie rule picks the lower index
-            // deterministically, unlike the old lane-order-dependent reduce). Indices 5 and 5+64 share
-            // lane 5 (69 % 64 == 5) across two groups of the strided scan - a per-lane tie, already
-            // resolved before the cross-lane fold ever sees it (the lane's own strict `>` scan keeps
-            // the first occurrence). Indices 1 and 64 sit in different lanes (64 % 64 == 0, 1 % 64 ==
-            // 1) and tie only at the cross-lane fold, the actual case the fold's `ci < bi` tie-break
-            // exists for.
             let top = logits[0..vocab]
                 .iter()
                 .cloned()
                 .fold(f32::NEG_INFINITY, f32::max)
                 + 1.0;
-            logits[5] = top; // per-lane tie
+            logits[5] = top; // per-lane tie across chunks 0 and 1
             logits[5 + 64] = top;
             logits[1] = top; // cross-lane tie
             logits[64] = top;
         }
         if vocab > 8 {
-            // Last row (row 0 only has one row, b=1; otherwise a different row than the ties above,
-            // so the non-finite override can't mask whether the tie-break itself picked the right
-            // index): one NaN (tail index, V-1, V % 64 != 0 for vocab=100/130/257), one +inf (index 7),
-            // one -inf (index 3) - SC-007.
+            // Last row: one NaN (tail index, V-1), one +inf (index 7), one -inf (index 3) - SC-007.
             let nf = (b - 1) * vocab;
             logits[nf + vocab - 1] = f32::NAN;
             logits[nf + 7] = f32::INFINITY;
             logits[nf + 3] = f32::NEG_INFINITY;
         }
 
-        let dims = [vocab as u32];
-        let mut bufs = [
+        let chunk_dims = [vocab as u32, CHUNK as u32, groups as u32];
+        let mut stage1 = [
             KernelBuffer::read_only_f32(&logits),
-            KernelBuffer::read_only_u32(&dims),
+            KernelBuffer::read_only_u32(&chunk_dims),
+            KernelBuffer::write_f32(b * groups * 3),
+        ];
+        ctx.dispatch(
+            "argmax_chunk",
+            &chunk_kernel,
+            [64, 1, 1],
+            [64 * groups as u32, b as u32, 1],
+            &mut stage1,
+        )
+        .expect("dispatch argmax_chunk");
+        let combine_dims = [groups as u32, vocab as u32];
+        let mut stage2 = [
+            KernelBuffer::read_only_f32(stage1[2].as_f32()),
+            KernelBuffer::read_only_u32(&combine_dims),
             KernelBuffer::write_i32(b * 2),
         ];
-        let threads = [64 * b as u32, 1, 1];
         ctx.dispatch(
-            "argmax_batched",
-            &compiled_kernel,
+            "argmax_combine",
+            &combine_kernel,
             [64, 1, 1],
-            threads,
-            &mut bufs,
+            [64 * b as u32, 1, 1],
+            &mut stage2,
         )
-        .expect("dispatch batched argmax");
-        let got = bufs[2].as_i32().to_vec();
+        .expect("dispatch argmax_combine");
+        let got = stage2[2].as_i32().to_vec();
 
         for row in 0..b {
             let (token, flag) = host_sample_token_greedy(&logits[row * vocab..(row + 1) * vocab]);
             assert_eq!(
                 (got[row * 2], got[row * 2 + 1]),
                 (token, flag),
-                "batch={b} vocab={vocab} row={row}: on-device batched greedy sample (token, \
+                "batch={b} vocab={vocab} row={row}: on-device two-stage greedy sample (token, \
                  non_finite_index) must match the host oracle"
             );
         }
     }
     eprintln!(
-        "batched greedy sample (one workgroup per row) matches the host oracle on ties, the old \
-         -1e30 sentinel row and non-finite logits"
+        "two-stage greedy sample (one workgroup per row chunk, then per row) matches the host \
+         oracle on cross-chunk ties, the old -1e30 sentinel row and non-finite logits"
     );
 }
 

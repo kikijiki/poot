@@ -87,10 +87,10 @@ pub use kernel_mapping::{
     validate_recipe_tile_local,
 };
 pub use passes::{
-    BoundaryDescriptor, DecomposeError, ExpertStackRefusal, LegalizeError, PackedBindError,
-    PackedConst, PackedDequantErrorContext, PackedDequantProductionError, PackedLayout, PoolError,
-    PoolSite, PoolSpec, PooledWeight, ShardError, ShardRule, ShardedGraph, StageSplitError,
-    WeightFormats, WeightFormatsError, bind_packed_weights, recognize_packed_contractions,
+    BoundaryDescriptor, ExpertStackRefusal, LegalizeError, PackedBindError, PackedConst,
+    PackedDequantErrorContext, PackedDequantProductionError, PackedLayout, PoolError, PoolSite,
+    PoolSpec, PooledWeight, ShardError, ShardRule, ShardedGraph, StageSplitError, WeightFormats,
+    WeightFormatsError, bind_packed_weights, recognize_packed_contractions,
     recognize_packed_row_gathers, routed_step_demand, shard,
 };
 // Card 626 (SC-001): `compile` alone runs the graph passes in production - `passes` is a private module, so a
@@ -100,9 +100,9 @@ pub use passes::{
 pub use graph_validation::{ValidationPacketPlan, ValidationPacketSource};
 #[cfg(any(test, feature = "test-support"))]
 pub use passes::{
-    RoutedExpertSite, canonicalize, collapse_reshape_chains, cse, dce,
-    decompose_large_vocab_greedy, elide_noop_transposes, flash_attention_capped, fold_iota, fuse,
-    legalize, passes_without_target, rope_fusion, routed_expert_sites,
+    RoutedExpertSite, canonicalize, collapse_reshape_chains, cse, dce, elide_noop_transposes,
+    flash_attention_capped, fold_iota, fuse, legalize, passes_without_target, rope_fusion,
+    routed_expert_sites,
 };
 pub use planner::{KernelChoice, NoDispatch, Planned, dispatch_work};
 #[cfg(any(test, feature = "test-support"))]

@@ -72,6 +72,14 @@ pub enum Capability {
         workgroup_width: usize,
         limit: usize,
     },
+    /// A planned dispatch needs more workgroups along one grid axis than the target's grid allows. The
+    /// two-stage greedy pick puts a row per Y workgroup and a row per X workgroup in its combine stage;
+    /// the planner refuses rather than launching a grid the device cannot run.
+    DispatchGridAxisLimit {
+        axis: usize,
+        workgroups: usize,
+        limit: usize,
+    },
     /// The op has no I32 kernel (reduction, row fusion, a division without total exact semantics, a unary
     /// that is not an exact integer primitive, a remainder by a literal zero). Every such refusal names a
     /// missing kernel: an I32 value is always stored as I32 words.
@@ -303,6 +311,14 @@ impl fmt::Display for Capability {
             } => write!(
                 f,
                 "the packed E4M3FN dispatch needs {threads} threads ({workgroups_x} x-workgroups at width {workgroup_width}), above the grid limit {limit}"
+            ),
+            Capability::DispatchGridAxisLimit {
+                axis,
+                workgroups,
+                limit,
+            } => write!(
+                f,
+                "the dispatch needs {workgroups} workgroups along grid axis {axis}, above the target's limit {limit}"
             ),
             Capability::ExactI32Op => f.write_str("no I32 kernel for this op"),
             Capability::UnfoldedIota => f.write_str(

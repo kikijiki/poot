@@ -176,7 +176,8 @@ pub enum ImportedKernel {
     PackedBf16ToF32,
     PackedE4m3RowGather,
     // sampling.rs
-    ArgmaxBatched,
+    ArgmaxChunk,
+    ArgmaxCombine,
     SampleGumbelArgmaxBatched,
     SampleTruncatedGumbelArgmaxBatched,
     SampleToppGumbelArgmaxBatched,
@@ -221,12 +222,11 @@ pub(crate) enum SerialLoop {
 /// The lanes of the one workgroup each sampler body runs per row (`W` in `pootc/kernels/sampling/*.rs`).
 pub(crate) const SAMPLER_LANES: u64 = 64;
 
-/// Vocabulary passes of each `SampleToken` body: the greedy argmax scans once; Gumbel scans for the finite
+/// Vocabulary passes of each stochastic `SampleToken` body: Gumbel scans for the finite
 /// range, then for the perturbed argmax; the truncated rule adds a 30-step top-k bisection, each step a
 /// scan; top-p adds a sum scan and a second 30-step bisection. `a_sampling_declaration_matches_the_loops_of_its_body`
 /// derives the count from each body's control flow and fails when a declaration drifts from it.
 const BISECTION_STEPS: u64 = 30;
-const ARGMAX_PASSES: u64 = 1;
 const GUMBEL_PASSES: u64 = 2;
 const TRUNCATED_GUMBEL_PASSES: u64 = GUMBEL_PASSES + BISECTION_STEPS;
 const TOPP_GUMBEL_PASSES: u64 = TRUNCATED_GUMBEL_PASSES + 1 + BISECTION_STEPS;
@@ -254,9 +254,6 @@ impl ImportedKernel {
             | ImportedKernel::TiledGemmBatched => {
                 ImportedNeeds::serial(SerialLoop::ContractionDepth)
             }
-            ImportedKernel::ArgmaxBatched => ImportedNeeds::serial(SerialLoop::RowVocab {
-                passes: ARGMAX_PASSES,
-            }),
             ImportedKernel::SampleGumbelArgmaxBatched => {
                 ImportedNeeds::serial(SerialLoop::RowVocab {
                     passes: GUMBEL_PASSES,
@@ -273,15 +270,21 @@ impl ImportedKernel {
                 })
             }
             // Packing loops are bounded by rank or a constant; `RandomUniform` is one thread per
-            // element. The probes are test kernels no planner
-            // route selects, so none is bounded here (`RmsnormDyn` loops over its row width; `RowsumFor`
-            // over a constant). None uses a subgroup collective or a matrix fragment
+            // element. The two greedy stages are not bounded by `max_dispatch_work`: `ArgmaxChunk`
+            // loops over its `ARGMAX_CHUNK`-element slice of a row (16 steps per lane) and
+            // `ArgmaxCombine` over a row's chunk count, so each lane's work is bounded by vocab / 1024
+            // (a handful of steps at any real vocabulary), not by the vocabulary itself.
+            // The probes are test kernels no planner route selects, so none is bounded here
+            // (`RmsnormDyn` loops over its row width; `RowsumFor` over a constant). None uses a
+            // subgroup collective or a matrix fragment
             // (`a_declared_subgroup_matches_the_fragments_the_body_uses` pins that against the bodies).
             ImportedKernel::PackI8
             | ImportedKernel::UnpackI8
             | ImportedKernel::PackedBf16RowGather
             | ImportedKernel::PackedBf16ToF32
             | ImportedKernel::PackedE4m3RowGather
+            | ImportedKernel::ArgmaxChunk
+            | ImportedKernel::ArgmaxCombine
             | ImportedKernel::RandomUniform
             | ImportedKernel::AssertTrap
             | ImportedKernel::AtomicAddSumSmoke
@@ -601,7 +604,7 @@ mod needs_tests {
         b.finish(out).unwrap()
     }
 
-    /// Each sampler's declared vocabulary work is `rows * lanes` threads of `passes * ceil(vocab / lanes)`
+    /// Each stochastic sampler's declared vocabulary work is `rows * lanes` threads of `passes * ceil(vocab / lanes)`
     /// steps: a budget of exactly that admits the dispatch, one step less refuses it with `DispatchWork`
     /// naming it. Splitting is not available (a row's reduction cannot cross launches), so the bound is a
     /// typed refusal, not a split.
@@ -614,7 +617,6 @@ mod needs_tests {
         let backend = Backend::SpirvVulkan;
         let lane_steps = (SAMPLE_VOCAB as u64).div_ceil(SAMPLER_LANES);
         for (rule, kernel) in [
-            (SampleRule::Greedy, ArgmaxBatched),
             (SampleRule::Gumbel, SampleGumbelArgmaxBatched),
             (SampleRule::GumbelTopK, SampleTruncatedGumbelArgmaxBatched),
             (SampleRule::GumbelTopKTopP, SampleToppGumbelArgmaxBatched),
@@ -685,7 +687,6 @@ mod needs_tests {
         .collect::<Vec<_>>();
         all.extend(
             [
-                (ArgmaxBatched, SampleRule::Greedy),
                 (SampleGumbelArgmaxBatched, SampleRule::Gumbel),
                 (SampleTruncatedGumbelArgmaxBatched, SampleRule::GumbelTopK),
                 (SampleToppGumbelArgmaxBatched, SampleRule::GumbelTopKTopP),
