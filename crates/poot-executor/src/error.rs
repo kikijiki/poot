@@ -379,6 +379,19 @@ pub enum BindError {
         /// The range the slot declares.
         range: poot_graph_ir::IndexRange,
     },
+    /// A write-map slot was bound from a raw view. Its words are slot indices the kernel stores through,
+    /// so only a checked [`poot_graph_ir::ForwardSlotMap`] binds it.
+    #[error("slot {key}: a write map binds only as a checked ForwardSlotMap")]
+    UncheckedWriteMap {
+        /// The write-map slot.
+        key: SlotKey,
+    },
+    /// A checked write map was bound to a slot that is not a write-map slot.
+    #[error("slot {key}: a ForwardSlotMap binds only a write-map slot")]
+    NotAWriteMap {
+        /// The slot the map was bound to.
+        key: SlotKey,
+    },
     /// `reset_state(Row(row))` named a row outside the carried state's leading axis, or the state
     /// is not a whole number of equal rows.
     #[error("state {name}: cannot reset row {row} of its {rows} leading rows")]

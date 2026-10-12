@@ -51,8 +51,9 @@ pub fn movement_body(
             data_shapes.push(update_shape.clone());
             reads_index = matches!(index, UpdateIndex::Runtime);
         }
+        // The rows are written in place into the output buffer, which already holds the base: the
+        // kernel reads the source rows and the slot map, never the base.
         MovementOp::ScatterRows { src_shape, .. } => {
-            data_shapes.push(spec.out_shape.clone());
             data_shapes.push(src_shape.clone());
             reads_index = true;
         }
@@ -69,8 +70,8 @@ pub fn movement_body(
             shape,
         });
     }
-    // The scatter reads its index buffer after both data inputs; every other op has at most one input
-    // before it, or (a runtime update) two, so the order is always data inputs, index, output.
+    // The index buffer follows the data inputs and precedes the output: the order is always data inputs,
+    // index, output.
     let index = reads_index.then(|| {
         params.push(slice(&Ty::I32, false));
         local(params.len() as u32 - 1)
@@ -99,20 +100,51 @@ pub fn movement_body(
                 cfg.assign(elem(out.param, destination), Rvalue::Use(copy(value)));
             });
         }
+        MovementOp::ScatterRows { src_shape, window } => {
+            // One thread owns one source unit (an element, or a packed `u32` word): it copies the unit to
+            // the same offset of the pool slot its source row names, or nothing for a padding row. A unit
+            // of the output is written by at most one thread because the map holds each slot once.
+            let units = storage.units(src_shape);
+            let per_slot = storage.units(&spec.out_shape[1..]);
+            let slots = index.expect("a scatter reads its slot map");
+            let unit = match window {
+                Some(window) if window.offset != 0 => {
+                    cfg.bin(Ty::Usize, BinOp::Add, copy(thread), cu(window.offset))
+                }
+                _ => thread,
+            };
+            let in_bounds = cfg.bin(Ty::Bool, BinOp::Lt, copy(unit), cu(units));
+            cfg.if_then(in_bounds, |cfg| {
+                let row = cfg.bin(Ty::Usize, BinOp::Div, copy(unit), cu(per_slot));
+                let column = cfg.bin(Ty::Usize, BinOp::Rem, copy(unit), cu(per_slot));
+                let slot = cfg.let_(Ty::I32, Rvalue::Use(Operand::Copy(elem(slots, row))));
+                let writes = cfg.bin(
+                    Ty::Bool,
+                    BinOp::Ge,
+                    copy(slot),
+                    Operand::Const(poot_kernel_ir::Constant::I32(0)),
+                );
+                cfg.if_then(writes, |cfg| {
+                    let slot = cfg.let_(
+                        Ty::Usize,
+                        Rvalue::Cast {
+                            to: Ty::Usize,
+                            operand: copy(slot),
+                        },
+                    );
+                    let first = cfg.bin(Ty::Usize, BinOp::Mul, copy(slot), cu(per_slot));
+                    let destination = cfg.bin(Ty::Usize, BinOp::Add, copy(first), copy(column));
+                    let value = cfg.let_(
+                        storage.unit_ty(),
+                        Rvalue::Use(Operand::Copy(elem(inputs[0].param, unit))),
+                    );
+                    cfg.assign(elem(out.param, destination), Rvalue::Use(copy(value)));
+                });
+            });
+        }
         _ => {
             let units = storage.units(&spec.out_shape);
-            let offset = match &spec.op {
-                MovementOp::ScatterRows {
-                    window: Some(window),
-                    ..
-                } => window.offset,
-                _ => 0,
-            };
-            let unit = if offset == 0 {
-                thread
-            } else {
-                cfg.bin(Ty::Usize, BinOp::Add, copy(thread), cu(offset))
-            };
+            let unit = thread;
             let in_bounds = cfg.bin(Ty::Bool, BinOp::Lt, copy(unit), cu(units));
             cfg.if_then(in_bounds, |cfg| {
                 let source = Source {
@@ -317,33 +349,7 @@ impl Source<'_> {
                 value
             }
             MovementOp::ScatterRows { .. } => {
-                let inverse = self.index.expect("a scatter reads an inverse map");
-                let rest: usize = out_shape[1..].iter().product();
-                let row = cfg.bin(Ty::Usize, BinOp::Div, copy(flat), cu(rest));
-                let column = cfg.bin(Ty::Usize, BinOp::Rem, copy(flat), cu(rest));
-                let kept = read_lane(cfg, storage, &self.inputs[0], flat);
-                let value = cfg.var(storage.unit_ty(), Rvalue::Use(copy(kept)));
-                let source_row = cfg.let_(Ty::I32, Rvalue::Use(Operand::Copy(elem(inverse, row))));
-                let written = cfg.bin(
-                    Ty::Bool,
-                    BinOp::Ge,
-                    copy(source_row),
-                    Operand::Const(poot_kernel_ir::Constant::I32(0)),
-                );
-                cfg.if_then(written, |cfg| {
-                    let source_row = cfg.let_(
-                        Ty::Usize,
-                        Rvalue::Cast {
-                            to: Ty::Usize,
-                            operand: copy(source_row),
-                        },
-                    );
-                    let base = cfg.bin(Ty::Usize, BinOp::Mul, copy(source_row), cu(rest));
-                    let src = cfg.bin(Ty::Usize, BinOp::Add, copy(base), copy(column));
-                    let moved = read_lane(cfg, storage, &self.inputs[1], src);
-                    cfg.assign(Place::local(value), Rvalue::Use(copy(moved)));
-                });
-                value
+                unreachable!("a row scatter writes by source unit, not by output lane")
             }
             MovementOp::PermuteRows { .. } => {
                 unreachable!("a permuted-row scatter writes by source element, not by output lane")

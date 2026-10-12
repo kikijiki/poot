@@ -434,7 +434,7 @@ mod value_storage_tests {
     }
 
     /// One graph holding every shape of I32 consumer that used to choose a lane: a computed `Gather` index
-    /// (`Binary(GeU)`), a `Slot::SlotMap` index feeding `ScatterUpdate`'s `inv` operand, and a
+    /// (`Binary(GeU)`), a `Slot::WriteMap` index feeding `ScatterUpdate`'s `slots` operand, and a
     /// `Slot::Token` feeding a plain embedding `Gather` (the shape `poot-wgpu-device`'s
     /// `qwen2_decode_gpu_resident_matches_cpu` exercises). Returns `(graph, gather_index_value_id,
     /// slotmap_value_id, token_value_id)`.
@@ -473,9 +473,7 @@ mod value_storage_tests {
         let src = b
             .constant("src", TensorType::new(vec![NSRC, REST], DType::F32))
             .unwrap();
-        let slot_map = b
-            .slot(Slot::SlotMap, TensorType::new(vec![POOL], DType::I32))
-            .unwrap();
+        let slot_map = b.write_map("write", NSRC, POOL).unwrap();
         let _scatter = b.scatter_update(base, src, slot_map).unwrap();
 
         const VOCAB: usize = 8;
@@ -495,7 +493,7 @@ mod value_storage_tests {
     }
 
     /// POOT-725: every declared-I32 value is stored as dense I32 words, whatever reads it: a computed `Gather`
-    /// index, a `Slot::SlotMap` feeding `ScatterUpdate`'s `inv`, and a `Slot::Token` feeding an embedding
+    /// index, a `Slot::WriteMap` feeding `ScatterUpdate`'s `slots`, and a `Slot::Token` feeding an embedding
     /// `Gather`, in the same graph, on every backend. There is no F32 mirror to choose.
     ///
     /// Mutation: make `value_storage_kind` return `StorageKind::Dense(DType::F32)` for every I32 value; each
@@ -512,7 +510,7 @@ mod value_storage_tests {
             let storage = fixture_value_storage(&g, backend, &caps);
             for (what, id) in [
                 ("a computed Gather index", gather_index_id),
-                ("a SlotMap feeding ScatterUpdate's inv", slot_id),
+                ("a WriteMap feeding ScatterUpdate's slots", slot_id),
                 ("a Token feeding an embedding Gather", token_id),
             ] {
                 assert_eq!(

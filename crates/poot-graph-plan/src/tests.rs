@@ -5,8 +5,8 @@ use crate::dtype_widen::{bf16_const_feeds_only_packed_readers, widen_mismatched_
 use crate::graph_validation::ValidationPacketSource;
 use crate::planner::{Planned, fty_ty};
 use crate::predicates::{
-    DenseGemvLaunch, GEMM_TILE, GEMV_WIDTH, GraphTables, SCATTER_UPDATE_WG, dense_decode_gemv_in,
-    dense_gemv_launch, is_elementwise_2d_in,
+    DenseGemvLaunch, ELEMENTWISE_2D_WIDTH, GEMM_TILE, GEMV_WIDTH, GraphTables,
+    dense_decode_gemv_in, dense_gemv_launch, is_elementwise_2d_in,
 };
 use crate::production_plan::Submission;
 use crate::refusal::RefusalDtypes;
@@ -1129,10 +1129,10 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
         let src = builder
             .constant("src", TensorType::new(vec![source_rows, 2, 5], GDt::E4M3FN))
             .unwrap();
-        let inverse = builder
-            .constant("inverse", TensorType::new(vec![4], GDt::I32))
+        let slots = builder
+            .constant("slots", TensorType::new(vec![source_rows], GDt::I32))
             .unwrap();
-        let output = builder.scatter_update(base, src, inverse).unwrap();
+        let output = builder.scatter_update(base, src, slots).unwrap();
         builder.finish(output).unwrap()
     };
     let graph = build(3);
@@ -1144,7 +1144,8 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
         launch: Launch { grid, .. },
         ..
     } = into_plain(planned_plan);
-    assert_eq!(body.param_count, 4);
+    // The kernel reads the source rows and the slot map; the base is the output's own buffer.
+    assert_eq!(body.param_count, 3);
     let KernelChoice::Generated(KernelRequest::Movement(spec)) = &choice else {
         panic!("expected the packed E4M3FN scatter-update request: {choice:?}");
     };
@@ -1157,7 +1158,8 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
             window: None
         }
     );
-    assert_eq!(grid, [16, 1, 1]);
+    // One thread per packed source word: 3 rows x 2 pool rows x ceil(5 / 4) words.
+    assert_eq!(grid, [12, 1, 1]);
 
     let other = build(2);
     let other_eqn = &other.eqns()[0];
@@ -1197,6 +1199,8 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
     assert_eq!(refusal.op, OpKind::ScatterUpdate);
     assert_eq!(refusal.target, TargetId::Gpu(backend));
 
+    // A rank-1 packed pool has one lane per slot: slots share words, so there is no whole unit to copy and
+    // the request is refused by name instead of racing sub-word stores.
     let builder = Builder::for_tests();
     let base = builder
         .constant("base_rank1", TensorType::new(vec![5], GDt::E4M3FN))
@@ -1204,36 +1208,28 @@ fn e4m3fn_scatter_update_materializes_exact_packed_output_and_keys_all_shapes() 
     let src = builder
         .constant("src_rank1", TensorType::new(vec![3], GDt::E4M3FN))
         .unwrap();
-    let inverse = builder
-        .constant("inverse_rank1", TensorType::new(vec![5], GDt::I32))
+    let slots = builder
+        .constant("slots_rank1", TensorType::new(vec![3], GDt::I32))
         .unwrap();
-    let output = builder.scatter_update(base, src, inverse).unwrap();
+    let output = builder.scatter_update(base, src, slots).unwrap();
     let rank1 = builder.finish(output).unwrap();
-    let rank1_eqn = &rank1.eqns()[0];
-    let (planned_plan, choice) =
-        planned_with_choice(&rank1, rank1_eqn, Backend::SpirvVulkan).unwrap();
-    let Dispatch {
-        body,
-        launch: Launch { grid, .. },
-        ..
-    } = into_plain(planned_plan);
-    assert_eq!(body.param_count, 4);
+    let refusal = refusal_of(
+        plan_eqn(
+            &rank1,
+            &rank1.eqns()[0],
+            Backend::SpirvVulkan,
+            &default_caps_for(Backend::SpirvVulkan),
+            &crate::test_support::roomy_body_limits(),
+        ),
+        "rank-1 E4M3FN ScatterUpdate",
+    );
     assert!(
         matches!(
-            &choice,
-            KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
-                storage: kg::Storage::PackedRows { lane_bits: 8 },
-                out_shape,
-                op: kg::MovementOp::ScatterRows { src_shape, window: None, .. },
-                ..
-            })) if out_shape == &[5] && src_shape == &[3]
+            refusal.missing,
+            Capability::KernelGen(kg::KernelGenError::Unsupported { .. })
         ),
-        "{choice:?}"
-    );
-    assert_eq!(
-        grid,
-        [2, 1, 1],
-        "rank-1 POOL=5 output is two physical packed words, not five logical bytes"
+        "{:?}",
+        refusal.missing
     );
 }
 
@@ -1349,10 +1345,10 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
         let src = builder
             .constant("src", TensorType::new(vec![source_rows, 5], GDt::E4M3FN))
             .unwrap();
-        let inverse = builder
-            .constant("inverse", TensorType::new(vec![pool], GDt::I32))
+        let slots = builder
+            .constant("slots", TensorType::new(vec![source_rows], GDt::I32))
             .unwrap();
-        let output = builder.scatter_update(base, src, inverse).unwrap();
+        let output = builder.scatter_update(base, src, slots).unwrap();
         let graph = builder.finish(output).unwrap();
         let eqn = &graph.eqns()[0];
         let refusal = refusal_of(
@@ -1376,10 +1372,10 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
     let src = builder
         .constant("src", TensorType::f32(vec![1, 5]))
         .unwrap();
-    let inverse = builder
-        .constant("inverse", TensorType::new(vec![2], GDt::I32))
+    let slots = builder
+        .constant("slots", TensorType::new(vec![1], GDt::I32))
         .unwrap();
-    let output = builder.scatter_update(base, src, inverse).unwrap();
+    let output = builder.scatter_update(base, src, slots).unwrap();
     let graph = builder.finish(output).unwrap();
     let eqn = &graph.eqns()[0];
     let refusal = refusal_of(
@@ -1399,15 +1395,15 @@ fn e4m3fn_scatter_update_rejects_empty_and_mixed_storage_by_name() {
         "the refusal must carry the mixed operand dtypes"
     );
 
-    // Card 529: an E4M3FN `inv` no longer reaches the planner - `infer` rejects it for every
+    // Card 529: an E4M3FN slot map no longer reaches the planner - `infer` rejects it for every
     // `ScatterUpdate`, so this is an IR-level `ShapeError` now, not a planner refusal.
     let err = OpKind::ScatterUpdate
         .infer(&[
             TensorType::new(vec![2, 5], GDt::E4M3FN),
             TensorType::new(vec![1, 5], GDt::E4M3FN),
-            TensorType::new(vec![2], GDt::E4M3FN),
+            TensorType::new(vec![1], GDt::E4M3FN),
         ])
-        .expect_err("E4M3FN ScatterUpdate with an E4M3FN inverse must be rejected by infer");
+        .expect_err("E4M3FN ScatterUpdate with an E4M3FN slot map must be rejected by infer");
     assert!(matches!(
         err,
         ShapeError::DtypeOp {
@@ -4528,108 +4524,116 @@ fn view_chain_matches_oracle_fuzz() {
     }
 }
 
-/// Card 159 Inc3: at gemma4-dense's batched-shared-pool-prefill local-layer scatter shape
-/// (`pool_slots=1025, Hkv=16, D=256` -> `out_numel=4,198,400`, over `SCATTER_UPDATE_CHUNK_WORK`), the
-/// wgpu `ScatterUpdate` plan must split into several dispatches (kernelgen
-/// `scatter_update_chunked_dt`, not the fixed-signature imported kernel) covering disjoint,
-/// full-coverage element ranges, avoiding the flush_work-watchdog single-dispatch thrashing (see
-/// `gemma4_prefill_kv_trace_shared_pool` in poot-models). NVPTX (no display watchdog) stays the single
-/// unchunked imported dispatch at the same shape; chunking is SpirvVulkan-only.
+/// The scatter's cost follows the source rows, not the pool (POOT-1148). At gemma4-dense's local-layer pool
+/// (`pool_slots = 1025, Hkv = 16, D = 256`, 4.2M elements, which the old pool-wide kernel had to chunk for the
+/// wgpu watchdog) a real prompt (`l = 49` rows) is one dispatch of `49 * Hkv * D` threads. A wide batched
+/// prefill (`l = 512`, past `scatter_update_work` source units) splits into dispatches over disjoint,
+/// full-coverage source-unit windows, each reading the source rows and the slot map only. NVPTX (no display
+/// watchdog) stays one dispatch at the same shape.
 #[test]
-fn scatter_update_chunks_on_wgpu_at_gemma4_local_layer_pool_shape() {
-    let pool_slots = 1025;
-    let hkv = 16;
-    let d = 256;
-    let l = 49; // a real prompt length (card 159's repro)
-    let out_numel = pool_slots * hkv * d;
+fn scatter_update_launches_over_source_rows_and_chunks_only_a_wide_prefill_on_wgpu() {
+    let (pool_slots, hkv, d) = (1025usize, 16usize, 256usize);
+    let build = |rows: usize| {
+        let b = Builder::for_tests();
+        let base = b
+            .constant("base", TensorType::f32(vec![pool_slots, hkv, d]))
+            .unwrap();
+        let src = b
+            .constant("src", TensorType::f32(vec![rows, hkv, d]))
+            .unwrap();
+        let slots = b
+            .constant("slots", TensorType::new(vec![rows], GDt::I32))
+            .unwrap();
+        let out = b.scatter_update(base, src, slots).unwrap();
+        b.finish(out).unwrap()
+    };
+    let scatter = |g: &Graph| {
+        g.eqns()
+            .iter()
+            .find(|e| matches!(e.op, OpKind::ScatterUpdate))
+            .unwrap()
+            .clone()
+    };
+    let window_of = |dispatch: &Dispatch| match dispatch.choice() {
+        KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
+            op: kg::MovementOp::ScatterRows { window, .. },
+            ..
+        })) => *window,
+        other => panic!("expected a ScatterRows request: {other:?}"),
+    };
+    let wgpu = default_caps_for(Backend::SpirvVulkan);
+    let budget = wgpu.watchdog_budget.unwrap().scatter_update_work as usize;
 
-    let b = Builder::for_tests();
-    let base = b
-        .constant("base", TensorType::f32(vec![pool_slots, hkv, d]))
-        .unwrap();
-    let src = b.constant("src", TensorType::f32(vec![l, hkv, d])).unwrap();
-    let inv = b
-        .constant("inv", TensorType::new(vec![pool_slots], GDt::I32))
-        .unwrap();
-    let out = b.scatter_update(base, src, inv).unwrap();
-    let g = b.finish(out).unwrap();
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::ScatterUpdate))
-        .unwrap();
-    let out_shape = g.aval(eqn.out).shape.clone();
-    assert_eq!(numel(&out_shape), out_numel);
-
+    // A real prompt: 49 rows x 4096 elements, far below the budget, in a 4.2M-element pool.
+    let short = build(49);
+    let eqn = scatter(&short);
     let plan = plan_eqn(
-        &g,
-        eqn,
+        &short,
+        &eqn,
         Backend::SpirvVulkan,
-        &default_caps_for(Backend::SpirvVulkan),
+        &wgpu,
         &crate::test_support::roomy_body_limits(),
     )
     .unwrap();
-    let chunks = plan.dispatches();
     assert!(
-        chunks.len() > 1,
-        "large wgpu scatter should split into >1 dispatch: {plan:?}"
+        49 * hkv * d <= budget,
+        "premise: the prompt is under the budget"
     );
-    // dispatches must be disjoint and fully cover out_numel (the split-plan contract).
-    let covered: usize = chunks
+    let [dispatch] = plan.dispatches() else {
+        panic!("a short prefill is one dispatch: {plan:?}")
+    };
+    assert_eq!(window_of(dispatch), None);
+    assert_eq!(
+        dispatch.launch().grid[0] as usize,
+        49 * hkv * d,
+        "one thread per source element, whatever the pool"
+    );
+
+    // A wide prefill: windows are disjoint, in order and cover every source unit.
+    let wide = build(512);
+    let eqn = scatter(&wide);
+    let units = 512 * hkv * d;
+    assert!(units > budget, "premise: the prefill is past the budget");
+    let plan = plan_eqn(
+        &wide,
+        &eqn,
+        Backend::SpirvVulkan,
+        &wgpu,
+        &crate::test_support::roomy_body_limits(),
+    )
+    .unwrap();
+    let windows: Vec<kg::UnitWindow> = plan
+        .dispatches()
         .iter()
-        .map(|c| {
-            c.launch().grid[0] as usize / c.body().workgroup_size[0] as usize * SCATTER_UPDATE_WG
-        })
-        .sum::<usize>()
-        .min(out_numel + (chunks.len() - 1) * SCATTER_UPDATE_WG); // last chunk may over-launch to a wg boundary
-    assert!(covered >= out_numel, "chunks must cover the full output");
-    // A small pool (well under the chunk budget) stays the single dispatch. card 525: plan_eqn
-    // can no longer be handed a shape that disagrees with the graph, so this needs its own small
-    // ScatterUpdate graph rather than replaying the large one under a fake `[4, 3]` shape.
-    let small_b = Builder::for_tests();
-    let small_base = small_b
-        .constant("base", TensorType::f32(vec![4, 3]))
-        .unwrap();
-    let small_src = small_b
-        .constant("src", TensorType::f32(vec![2, 3]))
-        .unwrap();
-    let small_inv = small_b
-        .constant("inv", TensorType::new(vec![4], GDt::I32))
-        .unwrap();
-    let small_out = small_b
-        .scatter_update(small_base, small_src, small_inv)
-        .unwrap();
-    let small_g = small_b.finish(small_out).unwrap();
-    let small_eqn = small_g
-        .eqns()
-        .iter()
-        .find(|e| matches!(e.op, OpKind::ScatterUpdate))
-        .unwrap();
-    assert_eq!(numel(&small_g.aval(small_eqn.out).shape), 4 * 3);
-    let whole_scatter = |choice: &KernelChoice| {
+        .map(|dispatch| window_of(dispatch).expect("a chunk names its window"))
+        .collect();
+    assert!(windows.len() > 1, "{plan:?}");
+    let mut next = 0;
+    for window in &windows {
+        assert_eq!(window.offset, next, "windows are consecutive");
+        next += window.threads;
+    }
+    assert!(next >= units, "windows cover every source unit");
+    assert!(
+        windows[..windows.len() - 1]
+            .iter()
+            .all(|w| w.offset + w.threads <= units),
+        "only the last window may launch past the source"
+    );
+
+    // NVPTX has no display watchdog: one whole dispatch at the wide shape.
+    let (nvptx, choice) = planned_with_choice(&wide, &eqn, Backend::Nvptx).unwrap();
+    assert!(is_plain(&nvptx), "{nvptx:?}");
+    assert!(
         matches!(
             choice,
             KernelChoice::Generated(KernelRequest::Movement(kg::MovementSpec {
                 op: kg::MovementOp::ScatterRows { window: None, .. },
                 ..
             }))
-        )
-    };
-    match planned_with_choice(&small_g, small_eqn, Backend::SpirvVulkan) {
-        Ok((compute_plan, choice)) if is_plain(&compute_plan) => {
-            assert!(whole_scatter(&choice), "{choice:?}")
-        }
-        other => {
-            panic!("small wgpu ScatterUpdate should be the single whole dispatch: {other:?}")
-        }
-    }
-    // NVPTX has no display watchdog: stays the single whole dispatch even at the large shape.
-    match planned_with_choice(&g, eqn, Backend::Nvptx).unwrap() {
-        (compute_plan, choice) if is_plain(&compute_plan) => {
-            assert!(whole_scatter(&choice), "{choice:?}")
-        }
-        _ => panic!("NVPTX ScatterUpdate should stay a single dispatch (no chunking)"),
-    }
+        ),
+        "{choice:?}"
+    );
 }
 
 /// Card 258: at BLOOM's tied-`lm_head` decode-GEMV scale (`M=1, K=1024, N=250880`, the shape that hung
@@ -5297,31 +5301,34 @@ fn is_elementwise_2d_folds_binary_and_unary_for_a_non_f32_dtype() {
         256
     ));
 
-    // Every data-movement body is dtype-generic, so a BF16 ScatterUpdate past the ceiling folds like any
-    // other movement, and one below it stays on the flat launch.
-    let scatter_eqn = Eqn {
-        op: OpKind::ScatterUpdate,
-        inputs: vec![],
-        out: x.id(),
-        layer: None,
+    // A ScatterUpdate launches one thread per source element, so it folds when the source rows pass the
+    // ceiling (not when the pool does), and a source below it stays on the flat launch.
+    let ceiling =
+        default_caps_for(Backend::SpirvVulkan).max_grid[0] as usize * ELEMENTWISE_2D_WIDTH;
+    let row = 1024usize;
+    let scatter = |rows: usize| {
+        let b = Builder::for_tests();
+        let base = b.constant("base", TensorType::f32(vec![4, row])).unwrap();
+        let src = b.constant("src", TensorType::f32(vec![rows, row])).unwrap();
+        let slots = b
+            .constant("slots", TensorType::new(vec![rows], GDt::I32))
+            .unwrap();
+        let out = b.scatter_update(base, src, slots).unwrap();
+        b.finish(out).unwrap()
     };
+    let wide = scatter(ceiling / row + 1);
+    let narrow = scatter(1);
+    let folds = |g: &Graph| {
+        let eqn = g.eqns().last().unwrap();
+        let out_shape = g.aval(eqn.out).shape.clone();
+        let out_numel = numel(&out_shape);
+        is_elementwise_2d(g, Backend::SpirvVulkan, eqn, &out_shape, out_numel)
+    };
+    assert!(folds(&wide), "a source past the ceiling must 2-D-fold");
     assert!(
-        is_elementwise_2d(
-            &g,
-            Backend::SpirvVulkan,
-            &scatter_eqn,
-            &out_shape,
-            over_ceiling
-        ),
-        "a BF16 ScatterUpdate past the ceiling must 2-D-fold"
+        !folds(&narrow),
+        "a small source stays flat although the pool is the same"
     );
-    assert!(!is_elementwise_2d(
-        &g,
-        Backend::SpirvVulkan,
-        &scatter_eqn,
-        &small_shape,
-        256
-    ));
 }
 
 /// Find the named const's value id in `g`.

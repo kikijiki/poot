@@ -30,7 +30,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Block table",
-    def: "A host-side per-sequence table that maps logical KV block indices to physical block indices in the paged KV pool. The host flattens it into the Slot::SlotMap graph input (logical position to physical slot), which the paged decode graph uses to gather K/V.",
+    def: "A host-side per-sequence table that maps logical KV block indices to physical block indices in the paged KV pool. The host flattens it into the Slot::SlotMap graph input (logical position to physical slot), which the paged decode graph uses to gather K/V, and into the Slot::WriteMap input (each new token to its physical slot), which the graph writes K/V through.",
     see: "attention",
   },
   {
@@ -218,7 +218,7 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "Slot",
-    def: "A per-step graph input (Storage::Slot) such as Token, Pos, or SlotMap. Stored in a device buffer at a stable address. The captured graph references these addresses; per-token updates write the new value in place.",
+    def: "A per-step graph input (Storage::Slot) such as Token, Pos, SlotMap, or WriteMap. Stored in a device buffer at a stable address. The captured graph references these addresses; per-token updates write the new value in place.",
     see: "execution",
   },
   {

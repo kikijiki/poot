@@ -71,9 +71,6 @@ package the model-free lane excludes, must match one of the `test-device-*` sele
 device crate by `package(...)` there, so a test added later is picked up, and list the new test in
 `scripts/required-device-cases/<lane>.txt`.
 
-To run the push gate (formatting, benchmark harness tests and the complete `just test-model-free` gate)
-before every `git push`, opt in with `just install-pre-push-hook`.
-
 Focused runs are fine during development:
 
 ```bash

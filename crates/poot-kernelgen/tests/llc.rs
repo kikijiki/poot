@@ -319,17 +319,6 @@ fn e4m3fn_software_conversion_lowers_on_all_gpu_targets() {
             ),
             "e4m3fn_scatter_update",
         ),
-        (
-            packed_movement(
-                "e4m3fn_scatter_update_rank1",
-                vec![5],
-                MovementOp::ScatterRows {
-                    src_shape: vec![3],
-                    window: None,
-                },
-            ),
-            "e4m3fn_scatter_update_rank1",
-        ),
     ] {
         for target in [Target::SpirvVulkan, Target::Nvptx] {
             let out = poot_codegen::artifact_path(&dir, name, target);

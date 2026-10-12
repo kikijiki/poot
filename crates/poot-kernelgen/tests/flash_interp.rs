@@ -10,7 +10,7 @@ use poot_test_util::{assert_close, max_abs_error};
 
 #[path = "support/attention.rs"]
 mod attention;
-use attention::{attention_reference, attention_reference_keys};
+use attention::{KeyExtras, attention_reference, attention_reference_keys};
 
 fn spec(
     batch: usize,
@@ -67,13 +67,15 @@ struct Operands {
     mask: Vec<f32>,
     /// The live length of each batch row.
     len: Option<Vec<i32>>,
+    /// The `[B, Lk]` slot map of a paged key, which reads `k` and `v` as pools.
+    read: Option<Vec<i32>>,
 }
 
 impl Operands {
     fn new(spec: &kg::AttentionSpec, mask: Vec<f32>) -> Self {
         let hkv = spec.hq / spec.n_rep;
         let (head_dim, k_shared) = match spec.key {
-            kg::KeyLayout::Single => (spec.dk, None),
+            kg::KeyLayout::Single | kg::KeyLayout::Paged => (spec.dk, None),
             kg::KeyLayout::Split { shared_dim } => (
                 spec.dk - shared_dim,
                 Some(fill(spec.batch * spec.lk * shared_dim, 4)),
@@ -86,6 +88,18 @@ impl Operands {
             v: fill(spec.batch * hkv * spec.lk * spec.dv, 3),
             mask,
             len: None,
+            read: None,
+        }
+    }
+
+    /// These operands with `k` and `v` as `slots`-slot pools read through `read`, filled from their own seeds.
+    fn with_pools(self, spec: &kg::AttentionSpec, slots: usize, read: Vec<i32>) -> Self {
+        let hkv = spec.hq / spec.n_rep;
+        Self {
+            k: fill(slots * hkv * spec.dk, 5),
+            v: fill(slots * hkv * spec.dv, 6),
+            read: Some(read),
+            ..self
         }
     }
 
@@ -103,10 +117,13 @@ impl Operands {
             spec,
             &self.q,
             &self.k,
-            self.k_shared.as_deref(),
             &self.v,
             &self.mask,
-            self.len.as_deref(),
+            KeyExtras {
+                k_shared: self.k_shared.as_deref(),
+                len: self.len.as_deref(),
+                read: self.read.as_deref(),
+            },
         )
     }
 }
@@ -131,6 +148,7 @@ fn interpret(spec: &kg::AttentionSpec, caps: &DeviceCaps, operands: &Operands) -
         Buffer::from_f32s(&operands.mask),
     ];
     buffers.extend(operands.k_shared.as_deref().map(Buffer::from_f32s));
+    buffers.extend(operands.read.as_deref().map(Buffer::from_i32s));
     buffers.extend(operands.len.as_deref().map(Buffer::from_i32s));
     buffers.push(Buffer::from_f32s(&vec![f32::NAN; out_len]));
     run(&generated.body, workgroups, &mut buffers).unwrap();
@@ -510,6 +528,7 @@ fn interpret_split(
         Buffer::from_f32s(&operands.mask),
     ];
     buffers.extend(operands.k_shared.as_deref().map(Buffer::from_f32s));
+    buffers.extend(operands.read.as_deref().map(Buffer::from_i32s));
     buffers.extend(operands.len.as_deref().map(Buffer::from_i32s));
     let scratch = buffers.len();
     buffers.push(Buffer::from_f32s(&vec![
@@ -651,4 +670,107 @@ fn more_splits_than_keys_is_a_typed_error() {
         ),
         "{error:?}"
     );
+}
+
+/// A paged key's slot map over a `slots`-slot pool: batch row `b`'s position `t` names a distinct slot, in an
+/// order that is neither row-major nor increasing, so a kernel that addressed the pool by position (or by
+/// `(b, t)` instead of by the slot) reads the wrong rows. Positions from `visible[b]` on name slot 0, as the
+/// engine's map does for a position not written yet.
+fn scattered_read(batch: usize, lk: usize, slots: usize, visible: &[usize]) -> Vec<i32> {
+    let mut read = Vec::with_capacity(batch * lk);
+    for (b, &visible) in visible.iter().enumerate().take(batch) {
+        for t in 0..lk {
+            read.push(if t < visible {
+                // 7 is coprime to every pool size used here, so the visible slots never repeat.
+                ((b * lk + t) * 7 % (slots - 1) + 1) as i32
+            } else {
+                0
+            });
+        }
+    }
+    read
+}
+
+/// The dense `[B, Hkv, Lk, D]` operand a paged read of `pool` through `read` stands for.
+fn gather_pool(
+    pool: &[f32],
+    read: &[i32],
+    (batch, hkv, lk, d): (usize, usize, usize, usize),
+) -> Vec<f32> {
+    let mut dense = vec![0.0; batch * hkv * lk * d];
+    for b in 0..batch {
+        for g in 0..hkv {
+            for t in 0..lk {
+                let from = (read[b * lk + t] as usize * hkv + g) * d;
+                let to = ((b * hkv + g) * lk + t) * d;
+                dense[to..to + d].copy_from_slice(&pool[from..from + d]);
+            }
+        }
+    }
+    dense
+}
+
+/// A paged key reads the pools in place: the kernel over `(pool, read)` equals the dense kernel over the
+/// views the slot map gathers, and the textbook reference, with a ragged batch of visible lengths, GQA and a
+/// softcap riding along. The pool is larger than any one row's keys and the slots are scattered.
+#[test]
+fn a_paged_key_equals_the_dense_kernel_over_its_gathered_views() {
+    let (batch, hq, n_rep, lk, d, slots) = (3, 4, 2, 13, 8, 64);
+    let visible = [13, 5, 9];
+    let paged = kg::AttentionSpec {
+        key: kg::KeyLayout::Paged,
+        score: kg::ScoreTransform::ScaleSoftcap {
+            scale_bits: 0.5f32.to_bits(),
+            cap_bits: 3.0f32.to_bits(),
+        },
+        ..with_lanes(spec(batch, hq, n_rep, 1, lk, d), 4)
+    };
+    let mask = additive_mask(batch, 1, lk, Some(&visible));
+    let read = scattered_read(batch, lk, slots, &visible);
+    let operands = Operands::new(&paged, mask.clone()).with_pools(&paged, slots, read.clone());
+    let got = interpret(&paged, &caps(), &operands);
+    assert!(got.iter().all(|x| x.is_finite()), "{got:?}");
+    assert_close(&got, &operands.reference(&paged), 1e-5);
+
+    // The same attention as a dense kernel over the gathered views.
+    let dense_spec = kg::AttentionSpec {
+        key: kg::KeyLayout::Single,
+        ..paged.clone()
+    };
+    let hkv = hq / n_rep;
+    let shape = (batch, hkv, lk, d);
+    let mut dense = Operands::new(&dense_spec, mask);
+    dense.k = gather_pool(&operands.k, &read, shape);
+    dense.v = gather_pool(&operands.v, &read, shape);
+    assert_close(&got, &interpret(&dense_spec, &caps(), &dense), 1e-5);
+}
+
+/// A paged key under a live bound and the split-KV schedule never reads the pool rows past a row's length:
+/// positions there name a poisoned slot, and the output is finite and equals the reference.
+#[test]
+fn a_paged_split_kv_with_a_live_bound_never_reads_past_the_length() {
+    let (batch, hq, n_rep, lk, d, slots) = (2, 4, 2, 41, 8, 128);
+    let live = kg::AttentionSpec {
+        key: kg::KeyLayout::Paged,
+        bound: kg::KeyBound::Live,
+        ..with_splits(spec(batch, hq, n_rep, 1, lk, d), 4, 4)
+    };
+    let len = [9, 41];
+    let visible = [9, 41];
+    let mut read = scattered_read(batch, lk, slots, &visible);
+    // The tail of row 0 names the last slot, which holds NaN in both pools.
+    let poison = (slots - 1) as i32;
+    read[9..lk].fill(poison);
+    let mut operands = Operands::new(&live, vec![0.0; batch * lk])
+        .with_pools(&live, slots, read)
+        .with_len(&len);
+    let hkv = hq / n_rep;
+    for g in 0..hkv {
+        let row = (slots - 1) * hkv + g;
+        operands.k[row * d..(row + 1) * d].fill(f32::NAN);
+        operands.v[row * d..(row + 1) * d].fill(f32::NAN);
+    }
+    let (got, _) = interpret_split(&live, &caps(), &operands, f32::NAN);
+    assert!(got.iter().all(|x| x.is_finite()), "{got:?}");
+    assert_close(&got, &operands.reference(&live), SPLIT_KV_TOLERANCE);
 }

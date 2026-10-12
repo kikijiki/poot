@@ -1840,7 +1840,31 @@ impl<D: Device> Engine<D> {
                 return Err(BindError::Duplicate { key: key.clone() }.into());
             }
             let slot = &e.slots[index];
+            if key.role() == Slot::WriteMap {
+                return Err(BindError::UncheckedWriteMap { key: key.clone() }.into());
+            }
             let bytes = binder::check_and_encode(slot, value.shape, value.view)?;
+            writes.push((slot.buffer, bytes));
+        }
+        for (key, map) in inputs.write_maps() {
+            let Some(index) = e.slots.iter().position(|slot| &slot.key == key) else {
+                return Err(BindError::Unknown { key: key.clone() }.into());
+            };
+            if std::mem::replace(&mut seen[index], true) {
+                return Err(BindError::Duplicate { key: key.clone() }.into());
+            }
+            let slot = &e.slots[index];
+            if key.role() != Slot::WriteMap {
+                return Err(BindError::NotAWriteMap { key: key.clone() }.into());
+            }
+            // The map's own constructor refused a repeated or out-of-pool slot. The slot's declared range
+            // is still checked: a map checked against a larger pool than the graph's must not bind.
+            let words = map.as_slice();
+            let shape = [words.len()];
+            let view =
+                poot_tensor::HostView::new(DType::I32, words.len(), bytemuck::cast_slice(words))
+                    .expect("an i32 slice is a whole number of words");
+            let bytes = binder::check_and_encode(slot, &shape, view)?;
             writes.push((slot.buffer, bytes));
         }
         if let Some(missing) = seen.iter().position(|bound| !bound) {
@@ -4772,6 +4796,222 @@ mod weight_source_tests {
             Err(other) => panic!("expected TokenOutOfRange, got {other}"),
             Ok(_) => panic!("a token past the table bound"),
         }
+    }
+
+    /// POOT-1148: a forward write map is the one input whose words the scatter kernel stores through, so it
+    /// binds only as a checked `ForwardSlotMap`. A raw I32 view of the slot is refused by name; a typed map
+    /// checked against a larger pool than the graph declares meets the slot's declared range at the bind; a
+    /// typed map to a slot that is not a write map is refused; a map of distinct in-pool slots steps.
+    ///
+    /// Mutation: drop the `UncheckedWriteMap` arm in `bind`: the raw view binds and the first row goes red.
+    #[test]
+    fn a_write_map_binds_only_as_a_checked_forward_slot_map() {
+        use poot_graph_ir::{ForwardSlotMap, StateRole};
+        let mut engine = Engine::new(Recorder::default());
+        let b = Builder::for_tests();
+        let pool = b
+            .state_input("pool", TensorType::f32(vec![4, K]), StateRole::Recurrent)
+            .unwrap();
+        let src = b
+            .slot_named(Slot::Activation, "src", TensorType::f32(vec![2, K]))
+            .unwrap();
+        let slots = b.write_map("write", 2, 4).unwrap();
+        let out = b.scatter_update(pool, src, slots).unwrap();
+        let graph = b
+            .finish(poot_graph_ir::Outputs::new(out).with_state(&[(pool, out)]))
+            .unwrap();
+        let program = compile(&engine, &graph);
+        let weights = store(vec![]);
+        let exe = engine
+            .load_weights(Arc::clone(&weights), map(&weights, vec![]))
+            .unwrap();
+        let entry = engine.add_entry(exe, &program).unwrap();
+
+        let rows = [0u8; 2 * K * 4];
+        let src_key = SlotKey::new(Slot::Activation, Some("src"));
+        let write_key = SlotKey::new(Slot::WriteMap, Some("write"));
+        let words: Vec<u8> = [3i32, -1].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let src_shape = [2, K];
+        let src_view = poot_tensor::HostView::new(DType::F32, 2 * K, &rows).unwrap();
+        let mut refusal =
+            |inputs: &StepInputs<'_>| match engine.step(exe, entry, inputs, &mut NoSync) {
+                Err(ExecError::Bind(error)) => Some(*error),
+                Err(other) => panic!("expected a bind refusal, got {other}"),
+                Ok(_) => None,
+            };
+
+        let mut raw = StepInputs::new();
+        raw.push(src_key.clone(), &src_shape, src_view);
+        raw.push(
+            write_key.clone(),
+            &[2],
+            poot_tensor::HostView::new(DType::I32, 2, &words).unwrap(),
+        );
+        assert!(
+            matches!(refusal(&raw), Some(BindError::UncheckedWriteMap { key }) if key == write_key),
+            "a raw view of a write map must be refused"
+        );
+
+        let wide = ForwardSlotMap::new(vec![5, -1], 8).unwrap();
+        let mut over_declared = StepInputs::new();
+        over_declared.push(src_key.clone(), &src_shape, src_view);
+        over_declared.push_write_map(write_key.clone(), &wide);
+        assert!(
+            matches!(
+                refusal(&over_declared),
+                Some(BindError::Range {
+                    index: 0,
+                    value: 5,
+                    ..
+                })
+            ),
+            "a map checked against a larger pool meets the slot's declared range"
+        );
+
+        let ok = ForwardSlotMap::new(vec![3, -1], 4).unwrap();
+        let mut misplaced = StepInputs::new();
+        misplaced.push(src_key.clone(), &src_shape, src_view);
+        misplaced.push_write_map(write_key.clone(), &ok);
+        misplaced.push_write_map(SlotKey::new(Slot::Activation, Some("src")), &ok);
+        assert!(
+            matches!(refusal(&misplaced), Some(BindError::Duplicate { .. })),
+            "a second bind of the src slot is a duplicate"
+        );
+        let mut wrong_kind = StepInputs::new();
+        wrong_kind.push_write_map(write_key.clone(), &ok);
+        wrong_kind.push_write_map(src_key.clone(), &ok);
+        assert!(
+            matches!(refusal(&wrong_kind), Some(BindError::NotAWriteMap { key }) if key == src_key),
+            "a checked map binds only a write-map slot"
+        );
+
+        let mut good = StepInputs::new();
+        good.push(src_key, &src_shape, src_view);
+        good.push_write_map(write_key, &ok);
+        assert!(refusal(&good).is_none(), "distinct in-pool slots step");
+    }
+
+    /// POOT-1149: the paged attention kernel reads its pools through the read map without a bound check, so a
+    /// map word outside the pool is refused at the bind, naming the slot, the word and its index, before
+    /// anything dispatches; the same step with every word in the pool runs.
+    ///
+    /// Mutation: declare the read map unranged in `Builder::read_map` (`slot_named` instead of
+    /// `slot_named_ranged`): the word-4 step binds and the first assertion goes red with "expected a typed
+    /// range refusal".
+    #[test]
+    fn a_paged_read_map_word_outside_the_pool_is_a_typed_bind_refusal() {
+        use poot_graph_ir::{ForwardSlotMap, StateRole};
+        const SLOTS: usize = 4;
+        let mut engine = Engine::new(Recorder::default());
+        let b = Builder::for_tests();
+        let pool = |name: &str| {
+            b.state_input(
+                name,
+                TensorType::f32(vec![SLOTS, 2, 4]),
+                StateRole::Positional { axis: 0 },
+            )
+            .unwrap()
+        };
+        let (k_pool, v_pool) = (pool("k_pool"), pool("v_pool"));
+        let activation = |name: &str, shape: Vec<usize>| {
+            b.slot_named(Slot::Activation, name, TensorType::f32(shape))
+                .unwrap()
+        };
+        let write = b.write_map("write", 1, SLOTS).unwrap();
+        let read = b.read_map("read", 1, 3, SLOTS).unwrap();
+        let k_written = b
+            .scatter_update(k_pool, activation("new_k", vec![1, 2, 4]), write)
+            .unwrap();
+        let v_written = b
+            .scatter_update(v_pool, activation("new_v", vec![1, 2, 4]), write)
+            .unwrap();
+        let k = poot_graph_ir::ops::paged_view(&b, k_written, read).unwrap();
+        let v = poot_graph_ir::ops::paged_view(&b, v_written, read).unwrap();
+        let q = activation("q", vec![1, 2, 1, 4]);
+        let mask = activation("mask", vec![1, 1, 1, 3]);
+        let out = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, 0.5, mask).unwrap();
+        let graph = b
+            .finish(
+                poot_graph_ir::Outputs::new(out)
+                    .with_state(&[(k_pool, k_written), (v_pool, v_written)]),
+            )
+            .unwrap();
+        let program = compile(&engine, &graph);
+        let weights = store(vec![]);
+        let exe = engine
+            .load_weights(Arc::clone(&weights), map(&weights, vec![]))
+            .unwrap();
+        let entry = engine.add_entry(exe, &program).unwrap();
+
+        let floats = |n: usize| vec![0u8; n * 4];
+        let (new_rows, q_row, mask_row) = (floats(8), floats(8), floats(3));
+        let words =
+            |words: [i32; 3]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let write_map = ForwardSlotMap::new(vec![2], SLOTS).unwrap();
+        let read_key = SlotKey::new(Slot::SlotMap, Some("read"));
+        let mut step = |read_words: [i32; 3]| {
+            let read_bytes = words(read_words);
+            fn f32_view(bytes: &[u8]) -> poot_tensor::HostView<'_> {
+                poot_tensor::HostView::new(DType::F32, bytes.len() / 4, bytes).unwrap()
+            }
+            let mut inputs = StepInputs::new();
+            inputs.push(
+                SlotKey::new(Slot::Activation, Some("new_k")),
+                &[1, 2, 4],
+                f32_view(&new_rows),
+            );
+            inputs.push(
+                SlotKey::new(Slot::Activation, Some("new_v")),
+                &[1, 2, 4],
+                f32_view(&new_rows),
+            );
+            inputs.push(
+                SlotKey::new(Slot::Activation, Some("q")),
+                &[1, 2, 1, 4],
+                f32_view(&q_row),
+            );
+            inputs.push(
+                SlotKey::new(Slot::Activation, Some("mask")),
+                &[1, 1, 1, 3],
+                f32_view(&mask_row),
+            );
+            inputs.push_write_map(SlotKey::new(Slot::WriteMap, Some("write")), &write_map);
+            inputs.push(
+                read_key.clone(),
+                &[1, 3],
+                poot_tensor::HostView::new(DType::I32, 3, &read_bytes).unwrap(),
+            );
+            engine.step(exe, entry, &inputs, &mut NoSync).map(|_| ())
+        };
+        match step([0, SLOTS as i32, 1]) {
+            Err(ExecError::Bind(error)) => assert!(
+                matches!(
+                    *error,
+                    BindError::Range { ref key, index: 1, value, .. }
+                        if *key == read_key && value == SLOTS as i32
+                ),
+                "{error:?}"
+            ),
+            other => panic!("expected a typed range refusal, got {other:?}"),
+        }
+        match step([0, -1, 1]) {
+            Err(ExecError::Bind(error)) => assert!(
+                matches!(
+                    *error,
+                    BindError::Range {
+                        index: 1,
+                        value: -1,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            ),
+            other => panic!("expected a typed range refusal, got {other:?}"),
+        }
+        assert!(
+            step([0, SLOTS as i32 - 1, 1]).is_ok(),
+            "every word in the pool steps"
+        );
     }
 
     const EXPERTS: usize = 6;

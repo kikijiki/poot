@@ -2,8 +2,9 @@
 //! device the caller built.
 //!
 //! The fixture is the shape a batched recurrent model traces: one carried pool `[SLOTS, WIDTH]`, a
-//! `[ROWS]` read index (which pool row each step row continues), a `[SLOTS]` write map (which step row's
-//! result each pool row takes, or -1 to keep it) and a step that folds an input into the gathered rows
+//! `[ROWS]` read index (which pool row each step row continues), a `[ROWS]` forward write map (which pool
+//! row each step row's result is written to, or -1 for a masked row) and a step that folds an input into
+//! the gathered rows
 //! (`next = state + x`). A second carried value, a `Positional { axis: 0 }` pool with no row axis, counts
 //! the steps taken and rides along in the output: `Row(n)` must leave it alone. The oracle is a host array
 //! updated by the same rule, so a pool row the device addressed wrongly, committed when it should not
@@ -13,7 +14,7 @@
 use std::sync::Arc;
 
 use poot_eval::test_support::StepFixture;
-use poot_executor::{BindError, ExecError, Executor, NoSync, StateScope, StepInputs};
+use poot_executor::{BindError, ExecError, Executor, NoSync, StateScope};
 use poot_graph_ir::{BinOp, Builder, Graph, Scalar, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{Target, production_plan::Submission};
 use poot_quant::weights::WeightStore;
@@ -57,13 +58,7 @@ fn fixture(dtype: DType) -> Fixture {
             TensorType::new(vec![ROWS], DType::I32),
         )
         .unwrap();
-    let write = b
-        .slot_named(
-            Slot::Activation,
-            "state_write",
-            TensorType::new(vec![SLOTS], DType::I32),
-        )
-        .unwrap();
+    let write = b.write_map("state_write", ROWS, SLOTS).unwrap();
     let x = b
         .slot_named(
             Slot::Activation,
@@ -139,20 +134,17 @@ fn tensor(dtype: DType, shape: Vec<usize>, values: &[i32]) -> HostTensor {
 
 fn inputs(dtype: DType, slots: [usize; ROWS], live: [bool; ROWS], x: &[i32]) -> Vec<StepFixture> {
     let key = |name: &str| SlotKey::new(Slot::Activation, Some(name));
-    let mut write = vec![-1i32; SLOTS];
-    for r in 0..ROWS {
-        if live[r] {
-            write[slots[r]] = r as i32;
-        }
-    }
+    let write: Vec<i32> = (0..ROWS)
+        .map(|r| if live[r] { slots[r] as i32 } else { -1 })
+        .collect();
     vec![
         StepFixture {
             key: key("state_read"),
             tensor: HostTensor::i32(vec![ROWS], slots.iter().map(|&s| s as i32).collect()),
         },
         StepFixture {
-            key: key("state_write"),
-            tensor: HostTensor::i32(vec![SLOTS], write),
+            key: SlotKey::new(Slot::WriteMap, Some("state_write")),
+            tensor: HostTensor::i32(vec![ROWS], write),
         },
         StepFixture {
             key: key("x"),
@@ -195,12 +187,13 @@ fn run_dtype(exec: &mut dyn Executor, target: Target, dtype: DType) -> Result<()
      -> Result<(), String> {
         let want = model.step(slots, live, &x);
         let step = inputs(dtype, slots, live, &x);
-        let mut bound = StepInputs::new();
-        for input in &step {
-            bound.push(input.key.clone(), input.tensor.shape(), input.tensor.view());
-        }
         let host = exec
-            .step(exe, entry, &bound, &mut NoSync)
+            .step(
+                exe,
+                entry,
+                &crate::BoundStep::new(&fixture.graph, &step)?.inputs(),
+                &mut NoSync,
+            )
             .map_err(|e| format!("{what}: step: {e}"))?
             .to_host()
             .map_err(|e| format!("{what}: read: {e}"))?;

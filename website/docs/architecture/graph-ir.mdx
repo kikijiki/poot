@@ -79,8 +79,8 @@ Bound from the input map and uploaded for execution. Weight caches use payload i
 representation, so reusing a name for different bytes does not reuse the previous weight. `Graph::consts()` lists the const binders.
 
 **`Slot(Slot)`**. A per-step input routed through a stable device buffer that the host
-rewrites in place. The `Slot` kind says what it carries: `Token`, `Pos`, `SlotMap` (paged KV),
-`LoraIdx`, and others. The attention mask is not a slot: it is computed in-graph from `Pos`.
+rewrites in place. The `Slot` kind says what it carries: `Token`, `Pos`, `SlotMap` and `WriteMap` (paged KV
+reads and writes; both declare the range of the words they hold, which the bind checks), `LoraIdx`, and others. The attention mask is not a slot: it is computed in-graph from `Pos`.
 
 **`State`**. A persistent buffer carried across decode steps: the KV cache. Pre-allocated to
 `cap` capacity per layer. `Graph::state()` pairs each `state_in` binder with a `state_out`

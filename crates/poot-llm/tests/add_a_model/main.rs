@@ -825,12 +825,10 @@ fn oracle_paged_step(
     let read: Vec<i32> = (0..rows)
         .flat_map(|r| (0..CAPACITY).map(move |p| (r * CAPACITY + p) as i32))
         .collect();
-    let mut write = vec![-1i32; pool];
-    for r in 0..rows {
-        for j in 0..n {
-            write[r * CAPACITY + start + j] = (r * n + j) as i32;
-        }
-    }
+    // Flat token `r * n + j` is written at row `r`'s slot of position `start + j`.
+    let write: Vec<i32> = (0..rows)
+        .flat_map(|r| (0..n).map(move |j| (r * CAPACITY + start + j) as i32))
+        .collect();
     let slots = [
         (
             SlotKey::new(Slot::Token, None),
@@ -853,8 +851,8 @@ fn oracle_paged_step(
             HostTensor::i32(vec![rows, CAPACITY], read),
         ),
         (
-            SlotKey::new(Slot::SlotMap, Some("write")),
-            HostTensor::i32(vec![pool], write),
+            SlotKey::new(Slot::WriteMap, Some("write")),
+            HostTensor::i32(vec![rows * n], write),
         ),
     ];
     let (logits, next) = eval_mapped(&graph, store, model.weights(), &slots, state);

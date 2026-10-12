@@ -19,6 +19,8 @@ use poot_target::{Backend, DeviceCaps, TargetId, TensorCoreSupport};
 
 use crate::PlanError;
 use crate::imported::ImportedKernel;
+use crate::planner::PlannedDispatch;
+use crate::{Binding, Sink, Source};
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 
 /// The codegen capability query for the target (card 522, R468-014). `Backend`'s `AmdGcn` payload already
@@ -475,14 +477,15 @@ pub(crate) const GEMM_TILE: usize = 8;
 /// thread count and its dispatch agree.
 pub(crate) const SCATTER_UPDATE_WG: usize = 64;
 
-/// Plan a `ScatterUpdate` (card 059: `base[POOL,rest]`, `src[N,rest]`, `inv[POOL]` -> `out[POOL,rest]`).
-/// It is `O(POOL*rest)`: one thread per output unit, since every pool row is passed through from `base` or
-/// overwritten from `src`. At or below `caps.watchdog_budget`'s `scatter_update_work` units, or on a device
-/// with no watchdog budget, it is one dispatch. Otherwise it splits into dispatches over disjoint unit
-/// windows of the same output (card 159: a `pool_slots~=1025, Hkv=16, D=256` scatter is ~4.2M elements,
-/// over `poot-wgpu-device`'s 4M `flush_work` cap alone; the batched gemma4-dense pool prefill's per-layer KV write
-/// reaches millions of elements twice per layer x 60 layers, so the box's own wgpu/RADV device keeps each
-/// chunk to 1M, a small fraction of that cap, so chunks batch with their neighbors).
+/// Plan a `ScatterUpdate` (`base[POOL,rest]`, `src[N,rest]`, `slots[N]` -> `out[POOL,rest]`). The output
+/// is the pool itself, donated in place ([`crate::state_commit`] refuses a graph that cannot), so the
+/// kernel is `O(N*rest)`: one thread per source unit, reading `src` and `slots` and storing into the named
+/// slot. The base is never read, so the dispatch binds `[src, slots] -> out`. At or below
+/// `caps.watchdog_budget`'s `scatter_update_work` source units, or on a device with no watchdog budget,
+/// it is one dispatch. Otherwise it splits into dispatches over disjoint source-unit windows (card 159: the
+/// per-layer KV write of a wide batched prefill is millions of elements, over `poot-wgpu-device`'s 4M
+/// `flush_work` cap alone, so the box's own wgpu/RADV device keeps each chunk to 1M, a small fraction of
+/// that cap, so chunks batch with their neighbors).
 pub(crate) fn scatter_update_plan(
     site: Site<'_>,
     backend: Backend,
@@ -491,7 +494,14 @@ pub(crate) fn scatter_update_plan(
     src_shape: Vec<usize>,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
-    let units = storage.units(out_shape);
+    let units = storage.units(&src_shape);
+    // The kernel's reads are the equation's `src` and `slots` operands; `base` is the output's own buffer.
+    let bound = |dispatch: PlannedDispatch| {
+        dispatch.bound(Binding::new(
+            vec![Source::Operand(1), Source::Operand(2)],
+            Sink::Out,
+        ))
+    };
     let spec = |window| {
         kg::MovementSpec::new(
             storage.clone(),
@@ -508,12 +518,13 @@ pub(crate) fn scatter_update_plan(
         .filter(|&budget| units > budget)
     else {
         let fold_ceiling = caps.max_grid[0] as usize * ELEMENTWISE_2D_WIDTH;
-        return Planned::generated(
+        let whole = Planned::generated_dispatch(
             site,
             KernelRequest::Movement(spec(None).folded(units > fold_ceiling)),
             backend,
             caps,
-        );
+        )?;
+        return Planned::split(vec![bound(whole)]);
     };
     let chunk_units = (chunk_work / SCATTER_UPDATE_WG).max(1) * SCATTER_UPDATE_WG;
     let chunks = (0..units.div_ceil(chunk_units))
@@ -529,6 +540,7 @@ pub(crate) fn scatter_update_plan(
                 backend,
                 caps,
             )
+            .map(bound)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Planned::split(chunks)
@@ -901,14 +913,24 @@ pub(crate) fn is_elementwise_2d_in(
     match &eqn.op {
         // Data movement: one thread per output buffer unit (a packed E4M3FN word, else an element). The
         // materializing path only (a promoted `Plan::View` never launches).
-        OpKind::ScatterUpdate
-        | OpKind::DynamicUpdateSlice { .. }
+        OpKind::DynamicUpdateSlice { .. }
         | OpKind::Transpose { .. }
         | OpKind::Slice { .. }
         | OpKind::Broadcast { .. }
         | OpKind::Concat { .. }
         | OpKind::Gather { .. }
         | OpKind::Scatter { .. } => movement_units(g, eqn, out_shape, out_numel) > fold_ceiling,
+        // The in-place row write: one thread per source unit, so the fold follows the source rows.
+        OpKind::ScatterUpdate => {
+            let ids = value_ids(eqn);
+            let src_shape = &g.aval(ids[1]).shape;
+            let units = if g.aval(eqn.out).dtype == DType::E4M3FN {
+                kg::Storage::BYTE_LANES.units(src_shape)
+            } else {
+                src_shape.iter().product()
+            };
+            units > fold_ceiling
+        }
         // Binary (broadcast-value and scalar/literal forms), any dtype.
         OpKind::Binary(_) | OpKind::Select => out_numel > fold_ceiling,
         // Unary (e.g. `Exp` over the full attention-score tensor), any dtype.

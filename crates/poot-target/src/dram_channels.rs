@@ -1,7 +1,8 @@
 //! The DRAM channel model of POOT-1139 (research note 2026-10-12, section 2): the Strix Halo APU selects a
 //! channel by address bits [11:8], a 256 B granule over 16 channels, so a read whose row stride is a multiple
-//! of several granules camps on a subset of the channels. One definition for the planner's stride audit
-//! (`poot-models`' `stride_audit`) and the device crates' strided-read probe (`poot-executor-parity`).
+//! of several granules camps on a subset of the channels. One definition for the KV layout rule
+//! (`poot-models`' `HeadSpan`), the planner's stride audit (`poot-models`' `stride_audit`) and the device
+//! crates' strided-read probe (`poot-executor-parity`).
 
 /// DRAM channels the address map interleaves over.
 pub const CHANNELS: usize = 16;
@@ -21,6 +22,15 @@ pub const fn alias_factor(row_stride_bytes: usize) -> usize {
     if factor == 0 { 1 } else { factor }
 }
 
+/// The largest alias factor a served stride may have: a row stride above it leaves more than four of the
+/// sixteen channels idle, which POOT-1139's probe measured at 2.6-4.6x on both backends.
+pub const MAX_ALIAS: usize = 4;
+
+/// Whether a read at `row_stride_bytes` per row camps on too few channels ([`MAX_ALIAS`]).
+pub const fn camps(row_stride_bytes: usize) -> bool {
+    alias_factor(row_stride_bytes) > MAX_ALIAS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,5 +48,16 @@ mod tests {
         assert_eq!(alias_factor(256), 1);
         assert_eq!(alias_factor(384), 1);
         assert_eq!(alias_factor(4160), 1);
+    }
+
+    /// `camps` is the alias factor above [`MAX_ALIAS`]: 2048 B (eight granules) is the smallest camping stride.
+    /// Mutation: compare with `>=`; the 1024 B row goes red.
+    #[test]
+    fn a_stride_camps_above_four_channels_idle() {
+        assert!(camps(4096));
+        assert!(camps(2048));
+        assert!(!camps(1024));
+        assert!(!camps(4160));
+        assert!(!camps(10240 + 512));
     }
 }

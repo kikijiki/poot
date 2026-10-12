@@ -109,10 +109,9 @@ fn paged_decode_matches_contiguous_decode_cpu() {
         let (clog, cnew) = decode(&m, &cont, &c_caches, tok, pos);
         c_caches = cnew;
 
-        let mut write = vec![-1i32; cap];
-        write[read[pos] as usize] = 0;
+        let write = vec![read[pos]];
         let mut slots = token_pos(1, 1, &[tok], &[pos as i32]);
-        slots.extend(slot_maps(1, cap, cap, read.clone(), write));
+        slots.extend(slot_maps(1, cap, read.clone(), write));
         let (plog, pnew) = step(&m, &paged, &slots, &p_caches);
         p_caches = pnew;
 

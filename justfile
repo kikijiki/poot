@@ -330,36 +330,6 @@ bench:
     cargo bench -p poot-graph-plan --bench decode
     scripts/with-required-backend.sh POOT_REQUIRE_WGPU cargo bench -p poot-wgpu-device --bench op_dispatch
 
-# ---- mutation sampling (card 538, R486-015) ----------------------------------
-
-# recurring cargo-mutants sample on the high-survival modules 486 found (matcher, planner, eval, sampler);
-# reports survivors under a dated Backstage receipt, does not make them die, and exits nonzero on any
-# survivor or a failed baseline. `module` is one of the names in scripts/mutation-sample.sh, or `all`.
-# Expect tens of minutes per module (cargo-mutants rebuilds and re-tests the crate once per mutant); `all`
-# can run well past an hour, so run it deliberately rather than as a quick check.
-mutation-sample module="all":
-    scripts/mutation-sample.sh {{module}}
-
-# fast, hermetic check of the recipe's own reporting/exit-code logic (stubbed cargo-mutants output, no
-# build or nix develop needed)
-mutation-sample-self-test:
-    scripts/mutation-sample.sh self-test
-
-# ---- push gate --------------------------------------------------------------
-
-# push gate: formatting, the benchmark harness's own tests, then the whole model-free gate
-pre-push:
-    cargo fmt --all -- --check
-    just -f benchmarks/justfile harness-test
-    just test-model-free
-
-# The hook is scripts/pre-push.sh; remove it with `rm "$(git rev-parse --git-path hooks/pre-push)"`.
-
-# opt in to running the push gate before every `git push` (also from linked worktrees)
-install-pre-push-hook:
-    ln -sf "$(realpath scripts/pre-push.sh)" "$(git rev-parse --git-path hooks/pre-push)"
-    @echo "installed $(git rev-parse --git-path hooks/pre-push)"
-
 # ---- kernel assets ----------------------------------------------------------
 
 # regenerate the committed imported-kernel assets (pootc/kernels/<family>/*.rs) from

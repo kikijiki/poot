@@ -94,7 +94,8 @@ name with `Builder::constant`. The checkpoint loader binds device buffers to tho
 close. Const buffers never move.
 
 **Slots** (`Storage::Slot`). Per-step inputs such as the token id and position
-(`Slot::Token`, `Slot::Pos`; paged decode adds `Slot::SlotMap`). The attention mask is built in-graph
+(`Slot::Token`, `Slot::Pos`; paged decode adds `Slot::SlotMap` and `Slot::WriteMap`, whose declared
+word ranges are checked at the bind). The attention mask is built in-graph
 from `Slot::Pos`; no slot carries it. Each slot is
 bound to a stable device buffer that the host rewrites in place every step.
 

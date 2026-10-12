@@ -16,7 +16,7 @@ use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Graph, SlotKey, Storage, ValueId};
+use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey, Storage, ValueId, ValueMeta};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
     staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
@@ -68,11 +68,30 @@ struct SlotBind {
     shape: Vec<usize>,
     dtype: DType,
     bytes: Vec<u8>,
+    /// The checked map of a `Slot::WriteMap` input, which binds only through it.
+    map: Option<ForwardSlotMap>,
+}
+
+/// The checked [`ForwardSlotMap`] of `t` when slot `m` is a write map, against the pool its declared range
+/// ends at.
+fn write_map_of(m: &ValueMeta, t: &HostTensor) -> Option<ForwardSlotMap> {
+    (m.slot_key()?.role() == Slot::WriteMap).then(|| {
+        let pool = m
+            .range()
+            .expect("a write map declares its pool")
+            .hi_exclusive();
+        ForwardSlotMap::new(t.as_i32().unwrap().to_vec(), pool as usize)
+            .expect("the test's write map names distinct slots of the pool")
+    })
 }
 
 fn step_inputs(binds: &[SlotBind]) -> StepInputs<'_> {
     let mut inputs = StepInputs::new();
     for b in binds {
+        if let Some(map) = &b.map {
+            inputs.push_write_map(b.key.clone(), map);
+            continue;
+        }
         let elems = b.shape.iter().product();
         inputs.push(
             b.key.clone(),
@@ -133,6 +152,7 @@ fn split_consts_and_slots_t(
                         .iter()
                         .flat_map(|v| v.to_le_bytes())
                         .collect(),
+                    map: write_map_of(m, t),
                 });
             }
             Storage::State | Storage::Computed(_) => {}
@@ -202,6 +222,7 @@ fn split_consts_and_slots_v(
                     shape: t.shape().to_vec(),
                     dtype,
                     bytes,
+                    map: write_map_of(m, t),
                 });
             }
             Storage::State | Storage::Computed(_) => {}
@@ -829,7 +850,8 @@ fn deep_fused_chain_gpu_matches_cpu() {
 
 /// Card 159 Inc 3 synthetic repro: force `scatter_update`'s dispatch grid past wgpu's 65535-per-dim workgroup
 /// cap so the movement generator's 2-D grid fold (`MovementSpec::folded`) engages. At `WORKGROUP_SIZE=256` the fold only
-/// kicks in above `out_numel = 65535*256 = 16_776_960`, so `pool` is just over that with `d=1` (~64MB f32).
+/// kicks in above `source elements = 65535*256 = 16_776_960` (one thread per source element), so the
+/// source has just over that with `d=1` (~64MB f32).
 /// Compares the per-dispatch executor bit-exact against a plain CPU `poot_eval::eval`, so a
 /// wrong-but-self-consistent GPU result is caught as well as a hang.
 #[test]
@@ -839,44 +861,53 @@ fn wgpu_scatter_update_grid_over_65535_workgroups() {
         return;
     };
 
-    // out_numel = pool * d must exceed 65535*256 = 16_776_960.
+    // The kernel launches one thread per SOURCE element, so the source rows are what must pass
+    // 65535*256 = 16_776_960 elements; the pool holds one slot per source row.
     let d = 1usize;
-    let pool = 16_776_960 / d + 4096; // 16_781_056 elements, ~64MB f32 buffers.
-    let n = 4usize; // small src row count.
+    let n = 16_776_960 / d + 4096; // 16_781_056 source rows, ~64MB f32 buffers.
+    let pool = n;
 
-    let inv_data: Vec<i32> = (0..pool)
-        .map(|i| if i % 5 == 0 { -1 } else { ((i / 5) % n) as i32 })
+    // Every fifth row is padding; the rest are a bijection of the pool (7919 is prime and not a factor of
+    // n = 2^12 * 17 * 241), so no two rows name one slot.
+    let slots_data: Vec<i32> = (0..n)
+        .map(|t| {
+            if t % 5 == 0 {
+                -1
+            } else {
+                ((t * 7919) % pool) as i32
+            }
+        })
         .collect();
 
     let b = Builder::for_tests();
     let base = b
-        .constant("big_sc_base", TensorType::f32(vec![pool, d]))
+        .state_input(
+            "big_sc_pool",
+            TensorType::f32(vec![pool, d]),
+            poot_graph_ir::StateRole::Recurrent,
+        )
         .unwrap();
     let src = b
-        .constant("big_sc_src", TensorType::f32(vec![n, d]))
+        .slot(Slot::Activation, TensorType::f32(vec![n, d]))
         .unwrap();
-    let inv = b
-        .constant("big_sc_inv", TensorType::new(vec![pool], DType::I32))
+    let slots = b.write_map("write", n, pool).unwrap();
+    let out = b.scatter_update(base, src, slots).unwrap();
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(base, out)]))
         .unwrap();
-    let out = b.scatter_update(base, src, inv).unwrap();
-    let g = b.finish(out).unwrap();
-    let g = poot_graph_plan::cse(&g).unwrap();
 
-    let base_data = fill(1, pool * d);
     let src_data = fill(2, n * d);
 
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    inputs.insert(
-        base.id(),
-        HostTensor::f32(vec![pool, d], base_data.clone()).into(),
-    );
+    // The carried pool starts zero on the CPU oracle, as the contract's state does.
+    inputs.insert(base.id(), HostTensor::zeros(vec![pool, d]).into());
     inputs.insert(
         src.id(),
         HostTensor::f32(vec![n, d], src_data.clone()).into(),
     );
     inputs.insert(
-        inv.id(),
-        HostTensor::i32(vec![pool], inv_data.clone()).into(),
+        slots.id(),
+        HostTensor::i32(vec![n], slots_data.clone()).into(),
     );
 
     // CPU oracle first (independent of any GPU dispatch-grid math).
@@ -887,10 +918,10 @@ fn wgpu_scatter_update_grid_over_65535_workgroups() {
         .expect("cpu eval scatter_update output is dense");
 
     eprintln!(
-        "wgpu_scatter_update_grid_over_65535_workgroups: out_numel={} \
+        "wgpu_scatter_update_grid_over_65535_workgroups: source elements={} \
          (total_groups={}, expect x_groups=65535 y_groups=2)",
-        pool * d,
-        (pool * d).div_ceil(256)
+        n * d,
+        (n * d).div_ceil(256)
     );
 
     let per_out = run_once_contract_v(&mut *exec, target, &g, &inputs);
@@ -910,7 +941,7 @@ fn wgpu_scatter_update_grid_over_65535_workgroups() {
 
     eprintln!(
         "wgpu_scatter_update_grid_over_65535_workgroups: OK ({} elements, bit-exact vs CPU)",
-        pool * d
+        n * d
     );
 }
 

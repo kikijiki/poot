@@ -400,11 +400,19 @@ pub enum Slot {
     /// batched decode), axis-major in the order temporal, height, width. One packed kind keeps a binder from updating only a subset of the axes;
     /// model tracers split it with Slice/Reshape before `rope_sectioned`. Per-prompt/per-step data, never a `Const`.
     MropePosition,
-    /// Paged-KV slot map `[cap]` (i32): logical key position `t` -> the flat physical slot in the block pool holding
-    /// its K/V. The paged decode graph (spec 045) gathers the physical-order K/V cache by this to reconstruct
-    /// logical order before masked attention; the physical write slot is derived in-graph as
-    /// `gather_scalar(slot_map, pos)`. Per-step-varying, so a Slot.
+    /// Paged-KV read map `[rows, cap]` (i32): row `r`'s logical key position `t` -> the flat physical slot in the
+    /// block pool holding its K/V. Attention reads the pool through it in place ([`crate::KeyLayout::Paged`]);
+    /// a consumer that is not that attention gathers the logical view by it ([`crate::ops::paged_view`]).
+    /// Declare it with [`crate::builder::Builder::read_map`], whose range `[0, pool_slots)` is a checked bind
+    /// fact: the kernel's unchecked pool read stands on it. Per-step-varying, so a Slot.
     SlotMap,
+    /// A forward write map `[N]` (i32) of an in-place row write ([`crate::OpKind::ScatterUpdate`]): for each
+    /// of the step's `N` new rows, the pool slot it is written to, or `-1` for a row that writes nothing. One
+    /// thread owns one source row, so two rows naming one slot would race; the kind is bound only as a
+    /// [`crate::ForwardSlotMap`], whose constructor refuses a repeated or out-of-pool slot. Declare it with
+    /// [`crate::builder::Builder::slot_named_ranged`] over `[-1, pool_slots)`; several occurrences (a KV pool's
+    /// and a recurrent pool's) are told apart by tag.
+    WriteMap,
     /// The current token's already-embedded input row `[hidden]`, host-computed per step (a single-row dequant, not
     /// a GPU gather). Lets a decode graph skip declaring the full `[vocab,hidden]` embedding table as a GPU-resident
     /// Const, needed when its dense-f32 size exceeds a backend's max single-buffer size (gemma4's `hidden=5376`
@@ -463,6 +471,7 @@ impl Slot {
             Slot::Pos => "pos",
             Slot::MropePosition => "mropeposition",
             Slot::SlotMap => "slotmap",
+            Slot::WriteMap => "writemap",
             Slot::TokenEmbed => "tokenembed",
             Slot::LoraIdx => "loraidx",
             Slot::ExpertPoolMap => "expertpoolmap",

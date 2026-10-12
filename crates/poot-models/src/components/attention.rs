@@ -12,10 +12,17 @@
 //! [`StateRole::Positional`] on axis 2. Paged: one `[pool_slots, kv_heads, head_dim]` pool per
 //! layer shared by every row and addressed through the step's slot maps ([`Step::paged`]),
 //! declared `Positional` on axis 0; the leading axis of a pool is the slot axis, not a row axis.
+//!
+//! A contiguous K or V cache stores [`HeadSpan::padded`](super::kv_stride::HeadSpan::padded) positions per
+//! head: the capacity, or one position more when `capacity * head_dim * 4` is a multiple of 2048 B (the head
+//! stride would put every head of a position on the same DRAM channel, POOT-1150). Attention reads the stored
+//! extent; the extra position is never written and the mask hides it. A paged cache keeps its capacity: its
+//! stride is the pool's, which in-place paged reads re-lay out.
 
-use poot_graph_ir::{BinOp, Builder, ComputedConst, StateRole, TensorType, Traced, ops};
+use poot_graph_ir::{BinOp, Builder, ComputedConst, Scalar, StateRole, TensorType, Traced, ops};
 use poot_quant::weights::{AttnRole, WeightId, WeightMap, WeightRole};
 
+use super::kv_stride::{Exemption, HeadSpan};
 use super::linear::{Weight, WeightError, linear};
 use super::norm::{NormParams, norm};
 use super::rope::{RopeParams, apply_rope, apply_rope_sectioned, rope_rows};
@@ -450,8 +457,17 @@ fn first_positions(b: &Builder, step: &Step) -> Result<Vec<Traced>, TraceError> 
         .collect::<Result<_, TraceError>>()
 }
 
+/// What a cache stores per row: `kv_heads` heads of `head_dim` elements at the positions its [`HeadSpan`]
+/// stores. A cache is declared from a span, so its head stride is the one the span decided.
+#[derive(Clone, Copy, Debug)]
+struct CacheDims {
+    kv_heads: usize,
+    head_dim: usize,
+    span: HeadSpan,
+}
+
 /// The contiguous layout: row `r` writes its `tokens` new positions at its own first position
-/// (`write_at[r]`) into its private `[kv_heads, capacity, head_dim]` cache. The mask hides every key
+/// (`write_at[r]`) into its private `[kv_heads, positions, head_dim]` cache. The mask hides every key
 /// past each query's own position, including stale entries beyond the live length.
 fn write_contiguous(
     b: &Builder,
@@ -459,14 +475,18 @@ fn write_contiguous(
     write_at: &[Traced],
     name: &str,
     new: Traced,
-    hkv: usize,
-    d: usize,
+    dims: CacheDims,
 ) -> Result<CacheWrite, TraceError> {
-    let shape = step.shape();
-    let (rows, cap) = (shape.rows.get(), shape.capacity.get());
+    let rows = step.shape().rows.get();
+    let CacheDims {
+        kv_heads,
+        head_dim,
+        span,
+    } = dims;
+    let positions = span.stored();
     let input = b.state_input(
         name,
-        TensorType::f32(vec![rows, hkv, cap, d]),
+        TensorType::f32(vec![rows, kv_heads, positions, head_dim]),
         StateRole::Positional { axis: 2 },
     )?;
     let output = if rows == 1 {
@@ -485,20 +505,27 @@ fn write_contiguous(
 }
 
 /// The paged layout: one `[pool_slots, kv_heads, head_dim]` pool shared by every row. The step's
-/// `rows * tokens` new K/V rows scatter into the pool by the write map (a padding token's -1 leaves
-/// its slot alone), then each row's `capacity` logical positions gather back by the read map, so
-/// the same mask as the contiguous layout applies.
+/// `rows * tokens` new K/V rows are written in place into the pool by the forward write map (token `t`
+/// goes to slot `write[t]`; a padding token's -1 writes nothing), so the append costs the tokens, not
+/// the pool. Then each row's `capacity` logical positions are viewed by the read map from the
+/// post-write pool ([`ops::paged_view`], which attention fuses into reading the pool in place), so the
+/// same mask as the contiguous layout applies.
 fn write_paged(
     b: &Builder,
     step: &Step,
     maps: PagedMaps,
     name: &str,
     new: Traced,
-    hkv: usize,
-    d: usize,
+    dims: CacheDims,
 ) -> Result<CacheWrite, TraceError> {
+    let CacheDims {
+        kv_heads: hkv,
+        head_dim: d,
+        span,
+    } = dims;
+    debug_assert_eq!(span.pad(), 0, "a paged cache is viewed at its capacity");
     let shape = step.shape();
-    let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
+    let (rows, t) = (shape.rows.get(), shape.tokens.get());
     let KvLayout::Paged { pool_slots, .. } = shape.kv else {
         return Err(WiringError::SlotMapsOnContiguousStep.into());
     };
@@ -509,9 +536,7 @@ fn write_paged(
     )?;
     let flat = b.reshape(b.transpose(new, vec![0, 2, 1, 3])?, vec![rows * t, hkv, d])?;
     let output = b.scatter_update(input, flat, maps.write)?;
-    let slots = b.reshape(maps.read, vec![rows * cap])?;
-    let gathered = b.reshape(b.gather(output, 0, slots)?, vec![rows, cap, hkv, d])?;
-    Ok(((input, output), b.transpose(gathered, vec![0, 2, 1, 3])?))
+    Ok(((input, output), ops::paged_view(b, output, maps.read)?))
 }
 
 /// Where each row of `step` writes its new positions: the first position of each row under the
@@ -539,19 +564,34 @@ pub(crate) fn carried_cache(
     hkv: usize,
     d: usize,
 ) -> Result<Traced, TraceError> {
+    // Its consumers index the cache by logical position (MLA latents, block-pooled index keys).
+    let span = HeadSpan::exact(step.shape().capacity.get(), d, Exemption::LogicalExtent);
+    let dims = CacheDims {
+        kv_heads: hkv,
+        head_dim: d,
+        span,
+    };
+    carried(b, step, write_at, layer, name, new, dims)
+}
+
+/// One cache of `dims`: the body of [`carried_cache`] and of attention's own key and value caches, which
+/// are stored at their [`HeadSpan`] so the head stride is off the DRAM channel period (POOT-1150) and are
+/// returned `[rows, kv_heads, positions, head_dim]`. A position past the capacity is never written and the
+/// mask hides it.
+fn carried(
+    b: &Builder,
+    step: &Step,
+    write_at: &[Traced],
+    layer: usize,
+    name: &str,
+    new: Traced,
+    dims: CacheDims,
+) -> Result<Traced, TraceError> {
     let ((input, output), read) = match step.paged() {
-        None => write_contiguous(
-            b,
-            step,
-            write_at,
-            &format!("kv.l{layer}.{name}"),
-            new,
-            hkv,
-            d,
-        )?,
+        None => write_contiguous(b, step, write_at, &format!("kv.l{layer}.{name}"), new, dims)?,
         Some(maps) => {
             let name = format!("kv.pool.l{layer}.{name}");
-            write_paged(b, step, maps, &name, new, hkv, d)?
+            write_paged(b, step, maps, &name, new, dims)?
         }
     };
     step.carry(input, output);
@@ -568,7 +608,30 @@ pub fn attention(
     w: &AttentionWeights,
     p: &AttentionParams,
 ) -> Result<Traced, TraceError> {
-    attention_selecting(b, step, layer, x, w, p, &|_, mask| Ok(mask))
+    attention_with(b, step, layer, x, w, p, None)
+}
+
+/// `mask` (`[rows, heads | 1, tokens, capacity]`, additive) over `span`'s stored positions: the positions
+/// past the capacity are appended fully masked.
+fn hide_padding(b: &Builder, mask: Traced, span: HeadSpan) -> Result<Traced, TraceError> {
+    if span.pad() == 0 {
+        return Ok(mask);
+    }
+    let shape = b.aval(mask)?.shape;
+    let last = shape.len() - 1;
+    // `-1e9` (the mask's own hidden value) over the padded columns, built from a range so no selector output
+    // reaches it: `0 * iota - 1e9` is finite for any mask.
+    let hidden = b.binary_scalar(
+        BinOp::Sub,
+        b.binary_scalar(BinOp::Mul, b.iota(span.pad())?, Scalar::F32(0.0))?,
+        Scalar::F32(1.0e9),
+    )?;
+    let mut hidden_shape = vec![1; shape.len()];
+    hidden_shape[last] = span.pad();
+    let mut pad_shape = shape;
+    pad_shape[last] = span.pad();
+    let hidden = b.broadcast(b.reshape(hidden, hidden_shape)?, pad_shape)?;
+    Ok(b.concat(last, &[mask, hidden])?)
 }
 
 /// Replaces the causal-over-cache mask `[rows, 1, tokens, capacity]` of an attention with the one a
@@ -584,6 +647,20 @@ pub fn attention_selecting(
     w: &AttentionWeights,
     p: &AttentionParams,
     select: MaskSelector<'_>,
+) -> Result<Traced, TraceError> {
+    attention_with(b, step, layer, x, w, p, Some(select))
+}
+
+/// The one attention body: `select` is the mask selector of [`attention_selecting`], `None` for plain
+/// causal attention.
+fn attention_with(
+    b: &Builder,
+    step: &Step,
+    layer: usize,
+    x: Traced,
+    w: &AttentionWeights,
+    p: &AttentionParams,
+    select: Option<MaskSelector<'_>>,
 ) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
@@ -658,15 +735,32 @@ pub fn attention_selecting(
     };
 
     let write_at = first_writes(b, step)?;
-    let k_cache = carried_cache(b, step, &write_at, layer, "k", k, hkv, d)?;
-    let v_cache = carried_cache(b, step, &write_at, layer, "v", v, hkv, d)?;
+    // A contiguous cache is padded off the channel period; a paged one is read in place through the pool
+    // view, whose stride is the pool's row stride, so it keeps its capacity.
+    let span = match step.paged() {
+        None => HeadSpan::padded(cap, d),
+        Some(_) => HeadSpan::exact(cap, d, Exemption::PagedView),
+    };
+    let dims = CacheDims {
+        kv_heads: hkv,
+        head_dim: d,
+        span,
+    };
+    let k_cache = carried(b, step, &write_at, layer, "k", k, dims)?;
+    let v_cache = carried(b, step, &write_at, layer, "v", v, dims)?;
+    // The causal mask over the capacity, narrowed by the selector if any, then the stored positions past the
+    // capacity appended hidden: the same on every entry point.
     let mask = if p.alibi {
         let slopes = b.computed(ComputedConst::AlibiSlopes { heads: hq })?;
         ops::alibi_mask_from_pos(b, step.pos(), cap, p.window, slopes, hq)?
     } else {
         ops::causal_mask_from_pos(b, step.pos(), cap, p.window)?
     };
-    let mask = select(b, mask)?;
+    let mask = match select {
+        Some(select) => select(b, mask)?,
+        None => mask,
+    };
+    let mask = hide_padding(b, mask, span)?;
     let out = match &w.sinks {
         Some(sinks) => ops::attention_prefill_with_sink(
             b,
@@ -714,7 +808,9 @@ mod tests {
     const HEADS: usize = 4;
     const KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 4;
-    const CAP: usize = 8;
+    /// 128 positions of 4 f32: a 2048 B head stride, which camps, so every contiguous case below runs over
+    /// a cache that stores one position more than its capacity ([`HeadSpan`]).
+    const CAP: usize = 128;
     const THETA: f32 = 10_000.0;
     const EPS: f32 = 1e-5;
 
@@ -838,6 +934,56 @@ mod tests {
         fx
     }
 
+    /// A `[.., CAP, HEAD_DIM]` cache as the graph stores it: every head gains the padded position, zeroed.
+    fn stored_cache(cache: &[f32]) -> Vec<f32> {
+        let head = CAP * HEAD_DIM;
+        assert_eq!(cache.len() % head, 0);
+        let pad = HeadSpan::padded(CAP, HEAD_DIM).pad();
+        assert_eq!(
+            pad, 1,
+            "the fixture capacity must camp, or the padded path is not run"
+        );
+        cache
+            .chunks(head)
+            .flat_map(|h| {
+                h.iter()
+                    .copied()
+                    .chain(std::iter::repeat_n(0.0, pad * HEAD_DIM))
+            })
+            .collect()
+    }
+
+    /// The inverse of [`stored_cache`]; the padded position must still be zero: nothing writes it.
+    fn logical_cache(stored: &[f32]) -> Vec<f32> {
+        let span = HeadSpan::padded(CAP, HEAD_DIM);
+        let head = span.stored() * HEAD_DIM;
+        assert_eq!(stored.len() % head, 0);
+        let mut out = Vec::new();
+        for h in stored.chunks(head) {
+            let (live, pad) = h.split_at(CAP * HEAD_DIM);
+            assert!(
+                pad.iter().all(|&v| v == 0.0),
+                "a padded position was written: {pad:?}"
+            );
+            out.extend_from_slice(live);
+        }
+        out
+    }
+
+    /// `fx.eval` over logical `[.., CAP, HEAD_DIM]` caches: they enter and leave in logical form, and the
+    /// graph's state carries the stored extent in between.
+    fn eval_logical(
+        fx: &Fx,
+        g: &poot_graph_ir::Graph,
+        x: &[f32],
+        slots: &[(Slot, &[i32])],
+        state: &[Vec<f32>; 2],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let stored = [stored_cache(&state[0]), stored_cache(&state[1])];
+        let (y, caches) = fx.eval(g, &[("x", x)], slots, &[&stored[0], &stored[1]]);
+        (y, caches.iter().map(|c| logical_cache(c)).collect())
+    }
+
     /// One step of `tokens` at `pos` over caches holding `state`; returns output and caches.
     fn run(
         fx: &Fx,
@@ -845,6 +991,18 @@ mod tests {
         x: &[f32],
         pos: &[i32],
         state: &[Vec<f32>; 2],
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        run_with(fx, o, x, pos, state, false)
+    }
+
+    /// [`run`] through [`attention_selecting`] with a selector that keeps the mask, when `selecting`.
+    fn run_with(
+        fx: &Fx,
+        o: Opts,
+        x: &[f32],
+        pos: &[i32],
+        state: &[Vec<f32>; 2],
+        selecting: bool,
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let t = pos.len();
         let p = params(o);
@@ -863,7 +1021,11 @@ mod tests {
         )
         .unwrap();
         let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH])).unwrap();
-        let y = attention(&b, &step, 2, xs, &w, &p).unwrap();
+        let y = if selecting {
+            attention_selecting(&b, &step, 2, xs, &w, &p, &|_, mask| Ok(mask)).unwrap()
+        } else {
+            attention(&b, &step, 2, xs, &w, &p).unwrap()
+        };
         let g = step.finish(b, y).unwrap();
         let pairs: Vec<_> = g.state_pairs().collect();
         assert_eq!(pairs.len(), 2);
@@ -873,11 +1035,12 @@ mod tests {
                 .all(|pair| pair.role == StateRole::Positional { axis: 2 })
         );
         let tokens = vec![0; t];
-        fx.eval(
+        eval_logical(
+            fx,
             &g,
-            &[("x", x)],
+            x,
             &[(Slot::Token, &tokens), (Slot::Pos, pos)],
-            &[&state[0], &state[1]],
+            state,
         )
     }
 
@@ -1071,6 +1234,85 @@ mod tests {
     #[test]
     fn attention_matches_an_f64_reference_continuing_over_a_filled_cache() {
         assert_matches_reference(BASE);
+    }
+
+    /// A mask selector sees the capacity-wide causal mask and the padded position is hidden after it: the
+    /// selecting body over a camping capacity gives what plain attention gives, and still matches the
+    /// reference. Mutation: have `hide_padding` append a visible (zero) column; the padded zero key takes
+    /// softmax mass and the output goes red.
+    #[test]
+    fn a_selector_over_a_padded_cache_matches_plain_attention() {
+        for o in [
+            BASE,
+            Opts {
+                positions: Positions::Alibi,
+                ..BASE
+            },
+        ] {
+            let fx = fixture(o);
+            let cache_len = KV_HEADS * CAP * HEAD_DIM;
+            let state = [oracle::random(cache_len, 41), oracle::random(cache_len, 42)];
+            let x = oracle::random(2 * WIDTH, 43);
+            let pos = [5, 6];
+            let plain = run_with(&fx, o, &x, &pos, &state, false);
+            let selected = run_with(&fx, o, &x, &pos, &state, true);
+            assert_eq!(plain.0, selected.0, "{o:?}: the selecting body differs");
+            assert_eq!(plain.1, selected.1, "{o:?}: the selected caches differ");
+        }
+    }
+
+    /// A contiguous step stores one head position more than its capacity when that stride camps and attends
+    /// over the stored extent; a paged step keeps the capacity (its pool view is exempt).
+    /// Mutation: `HeadSpan::padded` returns the capacity; the contiguous stored extent is `CAP` and this
+    /// goes red.
+    #[test]
+    fn a_camping_capacity_stores_one_position_more() {
+        let fx = fixture(BASE);
+        let p = params(BASE);
+        let w = AttentionWeights::new(&fx.map(), 2, WIDTH, &p).unwrap();
+        for kv in [
+            KvLayout::Contiguous,
+            KvLayout::Paged {
+                pool_slots: NonZeroUsize::new(POOL).unwrap(),
+                seqs: NonZeroUsize::MIN,
+            },
+        ] {
+            let b = Builder::for_tests();
+            let step = Step::new(
+                &b,
+                StepShape {
+                    rows: NonZeroUsize::MIN,
+                    tokens: NonZeroUsize::MIN,
+                    capacity: NonZeroUsize::new(CAP).unwrap(),
+                    kv,
+                    logits: LogitRows::All,
+                    hidden: None,
+                },
+            )
+            .unwrap();
+            let xs = b.constant("x", TensorType::f32(vec![1, 1, WIDTH])).unwrap();
+            let y = attention(&b, &step, 2, xs, &w, &p).unwrap();
+            let g = step.finish(b, y).unwrap();
+            let shapes: Vec<Vec<usize>> = g
+                .state_pairs()
+                .map(|pair| g.meta(pair.input).aval.shape.clone())
+                .collect();
+            let want = match kv {
+                KvLayout::Contiguous => vec![1, KV_HEADS, CAP + 1, HEAD_DIM],
+                KvLayout::Paged { .. } => vec![POOL, KV_HEADS, HEAD_DIM],
+            };
+            assert_eq!(shapes, vec![want.clone(), want], "{kv:?}");
+            // Contiguous attention reads (and masks) the stored extent; a paged one never sees it.
+            let spans_stored = g
+                .eqns()
+                .iter()
+                .any(|eqn| g.meta(eqn.out).aval.shape.last() == Some(&(CAP + 1)));
+            assert_eq!(
+                spans_stored,
+                kv == KvLayout::Contiguous,
+                "{kv:?}: values over the stored positions"
+            );
+        }
     }
 
     /// SC-001: Q/K RMSNorm per head (Qwen3) and over the whole projection (OLMo 2), before RoPE.
@@ -1297,11 +1539,12 @@ mod tests {
             let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH])).unwrap();
             let y = attention(&b, &step, 2, xs, &w, &p).unwrap();
             let g = step.finish(b, y).unwrap();
-            fx.eval(
+            eval_logical(
+                fx,
                 &g,
-                &[("x", x)],
+                x,
                 &[(Slot::Token, &[0; 3]), (Slot::Pos, pos)],
-                &[&state[0], &state[1]],
+                state,
             )
         };
         let cache_len = H * cap * D;
@@ -1448,8 +1691,8 @@ mod tests {
     }
 
     /// One step over `rows` rows of `t` tokens each, contiguous or paged, on the oracle. `pos` is
-    /// `[rows * t]`. Paged: `state` is the two pools, `maps` the read `[rows * CAP]` and write
-    /// `[pool]` maps.
+    /// `[rows * t]`. Paged: `state` is the two pools, `maps` the read `[rows * CAP]` and the forward
+    /// write `[rows * t]` maps.
     fn run_rows(
         fx: &Fx,
         o: Opts,
@@ -1494,15 +1737,28 @@ mod tests {
         let tokens = vec![0; rows * t];
         let named: Vec<(&str, &[i32])> = match paged {
             None => Vec::new(),
-            Some((_, read, write)) => vec![("slotmap.read", read), ("slotmap.write", write)],
+            Some((_, read, write)) => vec![("slotmap.read", read), ("writemap.write", write)],
         };
-        fx.eval_named(
-            &g,
-            &[("x", x)],
-            &[(Slot::Token, &tokens), (Slot::Pos, pos)],
-            &named,
-            &[&state[0], &state[1]],
-        )
+        match paged {
+            None => {
+                let stored = [stored_cache(&state[0]), stored_cache(&state[1])];
+                let (y, caches) = fx.eval_named(
+                    &g,
+                    &[("x", x)],
+                    &[(Slot::Token, &tokens), (Slot::Pos, pos)],
+                    &named,
+                    &[&stored[0], &stored[1]],
+                );
+                (y, caches.iter().map(|c| logical_cache(c)).collect())
+            }
+            Some(_) => fx.eval_named(
+                &g,
+                &[("x", x)],
+                &[(Slot::Token, &tokens), (Slot::Pos, pos)],
+                &named,
+                &[&state[0], &state[1]],
+            ),
+        }
     }
 
     /// Two contiguous rows at different positions over different caches produce, for each row, what
@@ -1569,7 +1825,7 @@ mod tests {
         });
     }
 
-    const POOL: usize = 40;
+    const POOL: usize = 2 * CAP + 8;
 
     /// The pool slot of row `r`'s logical position `j`: the two rows interleave their slots, so
     /// neither row's blocks are contiguous.
@@ -1590,12 +1846,12 @@ mod tests {
         let read: Vec<i32> = (0..2)
             .flat_map(|r| (0..CAP).map(move |j| slot_of(r, j)))
             .collect();
-        let mut write = vec![-1; POOL];
-        for (r, row) in positions.iter().enumerate() {
-            for (i, &p) in row.iter().enumerate() {
-                write[slot_of(r, p) as usize] = (r * t + i) as i32;
-            }
-        }
+        // The forward map: flat token `r * t + i` writes the slot of its position.
+        let write: Vec<i32> = positions
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| row.iter().map(move |&p| slot_of(r, p)))
+            .collect();
         let x = oracle::random(2 * t * WIDTH, 83);
         let pos: Vec<i32> = positions.iter().flatten().map(|&p| p as i32).collect();
         let (got, got_pools) = run_rows(
@@ -1670,10 +1926,7 @@ mod tests {
             .flat_map(|r| (0..CAP).map(move |j| slot_of(r, j)))
             .collect();
         // Row 1's first token is padding: it writes nowhere; its second token (position 3) does.
-        let mut write = vec![-1; POOL];
-        write[slot_of(0, 1) as usize] = 0;
-        write[slot_of(0, 2) as usize] = 1;
-        write[slot_of(1, 3) as usize] = 3;
+        let write = [slot_of(0, 1), slot_of(0, 2), -1, slot_of(1, 3)];
         let x = oracle::random(2 * t * WIDTH, 93);
         let (_, got) = run_rows(
             &fx,

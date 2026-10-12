@@ -1,5 +1,5 @@
 //! The one index-validity rule every index-consuming op shares (R470-008, R470-011): `Gather`,
-//! `Scatter`, `ScatterUpdate`'s non-keep-base rows, `DynamicUpdateSlice`'s runtime start, `ArgTopK`'s
+//! `Scatter`, `ScatterUpdate`'s non-padding slots, `DynamicUpdateSlice`'s runtime start, `ArgTopK`'s
 //! rank and `IndexedMatMul`'s expert id all read one row-selecting integer through [`index_at`]
 //! instead of each restating its own rounding and bounds check.
 
@@ -40,6 +40,9 @@ pub enum IndexFaultKind {
     Negative,
     /// The value is a non-negative integer but `>= len`.
     OutOfRange,
+    /// A row-writing index names a row an earlier position already named: two source rows would write one
+    /// slot (see [`claim_row`]).
+    Duplicate,
 }
 
 /// One index read refused: `value` at `position` of the index operand cannot select a row of
@@ -103,4 +106,27 @@ pub(crate) fn index_at(
         return Err(fault(IndexFaultKind::OutOfRange));
     }
     Ok(selected)
+}
+
+/// Mark `row` (selected by `value` at `position` of an index operand over `len` rows) as written, or
+/// refuse with [`IndexFaultKind::Duplicate`] when an earlier position already wrote it. `claimed` holds one
+/// flag per row. The row-writing ops whose result would depend on write order are refused here, so a
+/// plausible last-writer-wins value never stands in for a write race.
+pub(crate) fn claim_row(
+    claimed: &mut [bool],
+    row: usize,
+    value: IndexValue,
+    position: usize,
+    eqn: ValueId,
+) -> Result<(), EvalError> {
+    if std::mem::replace(&mut claimed[row], true) {
+        return Err(EvalError::Index(Box::new(IndexFault {
+            eqn,
+            position,
+            value,
+            len: claimed.len(),
+            kind: IndexFaultKind::Duplicate,
+        })));
+    }
+    Ok(())
 }

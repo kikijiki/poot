@@ -901,7 +901,7 @@ mod tests {
             .constant("src", TensorType::new(vec![1, 5], DType::E4M3FN))
             .unwrap();
         let inverse = builder
-            .constant("inverse", TensorType::new(vec![2], DType::I32))
+            .constant("inverse", TensorType::new(vec![1], DType::I32))
             .unwrap();
         let output = builder.scatter_update(base, src, inverse).unwrap();
         let graph = builder.finish(output).unwrap();
@@ -916,7 +916,7 @@ mod tests {
             ),
             (
                 inverse.id(),
-                crate::Value::Host(poot_tensor::HostTensor::f32(vec![2], vec![0.0, -1.0])),
+                crate::Value::Host(poot_tensor::HostTensor::f32(vec![1], vec![0.0])),
             ),
         ]);
 
@@ -966,7 +966,7 @@ mod tests {
             .constant("src", TensorType::new(vec![2, 5], DType::E4M3FN))
             .unwrap();
         let inverse = builder
-            .constant("inverse", TensorType::new(vec![3], DType::I32))
+            .constant("inverse", TensorType::new(vec![2], DType::I32))
             .unwrap();
         let output = builder.scatter_update(base, src, inverse).unwrap();
         let graph = builder.finish(output).unwrap();
@@ -982,7 +982,7 @@ mod tests {
             (src.id(), crate::Value::Host(src_value)),
             (
                 inverse.id(),
-                crate::Value::Host(poot_tensor::HostTensor::i32(vec![3], vec![1, -1, 0])),
+                crate::Value::Host(poot_tensor::HostTensor::i32(vec![2], vec![2, 0])),
             ),
         ]);
         let crate::Value::Host(got) = crate::eval(

@@ -91,12 +91,19 @@ fn real_decode_graph(dense: poot_models::test_support::dense::Dense, cap: usize)
 
 /// Dispatches per token of the 24-layer Qwen2.5-0.5B real-config decode graph (the legacy tracer planned 415).
 /// POOT-725 made the `Cast(Slot::Pos -> F32)` of the position a kernel (368); POOT-1108 folds it into the
-/// mask region that reads it, so the launch is gone again.
-const QWEN2_0_5B_DISPATCHES: usize = 367;
+/// mask region that reads it, so the launch is gone again. POOT-1150: +3, the hidden pad column of the
+/// padded KV stride (one iota-built column and its concat, shared by every layer's mask; capacity 64 camps).
+const QWEN2_0_5B_DISPATCHES: usize = 370;
 
 /// Dispatches per token of the 28-layer Qwen3-0.6B real-config decode graph (the legacy tracer planned 539).
-/// POOT-725: 484; POOT-1108: 483, the position cast folded as for Qwen2.5 above.
-const QWEN3_0_6B_DISPATCHES: usize = 483;
+/// POOT-725: 484; POOT-1108: 483, the position cast folded as for Qwen2.5 above; POOT-1150: 486, the hidden
+/// pad column as above.
+const QWEN3_0_6B_DISPATCHES: usize = 486;
+
+/// Dispatches per token of the same Qwen2.5-0.5B config traced over a paged KV pool: the contiguous decode's
+/// minus the one the in-place write does not need. Before attention read the pools in place this was 96 more
+/// (one gather and one transpose per layer and per K and V).
+const QWEN2_0_5B_PAGED_DISPATCHES: usize = 366;
 
 /// Dispatches `program` runs per step: every planned equation but the free ones (an alias or a strided view).
 fn dispatches(program: &Program) -> usize {
@@ -144,6 +151,74 @@ fn dispatch_count_planned_regression_on_real_qwen2_decode_configs() {
                 "{name} {backend:?}: a weight cast still dispatches"
             );
         }
+    }
+}
+
+/// POOT-1149: a paged decode of the real Qwen2.5-0.5B config reads each layer's K and V pools in place. Every
+/// layer's attention is one `Paged` attention over the scatter-updated pools and the read map, so the plan holds
+/// no gather and no transpose of a materialized `[rows, hkv, capacity, d]` view: the 96 per-step gather and
+/// transpose dispatches of the gathered view are gone and the step dispatches no more than the contiguous one.
+///
+/// Mutation: drop the `peel_paged_kv` call in `match_attention`; the attentions stay `Single` over a gathered
+/// view, the gather and transpose dispatches return, and the count rows go red.
+#[test]
+fn a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_the_pools() {
+    use poot_graph_ir::KeyLayout;
+    use poot_models::model::{LogitRows, Phase};
+    use poot_models::test_support::dense::paged_step;
+
+    let (cap, layers) = (64usize, 24usize);
+    let paged = qwen2_0_5b()
+        .zeroed_model(GDt::BF16)
+        .model
+        .trace(
+            Phase::Decode,
+            paged_step(1, 1, cap, 4 * cap, LogitRows::Last),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .expect("the family traces a paged decode step");
+    for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
+        let program = compiled(&paged, backend);
+        let graph = program.graph();
+        let attentions: Vec<_> = graph
+            .eqns()
+            .iter()
+            .filter_map(|eqn| match &eqn.op {
+                OpKind::Attention(attrs) => Some(attrs.key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attentions,
+            vec![KeyLayout::Paged; layers],
+            "{backend:?}: every layer's attention reads its pools in place"
+        );
+        let written: std::collections::HashSet<ValueId> = graph
+            .eqns()
+            .iter()
+            .filter(|eqn| matches!(eqn.op, OpKind::ScatterUpdate))
+            .map(|eqn| eqn.out)
+            .collect();
+        assert_eq!(
+            written.len(),
+            2 * layers,
+            "{backend:?}: one pool write per K and V"
+        );
+        let reshaped_pool = graph.eqns().iter().find(|eqn| {
+            matches!(eqn.op, OpKind::Gather { .. } | OpKind::Transpose { .. })
+                && eqn.inputs.iter().any(
+                    |operand| matches!(operand, Operand::Value(value) if written.contains(value)),
+                )
+        });
+        assert!(
+            reshaped_pool.is_none(),
+            "{backend:?}: the plan still gathers or transposes a written pool: {reshaped_pool:?}"
+        );
+        assert_eq!(
+            dispatches(&program),
+            QWEN2_0_5B_PAGED_DISPATCHES,
+            "{backend:?}: a paged decode's dispatches moved off its pin"
+        );
     }
 }
 

@@ -1364,10 +1364,10 @@ mod tests {
             .constant("base", TensorType::new(vec![2, 5], DType::E4M3FN))
             .unwrap();
         let src = b.constant("src", TensorType::f32(vec![1, 5])).unwrap();
-        let inverse = b
-            .constant("inverse", TensorType::new(vec![2], DType::I32))
+        let slots = b
+            .constant("slots", TensorType::new(vec![1], DType::I32))
             .unwrap();
-        let out = b.scatter_update(base, src, inverse).unwrap();
+        let out = b.scatter_update(base, src, slots).unwrap();
         let refusal = refusal(
             compile(&b.finish(out).unwrap(), &wgpu(), &REPLAY),
             "E4M3FN ScatterUpdate over an f32 source",
@@ -2217,11 +2217,11 @@ mod tests {
         assert_eq!(read_element(region_plan, leaf), poot_kernel_ir::Ty::I32);
     }
 
-    /// An I32 slot that is a Gather index and a `ScatterUpdate` inverse map reads both on `Slice<i32>`, and
+    /// An I32 slot that is a Gather index and a `ScatterUpdate` slot map reads both on `Slice<i32>`, and
     /// `compile` plans one dense I32 buffer for the slot.
     ///
-    /// Mutation (never left in the tree): type the scatter's inverse map as `Ty::F32`
-    /// (`planner/movement.rs`) -> `Plan(I32ReadAsF32)`.
+    /// Mutation (never left in the tree): type the scatter's slot map as `Ty::F32`
+    /// (`kernelgen data_movement`) -> `Plan(I32ReadAsF32)`.
     #[test]
     fn compile_reads_an_i32_slot_on_one_lane_for_gather_and_scatter_update() {
         let b = Builder::for_tests();
@@ -2267,8 +2267,147 @@ mod tests {
             .planned()
             .find(|(eqn, _)| matches!(eqn.op, OpKind::ScatterUpdate))
             .expect("the scatter survives compile");
-        // ScatterUpdate operands are (base, src, inv).
-        assert_eq!(read_element(scatter_plan, 2), poot_kernel_ir::Ty::I32);
+        // The scatter kernel reads (src, slots): the base is the output's own buffer.
+        assert_eq!(read_element(scatter_plan, 1), poot_kernel_ir::Ty::I32);
+    }
+
+    /// POOT-1148: the scatter kernel writes only the rows its slot map names, so its output must be donated to
+    /// its base's state buffer. `compile` (the production entry) refuses a graph where it cannot be, naming
+    /// the scatter: a step that also reads the pool as it was before the write, or a scatter over a value
+    /// that is not carried state. Both targets differ from the donated shape only in what reads the base.
+    ///
+    /// Mutation: drop the `ScatterNotInPlace` check in `state_commit_from_plans`; both graphs compile and the
+    /// rows go red with "expected ScatterNotInPlace, got Ok".
+    #[test]
+    fn compile_refuses_a_scatter_whose_output_cannot_be_donated_to_its_base() {
+        let reads_old_pool = || {
+            let b = Builder::for_tests();
+            let pool = b
+                .state_input(
+                    "pool",
+                    TensorType::f32(vec![8, 4]),
+                    StateRole::Positional { axis: 0 },
+                )
+                .unwrap();
+            let new = b
+                .slot(Slot::Activation, TensorType::f32(vec![2, 4]))
+                .unwrap();
+            let write = b.write_map("write", 2, 8).unwrap();
+            let read = b
+                .slot_named(Slot::SlotMap, "read", TensorType::new(vec![3], DType::I32))
+                .unwrap();
+            let written = b.scatter_update(pool, new, write).unwrap();
+            let stale = b.gather(pool, 0, read).unwrap();
+            let out = b
+                .binary(BinOp::Add, stale, b.gather(written, 0, read).unwrap())
+                .unwrap();
+            let g = b
+                .finish(poot_graph_ir::Outputs::new(out).with_state(&[(pool, written)]))
+                .unwrap();
+            (g, written.id())
+        };
+        let not_state = || {
+            let b = Builder::for_tests();
+            let base = b
+                .slot(Slot::Activation, TensorType::f32(vec![8, 4]))
+                .unwrap();
+            let new = b
+                .slot_named(Slot::Activation, "new", TensorType::f32(vec![2, 4]))
+                .unwrap();
+            let write = b.write_map("write", 2, 8).unwrap();
+            let written = b.scatter_update(base, new, write).unwrap();
+            (b.finish(written).unwrap(), written.id())
+        };
+        for (what, (graph, scatter)) in [
+            ("a pool read before the write", reads_old_pool()),
+            ("a base that is not state", not_state()),
+        ] {
+            match compile(&graph, &wgpu(), &REPLAY) {
+                Err(CompileError::Plan(error)) => assert!(
+                    matches!(*error, PlanError::ScatterNotInPlace { value } if value == scatter),
+                    "{what}: {error:?}"
+                ),
+                other => panic!(
+                    "{what}: expected ScatterNotInPlace, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+        }
+    }
+
+    /// POOT-1149: attention that reads its K and V pools in place must read the pools the step wrote. A paged
+    /// attention over the pools as they were before this step's write is not buildable: the pools' scatter
+    /// updates donate their buffers, and a reader of the pre-write pool makes that impossible. `compile`
+    /// refuses it with `ScatterNotInPlace`, naming the K scatter, where the same attention over the written
+    /// pools compiles and fuses to one `Paged` attention.
+    ///
+    /// Mutation: in `write_paged`, view the pool state input instead of the scatter's output (the models' own
+    /// tracer): `a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_the_pools` goes
+    /// red with `the graph compiles: Plan(ScatterNotInPlace { value: v66 })`; and drop the `ScatterNotInPlace`
+    /// check in `state_commit_from_plans` and this row goes red with "expected ScatterNotInPlace, got Ok".
+    #[test]
+    fn a_paged_attention_over_the_pools_before_the_write_is_refused_and_after_it_fuses() {
+        let build = |stale: bool| {
+            let b = Builder::for_tests();
+            let pool = |name: &str| {
+                b.state_input(
+                    name,
+                    TensorType::f32(vec![8, 2, 4]),
+                    StateRole::Positional { axis: 0 },
+                )
+                .unwrap()
+            };
+            let (k_pool, v_pool) = (pool("k_pool"), pool("v_pool"));
+            let new = |name: &str| {
+                b.slot_named(Slot::Activation, name, TensorType::f32(vec![2, 2, 4]))
+                    .unwrap()
+            };
+            let write = b.write_map("write", 2, 8).unwrap();
+            let read = b.read_map("read", 1, 3, 8).unwrap();
+            let k_written = b.scatter_update(k_pool, new("new_k"), write).unwrap();
+            let v_written = b.scatter_update(v_pool, new("new_v"), write).unwrap();
+            let (k_read, v_read) = if stale {
+                (k_pool, v_pool)
+            } else {
+                (k_written, v_written)
+            };
+            let q = b
+                .slot_named(Slot::Activation, "q", TensorType::f32(vec![1, 2, 1, 4]))
+                .unwrap();
+            let mask = b
+                .slot_named(Slot::Activation, "mask", TensorType::f32(vec![1, 1, 1, 3]))
+                .unwrap();
+            let k = poot_graph_ir::ops::paged_view(&b, k_read, read).unwrap();
+            let v = poot_graph_ir::ops::paged_view(&b, v_read, read).unwrap();
+            let out = poot_graph_ir::ops::attention_masked(&b, q, k, v, 1, 0.5, mask).unwrap();
+            let graph = b
+                .finish(
+                    poot_graph_ir::Outputs::new(out)
+                        .with_state(&[(k_pool, k_written), (v_pool, v_written)]),
+                )
+                .unwrap();
+            (graph, k_written.id())
+        };
+        let (stale, k_scatter) = build(true);
+        match compile(&stale, &wgpu(), &REPLAY) {
+            Err(CompileError::Plan(error)) => assert!(
+                matches!(*error, PlanError::ScatterNotInPlace { value } if value == k_scatter),
+                "{error:?}"
+            ),
+            other => panic!("expected ScatterNotInPlace, got {:?}", other.map(|_| ())),
+        }
+        let (fresh, _) = build(false);
+        let program = compile(&fresh, &wgpu(), &REPLAY).expect("the post-write read compiles");
+        let keys: Vec<_> = program
+            .graph()
+            .eqns()
+            .iter()
+            .filter_map(|eqn| match &eqn.op {
+                OpKind::Attention(attrs) => Some(attrs.key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, [poot_graph_ir::KeyLayout::Paged]);
     }
 
     /// POOT-1074: an I32 state pool read by a `Gather` and written back by a `ScatterUpdate` (the paged PLE
@@ -2286,9 +2425,7 @@ mod tests {
         let read = b
             .slot(Slot::Pos, TensorType::new(vec![2], DType::I32))
             .unwrap();
-        let write = b
-            .slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32))
-            .unwrap();
+        let write = b.write_map("write", 2, 4).unwrap();
         let x = b
             .slot(Slot::Activation, TensorType::new(vec![2, 3], DType::I32))
             .unwrap();
@@ -2309,15 +2446,23 @@ mod tests {
         }
     }
 
-    /// POOT-1074: an I32 `ScatterUpdate` that is NOT a state edge moves its base's and its source's words.
-    /// Here the result is gathered as a table while the source is also cast to F32; every reader of the
-    /// source reads `Slice<i32>`.
+    /// POOT-1074: an I32 pool written by a `ScatterUpdate` moves its source's words as I32. Here the
+    /// updated pool is gathered as a table while the source is also cast to F32 by another state's update;
+    /// every reader of the source reads `Slice<i32>`.
     #[test]
     fn compile_plans_an_i32_scatter_update_source_beside_a_cast_reader() {
         let b = Builder::for_tests();
-        // The cast readers' words are proven exact: the base is an iota table and the source declares
-        // its range, so the result of the scatter (one or the other) is inside `[0, 12)`.
-        let base = b.reshape(b.iota_i32(12).unwrap(), vec![4, 3]).unwrap();
+        let pool = b
+            .state_input(
+                "pool",
+                TensorType::new(vec![4, 3], DType::I32),
+                StateRole::Recurrent,
+            )
+            .unwrap();
+        let seen = b
+            .state_input("seen", TensorType::f32(vec![2, 3]), StateRole::Recurrent)
+            .unwrap();
+        // The cast reader's words are proven exact: the source declares its range.
         let src = b
             .slot_ranged(
                 Slot::Activation,
@@ -2325,20 +2470,20 @@ mod tests {
                 IndexRange::below(12).unwrap(),
             )
             .unwrap();
-        let inv = b
-            .slot(Slot::SlotMap, TensorType::new(vec![4], DType::I32))
-            .unwrap();
+        let slots = b.write_map("write", 2, 4).unwrap();
         let at = b
             .slot(Slot::Pos, TensorType::new(vec![2], DType::I32))
             .unwrap();
-        let updated = b.scatter_update(base, src, inv).unwrap();
-        let rows = b
-            .cast(b.gather(updated, 0, at).unwrap(), DType::F32)
+        let updated = b.scatter_update(pool, src, slots).unwrap();
+        let rows = b.gather(updated, 0, at).unwrap();
+        let seen_next = b
+            .binary(BinOp::Add, seen, b.cast(src, DType::F32).unwrap())
             .unwrap();
-        let out = b
-            .binary(BinOp::Add, rows, b.cast(src, DType::F32).unwrap())
+        let g = b
+            .finish(
+                poot_graph_ir::Outputs::new(rows).with_state(&[(pool, updated), (seen, seen_next)]),
+            )
             .unwrap();
-        let g = b.finish(out).unwrap();
         for backend in [
             Backend::SpirvVulkan,
             Backend::Nvptx,
@@ -2855,7 +3000,7 @@ mod tests {
     }
 
     /// The same agreement reached through an alias: the I32 `[4]` slot is the Gather's index, and its
-    /// `Reshape` round trip (a `Plan::Alias` of the slot's buffer) is the scatter's inverse map. `compile`
+    /// `Reshape` round trip (a `Plan::Alias` of the slot's buffer) is the scatter's slot map. `compile`
     /// plans the slot as dense I32 for both readers.
     #[test]
     fn compile_reads_an_i32_buffer_on_one_lane_through_an_alias() {

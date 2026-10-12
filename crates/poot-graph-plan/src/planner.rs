@@ -207,6 +207,7 @@ mod sampling;
 mod scan;
 
 pub use choice::Planned;
+pub(crate) use choice::PlannedDispatch;
 pub use choice::{KernelChoice, NoDispatch};
 pub(crate) use matmul::epilogue_head_lowers;
 

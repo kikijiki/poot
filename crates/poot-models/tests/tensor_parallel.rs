@@ -218,7 +218,17 @@ fn decode_step(graph: &Graph) -> Step {
                 .then(|| meta.aval.shape.clone())
         })
     };
-    let pool_slots = slot_shape(Slot::SlotMap, 1).map_or(1, |shape| shape[0]);
+    // The pool is the extent the write map's declared range ends at.
+    let pool_slots = graph
+        .inputs()
+        .iter()
+        .find_map(|&input| {
+            let meta = graph.meta(input);
+            (meta.storage == Storage::Slot(Slot::WriteMap))
+                .then(|| meta.range().map(|range| range.hi_exclusive() as usize))
+                .flatten()
+        })
+        .unwrap_or(1);
     let rows = slot_shape(Slot::Token, 2).map_or(1, |shape| shape[0]);
     for &input in graph.inputs() {
         let meta = graph.meta(input);
@@ -246,7 +256,7 @@ fn decode_step(graph: &Graph) -> Step {
             }
             // The paged slot maps: a row's logical position `t` reads pool slot `pool_slot(row, t)`;
             // the step's one token per row (position 3) writes the slot its position maps to.
-            Storage::Slot(Slot::SlotMap) if shape.len() == 2 => {
+            Storage::Slot(Slot::SlotMap) => {
                 let cap = shape[1];
                 let pool = pool_slots;
                 let map = (0..rows)
@@ -257,12 +267,10 @@ fn decode_step(graph: &Graph) -> Step {
                     HostTensor::i32(shape, map),
                 );
             }
-            Storage::Slot(Slot::SlotMap) => {
-                let pool = shape[0];
-                let mut map = vec![-1i32; pool];
-                for row in 0..rows {
-                    map[pool_slot(row, 3, pool)] = row as i32;
-                }
+            Storage::Slot(Slot::WriteMap) => {
+                let map = (0..rows)
+                    .map(|row| pool_slot(row, 3, pool_slots) as i32)
+                    .collect();
                 slots.insert(
                     meta.slot_key().cloned().unwrap(),
                     HostTensor::i32(shape, map),

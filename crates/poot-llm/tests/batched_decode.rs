@@ -107,12 +107,9 @@ fn assert_paged_matches_contiguous(
             .flat_map(|r| (0..CAP).map(move |t| (r, t)))
             .map(|(r, t)| read(r, t) as i32)
             .collect();
-        let mut write = vec![-1i32; pool_slots];
-        for r in 0..BATCH {
-            write[read(r, s)] = r as i32;
-        }
+        let write: Vec<i32> = (0..BATCH).map(|r| read(r, s) as i32).collect();
         let mut paged_slots = token_pos(BATCH, 1, ids, &pos);
-        paged_slots.extend(slot_maps(BATCH, CAP, pool_slots, read_map, write));
+        paged_slots.extend(slot_maps(BATCH, CAP, read_map, write));
         let (pl, next) = step(&m, &paged, &paged_slots, &p_state);
         p_state = next;
 

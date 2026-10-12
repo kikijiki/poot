@@ -143,7 +143,6 @@
             pkgs.jq            # JSON queries in scripts/test-model-free.sh
             pkgs.cargo-nextest # test runner
             pkgs.cargo-machete # unused-dependency check (`just machete`)
-            pkgs.cargo-mutants # mutation-sampling recipe (`just mutation-sample`, card 538)
 
             pkgs.prettier # markdown autoformatter (`just docs-fix`)
             pkgs.lychee   # broken-link checker for the docs (`just docs-check`)

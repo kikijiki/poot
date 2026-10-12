@@ -67,7 +67,7 @@ target grid limit. It recognizes supported attention subgraphs and replaces them
 query row against the prompt) are the same op: `q [B, Hq, Lq, Dk]`, `k [B, Hkv, Lk, Dk]`,
 `v [B, Hkv, Lk, Dv]` (the value width is independent of the key width), an additive
 `mask [B, Hm, Lq, Lk]` whose head axis is 1 or `Hq` (ALiBi), and an optional attention-logit
-softcap. Two more forms ride on the same op: a split key (below) and a live length.
+softcap. Three more forms ride on the same op: a split key, a paged key and a live length (below).
 
 The planner turns the eqn into one generation request that names the shape, the score
 transform (scale, or scale plus softcap), the mask kind, the key bound and the schedule. One
@@ -115,7 +115,7 @@ A key whose score is `-inf` adds exactly zero weight, and a row with no visible 
 `0 / 0`, as the oracle's softmax gives. Peak memory is **O(head_dim)** per workgroup: the
 `[Lq x Lk]` score matrix is never written.
 
-## Split keys and the live length
+## Split keys, paged keys and the live length
 
 **Split keys.** Multi-head latent attention [^mla] builds each key from a per-head part and one
 rotary part shared by every head: `concat(k_nope, broadcast(k_pe))`. The rewrite recognizes that
@@ -123,6 +123,17 @@ chain and keeps the two parts as separate operands, `k [B, Hkv, Lk, Dk - s]` and
 `k_shared [B, 1, Lk, s]`. The kernel reads the shared part once per key for every head, so the
 broadcast key is never built. A value narrower than the key (DeepSeek-V2: key width 192, value width
 128) is part of the op's type.
+
+**Paged keys.** A paged KV cache keeps K and V in per-layer pools of fixed slots (see
+[Paged KV](#kv-cache)). The paged key form takes the pools themselves, `k [S, Hkv, Dk]` and
+`v [S, Hkv, Dv]`, and an `I32 read [B, Lk]` operand that names the pool slot of each logical
+position. The kernel addresses key `t` of row `b` and key head `g` as pool row
+`read[b, t] * Hkv + g`, so the per-row `[B, Hkv, Lk, D]` view is never gathered or transposed. The
+schedule, live length and mask handling are the ones the dense form uses; only the address
+differs. The rewrite fuses a paged key only when the graph proves every word of `read` is a slot of
+the pool (the map's declared range, which the bind enforces); otherwise the attention stays over the
+gathered view. Attention that reads other cached values (latent, indexer and sliding-window caches)
+keeps the gathered view.
 
 **Live length.** A decode over a capacity-long cache normally visits every slot and lets the mask
 hide the unused ones. The live form takes an `I32 len [B]` operand and visits only the first
@@ -203,14 +214,19 @@ sequence length.
 **Paged KV** [^pagedattn]: K/V space is divided into fixed-size blocks (16 tokens,
 `poot_llm::driver::block_table::BLOCK_SIZE`) from a shared pool, inspired by virtual memory
 management in operating systems. Each layer holds one `[pool_slots, kv_heads, head_dim]` pool
-shared by every row of a step. The driver keeps a block table per sequence and binds two
-`Slot::SlotMap` inputs per step: `read`, an `[rows, cap]` i32 map from each row's logical position
-to its flat physical slot, and `write`, a `[pool_slots]` i32 map from a pool slot to the step's
-token that writes it (or -1, which leaves the slot alone, so a padding token writes nothing). The
-paged graph writes new rows with `ScatterUpdate` through `write`, then gathers each row's K/V
-through `read` and applies the same causal mask as the contiguous layout. Blocks are allocated on
-demand and freed when the sequence completes. Memory scales with actual usage. Shared prefix
-blocks enable prefix caching across requests.
+shared by every row of a step. The driver keeps a block table per sequence and binds two inputs
+per step: `read` (`Slot::SlotMap`), an `[rows, cap]` i32 map from each row's logical position to
+its flat physical slot, and `write` (`Slot::WriteMap`), a `[rows * tokens]` i32 map from each new
+token to the pool slot it is written to (or -1, so a padding token writes nothing). A write map is
+bound only as a checked `ForwardSlotMap`, which refuses a slot outside the pool or named twice. The
+read map is declared in `[0, pool_slots)`, so a word outside the pool is refused at the bind as a
+typed range error before anything dispatches. The
+paged graph writes new rows with `ScatterUpdate` through `write`, in place on the donated pool and
+at a cost that follows the tokens, not the pool. Attention then reads each row's K/V from the
+written pools in place through `read` (a paged key, see [Paged keys](#split-keys-paged-keys-and-the-live-length)), with no gather and no transpose, and
+applies the same causal mask as the contiguous layout. Blocks are allocated on demand and freed
+when the sequence completes. Memory scales with actual usage. Shared prefix blocks enable prefix
+caching across requests.
 
 ## Prefix caching
 

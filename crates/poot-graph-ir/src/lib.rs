@@ -25,6 +25,8 @@ pub mod packed_source;
 /// The interval analysis of I32 values and the declared slot ranges it starts from (POOT-726).
 pub mod range;
 pub mod rope_table;
+/// The checked forward write map of an in-place row write.
+mod slot_map;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod types;
@@ -61,4 +63,5 @@ pub use packed_source::{
     packed_stack_source_type,
 };
 pub use range::{IndexRange, RangeFacts, value_ranges};
+pub use slot_map::{ForwardSlotMap, SlotMapError};
 pub use types::{Scalar, TensorType};

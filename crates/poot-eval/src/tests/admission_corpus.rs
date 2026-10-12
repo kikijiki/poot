@@ -426,13 +426,13 @@ fn gather_scatter_scatter_update_evaluate() {
     let b = Builder::for_tests();
     let base = b.constant("base", TensorType::f32(vec![3, 1])).unwrap();
     let src = b.constant("src", TensorType::f32(vec![2, 1])).unwrap();
-    let inv = graph_fixtures::i32_constant(&b, "inv", vec![3]).unwrap();
-    let out = b.scatter_update(base, src, inv).unwrap();
+    let slots = graph_fixtures::i32_constant(&b, "slots", vec![2]).unwrap();
+    let out = b.scatter_update(base, src, slots).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([
         (base.id(), HostTensor::f32(vec![3, 1], vec![0.0, 0.0, 0.0])),
         (src.id(), HostTensor::f32(vec![2, 1], vec![9.0, 8.0])),
-        (inv.id(), HostTensor::i32(vec![3], vec![-1, 1, 0])),
+        (slots.id(), HostTensor::i32(vec![2], vec![2, 1])),
     ]);
     let out = eval_every_combination("scatter_update", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[0.0, 8.0, 9.0]);
@@ -1473,55 +1473,61 @@ fn movement_ops_match_the_literal_index_permutation_on_every_t_copy_lane() {
 // ---------------------------------------------------------------------------------------------
 // SC-004 (card 555): every other index reader goes through the one index rule.
 //
-// Mutation (recorded): in `ops::movement::generic::scatter_update`, change the `-1` keep-base guard
+// Mutation (recorded): in `ops::movement::generic::scatter_update`, change the `-1` padding guard
 // from `matches!(value, IndexValue::I32(-1))` to `match value { IndexValue::I32(v) => v < 0, .. }`
-// (treat every negative as keep-base). Confirmed red: the `-2` row below, which must fault, instead
-// silently kept the base row (no error, wrong-but-plausible output); reverted, confirmed green.
+// (treat every negative as padding). Confirmed red: the `-2` row below, which must fault, instead
+// silently skipped the row (no error, wrong-but-plausible output); reverted, confirmed green.
 #[test]
 fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_index_at() {
     use crate::ops::index_rule::IndexFaultKind;
 
-    // ScatterUpdate: inverse `-1` keeps the base row; `-2` and `pool` (== src rows) fault.
+    // ScatterUpdate: slot `-1` is padding (the row writes nothing); `-2`, `pool` (== 3) fault, and a slot
+    // named twice faults as a write race.
     {
         let b = Builder::for_tests();
         let base = b.constant("base", TensorType::f32(vec![3, 1])).unwrap();
         let src = b.constant("src", TensorType::f32(vec![2, 1])).unwrap();
-        let inv = graph_fixtures::i32_constant(&b, "inv", vec![3]).unwrap();
-        let out = b.scatter_update(base, src, inv).unwrap();
+        let slots = graph_fixtures::i32_constant(&b, "slots", vec![2]).unwrap();
+        let out = b.scatter_update(base, src, slots).unwrap();
         let g = b.finish(out).unwrap();
         let base_value = HostTensor::f32(vec![3, 1], vec![7.0, 8.0, 9.0]);
         let src_value = HostTensor::f32(vec![2, 1], vec![1.0, 2.0]);
-
-        let inputs = dense_inputs([
-            (base.id(), base_value.clone()),
-            (src.id(), src_value.clone()),
-            (inv.id(), HostTensor::i32(vec![3], vec![-1, 0, 1])),
-        ]);
-        let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-            .unwrap()
-            .output
-            .into_host()
-            .unwrap();
-        assert_eq!(
-            out.as_f32().unwrap(),
-            &[7.0, 1.0, 2.0],
-            "-1 keeps the base row"
-        );
-
-        for (bad, kind) in [
-            (-2, IndexFaultKind::Negative),
-            (2, IndexFaultKind::OutOfRange),
-        ] {
+        let run = |words: [i32; 2]| {
             let inputs = dense_inputs([
                 (base.id(), base_value.clone()),
                 (src.id(), src_value.clone()),
-                (inv.id(), HostTensor::i32(vec![3], vec![-1, bad, 1])),
+                (slots.id(), HostTensor::i32(vec![2], words.to_vec())),
             ]);
-            let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+            eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        };
+
+        let out = run([1, 2]).unwrap().output.into_host().unwrap();
+        assert_eq!(
+            out.as_f32().unwrap(),
+            &[7.0, 1.0, 2.0],
+            "rows land at slots"
+        );
+        let out = run([-1, 0]).unwrap().output.into_host().unwrap();
+        assert_eq!(
+            out.as_f32().unwrap(),
+            &[2.0, 8.0, 9.0],
+            "-1 writes nothing; the other row lands"
+        );
+
+        for (words, position, kind) in [
+            ([-2, 1], 0, IndexFaultKind::Negative),
+            ([0, 3], 1, IndexFaultKind::OutOfRange),
+            ([2, 2], 1, IndexFaultKind::Duplicate),
+        ] {
+            let err = run(words).unwrap_err();
             let EvalError::Index(fault) = &err else {
-                panic!("ScatterUpdate inverse {bad}: expected EvalError::Index, got {err:?}")
+                panic!("ScatterUpdate slots {words:?}: expected EvalError::Index, got {err:?}")
             };
-            assert_eq!(fault.kind, kind, "ScatterUpdate inverse {bad}");
+            assert_eq!(
+                (fault.kind, fault.position),
+                (kind, position),
+                "ScatterUpdate slots {words:?}"
+            );
         }
     }
 

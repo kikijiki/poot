@@ -954,10 +954,10 @@ impl<'a> Sharder<'a> {
         Ok((eqn.op.clone(), inputs, layout))
     }
 
-    /// The paged KV write: `out[p, ..] = inv[p] >= 0 ? src[inv[p], ..] : base[p, ..]`. Rows are indexed on
-    /// axis 0 by the whole-valued slot map, so the write divides over ranks on any trailing axis (the
-    /// KV heads): each rank scatters its own heads' rows into its own pool, and the pool takes the layout
-    /// of what is written into it exactly like a contiguous cache.
+    /// The paged KV write: `out = base`, then `out[slots[t], ..] = src[t, ..]` for each `slots[t] >= 0`.
+    /// Rows are indexed on axis 0 by the whole-valued slot map, so the write divides over ranks on any
+    /// trailing axis (the KV heads): each rank scatters its own heads' rows into its own pool, and the
+    /// pool takes the layout of what is written into it exactly like a contiguous cache.
     fn scatter_update(&mut self, eqn: &Eqn, inputs: Vec<Operand>) -> Rewrite {
         let mut inputs = inputs;
         for operand in &mut inputs {

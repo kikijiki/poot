@@ -556,7 +556,8 @@ impl ContractionHead {
 ///
 /// `mask`, `key` and `bound` name the operand conventions the kernels read. A variant added to one is a new case
 /// every consumer matches, never a flag on the others. The operand list is `[q, k, v, mask]`, then the shared key
-/// part when `key` is [`KeyLayout::Split`], then `len` when `bound` is [`KvBound::Live`].
+/// part when `key` is [`KeyLayout::Split`] or the slot map `read` when it is [`KeyLayout::Paged`], then `len`
+/// when `bound` is [`KvBound::Live`].
 #[derive(Clone, PartialEq, Debug)]
 pub struct AttentionAttrs {
     /// Query heads per key/value head (`Hq / Hkv`).
@@ -608,6 +609,13 @@ pub enum KeyLayout {
         /// The width `s` of the shared operand's last axis; the head part is `D - s` wide.
         shared_dim: usize,
     },
+    /// The key and the value are read in place from the paged KV pools they live in: `k [S,Hkv,Dk]` and
+    /// `v [S,Hkv,Dv]` are the pools of `S` slots, and the I32 `read [B,Lk]` operand, which follows `mask`
+    /// in the operand list, names the pool slot holding logical position `t` of batch row `b`. It is the
+    /// decomposition `transpose(reshape(gather(pool, 0, read)))` of each pool, without the materialized
+    /// `[B,Hkv,Lk,D]` copies. Every `read` word must be a slot of the pool; the matcher fuses only a map
+    /// whose declared range proves it.
+    Paged,
 }
 
 /// Which keys [`AttentionAttrs`]'s kernel visits.
@@ -706,12 +714,18 @@ pub enum OpKind {
         /// The axis scattered along; axis 0 only.
         axis: usize,
     },
-    /// Scatter-update rows into a base (card 059, the multi-token paged KV write): `out[p, ..] =
-    /// inv[p] >= 0 ? src[inv[p], ..] : base[p, ..]`. Inputs are `base [POOL, ..rest]`, `src [N, ..rest]`, and the
-    /// `[POOL]` inverse map `inv` (input 2, f32: the src row that writes slot `p`, or `-1` to keep `base[p]`).
-    /// Output the same shape as `base`. Unlike [`OpKind::Scatter`] (a permutation, every row written), this writes the `N`
-    /// mapped rows and passes the rest through: the scattered analog of [`OpKind::DynamicUpdateSlice`] a paged prefill's N
-    /// tokens need (kernel `scatter_update_dt`).
+    /// Scatter-update rows into a base (the multi-token paged KV write): `out = base`, then
+    /// `out[slots[t], ..] = src[t, ..]` for each source row `t` whose `slots[t] >= 0`. Inputs are
+    /// `base [POOL, ..rest]`, `src [N, ..rest]`, and the forward map `slots [N]` (input 2, I32: the pool
+    /// slot row `t` is written to, or `-1` for a row that writes nothing). Output the same shape as `base`.
+    /// The cost is `O(N * rest)`, never `O(POOL * rest)`: one thread per source element.
+    ///
+    /// The kernel writes only the named rows, so the planner requires the output to be donated to `base`'s
+    /// own buffer (a state pair whose old value nothing else reads), and refuses the graph otherwise. Two
+    /// rows naming one slot would race; the map's single binder, [`crate::ForwardSlotMap`], refuses a
+    /// repeated slot, and the oracle refuses one too. Unlike [`OpKind::Scatter`] (a permutation, every row
+    /// written), this passes the unnamed rows through: the scattered analog of
+    /// [`OpKind::DynamicUpdateSlice`].
     ScatterUpdate,
     /// Batched matmul A[..,M,K] x B[..,K,N] -> [..,M,N], batch dims broadcast (numpy semantics).
     MatMul,
@@ -963,7 +977,7 @@ fn reject_non_arithmetic(op: &'static str, dtype: DType) -> Result<(), ShapeErro
 }
 
 /// Card 529 (R466-010), POOT-725: reject an index-role operand (`Gather`'s and `Scatter`'s index,
-/// `ScatterUpdate`'s `inv`, `IndexedMatMul`'s and friends' `idx`, `DynamicUpdateSlice`'s runtime index)
+/// `ScatterUpdate`'s `slots`, `IndexedMatMul`'s and friends' `idx`, `DynamicUpdateSlice`'s runtime index)
 /// that is not I32. I32 is the only index dtype.
 fn check_index_dtype(op: &'static str, dtype: DType) -> Result<(), ShapeError> {
     if dtype == DType::I32 {
@@ -1346,12 +1360,12 @@ impl OpKind {
                 Ok(TensorType::new(shape, DType::F32))
             }
             OpKind::ScatterUpdate => {
-                // base[POOL,..rest], src[N,..rest], inv[POOL] -> base's type. The N rows mapped by inv are
-                // written from src, the rest passed through from base.
+                // base[POOL,..rest], src[N,..rest], slots[N] -> base's type. Source row t is written to
+                // pool slot slots[t]; every other pool row passes through from base.
                 arity(ins, 3)?;
-                let (base, src, inv) = (&ins[0], &ins[1], &ins[2]);
-                check_index_dtype("ScatterUpdate", inv.dtype)?;
-                let Some((&pool, rest)) = base.shape.split_first() else {
+                let (base, src, slots) = (&ins[0], &ins[1], &ins[2]);
+                check_index_dtype("ScatterUpdate", slots.dtype)?;
+                let Some((_, rest)) = base.shape.split_first() else {
                     return Err(ShapeError::RankTooLow {
                         op: "ScatterUpdate",
                         operand: "base",
@@ -1367,12 +1381,12 @@ impl OpKind {
                         actual: src.rank(),
                     });
                 }
-                let &[inv_len] = inv.shape.as_slice() else {
+                let &[slots_len] = slots.shape.as_slice() else {
                     return Err(ShapeError::OperandRank {
                         op: "ScatterUpdate",
-                        operand: "inv",
+                        operand: "slots",
                         expected: 1,
-                        actual: inv.rank(),
+                        actual: slots.rank(),
                     });
                 };
                 for (dim, (&expected, &actual)) in
@@ -1388,13 +1402,13 @@ impl OpKind {
                         });
                     }
                 }
-                if inv_len != pool {
+                if slots_len != src.shape[0] {
                     return Err(ShapeError::OperandDim {
                         op: "ScatterUpdate",
-                        operand: "inv",
+                        operand: "slots",
                         dim: 0,
-                        expected: pool,
-                        actual: inv_len,
+                        expected: src.shape[0],
+                        actual: slots_len,
                     });
                 }
                 Ok(base.clone())
@@ -2120,7 +2134,8 @@ fn reject_i32_region(op: &'static str, output: TensorType) -> Result<TensorType,
 }
 
 /// The typing rule of `Attention`. Operands are `[q, k, v, mask]`, then the shared key part for a
-/// [`KeyLayout::Split`], then the I32 `len [B]` for a [`KvBound::Live`]. Every consumer (the oracle, the
+/// [`KeyLayout::Split`] or the I32 `read [B,Lk]` slot map of the `[S,Hkv,D]` pools `k` and `v` for a
+/// [`KeyLayout::Paged`], then the I32 `len [B]` for a [`KvBound::Live`]. Every consumer (the oracle, the
 /// generated kernels) indexes the operands densely, with no broadcast strides: `q[B,Hq,Lq,Dk]` with `n_rep | Hq`,
 /// `k[B,Hq/n_rep,Lk,Dk]` (or `Dk - shared_dim` wide next to `k_shared[B,1,Lk,shared_dim]`), `v[B,Hq/n_rep,Lk,Dv]`
 /// and `mask[B,Hm,Lq,Lk]` with `Hm` either 1 (one plane shared by every head) or `Hq` (one per head, for ALiBi).
@@ -2131,10 +2146,12 @@ fn reject_i32_region(op: &'static str, output: TensorType) -> Result<TensorType,
 /// has.
 fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorType, ShapeError> {
     let split = matches!(attrs.key, KeyLayout::Split { .. });
+    let paged = matches!(attrs.key, KeyLayout::Paged);
     let live = matches!(attrs.bound, KvBound::Live);
-    arity(ins, 4 + usize::from(split) + usize::from(live))?;
+    arity(ins, 4 + usize::from(split || paged) + usize::from(live))?;
     let (q, k, v, mask) = (&ins[0], &ins[1], &ins[2], &ins[3]);
     let shared = split.then(|| &ins[4]);
+    let read = paged.then(|| &ins[4]);
     let len = live.then(|| &ins[ins.len() - 1]);
     // Float operands only: the decomposition's softmax (`Exp`, `Div`) does not type over I32.
     if q.dtype.class() != DTypeClass::Arithmetic {
@@ -2155,6 +2172,15 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
             });
         }
     }
+    if let Some(read) = read
+        && read.dtype != DType::I32
+    {
+        return Err(ShapeError::AttentionDtype {
+            operand: "read",
+            expected: DType::I32,
+            actual: read.dtype,
+        });
+    }
     let n_rep = attrs.n_rep;
     let &[bsz, hq, lq, dk] = q.shape.as_slice() else {
         return Err(ShapeError::AttentionQuery {
@@ -2168,59 +2194,114 @@ fn infer_attention(ins: &[TensorType], attrs: &AttentionAttrs) -> Result<TensorT
             actual: q.shape.clone(),
         });
     }
-    let Some(&lk) = k.shape.get(2) else {
-        return Err(ShapeError::AttentionOperand {
-            operand: "k",
-            expected: vec![bsz, hq / n_rep, lq, dk],
-            actual: k.shape.clone(),
-        });
-    };
-    let key_width = match attrs.key {
-        KeyLayout::Single => dk,
-        KeyLayout::Split { shared_dim } => {
-            if shared_dim == 0 || shared_dim >= dk {
+    let hkv = hq / n_rep;
+    // The key and value extents `Lk` and `Dv`, with the key and value operands checked against them: a dense
+    // `[B,Hkv,Lk,..]` pair, or one `[S,Hkv,..]` pool each read through the `[B,Lk]` slot map.
+    let (lk, dv) = match read {
+        Some(read) => {
+            let &[rows, lk] = read.shape.as_slice() else {
                 return Err(ShapeError::AttentionOperand {
-                    operand: "k_shared",
-                    expected: vec![bsz, 1, lk, shared_dim],
-                    actual: vec![bsz, 1, lk, dk],
+                    operand: "read",
+                    expected: vec![bsz, 1],
+                    actual: read.shape.clone(),
+                });
+            };
+            if rows != bsz {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "read",
+                    expected: vec![bsz, lk],
+                    actual: read.shape.clone(),
                 });
             }
-            dk - shared_dim
+            let Some(&slots) = k.shape.first() else {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "k",
+                    expected: vec![1, hkv, dk],
+                    actual: k.shape.clone(),
+                });
+            };
+            let k_expected = [slots, hkv, dk];
+            if k.shape != k_expected {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "k",
+                    expected: k_expected.to_vec(),
+                    actual: k.shape.clone(),
+                });
+            }
+            let Some(&dv) = v.shape.get(2) else {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "v",
+                    expected: vec![slots, hkv, dk],
+                    actual: v.shape.clone(),
+                });
+            };
+            let v_expected = [slots, hkv, dv];
+            if dv == 0 || v.shape != v_expected {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "v",
+                    expected: v_expected.to_vec(),
+                    actual: v.shape.clone(),
+                });
+            }
+            (lk, dv)
+        }
+        None => {
+            let Some(&lk) = k.shape.get(2) else {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "k",
+                    expected: vec![bsz, hkv, lq, dk],
+                    actual: k.shape.clone(),
+                });
+            };
+            let key_width = match attrs.key {
+                KeyLayout::Single | KeyLayout::Paged => dk,
+                KeyLayout::Split { shared_dim } => {
+                    if shared_dim == 0 || shared_dim >= dk {
+                        return Err(ShapeError::AttentionOperand {
+                            operand: "k_shared",
+                            expected: vec![bsz, 1, lk, shared_dim],
+                            actual: vec![bsz, 1, lk, dk],
+                        });
+                    }
+                    dk - shared_dim
+                }
+            };
+            let k_expected = [bsz, hkv, lk, key_width];
+            if k.shape != k_expected {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "k",
+                    expected: k_expected.to_vec(),
+                    actual: k.shape.clone(),
+                });
+            }
+            if let (KeyLayout::Split { shared_dim }, Some(shared)) = (attrs.key, shared) {
+                let expected = [bsz, 1, lk, shared_dim];
+                if shared.shape != expected {
+                    return Err(ShapeError::AttentionOperand {
+                        operand: "k_shared",
+                        expected: expected.to_vec(),
+                        actual: shared.shape.clone(),
+                    });
+                }
+            }
+            let Some(&dv) = v.shape.get(3) else {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "v",
+                    expected: vec![bsz, hkv, lk, dk],
+                    actual: v.shape.clone(),
+                });
+            };
+            let v_expected = [bsz, hkv, lk, dv];
+            if dv == 0 || v.shape != v_expected {
+                return Err(ShapeError::AttentionOperand {
+                    operand: "v",
+                    expected: v_expected.to_vec(),
+                    actual: v.shape.clone(),
+                });
+            }
+            (lk, dv)
         }
     };
-    let k_expected = [bsz, hq / n_rep, lk, key_width];
-    if k.shape != k_expected {
-        return Err(ShapeError::AttentionOperand {
-            operand: "k",
-            expected: k_expected.to_vec(),
-            actual: k.shape.clone(),
-        });
-    }
-    if let (KeyLayout::Split { shared_dim }, Some(shared)) = (attrs.key, shared) {
-        let expected = [bsz, 1, lk, shared_dim];
-        if shared.shape != expected {
-            return Err(ShapeError::AttentionOperand {
-                operand: "k_shared",
-                expected: expected.to_vec(),
-                actual: shared.shape.clone(),
-            });
-        }
-    }
-    let Some(&dv) = v.shape.get(3) else {
-        return Err(ShapeError::AttentionOperand {
-            operand: "v",
-            expected: vec![bsz, hq / n_rep, lk, dk],
-            actual: v.shape.clone(),
-        });
-    };
-    let v_expected = [bsz, hq / n_rep, lk, dv];
-    if dv == 0 || v.shape != v_expected {
-        return Err(ShapeError::AttentionOperand {
-            operand: "v",
-            expected: v_expected.to_vec(),
-            actual: v.shape.clone(),
-        });
-    }
     let mask_heads = if mask.shape.get(1) == Some(&hq) {
         hq
     } else {
@@ -2712,7 +2793,7 @@ mod tests {
         );
         refused(
             "ScatterUpdate",
-            OpKind::ScatterUpdate.infer(&[f(&[4, 5]), f(&[2, 5]), f(&[4])]),
+            OpKind::ScatterUpdate.infer(&[f(&[4, 5]), f(&[2, 5]), f(&[2])]),
         );
         refused(
             "IndexedMatMul",
@@ -3521,6 +3602,72 @@ mod tests {
         ));
     }
 
+    /// A paged key types over `[S,Hkv,D]` pools and the `[B,Lk]` I32 slot map: the output is the dense one's,
+    /// and every operand that disagrees with the pool or the map is a typed refusal naming it.
+    #[test]
+    fn a_paged_attention_types_over_pools_and_a_slot_map_and_refuses_each_disagreement() {
+        let op = OpKind::Attention(AttentionAttrs {
+            key: KeyLayout::Paged,
+            ..AttentionAttrs::new(2, 1.0, None)
+        });
+        let i32_map = |shape: &[usize]| TensorType::new(shape.to_vec(), DType::I32);
+        let q = f(&[2, 4, 1, 8]);
+        let mask = f(&[2, 1, 1, 6]);
+        let ok = [
+            q.clone(),
+            f(&[9, 2, 8]),
+            f(&[9, 2, 5]),
+            mask.clone(),
+            i32_map(&[2, 6]),
+        ];
+        assert_eq!(op.infer(&ok).unwrap(), f(&[2, 4, 1, 5]));
+
+        let refused = |operand: usize, replacement: TensorType| {
+            let mut ins = ok.clone();
+            ins[operand] = replacement;
+            op.infer(&ins)
+        };
+        // The key pool's head width must be the query's, its head count `Hq / n_rep`.
+        assert!(matches!(
+            refused(1, f(&[9, 2, 7])),
+            Err(ShapeError::AttentionOperand { operand: "k", .. })
+        ));
+        assert!(matches!(
+            refused(1, f(&[9, 3, 8])),
+            Err(ShapeError::AttentionOperand { operand: "k", .. })
+        ));
+        // The value pool has the key pool's slots and head count.
+        assert!(matches!(
+            refused(2, f(&[8, 2, 5])),
+            Err(ShapeError::AttentionOperand { operand: "v", .. })
+        ));
+        // The slot map is I32 `[B, Lk]`, `Lk` the mask's key width.
+        assert!(matches!(
+            refused(4, f(&[2, 6])),
+            Err(ShapeError::AttentionDtype {
+                operand: "read",
+                expected: DType::I32,
+                actual: DType::F32
+            })
+        ));
+        assert!(matches!(
+            refused(4, i32_map(&[3, 6])),
+            Err(ShapeError::AttentionOperand {
+                operand: "read",
+                ..
+            })
+        ));
+        assert!(matches!(
+            refused(3, f(&[2, 1, 1, 7])),
+            Err(ShapeError::AttentionOperand {
+                operand: "mask",
+                ..
+            })
+        ));
+        // A paged key without its slot map is an arity error, not a dense read of the pool.
+        assert!(matches!(op.infer(&ok[..4]), Err(ShapeError::Arity { .. })));
+    }
+
     /// Card 623 (R466-011 follow-up, SC-004): `Rope` rejects a dtype mismatch between `x` and
     /// `cos`/`sin`, naming the mismatched operand. The baseline (before this card) accepted any dtype
     /// pairing since `infer_rope` never checked operand dtypes at all.
@@ -3996,10 +4143,10 @@ mod tests {
                 operand_rank("ScatterUpdate", "src", 2, 1),
             ),
             (
-                "scatter_update inv rank",
+                "scatter_update slots rank",
                 OpKind::ScatterUpdate,
-                vec![f(&[4, 2]), f(&[3, 2]), i32_ty(&[4, 1])],
-                operand_rank("ScatterUpdate", "inv", 1, 2),
+                vec![f(&[4, 2]), f(&[3, 2]), i32_ty(&[3, 1])],
+                operand_rank("ScatterUpdate", "slots", 1, 2),
             ),
             (
                 "concat operand rank",
@@ -4040,14 +4187,14 @@ mod tests {
             (
                 "scatter_update src trailing dim",
                 OpKind::ScatterUpdate,
-                vec![f(&[4, 2]), f(&[3, 5]), i32_ty(&[4])],
+                vec![f(&[4, 2]), f(&[3, 5]), i32_ty(&[3])],
                 operand_dim("ScatterUpdate", "src", 1, 2, 5),
             ),
             (
-                "scatter_update inv extent",
+                "scatter_update slots extent",
                 OpKind::ScatterUpdate,
-                vec![f(&[4, 2]), f(&[3, 2]), i32_ty(&[3])],
-                operand_dim("ScatterUpdate", "inv", 0, 4, 3),
+                vec![f(&[4, 2]), f(&[3, 2]), i32_ty(&[4])],
+                operand_dim("ScatterUpdate", "slots", 0, 3, 4),
             ),
             (
                 "indexed_matmul contraction extent",

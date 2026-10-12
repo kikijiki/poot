@@ -3,8 +3,8 @@
 //!
 //! [`generic`] holds one function per op, over `T: Copy`: `Transpose`/`Slice`/`Concat`/`Broadcast`
 //! are pure geometry with no runtime index to fault on; `DynamicUpdateSlice`'s runtime start,
-//! `ScatterUpdate`'s inverse (its `-1` "keep base" sentinel handled before any other value reaches
-//! [`index_at`](super::index_rule::index_at)) and axis-0 `Scatter`'s index all route through the one
+//! `ScatterUpdate`'s slot map (its `-1` padding sentinel handled before any other value reaches
+//! [`index_at`](super::index_rule::index_at), a repeated slot refused) and axis-0 `Scatter`'s index all route through the one
 //! index rule shared with every other index-consuming op (R470-011). The rest of this module is the
 //! thin per-class plumbing: a [`HostTensor`]'s payload is one of four storage classes (`f32`, `i32`,
 //! half-width words, raw bytes), each op runs [`generic`] over that class and republishes the same
@@ -36,7 +36,7 @@ pub(crate) fn index_values(t: &HostTensor) -> Result<Vec<IndexValue>, EvalError>
 pub(crate) mod generic {
     use poot_graph_ir::ValueId;
 
-    use super::super::index_rule::{IndexValue, index_at};
+    use super::super::index_rule::{IndexValue, claim_row, index_at};
     use crate::{EvalError, broadcast_flat, strides, unravel};
 
     pub(crate) fn transpose<T: Copy>(data: &[T], shape: &[usize], perm: &[usize]) -> Vec<T> {
@@ -136,28 +136,28 @@ pub(crate) mod generic {
         out
     }
 
-    /// `out[p] = inverse[p] >= 0 ? src[inverse[p]] : base[p]` over axis-0 rows (the eager oracle for
-    /// the GPU `scatter_update_dt`). `inverse`'s `-1` sentinel ("keep base") is handled here, before
-    /// any other value reaches [`index_at`]: every other negative value, and `src`'s own row count,
-    /// fault through it.
+    /// `out = base`, then `out[slots[t]] = src[t]` for every source row `t` whose slot is not the `-1`
+    /// padding sentinel (the eager oracle for the generated scatter kernel). The sentinel is handled here,
+    /// before any other value reaches [`index_at`]: every other negative value, and a slot at or past the
+    /// pool, fault through it. A slot named twice faults ([`claim_row`]): the kernel would race.
     pub(crate) fn scatter_update<T: Copy>(
         base: &[T],
         base_shape: &[usize],
         src: &[T],
-        src_rows: usize,
-        inverse: &[IndexValue],
+        slots: &[IndexValue],
         eqn: ValueId,
     ) -> Result<Vec<T>, EvalError> {
         let pool = base_shape[0];
         let rest: usize = base_shape[1..].iter().product::<usize>().max(1);
         let mut out = base.to_vec();
-        for (p, &value) in inverse.iter().enumerate().take(pool) {
-            let keep_base = matches!(value, IndexValue::I32(-1));
-            if keep_base {
+        let mut claimed = vec![false; pool];
+        for (t, &value) in slots.iter().enumerate() {
+            if matches!(value, IndexValue::I32(-1)) {
                 continue;
             }
-            let row = index_at(value, p, src_rows, eqn)?;
-            let (dst, src_at) = (p * rest, row * rest);
+            let slot = index_at(value, t, pool, eqn)?;
+            claim_row(&mut claimed, slot, value, t, eqn)?;
+            let (dst, src_at) = (slot * rest, t * rest);
             out[dst..dst + rest].copy_from_slice(&src[src_at..src_at + rest]);
         }
         Ok(out)
@@ -352,25 +352,24 @@ pub(crate) fn scatter_axis0(
 pub(crate) fn scatter_update(
     base: &HostTensor,
     src: &HostTensor,
-    inverse: &HostTensor,
+    slots: &HostTensor,
     out_shape: &[usize],
     eqn: ValueId,
 ) -> Result<HostTensor, EvalError> {
-    let inverse_values = index_values(inverse)?;
-    let src_rows = src.shape().first().copied().unwrap_or(0);
+    let slot_values = index_values(slots)?;
     let data = match (base.data(), src.data()) {
-        (HostData::F32(b), HostData::F32(s)) => HostData::F32(
-            generic::scatter_update(b, base.shape(), s, src_rows, &inverse_values, eqn)?.into(),
-        ),
-        (HostData::I32(b), HostData::I32(s)) => HostData::I32(
-            generic::scatter_update(b, base.shape(), s, src_rows, &inverse_values, eqn)?.into(),
-        ),
-        (HostData::Half(b), HostData::Half(s)) => HostData::Half(
-            generic::scatter_update(b, base.shape(), s, src_rows, &inverse_values, eqn)?.into(),
-        ),
-        (HostData::Bytes(b), HostData::Bytes(s)) => HostData::Bytes(
-            generic::scatter_update(b, base.shape(), s, src_rows, &inverse_values, eqn)?.into(),
-        ),
+        (HostData::F32(b), HostData::F32(s)) => {
+            HostData::F32(generic::scatter_update(b, base.shape(), s, &slot_values, eqn)?.into())
+        }
+        (HostData::I32(b), HostData::I32(s)) => {
+            HostData::I32(generic::scatter_update(b, base.shape(), s, &slot_values, eqn)?.into())
+        }
+        (HostData::Half(b), HostData::Half(s)) => {
+            HostData::Half(generic::scatter_update(b, base.shape(), s, &slot_values, eqn)?.into())
+        }
+        (HostData::Bytes(b), HostData::Bytes(s)) => {
+            HostData::Bytes(generic::scatter_update(b, base.shape(), s, &slot_values, eqn)?.into())
+        }
         _ => {
             return Err(EvalError::unsupported(
                 "scatter_update",
@@ -557,7 +556,7 @@ impl Value {
     pub fn scatter_update(
         &self,
         src: &Self,
-        inverse: &HostTensor,
+        slots: &HostTensor,
         eqn: ValueId,
     ) -> Result<Self, EvalError> {
         match (self, src) {
@@ -565,7 +564,7 @@ impl Value {
                 Err(value.unsupported("ScatterUpdate"))
             }
             (Value::Host(base), Value::Host(src)) => {
-                Ok(scatter_update(base, src, inverse, base.shape(), eqn)?.into())
+                Ok(scatter_update(base, src, slots, base.shape(), eqn)?.into())
             }
             _ => Err(EvalError::Packed(PackedEvalError::WrongConsumer {
                 operation: "ScatterUpdate",

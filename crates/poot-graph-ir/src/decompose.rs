@@ -91,18 +91,24 @@ pub fn decompose(
             let Some((&[q, k, v, mask], extra)) = inputs.split_first_chunk::<4>() else {
                 return Ok(None);
             };
-            let (shared, len) = match (attrs.key, attrs.bound, extra) {
-                (KeyLayout::Single, KvBound::Capacity, []) => (None, None),
-                (KeyLayout::Split { .. }, KvBound::Capacity, &[shared]) => (Some(shared), None),
-                (KeyLayout::Single, KvBound::Live, &[len]) => (None, Some(len)),
-                (KeyLayout::Split { .. }, KvBound::Live, &[shared, len]) => {
-                    (Some(shared), Some(len))
-                }
+            let (extra_key, len) = match (attrs.bound, extra) {
+                (KvBound::Capacity, []) => (None, None),
+                (KvBound::Capacity, &[operand]) => (Some(operand), None),
+                (KvBound::Live, &[len]) => (None, Some(len)),
+                (KvBound::Live, &[operand, len]) => (Some(operand), Some(len)),
                 _ => return Ok(None),
             };
-            let keys = match shared {
-                Some(shared) => ops::AttentionKeys::Split { head: k, shared },
-                None => ops::AttentionKeys::Single(k),
+            // The paged form is the dense one over the views its slot map gathers out of the pools.
+            let (keys, v) = match (attrs.key, extra_key) {
+                (KeyLayout::Single, None) => (ops::AttentionKeys::Single(k), v),
+                (KeyLayout::Split { .. }, Some(shared)) => {
+                    (ops::AttentionKeys::Split { head: k, shared }, v)
+                }
+                (KeyLayout::Paged, Some(read)) => (
+                    ops::AttentionKeys::Single(ops::paged_view(&b, k, read)?),
+                    ops::paged_view(&b, v, read)?,
+                ),
+                _ => return Ok(None),
             };
             ops::attention_over_keys(
                 &b,
@@ -635,7 +641,7 @@ mod tests {
             ),
             (
                 OpKind::ScatterUpdate,
-                vec![f32(&[4, 3]), f32(&[2, 3]), typed(&[4], i32)],
+                vec![f32(&[4, 3]), f32(&[2, 3]), typed(&[2], i32)],
             ),
             (OpKind::MatMul, vec![f32(&[2, 3]), f32(&[3, 4])]),
             (
@@ -722,6 +728,20 @@ mod tests {
             (
                 OpKind::Attention(AttentionAttrs::new(2, 0.5, Some(30.0))),
                 prefill,
+            ),
+            (
+                // A paged key: two `[S, Hkv, D]` pools read through the `[B, Lk]` slot map.
+                OpKind::Attention(AttentionAttrs {
+                    key: KeyLayout::Paged,
+                    ..AttentionAttrs::new(2, 0.5, None)
+                }),
+                vec![
+                    f32(&[2, 4, 1, 8]),
+                    f32(&[9, 2, 8]),
+                    f32(&[9, 2, 8]),
+                    f32(&[2, 1, 1, 6]),
+                    typed(&[2, 6], i32),
+                ],
             ),
             (
                 OpKind::Rope { rot: 8 },

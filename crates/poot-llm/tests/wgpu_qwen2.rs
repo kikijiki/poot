@@ -3,8 +3,8 @@
 //!
 //! Weights are data: every const is filled from its name, so the device and the oracle read the same
 //! values. Each graph is the family's own (`poot_models::test_support::dense::Dense`), traced for a
-//! [`StepShape`]; a paged step reads and writes one shared KV pool through the two `Slot::SlotMap`
-//! inputs `"read"` and `"write"`.
+//! [`StepShape`]; a paged step reads one shared KV pool through the `Slot::SlotMap` input `"read"` and
+//! writes it through the forward `Slot::WriteMap` input `"write"` (one pool slot per new token).
 
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_runtime_common::DeviceBackend;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, NoSync, StepInputs};
-use poot_graph_ir::{Graph, Slot, SlotKey, Storage, ValueId, ValueTable};
+use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey, Storage, ValueId, ValueTable};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
     staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
@@ -58,11 +58,17 @@ struct SlotBind {
     shape: Vec<usize>,
     dtype: DType,
     bytes: Vec<u8>,
+    /// The checked map of a `Slot::WriteMap` input, which binds only through it.
+    map: Option<ForwardSlotMap>,
 }
 
 fn step_inputs(binds: &[SlotBind]) -> StepInputs<'_> {
     let mut inputs = StepInputs::new();
     for b in binds {
+        if let Some(map) = &b.map {
+            inputs.push_write_map(b.key.clone(), map);
+            continue;
+        }
         let elems = b.shape.iter().product();
         inputs.push(
             b.key.clone(),
@@ -119,11 +125,20 @@ fn split_consts_and_slots_v(
                     .get(&id)
                     .and_then(Value::as_host)
                     .unwrap_or_else(|| panic!("missing slot input {id:?}"));
+                let map = (m.slot_key().unwrap().role() == Slot::WriteMap).then(|| {
+                    let pool = m
+                        .range()
+                        .expect("a write map declares its pool")
+                        .hi_exclusive();
+                    ForwardSlotMap::new(t.as_i32().unwrap().to_vec(), pool as usize)
+                        .expect("the feed's write map is distinct slots of the pool")
+                });
                 slots.push(SlotBind {
                     key: m.slot_key().unwrap().clone(),
                     shape: t.shape().to_vec(),
                     dtype,
                     bytes: tensor_bytes(dtype, t),
+                    map,
                 });
             }
             Storage::State | Storage::Computed(_) => {}
@@ -252,7 +267,8 @@ impl Feed {
         }
     }
 
-    /// The paged slot maps: `read` is `[rows, capacity]`, `write` is `[pool_slots]`.
+    /// The paged slot maps: `read` is `[rows, capacity]`, `write` is `[rows * tokens]` (one pool slot per
+    /// new token, -1 for padding).
     fn paged(mut self, read: Vec<i32>, write: Vec<i32>) -> Self {
         (self.read, self.write) = (read, write);
         self
@@ -272,8 +288,11 @@ fn bind(g: &Graph, feed: &Feed, seed_state: bool) -> HashMap<ValueId, Value> {
             Storage::Slot(Slot::Pos) => HostTensor::i32(shape, feed.pos.clone()),
             Storage::Slot(Slot::SlotMap) => match meta.name.as_deref() {
                 Some("slotmap.read") => HostTensor::i32(shape, feed.read.clone()),
-                Some("slotmap.write") => HostTensor::i32(shape, feed.write.clone()),
                 other => panic!("unexpected slot map {other:?}"),
+            },
+            Storage::Slot(Slot::WriteMap) => match meta.name.as_deref() {
+                Some("writemap.write") => HostTensor::i32(shape, feed.write.clone()),
+                other => panic!("unexpected write map {other:?}"),
             },
             Storage::Slot(other) => panic!("unexpected slot {other:?}"),
             Storage::Const => {
@@ -471,10 +490,8 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
     let read: Vec<i32> = (0..cap)
         .map(|p| slot_map.get(p).map_or(0, |&s| s as i32))
         .collect();
-    let mut write = vec![-1i32; pool];
-    for (p, &s) in slot_map.iter().enumerate() {
-        write[s] = p as i32;
-    }
+    // token p of the prompt writes the slot of position p.
+    let write: Vec<i32> = slot_map.iter().map(|&s| s as i32).collect();
     let feed_c = Feed::new(tokens.clone(), pos.clone());
     let feed_p = Feed::new(tokens, pos).paged(read, write);
 
@@ -706,8 +723,7 @@ fn paged_decode_kv_gpu_matches_cpu() {
         .iter()
         .enumerate()
         .map(|(pos, &token)| {
-            let mut write = vec![-1i32; cap];
-            write[cap - 1 - pos] = 0;
+            let write = vec![(cap - 1 - pos) as i32];
             Feed::new(vec![token], vec![pos as i32]).paged(read.clone(), write)
         })
         .collect();
@@ -736,10 +752,7 @@ fn batched_paged_decode_gpu_matches_cpu() {
             let tokens = (0..batch)
                 .map(|r| (((s * batch + r) * 5 + 2) % vocab) as i32)
                 .collect();
-            let mut write = vec![-1i32; batch * cap];
-            for r in 0..batch {
-                write[slot(r, s) as usize] = r as i32;
-            }
+            let write: Vec<i32> = (0..batch).map(|r| slot(r, s)).collect();
             Feed::new(tokens, vec![s as i32; batch]).paged(read.clone(), write)
         })
         .collect();
@@ -775,10 +788,7 @@ fn batched_shared_pool_decode_gpu_matches_cpu() {
             let tokens = (0..batch)
                 .map(|r| (((s * batch + r) * 5 + 2) % vocab) as i32)
                 .collect();
-            let mut write = vec![-1i32; pool_slots];
-            for r in 0..batch {
-                write[s * batch + r] = r as i32;
-            }
+            let write: Vec<i32> = (0..batch).map(|r| (s * batch + r) as i32).collect();
             Feed::new(tokens, vec![s as i32; batch]).paged(read.clone(), write)
         })
         .collect();
@@ -1026,10 +1036,7 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
     let read: Vec<i32> = global_slots.iter().map(|&p| p as i32).collect();
     // the chunk of `len` tokens from position `start` writes its token `i` at the slot of `start + i`.
     let feed = |start: usize, len: usize| -> Feed {
-        let mut write = vec![-1i32; pool_slots];
-        for i in 0..len {
-            write[global_slots[start + i]] = i as i32;
-        }
+        let write: Vec<i32> = (0..len).map(|i| global_slots[start + i] as i32).collect();
         Feed::new(
             tokens[start..start + len].to_vec(),
             (start as i32..(start + len) as i32).collect(),

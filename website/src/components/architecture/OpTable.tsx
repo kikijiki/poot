@@ -96,9 +96,9 @@ const OPS: Op[] = [
   {
     name: "ScatterUpdate",
     category: "data",
-    inputs: "base, src, inv",
+    inputs: "base: [P, ...], src: [N, ...], slots: [N]",
     outputShape: "same as base",
-    notes: "Paged multi-token KV write",
+    notes: "Paged KV write: row t of src goes to pool slot slots[t] (-1 writes nothing), in place on the donated pool; cost follows N, not P",
   },
   {
     name: "DynamicUpdateSlice",

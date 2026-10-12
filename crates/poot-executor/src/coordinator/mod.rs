@@ -829,6 +829,20 @@ impl<D: Device + Collectives> Executor for Coordinator<D> {
                 return Err(BindError::Unknown { key: key.clone() }.into());
             }
         }
+        // A checked write map goes to every device that names its slot, still as the checked type.
+        for (key, map) in inputs.write_maps() {
+            let mut taken = false;
+            for (slot, &rank) in ranks.iter().enumerate() {
+                let entry = per_rank[rank].expect("a participating rank");
+                if self.engines[rank].takes_input(per_rank_exe[rank], entry, key)? {
+                    split[slot].push_write_map(key.clone(), map);
+                    taken = true;
+                }
+            }
+            if !taken {
+                return Err(BindError::Unknown { key: key.clone() }.into());
+            }
+        }
         for (slot, &rank) in ranks.iter().enumerate() {
             let entry = per_rank[rank].expect("a participating rank");
             self.engines[rank].bind_inputs(per_rank_exe[rank], entry, &split[slot])?;

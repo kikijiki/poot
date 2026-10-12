@@ -854,45 +854,39 @@ fn indexed_bodies_compile_to_valid_spirv_and_nvptx() {
 
 #[test]
 fn scatter_update_writes_mapped_rows_keeps_rest() {
-    // scatter-update for the multi-token paged KV write: out[p] = inv[p]>=0 ? src[inv[p]] : base[p]. POOL=4
-    // rows of rest=2; src has 2 rows; inv maps src row 1 -> slot 0, src row 0 -> slot 2; slots 1,3 keep base.
-    // Unlike a permutation scatter, only mapped rows are written.
+    // The in-place row write of the paged KV append: out[slots[t]] = src[t] for slots[t] >= 0, into a pool.
+    // POOL=4 rows of rest=2; src has 3 rows; src row 0 -> slot 2, row 1 is padding (-1), row 2 -> slot 0;
+    // slots 1 and 3 are not named. Only source rows are read. The runtime's writable buffers start zeroed,
+    // so the unnamed slots read back zero here; keeping a non-zero base is checked on the KIR interpreter
+    // (`packed_contraction_movement`) and on every executor (`state_row`).
     let Some(ctx) = ctx() else { return };
     let (pool, rest) = (4usize, 2usize);
-    let base: Vec<f32> = (0..pool * rest).map(|i| 100.0 + i as f32).collect(); // 100..108
-    let src: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0]; // src[0]=[1,2], src[1]=[3,4]
-    let inv: Vec<i32> = vec![1, -1, 0, -1]; // slot0<-src1, slot1<-base, slot2<-src0, slot3<-base
+    let src: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // src[0]=[1,2], src[1]=[3,4], src[2]=[5,6]
+    let slots: Vec<i32> = vec![2, -1, 0];
     let s = spv(
         &movement(
             "scu",
             vec![pool, rest],
             kg::MovementOp::ScatterRows {
-                src_shape: vec![2, rest],
+                src_shape: vec![3, rest],
                 window: None,
             },
         ),
         "scu",
     );
     let mut bufs = [
-        KernelBuffer::read_only_f32(&base),
         KernelBuffer::read_only_f32(&src),
-        KernelBuffer::read_only_i32(&inv),
+        KernelBuffer::read_only_i32(&slots),
         KernelBuffer::write_f32(pool * rest),
     ];
-    ctx.dispatch(
-        "test",
-        &s,
-        [64, 1, 1],
-        [(pool * rest) as u32, 1, 1],
-        &mut bufs,
-    )
-    .unwrap();
-    // base rows: r0=[100,101] r1=[102,103] r2=[104,105] r3=[106,107]. out: slot0=src1=[3,4],
-    // slot1=base r1=[102,103], slot2=src0=[1,2], slot3=base r3=[106,107].
+    ctx.dispatch("test", &s, [64, 1, 1], [(3 * rest) as u32, 1, 1], &mut bufs)
+        .unwrap();
+    // out: slot0=src2=[5,6], slot1 unnamed, slot2=src0=[1,2], slot3 unnamed; src row 1 (padding) lands
+    // nowhere.
     assert_eq!(
-        bufs[3].as_f32(),
-        &[3.0, 4.0, 102.0, 103.0, 1.0, 2.0, 106.0, 107.0],
-        "slot0=src1, slot1=base, slot2=src0, slot3=base"
+        bufs[2].as_f32(),
+        &[5.0, 6.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0],
+        "slot0=src2, slot2=src0, the rest untouched"
     );
 }
 

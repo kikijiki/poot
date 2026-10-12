@@ -13,6 +13,7 @@ pub mod ffn;
 pub mod gdn;
 pub mod head;
 pub mod kda;
+pub mod kv_stride;
 pub mod linear;
 pub mod mamba2;
 pub mod mhc;

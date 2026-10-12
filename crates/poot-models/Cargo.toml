@@ -17,7 +17,6 @@ test-support = [
     "dep:poot-graph-plan",
     "dep:poot-profile",
     "dep:poot-runtime-common",
-    "dep:poot-target",
     "dep:bytemuck",
     "poot-graph-ir/test-support",
     "poot-graph-plan/test-support",
@@ -40,7 +39,7 @@ poot-executor-parity = { workspace = true, optional = true }
 poot-graph-plan = { workspace = true, optional = true }
 poot-profile = { workspace = true, optional = true }
 poot-runtime-common = { workspace = true, optional = true }
-poot-target = { workspace = true, optional = true }
+poot-target.workspace = true
 bytemuck = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -60,7 +59,6 @@ poot-runtime-common.workspace = true
 poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-kernel-ir.workspace = true
 poot-kernelgen.workspace = true
-poot-target.workspace = true
 criterion.workspace = true
 
 [[bench]]

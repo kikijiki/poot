@@ -34,7 +34,7 @@ pub use timing::{DetailedTiming, DrainPolicy, TimingOptions};
 #[cfg(test)]
 mod tests;
 
-use poot_graph_ir::{BoundaryId, SlotKey};
+use poot_graph_ir::{BoundaryId, ForwardSlotMap, SlotKey};
 use poot_graph_plan::{
     multi_device::topology::DeviceId, staged::StageId, staged::StagedProgram, staged::SyncPoint,
     staged::TargetSet,
@@ -198,9 +198,14 @@ pub struct StepValue<'a> {
 }
 
 /// The values one step binds, one per slot of the entry's schema.
+///
+/// A [`Slot::WriteMap`](poot_graph_ir::Slot::WriteMap) slot is bound only through
+/// [`Self::push_write_map`], which takes a checked [`ForwardSlotMap`]: a repeated or out-of-pool slot is
+/// unrepresentable there, and [`Self::push`] of a raw view to such a slot is a [`BindError`].
 #[derive(Debug, Default)]
 pub struct StepInputs<'a> {
     values: Vec<(SlotKey, StepValue<'a>)>,
+    write_maps: Vec<(SlotKey, &'a ForwardSlotMap)>,
 }
 
 impl<'a> StepInputs<'a> {
@@ -214,8 +219,18 @@ impl<'a> StepInputs<'a> {
         self.values.push((key, StepValue { shape, view }));
     }
 
+    /// Bind the write map of `key`, a [`Slot::WriteMap`](poot_graph_ir::Slot::WriteMap) slot, from a map
+    /// whose constructor already refused out-of-pool and repeated slots.
+    pub fn push_write_map(&mut self, key: SlotKey, map: &'a ForwardSlotMap) {
+        self.write_maps.push((key, map));
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &(SlotKey, StepValue<'a>)> {
         self.values.iter()
+    }
+
+    pub(crate) fn write_maps(&self) -> impl Iterator<Item = &(SlotKey, &'a ForwardSlotMap)> {
+        self.write_maps.iter()
     }
 }
 

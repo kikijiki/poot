@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 
+use poot_graph_ir::ForwardSlotMap;
 use poot_graph_ir::op::SampleRule;
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 use poot_models::mrope::MropePositionIds;
@@ -882,18 +883,22 @@ impl Driver {
             lora: vec![0; entry_rows],
             ..StepData::default()
         };
-        if let KvLayout::Paged { pool_slots, .. } = kv {
+        // The forward write maps, one entry per flat token (KV) and per step row (recurrent state): -1
+        // writes nothing, so padding and masked rows leave the pool alone.
+        let mut kv_write = Vec::new();
+        if let KvLayout::Paged { .. } = kv {
             data.read = vec![0; entry_rows * capacity];
-            data.write = vec![-1; pool_slots.get()];
+            kv_write = vec![ForwardSlotMap::PADDING; entry_rows * width];
         }
         // A recurrent state pool: masked rows read pool row 0 and write nothing.
-        if let Some(spec) = entry
+        let pools_state = entry
             .slots
             .iter()
-            .find(|spec| spec.role == SlotRole::StateWrite)
-        {
+            .any(|spec| spec.role == SlotRole::StateWrite);
+        let mut state_write = Vec::new();
+        if pools_state {
             data.state_read = vec![0; entry_rows];
-            data.state_write = vec![-1; spec.shape[0]];
+            state_write = vec![ForwardSlotMap::PADDING; entry_rows];
         }
         let hidden = if key.phase == Phase::PrefillEmbeds {
             let spec = entry
@@ -945,9 +950,9 @@ impl Driver {
                 }
                 KvStore::Contiguous => None,
             };
-            if !data.state_write.is_empty() {
+            if pools_state {
                 data.state_read[i] = seq.slot as i32;
-                data.state_write[seq.slot] = i as i32;
+                state_write[i] = seq.slot as i32;
             }
             data.lora[i] = seq.adapter.row_value();
             for k in 0..width {
@@ -971,7 +976,7 @@ impl Driver {
                         if let Some(map) = &map
                             && position < seq.reserved
                         {
-                            data.write[map[position] as usize] = at as i32;
+                            kv_write[at] = map[position] as i32;
                         }
                     }
                     None => {
@@ -989,6 +994,13 @@ impl Driver {
             }
         }
         data.mrope = mrope;
+        // Each pool slot has one owner: a block table that handed two tokens one slot is refused here.
+        if let KvLayout::Paged { pool_slots, seqs } = kv {
+            data.write = ForwardSlotMap::new(kv_write, pool_slots.get())?;
+            if pools_state {
+                data.state_write = ForwardSlotMap::new(state_write, seqs.get())?;
+            }
+        }
         // Sampler inputs of a non-greedy suffix: one row each, placeholders for rows that do not pick
         // and for the masked rows.
         if let Head::Sample(rule) = key.head

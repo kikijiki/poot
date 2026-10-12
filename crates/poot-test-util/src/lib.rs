@@ -11,7 +11,6 @@
 pub mod checkpoints;
 pub mod contained_child;
 pub mod device_caps;
-pub mod dram_channels;
 mod hang_guard;
 pub mod smolvlm;
 

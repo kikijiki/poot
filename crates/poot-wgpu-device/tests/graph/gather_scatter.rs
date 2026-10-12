@@ -397,10 +397,14 @@ fn gather_nonaxis0_gpu_matches_cpu_over_random_shapes() {
 
 #[test]
 fn scatter_update_gpu_matches_cpu() {
-    // The `ScatterUpdate` graph op (the multi-token paged KV write) lowers on the GPU and matches the CPU oracle.
-    // out[p] = inv[p]>=0 ? src[inv[p]] : base[p]: POOL=4 rows of rest=2, src=2 rows, inv maps src row 1 -> slot 0 and src row 0
-    // -> slot 2; slots 1,3 keep base. Tracer-emittable op, plan route and eager eval agree (one definition,
-    // shared by both backends).
+    // The `ScatterUpdate` graph op (the in-place paged KV append) lowers on the GPU and matches the CPU oracle
+    // over two steps of one carried pool: POOL=4 rows of rest=2, two source rows a step. Step 1 writes src
+    // row 0 to slot 2 and row 1 to slot 0; step 2 writes row 0 to slot 3 and pads row 1 (-1). The second
+    // step's output keeps step 1's rows (the pool is the state, written in place) and lands only the named
+    // one. Tracer-emittable op, plan route and eager eval agree (one definition, shared by both backends).
+    use poot_eval::test_support::StepFixture;
+    use poot_executor_parity::{Fixture, run_outputs};
+    use poot_graph_ir::{Slot, SlotKey, StateRole};
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -408,53 +412,75 @@ fn scatter_update_gpu_matches_cpu() {
     let (pool, n, rest) = (4usize, 2usize, 2usize);
     let b = Builder::for_tests();
     let base = b
-        .constant("base", TensorType::f32(vec![pool, rest]))
+        .state_input(
+            "pool",
+            TensorType::f32(vec![pool, rest]),
+            StateRole::Recurrent,
+        )
         .unwrap();
-    let src = b.constant("src", TensorType::f32(vec![n, rest])).unwrap();
-    let inv = b
-        .constant("inv", TensorType::new(vec![pool], poot_tensor::DType::I32))
+    let src = b
+        .slot_named(Slot::Activation, "src", TensorType::f32(vec![n, rest]))
         .unwrap();
-    let out = b.scatter_update(base, src, inv).unwrap();
-    let (bi, si, ii) = (base.id(), src.id(), inv.id());
-    let g = b.finish(out).unwrap();
+    let slots = b.write_map("write", n, pool).unwrap();
+    let out = b.scatter_update(base, src, slots).unwrap();
+    let g = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(base, out)]))
+        .unwrap();
 
-    let based: Vec<f32> = (0..pool * rest).map(|i| 100.0 + i as f32).collect();
-    let srcd: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
-    let invd: Vec<i32> = vec![1, -1, 0, -1];
-    let mut inputs = HashMap::new();
-    inputs.insert(bi, HostTensor::f32(vec![pool, rest], based));
-    inputs.insert(si, HostTensor::f32(vec![n, rest], srcd));
-    inputs.insert(ii, HostTensor::i32(vec![pool], invd));
+    let step = |src: [f32; 4], slots: [i32; 2]| {
+        vec![
+            StepFixture {
+                key: SlotKey::new(Slot::Activation, Some("src")),
+                tensor: HostTensor::f32(vec![n, rest], src.to_vec()),
+            },
+            StepFixture {
+                key: SlotKey::new(Slot::WriteMap, Some("write")),
+                tensor: HostTensor::i32(vec![n], slots.to_vec()),
+            },
+        ]
+    };
+    let steps = vec![
+        step([1.0, 2.0, 3.0, 4.0], [2, 0]),
+        step([5.0, 6.0, 7.0, 8.0], [3, -1]),
+    ];
 
-    let eval_inputs: HashMap<_, Value> = inputs
-        .iter()
-        .map(|(&id, t)| (id, Value::from(t.clone())))
-        .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
-    let got = run_via_contract(&mut gpu, target, &g, &inputs);
-    assert_eq!(got.shape(), vec![pool, rest]);
-    assert_eq!(got.shape(), cpu.shape());
-    for (i, (a, b)) in got
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(cpu.as_f32().unwrap().iter())
-        .enumerate()
-    {
-        assert!(
-            (a - b).abs() < 1e-6,
-            "scatter_update elem {i}: gpu {a} vs cpu {b}"
+    // The CPU oracle carries the pool across the same steps.
+    let mut carried = HostTensor::zeros(vec![pool, rest]);
+    let mut want = Vec::new();
+    for values in &steps {
+        let mut inputs: HashMap<_, Value> = HashMap::new();
+        inputs.insert(base.id(), carried.clone().into());
+        inputs.insert(src.id(), values[0].tensor.clone().into());
+        inputs.insert(slots.id(), values[1].tensor.clone().into());
+        let result = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+        carried = result.output.into_host().unwrap();
+        want.push(carried.clone());
+    }
+    assert_eq!(
+        want[1].as_f32().unwrap(),
+        &[3.0, 4.0, 0.0, 0.0, 1.0, 2.0, 5.0, 6.0],
+        "ground truth: step 2 keeps slots 0 and 2 and lands slot 3; the padded row writes nowhere"
+    );
+
+    let got = run_outputs(
+        &mut gpu,
+        target,
+        &Fixture {
+            name: "scatter_update_two_steps",
+            graph: g,
+            store: poot_quant::weights::WeightStore::builder().build(),
+            steps,
+        },
+    )
+    .unwrap();
+    for (step, (got, want)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(got.shape(), want.shape());
+        assert_eq!(
+            got.as_f32().unwrap(),
+            want.as_f32().unwrap(),
+            "scatter_update step {step}: gpu vs cpu"
         );
     }
-    // ground truth: slot0=src1=[3,4], slot1=base=[102,103], slot2=src0=[1,2], slot3=base=[106,107].
-    assert_eq!(
-        got.as_f32().unwrap(),
-        &[3.0, 4.0, 102.0, 103.0, 1.0, 2.0, 106.0, 107.0]
-    );
 }
 
 #[test]
@@ -512,15 +538,15 @@ fn scatter_update_plan_selection() {
     use poot_graph_ir::op::OpKind;
     use poot_target::Backend;
     use poot_tensor::DType;
-    // base [4,3] pool, src [2,3], inv [4].
+    // base [4,3] pool, src [2,3], slots [2].
     let plan_for = |dt: DType, backend| {
         let b = Builder::for_tests();
         let base = b.constant("base", TensorType::new(vec![4, 3], dt)).unwrap();
         let src = b.constant("src", TensorType::new(vec![2, 3], dt)).unwrap();
-        let inv = b
-            .constant("inv", TensorType::new(vec![4], poot_tensor::DType::I32))
+        let slots = b
+            .constant("slots", TensorType::new(vec![2], poot_tensor::DType::I32))
             .unwrap();
-        let out = b.scatter_update(base, src, inv).unwrap();
+        let out = b.scatter_update(base, src, slots).unwrap();
         let g = b.finish(out).unwrap();
         let eqn = g
             .eqns()

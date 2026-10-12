@@ -53,7 +53,8 @@ fn update_base(eqn: &poot_graph_ir::Eqn) -> Option<ValueId> {
 /// State outputs are pinned by `compute_views`, so strided views materialize before this boundary (the
 /// plans this takes were planned against those views). Planner aliases such as `Reshape` and
 /// same-dtype `Cast` are followed to their storage root. Donation is narrow: only DynamicUpdateSlice
-/// and ScatterUpdate have an overlapping base/output kernel contract.
+/// and ScatterUpdate have an overlapping base/output kernel contract, and for ScatterUpdate it is a
+/// precondition: a graph whose scatter cannot be donated is refused with [`PlanError::ScatterNotInPlace`].
 ///
 /// Generic over the validation channel (Card 375c) so a captured backend can plan a
 /// `Graph` like an ordinary `Graph`. A donation admitted here is not necessarily safe to
@@ -79,7 +80,17 @@ pub(crate) fn state_commit_from_plans(
         }
     }
 
-    Ok(commit_from_roots(g, &roots, &producers))
+    let commit = commit_from_roots(g, &roots, &producers);
+    // `ScatterUpdate`'s kernel writes only the named rows into its output buffer, so the output must be
+    // the base's own state buffer: an undonated scatter would leave every unnamed row unwritten.
+    if let Some(scatter) = g
+        .eqns()
+        .iter()
+        .find(|eqn| eqn.op == OpKind::ScatterUpdate && !commit.inplace.contains_key(&eqn.out))
+    {
+        return Err(PlanError::ScatterNotInPlace { value: scatter.out });
+    }
+    Ok(commit)
 }
 
 fn check_state_shapes(g: &Graph) -> Result<(), PlanError> {
@@ -514,9 +525,9 @@ mod tests {
         );
     }
 
-    /// `ScatterUpdate` stays donation-eligible for `state_commit_from_plans`, but the journal cannot
-    /// statically recover which base rows its runtime `inv` map touches, so it is refused rather than
-    /// snapshotting the whole buffer.
+    /// `ScatterUpdate` is donated by `state_commit_from_plans`, but the journal cannot statically recover
+    /// which base rows its runtime slot map touches, so it is refused rather than snapshotting the whole
+    /// buffer.
     #[test]
     fn journal_rejects_a_scatter_update_donation_instead_of_snapshotting_whole_state() {
         let builder = Builder::for_tests();
@@ -526,13 +537,8 @@ mod tests {
         let src = builder
             .slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![2, 2]))
             .unwrap();
-        let inv = builder
-            .slot(
-                poot_graph_ir::Slot::Activation,
-                TensorType::new(vec![4], poot_tensor::DType::I32),
-            )
-            .unwrap();
-        let updated = builder.scatter_update(state, src, inv).unwrap();
+        let slots = builder.write_map("write", 2, 4).unwrap();
+        let updated = builder.scatter_update(state, src, slots).unwrap();
         let graph = builder
             .finish(poot_graph_ir::Outputs::new(updated).with_state(&[(state, updated)]))
             .unwrap();
@@ -552,6 +558,106 @@ mod tests {
                 assert_eq!(op, "scatter_update");
             }
             other => panic!("expected UnrecoverableDonation, got {other:?}"),
+        }
+    }
+
+    /// The production paged-KV write shape (`write_paged`): the pool is scatter-updated by this step's new
+    /// rows, then the step reads the pool back through a gather of the post-write value. The pool is read by
+    /// nothing else, so the scatter's output is donated to the pool's own buffer and no copy is committed.
+    #[test]
+    fn a_paged_pool_write_read_back_after_the_scatter_is_donated_in_place() {
+        let builder = Builder::for_tests();
+        let pool = builder
+            .state_input(
+                "pool",
+                TensorType::f32(vec![8, 2, 4]),
+                StateRole::Positional { axis: 0 },
+            )
+            .unwrap();
+        let new = builder
+            .slot(
+                poot_graph_ir::Slot::Activation,
+                TensorType::f32(vec![3, 2, 4]),
+            )
+            .unwrap();
+        let write = builder.write_map("write", 3, 8).unwrap();
+        let read = builder
+            .slot_named(
+                poot_graph_ir::Slot::SlotMap,
+                "read",
+                TensorType::new(vec![5], poot_tensor::DType::I32),
+            )
+            .unwrap();
+        let written = builder.scatter_update(pool, new, write).unwrap();
+        let viewed = builder.gather(written, 0, read).unwrap();
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(viewed).with_state(&[(pool, written)]))
+            .unwrap();
+        let plan =
+            commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)).unwrap();
+        assert_eq!(plan.inplace, HashMap::from([(written.id(), pool.id())]));
+        assert!(
+            plan.copies.is_empty(),
+            "a donated pool needs no commit copy"
+        );
+    }
+
+    /// A step that also reads the pool as it was before the write cannot donate it: overwriting the pool
+    /// would change that read. The scatter kernel writes only the named rows, so an undonated scatter would
+    /// leave the rest of its output unwritten: the graph is refused, naming the scatter's output.
+    #[test]
+    fn a_paged_pool_read_before_the_write_is_refused_not_copied() {
+        let builder = Builder::for_tests();
+        let pool = builder
+            .state_input(
+                "pool",
+                TensorType::f32(vec![8, 2, 4]),
+                StateRole::Positional { axis: 0 },
+            )
+            .unwrap();
+        let new = builder
+            .slot(
+                poot_graph_ir::Slot::Activation,
+                TensorType::f32(vec![3, 2, 4]),
+            )
+            .unwrap();
+        let write = builder.write_map("write", 3, 8).unwrap();
+        let read = builder
+            .slot_named(
+                poot_graph_ir::Slot::SlotMap,
+                "read",
+                TensorType::new(vec![5], poot_tensor::DType::I32),
+            )
+            .unwrap();
+        let written = builder.scatter_update(pool, new, write).unwrap();
+        let stale = builder.gather(pool, 0, read).unwrap();
+        let fresh = builder.gather(written, 0, read).unwrap();
+        let viewed = builder.binary(BinOp::Add, stale, fresh).unwrap();
+        let graph = builder
+            .finish(poot_graph_ir::Outputs::new(viewed).with_state(&[(pool, written)]))
+            .unwrap();
+        match commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)) {
+            Err(PlanError::ScatterNotInPlace { value }) => assert_eq!(value, written.id()),
+            other => panic!("expected ScatterNotInPlace, got {other:?}"),
+        }
+    }
+
+    /// A scatter whose base is not a carried state has no buffer to write in place: refused, naming it.
+    #[test]
+    fn a_scatter_over_a_value_that_is_not_state_is_refused() {
+        let builder = Builder::for_tests();
+        let base = builder
+            .slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![8, 2]))
+            .unwrap();
+        let new = builder
+            .slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![3, 2]))
+            .unwrap();
+        let write = builder.write_map("write", 3, 8).unwrap();
+        let written = builder.scatter_update(base, new, write).unwrap();
+        let graph = builder.finish(written).unwrap();
+        match commit_for_test(&graph, Backend::Nvptx, &default_caps_for(Backend::Nvptx)) {
+            Err(PlanError::ScatterNotInPlace { value }) => assert_eq!(value, written.id()),
+            other => panic!("expected ScatterNotInPlace, got {other:?}"),
         }
     }
 
@@ -634,13 +740,8 @@ mod tests {
         let src = builder
             .slot(poot_graph_ir::Slot::Activation, TensorType::f32(vec![2, 2]))
             .unwrap();
-        let inv = builder
-            .slot(
-                poot_graph_ir::Slot::Activation,
-                TensorType::new(vec![4], poot_tensor::DType::I32),
-            )
-            .unwrap();
-        let updated = builder.scatter_update(state, src, inv).unwrap();
+        let slots = builder.write_map("write", 2, 4).unwrap();
+        let updated = builder.scatter_update(state, src, slots).unwrap();
         let witness = builder
             .binary_scalar(
                 BinOp::Ge,
@@ -701,9 +802,9 @@ mod tests {
     /// `state_commit_from_plans` donates an edge whenever aliasing is safe for its own two-phase commit
     /// (`update_base` grants this to `DynamicUpdateSlice` and `ScatterUpdate`). A native transaction needs the
     /// exact bytes a rollback must restore, known without inspecting device data. `DynamicUpdateSlice` gives
-    /// that (see [`DonationFootprint`]). `ScatterUpdate`'s `inv` operand is a full-length per-base-row selector
-    /// of runtime data, so any subset of rows may be touched and no static shape smaller than the whole buffer
-    /// exists; snapshotting the entire state would defeat the donation, so it is rejected with
+    /// that (see [`DonationFootprint`]). `ScatterUpdate`'s `slots` operand holds runtime pool slots, so any
+    /// subset of rows may be touched and no static shape smaller than the whole buffer exists; snapshotting
+    /// the entire state would defeat the donation, so it is rejected with
     /// [`PlanError::UnrecoverableDonation`].
     fn journal_donated_updates(
         g: &Graph,
