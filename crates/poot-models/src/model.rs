@@ -324,6 +324,10 @@ pub enum ShapeReason {
     /// A [`Phase::Mtp`] step whose shape names no hidden-state carry: there is nothing for the
     /// layer to read.
     MtpWithoutCarry,
+    /// A paged-KV step of a family whose indexer keeps a per-row block-key cache. The cache's paging
+    /// granule (a page must hold whole blocks) belongs to the paged-KV owner, POOT-1148; until it
+    /// decides, the indexer refuses a paged layout rather than invent one.
+    PagedIndexer,
 }
 
 /// A model could not be built from its config and weights.

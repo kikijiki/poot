@@ -146,6 +146,7 @@
 
             pkgs.prettier # markdown autoformatter (`just docs-fix`)
             pkgs.lychee   # broken-link checker for the docs (`just docs-check`)
+            pkgs.resvg    # pinned SVG rasteriser for `just diagrams` (website/diagrams -> PNG)
 
             pkgs.bun    # JS runtime + package manager for the Docusaurus site in ./website (`just site-dev` / `site-build`)
             pkgs.nodejs # Node runtime the Docusaurus toolchain shells out to
@@ -157,6 +158,8 @@
             ${cargoEnv}
             # Put system LLVM's llc ahead of anything the rust toolchain exposes.
             export PATH="${llvm.llvm}/bin:$PATH"
+            # The only fonts `just diagrams` renders with (resvg skips the host's fonts), so the PNGs are byte-stable.
+            export POOT_DIAGRAM_FONT_DIR="${pkgs.dejavu_fonts}/share/fonts/truetype"
             export LIBCLANG_PATH="${llvm.libclang.lib}/lib"
             export CLANG_HLSL="${llvm.clang-unwrapped}/bin/clang"   # unwrapped clang for HLSL->SPIR-V
 

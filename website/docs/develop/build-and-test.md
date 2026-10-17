@@ -105,3 +105,21 @@ with default features in the dev shell.
 
 See [Backends](../architecture/backends.mdx) for codegen targets, dispatch models, and capability
 notes. For serve-time backend choice, see [Picking a backend](../serve/choosing-a-backend.md).
+
+## Regenerating the diagrams
+
+The architecture diagrams in the README (and the PNGs the website serves from `/img/architecture/`) are
+generated from hand-written SVG sources in `website/diagrams/`, one per image. To change a label, edit the
+SVG and run, inside the dev shell:
+
+```bash
+just diagrams                       # render every source to website/static/img/architecture/ plus index.json
+just diagrams --only model-tracing,rust-kernels
+just diagrams --out DIR          # render somewhere else
+just diagrams --publish-dir DIR  # also copy the PNGs and index.json there
+just diagrams --check            # fail if a committed PNG differs from its source
+```
+
+Rendering uses the dev shell's pinned `resvg` and one bundled font, so the output is byte-reproducible. `index.json`
+holds each image's name, size, checksums, source and alt text; the README alt texts are copied from it (each SVG's
+`<desc>`), and `just test` runs `--check`. The script writes only to `--out` and `--publish-dir`.

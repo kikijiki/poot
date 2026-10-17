@@ -850,3 +850,42 @@ fn read_traffic_counts_each_streamed_weight_once_and_the_cache_per_position() {
         (embed + proj + 5 * per_position) as u64
     );
 }
+
+/// A block-granular cache counts each position's share of an entry: a `[rows, 1, blocks, dim]` cache
+/// of `ratio`-position blocks reads `dim * 4 / ratio` bytes per attended position per row, not
+/// `dim * 4` as the same shape declared positional would (POOT-1143). Mutation: handle `Blocked` like
+/// `Positional` in `read_traffic` (drop the `ratio` factor); the per-position count is four times too large.
+#[test]
+fn a_blocked_cache_counts_its_entry_over_the_positions_it_covers() {
+    const ROWS: usize = 2;
+    const BLOCKS: usize = 4;
+    const DIM: usize = 8;
+    const RATIO: u32 = 4;
+    let b = Builder::for_tests();
+    let q = b
+        .constant("q", TensorType::f32(vec![ROWS, 1, 1, DIM]))
+        .unwrap();
+    let blocks = b
+        .state_input(
+            "blocks",
+            TensorType::f32(vec![ROWS, 1, BLOCKS, DIM]),
+            StateRole::Blocked {
+                axis: 2,
+                ratio: std::num::NonZeroU32::new(RATIO).unwrap(),
+            },
+        )
+        .unwrap();
+    let scores = b
+        .matmul(q, b.transpose(blocks, vec![0, 1, 3, 2]).unwrap())
+        .unwrap();
+    let blocks_out = b.binary(BinOp::Mul, blocks, blocks).unwrap();
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(scores).with_state(&[(blocks, blocks_out)]))
+        .expect("the fixture validates");
+    let traffic = staged(&graph, pipeline(&[]), &options()).read_traffic();
+    assert_eq!(
+        traffic.kv_bytes_per_position,
+        (DIM * 4 / RATIO as usize) as u64
+    );
+    assert_eq!(traffic.recurrent_state_bytes, 0);
+}

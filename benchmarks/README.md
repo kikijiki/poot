@@ -181,7 +181,7 @@ the row-level identity subset only.
 
 ### Performance receipts and the bank
 
-`harness/performance_receipt.py` also validates a *receipt* (a record of one workload on one device with
+`harness/performance_receipt.py` also validates a _receipt_ (a record of one workload on one device with
 every repeat): identity and preparation. Two records are compared only if they state the same workload
 identity: checkpoint digest and token fixture, precision and layout, dimensions and lengths (prompt, live,
 max context, requested and actual output), sampler and template, cache state and prepared set, timing

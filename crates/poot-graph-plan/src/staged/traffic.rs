@@ -104,6 +104,15 @@ pub(super) fn read_traffic(program: &Program) -> ReadTraffic {
                     traffic.kv_bytes_per_position =
                         traffic.kv_bytes_per_position.saturating_add(per_position);
                 }
+                Some(StateRole::Blocked { axis, ratio }) => {
+                    // An entry covers `ratio` positions, so a position's share is the entry's over `ratio`.
+                    let extent = meta.aval.shape.get(usize::from(axis)).copied().unwrap_or(1);
+                    let rows = meta.aval.shape.first().copied().unwrap_or(1);
+                    let positions = extent.max(1) as u64 * u64::from(ratio.get());
+                    let per_position = bytes / (positions * rows.max(1) as u64);
+                    traffic.kv_bytes_per_position =
+                        traffic.kv_bytes_per_position.saturating_add(per_position);
+                }
                 Some(StateRole::Recurrent) | None => {
                     traffic.recurrent_state_bytes =
                         traffic.recurrent_state_bytes.saturating_add(bytes)

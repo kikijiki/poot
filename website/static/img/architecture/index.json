@@ -1,0 +1,44 @@
+{
+  "images": [
+    {
+      "name": "capture-replay",
+      "file": "capture-replay.png",
+      "width": 2400,
+      "height": 1270,
+      "sha256": "d6e118c561bf9926c5234ab8a2699d814af904293db39eba736428d5ad7c7a31",
+      "source": "website/diagrams/capture-replay.svg",
+      "sourceSha256": "92f3db45e1a6b6967127d9a14a1df881805aefd54fd1046cc5b178478dc13814",
+      "alt": "Capture the decode step once and replay it every token, one host call per token"
+    },
+    {
+      "name": "compilation-pipeline",
+      "file": "compilation-pipeline.png",
+      "width": 2400,
+      "height": 2350,
+      "sha256": "54ae803b718fe8048552de472074e90f6f7c479455822fa9ef2cd0d7a98f59ba",
+      "source": "website/diagrams/compilation-pipeline.svg",
+      "sourceSha256": "ec87b5dbc413f3c9cbd248ca10862896d6929ec6c85677961d464c08b6925e2d",
+      "alt": "From model code to GPU: graph IR, graph passes, kernel planning, one shared LLVM emitter, three backends"
+    },
+    {
+      "name": "model-tracing",
+      "file": "model-tracing.png",
+      "width": 2400,
+      "height": 1470,
+      "sha256": "a340e4dd62102639ddb82cd9f85cf9f0e85532ae200da1c74bc38e1004c16b1b",
+      "source": "website/diagrams/model-tracing.svg",
+      "sourceSha256": "1ea5cbec3f5e7500818b90abf130295ab9c2dc79cdf78fc3d4c48ba842a8ca40",
+      "alt": "A model is a Rust function: the builder records every call into a flat graph IR"
+    },
+    {
+      "name": "rust-kernels",
+      "file": "rust-kernels.png",
+      "width": 2400,
+      "height": 1374,
+      "sha256": "74acf7cb9e46bd51054da50ac670ab88d21b239900e0b597929ed4ed489ce628",
+      "source": "website/diagrams/rust-kernels.svg",
+      "sourceSha256": "0cc0a677b244e019f534970cb001090b2953aeb785dda07e9e5cb8b61286cfc1",
+      "alt": "One Rust kernel compiled to SPIR-V, PTX and AMDGCN"
+    }
+  ]
+}

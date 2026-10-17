@@ -8,7 +8,7 @@
 //!
 //! The model is its config ([`config`]: typed, checked once, nothing pinned to a shipped checkpoint),
 //! its weight-name table (also in [`config`]) and one body ([`trace`]). A step carries the QSA layers'
-//! KV and indexer-key caches, each GDN layer's conv window and state matrices, and each PLE layer's
+//! KV caches and indexer block keys, each GDN layer's conv window and state matrices, and each PLE layer's
 //! n-gram history and conv window, so a prompt prefilled in chunks continues exactly where the
 //! previous chunk stopped and one token is a decode step. A prefill is a whole number of
 //! `indexer_compress_ratio` tokens (the model's prefill granule) and the cache capacity a multiple of
@@ -28,8 +28,8 @@ use crate::components::linear::WeightError;
 use crate::components::moe;
 use crate::components::standard::{Step, check_step};
 use crate::model::{
-    FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason, StepShape,
-    TraceError,
+    FamilyKey, KvLayout, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason,
+    StepShape, TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
@@ -118,6 +118,14 @@ impl Model for Qwen4Exp {
                 family: FAMILY,
                 shape,
                 reason: ShapeReason::Granule { granule },
+            });
+        }
+        // The block-key cache is a per-row buffer; its paging granule is POOT-1148's to decide.
+        if matches!(shape.kv, KvLayout::Paged { .. }) {
+            return Err(TraceError::ShapeUnsupported {
+                family: FAMILY,
+                shape,
+                reason: ShapeReason::PagedIndexer,
             });
         }
         let step = Step::new(&b, shape)?;

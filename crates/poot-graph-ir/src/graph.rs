@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::num::NonZeroU32;
 
 use poot_tensor::HostTensor;
 
@@ -653,6 +654,16 @@ pub enum StateRole {
     Positional {
         /// The axis along which the live position indexes the buffer.
         axis: u8,
+    },
+    /// Written per block of `ratio` consecutive positions along `axis`: position `p` lives at index
+    /// `p / ratio`, so the axis holds `capacity / ratio` entries.
+    /// Like [`StateRole::Positional`] an entry past the committed length is harmless, because a
+    /// reader hides it by position. The QSA block-key cache is the one user.
+    Blocked {
+        /// The axis along which a position's block indexes the buffer.
+        axis: u8,
+        /// The positions each entry along `axis` covers.
+        ratio: NonZeroU32,
     },
     /// Folds every token into its value: conv windows, GDN/KDA/SSM matrices, ring buffers written at
     /// `pos % w`, and the pooled `[pool_slots, hkv, d]` caches (position on axis 0). The safe default
@@ -1785,7 +1796,10 @@ impl Graph {
                 (Storage::State, None) => {
                     return Err(GraphValidationError::MissingStateRole { value: id });
                 }
-                (Storage::State, Some(StateRole::Positional { axis })) => {
+                (
+                    Storage::State,
+                    Some(StateRole::Positional { axis } | StateRole::Blocked { axis, .. }),
+                ) => {
                     let rank = meta.aval.rank();
                     if usize::from(axis) >= rank {
                         return Err(GraphValidationError::StateRoleAxis {
@@ -2136,6 +2150,7 @@ mod tests {
         ValidationId, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
     };
     use poot_tensor::DType;
+    use std::num::NonZeroU32;
 
     /// The typed validity error a draft's commit refuses with.
     fn commit_invalid(draft: GraphEdit) -> GraphValidationError {
@@ -2812,6 +2827,34 @@ mod tests {
                 "state",
                 TensorType::f32(vec![1, 2, 3, 4]),
                 StateRole::Positional { axis: 4 },
+            )
+            .unwrap();
+        let output = b.constant("output", TensorType::f32(vec![1])).unwrap();
+        let refused = b.finish(crate::Outputs::new(output).with_state(&[(state, state)]));
+
+        assert_eq!(
+            refused.err(),
+            Some(crate::BuilderError::from(EditError::Invalid(
+                GraphValidationError::StateRoleAxis {
+                    value: state.id(),
+                    axis: 4,
+                    rank: 4,
+                }
+            )))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_blocked_axis_out_of_range_for_rank() {
+        let b = Builder::for_tests();
+        let state = b
+            .state_input(
+                "state",
+                TensorType::f32(vec![1, 2, 3, 4]),
+                StateRole::Blocked {
+                    axis: 4,
+                    ratio: NonZeroU32::new(2).unwrap(),
+                },
             )
             .unwrap();
         let output = b.constant("output", TensorType::f32(vec![1])).unwrap();

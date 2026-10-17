@@ -12,6 +12,7 @@ architecture, usage, and examples (`docs/`). Benchmark results live under `../be
   - **Architecture** - design, IR, backends, serving design
   - **Reference** - feature matrix, performance, FAQ
 - `src/components/architecture/` - interactive diagrams used by the architecture pages.
+- `diagrams/` - the SVG sources of the architecture images the README and the website use; `just diagrams` renders them to `static/img/architecture/`.
 
 ## Commands
 

@@ -61,6 +61,10 @@ mod device_tests;
 #[cfg(test)]
 mod hidden_carry_tests;
 #[cfg(test)]
+mod llamacpp_bisect_tests;
+#[cfg(test)]
+mod llamacpp_kl_tests;
+#[cfg(test)]
 mod placed_tests;
 #[cfg(test)]
 mod tests;
@@ -114,8 +118,8 @@ pub use open::{BackendChoice, open_executor, open_group, open_timed_executor};
 use placement::{Placed, Placement};
 pub use prefix_cache::{PrefixOutcome, PrefixSkip};
 pub use speculate::{
-    DraftPolicy, NotSpeculated, RollbackTiming, RowSpeculation, SpeculationCaps, SpeculationStats,
-    StepTime,
+    DraftPolicy, NotSpeculated, PassTiming, PositionAcceptance, RollbackTiming, RowSpeculation,
+    SpeculationCaps, SpeculationStats, StepTime,
 };
 use step::PickPolicy;
 pub use step::{Admission, Release, RowResult, RowWork, SeqId, SeqRequest, StepRow};
@@ -425,7 +429,7 @@ impl<F: FnMut(u32, &str) -> GenerationControl> TokenSink for F {
 }
 
 /// What the driver has done, for the prepared-set and compile-once assertions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DriverStats {
     /// Programs compiled (cold preparations; a refused one counts, a warm replay never does).
     pub compiles: u64,
@@ -442,8 +446,13 @@ pub struct DriverStats {
     pub host_picks: u64,
     /// What the draft policy did across the rows stepped.
     pub speculation: SpeculationStats,
+    /// The same rounds by draft position: where in a round the drafts stop being kept.
+    pub positions: PositionAcceptance,
     /// What a recurrent target's rollback cost the executor, on a driver built `with_phase_timing`.
     pub rollback: RollbackTiming,
+    /// What the draft passes and the verify windows cost the executor, on a driver built
+    /// `with_phase_timing`.
+    pub passes: PassTiming,
     /// What the expert residency managers did, summed over the executables (zero without a pool).
     pub residency: ResidencyCounters,
 }
@@ -1092,7 +1101,7 @@ impl Driver {
     pub fn stats(&self) -> DriverStats {
         DriverStats {
             residency: self.residency_counters(),
-            ..self.stats
+            ..self.stats.clone()
         }
     }
 
@@ -1425,7 +1434,7 @@ impl Driver {
                     }
                     carried = true;
                 }
-                StateRole::Positional { .. } => {}
+                StateRole::Positional { .. } | StateRole::Blocked { .. } => {}
             }
         }
         if shape.hidden.is_some() && !carried {

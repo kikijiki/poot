@@ -50,7 +50,7 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: dead-pub machete docs-paths aie-link-driver crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
+test-model-free: dead-pub machete docs-paths diagrams-check aie-link-driver crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
@@ -79,6 +79,17 @@ test-lane-coverage:
 # `_ptx`) runs in the device lanes.
 test-add-a-model:
     cargo nextest run --no-tests=fail --no-fail-fast -p poot-llm --test add_a_model -E 'not test(/_(wgpu|rocm|ptx)$/)'
+
+# render website/diagrams/*.svg to the PNGs the README and the website use (flags: --out DIR, --only a,b,
+# --publish-dir DIR, --check, e.g. `just diagrams --only model-tracing`); see scripts/diagrams.py
+diagrams *args:
+    scripts/diagrams.py {{args}}
+
+# the renderer's self-test (CLI paths, reference-check failures), then fail when a committed diagram PNG or index.json
+# differs from its source, or the README and the website reference other images than index.json
+diagrams-check:
+    scripts/diagrams.py --self-test
+    scripts/diagrams.py --check
 
 # fail on a `docs/<name>.md` reference in a tracked file whose target does not exist (project notes live in
 # Backstage, not in this repository's docs/)

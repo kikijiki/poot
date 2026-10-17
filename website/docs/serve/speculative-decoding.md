@@ -50,7 +50,7 @@ A row that verified drafts reports `Verified { proposed, accepted }`; a prefill 
 
 ## Measuring a policy
 
-The `speculation_bench` example of `poot-llm` runs one policy on one checkpoint and prompt and prints the decode rate, the acceptance rate and a digest of the generated tokens. Run it once per policy on the same binary and prompt: a greedy run must print the digest `off` prints, and the acceptance rate is the driver's own count. A draft model gives a gain only when it agrees with the target often enough to pay for its own steps, so measure with the draft you intend to serve.
+The `speculation_bench` example of `poot-llm` runs one policy on one checkpoint and prompt and prints the decode rate, the acceptance rate (overall and per draft position), `p` (the share of verified rounds that rejected a draft, so restored and replayed a recurrent target) and a digest of the generated tokens. With `--timing 1` it adds the engine's time per verified round for the draft passes, the verify window and the snapshot, restore and replay copies, and the host remainder; take the decode rate from a run without it. `speculation_prompts/` holds a mixed-text and a repetitive-text prompt of about 570 tokens. Run it once per policy on the same binary and prompt: a greedy run must print the digest `off` prints, and the acceptance rate is the driver's own count. A draft model gives a gain only when it agrees with the target often enough to pay for its own steps, so measure with the draft you intend to serve.
 
 ## What is refused
 
