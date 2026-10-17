@@ -53,8 +53,8 @@ pub use handle::{
 use poot_target::AmdArch;
 pub use spirv_postprocess::NoContractionError;
 pub use vpu::{
-    VpuElem, VpuEmitError, VpuInput, VpuIr, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue,
-    emit_vpu,
+    VpuElem, VpuEmitError, VpuInput, VpuIr, VpuNode, VpuOp, VpuRegion, VpuScalar, VpuTensor,
+    VpuValue, emit_vpu,
 };
 
 /// A codegen backend target.

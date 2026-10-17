@@ -447,7 +447,7 @@ pub fn aie_shape_abi(choice: &KernelChoice) -> Result<AieShapeAbi, AieAbiRefusal
         .map(|(index, binding)| {
             AieBinding::new(
                 index,
-                BufferStorage::f32(),
+                word_storage(binding.element),
                 if binding.writes {
                     ArgAccess::Write
                 } else {
@@ -459,6 +459,15 @@ pub fn aie_shape_abi(choice: &KernelChoice) -> Result<AieShapeAbi, AieAbiRefusal
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(AieShapeAbi::new(bindings)?)
+}
+
+/// The canonical word buffer of an element kind an AIE binding may have (F32, else I32). The shape ABI
+/// refuses any other storage when it builds the binding.
+fn word_storage(element: ElementKind) -> BufferStorage {
+    match element {
+        ElementKind::F32 => BufferStorage::f32(),
+        _ => BufferStorage::i32(),
+    }
 }
 
 /// Why a plan has no AIE shape ABI, or a region has no link recipe.
@@ -483,8 +492,10 @@ pub enum AieAbiRefusal {
         /// The value the equation produces.
         eqn: ValueId,
     },
-    /// Two equations read one value with different dimensions.
-    #[error("value {value:?} is read with different dimensions by two equations of the region")]
+    /// Two equations bind one value with different dimensions or element kinds.
+    #[error(
+        "value {value:?} is bound with different dimensions or elements by two equations of the region"
+    )]
     ReaderDims {
         /// The value that is read twice.
         value: ValueId,
@@ -497,22 +508,25 @@ pub enum AieAbiRefusal {
     NotAnAieProgram,
 }
 
-/// Record the dimensions and proved access `binding` declares for `value`. A second declaration must have
-/// the same dimensions; the larger proved access wins.
+/// What the region's equations declare of one value: its dimensions, element kind and proved access.
+type Declared<'a> = (&'a [u64], ElementKind, u64);
+
+/// Record the dimensions, element kind and proved access `binding` declares for `value`. A second
+/// declaration must have the same dimensions and element kind; the larger proved access wins.
 fn note_dims<'a>(
-    seen: &mut HashMap<ValueId, (&'a [u64], u64)>,
+    seen: &mut HashMap<ValueId, Declared<'a>>,
     value: ValueId,
     binding: &'a kg::SerializedBinding,
 ) -> Result<(), AieAbiRefusal> {
     match seen.entry(value) {
         Entry::Vacant(slot) => {
-            slot.insert((&binding.dims, binding.accessed));
+            slot.insert((&binding.dims, binding.element, binding.accessed));
         }
         Entry::Occupied(mut slot) => {
-            if *slot.get().0 != *binding.dims {
+            if *slot.get().0 != *binding.dims || slot.get().1 != binding.element {
                 return Err(AieAbiRefusal::ReaderDims { value });
             }
-            slot.get_mut().1 = slot.get().1.max(binding.accessed);
+            slot.get_mut().2 = slot.get().2.max(binding.accessed);
         }
     }
     Ok(())
@@ -581,7 +595,7 @@ pub(crate) fn aie_region_recipe(
 
     // The dimensions and proved access of every value the host sees: what the first equation that touches
     // it declares. Two readers must agree on the dimensions; the larger proved access wins.
-    let mut seen: HashMap<ValueId, (&[u64], u64)> = HashMap::new();
+    let mut seen: HashMap<ValueId, Declared<'_>> = HashMap::new();
     for member in &members {
         for (&value, binding) in member.reads.iter().zip(member.bindings) {
             note_dims(&mut seen, value, binding)?;
@@ -591,8 +605,8 @@ pub(crate) fn aie_region_recipe(
     }
 
     let host_binding = |index: usize, value: ValueId, access: ArgAccess| {
-        let (dims, accessed) = seen[&value];
-        AieBinding::new(index, BufferStorage::f32(), access, dims, accessed)
+        let (dims, element, accessed) = seen[&value];
+        AieBinding::new(index, word_storage(element), access, dims, accessed)
     };
     let mut host = Vec::new();
     for (index, &value) in region.reads().iter().enumerate() {
@@ -610,9 +624,8 @@ pub(crate) fn aie_region_recipe(
     // One FIFO per value: the region's reads first, then each equation's output.
     let mut fifo_of: HashMap<ValueId, usize> = HashMap::new();
     let mut fifos: Vec<AieFifo> = Vec::new();
-    let element = ElementKind::F32;
     let mut open = |value: ValueId, producer: FifoEnd| {
-        let (dims, _) = seen[&value];
+        let (dims, element, _) = seen[&value];
         fifo_of.insert(value, fifos.len());
         fifos.push(AieFifo {
             producer,
@@ -1157,8 +1170,12 @@ mod tests {
                 bindings.iter().map(|b| b.writes).collect::<Vec<_>>(),
                 [false, true]
             );
-            // A unary request states an element count, not a shape, so its buffers are flat.
-            assert!(bindings.iter().all(|b| b.dims == [12] && b.accessed == 12));
+            // The buffers are bound at the graph's own dimensions.
+            assert!(
+                bindings
+                    .iter()
+                    .all(|b| b.dims == [3, 4] && b.accessed == 12)
+            );
             let dispatch = planned.plan.single().expect("one dispatch");
             assert_eq!(dispatch.body.workgroup_size, [1, 1, 1]);
             assert_eq!(
@@ -1170,6 +1187,72 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), 3, "each op is its own kernel");
+    }
+
+    /// A last-axis reduction and a gather plan for an AIE target as the ordinary requests under the
+    /// serialized schedule, bound at the graph's own dimensions: the reduction's output keeps its unit
+    /// axis, the gather's index is an I32 buffer in an arena of its own, and the plan's contract is the
+    /// op's. Mutation: bind the gather's index as `ElementKind::F32` in `serialized_movement`, or take the
+    /// dimensions from the request instead of the graph in `build_serialized`; the assertions fail.
+    #[test]
+    fn plan_eqn_plans_a_row_reduction_and_a_gather_with_the_graphs_dimensions() {
+        use poot_target::ElementKind;
+        let sum = graph_of(|b| {
+            let x = b.constant("x", TensorType::f32(vec![5, 8])).unwrap();
+            b.reduce(RedOp::Sum, x, 1, true).unwrap()
+        });
+        let planned = plan_aie(&sum).unwrap();
+        let KernelChoice::Serialized {
+            contract, bindings, ..
+        } = &planned.choice
+        else {
+            panic!("a row sum is planned as a serialized schedule");
+        };
+        assert_eq!(contract.id, "f32-row-sum-sequential-v1");
+        let seen: Vec<_> = bindings.iter().map(|b| (&b.dims[..], b.accessed)).collect();
+        assert_eq!(seen, [(&[5u64, 8][..], 40), (&[5u64, 1][..], 5)]);
+
+        let gather = graph_of(|b| {
+            let table = b.constant("table", TensorType::f32(vec![10, 3])).unwrap();
+            let ids = b
+                .constant("ids", TensorType::new(vec![4], DType::I32))
+                .unwrap();
+            b.gather(table, 0, ids).unwrap()
+        });
+        let planned = plan_aie(&gather).unwrap();
+        let KernelChoice::Serialized {
+            contract, bindings, ..
+        } = &planned.choice
+        else {
+            panic!("a gather is planned as a serialized schedule");
+        };
+        assert_eq!(contract.id, "gather-copy-v1");
+        let seen: Vec<_> = bindings
+            .iter()
+            .map(|b| (&b.dims[..], b.element, b.writes))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (&[10u64, 3][..], ElementKind::F32, false),
+                (&[4u64][..], ElementKind::I32, false),
+                (&[4u64, 3][..], ElementKind::F32, true),
+            ]
+        );
+        let abi = aie_shape_abi(&planned.choice).unwrap();
+        let arenas: Vec<_> = abi
+            .arenas()
+            .iter()
+            .map(|a| (a.access(), a.element(), a.words()))
+            .collect();
+        assert_eq!(
+            arenas,
+            [
+                (poot_runtime_common::ArgAccess::Read, ElementKind::F32, 30),
+                (poot_runtime_common::ArgAccess::Read, ElementKind::I32, 4),
+                (poot_runtime_common::ArgAccess::Write, ElementKind::F32, 12),
+            ]
+        );
     }
 
     /// The same ordinary request path refuses what has no serialized schedule, each with the planner's own
@@ -1185,23 +1268,40 @@ mod tests {
             }) => (request, reason),
             other => panic!("expected a generator refusal, got {other:?}"),
         };
-        let sqrt = graph_of(|b| {
+        let round = graph_of(|b| {
             let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
-            b.unary(poot_graph_ir::UnOp::Sqrt, x).unwrap()
+            b.unary(poot_graph_ir::UnOp::Round, x).unwrap()
         });
-        let (request, reason) = kernel_gen(aie_refusal(&sqrt));
+        let (request, reason) = kernel_gen(aie_refusal(&round));
         assert_eq!(request, "serialized_schedule");
         assert!(reason.contains("no proved lowering"), "{reason}");
         let broadcast = add_graph(vec![2, 3], vec![1, 3], DType::F32);
         assert!(kernel_gen(aie_refusal(&broadcast)).1.contains("broadcast"));
         let ints = add_graph(vec![2, 3], vec![2, 3], DType::I32);
         assert_eq!(kernel_gen(aie_refusal(&ints)).0, "serialized_schedule");
-        let max = graph_of(|b| {
-            let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
-            let y = b.constant("y", TensorType::f32(vec![4])).unwrap();
-            b.binary(poot_graph_ir::BinOp::Max, x, y).unwrap()
+        // A reduction over a leading axis has no row to loop over.
+        let leading = graph_of(|b| {
+            let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+            b.reduce(RedOp::Sum, x, 0, false).unwrap()
         });
-        assert_eq!(kernel_gen(aie_refusal(&max)).0, "serialized_schedule");
+        assert_eq!(
+            aie_refusal(&leading),
+            Capability::NonLastAxisReduce { axis: 0 }
+        );
+        // A half-precision reduction is not a row of F32 words.
+        let bf16_rows = graph_of(|b| {
+            let x = b
+                .constant("x", TensorType::new(vec![2, 3], DType::BF16))
+                .unwrap();
+            b.reduce(RedOp::Sum, x, 1, false).unwrap()
+        });
+        assert_eq!(kernel_gen(aie_refusal(&bf16_rows)).0, "serialized_schedule");
+        // A data movement other than a gather reads GPU capabilities.
+        let transpose = graph_of(|b| {
+            let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();
+            b.transpose(x, vec![1, 0]).unwrap()
+        });
+        assert_eq!(aie_refusal(&transpose), Capability::GpuOnly);
         // A collective is a cut between stage programs on every target.
         let reduce = graph_of(|b| {
             let x = b.constant("x", TensorType::f32(vec![2, 3])).unwrap();

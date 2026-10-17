@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use super::{VpuElem, VpuOp, VpuTensor};
+use super::{VpuElem, VpuOp, VpuScalar, VpuTensor};
 
 impl VpuElem {
     /// The `element_type` attribute spelling.
@@ -20,6 +20,26 @@ impl VpuElem {
             VpuElem::F16 => "FP16",
             VpuElem::F32 => "FP32",
             VpuElem::I32 => "I32",
+        }
+    }
+}
+
+impl VpuScalar {
+    /// The element type the constant has.
+    pub const fn elem(self) -> VpuElem {
+        match self {
+            VpuScalar::F16(_) => VpuElem::F16,
+            VpuScalar::F32(_) => VpuElem::F32,
+            VpuScalar::I32(_) => VpuElem::I32,
+        }
+    }
+
+    /// The constant's little-endian bytes, as the weight blob holds them.
+    fn le_bytes(self) -> Vec<u8> {
+        match self {
+            VpuScalar::F16(bits) => bits.to_le_bytes().to_vec(),
+            VpuScalar::F32(bits) => bits.to_le_bytes().to_vec(),
+            VpuScalar::I32(value) => value.to_le_bytes().to_vec(),
         }
     }
 }
@@ -50,17 +70,37 @@ fn join_dims(shape: &[usize]) -> String {
 pub struct VpuValue(pub u32);
 
 impl VpuOp {
+    /// Whether the op is a nullary `Const`: its layer is an auxiliary constant (`aux_<id>`), not a layer
+    /// named after its equation, so the compiler is never asked about it.
+    const fn is_constant(&self) -> bool {
+        matches!(self, VpuOp::Iota { .. } | VpuOp::Scalar(_))
+    }
+
     /// How many operands the op takes; `None` for a variadic op (`Concat`).
     const fn arity(&self) -> Option<usize> {
         match self {
+            VpuOp::Iota { .. } | VpuOp::Scalar(_) => Some(0),
             VpuOp::Exp
+            | VpuOp::Negative
+            | VpuOp::Sqrt
             | VpuOp::ReduceSum { .. }
+            | VpuOp::ReduceMax { .. }
             | VpuOp::Reshape
             | VpuOp::Transpose { .. }
             | VpuOp::Broadcast
             | VpuOp::Slice { .. }
-            | VpuOp::Convert => Some(1),
-            VpuOp::Add | VpuOp::Multiply | VpuOp::MatMul | VpuOp::Gather { .. } => Some(2),
+            | VpuOp::Convert
+            | VpuOp::NarrowEntry
+            | VpuOp::WidenExit => Some(1),
+            VpuOp::Add
+            | VpuOp::Subtract
+            | VpuOp::Multiply
+            | VpuOp::Divide
+            | VpuOp::Maximum
+            | VpuOp::GreaterEqual
+            | VpuOp::MatMul
+            | VpuOp::Gather { .. } => Some(2),
+            VpuOp::DynamicUpdateSlice { .. } => Some(3),
             VpuOp::Concat { .. } => None,
         }
     }
@@ -77,6 +117,18 @@ pub struct VpuNode {
     pub inputs: Vec<VpuValue>,
     /// The type of the value the node defines.
     pub out: VpuTensor,
+}
+
+impl VpuNode {
+    /// The IR layer name the node's value goes by: the equation's (`v<origin>`), or the boundary
+    /// conversion's, which shares its `origin` with a neighbour and so names its direction.
+    fn layer_name(&self) -> String {
+        match self.op {
+            VpuOp::NarrowEntry => format!("v{}_narrow", self.origin),
+            VpuOp::WidenExit => format!("v{}_widen", self.origin),
+            _ => format!("v{}", self.origin),
+        }
+    }
 }
 
 /// A value a region reads from outside: a runtime argument the device binds (weights, activations, state).
@@ -114,11 +166,13 @@ impl VpuRegion {
         self.inputs.iter().map(|input| input.tensor.shape.clone())
     }
 
-    /// The IR layer name and poot equation of every node, in program order.
+    /// The IR layer name and poot equation of every node, in program order. A constant node (a scalar literal
+    /// or an iota) is an auxiliary `Const` like an axis or a shape: it has no layer of its own to report.
     pub fn layers(&self) -> impl Iterator<Item = (String, u32)> + '_ {
         self.nodes
             .iter()
-            .map(|node| (format!("v{}", node.origin), node.origin))
+            .filter(|node| !node.op.is_constant())
+            .map(|node| (node.layer_name(), node.origin))
     }
 
     /// The node an output value is defined by. Outputs are node values: the emitter numbers inputs first.
@@ -132,7 +186,7 @@ impl VpuRegion {
     pub fn output_names(&self) -> impl Iterator<Item = String> + '_ {
         self.outputs.iter().map(|&value| {
             self.output_node(value)
-                .map_or_else(String::new, |node| format!("v{}", node.origin))
+                .map_or_else(String::new, VpuNode::layer_name)
         })
     }
 
@@ -203,8 +257,15 @@ pub struct VpuIr {
 struct Port {
     layer: usize,
     port: usize,
-    elem: VpuElem,
+    precision: &'static str,
     dims: String,
+}
+
+/// The port a layer defines: its shape from `tensor`, its precision as the IR spells it (a comparison's
+/// boolean is a precision no region element type has).
+struct Output<'a> {
+    precision: &'static str,
+    tensor: &'a VpuTensor,
 }
 
 struct Emitter {
@@ -231,32 +292,40 @@ impl Emitter {
         );
     }
 
-    /// A 1-D (or rank-0 for `None`) `i64` constant for an op's second input.
-    fn i64_const(&mut self, values: &[i64], scalar: bool) -> Port {
+    /// A `Const` layer holding `bytes`, of the given IR element type and port precision, in the weight blob.
+    fn const_layer(
+        &mut self,
+        element_type: &str,
+        precision: &'static str,
+        shape: &[usize],
+        bytes: &[u8],
+    ) -> Port {
         let offset = self.weights.len();
-        for v in values {
-            self.weights.extend_from_slice(&v.to_le_bytes());
-        }
+        self.weights.extend_from_slice(bytes);
         let id = self.layer_id();
-        let (shape, dims) = if scalar {
-            (String::new(), String::new())
-        } else {
-            (
-                values.len().to_string(),
-                format!("<dim>{}</dim>", values.len()),
-            )
-        };
+        let dims = shape.iter().fold(String::new(), |mut s, d| {
+            let _ = write!(s, "<dim>{d}</dim>");
+            s
+        });
         let _ = write!(
             self.layers,
-            r#"<layer id="{id}" name="aux_{id}" type="Const" version="opset1"><data element_type="i64" shape="{shape}" offset="{offset}" size="{size}"/><output><port id="0" precision="I64">{dims}</port></output></layer>"#,
-            size = values.len() * 8,
+            r#"<layer id="{id}" name="aux_{id}" type="Const" version="opset1"><data element_type="{element_type}" shape="{shape}" offset="{offset}" size="{size}"/><output><port id="0" precision="{precision}">{dims}</port></output></layer>"#,
+            shape = join_dims(shape),
+            size = bytes.len(),
         );
         Port {
             layer: id,
             port: 0,
-            elem: VpuElem::I32,
+            precision,
             dims,
         }
+    }
+
+    /// A 1-D (or rank-0 for `scalar`) `i64` constant for an op's second input.
+    fn i64_const(&mut self, values: &[i64], scalar: bool) -> Port {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let shape = if scalar { vec![] } else { vec![values.len()] };
+        self.const_layer("i64", "I64", &shape, &bytes)
     }
 
     fn i64_vec(&mut self, values: &[usize]) -> Port {
@@ -274,6 +343,24 @@ impl Emitter {
         data: &str,
         inputs: &[(Port, &'static str)],
         out: &VpuTensor,
+    ) -> Port {
+        let result = Output {
+            precision: out.elem.precision(),
+            tensor: out,
+        };
+        self.op_layer_as(name, kind, version, data, inputs, &result)
+    }
+
+    /// [`Emitter::op_layer`] with an output port precision other than `out`'s element type's: the boolean
+    /// result of a comparison, which no region value carries.
+    fn op_layer_as(
+        &mut self,
+        name: &str,
+        kind: &str,
+        version: &str,
+        data: &str,
+        inputs: &[(Port, &'static str)],
+        out: &Output<'_>,
     ) -> Port {
         let id = self.layer_id();
         let mut in_ports = String::new();
@@ -293,8 +380,8 @@ impl Emitter {
         let _ = write!(
             self.layers,
             r#"<layer id="{id}" name="{name}" type="{kind}" version="{version}">{data}{input}<output><port id="{out_port}" precision="{p}" names="{name}">{dims}</port></output></layer>"#,
-            p = out.elem.precision(),
-            dims = out.dims(),
+            p = out.precision,
+            dims = out.tensor.dims(),
         );
         for (index, (port, _)) in inputs.iter().enumerate() {
             self.edge(port, id, index);
@@ -302,8 +389,8 @@ impl Emitter {
         Port {
             layer: id,
             port: out_port,
-            elem: out.elem,
-            dims: out.dims(),
+            precision: out.precision,
+            dims: out.tensor.dims(),
         }
     }
 }
@@ -341,7 +428,7 @@ pub fn emit_vpu(region: &VpuRegion) -> Result<VpuIr, VpuEmitError> {
         e.ports.push(Port {
             layer: id,
             port: 0,
-            elem: t.elem,
+            precision: t.elem.precision(),
             dims: t.dims(),
         });
         e.types.push(t.clone());
@@ -359,7 +446,7 @@ pub fn emit_vpu(region: &VpuRegion) -> Result<VpuIr, VpuEmitError> {
         let _ = write!(
             e.layers,
             r#"<layer id="{id}" name="result_{index}" type="Result" version="opset1"><input><port id="0" precision="{p}">{dims}</port></input></layer>"#,
-            p = port.elem.precision(),
+            p = port.precision,
             dims = port.dims,
         );
         e.edge(&port, id, 0);
@@ -390,6 +477,7 @@ fn lower_node(e: &mut Emitter, node: &VpuNode) -> Result<(), VpuEmitError> {
     }
     let mut operands = Vec::with_capacity(node.inputs.len());
     let mut shapes = Vec::with_capacity(node.inputs.len());
+    let mut elems = Vec::with_capacity(node.inputs.len());
     for value in &node.inputs {
         let index = value.0 as usize;
         let (Some(port), Some(ty)) = (e.ports.get(index), e.types.get(index)) else {
@@ -400,35 +488,84 @@ fn lower_node(e: &mut Emitter, node: &VpuNode) -> Result<(), VpuEmitError> {
         };
         operands.push(port.clone());
         shapes.push(ty.shape.clone());
+        elems.push(ty.elem);
     }
     let out_of_range = || VpuEmitError::ParameterOutOfRange {
         origin,
         op: node.op.clone(),
         shape: shapes.first().cloned().unwrap_or_default(),
     };
-    let name = format!("v{origin}");
-    let prec = |p: &Port| p.elem.precision();
+    let name = node.layer_name();
+    let prec = |p: &Port| p.precision;
     let with = |operands: &[Port]| -> Vec<(Port, &'static str)> {
         operands.iter().map(|p| (p.clone(), prec(p))).collect()
     };
+    let binary = |e: &mut Emitter, name: &str, kind: &str| {
+        e.op_layer(
+            name,
+            kind,
+            "opset1",
+            r#"<data auto_broadcast="numpy"/>"#,
+            &with(&operands),
+            &node.out,
+        )
+    };
     let out = match &node.op {
-        VpuOp::Add => e.op_layer(
-            &name,
-            "Add",
-            "opset1",
-            r#"<data auto_broadcast="numpy"/>"#,
-            &with(&operands),
-            &node.out,
-        ),
-        VpuOp::Multiply => e.op_layer(
-            &name,
-            "Multiply",
-            "opset1",
-            r#"<data auto_broadcast="numpy"/>"#,
-            &with(&operands),
-            &node.out,
-        ),
+        VpuOp::Add => binary(e, &name, "Add"),
+        VpuOp::Subtract => binary(e, &name, "Subtract"),
+        VpuOp::Multiply => binary(e, &name, "Multiply"),
+        VpuOp::Divide => binary(e, &name, "Divide"),
+        VpuOp::Maximum => binary(e, &name, "Maximum"),
         VpuOp::Exp => e.op_layer(&name, "Exp", "opset1", "", &with(&operands), &node.out),
+        VpuOp::Negative => e.op_layer(&name, "Negative", "opset1", "", &with(&operands), &node.out),
+        VpuOp::Sqrt => e.op_layer(&name, "Sqrt", "opset1", "", &with(&operands), &node.out),
+        VpuOp::GreaterEqual => {
+            // The comparison is boolean; poot's `Ge` is the operands' element type holding 1 or 0.
+            let flags = e.op_layer_as(
+                &format!("{name}_flags"),
+                "GreaterEqual",
+                "opset1",
+                r#"<data auto_broadcast="numpy"/>"#,
+                &with(&operands),
+                &Output {
+                    precision: "BOOL",
+                    tensor: &node.out,
+                },
+            );
+            e.op_layer(
+                &name,
+                "Convert",
+                "opset1",
+                &format!(
+                    r#"<data destination_type="{}"/>"#,
+                    node.out.elem.element_type()
+                ),
+                &[(flags, "BOOL")],
+                &node.out,
+            )
+        }
+        VpuOp::Scalar(scalar) => {
+            let elem = scalar.elem();
+            e.const_layer(
+                elem.element_type(),
+                elem.precision(),
+                &node.out.shape,
+                &scalar.le_bytes(),
+            )
+        }
+        VpuOp::Iota { len } => {
+            let bytes: Vec<u8> = match node.out.elem {
+                VpuElem::I32 => (0..*len as i32).flat_map(i32::to_le_bytes).collect(),
+                VpuElem::F32 => (0..*len).flat_map(|i| (i as f32).to_le_bytes()).collect(),
+                VpuElem::F16 => return Err(out_of_range()),
+            };
+            e.const_layer(
+                node.out.elem.element_type(),
+                node.out.elem.precision(),
+                &node.out.shape,
+                &bytes,
+            )
+        }
         VpuOp::MatMul => e.op_layer(
             &name,
             "MatMul",
@@ -437,7 +574,7 @@ fn lower_node(e: &mut Emitter, node: &VpuNode) -> Result<(), VpuEmitError> {
             &with(&operands),
             &node.out,
         ),
-        VpuOp::Convert => e.op_layer(
+        VpuOp::Convert | VpuOp::NarrowEntry | VpuOp::WidenExit => e.op_layer(
             &name,
             "Convert",
             "opset1",
@@ -461,16 +598,21 @@ fn lower_node(e: &mut Emitter, node: &VpuNode) -> Result<(), VpuEmitError> {
                 &node.out,
             )
         }
-        VpuOp::ReduceSum { axis, keepdim } => {
+        VpuOp::ReduceSum { axis, keepdim } | VpuOp::ReduceMax { axis, keepdim } => {
             if *axis >= shapes[0].len() {
                 return Err(out_of_range());
             }
+            let kind = if matches!(node.op, VpuOp::ReduceSum { .. }) {
+                "ReduceSum"
+            } else {
+                "ReduceMax"
+            };
             let axes = e.i64_vec(&[*axis]);
             let mut ins = with(&operands);
             ins.push((axes, "I64"));
             e.op_layer(
                 &name,
-                "ReduceSum",
+                kind,
                 "opset1",
                 &format!(r#"<data keep_dims="{keepdim}"/>"#),
                 &ins,
@@ -529,11 +671,21 @@ fn lower_node(e: &mut Emitter, node: &VpuNode) -> Result<(), VpuEmitError> {
             }
             e.op_layer(&name, "Slice", "opset8", "", &ins, &node.out)
         }
+        VpuOp::DynamicUpdateSlice { axis } => {
+            let fits = *axis < shapes[0].len()
+                && shapes[1].len() == shapes[0].len()
+                && shapes[1][*axis] <= shapes[0][*axis]
+                && shapes[2].is_empty();
+            if !fits {
+                return Err(out_of_range());
+            }
+            lower_update_slice(e, node, &name, &operands, &shapes, *axis)
+        }
         VpuOp::Gather { axis } => {
             if *axis >= shapes[0].len() {
                 return Err(out_of_range());
             }
-            lower_gather(e, node, &name, &operands, &shapes, *axis)
+            lower_gather(e, node, &name, &operands, &shapes, elems[1], *axis)
         }
     };
     e.ports.push(out);
@@ -550,14 +702,15 @@ fn lower_gather(
     name: &str,
     operands: &[Port],
     shapes: &[Vec<usize>],
+    index_elem: VpuElem,
     axis: usize,
 ) -> Port {
     let axis_const = e.i64_const(&[axis as i64], true);
     let index_rank = shapes[1].len();
     if index_rank > 0 {
         let ins = [
-            (operands[0].clone(), operands[0].elem.precision()),
-            (operands[1].clone(), operands[1].elem.precision()),
+            (operands[0].clone(), operands[0].precision),
+            (operands[1].clone(), operands[1].precision),
             (axis_const, "I64"),
         ];
         return e.op_layer(
@@ -570,7 +723,7 @@ fn lower_gather(
         );
     }
     let index_1d = VpuTensor {
-        elem: operands[1].elem,
+        elem: index_elem,
         shape: vec![1],
     };
     let one = e.i64_vec(&[1]);
@@ -579,10 +732,7 @@ fn lower_gather(
         "Reshape",
         "opset1",
         r#"<data special_zero="false"/>"#,
-        &[
-            (operands[1].clone(), operands[1].elem.precision()),
-            (one, "I64"),
-        ],
+        &[(operands[1].clone(), operands[1].precision), (one, "I64")],
         &index_1d,
     );
     let mut kept = shapes[0].clone();
@@ -597,8 +747,8 @@ fn lower_gather(
         "opset8",
         r#"<data batch_dims="0"/>"#,
         &[
-            (operands[0].clone(), operands[0].elem.precision()),
-            (index, operands[1].elem.precision()),
+            (operands[0].clone(), operands[0].precision),
+            (index, operands[1].precision),
             (axis_const, "I64"),
         ],
         &gathered_ty,
@@ -610,6 +760,48 @@ fn lower_gather(
         "opset1",
         r#"<data special_zero="false"/>"#,
         &[(gathered, node.out.elem.precision()), (shape, "I64")],
+        &node.out,
+    )
+}
+
+/// `DynamicUpdateSlice` as a `ScatterUpdate` of the update's rows at the indices `index..index + extent`:
+/// the indices are the constant range `0..extent` plus the scalar index, so a literal index is a constant
+/// the vendor compiler folds and a runtime index is read from its value.
+fn lower_update_slice(
+    e: &mut Emitter,
+    node: &VpuNode,
+    name: &str,
+    operands: &[Port],
+    shapes: &[Vec<usize>],
+    axis: usize,
+) -> Port {
+    let extent = shapes[1][axis];
+    let range: Vec<u8> = (0..extent as i32).flat_map(i32::to_le_bytes).collect();
+    let range = e.const_layer("i32", "I32", &[extent], &range);
+    let indices_ty = VpuTensor {
+        elem: VpuElem::I32,
+        shape: vec![extent],
+    };
+    let indices = e.op_layer(
+        &format!("{name}_indices"),
+        "Add",
+        "opset1",
+        r#"<data auto_broadcast="numpy"/>"#,
+        &[(range, "I32"), (operands[2].clone(), operands[2].precision)],
+        &indices_ty,
+    );
+    let axis_const = e.i64_const(&[axis as i64], true);
+    e.op_layer(
+        name,
+        "ScatterUpdate",
+        "opset3",
+        "",
+        &[
+            (operands[0].clone(), operands[0].precision),
+            (indices, "I32"),
+            (operands[1].clone(), operands[1].precision),
+            (axis_const, "I64"),
+        ],
         &node.out,
     )
 }
@@ -682,6 +874,37 @@ mod tests {
                 r#"type="Convert" version="opset1"><data destination_type="f32"/>"#,
             ),
             (
+                node(VpuOp::Subtract, &[0, 0], tensor(VpuElem::F16, &[2, 3])),
+                r#"type="Subtract" version="opset1"><data auto_broadcast="numpy"/>"#,
+            ),
+            (
+                node(VpuOp::Divide, &[0, 0], tensor(VpuElem::F16, &[2, 3])),
+                r#"type="Divide" version="opset1"><data auto_broadcast="numpy"/>"#,
+            ),
+            (
+                node(VpuOp::Maximum, &[0, 0], tensor(VpuElem::F16, &[2, 3])),
+                r#"type="Maximum" version="opset1"><data auto_broadcast="numpy"/>"#,
+            ),
+            (
+                node(VpuOp::Negative, &[0], tensor(VpuElem::F16, &[2, 3])),
+                r#"type="Negative" version="opset1">"#,
+            ),
+            (
+                node(VpuOp::Sqrt, &[0], tensor(VpuElem::F16, &[2, 3])),
+                r#"type="Sqrt" version="opset1">"#,
+            ),
+            (
+                node(
+                    VpuOp::ReduceMax {
+                        axis: 1,
+                        keepdim: false,
+                    },
+                    &[0],
+                    tensor(VpuElem::F16, &[2]),
+                ),
+                r#"type="ReduceMax" version="opset1"><data keep_dims="false"/>"#,
+            ),
+            (
                 node(VpuOp::Reshape, &[0], tensor(VpuElem::F16, &[6])),
                 r#"type="Reshape" version="opset1"><data special_zero="false"/>"#,
             ),
@@ -743,6 +966,11 @@ mod tests {
                 end: 1,
             },
             VpuOp::Concat { axis: 2 },
+            VpuOp::ReduceMax {
+                axis: 2,
+                keepdim: true,
+            },
+            VpuOp::DynamicUpdateSlice { axis: 2 },
         ] {
             let operands = vec![0; op.arity().unwrap_or(2)];
             let error = emit_vpu(&region(
@@ -752,6 +980,34 @@ mod tests {
             assert!(
                 matches!(error, Err(VpuEmitError::ParameterOutOfRange { .. })),
                 "{op:?}: {error:?}"
+            );
+        }
+    }
+
+    /// Every layer name `layers()` reports is a layer of the emitted text, for a region holding a scalar
+    /// literal, an iota and a `Ge` (the vendor compiler is asked about exactly these names).
+    /// Mutation: filter only `Scalar` nodes in `layers()`; the iota's `v9` is reported but never emitted.
+    #[test]
+    fn every_reported_layer_is_in_the_emitted_text() {
+        let r = region(
+            vec![
+                node(VpuOp::Iota { len: 3 }, &[], tensor(VpuElem::I32, &[3])),
+                node(
+                    VpuOp::Scalar(VpuScalar::F16(0x3c00)),
+                    &[],
+                    tensor(VpuElem::F16, &[]),
+                ),
+                node(VpuOp::GreaterEqual, &[0, 3], tensor(VpuElem::F16, &[2, 3])),
+            ],
+            vec![VpuValue(4)],
+        );
+        let xml = emit_vpu(&r).unwrap().xml;
+        let reported: Vec<_> = r.layers().collect();
+        assert_eq!(reported.len(), 1, "only the Ge: {reported:?}");
+        for (name, _) in reported {
+            assert!(
+                xml.contains(&format!(r#"name="{name}""#)),
+                "{name} in {xml}"
             );
         }
     }

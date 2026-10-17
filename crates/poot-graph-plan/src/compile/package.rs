@@ -528,6 +528,7 @@ mod tests {
                 target: VpuTargetId::Npu4,
                 compiler: Queried::Known(VendorCompilerId { major: 8, minor: 3 }),
                 memory_budget_bytes: Queried::Unknown,
+                narrowing: None,
             },
         };
         let program = compile(

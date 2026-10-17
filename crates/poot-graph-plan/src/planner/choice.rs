@@ -14,7 +14,9 @@ use std::fmt;
 use poot_kernelgen::{KernelRequest, generate};
 use poot_target::{AieTargetId, Backend, DeviceCaps};
 
-use crate::{Binding, Capability, Dispatch, DispatchPlan, ImportedKernel, Plan, PlanError};
+use crate::{
+    AieAbiRefusal, Binding, Capability, Dispatch, DispatchPlan, ImportedKernel, Plan, PlanError,
+};
 use poot_graph_ir::ValueId;
 use poot_kernel_ir::Body;
 use poot_tensor::DType;
@@ -217,6 +219,20 @@ fn build_serialized(
 ) -> Result<Built, PlanError> {
     let sequential = poot_kernelgen::serialized_schedule(&request, site.limits())
         .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
+    // The generator proved what the body does to each parameter; the graph says what each buffer is. One
+    // binding per operand then the output, or the generator and the equation disagree about the ABI.
+    let dims = site.dims();
+    if dims.len() != sequential.accesses.len() {
+        return Err(site.refuse(Capability::AieAbi(AieAbiRefusal::Bindings {
+            eqn: site.eqn_out(),
+        })));
+    }
+    let bindings = sequential
+        .accesses
+        .iter()
+        .zip(dims)
+        .map(|(access, dims)| access.over(dims))
+        .collect();
     let launch = poot_kernelgen::Launch {
         grid: [1, 1, 1],
         meta: None,
@@ -224,7 +240,7 @@ fn build_serialized(
     let choice = KernelChoice::Serialized {
         request,
         contract: sequential.contract,
-        bindings: sequential.bindings,
+        bindings,
     };
     let key = choice.digest(target.into()).to_string();
     let label = choice.display_label();

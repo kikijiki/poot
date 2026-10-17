@@ -460,3 +460,123 @@ fn a_region_whose_precision_differs_from_the_compiled_graphs_is_refused_for_its_
         "{reason}"
     );
 }
+
+/// `x + x` over an F32 `[1, 16]` argument, narrowed at the boundary the way the planner emits it
+/// (`NarrowEntry`, `Add`, `WidenExit`): the input `a` and the result `v3_widen` are F32 arguments the narrowing
+/// contract's range constrains.
+fn doubling_f32_artifact() -> VpuGraphArtifact {
+    let tensor = |elem| VpuTensor {
+        elem,
+        shape: vec![1, N],
+    };
+    let node = |op, input: u32, elem| VpuNode {
+        origin: input + 1,
+        op,
+        inputs: vec![VpuValue(input)],
+        out: tensor(elem),
+    };
+    let region = VpuRegion {
+        name: "double".into(),
+        inputs: vec![VpuInput {
+            name: "a".into(),
+            tensor: tensor(VpuElem::F32),
+        }],
+        nodes: vec![
+            node(VpuOp::NarrowEntry, 0, VpuElem::F16),
+            VpuNode {
+                origin: 2,
+                op: VpuOp::Add,
+                inputs: vec![VpuValue(1), VpuValue(1)],
+                out: tensor(VpuElem::F16),
+            },
+            node(VpuOp::WidenExit, 2, VpuElem::F32),
+        ],
+        outputs: vec![VpuValue(3)],
+    };
+    let ir = emit_vpu(&region).unwrap();
+    let binding = |name: &str| VpuBinding::new(name, BufferStorage::f32(), vec![1, N]);
+    VpuGraphArtifact::new(
+        VpuTargetId::Npu4,
+        ir.xml.into_bytes(),
+        ir.weights,
+        vec![binding("a")],
+        vec![binding("v3_widen")],
+        vec![VpuLayer::new("v2", 2)],
+    )
+    .unwrap()
+}
+
+/// The narrowing contract's range binds an argument at the point the host can see it. A recording of two graph
+/// executions, `a -> mid -> out`, writes `mid` itself: `mid` is the first execution's result and the second's
+/// input, so it is range-checked as a result, after the replay, and never before it as an input, when it still
+/// holds whatever the last replay (or nothing) left there. The row seeds `mid` with a NaN no execution reads: the
+/// replay runs and the result is the sum. A value past the range in `a` is still refused before the replay.
+///
+/// Mutation: record a range check for every F32 input in `VpuDevice::dispatch`, written or not; the stale NaN in
+/// `mid` is refused as an input before the replay.
+#[test]
+fn an_argument_a_recorded_execution_writes_is_range_checked_as_its_result() {
+    let Some((_lock, mut device)) = device(VpuConfig::default()) else {
+        return;
+    };
+    let artifact = doubling_f32_artifact();
+    let digest = artifact.digest();
+    let kernel = device
+        .load_kernel("double", vpu_kernel_handle(artifact))
+        .expect("the doubling graph loads");
+    let alloc = |device: &mut VpuDevice| {
+        device
+            .allocate(BufferRole::Staging, BufferStorage::f32(), N)
+            .unwrap()
+    };
+    let (a, mid, out) = (alloc(&mut device), alloc(&mut device), alloc(&mut device));
+    let launch = LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest));
+    device.begin(Submission::Replay).unwrap();
+    for (input, output) in [(&a, &mid), (&mid, &out)] {
+        device
+            .dispatch(Dispatch {
+                kernel: &kernel,
+                inputs: &[Arg {
+                    buffer: input,
+                    elems: N as u32,
+                }],
+                output: Arg {
+                    buffer: output,
+                    elems: N as u32,
+                },
+                launch,
+                work: 1,
+            })
+            .unwrap();
+    }
+    let recording = device.finish().unwrap().expect("a recording");
+    let write = |device: &mut VpuDevice, buffer: &_, value: f32| {
+        device
+            .write_with(buffer, 0, 4 * N, &mut |_, bytes| {
+                bytes.copy_from_slice(
+                    &(0..N)
+                        .flat_map(|_| value.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                )
+            })
+            .unwrap()
+    };
+    let read = |device: &mut VpuDevice| {
+        let mut bytes = [0u8; 4 * N];
+        device.read(&out, &mut bytes).unwrap();
+        f32::from_le_bytes(bytes[..4].try_into().unwrap())
+    };
+
+    // The stale NaN in `mid` is the first execution's to overwrite; it is not an input of the replay.
+    write(&mut device, &mid, f32::NAN);
+    write(&mut device, &a, 1.0);
+    device.replay(&recording).expect("a written argument is not an input");
+    assert_eq!(read(&mut device), 4.0);
+
+    // `a` is the replay's own input: past the range it is refused before anything runs.
+    write(&mut device, &a, 65_520.0);
+    let Err(VpuError::NarrowingRange { role, binding, value, .. }) = device.replay(&recording) else {
+        panic!("an input past the range must be refused");
+    };
+    assert_eq!((role, binding, value), ("input", 0, 65_520.0));
+}

@@ -130,20 +130,20 @@ fn generated(n: u64, dims: &[u64]) -> (poot_kernel_ir::Body, AieShapeAbi) {
     assert_eq!(n, dims.iter().product::<u64>());
     let generated = schedule(poot_kernel_ir::BinOp::Add, dims);
     let bindings = generated
-        .bindings
+        .accesses
         .iter()
         .enumerate()
-        .map(|(index, b)| {
+        .map(|(index, access)| {
             AieBinding::new(
                 index,
                 BufferStorage::f32(),
-                if b.writes {
+                if access.writes {
                     ArgAccess::Write
                 } else {
                     ArgAccess::Read
                 },
-                &b.dims,
-                b.accessed,
+                dims,
+                access.accessed,
             )
             .unwrap()
         })

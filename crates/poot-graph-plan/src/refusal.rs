@@ -2,7 +2,7 @@
 //! target and the missing capability. It is never free text, so a caller matches on it instead of
 //! restating the planner's gaps.
 
-use crate::predicates::GraphTables;
+use crate::predicates::{GraphTables, value_ids};
 use std::fmt;
 
 use poot_kernelgen::BodyLimits;
@@ -203,18 +203,39 @@ pub enum Capability {
     /// The plan has no AIE shape ABI (the choice is not an AIE sequential schedule, or a binding is
     /// malformed).
     AieAbi(crate::AieAbiRefusal),
-    /// The target computes in a narrower float than the equation's `dtype` (POOT-1159): an Intel NPU
-    /// computes in FP16, so F32 or BF16 arithmetic on it would silently narrow the equation's semantics.
-    /// Computing it narrower is an explicit graph transform the operator chooses, never the planner's
-    /// default.
+    /// The target computes in a narrower float than the equation's `dtype` and the dtype is not one a
+    /// [`poot_target::NarrowingContract`] can cover (POOT-1159): BF16 or F64 arithmetic on an Intel NPU, which
+    /// computes in FP16, would silently change the equation's semantics.
     Arithmetic {
         /// The float dtype the equation computes in.
         dtype: DType,
     },
+    /// The equation touches `dtype` values and the target computes narrower, but its capabilities record no
+    /// [`poot_target::NarrowingContract`] for them (POOT-1178): narrowing is a typed, bounded step of the
+    /// region, never a conversion the planner makes without a recorded error bound.
+    NarrowingContract {
+        /// The float dtype that would be narrowed.
+        dtype: DType,
+    },
+    /// An integer converts to a float on a target whose float width holds integers exactly only up to
+    /// `exact_limit` (POOT-1180): the conversion changes the value above it, and the target records no bound
+    /// on the integer, so the planner cannot show the conversion exact. An Intel NPU's FP16 holds the
+    /// integers up to 2048, which a token position or an index exceeds.
+    IntegerToFloat {
+        /// The float dtype the integer converts to inside the region.
+        to: DType,
+        /// The largest magnitude below which every integer converts exactly.
+        exact_limit: u32,
+    },
+    /// An inline literal of an equation computed under a [`poot_target::NarrowingContract`] lies outside the
+    /// range the contract's bound holds for (POOT-1181): narrowing it would saturate to infinity, so the
+    /// planner refuses it instead.
+    NarrowingRange {
+        /// The float dtype that would be narrowed.
+        dtype: DType,
+    },
     /// The Intel lowering table has no OpenVINO opset op with this op's semantics (POOT-1159).
     VpuOpset,
-    /// An operand is an inline literal; the Intel lowering reads value operands only.
-    LiteralOperand,
 }
 
 /// What a fused region step cannot be lowered to, by the region's arithmetic.
@@ -298,6 +319,21 @@ impl<'a> Site<'a> {
 
     pub(crate) fn refuse(self, missing: Capability) -> PlanError {
         refusal_at(self.g, self.eqn, self.target, missing)
+    }
+
+    /// The value the equation produces.
+    pub(crate) fn eqn_out(&self) -> ValueId {
+        self.eqn.out
+    }
+
+    /// The logical dimensions of each value operand of the equation, then of its output: the shapes a
+    /// serialized kernel's buffers are bound at.
+    pub(crate) fn dims(&self) -> Vec<Vec<u64>> {
+        value_ids(self.eqn)
+            .into_iter()
+            .chain([self.eqn.out])
+            .map(|id| self.g.aval(id).shape.iter().map(|&d| d as u64).collect())
+            .collect()
     }
 }
 
@@ -462,11 +498,20 @@ impl fmt::Display for Capability {
                 f,
                 "the target does not compute in {dtype}; computing it narrower changes the equation's semantics"
             ),
+            Capability::NarrowingContract { dtype } => write!(
+                f,
+                "the target computes narrower than {dtype} and records no numerical contract for narrowing it"
+            ),
+            Capability::IntegerToFloat { to, exact_limit } => write!(
+                f,
+                "an integer converts to {to} exactly only up to {exact_limit} and the target records no bound on its value"
+            ),
+            Capability::NarrowingRange { dtype } => write!(
+                f,
+                "a {dtype} literal lies outside the range the target's narrowing contract holds for"
+            ),
             Capability::VpuOpset => {
                 f.write_str("no OpenVINO opset op has this op's semantics")
-            }
-            Capability::LiteralOperand => {
-                f.write_str("the lowering reads value operands only, not an inline literal")
             }
         }
     }
