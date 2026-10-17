@@ -163,3 +163,72 @@ pub(crate) fn refusal_of(
         other => panic!("expected a planner refusal, got {other:?}"),
     }
 }
+
+/// A deterministic stream of values in `[0, 1)`.
+pub(crate) struct Stream(pub(crate) u64);
+
+impl Stream {
+    pub(crate) fn next(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// `n` values uniform in `[lo, hi)`.
+    pub(crate) fn linear(&mut self, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+        (0..n).map(|_| lo + (hi - lo) * self.next()).collect()
+    }
+
+    /// `n` values whose logarithm is uniform in `[ln lo, ln hi)`.
+    pub(crate) fn logarithmic(&mut self, n: usize, lo: f32, hi: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| (lo.ln() + (hi.ln() - lo.ln()) * self.next()).exp())
+            .collect()
+    }
+}
+
+/// The worst `error / allowed` over a result's elements, with the element that attains it. A ratio above 1
+/// is outside the contract; an `Exact` contract allows no error, so any difference is infinite. `operands`
+/// are the pointwise operands an `OperandUlps` bound is relative to; `terms[i]` is the sum of the magnitudes
+/// the `i`th result adds, which a `TermsUlps` bound is relative to.
+pub(crate) fn worst_against(
+    contract: &poot_kernelgen::NumericalContract,
+    operands: &[&[f32]],
+    terms: &[f32],
+    got: &[f32],
+    want: &[f32],
+) -> (f32, usize) {
+    use poot_kernelgen::ErrorBound;
+    let ratio = |i: usize| -> f32 {
+        let (g, w) = (got[i], want[i]);
+        if !g.is_finite() {
+            return f32::INFINITY;
+        }
+        let error = (g - w).abs();
+        let allowed = match contract.bound {
+            ErrorBound::Exact => {
+                return if g.to_bits() == w.to_bits() {
+                    0.0
+                } else {
+                    f32::INFINITY
+                };
+            }
+            ErrorBound::OperandUlps(ulps) => {
+                let larger = operands.iter().map(|op| op[i].abs()).fold(0.0f32, f32::max);
+                ulps as f32 * larger * f32::EPSILON
+            }
+            ErrorBound::TermsUlps(ulps) => ulps as f32 * terms[i] * f32::EPSILON,
+            ErrorBound::Result { abs, rel } => abs + rel * w.abs(),
+        };
+        if error == 0.0 { 0.0 } else { error / allowed }
+    };
+    (0..got.len())
+        .map(|i| (ratio(i), i))
+        .fold(
+            (0.0, 0),
+            |worst, next| {
+                if next.0 > worst.0 { next } else { worst }
+            },
+        )
+}

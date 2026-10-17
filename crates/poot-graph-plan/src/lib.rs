@@ -104,7 +104,7 @@ pub use passes::{
 };
 pub use planner::{KernelChoice, NoDispatch, Planned, dispatch_work};
 #[cfg(any(test, feature = "test-support"))]
-pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views};
+pub use planner::{plan_eqn, plan_eqn_choice, plan_eqn_views, vpu_refusals};
 pub use predicates::{compute_views, numel, value_ids};
 pub use refusal::{Capability, FusedStepGap, Refusal, RefusalDtypes, StorageGap};
 pub use types::{

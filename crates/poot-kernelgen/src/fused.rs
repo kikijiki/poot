@@ -1753,6 +1753,23 @@ pub fn fused_row_parallel_views(
                         },
                     },
                 });
+                if w == 1 {
+                    // One lane owns the whole row: its partial is the reduction. No workgroup memory and no
+                    // barrier, so the body has no thread cooperation (a target that runs one scalar thread
+                    // serializes the grid, `poot_kernel_ir::serialize::serialize_grid`).
+                    blocks.push(BasicBlock {
+                        statements: vec![Statement::Assign(
+                            Place::local(acc_reg),
+                            Rvalue::Use(copy(Place::local(partial))),
+                        )],
+                        terminator: Terminator::Goto {
+                            target: BlockId {
+                                index: bid(pre + 4),
+                            },
+                        },
+                    });
+                    continue;
+                }
                 // pre+3 write-lds: LDS[lane] = partial; barrier -> the tree's first round.
                 let round_start = bid(pre + 4);
                 blocks.push(BasicBlock {
@@ -1907,10 +1924,12 @@ pub fn fused_row_parallel_views(
     });
     let mut body = Body::new(name, (n + 1) as u32, al.locals, all);
     body.workgroup_size = [w as u32, 1, 1];
-    body.workgroup_locals = vec![WorkgroupLocalDecl {
-        elem_ty: Ty::F32,
-        len: w as u32,
-    }];
+    if w > 1 {
+        body.workgroup_locals = vec![WorkgroupLocalDecl {
+            elem_ty: Ty::F32,
+            len: w as u32,
+        }];
+    }
     Ok(body)
 }
 

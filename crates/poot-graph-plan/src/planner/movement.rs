@@ -10,11 +10,11 @@ use super::{
     BodyLimits, Capability, ContractionHead, DType, Eqn, HashMap, KernelRequest, OpKind, Operand,
     PlanError, Planned, Scalar, ValueId, fty_ty, numel, value_ids,
 };
-use crate::planner::{GraphTables, Layout};
+use crate::planner::{GraphTables, Layout, Lowering};
 use crate::predicates::{is_elementwise_2d_in, scatter_update_plan};
 use crate::refusal::Site;
 use poot_kernelgen::{MovementOp, MovementSpec, Storage, UpdateIndex};
-use poot_target::{Backend, DeviceCaps};
+use poot_target::{AieTargetId, Backend, DeviceCaps};
 
 /// The storage a movement over values of `dtype` reads and writes: the packed byte rows of an E4M3FN
 /// value, else one element per value in its own element type (an I32 value keeps its i32 bits).
@@ -25,6 +25,44 @@ fn movement_storage(dtype: DType) -> Storage {
             carrier: fty_ty(dtype),
         },
     }
+}
+
+/// Plan a gather for an AIE core (POOT-1174): the movement request every target plans, under the target's
+/// serialized one-core schedule. A gather copies bits through an `I32` index, so it runs on the core for any
+/// `F32` or `I32` data; every other data movement reads GPU capabilities and is refused as such.
+pub(super) fn plan_serialized(
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    out_shape: &[usize],
+    target: AieTargetId,
+    odt: DType,
+    limits: BodyLimits,
+) -> Result<Planned, PlanError> {
+    let site = Site::new(g, eqn, target, limits);
+    let axis = match &eqn.op {
+        OpKind::Gather { axis } => axis,
+        // A collective is a cut between stage programs on every target; any other movement's lowering
+        // reads GPU capabilities.
+        OpKind::AllReduce { .. } | OpKind::AllGather { .. } => {
+            return Err(site.refuse(Capability::CollectiveInStage));
+        }
+        _ => return Err(site.refuse(Capability::GpuOnly)),
+    };
+    let ids = value_ids(eqn);
+    if g.aval(ids[1]).dtype != DType::I32 {
+        return Err(site.refuse(Capability::IndexOperand));
+    }
+    let data = g.aval(ids[0]).shape.clone();
+    let spec = MovementSpec::new(
+        movement_storage(odt),
+        out_shape.to_vec(),
+        MovementOp::Gather {
+            index_numel: numel(&g.aval(ids[1]).shape),
+            in_shape: data,
+            axis: *axis,
+        },
+    );
+    Planned::lowered(site, KernelRequest::Movement(spec), Lowering::Aie(target))
 }
 
 /// Plan one data-movement equation (including the e4m3fn packed forms) and refuse the collectives.

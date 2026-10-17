@@ -5,13 +5,16 @@
 # never a pass. Sorted in canonical (LC_ALL=C) order.
 #
 # Every poot-npu `vpu` row, on the Intel NPU through the real compile -> Engine -> vendor graph compiler ->
-# Level Zero route: the op bank against the shared oracle (elementwise, transcendental, reduction, contraction,
-# gather, movement, rank four, F32 at the boundary, carried state), one compiled graph and one replay per step,
+# Level Zero route: the op bank against the shared oracle (elementwise incl. sub, max, ge, div, neg, sqrt and
+# scalar literals, transcendental, reduction sum and max, contraction, gather incl. by an iota, update-slice at a
+# literal and a runtime index, movement, rank four, F32 at the boundary, carried state), one compiled graph and one replay per step,
 # the planner's typed refusals for the NPU target, unload releasing every buffer, capture and replay. The blob
 # cache: a second device loading the cached blob without the compiler, a damaged or foreign entry recompiled,
 # a blob the driver rejects recompiled. The device's own contract: the compiled graph against the region's
 # ABI (name, count, direction, extents, precision), the rank bound, the vendor compiler's log, dispatch
-# refusals, and the failed replay's poison. Hardware-free unit rows ride along (the layer rejection, the
+# refusals, and the failed replay's poison. The Qwen2.5-0.5B-dimension block (POOT-1175): its
+# attention core and MLP in F16 against the oracle (its refusal table is a model-free row in poot-models).
+# Hardware-free unit rows ride along (the layer rejection, the
 # padded dimensions, the cache key, the cache write, the precision refusal).
 poot-npu	blob_cache::tests::a_failed_put_removes_its_temporary_file
 poot-npu	blob_cache::tests::concurrent_puts_of_one_key_leave_one_whole_entry
@@ -27,6 +30,7 @@ poot-npu::vpu_contract	a_region_whose_extents_differ_from_the_compiled_graphs_is
 poot-npu::vpu_contract	a_region_whose_precision_differs_from_the_compiled_graphs_is_refused_for_its_precision
 poot-npu::vpu_contract	a_replay_that_misses_its_deadline_poisons_the_device
 poot-npu::vpu_contract	a_vendor_compile_failure_is_a_typed_error_with_the_compilers_log
+poot-npu::vpu_contract	an_argument_a_recorded_execution_writes_is_range_checked_as_its_result
 poot-npu::vpu_contract	an_argument_read_by_the_graph_but_declared_an_output_is_refused_for_its_direction
 poot-npu::vpu_device	a_cache_entry_that_is_not_this_regions_blob_is_recompiled_and_replaced
 poot-npu::vpu_device	a_cached_blob_the_driver_rejects_is_recompiled_and_replaced
@@ -37,3 +41,7 @@ poot-npu::vpu_device	equations_the_npu_cannot_lower_are_refused_with_typed_capab
 poot-npu::vpu_device	every_buffer_is_released_when_the_executable_is_unloaded
 poot-npu::vpu_device	replaying_a_recording_over_reset_state_is_bit_identical
 poot-npu::vpu_device	the_fixture_bank_matches_the_oracle_on_the_npu
+poot-npu::vpu_narrowing	an_f32_value_outside_the_narrowing_range_is_a_typed_error
+poot-npu::vpu_narrowing	the_f32_fragments_stay_within_the_recorded_narrowing_contract
+poot-npu::vpu_qwen	the_attention_core_of_the_block_matches_the_oracle_on_the_npu
+poot-npu::vpu_qwen	the_mlp_of_the_block_matches_the_oracle_on_the_npu

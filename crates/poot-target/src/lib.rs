@@ -22,7 +22,7 @@ pub mod storage;
 pub mod vpu;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
-pub use vpu::{VendorCompilerId, VpuArithmetic, VpuCaps, VpuTargetId};
+pub use vpu::{NarrowingContract, VendorCompilerId, VpuArithmetic, VpuCaps, VpuTargetId};
 
 /// The GPU lowering backend. Most of `plan_eqn` is backend-neutral; the NVPTX-only kernels (tensor-core
 /// gemm, spec 025) are gated on this so the SPIR-V/wgpu path keeps the portable kernel.

@@ -14,6 +14,8 @@
 
 #![cfg(feature = "xdna")]
 
+mod common;
+
 use std::fs::File;
 
 use poot_eval::test_support::weight_map_oracle::oracle_for;
@@ -21,13 +23,15 @@ use poot_executor::{Device, Engine};
 use poot_executor_parity::Fixture;
 use poot_graph_ir::{BinOp, Builder, TensorType, UnOp};
 use poot_kernel_ir::MathOp;
-use poot_kernelgen::{AieOp, ErrorBound, NumericalContract, UnaryOp};
+use poot_kernelgen::{AieOp, UnaryOp};
 use poot_npu::{XdnaConfig, XdnaDevice};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::DType;
+
+use common::{Stream, worst_against};
 
 /// The tensor every case runs over: 2048 elements, laid out `[32, 64]`, so the schedule's loop is checked
 /// against a shape the ordinary generator knows nothing of. Three four-byte FIFOs of it fit one tile.
@@ -77,28 +81,6 @@ fn store(consts: &[(&str, &[f32])]) -> WeightStore {
         builder.insert(*name, WeightEntry::Dense(dense)).unwrap();
     }
     builder.build()
-}
-
-/// A deterministic stream of values in `[0, 1)`.
-struct Stream(u64);
-
-impl Stream {
-    fn next(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 40) as f32 / (1u64 << 24) as f32
-    }
-
-    fn linear(&mut self, lo: f32, hi: f32) -> Vec<f32> {
-        (0..N).map(|_| lo + (hi - lo) * self.next()).collect()
-    }
-
-    fn logarithmic(&mut self, lo: f32, hi: f32) -> Vec<f32> {
-        (0..N)
-            .map(|_| (lo.ln() + (hi.ln() - lo.ln()) * self.next()).exp())
-            .collect()
-    }
 }
 
 /// The graph op a case runs, the AIE op the planner maps it to, and its operands' data.
@@ -161,36 +143,56 @@ fn cases() -> Vec<(&'static str, Case)> {
     vec![
         (
             "add",
-            Case::binary(BinOp::Add, K::Add, s.linear(-1e6, 1e6), s.linear(-1e6, 1e6)),
+            Case::binary(
+                BinOp::Add,
+                K::Add,
+                s.linear(N, -1e6, 1e6),
+                s.linear(N, -1e6, 1e6),
+            ),
         ),
         (
             "add (wide magnitudes)",
             Case::binary(
                 BinOp::Add,
                 K::Add,
-                s.logarithmic(1e-20, 1e20),
-                s.logarithmic(1e-20, 1e20),
+                s.logarithmic(N, 1e-20, 1e20),
+                s.logarithmic(N, 1e-20, 1e20),
             ),
         ),
         (
             "add (cancellation)",
-            Case::binary(BinOp::Add, K::Add, s.linear(1.0, 2.0), s.linear(-2.0, -1.0)),
+            Case::binary(
+                BinOp::Add,
+                K::Add,
+                s.linear(N, 1.0, 2.0),
+                s.linear(N, -2.0, -1.0),
+            ),
         ),
         (
             "sub",
-            Case::binary(BinOp::Sub, K::Sub, s.linear(-1e6, 1e6), s.linear(-1e6, 1e6)),
+            Case::binary(
+                BinOp::Sub,
+                K::Sub,
+                s.linear(N, -1e6, 1e6),
+                s.linear(N, -1e6, 1e6),
+            ),
         ),
         (
             "sub (cancellation)",
-            Case::binary(BinOp::Sub, K::Sub, s.linear(1.0, 2.0), s.linear(1.0, 2.0)),
+            Case::binary(
+                BinOp::Sub,
+                K::Sub,
+                s.linear(N, 1.0, 2.0),
+                s.linear(N, 1.0, 2.0),
+            ),
         ),
         (
             "mul",
             Case::binary(
                 BinOp::Mul,
                 K::Mul,
-                s.logarithmic(1e-15, 1e15),
-                s.logarithmic(1e-15, 1e15),
+                s.logarithmic(N, 1e-15, 1e15),
+                s.logarithmic(N, 1e-15, 1e15),
             ),
         ),
         (
@@ -198,111 +200,97 @@ fn cases() -> Vec<(&'static str, Case)> {
             Case::binary(
                 BinOp::Div,
                 K::Div,
-                s.logarithmic(1e-15, 1e15),
-                s.logarithmic(1e-15, 1e15),
+                s.logarithmic(N, 1e-15, 1e15),
+                s.logarithmic(N, 1e-15, 1e15),
+            ),
+        ),
+        (
+            "max",
+            Case::binary(
+                BinOp::Max,
+                K::Max,
+                s.linear(N, -1e6, 1e6),
+                s.linear(N, -1e6, 1e6),
             ),
         ),
         (
             "ge",
-            Case::binary(BinOp::Ge, K::Ge, s.linear(-5.0, 5.0), s.linear(-5.0, 5.0)),
+            Case::binary(
+                BinOp::Ge,
+                K::Ge,
+                s.linear(N, -5.0, 5.0),
+                s.linear(N, -5.0, 5.0),
+            ),
         ),
         (
             "neg",
             Case::unary(
                 UnOp::Neg,
                 UnaryOp::Basic(poot_kernel_ir::UnOp::Neg),
-                s.linear(-1e30, 1e30),
+                s.linear(N, -1e30, 1e30),
             ),
         ),
         (
             "recip",
-            Case::unary(UnOp::Recip, UnaryOp::Recip, s.logarithmic(1e-30, 1e30)),
+            Case::unary(UnOp::Recip, UnaryOp::Recip, s.logarithmic(N, 1e-30, 1e30)),
         ),
         (
             "exp",
-            Case::unary(UnOp::Exp, math(MathOp::Exp), s.linear(-87.0, 88.0)),
+            Case::unary(UnOp::Exp, math(MathOp::Exp), s.linear(N, -87.0, 88.0)),
         ),
         (
             "exp (near zero)",
-            Case::unary(UnOp::Exp, math(MathOp::Exp), s.linear(-10.0, 10.0)),
+            Case::unary(UnOp::Exp, math(MathOp::Exp), s.linear(N, -10.0, 10.0)),
         ),
         (
             "log",
             Case::unary(
                 UnOp::Log,
                 math(MathOp::Log),
-                s.logarithmic(f32::MIN_POSITIVE, 3.0e38),
+                s.logarithmic(N, f32::MIN_POSITIVE, 3.0e38),
             ),
         ),
         (
             "log (near one)",
-            Case::unary(UnOp::Log, math(MathOp::Log), s.linear(0.5, 2.0)),
+            Case::unary(UnOp::Log, math(MathOp::Log), s.linear(N, 0.5, 2.0)),
+        ),
+        (
+            "sqrt",
+            Case::unary(
+                UnOp::Sqrt,
+                math(MathOp::Sqrt),
+                s.logarithmic(N, f32::MIN_POSITIVE, 3.0e38),
+            ),
+        ),
+        (
+            "sqrt (near one)",
+            Case::unary(UnOp::Sqrt, math(MathOp::Sqrt), s.linear(N, 0.5, 2.0)),
         ),
         (
             "tanh",
-            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(-60.0, 60.0)),
+            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(N, -60.0, 60.0)),
         ),
         (
             "tanh (near zero)",
-            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(-1e-3, 1e-3)),
+            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(N, -1e-3, 1e-3)),
         ),
         (
             "tanh (saturated)",
-            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(-1e30, 1e30)),
+            Case::unary(UnOp::Tanh, UnaryOp::Tanh, s.linear(N, -1e30, 1e30)),
         ),
         (
             "erf",
-            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(-6.0, 6.0)),
+            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(N, -6.0, 6.0)),
         ),
         (
             "erf (near zero)",
-            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(-1e-3, 1e-3)),
+            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(N, -1e-3, 1e-3)),
         ),
         (
             "erf (saturated)",
-            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(-1e30, 1e30)),
+            Case::unary(UnOp::Erf, UnaryOp::Erf, s.linear(N, -1e30, 1e30)),
         ),
     ]
-}
-
-/// The worst `error / allowed` over a case's elements, with the element that attains it. A ratio above 1 is
-/// outside the contract; an `Exact` contract allows no error, so any difference is infinite.
-fn worst_against(
-    contract: &NumericalContract,
-    operands: &[&[f32]],
-    got: &[f32],
-    want: &[f32],
-) -> (f32, usize) {
-    let ratio = |i: usize| -> f32 {
-        let (g, w) = (got[i], want[i]);
-        if !g.is_finite() {
-            return f32::INFINITY;
-        }
-        let error = (g - w).abs();
-        let allowed = match contract.bound {
-            ErrorBound::Exact => {
-                return if g.to_bits() == w.to_bits() {
-                    0.0
-                } else {
-                    f32::INFINITY
-                };
-            }
-            ErrorBound::OperandUlps(ulps) => {
-                let larger = operands.iter().map(|op| op[i].abs()).fold(0.0f32, f32::max);
-                ulps as f32 * larger * f32::EPSILON
-            }
-            ErrorBound::Result { abs, rel } => abs + rel * w.abs(),
-        };
-        if error == 0.0 { 0.0 } else { error / allowed }
-    };
-    (0..got.len())
-        .map(|i| (ratio(i), i))
-        .fold(
-            (0.0, 0),
-            |worst, next| {
-                if next.0 > worst.0 { next } else { worst }
-            },
-        )
 }
 
 /// Every op that has a numerical contract, through the production route onto the NPU, against the CPU
@@ -339,7 +327,7 @@ fn every_pointwise_op_meets_its_numerical_contract_on_the_npu() {
         let want = oracle(&fixture.steps[0]);
         assert_eq!(outputs[0].shape(), [ROWS, COLS], "{name}: shape");
         let (got, want) = (outputs[0].to_f32().unwrap(), want.to_f32().unwrap());
-        let (worst, at) = worst_against(&contract, &operands, &got, &want);
+        let (worst, at) = worst_against(&contract, &operands, &[], &got, &want);
         eprintln!("{name}: {} worst error/allowed {worst:.3}", contract.id);
         if worst > 1.0 {
             failures.push(format!(

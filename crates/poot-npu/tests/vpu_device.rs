@@ -17,7 +17,9 @@ mod vpu_common;
 use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::Device;
 use poot_executor_parity::Fixture;
-use poot_graph_ir::{BinOp, Builder, Graph, Outputs, RedOp, Slot, StateRole, TensorType, UnOp};
+use poot_graph_ir::{
+    BinOp, Builder, Graph, Outputs, RedOp, Scalar, Slot, StateRole, TensorType, UnOp,
+};
 use poot_quant::weights::WeightStore;
 use poot_tensor::DType;
 
@@ -257,6 +259,189 @@ fn f32_boundary() -> Row {
     }
 }
 
+/// `op(x, y)` over two `[3, 5]` F16 slots whose values stay small enough that every step is exactly
+/// representable (or, when `exact` is false, within FP16 tolerance). `y` is never zero, so a division is defined.
+fn binary_slots(name: &'static str, op: BinOp, exact: bool) -> Row {
+    let b = Builder::for_tests();
+    let x = b.slot_named(Slot::Activation, "x", f16(&[3, 5])).unwrap();
+    let y = b.slot_named(Slot::Activation, "y", f16(&[3, 5])).unwrap();
+    let out = b.binary(op, x, y).unwrap();
+    let graph = b.finish(out).unwrap();
+    let steps = (0..2)
+        .map(|s| {
+            let mut step = x_step("x", &[3, 5], move |i| ((i + 3 * s) % 9) as f32 - 4.0);
+            step.extend(x_step("y", &[3, 5], move |i| {
+                ((i * 2 + s) % 7) as f32 * 0.5 + 0.5
+            }));
+            step
+        })
+        .collect();
+    Row {
+        fixture: Fixture {
+            name,
+            graph,
+            store: WeightStore::builder().build(),
+            steps,
+        },
+        exact,
+    }
+}
+
+/// `op(x)` over a `[3, 5]` F16 slot of positive values, so a square root is defined and a negation has no zero
+/// to disagree on: measured on Lunar Lake, the NPU's `Negative` of `+0` is `+0` where the oracle's is `-0`
+/// (the sign of a zero, nothing else).
+fn unary_slot(name: &'static str, op: UnOp, exact: bool) -> Row {
+    let b = Builder::for_tests();
+    let x = b.slot_named(Slot::Activation, "x", f16(&[3, 5])).unwrap();
+    let out = b.unary(op, x).unwrap();
+    let graph = b.finish(out).unwrap();
+    let steps = (0..2)
+        .map(|s| {
+            x_step("x", &[3, 5], move |i| {
+                ((i + 5 * s) % 12) as f32 * 0.75 + 0.25
+            })
+        })
+        .collect();
+    Row {
+        fixture: Fixture {
+            name,
+            graph,
+            store: WeightStore::builder().build(),
+            steps,
+        },
+        exact,
+    }
+}
+
+/// Row and column maxima of a `[4, 6]` slot, kept apart by `keepdim` and combined by a broadcasting subtract.
+fn reduce_max_rows() -> Row {
+    let b = Builder::for_tests();
+    let x = b.slot_named(Slot::Activation, "x", f16(&[4, 6])).unwrap();
+    let rows = b.reduce(RedOp::Max, x, 1, true).unwrap();
+    let cols = b.reduce(RedOp::Max, x, 0, true).unwrap();
+    let out = b.binary(BinOp::Sub, rows, cols).unwrap();
+    let graph = b.finish(out).unwrap();
+    let steps = (0..3)
+        .map(|s| x_step("x", &[4, 6], move |i| ((i * (s + 3)) % 13) as f32 - 6.0))
+        .collect();
+    Row {
+        fixture: Fixture {
+            name: "reduce_max_rows",
+            graph,
+            store: WeightStore::builder().build(),
+            steps,
+        },
+        exact: true,
+    }
+}
+
+/// Inline scalar literals as operands: `max(x * 0.5 + 1.5 - 2.0, 0.0)` and the indicator `ge(x, 1.0)`, added.
+/// Every literal is a constant the planner defines for its consumer.
+fn literal_operands() -> Row {
+    let b = Builder::for_tests();
+    let x = b.slot_named(Slot::Activation, "x", f16(&[3, 5])).unwrap();
+    let scaled = b.binary_scalar(BinOp::Mul, x, Scalar::F32(0.5)).unwrap();
+    let shifted = b
+        .binary_scalar(BinOp::Add, scaled, Scalar::F32(1.5))
+        .unwrap();
+    let lowered = b
+        .binary_scalar(BinOp::Sub, shifted, Scalar::F32(2.0))
+        .unwrap();
+    let relu = b
+        .binary_scalar(BinOp::Max, lowered, Scalar::F32(0.0))
+        .unwrap();
+    let flag = b.binary_scalar(BinOp::Ge, x, Scalar::F32(1.0)).unwrap();
+    let out = b.binary(BinOp::Add, relu, flag).unwrap();
+    let graph = b.finish(out).unwrap();
+    let steps = (0..2)
+        .map(|s| x_step("x", &[3, 5], move |i| ((i + 4 * s) % 11) as f32 - 5.0))
+        .collect();
+    Row {
+        fixture: Fixture {
+            name: "literal_operands",
+            graph,
+            store: WeightStore::builder().build(),
+            steps,
+        },
+        exact: true,
+    }
+}
+
+/// An iota as a gather index: rows `0..4` of a `[6, 4]` table, the index range a constant the graph defines.
+fn iota_gather() -> Row {
+    let b = Builder::for_tests();
+    let table = b.constant("table", f16(&[6, 4])).unwrap();
+    let ids = b.iota_i32(4).unwrap();
+    let out = b.gather(table, 0, ids).unwrap();
+    let graph = b.finish(out).unwrap();
+    Row {
+        fixture: Fixture {
+            name: "iota_gather",
+            graph,
+            store: store(&[constant("table", &[6, 4], |i| i as f32 * 0.5)]),
+            steps: vec![Vec::new(), Vec::new()],
+        },
+        exact: true,
+    }
+}
+
+/// The KV-cache slot write: a two-row update written into a `[6, 4]` cache at a literal row index.
+fn update_slice_literal() -> Row {
+    let b = Builder::for_tests();
+    let cache = b.constant("cache", f16(&[6, 4])).unwrap();
+    let row = b.slot_named(Slot::Activation, "row", f16(&[2, 4])).unwrap();
+    let out = b.dynamic_update_slice(cache, row, 3, 0).unwrap();
+    let graph = b.finish(out).unwrap();
+    let steps = (0..2)
+        .map(|s| x_step("row", &[2, 4], move |i| (i + 1 + 10 * s) as f32))
+        .collect();
+    Row {
+        fixture: Fixture {
+            name: "update_slice_literal",
+            graph,
+            store: store(&[constant("cache", &[6, 4], |i| -(i as f32))]),
+            steps,
+        },
+        exact: true,
+    }
+}
+
+/// The same write at an I32 position slot that differs on every step: one recording, three positions.
+fn update_slice_runtime() -> Row {
+    let b = Builder::for_tests();
+    let cache = b.constant("cache", f16(&[6, 4])).unwrap();
+    let row = b.slot_named(Slot::Activation, "row", f16(&[2, 4])).unwrap();
+    let pos = b
+        .slot_named(
+            Slot::Activation,
+            "pos",
+            TensorType::new(Vec::new(), DType::I32),
+        )
+        .unwrap();
+    let out = b.dynamic_update_slice_dyn(cache, row, pos, 0).unwrap();
+    let graph = b.finish(out).unwrap();
+    let steps = [0, 2, 4]
+        .into_iter()
+        .map(|at: i32| {
+            let mut step = x_step("row", &[2, 4], move |i| (i + 1) as f32 + 10.0 * at as f32);
+            step.push(poot_eval::test_support::StepFixture {
+                key: vpu_common::slot_key("pos"),
+                tensor: poot_tensor::HostTensor::i32(Vec::new(), vec![at]),
+            });
+            step
+        })
+        .collect();
+    Row {
+        fixture: Fixture {
+            name: "update_slice_runtime",
+            graph,
+            store: store(&[constant("cache", &[6, 4], |i| -(i as f32))]),
+            steps,
+        },
+        exact: true,
+    }
+}
+
 fn bank() -> Vec<Row> {
     vec![
         add_consts(),
@@ -268,6 +453,17 @@ fn bank() -> Vec<Row> {
         movement_chain(),
         rank_four_add(),
         f32_boundary(),
+        binary_slots("sub_slots", BinOp::Sub, true),
+        binary_slots("max_slots", BinOp::Max, true),
+        binary_slots("ge_slots", BinOp::Ge, true),
+        binary_slots("div_slots", BinOp::Div, false),
+        unary_slot("neg_slot", UnOp::Neg, true),
+        unary_slot("sqrt_slot", UnOp::Sqrt, false),
+        reduce_max_rows(),
+        literal_operands(),
+        iota_gather(),
+        update_slice_literal(),
+        update_slice_runtime(),
     ]
 }
 
@@ -363,56 +559,68 @@ fn a_program_is_one_compiled_graph_and_one_replay_per_step() {
 }
 
 /// Equations the NPU's lowering cannot take are typed refusals naming the equation and the target, before any
-/// buffer is allocated: an F32 add is not computed in FP16, `Sub` has no opset op, an inline literal is not a
-/// value operand, a conversion through BF16 changes the value.
+/// buffer is allocated: a BF16 add is not computed in FP16, an F32 add is refused naming the missing contract
+/// once the target records none, `Log` has no opset op, a literal FP16 cannot hold is not saturated, a
+/// conversion through BF16 changes the value.
 ///
-/// Mutation: drop the arithmetic check in `lower_eqn` (poot-graph-plan); the F32 add is admitted and the
+/// Mutation: drop the arithmetic check in `lower_eqn` (poot-graph-plan); the BF16 add is admitted and the
 /// first assertion fails.
 #[test]
 fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
     use poot_graph_plan::Capability;
     let Some(npu) = npu() else { return };
     let target = npu.engine.device().target();
-    let f32s = |shape: &[usize]| TensorType::f32(shape.to_vec());
-
-    let f32_add = {
+    let poot_graph_plan::Target::Vpu { target: id, caps } = target else {
+        panic!("the NPU device plans for a Vpu target");
+    };
+    let add_of = |dtype: DType| {
         let b = Builder::for_tests();
-        let x = b.constant("x", f32s(&[2, 3])).unwrap();
-        let y = b.constant("y", f32s(&[2, 3])).unwrap();
+        let x = b.constant("x", TensorType::new(vec![2, 3], dtype)).unwrap();
+        let y = b.constant("y", TensorType::new(vec![2, 3], dtype)).unwrap();
         let out = b.binary(BinOp::Add, x, y).unwrap();
         b.finish(out).unwrap()
     };
-    let refusal = refusal_of(f32_add, target);
+    let refusal = refusal_of(add_of(DType::BF16), target);
     assert_eq!(
         refusal.missing,
-        Capability::Arithmetic { dtype: DType::F32 }
+        Capability::Arithmetic { dtype: DType::BF16 }
     );
     assert_eq!(
         refusal.target,
         poot_target::TargetId::Vpu(poot_target::VpuTargetId::Npu4)
     );
+    let uncontracted = poot_graph_plan::Target::Vpu {
+        target: id,
+        caps: poot_target::VpuCaps {
+            narrowing: None,
+            ..caps
+        },
+    };
+    assert_eq!(
+        refusal_of(add_of(DType::F32), uncontracted).missing,
+        Capability::NarrowingContract { dtype: DType::F32 }
+    );
 
-    let sub = {
+    let log = {
         let b = Builder::for_tests();
         let x = b.constant("x", f16(&[2, 3])).unwrap();
-        let y = b.constant("y", f16(&[2, 3])).unwrap();
-        let out = b.binary(BinOp::Sub, x, y).unwrap();
+        let out = b.unary(UnOp::Log, x).unwrap();
         b.finish(out).unwrap()
     };
-    let sub_refusal = refusal_of(sub, target);
-    assert_eq!(sub_refusal.missing, Capability::VpuOpset);
+    let log_refusal = refusal_of(log, target);
+    assert_eq!(log_refusal.missing, Capability::VpuOpset);
 
     let literal = {
         let b = Builder::for_tests();
         let x = b.constant("x", f16(&[2, 3])).unwrap();
         let out = b
-            .binary_scalar(BinOp::Add, x, poot_graph_ir::Scalar::F32(1.0))
+            .binary_scalar(BinOp::Add, x, poot_graph_ir::Scalar::F32(1.0e10))
             .unwrap();
         b.finish(out).unwrap()
     };
     assert_eq!(
         refusal_of(literal, target).missing,
-        Capability::LiteralOperand
+        Capability::DtypeLowering
     );
 
     let through_bf16 = {

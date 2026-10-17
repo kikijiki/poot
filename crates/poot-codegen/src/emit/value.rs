@@ -621,6 +621,9 @@ impl<'a> Emitter<'a> {
         if op == MathOp::Log {
             return self.emit_log(&va, &ty, w);
         }
+        if op == MathOp::Sqrt && self.target == Target::AieCore {
+            return self.emit_sqrt_software(&va, &ty, w);
+        }
         let intrin = match op {
             MathOp::Sqrt => "llvm.sqrt.f32",
             MathOp::Abs => "llvm.fabs.f32",
@@ -640,6 +643,38 @@ impl<'a> Emitter<'a> {
         let t = self.fresh();
         let _ = writeln!(w, "  {t} = tail call {ty} @{intrin}({ty} {va})");
         Ok((t, ty))
+    }
+
+    /// `sqrt(x)` on the AIE core, which has no square-root unit and aborts Peano's `llvm.sqrt.f32` lowering:
+    /// the bit-halving initial estimate `bits(y0) = 0x1FBD1DF5 + bits(x) / 2` (relative error under 3.5%), then
+    /// four Newton steps `y = (y + x / y) / 2`, each squaring the relative error, so the last step is limited
+    /// by the rounding of the divide and add (a few units in the last place), not by the estimate. Defined
+    /// for positive normal `x`; zero, subnormals and negative operands are outside the sequence's domain.
+    pub(super) fn emit_sqrt_software(
+        &mut self,
+        va: &str,
+        ty: &str,
+        w: &mut String,
+    ) -> Result<(String, String), EmitError> {
+        let c = |v: f32| format!("0x{:016X}", (v as f64).to_bits());
+        let xi = self.fresh();
+        let _ = writeln!(w, "  {xi} = bitcast {ty} {va} to i32");
+        let half = self.fresh();
+        let _ = writeln!(w, "  {half} = lshr i32 {xi}, 1");
+        let guess_bits = self.fresh();
+        let _ = writeln!(w, "  {guess_bits} = add i32 {half}, 532487669"); // 0x1FBD1DF5
+        let mut y = self.fresh();
+        let _ = writeln!(w, "  {y} = bitcast i32 {guess_bits} to {ty}");
+        for _ in 0..4 {
+            let quotient = self.fresh();
+            let _ = writeln!(w, "  {quotient} = fdiv {ty} {va}, {y}");
+            let sum = self.fresh();
+            let _ = writeln!(w, "  {sum} = fadd {ty} {y}, {quotient}");
+            let next = self.fresh();
+            let _ = writeln!(w, "  {next} = fmul {ty} {sum}, {}", c(0.5));
+            y = next;
+        }
+        Ok((y, ty.to_string()))
     }
 
     /// `exp(x)`, per backend. SPIR-V: `llvm.exp.f32` -> GLSL Exp. NVPTX: `ex2.approx(x * log2 e)`.
@@ -902,6 +937,16 @@ impl<'a> Emitter<'a> {
                 "BinOp::{op:?} on a Ty::Vec operand ({tya}): only elementwise Add/Sub/Mul/etc are wired \
                  for vectors this increment, not the Min/Max intrinsic path"
             )));
+        }
+        // The AIE core aborts Peano's `llvm.minnum`/`llvm.maxnum` lowering, so a float Min/Max is the compare
+        // and select it means (NaN operands are outside the contract: the select returns the second operand).
+        if is_float && self.target == Target::AieCore && matches!(op, BinOp::Min | BinOp::Max) {
+            let predicate = if op == BinOp::Max { "ogt" } else { "olt" };
+            let wins = self.fresh();
+            let _ = writeln!(w, "  {wins} = fcmp {predicate} {tya} {va}, {vb}");
+            let t = self.fresh();
+            let _ = writeln!(w, "  {t} = select i1 {wins}, {tya} {va}, {tya} {vb}");
+            return Ok((t, tya));
         }
         // Min/Max lower to an intrinsic call, not a plain binary instruction.
         if matches!(op, BinOp::Min | BinOp::Max) {

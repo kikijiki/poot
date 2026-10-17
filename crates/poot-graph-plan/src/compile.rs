@@ -870,8 +870,12 @@ pub fn compile(
     pipeline.run("fuse", transform::fuse)?;
     pipeline.run("fuse_widening_casts", transform::fuse_widening_casts)?;
     // After `fuse`: the casts it left between an I32 word and the float pointwise kernels that read it or
-    // the exact-I32 kernels that write it become steps of those kernels (POOT-1108).
-    pipeline.run("fuse_index_casts", transform::fuse_index_casts)?;
+    // the exact-I32 kernels that write it become steps of those kernels (POOT-1108). GPU targets only: the
+    // folded cast is a kernel step, and on a target that plans no kernel the rewrite commits an invalid graph
+    // (a `ge` over an I32 and an F32 operand) instead of leaving the planner its typed refusal (POOT-1176).
+    if gpu.is_some() {
+        pipeline.run("fuse_index_casts", transform::fuse_index_casts)?;
+    }
     let (graph, baseline, passes) = pipeline.finish()?;
     // `legalize` fitted every constant, but a later pass's revert of an unplannable split (`after_apply`) can
     // put an oversized one back: re-check the graph the planner receives, never trust the pass's own result.
@@ -1164,8 +1168,8 @@ fn escaped_value(error: &PackedDequantProductionError) -> ValueId {
 /// the members it absorbed. A refused root is restored from `before`, together with every member that
 /// `after` dropped and the restored equations read. Equations are emitted in `before`'s order, which is
 /// topological for both graphs because a rewritten root reads only values defined before its region. A
-/// pass that defines an output `before` never had cannot be taken apart this way, so a refusal there reverts
-/// the whole pass.
+/// pass that defines an output `before` never had, or gives an output it had another type, cannot be taken
+/// apart this way, so a refusal there reverts the whole pass.
 ///
 /// Alongside the restored graph, returns the typed refusal behind it, keyed by every equation the revert
 /// restored (card 669): each refused root's closure maps to its own [`Refusal`], the first root in probe
@@ -1205,10 +1209,19 @@ fn revert_unplannable_rewrites(
     if refused.is_empty() {
         return Ok((after, HashMap::new()));
     }
-    if after
-        .eqns()
-        .iter()
-        .any(|eqn| !before_at.contains_key(&eqn.out))
+    // A value `after` retyped is read by equations this revert keeps from `after` (a view whose op is
+    // unchanged) and by ones it restores from `before`: neither side is well typed with the other, so the
+    // pass cannot be taken apart root by root.
+    let retypes = after.eqns().iter().any(|eqn| {
+        before_at
+            .get(&eqn.out)
+            .is_some_and(|_| before.aval(eqn.out) != after.aval(eqn.out))
+    });
+    if retypes
+        || after
+            .eqns()
+            .iter()
+            .any(|eqn| !before_at.contains_key(&eqn.out))
     {
         return Ok((before.clone(), HashMap::new()));
     }
@@ -1520,6 +1533,63 @@ mod tests {
             .collect();
         assert_eq!(ops, ["mul", "exp", "add"], "the chain stays decomposed");
         assert_eq!(program.passes().count(), 0, "no pass changed the graph");
+    }
+
+    /// `fuse_index_casts` retypes the views between an I32 word's cast and the float region that reads it.
+    /// A target that refuses the folded region has the equations it replaced put back, but the views stay
+    /// I32, so the restored `ge` would read an I32 and an F32 operand. A pass that retypes a value is
+    /// reverted whole, so `compile` reaches the planner's typed refusal instead of an invalid graph (POOT-1179).
+    ///
+    /// Mutation: drop `retypes ||` in `revert_unplannable_rewrites`; `compile` returns the untyped
+    /// `Edit(Invalid(BinaryValueDtypeMismatch { operation: "ge", left: I32, right: F32 }))`.
+    #[test]
+    fn compile_reverts_a_retyping_pass_whole_when_the_target_refuses_its_region() {
+        let n = 4096usize;
+        let b = Builder::for_tests();
+        let a = b
+            .slot_named(Slot::Token, "a", TensorType::new(vec![n], DType::I32))
+            .unwrap();
+        let c = b
+            .slot_named(Slot::Token, "c", TensorType::new(vec![n], DType::I32))
+            .unwrap();
+        let flag = b.binary(BinOp::GeU, a, c).unwrap();
+        let x = b.constant("x", TensorType::f32(vec![1, n])).unwrap();
+        let flag_row = b
+            .reshape(b.cast(flag, DType::F32).unwrap(), vec![1, n])
+            .unwrap();
+        let hits = b
+            .reduce(
+                RedOp::Sum,
+                b.binary(BinOp::Ge, flag_row, x).unwrap(),
+                1,
+                true,
+            )
+            .unwrap();
+        // A second reader of the I32 flag keeps the cast from folding into its producer.
+        let others = b
+            .reduce(
+                RedOp::Sum,
+                b.cast(b.unary(UnOp::Not, flag).unwrap(), DType::F32)
+                    .unwrap(),
+                0,
+                true,
+            )
+            .unwrap();
+        let out = b
+            .binary(BinOp::Add, b.reshape(hits, vec![1]).unwrap(), others)
+            .unwrap();
+        let g = b.finish(out).unwrap();
+
+        let planned = compile(&g, &wgpu(), &REPLAY).expect("the roomy target folds the cast");
+        assert!(planned.passes().any(|pass| pass == "fuse_index_casts"));
+
+        let mut narrow = wgpu();
+        gpu_caps_mut(&mut narrow).max_workgroup_invocations = 1;
+        // The target plans nothing at one invocation per workgroup, so the reverted graph meets the
+        // planner's typed refusal of the equation it was left with, not an invalid-graph edit error.
+        let refused = refusal(compile(&g, &narrow, &REPLAY), "a one-invocation workgroup");
+        assert_eq!(refused.op, OpKind::Binary(BinOp::GeU));
+        assert!(matches!(refused.missing, Capability::KernelResources(_)));
     }
 
     /// `compile` plans each equation of the program exactly once: value storage reads the plans `plan_graph`

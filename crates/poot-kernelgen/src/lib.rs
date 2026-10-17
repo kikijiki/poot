@@ -6,6 +6,7 @@
 //! any length, not a baked-in size); the naive reductions loop serially over the reduced dim (no LDS). The
 //! standard skeleton is `i = tid.x; if i < out.len() { ... }`.
 
+mod aie_row;
 mod attention;
 mod block_top_k;
 mod contraction;
@@ -40,8 +41,9 @@ pub use request::{
     AieOp, BodyUse, CastSpec, ContractionSpec, ElementwiseSpec, ErrorBound, Fold, FragmentUse,
     Generated, I32Binary, IndexedContraction, KernelRequest, KernelRequirements, Launch,
     MatmulShapes, NumericalContract, PackedContraction, PackedRequest, PackedRows, PointwiseForm,
-    PointwiseSpec, RopeSpec, RowSpec, SerialWork, SerializedBinding, SerializedGenerated, TopKSpec,
-    UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand, fold_groups, generate, serialized_schedule,
+    PointwiseSpec, RopeSpec, RowSpec, SerialWork, SerializedAccess, SerializedBinding,
+    SerializedGenerated, TopKSpec, UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand, fold_groups,
+    generate, serialized_schedule,
 };
 pub use scan::{ScanKernel, ScanPhase, ScanSpec};
 

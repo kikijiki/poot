@@ -39,18 +39,50 @@ pub struct VpuTensor {
     pub shape: Vec<usize>,
 }
 
+/// A scalar constant, as the bits of its element type. A literal operand of a poot equation, or an index, lowers
+/// to a rank-0 `Const` node holding one of these.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VpuScalar {
+    /// An IEEE binary16 value, as its bits.
+    F16(u16),
+    /// An IEEE binary32 value, as its bits.
+    F32(u32),
+    /// A signed 32-bit integer.
+    I32(i32),
+}
+
 /// The OpenVINO op one poot primitive lowers to, with the parameters the opset op takes. One variant per
 /// primitive: each has exactly one lowering.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum VpuOp {
     /// Elementwise `Add` with numpy broadcasting.
     Add,
+    /// Elementwise `Subtract` with numpy broadcasting.
+    Subtract,
     /// Elementwise `Multiply` with numpy broadcasting.
     Multiply,
+    /// Elementwise `Divide` with numpy broadcasting.
+    Divide,
+    /// Elementwise `Maximum` with numpy broadcasting.
+    Maximum,
+    /// Elementwise `a >= b` as `1` or `0` in the operands' element type: `GreaterEqual`, then a `Convert` of
+    /// its boolean result, which is poot's `Ge`.
+    GreaterEqual,
     /// Elementwise `Exp`.
     Exp,
+    /// Elementwise `Negative`.
+    Negative,
+    /// Elementwise `Sqrt`.
+    Sqrt,
     /// `ReduceSum` over one axis.
     ReduceSum {
+        /// The reduced axis.
+        axis: usize,
+        /// Whether the axis stays as extent 1.
+        keepdim: bool,
+    },
+    /// `ReduceMax` over one axis.
+    ReduceMax {
         /// The reduced axis.
         axis: usize,
         /// Whether the axis stays as extent 1.
@@ -88,6 +120,28 @@ pub enum VpuOp {
     },
     /// `Convert` to the node's output element type.
     Convert,
+    /// The `Convert` that narrows a region input to the device's arithmetic width on entry (POOT-1178). Its
+    /// `origin` is the input's value id; the layer is named `v<origin>_narrow`.
+    NarrowEntry,
+    /// The `Convert` that widens a narrowed result back to the width the program stores it in on exit
+    /// (POOT-1178). Its `origin` is the result's equation; the layer is named `v<origin>_widen`, and that
+    /// layer, not the narrowed one, is the result.
+    WidenExit,
+    /// The range `0..len` as a rank-1 `Const` of the node's element type (`F32` or `I32`). No operands.
+    Iota {
+        /// The number of elements.
+        len: usize,
+    },
+    /// A copy of the first operand with the second written into it from the scalar `I32` index (the third
+    /// operand) along `axis`: `ScatterUpdate` at the indices `index..index + extent`. The index must select a
+    /// window that fits (the CPU oracle rejects one that does not with a typed error): the device does not
+    /// check it and its result for an out-of-range index is undefined.
+    DynamicUpdateSlice {
+        /// The axis the update is written along.
+        axis: usize,
+    },
+    /// A rank-0 `Const`. No operands.
+    Scalar(VpuScalar),
 }
 
 mod region;

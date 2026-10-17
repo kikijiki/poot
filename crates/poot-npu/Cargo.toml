@@ -29,6 +29,8 @@ poot-runtime-common = { workspace = true, features = ["test-support"] }
 poot-eval = { workspace = true, features = ["test-support"] }
 poot-codegen = { workspace = true, features = ["test-support"] }
 poot-executor-parity.workspace = true
+# `Program::kernel_choice`: the rows read the numerical contract the planner attached to the equation.
+poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 poot-kernel-ir.workspace = true
 poot-kernelgen.workspace = true

@@ -381,8 +381,12 @@ pub(super) fn plan(
                 numel: out_numel,
                 leaves: leaves(&ids),
                 kernel,
-                // One workgroup of `width` lanes per row (spec 013).
-                width: row_parallel_width(out_shape[region.axis]),
+                // One workgroup of `width` lanes per row (spec 013); an AIE core is one lane, the form of
+                // the generator without workgroup memory.
+                width: match lowering {
+                    Lowering::Gpu { .. } => row_parallel_width(out_shape[region.axis]),
+                    Lowering::Aie(_) => 1,
+                },
             }))?
         }
         OpKind::Iota { .. } => {

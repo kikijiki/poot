@@ -40,7 +40,24 @@ Verified on an AMD XDNA2 NPU (Strix Halo, `aie2p`):
   - `log`: the same bound. Domain: positive normal numbers (from 1.18e-38 up); smaller inputs are not
     promised.
   - `tanh` and `erf`: the same bound over every finite input, which they saturate exactly.
+  - `sqrt`: relative error 4e-7, the core's software square root (a bit-halving estimate and four Newton
+    steps). Domain: positive normal numbers.
+  - `max`: the larger operand, exactly (a compare and select). Domain: operands that are not NaN.
   Activation slots and a carried running-sum state replay over changing inputs.
+- **Row reductions and norms** run as the ordinary row kernel with one lane per row, its row loop serialized
+  like the pointwise ones: no workgroup memory and no barrier.
+  - A last-axis `sum` adds in order and is within `2 x cols x 2^-23` of the sum of the row's magnitudes (each
+    addition is faithful to two units of its larger operand, and a sum that cancels has no relative bound).
+    A last-axis `max` is exact.
+  - A fused norm (RMSNorm, with or without a weight) has a bound derived from its steps: `mul` and `div`
+    are exact, an `add` is admitted only when both operands are provably non-negative (it cannot cancel), a
+    `sqrt` only when its operand is provably a positive normal number, and a `sum` only over non-negative
+    terms. The derived relative bound of a 64-column RMSNorm is 8.5e-6, and the hardware stays under
+    3 percent of it. A step with no derived bound (a subtraction, `exp` inside a row kernel, a signed `sum`) is
+    a typed refusal that names the missing bound, so a LayerNorm and a softmax are refused.
+- **Gather** of `F32` or `I32` elements through an `I32` index returns the source elements bit for bit,
+  negative zero and NaN payloads included, along any axis. An index outside the axis is not checked, as on
+  the GPU kernel.
 - **A graph of twenty equations with twenty distinct shapes runs in three hardware contexts**, where one
   artifact per equation fails at the seventeenth load.
 - **Region bounds, measured**: 32 compute tiles, 16 host streams in and 16 out, 2 streams per tile, and a
@@ -48,24 +65,44 @@ Verified on an AMD XDNA2 NPU (Strix Halo, `aie2p`):
   the toolchain; the compiler splits a program at these numbers, or refuses an equation that fits no region
   with a typed limit.
 
-Nothing else is verified. Every other equation (`max`, `sqrt`, `round`, other unary ops, reductions, matmul,
-attention, collectives) is refused by the planner with a typed capability, and no model runs on the NPU. Performance
+Nothing else is verified. Every other equation (`round`, other unary ops, reductions over another axis or
+another element type, data movements other than gather, matmul, attention, collectives) is refused by the
+planner with a typed capability, and no model runs on the NPU. Performance
 is not a goal of this path: it is scalar, and not competitive with the GPU backends.
 
 ## Intel NPU
 
 An Intel NPU has no public core ISA or kernel toolchain. Its only entry point is the driver's graph compiler,
 so the artifact of a program is one **graph**: the planner lowers each equation to the one OpenVINO opset op
-with the same semantics (`add`, `multiply`, `exp`, `reduce-sum`, `matmul`, `gather`, `reshape`, `transpose`,
-`broadcast`, `slice`, `concat`, `convert`) and nothing is recognized as a composite, so attention stays its
+with the same semantics (`add`, `subtract`, `multiply`, `divide`, `maximum`, `greater-equal`, `exp`, `negative`, `sqrt`,
+`reduce-sum`, `reduce-max`, `matmul`, `gather`, `reshape`, `transpose`, `broadcast`, `slice`, `concat`,
+`convert`, a constant range for `iota`, and a scatter for `dynamic_update_slice`; an inline scalar literal
+becomes a constant) and nothing is recognized as a composite, so attention stays its
 primitives and the vendor compiler fuses what it can. `poot-codegen` serializes the whole program as OpenVINO
 IR, the shared `Engine` hands it to `VpuDevice`, the driver's compiler builds the blob, and the device runs
 the graph through Level Zero. Every value the graph's own equations read stays inside it; its arguments are
 the weights, activations and state it reads and the values it returns, in host memory the NPU addresses.
 
-The NPU computes in FP16, so an F32 or BF16 arithmetic equation is refused with a typed capability instead of
-being computed narrower; F32 data may cross the graph's boundary and meet FP16 arithmetic only through an
-explicit conversion.
+The NPU computes in FP16, and a vendor compiler handed an F32 graph narrows it silently, so poot makes the
+narrowing a step of its own. When the device records a numerical contract (a bound on the normwise error of a
+narrowed region, measured on the device against the F32 CPU oracle), the planner converts each F32 argument
+of the graph to FP16 on entry, computes the whole graph in FP16 and converts each F32 result back on exit;
+nothing in between is converted op by op, so the contract bounds the graph's error as a whole. A target that
+records no contract refuses an F32 arithmetic equation with a typed capability naming the missing contract,
+and BF16 arithmetic, which no contract covers, is refused as well. Data movement is bit exact in any width the
+device carries.
+
+The contract's bound holds only for values FP16 can hold, so the contract also records the largest magnitude an
+F32 value may have (65504). A literal beyond it is refused when the graph is planned, except the additive
+literals described below, which saturate on purpose. The device checks the graph's F32 inputs before each
+replay: a value beyond the range, or a NaN, is a typed error that names the argument and the element and runs
+nothing. The check reads every F32 argument on every replay, the weights included, so a weight outside the
+range is refused at the first replay that binds it, not when the graph is loaded or planned. An argument that
+an earlier command of the same recording writes is checked as that command's result instead. The F32 results
+are checked after the replay too, since a result that left the range was computed outside what the bound was
+measured on. On the laptop NPU an F32 input of 65504 runs, an input of 65520 (which FP16 rounds to infinity)
+is refused, and a sum of two in-range inputs that exceeds the range comes back as a finite F32 and is refused
+as a result.
 
 Compiled blobs are cached on disk under the region's full identity (the part, the vendor compiler's version,
 the compiler options and the IR with its constants), so a second run of the same program loads the blob and
@@ -74,19 +111,30 @@ refuses, is recompiled and replaced.
 
 Verified on an Intel Core Ultra (Lunar Lake) NPU, driver and compiler 1.38.0:
 
-- **F16 programs** over elementwise `add` and `mul`, `exp`, row and column sums, a matmul, a gather by `I32`
-  indices, transpose, reshape, slice, concat and broadcast, rank four tensors, an `F32` boundary around FP16
-  arithmetic, activation slots, a carried running-sum state, and replay over changing inputs match the CPU
-  oracle bit for bit on integer-valued inputs and within FP16 tolerance for `exp`.
+- **F16 programs** over elementwise `add`, `sub`, `mul`, `max`, `ge`, `div`, `neg`, `sqrt` and `exp`, inline
+  scalar literals, row and column sums and maxima, a matmul, a gather by `I32` indices (also by an `iota`),
+  transpose, reshape, slice, concat and broadcast, a `dynamic_update_slice` at a literal and at a runtime
+  index, rank four tensors, an `F32` boundary around FP16 arithmetic, activation slots, a carried running-sum
+  state, and replay over changing inputs match the CPU oracle bit for bit on integer-valued inputs and within
+  FP16 tolerance for `exp`, `div` and `sqrt`. The sign of a zero is not promised: the NPU's `neg` of `+0` is
+  `+0`.
 - **A program is one compiled graph and one replay per step**, however many equations it holds.
 - **The compiled graph's arguments are checked against the program's** (names, order, direction, extents,
   precision) before anything runs, so a compiler that reordered, retyped or reshaped an argument is a typed
   refusal.
 
-Nothing else is verified. Every other equation (`sub`, `max`, `div`, other unary ops, inline literals,
-softmax, attention, collectives) is refused by the planner with a typed capability, and no model runs on the
-Intel NPU. A layer the vendor compiler rejects is a typed error carrying the compiler's own log. Performance
-is not a goal of this path.
+Nothing else is verified. Every other equation is refused by the planner with a typed capability: `log`,
+`recip` and the other unary ops, BF16 arithmetic and F32 arithmetic on a target with no recorded narrowing
+contract (the NPU computes in FP16), and converts through BF16 or an integer. Softmax, attention and
+collectives are not recognized as composites, and no model runs on the Intel NPU. A literal FP16 cannot hold
+is refused (`NarrowingRange`), unless the target records the narrowing contract and the literal is the operand
+of an add or subtract: then a finite F32 literal saturates to ±65504 (a mask sentinel acting as an infinity).
+A multiplicative use stays refused, an infinite literal stays infinite and a NaN literal is refused. An integer
+converted to a float is refused as `IntegerToFloat`, because FP16 holds integers exactly only up to 2048. The
+index of a runtime `dynamic_update_slice` must select a window that fits: the CPU oracle rejects an
+out-of-range index with a typed error, but the NPU does not check it and its result is undefined. A layer the
+vendor compiler rejects is a typed error carrying the compiler's own log. Performance is not a goal of this
+path.
 
 ## Failure behavior
 

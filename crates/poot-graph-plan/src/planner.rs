@@ -220,6 +220,8 @@ pub(crate) use choice::PlannedDispatch;
 pub use choice::{KernelChoice, NoDispatch};
 pub(crate) use matmul::epilogue_head_lowers;
 pub(crate) use vpu::plan_vpu_region;
+#[cfg(any(test, feature = "test-support"))]
+pub use vpu::vpu_refusals;
 
 use std::cell::Cell;
 
@@ -516,10 +518,11 @@ pub(crate) fn plan_eqn_views_impl(
 }
 
 /// An AIE target's per-equation plan. The AIE core runs one sequential loop, and `poot-kernelgen` has a
-/// sequential schedule for the elementwise family only, so that family is planned (through the same
-/// request builder every target uses, under [`Lowering::Aie`]) and finalized against the target's own
-/// limits. Every other family's lowering reads GPU capabilities ([`DeviceCaps`]) and is refused with
-/// [`Capability::GpuOnly`]; a collective is a cut between stage programs on every target.
+/// serialized schedule for the elementwise, row (reduction and norm) and gather families only, so those are
+/// planned (through the same request builders every target uses, under [`Lowering::Aie`]) and finalized
+/// against the target's own limits. Every other family's lowering reads GPU capabilities ([`DeviceCaps`])
+/// and is refused with [`Capability::GpuOnly`]; a collective is a cut between stage programs on every
+/// target.
 #[allow(clippy::too_many_arguments)]
 fn plan_aie_eqn(
     g: GraphTables<'_>,
@@ -555,6 +558,7 @@ fn plan_aie_eqn(
             packed_operands,
         )?,
         OpKind::Iota { .. } => return Err(site.refuse(Capability::UnfoldedIota)),
+        movement_ops!() => movement::plan_serialized(g, eqn, out_shape, target, odt, limits)?,
         imported_ops!()
         | packed_ops!()
         | moe_ops!()
@@ -563,17 +567,9 @@ fn plan_aie_eqn(
         | scan_ops!()
         | block_top_k_ops!()
         | cast_ops!()
-        | sampling_ops!()
-        | movement_ops!() => {
-            // A collective is a cut between stage programs on every target; any other op's lowering
-            // reads GPU capabilities.
-            let missing = match eqn.op {
-                OpKind::AllReduce { .. } | OpKind::AllGather { .. } => {
-                    Capability::CollectiveInStage
-                }
-                _ => Capability::GpuOnly,
-            };
-            return Err(site.refuse(missing));
+        | sampling_ops!() => {
+            // Any other op's lowering reads GPU capabilities.
+            return Err(site.refuse(Capability::GpuOnly));
         }
     };
     finalize_aie(&planned, g, eqn, target, caps)?;

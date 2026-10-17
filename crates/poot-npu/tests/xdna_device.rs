@@ -282,14 +282,13 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
     let unary = {
         let b = Builder::for_tests();
         let x = b.constant("x", f32s(&[2, 3])).unwrap();
-        let out = b.unary(poot_graph_ir::UnOp::Sqrt, x).unwrap();
+        let out = b.unary(poot_graph_ir::UnOp::Round, x).unwrap();
         b.finish(out).unwrap()
     };
-    let max = {
+    let leading_reduce = {
         let b = Builder::for_tests();
         let x = b.constant("x", f32s(&[2, 3])).unwrap();
-        let y = b.constant("y", f32s(&[2, 3])).unwrap();
-        let out = b.binary(BinOp::Max, x, y).unwrap();
+        let out = b.reduce(RedOp::Sum, x, 0, false).unwrap();
         b.finish(out).unwrap()
     };
     let matmul = {
@@ -297,12 +296,6 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
         let x = b.constant("x", f32s(&[2, 3])).unwrap();
         let y = b.constant("y", f32s(&[3, 2])).unwrap();
         let out = b.matmul(x, y).unwrap();
-        b.finish(out).unwrap()
-    };
-    let reduce = {
-        let b = Builder::for_tests();
-        let x = b.constant("x", f32s(&[2, 3])).unwrap();
-        let out = b.reduce(RedOp::Sum, x, 1, false).unwrap();
         b.finish(out).unwrap()
     };
     let collective = {
@@ -320,19 +313,21 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
     };
     let unary = refusal_of(unary, target);
     assert!(kernelgen_unsupported(&unary.missing), "{unary:?}");
-    let max = refusal_of(max, target);
-    assert!(kernelgen_unsupported(&max.missing), "{max:?}");
+    let leading_reduce = refusal_of(leading_reduce, target);
+    assert_eq!(
+        leading_reduce.missing,
+        Capability::NonLastAxisReduce { axis: 0 },
+        "{leading_reduce:?}"
+    );
     let matmul = refusal_of(matmul, target);
     assert_eq!(matmul.missing, Capability::GpuOnly, "{matmul:?}");
-    let reduce = refusal_of(reduce, target);
-    assert!(kernelgen_unsupported(&reduce.missing), "{reduce:?}");
     let collective = refusal_of(collective, target);
     assert_eq!(
         collective.missing,
         Capability::CollectiveInStage,
         "{collective:?}"
     );
-    for refusal in [&unary, &max, &matmul, &reduce, &collective] {
+    for refusal in [&unary, &leading_reduce, &matmul, &collective] {
         assert_eq!(
             refusal.target,
             poot_target::TargetId::Aie(poot_target::AieTargetId::Xdna2)
@@ -465,16 +460,16 @@ fn linked_add(n: usize) -> LinkedAdd {
     };
     let generated = poot_kernelgen::serialized_schedule(&request, &limits).unwrap();
     let bindings = generated
-        .bindings
+        .accesses
         .iter()
         .enumerate()
-        .map(|(index, b)| {
-            let access = if b.writes {
+        .map(|(index, a)| {
+            let access = if a.writes {
                 ArgAccess::Write
             } else {
                 ArgAccess::Read
             };
-            AieBinding::new(index, BufferStorage::f32(), access, &b.dims, b.accessed).unwrap()
+            AieBinding::new(index, BufferStorage::f32(), access, &[n as u64], a.accessed).unwrap()
         })
         .collect();
     let abi = AieShapeAbi::new(bindings).unwrap();
