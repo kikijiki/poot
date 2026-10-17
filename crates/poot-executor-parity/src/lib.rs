@@ -31,7 +31,9 @@
 pub mod alibi;
 pub mod attention;
 pub mod bf16_cast;
+pub mod block_top_k;
 pub mod capture;
+pub mod coresident;
 pub mod gdn;
 pub mod i32_gather;
 pub mod launch;
@@ -42,6 +44,7 @@ pub mod routing;
 pub mod sample_token;
 pub mod scan;
 pub mod select;
+pub mod selected_attention;
 pub mod state_row;
 pub mod strided_read;
 pub mod write_probe;
@@ -738,6 +741,86 @@ pub fn run_outputs(
     Ok(outputs)
 }
 
+/// The device time of one step of `name`: its device span, first dispatch start to last dispatch end. The span
+/// is the one measure every backend reports; PTX replays a captured graph bracketed by one event pair and has
+/// no per-dispatch duration, so a receipt keyed on the dispatch sum would find none there. `Err` when the
+/// device reports no timestamps at all: a receipt never falls back to host wall.
+fn step_device_time(
+    name: &str,
+    device_time: &poot_executor::DeviceTime,
+) -> Result<std::time::Duration, String> {
+    let poot_executor::DeviceTime::Measured(measured) = device_time else {
+        return Err(format!("{name}: the device reports no timestamps"));
+    };
+    measured
+        .device_span
+        .ok_or_else(|| format!("{name}: no device span"))
+}
+
+/// Load `fixture` onto `exec` and step its first step `repeats` times, returning each step's device span
+/// ([`step_device_time`]). A step is the fixture's one op, so the span is that kernel's time (and any copy the
+/// plan adds). `Err` when the device reports no timestamps: a receipt never falls back to host wall.
+pub fn run_device_times(
+    exec: &mut dyn Executor,
+    target: Target,
+    fixture: &Fixture,
+    repeats: usize,
+) -> Result<Vec<std::time::Duration>, String> {
+    let exe = exec
+        .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
+        .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
+    let entry = exec
+        .add_entry(exe, &staged(fixture, target, Submission::Replay))
+        .map_err(|e| format!("{}: add_entry: {e}", fixture.name))?;
+    let step = fixture
+        .steps
+        .first()
+        .ok_or_else(|| format!("{}: no step", fixture.name))?;
+    let mut times = Vec::with_capacity(repeats);
+    for i in 0..repeats {
+        let out = exec
+            .step(
+                exe,
+                entry,
+                &BoundStep::new(&fixture.graph, step)?.inputs(),
+                &mut NoSync,
+            )
+            .map_err(|e| format!("{}: step {i}: {e}", fixture.name))?;
+        times.push(step_device_time(fixture.name, &out.device_time())?);
+        drop(out);
+    }
+    exec.unload(exe)
+        .map_err(|e| format!("{}: unload: {e}", fixture.name))?;
+    Ok(times)
+}
+
+/// A perf receipt: the device time of each fixture's first step, `rounds` times over, the fixtures visited in
+/// an order that reverses every round (A B, B A, ...) with `repeats` steps each visit, so a drift of the box
+/// between visits lands on every fixture alike (single numbers on this box move about 30% between holds).
+/// Returns one sample list per fixture, in the order given; the first step of every visit (a cold cache) is
+/// dropped.
+pub fn receipt(
+    exec: &mut dyn Executor,
+    target: Target,
+    fixtures: &[&Fixture],
+    rounds: usize,
+    repeats: usize,
+) -> Result<Vec<Vec<std::time::Duration>>, String> {
+    let mut samples = vec![Vec::new(); fixtures.len()];
+    for round in 0..rounds {
+        let order: Vec<usize> = if round % 2 == 0 {
+            (0..fixtures.len()).collect()
+        } else {
+            (0..fixtures.len()).rev().collect()
+        };
+        for i in order {
+            let times = run_device_times(exec, target, fixtures[i], repeats + 1)?;
+            samples[i].extend(times.into_iter().skip(1));
+        }
+    }
+    Ok(samples)
+}
+
 /// Capture-and-replay repeatability. The entry's first step records and replays in one call; every
 /// later step is a pure replay. This steps `fixture` once, comparing each step to `oracle` within
 /// tolerance (as [`run_parity`] does, so a replay that drops a state commit diverges from the
@@ -812,4 +895,36 @@ pub fn run_capture_replay(
     exec.unload(exe)
         .map_err(|e| format!("{}: unload: {e}", fixture.name))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod device_time_tests {
+    use std::time::Duration;
+
+    use poot_executor::{DeviceTime, MeasuredDeviceTime};
+
+    use super::step_device_time;
+
+    /// PTX reports a graph-replay span and no per-dispatch durations: the receipt reads that span.
+    ///
+    /// Mutation: read `sum_of_dispatch_durations` instead of `device_span`; this fails with
+    /// `Err("row: no device span")` (the card 1170 failure shape).
+    #[test]
+    fn a_span_only_measurement_yields_the_span() {
+        let ptx_shaped = DeviceTime::Measured(MeasuredDeviceTime {
+            sum_of_dispatch_durations: None,
+            device_span: Some(Duration::from_micros(7)),
+            dispatches: Vec::new(),
+        });
+        assert_eq!(
+            step_device_time("row", &ptx_shaped),
+            Ok(Duration::from_micros(7))
+        );
+    }
+
+    #[test]
+    fn unknown_device_time_is_refused_not_fabricated() {
+        let err = step_device_time("row", &DeviceTime::Unknown).unwrap_err();
+        assert!(err.contains("no timestamps"), "{err}");
+    }
 }

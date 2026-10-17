@@ -165,6 +165,8 @@ pub(crate) fn encode_host(dtype: DType, bytes: &[u8], planned: BufferStorage) ->
     match (dtype, planned.element(), planned.dtype()) {
         (DType::F32, ElementKind::F32, LogicalDType::F32) => Some(bytes.to_vec()),
         (DType::I32, ElementKind::I32, LogicalDType::I32) => Some(bytes.to_vec()),
+        // Native F16 words: a target that computes in F16 (an Intel NPU) stores an F16 slot as it is.
+        (DType::F16, ElementKind::F16, LogicalDType::F16) => Some(bytes.to_vec()),
         _ => None,
     }
 }
@@ -174,7 +176,9 @@ mod tests {
     use poot_target::BufferStorage;
     use poot_tensor::DType;
 
-    use super::{EncodeError, Encoding, encode_range, encode_stored, encoded_len, encoding_of};
+    use super::{
+        EncodeError, Encoding, encode_host, encode_range, encode_stored, encoded_len, encoding_of,
+    };
 
     /// POOT-1060: a stored E4M3FN table lands as `u32` words with every row of the last axis zero-padded to
     /// a whole word, so a width that is not a multiple of four starts the next row in the next word, and the
@@ -193,6 +197,21 @@ mod tests {
         assert_eq!(wide, [9, 8, 7, 6, 5, 0, 0, 0]);
         let aligned = encode_stored(DType::E4M3FN, &[2, 4], &[1, 2, 3, 4, 5, 6, 7, 8], packed);
         assert_eq!(aligned.unwrap(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// A slot or computed const lands in the lane it is planned in, bit for bit: F16 words in a native F16
+    /// buffer (an Intel NPU's lane), and never in a lane of another width.
+    ///
+    /// Mutation: drop the `(F16, F16, F16)` arm of `encode_host`; the native F16 lane has no encoding.
+    #[test]
+    fn a_host_f16_view_lands_only_in_the_native_f16_lane() {
+        let words = [0x00u8, 0x3c, 0x00, 0x40];
+        assert_eq!(
+            encode_host(DType::F16, &words, BufferStorage::f16()).as_deref(),
+            Some(words.as_slice())
+        );
+        assert_eq!(encode_host(DType::F16, &words, BufferStorage::f32()), None);
+        assert_eq!(encode_host(DType::F32, &words, BufferStorage::f16()), None);
     }
 
     /// Dense E4M3FN storage still has no encoding: only the packed lane does.

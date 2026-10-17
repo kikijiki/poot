@@ -2146,6 +2146,62 @@ impl Builder {
         Ok(ScanResult { packed, y, s_out })
     }
 
+    /// The block selection of a sparse-attention indexer (POOT-1143): ONE `OpKind::BlockTopK` equation over
+    /// `scores` `[R, 1, T, NB]` and the queries' positions `pos` `[R, T]`, returned as its typed
+    /// values. The two projections are slices of the packed result at the columns its
+    /// [`crate::BlockTopKLayout`] names.
+    pub fn block_top_k(
+        &self,
+        attrs: crate::op::BlockTopKAttrs,
+        scores: Traced,
+        pos: Traced,
+    ) -> Result<BlockTopKResult, BuilderError> {
+        let layout = {
+            let (scores, pos) = (self.aval(scores)?, self.aval(pos)?);
+            attrs
+                .layout(&[scores, pos])
+                .map_err(|source| BuilderError::Inference {
+                    equation: self.g.borrow().eqns().len(),
+                    operation: OpKind::BlockTopK(attrs).name(),
+                    source,
+                })?
+        };
+        let packed = self.emit(
+            OpKind::BlockTopK(attrs),
+            vec![self.operand(scores)?, self.operand(pos)?],
+        )?;
+        let (ids, keep) = (layout.ids(), layout.keep());
+        Ok(BlockTopKResult {
+            packed,
+            ids: self.slice(packed, 3, ids.start, ids.end)?,
+            keep: self.slice(packed, 3, keep.start, keep.end)?,
+        })
+    }
+
+    /// Attention over the blocks a selection made (POOT-1143): ONE `OpKind::SelectedAttention` equation over
+    /// `q`, the cached `k` and `v`, the selected block `ids` `[B, 1, Lq, K]` and the queries' positions `pos`
+    /// `[B, Lq]`. Output `[B, Hq, Lq, Dv]`.
+    pub fn selected_attention(
+        &self,
+        attrs: crate::op::SelectedAttentionAttrs,
+        q: Traced,
+        k: Traced,
+        v: Traced,
+        ids: Traced,
+        pos: Traced,
+    ) -> Result<Traced, BuilderError> {
+        self.emit(
+            OpKind::SelectedAttention(attrs),
+            vec![
+                self.operand(q)?,
+                self.operand(k)?,
+                self.operand(v)?,
+                self.operand(ids)?,
+                self.operand(pos)?,
+            ],
+        )
+    }
+
     /// Reinterpret `x` with `shape`, which must hold the same number of elements.
     pub fn reshape(&self, x: Traced, shape: Vec<usize>) -> Result<Traced, BuilderError> {
         self.emit(OpKind::Reshape { shape }, vec![self.operand(x)?])
@@ -2528,6 +2584,18 @@ pub struct ScanResult {
     pub y: Traced,
     /// The carried state `[1, H, S, W]`.
     pub s_out: Traced,
+}
+
+/// The values of a traced block selection: the packed result its one equation defines and the two
+/// projections of it.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockTopKResult {
+    /// The packed I32 `[R, 1, T, K + NB]` result.
+    pub packed: Traced,
+    /// The selected block ids `[R, 1, T, K]`, ascending, `-1` after the last selected.
+    pub ids: Traced,
+    /// The `0`/`1` keep indicator of each block `[R, 1, T, NB]`.
+    pub keep: Traced,
 }
 
 /// `(y, s_out)` as the slices of `packed` at the layout's rows.

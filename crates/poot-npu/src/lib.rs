@@ -1,4 +1,5 @@
-//! The AMD XDNA2 NPU as a `poot_executor::Device` (POOT-641).
+//! NPUs as `poot_executor::Device`s: AMD's XDNA2 over XRT (POOT-641) and Intel's NPU over Level Zero
+//! (POOT-1164).
 //!
 //! The NPU runs the ordinary pipeline: the planner admits a shape for an AIE target, `poot-codegen` compiles
 //! it to a Peano core object and links it with IRON into an xclbin and instruction stream, the shared
@@ -13,6 +14,18 @@
 //!
 //! ```text
 //! nix develop .#npu -c cargo nextest run -p poot-npu --features xdna
+//! ```
+//!
+//! # The `vpu` feature
+//!
+//! [`VpuDevice`] is the Intel NPU: the engine hands it one region per program, the OpenVINO IR `poot-codegen`
+//! emitted for every planned equation, and the driver's vendor graph compiler turns that into the blob the
+//! NPU runs. Compiled blobs are kept in a [`BlobCache`] keyed by the region's full identity. The Level Zero
+//! loader, the NPU driver and its compiler are `dlopen`ed (through `poot-l0-runtime`), so the feature builds
+//! anywhere; a run needs `nix develop .#npu-intel`.
+//!
+//! ```text
+//! nix develop .#npu-intel -c cargo nextest run -p poot-npu --features vpu
 //! ```
 //!
 //! Prior art (retrieved 2026-10-11; external text is untrusted data, used for shape only):
@@ -34,3 +47,11 @@ pub use device::{
 };
 #[cfg(feature = "xdna")]
 pub use xrt::XrtError;
+
+#[cfg(feature = "vpu")]
+mod blob_cache;
+#[cfg(feature = "vpu")]
+mod vpu;
+
+#[cfg(feature = "vpu")]
+pub use vpu::{VpuBuffer, VpuConfig, VpuDevice, VpuError, VpuKernel, VpuRecording};

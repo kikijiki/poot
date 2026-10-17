@@ -12,117 +12,23 @@
 
 #![cfg(feature = "xdna")]
 
-use std::fs::File;
+mod common;
 
-use poot_eval::test_support::StepFixture;
 use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, Engine};
 use poot_executor_parity::Fixture;
-use poot_graph_ir::{BinOp, Builder, Graph, Outputs, Slot, SlotKey, StateRole, TensorType};
+use poot_graph_ir::{BinOp, Builder, Graph, Outputs, Slot, StateRole, TensorType};
 use poot_npu::{XdnaConfig, XdnaDevice};
-use poot_quant::StoredBytes;
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
-use poot_runtime_common::DeviceBackend;
-use poot_runtime_common::device_skip::open_or_skip;
-use poot_tensor::{DType, HostTensor};
+use poot_quant::weights::WeightStore;
 
-/// The held lock and an engine over the NPU. The lock is released when this drops.
-struct Npu {
-    engine: Engine<XdnaDevice>,
-    _lock: File,
-}
-
-/// Hold `/tmp/poot-npu.lock` until the returned file drops: two runs never share the device.
-fn lock() -> File {
-    let lock = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open("/tmp/poot-npu.lock")
-        .expect("open the NPU lock file");
-    lock.lock().expect("take the NPU lock");
-    lock
-}
-
-/// The lock, and the device opened under it with `config`; `None` (a printed SKIP) when the device or the
-/// Peano/IRON toolchain is absent and `POOT_REQUIRE_NPU` is not `1`. With it set, either absence fails the
-/// row: the lane never passes on skips.
-fn device(config: XdnaConfig) -> Option<(File, XdnaDevice)> {
-    let lock = lock();
-    let get = |name: &str| std::env::var(name).ok();
-    for variable in ["POOT_AIE_LLC", "POOT_AIE_IRON"] {
-        if get(variable).is_none() {
-            let missing = format!("${variable} is unset (run under `nix develop .#npu`)");
-            let reason = DeviceBackend::Npu.fail_if_required(get, missing);
-            eprintln!("SKIP: NPU toolchain unavailable: {reason}");
-            return None;
-        }
-    }
-    let device = open_or_skip(DeviceBackend::Npu, XdnaDevice::open_with(config))?;
-    Some((lock, device))
-}
-
-/// An engine over the NPU (see [`device`]).
-fn npu() -> Option<Npu> {
-    let (lock, device) = device(XdnaConfig::default())?;
-    Some(Npu {
-        engine: Engine::new(device),
-        _lock: lock,
-    })
-}
-
-/// A named dense F32 constant of the fixture's weight store.
-struct Const {
-    name: &'static str,
-    shape: Vec<usize>,
-    values: Vec<f32>,
-}
-
-fn constant(name: &'static str, shape: &[usize], f: impl Fn(usize) -> f32) -> Const {
-    let numel = shape.iter().product();
-    Const {
-        name,
-        shape: shape.to_vec(),
-        values: (0..numel).map(f).collect(),
-    }
-}
-
-fn store(consts: &[Const]) -> WeightStore {
-    let mut builder = WeightStore::builder();
-    for c in consts {
-        let bytes: Vec<u8> = c.values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense =
-            DenseWeight::try_new(DType::F32, c.shape.clone(), StoredBytes::from(bytes)).unwrap();
-        builder.insert(c.name, WeightEntry::Dense(dense)).unwrap();
-    }
-    builder.build()
-}
-
-fn slot_key(name: &str) -> SlotKey {
-    SlotKey::new(Slot::Activation, Some(name))
-}
-
-fn x_step(name: &str, shape: &[usize], f: impl Fn(usize) -> f32) -> Vec<StepFixture> {
-    let numel: usize = shape.iter().product();
-    vec![StepFixture {
-        key: slot_key(name),
-        tensor: HostTensor::f32(shape.to_vec(), (0..numel).map(f).collect()),
-    }]
-}
-
-/// One fixture of the bank: whether its values are small integers, which every IEEE or AIE rounding of
-/// `+ - *` and `max` reproduces exactly, so the device must equal the oracle bit for bit.
-struct Row {
-    fixture: Fixture,
-    exact: bool,
-}
+use common::{Row, assert_matches, constant, device, npu, refusal_of, store, x_step};
 
 /// `a + b` over two `[2, 3]` constants.
 fn add_consts() -> Row {
-    let b = Builder::new();
-    let x = b.constant("a", TensorType::f32(vec![2, 3]));
-    let y = b.constant("b", TensorType::f32(vec![2, 3]));
-    let out = b.binary(BinOp::Add, x, y);
+    let b = Builder::for_tests();
+    let x = b.constant("a", TensorType::f32(vec![2, 3])).unwrap();
+    let y = b.constant("b", TensorType::f32(vec![2, 3])).unwrap();
+    let out = b.binary(BinOp::Add, x, y).unwrap();
     let graph = b.finish(out).unwrap();
     let store = store(&[
         constant("a", &[2, 3], |i| i as f32 + 1.0),
@@ -141,10 +47,10 @@ fn add_consts() -> Row {
 
 /// `a - b`: not commutative, so a swapped argument order flips the sign of every element.
 fn sub_consts() -> Row {
-    let b = Builder::new();
-    let x = b.constant("a", TensorType::f32(vec![2, 3]));
-    let y = b.constant("b", TensorType::f32(vec![2, 3]));
-    let out = b.binary(BinOp::Sub, x, y);
+    let b = Builder::for_tests();
+    let x = b.constant("a", TensorType::f32(vec![2, 3])).unwrap();
+    let y = b.constant("b", TensorType::f32(vec![2, 3])).unwrap();
+    let out = b.binary(BinOp::Sub, x, y).unwrap();
     let graph = b.finish(out).unwrap();
     let store = store(&[
         constant("a", &[2, 3], |i| 100.0 + i as f32),
@@ -164,12 +70,14 @@ fn sub_consts() -> Row {
 /// `x * w + b` over a `[4, 8]` activation slot and two constants: three steps with different `x`, so the
 /// recording is replayed over inputs the device had not seen when it recorded.
 fn scale_shift_slot() -> Row {
-    let b = Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![4, 8]));
-    let w = b.constant("w", TensorType::f32(vec![4, 8]));
-    let bias = b.constant("bias", TensorType::f32(vec![4, 8]));
-    let scaled = b.binary(BinOp::Mul, x, w);
-    let out = b.binary(BinOp::Add, scaled, bias);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![4, 8]))
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![4, 8])).unwrap();
+    let bias = b.constant("bias", TensorType::f32(vec![4, 8])).unwrap();
+    let scaled = b.binary(BinOp::Mul, x, w).unwrap();
+    let out = b.binary(BinOp::Add, scaled, bias).unwrap();
     let graph = b.finish(out).unwrap();
     let store = store(&[
         constant("w", &[4, 8], |i| (i % 7) as f32 - 3.0),
@@ -192,12 +100,14 @@ fn scale_shift_slot() -> Row {
 /// `x * w - d` over a `[3, 5]` slot with fractional values (the AIE core's float rounding is not asserted
 /// bit for bit).
 fn mul_sub_fractional() -> Row {
-    let b = Builder::new();
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![3, 5]));
-    let w = b.constant("w", TensorType::f32(vec![3, 5]));
-    let d = b.constant("d", TensorType::f32(vec![3, 5]));
-    let scaled = b.binary(BinOp::Mul, x, w);
-    let out = b.binary(BinOp::Sub, scaled, d);
+    let b = Builder::for_tests();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![3, 5]))
+        .unwrap();
+    let w = b.constant("w", TensorType::f32(vec![3, 5])).unwrap();
+    let d = b.constant("d", TensorType::f32(vec![3, 5])).unwrap();
+    let scaled = b.binary(BinOp::Mul, x, w).unwrap();
+    let out = b.binary(BinOp::Sub, scaled, d).unwrap();
     let graph = b.finish(out).unwrap();
     let store = store(&[
         constant("w", &[3, 5], |i| 0.37 * i as f32 - 2.0),
@@ -220,10 +130,14 @@ fn mul_sub_fractional() -> Row {
 /// A carried running sum: `state' = state + x`, output `state'`. Every step reads the state the previous
 /// step committed, so a dropped commit or a stale read shows in the output.
 fn running_sum_state() -> Row {
-    let b = Builder::new();
-    let state = b.state_input("acc", TensorType::f32(vec![2, 4]), StateRole::Recurrent);
-    let x = b.slot_named(Slot::Activation, "x", TensorType::f32(vec![2, 4]));
-    let next = b.binary(BinOp::Add, state, x);
+    let b = Builder::for_tests();
+    let state = b
+        .state_input("acc", TensorType::f32(vec![2, 4]), StateRole::Recurrent)
+        .unwrap();
+    let x = b
+        .slot_named(Slot::Activation, "x", TensorType::f32(vec![2, 4]))
+        .unwrap();
+    let next = b.binary(BinOp::Add, state, x).unwrap();
     let graph: Graph = b
         .finish(Outputs::new(next).with_state(&[(state, next)]))
         .unwrap();
@@ -251,23 +165,6 @@ fn bank() -> Vec<Row> {
     ]
 }
 
-fn assert_matches(name: &str, step: usize, got: &HostTensor, want: &HostTensor, exact: bool) {
-    assert_eq!(got.dtype(), want.dtype(), "{name} step {step}: dtype");
-    assert_eq!(got.shape(), want.shape(), "{name} step {step}: shape");
-    let (got, want) = (got.to_f32().unwrap(), want.to_f32().unwrap());
-    for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
-        let ok = if exact {
-            g.to_bits() == w.to_bits()
-        } else {
-            (g - w).abs() <= 1e-5 * w.abs().max(1.0)
-        };
-        assert!(
-            ok && !g.is_nan(),
-            "{name} step {step} element {i}: the NPU computed {g}, the oracle {w}"
-        );
-    }
-}
-
 /// SC-001: the declared fixture bank, through the ordinary route onto the NPU, every step's output (which
 /// is the carried state for the running sum) against the shared CPU oracle, element by element.
 ///
@@ -293,10 +190,10 @@ fn the_fixture_bank_matches_the_oracle_on_the_npu() {
 
 /// `a + b` over two `[n]` constants.
 fn add_of(name: &'static str, n: usize) -> Row {
-    let b = Builder::new();
-    let x = b.constant("a", TensorType::f32(vec![n]));
-    let y = b.constant("b", TensorType::f32(vec![n]));
-    let out = b.binary(BinOp::Add, x, y);
+    let b = Builder::for_tests();
+    let x = b.constant("a", TensorType::f32(vec![n])).unwrap();
+    let y = b.constant("b", TensorType::f32(vec![n])).unwrap();
+    let out = b.binary(BinOp::Add, x, y).unwrap();
     let graph = b.finish(out).unwrap();
     let store = store(&[
         constant("a", &[n], |i| (i % 97) as f32),
@@ -313,32 +210,6 @@ fn add_of(name: &'static str, n: usize) -> Row {
     }
 }
 
-/// Compile `graph` for `target` the way every executor entry does, returning the error the planner raised.
-fn refusal_of(graph: Graph, target: poot_graph_plan::Target) -> poot_graph_plan::Refusal {
-    use poot_graph_plan::{
-        CompileError, CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement,
-        Partition, PlanError, StagedCompileError, Submission, TargetSet, compile_staged,
-    };
-    let Err(error) = compile_staged(
-        &graph,
-        &TargetSet::single(DeviceId(0), target),
-        &Partition {
-            experts: ExpertPlacement::AllResident,
-            devices: DevicePlacement::Single(DeviceId(0)),
-        },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
-    ) else {
-        panic!("the equation is admitted for the NPU");
-    };
-    match error {
-        StagedCompileError::Compile(CompileError::Plan(plan)) => match *plan {
-            PlanError::Refused(refusal) => *refusal,
-            other => panic!("expected a typed refusal, got {other:?}"),
-        },
-        other => panic!("expected a planner refusal, got {other:?}"),
-    }
-}
-
 /// The elements of each of an add's three bindings that fill the tile: 2688 four-byte elements, double
 /// buffered, three FIFOs, is 64512 bytes, 64 KiB less the core's 1 KiB stack. Measured on this device: 2688
 /// links and runs, 2689 is refused by `aiecc` ("Failed to allocate buffer ... Not all requested buffers fit
@@ -346,12 +217,12 @@ fn refusal_of(graph: Graph, target: poot_graph_plan::Target) -> poot_graph_plan:
 const FULL_TILE_ELEMENTS: usize = 2688;
 
 /// The device's `tile_local_bytes` is the measured limit: an add that exactly fills the tile runs and
-/// matches the oracle, and one element more per binding is refused as a typed tile-local limit before the
-/// toolchain runs (not as an `aiecc` allocation failure).
+/// matches the oracle, and one element more per binding is refused by `package` as a typed tile-local limit
+/// naming the equation, before the toolchain runs (not as an `aiecc` allocation failure).
 ///
-/// Mutation (engine): drop the `validate_recipe_tile_local` call in `Engine::aie_kernel`. The 2689-element
-/// add is linked and `aiecc` fails with "IRON (link) failed ... Failed to allocate buffer", and the last
-/// assertion goes red. Mutation (caps): `TILE_LOCAL_BYTES` of 65536; the first assertion fails.
+/// Mutation (limit): drop the `validate_recipe_tile_local` call in `validate_region_recipe`. The 2689-element
+/// add is admitted, linked, and `aiecc` fails with "Failed to allocate buffer"; the refusal assertion goes
+/// red. Mutation (caps): `TILE_LOCAL_BYTES` of 65536; the first assertion fails.
 #[test]
 fn the_declared_tile_memory_is_the_size_that_links_and_runs() {
     let Some(mut npu) = npu() else { return };
@@ -379,14 +250,16 @@ fn the_declared_tile_memory_is_the_size_that_links_and_runs() {
     );
 
     let over = add_of("over_tile_add", FULL_TILE_ELEMENTS + 1);
-    let error = poot_executor_parity::run_outputs(&mut npu.engine, target, &over.fixture)
-        .expect_err("one element past the tile does not link");
+    let refusal = refusal_of(over.fixture.graph, target);
     let reserved_over = 3 * (FULL_TILE_ELEMENTS + 1) * 4 * 2;
-    assert!(
-        error.contains(&format!(
-            "link recipe tile-local bytes: needed {reserved_over}, the target offers {reserved}"
-        )),
-        "{error}"
+    assert_eq!(
+        refusal.missing,
+        poot_graph_plan::Capability::AieLimit(poot_graph_plan::AieLimitRefusal::Exceeded {
+            resource: "link recipe tile-local bytes",
+            needed: reserved_over as u64,
+            available: u64::from(reserved),
+        }),
+        "{refusal:?}"
     );
 }
 
@@ -407,35 +280,35 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
     let f32s = |shape: &[usize]| TensorType::f32(shape.to_vec());
 
     let unary = {
-        let b = Builder::new();
-        let x = b.constant("x", f32s(&[2, 3]));
-        let out = b.unary(poot_graph_ir::UnOp::Neg, x);
+        let b = Builder::for_tests();
+        let x = b.constant("x", f32s(&[2, 3])).unwrap();
+        let out = b.unary(poot_graph_ir::UnOp::Sqrt, x).unwrap();
         b.finish(out).unwrap()
     };
     let max = {
-        let b = Builder::new();
-        let x = b.constant("x", f32s(&[2, 3]));
-        let y = b.constant("y", f32s(&[2, 3]));
-        let out = b.binary(BinOp::Max, x, y);
+        let b = Builder::for_tests();
+        let x = b.constant("x", f32s(&[2, 3])).unwrap();
+        let y = b.constant("y", f32s(&[2, 3])).unwrap();
+        let out = b.binary(BinOp::Max, x, y).unwrap();
         b.finish(out).unwrap()
     };
     let matmul = {
-        let b = Builder::new();
-        let x = b.constant("x", f32s(&[2, 3]));
-        let y = b.constant("y", f32s(&[3, 2]));
-        let out = b.matmul(x, y);
+        let b = Builder::for_tests();
+        let x = b.constant("x", f32s(&[2, 3])).unwrap();
+        let y = b.constant("y", f32s(&[3, 2])).unwrap();
+        let out = b.matmul(x, y).unwrap();
         b.finish(out).unwrap()
     };
     let reduce = {
-        let b = Builder::new();
-        let x = b.constant("x", f32s(&[2, 3]));
-        let out = b.reduce(RedOp::Sum, x, 1, false);
+        let b = Builder::for_tests();
+        let x = b.constant("x", f32s(&[2, 3])).unwrap();
+        let out = b.reduce(RedOp::Sum, x, 1, false).unwrap();
         b.finish(out).unwrap()
     };
     let collective = {
-        let b = Builder::new();
-        let x = b.constant("x", f32s(&[2, 3]));
-        let out = b.all_reduce(x, RedOp::Sum, 0);
+        let b = Builder::for_tests();
+        let x = b.constant("x", f32s(&[2, 3])).unwrap();
+        let out = b.all_reduce(x, RedOp::Sum, 0).unwrap();
         b.finish(out).unwrap()
     };
 
@@ -480,7 +353,7 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
 #[test]
 fn every_buffer_is_released_when_the_executable_is_unloaded() {
     use poot_executor::{Executor, NoSync, StepInputs};
-    use poot_graph_plan::Submission;
+    use poot_graph_plan::production_plan::Submission;
     use std::sync::Arc;
 
     let Some(mut npu) = npu() else { return };
@@ -561,7 +434,8 @@ struct LinkedAdd {
 
 fn linked_add(n: usize) -> LinkedAdd {
     use poot_codegen::{
-        AieLinkRecipe, KernelCache, Target, Toolchain, aie_kernel_handle, compile_aie,
+        KernelCache, Target, Toolchain, aie_kernel_handle, compile_aie,
+        test_support::single_tile_recipe,
     };
     use poot_kernelgen::{
         BodyLimits, ElementwiseSpec, Fold, KernelRequest, Layout, ValueBinary, ViewOperand,
@@ -589,7 +463,7 @@ fn linked_add(n: usize) -> LinkedAdd {
         max_instructions: std::num::NonZeroUsize::new(4096).unwrap(),
         max_locals: std::num::NonZeroUsize::new(256).unwrap(),
     };
-    let generated = poot_kernelgen::sequential_schedule(&request, &limits).unwrap();
+    let generated = poot_kernelgen::serialized_schedule(&request, &limits).unwrap();
     let bindings = generated
         .bindings
         .iter()
@@ -607,8 +481,8 @@ fn linked_add(n: usize) -> LinkedAdd {
     let dir = poot_test_util::unique_temp_path("npu-linked-add");
     std::fs::create_dir_all(&*dir).unwrap();
     let compiled = compile_aie(
-        &generated.body,
-        &AieLinkRecipe::sequential(&generated.body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&generated.body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &Toolchain::from_env(),
         &KernelCache::at(dir.join("cache"), Target::AieCore),
         std::num::NonZeroU64::new(1 << 24).unwrap(),
@@ -616,7 +490,7 @@ fn linked_add(n: usize) -> LinkedAdd {
     .unwrap_or_else(|e| panic!("the real Peano and IRON toolchain links the add: {e}"));
     let words = std::num::NonZeroU32::new((compiled.artifact.instructions().len() / 4) as u32)
         .expect("a linked artifact has an instruction stream");
-    let kernel = aie_kernel_handle(&generated.body, compiled.artifact).unwrap();
+    let kernel = aie_kernel_handle(compiled.artifact);
     LinkedAdd { kernel, words }
 }
 
@@ -633,9 +507,10 @@ fn f32_bytes(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
 /// recorded, runs, and the device fails or computes over the wrong length instead of returning `Bindings`.
 #[test]
 fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
-    use poot_executor::{AieInvocation, Arg, BufferRole, Dispatch, LaunchKind};
-    use poot_graph_plan::Submission;
+    use poot_executor::{AieInvocation, Arg, Dispatch, LaunchKind};
+    use poot_graph_plan::production_plan::Submission;
     use poot_npu::XdnaError;
+    use poot_runtime_common::BufferRole;
     use poot_target::{AieTargetId, BufferStorage};
 
     const N: usize = 6;
@@ -691,6 +566,14 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
     assert!(matches!(
         try_dispatch(&mut device, grid, &inputs, arg(&out, N as u32)),
         Err(XdnaError::GridLaunch { threads: [6, 1, 1] })
+    ));
+    let graph = LaunchKind::VpuGraph(poot_executor::VpuInvocation::new(
+        poot_target::VpuTargetId::Npu4,
+        0,
+    ));
+    assert!(matches!(
+        try_dispatch(&mut device, graph, &inputs, arg(&out, N as u32)),
+        Err(XdnaError::GraphLaunch)
     ));
     let other_stream = LaunchKind::Aie(AieInvocation::new(
         AieTargetId::Xdna2,
@@ -766,6 +649,54 @@ fn a_byte_artifact_kernel_is_refused_at_load() {
     assert!(device.memory().is_empty(), "nothing was allocated");
 }
 
+/// SC-002, load side, the region ABI: a dispatch ends with its written `output`, so an artifact whose last
+/// binding is read-only has no tensor to pass there and is refused by the device before XRT is touched, a
+/// typed [`XdnaError::LastBindingRead`] naming the kernel. The artifact here is synthetic (an `xclbin2` magic
+/// and one instruction word): the refusal is raised before the device reads either.
+///
+/// Mutation: delete the last-binding check in `XdnaDevice::load_artifact`. The load reaches XRT, which
+/// rejects the synthetic xclbin as an `Xrt` error, and the match below goes red.
+#[test]
+fn an_artifact_whose_last_binding_is_read_only_is_refused_at_load() {
+    use poot_npu::XdnaError;
+    use poot_runtime_common::{AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess};
+    use poot_target::{AieTargetId, BufferStorage};
+
+    let Some((_lock, mut device)) = device(XdnaConfig::default()) else {
+        return;
+    };
+    let binding = |i, access| AieBinding::new(i, BufferStorage::f32(), access, &[4], 4).unwrap();
+    let abi = AieShapeAbi::new(vec![
+        binding(0, ArgAccess::Write),
+        binding(1, ArgAccess::Read),
+    ])
+    .unwrap();
+    let artifact = AieLinkedArtifact::new(
+        b"xclbin2\0synthetic".to_vec(),
+        b"IIII".to_vec(),
+        "MLIR_AIE",
+        abi,
+        AieTargetId::Xdna2,
+        "synthetic toolchain",
+        0,
+    )
+    .unwrap();
+    let error = device
+        .load_kernel("read_last", poot_codegen::aie_kernel_handle(artifact))
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(&error, XdnaError::LastBindingRead { key } if key == "read_last"),
+        "{error:?}"
+    );
+    assert_eq!(
+        device.kernels_loaded(),
+        0,
+        "nothing reached a hardware context"
+    );
+    assert!(device.memory().is_empty(), "nothing was allocated");
+}
+
 /// Failure lifetime: a run that does not complete within the device's deadline is a typed `Xrt` error, the
 /// device is poisoned (every later call is `Poisoned`, none touches XRT), and the buffers the run named stay
 /// allocated and charged: nothing the hardware may still write is freed under it.
@@ -773,13 +704,14 @@ fn a_byte_artifact_kernel_is_refused_at_load() {
 /// The deadline is one microsecond, which the NPU cannot meet; the run completes harmlessly after the
 /// host stopped waiting.
 ///
-/// Mutation: in `XdnaDevice::run` drop the `self.poisoned = true` assignment. The replay after the timeout
+/// Mutation: in `XdnaDevice::run` drop the `self.poisoned = true` assignment (or the arenas' quarantine). The replay after the timeout
 /// is attempted again instead of returning `Poisoned`.
 #[test]
 fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
-    use poot_executor::{AieInvocation, Arg, BufferRole, Dispatch, LaunchKind};
-    use poot_graph_plan::Submission;
+    use poot_executor::{AieInvocation, Arg, Dispatch, LaunchKind};
+    use poot_graph_plan::production_plan::Submission;
     use poot_npu::XdnaError;
+    use poot_runtime_common::BufferRole;
     use poot_target::{AieTargetId, BufferStorage};
 
     const N: usize = 6;
@@ -848,9 +780,11 @@ fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
     drop((inputs, recording));
     drop((a, b, out));
     let live: u64 = device.memory().iter().map(|(_, c)| c.live_bytes).sum();
+    // The three tensors, and the two arenas the run gathered them into: the two reads share one, the
+    // written output has the other.
     assert_eq!(
         live,
-        (3 * N * 4) as u64,
-        "the failed run's three buffers stay charged after every handle to them dropped"
+        (3 * N * 4 + 3 * N * 4) as u64,
+        "the failed run's three buffers and two arenas stay charged after every handle to them dropped"
     );
 }

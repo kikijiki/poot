@@ -35,6 +35,13 @@ impl<'a> Emitter<'a> {
                  (no AIE-core equivalent)"
                     .into(),
             )),
+            // The Intel matrix engine (DPAS) is reached through `SPV_INTEL_subgroup_matrix_multiply_accumulate`,
+            // which no lowering here emits yet.
+            (Target::SpirvOpenCl, _) => Err(EmitError::Unsupported(
+                "WMMA/cooperative-matrix tensor-core ops on SpirvOpenCl: the Intel DPAS lowering \
+                 (SPV_INTEL_subgroup_matrix_multiply_accumulate) is not implemented"
+                    .into(),
+            )),
         }
     }
 
@@ -171,9 +178,10 @@ impl<'a> Emitter<'a> {
                 FragmentRole::Matrix(WmmaMat::B) => self.coopmat_ty("half", 1),
                 FragmentRole::Accumulator => self.coopmat_ty("float", 2),
             }),
-            Target::AieCore => Err(EmitError::Unsupported(
-                "matrix fragments have no AIE-core representation".into(),
-            )),
+            Target::AieCore | Target::SpirvOpenCl => Err(EmitError::Unsupported(format!(
+                "matrix fragments have no {:?} representation",
+                self.target
+            ))),
         }
     }
 

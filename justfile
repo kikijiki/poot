@@ -50,7 +50,7 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: dead-pub machete docs-paths diagrams-check aie-link-driver crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
+test-model-free: dead-pub machete docs-paths diagrams-check aie-link-driver npu-build vpu-build crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
@@ -113,6 +113,26 @@ dead-pub:
 # the AIE link driver's recipe refusals (POOT-1118); stdlib only, so it needs no NPU toolchain
 aie-link-driver:
     python3 scripts/poot-aie-link.py --self-test
+
+# Build and lint poot-npu with its `xdna` feature (XRT shim, device, device rows) against the current workspace APIs.
+# The default build compiles the crate to its documentation only, so without this recipe the device code can rot
+# unseen (it did, 2026-10-12 to 2026-10-17, POOT-1158). The feature needs `nix develop .#npu`; where that shell
+# cannot be entered the recipe says so and builds nothing. It builds only: the device rows run in `test-device-npu`.
+npu-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! nix develop .#npu -c true >/dev/null 2>&1; then
+        echo "npu-build: nix develop .#npu is unavailable here; poot-npu --features xdna NOT built" >&2
+        exit 0
+    fi
+    nix develop .#npu -c cargo clippy -p poot-npu --features xdna --all-targets -- -D warnings
+
+# Build and lint poot-npu with its `vpu` feature (the Intel NPU device over Level Zero, the blob cache, the device
+# rows) against the current workspace APIs. The Level Zero loader, the NPU driver and its compiler are `dlopen`ed,
+# so this builds in the default shell; only running the rows needs `nix develop .#npu-intel`. It builds only: the
+# rows run in `test-device-vpu`.
+vpu-build:
+    cargo clippy -p poot-npu --features vpu --all-targets -- -D warnings
 
 # fail when a crate source or manifest cites a deleted API (Runner, GpuExecutor, run_resident_kv, run_prefill, POOT_SPEC_*)
 # as if it still existed; a comment block that says the name is gone is history and passes
@@ -250,6 +270,28 @@ test-device-npu:
     nix develop .#npu -c scripts/with-required-backend.sh POOT_REQUIRE_NPU \
         {{nextest}} --profile device-npu -p poot-npu --features xdna --test-threads=1 -E '{{npu_selection}}'
     scripts/check-required-cases.py npu
+
+# Intel NPU lane (POOT-1164): every poot-npu `vpu` row on the Lunar Lake laptop's NPU, through the real compile ->
+# Engine -> vendor graph compiler -> Level Zero route, plus the blob cache and the device's own contract. It runs
+# in `nix develop .#npu-intel` (the Level Zero loader, the NPU driver and its compiler on LD_LIBRARY_PATH). Each
+# row takes `/tmp/poot-vpu.lock` itself, so the recipe does not. POOT_REQUIRE_INTEL_NPU=1 is set by the backend
+# wrapper: an absent device or driver stack fails the lane, it never skips; the required-case gate then checks
+# every row ran.
+test-device-vpu:
+    scripts/check-required-cases.py --self-test
+    nix develop .#npu-intel -c scripts/with-required-backend.sh POOT_REQUIRE_INTEL_NPU \
+        {{nextest}} --profile device-vpu -p poot-npu --features vpu --test-threads=1 -E '{{npu_selection}}'
+    scripts/check-required-cases.py vpu
+
+# Level Zero device rows (POOT-1163, POOT-1164) through poot-l0-runtime: the generated `add` kernel, compiled to
+# OpenCL SPIR-V, on the Intel GPU against the CPU oracle, and the Intel NPU's graph extension (IR compiled by the
+# driver's graph compiler, blob reload, recordings). It runs in `nix develop .#npu-intel` (the Level Zero loader,
+# compute runtime, IGC, gmmlib and the NPU driver stack on LD_LIBRARY_PATH) on the Lunar Lake laptop. The rows are
+# `#[ignore]`d, so they are run by test binary; no device means the context open fails and the recipe fails.
+test-device-l0:
+    nix develop .#npu-intel -c cargo nextest run --profile device-l0 -p poot-l0-runtime --run-ignored only \
+        -E 'binary_id(=poot-l0-runtime::add) | binary_id(=poot-l0-runtime::npu_graph)'
+    scripts/check-required-cases.py l0
 
 # The poot-llm tests that exist only under `--features rocm`. Nothing else builds the feature,
 # so without this recipe those tests never compile. It reports how many test binaries the feature turns from

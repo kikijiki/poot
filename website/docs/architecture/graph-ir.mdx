@@ -95,7 +95,9 @@ value of identical type. The executor feeds the buffer in and overwrites it with
 The `OpKind` vocabulary. Tracers emit the primitives (elementwise, reduce, movement, matmul,
 gather/scatter, quantization). The optimizer introduces the composite ops (`Fused`, `FusedRow`,
 `ContractionEpilogue`, `Attention`, `Rope`, and the packed/dense contraction ops), each with the
-same semantics as the primitive chain it replaces; a tracer cannot emit them. No op records a
+same semantics as the primitive chain it replaces; a tracer cannot emit them, with three exceptions that
+state a recurrence or a selection rather than a schedule: `Scan`, `BlockTopK` and `SelectedAttention` are
+emitted by tracers as source composites, each with a primitive definition the CPU oracle evaluates. No op records a
 kernel choice: which kernel runs an eqn (a tiled GEMM, the attention kernel, an imported kernel)
 is a property of its plan.
 

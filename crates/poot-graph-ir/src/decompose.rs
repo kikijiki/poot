@@ -130,6 +130,29 @@ pub fn decompose(
             let last = shape.len() - 1;
             ops::rope_partial(&b, x, cos, sin, shape[last], *rot, last)?
         }
+        OpKind::SelectedAttention(attrs) => {
+            let &[q, k, v, ids, pos] = inputs.as_slice() else {
+                return Ok(None);
+            };
+            ops::selected_attention(
+                &b,
+                q,
+                k,
+                v,
+                ids,
+                pos,
+                attrs.n_rep,
+                attrs.scale,
+                attrs.softcap,
+                attrs.ratio,
+            )?
+        }
+        OpKind::BlockTopK(attrs) => {
+            let &[scores, pos] = inputs.as_slice() else {
+                return Ok(None);
+            };
+            ops::block_top_k_packed(&b, scores, pos, attrs.ratio, attrs.k)?
+        }
         OpKind::Scan(attrs) => {
             // The definition unrolls one chunk body per chunk; the CPU oracle never evaluates it whole but one
             // chunk window at a time (`poot_eval`), so the sequence length has no ceiling there.
@@ -484,6 +507,8 @@ mod tests {
             OpKind::Attention(_) => 28,
             OpKind::Rope { .. } => 29,
             OpKind::Scan(_) => 34,
+            OpKind::BlockTopK(_) => 36,
+            OpKind::SelectedAttention(_) => 37,
             OpKind::GroupedDenseContraction { .. } => 35,
             OpKind::AllReduce { .. } => 30,
             OpKind::AllGather { .. } => 31,
@@ -492,7 +517,7 @@ mod tests {
         }
     }
 
-    const VARIANTS: usize = 36;
+    const VARIANTS: usize = 38;
 
     /// The epilogue region `(head + bias) + residual`: local 0 the head result, 1 the bias, 2 the residual.
     fn bias_residual_region() -> FusedRegion {
@@ -779,6 +804,26 @@ mod tests {
                     f32(&[1, 2, 1, 1]),
                     f32(&[1, 2, 5, 3]),
                 ],
+            ),
+            (
+                OpKind::SelectedAttention(crate::op::SelectedAttentionAttrs {
+                    n_rep: 2,
+                    scale: 0.5,
+                    softcap: None,
+                    ratio: 2,
+                    k: 2,
+                }),
+                vec![
+                    f32(&[2, 4, 1, 8]),
+                    f32(&[2, 2, 6, 8]),
+                    f32(&[2, 2, 6, 8]),
+                    typed(&[2, 1, 1, 2], i32),
+                    typed(&[2, 1], i32),
+                ],
+            ),
+            (
+                OpKind::BlockTopK(crate::op::BlockTopKAttrs { ratio: 2, k: 3 }),
+                vec![f32(&[2, 1, 3, 6]), typed(&[2, 3], i32)],
             ),
             (
                 OpKind::AllReduce {

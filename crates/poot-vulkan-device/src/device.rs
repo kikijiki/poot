@@ -166,12 +166,18 @@ impl Device for VulkanDevice {
     }
 
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), VulkanGpuError> {
-        // A thread-grid device: an AIE invocation has no grid to run, and its kernel was never loadable here.
+        // A thread-grid device: an AIE or NPU invocation has no grid to run, and its kernel was never loadable here.
         let (threads, workgroup) = match d.launch {
             LaunchKind::Grid { threads, workgroup } => (threads, workgroup),
             LaunchKind::Aie(invocation) => {
                 return Err(RuntimeError::WrongKernelTarget {
                     actual: TargetId::Aie(invocation.target()),
+                }
+                .into());
+            }
+            LaunchKind::VpuGraph(invocation) => {
+                return Err(RuntimeError::WrongKernelTarget {
+                    actual: TargetId::Vpu(invocation.target()),
                 }
                 .into());
             }

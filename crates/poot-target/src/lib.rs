@@ -19,8 +19,10 @@
 pub mod aie;
 pub mod dram_channels;
 pub mod storage;
+pub mod vpu;
 pub use aie::{AieCaps, AieIsa, AiePlatform, AieTargetId};
 pub use storage::{BufferStorage, ElementKind, LogicalDType, StorageLayout};
+pub use vpu::{VendorCompilerId, VpuArithmetic, VpuCaps, VpuTargetId};
 
 /// The GPU lowering backend. Most of `plan_eqn` is backend-neutral; the NVPTX-only kernels (tensor-core
 /// gemm, spec 025) are gated on this so the SPIR-V/wgpu path keeps the portable kernel.
@@ -44,7 +46,7 @@ pub enum Backend {
     AmdGcn(AmdArch),
 }
 
-/// What a kernel, a plan or a refusal is for, by identity: a GPU lowering backend or an AIE target. The
+/// What a kernel, a plan or a refusal is for, by identity: a GPU lowering backend, an AIE target or a VPU target. The
 /// capability descriptor that goes with it is the compiler's `Target`; this is the tag without the limits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetId {
@@ -53,6 +55,9 @@ pub enum TargetId {
     /// An AMD XDNA NPU: one core runs a sequential loop and a typed link recipe moves the data (POOT-664).
     /// Its limits are [`AieCaps`], not [`DeviceCaps`].
     Aie(AieTargetId),
+    /// An Intel NPU: the vendor graph compiler compiles the OpenVINO graph poot emits (POOT-1159). Its
+    /// capabilities are [`VpuCaps`], not [`DeviceCaps`].
+    Vpu(VpuTargetId),
 }
 
 impl TargetId {
@@ -63,7 +68,7 @@ impl TargetId {
             TargetId::Gpu(Backend::Nvptx) => Some("nvptx".to_string()),
             TargetId::Gpu(Backend::SpirvVulkan) => Some("spirv-vulkan".to_string()),
             TargetId::Gpu(Backend::AmdGcn(arch)) => Some(format!("amdgcn-{}", arch.mcpu())),
-            TargetId::Aie(_) => None,
+            TargetId::Aie(_) | TargetId::Vpu(_) => None,
         }
     }
 }
@@ -77,6 +82,12 @@ impl From<Backend> for TargetId {
 impl From<AieTargetId> for TargetId {
     fn from(target: AieTargetId) -> Self {
         TargetId::Aie(target)
+    }
+}
+
+impl From<VpuTargetId> for TargetId {
+    fn from(target: VpuTargetId) -> Self {
+        TargetId::Vpu(target)
     }
 }
 
@@ -522,6 +533,20 @@ mod tests {
             Some("spirv-vulkan".to_string())
         );
         assert_eq!(TargetId::from(AieTargetId::Xdna2).calibration_label(), None);
+    }
+
+    /// A VPU target has no calibration label and its canonical text is the cache-key spelling of its
+    /// platform; an F16 part computes in F16. Mutation: change the platform name; the text differs.
+    #[test]
+    fn a_vpu_target_names_its_platform_and_arithmetic() {
+        let target = TargetId::from(VpuTargetId::Npu4);
+        assert_eq!(target.calibration_label(), None);
+        assert_eq!(VpuTargetId::Npu4.canonical(), "vpu:platform=NPU4000");
+        assert_eq!(VpuTargetId::Npu4.arithmetic(), VpuArithmetic::F16);
+        assert_eq!(
+            VendorCompilerId { major: 7, minor: 5 }.canonical(),
+            "vcl=7.5"
+        );
     }
 
     #[test]

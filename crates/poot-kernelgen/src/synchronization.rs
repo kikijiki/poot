@@ -127,6 +127,35 @@ mod tests {
     use super::*;
     use crate::unit_helpers::{ctx, ptx, spirv_word_count, spv, which};
 
+    /// The LDS atomic orders at the workgroup, never the device: only the workgroup's threads reach LDS, and a
+    /// device-scope `atomicrmw` on addrspace(3) asks the hardware for ordering nobody can observe. The
+    /// global-memory atomic on the same target keeps its own (device or default) scope. Checked on the emitted
+    /// LLVM IR per target. Mutation: have `WorkgroupLocalAtomic` call `atomic_syncscope` instead of
+    /// `workgroup_atomic_syncscope`; the SPIR-V rows turn red.
+    #[test]
+    fn workgroup_local_atomic_is_ordered_at_workgroup_scope() {
+        let body = workgroup_atomic_add_smoke("wgatom_scope");
+        let lds_atomic = |target: Target| {
+            let ir = poot_codegen::emit_llvm_ir(&body, target).unwrap();
+            ir.lines()
+                .find(|line| line.contains("atomicrmw") && line.contains("addrspace(3)"))
+                .unwrap_or_else(|| panic!("no LDS atomicrmw in:\n{ir}"))
+                .to_string()
+        };
+        for (target, scope) in [
+            (Target::SpirvVulkan, "workgroup"),
+            (Target::SpirvOpenCl, "workgroup"),
+            (Target::Nvptx, "block"),
+            (Target::AmdGcn(poot_target::AmdArch::gfx1151()), "workgroup"),
+        ] {
+            let line = lds_atomic(target);
+            assert!(
+                line.contains(&format!("syncscope(\"{scope}\")")),
+                "{target:?}: expected syncscope(\"{scope}\") in {line}"
+            );
+        }
+    }
+
     #[test]
     fn workgroup_local_atomic_compiles_to_both_backends() {
         // LDS-scoped sibling of the global atomic counter (in-tile reductions): must emit valid SPIR-V

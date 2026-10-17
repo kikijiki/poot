@@ -1935,6 +1935,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "poot-l0-runtime"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "libc",
+ "poot-codegen",
+ "poot-kernel-ir",
+ "poot-l0-runtime",
+ "poot-quant",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "poot-llm"
 version = "0.0.0"
 dependencies = [
@@ -2021,6 +2035,7 @@ dependencies = [
 name = "poot-npu"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "cc",
  "poot-codegen",
  "poot-eval",
@@ -2030,6 +2045,8 @@ dependencies = [
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",
+ "poot-l0-runtime",
+ "poot-npu",
  "poot-quant",
  "poot-runtime-common",
  "poot-target",

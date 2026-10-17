@@ -13,7 +13,7 @@ these tables.
 This page answers "does X work on backend Y?". The model and weight-format tables are generated from what the
 planner says; the other tables are written by hand.
 
-The AMD XDNA2 NPU is not a column here: it runs only F32 `add`, `sub` and `mul` programs (see
+The AMD XDNA2 and Intel NPU4 NPUs are not columns here: XDNA2 runs only F32 `add`, `sub` and `mul` programs and Intel only a short list of F16 ops (see
 [NPU offload](../architecture/npu.mdx)).
 
 For lower-level kernel/dispatch capability (elementwise, GEMV, flash attention, capture/replay, ...), see
@@ -243,7 +243,7 @@ driver.
 - **Anything else (Intel iGPU/dGPU, other Vulkan-capable hardware):** wgpu is the supported choice. Raw Vulkan
   runs there in principle but is verified on AMD (RADV) only. Pick either through the `poot-llm` API
   or the `poot-serve` `--backend` option.
-- **NPU:** AMD XDNA2 only, experimental: F32 `add`, `sub` and `mul` programs, no model. See
+- **NPU:** AMD XDNA2 (F32 `add`, `sub`, `mul`) and Intel NPU4 (a short list of F16 ops), experimental, no model. See
   [Architecture: NPU Offload](../architecture/npu.mdx).
 
 See [Picking a backend](../serve/choosing-a-backend.md) for the decision walkthrough.

@@ -22,7 +22,7 @@ pub use coordinator::{
 };
 pub use device::{
     AieInvocation, Arg, Collectives, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind,
-    MeasuredDeviceTime, NativeCounters, SupportBound, WeightUpload, write_slice,
+    MeasuredDeviceTime, NativeCounters, SupportBound, VpuInvocation, WeightUpload, write_slice,
 };
 pub use engine::Engine;
 pub use error::{BindError, DeviceError, ExecError, LoadError};

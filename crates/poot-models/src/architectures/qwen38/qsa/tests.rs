@@ -1,7 +1,7 @@
 //! The incremental block-key cache against a full re-pool of the raw keys (POOT-1143 stage 1).
 //!
 //! Both graphs share the query, the scoring, the eligibility and the budgeted rank
-//! ([`query`], [`selection_mask`]); they differ only in how the block keys are made. The reference
+//! ([`query`], [`select_blocks`]); they differ only in how the block keys are made. The reference
 //! carries every raw key and pools the whole capacity each step (the indexer before the cache); the
 //! cache carries block keys and the unfinished block's raw keys. On the CPU oracle the keys are the same
 //! ops over the same inputs, so the masks (hence every query's selected set, ties included) and every
@@ -16,6 +16,7 @@ use crate::components::attention::carried_cache;
 use crate::components::norm::NormKind;
 use crate::components::standard::oracle::{Fx, random};
 use crate::model::{KvLayout, LogitRows, StepShape};
+use poot_tensor::DType;
 
 /// The indexer's shape under test.
 #[derive(Clone, Copy, Debug)]
@@ -139,9 +140,121 @@ fn repooled_keys(
     repool(b, keys, w, d, cap)
 }
 
+/// The additive penalty of a position the selection drops.
+const DROPPED: f32 = -1e30;
+
+/// `(indicator - 1) * 1e30`: zero where the `{0, 1}` indicator is one, [`DROPPED`] where it is zero.
+fn penalty(b: &Builder, indicator: Traced) -> Result<Traced, TraceError> {
+    Ok(b.binary_scalar(
+        BinOp::Mul,
+        b.binary_scalar(BinOp::Sub, indicator, Scalar::F32(1.0))?,
+        Scalar::F32(-DROPPED),
+    )?)
+}
+
+/// Spread a per-block value `[rows, 1, tokens, blocks]` over the `ratio` positions of each block.
+fn per_position(b: &Builder, blocks: Traced, ratio: usize) -> Result<Traced, TraceError> {
+    let shape = b.aval(blocks)?.shape;
+    let [rows, one, t, nb] = shape[..] else {
+        panic!("per_position takes [rows, 1, tokens, blocks]");
+    };
+    let wide = b.broadcast(
+        b.reshape(blocks, vec![rows, one, t, nb, 1])?,
+        vec![rows, one, t, nb, ratio],
+    )?;
+    Ok(b.reshape(wide, vec![rows, one, t, nb * ratio])?)
+}
+
+/// `causal` plus [`DROPPED`] on every position outside `selected` (the penalty of each block the query keeps,
+/// `[rows, 1, tokens, blocks]`) and outside the query's own unfinished block, which is always visible: the
+/// dense mask the stage-1 attention read, kept as the reference for the ids the attention now reads.
+fn with_tail(
+    b: &Builder,
+    step: &Step,
+    selected: Traced,
+    causal: Traced,
+    p: &QsaParams,
+) -> Result<Traced, TraceError> {
+    let shape = step.shape();
+    let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
+    let (ratio, nb) = (p.ratio, cap / p.ratio);
+    let wide = vec![rows, 1, t, nb];
+    let pos = b.broadcast(
+        b.reshape(b.cast(step.pos(), DType::F32)?, vec![rows, 1, t, 1])?,
+        wide.clone(),
+    )?;
+    let first = b.broadcast(
+        b.reshape(
+            b.binary_scalar(BinOp::Mul, b.iota(nb)?, Scalar::F32(ratio as f32))?,
+            vec![1, 1, 1, nb],
+        )?,
+        wide,
+    )?;
+    let last = b.binary_scalar(BinOp::Add, first, Scalar::F32((ratio - 1) as f32))?;
+    let complete = b.binary(BinOp::Ge, pos, last)?;
+    let started = b.binary(BinOp::Ge, pos, first)?;
+    let tail = penalty(b, b.binary(BinOp::Sub, started, complete)?)?;
+    let selection = b.binary(
+        BinOp::Max,
+        per_position(b, selected, ratio)?,
+        per_position(b, tail, ratio)?,
+    )?;
+    Ok(b.binary(BinOp::Add, selection, causal)?)
+}
+
+/// The op's selection as the dense mask: the keep indicator of the best blocks, then [`with_tail`].
+fn op_selection_mask(
+    b: &Builder,
+    step: &Step,
+    q: Traced,
+    block_k: Traced,
+    causal: Traced,
+    p: &QsaParams,
+) -> Result<Traced, TraceError> {
+    let kept = select_blocks(b, step, q, block_k, p)?.keep;
+    with_tail(b, step, penalty(b, b.cast(kept, DType::F32)?)?, causal, p)
+}
+
+/// The selection as it was before `OpKind::BlockTopK` (stage 1's chain), kept as the oracle for exact set
+/// equality: eligibility as an additive penalty, a pairwise stable rank of the penalised scores, the keep mask
+/// of the budget, and eligibility again, because a budget above the eligible count fills with ineligible
+/// blocks.
+fn legacy_selection_mask(
+    b: &Builder,
+    step: &Step,
+    q: Traced,
+    block_k: Traced,
+    causal: Traced,
+    p: &QsaParams,
+) -> Result<Traced, TraceError> {
+    let shape = step.shape();
+    let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
+    let (ratio, nb) = (p.ratio, cap / p.ratio);
+    let scores = block_scores(b, q, block_k, p.dim)?;
+    let wide = vec![rows, 1, t, nb];
+    let pos = b.broadcast(
+        b.reshape(b.cast(step.pos(), DType::F32)?, vec![rows, 1, t, 1])?,
+        wide.clone(),
+    )?;
+    let first = b.broadcast(
+        b.reshape(
+            b.binary_scalar(BinOp::Mul, b.iota(nb)?, Scalar::F32(ratio as f32))?,
+            vec![1, 1, 1, nb],
+        )?,
+        wide,
+    )?;
+    let last = b.binary_scalar(BinOp::Add, first, Scalar::F32((ratio - 1) as f32))?;
+    let eligible = penalty(b, b.binary(BinOp::Ge, pos, last)?)?;
+    let rank = ops::stable_descending_rank(b, b.binary(BinOp::Add, scores, eligible)?)?;
+    let kept = penalty(b, ops::top_k_keep_mask(b, rank, p.block_topk())?)?;
+    with_tail(b, step, b.binary(BinOp::Add, eligible, kept)?, causal, p)
+}
+
 /// What a traced step outputs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Output {
+    /// The cache's mask through the legacy selection chain ([`legacy_selection_mask`]), nothing else.
+    LegacyMask,
     /// The cache's mask `[rows * tokens * capacity]` (its block keys are its carried state).
     CachedMask,
     /// The reference's mask followed by its re-pooled block keys.
@@ -169,9 +282,21 @@ fn trace(fx: &Fx, d: Dims, s: StepShape, output: Output) -> Graph {
     let flat = |v: Traced, len: usize| b.reshape(v, vec![len]).unwrap();
     let out = match output {
         Output::CachedMask => flat(
-            qsa_mask(&b, &step, 0, x, causal, &w, &p).unwrap(),
+            {
+                let q = query(&b, &step, x, &w, &p).unwrap();
+                let keys = block_keys(&b, &step, 0, x, &w, &p).unwrap();
+                op_selection_mask(&b, &step, q, keys, causal, &p).unwrap()
+            },
             rows * t * cap,
         ),
+        Output::LegacyMask => {
+            let q = query(&b, &step, x, &w, &p).unwrap();
+            let keys = block_keys(&b, &step, 0, x, &w, &p).unwrap();
+            flat(
+                legacy_selection_mask(&b, &step, q, keys, causal, &p).unwrap(),
+                rows * t * cap,
+            )
+        }
         Output::CachedKeys => flat(
             block_keys(&b, &step, 0, x, &w, &p).unwrap(),
             rows * nb * d.dim,
@@ -183,7 +308,7 @@ fn trace(fx: &Fx, d: Dims, s: StepShape, output: Output) -> Graph {
         Output::ReferenceMask => {
             let q = query(&b, &step, x, &w, &p).unwrap();
             let keys = repooled_keys(&b, &step, x, &w, d).unwrap();
-            let mask = selection_mask(&b, &step, q, keys, causal, &p).unwrap();
+            let mask = op_selection_mask(&b, &step, q, keys, causal, &p).unwrap();
             b.concat(
                 0,
                 &[flat(mask, rows * t * cap), flat(keys, rows * nb * d.dim)],
@@ -227,7 +352,7 @@ fn assert_bitwise(label: &str, what: impl Fn(usize) -> String, got: &[f32], want
         assert_eq!(
             g.to_bits(),
             w.to_bits(),
-            "{label}: {}: got {g}, re-pooled {w}",
+            "{label}: {}: got {g}, reference {w}",
             what(i)
         );
     }
@@ -291,6 +416,89 @@ fn assert_plan_matches(label: &str, d: Dims, rows: usize, cap: usize, plan: &[Ch
         cache_state = Some(next_cache);
         ref_state = Some(next_ref);
     }
+}
+
+/// Run `plan` through the op's selection and the legacy chain's over the same carried block keys, and compare
+/// every step's mask word for word: the exact top-k set equality of stage 2 on the oracle.
+fn assert_legacy_selection_matches(label: &str, d: Dims, rows: usize, cap: usize, plan: &[Chunk]) {
+    let fx = d.fixture();
+    let inputs: Vec<Vec<f32>> = (0..rows)
+        .map(|r| random(cap * d.width, 300 + r as u64))
+        .collect();
+    let (mut new_state, mut old_state) = (None, None);
+    for (n, Chunk { t, starts }) in plan.iter().enumerate() {
+        let s = shape(rows, *t, cap);
+        let (new, old) = (
+            trace(&fx, d, s, Output::CachedMask),
+            trace(&fx, d, s, Output::LegacyMask),
+        );
+        let new_in = new_state.take().unwrap_or_else(|| zero_state(&new));
+        let old_in = old_state.take().unwrap_or_else(|| zero_state(&old));
+        let x: Vec<f32> = (0..rows)
+            .flat_map(|r| inputs[r][starts[r] * d.width..(starts[r] + t) * d.width].to_vec())
+            .collect();
+        let pos: Vec<i32> = (0..rows)
+            .flat_map(|r| (starts[r]..starts[r] + t).map(|p| p as i32))
+            .collect();
+        let causal = causal_rows(&pos, cap);
+        let tokens = vec![0i32; rows * t];
+        let consts: [(&str, &[f32]); 2] = [("x", &x), ("causal", &causal)];
+        let slots: [(Slot, &[i32]); 2] = [(Slot::Token, &tokens), (Slot::Pos, &pos)];
+        let (mask, next_new) = fx.eval(&new, &consts, &slots, &views(&new_in));
+        let (want, next_old) = fx.eval(&old, &consts, &slots, &views(&old_in));
+        assert_bitwise(
+            &format!("{label}, step {n}"),
+            |i| {
+                format!(
+                    "mask element {i} (row {}, query {}, position {})",
+                    i / (t * cap),
+                    i / cap % t,
+                    i % cap
+                )
+            },
+            &mask,
+            &want,
+        );
+        new_state = Some(next_new);
+        old_state = Some(next_old);
+    }
+}
+
+/// SC-1143-9, the selection stage end to end on the oracle (design section 5, tier 3): the op's masks equal the
+/// legacy rank chain's at every query of whole, chunked, token-at-a-time and two-row plans, over scores that
+/// cross the budget (a query with three complete blocks drops one). Mutations: see
+/// `block_top_k::tests` (tie placement, eligibility, NaN canonicalization); here, the budget one short
+/// (`k: p.block_topk() - 1`) goes red at the first query past the budget.
+#[test]
+fn the_op_selects_what_the_legacy_rank_chain_selected() {
+    let cap = 32;
+    assert_legacy_selection_matches("whole prompt", SMALL, 1, cap, &[chunk(32, &[0])]);
+    assert_legacy_selection_matches(
+        "chunks",
+        SMALL,
+        1,
+        cap,
+        &[
+            chunk(5, &[0]),
+            chunk(3, &[5]),
+            chunk(8, &[8]),
+            chunk(16, &[16]),
+        ],
+    );
+    assert_legacy_selection_matches(
+        "token at a time",
+        SMALL,
+        1,
+        cap,
+        &(0..cap).map(|p| chunk(1, &[p])).collect::<Vec<_>>(),
+    );
+    assert_legacy_selection_matches(
+        "two rows",
+        SMALL,
+        2,
+        cap,
+        &[chunk(9, &[0, 0]), chunk(7, &[9, 4]), chunk(16, &[16, 11])],
+    );
 }
 
 /// SC-1143-1 (block keys) and SC-1143-3 (selection, per layer): one whole prompt, aligned chunks, a
@@ -457,6 +665,14 @@ fn assert_depth_matches(label: &str, cap: usize, depth: usize, t: usize, selecti
         } else {
             assert_eq!(kept, depth + 1, "{label}: under the budget all is kept");
         }
+        let legacy = trace(&fx, d, s, Output::LegacyMask);
+        let (legacy_mask, _) = fx.eval(&legacy, &consts, &slots, &views(&cache_in));
+        assert_bitwise(
+            &format!("{label} against the legacy rank chain"),
+            |i| format!("mask element {i} (query {}, position {})", i / cap, i % cap),
+            got_mask,
+            &legacy_mask,
+        );
         (&next_cache[0][..], &want[t * cap..])
     } else {
         (&got[..], &want[..])
@@ -481,10 +697,10 @@ fn the_depth_sweep_selects_what_a_full_repool_selects_real_dims() {
 }
 
 /// The 32K row of the sweep with its selection (8192 blocks, 512 kept): the oracle evaluates the
-/// 8192 x 8192 rank chain in about 11 minutes, so it is run by name, not in the gate. The keys at 32K are
+/// 8192 x 8192 rank chain in about four minutes (release), so it is run by name, not in the gate. The keys at 32K are
 /// in `the_block_keys_at_depth_are_the_repooled_ones_real_dims`.
 #[test]
-#[ignore = "about 11 minutes on the CPU oracle; run by name: -E 'test(=the_32k_selection_matches_a_full_repool_real_dims)'"]
+#[ignore = "about four minutes in a release build on the CPU oracle; run by name with --release: -E 'test(=the_32k_selection_matches_a_full_repool_real_dims)'"]
 fn the_32k_selection_matches_a_full_repool_real_dims() {
     assert_depth_matches("32K", 32768, 32768 - 5, 1, true);
 }

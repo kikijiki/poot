@@ -24,15 +24,28 @@ pub struct ReadTraffic {
     /// Bytes of positional cache (KV) one cached position of one row holds across every layer. A step
     /// reads this many bytes per key position each of its tokens attends to.
     pub kv_bytes_per_position: u64,
+    /// The same, for the cache a block-selected attention reads: it reads at most
+    /// [`Self::selected_positions`] of a token's attended positions, not all of them.
+    pub selected_kv_bytes_per_position: u64,
+    /// The most positions one token reads of a cache counted in `selected_kv_bytes_per_position`: the
+    /// `K * ratio` positions of its selected blocks and the unfinished block's `ratio`.
+    pub selected_positions: u64,
 }
 
 impl ReadTraffic {
-    /// The bytes of a step whose tokens attend to `positions` key positions in total (one per token
-    /// per attended position: a decode token at position `p` attends `p + 1`).
-    pub fn step_bytes(&self, positions: u64) -> u64 {
+    /// The bytes of a step whose tokens attend to `attended[i]` key positions each (a decode token at position
+    /// `p` attends `p + 1`): a dense cache is read at every attended position, a block-selected one at no more
+    /// than [`Self::selected_positions`] of them.
+    pub fn step_bytes(&self, attended: impl IntoIterator<Item = u64>) -> u64 {
+        let (mut dense, mut selected) = (0u64, 0u64);
+        for positions in attended {
+            dense = dense.saturating_add(positions);
+            selected = selected.saturating_add(positions.min(self.selected_positions));
+        }
         self.weight_bytes
             .saturating_add(self.recurrent_state_bytes)
-            .saturating_add(self.kv_bytes_per_position.saturating_mul(positions))
+            .saturating_add(self.kv_bytes_per_position.saturating_mul(dense))
+            .saturating_add(self.selected_kv_bytes_per_position.saturating_mul(selected))
     }
 
     fn add(&mut self, other: Self) {
@@ -43,6 +56,10 @@ impl ReadTraffic {
         self.kv_bytes_per_position = self
             .kv_bytes_per_position
             .saturating_add(other.kv_bytes_per_position);
+        self.selected_kv_bytes_per_position = self
+            .selected_kv_bytes_per_position
+            .saturating_add(other.selected_kv_bytes_per_position);
+        self.selected_positions = self.selected_positions.max(other.selected_positions);
     }
 }
 
@@ -64,7 +81,7 @@ pub(super) fn read_traffic(program: &Program) -> ReadTraffic {
             Plan::Alias(src) | Plan::View { src, .. } => {
                 source.insert(eqn.out, *src);
             }
-            Plan::Dispatches(_) => {}
+            Plan::Dispatches(_) | Plan::Graph => {}
         }
     }
     let root = |mut id: ValueId| {
@@ -73,12 +90,21 @@ pub(super) fn read_traffic(program: &Program) -> ReadTraffic {
         }
         id
     };
+    // The caches a block-selected attention reads (its key and value operands), and the most positions it reads
+    // of them per token.
+    let mut selected_caches: HashSet<ValueId> = HashSet::new();
+    let mut selected_positions = 0u64;
     let mut streamed: HashSet<ValueId> = HashSet::new();
     for (eqn, plan) in program.planned() {
         if !matches!(plan, Plan::Dispatches(_)) {
             continue;
         }
-        for (index, id) in value_ids(eqn).into_iter().enumerate() {
+        let ids = value_ids(eqn);
+        if let OpKind::SelectedAttention(attrs) = &eqn.op {
+            selected_caches.extend([root(ids[1]), root(ids[2])]);
+            selected_positions = selected_positions.max(((attrs.k + 1) * attrs.ratio) as u64);
+        }
+        for (index, id) in ids.into_iter().enumerate() {
             if index == 0 && takes_rows_of_table(&eqn.op) {
                 continue;
             }
@@ -101,8 +127,12 @@ pub(super) fn read_traffic(program: &Program) -> ReadTraffic {
                         meta.aval.shape.first().copied().unwrap_or(1)
                     };
                     let per_position = bytes / (extent.max(1) as u64 * rows.max(1) as u64);
-                    traffic.kv_bytes_per_position =
-                        traffic.kv_bytes_per_position.saturating_add(per_position);
+                    let counted = if selected_caches.contains(&id) {
+                        &mut traffic.selected_kv_bytes_per_position
+                    } else {
+                        &mut traffic.kv_bytes_per_position
+                    };
+                    *counted = counted.saturating_add(per_position);
                 }
                 Some(StateRole::Blocked { axis, ratio }) => {
                     // An entry covers `ratio` positions, so a position's share is the entry's over `ratio`.
@@ -122,6 +152,7 @@ pub(super) fn read_traffic(program: &Program) -> ReadTraffic {
             Storage::Device | Storage::Computed(_) | Storage::Slot(_) => {}
         }
     }
+    traffic.selected_positions = selected_positions;
     traffic
 }
 

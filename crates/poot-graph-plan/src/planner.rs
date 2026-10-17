@@ -152,7 +152,7 @@ macro_rules! matmul_ops {
 /// Ops planned by `planner::attention`.
 macro_rules! attention_ops {
     () => {
-        OpKind::Attention(_)
+        OpKind::Attention(_) | OpKind::SelectedAttention(_)
     };
 }
 
@@ -160,6 +160,13 @@ macro_rules! attention_ops {
 macro_rules! scan_ops {
     () => {
         OpKind::Scan(_)
+    };
+}
+
+/// Ops planned by `planner::block_top_k`.
+macro_rules! block_top_k_ops {
+    () => {
+        OpKind::BlockTopK(_)
     };
 }
 
@@ -195,6 +202,7 @@ macro_rules! movement_ops {
 }
 
 mod attention;
+mod block_top_k;
 mod cast;
 mod choice;
 mod elementwise;
@@ -205,11 +213,13 @@ mod packed;
 mod packed_dequant;
 mod sampling;
 mod scan;
+mod vpu;
 
 pub use choice::Planned;
 pub(crate) use choice::PlannedDispatch;
 pub use choice::{KernelChoice, NoDispatch};
 pub(crate) use matmul::epilogue_head_lowers;
+pub(crate) use vpu::plan_vpu_region;
 
 use std::cell::Cell;
 
@@ -501,6 +511,7 @@ pub(crate) fn plan_eqn_views_impl(
             packed_operands,
             limits,
         ),
+        Target::Vpu { caps, .. } => vpu::plan_eqn(g, eqn, caps),
     }
 }
 
@@ -550,6 +561,7 @@ fn plan_aie_eqn(
         | matmul_ops!()
         | attention_ops!()
         | scan_ops!()
+        | block_top_k_ops!()
         | cast_ops!()
         | sampling_ops!()
         | movement_ops!() => {
@@ -794,6 +806,7 @@ fn plan_gpu_eqn(
         )?,
         attention_ops!() => attention::plan(g, eqn, backend, caps, limits)?,
         scan_ops!() => scan::plan(g, eqn, backend, caps, limits)?,
+        block_top_k_ops!() => block_top_k::plan(g, eqn, backend, caps, limits)?,
         cast_ops!() => cast::plan(
             g,
             eqn,

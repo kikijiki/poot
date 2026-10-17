@@ -68,6 +68,9 @@ query row against the prompt) are the same op: `q [B, Hq, Lq, Dk]`, `k [B, Hkv, 
 `v [B, Hkv, Lk, Dv]` (the value width is independent of the key width), an additive
 `mask [B, Hm, Lq, Lk]` whose head axis is 1 or `Hq` (ALiBi), and an optional attention-logit
 softcap. Three more forms ride on the same op: a split key, a paged key and a live length (below).
+A sparse-attention indexer uses a block-selected form instead: no mask operand, the selected block ids and
+the query positions in its place, so each row visits only the `(K + 1) * ratio` positions of its `K` selected
+blocks and its own unfinished block rather than all `Lk`.
 
 The planner turns the eqn into one generation request that names the shape, the score
 transform (scale, or scale plus softcap), the mask kind, the key bound and the schedule. One

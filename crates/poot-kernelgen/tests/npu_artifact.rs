@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use poot_codegen::{
     AieAbiMismatch, AieCompileError, AieIdentity, AieLinkRecipe, AieStage, AieToolIdentity,
     AieTools, KernelCache, Target, Toolchain, aie_kernel_handle, compile_aie,
+    test_support::single_tile_recipe,
 };
 use poot_runtime_common::{
     AieArtifactError, AieBindError, AieBinding, AieBound, AieLinkedArtifact, AieShapeAbi,
@@ -49,16 +50,16 @@ fn script(dir: &Path, name: &str, body: &str) -> String {
 }
 
 /// A Peano stand-in: lists `aie2p` in `--version`, and "compiles" by writing an ELF header and the
-/// kernel's symbol to the `-o` path.
+/// emitted IR (which names the kernel's symbol) to the `-o` path.
 fn peano(dir: &Path, targets: &str) -> String {
     script(
         dir,
         "peano-llc",
         &format!(
             r#"case "$1" in --version) echo "fake-peano 1 ({targets})"; exit 0;; esac
-for last; do :; done
-printf '\177ELF' > "$last"
-printf 'poot_seq_binary' >> "$last""#
+for arg; do case "$prev" in -o) out="$arg";; esac; case "$arg" in *.ll) ll="$arg";; esac; prev="$arg"; done
+printf '\177ELF' > "$out"
+cat "$ll" >> "$out""#
         ),
     )
 }
@@ -102,7 +103,7 @@ fn toolchain(peano: Option<String>, iron: Option<String>) -> Toolchain {
 
 /// The sequential schedule of the ordinary elementwise-binary request over `dims` (the request the GPU
 /// planner builds; only the target's schedule differs).
-fn schedule(op: poot_kernel_ir::BinOp, dims: &[u64]) -> poot_kernelgen::SequentialGenerated {
+fn schedule(op: poot_kernel_ir::BinOp, dims: &[u64]) -> poot_kernelgen::SerializedGenerated {
     let shape: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
     let operand = || poot_kernelgen::ViewOperand {
         shape: shape.clone(),
@@ -120,7 +121,7 @@ fn schedule(op: poot_kernel_ir::BinOp, dims: &[u64]) -> poot_kernelgen::Sequenti
                 width: 256,
             },
         });
-    poot_kernelgen::sequential_schedule(&request, &limits()).unwrap()
+    poot_kernelgen::serialized_schedule(&request, &limits()).unwrap()
 }
 
 /// The real sequential body the ordinary request generates over `dims`, and its shape ABI (the bindings
@@ -207,8 +208,8 @@ fn linked(dir: &Path, n: u64, dims: &[u64]) -> (poot_kernel_ir::Body, AieLinkedA
     );
     let cache = KernelCache::at(dir.join("cache"), Target::AieCore);
     let compiled = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &tc,
         &cache,
         LIMIT,
@@ -225,10 +226,10 @@ fn linked(dir: &Path, n: u64, dims: &[u64]) -> (poot_kernel_ir::Body, AieLinkedA
 #[test]
 fn the_ordinary_handle_carries_the_compiler_derived_abi() {
     let dir = scratch("handle");
-    let (body, artifact) = linked(&dir, 6, &[2, 3]);
+    let (_, artifact) = linked(&dir, 6, &[2, 3]);
     assert_eq!(artifact.abi().core_lengths(), vec![6, 6, 6]);
 
-    let handle = aie_kernel_handle(&body, artifact.clone()).unwrap();
+    let handle = aie_kernel_handle(artifact.clone());
     assert_eq!(handle.target(), TargetId::Aie(AieTargetId::Xdna2));
     assert_eq!(handle.entry_point(), "MLIR_AIE");
     assert!(!handle.has_trap());
@@ -251,7 +252,7 @@ fn the_ordinary_handle_carries_the_compiler_derived_abi() {
             handle.code()
         );
     };
-    assert_eq!(carried, &artifact);
+    assert_eq!(*carried, artifact);
 }
 
 /// The fake loader reaches "XRT" only for the exact bound shape; each malformed binding is refused first.
@@ -260,8 +261,8 @@ fn the_ordinary_handle_carries_the_compiler_derived_abi() {
 #[test]
 fn malformed_bindings_are_refused_before_the_loader_reaches_xrt() {
     let dir = scratch("loader");
-    let (body, artifact) = linked(&dir, 6, &[2, 3]);
-    let handle = aie_kernel_handle(&body, artifact).unwrap();
+    let (_, artifact) = linked(&dir, 6, &[2, 3]);
+    let handle = aie_kernel_handle(artifact);
     let dims = [2u64, 3];
     let mut loader = FakeLoader::default();
 
@@ -410,61 +411,76 @@ fn a_serialized_artifact_round_trips_and_rejects_corruption() {
     assert!(AieLinkedArtifact::from_bytes(&bad_magic, AieTargetId::Xdna2).is_err());
 }
 
-/// A body and a shape ABI that do not describe one kernel never become a handle or an artifact: wrong
-/// binding count, an I32 binding over an F32 body, a read binding the body writes.
+/// A body and a recipe that do not describe one core never become an artifact: wrong port count, an I32 port
+/// over an F32 body, a read port the body writes. The check runs before any tool does.
+///
+/// Mutation: delete the element or access comparison in `check_tile_body`; its row compiles instead.
 #[test]
-fn a_body_and_abi_that_disagree_are_refused_by_type() {
+fn a_body_and_recipe_that_disagree_are_refused_before_any_tool_runs() {
     let dir = scratch("abi");
-    let (body, artifact) = linked(&dir, 4, &[4]);
+    let (body, _) = generated(4, &[4]);
     let read = |i, storage| AieBinding::new(i, storage, ArgAccess::Read, &[4], 4).unwrap();
     let write = |i, storage| AieBinding::new(i, storage, ArgAccess::Write, &[4], 4).unwrap();
-    let make = |bindings| {
-        AieLinkedArtifact::new(
-            artifact.xclbin().to_vec(),
-            artifact.instructions().to_vec(),
-            artifact.entry(),
-            AieShapeAbi::new(bindings).unwrap(),
-            AieTargetId::Xdna2,
-            artifact.toolchain(),
-            0,
-        )
-        .unwrap()
+    let cache = KernelCache::at(dir.join("cache"), Target::AieCore);
+    let tc = toolchain(
+        Some(peano(&dir, "aie2p")),
+        Some(iron(&dir, "npu2", Iron::Links)),
+    );
+    let refusal = |bindings| {
+        let abi = AieShapeAbi::new(bindings).unwrap();
+        match compile_aie(
+            &[&body],
+            &single_tile_recipe(AieTargetId::Xdna2, &abi),
+            &tc,
+            &cache,
+            LIMIT,
+        ) {
+            Err(AieCompileError::Abi(mismatch)) => mismatch,
+            other => panic!(
+                "expected a body/recipe mismatch, got {:?}",
+                other.map(|_| ())
+            ),
+        }
     };
-    let two = make(vec![
-        read(0, BufferStorage::f32()),
-        write(1, BufferStorage::f32()),
-    ]);
     assert_eq!(
-        aie_kernel_handle(&body, two).map(|_| ()),
-        Err(AieAbiMismatch::Count { body: 3, abi: 2 })
+        refusal(vec![
+            read(0, BufferStorage::f32()),
+            write(1, BufferStorage::f32())
+        ]),
+        AieAbiMismatch::Count {
+            tile: 0,
+            body: 3,
+            recipe: 2
+        }
     );
-    let mirror = make(vec![
-        read(0, BufferStorage::f32()),
-        read(1, BufferStorage::i32()),
-        write(2, BufferStorage::f32()),
-    ]);
     assert_eq!(
-        aie_kernel_handle(&body, mirror).map(|_| ()),
-        Err(AieAbiMismatch::Element {
-            index: 1,
+        refusal(vec![
+            read(0, BufferStorage::f32()),
+            read(1, BufferStorage::i32()),
+            write(2, BufferStorage::f32()),
+        ]),
+        AieAbiMismatch::Element {
+            tile: 0,
+            port: 1,
             body: ElementKind::F32,
-            abi: ElementKind::I32
-        })
+            fifo: ElementKind::I32
+        }
     );
-    // A written binding the body only reads: the ABI is valid on its own, the body disagrees at index 0.
-    let wrong_access = make(vec![
-        write(0, BufferStorage::f32()),
-        read(1, BufferStorage::f32()),
-        write(2, BufferStorage::f32()),
-    ]);
+    // A written port the body only reads: the recipe is valid on its own, the body disagrees at port 0.
     assert_eq!(
-        aie_kernel_handle(&body, wrong_access).map(|_| ()),
-        Err(AieAbiMismatch::Access {
-            index: 0,
+        refusal(vec![
+            write(0, BufferStorage::f32()),
+            read(1, BufferStorage::f32()),
+            write(2, BufferStorage::f32()),
+        ]),
+        AieAbiMismatch::Access {
+            tile: 0,
+            port: 0,
             body_writes: false,
-            abi_writes: true
-        })
+            fifo_writes: true
+        }
     );
+    assert_nothing_published(&cache);
 }
 
 // ---- SC-001: cache identity across shapes and toolchains ------------------------------------------------
@@ -489,8 +505,8 @@ fn identity(
 ) -> AieIdentity {
     let n = dims.iter().product();
     let (_, abi) = generated(n, dims);
-    let recipe = AieLinkRecipe::sequential(&body.name, target, &abi).unwrap();
-    AieIdentity::new(body, &recipe, t)
+    let recipe = single_tile_recipe(target, &abi);
+    AieIdentity::new(&[body], &recipe, t)
 }
 
 /// Same Body and the same element count under different dimensions, a different Peano or IRON build (version
@@ -584,6 +600,317 @@ fn a_different_body_is_a_different_core_identity() {
     assert_ne!(a.core_digest(), m.core_digest());
 }
 
+/// The shape of a two-tile region `out = (a op0 b) op1 c`: tile 0 reads host tensors `a` and `b` and feeds
+/// tile 1 over an on-chip link, tile 1 reads the link and host tensor `c` and writes `out` to the host.
+struct Chain2 {
+    ops: [poot_kernel_ir::BinOp; 2],
+    /// Which host binding each of `a`, `b`, `c` is: the order decides every arena offset.
+    binding_of: [usize; 3],
+    /// Whether tile 1 reads `(c, link)` rather than `(link, c)`.
+    swap_second: bool,
+    /// Whether tile 0 and tile 1 swap places in the recipe (the wiring follows them).
+    swap_tiles: bool,
+}
+
+impl Chain2 {
+    fn new(op0: poot_kernel_ir::BinOp, op1: poot_kernel_ir::BinOp) -> Self {
+        Self {
+            ops: [op0, op1],
+            binding_of: [0, 1, 2],
+            swap_second: false,
+            swap_tiles: false,
+        }
+    }
+
+    /// The bodies in tile order, and the recipe.
+    fn build(&self, dims: &[u64]) -> (Vec<poot_kernel_ir::Body>, AieLinkRecipe) {
+        use poot_codegen::{AieFifo, AieTile, FifoEnd};
+        let elements: u64 = dims.iter().product();
+        let binding = |i: usize, access| {
+            AieBinding::new(i, BufferStorage::f32(), access, dims, elements).unwrap()
+        };
+        let abi = AieShapeAbi::new(vec![
+            binding(0, ArgAccess::Read),
+            binding(1, ArgAccess::Read),
+            binding(2, ArgAccess::Read),
+            binding(3, ArgAccess::Write),
+        ])
+        .unwrap();
+        let [a, b, c] = self.binding_of;
+        let (t0, t1) = if self.swap_tiles { (1, 0) } else { (0, 1) };
+        let fifo = |producer, consumers| AieFifo {
+            producer,
+            consumers,
+            depth: AieLinkRecipe::FIFO_DEPTH,
+            elements,
+            element: ElementKind::F32,
+        };
+        let (second_link, second_c) = if self.swap_second { (1, 0) } else { (0, 1) };
+        let fifos = vec![
+            fifo(
+                FifoEnd::Host { binding: a },
+                vec![FifoEnd::Tile { tile: t0, port: 0 }],
+            ),
+            fifo(
+                FifoEnd::Host { binding: b },
+                vec![FifoEnd::Tile { tile: t0, port: 1 }],
+            ),
+            fifo(
+                FifoEnd::Host { binding: c },
+                vec![FifoEnd::Tile {
+                    tile: t1,
+                    port: second_c,
+                }],
+            ),
+            fifo(
+                FifoEnd::Tile { tile: t0, port: 2 },
+                vec![FifoEnd::Tile {
+                    tile: t1,
+                    port: second_link,
+                }],
+            ),
+            fifo(
+                FifoEnd::Tile { tile: t1, port: 2 },
+                vec![FifoEnd::Host { binding: 3 }],
+            ),
+        ];
+        let first = AieTile {
+            ports: vec![0, 1, 3],
+        };
+        let second = AieTile {
+            ports: if self.swap_second {
+                vec![2, 3, 4]
+            } else {
+                vec![3, 2, 4]
+            },
+        };
+        let tiles = if self.swap_tiles {
+            vec![second, first]
+        } else {
+            vec![first, second]
+        };
+        let bodies = [
+            schedule(self.ops[0], dims).body,
+            schedule(self.ops[1], dims).body,
+        ];
+        let bodies = if self.swap_tiles {
+            vec![bodies[1].clone(), bodies[0].clone()]
+        } else {
+            bodies.to_vec()
+        };
+        (
+            bodies,
+            AieLinkRecipe::new(AieTargetId::Xdna2, abi, tiles, fifos).unwrap(),
+        )
+    }
+
+    fn identity(&self, dims: &[u64], t: &AieTools) -> AieIdentity {
+        let (bodies, recipe) = self.build(dims);
+        let bodies: Vec<&poot_kernel_ir::Body> = bodies.iter().collect();
+        AieIdentity::new(&bodies, &recipe, t)
+    }
+}
+
+/// A region's cache identity sees every equation's body, which tile each runs on, how the tiles are wired
+/// and where each tensor sits in the host arenas: a region that differs in any of them is a different
+/// artifact, so a reordered chain can never be served another chain's xclbin. The core objects, which are
+/// the same set of bodies, keep one core identity under a different placement.
+///
+/// Mutation: leave the `placed` lines out of the link text in `AieIdentity::new` and the tile and fifo
+/// lines out of `AieLinkRecipe::canonical`; the reordered, rewired and re-laid-out rows share the base
+/// digest.
+#[test]
+fn the_region_identity_sees_every_body_the_placement_the_wiring_and_the_offsets() {
+    use poot_kernel_ir::BinOp::{Add, Mul, Sub};
+    let t = tools(tool("peano 1", 1), tool("iron 1", 2));
+    let dims = [2u64, 3];
+    let base = Chain2::new(Add, Sub).identity(&dims, &t);
+    assert_eq!(base, Chain2::new(Add, Sub).identity(&dims, &t), "stable");
+
+    let differs = |other: AieIdentity, what: &str| {
+        assert_ne!(
+            base.link_digest(),
+            other.link_digest(),
+            "{what} must change the link identity"
+        );
+    };
+    differs(
+        Chain2::new(Add, Mul).identity(&dims, &t),
+        "another body on the second tile",
+    );
+    differs(
+        Chain2::new(Mul, Sub).identity(&dims, &t),
+        "another body on the first tile",
+    );
+    let reordered = Chain2 {
+        swap_tiles: true,
+        ..Chain2::new(Add, Sub)
+    };
+    differs(
+        reordered.identity(&dims, &t),
+        "the same two bodies on swapped tiles",
+    );
+    assert_eq!(
+        base.core_digest(),
+        reordered.identity(&dims, &t).core_digest(),
+        "the core objects are the same set of bodies wherever they sit"
+    );
+    differs(
+        Chain2 {
+            swap_second: true,
+            ..Chain2::new(Add, Sub)
+        }
+        .identity(&dims, &t),
+        "the second tile reading its operands the other way round (sub is not commutative)",
+    );
+    differs(
+        Chain2 {
+            binding_of: [2, 1, 0],
+            ..Chain2::new(Add, Sub)
+        }
+        .identity(&dims, &t),
+        "another host binding order (and so other arena offsets and FIFO ends) for the same tensors",
+    );
+    differs(
+        Chain2::new(Add, Sub).identity(&[3, 2], &t),
+        "the dimensions at equal element counts",
+    );
+}
+
+/// A wiring that is not a region is a typed [`RecipeFault`] at construction, before any tool runs: a FIFO no
+/// one reads, a host end that contradicts its binding, a binding streamed twice or never, a tile port wired
+/// to something other than the FIFO its tile lists. Mutation: delete one check in `AieLinkRecipe::new`;
+/// its row below builds a recipe.
+#[test]
+fn a_wiring_that_is_not_a_region_is_a_typed_fault_at_construction() {
+    use poot_codegen::{AieFifo, AieTile, FifoEnd, RecipeFault};
+    let dims = [2u64, 3];
+    let binding = |i, access| AieBinding::new(i, BufferStorage::f32(), access, &dims, 6).unwrap();
+    let abi = || {
+        AieShapeAbi::new(vec![
+            binding(0, ArgAccess::Read),
+            binding(1, ArgAccess::Write),
+        ])
+        .unwrap()
+    };
+    let fifo = |producer, consumers| AieFifo {
+        producer,
+        consumers,
+        depth: 2,
+        elements: 6,
+        element: ElementKind::F32,
+    };
+    let host = |binding| FifoEnd::Host { binding };
+    let tile = |port| FifoEnd::Tile { tile: 0, port };
+    let good_fifos = || vec![fifo(host(0), vec![tile(0)]), fifo(tile(1), vec![host(1)])];
+    let one_tile = || vec![AieTile { ports: vec![0, 1] }];
+    let build = |tiles: Vec<AieTile>, fifos: Vec<AieFifo>| {
+        AieLinkRecipe::new(AieTargetId::Xdna2, abi(), tiles, fifos).map(|_| ())
+    };
+    let fault = |result: Result<(), AieAbiMismatch>| match result {
+        Err(AieAbiMismatch::Recipe(fault)) => fault,
+        other => panic!("expected a recipe fault, got {other:?}"),
+    };
+    assert_eq!(build(one_tile(), good_fifos()), Ok(()), "control");
+    assert_eq!(fault(build(vec![], good_fifos())), RecipeFault::NoTiles);
+    let mut empty = good_fifos();
+    empty[0].depth = 0;
+    assert_eq!(
+        fault(build(one_tile(), empty)),
+        RecipeFault::Empty { fifo: 0 }
+    );
+    let mut unread = good_fifos();
+    unread[1].consumers.clear();
+    assert_eq!(
+        fault(build(one_tile(), unread)),
+        RecipeFault::NoConsumer { fifo: 1 }
+    );
+    let mut unknown = good_fifos();
+    unknown[0].producer = host(7);
+    assert_eq!(
+        fault(build(one_tile(), unknown)),
+        RecipeFault::UnknownBinding {
+            fifo: 0,
+            binding: 7,
+            bindings: 2
+        }
+    );
+    // The host fills a written binding.
+    let mut backwards = good_fifos();
+    backwards[0].producer = host(1);
+    backwards[1].consumers = vec![host(0)];
+    assert_eq!(
+        fault(build(one_tile(), backwards)),
+        RecipeFault::HostDirection {
+            fifo: 0,
+            binding: 1,
+            access: ArgAccess::Write
+        }
+    );
+    let mut sized = good_fifos();
+    sized[0].elements = 5;
+    assert_eq!(
+        fault(build(one_tile(), sized)),
+        RecipeFault::HostElements {
+            fifo: 0,
+            binding: 0,
+            elements: 5,
+            element: ElementKind::F32
+        }
+    );
+    let mut twice = good_fifos();
+    twice.push(fifo(host(0), vec![tile(1)]));
+    assert_eq!(
+        fault(build(one_tile(), twice)),
+        RecipeFault::BindingStreams {
+            binding: 0,
+            fifos: 2
+        }
+    );
+    let mut never = good_fifos();
+    never[1].consumers = vec![FifoEnd::Tile { tile: 0, port: 0 }];
+    assert_eq!(
+        fault(build(one_tile(), never)),
+        RecipeFault::BindingStreams {
+            binding: 1,
+            fifos: 0
+        }
+    );
+    let mut missing_port = good_fifos();
+    missing_port[0].consumers = vec![FifoEnd::Tile { tile: 0, port: 9 }];
+    assert_eq!(
+        fault(build(one_tile(), missing_port)),
+        RecipeFault::UnknownPort {
+            fifo: 0,
+            tile: 0,
+            port: 9
+        }
+    );
+    // The tile lists FIFO 1 for port 0 but FIFO 0 names that port: port 0 is claimed by nobody.
+    assert_eq!(
+        fault(build(vec![AieTile { ports: vec![1, 0] }], good_fifos())),
+        RecipeFault::PortWiring {
+            tile: 0,
+            port: 0,
+            ends: 0
+        }
+    );
+    assert_eq!(
+        fault(build(vec![AieTile { ports: vec![0, 5] }], good_fifos())),
+        RecipeFault::UnknownFifo {
+            tile: 0,
+            port: 1,
+            fifo: 5
+        }
+    );
+    let mut loopback = good_fifos();
+    loopback[0].consumers.push(host(1));
+    assert_eq!(
+        fault(build(one_tile(), loopback)),
+        RecipeFault::HostToHost { fifo: 0 }
+    );
+}
+
 // ---- SC-003: unavailable toolchain, typed, nothing published ---------------------------------------------
 
 fn assert_nothing_published(cache: &KernelCache) {
@@ -606,8 +933,8 @@ fn an_unavailable_toolchain_is_a_typed_stage_cause_and_publishes_nothing() {
     let run = |tc: Toolchain, name: &str| {
         let cache = KernelCache::at(dir.join(format!("cache-{name}")), Target::AieCore);
         let result = compile_aie(
-            &body,
-            &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+            &[&body],
+            &single_tile_recipe(AieTargetId::Xdna2, &abi),
             &tc,
             &cache,
             LIMIT,
@@ -685,8 +1012,8 @@ fn a_failed_link_leaves_no_half_published_bundle() {
         let tc = toolchain(Some(peano.clone()), Some(iron(&dir, "npu2", mode)));
         let cache = KernelCache::at(dir.join(format!("cache-{name}")), Target::AieCore);
         let error = compile_aie(
-            &body,
-            &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+            &[&body],
+            &single_tile_recipe(AieTargetId::Xdna2, &abi),
             &tc,
             &cache,
             LIMIT,
@@ -732,8 +1059,8 @@ fn a_linked_artifact_is_published_once_and_served_by_identity() {
     let cache = KernelCache::at(dir.join("cache"), Target::AieCore);
     let (body, abi) = generated(6, &[2, 3]);
     let first = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &tc,
         &cache,
         LIMIT,
@@ -742,8 +1069,8 @@ fn a_linked_artifact_is_published_once_and_served_by_identity() {
     assert!(first.built);
     assert_eq!(entries(cache.dir()).len(), 1);
     let second = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &tc,
         &cache,
         LIMIT,
@@ -754,8 +1081,8 @@ fn a_linked_artifact_is_published_once_and_served_by_identity() {
 
     let (body_t, abi_t) = generated(6, &[3, 2]);
     let other = compile_aie(
-        &body_t,
-        &AieLinkRecipe::sequential(&body_t.name, AieTargetId::Xdna2, &abi_t).unwrap(),
+        &[&body_t],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi_t),
         &tc,
         &cache,
         LIMIT,
@@ -784,14 +1111,14 @@ fn a_real_peano_and_iron_toolchain_links_a_loadable_artifact() {
     let cache = KernelCache::at(dir, Target::AieCore);
     let (body, abi) = generated(6, &[2, 3]);
     let compiled = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &tc,
         &cache,
         LIMIT,
     )
     .unwrap_or_else(|e| panic!("real AIE compile failed: {e}"));
-    let handle = aie_kernel_handle(&body, compiled.artifact).unwrap();
+    let handle = aie_kernel_handle(compiled.artifact);
     assert_eq!(handle.args().len(), 3);
 }
 
@@ -845,8 +1172,8 @@ fn a_stale_cache_entry_for_another_shape_is_refused() {
     let cache = KernelCache::at(dir.join("cache"), Target::AieCore);
     let (body, abi) = generated(6, &[2, 3]);
     let first = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &tc,
         &cache,
         LIMIT,
@@ -856,8 +1183,8 @@ fn a_stale_cache_entry_for_another_shape_is_refused() {
     // The artifact of a different shape, planted under the [2,3] request's key.
     let (_, other_abi) = generated(6, &[3, 2]);
     let other = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &other_abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &other_abi),
         &tc,
         &KernelCache::at(dir.join("other"), Target::AieCore),
         LIMIT,
@@ -868,8 +1195,8 @@ fn a_stale_cache_entry_for_another_shape_is_refused() {
         .unwrap();
 
     let error = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &tc,
         &cache,
         LIMIT,
@@ -884,7 +1211,8 @@ fn a_stale_cache_entry_for_another_shape_is_refused() {
 
 /// A core object that does not name the body's symbol, or a body with no symbol to name, is a typed
 /// `CoreObject` refusal and publishes nothing. Mutation: drop the `is_empty()` guard in
-/// `build_object_plan`; the empty name matches every window and the object is accepted.
+/// `build_object_plan`; the body compiles under the symbol its fingerprint alone names and the object is
+/// accepted.
 #[test]
 fn a_body_with_no_symbol_is_a_typed_core_object_error() {
     let dir = scratch("emptysym");
@@ -896,8 +1224,8 @@ fn a_body_with_no_symbol_is_a_typed_core_object_error() {
     let (mut body, abi) = generated(6, &[2, 3]);
     body.name.clear();
     let error = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &tc,
         &cache,
         LIMIT,
@@ -915,7 +1243,7 @@ fn a_body_with_no_symbol_is_a_typed_core_object_error() {
 /// error word, so a failed bounds check could not be reported (POOT-1120). This is what happened to the
 /// MIR-imported sequential kernels (`pootc`'s former `*_lowers_to_aie2p` rows): rustc's slice indexing
 /// leaves an `Assert`, which imports as a `Trap`, and the typed schedule takes only trap-free bodies such
-/// as the generator's. Mutation: delete the `has_trap()` guard in `check_body_abi`; the compile links and
+/// as the generator's. Mutation: delete the `has_trap()` guard in `check_tile_body`; the compile links and
 /// the `Trap` assertion fails.
 #[test]
 fn a_body_that_can_trap_is_refused_before_any_tool_runs_a_link() {
@@ -930,8 +1258,8 @@ fn a_body_that_can_trap_is_refused_before_any_tool_runs_a_link() {
     last.terminator = poot_kernel_ir::Terminator::Trap { code: 1 };
     assert!(body.has_trap());
     let error = compile_aie(
-        &body,
-        &AieLinkRecipe::sequential(&body.name, AieTargetId::Xdna2, &abi).unwrap(),
+        &[&body],
+        &single_tile_recipe(AieTargetId::Xdna2, &abi),
         &tc,
         &cache,
         LIMIT,
@@ -939,7 +1267,10 @@ fn a_body_that_can_trap_is_refused_before_any_tool_runs_a_link() {
     .map(|_| ())
     .unwrap_err();
     assert!(
-        matches!(error, AieCompileError::Abi(AieAbiMismatch::Trap)),
+        matches!(
+            error,
+            AieCompileError::Abi(AieAbiMismatch::Trap { tile: 0 })
+        ),
         "got {error:?}"
     );
     assert_nothing_published(&cache);

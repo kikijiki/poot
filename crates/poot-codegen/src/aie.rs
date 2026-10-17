@@ -1,23 +1,32 @@
-//! AIE compilation: a sequential `Body` to a Peano core object, a typed link recipe, and a loadable
-//! xclbin/instruction artifact (POOT-664, spec 1002).
+//! AIE compilation: the sequential `Body`s of one region to Peano core objects, a typed link recipe that
+//! places them on compute tiles, and one loadable xclbin/instruction artifact (POOT-664, spec 1002,
+//! POOT-1160).
 //!
 //! ```text
-//! Body + AieShapeAbi --check_body_abi--> AieLinkRecipe --Peano--> AieObjectPlan --IRON--> AieLinkedArtifact
+//! Bodies + AieLinkRecipe --check_tile--> Peano (one object per distinct Body) --IRON--> AieLinkedArtifact
 //! ```
 //!
-//! The core object is an intermediate, never a runnable module. The linked artifact is the only thing
-//! [`crate::kernel_handle`] / [`crate::aie_kernel_handle`] wrap, and the runtime (POOT-641) only loads it:
-//! it neither runs IRON nor recognizes graphs.
+//! A region is a set of planned equations that run in one hardware context. Each equation's `Body` is a
+//! tile program: one compute tile runs it once. Every value the region touches is one object FIFO: a value
+//! the region reads from the host streams in, a value the region returns streams out, and a value that only
+//! other equations of the region read moves tile to tile and never reaches host memory. The recipe says
+//! which tile reads and writes which FIFO; it is data, not a script. The host side of the artifact is the
+//! recipe's [`AieShapeAbi`]: a handful of host arenas, each region value at a fixed offset inside one.
+//!
+//! The core objects are intermediates, never runnable modules. The linked artifact is the only thing
+//! [`crate::aie_kernel_handle`] wraps, and the runtime (POOT-641) only loads it: it neither runs IRON nor
+//! recognizes graphs.
 //!
 //! # Identity and publication
 //!
-//! Two canonical, length-tagged texts name an artifact ([`AieIdentity`]): the core object's (the whole
-//! verified Body, target, numerical contract, core ABI revision, codegen source and the Peano build) and the
-//! link's (the core digest, every binding's storage, dimensions and access, the recipe, platform, the IRON
-//! build, flags, instruction format and finalization policy). A shape, layout, recipe or tool change
-//! names a different cache entry. Both tools are resolved and checked before any scratch exists, and the
-//! bundle is published as one cache entry after both link outputs were read and validated, so a failure at
-//! any stage leaves no entry.
+//! Two canonical, length-tagged texts name an artifact ([`AieIdentity`]): the core objects' (every tile's
+//! whole verified Body, target, numerical contract, core ABI revision, codegen source and the Peano build)
+//! and the link's (the core digest of every tile in tile order, the recipe with its wiring, every binding's
+//! storage, dimensions, access and arena offset, the platform, the IRON build, flags, instruction format
+//! and finalization policy). A shape, layout, wiring, placement order or tool change names a different
+//! cache entry. Both tools are resolved and checked before any scratch exists, and the bundle is published
+//! as one cache entry after both link outputs were read and validated, so a failure at any stage leaves no
+//! entry.
 //!
 //! # The IRON link driver protocol
 //!
@@ -26,19 +35,21 @@
 //! ```text
 //! POOT_AIE_IRON --version     first stdout line: the driver and IRON build identity
 //! POOT_AIE_IRON --platforms   the platform names it can link for, one per line
-//! POOT_AIE_IRON link --platform <name> --object <core.o> --recipe <recipe.txt> \
+//! POOT_AIE_IRON link --platform <name> --objects <dir> --recipe <recipe.txt> \
 //!                    --xclbin <out> --insts <out>
 //! ```
 //!
-//! The recipe file is [`AieLinkRecipe::canonical`]. Success is exit status 0 with both outputs written.
+//! The recipe file is [`AieLinkRecipe::canonical`] followed by one `object` line per tile naming that
+//! tile's core object file inside `<dir>` and its entry symbol. Success is exit status 0 with both outputs
+//! written.
 //!
-//! The one implementation is `scripts/poot-aie-link.py` (POOT-1118): it builds the one-core IRON program the
-//! recipe describes and links it with mlir-aie's `aiecc`. The flake's `npu` devshell (`nix develop .#npu`)
-//! exports `POOT_AIE_IRON` as the wrapper of it and `POOT_AIE_LLC` as the pinned Peano `llc`; anywhere else
-//! the variables are unset and the compile is the typed [`AieCompileError::ToolchainMissing`]. The
-//! model-free tests exercise this orchestration against scripted drivers, which prove the protocol handling
-//! and typed failures, not machine code; the ignored
-//! `a_real_peano_and_iron_toolchain_links_a_loadable_artifact` row runs the real pair.
+//! The one implementation is `scripts/poot-aie-link.py` (POOT-1118, POOT-1160): it builds the IRON program
+//! the recipe describes, one worker per tile and one object FIFO per value, and links it with mlir-aie's
+//! `aiecc`. The flake's `npu` devshell (`nix develop .#npu`) exports `POOT_AIE_IRON` as the wrapper of it
+//! and `POOT_AIE_LLC` as the pinned Peano `llc`; anywhere else the variables are unset and the compile is
+//! the typed [`AieCompileError::ToolchainMissing`]. The model-free tests exercise this orchestration
+//! against scripted drivers, which prove the protocol handling and typed failures, not machine code; the
+//! ignored `a_real_peano_and_iron_toolchain_links_a_loadable_artifact` row runs the real pair.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -89,55 +100,183 @@ impl std::fmt::Display for AieStage {
     }
 }
 
-/// The body and the shape ABI do not describe the same kernel, or the ABI cannot be linked.
+/// A tile's body and the recipe do not describe the same region, or the recipe cannot be linked.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AieAbiMismatch {
-    /// Body parameter `index` is not a flat buffer slice of a runtime element type.
-    #[error("body parameter {index} is not a flat buffer slice of a runtime element type")]
+    /// Body parameter `index` of a tile is not a flat buffer slice of a runtime element type.
+    #[error(
+        "tile {tile}: body parameter {index} is not a flat buffer slice of a runtime element type"
+    )]
     Parameter {
+        /// The tile whose body is at fault.
+        tile: usize,
         /// Position of the offending parameter in the body's signature.
         index: usize,
     },
-    /// The body and the shape ABI disagree on how many buffers the kernel takes.
-    #[error("the body takes {body} buffers and the shape ABI binds {abi}")]
+    /// A tile's body and the recipe disagree on how many buffers the tile takes.
+    #[error("tile {tile}: the body takes {body} buffers and the recipe wires {recipe}")]
     Count {
+        /// The tile whose body is at fault.
+        tile: usize,
         /// Buffer parameters the body declares.
         body: usize,
-        /// Bindings the shape ABI declares.
-        abi: usize,
+        /// Ports the recipe wires for the tile.
+        recipe: usize,
     },
-    /// Binding `index` has one element kind in the body and another in the shape ABI.
-    #[error("binding {index}: the body's element is {body}, the shape ABI's is {abi}")]
+    /// A tile port has one element kind in the body and another in its FIFO.
+    #[error("tile {tile} port {port}: the body's element is {body}, the FIFO's is {fifo}")]
     Element {
-        /// Binding position, shared by the body parameter list and the ABI's bindings.
-        index: usize,
+        /// The tile whose body is at fault.
+        tile: usize,
+        /// Port position, shared by the body parameter list and the tile's ports.
+        port: usize,
         /// Element kind the body's parameter declares.
         body: ElementKind,
-        /// Element kind the shape ABI's binding declares.
-        abi: ElementKind,
+        /// Element kind the FIFO carries.
+        fifo: ElementKind,
     },
-    /// Binding `index` is written by one side and read-only on the other.
-    #[error("binding {index}: the body writes it = {body_writes}, the shape ABI says {abi_writes}")]
+    /// A tile port is written by one side and read-only on the other.
+    #[error(
+        "tile {tile} port {port}: the body writes it = {body_writes}, the recipe says {fifo_writes}"
+    )]
     Access {
-        /// Binding position, shared by the body parameter list and the ABI's bindings.
-        index: usize,
+        /// The tile whose body is at fault.
+        tile: usize,
+        /// Port position, shared by the body parameter list and the tile's ports.
+        port: usize,
         /// Whether the body writes the buffer.
         body_writes: bool,
-        /// Whether the shape ABI declares the binding as written.
-        abi_writes: bool,
+        /// Whether the recipe has the tile produce the FIFO.
+        fifo_writes: bool,
     },
-    /// The body contains a trap; the AIE ABI binds no error word to report it through.
-    #[error("the body can trap, and the AIE ABI has no error word")]
-    Trap,
+    /// A tile's body contains a trap; the AIE ABI binds no error word to report it through.
+    #[error("tile {tile}: the body can trap, and the AIE ABI has no error word")]
+    Trap {
+        /// The tile whose body is at fault.
+        tile: usize,
+    },
     /// A binding's storage is not dense row-major, the only layout the sequential schedule moves.
     #[error("a binding is not dense row-major storage")]
     Layout {
         /// Position of the offending binding.
         index: usize,
     },
-    /// The summed tile-local FIFO bytes of the recipe overflow `u64`.
+    /// The summed tile-local FIFO bytes of a tile overflow `u64`.
     #[error("the recipe's tile-local byte total overflows")]
     TileLocalOverflow,
+    /// The recipe's wiring is not a region: see [`RecipeFault`].
+    #[error("the link recipe is malformed: {0}")]
+    Recipe(#[from] RecipeFault),
+    /// The tile bodies handed to the compiler are not one per recipe tile.
+    #[error("the recipe has {tiles} tiles and {bodies} bodies were given")]
+    BodyCount {
+        /// Tiles the recipe places.
+        tiles: usize,
+        /// Bodies the caller supplied.
+        bodies: usize,
+    },
+}
+
+/// Why a region's wiring is not a dataflow a link driver can build. Every fault is raised at recipe
+/// construction, before any tool runs.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RecipeFault {
+    /// The recipe places no tile.
+    #[error("the recipe places no tile")]
+    NoTiles,
+    /// A FIFO has no consumer: its values would be produced and never read.
+    #[error("FIFO {fifo} has no consumer")]
+    NoConsumer {
+        /// The FIFO.
+        fifo: usize,
+    },
+    /// A FIFO is moved with a zero depth or zero elements.
+    #[error("FIFO {fifo} has a zero depth or zero elements")]
+    Empty {
+        /// The FIFO.
+        fifo: usize,
+    },
+    /// A FIFO names a host binding the shape ABI does not have.
+    #[error("FIFO {fifo} names host binding {binding}; the shape ABI has {bindings}")]
+    UnknownBinding {
+        /// The FIFO.
+        fifo: usize,
+        /// The binding it names.
+        binding: usize,
+        /// Bindings the shape ABI declares.
+        bindings: usize,
+    },
+    /// A FIFO's host end contradicts the binding's access: the host fills a read binding and drains a
+    /// written one.
+    #[error(
+        "FIFO {fifo}: host binding {binding} is {access:?} but the FIFO's host end is the other side"
+    )]
+    HostDirection {
+        /// The FIFO.
+        fifo: usize,
+        /// The binding it names.
+        binding: usize,
+        /// The binding's access.
+        access: ArgAccess,
+    },
+    /// A FIFO carries other elements than its host binding holds.
+    #[error(
+        "FIFO {fifo} moves {elements} {element:?} elements; host binding {binding} holds others"
+    )]
+    HostElements {
+        /// The FIFO.
+        fifo: usize,
+        /// The binding it names.
+        binding: usize,
+        /// Elements the FIFO moves.
+        elements: u64,
+        /// The element kind the FIFO moves.
+        element: ElementKind,
+    },
+    /// A host binding is not the host end of exactly one FIFO.
+    #[error("host binding {binding} is the host end of {fifos} FIFOs, not one")]
+    BindingStreams {
+        /// The binding.
+        binding: usize,
+        /// FIFOs that name it.
+        fifos: usize,
+    },
+    /// A FIFO end names a tile or port the recipe does not have.
+    #[error("FIFO {fifo} names tile {tile} port {port}, which the recipe does not have")]
+    UnknownPort {
+        /// The FIFO.
+        fifo: usize,
+        /// The tile it names.
+        tile: usize,
+        /// The port it names.
+        port: usize,
+    },
+    /// A tile port is not the end of exactly the FIFO the tile lists for it.
+    #[error("tile {tile} port {port} is wired by {ends} FIFO ends matching its FIFO, not one")]
+    PortWiring {
+        /// The tile.
+        tile: usize,
+        /// The port.
+        port: usize,
+        /// FIFO ends that name this port as the FIFO the tile lists.
+        ends: usize,
+    },
+    /// A tile lists a FIFO the recipe does not have.
+    #[error("tile {tile} port {port} lists FIFO {fifo}, which the recipe does not have")]
+    UnknownFifo {
+        /// The tile.
+        tile: usize,
+        /// The port.
+        port: usize,
+        /// The FIFO it lists.
+        fifo: usize,
+    },
+    /// A FIFO's producer and consumer are both the host: it would move host data to host memory.
+    #[error("FIFO {fifo} runs from the host to the host")]
+    HostToHost {
+        /// The FIFO.
+        fifo: usize,
+    },
 }
 
 /// Why an AIE compilation produced no artifact. Every variant leaves nothing published.
@@ -205,41 +344,61 @@ pub enum AieCompileError {
     Io(#[from] std::io::Error),
 }
 
-/// Whether a FIFO feeds the core from the host or drains it back.
+/// One end of an object FIFO: the host, or one port of one tile's core.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FifoDirection {
-    /// Data moves from the host buffer into the core (a read binding).
-    HostToTile,
-    /// Data moves from the core back to the host buffer (a written binding).
-    TileToHost,
+pub enum FifoEnd {
+    /// The host side. The shape ABI's binding `binding` is filled into the FIFO (a read binding) or drained
+    /// out of it (a written one).
+    Host {
+        /// Index of the host binding in the shape ABI.
+        binding: usize,
+    },
+    /// Port `port` of tile `tile`: body parameter `port` of that tile's core.
+    Tile {
+        /// Index of the tile in the recipe.
+        tile: usize,
+        /// Index of the port in the tile's parameter list.
+        port: usize,
+    },
 }
 
-/// One object FIFO of a link recipe: the host binding it moves, its direction, depth and element.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One object FIFO of a link recipe: one value of the region, moved from its producer to its consumers.
+/// A value the region reads has the host as its producer; a value the region returns has the host among its
+/// consumers; a value only the region's own tiles read has no host end and never reaches host memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AieFifo {
-    /// Index of the host binding in the shape ABI this FIFO moves.
-    pub binding: usize,
-    /// Whether the FIFO feeds the core or drains it.
-    pub direction: FifoDirection,
-    /// Buffers the FIFO holds in flight.
+    /// The one end that writes the value.
+    pub producer: FifoEnd,
+    /// The ends that read it: every consumer receives every element.
+    pub consumers: Vec<FifoEnd>,
+    /// Buffers the FIFO holds in flight at each tile it touches.
     pub depth: u32,
-    /// Elements per FIFO buffer (a whole binding, in the sequential schedule).
+    /// Elements per FIFO buffer (a whole tensor, in the sequential schedule).
     pub elements: u64,
     /// Element kind of the buffers the FIFO carries.
     pub element: ElementKind,
 }
 
-/// The typed shape/layout recipe IRON links a core object with: which symbol runs on the one core, what
-/// each host binding is, and the FIFO that moves it. Data, not a script.
+/// One tile of a link recipe: the core placed on it runs one body once per invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AieTile {
+    /// For each parameter of the tile's body, in parameter order, the FIFO that parameter is wired to.
+    pub ports: Vec<usize>,
+}
+
+/// The typed link recipe IRON links a region with: which body runs on each compute tile, the FIFO each of
+/// its parameters is wired to, and the host binding of every FIFO that reaches host memory. Data, not a
+/// script. Tile order is placement order and part of the artifact's identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AieLinkRecipe {
-    symbol: String,
     target: AieTargetId,
     abi: AieShapeAbi,
+    tiles: Vec<AieTile>,
     fifos: Vec<AieFifo>,
-    /// One finite invocation: the core runs its loop once over the whole tensors.
+    /// One finite invocation: every core runs its loop once over the whole tensors.
     invocations: u64,
-    /// Tile-local bytes every FIFO buffer reserves at its depth, checked once at construction.
+    /// Tile-local bytes the busiest tile reserves for its FIFO buffers at their depth, checked once at
+    /// construction.
     tile_local_bytes: u64,
 }
 
@@ -247,41 +406,130 @@ impl AieLinkRecipe {
     /// IRON's default `ObjectFifo` depth.
     pub const FIFO_DEPTH: u32 = 2;
 
-    /// The one-core sequential schedule: one whole-tensor FIFO per binding, written bindings drained,
-    /// read bindings fed, one invocation.
-    pub fn sequential(
-        symbol: &str,
+    /// The recipe placing `tiles` and wiring them with `fifos`, with `abi` the host side. Every FIFO must
+    /// have a consumer, every host binding must be the host end of exactly one FIFO of its own direction
+    /// and size, and every tile port must be the end of exactly the FIFO the tile lists for it.
+    pub fn new(
         target: AieTargetId,
-        abi: &AieShapeAbi,
+        abi: AieShapeAbi,
+        tiles: Vec<AieTile>,
+        fifos: Vec<AieFifo>,
     ) -> Result<Self, AieAbiMismatch> {
-        let fifos: Vec<AieFifo> = abi
-            .bindings()
-            .iter()
-            .enumerate()
-            .map(|(binding, b)| AieFifo {
-                binding,
-                direction: match b.access() {
-                    ArgAccess::Read => FifoDirection::HostToTile,
-                    ArgAccess::Write => FifoDirection::TileToHost,
-                },
-                depth: Self::FIFO_DEPTH,
-                elements: b.elements(),
-                element: b.storage().element(),
-            })
-            .collect();
-        let tile_local_bytes = fifos
-            .iter()
-            .try_fold(0u64, |total, fifo| {
+        if tiles.is_empty() {
+            return Err(RecipeFault::NoTiles.into());
+        }
+        check_host_layout(&abi)?;
+        let mut host_ends = vec![0usize; abi.bindings().len()];
+        let mut claimed: Vec<Vec<usize>> =
+            tiles.iter().map(|tile| vec![0; tile.ports.len()]).collect();
+        for (index, tile) in tiles.iter().enumerate() {
+            for (port, &fifo) in tile.ports.iter().enumerate() {
+                if fifo >= fifos.len() {
+                    return Err(RecipeFault::UnknownFifo {
+                        tile: index,
+                        port,
+                        fifo,
+                    }
+                    .into());
+                }
+            }
+        }
+        for (fifo_index, fifo) in fifos.iter().enumerate() {
+            if fifo.depth == 0 || fifo.elements == 0 {
+                return Err(RecipeFault::Empty { fifo: fifo_index }.into());
+            }
+            if fifo.consumers.is_empty() {
+                return Err(RecipeFault::NoConsumer { fifo: fifo_index }.into());
+            }
+            let ends = std::iter::once((fifo.producer, true))
+                .chain(fifo.consumers.iter().map(|&end| (end, false)));
+            for (end, produces) in ends {
+                match end {
+                    FifoEnd::Host { binding } => {
+                        let Some(declared) = abi.bindings().get(binding) else {
+                            return Err(RecipeFault::UnknownBinding {
+                                fifo: fifo_index,
+                                binding,
+                                bindings: abi.bindings().len(),
+                            }
+                            .into());
+                        };
+                        // The host fills what the region reads and drains what it writes.
+                        let host_fills = produces;
+                        if host_fills != (declared.access() == ArgAccess::Read) {
+                            return Err(RecipeFault::HostDirection {
+                                fifo: fifo_index,
+                                binding,
+                                access: declared.access(),
+                            }
+                            .into());
+                        }
+                        if declared.elements() != fifo.elements
+                            || declared.storage().element() != fifo.element
+                        {
+                            return Err(RecipeFault::HostElements {
+                                fifo: fifo_index,
+                                binding,
+                                elements: fifo.elements,
+                                element: fifo.element,
+                            }
+                            .into());
+                        }
+                        host_ends[binding] += 1;
+                    }
+                    FifoEnd::Tile { tile, port } => {
+                        let listed = tiles.get(tile).and_then(|t| t.ports.get(port));
+                        if listed.is_none() {
+                            return Err(RecipeFault::UnknownPort {
+                                fifo: fifo_index,
+                                tile,
+                                port,
+                            }
+                            .into());
+                        }
+                        if listed == Some(&fifo_index) {
+                            claimed[tile][port] += 1;
+                        }
+                    }
+                }
+            }
+            if matches!(fifo.producer, FifoEnd::Host { .. })
+                && fifo
+                    .consumers
+                    .iter()
+                    .any(|end| matches!(end, FifoEnd::Host { .. }))
+            {
+                return Err(RecipeFault::HostToHost { fifo: fifo_index }.into());
+            }
+        }
+        for (binding, &fifos) in host_ends.iter().enumerate() {
+            if fifos != 1 {
+                return Err(RecipeFault::BindingStreams { binding, fifos }.into());
+            }
+        }
+        for (tile, ports) in claimed.iter().enumerate() {
+            for (port, &ends) in ports.iter().enumerate() {
+                if ends != 1 {
+                    return Err(RecipeFault::PortWiring { tile, port, ends }.into());
+                }
+            }
+        }
+        let mut tile_local_bytes = 0u64;
+        for tile in &tiles {
+            let reserved = tile.ports.iter().try_fold(0u64, |total, &fifo| {
+                let fifo = &fifos[fifo];
                 let one = fifo
                     .elements
                     .checked_mul(fifo.element.byte_width() as u64)?;
                 total.checked_add(one.checked_mul(u64::from(fifo.depth))?)
-            })
-            .ok_or(AieAbiMismatch::TileLocalOverflow)?;
+            });
+            tile_local_bytes =
+                tile_local_bytes.max(reserved.ok_or(AieAbiMismatch::TileLocalOverflow)?);
+        }
         Ok(Self {
-            symbol: symbol.to_owned(),
             target,
-            abi: abi.clone(),
+            abi,
+            tiles,
             fifos,
             invocations: 1,
             tile_local_bytes,
@@ -293,44 +541,93 @@ impl AieLinkRecipe {
         self.target
     }
 
-    /// The kernel symbol the one core runs.
-    pub fn symbol(&self) -> &str {
-        &self.symbol
+    /// The tiles, in placement order.
+    pub fn tiles(&self) -> &[AieTile] {
+        &self.tiles
     }
 
-    /// The FIFOs of the schedule, one per host binding, in binding order.
+    /// The FIFOs of the region, one per value.
     pub fn fifos(&self) -> &[AieFifo] {
         &self.fifos
     }
 
-    /// The shape ABI the recipe was built for.
+    /// The shape ABI the recipe was built for: the region's host side.
     pub fn abi(&self) -> &AieShapeAbi {
         &self.abi
     }
 
-    /// How many times the core runs its loop (one, in the sequential schedule).
+    /// How many times each core runs its loop (one, in the sequential schedule).
     pub fn invocations(&self) -> u64 {
         self.invocations
     }
 
-    /// Tile-local bytes every FIFO buffer reserves at its depth (no overflow: construction refused one).
+    /// Tile-local bytes the busiest tile reserves for its FIFO buffers at their depth (no overflow:
+    /// construction refused one).
     pub fn tile_local_bytes(&self) -> u64 {
         self.tile_local_bytes
     }
 
-    /// The recipe's canonical text: versioned, tagged and length-prefixed, and the file the driver reads.
+    /// How many streams tile `tile` reads and writes: the DMA channels its core uses.
+    pub fn tile_streams(&self, tile: usize) -> (u32, u32) {
+        let mut reads = 0;
+        let mut writes = 0;
+        for (port, &fifo) in self.tiles[tile].ports.iter().enumerate() {
+            let end = FifoEnd::Tile { tile, port };
+            if self.fifos[fifo].producer == end {
+                writes += 1;
+            } else {
+                reads += 1;
+            }
+        }
+        (reads, writes)
+    }
+
+    /// How many streams the host opens into the array and out of it: the shim channels the region uses.
+    pub fn host_streams(&self) -> (u32, u32) {
+        let reads = self
+            .fifos
+            .iter()
+            .filter(|fifo| matches!(fifo.producer, FifoEnd::Host { .. }))
+            .count();
+        let writes = self
+            .fifos
+            .iter()
+            .filter(|fifo| {
+                fifo.consumers
+                    .iter()
+                    .any(|end| matches!(end, FifoEnd::Host { .. }))
+            })
+            .count();
+        (
+            u32::try_from(reads).unwrap_or(u32::MAX),
+            u32::try_from(writes).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// The recipe's canonical text: versioned, tagged and length-prefixed, and the file the driver reads
+    /// (with the driver's `object` lines appended).
     pub fn canonical(&self) -> String {
-        let mut out = String::from("poot-aie-recipe-v1\n");
-        field(&mut out, "symbol", &self.symbol);
+        let mut out = String::from("poot-aie-recipe-v2\n");
         field(&mut out, "target", &self.target.canonical());
         field(&mut out, "invocations", &self.invocations.to_string());
-        for fifo in &self.fifos {
+        for (index, tile) in self.tiles.iter().enumerate() {
+            field(
+                &mut out,
+                "tile",
+                &format!("index={index};ports={}", join(tile.ports.iter())),
+            );
+        }
+        for (index, fifo) in self.fifos.iter().enumerate() {
             field(
                 &mut out,
                 "fifo",
                 &format!(
-                    "binding={};dir={:?};depth={};elems={};elem={:?}",
-                    fifo.binding, fifo.direction, fifo.depth, fifo.elements, fifo.element
+                    "index={index};producer={};consumers={};depth={};elems={};elem={:?}",
+                    end_canonical(fifo.producer),
+                    join(fifo.consumers.iter().map(|&end| end_canonical(end))),
+                    fifo.depth,
+                    fifo.elements,
+                    fifo.element
                 ),
             );
         }
@@ -339,63 +636,111 @@ impl AieLinkRecipe {
     }
 }
 
+/// `items` joined by commas.
+fn join<T: std::fmt::Display>(items: impl Iterator<Item = T>) -> String {
+    items
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn end_canonical(end: FifoEnd) -> String {
+    match end {
+        FifoEnd::Host { binding } => format!("host.{binding}"),
+        FifoEnd::Tile { tile, port } => format!("tile.{tile}.{port}"),
+    }
+}
+
 fn field(out: &mut String, tag: &str, value: &str) {
     let _ = writeln!(out, "{tag}[{}]={value}", value.len());
 }
 
 /// The shape ABI in canonical text: ordered, with every dimension (equal element counts under different
-/// dimensions are different ABIs), the full storage record, access and proved access range.
+/// dimensions are different ABIs), the full storage record, access, proved access range and the arena
+/// placement the host and the link driver both address.
 fn abi_canonical(abi: &AieShapeAbi) -> String {
     let mut out = String::new();
+    for (index, arena) in abi.arenas().iter().enumerate() {
+        field(
+            &mut out,
+            "arena",
+            &format!(
+                "index={index};access={:?};elem={:?};words={}",
+                arena.access(),
+                arena.element(),
+                arena.words()
+            ),
+        );
+    }
     for (index, binding) in abi.bindings().iter().enumerate() {
         let storage = binding.storage();
         field(
             &mut out,
             "binding",
             &format!(
-                "index={index};element={:?};dtype={:?};layout={:?};access={:?};dims={:?};accessed={}",
+                "index={index};element={:?};dtype={:?};layout={:?};access={:?};dims={:?};accessed={};arena={};offset={}",
                 storage.element(),
                 storage.dtype(),
                 storage.layout(),
                 binding.access(),
                 binding.dims(),
-                binding.accessed_elements()
+                binding.accessed_elements(),
+                binding.arena(),
+                binding.offset()
             ),
         );
     }
     out
 }
 
-/// Check that `body`'s buffer parameters and `abi`'s bindings describe one kernel: count, element kind and
-/// which buffers are written, in order. A body that can trap is refused (the ABI binds no error word).
-pub(crate) fn check_body_abi(body: &Body, abi: &AieShapeAbi) -> Result<(), AieAbiMismatch> {
+/// Check that tile `tile`'s `body` and the recipe describe one core: its buffer parameters are the tile's
+/// ports in count, element kind and which ones the tile writes. A body that can trap is refused (the ABI
+/// binds no error word), and so is a host binding that is not dense row-major.
+pub(crate) fn check_tile_body(
+    recipe: &AieLinkRecipe,
+    tile: usize,
+    body: &Body,
+) -> Result<(), AieAbiMismatch> {
     if body.has_trap() {
-        return Err(AieAbiMismatch::Trap);
+        return Err(AieAbiMismatch::Trap { tile });
     }
-    let schema = try_arg_schema(body).map_err(|index| AieAbiMismatch::Parameter { index })?;
-    if schema.len() != abi.bindings().len() {
+    let schema = try_arg_schema(body).map_err(|index| AieAbiMismatch::Parameter { tile, index })?;
+    let ports = &recipe.tiles[tile].ports;
+    if schema.len() != ports.len() {
         return Err(AieAbiMismatch::Count {
+            tile,
             body: schema.len(),
-            abi: abi.bindings().len(),
+            recipe: ports.len(),
         });
     }
-    for (index, (arg, binding)) in schema.iter().zip(abi.bindings()).enumerate() {
+    for (port, (arg, &fifo)) in schema.iter().zip(ports).enumerate() {
+        let fifo = &recipe.fifos[fifo];
+        if arg.element() != fifo.element {
+            return Err(AieAbiMismatch::Element {
+                tile,
+                port,
+                body: arg.element(),
+                fifo: fifo.element,
+            });
+        }
+        let writes = fifo.producer == FifoEnd::Tile { tile, port };
+        if (arg.access() == ArgAccess::Write) != writes {
+            return Err(AieAbiMismatch::Access {
+                tile,
+                port,
+                body_writes: arg.access() == ArgAccess::Write,
+                fifo_writes: writes,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Check the recipe's host side is dense row-major storage, the only layout the sequential schedule moves.
+fn check_host_layout(abi: &AieShapeAbi) -> Result<(), AieAbiMismatch> {
+    for (index, binding) in abi.bindings().iter().enumerate() {
         if binding.storage().layout() != StorageLayout::Dense {
             return Err(AieAbiMismatch::Layout { index });
-        }
-        if arg.element() != binding.storage().element() {
-            return Err(AieAbiMismatch::Element {
-                index,
-                body: arg.element(),
-                abi: binding.storage().element(),
-            });
-        }
-        if arg.access() != binding.access() {
-            return Err(AieAbiMismatch::Access {
-                index,
-                body_writes: arg.access() == ArgAccess::Write,
-                abi_writes: binding.access() == ArgAccess::Write,
-            });
         }
     }
     Ok(())
@@ -554,29 +899,43 @@ pub struct AieIdentity {
 }
 
 impl AieIdentity {
-    /// The identity of linking `body` with `recipe` using `tools`. Pure over its inputs: it reads no
-    /// environment and starts no process, so a test names exactly the dimension it varies.
-    pub fn new(body: &Body, recipe: &AieLinkRecipe, tools: &AieTools) -> Self {
+    /// The identity of linking `bodies` (one per tile, in tile order) with `recipe` using `tools`. Pure
+    /// over its inputs: it reads no environment and starts no process, so a test names exactly the
+    /// dimension it varies. The core text names the distinct core objects and how they are built; the
+    /// link text places them: which body runs on which tile and how the tiles are wired.
+    pub fn new(bodies: &[&Body], recipe: &AieLinkRecipe, tools: &AieTools) -> Self {
         let target = recipe.target;
-        let mut core = String::from("poot-aie-core-v1\n");
-        field(
-            &mut core,
-            "body",
-            &format!("{:016x}", body_fingerprint(body)),
-        );
-        field(&mut core, "symbol", &body.name);
+        let mut distinct: Vec<(u64, String)> = bodies
+            .iter()
+            .enumerate()
+            .map(|(tile, body)| (body_fingerprint(body), core_symbol(recipe, tile, body)))
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut core = String::from("poot-aie-core-v2\n");
+        for (fingerprint, symbol) in distinct {
+            field(&mut core, "body", &format!("{fingerprint:016x}"));
+            field(&mut core, "symbol", &symbol);
+        }
         field(&mut core, "isa", target.isa().march());
         field(&mut core, "numerics", NUMERICAL_CONTRACT);
         field(&mut core, "core-abi", &CORE_ABI_REVISION.to_string());
         field(&mut core, "codegen", codegen_src_hash());
         field(&mut core, "flags", &Target::AieCore.llc_args().join(" "));
         field(&mut core, "peano", &tools.peano.canonical());
-        let mut link = String::from("poot-aie-link-v1\n");
+        let mut link = String::from("poot-aie-link-v2\n");
         field(
             &mut link,
             "core",
             &format!("{:016x}", poot_runtime_common::fnv1a_bytes(core.as_bytes())),
         );
+        for (tile, body) in bodies.iter().enumerate() {
+            field(
+                &mut link,
+                "placed",
+                &format!("tile={tile};body={:016x}", body_fingerprint(body)),
+            );
+        }
         link.push_str(&recipe.canonical());
         field(&mut link, "platform", target.platform().name());
         field(&mut link, "abi", &target.abi_revision().to_string());
@@ -613,58 +972,125 @@ impl AieToolIdentity {
     }
 }
 
-/// A compiled core object with the typed recipe it will be linked with. Not runnable.
+/// The compiled core objects of a region with the typed recipe they will be linked with. Not runnable.
 #[derive(Clone, Debug)]
 pub(crate) struct AieObjectPlan {
-    pub symbol: String,
-    pub object: Vec<u8>,
+    /// The distinct core objects: the file name the driver finds each under, its entry symbol and bytes.
+    pub objects: Vec<AieObject>,
+    /// For each tile of the recipe, the index of its object in `objects`.
+    pub tile_objects: Vec<usize>,
     pub recipe: AieLinkRecipe,
 }
 
-/// Compile `body` to an AIE core object and pair it with its recipe. `scratch` is a private directory the
-/// caller owns and removes.
+/// One compiled core object.
+#[derive(Clone, Debug)]
+pub(crate) struct AieObject {
+    pub file: String,
+    pub symbol: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Compile every distinct body of `bodies` (one per tile of `recipe`) to an AIE core object and pair them
+/// with the recipe. `scratch` is a private directory the caller owns and removes.
 pub(crate) fn build_object_plan(
-    body: &Body,
+    bodies: &[&Body],
     recipe: &AieLinkRecipe,
     toolchain: &Toolchain,
     scratch: &Path,
 ) -> Result<AieObjectPlan, AieCompileError> {
-    check_body_abi(body, recipe.abi())?;
-    let out = scratch.join(format!("{}.o", body.name));
-    compile_with(body, Target::AieCore, &out, toolchain).map_err(|error| match error {
-        CompileError::Emit(error) => AieCompileError::Emit(error),
-        CompileError::Io(error) => AieCompileError::Io(error),
-        CompileError::ToolchainMissing { variable, .. } => AieCompileError::ToolchainMissing {
-            stage: AieStage::Peano,
-            variable,
-        },
-        CompileError::Llc { status, stderr, .. } => AieCompileError::Tool {
-            stage: AieStage::Peano,
-            status,
-            stderr,
-        },
-        CompileError::NoContraction(_) | CompileError::ArtifactTooLarge(_) => {
-            unreachable!("only SPIR-V post-processing and bounded cache reads raise this")
+    check_bodies(bodies, recipe)?;
+    let mut objects: Vec<AieObject> = Vec::new();
+    let mut symbols: Vec<String> = Vec::new();
+    let mut tile_objects = Vec::with_capacity(bodies.len());
+    for (tile, body) in bodies.iter().enumerate() {
+        let symbol = core_symbol(recipe, tile, body);
+        if let Some(index) = symbols.iter().position(|known| *known == symbol) {
+            tile_objects.push(index);
+            continue;
         }
-    })?;
-    let object = std::fs::read(&out)?;
-    // A smoke check, not a symbol-table lookup: an ELF whose bytes name the core symbol. An empty name has
-    // no symbol to find, so it is the same typed refusal.
-    if !object.starts_with(b"\x7fELF")
-        || body.name.is_empty()
-        || !object
-            .windows(body.name.len())
-            .any(|window| window == body.name.as_bytes())
-    {
-        return Err(AieCompileError::CoreObject {
-            symbol: body.name.clone(),
+        // A body with no name has no symbol for a core object to define.
+        if body.name.is_empty() {
+            return Err(AieCompileError::CoreObject {
+                symbol: String::new(),
+            });
+        }
+        let file = format!("{symbol}.o");
+        let out = scratch.join(&file);
+        let mut core = (*body).clone();
+        core.name = symbol.clone();
+        compile_with(&core, Target::AieCore, &out, toolchain).map_err(|error| match error {
+            CompileError::Emit(error) => AieCompileError::Emit(error),
+            CompileError::Io(error) => AieCompileError::Io(error),
+            CompileError::ToolchainMissing { variable, .. } => AieCompileError::ToolchainMissing {
+                stage: AieStage::Peano,
+                variable,
+            },
+            CompileError::Llc { status, stderr, .. } => AieCompileError::Tool {
+                stage: AieStage::Peano,
+                status,
+                stderr,
+            },
+            CompileError::NoContraction(_) | CompileError::ArtifactTooLarge(_) => {
+                unreachable!("only SPIR-V post-processing and bounded cache reads raise this")
+            }
+        })?;
+        let bytes = std::fs::read(&out)?;
+        // A smoke check, not a symbol-table lookup: an ELF whose bytes name the core symbol.
+        if !bytes.starts_with(b"\x7fELF")
+            || !bytes
+                .windows(core.name.len())
+                .any(|window| window == core.name.as_bytes())
+        {
+            return Err(AieCompileError::CoreObject {
+                symbol: core.name.clone(),
+            });
+        }
+        tile_objects.push(objects.len());
+        symbols.push(symbol);
+        objects.push(AieObject {
+            file,
+            symbol: core.name.clone(),
+            bytes,
         });
     }
     Ok(AieObjectPlan {
-        symbol: body.name.clone(),
-        object,
+        objects,
+        tile_objects,
         recipe: recipe.clone(),
     })
+}
+
+/// The entry symbol of the core object tile `tile` runs. Every core object of a region is linked into one
+/// IRON module, where a kernel symbol is global and carries the argument types it was declared with. Two
+/// distinct bodies of one generator share a name, and one body runs on tiles of different shapes (its lengths
+/// are arguments), so the symbol names the body's fingerprint and the element counts of the tile's ports:
+/// two tiles share an object exactly when they run the same body over the same shapes.
+fn core_symbol(recipe: &AieLinkRecipe, tile: usize, body: &Body) -> String {
+    let sizes: Vec<String> = recipe.tiles()[tile]
+        .ports
+        .iter()
+        .map(|&fifo| recipe.fifos()[fifo].elements.to_string())
+        .collect();
+    format!(
+        "{}_{:016x}_{}",
+        body.name,
+        body_fingerprint(body),
+        sizes.join("_")
+    )
+}
+
+/// One body per tile, each the core its tile's ports describe.
+fn check_bodies(bodies: &[&Body], recipe: &AieLinkRecipe) -> Result<(), AieAbiMismatch> {
+    if bodies.len() != recipe.tiles().len() {
+        return Err(AieAbiMismatch::BodyCount {
+            tiles: recipe.tiles().len(),
+            bodies: bodies.len(),
+        });
+    }
+    for (tile, body) in bodies.iter().enumerate() {
+        check_tile_body(recipe, tile, body)?;
+    }
+    Ok(())
 }
 
 /// Link `plan` into a loadable artifact with the IRON driver. Both outputs are read and the bundle
@@ -675,16 +1101,28 @@ pub(crate) fn link_object(
     target: AieTargetId,
     scratch: &Path,
 ) -> Result<AieLinkedArtifact, AieCompileError> {
-    let object = scratch.join(format!("{}.link.o", plan.symbol));
+    let objects = scratch.join("objects");
     let recipe = scratch.join("recipe.txt");
     let xclbin = scratch.join("final.xclbin");
     let insts = scratch.join("insts.bin");
-    std::fs::write(&object, &plan.object)?;
-    std::fs::write(&recipe, plan.recipe.canonical())?;
+    std::fs::create_dir_all(&objects)?;
+    for object in &plan.objects {
+        std::fs::write(objects.join(&object.file), &object.bytes)?;
+    }
+    let mut text = plan.recipe.canonical();
+    for (tile, &object) in plan.tile_objects.iter().enumerate() {
+        let object = &plan.objects[object];
+        field(
+            &mut text,
+            "object",
+            &format!("tile={tile};file={};symbol={}", object.file, object.symbol),
+        );
+    }
+    std::fs::write(&recipe, text)?;
     let output = Command::new(&tools.iron.path)
         .args(["link", "--platform", target.platform().name()])
-        .arg("--object")
-        .arg(&object)
+        .arg("--objects")
+        .arg(&objects)
         .arg("--recipe")
         .arg(&recipe)
         .arg("--xclbin")
@@ -747,12 +1185,12 @@ pub struct AieCompiled {
     pub identity: AieIdentity,
 }
 
-/// The whole pipeline: resolve the tools, then serve the artifact for `(body, recipe)` from `cache`
-/// or build it (core object, recipe, IRON link), publishing the validated bundle as one entry. Tool
-/// resolution comes first, so a missing or unsupported toolchain fails before any scratch exists or any
-/// entry is written.
+/// The whole pipeline: resolve the tools, then serve the artifact for `(bodies, recipe)` from `cache`
+/// or build it (core objects, recipe, IRON link), publishing the validated bundle as one entry. `bodies` are
+/// one per tile of `recipe`, in tile order. Tool resolution comes first, so a missing or unsupported
+/// toolchain fails before any scratch exists or any entry is written.
 pub fn compile_aie(
-    body: &Body,
+    bodies: &[&Body],
     recipe: &AieLinkRecipe,
     toolchain: &Toolchain,
     cache: &KernelCache,
@@ -760,12 +1198,12 @@ pub fn compile_aie(
 ) -> Result<AieCompiled, AieCompileError> {
     let (abi, target) = (recipe.abi(), recipe.target());
     let tools = resolve_aie_tools(toolchain, target)?;
-    check_body_abi(body, abi)?;
-    let identity = AieIdentity::new(body, recipe, &tools);
+    check_bodies(bodies, recipe)?;
+    let identity = AieIdentity::new(bodies, recipe, &tools);
     let key = identity.cache_key();
     let built = cache.load_or_build(&key, max_artifact_bytes, || {
         let scratch = Scratch::create(cache, &key)?;
-        let plan = build_object_plan(body, recipe, toolchain, &scratch.0)?;
+        let plan = build_object_plan(bodies, recipe, toolchain, &scratch.0)?;
         Ok::<_, AieCompileError>(link_object(&plan, &tools, target, &scratch.0)?.to_bytes())
     })?;
     let artifact = AieLinkedArtifact::from_bytes(&built.bytes, target)?;

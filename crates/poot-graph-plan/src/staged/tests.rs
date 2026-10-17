@@ -846,7 +846,7 @@ fn read_traffic_counts_each_streamed_weight_once_and_the_cache_per_position() {
     let per_position = TRAFFIC_KV_HEADS * TRAFFIC_HEAD_DIM * f32_bytes;
     assert_eq!(traffic.kv_bytes_per_position, per_position as u64);
     assert_eq!(
-        traffic.step_bytes(5),
+        traffic.step_bytes([2, 3]),
         (embed + proj + 5 * per_position) as u64
     );
 }
@@ -888,4 +888,58 @@ fn a_blocked_cache_counts_its_entry_over_the_positions_it_covers() {
         (DIM * 4 / RATIO as usize) as u64
     );
     assert_eq!(traffic.recurrent_state_bytes, 0);
+}
+
+/// A cache a block-selected attention reads is counted at no more than its `(K + 1) * ratio` positions per
+/// token, not at every attended position (POOT-1143): a token attending 40 positions of a cache selected from
+/// at 12 reads 12, one attending 5 reads 5. A dense cache beside it keeps counting every attended position.
+/// Mutation: count the selected cache in `kv_bytes_per_position`; the long token's bytes triple.
+#[test]
+fn a_block_selected_cache_is_counted_at_its_selected_positions() {
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, 2, 1, 4])).unwrap();
+    let ids = b
+        .constant("ids", TensorType::new(vec![1, 1, 1, 2], DType::I32))
+        .unwrap();
+    let pos = b
+        .constant("pos", TensorType::new(vec![1, 1], DType::I32))
+        .unwrap();
+    let cache = |name: &str| {
+        b.state_input(
+            name,
+            TensorType::f32(vec![1, 1, 64, 4]),
+            StateRole::Positional { axis: 2 },
+        )
+        .unwrap()
+    };
+    let (k, v) = (cache("k"), cache("v"));
+    let out = b
+        .selected_attention(
+            poot_graph_ir::SelectedAttentionAttrs {
+                n_rep: 2,
+                scale: 0.5,
+                softcap: None,
+                ratio: 4,
+                k: 2,
+            },
+            q,
+            k,
+            v,
+            ids,
+            pos,
+        )
+        .unwrap();
+    let k_out = b.binary(BinOp::Mul, k, k).unwrap();
+    let v_out = b.binary(BinOp::Mul, v, v).unwrap();
+    let graph = b
+        .finish(poot_graph_ir::Outputs::new(out).with_state(&[(k, k_out), (v, v_out)]))
+        .expect("the fixture validates");
+    let traffic = staged(&graph, pipeline(&[]), &options()).read_traffic();
+    let per_position = 2 * 4 * 4; // k and v: four f32 per position each
+    assert_eq!(traffic.kv_bytes_per_position, 0);
+    assert_eq!(traffic.selected_kv_bytes_per_position, per_position);
+    assert_eq!(traffic.selected_positions, 12);
+    let base = traffic.step_bytes([]);
+    assert_eq!(traffic.step_bytes([5]) - base, 5 * per_position);
+    assert_eq!(traffic.step_bytes([40]) - base, 12 * per_position);
 }

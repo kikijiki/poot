@@ -14,9 +14,9 @@
 //! body's workgroup size to get dispatch counts), so a body and the grid that shapes it come out of one
 //! function and cannot disagree.
 
+use poot_kernel_ir::serialize::{Grid, serialize_grid};
 use poot_kernel_ir::{
-    BasicBlock, BinOp, BlockId, Body, Constant, FRAGMENT_COLLECTIVE_LANES, MathOp, Operand, Place,
-    Rvalue, Statement, Terminator, Ty, UnOp, WmmaDtype, WmmaShape,
+    BinOp, Body, FRAGMENT_COLLECTIVE_LANES, MathOp, Statement, Ty, UnOp, WmmaDtype, WmmaShape,
 };
 use poot_target::{BufferStorage, DeviceCaps};
 
@@ -24,6 +24,7 @@ use crate::KernelGenError;
 use crate::attention::{
     AttentionCombineSpec, AttentionSpec, attention_body, attention_combine_body,
 };
+use crate::block_top_k::{BlockTopKSpec, block_top_k_body};
 use crate::contraction::{Epilogue, Schedule, dense_contraction, indexed_contraction};
 use crate::data_movement::{MovementSpec, Storage, arg_top_k_dt, movement_body, rope_dt};
 use crate::elementwise::{
@@ -41,9 +42,7 @@ use crate::fused::{
     fused_row_parallel_views, fused_views, pointwise_size, row_size,
 };
 use crate::gemv::{attn_scores_v_gemv_lds, gemv_lds};
-use crate::helpers::{
-    BodyBudget, BodyLimits, BodySize, Layout, WeightLayout, copy, elem, guard, ld, local, slice_f32,
-};
+use crate::helpers::{BodyBudget, BodyLimits, BodySize, Layout, WeightLayout};
 use crate::matmul::{
     matmul_batched_dt_grid, matmul_batched_epilogue_dt_grid, matmul_batched_nk_grid,
 };
@@ -287,6 +286,8 @@ pub enum KernelRequest {
     Rope(RopeSpec),
     /// Batched argtop-k index extraction.
     TopK(TopKSpec),
+    /// The per-query block selection of a sparse-attention indexer: a radix select over block scores.
+    BlockTopK(BlockTopKSpec),
 }
 
 impl KernelRequest {
@@ -373,6 +374,7 @@ impl KernelRequest {
             Self::Packed(_) => "packed",
             Self::Rope(_) => "rope",
             Self::TopK(_) => "topk",
+            Self::BlockTopK(_) => "block_top_k",
         }
     }
 }
@@ -938,13 +940,14 @@ fn recipe_size(req: &KernelRequest) -> Option<BodySize> {
 
 fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
     match req {
-        KernelRequest::Elementwise(spec) => elementwise(spec, caps),
+        KernelRequest::Elementwise(spec) => elementwise(spec, Placement::Grid(caps)),
         KernelRequest::Pointwise(spec) => pointwise(spec, caps),
         KernelRequest::Row(spec) => row(spec, caps),
         KernelRequest::Contraction(spec) => contraction(spec, caps),
         KernelRequest::Attention(spec) => attention(spec, caps),
         KernelRequest::AttentionCombine(spec) => attention_combine(spec, caps),
         KernelRequest::Scan(spec) => scan(spec, caps),
+        KernelRequest::BlockTopK(spec) => block_top_k(spec, caps),
         KernelRequest::Movement(spec) => movement(spec, caps),
         KernelRequest::Packed(spec) => {
             let body = packed_kernel(spec.name, spec.spec)?;
@@ -973,10 +976,13 @@ fn build(req: &KernelRequest, caps: &DeviceCaps) -> Result<Generated, KernelGenE
     }
 }
 
-fn elementwise(spec: &ElementwiseSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
+fn elementwise(
+    spec: &ElementwiseSpec,
+    placement: Placement<'_>,
+) -> Result<Generated, KernelGenError> {
     match spec {
         ElementwiseSpec::Unary { op, dt, view, fold } => {
-            let xg = fold.x_groups(caps);
+            let xg = placement.x_groups(*fold);
             let dt = dt.clone();
             let body = match (op, view) {
                 (UnaryOp::Basic(op), None) => unary_dt_grid(ENTRY, dt, *op, xg),
@@ -1004,7 +1010,7 @@ fn elementwise(spec: &ElementwiseSpec, caps: &DeviceCaps) -> Result<Generated, K
                     ));
                 }
             };
-            with(body, fold.launch(caps))
+            with(body, placement.launch(*fold))
         }
         ElementwiseSpec::ScalarFloat {
             op,
@@ -1017,18 +1023,18 @@ fn elementwise(spec: &ElementwiseSpec, caps: &DeviceCaps) -> Result<Generated, K
                 *op,
                 dt.clone(),
                 f32::from_bits(*lit_bits),
-                fold.x_groups(caps),
+                placement.x_groups(*fold),
             ),
-            fold.launch(caps),
+            placement.launch(*fold),
         ),
         ElementwiseSpec::ScalarI32 { op, lit, fold } => {
-            let xg = fold.x_groups(caps);
+            let xg = placement.x_groups(*fold);
             let body = match op {
                 I32Binary::GeU => binary_scalar_i32_geu_grid(ENTRY, *lit, xg),
                 I32Binary::RemU => binary_scalar_i32_remu_grid(ENTRY, *lit, xg),
                 I32Binary::Basic(op) => binary_scalar_i32_grid(ENTRY, *op, *lit, xg),
             };
-            with(body, fold.launch(caps))
+            with(body, placement.launch(*fold))
         }
         ElementwiseSpec::Binary {
             op,
@@ -1037,7 +1043,7 @@ fn elementwise(spec: &ElementwiseSpec, caps: &DeviceCaps) -> Result<Generated, K
             b,
             fold,
         } => {
-            let xg = fold.x_groups(caps);
+            let xg = placement.x_groups(*fold);
             let body = match op {
                 ValueBinary::GeU => binary_broadcast_i32_geu_views_grid(
                     ENTRY, out_shape, &a.shape, &a.layout, &b.shape, &b.layout, xg,
@@ -1057,7 +1063,7 @@ fn elementwise(spec: &ElementwiseSpec, caps: &DeviceCaps) -> Result<Generated, K
                     xg,
                 ),
             };
-            with(body, fold.launch(caps))
+            with(body, placement.launch(*fold))
         }
         ElementwiseSpec::Cast(cast) => match cast {
             CastSpec::F32ToBf16 { numel } => with(cast_f32_to_bf16(ENTRY), Launch::flat(*numel)),
@@ -1410,6 +1416,15 @@ fn scan(spec: &ScanSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError>
     )
 }
 
+fn block_top_k(spec: &BlockTopKSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
+    let (x, y) = fold_groups(spec.queries, caps.max_grid[0]);
+    let lanes = crate::block_top_k::LANES;
+    with(
+        block_top_k_body(ENTRY, spec, x)?,
+        Launch::grid([(x * lanes) as u32, y as u32, 1]),
+    )
+}
+
 fn movement(spec: &MovementSpec, caps: &DeviceCaps) -> Result<Generated, KernelGenError> {
     with(
         movement_body(ENTRY, spec, spec.fold.x_groups(caps))?,
@@ -1417,222 +1432,258 @@ fn movement(spec: &MovementSpec, caps: &DeviceCaps) -> Result<Generated, KernelG
     )
 }
 
-/// The sequential schedule of an ordinary request (POOT-664): the iteration space of an AIE core, which
-/// runs one scalar loop over the whole tensor, selected by the target instead of a thread grid. The request
-/// is the one the GPU planner builds; only the schedule differs, so no second recognizer exists. The
-/// finite iteration count and the proved access ranges come back in [`SequentialGenerated`].
+/// How an elementwise kernel's threads are placed: on a device's thread grid, or run one after another by a
+/// single core.
+#[derive(Clone, Copy)]
+enum Placement<'a> {
+    /// A thread grid bounded by the device's caps (the 2-D fold reads them).
+    Grid(&'a DeviceCaps),
+    /// One core, no grid cap: the planner never folds a kernel it serializes.
+    Serial,
+}
+
+impl Placement<'_> {
+    fn x_groups(self, fold: Fold) -> Option<usize> {
+        match self {
+            Placement::Grid(caps) => fold.x_groups(caps),
+            Placement::Serial => None,
+        }
+    }
+
+    fn launch(self, fold: Fold) -> Launch {
+        match self {
+            Placement::Grid(caps) => fold.launch(caps),
+            Placement::Serial => Launch::flat(fold.numel),
+        }
+    }
+}
+
+/// How far an AIE op's F32 result may be from the exact (infinitely precise) result, for finite operands
+/// whose result is a finite normal number (overflow, underflow and subnormal results are not promised).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ErrorBound {
+    /// The IEEE-754 round-to-nearest-even result, bit for bit.
+    Exact,
+    /// At most `n * f32::EPSILON * max(|a|, |b|)`. The AIE2p adder does not round to nearest even: its
+    /// result is faithful (within one unit in the last place of the result, which is up to two units of the
+    /// larger operand), and a cancellation that leaves a small result is exact (Sterbenz). The error is
+    /// therefore a bound on the operands, not on the result.
+    OperandUlps(u32),
+    /// `|got - exact| <= abs + rel * |exact|`.
+    Result {
+        /// The absolute part of the bound.
+        abs: f32,
+        /// The relative part of the bound.
+        rel: f32,
+    },
+}
+
+/// The numerical contract of one AIE pointwise op: what its F32 result is promised to be. The AIE2p core has
+/// no hardware transcendental unit, so an op is either one the core executes (and rounds in its own way) or
+/// a software sequence, and the sequence's accuracy is part of the kernel's identity, not an accident of its
+/// lowering. Tier 2 compares a run against the exact result within `bound`, over the inputs in `domain`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NumericalContract {
+    /// The contract's name, stated in the kernel's identity.
+    pub id: &'static str,
+    /// The error the result may have.
+    pub bound: ErrorBound,
+    /// The inclusive range of the (first) operand the bound is promised over; the core's software sequences
+    /// clamp or lose accuracy outside it. Arithmetic is promised over every finite operand.
+    pub domain: (f32, f32),
+}
+
+/// A pointwise op an AIE core runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AieOp {
+    /// `a <op> b` over F32.
+    Binary(BinOp),
+    /// `<op>(x)` over F32.
+    Unary(UnaryOp),
+}
+
+impl AieOp {
+    /// The numerical contract the op runs under, or `None` when no lowering is proved for it. An op without a
+    /// contract is a typed refusal: it never silently runs under another op's. Each contract was measured on
+    /// an XDNA2 core against the exact result (`poot-npu/tests/aie_pointwise.rs`), and the bound has margin
+    /// over the worst error seen; an op the real Peano toolchain cannot compile (`sqrt`, `round`, `max`: it
+    /// aborts) has none.
+    pub fn contract(self) -> Option<NumericalContract> {
+        const FINITE: (f32, f32) = (f32::MIN, f32::MAX);
+        let exact = |id| NumericalContract {
+            id,
+            bound: ErrorBound::Exact,
+            domain: FINITE,
+        };
+        let software = |id, domain| NumericalContract {
+            id,
+            bound: ErrorBound::Result {
+                abs: 2e-6,
+                rel: 1e-5,
+            },
+            domain,
+        };
+        Some(match self {
+            AieOp::Binary(BinOp::Add | BinOp::Sub) => NumericalContract {
+                id: "f32-add-sub-aie2p-v1",
+                bound: ErrorBound::OperandUlps(2),
+                domain: FINITE,
+            },
+            AieOp::Binary(BinOp::Mul) => exact("f32-mul-rne-v1"),
+            AieOp::Binary(BinOp::Div) => exact("f32-div-rne-v1"),
+            AieOp::Binary(BinOp::Ge) => exact("f32-ge-v1"),
+            AieOp::Unary(UnaryOp::Basic(UnOp::Neg)) => exact("f32-neg-v1"),
+            AieOp::Unary(UnaryOp::Recip) => exact("f32-recip-rne-v1"),
+            // The software sequences (`poot-codegen`'s AIE core lowering): exp clamps its argument to
+            // [-88, 88], log is the atanh series, tanh and erf are the devices' shared closed forms.
+            AieOp::Unary(UnaryOp::Math(MathOp::Exp)) => {
+                software("f32-exp-software-v1", (-87.0, 88.0))
+            }
+            AieOp::Unary(UnaryOp::Math(MathOp::Log)) => {
+                software("f32-log-software-v1", (f32::MIN_POSITIVE, f32::MAX))
+            }
+            AieOp::Unary(UnaryOp::Tanh) => software("f32-tanh-software-v1", FINITE),
+            AieOp::Unary(UnaryOp::Erf) => software("f32-erf-software-v1", FINITE),
+            AieOp::Binary(_) | AieOp::Unary(_) => return None,
+        })
+    }
+}
+
+/// The entry symbol of a serialized body (the AIE core object's C symbol).
+const AIE_ENTRY: &str = "poot_aie_kernel";
+
+/// The AIE schedule of an ordinary request (POOT-1161): the request the GPU planner builds, generated by the
+/// ordinary generator with one-thread workgroups, then its thread grid serialized into loops
+/// ([`poot_kernel_ir::serialize::serialize_grid`]) because an AIE core runs one scalar thread. No second
+/// generator exists; a request family gains an AIE schedule when its ordinary body has no thread cooperation
+/// and the family's ops have a [`NumericalContract`]. The iteration count and the proved access ranges come
+/// back in [`SerializedGenerated`].
 ///
-/// Only a dense, equal-shape F32 elementwise binary has a sequential body today; any other request is a
-/// typed [`KernelGenError::Unsupported`] (no emulated grid, no host fallback).
-pub fn sequential_schedule(
+/// Only a dense, equal-shape F32 elementwise unary or binary op with a contract has an AIE schedule today;
+/// any other request is a typed [`KernelGenError::Unsupported`] (no emulated grid, no host fallback).
+pub fn serialized_schedule(
     req: &KernelRequest,
     limits: &BodyLimits,
-) -> Result<SequentialGenerated, KernelGenError> {
-    let KernelRequest::Elementwise(ElementwiseSpec::Binary {
-        op: ValueBinary::Basic(op, Ty::F32),
-        out_shape,
-        a,
-        b,
-        ..
-    }) = req
-    else {
+) -> Result<SerializedGenerated, KernelGenError> {
+    const GENERATOR: &str = "serialized_schedule";
+    let KernelRequest::Elementwise(spec) = req else {
         return Err(unsupported(
             req.family(),
-            "no AIE sequential schedule for this request family",
+            "no AIE schedule for this request family",
         ));
     };
-    for operand in [a, b] {
-        if operand.shape != *out_shape {
+    let (op, out_shape, operands, fold) = match spec {
+        ElementwiseSpec::Binary {
+            op: ValueBinary::Basic(op, Ty::F32),
+            out_shape,
+            a,
+            b,
+            fold,
+        } => (AieOp::Binary(*op), out_shape.clone(), vec![a, b], fold),
+        ElementwiseSpec::Unary {
+            op,
+            dt: Ty::F32,
+            view: None,
+            fold,
+        } => (AieOp::Unary(*op), vec![fold.numel], Vec::new(), fold),
+        _ => {
             return Err(unsupported(
-                "sequential_binary",
-                "an operand is broadcast against the output; the sequential loop reads at the output index",
+                GENERATOR,
+                "only F32 elementwise unary and binary ops have an AIE schedule",
+            ));
+        }
+    };
+    let contract = op.contract().ok_or_else(|| {
+        unsupported(
+            GENERATOR,
+            "the AIE core has no proved lowering and numerical contract for this op",
+        )
+    })?;
+    for operand in &operands {
+        if operand.shape != out_shape {
+            return Err(unsupported(
+                GENERATOR,
+                "an operand is broadcast against the output; the AIE shape ABI binds dense equal-shape buffers",
             ));
         }
         if operand.layout != Layout::contiguous(&operand.shape) {
             return Err(unsupported(
-                "sequential_binary",
-                "an operand is a strided view; the sequential loop reads dense row-major buffers",
+                GENERATOR,
+                "an operand is a strided view; the AIE shape ABI binds dense row-major buffers",
             ));
         }
     }
-    let elems = out_shape
-        .iter()
-        .try_fold(1u64, |n, &d| n.checked_mul(d as u64))
-        .ok_or(KernelGenError::ExceedsBound {
-            generator: "sequential_binary",
-            what: "output element count".into(),
-            value: usize::MAX,
-            bound: u64::MAX as usize,
+    if fold.two_d {
+        return Err(unsupported(
+            GENERATOR,
+            "a 2-D folded launch has no AIE schedule; the core loops the whole tensor",
+        ));
+    }
+    let generated = elementwise(spec, Placement::Serial)?;
+    let threads = generated.launch.grid;
+    let iterations = threads.iter().map(|&n| u64::from(n)).product::<u64>();
+    if iterations != fold.numel as u64 {
+        return Err(KernelGenError::ExceedsBound {
+            generator: GENERATOR,
+            what: "output element count against the launch's u32 thread extent".into(),
+            value: fold.numel,
+            bound: u32::MAX as usize,
+        });
+    }
+    let mut body = generated.body;
+    // Serialization turns every thread into a loop iteration, so the workgroup has one thread. The body is
+    // the AIE core object's C symbol.
+    body.name = AIE_ENTRY.to_string();
+    body.workgroup_size = [1, 1, 1];
+    let body =
+        serialize_grid(&body, Grid { threads }).map_err(|source| KernelGenError::Serialize {
+            generator: GENERATOR,
+            source,
         })?;
-    generate_sequential(
-        &SequentialBinary {
-            op: *op,
-            dims: out_shape.iter().map(|&d| d as u64).collect(),
-            a_elems: elems,
-            b_elems: elems,
-            out_elems: elems,
-        },
-        limits,
-    )
+    BodyBudget::new(*limits).reserve(GENERATOR, BodyStage::Finished, BodySize::of(&body))?;
+    let accessed = iterations;
+    let dims: Vec<u64> = out_shape.iter().map(|&d| d as u64).collect();
+    let writes = std::iter::repeat_n(false, operands.len().max(1)).chain([true]);
+    Ok(SerializedGenerated {
+        body,
+        iterations,
+        contract,
+        bindings: writes
+            .map(|writes| SerializedBinding {
+                dims: dims.clone(),
+                writes,
+                accessed,
+            })
+            .collect(),
+    })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SequentialBinary {
-    op: BinOp,
-    /// The logical dimensions every binding shares (inputs and output have the output's shape).
-    dims: Vec<u64>,
-    a_elems: u64,
-    b_elems: u64,
-    out_elems: u64,
-}
-
-/// A sequentially scheduled kernel: its body, how many loop iterations one invocation runs, and the
-/// number of leading elements the body reads or writes of each parameter (binding order). The access
-/// counts are what the artifact's shape ABI is checked against, so a body cannot be linked against a
-/// shape it would read past.
+/// A sequentially scheduled kernel: its body, how many loop iterations one invocation runs, the numerical
+/// contract its op runs under, and the number of leading elements the body reads or writes of each parameter
+/// (binding order). The access counts are what the artifact's shape ABI is checked against, so a body cannot
+/// be linked against a shape it would read past.
 #[derive(Clone, Debug)]
-pub struct SequentialGenerated {
+pub struct SerializedGenerated {
     /// The kernel body.
     pub body: Body,
     /// Loop iterations one invocation runs.
     pub iterations: u64,
+    /// The numerical contract the op runs under.
+    pub contract: NumericalContract,
     /// One entry per body parameter, in binding order.
-    pub bindings: Box<[SequentialBinding]>,
+    pub bindings: Box<[SerializedBinding]>,
 }
 
 /// One buffer of a sequential kernel: its logical dimensions, whether the loop writes it, and how many
 /// leading elements the loop touches.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SequentialBinding {
+pub struct SerializedBinding {
     /// Logical dimensions of the buffer.
     pub dims: Vec<u64>,
     /// Whether the loop writes the buffer.
     pub writes: bool,
     /// Leading elements the loop reads or writes.
     pub accessed: u64,
-}
-
-/// The entry symbol of a sequential binary body (the AIE core object's C symbol).
-const SEQUENTIAL_BINARY_ENTRY: &str = "poot_seq_binary";
-
-/// Generate the sequential loop `out[i] = a[i] <op> b[i]` for `i in 0..len(out)`.
-///
-/// Admitted ops are those the AIE core's scalar F32 lowering is proved for (`Add`, `Sub`, `Mul`); any
-/// other is a typed [`KernelGenError::Unsupported`]. Pure; returns an error rather than panicking.
-fn generate_sequential(
-    spec: &SequentialBinary,
-    limits: &BodyLimits,
-) -> Result<SequentialGenerated, KernelGenError> {
-    const GENERATOR: &str = "sequential_binary";
-    if !matches!(spec.op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
-        return Err(unsupported(
-            GENERATOR,
-            "the AIE core's scalar F32 lowering is proved for add, sub and mul only",
-        ));
-    }
-    if spec.out_elems == 0 {
-        return Err(KernelGenError::BelowMinimum {
-            generator: GENERATOR,
-            what: "output length".into(),
-            value: 0,
-            min: 1,
-        });
-    }
-    for (what, len) in [
-        ("first input length", spec.a_elems),
-        ("second input length", spec.b_elems),
-    ] {
-        if len < spec.out_elems {
-            return Err(KernelGenError::ExceedsBound {
-                generator: GENERATOR,
-                what: format!("output length against the {what}"),
-                value: spec.out_elems as usize,
-                bound: len as usize,
-            });
-        }
-    }
-    let locals = vec![
-        ld(Ty::Unit, false),
-        ld(slice_f32(false), false),
-        ld(slice_f32(false), false),
-        ld(slice_f32(true), true),
-        ld(Ty::Usize, true),
-        ld(Ty::Usize, false),
-        ld(Ty::Bool, false),
-        ld(Ty::F32, false),
-        ld(Ty::Usize, false),
-    ];
-    let (a, b, out, i, len, cmp, value, next) = (
-        local(1),
-        local(2),
-        local(3),
-        local(4),
-        local(5),
-        local(6),
-        local(7),
-        local(8),
-    );
-    let blocks = vec![
-        BasicBlock {
-            statements: vec![
-                Statement::Assign(Place::local(len), Rvalue::Len(Place::local(out))),
-                Statement::Assign(
-                    Place::local(i),
-                    Rvalue::Use(Operand::Const(Constant::Usize(0))),
-                ),
-            ],
-            terminator: Terminator::Goto {
-                target: BlockId { index: 1 },
-            },
-        },
-        BasicBlock {
-            statements: vec![Statement::Assign(
-                Place::local(cmp),
-                Rvalue::BinaryOp(BinOp::Lt, copy(Place::local(i)), copy(Place::local(len))),
-            )],
-            terminator: guard(cmp, 3, 2),
-        },
-        BasicBlock {
-            statements: vec![
-                Statement::Assign(
-                    Place::local(value),
-                    Rvalue::BinaryOp(spec.op, copy(elem(a, i)), copy(elem(b, i))),
-                ),
-                Statement::Assign(elem(out, i), Rvalue::Use(copy(Place::local(value)))),
-                Statement::Assign(
-                    Place::local(next),
-                    Rvalue::BinaryOp(
-                        BinOp::Add,
-                        copy(Place::local(i)),
-                        Operand::Const(Constant::Usize(1)),
-                    ),
-                ),
-                Statement::Assign(Place::local(i), Rvalue::Use(copy(Place::local(next)))),
-            ],
-            terminator: Terminator::Goto {
-                target: BlockId { index: 1 },
-            },
-        },
-        BasicBlock {
-            statements: vec![],
-            terminator: Terminator::Return,
-        },
-    ];
-    let mut body = Body::new(SEQUENTIAL_BINARY_ENTRY, 3, locals, blocks);
-    // One core, one loop: there is no workgroup to size, and the body states it.
-    body.workgroup_size = [1, 1, 1];
-    BodyBudget::new(*limits).reserve(GENERATOR, BodyStage::Finished, BodySize::of(&body))?;
-    Ok(SequentialGenerated {
-        body,
-        iterations: spec.out_elems,
-        bindings: [false, false, true]
-            .map(|writes| SequentialBinding {
-                dims: spec.dims.clone(),
-                writes,
-                accessed: spec.out_elems,
-            })
-            .into(),
-    })
 }
 
 #[cfg(test)]
@@ -2386,94 +2437,317 @@ mod tests {
         );
     }
 
-    // ---- POOT-664: the sequential (single-core) schedule ------------------------------------------------
+    // ---- POOT-1161: the AIE schedule is the ordinary body with its grid serialized -----------------------
 
-    fn sequential_limits() -> crate::BodyLimits {
+    fn dense_binary(op: BinOp, shape: &[usize]) -> KernelRequest {
+        let operand = || ViewOperand {
+            shape: shape.to_vec(),
+            layout: Layout::contiguous(shape),
+        };
+        KernelRequest::Elementwise(ElementwiseSpec::Binary {
+            op: ValueBinary::Basic(op, Ty::F32),
+            out_shape: shape.to_vec(),
+            a: operand(),
+            b: operand(),
+            fold: Fold {
+                numel: shape.iter().product(),
+                two_d: false,
+                width: 256,
+            },
+        })
+    }
+
+    fn dense_unary(op: UnaryOp, numel: usize) -> KernelRequest {
+        KernelRequest::Elementwise(ElementwiseSpec::Unary {
+            op,
+            dt: Ty::F32,
+            view: None,
+            fold: Fold {
+                numel,
+                two_d: false,
+                width: 256,
+            },
+        })
+    }
+
+    /// Every op with a contract, as the request the planner builds for it.
+    fn admitted_requests(numel: usize) -> Vec<(AieOp, KernelRequest)> {
+        let binary = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Ge]
+            .map(|op| (AieOp::Binary(op), dense_binary(op, &[numel])));
+        let unary = [
+            UnaryOp::Basic(UnOp::Neg),
+            UnaryOp::Recip,
+            UnaryOp::Math(MathOp::Exp),
+            UnaryOp::Math(MathOp::Log),
+            UnaryOp::Tanh,
+            UnaryOp::Erf,
+        ]
+        .map(|op| (AieOp::Unary(op), dense_unary(op, numel)));
+        binary.into_iter().chain(unary).collect()
+    }
+
+    fn aie_limits() -> crate::BodyLimits {
         crate::BodyLimits {
             max_instructions: NonZeroUsize::new(4096).unwrap(),
             max_locals: NonZeroUsize::new(256).unwrap(),
         }
     }
 
-    fn sequential(
-        op: BinOp,
-        a: u64,
-        b: u64,
-        out: u64,
-    ) -> Result<SequentialGenerated, KernelGenError> {
-        generate_sequential(
-            &SequentialBinary {
-                op,
-                dims: vec![out],
-                a_elems: a,
-                b_elems: b,
-                out_elems: out,
-            },
-            &sequential_limits(),
-        )
+    fn f32_buffers(inputs: usize, numel: usize) -> Vec<poot_kernel_ir::interp::Buffer> {
+        use poot_kernel_ir::interp::Buffer;
+        let sample = |k: usize| -> Vec<f32> {
+            (0..numel)
+                .map(|i| 0.3 + 0.17 * ((i * (k + 3)) % 29) as f32)
+                .collect()
+        };
+        (0..inputs)
+            .map(|k| Buffer::from_f32s(&sample(k)))
+            .chain([Buffer::from_f32s(&vec![f32::NAN; numel])])
+            .collect()
     }
 
-    /// The sequential schedule has no grid: one workgroup of one, a finite iteration count equal to the
-    /// output length, and every parameter's proved access range is that length. Mutation: widen `accessed`
-    /// past `out_elems` or drop the workgroup assignment; the equality below fails.
+    /// Tier 1 on the production bodies: the AIE schedule of each admitted request, run as one thread, writes
+    /// exactly what the ordinary GPU body writes when run over its grid. 70 elements is not a whole number of
+    /// the GPU body's 64-thread workgroups, so the ordinary body's bounds guard is part of what is compared.
+    ///
+    /// Mutation: in `serialized_schedule` serialize over `Grid { threads: [1, 1, 1] }`; only the first element
+    /// is written and the buffers differ.
     #[test]
-    fn a_sequential_binary_states_its_iteration_space_and_access_ranges() {
-        let generated = sequential(BinOp::Add, 6, 6, 6).unwrap();
-        assert_eq!(generated.body.workgroup_size, [1, 1, 1]);
-        assert_eq!(generated.iterations, 6);
-        let accessed: Vec<u64> = generated.bindings.iter().map(|b| b.accessed).collect();
-        assert_eq!(accessed, [6, 6, 6]);
+    fn the_aie_schedule_computes_what_the_grid_body_computes() {
+        use poot_kernel_ir::interp::run;
+        const NUMEL: usize = 70;
+        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        for (op, request) in admitted_requests(NUMEL) {
+            let inputs = if matches!(op, AieOp::Unary(_)) { 1 } else { 2 };
+            let grid_body = generate(&request, &caps, &aie_limits()).unwrap();
+            let [x, ..] = grid_body.launch.grid;
+            let [wg, ..] = grid_body.body.workgroup_size;
+            let mut want = f32_buffers(inputs, NUMEL);
+            run(&grid_body.body, [x.div_ceil(wg), 1, 1], &mut want).unwrap();
+
+            let scheduled = serialized_schedule(&request, &aie_limits()).unwrap();
+            assert_eq!(scheduled.body.workgroup_size, [1, 1, 1], "{op:?}");
+            let mut got = f32_buffers(inputs, NUMEL);
+            run(&scheduled.body, [1, 1, 1], &mut got).unwrap();
+
+            let out = inputs;
+            assert!(
+                want[out].to_f32s().unwrap().iter().all(|v| !v.is_nan()),
+                "{op:?}: the grid body leaves an element unwritten"
+            );
+            assert_eq!(got, want, "{op:?}");
+        }
+    }
+
+    /// The schedule states its iteration space, bindings and contract, and its entry symbol is the AIE
+    /// core's. Mutation: widen `accessed` past the element count or drop the `writes` flag of the output;
+    /// the equalities below fail.
+    #[test]
+    fn the_aie_schedule_states_its_iteration_space_bindings_and_contract() {
+        let binary =
+            serialized_schedule(&dense_binary(BinOp::Add, &[2, 3]), &aie_limits()).unwrap();
+        assert_eq!(binary.iterations, 6);
+        assert_eq!(binary.body.name, AIE_ENTRY);
         assert_eq!(
-            generated
+            binary.contract,
+            AieOp::Binary(BinOp::Add).contract().unwrap()
+        );
+        assert_eq!(
+            binary.bindings.as_ref(),
+            [false, false, true].map(|writes| SerializedBinding {
+                dims: vec![2, 3],
+                writes,
+                accessed: 6,
+            })
+        );
+        assert!(binary.body.verify().is_ok());
+
+        let unary = serialized_schedule(&dense_unary(UnaryOp::Tanh, 5), &aie_limits()).unwrap();
+        assert_eq!(unary.iterations, 5);
+        assert_eq!(
+            unary.bindings.iter().map(|b| b.writes).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert!(
+            unary
                 .bindings
                 .iter()
-                .map(|b| b.writes)
-                .collect::<Vec<_>>(),
-            [false, false, true]
+                .all(|b| b.dims == [5] && b.accessed == 5)
         );
-        assert_eq!(generated.body.name, SEQUENTIAL_BINARY_ENTRY);
-        assert!(generated.body.verify().is_ok());
     }
 
-    /// A loop over the output that would read past a shorter input is refused by the generator, with the
-    /// first input and the second named apart. Mutation: delete the `len < out_elems` comparison; the short
-    /// input is admitted and both errors below become `Ok`.
+    /// An op has an AIE schedule exactly when it has a numerical contract, and an op without one is a typed
+    /// refusal that names the missing lowering, never a body under another op's contract.
+    /// Mutation: give `sqrt` a contract; the refusal row below turns `Ok`.
     #[test]
-    fn a_sequential_loop_over_a_shorter_input_is_refused() {
-        for (a, b, side) in [(4, 6, "first input"), (6, 4, "second input")] {
-            let error = sequential(BinOp::Add, a, b, 6).unwrap_err();
-            let KernelGenError::ExceedsBound {
-                generator,
-                what,
-                value,
-                bound,
-            } = error
-            else {
-                panic!("expected ExceedsBound, got {error:?}");
-            };
-            assert_eq!((generator, value, bound), ("sequential_binary", 6, 4));
-            assert!(what.contains(side), "{what}");
-        }
-        assert!(matches!(
-            sequential(BinOp::Add, 0, 0, 0),
-            Err(KernelGenError::BelowMinimum { .. })
-        ));
-    }
-
-    /// Only the ops the AIE core's scalar lowering is proved for generate; the rest are typed refusals.
-    #[test]
-    fn a_sequential_binary_op_without_a_proved_lowering_is_unsupported() {
-        for op in [BinOp::Div, BinOp::Max, BinOp::BitAnd, BinOp::Rem] {
+    fn an_op_without_a_contract_has_no_aie_schedule() {
+        for (op, request) in admitted_requests(4) {
+            assert!(op.contract().is_some(), "{op:?}");
             assert!(
-                matches!(
-                    sequential(op, 4, 4, 4),
-                    Err(KernelGenError::Unsupported { .. })
-                ),
+                serialized_schedule(&request, &aie_limits()).is_ok(),
                 "{op:?}"
             );
         }
-        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
-            assert!(sequential(op, 4, 4, 4).is_ok(), "{op:?}");
+        let without = [
+            dense_binary(BinOp::Max, &[4]),
+            dense_binary(BinOp::BitAnd, &[4]),
+            dense_binary(BinOp::Rem, &[4]),
+            dense_unary(UnaryOp::Math(MathOp::Sqrt), 4),
+            dense_unary(UnaryOp::Math(MathOp::Round), 4),
+            dense_unary(UnaryOp::Math(MathOp::Sin), 4),
+        ];
+        for request in without {
+            let error = serialized_schedule(&request, &aie_limits()).unwrap_err();
+            let KernelGenError::Unsupported { request, reason } = error else {
+                panic!("expected Unsupported, got {error:?}");
+            };
+            assert_eq!(request, "serialized_schedule");
+            assert!(reason.contains("no proved lowering"), "{reason}");
         }
+    }
+
+    /// A launch with no threads is the serializer's refusal, surfaced as its own typed variant carrying the
+    /// `SerializeError`, not folded into `Unsupported`. Mutation: map the serializer's error back to
+    /// `unsupported(..)` in `serialized_schedule`; the match below fails.
+    #[test]
+    fn a_grid_the_serializer_refuses_is_its_own_typed_error() {
+        let error = serialized_schedule(&dense_unary(UnaryOp::Tanh, 0), &aie_limits()).unwrap_err();
+        let KernelGenError::Serialize { generator, source } = error else {
+            panic!("expected Serialize, got {error:?}");
+        };
+        assert_eq!(generator, "serialized_schedule");
+        assert!(
+            matches!(
+                source,
+                poot_kernel_ir::serialize::SerializeError::EmptyGrid { .. }
+            ),
+            "{source:?}"
+        );
+    }
+
+    /// What the AIE shape ABI cannot bind is refused before any body is built: a broadcast or strided
+    /// operand, a folded launch, a non-F32 element, a view, another family, and an element count the launch
+    /// cannot state. Mutation: delete the operand-shape check, the stride check or the `two_d` check; the
+    /// matching row is admitted.
+    #[test]
+    fn a_request_the_aie_abi_cannot_bind_is_refused() {
+        let refused = |request: KernelRequest, needle: &str| {
+            let error = serialized_schedule(&request, &aie_limits()).unwrap_err();
+            match error {
+                KernelGenError::Unsupported { reason, .. } => {
+                    assert!(
+                        reason.contains(needle),
+                        "{reason} does not mention {needle}"
+                    )
+                }
+                other => panic!("expected Unsupported, got {other:?}"),
+            }
+        };
+        let KernelRequest::Elementwise(ElementwiseSpec::Binary {
+            op,
+            out_shape,
+            a,
+            b,
+            fold,
+        }) = dense_binary(BinOp::Add, &[2, 3])
+        else {
+            unreachable!()
+        };
+        let binary = |a: ViewOperand, b: ViewOperand, fold: Fold| {
+            KernelRequest::Elementwise(ElementwiseSpec::Binary {
+                op: op.clone(),
+                out_shape: out_shape.clone(),
+                a,
+                b,
+                fold,
+            })
+        };
+        refused(
+            binary(
+                ViewOperand {
+                    shape: vec![1, 3],
+                    layout: Layout::contiguous(&[1, 3]),
+                },
+                b.clone(),
+                fold,
+            ),
+            "broadcast",
+        );
+        refused(
+            binary(
+                ViewOperand {
+                    shape: vec![2, 3],
+                    layout: Layout {
+                        strides: vec![1, 2],
+                        offset: 0,
+                    },
+                },
+                b.clone(),
+                fold,
+            ),
+            "strided",
+        );
+        refused(
+            binary(
+                a.clone(),
+                b.clone(),
+                Fold {
+                    two_d: true,
+                    ..fold
+                },
+            ),
+            "2-D folded",
+        );
+        let ints = KernelRequest::Elementwise(ElementwiseSpec::Binary {
+            op: ValueBinary::Basic(BinOp::Add, Ty::I32),
+            out_shape: vec![2, 3],
+            a: a.clone(),
+            b: b.clone(),
+            fold,
+        });
+        refused(ints, "only F32");
+        refused(
+            KernelRequest::Elementwise(ElementwiseSpec::Unary {
+                op: UnaryOp::Tanh,
+                dt: Ty::F32,
+                view: Some(a),
+                fold,
+            }),
+            "only F32",
+        );
+        refused(
+            KernelRequest::TopK(TopKSpec {
+                e: 8,
+                k: 2,
+                numel: 4,
+            }),
+            "no AIE schedule",
+        );
+        let huge = dense_unary(UnaryOp::Tanh, u32::MAX as usize + 1);
+        assert!(matches!(
+            serialized_schedule(&huge, &aie_limits()),
+            Err(KernelGenError::ExceedsBound { .. })
+        ));
+    }
+
+    /// The finished body is measured against the limits. Mutation: drop the `Finished` reservation in
+    /// `serialized_schedule`; the over-limit body comes back `Ok`.
+    #[test]
+    fn a_serialized_body_over_the_limits_is_refused() {
+        let request = dense_binary(BinOp::Add, &[4]);
+        let scheduled = serialized_schedule(&request, &aie_limits()).unwrap();
+        let size = BodySize::of(&scheduled.body);
+        let error =
+            serialized_schedule(&request, &limits(size.instructions - 1, size.locals)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                KernelGenError::BodyLimit {
+                    stage: BodyStage::Finished,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 }

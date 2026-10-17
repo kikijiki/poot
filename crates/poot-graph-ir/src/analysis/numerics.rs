@@ -86,7 +86,8 @@ fn implied_op_numerics(op: &OpKind, out_dtype: DType) -> NumericsProperty {
         | OpKind::FusedRow(_)
         | OpKind::Attention(_)
         | OpKind::Rope { .. }
-        | OpKind::Scan(_) => NumericsProperty::Reassociating,
+        | OpKind::Scan(_)
+        | OpKind::SelectedAttention(_) => NumericsProperty::Reassociating,
         OpKind::PackedDequant { .. }
         | OpKind::PackedContraction { .. }
         | OpKind::PackedRowGather { .. }

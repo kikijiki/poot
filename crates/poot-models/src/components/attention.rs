@@ -19,7 +19,10 @@
 //! extent; the extra position is never written and the mask hides it. A paged cache keeps its capacity: its
 //! stride is the pool's, which in-place paged reads re-lay out.
 
-use poot_graph_ir::{BinOp, Builder, ComputedConst, Scalar, StateRole, TensorType, Traced, ops};
+use poot_graph_ir::{
+    BinOp, Builder, ComputedConst, Scalar, SelectedAttentionAttrs, StateRole, TensorType, Traced,
+    ops,
+};
 use poot_quant::weights::{AttnRole, WeightId, WeightMap, WeightRole};
 
 use super::kv_stride::{Exemption, HeadSpan};
@@ -634,11 +637,21 @@ fn hide_padding(b: &Builder, mask: Traced, span: HeadSpan) -> Result<Traced, Tra
     Ok(b.concat(last, &[mask, hidden])?)
 }
 
-/// Replaces the causal-over-cache mask `[rows, 1, tokens, capacity]` of an attention with the one a
-/// selector builds from it (a sparse selection narrows which cached positions a query reads).
-pub type MaskSelector<'a> = &'a dyn Fn(&Builder, Traced) -> Result<Traced, TraceError>;
+/// The blocks of cached positions a sparse selection lets each query read.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockSelection {
+    /// The selected block ids `[rows, 1, tokens, K]` I32, ascending, `-1` after the last.
+    pub ids: Traced,
+    /// The positions each block covers.
+    pub ratio: usize,
+}
 
-/// [`attention`] under the mask `select` makes of the causal one.
+/// Builds a [`BlockSelection`] for an attention (a sparse selection narrows which cached positions a query
+/// reads).
+pub type BlockSelector<'a> = &'a dyn Fn(&Builder) -> Result<BlockSelection, TraceError>;
+
+/// [`attention`] over the blocks `select` names: the attention reads only the keys of each query's selected
+/// blocks and of its own unfinished block ([`poot_graph_ir::OpKind::SelectedAttention`]).
 pub fn attention_selecting(
     b: &Builder,
     step: &Step,
@@ -646,12 +659,12 @@ pub fn attention_selecting(
     x: Traced,
     w: &AttentionWeights,
     p: &AttentionParams,
-    select: MaskSelector<'_>,
+    select: BlockSelector<'_>,
 ) -> Result<Traced, TraceError> {
     attention_with(b, step, layer, x, w, p, Some(select))
 }
 
-/// The one attention body: `select` is the mask selector of [`attention_selecting`], `None` for plain
+/// The one attention body: `select` is the block selector of [`attention_selecting`], `None` for plain
 /// causal attention.
 fn attention_with(
     b: &Builder,
@@ -660,7 +673,7 @@ fn attention_with(
     x: Traced,
     w: &AttentionWeights,
     p: &AttentionParams,
-    select: Option<MaskSelector<'_>>,
+    select: Option<BlockSelector<'_>>,
 ) -> Result<Traced, TraceError> {
     let shape = step.shape();
     let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
@@ -748,42 +761,65 @@ fn attention_with(
     };
     let k_cache = carried(b, step, &write_at, layer, "k", k, dims)?;
     let v_cache = carried(b, step, &write_at, layer, "v", v, dims)?;
-    // The causal mask over the capacity, narrowed by the selector if any, then the stored positions past the
-    // capacity appended hidden: the same on every entry point.
-    let mask = if p.alibi {
-        let slopes = b.computed(ComputedConst::AlibiSlopes { heads: hq })?;
-        ops::alibi_mask_from_pos(b, step.pos(), cap, p.window, slopes, hq)?
-    } else {
-        ops::causal_mask_from_pos(b, step.pos(), cap, p.window)?
-    };
-    let mask = match select {
-        Some(select) => select(b, mask)?,
-        None => mask,
-    };
-    let mask = hide_padding(b, mask, span)?;
-    let out = match &w.sinks {
-        Some(sinks) => ops::attention_prefill_with_sink(
-            b,
-            q,
-            k_cache,
-            v_cache,
-            hq / hkv,
-            p.scale,
-            mask,
-            sinks.declare_f32(b)?,
-            hq,
-            t,
-        )?,
-        None => ops::attention_masked_softcap(
-            b,
-            q,
-            k_cache,
-            v_cache,
-            hq / hkv,
-            p.scale,
-            mask,
-            p.softcap,
-        )?,
+    let out = match select {
+        // Only the selected blocks' keys and the query's own unfinished block are read: no mask over the
+        // capacity, and the stored positions past it are never visited.
+        Some(select) => {
+            if w.sinks.is_some() || p.alibi || p.window.is_some() {
+                return Err(WiringError::SelectionWithBiasedScores.into());
+            }
+            let BlockSelection { ids, ratio } = select(b)?;
+            let k_blocks = b.aval(ids)?.shape[3];
+            b.selected_attention(
+                SelectedAttentionAttrs {
+                    n_rep: hq / hkv,
+                    scale: p.scale,
+                    softcap: p.softcap,
+                    ratio,
+                    k: k_blocks,
+                },
+                q,
+                k_cache,
+                v_cache,
+                ids,
+                step.pos(),
+            )?
+        }
+        None => {
+            // The causal mask over the capacity, then the stored positions past the capacity appended
+            // hidden: the same on every entry point.
+            let mask = if p.alibi {
+                let slopes = b.computed(ComputedConst::AlibiSlopes { heads: hq })?;
+                ops::alibi_mask_from_pos(b, step.pos(), cap, p.window, slopes, hq)?
+            } else {
+                ops::causal_mask_from_pos(b, step.pos(), cap, p.window)?
+            };
+            let mask = hide_padding(b, mask, span)?;
+            match &w.sinks {
+                Some(sinks) => ops::attention_prefill_with_sink(
+                    b,
+                    q,
+                    k_cache,
+                    v_cache,
+                    hq / hkv,
+                    p.scale,
+                    mask,
+                    sinks.declare_f32(b)?,
+                    hq,
+                    t,
+                )?,
+                None => ops::attention_masked_softcap(
+                    b,
+                    q,
+                    k_cache,
+                    v_cache,
+                    hq / hkv,
+                    p.scale,
+                    mask,
+                    p.softcap,
+                )?,
+            }
+        }
     };
     let out = b.reshape(b.transpose(out, vec![0, 2, 1, 3])?, vec![rows, t, hq * d])?;
     let out = match gate {
@@ -812,6 +848,8 @@ mod tests {
     /// a cache that stores one position more than its capacity ([`HeadSpan`]).
     const CAP: usize = 128;
     const THETA: f32 = 10_000.0;
+    /// The block size of the selecting cases.
+    const SELECT_RATIO: usize = 4;
     const EPS: f32 = 1e-5;
 
     /// How positions enter the scores.
@@ -995,7 +1033,7 @@ mod tests {
         run_with(fx, o, x, pos, state, false)
     }
 
-    /// [`run`] through [`attention_selecting`] with a selector that keeps the mask, when `selecting`.
+    /// [`run`] through [`attention_selecting`] with a selector that selects every block, when `selecting`.
     fn run_with(
         fx: &Fx,
         o: Opts,
@@ -1022,7 +1060,19 @@ mod tests {
         .unwrap();
         let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH])).unwrap();
         let y = if selecting {
-            attention_selecting(&b, &step, 2, xs, &w, &p, &|_, mask| Ok(mask)).unwrap()
+            // Every block of the capacity selected: the whole causal prefix is read.
+            attention_selecting(&b, &step, 2, xs, &w, &p, &|b| {
+                let blocks = CAP / SELECT_RATIO;
+                let ids = b.broadcast(
+                    b.reshape(b.iota_i32(blocks)?, vec![1, 1, 1, blocks])?,
+                    vec![1, 1, t, blocks],
+                )?;
+                Ok(BlockSelection {
+                    ids,
+                    ratio: SELECT_RATIO,
+                })
+            })
+            .unwrap()
         } else {
             attention(&b, &step, 2, xs, &w, &p).unwrap()
         };
@@ -1236,29 +1286,65 @@ mod tests {
         assert_matches_reference(BASE);
     }
 
-    /// A mask selector sees the capacity-wide causal mask and the padded position is hidden after it: the
-    /// selecting body over a camping capacity gives what plain attention gives, and still matches the
-    /// reference. Mutation: have `hide_padding` append a visible (zero) column; the padded zero key takes
-    /// softmax mass and the output goes red.
+    /// A block selection that names every block reads the whole causal prefix: the selecting body over a
+    /// camping capacity (one stored position more than the capacity, which no block names and no tail
+    /// reaches) gives what plain attention gives. Mutation: drop the causal penalty from
+    /// `selected_block_mask`; the queries take the keys after them and the output goes red. A biased score
+    /// (ALiBi) is refused by the selecting body with a typed wiring error.
     #[test]
-    fn a_selector_over_a_padded_cache_matches_plain_attention() {
-        for o in [
-            BASE,
-            Opts {
-                positions: Positions::Alibi,
-                ..BASE
+    fn a_full_selection_over_a_padded_cache_matches_plain_attention() {
+        let o = BASE;
+        let fx = fixture(o);
+        let cache_len = KV_HEADS * CAP * HEAD_DIM;
+        let state = [oracle::random(cache_len, 41), oracle::random(cache_len, 42)];
+        let x = oracle::random(2 * WIDTH, 43);
+        let pos = [5, 6];
+        let plain = run_with(&fx, o, &x, &pos, &state, false);
+        let selected = run_with(&fx, o, &x, &pos, &state, true);
+        assert_eq!(plain.0, selected.0, "{o:?}: the selecting body differs");
+        assert_eq!(plain.1, selected.1, "{o:?}: the selected caches differ");
+    }
+
+    #[test]
+    fn a_selection_over_biased_scores_is_a_typed_wiring_error() {
+        let o = Opts {
+            positions: Positions::Alibi,
+            ..BASE
+        };
+        let fx = fixture(o);
+        let p = params(o);
+        let w = AttentionWeights::new(&fx.map(), 2, WIDTH, &p).unwrap();
+        let b = Builder::for_tests();
+        let step = Step::new(
+            &b,
+            StepShape {
+                rows: NonZeroUsize::MIN,
+                tokens: NonZeroUsize::MIN,
+                capacity: NonZeroUsize::new(CAP).unwrap(),
+                kv: KvLayout::Contiguous,
+                logits: LogitRows::All,
+                hidden: None,
             },
-        ] {
-            let fx = fixture(o);
-            let cache_len = KV_HEADS * CAP * HEAD_DIM;
-            let state = [oracle::random(cache_len, 41), oracle::random(cache_len, 42)];
-            let x = oracle::random(2 * WIDTH, 43);
-            let pos = [5, 6];
-            let plain = run_with(&fx, o, &x, &pos, &state, false);
-            let selected = run_with(&fx, o, &x, &pos, &state, true);
-            assert_eq!(plain.0, selected.0, "{o:?}: the selecting body differs");
-            assert_eq!(plain.1, selected.1, "{o:?}: the selected caches differ");
-        }
+        )
+        .unwrap();
+        let xs = b.constant("x", TensorType::f32(vec![1, 1, WIDTH])).unwrap();
+        let refusal = attention_selecting(&b, &step, 2, xs, &w, &p, &|b| {
+            Ok(BlockSelection {
+                ids: b.constant(
+                    "ids",
+                    TensorType::new(vec![1, 1, 1, 2], poot_tensor::DType::I32),
+                )?,
+                ratio: SELECT_RATIO,
+            })
+        })
+        .expect_err("ALiBi scores are refused");
+        assert!(
+            matches!(
+                refusal,
+                TraceError::Wiring(WiringError::SelectionWithBiasedScores)
+            ),
+            "{refusal:?}"
+        );
     }
 
     /// A contiguous step stores one head position more than its capacity when that stride camps and attends

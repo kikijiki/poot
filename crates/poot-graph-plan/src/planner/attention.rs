@@ -10,7 +10,7 @@ use crate::planner::GraphTables;
 use crate::predicates::{attention_lanes, attention_splits};
 use crate::refusal::Site;
 use crate::types::ScratchDecl;
-use poot_graph_ir::{AttentionAttrs, KeyLayout, KvBound, MaskOperand};
+use poot_graph_ir::{AttentionAttrs, KeyLayout, KvBound, MaskOperand, SelectedAttentionAttrs};
 use poot_kernelgen::{
     AttentionCombineSpec, AttentionSchedule, AttentionSpec, KeyBound, KeyLayout as KernelKeyLayout,
     MaskKind, ScoreTransform,
@@ -32,6 +32,9 @@ pub(super) fn plan(
     caps: &DeviceCaps,
     limits: BodyLimits,
 ) -> Result<Planned, PlanError> {
+    if let OpKind::SelectedAttention(attrs) = &eqn.op {
+        return plan_selected(g, eqn, attrs, backend, caps, limits);
+    }
     let OpKind::Attention(AttentionAttrs {
         n_rep,
         scale,
@@ -107,6 +110,72 @@ pub(super) fn plan(
             streaming,
             SplitKv { lanes, splits },
             ids.len(),
+            backend,
+            caps,
+        ),
+    }
+}
+
+/// Plan a block-selected attention: the streaming kernel with its mask derived from the selection operands.
+/// Each row visits `(K + 1) * ratio` candidate positions, so there is no split-KV schedule to choose: the
+/// lanes are the widest the device's workgroup memory takes, as for a dense row.
+fn plan_selected(
+    g: GraphTables<'_>,
+    eqn: &Eqn,
+    attrs: &SelectedAttentionAttrs,
+    backend: Backend,
+    caps: &DeviceCaps,
+    limits: BodyLimits,
+) -> Result<Planned, PlanError> {
+    let site = Site::new(g, eqn, backend, limits);
+    let operand_types: Vec<_> = value_ids(eqn)
+        .iter()
+        .map(|&id| g.aval(id).clone())
+        .collect();
+    let layout = attrs
+        .layout(&operand_types)
+        .map_err(|e| PlanError::BadShape(format!("selected attention: {e}")))?;
+    let lanes = attention_lanes(layout.dv, caps).ok_or_else(|| {
+        site.refuse(Capability::AttentionLds {
+            dv: layout.dv,
+            lds_bytes: caps.lds_bytes,
+        })
+    })?;
+    let score = match attrs.softcap {
+        None => ScoreTransform::Scale {
+            scale_bits: attrs.scale.to_bits(),
+        },
+        Some(cap) => ScoreTransform::ScaleSoftcap {
+            scale_bits: attrs.scale.to_bits(),
+            cap_bits: cap.to_bits(),
+        },
+    };
+    let spec = AttentionSpec {
+        batch: layout.batch,
+        hq: layout.hq,
+        n_rep: attrs.n_rep,
+        lq: layout.lq,
+        lk: layout.lk,
+        dk: layout.dk,
+        dv: layout.dv,
+        key: KernelKeyLayout::Single,
+        score,
+        mask: MaskKind::Blocks {
+            ratio: attrs.ratio,
+            k: attrs.k,
+        },
+        bound: KeyBound::Static,
+        schedule: AttentionSchedule::Streaming { lanes },
+    };
+    // A decode row considers `(K + 1) * ratio` positions however deep the cache is, but a few heads still leave a
+    // many-CU device idle: the same split-KV rule divides the candidates.
+    match attention_splits(&spec, caps) {
+        None => Planned::generated(site, KernelRequest::Attention(spec), backend, caps),
+        Some(splits) => split_kv(
+            site,
+            spec,
+            SplitKv { lanes, splits },
+            operand_types.len(),
             backend,
             caps,
         ),

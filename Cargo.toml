@@ -24,6 +24,7 @@ members = [
     "crates/poot-ptx-runtime",
     "crates/poot-rocm-runtime",
     "crates/poot-rocm-device",
+    "crates/poot-l0-runtime",
     "crates/poot-vulkan-runtime",
     "crates/poot-vulkan-device",
     "crates/poot-kernelgen",
@@ -109,6 +110,7 @@ poot-vulkan-device = { path = "crates/poot-vulkan-device" }
 poot-eval = { path = "crates/poot-eval" }
 poot-wgpu-device = { path = "crates/poot-wgpu-device" }
 poot-kernelgen = { path = "crates/poot-kernelgen" }
+poot-l0-runtime = { path = "crates/poot-l0-runtime" }
 poot-llm = { path = "crates/poot-llm" }
 poot-load = { path = "crates/poot-load" }
 poot-ptx-device = { path = "crates/poot-ptx-device" }

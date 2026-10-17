@@ -97,8 +97,17 @@ impl AttentionSpec {
     /// The keys one workgroup walks: all `lk`, or one split's chunk.
     pub fn keys_per_workgroup(&self) -> usize {
         match self.schedule {
-            AttentionSchedule::Streaming { .. } => self.lk,
-            AttentionSchedule::SplitKv { splits, .. } => self.lk.div_ceil(splits),
+            AttentionSchedule::Streaming { .. } => self.candidates(),
+            AttentionSchedule::SplitKv { splits, .. } => self.candidates().div_ceil(splits),
+        }
+    }
+
+    /// The key positions a row considers: all `lk`, or under [`MaskKind::Blocks`] the `(K + 1) * ratio` of its
+    /// selected blocks and its unfinished block. The split schedule divides these.
+    pub fn candidates(&self) -> usize {
+        match self.mask {
+            MaskKind::Blocks { ratio, k } => (k + 1) * ratio,
+            MaskKind::Broadcast | MaskKind::PerHead => self.lk,
         }
     }
 
@@ -186,6 +195,17 @@ pub enum MaskKind {
     Broadcast,
     /// `Hm == Hq`: one plane per head (ALiBi).
     PerHead,
+    /// No mask operand: the parameters that follow the value are the `I32 [B, Lq, K]` ids of the blocks each
+    /// query selected (ascending, `-1` after the last) and the `I32 [B, Lq]` query positions. A row visits
+    /// only the keys of its selected blocks of `ratio` positions and its own unfinished block, `(K + 1) *
+    /// ratio` candidates in all, instead of the `lk` positions; the scores need no mask. Dense keys and the
+    /// static bound only; the split schedule divides the candidates.
+    Blocks {
+        /// Positions per block.
+        ratio: usize,
+        /// Selected blocks per query: the width of `ids`.
+        k: usize,
+    },
 }
 
 /// How the key operand is laid out.
@@ -292,14 +312,27 @@ fn validate(spec: &AttentionSpec) -> Result<usize, KernelGenError> {
             divisor: spec.n_rep,
         });
     }
-    // A split with no key at all is a wasted workgroup, and `ceil(lk / splits)` would leave it empty.
-    if splits > spec.lk {
+    // A split with no key at all is a wasted workgroup, and `ceil(candidates / splits)` would leave it empty.
+    if splits > spec.candidates() {
         return Err(KernelGenError::ExceedsBound {
             generator: GENERATOR,
             what: "splits".to_string(),
             value: splits,
-            bound: spec.lk,
+            bound: spec.candidates(),
         });
+    }
+    if let MaskKind::Blocks { ratio, k } = spec.mask {
+        for (what, value) in [("ratio", ratio), ("k", k)] {
+            if value == 0 {
+                return Err(bad(what, value, 1));
+            }
+        }
+        if spec.key != KeyLayout::Single || spec.bound != KeyBound::Static {
+            return Err(KernelGenError::Unsupported {
+                request: "attention",
+                reason: "a block-selected attention reads a dense key under the static bound",
+            });
+        }
     }
     if let KeyLayout::Split { shared_dim } = spec.key {
         if shared_dim == 0 {
@@ -429,6 +462,77 @@ enum KeyRows {
     },
 }
 
+/// A key a block-selected row considers: its position, and whether the row reads it.
+struct Candidate {
+    key: poot_kernel_ir::Local,
+    valid: poot_kernel_ir::Local,
+}
+
+/// Candidate `candidate` of query `query` (an index into `ids` and `pos`) among the `(k + 1) * ratio` a
+/// block-selected row considers: the positions of its `k` selected blocks in order, then the positions of its
+/// own unfinished block. `(k, ratio, lk)` are the selection width, the block size and the stored key
+/// extent. A position is read when it is real (`id >= 0`, or inside the unfinished block), at or before
+/// the query, and inside the stored keys: whatever `ids` holds, no address leaves the key buffers.
+fn block_candidate(
+    c: &mut Cfg,
+    ids: poot_kernel_ir::Local,
+    pos: poot_kernel_ir::Local,
+    query: poot_kernel_ir::Local,
+    (k, ratio, lk): (usize, usize, usize),
+    candidate: poot_kernel_ir::Local,
+) -> Candidate {
+    let i32c = |value: i32| Operand::Const(Constant::I32(value));
+    let widen = |c: &mut Cfg, word: poot_kernel_ir::Local| {
+        c.let_(
+            Ty::Usize,
+            Rvalue::Cast {
+                to: Ty::Usize,
+                operand: local_op(word),
+            },
+        )
+    };
+    let raw = c.let_(Ty::I32, Rvalue::Use(copy(elem(pos, query))));
+    let at = c.bin(Ty::I32, BinOp::Max, local_op(raw), i32c(0));
+    let position = widen(c, at);
+    let next = uc(c, BinOp::Add, position, 1);
+    let complete = uc(c, BinOp::Div, next, ratio);
+    let tail_start = uc(c, BinOp::Mul, complete, ratio);
+
+    let slot = uc(c, BinOp::Div, candidate, ratio);
+    let offset = uc(c, BinOp::Rem, candidate, ratio);
+    let in_ids = c.bin(Ty::Bool, BinOp::Lt, local_op(slot), cu(k));
+    // Read a real slot of `ids` even for a tail candidate: the value is discarded there.
+    let last_slot = c.usize_const(k - 1);
+    let slot_read =
+        crate::block_top_k::select(c, Ty::Usize, in_ids, local_op(slot), local_op(last_slot));
+    let id_at = {
+        let row = uc(c, BinOp::Mul, query, k);
+        ubin(c, BinOp::Add, row, slot_read)
+    };
+    let id = c.let_(Ty::I32, Rvalue::Use(copy(elem(ids, id_at))));
+    let id_real = c.bin(Ty::Bool, BinOp::Ge, local_op(id), i32c(0));
+    let id_clamped = c.bin(Ty::I32, BinOp::Max, local_op(id), i32c(0));
+    let block = widen(c, id_clamped);
+    let block_start = uc(c, BinOp::Mul, block, ratio);
+    let selected_key = ubin(c, BinOp::Add, block_start, offset);
+    let tail_key = ubin(c, BinOp::Add, tail_start, offset);
+    let key = crate::block_top_k::select(
+        c,
+        Ty::Usize,
+        in_ids,
+        local_op(selected_key),
+        local_op(tail_key),
+    );
+    let tail_real = c.bin(Ty::Bool, BinOp::Le, local_op(tail_key), local_op(position));
+    let real =
+        crate::block_top_k::select(c, Ty::Bool, in_ids, local_op(id_real), local_op(tail_real));
+    let causal = c.bin(Ty::Bool, BinOp::Le, local_op(key), local_op(position));
+    let stored = c.bin(Ty::Bool, BinOp::Lt, local_op(key), cu(lk));
+    let readable = c.both(real, causal);
+    let valid = c.both(readable, stored);
+    Candidate { key, valid }
+}
+
 /// Build the attention kernel `spec` describes. The launch is `spec.workgroups()` workgroups of `lanes`
 /// threads laid over a 2-D grid `x_groups` workgroups across: `gi = GroupY * x_groups + GroupX` is the flat
 /// `(batch, head, row)` index, and a workgroup past `workgroups()` (the fold's remainder) returns.
@@ -463,7 +567,7 @@ pub(crate) fn attention_body(
     let chunk = spec.keys_per_workgroup();
     let hkv = hq / n_rep;
     let mask_heads = match mask_kind {
-        MaskKind::Broadcast => 1,
+        MaskKind::Broadcast | MaskKind::Blocks { .. } => 1,
         MaskKind::PerHead => hq,
     };
 
@@ -472,8 +576,15 @@ pub(crate) fn attention_body(
         ld(slice_f32(false), false), // 1 q
         ld(slice_f32(false), false), // 2 k
         ld(slice_f32(false), false), // 3 v
-        ld(slice_f32(false), false), // 4 mask
     ];
+    // 4 the additive mask, or the selected block ids and the query positions (5)
+    match mask_kind {
+        MaskKind::Broadcast | MaskKind::PerHead => params.push(ld(slice_f32(false), false)),
+        MaskKind::Blocks { .. } => {
+            params.push(ld(slice_dtype(Ty::I32, false), false));
+            params.push(ld(slice_dtype(Ty::I32, false), false));
+        }
+    }
     let mut next_param = |decl| {
         params.push(decl);
         poot_kernel_ir::Local {
@@ -547,7 +658,7 @@ pub(crate) fn attention_body(
         };
         let maskbase = {
             let plane = match mask_kind {
-                MaskKind::Broadcast => uc(c, BinOp::Mul, b, mask_heads),
+                MaskKind::Broadcast | MaskKind::Blocks { .. } => uc(c, BinOp::Mul, b, mask_heads),
                 MaskKind::PerHead => {
                     let by_batch = uc(c, BinOp::Mul, b, mask_heads);
                     ubin(c, BinOp::Add, by_batch, h)
@@ -558,6 +669,11 @@ pub(crate) fn attention_body(
             ubin(c, BinOp::Add, plane_start, row_start)
         };
         let lane_slot = uc(c, BinOp::Mul, lane, dv);
+        // The query's index among the `B * Lq` of the selection operands.
+        let qrow = {
+            let by_batch = uc(c, BinOp::Mul, b, lq);
+            ubin(c, BinOp::Add, by_batch, i)
+        };
 
         // This lane's partial state: the running maximum and denominator in registers, `o` in LDS.
         let m = c.var(Ty::F32, Rvalue::Use(f32c(f32::NEG_INFINITY)));
@@ -570,7 +686,7 @@ pub(crate) fn attention_body(
         // The keys this row visits: all `lk`, or the first `len[b]` clamped into `0..=lk`. A negative length
         // is a zero bound (the signed compare comes before the unsigned cast), a length past `lk` is `lk`.
         let key_end = match len {
-            None => cu(lk),
+            None => cu(spec.candidates()),
             Some(len) => {
                 let raw = c.let_(Ty::I32, Rvalue::Use(copy(elem(len, b))));
                 let end = c.var(Ty::Usize, Rvalue::Use(cu(0)));
@@ -613,7 +729,7 @@ pub(crate) fn attention_body(
                 (local_op(first), local_op(end))
             }
         };
-        count_to(c, first_key, key_end, lanes, |c, t| {
+        let visit = |c: &mut Cfg, t: poot_kernel_ir::Local| {
             // dot = q[row] . k[t], over the key's own part and then its shared part
             let dot = c.var(Ty::F32, Rvalue::Use(f32c(0.0)));
             let accumulate = |c: &mut Cfg,
@@ -670,9 +786,15 @@ pub(crate) fn attention_body(
             }
 
             let s = score_of(c, score, dot);
-            let mi = ubin(c, BinOp::Add, maskbase, t);
-            let mask_value = c.let_(Ty::F32, Rvalue::Use(copy(elem(mask, mi))));
-            let s = fbin(c, BinOp::Add, s, mask_value);
+            // A block-selected row visits only keys it reads, so there is no mask to add.
+            let s = match mask_kind {
+                MaskKind::Blocks { .. } => s,
+                MaskKind::Broadcast | MaskKind::PerHead => {
+                    let mi = ubin(c, BinOp::Add, maskbase, t);
+                    let mask_value = c.let_(Ty::F32, Rvalue::Use(copy(elem(mask, mi))));
+                    fbin(c, BinOp::Add, s, mask_value)
+                }
+            };
 
             // The online-softmax step. `m_new == -inf` means every position seen so far, this one
             // included, is masked: the lane has contributed nothing, and `exp(-inf - -inf)` is NaN.
@@ -708,7 +830,20 @@ pub(crate) fn attention_body(
                 lds_write(c, O_ARRAY, slot, local_op(sum));
             });
             c.assign(Place::local(m), Rvalue::Use(local_op(m_new)));
-        });
+        };
+        match mask_kind {
+            MaskKind::Blocks { ratio, k } => {
+                let ids = poot_kernel_ir::Local { index: 4 };
+                let pos = poot_kernel_ir::Local { index: 5 };
+                count_to(c, first_key, key_end, lanes, |c, candidate| {
+                    let visible = block_candidate(c, ids, pos, qrow, (k, ratio, lk), candidate);
+                    c.if_then(visible.valid, |c| visit(c, visible.key));
+                });
+            }
+            MaskKind::Broadcast | MaskKind::PerHead => {
+                count_to(c, first_key, key_end, lanes, visit);
+            }
+        }
 
         // Publish this lane's `(m, l)`, then the one barrier: every lane reaches it exactly once.
         lds_write(c, M_ARRAY, lane, local_op(m));

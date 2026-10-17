@@ -23,7 +23,7 @@ use crate::dtype_widen::{
     widen_mismatched_matmul_dtypes,
 };
 use crate::graph_validation::ValidationPacketPlan;
-use crate::planner::{plan_eqn_compiled, plan_graph};
+use crate::planner::{plan_eqn_compiled, plan_graph, plan_vpu_region};
 use crate::production_plan::Submission;
 use crate::state_commit::{StateCommitPlan, state_commit_from_plans};
 #[cfg(feature = "test-support")]
@@ -31,6 +31,7 @@ use crate::types::{DispatchPlanError, ScratchDecl};
 use crate::types::{GraphStorage, ValueStorage};
 #[cfg(feature = "test-support")]
 use crate::{Binding, DispatchPlan};
+use poot_codegen::VpuRegion;
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
@@ -42,14 +43,25 @@ use poot_graph_ir::{
     BoundaryId, ContractionRows, EditError, Eqn, Export, Graph, IndexRange, OpKind, Operand, Slot,
     ValueId, ValueTable, value_ranges,
 };
-use poot_target::{AieCaps, AieTargetId, Backend, DeviceCaps, Queried, TargetId};
+use poot_target::{
+    AieCaps, AieTargetId, Backend, DeviceCaps, Queried, TargetId, VpuCaps, VpuTargetId,
+};
 use poot_tensor::DType;
 
+use crate::kernel_mapping::{AieAbiRefusal, aie_region_recipe};
 use crate::passes::{self as transform, GraphBudget, LegalizeError, PackedDequantProductionError};
 pub use crate::passes::{LoraError, LoraPlan};
 use crate::{
-    BufferPlan, KernelChoice, Plan, PlanError, Refusal, compute_views, device_validation, planner,
+    BufferPlan, Dispatch, KernelChoice, Plan, PlanError, Refusal, compute_views, device_validation,
+    planner,
 };
+use poot_codegen::AieLinkRecipe;
+use poot_kernel_ir::Body;
+
+mod package;
+use package::package;
+pub(crate) use package::whole_graph_region;
+pub use package::{ArtifactGranularity, Region};
 
 /// What a graph is compiled for: the target and the device's measured capabilities (card 522). Passes and
 /// the planner read it; tracers never see it.
@@ -100,6 +112,14 @@ pub enum Target {
         /// The limits the part's runtime reports.
         caps: AieCaps,
     },
+    /// An Intel NPU target and the capabilities its runtime reports: the vendor graph compiler compiles the
+    /// OpenVINO graph poot emits for a region of equations.
+    Vpu {
+        /// The Intel NPU part the program is generated for.
+        target: VpuTargetId,
+        /// The capabilities the part's runtime reports.
+        caps: VpuCaps,
+    },
 }
 
 impl Target {
@@ -112,6 +132,10 @@ impl Target {
                 Queried::Known(bytes) => Some(bytes),
                 Queried::Unknown => None,
             },
+            Target::Vpu { caps, .. } => match caps.memory_budget_bytes {
+                Queried::Known(bytes) => Some(bytes),
+                Queried::Unknown => None,
+            },
         }
     }
 
@@ -120,6 +144,21 @@ impl Target {
         match self {
             Target::Gpu { backend, .. } => TargetId::Gpu(*backend),
             Target::Aie { target, .. } => TargetId::Aie(*target),
+            Target::Vpu { target, .. } => TargetId::Vpu(*target),
+        }
+    }
+
+    /// How big this target's compiled artifacts are. A GPU target loads one artifact per planned kernel. An
+    /// XDNA target holds a bounded number of hardware contexts, one per loaded artifact, so its artifacts
+    /// are regions of planned equations and [`compile`] groups them (see [`Region`]). An Intel NPU's vendor
+    /// graph compiler takes the whole graph as one artifact.
+    pub const fn granularity(&self) -> ArtifactGranularity {
+        match self {
+            Target::Gpu { .. } => ArtifactGranularity::Kernel,
+            Target::Aie { caps, .. } => ArtifactGranularity::Region {
+                limits: caps.region,
+            },
+            Target::Vpu { .. } => ArtifactGranularity::Graph,
         }
     }
 }
@@ -525,8 +564,14 @@ pub struct Program {
     /// 546a): a zero-lane packet for a graph with no validation outputs, checked
     /// by the contract before any readback the same way either way.
     validation: ValidationPacketPlan,
+    /// The regions `package` grouped the planned equations into: empty for a target whose artifacts are
+    /// kernels, otherwise a partition of the program's dispatching equations into contiguous runs.
+    regions: Vec<Region>,
+    /// The Intel NPU graph the program's one region runs: every equation lowered to an opset node, with the
+    /// region's reads as its arguments and its writes as its results. `None` for every other target.
+    vpu: Option<VpuRegion>,
     /// Lifetimes and arena-slot assignment for this program's locally-computed values (Card 547b),
-    /// derived from `plans`, `storage`, `state_commit` and `validation` once here.
+    /// derived from `plans`, `storage`, `state_commit`, `validation` and `regions` once here.
     buffer_plan: BufferPlan,
     /// The limits this program was compiled under; an executor loads its kernels under the same
     /// `max_artifact_bytes`.
@@ -573,6 +618,42 @@ impl Program {
         &self.buffer_plan
     }
 
+    /// The regions of the program: each is linked into one artifact and run in one invocation. Empty for a
+    /// target whose artifacts are kernels ([`Target::granularity`]), where every dispatch is its own.
+    pub fn regions(&self) -> &[Region] {
+        &self.regions
+    }
+
+    /// The Intel NPU graph the program's one region runs, ready for [`poot_codegen::emit_vpu`]; `None` for a
+    /// program compiled for any other target.
+    pub fn vpu_region(&self) -> Option<&VpuRegion> {
+        self.vpu.as_ref()
+    }
+
+    /// What `region` is linked from: its link recipe and, in tile order, the body each tile runs. The
+    /// recipe is derived from the same plans the bodies are, so the two cannot disagree.
+    pub fn region_link(
+        &self,
+        region: &Region,
+    ) -> Result<(AieLinkRecipe, Vec<&Body>), AieAbiRefusal> {
+        let Target::Aie { target, .. } = self.target else {
+            return Err(AieAbiRefusal::NotAnAieProgram);
+        };
+        let recipe = aie_region_recipe(&self.graph, &self.plans, region, target)?;
+        let bodies = region
+            .members()
+            .map(|index| {
+                self.plans[index]
+                    .single()
+                    .map(Dispatch::body)
+                    .ok_or_else(|| AieAbiRefusal::NotOneDispatch {
+                        eqn: self.graph.eqns()[index].out,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((recipe, bodies))
+    }
+
     /// Where each exported boundary lives after optimization, CSE and renumbering: the compiled
     /// graph's [`Graph::exports`]. Several boundaries may resolve to one value.
     pub fn exports(&self) -> impl Iterator<Item = Export> + '_ {
@@ -587,7 +668,7 @@ impl Program {
         for (eqn, plan) in self.planned() {
             match plan {
                 Plan::Alias(src) | Plan::View { src, .. } => root[eqn.out] = root[*src],
-                Plan::Dispatches(_) => {}
+                Plan::Dispatches(_) | Plan::Graph => {}
             }
         }
         self.graph.exports().find_map(|export| {
@@ -687,6 +768,9 @@ impl Program {
 /// so a table `legalize` already hosted must not still look like one to it. Card 534a's step is the one
 /// preparation every target needs before planning: no executor sequences its own copy of it any more.
 ///
+/// After planning, a target whose artifacts are regions (`Target::granularity`) has its planned equations grouped
+/// into regions by `package` before the buffer plan runs; a kernel target has none.
+///
 /// Every target runs every pass, in this one order, on every graph, except the GPU-limit stages (flash
 /// prefill cap, legalization, matmul dtype widening, the contraction epilogue probe and the oversized-constant
 /// re-check): they read [`DeviceCaps`], so an AIE target does not run them.
@@ -716,7 +800,7 @@ pub fn compile(
     // GPU stages and an AIE compile does not run them.
     let gpu = match target {
         Target::Gpu { backend, caps } => Some((*backend, caps)),
-        Target::Aie { .. } => None,
+        Target::Aie { .. } | Target::Vpu { .. } => None,
     };
     // A flash prefill launches `Hq * L` workgroups on one grid axis; cap the rewrite at the target's grid so
     // the planner is never handed a launch the device cannot issue.
@@ -797,12 +881,18 @@ pub fn compile(
     let planned = plan_graph(&graph, target, &options.limits.body())?;
     let state_commit = state_commit_from_plans(&graph, &planned.plans)?;
     let validation = device_validation::validation_packet_plan(&graph);
+    let regions = package(&graph, &planned.plans, target)?;
+    let vpu = match target {
+        Target::Vpu { caps, .. } => Some(plan_vpu_region(&graph, caps)?),
+        Target::Gpu { .. } | Target::Aie { .. } => None,
+    };
     let buffer_plan = plan_buffers(
         &graph,
         &planned.plans,
         &planned.storage,
         &state_commit,
         &validation,
+        &regions,
     );
     Ok(Program {
         graph,
@@ -817,6 +907,8 @@ pub fn compile(
         submission: options.execution,
         state_commit,
         validation,
+        regions,
+        vpu,
         buffer_plan,
         limits: options.limits,
     })

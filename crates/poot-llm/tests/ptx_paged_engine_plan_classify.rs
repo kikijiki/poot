@@ -38,6 +38,7 @@ fn plan_tag(p: &Plan) -> &'static str {
         },
         Plan::Alias(_) => "Alias",
         Plan::View { .. } => "View",
+        Plan::Graph => "Graph",
     }
 }
 

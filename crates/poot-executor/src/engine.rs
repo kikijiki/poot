@@ -14,7 +14,7 @@
 //! abort poisons the whole engine (`Device::abort` itself can never run again once poisoned - one
 //! engine drives one device, so there is nothing left to recover).
 
-use poot_runtime_common::BufferRole;
+use poot_runtime_common::{BufferRole, VpuBinding, VpuGraphArtifact, VpuLayer};
 use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::Range;
@@ -26,20 +26,21 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::multi_device::PlanNodeId;
 use poot_graph_plan::{
-    KernelChoice, Plan, PoolSite, Program, Sink, Source, Target, aie_shape_abi, dispatch_work,
+    Plan, PoolSite, Program, Region, Sink, Source, Target, dispatch_work,
     multi_device::topology::DeviceId, production_plan::Submission, staged::Link, staged::StageId,
     staged::StagedProgram, staged::SyncPoint, staged::TargetSet, staged::Transfer,
-    validate_linked_artifact, validate_recipe_tile_local, value_ids,
+    validate_linked_artifact, value_ids,
 };
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
 use poot_quant::weights::{StoreGeneration, WeightMap, WeightStore};
-use poot_runtime_common::AieShapeAbi;
-use poot_target::{AieCaps, AieTargetId, Backend, BufferStorage, TargetId};
+use poot_target::{AieCaps, AieTargetId, Backend, BufferStorage, TargetId, VpuTargetId};
 use poot_tensor::DType;
 
 use crate::binder::{self, BoundSlot, EmbedRows, StoredAs, WeightBinder};
-use crate::device::{AieInvocation, Arg, Device, DeviceTime, Dispatch, LaunchKind, WeightUpload};
+use crate::device::{
+    AieInvocation, Arg, Device, DeviceTime, Dispatch, LaunchKind, VpuInvocation, WeightUpload,
+};
 use crate::error::{BindError, DeviceError, ExecError, LoadError};
 use crate::shared_kernels::{SharedKernels, SharedKernelsMismatch};
 use crate::timing::TimingOptions;
@@ -68,11 +69,13 @@ pub struct Engine<D: Device> {
     /// different bodies (SC-024), and a string-keyed fast path here would alias the second one onto
     /// the first's kernel before ever reaching `kernel_cache`'s own content-keyed lookup below.
     kernel_index: HashMap<u64, usize>,
-    /// The AIE kernels this engine loaded: by body fingerprint, then by the shape ABI the artifact was
-    /// linked against (one body can be linked for more than one ABI), with the loaded index and the
-    /// invocation its dispatches carry. Empty for a GPU device.
-    aie_kernels: HashMap<u64, Vec<(AieShapeAbi, usize, AieInvocation)>>,
-    kernel_cache: poot_codegen::KernelCache,
+    /// The AIE regions this engine loaded: by the region's link recipe and the fingerprint of the body on
+    /// every tile (one body can sit in more than one region, and one region shape can run other bodies),
+    /// with the loaded index and the invocation its dispatches carry. Empty for a GPU device.
+    aie_kernels: HashMap<String, (usize, AieInvocation)>,
+    /// The Intel NPU graph this engine loaded, by the digest of its artifact.
+    vpu_kernels: HashMap<u64, (usize, VpuInvocation)>,
+    kernel_cache: Option<poot_codegen::KernelCache>,
     /// The external tools an AIE kernel is linked with. A GPU device's kernel cache resolves its own.
     toolchain: poot_codegen::Toolchain,
     /// Artifacts shared with the other engines of one planning pass; `None` for an executing engine,
@@ -395,6 +398,18 @@ fn checked_u32(elems: usize) -> Result<u32, ExecError> {
         .map_err(|_| LoadError::Unimplemented("value exceeds u32 element count").into())
 }
 
+/// The cache of compiled kernel bodies, for a target whose kernels are bodies.
+fn kernel_cache_of(
+    cache: &Option<poot_codegen::KernelCache>,
+    target: TargetId,
+) -> Result<&poot_codegen::KernelCache, LoadError> {
+    cache.as_ref().ok_or(LoadError::NoKernelBodies { target })
+}
+
+fn target_of<D: Device>(device: &D) -> TargetId {
+    device.target().id()
+}
+
 pub(crate) fn device_error<E: std::error::Error + Send + Sync + 'static>(
     target: TargetId,
 ) -> impl Fn(E) -> ExecError {
@@ -405,6 +420,7 @@ pub(crate) fn device_error<E: std::error::Error + Send + Sync + 'static>(
                 TargetId::Gpu(Backend::AmdGcn(_)) => "rocm",
                 TargetId::Gpu(Backend::Nvptx) => "ptx",
                 TargetId::Aie(_) => "xdna",
+                TargetId::Vpu(_) => "intel-npu",
             },
             source: Box::new(source),
         })
@@ -547,8 +563,13 @@ impl<D: Device> Engine<D> {
             kernels: Vec::new(),
             kernel_index: HashMap::new(),
             aie_kernels: HashMap::new(),
+            vpu_kernels: HashMap::new(),
             toolchain: poot_codegen::Toolchain::from_env(),
-            kernel_cache: poot_codegen::KernelCache::open(poot_codegen::Target::from(target)),
+            // A target whose artifacts are not compiled kernel bodies (an Intel NPU's vendor graphs) has no
+            // kernel cache; a per-equation kernel asked of such an engine is a typed `LoadError`.
+            kernel_cache: poot_codegen::Target::try_from(target)
+                .ok()
+                .map(poot_codegen::KernelCache::open),
             shared_kernels: None,
             kernels_resolved: 0,
             residency: HashMap::new(),
@@ -640,11 +661,11 @@ impl<D: Device> Engine<D> {
         body: &Body,
         max_artifact_bytes: NonZeroU64,
     ) -> Result<usize, ExecError> {
-        let fingerprint = self.kernel_cache.key(body).fingerprint();
+        let cache = kernel_cache_of(&self.kernel_cache, target_of(&self.device))?;
+        let fingerprint = cache.key(body).fingerprint();
         if let Some(&index) = self.kernel_index.get(&fingerprint) {
             return Ok(index);
         }
-        let cache = &self.kernel_cache;
         let resolve = || {
             cache
                 .load_or_compile(body, max_artifact_bytes)
@@ -679,61 +700,55 @@ impl<D: Device> Engine<D> {
         Ok(index)
     }
 
-    /// Kernel index and invocation for the AIE `body` of a sequential `choice`, linked for `target` on first
-    /// use: the shape ABI is read from the plan's own choice, [`poot_codegen::compile_aie`] links the body
-    /// against it, the linked artifact is checked against the target's measured `caps` before it is
-    /// wrapped, and only then does the device load it. Every refusal is a typed [`LoadError`] naming the
-    /// kernel; nothing is loaded on any of them.
-    fn aie_kernel(
+    /// Kernel index and invocation for the AIE `region` of `program`, linked for `target` on first use: the
+    /// link recipe is read from the program's own plans (`compile` already admitted it against the target's
+    /// limits when it packaged the region), [`poot_codegen::compile_aie`] links the tile bodies against it
+    /// into one artifact, the linked artifact is checked against `caps` before it is wrapped (what only a
+    /// linked artifact can answer), and only then does the device load it. Every refusal is a typed
+    /// [`LoadError`] naming the region; nothing is loaded on any of them.
+    fn aie_region_kernel(
         &mut self,
         target: AieTargetId,
         caps: &AieCaps,
-        key: &str,
-        body: &Body,
-        choice: &KernelChoice,
+        program: &Program,
+        region: &Region,
         max_artifact_bytes: NonZeroU64,
     ) -> Result<(usize, AieInvocation), ExecError> {
-        let abi = aie_shape_abi(choice).map_err(|source| LoadError::AieAbi {
-            key: key.to_string(),
-            source,
-        })?;
-        let fingerprint = self.kernel_cache.key(body).fingerprint();
-        if let Some(&(_, index, invocation)) = self
-            .aie_kernels
-            .get(&fingerprint)
-            .and_then(|loaded| loaded.iter().find(|(linked, ..)| *linked == abi))
-        {
+        let members = region.members();
+        let key = format!("region[{}..{}]", members.start, members.end);
+        let (recipe, bodies) = program
+            .region_link(region)
+            .map_err(|source| LoadError::AieAbi {
+                key: key.clone(),
+                source,
+            })?;
+        // The recipe holds the wiring and shapes, the bodies hold the arithmetic: both name the region.
+        let identity = {
+            let mut text = recipe.canonical();
+            let cache = kernel_cache_of(&self.kernel_cache, TargetId::Aie(target))?;
+            for body in &bodies {
+                text.push_str(&format!("{:016x}\n", cache.key(body).fingerprint()));
+            }
+            text
+        };
+        if let Some(&(index, invocation)) = self.aie_kernels.get(&identity) {
             return Ok((index, invocation));
         }
-        // The recipe's FIFO buffers follow from the shape ABI, so the tile-local limit is answered before
-        // the toolchain runs: an over-limit plan is a typed limit refusal, not a link failure.
-        let recipe = poot_codegen::AieLinkRecipe::sequential(&body.name, target, &abi).map_err(
-            |source| LoadError::AieCompile {
-                key: key.to_string(),
-                source: source.into(),
-            },
-        )?;
-        validate_recipe_tile_local(recipe.tile_local_bytes(), caps).map_err(|source| {
-            LoadError::AieLimit {
-                key: key.to_string(),
-                source,
-            }
-        })?;
         let compiled = poot_codegen::compile_aie(
-            body,
+            &bodies,
             &recipe,
             &self.toolchain,
-            &self.kernel_cache,
+            kernel_cache_of(&self.kernel_cache, TargetId::Aie(target))?,
             max_artifact_bytes,
         )
         .map_err(|source| LoadError::AieCompile {
-            key: key.to_string(),
+            key: key.clone(),
             source,
         })?;
         self.kernels_resolved += 1;
         validate_linked_artifact(&compiled.artifact, caps).map_err(|source| {
             LoadError::AieLimit {
-                key: key.to_string(),
+                key: key.clone(),
                 source,
             }
         })?;
@@ -742,27 +757,92 @@ impl<D: Device> Engine<D> {
             .ok()
             .and_then(NonZeroU32::new)
             .ok_or_else(|| LoadError::AieInstructionStream {
-                key: key.to_string(),
+                key: key.clone(),
                 bytes: stream_bytes,
             })?;
-        let handle =
-            poot_codegen::aie_kernel_handle(body, compiled.artifact).map_err(|source| {
-                LoadError::AieHandle {
-                    key: key.to_string(),
-                    source,
-                }
-            })?;
+        let handle = poot_codegen::aie_kernel_handle(compiled.artifact);
         let kernel = self
             .device
-            .load_kernel(key, handle)
+            .load_kernel(&key, handle)
             .map_err(device_error(target.into()))?;
         self.kernels.push(kernel);
         let index = self.kernels.len() - 1;
         let invocation = AieInvocation::new(target, words);
-        self.aie_kernels
-            .entry(fingerprint)
-            .or_default()
-            .push((abi, index, invocation));
+        self.aie_kernels.insert(identity, (index, invocation));
+        Ok((index, invocation))
+    }
+
+    /// Kernel index and invocation for the Intel NPU graph of `program`, loaded on first use: the planner's
+    /// region is serialized to OpenVINO IR ([`poot_codegen::emit_vpu`]) and handed to the device with the
+    /// region's argument ABI (the program's own region reads, then writes, with the storage the buffer plan
+    /// gave each value). The device compiles it with the vendor compiler and checks the compiled graph's
+    /// arguments against that ABI. Every refusal is a typed [`LoadError`] naming the region.
+    fn vpu_region_kernel(
+        &mut self,
+        target: VpuTargetId,
+        program: &Program,
+        region: &Region,
+    ) -> Result<(usize, VpuInvocation), ExecError> {
+        let members = region.members();
+        let key = format!("region[{}..{}]", members.start, members.end);
+        let graph = program.vpu_region().ok_or(LoadError::Unimplemented(
+            "an Intel NPU program without its graph",
+        ))?;
+        let ir = poot_codegen::emit_vpu(graph).map_err(|source| LoadError::VpuEmit {
+            key: key.clone(),
+            source,
+        })?;
+        let binding = |name: String, value: ValueId, shape: Vec<usize>| {
+            VpuBinding::new(
+                name,
+                program.storage().storage(value).buffer_storage(),
+                shape,
+            )
+        };
+        let inputs = region
+            .reads()
+            .iter()
+            .zip(graph.input_names())
+            .zip(graph.input_shapes())
+            .map(|((&value, name), shape)| binding(name, value, shape))
+            .collect();
+        let outputs = region
+            .writes()
+            .iter()
+            .zip(graph.output_names())
+            .zip(graph.output_shapes())
+            .map(|((&value, name), shape)| binding(name, value, shape))
+            .collect();
+        let layers = graph
+            .layers()
+            .map(|(name, origin)| VpuLayer::new(name, origin))
+            .collect();
+        let artifact = VpuGraphArtifact::new(
+            target,
+            ir.xml.into_bytes(),
+            ir.weights,
+            inputs,
+            outputs,
+            layers,
+        )
+        .map_err(|source| LoadError::VpuArtifact {
+            key: key.clone(),
+            source,
+        })?;
+        let digest = artifact.digest();
+        if let Some(&(index, invocation)) = self.vpu_kernels.get(&digest) {
+            return Ok((index, invocation));
+        }
+        let handle = poot_codegen::vpu_kernel_handle(artifact);
+        let kernel = self
+            .device
+            .load_kernel(&key, handle)
+            .map_err(device_error(target.into()))?;
+        self.kernels_resolved += 1;
+        self.kernels.push(kernel);
+        let index = self.kernels.len() - 1;
+        let invocation = VpuInvocation::new(target, digest);
+        self.vpu_kernels.insert(digest, (index, invocation));
         Ok((index, invocation))
     }
 
@@ -1394,6 +1474,13 @@ impl<D: Device> Engine<D> {
         let commit_plan = program.state_commit();
 
         let max_artifact_bytes = program.limits().max_artifact_bytes;
+        // The region each equation belongs to, if any.
+        let mut region_of: Vec<Option<usize>> = vec![None; g.eqns().len()];
+        for (index, region) in program.regions().iter().enumerate() {
+            for member in region.members() {
+                region_of[member] = Some(index);
+            }
+        }
         let mut steps = Vec::new();
         for (eqn_index, (eqn, plan)) in program.planned().enumerate() {
             let operand = |values: &ValueTable<Option<(Loc, u32)>>,
@@ -1412,6 +1499,74 @@ impl<D: Device> Engine<D> {
                     .map(|v| operand(values, v))
                     .collect()
             };
+            // A region runs as one invocation, at the position of its last equation: its other equations
+            // materialize nothing here, and every value it returns is placed when its step is built.
+            if let Some(region) = region_of[eqn_index].map(|region| &program.regions()[region]) {
+                if eqn_index + 1 != region.members().end {
+                    continue;
+                }
+                let (kernel, launch) = match self.device.target() {
+                    Target::Aie { target, caps } => {
+                        let (kernel, invocation) = self.aie_region_kernel(
+                            target,
+                            &caps,
+                            program,
+                            region,
+                            max_artifact_bytes,
+                        )?;
+                        (kernel, LaunchKind::Aie(invocation))
+                    }
+                    Target::Vpu { target, .. } => {
+                        let (kernel, invocation) =
+                            self.vpu_region_kernel(target, program, region)?;
+                        (kernel, LaunchKind::VpuGraph(invocation))
+                    }
+                    Target::Gpu { .. } => {
+                        return Err(
+                            LoadError::Unimplemented("a region program on a GPU target").into()
+                        );
+                    }
+                };
+                // The region's bindings, in the order its shape ABI declares them: what it reads, then what
+                // it returns. The dispatch's `output` is the last one; the others returned ride in `inputs`
+                // after the reads, and the artifact's ABI says which of the arguments the region writes.
+                let mut args = Vec::with_capacity(region.reads().len() + region.writes().len());
+                for &read in region.reads() {
+                    args.push(operand(&values, read)?);
+                }
+                for &write in region.writes() {
+                    let loc = out_loc(
+                        OutLocArgs {
+                            out: write,
+                            commit_plan,
+                            buffer_plan,
+                            arena_base,
+                        },
+                        &values,
+                    )?;
+                    let placed = (loc, elems_of(write)?);
+                    values[write] = Some(placed);
+                    args.push(placed);
+                }
+                let output = args
+                    .pop()
+                    .ok_or(LoadError::Unimplemented("a region that returns no value"))?;
+                let work = region
+                    .members()
+                    .map(|member| dispatch_work(g, &g.eqns()[member]))
+                    .sum();
+                let members = region.members();
+                steps.push(LoadedStep {
+                    kernel,
+                    inputs: args,
+                    output,
+                    launch,
+                    work,
+                    kind_name: "region",
+                    label: format!("region[{}..{}]", members.start, members.end),
+                });
+                continue;
+            }
             let work = dispatch_work(g, eqn);
             match plan {
                 Plan::Alias(source) => {
@@ -1419,6 +1574,11 @@ impl<D: Device> Engine<D> {
                 }
                 Plan::View { src, .. } => {
                     values[eqn.out] = Some(operand(&values, *src)?);
+                }
+                // `package` puts every node of a graph artifact in the program's one region, and the
+                // walk above handled it.
+                Plan::Graph => {
+                    return Err(LoadError::Unimplemented("a graph node outside any region").into());
                 }
                 Plan::Dispatches(dispatches) => {
                     let output_loc = out_loc(
@@ -1461,16 +1621,19 @@ impl<D: Device> Engine<D> {
                                     workgroup: body.workgroup_size,
                                 },
                             ),
-                            Target::Aie { target, caps } => {
-                                let (kernel, invocation) = self.aie_kernel(
-                                    target,
-                                    &caps,
-                                    dispatch.key(),
-                                    body,
-                                    dispatch.choice(),
-                                    max_artifact_bytes,
-                                )?;
-                                (kernel, LaunchKind::Aie(invocation))
+                            // `package` puts every dispatching equation of an AIE program in a region,
+                            // and the walk above handled those.
+                            Target::Aie { .. } => {
+                                return Err(LoadError::Unimplemented(
+                                    "an AIE dispatch outside any region",
+                                )
+                                .into());
+                            }
+                            Target::Vpu { .. } => {
+                                return Err(LoadError::Unimplemented(
+                                    "an Intel NPU runs regions, not per-equation kernels",
+                                )
+                                .into());
                             }
                         };
                         let binding = dispatch.binding();
@@ -6102,6 +6265,7 @@ mod aie_engine_tests {
 
     const A: WeightId = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
     const B: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
+    const C: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Up));
 
     /// What the device was handed: every loaded kernel's target, binding count and instruction words, and
     /// every dispatch's launch and argument element counts.
@@ -6115,6 +6279,8 @@ mod aie_engine_tests {
         caps: AieCaps,
         seen: Seen,
         buffers: usize,
+        /// The role of every buffer the engine allocated, in order.
+        roles: Vec<BufferRole>,
     }
 
     impl Device for AieRecorder {
@@ -6134,10 +6300,11 @@ mod aie_engine_tests {
         }
         fn allocate(
             &mut self,
-            _role: BufferRole,
+            role: BufferRole,
             _storage: BufferStorage,
             _elems: usize,
         ) -> Result<usize, Self::Error> {
+            self.roles.push(role);
             self.buffers += 1;
             Ok(self.buffers - 1)
         }
@@ -6205,13 +6372,32 @@ mod aie_engine_tests {
             host_bindings: Queried::Known(8),
             instruction_bytes: Queried::Known(1 << 20),
             memory_budget_bytes: Queried::Known(1 << 30),
+            region: poot_target::aie::RegionLimits {
+                compute_tiles: Queried::Known(32),
+                tile_input_channels: Queried::Known(2),
+                tile_output_channels: Queried::Known(2),
+                host_input_streams: Queried::Known(16),
+                host_output_streams: Queried::Known(16),
+            },
         }
     }
 
     /// `a + b` over two F32 `[2, 3]` weights, compiled for the recorder's AIE target and added as an entry.
     fn load_add(engine: &mut Engine<AieRecorder>) -> Result<(ExecutableId, EntryId), ExecError> {
+        load_graph(engine, &[A, B], |b, w| {
+            b.binary(poot_graph_ir::BinOp::Add, w[0], w[1]).unwrap()
+        })
+    }
+
+    /// The graph `build` makes over F32 `[2, 3]` weights named by `ids`, compiled for the recorder's AIE
+    /// target and added as an entry.
+    fn load_graph(
+        engine: &mut Engine<AieRecorder>,
+        ids: &[WeightId],
+        build: impl FnOnce(&Builder, &[poot_graph_ir::Traced]) -> poot_graph_ir::Traced,
+    ) -> Result<(ExecutableId, EntryId), ExecError> {
         let mut store = WeightStore::builder();
-        for id in [A, B] {
+        for &id in ids {
             let bytes: Vec<u8> = (0..6).flat_map(|i| (i as f32).to_le_bytes()).collect();
             store
                 .insert(
@@ -6224,16 +6410,17 @@ mod aie_engine_tests {
         }
         let store = Arc::new(store.build());
         let b = Builder::for_tests();
-        let x = b
-            .constant(&A.const_name(), TensorType::f32(vec![2, 3]))
-            .unwrap();
-        let y = b
-            .constant(&B.const_name(), TensorType::f32(vec![2, 3]))
-            .unwrap();
-        let sum = b.binary(poot_graph_ir::BinOp::Add, x, y).unwrap();
-        let g = b.finish(sum).unwrap();
+        let consts: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                b.constant(&id.const_name(), TensorType::f32(vec![2, 3]))
+                    .unwrap()
+            })
+            .collect();
+        let out = build(&b, &consts);
+        let g = b.finish(out).unwrap();
         let mut weights = WeightMap::builder(&store);
-        for id in [A, B] {
+        for &id in ids {
             weights
                 .map(id, WeightView::Stored(id.const_name().into()))
                 .unwrap();
@@ -6259,6 +6446,7 @@ mod aie_engine_tests {
             caps,
             seen: Seen::default(),
             buffers: 0,
+            roles: Vec::new(),
         })
         .with_toolchain(poot_codegen::test_support::scripted_toolchain(
             dir, with_iron,
@@ -6308,44 +6496,50 @@ mod aie_engine_tests {
         );
     }
 
-    /// The plan's tile-local reservation is checked against the target's limit before anything is linked:
-    /// this target admits the plan's three bindings, so the planner plans it, but its tile-local memory is
-    /// one byte short of what the add's FIFOs reserve (144). The engine refuses it as the typed
-    /// `LoadError::AieLimit` naming both numbers before the toolchain is even resolved (this engine has no
-    /// IRON driver: a refusal that came after linking would be `ToolchainMissing`), and no kernel handed
-    /// to the device. Mutation: drop the `validate_recipe_tile_local` call
-    /// in `aie_kernel`; the error becomes `AieCompile(ToolchainMissing)` and this row goes red.
+    /// A chain of three equations is one region: the engine loads one linked artifact whose host side is the
+    /// three weights read and the one value returned, and dispatches it once. The two values in between exist
+    /// only inside the artifact: the engine allocates a buffer for the returned value and for no other
+    /// computed value.
+    /// Mutation: have `package` close a region after every equation (`fits` returns an error for any
+    /// region of two); three kernels are loaded and three dispatched, and this row goes red.
     #[test]
-    fn a_plan_past_the_targets_tile_memory_is_refused_before_linking() {
-        let dir = poot_test_util::unique_temp_path("aie-engine-limit");
+    fn a_chain_is_one_linked_region_dispatched_once_with_no_buffer_for_its_intermediates() {
+        let dir = poot_test_util::unique_temp_path("aie-engine-chain");
         std::fs::create_dir_all(&*dir).unwrap();
-        let tight = AieCaps {
-            tile_local_bytes: poot_target::Queried::Known(143),
-            ..caps()
-        };
-        let mut engine = engine(tight, false, &dir);
-        let error = load_error(load_add(&mut engine).unwrap_err());
-        assert!(
-            matches!(
-                &error,
-                LoadError::AieLimit {
-                    source: poot_graph_plan::AieLimitRefusal::Exceeded {
-                        resource: "link recipe tile-local bytes",
-                        needed: 144,
-                        available: 143,
-                    },
-                    ..
-                }
-            ),
-            "{error:?}"
+        let mut engine = engine(caps(), true, &dir);
+        let (exe, entry) = load_graph(&mut engine, &[A, B, C], |b, w| {
+            let first = b.binary(poot_graph_ir::BinOp::Add, w[0], w[1]).unwrap();
+            let second = b.binary(poot_graph_ir::BinOp::Mul, first, w[2]).unwrap();
+            b.binary(poot_graph_ir::BinOp::Add, second, w[0]).unwrap()
+        })
+        .expect("the chain loads through compile_aie");
+        engine
+            .step(exe, entry, &StepInputs::new(), &mut NoSync)
+            .expect("the recorded step replays");
+        let seen = &engine.device.seen;
+        assert_eq!(
+            seen.loaded,
+            vec![(TargetId::Aie(AieTargetId::Xdna2), 4, 1)],
+            "one artifact for the three equations: three reads and the returned value"
         );
-        assert!(engine.device.seen.loaded.is_empty(), "nothing was loaded");
+        assert_eq!(seen.dispatches.len(), 1, "one invocation for the region");
+        assert_eq!(seen.dispatches[0].1, vec![6, 6, 6, 6]);
+        let activations = engine
+            .device
+            .roles
+            .iter()
+            .filter(|role| **role == BufferRole::Activation)
+            .count();
+        assert_eq!(
+            activations, 1,
+            "only the returned value has an arena slot; the two values in between have none"
+        );
     }
 
     /// What only the linked artifact can answer is checked after linking and before the artifact is wrapped:
     /// this target's instruction limit is below the stream the driver wrote. The engine refuses it as the
     /// typed `LoadError::AieLimit` and the device is never handed a kernel. Mutation: drop the
-    /// `validate_linked_artifact` call in `aie_kernel`; the kernel loads and this row goes red.
+    /// `validate_linked_artifact` call in `aie_region_kernel`; the kernel loads and this row goes red.
     #[test]
     fn a_linked_artifact_past_the_targets_instruction_limit_is_refused_before_load() {
         let dir = poot_test_util::unique_temp_path("aie-engine-instr");
@@ -6396,5 +6590,253 @@ mod aie_engine_tests {
             "{error:?}"
         );
         assert!(engine.device.seen.loaded.is_empty(), "nothing was loaded");
+    }
+}
+
+/// POOT-1164: the engine's Intel NPU arm. A device whose target is an Intel NPU loads one graph artifact per
+/// program (the OpenVINO IR the planner's region emits, with its argument ABI), and every step dispatches it
+/// once as a `LaunchKind::VpuGraph` invocation of the artifact it loaded. The device here is a recorder with an
+/// Intel NPU target; there is no NPU in this process, so no row here claims execution (the device lane's rows
+/// do).
+#[cfg(test)]
+mod vpu_engine_tests {
+    use super::*;
+    use crate::{Executor, NoSync};
+    use poot_graph_ir::Builder;
+    use poot_graph_plan::{
+        CompileOptions, multi_device::topology::DeviceId, staged::DevicePlacement,
+        staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
+    };
+    use poot_quant::weights::{
+        AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightView,
+    };
+    use poot_runtime_common::{BufferRole, KernelCode};
+    use poot_target::{Queried, VendorCompilerId, VpuCaps};
+
+    const A: WeightId = WeightId::layer(0, WeightRole::Attn(AttnRole::Q));
+    const B: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Gate));
+    const C: WeightId = WeightId::layer(0, WeightRole::Ffn(FfnRole::Up));
+
+    /// What the device was handed: every loaded artifact's digest, input and output counts, and every
+    /// dispatch's launch and argument element counts.
+    #[derive(Default)]
+    struct Seen {
+        loaded: Vec<(u64, usize, usize)>,
+        dispatches: Vec<(LaunchKind, Vec<u32>)>,
+    }
+
+    struct VpuRecorder {
+        seen: Seen,
+        buffers: usize,
+        roles: Vec<BufferRole>,
+    }
+
+    impl Device for VpuRecorder {
+        type Buffer = usize;
+        type Kernel = usize;
+        type Recording = ();
+        type Error = std::convert::Infallible;
+
+        fn target(&self) -> Target {
+            Target::Vpu {
+                target: VpuTargetId::Npu4,
+                // SYNTHETIC: an NPU4 with a made-up compiler version, not a device measurement.
+                caps: VpuCaps {
+                    target: VpuTargetId::Npu4,
+                    compiler: Queried::Known(VendorCompilerId { major: 8, minor: 3 }),
+                    memory_budget_bytes: Queried::Unknown,
+                },
+            }
+        }
+        fn memory(&self) -> Vec<(BufferRole, poot_runtime_common::MemoryCounterSnapshot)> {
+            Vec::new()
+        }
+        fn allocate(
+            &mut self,
+            role: BufferRole,
+            _storage: BufferStorage,
+            _elems: usize,
+        ) -> Result<usize, Self::Error> {
+            self.roles.push(role);
+            self.buffers += 1;
+            Ok(self.buffers - 1)
+        }
+        fn load_kernel(
+            &mut self,
+            _key: &str,
+            kernel: poot_runtime_common::CompiledKernel,
+        ) -> Result<usize, Self::Error> {
+            let KernelCode::Vpu(artifact) = kernel.code() else {
+                panic!("an Intel NPU device was handed a non-graph artifact");
+            };
+            assert_eq!(kernel.target(), TargetId::Vpu(VpuTargetId::Npu4));
+            self.seen.loaded.push((
+                artifact.digest(),
+                artifact.inputs().len(),
+                artifact.outputs().len(),
+            ));
+            Ok(self.seen.loaded.len() - 1)
+        }
+        fn begin(&mut self, _submission: Submission) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
+            let mut elems: Vec<u32> = d.inputs.iter().map(|arg| arg.elems).collect();
+            elems.push(d.output.elems);
+            self.seen.dispatches.push((d.launch, elems));
+            Ok(())
+        }
+        fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<Option<()>, Self::Error> {
+            Ok(Some(()))
+        }
+        fn replay(&mut self, _recording: &()) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn write_with(
+            &mut self,
+            _dst: &usize,
+            _offset: usize,
+            _len: usize,
+            _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn read(&mut self, _src: &usize, _out: &mut [u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn synchronize(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn device_time(&self) -> DeviceTime {
+            DeviceTime::Unknown
+        }
+        fn abort(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// The graph `build` makes over F16 `[2, 3]` weights named by `ids`, compiled for the recorder's Intel NPU
+    /// target and added as an entry.
+    fn load_graph(
+        engine: &mut Engine<VpuRecorder>,
+        ids: &[WeightId],
+        build: impl FnOnce(&Builder, &[poot_graph_ir::Traced]) -> poot_graph_ir::Traced,
+    ) -> Result<(ExecutableId, EntryId), ExecError> {
+        let mut store = WeightStore::builder();
+        for &id in ids {
+            let bytes: Vec<u8> = (0..6u16).flat_map(|i| (0x3c00 + i).to_le_bytes()).collect();
+            store
+                .insert(
+                    id.const_name(),
+                    WeightEntry::Dense(
+                        DenseWeight::try_new(DType::F16, vec![2, 3], bytes.into()).unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
+        let store = Arc::new(store.build());
+        let b = Builder::for_tests();
+        let consts: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                b.constant(&id.const_name(), TensorType::new(vec![2, 3], DType::F16))
+                    .unwrap()
+            })
+            .collect();
+        let out = build(&b, &consts);
+        let g = b.finish(out).unwrap();
+        let mut weights = WeightMap::builder(&store);
+        for &id in ids {
+            weights
+                .map(id, WeightView::Stored(id.const_name().into()))
+                .unwrap();
+        }
+        let weights = weights.build();
+        let program = compile_staged(
+            &g,
+            &TargetSet::single(DeviceId(0), engine.device().target()),
+            &Partition {
+                experts: ExpertPlacement::AllResident,
+                devices: DevicePlacement::Single(DeviceId(0)),
+            },
+            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        )
+        .expect("the graph compiles for an Intel NPU target");
+        let exe = engine.load_weights(store, Arc::new(weights))?;
+        let entry = engine.add_entry(exe, &program)?;
+        Ok((exe, entry))
+    }
+
+    fn engine() -> Engine<VpuRecorder> {
+        // `Engine::new` over an Intel NPU device must not need a kernel-body compiler.
+        Engine::new(VpuRecorder {
+            seen: Seen::default(),
+            buffers: 0,
+            roles: Vec::new(),
+        })
+    }
+
+    /// A chain of three equations over three weights is one graph artifact whose host side is the three
+    /// weights read and the one value returned, dispatched once as a graph invocation of that same artifact.
+    /// The two values in between exist only inside the graph: the engine allocates a buffer for the returned
+    /// value and for no other computed value.
+    ///
+    /// Mutation: have `package` return no region for `ArtifactGranularity::Graph`; the load is refused ("a
+    /// graph node outside any region") and nothing is loaded.
+    #[test]
+    fn a_chain_is_one_graph_artifact_dispatched_once_with_no_buffer_for_its_intermediates() {
+        let mut engine = engine();
+        let (exe, entry) = load_graph(&mut engine, &[A, B, C], |b, w| {
+            let first = b.binary(poot_graph_ir::BinOp::Add, w[0], w[1]).unwrap();
+            let second = b.binary(poot_graph_ir::BinOp::Mul, first, w[2]).unwrap();
+            b.binary(poot_graph_ir::BinOp::Add, second, w[0]).unwrap()
+        })
+        .expect("the chain loads");
+        engine
+            .step(exe, entry, &StepInputs::new(), &mut NoSync)
+            .expect("the recorded step replays");
+        let seen = &engine.device.seen;
+        assert_eq!(seen.loaded.len(), 1, "one artifact for the three equations");
+        let (digest, inputs, outputs) = seen.loaded[0];
+        assert_eq!(
+            (inputs, outputs),
+            (3, 1),
+            "three weights read, one value returned"
+        );
+        assert_eq!(seen.dispatches.len(), 1, "one invocation for the graph");
+        assert_eq!(
+            seen.dispatches[0].0,
+            LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest)),
+            "the invocation names the artifact the engine loaded"
+        );
+        assert_eq!(seen.dispatches[0].1, vec![6, 6, 6, 6]);
+        let activations = engine
+            .device
+            .roles
+            .iter()
+            .filter(|role| **role == BufferRole::Activation)
+            .count();
+        assert_eq!(
+            activations, 1,
+            "only the returned value has an arena slot; the two values in between have none"
+        );
+    }
+
+    /// Two entries over the same graph load the artifact once: the engine keys it by its digest.
+    ///
+    /// Mutation: drop the `vpu_kernels` lookup in `vpu_region_kernel`; the device loads the artifact twice.
+    #[test]
+    fn the_same_graph_added_twice_is_loaded_once() {
+        let mut engine = engine();
+        for _ in 0..2 {
+            load_graph(&mut engine, &[A, B], |b, w| {
+                b.binary(poot_graph_ir::BinOp::Add, w[0], w[1]).unwrap()
+            })
+            .expect("the add loads");
+        }
+        assert_eq!(engine.device.seen.loaded.len(), 1);
     }
 }

@@ -16,7 +16,7 @@ rust-version.workspace = true
 # through a forwarder. (`is_decode_gemv`/`is_tiled_gemm` were the same shape but had no private-state reason
 # to stay - deleted; their callers now check the planned `Plan` instead.) The `test_support` module (plan_eqn,
 # the GPU-target accessors) sits behind the same feature.
-test-support = []
+test-support = ["poot-codegen/test-support"]
 
 [dependencies]
 poot-codegen.workspace = true

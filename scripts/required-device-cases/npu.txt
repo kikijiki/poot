@@ -7,12 +7,24 @@
 # Every poot-npu device row, on the XDNA2 NPU through the real compile -> Engine -> XRT route: the fixture
 # bank against the shared oracle, the measured tile-memory boundary, the planner's typed refusals for the NPU
 # target, the device's own pre-XRT refusals, unload releasing every buffer, capture/replay, and the failed
-# run's poison and quarantine.
+# run's poison and quarantine. The region rows (POOT-1160): twenty distinct-shape equations in three hardware
+# contexts, intermediates with no buffer, one run per region, the measured region bounds and the packaging
+# that splits at them, and a reordered chain being its own artifact. Every pointwise op is run against its numerical contract.
+poot-npu::aie_pointwise	every_pointwise_op_meets_its_numerical_contract_on_the_npu
+poot-npu::aie_pointwise	executables_over_one_graph_and_different_data_each_compute_their_own_on_the_npu
 poot-npu::xdna_device	a_byte_artifact_kernel_is_refused_at_load
 poot-npu::xdna_device	a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs
 poot-npu::xdna_device	a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers
+poot-npu::xdna_device	an_artifact_whose_last_binding_is_read_only_is_refused_at_load
 poot-npu::xdna_device	equations_the_npu_cannot_lower_are_refused_with_typed_capabilities
 poot-npu::xdna_device	every_buffer_is_released_when_the_executable_is_unloaded
 poot-npu::xdna_device	replaying_a_recording_over_reset_state_is_bit_identical
 poot-npu::xdna_device	the_declared_tile_memory_is_the_size_that_links_and_runs
 poot-npu::xdna_device	the_fixture_bank_matches_the_oracle_on_the_npu
+poot-npu::xdna_region	a_chain_region_returns_one_value_and_allocates_nothing_for_the_rest
+poot-npu::xdna_region	a_region_at_every_declared_limit_links_and_one_past_is_refused
+poot-npu::xdna_region	a_reordered_chain_is_its_own_artifact_and_computes_its_own_function
+poot-npu::xdna_region	a_six_equation_region_is_one_run_per_step
+poot-npu::xdna_region	a_value_that_is_returned_and_read_on_chip_is_right_on_both_paths
+poot-npu::xdna_region	packaging_splits_at_the_declared_bounds_and_each_split_program_runs
+poot-npu::xdna_region	twenty_equations_of_distinct_shapes_run_within_the_sixteen_hardware_contexts

@@ -6,9 +6,9 @@
 //! # The AIE (XDNA2) path
 //!
 //! Supporting NPUs (Intel, AMD XDNA2) remains a poot objective (POOT-1093). The [`aie`] module is this
-//! crate's half of it (POOT-664): a core object compiled by Peano from a sequential `Body`, a typed
-//! shape/layout [`AieLinkRecipe`], IRON linking to a loadable xclbin/instruction artifact, the
-//! shape-and-toolchain-keyed cache identity, and the ordinary [`kernel_handle`] over the linked artifact.
+//! crate's half of it (POOT-664): a core object compiled by Peano from each tile body of a region, a typed
+//! wiring/layout [`AieLinkRecipe`], IRON linking to one loadable xclbin/instruction artifact, the
+//! shape-wiring-and-toolchain-keyed cache identity, and [`aie_kernel_handle`] over the linked artifact.
 //! Device loading and execution are the XDNA runtime's (POOT-641); nothing here runs on hardware, and no
 //! Peano/IRON positive compile is claimed unless a receipt names the toolchain.
 //!
@@ -33,28 +33,40 @@ mod spirv_postprocess;
 mod structurize;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+mod vpu;
 
 use std::path::Path;
 use std::process::Command;
 
 pub use aie::{
     AieAbiMismatch, AieCompileError, AieCompiled, AieFifo, AieIdentity, AieLinkRecipe, AieStage,
-    AieToolIdentity, AieTools, FifoDirection, compile_aie,
+    AieTile, AieToolIdentity, AieTools, FifoEnd, RecipeFault, compile_aie,
 };
 pub use cache::{
     Artifact, ArtifactTooLarge, KernelCache, KernelKey, epoch as kernel_cache_epoch,
     kernel_cache_root,
 };
 pub use emit::emit_llvm_ir;
-pub use handle::{GpuTarget, NotAByteTarget, aie_kernel_handle, kernel_handle};
+pub use handle::{
+    GpuTarget, NoBodyTarget, NotAByteTarget, aie_kernel_handle, kernel_handle, vpu_kernel_handle,
+};
 use poot_target::AmdArch;
 pub use spirv_postprocess::NoContractionError;
+pub use vpu::{
+    VpuElem, VpuEmitError, VpuInput, VpuIr, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue,
+    emit_vpu,
+};
 
 /// A codegen backend target.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
     /// SPIR-V for Vulkan/wgpu (triple `spirv-unknown-vulkan1.3-compute`, carried in the IR text).
     SpirvVulkan,
+    /// OpenCL-flavoured SPIR-V (`Kernel` capability) for Level Zero devices such as the Intel Xe iGPU
+    /// (triple `spirv64-unknown-unknown`). The ABI is the PTX one: flat `ptr addrspace(1)` arguments plus
+    /// an `i64` length per slice, `get_global_id`-style builtins, no structurize or debranch pass. The
+    /// validator needs `--target-env spv1.4` or newer for the backend's output.
+    SpirvOpenCl,
     /// PTX for NVIDIA/cudarc (triple `nvptx64-nvidia-cuda`).
     Nvptx,
     /// AIE core machine code for the AMD XDNA2 NPU, via Peano (`llc --march=aie2p`). One AIE core runs a
@@ -101,6 +113,10 @@ pub fn capability(target: Target) -> Capability {
             strided_views: true,
             imported_lds_array_bodies: true,
         },
+        Target::SpirvOpenCl => Capability {
+            strided_views: true,
+            imported_lds_array_bodies: true,
+        },
         Target::AmdGcn(_) => Capability {
             strided_views: true,
             imported_lds_array_bodies: false,
@@ -140,6 +156,14 @@ impl Target {
                  +SPV_KHR_cooperative_matrix"
                     .into(),
             ],
+            // OpenCL SPIR-V: the triple is carried in the IR text, as for Vulkan. Float atomics are the only
+            // extensions the kernels use; the cooperative-matrix path is Vulkan-only.
+            Target::SpirvOpenCl => vec![
+                "-O0".into(),
+                "-filetype=obj".into(),
+                "--spirv-ext=+SPV_EXT_shader_atomic_float_add,+SPV_EXT_shader_atomic_float_min_max"
+                    .into(),
+            ],
             // Peano (llvm-aie) lowers scalar LLVM IR to the AIE2p core ISA. The IRON harness links the `.o`
             // by C symbol via `external_func(..., link_with=...)`. aie2p Peano is reported -O0-stable-only
             // (llvm-aie #315), but the scalar kernel lowers cleanly at -O1 (spec 057 open question). `llc`
@@ -172,7 +196,7 @@ impl Target {
     fn output_ext(&self) -> &'static str {
         match self {
             Target::Nvptx => "ptx",
-            Target::SpirvVulkan => "spv",
+            Target::SpirvVulkan | Target::SpirvOpenCl => "spv",
             Target::AieCore => "o",
             // ELF (`e_machine = EM_AMDGPU`); `.hsaco` distinguishes it from the AIE `.o`.
             Target::AmdGcn(_) => "hsaco",
@@ -308,7 +332,7 @@ impl Toolchain {
                     target,
                     variable: "POOT_AMD_CLANG",
                 }),
-            Target::Nvptx | Target::SpirvVulkan => Ok(&self.llc),
+            Target::Nvptx | Target::SpirvVulkan | Target::SpirvOpenCl => Ok(&self.llc),
         }
     }
 }

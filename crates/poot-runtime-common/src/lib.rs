@@ -5,8 +5,9 @@ pub mod device_skip;
 mod kernel;
 mod memory;
 pub mod telemetry;
+mod vpu;
 pub use kernel::{
-    AieArtifactError, AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess, ArgSchema,
+    AieArena, AieArtifactError, AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess, ArgSchema,
     CompiledKernel, KernelArgError, KernelCode, check_element_schema, check_kernel_args,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -15,6 +16,7 @@ pub use memory::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
 pub use telemetry::{
     CallCounts, CallPurpose, Coverage, ExecutionCounters, TransferCounts, TransferDirection,
 };
+pub use vpu::{VpuArtifactError, VpuBinding, VpuGraphArtifact, VpuLayer};
 
 /// Failure while converting a logical element count into a native buffer layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,11 +131,20 @@ pub enum DeviceBackend {
     Ptx,
     /// The AMD XDNA2 NPU over XRT (`poot-npu`).
     Npu,
+    /// The Intel NPU over Level Zero (`poot-npu`, feature `vpu`).
+    IntelNpu,
 }
 
 impl DeviceBackend {
     /// Every backend, for tests and scripts that must cover all of them.
-    pub const ALL: [Self; 5] = [Self::Wgpu, Self::Vulkan, Self::Rocm, Self::Ptx, Self::Npu];
+    pub const ALL: [Self; 6] = [
+        Self::Wgpu,
+        Self::Vulkan,
+        Self::Rocm,
+        Self::Ptx,
+        Self::Npu,
+        Self::IntelNpu,
+    ];
 
     /// The environment variable that requires this backend (`POOT_REQUIRE_<BACKEND>`).
     pub const fn variable(self) -> &'static str {
@@ -143,6 +154,7 @@ impl DeviceBackend {
             Self::Rocm => "POOT_REQUIRE_ROCM",
             Self::Ptx => "POOT_REQUIRE_PTX",
             Self::Npu => "POOT_REQUIRE_NPU",
+            Self::IntelNpu => "POOT_REQUIRE_INTEL_NPU",
         }
     }
 
@@ -154,6 +166,7 @@ impl DeviceBackend {
             Self::Rocm => "ROCm",
             Self::Ptx => "PTX",
             Self::Npu => "NPU",
+            Self::IntelNpu => "Intel NPU",
         }
     }
 
@@ -435,6 +448,7 @@ mod device_backend_tests {
             "POOT_REQUIRE_ROCM",
             "POOT_REQUIRE_PTX",
             "POOT_REQUIRE_NPU",
+            "POOT_REQUIRE_INTEL_NPU",
         ];
         for (backend, own) in DeviceBackend::ALL.into_iter().zip(variables) {
             assert_eq!(backend.variable(), own);

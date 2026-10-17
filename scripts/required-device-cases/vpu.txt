@@ -1,0 +1,39 @@
+# Required cases for `just test-device-vpu`, one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py vpu) fails the lane unless every case here ran and passed - a skip is
+# never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# Every poot-npu `vpu` row, on the Intel NPU through the real compile -> Engine -> vendor graph compiler ->
+# Level Zero route: the op bank against the shared oracle (elementwise, transcendental, reduction, contraction,
+# gather, movement, rank four, F32 at the boundary, carried state), one compiled graph and one replay per step,
+# the planner's typed refusals for the NPU target, unload releasing every buffer, capture and replay. The blob
+# cache: a second device loading the cached blob without the compiler, a damaged or foreign entry recompiled,
+# a blob the driver rejects recompiled. The device's own contract: the compiled graph against the region's
+# ABI (name, count, direction, extents, precision), the rank bound, the vendor compiler's log, dispatch
+# refusals, and the failed replay's poison. Hardware-free unit rows ride along (the layer rejection, the
+# padded dimensions, the cache key, the cache write, the precision refusal).
+poot-npu	blob_cache::tests::a_failed_put_removes_its_temporary_file
+poot-npu	blob_cache::tests::concurrent_puts_of_one_key_leave_one_whole_entry
+poot-npu	vpu::tests::a_layer_missing_from_the_supported_set_is_reported_with_its_equation
+poot-npu	vpu::tests::an_element_kind_the_boundary_does_not_carry_is_refused_not_widened
+poot-npu	vpu::tests::dimensions_are_padded_to_five_on_the_right
+poot-npu	vpu::tests::the_blob_key_covers_the_region_the_compiler_and_the_options
+poot-npu::vpu_contract	a_compiled_graph_that_disagrees_with_the_regions_abi_is_refused_before_it_runs
+poot-npu::vpu_contract	a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs
+poot-npu::vpu_contract	a_graph_with_more_arguments_than_the_region_declares_is_refused_for_its_count
+poot-npu::vpu_contract	a_region_past_five_dimensions_is_refused_at_load
+poot-npu::vpu_contract	a_region_whose_extents_differ_from_the_compiled_graphs_is_refused_for_its_dimensions
+poot-npu::vpu_contract	a_region_whose_precision_differs_from_the_compiled_graphs_is_refused_for_its_precision
+poot-npu::vpu_contract	a_replay_that_misses_its_deadline_poisons_the_device
+poot-npu::vpu_contract	a_vendor_compile_failure_is_a_typed_error_with_the_compilers_log
+poot-npu::vpu_contract	an_argument_read_by_the_graph_but_declared_an_output_is_refused_for_its_direction
+poot-npu::vpu_device	a_cache_entry_that_is_not_this_regions_blob_is_recompiled_and_replaced
+poot-npu::vpu_device	a_cached_blob_the_driver_rejects_is_recompiled_and_replaced
+poot-npu::vpu_device	a_gather_by_i32_indices_returns_its_rows_on_the_npu
+poot-npu::vpu_device	a_program_is_one_compiled_graph_and_one_replay_per_step
+poot-npu::vpu_device	a_second_device_loads_the_cached_blob_without_compiling
+poot-npu::vpu_device	equations_the_npu_cannot_lower_are_refused_with_typed_capabilities
+poot-npu::vpu_device	every_buffer_is_released_when_the_executable_is_unloaded
+poot-npu::vpu_device	replaying_a_recording_over_reset_state_is_bit_identical
+poot-npu::vpu_device	the_fixture_bank_matches_the_oracle_on_the_npu

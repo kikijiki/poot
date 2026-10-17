@@ -9,7 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3 = { workspace = true, optional = true }
 poot-executor.workspace = true
+poot-l0-runtime = { workspace = true, optional = true }
 poot-graph-plan.workspace = true
 poot-runtime-common.workspace = true
 poot-target.workspace = true
@@ -20,11 +22,14 @@ tracing.workspace = true
 cc = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The device's run and load counters, which only this crate's device rows read (ADR-0113): they have no
+# production caller, so they sit behind `test-support` and the rows reach them through this self edge.
+poot-npu = { path = ".", features = ["test-support"] }
 poot-runtime-common = { workspace = true, features = ["test-support"] }
 poot-eval = { workspace = true, features = ["test-support"] }
-poot-codegen.workspace = true
+poot-codegen = { workspace = true, features = ["test-support"] }
 poot-executor-parity.workspace = true
-poot-graph-ir.workspace = true
+poot-graph-ir = { workspace = true, features = ["test-support"] }
 poot-kernel-ir.workspace = true
 poot-kernelgen.workspace = true
 poot-quant.workspace = true
@@ -32,10 +37,16 @@ poot-tensor.workspace = true
 poot-test-util.workspace = true
 
 [features]
+# The Intel NPU device over Level Zero (POOT-1164): the vendor graph compiler, the blob cache and the `Device`.
+# The Level Zero loader and the NPU driver are `dlopen`ed, so this builds anywhere; running it needs
+# `nix develop .#npu-intel` (the driver, its compiler and the loader).
+vpu = ["dep:blake3", "dep:poot-l0-runtime"]
 # The XRT FFI and the `Device` itself. Off by default: the shim needs the XRT headers and `libxrt_coreutil`,
 # which only `nix develop .#npu` provides, so a default workspace build and the model-free gate compile this
 # crate to its documentation. The device lane builds it with `--features xdna` (spec 1002, POOT-1118).
 xdna = ["dep:cc"]
+# The device's run and load counters (see the dev-dependency self edge above).
+test-support = []
 
 [lints]
 workspace = true

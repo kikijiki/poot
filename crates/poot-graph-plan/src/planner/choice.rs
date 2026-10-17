@@ -12,7 +12,7 @@ use crate::types::{Launch, ScratchDecl};
 use std::fmt;
 
 use poot_kernelgen::{KernelRequest, generate};
-use poot_target::{AieTargetId, Backend, DeviceCaps, TargetId};
+use poot_target::{AieTargetId, Backend, DeviceCaps};
 
 use crate::{Binding, Capability, Dispatch, DispatchPlan, ImportedKernel, Plan, PlanError};
 use poot_graph_ir::ValueId;
@@ -26,6 +26,8 @@ pub enum NoDispatch {
     Alias,
     /// The output is a strided view of an input buffer.
     View,
+    /// The equation is a node of the target's graph artifact (an Intel NPU's vendor-compiled graph).
+    Graph,
 }
 
 /// The kernel the planner chose for one equation.
@@ -36,15 +38,18 @@ pub enum NoDispatch {
 pub enum KernelChoice {
     /// A body `poot-kernelgen` generated from this request, launched as a thread grid.
     Generated(KernelRequest),
-    /// The same request under the target's sequential one-core schedule (an AIE core): one invocation of a
-    /// one-thread workgroup. `bindings` are what the generator proved of the body it produced (one per
-    /// parameter, in binding order); the shape ABI the body is linked against is derived from them, so
-    /// the body and its ABI come from one generation.
-    Sequential {
+    /// The same request under the target's serialized one-core schedule (an AIE core): the ordinary body with
+    /// its thread grid turned into loops, one invocation of a one-thread workgroup. `bindings` are what the
+    /// generator proved of the body it produced (one per parameter, in binding order); the shape ABI the body
+    /// is linked against is derived from them, so the body and its ABI come from one generation.
+    Serialized {
         /// The request that was generated.
         request: KernelRequest,
+        /// The numerical contract the request's op runs under on the core. It is part of the choice, so
+        /// the plan key tells two contracts apart.
+        contract: poot_kernelgen::NumericalContract,
         /// What the generator proved of each body parameter, in binding order.
-        bindings: Box<[poot_kernelgen::SequentialBinding]>,
+        bindings: Box<[poot_kernelgen::SerializedBinding]>,
     },
     /// A shipped template body, bound with a metadata buffer of `meta_schema` words (zero for none). The
     /// count is read from the metadata the plan carries, never typed in a second place. `index` is the
@@ -70,7 +75,7 @@ impl KernelChoice {
     pub fn label(&self) -> String {
         match self {
             Self::Generated(request) => format!("generated:{}", request.family()),
-            Self::Sequential { request, .. } => format!("sequential:{}", request.family()),
+            Self::Serialized { request, .. } => format!("serialized:{}", request.family()),
             Self::Imported { kernel, .. } => format!("imported:{kernel:?}").to_lowercase(),
             Self::NoDispatch(kind) => format!("nodispatch:{kind:?}").to_lowercase(),
         }
@@ -80,13 +85,13 @@ impl KernelChoice {
     /// ([`KernelRequest::display_label`]), a shipped template its kernel. Carried by the plan beside its key.
     fn display_label(&self) -> String {
         match self {
-            Self::Generated(request) | Self::Sequential { request, .. } => request.display_label(),
+            Self::Generated(request) | Self::Serialized { request, .. } => request.display_label(),
             other => other.label(),
         }
     }
 
     /// The digest of this choice's canonical encoding for `target`'s codegen epoch.
-    fn digest(&self, target: TargetId) -> ChoiceDigest {
+    fn digest(&self, target: poot_codegen::Target) -> ChoiceDigest {
         // The `Debug` form of the plain-data choice is its encoding. That is sound only while no type
         // reachable from a request has a lossy `Debug`: the audit (card 636) found one hand-written
         // impl, `TileSize`, which prints its `u32` edge, and `f32` fields (`FusedInput::Lit`), whose `Debug`
@@ -94,9 +99,7 @@ impl KernelChoice {
         // `every_request_family_has_a_field_that_changes_the_digest` test pins one field per family (and the
         // `TileSize` edge and the Gemv launch shape of the packed family).
         let mut hasher = blake3::Hasher::new();
-        hasher.update(
-            poot_codegen::kernel_cache_epoch(poot_codegen::Target::from(target)).as_bytes(),
-        );
+        hasher.update(poot_codegen::kernel_cache_epoch(target).as_bytes());
         hasher.update(b"\n");
         hasher.update(format!("{self:?}").as_bytes());
         ChoiceDigest(*hasher.finalize().as_bytes())
@@ -207,19 +210,20 @@ fn build(
 /// The same request under an AIE core's sequential one-core schedule: one invocation of a one-thread
 /// workgroup, with the access ranges the generator proved. Only the schedule is the target's; the request is
 /// the one every target plans.
-fn build_sequential(
+fn build_serialized(
     site: Site<'_>,
     request: KernelRequest,
     target: AieTargetId,
 ) -> Result<Built, PlanError> {
-    let sequential = poot_kernelgen::sequential_schedule(&request, site.limits())
+    let sequential = poot_kernelgen::serialized_schedule(&request, site.limits())
         .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
     let launch = poot_kernelgen::Launch {
         grid: [1, 1, 1],
         meta: None,
     };
-    let choice = KernelChoice::Sequential {
+    let choice = KernelChoice::Serialized {
         request,
+        contract: sequential.contract,
         bindings: sequential.bindings,
     };
     let key = choice.digest(target.into()).to_string();
@@ -258,17 +262,17 @@ impl Planned {
     ) -> Result<Self, PlanError> {
         match lowering {
             Lowering::Gpu { backend, caps } => Self::generated(site, request, backend, caps),
-            Lowering::Aie(target) => Self::sequential(site, request, target),
+            Lowering::Aie(target) => Self::serialized(site, request, target),
         }
     }
 
     /// Plan `request` for an AIE target: its sequential schedule as one dispatch.
-    fn sequential(
+    fn serialized(
         site: Site<'_>,
         request: KernelRequest,
         target: AieTargetId,
     ) -> Result<Self, PlanError> {
-        let PlannedDispatch { dispatch } = build_sequential(site, request, target)?.into_dispatch();
+        let PlannedDispatch { dispatch } = build_serialized(site, request, target)?.into_dispatch();
         let choice = dispatch.choice().clone();
         Ok(Self {
             plan: single_plan(dispatch)?,
@@ -392,6 +396,11 @@ impl Planned {
             },
             NoDispatch::View,
         )
+    }
+
+    /// An equation that lowers to a node of the target's graph artifact.
+    pub(crate) fn graph() -> Self {
+        Self::no_dispatch(Plan::Graph, NoDispatch::Graph)
     }
 
     fn no_dispatch(plan: Plan, kind: NoDispatch) -> Self {

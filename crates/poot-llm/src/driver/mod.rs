@@ -201,7 +201,9 @@ pub fn program_retention(program: &StagedProgram) -> Retention {
                         own(dispatch.key(), dispatch.body(), &mut retention);
                     }
                 }
-                poot_graph_plan::Plan::Alias(_) | poot_graph_plan::Plan::View { .. } => {}
+                poot_graph_plan::Plan::Alias(_)
+                | poot_graph_plan::Plan::View { .. }
+                | poot_graph_plan::Plan::Graph => {}
             }
         }
     }
@@ -1500,13 +1502,13 @@ impl Driver {
         }
         self.stats.steps += 1;
         // A token at position `p` attends `p + 1` cached positions: the plan's KV bytes per position
-        // times that count, on top of the weights and recurrent state every step streams.
-        let attended: u64 = data
-            .pos
-            .iter()
-            .map(|&p| u64::from(p.max(0).cast_unsigned()) + 1)
-            .sum();
-        let bytes = entry.traffic.step_bytes(attended);
+        // times that count (a block-selected cache: times at most its selected positions), on top of the
+        // weights and recurrent state every step streams.
+        let bytes = entry.traffic.step_bytes(
+            data.pos
+                .iter()
+                .map(|&p| u64::from(p.max(0).cast_unsigned()) + 1),
+        );
         let counter = if entry.decode {
             &mut self.stats.decode_read_bytes
         } else {

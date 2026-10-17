@@ -192,6 +192,8 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::Attention(_)
         | OpKind::Rope { .. }
         | OpKind::Scan(_)
+        | OpKind::BlockTopK(_)
+        | OpKind::SelectedAttention(_)
         | OpKind::AllReduce { .. }
         | OpKind::AllGather { .. }
         | OpKind::Iota { .. }

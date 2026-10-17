@@ -353,3 +353,67 @@ fn greedy_sample_token_is_exact_on_wgpu() {
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     poot_executor_parity::sample_token::assert_greedy_pick_is_exact(exec.as_mut(), t);
 }
+
+/// POOT-1165: executables of one engine over the same graph and different constants each compute their own,
+/// while all of them stay loaded and alternate.
+#[test]
+fn executables_over_one_graph_and_different_data_each_compute_their_own_on_wgpu() {
+    let Ok(device) = WgpuDevice::new() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    let fixtures =
+        poot_executor_parity::coresident::same_graph_different_data_fixtures(&[0.0, 3.0, -7.0]);
+    poot_executor_parity::coresident::run_coresident(exec.as_mut(), t, &fixtures)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// POOT-1143 stage 2: the indexer's block selection (ties straddling the cut, fewer complete blocks than `k`,
+/// queries as rows by tokens, a wide row, all scores equal) runs through the generated radix-select kernel
+/// on the device, and its words equal both the plain stable-sort selection (computed here without the oracle)
+/// and the oracle's primitive definition at every replayed step.
+/// Mutation: in `block_top_k.rs` take the last equal blocks at the threshold instead of the first (ties
+/// ascending by block); the ties case goes red.
+#[test]
+fn block_top_k_selects_what_the_plain_selection_selects_on_wgpu() {
+    let Ok(device) = WgpuDevice::new() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    for case in poot_executor_parity::block_top_k::cases() {
+        poot_executor_parity::block_top_k::assert_device_selects(exec.as_mut(), t, &case);
+        if case.oracle {
+            let mut oracle = oracle_for(&case.fixture.graph, &case.fixture.store);
+            poot_executor_parity::run_parity(exec.as_mut(), t, &case.fixture, &mut oracle)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+}
+
+/// POOT-1143 stage 3: attention over the blocks a selection names (a GQA decode, a prefill with empty and short
+/// selections, every block selected, and the design's deep decode: 24 query heads over 2 of 256, 32768 positions,
+/// 512 blocks selected) runs through the generated kernel on the device and equals the independent f64 attention
+/// over the selected keys within the tier-2 tolerance, and the oracle's dense definition where it is cheap.
+/// Mutation: in `block_candidate` read the unfinished block's start one block early; the queries take keys of a
+/// block that is not their own and the first case goes red.
+#[test]
+fn selected_attention_reads_exactly_the_selected_blocks_on_wgpu() {
+    let Ok(device) = WgpuDevice::new() else {
+        eprintln!("skip: no wgpu adapter");
+        return;
+    };
+    let t = target(&device);
+    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
+    for case in poot_executor_parity::selected_attention::all() {
+        poot_executor_parity::selected_attention::assert_device_attends(exec.as_mut(), t, &case);
+        if case.oracle {
+            let mut oracle = oracle_for(&case.fixture.graph, &case.fixture.store);
+            poot_executor_parity::run_parity(exec.as_mut(), t, &case.fixture, &mut oracle)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+}

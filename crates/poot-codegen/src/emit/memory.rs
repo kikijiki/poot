@@ -15,7 +15,7 @@ impl<'a> Emitter<'a> {
             return Err(EmitError::Unsupported("Len of a non-param".into()));
         }
         match self.target {
-            Target::Nvptx => Ok((format!("%n{}", slice.index), "i64".into())),
+            Target::Nvptx | Target::SpirvOpenCl => Ok((format!("%n{}", slice.index), "i64".into())),
             // AIE core: the length is a scalar i32 kernel arg per slice (the IRON harness passes the tile length); same
             // model as NVPTX but 32-bit.
             Target::AieCore => Ok((format!("%n{}", slice.index), "i32".into())),
@@ -185,7 +185,7 @@ impl<'a> Emitter<'a> {
         // load the index value (usize-width).
         let (idx_val, _) = self.load_place(&Place::local(idx_local), w)?;
         match self.target {
-            Target::Nvptx => {
+            Target::Nvptx | Target::SpirvOpenCl => {
                 let p = self.fresh();
                 let _ = writeln!(
                     w,

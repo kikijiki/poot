@@ -1,5 +1,7 @@
 # poot
 
+> *I-I need to, I need to COMPOOOOT*
+
 poot is an LLM inference engine written from scratch in Rust. A model is an ordinary Rust function that is
 traced once into a backend-neutral graph of primitive tensor ops. A shared planner and code generator
 compile that graph into fused kernels, and the GPU backends (wgpu, ROCm, PTX, raw Vulkan) replay a captured

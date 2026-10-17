@@ -7,31 +7,92 @@ sidebar_position: 12
 # NPU Offload
 
 :::note[Experimental, correctness-scoped]
-The AMD XDNA2 NPU runs a narrow set of programs through the ordinary pipeline. It is not a serving
-backend and has no `--backend` option: it is a library `Device` (`poot-npu`, behind its `xdna` feature,
-built under the repository's `nix develop .#npu` shell). Intel NPUs are not supported.
+Two NPUs run a narrow set of programs through the ordinary pipeline: AMD's XDNA2 and Intel's NPU4 (Lunar
+Lake). Neither is a serving backend and neither has a `--backend` option: each is a library `Device`
+(`poot-npu`, behind its `xdna` feature under the repository's `nix develop .#npu` shell, and its `vpu`
+feature under `nix develop .#npu-intel`).
 :::
 
 ## What runs
 
-The planner admits an equation for the AIE target, `poot-codegen` compiles it to a Peano core object and
-links it with IRON into an xclbin and instruction stream, the shared `Engine` loads that artifact, and
-`XdnaDevice` runs it through XRT. There is no second executor and no graph matcher.
+The planner admits each equation for the AIE target. The NPU holds a bounded number of hardware contexts
+(16 on this XDNA2) and one loaded artifact takes one, so the compiler groups the planned equations of a
+program into **regions**: a contiguous run of equations that is one artifact and one run per step. Each
+equation of a region is a Peano core object on its own compute tile; a value only the region's own
+equations read moves tile to tile and never reaches host memory, and the region's other tensors sit at fixed
+offsets in a few host arenas. A region closes where the next equation would break a measured bound (32
+compute tiles, 16 host streams each way, 64512 tile-local bytes). `poot-codegen` links a region with IRON
+into an xclbin and instruction stream, the shared `Engine` loads it, and `XdnaDevice` runs it through XRT.
+There is no second executor and no graph matcher.
 
 Verified on an AMD XDNA2 NPU (Strix Halo, `aie2p`):
 
-- **F32 `add`, `sub` and `mul`** over dense tensors, run as one sequential core, match the CPU oracle bit
-  for bit on integer-valued inputs and within 1e-5 on fractional ones, including activation slots and a
-  carried running-sum state, replayed over changing inputs.
-- **Tile-local limit: 64512 bytes**, measured. An add whose double-buffered FIFOs reserve exactly that runs;
-  one element more per binding is refused before linking as a typed limit.
+- **Pointwise F32 ops** over dense tensors run as serialized cores: the ordinary kernel body with its
+  thread grid turned into loops. Each op has a numerical contract measured on the hardware and checked
+  against the CPU oracle over inputs that reach the edges of its domain. Outside the domain nothing is
+  promised.
+  - `add` and `sub`: within 2 x 2^-23 of the larger operand (the core's adder is not round-to-nearest-even;
+    a cancellation that leaves a small result is exact). Domain: finite operands with a finite normal result.
+  - `mul`, `div`, `neg`, `recip` and `ge`: bit for bit equal to the IEEE result. Domain: finite operands with
+    a finite normal result.
+  - `exp`: absolute error 2e-6 plus relative 1e-5. Domain: -87 to 88. The core clamps its argument to
+    +-88, so larger arguments saturate instead of overflowing.
+  - `log`: the same bound. Domain: positive normal numbers (from 1.18e-38 up); smaller inputs are not
+    promised.
+  - `tanh` and `erf`: the same bound over every finite input, which they saturate exactly.
+  Activation slots and a carried running-sum state replay over changing inputs.
+- **A graph of twenty equations with twenty distinct shapes runs in three hardware contexts**, where one
+  artifact per equation fails at the seventeenth load.
+- **Region bounds, measured**: 32 compute tiles, 16 host streams in and 16 out, 2 streams per tile, and a
+  tile-local limit of 64512 bytes. An artifact at each bound links and runs, and one past it is refused by
+  the toolchain; the compiler splits a program at these numbers, or refuses an equation that fits no region
+  with a typed limit.
 
-Nothing else is verified. Every other equation (unary ops, `max`, `div`, reductions, matmul, attention,
-collectives) is refused by the planner with a typed capability, and no model runs on the NPU. Performance
-is not a goal of this path: it is scalar, one core, and not competitive with the GPU backends.
+Nothing else is verified. Every other equation (`max`, `sqrt`, `round`, other unary ops, reductions, matmul,
+attention, collectives) is refused by the planner with a typed capability, and no model runs on the NPU. Performance
+is not a goal of this path: it is scalar, and not competitive with the GPU backends.
+
+## Intel NPU
+
+An Intel NPU has no public core ISA or kernel toolchain. Its only entry point is the driver's graph compiler,
+so the artifact of a program is one **graph**: the planner lowers each equation to the one OpenVINO opset op
+with the same semantics (`add`, `multiply`, `exp`, `reduce-sum`, `matmul`, `gather`, `reshape`, `transpose`,
+`broadcast`, `slice`, `concat`, `convert`) and nothing is recognized as a composite, so attention stays its
+primitives and the vendor compiler fuses what it can. `poot-codegen` serializes the whole program as OpenVINO
+IR, the shared `Engine` hands it to `VpuDevice`, the driver's compiler builds the blob, and the device runs
+the graph through Level Zero. Every value the graph's own equations read stays inside it; its arguments are
+the weights, activations and state it reads and the values it returns, in host memory the NPU addresses.
+
+The NPU computes in FP16, so an F32 or BF16 arithmetic equation is refused with a typed capability instead of
+being computed narrower; F32 data may cross the graph's boundary and meet FP16 arithmetic only through an
+explicit conversion.
+
+Compiled blobs are cached on disk under the region's full identity (the part, the vendor compiler's version,
+the compiler options and the IR with its constants), so a second run of the same program loads the blob and
+never runs the compiler. A cache entry that is damaged, truncated or another region's, or that the driver
+refuses, is recompiled and replaced.
+
+Verified on an Intel Core Ultra (Lunar Lake) NPU, driver and compiler 1.38.0:
+
+- **F16 programs** over elementwise `add` and `mul`, `exp`, row and column sums, a matmul, a gather by `I32`
+  indices, transpose, reshape, slice, concat and broadcast, rank four tensors, an `F32` boundary around FP16
+  arithmetic, activation slots, a carried running-sum state, and replay over changing inputs match the CPU
+  oracle bit for bit on integer-valued inputs and within FP16 tolerance for `exp`.
+- **A program is one compiled graph and one replay per step**, however many equations it holds.
+- **The compiled graph's arguments are checked against the program's** (names, order, direction, extents,
+  precision) before anything runs, so a compiler that reordered, retyped or reshaped an argument is a typed
+  refusal.
+
+Nothing else is verified. Every other equation (`sub`, `max`, `div`, other unary ops, inline literals,
+softmax, attention, collectives) is refused by the planner with a typed capability, and no model runs on the
+Intel NPU. A layer the vendor compiler rejects is a typed error carrying the compiler's own log. Performance
+is not a goal of this path.
 
 ## Failure behavior
 
 Dispatch refusals that need no hardware (a grid launch, a stream or buffer that is not the kernel's shape
 ABI) are typed errors before XRT is touched. A run that misses its deadline is a typed error and poisons the
-device; the buffers it used stay allocated until the device is dropped.
+device; the buffers and host arenas it used stay allocated until the device is dropped. The Intel device
+behaves the same way: its dispatch refusals (a grid launch, an invocation of another graph, a buffer that is
+not the graph's argument) are typed errors before Level Zero is touched, and a replay that misses its deadline
+poisons the device and keeps the failed recording's buffers alive until it is dropped.

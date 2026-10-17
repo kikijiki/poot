@@ -76,16 +76,14 @@ mod storage_analysis;
 
 pub use buffer_plan::{ArenaSlotId, BufferPlan};
 pub use compile::{
-    CastRangeError, CompileError, CompileLimits, CompileOptions, ExpansionError, ExpertIdsError,
-    ExpertIdsGap, GraphResource, LoraError, LoraPlan, Program, SlotSchema, Target, compile,
+    ArtifactGranularity, CastRangeError, CompileError, CompileLimits, CompileOptions,
+    ExpansionError, ExpertIdsError, ExpertIdsGap, GraphResource, LoraError, LoraPlan, Program,
+    Region, SlotSchema, Target, compile,
 };
 pub use imported::ImportedKernel;
 #[cfg(any(test, feature = "test-support"))]
 pub use imported::{AssetDest, AssetEntry, MANIFEST};
-pub use kernel_mapping::{
-    AieAbiRefusal, AieLimitRefusal, aie_shape_abi, validate_linked_artifact,
-    validate_recipe_tile_local,
-};
+pub use kernel_mapping::{AieAbiRefusal, AieLimitRefusal, aie_shape_abi, validate_linked_artifact};
 pub use passes::{
     BoundaryDescriptor, ExpertStackRefusal, LegalizeError, PackedBindError, PackedConst,
     PackedDequantErrorContext, PackedDequantProductionError, PackedLayout, PoolError, PoolSite,
