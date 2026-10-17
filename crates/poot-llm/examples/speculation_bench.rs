@@ -2,16 +2,27 @@
 //! and prints one line, so `off`, `lookup`, `model` and `mtp` run on the same binary and prompt are comparable.
 //!
 //! The decode rate is timed from the token callback (first token to last, prefill excluded). The
-//! acceptance numbers are the driver's own counters (`Driver::stats().speculation`, accepted over
-//! proposed drafts), and `hash` is an FNV-1a digest of the generated tokens: a greedy run under any
-//! policy must print the digest `off` prints.
+//! acceptance numbers are the driver's own counters (`Driver::stats()`), summed over the measured
+//! iterations: `acceptance` is accepted over proposed drafts, `pos_accept` the same per draft position
+//! (`kept/proposed` for position 1, 2, ...), `p` the share of verified rounds that rejected a draft and
+//! so restored and replayed a recurrent target. `hash` is an FNV-1a digest of the generated tokens: a
+//! greedy run under any policy must print the digest `off` prints.
+//!
+//! `--timing 1` builds the driver with phase timing and adds the engine's own clock per verified
+//! round, in ms: the draft passes of the decode window (an MTP layer's catch-up and chain, which read the output
+//! head; the catch-up over the prompt belongs to prefill and is not counted),
+//! the verify window, the snapshot, restore and replay copies, and `host` (the callback span per round
+//! less those, so it also holds sampling and any step the counters do not cover). Timing snapshots the
+//! executor at each step, so take `decode_tok_s` from a run without it.
 //!
 //! Run: `cargo run -p poot-llm --release --example speculation_bench -- --target DIR --policy off|lookup|model|mtp
 //! [--draft DIR] [--backend wgpu|rocm|ptx|vulkan|auto] [--prompt-file F] [--new N] [--k K] [--ngram N]
-//! [--warmup N] [--iters N]`. `--draft` is required by (and only read under) `--policy model`; its
-//! vocabulary and token ids must match the target's. `--policy mtp` drafts with the target's own
-//! multi-token-prediction layer, `--k` tokens a round (a target with no such layer is refused). Use a fresh process per policy: a ROCm executor
-//! cannot be reopened after a drop.
+//! [--warmup N] [--iters N] [--timing 0|1]`. `--draft` is required by (and only read under)
+//! `--policy model`; its vocabulary and token ids must match the target's. `--policy mtp` drafts with
+//! the target's own multi-token-prediction layer, `--k` tokens a round (a target with no such layer
+//! is refused). `speculation_prompts/` holds a mixed-text and a repetitive-text prompt of about 570
+//! tokens for `--prompt-file`. Use a fresh process per policy: a ROCm executor cannot be reopened
+//! after a drop.
 
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -97,6 +108,7 @@ fn main() -> Result<()> {
     let ngram =
         NonZeroUsize::new(number(&values, "--ngram", 2)?).context("--ngram must be positive")?;
     let new = number(&values, "--new", 128)?;
+    let timed = number(&values, "--timing", 0)? != 0;
     let (warmup, iters) = (
         number(&values, "--warmup", 1)?,
         number(&values, "--iters", 3)?,
@@ -150,12 +162,19 @@ fn main() -> Result<()> {
         open_executor(backend(values.get("--backend").copied())?)?,
         options,
     )?;
+    if timed {
+        driver = driver.with_phase_timing();
+    }
 
     let mut rates = Vec::new();
     let mut hash = 0;
-    let mut measured = Default::default();
+    let mut before = driver.stats();
+    let mut span = std::time::Duration::ZERO;
     for run in 0..warmup + iters {
-        let before = driver.stats().speculation;
+        if run == warmup {
+            before = driver.stats();
+            span = std::time::Duration::ZERO;
+        }
         let mut stamps = Vec::with_capacity(new);
         let generation = driver.generate(
             GenerateRequest {
@@ -174,29 +193,40 @@ fn main() -> Result<()> {
         if run < warmup {
             continue;
         }
-        let span = stamps[stamps.len() - 1] - stamps[0];
-        rates.push((stamps.len() - 1) as f64 / span.as_secs_f64());
-        let after = driver.stats().speculation;
-        measured = poot_llm::driver::SpeculationStats {
-            rounds: after.rounds - before.rounds,
-            proposed: after.proposed - before.proposed,
-            accepted: after.accepted - before.accepted,
-            skipped_sampler: after.skipped_sampler - before.skipped_sampler,
-            skipped_no_room: after.skipped_no_room - before.skipped_no_room,
-            skipped_no_proposal: after.skipped_no_proposal - before.skipped_no_proposal,
-            restored: after.restored - before.restored,
-            replayed: after.replayed - before.replayed,
-        };
+        let run_span = stamps[stamps.len() - 1] - stamps[0];
+        span += run_span;
+        rates.push((stamps.len() - 1) as f64 / run_span.as_secs_f64());
     }
+    let after = driver.stats();
+    let measured = after.speculation.since(&before.speculation);
+    let positions = after.positions.since(&before.positions);
+    let rollback = after.rollback.since(before.rollback);
+    let passes = after.passes.since(before.passes);
     let acceptance = if measured.proposed > 0 {
         format!("{:.3}", measured.accepted as f64 / measured.proposed as f64)
+    } else {
+        "n/a".to_string()
+    };
+    let by_position = if positions.proposed.is_empty() {
+        "n/a".to_string()
+    } else {
+        positions
+            .accepted
+            .iter()
+            .zip(&positions.proposed)
+            .map(|(kept, proposed)| format!("{kept}/{proposed}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let p = if measured.rounds > 0 {
+        format!("{:.3}", measured.restored as f64 / measured.rounds as f64)
     } else {
         "n/a".to_string()
     };
     println!(
         "policy={policy_name} prompt_tokens={} new={new} decode_tok_s={:.1} acceptance={acceptance} \
          rounds={} proposed={} accepted={} skipped_no_room={} skipped_no_proposal={} restored={} \
-         replayed={} hash={hash:016x}",
+         replayed={} pos_accept={by_position} p={p} hash={hash:016x}",
         prompt_tokens.len(),
         median(rates),
         measured.rounds,
@@ -207,5 +237,29 @@ fn main() -> Result<()> {
         measured.restored,
         measured.replayed,
     );
+    if timed && measured.rounds > 0 {
+        let per_round = |time: poot_llm::driver::StepTime| {
+            time.wall.as_secs_f64() * 1e3 / measured.rounds as f64
+        };
+        let engine = [
+            passes.drafts,
+            passes.verifies,
+            rollback.snapshots,
+            rollback.restores,
+            rollback.replays,
+        ]
+        .map(per_round);
+        let host = span.as_secs_f64() * 1e3 / measured.rounds as f64 - engine.iter().sum::<f64>();
+        println!(
+            "round_ms draft={:.2} verify={:.2} snapshot={:.2} restore={:.2} replay={:.2} host={host:.2} \
+             draft_passes_per_round={:.2}",
+            engine[0],
+            engine[1],
+            engine[2],
+            engine[3],
+            engine[4],
+            passes.drafts.steps as f64 / measured.rounds as f64,
+        );
+    }
     Ok(())
 }

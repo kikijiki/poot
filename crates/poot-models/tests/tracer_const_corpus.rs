@@ -307,16 +307,8 @@ fn corpus() -> Vec<Row> {
                 registered_trace("qwen4exp", Phase::Decode, step(2, 1, cap, LogitRows::Last))
             },
         },
-        Row {
-            name: "qwen4exp.prefill_paged",
-            build: |prompt, cap| {
-                registered_trace(
-                    "qwen4exp",
-                    Phase::Prefill,
-                    paged_step(1, prompt, cap, cap, LogitRows::Last),
-                )
-            },
-        },
+        // No paged row: the indexer's block-key cache is refused under a paged layout (POOT-1148
+        // owns its paging granule), a typed refusal `qwen38::tests` pins.
         Row {
             name: "qwen35.decode",
             build: |_, cap| {

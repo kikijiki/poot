@@ -33,9 +33,9 @@ use poot_llm::driver::speculate::{DRAFT_STREAM_SALT, propose_lookup, spec_sample
 use poot_llm::driver::step::PickPolicy;
 use poot_llm::driver::{
     AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest,
-    Head, Layout, LoadOptions, ModelHandle, NotSpeculated, PoolShape, PreparedSetLimits, Release,
-    RowResult, RowSpeculation, RowWork, SeqRequest, ServingShapes, SpeculationStats, StepRow, Warm,
-    open_executor, program_retention,
+    Head, Layout, LoadOptions, ModelHandle, NotSpeculated, PoolShape, PositionAcceptance,
+    PreparedSetLimits, Release, RowResult, RowSpeculation, RowWork, SeqRequest, ServingShapes,
+    SpeculationStats, StepRow, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
@@ -1062,6 +1062,7 @@ fn assert_rows_report_why_they_did_not_speculate(choice: BackendChoice, backend:
         })
         .unwrap_or_else(|e| panic!("{e}"));
     let mut expected = SpeculationStats::default();
+    let mut expected_positions = PositionAcceptance::default();
     let mut round = |driver: &mut Driver,
                      prompt: &[u32],
                      max_new: usize,
@@ -1078,6 +1079,14 @@ fn assert_rows_report_why_they_did_not_speculate(choice: BackendChoice, backend:
                     expected.rounds += 1;
                     expected.proposed += proposed as u64;
                     expected.accepted += accepted as u64;
+                    // A draft at position `i` was proposed when `proposed > i` and kept when `accepted > i`.
+                    let width = expected_positions.proposed.len().max(proposed);
+                    expected_positions.proposed.resize(width, 0);
+                    expected_positions.accepted.resize(width, 0);
+                    for i in 0..proposed {
+                        expected_positions.proposed[i] += 1;
+                        expected_positions.accepted[i] += u64::from(i < accepted);
+                    }
                 }
                 RowSpeculation::NotSpeculated(NotSpeculated::Sampler) => {
                     expected.skipped_sampler += 1;
@@ -1142,6 +1151,11 @@ fn assert_rows_report_why_they_did_not_speculate(choice: BackendChoice, backend:
 
     let stats = driver.stats().speculation;
     assert_eq!(stats, expected, "the counters are what the rows reported");
+    assert_eq!(
+        driver.stats().positions,
+        expected_positions,
+        "the per-position counters are what the rows reported"
+    );
     assert_eq!(stats.skipped_sampler, 6);
     assert!(stats.skipped_no_proposal >= 1 && stats.skipped_no_room >= 1);
     assert!(stats.rounds > 0 && stats.accepted <= stats.proposed);

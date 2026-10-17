@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="735" viewBox="0 0 1200 735">
+  <title>A model is a Rust function</title>
+  <desc>A model is a Rust function: the builder records every call into a flat graph IR</desc>
+  <style>
+    text { font-family: "DejaVu Sans Mono", monospace; fill: #e8eaf0; }
+    .bg { fill: #0d1017; }
+    .box { fill: #151a24; stroke-width: 1.6; }
+    .teal { stroke: #2dd4bf; } .blue { stroke: #60a5fa; } .purple { stroke: #a78bfa; }
+    .amber { stroke: #f5b83d; } .red { stroke: #fb7185; } .grey { stroke: #2a3040; }
+    .link { stroke: #8b93a3; stroke-width: 1.6; fill: none; }
+    .head { fill: #8b93a3; }
+    .title { font-size: 22px; font-weight: 700; }
+    .sub { font-size: 14px; fill: #8b93a3; }
+    .h { font-size: 15px; font-weight: 700; text-anchor: middle; }
+    .l { font-size: 15px; font-weight: 700; }
+    .d { font-size: 12px; fill: #8b93a3; text-anchor: middle; }
+    .n { font-size: 12px; fill: #8b93a3; }
+    .m { font-size: 15px; text-anchor: middle; }
+    .code { font-size: 14px; }
+    .tx-teal { fill: #2dd4bf; } .tx-blue { fill: #60a5fa; } .tx-purple { fill: #a78bfa; }
+    .tx-amber { fill: #f5b83d; } .tx-red { fill: #fb7185; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" class="head"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1200" height="735"/>
+  <text class="title" x="40" y="52">A model is a Rust function</text>
+  <text class="sub" x="40" y="82">Traced once at load; the same graph runs on the CPU oracle or is lowered to GPU kernels</text>
+
+  <g class="link">
+    <path d="M600 226 H660" marker-end="url(#arrow)"/>
+    <path d="M910 318 V368" marker-end="url(#arrow)"/>
+    <path d="M460 440 V486" marker-end="url(#arrow)"/>
+    <path d="M780 440 V486" marker-end="url(#arrow)"/>
+  </g>
+
+  <rect class="box teal" x="40" y="127" width="560" height="191" rx="10"/>
+  <text class="l tx-teal" x="60" y="154">Registered family: plain Rust</text>
+  <text class="code" xml:space="preserve" x="60" y="186">let h  = ops::rmsnorm(b, x, attn_norm, eps);</text>
+  <text class="code" xml:space="preserve" x="60" y="208">let q  = ops::linear(b, h, q_proj, q_bias);</text>
+  <text class="code" xml:space="preserve" x="60" y="230">let q  = ops::rope(b, q, cos_table, sin_table, pos);</text>
+  <text class="code" xml:space="preserve" x="60" y="252">let o  = ops::attention_masked(</text>
+  <text class="code" xml:space="preserve" x="60" y="274">    b, q, k_cache, v_cache, n_rep, scale, mask);</text>
+  <text class="code" xml:space="preserve" x="60" y="296">let ff = ops::swiglu(b, gate, up);</text>
+
+  <rect class="box amber" x="660" y="127" width="500" height="191" rx="10"/>
+  <text class="l tx-amber" x="680" y="154">Builder records every call</text>
+  <text class="m" style="text-anchor:start" x="680" y="194">1 allocate a new ValueId</text>
+  <text class="m" style="text-anchor:start" x="680" y="222">2 infer the output shape + dtype</text>
+  <text class="m" style="text-anchor:start" x="680" y="250">3 append Eqn { op, inputs, out }</text>
+  <text class="n" x="680" y="286">Traced handles carry types only, no data.</text>
+
+  <rect class="box blue" x="330" y="368" width="580" height="72" rx="10"/>
+  <text class="h tx-blue" x="620" y="398">Graph IR: flat list of primitive eqns</text>
+  <text class="d" x="620" y="422">elementwise, reduce, broadcast, matmul, gather, view</text>
+
+  <rect class="box purple" x="270" y="486" width="380" height="72" rx="10"/>
+  <text class="h tx-purple" x="460" y="516">CPU oracle</text>
+  <text class="d" x="460" y="540">poot_eval::eval, tensor by tensor</text>
+
+  <rect class="box red" x="690" y="486" width="380" height="72" rx="10"/>
+  <text class="h tx-red" x="880" y="516">Planner</text>
+  <text class="d" x="880" y="540">lowers the graph to GPU kernels</text>
+
+  <text class="n" x="40" y="598">Four kinds of value in the graph</text>
+
+  <rect class="box teal" x="40" y="614" width="262" height="72" rx="10"/>
+  <text class="h tx-teal" x="171" y="643">Const</text>
+  <text class="d" x="171" y="666">weights, tables</text>
+  <rect class="box amber" x="326" y="614" width="262" height="72" rx="10"/>
+  <text class="h tx-amber" x="457" y="643">Slot</text>
+  <text class="d" x="457" y="666">token, position, read map</text>
+  <rect class="box purple" x="612" y="614" width="262" height="72" rx="10"/>
+  <text class="h tx-purple" x="743" y="643">State</text>
+  <text class="d" x="743" y="666">the KV cache</text>
+  <rect class="box blue" x="898" y="614" width="262" height="72" rx="10"/>
+  <text class="h tx-blue" x="1029" y="643">Device</text>
+  <text class="d" x="1029" y="666">activations, stable addresses</text>
+</svg>

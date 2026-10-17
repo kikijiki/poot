@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1175" viewBox="0 0 1200 1175">
+  <title>From model code to GPU</title>
+  <desc>From model code to GPU: graph IR, graph passes, kernel planning, one shared LLVM emitter, three backends</desc>
+  <style>
+    text { font-family: "DejaVu Sans Mono", monospace; fill: #e8eaf0; }
+    .bg { fill: #0d1017; }
+    .box { fill: #151a24; stroke-width: 1.6; }
+    .teal { stroke: #2dd4bf; } .blue { stroke: #60a5fa; } .purple { stroke: #a78bfa; }
+    .amber { stroke: #f5b83d; } .red { stroke: #fb7185; } .grey { stroke: #2a3040; }
+    .link { stroke: #8b93a3; stroke-width: 1.6; fill: none; }
+    .head { fill: #8b93a3; }
+    .title { font-size: 22px; font-weight: 700; }
+    .sub { font-size: 14px; fill: #8b93a3; }
+    .h { font-size: 15px; font-weight: 700; text-anchor: middle; }
+    .l { font-size: 15px; font-weight: 700; }
+    .d { font-size: 12px; fill: #8b93a3; text-anchor: middle; }
+    .n { font-size: 12px; fill: #8b93a3; }
+    .m { font-size: 15px; text-anchor: middle; }
+    .code { font-size: 14px; }
+    .tx-teal { fill: #2dd4bf; } .tx-blue { fill: #60a5fa; } .tx-purple { fill: #a78bfa; }
+    .tx-amber { fill: #f5b83d; } .tx-red { fill: #fb7185; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" class="head"/>
+    </marker>
+  </defs>
+  <rect class="bg" width="1200" height="1175"/>
+  <text class="title" x="40" y="52">From model code to GPU</text>
+  <text class="sub" x="40" y="82">One graph, three backends, one host call per token</text>
+
+  <g class="link" marker-end="url(#arrow)">
+    <path d="M600 192 V222" marker-end="url(#arrow)"/>
+    <path d="M600 284 V314" marker-end="url(#arrow)"/>
+    <path d="M600 376 V406" marker-end="url(#arrow)"/>
+    <path d="M490 500 L340 536" marker-end="url(#arrow)"/>
+    <path d="M710 500 L860 536" marker-end="url(#arrow)"/>
+    <path d="M340 620 L480 660" marker-end="url(#arrow)"/>
+    <path d="M860 620 L720 660" marker-end="url(#arrow)"/>
+    <path d="M600 722 V752" marker-end="url(#arrow)"/>
+    <path d="M440 814 L227 842" marker-end="url(#arrow)"/>
+    <path d="M600 814 V842" marker-end="url(#arrow)"/>
+    <path d="M760 814 L972 842" marker-end="url(#arrow)"/>
+    <path d="M227 940 V974" marker-end="url(#arrow)"/>
+    <path d="M600 940 V974" marker-end="url(#arrow)"/>
+    <path d="M972 940 V974" marker-end="url(#arrow)"/>
+    <path d="M227 1040 L480 1070" marker-end="url(#arrow)"/>
+    <path d="M600 1040 V1070" marker-end="url(#arrow)"/>
+    <path d="M972 1040 L720 1070" marker-end="url(#arrow)"/>
+  </g>
+
+  <rect class="box teal" x="365" y="130" width="470" height="62" rx="10"/>
+  <text class="h tx-teal" x="600" y="158">Model code (Rust)</text>
+  <text class="d" x="600" y="178">Builder + traced handles</text>
+
+  <rect class="box teal" x="365" y="222" width="470" height="62" rx="10"/>
+  <text class="h tx-teal" x="600" y="250">Graph IR</text>
+  <text class="d" x="600" y="270">flat SSA: OpKind + inputs -&gt; ValueId</text>
+
+  <rect class="box teal" x="250" y="314" width="700" height="62" rx="10"/>
+  <text class="h tx-teal" x="600" y="342">Compile: graph passes</text>
+  <text class="d" x="600" y="362">canonicalize &#183; CSE &#183; RoPE fusion &#183; flash attention &#183; DCE &#183; packed &#183; legalize &#183; fuse</text>
+
+  <rect class="box teal" x="250" y="406" width="700" height="94" rx="10"/>
+  <text class="h tx-teal" x="600" y="434">Per-eqn planning: kernel request -&gt; KernelChoice</text>
+  <text class="d" x="600" y="458">Generated &#183; Sequential &#183; Imported &#183; NoDispatch</text>
+  <text class="d" x="600" y="480">plans: Dispatches &#183; Alias &#183; View</text>
+
+  <rect class="box blue" x="135" y="536" width="410" height="84" rx="10"/>
+  <text class="h tx-blue" x="340" y="570">pootc: MIR import</text>
+  <text class="d" x="340" y="594">Rust #[kernel] -&gt; Stable MIR -&gt; .kir.json</text>
+
+  <rect class="box blue" x="655" y="536" width="410" height="84" rx="10"/>
+  <text class="h tx-blue" x="860" y="570">poot-kernelgen</text>
+  <text class="d" x="860" y="594">Body built from shape params at runtime</text>
+
+  <rect class="box blue" x="365" y="660" width="470" height="62" rx="10"/>
+  <text class="h tx-blue" x="600" y="688">Kernel IR (Body)</text>
+  <text class="d" x="600" y="708">basic blocks &#183; WMMA ops &#183; LDS arrays</text>
+
+  <rect class="box grey" x="310" y="752" width="580" height="62" rx="10"/>
+  <text class="h" x="600" y="780">emit_llvm_ir(body, target)</text>
+  <text class="d" x="600" y="800">one shared emitter</text>
+
+  <rect class="box purple" x="60" y="842" width="335" height="98" rx="10"/>
+  <text class="h tx-purple" x="227" y="874">Vulkan / SPIR-V</text>
+  <text class="d" x="227" y="898">LLVM IR -&gt; llc -&gt; .spv</text>
+  <text class="d" x="227" y="920">barrier fixup -&gt; wgpu</text>
+
+  <rect class="box amber" x="432" y="842" width="335" height="98" rx="10"/>
+  <text class="h tx-amber" x="600" y="874">NVIDIA / PTX</text>
+  <text class="d" x="600" y="898">LLVM IR -&gt; llc -&gt; .ptx</text>
+  <text class="d" x="600" y="920">CUDA JIT -&gt; .cubin</text>
+
+  <rect class="box red" x="805" y="842" width="335" height="98" rx="10"/>
+  <text class="h tx-red" x="972" y="874">AMD / ROCm</text>
+  <text class="d" x="972" y="898">LLVM IR -&gt; amdclang</text>
+  <text class="d" x="972" y="920">-&gt; .hsaco -&gt; HSA load</text>
+
+  <rect class="box purple" x="60" y="974" width="335" height="66" rx="10"/>
+  <text class="m" x="227" y="1002">wgpu: cached re-encode,</text>
+  <text class="m" x="227" y="1024">one submit per token</text>
+
+  <rect class="box amber" x="432" y="974" width="335" height="66" rx="10"/>
+  <text class="m" x="600" y="1002">CUDA graph capture,</text>
+  <text class="m" x="600" y="1024">one launch per token</text>
+
+  <rect class="box red" x="805" y="974" width="335" height="66" rx="10"/>
+  <text class="m" x="972" y="1002">HSA: batched AQL,</text>
+  <text class="m" x="972" y="1024">one doorbell per token</text>
+
+  <rect class="box teal" x="415" y="1070" width="370" height="50" rx="10"/>
+  <text class="h tx-teal" x="600" y="1101">Output tensor: token logits</text>
+</svg>

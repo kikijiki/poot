@@ -36,9 +36,11 @@ use super::error::{DriverError, EmbedsError, InvalidRequest, MropeError, Prepare
 use super::lora::{AdapterRef, GenerationId};
 use super::mrope::rotary_position;
 use super::prefix_cache::{PrefixIdentity, PrefixOutcome, PrefixSkip};
-use super::speculate::{self, DraftPolicy, NotSpeculated, Proposal, RowSpeculation, SpecRow};
+use super::speculate::{
+    self, DraftPolicy, NotSpeculated, PassTiming, Proposal, RowSpeculation, SpecRow, StepTime,
+};
 use super::suffix::{self, Head, SuffixRows};
-use super::{Driver, EntryKey, ModelRole, SlotRole, StepData, host_sample};
+use super::{Driver, EntryKey, ModelRole, SlotRole, StepData, host_sample, window_wall};
 use crate::core::sampler::{Sampler, TokenLogprob};
 
 #[cfg(test)]
@@ -769,6 +771,9 @@ impl Driver {
             }
             let speculation = plan.speculation(tokens.len());
             self.stats.speculation.record(speculation);
+            if let RowSpeculation::Verified { proposed, accepted } = speculation {
+                self.stats.positions.record(proposed, accepted);
+            }
             results.push(RowResult {
                 seq: row.seq,
                 consumed,
@@ -827,6 +832,7 @@ impl Driver {
                 .unwrap_or(1);
             let embeds = group_plans.iter().any(|plan| plan.embeds);
             let window = group_plans.iter().any(|plan| plan.picks > 1);
+            let verifies = group_plans.iter().any(|plan| !plan.drafts().is_empty());
             let ran = self
                 .step_entry(
                     ModelRole::Target,
@@ -836,7 +842,13 @@ impl Driver {
                     head,
                     adapter,
                 )
-                .and_then(|key| self.run_plans(&mut group_lanes, &group_plans, key));
+                .and_then(|key| {
+                    self.timed(
+                        verifies,
+                        |passes| &mut passes.verifies,
+                        |driver| driver.run_plans(&mut group_lanes, &group_plans, key),
+                    )
+                });
             for (&i, part) in group.iter().zip(group_lanes.into_iter().zip(group_plans)) {
                 parts[i] = Some(part);
             }
@@ -1070,6 +1082,25 @@ impl Driver {
                 })
             }
         }
+    }
+
+    /// Run `pass`, and on a phase-timed driver add the engine time it took to the tally `account`
+    /// names when `counts` holds. A pass that is not counted still runs untimed.
+    pub(super) fn timed<T>(
+        &mut self,
+        counts: bool,
+        account: fn(&mut PassTiming) -> &mut StepTime,
+        pass: impl FnOnce(&mut Self) -> Result<T, DriverError>,
+    ) -> Result<T, DriverError> {
+        let started = (self.time_phases && counts).then(|| self.executor.stats().timing.mark());
+        let result = pass(self)?;
+        if let Some(started) = started {
+            let wall = window_wall(&self.executor.stats().timing, &started);
+            let tally = account(&mut self.stats.passes);
+            tally.steps += 1;
+            tally.wall += wall;
+        }
+        Ok(result)
     }
 
     /// Advance `seq` by the first `kept` tokens of its last step's result. The rest of

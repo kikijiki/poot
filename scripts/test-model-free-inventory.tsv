@@ -475,6 +475,7 @@ poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_accepts_named_same
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_preserves_literal_first_binary_contract
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_a_duplicate_ssa_producer
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_arithmetic_on_a_packed_or_storage_only_dtype
+poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_blocked_axis_out_of_range_for_rank
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_inconsistent_binding_and_state_tables
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_mismatched_binary_value_operands_including_scalars
 poot-graph-ir	poot-graph-ir	model-free	graph::tests::validate_rejects_out_of_range_eqn_output_without_panicking
@@ -855,6 +856,7 @@ poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::an_i32_bounda
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::one_store_key_naming_two_different_tensors_is_a_duplicate_owner
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::the_same_cut_on_one_wgpu_device_compiles
 poot-graph-plan	poot-graph-plan	model-free	staged::devices::tests::the_weight_derivation_of_a_layered_decode_places_every_owner_on_its_stages
+poot-graph-plan	poot-graph-plan	model-free	staged::tests::a_blocked_cache_counts_its_entry_over_the_positions_it_covers
 poot-graph-plan	poot-graph-plan	model-free	staged::tests::a_boundary_that_views_carried_state_is_refused_at_compile
 poot-graph-plan	poot-graph-plan	model-free	staged::tests::a_pool_below_the_step_demand_or_not_below_the_experts_is_a_typed_refusal
 poot-graph-plan	poot-graph-plan	model-free	staged::tests::a_pooled_moe_program_equals_the_unpooled_oracle_bit_for_bit
@@ -1468,6 +1470,11 @@ poot-kernelgen	poot-kernelgen::select_interp	model-free	a_folded_float_select_co
 poot-kernelgen	poot-kernelgen::select_interp	model-free	float_select_equals_the_hand_written_words
 poot-kernelgen	poot-kernelgen::select_interp	model-free	i32_select_takes_the_true_branch_for_any_nonzero_word
 poot-llm	poot-llm	checkpoint	driver::device_tests::checkpoint::a_gptq_checkpoint_loads_its_linears_packed_with_no_dense_copy
+poot-llm	poot-llm	checkpoint	driver::llamacpp_bisect_tests::checkpoint_rows::qwen2_5_0_5b_q8_0_follows_llamacpp_through_every_layer
+poot-llm	poot-llm	checkpoint	driver::llamacpp_kl_tests::checkpoint_rows::one_perturbed_dequant_scale_exceeds_the_gate
+poot-llm	poot-llm	checkpoint	driver::llamacpp_kl_tests::checkpoint_rows::qwen2_5_0_5b_q4_k_m_follows_llamacpp
+poot-llm	poot-llm	checkpoint	driver::llamacpp_kl_tests::checkpoint_rows::qwen2_5_0_5b_q8_0_follows_llamacpp
+poot-llm	poot-llm	checkpoint	driver::llamacpp_kl_tests::checkpoint_rows::qwen3_0_6b_q8_0_follows_llamacpp
 poot-llm	poot-llm	checkpoint	driver::text_checkpoint_tests::chat_template_checkpoints::multi_turn_tool_conversation_renders
 poot-llm	poot-llm	checkpoint	driver::text_checkpoint_tests::chat_template_checkpoints::real_gemma4_chat_template_renders_via_jinja_not_the_chatformat_fallback
 poot-llm	poot-llm	checkpoint	driver::text_checkpoint_tests::chat_template_checkpoints::real_qwen_template_renders_with_role_markers
@@ -1678,6 +1685,8 @@ poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_all_accepted_equals_off_pt
 poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_all_accepted_equals_off_wgpu
 poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_greedy_equals_off_ptx
 poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_greedy_equals_off_wgpu
+poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_prefill_catch_up_is_not_a_decode_pass_ptx
+poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_prefill_catch_up_is_not_a_decode_pass_wgpu
 poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_proposals_equal_the_oracle_chain_ptx
 poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_proposals_equal_the_oracle_chain_wgpu
 poot-llm	poot-llm	device	driver::step::mtp_tests::mtp_serves_a_sampled_row_ptx
@@ -1768,6 +1777,16 @@ poot-llm	poot-llm	model-free	driver::hidden_carry_tests::a_carry_aval_that_diffe
 poot-llm	poot-llm	model-free	driver::hidden_carry_tests::a_family_that_ignores_the_request_is_refused_typed
 poot-llm	poot-llm	model-free	driver::hidden_carry_tests::a_kv_only_family_with_the_carry_stays_kv_only_and_every_target_program_declares_one_aval
 poot-llm	poot-llm	model-free	driver::hidden_carry_tests::the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched
+poot-llm	poot-llm	model-free	driver::llamacpp_bisect_tests::format_tests::a_dump_reads_back_the_last_tensor_of_a_name
+poot-llm	poot-llm	model-free	driver::llamacpp_bisect_tests::format_tests::a_malformed_dump_is_a_typed_error
+poot-llm	poot-llm	model-free	driver::llamacpp_bisect_tests::format_tests::agreement_is_the_rms_difference_over_the_rms_reference
+poot-llm	poot-llm	model-free	driver::llamacpp_bisect_tests::format_tests::the_bisection_names_the_first_site_that_leaves_the_reference
+poot-llm	poot-llm	model-free	driver::llamacpp_kl_tests::format_tests::a_malformed_reference_file_is_a_typed_error
+poot-llm	poot-llm	model-free	driver::llamacpp_kl_tests::format_tests::a_reference_file_reads_back_its_tokens_and_its_distributions
+poot-llm	poot-llm	model-free	driver::llamacpp_kl_tests::gate_tests::a_clamped_tail_is_not_read_as_probability
+poot-llm	poot-llm	model-free	driver::llamacpp_kl_tests::gate_tests::a_nan_logit_fails_the_gate
+poot-llm	poot-llm	model-free	driver::llamacpp_kl_tests::gate_tests::a_perturbed_distribution_fails_each_threshold
+poot-llm	poot-llm	model-free	driver::llamacpp_kl_tests::gate_tests::poot_reproducing_the_reference_passes_the_gate
 poot-llm	poot-llm	model-free	driver::lora::tests::a_generations_weights_share_the_base_entries_and_add_the_stack
 poot-llm	poot-llm	model-free	driver::lora::tests::a_module_the_model_lacks_or_a_factor_that_does_not_fit_is_a_typed_refusal
 poot-llm	poot-llm	model-free	driver::lora::tests::adapters_stack_padded_with_a_zero_no_adapter_entry
@@ -1805,11 +1824,14 @@ poot-llm	poot-llm	model-free	driver::prefix_cache::tests::prefix_cache_match_onl
 poot-llm	poot-llm	model-free	driver::prefix_cache::tests::prefix_cache_match_register_shares_prefix
 poot-llm	poot-llm	model-free	driver::prefix_cache::tests::prefix_cache_refcount_keeps_shared_blocks_alive
 poot-llm	poot-llm	model-free	driver::snapshot::tests::a_copied_slot_takes_its_source_row_and_the_rest_keep_theirs
+poot-llm	poot-llm	model-free	driver::speculate::position_acceptance_tests::counts_the_kept_prefix_of_each_round
+poot-llm	poot-llm	model-free	driver::speculate::position_acceptance_tests::since_is_the_rounds_between_two_readings
 poot-llm	poot-llm	model-free	driver::speculate::prompt_lookup_tests::empty_on_no_match_or_degenerate
 poot-llm	poot-llm	model-free	driver::speculate::prompt_lookup_tests::most_recent_match_wins
 poot-llm	poot-llm	model-free	driver::speculate::prompt_lookup_tests::proposes_recent_continuation
 poot-llm	poot-llm	model-free	driver::speculate::prompt_lookup_tests::truncates_to_available_follow_tokens
 poot-llm	poot-llm	model-free	driver::speculate::prompt_lookup_tests::unigram_pattern_matches_most_recent
+poot-llm	poot-llm	model-free	driver::speculate::since_tests::running_totals_subtract_field_by_field
 poot-llm	poot-llm	model-free	driver::speculate::spec_sampling_tests::a_point_mass_draft_matches_the_target_distribution_chi_squared
 poot-llm	poot-llm	model-free	driver::speculate::spec_sampling_tests::greedy_acceptance_keeps_the_agreeing_prefix_and_the_pick_after_it
 poot-llm	poot-llm	model-free	driver::speculate::spec_sampling_tests::residual_correction_matches_target_distribution_chi_squared
@@ -2592,9 +2614,13 @@ poot-models	poot-models	model-free	architectures::qwen2::tests::vl::section_widt
 poot-models	poot-models	model-free	architectures::qwen2::tests::vl::section_widths_that_overflow_are_refused
 poot-models	poot-models	model-free	architectures::qwen2::tests::vl::text_positions_on_all_three_axes_are_the_plain_qwen2_model
 poot-models	poot-models	model-free	architectures::qwen2::tests::vl::the_released_shape_builds_under_either_rope_block
+poot-models	poot-models	model-free	architectures::qwen38::qsa::tests::a_step_ending_at_the_capacity_keeps_every_block_in_place
+poot-models	poot-models	model-free	architectures::qwen38::qsa::tests::rows_at_different_positions_keep_their_own_blocks
+poot-models	poot-models	model-free	architectures::qwen38::qsa::tests::the_cache_selects_exactly_what_a_full_repool_selects
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_checkpoint_with_sharded_ple_tables_matches_the_single_table
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_finetune_like_config_loads_traces_and_matches_its_reference
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_missing_tensor_is_named_before_any_trace
+poot-models	poot-models	model-free	architectures::qwen38::tests::a_paged_step_is_a_typed_indexer_refusal
 poot-models	poot-models	model-free	architectures::qwen38::tests::a_shape_off_the_granule_is_a_typed_refusal
 poot-models	poot-models	model-free	architectures::qwen38::tests::an_out_of_vocabulary_token_is_a_typed_validation_fault
 poot-models	poot-models	model-free	architectures::qwen38::tests::bf16_experts_match_the_independent_reference
@@ -2602,6 +2628,7 @@ poot-models	poot-models	model-free	architectures::qwen38::tests::chunked_prefill
 poot-models	poot-models	model-free	architectures::qwen38::tests::e4m3_packed_experts_match_the_independent_reference
 poot-models	poot-models	model-free	architectures::qwen38::tests::from_raw_refuses_what_the_family_cannot_configure
 poot-models	poot-models	model-free	architectures::qwen38::tests::packed_experts_trace_as_packed_weights_and_dense_ones_as_stored_stacks
+poot-models	poot-models	model-free	architectures::qwen38::tests::the_block_key_cache_is_declared_blocked
 poot-models	poot-models	model-free	architectures::qwen38::tests::the_fixtures_generate_the_recorded_tokens
 poot-models	poot-models	model-free	architectures::qwen38::tests::the_ple_history_literals_are_the_references_first_step
 poot-models	poot-models	model-free	architectures::qwen38::tests::the_ple_layer_follows_the_token_history
@@ -2837,6 +2864,8 @@ poot-models	poot-models	model-free	registry::tests::gguf_eos_is_the_tokenizer_eo
 poot-models	poot-models	model-free	registry::tests::qwen2_5_eos_is_the_union_of_config_and_generation_config
 poot-models	poot-models	real-dims	architectures::deepseek4::tests::a_real_dims_fp4_expert_projection_equals_the_hand_decoded_column_real_dims
 poot-models	poot-models	real-dims	architectures::deepseek4::tests::a_real_dims_layer_fixture_compiles_for_every_backend_real_dims
+poot-models	poot-models	real-dims	architectures::qwen38::qsa::tests::the_block_keys_at_depth_are_the_repooled_ones_real_dims
+poot-models	poot-models	real-dims	architectures::qwen38::qsa::tests::the_depth_sweep_selects_what_a_full_repool_selects_real_dims
 poot-models	poot-models::alibi_decode_flash_fusion	model-free	alibi_decode_chain_fuses_to_flash_without_changing_logits
 poot-models	poot-models::alibi_decode_flash_fusion	model-free	alibi_prefill_chain_fuses_to_flash_without_changing_logits
 poot-models	poot-models::compile_budgets_real_trace	model-free	a_real_model_trace_under_explicit_limits_reaches_compile_and_each_budget_refuses_alone
@@ -3678,6 +3707,8 @@ poot-serve	poot-serve::bounded_drain_production	device	bounded_drain_production_
 poot-serve	poot-serve::bounded_drain_production	device	bounded_drain_production_timeout_closes_accepted_barrier
 poot-serve	poot-serve::served_groups	device	a_model_without_an_mtp_layer_refuses_draft_mtp_startup_rocm
 poot-serve	poot-serve::served_groups	device	a_model_without_an_mtp_layer_refuses_draft_mtp_startup_wgpu
+poot-serve	poot-serve::served_groups	device	a_paged_pool_refuses_the_qwen4exp_indexer_startup_rocm
+poot-serve	poot-serve::served_groups	device	a_paged_pool_refuses_the_qwen4exp_indexer_startup_wgpu
 poot-serve	poot-serve::served_groups	device	draft_with_a_larger_vocabulary_refuses_startup_rocm
 poot-serve	poot-serve::served_groups	device	draft_with_a_larger_vocabulary_refuses_startup_wgpu
 poot-serve	poot-serve::served_groups	device	served_bloom_rocm
@@ -3740,8 +3771,6 @@ poot-serve	poot-serve::served_groups	device	served_qwen3moe_rocm
 poot-serve	poot-serve::served_groups	device	served_qwen3moe_wgpu
 poot-serve	poot-serve::served_groups	device	served_qwen3next_rocm
 poot-serve	poot-serve::served_groups	device	served_qwen3next_wgpu
-poot-serve	poot-serve::served_groups	device	served_qwen4exp_rocm
-poot-serve	poot-serve::served_groups	device	served_qwen4exp_wgpu
 poot-serve	poot-serve::served_groups	device	served_qwen_vl_caption_rocm
 poot-serve	poot-serve::served_groups	device	served_qwen_vl_caption_wgpu
 poot-serve	poot-serve::served_groups	device	served_qwen_vl_refusals_rocm

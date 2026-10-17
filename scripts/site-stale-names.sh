@@ -13,7 +13,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 allow=scripts/site-stale-names.allow
 src=(crates scripts justfile Cargo.toml flake.nix nix README.md benchmarks)
-site=(website/docs website/src)
+site=(website/docs website/src website/diagrams)
 rc=0
 
 allowed() { grep -qxF -- "$1" <(grep -v '^#' "$allow") ; }
@@ -54,6 +54,8 @@ trap 'rm -f "$corpus" "$stripped" "$cited"' EXIT
     git grep -hIoE '`[A-Za-z_][A-Za-z0-9_:.]*(\(\))?`' -- "${site[@]}" website/static | tr -d '`'
     git grep -hIoE '<code>[A-Za-z_][A-Za-z0-9_:.]*(\(\))?</code>' -- "${site[@]}" website/static | sed -E 's/<\/?code>//g'
     git grep -hIoE '\b[A-Z][a-z0-9]+([A-Z][a-z0-9]*)+\b' -- "${site[@]}" website/static
+    # The diagram sources name kernels and functions in plain text, not in backticks.
+    git grep -hIoE '\b[a-z][a-z0-9]*(_[a-z0-9]+)+\b' -- website/diagrams
 } | sed 's/()$//' | sort -u >"$cited"
 checked=0
 

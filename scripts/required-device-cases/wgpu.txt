@@ -144,6 +144,7 @@ poot-llm	driver::device_tests::smolvlm_front_end_requests_served_batched_equal_s
 poot-llm	driver::device_tests::two_frames_of_one_size_embed_differently_wgpu
 poot-llm	driver::step::mtp_tests::mtp_all_accepted_equals_off_wgpu
 poot-llm	driver::step::mtp_tests::mtp_greedy_equals_off_wgpu
+poot-llm	driver::step::mtp_tests::mtp_prefill_catch_up_is_not_a_decode_pass_wgpu
 poot-llm	driver::step::mtp_tests::mtp_proposals_equal_the_oracle_chain_wgpu
 poot-llm	driver::step::mtp_tests::mtp_serves_a_sampled_row_wgpu
 poot-llm	driver::step::mtp_tests::mtp_two_rows_equal_off_wgpu
@@ -226,6 +227,7 @@ poot-serve::bin/poot-serve	tests::lifecycle::device::an_encode_job_on_the_servin
 poot-serve::bounded_drain_production	bounded_drain_production_completes_accepted_barrier_before_exit
 poot-serve::bounded_drain_production	bounded_drain_production_timeout_closes_accepted_barrier
 poot-serve::served_groups	a_model_without_an_mtp_layer_refuses_draft_mtp_startup_wgpu
+poot-serve::served_groups	a_paged_pool_refuses_the_qwen4exp_indexer_startup_wgpu
 poot-serve::served_groups	draft_with_a_larger_vocabulary_refuses_startup_wgpu
 poot-serve::served_groups	served_bloom_wgpu
 poot-serve::served_groups	served_deepseek2_wgpu
@@ -256,7 +258,6 @@ poot-serve::served_groups	served_qwen35_wgpu
 poot-serve::served_groups	served_qwen3_wgpu
 poot-serve::served_groups	served_qwen3moe_wgpu
 poot-serve::served_groups	served_qwen3next_wgpu
-poot-serve::served_groups	served_qwen4exp_wgpu
 poot-serve::served_groups	served_qwen_vl_caption_wgpu
 poot-serve::served_groups	served_qwen_vl_refusals_wgpu
 poot-serve::served_groups	served_sampled_request_returns_the_samplers_tokens_wgpu

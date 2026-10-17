@@ -57,13 +57,11 @@ fn nz(n: usize) -> NonZeroUsize {
 
 /// Registry fixtures served on wgpu and ROCm, by group. `family` or `family/variant` as
 /// `device_tests::RECORDED` names them.
-const EXACT: &[&str] = &[
-    "deepseek4",
-    "glm53_flash",
-    "minimax_m2",
-    "qwen4exp",
-    "qwen35",
-];
+const EXACT: &[&str] = &["deepseek4", "glm53_flash", "minimax_m2", "qwen35"];
+/// Families the server cannot serve yet: their paged KV layout is undecided, so startup is the typed
+/// refusal (`a_paged_pool_refuses_the_qwen4exp_indexer_startup_*`). POOT-1148 owns the paging
+/// granule of the indexer's block-key cache; its landing moves `qwen4exp` back into [`EXACT`].
+const PAGED_REFUSED: &[&str] = &["qwen4exp"];
 const GEMMA4: &[&str] = &["gemma4"];
 const QWEN3_NEXT: &[&str] = &["qwen3next"];
 const DENSE: &[&str] = &[
@@ -118,7 +116,15 @@ fn fixture_of(name: &str) -> Fixture {
 /// in no group and the row goes red.
 #[test]
 fn every_generating_family_is_in_a_served_group() {
-    let groups = [EXACT, GEMMA4, QWEN3_NEXT, DENSE, MOE, MLA_AND_HYBRID];
+    let groups = [
+        EXACT,
+        PAGED_REFUSED,
+        GEMMA4,
+        QWEN3_NEXT,
+        DENSE,
+        MOE,
+        MLA_AND_HYBRID,
+    ];
     let registry = Registry::builtin().unwrap();
     let mut missing = Vec::new();
     for entry in registry.entries() {
@@ -519,7 +525,6 @@ served_rows! {
     "deepseek4" => served_deepseek4_wgpu, served_deepseek4_rocm;
     "glm53_flash" => served_glm53_flash_wgpu, served_glm53_flash_rocm;
     "minimax_m2" => served_minimax_m2_wgpu, served_minimax_m2_rocm;
-    "qwen4exp" => served_qwen4exp_wgpu, served_qwen4exp_rocm;
     "qwen35" => served_qwen35_wgpu, served_qwen35_rocm;
     "gemma4" => served_gemma4_wgpu, served_gemma4_rocm;
     "qwen3next" => served_qwen3next_wgpu, served_qwen3next_rocm;
@@ -744,6 +749,44 @@ speculative_rows! {
     Draft::Lookup => served_lookup_speculation_returns_the_off_tokens_wgpu, served_lookup_speculation_returns_the_off_tokens_rocm;
     Draft::Model => served_draft_model_speculation_returns_the_off_tokens_wgpu, served_draft_model_speculation_returns_the_off_tokens_rocm;
     Draft::Mtp => served_mtp_speculation_returns_the_off_tokens_wgpu, served_mtp_speculation_returns_the_off_tokens_rocm;
+}
+
+/// The server pages its KV pool, and the qwen4exp indexer's per-row block-key cache has no paged
+/// layout yet (POOT-1148): startup stops with the typed `PagedIndexer` refusal, before the listener
+/// binds. Mutation: drop the paged check from `Qwen4Exp::trace_into`; the engine plans a paged
+/// indexer and the server starts, so the row goes red.
+fn a_paged_pool_refuses_the_qwen4exp_indexer_startup(
+    choice: BackendChoice,
+    backend: DeviceBackend,
+    flag: &str,
+) {
+    if poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice)).is_none() {
+        return;
+    }
+    let dir = write_checkpoint("qwen4exp");
+    let stderr = refused(&dir, flag, &[]);
+    assert!(
+        stderr.contains("PagedIndexer"),
+        "the refusal does not name the paged indexer: {stderr}"
+    );
+}
+
+#[test]
+fn a_paged_pool_refuses_the_qwen4exp_indexer_startup_wgpu() {
+    a_paged_pool_refuses_the_qwen4exp_indexer_startup(
+        BackendChoice::Wgpu,
+        DeviceBackend::Wgpu,
+        "wgpu",
+    );
+}
+
+#[test]
+fn a_paged_pool_refuses_the_qwen4exp_indexer_startup_rocm() {
+    a_paged_pool_refuses_the_qwen4exp_indexer_startup(
+        BackendChoice::Rocm,
+        DeviceBackend::Rocm,
+        "rocm",
+    );
 }
 
 /// `--draft-mtp` on a family with no MTP program stops startup with the family's typed phase refusal,

@@ -1,0 +1,15 @@
+You are reviewing a design document for a small service that mirrors package metadata between two registries. Read the three excerpts below, then answer the questions that follow them.
+
+Excerpt 1 (operations). The mirror polls the upstream registry every ten minutes, compares the index digest with the one it stored last time, and fetches only the packages whose digests changed. A failed fetch is retried with exponential backoff up to six times; after that the package is parked in a quarantine table and an alert fires. The on-call engineer can release a parked package by hand, which resets its retry counter. During the March incident the quarantine table grew to four thousand rows because an upstream certificate had expired, and nobody noticed for two days since the alert threshold was set above that count.
+
+Excerpt 2 (code). The digest comparison is implemented as follows:
+
+def changed(local: dict[str, str], upstream: dict[str, str]) -> list[str]:
+    names = set(local) | set(upstream)
+    return sorted(n for n in names if local.get(n) != upstream.get(n))
+
+The author argues that sorting makes the output deterministic, which simplifies testing, and that the union of both key sets also detects packages that were deleted upstream. A reviewer notes that deleted packages are then fetched, fail with a 404, and end up in quarantine, which is probably not what anyone wants.
+
+Excerpt 3 (planning). Marta proposes moving the poll interval from ten minutes to one, arguing that downstream users complained about stale metadata. Tomasz objects: at one minute the upstream rate limiter, which allows sixty requests an hour for anonymous clients, would throttle the mirror within the first hour. He suggests authenticating, which raises the limit to five thousand an hour, but that requires storing a token, and the security team has not yet approved a secret store for this service. The team agreed to revisit the question after the quarterly review, unless the incident count rises again.
+
+Questions. First, summarize the three excerpts in two sentences each. Second, explain why the March incident went unnoticed and propose a better alert rule, with a threshold and a justification. Third, rewrite the changed function so that packages deleted upstream are reported separately instead of fetched, and show a short test. Fourth, decide whether the poll interval should change, weighing Marta's concern against Tomasz's, and state what evidence would settle the matter. Keep each answer under one hundred and fifty words, quote the excerpt you rely on, and flag any claim the excerpts do not support. Finish with a list of five risks, each with one sentence on how to detect it early, ordered from most to least serious.

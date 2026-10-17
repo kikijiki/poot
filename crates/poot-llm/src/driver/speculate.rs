@@ -215,16 +215,79 @@ impl SpeculationStats {
             }
         }
     }
+
+    /// The rounds run since `earlier`, a reading of the same running totals.
+    pub fn since(&self, earlier: &Self) -> Self {
+        Self {
+            rounds: self.rounds - earlier.rounds,
+            proposed: self.proposed - earlier.proposed,
+            accepted: self.accepted - earlier.accepted,
+            skipped_sampler: self.skipped_sampler - earlier.skipped_sampler,
+            skipped_no_room: self.skipped_no_room - earlier.skipped_no_room,
+            skipped_no_proposal: self.skipped_no_proposal - earlier.skipped_no_proposal,
+            restored: self.restored - earlier.restored,
+            replayed: self.replayed - earlier.replayed,
+        }
+    }
 }
 
-/// The engine wall time of one kind of rollback step, summed: the steps run and the time the
-/// executor measured for them.
+/// Drafts proposed and kept at each draft position of a verified round: index 0 is the first draft,
+/// the one a round's other drafts depend on. A round that kept `accepted` of `proposed` drafts kept
+/// positions `0..accepted` (the target accepts a prefix), so `accepted[i] / proposed[i]` is the rate
+/// at which a draft that reached position `i` survives, and `accepted[i] <= proposed[i]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PositionAcceptance {
+    /// Rounds that proposed a draft at each position.
+    pub proposed: Vec<u64>,
+    /// Rounds that kept the draft at each position.
+    pub accepted: Vec<u64>,
+}
+
+impl PositionAcceptance {
+    pub(super) fn record(&mut self, proposed: usize, accepted: usize) {
+        if self.proposed.len() < proposed {
+            self.proposed.resize(proposed, 0);
+            self.accepted.resize(proposed, 0);
+        }
+        for position in 0..proposed {
+            self.proposed[position] += 1;
+            self.accepted[position] += u64::from(position < accepted);
+        }
+    }
+
+    /// The rounds run since `earlier`, a reading of the same running totals.
+    pub fn since(&self, earlier: &Self) -> Self {
+        let take = |now: &[u64], then: &[u64]| {
+            now.iter()
+                .enumerate()
+                .map(|(i, n)| n - then.get(i).copied().unwrap_or(0))
+                .collect()
+        };
+        Self {
+            proposed: take(&self.proposed, &earlier.proposed),
+            accepted: take(&self.accepted, &earlier.accepted),
+        }
+    }
+}
+
+/// The engine wall time of one kind of step, summed: the steps run and the time the executor
+/// measured for them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StepTime {
-    /// Rollback steps run.
+    /// Steps run.
     pub steps: u64,
     /// Engine wall time of those steps.
     pub wall: std::time::Duration,
+}
+
+impl StepTime {
+    /// The steps run since `earlier`, a reading of the same running totals.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            steps: self.steps - earlier.steps,
+            wall: self.wall - earlier.wall,
+        }
+    }
 }
 
 /// What a recurrent target's rounds spent on rollback, measured on a driver built
@@ -240,6 +303,40 @@ pub struct RollbackTiming {
     pub restores: StepTime,
     /// Replay chunks that re-feed the kept prefix.
     pub replays: StepTime,
+}
+
+impl RollbackTiming {
+    /// The rollback steps run since `earlier`, a reading of the same running totals.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            snapshots: self.snapshots.since(earlier.snapshots),
+            restores: self.restores.since(earlier.restores),
+            replays: self.replays.since(earlier.replays),
+        }
+    }
+}
+
+/// What a round's two kinds of model pass cost, measured on a driver built
+/// [`Driver::with_phase_timing`](super::Driver::with_phase_timing) (zero otherwise), on the engine's
+/// own clock: the draft passes (an MTP layer's catch-up and chain steps, or a draft model's steps, which
+/// read the output head the draft shares with the target) and the target's verify windows (steps that
+/// carry drafts; a decode step that carries none is in neither).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PassTiming {
+    /// Draft passes.
+    pub drafts: StepTime,
+    /// Target steps that verified drafts.
+    pub verifies: StepTime,
+}
+
+impl PassTiming {
+    /// The passes run since `earlier`, a reading of the same running totals.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            drafts: self.drafts.since(earlier.drafts),
+            verifies: self.verifies.since(earlier.verifies),
+        }
+    }
 }
 
 /// The salt that derives the draft's proposal stream from a row's sampler: one request seed gives two
@@ -276,6 +373,8 @@ struct Cover {
     seq: SeqId,
     plan: RowPlan,
     next: Option<(usize, u32)>,
+    /// The step this row's catch-up follows was a decode step, not a prompt piece.
+    decode: bool,
 }
 
 /// The driver's speculation state: the policy, the loaded draft and the per-sequence draft progress.
@@ -917,7 +1016,11 @@ impl Driver {
             seq,
             sampler: &mut idle,
         }];
-        let readback = self.run_plans(&mut lanes, std::slice::from_ref(&plan), key)?;
+        let readback = self.timed(
+            true,
+            |passes| &mut passes.drafts,
+            |driver| driver.run_plans(&mut lanes, std::slice::from_ref(&plan), key),
+        )?;
         Ok(match (pick, readback) {
             (None, _) => None,
             (Some(_), Readback::Tokens(tokens)) => Some(DraftOut::Token(tokens[0][0])),
@@ -981,12 +1084,15 @@ impl Driver {
 
     /// One step of the MTP layer over the sequences `seqs`, one lane each of `plans`: tokens and
     /// start come from each plan, the carry rows from the sequences' own pool rows. Every plan feeds
-    /// `width` tokens. Returns the greedy token of each lane that picks.
+    /// `width` tokens. Returns the greedy token of each lane that picks. `decode` says the pass
+    /// belongs to a decode step, which is the only work [`PassTiming::drafts`] counts: the catch-up
+    /// over a prompt piece is prefill time and sits before the first token.
     fn run_mtp(
         &mut self,
         seqs: &[SeqId],
         plans: &[RowPlan],
         width: usize,
+        decode: bool,
     ) -> Result<Vec<Vec<u32>>, DriverError> {
         let key = self.step_entry(
             ModelRole::Mtp,
@@ -1002,7 +1108,12 @@ impl Driver {
             .zip(&mut idle)
             .map(|(&seq, sampler)| Lane { seq, sampler })
             .collect();
-        match self.run_plans(&mut lanes, plans, key)? {
+        let readback = self.timed(
+            decode,
+            |passes| &mut passes.drafts,
+            |driver| driver.run_plans(&mut lanes, plans, key),
+        )?;
+        match readback {
             Readback::Tokens(tokens) => Ok(tokens),
             Readback::Logits { .. } => unreachable!("the layer runs the greedy suffix"),
         }
@@ -1061,7 +1172,7 @@ impl Driver {
                     }
                 })
                 .collect();
-            let picked = self.run_mtp(&seqs, &steps, 1)?;
+            let picked = self.run_mtp(&seqs, &steps, 1, true)?;
             for (&i, tokens) in live.iter().zip(picked) {
                 chains[i].3.push(tokens[0]);
             }
@@ -1127,6 +1238,7 @@ impl Driver {
                     not_speculated: None,
                 },
                 next,
+                decode: !plan.prefill,
             });
         }
         let mut widths: Vec<usize> = covers.iter().map(|cover| cover.plan.feed.len()).collect();
@@ -1150,7 +1262,8 @@ impl Driver {
                     not_speculated: None,
                 })
                 .collect();
-            let picked = self.run_mtp(&seqs, &steps, width)?;
+            let picked =
+                self.run_mtp(&seqs, &steps, width, group.iter().any(|cover| cover.decode))?;
             for (cover, tokens) in group.iter().zip(picked) {
                 match (cover.next, tokens.first()) {
                     (Some((len, last)), Some(&draft)) => {
@@ -1386,6 +1499,115 @@ pub fn propose_lookup(tokens: &[u32], ngram: usize, max_k: usize) -> Vec<u32> {
 /// [`Sampler::probs`] reproduces. A penalty, bias, constraint or logprob record is not.
 pub(super) fn speculation_sampler_ok(sampler: &Sampler) -> bool {
     suffix::rule_of(sampler).is_some()
+}
+
+#[cfg(test)]
+mod since_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn time(steps: u64, millis: u64) -> StepTime {
+        StepTime {
+            steps,
+            wall: Duration::from_millis(millis),
+        }
+    }
+
+    /// `since` is later minus earlier, field by field, for every running total the bench reads twice.
+    /// Mutation: return `self` unchanged from `StepTime::since`; the timing rows are red.
+    #[test]
+    fn running_totals_subtract_field_by_field() {
+        assert_eq!(time(5, 70).since(time(2, 30)), time(3, 40));
+        let rollback = RollbackTiming {
+            snapshots: time(4, 8),
+            restores: time(3, 9),
+            replays: time(2, 10),
+        };
+        let earlier = RollbackTiming {
+            snapshots: time(1, 2),
+            restores: time(1, 3),
+            replays: time(1, 4),
+        };
+        assert_eq!(
+            rollback.since(earlier),
+            RollbackTiming {
+                snapshots: time(3, 6),
+                restores: time(2, 6),
+                replays: time(1, 6),
+            }
+        );
+        let passes = PassTiming {
+            drafts: time(9, 90),
+            verifies: time(3, 60),
+        };
+        let earlier = PassTiming {
+            drafts: time(4, 40),
+            verifies: time(1, 10),
+        };
+        assert_eq!(
+            passes.since(earlier),
+            PassTiming {
+                drafts: time(5, 50),
+                verifies: time(2, 50),
+            }
+        );
+        let stats = SpeculationStats {
+            rounds: 6,
+            proposed: 18,
+            accepted: 9,
+            restored: 4,
+            replayed: 7,
+            ..SpeculationStats::default()
+        };
+        let earlier = SpeculationStats {
+            rounds: 2,
+            proposed: 6,
+            accepted: 5,
+            restored: 1,
+            replayed: 1,
+            ..SpeculationStats::default()
+        };
+        assert_eq!(
+            stats.since(&earlier),
+            SpeculationStats {
+                rounds: 4,
+                proposed: 12,
+                accepted: 4,
+                restored: 3,
+                replayed: 6,
+                ..SpeculationStats::default()
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod position_acceptance_tests {
+    use super::PositionAcceptance;
+
+    /// A round that kept a prefix of its drafts proposed position `i` when it proposed more than `i`
+    /// drafts and kept it when it kept more than `i`. Mutation: count the position `accepted` as kept
+    /// (`position <= accepted`); the `accepted` row is red.
+    #[test]
+    fn counts_the_kept_prefix_of_each_round() {
+        let mut positions = PositionAcceptance::default();
+        positions.record(3, 1);
+        positions.record(3, 3);
+        positions.record(2, 0);
+        assert_eq!(positions.proposed, [3, 3, 2]);
+        assert_eq!(positions.accepted, [2, 1, 1]);
+    }
+
+    #[test]
+    fn since_is_the_rounds_between_two_readings() {
+        let mut positions = PositionAcceptance::default();
+        positions.record(1, 1);
+        let earlier = positions.clone();
+        positions.record(3, 2);
+        let delta = positions.since(&earlier);
+        assert_eq!(delta.proposed, [1, 1, 1]);
+        assert_eq!(delta.accepted, [1, 1, 0]);
+    }
 }
 
 #[cfg(test)]

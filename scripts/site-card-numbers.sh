@@ -5,7 +5,7 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 rc=0
-git grep -nIiP '\b(cards? #?[0-9]{3,4}[a-d]?|POOT-[0-9]+|POOT-ADR-[0-9]+)\b' -- website/docs website/src || rc=$?
+git grep -nIiP '\b(cards? #?[0-9]{3,4}[a-d]?|POOT-[0-9]+|POOT-ADR-[0-9]+)\b' -- website/docs website/src website/diagrams || rc=$?
 case $rc in
     0) echo "internal card numbers found (see above) - the site holds user-facing truth only"; exit 1 ;;
     1) exit 0 ;;

@@ -37,8 +37,8 @@ use crate::driver::step::PickPolicy;
 use crate::driver::tests::tiny_text;
 use crate::driver::{
     AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, Head, Layout,
-    ModelHandle, PoolShape, PrefixOutcome, PrefixSkip, PreparedSetLimits, Release, RowResult,
-    RowSpeculation, RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm,
+    ModelHandle, PassTiming, PoolShape, PrefixOutcome, PrefixSkip, PreparedSetLimits, Release,
+    RowResult, RowSpeculation, RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -916,7 +916,9 @@ fn mtp_greedy_equals_off(choice: BackendChoice) {
         return;
     };
     let reference = serve(&mut off, &PROMPT, &mut Sampler::greedy());
-    let mut driver = glm_driver(choice, &handle, mtp(K)).expect("the device opened a moment ago");
+    let mut driver = glm_driver(choice, &handle, mtp(K))
+        .expect("the device opened a moment ago")
+        .with_phase_timing();
     let served = serve(&mut driver, &PROMPT, &mut Sampler::greedy());
     assert_eq!(
         served.tokens, reference.tokens,
@@ -936,6 +938,35 @@ fn mtp_greedy_equals_off(choice: BackendChoice) {
     eprintln!(
         "MTP k={K} on {choice:?}: rounds {} proposed {} accepted {}",
         stats.rounds, stats.proposed, stats.accepted
+    );
+    let positions = driver.stats().positions;
+    assert_eq!(
+        positions.proposed.iter().sum::<u64>(),
+        stats.proposed,
+        "{positions:?}"
+    );
+    assert_eq!(
+        positions.accepted.iter().sum::<u64>(),
+        stats.accepted,
+        "{positions:?}"
+    );
+    assert!(
+        positions.accepted.windows(2).all(|pair| pair[0] >= pair[1])
+            && positions
+                .accepted
+                .iter()
+                .zip(&positions.proposed)
+                .all(|(a, p)| a <= p),
+        "a draft is kept only after the ones before it: {positions:?}"
+    );
+    let passes = driver.stats().passes;
+    assert_eq!(
+        passes.verifies.steps, stats.rounds,
+        "one verify window a round, none for the prefill or a draft-less decode: {passes:?}"
+    );
+    assert!(
+        passes.drafts.steps > 0 && !passes.drafts.wall.is_zero() && !passes.verifies.wall.is_zero(),
+        "the draft passes and the verify windows were timed: {passes:?}"
     );
 }
 
@@ -1160,6 +1191,67 @@ macro_rules! per_backend {
     };
 }
 
+/// The draft passes the driver times are the decode window's: the catch-up over the prompt pieces
+/// runs inside the prefill steps, before the first token, so a tally that took them would put work in
+/// a bench's per-round breakdown that its first-token-to-last span never held. After the prefill
+/// nothing is tallied; the decode step that follows tallies its chain and catch-up passes and one
+/// verify window. Mutation: count every catch-up as a decode pass (`run_mtp` called with
+/// `decode = true` from `mtp_catch_up`); the prefill assertion is red.
+fn mtp_prefill_catch_up_is_not_a_decode_pass(choice: BackendChoice) {
+    let handle = glm_handle(FixtureHead::Zeroed);
+    let Some(driver) = glm_driver(choice, &handle, mtp(K)) else {
+        return;
+    };
+    let mut driver = driver.with_phase_timing();
+    let sampler = &mut Sampler::greedy();
+    prepare(
+        &mut driver,
+        &[PROMPT.len()],
+        Layout::Contiguous,
+        &[NonZeroUsize::MIN],
+    );
+    let Admission::Opened { seq, .. } = driver
+        .open(SeqRequest {
+            prompt: &PROMPT,
+            max_new: NEW,
+            adapter: AdapterRef::Base,
+        })
+        .unwrap()
+    else {
+        panic!("a fresh driver admits one sequence")
+    };
+    let first = loop {
+        let mut rows = [StepRow {
+            seq,
+            work: RowWork::Prefill { upto: PROMPT.len() },
+            sampler: &mut *sampler,
+        }];
+        let result = driver.step(&mut rows).unwrap().remove(0);
+        if !result.tokens.is_empty() {
+            break result;
+        }
+    };
+    let prefilled = driver.stats().passes;
+    assert_eq!(
+        prefilled,
+        PassTiming::default(),
+        "the prefill's catch-up passes are not decode passes on {choice:?}"
+    );
+    driver.commit(seq, first.tokens.len(), sampler).unwrap();
+    decode(&mut driver, seq, sampler);
+    let decoded = driver.stats().passes;
+    assert!(
+        decoded.drafts.steps > 0 && decoded.verifies.steps == 1,
+        "a decode round tallies its draft passes and one verify window on {choice:?}: {decoded:?}"
+    );
+}
+
+per_backend!(
+    mtp_prefill_catch_up_is_not_a_decode_pass,
+    mtp_prefill_catch_up_is_not_a_decode_pass_wgpu,
+    mtp_prefill_catch_up_is_not_a_decode_pass_rocm,
+    mtp_prefill_catch_up_is_not_a_decode_pass_ptx
+);
 per_backend!(
     mtp_greedy_equals_off,
     mtp_greedy_equals_off_wgpu,

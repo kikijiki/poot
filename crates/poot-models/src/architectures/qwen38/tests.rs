@@ -431,7 +431,7 @@ mod reference {
         }
 
         /// The QSA layer: the indexer's blocks by a plain sort, attention over the selected keys
-        /// only. Reports the keys, values and raw indexer keys the layer caches.
+        /// only. Reports the keys, values, block keys and unfinished-block raw keys the layer caches.
         fn qsa(
             &self,
             l: usize,
@@ -597,9 +597,25 @@ mod reference {
                 format!("kv.l{l}.v"),
                 cache(&|p, kv| v[p][kv].clone(), nkv, hd),
             );
+            // The block keys of the complete blocks, zeros after them; the unfinished block's raw keys
+            // by residue: slot `j` holds the latest position `= j mod ratio`.
+            let blocks = cap / ratio;
             state.insert(
-                format!("kv.l{l}.index"),
-                cache(&|p, _| raw_k[p].clone(), 1, di),
+                format!("kv.l{l}.index_blocks"),
+                (0..blocks)
+                    .flat_map(|b| block_keys.get(b).cloned().unwrap_or_else(|| vec![0.0; di]))
+                    .collect(),
+            );
+            state.insert(
+                format!("kv.l{l}.index_tail"),
+                (0..ratio)
+                    .flat_map(|j| {
+                        (0..n)
+                            .rev()
+                            .find(|p| p % ratio == j)
+                            .map_or_else(|| vec![0.0; di], |p| raw_k[p].clone())
+                    })
+                    .collect(),
             );
             out
         }
@@ -1036,6 +1052,85 @@ fn a_shape_off_the_granule_is_a_typed_refusal() {
     );
 }
 
+/// SC-1143-5: a paged-KV step is a typed refusal naming the indexer, and builds no graph: the block-key
+/// cache is per row and its paging granule is POOT-1148's. Mutation: drop the paged check from
+/// `Qwen4Exp::trace_into`; the paged shape traces and the refusal assertion goes red.
+#[test]
+fn a_paged_step_is_a_typed_indexer_refusal() {
+    use crate::model::{ShapeReason, TraceError};
+
+    let model = built(&super::fixture());
+    let shape = StepShape {
+        rows: NonZeroUsize::MIN,
+        tokens: NonZeroUsize::new(2).unwrap(),
+        capacity: NonZeroUsize::new(8).unwrap(),
+        kv: KvLayout::Paged {
+            pool_slots: NonZeroUsize::new(16).unwrap(),
+            seqs: NonZeroUsize::MIN,
+        },
+        logits: LogitRows::All,
+        hidden: None,
+    };
+    let refusal = model
+        .trace(
+            Phase::Prefill,
+            shape,
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .expect_err("a paged step is refused");
+    assert!(
+        matches!(
+            refusal,
+            TraceError::ShapeUnsupported {
+                reason: ShapeReason::PagedIndexer,
+                ..
+            }
+        ),
+        "{refusal:?}"
+    );
+}
+
+/// SC-1143-6: the indexer's block keys are declared [`StateRole::Blocked`] at the block ratio and its
+/// unfinished-block raw keys `Recurrent`; the K/V caches stay `Positional`. Mutation: declare the block
+/// keys `Positional { axis: 2 }`; the traffic accounting would read each entry as one position.
+#[test]
+fn the_block_key_cache_is_declared_blocked() {
+    use poot_graph_ir::StateRole;
+
+    let case = Case::new(super::fixture());
+    let model = case.model();
+    let shape = StepShape {
+        rows: NonZeroUsize::MIN,
+        tokens: NonZeroUsize::new(2).unwrap(),
+        capacity: NonZeroUsize::new(case.cap).unwrap(),
+        kv: KvLayout::Contiguous,
+        logits: LogitRows::All,
+        hidden: None,
+    };
+    let g = model
+        .trace(
+            Phase::Prefill,
+            shape,
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
+    let role = |name: &str| {
+        g.state_pairs()
+            .find(|pair| g.meta(pair.input).name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no state {name}"))
+            .role
+    };
+    assert_eq!(
+        role("kv.l2.index_blocks"),
+        StateRole::Blocked {
+            axis: 2,
+            ratio: std::num::NonZeroU32::new(2).unwrap()
+        }
+    );
+    assert_eq!(role("kv.l2.index_tail"), StateRole::Recurrent);
+    assert_eq!(role("kv.l2.k"), StateRole::Positional { axis: 2 });
+}
+
 /// SC-006 (the model's half): the PLE reads the token history through the carried state. The same
 /// continuation chunk after three different prefixes (a fresh-looking one, a nonzero one, one with
 /// the end-of-sequence id in the window) matches the reference after each, and the three differ;
@@ -1303,6 +1398,13 @@ fn from_raw_refuses_what_the_family_cannot_configure() {
     assert_eq!(
         field(refuse(&|c| c["text_config"]["indexer_budget"] = 1.into())),
         ("indexer_budget", ConfigReason::Unsupported)
+    );
+    // The indexer finds a position's block with a shift and a mask.
+    assert_eq!(
+        field(refuse(
+            &|c| c["text_config"]["indexer_compress_ratio"] = 3.into()
+        )),
+        ("indexer_compress_ratio", ConfigReason::Unsupported)
     );
     assert_eq!(
         field(refuse(&|c| c["text_config"]["hc_count"] = 0.into())),

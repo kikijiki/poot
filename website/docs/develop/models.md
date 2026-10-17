@@ -70,7 +70,9 @@ outside the vocabulary stops the step with a validation error naming the n-gram 
 checkpoint stores the n-gram table as 128 E4M3 row-range shards under one scale; each shard stays a resident weight
 and a lookup reads the shard that owns the row, with exact integer ids. The shard layout is checked on small fixtures on
 the CPU oracle and the wgpu, ROCm and PTX executors. The E4M3 shard lookup is gathered bit-exactly against the
-reference decode on all three executors on small fixtures; no real checkpoint has run.
+reference decode on all three executors on small fixtures; no real checkpoint has run. The indexer keeps a per-row
+cache of block keys, so the model generates with `Driver` but `poot-serve` cannot serve it under the paged KV pool
+until paged block-key caching lands; startup stops with a typed refusal.
 
 ## DeepSeek-V4
 
