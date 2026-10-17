@@ -20,7 +20,7 @@ Which crate owns which layer, and the few constraints that span several pages.
 | Codegen          | `poot-codegen`                                                                                             | Kernel IR to LLVM IR to SPIR-V, PTX, AMDGCN code objects or AIE                                         |
 | Runtimes         | `poot-wgpu-runtime`, `poot-rocm-runtime`, `poot-ptx-runtime`, `poot-vulkan-runtime`, `poot-runtime-common` | Devices, buffers, transfers; mechanism only                                                             |
 | Executors        | `poot-wgpu-device` (wgpu), `poot-rocm-device`, `poot-ptx-device`, `poot-vulkan-device`                     | Load, bind, capture, replay and read back a plan                                                        |
-| NPU device       | `poot-npu`                                                                                                 | Experimental XDNA2 `Device` over XRT (`xdna` feature); F32 add, sub and mul only                        |
+| NPU device       | `poot-npu`                                                                                                 | Experimental `Device`s: XDNA2 over XRT (`xdna`; F32 add, sub, mul) and Intel NPU4 over Level Zero (`vpu`; F16 graphs) |
 | Models           | `poot-models`                                                                                              | The `Model` trait, the family registry, per-family tracers over shared components                       |
 | Loading          | `poot-load`, `poot-quant`                                                                                  | Safetensors and GGUF readers; packed quantization descriptors shared by loader, IR and planner          |
 | Text             | `poot-text`                                                                                                | Tokenizer, chat templates and guided-decoding constraints; needs no model and no device                 |
@@ -31,7 +31,8 @@ Which crate owns which layer, and the few constraints that span several pages.
 ## Cross-cutting notes
 
 - **AIE compilation and NPU execution are separate stages.** The compiler produces a typed AIE core object,
-  link recipe and linked artifact with a shape ABI for the planner's sequential schedule; `poot-npu`'s
+  link recipe and linked artifact with a shape ABI for the planner's serialized schedule (the ordinary
+  kernel body with its thread grid turned into loops); `poot-npu`'s
   `Device` loads and runs them through the shared engine. See [NPU Offload](./npu).
 - **Oracle use is still broader than the target.** The driver's CPU-oracle checks call the evaluator
   today. See [Execution](./execution#verification).

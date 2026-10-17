@@ -152,6 +152,18 @@ pub enum Capability {
         /// The device's workgroup memory, in bytes.
         lds_bytes: u32,
     },
+    /// The block top-k kernel is one fixed workgroup of `lanes` lanes (one radix bin each) with `lds_needed` bytes of
+    /// workgroup memory, and the device's workgroup, invocation or memory limits are below it.
+    BlockTopKWorkgroup {
+        /// Lanes the kernel needs in one workgroup.
+        lanes: usize,
+        /// The device's most invocations per workgroup.
+        max_invocations: u32,
+        /// Workgroup memory the kernel needs, in bytes.
+        lds_needed: u64,
+        /// The device's workgroup memory, in bytes.
+        lds_bytes: u32,
+    },
     /// A plan-local scratch buffer (`DispatchPlan::scratch`) is larger than the device's single-buffer
     /// ceiling. The split-KV attention rule chooses the streaming schedule when its scratch does not fit,
     /// so this is the backstop for a plan that reached validation anyway: a typed refusal, never a failed
@@ -191,6 +203,18 @@ pub enum Capability {
     /// The plan has no AIE shape ABI (the choice is not an AIE sequential schedule, or a binding is
     /// malformed).
     AieAbi(crate::AieAbiRefusal),
+    /// The target computes in a narrower float than the equation's `dtype` (POOT-1159): an Intel NPU
+    /// computes in FP16, so F32 or BF16 arithmetic on it would silently narrow the equation's semantics.
+    /// Computing it narrower is an explicit graph transform the operator chooses, never the planner's
+    /// default.
+    Arithmetic {
+        /// The float dtype the equation computes in.
+        dtype: DType,
+    },
+    /// The Intel lowering table has no OpenVINO opset op with this op's semantics (POOT-1159).
+    VpuOpset,
+    /// An operand is an inline literal; the Intel lowering reads value operands only.
+    LiteralOperand,
 }
 
 /// What a fused region step cannot be lowered to, by the region's arithmetic.
@@ -221,6 +245,8 @@ pub enum StorageGap {
     /// An E4M3FN `DenseRowGather` table is stored packed four elements per `u32` word with padded rows
     /// (POOT-1060), so it must be a const no other equation reads and no output observes.
     E4m3PackedLanes,
+    /// The dtype is none of the widths an Intel NPU region carries (F16, F32, I32).
+    VpuDtype,
 }
 
 impl RefusalDtypes {
@@ -403,6 +429,15 @@ impl fmt::Display for Capability {
                 "the scan kernel needs {} bytes of workgroup memory for one state column of {rows} rows, the device has {lds_bytes}",
                 4 * rows
             ),
+            Capability::BlockTopKWorkgroup {
+                lanes,
+                max_invocations,
+                lds_needed,
+                lds_bytes,
+            } => write!(
+                f,
+                "the block top-k kernel needs a {lanes}-lane workgroup and {lds_needed} bytes of workgroup memory, the device has {max_invocations} invocations and {lds_bytes} bytes"
+            ),
             Capability::ScratchBytes {
                 needed,
                 max_buffer_bytes,
@@ -423,6 +458,16 @@ impl fmt::Display for Capability {
             ),
             Capability::AieLimit(refusal) => write!(f, "AIE limit: {refusal}"),
             Capability::AieAbi(refusal) => write!(f, "AIE shape ABI: {refusal}"),
+            Capability::Arithmetic { dtype } => write!(
+                f,
+                "the target does not compute in {dtype}; computing it narrower changes the equation's semantics"
+            ),
+            Capability::VpuOpset => {
+                f.write_str("no OpenVINO opset op has this op's semantics")
+            }
+            Capability::LiteralOperand => {
+                f.write_str("the lowering reads value operands only, not an inline literal")
+            }
         }
     }
 }
@@ -462,6 +507,9 @@ impl fmt::Display for StorageGap {
             StorageGap::E4m3PackedLanes => f.write_str(
                 "a packed-E4M3 row-gather table must be a const read only by dense row gathers, \
                  not a computed value, an output or a buffer another kernel reads as raw bytes",
+            ),
+            StorageGap::VpuDtype => f.write_str(
+                "an Intel NPU region carries only F16, F32 and I32 values",
             ),
         }
     }

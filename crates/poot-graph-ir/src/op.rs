@@ -906,6 +906,34 @@ pub enum OpKind {
     /// schedule runs the sequence in a loop of bounded dispatches instead. One source-admissible
     /// recurrence carrier, not a fusion or schedule choice.
     Scan(ScanAttrs),
+    /// The per-query block selection of a sparse-attention indexer (POOT-1143): the best `k` of the blocks
+    /// of `ratio` consecutive positions that a query's position has completed, ranked by score. Operands
+    /// are the block scores `[R, 1, T, NB]` (F32) and the queries' absolute positions `[R, T]` (I32). The
+    /// one typed result is I32 `[R, 1, T, K + NB]` ([`BlockTopKAttrs::layout`] names the halves): the
+    /// first `K` entries are the selected block ids in ascending order, `-1` after the last when fewer than
+    /// `K` blocks are eligible; the last `NB` are the `0`/`1` keep indicator of each block.
+    ///
+    /// Block `b` is eligible for a query at position `p` when every position of it is at or before `p`:
+    /// `b * ratio + ratio - 1 <= p`. Eligible blocks rank by canonical score
+    /// ([`crate::ops::canonical_router_scores`]) descending, ties to the lower block; ineligible blocks are
+    /// never selected. Its definition is the primitive chain of [`crate::ops::block_top_k_packed`]: a stable
+    /// rank over all `NB` blocks, quadratic in `NB`, so the CPU oracle refuses past a block-count bound
+    /// and a device runs a linear selection kernel instead. The selected set is exact on every executor.
+    BlockTopK(BlockTopKAttrs),
+    /// Attention over the blocks a [`OpKind::BlockTopK`] selected (POOT-1143): each query reads only the keys of
+    /// its `K` selected blocks and of its own unfinished block, not all `Lk`. Operands `[q, k, v, ids, pos]`:
+    /// `q [B,Hq,Lq,Dk]`, `k [B,Hkv,Lk,Dk]`, `v [B,Hkv,Lk,Dv]` (the cache, stored positions past `Lk` never
+    /// read), `ids [B,1,Lq,K]` I32 (the selected block ids, ascending, `-1` after the last: the ids half of a
+    /// `BlockTopK` result; the contract is that `ids` come from one: eligible, complete blocks, each once, none
+    /// the query's own unfinished block, which a device kernel would otherwise read twice) and `pos [B,Lq]` I32 (the queries' absolute positions). Output `[B,Hq,Lq,Dv]`.
+    ///
+    /// Query `(b, i)` at position `p` reads key `j` when `j <= p` and either block `j / ratio` is among its
+    /// `ids`, or `j >= ((p + 1) / ratio) * ratio` (the unfinished block, always visible, unscored); the
+    /// scores are `q . k * scale`, softcapped if asked, and softmax runs over the visible keys only. Its
+    /// definition is the dense [`OpKind::Attention`] under the additive mask those conditions make
+    /// ([`crate::ops::selected_attention`]); a device kernel visits `(K + 1) * ratio` positions per query
+    /// instead of `Lk`, so its sum is reassociated (ADR-0101 tier 2) while the keys it reads are exact.
+    SelectedAttention(SelectedAttentionAttrs),
     /// A cross-replica collective reduce (card 049a, tensor-parallel). Each rank holds a same-shaped partial tensor;
     /// the collective combines them with `op` and distributes the result back to every rank. The output type is
     /// identical to the input type.
@@ -1808,6 +1836,8 @@ impl OpKind {
             OpKind::Attention(attrs) => infer_attention(ins, attrs),
             OpKind::Rope { rot } => infer_rope(ins, *rot),
             OpKind::Scan(attrs) => infer_scan(ins, attrs),
+            OpKind::BlockTopK(attrs) => infer_block_top_k(ins, attrs),
+            OpKind::SelectedAttention(attrs) => infer_selected_attention(ins, attrs),
             OpKind::AllReduce { .. } => {
                 // Shape-preserving: each rank holds a same-shaped partial; the collective combines across ranks and returns
                 // the full result in the same shape and dtype.
@@ -1907,6 +1937,8 @@ impl OpKind {
             | Self::Attention(_)
             | Self::Rope { .. }
             | Self::Scan(_)
+            | Self::BlockTopK(_)
+            | Self::SelectedAttention(_)
             | Self::ContractionEpilogue { .. }
             | Self::Fused(_)
             | Self::FusedRow(_) => OpClass::Composite,
@@ -1969,6 +2001,8 @@ impl OpKind {
             Self::Attention(_) => "attention",
             Self::Rope { .. } => "rope",
             Self::Scan(_) => "scan",
+            Self::BlockTopK(_) => "block_top_k",
+            Self::SelectedAttention(_) => "selected_attention",
             Self::AllReduce { .. } => "all_reduce",
             Self::AllGather { .. } => "all_gather",
             Self::RandomUniform { .. } => "random_uniform",
@@ -2041,6 +2075,8 @@ impl OpKind {
             | OpKind::Attention(_)
             | OpKind::Rope { .. }
             | OpKind::Scan(_)
+            | OpKind::BlockTopK(_)
+            | OpKind::SelectedAttention(_)
             | OpKind::AllReduce { .. }
             | OpKind::AllGather { .. }
             | OpKind::RandomUniform { .. }
@@ -2112,6 +2148,11 @@ impl OpKind {
             ),
             OpKind::Rope { rot } => format!("rope rot={rot}"),
             OpKind::Scan(attrs) => format!("scan {} chunk={}", attrs.family.name(), attrs.chunk),
+            OpKind::BlockTopK(attrs) => format!("block_top_k ratio={} k={}", attrs.ratio, attrs.k),
+            OpKind::SelectedAttention(a) => format!(
+                "selected_attention n_rep={} scale={} softcap={:?} ratio={} k={}",
+                a.n_rep, a.scale, a.softcap, a.ratio, a.k
+            ),
             OpKind::AllReduce { op, axis } => {
                 format!("all_reduce.{} ax={axis}", format!("{op:?}").to_lowercase())
             }
@@ -2495,6 +2536,269 @@ fn infer_all_gather(
         })?;
     *len = gathered;
     Ok(TensorType::new(shape, input.dtype))
+}
+
+/// The attributes of [`OpKind::SelectedAttention`].
+#[derive(Clone, PartialEq, Debug)]
+pub struct SelectedAttentionAttrs {
+    /// Query heads per key/value head (`Hq / Hkv`).
+    pub n_rep: usize,
+    /// Multiplier on the `Q K^T` scores.
+    pub scale: f32,
+    /// `Some(c)` applies `c * tanh(scores / c)` to the scaled scores; `None` applies none.
+    pub softcap: Option<f32>,
+    /// The positions each selected block covers.
+    pub ratio: usize,
+    /// The blocks each query reads: the width of the `ids` operand.
+    pub k: usize,
+}
+
+/// The extents a [`OpKind::SelectedAttention`]'s operands fix.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SelectedAttentionLayout {
+    /// Batch rows `B`.
+    pub batch: usize,
+    /// Query heads `Hq`.
+    pub hq: usize,
+    /// Query rows per batch row `Lq`.
+    pub lq: usize,
+    /// Stored key positions `Lk`.
+    pub lk: usize,
+    /// The query and key head width.
+    pub dk: usize,
+    /// The value and output head width.
+    pub dv: usize,
+}
+
+impl SelectedAttentionAttrs {
+    /// The layout `ins` (`[q, k, v, ids, pos]`) imply, or the typing error.
+    pub fn layout(&self, ins: &[TensorType]) -> Result<SelectedAttentionLayout, ShapeError> {
+        arity(ins, 5)?;
+        let (q, k, v, ids, pos) = (&ins[0], &ins[1], &ins[2], &ins[3], &ins[4]);
+        if self.ratio == 0 || self.k == 0 {
+            return Err(ShapeError::SelectedAttention {
+                ratio: self.ratio,
+                k: self.k,
+            });
+        }
+        if q.dtype.class() != DTypeClass::Arithmetic {
+            return Err(ShapeError::DtypeOp {
+                op: "SelectedAttention",
+                dtype: q.dtype,
+            });
+        }
+        for (operand, t) in [("k", k), ("v", v)] {
+            if t.dtype != q.dtype {
+                return Err(ShapeError::AttentionDtype {
+                    operand,
+                    expected: q.dtype,
+                    actual: t.dtype,
+                });
+            }
+        }
+        for (operand, t) in [("ids", ids), ("pos", pos)] {
+            if t.dtype != DType::I32 {
+                return Err(ShapeError::AttentionDtype {
+                    operand,
+                    expected: DType::I32,
+                    actual: t.dtype,
+                });
+            }
+        }
+        let n_rep = self.n_rep;
+        let &[batch, hq, lq, dk] = q.shape.as_slice() else {
+            return Err(ShapeError::AttentionQuery {
+                n_rep,
+                actual: q.shape.clone(),
+            });
+        };
+        if n_rep == 0 || hq % n_rep != 0 {
+            return Err(ShapeError::AttentionQuery {
+                n_rep,
+                actual: q.shape.clone(),
+            });
+        }
+        let hkv = hq / n_rep;
+        let Some(&lk) = k.shape.get(2) else {
+            return Err(ShapeError::AttentionOperand {
+                operand: "k",
+                expected: vec![batch, hkv, lq, dk],
+                actual: k.shape.clone(),
+            });
+        };
+        let k_expected = [batch, hkv, lk, dk];
+        if k.shape != k_expected {
+            return Err(ShapeError::AttentionOperand {
+                operand: "k",
+                expected: k_expected.to_vec(),
+                actual: k.shape.clone(),
+            });
+        }
+        let Some(&dv) = v.shape.get(3) else {
+            return Err(ShapeError::AttentionOperand {
+                operand: "v",
+                expected: vec![batch, hkv, lk, dk],
+                actual: v.shape.clone(),
+            });
+        };
+        let v_expected = [batch, hkv, lk, dv];
+        if dv == 0 || lk == 0 || v.shape != v_expected {
+            return Err(ShapeError::AttentionOperand {
+                operand: "v",
+                expected: v_expected.to_vec(),
+                actual: v.shape.clone(),
+            });
+        }
+        let ids_expected = [batch, 1, lq, self.k];
+        if ids.shape != ids_expected {
+            return Err(ShapeError::AttentionOperand {
+                operand: "ids",
+                expected: ids_expected.to_vec(),
+                actual: ids.shape.clone(),
+            });
+        }
+        if pos.shape != [batch, lq] {
+            return Err(ShapeError::AttentionOperand {
+                operand: "pos",
+                expected: vec![batch, lq],
+                actual: pos.shape.clone(),
+            });
+        }
+        Ok(SelectedAttentionLayout {
+            batch,
+            hq,
+            lq,
+            lk,
+            dk,
+            dv,
+        })
+    }
+}
+
+/// The typing rule of `SelectedAttention`: the dense attention's output `[B, Hq, Lq, Dv]`.
+fn infer_selected_attention(
+    ins: &[TensorType],
+    attrs: &SelectedAttentionAttrs,
+) -> Result<TensorType, ShapeError> {
+    let layout = attrs.layout(ins)?;
+    Ok(TensorType::new(
+        vec![layout.batch, layout.hq, layout.lq, layout.dv],
+        ins[0].dtype,
+    ))
+}
+
+/// The attributes of [`OpKind::BlockTopK`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct BlockTopKAttrs {
+    /// The positions each block covers.
+    pub ratio: usize,
+    /// The blocks kept per query.
+    pub k: usize,
+}
+
+/// The two halves of a [`OpKind::BlockTopK`] result `[R, 1, T, K + NB]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct BlockTopKLayout {
+    /// Rows `R`.
+    pub rows: usize,
+    /// Queries per row `T`.
+    pub tokens: usize,
+    /// The blocks `NB` the scores rank.
+    pub blocks: usize,
+    /// The blocks kept `K`.
+    pub k: usize,
+}
+
+impl BlockTopKLayout {
+    /// The packed result's shape `[R, 1, T, K + NB]`.
+    pub fn packed_shape(&self) -> Vec<usize> {
+        vec![self.rows, 1, self.tokens, self.k + self.blocks]
+    }
+
+    /// The selected block ids' columns, `0..K`.
+    pub fn ids(&self) -> std::ops::Range<usize> {
+        0..self.k
+    }
+
+    /// The keep indicator's columns, `K..K + NB`.
+    pub fn keep(&self) -> std::ops::Range<usize> {
+        self.k..self.k + self.blocks
+    }
+}
+
+impl BlockTopKAttrs {
+    /// The layout `ins` (`[scores, pos]`) imply, or the typing error.
+    pub fn layout(&self, ins: &[TensorType]) -> Result<BlockTopKLayout, ShapeError> {
+        arity(ins, 2)?;
+        let (scores, pos) = (&ins[0], &ins[1]);
+        if scores.dtype != DType::F32 {
+            return Err(ShapeError::DtypeOp {
+                op: "BlockTopK",
+                dtype: scores.dtype,
+            });
+        }
+        if pos.dtype != DType::I32 {
+            return Err(ShapeError::DtypeOp {
+                op: "BlockTopK",
+                dtype: pos.dtype,
+            });
+        }
+        let &[rows, one, tokens, blocks] = scores.shape.as_slice() else {
+            return Err(ShapeError::OperandRank {
+                op: "BlockTopK",
+                operand: "scores",
+                expected: 4,
+                actual: scores.shape.len(),
+            });
+        };
+        if one != 1 {
+            return Err(ShapeError::OperandDim {
+                op: "BlockTopK",
+                operand: "scores",
+                dim: 1,
+                expected: 1,
+                actual: one,
+            });
+        }
+        if pos.shape != [rows, tokens] {
+            return Err(match pos.shape.as_slice() {
+                &[r, t] => ShapeError::OperandDim {
+                    op: "BlockTopK",
+                    operand: "pos",
+                    dim: usize::from(r == rows),
+                    expected: if r == rows { tokens } else { rows },
+                    actual: if r == rows { t } else { r },
+                },
+                other => ShapeError::OperandRank {
+                    op: "BlockTopK",
+                    operand: "pos",
+                    expected: 2,
+                    actual: other.len(),
+                },
+            });
+        }
+        if self.ratio == 0 || self.k == 0 || self.k > blocks {
+            return Err(ShapeError::BlockTopK {
+                ratio: self.ratio,
+                k: self.k,
+                blocks,
+            });
+        }
+        Ok(BlockTopKLayout {
+            rows,
+            tokens,
+            blocks,
+            k: self.k,
+        })
+    }
+}
+
+/// The typing rule of `BlockTopK`: the packed I32 result of the layout the operands imply.
+fn infer_block_top_k(ins: &[TensorType], attrs: &BlockTopKAttrs) -> Result<TensorType, ShapeError> {
+    Ok(TensorType::new(
+        attrs.layout(ins)?.packed_shape(),
+        DType::I32,
+    ))
 }
 
 /// The typing rule of `Scan`: the packed result of the layout the operands imply.
@@ -4680,6 +4984,14 @@ mod tests {
                 }
                 OpKind::Rope { rot } => rot.hash(h),
                 OpKind::Scan(attrs) => attrs.hash(h),
+                OpKind::BlockTopK(attrs) => attrs.hash(h),
+                OpKind::SelectedAttention(attrs) => {
+                    attrs.n_rep.hash(h);
+                    attrs.scale.to_bits().hash(h);
+                    attrs.softcap.map(f32::to_bits).hash(h);
+                    attrs.ratio.hash(h);
+                    attrs.k.hash(h);
+                }
                 OpKind::AllReduce { op, axis } => {
                     op.hash(h);
                     axis.hash(h);

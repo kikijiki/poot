@@ -138,8 +138,8 @@ pub(crate) fn bf16_const_is_packed(
         TargetId::Gpu(Backend::AmdGcn(_) | Backend::Nvptx) => {
             bf16_const_feeds_only_packed_readers(g, views, id)
         }
-        // An AIE core has no BF16 lane: the const stays unpacked and the BF16 consumers refuse.
-        TargetId::Aie(_) => false,
+        // An AIE core has no BF16 lane: the const stays unpacked and the BF16 consumers refuse; neither does a VPU.
+        TargetId::Aie(_) | TargetId::Vpu(_) => false,
     }
 }
 

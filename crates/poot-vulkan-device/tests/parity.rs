@@ -532,3 +532,45 @@ fn greedy_sample_token_is_exact_on_vulkan() {
     };
     poot_executor_parity::sample_token::assert_greedy_pick_is_exact(exec.as_mut(), target);
 }
+
+/// POOT-1143 stage 2: the indexer's block selection (ties straddling the cut, fewer complete blocks than `k`,
+/// queries as rows by tokens, a wide row, all scores equal) runs through the generated radix-select kernel
+/// on the device, and its words equal both the plain stable-sort selection (computed here without the oracle)
+/// and the oracle's primitive definition at every replayed step.
+/// Mutation: in `block_top_k.rs` take the last equal blocks at the threshold instead of the first (ties
+/// ascending by block); the ties case goes red.
+#[test]
+fn block_top_k_selects_what_the_plain_selection_selects_on_vulkan() {
+    let Some((mut exec, target)) = vulkan() else {
+        return;
+    };
+    for case in poot_executor_parity::block_top_k::cases() {
+        poot_executor_parity::block_top_k::assert_device_selects(exec.as_mut(), target, &case);
+        if case.oracle {
+            assert_matches_oracle(exec.as_mut(), target, &case.fixture);
+        }
+    }
+}
+
+/// POOT-1143 stage 3: attention over the blocks a selection names (a GQA decode, a prefill with empty and short
+/// selections, every block selected, and the design's deep decode: 24 query heads over 2 of 256, 32768 positions,
+/// 512 blocks selected) runs through the generated kernel on the device and equals the independent f64 attention
+/// over the selected keys within the tier-2 tolerance, and the oracle's dense definition where it is cheap.
+/// Mutation: in `block_candidate` read the unfinished block's start one block early; the queries take keys of a
+/// block that is not their own and the first case goes red.
+#[test]
+fn selected_attention_reads_exactly_the_selected_blocks_on_vulkan() {
+    let Some((mut exec, target)) = vulkan() else {
+        return;
+    };
+    for case in poot_executor_parity::selected_attention::all() {
+        poot_executor_parity::selected_attention::assert_device_attends(
+            exec.as_mut(),
+            target,
+            &case,
+        );
+        if case.oracle {
+            assert_matches_oracle(exec.as_mut(), target, &case.fixture);
+        }
+    }
+}

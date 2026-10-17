@@ -17,7 +17,7 @@ gpu = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '''
-package(poot-npu) | package(poot-wgpu-device) | package(poot-wgpu-runtime) | package(poot-kernelgen)
+package(poot-npu) | package(poot-l0-runtime) | package(poot-wgpu-device) | package(poot-wgpu-runtime) | package(poot-kernelgen)
 | package(poot-rocm-device) | package(poot-rocm-runtime) | package(poot-vulkan-runtime) | package(poot-vulkan-device)
 | package(poot-ptx-device) | package(poot-ptx-runtime)
 | (package(pootc) & (binary(import_run) | binary(macro_kernel)))
@@ -62,5 +62,13 @@ path = "results.xml"
 store-success-output = true
 
 [profile.device-npu.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-vpu.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-l0.junit]
 path = "results.xml"
 store-success-output = true

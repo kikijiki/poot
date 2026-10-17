@@ -971,6 +971,19 @@ pub enum ShapeError {
         dtype: DType,
     },
 
+    /// A block top-k keeps `k` of the `blocks` blocks of `ratio` positions: `ratio >= 1`, `1 <= k <= blocks`.
+    #[error(
+        "block top-k needs ratio >= 1 and 1 <= k <= blocks, got ratio {ratio}, k {k}, blocks {blocks}"
+    )]
+    BlockTopK {
+        /// The positions each block covers.
+        ratio: usize,
+        /// The blocks kept per query.
+        k: usize,
+        /// The blocks the scores rank.
+        blocks: usize,
+    },
+
     /// The operation does not accept the dtype.
     #[error("{op} does not support {dtype}")]
     DtypeOp {
@@ -1164,6 +1177,15 @@ pub enum ShapeError {
         expected: Vec<usize>,
         /// The operand's shape.
         actual: Vec<usize>,
+    },
+
+    /// A selected attention keeps `k >= 1` blocks of `ratio >= 1` positions per query.
+    #[error("selected attention needs ratio >= 1 and k >= 1, got ratio {ratio}, k {k}")]
+    SelectedAttention {
+        /// The positions each block covers.
+        ratio: usize,
+        /// The blocks each query reads.
+        k: usize,
     },
 
     /// An attention operand's dtype differs from the query's.

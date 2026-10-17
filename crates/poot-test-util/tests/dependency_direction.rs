@@ -65,6 +65,7 @@ const RANKS: &[(&str, u8)] = &[
     ("poot-load", 3),
     ("poot-wgpu-runtime", 3),
     ("poot-rocm-runtime", 3),
+    ("poot-l0-runtime", 3),
     ("poot-ptx-runtime", 3),
     // 4: the CPU oracle and the raw Vulkan runtime
     ("poot-eval", 4),

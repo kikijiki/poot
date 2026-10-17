@@ -1,0 +1,45 @@
+# POOT-1143 stages 2 and 3: device times of the block top-k and selected-attention kernels.
+#
+# POOT-1166: the block top-k rows below are re-measured after the packed-count radix select (7 passes of 5 bits, or
+# 8 of 4, down from 11 of 3; kernelgen/src/block_top_k.rs). wgpu 32768 blocks: median 1862.8 -> 219.4 us, floor 1494.9 -> 210.2.
+# rocm 32768 blocks: floor 289.3 -> 133.6 us, median 1389.5 -> 1499.4 (the rocm rows are noisy between holds). The
+# paragraph on "11 passes" below describes the state before POOT-1166. The other rows are unchanged from POOT-1143.
+#
+# Produced by `block_top_k_and_selected_attention_device_times` (poot-wgpu-device and poot-rocm-device,
+# tests/selected_attention_receipt.rs) on the Strix Halo iGPU (gfx1151), device timestamps (never host wall),
+# fixtures interleaved A B / B A over 4 rounds of 8 steps, the first step of every visit dropped: 32 samples.
+# Columns: backend, fixture, median_us, min_us, max_us, samples.
+# The box is shared (desktop, other lanes' non-GPU-locked work): single numbers move ~30% between holds and the
+# spread here is wider. Read the min as the kernel's floor and the median as what a step sees.
+#
+# What it says against the design (flash-next-qsa-depth.md section 4.2):
+# - The design claimed a 3-pass radix select (12/12/8 bits, 4096 bins) at ~10-30 us per row. The kernel here is
+#   11 passes (2 + 10x3 bits) that each re-read the row from global memory: LLVM's SPIR-V backend miscompiles
+#   the workgroup atomic a histogram needs (see kernelgen/src/block_top_k.rs), so each lane counts into a row of
+#   its own, and a 4096-bin table does not fit the 16 KiB of workgroup memory a Vulkan device guarantees.
+#   At 32768 blocks (128K positions) it takes ~1.4-1.9 ms median (0.29-1.5 ms floor) per layer call: about 50-150x the
+#   design figure (the floor is ~10-30x), so twelve layers spend ~17-22 ms of a decode step in the selection.
+# - It scales with the row (2048 -> 32768 blocks: ~5x on the floor, ~6x on the median), as 11 passes over a
+#   resident row should; nothing quadratic is left.
+# - The selected attention does not scale with depth (32K -> 128K positions: rocm 1.1 -> 1.8 ms median, wgpu
+#   14.5 -> 13.8 ms) and is ~12x (32K) and ~48x (128K) faster than the dense attention over the same cache on
+#   rocm (21.9 and 84.7 ms median). wgpu's dense row is timed at 32K only: the 128K dense dispatch lost the RADV
+#   context on this box ("context is lost ... guilty of a hard recovery"); the selected row at 128K ran.
+# - wgpu runs the selected attention ~10x slower than rocm (14 vs 1.1-1.8 ms): its 16 KiB of workgroup memory
+#   leaves few lanes per row (attention_lanes), so each lane walks many candidates serially.
+# Before the split-KV rule divided the candidates, wgpu took 51 ms for the selected row.
+#
+# Not run: PTX (no NVIDIA device on this box). poot-ptx-device/tests/selected_attention_receipt.rs is the same row.
+rocm	block_top_k_2048_blocks	76.0	15.4	459.5	32
+rocm	block_top_k_8192_blocks	504.7	35.5	811.6	32
+rocm	block_top_k_32768_blocks	1499.4	133.6	2758.0	32
+rocm	selected_attention_deep_decode_32768	1066.7	380.8	8568.1	32
+rocm	dense_attention_deep_decode_32768	21890.7	14205.6	29459.7	32
+rocm	selected_attention_deep_decode_131072	1779.4	298.8	7138.6	32
+rocm	dense_attention_deep_decode_131072	84652.7	54148.9	797227.5	32
+wgpu	block_top_k_2048_blocks	29.6	28.5	45.8	32
+wgpu	block_top_k_8192_blocks	61.3	60.6	69.9	32
+wgpu	block_top_k_32768_blocks	219.4	210.2	234.8	32
+wgpu	selected_attention_deep_decode_32768	14537.9	11284.9	19394.6	32
+wgpu	dense_attention_deep_decode_32768	174248.9	137873.9	225917.8	32
+wgpu	selected_attention_deep_decode_131072	13797.8	9687.6	20084.6	32

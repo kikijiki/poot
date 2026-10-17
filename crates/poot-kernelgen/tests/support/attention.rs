@@ -60,6 +60,7 @@ pub(crate) fn attention_reference_keys(
     let mask_heads = match spec.mask {
         MaskKind::Broadcast => 1,
         MaskKind::PerHead => hq,
+        MaskKind::Blocks { .. } => unreachable!("the dense reference takes an additive mask"),
     };
     let (scale, softcap) = match spec.score {
         ScoreTransform::Scale { scale_bits } => (f32::from_bits(scale_bits), None),

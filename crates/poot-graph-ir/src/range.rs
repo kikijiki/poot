@@ -3,6 +3,7 @@
 //! Every I32 value gets one proven interval of the words it can hold. The facts have two sources:
 //!
 //! - the equations: `Iota(n)` is `[0, n)`, `ArgTopK` ids over an axis of extent `E` are `[0, E)`, a
+//!   `BlockTopK` result is `[-1, blocks)`, a
 //!   comparison is `[0, 2)`, `Select` the union of its two branches, `Add`/`Sub`/`Mul` interval
 //!   arithmetic, a movement op keeps its operand's range, a `Gather` reads a subset of its table;
 //! - the inputs: a slot declares its range at construction
@@ -255,6 +256,15 @@ fn equation_range(
                 .unwrap_or(IndexRange::I32),
             _ => IndexRange::I32,
         },
+        // The packed ids and indicator: ids `-1..blocks`, the indicator `0` or `1`.
+        OpKind::BlockTopK(_) => inputs
+            .first()
+            .and_then(|operand| match operand {
+                Operand::Value(id) => graph.aval(*id).shape.last().copied(),
+                Operand::Lit(_) => None,
+            })
+            .and_then(|blocks| IndexRange::new(-1, i64::try_from(blocks.max(2)).ok()?))
+            .unwrap_or(IndexRange::I32),
         OpKind::SampleToken { .. } => match inputs.first() {
             // `(token, non_finite_index)`: the token is a logits column; the second word is `-1` or the lowest
             // non-finite index, also a column.

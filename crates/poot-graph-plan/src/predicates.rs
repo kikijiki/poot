@@ -26,8 +26,8 @@ use poot_kernelgen::{ContractionSpec, KernelRequest};
 /// The codegen capability query for the target (card 522, R468-014). `Backend`'s `AmdGcn` payload already
 /// carries the same `AmdArch` `poot_codegen::Target::AmdGcn` takes, so the conversion is a bare re-tag, not
 /// a new dependency.
-fn codegen_capability(target: TargetId) -> poot_codegen::Capability {
-    poot_codegen::capability(poot_codegen::Target::from(target))
+fn codegen_capability(target: poot_codegen::Target) -> poot_codegen::Capability {
+    poot_codegen::capability(target)
 }
 
 /// The value-operand ids of an eqn, in order (literals dropped) - these are the kernel's data params.
@@ -167,7 +167,10 @@ fn is_movement_view_candidate(op: &OpKind) -> bool {
 /// state pair) keeps its own materialized buffer, so a validation packet can copy it row-major from offset 0.
 pub fn compute_views(g: &Graph, target: impl Into<TargetId>) -> HashMap<ValueId, Layout> {
     let mut views: HashMap<ValueId, Layout> = HashMap::new();
-    if !codegen_capability(target.into()).strided_views {
+    // A target that compiles no kernel bodies (a VPU) has no strided-view bodies to read a view through.
+    let strided = poot_codegen::Target::try_from(target.into())
+        .is_ok_and(|target| codegen_capability(target).strided_views);
+    if !strided {
         return views;
     }
     let cons = consumers(g.into());
@@ -599,7 +602,7 @@ pub(crate) fn attention_splits(
     let wanted = (compute_units * WORKGROUPS_PER_COMPUTE_UNIT).div_ceil(rows);
     let splits = wanted
         .min(MAX_ATTENTION_SPLITS)
-        .min(spec.lk / MIN_KEYS_PER_SPLIT);
+        .min(spec.candidates() / MIN_KEYS_PER_SPLIT);
     if splits < 2 || rows >= compute_units {
         return None;
     }

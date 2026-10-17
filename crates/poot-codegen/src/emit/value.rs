@@ -4,7 +4,8 @@ use crate::spirv_postprocess::NO_CONTRACT_MARKER;
 
 use super::{
     AtomicOp, BinOp, EmitError, Emitter, Fp8Format, NO_CONTRACT_STRICTFP_ATTR, Operand, ResultTy,
-    Rvalue, Target, Ty, align_of, binop_inst, float_bits, int_bits, positive_e4m3fn_value,
+    Rvalue, Target, Ty, align_of, binop_inst, float_bits, int_bits, intrinsic_overload,
+    positive_e4m3fn_value,
 };
 
 impl<'a> Emitter<'a> {
@@ -57,7 +58,8 @@ impl<'a> Emitter<'a> {
             // Atomic RMW on a workgroup-local (LDS, addrspace 3) array element, returning the old value: the
             // intra-workgroup counterpart of GlobalAtomic, for in-tile reductions and histograms. One workgroup is
             // co-resident, so there is no forward-progress concern and it verifies on RADV directly. Same atomicrmw
-            // lowering as GlobalAtomic (including the `syncscope` fix; see `atomic_syncscope`).
+            // lowering as GlobalAtomic, but ordered at workgroup scope: only the workgroup reaches LDS (see
+            // `workgroup_atomic_syncscope`).
             Rvalue::WorkgroupLocalAtomic {
                 idx,
                 value,
@@ -98,7 +100,7 @@ impl<'a> Emitter<'a> {
                 );
                 let t = self.fresh();
                 let align = align_of(&elem);
-                let scope = self.atomic_syncscope();
+                let scope = self.workgroup_atomic_syncscope();
                 let _ = writeln!(
                     w,
                     "  {t} = atomicrmw {inst} ptr addrspace(3) {p}, {elem} {v} {scope}monotonic, align {align}"
@@ -560,7 +562,7 @@ impl<'a> Emitter<'a> {
         match op {
             poot_kernel_ir::IntScalarOp::LeadingZeros => match self.target {
                 Target::SpirvVulkan | Target::AieCore => self.emit_clz_i32_software(&va, w),
-                Target::Nvptx | Target::AmdGcn(_) => {
+                Target::Nvptx | Target::SpirvOpenCl | Target::AmdGcn(_) => {
                     self.declares
                         .insert("declare i32 @llvm.ctlz.i32(i32, i1)".into());
                     let t = self.fresh();
@@ -649,7 +651,7 @@ impl<'a> Emitter<'a> {
         w: &mut String,
     ) -> Result<(String, String), EmitError> {
         match self.target {
-            Target::SpirvVulkan => {
+            Target::SpirvVulkan | Target::SpirvOpenCl => {
                 self.declares
                     .insert(format!("declare {ty} @llvm.exp.f32({ty})"));
                 let t = self.fresh();
@@ -773,7 +775,7 @@ impl<'a> Emitter<'a> {
         w: &mut String,
     ) -> Result<(String, String), EmitError> {
         match self.target {
-            Target::SpirvVulkan => {
+            Target::SpirvVulkan | Target::SpirvOpenCl => {
                 self.declares
                     .insert(format!("declare {ty} @llvm.log.f32({ty})"));
                 let t = self.fresh();
@@ -903,15 +905,18 @@ impl<'a> Emitter<'a> {
         }
         // Min/Max lower to an intrinsic call, not a plain binary instruction.
         if matches!(op, BinOp::Min | BinOp::Max) {
-            let intrin = match (op, is_float) {
-                (BinOp::Min, true) => "llvm.minnum.f32",
-                (BinOp::Max, true) => "llvm.maxnum.f32",
-                (BinOp::Min, false) if signed => "llvm.smin.i32",
-                (BinOp::Min, false) => "llvm.umin.i32",
-                (BinOp::Max, false) if signed => "llvm.smax.i32",
-                (BinOp::Max, false) => "llvm.umax.i32",
+            // The intrinsic is overloaded on the operand type, so its name carries that type's width.
+            let overload = intrinsic_overload(&tya)?;
+            let stem = match (op, is_float) {
+                (BinOp::Min, true) => "minnum",
+                (BinOp::Max, true) => "maxnum",
+                (BinOp::Min, false) if signed => "smin",
+                (BinOp::Min, false) => "umin",
+                (BinOp::Max, false) if signed => "smax",
+                (BinOp::Max, false) => "umax",
                 _ => unreachable!(),
             };
+            let intrin = format!("llvm.{stem}.{overload}");
             self.declares
                 .insert(format!("declare {tya} @{intrin}({tya}, {tya})"));
             let t = self.fresh();
@@ -985,6 +990,15 @@ impl<'a> Emitter<'a> {
         if self.target == Target::AieCore {
             return Err(EmitError::Unsupported(
                 "BinaryOpNoContract on AieCore: card 628 wires SpirvVulkan/AmdGcn/Nvptx only"
+                    .into(),
+            ));
+        }
+        // The backend translates no fast-math flag into a `NoContraction` decoration, and the stub-call
+        // rewrite that carries it on Vulkan (`spirv_postprocess::fix_no_contraction`) is not wired for the
+        // OpenCL module shape. Refuse rather than emit an unmarked subtract.
+        if self.target == Target::SpirvOpenCl {
+            return Err(EmitError::Unsupported(
+                "BinaryOpNoContract on SpirvOpenCl: no NoContraction decoration is emitted for OpenCL SPIR-V"
                     .into(),
             ));
         }

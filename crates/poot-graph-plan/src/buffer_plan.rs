@@ -28,6 +28,7 @@
 //! index, so a scratch never shares a slot with them; it does share with any earlier or later
 //! equation's scratch or temporary.
 
+use crate::compile::Region;
 use crate::graph_validation::ValidationPacketPlan;
 use crate::state_commit::StateCommitPlan;
 use crate::types::GraphStorage;
@@ -168,14 +169,33 @@ impl SlotInfo {
 /// already runs) to the last equation that reads it, inclusive: an equation that both reads a value
 /// last and produces a new one is one dispatch with distinct input/output buffers, so the two are
 /// always treated as live at once and never share a slot.
+///
+/// A [`Region`] runs as one invocation, at the position of its last equation: its reads are all alive until
+/// then and its returned values are born then, so no slot is shared between a region's reads and its
+/// writes. A value an equation of a region produces that only the region itself reads lives in the artifact
+/// (tile to tile) and has no slot.
 pub(crate) fn plan_buffers(
     g: &Graph,
     plans: &[Plan],
     storage: &GraphStorage,
     state_commit: &StateCommitPlan,
     validation: &ValidationPacketPlan,
+    regions: &[Region],
 ) -> BufferPlan {
     let n = g.eqns().len();
+    // The equation index at which each equation's reads and writes happen: its own, or its region's last.
+    let mut at: Vec<usize> = (0..n).collect();
+    let mut inside_region: HashSet<ValueId> = HashSet::new();
+    for region in regions {
+        let members = region.members();
+        for eqn_idx in members.clone() {
+            at[eqn_idx] = members.end - 1;
+            let out = g.eqns()[eqn_idx].out;
+            if !region.writes().contains(&out) {
+                inside_region.insert(out);
+            }
+        }
+    }
     let mut roots: ValueTable<ValueId> = g.values().ids().collect();
     let mut birth: HashMap<BufferKey, usize> = HashMap::new();
     let mut death: HashMap<BufferKey, usize> = HashMap::new();
@@ -202,8 +222,8 @@ pub(crate) fn plan_buffers(
                     eqn: eqn_idx,
                     id: ScratchId::new(index as u32),
                 };
-                birth.insert(key, eqn_idx);
-                death.insert(key, eqn_idx);
+                birth.insert(key, at[eqn_idx]);
+                death.insert(key, at[eqn_idx]);
                 elems.insert(key, decl.elems());
                 store_of.insert(key, decl.storage());
             }
@@ -211,6 +231,10 @@ pub(crate) fn plan_buffers(
         // Donated in place: `Engine::load_entry`'s `out_loc` writes this output
         // straight into the paired state buffer, never a local allocation - no slot to assign.
         if state_commit.inplace.contains_key(&eqn.out) {
+            continue;
+        }
+        // Read only by the equations of its own region: it moves tile to tile and never reaches memory.
+        if inside_region.contains(&eqn.out) {
             continue;
         }
         let value_storage = storage.storage(eqn.out).buffer_storage();
@@ -221,8 +245,8 @@ pub(crate) fn plan_buffers(
             continue;
         };
         let key = BufferKey::Value(eqn.out);
-        birth.insert(key, eqn_idx);
-        death.insert(key, eqn_idx);
+        birth.insert(key, at[eqn_idx]);
+        death.insert(key, at[eqn_idx]);
         elems.insert(key, value_elems);
         store_of.insert(key, value_storage);
     }
@@ -233,7 +257,7 @@ pub(crate) fn plan_buffers(
         for value in value_ids(eqn) {
             let root = roots[value];
             if let Some(d) = death.get_mut(&BufferKey::Value(root)) {
-                *d = (*d).max(eqn_idx);
+                *d = (*d).max(at[eqn_idx]);
             }
         }
     }

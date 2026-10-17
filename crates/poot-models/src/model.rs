@@ -413,6 +413,10 @@ pub enum WiringError {
     /// family guarantees the low-rank query beside every selector.
     #[error("a key-position selector needs the low-rank query")]
     SelectorWithoutLowRankQuery,
+    /// A block selection was asked of an attention that sinks, a window or ALiBi bias the scores: the
+    /// selected-block kernel reads dense keys under the plain causal scores only.
+    #[error("a block selection needs plain causal scores (no sinks, window or ALiBi)")]
+    SelectionWithBiasedScores,
     /// A step with slot maps was traced against a contiguous KV layout.
     #[error("a step with slot maps must be paged")]
     SlotMapsOnContiguousStep,

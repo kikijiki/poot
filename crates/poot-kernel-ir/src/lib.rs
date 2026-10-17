@@ -13,6 +13,7 @@
 pub mod fixtures;
 pub mod interp;
 pub mod naming;
+pub mod serialize;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 

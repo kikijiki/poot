@@ -7,7 +7,10 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::Toolchain;
+use poot_runtime_common::{AieShapeAbi, ArgAccess};
+use poot_target::AieTargetId;
+
+use crate::{AieFifo, AieLinkRecipe, AieTile, FifoEnd, Toolchain};
 
 fn script(dir: &Path, name: &str, body: &str) -> String {
     let path = dir.join(name);
@@ -18,14 +21,15 @@ fn script(dir: &Path, name: &str, body: &str) -> String {
 }
 
 /// A [`Toolchain`] whose Peano (`POOT_AIE_LLC`) and, when `with_iron`, IRON (`POOT_AIE_IRON`) drivers are
-/// scripts under `dir` that follow the documented driver protocol and write plausible outputs.
+/// scripts under `dir` that follow the documented driver protocol and write plausible outputs (the "object"
+/// is an ELF header followed by the IR it was compiled from, so it names its kernel symbol).
 pub fn scripted_toolchain(dir: &Path, with_iron: bool) -> Toolchain {
     let peano = script(
         dir,
         "peano",
         r#"case "$1" in --version) echo "fake-peano (aie2p)"; exit 0;; esac
-for last; do :; done
-printf '\177ELF' > "$last"; printf 'poot_seq_binary' >> "$last""#,
+for arg; do case "$prev" in -o) out="$arg";; esac; case "$arg" in *.ll) ll="$arg";; esac; prev="$arg"; done
+printf '\177ELF' > "$out"; cat "$ll" >> "$out""#,
     );
     let iron = script(
         dir,
@@ -39,4 +43,40 @@ printf 'xclbin2\0payload' > "$x"; printf 'IIII' > "$i""#,
         "POOT_AIE_IRON" => with_iron.then(|| iron.clone()),
         _ => None,
     })
+}
+
+/// The recipe of a region of one tile whose body takes `abi`'s bindings, in order: each read binding is a
+/// host-to-tile FIFO and each written one a tile-to-host FIFO. The shape every region of one equation has,
+/// for a test that links a single body against a hand-built ABI.
+pub fn single_tile_recipe(target: AieTargetId, abi: &AieShapeAbi) -> AieLinkRecipe {
+    let fifos = abi
+        .bindings()
+        .iter()
+        .enumerate()
+        .map(|(binding, b)| {
+            let (host, tile) = (
+                FifoEnd::Host { binding },
+                FifoEnd::Tile {
+                    tile: 0,
+                    port: binding,
+                },
+            );
+            let (producer, consumer) = match b.access() {
+                ArgAccess::Read => (host, tile),
+                ArgAccess::Write => (tile, host),
+            };
+            AieFifo {
+                producer,
+                consumers: vec![consumer],
+                depth: AieLinkRecipe::FIFO_DEPTH,
+                elements: b.elements(),
+                element: b.storage().element(),
+            }
+        })
+        .collect();
+    let tile = AieTile {
+        ports: (0..abi.bindings().len()).collect(),
+    };
+    AieLinkRecipe::new(target, abi.clone(), vec![tile], fifos)
+        .expect("one tile over a shape ABI is a region")
 }

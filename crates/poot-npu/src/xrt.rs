@@ -203,6 +203,35 @@ impl XrtBo {
         unsafe { std::ptr::copy(src.map.as_ptr(), self.map.as_ptr(), self.len) };
     }
 
+    /// Copy `len` bytes of `src`'s mapping, from `src_offset`, over this buffer's mapping from `offset`.
+    /// Both ranges must lie inside their buffers; the two buffers may be the same one only if the ranges do
+    /// not overlap meaningfully (the copy is a `memmove`, so overlap is safe, not useful).
+    pub(crate) fn copy_range_from(
+        &self,
+        offset: usize,
+        src: &XrtBo,
+        src_offset: usize,
+        len: usize,
+    ) {
+        assert!(
+            offset <= self.len && len <= self.len - offset,
+            "destination range outside the buffer"
+        );
+        assert!(
+            src_offset <= src.len && len <= src.len - src_offset,
+            "source range outside the buffer"
+        );
+        // SAFETY: both ranges are inside their mappings, which live as long as the buffers; `copy` handles
+        // overlap, so `src` and `self` being the same buffer is sound.
+        unsafe {
+            std::ptr::copy(
+                src.map.as_ptr().add(src_offset),
+                self.map.as_ptr().add(offset),
+                len,
+            );
+        }
+    }
+
     /// Make the host's writes to `offset..offset + size` visible to the device.
     pub(crate) fn sync_to_device(&self, offset: usize, size: usize) -> Result<(), XrtError> {
         self.sync(true, offset, size)

@@ -1,5 +1,5 @@
 //! POOT-1038 acceptance on PTX, kept as the standing proof that a routed-expert prefill needs no guard: the
-//! qwen38 routed-expert prefill compiles through the full pipeline (`flash_attention_capped` and `fuse` run, the
+//! qwen38 routed-expert prefill compiles through the full pipeline (`fuse` runs, its attention is the block-selected kernel, the
 //! router contraction plans a generated tiled schedule) and completes on the live device, with the CPU
 //! oracle's logits.
 //!
@@ -9,8 +9,8 @@
 //! cause was ROCm HSA signal churn (cured), and no PTX hang was ever observed. A hang is a red row, not a skip:
 //! a watchdog thread aborts the process after [`DEADLINE`].
 //!
-//! Mutations (observed red): skipping `flash_attention_capped` in `poot-graph-plan/src/compile.rs`'s `compile`
-//! fails the plan row before any launch ("flash_attention_capped: the program runs it"); `DEADLINE` of 1 ms
+//! Mutations (observed red): skipping `fuse` in `poot-graph-plan/src/compile.rs`'s `compile`
+//! fails the plan row before any launch ("fuse: the program runs it"); `DEADLINE` of 1 ms
 //! aborts the process with "HANG: routed prefill did not complete within 1ms".
 
 use std::sync::{Arc, mpsc};
@@ -239,9 +239,9 @@ fn routed_prefill_unguarded_ptx() {
     );
     // The plan rows run before anything executes: a plan without the passes is a red row without a launch.
     let facts = plan(&graph, &target, 4);
-    for pass in ["flash_attention_capped", "fuse"] {
-        assert!(facts.passes.contains(&pass), "{pass}: the program runs it");
-    }
+    // The QSA layer's attention is the block-selected op, planned straight to its kernel: no dense attention
+    // for `flash_attention_capped` to fuse, which the dense families' rows still assert.
+    assert!(facts.passes.contains(&"fuse"), "fuse: the program runs it");
     assert!(
         facts.tiled_routers > 0,
         "the router-logits contraction plans a generated tiled schedule"

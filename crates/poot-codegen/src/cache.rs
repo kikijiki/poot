@@ -362,6 +362,7 @@ fn cache_kind(target: Target) -> &'static str {
     match target {
         Target::Nvptx => "ptx",
         Target::SpirvVulkan => "spirv",
+        Target::SpirvOpenCl => "spirv-opencl",
         Target::AmdGcn(_) => "rocm",
         Target::AieCore => "aie",
     }

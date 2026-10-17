@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run a command with exactly one backend made mandatory.
 #
-#   with-required-backend.sh POOT_REQUIRE_{WGPU,VULKAN,ROCM,PTX,NPU} command [args...]
+#   with-required-backend.sh POOT_REQUIRE_{WGPU,VULKAN,ROCM,PTX,NPU,INTEL_NPU} command [args...]
 #
 # Two guarantees, both independent of the tests the command runs:
 #   1. Only the selected POOT_REQUIRE_* variable is set; every other one is cleared.
@@ -16,6 +16,7 @@ readonly backend_vars=(
   POOT_REQUIRE_ROCM
   POOT_REQUIRE_PTX
   POOT_REQUIRE_NPU
+  POOT_REQUIRE_INTEL_NPU
 )
 
 # Succeeds when a device for the backend is visible. Each probe reads the tool's own view of the machine, so
@@ -40,6 +41,12 @@ probe_device() {
       listing=$(xrt-smi examine 2>/dev/null || true)
       grep -qE '^\|\[[0-9a-fA-F:.]+\] +\|NPU ' <<<"$listing"
       ;;
+    POOT_REQUIRE_INTEL_NPU)
+      # The Intel NPU is a compute accelerator the `intel_vpu` kernel driver owns: the module is loaded
+      # when the device is probed. Whether the user-mode stack then opens it is the test's own contract.
+      listing=$(lsmod 2>/dev/null || true)
+      grep -qE '^intel_vpu ' <<<"$listing"
+      ;;
   esac
 }
 
@@ -52,6 +59,7 @@ run_with_only() {
     -u POOT_REQUIRE_ROCM \
     -u POOT_REQUIRE_PTX \
     -u POOT_REQUIRE_NPU \
+    -u POOT_REQUIRE_INTEL_NPU \
     "$selected=1" \
     "$@"
 }
@@ -74,6 +82,10 @@ make_stub_tools() {
   local xrt_line=''
   [[ "$state" == "present" ]] && xrt_line='|[0000:c7:00.1]  |NPU Strix Halo  |aie2p         |6x8       |'
   printf '#!/bin/sh\n[ -n "%s" ] && echo "%s"\nexit 0\n' "$xrt_line" "$xrt_line" >"$dir/xrt-smi"
+  local lsmod_line=''
+  [[ "$state" == "present" ]] && lsmod_line='intel_vpu             401408  0'
+  printf '#!/bin/sh\n[ -n "%s" ] && echo "%s"\nexit 0\n' "$lsmod_line" "$lsmod_line" >"$dir/lsmod"
+  chmod +x "$dir/lsmod"
   chmod +x "$dir/vulkaninfo" "$dir/rocminfo" "$dir/nvidia-smi" "$dir/xrt-smi"
 }
 
@@ -137,9 +149,9 @@ fi
 selected=${1:-}
 shift || true
 case "$selected" in
-  POOT_REQUIRE_WGPU | POOT_REQUIRE_VULKAN | POOT_REQUIRE_ROCM | POOT_REQUIRE_PTX | POOT_REQUIRE_NPU) ;;
+  POOT_REQUIRE_WGPU | POOT_REQUIRE_VULKAN | POOT_REQUIRE_ROCM | POOT_REQUIRE_PTX | POOT_REQUIRE_NPU | POOT_REQUIRE_INTEL_NPU) ;;
   *)
-    echo "usage: $0 POOT_REQUIRE_{WGPU,VULKAN,ROCM,PTX,NPU} command [args...]" >&2
+    echo "usage: $0 POOT_REQUIRE_{WGPU,VULKAN,ROCM,PTX,NPU,INTEL_NPU} command [args...]" >&2
     exit 2
     ;;
 esac

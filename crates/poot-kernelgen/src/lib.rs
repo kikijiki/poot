@@ -7,6 +7,7 @@
 //! standard skeleton is `i = tid.x; if i < out.len() { ... }`.
 
 mod attention;
+mod block_top_k;
 mod contraction;
 mod data_movement;
 mod elementwise;
@@ -33,13 +34,14 @@ pub use attention::{
 
 // The one generation seam. `poot-graph-plan` plans every generated kernel through `generate` and the request
 // types; nothing else it needs from this crate is a generator.
+pub use block_top_k::{BlockTopKSpec, LANES as BLOCK_TOP_K_LANES};
 pub use error::{BodyResource, BodyStage, KernelGenError};
 pub use request::{
-    BodyUse, CastSpec, ContractionSpec, ElementwiseSpec, Fold, FragmentUse, Generated, I32Binary,
-    IndexedContraction, KernelRequest, KernelRequirements, Launch, MatmulShapes, PackedContraction,
-    PackedRequest, PackedRows, PointwiseForm, PointwiseSpec, RopeSpec, RowSpec, SequentialBinding,
-    SequentialGenerated, SerialWork, TopKSpec, UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand,
-    fold_groups, generate, sequential_schedule,
+    AieOp, BodyUse, CastSpec, ContractionSpec, ElementwiseSpec, ErrorBound, Fold, FragmentUse,
+    Generated, I32Binary, IndexedContraction, KernelRequest, KernelRequirements, Launch,
+    MatmulShapes, NumericalContract, PackedContraction, PackedRequest, PackedRows, PointwiseForm,
+    PointwiseSpec, RopeSpec, RowSpec, SerialWork, SerializedBinding, SerializedGenerated, TopKSpec,
+    UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand, fold_groups, generate, serialized_schedule,
 };
 pub use scan::{ScanKernel, ScanPhase, ScanSpec};
 

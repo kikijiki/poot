@@ -1,5 +1,9 @@
 use std::fmt::Write as _;
 
+/// SPIR-V memory semantics of the OpenCL workgroup barrier: `AcquireRelease` (0x8) ordering over
+/// `WorkgroupMemory` (0x100) and `CrossWorkgroupMemory` (0x200).
+const OPENCL_BARRIER_SEMANTICS: u32 = 0x8 | 0x100 | 0x200;
+
 use super::{
     BTreeSet, BlockId, Body, EmitError, Emitter, Local, MemoryOrdering, MemoryScope, Operand,
     Place, Statement, Target, Terminator, Ty, align_of,
@@ -36,7 +40,7 @@ impl<'a> Emitter<'a> {
                 // AIE is a 32-bit core, so usize is i32 (as on SPIR-V). NVPTX is the 64-bit outlier; AMDGPU follows NVPTX
                 // (the flat kernarg ABI uses i64 lengths, see `emit_signature`).
                 Target::SpirvVulkan | Target::AieCore => "i32".into(),
-                Target::Nvptx | Target::AmdGcn(_) => "i64".into(),
+                Target::Nvptx | Target::SpirvOpenCl | Target::AmdGcn(_) => "i64".into(),
             },
             Ty::F16 => "half".into(),
             // bf16 is NVPTX-only: the LLVM SPIR-V backend rejects `bfloat` without SPV_KHR_bfloat16, which the
@@ -44,7 +48,7 @@ impl<'a> Emitter<'a> {
             // llc error; the SPIR-V/wgpu path stays f32/f16.
             Ty::BF16 => match self.target {
                 Target::Nvptx => "bfloat".into(),
-                Target::SpirvVulkan => {
+                Target::SpirvVulkan | Target::SpirvOpenCl => {
                     return Err(EmitError::Unsupported(
                         "bf16 compute is NVPTX-only (SPIR-V needs SPV_KHR_bfloat16, unsupported on the Arc)"
                             .into(),
@@ -72,7 +76,7 @@ impl<'a> Emitter<'a> {
                     let inner = self.scalar_llty(elem)?;
                     format!("<{lanes} x {inner}>")
                 }
-                Target::Nvptx | Target::AmdGcn(_) | Target::AieCore => {
+                Target::Nvptx | Target::SpirvOpenCl | Target::AmdGcn(_) | Target::AieCore => {
                     return Err(EmitError::Unsupported(format!(
                         "Ty::Vec{{elem={elem:?}, lanes={lanes}}} on {:?}: vector codegen is \
                          SpirvVulkan-only in this increment (spec 134 P1); NVPTX/AMDGCN lowering is a \
@@ -90,7 +94,7 @@ impl<'a> Emitter<'a> {
             Target::SpirvVulkan | Target::AieCore => "i32",
             // NVPTX and AMDGPU both use i64 for `usize`; the flat kernarg ABI declares lengths as i64 (see
             // `emit_signature`; the AMDGPU signature mirrors NVPTX).
-            Target::Nvptx | Target::AmdGcn(_) => "i64",
+            Target::Nvptx | Target::SpirvOpenCl | Target::AmdGcn(_) => "i64",
         }
     }
 
@@ -103,8 +107,24 @@ impl<'a> Emitter<'a> {
     /// correctly.
     pub(super) fn atomic_syncscope(&self) -> &'static str {
         match self.target {
-            Target::SpirvVulkan => "syncscope(\"device\") ",
+            Target::SpirvVulkan | Target::SpirvOpenCl => "syncscope(\"device\") ",
             Target::Nvptx | Target::AmdGcn(_) | Target::AieCore => "",
+        }
+    }
+
+    /// The `atomicrmw` syncscope prefix (with trailing space) for an atomic on workgroup-local (LDS, addrspace 3)
+    /// memory. Only the workgroup's threads can reach LDS, so the ordering scope is the workgroup, not the device
+    /// (`atomic_syncscope`): the target's workgroup scope name is the one `fence_syncscope` gives
+    /// `MemoryScope::Workgroup`. AieCore keeps the default scope, as for every other atomic on it.
+    pub(super) fn workgroup_atomic_syncscope(&self) -> String {
+        match self.target {
+            Target::AieCore => String::new(),
+            Target::Nvptx | Target::AmdGcn(_) | Target::SpirvVulkan | Target::SpirvOpenCl => {
+                format!(
+                    "syncscope(\"{}\") ",
+                    self.fence_syncscope(MemoryScope::Workgroup)
+                )
+            }
         }
     }
 
@@ -129,8 +149,8 @@ impl<'a> Emitter<'a> {
             (Target::Nvptx, MemoryScope::Device) => "device",
             (Target::AmdGcn(_), MemoryScope::Workgroup) => "workgroup",
             (Target::AmdGcn(_), MemoryScope::Device) => "agent",
-            (Target::SpirvVulkan, MemoryScope::Workgroup) => "workgroup",
-            (Target::SpirvVulkan, MemoryScope::Device) => "device",
+            (Target::SpirvVulkan | Target::SpirvOpenCl, MemoryScope::Workgroup) => "workgroup",
+            (Target::SpirvVulkan | Target::SpirvOpenCl, MemoryScope::Device) => "device",
             // AieCore never reaches here - Statement::Fence rejects it before calling this.
             (Target::AieCore, _) => "singlethread",
         }
@@ -217,6 +237,10 @@ impl<'a> Emitter<'a> {
                 self.out
                     .push_str("target triple = \"nvptx64-nvidia-cuda\"\n\n");
             }
+            Target::SpirvOpenCl => {
+                self.out
+                    .push_str("target triple = \"spirv64-unknown-unknown\"\n\n");
+            }
             // AIE core: no datalayout/triple in the IR text; Peano supplies them from `--march=aie2p` (plain scalar IR
             // with no triple lowers cleanly). A comment marks the target.
             Target::AieCore => {
@@ -270,6 +294,20 @@ impl<'a> Emitter<'a> {
         match self.target {
             Target::SpirvVulkan => {
                 self.out.push_str("define void @main() #0 {\n");
+            }
+            // The PTX argument ABI (a global pointer and an `i64` length per slice) under the OpenCL kernel
+            // calling convention; the workgroup size rides `!reqd_work_group_size` (see `emit_footer`).
+            Target::SpirvOpenCl => {
+                let mut args = Vec::new();
+                for p in self.body.params() {
+                    args.push(format!("ptr addrspace(1) %p{}, i64 %n{}", p.index, p.index));
+                }
+                let _ = writeln!(
+                    self.out,
+                    "define spir_kernel void @{}({}) !reqd_work_group_size !0 {{",
+                    self.body.name,
+                    args.join(", ")
+                );
             }
             Target::Nvptx => {
                 let mut args = Vec::new();
@@ -665,6 +703,18 @@ impl<'a> Emitter<'a> {
                             .insert("declare void @llvm.nvvm.barrier0()".into());
                         let _ = writeln!(w, "  call void @llvm.nvvm.barrier0()");
                     }
+                    // `__spirv_ControlBarrier(Workgroup, Workgroup, AcquireRelease | WorkgroupMemory |
+                    // CrossWorkgroupMemory)` orders shared and global accesses within the workgroup, as PTX
+                    // `bar.sync` does. Convergent, like the Vulkan barrier.
+                    Target::SpirvOpenCl => {
+                        self.declares.insert(
+                            "declare void @_Z22__spirv_ControlBarrierjjj(i32, i32, i32) #1".into(),
+                        );
+                        let _ = writeln!(
+                            w,
+                            "  call void @_Z22__spirv_ControlBarrierjjj(i32 2, i32 2, i32 {OPENCL_BARRIER_SEMANTICS}) #1"
+                        );
+                    }
                     // A single AIE core has no workgroup to synchronize; a barrier is a GPU/SPMD construct. Reject by name:
                     // an AIE kernel must be a barrier-free sequential loop.
                     Target::AieCore => {
@@ -720,6 +770,13 @@ impl<'a> Emitter<'a> {
                     w.push_str("  unreachable\n");
                     Ok(())
                 }
+                // OpenCL SPIR-V has no device trap: the backend lowers `llvm.trap` to `OpUnreachable`, which is
+                // undefined behaviour, not a fault. Refuse by name instead of emitting a check that does nothing.
+                Target::SpirvOpenCl => Err(EmitError::Unsupported(
+                    "Assert/Unreachable trap on SpirvOpenCl: OpenCL SPIR-V has no device trap (llvm.trap \
+                     lowers to OpUnreachable, which is undefined behaviour)"
+                        .into(),
+                )),
                 Target::SpirvVulkan => Err(EmitError::Unsupported(
                     "internal error: a Trap terminator reached SpirvVulkan emission; debranch_traps_for_spirv \
                      should have removed every one (card 531c)"

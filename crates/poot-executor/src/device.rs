@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use poot_graph_plan::{Target, production_plan::Submission};
 use poot_runtime_common::CompiledKernel;
-use poot_target::{AieTargetId, BufferStorage};
+use poot_target::{AieTargetId, BufferStorage, VpuTargetId};
 
 /// One dispatch's device duration within a step's recording, in replay order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +82,37 @@ pub enum LaunchKind {
     },
     /// One finite run of a loaded AIE kernel's instruction stream over the dispatch's host buffer objects.
     Aie(AieInvocation),
+    /// One execution of a loaded Intel NPU graph over the dispatch's host buffers.
+    VpuGraph(VpuInvocation),
+}
+
+/// One execution of an Intel NPU graph: the graph runs once over the dispatch's host buffers (the `inputs`
+/// then the `output`, in the graph's argument order: its inputs, then its results) and ends; there is no
+/// grid. It names the target the graph was compiled for and the digest of the artifact the engine loaded
+/// (the IR and argument ABI, [`poot_runtime_common::VpuGraphArtifact::digest`]). A device implementation
+/// must refuse an invocation that disagrees with the kernel it carries; the other devices read only the
+/// variant, to refuse the launch kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VpuInvocation {
+    target: VpuTargetId,
+    digest: u64,
+}
+
+impl VpuInvocation {
+    /// An invocation of the graph with `digest` compiled for `target`.
+    pub const fn new(target: VpuTargetId, digest: u64) -> Self {
+        Self { target, digest }
+    }
+
+    /// The target the graph was compiled for.
+    pub const fn target(&self) -> VpuTargetId {
+        self.target
+    }
+
+    /// The digest of the artifact the engine loaded.
+    pub const fn digest(&self) -> u64 {
+        self.digest
+    }
 }
 
 /// One run of an AIE kernel: its instruction stream executes once over the dispatch's host buffer objects

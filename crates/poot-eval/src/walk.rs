@@ -587,9 +587,40 @@ fn evaluate_composite(
     if outermost {
         opts.composite = Some(eqn.out);
     }
+    let oversized_block_top_k = match &eqn.op {
+        OpKind::BlockTopK(attrs) => attrs
+            .layout(&operand_types)
+            .ok()
+            .filter(|layout| block_top_k_pairs(layout) > MAX_BLOCK_TOP_K_PAIRS),
+        _ => None,
+    };
     let result = match &eqn.op {
         OpKind::Scan(attrs) => {
             evaluate_scan(attrs, eqn, &operand_types, bound, idx, opts, decompositions)
+        }
+        OpKind::BlockTopK(_) if oversized_block_top_k.is_some() => Err(EvalError::Unsupported {
+            eqn: eqn.out,
+            op: resolve::op_label(&eqn.op),
+            detail: oversized_block_top_k.map_or_else(String::new, |layout| {
+                format!(
+                    "the oracle's definition ranks every pair of blocks (quadratic); {} query rows of {} blocks exceed its {MAX_BLOCK_TOP_K_PAIRS}-pair bound",
+                    layout.rows * layout.tokens,
+                    layout.blocks,
+                )
+            }),
+        }),
+        OpKind::SelectedAttention(attrs)
+            if attrs.layout(&operand_types).is_ok_and(|layout| {
+                selected_block_pairs(attrs, &layout) > MAX_SELECTED_BLOCK_PAIRS
+            }) =>
+        {
+            Err(EvalError::Unsupported {
+                eqn: eqn.out,
+                op: resolve::op_label(&eqn.op),
+                detail: format!(
+                    "the oracle's definition compares every selected block id with every block for every query; this selection exceeds its {MAX_SELECTED_BLOCK_PAIRS}-comparison bound"
+                ),
+            })
         }
         op => decompositions
             .get(op, operand_types)
@@ -613,6 +644,30 @@ fn evaluate_composite(
         opts.composite = None;
     }
     result.map_err(|error| attributed_to(eqn, error))
+}
+
+/// The most block pairs a `BlockTopK` decomposition may rank at once: its definition compares every block
+/// with every other for every query, so its tensors grow with the square of the block count. A graph past
+/// the bound is refused rather than allocated (8192 blocks of one query is 2^26 pairs).
+const MAX_BLOCK_TOP_K_PAIRS: usize = 1 << 27;
+
+/// The most `(selected id, block)` comparisons a `SelectedAttention` decomposition may make at once: its mask is
+/// built from an indicator of every query's `K` ids against every block.
+const MAX_SELECTED_BLOCK_PAIRS: usize = 1 << 27;
+
+/// The comparisons the mask of a selected attention makes: `batch * lq * k * blocks`, saturating.
+fn selected_block_pairs(
+    attrs: &poot_graph_ir::SelectedAttentionAttrs,
+    layout: &poot_graph_ir::SelectedAttentionLayout,
+) -> usize {
+    (layout.batch * layout.lq)
+        .saturating_mul(attrs.k)
+        .saturating_mul(layout.lk.div_ceil(attrs.ratio))
+}
+
+/// The pairs a block top-k ranks: `queries * blocks^2`, saturating.
+fn block_top_k_pairs(layout: &poot_graph_ir::BlockTopKLayout) -> usize {
+    (layout.rows * layout.tokens).saturating_mul(layout.blocks.saturating_mul(layout.blocks))
 }
 
 /// Evaluate `decomposition` over `bound`, the values of its operand placeholders in operand order: every
@@ -1469,7 +1524,9 @@ fn evaluate_dense(
         | OpKind::FusedRow(_)
         | OpKind::Attention(_)
         | OpKind::Rope { .. }
-        | OpKind::Scan(_) => {
+        | OpKind::Scan(_)
+        | OpKind::BlockTopK(_)
+        | OpKind::SelectedAttention(_) => {
             unreachable!("a composite evaluates through its decomposition (evaluate_composite)")
         }
     };

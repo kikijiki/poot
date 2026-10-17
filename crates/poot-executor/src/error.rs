@@ -118,12 +118,12 @@ pub enum LoadError {
         /// The name the weight map was asked for.
         name: String,
     },
-    /// An AIE kernel's plan has no shape ABI to link against (POOT-664).
+    /// An AIE region's plans have no link recipe to link against (POOT-664, POOT-1160).
     #[error("kernel {key}: {source}")]
     AieAbi {
-        /// The plan key of the kernel.
+        /// The region.
         key: String,
-        /// Why the plan carries no shape ABI.
+        /// Why the plans carry no link recipe.
         source: poot_graph_plan::AieAbiRefusal,
     },
     /// A linked AIE artifact's instruction stream is empty or longer than `u32::MAX` words, which the
@@ -134,6 +134,29 @@ pub enum LoadError {
         key: String,
         /// The stream's length in bytes.
         bytes: usize,
+    },
+    /// An Intel NPU region could not be emitted as OpenVINO IR: the region the planner assembled is not well
+    /// formed. An invariant breach in the lowering, named.
+    #[error("kernel {key}: {source}")]
+    VpuEmit {
+        /// The key of the region.
+        key: String,
+        /// What the emitter refused.
+        source: poot_codegen::VpuEmitError,
+    },
+    /// The region's argument ABI is not one the NPU device can bind.
+    #[error("kernel {key}: {source}")]
+    VpuArtifact {
+        /// The key of the region.
+        key: String,
+        /// Why the artifact was refused.
+        source: poot_runtime_common::VpuArtifactError,
+    },
+    /// The program has no kernel-body compiler for its target, but a per-equation kernel was asked for.
+    #[error("target {target:?} compiles no per-equation kernel bodies")]
+    NoKernelBodies {
+        /// The target.
+        target: poot_target::TargetId,
     },
     /// An AIE kernel could not be linked: a toolchain stage, the body/ABI check or the artifact validator.
     #[error("kernel {key}: {source}")]
@@ -150,14 +173,6 @@ pub enum LoadError {
         key: String,
         /// Which measured limit the artifact exceeds or lacks.
         source: poot_graph_plan::AieLimitRefusal,
-    },
-    /// The linked AIE artifact does not describe the body's buffer parameters.
-    #[error("kernel {key}: {source}")]
-    AieHandle {
-        /// The plan key of the kernel.
-        key: String,
-        /// How the artifact's description disagrees with the body.
-        source: poot_codegen::AieAbiMismatch,
     },
     /// A graph const carries no name, so no weight can be bound to it.
     #[error("const {value} has no name to bind by")]

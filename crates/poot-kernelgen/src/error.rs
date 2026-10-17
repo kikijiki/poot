@@ -148,6 +148,17 @@ pub enum KernelGenError {
         /// What the generator or target cannot state.
         reason: &'static str,
     },
+    /// The generated body cannot be turned into a one-thread loop nest: it does something a single thread
+    /// running the grid in order would not reproduce (or the launch is not a whole grid). The arguments are
+    /// fine and the target could state the request elsewhere; the body's own structure refuses this schedule.
+    #[error("{generator}: the body cannot be serialized: {source}")]
+    Serialize {
+        /// The generator that serialized the body.
+        generator: &'static str,
+        /// Why [`poot_kernel_ir::serialize::serialize_grid`] refused.
+        #[source]
+        source: poot_kernel_ir::serialize::SerializeError,
+    },
     /// The body this request needs would exceed the caller's [`crate::BodyLimits`]. `attempted` is the
     /// total the generator would have reached, `limit` the cap; `stage` says whether the request was
     /// refused from its checked size before any statement existed or the finished body was measured.
@@ -202,6 +213,7 @@ impl KernelGenError {
             | Self::IndexLeafOperand { generator, .. }
             | Self::NarrowOperand { generator, .. }
             | Self::IndexCastOperand { generator, .. }
+            | Self::Serialize { generator, .. }
             | Self::ShapeMismatch { generator, .. } => generator,
             Self::UnsupportedDescriptor { .. } => "packed_kernel",
             Self::Unsupported { request, .. } => request,

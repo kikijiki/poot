@@ -35,7 +35,7 @@ pub use budget::{AllocationSite, Attempted, BudgetResource, TraceBudgetExceeded,
 #[cfg(any(test, feature = "test-support"))]
 pub use budget::{Charged, Ledger, LedgerEvent, Reservation};
 pub use builder::{
-    Builder, BuilderAppendAccounting, BuilderAppendPlan, LayerScope, Outputs,
+    BlockTopKResult, Builder, BuilderAppendAccounting, BuilderAppendPlan, LayerScope, Outputs,
     PreparedBuilderAppend, ScanResult, Traced, WitnessDeclaration,
 };
 pub use error::{
@@ -54,9 +54,10 @@ pub use index_guard::{
     is_guard_witness,
 };
 pub use op::{
-    AttentionAttrs, BinOp, ContractionRows, DENSE_CONTRACTION_WEIGHT_DTYPES,
-    DENSE_ROW_GATHER_SOURCE_DTYPES, KeyLayout, KvBound, MaskOperand, OpClass, OpKind, RedOp,
-    ScanAttrs, ScanFamily, ScanLayout, UnOp,
+    AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows,
+    DENSE_CONTRACTION_WEIGHT_DTYPES, DENSE_ROW_GATHER_SOURCE_DTYPES, KeyLayout, KvBound,
+    MaskOperand, OpClass, OpKind, RedOp, ScanAttrs, ScanFamily, ScanLayout, SelectedAttentionAttrs,
+    SelectedAttentionLayout, UnOp,
 };
 pub use packed_source::{
     PackedSourceName, packed_source_constants, packed_source_type, packed_stack_source_constants,

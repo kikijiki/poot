@@ -6,11 +6,12 @@
 //! cannot drift from what the emitter actually compiled.
 
 use poot_kernel_ir::{Body, Ty};
-use poot_runtime_common::{AieLinkedArtifact, ArgAccess, ArgSchema, CompiledKernel, KernelCode};
+use poot_runtime_common::{
+    AieLinkedArtifact, ArgAccess, ArgSchema, CompiledKernel, KernelCode, VpuGraphArtifact,
+};
 use poot_target::{AieTargetId, Backend, ElementKind, TargetId};
 
 use crate::Target;
-use crate::aie::{AieAbiMismatch, check_body_abi};
 
 /// The native [`ElementKind`] a kernel buffer parameter's slice element type lowers to, or `None` for a
 /// type no runtime buffer carries. Every buffer parameter emitted for wgpu/Vulkan/ROCm/PTX dispatch is one
@@ -90,9 +91,10 @@ impl From<GpuTarget> for Target {
     }
 }
 
-/// An AIE core target has no byte-artifact kernel handle: its kernel is a linked artifact.
+/// A target with no byte-artifact kernel handle: an AIE core's kernel is a linked artifact, and
+/// [`Target::SpirvOpenCl`] has no runtime [`Backend`] to dispatch it yet (the Level Zero runtime adds one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} has no byte-artifact kernel handle: its kernel is a linked artifact")]
+#[error("{0:?} has no byte-artifact kernel handle")]
 pub struct NotAByteTarget(pub Target);
 
 impl From<Backend> for GpuTarget {
@@ -113,7 +115,7 @@ impl TryFrom<Target> for GpuTarget {
             Target::SpirvVulkan => Ok(GpuTarget::SpirvVulkan),
             Target::Nvptx => Ok(GpuTarget::Nvptx),
             Target::AmdGcn(arch) => Ok(GpuTarget::AmdGcn(arch)),
-            Target::AieCore => Err(NotAByteTarget(target)),
+            Target::AieCore | Target::SpirvOpenCl => Err(NotAByteTarget(target)),
         }
     }
 }
@@ -163,13 +165,30 @@ impl From<Backend> for Target {
     }
 }
 
-/// The codegen [`Target`] of a target identity (the one AIE target id is a closed enum, so no id is
-/// dropped).
-impl From<TargetId> for Target {
-    fn from(target: TargetId) -> Target {
+/// The codegen [`Target`] of an AIE target (a closed enum, so no id is dropped).
+impl From<AieTargetId> for Target {
+    fn from(target: AieTargetId) -> Target {
         match target {
-            TargetId::Gpu(backend) => backend.into(),
-            TargetId::Aie(AieTargetId::Xdna2) => Target::AieCore,
+            AieTargetId::Xdna2 => Target::AieCore,
+        }
+    }
+}
+
+/// A target identity with no codegen [`Target`]: a VPU compiles a graph the vendor lowers, not a `Body`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} compiles no kernel Body: its regions go through `emit_vpu`")]
+pub struct NoBodyTarget(pub TargetId);
+
+/// The codegen [`Target`] of a target identity that compiles kernel bodies (a GPU backend or an AIE
+/// target). A VPU target is the typed [`NoBodyTarget`]: its regions are emitted by [`crate::emit_vpu`].
+impl TryFrom<TargetId> for Target {
+    type Error = NoBodyTarget;
+
+    fn try_from(target: TargetId) -> Result<Target, NoBodyTarget> {
+        match target {
+            TargetId::Gpu(backend) => Ok(backend.into()),
+            TargetId::Aie(target) => Ok(target.into()),
+            TargetId::Vpu(_) => Err(NoBodyTarget(target)),
         }
     }
 }
@@ -206,23 +225,56 @@ pub fn kernel_handle(body: &Body, target: GpuTarget, bytes: Vec<u8>) -> Compiled
     }
 }
 
-/// The [`CompiledKernel`] for an AIE `body` and the `artifact` linked for it. Fallible: the artifact's shape
-/// ABI must be exactly `body`'s buffer parameters (count, element kind and which ones are written), and a
-/// body that can trap has no home in an ABI without an error word. Nothing is wrapped on a mismatch.
-pub fn aie_kernel_handle(
-    body: &Body,
-    artifact: AieLinkedArtifact,
-) -> Result<CompiledKernel, AieAbiMismatch> {
-    check_body_abi(body, artifact.abi())?;
-    let args = try_arg_schema(body).expect("check_body_abi accepted every parameter");
+/// The [`CompiledKernel`] for an AIE region's linked `artifact`. Its arguments are the artifact's shape
+/// ABI, binding for binding: the host side of the region. Which core runs which body was checked tile by
+/// tile when the artifact was compiled (`compile_aie`), and the artifact itself is only constructible
+/// through the validator, so there is nothing left to refuse here.
+pub fn aie_kernel_handle(artifact: AieLinkedArtifact) -> CompiledKernel {
+    let args: Box<[ArgSchema]> = artifact
+        .abi()
+        .bindings()
+        .iter()
+        .map(|binding| ArgSchema::new(binding.storage().element(), binding.access()))
+        .collect();
     let entry_point: Box<str> = artifact.entry().into();
     let target = TargetId::Aie(artifact.target());
     // SAFETY: `artifact` came out of the artifact validator (an xclbin, a whole instruction stream and a
-    // self-consistent shape ABI), and `check_body_abi` proved its bindings are exactly `body`'s buffer
-    // parameters in order with the same element kinds and write flags; `args` is read from that same
-    // body, and a trapping body was refused, so `has_trap` is false as `Body::has_trap()` says. The
-    // generator's proved access ranges are inside every binding's extent (checked at construction).
-    Ok(unsafe { CompiledKernel::new(target, entry_point, KernelCode::Aie(artifact), args, false) })
+    // self-consistent shape ABI), and `args` is that ABI's bindings in order with their element kinds and
+    // write flags, so the schema describes the artifact exactly. Every tile body was checked against the
+    // recipe the ABI belongs to at compile time, and a trapping body was refused there, so `has_trap` is
+    // false. The generator's proved access ranges are inside every binding's extent (checked at
+    // construction).
+    unsafe { CompiledKernel::new(target, entry_point, KernelCode::Aie(artifact), args, false) }
+}
+
+/// The [`CompiledKernel`] for an Intel NPU region's `artifact`. Its arguments are the artifact's inputs and then
+/// its outputs: the region reads the first and writes the rest.
+pub fn vpu_kernel_handle(artifact: VpuGraphArtifact) -> CompiledKernel {
+    let args: Box<[ArgSchema]> = artifact
+        .inputs()
+        .iter()
+        .map(|b| ArgSchema::new(b.storage().element(), ArgAccess::Read))
+        .chain(
+            artifact
+                .outputs()
+                .iter()
+                .map(|b| ArgSchema::new(b.storage().element(), ArgAccess::Write)),
+        )
+        .collect();
+    let target = TargetId::Vpu(artifact.target());
+    // SAFETY: `artifact` is only constructible through `VpuGraphArtifact::new`, which admits only dense F16,
+    // F32 and I32 bindings of non-empty shape, and `args` is exactly its inputs (read) then outputs
+    // (written) in order, so the schema describes the artifact. The graph has no trap word, and the device
+    // checks the compiled graph's own argument list against these bindings before it executes.
+    unsafe {
+        CompiledKernel::new(
+            target,
+            "poot_region",
+            KernelCode::Vpu(artifact),
+            args,
+            false,
+        )
+    }
 }
 
 #[cfg(test)]

@@ -325,6 +325,7 @@ fn attention_fixture_bank_matches_cpu_on_ptx() {
         let mask_heads = match spec.mask {
             kg::MaskKind::Broadcast => 1,
             kg::MaskKind::PerHead => spec.hq,
+            kg::MaskKind::Blocks { .. } => unreachable!("no block-selected row in this table"),
         };
         let mask: Vec<f32> = (0..spec.batch * mask_heads * spec.lq * spec.lk)
             .map(|i| {

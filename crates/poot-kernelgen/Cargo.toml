@@ -25,7 +25,7 @@ poot-quant = { workspace = true, features = ["test-support"] }
 # call `poot_kernel_ir::interp::Buffer::from_f32s`/`from_u32s`/`to_f32s` directly, gated behind
 # `test-support` in poot-kernel-ir.
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
-poot-codegen.workspace = true
+poot-codegen = { workspace = true, features = ["test-support"] }
 poot-wgpu-runtime = { workspace = true, features = ["test-support"] }
 poot-ptx-runtime = { workspace = true, features = ["test-support"] }
 # The packed-kernel ROCm device rows (card 542a SC-004/SC-005) dispatch generated bodies on real

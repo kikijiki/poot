@@ -1,7 +1,8 @@
 //! Qwen Sparse Attention (QSA): the block indexer that narrows which cached positions a
 //! full-attention layer reads (`Qwen4ExpTextQSAIndexer`). The layer itself is the ordinary gated GQA
-//! attention (`components::attention` with the output gate); the indexer only replaces its
-//! causal-over-cache mask by [`qsa_mask`].
+//! attention (`components::attention` with the output gate); the indexer only chooses which blocks of
+//! cached positions it reads ([`qsa_select`] returns their ids, and the attention reads those blocks and the
+//! query's own unfinished block).
 //!
 //! The indexer scores *blocks* of `ratio` consecutive positions and caches the blocks' keys, not the
 //! positions':
@@ -14,7 +15,8 @@
 //!    the heads.
 //! 4. Per query, the best `budget / ratio` blocks stay visible, ties going to the lower block (the
 //!    budget is exact even on equal scores). A block is eligible once every position of it is at or
-//!    before the query. The query's own unfinished block is always visible, unscored.
+//!    before the query. The query's own unfinished block is always visible, unscored. The selection is
+//!    one typed op, [`BlockTopKAttrs`]: a linear radix select on a device, a quadratic rank on the oracle.
 //!
 //! A completed block's key is a pure function of its `ratio` raw keys and its first position, so it
 //! never changes and is computed once. Each layer carries two states: the block keys
@@ -32,28 +34,23 @@
 //! boundary, finds the later block's keys in the slots below the rewind point and pools them into
 //! the rewound block. Rewinding to a boundary reads no tail slot, and complete blocks are never touched.
 //!
-//! Every quantity of the selection is a function of the query's position, so the mask is built in
-//! the graph from the step's `Slot::Pos`.
-//!
-//! All masks are `{0, -1e30}` valued, so AND is a plain add (two penalties never overflow `f32`) and
-//! OR is a max.
+//! Every quantity of the selection is a function of the query's position, so the selection is built in
+//! the graph from the step's `Slot::Pos` and one graph serves a prompt, a chunk and one token.
 
-use poot_graph_ir::ops::{stable_descending_rank, top_k_keep_mask};
 use std::num::NonZeroU32;
 
-use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, StateRole, TensorType, Traced, ops};
+use poot_graph_ir::{
+    BinOp, BlockTopKAttrs, BlockTopKResult, Builder, RedOp, Scalar, StateRole, TensorType, Traced,
+    ops,
+};
 use poot_quant::weights::{QsaRole, WeightId, WeightMap, WeightRole};
-use poot_tensor::DType;
 
-use crate::components::attention::first_writes;
+use crate::components::attention::{BlockSelection, first_writes};
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::{NormParams, norm};
 use crate::components::rope::{RopeParams, apply_rope, rope_rows};
 use crate::components::standard::{ParamError, Step};
 use crate::model::{ConfigReason, TraceError};
-
-/// The additive penalty of a position the selection drops or has not made visible.
-const DROPPED: f32 = -1e30;
 
 /// Checked QSA parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -175,36 +172,6 @@ impl QsaWeights {
             k_norm: w(QsaRole::KNorm, &[p.dim])?,
         })
     }
-}
-
-/// `(indicator - 1) * 1e30`: zero where the `{0, 1}` indicator is one, [`DROPPED`] where it is zero.
-fn penalty(b: &Builder, indicator: Traced) -> Result<Traced, TraceError> {
-    Ok(b.binary_scalar(
-        BinOp::Mul,
-        b.binary_scalar(BinOp::Sub, indicator, Scalar::F32(1.0))?,
-        Scalar::F32(-DROPPED),
-    )?)
-}
-
-/// Spread a per-block value `[rows, 1, tokens, blocks]` over the `ratio` positions of each block:
-/// `[rows, 1, tokens, blocks * ratio]`.
-fn per_position(b: &Builder, blocks: Traced, ratio: usize) -> Result<Traced, TraceError> {
-    let shape = b.aval(blocks)?.shape;
-    let [rows, one, t, nb] = shape[..] else {
-        return Err(poot_graph_ir::BuilderError::Requirement {
-            operation: "per_position",
-            requirement: poot_graph_ir::Requirement::Rank {
-                expected: 4,
-                found: shape,
-            },
-        }
-        .into());
-    };
-    let wide = b.broadcast(
-        b.reshape(blocks, vec![rows, one, t, nb, 1])?,
-        vec![rows, one, t, nb, ratio],
-    )?;
-    Ok(b.reshape(wide, vec![rows, one, t, nb * ratio])?)
 }
 
 /// The blocks a step of `tokens` positions can touch: its first position may sit anywhere in a
@@ -415,22 +382,24 @@ fn block_keys(
     Ok(keys_out)
 }
 
-/// The mask of `layer`'s sparse attention: `causal` (`[rows, 1, tokens, capacity]`) plus
-/// [`DROPPED`] on every position outside each query's selection. `x` is the layer's normed input
-/// `[rows, tokens, width]`; the layer's block keys and unfinished-block raw keys are carried by `step`
-/// ([`block_keys`]). The step's capacity must be a multiple of the block `ratio`.
-pub(super) fn qsa_mask(
+/// `layer`'s block selection: the blocks of cached positions each query of the step reads, as the ids half of a
+/// [`BlockTopKAttrs`] selection (the attention then reads those blocks and the query's own unfinished block). `x`
+/// is the layer's normed input `[rows, tokens, width]`; the layer's block keys and unfinished-block raw keys are
+/// carried by `step` ([`block_keys`]). The step's capacity must be a multiple of the block `ratio`.
+pub(super) fn qsa_select(
     b: &Builder,
     step: &Step,
     layer: usize,
     x: Traced,
-    causal: Traced,
     w: &QsaWeights,
     p: &QsaParams,
-) -> Result<Traced, TraceError> {
+) -> Result<BlockSelection, TraceError> {
     let q = query(b, step, x, w, p)?;
     let block_k = block_keys(b, step, layer, x, w, p)?; // [rows, 1, blocks, dim]
-    selection_mask(b, step, q, block_k, causal, p)
+    Ok(BlockSelection {
+        ids: select_blocks(b, step, q, block_k, p)?.ids,
+        ratio: p.ratio,
+    })
 }
 
 /// The indexer queries `[rows, heads, tokens, dim]`: a norm over each head, then RoPE at its own position.
@@ -456,63 +425,42 @@ fn query(
     )
 }
 
-/// `causal` plus [`DROPPED`] on every position outside each query's selection, from the queries `q`
-/// and the block keys `block_k` `[rows, 1, blocks, dim]`: scoring, eligibility, the budgeted rank.
-fn selection_mask(
+/// The score of every block for every query: `sum_h ReLU(q . k_block) / sqrt(dim)`, the head axis kept at
+/// one: `[rows, 1, tokens, blocks]`.
+fn block_scores(b: &Builder, q: Traced, block_k: Traced, dim: usize) -> Result<Traced, TraceError> {
+    let dots = b.matmul(q, b.transpose(block_k, vec![0, 1, 3, 2])?)?; // [rows, heads, tokens, blocks]
+    Ok(b.binary_scalar(
+        BinOp::Mul,
+        b.reduce(RedOp::Sum, ops::relu(b, dots)?, 1, true)?,
+        Scalar::F32(1.0 / (dim as f32).sqrt()),
+    )?)
+}
+
+/// The budgeted selection of the blocks each query has completed, from the queries `q` and the block keys
+/// `block_k` `[rows, 1, blocks, dim]`: scoring, then the best `budget / ratio` blocks, ties to the lower block
+/// ([`BlockTopKAttrs`]); a budget above the block count keeps every complete block.
+fn select_blocks(
     b: &Builder,
     step: &Step,
     q: Traced,
     block_k: Traced,
-    causal: Traced,
     p: &QsaParams,
-) -> Result<Traced, TraceError> {
-    let shape = step.shape();
-    let (rows, t, cap) = (shape.rows.get(), shape.tokens.get(), shape.capacity.get());
-    let (dim, ratio) = (p.dim, p.ratio);
-    let nb = cap / ratio;
-    debug_assert_eq!(nb * ratio, cap, "the model checks the capacity granule");
-
-    // Score: `sum_h ReLU(q . k_block) / sqrt(dim)`, the head axis kept at one.
-    let dots = b.matmul(q, b.transpose(block_k, vec![0, 1, 3, 2])?)?; // [rows, heads, tokens, blocks]
-    let scores = b.binary_scalar(
-        BinOp::Mul,
-        b.reduce(RedOp::Sum, ops::relu(b, dots)?, 1, true)?,
-        Scalar::F32(1.0 / (dim as f32).sqrt()),
-    )?; // [rows, 1, tokens, blocks]
-
-    // Eligibility and the tail, from each query's position and each block's first position.
-    let wide = vec![rows, 1, t, nb];
-    let pos = b.broadcast(
-        b.reshape(b.cast(step.pos(), DType::F32)?, vec![rows, 1, t, 1])?,
-        wide.clone(),
-    )?;
-    let first = b.broadcast(
-        b.reshape(
-            b.binary_scalar(BinOp::Mul, b.iota(nb)?, Scalar::F32(ratio as f32))?,
-            vec![1, 1, 1, nb],
-        )?,
-        wide.clone(),
-    )?;
-    let last = b.binary_scalar(BinOp::Add, first, Scalar::F32((ratio - 1) as f32))?;
-    // Complete as of the query: its last position is at or before the query.
-    let complete = b.binary(BinOp::Ge, pos, last)?;
-    let eligible = penalty(b, complete)?;
-    // The query's own unfinished block: it starts at or before the query, and is not yet complete.
-    let started = b.binary(BinOp::Ge, pos, first)?;
-    let tail = penalty(b, b.binary(BinOp::Sub, started, complete)?)?;
-
-    // Rank the sum, so an ineligible block cannot outrank an eligible one, keep the budget exactly,
-    // and re-AND eligibility: a budget above the eligible count fills with ineligible blocks.
-    let rank = stable_descending_rank(b, b.binary(BinOp::Add, scores, eligible)?)?;
-    let kept = penalty(b, top_k_keep_mask(b, rank, p.block_topk())?)?;
-    let selected = b.binary(BinOp::Add, eligible, kept)?;
-
-    let selection = b.binary(
-        BinOp::Max,
-        per_position(b, selected, ratio)?,
-        per_position(b, tail, ratio)?,
-    )?;
-    Ok(b.binary(BinOp::Add, selection, causal)?)
+) -> Result<BlockTopKResult, TraceError> {
+    let nb = step.shape().capacity.get() / p.ratio;
+    debug_assert_eq!(
+        nb * p.ratio,
+        step.shape().capacity.get(),
+        "the model checks the capacity granule"
+    );
+    let scores = block_scores(b, q, block_k, p.dim)?;
+    Ok(b.block_top_k(
+        BlockTopKAttrs {
+            ratio: p.ratio,
+            k: p.block_topk().min(nb),
+        },
+        scores,
+        step.pos(),
+    )?)
 }
 
 #[cfg(test)]

@@ -569,6 +569,10 @@ pub enum Plan {
         /// Element offset of the view's first element in the source buffer.
         offset: usize,
     },
+    /// The equation lowers to a node of the target's graph artifact (an Intel NPU's vendor-compiled graph) and
+    /// launches nothing of its own: the program's one region ([`ArtifactGranularity::Graph`](crate::ArtifactGranularity))
+    /// runs it with the rest of the graph.
+    Graph,
 }
 
 /// Which [`Plan`] variant an equation planned as, without its payload. Executors name it when a walk
@@ -581,6 +585,8 @@ pub enum PlanKind {
     Alias,
     /// The output is a strided view of a source buffer.
     View,
+    /// The equation is a node of the target's graph artifact.
+    Graph,
 }
 
 impl Plan {
@@ -615,6 +621,7 @@ impl Plan {
             Plan::Dispatches(_) => PlanKind::Dispatches,
             Plan::Alias(_) => PlanKind::Alias,
             Plan::View { .. } => PlanKind::View,
+            Plan::Graph => PlanKind::Graph,
         }
     }
 }

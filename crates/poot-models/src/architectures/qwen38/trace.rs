@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Every block calls its shared component: `components::gdn`, `components::attention` under the
-//! QSA mask ([`qsa_mask`](super::qsa::qsa_mask)), `components::moe` and `components::ple`; the
+//! QSA mask ([`qsa_select`](super::qsa::qsa_select)), `components::moe` and `components::ple`; the
 //! gated residual around them is the family's own ([`gated_residual`](super::gated_residual)).
 
 use poot_graph_ir::{BinOp, Builder, Traced};
@@ -19,7 +19,7 @@ use poot_quant::weights::{HyperSite, WeightId, WeightMap, WeightRole};
 use super::LayerKind;
 use super::config::Qwen4ExpParams;
 use super::gated_residual::{self, HyperWeights};
-use super::qsa::{QsaWeights, qsa_mask};
+use super::qsa::{QsaWeights, qsa_select};
 use crate::components::attention::{AttentionWeights, attention_selecting};
 use crate::components::embed::Embedding;
 use crate::components::gdn::{GdnWeights, gdn};
@@ -131,15 +131,11 @@ pub(super) fn trace_step(
         let (input, weights) = gated_residual::input(b, x, &layer.attn_gate, hyper)?;
         let mixed = match &layer.mixer {
             Mixer::Gdn(gdn_weights) => gdn(b, step, l, input, gdn_weights, &p.gdn)?,
-            Mixer::Full(full) => attention_selecting(
-                b,
-                step,
-                l,
-                input,
-                &full.attention,
-                &p.attention,
-                &|b, causal| qsa_mask(b, step, l, input, causal, &full.qsa, &p.qsa),
-            )?,
+            Mixer::Full(full) => {
+                attention_selecting(b, step, l, input, &full.attention, &p.attention, &|b| {
+                    qsa_select(b, step, l, input, &full.qsa, &p.qsa)
+                })?
+            }
         };
         x = gated_residual::inject(b, x, mixed, weights)?;
         let (input, weights) = gated_residual::input(b, x, &layer.mlp_gate, hyper)?;

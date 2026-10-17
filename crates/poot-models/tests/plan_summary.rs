@@ -185,6 +185,7 @@ fn describe_plan(eqn: &Eqn, plan: &Plan, choice: &KernelChoice) -> PlanCells {
             choice,
             format!("src={src} strides={strides:?} offset={offset}"),
         ),
+        Plan::Graph => PlanCells::no_launch("graph", choice, String::new()),
     }
 }
 
@@ -430,7 +431,7 @@ fn nvptx_plan_summary_matches_the_checked_in_file() {
 /// file compiles.
 fn is_loadable(plan: &Plan) -> bool {
     match plan {
-        Plan::Dispatches(_) | Plan::Alias(_) | Plan::View { .. } => true,
+        Plan::Dispatches(_) | Plan::Alias(_) | Plan::View { .. } | Plan::Graph => true,
     }
 }
 
@@ -488,8 +489,9 @@ fn plan_summary_rendering_is_deterministic() {
 /// Card 557 SC-003: a tracer states primitives and `ops::` compositions only. Every corpus graph, as
 /// traced and before `compile`, holds no compiler-fusion or schedule-choice composite (`OpClass::
 /// Composite`: the flash ops, `Rope`, `ContractionEpilogue` and the fused regions; the packed and dense claims
-/// are `Primitive` until Card 629 gives them a decomposition). The one authorized bounded semantic source
-/// carrier is the recurrence `Scan` (it states a recurrence and its bounded expansion, not a schedule). Then `compile`'s passes do form composites, so
+/// are `Primitive` until Card 629 gives them a decomposition). The authorized bounded semantic source
+/// carriers are the recurrence `Scan` (it states a recurrence and its bounded expansion, not a schedule) and
+/// the indexer's `BlockTopK` and `SelectedAttention` (they state a selection and the attention over it, with a dense oracle definition, not a schedule). Then `compile`'s passes do form composites, so
 /// the check is not vacuous. Mutation: emit `ContractionEpilogue` from `ops::linear`, or mark one of those ops
 /// `OpClass::Primitive` and trace it; this row names the graph and equation.
 #[test]
@@ -502,7 +504,12 @@ fn every_corpus_trace_is_primitive_before_compile() {
     for row in corpus(&registry()) {
         let g = row.graph();
         for (i, eqn) in g.eqns().iter().enumerate() {
-            if matches!(eqn.op, poot_graph_ir::OpKind::Scan(_)) {
+            if matches!(
+                eqn.op,
+                poot_graph_ir::OpKind::Scan(_)
+                    | poot_graph_ir::OpKind::BlockTopK(_)
+                    | poot_graph_ir::OpKind::SelectedAttention(_)
+            ) {
                 continue;
             }
             assert_eq!(

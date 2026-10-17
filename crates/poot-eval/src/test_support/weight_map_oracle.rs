@@ -155,7 +155,7 @@ pub fn oracle_for<'a>(
                 Storage::State => Value::from(
                     state
                         .entry(meta.name.clone().unwrap())
-                        .or_insert_with(|| HostTensor::zeros(meta.aval.shape.clone()))
+                        .or_insert_with(|| zero_state(&meta.aval))
                         .clone(),
                 ),
                 Storage::Computed(c) => Value::from(c.tensor()),
@@ -176,6 +176,19 @@ pub fn oracle_for<'a>(
             );
         }
         evaluation.output.into_host().expect("dense output")
+    }
+}
+
+/// A carried state's value before the first step: zeros of the state's own dtype.
+fn zero_state(aval: &poot_graph_ir::TensorType) -> HostTensor {
+    let shape = aval.shape.clone();
+    match aval.dtype {
+        DType::F32 => HostTensor::zeros(shape),
+        DType::F16 => {
+            let count = shape.iter().product();
+            HostTensor::f16(shape, vec![0u16; count])
+        }
+        other => panic!("the oracle has no zero state for {other:?}"),
     }
 }
 

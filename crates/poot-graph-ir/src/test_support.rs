@@ -6,9 +6,11 @@
 //! `Builder`/`Graph` methods; [`scan`] and [`const_weights`] are the recurrence-scan fixture and the named
 //! weights of a toy graph.
 
+pub mod block_top_k;
 pub mod const_weights;
 pub mod graph_fixtures;
 pub mod scan;
+pub mod selected_attention;
 
 #[cfg(test)]
 use crate::error::GraphValidationError;

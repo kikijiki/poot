@@ -91,6 +91,8 @@ pub(crate) fn target_link_kinds(target: TargetId) -> &'static [CollectiveKind] {
             CollectiveKind::AllGather,
             CollectiveKind::AllToAll,
         ],
-        TargetId::Gpu(Backend::SpirvVulkan | Backend::AmdGcn(_)) | TargetId::Aie(_) => &[],
+        TargetId::Gpu(Backend::SpirvVulkan | Backend::AmdGcn(_))
+        | TargetId::Aie(_)
+        | TargetId::Vpu(_) => &[],
     }
 }

@@ -127,6 +127,7 @@ pub(super) fn plan(
         | matmul_ops!()
         | attention_ops!()
         | scan_ops!()
+        | block_top_k_ops!()
         | cast_ops!()
         | movement_ops!() => unreachable!("plan_eqn routes only sampling ops here"),
     };

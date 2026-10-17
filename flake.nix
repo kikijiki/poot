@@ -83,6 +83,33 @@
           exec ${mlirAie.passthru.python.interpreter} ${./scripts/poot-aie-link.py} "$@"
         '';
 
+        # Intel's prebuilt NPU user-mode stack (POOT-1164): the Level Zero NPU driver and the vendor graph
+        # compiler it dlopens to turn an OpenVINO graph into a blob. nixpkgs' flake pin ships an older driver
+        # and no compiler, and the two must be one release, so both come from the pinned upstream release tarball
+        # (the sha256 is the one GitHub publishes for the asset). The tarball is untrusted data: only two .deb
+        # members are unpacked, nothing in them runs at build time beyond the patching of ELF headers.
+        npuUserMode = pkgs.stdenv.mkDerivation rec {
+          pname = "intel-npu-user-mode";
+          version = "1.38.0.20260910";
+          src = pkgs.fetchurl {
+            url = "https://github.com/intel/linux-npu-driver/releases/download/v1.38.0/linux-npu-driver-v${version}-34487311128-ubuntu2404.tar.gz";
+            hash = "sha256-HvzUtgwiq+51HY8nBZYsvMKlad5Fx+DmcM8Ir7/NwdI=";
+          };
+          sourceRoot = ".";
+          nativeBuildInputs = [ pkgs.dpkg pkgs.autoPatchelfHook ];
+          buildInputs = [ pkgs.stdenv.cc.cc.lib pkgs.onetbb pkgs.zlib pkgs.zstd ];
+          unpackPhase = ''
+            tar -xzf $src --wildcards '*intel-driver-compiler-npu_*.deb' '*intel-level-zero-npu_*.deb'
+            for deb in intel-driver-compiler-npu_*.deb intel-level-zero-npu_*.deb; do
+              dpkg-deb -x "$deb" unpacked
+            done
+          '';
+          installPhase = ''
+            mkdir -p $out/lib
+            cp -P unpacked/usr/lib/x86_64-linux-gnu/*.so* $out/lib/
+          '';
+        };
+
         # Environment shared by every devShell that builds the workspace.
         #
         # Card 395: one Cargo target dir shared across every worktree, so cargo's own file lock serializes
@@ -279,6 +306,25 @@
             export POOT_AIE_LLC="${peano}/bin/llc"
             export POOT_AIE_IRON="${pootAieLink}/bin/poot-aie-link"
             echo "  npu: xrt ${xrt.version}, peano ${peano.version}, mlir-aie ${mlirAie.version}"
+          '';
+        });
+
+        # The Intel Level Zero shell (POOT-1163): the default shell plus the pinned Level Zero loader, the
+        # Intel GPU compute runtime, IGC and gmmlib, for poot-l0-runtime's device rows on the Lunar Lake
+        # laptop. A separate shell on purpose, like `.#npu`: no default-lane test needs the stack. The
+        # loader finds the GPU driver (`libze_intel_gpu.so.1`) and IGC only through LD_LIBRARY_PATH on this
+        # NixOS (there is no /run/opengl-driver), and with IGC missing `zeInit` aborts without saying why, so
+        # all four libraries are put there together. The compute runtime's ICD is in its separate `drivers`
+        # output, not `out`.
+        devShells.npu-intel = self.devShells.${system}.default.overrideAttrs (old: {
+          shellHook = old.shellHook + ''
+            # ---- Intel Level Zero (POOT-1163) ----
+            export LD_LIBRARY_PATH="${pkgs.level-zero}/lib:${pkgs.intel-compute-runtime.drivers}/lib:${pkgs.intel-graphics-compiler}/lib:${pkgs.intel-gmmlib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "  level-zero: ${pkgs.level-zero.version}, igc ${pkgs.intel-graphics-compiler.version}, compute-runtime ${pkgs.intel-compute-runtime.version}"
+            # ---- Intel NPU (POOT-1164) ----
+            # The NPU driver finds its vendor graph compiler by soname on this path.
+            export LD_LIBRARY_PATH="${npuUserMode}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            echo "  npu user mode: ${npuUserMode.version}"
           '';
         });
       });

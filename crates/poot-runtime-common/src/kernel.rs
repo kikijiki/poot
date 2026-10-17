@@ -29,6 +29,8 @@
 
 use poot_target::{AieTargetId, BufferStorage, ElementKind, TargetId};
 
+use crate::vpu::VpuGraphArtifact;
+
 /// Whether a kernel argument is read, or written back to the caller's buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArgAccess {
@@ -77,6 +79,8 @@ pub enum KernelCode {
     Hsaco(Box<[u8]>),
     /// A linked AIE xclbin plus its instruction stream, validated against its shape ABI at construction.
     Aie(AieLinkedArtifact),
+    /// OpenVINO IR plus its argument ABI, for the Intel NPU's vendor graph compiler.
+    Vpu(VpuGraphArtifact),
 }
 
 impl KernelCode {
@@ -362,10 +366,11 @@ impl std::fmt::Display for AieArtifactError {
 
 impl std::error::Error for AieArtifactError {}
 
-/// One tensor binding of a shape-specialized AIE kernel: which host buffer it names (by position), the
-/// exact physical and logical storage it must have, its logical dimensions, whether the kernel writes
-/// it, and how many leading elements the compiler proved the kernel touches. The shape is part of the
-/// kernel: a different shape is a different artifact, never a runtime argument.
+/// One tensor binding of a shape-specialized AIE region: which host buffer it names (by position), the
+/// exact physical and logical storage it must have, its logical dimensions, whether the region writes
+/// it, and how many leading elements the compiler proved the region touches. The shape is part of the
+/// artifact: a different shape is a different artifact, never a runtime argument. Where the binding lives
+/// in the artifact's host arenas is derived from the binding list by [`AieShapeAbi::new`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AieBinding {
     storage: BufferStorage,
@@ -373,6 +378,10 @@ pub struct AieBinding {
     dims: Box<[u64]>,
     elements: u64,
     accessed_elements: u64,
+    /// Index into [`AieShapeAbi::arenas`] of the arena this binding lives in.
+    arena: usize,
+    /// Offset of the binding's first element, in 32-bit words from the start of its arena.
+    offset: u64,
 }
 
 impl AieBinding {
@@ -414,6 +423,8 @@ impl AieBinding {
             dims: dims.into(),
             elements,
             accessed_elements,
+            arena: 0,
+            offset: 0,
         })
     }
 
@@ -441,31 +452,114 @@ impl AieBinding {
     pub const fn accessed_elements(&self) -> u64 {
         self.accessed_elements
     }
+
+    /// Index into [`AieShapeAbi::arenas`] of the arena the binding lives in.
+    pub const fn arena(&self) -> usize {
+        self.arena
+    }
+
+    /// Offset of the binding's first element, in 32-bit words from the start of its arena.
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
 }
 
-/// The ordered, compiler-derived binding list of an AIE kernel (the shape and argument ABI).
+/// One host buffer the firmware binds to a region: every binding of one access and element kind lives in
+/// it, one after the other. The firmware's dispatch ABI binds a fixed handful of host buffers whatever the
+/// region's tensor count, so a region addresses its tensors by offset inside these, never by buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AieArena {
+    access: ArgAccess,
+    element: ElementKind,
+    words: u64,
+}
+
+impl AieArena {
+    /// Whether the bindings in the arena are read or written by the region.
+    pub const fn access(&self) -> ArgAccess {
+        self.access
+    }
+
+    /// The element kind of every binding in the arena.
+    pub const fn element(&self) -> ElementKind {
+        self.element
+    }
+
+    /// The arena's length in 32-bit words: the sum of its bindings' elements.
+    pub const fn words(&self) -> u64 {
+        self.words
+    }
+}
+
+/// The ordered, compiler-derived binding list of an AIE region (the shape and argument ABI), and the host
+/// arenas they are laid out in. The layout is a function of the binding list, so two artifacts with the
+/// same bindings agree on every offset and a loader cannot disagree with the linker about one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AieShapeAbi {
     bindings: Box<[AieBinding]>,
+    arenas: Box<[AieArena]>,
 }
 
 impl AieShapeAbi {
-    /// The ABI of `bindings`; refuses an empty list or one with no written binding.
-    pub fn new(bindings: Vec<AieBinding>) -> Result<Self, AieArtifactError> {
+    /// The ABI of `bindings`; refuses an empty list or one with no written binding. The arenas are the
+    /// distinct (access, element kind) pairs in the order reads then writes, F32 then I32; a binding is
+    /// placed in its arena after the bindings before it.
+    pub fn new(mut bindings: Vec<AieBinding>) -> Result<Self, AieArtifactError> {
         let writes = bindings
             .iter()
             .any(|binding| binding.access == ArgAccess::Write);
         if bindings.is_empty() || !writes || u32::try_from(bindings.len()).is_err() {
             return Err(AieArtifactError::NoBindings);
         }
+        let mut arenas: Vec<AieArena> = Vec::new();
+        for binding in &bindings {
+            let (access, element) = (binding.access, binding.storage.element());
+            if !arenas
+                .iter()
+                .any(|arena| arena.access == access && arena.element == element)
+            {
+                arenas.push(AieArena {
+                    access,
+                    element,
+                    words: 0,
+                });
+            }
+        }
+        arenas.sort_by_key(|arena| {
+            (
+                arena.access == ArgAccess::Write,
+                arena.element != ElementKind::F32,
+            )
+        });
+        for (index, binding) in bindings.iter_mut().enumerate() {
+            let arena_index = arenas
+                .iter()
+                .position(|arena| {
+                    arena.access == binding.access && arena.element == binding.storage.element()
+                })
+                .expect("every binding's arena was created above");
+            let arena = &mut arenas[arena_index];
+            binding.arena = arena_index;
+            binding.offset = arena.words;
+            arena.words = arena
+                .words
+                .checked_add(binding.elements)
+                .ok_or(AieArtifactError::ExtentOverflow { index })?;
+        }
         Ok(Self {
             bindings: bindings.into(),
+            arenas: arenas.into(),
         })
     }
 
     /// The bindings, in host-buffer order.
     pub fn bindings(&self) -> &[AieBinding] {
         &self.bindings
+    }
+
+    /// The host arenas the bindings are laid out in: argument `i` of the firmware's dispatch is arena `i`.
+    pub fn arenas(&self) -> &[AieArena] {
+        &self.arenas
     }
 
     /// The core's ABI is interleaved `(ptr, u32 len)` pairs; these are the lengths, in binding order.
@@ -491,7 +585,7 @@ pub struct AieLinkedArtifact {
 }
 
 const XCLBIN_MAGIC: &[u8; 8] = b"xclbin2\0";
-const AIE_BUNDLE_MAGIC: &[u8; 8] = b"POOTAIE1";
+const AIE_BUNDLE_MAGIC: &[u8; 8] = b"POOTAIE2";
 
 impl AieLinkedArtifact {
     /// Validate and wrap a linked artifact.

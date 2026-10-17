@@ -44,6 +44,7 @@ pub(crate) fn last_axis(operation: &'static str, shape: &[usize]) -> Result<usiz
 
 mod activation;
 mod attention;
+mod block_top_k;
 mod counter;
 mod linear;
 mod moe;
@@ -51,6 +52,7 @@ mod norm;
 mod prefill;
 mod rope;
 pub mod sampling;
+mod selected_attention;
 mod ssm;
 mod u64_hash;
 
@@ -67,6 +69,7 @@ pub use attention::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use attention::{LiveAttention, attention_live};
+pub use block_top_k::block_top_k_packed;
 pub use linear::linear;
 #[cfg(any(test, feature = "test-support"))]
 pub use linear::{
@@ -90,6 +93,7 @@ pub use prefill::{attention_prefill, attention_prefill_softcap, rope_prefill};
 pub use rope::{rope, rope_partial, rope_sectioned, rope_sectioned_partial};
 #[cfg(any(test, feature = "test-support"))]
 pub use rope::{rope_batched, rope_sectioned_batched};
+pub use selected_attention::selected_attention;
 #[cfg(any(test, feature = "test-support"))]
 pub use ssm::{
     causal_conv1d_decode, causal_conv1d_prefill, causal_conv1d_prefill_dilated,

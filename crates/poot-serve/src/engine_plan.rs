@@ -211,6 +211,7 @@ fn backend_label(target: TargetId) -> String {
         TargetId::Gpu(TargetBackend::SpirvVulkan) => "spirv-vulkan".to_string(),
         TargetId::Gpu(TargetBackend::AmdGcn(arch)) => format!("amdgcn-{}", arch.mcpu()),
         TargetId::Aie(target) => target.canonical(),
+        TargetId::Vpu(target) => target.canonical(),
     }
 }
 

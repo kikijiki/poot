@@ -100,4 +100,25 @@ pub struct AieCaps {
     pub instruction_bytes: Queried<u64>,
     /// Bytes of device-visible host memory the program's buffer objects may total.
     pub memory_budget_bytes: Queried<u64>,
+    /// What one region artifact (one xclbin, one hardware context) may hold.
+    pub region: RegionLimits,
+}
+
+/// The bounds of one region artifact: how many planned equations a partition can run at once and how many
+/// streams its array and each tile can open. A region holds one equation per compute tile, so these decide
+/// where `package` closes a region. Every bound is [`Queried`]: a bound nobody measured refuses a region
+/// that needs it, never a plausible number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RegionLimits {
+    /// Compute tiles of the partition a region links into: one planned equation runs on each.
+    pub compute_tiles: Queried<u32>,
+    /// DMA input channels of one compute tile: the most streams one equation may read.
+    pub tile_input_channels: Queried<u32>,
+    /// DMA output channels of one compute tile: the most streams one equation may write.
+    pub tile_output_channels: Queried<u32>,
+    /// Host-to-array streams the shim tiles open for one region: every distinct value it reads from outside
+    /// is one, however many equations read it.
+    pub host_input_streams: Queried<u32>,
+    /// Array-to-host streams the shim tiles open for one region: every value the region returns is one.
+    pub host_output_streams: Queried<u32>,
 }

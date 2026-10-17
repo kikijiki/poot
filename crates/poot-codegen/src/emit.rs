@@ -1,6 +1,6 @@
 //! Body -> textual LLVM IR, for the SPIR-V (Vulkan resource shape) and NVPTX (raw-pointer shape)
-//! targets, plus AMDGPU and AIE core (the `AieCore` branches are retained but inactive: nothing in the
-//! pipeline compiles for it, POOT-1093). One target-branched walk: the block/statement/operand/binop logic is
+//! targets, plus AMDGPU and AIE core (the `AieCore` branches are live: `crate::compile_aie` compiles every
+//! tile body of an XDNA2 region through them, POOT-641). One target-branched walk: the block/statement/operand/binop logic is
 //! shared; the leaves that differ (usize width, buffer access, thread-id intrinsics, the length source, the
 //! signature, the footer) branch on `Target`. Alloca-form + plain branches throughout (llc's mem2reg/SROA does
 //! SSA construction and phi insertion); only SPIR-V resource handles stay SSA-direct in the entry block,
@@ -78,6 +78,24 @@ enum ResultTy {
 /// is free on both. `emit_signature` references it on the `define` (and `emit_binop_no_contract` on each
 /// constrained-intrinsic call) exactly when `strictfp_needed`; `emit_footer` declares it the same way.
 const NO_CONTRACT_STRICTFP_ATTR: u32 = 0;
+
+/// The type suffix LLVM mangles into an overloaded intrinsic's name (`llvm.umin.<suffix>`) for a scalar operand of
+/// LLVM type `llty`.
+fn intrinsic_overload(llty: &str) -> Result<&'static str, EmitError> {
+    Ok(match llty {
+        "i32" => "i32",
+        "i64" => "i64",
+        "half" => "f16",
+        "bfloat" => "bf16",
+        "float" => "f32",
+        "double" => "f64",
+        other => {
+            return Err(EmitError::Unsupported(format!(
+                "no overloaded-intrinsic suffix for the LLVM type `{other}`"
+            )));
+        }
+    })
+}
 
 /// The LLVM instruction mnemonic + result-type class for a binop on a given operand type.
 fn binop_inst(op: BinOp, is_float: bool, signed: bool) -> (&'static str, ResultTy) {

@@ -2891,6 +2891,7 @@ mod checkpoint {
     }
 
     /// POOT-572 SC-007 (M5's one real-dimensions receipt): the real `Qwen/Qwen3.8-27B-FP8` checkpoint
+    /// (and, for POOT-135, the real SmolLM3-3B bf16 GGUF, whose documented answer is the same " Paris")
     /// loads through the registry (its block-scaled FP8 projections packed as stored), generates through
     /// the driver on one 80 GB-class GPU, and its first token's top-five log-probabilities equal the CPU
     /// oracle's over the same traced graph and weight map (token ids exact, log-probabilities within
@@ -2898,12 +2899,12 @@ mod checkpoint {
     /// weight-name mapping shared by the device and the oracle (they read one name table) cannot pass
     /// it. Prints the receipt lines a pod run records. Never runs on the dev box: the row is `#[ignore]`d
     /// and a checkpoint of this size is a pod's.
-    fn qwen35_27b_generates_and_matches_the_oracle(path: &std::path::Path, choice: BackendChoice) {
+    fn generates_and_matches_the_oracle(path: &std::path::Path, choice: BackendChoice) -> Vec<u32> {
         let handle = load(path);
         let ids = handle.text().encode(CAPITAL).unwrap();
         let capacity = 64;
         let Some(executor) = open(choice) else {
-            return;
+            return Vec::new();
         };
         let mut limits = options(8, capacity);
         limits.prepared.max_retained_bytes = NonZeroU64::new(1 << 38).unwrap();
@@ -2947,6 +2948,24 @@ mod checkpoint {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         for line in status.lines().filter(|l| l.starts_with("VmHWM")) {
             eprintln!("RECEIPT peak host memory ({line})");
+        }
+        generated.tokens
+    }
+
+    /// POOT-135: the SmolLM3-3B GGUF's eight-token greedy continuation equals the one the safetensors
+    /// checkpoint produces on every backend (" Paris. It is the largest city in", updates 0620, 0646 and
+    /// 0655), on top of the oracle comparison. The oracle reads the same weight map as the device, so a
+    /// GGUF layout error they share (the Q/K row order, the NoPE layer schedule) moves both and only this
+    /// independent literal catches it. Mutation: in `Smollm3Params::from_raw`, skip
+    /// `with_interleaved_rope` for a GGUF; the continuation becomes " Paris, which is the capital of France".
+    fn smollm3_gguf_continues_like_the_safetensors_checkpoint(
+        path: &std::path::Path,
+        choice: BackendChoice,
+    ) {
+        const SAFETENSORS_CONTINUATION: [u32; 8] = [12366, 13, 1102, 374, 279, 7928, 3363, 304];
+        let tokens = generates_and_matches_the_oracle(path, choice);
+        if !tokens.is_empty() {
+            assert_eq!(tokens, SAFETENSORS_CONTINUATION, "{choice:?}");
         }
     }
 
@@ -2993,8 +3012,14 @@ mod checkpoint {
     }
 
     rows! {
-        qwen35_27b_fp8_receipt: "qwen3.8-27b-fp8", qwen35_27b_generates_and_matches_the_oracle,
+        qwen35_27b_fp8_receipt: "qwen3.8-27b-fp8",
+            |path, choice| {
+                generates_and_matches_the_oracle(path, choice);
+            },
             "loads the real Qwen3.8-27B-FP8 checkpoint (about 28 GB) and runs the CPU oracle over it: an 80 GB-class pod only, never the dev box";
+        smollm3_gguf_oracle: "smollm3-3b-gguf/smollm3-3b-bf16.gguf",
+            smollm3_gguf_continues_like_the_safetensors_checkpoint,
+            "loads the real SmolLM3-3B bf16 GGUF (6 GB, f32 on the CPU oracle) onto the GPU; needs >= 40Gi available";
         qwen2_bf16_recorded: "qwen2.5-0.5b",
             |path, choice| recorded(path, &QWEN2_5_0_5B_PROMPT, &QWEN2_5_0_5B, choice),
             "loads the real qwen2.5-0.5b bf16 checkpoint onto the GPU; needs >= 40Gi available";
@@ -3059,6 +3084,8 @@ mod checkpoint {
             "loads the bloom-560m Q8_0 GGUF onto the GPU; needs >= 40Gi available";
         mpt_coherent: "mptk-1b", mptk_is_fluent,
             "loads mptk-1b (MPT-1.3B, f32) onto the GPU; needs >= 40Gi available";
+        mpt_gguf_coherent: "mptk-1b-gguf/mptk-1b-f16.gguf", mptk_is_fluent,
+            "loads the mptk-1b F16 GGUF (llama.cpp convert_hf_to_gguf.py; tied embeddings, no output.weight) onto the GPU; needs >= 40Gi available";
         smollm3_coherent: "smollm3-3b",
             |path, choice| continues_with(path, choice, CAPITAL, 20, "paris"),
             "loads the bf16 SmolLM3-3B onto the GPU; needs >= 40Gi available";
