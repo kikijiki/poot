@@ -206,7 +206,6 @@ pub enum AttentionKeys {
 /// What [`attention_live`] returns: the attention output and the length-validation witness the caller
 /// declares as a validation output.
 #[derive(Clone, Copy, Debug)]
-#[cfg(any(test, feature = "test-support"))]
 pub struct LiveAttention {
     /// `[B,Hq,Lq,Dv]`.
     pub out: Traced,
@@ -219,7 +218,6 @@ pub struct LiveAttention {
 /// index-bounds guard ([`Builder::guard_index_bounds`] on `len - 1`), so an out-of-range length publishes
 /// nothing through the validation channel and the graph reads a valid in-range fallback.
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(test, feature = "test-support"))]
 pub fn attention_live(
     b: &Builder,
     q: Traced,

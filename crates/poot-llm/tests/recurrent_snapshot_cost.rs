@@ -340,6 +340,12 @@ impl Device for CountingDevice {
         std::mem::forget(self.memory.record_alloc(role, bytes));
         Ok(())
     }
+    /// This fake keeps no storage, so it states no bound: the engine's length check passes every
+    /// dispatch it records.
+    fn buffer_elems(&self, _buffer: &()) -> usize {
+        usize::MAX
+    }
+
     fn load_kernel(
         &mut self,
         _key: &str,

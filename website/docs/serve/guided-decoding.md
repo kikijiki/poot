@@ -8,6 +8,17 @@ sidebar_position: 6
 
 The server validates the constraint before it asks the engine: an invalid `guided_regex`, `guided_json`, `guided_choice`, `guided_grammar` or `response_format` is a `400`. Every one of a request's `n` choices carries the constraint.
 
+Constraints are bounded so one request cannot exhaust the server. A `guided_regex` longer than 4096 bytes, a
+`guided_grammar` longer than 16 KiB, or a `guided_json` or `response_format` schema whose JSON text is longer than
+16 KiB is a `400`. So is a pattern whose compiled automaton is too large, for example a long counted repetition
+over an alternation such as `(a|b)*a(a|b){17}`; the error names the regex and the size limit it hit.
+
+The constraint applies to the bytes each token adds to the output, read from the model's vocabulary. A
+word-initial token of a SentencePiece model counts as its leading space plus the word, so a pattern that starts
+with a space, such as `guided_regex: " the [a-z]+"`, constrains the tokens the model emits. The `bytes` of a
+logprob entry include that space. The returned text of a whole (non-streamed) reply is decoded as one sequence,
+and that decode drops the single leading space a SentencePiece model adds to the start of text.
+
 The completion and chat endpoints can constrain the output so it is guaranteed well-formed. The
 engine compiles the constraint to a per-step token mask and the sampler only ever picks an allowed
 token. Four request fields, checked in this order (`guided_choice`, then `guided_regex`, then

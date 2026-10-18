@@ -551,6 +551,10 @@ impl Device for XdnaDevice {
         })))
     }
 
+    fn buffer_elems(&self, buffer: &XdnaBuffer) -> usize {
+        buffer.bytes() / buffer.0.storage.element().byte_width()
+    }
+
     fn load_kernel(&mut self, key: &str, kernel: CompiledKernel) -> Result<XdnaKernel, XdnaError> {
         self.healthy()?;
         let KernelCode::Aie(artifact) = kernel.code() else {

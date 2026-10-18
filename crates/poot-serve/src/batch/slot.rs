@@ -1,13 +1,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use poot_llm::driver::error::FailureClass;
 use poot_llm::{Sampler, TokenLogprob};
 
 use crate::metrics::Metrics;
-use crate::types::{Completion, FinishReason, GenEvent, Job, PerTokenInfo, PromptInput};
+use crate::types::{
+    ChoiceReply, Completion, FinishReason, GenEvent, Job, PerTokenInfo, PromptInput,
+};
 use poot_llm::driver::stops::StopScanner;
 
 /// A request that holds an engine sequence: its committed tokens, its sampler and the channel back to
@@ -26,7 +27,7 @@ pub(crate) struct Slot<S> {
     pub(crate) stream: bool,
     /// The generated text released so far, cut before a stop string.
     pub(crate) text: String,
-    pub(crate) reply: Sender<GenEvent>,
+    pub(crate) reply: ChoiceReply,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) logprobs: Vec<TokenLogprob>,
     /// Set on the first emitted token; `cumulative_ms` in `PerTokenInfo` is measured from it.
@@ -91,7 +92,7 @@ impl<S> Slot<S> {
     }
 
     /// The finished request's result.
-    pub(crate) fn into_completion(self, finish: FinishReason) -> (Sender<GenEvent>, Completion) {
+    pub(crate) fn into_completion(self, finish: FinishReason) -> (ChoiceReply, Completion) {
         let Self {
             mut tokens,
             prompt_len,

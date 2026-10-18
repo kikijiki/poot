@@ -64,11 +64,10 @@ pub use activation::{
 };
 pub(crate) use attention::attention_over_keys;
 pub use attention::{
-    AttentionKeys, attention, attention_masked, attention_masked_softcap,
-    attention_prefill_with_sink, attention_softcap, paged_view, repeat_kv, repeat_kv_tiled,
+    AttentionKeys, LiveAttention, attention, attention_live, attention_masked,
+    attention_masked_softcap, attention_prefill_with_sink, attention_softcap, paged_view,
+    repeat_kv, repeat_kv_tiled,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use attention::{LiveAttention, attention_live};
 pub use block_top_k::block_top_k_packed;
 pub use linear::linear;
 #[cfg(any(test, feature = "test-support"))]

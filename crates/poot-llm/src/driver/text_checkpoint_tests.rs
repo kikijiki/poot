@@ -4,9 +4,39 @@
 
 mod chat_template_checkpoints {
     use poot_load::gguf::GgufIndex;
-    use poot_text::{ChatFormat, read_tokenizer_config_chat, render_jinja_value};
+    use poot_text::{ChatFormat, ChatTemplate, TextCodec, read_tokenizer_config_chat};
+    use tokenizers::Tokenizer;
+    use tokenizers::models::wordlevel::WordLevel;
 
     const MSGS: &[(&str, &str)] = &[("system", "Be terse."), ("user", "Hi")];
+
+    /// `messages` (a raw OpenAI `messages` array) rendered through the jinja `template`, as the chat endpoint
+    /// renders them. No token is looked up, so the codec's tokenizer is an empty word list.
+    fn render(
+        template: &str,
+        messages: &serde_json::Value,
+        bos: Option<&str>,
+        eos: Option<&str>,
+        tools: Option<&serde_json::Value>,
+    ) -> poot_text::Result<String> {
+        let model = WordLevel::builder()
+            .vocab([("<unk>".to_string(), 0u32)].into_iter().collect())
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("build wordlevel model");
+        let codec = TextCodec::with_tokenizer(
+            Tokenizer::new(model),
+            None,
+            0,
+            ChatFormat::ChatML,
+            ChatTemplate {
+                template: Some(template.to_string()),
+                bos_token: bos.map(str::to_string),
+                eos_token: eos.map(str::to_string),
+            },
+        );
+        Ok(codec.render_chat_value(messages, tools)?.prompt)
+    }
 
     /// A conversation of `(role, content)` pairs rendered through a jinja chat template, as the
     /// `messages` array of an OpenAI request.
@@ -21,7 +51,7 @@ mod chat_template_checkpoints {
             .iter()
             .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
             .collect();
-        render_jinja_value(
+        render(
             template,
             &serde_json::Value::Array(messages),
             bos,
@@ -108,7 +138,7 @@ mod chat_template_checkpoints {
             { "role": "tool", "tool_call_id": "call_0", "name": "get_weather",
               "content": "{\"temp_c\": 18, \"sky\": \"sunny\"}" },
         ]);
-        let out = render_jinja_value(
+        let out = render(
             &tmpl,
             &messages,
             bos.as_deref(),
@@ -159,7 +189,7 @@ mod chat_template_checkpoints {
             {"role": "user", "content": "What is the capital of France?"},
             {"role": "assistant", "content": "Paris."},
         ]);
-        let out = render_jinja_value(&tmpl, &messages, None, None, None)
+        let out = render(&tmpl, &messages, None, None, None)
             .expect("the real gemma4 chat_template must render (this is the reported bug)");
         eprintln!("gemma4 chat_template render:\n{out}");
         assert!(!out.is_empty());

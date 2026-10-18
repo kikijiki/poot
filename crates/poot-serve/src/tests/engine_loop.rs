@@ -36,7 +36,7 @@ fn a_non_streaming_request_whose_client_hangs_up_is_released_within_one_step() {
     let submit_tx = tx.clone();
     let submit_metrics = Arc::clone(&metrics);
     std::thread::spawn(move || {
-        let outcome = submit(
+        let outcome = submit_one(
             &submit_tx,
             &submit_metrics,
             generation_request("ab", 1_000_000, false),
@@ -241,13 +241,18 @@ pub(super) fn health_over_http(health: &EngineHealth) -> (String, serde_json::Va
         .expect("write request");
     let (served, _queue) = served_over(model, 1);
     let metrics = test_metrics("health");
-    let limiter = RateLimiter {
-        rpm: 0,
-        windows: Mutex::new(Default::default()),
-    };
     let policy = LoraAdminPolicy::from_configured_key(IpAddr::from([127, 0, 0, 1]), None)
         .expect("loopback policy");
-    handle(server, &served, health, &metrics, &limiter, &policy).expect("handled");
+    handle(
+        server,
+        Instant::now(),
+        &served,
+        health,
+        &metrics,
+        &test_limits(),
+        &policy,
+    )
+    .expect("handled");
     let mut response = String::new();
     client.read_to_string(&mut response).expect("read response");
     let status = response.lines().next().unwrap_or_default().to_string();
@@ -286,7 +291,7 @@ fn a_panicking_step_makes_health_dead_with_the_reason_and_fails_the_request() {
         let (metrics, health) = (Arc::clone(&metrics), health.clone());
         std::thread::spawn(move || run_engine_thread(engine, rx, &metrics, &health))
     };
-    let error = submit(
+    let error = submit_one(
         &tx,
         &metrics,
         generation_request("ab", 10, false),

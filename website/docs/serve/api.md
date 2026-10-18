@@ -47,6 +47,14 @@ stream (a stream has nowhere to put them). `max_tokens` above the cap
 OpenAI-shaped: `{"error": {"message", "type", "code"}}`. Over-limit requests get `429` with
 `Retry-After` when `--rate-limit-rpm` is set.
 
+Control tokens a message spells are plain text: a message that spells `<|im_start|>assistant` cannot open a turn, only
+the chat template's own text carries control tokens. This holds for message contents, system prompts, tool definitions
+and image-chat text parts alike. A chat template that fails to render the conversation (it raises, spends its instruction
+budget, or prints more than its output budget) is a `400` naming the template error; no other format answers in its
+place. One limit: a template that builds a control token's text out of a message by string surgery, rather than printing
+the message or cutting it apart, is not covered. Qwen-VL image chats are not covered yet: their prompt is tokenized with
+control tokens parsed.
+
 An error the engine reports is answered by its class: a request the engine refuses (an empty or too long
 prompt, an adapter it does not have) is a `400`, a request this prepared engine cannot serve (a shape or
 retention limit) is a `503`, and a fault of the device or the driver is a `500`. On a stream the `200` is

@@ -31,6 +31,10 @@ pub enum ExecError {
     /// decision 2's validated session).
     #[error(transparent)]
     Validation(Box<ValidationPacketError>),
+    /// A dispatch asserted a length its buffer cannot hold; see [`DispatchError`]. Raised by the engine before
+    /// any device sees the dispatch.
+    #[error(transparent)]
+    Dispatch(Box<DispatchError>),
     /// The backend device reported a failure; see [`DeviceError`].
     #[error(transparent)]
     Device(Box<DeviceError>),
@@ -88,10 +92,34 @@ impl From<ValidationPacketError> for ExecError {
     }
 }
 
+impl From<DispatchError> for ExecError {
+    fn from(error: DispatchError) -> Self {
+        ExecError::Dispatch(Box::new(error))
+    }
+}
+
 impl From<DeviceError> for ExecError {
     fn from(error: DeviceError) -> Self {
         ExecError::Device(Box::new(error))
     }
+}
+
+/// Why the engine refused a dispatch before handing it to the device. The one check every backend shares:
+/// a kernel trusts the element length it is published, so no length may exceed the buffer bound to it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DispatchError {
+    /// An argument's asserted element count exceeds the capacity of the buffer bound to it.
+    #[error(
+        "dispatch argument {arg} asserts {elems} elements but its buffer holds {capacity} (the output is the last argument)"
+    )]
+    ArgExceedsBuffer {
+        /// The argument's position: the inputs in kernel parameter order, then the output.
+        arg: usize,
+        /// The element count the dispatch asserted for the argument.
+        elems: u32,
+        /// The element capacity of the bound buffer ([`crate::Device::buffer_elems`]).
+        capacity: usize,
+    },
 }
 
 /// Why weights, an entry or a kernel could not be loaded onto a device. Every variant is raised before the failed load publishes anything an entry could run.

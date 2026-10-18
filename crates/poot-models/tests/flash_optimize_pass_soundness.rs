@@ -360,8 +360,8 @@ fn dispatch_count_regression_on_real_qwen2_decode_configs() {
 /// the position's I32-to-F32 cast into the mask region that reads it (POOT-1108) removed that equation, 536 and
 /// 680. The production dispatch counts are pinned through `compile` in `src/tests.rs`.
 // POOT-1150: +3 each, the hidden pad column (iota range and concat) of the padded KV stride at capacity 64.
-const PIN_QWEN2: usize = 539;
-const PIN_QWEN3: usize = 683;
+const PIN_QWEN2: usize = 540;
+const PIN_QWEN3: usize = 684;
 
 #[test]
 fn flash_default_cuts_prefill_dispatch_count() {

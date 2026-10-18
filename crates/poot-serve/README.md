@@ -16,7 +16,7 @@ cargo run -p poot-serve --release -- /path/to/model 127.0.0.1:8080
 
 ## CLI flags
 
-- Positional: `[MODEL_DIR] [ADDR]`. `ADDR` defaults to `127.0.0.1:8080`. Without `MODEL_DIR` the model is
+- Positional: `[MODEL_DIR] [ADDR]`. `ADDR` defaults to `127.0.0.1:8080`; a request's `Host` must name it (a wildcard address checks only the port). Without `MODEL_DIR` the model is
   `qwen2.5-0.5b` under the `POOT_MODELS_DIR` directory; with neither, startup fails naming the variable.
 - `--backend wgpu|rocm|ptx|vulkan|auto` (default `auto`) - the device. `auto` opens PTX if a CUDA device opens,
   else ROCm if an HSA GPU agent opens, else wgpu, once; a model the chosen backend refuses fails startup and no
@@ -24,8 +24,18 @@ cargo run -p poot-serve --release -- /path/to/model 127.0.0.1:8080
 
 - `--rate-limit-rpm N` - per-client requests-per-minute limit (default 0 = unlimited)
 - `--max-connections N` - connection-handler thread cap (default 4096, 0 = unlimited)
-- `--read-timeout-secs N` - idle read timeout for the request head and body (default 30, 0 disables)
-- `--write-timeout-secs N` - positive whole-second idle timeout for HTTP and SSE response writes (default 30)
+- `--max-pending-requests N` - model requests admitted at once, running or waiting for the engine; one more is
+  answered 429 (default 256, at least 1)
+- `--max-receiving-requests N` - admitted requests that may be reading their body at once; one more is answered 429
+  (default 64, at least 1)
+- `--max-queue-wait-secs N` - seconds an admitted generation request may wait for the engine to open it, else 503
+  (default 60, at least 1)
+- `--max-body-mib N` - request body cap in MiB for every route but chat on an image server (default 4)
+- `--max-image-body-mib N` - request body cap in MiB for chat on a server that takes images (default 64)
+- `--request-timeout-secs N` - seconds from accept for the whole request head and body to arrive, else 408
+  (default 30, at least 1)
+- `--write-timeout-secs N` - positive whole-second limit on one response write or stream frame, however the reader
+  paces it (default 30)
 - `--drain-timeout-secs N` - graceful shutdown drain timeout before cancellation (default 30, 1 to 86400)
 - `--lora-admin-key-file FILE` - file holding the bearer token for `/v1/lora_adapters`
 - `--draft-lookup NGRAM:K`, `--draft-model PATH:K` - speculative decoding

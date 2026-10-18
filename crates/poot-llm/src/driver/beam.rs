@@ -211,18 +211,7 @@ impl Driver {
         if max_new == 0 {
             return Ok(Vec::new());
         }
-        if prompt.is_empty() {
-            return Err(InvalidRequest::EmptyPrompt.into());
-        }
-        let capacity = self.options.capacity.get();
-        if prompt.len() + max_new > capacity {
-            return Err(InvalidRequest::Capacity {
-                prompt: prompt.len(),
-                max_new,
-                max: capacity,
-            }
-            .into());
-        }
+        self.check_admission(&prompt, max_new)?;
         let open = self
             .serving
             .as_ref()

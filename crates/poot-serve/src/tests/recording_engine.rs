@@ -7,7 +7,10 @@ use std::collections::BTreeSet;
 use poot_llm::driver::{Encoded, PrefixOutcome, PrefixSkip, PromptEmbeds, Release, RowSpeculation};
 
 use super::*;
-use crate::types::{AdapterInfo, AdminError, AdminReply, AdminRequest, EncodeRow, PromptRows};
+use crate::types::{
+    AdapterInfo, AdminError, AdminReply, AdminRequest, ChoiceEvents, ChoiceReply, EncodeRow,
+    PromptRows,
+};
 
 /// The block the fake's prefix cache registers and reuses in: whole multiples of it.
 const BLOCK: usize = 4;
@@ -411,8 +414,29 @@ impl ServeEngine for RecordingEngine {
 
 /// A job for `prompt`, and what the test keeps of it: the reply receiver and the cancel flag.
 pub(crate) struct Submitted {
-    pub(crate) replies: Receiver<GenEvent>,
+    pub(crate) replies: ReplyStream,
     pub(crate) cancel: Arc<AtomicBool>,
+}
+
+/// The events of a job's one choice, untagged: what a test that reads a single job's replies sees.
+pub(crate) struct ReplyStream(ChoiceEvents);
+
+impl ReplyStream {
+    pub(crate) fn recv(&self) -> Result<GenEvent, mpsc::RecvError> {
+        self.0.recv().map(|(_, event)| event)
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<GenEvent, mpsc::TryRecvError> {
+        self.0.try_recv().map(|(_, event)| event)
+    }
+
+    pub(crate) fn recv_timeout(&self, wait: Duration) -> Result<GenEvent, mpsc::RecvTimeoutError> {
+        self.0.recv_timeout(wait).map(|(_, event)| event)
+    }
+
+    pub(crate) fn try_iter(&self) -> impl Iterator<Item = GenEvent> + '_ {
+        self.0.try_iter().map(|(_, event)| event)
+    }
 }
 
 pub(crate) struct JobSpec {
@@ -422,6 +446,8 @@ pub(crate) struct JobSpec {
     pub(crate) stream: bool,
     /// Embedding rows standing in for the first prompt token: a multimodal prompt.
     pub(crate) embeds: bool,
+    /// The job has waited past its maximum queue wait before the engine sees it.
+    pub(crate) overdue: bool,
 }
 
 /// One token per character, its code point: the prompts the tests write as strings.
@@ -437,6 +463,7 @@ impl JobSpec {
             stop: Vec::new(),
             stream: false,
             embeds: false,
+            overdue: false,
         }
     }
 
@@ -456,8 +483,14 @@ impl JobSpec {
         self
     }
 
+    pub(crate) fn overdue(mut self) -> Self {
+        self.overdue = true;
+        self
+    }
+
     pub(crate) fn build(self) -> (Job, Submitted) {
-        let (reply, replies) = mpsc::channel();
+        let (mut replies, events) = ChoiceReply::channel(1);
+        let reply = replies.remove(0);
         let cancel = Arc::new(AtomicBool::new(false));
         let tokens = tokens_of(&self.prompt);
         let prompt = if self.embeds {
@@ -479,10 +512,21 @@ impl JobSpec {
             stream: self.stream,
             reply,
             submitted: Instant::now(),
+            start_by: if self.overdue {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(3600)
+            },
             lora_adapter: AdapterRef::Base,
             cancel: Arc::clone(&cancel),
         };
-        (job, Submitted { replies, cancel })
+        (
+            job,
+            Submitted {
+                replies: ReplyStream(events),
+                cancel,
+            },
+        )
     }
 }
 

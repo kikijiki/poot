@@ -41,6 +41,28 @@ fn chain_hash(prev: u64, block: &[u32]) -> u64 {
     h
 }
 
+/// The chain hash of the empty prefix: FNV's offset basis.
+const CHAIN_ROOT: u64 = 0xcbf29ce484222325;
+
+/// One cached prefix block. The chain hash only indexes: a hit is accepted when the block's tokens and
+/// the chain hash of the prefix before it equal the entry's (the parent entry was itself verified the
+/// same way, as a lookup walks the blocks in order), so a hash collision is a miss, never shared K/V.
+#[derive(Debug)]
+struct Entry {
+    /// Chain hash of the prefix before this block.
+    parent: u64,
+    /// The block's tokens.
+    tokens: [u32; BLOCK_SIZE],
+    /// The physical block holding the K/V.
+    block: u32,
+}
+
+impl Entry {
+    fn matches(&self, parent: u64, tokens: &[u32; BLOCK_SIZE]) -> bool {
+        self.parent == parent && self.tokens == *tokens
+    }
+}
+
 /// What `release` did with a finished sequence's prompt prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixOutcome {
@@ -81,11 +103,21 @@ pub enum PrefixSkip {
 /// read-only). The cache holds one reference to each cached block, so it survives after the producing
 /// sequence frees, and releases it on eviction. This is the allocator/policy layer; skipping prefill
 /// compute for reused blocks and the engine wiring are separate.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PrefixCache {
-    /// (chained hash of a full prefix block, effective-weights identity) -> the physical block holding
-    /// its KV.
-    cached: std::collections::HashMap<(u64, PrefixIdentity), u32>,
+    /// (chained hash of a full prefix block, effective-weights identity) -> the block's entry.
+    cached: std::collections::HashMap<(u64, PrefixIdentity), Entry>,
+    /// The chain hash; replaceable in tests to force collisions.
+    hash: fn(u64, &[u32]) -> u64,
+}
+
+impl Default for PrefixCache {
+    fn default() -> Self {
+        Self {
+            cached: std::collections::HashMap::new(),
+            hash: chain_hash,
+        }
+    }
 }
 
 impl PrefixCache {
@@ -120,15 +152,17 @@ impl PrefixCache {
         pool: &mut BlockPool,
     ) -> (Vec<u32>, usize) {
         let mut out = Vec::new();
-        let mut chain = 0xcbf29ce484222325u64; // FNV offset basis
+        let mut chain = CHAIN_ROOT;
         for block in tokens.as_chunks::<BLOCK_SIZE>().0 {
-            chain = chain_hash(chain, block);
+            let parent = chain;
+            chain = (self.hash)(parent, block);
             match self.cached.get(&(chain, identity)) {
-                Some(&blk) => {
-                    pool.incref(blk);
-                    out.push(blk);
+                Some(entry) if entry.matches(parent, block) => {
+                    pool.incref(entry.block);
+                    out.push(entry.block);
                 }
-                None => break, // the first uncached block ends the matched prefix
+                // The first uncached block, or a colliding one, ends the matched prefix.
+                _ => break,
             }
         }
         let skip = out.len() * BLOCK_SIZE;
@@ -147,17 +181,27 @@ impl PrefixCache {
         identity: PrefixIdentity,
         pool: &mut BlockPool,
     ) {
-        let mut chain = 0xcbf29ce484222325u64;
+        let mut chain = CHAIN_ROOT;
         for (i, block) in tokens.as_chunks::<BLOCK_SIZE>().0.iter().enumerate() {
-            chain = chain_hash(chain, block);
-            if i >= physical.len() {
-                break;
-            }
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                self.cached.entry((chain, identity))
-            {
-                e.insert(physical[i]);
-                pool.incref(physical[i]); // the cache's own reference (only for newly-cached blocks)
+            let Some(&blk) = physical.get(i) else { break };
+            let parent = chain;
+            chain = (self.hash)(parent, block);
+            match self.cached.entry((chain, identity)) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(Entry {
+                        parent,
+                        tokens: *block,
+                        block: blk,
+                    });
+                    pool.incref(blk); // the cache's own reference (only for newly-cached blocks)
+                }
+                // Already cached; a colliding block keeps the first's entry and ends the chain, as
+                // every later block would hang off a prefix the cache does not hold.
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    if !e.get().matches(parent, block) {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -185,8 +229,8 @@ impl PrefixCache {
             .copied()
             .collect();
         for key in &stale {
-            let blk = self.cached.remove(key).expect("collected from the map");
-            pool.free_block(blk);
+            let entry = self.cached.remove(key).expect("collected from the map");
+            pool.free_block(entry.block);
         }
         stale.len()
     }
@@ -198,12 +242,12 @@ impl PrefixCache {
         let stale: Vec<(u64, PrefixIdentity)> = self
             .cached
             .iter()
-            .filter(|&(_, &blk)| pool.refcount(blk) == 1)
+            .filter(|&(_, entry)| pool.refcount(entry.block) == 1)
             .map(|(&h, _)| h)
             .collect();
         for h in &stale {
-            let blk = self.cached.remove(h).unwrap();
-            pool.free_block(blk); // releases the cache's last reference -> back to the free list
+            let entry = self.cached.remove(h).unwrap();
+            pool.free_block(entry.block); // releases the cache's last reference -> back to the free list
         }
         stale.len()
     }
@@ -431,5 +475,29 @@ mod tests {
         pc.release(&b, &mut pool); // -> refcount 1 (cache only)
         assert_eq!(pc.evict_unused(&mut pool), 1);
         assert_eq!(pool.available(), pool.capacity(), "now reclaimed");
+    }
+
+    /// Two different blocks forced onto one chain hash: the second request misses rather than sharing
+    /// the first's K/V. Mutation: accept on the key alone (drop `entry.matches`); the second hits.
+    #[test]
+    fn colliding_chain_hash_is_a_miss_not_a_shared_block() {
+        let mut pool = BlockPool::new(4);
+        let mut pc = PrefixCache {
+            hash: |_, _| 7,
+            ..PrefixCache::default()
+        };
+        let a = toks(0, BLOCK_SIZE);
+        let b = toks(1000, BLOCK_SIZE);
+        let a_blocks = [pool.alloc().unwrap()];
+        pc.register_for(&a, &a_blocks, PrefixIdentity::BASE, &mut pool);
+        let (hit, _) = pc.match_prefix_for(&a, PrefixIdentity::BASE, &mut pool);
+        assert_eq!(hit, a_blocks, "the same tokens still hit");
+        let (miss, skip) = pc.match_prefix_for(&b, PrefixIdentity::BASE, &mut pool);
+        assert!(miss.is_empty() && skip == 0, "a colliding block must miss");
+        // Registering the colliding block keeps the first entry.
+        let b_blocks = [pool.alloc().unwrap()];
+        pc.register_for(&b, &b_blocks, PrefixIdentity::BASE, &mut pool);
+        assert_eq!(pc.len(), 1);
+        assert_eq!(pool.refcount(b_blocks[0]), 1, "the cache took no reference");
     }
 }

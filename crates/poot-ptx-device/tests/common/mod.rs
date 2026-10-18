@@ -351,6 +351,9 @@ impl Device for PtxDeviceProxy<'_> {
     ) -> Result<Self::Buffer, Self::Error> {
         self.0.allocate(role, storage, elems)
     }
+    fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
+        self.0.buffer_elems(buffer)
+    }
     fn load_kernel(
         &mut self,
         key: &str,

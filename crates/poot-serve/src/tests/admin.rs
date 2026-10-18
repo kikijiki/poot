@@ -605,7 +605,7 @@ fn lora_admin_trust_boundary_policy_precedes_every_route_operation() {
             method: "POST",
             path: "/v1/lora_adapters",
             authorization: &[],
-            content_length: MAX_BODY_BYTES + 1,
+            content_length: BODY_CAP + 1,
         },
         WithheldHeadCase {
             name: "duplicate invalid then valid",
@@ -876,19 +876,15 @@ fn lora_admin_trust_boundary_keeps_ordinary_inference_usable() {
         let (server, _) = listener.accept().expect("accept inference control client");
         let (served, job_rx) = served_over(Arc::clone(&runner), 1);
         let metrics = Arc::new(test_metrics("card315-inference"));
-        let limiter = Arc::new(RateLimiter {
-            rpm: 0,
-            windows: Mutex::new(HashMap::new()),
-        });
         let metrics_for_handler = Arc::clone(&metrics);
-        let limiter_for_handler = Arc::clone(&limiter);
         let handler = std::thread::spawn(move || {
             handle(
                 server,
+                Instant::now(),
                 &served,
                 &EngineHealth::serving_for_test("spirv-vulkan", 4, 1024),
                 &metrics_for_handler,
-                &limiter_for_handler,
+                &test_limits(),
                 &policy,
             )
         });
@@ -896,7 +892,7 @@ fn lora_admin_trust_boundary_keeps_ordinary_inference_usable() {
         let body = r#"{"prompt":"a","max_tokens":1}"#;
         write!(
             client,
-            "POST /v1/completions HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .expect("write inference request without admin credentials");

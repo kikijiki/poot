@@ -252,6 +252,15 @@ fn map_file(path: &Path) -> Result<(String, StoredBytes), LoadError> {
     Ok((name, StoredBytes::map(File::open(path)?)?))
 }
 
+/// Whether `name` is exactly one normal path component: no separator, no `.`/`..`, not absolute.
+fn is_plain_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
 /// Unique shard file names a `model.safetensors.index.json`'s `weight_map` names, sorted so shards
 /// are read in a deterministic order (each shard is read exactly once regardless of how many
 /// tensors it contributes).
@@ -267,6 +276,12 @@ fn shard_files(index: &serde_json::Value) -> Result<Vec<String>, LoadError> {
             })
         })
         .collect::<Result<_, _>>()?;
+    // The index is untrusted: a shard is a plain file name in the model directory, never a path.
+    if let Some(unsafe_name) = shards.iter().find(|name| !is_plain_file_name(name)) {
+        return Err(LoadError::UnsafeShardName {
+            name: unsafe_name.clone(),
+        });
+    }
     shards.sort();
     shards.dedup();
     Ok(shards)
@@ -368,6 +383,16 @@ pub fn pack_quantized_linears(
             _ => Err(layout(name, "missing".to_string())),
         }
     };
+    // A header's extent times the 8 codes a packed i32 word holds: refused, not wrapped, when it
+    // overflows `usize` (the header is untrusted).
+    let pack_extent = |tensor: String, words: usize, what: &str| {
+        words.checked_mul(8).ok_or_else(|| {
+            layout(
+                tensor,
+                format!("{what} extent {words} times 8 overflows usize"),
+            )
+        })
+    };
     let nonzero = |tensor: String, n: usize, what: &str| {
         std::num::NonZeroUsize::new(n).ok_or_else(|| layout(tensor, format!("{what} is 0")))
     };
@@ -452,7 +477,7 @@ pub fn pack_quantized_linears(
                         format!("shape {:?}, expected [K/8, out]", qweight.shape()),
                     ));
                 };
-                let k = k8 * 8;
+                let k = pack_extent(format!("{prefix}.qweight"), k8, "K/8")?;
                 let [groups, _] = scales.shape()[..] else {
                     return Err(layout(
                         format!("{prefix}.scales"),
@@ -519,7 +544,7 @@ pub fn pack_quantized_linears(
                 };
                 (
                     WeightFormat::Awq { group_size },
-                    [out8 * 8, k],
+                    [pack_extent(format!("{prefix}.qweight"), out8, "out/8")?, k],
                     vec![
                         (
                             SourceRole::Planar(OperandRole::Codes),
@@ -662,5 +687,128 @@ pub(crate) mod test_only {
     pub(crate) fn load_weight_store_bytes(bytes: &[u8]) -> Result<WeightStore, LoadError> {
         let files = [(String::new(), StoredBytes::from(bytes.to_vec()))];
         build_store(safetensors_plan(&files)?, default_workers())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A model directory whose `model.safetensors.index.json` maps one tensor to `shard`.
+    fn map_dir_with_shard_named(label: &str, shard: &str) -> Result<usize, LoadError> {
+        let dir = poot_test_util::unique_temp_path(label);
+        std::fs::create_dir_all(&*dir).unwrap();
+        let index = serde_json::json!({"weight_map": {"w": shard}});
+        std::fs::write(dir.join("model.safetensors.index.json"), index.to_string()).unwrap();
+        map_weight_files(&*dir).map(|files| files.len())
+    }
+
+    /// POOT-1196 SC-006: a shard index naming a path (parent component, separator, absolute) is
+    /// refused by name before any file is opened; a plain name proceeds (to the missing file).
+    #[test]
+    fn shard_names_must_be_plain_file_names() {
+        for name in [
+            "../x.safetensors",
+            "sub/x.safetensors",
+            "/etc/x.safetensors",
+            "..",
+        ] {
+            let error = map_dir_with_shard_named("shard_name", name).unwrap_err();
+            assert!(
+                matches!(&error, LoadError::UnsafeShardName { name: n } if n == name),
+                "{name}: {error}"
+            );
+        }
+        let error = map_dir_with_shard_named("shard_name_plain", "x.safetensors").unwrap_err();
+        assert!(matches!(error, LoadError::Io(_)), "{error}");
+    }
+
+    /// An archive of the given `(name, dtype, shape)` entries, all zero bytes sized by the shape.
+    fn archive(entries: &[(&str, &str, Vec<usize>)]) -> Vec<u8> {
+        let mut header = serde_json::Map::new();
+        let mut data_len = 0usize;
+        for (name, dtype, shape) in entries {
+            let width = if *dtype == "F16" { 2 } else { 4 };
+            let bytes = shape.iter().product::<usize>() * width;
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [data_len, data_len + bytes]}),
+            );
+            data_len += bytes;
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut blob = (header.len() as u64).to_le_bytes().to_vec();
+        blob.extend(header);
+        blob.resize(blob.len() + data_len, 0);
+        blob
+    }
+
+    fn pack(
+        kind: QuantKind,
+        entries: &[(&str, &str, Vec<usize>)],
+    ) -> Result<WeightStore, LoadError> {
+        let store = test_only::load_weight_store_bytes(&archive(entries))?;
+        pack_quantized_linears(
+            &store,
+            QuantScheme {
+                kind,
+                group_size: 8,
+            },
+        )
+    }
+
+    /// POOT-1196 SC-005: header extents of a quantized linear that overflow on multiply, or are
+    /// zero, are a typed refusal naming the tensor; none panics or wraps.
+    #[test]
+    fn quantized_linear_extents_are_checked() {
+        let huge = usize::MAX / 8 + 1;
+        // GPTQ qweight [K/8, out] with K/8 * 8 overflowing; zero elements keep the header valid.
+        let gptq = |k8: usize| {
+            pack(
+                QuantKind::Gptq,
+                &[
+                    ("l.qweight", "I32", vec![k8, 0]),
+                    ("l.qzeros", "I32", vec![1, 1]),
+                    ("l.scales", "F16", vec![1, 1]),
+                    ("l.g_idx", "I32", vec![0]),
+                ],
+            )
+        };
+        // AWQ qweight [K, out/8] with out/8 * 8 overflowing.
+        let awq = |out8: usize| {
+            pack(
+                QuantKind::Awq,
+                &[
+                    ("l.qweight", "I32", vec![0, out8]),
+                    ("l.qzeros", "I32", vec![1, 1]),
+                    ("l.scales", "F16", vec![1, 1]),
+                ],
+            )
+        };
+        for (what, result) in [("gptq", gptq(huge)), ("awq", awq(huge))] {
+            match result {
+                Err(LoadError::QuantizedLinearLayout { tensor, reason }) => {
+                    assert_eq!(tensor, "l.qweight", "{what}");
+                    assert!(reason.contains("overflows"), "{what}: {reason}");
+                }
+                other => panic!("{what}: expected a layout refusal, got {other:?}"),
+            }
+        }
+        // A zero extent is the packed weight's own typed refusal, naming the linear's `.weight` key.
+        for (what, result) in [("gptq", gptq(0)), ("awq", awq(0))] {
+            match result {
+                Err(LoadError::QuantizedLinearPayload { linear, source }) => {
+                    assert_eq!(linear, "l.weight", "{what}");
+                    assert_eq!(
+                        source,
+                        poot_quant::PackedWeightError::ZeroExtent {
+                            axis: poot_quant::LogicalAxis::Out
+                        },
+                        "{what}"
+                    );
+                }
+                other => panic!("{what}: expected a zero-extent payload refusal, got {other:?}"),
+            }
+        }
     }
 }

@@ -109,3 +109,11 @@ fit the engine's 4096 positions`), and the c4/c16/c32 cells at 1800 s each burne
 this device"}` (no calibrated ceiling row for the H100 in `crates/poot-profile/data/ceilings.tsv`), and the fit is
   `unknown` (needs two points with different bytes per token). `summarize.py` now prints that reason.
 - `ingest.py` turns a sweep dir into a `results/<run-id>` snapshot through the harness's own result contract.
+
+## Run 2 findings (2026-10-18, H100, same poot build; `benchmarks/results/2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb-run2`)
+
+- **oracle row passed** (3623 s): fixture committed as `crates/poot-llm/tests/data/qwen38_27b_fp8_oracle_top5.json`. ROCm and PTX device
+  top-5 agree to 9e-6 and both sit a near-constant ~7e-4 below the CPU oracle (inside the 1e-3 criterion, thin margin).
+- **llama.cpp** (Q4_K_XL, not the same weights): tg 79.6 tok/s, pp 2500-2800 tok/s vs poot 8.18 / ~35 (POOT-1265).
+- **vLLM did not start**: DeepGEMM's JIT needs nvcc, the image has none (POOT-1269).
+- poot-serve: c1 rows lose 1 of 3 requests, c4 hits the 300 s cap; llama.cpp ISL 2048 c4 also hit it.

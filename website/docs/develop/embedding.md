@@ -125,10 +125,12 @@ let rendered = handle.text().render_chat_value(&serde_json::json!([
     {"role": "system", "content": "You are helpful."},
     {"role": "user", "content": "Say hello in one sentence."}
 ]), None);
-// rendered.prompt is the text to encode; rendered.stops holds the turn-end markers.
+// handle.text().encode_chat(&rendered) is the prompt as token ids; rendered.stops holds the turn-end markers.
 ```
 
-The second argument accepts tool definitions for templates that support them.
+The second argument accepts tool definitions for templates that support them. `encode_chat` tokenizes the
+control tokens a message spells as plain text, so a message that spells a control token cannot open a turn; a template that fails
+to render is an error, not a fallback format.
 
 ## Tokenize without generating
 

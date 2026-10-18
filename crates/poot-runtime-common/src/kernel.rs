@@ -130,8 +130,10 @@ impl CompiledKernel {
     /// point is `entry_point`, whose parameters are exactly `args` in binding order (each argument's
     /// native element kind and whether the kernel writes it), and whose `has_trap` equals
     /// `Body::has_trap()` for that body. Every access the code makes to argument `i` must stay within
-    /// the bound buffer's element count at dispatch time (the codegen-side half of that contract: the
-    /// runtime bounds the length it publishes to the code from the buffer's own recorded capacity).
+    /// the bound buffer's element count at dispatch time (the codegen-side half of that contract; the
+    /// other half is `poot_executor::Engine`'s, which refuses a dispatch whose asserted length exceeds
+    /// the capacity the device reports for the buffer bound to it, before any device sees the dispatch,
+    /// so a runtime may trust the lengths it is handed).
     pub unsafe fn new(
         target: TargetId,
         entry_point: impl Into<Box<str>>,

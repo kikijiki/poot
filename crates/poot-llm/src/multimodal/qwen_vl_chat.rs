@@ -21,7 +21,7 @@ use super::qwen_vl_image::{
     Qwen25VlVideoMetadata, assemble_qwen2_5_vl_raw_request_mrope_model_input,
 };
 use super::qwen_vl_mrope::{QwenVlMropeMetadataLoadError, load_qwen_vl_mrope_source_metadata};
-use poot_text::{read_tokenizer_config_chat, render_jinja_value};
+use poot_text::{ChatFormat, TextCodec};
 
 const VISION_END_DELIMITER: &str = "<|vision_end|>";
 /// One typed Qwen2.5-VL chat message.
@@ -197,19 +197,18 @@ where
         });
     }
     let tokens = sources.processor_special_tokens();
-    let (template, bos, eos) = read_tokenizer_config_chat(model_dir);
-    let Some(template) = template.as_deref() else {
+    let text = TextCodec::from_hf_dir(model_dir, 0, None, ChatFormat::ChatML)
+        .map_err(|error| Qwen25VlChatRequestError::ChatTemplate(error.to_string()))?;
+    if !text.has_chat_template() {
         return Err(Qwen25VlChatRequestError::MissingChatTemplate);
-    };
+    }
     let (rendered_messages, media) = flatten_validated_messages(messages, &tokens);
-    let rendered_prompt = render_jinja_value(
-        template,
-        &rendered_messages,
-        bos.as_deref(),
-        eos.as_deref(),
-        None,
-    )
-    .map_err(|error| Qwen25VlChatRequestError::ChatTemplate(error.to_string()))?;
+    // The raw-request assembler below tokenizes the prompt with its own tokenizer and parses control tokens
+    // in all of it: the chat's untrusted spans stop here, so a message that spells one still forges it.
+    let rendered_prompt = text
+        .render_template_chat(&rendered_messages)
+        .map_err(|error| Qwen25VlChatRequestError::ChatTemplate(error.to_string()))?
+        .prompt;
     assemble_qwen2_5_vl_raw_request_mrope_model_input(Qwen25VlRawRequestMropeModelInputRequest {
         model_dir,
         rendered_prompt: &rendered_prompt,

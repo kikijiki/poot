@@ -133,6 +133,10 @@ impl Device for PtxDevice {
         Ok(self.ctx.alloc_storage(role, storage, elems)?)
     }
 
+    fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
+        buffer.elem_count() as usize
+    }
+
     fn load_kernel(&mut self, key: &str, kernel: CompiledKernel) -> Result<PtxKernel, PtxGpuError> {
         Ok(PtxKernel {
             key: key.to_string(),

@@ -782,6 +782,7 @@ struct PlanningDevice {
 struct PlanningBuffer {
     records: Records,
     index: usize,
+    elems: usize,
     _guard: AllocGuard,
 }
 
@@ -844,8 +845,13 @@ impl Device for PlanningDevice {
         Ok(PlanningBuffer {
             records: Arc::clone(&self.records),
             index,
+            elems,
             _guard: guard,
         })
+    }
+
+    fn buffer_elems(&self, buffer: &PlanningBuffer) -> usize {
+        buffer.elems
     }
 
     fn load_kernel(&mut self, _key: &str, _kernel: CompiledKernel) -> Result<(), PlanningOnly> {

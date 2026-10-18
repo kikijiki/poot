@@ -152,8 +152,9 @@ impl Sampler {
 
     /// Whether this row can sample on the GPU via an on-device top-p-Gumbel-max kernel instead of the host
     /// `pick()` path (card 148): min-p folds into a logit floor, top-k into a bisected count threshold, and
-    /// top-p into a bisected integer-mass threshold (each token's mass quantized to fixed-point u32 and
-    /// summed via `atomic_add`, so the sum is order-independent and GPU==CPU bit-exact). Same "no
+    /// top-p into a bisected integer-mass threshold (each token's mass is the fixed-point integer
+    /// `poot_eval::top_p_token_mass`, summed exactly, so the sum is order-independent and GPU==CPU
+    /// bit-exact). Same "no
     /// penalties/bias/logprobs/guided" bar as [`Self::is_greedy`].
     pub fn is_simple_temperature(&self) -> bool {
         self.temperature > 0.0
@@ -428,23 +429,21 @@ impl Sampler {
         if self.top_p <= 0.0 {
             cand.truncate(1);
         } else if self.top_p < 1.0 {
-            // ADR-0114 (tier 2): mirrors `poot-eval`'s `sample_one_row` quantized top-p bisection
-            // (integer mass in units of `round(exp((l-max)/T) * 16)`), not an exact real-valued
-            // cumulative sum, so `probs()` (built from this list) describes the nucleus
-            // `pick_from`'s device-equivalent `eval_sample_token` draws from (R-551b-2's "one
-            // sampling semantics" extended to top-p, card 551b). `cand` is already the
-            // min-p/top-k floor's surviving set (tier 1, unaffected), sorted descending by
-            // `exp((l-max)/T)`, so a quantized prefix sum over it is exactly the oracle's
-            // `mass_at(thresh)` restricted to this set, for the same reason the oracle's own
-            // bisection only ever searches thresholds within it (card 677: that bisection now
-            // starts its search at a finite floor - `min_logit` at worst - whether or not min-p or
-            // top-k ran, so this cut is unconditional).
-            let z_trunc: f32 = cand.iter().map(|c| (c.1 * 16.0).round()).sum();
-            let tp_thresh = (self.top_p * z_trunc).round();
-            let mut cum = 0.0f32;
+            // The oracle's nucleus (`poot-eval`'s `sample_one_row`), so `probs()` (built from this list)
+            // describes the set `pick_from`'s `eval_sample_token` draws from (R-551b-2's "one sampling
+            // semantics" extended to top-p). Both sum `top_p_token_mass` integers (exact, `2^-24` of the
+            // top token per unit) and cut at `top_p_threshold`; `cand` is the min-p/top-k floor's
+            // surviving set sorted descending, so the prefix sum is the oracle's `mass_at(thresh)`
+            // restricted to it.
+            let inv_temp = 1.0 / self.temperature;
+            let mass = |c: &(usize, f32)| {
+                u64::from(poot_eval::top_p_token_mass(logits[c.0], max, inv_temp))
+            };
+            let tp_thresh = poot_eval::top_p_threshold(cand.iter().map(mass).sum(), self.top_p);
+            let mut cum = 0u64;
             let mut cut = cand.len();
             for (i, c) in cand.iter().enumerate() {
-                cum += (c.1 * 16.0).round();
+                cum += mass(c);
                 if cum >= tp_thresh {
                     cut = i + 1;
                     break;
@@ -477,14 +476,19 @@ impl Sampler {
         // `-inf` (card 551a SC-004 pins this for the device suffix, whose production callers never
         // see a masked row - `rule_of` routes those to the host). The host path's contract is
         // different and pre-existing (`check_pickable` already passed, so `-inf` here is a
-        // legitimately masked token, never a fault): substitute it with a large-but-finite sentinel
-        // so it reads as a real, vanishingly-low-probability candidate instead of tripping the
-        // oracle's non-finite flag. `check_pickable` guarantees at least one strictly finite logit,
-        // so this sentinel is never the row's max.
+        // legitimately masked token, never a fault): write the oracle's `MASKED_LOGIT` stand-in, which
+        // carries no mass and which the oracle's top-k / top-p floor ignores. `check_pickable`
+        // guarantees at least one strictly finite logit, so it is never the row's max.
         let patched: Option<Vec<f32>> = logits.contains(&f32::NEG_INFINITY).then(|| {
             logits
                 .iter()
-                .map(|&v| if v == f32::NEG_INFINITY { f32::MIN } else { v })
+                .map(|&v| {
+                    if v == f32::NEG_INFINITY {
+                        poot_eval::MASKED_LOGIT
+                    } else {
+                        v
+                    }
+                })
                 .collect()
         });
         let logits = patched.as_deref().unwrap_or(logits);
@@ -1414,6 +1418,138 @@ mod sampler_tests {
         assert_eq!(a.top_k, 5);
         assert_eq!(a.top_p, 0.9);
         assert_eq!(a.min_p, 0.1);
+    }
+
+    /// The exact top-p reference (POOT-1195): the smallest prefix of the tokens sorted by probability, in
+    /// descending order, whose f64 mass reaches `top_p` of the total. Test-local; no production code
+    /// imports it. Returns the nucleus as token ids.
+    fn exact_nucleus(logits: &[(u32, f32)], temperature: f32, top_p: f32) -> Vec<u32> {
+        let mut sorted = logits.to_vec();
+        sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let max = f64::from(sorted[0].1);
+        let mass: Vec<f64> = sorted
+            .iter()
+            .map(|&(_, l)| ((f64::from(l) - max) / f64::from(temperature)).exp())
+            .collect();
+        let target = f64::from(top_p) * mass.iter().sum::<f64>();
+        let mut cum = 0.0f64;
+        let mut size = sorted.len();
+        for (i, m) in mass.iter().enumerate() {
+            cum += m;
+            if cum >= target {
+                size = i + 1;
+                break;
+            }
+        }
+        sorted[..size].iter().map(|&(id, _)| id).collect()
+    }
+
+    fn zipf_logits(vocab: usize, s: f64) -> Vec<f32> {
+        (0..vocab)
+            .map(|i| (-s * ((i + 1) as f64).ln()) as f32)
+            .collect()
+    }
+
+    /// The top-p probe distributions of POOT-1195: the two Zipf rows and a head with a flat tail (strictly
+    /// descending so the boundary is one token, not a tie group). Each is `(name, logits, top_p, pinned
+    /// nucleus size)`.
+    fn nucleus_rows() -> Vec<(&'static str, Vec<f32>, f32, Option<usize>)> {
+        let mut head_tail = vec![0.5f64.ln() as f32];
+        head_tail.extend((0..500).map(|j| (0.001f64 * (1.0 - 1.0e-4 * j as f64)).ln() as f32));
+        vec![
+            ("zipf s=1.1", zipf_logits(32_000, 1.1), 0.95, Some(12_413)),
+            ("zipf s=0.8", zipf_logits(32_000, 0.8), 0.95, Some(25_496)),
+            ("head + flat tail", head_tail, 0.9, None),
+        ]
+    }
+
+    /// SC-001: the host sampler's nucleus (the support of `probs`) is the exact reference's. The old
+    /// quantized mass kept 20 of the 12,413 tokens on the first row.
+    #[test]
+    fn host_nucleus_equals_the_exact_reference() {
+        for (name, logits, top_p, pinned) in nucleus_rows() {
+            let tagged: Vec<(u32, f32)> = (0..).zip(logits.iter().copied()).collect();
+            let reference = exact_nucleus(&tagged, 1.0, top_p);
+            if let Some(pinned) = pinned {
+                assert_eq!(
+                    reference.len(),
+                    pinned,
+                    "{name}: the card pins the reference"
+                );
+            }
+            let probs = Sampler::new(1.0, 0, top_p, 1).probs(&logits).unwrap();
+            let kept: Vec<u32> = (0..)
+                .zip(&probs)
+                .filter(|(_, p)| **p > 0.0)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                kept.len(),
+                reference.len(),
+                "{name}: host nucleus size vs exact f64"
+            );
+            assert_eq!(kept, reference, "{name}: host nucleus members");
+        }
+    }
+
+    /// 50 allowed ids out of 200, with distinct logits, and the constraint that allows exactly them.
+    fn guided_row() -> (Vec<f32>, Vec<u32>, Constraint) {
+        let allowed: Vec<u32> = (0..50).map(|i| 3 + 4 * i).collect();
+        // A distinct, scrambled logit per token so the allowed set has a unique argmax and a short nucleus.
+        let logits: Vec<f32> = (0..200u32)
+            .map(|i| ((i * 37) % 200) as f32 * 0.07)
+            .collect();
+        let constraint = Constraint::choices(allowed.iter().map(|&id| vec![id]).collect(), 199);
+        (logits, allowed, constraint)
+    }
+
+    /// SC-004: under a constraint, `top_k = 1` returns the argmax of the allowed set for every seed. The
+    /// `f32::MIN` mask sentinel used to be the bisection floor, which left top-k a no-op.
+    #[test]
+    fn guided_top_k_one_returns_the_allowed_argmax() {
+        let (logits, allowed, _) = guided_row();
+        let best = *allowed
+            .iter()
+            .max_by(|&&a, &&b| logits[a as usize].total_cmp(&logits[b as usize]))
+            .unwrap();
+        for seed in 1..=64u64 {
+            let (_, _, constraint) = guided_row();
+            let mut s = Sampler::new(0.8, 1, 1.0, seed).with_constraint(constraint);
+            assert_eq!(s.pick(&logits).unwrap(), best as usize, "seed {seed}");
+        }
+    }
+
+    /// SC-005: under the same constraint, `top_p = 0.5` draws only from the nucleus the exact reference
+    /// computes over the allowed set, and still draws more than one distinct token.
+    #[test]
+    fn guided_top_p_draws_only_from_the_allowed_nucleus() {
+        let (logits, allowed, _) = guided_row();
+        let allowed_logits: Vec<(u32, f32)> = allowed
+            .iter()
+            .map(|&id| (id, logits[id as usize]))
+            .collect();
+        let nucleus = exact_nucleus(&allowed_logits, 0.8, 0.5);
+        assert!(
+            (2..allowed.len()).contains(&nucleus.len()),
+            "the fixture needs a proper multi-token nucleus, got {}",
+            nucleus.len()
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 1..=300u64 {
+            let (_, _, constraint) = guided_row();
+            let mut s = Sampler::new(0.8, 0, 0.5, seed).with_constraint(constraint);
+            let token = s.pick(&logits).unwrap() as u32;
+            assert!(
+                nucleus.contains(&token),
+                "seed {seed}: {token} is outside the nucleus {nucleus:?}"
+            );
+            seen.insert(token);
+        }
+        assert!(
+            seen.len() > 1,
+            "a nucleus of {} tokens must be sampled, not collapsed: {seen:?}",
+            nucleus.len()
+        );
     }
 }
 

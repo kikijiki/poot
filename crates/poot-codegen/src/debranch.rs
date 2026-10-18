@@ -7,6 +7,11 @@
 //! `crate::structurize` (which runs after this pass) never has to reason about a selection with a trap
 //! arm.
 //!
+//! Precondition: every device that runs debranched SPIR-V has robust buffer access enabled. `poot-wgpu-runtime`
+//! gets it from wgpu-hal (below); `poot-vulkan-runtime` builds its own `VkDevice`, enables `robustBufferAccess`
+//! and refuses to open a device that does not advertise it (`RuntimeError::RobustBufferAccessUnsupported`). A
+//! new runtime for this target must do the same.
+//!
 //! Out-of-bounds accesses the skipped `Assert` would have guarded against are defined under Vulkan robust
 //! buffer access, so continuing past a failed assert is sound: reads return an unspecified in-bounds-typed
 //! value and writes are dropped or redirected, never memory-unsafe. Verified, not assumed (card 531c):

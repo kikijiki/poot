@@ -6,22 +6,24 @@
 //! Why top-p needs an exact integer mass: min-p and top-k are monotone-in-logit truncations found by an
 //! exact-integer bisection (a logit floor, or a `count(logit >= mid)` that is an exact integer in f32),
 //! so a GPU tree-reduce and a CPU sequential reduce land on the same bits. Top-p's boundary is a
-//! probability-mass float sum (`sum exp((l-max)/T)`) whose value depends on reduction order, so a GPU
-//! tree-sum and a CPU sequential sum differ by ~ULP, which can flip the last token in the nucleus and
-//! break the bit-exact oracle (tier 2 on the noise/membership boundary, ADR-0101). Fix: quantize each
-//! token's mass to a fixed-point integer (`round(exp((l-max)/T) * SCALE)`) and sum it; integer addition
-//! is exactly associative, so the sum is order-independent (the CPU oracle runs the identical integer
-//! formula).
+//! probability-mass sum whose float value depends on reduction order, which can flip the last token in
+//! the nucleus and break the bit-exact oracle (tier 2 on the noise/membership boundary, ADR-0101). Fix:
+//! each token's mass is the integer `q = round(exp((l-max)/T) * 2^24)` (`poot-eval`'s
+//! `top_p_token_mass`, at most `2^24`), so a token down to `2^-25` of the top token keeps a nonzero mass
+//! and the tail of a flat distribution is summed, not rounded away. Integer addition is exactly
+//! associative, so the sum is order-independent.
 //!
-//! No scratch, no atomics (R-551a-5): unlike the Card 148 original, this kernel's bisection is entirely
-//! workgroup-local (one workgroup per row, so there is no cross-workgroup contention to arbitrate) - the
-//! per-lane partial masses LDS-reduce the same way the row-max and top-k counts already do: each lane
-//! writes its partial to a shared array, a barrier, then lane 0 folds the 64 partials serially. `SCALE =
-//! 16`: every term is `<= SCALE`, so the row total is `<= vocab * SCALE`, which stays an f32-exact
-//! integer (`< 2^24`) for `vocab < 2^20` (1,048,576) - comfortably above every real vocabulary (Qwen3-Next
-//! ~151K). A coarser scale than an atomic-counter design could afford (which summed in `u32`, not
-//! f32-exact LDS), but still exact end to end: the CPU oracle quantizes with the identical `SCALE`, so
-//! device and oracle agree by construction, not by precision margin.
+//! The sum is a two-limb integer in base `2^24` (`hi * 2^24 + lo`, `lo < 2^24`), because the row total
+//! (up to `2^24 * vocab`) does not fit an f32 and the workgroup arrays hold f32. Each lane carries its
+//! own two limbs (each f32-exact: `lo < 2^24`, `hi <= vocab / 64`), writes them to arrays 3 and 4, and
+//! after a barrier every lane folds the 64 partials in `u32` and normalizes the carry, so there is no
+//! vocabulary bound below the `u32` limbs. No scratch, no atomics (R-551a-5): the bisection is entirely
+//! workgroup-local (one workgroup per row).
+//!
+//! The threshold is the one rounded quantity, and it is rounded identically on the host: `Z` is the
+//! total converted to f32 once (`hi * 2^24` is exact, the add rounds once, as the host's `u64 as f32`),
+//! `tp_thresh = round(top_p * Z)` in f32, then split back into the same two limbs (exact: a division by
+//! a power of two and a subtraction). The compared `mass_above >= tp_thresh` is exact integer order.
 //!
 //! Shape: one workgroup per row, 64 lanes, same LDS-reduce idiom as `sample_truncated_gumbel_argmax_batched`:
 //!   1. row max/min pass (values only) + the lowest non-finite index (R-551a-2), as in the top-k kernel.
@@ -32,7 +34,7 @@
 //!        skipping it would sample from the unrestricted min-p/top-k distribution, disagreeing with the
 //!        CPU sampler's top-1 cut.
 //!      - `0 < top_p < 1`: bisection.
-//!        a. `Z_trunc` = LDS-summed quantized mass over `logit >= floor1`.
+//!        a. `Z_trunc` = the exact two-limb quantized mass over `logit >= floor1`.
 //!        b. `tp_thresh = round(top_p * Z_trunc)` (identical f32 arithmetic on GPU and CPU).
 //!        c. bisect `t_p` over `[floor1, max_logit]` (30 iterations): each iteration LDS-sums the
 //!           quantized mass over `logit >= mid`; if `mass_above >= tp_thresh` then `lo = mid`, else
@@ -49,8 +51,6 @@ use poot_kernel_intrinsics::{
     group_index, local_index, no_contract_add, wg_read, wg_write, workgroup_barrier,
 };
 const W: usize = 64;
-// SCALE = 16 (inlined as a literal below; the importer only evaluates integer `const`s, not f32 ones).
-// See the module doc for the overflow/precision derivation.
 
 pub fn __poot_kernel_sample_topp_gumbel_argmax_batched(
     logits: &[f32],
@@ -82,7 +82,8 @@ pub fn __poot_kernel_sample_topp_gumbel_argmax_batched(
             if v > local_max {
                 local_max = v;
             }
-            if v < local_min {
+            // The oracle's `MASKED_LOGIT` (f32::MIN) is an excluded token, not a candidate floor.
+            if v < local_min && v > -3.4028235e38f32 {
                 local_min = v;
             }
         } else if (j as f32) < local_bad {
@@ -166,9 +167,9 @@ pub fn __poot_kernel_sample_topp_gumbel_argmax_batched(
     let floor1 = if min_p_floor > t_k { min_p_floor } else { t_k };
 
     // Pass 3: top-p (nucleus) bisection for t_p on [floor1, max_logit]. Skipped when top_p is outside
-    // the open interval (0,1); floor then stays floor1. The mass is a fixed-point integer accumulated
-    // by an LDS lane-0 fold (array 3, reused from pass 2 - every write there happened under a barrier
-    // this pass's first write is ordered after).
+    // the open interval (0,1); floor then stays floor1. The mass is the two-limb fixed-point integer the
+    // module doc describes, in LDS arrays 3 and 4 (array 3 is reused from pass 2 - every write there
+    // happened under a barrier this pass's first write is ordered after).
     let mut floor = floor1;
     if top_p <= 0.0f32 {
         // top_p <= 0: collapse to top-1 (only the max-logit token survives). Matches the CPU sampler's
@@ -176,62 +177,83 @@ pub fn __poot_kernel_sample_topp_gumbel_argmax_batched(
         // `floor1` and sample from the unrestricted min-p/top-k distribution.
         floor = max_logit;
     } else if top_p < 1.0f32 {
-        // Z_trunc: total quantized mass over the post-min-p/top-k set (logit >= floor1).
-        let mut mass_z = 0.0f32;
+        // Z_trunc: the exact quantized mass over the post-min-p/top-k set (logit >= floor1), as the
+        // (hi, lo) base-2^24 limbs `mass_limbs` describes, then the f32 `Z` the threshold is rounded from.
+        let mut z_hi = 0u32;
+        let mut z_lo = 0u32;
         let mut jz = lane;
+        let mut acc_hi = 0u32;
+        let mut acc_lo = 0u32;
         while jz < vocab {
             let v = logits[base + jz];
             if v >= floor1 {
-                let e = ((v - max_logit) * inv_temp).exp();
-                mass_z = mass_z + (e * 16.0f32).round();
+                let q = (((v - max_logit) * inv_temp).exp() * 16777216.0f32).round() as u32;
+                let sum = acc_lo + q;
+                if sum >= 16777216u32 {
+                    acc_hi = acc_hi + 1u32;
+                    acc_lo = sum - 16777216u32;
+                } else {
+                    acc_lo = sum;
+                }
             }
             jz = jz + W;
         }
-        wg_write(3, lane, mass_z);
+        wg_write(3, lane, acc_hi as f32);
+        wg_write(4, lane, acc_lo as f32);
         workgroup_barrier();
-        if lane == 0 {
-            let mut total = 0.0f32;
-            let mut kk = 0usize;
-            while kk < W {
-                total = total + wg_read(3, kk);
-                kk = kk + 1;
-            }
-            wg_write(3, 0, total);
+        let mut kk = 0usize;
+        while kk < W {
+            z_hi = z_hi + wg_read(3, kk) as u32;
+            z_lo = z_lo + wg_read(4, kk) as u32;
+            kk = kk + 1;
         }
+        z_hi = z_hi + (z_lo >> 24);
+        z_lo = z_lo & 16777215u32;
         workgroup_barrier();
-        let z_trunc = wg_read(3, 0);
-        let tp_thresh = (top_p * z_trunc).round();
-        workgroup_barrier();
+        // `top_p_threshold`: the f32 product, rounded. `Z` is the correctly rounded f32 of the exact
+        // integer (`hi * 2^24` is exact; the add rounds once), as the host's `u64 as f32` is.
+        let z_f = (z_hi as f32) * 16777216.0f32 + (z_lo as f32);
+        let tp_thresh = (top_p * z_f).round();
+        let thr_hi_f = (tp_thresh / 16777216.0f32).floor();
+        let thr_hi = thr_hi_f as u32;
+        let thr_lo = (tp_thresh - thr_hi_f * 16777216.0f32) as u32;
 
         let mut tlo = floor1;
         let mut thi = max_logit;
         let mut it = 0usize;
         while it < 30 {
             let mid = (tlo + thi) * 0.5f32;
-            let mut mass_local = 0.0f32;
+            let mut m_hi = 0u32;
+            let mut m_lo = 0u32;
+            let mut lane_hi = 0u32;
+            let mut lane_lo = 0u32;
             let mut jm = lane;
             while jm < vocab {
                 let v = logits[base + jm];
                 if v >= mid {
-                    let e = ((v - max_logit) * inv_temp).exp();
-                    mass_local = mass_local + (e * 16.0f32).round();
+                    let q = (((v - max_logit) * inv_temp).exp() * 16777216.0f32).round() as u32;
+                    let sum = lane_lo + q;
+                    if sum >= 16777216u32 {
+                        lane_hi = lane_hi + 1u32;
+                        lane_lo = sum - 16777216u32;
+                    } else {
+                        lane_lo = sum;
+                    }
                 }
                 jm = jm + W;
             }
-            wg_write(3, lane, mass_local);
+            wg_write(3, lane, lane_hi as f32);
+            wg_write(4, lane, lane_lo as f32);
             workgroup_barrier();
-            if lane == 0 {
-                let mut total = 0.0f32;
-                let mut kk2 = 0usize;
-                while kk2 < W {
-                    total = total + wg_read(3, kk2);
-                    kk2 = kk2 + 1;
-                }
-                wg_write(3, 0, total);
+            let mut k3 = 0usize;
+            while k3 < W {
+                m_hi = m_hi + wg_read(3, k3) as u32;
+                m_lo = m_lo + wg_read(4, k3) as u32;
+                k3 = k3 + 1;
             }
-            workgroup_barrier();
-            let mass_above = wg_read(3, 0);
-            if mass_above >= tp_thresh {
+            m_hi = m_hi + (m_lo >> 24);
+            m_lo = m_lo & 16777215u32;
+            if m_hi > thr_hi || (m_hi == thr_hi && m_lo >= thr_lo) {
                 tlo = mid;
             } else {
                 thi = mid;

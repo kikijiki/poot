@@ -120,7 +120,7 @@ impl Context {
                 Err(e) => {
                     // SAFETY: no device was created; the instance is still solely owned here.
                     unsafe { instance.destroy_instance(None) };
-                    return Err(e.into());
+                    return Err(e);
                 }
             };
         // SAFETY: `device` was just created with exactly one queue at (`queue_family_index`, index 0).

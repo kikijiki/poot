@@ -25,7 +25,7 @@ pub use device::{
     MeasuredDeviceTime, NativeCounters, SupportBound, VpuInvocation, WeightUpload, write_slice,
 };
 pub use engine::Engine;
-pub use error::{BindError, DeviceError, ExecError, LoadError};
+pub use error::{BindError, DeviceError, DispatchError, ExecError, LoadError};
 use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use poot_tensor::{HostTensor, HostView};
 pub use shared_kernels::{SharedKernels, SharedKernelsMismatch};

@@ -1,6 +1,6 @@
 //! Process configuration, model startup, listener orchestration, and graceful shutdown.
 
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -22,7 +22,10 @@ use crate::engine_plan::{
     Coordinated, EngineArgs, EngineHealth, EnginePlan, EngineState, Opened, Started, StartupError,
     device_budget,
 };
-use crate::http::{ConnGuard, RateLimiter, configure_response_writes, handle};
+use crate::http::{
+    BodyCaps, ConnGuard, HostPolicy, Limits, RateLimiter, RequestQueue, configure_response_writes,
+    handle,
+};
 use crate::lifecycle::{
     CANCELLATION_SETTLE_TIMEOUT, ServerDrainTimeout, WorkerRegistry, deadline_after,
     reset_drain_cancellation,
@@ -41,22 +44,32 @@ pub(crate) struct ModelDirUnset;
 /// The model directory under `POOT_MODELS_DIR` used when no path is given.
 const DEFAULT_MODEL: &str = "qwen2.5-0.5b";
 
-/// The values the accept loop and the drain run on, built once from the configuration: the rate limiter,
-/// the connection cap, the read and write bounds and the drain bound.
+/// The values the accept loop and the drain run on, built once from the configuration and the address the
+/// listener bound: what bounds a request (rate, queue, body caps, origin, arrival time), the connection
+/// cap, the write bound and the drain bound.
 pub(crate) struct Transport {
-    pub(crate) limiter: Arc<RateLimiter>,
+    pub(crate) limits: Arc<Limits>,
     pub(crate) max_connections: usize,
-    pub(crate) read_timeout: Option<Duration>,
     pub(crate) write_timeout: Duration,
     pub(crate) drain_timeout: ServerDrainTimeout,
 }
 
 impl Transport {
-    pub(crate) fn of(config: &ServeConfig) -> Self {
+    pub(crate) fn of(config: &ServeConfig, bound: SocketAddr) -> Self {
+        const MIB: usize = 1024 * 1024;
         Self {
-            limiter: Arc::new(RateLimiter::new(config.rate_limit_rpm)),
+            limits: Arc::new(Limits {
+                limiter: RateLimiter::new(config.rate_limit_rpm),
+                queue: RequestQueue::new(config.max_pending_requests),
+                receiving: RequestQueue::new(config.max_receiving_requests),
+                bodies: BodyCaps {
+                    text: config.max_body_mib * MIB,
+                    images: config.max_image_body_mib * MIB,
+                },
+                hosts: HostPolicy::for_listener(bound),
+                request_timeout: config.request_timeout_secs,
+            }),
             max_connections: config.max_connections,
-            read_timeout: config.read_timeout_secs.0,
             write_timeout: config.write_timeout_secs,
             drain_timeout: config.drain_timeout_secs,
         }
@@ -139,6 +152,9 @@ fn init_logging() {
 
 /// SIGINT/SIGTERM set SHUTDOWN so the accept loop exits.
 fn install_signal_handlers() {
+    // SAFETY: `sigint_handler` is an `extern "C" fn(c_int)` that only stores to an atomic, which is
+    // async-signal-safe, and it stays valid for the life of the process. `signal` takes no pointers
+    // the handler could outlive.
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -376,24 +392,23 @@ pub(crate) fn run() -> Result<()> {
         engine: job_tx,
         view,
         images,
+        max_queue_wait: config.max_queue_wait_secs,
     });
-
-    let Transport {
-        limiter,
-        max_connections: max_conns,
-        read_timeout,
-        write_timeout,
-        drain_timeout,
-    } = Transport::of(&config);
-    if limiter.rpm > 0 {
-        tracing::info!(
-            rpm = limiter.rpm,
-            "per-key rate limit active (--rate-limit-rpm)"
-        );
-    }
 
     let addr = &config.addr;
     let listener = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+    let Transport {
+        limits,
+        max_connections: max_conns,
+        write_timeout,
+        drain_timeout,
+    } = Transport::of(&config, listener.local_addr()?);
+    if limits.limiter.rpm > 0 {
+        tracing::info!(
+            rpm = limits.limiter.rpm,
+            "per-key rate limit active (--rate-limit-rpm)"
+        );
+    }
     let lora_admin_policy = Arc::new(config.lora_admin_policy(listener.local_addr()?.ip())?);
     match lora_admin_policy.mode() {
         LoraAdminPolicyMode::LocalOnly => {
@@ -420,6 +435,7 @@ pub(crate) fn run() -> Result<()> {
         }
         match listener.accept() {
             Ok((s, _)) => {
+                let accepted = Instant::now();
                 // A signal may land after the top-of-loop check while a queued socket makes `accept` succeed; the signal is
                 // the admission boundary, so close that socket rather than start one more request.
                 if SHUTDOWN.load(Ordering::SeqCst) {
@@ -437,8 +453,6 @@ pub(crate) fn run() -> Result<()> {
                 // Disable Nagle: SSE writes one small chunk + flush per token, and Nagle + delayed-ACK stalls each write
                 // (tens of ms/token even on localhost).
                 let _ = s.set_nodelay(true);
-                // Bound slowloris: a stalled client's initial read times out instead of blocking the thread forever.
-                let _ = s.set_read_timeout(read_timeout);
                 // Bound every response write; if the timeout cannot be installed, close the connection.
                 if let Err(e) = configure_response_writes(&s, write_timeout) {
                     tracing::error!(error = %e, "configure connection write timeout");
@@ -447,16 +461,22 @@ pub(crate) fn run() -> Result<()> {
                 let served = Arc::clone(&served);
                 let health = health.clone();
                 let metrics = Arc::clone(&metrics);
-                let limiter = Arc::clone(&limiter);
+                let limits = Arc::clone(&limits);
                 let lora_admin_policy = Arc::clone(&lora_admin_policy);
                 live_conns.fetch_add(1, Ordering::SeqCst);
                 let conn_counter = Arc::clone(&live_conns);
                 // One thread per connection: parse and shape concurrently.
                 if let Err(e) = workers.spawn_connection("poot-conn", s, move |s| {
                     let _guard = ConnGuard(conn_counter);
-                    if let Err(e) =
-                        handle(s, &served, &health, &metrics, &limiter, &lora_admin_policy)
-                    {
+                    if let Err(e) = handle(
+                        s,
+                        accepted,
+                        &served,
+                        &health,
+                        &metrics,
+                        &limits,
+                        &lora_admin_policy,
+                    ) {
                         tracing::error!(error = format!("{e:#}"), "request error");
                     }
                 }) {

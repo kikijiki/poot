@@ -22,7 +22,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use poot_executor::{Arg, Device, Dispatch, Engine, Executor, NoSync, StepInputs};
+use poot_executor::{
+    Arg, Device, Dispatch, DispatchError, Engine, ExecError, Executor, NoSync, StepInputs,
+};
 use poot_graph_ir::op::RedOp;
 use poot_graph_ir::{BinOp, Builder, TensorType};
 use poot_graph_plan::{
@@ -109,6 +111,9 @@ struct Recorder {
     /// assert the exact per-slot sizes an independently hand-traced plan predicts, never a number
     /// re-derived from `BufferPlan` itself.
     activation_allocs: Rc<RefCell<Vec<usize>>>,
+    /// How many elements short of the asked count each `BufferRole::Activation` buffer is really
+    /// allocated: a device whose allocation disagrees with the plan's lengths.
+    activation_shortfall: usize,
 }
 
 struct RecordingDevice {
@@ -116,7 +121,8 @@ struct RecordingDevice {
 }
 
 impl Device for RecordingDevice {
-    type Buffer = ();
+    /// The native elements the device really allocated: what [`Device::buffer_elems`] reports.
+    type Buffer = usize;
     type Kernel = ();
     type Recording = ();
     type Error = std::convert::Infallible;
@@ -134,15 +140,21 @@ impl Device for RecordingDevice {
         role: BufferRole,
         storage: poot_target::BufferStorage,
         elems: usize,
-    ) -> Result<(), std::convert::Infallible> {
+    ) -> Result<usize, std::convert::Infallible> {
+        let mut capacity = elems;
         if role == BufferRole::Activation {
             self.recorder.activation_allocs.borrow_mut().push(elems);
+            capacity -= self.recorder.activation_shortfall;
         }
         let bytes = (elems * storage.element().byte_width()) as u64;
         // `Buffer = ()` has no `Drop` to tie the guard's live-bytes decrement to (mirrors
         // `cr30_lifecycle.rs`'s `FaultyDevice`): leaked on purpose, read back via `snapshot_all`.
         std::mem::forget(self.recorder.memory.record_alloc(role, bytes));
-        Ok(())
+        Ok(capacity)
+    }
+
+    fn buffer_elems(&self, buffer: &usize) -> usize {
+        *buffer
     }
 
     fn load_kernel(
@@ -165,7 +177,7 @@ impl Device for RecordingDevice {
         Ok(())
     }
 
-    fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), std::convert::Infallible> {
+    fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), std::convert::Infallible> {
         Ok(())
     }
 
@@ -179,7 +191,7 @@ impl Device for RecordingDevice {
 
     fn write_with(
         &mut self,
-        _dst: &(),
+        _dst: &usize,
         _offset: usize,
         _len: usize,
         _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
@@ -187,7 +199,7 @@ impl Device for RecordingDevice {
         Ok(())
     }
 
-    fn read(&mut self, _src: &(), out: &mut [u8]) -> Result<(), std::convert::Infallible> {
+    fn read(&mut self, _src: &usize, out: &mut [u8]) -> Result<(), std::convert::Infallible> {
         out.fill(0);
         Ok(())
     }
@@ -431,5 +443,50 @@ fn state_commit_export_keeps_its_own_slot_through_the_epilogue() {
         activation_bytes,
         (3 * K * 4) as u64,
         "independently hand-traced arena bytes for this fixture (three never-reused [K=2] f32 slots)"
+    );
+}
+
+/// POOT-1205 SC-001: a dispatch whose asserted length exceeds its bound buffer by one element is refused
+/// with the shared typed error by the engine, before `Device::dispatch` is called. The device allocates
+/// every activation buffer one element short of what the plan asked, so eqn 0's output (`v1`, 64
+/// elements) asserts 64 against a buffer of 63; the same fixture and device allocate exactly and step
+/// cleanly when no buffer is short.
+///
+/// Mutation: remove the `check_arg_lengths` call in `Engine::walk` (`crates/poot-executor/src/engine.rs`);
+/// the device then records the dispatches and the step succeeds, so the `Err` assertion goes red.
+#[test]
+fn a_dispatch_longer_than_its_buffer_is_refused_before_the_device_sees_it() {
+    let (g, store, map) = fixture();
+    let recorder = Recorder {
+        activation_shortfall: 1,
+        ..Recorder::default()
+    };
+    let mut engine = Engine::new(RecordingDevice {
+        recorder: recorder.clone(),
+    });
+    let exe = engine.load_weights(store, map).unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, fake_target())).unwrap();
+
+    let error = engine
+        .step(exe, entry, &StepInputs::new(), &mut NoSync)
+        .err()
+        .expect("a length beyond its buffer must be refused");
+
+    let ExecError::Dispatch(refusal) = error else {
+        panic!("expected the shared dispatch error, got {error:?}");
+    };
+    assert_eq!(
+        *refusal,
+        DispatchError::ArgExceedsBuffer {
+            arg: 2,
+            elems: 64,
+            capacity: 63
+        },
+        "eqn 0 asserts its 64-element output (argument 2) against a 63-element buffer"
+    );
+    assert!(
+        recorder.dispatches.borrow().is_empty(),
+        "the device must never see the refused dispatch: {:?}",
+        recorder.dispatches.borrow()
     );
 }

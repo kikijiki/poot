@@ -140,6 +140,8 @@ impl World {
 /// or a recording's.
 struct Alloc {
     id: usize,
+    /// The native element capacity the buffer was allocated with.
+    elems: usize,
     data: RefCell<Vec<u8>>,
     world: Rc<World>,
 }
@@ -242,6 +244,7 @@ impl Device for FakeDevice {
         std::mem::forget(self.memory.record_alloc(role, bytes as u64));
         let buf = Rc::new(Alloc {
             id: self.world.id(),
+            elems,
             // Fresh memory is garbage until the enqueued zeroing runs.
             data: RefCell::new(vec![0xAA; bytes]),
             world: Rc::clone(&self.world),
@@ -257,6 +260,10 @@ impl Device for FakeDevice {
         queues[self.index].push_back(Rc::clone(&buf));
         enqueued[self.index] += 1;
         Ok(buf)
+    }
+
+    fn buffer_elems(&self, buffer: &Buf) -> usize {
+        buffer.elems
     }
 
     fn load_kernel(

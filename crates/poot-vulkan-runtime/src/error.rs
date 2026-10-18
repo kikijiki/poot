@@ -1,5 +1,5 @@
 use ash::vk;
-use poot_target::{BufferStorage, ElementKind};
+use poot_target::BufferStorage;
 
 /// Every failure the raw-Vulkan runtime reports: loader and device setup, dispatch argument validation,
 /// pipeline caching, submission loss and host transfers. Typed so a caller matches on the variant, never on
@@ -16,6 +16,13 @@ pub enum RuntimeError {
     /// No physical device exposes a queue family with compute support.
     #[error("no Vulkan physical device with a compute queue family was found")]
     NoComputeDevice,
+    /// The chosen device does not advertise `robustBufferAccess`. Debranched SPIR-V keeps executing past a
+    /// failed bounds assert and relies on robust buffer access to make the skipped access harmless, so a
+    /// device without it is never opened.
+    #[error(
+        "the Vulkan device does not support the robustBufferAccess feature, which debranched SPIR-V requires"
+    )]
+    RobustBufferAccessUnsupported,
     /// The chosen device has no memory type that is both host-visible and host-coherent, which the
     /// staging and length buffers need.
     #[error("no Vulkan memory type is HOST_VISIBLE | HOST_COHERENT")]
@@ -51,20 +58,6 @@ pub enum RuntimeError {
     PipelineKeyConflict {
         /// The pipeline cache key that was reused.
         key: String,
-    },
-    /// A dispatch told a kernel a buffer holds more elements than its allocation does.
-    #[error(
-        "argument {index}: {elems} {element} elements exceed the {byte_len}-byte buffer bound to it"
-    )]
-    ArgExceedsBuffer {
-        /// Position of the argument in the kernel's argument schema.
-        index: usize,
-        /// Element count the dispatch declared for the argument.
-        elems: u32,
-        /// Element kind the declared count is measured in.
-        element: ElementKind,
-        /// Byte size of the buffer actually bound.
-        byte_len: usize,
     },
     /// A device-side buffer copy between buffers of different byte sizes.
     #[error("a copy needs equal sizes, got a {src}-byte source and a {dst}-byte destination")]

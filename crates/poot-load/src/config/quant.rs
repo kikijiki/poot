@@ -20,6 +20,13 @@ pub struct QuantConfig {
     /// GPTQ symmetric-quantization flag; `Some(false)` is refused.
     #[serde(default)]
     pub sym: Option<bool>,
+    /// GPTQ checkpoint convention (GPTQModel): `"gptq"` (the v1 zero `u4 + 1`, also what an absent key
+    /// means) is the only one admitted; `"gptq_v2"` stores zeros the decoder would read one unit off.
+    #[serde(default)]
+    pub checkpoint_format: Option<String>,
+    /// AWQ zero-point flag; `Some(false)` (symmetric, no `qzeros` bias) is refused.
+    #[serde(default)]
+    pub zero_point: Option<bool>,
     /// AWQ packing version; only `"gemm"` is admitted.
     #[serde(default)]
     pub version: Option<String>,

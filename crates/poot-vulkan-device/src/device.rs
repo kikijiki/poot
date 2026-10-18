@@ -141,6 +141,10 @@ impl Device for VulkanDevice {
         Ok(self.ctx.alloc_storage(role, storage, elems.max(1))?)
     }
 
+    fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
+        buffer.byte_len() / buffer.element().byte_width()
+    }
+
     fn load_kernel(
         &mut self,
         key: &str,

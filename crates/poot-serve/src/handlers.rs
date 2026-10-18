@@ -1,11 +1,10 @@
 //! Endpoint handlers: completions and chat (streamed or not), embeddings and rerank. Each validates the
 //! request, turns it into jobs on the one engine queue and turns their events into the response. The
-//! request-to-job conversion is [`Shaped`]; `n` choices are `n` concurrent jobs.
+//! request-to-job conversion is [`Shaped`]; `n` choices are `n` concurrent jobs, all waited on from the
+//! connection's one thread.
 
-use std::io::Write;
 use std::net::TcpStream;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -22,7 +21,7 @@ use crate::api::{
     parse_tool_calls, reject_unsupported_modality, resolve_lora_adapter, sampler_of,
     suppress_stream_usage, tool_call_stream_deltas,
 };
-use crate::http::{error_body, respond_error};
+use crate::http::{error_body, respond_error, write_all_within};
 use crate::lifecycle::{ClientGone, GenerationRequest, peer_closed, submit, submit_encode};
 use crate::metrics::{InFlight, Metrics};
 use crate::types::{Completion, EncodeRow, GenerationError, PromptInput, PromptRows, Served};
@@ -94,108 +93,19 @@ pub(crate) fn write_sse_data(
     }
 }
 
-/// The one blocking socket write behind [`write_sse_data`]: the frame bytes, then the flush that
-/// carries them. Split out so a recorder can wrap the whole operation.
+/// The one blocking socket write behind [`write_sse_data`]: the frame bytes, within the write deadline
+/// as a whole. Split out so a recorder can wrap the whole operation.
 fn write_sse_frame(stream: &mut TcpStream, data: &impl std::fmt::Display) -> std::io::Result<()> {
-    write!(stream, "data: {data}\n\n")?;
-    stream.flush()
+    write_all_within(stream, format!("data: {data}\n\n").as_bytes())
 }
 
 /// An SSE comment sent while tool output is buffered. It carries no model output, but its write/flush
 /// detects disconnect and backpressure at each generated token.
 pub(crate) fn write_tool_stream_heartbeat(stream: &mut TcpStream) -> std::io::Result<()> {
-    stream.write_all(b": poot-tool-buffering\n\n")?;
-    stream.flush()
+    write_all_within(stream, b": poot-tool-buffering\n\n")
 }
 
 const SSE_HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-
-/// One response socket the `n` choices of a streamed request write to. The choices are concurrent jobs,
-/// so their chunks interleave; each frame is one locked write, and one choice's failure aborts the rest.
-struct SseWriter<'a> {
-    stream: Mutex<&'a mut TcpStream>,
-    aborted: AtomicBool,
-}
-
-impl<'a> SseWriter<'a> {
-    fn new(stream: &'a mut TcpStream) -> Self {
-        Self {
-            stream: Mutex::new(stream),
-            aborted: AtomicBool::new(false),
-        }
-    }
-
-    fn send(&self, data: &impl std::fmt::Display) -> std::io::Result<()> {
-        let mut stream = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-        write_sse_data(&mut stream, data)
-    }
-
-    fn heartbeat(&self) -> std::io::Result<()> {
-        let mut stream = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-        write_tool_stream_heartbeat(&mut stream)
-    }
-
-    /// A choice failed or the client is gone: the other choices stop.
-    fn abort(&self) {
-        self.aborted.store(true, Ordering::SeqCst);
-    }
-
-    fn aborted(&self) -> bool {
-        self.aborted.load(Ordering::SeqCst)
-    }
-
-    fn into_stream(self) -> &'a mut TcpStream {
-        self.stream.into_inner().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
-/// Run one closure per choice on its own input: inline for a single choice, else each on a scoped
-/// thread, so `n` jobs are in the engine at once. Results are in choice order.
-fn run_choices<I: Send, T: Send>(inputs: Vec<I>, run: impl Fn(usize, I) -> T + Sync) -> Vec<T> {
-    if inputs.len() == 1 {
-        return inputs.into_iter().map(|input| run(0, input)).collect();
-    }
-    std::thread::scope(|scope| {
-        let run = &run;
-        let handles: Vec<_> = inputs
-            .into_iter()
-            .enumerate()
-            .map(|(index, input)| scope.spawn(move || run(index, input)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|p| std::panic::resume_unwind(p))
-            })
-            .collect()
-    })
-}
-
-/// The choices' results as one: every completion in order, or the first failure that is not a
-/// cancellation (a choice that stopped because another failed is no news), else the cancellation.
-fn collect_choices<T>(
-    results: Vec<std::result::Result<T, GenerationError>>,
-) -> std::result::Result<Vec<T>, GenerationError> {
-    let mut done = Vec::with_capacity(results.len());
-    let mut cancelled = None;
-    for result in results {
-        match result {
-            Ok(value) => done.push(value),
-            Err(
-                error @ (GenerationError::ClientCancelled | GenerationError::ServerDrainExpired),
-            ) => {
-                cancelled.get_or_insert(error);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    match cancelled {
-        Some(error) => Err(error),
-        None => Ok(done),
-    }
-}
 
 /// A request validated and converted: what every one of its `n` jobs shares. Everything that can refuse
 /// the request happens in the constructors, before the first response byte.
@@ -291,11 +201,8 @@ fn shape_chat(served: &Served, req: &ChatReq) -> Result<Shaped> {
             (image_prompt(images, req)?, Vec::new())
         }
         _ => {
-            let (prompt, turn_stops) = chat_prompt_and_stops(&served.model, req)?;
-            (
-                PromptInput::Tokens(tokenize(&served.model, &prompt)?),
-                turn_stops,
-            )
+            let (tokens, turn_stops) = chat_tokens_and_stops(&served.model, req)?;
+            (PromptInput::Tokens(tokens), turn_stops)
         }
     };
     let n = clamp_n(req.n);
@@ -420,57 +327,50 @@ pub(crate) fn stream_completion(
         Ok(prepared) => prepared,
         Err(e) => return respond_shaping_error(stream, &e),
     };
-    stream.write_all(SSE_HEADERS)?;
-    stream.flush()?;
+    write_all_within(stream, SSE_HEADERS)?;
     let start = Instant::now();
-    let ttft: Mutex<Option<Duration>> = Mutex::new(None);
+    let mut ttft: Option<Duration> = None;
     // A second handle on the socket, for the hang-up probe: the token closure owns the writes.
     let probe = stream.try_clone().ok();
-    let writer = SseWriter::new(stream);
-    let gone = || writer.aborted() || probe.as_ref().is_some_and(peer_closed);
-    let results = run_choices(choices, |index, sampler| {
-        let result = submit(
-            &served.engine,
-            metrics,
-            shaped.request(sampler, true),
-            &gone,
-            |piece, info| {
-                ttft.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_or_insert_with(|| start.elapsed());
-                // Inter-token latency from the engine's `since_prev_ms`; skipped for the first token (0.0).
-                if info.since_prev_ms > 0.0 {
-                    metrics.itl.observe(info.since_prev_ms);
-                }
-                tracing::trace!(
-                    token_idx = info.token_idx,
-                    since_prev_ms = format!("{:.3}", info.since_prev_ms),
-                    cumulative_ms = format!("{:.3}", info.cumulative_ms),
-                    kv_used_ratio = format!("{:.3}", info.kv_used_ratio),
-                    "token"
-                );
-                let chunk = serde_json::json!({
-                    "object": "text_completion",
-                    "choices": [{ "index": index, "text": piece, "finish_reason": serde_json::Value::Null }],
-                })
-                .to_string();
-                // A failed write means the client is gone: stop.
-                if writer.send(&chunk).is_ok() {
-                    GenerationControl::Continue(())
-                } else {
-                    writer.abort();
-                    GenerationControl::Break(())
-                }
-            },
-        );
-        if result.is_err() {
-            writer.abort();
-        }
-        result
-    });
-    let completions = match collect_choices(results) {
+    let gone = || probe.as_ref().is_some_and(peer_closed);
+    let submitted = submit(
+        &served.engine,
+        metrics,
+        served.max_queue_wait,
+        choices
+            .into_iter()
+            .map(|sampler| shaped.request(sampler, true))
+            .collect(),
+        &gone,
+        |index, piece, info| {
+            ttft.get_or_insert_with(|| start.elapsed());
+            // Inter-token latency from the engine's `since_prev_ms`; skipped for the first token (0.0).
+            if info.since_prev_ms > 0.0 {
+                metrics.itl.observe(info.since_prev_ms);
+            }
+            tracing::trace!(
+                token_idx = info.token_idx,
+                since_prev_ms = format!("{:.3}", info.since_prev_ms),
+                cumulative_ms = format!("{:.3}", info.cumulative_ms),
+                kv_used_ratio = format!("{:.3}", info.kv_used_ratio),
+                "token"
+            );
+            let chunk = serde_json::json!({
+                "object": "text_completion",
+                "choices": [{ "index": index, "text": piece, "finish_reason": serde_json::Value::Null }],
+            })
+            .to_string();
+            // A failed write means the client is gone: stop.
+            if write_sse_data(stream, &chunk).is_ok() {
+                GenerationControl::Continue(())
+            } else {
+                GenerationControl::Break(())
+            }
+        },
+    );
+    let completions = match submitted {
         Ok(completions) => completions,
-        Err(error) => return stream_generation_error(writer.into_stream(), metrics, &error),
+        Err(error) => return stream_generation_error(stream, metrics, &error),
     };
     let mut total_completion = 0usize;
     for (index, completion) in completions.iter().enumerate() {
@@ -478,15 +378,12 @@ pub(crate) fn stream_completion(
             "object": "text_completion",
             "choices": [{ "index": index, "text": "", "finish_reason": completion.finish.api_name() }],
         });
-        writer.send(&final_chunk)?;
+        write_sse_data(stream, &final_chunk)?;
         total_completion += completion_tokens(&served.model, completion, &completion.text)?;
     }
     let prompt_tokens = completions[0].prompt_tokens;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let ttft_ms = ttft
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner())
-        .map_or(total_ms, |d| d.as_secs_f64() * 1000.0);
+    let ttft_ms = ttft.map_or(total_ms, |d| d.as_secs_f64() * 1000.0);
     tracing::debug!(
         prompt_tokens,
         completion_tokens = total_completion,
@@ -502,9 +399,9 @@ pub(crate) fn stream_completion(
             ttft_ms,
             total_ms,
         );
-        writer.send(&receipt)?;
+        write_sse_data(stream, &receipt)?;
     }
-    writer.send(&"[DONE]")?;
+    write_sse_data(stream, &"[DONE]")?;
     Ok(())
 }
 
@@ -518,17 +415,18 @@ pub(crate) fn handle_completion(
     let _inflight = InFlight::enter(metrics);
     let shaped = shape_completion(served, req)?;
     let choices = samplers(shaped.n, |i| completion_sampler(&served.model, req, i))?;
-    let results = run_choices(choices, |_, sampler| {
-        submit(
-            &served.engine,
-            metrics,
-            shaped.request(sampler, false),
-            client_gone,
-            |_, _| GenerationControl::Continue(()),
-        )
-    });
-    let completions =
-        collect_choices(results).inspect_err(|error| account_generation_error(metrics, error))?;
+    let completions = submit(
+        &served.engine,
+        metrics,
+        served.max_queue_wait,
+        choices
+            .into_iter()
+            .map(|sampler| shaped.request(sampler, false))
+            .collect(),
+        client_gone,
+        |_, _, _| GenerationControl::Continue(()),
+    )
+    .inspect_err(|error| account_generation_error(metrics, error))?;
     let mut total_completion = 0usize;
     let mut choices = Vec::with_capacity(completions.len());
     for (index, completion) in completions.iter().enumerate() {
@@ -539,9 +437,9 @@ pub(crate) fn handle_completion(
             index,
             text: completion.text.clone(),
             finish_reason: completion.finish.api_name().into(),
-            logprobs: req
-                .logprobs
-                .map(|_| logprobs_json(&served.model, &completion.logprobs, completion_tokens)),
+            logprobs: req.logprobs.map(|_| {
+                logprobs_json(served.model.text(), &completion.logprobs, completion_tokens)
+            }),
         });
     }
     let prompt_tokens = completions[0].prompt_tokens;
@@ -561,23 +459,27 @@ pub(crate) fn handle_completion(
     Ok(serde_json::to_string(&resp)?)
 }
 
-/// Render a chat request into its prompt and the assistant turn-end stop markers: the jinja chat template
+/// Render a chat request into its prompt tokens and the assistant turn-end stop markers: the jinja chat template
 /// (the checkpoint's, or the `--chat-template` given at startup) when there is one, else the per-arch
 /// `ChatFormat`. Shared by the stream and non-stream paths. The prompt must come from the template; wrong
-/// markup degrades output and the turn-end never matches. A startup override that fails to render the
-/// conversation refuses the request rather than answering in another format.
-pub(crate) fn chat_prompt_and_stops(
+/// markup degrades output and the turn-end never matches. A template that fails to render the conversation
+/// refuses the request rather than answering in another format. Message contents are tokenized as plain text:
+/// a message cannot spell a control token.
+pub(crate) fn chat_tokens_and_stops(
     handle: &ModelHandle,
     req: &ChatReq,
-) -> Result<(String, Vec<String>)> {
+) -> Result<(Vec<u32>, Vec<String>)> {
     // Pass the full message objects (role, content, tool_calls, tool_call_id, name) so multi-turn tool
     // conversations render through the template's tool-history branch.
     let msgs = serde_json::to_value(&req.messages).unwrap_or(serde_json::Value::Null);
+    // The conversation is the client's: a template that refuses it (it raises, or spends its budget) is a 400.
+    // The tokenizer failing on the rendered prompt is not the client's doing.
     let rendered = handle
         .text()
         .render_chat_value(&msgs, req.tools.as_ref())
         .map_err(|e| anyhow::Error::new(RefusedRequest(format!("{e:#}"))))?;
-    Ok((rendered.prompt, rendered.stops))
+    let tokens = handle.text().encode_chat(&rendered)?;
+    Ok((tokens, rendered.stops))
 }
 
 /// `/v1/chat/completions` (non-streaming): render the conversation, generate the assistant turn, and trim
@@ -591,17 +493,18 @@ pub(crate) fn handle_chat(
     let _inflight = InFlight::enter(metrics);
     let shaped = shape_chat(served, req)?;
     let choices = samplers(shaped.n, |i| chat_sampler(&served.model, req, i))?;
-    let results = run_choices(choices, |_, sampler| {
-        submit(
-            &served.engine,
-            metrics,
-            shaped.request(sampler, false),
-            client_gone,
-            |_, _| GenerationControl::Continue(()),
-        )
-    });
-    let completions =
-        collect_choices(results).inspect_err(|error| account_generation_error(metrics, error))?;
+    let completions = submit(
+        &served.engine,
+        metrics,
+        served.max_queue_wait,
+        choices
+            .into_iter()
+            .map(|sampler| shaped.request(sampler, false))
+            .collect(),
+        client_gone,
+        |_, _, _| GenerationControl::Continue(()),
+    )
+    .inspect_err(|error| account_generation_error(metrics, error))?;
     let mut total_completion = 0usize;
     let mut choices = Vec::with_capacity(completions.len());
     for (index, completion) in completions.iter().enumerate() {
@@ -639,9 +542,9 @@ pub(crate) fn handle_chat(
             index,
             message,
             finish_reason,
-            logprobs: req
-                .logprobs
-                .then(|| logprobs_json(&served.model, &completion.logprobs, completion_tokens)),
+            logprobs: req.logprobs.then(|| {
+                logprobs_json(served.model.text(), &completion.logprobs, completion_tokens)
+            }),
         });
     }
     let prompt_tokens = completions[0].prompt_tokens;
@@ -681,76 +584,70 @@ pub(crate) fn stream_chat(
         Ok(prepared) => prepared,
         Err(e) => return respond_shaping_error(stream, &e),
     };
-    stream.write_all(SSE_HEADERS)?;
-    stream.flush()?;
+    write_all_within(stream, SSE_HEADERS)?;
     // When the request offers `tools`, the output is buffered instead of streamed as content deltas,
     // since `<tool_call>` markup must not reach the client as content. At choice end: parsed calls become
     // a `delta.tool_calls` chunk; otherwise the text is flushed as one content delta.
     let tools_mode = req.tools.is_some();
     let start = Instant::now();
-    let ttft: Mutex<Option<Duration>> = Mutex::new(None);
+    let mut ttft: Option<Duration> = None;
     let probe = stream.try_clone().ok();
-    let writer = SseWriter::new(stream);
-    let gone = || writer.aborted() || probe.as_ref().is_some_and(peer_closed);
-    let results = run_choices(choices, |index, sampler| {
-        // The first chunk of a choice announces the assistant role.
+    let gone = || probe.as_ref().is_some_and(peer_closed);
+    // The first chunk of each choice announces the assistant role.
+    for index in 0..shaped.n {
         let role = serde_json::json!({
             "object": "chat.completion.chunk", "model": model,
             "choices": [{ "index": index, "delta": { "role": "assistant" }, "finish_reason": serde_json::Value::Null }],
         });
-        if writer.send(&role).is_err() {
-            writer.abort();
-            return Err(GenerationError::ClientCancelled); // client gone before this choice started.
+        if write_sse_data(stream, &role).is_err() {
+            // The client is gone before any choice started.
+            return stream_generation_error(stream, metrics, &GenerationError::ClientCancelled);
         }
-        let result = submit(
-            &served.engine,
-            metrics,
-            shaped.request(sampler, true),
-            &gone,
-            |piece, info| {
-                if tools_mode && writer.heartbeat().is_err() {
-                    writer.abort();
-                    return GenerationControl::Break(());
-                }
-                ttft.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_or_insert_with(|| start.elapsed());
-                // Inter-token latency from the engine's `since_prev_ms`.
-                if info.since_prev_ms > 0.0 {
-                    metrics.itl.observe(info.since_prev_ms);
-                }
-                tracing::trace!(
-                    token_idx = info.token_idx,
-                    since_prev_ms = format!("{:.3}", info.since_prev_ms),
-                    cumulative_ms = format!("{:.3}", info.cumulative_ms),
-                    kv_used_ratio = format!("{:.3}", info.kv_used_ratio),
-                    "token"
-                );
-                if tools_mode {
-                    // Output stays buffered; the heartbeat above already probed transport.
-                    return GenerationControl::Continue(());
-                }
-                let chunk = serde_json::json!({
-                    "object": "chat.completion.chunk", "model": model,
-                    "choices": [{ "index": index, "delta": { "content": piece }, "finish_reason": serde_json::Value::Null }],
-                });
-                // A failed write means the client is gone: stop.
-                if writer.send(&chunk).is_ok() {
-                    GenerationControl::Continue(())
-                } else {
-                    writer.abort();
-                    GenerationControl::Break(())
-                }
-            },
-        );
-        if result.is_err() {
-            writer.abort();
-        }
-        result
-    });
-    let completions = match collect_choices(results) {
+    }
+    let submitted = submit(
+        &served.engine,
+        metrics,
+        served.max_queue_wait,
+        choices
+            .into_iter()
+            .map(|sampler| shaped.request(sampler, true))
+            .collect(),
+        &gone,
+        |index, piece, info| {
+            if tools_mode && write_tool_stream_heartbeat(stream).is_err() {
+                return GenerationControl::Break(());
+            }
+            ttft.get_or_insert_with(|| start.elapsed());
+            // Inter-token latency from the engine's `since_prev_ms`.
+            if info.since_prev_ms > 0.0 {
+                metrics.itl.observe(info.since_prev_ms);
+            }
+            tracing::trace!(
+                token_idx = info.token_idx,
+                since_prev_ms = format!("{:.3}", info.since_prev_ms),
+                cumulative_ms = format!("{:.3}", info.cumulative_ms),
+                kv_used_ratio = format!("{:.3}", info.kv_used_ratio),
+                "token"
+            );
+            if tools_mode {
+                // Output stays buffered; the heartbeat above already probed transport.
+                return GenerationControl::Continue(());
+            }
+            let chunk = serde_json::json!({
+                "object": "chat.completion.chunk", "model": model,
+                "choices": [{ "index": index, "delta": { "content": piece }, "finish_reason": serde_json::Value::Null }],
+            });
+            // A failed write means the client is gone: stop.
+            if write_sse_data(stream, &chunk).is_ok() {
+                GenerationControl::Continue(())
+            } else {
+                GenerationControl::Break(())
+            }
+        },
+    );
+    let completions = match submitted {
         Ok(completions) => completions,
-        Err(error) => return stream_generation_error(writer.into_stream(), metrics, &error),
+        Err(error) => return stream_generation_error(stream, metrics, &error),
     };
     let mut total_completion = 0usize;
     for (index, completion) in completions.iter().enumerate() {
@@ -767,7 +664,7 @@ pub(crate) fn stream_chat(
                 "object": "chat.completion.chunk", "model": model,
                 "choices": [{ "index": index, "delta": { "tool_calls": deltas }, "finish_reason": serde_json::Value::Null }],
             });
-            writer.send(&chunk)?;
+            write_sse_data(stream, &chunk)?;
             "tool_calls"
         } else {
             if tools_mode && !completion.text.is_empty() {
@@ -776,7 +673,7 @@ pub(crate) fn stream_chat(
                     "object": "chat.completion.chunk", "model": model,
                     "choices": [{ "index": index, "delta": { "content": completion.text }, "finish_reason": serde_json::Value::Null }],
                 });
-                writer.send(&chunk)?;
+                write_sse_data(stream, &chunk)?;
             }
             completion.finish.api_name()
         };
@@ -784,16 +681,13 @@ pub(crate) fn stream_chat(
             "object": "chat.completion.chunk", "model": model,
             "choices": [{ "index": index, "delta": {}, "finish_reason": finish }],
         });
-        writer.send(&done)?;
+        write_sse_data(stream, &done)?;
         total_completion +=
             completion_tokens(&served.model, completion, completion.text.trim_end())?;
     }
     let prompt_tokens = completions[0].prompt_tokens;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let ttft_ms = ttft
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner())
-        .map_or(total_ms, |d| d.as_secs_f64() * 1000.0);
+    let ttft_ms = ttft.map_or(total_ms, |d| d.as_secs_f64() * 1000.0);
     tracing::debug!(
         prompt_tokens,
         completion_tokens = total_completion,
@@ -809,9 +703,9 @@ pub(crate) fn stream_chat(
             ttft_ms,
             total_ms,
         );
-        writer.send(&receipt)?;
+        write_sse_data(stream, &receipt)?;
     }
-    writer.send(&"[DONE]")?;
+    write_sse_data(stream, &"[DONE]")?;
     Ok(())
 }
 

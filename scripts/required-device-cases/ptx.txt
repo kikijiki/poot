@@ -72,7 +72,7 @@ poot-llm	driver::device_tests::qwen35_sampled_differs_from_greedy_ptx
 poot-llm	driver::device_tests::qwen3next_decode_reuses_one_program_across_positions_ptx
 poot-llm	driver::device_tests::qwen3next_sampled_differs_from_greedy_ptx
 poot-llm	driver::device_tests::qwen4exp_bf16_owners_are_not_widened_per_step_ptx
-poot-llm	driver::device_tests::qwen4exp_out_of_vocab_token_is_a_typed_validation_fault_ptx
+poot-llm	driver::device_tests::qwen4exp_out_of_vocab_token_is_refused_at_the_driver_ptx
 poot-llm	driver::device_tests::qwen4exp_ple_histories_match_the_reference_ptx
 poot-llm	driver::device_tests::qwen4exp_sharded_ple_table_matches_the_reference_ptx
 poot-llm	driver::device_tests::readmit_nemotron_h_ptx
@@ -169,6 +169,7 @@ poot-llm::timed_executor	profiled_executor_reports_a_nonzero_device_span_ptx
 poot-ptx-device::batched_lora_ptx	batched_lora_decode_ptx_matches_per_row_merged_weight_reference
 poot-ptx-device::buffer_plan	a_short_value_reusing_a_larger_slot_matches_the_oracle_on_ptx
 poot-ptx-device::buffer_plan	an_aie_launch_is_a_typed_refusal_on_ptx
+poot-ptx-device::buffer_plan	an_over_length_dispatch_is_refused_by_the_engine_on_ptx
 poot-ptx-device::buffer_plan	len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_ptx
 poot-ptx-device::buffer_plan	lp3_ptx_write_with_is_exact_across_ring_chunks
 poot-ptx-device::cross_backend	a_dense_tiled_epilogue_matches_the_oracle_on_ptx
@@ -195,6 +196,7 @@ poot-ptx-device::cross_backend	reduce_sum_ptx_matches_cpu
 poot-ptx-device::cross_backend	rmsnorm_ptx_matches_cpu
 poot-ptx-device::cross_backend	sample_token_greedy_ptx_matches_cpu
 poot-ptx-device::cross_backend	sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu
+poot-ptx-device::cross_backend	sample_token_topp_nucleus_ptx_matches_cpu
 poot-ptx-device::cross_backend	single_element_ptx_matches_cpu
 poot-ptx-device::cross_backend	transpose_slice_ptx_matches_cpu
 poot-ptx-device::cross_backend	unary_erf_ptx_matches_cpu

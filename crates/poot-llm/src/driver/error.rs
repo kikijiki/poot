@@ -162,6 +162,16 @@ pub enum InvalidRequest {
         /// The positions the model has.
         max: usize,
     },
+    /// A token id at or past the model's vocabulary: it names no embedding row.
+    #[error("token id {token} at prompt position {at} is outside the vocabulary of {vocab} tokens")]
+    TokenOutOfVocab {
+        /// The offending id.
+        token: u32,
+        /// Its position in the prompt.
+        at: usize,
+        /// The model's vocabulary size.
+        vocab: usize,
+    },
     /// `open` and `step` serve the shapes `Driver::prepare` admitted; nothing is admitted yet.
     #[error("the driver has no serving shapes: call prepare first")]
     NotPrepared,

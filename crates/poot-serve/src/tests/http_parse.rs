@@ -370,8 +370,9 @@ fn request_defaults_stay_greedy() {
     assert!(sampler_of(&req.sampling).is_greedy());
 }
 
-/// card 224: an oversized `Content-Length` must be rejected by `read_request` before the body buffer is allocated.
-/// The client sends only headers, so if the fix regressed to the old unconditional `vec![0u8; content_length]` + `read_exact`, this test would hang waiting for bytes (caught by nextest's per-test timeout) rather than fail fast. Removing the `body_len_ok` check reproduces that hang.
+/// An oversized `Content-Length` must be rejected by `read_request` before the body buffer is allocated.
+/// The client sends only headers, so if the cap check moved after the read, this test would hang waiting
+/// for bytes (caught by nextest's per-test timeout) rather than fail fast.
 #[test]
 fn read_request_rejects_oversized_content_length_without_reading_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -379,7 +380,7 @@ fn read_request_rejects_oversized_content_length_without_reading_body() {
     let mut client = TcpStream::connect(addr).unwrap();
     let (mut server, _) = listener.accept().unwrap();
 
-    let too_big = MAX_BODY_BYTES + 1;
+    let too_big = BODY_CAP + 1;
     write!(
         client,
         "POST /v1/completions HTTP/1.1\r\nContent-Length: {too_big}\r\n\r\n"
@@ -388,9 +389,9 @@ fn read_request_rejects_oversized_content_length_without_reading_body() {
     client.flush().unwrap();
     // no body bytes sent: read_request must return before trying to read any of them.
 
-    let result = read_request(&mut server).expect("header parse succeeds");
+    let result = read_request(&mut server, BODY_CAP);
     assert!(
-        matches!(result, RequestRead::BodyTooLarge),
+        matches!(result, Err(ReadFailure::Refused(Refusal::BodyTooLarge))),
         "an oversized Content-Length must be rejected, not parsed into a request"
     );
 }
@@ -413,10 +414,7 @@ fn read_request_parses_a_normal_small_body() {
         .unwrap();
     client.flush().unwrap();
 
-    let parsed = match read_request(&mut server).expect("read succeeds") {
-        RequestRead::Parsed(p) => p,
-        _ => panic!("a normal-sized body must parse, not be rejected"),
-    };
+    let parsed = read_request(&mut server, BODY_CAP).expect("a normal-sized body must parse");
     assert_eq!(parsed.method, "POST");
     assert_eq!(parsed.path, "/v1/completions");
     assert_eq!(parsed.authorization.as_deref(), Some("Bearer secret"));
@@ -434,29 +432,25 @@ fn read_request_from_parses_a_normal_request() {
         body
     );
     let mut cur = std::io::Cursor::new(raw.into_bytes());
-    let parsed = match read_request_from(&mut cur).expect("parse ok") {
-        RequestRead::Parsed(p) => p,
-        _ => panic!("normal request must parse"),
-    };
+    let parsed = read_request_from(&mut cur, BODY_CAP).expect("normal request must parse");
     assert_eq!(parsed.method, "POST");
     assert_eq!(parsed.path, "/v1/completions");
     assert_eq!(parsed.authorization.as_deref(), Some("Bearer secret"));
     assert_eq!(parsed.body, body);
 }
 
-/// The body is read incrementally, bounded by Content-Length, not pre-allocated to the declared size: a client may declare a large Content-Length (up to the 64MB cap) yet send far fewer bytes, and that must not commit the declared size off the unverified header (a memory-amplification DoS across many connections).
-/// Here the header declares 5_000_000 bytes but only a few are sent; the reader must return exactly the bytes available (then EOF) without erroring or over-allocating.
+/// A body that ends before its declared `Content-Length` is a truncated request, refused rather than
+/// handed to the JSON parser as if it were whole. The body is read as it arrives, not allocated at the
+/// declared size, so a client that declares a large body and sends a few bytes costs only those bytes.
 #[test]
-fn read_request_from_reads_body_incrementally_not_the_declared_length() {
+fn read_request_from_refuses_a_body_shorter_than_its_declared_length() {
     let sent = r#"{"prompt":"hi"}"#; // far less than the declared Content-Length below
-    let raw = format!("POST /v1/completions HTTP/1.1\r\nContent-Length: 5000000\r\n\r\n{sent}");
+    let raw = format!("POST /v1/completions HTTP/1.1\r\nContent-Length: 1000000\r\n\r\n{sent}");
     let mut cur = std::io::Cursor::new(raw.into_bytes());
-    let parsed = match read_request_from(&mut cur).expect("parse ok") {
-        RequestRead::Parsed(p) => p,
-        _ => panic!("a short body under a large declared Content-Length must still parse"),
-    };
-    // Only the bytes actually present are read (the take() cap plus EOF), not 5_000_000 zero bytes.
-    assert_eq!(parsed.body, sent);
+    assert!(matches!(
+        read_request_from(&mut cur, BODY_CAP),
+        Err(ReadFailure::Refused(Refusal::TruncatedBody))
+    ));
 }
 
 /// card 224 follow-on: a single header line longer than `MAX_HEADER_BYTES` (no newline) must be rejected as HeadersTooLarge without the reader allocating past the cap (closing the unbounded-`read_line` DoS on the request-head side).
@@ -467,8 +461,8 @@ fn read_request_from_rejects_an_oversized_header_line() {
     let mut cur = std::io::Cursor::new(raw);
     assert!(
         matches!(
-            read_request_from(&mut cur).expect("parse returns"),
-            RequestRead::HeadersTooLarge
+            read_request_from(&mut cur, BODY_CAP),
+            Err(ReadFailure::Refused(Refusal::HeadersTooLarge))
         ),
         "an over-long header line must be rejected as HeadersTooLarge"
     );
@@ -488,8 +482,8 @@ fn read_request_from_rejects_oversized_cumulative_headers() {
     let mut cur = std::io::Cursor::new(raw);
     assert!(
         matches!(
-            read_request_from(&mut cur).expect("parse returns"),
-            RequestRead::HeadersTooLarge
+            read_request_from(&mut cur, BODY_CAP),
+            Err(ReadFailure::Refused(Refusal::HeadersTooLarge))
         ),
         "cumulative headers over the budget must be rejected"
     );

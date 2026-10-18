@@ -5,7 +5,7 @@
 //! Mutations (applied by hand, shown red, restored; recorded in the POOT-1189 report):
 //! SH-1 `gguf_plan` slices every tensor out of shard 0; SH-2 `parse_shards` skips the `split.count`
 //! check; SH-3 skips the `split.no` check; SH-4 lets a later shard replace a tensor of an earlier
-//! one; SH-5 `gguf_plan` skips the `split.tensors.count` check; SH-6 `split_name` accepts a shard
+//! one; SH-5 `gguf_plan` skips the `split.tensors.count` check; SH-7 `parse_shards` checks `split.count` only for more than one file; SH-8 drops the first shard's `split.no` check; SH-6 `split_name` accepts a shard
 //! number above the count.
 
 use std::path::Path;
@@ -128,22 +128,78 @@ fn sh4_a_tensor_in_two_shards_is_refused() {
     );
 }
 
-/// SH-5: the first shard alone parses (its metadata is readable) but is not a loadable checkpoint:
-/// its directory lists one tensor of the three the set declares.
+/// SH-5: a full-size set whose directory lists fewer tensors than `split.tensors.count` declares
+/// parses but is not a loadable checkpoint.
 #[test]
-fn sh5_a_lone_shard_is_not_loadable() {
-    let [a, ..] = three();
-    let index = GgufIndex::parse(&a).unwrap();
+fn sh5_a_set_missing_tensors_is_not_loadable() {
+    let files = [
+        shard(0, 2, 3, &[("a", 1.0)]),
+        shard(1, 2, 3, &[("b", 10.0)]),
+    ];
+    let index = GgufIndex::parse_shards(&files).unwrap();
     let error = read_gguf(&index, &IdentityNames, default_workers()).unwrap_err();
     assert!(
         matches!(
             error,
             LoadError::GgufSplit(GgufSplitError::Incomplete {
                 declared: 3,
-                found: 1
+                found: 2
             })
         ),
         "{error}"
+    );
+}
+
+/// SH-7 (POOT-1196): the first shard on its own is refused, with or without `split.tensors.count`:
+/// `split.count` is checked for a single file too.
+#[test]
+fn sh7_a_lone_shard_is_refused() {
+    let [a, ..] = three();
+    assert_eq!(
+        split_error(GgufIndex::parse(&a)),
+        GgufSplitError::Count {
+            declared: Some(3),
+            given: 1
+        }
+    );
+    let no_total = StoredBytes::from(write_gguf(
+        &[
+            ("split.no", GgufValue::U32(0)),
+            ("split.count", GgufValue::U32(3)),
+        ],
+        &[],
+    ));
+    assert_eq!(
+        split_error(GgufIndex::parse(&no_total)),
+        GgufSplitError::Count {
+            declared: Some(3),
+            given: 1
+        }
+    );
+}
+
+/// SH-8 (POOT-1196): the first shard must sit at `split.no = 0`: another number, or none, is
+/// refused at position 0.
+#[test]
+fn sh8_the_first_shard_must_be_number_zero() {
+    let wrong = [
+        shard(1, 2, 2, &[("a", 1.0)]),
+        shard(1, 2, 2, &[("b", 10.0)]),
+    ];
+    assert_eq!(
+        split_error(GgufIndex::parse_shards(&wrong)),
+        GgufSplitError::Order {
+            position: 0,
+            declared: Some(1)
+        }
+    );
+    let unnumbered = StoredBytes::from(write_gguf(&[("split.count", GgufValue::U32(1))], &[]));
+    assert_eq!(
+        split_error(GgufIndex::parse(&unnumbered)),
+        GgufSplitError::Order {
+            position: 0,
+            declared: None
+        }
     );
 }
 

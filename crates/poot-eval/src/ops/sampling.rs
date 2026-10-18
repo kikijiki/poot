@@ -35,6 +35,31 @@ pub(crate) fn random_uniform(seed: &HostTensor, cols: usize) -> Result<HostTenso
     Ok(HostTensor::f32(shape, data))
 }
 
+/// The finite stand-in a caller writes for a token it excluded from the row (a guided-decoding mask).
+/// `SampleToken` flags a non-finite logit, so a masked token cannot be `-inf`; it is the lowest finite
+/// f32 instead, and the bisection floor ignores it so top-k and top-p search the real logits only.
+pub const MASKED_LOGIT: f32 = f32::MIN;
+
+/// Fixed-point scale of a token's top-p mass: `2^24` units for the top token (probability ratio 1).
+/// A token whose probability is at least `2^-25` of the top token keeps a nonzero mass, so the tail of a
+/// flat distribution is summed instead of rounded away.
+const TOP_P_MASS_UNITS: f32 = 16_777_216.0;
+
+/// One token's top-p mass in units of `2^-24` of the top token: `round(exp((logit - max) * inv_temp) *
+/// 2^24)`, at most `2^24`. The one definition of a token's nucleus mass: the oracle's bisection, the
+/// host sampler's candidate cut and the device kernel all sum these integers, so the sum is exact and
+/// independent of reduction order.
+pub fn top_p_token_mass(logit: f32, max_logit: f32, inv_temp: f32) -> u32 {
+    (((logit - max_logit) * inv_temp).exp() * TOP_P_MASS_UNITS).round() as u32
+}
+
+/// The mass the nucleus must reach: `round(top_p * total)` with the `f32` product the device kernel also
+/// computes (`total` rounded to f32 first). Only this threshold is rounded; the masses compared against
+/// it are exact integers.
+pub fn top_p_threshold(total: u64, top_p: f32) -> u64 {
+    (top_p * total as f32).round() as u64
+}
+
 /// One row's `(token, non_finite_index)`. `params` is `(inv_temp, floor_offset, noise_scale)`; `top_k`
 /// is `None` when the rule has no top-k operand, `Some(k)` otherwise (`k <= 0` disables it, matching the
 /// kernel); `top_p` is `None` unless `rule` is `GumbelTopKTopP`.
@@ -54,7 +79,9 @@ fn sample_one_row(
             if v > max_logit {
                 max_logit = v;
             }
-            if v < min_logit {
+            // `MASKED_LOGIT` is a row the caller excluded, not a candidate: counting it would make the
+            // top-k / top-p bisection start from a floor no real logit approaches (R2-C1-002).
+            if v < min_logit && v != MASKED_LOGIT {
                 min_logit = v;
             }
         } else if non_finite_idx.is_none() {
@@ -114,24 +141,19 @@ fn sample_one_row(
         if tp <= 0.0f32 {
             floor = max_logit;
         } else if tp < 1.0f32 {
-            let mass_at = |thresh: f32| -> f32 {
-                let mut mass = 0.0f32;
-                for &v in logits {
-                    if v >= thresh {
-                        let e = ((v - max_logit) * inv_temp).exp();
-                        mass += (e * 16.0f32).round();
-                    }
-                }
-                mass
+            let mass_at = |thresh: f32| -> u64 {
+                logits
+                    .iter()
+                    .filter(|&&v| v >= thresh)
+                    .map(|&v| u64::from(top_p_token_mass(v, max_logit, inv_temp)))
+                    .sum()
             };
-            let z_trunc = mass_at(floor1);
-            let tp_thresh = (tp * z_trunc).round();
+            let tp_thresh = top_p_threshold(mass_at(floor1), tp);
             let mut tlo = floor1;
             let mut thi = max_logit;
             for _ in 0..30 {
                 let mid = (tlo + thi) * 0.5f32;
-                let mass_above = mass_at(mid);
-                if mass_above >= tp_thresh {
+                if mass_at(mid) >= tp_thresh {
                     tlo = mid;
                 } else {
                     thi = mid;

@@ -24,7 +24,6 @@ mod tokenize;
 
 pub use chat::{
     ChatTemplateOverride, CheckedChatTemplate, RenderedChat, Speaker, read_tokenizer_config_chat,
-    render_jinja_value,
 };
 pub use chat_format::ChatFormat;
 pub use error::{ChatTemplateError, Result, TextError};

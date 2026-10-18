@@ -10,7 +10,9 @@ impl Context {
     /// Validate one dispatch's bindings against the kernel's argument `schema` (card 608, SC-002) and
     /// this context, and validate its grid. Every dispatch path goes through here, so a kernel is only ever
     /// bound to exactly the number and native kind of buffers its schema names, all of them children of
-    /// this context's device, each told no more elements than its allocation holds.
+    /// this context's device. The element count each is told is not checked here: it is the executor's
+    /// to bound by the buffer's capacity (`poot_executor::DispatchError::ArgExceedsBuffer`), once, for
+    /// every backend.
     pub(crate) fn check_bindings(
         &self,
         schema: &[poot_runtime_common::ArgSchema],
@@ -23,18 +25,6 @@ impl Context {
         poot_runtime_common::check_element_schema(schema, &elements)?;
         if args.iter().any(|a| !a.buffer.belongs_to(&self.owner)) {
             return Err(RuntimeError::ForeignObject("buffer"));
-        }
-        for (index, arg) in args.iter().enumerate() {
-            let element = arg.buffer.element();
-            let bytes = u64::from(arg.elems) * element.byte_width() as u64;
-            if bytes > arg.buffer.byte_len() as u64 {
-                return Err(RuntimeError::ArgExceedsBuffer {
-                    index,
-                    elems: arg.elems,
-                    element,
-                    byte_len: arg.buffer.byte_len(),
-                });
-            }
         }
         // Fold first so the length block carries the X-thread extent for `thread_index` reconstruction.
         crate::util::resolve_groups(threads, wg, self.max_workgroup_count)

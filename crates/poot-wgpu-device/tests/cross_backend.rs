@@ -1245,6 +1245,136 @@ fn sample_token_gumbel_topk_cross_backend() {
     assert_eq!(got, vec![3, -1]);
 }
 
+/// POOT-1195 (R2-C1-001) SC-003: the batched top-p kernel picks the same token as the CPU oracle for
+/// 1,000 seeded rows on each of three distributions whose real nucleus the old `SCALE = 16` mass
+/// collapsed (Zipf s=1.1 and s=0.8 over 32,000 tokens at `top_p = 0.95`; a 0.5 head over a 500-token
+/// flat tail at `top_p = 0.9`), on wgpu. Every row shares the logits and draws its own Gumbel noise,
+/// so a collapsed device nucleus is observable twice: as a mismatch against the oracle and as a draw that
+/// never leaves the first few tokens.
+///
+/// Mutation: put `SCALE = 16` (`round(exp(..) * 16)`) back in `sample_topp_gumbel_argmax_batched.rs`
+/// and regenerate the assets; this row goes red while the host rows stay green.
+#[test]
+fn sample_token_topp_nucleus_matches_cpu_cross_backend() {
+    let _g = gpu_lock();
+    let Some((mut exec, target)) = try_gpu() else {
+        return;
+    };
+    let zipf = |s: f64| -> Vec<f32> {
+        (0..32_000)
+            .map(|i| (-s * ((i + 1) as f64).ln()) as f32)
+            .collect()
+    };
+    let mut head_tail = vec![0.5f64.ln() as f32];
+    head_tail.extend((0..500).map(|j| (0.001f64 * (1.0 - 1.0e-4 * j as f64)).ln() as f32));
+    let distributions: [(&str, Vec<f32>, f32); 3] = [
+        ("zipf s=1.1", zipf(1.1), 0.95),
+        ("zipf s=0.8", zipf(0.8), 0.95),
+        ("head + flat tail", head_tail, 0.9),
+    ];
+    let rows = 1000usize;
+    for (label, row_logits, top_p) in distributions {
+        let vocab = row_logits.len();
+        let b = Builder::for_tests();
+        let logits = b
+            .constant("logits", TensorType::f32(vec![rows, vocab]))
+            .unwrap();
+        let noise = b
+            .constant("noise", TensorType::f32(vec![rows, vocab]))
+            .unwrap();
+        let params = b
+            .constant("params", TensorType::f32(vec![rows, 4]))
+            .unwrap();
+        let top_k = {
+            use poot_graph_ir::Slot;
+            b.slot_named(
+                Slot::Sampler,
+                "top_k",
+                TensorType::new(vec![rows], DType::I32),
+            )
+            .unwrap()
+        };
+        let out = b
+            .sample_token(
+                poot_graph_ir::op::SampleRule::GumbelTopKTopP,
+                logits,
+                Some(noise),
+                Some(params),
+                Some(top_k),
+            )
+            .unwrap();
+        let (li, ni, pi) = (logits.id(), noise.id(), params.id());
+        let g = b.finish(out).unwrap();
+
+        let logits_data: Vec<f32> = (0..rows).flat_map(|_| row_logits.iter().copied()).collect();
+        // Gumbel noise `-ln(-ln(u))`, one xorshift64 stream per row (row index is the seed).
+        let noise_data: Vec<f32> = (0..rows)
+            .flat_map(|r| {
+                let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ ((r as u64 + 1) << 20);
+                (0..vocab).map(move |_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    let u = (((s >> 40) as f32) + 0.5) / (1u64 << 24) as f32;
+                    -(-u.ln()).ln()
+                })
+            })
+            .collect();
+        let params_data: Vec<f32> = (0..rows)
+            .flat_map(|_| [1.0, f32::NEG_INFINITY, 1.0, top_p])
+            .collect();
+        let top_k_data = vec![0i32; rows];
+        let inputs: HashMap<ValueId, Value> = HashMap::from([
+            (
+                li,
+                HostTensor::f32(vec![rows, vocab], logits_data.clone()).into(),
+            ),
+            (
+                ni,
+                HostTensor::f32(vec![rows, vocab], noise_data.clone()).into(),
+            ),
+            (
+                pi,
+                HostTensor::f32(vec![rows, 4], params_data.clone()).into(),
+            ),
+            (
+                top_k.id(),
+                HostTensor::i32(vec![rows], top_k_data.clone()).into(),
+            ),
+        ]);
+        let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap();
+        let cpu = cpu.as_i32().expect("SampleToken output is I32").to_vec();
+
+        let got: Vec<i32> = run_gumbel_family_contract(
+            &mut *exec,
+            target,
+            &g,
+            (li, vec![rows, vocab], logits_data),
+            (ni, vec![rows, vocab], noise_data),
+            (pi, vec![rows, 4], params_data),
+            Some((top_k.id(), vec![rows], top_k_data)),
+        );
+        let first_diff = got.iter().zip(&cpu).position(|(g, c)| g != c);
+        assert_eq!(
+            first_diff,
+            None,
+            "{label}: device top-p vs the CPU oracle over {rows} seeded rows: first differing word {first_diff:?} \
+             (device {:?}, oracle {:?})",
+            first_diff.map(|i| got[i]),
+            first_diff.map(|i| cpu[i]),
+        );
+        let farthest = got.chunks(2).map(|row| row[0]).max().unwrap();
+        assert!(
+            farthest > 100,
+            "{label}: a real nucleus reaches far past the first 20 tokens, the farthest draw was {farthest}"
+        );
+    }
+}
+
 /// Card 551a (SC-001): `OpKind::SampleToken { rule: GumbelTopKTopP }` through the full compile/
 /// planner/executor contract matches the CPU oracle bit for bit. `top_p = 0` must collapse to top-1
 /// (`floor = max_logit`) rather than being treated as disabled (the kernel doc's own warning: "do not
@@ -1354,9 +1484,8 @@ fn sample_token_gumbel_topk_topp_cross_backend() {
 /// Fixture: logits 3 and 6 tied at the row max (10.0); logit 2 sits just below (9.0) but carries a
 /// huge noise boost (noise_scale=1, noise=20.0) that makes it the Gumbel-max winner of the
 /// UNTRUNCATED row (perturbed 9+20=29 beats the tied pair's 10+0=10). `top_p = 0.7` with `top_k = 0`
-/// and min-p disabled gives a quantized nucleus mass of 16 (idx 3) + 16 (idx 6) + 6 (idx 2) = 38 and
-/// a threshold of `round(0.7 * 38) = 27`; the tied pair alone already clears it (32 >= 27), so the
-/// correct nucleus is exactly {3, 6}, excluding the decoy. A correct bisection converges its floor to
+/// and min-p disabled gives the tied pair 2 / (2 + e^-1), about 84% of the mass, which already clears
+/// `top_p = 0.7` (the decoy at logit 9.0 carries the rest), so the correct nucleus is exactly {3, 6}, excluding the decoy. A correct bisection converges its floor to
 /// `max_logit` (10.0), which still keeps the tied pair since `v >= floor` is `>=`, not `>`; tie-break
 /// picks index 3. Left broken (floor pinned at `-inf`), every index competes and the decoy (29) wins
 /// - an observable, not masked, mutation witness (reverting `poot-eval`'s fix reproduces this on the

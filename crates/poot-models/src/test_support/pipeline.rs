@@ -542,6 +542,9 @@ impl<D: Device> Device for Counting<D> {
     ) -> Result<Self::Buffer, Self::Error> {
         self.inner.allocate(role, storage, elems)
     }
+    fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
+        self.inner.buffer_elems(buffer)
+    }
     fn load_kernel(
         &mut self,
         key: &str,

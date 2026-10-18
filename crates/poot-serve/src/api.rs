@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use poot_llm::driver::{AdapterRef, DriverCaps, ModelHandle};
 use poot_llm::{Modality, Sampler, TokenLogprob};
+use poot_text::TextCodec;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{EngineView, GenerationError};
@@ -73,18 +74,20 @@ pub(crate) fn resolve_lora_adapter(view: &EngineView, name: &Option<String>) -> 
         .with_context(|| format!("unknown lora_adapter {name:?}: no loaded adapter has that name"))
 }
 
-/// Build the OpenAI-style `logprobs` object from the per-token records, decoding each token id to
-/// its text piece (and UTF-8 bytes). Uses the chat-completions `content` array shape for both
+/// Build the OpenAI-style `logprobs` object from the per-token records, giving each token id its
+/// surface bytes (the vocabulary piece, so a word-initial SentencePiece token keeps its leading
+/// space) and the text of those bytes. Uses the chat-completions `content` array shape for both
 /// endpoints. Records are truncated to `limit` so they align with the returned (possibly
 /// stop-trimmed) text.
 pub(crate) fn logprobs_json(
-    handle: &ModelHandle,
+    text: &TextCodec,
     records: &[TokenLogprob],
     limit: usize,
 ) -> serde_json::Value {
     let entry = |id: u32, logprob: f32| -> serde_json::Value {
-        let piece = handle.text().decode(&[id]).unwrap_or_default();
-        serde_json::json!({ "token": piece, "logprob": logprob, "bytes": piece.as_bytes() })
+        let bytes = text.token_bytes(id);
+        let piece = String::from_utf8_lossy(&bytes);
+        serde_json::json!({ "token": piece, "logprob": logprob, "bytes": bytes })
     };
     let content: Vec<serde_json::Value> = records
         .iter()
@@ -243,6 +246,22 @@ pub(crate) fn classify_handler_error(e: &anyhow::Error) -> (u16, &'static str) {
     }
 }
 
+/// Longest `guided_regex` pattern accepted, in bytes. The compiled automaton is bounded separately
+/// (`poot-text`), so this only keeps the request itself small.
+const MAX_GUIDED_PATTERN_BYTES: usize = 4096;
+/// Longest `guided_grammar` (GBNF source) accepted, in bytes.
+const MAX_GUIDED_GRAMMAR_BYTES: usize = 16 * 1024;
+/// Longest `guided_json` / `response_format` schema accepted, in bytes of its JSON text.
+const MAX_GUIDED_SCHEMA_BYTES: usize = 16 * 1024;
+
+/// Refuse a guided-decoding input longer than its cap, before any compile work.
+fn check_guided_len(field: &str, len: usize, max: usize) -> Result<()> {
+    if len > max {
+        bail!("{field} is {len} bytes long: the limit is {max}");
+    }
+    Ok(())
+}
+
 /// Apply a guided-decoding constraint to the sampler from the request (specs 040 / 043 / 044).
 /// `guided_choice` (a non-empty string list) constrains output to one of those strings;
 /// `guided_regex` to a regex; `guided_grammar` to a GBNF grammar; `guided_json` to a JSON Schema;
@@ -277,18 +296,30 @@ pub(crate) fn apply_guided(
         return Ok(sampler.with_constraint(handle.text().build_choice_constraint(choices)?));
     }
     if let Some(pattern) = guided_regex.as_ref().filter(|p| !p.is_empty()) {
+        check_guided_len("guided_regex", pattern.len(), MAX_GUIDED_PATTERN_BYTES)?;
         return Ok(sampler.with_constraint(handle.text().build_regex_constraint(pattern)?));
     }
     if let Some(gbnf) = guided_grammar.as_ref().filter(|g| !g.is_empty()) {
+        check_guided_len("guided_grammar", gbnf.len(), MAX_GUIDED_GRAMMAR_BYTES)?;
         return Ok(sampler.with_constraint(handle.text().build_grammar_constraint(gbnf)?));
     }
     if let Some(schema) = guided_json {
+        check_guided_len(
+            "guided_json",
+            schema.to_string().len(),
+            MAX_GUIDED_SCHEMA_BYTES,
+        )?;
         return Ok(sampler.with_constraint(handle.text().build_json_constraint(schema)?));
     }
     // OpenAI structured outputs (the standard field clients send, vs poot's `guided_json` extension).
     if let Some(rf) = response_format {
         match response_format_constraint(rf)? {
             ResponseFormatConstraint::Schema(schema) => {
+                check_guided_len(
+                    "response_format schema",
+                    schema.to_string().len(),
+                    MAX_GUIDED_SCHEMA_BYTES,
+                )?;
                 return Ok(sampler.with_constraint(handle.text().build_json_constraint(schema)?));
             }
             ResponseFormatConstraint::JsonObject => {

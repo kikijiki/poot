@@ -1,0 +1,59 @@
+{
+  "checkpoint": "Qwen/Qwen3.8-27B-FP8",
+  "checkpoint_revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+  "source": "poot-llm device_tests::qwen35_27b_fp8_receipt (CPU oracle, f64 log-softmax of the last prompt position)",
+  "device_backend": "ptx",
+  "prompt": "The capital of France is",
+  "prompt_ids": [
+    760,
+    6511,
+    314,
+    9338,
+    369
+  ],
+  "generated_ids": [
+    11751,
+    13,
+    198,
+    760,
+    6511,
+    314,
+    9564,
+    369
+  ],
+  "generated_text": " Paris.\nThe capital of Germany is",
+  "oracle_first_token_top5": {
+    "ids": [
+      11751,
+      524,
+      264,
+      31586,
+      1076
+    ],
+    "logprobs": [
+      -0.4540088186679867,
+      -3.3513877401767758,
+      -3.529184104007342,
+      -3.921600104373553,
+      -3.943039656680682
+    ]
+  },
+  "device_first_token_top5": {
+    "ids": [
+      11751,
+      524,
+      264,
+      31586,
+      1076
+    ],
+    "logprobs": [
+      -0.4532708,
+      -3.3506584,
+      -3.5284882,
+      -3.920888,
+      -3.9422998
+    ]
+  },
+  "tolerance": "token ids exact, log-probabilities within 1e-3 (ADR-0101 tier 2)",
+  "not_included": "top-50 / full logits: the row prints top-5 only"
+}

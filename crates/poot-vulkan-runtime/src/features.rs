@@ -2,6 +2,8 @@ use std::ffi::{CStr, c_char};
 
 use ash::vk;
 
+use crate::error::RuntimeError;
+
 /// The shader and storage features a physical device supports out of those poot's SPIR-V can declare:
 /// the `Float16`/`Int8`/`Int16`/`Int64`/`Float64` arithmetic capabilities, 8- and 16-bit storage-buffer
 /// access, the Vulkan memory model (cooperative-matrix modules require it), zero-initialized workgroup
@@ -10,6 +12,10 @@ use ash::vk;
 /// features; nothing unsupported is ever requested.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct DeviceFeatures {
+    /// `robustBufferAccess`: an out-of-bounds buffer access is defined (a read returns an unspecified
+    /// value, a write is dropped or redirected). Debranched SPIR-V runs on past a failed bounds assert, so
+    /// a device without it is refused at creation.
+    robust_buffer_access: bool,
     shader_float64: bool,
     shader_int16: bool,
     shader_int64: bool,
@@ -75,6 +81,7 @@ impl DeviceFeatures {
         let core = features2.features;
         let on = |flag: vk::Bool32| flag == vk::TRUE;
         DeviceFeatures {
+            robust_buffer_access: on(core.robust_buffer_access),
             shader_float64: on(core.shader_float64),
             shader_int16: on(core.shader_int16),
             shader_int64: on(core.shader_int64),
@@ -115,7 +122,21 @@ impl DeviceFeatures {
         self.cooperative_matrix && self.subgroup_size_control
     }
 
+    /// The core features the logical device enables: everything supported that poot's SPIR-V can use.
+    /// Robust buffer access is not optional here: `create_device` refuses a device without it.
+    fn enabled_core(&self) -> vk::PhysicalDeviceFeatures {
+        vk::PhysicalDeviceFeatures::default()
+            .robust_buffer_access(true)
+            .shader_float64(self.shader_float64)
+            .shader_int16(self.shader_int16)
+            .shader_int64(self.shader_int64)
+    }
+
     /// Create the logical device with every supported feature enabled.
+    ///
+    /// Refuses ([`RuntimeError::RobustBufferAccessUnsupported`]) a device without `robustBufferAccess`:
+    /// debranched SPIR-V (`poot_codegen::debranch`) continues past a failed bounds assert and is sound
+    /// only because robust buffer access makes the skipped access harmless.
     ///
     /// # Safety
     ///
@@ -126,7 +147,10 @@ impl DeviceFeatures {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
         queue_infos: &[vk::DeviceQueueCreateInfo<'_>],
-    ) -> Result<ash::Device, vk::Result> {
+    ) -> Result<ash::Device, RuntimeError> {
+        if !self.robust_buffer_access {
+            return Err(RuntimeError::RobustBufferAccessUnsupported);
+        }
         let mut extension_names: Vec<*const c_char> = Vec::new();
         if self.cooperative_matrix {
             extension_names.push(ash::khr::cooperative_matrix::NAME.as_ptr());
@@ -140,10 +164,7 @@ impl DeviceFeatures {
         if self.memory_budget {
             extension_names.push(ash::ext::memory_budget::NAME.as_ptr());
         }
-        let core = vk::PhysicalDeviceFeatures::default()
-            .shader_float64(self.shader_float64)
-            .shader_int16(self.shader_int16)
-            .shader_int64(self.shader_int64);
+        let core = self.enabled_core();
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default()
             .storage_buffer16_bit_access(self.storage_buffer16);
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -177,6 +198,66 @@ impl DeviceFeatures {
             info = info.push_next(&mut size_control);
         }
         // SAFETY: the caller's contract; `info` and the structs chained into it outlive the call.
-        unsafe { instance.create_device(physical_device, &info, None) }
+        Ok(unsafe { instance.create_device(physical_device, &info, None)? })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SC-002: a feature set without `robustBufferAccess` is refused with the typed error before the
+    /// instance is touched. The instance has no loaded entry points, so any driver call would panic.
+    /// Mutation: drop the refusal in `create_device`; the call then reaches the driver stubs and the test
+    /// fails (panic) instead of seeing the typed error.
+    #[test]
+    fn a_device_without_robust_buffer_access_is_refused() {
+        // SAFETY: a null instance with every entry point unloaded; `create_device` must return before
+        // calling any of them.
+        let instance =
+            unsafe { ash::Instance::load_with(|_| std::ptr::null(), vk::Instance::null()) };
+        let features = DeviceFeatures::default();
+        // SAFETY: the refusal returns before `physical_device` or `instance` are used.
+        let result = unsafe { features.create_device(&instance, vk::PhysicalDevice::null(), &[]) };
+        assert!(
+            matches!(result, Err(RuntimeError::RobustBufferAccessUnsupported)),
+            "expected the typed robustBufferAccess refusal, got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    /// SC-001: on the local GPU the features the runtime enables include `robustBufferAccess`. Queries
+    /// the device the way `Context::new` does and checks the very struct `create_device` passes to
+    /// `vkCreateDevice`. Mutation: remove `.robust_buffer_access(true)` from `enabled_core`.
+    #[test]
+    fn the_enabled_core_features_include_robust_buffer_access() {
+        let Ok(ctx) = crate::Context::new() else {
+            eprintln!(
+                "SKIP the_enabled_core_features_include_robust_buffer_access: no Vulkan device"
+            );
+            return;
+        };
+        // SAFETY: `ctx.physical_device` is valid for `ctx.instance`.
+        let props = unsafe {
+            ctx.instance
+                .get_physical_device_properties(ctx.physical_device)
+        };
+        // SAFETY: as above.
+        let extensions = unsafe {
+            ctx.instance
+                .enumerate_device_extension_properties(ctx.physical_device)
+        }
+        .unwrap_or_default();
+        let features = DeviceFeatures::query(
+            &ctx.instance,
+            ctx.physical_device,
+            props.api_version,
+            &extensions,
+        );
+        assert_eq!(
+            features.enabled_core().robust_buffer_access,
+            vk::TRUE,
+            "the device must be created with robustBufferAccess"
+        );
     }
 }

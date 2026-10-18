@@ -509,3 +509,16 @@ fn the_vulkan_device_reports_live_free_memory_within_its_open_time_ceiling() {
     );
     drop(held);
 }
+
+/// POOT-1205 SC-003: the engine refuses a dispatch whose asserted length exceeds its buffer by one element
+/// with the shared `DispatchError::ArgExceedsBuffer`, before this device is handed the dispatch.
+///
+/// Mutation: remove the `check_arg_lengths` call in `Engine::walk` (`crates/poot-executor/src/engine.rs`);
+/// the device records the dispatch and the step no longer fails, so this row goes red.
+#[test]
+fn an_over_length_dispatch_is_refused_by_the_engine_on_vulkan() {
+    let Some(device) = vulkan() else {
+        return;
+    };
+    poot_executor_parity::dispatch_length::over_length_dispatch_is_refused(device);
+}

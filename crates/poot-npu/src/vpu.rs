@@ -614,6 +614,10 @@ impl Device for VpuDevice {
         })))
     }
 
+    fn buffer_elems(&self, buffer: &VpuBuffer) -> usize {
+        buffer.bytes() / buffer.0.storage.element().byte_width()
+    }
+
     fn load_kernel(&mut self, key: &str, kernel: CompiledKernel) -> Result<VpuKernel, VpuError> {
         self.healthy()?;
         let KernelCode::Vpu(artifact) = kernel.code() else {
@@ -711,7 +715,10 @@ impl Device for VpuDevice {
                 // An input an earlier command of this recording writes holds nothing the host can check
                 // before the replay; its writer's result check covers it.
                 if matches!(direction, Direction::Input)
-                    && self.open_written.iter().any(|w| Rc::ptr_eq(&w.0, &arg.buffer.0))
+                    && self
+                        .open_written
+                        .iter()
+                        .any(|w| Rc::ptr_eq(&w.0, &arg.buffer.0))
                 {
                     continue;
                 }

@@ -1727,21 +1727,20 @@ fn cpu_gumbel_family_pick(
     }
     if let Some(top_p) = top_p {
         let floor1 = floor;
-        let quantized_mass = |threshold: f32| -> f32 {
-            let mut m = 0.0f32;
-            for &v in logits {
-                if v >= threshold {
-                    let e = ((v - max_logit) * inv_temp).exp();
-                    m += (e * 16.0f32).round();
-                }
-            }
-            m
+        // The oracle's own mass and threshold rule (`poot-eval`): exact integers summed in a `u64`, so
+        // the kernel's two-limb sum is compared against the same definition, not a copy of it.
+        let quantized_mass = |threshold: f32| -> u64 {
+            logits
+                .iter()
+                .filter(|&&v| v >= threshold)
+                .map(|&v| u64::from(poot_eval::top_p_token_mass(v, max_logit, inv_temp)))
+                .sum()
         };
         if top_p <= 0.0 {
             floor = max_logit;
         } else if top_p < 1.0 {
             let z_trunc = quantized_mass(floor1);
-            let tp_thresh = (top_p * z_trunc).round();
+            let tp_thresh = poot_eval::top_p_threshold(z_trunc, top_p);
             let mut tlo = floor1;
             let mut thi = max_logit;
             for _ in 0..30 {
@@ -2019,10 +2018,10 @@ fn imported_sample_topp_gumbel_argmax_batched_matches_cpu_oracle() {
     // (`sample_topp_gumbel_argmax_batched.rs`), `SampleRule::GumbelTopKTopP`. No scratch buffer and no
     // atomics (unlike the Card 148 original): the bisection is entirely workgroup-local LDS reduction, so
     // this kernel has 6 params, same as the top-k kernel, with `params` carrying a 4th `top_p` column
-    // instead of a separate scratch buffer. The quantization scale is 16 (not the old 16384), the largest
-    // power of two keeping the row's total quantized mass exact in f32 for realistic vocab sizes (see
-    // `sample_topp_gumbel_argmax_batched.rs`); [`cpu_gumbel_family_pick`] uses the identical scale, so
-    // this is still an exact-integer-mass comparison, not an approximation.
+    // instead of a separate scratch buffer. The mass is the two-limb exact integer sum described in
+    // `sample_topp_gumbel_argmax_batched.rs`; [`cpu_gumbel_family_pick`] sums the same
+    // `poot_eval::top_p_token_mass` integers in a `u64`, so this is an exact-integer-mass comparison,
+    // not an approximation.
     let kernel = manifest_path("kernels/sampling/sample_topp_gumbel_argmax_batched.rs");
     let (compiled_kernel, params, _needs_error_word) =
         pootc_compile(kernel, "sample_topp_gumbel_argmax_batched");

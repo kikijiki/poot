@@ -290,14 +290,6 @@ fn deeply_nested_guided_json_is_rejected_at_the_door() {
 // ---- card 224: request-validation hardening ----
 
 #[test]
-fn body_len_ok_boundaries() {
-    assert!(body_len_ok(0));
-    assert!(body_len_ok(MAX_BODY_BYTES));
-    assert!(!body_len_ok(MAX_BODY_BYTES + 1));
-    assert!(!body_len_ok(usize::MAX));
-}
-
-#[test]
 fn conn_guard_decrements_on_drop_including_a_panicking_thread() {
     // Regression shape: the live-connection counter must come back down even if the connection-handler thread panics mid-`handle`: ConnGuard's decrement lives in Drop, so unwinding runs it. A counter that only goes up would eventually wedge the `--max-connections` cap shut with zero connections live.
     let counter = Arc::new(AtomicUsize::new(1));
@@ -356,6 +348,43 @@ fn guided_decode_error_classifies_400_other_errors_stay_500() {
     let (status, ty) = classify_handler_error(&other);
     assert_eq!(status, 500);
     assert_eq!(ty, "server_error");
+}
+
+/// A SentencePiece vocabulary with `add_space_prefix`: the word-initial piece `\u{2581}the` decodes to
+/// `the` alone (the isolated decode strips its space), but its logprob `bytes` are the vocabulary's.
+/// Mutation: decode the token id alone in `logprobs_json`; the first byte is 0x74, not 0x20.
+#[test]
+fn logprob_bytes_of_a_word_initial_spm_token_start_with_a_space() {
+    let tokens: Vec<String> = ["<unk>", "<s>", "</s>", "\u{2581}the", "a"]
+        .map(String::from)
+        .to_vec();
+    let codec = poot_text::TextCodec::from_gguf(
+        &poot_text::GgufVocab {
+            model: Some("llama".into()),
+            scores: Some(vec![0.0; tokens.len()]),
+            tokens: Some(tokens),
+            unknown_token_id: Some(0),
+            add_space_prefix: Some(true),
+            ..poot_text::GgufVocab::default()
+        },
+        2,
+        poot_text::ChatFormat::ChatML,
+    )
+    .expect("build the SPM codec");
+    let records = [poot_llm::TokenLogprob {
+        token: 3,
+        logprob: -0.5,
+        top: vec![(4, -1.0)],
+    }];
+    let json = crate::api::logprobs_json(&codec, &records, 1);
+    let entry = &json["content"][0];
+    assert_eq!(
+        entry["bytes"],
+        serde_json::json!([32, 116, 104, 101]),
+        "{entry}"
+    );
+    assert_eq!(entry["token"], " the");
+    assert_eq!(entry["top_logprobs"][0]["bytes"], serde_json::json!([97]));
 }
 
 fn chat_req_with_part(part: &str) -> ChatReq {

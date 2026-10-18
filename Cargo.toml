@@ -165,6 +165,8 @@ ash = "0.38"
 wgpu-hal = { version = "29.0.3", features = ["vulkan"] }
 # Guided decoding: byte-level DFA for regex-constrained generation (same 0.4 line as tokenizers/regex).
 regex-automata = "0.4"
+# poot-text: one-pass scan for the special tokens of a vocabulary.
+aho-corasick = "1"
 # poot-orchestrator: blocking HTTP with rustls (no system OpenSSL) for the RunPod REST API, the bundled
 # SQLite run-state store, its config format, the Ctrl-C handler and the read-only dashboard server.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
