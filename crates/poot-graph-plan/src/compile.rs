@@ -1804,6 +1804,59 @@ mod tests {
         );
     }
 
+    /// POOT-1182: a BF16 embed table over the buffer limit is hosted, and the rows the host gathers are
+    /// weight bytes in the lane the plan chose, exactly as the table's own const would be. On wgpu that
+    /// lane is the packed `u32` one (SPIR-V has no scalar BF16), so the widening `Cast` plans the
+    /// packed body; planning it as the native two-byte cast failed at codegen on the real Qwen3.8-27B-FP8
+    /// checkpoint (`bf16 compute is NVPTX-only`). Mutation: drop `Slot::TokenEmbed` from
+    /// `Storage::holds_weight_bytes`; the slot's storage is `Dense(BF16)` and the cast the native one.
+    #[test]
+    fn compile_reads_hosted_bf16_embed_rows_through_the_packed_lane() {
+        let b = Builder::for_tests();
+        let token = b
+            .slot(Slot::Token, TensorType::new(vec![1, 4], DType::I32))
+            .unwrap();
+        let embed = b
+            .constant(
+                "model.embed_tokens.weight",
+                TensorType::new(vec![40_960, 64], DType::BF16),
+            )
+            .unwrap();
+        let rows = b.gather(embed, 0, token).unwrap();
+        let out = b.cast(rows, DType::F32).unwrap();
+        let g = b.finish(out).unwrap();
+
+        // The gather is folded to a `DenseRowGather` when the table fits, so only a target whose limit is
+        // under the 5 MiB table hosts it.
+        let target = wgpu_with_limit(1 << 20);
+        let program = compile(&g, &target, &REPLAY).expect("a hosted BF16 embed compiles");
+        let &hosted = program
+            .graph()
+            .inputs()
+            .iter()
+            .find(|&&id| program.graph().meta(id).storage == Storage::Slot(Slot::TokenEmbed))
+            .expect("the oversized table is hosted");
+        assert_eq!(
+            program.storage().storage(hosted).buffer_storage(),
+            poot_target::BufferStorage::bf16_packed()
+        );
+        let (cast, _) = program
+            .planned()
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::Cast { .. }))
+            .expect("the widening cast survives compile");
+        assert!(
+            matches!(
+                program.kernel_choice(cast),
+                KernelChoice::Imported {
+                    kernel: crate::ImportedKernel::PackedBf16ToF32,
+                    ..
+                }
+            ),
+            "{:?}",
+            program.kernel_choice(cast)
+        );
+    }
+
     /// A target whose buffer limit holds the whole table compiles to a program that still binds the
     /// dense `Gather` - `legalize` is a no-op and is not recorded (matches SC-002's other outcome: a
     /// target under the limit never needs the rewrite).

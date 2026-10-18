@@ -131,7 +131,7 @@ fn mb1_mapped_gguf_equals_a_positional_read() {
     std::fs::write(&*path, &bytes).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
     let reader = File::open(&*path).unwrap();
     for (key, offset, len) in gguf_extents(&index, &bytes, &store) {
         let mut expected = vec![0u8; len];
@@ -182,7 +182,7 @@ fn mb2_entries_are_views_of_one_region() {
     std::fs::write(&*path, &bytes).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
     let extents = gguf_extents(&index, &bytes, &store);
     let (first_key, first_offset, _) = extents[0];
     let first_ptr = entry_bytes(&store, first_key).as_ptr() as isize;
@@ -203,7 +203,8 @@ fn is_mapped(path: &Path) -> bool {
         .contains(path.to_str().unwrap())
 }
 
-/// MB-3: the mapping outlives the store while a clone of an entry lives, and is gone after the last drop.
+/// MB-3: the mapping outlives the store while a clone of an entry lives (the index holds one too, until
+/// it drops), and is gone after the last drop.
 #[test]
 fn mb3_the_last_owner_unmaps() {
     let path = poot_test_util::unique_temp_path("mb3.gguf");
@@ -212,12 +213,13 @@ fn mb3_the_last_owner_unmaps() {
     let file = map_path(&path);
     assert!(is_mapped(&path));
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
     let Some(WeightEntry::Dense(norm)) = store.get("norm.weight") else {
         panic!("norm.weight is dense")
     };
     let held = norm.bytes().clone();
     drop(file);
+    drop(index);
     drop(store);
     assert!(
         is_mapped(&path),
@@ -272,7 +274,7 @@ fn mb4_unmappable_sources_are_typed() {
     let from_memory = StoredBytes::from(bytes);
     let load = |source: &StoredBytes| {
         let index = GgufIndex::parse(source).unwrap();
-        read_gguf(&index, source, &IdentityNames, default_workers()).unwrap()
+        read_gguf(&index, &IdentityNames, default_workers()).unwrap()
     };
     assert_eq!(load(&from_file), load(&from_memory));
 }
@@ -295,7 +297,7 @@ fn mb5_a_truncated_file_is_refused_typed() {
     std::fs::write(&*path, fixture_gguf()).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
     assert!(store.check_sources().is_ok());
 
     File::options()
@@ -307,7 +309,7 @@ fn mb5_a_truncated_file_is_refused_typed() {
 
     // Boundary 1, end of load: the reader's own check, reached with no tensor read.
     assert!(matches!(
-        read_gguf(&index, &file, &KeepNothing, default_workers()),
+        read_gguf(&index, &KeepNothing, default_workers()),
         Err(LoadError::SourceChanged(_))
     ));
     // Boundary 2's check, on the store loaded before the truncation.
@@ -325,7 +327,7 @@ fn mb6_rename_replacement_is_safe() {
     std::fs::write(&*path, &original).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
     let before: Vec<Vec<u8>> = GGUF_KEYS
         .iter()
         .map(|k| entry_bytes(&store, k).to_vec())
@@ -357,7 +359,7 @@ fn mb7_validation_runs_over_mapped_bytes() {
     std::fs::write(&*path, bytes).unwrap();
     let file = map_path(&path);
     let index = GgufIndex::parse(&file).unwrap();
-    let error = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap_err();
+    let error = read_gguf(&index, &IdentityNames, default_workers()).unwrap_err();
     match error {
         LoadError::GgufPackedWeight(PackedWeightError::NonFiniteField {
             role, element, ..

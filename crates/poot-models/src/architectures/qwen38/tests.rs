@@ -161,7 +161,7 @@ mod reference {
                 ple: params
                     .ple
                     .iter()
-                    .map(|p| p.as_ref().map(|p| *p.spec()))
+                    .map(|p| p.as_ref().map(|p| p.spec().clone()))
                     .collect(),
             }
         }
@@ -722,6 +722,8 @@ mod reference {
 }
 
 use reference::Reference;
+
+mod gguf;
 
 /// A fixture, the prompt run through it and the cache it is traced at.
 struct Case {

@@ -36,6 +36,21 @@ impl<'a> Emitter<'a> {
             Rvalue::Fp8Encode { format, operand } => {
                 self.emit_fp8_encode(*format, operand, dest_ty, w)
             }
+            Rvalue::ConstantTableRead { idx, table } => {
+                let (i, _) = self.operand(idx, w)?;
+                let space = self.constant_table_addrspace()?;
+                let n = self.body.constant_tables[*table as usize].words.len();
+                let us = self.usize_llty();
+                let name = self.body.name.clone();
+                let p = self.fresh();
+                let _ = writeln!(
+                    w,
+                    "  {p} = getelementptr inbounds [{n} x i32], ptr addrspace({space}) @{name}_ct{table}, {us} 0, {us} {i}"
+                );
+                let t = self.fresh();
+                let _ = writeln!(w, "  {t} = load i32, ptr addrspace({space}) {p}, align 4");
+                Ok((t, "i32".to_string()))
+            }
             Rvalue::WorkgroupLocalRead { idx, array } => {
                 let (i, _) = self.operand(idx, w)?;
                 let decl = &self.body.workgroup_locals[*array as usize];

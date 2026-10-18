@@ -10,8 +10,8 @@ poot traces model forwards into a primitive graph and runs them on its own kerne
 families by architecture shape. It does not duplicate the full backend tables; use the [feature
 matrix](../reference/feature-matrix.md) for what compiles on wgpu, ROCm and PTX.
 
-Checkpoint formats: **safetensors** (including GPTQ, AWQ, and FP8 layouts) and **GGUF** (single file with
-embedded config and tokenizer). Both work from the library (`poot-llm`). A dense decoder loads as a
+Checkpoint formats: **safetensors** (including GPTQ, AWQ, and FP8 layouts) and **GGUF** (one file, or a split set
+named by any of its `-0000N-of-0000M.gguf` shards, with embedded config and tokenizer). Both work from the library (`poot-llm`). A dense decoder loads as a
 `driver::ModelHandle` and generates through the driver, and so do the mixture-of-experts families Qwen3-MoE,
 Granite MoE, Mixtral, OLMoE, gpt-oss, MiniMax-M2 and Gemma 4, the MLA families (DeepSeek-V2/V3/V3.2) and the hybrids Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next and Qwen3.5 (the Qwen3.8-27B-FP8 text tower). The
 checkpoint's config decides which: the families that load through the driver are the ones the model registry knows.
@@ -58,15 +58,20 @@ continues exactly. Qwen3-Next (hybrid) carries each gated delta rule (GDN) layer
 
 ## Qwen3.8-Flash-Next
 
-An HF `qwen4_exp` checkpoint, read from its `text_config`. Most layers are gated delta rule (GDN) linear attention; the
+An HF `qwen4_exp` checkpoint, read from its `text_config`, or a GGUF `qwen4exp` (the unsloth quants), read from its
+metadata. Most layers are gated delta rule (GDN) linear attention; the
 rest are gated attention that reads only the blocks of cached positions a small indexer selects (Qwen Sparse
 Attention). The residual is several parallel streams gated by Hyper-Connections, the layers the config names
 start with a per-layer n-gram embedding, and every layer ends in routed experts with a gated shared expert.
 It loads with `ModelHandle::load` and generates with `Driver`. Its layer, expert, head and stream counts come
 from the checkpoint's config, so a fine-tune with other counts loads the same way. A prompt is prefilled in whole
 blocks of `indexer_compress_ratio` tokens and its tail runs as decode steps. Routed experts are read as the
-checkpoint stores them: dense stacks, or packed E4M3 tensors per expert. The vision tower is not loaded. A token
-outside the vocabulary stops the step with a validation error naming the n-gram embedding's layer. The official
+checkpoint stores them: dense stacks, packed E4M3 tensors per expert, or a GGUF's stacked K-quant, IQ4, IQ2_XS,
+IQ3_XXS and IQ3_S tensors kept packed, one owner per expert (UD-Q2_K_XL stores the expert gate and up stacks as
+IQ2_XS and IQ3_XXS). A GGUF stores the n-gram hash constants as metadata and the table as one tensor, and poot reads
+both as stored. A tensor of a type poot has no format for (for example IQ2_XXS or IQ2_S) is refused by tensor name and
+type. The vision tower is not loaded. A token outside the vocabulary stops the step with a validation error naming the
+n-gram embedding's layer. The official
 checkpoint stores the n-gram table as 128 E4M3 row-range shards under one scale; each shard stays a resident weight
 and a lookup reads the shard that owns the row, with exact integer ids. The shard layout is checked on small fixtures on
 the CPU oracle and the wgpu, ROCm and PTX executors. The E4M3 shard lookup is gathered bit-exactly against the

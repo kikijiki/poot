@@ -174,7 +174,7 @@ impl PlanarPlan {
                     },
                 )
             }
-            ValueMap::Codebook(_) => {
+            ValueMap::Codebook(_) | ValueMap::SignedGrid(_) => {
                 unreachable!("format tests: a planar format's value map is Integer or Float")
             }
         };

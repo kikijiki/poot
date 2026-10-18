@@ -503,11 +503,15 @@ pub enum Storage {
 
 impl Storage {
     /// Whether the buffer holds a weight's stored bytes in the lane its readers' storage plan chose: a
-    /// `Const` uploaded once, or the resident [`Slot::ExpertPool`] a host refills row by row from the
-    /// same stored bytes. Lane decisions made for a weight (a packed BF16 table, a packed contraction
-    /// source) apply to both.
+    /// `Const` uploaded once, the resident [`Slot::ExpertPool`] a host refills row by row from the
+    /// same stored bytes, or the [`Slot::TokenEmbed`] rows a host gathers from an embedding table too
+    /// large for one device buffer and encodes in the storage the plan chose. Lane decisions made for a
+    /// weight (a packed BF16 table, a packed contraction source) apply to all three.
     pub fn holds_weight_bytes(self) -> bool {
-        matches!(self, Storage::Const | Storage::Slot(Slot::ExpertPool))
+        matches!(
+            self,
+            Storage::Const | Storage::Slot(Slot::ExpertPool | Slot::TokenEmbed)
+        )
     }
 }
 

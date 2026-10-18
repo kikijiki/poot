@@ -33,7 +33,7 @@ fn blocks(format: WeightFormat, out: usize, k: usize, fill: u8) -> Vec<u8> {
 fn load(bytes: Vec<u8>, workers: NonZeroUsize) -> Result<WeightStore, LoadError> {
     let file = StoredBytes::from(bytes);
     let index = GgufIndex::parse(&file).unwrap();
-    read_gguf(&index, &file, &IdentityNames, workers)
+    read_gguf(&index, &IdentityNames, workers)
 }
 
 fn stored(store: &WeightStore, key: &str) -> Vec<u8> {

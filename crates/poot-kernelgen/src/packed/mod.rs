@@ -126,7 +126,9 @@ mod float_decode_tests {
 /// implementation so every op's test compares against the identical oracle input shape.
 #[cfg(test)]
 mod fixtures {
-    use poot_quant::format::{FieldEncoding, FloatFormat, OperandRole, Storage, WeightFormat};
+    use poot_quant::format::{
+        BlockLayout, FieldEncoding, FloatFormat, OperandRole, Storage, ValueMap, WeightFormat,
+    };
 
     use crate::contraction::{Schedule, TileSize};
 
@@ -185,16 +187,27 @@ mod fixtures {
         WeightFormat::Mxfp4,
     ];
 
-    /// The six K-quant super-block formats (card 542b): packed 6-bit `SubScale`/`SubMin` sub-factors
-    /// (Q2_K, Q4_K, Q5_K two-piece each; Q3_K, IQ4_XS `SubScale` two-piece; Q6_K `SubScale` one
-    /// piece), 256-value super-blocks (`blocks::QK_K`).
-    pub(super) const KQUANT: [WeightFormat; 6] = [
+    /// The 256-value super-block formats (`blocks::QK_K`): the six K-quants and `IQ4_XS` of card 542b
+    /// (packed 6-bit `SubScale`/`SubMin` sub-factors: Q2_K, Q4_K, Q5_K two-piece each; Q3_K, IQ4_XS
+    /// `SubScale` two-piece; Q6_K `SubScale` one piece) and the three lattice quants `IQ2_XS`/`IQ3_XXS`/`IQ3_S`,
+    /// whose decode reads a constant table and a `Signs` field.
+    pub(super) const KQUANT: [WeightFormat; 9] = [
         WeightFormat::Q2_K,
         WeightFormat::Q3_K,
         WeightFormat::Q4_K,
         WeightFormat::Q5_K,
         WeightFormat::Q6_K,
         WeightFormat::Iq4_Xs,
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
+    ];
+
+    /// The lattice quants, which decode through a constant grid table and a `Signs` field.
+    pub(super) const LATTICE: [WeightFormat; 3] = [
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
     ];
 
     /// xorshift64 bytes, exactly `plan.rs`'s own fixture generator (card 539a): deterministic and
@@ -279,6 +292,116 @@ mod fixtures {
         poot_quant::plan::decode_blocks(format, &bytes, &mut expected)
             .unwrap_or_else(|error| panic!("{format:?}: fixture must decode: {error}"));
         (k, bytes, expected)
+    }
+
+    /// Write `value` into `role`'s field of `block` as read for in-block element `index`: the field's
+    /// pieces take the value's bits low first (`format::Field`).
+    fn write_field(
+        layout: BlockLayout,
+        block: &mut [u8],
+        role: OperandRole,
+        index: usize,
+        mut value: u32,
+    ) {
+        let field = layout.field(role).expect("the format has this field");
+        for piece in field.field.pieces {
+            let start = piece.layout.bit(index as u32) as usize;
+            for bit in 0..piece.width as usize {
+                let (byte, shift) = ((start + bit) / 8, (start + bit) % 8);
+                block[byte] =
+                    (block[byte] & !(1 << shift)) | ((((value >> bit) & 1) as u8) << shift);
+            }
+            value >>= piece.width;
+        }
+    }
+
+    /// Blocks of a lattice format in which every grid point occurs, every one of the 128 stored sign
+    /// patterns occurs and every scale nibble occurs, so a wrong grid word, sign bit or scale in a decode
+    /// changes some element: `(rows, K, bytes, decoded)`, one block per row, `decoded` from the CPU oracle
+    /// (`decode_blocks`). Grid point `p` sits at consecutive in-block groups across rows, the sign
+    /// pattern of eight-value group `g` is `g % 128`, and the scale nibble of each scale run is its index
+    /// modulo 16 (16-value runs for `IQ2_XS`, 32-value runs for `IQ3_XXS`). `d` is 1.0.
+    pub(super) fn every_grid_point(format: WeightFormat) -> (usize, usize, Vec<u8>, Vec<f32>) {
+        let descriptor = format.descriptor();
+        let (Storage::Blocks(layout), ValueMap::SignedGrid(grid)) =
+            (descriptor.storage, descriptor.value)
+        else {
+            panic!("{format:?} is not a lattice format");
+        };
+        let rows = grid.points() * grid.lanes / layout.values;
+        let scale_run = if grid.lanes == 8 { 16 } else { 32 };
+        let mut bytes = vec![0u8; rows * layout.bytes];
+        for (row, block) in bytes.chunks_mut(layout.bytes).enumerate() {
+            write_field(layout, block, OperandRole::Scale, 0, 0x3c00);
+            for index in 0..layout.values {
+                let element = row * layout.values + index;
+                let fields = [
+                    (OperandRole::Codes, element / grid.lanes),
+                    (OperandRole::Signs, element / 8 % 128),
+                    (OperandRole::SubScale, element / scale_run % 16),
+                ];
+                for (role, value) in fields {
+                    write_field(layout, block, role, index, value as u32);
+                }
+            }
+        }
+        let mut decoded = vec![0.0f32; rows * layout.values];
+        poot_quant::plan::decode_blocks(format, &bytes, &mut decoded)
+            .unwrap_or_else(|error| panic!("{format:?}: the grid fixture must decode: {error}"));
+        (rows, layout.values, bytes, decoded)
+    }
+
+    /// One `RowGather` case: weight bytes, the oracle's decode of them, and the rows to gather.
+    pub(super) struct GatherCase {
+        pub(super) format: WeightFormat,
+        pub(super) label: &'static str,
+        pub(super) k: usize,
+        pub(super) bytes: Vec<u8>,
+        pub(super) ids: Vec<u32>,
+        /// The oracle's rows `ids` select, concatenated.
+        pub(super) expected: Vec<f32>,
+    }
+
+    /// Every [`KQUANT`] format over random blocks (rows `[3, 0, 4, 3]` of five), and every [`LATTICE`]
+    /// format over [`every_grid_point`] blocks (all rows, reversed).
+    pub(super) fn kquant_gather_cases() -> Vec<GatherCase> {
+        let select = |decoded: &[f32], k: usize, ids: &[u32]| -> Vec<f32> {
+            ids.iter()
+                .flat_map(|&id| {
+                    decoded[id as usize * k..(id as usize + 1) * k]
+                        .iter()
+                        .copied()
+                })
+                .collect()
+        };
+        let mut cases = Vec::new();
+        for (seed, format) in KQUANT.into_iter().enumerate() {
+            let (k, bytes, decoded) = fixture(format, 5, 2, seed as u64);
+            let ids = vec![3, 0, 4, 3];
+            let expected = select(&decoded, k, &ids);
+            cases.push(GatherCase {
+                format,
+                label: "random blocks",
+                k,
+                bytes,
+                ids,
+                expected,
+            });
+        }
+        for format in LATTICE {
+            let (rows, k, bytes, decoded) = every_grid_point(format);
+            let ids: Vec<u32> = (0..rows as u32).rev().collect();
+            let expected = select(&decoded, k, &ids);
+            cases.push(GatherCase {
+                format,
+                label: "every grid point",
+                k,
+                bytes,
+                ids,
+                expected,
+            });
+        }
+        cases
     }
 
     /// `activation[rows,K] @ decode(weight)^T` in plain f32, `weight` decoded to `[out_rows,K]` by
@@ -573,28 +696,23 @@ mod row_gather_tests {
     use poot_kernel_ir::interp::{Buffer, run};
     use poot_kernel_ir::test_support::workgroups_covering;
 
-    use super::fixtures::{BLOCK32, KQUANT, fixture, pack_words};
+    use super::fixtures::{BLOCK32, GatherCase, KQUANT, fixture, kquant_gather_cases, pack_words};
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_kernel};
 
     /// The K-quant sibling of `row_gather_matches_decode_blocks_rows_for_every_block32_format`
     /// (card 542b): exercises `DecodePlan`'s `SubScale`/`SubMin` path through `RowGather` too.
     #[test]
     fn row_gather_matches_decode_blocks_rows_for_every_kquant_format() {
-        let out_rows = 5;
-        let blocks_per_row = 2;
-        let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
-        for (seed, format) in KQUANT.into_iter().enumerate() {
-            let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
-            let expected: Vec<f32> = ids
-                .iter()
-                .flat_map(|&id| {
-                    decoded[id as usize * k..(id as usize + 1) * k]
-                        .iter()
-                        .copied()
-                })
-                .collect();
-
+        for GatherCase {
+            format,
+            label,
+            k,
+            bytes,
+            ids,
+            expected,
+        } in kquant_gather_cases()
+        {
+            let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
             let spec = PackedKernelSpec {
                 format,
                 op: PackedKernelOp::RowGather,
@@ -621,7 +739,7 @@ mod row_gather_tests {
             let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
             assert_eq!(
                 got_bits, want_bits,
-                "{format:?}: RowGather vs decode_blocks rows"
+                "{format:?} ({label}): RowGather vs decode_blocks rows"
             );
         }
     }
@@ -673,21 +791,16 @@ mod row_gather_tests {
             }
         };
 
-        let out_rows = 5;
-        let blocks_per_row = 2;
-        let ids: [u32; 4] = [3, 0, 4, 3];
-        let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
-        for (seed, format) in KQUANT.into_iter().enumerate() {
-            let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
-            let expected: Vec<f32> = ids
-                .iter()
-                .flat_map(|&id| {
-                    decoded[id as usize * k..(id as usize + 1) * k]
-                        .iter()
-                        .copied()
-                })
-                .collect();
-
+        for GatherCase {
+            format,
+            label,
+            k,
+            bytes,
+            ids,
+            expected,
+        } in kquant_gather_cases()
+        {
+            let ids_i32: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
             let spec = PackedKernelSpec {
                 format,
                 op: PackedKernelOp::RowGather,
@@ -726,7 +839,7 @@ mod row_gather_tests {
             let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
             assert_eq!(
                 got_bits, want_bits,
-                "{format:?}: RowGather (wgpu) vs decode_blocks rows"
+                "{format:?} ({label}): RowGather (wgpu) vs decode_blocks rows"
             );
         }
     }
@@ -1789,8 +1902,8 @@ mod rocm_tests {
     use poot_target::ElementKind;
 
     use super::fixtures::{
-        BLOCK32, GEMV_SCHEDULES, KQUANT, assert_close, contraction_fixture, fixture, pack_words,
-        schedule_tag,
+        BLOCK32, GEMV_SCHEDULES, GatherCase, KQUANT, assert_close, contraction_fixture, fixture,
+        kquant_gather_cases, pack_words, schedule_tag,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
     use crate::contraction::{Schedule, TileSize};
@@ -2058,19 +2171,15 @@ mod rocm_tests {
         let Some(ctx) = open_or_skip("row_gather_matches_decode_blocks_rows_on_rocm_kquant") else {
             return;
         };
-        let out_rows = 5;
-        let blocks_per_row = 2;
-        let ids: [u32; 4] = [3, 0, 4, 3];
-        for (seed, format) in KQUANT.into_iter().enumerate() {
-            let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
-            let expected: Vec<f32> = ids
-                .iter()
-                .flat_map(|&id| {
-                    decoded[id as usize * k..(id as usize + 1) * k]
-                        .iter()
-                        .copied()
-                })
-                .collect();
+        for GatherCase {
+            format,
+            label,
+            k,
+            bytes,
+            ids,
+            expected,
+        } in kquant_gather_cases()
+        {
             let spec = PackedKernelSpec {
                 format,
                 op: PackedKernelOp::RowGather,
@@ -2097,7 +2206,7 @@ mod rocm_tests {
             let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
             assert_eq!(
                 got_bits, want_bits,
-                "{format:?}: RowGather (ROCm) vs decode_blocks rows"
+                "{format:?} ({label}): RowGather (ROCm) vs decode_blocks rows"
             );
         }
     }
@@ -2267,8 +2376,8 @@ mod ptx_tests {
     use poot_ptx_runtime::{PtxBuffer, PtxContext};
 
     use super::fixtures::{
-        BLOCK32, GEMV_SCHEDULES, KQUANT, assert_close, contraction_fixture, fixture, pack_words,
-        schedule_tag,
+        BLOCK32, GEMV_SCHEDULES, GatherCase, KQUANT, assert_close, contraction_fixture, fixture,
+        kquant_gather_cases, pack_words, schedule_tag,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
     use crate::contraction::{Schedule, TileSize};
@@ -2332,7 +2441,7 @@ mod ptx_tests {
             let words = pack_words(&bytes);
             let words_buf = upload_u32(&ctx, &words);
             let ids_buf = ctx
-                .upload_i32(&ids.map(|id| id as i32))
+                .upload_i32(&ids.iter().map(|&id| id as i32).collect::<Vec<_>>())
                 .expect("upload ids");
             let metadata_buf = upload_u32(&ctx, &[k as u32]);
             let out_buf = ctx.alloc_f32(ids.len() * k).expect("allocate out");
@@ -2438,19 +2547,15 @@ mod ptx_tests {
         let Some(ctx) = open_or_skip("row_gather_matches_decode_blocks_rows_on_ptx_kquant") else {
             return;
         };
-        let out_rows = 5;
-        let blocks_per_row = 2;
-        let ids: [u32; 4] = [3, 0, 4, 3];
-        for (seed, format) in KQUANT.into_iter().enumerate() {
-            let (k, bytes, decoded) = fixture(format, out_rows, blocks_per_row, seed as u64);
-            let expected: Vec<f32> = ids
-                .iter()
-                .flat_map(|&id| {
-                    decoded[id as usize * k..(id as usize + 1) * k]
-                        .iter()
-                        .copied()
-                })
-                .collect();
+        for GatherCase {
+            format,
+            label,
+            k,
+            bytes,
+            ids,
+            expected,
+        } in kquant_gather_cases()
+        {
             let spec = PackedKernelSpec {
                 format,
                 op: PackedKernelOp::RowGather,
@@ -2462,7 +2567,7 @@ mod ptx_tests {
             let words = pack_words(&bytes);
             let words_buf = upload_u32(&ctx, &words);
             let ids_buf = ctx
-                .upload_i32(&ids.map(|id| id as i32))
+                .upload_i32(&ids.iter().map(|&id| id as i32).collect::<Vec<_>>())
                 .expect("upload ids");
             let metadata_buf = upload_u32(&ctx, &[k as u32]);
             let out_buf = ctx.alloc_f32(ids.len() * k).expect("allocate out");
@@ -2486,7 +2591,7 @@ mod ptx_tests {
             let want_bits: Vec<u32> = expected.iter().map(|v| v.to_bits()).collect();
             assert_eq!(
                 got_bits, want_bits,
-                "{format:?}: RowGather (PTX) vs decode_blocks rows"
+                "{format:?} ({label}): RowGather (PTX) vs decode_blocks rows"
             );
         }
     }

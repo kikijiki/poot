@@ -7,16 +7,20 @@
 //! role (dquant.md's value formula). `DecodePlan` holds no layout of its own - every constant it uses
 //! comes straight from the descriptor's `Field`/`BitLayout`/`Piece` data.
 
-use poot_kernel_ir::{BinOp, Local, Rvalue, Ty};
+use poot_kernel_ir::{BinOp, ConstantTableDecl, Local, Rvalue, Ty};
 use poot_quant::format::{
-    BitLayout, BlockLayout, Field, FieldEncoding, FormatDescriptor, MinSign, OperandRole, Storage,
-    ValueMap, WeightFormat,
+    BitLayout, BlockLayout, Field, FieldEncoding, FormatDescriptor, MinSign, OperandRole, SignRule,
+    SignedGrid, Storage, ValueMap, WeightFormat,
 };
 
 use super::float_decode::emit_float_decode;
 use super::source::Source;
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, select_u32};
+
+/// The one constant table a lattice format's kernel declares: the grid's words
+/// ([`SignedGrid::word`]), read by [`DecodePlan::emit_value`] as table 0.
+const GRID_TABLE: u8 = 0;
 
 /// The `Scale`/`Min` factors of one block, hoisted once and reused by every element the block holds
 /// (`emit_value` combines them with the per-element code through the value formula).
@@ -32,6 +36,7 @@ pub(crate) struct DecodePlan {
     sub_scale: Option<Field>,
     min: Option<Field>,
     sub_min: Option<Field>,
+    signs: Option<Field>,
     value: ValueMap,
     min_sign: Option<MinSign>,
 }
@@ -49,12 +54,18 @@ impl DecodePlan {
         let Some(codes) = layout.field(OperandRole::Codes) else {
             return Err(reject(format, "no Codes field"));
         };
+        if matches!(descriptor.value, ValueMap::SignedGrid(_))
+            && layout.field(OperandRole::Signs).is_none()
+        {
+            return Err(reject(format, "a signed grid without a Signs field"));
+        }
         for field in [
             Some(codes),
             layout.field(OperandRole::Scale),
             layout.field(OperandRole::SubScale),
             layout.field(OperandRole::Min),
             layout.field(OperandRole::SubMin),
+            layout.field(OperandRole::Signs),
         ]
         .into_iter()
         .flatten()
@@ -70,9 +81,22 @@ impl DecodePlan {
             sub_scale: layout.field(OperandRole::SubScale).map(|f| f.field),
             min: layout.field(OperandRole::Min).map(|f| f.field),
             sub_min: layout.field(OperandRole::SubMin).map(|f| f.field),
+            signs: layout.field(OperandRole::Signs).map(|f| f.field),
             value: descriptor.value,
             min_sign: descriptor.min_sign,
         })
+    }
+
+    /// The constant tables the decode reads, for the kernel body to declare
+    /// ([`poot_kernel_ir::Body::constant_tables`]): the lattice of a [`ValueMap::SignedGrid`]
+    /// format, as the `u32` words a device reads it in, and nothing for any other format.
+    pub(crate) fn constant_tables(&self) -> Vec<ConstantTableDecl> {
+        match self.value {
+            ValueMap::SignedGrid(grid) => vec![ConstantTableDecl {
+                words: (0..grid.words()).map(|word| grid.word(word)).collect(),
+            }],
+            ValueMap::Integer | ValueMap::Codebook(_) | ValueMap::Float => Vec::new(),
+        }
     }
 
     /// Values per block (the block-32 formats' `32`).
@@ -235,6 +259,14 @@ impl DecodePlan {
                 emit_encoded_number(e, self.codes.encoding, self.codes.width(), coded_bits)
             }
             ValueMap::Codebook(table) => emit_codebook(e, coded_bits, table),
+            ValueMap::SignedGrid(grid) => {
+                let signs = self
+                    .signs
+                    .as_ref()
+                    .expect("DecodePlan::of: a signed grid has a Signs field");
+                let sign_bits = self.emit_field_bits(e, src, block_bit, signs, i);
+                emit_signed_grid(e, grid, coded_bits, sign_bits, i)
+            }
             ValueMap::Float => {
                 let FieldEncoding::Float(format) = self.codes.encoding else {
                     unreachable!("format tests: a Float value map has a Float-encoded Codes field")
@@ -328,7 +360,138 @@ fn emit_encoded_number(e: &mut Emit, encoding: FieldEncoding, width: u32, bits: 
             )
         }
         FieldEncoding::Float(format) => emit_float_decode(e, format, bits),
+        FieldEncoding::HalfStep { exponent } => {
+            // `(bits + 1/2) * 2^exponent`, both steps exact (`scalar::half_step_to_f32`).
+            let signed = e.let_(
+                Ty::I32,
+                Rvalue::Bitcast {
+                    to: Ty::I32,
+                    operand: copy(bits),
+                },
+            );
+            let integer = e.let_(
+                Ty::F32,
+                Rvalue::Cast {
+                    to: Ty::F32,
+                    operand: copy(signed),
+                },
+            );
+            let half = bin(
+                e,
+                Ty::F32,
+                BinOp::Add,
+                copy(integer),
+                poot_kernel_ir::Operand::Const(poot_kernel_ir::Constant::F32(0.5)),
+            );
+            bin(
+                e,
+                Ty::F32,
+                BinOp::Mul,
+                copy(half),
+                poot_kernel_ir::Operand::Const(poot_kernel_ir::Constant::F32(f32::from_bits(
+                    ((127 + exponent) as u32) << 23,
+                ))),
+            )
+        }
     }
+}
+
+/// `sign * grid[code][i % lanes]` ([`ValueMap::SignedGrid`]): the lattice point's word read from
+/// constant table [`GRID_TABLE`], the lane's byte widened to f32, and the lane's sign bit XORed
+/// into the float's sign. `sign_bits` are the seven stored sign bits of the eight-value group of
+/// `i`, completed by `grid.signs` ([`SignRule::negative`]). Exact: integer magnitudes and a
+/// sign flip.
+fn emit_signed_grid(
+    e: &mut Emit,
+    grid: &'static SignedGrid,
+    code: Local,
+    sign_bits: Local,
+    i: Local,
+) -> Local {
+    let words_per_point = grid.lanes / 4;
+    let lane = bin(e, Ty::Usize, BinOp::Rem, copy(i), cu(grid.lanes));
+    let lane_word = bin(e, Ty::Usize, BinOp::Div, copy(lane), cu(4));
+    let lane_byte = bin(e, Ty::Usize, BinOp::Rem, copy(lane), cu(4));
+    let code_index = e.let_(
+        Ty::Usize,
+        Rvalue::Cast {
+            to: Ty::Usize,
+            operand: copy(code),
+        },
+    );
+    let point_word = bin(
+        e,
+        Ty::Usize,
+        BinOp::Mul,
+        copy(code_index),
+        cu(words_per_point),
+    );
+    let word_index = bin(e, Ty::Usize, BinOp::Add, copy(point_word), copy(lane_word));
+    let word = e.let_(
+        Ty::U32,
+        Rvalue::ConstantTableRead {
+            idx: copy(word_index),
+            table: GRID_TABLE,
+        },
+    );
+    let byte_index = e.let_(
+        Ty::U32,
+        Rvalue::Cast {
+            to: Ty::U32,
+            operand: copy(lane_byte),
+        },
+    );
+    let byte_shift = bin(e, Ty::U32, BinOp::Mul, copy(byte_index), c32(8));
+    let shifted = bin(e, Ty::U32, BinOp::Shr, copy(word), copy(byte_shift));
+    let magnitude_bits = bin(e, Ty::U32, BinOp::BitAnd, copy(shifted), c32(0xff));
+    let magnitude = e.let_(
+        Ty::F32,
+        Rvalue::Cast {
+            to: Ty::F32,
+            operand: copy(magnitude_bits),
+        },
+    );
+    // The sign pattern: eight stored bits, or seven plus their parity as bit 7 (`ksigns_iq2xs`).
+    let pattern = match grid.signs {
+        SignRule::Direct => sign_bits,
+        SignRule::ParityOfSeven => {
+            // The parity of seven bits, folded: `x ^ x >> 4`, then `^ >> 2`, then `^ >> 1`, bit 0.
+            let mut folded = sign_bits;
+            for shift in [4, 2, 1] {
+                let high = bin(e, Ty::U32, BinOp::Shr, copy(folded), c32(shift));
+                folded = bin(e, Ty::U32, BinOp::BitXor, copy(folded), copy(high));
+            }
+            let parity = bin(e, Ty::U32, BinOp::BitAnd, copy(folded), c32(1));
+            let parity_bit = bin(e, Ty::U32, BinOp::Shl, copy(parity), c32(7));
+            bin(e, Ty::U32, BinOp::BitOr, copy(sign_bits), copy(parity_bit))
+        }
+    };
+    let group_lane = bin(e, Ty::Usize, BinOp::Rem, copy(i), cu(8));
+    let group_shift = e.let_(
+        Ty::U32,
+        Rvalue::Cast {
+            to: Ty::U32,
+            operand: copy(group_lane),
+        },
+    );
+    let selected = bin(e, Ty::U32, BinOp::Shr, copy(pattern), copy(group_shift));
+    let negative = bin(e, Ty::U32, BinOp::BitAnd, copy(selected), c32(1));
+    let flip = bin(e, Ty::U32, BinOp::Shl, copy(negative), c32(31));
+    let magnitude_raw = e.let_(
+        Ty::U32,
+        Rvalue::Bitcast {
+            to: Ty::U32,
+            operand: copy(magnitude),
+        },
+    );
+    let signed_raw = bin(e, Ty::U32, BinOp::BitXor, copy(magnitude_raw), copy(flip));
+    e.let_(
+        Ty::F32,
+        Rvalue::Bitcast {
+            to: Ty::F32,
+            operand: copy(signed_raw),
+        },
+    )
 }
 
 /// `table[bits & 0xf]` (a 16-entry codebook, `IQ4_NL`/`IQ4_XS`): a depth-4 binary select tree over

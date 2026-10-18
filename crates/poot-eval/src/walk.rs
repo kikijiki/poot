@@ -163,6 +163,7 @@ pub fn eval(
     bind_inputs(g, inputs, &mut env)?;
 
     let mut decompositions = Decompositions::default();
+    let releases = (!opts.keep_environment).then(|| releases_after_each_equation(g));
     for (idx, eqn) in g.eqns().iter().enumerate() {
         let value = evaluate_equation(g, eqn, &env, idx, &mut opts, &mut decompositions)?;
         let value = store_as_declared(value, g.aval(eqn.out).dtype)?;
@@ -171,6 +172,9 @@ pub fn eval(
             observer.value(idx, eqn.out, &value);
         }
         env[eqn.out] = Some(value);
+        for &dead in releases.iter().flat_map(|releases| &releases[idx]) {
+            env[dead] = None;
+        }
     }
 
     validate_environment(g, &env)?;
@@ -197,6 +201,34 @@ pub fn eval(
         state,
         environment,
     })
+}
+
+/// For each equation, the values nothing reads after it: those it read for the last time and its own result
+/// when no later equation reads that. The walk drops them from the environment, so a graph that dequantizes
+/// every weight in turn (the CPU oracle over a 27B checkpoint) holds one weight at a time, not all of them. A
+/// liveness root (the result, a witness or export, the next value of a carried state) is never released.
+pub(crate) fn releases_after_each_equation(g: &Graph) -> Vec<Vec<ValueId>> {
+    let mut last_read: HashMap<ValueId, usize> = HashMap::new();
+    for (idx, eqn) in g.eqns().iter().enumerate() {
+        for operand in &eqn.inputs {
+            if let IrOperand::Value(value) = operand {
+                last_read.insert(*value, idx);
+            }
+        }
+    }
+    let roots: std::collections::HashSet<ValueId> = g.liveness_roots().collect();
+    let mut releases = vec![Vec::new(); g.eqns().len()];
+    for (idx, eqn) in g.eqns().iter().enumerate() {
+        if !last_read.contains_key(&eqn.out) && !roots.contains(&eqn.out) {
+            releases[idx].push(eqn.out);
+        }
+    }
+    for (value, idx) in last_read {
+        if !roots.contains(&value) {
+            releases[idx].push(value);
+        }
+    }
+    releases
 }
 
 /// Tell the caller's observer, if any, what the walk is about to copy out.

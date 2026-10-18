@@ -13,7 +13,7 @@ use crate::format::{
     BlockField, Field, FieldEncoding, FloatFormat, FormatDescriptor, MinSign, OperandRole, Storage,
     ValueMap, WeightFormat,
 };
-use crate::scalar::float_to_f32;
+use crate::scalar::{float_to_f32, half_step_to_f32};
 
 /// The largest block, plus zero padding so an 8-byte window never leaves the scratch.
 const MAX_BLOCK_BYTES: usize = 256;
@@ -114,6 +114,7 @@ impl Reader {
                 (((bits << unused) as i32) >> unused) as f32
             }
             FieldEncoding::Float(format) => float_to_f32(format, bits),
+            FieldEncoding::HalfStep { exponent } => half_step_to_f32(bits, exponent),
         }
     }
 
@@ -125,7 +126,7 @@ impl Reader {
                 let unused = 32 - self.width;
                 ((bits << unused) as i32) >> unused
             }
-            FieldEncoding::Float(_) => 0,
+            FieldEncoding::Float(_) | FieldEncoding::HalfStep { .. } => 0,
         }
     }
 }
@@ -267,6 +268,8 @@ pub(crate) struct ConstPlan<const N: usize> {
     min_sign: Option<MinSign>,
     codes: Reader,
     code_pieces: [Pieces; N],
+    /// The `Signs` operand's bits at each element, for a [`ValueMap::SignedGrid`] format.
+    sign_pieces: [Pieces; N],
     /// `Scale`, `SubScale`, `Min`, `SubMin`.
     factors: [Factor<N>; 4],
 }
@@ -300,6 +303,14 @@ impl<const N: usize> ConstPlan<N> {
             code_pieces[index] = Pieces::at(&codes.field, index as u32);
             index += 1;
         }
+        let mut sign_pieces = [Pieces::EMPTY; N];
+        if let Some(signs) = layout.const_field(OperandRole::Signs) {
+            let mut index = 0;
+            while index < N {
+                sign_pieces[index] = Pieces::at(&signs.field, index as u32);
+                index += 1;
+            }
+        }
         let factors = [
             Factor::compile(layout.const_field(OperandRole::Scale)),
             Factor::compile(layout.const_field(OperandRole::SubScale)),
@@ -313,6 +324,7 @@ impl<const N: usize> ConstPlan<N> {
             min_sign: descriptor.min_sign,
             codes: Reader::of(&codes.field),
             code_pieces,
+            sign_pieces,
             factors,
         }
     }
@@ -379,6 +391,15 @@ impl<const N: usize> ConstPlan<N> {
             let decoded = match self.value {
                 ValueMap::Integer => self.codes.integer(bits) as f32,
                 ValueMap::Codebook(table) => table[(bits & 0xf) as usize],
+                ValueMap::SignedGrid(grid) => {
+                    let signs = self.sign_pieces[index].read(padded);
+                    let magnitude = f32::from(grid.magnitude(bits as usize, index % grid.lanes));
+                    if grid.signs.negative(signs, (index % 8) as u32) {
+                        -magnitude
+                    } else {
+                        magnitude
+                    }
+                }
                 ValueMap::Float => self.codes.number(bits),
             };
             let (scale, min) = self.scale_and_min(slots, index);
@@ -418,6 +439,9 @@ macro_rules! with_plan {
             WeightFormat::Q5_K => arm!(blocks::Q5_K, blocks::QK_K),
             WeightFormat::Q6_K => arm!(blocks::Q6_K, blocks::QK_K),
             WeightFormat::Iq4_Xs => arm!(blocks::IQ4_XS, blocks::QK_K),
+            WeightFormat::Iq2_Xs => arm!(blocks::IQ2_XS, blocks::QK_K),
+            WeightFormat::Iq3_Xxs => arm!(blocks::IQ3_XXS, blocks::QK_K),
+            WeightFormat::Iq3_S => arm!(blocks::IQ3_S, blocks::QK_K),
             _ => $otherwise,
         }
     }};
@@ -490,7 +514,7 @@ fn decode_dense_floats(float: FloatFormat, width: usize, bytes: &[u8], out: &mut
 mod tests {
     use super::*;
 
-    const BLOCK_FORMATS: [WeightFormat; 16] = [
+    const BLOCK_FORMATS: [WeightFormat; 19] = [
         WeightFormat::F32,
         WeightFormat::F16,
         WeightFormat::Bf16,
@@ -506,6 +530,9 @@ mod tests {
         WeightFormat::Q6_K,
         WeightFormat::Iq4_Nl,
         WeightFormat::Iq4_Xs,
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
         WeightFormat::Mxfp4,
     ];
 

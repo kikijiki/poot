@@ -62,7 +62,9 @@ const SHIPPED: &[(ConfigSource, &str, &str)] = &[
     (Gguf, "qwen35moe", "qwen3next"),
     (Hf, "qwen3_5", "qwen35"),
     (Hf, "qwen3_5_text", "qwen35"),
+    (Gguf, "qwen35", "qwen35"),
     (Hf, "qwen4_exp", "qwen4exp"),
+    (Gguf, "qwen4exp", "qwen4exp"),
     // `glm5_next_text` is the nested `text_config` type of a `glm5_next` checkpoint, never a
     // top-level `model_type`, so it is not a key.
     (Hf, "glm5_next", "glm53_flash"),

@@ -20,18 +20,19 @@ use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced};
 use poot_quant::weights::{HyperRole, WeightId, WeightMap};
 
 use crate::components::linear::{Weight, WeightError, linear};
+use crate::components::norm::NormParams;
 use crate::components::ple::grouped_norm;
 use crate::components::standard::ParamError;
 use crate::model::{ConfigReason, ParamBlock, TraceError, WiringError};
 
 /// Checked Hyper-Connections parameters: the stream width, the stream count, the gate's low rank
-/// and the norm epsilon.
+/// and the grouped norm (its epsilon, and whether the stored scale is an offset from one).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct HyperParams {
     width: usize,
     streams: usize,
     rank: usize,
-    eps: f32,
+    norm: NormParams,
 }
 
 impl HyperParams {
@@ -39,7 +40,7 @@ impl HyperParams {
         width: usize,
         streams: usize,
         rank: usize,
-        eps: f32,
+        norm: NormParams,
     ) -> Result<Self, ParamError> {
         for (field, value) in [
             ("hidden_size", width),
@@ -50,17 +51,11 @@ impl HyperParams {
                 return Err(ParamError::new(field, ConfigReason::Zero));
             }
         }
-        if !(eps.is_finite() && eps > 0.0) {
-            return Err(ParamError::new(
-                "rms_norm_eps",
-                ConfigReason::NotFinitePositive,
-            ));
-        }
         Ok(Self {
             width,
             streams,
             rank,
-            eps,
+            norm,
         })
     }
 
@@ -134,7 +129,7 @@ fn mixed(
     w: &HyperWeights,
     p: &HyperParams,
 ) -> Result<(Traced, Traced), TraceError> {
-    let normed = grouped_norm(b, x, &w.norm, p.streams, p.eps)?;
+    let normed = grouped_norm(b, x, &w.norm, p.streams, p.norm)?;
     let down = b.binary_scalar(
         BinOp::Mul,
         linear(b, normed, &w.down, None)?,

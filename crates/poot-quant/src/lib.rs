@@ -15,6 +15,7 @@ mod content;
 pub mod decode;
 mod encode;
 pub mod format;
+mod grids;
 pub mod plan;
 mod planar;
 pub mod scalar;

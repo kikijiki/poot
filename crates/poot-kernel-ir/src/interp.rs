@@ -722,6 +722,18 @@ impl Workgroup<'_> {
                 let index = self.index_operand(lane, idx)?;
                 element(&self.lds[*array as usize], "workgroup array", index).map(Value::Scalar)
             }
+            Rvalue::ConstantTableRead { idx, table } => {
+                let index = self.index_operand(lane, idx)?;
+                let words = &self.body.constant_tables[*table as usize].words;
+                words
+                    .get(index)
+                    .map(|&word| Value::Scalar(Scalar::U32(word)))
+                    .ok_or(Fault::OutOfBounds {
+                        what: "constant table",
+                        index,
+                        len: words.len(),
+                    })
+            }
             Rvalue::WorkgroupLocalAtomic {
                 idx,
                 value,
@@ -1226,7 +1238,8 @@ fn fp8_encode(format: Fp8Format, value: f32) -> u32 {
 mod tests {
     use super::*;
     use crate::{
-        BasicBlock, BlockId, LocalDecl, SwitchTargets, VerifyErrorKind, WorkgroupLocalDecl,
+        BasicBlock, BlockId, ConstantTableDecl, LocalDecl, SwitchTargets, VerifyErrorKind,
+        WorkgroupLocalDecl,
     };
 
     fn l(index: u32) -> Local {
@@ -1507,6 +1520,66 @@ mod tests {
             len: wg,
         }];
         body
+    }
+
+    /// `out[lane] = table[lane]`: each lane reads its own word of a three-word constant table.
+    fn table_body(wg: u32) -> Body {
+        // _1 out, _2 lane, _3 word
+        let mut body = body_of(
+            1,
+            vec![buffer_ty(Ty::U32), Ty::Usize, Ty::U32],
+            vec![
+                block(vec![], thread_index(2, IndexAxis::X, 1)),
+                block(
+                    vec![
+                        assign(
+                            3,
+                            Rvalue::ConstantTableRead {
+                                idx: copy(2),
+                                table: 0,
+                            },
+                        ),
+                        Statement::Assign(element_of(1, 2), Rvalue::Use(copy(3))),
+                    ],
+                    Terminator::Return,
+                ),
+            ],
+            [wg, 1, 1],
+        );
+        body.constant_tables = vec![ConstantTableDecl {
+            words: vec![0xdead_beef, 7, 0x8000_0001],
+        }];
+        body
+    }
+
+    #[test]
+    fn a_constant_table_read_returns_the_declared_word() {
+        let body = table_body(3);
+        let mut buffers = [Buffer::from_u32s(&[0; 3])];
+        run(&body, [1, 1, 1], &mut buffers).unwrap();
+        assert_eq!(u32s(&buffers[0]), vec![0xdead_beef, 7, 0x8000_0001]);
+    }
+
+    /// A dynamic index past the table is a fault, never a wrapped or zero word.
+    #[test]
+    fn a_constant_table_read_past_the_end_is_a_fault() {
+        let body = table_body(4);
+        let mut buffers = [Buffer::from_u32s(&[0; 4])];
+        let err = run(&body, [1, 1, 1], &mut buffers).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                InterpError::Fault {
+                    fault: Fault::OutOfBounds {
+                        what: "constant table",
+                        index: 3,
+                        len: 3,
+                    },
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Qwen3.8-Flash-Next (HF `qwen4_exp`) behind [`Model`]: a hybrid stack whose mixer is a Gated
+//! Qwen3.8-Flash-Next (HF `qwen4_exp`, GGUF `qwen4exp`) behind [`Model`]: a hybrid stack whose mixer is a Gated
 //! DeltaNet linear-attention layer ([`gdn`](crate::components::gdn)) on most layers and gated
 //! attention narrowed by a block indexer (QSA, [`qsa`]) on the rest, each followed by the routed
 //! mixture of experts with a sigmoid-gated shared expert ([`moe`](crate::components::moe)). The
@@ -7,7 +7,7 @@
 //! ([`ple`](crate::components::ple)).
 //!
 //! The model is its config ([`config`]: typed, checked once, nothing pinned to a shipped checkpoint),
-//! its weight-name table (also in [`config`]) and one body ([`trace`]). A step carries the QSA layers'
+//! its weight-name table per format (also in [`config`]) and one body ([`trace`]). A step carries the QSA layers'
 //! KV caches and indexer block keys, each GDN layer's conv window and state matrices, and each PLE layer's
 //! n-gram history and conv window, so a prompt prefilled in chunks continues exactly where the
 //! previous chunk stopped and one token is a decode step. A prefill is a whole number of
@@ -15,7 +15,8 @@
 //! it; a prompt that is not one runs as whole-granule prefill plus decode steps.
 //!
 //! Storage stays as stored: the routed experts are dense stacks or packed per-expert weights (E4M3
-//! in the official release), the BF16 owners are never widened per step.
+//! in the official release, K-quant and IQ4 blocks in a GGUF), the BF16 owners are never widened per
+//! step.
 
 use std::sync::Arc;
 
@@ -48,7 +49,10 @@ pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen4exp");
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
-    keys: &[(ConfigSource::HfModelType, "qwen4_exp")],
+    keys: &[
+        (ConfigSource::HfModelType, "qwen4_exp"),
+        (ConfigSource::GgufArchitecture, "qwen4exp"),
+    ],
     build,
     fixture,
     variants: &[("packed", packed_fixture), ("finetune", finetune_fixture)],
@@ -73,7 +77,7 @@ pub(crate) struct Qwen4Exp {
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
     let mut p = Qwen4ExpParams::from_raw(raw)?;
-    let (names, gate_up) = config::expert_layout(store);
+    let (names, gate_up) = config::expert_layout(p.layout, store);
     p.moe = p.moe.with_gate_up(gate_up);
     let weights = config::weights_of(&p, store, names)?;
     let body = trace::Weights::new(&weights, &p).map_err(|e: WeightError| e.for_family(FAMILY))?;

@@ -9,7 +9,7 @@ use crate::format::{
     Axis, Extent, FieldEncoding, FormatDescriptor, GroupMap, Major, MinSign, OperandRole,
     PlanarLayout, PlanarOperand, Storage, ValueMap, WeightFormat,
 };
-use crate::scalar::float_to_f32;
+use crate::scalar::{float_to_f32, half_step_to_f32};
 
 /// Typed failures of the scalar decoder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,13 +201,16 @@ impl Raw {
                 let unused = 32 - self.width;
                 i64::from(((self.bits << unused) as i32) >> unused)
             }
-            FieldEncoding::Float(_) => unreachable!("descriptor tests: integer operands are ints"),
+            FieldEncoding::Float(_) | FieldEncoding::HalfStep { .. } => {
+                unreachable!("descriptor tests: integer operands are ints")
+            }
         }
     }
 
     fn number(self) -> f32 {
         match self.encoding {
             FieldEncoding::Float(format) => float_to_f32(format, self.bits),
+            FieldEncoding::HalfStep { exponent } => half_step_to_f32(self.bits, exponent),
             FieldEncoding::Unsigned { .. } | FieldEncoding::Signed => self.integer() as f32,
         }
     }
@@ -244,8 +247,11 @@ impl Formula<'_> {
         Ok((scale, min, code))
     }
 
+    /// The value at in-block element `element`, which only a [`ValueMap::SignedGrid`] reads (its
+    /// lane and sign bit are positions in the block); planar formats have no such map and pass 0.
     fn evaluate(
         &self,
+        element: usize,
         mut operand: impl FnMut(OperandRole) -> Result<Option<Raw>, DecodeError>,
     ) -> Result<f32, DecodeError> {
         let (scale, min, code) = self.parts(&mut operand)?;
@@ -255,6 +261,18 @@ impl Formula<'_> {
                 (code.integer() - zero) as f32
             }
             ValueMap::Codebook(table) => table[code.bits as usize],
+            ValueMap::SignedGrid(grid) => {
+                let signs = operand(OperandRole::Signs)?.ok_or(DecodeError::MissingOperand {
+                    format: self.descriptor.format,
+                    role: OperandRole::Signs,
+                })?;
+                let magnitude = f32::from(grid.magnitude(code.bits as usize, element % grid.lanes));
+                if grid.signs.negative(signs.bits, (element % 8) as u32) {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            }
             ValueMap::Float => {
                 let value = code.number();
                 if value.is_nan() {
@@ -401,7 +419,7 @@ impl FormatDescriptor {
                 });
             }
         }
-        Formula { descriptor: self }.evaluate(|role| {
+        Formula { descriptor: self }.evaluate(0, |role| {
             layout
                 .operands
                 .iter()
@@ -442,7 +460,7 @@ impl FormatDescriptor {
             }
         }
         for (column, value) in out.iter_mut().enumerate().take(shape[1]) {
-            *value = Formula { descriptor: self }.evaluate(|role| {
+            *value = Formula { descriptor: self }.evaluate(0, |role| {
                 layout
                     .operands
                     .iter()
@@ -653,7 +671,7 @@ mod tests {
                     values: layout.values,
                 });
             }
-            Formula { descriptor: self }.evaluate(|role| {
+            Formula { descriptor: self }.evaluate(index, |role| {
                 Ok(layout
                     .field(role)
                     .map(|field| read_field(&field.field, block, index as u32)))

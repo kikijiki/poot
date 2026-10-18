@@ -127,6 +127,17 @@ pub const fn e8m0_to_f32(byte: u8) -> f32 {
     }
 }
 
+/// `(bits + 1/2) * 2^exponent`, the value of a [`crate::format::FieldEncoding::HalfStep`] field.
+/// `bits` is a few bits wide and `exponent` a normal f32 exponent, so both the half step and the
+/// scaling are exact.
+pub const fn half_step_to_f32(bits: u32, exponent: i32) -> f32 {
+    assert!(
+        -126 <= exponent && exponent <= 127,
+        "a normal f32 power of two"
+    );
+    (bits as f32 + 0.5) * f32::from_bits(((127 + exponent) as u32) << 23)
+}
+
 /// Decode `bits` (the low [`FloatFormat::bits`] bits) of a stored float.
 pub const fn float_to_f32(format: FloatFormat, bits: u32) -> f32 {
     match format {

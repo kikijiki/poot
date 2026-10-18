@@ -30,5 +30,6 @@ mod selected_attention;
 mod swa_gemma3;
 mod tensor_residency;
 mod validation;
+mod value_release;
 mod weight_store;
 mod widen;

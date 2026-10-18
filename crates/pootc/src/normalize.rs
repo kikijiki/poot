@@ -398,7 +398,9 @@ fn rewrite_rvalue(rv: &mut Rvalue, aliases: &HashMap<u32, Place>) {
             rewrite_operand(if_false, aliases);
         }
         Rvalue::Len(p) => rewrite_place(p, aliases),
-        Rvalue::WorkgroupLocalRead { idx, .. } => rewrite_operand(idx, aliases),
+        Rvalue::WorkgroupLocalRead { idx, .. } | Rvalue::ConstantTableRead { idx, .. } => {
+            rewrite_operand(idx, aliases)
+        }
         Rvalue::WorkgroupLocalAtomic { idx, value, .. } => {
             rewrite_operand(idx, aliases);
             rewrite_operand(value, aliases);

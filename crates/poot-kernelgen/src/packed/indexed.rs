@@ -93,6 +93,16 @@ enum Decode {
     Planar(PlanarPlan),
 }
 
+impl Decode {
+    /// The constant tables the decode reads ([`DecodePlan::constant_tables`]); a planar layout has none.
+    fn constant_tables(&self) -> Vec<poot_kernel_ir::ConstantTableDecl> {
+        match self {
+            Self::Block(plan) => plan.constant_tables(),
+            Self::Planar(_) => Vec::new(),
+        }
+    }
+}
+
 /// A stacked packed table as the segmented Tiled body reads it: each lane decodes one weight element of the
 /// step's expert, relative to that expert's slab in each source.
 struct PackedExperts {
@@ -175,7 +185,8 @@ pub(super) fn indexed_tiled(
         .map(|j| local(3 + (sources + j) as u32))
         .collect();
     let metadata = local(3 + (sources + leaf_count) as u32);
-    Ok(indexed_tiled_body(
+    let tables = decode.constant_tables();
+    let mut body = indexed_tiled_body(
         IndexedTiledBody {
             name,
             tile,
@@ -195,7 +206,9 @@ pub(super) fn indexed_tiled(
             words,
             metadata,
         },
-    ))
+    );
+    body.constant_tables = tables;
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -225,6 +238,9 @@ mod tests {
             (WeightFormat::Q8_0, 64),
             (WeightFormat::Q4_K, 256),
             (WeightFormat::Q6_K, 256),
+            (WeightFormat::Iq2_Xs, 256),
+            (WeightFormat::Iq3_Xxs, 256),
+            (WeightFormat::Iq3_S, 256),
             (WeightFormat::Mxfp4, 64),
             (
                 WeightFormat::E4m3PerChannel {

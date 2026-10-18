@@ -264,6 +264,10 @@ def run_cell(model, scen, fw, fw_cfg, runners, models_dir, suite, interval_ms, o
                 "--osl", str(scen.get("osl", 128))]
         if scen.get("synthetic", True):
             cmd.append("--synthetic")
+        # A scenario may bound one prefill forward (a device whose watchdog kills a long dispatch). Only
+        # poot's runner takes the knob: it is poot's driver option, the baselines chunk on their own.
+        if fw == "poot" and scen.get("prefill_chunk") is not None:
+            cmd += ["--prefill-chunk", str(scen["prefill_chunk"])]
         on_line = _curve_progress(fw, isls)
     obs = run_observed(cmd, interval_s=interval_ms / 1000.0, on_line=on_line)
     timing = parse_last_json_line(obs["stdout"])

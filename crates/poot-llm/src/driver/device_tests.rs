@@ -2890,22 +2890,25 @@ mod checkpoint {
         assert_eq!(tokens, split, "{}: prefill chunking", path.display());
     }
 
-    /// POOT-572 SC-007 (M5's one real-dimensions receipt): the real `Qwen/Qwen3.8-27B-FP8` checkpoint
-    /// (and, for POOT-135, the real SmolLM3-3B bf16 GGUF, whose documented answer is the same " Paris")
-    /// loads through the registry (its block-scaled FP8 projections packed as stored), generates through
-    /// the driver on one 80 GB-class GPU, and its first token's top-five log-probabilities equal the CPU
-    /// oracle's over the same traced graph and weight map (token ids exact, log-probabilities within
-    /// `1e-3`, ADR-0101 tier 2). The first token is also the documented answer to the prompt: a wrong
-    /// weight-name mapping shared by the device and the oracle (they read one name table) cannot pass
-    /// it. Prints the receipt lines a pod run records. Never runs on the dev box: the row is `#[ignore]`d
-    /// and a checkpoint of this size is a pod's.
-    fn generates_and_matches_the_oracle(path: &std::path::Path, choice: BackendChoice) -> Vec<u32> {
+    /// What the device half of a real-checkpoint receipt produced.
+    struct DeviceReceipt {
+        handle: Arc<ModelHandle>,
+        ids: Vec<u32>,
+        capacity: usize,
+        generated: crate::driver::Generation,
+    }
+
+    /// The device half of POOT-572 SC-007 (M5's one real-dimensions receipt): the checkpoint loads through
+    /// the registry, generates through the driver, and its first token is the documented answer to the
+    /// prompt, " Paris". A wrong weight-name mapping shared by the device and the oracle (they read one
+    /// name table) cannot pass it. Prints the `RECEIPT` lines a run records. `None` when the backend is
+    /// absent. The driver is dropped before returning, so a checkpoint that nearly fills the machine is
+    /// never held on the device and on the CPU at once.
+    fn generates_paris(path: &std::path::Path, choice: BackendChoice) -> Option<DeviceReceipt> {
         let handle = load(path);
         let ids = handle.text().encode(CAPITAL).unwrap();
         let capacity = 64;
-        let Some(executor) = open(choice) else {
-            return Vec::new();
-        };
+        let executor = open(choice)?;
         let mut limits = options(8, capacity);
         limits.prepared.max_retained_bytes = NonZeroU64::new(1 << 38).unwrap();
         let mut driver = Driver::new(Arc::clone(&handle), executor, limits).unwrap();
@@ -2921,16 +2924,53 @@ mod checkpoint {
                 &mut |_: u32, _: &str| GenerationControl::Continue(()),
             )
             .unwrap();
+        // The device's weights are not needed again; the oracle below reads the host store. Releasing them
+        // keeps the two residencies from adding up on a machine whose device memory is its host memory.
+        drop(driver);
         let text = handle.text().decode(&generated.tokens).unwrap();
         eprintln!("RECEIPT prompt {CAPITAL:?} ids {ids:?}");
         eprintln!("RECEIPT generated {:?} text {text:?}", generated.tokens);
-        let got = &generated.logprobs[0].top;
-        eprintln!("RECEIPT device first-token top5 {got:?}");
+        eprintln!(
+            "RECEIPT device first-token top5 {:?}",
+            generated.logprobs[0].top
+        );
         let first = handle.text().decode(&generated.tokens[..1]).unwrap();
         assert_eq!(
             first, " Paris",
             "the documented answer; the text was {text:?}"
         );
+        Some(DeviceReceipt {
+            handle,
+            ids,
+            capacity,
+            generated,
+        })
+    }
+
+    /// The process's peak resident memory, as a `RECEIPT` line.
+    fn print_peak_host_memory() {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines().filter(|l| l.starts_with("VmHWM")) {
+            eprintln!("RECEIPT peak host memory ({line})");
+        }
+    }
+
+    /// POOT-572 SC-007, the oracle half on top of [`generates_paris`]: the first token's top-five
+    /// log-probabilities equal the CPU oracle's over the same traced graph and weight map (token ids
+    /// exact, log-probabilities within `1e-3`, ADR-0101 tier 2). Runs the oracle locally, so it is for
+    /// checkpoints whose oracle fits the host; the 27B FP8 checkpoint's oracle needs more than 64 GB and
+    /// is compared against a recorded fixture instead (POOT-1184).
+    fn generates_and_matches_the_oracle(path: &std::path::Path, choice: BackendChoice) -> Vec<u32> {
+        let Some(DeviceReceipt {
+            handle,
+            ids,
+            capacity,
+            generated,
+        }) = generates_paris(path, choice)
+        else {
+            return Vec::new();
+        };
+        let got = &generated.logprobs[0].top;
         let want = oracle_top5(&handle, &ids, capacity);
         eprintln!("RECEIPT oracle first-token top5 {want:?}");
         assert_eq!(generated.tokens[0], want[0].0, "first token");
@@ -2945,10 +2985,7 @@ mod checkpoint {
                 "token {token} has log-probability {got}, the oracle gives {want}"
             );
         }
-        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        for line in status.lines().filter(|l| l.starts_with("VmHWM")) {
-            eprintln!("RECEIPT peak host memory ({line})");
-        }
+        print_peak_host_memory();
         generated.tokens
     }
 
@@ -3012,11 +3049,15 @@ mod checkpoint {
     }
 
     rows! {
+        // Device half only: the checkpoint's CPU oracle needs more than 64 GB of host RAM, so its comparison
+        // (top-five ids and log-probabilities within 1e-3) is a separate row that waits for the oracle
+        // fixture recorded on the PTX pod (POOT-1184).
         qwen35_27b_fp8_receipt: "qwen3.8-27b-fp8",
             |path, choice| {
-                generates_and_matches_the_oracle(path, choice);
+                generates_paris(path, choice);
+                print_peak_host_memory();
             },
-            "loads the real Qwen3.8-27B-FP8 checkpoint (about 28 GB) and runs the CPU oracle over it: an 80 GB-class pod only, never the dev box";
+            "loads the real Qwen3.8-27B-FP8 checkpoint (about 28 GB) onto the GPU; needs >= 40Gi available and all of the lane's real-checkpoint guards";
         smollm3_gguf_oracle: "smollm3-3b-gguf/smollm3-3b-bf16.gguf",
             smollm3_gguf_continues_like_the_safetensors_checkpoint,
             "loads the real SmolLM3-3B bf16 GGUF (6 GB, f32 on the CPU oracle) onto the GPU; needs >= 40Gi available";

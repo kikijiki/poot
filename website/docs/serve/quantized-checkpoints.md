@@ -25,11 +25,11 @@ cargo run -p poot-llm --release --example gguf_generate -- \
 ```
 
 The reader accepts F32, F16 and BF16, legacy quants `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`,
-K-quants `Q2_K` through `Q6_K`, `IQ4_NL`, `IQ4_XS`, and MXFP4. Quantized weights stay packed at
+K-quants `Q2_K` through `Q6_K`, `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, and MXFP4. Quantized weights stay packed at
 load time. Q8_0 and Q4_K_M Qwen library decode paths have real-checkpoint receipts on wgpu, ROCm
 and PTX; those receipts do not establish every family/format combination.
 
-`Q8_K` and the IQ2/IQ3 grid formats are unsupported and refused by name.
+`Q8_K` and the other grid formats (`IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_S`) are unsupported and refused by name.
 
 A mixed format such as `Q4_K_M` uses a higher bit width for some tensors. The loader preserves each
 tensor's stored format. Packed MoE experts stay packed too: the routed projection is one indexed packed

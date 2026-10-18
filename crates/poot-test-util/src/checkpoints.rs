@@ -62,6 +62,7 @@ pub const CHECKPOINTS: &[&str] = &[
     "qwen3-moe-tiny",
     "qwen3-moe-tiny-sparse",
     "qwen3-moe-tiny-sparse-gguf",
+    "Qwen3.8-27B-GGUF",
     "qwen3.8-27b-fp8",
     "smollm2-135m-gguf",
     "smollm2-360m",

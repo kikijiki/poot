@@ -98,6 +98,10 @@ pub enum LoadError {
         /// Bytes the file holds from the tensor's offset.
         have: usize,
     },
+    /// The shards given for a split GGUF checkpoint are not the set its metadata declares, or the
+    /// directory lacks tensors the metadata counts.
+    #[error("gguf split checkpoint: {0}")]
+    GgufSplit(#[from] GgufSplitError),
     /// A planned job's byte range lies outside its checkpoint file (a plan bug: each reader checks its ranges
     /// against the container before planning, so this is the pipeline's own guard).
     #[error("tensor {tensor:?}: bytes {need} needed, file holds {have}")]
@@ -146,5 +150,47 @@ pub enum LoadError {
         /// The packed payload's content-check refusal.
         #[source]
         source: poot_quant::PackedWeightError,
+    },
+}
+
+/// Why a set of GGUF shards is not the split checkpoint it claims to be.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum GgufSplitError {
+    /// No shard was given.
+    #[error("no shard given")]
+    NoShards,
+    /// The number of shards given is not the `split.count` the first shard declares.
+    #[error("{given} shards given, the first declares split.count = {declared:?}")]
+    Count {
+        /// `split.count` of the first shard, if it has one.
+        declared: Option<usize>,
+        /// How many shards were given.
+        given: usize,
+    },
+    /// A shard is not in the position its `split.no` declares.
+    #[error("shard at position {position} declares split.no = {declared:?}")]
+    Order {
+        /// The shard's position in the set given.
+        position: usize,
+        /// Its `split.no`, if it has one.
+        declared: Option<u64>,
+    },
+    /// One tensor name is listed by two shards.
+    #[error("tensor {tensor:?} is listed by shards {} and {}", shards.0, shards.1)]
+    DuplicateTensor {
+        /// The tensor name.
+        tensor: String,
+        /// The two shard positions that list it.
+        shards: (usize, usize),
+    },
+    /// The directory lists fewer tensors than `split.tensors.count` declares: shards are missing.
+    #[error(
+        "the shards list {found} tensors, the checkpoint declares split.tensors.count = {declared}"
+    )]
+    Incomplete {
+        /// `split.tensors.count`.
+        declared: usize,
+        /// Tensors the given shards list.
+        found: usize,
     },
 }

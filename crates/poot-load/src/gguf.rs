@@ -1,7 +1,7 @@
 //! GGUF container reader (spec 022): the llama.cpp/unsloth binary format. Parses the header, the typed
 //! metadata key-value pairs, and the tensor info table, and dequantizes the ggml tensor types F32, F16, BF16,
 //! the legacy blocks (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0), the K-quant super-blocks (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K), and the
-//! IQ4_NL / IQ4_XS codebook quants to f32.
+//! IQ4_NL / IQ4_XS codebook quants and the IQ2_XS / IQ3_XXS / IQ3_S lattice quants to f32.
 //!
 //! Layout (little-endian): magic `GGUF`, `version: u32`, `tensor_count: u64`, `metadata_kv_count: u64`,
 //! then the KV pairs, then the tensor infos, then padding to `general.alignment` (default 32), then the
@@ -17,13 +17,14 @@ pub use format::{GgufIndex, GgufTensorInfo, GgufValue, weight_format_of};
 use poot_tensor::DType;
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{WeightKey, WeightStore};
 use poot_quant::{PackedWeight, SourceRole, StoredBytes};
 
-use crate::LoadError;
 use crate::plan::{Container, JobKind, LoadPlan, TensorJob, build_store};
+use crate::{GgufSplitError, LoadError};
 
 /// Which GGUF tensor names a family's tracer reads, and the [`WeightKey`] to store each one under
 /// in the [`WeightStore`] [`read_gguf`] builds. The reader itself names no family (ADR-0103
@@ -82,21 +83,27 @@ fn tensor_range(
 /// [`WeightEntry::Packed`] job with a single `SourceRole::Blocks` source; a quantized rank-3 expert
 /// tensor (`[E, out, K]`) becomes `E` separate packed owners, one per expert, keyed
 /// `"{key}.{expert}"` (ADR-0109: experts stay separate owners, never stacked on the host). Every
-/// tensor is a view of exactly its own bytes of `file` (one mapping, or an in-memory buffer); nothing
+/// tensor is a view of exactly its own bytes of its shard (a mapping, or an in-memory buffer); nothing
 /// here copies a tensor, and no byte is transcoded, widened or repacked (ADR-0103 decision 1). A
 /// tensor `names` does not map is skipped entirely, including its type check; a quantized tensor of a
 /// type [`weight_format_of`] does not know is refused by name ([`LoadError::UnsupportedGgufType`]),
 /// never loaded dense (ADR-0103 decision 2). The plan runs through [`build_store`], the one pipeline.
-pub fn gguf_plan(
-    index: &GgufIndex,
-    file: &StoredBytes,
-    names: &dyn TensorNameMap,
-) -> Result<LoadPlan, LoadError> {
-    let mut plan = LoadPlan::new(Container::Gguf, vec![file.clone()]);
-    let data_start = index.data_start();
-    if data_start > file.len() {
-        return Err(gerr("tensor data start past end of file"));
+pub fn gguf_plan(index: &GgufIndex, names: &dyn TensorNameMap) -> Result<LoadPlan, LoadError> {
+    let files = index.files();
+    if let Some(declared) = index.declared_tensors()
+        && declared != index.tensors.len()
+    {
+        return Err(LoadError::GgufSplit(GgufSplitError::Incomplete {
+            declared,
+            found: index.tensors.len(),
+        }));
     }
+    for (shard, file) in files.iter().enumerate() {
+        if index.data_start(shard) > file.len() {
+            return Err(gerr("tensor data start past end of file"));
+        }
+    }
+    let mut plan = LoadPlan::new(Container::Gguf, files.clone());
     // The index is a hash map: plan in tensor-name order, so the store's insertion order (its
     // generations) and the error a bad checkpoint reports do not depend on the map's iteration order.
     let mut tensors: Vec<_> = index.tensors.iter().collect();
@@ -121,8 +128,13 @@ pub fn gguf_plan(
                 .ok_or_else(|| gerr(&format!("{name}: dense byte length overflows usize")))?;
             plan.push(TensorJob {
                 key,
-                file: 0,
-                range: tensor_range(file, data_start, info.offset, byte_len)?,
+                file: info.shard,
+                range: tensor_range(
+                    &files[info.shard],
+                    index.data_start(info.shard),
+                    info.offset,
+                    byte_len,
+                )?,
                 kind: JobKind::Dense { dtype, shape },
             });
             continue;
@@ -133,8 +145,13 @@ pub fn gguf_plan(
                 let len = weight.source_bytes(SourceRole::Blocks);
                 plan.push(TensorJob {
                     key,
-                    file: 0,
-                    range: tensor_range(file, data_start, info.offset, len)?,
+                    file: info.shard,
+                    range: tensor_range(
+                        &files[info.shard],
+                        index.data_start(info.shard),
+                        info.offset,
+                        len,
+                    )?,
                     kind: JobKind::Packed { weight },
                 });
             }
@@ -150,8 +167,13 @@ pub fn gguf_plan(
                         .ok_or_else(|| gerr(&format!("{name}: expert offset overflows")))?;
                     plan.push(TensorJob {
                         key: WeightKey::from(format!("{key}.{expert}")),
-                        file: 0,
-                        range: tensor_range(file, data_start, expert_offset, expert_len)?,
+                        file: info.shard,
+                        range: tensor_range(
+                            &files[info.shard],
+                            index.data_start(info.shard),
+                            expert_offset,
+                            expert_len,
+                        )?,
                         kind: JobKind::Packed { weight },
                     });
                 }
@@ -167,15 +189,44 @@ pub fn gguf_plan(
     Ok(plan)
 }
 
+/// The files of the checkpoint `path` names, in shard order. llama.cpp splits a checkpoint into
+/// `{stem}-{no:05}-of-{count:05}.gguf`; naming any one shard names the whole set. A file whose name
+/// is not that pattern is a checkpoint of one file.
+pub fn shard_paths(path: &Path) -> Vec<PathBuf> {
+    match path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(split_name)
+    {
+        Some((stem, count)) => (1..=count)
+            .map(|no| path.with_file_name(format!("{stem}-{no:05}-of-{count:05}.gguf")))
+            .collect(),
+        None => vec![path.to_path_buf()],
+    }
+}
+
+/// The stem and shard count of a split checkpoint's file name, when `name` is one: five-digit shard
+/// number and count, the number within `1..=count`.
+fn split_name(name: &str) -> Option<(&str, usize)> {
+    let (rest, count) = name.strip_suffix(".gguf")?.rsplit_once("-of-")?;
+    let (stem, no) = rest.rsplit_once('-')?;
+    let number = |digits: &str| {
+        (digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| digits.parse::<usize>().ok())
+            .flatten()
+    };
+    let (no, count) = (number(no)?, number(count)?);
+    (1..=count).contains(&no).then_some((stem, count))
+}
+
 /// [`gguf_plan`] then [`build_store`] on `workers` threads: every tensor validated, the file checked
 /// unchanged (ADR-0103 amendment, boundary 1), then the store published.
 pub fn read_gguf(
     index: &GgufIndex,
-    file: &StoredBytes,
     names: &dyn TensorNameMap,
     workers: NonZeroUsize,
 ) -> Result<WeightStore, LoadError> {
-    build_store(gguf_plan(index, file, names)?, workers)
+    build_store(gguf_plan(index, names)?, workers)
 }
 
 #[cfg(test)]
@@ -303,7 +354,7 @@ mod tests {
                 .ok_or_else(|| gerr(&format!("missing tensor {name}")))?;
             let shape: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
             let numel: usize = shape.iter().product();
-            let start = self.index.data_start() + info.offset as usize;
+            let start = self.index.data_start(info.shard) + info.offset as usize;
             let raw = &self.bytes[start..];
             let format = weight_format_of(info.ggml_type)
                 .ok_or_else(|| gerr(&format!("unsupported ggml type {}", info.ggml_type)))?;
@@ -899,13 +950,7 @@ mod tests {
         }
         // The one reader keeps each dense tensor's stored bytes exactly (spec 135 Phase 2, FR-006):
         // a GPU upload reads the source, not a re-encode.
-        let store = read_gguf(
-            &g,
-            &StoredBytes::from(g.bytes.to_vec()),
-            &IdentityNames,
-            default_workers(),
-        )
-        .expect("read_gguf");
+        let store = read_gguf(&g, &IdentityNames, default_workers()).expect("read_gguf");
         let stored = |name: &str| match store.get(name) {
             Some(WeightEntry::Dense(dense)) => (dense.dtype(), dense.bytes().as_slice().to_vec()),
             other => panic!("{name}: {other:?}"),
@@ -1064,6 +1109,9 @@ mod tests {
             (13, WeightFormat::Q5_K),
             (14, WeightFormat::Q6_K),
             (20, WeightFormat::Iq4_Nl),
+            (17, WeightFormat::Iq2_Xs),
+            (18, WeightFormat::Iq3_Xxs),
+            (21, WeightFormat::Iq3_S),
             (23, WeightFormat::Iq4_Xs),
             (30, WeightFormat::Bf16),
             (39, WeightFormat::Mxfp4),
@@ -1072,8 +1120,7 @@ mod tests {
             assert_eq!(weight_format_of(id), Some(format), "ggml type {id}");
         }
         let unmapped: &[u32] = &[
-            4, 5, 9, 15, 16, 17, 18, 19, 21, 22, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36,
-            37, 38,
+            4, 5, 9, 15, 16, 19, 22, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38,
         ];
         for &id in unmapped {
             assert_eq!(weight_format_of(id), None, "ggml type {id}");
@@ -1164,7 +1211,7 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let store = read_gguf(&index, &file, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&index, &IdentityNames, default_workers()).expect("read_gguf");
 
         assert_eq!(store.len(), 1);
         let entry = store.get("blk.0.attn_v.weight").expect("missing entry");
@@ -1189,8 +1236,8 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let error = read_gguf(&index, &file, &IdentityNames, default_workers())
-            .expect_err("must refuse Q8_1");
+        let error =
+            read_gguf(&index, &IdentityNames, default_workers()).expect_err("must refuse Q8_1");
         match error {
             LoadError::UnsupportedGgufType { tensor, ggml_type } => {
                 assert_eq!(tensor, "blk.0.attn_v.weight");
@@ -1218,8 +1265,8 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let store = read_gguf(&index, &file, &SkipEverything, default_workers())
-            .expect("skips, does not refuse");
+        let store =
+            read_gguf(&index, &SkipEverything, default_workers()).expect("skips, does not refuse");
         assert!(store.is_empty());
     }
 
@@ -1255,7 +1302,7 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let store = read_gguf(&index, &file, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&index, &IdentityNames, default_workers()).expect("read_gguf");
 
         assert_eq!(store.len(), experts);
         for expert in 0..experts {
@@ -1307,7 +1354,7 @@ mod tests {
         let fixture = TempGguf::write(&bytes);
         let file = fixture.map();
         let index = GgufIndex::parse(&file).expect("parse index");
-        let store = read_gguf(&index, &file, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&index, &IdentityNames, default_workers()).expect("read_gguf");
 
         let WeightEntry::Dense(f32_entry) = store.get("norm.weight").expect("missing f32 entry")
         else {
@@ -1347,7 +1394,7 @@ mod tests {
         );
         let file = StoredBytes::from(bytes);
         let index = GgufIndex::parse(&file).expect("parse in-memory gguf");
-        let store = read_gguf(&index, &file, &IdentityNames, default_workers()).expect("read_gguf");
+        let store = read_gguf(&index, &IdentityNames, default_workers()).expect("read_gguf");
         let entry = store.get("blk.0.attn_v.weight").expect("missing entry");
         let WeightEntry::Packed(payload) = entry else {
             panic!("expected a packed entry, got {entry:?}");
@@ -1399,7 +1446,7 @@ mod tests {
             &[("w", vec![32, 1], GGML_Q8_0, block)],
         );
         let parse = |bytes: &[u8]| GgufIndex::parse(&StoredBytes::from(bytes.to_vec()));
-        let header_end = parse(&bytes).unwrap().data_start();
+        let header_end = parse(&bytes).unwrap().data_start(0);
         for len in 0..header_end {
             let prefix = &bytes[..len];
             assert!(
@@ -1414,7 +1461,7 @@ mod tests {
             ],
             &[],
         );
-        let end = parse(&header_only).unwrap().data_start();
+        let end = parse(&header_only).unwrap().data_start(0);
         let index =
             parse(&header_only[..end]).expect("a header whose last KV ends at end of file parses");
         assert_eq!(

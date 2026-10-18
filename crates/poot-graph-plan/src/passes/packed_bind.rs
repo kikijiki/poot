@@ -239,7 +239,9 @@ pub fn bind_packed_weights(g: &Graph, formats: &WeightFormats) -> Result<Graph, 
     }
     let consumers = packed_consumer_map(g);
     let mut out = g.edit();
-    let mut decode: Vec<Eqn> = Vec::new();
+    // The decode equations of each bound constant, keyed by the equation that first reads it: they run just
+    // before it, so one decoded weight is live at a time, not every weight from the first equation on.
+    let mut decode: BTreeMap<usize, Vec<Eqn>> = BTreeMap::new();
     let mut bound: Vec<ValueId> = Vec::new();
     let mut removed: HashSet<usize> = HashSet::new();
     let mut claimed: HashMap<usize, Eqn> = HashMap::new();
@@ -331,20 +333,24 @@ pub fn bind_packed_weights(g: &Graph, formats: &WeightFormats) -> Result<Graph, 
             )),
             PackedLayout::ExpertRows { .. } => unreachable!("expert stacks continue above"),
         };
+        let first_reader = consumers[id].first().copied().unwrap_or(0);
+        // The decode belongs to the layer of the equation it feeds, so a layer's equations stay one run.
+        let layer = g.eqns().get(first_reader).and_then(|eqn| eqn.layer);
+        let decode = decode.entry(first_reader).or_default();
         decode.push(Eqn {
             op: OpKind::PackedDequant {
                 descriptor: packed.weight,
             },
             inputs: carriers,
             out: dequant_out,
-            layer: None,
+            layer,
         });
         if packed.layout == PackedLayout::Columns {
             decode.push(Eqn {
                 op: OpKind::Transpose { perm: vec![1, 0] },
                 inputs: vec![Operand::Value(dequant_out)],
                 out: id,
-                layer: None,
+                layer,
             });
         }
         out.values_mut()[id].storage = Storage::Device;
@@ -357,13 +363,18 @@ pub fn bind_packed_weights(g: &Graph, formats: &WeightFormats) -> Result<Graph, 
     }
     out.inputs_mut().retain(|id| !bound.contains(id));
     out.consts_mut().retain(|id| !bound.contains(id));
-    let kept = std::mem::take(out.eqns_mut())
-        .into_iter()
-        .enumerate()
-        .filter(|(index, _)| !removed.contains(index))
-        .map(|(index, eqn)| claimed.remove(&index).unwrap_or(eqn));
-    decode.extend(kept);
-    *out.eqns_mut() = decode;
+    let mut ordered = Vec::new();
+    for (index, eqn) in std::mem::take(out.eqns_mut()).into_iter().enumerate() {
+        // A decode anchored on a removed equation runs before the next one kept.
+        while let Some(entry) = decode.first_entry().filter(|entry| *entry.key() <= index) {
+            ordered.extend(entry.remove());
+        }
+        if !removed.contains(&index) {
+            ordered.push(claimed.remove(&index).unwrap_or(eqn));
+        }
+    }
+    ordered.extend(decode.into_values().flatten());
+    *out.eqns_mut() = ordered;
     out.commit().map_err(|source| PackedBindError::Graph {
         name: last_name.unwrap_or_default(),
         source: Box::new(source),
@@ -445,6 +456,41 @@ mod tests {
 
     fn ops(g: &Graph) -> Vec<String> {
         g.eqns().iter().map(|eqn| eqn.op.name()).collect()
+    }
+
+    /// POOT-1182: each bound weight decodes just before the first equation that reads it, not all at the head of
+    /// the graph. The CPU oracle walks the bound graph as it stands, so a decode-first order held every decoded
+    /// weight of a 27B checkpoint (more than 100 GB of F32) at once. Mutation: put the decode equations ahead of
+    /// every kept equation again; the second projection's decode moves to the front and the order differs.
+    #[test]
+    fn a_bound_weight_decodes_just_before_its_first_reader() {
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2, 64])).unwrap();
+        let first = b
+            .constant("first.weight", TensorType::f32(vec![64, 32]))
+            .unwrap();
+        let second = b
+            .constant("second.weight", TensorType::f32(vec![32, 8]))
+            .unwrap();
+        let h = b.matmul(x, first).unwrap();
+        let y = b.matmul(h, second).unwrap();
+        let g = b.finish(y).unwrap();
+        let formats = formats(&[
+            ("first.weight", column(32, 64)),
+            ("second.weight", column(8, 32)),
+        ]);
+        let bound = bind_packed_weights(&g, &formats).unwrap();
+        assert_eq!(
+            ops(&bound),
+            [
+                "packed_dequant q8_0",
+                "transpose [1, 0]",
+                "matmul",
+                "packed_dequant q8_0",
+                "transpose [1, 0]",
+                "matmul"
+            ]
+        );
     }
 
     /// A projection `x @ W` whose `[K, out]` weight is stored packed binds to `packed_linear`'s
@@ -636,6 +682,46 @@ mod tests {
     /// ids operands kept and the output value untouched; no `PackedDequant` (no decoded table) remains. A
     /// one-expert stack keeps its `E` axis. Mutation: bind the stack as per-expert `PackedDequant` branches
     /// (the removed W12 chain); the dequant count and the missing contraction fail this row.
+    /// POOT-1182: a decode whose first reader is an equation the bind replaces (here the indexed matmul it
+    /// claims, reading the packed decode as its activation, after the removed stack transpose) still lands
+    /// immediately before that equation, and the bound graph is a valid, ordered graph.
+    #[test]
+    fn a_decode_read_first_by_a_claimed_equation_precedes_it() {
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![3, 64])).unwrap();
+        let sel = b
+            .constant("sel", TensorType::new(vec![3], DType::I32))
+            .unwrap();
+        let w = b
+            .constant("experts.weight", TensorType::f32(vec![2, 8, 64]))
+            .unwrap();
+        let y = b
+            .indexed_matmul(x, b.transpose(w, vec![0, 2, 1]).unwrap(), sel)
+            .unwrap();
+        let g = b.finish(y).unwrap();
+        let rows = PackedConst {
+            linear_id: "x".into(),
+            weight: q8(3, 64),
+            layout: PackedLayout::Rows,
+        };
+        let bound = bind_packed_weights(&g, &formats(&[("x", rows), ("experts.weight", stack(2))]))
+            .unwrap();
+        let [decode, claimed] = bound.eqns() else {
+            panic!("{:?}", ops(&bound));
+        };
+        assert!(
+            matches!(decode.op, OpKind::PackedDequant { .. }),
+            "{:?}",
+            ops(&bound)
+        );
+        assert_eq!(decode.out, x.id());
+        assert!(
+            matches!(claimed.op, OpKind::PackedContraction { .. }),
+            "{:?}",
+            ops(&bound)
+        );
+    }
+
     #[test]
     fn a_packed_expert_stack_binds_to_one_indexed_contraction() {
         for experts in [1usize, 2] {

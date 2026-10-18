@@ -34,6 +34,7 @@ use poot_tensor::DType;
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};
+use super::norm::{NormKind, NormParams};
 use super::standard::{ParamError, Step};
 use crate::model::ConfigReason;
 use crate::model::{TraceError, WiringError};
@@ -69,8 +70,34 @@ impl PleWitness {
     }
 }
 
+/// Where a PLE layer's n-gram hash constants come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NgramHash {
+    /// Derived from the config, as the reference model does at construction.
+    Derived {
+        /// The floor of each head's prime vocabulary slice.
+        vocab_base: u64,
+        /// The table's row count is padded up to a multiple of this.
+        vocab_divisible_by: usize,
+        /// The seed of the hash multipliers.
+        seed: u64,
+    },
+    /// The constants a checkpoint stores (a GGUF's `ple.*` arrays), read as stored: they are the
+    /// reference model's derived buffers, so the hash needs neither the base nor the seed.
+    Stored {
+        /// One odd 64-bit multiplier per n-gram position.
+        multipliers: Vec<u64>,
+        /// Per hash head, the first table row of its slice.
+        head_offsets: Vec<u64>,
+        /// Per hash head, the prime its id is reduced by.
+        head_vocab_sizes: Vec<u64>,
+        /// The table's row count, as the table stores it.
+        rows: usize,
+    },
+}
+
 /// What a PLE layer's config fixes.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PleSpec {
     /// The model's hidden width, and how many parallel streams the residual carries.
     pub width: usize,
@@ -84,18 +111,15 @@ pub struct PleSpec {
     pub ngram_size: usize,
     /// Hash heads per n-gram order.
     pub heads_per_ngram: usize,
-    /// The floor of each head's prime vocabulary slice.
-    pub ngram_vocab_base: u64,
-    /// The table's row count is padded up to a multiple of this.
-    pub vocab_divisible_by: usize,
-    /// The seed of the hash multipliers.
-    pub seed: u64,
+    /// The n-gram hash's tables.
+    pub hash: NgramHash,
     /// The vocabulary size the n-gram hash reduces token ids against.
     pub vocab: usize,
     /// The end-of-sequence id: the fill of the hash's out-of-segment context.
     pub eos: u32,
-    /// The epsilon of the layer's norms.
-    pub eps: f32,
+    /// The layer's grouped norms: their epsilon, and whether the stored scales are offsets from one
+    /// ([`NormKind::RmsPlusOne`], HF) or the scale itself ([`NormKind::Rms`], a GGUF that folded the one in).
+    pub norm: NormParams,
     /// This layer's position among the model's PLE layers: it salts the head primes and the
     /// multipliers, so two PLE layers hash differently.
     pub ordinal: usize,
@@ -134,10 +158,6 @@ impl PleParams {
             ("ple_embed_dim", spec.embed_dim),
             ("heads_per_ngram", spec.heads_per_ngram),
             ("vocab_size", spec.vocab),
-            (
-                "make_ngram_vocab_size_divisible_by",
-                spec.vocab_divisible_by,
-            ),
         ] {
             if value == 0 {
                 return Err(zero(field));
@@ -146,23 +166,11 @@ impl PleParams {
         if !(2..=3).contains(&spec.ngram_size) {
             return Err(ParamError::new("ngram_size", ConfigReason::Unsupported));
         }
-        if spec.ngram_vocab_base < 2 {
-            return Err(ParamError::new(
-                "ngram_vocab_size_base",
-                ConfigReason::Unsupported,
-            ));
-        }
         let heads = (spec.ngram_size - 1) * spec.heads_per_ngram;
         if !spec.embed_dim.is_multiple_of(heads) {
             return Err(ParamError::new(
                 "ple_embed_dim",
                 ConfigReason::NotDivisible { by: heads },
-            ));
-        }
-        if !(spec.eps.is_finite() && spec.eps > 0.0) {
-            return Err(ParamError::new(
-                "rms_norm_eps",
-                ConfigReason::NotFinitePositive,
             ));
         }
         let eos = i32::try_from(spec.eos).map_err(|_| {
@@ -263,37 +271,78 @@ fn nth_prime_after(start: u64, count: usize) -> u64 {
     candidate
 }
 
+/// The head slices stack into one table whose row ids are I32, and each prime reduces a packed
+/// u64 through `u64_rem_u32`.
+fn too_big(field: &'static str) -> ParamError {
+    ParamError::new(
+        field,
+        ConfigReason::Exceeds {
+            max: i32::MAX as usize,
+        },
+    )
+}
+
 fn ngram_tables(spec: &PleSpec, heads: usize) -> Result<NgramTables, ParamError> {
-    // The head slices stack into one table whose row ids are I32, and each prime reduces a packed
-    // u64 through `u64_rem_u32`.
-    let too_big = |field| {
-        ParamError::new(
-            field,
-            ConfigReason::Exceeds {
-                max: i32::MAX as usize,
-            },
-        )
-    };
+    match &spec.hash {
+        NgramHash::Derived {
+            vocab_base,
+            vocab_divisible_by,
+            seed,
+        } => derived_tables(spec, heads, *vocab_base, *vocab_divisible_by, *seed),
+        NgramHash::Stored {
+            multipliers,
+            head_offsets,
+            head_vocab_sizes,
+            rows,
+        } => stored_tables(
+            spec,
+            heads,
+            multipliers,
+            head_offsets,
+            head_vocab_sizes,
+            *rows,
+        ),
+    }
+}
+
+/// The tables the reference model derives at construction from the config.
+fn derived_tables(
+    spec: &PleSpec,
+    heads: usize,
+    vocab_base: u64,
+    vocab_divisible_by: usize,
+    seed: u64,
+) -> Result<NgramTables, ParamError> {
+    if vocab_base < 2 {
+        return Err(ParamError::new(
+            "ngram_vocab_size_base",
+            ConfigReason::Unsupported,
+        ));
+    }
+    if vocab_divisible_by == 0 {
+        return Err(ParamError::new(
+            "make_ngram_vocab_size_divisible_by",
+            ConfigReason::Zero,
+        ));
+    }
     let mut head_vocab = Vec::with_capacity(heads);
     let mut head_offset = Vec::with_capacity(heads);
     let mut total: u64 = 0;
     for head in 0..heads {
         let global = spec.ordinal * heads + head;
-        let prime = nth_prime_after(spec.ngram_vocab_base - 1, global + 1);
+        let prime = nth_prime_after(vocab_base - 1, global + 1);
         head_vocab.push(u32::try_from(prime).map_err(|_| too_big("ngram_vocab_size_base"))?);
         head_offset.push(i32::try_from(total).map_err(|_| too_big("ngram_vocab_size_base"))?);
         total += prime;
     }
     let total = usize::try_from(total).map_err(|_| too_big("ngram_vocab_size_base"))?;
-    let padded_rows = total.div_ceil(spec.vocab_divisible_by) * spec.vocab_divisible_by;
+    let padded_rows = total.div_ceil(vocab_divisible_by) * vocab_divisible_by;
     if i32::try_from(padded_rows).is_err() {
         return Err(too_big("ngram_vocab_size_base"));
     }
     let multiplier_max = i64::MAX as u64 / spec.vocab as u64;
     let half_bound = (multiplier_max / 2).max(1);
-    let base_seed = spec
-        .seed
-        .wrapping_add(PRIME_1.wrapping_mul(spec.ordinal as u64));
+    let base_seed = seed.wrapping_add(PRIME_1.wrapping_mul(spec.ordinal as u64));
     let multipliers = (0..spec.ngram_size)
         .map(|index| {
             let value = base_seed.wrapping_add(SPLITMIX_GAMMA.wrapping_mul(index as u64 + 1));
@@ -305,6 +354,56 @@ fn ngram_tables(spec: &PleSpec, heads: usize) -> Result<NgramTables, ParamError>
         head_offset,
         padded_rows,
         multipliers,
+    })
+}
+
+/// The tables a checkpoint stores, checked against the layer's shape: one multiplier per n-gram
+/// position, one slice per hash head, every slice non-empty and inside the table, and the table's
+/// rows addressable by the I32 ids.
+fn stored_tables(
+    spec: &PleSpec,
+    heads: usize,
+    multipliers: &[u64],
+    head_offsets: &[u64],
+    head_vocab_sizes: &[u64],
+    rows: usize,
+) -> Result<NgramTables, ParamError> {
+    let length = |field, found: usize, expected: usize| {
+        if found == expected {
+            Ok(())
+        } else {
+            Err(ParamError::new(field, ConfigReason::Length { expected }))
+        }
+    };
+    length("ple.layer_multipliers", multipliers.len(), spec.ngram_size)?;
+    length("ple.head_offsets", head_offsets.len(), heads)?;
+    length("ple.head_vocab_sizes", head_vocab_sizes.len(), heads)?;
+    if i32::try_from(rows).is_err() {
+        return Err(too_big("ple.rows"));
+    }
+    let mut head_vocab = Vec::with_capacity(heads);
+    let mut head_offset = Vec::with_capacity(heads);
+    for (&offset, &size) in head_offsets.iter().zip(head_vocab_sizes) {
+        if size == 0 {
+            return Err(ParamError::new("ple.head_vocab_sizes", ConfigReason::Zero));
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| too_big("ple.head_offsets"))?;
+        if end > rows as u64 {
+            return Err(ParamError::new(
+                "ple.head_offsets",
+                ConfigReason::Exceeds { max: rows },
+            ));
+        }
+        head_vocab.push(u32::try_from(size).map_err(|_| too_big("ple.head_vocab_sizes"))?);
+        head_offset.push(i32::try_from(offset).map_err(|_| too_big("ple.head_offsets"))?);
+    }
+    Ok(NgramTables {
+        head_vocab,
+        head_offset,
+        padded_rows: rows,
+        multipliers: multipliers.to_vec(),
     })
 }
 
@@ -454,25 +553,32 @@ impl Table {
 }
 
 /// A grouped RMSNorm of `x` (`[.., groups * width]`): each of the `groups` runs of `width` values
-/// is normalized by its own mean square, then the whole row is scaled by `1 + scale` (the
-/// reference model's `Qwen4ExpTextRMSNorm(dim, group_size)`: the scale has no group structure and is
-/// stored as an offset from one).
+/// is normalized by its own mean square, then the whole row is scaled by `norm`'s kind: by `1 + scale`
+/// for the reference model's `Qwen4ExpTextRMSNorm(dim, group_size)`, whose scale has no group structure
+/// and is stored as an offset from one ([`NormKind::RmsPlusOne`]), or by `scale` for a checkpoint that
+/// folded the one in ([`NormKind::Rms`]).
 pub fn grouped_norm(
     b: &Builder,
     x: Traced,
     scale: &Weight,
     groups: usize,
-    eps: f32,
+    norm: NormParams,
 ) -> Result<Traced, TraceError> {
     let shape = b.aval(x)?.shape;
     let width = shape[shape.len() - 1] / groups;
     let mut grouped = shape[..shape.len() - 1].to_vec();
     grouped.extend([groups, width]);
     let normed = b.reshape(
-        ops::rmsnorm_no_weight(b, b.reshape(x, grouped)?, eps)?,
+        ops::rmsnorm_no_weight(b, b.reshape(x, grouped)?, norm.eps())?,
         shape.clone(),
     )?;
-    let scale = b.binary_scalar(BinOp::Add, scale.declare_f32(b)?, Builder::f32(1.0))?;
+    let scale = match norm.kind() {
+        NormKind::RmsPlusOne => {
+            b.binary_scalar(BinOp::Add, scale.declare_f32(b)?, Builder::f32(1.0))?
+        }
+        NormKind::Rms => scale.declare_f32(b)?,
+        NormKind::Layer => return Err(WiringError::GroupedLayerNorm.into()),
+    };
     Ok(b.binary(BinOp::Mul, normed, b.broadcast(scale, shape)?)?)
 }
 
@@ -582,15 +688,15 @@ pub fn ple(
     let (rows, t) = (shape.rows.get(), shape.tokens.get());
     let (streams, width) = (p.spec.streams, p.spec.width);
     let stream = p.stream_width();
-    let eps = p.spec.eps;
+    let norm = p.spec.norm;
 
     let ids = ngram_ids(b, step, layer, p)?;
     let looked = w.table.lookup(b, ids)?; // [rows, tokens, heads, head_dim]
     let emb = b.reshape(looked, vec![rows, t, p.spec.embed_dim])?;
 
-    let key = grouped_norm(b, linear(b, emb, &w.key, None)?, &w.key_norm, streams, eps)?;
+    let key = grouped_norm(b, linear(b, emb, &w.key, None)?, &w.key_norm, streams, norm)?;
     let value = linear(b, emb, &w.value, None)?; // [rows, tokens, width]
-    let query = grouped_norm(b, x, &w.query_norm, streams, eps)?;
+    let query = grouped_norm(b, x, &w.query_norm, streams, norm)?;
 
     let grouped = vec![rows, t, streams, width];
     let dot = b.reduce(
@@ -629,7 +735,7 @@ pub fn ple(
         vec![rows, t, stream],
     )?;
 
-    let normed = grouped_norm(b, gated, &w.conv_norm, streams, eps)?;
+    let normed = grouped_norm(b, gated, &w.conv_norm, streams, norm)?;
     let conv = causal_conv(
         b,
         step,
@@ -646,7 +752,7 @@ pub fn ple(
 /// them.
 #[cfg(test)]
 pub(crate) mod oracle {
-    use super::PleSpec;
+    use super::{NgramHash, NormKind, NormParams, PleSpec};
 
     /// The per-layer tables of the reference hash, derived here by a different route than the
     /// component's (`u128` arithmetic, a divisor scan).
@@ -665,9 +771,29 @@ pub(crate) mod oracle {
     }
 
     pub(crate) fn tables(spec: &PleSpec) -> Tables {
+        let (vocab_base, vocab_divisible_by, seed) = match &spec.hash {
+            NgramHash::Derived {
+                vocab_base,
+                vocab_divisible_by,
+                seed,
+            } => (*vocab_base, *vocab_divisible_by, *seed),
+            NgramHash::Stored {
+                multipliers,
+                head_offsets,
+                head_vocab_sizes,
+                rows,
+            } => {
+                return Tables {
+                    head_vocab: head_vocab_sizes.iter().map(|&v| v as i64).collect(),
+                    head_offset: head_offsets.iter().map(|&v| v as i64).collect(),
+                    rows: *rows,
+                    multipliers: multipliers.iter().map(|&v| v as i64).collect(),
+                };
+            }
+        };
         let heads = (spec.ngram_size - 1) * spec.heads_per_ngram;
         let (mut head_vocab, mut head_offset, mut total) = (Vec::new(), Vec::new(), 0i64);
-        let mut candidates = (spec.ngram_vocab_base..).filter(|&n| prime(n));
+        let mut candidates = (vocab_base..).filter(|&n| prime(n));
         // Layer `o` takes the primes after those of layers `0..o`: skip `o * heads` of them.
         for _ in 0..spec.ordinal * heads {
             candidates.next();
@@ -678,7 +804,7 @@ pub(crate) mod oracle {
             head_vocab.push(size);
             total += size;
         }
-        let divisor = spec.vocab_divisible_by as i64;
+        let divisor = vocab_divisible_by as i64;
         let rows = ((total + divisor - 1) / divisor * divisor) as usize;
         let mix = |z: u128| -> u64 {
             let mask = (1u128 << 64) - 1;
@@ -688,7 +814,7 @@ pub(crate) mod oracle {
             (z ^ (z >> 31)) as u64
         };
         let bound = (i64::MAX as u64 / spec.vocab as u64 / 2).max(1);
-        let seed = spec.seed as u128 + 10007 * spec.ordinal as u128;
+        let seed = seed as u128 + 10007 * spec.ordinal as u128;
         let multipliers = (0..spec.ngram_size)
             .map(|i| {
                 let value = (seed + 0x9E37_79B9_7F4A_7C15u128 * (i as u128 + 1)) & ((1 << 64) - 1);
@@ -775,13 +901,19 @@ pub(crate) mod oracle {
             .collect()
     }
 
-    fn grouped(x: &[f64], scale: &[f64], groups: usize, eps: f64) -> Vec<f64> {
+    fn grouped(x: &[f64], scale: &[f64], groups: usize, norm: NormParams) -> Vec<f64> {
         let width = x.len() / groups;
+        let eps = f64::from(norm.eps());
+        let offset = if norm.kind() == NormKind::RmsPlusOne {
+            1.0
+        } else {
+            0.0
+        };
         (0..x.len())
             .map(|i| {
                 let group = &x[i / width * width..(i / width + 1) * width];
                 let ms = group.iter().map(|v| v * v).sum::<f64>() / width as f64;
-                x[i] / (ms + eps).sqrt() * (1.0 + scale[i])
+                x[i] / (ms + eps).sqrt() * (offset + scale[i])
             })
             .collect()
     }
@@ -806,7 +938,7 @@ pub(crate) mod oracle {
         let stream = width * streams;
         let heads = (spec.ngram_size - 1) * spec.heads_per_ngram;
         let head_dim = embed / heads;
-        let eps = f64::from(spec.eps);
+        let norm = spec.norm;
         let (mut gated, mut normed) = (Vec::new(), Vec::new());
         for (x, ids) in x.iter().zip(ids) {
             let emb: Vec<f64> = ids
@@ -819,10 +951,10 @@ pub(crate) mod oracle {
                 &matvec(&w.key, stream, embed, &emb),
                 &w.key_norm,
                 streams,
-                eps,
+                norm,
             );
             let value = matvec(&w.value, width, embed, &emb);
-            let query = grouped(x, &w.query_norm, streams, eps);
+            let query = grouped(x, &w.query_norm, streams, norm);
             let mut row = vec![0.0; stream];
             for s in 0..streams {
                 let dot: f64 = (0..width)
@@ -835,7 +967,7 @@ pub(crate) mod oracle {
                     row[s * width + i] = sigma * value[i];
                 }
             }
-            normed.push(grouped(&row, &w.conv_norm, streams, eps));
+            normed.push(grouped(&row, &w.conv_norm, streams, norm));
             gated.push(row);
         }
         let (kernel, dilation) = (spec.conv_kernel, spec.ngram_size);
@@ -882,12 +1014,14 @@ mod tests {
             conv_kernel: 3,
             ngram_size: 3,
             heads_per_ngram: 2,
-            ngram_vocab_base: 17,
-            vocab_divisible_by: 8,
-            seed: 1234,
+            hash: NgramHash::Derived {
+                vocab_base: 17,
+                vocab_divisible_by: 8,
+                seed: 1234,
+            },
             vocab: 11,
             eos: 5,
-            eps: 1e-6,
+            norm: NormParams::of(NormKind::RmsPlusOne, 1e-6).unwrap(),
             ordinal: 0,
         }
     }
@@ -1161,8 +1295,11 @@ mod tests {
             embed_dim: 2560,
             conv_kernel: 4,
             heads_per_ngram: 8,
-            ngram_vocab_base: 20_000_000,
-            vocab_divisible_by: 128,
+            hash: NgramHash::Derived {
+                vocab_base: 20_000_000,
+                vocab_divisible_by: 128,
+                seed: 1234,
+            },
             vocab: 248_320,
             eos: 248_044,
             ..spec()
@@ -1465,8 +1602,11 @@ mod tests {
             embed_dim: 2560,
             conv_kernel: 4,
             heads_per_ngram: 8,
-            ngram_vocab_base: 20_000_000,
-            vocab_divisible_by: 128,
+            hash: NgramHash::Derived {
+                vocab_base: 20_000_000,
+                vocab_divisible_by: 128,
+                seed: 1234,
+            },
             vocab: 248_320,
             eos: 248_044,
             ..spec()

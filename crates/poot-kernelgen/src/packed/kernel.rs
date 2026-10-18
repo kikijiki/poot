@@ -178,7 +178,9 @@ fn row_gather(name: &str, format: WeightFormat) -> Result<Body, KernelGenError> 
         statements: vec![],
         terminator: Terminator::Return,
     };
-    Ok(Body::new(name, 4, al.locals, vec![bb0, bb1, bb2, bb3]))
+    let mut body = Body::new(name, 4, al.locals, vec![bb0, bb1, bb2, bb3]);
+    body.constant_tables = plan.constant_tables();
+    Ok(body)
 }
 
 /// `out[col_flat] = sum over k of activation[b, k] * decode(col_flat, k)`, `M == 1`:
@@ -283,7 +285,7 @@ fn contraction_gemv(
             .collect();
         poisoned(e, decoded, poison)
     };
-    Ok(gemv_body(
+    let mut body = gemv_body(
         name,
         al,
         lead + 2 + leaf_count as u32,
@@ -295,7 +297,9 @@ fn contraction_gemv(
             lanes: &lanes,
         }),
         decode_run,
-    ))
+    );
+    body.constant_tables = plan.constant_tables();
+    Ok(body)
 }
 
 /// `values` with `poison` (`0.0` or NaN, [`ExpertRows`]) added to the first, so an invalid expert id makes the
@@ -936,6 +940,7 @@ fn contraction_tiled(
             len: (ts * ts) as u32,
         },
     ];
+    body.constant_tables = plan.constant_tables();
     Ok(body)
 }
 

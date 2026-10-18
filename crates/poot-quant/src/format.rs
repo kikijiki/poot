@@ -25,6 +25,8 @@
 //!   one (`q - 8` for `Q4_0`, `q - (z + 1)` for GPTQ). Offsets such as `- 8` are part of the
 //!   field's [`FieldEncoding`].
 //! - [`ValueMap::Codebook`]: a 16-entry table (`IQ4_NL`, `IQ4_XS`).
+//! - [`ValueMap::SignedGrid`]: a lattice point looked up by the code, one lane of it picked by the
+//!   element's position, and its sign taken from the `Signs` operand (`IQ2_XS`, `IQ3_XXS`, `IQ3_S`).
 //! - [`ValueMap::Float`]: the code is a float (F32, F16, BF16, E4M3FN, E2M1).
 //!
 //! ## Two storage shapes
@@ -81,12 +83,19 @@
 //! | `Q6_K` | `d` f16 | i8 | u6 - 32 (`ql` + `qh`) | - | - | - |
 //! | `IQ4_NL` | `d` f16 | - | codebook | - | - | - |
 //! | `IQ4_XS` | `d` f16 | u6 - 32 | codebook | - | - | - |
+//! | `IQ2_XS` | `d` f16 | u4 + 1/2, x 1/4 | u9 grid point, 8 lanes | - | - | - |
+//! | `IQ3_XXS` | `d` f16 | u4 + 1/2, x 1/2 | u8 grid point, 4 lanes | - | - | - |
+//! | `IQ3_S` | `d` f16 | u4 + 1/2, x 2 | u9 grid point, 4 lanes | - | - | - |
 //! | MXFP4 (GGUF) | `e` E8M0 | - | E2M1 | - | - | - |
 //! | E4M3 per-channel | f32/bf16/E8M0 per row | - | E4M3FN | - | - | - |
 //! | E4M3 128x128 block | f32/bf16/E8M0 per block | - | E4M3FN | - | - | - |
 //! | E2M1 row-32 | E8M0 per 32 along K | - | E2M1 | - | - | - |
 //! | GPTQ int4 | f16 per group | - | u4 | u4 + 1 per group | - | - |
 //! | AWQ int4 | f16 per group | - | u4 | u4 per group | - | - |
+//!
+//! `IQ2_XS`, `IQ3_XXS` and `IQ3_S` also have a `Signs` operand per group of eight values: seven
+//! stored bits whose parity is the eighth sign (ggml's `ksigns_iq2xs`) for the first two, eight
+//! stored bits for `IQ3_S`. See [`SignedGrid`] and [`SignRule`].
 //!
 //! `Q3_K`'s `hmask` bit is stored inverted (`q = low2 - (h ? 0 : 4)`); as a code it is
 //! `low2 | h << 2` with a `-4` offset, which is the same value for all eight codes.
@@ -160,6 +169,16 @@ pub enum WeightFormat {
     Iq4_Nl,
     /// GGUF `IQ4_XS` (ggml type 23): 256-value super-blocks of 4-bit codebook codes with 6-bit sub-block scales.
     Iq4_Xs,
+    /// GGUF `IQ2_XS` (ggml type 17): 256-value super-blocks of 9-bit lattice points over eight values
+    /// each, 7-bit sign patterns and 4-bit half-step sub-block scales.
+    Iq2_Xs,
+    /// GGUF `IQ3_XXS` (ggml type 18): 256-value super-blocks of 8-bit lattice points over four values
+    /// each, with the sign patterns and a 4-bit half-step scale packed per 32 values.
+    Iq3_Xxs,
+    /// GGUF `IQ3_S` (ggml type 21): 256-value super-blocks of 9-bit lattice points over four values
+    /// each (eight low bits and one high bit stored apart), 8-bit sign patterns and 4-bit odd-integer
+    /// scales.
+    Iq3_S,
     /// GGUF MXFP4 (ggml type 39): 32-value blocks, element `j` in the low nibble of byte `j` and
     /// element `j + 16` in its high nibble.
     Mxfp4,
@@ -230,6 +249,8 @@ pub enum OperandRole {
     Min,
     /// The sub-block min of a super-block (`m`).
     SubMin,
+    /// The sign pattern of a group of eight values ([`SignedGrid`]).
+    Signs,
     /// The group index of each K value (GPTQ `g_idx`).
     GroupIndex,
 }
@@ -252,8 +273,78 @@ pub enum ValueMap {
     Integer,
     /// `table[code]`.
     Codebook(&'static [f32; 16]),
+    /// A lattice point read through a [`SignedGrid`].
+    SignedGrid(&'static SignedGrid),
     /// The code is a float; its format is the `Codes` field's [`FieldEncoding::Float`].
     Float,
+}
+
+/// The lattice of `IQ2_XS` and `IQ3_XXS`: a table of grid points, each a short run of unsigned
+/// magnitudes, and the sign rule that applies to them.
+///
+/// Element `i` of a block decodes to `sign(i) * magnitudes[code * lanes + i % lanes]`, where `code`
+/// is the `Codes` operand at `i` and the sign comes from the `Signs` operand at `i` under
+/// [`Self::signs`]: the signs of the group of eight values `i / 8 * 8 ..` (bit `j` set means value
+/// `j` of the group is negative), whatever [`Self::lanes`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignedGrid {
+    /// The grid points, row-major: point `g` is `magnitudes[g * lanes .. (g + 1) * lanes]`.
+    pub magnitudes: &'static [u8],
+    /// Values one grid point covers: 8 for `IQ2_XS`, 4 for `IQ3_XXS`. A multiple of four, so a
+    /// point is a whole number of little-endian `u32` words ([`Self::word`]).
+    pub lanes: usize,
+    /// How the `Signs` operand states the eight signs of a group.
+    pub signs: SignRule,
+}
+
+/// How a [`SignedGrid`]'s `Signs` operand states the eight signs of a group of eight values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignRule {
+    /// Seven stored bits are signs 0 to 6 and sign 7 is their parity, which is how ggml's
+    /// `ksigns_iq2xs` completes a 7-bit index to a byte of even population count (`IQ2_XS`,
+    /// `IQ3_XXS`).
+    ParityOfSeven,
+    /// Eight stored bits, one sign each (`IQ3_S`).
+    Direct,
+}
+
+impl SignRule {
+    /// Whether value `lane` (0 to 7) of a group of eight is negative under the stored `signs`.
+    pub const fn negative(self, signs: u32, lane: u32) -> bool {
+        let pattern = match self {
+            Self::ParityOfSeven => signs | ((signs.count_ones() & 1) << 7),
+            Self::Direct => signs,
+        };
+        pattern >> lane & 1 == 1
+    }
+}
+
+impl SignedGrid {
+    /// Number of grid points.
+    pub const fn points(&self) -> usize {
+        self.magnitudes.len() / self.lanes
+    }
+
+    /// The magnitude of lane `lane` of grid point `code`.
+    pub const fn magnitude(&self, code: usize, lane: usize) -> u8 {
+        self.magnitudes[code * self.lanes + lane]
+    }
+
+    /// Little-endian `u32` word `word` of the table: the form a device kernel reads it in. Grid
+    /// point `g` occupies words `g * lanes / 4 ..`, lane `l` in byte `l % 4` of word `l / 4`.
+    pub const fn word(&self, word: usize) -> u32 {
+        u32::from_le_bytes([
+            self.magnitudes[4 * word],
+            self.magnitudes[4 * word + 1],
+            self.magnitudes[4 * word + 2],
+            self.magnitudes[4 * word + 3],
+        ])
+    }
+
+    /// Number of `u32` words in [`Self::word`]'s form.
+    pub const fn words(&self) -> usize {
+        self.magnitudes.len() / 4
+    }
 }
 
 /// The narrow float formats a code or scale can be stored in.
@@ -334,6 +425,14 @@ pub enum FieldEncoding {
     Signed,
     /// A float of this format.
     Float(FloatFormat),
+    /// An unsigned integer plus one half, scaled by a power of two: `(u + 1/2) * 2^exponent`
+    /// (`IQ2_XS`'s `(0.5 + n) * 0.25`, `IQ3_XXS`'s `(0.5 + n) * 0.5` sub-block scales). Both steps
+    /// are exact in f32, so scaling by a block's `d` afterwards rounds once, as ggml's
+    /// `d * (0.5f + n) * 0.25f` does.
+    HalfStep {
+        /// The power of two the half-step integer is multiplied by.
+        exponent: i32,
+    },
 }
 
 /// One digit of a [`BitLayout`]: its extent and the bit stride it contributes.
@@ -609,6 +708,9 @@ impl WeightFormat {
             Self::Q6_K => blocks::Q6_K,
             Self::Iq4_Nl => blocks::IQ4_NL,
             Self::Iq4_Xs => blocks::IQ4_XS,
+            Self::Iq2_Xs => blocks::IQ2_XS,
+            Self::Iq3_Xxs => blocks::IQ3_XXS,
+            Self::Iq3_S => blocks::IQ3_S,
             Self::Mxfp4 => blocks::MXFP4,
             Self::E4m3PerChannel { scale } => planar::e4m3_per_channel(scale),
             Self::E4m3Block128 { scale } => planar::e4m3_block128(scale),

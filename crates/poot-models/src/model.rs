@@ -461,6 +461,9 @@ pub enum WiringError {
     /// An order-3 n-gram head was traced for a spec that hashes only two tokens.
     #[error("an order-3 n-gram head has no third hashed token")]
     NgramOrderThree,
+    /// A grouped norm was given a LayerNorm: its scale is an RMS scale, as stored or an offset from one.
+    #[error("a grouped norm has no LayerNorm form")]
+    GroupedLayerNorm,
 }
 
 impl WiringError {

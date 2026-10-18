@@ -16,7 +16,7 @@ pub mod safetensors;
 
 // Re-export main types from each module for convenience
 pub use config::{QuantConfig, QuantKind, QuantScheme};
-pub use error::LoadError;
+pub use error::{GgufSplitError, LoadError};
 
 // Re-export helper functions from dtype for internal use
 pub(crate) use dtype::{checked_header_end, miss, parse_dtype};

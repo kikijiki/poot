@@ -267,7 +267,7 @@ mod tests {
         FloatFormat::E8m0,
     ];
 
-    const BLOCK_FORMATS: [WeightFormat; 16] = [
+    const BLOCK_FORMATS: [WeightFormat; 19] = [
         WeightFormat::F32,
         WeightFormat::F16,
         WeightFormat::Bf16,
@@ -283,6 +283,9 @@ mod tests {
         WeightFormat::Q6_K,
         WeightFormat::Iq4_Nl,
         WeightFormat::Iq4_Xs,
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
         WeightFormat::Mxfp4,
     ];
 
