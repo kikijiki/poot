@@ -396,6 +396,8 @@ struct World {
     fail_synchronize: bool,
     /// Make the device's `abort` fail: the engine poisons, as a lost device does.
     fail_abort: bool,
+    /// Make `reset_state` fail, for the failed-open row.
+    fail_reset: bool,
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -404,6 +406,8 @@ type Shared = Rc<RefCell<World>>;
 struct FakeBuffer {
     id: usize,
     role: BufferRole,
+    /// The native element capacity the buffer was allocated with.
+    elems: usize,
 }
 
 struct FakeDevice {
@@ -469,7 +473,11 @@ impl Device for FakeDevice {
         if role == BufferRole::Weight {
             world.weight_allocations += 1;
         }
-        Ok(FakeBuffer { id, role })
+        Ok(FakeBuffer { id, role, elems })
+    }
+
+    fn buffer_elems(&self, buffer: &FakeBuffer) -> usize {
+        buffer.elems
     }
 
     fn load_kernel(
@@ -654,6 +662,12 @@ impl Executor for Counting {
     }
 
     fn reset_state(&mut self, exe: ExecutableId, scope: StateScope) -> Result<(), ExecError> {
+        if self.world.borrow().fail_reset {
+            return Err(ExecError::Device(Box::new(poot_executor::DeviceError {
+                backend: "fake",
+                source: Box::new(FakeError),
+            })));
+        }
         self.inner.reset_state(exe, scope)
     }
 
@@ -798,6 +812,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         fail_unload: false,
         fail_synchronize: false,
         fail_abort: false,
+        fail_reset: false,
     }));
     let device = FakeDevice {
         world: world.clone(),
@@ -1625,19 +1640,22 @@ fn an_unusable_chat_template_is_refused_at_load() {
 
 const FAILING_TEMPLATE: &str = "{{ raise_exception('no such conversation') }}";
 
-/// A template that compiles but fails to render is an error when it is the override, and falls back to
-/// the family's chat format when it is the checkpoint's own: a template the caller asked for is never
-/// quietly replaced by another format. Mutation: drop the `chat_template_overridden` arm of
-/// `TextCodec::render_chat_value`; the override row renders in ChatML.
+/// A template that compiles but fails to render is a typed error, whether it is the checkpoint's own or the
+/// override: no other format answers in its place. Mutation: fall back to the family's chat format on a
+/// failed render in `TextCodec::render_chat_value`; the checkpoint's own row renders in ChatML.
 #[test]
-fn an_override_that_fails_to_render_is_an_error_not_a_fallback() {
+fn a_template_that_fails_to_render_is_an_error_not_a_fallback() {
     let registry = Registry::builtin().unwrap();
     let own = hf_directory_with_template("driver_template_failing_own", Some(FAILING_TEMPLATE));
     let own = ModelHandle::load(&own, &registry, &LoadOptions::default()).unwrap();
-    let rendered = own.text().render_user_turn(None, "Hi").unwrap().unwrap();
-    assert_eq!(
-        rendered.prompt, "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n",
-        "the checkpoint's own failing template falls back to its family's format"
+    let err = own.text().render_user_turn(None, "Hi").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            poot_text::TextError::ChatTemplate(ChatTemplateError::Render(ref reason))
+                if reason.contains("no such conversation")
+        ),
+        "{err:?}"
     );
 
     let base = hf_directory_with_template("driver_template_failing_override", None);

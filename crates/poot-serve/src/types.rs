@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver, SendError, Sender};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use poot_llm::driver::error::FailureClass;
 use poot_llm::driver::{AdapterRef, DriverCaps, Encoded, ModelHandle, PromptEmbeds};
@@ -56,9 +56,12 @@ pub(crate) struct Job {
     pub(crate) stop: Vec<String>,
     /// stream token pieces as generated (SSE) vs only the final completion.
     pub(crate) stream: bool,
-    pub(crate) reply: Sender<GenEvent>,
+    pub(crate) reply: ChoiceReply,
     /// Enqueue time, for the queue-wait histogram (`now - submitted` at admit).
     pub(crate) submitted: Instant,
+    /// The instant by which the engine must have opened the request; a job still waiting then is failed
+    /// as unavailable (503) instead of queueing without bound.
+    pub(crate) start_by: Instant,
     /// This request's adapter selection, resolved by the HTTP layer before enqueueing: the base weights
     /// or a captured adapter set's row. [`AdapterRef::Base`] means "no adapter".
     pub(crate) lora_adapter: AdapterRef,
@@ -258,6 +261,8 @@ pub(crate) struct Served {
     pub(crate) pooling: Pooling,
     /// The image front end of a vision-language checkpoint; `None` serves text only.
     pub(crate) images: Option<ImageClient>,
+    /// How long an admitted generation request may wait for the engine to open it.
+    pub(crate) max_queue_wait: Duration,
 }
 
 /// What the engine sends back per job: token pieces (streaming), then a terminal `Done` or `Failed`.
@@ -285,7 +290,7 @@ impl GenEvent {
     /// a stale count. Every commit path calls this.
     pub(crate) fn deliver_done(
         metrics: &Metrics,
-        reply: &Sender<GenEvent>,
+        reply: &ChoiceReply,
         completion: Completion,
     ) -> bool {
         deliver_terminal(metrics, reply, GenEvent::Done(completion))
@@ -306,13 +311,17 @@ thread_local! {
 /// and the send - cannot be retracted from a monotonic counter, so it stays a completion and is logged.
 /// Returns whether the event was delivered. Every terminal success send in the server goes through this,
 /// so the ordering and card 051's classification exist once instead of per call site.
-pub(crate) fn deliver_terminal<T>(metrics: &Metrics, reply: &Sender<T>, event: T) -> bool {
-    let predicted = !reply.is_disconnected();
+pub(crate) fn deliver_terminal<T>(
+    metrics: &Metrics,
+    reply: &impl TerminalSink<T>,
+    event: T,
+) -> bool {
+    let predicted = !reply.is_closed();
     metrics.record_terminal(predicted);
     if let Some(record) = DELIVERY_RECORDER.get() {
         record(metrics);
     }
-    let delivered = reply.send(event).is_ok();
+    let delivered = reply.deliver(event);
     if predicted != delivered {
         tracing::debug!(
             predicted,
@@ -320,6 +329,63 @@ pub(crate) fn deliver_terminal<T>(metrics: &Metrics, reply: &Sender<T>, event: T
         );
     }
     delivered
+}
+
+/// Where a terminal event goes: a reply channel the engine can ask whether anyone still listens.
+pub(crate) trait TerminalSink<T> {
+    fn is_closed(&self) -> bool;
+    fn deliver(&self, event: T) -> bool;
+}
+
+impl<T> TerminalSink<T> for Sender<T> {
+    fn is_closed(&self) -> bool {
+        self.is_disconnected()
+    }
+
+    fn deliver(&self, event: T) -> bool {
+        self.send(event).is_ok()
+    }
+}
+
+impl TerminalSink<GenEvent> for ChoiceReply {
+    fn is_closed(&self) -> bool {
+        self.replies.is_disconnected()
+    }
+
+    fn deliver(&self, event: GenEvent) -> bool {
+        self.send(event).is_ok()
+    }
+}
+
+/// The events of one request's choices, each tagged with its choice index: the one channel a handler
+/// thread waits on, however many choices (`n`) the request has.
+pub(crate) type ChoiceEvents = Receiver<(usize, GenEvent)>;
+
+/// One choice's sending end of its request's [`ChoiceEvents`].
+#[derive(Clone)]
+pub(crate) struct ChoiceReply {
+    index: usize,
+    replies: Sender<(usize, GenEvent)>,
+}
+
+impl ChoiceReply {
+    /// A channel for `choices` choices: the receiver, and the sending end of each choice in order.
+    pub(crate) fn channel(choices: usize) -> (Vec<ChoiceReply>, ChoiceEvents) {
+        let (replies, events) = mpsc::channel();
+        let senders = (0..choices)
+            .map(|index| ChoiceReply {
+                index,
+                replies: replies.clone(),
+            })
+            .collect();
+        (senders, events)
+    }
+
+    pub(crate) fn send(&self, event: GenEvent) -> Result<(), SendError<GenEvent>> {
+        self.replies
+            .send((self.index, event))
+            .map_err(|SendError((_, event))| SendError(event))
+    }
 }
 
 /// A producer failure whose `requests_errored` increment already happened. The private fields and sole

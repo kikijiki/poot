@@ -28,21 +28,25 @@ pub(super) fn roundtrip(
         .expect("bound the response read");
     let (server, _) = listener.accept().expect("accept client");
     let health = EngineHealth::serving_for_test("fake", 4, 64);
-    let limiter = RateLimiter {
-        rpm: 0,
-        windows: Mutex::new(HashMap::new()),
-    };
     let policy = LoraAdminPolicy::from_configured_key(IpAddr::from([127, 0, 0, 1]), None)
         .expect("loopback lora policy");
     write!(
         client,
-        "{method} {path} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .expect("write request");
     client.flush().expect("flush request");
-    handle(server, served, &health, metrics, &limiter, &policy)
-        .expect("the handler answers without a transport error");
+    handle(
+        server,
+        Instant::now(),
+        served,
+        &health,
+        metrics,
+        &test_limits(),
+        &policy,
+    )
+    .expect("the handler answers without a transport error");
     let mut response = String::new();
     client
         .read_to_string(&mut response)
@@ -343,6 +347,40 @@ fn a_request_the_engine_cannot_serve_as_asked_is_a_typed_400_and_reaches_no_engi
     assert_eq!(metrics.inflight.load(Ordering::Relaxed), 0);
 }
 
+/// A chat template that raises on the conversation refuses the request: a 400 that carries the template's
+/// own message, on the streaming route before its 200 headers too, with no other format answering and
+/// nothing reaching the engine.
+#[test]
+fn a_chat_template_that_raises_is_a_400_naming_its_error_and_reaches_no_engine() {
+    let model = tiny_model_with_chat_template(
+        "{{ raise_exception('conversation roles must alternate user and assistant') }}",
+    );
+    let metrics = Arc::new(test_metrics("template-raises"));
+    let (served, engine) = serve_with_fake(counting_engine(1), model, &metrics);
+    for body in [
+        r#"{"messages":[{"role":"user","content":"a"}]}"#,
+        r#"{"messages":[{"role":"user","content":"a"}],"stream":true}"#,
+    ] {
+        let response = roundtrip(&served, &metrics, "POST", "/v1/chat/completions", body);
+        assert_eq!(
+            status_line(&response),
+            "HTTP/1.1 400 Bad Request",
+            "{response}"
+        );
+        let message = json_body(&response)["error"]["message"].to_string();
+        assert!(
+            message.contains("conversation roles must alternate"),
+            "{message}"
+        );
+    }
+    let events = engine.finish(served).events();
+    assert!(
+        events.is_empty(),
+        "a refused request never reaches the engine: {events:?}"
+    );
+    assert_eq!(metrics.inflight.load(Ordering::Relaxed), 0);
+}
+
 /// The JSON of every `data:` frame of a streamed response, `[DONE]` excluded.
 fn sse_frames(response: &str) -> Vec<serde_json::Value> {
     let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
@@ -471,7 +509,7 @@ fn every_generation_route_appears_in_the_request_metrics() {
     let chat_prompt = {
         let msgs = serde_json::json!([{"role": "user", "content": "a"}]);
         let rendered = model.text().render_chat_value(&msgs, None).unwrap();
-        model.text().encode(&rendered.prompt).unwrap().len()
+        model.text().encode_chat(&rendered).unwrap().len()
     };
     for (case, path, body) in [
         (
@@ -541,7 +579,7 @@ fn a_multimodal_job_appears_in_the_request_metrics() {
             mrope: None,
         },
     };
-    let completion = submit(&served.engine, &metrics, request, &|| false, |_, _| {
+    let completion = submit_one(&served.engine, &metrics, request, &|| false, |_, _| {
         GenerationControl::Continue(())
     })
     .expect("the multimodal job completes");
@@ -902,7 +940,7 @@ fn every_restored_route_answers_on_the_fixture() {
     let rendered_tokens = |content: &str| {
         let msgs = serde_json::json!([{"role": "user", "content": content}]);
         let rendered = model.text().render_chat_value(&msgs, None).unwrap();
-        model.text().encode(&rendered.prompt).unwrap().len()
+        model.text().encode_chat(&rendered).unwrap().len()
     };
     for (route, method, path, body) in [
         ("embeddings", "POST", "/v1/embeddings", r#"{"input":"a"}"#),
@@ -1214,6 +1252,13 @@ fn a_request_invalid_on_its_face_is_a_400_before_the_engine() {
                 "invalid guided regex",
                 format!("{{{fields},\"guided_regex\":\"(\",\"stream\":{stream}}}"),
             ),
+            (
+                "over-long guided regex",
+                format!(
+                    "{{{fields},\"guided_regex\":\"{}\",\"stream\":{stream}}}",
+                    "a".repeat(5000)
+                ),
+            ),
         ];
         for (case, body) in cases {
             let response = roundtrip(&served, &metrics, "POST", path, &body);
@@ -1226,6 +1271,35 @@ fn a_request_invalid_on_its_face_is_a_400_before_the_engine() {
     }
     assert_eq!(metrics.requests_errored.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.inflight.load(Ordering::Relaxed), 0);
+}
+
+/// A `guided_regex` whose automaton would have 2^18 states is refused as a 400 within a second on every
+/// generation route, and the server keeps answering `/health`. Mutation: remove the DFA size limits in
+/// `TextCodec::guided_dfa`; the request builds the automaton and runs far past the deadline.
+#[test]
+fn a_state_explosion_guided_regex_is_a_prompt_400_and_the_server_stays_up() {
+    let model = tiny_model();
+    let metrics = Arc::new(test_metrics("state-explosion"));
+    let (served, queue) = served_over(model, 1);
+    drop(queue);
+    for (path, fields, stream) in GENERATION_ROUTES {
+        let body =
+            format!("{{{fields},\"guided_regex\":\"(a|b)*a(a|b){{17}}\",\"stream\":{stream}}}");
+        let started = Instant::now();
+        let response = roundtrip(&served, &metrics, "POST", path, &body);
+        assert_eq!(
+            status_line(&response),
+            "HTTP/1.1 400 Bad Request",
+            "{path} stream={stream}: {response}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{path} stream={stream}: the refusal took {:?}",
+            started.elapsed()
+        );
+    }
+    let health = roundtrip(&served, &metrics, "GET", "/health", "");
+    assert_eq!(status_line(&health), "HTTP/1.1 200 OK", "{health}");
 }
 
 /// The four generation requests: both routes, streaming and not. `max_tokens` is spliced in as raw JSON
@@ -1373,7 +1447,7 @@ fn a_job_for_a_gone_engine_is_engine_unavailable() {
     let (tx, rx) = mpsc::channel::<EngineMsg>();
     drop(rx);
     let metrics = test_metrics("gone-engine");
-    let error = submit(
+    let error = submit_one(
         &tx,
         &metrics,
         generation_request("a", 1, false),
@@ -1560,7 +1634,7 @@ mod device {
         metrics: &Metrics,
         request: GenerationRequest,
     ) -> Completion {
-        submit(tx, metrics, request, &|| false, |_, _| {
+        submit_one(tx, metrics, request, &|| false, |_, _| {
             GenerationControl::Continue(())
         })
         .expect("the request completes")
@@ -1644,7 +1718,7 @@ mod device {
             },
         };
         request.stream = true;
-        let completion = submit(tx, &metrics, request, &|| false, |piece, _| {
+        let completion = submit_one(tx, &metrics, request, &|| false, |piece, _| {
             pieces.lock().unwrap().push_str(piece);
             GenerationControl::Continue(())
         })
@@ -2034,7 +2108,7 @@ mod device {
         );
 
         // A request that holds the unloaded generation is refused, not served the base weights.
-        let refused = submit(
+        let refused = submit_one(
             tx,
             &metrics,
             greedy_request(PROMPT.to_vec(), stale),

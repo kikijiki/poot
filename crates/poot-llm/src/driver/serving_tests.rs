@@ -1544,3 +1544,209 @@ fn a_device_lost_during_an_encode_step_stays_a_fault() {
         assert_eq!(error.class(), crate::driver::error::FailureClass::Fault);
     }
 }
+
+/// An id equal to the vocabulary size names no embedding row: `open`, `resume` and `open_with_embeds`
+/// each refuse it typed before the sequence holds anything. Mutation: drop the vocabulary check from
+/// `check_admission`'s caller in one entry point; that row opens or resumes the prompt instead.
+#[test]
+fn a_token_id_at_the_vocabulary_size_is_refused_at_every_open_entry() {
+    let bad = [1, 2, VOCAB as u32];
+    let refused = |error: DriverError| {
+        assert!(
+            matches!(
+                error,
+                DriverError::InvalidRequest(InvalidRequest::TokenOutOfVocab {
+                    token,
+                    at: 2,
+                    vocab: VOCAB,
+                }) if token == VOCAB as u32
+            ),
+            "{error:?}"
+        );
+    };
+    let request = |prompt| SeqRequest {
+        prompt,
+        max_new: 2,
+        adapter: AdapterRef::Base,
+    };
+
+    let mut rig = paged_rig(RigOptions::default());
+    rig.driver
+        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[]))
+        .unwrap();
+    let free = rig.driver.free_blocks();
+    refused(rig.driver.open(request(&bad)).unwrap_err());
+    let embeds = crate::driver::PromptEmbeds::new(4, vec![1], vec![0.0; 4]).unwrap();
+    refused(
+        rig.driver
+            .open_with_embeds(request(&bad), embeds)
+            .unwrap_err(),
+    );
+    assert_eq!(rig.driver.free_blocks(), free, "a refusal held no blocks");
+
+    let mut rig = rig_default(picks_one());
+    rig.driver.prepare(&contiguous(&[Head::GREEDY])).unwrap();
+    let seq = open_one(&mut rig, &[1, 2, 3], AdapterRef::Base);
+    refused(rig.driver.resume(seq, &bad, 2).unwrap_err());
+}
+
+/// `max_new = usize::MAX` overflows the prompt-plus-reserve sum: it is the typed `Capacity` refusal at
+/// `open` and `generate`, not an arithmetic panic. Mutation: `+` for `checked_add` in `check_admission`;
+/// the debug build panics on overflow.
+#[test]
+fn an_overflowing_max_new_is_a_capacity_refusal() {
+    let mut rig = paged_rig(RigOptions::default());
+    rig.driver
+        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[]))
+        .unwrap();
+    let expected = DriverError::InvalidRequest(InvalidRequest::Capacity {
+        prompt: 3,
+        max_new: usize::MAX,
+        max: 64,
+    });
+    let error = rig
+        .driver
+        .open(SeqRequest {
+            prompt: &[1, 2, 3],
+            max_new: usize::MAX,
+            adapter: AdapterRef::Base,
+        })
+        .unwrap_err();
+    assert_eq!(format!("{error:?}"), format!("{expected:?}"));
+}
+
+/// A row reset that fails inside `open` leaves the driver as it was: the slot is still free, no
+/// sequence is recorded and the pool holds every block the admission took. Mutation: move the reset
+/// after the slot pop and sequence insert; the slot, the sequence and the blocks leak.
+#[test]
+fn a_failed_row_reset_leaves_no_slot_sequence_or_blocks_behind() {
+    let mut rig = paged_rig(RigOptions {
+        variant: Variant::Recurrent,
+        ..RigOptions::default()
+    });
+    rig.driver
+        .prepare(&shapes(pool(4, 2), &[nz(1)], &[Head::GREEDY], &[]))
+        .unwrap();
+    let before = (
+        rig.driver.serving.as_ref().unwrap().free_slots.clone(),
+        rig.driver.serving.as_ref().unwrap().seqs.len(),
+        rig.driver.free_blocks(),
+    );
+    rig.world.borrow_mut().fail_reset = true;
+    let error = rig
+        .driver
+        .open(SeqRequest {
+            prompt: &[1, 2, 3],
+            max_new: 2,
+            adapter: AdapterRef::Base,
+        })
+        .unwrap_err();
+    assert!(matches!(error, DriverError::Device(_)), "{error:?}");
+    let after = (
+        rig.driver.serving.as_ref().unwrap().free_slots.clone(),
+        rig.driver.serving.as_ref().unwrap().seqs.len(),
+        rig.driver.free_blocks(),
+    );
+    assert_eq!(after, before);
+    rig.world.borrow_mut().fail_reset = false;
+    open_one(&mut rig, &[1, 2, 3], AdapterRef::Base);
+}
+
+/// The adapter lease an `open` took is given back when its row reset fails: the generation can still be
+/// unloaded. Mutation: drop the `lora.release` in `open_seq`'s reset-failure path; the unload is refused.
+#[test]
+fn a_failed_row_reset_gives_the_adapter_lease_back() {
+    let mut rig = lora_rig(RigOptions::default());
+    let g = rig
+        .driver
+        .capture_adapter_set(set(1), &adapters(1))
+        .unwrap();
+    rig.driver
+        .prepare(&ServingShapes {
+            layout: Layout::Contiguous,
+            rows: &[NonZeroUsize::MIN],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[g],
+        })
+        .unwrap();
+    let adapter = AdapterRef::Adapter {
+        generation: g,
+        index: lora_idx(1),
+    };
+    rig.world.borrow_mut().fail_reset = true;
+    let error = rig
+        .driver
+        .open(SeqRequest {
+            prompt: &[1, 2, 3],
+            max_new: 2,
+            adapter,
+        })
+        .unwrap_err();
+    assert!(matches!(error, DriverError::Device(_)), "{error:?}");
+    assert_eq!(rig.driver.serving.as_ref().unwrap().seqs.len(), 0);
+    rig.driver
+        .unload_adapter_set(g)
+        .expect("a failed open holds no lease on the generation");
+}
+
+/// A `resume` whose row reset fails leaves the sequence as it was (tokens, positions done), so the
+/// caller can retry or release it. Mutation: reset after the sequence is rewritten (the old order);
+/// the sequence holds the new prompt while its row is dirty.
+#[test]
+fn a_failed_row_reset_in_resume_leaves_the_sequence_untouched() {
+    let mut rig = rig_default(picks_one());
+    rig.driver.prepare(&contiguous(&[Head::GREEDY])).unwrap();
+    let seq = open_one(&mut rig, &[1, 2, 3], AdapterRef::Base);
+    let held = |rig: &Rig| format!("{:?}", rig.driver.serving.as_ref().unwrap().seqs[&seq]);
+    let before = held(&rig);
+    rig.world.borrow_mut().fail_reset = true;
+    // A prompt sharing nothing with the held one restarts the row from zero.
+    let error = rig.driver.resume(seq, &[4, 5], 2).unwrap_err();
+    assert!(matches!(error, DriverError::Device(_)), "{error:?}");
+    assert_eq!(held(&rig), before);
+}
+
+/// `beam` takes the same admission check as `open`: an overflowing `max_new` and an id at the
+/// vocabulary size are typed refusals. Mutation: the old inline `+` (overflow panic) / no vocabulary
+/// check in `beam`.
+#[test]
+fn beam_refuses_an_overflowing_max_new_and_an_out_of_vocab_id() {
+    let mut rig = rig_default(picks_one());
+    let request = |prompt: Vec<u32>, max_new| crate::driver::BeamRequest {
+        prompt,
+        max_new,
+        width: nz(2),
+        length_penalty: 1.0,
+        ignore_eos: false,
+    };
+    let error = rig
+        .driver
+        .beam(request(vec![1, 2, 3], usize::MAX))
+        .unwrap_err();
+    assert_eq!(
+        format!("{error:?}"),
+        format!(
+            "{:?}",
+            crate::driver::BeamError::from(InvalidRequest::Capacity {
+                prompt: 3,
+                max_new: usize::MAX,
+                max: 64
+            })
+        )
+    );
+    let error = rig
+        .driver
+        .beam(request(vec![1, VOCAB as u32], 2))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::driver::BeamError::Driver(DriverError::InvalidRequest(
+                InvalidRequest::TokenOutOfVocab { at: 1, .. }
+            ))
+        ),
+        "{error:?}"
+    );
+}

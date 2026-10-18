@@ -53,6 +53,21 @@ pub struct LoraAdapterConfig {
     pub use_rslora: bool,
 }
 
+/// The [`LoraAdapterConfig`] of an `adapter_config.json`'s bytes. PEFT's per-module overrides
+/// (`rank_pattern`, `alpha_pattern`) are not part of the struct, so they are read from the raw
+/// document: a non-empty one is refused rather than silently flattened to the one `r`/`lora_alpha`.
+fn parse_adapter_config(bytes: &[u8]) -> Result<LoraAdapterConfig, LoadError> {
+    let document: serde_json::Value = serde_json::from_slice(bytes)?;
+    for field in ["rank_pattern", "alpha_pattern"] {
+        let overrides = document.get(field).filter(|value| !value.is_null());
+        let empty = overrides.is_none_or(|value| value.as_object().is_some_and(|o| o.is_empty()));
+        if !empty {
+            return Err(LoadError::UnsupportedLoraConfig { field });
+        }
+    }
+    Ok(serde_json::from_value(document)?)
+}
+
 impl LoraAdapterConfig {
     /// PEFT's correction scale: `lora_alpha / r` (standard), or `lora_alpha / sqrt(r)` under rslora.
     pub fn scaling(&self) -> f32 {
@@ -92,8 +107,7 @@ impl LoraAdapter {
     /// (`PeftModel.save_pretrained` output). The older pickle `adapter_model.bin` is not supported.
     pub fn load(dir: impl AsRef<Path>) -> Result<Self, LoadError> {
         let dir = dir.as_ref();
-        let config: LoraAdapterConfig =
-            serde_json::from_slice(&std::fs::read(dir.join("adapter_config.json"))?)?;
+        let config = parse_adapter_config(&std::fs::read(dir.join("adapter_config.json"))?)?;
         let store =
             crate::safetensors::load_weight_store_file(dir.join("adapter_model.safetensors"))?;
         Self::from_store(config, &store)
@@ -305,6 +319,30 @@ mod tests {
                 .weights
                 .contains_key("model.layers.0.self_attn.k_proj")
         );
+    }
+
+    /// POOT-1196 SC-006: a non-empty `alpha_pattern` or `rank_pattern` is refused by name; empty ones
+    /// (PEFT writes `{}`) load.
+    #[test]
+    fn per_module_patterns_are_refused() {
+        let config = |extra: serde_json::Value| {
+            let mut doc = serde_json::json!({
+                "r": 8, "lora_alpha": 16.0, "target_modules": ["q_proj"],
+                "alpha_pattern": {}, "rank_pattern": {}
+            });
+            doc.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse_adapter_config(&serde_json::to_vec(&doc).unwrap())
+        };
+        assert!(config(serde_json::json!({})).is_ok());
+        for field in ["alpha_pattern", "rank_pattern"] {
+            let error = config(serde_json::json!({ field: {"q_proj": 4} })).unwrap_err();
+            assert!(
+                matches!(&error, LoadError::UnsupportedLoraConfig { field: f } if *f == field),
+                "{field}: {error}"
+            );
+        }
     }
 
     #[test]

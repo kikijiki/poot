@@ -20,6 +20,17 @@ use crate::lifecycle::ServerDrainTimeout;
 
 /// Connections served at once when `--max-connections` is not given.
 const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+/// Model requests admitted at once (running or waiting for the engine) when `--max-pending-requests` is
+/// not given.
+const DEFAULT_MAX_PENDING_REQUESTS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+/// How many admitted requests may still be receiving their body at once.
+const DEFAULT_MAX_RECEIVING_REQUESTS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+/// The request body cap of every route but a chat that may carry images, in MiB.
+const DEFAULT_MAX_BODY_MIB: usize = 4;
+/// The request body cap of a chat route on a server that takes images, in MiB: room for base64 images.
+const DEFAULT_MAX_IMAGE_BODY_MIB: usize = 64;
+/// The largest body cap a flag accepts, in MiB, so the byte count never overflows.
+const MAX_BODY_MIB: usize = 1024;
 
 /// The most steps `--timing-max-steps` accepts. The engine thread copies the retained detail each time it
 /// publishes (at most every 250 ms); these maxima keep that copy to a few milliseconds
@@ -70,10 +81,6 @@ pub(crate) enum PlacementSpec {
     Tensor { ordinals: Vec<usize> },
 }
 
-/// The idle bound on reading a request, or none (`--read-timeout-secs 0`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReadTimeout(pub(crate) Option<Duration>);
-
 /// The command line, parsed into typed values. Every field's parser is strict.
 #[derive(Debug, Parser)]
 #[command(
@@ -83,7 +90,9 @@ pub(crate) struct ReadTimeout(pub(crate) Option<Duration>);
 pub(crate) struct ServeConfig {
     /// Model directory or GGUF file; default: `qwen2.5-0.5b` under `POOT_MODELS_DIR`.
     pub(crate) model: Option<String>,
-    /// Listen address.
+    /// Listen address. A request's `Host` must name it: a loopback address accepts `localhost`, `127.0.0.1`
+    /// and `[::1]`, a specific address only itself, and a wildcard address (`0.0.0.0`, `[::]`) checks only
+    /// the port, since it cannot know which names reach the machine.
     #[arg(default_value = "127.0.0.1:8080")]
     pub(crate) addr: String,
     /// The device backend: wgpu, rocm, ptx, vulkan, or auto (PTX if a CUDA device opens, else ROCm if an
@@ -145,20 +154,67 @@ pub(crate) struct ServeConfig {
         value_parser = parse_count
     )]
     pub(crate) max_connections: usize,
-    /// Idle seconds a request read may stall before the connection closes; 0 disables the bound.
+    /// Most model requests admitted at once, running or waiting for the engine; one more is answered 429
+    /// without its body being read. At least 1.
     #[arg(
         long,
-        value_name = "SECS",
-        default_value = "30",
-        value_parser = parse_read_timeout
+        value_name = "N",
+        default_value_t = DEFAULT_MAX_PENDING_REQUESTS,
+        value_parser = parse_pending_requests
     )]
-    pub(crate) read_timeout_secs: ReadTimeout,
-    /// Idle seconds a response write may block before the connection closes; at least 1.
+    pub(crate) max_pending_requests: NonZeroUsize,
+    /// Most admitted requests that may be reading their body at once; a request that would be one more is
+    /// answered 429 before its body is read. Smaller than `--max-pending-requests` by default, so clients
+    /// that send slowly cannot hold every slot while no work reaches the engine. At least 1.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_MAX_RECEIVING_REQUESTS,
+        value_parser = parse_pending_requests
+    )]
+    pub(crate) max_receiving_requests: NonZeroUsize,
+    /// Seconds an admitted generation request may wait for the engine to open it; a request still queued
+    /// then is answered 503. At least 1.
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value = "60",
+        value_parser = parse_positive_secs
+    )]
+    pub(crate) max_queue_wait_secs: Duration,
+    /// Largest request body, in MiB, of every route but a chat on a server that takes images. A larger
+    /// `Content-Length` is answered 413 before the body is read.
+    #[arg(
+        long,
+        value_name = "MIB",
+        default_value_t = DEFAULT_MAX_BODY_MIB,
+        value_parser = parse_body_mib
+    )]
+    pub(crate) max_body_mib: usize,
+    /// Largest request body, in MiB, of a chat on a server that takes images (a vision-language model).
+    #[arg(
+        long,
+        value_name = "MIB",
+        default_value_t = DEFAULT_MAX_IMAGE_BODY_MIB,
+        value_parser = parse_body_mib
+    )]
+    pub(crate) max_image_body_mib: usize,
+    /// Seconds from accept in which the whole request, head and body, must arrive; a client that is still
+    /// sending then is answered 408 and closed. At least 1.
     #[arg(
         long,
         value_name = "SECS",
         default_value = "30",
-        value_parser = parse_write_timeout
+        value_parser = parse_positive_secs
+    )]
+    pub(crate) request_timeout_secs: Duration,
+    /// Seconds one response write (a whole response or one stream frame) may take before the connection
+    /// closes, however slowly the reader drains it; at least 1.
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value = "30",
+        value_parser = parse_positive_secs
     )]
     pub(crate) write_timeout_secs: Duration,
     /// Seconds in-flight requests get to finish after a shutdown signal; 1 to 86400.
@@ -312,12 +368,16 @@ fn parse_count(raw: &str) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("is too large, got {raw:?}"))
 }
 
-fn parse_read_timeout(raw: &str) -> Result<ReadTimeout, String> {
-    let secs = whole_number(raw)?;
-    Ok(ReadTimeout((secs > 0).then(|| Duration::from_secs(secs))))
+fn parse_pending_requests(raw: &str) -> Result<NonZeroUsize, String> {
+    positive(raw, "the pending request count")
 }
 
-fn parse_write_timeout(raw: &str) -> Result<Duration, String> {
+/// A body cap in MiB: positive, and small enough that the byte count is exact.
+fn parse_body_mib(raw: &str) -> Result<usize, String> {
+    bounded_count(raw, MAX_BODY_MIB)
+}
+
+fn parse_positive_secs(raw: &str) -> Result<Duration, String> {
     match whole_number(raw)? {
         0 => Err("must be greater than zero, got 0".to_string()),
         secs => Ok(Duration::from_secs(secs)),

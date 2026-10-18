@@ -11,7 +11,7 @@ use poot_text::ChatTemplateOverride;
 
 use super::*;
 use crate::admin::{LoraAdminDenial, LoraAdminPolicyMode};
-use crate::config::{ReadTimeout, ServeConfig};
+use crate::config::ServeConfig;
 use crate::http::AuthorizationHeader;
 
 fn parse(flags: &[&str]) -> Result<ServeConfig, String> {
@@ -59,10 +59,10 @@ fn defaults_are_the_documented_ones() {
     assert_eq!(config.draft_model, None);
     assert_eq!(config.rate_limit_rpm, 0);
     assert_eq!(config.max_connections, 4096);
-    assert_eq!(
-        config.read_timeout_secs,
-        ReadTimeout(Some(Duration::from_secs(30)))
-    );
+    assert_eq!(config.max_pending_requests.get(), 256);
+    assert_eq!(config.max_body_mib, 4);
+    assert_eq!(config.max_image_body_mib, 64);
+    assert_eq!(config.request_timeout_secs, Duration::from_secs(30));
     assert_eq!(config.write_timeout_secs, Duration::from_secs(30));
     assert_eq!(
         config.drain_timeout_secs.duration(),
@@ -83,8 +83,14 @@ fn flags_set_their_fields() {
         "60",
         "--max-connections",
         "0",
-        "--read-timeout-secs",
-        "0",
+        "--max-pending-requests",
+        "8",
+        "--max-body-mib",
+        "2",
+        "--max-image-body-mib",
+        "16",
+        "--request-timeout-secs",
+        "5",
         "--write-timeout-secs",
         " 7 ",
         "--drain-timeout-secs",
@@ -97,7 +103,10 @@ fn flags_set_their_fields() {
     assert_eq!(config.backend, BackendChoice::Vulkan);
     assert_eq!(config.rate_limit_rpm, 60);
     assert_eq!(config.max_connections, 0);
-    assert_eq!(config.read_timeout_secs, ReadTimeout(None));
+    assert_eq!(config.max_pending_requests.get(), 8);
+    assert_eq!(config.max_body_mib, 2);
+    assert_eq!(config.max_image_body_mib, 16);
+    assert_eq!(config.request_timeout_secs, Duration::from_secs(5));
     assert_eq!(config.write_timeout_secs, Duration::from_secs(7));
     assert_eq!(
         config.drain_timeout_secs.duration(),
@@ -150,10 +159,22 @@ fn an_invalid_value_for_any_field_is_a_startup_error() {
         (&["--max-connections", "garbage"], "must be a whole number"),
         (&["--max-connections=-5"], "non-negative"),
         (
-            &["--read-timeout-secs", "garbage"],
+            &["--request-timeout-secs", "garbage"],
             "must be a whole number",
         ),
-        (&["--read-timeout-secs=-1"], "non-negative"),
+        (&["--request-timeout-secs=-1"], "non-negative"),
+        (&["--request-timeout-secs", "0"], "greater than zero"),
+        (&["--max-pending-requests", "0"], "not a positive integer"),
+        (
+            &["--max-pending-requests", "many"],
+            "not a positive integer",
+        ),
+        (&["--max-body-mib", "0"], "greater than zero"),
+        (&["--max-body-mib", "1025"], "at most 1024"),
+        (
+            &["--max-image-body-mib", "garbage"],
+            "must be a whole number",
+        ),
         (&["--write-timeout-secs", "0"], "greater than zero"),
         (&["--write-timeout-secs=-1"], "non-negative"),
         (
@@ -347,21 +368,22 @@ fn config_under_environment_child() {
     };
     let flags: Vec<&str> = flags.split_whitespace().collect();
     let config = config(&flags);
-    let transport = Transport::of(&config);
+    let transport = Transport::of(&config, "127.0.0.1:8080".parse().unwrap());
     let args = engine_args(&config, DraftPolicy::Off);
     let policy = config
         .lora_admin_policy(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         .expect("a policy");
     let bearer = AuthorizationHeader::Single("Bearer env-admin-key".to_string());
     println!(
-        "CONFIG {:?} | {:?} | {:?} | rpm={} max_connections={} read={:?} write={:?} drain={:?} | {:?} | \
+        "CONFIG {:?} | {:?} | {:?} | rpm={} max_connections={} request={:?} bodies={:?} write={:?} drain={:?} | {:?} | \
          mode={:?} env_key={:?} missing={:?}",
         config,
         config.telemetry(),
         config.load_options().chat_template,
-        transport.limiter.rpm,
+        transport.limits.limiter.rpm,
         transport.max_connections,
-        transport.read_timeout,
+        transport.limits.request_timeout,
+        transport.limits.bodies,
         transport.write_timeout,
         transport.drain_timeout,
         args,
@@ -417,7 +439,8 @@ fn former_mode_variables_have_no_effect_and_the_typed_flags_do() {
         ("POOT_TP_GPUS", "2", "", ""),
         ("POOT_RATE_LIMIT_RPM", "60", "--rate-limit-rpm", "60"),
         ("POOT_MAX_CONNECTIONS", "7", "--max-connections", "7"),
-        ("POOT_READ_TIMEOUT_SECS", "5", "--read-timeout-secs", "5"),
+        ("POOT_READ_TIMEOUT_SECS", "5", "--request-timeout-secs", "5"),
+        ("POOT_MAX_BODY_MIB", "1", "--max-body-mib", "1"),
         ("POOT_WRITE_TIMEOUT_SECS", "5", "--write-timeout-secs", "5"),
         ("POOT_DRAIN_TIMEOUT_SECS", "5", "--drain-timeout-secs", "5"),
         (

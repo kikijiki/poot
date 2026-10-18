@@ -43,7 +43,11 @@ equation, so long prompts run in smaller chunks.
 
 `ModelHandle::load` packs quantized projections directly from their stored tensors, for every dense family
 the registry knows; GPTQ/AWQ projections need no opt-in loader to avoid a dense f32 copy. Supported configuration variants are
-GPTQ 4-bit symmetric with `desc_act: false`, and AWQ 4-bit GEMM. Unsupported variants are refused.
+GPTQ 4-bit symmetric with `desc_act: false` in the v1 checkpoint format, and AWQ 4-bit GEMM with zero points.
+Unsupported variants are refused by name: a GPTQModel `checkpoint_format: gptq_v2` checkpoint (its zeros would decode
+one unit off) and AWQ with `zero_point: false` are refused at load, naming the config field and value. A LoRA adapter whose
+`adapter_config.json` sets a non-empty `rank_pattern` or `alpha_pattern` (per-module rank or alpha) is refused by name,
+since poot applies the one `r` and `lora_alpha` to every target module.
 
 There is one loader. It keeps the checkpoint's other BF16/F16 weights as stored words and holds no
 widened f32 copy of them. Loading is therefore not a promise that all temporary device allocations stay

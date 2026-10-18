@@ -413,6 +413,18 @@ docs-check:
     fi
     echo "-- docs/ path references --"
     just docs-paths || rc=1
+    echo "-- architecture guide (layer table, stale claims, checked-against sha) --"
+    # The guide and overview live in Backstage, a sibling checkout. A missing checkout fails the stage;
+    # POOT_SKIP_ARCHITECTURE_DOC=1 is the explicit opt-out for a clone that has none.
+    if [ -d ../backstage/projects/poot ]; then
+        python3 scripts/check-architecture-doc.py --self-test || rc=1
+        python3 scripts/check-architecture-doc.py || rc=1
+    elif [ "${POOT_SKIP_ARCHITECTURE_DOC:-}" = 1 ]; then
+        echo "../backstage not found: skipped by POOT_SKIP_ARCHITECTURE_DOC=1"
+    else
+        echo "../backstage not found: clone it beside this repo, or set POOT_SKIP_ARCHITECTURE_DOC=1"
+        rc=1
+    fi
     echo "-- ascii (no em-dashes / non-ascii) --"
     if grep -nP '[^\x00-\x7F]' $files; then
         echo "non-ASCII characters found (see above) - replace with ASCII equivalents"

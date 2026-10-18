@@ -1,7 +1,7 @@
 //! Server metrics: latency histograms, counters, gauges, and their JSON/Prometheus rendering.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use poot_llm::driver::RowSpeculation;
@@ -232,11 +232,17 @@ impl TimingMetrics {
     /// export is a fixed-size summary, so a reader that never comes retains nothing.
     pub(crate) fn publish(&self, snapshot: &TimingSnapshot) {
         let export = TimingExport::of(snapshot);
-        *self.published.lock().unwrap() = export;
+        *self
+            .published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = export;
     }
 
     pub(crate) fn export(&self) -> TimingExport {
-        self.published.lock().unwrap().clone()
+        self.published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn mode(&self) -> &'static str {
@@ -447,7 +453,7 @@ impl Metrics {
     }
 
     pub(crate) fn json(&self) -> String {
-        let mut sys = self.sys.lock().unwrap();
+        let mut sys = self.sys.lock().unwrap_or_else(PoisonError::into_inner);
         sys.refresh_memory();
         sys.refresh_cpu_usage();
         let mb = |bytes: u64| bytes / (1024 * 1024);
@@ -502,7 +508,7 @@ impl Metrics {
     /// Prometheus text-exposition rendering (`GET /metrics/prometheus`). Counters are `_total`; the decode path is a
     /// labelled gauge. The JSON form stays on `/metrics`.
     pub(crate) fn prometheus(&self) -> String {
-        let mut sys = self.sys.lock().unwrap();
+        let mut sys = self.sys.lock().unwrap_or_else(PoisonError::into_inner);
         sys.refresh_memory();
         sys.refresh_cpu_usage();
         let mb = |bytes: u64| bytes / (1024 * 1024);

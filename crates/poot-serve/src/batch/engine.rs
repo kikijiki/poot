@@ -651,6 +651,7 @@ impl<E: ServeEngine> Scheduler<'_, E> {
         for _ in self.waiting.len()..before {
             self.count_cancelled();
         }
+        self.fail_overdue();
         let before = self.encodes.len();
         self.encodes
             .retain(|job| !job.cancel.load(Ordering::SeqCst));
@@ -662,6 +663,25 @@ impl<E: ServeEngine> Scheduler<'_, E> {
             self.finish(slot, SlotFate::Cancelled)?;
         }
         Ok(())
+    }
+
+    /// Fail the waiting requests the engine has not opened by their `start_by`, as unavailable: a request
+    /// does not queue without bound behind a long-running one.
+    fn fail_overdue(&mut self) {
+        let now = Instant::now();
+        let (overdue, waiting): (VecDeque<Job>, VecDeque<Job>) = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .partition(|job| now >= job.start_by);
+        self.waiting = waiting;
+        for job in overdue {
+            let waited = job.submitted.elapsed().as_secs();
+            reject_job(
+                job,
+                self.metrics,
+                FailureClass::Unsupported,
+                format!("the request waited {waited} s for the engine and was not started"),
+            );
+        }
     }
 
     /// Run the queued encode and administration jobs once no sequence is open: an encode step shares

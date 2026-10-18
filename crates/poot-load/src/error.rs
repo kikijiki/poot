@@ -43,12 +43,47 @@ pub enum LoadError {
         second: String,
     },
     /// Two tensors in one checkpoint share a name.
-    #[error("duplicate safetensors tensor name {name:?} {scope}")]
+    #[error("duplicate tensor name {name:?} {scope}")]
     DuplicateTensorName {
         /// The repeated tensor name.
         name: String,
-        /// Where the repeat was found (`"within one header"` or `"across model shards"`).
+        /// Where the repeat was found (`"within one header"`, `"across model shards"` or `"within one GGUF directory"`).
         scope: String,
+    },
+    /// A GGUF header lists one metadata key twice, so which value is meant is ambiguous.
+    #[error("duplicate gguf metadata key {key:?}")]
+    DuplicateGgufMetadataKey {
+        /// The repeated key.
+        key: String,
+    },
+    /// `general.alignment` is not a non-zero power of two (or not an integer), so the tensor data
+    /// start cannot be computed.
+    #[error("gguf general.alignment = {value}: must be a non-zero power of two")]
+    InvalidGgufAlignment {
+        /// The rejected value, as the file spells it.
+        value: String,
+    },
+    /// A shard index names a file that is not a bare file name inside the model directory.
+    #[error("shard index names {name:?}: a shard must be a plain file name in the model directory")]
+    UnsafeShardName {
+        /// The shard name as the index spells it.
+        name: String,
+    },
+    /// A `quantization_config` field names a variant poot has no decoder for (a silent decode with
+    /// the wrong convention is worse than a refusal): `field` is the config key, `value` what it carried.
+    #[error("quant config {field} = {value}: unsupported")]
+    UnsupportedQuantConfig {
+        /// The `quantization_config` key.
+        field: &'static str,
+        /// The rejected value.
+        value: String,
+    },
+    /// An `adapter_config.json` field asks for behaviour the adapter loader does not apply, so loading
+    /// the adapter would silently ignore it.
+    #[error("adapter_config.json {field}: unsupported, per-module overrides are not applied")]
+    UnsupportedLoraConfig {
+        /// The `adapter_config.json` key.
+        field: &'static str,
     },
     /// `config.json` has no `rope_theta` and the model type has no reference default to fall back to.
     #[error("config has no rope_theta and model_type {model_type:?} has no reference default")]

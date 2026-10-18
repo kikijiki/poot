@@ -58,17 +58,22 @@ const VOCAB: usize = 32;
 /// The qwen2 decode graph of the fixture over `CAP` positions: Model::trace of the registry's qwen2
 /// family at 16 hidden, 4 heads over 2 key-value heads, F32 consts.
 fn decode_graph() -> Graph {
+    decode_graph_over(CAP)
+}
+
+/// [`decode_graph`] over `cap` positions.
+fn decode_graph_over(cap: usize) -> Graph {
     let m = Dense::new(Family::Qwen2)
         .vocab(VOCAB)
         .dims(16, 32, 2)
         .heads(4, 2)
         .head_dim(4)
-        .max_positions(16)
+        .max_positions(cap.max(16))
         .f32_model();
     m.model
         .trace(
             Phase::Decode,
-            step(1, 1, CAP, LogitRows::Last),
+            step(1, 1, cap, LogitRows::Last),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -255,6 +260,48 @@ fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
     );
     let ExecutorStats { recordings, .. } = engine.stats();
     assert_eq!(recordings, 1, "one entry, one recording after CAP steps");
+}
+
+/// POOT-1209: decode attention is bounded by the live length `pos + 1`. A 24-position cache stepped through
+/// every position on `Engine<RocmDevice>`, so the first (`pos` 0, a length of one), 15 and the last
+/// (`capacity - 1`, a full length) are all compared with the CPU oracle, each step reading what the earlier
+/// ones wrote (the oracle's own greedy token feeds both). The CPU oracle runs the same graph, so this row
+/// proves the device's live-bound attention kernel; the length itself is pinned against an independent f64
+/// reference by `components::attention`'s
+/// `a_decode_token_attends_to_exactly_its_live_prefix_at_the_first_a_middle_and_the_last_position`.
+#[test]
+fn live_bound_decode_matches_the_oracle_at_the_first_a_middle_and_the_last_position() {
+    const LIVE_CAP: usize = 24;
+    let Some(device) = require_rocm() else {
+        return;
+    };
+    let target = device.target();
+    let mut engine = Engine::new(device);
+    let g = decode_graph_over(LIVE_CAP);
+    let store = store_for(&g);
+    let mut weights = ConstWeights::new(&store);
+    let named = weights.graph(&g);
+    let exe = engine
+        .load_weights(store.clone(), Arc::new(weights.map()))
+        .unwrap();
+    let entry = engine
+        .add_entry(exe, &decode_staged(&named, target))
+        .unwrap();
+    let mut state: HashMap<String, HostTensor> = HashMap::new();
+    let mut token = 3u32 % VOCAB as u32;
+    for pos in 0..LIVE_CAP {
+        let inputs = decode_slot_inputs(&g, token, pos, LIVE_CAP);
+        let got = bytemuck_f32(
+            &engine
+                .step(exe, entry, &inputs, &mut NoSync)
+                .unwrap()
+                .read()
+                .unwrap(),
+        );
+        let expected = oracle_decode_step(&g, &store, &mut state, token, pos, LIVE_CAP);
+        assert_close_rel(&got, &expected, 1e-3);
+        token = argmax(&expected);
+    }
 }
 
 fn argmax(logits: &[f32]) -> u32 {

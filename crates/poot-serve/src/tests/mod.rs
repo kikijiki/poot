@@ -37,10 +37,10 @@ use crate::handlers::{
     account_generation_error, handle_chat, sse_write_probe, stream_chat, stream_completion,
     stream_receipt,
 };
-use crate::http::test_only::{RequestRead, read_request, read_request_from};
+use crate::http::test_only::{read_request, read_request_from};
 use crate::http::{
-    ConnGuard, MAX_BODY_BYTES, MAX_HEADER_BYTES, RateLimiter, body_len_ok,
-    configure_response_writes, error_body, handle, model_object, read_request_for_routing, respond,
+    BodyCaps, ConnGuard, HostPolicy, Limits, MAX_HEADER_BYTES, RateLimiter, ReadFailure, Refusal,
+    RequestQueue, configure_response_writes, error_body, handle, model_object, respond,
     respond_error, respond_typed,
 };
 use crate::lifecycle::{
@@ -55,6 +55,7 @@ use crate::types::{
 use poot_llm::driver::stops::StopScanner;
 
 mod admin;
+mod admission;
 mod config;
 mod drain;
 pub(crate) mod encoder_routes;
@@ -198,6 +199,7 @@ pub(crate) fn served_over(
         view: EngineView::new(test_caps(rows)),
         pooling: Pooling::Mean,
         images: None,
+        max_queue_wait: TEST_QUEUE_WAIT,
     };
     (Arc::new(served), queue)
 }
@@ -234,6 +236,56 @@ pub(crate) fn tiny_model() -> Arc<ModelHandle> {
     let model = load_handle(&path);
     let _ = std::fs::remove_file(&path);
     model
+}
+
+/// The text body cap of [`test_limits`], in bytes.
+pub(crate) const BODY_CAP: usize = 4 * 1024 * 1024;
+
+/// The limits a request is served under when the test is not about one of them: no rate limit, and
+/// queue, bodies and arrival time ample.
+pub(crate) fn test_limits() -> Limits {
+    test_limits_with(256, Duration::from_secs(30))
+}
+
+/// [`test_limits`] with the request queue holding `queue` requests and `request_timeout` to arrive in.
+pub(crate) fn test_limits_with(queue: usize, request_timeout: Duration) -> Limits {
+    Limits {
+        limiter: RateLimiter::new(0),
+        queue: RequestQueue::new(
+            std::num::NonZeroUsize::new(queue).expect("a queue of one or more"),
+        ),
+        receiving: RequestQueue::new(
+            std::num::NonZeroUsize::new(queue).expect("a queue of one or more"),
+        ),
+        bodies: BodyCaps {
+            text: BODY_CAP,
+            images: 64 * 1024 * 1024,
+        },
+        hosts: HostPolicy::for_listener("127.0.0.1:0".parse().expect("a socket address")),
+        request_timeout,
+    }
+}
+
+/// The queue wait a test's jobs are given: ample.
+pub(crate) const TEST_QUEUE_WAIT: Duration = Duration::from_secs(60);
+
+/// One generation job through [`submit`]: an `n = 1` request.
+pub(crate) fn submit_one(
+    tx: &mpsc::Sender<EngineMsg>,
+    metrics: &Metrics,
+    request: GenerationRequest,
+    client_gone: &dyn Fn() -> bool,
+    mut on_token: impl FnMut(&str, PerTokenInfo) -> GenerationControl,
+) -> std::result::Result<Completion, GenerationError> {
+    submit(
+        tx,
+        metrics,
+        TEST_QUEUE_WAIT,
+        vec![request],
+        client_gone,
+        |_, piece, info| on_token(piece, info),
+    )
+    .map(|mut completions| completions.remove(0))
 }
 
 /// A generation request over the tokens of `prompt` (one token per character).
@@ -461,6 +513,23 @@ pub(crate) fn load_handle(path: &std::path::Path) -> Arc<ModelHandle> {
     )
 }
 
+/// The model of the tiny GGUF fixture rendering every chat through `template` instead of its own.
+pub(crate) fn tiny_model_with_chat_template(template: &str) -> Arc<ModelHandle> {
+    let path = write_tiny_gguf();
+    let options = LoadOptions {
+        chat_template: Some(poot_text::ChatTemplateOverride::Jinja(template.to_string())),
+        ..LoadOptions::default()
+    };
+    let model = ModelHandle::load(
+        &path,
+        &Registry::builtin().expect("shipped families register disjoint keys"),
+        &options,
+    )
+    .expect("load the model");
+    let _ = std::fs::remove_file(&path);
+    Arc::new(model)
+}
+
 /// A minimal `Metrics` for the card 201 tests: only `model` varies; every counter/histogram starts at zero. Mirrors the inline construction in `prometheus_exposition_is_well_formed`.
 pub(crate) fn test_metrics(model: &str) -> Metrics {
     Metrics {
@@ -542,7 +611,7 @@ fn run_lora_admin_socket(
     client
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("bound admin response read");
-    let (mut server, _) = listener
+    let (server, _) = listener
         .accept()
         .expect("accept admin trust-boundary client");
 
@@ -552,19 +621,27 @@ fn run_lora_admin_socket(
         .collect::<String>();
     write!(
         client,
-        "{method} {path} HTTP/1.1\r\nContent-Length: {}\r\n{authorization_headers}\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization_headers}\r\n{body}",
         body.len()
     )
     .expect("write admin request");
     client.flush().expect("flush admin request");
+    // The handler runs on this thread, so the client finishes its side before it: a refused request is
+    // closed only once the client is done sending.
+    client
+        .shutdown(std::net::Shutdown::Write)
+        .expect("finish the admin request");
 
-    assert!(
-        read_request_for_routing(&mut server, served, policy)
-            .expect("stage and handle admin request")
-            .is_none(),
-        "an admin target must be consumed before ordinary routing"
-    );
-    drop(server);
+    handle(
+        server,
+        Instant::now(),
+        served,
+        &EngineHealth::serving_for_test("fake", 4, 64),
+        &test_metrics("admin-socket"),
+        &test_limits(),
+        policy,
+    )
+    .expect("stage and handle admin request");
 
     let mut response = String::new();
     client
@@ -589,13 +666,20 @@ fn run_denied_lora_admin_head_without_body(
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("bound immediate denial read");
-    let (mut server, _) = listener.accept().expect("accept head-first admin client");
-    server
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .expect("make an accidental body read fail promptly");
+    let (server, _) = listener.accept().expect("accept head-first admin client");
 
-    let handler =
-        std::thread::spawn(move || read_request_for_routing(&mut server, &served, &policy));
+    // An accidental body read ends at the request deadline instead of hanging the test.
+    let handler = std::thread::spawn(move || {
+        handle(
+            server,
+            Instant::now(),
+            &served,
+            &EngineHealth::serving_for_test("fake", 4, 64),
+            &test_metrics("head-first"),
+            &test_limits_with(256, Duration::from_millis(500)),
+            &policy,
+        )
+    });
 
     let authorization_headers = authorization
         .iter()
@@ -603,7 +687,7 @@ fn run_denied_lora_admin_head_without_body(
         .collect::<String>();
     write!(
         client,
-        "{method} {path} HTTP/1.1\r\nContent-Length: {content_length}\r\n{authorization_headers}\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\n{authorization_headers}\r\n"
     )
     .expect("write only unauthorized admin request head");
     client.flush().expect("flush unauthorized admin head");
@@ -612,14 +696,10 @@ fn run_denied_lora_admin_head_without_body(
     client
         .read_to_string(&mut response)
         .expect("denial must arrive while the declared body is withheld");
-    assert!(
-        handler
-            .join()
-            .expect("join head-first handler")
-            .expect("head-first request handling")
-            .is_none(),
-        "a denied admin request is fully handled"
-    );
+    handler
+        .join()
+        .expect("join head-first handler")
+        .expect("a denied admin request is fully handled");
     response
 }
 
@@ -704,7 +784,7 @@ fn run_write_deadline_stream_case(case: WriteDeadlineClientCase) {
                     .send(header_result.as_ref().map(|_| ()).map_err(|e| e.kind()))
                     .expect("announce SSE header result");
                 header_result.map_err(|error| error.to_string()).and_then(|_| {
-                    submit(
+                    submit_one(
                         &job_tx,
                         &metrics,
                         generation_request("write deadline", 2, true),

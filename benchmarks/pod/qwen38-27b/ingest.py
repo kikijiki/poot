@@ -9,7 +9,7 @@ Usage: python -I ingest.py <sweep-results-dir> <snapshot-dir> --run-id ID --mode
            [--note TEXT] [--caveat TEXT]...
 
 Each --caveat is recorded verbatim on the row (run-specific facts - why a baseline is missing, a known defect - come
-from the caller, not from this script). logs/oracle_receipt.* are copied into the snapshot when present.
+from the caller, not from this script). logs/oracle_receipt.* and the small serve_*.err logs are copied into the snapshot when present.
 """
 
 import argparse
@@ -97,8 +97,11 @@ def main():
     for name in ("summary.tsv", "phases.tsv", "commands.tsv", "env.txt", "model-revisions.txt"):
         shutil.copy(sweep / name, snap / name)
     (snap / "logs").mkdir()
-    for log in sorted((sweep / "logs").glob("oracle_receipt.*")):
-        shutil.copy(log, snap / "logs" / log.name)
+    # The logs that explain a missing row: the oracle receipt and a server that failed to start.
+    for pattern in ("oracle_receipt.*", "serve_*.err"):
+        for log in sorted((sweep / "logs").glob(pattern)):
+            if pattern == "oracle_receipt.*" or log.stat().st_size < 1_000_000:
+                shutil.copy(log, snap / "logs" / log.name)
 
 
 if __name__ == "__main__":

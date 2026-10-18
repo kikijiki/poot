@@ -13,8 +13,8 @@ use poot_llm::{GenerationControl, Sampler};
 
 use crate::metrics::Metrics;
 use crate::types::{
-    AdminError, AdminJob, AdminReply, AdminRequest, Completion, EncodeJob, EncodeReply, EncodeRow,
-    EngineMsg, GenEvent, GenerationError, Job, PerTokenInfo, PromptInput,
+    AdminError, AdminJob, AdminReply, AdminRequest, ChoiceReply, Completion, EncodeJob,
+    EncodeReply, EncodeRow, EngineMsg, GenEvent, GenerationError, Job, PerTokenInfo, PromptInput,
 };
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -329,9 +329,8 @@ impl Drop for JobGuard {
     }
 }
 
-/// Whether the client that waits for a job has gone: polled while the job waits. `Sync`, because a request's
-/// `n` choices wait on their own threads and share it.
-pub(crate) type ClientGone<'a> = &'a (dyn Fn() -> bool + Sync);
+/// Whether the client that waits for a job has gone: polled while the job waits.
+pub(crate) type ClientGone<'a> = &'a dyn Fn() -> bool;
 
 /// What one generation job asks of the engine: the request-to-job conversion every route shares.
 pub(crate) struct GenerationRequest {
@@ -370,59 +369,126 @@ fn next_reply<T>(
     }
 }
 
-/// Submit a generation job and block until it finishes, returning its [`Completion`]. `on_token`
-/// receives each streamed piece with its [`PerTokenInfo`]; non-streaming callers return
-/// `GenerationControl::Continue(())`. `Break(())` (e.g. after a client socket write fails) makes `submit`
-/// return early. However `submit` returns, the job's [`JobGuard`] drops and the engine releases the
-/// request within one step.
-///
-/// A finished request is recorded in the request metrics here, once, whatever route it came from.
-pub(crate) fn submit(
-    tx: &Sender<EngineMsg>,
-    metrics: &Metrics,
-    request: GenerationRequest,
-    client_gone: ClientGone<'_>,
-    mut on_token: impl FnMut(&str, PerTokenInfo) -> GenerationControl,
-) -> std::result::Result<Completion, GenerationError> {
-    let GenerationRequest {
-        prompt,
-        max_new,
-        sampler,
-        stop,
-        stream,
-        lora_adapter,
-    } = request;
-    let (reply, rx) = mpsc::channel();
-    let (_guard, cancel) = JobGuard::new();
-    let start = Instant::now();
-    tx.send(EngineMsg::Generate(Box::new(Job {
-        prompt,
-        max_new,
-        sampler,
-        stop,
-        stream,
-        reply,
-        submitted: start,
-        lora_adapter,
-        cancel,
-    })))
-    .map_err(|_| GenerationError::EngineUnavailable)?;
-    let mut ttft_ms = None;
-    loop {
-        match next_reply(&rx, client_gone)? {
+/// How long the wait for a request's replies parks on their channel; also how often the wait asks whether
+/// the client has hung up.
+const REPLY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// One choice of a generation request while it runs on the engine. Dropping it cancels the job.
+struct ChoiceInFlight {
+    started: Instant,
+    ttft_ms: Option<f64>,
+    completion: Option<Completion>,
+    _guard: JobGuard,
+}
+
+impl ChoiceInFlight {
+    /// Take one event of choice `index`: a piece goes to `on_token`, a terminal event ends the choice.
+    fn accept(
+        &mut self,
+        index: usize,
+        event: GenEvent,
+        metrics: &Metrics,
+        on_token: &mut impl FnMut(usize, &str, PerTokenInfo) -> GenerationControl,
+    ) -> std::result::Result<(), GenerationError> {
+        match event {
             GenEvent::Token(piece, info) => {
-                ttft_ms.get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
-                if on_token(&piece, info).is_break() {
+                self.ttft_ms
+                    .get_or_insert_with(|| self.started.elapsed().as_secs_f64() * 1000.0);
+                if on_token(index, &piece, info).is_break() {
                     return Err(GenerationError::ClientCancelled);
                 }
             }
             GenEvent::Done(completion) => {
-                metrics.record_request(start.elapsed().as_secs_f64() * 1000.0, ttft_ms);
-                return Ok(completion);
+                metrics.record_request(self.started.elapsed().as_secs_f64() * 1000.0, self.ttft_ms);
+                self.completion = Some(completion);
             }
             GenEvent::Failed(failure) => return Err(GenerationError::EngineFailed(failure)),
         }
+        Ok(())
     }
+}
+
+/// Submit one generation job per request (the `n` choices of one HTTP request) and block until every
+/// one finishes, returning their [`Completion`]s in request order. The choices share one reply channel,
+/// so this thread waits on a single receiver however many there are. `on_token` receives each streamed
+/// piece with its choice index and [`PerTokenInfo`]; non-streaming callers return
+/// `GenerationControl::Continue(())`. `Break(())` (e.g. after a client socket write fails) makes `submit`
+/// return early, as does the first choice that fails. However `submit` returns, every job's [`JobGuard`]
+/// drops and the engine releases the requests within one step. A job the engine has not opened within
+/// `max_queue_wait` is failed by the engine as unavailable.
+///
+/// A finished choice is recorded in the request metrics here, once, whatever route it came from.
+pub(crate) fn submit(
+    tx: &Sender<EngineMsg>,
+    metrics: &Metrics,
+    max_queue_wait: Duration,
+    requests: Vec<GenerationRequest>,
+    client_gone: ClientGone<'_>,
+    mut on_token: impl FnMut(usize, &str, PerTokenInfo) -> GenerationControl,
+) -> std::result::Result<Vec<Completion>, GenerationError> {
+    let (replies, events) = ChoiceReply::channel(requests.len());
+    let mut choices = Vec::with_capacity(requests.len());
+    for (request, reply) in requests.into_iter().zip(replies) {
+        let GenerationRequest {
+            prompt,
+            max_new,
+            sampler,
+            stop,
+            stream,
+            lora_adapter,
+        } = request;
+        let (guard, cancel) = JobGuard::new();
+        let started = Instant::now();
+        // A choice whose send fails returns here, and the guards of the choices already queued cancel them.
+        tx.send(EngineMsg::Generate(Box::new(Job {
+            prompt,
+            max_new,
+            sampler,
+            stop,
+            stream,
+            reply,
+            submitted: started,
+            start_by: started + max_queue_wait,
+            lora_adapter,
+            cancel,
+        })))
+        .map_err(|_| GenerationError::EngineUnavailable)?;
+        choices.push(ChoiceInFlight {
+            started,
+            ttft_ms: None,
+            completion: None,
+            _guard: guard,
+        });
+    }
+    let mut running = choices.len();
+    while running > 0 {
+        if drain_cancellation_requested() {
+            return Err(GenerationError::ServerDrainExpired);
+        }
+        match events.recv_timeout(REPLY_POLL_INTERVAL) {
+            Ok((index, event)) => {
+                let choice = &mut choices[index];
+                choice.accept(index, event, metrics, &mut on_token)?;
+                if choice.completion.is_some() {
+                    running -= 1;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if client_gone() {
+                    return Err(GenerationError::ClientCancelled);
+                }
+            }
+            // Every choice holds a sender until the engine finishes with it, so a closed channel with
+            // choices still running is an engine that dropped them.
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(GenerationError::ReplyChannelClosed);
+            }
+        }
+    }
+    Ok(choices
+        .into_iter()
+        .filter_map(|choice| choice.completion)
+        .collect())
 }
 
 /// Submit an encode job over token `rows` and block until the engine thread answers. A finished

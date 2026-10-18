@@ -141,7 +141,7 @@ impl ProductionServer {
             .arg(addr.to_string())
             .args(["--backend", "wgpu"])
             .args(["--drain-timeout-secs", &drain_secs.to_string()])
-            .args(["--read-timeout-secs", "30"])
+            .args(["--request-timeout-secs", "30"])
             .args(["--write-timeout-secs", "30"]);
         if let Some(hook) = removed_hook {
             command.env("POOT_CARD327_TEST_ACCEPT_BARRIER_ADDR", hook.to_string());

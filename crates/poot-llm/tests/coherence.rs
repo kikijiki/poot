@@ -141,7 +141,7 @@ fn cross_encoder_reranks() {
 /// Cheap (header-only, no GPU, no weight load) precondition for
 /// the gpt-oss-20b driver coherence row (`driver/device_tests.rs`): the real `ggml-org/gpt-oss-20b-GGUF` file ships the
 /// full OpenAI "harmony" jinja chat template in `tokenizer.chat_template`, and poot's
-/// `render_jinja_value` must render it rather than silently falling back to the hardcoded
+/// `TextCodec::render_chat_value` must render it rather than silently falling back to the hardcoded
 /// `ChatFormat`.
 ///
 /// gpt-oss is an instruct model whose prompt format is not ChatML: a raw or ChatML-shaped prompt
@@ -187,17 +187,33 @@ fn gptoss_20b_gguf_harmony_chat_template_renders() {
     };
     let bos = tok_at("tokenizer.ggml.bos_token_id");
     let eos = tok_at("tokenizer.ggml.eos_token_id");
-    let rendered = poot_text::render_jinja_value(
-        tmpl,
-        &serde_json::json!([{"role": "user", "content": "What is the capital of France?"}]),
-        bos.as_deref(),
-        eos.as_deref(),
+    let codec = poot_text::TextCodec::with_tokenizer(
+        tokenizers::Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab([("<unk>".to_string(), 0u32)].into_iter().collect())
+                .unk_token("<unk>".to_string())
+                .build()
+                .expect("build wordlevel model"),
+        ),
         None,
-    )
-    .expect(
+        0,
+        poot_text::ChatFormat::ChatML,
+        poot_text::ChatTemplate {
+            template: Some(tmpl.to_string()),
+            bos_token: bos,
+            eos_token: eos,
+        },
+    );
+    let rendered = codec
+        .render_chat_value(
+            &serde_json::json!([{"role": "user", "content": "What is the capital of France?"}]),
+            None,
+        )
+        .expect(
         "the harmony chat template must render through poot's own minijinja path - a failure here is \
          exactly the silent ChatFormat fallback that would make a coherence run produce garbage",
-    );
+        )
+        .prompt;
     eprintln!("gpt-oss-20b harmony rendered prompt:\n{rendered}");
     // Harmony's own structural markers (see the openai/gpt-oss model card): every turn is
     // `<|start|>{role}<|message|>{content}<|end|>`, and the generation prompt opens an assistant turn.

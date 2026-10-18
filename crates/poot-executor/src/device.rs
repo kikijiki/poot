@@ -221,6 +221,12 @@ pub trait Device {
         elems: usize,
     ) -> Result<Self::Buffer, Self::Error>;
 
+    /// The number of native elements `buffer` holds: its allocated capacity, in units of the element kind it
+    /// was allocated with (what [`Arg::elems`] counts). The engine refuses a dispatch whose asserted
+    /// length exceeds it before any device sees the dispatch ([`crate::DispatchError::ArgExceedsBuffer`]),
+    /// so a kernel may trust the lengths it is handed.
+    fn buffer_elems(&self, buffer: &Self::Buffer) -> usize;
+
     /// Load one compiled kernel. `key` is the plan's content key (kernel caches and labels use it).
     fn load_kernel(
         &mut self,

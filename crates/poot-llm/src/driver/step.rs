@@ -205,7 +205,7 @@ enum KvStore {
 pub(super) struct Serving {
     kv: KvStore,
     pub(super) seqs: HashMap<SeqId, Seq>,
-    free_slots: Vec<usize>,
+    pub(super) free_slots: Vec<usize>,
     next_seq: u64,
 }
 
@@ -417,28 +417,18 @@ impl Driver {
         embeds: Option<PromptEmbeds>,
         mrope: Option<MropePositionIds>,
     ) -> Result<Admission, DriverError> {
-        let capacity = self.options.capacity.get();
         let SeqRequest {
             prompt,
             max_new,
             adapter,
         } = request;
-        if prompt.is_empty() {
-            return Err(InvalidRequest::EmptyPrompt.into());
-        }
-        if prompt.len() + max_new > capacity {
-            return Err(InvalidRequest::Capacity {
-                prompt: prompt.len(),
-                max_new,
-                max: capacity,
-            }
-            .into());
-        }
+        let reserved = self.check_admission(prompt, max_new)?;
         let residency = self.residency;
         let serving = self.serving.as_mut().ok_or(InvalidRequest::NotPrepared)?;
         let Some(&slot) = serving.free_slots.last() else {
             return Ok(Admission::NoRoom { needed_blocks: 0 });
         };
+        let private = matches!(serving.kv, KvStore::Contiguous);
         let identity = self.lora.retain(adapter)?;
         let reused = match &mut serving.kv {
             KvStore::Contiguous => 0,
@@ -462,7 +452,7 @@ impl Driver {
                     Ok(reused) => reused,
                     Err(PoolExhausted) => {
                         self.lora.release(adapter);
-                        let needed = (prompt.len() + max_new).div_ceil(BLOCK_SIZE);
+                        let needed = reserved.div_ceil(BLOCK_SIZE);
                         return Ok(Admission::NoRoom {
                             needed_blocks: needed.saturating_sub(cache.free_blocks()).max(1),
                         });
@@ -470,7 +460,22 @@ impl Driver {
                 }
             }
         };
-        let private = matches!(serving.kv, KvStore::Contiguous);
+        if private || residency == StateResidency::Recurrent {
+            // The private cache holds one sequence's row and a recurrent state pool one row per
+            // slot: a new sequence starts from zero in its own slot's row and leaves every other
+            // sequence's state alone. It runs once admission and the lease are settled and before
+            // the slot and sequence are taken; a failure gives the lease and the blocks back.
+            if let Err(error) = self.reset_row_state(slot) {
+                self.lora.release(adapter);
+                if let Some(KvStore::Paged { cache, .. }) =
+                    self.serving.as_mut().map(|serving| &mut serving.kv)
+                {
+                    cache.reset(slot);
+                }
+                return Err(error);
+            }
+        }
+        let serving = self.serving.as_mut().expect("checked above");
         serving.free_slots.pop();
         serving.next_seq += 1;
         let seq = SeqId(NonZeroU64::new(serving.next_seq).expect("the counter starts at one"));
@@ -481,7 +486,7 @@ impl Driver {
                 tokens: prompt.to_vec(),
                 prompt_len: prompt.len(),
                 done: reused,
-                reserved: prompt.len() + max_new,
+                reserved,
                 adapter,
                 identity,
                 seeded: false,
@@ -492,12 +497,6 @@ impl Driver {
                 mrope,
             },
         );
-        if private || residency == StateResidency::Recurrent {
-            // The private cache holds one sequence's row and a recurrent state pool one row per
-            // slot: a new sequence starts from zero in its own slot's row and leaves every other
-            // sequence's state alone.
-            self.reset_row_state(slot)?;
-        }
         self.speculation.open(seq, reused);
         Ok(Admission::Opened { seq, reused })
     }
@@ -530,18 +529,7 @@ impl Driver {
         prompt: &[u32],
         max_new: usize,
     ) -> Result<usize, DriverError> {
-        let capacity = self.options.capacity.get();
-        if prompt.is_empty() {
-            return Err(InvalidRequest::EmptyPrompt.into());
-        }
-        if prompt.len() + max_new > capacity {
-            return Err(InvalidRequest::Capacity {
-                prompt: prompt.len(),
-                max_new,
-                max: capacity,
-            }
-            .into());
-        }
+        let reserved = self.check_admission(prompt, max_new)?;
         let residency = self.residency;
         let serving = self.serving.as_mut().ok_or(InvalidRequest::NotPrepared)?;
         if !matches!(serving.kv, KvStore::Contiguous) {
@@ -576,15 +564,24 @@ impl Driver {
         if residency == StateResidency::Recurrent && (reused != resident || state.state_ahead) {
             reused = 0;
         }
+        let slot = state.slot;
+        if reused == 0 {
+            // The row restarts from zero: reset it before the sequence is rewritten, so a failed
+            // reset leaves the sequence as it was.
+            self.reset_row_state(slot)?;
+        }
+        let state = self
+            .serving
+            .as_mut()
+            .and_then(|serving| serving.seqs.get_mut(&seq))
+            .expect("looked up above");
         state.tokens = prompt.to_vec();
         state.prompt_len = prompt.len();
         state.done = reused;
-        state.reserved = prompt.len() + max_new;
+        state.reserved = reserved;
         state.seeded = false;
-        let slot = state.slot;
         if reused == 0 {
             state.state_ahead = false;
-            self.reset_row_state(slot)?;
         }
         self.speculation.rewind(seq, reused);
         Ok(reused)

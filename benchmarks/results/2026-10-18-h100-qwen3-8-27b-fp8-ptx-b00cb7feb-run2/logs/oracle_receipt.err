@@ -1,0 +1,74 @@
+  Extracting 1 binary and 4 linked paths to /root/ex
+   Extracted 117 files to /root/ex in 0.08s
+────────────
+ Nextest run ID b8134fc0-6824-4fb6-9207-06a57a417d52 with nextest profile: default
+    Starting 1 test across 1 binary (659 tests skipped)
+       START [         ] (1/1) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+RECEIPT prompt "The capital of France is" ids [760, 6511, 314, 9338, 369]
+RECEIPT generated [11751, 13, 198, 760, 6511, 314, 9564, 369] text " Paris.\nThe capital of Germany is"
+RECEIPT device first-token top5 [(11751, -0.4532708), (524, -3.3506584), (264, -3.5284882), (31586, -3.920888), (1076, -3.9422998)]
+        SLOW [> 60.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>120.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>180.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>240.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>300.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>360.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>420.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>480.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>540.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>600.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>660.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>720.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>780.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>840.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>900.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>960.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1020.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1080.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1140.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1200.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1260.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1320.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1380.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1440.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1500.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1560.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1620.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1680.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1740.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1800.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1860.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1920.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>1980.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2040.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2100.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2160.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2220.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2280.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2340.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2400.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2460.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2520.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2580.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2640.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2700.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2760.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2820.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2880.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>2940.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3000.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3060.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3120.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3180.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3240.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3300.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3360.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3420.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3480.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3540.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+        SLOW [>3600.000s] (───) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+RECEIPT oracle first-token top5 [(11751, -0.4540088186679867), (524, -3.3513877401767758), (264, -3.529184104007342), (31586, -3.921600104373553), (1076, -3.943039656680682)]
+RECEIPT peak host memory (VmHWM:	226195020 kB)
+        PASS [3622.642s] (1/1) poot-llm driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::ptx
+────────────
+     Summary [3622.644s] 1 test run: 1 passed (1 slow), 659 skipped

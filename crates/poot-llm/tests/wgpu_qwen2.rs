@@ -814,6 +814,28 @@ fn qwen2_masked_decode_gpu_matches_cpu() {
     assert_replay_matches_cpu(&g, &feeds, "masked decode GPU");
 }
 
+/// POOT-1209: decode attention is bounded by the live length `pos + 1`. A 24-position cache stepped through
+/// every position, so the first (`pos` 0, a length of one), 15 and the last (`capacity - 1`, a full length)
+/// are all compared with the CPU oracle, each step reading what the earlier ones wrote. The CPU oracle runs the
+/// same graph, so this row proves the device's live-bound attention kernel; the length itself is pinned
+/// against an independent f64 reference by `components::attention`'s
+/// `a_decode_token_attends_to_exactly_its_live_prefix_at_the_first_a_middle_and_the_last_position`.
+#[test]
+fn qwen2_live_bound_decode_gpu_matches_cpu_at_the_first_a_middle_and_the_last_position() {
+    const CAP: usize = 24;
+    let dense = Dense::new(Family::Qwen2)
+        .vocab(32)
+        .dims(16, 32, 2)
+        .heads(4, 2)
+        .head_dim(4)
+        .max_positions(CAP);
+    let g = trace(&dense, Phase::Decode, step(1, 1, CAP, LogitRows::Last));
+    let feeds: Vec<Feed> = (0..CAP)
+        .map(|pos| Feed::new(vec![(pos as i32 * 7 + 3) % 32], vec![pos as i32]))
+        .collect();
+    assert_replay_matches_cpu(&g, &feeds, "live-bound decode GPU");
+}
+
 /// The real Qwen2.5-0.5B architecture (24 layers, hidden 896, 14 heads over 2 key-value heads), its
 /// vocabulary cut to 4096 (the vocabulary does not change the graph's structure). The checkpoint is
 /// zeros: these rows read the graph, not its values.

@@ -25,7 +25,7 @@ use poot_target::{AmdArch, Backend, DeviceCaps, Queried, TargetId};
 
 use super::*;
 use crate::admin::LoraAdminPolicy;
-use crate::http::{RateLimiter, handle};
+use crate::http::handle;
 use crate::tests::{load_handle, test_metrics, write_tiny_gguf};
 use poot_graph_plan::test_support::gpu_caps_mut;
 use poot_llm::driver::capacity::{CapacityRefusal, FitError, Observation, Rejection};
@@ -253,6 +253,12 @@ impl Device for FixtureDevice {
         std::mem::forget(self.memory.record_alloc(role, bytes));
         Ok(())
     }
+    /// This fake keeps no storage, so it states no bound: the engine's length check passes every
+    /// dispatch it records.
+    fn buffer_elems(&self, _buffer: &()) -> usize {
+        usize::MAX
+    }
+
     fn load_kernel(&mut self, _key: &str, kernel: CompiledKernel) -> Result<(), FixtureError> {
         if let Some(loaded) = &self.loaded_kernels {
             let mut hasher = std::hash::DefaultHasher::new();
@@ -495,13 +501,18 @@ fn get_health(
         .expect("write request");
     let (served, _queue) = crate::tests::served_over(Arc::clone(handle_model), 1);
     let metrics = test_metrics("health");
-    let limiter = RateLimiter {
-        rpm: 0,
-        windows: Mutex::new(Default::default()),
-    };
     let policy = LoraAdminPolicy::from_configured_key(IpAddr::from([127, 0, 0, 1]), None)
         .expect("loopback policy");
-    handle(server, &served, health, &metrics, &limiter, &policy).expect("handled");
+    handle(
+        server,
+        std::time::Instant::now(),
+        &served,
+        health,
+        &metrics,
+        &crate::tests::test_limits(),
+        &policy,
+    )
+    .expect("handled");
     let mut response = String::new();
     client.read_to_string(&mut response).expect("read response");
     let status = response.lines().next().unwrap_or_default().to_string();

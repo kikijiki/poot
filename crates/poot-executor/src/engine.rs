@@ -41,7 +41,7 @@ use crate::binder::{self, BoundSlot, EmbedRows, StoredAs, WeightBinder};
 use crate::device::{
     AieInvocation, Arg, Device, DeviceTime, Dispatch, LaunchKind, VpuInvocation, WeightUpload,
 };
-use crate::error::{BindError, DeviceError, ExecError, LoadError};
+use crate::error::{BindError, DeviceError, DispatchError, ExecError, LoadError};
 use crate::shared_kernels::{SharedKernels, SharedKernelsMismatch};
 use crate::timing::TimingOptions;
 use crate::{
@@ -425,6 +425,27 @@ pub(crate) fn device_error<E: std::error::Error + Send + Sync + 'static>(
             source: Box::new(source),
         })
     }
+}
+
+/// The one length check every backend shares: no argument of a dispatch may assert more native elements than
+/// the buffer bound to it holds ([`Device::buffer_elems`]), because a kernel trusts the length it is
+/// published. Arguments are numbered as the device sees them, the inputs then the output.
+fn check_arg_lengths<D: Device>(
+    device: &D,
+    inputs: &[Arg<'_, D>],
+    output: &Arg<'_, D>,
+) -> Result<(), DispatchError> {
+    for (arg, bound) in inputs.iter().chain(std::iter::once(output)).enumerate() {
+        let capacity = device.buffer_elems(bound.buffer);
+        if bound.elems as usize > capacity {
+            return Err(DispatchError::ArgExceedsBuffer {
+                arg,
+                elems: bound.elems,
+                capacity,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The one way a step puts host bytes on the device: every write of a step's bind goes through here,
@@ -2075,16 +2096,19 @@ impl<D: Device> Engine<D> {
         Ok(())
     }
 
-    /// Walk one stage into the device: every dispatch, then the state commit.
+    /// Walk one stage into the device: every dispatch, then the state commit. Each dispatch's asserted
+    /// lengths are checked against the buffers bound to them first ([`check_arg_lengths`]), so no device
+    /// is handed a length its buffer cannot hold.
     fn walk(
         device: &mut D,
         kernels: &[D::Kernel],
         stage: &StageRun<D>,
         buffers: (&[D::Buffer], &[D::Buffer]),
         held: &Held<'_, D>,
-    ) -> Result<(), D::Error> {
+    ) -> Result<(), ExecError> {
         let (locals, arena) = buffers;
         let at = |loc| resolve::<D>(loc, locals, arena, held);
+        let on_device = device_error(target_of(device));
         for step in &stage.steps {
             let inputs: Vec<Arg<'_, D>> = step
                 .inputs
@@ -2095,25 +2119,31 @@ impl<D: Device> Engine<D> {
                 })
                 .collect();
             let (output_loc, output_elems) = step.output;
-            device.dispatch(Dispatch {
-                kernel: &kernels[step.kernel],
-                inputs: &inputs,
-                output: Arg {
-                    buffer: at(output_loc),
-                    elems: output_elems,
-                },
-                launch: step.launch,
-                work: step.work,
-            })?;
+            let output = Arg {
+                buffer: at(output_loc),
+                elems: output_elems,
+            };
+            check_arg_lengths(device, &inputs, &output)?;
+            device
+                .dispatch(Dispatch {
+                    kernel: &kernels[step.kernel],
+                    inputs: &inputs,
+                    output,
+                    launch: step.launch,
+                    work: step.work,
+                })
+                .map_err(&on_device)?;
         }
         // The two-phase commit: the primary output is snapshotted now, after every
         // dispatch has computed its final value but before any commit copy overwrites the buffer it
         // aliases; the commits themselves run as a simultaneous assignment immediately after.
         if let Some(preserve) = stage.preserve_output {
-            device.copy(at(stage.output), at(preserve))?;
+            device
+                .copy(at(stage.output), at(preserve))
+                .map_err(&on_device)?;
         }
         for &(src, dst) in &stage.commits {
-            device.copy(at(src), at(dst))?;
+            device.copy(at(src), at(dst)).map_err(&on_device)?;
         }
         Ok(())
     }
@@ -2163,7 +2193,7 @@ impl<D: Device> Engine<D> {
         let buffers = (e.locals.as_slice(), e.arena.as_slice());
         if let Err(walk_err) = Self::walk(device, kernels, stage, buffers, &held) {
             self.abort_after_failure(exe, walk_recording);
-            return Err(error(walk_err));
+            return Err(walk_err);
         }
         let outgoing: Vec<Outgoing<'_, D>> = e
             .outgoing
@@ -3284,6 +3314,10 @@ mod kernel_identity_tests {
         ) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
+        fn buffer_elems(&self, _buffer: &()) -> usize {
+            // This fake keeps no storage, so it states no bound: the length check passes every dispatch.
+            usize::MAX
+        }
         fn load_kernel(
             &mut self,
             key: &str,
@@ -3520,6 +3554,10 @@ mod arena_slot_alloc_tests {
             self.seen_elems.push(elems);
             Ok(())
         }
+        fn buffer_elems(&self, _buffer: &()) -> usize {
+            // This fake keeps no storage, so it states no bound: the length check passes every dispatch.
+            usize::MAX
+        }
         fn load_kernel(
             &mut self,
             key: &str,
@@ -3646,6 +3684,9 @@ mod f16_packed_weight_upload_tests {
         ) -> Result<usize, std::convert::Infallible> {
             self.allocations.push((role, storage, elems));
             Ok(self.allocations.len() - 1)
+        }
+        fn buffer_elems(&self, buffer: &usize) -> usize {
+            self.allocations[*buffer].2
         }
         fn load_kernel(
             &mut self,
@@ -4097,6 +4138,9 @@ mod weight_source_tests {
             std::mem::forget(self.memory.record_alloc(role, bytes));
             self.allocations.push((role, storage, elems));
             Ok(self.allocations.len() - 1)
+        }
+        fn buffer_elems(&self, buffer: &usize) -> usize {
+            self.allocations[*buffer].2
         }
         fn load_kernel(
             &mut self,
@@ -5617,6 +5661,9 @@ mod weight_source_tests {
         ) -> Result<usize, WriteFault> {
             Ok(self.inner.allocate(role, storage, elems).unwrap())
         }
+        fn buffer_elems(&self, buffer: &usize) -> usize {
+            self.inner.buffer_elems(buffer)
+        }
         fn load_kernel(
             &mut self,
             _key: &str,
@@ -5855,6 +5902,10 @@ mod weight_source_tests {
                 index: self.contents.len() - 1,
                 freed: Arc::clone(&self.freed),
             })
+        }
+        fn buffer_elems(&self, _buffer: &Held) -> usize {
+            // This fake keeps no storage, so it states no bound: the length check passes every dispatch.
+            usize::MAX
         }
         fn load_kernel(
             &mut self,
@@ -6308,6 +6359,10 @@ mod aie_engine_tests {
             self.buffers += 1;
             Ok(self.buffers - 1)
         }
+        fn buffer_elems(&self, _buffer: &usize) -> usize {
+            // This fake keeps no storage, so it states no bound: the length check passes every dispatch.
+            usize::MAX
+        }
         fn load_kernel(
             &mut self,
             _key: &str,
@@ -6661,6 +6716,10 @@ mod vpu_engine_tests {
             self.roles.push(role);
             self.buffers += 1;
             Ok(self.buffers - 1)
+        }
+        fn buffer_elems(&self, _buffer: &usize) -> usize {
+            // This fake keeps no storage, so it states no bound: the length check passes every dispatch.
+            usize::MAX
         }
         fn load_kernel(
             &mut self,

@@ -1,13 +1,14 @@
 //! GGUF metadata, tensor table, and container I/O.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
 
 use crate::{GgufSplitError, LoadError};
 
-/// A GGUF metadata value (the 13 GGUF value types; `Array` holds a homogeneous list).
+/// A GGUF metadata value (the 13 GGUF value types; `Array` holds a homogeneous list, read only for the
+/// tables and short per-layer lists, see `GgufIndex::metadata`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum GgufValue {
     /// An unsigned 8-bit integer.
@@ -98,6 +99,35 @@ pub struct GgufTensorInfo {
     pub shard: usize,
 }
 
+/// The GGUF value-type id of an array.
+const GGUF_TYPE_ARRAY: u32 = 9;
+
+/// `general.alignment` when a header does not declare one (the GGUF spec's default).
+const DEFAULT_ALIGNMENT: usize = 32;
+
+/// The metadata arrays of vocabulary size that readers consume, with the element types each may
+/// carry (GGUF type ids: 4 u32, 5 i32, 6 f32, 8 string): the tokenizer tables. Any other array
+/// longer than [`MAX_LAYER_ARRAY_LEN`] is bounds-checked and skipped, never stored, and the small
+/// per-layer arrays are held to [`MAX_LAYER_ARRAY_TOTAL`] elements per file, so no header makes the
+/// parser build a `GgufValue` per byte of the file.
+const STORED_ARRAYS: [(&str, &[u32]); 4] = [
+    ("tokenizer.ggml.tokens", &[8]),
+    ("tokenizer.ggml.merges", &[8]),
+    ("tokenizer.ggml.scores", &[6]),
+    ("tokenizer.ggml.token_type", &[4, 5]),
+];
+
+/// Most elements a stored array may declare (4M, about 16x the largest real vocabulary), bounding
+/// the decoded size independently of the file's size.
+pub(crate) const MAX_STORED_ARRAY_LEN: usize = 1 << 22;
+
+/// Longest array stored under a non-tokenizer key: the per-layer tables (`sliding_window_pattern`,
+/// `compress_ratios`, per-layer head counts) have one element per layer, and no model has 4096 layers.
+const MAX_LAYER_ARRAY_LEN: usize = 4096;
+
+/// Elements all non-tokenizer arrays of one file may store between them.
+const MAX_LAYER_ARRAY_TOTAL: usize = 1 << 16;
+
 /// Maximum tensor rank accepted from a GGUF header (ggml caps at GGML_MAX_DIMS = 4). Bounds
 /// `Vec::with_capacity(n_dims)` against a crafted multi-GB allocation.
 pub(crate) const MAX_TENSOR_DIMS: usize = 8;
@@ -138,7 +168,93 @@ impl<'a> Cursor<'a> {
         let raw = self.take(n)?;
         String::from_utf8(raw.to_vec()).map_err(|_| gerr("non-utf8 string"))
     }
-    /// A typed value given its GGUF value-type id (recursing for arrays).
+    /// An array's element type id and count, the count refused when the remaining bytes cannot hold
+    /// it: each element occupies at least its fixed width (a string at least its length prefix), so
+    /// a header cannot claim more elements than the file has bytes for. Nested arrays are refused.
+    fn array_header(&mut self) -> Result<(u32, usize), LoadError> {
+        let elem_ty = self.u32()?;
+        if elem_ty == 9 {
+            return Err(gerr("nested GGUF arrays are not supported"));
+        }
+        let n = usize::try_from(self.u64()?).map_err(|_| gerr("array length overflows usize"))?;
+        let min_width = match elem_ty {
+            0 | 1 | 7 => 1,
+            2 | 3 => 2,
+            4..=6 => 4,
+            _ => 8,
+        };
+        let remaining = self.b.len() - self.p;
+        if n.checked_mul(min_width).is_none_or(|need| need > remaining) {
+            return Err(gerr("array length exceeds the bytes remaining"));
+        }
+        Ok((elem_ty, n))
+    }
+
+    /// The `n` elements of type `elem_ty` that follow an [`Self::array_header`], decoded.
+    fn array_elements(&mut self, elem_ty: u32, n: usize) -> Result<GgufValue, LoadError> {
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(self.value(elem_ty)?);
+        }
+        Ok(GgufValue::Array(v))
+    }
+
+    /// Step over the `n` elements of type `elem_ty` that follow an [`Self::array_header`] without
+    /// decoding or storing them.
+    fn skip_elements(&mut self, elem_ty: u32, n: usize) -> Result<(), LoadError> {
+        match elem_ty {
+            8 => {
+                for _ in 0..n {
+                    let len = usize::try_from(self.u64()?)
+                        .map_err(|_| gerr("string length overflows usize"))?;
+                    self.take(len)?;
+                }
+            }
+            0 | 1 | 7 => drop(self.take(n)?),
+            2 | 3 => drop(self.take(n * 2)?),
+            4..=6 => drop(self.take(n * 4)?),
+            10..=12 => drop(self.take(n * 8)?),
+            other => return Err(gerr(&format!("unknown GGUF value type {other}"))),
+        }
+        Ok(())
+    }
+
+    /// The array metadata value for `key` at the cursor, or `None` for one no reader consumes, which
+    /// is stepped over unstored (see [`STORED_ARRAYS`]). `layer_budget` counts the elements
+    /// stored under small per-layer keys across the whole header and is spent here.
+    pub(crate) fn array(
+        &mut self,
+        key: &str,
+        layer_budget: &mut usize,
+    ) -> Result<Option<GgufValue>, LoadError> {
+        let (elem_ty, n) = self.array_header()?;
+        if let Some((_, allowed)) = STORED_ARRAYS.iter().find(|(stored, _)| *stored == key) {
+            if !allowed.contains(&elem_ty) {
+                return Err(gerr(&format!(
+                    "{key} has array element type {elem_ty}, expected one of {allowed:?}"
+                )));
+            }
+            if n > MAX_STORED_ARRAY_LEN {
+                return Err(gerr(&format!(
+                    "{key} has {n} elements, more than the {MAX_STORED_ARRAY_LEN} a tokenizer table holds"
+                )));
+            }
+            return self.array_elements(elem_ty, n).map(Some);
+        }
+        if n > MAX_LAYER_ARRAY_LEN {
+            self.skip_elements(elem_ty, n)?;
+            return Ok(None);
+        }
+        *layer_budget = layer_budget.checked_sub(n).ok_or_else(|| {
+            gerr(&format!(
+                "{key}: metadata arrays outside the tokenizer tables declare more than \
+                 {MAX_LAYER_ARRAY_TOTAL} elements"
+            ))
+        })?;
+        self.array_elements(elem_ty, n).map(Some)
+    }
+
+    /// A typed scalar or string given its GGUF value-type id.
     pub(crate) fn value(&mut self, ty: u32) -> Result<GgufValue, LoadError> {
         Ok(match ty {
             0 => GgufValue::U8(self.take(1)?[0]),
@@ -150,18 +266,7 @@ impl<'a> Cursor<'a> {
             6 => GgufValue::F32(f32::from_bits(self.u32()?)),
             7 => GgufValue::Bool(self.take(1)?[0] != 0),
             8 => GgufValue::Str(self.gstr()?),
-            9 => {
-                let elem_ty = self.u32()?;
-                if elem_ty == 9 {
-                    return Err(gerr("nested GGUF arrays are not supported"));
-                }
-                let n = self.u64()? as usize;
-                let mut v = Vec::with_capacity(n.min(1 << 20));
-                for _ in 0..n {
-                    v.push(self.value(elem_ty)?);
-                }
-                GgufValue::Array(v)
-            }
+            9 => return Err(gerr("an array is read through Cursor::array or skip_array")),
             10 => GgufValue::U64(self.u64()?),
             11 => GgufValue::I64(i64::from_le_bytes(self.take(8)?.try_into().unwrap())),
             12 => GgufValue::F64(f64::from_le_bytes(self.take(8)?.try_into().unwrap())),
@@ -273,11 +378,21 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader, LoadError> {
     let kv_count = c.u64()? as usize;
 
     let mut metadata = HashMap::new();
+    let mut seen_keys = HashSet::new();
+    let mut layer_budget = MAX_LAYER_ARRAY_TOTAL;
     for _ in 0..kv_count {
         let key = c.gstr()?;
         let ty = c.u32()?;
-        let val = c.value(ty)?;
-        metadata.insert(key, val);
+        if !seen_keys.insert(key.clone()) {
+            return Err(LoadError::DuplicateGgufMetadataKey { key });
+        }
+        if ty == GGUF_TYPE_ARRAY {
+            if let Some(array) = c.array(&key, &mut layer_budget)? {
+                metadata.insert(key, array);
+            }
+        } else {
+            metadata.insert(key, c.value(ty)?);
+        }
     }
 
     let mut tensors = HashMap::new();
@@ -307,23 +422,34 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader, LoadError> {
         }
         let ggml_type = c.u32()?;
         let offset = c.u64()?;
-        tensors.insert(
-            name,
-            GgufTensorInfo {
-                dims,
-                ggml_type,
-                offset,
-                shard: 0,
-            },
-        );
+        let info = GgufTensorInfo {
+            dims,
+            ggml_type,
+            offset,
+            shard: 0,
+        };
+        if tensors.insert(name.clone(), info).is_some() {
+            return Err(LoadError::DuplicateTensorName {
+                name,
+                scope: "within one GGUF directory".to_string(),
+            });
+        }
     }
 
     // Tensor data begins at the cursor, padded up to general.alignment (default 32).
-    let alignment = metadata
-        .get("general.alignment")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(32) as usize;
-    let data_start = c.p.div_ceil(alignment) * alignment;
+    let alignment = match metadata.get("general.alignment") {
+        None => DEFAULT_ALIGNMENT,
+        Some(value) => value
+            .as_u64()
+            .filter(|a| a.is_power_of_two())
+            .and_then(|a| usize::try_from(a).ok())
+            .ok_or_else(|| LoadError::InvalidGgufAlignment {
+                value: format!("{value:?}"),
+            })?,
+    };
+    let data_start =
+        c.p.checked_next_multiple_of(alignment)
+            .ok_or_else(|| gerr("tensor data start overflows usize"))?;
     if data_start > bytes.len() {
         return Err(gerr("tensor data start past end of file"));
     }
@@ -401,6 +527,8 @@ pub struct GgufIndex {
     /// The GGUF format version the first shard declares.
     pub version: u32,
     /// Metadata key-value table of the first shard, keyed by the dotted key (`general.architecture`, ...).
+    /// Arrays are stored for the tokenizer tables and for short per-layer tables; a longer array under
+    /// any other key is validated and left out (`STORED_ARRAYS`).
     pub metadata: HashMap<String, GgufValue>,
     /// Tensor directory of every shard, keyed by tensor name.
     pub tensors: HashMap<String, GgufTensorInfo>,
@@ -416,17 +544,17 @@ struct Shard {
 impl GgufIndex {
     /// Parse a single-file checkpoint: a header and tensor directory from `file`, a mapping of a
     /// checkpoint or an in-memory buffer (a fixture). Only the header pages are touched, so it also
-    /// works on a partial download. One shard of a split checkpoint parses too, so its metadata can
-    /// be read, but [`crate::gguf::gguf_plan`] refuses it: its directory lacks tensors its metadata
-    /// counts.
+    /// works on a partial download. A file that declares itself one shard of a split set is refused
+    /// here, as `parse_shards` refuses any set of the wrong size.
     pub fn parse(file: &StoredBytes) -> Result<Self, LoadError> {
         Self::parse_shards(std::slice::from_ref(file))
     }
 
     /// Parse a split checkpoint from its `files`, in shard order. With more than one file they must
     /// be exactly the set the first one declares (`split.count`), each in its declared position
-    /// (`split.no`), and no tensor may appear in two shards; a violation is a typed
-    /// [`LoadError::GgufSplit`]. A single file needs none of the split keys.
+    /// (`split.no`, the first at 0), and no tensor may appear in two shards; a violation is a typed
+    /// [`LoadError::GgufSplit`]. A single file that declares any split key is held to the same rules;
+    /// one with none needs no split keys.
     pub fn parse_shards(files: &[StoredBytes]) -> Result<Self, LoadError> {
         let first = files
             .first()
@@ -441,12 +569,21 @@ impl GgufIndex {
                 data_start: header.data_start,
             }],
         };
-        if files.len() > 1 {
+        // A file that carries any split key is one shard of a set, so the first shard must declare
+        // exactly the number of files given and sit at position 0, whether or not more files follow.
+        let declared_no = index.get("split.no").and_then(GgufValue::as_u64);
+        if files.len() > 1 || index.get("split.count").is_some() || declared_no.is_some() {
             let declared = index.split_key("split.count");
             if declared != Some(files.len()) {
                 return Err(LoadError::GgufSplit(GgufSplitError::Count {
                     declared,
                     given: files.len(),
+                }));
+            }
+            if declared_no != Some(0) {
+                return Err(LoadError::GgufSplit(GgufSplitError::Order {
+                    position: 0,
+                    declared: declared_no,
                 }));
             }
         }
@@ -507,5 +644,185 @@ impl GgufIndex {
     /// `GgufTensorInfo::offset` is relative to this.
     pub(crate) fn data_start(&self, shard: usize) -> usize {
         self.shards[shard].data_start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(
+        kvs: &[(&str, GgufValue)],
+        tensors: &[(&str, Vec<u64>, u32, Vec<u8>)],
+    ) -> Result<GgufIndex, LoadError> {
+        GgufIndex::parse(&StoredBytes::from(write_gguf(kvs, tensors)))
+    }
+
+    fn f32_tensor(name: &'static str) -> (&'static str, Vec<u64>, u32, Vec<u8>) {
+        (name, vec![2], 0, vec![0u8; 8])
+    }
+
+    /// POOT-1196 SC-003: `general.alignment` of 0 and of 3 is a typed refusal naming the value, not
+    /// a divide-by-zero panic or a silently wrong data start.
+    #[test]
+    fn alignment_must_be_a_nonzero_power_of_two() {
+        for bad in [0u32, 3] {
+            let error = parse(&[("general.alignment", GgufValue::U32(bad))], &[])
+                .err()
+                .unwrap_or_else(|| panic!("alignment {bad} must be refused"));
+            assert!(
+                matches!(&error, LoadError::InvalidGgufAlignment { value } if value == &format!("U32({bad})")),
+                "alignment {bad}: {error}"
+            );
+        }
+        let wrong_type = parse(&[("general.alignment", GgufValue::Str("32".into()))], &[]);
+        assert!(matches!(
+            wrong_type,
+            Err(LoadError::InvalidGgufAlignment { .. })
+        ));
+        parse(&[("general.alignment", GgufValue::U32(32))], &[]).expect("32 is a valid alignment");
+    }
+
+    /// POOT-1196 SC-004: a tensor name or a metadata key listed twice is refused by name.
+    #[test]
+    fn repeated_tensor_names_and_metadata_keys_are_refused() {
+        let error = parse(&[], &[f32_tensor("w"), f32_tensor("w")])
+            .err()
+            .expect("two tensors named w");
+        assert!(
+            matches!(&error, LoadError::DuplicateTensorName { name, .. } if name == "w"),
+            "{error}"
+        );
+        let error = parse(
+            &[
+                ("general.name", GgufValue::Str("a".into())),
+                ("general.name", GgufValue::Str("b".into())),
+            ],
+            &[],
+        )
+        .err()
+        .expect("general.name twice");
+        assert!(
+            matches!(&error, LoadError::DuplicateGgufMetadataKey { key } if key == "general.name"),
+            "{error}"
+        );
+    }
+
+    /// A header with one metadata array `key` of `n` declared elements of type `elem_ty`, whose bytes are `elements`.
+    fn header_with_array(key: &str, elem_ty: u32, elements: &[u8], n: u64) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend(3u32.to_le_bytes());
+        header.extend(0u64.to_le_bytes());
+        header.extend(1u64.to_le_bytes());
+        header.extend(gguf_gstr_bytes(key));
+        header.extend(9u32.to_le_bytes());
+        header.extend(elem_ty.to_le_bytes());
+        header.extend(n.to_le_bytes());
+        header.extend_from_slice(elements);
+        header.resize(header.len().next_multiple_of(32), 0); // the (empty) data section's alignment
+        header
+    }
+
+    /// An array whose declared length the remaining bytes cannot hold is refused before decoding,
+    /// stored or skipped.
+    #[test]
+    fn array_length_beyond_the_file_is_refused() {
+        for key in ["k", "tokenizer.ggml.scores"] {
+            let elem = if key == "k" { 4 } else { 6 };
+            let header = header_with_array(key, elem, &[], 1 << 40);
+            let error = GgufIndex::parse(&StoredBytes::from(header))
+                .err()
+                .expect("huge array");
+            assert!(error.to_string().contains("array length"), "{key}: {error}");
+        }
+    }
+
+    /// An array longer than any per-layer table under a non-tokenizer key is walked and dropped: it
+    /// costs no per-element memory (the key is simply absent) while its bytes are still
+    /// bounds-checked. A short per-layer array is stored.
+    #[test]
+    fn a_long_unread_array_is_skipped_not_stored() {
+        let long = MAX_LAYER_ARRAY_LEN + 1;
+        let bytes = header_with_array("some.table", 0, &vec![7u8; long], long as u64);
+        let index = GgufIndex::parse(&StoredBytes::from(bytes)).unwrap();
+        assert!(index.get("some.table").is_none());
+        let per_layer = header_with_array("some.layer_kinds", 0, &[1, 0, 1], 3);
+        let index = GgufIndex::parse(&StoredBytes::from(per_layer)).unwrap();
+        assert_eq!(
+            index
+                .get("some.layer_kinds")
+                .and_then(GgufValue::as_array)
+                .map(<[_]>::len),
+            Some(3)
+        );
+        // Its bytes must still be there.
+        let truncated = header_with_array("some.table", 0, &[1, 2, 3], 100_000);
+        assert!(GgufIndex::parse(&StoredBytes::from(truncated)).is_err());
+    }
+
+    /// Many short arrays cannot add up to a per-byte inflation: past the per-file element budget
+    /// the header is refused.
+    #[test]
+    fn short_arrays_share_one_element_budget() {
+        let arrays = MAX_LAYER_ARRAY_TOTAL / MAX_LAYER_ARRAY_LEN + 1;
+        let mut header = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend(3u32.to_le_bytes());
+        header.extend(0u64.to_le_bytes());
+        header.extend((arrays as u64).to_le_bytes());
+        for i in 0..arrays {
+            header.extend(gguf_gstr_bytes(&format!("some.table{i}")));
+            header.extend(9u32.to_le_bytes());
+            header.extend(0u32.to_le_bytes());
+            header.extend((MAX_LAYER_ARRAY_LEN as u64).to_le_bytes());
+            header.extend(vec![0u8; MAX_LAYER_ARRAY_LEN]);
+        }
+        header.resize(header.len().next_multiple_of(32), 0);
+        let error = GgufIndex::parse(&StoredBytes::from(header))
+            .err()
+            .expect("over budget");
+        assert!(error.to_string().contains("some.table16"), "{error}");
+    }
+
+    /// A stored table longer than the cap is refused however many bytes back it.
+    #[test]
+    fn a_tokenizer_table_beyond_the_cap_is_refused() {
+        let n = MAX_STORED_ARRAY_LEN + 1;
+        let bytes = header_with_array("tokenizer.ggml.scores", 6, &vec![0u8; 4 * n], n as u64);
+        let error = GgufIndex::parse(&StoredBytes::from(bytes))
+            .err()
+            .expect("over the cap");
+        assert!(
+            error.to_string().contains("tokenizer.ggml.scores"),
+            "{error}"
+        );
+    }
+
+    /// The tokenizer tables are stored, and only with the element type the readers decode; a
+    /// file-size `u8` array under a tokenizer key is refused instead of inflated.
+    #[test]
+    fn tokenizer_tables_are_stored_with_their_element_type() {
+        let mut e = Vec::new();
+        for s in ["ab", "c"] {
+            e.extend(gguf_gstr_bytes(s));
+        }
+        let ok = header_with_array("tokenizer.ggml.tokens", 8, &e, 2);
+        let index = GgufIndex::parse(&StoredBytes::from(ok)).unwrap();
+        assert_eq!(
+            index
+                .get("tokenizer.ggml.tokens")
+                .and_then(GgufValue::as_array)
+                .map(<[_]>::len),
+            Some(2)
+        );
+        let bytes = header_with_array("tokenizer.ggml.tokens", 0, &vec![7u8; 4096], 4096);
+        let error = GgufIndex::parse(&StoredBytes::from(bytes))
+            .err()
+            .expect("u8 tokens");
+        assert!(
+            error.to_string().contains("tokenizer.ggml.tokens"),
+            "{error}"
+        );
     }
 }

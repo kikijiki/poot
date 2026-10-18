@@ -258,6 +258,10 @@ impl Device for RocmDevice {
         Ok(self.ctx.allocate(role, storage, elems)?)
     }
 
+    fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
+        buffer.elem_count() as usize
+    }
+
     fn load_kernel(
         &mut self,
         _key: &str,

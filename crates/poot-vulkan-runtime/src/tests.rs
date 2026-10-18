@@ -927,40 +927,6 @@ fn dispatch_and_recording_refuse_objects_of_another_context() {
     assert_eq!(context.graphs_recorded(), 0);
 }
 
-/// Review of Card 553: a dispatch told a buffer holds more elements than its allocation does is refused
-/// before anything is recorded, whatever the buffer's own capacity is.
-#[test]
-fn a_binding_larger_than_its_buffer_is_refused() {
-    let (context, _mock) = mock_context(None);
-    let mut graph = context.begin_graph(GraphTiming::Off).expect("mock graph");
-    let buffer = mock_buffer(&context, 4 * size_of::<f32>()).expect("mock allocation");
-    let pipeline = mock_pipeline(&context, 1);
-    let result = context.record_dispatch(
-        &mut graph,
-        "k",
-        &pipeline,
-        [64, 1, 1],
-        [5, 1, 1],
-        &[Binding {
-            buffer: &buffer,
-            elems: 5,
-        }],
-    );
-    assert!(
-        matches!(
-            result,
-            Err(RuntimeError::ArgExceedsBuffer {
-                index: 0,
-                elems: 5,
-                byte_len: 16,
-                ..
-            })
-        ),
-        "got {result:?}"
-    );
-    assert_eq!(graph.core.dispatch_count, 0);
-}
-
 /// SC-001: a grid over the device's `maxComputeWorkGroupCount` is refused with the typed `GridCap`, before
 /// anything is recorded, never folded onto y (a kernel planned as a 1-D launch reads only x, so a fold
 /// computes wrong results silently). The mock context's limit is 65535 per axis.

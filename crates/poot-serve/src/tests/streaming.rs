@@ -19,7 +19,7 @@ fn submit_propagates_the_finish_reason() {
                 Ok((vec![1, 2, 3], "xxx".to_string(), finish))
             });
         });
-        let completion = submit(
+        let completion = submit_one(
             &tx,
             &m,
             generation_request("p", 3, false),
@@ -159,7 +159,7 @@ fn submit_stops_forwarding_when_client_disconnects() {
         });
     });
     let mut forwarded = 0;
-    let result = submit(
+    let result = submit_one(
         &tx,
         &m,
         generation_request("p", 100, true),

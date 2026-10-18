@@ -1717,6 +1717,34 @@ impl Driver {
         Ok(())
     }
 
+    /// Check a prompt and its `max_new` against the model before a sequence holds anything: the prompt
+    /// is not empty, every id names a vocabulary row, and the prompt plus `max_new` fits the
+    /// positions. Returns the positions to reserve.
+    fn check_admission(&self, prompt: &[u32], max_new: usize) -> Result<usize, InvalidRequest> {
+        if prompt.is_empty() {
+            return Err(InvalidRequest::EmptyPrompt);
+        }
+        let capacity = self.options.capacity.get();
+        let reserved = prompt
+            .len()
+            .checked_add(max_new)
+            .filter(|&reserved| reserved <= capacity)
+            .ok_or(InvalidRequest::Capacity {
+                prompt: prompt.len(),
+                max_new,
+                max: capacity,
+            })?;
+        let vocab = self.handle.config().vocab;
+        if let Some((at, &token)) = prompt
+            .iter()
+            .enumerate()
+            .find(|&(_, &token)| token as usize >= vocab)
+        {
+            return Err(InvalidRequest::TokenOutOfVocab { token, at, vocab });
+        }
+        Ok(reserved)
+    }
+
     fn generate_with(
         &mut self,
         request: GenerateRequest,
@@ -1738,18 +1766,7 @@ impl Driver {
                 timing: None,
             });
         }
-        if prompt.is_empty() {
-            return Err(InvalidRequest::EmptyPrompt.into());
-        }
-        let capacity = self.options.capacity.get();
-        if prompt.len() + max_new > capacity {
-            return Err(InvalidRequest::Capacity {
-                prompt: prompt.len(),
-                max_new,
-                max: capacity,
-            }
-            .into());
-        }
+        self.check_admission(prompt, max_new)?;
         let head = match suffix::rule_of(sampler) {
             Some(rule) => Head::Sample(rule),
             None => Head::Logits,

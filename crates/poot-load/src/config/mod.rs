@@ -18,6 +18,12 @@ impl QuantConfig {
                         self.bits, self.desc_act, self.sym
                     )));
                 }
+                if let Some(format) = self.checkpoint_format.as_deref().filter(|f| *f != "gptq") {
+                    return Err(LoadError::UnsupportedQuantConfig {
+                        field: "checkpoint_format",
+                        value: format.to_string(),
+                    });
+                }
                 Ok(QuantScheme {
                     kind: QuantKind::Gptq,
                     group_size,
@@ -29,6 +35,12 @@ impl QuantConfig {
                         "unsupported AWQ variant (bits={:?} version={:?}); only 4-bit gemm",
                         self.bits, self.version
                     )));
+                }
+                if self.zero_point == Some(false) {
+                    return Err(LoadError::UnsupportedQuantConfig {
+                        field: "zero_point",
+                        value: "false".to_string(),
+                    });
                 }
                 Ok(QuantScheme {
                     kind: QuantKind::Awq,
@@ -80,4 +92,55 @@ pub fn quant_scheme(config: &serde_json::Value) -> Result<Option<QuantScheme>, L
                 .scheme()
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scheme_of(block: serde_json::Value) -> Result<QuantScheme, LoadError> {
+        // Through the production entry: a whole `config.json` with a `quantization_config` block.
+        quant_scheme(&serde_json::json!({"quantization_config": block}))
+            .map(|scheme| scheme.expect("the block names a scheme"))
+    }
+
+    fn refused(result: Result<QuantScheme, LoadError>, field: &str, value: &str) {
+        match result {
+            Err(LoadError::UnsupportedQuantConfig { field: f, value: v }) => {
+                assert_eq!((f, v.as_str()), (field, value));
+            }
+            other => panic!("expected a refusal naming {field} = {value}, got {other:?}"),
+        }
+    }
+
+    /// POOT-1196 SC-001: a GPTQModel `gptq_v2` checkpoint is refused by field and value; v1 (named or
+    /// absent) loads.
+    #[test]
+    fn gptq_v2_is_refused_by_checkpoint_format() {
+        let block = |extra: serde_json::Value| {
+            let mut block = serde_json::json!({"quant_method": "gptq", "bits": 4, "sym": true});
+            block
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            block
+        };
+        refused(
+            scheme_of(block(serde_json::json!({"checkpoint_format": "gptq_v2"}))),
+            "checkpoint_format",
+            "gptq_v2",
+        );
+        scheme_of(block(serde_json::json!({"checkpoint_format": "gptq"}))).expect("v1 named");
+        scheme_of(block(serde_json::json!({}))).expect("v1 by absence");
+    }
+
+    /// POOT-1196 SC-002: AWQ without zero points is refused by name; with them (or by default) it loads.
+    #[test]
+    fn awq_without_zero_points_is_refused() {
+        let block = |zero_point: serde_json::Value| serde_json::json!({"quant_method": "awq", "bits": 4, "version": "gemm", "zero_point": zero_point});
+        refused(scheme_of(block(false.into())), "zero_point", "false");
+        scheme_of(block(true.into())).expect("zero_point true");
+        scheme_of(serde_json::json!({"quant_method": "awq", "bits": 4, "version": "gemm"}))
+            .expect("zero_point absent");
+    }
 }

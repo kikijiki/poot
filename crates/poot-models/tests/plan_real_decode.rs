@@ -93,17 +93,18 @@ fn real_decode_graph(dense: poot_models::test_support::dense::Dense, cap: usize)
 /// POOT-725 made the `Cast(Slot::Pos -> F32)` of the position a kernel (368); POOT-1108 folds it into the
 /// mask region that reads it, so the launch is gone again. POOT-1150: +3, the hidden pad column of the
 /// padded KV stride (one iota-built column and its concat, shared by every layer's mask; capacity 64 camps).
-const QWEN2_0_5B_DISPATCHES: usize = 370;
+/// POOT-1209: +1, the `[rows]` view of the position every layer's live attention bound reads.
+const QWEN2_0_5B_DISPATCHES: usize = 371;
 
 /// Dispatches per token of the 28-layer Qwen3-0.6B real-config decode graph (the legacy tracer planned 539).
 /// POOT-725: 484; POOT-1108: 483, the position cast folded as for Qwen2.5 above; POOT-1150: 486, the hidden
-/// pad column as above.
-const QWEN3_0_6B_DISPATCHES: usize = 486;
+/// pad column as above. POOT-1209: 487, the `[rows]` view of the position as above.
+const QWEN3_0_6B_DISPATCHES: usize = 487;
 
 /// Dispatches per token of the same Qwen2.5-0.5B config traced over a paged KV pool: the contiguous decode's
 /// minus the one the in-place write does not need. Before attention read the pools in place this was 96 more
 /// (one gather and one transpose per layer and per K and V).
-const QWEN2_0_5B_PAGED_DISPATCHES: usize = 366;
+const QWEN2_0_5B_PAGED_DISPATCHES: usize = 367;
 
 /// Dispatches `program` runs per step: every planned equation but the free ones (an alias or a strided view).
 fn dispatches(program: &Program) -> usize {

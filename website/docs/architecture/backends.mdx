@@ -27,7 +27,7 @@ diverge late, in three places:
 
 All backends implement the backend-neutral executor contract (`poot-executor`: one generic
 `Engine<D>` over a thin `Device` trait): `poot-wgpu-device`'s `WgpuDevice`, `poot-rocm-device`'s `RocmDevice`,
-`poot-ptx-device`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice` (raw Vulkan, verified on AMD RADV only). A dev-only table-driven parity crate (`poot-executor-parity`) runs
+`poot-ptx-device`'s `PtxDevice` and `poot-vulkan-device`'s `VulkanDevice` (raw Vulkan, verified on AMD RADV only; the device must support robust buffer access, which the runtime enables and refuses to open without). A dev-only table-driven parity crate (`poot-executor-parity`) runs
 the same fixture programs through the `Executor` on any `Device`. See [Execution](./execution) for
 the contract's shape.
 

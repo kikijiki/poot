@@ -1,0 +1,29 @@
+phase	rc	wall_s	peak_vram_mib	note
+download_fp8	0	165	0	
+download_gguf	0	118	531	
+oracle_receipt	0	3623	30413	
+serve_vllm_ready	2	90		
+serve_vllm_peak	-	95	39207	
+llamacpp_build	0	356	1	
+llamacpp_bench_pp	0	21	19413	
+llamacpp_bench_tg	0	29	19427	
+serve_llamacpp_ready	0	10		
+llamacpp_isl128_c1	0	16	38879	
+llamacpp_isl512_c1	0	18	38879	
+llamacpp_isl2048_c1	0	20	38891	
+llamacpp_isl8192_c1	0	30	38901	
+llamacpp_isl512_c4	0	230	39429	
+llamacpp_isl512_c16	0	127	38907	
+llamacpp_isl512_c32	0	93	38913	
+llamacpp_isl2048_c4	124	300	38913	
+llamacpp_isl2048_c16	0	245	38915	
+llamacpp_isl2048_c32	0	171	39443	
+serve_llamacpp_peak	-	1265	39443	
+poot_curve	0	2633	40429	
+poot_curve_roofline	0	64	30001	
+poot_curve_profile	0	1138	40429	
+serve_poot_ready	0	30		
+poot_isl128_c1	0	53	35067	
+poot_isl512_c1	0	143	35067	
+poot_isl512_c4	124	300	35067	
+serve_poot_peak	-	532	35067	

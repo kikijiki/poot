@@ -38,12 +38,15 @@ impl TextCodec {
 
     /// The anchored byte-DFA for `pattern`, cached by pattern. Building it is the dominant per-request
     /// cost of `guided_json` (~14ms for a small schema) and clients reuse schemas. The cache is bounded
-    /// (it clears past a cap).
+    /// (it clears past a cap). The build is size-bounded ([`DFA_SIZE_LIMIT`] and friends): a pattern
+    /// whose automaton would exceed the limits is refused rather than built, so one request cannot
+    /// exhaust the server.
     fn guided_dfa(
         &self,
         pattern: &str,
     ) -> Result<std::sync::Arc<regex_automata::dfa::dense::DFA<Vec<u32>>>> {
         use regex_automata::dfa::{StartKind, dense};
+        use regex_automata::nfa::thompson;
         const CAP: usize = 64;
         if let Some(dfa) = self.guided_dfa_cache.lock().unwrap().get(pattern) {
             return Ok(dfa.clone());
@@ -55,7 +58,13 @@ impl TextCodec {
         let whole = format!("(?:{pattern})$");
         let dfa = std::sync::Arc::new(
             dense::Builder::new()
-                .configure(dense::Config::new().start_kind(StartKind::Anchored))
+                .configure(
+                    dense::Config::new()
+                        .start_kind(StartKind::Anchored)
+                        .dfa_size_limit(Some(DFA_SIZE_LIMIT))
+                        .determinize_size_limit(Some(DETERMINIZE_SIZE_LIMIT)),
+                )
+                .thompson(thompson::Config::new().nfa_size_limit(Some(NFA_SIZE_LIMIT)))
                 .build(&whole)
                 .map_err(|e| err!("compile guided regex {pattern:?}: {e}"))?,
         );
@@ -67,20 +76,53 @@ impl TextCodec {
         Ok(dfa)
     }
 
-    /// The per-token UTF-8 byte table (token id -> decoded bytes), built once and cached (~50ms for a
-    /// 150k vocab). Byte-fallback tokens decode to U+FFFD and so are masked out of ASCII/JSON patterns.
+    /// The per-token surface byte table (token id -> the bytes the token contributes to the output),
+    /// built once from the vocabulary's token pieces and cached (~50ms for a 150k vocab). See
+    /// [`TextCodec::token_bytes`].
     fn token_byte_table(&self) -> std::sync::Arc<Vec<Vec<u8>>> {
         self.guided_byte_table
             .get_or_init(|| {
+                let kind = PieceKind::of(self.tokenizer.get_decoder());
+                let added = self.tokenizer.get_added_tokens_decoder();
                 let vocab = self.tokenizer.get_vocab_size(true);
-                let mut bytes = Vec::with_capacity(vocab);
-                for id in 0..vocab as u32 {
-                    let s = self.tokenizer.decode(&[id], false).unwrap_or_default();
-                    bytes.push(s.into_bytes());
-                }
+                let reverse = (kind == PieceKind::ByteLevel).then(byte_level_reverse);
+                let bytes = (0..vocab as u32)
+                    .map(|id| {
+                        let Some(piece) = self.tokenizer.id_to_token(id) else {
+                            return Vec::new();
+                        };
+                        if added.contains_key(&id) {
+                            return piece.into_bytes(); // an added token is its literal text
+                        }
+                        match (kind, &reverse) {
+                            (PieceKind::ByteLevel, Some(reverse)) => {
+                                byte_level_surface(&piece, reverse)
+                            }
+                            (PieceKind::SentencePiece, _) => sentencepiece_surface(&piece),
+                            (PieceKind::WordPiece, _) => piece
+                                .strip_prefix("##")
+                                .unwrap_or(&piece)
+                                .as_bytes()
+                                .to_vec(),
+                            _ => piece.into_bytes(),
+                        }
+                    })
+                    .collect();
                 std::sync::Arc::new(bytes)
             })
             .clone()
+    }
+
+    /// The bytes token `id` contributes to the output text, read from the vocabulary's token piece, not
+    /// from decoding the token alone: a word-initial SentencePiece token (`\u{2581}the`) keeps its
+    /// leading space (0x20) where an isolated decode strips it, and a byte-fallback token (`<0x41>`) is
+    /// its one byte. Guided masks and logprob `bytes` both read this. Empty for an id outside the
+    /// vocabulary.
+    pub fn token_bytes(&self, id: u32) -> Vec<u8> {
+        self.token_byte_table()
+            .get(id as usize)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Build a `guided_json` constraint: compile a JSON Schema to a regex and constrain decoding to it.
@@ -123,6 +165,176 @@ impl TextCodec {
     }
 }
 
+/// Largest compiled DFA (bytes) a client pattern may build. A pattern past it is refused with a 400.
+const DFA_SIZE_LIMIT: usize = 1 << 20;
+/// Largest working set (bytes) the DFA determinization may use before it gives up.
+const DETERMINIZE_SIZE_LIMIT: usize = 1 << 20;
+/// Largest Thompson NFA (bytes) a client pattern may build, which bounds the work before determinization.
+const NFA_SIZE_LIMIT: usize = 1 << 20;
+/// Most per-state token masks one request keeps ([`StateMasks`]); the cache clears past it.
+const STATE_MASK_CAP: usize = 1024;
+
+/// How a tokenizer's vocabulary pieces spell their bytes, read from its decoder: the decoder is what
+/// turns pieces back into text, so it names the spelling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PieceKind {
+    /// GPT-2 byte-level BPE: each piece character stands for one byte.
+    ByteLevel,
+    /// SentencePiece (Metaspace or ByteFallback decoder): U+2581 is a space, `<0xNN>` is a byte.
+    SentencePiece,
+    /// WordPiece: a `##` prefix marks a continuation and is not text.
+    WordPiece,
+    /// No decoder, or one that rewrites pieces in a way poot does not model (CTC, BPEDecoder): the piece
+    /// is taken as its own text. Such tokenizers are unsupported for exact surface bytes.
+    Verbatim,
+}
+
+impl PieceKind {
+    fn of(decoder: Option<&tokenizers::DecoderWrapper>) -> Self {
+        use tokenizers::DecoderWrapper;
+        match decoder {
+            Some(DecoderWrapper::ByteLevel(_)) => Self::ByteLevel,
+            Some(DecoderWrapper::Metaspace(_) | DecoderWrapper::ByteFallback(_)) => {
+                Self::SentencePiece
+            }
+            Some(DecoderWrapper::WordPiece(_)) => Self::WordPiece,
+            Some(DecoderWrapper::Sequence(seq)) => {
+                // the most specific member names the spelling: byte-level, then SentencePiece, then WordPiece.
+                let kinds: Vec<Self> = seq
+                    .get_decoders()
+                    .iter()
+                    .map(|d| Self::of(Some(d)))
+                    .collect();
+                [Self::ByteLevel, Self::SentencePiece, Self::WordPiece]
+                    .into_iter()
+                    .find(|k| kinds.contains(k))
+                    .unwrap_or(Self::Verbatim)
+            }
+            _ => Self::Verbatim,
+        }
+    }
+}
+
+/// The inverse of GPT-2's `bytes_to_unicode`: the byte each byte-level BPE piece character stands for.
+/// Printable Latin-1 bytes are themselves; the other bytes took the code points from U+0100 up, in order.
+fn byte_level_reverse() -> std::collections::HashMap<char, u8> {
+    let printable = |b: u8| matches!(b, b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF);
+    let mut next = 0x100u32;
+    let mut reverse = std::collections::HashMap::with_capacity(256);
+    for b in 0..=255u8 {
+        let c = if printable(b) {
+            char::from(b)
+        } else {
+            let c = char::from_u32(next).expect("U+0100..U+0143 are scalar values");
+            next += 1;
+            c
+        };
+        reverse.insert(c, b);
+    }
+    reverse
+}
+
+/// The bytes of a byte-level BPE piece: each character is the byte it encodes (a character outside the
+/// alphabet is its own UTF-8).
+fn byte_level_surface(piece: &str, reverse: &std::collections::HashMap<char, u8>) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(piece.len());
+    for c in piece.chars() {
+        match reverse.get(&c) {
+            Some(&b) => bytes.push(b),
+            None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    bytes
+}
+
+/// The bytes of a SentencePiece-style piece: the space marker U+2581 is a space (0x20), and a byte-fallback
+/// piece `<0xNN>` is the byte NN. Any other piece is its own text.
+fn sentencepiece_surface(piece: &str) -> Vec<u8> {
+    if let Some(byte) = piece
+        .strip_prefix("<0x")
+        .and_then(|hex| hex.strip_suffix('>'))
+        .filter(|hex| hex.len() == 2)
+        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+    {
+        return vec![byte];
+    }
+    piece.replace('\u{2581}', " ").into_bytes()
+}
+
+/// One DFA state's allowed tokens as a bitmask over the vocabulary.
+struct TokenMask {
+    words: Vec<u64>,
+}
+
+impl TokenMask {
+    fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().enumerate().flat_map(|(w, &word)| {
+            let mut rest = word;
+            std::iter::from_fn(move || {
+                if rest == 0 {
+                    return None;
+                }
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                Some(w as u32 * 64 + bit)
+            })
+        })
+    }
+}
+
+/// The allowed-token mask of each DFA state a request has visited. A state's mask is computed by walking
+/// the whole vocabulary once; every later visit reads the cached bitmask, so a step costs the allowed
+/// count, not the vocabulary. Shared by clones of one constraint.
+#[derive(Default)]
+pub struct StateMasks {
+    by_state: std::sync::Mutex<
+        std::collections::HashMap<
+            regex_automata::util::primitives::StateID,
+            std::sync::Arc<TokenMask>,
+        >,
+    >,
+    /// Token byte-walks done computing masks: grows by the vocabulary size per state computed, never on a
+    /// cache hit.
+    walked: std::sync::atomic::AtomicUsize,
+}
+
+impl StateMasks {
+    fn mask(
+        &self,
+        dfa: &regex_automata::dfa::dense::DFA<Vec<u32>>,
+        state: regex_automata::util::primitives::StateID,
+        bytes: &[Vec<u8>],
+    ) -> std::sync::Arc<TokenMask> {
+        use regex_automata::dfa::Automaton;
+        use std::sync::atomic::Ordering;
+        if let Some(mask) = self.by_state.lock().unwrap().get(&state) {
+            return mask.clone();
+        }
+        let mut words = vec![0u64; bytes.len().div_ceil(64)];
+        for (id, tok_bytes) in bytes.iter().enumerate() {
+            if tok_bytes.is_empty() {
+                continue;
+            }
+            let mut s = state;
+            let alive = tok_bytes.iter().all(|&b| {
+                s = dfa.next_state(s, b);
+                !(dfa.is_dead_state(s) || dfa.is_quit_state(s))
+            });
+            if alive {
+                words[id / 64] |= 1 << (id % 64);
+            }
+        }
+        self.walked.fetch_add(bytes.len(), Ordering::Relaxed);
+        let mask = std::sync::Arc::new(TokenMask { words });
+        let mut cache = self.by_state.lock().unwrap();
+        if cache.len() >= STATE_MASK_CAP {
+            cache.clear(); // bounded: drop the cold set rather than grow without limit
+        }
+        cache.insert(state, mask.clone());
+        mask
+    }
+}
+
 /// A guided-decoding constraint that masks each decode step to the tokens it permits. Stateful: it
 /// advances as each generated token is observed.
 ///
@@ -147,8 +359,10 @@ pub enum Constraint {
         dfa: std::sync::Arc<regex_automata::dfa::dense::DFA<Vec<u32>>>,
         /// the current DFA state (advances as tokens are observed).
         state: regex_automata::util::primitives::StateID,
-        /// per-token UTF-8 bytes, indexed by token id (shared from the runner).
+        /// per-token surface bytes, indexed by token id (see [`TextCodec::token_bytes`]).
         bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        /// the allowed-token bitmask of every state this constraint has visited.
+        masks: std::sync::Arc<StateMasks>,
         /// the model's EOS id, permitted in a match state.
         eos: u32,
     },
@@ -201,6 +415,7 @@ impl Constraint {
             dfa,
             state: start,
             bytes,
+            masks: std::sync::Arc::default(),
             eos,
         }
     }
@@ -248,27 +463,16 @@ impl Constraint {
                 (allowed, eos_ok)
             }
             Constraint::Regex {
-                dfa, state, bytes, ..
+                dfa,
+                state,
+                bytes,
+                masks,
+                ..
             } => {
                 // a token is allowed if its bytes walk the DFA from `state` without hitting a dead/quit
-                // state. EOS is allowed when the current state matches (the output so far is a full match).
-                for (id, tok_bytes) in bytes.iter().enumerate() {
-                    if tok_bytes.is_empty() {
-                        continue;
-                    }
-                    let mut s = *state;
-                    let mut alive = true;
-                    for &b in tok_bytes {
-                        s = dfa.next_state(s, b);
-                        if dfa.is_dead_state(s) || dfa.is_quit_state(s) {
-                            alive = false;
-                            break;
-                        }
-                    }
-                    if alive {
-                        allowed.insert(id as u32);
-                    }
-                }
+                // state (the state's cached mask). EOS is allowed when the current state matches (the
+                // output so far is a full match).
+                allowed.extend(masks.mask(dfa, *state, bytes).ids());
                 let eos_ok = dfa.is_match_state(dfa.next_eoi_state(*state));
                 (allowed, eos_ok)
             }
@@ -2540,5 +2744,305 @@ mod schema_regex_tests {
             failures, 0,
             "{failures} conforming instances were wrongly rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod surface_bytes_and_limits {
+    use super::Constraint;
+    use crate::chat_format::ChatFormat;
+    use crate::tokenize::{GgufVocab, TextCodec};
+    use regex_automata::dfa::Automaton;
+
+    /// A SentencePiece GGUF vocabulary with `add_space_prefix` (the llama default): word-initial pieces
+    /// carry the U+2581 marker, which an isolated decode strips from the first piece of its output.
+    fn spm_codec() -> TextCodec {
+        let tokens: Vec<String> = [
+            "<unk>",
+            "<s>",
+            "</s>",
+            "\u{2581}the",
+            "\u{2581}cat",
+            "\u{2581}",
+            "a",
+            "b",
+            "c",
+            "<0x41>",
+        ]
+        .map(String::from)
+        .to_vec();
+        let vocab = GgufVocab {
+            model: Some("llama".into()),
+            scores: Some(vec![0.0; tokens.len()]),
+            token_types: Some(vec![2, 3, 3, 1, 1, 1, 1, 1, 1, 6]),
+            tokens: Some(tokens),
+            unknown_token_id: Some(0),
+            add_space_prefix: Some(true),
+            ..GgufVocab::default()
+        };
+        TextCodec::from_gguf(&vocab, 2, ChatFormat::ChatML).expect("build the SPM codec")
+    }
+
+    /// Greedy lowest-id walk of a constraint to its first accepting state: the token ids it picks.
+    fn walk(constraint: &mut Constraint) -> Vec<u32> {
+        let mut picked = Vec::new();
+        for _ in 0..16 {
+            let (allowed, eos_ok) = constraint.allowed_next();
+            if eos_ok {
+                return picked;
+            }
+            let next = allowed
+                .into_iter()
+                .min()
+                .expect("a live state allows some token");
+            constraint.advance(next);
+            picked.push(next);
+        }
+        panic!("the walk never reached an accepting state: {picked:?}");
+    }
+
+    #[test]
+    fn word_initial_spm_token_keeps_its_leading_space_in_guided_output() {
+        let codec = spm_codec();
+        let mut constraint = codec
+            .build_regex_constraint("^ the [a-z]+$")
+            .expect("build the constraint");
+        let picked = walk(&mut constraint);
+        let text: Vec<u8> = picked
+            .iter()
+            .flat_map(|&id| codec.token_bytes(id))
+            .collect();
+        assert_eq!(
+            picked.first(),
+            Some(&3),
+            "the first token must be the word-initial `the`"
+        );
+        let re = regex_automata::meta::Regex::new("^ the [a-z]+$").unwrap();
+        assert!(
+            re.is_match(&text),
+            "guided output {:?} must match the regex",
+            String::from_utf8_lossy(&text)
+        );
+    }
+
+    #[test]
+    fn token_bytes_come_from_the_vocabulary_piece() {
+        let codec = spm_codec();
+        assert_eq!(
+            codec.token_bytes(3),
+            b" the",
+            "word-initial piece starts with 0x20"
+        );
+        assert_eq!(codec.token_bytes(5), b" ", "the bare marker is a space");
+        assert_eq!(codec.token_bytes(6), b"a");
+        assert_eq!(
+            codec.token_bytes(9),
+            b"A",
+            "a byte-fallback piece is its byte"
+        );
+        assert_eq!(
+            codec.token_bytes(1),
+            b"<s>",
+            "a control token is its literal text"
+        );
+        assert!(codec.token_bytes(99).is_empty(), "outside the vocabulary");
+    }
+
+    #[test]
+    fn byte_level_pieces_map_back_to_their_bytes() {
+        use tokenizers::Tokenizer;
+        use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
+        use tokenizers::models::wordlevel::WordLevel;
+        // `\u{0120}` is GPT-2's space; `\u{00c3}\u{00a9}` is the two bytes of U+00E9.
+        let vocab = [("\u{0120}the", 0u32), ("\u{00c3}\u{00a9}", 1), ("x", 2)]
+            .map(|(t, i)| (t.to_string(), i))
+            .into();
+        let mut tokenizer = Tokenizer::new(
+            WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("x".into())
+                .build()
+                .unwrap(),
+        );
+        tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+        let codec = TextCodec::new(
+            tokenizer,
+            None,
+            None,
+            0,
+            ChatFormat::ChatML,
+            crate::tokenize::ChatTemplate::default(),
+        );
+        assert_eq!(codec.token_bytes(0), b" the");
+        assert_eq!(codec.token_bytes(1), "\u{e9}".as_bytes());
+    }
+
+    /// A codec over a word-level vocabulary with the given decoder (`None` is no decoder at all).
+    fn word_codec(decoder: Option<tokenizers::DecoderWrapper>) -> TextCodec {
+        use tokenizers::Tokenizer;
+        use tokenizers::models::wordlevel::WordLevel;
+        let vocab = [("##ing", 0u32), ("the", 1), ("\u{2581}x", 2), ("<unk>", 3)]
+            .map(|(t, i)| (t.to_string(), i))
+            .into();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_decoder(decoder);
+        TextCodec::new(
+            tokenizer,
+            None,
+            None,
+            3,
+            ChatFormat::ChatML,
+            crate::tokenize::ChatTemplate::default(),
+        )
+    }
+
+    #[test]
+    fn a_wordpiece_continuation_loses_its_marker_and_other_decoders_keep_the_piece() {
+        use tokenizers::DecoderWrapper;
+        use tokenizers::decoders::wordpiece::WordPiece;
+        let wordpiece = word_codec(Some(DecoderWrapper::WordPiece(WordPiece::default())));
+        assert_eq!(
+            wordpiece.token_bytes(0),
+            b"ing",
+            "`##` is a marker, not text"
+        );
+        assert_eq!(wordpiece.token_bytes(1), b"the");
+        assert_eq!(
+            wordpiece.token_bytes(2),
+            "\u{2581}x".as_bytes(),
+            "WordPiece has no space marker"
+        );
+        let verbatim = word_codec(None);
+        assert_eq!(
+            verbatim.token_bytes(0),
+            b"##ing",
+            "no decoder: the piece is the text"
+        );
+        assert_eq!(verbatim.token_bytes(2), "\u{2581}x".as_bytes());
+    }
+
+    #[test]
+    fn a_state_explosion_pattern_is_refused() {
+        let codec = spm_codec();
+        // `(a|b)*a(a|b){17}` determinizes to 2^18 states.
+        let started = std::time::Instant::now();
+        let err = codec
+            .build_regex_constraint("(a|b)*a(a|b){17}")
+            .err()
+            .expect("the DFA size limit must refuse the pattern");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "refusal took {:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("guided regex"), "{err}");
+        // a pattern within the limits still builds.
+        codec
+            .build_regex_constraint("(a|b)*a(a|b){6}")
+            .expect("a modest pattern builds");
+    }
+
+    /// A 32k-token numeric vocabulary: every token walks the `[0-9]+` DFA, so a mask is a full-vocab scan.
+    fn numeric_codec() -> TextCodec {
+        use tokenizers::Tokenizer;
+        use tokenizers::models::wordlevel::WordLevel;
+        let vocab = (0..32_000u32)
+            .map(|i| (i.to_string(), i))
+            .chain([("<unk>".to_string(), 32_000u32)])
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+        TextCodec::new(
+            Tokenizer::new(model),
+            None,
+            None,
+            32_000,
+            ChatFormat::ChatML,
+            crate::tokenize::ChatTemplate::default(),
+        )
+    }
+
+    /// Guided decode-rate row: the host cost of one mask step on a 32k vocabulary where about 12% of the
+    /// tokens are allowed. Prints ns/step; run by name with `--run-ignored` and compare a build with the
+    /// per-state cache against one without it (see the card). A timing is not an assertion.
+    #[test]
+    #[ignore = "timing row, not a correctness test: prints ns/step"]
+    fn guided_mask_step_rate_row() {
+        use tokenizers::Tokenizer;
+        use tokenizers::models::wordlevel::WordLevel;
+        let letters = b"abcdefghijklmnopqrstuvwxyz";
+        let vocab = (0..32_000u32)
+            .map(|i| (format!("{}{i}", letters[i as usize % 26] as char), i))
+            .chain([("<unk>".to_string(), 32_000u32)])
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("<unk>".to_string())
+            .build()
+            .unwrap();
+        let codec = TextCodec::new(
+            Tokenizer::new(model),
+            None,
+            None,
+            32_000,
+            ChatFormat::ChatML,
+            crate::tokenize::ChatTemplate::default(),
+        );
+        let mut constraint = codec.build_regex_constraint("([a-c][0-9]+)+").unwrap();
+        let steps = 300u32;
+        let started = std::time::Instant::now();
+        let mut allowed_len = 0;
+        for _ in 0..steps {
+            let (allowed, _) = constraint.allowed_next();
+            allowed_len = allowed.len();
+            constraint.advance(0); // token `a0`
+        }
+        let per_step = started.elapsed() / steps;
+        eprintln!("guided mask step: {per_step:?}/step, {allowed_len} of 32000 tokens allowed");
+    }
+
+    #[test]
+    fn a_revisited_state_reads_its_cached_mask() {
+        let codec = numeric_codec();
+        let mut constraint = codec.build_regex_constraint("[0-9]+").unwrap();
+        let Constraint::Regex { masks, .. } = &constraint else {
+            unreachable!("a regex constraint");
+        };
+        let masks = masks.clone();
+        let walked = || masks.walked.load(std::sync::atomic::Ordering::Relaxed);
+        let (first, _) = constraint.allowed_next();
+        assert_eq!(first.len(), 32_000);
+        assert_eq!(
+            walked(),
+            32_001,
+            "the first visit scans the vocabulary once"
+        );
+        constraint.advance(7);
+        let (_, _) = constraint.allowed_next();
+        let after_second_state = walked();
+        assert_eq!(after_second_state, 2 * 32_001, "a new state scans once");
+        for token in [1, 22, 333, 4444] {
+            let (allowed, _) = constraint.allowed_next();
+            assert_eq!(allowed.len(), 32_000);
+            constraint.advance(token);
+        }
+        assert_eq!(
+            walked(),
+            after_second_state,
+            "revisiting the loop state must not scan the vocabulary again"
+        );
+        // the cached mask is the same set the scan produced.
+        let Constraint::Regex { dfa, state, .. } = &constraint else {
+            unreachable!()
+        };
+        assert!(!dfa.is_dead_state(*state));
     }
 }

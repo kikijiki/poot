@@ -17,7 +17,7 @@ use crate::driver::{
     Conversation, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, ModelHandle,
     PreparedSetLimits, program_retention,
 };
-use poot_text::{Speaker, TextCodec, TextError};
+use poot_text::{RenderedChat, Speaker, TextCodec, TextError};
 
 /// Tokens per prefill step at most, a multiple of the model's prefill granule ([`driver_options`]).
 const PREFILL_CHUNK: usize = 128;
@@ -124,11 +124,36 @@ impl From<InvalidRequest> for OneShotError {
     }
 }
 
+/// The text of a request that is encoded.
+#[derive(Debug, PartialEq, Eq)]
+enum Prompt {
+    /// A rendered chat turn: its message contents are never parsed for control tokens.
+    Chat(RenderedChat),
+    /// The caller's own text, which the output continues.
+    Raw(String),
+}
+
+impl Prompt {
+    fn text(&self) -> &str {
+        match self {
+            Self::Chat(chat) => &chat.prompt,
+            Self::Raw(text) => text,
+        }
+    }
+
+    fn encode(&self, codec: &TextCodec) -> Result<Vec<u32>, TextError> {
+        match self {
+            Self::Chat(chat) => codec.encode_chat(chat),
+            Self::Raw(text) => codec.encode(text),
+        }
+    }
+}
+
 /// A request as the model reads it.
 #[derive(Debug, PartialEq, Eq)]
 struct Framed {
     /// The text that is encoded.
-    prompt: String,
+    prompt: Prompt,
     /// Whether `prompt` is the caller's own text, which the output continues, rather than a chat turn.
     continued: bool,
     /// The chat template's turn-end markers: they end the run and never reach the sink.
@@ -148,14 +173,14 @@ fn frame(text: &TextCodec, request: &TextRequest) -> Result<Framed, OneShotError
     };
     match (chat, &request.system) {
         (Some(rendered), _) => Ok(Framed {
-            prompt: rendered.prompt,
-            continued: false,
             turn_ends: rendered.stops.clone(),
-            stops: [rendered.stops, request.stops.clone()].concat(),
+            stops: [rendered.stops.clone(), request.stops.clone()].concat(),
+            prompt: Prompt::Chat(rendered),
+            continued: false,
         }),
         (None, Some(_)) => Err(OneShotError::SystemWithoutTemplate),
         (None, None) => Ok(Framed {
-            prompt: request.prompt.clone(),
+            prompt: Prompt::Raw(request.prompt.clone()),
             continued: true,
             turn_ends: Vec::new(),
             stops: request.stops.clone(),
@@ -174,9 +199,9 @@ struct Plan {
 
 fn plan(handle: &ModelHandle, request: &TextRequest) -> Result<Plan, OneShotError> {
     let framed = frame(handle.text(), request)?;
-    let prompt = handle
-        .text()
-        .encode(&framed.prompt)
+    let prompt = framed
+        .prompt
+        .encode(handle.text())
         .map_err(OneShotError::Encode)?;
     let max_positions = handle.config().max_positions;
     let window = request.ctx.unwrap_or(max_positions);
@@ -245,7 +270,7 @@ pub fn generate_text(
     )?
     .with_phase_timing();
     if framed.continued {
-        sink(&framed.prompt);
+        sink(framed.prompt.text());
     }
     // The driver hands the sink the piece that completes a stop string. A chat template's turn end is
     // markup, not reply, so it is cut out; a caller's own `-r` string stays in the text, as in llama-cli.
@@ -352,9 +377,7 @@ impl ChatSession {
             .render_turns(self.options.system.as_deref(), &turns)
             .map_err(OneShotError::Render)?
             .ok_or(OneShotError::ConversationWithoutTemplate)?;
-        let prompt = text
-            .encode(&rendered.prompt)
-            .map_err(OneShotError::Encode)?;
+        let prompt = text.encode_chat(&rendered).map_err(OneShotError::Encode)?;
         let max_new =
             GenerateRequest::max_new_within(prompt.len(), self.window, self.options.max_new)?;
         let sampling = Sampling {
@@ -447,7 +470,7 @@ mod tests {
     #[test]
     fn a_templated_model_is_asked_as_a_chat_turn_with_the_callers_stops_after_its_own() {
         let framed = frame(&codec(Some(TEMPLATE)), &request(false)).unwrap();
-        assert_eq!(framed.prompt, "[user:Hi][assistant:");
+        assert_eq!(framed.prompt.text(), "[user:Hi][assistant:");
         assert!(!framed.continued);
         assert_eq!(framed.stops.last().map(String::as_str), Some("END"));
         assert!(framed.stops.len() > 1, "{:?}", framed.stops);
@@ -461,7 +484,7 @@ mod tests {
         assert_eq!(
             framed,
             Framed {
-                prompt: "Hi".into(),
+                prompt: Prompt::Raw("Hi".into()),
                 continued: true,
                 turn_ends: Vec::new(),
                 stops: vec!["END".into()],
@@ -477,7 +500,7 @@ mod tests {
         assert_eq!(
             framed,
             Framed {
-                prompt: "Hi".into(),
+                prompt: Prompt::Raw("Hi".into()),
                 continued: true,
                 turn_ends: Vec::new(),
                 stops: vec!["END".into()],
@@ -495,7 +518,10 @@ mod tests {
             ..request(raw)
         };
         let framed = frame(&codec(Some(TEMPLATE)), &with_system(false)).unwrap();
-        assert_eq!(framed.prompt, "[system:Be terse.][user:Hi][assistant:");
+        assert_eq!(
+            framed.prompt.text(),
+            "[system:Be terse.][user:Hi][assistant:"
+        );
         assert!(matches!(
             frame(&codec(None), &with_system(false)),
             Err(OneShotError::SystemWithoutTemplate)

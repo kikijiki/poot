@@ -2230,6 +2230,7 @@ dependencies = [
 name = "poot-text"
 version = "0.0.0"
 dependencies = [
+ "aho-corasick",
  "minijinja",
  "minijinja-contrib",
  "regex-automata",
@@ -2323,6 +2324,7 @@ name = "pootc"
 version = "0.0.0"
 dependencies = [
  "poot-codegen",
+ "poot-eval",
  "poot-graph-plan",
  "poot-kernel-ir",
  "poot-kernelgen",

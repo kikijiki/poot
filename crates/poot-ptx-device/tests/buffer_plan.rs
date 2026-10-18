@@ -298,3 +298,16 @@ fn an_aie_launch_is_a_typed_refusal_on_ptx() {
     );
     device.abort().unwrap();
 }
+
+/// POOT-1205 SC-002: the engine refuses a dispatch whose asserted length exceeds its buffer by one element
+/// with the shared `DispatchError::ArgExceedsBuffer`, before this device is handed the dispatch.
+///
+/// Mutation: remove the `check_arg_lengths` call in `Engine::walk` (`crates/poot-executor/src/engine.rs`);
+/// the device records the dispatch and the step no longer fails, so this row goes red.
+#[test]
+fn an_over_length_dispatch_is_refused_by_the_engine_on_ptx() {
+    let Some(device) = require_ptx() else {
+        return;
+    };
+    poot_executor_parity::dispatch_length::over_length_dispatch_is_refused(device);
+}

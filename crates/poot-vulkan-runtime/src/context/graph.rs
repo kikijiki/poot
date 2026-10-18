@@ -21,14 +21,14 @@ const DESCRIPTORS_PER_SET: u32 = 12;
 ///
 /// The count is the plan's own, not the buffer's capacity: an arena slot's buffer is sized to its
 /// largest occupant, and a smaller value sharing it must not let a kernel read or write past its own
-/// operand (Card 547b; Card 546a F8). A count whose bytes exceed the buffer is refused
-/// ([`RuntimeError::ArgExceedsBuffer`]).
+/// operand (Card 547b; Card 546a F8). The executor refuses a count beyond the buffer's capacity before
+/// any dispatch reaches this layer (`poot_executor::DispatchError::ArgExceedsBuffer`).
 #[derive(Clone, Copy)]
 pub struct Binding<'a> {
     /// The buffer the kernel reads or writes; it must belong to the same [`Context`] as the dispatch.
     pub buffer: &'a DeviceBuffer,
-    /// Element count the kernel is told the buffer holds, in the argument schema's element kind; at most
-    /// the buffer's byte size allows.
+    /// Element count the kernel is told the buffer holds, in the argument schema's element kind. The caller
+    /// guarantees it is at most the buffer's capacity (the executor's dispatch check does).
     pub elems: u32,
 }
 

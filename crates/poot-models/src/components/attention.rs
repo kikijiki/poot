@@ -808,6 +808,31 @@ fn attention_with(
                     hq,
                     t,
                 )?,
+                // A decode token attends to the stored positions up to its own and nothing past them, so
+                // the kernel is bounded by that live length and the rest of the capacity is never read.
+                // `Slot::Pos` is declared below the capacity, a checked bind fact, so the length is in
+                // `1..=positions` by construction and the guard's witness has nothing to report. A prefill
+                // chunk's queries end at different positions: it keeps the mask over the capacity, which
+                // its flash form skips by block.
+                None if t == 1 => {
+                    let len = b.binary_scalar(
+                        BinOp::Add,
+                        b.reshape(step.pos(), vec![rows])?,
+                        Scalar::I32(1),
+                    )?;
+                    ops::attention_live(
+                        b,
+                        q,
+                        ops::AttentionKeys::Single(k_cache),
+                        v_cache,
+                        hq / hkv,
+                        p.scale,
+                        mask,
+                        p.softcap,
+                        len,
+                    )?
+                    .out
+                }
                 None => ops::attention_masked_softcap(
                     b,
                     q,
@@ -1276,6 +1301,28 @@ mod tests {
             let mut p = fx.clone();
             p.perturb(id(role));
             oracle::assert_differs(&run(&p, o, &x, &pos, &state).0, &got, id(role));
+        }
+    }
+
+    /// POOT-1209 SC-003: a one-token decode step is bounded by its live length `pos + 1`. At the first
+    /// position (a length of one), at 15 and at the last of the capacity, over caches holding stale garbage
+    /// past the position, the output and both carried caches match the f64 reference, which attends to the
+    /// causal prefix of the plain scores. Mutation: `len = pos` in the decode branch of `attention_with`;
+    /// the `pos` 0 row goes red first (element 0 leaves the reference).
+    #[test]
+    fn a_decode_token_attends_to_exactly_its_live_prefix_at_the_first_a_middle_and_the_last_position()
+     {
+        let fx = fixture(BASE);
+        let cache_len = KV_HEADS * CAP * HEAD_DIM;
+        let state = [oracle::random(cache_len, 51), oracle::random(cache_len, 52)];
+        let x = oracle::random(WIDTH, 53);
+        for pos in [0, 15, CAP as i32 - 1] {
+            let (got, caches) = run(&fx, BASE, &x, &[pos], &state);
+            let (want, want_caches) = reference(&fx, BASE, &x, &[pos], &state);
+            oracle::assert_matches_f64(&got, &want, 1e-5);
+            for (got, want) in caches.iter().zip(&want_caches) {
+                oracle::assert_matches_f64(got, want, 1e-5);
+            }
         }
     }
 

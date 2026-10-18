@@ -6080,14 +6080,14 @@ per_backend!(
     qwen4exp_bf16_owners_are_not_widened_per_step_ptx
 );
 
-/// SC-009 (dfamily.md F4): a token outside the vocabulary reaches the PLE's guard as a typed
-/// validation fault naming the PLE's layer, not as published tokens. Mutation: discard the guard
-/// witness in `components::ple::ngram_ids`; the fault disappears, the run publishes tokens and the
-/// row goes red.
-fn qwen4exp_out_of_vocab_token_is_a_typed_validation_fault(choice: BackendChoice) {
-    use poot_executor::ExecError;
-    use poot_graph_ir::ValidationPacketError;
-    use poot_models::components::ple::PleWitness;
+/// SC-009 (dfamily.md F4): a token outside the vocabulary is refused at the driver boundary with the
+/// typed `TokenOutOfVocab`, before a device step runs. The PLE's device-side range witness (declared by
+/// the graph, pinned by `poot-models` `an_out_of_vocabulary_token_is_a_typed_validation_fault`) is
+/// defence in depth for a caller that feeds an executor directly: the driver is the only producer of
+/// a model's token inputs, validates every prompt id, and generates only ids below the vocabulary,
+/// so the witness cannot fire through it. Mutation: drop the vocabulary check from `check_admission`;
+/// the PLE guard fires instead (a validation fault) and the row goes red.
+fn qwen4exp_out_of_vocab_token_is_refused_at_the_driver(choice: BackendChoice) {
     let handle = qwen4exp_handle();
     let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
         return;
@@ -6105,19 +6105,23 @@ fn qwen4exp_out_of_vocab_token_is_a_typed_validation_fault(choice: BackendChoice
             &mut |_: u32, _: &str| GenerationControl::Continue(()),
         )
         .expect_err("a token outside the vocabulary must not publish tokens");
-    let DriverError::Device(ExecError::Validation(failure)) = error else {
-        panic!("expected a validation fault, got {error:?}");
-    };
-    let ValidationPacketError::Failure(failure) = *failure else {
-        panic!("expected one failing lane, got {failure:?}");
-    };
-    assert_eq!(PleWitness::decode(failure.id), Some(1), "{failure}");
+    assert!(
+        matches!(
+            error,
+            DriverError::InvalidRequest(InvalidRequest::TokenOutOfVocab {
+                token: 48,
+                at: 1,
+                vocab: 48
+            })
+        ),
+        "{error:?}"
+    );
 }
 per_backend!(
-    qwen4exp_out_of_vocab_token_is_a_typed_validation_fault,
-    qwen4exp_out_of_vocab_token_is_a_typed_validation_fault_wgpu,
-    qwen4exp_out_of_vocab_token_is_a_typed_validation_fault_rocm,
-    qwen4exp_out_of_vocab_token_is_a_typed_validation_fault_ptx
+    qwen4exp_out_of_vocab_token_is_refused_at_the_driver,
+    qwen4exp_out_of_vocab_token_is_refused_at_the_driver_wgpu,
+    qwen4exp_out_of_vocab_token_is_refused_at_the_driver_rocm,
+    qwen4exp_out_of_vocab_token_is_refused_at_the_driver_ptx
 );
 
 /// SC-008 (the driver's half): a prefill chunk the family's granule does not divide is a typed

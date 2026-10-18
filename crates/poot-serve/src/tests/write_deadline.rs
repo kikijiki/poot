@@ -145,8 +145,8 @@ fn write_deadline_bounds_production_stream_after_a_piece_saturates() {
     drop(client);
 }
 
-/// card 224: a `Content-Length` over `MAX_BODY_BYTES` must produce a 413 on the wire (not a hang or crash).
-/// This drives `handle`'s early-return path via `respond_error` semantics, as `handle` does with a `None` from `read_request`; `read_request_rejects_oversized_content_length_without_reading_body` covers the allocation-avoidance half.
+/// card 224: a `Content-Length` over the body cap must produce a 413 on the wire (not a hang or crash).
+/// This drives `handle`'s early-return path via `respond_error` semantics, as `handle` does for a `BodyTooLarge` refusal; `read_request_rejects_oversized_content_length_without_reading_body` covers the allocation-avoidance half.
 #[test]
 fn oversized_content_length_413_response_shape() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

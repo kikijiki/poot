@@ -486,6 +486,8 @@ impl World {
 }
 
 struct Alloc {
+    /// The native element capacity the buffer was allocated with.
+    elems: usize,
     data: RefCell<Vec<u8>>,
     _guard: AllocGuard,
 }
@@ -640,9 +642,14 @@ impl Device for Interp {
     ) -> Result<Buf, InterpFault> {
         let bytes = elems * storage.element().byte_width();
         Ok(Rc::new(Alloc {
+            elems,
             data: RefCell::new(vec![0; bytes]),
             _guard: self.memory.record_alloc(role, bytes as u64),
         }))
+    }
+
+    fn buffer_elems(&self, buffer: &Buf) -> usize {
+        buffer.elems
     }
 
     fn load_kernel(&mut self, key: &str, _kernel: CompiledKernel) -> Result<Body, InterpFault> {

@@ -125,6 +125,7 @@ The latest benchmark row per family and backend, from the stored results. A refu
 
 | Family | Backend | Result | Run |
 | --- | --- | --- | --- |
+| `qwen35` | ptx | <span class="matrix-status matrix-status--yes">Measured</span> | `2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb` |
 | `qwen35` | wgpu | <span class="matrix-status matrix-status--yes">Measured</span> | `2026-10-18-strix-halo-qwen3-8-27b-fp8-wgpu-4c8945ee1` |
 <!-- generated:feature-matrix:end -->
 

@@ -13,10 +13,12 @@ rust-version.workspace = true
 test-support = []
 
 [dependencies]
+aho-corasick.workspace = true
 tokenizers.workspace = true
 # Guided decoding: byte-level DFA for regex-constrained generation.
 regex-automata.workspace = true
-minijinja.workspace = true
+# `fuel` bounds the instructions a chat template may run.
+minijinja = { workspace = true, features = ["fuel"] }
 minijinja-contrib.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

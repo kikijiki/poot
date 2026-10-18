@@ -139,9 +139,10 @@ Every committed run, grouped by model and scenario. The point is to watch poot's
 
 | run | date | behind | backend | poot commit | GPU | poot tok/s | poot TTFT ms | poot VRAM GiB | fastest baseline | poot vs fastest |
 |---|---|---|---|---|---|---|---|---|---|---|
+| 2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb | 2026-10-18 | 0 | ptx | b00cb7fe | H100 80GB HBM3 | 8.2 | 3885.7 | 39.48 | - | - |
+| 2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb-run2 | 2026-10-18 | 0 | ptx | b00cb7fe | H100 80GB HBM3 | 8.2 | 3905.5 | 39.48 | - | - |
 | 2026-10-18-strix-halo-qwen3-8-27b-fp8-rocm-45713e6c3 | 2026-10-18 | 0 | - | 45713e6c | AMD Radeon 8060S Graphics (ROCm gfx1151, STRIX_HALO) | 5.0 | 10390.9 | - | - | - |
 | 2026-10-18-strix-halo-qwen3-8-27b-fp8-wgpu-4c8945ee1 | 2026-10-18 | 0 | wgpu | 4c8945ee | AMD Radeon 8060S Graphics | 3.0 | 30654.2 | - | - | - |
-| 2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb | 2026-10-18 | 0 | ptx | b00cb7fe | H100 80GB HBM3 | 8.2 | 3885.7 | 39.48 | - | - |
 
 ## smollm3-3b - decode-curve
 

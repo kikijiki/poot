@@ -34,6 +34,7 @@ pub mod bf16_cast;
 pub mod block_top_k;
 pub mod capture;
 pub mod coresident;
+pub mod dispatch_length;
 pub mod gdn;
 pub mod i32_gather;
 pub mod launch;
