@@ -8,8 +8,9 @@
 
 use crate::format::{
     BitLayout, BlockLayout, Digit, FieldEncoding, FloatFormat, FormatDescriptor, MinSign, Piece,
-    Storage, ValueMap, WeightFormat,
+    SignRule, SignedGrid, Storage, ValueMap, WeightFormat,
 };
+use crate::grids::{IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID};
 
 /// Values in a K-quant super-block (`QK_K`).
 pub(crate) const QK_K: usize = 256;
@@ -462,6 +463,183 @@ pub(crate) const IQ4_XS: FormatDescriptor = FormatDescriptor {
     min_sign: None,
 };
 
+/// `IQ2_XS`'s grid points as magnitude bytes, point `g` at `8*g ..` (`ggml-common.h` `iq2xs_grid`).
+const IQ2XS_MAGNITUDES: [u8; 512 * 8] = {
+    let mut bytes = [0u8; 512 * 8];
+    let mut point = 0;
+    while point < 512 {
+        let lanes = IQ2XS_GRID[point].to_le_bytes();
+        let mut lane = 0;
+        while lane < 8 {
+            bytes[point * 8 + lane] = lanes[lane];
+            lane += 1;
+        }
+        point += 1;
+    }
+    bytes
+};
+
+/// `IQ3_XXS`'s grid points as magnitude bytes, point `g` at `4*g ..` (`ggml-common.h` `iq3xxs_grid`).
+const IQ3XXS_MAGNITUDES: [u8; 256 * 4] = {
+    let mut bytes = [0u8; 256 * 4];
+    let mut point = 0;
+    while point < 256 {
+        let lanes = IQ3XXS_GRID[point].to_le_bytes();
+        let mut lane = 0;
+        while lane < 4 {
+            bytes[point * 4 + lane] = lanes[lane];
+            lane += 1;
+        }
+        point += 1;
+    }
+    bytes
+};
+
+/// `IQ3_S`'s grid points as magnitude bytes, point `g` at `4*g ..` (`ggml-common.h` `iq3s_grid`).
+const IQ3S_MAGNITUDES: [u8; 512 * 4] = {
+    let mut bytes = [0u8; 512 * 4];
+    let mut point = 0;
+    while point < 512 {
+        let lanes = IQ3S_GRID[point].to_le_bytes();
+        let mut lane = 0;
+        while lane < 4 {
+            bytes[point * 4 + lane] = lanes[lane];
+            lane += 1;
+        }
+        point += 1;
+    }
+    bytes
+};
+
+/// The `IQ2_XS` lattice: 512 points of eight magnitudes.
+pub(crate) const IQ2XS_LATTICE: SignedGrid = SignedGrid {
+    magnitudes: &IQ2XS_MAGNITUDES,
+    lanes: 8,
+    signs: SignRule::ParityOfSeven,
+};
+
+/// The `IQ3_XXS` lattice: 256 points of four magnitudes.
+pub(crate) const IQ3XXS_LATTICE: SignedGrid = SignedGrid {
+    magnitudes: &IQ3XXS_MAGNITUDES,
+    lanes: 4,
+    signs: SignRule::ParityOfSeven,
+};
+
+/// The `IQ3_S` lattice: 512 points of four magnitudes, with a full byte of signs per eight values.
+pub(crate) const IQ3S_LATTICE: SignedGrid = SignedGrid {
+    magnitudes: &IQ3S_MAGNITUDES,
+    lanes: 4,
+    signs: SignRule::Direct,
+};
+
+/// `IQ2_XS` (ggml type 17): `[d f16][qs u16[32]][scales u8[8]]`, 74 bytes per 256. Element
+/// `i = g*8 + l` (eight-value group `g`, lane `l`) reads `qs[g]`: its low 9 bits are the grid point
+/// and its high 7 bits the group's sign pattern. Sixteen-value run `i / 16` takes nibble `(i/16) % 2`
+/// of `scales[i/32]`. `y = d*(s + 1/2)/4 * sign * grid[point][l]`.
+pub(crate) const IQ2_XS: FormatDescriptor = FormatDescriptor {
+    format: WeightFormat::Iq2_Xs,
+    storage: blocks(
+        QK_K,
+        74,
+        &[
+            field!(Scale, "d", HALF, [piece(0, WHOLE_QK_K, 16)]),
+            field!(
+                SubScale,
+                "scales",
+                FieldEncoding::HalfStep { exponent: -2 },
+                [piece(528, &[digit(16, 4), digit(16, 0)], 4)]
+            ),
+            field!(
+                Codes,
+                "qs (grid point)",
+                UNSIGNED,
+                [piece(16, &[digit(32, 16), digit(8, 0)], 9)]
+            ),
+            field!(
+                Signs,
+                "qs (signs)",
+                UNSIGNED,
+                [piece(25, &[digit(32, 16), digit(8, 0)], 7)]
+            ),
+        ],
+    ),
+    value: ValueMap::SignedGrid(&IQ2XS_LATTICE),
+    min_sign: None,
+};
+
+/// `IQ3_XXS` (ggml type 18): `[d f16][qs u8[64]][scales_and_signs u32[8]]`, 98 bytes per 256.
+/// Element `i` reads grid point `qs[i/4]` (four lanes). Thirty-two-value run `ib` reads
+/// `scales_and_signs[ib]`: bits 0..28 are the sign patterns of its four eight-value groups (7 bits
+/// each) and bits 28..32 the half-step scale. `y = d*(s + 1/2)/2 * sign * grid[point][i % 4]`.
+pub(crate) const IQ3_XXS: FormatDescriptor = FormatDescriptor {
+    format: WeightFormat::Iq3_Xxs,
+    storage: blocks(
+        QK_K,
+        98,
+        &[
+            field!(Scale, "d", HALF, [piece(0, WHOLE_QK_K, 16)]),
+            field!(
+                SubScale,
+                "scales_and_signs (scale)",
+                FieldEncoding::HalfStep { exponent: -1 },
+                [piece(556, &[digit(8, 32), digit(32, 0)], 4)]
+            ),
+            field!(
+                Codes,
+                "qs",
+                UNSIGNED,
+                [piece(16, &[digit(64, 8), digit(4, 0)], 8)]
+            ),
+            field!(
+                Signs,
+                "scales_and_signs (signs)",
+                UNSIGNED,
+                [piece(528, &[digit(8, 32), digit(4, 7), digit(8, 0)], 7)]
+            ),
+        ],
+    ),
+    value: ValueMap::SignedGrid(&IQ3XXS_LATTICE),
+    min_sign: None,
+};
+
+/// `IQ3_S` (ggml type 21): `[d f16][qs u8[64]][qh u8[8]][signs u8[32]][scales u8[4]]`, 110 bytes per
+/// 256. Element `i` reads grid point `qs[i/4] | bit (i%32)/4 of qh[i/32] << 8` (four lanes), the sign
+/// byte `signs[i/8]` (bit `i%8`), and the scale nibble `i/32` of `scales`.
+/// `y = d*(2s + 1) * sign * grid[point][i % 4]`.
+pub(crate) const IQ3_S: FormatDescriptor = FormatDescriptor {
+    format: WeightFormat::Iq3_S,
+    storage: blocks(
+        QK_K,
+        110,
+        &[
+            field!(Scale, "d", HALF, [piece(0, WHOLE_QK_K, 16)]),
+            field!(
+                SubScale,
+                "scales",
+                FieldEncoding::HalfStep { exponent: 1 },
+                [piece(848, &[digit(8, 4), digit(32, 0)], 4)]
+            ),
+            field!(
+                Codes,
+                "qs + qh (grid point)",
+                UNSIGNED,
+                [
+                    piece(16, &[digit(64, 8), digit(4, 0)], 8),
+                    piece(528, &[digit(8, 8), digit(8, 1), digit(4, 0)], 1),
+                ]
+            ),
+            field!(
+                Signs,
+                "signs",
+                UNSIGNED,
+                [piece(592, &[digit(32, 8), digit(8, 0)], 8)]
+            ),
+        ],
+    ),
+    value: ValueMap::SignedGrid(&IQ3S_LATTICE),
+    min_sign: None,
+};
+
 /// MXFP4 (ggml type 39): `[e u8][qs u8[16]]`, 17 bytes per 32, with the `Q4_0` nibble order.
 /// `y = e2m1(q) * 2^(e - 127)`; see the sign-of-zero note in [`crate::format`].
 pub(crate) const MXFP4: FormatDescriptor = FormatDescriptor {
@@ -843,6 +1021,121 @@ mod tests {
         ]
     );
 
+    // Rows from gguf-py's `dequantize` (`gguf/quants.py`, the numpy port of ggml's
+    // `dequantize_row_iq2_xs` / `dequantize_row_iq3_xxs`) over seeded random blocks.
+    reference!(
+        iq2_xs_block_decodes_to_the_ggml_reference,
+        Iq2_Xs,
+        concat!(
+            "66324850543a2478bb5f4ae181b7c6af9a24d0cb74fab4c5c2ba3c17da9e347f",
+            "0b19634819fdd757c7c9addddb33c1cea60186d12c4cac91ae62443db02a979a",
+            "3349fddde3cbd37af7d3",
+        ),
+        [
+            (0, 16.87088),
+            (11, -29.017914),
+            (22, 6.1984863),
+            (33, 16.87088),
+            (44, -29.017914),
+            (55, -29.017914),
+            (66, -1.3996582),
+            (77, -7.523163),
+            (88, -5.798584),
+            (99, -14.3714905),
+            (110, -24.718964),
+            (121, 26.868439),
+            (132, 7.523163),
+            (143, 4.373932),
+            (154, -5.3986816),
+            (165, -13.121796),
+            (176, -9.372711),
+            (187, 2.9992676),
+            (198, -16.121063),
+            (209, 6.1984863),
+            (220, -6.1984863),
+            (231, 4.373932),
+            (242, -5.3986816),
+            (253, -16.87088),
+            (255, 16.87088),
+        ]
+    );
+
+    reference!(
+        iq3_xxs_block_decodes_to_the_ggml_reference,
+        Iq3_Xxs,
+        concat!(
+            "1c2e5d3697b99b819a8fdb4712e7ef54c41d7132946c8f368af080fdad616634",
+            "bbd1b28d866741f17d79ad17fff61b885cb3311872ad6faabba09eb4ff6f4e99",
+            "4ea5d22acf104e0f70fac5986f866d22552a0a9e77f341b58ea82c2798810d0a",
+            "7731",
+        ),
+        [
+            (0, 0.85913086),
+            (11, 2.0046387),
+            (22, 2.0046387),
+            (33, -14.796143),
+            (44, -14.796143),
+            (55, -8.877686),
+            (66, -4.868408),
+            (77, -1.6228027),
+            (88, -21.096436),
+            (99, -2.3864746),
+            (110, -0.47729492),
+            (121, -4.2956543),
+            (132, 2.9592285),
+            (143, 14.796143),
+            (154, 20.7146),
+            (165, 2.0046387),
+            (176, 2.0046387),
+            (187, 6.013916),
+            (198, 8.114014),
+            (209, 8.114014),
+            (220, 4.868408),
+            (231, -6.013916),
+            (242, -3.3410645),
+            (253, 0.6682129),
+            (255, -4.67749),
+        ]
+    );
+
+    reference!(
+        iq3_s_block_decodes_to_the_ggml_reference,
+        Iq3_S,
+        concat!(
+            "552f4850543a2478bb5f4ae181b7c6af9a24d0cb74fab4c5c2ba3c17da9e347f",
+            "0b19634819fdd757c7c9addddb33c1cea60186d12c4cac91ae62443db02a979a",
+            "3349fddde3cbd37af7d38d895d3697b99b819a8fdb4712e7ef54c41d7132946c",
+            "8f368af080fdad616634bbd1b28d",
+        ),
+        [
+            (0, -7.904846),
+            (11, -18.444641),
+            (22, -13.174744),
+            (33, -34.254333),
+            (44, -34.254333),
+            (55, -7.904846),
+            (66, 2.4058228),
+            (77, 3.0932007),
+            (88, -2.4058228),
+            (99, 21.652405),
+            (110, -9.279602),
+            (121, 34.025208),
+            (132, 1.7184448),
+            (143, 2.8640747),
+            (154, 1.7184448),
+            (165, 2.6349487),
+            (176, -7.904846),
+            (187, 28.984436),
+            (198, 21.652405),
+            (209, 15.466003),
+            (220, -9.279602),
+            (231, -13.632996),
+            (242, -1.9475708),
+            (253, -21.423279),
+            (255, 13.632996),
+        ]
+    );
+
     reference!(
         iq4_xs_block_decodes_to_the_ggml_reference,
         Iq4_Xs,
@@ -985,6 +1278,182 @@ mod tests {
         );
     }
 
+    /// FNV-1a over a table's bytes.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// The lattice tables are ggml's, entry for entry: their digests equal those of the grids
+    /// `gguf-py` (`gguf/quants.py`, `IQ2_XS.grid` and `IQ3_XXS.grid`, unpacked from `grid_hex`)
+    /// builds, an independent copy of `ggml-common.h`'s `iq2xs_grid` and `iq3xxs_grid`. A single
+    /// swapped or edited grid point changes the digest. Mutation: swap two entries of
+    /// `IQ2XS_GRID`; the first assertion goes red.
+    #[test]
+    fn the_lattice_tables_are_the_gguf_py_grids() {
+        assert_eq!(fnv1a(&IQ2XS_MAGNITUDES), 0xc9b1_ee61_e799_09bd);
+        assert_eq!(fnv1a(&IQ3XXS_MAGNITUDES), 0xdfa5_dc83_d6a1_55d5);
+        assert_eq!(IQ2XS_LATTICE.points(), 512);
+        assert_eq!(fnv1a(&IQ3S_MAGNITUDES), 0xfa37_020c_25b4_4829);
+        assert_eq!(IQ3XXS_LATTICE.points(), 256);
+        assert_eq!(IQ3S_LATTICE.points(), 512);
+        // A grid point is a little-endian run of magnitude bytes, as ggml's `uint64_t` entries.
+        assert_eq!(IQ2XS_LATTICE.magnitude(1, 0), 0x2b);
+        assert_eq!(IQ2XS_LATTICE.magnitude(1, 7), 0x08);
+        assert_eq!(IQ3XXS_LATTICE.magnitude(3, 0), 0x0c);
+        assert_eq!(IQ3XXS_LATTICE.magnitude(3, 3), 0x04);
+    }
+
+    /// The sign rule is ggml's `ksigns_iq2xs`: the stored seven bits plus their parity in bit 7.
+    #[test]
+    fn the_eighth_sign_is_the_parity_of_the_stored_seven() {
+        // `ksigns_iq2xs` begins 0, 129, 130, 3, 132: index 1 sets bit 7, index 3 does not.
+        let ksigns = |index: u32| -> u32 {
+            (0..8).fold(0, |byte, lane| {
+                byte | (u32::from(SignRule::ParityOfSeven.negative(index, lane)) << lane)
+            })
+        };
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(ksigns),
+            [0, 129, 130, 3, 132],
+            "ggml-common.h ksigns_iq2xs[0..5]"
+        );
+        assert_eq!(ksigns(127), 255);
+        assert_eq!(ksigns(126), 126);
+        for index in 0..128 {
+            assert_eq!(ksigns(index).count_ones() % 2, 0, "index {index}");
+        }
+    }
+
+    /// `dequantize_row_iq2_xs` and `dequantize_row_iq3_xxs` of `ggml/src/ggml-quants.c`, written
+    /// as ggml loops over the raw block with ggml's `ksigns_iq2xs` / `kmask_iq2xs` semantics, one
+    /// block at a time. The descriptor decodes the same random blocks bit for bit, so the bit
+    /// layouts (which `qs` word and which scale nibble feeds which value) match ggml's loops.
+    fn ggml_dequantize(format: WeightFormat, block: &[u8]) -> Vec<f32> {
+        let d = crate::scalar::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let ksigns = |index: u32| index | ((index.count_ones() & 1) << 7);
+        let mut y = Vec::new();
+        match format {
+            WeightFormat::Iq2_Xs => {
+                let qs: Vec<u16> = block[2..66]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&b| u16::from_le_bytes(b))
+                    .collect();
+                let scales = &block[66..74];
+                for ib32 in 0..8 {
+                    let db = [
+                        d * (0.5 + f32::from(scales[ib32] & 0xf)) * 0.25,
+                        d * (0.5 + f32::from(scales[ib32] >> 4)) * 0.25,
+                    ];
+                    for l in 0..4 {
+                        let word = qs[4 * ib32 + l];
+                        let grid = IQ2XS_GRID[usize::from(word & 511)].to_le_bytes();
+                        let signs = ksigns(u32::from(word >> 9));
+                        for (j, &magnitude) in grid.iter().enumerate() {
+                            let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                            y.push(db[l / 2] * f32::from(magnitude) * sign);
+                        }
+                    }
+                }
+            }
+            WeightFormat::Iq3_Xxs => {
+                let (qs, scales_and_signs) = block[2..].split_at(64);
+                for ib32 in 0..8 {
+                    let aux32 = u32::from_le_bytes(
+                        scales_and_signs[4 * ib32..4 * ib32 + 4].try_into().unwrap(),
+                    );
+                    let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+                    for l in 0..4 {
+                        let signs = ksigns((aux32 >> (7 * l)) & 127);
+                        let grid1 = IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l])].to_le_bytes();
+                        let grid2 =
+                            IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l + 1])].to_le_bytes();
+                        for (half, grid) in [grid1, grid2].into_iter().enumerate() {
+                            for (j, &magnitude) in grid.iter().enumerate() {
+                                let lane = j + 4 * half;
+                                let sign = if signs & (1 << lane) != 0 { -1.0 } else { 1.0 };
+                                y.push(db * f32::from(magnitude) * sign);
+                            }
+                        }
+                    }
+                }
+            }
+            WeightFormat::Iq3_S => {
+                let (qs, rest) = block[2..].split_at(64);
+                let (qh, rest) = rest.split_at(8);
+                let (signs, scales) = rest.split_at(32);
+                for (pair, &scale) in scales.iter().enumerate() {
+                    let db = [
+                        d * (1.0 + 2.0 * f32::from(scale & 0xf)),
+                        d * (1.0 + 2.0 * f32::from(scale >> 4)),
+                    ];
+                    for (half, db) in db.into_iter().enumerate() {
+                        let run = 2 * pair + half;
+                        for l in 0..4 {
+                            let low = |k: usize| usize::from(qs[8 * run + 2 * l + k]);
+                            let high = |shift: usize| (usize::from(qh[run]) << shift) & 256;
+                            let grid1 = IQ3S_GRID[low(0) | high(8 - 2 * l)].to_le_bytes();
+                            let grid2 = IQ3S_GRID[low(1) | high(7 - 2 * l)].to_le_bytes();
+                            let sign_byte = signs[4 * run + l];
+                            for (lane, &magnitude) in grid1.iter().chain(&grid2).enumerate() {
+                                let sign = if sign_byte & (1 << lane) != 0 {
+                                    -1.0
+                                } else {
+                                    1.0
+                                };
+                                y.push(db * f32::from(magnitude) * sign);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => unreachable!("only the lattice formats are transcribed"),
+        }
+        y
+    }
+
+    /// Random `IQ2_XS` and `IQ3_XXS` blocks (every sign pattern, grid point and scale nibble
+    /// occurs) decode, through the descriptor interpreter, to exactly what ggml's loops give.
+    /// Mutation: read the `Signs` field of `IQ3_XXS` at bit 529 instead of 528; red.
+    #[test]
+    fn lattice_blocks_decode_as_ggml_loops_do() {
+        let mut state = 0x1192_u64;
+        for format in [
+            WeightFormat::Iq2_Xs,
+            WeightFormat::Iq3_Xxs,
+            WeightFormat::Iq3_S,
+        ] {
+            let descriptor = format.descriptor();
+            let Storage::Blocks(layout) = descriptor.storage else {
+                unreachable!()
+            };
+            for _ in 0..256 {
+                let mut block: Vec<u8> = (0..layout.bytes)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state >> 24) as u8
+                    })
+                    .collect();
+                // A finite scale: keep the f16 exponent below all-ones.
+                block[1] &= 0x7b;
+                let want = ggml_dequantize(format, &block);
+                for (index, want) in want.into_iter().enumerate() {
+                    let got = descriptor.decode_block_value(&block, index).unwrap();
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{format:?} element {index}: {got:?} vs ggml {want:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Every block descriptor is well formed: each piece's layout covers the block's values, stays
     /// inside the block, an integer value map has an integer `Codes` field, a codebook code is four
     /// bits, and a min sign exactly when there is a `Min` operand.
@@ -1006,6 +1475,9 @@ mod tests {
             WeightFormat::Q6_K,
             WeightFormat::Iq4_Nl,
             WeightFormat::Iq4_Xs,
+            WeightFormat::Iq2_Xs,
+            WeightFormat::Iq3_Xxs,
+            WeightFormat::Iq3_S,
             WeightFormat::Mxfp4,
         ] {
             let descriptor = format.descriptor();
@@ -1040,6 +1512,20 @@ mod tests {
                     assert!(!matches!(codes.field.encoding, FieldEncoding::Float(_)))
                 }
                 ValueMap::Codebook(_) => assert_eq!(codes.field.width(), 4),
+                ValueMap::SignedGrid(grid) => {
+                    assert_eq!(grid.lanes % 4, 0, "{format:?} lanes fill whole words");
+                    assert_eq!(
+                        1usize << codes.field.width(),
+                        grid.points(),
+                        "{format:?}: the code indexes exactly the grid points"
+                    );
+                    let signs = layout.field(OperandRole::Signs).expect("a Signs field");
+                    let stored = match grid.signs {
+                        SignRule::ParityOfSeven => 7,
+                        SignRule::Direct => 8,
+                    };
+                    assert_eq!(signs.field.width(), stored, "{format:?} stored sign bits");
+                }
                 ValueMap::Float => {
                     assert!(matches!(codes.field.encoding, FieldEncoding::Float(_)))
                 }

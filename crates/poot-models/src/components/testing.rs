@@ -342,7 +342,7 @@ pub(crate) fn read_back(
     let bytes = write_gguf(kvs, tensors);
     let file = StoredBytes::from(bytes);
     let index = GgufIndex::parse(&file).unwrap();
-    let store = read_gguf(&index, &file, &IdentityNames, default_workers()).unwrap();
+    let store = read_gguf(&index, &IdentityNames, default_workers()).unwrap();
     (index, store)
 }
 

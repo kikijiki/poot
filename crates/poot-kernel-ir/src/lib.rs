@@ -436,6 +436,18 @@ ir_node! {
             /// Which workgroup-local array.
             array: u8,
         },
+        /// Read word `idx` of constant table `table` ([`Body::constant_tables`]): a `U32`. The table
+        /// is read-only and the same for every thread, so the result depends only on `idx`.
+        ///
+        /// `idx` must be below the table's length: the load is an `inbounds` GEP, so an out-of-range
+        /// dynamic index is undefined behaviour (poison), not a clamped or zero read. The producer
+        /// guarantees the bound.
+        ConstantTableRead {
+            /// The word index.
+            idx: Operand,
+            /// Which constant table.
+            table: u8,
+        },
         /// Atomic on workgroup-local array `array` at `idx`.
         WorkgroupLocalAtomic {
             /// The element index.
@@ -846,6 +858,18 @@ ir_node! {
 }
 
 ir_node! {
+    /// A constant table: read-only `u32` words fixed at kernel-generation time, readable by any
+    /// thread at a dynamic index ([`Rvalue::ConstantTableRead`]). The lookup tables of the lattice
+    /// quants (`IQ2_XS`, `IQ3_XXS`, `IQ3_S`) are the use: too large for a select tree over immediates, and
+    /// the same for every launch, so they belong to the kernel and not to a buffer the launch binds.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub struct ConstantTableDecl {
+        /// The table's words.
+        pub words: Vec<u32>,
+    }
+}
+
+ir_node! {
     /// A straight-line run of statements ending in one terminator.
     #[derive(Clone, PartialEq, Debug)]
     pub struct BasicBlock {
@@ -872,6 +896,12 @@ ir_node! {
         pub workgroup_size: [u32; 3],
         /// The workgroup-local (LDS) arrays.
         pub workgroup_locals: Vec<WorkgroupLocalDecl>,
+        /// The constant tables.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Vec::is_empty")
+        )]
+        pub constant_tables: Vec<ConstantTableDecl>,
     }
 }
 
@@ -890,6 +920,7 @@ impl Body {
             blocks,
             workgroup_size: [64, 1, 1],
             workgroup_locals: Vec::new(),
+            constant_tables: Vec::new(),
         }
     }
 
@@ -923,9 +954,9 @@ pub use verify::{Site, VerifyError, VerifyErrorKind};
 /// bindings, and no local read on a path where it was never assigned.
 mod verify {
     use super::{
-        BasicBlock, BinOp, BlockId, Body, Constant, FRAGMENT_COLLECTIVE_LANES, FragmentTy,
-        IndexAxis, Local, Operand, Place, ProjectionElem, Rvalue, Statement, Terminator, Ty,
-        WmmaMat, WmmaShape, WorkgroupLocalDecl,
+        BasicBlock, BinOp, BlockId, Body, Constant, ConstantTableDecl, FRAGMENT_COLLECTIVE_LANES,
+        FragmentTy, IndexAxis, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
+        Terminator, Ty, WmmaMat, WmmaShape, WorkgroupLocalDecl,
     };
     use std::collections::HashSet;
     use std::fmt;
@@ -983,6 +1014,19 @@ mod verify {
         #[error("workgroup-local array {0} is not declared")]
         /// A statement names a workgroup-local array the body does not declare.
         UndeclaredWorkgroupArray(u8),
+        #[error("constant table {0} is not declared")]
+        /// A statement names a constant table the body does not declare.
+        UndeclaredConstantTable(u8),
+        #[error("constant table {table} has {len} words; index {index} is outside it")]
+        /// A constant-table read with a constant index past the table's end.
+        ConstantTableIndex {
+            /// The table read.
+            table: u8,
+            /// The table's word count.
+            len: usize,
+            /// The constant index.
+            index: u64,
+        },
         #[error("block bb{} does not exist", .0.index)]
         /// A terminator names a block the body does not have.
         UndefinedBlock(BlockId),
@@ -1239,6 +1283,12 @@ mod verify {
             self.workgroup_locals
                 .get(array as usize)
                 .ok_or(VerifyErrorKind::UndeclaredWorkgroupArray(array))
+        }
+
+        fn constant_table(&self, table: u8) -> Check<&ConstantTableDecl> {
+            self.constant_tables
+                .get(table as usize)
+                .ok_or(VerifyErrorKind::UndeclaredConstantTable(table))
         }
 
         fn is_param(&self, l: Local) -> bool {
@@ -1594,6 +1644,20 @@ mod verify {
                     let decl = self.workgroup_array(*array)?;
                     expect_ty("workgroup array index", &Ty::Usize, &self.operand_ty(idx)?)?;
                     Ok(decl.elem_ty.clone())
+                }
+                Rvalue::ConstantTableRead { idx, table } => {
+                    let decl = self.constant_table(*table)?;
+                    expect_ty("constant table index", &Ty::Usize, &self.operand_ty(idx)?)?;
+                    if let Operand::Const(Constant::Usize(index)) = idx
+                        && *index >= decl.words.len() as u64
+                    {
+                        return Err(VerifyErrorKind::ConstantTableIndex {
+                            table: *table,
+                            len: decl.words.len(),
+                            index: *index,
+                        });
+                    }
+                    Ok(Ty::U32)
                 }
                 Rvalue::WorkgroupLocalAtomic {
                     idx, value, array, ..
@@ -2202,6 +2266,7 @@ mod verify {
                 .join(operand_class(if_true, flow).opaque())
                 .join(operand_class(if_false, flow).opaque()),
             Rvalue::Len(_) => LaneClass::Uniform,
+            Rvalue::ConstantTableRead { idx, .. } => operand_class(idx, flow).opaque(),
             Rvalue::WorkgroupLocalRead { .. }
             | Rvalue::WorkgroupLocalAtomic { .. }
             | Rvalue::GlobalAtomic { .. }
@@ -2361,7 +2426,9 @@ mod verify {
                 operand_reads(if_false, f);
             }
             Rvalue::Len(place) | Rvalue::VectorLoad { place } => place_reads(place, f),
-            Rvalue::WorkgroupLocalRead { idx, .. } => operand_reads(idx, f),
+            Rvalue::WorkgroupLocalRead { idx, .. } | Rvalue::ConstantTableRead { idx, .. } => {
+                operand_reads(idx, f)
+            }
             Rvalue::WorkgroupLocalAtomic { idx, value, .. } => {
                 operand_reads(idx, f);
                 operand_reads(value, f);
@@ -3093,6 +3160,60 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn constant_table_reads_are_checked_against_the_declaration() {
+        let read = |idx: Operand, table: u8| {
+            straight_line(
+                vec![Ty::U32],
+                vec![Statement::Assign(
+                    Place::local(l(2)),
+                    Rvalue::ConstantTableRead { idx, table },
+                )],
+            )
+        };
+        let declared = |mut body: Body| {
+            body.constant_tables.push(ConstantTableDecl {
+                words: vec![1, 2, 3],
+            });
+            body
+        };
+        // No table declared.
+        assert_eq!(
+            rejection(&read(Operand::Const(Constant::Usize(0)), 0)),
+            (
+                at_statement(0, 0),
+                VerifyErrorKind::UndeclaredConstantTable(0)
+            )
+        );
+        // A constant index past the declared words.
+        assert_eq!(
+            rejection(&declared(read(Operand::Const(Constant::Usize(3)), 0))),
+            (
+                at_statement(0, 0),
+                VerifyErrorKind::ConstantTableIndex {
+                    table: 0,
+                    len: 3,
+                    index: 3,
+                }
+            )
+        );
+        // The index is a `Usize`.
+        assert_eq!(
+            rejection(&declared(read(Operand::Const(Constant::U32(0)), 0))),
+            (
+                at_statement(0, 0),
+                VerifyErrorKind::TypeMismatch {
+                    what: "constant table index",
+                    expected: Ty::Usize,
+                    found: Ty::U32,
+                }
+            )
+        );
+        declared(read(Operand::Const(Constant::Usize(2)), 0))
+            .verify()
+            .unwrap();
     }
 
     #[test]

@@ -73,6 +73,9 @@ impl PackedSourceName {
             SourceRole::Planar(OperandRole::Min) => ".packed_min_source",
             SourceRole::Planar(OperandRole::SubMin) => ".packed_submin_source",
             SourceRole::Planar(OperandRole::GroupIndex) => ".packed_group_index_source",
+            SourceRole::Planar(OperandRole::Signs) => {
+                panic!("Signs is read inside a block format source, never planar")
+            }
         }
     }
 

@@ -35,13 +35,9 @@ fn assert_read_gguf_maps_without_anonymous_copies(path: &std::path::Path) {
     let file = poot_quant::StoredBytes::map(std::fs::File::open(path).expect("open gguf file"))
         .expect("map gguf file");
     let index = poot_load::gguf::GgufIndex::parse(&file).expect("parse gguf index");
-    let store = poot_load::gguf::read_gguf(
-        &index,
-        &file,
-        &IdentityNames,
-        poot_load::plan::default_workers(),
-    )
-    .expect("read_gguf");
+    let store =
+        poot_load::gguf::read_gguf(&index, &IdentityNames, poot_load::plan::default_workers())
+            .expect("read_gguf");
     std::hint::black_box(&store);
     let anon_growth = (proc_status_kib("RssAnon") * 1024).saturating_sub(baseline_anon);
     const ANON_LIMIT: u64 = 64 * 1024 * 1024;

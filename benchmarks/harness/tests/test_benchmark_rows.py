@@ -42,10 +42,11 @@ frameworks.poot = { precision = "bf16" }
 """
 
 
-def runner_script(single, curve):
-    """A runner that prints `single` for the single mode and `curve` when asked for decode-curve."""
+def runner_script(single, curve, args_log):
+    """A runner that prints `single` for the single mode and `curve` when asked for decode-curve, and logs its argv."""
     return (
         "#!/bin/sh\n"
+        f'echo "$*" >> {args_log}\n'
         'case " $* " in\n'
         f"  *' --mode decode-curve '*) printf '%s\\n' '{json.dumps(curve)}' ;;\n"
         f"  *) printf '%s\\n' '{json.dumps(single)}' ;;\n"
@@ -53,13 +54,13 @@ def runner_script(single, curve):
     )
 
 
-def bench_run(directory, single, curve):
-    """`bench run` over the fixture manifest with a stub runner; the rows it stored in results.jsonl."""
+def bench_run(directory, single, curve, manifest=MANIFEST):
+    """`bench run` over a fixture manifest with a stub runner; the rows it stored in results.jsonl."""
     directory = Path(directory)
     stub = directory / "stub-runner"
-    stub.write_text(runner_script(single, curve), encoding="ascii")
+    stub.write_text(runner_script(single, curve, directory / "args.log"), encoding="ascii")
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
-    (directory / "manifest.toml").write_text(MANIFEST)
+    (directory / "manifest.toml").write_text(manifest)
     (directory / "runners.toml").write_text(f'[poot]\nbin = "{stub}"\ncmd = ["{{bin}}"]\n')
     args = argparse.Namespace(
         manifest=str(directory / "manifest.toml"),
@@ -110,6 +111,22 @@ class StoredRowTests(unittest.TestCase):
         for row in rows:
             self.assertIn("invalid runner result", row["reason"])
             self.assertNotIn("decode_tok_s", row)
+
+    def test_a_scenario_chunk_reaches_the_runner_as_its_prefill_chunk_flag(self):
+        chunked = MANIFEST.replace("osl = 3\n", "osl = 3\nprefill_chunk = 2\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            bench_run(tmp, valid_single(), valid_curve(), manifest=chunked)
+            curve_argv = [
+                line for line in (Path(tmp) / "args.log").read_text().splitlines() if "--mode decode-curve" in line
+            ]
+        self.assertEqual(len(curve_argv), 1)
+        self.assertIn("--prefill-chunk 2", curve_argv[0])
+
+    def test_a_curve_without_a_chunk_passes_no_prefill_chunk_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bench_run(tmp, valid_single(), valid_curve())
+            argv = (Path(tmp) / "args.log").read_text()
+        self.assertNotIn("--prefill-chunk", argv)
 
 
 if __name__ == "__main__":

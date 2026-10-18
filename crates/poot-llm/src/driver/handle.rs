@@ -7,7 +7,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use poot_load::gguf::{GgufIndex, IdentityNames, read_gguf};
+use poot_load::gguf::{GgufIndex, IdentityNames, read_gguf, shard_paths};
 use poot_load::packed_safetensors::{FilePin, Sha256Digest, check_pin_reader};
 use poot_load::plan::default_workers;
 use poot_models::model::{Model, ModelConfig};
@@ -235,23 +235,29 @@ impl ModelHandle {
         options: &LoadOptions,
         template: Option<CheckedChatTemplate>,
     ) -> Result<Self, DriverError> {
-        let file = File::open(path).map_err(io_error(path))?;
-        let file = StoredBytes::map(file)
-            .map_err(poot_load::LoadError::from)
-            .map_err(LoadError::from)?;
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            check_integrity(
-                options,
-                path.parent().unwrap_or(Path::new("")),
-                Some(name),
-                &[(name.to_string(), file.clone())],
-            )?;
+        // Naming any shard of a split checkpoint names the set; each shard is mapped once and pinned
+        // on its own.
+        let mut files = Vec::new();
+        for shard in shard_paths(path) {
+            let file = File::open(&shard).map_err(io_error(&shard))?;
+            let file = StoredBytes::map(file)
+                .map_err(poot_load::LoadError::from)
+                .map_err(LoadError::from)?;
+            if let Some(name) = shard.file_name().and_then(|n| n.to_str()) {
+                check_integrity(
+                    options,
+                    shard.parent().unwrap_or(Path::new("")),
+                    Some(name),
+                    &[(name.to_string(), file.clone())],
+                )?;
+            }
+            files.push(file);
         }
-        let index = GgufIndex::parse(&file).map_err(LoadError::from)?;
+        let index = GgufIndex::parse_shards(&files).map_err(LoadError::from)?;
         let raw = RawConfig::Gguf(&index);
         let family = resolve(&raw, registry)?;
         let store =
-            read_gguf(&index, &file, &IdentityNames, default_workers()).map_err(LoadError::from)?;
+            read_gguf(&index, &IdentityNames, default_workers()).map_err(LoadError::from)?;
         Self::build(family, &raw, Arc::new(store), |config| {
             let text =
                 TextCodec::from_gguf(&gguf_vocab(&index), constraint_eos(config), config.chat)

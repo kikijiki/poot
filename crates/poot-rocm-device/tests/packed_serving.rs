@@ -51,6 +51,10 @@ fn formats() -> Vec<WeightFormat> {
         WeightFormat::Gptq {
             groups: GroupMap::Indexed { groups: nz(4) },
         },
+        // The lattice quants: a constant grid table and a sign field per block.
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
     ]
 }
 

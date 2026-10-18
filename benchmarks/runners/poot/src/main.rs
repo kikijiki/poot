@@ -196,6 +196,11 @@ struct Config {
     mode: Mode,
     isl_list: Vec<usize>,
     osl: usize,
+    /// Decode-curve mode: the longest slice of a context one prefill forward takes. A longer context is
+    /// prefilled in several forwards of at most this many tokens (the driver's chunk plan); `None` takes each
+    /// context whole. A typed driver option, recorded in the result: a device whose watchdog kills a
+    /// dispatch that runs too long needs it to bound the per-dispatch work.
+    prefill_chunk: Option<usize>,
     prepared_state: Option<PreparedState>,
     /// Artifacts the cache directory held before this process opened anything (`None`: no directory named).
     artifact_entries_at_start: Option<u64>,
@@ -211,7 +216,7 @@ enum Invocation {
 /// Options that take a value and switches that do not. Everything else is an error: a flag the runner
 /// ignores would report a measurement the caller did not ask for. `--synthetic` is part of the suite's
 /// runner contract (the harness passes it to every runner); decode-curve contexts are always synthetic.
-const VALUE_FLAGS: [&str; 13] = [
+const VALUE_FLAGS: [&str; 14] = [
     "--roofline-fit",
     "--model-dir",
     "--gguf",
@@ -224,6 +229,7 @@ const VALUE_FLAGS: [&str; 13] = [
     "--mode",
     "--isl-list",
     "--osl",
+    "--prefill-chunk",
     "--prepared-state",
 ];
 const SWITCHES: [&str; 6] = [
@@ -305,6 +311,10 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
         mode: Mode::parse(values.get("--mode").copied().unwrap_or("single"))?,
         isl_list,
         osl: number("--osl", 128)?,
+        prefill_chunk: values
+            .get("--prefill-chunk")
+            .map(|_| number("--prefill-chunk", 0))
+            .transpose()?,
         prepared_state: values
             .get("--prepared-state")
             .map(|name| PreparedState::parse(name))
@@ -313,6 +323,14 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
     };
 
     anyhow::ensure!(config.iters > 0, "--iters must be positive");
+    anyhow::ensure!(
+        config.prefill_chunk.is_none_or(|chunk| chunk > 0),
+        "--prefill-chunk must be positive"
+    );
+    anyhow::ensure!(
+        config.prefill_chunk.is_none() || config.mode == Mode::DecodeCurve,
+        "--prefill-chunk applies to --mode decode-curve only"
+    );
     match config.mode {
         Mode::Single => anyhow::ensure!(config.gen_tokens > 0, "--gen-tokens must be positive"),
         Mode::DecodeCurve => {
@@ -517,6 +535,12 @@ fn counters_from(stats: &DriverStats, recordings: u64) -> PreparationCounters {
     }
 }
 
+/// The prefill chunk a decode-curve cell opens its driver with: the longest context whole, or `limit` tokens
+/// when the caller bounds one forward (a context shorter than `limit` is still prefilled whole).
+fn curve_prefill_chunk(limit: Option<usize>, longest: usize) -> usize {
+    limit.map_or(longest, |limit| limit.min(longest))
+}
+
 fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<DriverOptions> {
     let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
     Ok(DriverOptions {
@@ -684,7 +708,11 @@ fn open_driver(
         }
         Mode::DecodeCurve => {
             let isl = config.isl_list.iter().max().copied().unwrap_or(0);
-            (isl + config.osl, isl, config.isl_list.clone())
+            (
+                isl + config.osl,
+                curve_prefill_chunk(config.prefill_chunk, isl),
+                config.isl_list.clone(),
+            )
         }
     };
     let capacity = NonZeroUsize::new(longest).context("the longest request is empty")?;
@@ -1338,7 +1366,13 @@ fn measure_curve(
     let fit = config
         .roofline
         .then(|| roofline_fit(curve.iter().map(|point| &point["roofline"])));
-    Ok(json!({ "osl": config.osl, "caveats": caveats, "curve": curve, "roofline_fit": fit }))
+    Ok(json!({
+        "osl": config.osl,
+        "prefill_chunk": config.prefill_chunk,
+        "caveats": caveats,
+        "curve": curve,
+        "roofline_fit": fit,
+    }))
 }
 
 /// Print the window and return its device time for the result line (`null` when nothing was profiled).
@@ -2764,5 +2798,39 @@ mod roofline_tests {
         assert_eq!(kind(&fit), "measured");
         assert!((fit["ms_per_gb"].as_f64().unwrap() - 3.0).abs() < 1e-9);
         assert!((fit["fixed_ms"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod prefill_chunk_tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> anyhow::Result<Invocation> {
+        let mut args = vec!["poot-bench-runner", "--model-dir", "/nonexistent"];
+        args.extend_from_slice(extra);
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        parse_args(&args)
+    }
+
+    #[test]
+    fn a_bounded_curve_prefills_a_long_context_in_chunks_and_a_short_one_whole() {
+        assert_eq!(curve_prefill_chunk(Some(512), 2048), 512);
+        assert_eq!(curve_prefill_chunk(Some(4096), 2048), 2048);
+        assert_eq!(curve_prefill_chunk(None, 2048), 2048);
+    }
+
+    #[test]
+    fn the_prefill_chunk_flag_is_read_and_limited_to_decode_curve() {
+        let curve = ["--mode", "decode-curve", "--isl-list", "128"];
+        let mut with_chunk = curve.to_vec();
+        with_chunk.extend(["--prefill-chunk", "512"]);
+        match parse(&with_chunk).expect("a bounded curve parses") {
+            Invocation::Run(config) => assert_eq!(config.prefill_chunk, Some(512)),
+            _ => unreachable!("a run"),
+        }
+        assert!(parse(&["--prefill-chunk", "512"]).is_err(), "single mode");
+        let mut zero = curve.to_vec();
+        zero.extend(["--prefill-chunk", "0"]);
+        assert!(parse(&zero).is_err(), "a chunk holds a token");
     }
 }

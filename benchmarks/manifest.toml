@@ -312,3 +312,19 @@ frameworks.transformers = { support = true, precision = "mxfp4", caveat = "verif
 frameworks.vllm         = { support = true, precision = "mxfp4" }
 frameworks.llamacpp     = { support = true, precision = "mxfp4", caveat = "gpt-oss has native GGUF/mxfp4 in llama.cpp - verify" }
 frameworks.candle       = { support = false, reason = "candle-transformers 0.10.2 has no gpt-oss model" }
+
+# Qwen3.8-27B-FP8 (Qwen3_5ForConditionalGeneration, block-scaled E4M3 projections, ~31 GB): poot only. The baselines
+# are not run on this box and the checkpoint needs an 80 GB-class device or the Strix Halo's unified memory.
+[[model]]
+id = "qwen3.8-27b-fp8"
+arch = "Qwen3_5ForConditionalGeneration"
+hf_repo = "Qwen/Qwen3.8-27B-FP8"
+local_dir = "qwen3.8-27b-fp8"
+size_class = "xl"
+group = "dense"
+match_precision = "bf16"
+frameworks.poot         = { precision = "bf16", caveat = "the runner computes in the activation dtype; the FP8 projections are read as stored (E4M3 payload, BF16 block scales)" }
+frameworks.candle       = { support = false, reason = "candle-transformers has no Qwen3.5 gated-delta-net architecture" }
+frameworks.transformers = { support = false, reason = "not run on this box (31 GB checkpoint, one GPU shared with the owner's servers)" }
+frameworks.vllm         = { support = false, reason = "not run on this box (31 GB checkpoint, one GPU shared with the owner's servers)" }
+frameworks.llamacpp     = { support = false, reason = "GGUF conversions of this model are separate checkpoints; not run here" }

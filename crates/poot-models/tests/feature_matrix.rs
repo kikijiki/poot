@@ -122,6 +122,9 @@ fn weight_formats() -> Vec<WeightFormat> {
         WeightFormat::Q6_K,
         WeightFormat::Iq4_Nl,
         WeightFormat::Iq4_Xs,
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
         WeightFormat::Mxfp4,
         WeightFormat::E4m3PerChannel {
             scale: ScaleEncoding::Bf16,
@@ -172,6 +175,9 @@ fn format_name(format: WeightFormat) -> String {
         WeightFormat::Q6_K => "GGUF Q6_K".into(),
         WeightFormat::Iq4_Nl => "GGUF IQ4_NL".into(),
         WeightFormat::Iq4_Xs => "GGUF IQ4_XS".into(),
+        WeightFormat::Iq2_Xs => "GGUF IQ2_XS".into(),
+        WeightFormat::Iq3_Xxs => "GGUF IQ3_XXS".into(),
+        WeightFormat::Iq3_S => "GGUF IQ3_S".into(),
         WeightFormat::Mxfp4 => "GGUF MXFP4".into(),
         WeightFormat::E4m3PerChannel { scale } => {
             format!("FP8 E4M3, per-channel {} scale", scale_name(scale))

@@ -16,6 +16,12 @@
 //! `model.`. A projection is stored dense or packed (the FP8 checkpoint's `E4m3Block128` codes and
 //! scales), and the one tracer serves both: storage is the weight handle's format descriptor.
 //!
+//! A GGUF (`general.architecture = qwen35`) is llama.cpp's spelling of the same model: one tensor per
+//! GDN quantity (`attn_qkv`, `attn_gate`, `ssm_beta`, `ssm_alpha`), the value heads reordered from
+//! grouped to tiled, `ssm_a` already negative, every norm with its one folded in (the GDN's gated norm
+//! has none), and the multi-token-prediction layer the file appends after the last block
+//! (`nextn_predict_layers`) left out of the stack. Projections stay packed under their GGUF names.
+//!
 //! Every dimension is config data, so any checkpoint of the architecture loads (a finetune with
 //! fewer layers, another width), with or without an integrity manifest.
 
@@ -56,6 +62,7 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     keys: &[
         (ConfigSource::HfModelType, "qwen3_5"),
         (ConfigSource::HfModelType, "qwen3_5_text"),
+        (ConfigSource::GgufArchitecture, "qwen35"),
     ],
     build,
     fixture,
@@ -66,22 +73,27 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
 const WRAPPER_TYPE: &str = "qwen3_5";
 
 /// Qwen3.5's config facts: `Qwen3_5TextConfig`'s defaults. The class declares no `eos_token_id`: a
-/// checkpoint names it. The GGUF keys are unread: only an HF config names this family.
+/// checkpoint names it. A GGUF names the base (`qwen35.rope.freq_base`) or gets llama.cpp's default.
 const SPEC: DenseSpec = DenseSpec {
     family: FAMILY,
     gguf: dense_keys!("qwen35"),
     hf_theta: 10_000.0,
-    gguf_theta: 10_000.0,
+    gguf_theta: 10_000_000.0,
     eps: 1e-6,
     eos: None,
 };
 
-const KEY_HEADS: Field = Field::hf("linear_num_key_heads");
-const VALUE_HEADS: Field = Field::hf("linear_num_value_heads");
-const KEY_HEAD_DIM: Field = Field::hf("linear_key_head_dim");
+const KEY_HEADS: Field = Field::new("linear_num_key_heads", "qwen35.ssm.group_count");
+const VALUE_HEADS: Field = Field::new("linear_num_value_heads", "qwen35.ssm.time_step_rank");
+const KEY_HEAD_DIM: Field = Field::new("linear_key_head_dim", "qwen35.ssm.state_size");
 const VALUE_HEAD_DIM: Field = Field::hf("linear_value_head_dim");
-const CONV_KERNEL: Field = Field::hf("linear_conv_kernel_dim");
-const INTERVAL: Field = Field::hf("full_attention_interval");
+const CONV_KERNEL: Field = Field::new("linear_conv_kernel_dim", "qwen35.ssm.conv_kernel");
+const INNER_SIZE: Field = Field::new("", "qwen35.ssm.inner_size");
+const INTERVAL: Field = Field::new("full_attention_interval", "qwen35.full_attention_interval");
+const ROTARY_DIM: Field = Field::new("", "qwen35.rope.dimension_count");
+/// Layers a GGUF appends after the stack for multi-token prediction: they count in `block_count`
+/// and have their own tensors, and the stack does not run them.
+const NEXTN_LAYERS: Field = Field::new("", "qwen35.nextn_predict_layers");
 
 /// One layer's mixer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,24 +104,106 @@ pub(crate) enum LayerKind {
     FullAttention,
 }
 
-/// Where a checkpoint stores the text tower: the layer prefix and the model-level tensors.
+/// How a checkpoint spells the text tower: the layer prefix, the model-level tensors and each
+/// layer's tensor suffixes. A projection is a stem; its stored key is `{stem}.weight`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Names {
     layers: &'static str,
     embed: &'static str,
     final_norm: &'static str,
+    head: &'static str,
+    attn_norm: &'static str,
+    ffn_norm: &'static str,
+    attention: AttentionNames,
+    gdn: GdnNames,
+    ffn: [&'static str; 3],
 }
 
-const WRAPPED_NAMES: Names = Names {
-    layers: "model.language_model.layers.",
-    embed: "model.language_model.embed_tokens.weight",
-    final_norm: "model.language_model.norm.weight",
-};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttentionNames {
+    projections: [&'static str; 4],
+    q_norm: &'static str,
+    k_norm: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GdnNames {
+    /// The `qkv`, `z`, `beta`, `alpha` and output projection stems.
+    projections: [&'static str; 5],
+    dt_bias: &'static str,
+    conv: &'static str,
+    a: &'static str,
+    norm: &'static str,
+}
 
 const TEXT_NAMES: Names = Names {
     layers: "model.layers.",
     embed: "model.embed_tokens.weight",
     final_norm: "model.norm.weight",
+    head: "lm_head",
+    attn_norm: ".input_layernorm.weight",
+    ffn_norm: ".post_attention_layernorm.weight",
+    attention: AttentionNames {
+        projections: [
+            ".self_attn.q_proj",
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+            ".self_attn.o_proj",
+        ],
+        q_norm: ".self_attn.q_norm.weight",
+        k_norm: ".self_attn.k_norm.weight",
+    },
+    gdn: GdnNames {
+        projections: [
+            ".linear_attn.in_proj_qkv",
+            ".linear_attn.in_proj_z",
+            ".linear_attn.in_proj_b",
+            ".linear_attn.in_proj_a",
+            ".linear_attn.out_proj",
+        ],
+        dt_bias: ".linear_attn.dt_bias",
+        conv: ".linear_attn.conv1d.weight",
+        a: ".linear_attn.A_log",
+        norm: ".linear_attn.norm.weight",
+    },
+    ffn: [".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"],
+};
+
+/// The multimodal wrapper stores the text tower under `model.language_model.`.
+const WRAPPED_NAMES: Names = Names {
+    layers: "model.language_model.layers.",
+    embed: "model.language_model.embed_tokens.weight",
+    final_norm: "model.language_model.norm.weight",
+    ..TEXT_NAMES
+};
+
+/// llama.cpp's `qwen35` tensors.
+const GGUF_NAMES: Names = Names {
+    layers: "blk.",
+    embed: "token_embd.weight",
+    final_norm: "output_norm.weight",
+    head: "output",
+    attn_norm: ".attn_norm.weight",
+    ffn_norm: ".post_attention_norm.weight",
+    attention: AttentionNames {
+        projections: [".attn_q", ".attn_k", ".attn_v", ".attn_output"],
+        q_norm: ".attn_q_norm.weight",
+        k_norm: ".attn_k_norm.weight",
+    },
+    gdn: GdnNames {
+        projections: [
+            ".attn_qkv",
+            ".attn_gate",
+            ".ssm_beta",
+            ".ssm_alpha",
+            ".ssm_out",
+        ],
+        dt_bias: ".ssm_dt.bias",
+        conv: ".ssm_conv1d.weight",
+        a: ".ssm_a",
+        norm: ".ssm_norm.weight",
+    },
+    ffn: [".ffn_gate", ".ffn_up", ".ffn_down"],
 };
 
 /// Qwen3.5's typed config: every value checked once, here, so tracing cannot fail on it.
@@ -178,14 +272,17 @@ fn rotary_factor(fields: &Fields<'_>, text: &serde_json::Value) -> Result<f32, M
 }
 
 /// Which layers are full attention: `layer_types` names them (`"full_attention"` or
-/// `"linear_attention"` per layer), or `full_attention_interval` (default 4) does, where layer `i` is
-/// full attention iff `(i + 1)` is a multiple of the interval.
+/// `"linear_attention"` per layer; HF only), or `full_attention_interval` (default 4) does, where layer
+/// `i` is full attention iff `(i + 1)` is a multiple of the interval.
 fn layer_kinds(
     fields: &Fields<'_>,
-    text: &serde_json::Value,
+    text: Option<&serde_json::Value>,
     layers: usize,
 ) -> Result<Vec<LayerKind>, ModelError> {
-    if let Some(types) = text.get("layer_types").filter(|v| !v.is_null()) {
+    if let Some(types) = text
+        .and_then(|t| t.get("layer_types"))
+        .filter(|v| !v.is_null())
+    {
         let wrong = || fields.error("layer_types", ConfigReason::WrongType);
         let types = types.as_array().ok_or_else(wrong)?;
         if types.len() != layers {
@@ -218,18 +315,28 @@ fn layer_kinds(
 }
 
 impl Qwen35Params {
+    /// Reads the typed config from an HF `config.json` (the multimodal wrapper or a text-only
+    /// config) or a GGUF index (`qwen35`); a field the family cannot serve is a typed
+    /// [`ModelError::Config`] naming it.
     pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
-        let RawConfig::HfJson { config, generation } = raw else {
-            return Err(ModelError::Config {
-                family: FAMILY,
-                field: "general.architecture",
-                reason: ConfigReason::Unsupported,
-            });
+        let text;
+        let (raw, names) = match raw {
+            RawConfig::HfJson { config, generation } => {
+                let (config, names) = text_config(config)?;
+                text = config;
+                (
+                    RawConfig::HfJson {
+                        config: &text,
+                        generation: *generation,
+                    },
+                    names,
+                )
+            }
+            RawConfig::Gguf(index) => (RawConfig::Gguf(index), GGUF_NAMES),
         };
-        let (text, names) = text_config(config)?;
-        let raw = RawConfig::HfJson {
-            config: &text,
-            generation: *generation,
+        let hf_text = match &raw {
+            RawConfig::HfJson { config, .. } => Some(*config),
+            RawConfig::Gguf(_) => None,
         };
         let fields = Fields::new(&raw, FAMILY);
         let dims = DenseDims::read(&fields, &SPEC)?;
@@ -243,10 +350,37 @@ impl Qwen35Params {
         if !fields.flag(Field::hf("attn_output_gate"), true)? {
             return Err(fields.error("attn_output_gate", ConfigReason::Unsupported));
         }
+        // The stack is the blocks before the multi-token-prediction layers a GGUF appends.
+        let layers = match &raw {
+            RawConfig::HfJson { .. } => dims.layers,
+            RawConfig::Gguf(_) => {
+                let nextn = fields.opt_u64(NEXTN_LAYERS)?.unwrap_or(0);
+                usize::try_from(nextn)
+                    .ok()
+                    .and_then(|nextn| dims.layers.checked_sub(nextn))
+                    .filter(|&layers| layers > 0)
+                    .ok_or(fields.error(
+                        fields.key(NEXTN_LAYERS),
+                        ConfigReason::Exceeds { max: dims.layers },
+                    ))?
+            }
+        };
+        // The residual-stream and projection norms: HF stores `(1 + w)`, a GGUF folds the one in.
         let eps = dims.eps;
         let eps_error = |_| fields.error("rms_norm_eps", ConfigReason::NotFinitePositive);
-        let norm = NormParams::of(NormKind::RmsPlusOne, eps).map_err(eps_error)?;
-        let rotary = ((dims.head_dim as f32 * rotary_factor(&fields, &text)?) as usize).max(1);
+        let norm_kind = match hf_text {
+            Some(_) => NormKind::RmsPlusOne,
+            None => NormKind::Rms,
+        };
+        let norm = NormParams::of(norm_kind, eps).map_err(eps_error)?;
+        let rotary = match hf_text {
+            Some(text) => ((dims.head_dim as f32 * rotary_factor(&fields, text)?) as usize).max(1),
+            None => match fields.opt_u64(ROTARY_DIM)? {
+                Some(n) => usize::try_from(n)
+                    .map_err(|_| fields.error(fields.key(ROTARY_DIM), ConfigReason::WrongType))?,
+                None => dims.head_dim,
+            },
+        };
         let attention = AttentionParams::new(
             dims.heads,
             dims.kv_heads,
@@ -263,19 +397,36 @@ impl Qwen35Params {
         if fields.count(VALUE_HEAD_DIM, Some(head_dim))? != head_dim {
             return Err(fields.error("linear_value_head_dim", ConfigReason::Unsupported));
         }
-        let gdn = GdnParams::new(
+        let (key_heads, value_heads) = (
             fields.count(KEY_HEADS, None)?,
             fields.count(VALUE_HEADS, None)?,
+        );
+        if let Some(inner) = fields.opt_u64(INNER_SIZE)?
+            && inner as usize != value_heads * head_dim
+        {
+            return Err(fields.error(fields.key(INNER_SIZE), ConfigReason::Unsupported));
+        }
+        let gdn = GdnParams::new(
+            key_heads,
+            value_heads,
             head_dim,
             fields.count(CONV_KERNEL, None)?,
             NormParams::new(eps).map_err(eps_error)?,
-            GdnHeadOrder::Grouped,
+            match hf_text {
+                Some(_) => GdnHeadOrder::Grouped,
+                None => GdnHeadOrder::Tiled,
+            },
         )
-        .map_err(|e| e.for_family(FAMILY))?
-        .with_log_decay();
+        .map_err(|e| e.for_family(FAMILY))?;
+        // HF stores `A_log`; a GGUF stores `ssm_a`, already negative.
+        let gdn = if hf_text.is_some() {
+            gdn.with_log_decay()
+        } else {
+            gdn
+        };
 
         Ok(Self {
-            kinds: layer_kinds(&fields, &text, dims.layers)?,
+            kinds: layer_kinds(&fields, hf_text, layers)?,
             layer: LayerParams::new(norm),
             stack: StackParams::new(norm),
             attention,
@@ -317,7 +468,7 @@ fn weights_of(p: &Qwen35Params, store: &WeightStore) -> Result<WeightMap, ModelE
         names.final_norm.to_string(),
     )?;
     let head = WeightId::model(WeightRole::Head);
-    let head_key = linear("lm_head");
+    let head_key = linear(names.head);
     if store.contains(&head_key) {
         put(head, head_key)?;
     } else if p.head_required {
@@ -332,55 +483,50 @@ fn weights_of(p: &Qwen35Params, store: &WeightStore) -> Result<WeightMap, ModelE
     for (l, kind) in p.kinds.iter().enumerate() {
         let layer = |suffix: &str| format!("{}{l}{suffix}", names.layers);
         let id = |role| WeightId::layer(l, role);
-        put(
-            id(WeightRole::Norm(NormRole::Attn)),
-            layer(".input_layernorm.weight"),
-        )?;
-        put(
-            id(WeightRole::Norm(NormRole::Ffn)),
-            layer(".post_attention_layernorm.weight"),
-        )?;
+        put(id(WeightRole::Norm(NormRole::Attn)), layer(names.attn_norm))?;
+        put(id(WeightRole::Norm(NormRole::Ffn)), layer(names.ffn_norm))?;
         match kind {
             LayerKind::FullAttention => {
+                let a = &names.attention;
+                let [q, k, v, o] = a.projections;
                 for (role, stem) in [
-                    (AttnRole::Q, ".self_attn.q_proj"),
-                    (AttnRole::K, ".self_attn.k_proj"),
-                    (AttnRole::V, ".self_attn.v_proj"),
-                    (AttnRole::O, ".self_attn.o_proj"),
+                    (AttnRole::Q, q),
+                    (AttnRole::K, k),
+                    (AttnRole::V, v),
+                    (AttnRole::O, o),
                 ] {
                     put(id(WeightRole::Attn(role)), linear(&layer(stem)))?;
                 }
-                for (role, suffix) in [
-                    (AttnRole::QNorm, ".self_attn.q_norm.weight"),
-                    (AttnRole::KNorm, ".self_attn.k_norm.weight"),
-                ] {
-                    put(id(WeightRole::Attn(role)), layer(suffix))?;
-                }
+                put(id(WeightRole::Attn(AttnRole::QNorm)), layer(a.q_norm))?;
+                put(id(WeightRole::Attn(AttnRole::KNorm)), layer(a.k_norm))?;
             }
             LayerKind::LinearAttention => {
+                let g = &names.gdn;
+                let [qkv, z, beta, alpha, out] = g.projections;
                 for (role, stem) in [
-                    (GdnRole::Qkv, ".linear_attn.in_proj_qkv"),
-                    (GdnRole::Z, ".linear_attn.in_proj_z"),
-                    (GdnRole::Beta, ".linear_attn.in_proj_b"),
-                    (GdnRole::Alpha, ".linear_attn.in_proj_a"),
-                    (GdnRole::Out, ".linear_attn.out_proj"),
+                    (GdnRole::Qkv, qkv),
+                    (GdnRole::Z, z),
+                    (GdnRole::Beta, beta),
+                    (GdnRole::Alpha, alpha),
+                    (GdnRole::Out, out),
                 ] {
                     put(id(WeightRole::Gdn(role)), linear(&layer(stem)))?;
                 }
                 for (role, suffix) in [
-                    (GdnRole::DtBias, ".linear_attn.dt_bias"),
-                    (GdnRole::Conv, ".linear_attn.conv1d.weight"),
-                    (GdnRole::A, ".linear_attn.A_log"),
-                    (GdnRole::GateNorm, ".linear_attn.norm.weight"),
+                    (GdnRole::DtBias, g.dt_bias),
+                    (GdnRole::Conv, g.conv),
+                    (GdnRole::A, g.a),
+                    (GdnRole::GateNorm, g.norm),
                 ] {
                     put(id(WeightRole::Gdn(role)), layer(suffix))?;
                 }
             }
         }
+        let [gate, up, down] = names.ffn;
         for (role, stem) in [
-            (FfnRole::Gate, ".mlp.gate_proj"),
-            (FfnRole::Up, ".mlp.up_proj"),
-            (FfnRole::Down, ".mlp.down_proj"),
+            (FfnRole::Gate, gate),
+            (FfnRole::Up, up),
+            (FfnRole::Down, down),
         ] {
             put(id(WeightRole::Ffn(role)), linear(&layer(stem)))?;
         }
@@ -411,7 +557,11 @@ pub(crate) struct Qwen35 {
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
-    let p = Qwen35Params::from_raw(raw)?;
+    assemble(Qwen35Params::from_raw(raw)?, store)
+}
+
+/// The model of `p` over the weights `store` holds.
+fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
     let weights = weights_of(&p, store)?;
     let weight_error = |e: WeightError| e.for_family(FAMILY);
     let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
@@ -749,6 +899,12 @@ const VARIANT_FINETUNE: FixtureVariant = ("finetune", finetune_fixture);
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use poot_load::gguf::{
+        GgufIndex, GgufValue, IdentityNames, TensorNameMap, gguf_plan, read_gguf,
+    };
+    use poot_load::plan::default_workers;
     use poot_quant::StoredBytes;
     use poot_quant::weights::HandleFormat;
     use serde_json::json;
@@ -757,7 +913,8 @@ mod tests {
     use crate::components::standard::oracle::run_step;
     use crate::components::testing::{
         CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
-        close, close_all, decoded, greedy_tokens, q8_0_store, step_shape, values,
+        close, close_all, decoded, f32_entry, gguf_tensor, greedy_tokens, q8_0_store,
+        read_back_owned, step_shape, values,
     };
     use crate::model::LogitRows;
     use crate::registry::Registry;
@@ -1553,29 +1710,6 @@ mod tests {
         assert!(p.head_required);
     }
 
-    /// A GGUF names no Qwen3.5 here: the config reader refuses it typed.
-    #[test]
-    fn a_gguf_config_is_refused_typed() {
-        use poot_load::gguf::{GgufIndex, GgufValue, write_gguf};
-        let index = GgufIndex::parse(&StoredBytes::from(write_gguf(
-            &[("general.architecture", GgufValue::Str("qwen35".into()))],
-            &[],
-        )))
-        .unwrap();
-        let err = Qwen35Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ModelError::Config {
-                    field: "general.architecture",
-                    reason: ConfigReason::Unsupported,
-                    ..
-                }
-            ),
-            "{err}"
-        );
-    }
-
     #[test]
     fn a_shape_the_body_cannot_trace_is_a_typed_refusal() {
         let fx = fixture();
@@ -1602,5 +1736,781 @@ mod tests {
             ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
+    }
+
+    // ---- the GGUF spelling ---------------------------------------------------------------------
+
+    /// A GGUF tensor as the reader takes it: name, dims, GGML type and bytes.
+    type GgufTensor = (String, Vec<u64>, u32, Vec<u8>);
+
+    /// The GGUF checkpoint llama.cpp's converter writes for the wrapped HF `fixture`: every
+    /// per-value-head tensor reordered from HF's grouped order to tiled, `ssm_a = -exp(A_log)`, the
+    /// norms with their one folded in (the GDN's gated norm has none), and, when `nextn` is set, the
+    /// extra block the file appends for multi-token prediction. Written here from the converter's
+    /// rules, independently of the family's own GGUF reader.
+    fn gguf_of(fx: &Fixture, nextn: bool) -> (Vec<(String, GgufValue)>, Vec<GgufTensor>) {
+        let (text, root) = text_of(fx);
+        let n = |f: &str| Fixture::count(text, f);
+        let (w, hd) = (n("hidden_size"), n("linear_key_head_dim"));
+        let (hk, hv) = (n("linear_num_key_heads"), n("linear_num_value_heads"));
+        let rep = hv / hk;
+        let (key_dim, value_dim) = (hk * hd, hv * hd);
+        let conv = 2 * key_dim + value_dim;
+        let kernel = n("linear_conv_kernel_dim");
+        let layers = n("num_hidden_layers");
+        let (heads, kv, d) = (
+            n("num_attention_heads"),
+            n("num_key_value_heads"),
+            n("head_dim"),
+        );
+        let (vocab, inter) = (n("vocab_size"), n("intermediate_size"));
+        let vals = |key: &str| values(fx.store.get(key).unwrap_or_else(|| panic!("{key}")));
+        // The tiled position `t` of a value head holds grouped head `(t % hk) * rep + t / hk`.
+        let grouped_of = |t: usize| (t % hk) * rep + t / hk;
+        // Rows of `data` (`width` values each) in runs of `block` rows, the runs reordered.
+        let reorder_blocks = |data: &[f32], width: usize, block: usize| -> Vec<f32> {
+            (0..hv)
+                .flat_map(|t| {
+                    let g = grouped_of(t);
+                    data[g * block * width..(g + 1) * block * width].to_vec()
+                })
+                .collect()
+        };
+        let mut tensors: Vec<GgufTensor> = Vec::new();
+        let mut put = |name: String, shape: Vec<usize>, data: Vec<f32>| {
+            assert_eq!(data.len(), shape.iter().product::<usize>(), "{name}");
+            tensors.push(gguf_tensor(&name, &f32_entry(shape, &data)));
+        };
+        let plus_one = |v: Vec<f32>| v.into_iter().map(|x| x + 1.0).collect::<Vec<f32>>();
+        put(
+            "token_embd.weight".into(),
+            vec![vocab, w],
+            vals(&format!("{root}.embed_tokens.weight")),
+        );
+        put(
+            "output_norm.weight".into(),
+            vec![w],
+            plus_one(vals(&format!("{root}.norm.weight"))),
+        );
+        put(
+            "output.weight".into(),
+            vec![vocab, w],
+            vals("lm_head.weight"),
+        );
+        for l in 0..layers {
+            let hf = |s: &str| format!("{root}.layers.{l}.{s}");
+            let gg = |s: &str| format!("blk.{l}.{s}");
+            put(
+                gg("attn_norm.weight"),
+                vec![w],
+                plus_one(vals(&hf("input_layernorm.weight"))),
+            );
+            put(
+                gg("post_attention_norm.weight"),
+                vec![w],
+                plus_one(vals(&hf("post_attention_layernorm.weight"))),
+            );
+            if fx.store.contains(&hf("self_attn.q_proj.weight")) {
+                for (gguf, hf_name, rows, cols) in [
+                    ("attn_q", "self_attn.q_proj", 2 * heads * d, w),
+                    ("attn_k", "self_attn.k_proj", kv * d, w),
+                    ("attn_v", "self_attn.v_proj", kv * d, w),
+                    ("attn_output", "self_attn.o_proj", w, heads * d),
+                ] {
+                    put(
+                        gg(&format!("{gguf}.weight")),
+                        vec![rows, cols],
+                        vals(&hf(&format!("{hf_name}.weight"))),
+                    );
+                }
+                for (gguf, hf_name) in [
+                    ("attn_q_norm", "self_attn.q_norm"),
+                    ("attn_k_norm", "self_attn.k_norm"),
+                ] {
+                    put(
+                        gg(&format!("{gguf}.weight")),
+                        vec![d],
+                        plus_one(vals(&hf(&format!("{hf_name}.weight")))),
+                    );
+                }
+            } else {
+                // `in_proj_qkv` rows are `[q | k | v]`; only the value rows follow the value heads.
+                let qkv = vals(&hf("linear_attn.in_proj_qkv.weight"));
+                let split = 2 * key_dim * w;
+                put(
+                    gg("attn_qkv.weight"),
+                    vec![conv, w],
+                    [qkv[..split].to_vec(), reorder_blocks(&qkv[split..], w, hd)].concat(),
+                );
+                put(
+                    gg("attn_gate.weight"),
+                    vec![value_dim, w],
+                    reorder_blocks(&vals(&hf("linear_attn.in_proj_z.weight")), w, hd),
+                );
+                put(
+                    gg("ssm_beta.weight"),
+                    vec![hv, w],
+                    reorder_blocks(&vals(&hf("linear_attn.in_proj_b.weight")), w, 1),
+                );
+                put(
+                    gg("ssm_alpha.weight"),
+                    vec![hv, w],
+                    reorder_blocks(&vals(&hf("linear_attn.in_proj_a.weight")), w, 1),
+                );
+                put(
+                    gg("ssm_dt.bias"),
+                    vec![hv],
+                    reorder_blocks(&vals(&hf("linear_attn.dt_bias")), 1, 1),
+                );
+                let a: Vec<f32> = vals(&hf("linear_attn.A_log"))
+                    .iter()
+                    .map(|a| -a.exp())
+                    .collect();
+                put(gg("ssm_a"), vec![hv], reorder_blocks(&a, 1, 1));
+                // The conv kernel `[conv, 1, K]` as `[conv, K]`, its value rows reordered.
+                let kernel_rows = vals(&hf("linear_attn.conv1d.weight"));
+                let split = 2 * key_dim * kernel;
+                put(
+                    gg("ssm_conv1d.weight"),
+                    vec![conv, kernel],
+                    [
+                        kernel_rows[..split].to_vec(),
+                        reorder_blocks(&kernel_rows[split..], kernel, hd),
+                    ]
+                    .concat(),
+                );
+                put(
+                    gg("ssm_norm.weight"),
+                    vec![hd],
+                    vals(&hf("linear_attn.norm.weight")),
+                );
+                // `out_proj` `[w, value_dim]`: its columns follow the value heads.
+                let out = vals(&hf("linear_attn.out_proj.weight"));
+                let mut reordered: Vec<f32> = Vec::with_capacity(out.len());
+                for row in 0..w {
+                    for t in 0..hv {
+                        let g = grouped_of(t);
+                        reordered
+                            .extend(&out[row * value_dim + g * hd..row * value_dim + (g + 1) * hd]);
+                    }
+                }
+                put(gg("ssm_out.weight"), vec![w, value_dim], reordered);
+            }
+            for (gguf, hf_name, rows, cols) in [
+                ("ffn_gate", "mlp.gate_proj", inter, w),
+                ("ffn_up", "mlp.up_proj", inter, w),
+                ("ffn_down", "mlp.down_proj", w, inter),
+            ] {
+                put(
+                    gg(&format!("{gguf}.weight")),
+                    vec![rows, cols],
+                    vals(&hf(&format!("{hf_name}.weight"))),
+                );
+            }
+        }
+        if nextn {
+            // The multi-token-prediction block: an attention layer's tensors plus its own
+            // projection and norms, under the index after the last block. None are read.
+            let gg = |s: &str| format!("blk.{layers}.{s}");
+            let ones = |len: usize| vec![1.0; len];
+            put(gg("attn_norm.weight"), vec![w], ones(w));
+            put(gg("post_attention_norm.weight"), vec![w], ones(w));
+            put(gg("nextn.eh_proj.weight"), vec![w, 2 * w], ones(2 * w * w));
+            put(gg("nextn.enorm.weight"), vec![w], ones(w));
+            put(gg("nextn.hnorm.weight"), vec![w], ones(w));
+            put(gg("nextn.shared_head_norm.weight"), vec![w], ones(w));
+        }
+        let u = |v: usize| GgufValue::U32(v as u32);
+        let mut kvs = vec![
+            (
+                "general.architecture".to_string(),
+                GgufValue::Str("qwen35".into()),
+            ),
+            ("qwen35.embedding_length".to_string(), u(w)),
+            ("qwen35.feed_forward_length".to_string(), u(inter)),
+            (
+                "qwen35.block_count".to_string(),
+                u(layers + usize::from(nextn)),
+            ),
+            ("qwen35.attention.head_count".to_string(), u(heads)),
+            ("qwen35.attention.head_count_kv".to_string(), u(kv)),
+            ("qwen35.attention.key_length".to_string(), u(d)),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon".to_string(),
+                GgufValue::F32(text["rms_norm_eps"].as_f64().unwrap() as f32),
+            ),
+            (
+                "qwen35.context_length".to_string(),
+                u(n("max_position_embeddings")),
+            ),
+            (
+                "qwen35.rope.freq_base".to_string(),
+                GgufValue::F32(text["rope_parameters"]["rope_theta"].as_f64().unwrap() as f32),
+            ),
+            (
+                "qwen35.rope.dimension_count".to_string(),
+                u((d as f64
+                    * text["rope_parameters"]["partial_rotary_factor"]
+                        .as_f64()
+                        .unwrap()) as usize),
+            ),
+            ("qwen35.ssm.inner_size".to_string(), u(value_dim)),
+            ("qwen35.ssm.state_size".to_string(), u(hd)),
+            ("qwen35.ssm.group_count".to_string(), u(hk)),
+            ("qwen35.ssm.time_step_rank".to_string(), u(hv)),
+            ("qwen35.ssm.conv_kernel".to_string(), u(kernel)),
+            ("qwen35.full_attention_interval".to_string(), u(4)),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                GgufValue::Array(
+                    (0..vocab)
+                        .map(|t| GgufValue::Str(format!("t{t}")))
+                        .collect(),
+                ),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".to_string(),
+                u(fx.config["eos_token_id"].as_u64().unwrap() as usize),
+            ),
+        ];
+        if nextn {
+            kvs.push(("qwen35.nextn_predict_layers".to_string(), u(1)));
+        }
+        (kvs, tensors)
+    }
+
+    /// The GGUF the converter writes for the HF fixture resolves through the registry to this family
+    /// and gives the same logits and attention cache as the HF model, prefill and decode, with and
+    /// without the appended multi-token-prediction block. Mutations: read the GGUF with
+    /// `GdnHeadOrder::Grouped` (the value heads pair with the wrong key heads); take `block_count`
+    /// as the stack's depth (the nextn block is traced as a fifth layer and the weight map names
+    /// tensors the file lacks).
+    #[test]
+    fn the_gguf_spelling_of_the_fixture_equals_the_hf_model() {
+        let fx = fixture();
+        let hf = model_of(&fx.config, &fx.store);
+        let prompt = [3, 17, 40, 8, 25, 9];
+        let (want, want_state) = run_step(&*hf, &fx.store, Phase::Prefill, CAP, &prompt, 0, &[]);
+        let (want_decode, _) = run_step(&*hf, &fx.store, Phase::Decode, CAP, &[5], 6, &want_state);
+        for nextn in [false, true] {
+            let (kvs, tensors) = gguf_of(&fx, nextn);
+            let (index, store) = read_back_owned(&kvs, &tensors);
+            let registry = Registry::builtin().unwrap();
+            let raw = RawConfig::Gguf(&index);
+            assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
+            let gguf = registry.build(&raw, &store).unwrap();
+            let (got, state) = run_step(&*gguf, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
+            close(&got, &want);
+            // The carried tensors differ in value-head order, so only the logits and the attention
+            // cache (the last two state values) are comparable.
+            let kv = want_state.len() - 2;
+            close_all(&state[kv..], &want_state[kv..]);
+            let (got, _) = run_step(&*gguf, &store, Phase::Decode, CAP, &[5], 6, &state);
+            close(&got, &want_decode);
+        }
+    }
+
+    /// The GGUF's config is read from its own keys: the stack's depth excludes the appended
+    /// multi-token-prediction blocks, the layer kinds follow `full_attention_interval`, and the norms
+    /// are the folded kind.
+    #[test]
+    fn a_gguf_config_excludes_the_nextn_block_and_reads_the_interval() {
+        let fx = fixture();
+        let (kvs, tensors) = gguf_of(&fx, true);
+        let (index, _) = read_back_owned(&kvs, &tensors);
+        let p = Qwen35Params::from_raw(&RawConfig::Gguf(&index)).unwrap();
+        assert_eq!(
+            p.kinds,
+            [
+                LayerKind::LinearAttention,
+                LayerKind::LinearAttention,
+                LayerKind::LinearAttention,
+                LayerKind::FullAttention,
+            ]
+        );
+        assert_eq!(p.names, GGUF_NAMES);
+        assert!(!p.head_required);
+        assert_eq!(p.eos, BTreeSet::from([47]));
+    }
+
+    /// More multi-token-prediction blocks than blocks is a typed config refusal naming the key.
+    #[test]
+    fn a_gguf_with_more_nextn_blocks_than_blocks_is_refused_typed() {
+        let fx = fixture();
+        let (mut kvs, tensors) = gguf_of(&fx, true);
+        for (key, value) in &mut kvs {
+            if key == "qwen35.nextn_predict_layers" {
+                *value = GgufValue::U32(5);
+            }
+        }
+        let (index, _) = read_back_owned(&kvs, &tensors);
+        let err = Qwen35Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ModelError::Config {
+                    field: "qwen35.nextn_predict_layers",
+                    reason: ConfigReason::Exceeds { max: 5 },
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    // ---- the real checkpoint ---------------------------------------------------------------------
+
+    const REAL_GGUF: poot_test_util::Checkpoint =
+        poot_test_util::checkpoint!("Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf");
+
+    /// Keeps the model-level tensors and the first `blocks` blocks of a GGUF (the real file is 18 GB:
+    /// the rows below read only these, mapped, and decode single rows).
+    struct FirstBlocks {
+        blocks: usize,
+    }
+
+    impl TensorNameMap for FirstBlocks {
+        fn weight_key(&self, name: &str) -> Option<WeightKey> {
+            let keep = match name.strip_prefix("blk.") {
+                None => true,
+                Some(rest) => rest
+                    .split_once('.')
+                    .and_then(|(block, _)| block.parse::<usize>().ok())
+                    .is_some_and(|block| block < self.blocks),
+            };
+            keep.then(|| WeightKey::from(name))
+        }
+    }
+
+    /// Keeps exactly one tensor.
+    struct Only(&'static str);
+
+    impl TensorNameMap for Only {
+        fn weight_key(&self, name: &str) -> Option<WeightKey> {
+            (name == self.0).then(|| WeightKey::from(name))
+        }
+    }
+
+    fn real_gguf() -> Option<GgufIndex> {
+        let path = poot_test_util::model_path(REAL_GGUF)?;
+        let file = StoredBytes::map(std::fs::File::open(path).unwrap()).unwrap();
+        let index = GgufIndex::parse(&file).unwrap();
+        Some(index)
+    }
+
+    /// The real `Qwen3.8-27B` GGUF (UD-Q4_K_XL) reads into the pinned dimensions: the 65th block is the
+    /// multi-token-prediction layer, the stack is 64 layers with full attention on every fourth, the
+    /// GDN's heads are the file's (16 key, 48 value, 128 wide), and its token ids and RoPE base are
+    /// the file's. Expected values are the header's, read by an independent parser.
+    #[test]
+    fn the_real_gguf_config_reads_into_the_pinned_dimensions() {
+        let Some(index) = real_gguf() else {
+            return;
+        };
+        let raw = RawConfig::Gguf(&index);
+        assert_eq!(
+            Registry::builtin().unwrap().resolve(&raw).unwrap().family,
+            FAMILY
+        );
+        let p = Qwen35Params::from_raw(&raw).unwrap();
+        assert_eq!((p.vocab, p.width, p.inter), (248_320, 5_120, 17_408));
+        assert_eq!(p.kinds.len(), 64);
+        for (l, kind) in p.kinds.iter().enumerate() {
+            let full = (l + 1) % 4 == 0;
+            assert_eq!(*kind == LayerKind::FullAttention, full, "layer {l}");
+        }
+        assert_eq!(p.max_positions, 262_144);
+        assert_eq!(p.eos, BTreeSet::from([248_046]));
+        assert_eq!(p.bos, Some(248_044));
+        assert_eq!(p.names, GGUF_NAMES);
+        assert!(!p.head_required);
+    }
+
+    /// The first four blocks of the real file (three GDN layers, then gated attention) bind through
+    /// the family's names with the quantization the file stores, kept packed: the weight map resolves
+    /// every tensor the stack reads, and the model traces a prefill step over them. The expected
+    /// formats are the header's, read by an independent parser. Mutation: map `attn_gate` to the
+    /// `ssm_alpha` row; the GDN's `z` projection binds a `[48, 5120]` tensor and the build is refused.
+    #[test]
+    fn the_real_gguf_first_blocks_bind_packed_and_trace() {
+        let Some(index) = real_gguf() else {
+            return;
+        };
+        let raw = RawConfig::Gguf(&index);
+        let mut p = Qwen35Params::from_raw(&raw).unwrap();
+        p.kinds.truncate(4);
+        let store = read_gguf(&index, &FirstBlocks { blocks: 4 }, default_workers()).unwrap();
+        let format = |key: &str| match store.get(key).unwrap_or_else(|| panic!("{key}")) {
+            WeightEntry::Packed(payload) => payload.weight().format(),
+            WeightEntry::Dense(_) => panic!("{key} was widened to a dense tensor"),
+        };
+        for (key, want) in [
+            ("token_embd.weight", WeightFormat::Q4_K),
+            ("output.weight", WeightFormat::Q6_K),
+            ("blk.0.attn_qkv.weight", WeightFormat::Q5_K),
+            ("blk.0.attn_gate.weight", WeightFormat::Q5_K),
+            ("blk.0.ssm_alpha.weight", WeightFormat::Q8_0),
+            ("blk.0.ssm_out.weight", WeightFormat::Q8_0),
+            ("blk.0.ffn_gate.weight", WeightFormat::Iq4_Xs),
+            ("blk.0.ffn_up.weight", WeightFormat::Q3_K),
+            ("blk.1.ffn_down.weight", WeightFormat::Iq4_Nl),
+            ("blk.3.attn_q.weight", WeightFormat::Q5_K),
+            ("blk.3.attn_k.weight", WeightFormat::Q4_K),
+            ("blk.3.attn_output.weight", WeightFormat::Q6_K),
+        ] {
+            assert_eq!(format(key), want, "{key}");
+        }
+        let model = assemble(p, &store).unwrap();
+        model
+            .trace(
+                Phase::Prefill,
+                step_shape(2, 8, LogitRows::Last),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
+    }
+
+    /// Every tensor of the real file's header plans through the production name map (`IdentityNames`,
+    /// what `poot-llm`'s driver loads a GGUF with): no tensor is refused for its type, including the
+    /// file's one `IQ3_S` tensor (`blk.14.ffn_down.weight`, ggml type 21), and each of the 866 tensors is
+    /// one owner of the plan. No first-blocks or single-tensor map narrows the file. Mutation: map ggml
+    /// type 21 to `None` in `weight_format_of`; the plan is refused naming that tensor.
+    #[test]
+    fn every_tensor_of_the_real_gguf_plans_through_the_production_name_map() {
+        let Some(index) = real_gguf() else {
+            return;
+        };
+        assert_eq!(index.tensors.len(), 866);
+        assert_eq!(index.tensors["blk.14.ffn_down.weight"].ggml_type, 21);
+        let plan = gguf_plan(&index, &IdentityNames).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(plan.len(), index.tensors.len());
+    }
+
+    /// Per-row dequant parity of the real file's tensors, one per quantization the file uses, against
+    /// an independent reference: a Python decoder written from the ggml format description, not from
+    /// this codebase. Each row is `(tensor, ggml type, row, first four values, sum, sum of absolute
+    /// values, position-weighted sum)`; the weighted sum fails a decoder that permutes values within
+    /// a block. Mutation: swap two entries of the IQ4_NL codebook; its rows go red.
+    #[test]
+    fn the_real_gguf_rows_dequantize_to_the_independent_reference() {
+        let Some(index) = real_gguf() else {
+            return;
+        };
+        type Row = (&'static str, u32, usize, [f64; 4], f64, f64, f64);
+        let rows: &[Row] = &[
+            (
+                "blk.0.ssm_out.weight",
+                8,
+                0,
+                [
+                    -0.00839853286743164,
+                    0.0004420280456542969,
+                    -0.016355037689208984,
+                    0.003094196319580078,
+                ],
+                0.12331223487854004,
+                67.53328037261963,
+                3157.006844162941,
+            ),
+            (
+                "blk.0.ssm_out.weight",
+                8,
+                4999,
+                [
+                    -0.0012052059173583984,
+                    -0.025510191917419434,
+                    -0.0026112794876098633,
+                    0.007030367851257324,
+                ],
+                0.9801188707351685,
+                67.41092574596405,
+                2547.979104399681,
+            ),
+            (
+                "blk.0.ffn_up.weight",
+                11,
+                0,
+                [-0.0062732696533203125, 0.0, 0.0, -0.012546539306640625],
+                1.4600802659988403,
+                42.24352943897247,
+                3183.182289838791,
+            ),
+            (
+                "blk.0.ffn_up.weight",
+                11,
+                17407,
+                [
+                    -0.004596233367919922,
+                    0.018384933471679688,
+                    0.009192466735839844,
+                    -0.013788700103759766,
+                ],
+                0.14160776138305664,
+                39.07256269454956,
+                -1015.8740805387497,
+            ),
+            (
+                "token_embd.weight",
+                12,
+                0,
+                [
+                    0.0050776004791259766,
+                    -0.014770984649658203,
+                    0.022090673446655273,
+                    -0.01193547248840332,
+                ],
+                0.48461365699768066,
+                53.55117869377136,
+                2789.253961920738,
+            ),
+            (
+                "token_embd.weight",
+                12,
+                248319,
+                [
+                    -0.0061026811599731445,
+                    0.0036643147468566895,
+                    0.0025790929794311523,
+                    0.005834758281707764,
+                ],
+                -0.002151012420654297,
+                12.777710556983948,
+                -801.5010811090469,
+            ),
+            (
+                "blk.0.attn_qkv.weight",
+                13,
+                0,
+                [
+                    -0.020967066287994385,
+                    0.019797146320343018,
+                    -0.005114316940307617,
+                    0.02432650327682495,
+                ],
+                -2.6517106890678406,
+                70.83429199457169,
+                -6794.964012026787,
+            ),
+            (
+                "blk.0.attn_qkv.weight",
+                13,
+                10239,
+                [
+                    -0.018031716346740723,
+                    0.013255476951599121,
+                    0.00543367862701416,
+                    -0.00043267011642456055,
+                ],
+                -0.22943055629730225,
+                68.50152027606964,
+                -386.7722784280777,
+            ),
+            (
+                "output.weight",
+                14,
+                0,
+                [
+                    0.002249479293823242,
+                    0.034866929054260254,
+                    0.011247396469116211,
+                    -0.023619532585144043,
+                ],
+                -0.7459412813186646,
+                63.81504261493683,
+                -2536.782041847706,
+            ),
+            (
+                "output.weight",
+                14,
+                248319,
+                [
+                    0.009332656860351562,
+                    -0.0058329105377197266,
+                    -0.000874936580657959,
+                    0.0020415186882019043,
+                ],
+                0.23581111431121826,
+                18.694132685661316,
+                286.3414177298546,
+            ),
+            (
+                "blk.1.ffn_down.weight",
+                20,
+                0,
+                [
+                    -0.006921887397766113,
+                    0.0075151920318603516,
+                    0.010481715202331543,
+                    0.0075151920318603516,
+                ],
+                0.036003828048706055,
+                146.68103766441345,
+                -807.7595727443695,
+            ),
+            (
+                "blk.1.ffn_down.weight",
+                20,
+                5119,
+                [
+                    -0.01989305019378662,
+                    -0.008493661880493164,
+                    0.0049173831939697266,
+                    -0.008493661880493164,
+                ],
+                -0.10125672817230225,
+                146.02655589580536,
+                2242.7229819893837,
+            ),
+            (
+                "blk.0.ffn_down.weight",
+                23,
+                0,
+                [
+                    -0.002213001251220703,
+                    -0.00017023086547851562,
+                    -0.01515054702758789,
+                    -0.004255771636962891,
+                ],
+                -0.2318987250328064,
+                143.0832684636116,
+                11267.667894542217,
+            ),
+            (
+                "blk.0.ffn_down.weight",
+                23,
+                5119,
+                [
+                    0.00507354736328125,
+                    0.007076263427734375,
+                    -0.006542205810546875,
+                    -0.00293731689453125,
+                ],
+                0.08191466331481934,
+                143.04997551441193,
+                -2703.979759335518,
+            ),
+            (
+                "blk.0.ffn_gate.weight",
+                23,
+                0,
+                [
+                    -0.004884600639343262,
+                    -0.010355353355407715,
+                    -0.010355353355407715,
+                    0.006838440895080566,
+                ],
+                0.5269913077354431,
+                44.8743252158165,
+                1564.4970512390137,
+            ),
+            (
+                "blk.0.ffn_gate.weight",
+                23,
+                17407,
+                [
+                    0.011252522468566895,
+                    0.0027600526809692383,
+                    0.0027600526809692383,
+                    0.011252522468566895,
+                ],
+                0.1207500696182251,
+                40.048569321632385,
+                -504.0539869070053,
+            ),
+            // The file's one IQ3_S tensor, decoded by gguf-py (`gguf.quants.dequantize`) from the
+            // mapped file. Mutation: swap two entries of the IQ3_S grid; these rows go red.
+            (
+                "blk.14.ffn_down.weight",
+                21,
+                0,
+                [
+                    -0.00481027364730835,
+                    -0.0016034245491027832,
+                    0.011223971843719482,
+                    -0.00481027364730835,
+                ],
+                -0.030666470527648926,
+                155.01027309894562,
+                -1297.5106790065765,
+            ),
+            (
+                "blk.14.ffn_down.weight",
+                21,
+                5119,
+                [
+                    -0.013991475105285645,
+                    0.009993910789489746,
+                    -0.005996346473693848,
+                    -0.0019987821578979492,
+                ],
+                2.1222199201583862,
+                159.6358369588852,
+                21469.186687111855,
+            ),
+        ];
+        let mut tensors: BTreeMap<&str, WeightStore> = BTreeMap::new();
+        for &(name, ggml_type, row, head, sum, abs_sum, weighted) in rows {
+            assert_eq!(index.tensors[name].ggml_type, ggml_type, "{name}");
+            let store = tensors
+                .entry(name)
+                .or_insert_with(|| read_gguf(&index, &Only(name), default_workers()).unwrap());
+            let WeightEntry::Packed(payload) = store.get(name).unwrap() else {
+                panic!("{name} was widened to a dense tensor");
+            };
+            let mut out = vec![0.0f32; payload.weight().shape()[1]];
+            payload.decode_row(row, &mut out).unwrap();
+            let near = |got: f64, want: f64, what: &str| {
+                let bound = 1e-4 * want.abs().max(1.0);
+                assert!(
+                    (got - want).abs() <= bound,
+                    "{name} row {row} {what}: {got} vs {want}"
+                );
+            };
+            for (i, want) in head.into_iter().enumerate() {
+                near(f64::from(out[i]), want, &format!("value {i}"));
+            }
+            near(out.iter().map(|&v| f64::from(v)).sum(), sum, "sum");
+            near(
+                out.iter().map(|&v| f64::from(v).abs()).sum(),
+                abs_sum,
+                "sum of absolute values",
+            );
+            near(
+                out.iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i + 1) as f64 * f64::from(v))
+                    .sum(),
+                weighted,
+                "weighted sum",
+            );
+        }
+    }
+
+    /// A GGUF without a mapped tensor fails the build with the weight map's typed missing-weight
+    /// error naming the GGUF tensor.
+    #[test]
+    fn a_gguf_missing_a_mapped_tensor_names_it() {
+        let fx = fixture();
+        let (kvs, tensors) = gguf_of(&fx, false);
+        let tensors: Vec<GgufTensor> = tensors
+            .into_iter()
+            .filter(|(name, ..)| name != "blk.0.ssm_alpha.weight")
+            .collect();
+        let (index, store) = read_back_owned(&kvs, &tensors);
+        let err = match Registry::builtin()
+            .unwrap()
+            .build(&RawConfig::Gguf(&index), &store)
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a store without blk.0.ssm_alpha.weight built"),
+        };
+        let crate::registry::LoadModelError::Model(ModelError::Weight {
+            source: WeightMapError::Missing { key, .. },
+            ..
+        }) = &err
+        else {
+            panic!("expected a missing-weight error, got {err}");
+        };
+        assert_eq!(key.as_str(), "blk.0.ssm_alpha.weight", "{err}");
     }
 }

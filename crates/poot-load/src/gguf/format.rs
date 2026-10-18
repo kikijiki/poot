@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use poot_quant::StoredBytes;
 use poot_quant::format::WeightFormat;
 
-use crate::LoadError;
+use crate::{GgufSplitError, LoadError};
 
 /// A GGUF metadata value (the 13 GGUF value types; `Array` holds a homogeneous list).
 #[derive(Debug, Clone, PartialEq)]
@@ -92,8 +92,10 @@ pub struct GgufTensorInfo {
     pub dims: Vec<u64>,
     /// The ggml tensor type id (see [`crate::gguf::weight_format_of`]).
     pub ggml_type: u32,
-    /// Byte offset of the tensor's data from the start of the tensor-data section.
+    /// Byte offset of the tensor's data from the start of its shard's tensor-data section.
     pub offset: u64,
+    /// Which shard of the set holds the tensor: always 0 for a single file.
+    pub shard: usize,
 }
 
 /// Maximum tensor rank accepted from a GGUF header (ggml caps at GGML_MAX_DIMS = 4). Bounds
@@ -311,6 +313,7 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader, LoadError> {
                 dims,
                 ggml_type,
                 offset,
+                shard: 0,
             },
         );
     }
@@ -336,83 +339,158 @@ fn parse_header(bytes: &[u8]) -> Result<ParsedHeader, LoadError> {
 /// Every ggml tensor type id a GGUF file can name (0..=39, ggml.h's `ggml_type`), mapped to the
 /// [`WeightFormat`] poot reads it as, or `None` when poot has no packed or dense representation for
 /// it: a ggml id ggml itself no longer assigns (a removed legacy variant, e.g. `Q4_2`), or a real
-/// ggml scheme with no packed path in `poot-quant` (`Q8_1`, `Q8_K`, the IQ2/IQ3/IQ1 grid formats,
+/// ggml scheme with no packed path in `poot-quant` (`Q8_1`, `Q8_K`, the IQ2_XXS/IQ2_S/IQ1 grid formats,
 /// `TQ1_0`/`TQ2_0`, or a plain integer/`F64` tensor type). A quantized tensor of a `None` type is
 /// refused by name at load ([`crate::LoadError::UnsupportedGgufType`]), never loaded dense silently
 /// (ADR-0103 decision 2). Pinned by a literal table (card 543 SC-004): every entry is written out, not
 /// derived, so it can be checked against `ggml.h` line by line.
 pub fn weight_format_of(ggml_type: u32) -> Option<WeightFormat> {
     const TABLE: [Option<WeightFormat>; 40] = [
-        Some(WeightFormat::F32),    // 0 GGML_TYPE_F32
-        Some(WeightFormat::F16),    // 1 GGML_TYPE_F16
-        Some(WeightFormat::Q4_0),   // 2 GGML_TYPE_Q4_0
-        Some(WeightFormat::Q4_1),   // 3 GGML_TYPE_Q4_1
-        None,                       // 4 GGML_TYPE_Q4_2 (removed)
-        None,                       // 5 GGML_TYPE_Q4_3 (removed)
-        Some(WeightFormat::Q5_0),   // 6 GGML_TYPE_Q5_0
-        Some(WeightFormat::Q5_1),   // 7 GGML_TYPE_Q5_1
-        Some(WeightFormat::Q8_0),   // 8 GGML_TYPE_Q8_0
-        None,                       // 9 GGML_TYPE_Q8_1 (no packed path)
-        Some(WeightFormat::Q2_K),   // 10 GGML_TYPE_Q2_K
-        Some(WeightFormat::Q3_K),   // 11 GGML_TYPE_Q3_K
-        Some(WeightFormat::Q4_K),   // 12 GGML_TYPE_Q4_K
-        Some(WeightFormat::Q5_K),   // 13 GGML_TYPE_Q5_K
-        Some(WeightFormat::Q6_K),   // 14 GGML_TYPE_Q6_K
-        None,                       // 15 GGML_TYPE_Q8_K (no packed path)
-        None,                       // 16 GGML_TYPE_IQ2_XXS (no packed path)
-        None,                       // 17 GGML_TYPE_IQ2_XS (no packed path)
-        None,                       // 18 GGML_TYPE_IQ3_XXS (no packed path)
-        None,                       // 19 GGML_TYPE_IQ1_S (no packed path)
-        Some(WeightFormat::Iq4_Nl), // 20 GGML_TYPE_IQ4_NL
-        None,                       // 21 GGML_TYPE_IQ3_S (no packed path)
-        None,                       // 22 GGML_TYPE_IQ2_S (no packed path)
-        Some(WeightFormat::Iq4_Xs), // 23 GGML_TYPE_IQ4_XS
-        None,                       // 24 GGML_TYPE_I8 (not a weight format)
-        None,                       // 25 GGML_TYPE_I16 (not a weight format)
-        None,                       // 26 GGML_TYPE_I32 (not a weight format)
-        None,                       // 27 GGML_TYPE_I64 (not a weight format)
-        None,                       // 28 GGML_TYPE_F64 (not a weight format)
-        None,                       // 29 GGML_TYPE_IQ1_M (no packed path)
-        Some(WeightFormat::Bf16),   // 30 GGML_TYPE_BF16
-        None,                       // 31 GGML_TYPE_Q4_0_4_4 (removed)
-        None,                       // 32 GGML_TYPE_Q4_0_4_8 (removed)
-        None,                       // 33 GGML_TYPE_Q4_0_8_8 (removed)
-        None,                       // 34 GGML_TYPE_TQ1_0 (no packed path)
-        None,                       // 35 GGML_TYPE_TQ2_0 (no packed path)
-        None,                       // 36 GGML_TYPE_IQ4_NL_4_4 (removed)
-        None,                       // 37 GGML_TYPE_IQ4_NL_4_8 (removed)
-        None,                       // 38 GGML_TYPE_IQ4_NL_8_8 (removed)
-        Some(WeightFormat::Mxfp4),  // 39 GGML_TYPE_MXFP4
+        Some(WeightFormat::F32),     // 0 GGML_TYPE_F32
+        Some(WeightFormat::F16),     // 1 GGML_TYPE_F16
+        Some(WeightFormat::Q4_0),    // 2 GGML_TYPE_Q4_0
+        Some(WeightFormat::Q4_1),    // 3 GGML_TYPE_Q4_1
+        None,                        // 4 GGML_TYPE_Q4_2 (removed)
+        None,                        // 5 GGML_TYPE_Q4_3 (removed)
+        Some(WeightFormat::Q5_0),    // 6 GGML_TYPE_Q5_0
+        Some(WeightFormat::Q5_1),    // 7 GGML_TYPE_Q5_1
+        Some(WeightFormat::Q8_0),    // 8 GGML_TYPE_Q8_0
+        None,                        // 9 GGML_TYPE_Q8_1 (no packed path)
+        Some(WeightFormat::Q2_K),    // 10 GGML_TYPE_Q2_K
+        Some(WeightFormat::Q3_K),    // 11 GGML_TYPE_Q3_K
+        Some(WeightFormat::Q4_K),    // 12 GGML_TYPE_Q4_K
+        Some(WeightFormat::Q5_K),    // 13 GGML_TYPE_Q5_K
+        Some(WeightFormat::Q6_K),    // 14 GGML_TYPE_Q6_K
+        None,                        // 15 GGML_TYPE_Q8_K (no packed path)
+        None,                        // 16 GGML_TYPE_IQ2_XXS (no packed path)
+        Some(WeightFormat::Iq2_Xs),  // 17 GGML_TYPE_IQ2_XS
+        Some(WeightFormat::Iq3_Xxs), // 18 GGML_TYPE_IQ3_XXS
+        None,                        // 19 GGML_TYPE_IQ1_S (no packed path)
+        Some(WeightFormat::Iq4_Nl),  // 20 GGML_TYPE_IQ4_NL
+        Some(WeightFormat::Iq3_S),   // 21 GGML_TYPE_IQ3_S
+        None,                        // 22 GGML_TYPE_IQ2_S (no packed path)
+        Some(WeightFormat::Iq4_Xs),  // 23 GGML_TYPE_IQ4_XS
+        None,                        // 24 GGML_TYPE_I8 (not a weight format)
+        None,                        // 25 GGML_TYPE_I16 (not a weight format)
+        None,                        // 26 GGML_TYPE_I32 (not a weight format)
+        None,                        // 27 GGML_TYPE_I64 (not a weight format)
+        None,                        // 28 GGML_TYPE_F64 (not a weight format)
+        None,                        // 29 GGML_TYPE_IQ1_M (no packed path)
+        Some(WeightFormat::Bf16),    // 30 GGML_TYPE_BF16
+        None,                        // 31 GGML_TYPE_Q4_0_4_4 (removed)
+        None,                        // 32 GGML_TYPE_Q4_0_4_8 (removed)
+        None,                        // 33 GGML_TYPE_Q4_0_8_8 (removed)
+        None,                        // 34 GGML_TYPE_TQ1_0 (no packed path)
+        None,                        // 35 GGML_TYPE_TQ2_0 (no packed path)
+        None,                        // 36 GGML_TYPE_IQ4_NL_4_4 (removed)
+        None,                        // 37 GGML_TYPE_IQ4_NL_4_8 (removed)
+        None,                        // 38 GGML_TYPE_IQ4_NL_8_8 (removed)
+        Some(WeightFormat::Mxfp4),   // 39 GGML_TYPE_MXFP4
     ];
     TABLE.get(ggml_type as usize).copied().flatten()
 }
 
-/// A GGUF file's header and tensor directory, with no tensor data read (dquant.md 8.1): the metadata
-/// key-value table and the `(name, ggml type, ne, data offset)` of every tensor.
-/// [`crate::gguf::read_gguf`] slices each tensor's bytes out of the same [`StoredBytes`] using
+/// A GGUF checkpoint's header and tensor directory, with no tensor data read (dquant.md 8.1): the
+/// metadata key-value table and the `(name, ggml type, ne, data offset)` of every tensor. A split
+/// checkpoint (llama.cpp's `-0000N-of-0000M.gguf` sets) is one index over its shards in order: the
+/// metadata is the first shard's, every tensor names the shard that holds it, and the index keeps the
+/// mappings it was parsed from, so the bytes a plan slices are the ones the directory describes.
+/// [`crate::gguf::read_gguf`] slices each tensor's bytes out of those mappings using
 /// [`Self::data_start`]; nothing here copies file contents.
 pub struct GgufIndex {
-    /// The GGUF format version the header declares.
+    /// The GGUF format version the first shard declares.
     pub version: u32,
-    /// Metadata key-value table, keyed by the dotted key (`general.architecture`, ...).
+    /// Metadata key-value table of the first shard, keyed by the dotted key (`general.architecture`, ...).
     pub metadata: HashMap<String, GgufValue>,
-    /// Tensor directory, keyed by tensor name.
+    /// Tensor directory of every shard, keyed by tensor name.
     pub tensors: HashMap<String, GgufTensorInfo>,
+    shards: Vec<Shard>,
+}
+
+/// One shard of a checkpoint: its mapping and where its tensor data begins.
+struct Shard {
+    file: StoredBytes,
     data_start: usize,
 }
 
 impl GgufIndex {
-    /// Parse a GGUF header and tensor directory from `file`, a mapping of a checkpoint or an in-memory
-    /// buffer (a fixture). Only the header pages are touched, so it also works on a partial download.
-    /// Header and tensor data come from the one `StoredBytes` that [`crate::gguf::read_gguf`] slices.
+    /// Parse a single-file checkpoint: a header and tensor directory from `file`, a mapping of a
+    /// checkpoint or an in-memory buffer (a fixture). Only the header pages are touched, so it also
+    /// works on a partial download. One shard of a split checkpoint parses too, so its metadata can
+    /// be read, but [`crate::gguf::gguf_plan`] refuses it: its directory lacks tensors its metadata
+    /// counts.
     pub fn parse(file: &StoredBytes) -> Result<Self, LoadError> {
-        let header = parse_header(file.as_slice())?;
-        Ok(Self {
+        Self::parse_shards(std::slice::from_ref(file))
+    }
+
+    /// Parse a split checkpoint from its `files`, in shard order. With more than one file they must
+    /// be exactly the set the first one declares (`split.count`), each in its declared position
+    /// (`split.no`), and no tensor may appear in two shards; a violation is a typed
+    /// [`LoadError::GgufSplit`]. A single file needs none of the split keys.
+    pub fn parse_shards(files: &[StoredBytes]) -> Result<Self, LoadError> {
+        let first = files
+            .first()
+            .ok_or(LoadError::GgufSplit(GgufSplitError::NoShards))?;
+        let header = parse_header(first.as_slice())?;
+        let mut index = Self {
             version: header.version,
             metadata: header.metadata,
             tensors: header.tensors,
-            data_start: header.data_start,
-        })
+            shards: vec![Shard {
+                file: first.clone(),
+                data_start: header.data_start,
+            }],
+        };
+        if files.len() > 1 {
+            let declared = index.split_key("split.count");
+            if declared != Some(files.len()) {
+                return Err(LoadError::GgufSplit(GgufSplitError::Count {
+                    declared,
+                    given: files.len(),
+                }));
+            }
+        }
+        for (position, file) in files.iter().enumerate().skip(1) {
+            let header = parse_header(file.as_slice())?;
+            let declared = header.metadata.get("split.no").and_then(GgufValue::as_u64);
+            if declared != Some(position as u64) {
+                return Err(LoadError::GgufSplit(GgufSplitError::Order {
+                    position,
+                    declared,
+                }));
+            }
+            for (name, mut info) in header.tensors {
+                info.shard = position;
+                if let Some(first) = index.tensors.insert(name.clone(), info) {
+                    return Err(LoadError::GgufSplit(GgufSplitError::DuplicateTensor {
+                        tensor: name,
+                        shards: (first.shard, position),
+                    }));
+                }
+            }
+            index.shards.push(Shard {
+                file: file.clone(),
+                data_start: header.data_start,
+            });
+        }
+        Ok(index)
+    }
+
+    fn split_key(&self, key: &str) -> Option<usize> {
+        self.get(key)
+            .and_then(GgufValue::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+    }
+
+    /// The tensor count the checkpoint declares for the whole split set (`split.tensors.count`), if
+    /// it declares one. A directory that lists fewer tensors is missing shards.
+    pub(crate) fn declared_tensors(&self) -> Option<usize> {
+        self.split_key("split.tensors.count")
+    }
+
+    /// The mappings of the shards, in order.
+    pub(crate) fn files(&self) -> Vec<StoredBytes> {
+        self.shards.iter().map(|s| s.file.clone()).collect()
     }
 
     /// The metadata value for `key`, if the file has one.
@@ -425,9 +503,9 @@ impl GgufIndex {
         self.get("general.architecture").and_then(GgufValue::as_str)
     }
 
-    /// The byte offset, from the start of the file, where tensor data begins. `GgufTensorInfo::offset`
-    /// is relative to this.
-    pub(crate) fn data_start(&self) -> usize {
-        self.data_start
+    /// The byte offset, from the start of shard `shard`, where its tensor data begins.
+    /// `GgufTensorInfo::offset` is relative to this.
+    pub(crate) fn data_start(&self, shard: usize) -> usize {
+        self.shards[shard].data_start
     }
 }

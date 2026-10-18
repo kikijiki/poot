@@ -203,6 +203,7 @@ impl<'a> Emitter<'a> {
 
         self.emit_header();
         self.emit_lds_globals()?;
+        self.emit_constant_table_globals()?;
         self.emit_signature();
         self.out.push_str(&block_ir);
         self.out.push_str("}\n\n");
@@ -284,6 +285,54 @@ impl<'a> Emitter<'a> {
                 self.out,
                 "@{}_lds{i} = internal addrspace(3) global [{} x {elem}] {init}, align 16",
                 self.body.name, decl.len
+            );
+        }
+        self.out.push('\n');
+        Ok(())
+    }
+
+    /// The LLVM address space a constant table lives in, per target: the backend's constant space on
+    /// AMDGPU and NVPTX (`addrspace(4)`), UniformConstant on OpenCL SPIR-V (`addrspace(2)`), and the
+    /// Private storage class on Vulkan SPIR-V (`addrspace(10)`), whose `OpVariable` initializer is
+    /// the table. Vulkan has no constant memory a shader can index dynamically by other means.
+    pub(super) fn constant_table_addrspace(&self) -> Result<u32, EmitError> {
+        match self.target {
+            Target::AmdGcn(_) | Target::Nvptx => Ok(4),
+            Target::SpirvOpenCl => Ok(2),
+            Target::SpirvVulkan => Ok(10),
+            Target::AieCore => Err(EmitError::Unsupported(
+                "constant tables on AIE-core: a single AIE core reads its operands from the tile's \
+                 L1 buffers, not from module constants"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Module-scope constant tables, one initialized global per declaration, indexed by
+    /// [`Rvalue::ConstantTableRead`]. Emitted before `define`, like the LDS arrays.
+    pub(super) fn emit_constant_table_globals(&mut self) -> Result<(), EmitError> {
+        if self.body.constant_tables.is_empty() {
+            return Ok(());
+        }
+        let space = self.constant_table_addrspace()?;
+        // Vulkan's Private storage class is a variable, not a constant, in SPIR-V; the others are
+        // read-only constants.
+        let kind = match self.target {
+            Target::SpirvVulkan => "global",
+            _ => "constant",
+        };
+        for (i, table) in self.body.constant_tables.iter().enumerate() {
+            let words: Vec<String> = table
+                .words
+                .iter()
+                .map(|&word| format!("i32 {}", word as i32))
+                .collect();
+            let _ = writeln!(
+                self.out,
+                "@{}_ct{i} = internal unnamed_addr addrspace({space}) {kind} [{} x i32] [{}], align 16",
+                self.body.name,
+                table.words.len(),
+                words.join(", ")
             );
         }
         self.out.push('\n');

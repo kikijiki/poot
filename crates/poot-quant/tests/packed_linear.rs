@@ -88,6 +88,9 @@ fn packed_weight_try_new_accepts_every_named_scheme() {
         WeightFormat::Q6_K,
         WeightFormat::Iq4_Nl,
         WeightFormat::Iq4_Xs,
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
         WeightFormat::Mxfp4,
         WeightFormat::E4m3PerChannel {
             scale: ScaleEncoding::F32,
@@ -145,6 +148,9 @@ fn packed_weight_source_shape_and_bytes_match_the_stored_grid_for_every_scheme()
         (WeightFormat::Q6_K, 256, 210),
         (WeightFormat::Iq4_Nl, 32, 18),
         (WeightFormat::Iq4_Xs, 256, 136),
+        (WeightFormat::Iq2_Xs, 256, 74),
+        (WeightFormat::Iq3_Xxs, 256, 98),
+        (WeightFormat::Iq3_S, 256, 110),
         (WeightFormat::Mxfp4, 32, 17),
     ] {
         let shape = [3, 2 * values];
@@ -698,6 +704,9 @@ fn decode_row_matches_the_scalar_decoder_bit_for_bit() {
         WeightFormat::Q5_K,
         WeightFormat::Q6_K,
         WeightFormat::Iq4_Xs,
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
     ];
     let planar_formats = [
         WeightFormat::E4m3PerChannel {
@@ -795,6 +804,9 @@ fn gather_rows_moves_whole_stored_rows_of_every_block_format() {
         WeightFormat::Q6_K,
         WeightFormat::Mxfp4,
         WeightFormat::Iq4_Xs,
+        WeightFormat::Iq2_Xs,
+        WeightFormat::Iq3_Xxs,
+        WeightFormat::Iq3_S,
     ];
     for (seed, format) in block_formats.into_iter().enumerate() {
         let gate =

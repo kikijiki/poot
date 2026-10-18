@@ -100,6 +100,9 @@ A one-layer dense decoder whose projections are stored in each format (a random 
 | FP8 E4M3, 128x128 block F32 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | FP8 E4M3, per-channel BF16 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | FP8 E4M3, per-channel F32 scale | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF IQ2_XS | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF IQ3_S | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| GGUF IQ3_XXS | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF IQ4_NL | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF IQ4_XS | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | GGUF MXFP4 | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
@@ -118,7 +121,11 @@ A one-layer dense decoder whose projections are stored in each format (a random 
 
 ### Measured
 
-No stored benchmark row names a resolved family yet. A row appears here once a benchmark run records one.
+The latest benchmark row per family and backend, from the stored results. A refusal carries the reason the tool reported.
+
+| Family | Backend | Result | Run |
+| --- | --- | --- | --- |
+| `qwen35` | wgpu | <span class="matrix-status matrix-status--yes">Measured</span> | `2026-10-18-strix-halo-qwen3-8-27b-fp8-wgpu-4c8945ee1` |
 <!-- generated:feature-matrix:end -->
 
 ## Reading the matrix
@@ -137,8 +144,9 @@ No stored benchmark row names a resolved family yet. A row appears here once a b
   only the selected experts' blocks; no expert table is materialized. Dense BF16 and F16 weights are kept as stored
   words with no host f32 copy. Packed checkpoint size is not a bound on total peak memory.
 - Real checkpoints: Qwen3.8-27B-FP8 ran on PTX (one H100 80 GB) and generates "Paris" for "The capital of France is",
-  with the first token's top-five log-probabilities equal to the CPU oracle's within 1e-3; it has not run on wgpu or
-  ROCm. DeepSeek-V4, MiniMax-M2, GLM-5.3-Flash and Qwen3.8-Flash-Next have only synthetic fixtures that match an
+  with the first token's top-five log-probabilities equal to the CPU oracle's within 1e-3. On ROCm (gfx1151) it also
+  generates "Paris" with coherent text (about 5 decode tok/s, 12 prefill tok/s); its top-five comparison against the CPU
+  oracle has not been run yet. It has not run on wgpu. DeepSeek-V4, MiniMax-M2, GLM-5.3-Flash and Qwen3.8-Flash-Next have only synthetic fixtures that match an
   independent f64 reference; no real public checkpoint of them has run.
 - The `bert` family runs on the driver's `Encode` step (`poot_llm::encoders`). `poot-serve` runs `Encode` steps for a
   decoder's embeddings and reranking on wgpu and ROCm; it does not start on a BERT checkpoint yet.
