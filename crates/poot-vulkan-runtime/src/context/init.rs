@@ -297,8 +297,6 @@ impl Context {
             max_workgroup_size: launch.max_workgroup_size,
             max_workgroup_invocations: launch.max_workgroup_invocations,
             subgroup: launch.subgroup,
-            // No driver API reports a safe per-dispatch work bound.
-            max_dispatch_work: poot_target::Queried::Unknown,
             max_grid: max_workgroup_count,
             watchdog_budget,
             tensor_core,

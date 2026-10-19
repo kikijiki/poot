@@ -19,20 +19,19 @@ use poot_executor::{
     Collectives, Coordinator, CoordinatorCounters, Device, DeviceTime, Dispatch, Engine, ExecError,
     Executor, NativeCounters, NoSync, SupportBound,
 };
-use poot_executor_parity::assert_close;
 use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::{IndexRange, Slot};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
-use poot_models::model::Phase;
 use poot_models::registry::Registry;
 use poot_models::test_support::dense::{Dense, Family};
 use poot_models::test_support::weight_map::{MappedModel, Step, decode_steps, trace};
 use poot_ptx_device::{PtxDevice, PtxGpuError};
 use poot_runtime_common::{BufferRole, DeviceBackend};
+use poot_test_util::assert_close_scaled;
 
 /// The qwen2/minimax/glm tokens every row decodes: distinct so a stale or missing boundary value
 /// changes the logits.
@@ -84,7 +83,7 @@ fn compile(
             experts: ExpertPlacement::AllResident,
             devices,
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .unwrap_or_else(|error| panic!("compile_staged: {error}"))
 }
@@ -107,7 +106,7 @@ fn single_device(
         .load_weights(Arc::clone(&mapped.store), Arc::clone(&mapped.map))
         .unwrap();
     let set = TargetSet::single(DeviceId(0), target);
-    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let g = trace(&*mapped.model, &mapped.map, 1, CAPACITY);
     let placement = if after_layers.is_empty() {
         DevicePlacement::Single(DeviceId(0))
     } else {
@@ -164,7 +163,7 @@ fn pipelined<D: Collectives>(
     let exe = coordinator
         .load_weights(Arc::clone(&mapped.store), Arc::clone(&mapped.map))
         .unwrap();
-    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let g = trace(&*mapped.model, &mapped.map, 1, CAPACITY);
     let program = compile(
         &g,
         &set,
@@ -249,7 +248,7 @@ fn assert_two_device_matches_single(mapped: &MappedModel, after_layers: &[usize]
     );
     let tolerance = want_class.max(run.class).tolerance();
     for (step, (got, want)) in run.logits.iter().zip(&want).enumerate() {
-        assert_close(got, want, tolerance, &format!("{label}: step {step}"));
+        assert_close_scaled(got, want, tolerance, &format!("{label}: step {step}"));
     }
     for device in &run.counters.devices {
         assert!(
@@ -487,8 +486,8 @@ impl Device for FailingFinish {
         self.inner.load_kernel(key, kernel)
     }
 
-    fn begin(&mut self, submission: Submission) -> Result<(), PtxGpuError> {
-        self.inner.begin(submission)
+    fn begin(&mut self) -> Result<(), PtxGpuError> {
+        self.inner.begin()
     }
 
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), PtxGpuError> {
@@ -630,7 +629,7 @@ fn a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx(
     let exe = coordinator
         .load_weights(Arc::clone(&mapped.store), Arc::clone(&mapped.map))
         .unwrap();
-    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let g = trace(&*mapped.model, &mapped.map, 1, CAPACITY);
     let program = compile(
         &g,
         &set,
@@ -663,7 +662,7 @@ fn a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx(
             .as_f32()
             .unwrap()
             .to_vec();
-        assert_close(
+        assert_close_scaled(
             &got,
             &want[index],
             tolerance,
@@ -759,7 +758,7 @@ fn split_kv_decode_in_each_stage_of_a_two_device_pipeline_matches_the_oracle_on_
 #[test]
 fn the_long_run_stays_inside_the_traced_position_range() {
     let mapped = Dense::new(Family::Qwen2).dims(64, 96, 3).model();
-    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let g = trace(&*mapped.model, &mapped.map, 1, CAPACITY);
     let pos = g
         .slots()
         .iter()

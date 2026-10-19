@@ -29,10 +29,9 @@ use poot_executor::{EntryId, ExecutableId, Executor, StateScope};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, WeightFormats, bind_packed_weights,
     multi_device::topology::DeviceId,
-    production_plan::Submission,
     staged::{DevicePlacement, ExpertPlacement, Partition, compile_staged},
 };
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::test_support::weight_map::Step;
 
 use super::{BackendChoice, ModelHandle, open_executor, serving_trace_limits};
@@ -350,16 +349,9 @@ struct TeacherForced {
 impl TeacherForced {
     fn new(handle: &ModelHandle, mut exec: Box<dyn Executor>, n_ctx: usize) -> Self {
         let model = handle.model();
-        let shape = StepShape {
-            rows: nz(1),
-            tokens: nz(n_ctx),
-            capacity: nz(n_ctx),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::All,
-            hidden: None,
-        };
+        let shape = StepShape::new(nz(1), nz(n_ctx), nz(n_ctx)).with_logits(LogitRows::All);
         let graph = model
-            .trace(Phase::Prefill, shape, serving_trace_limits(nz(n_ctx)))
+            .trace(&StepSpec::step(shape), serving_trace_limits(nz(n_ctx)))
             .expect("trace the teacher-forced prefill");
         let graph = bind_packed_weights(&graph, &WeightFormats::from_weight_map(model.weights()))
             .expect("bind the packed weights");
@@ -370,7 +362,7 @@ impl TeacherForced {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+            &CompileOptions::new(CompileLimits::STANDARD),
         )
         .expect("compile the teacher-forced prefill");
         let exe = exec
@@ -394,7 +386,7 @@ impl TeacherForced {
         self.exec
             .reset_state(self.exe, StateScope::All)
             .expect("reset the carried state");
-        let step = Step::new(Phase::Prefill, window, 0);
+        let step = Step::new(window, 0);
         let out = self
             .exec
             .step(

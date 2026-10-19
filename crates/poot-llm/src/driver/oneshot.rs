@@ -7,15 +7,15 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
 use poot_executor::Executor;
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 
 use crate::GenerationControl;
 use crate::core::sampler::Sampler;
 use crate::driver::error::{DriverError, InvalidRequest};
 use crate::driver::stops::StopScanner;
 use crate::driver::{
-    Conversation, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, ModelHandle,
-    PreparedSetLimits, program_retention,
+    Conversation, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, Layout,
+    ModelHandle, PreparedSetLimits, Serving, program_retention,
 };
 use poot_text::{RenderedChat, Speaker, TextCodec, TextError};
 
@@ -230,7 +230,7 @@ fn driver_options(capacity: NonZeroUsize, granule: NonZeroUsize) -> DriverOption
     // admitted piece, the full chunk included: a window under the chunk shrinks it.
     let chunk = PREFILL_CHUNK.min(capacity.get()) / granule * granule.get();
     let chunk = NonZeroUsize::new(chunk).unwrap_or(granule);
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -268,7 +268,8 @@ pub fn generate_text(
         executor,
         driver_options(capacity, handle.config().prefill_granule),
     )?
-    .with_phase_timing();
+    .with_phase_timing()
+    .serve(Layout::Contiguous);
     if framed.continued {
         sink(framed.prompt.text());
     }
@@ -317,7 +318,7 @@ pub struct ChatOptions {
 /// ([`Driver::resume`]): a turn prefills its new tokens, not the history again.
 pub struct ChatSession {
     handle: Arc<ModelHandle>,
-    driver: Driver,
+    driver: Driver<Serving>,
     conversation: Conversation,
     options: ChatOptions,
     window: usize,
@@ -346,7 +347,8 @@ impl ChatSession {
             executor,
             driver_options(capacity, handle.config().prefill_granule),
         )?
-        .with_phase_timing();
+        .with_phase_timing()
+        .serve(Layout::Contiguous);
         Ok(Self {
             handle: Arc::clone(handle),
             driver,

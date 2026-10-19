@@ -17,14 +17,6 @@ pub enum PackedKernelOpKind {
     Contraction,
 }
 
-impl From<poot_kernelgen::PackedKernelOp> for PackedKernelOpKind {
-    fn from(op: poot_kernelgen::PackedKernelOp) -> Self {
-        match op {
-            poot_kernelgen::PackedKernelOp::RowGather => Self::RowGather,
-        }
-    }
-}
-
 /// The three lowering backends, without [`AmdArch`](poot_target::AmdArch)'s runtime gfx/wave detail:
 /// packed-lowering admission never depends on which AMD part is attached, only on the backend
 /// family, and a bare discriminant is `const`-constructible (a full `Backend` is not: `AmdArch` is
@@ -132,30 +124,8 @@ pub fn admit_packed(
     Ok(format)
 }
 
-/// Select a generated packed kernel (a row gather) from `table`: `op`'s
-/// [`PackedKernelOpKind`] must have a row admitting `weight`'s descriptor on `backend` ([`admit_packed`]).
-pub fn select_packed_kernel(
-    table: &[PackedLoweringRow],
-    weight: PackedWeight,
-    op: poot_kernelgen::PackedKernelOp,
-    backend: Backend,
-) -> Result<poot_kernelgen::PackedKernelSpec, crate::refusal::Capability> {
-    let format = admit_packed(table, weight, PackedKernelOpKind::from(op), backend)?;
-    let spec = poot_kernelgen::PackedKernelSpec { format, op };
-    // The table's `admits` predicate is a descriptor property (dquant.md D3): it says this format's
-    // shape is card 542a's staging, not that `packed_kernel` can build every body for it (a field of
-    // more than two pieces, for one, `DecodePlan::of` also rejects). Building the body here, at claim
-    // time, catches the generator's own precondition the same way card 531b's `Capability::KernelGen`
-    // already does for the other generator families, rather than deferring the same failure to a
-    // panic inside compile.
-    poot_kernelgen::packed_kernel("select_packed_kernel_probe", spec)
-        .map_err(crate::refusal::Capability::KernelGen)?;
-    Ok(spec)
-}
-
 #[cfg(test)]
 mod packed_lowering_tests {
-    use poot_kernelgen::PackedKernelOp;
     use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
 
     use super::*;
@@ -285,10 +255,10 @@ mod packed_lowering_tests {
         let format = WeightFormat::E2m1Row32;
         let weight = PackedWeight::try_new(format, [4, 64]).unwrap();
         assert_eq!(
-            select_packed_kernel(
+            admit_packed(
                 PACKED_LOWERING,
                 weight,
-                PackedKernelOp::RowGather,
+                PackedKernelOpKind::RowGather,
                 Backend::SpirvVulkan
             ),
             Err(Capability::PackedLowering {
@@ -312,10 +282,10 @@ mod packed_lowering_tests {
         };
         let weight = PackedWeight::try_new(format, [4, 8]).unwrap();
         assert_eq!(
-            select_packed_kernel(
+            admit_packed(
                 PACKED_LOWERING,
                 weight,
-                PackedKernelOp::RowGather,
+                PackedKernelOpKind::RowGather,
                 Backend::SpirvVulkan
             ),
             Err(Capability::PackedLowering {

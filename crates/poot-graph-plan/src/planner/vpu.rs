@@ -10,18 +10,21 @@
 //!
 //! Numerics (POOT-1178, POOT-ADR-0103). An Intel NPU computes in FP16, and a vendor compiler handed an F32
 //! graph narrows it silently. Poot makes that step its own: when the target records a
-//! [`NarrowingContract`], [`narrow_to_device_precision`] plans the whole region over F16 values, converts each
-//! F32 region input to F16 on entry and each F32 result back on exit, and the contract bounds the error of the
-//! region as a whole (interior values are not converted op by op). With no contract an F32 equation is refused
+//! [`NarrowingContract`](poot_target::NarrowingContract), [`narrow_to_device_precision`] rewrites the graph over F16
+//! values with a `Cast` to F16 at each F32 region input and one back to F32 at each F32 result, and the
+//! contract bounds the error of the region as a whole (interior values are not converted op by op). The
+//! casts are graph equations, so the program's published numerics class carries the narrowing. With no contract an F32 equation is refused
 //! with [`Capability::NarrowingContract`], and BF16 or F64 arithmetic, which no contract covers, with
 //! [`Capability::Arithmetic`]. Data movement is bit exact in any width the device carries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use poot_codegen::{VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuScalar, VpuTensor, VpuValue};
 use poot_graph_ir::op::{BinOp, ContractionHead, RedOp, UnOp};
-use poot_graph_ir::{Eqn, Graph, OpKind, Operand, Scalar, ValueId};
-use poot_target::{NarrowingContract, VpuArithmetic, VpuCaps};
+use poot_graph_ir::{
+    EditError, Eqn, Graph, OpKind, Operand, Scalar, Storage, TensorType, ValueId, ValueMeta,
+};
+use poot_target::{VpuArithmetic, VpuCaps};
 use poot_tensor::DType;
 
 use crate::compile::whole_graph_region;
@@ -44,13 +47,16 @@ pub(super) fn plan_eqn(
 /// Every equation of `graph` the Intel NPU `caps` refuses, in program order, each with its typed refusal.
 /// [`plan_vpu_region`] stops at the first refusal; this plans every equation on its own, so a caller sees
 /// the whole list of what stands between a graph and the NPU (the first refusal alone hides every other
-/// op class).
+/// op class). The graph is the one `compile` plans: narrowed first under a target's contract.
 ///
 /// # Errors
 ///
 /// A planning failure that is not a refusal.
 #[cfg(any(test, feature = "test-support"))]
 pub fn vpu_refusals(graph: &Graph, caps: &VpuCaps) -> Result<Vec<crate::Refusal>, PlanError> {
+    let narrowed =
+        narrow_to_device_precision(graph, caps).expect("narrowing a valid graph is a valid graph");
+    let graph = &narrowed;
     let g = GraphTables::from(graph);
     let mut refused = Vec::new();
     for eqn in graph.eqns() {
@@ -73,39 +79,17 @@ const fn elem_of(dtype: DType) -> Option<VpuElem> {
     }
 }
 
-/// The contract under which the region computes `dtype` values narrower, if the target records one for them.
-fn narrowing_of(caps: &VpuCaps, dtype: DType) -> Option<NarrowingContract> {
-    match (caps.arithmetic(), dtype) {
-        (VpuArithmetic::F16, DType::F32) => caps.narrowing,
-        _ => None,
-    }
-}
-
-/// The dtype a value of `dtype` has inside the region: F16 for an F32 value the contract narrows, else its own.
-fn device_dtype(caps: &VpuCaps, dtype: DType) -> DType {
-    if narrowing_of(caps, dtype).is_some() {
-        match caps.arithmetic() {
-            VpuArithmetic::F16 => DType::F16,
-        }
-    } else {
-        dtype
-    }
-}
-
-/// Whether the target computes `dtype` values, natively or narrowed under the target's contract.
+/// Whether the target computes `dtype` values. An F32 value is not computed: [`narrow_to_device_precision`]
+/// has already made every F32 value of a contract-carrying target an F16 one, so an F32 equation that
+/// reaches the planner has no contract.
 fn computes(caps: &VpuCaps, dtype: DType) -> Result<(), Capability> {
     match (caps.arithmetic(), dtype) {
         (VpuArithmetic::F16, DType::F16) => Ok(()),
-        (VpuArithmetic::F16, DType::F32) => narrowing_of(caps, dtype)
-            .map(|_| ())
-            .ok_or(Capability::NarrowingContract { dtype }),
+        (VpuArithmetic::F16, DType::F32) => Err(Capability::NarrowingContract { dtype }),
         (VpuArithmetic::F16, DType::BF16 | DType::F64) => Err(Capability::Arithmetic { dtype }),
         (VpuArithmetic::F16, _) => Err(Capability::DtypeLowering),
     }
 }
-
-/// The largest finite FP16 value.
-const F16_MAX: f32 = 65504.0;
 
 /// The largest integer below which every integer is exact in FP16 (11 significand bits).
 const F16_EXACT_INTEGERS: u32 = 2048;
@@ -133,23 +117,12 @@ fn literal_value(scalar: Scalar) -> f32 {
 
 /// The constant an inline literal lowers to when it takes part in arithmetic in `dtype`: the value rounded
 /// to the device's arithmetic width. A literal the width cannot hold is refused, not rounded to infinity, and a
-/// NaN literal is refused. The one exception is `saturate`, set only for a finite F32 literal of an additive
-/// equation (`Add`, `Sub`) under the narrowing contract: there a magnitude past the range is a sentinel that
-/// acts as an infinity (a mask), so it saturates to the largest finite value. A multiplicative use would
-/// silently change the result (`x * 1e9` is not `x * 65504`), so it stays refused.
-fn arithmetic_scalar(
-    scalar: Scalar,
-    dtype: DType,
-    saturate: bool,
-) -> Result<VpuScalar, Capability> {
+/// NaN literal is refused. (The saturation of a mask sentinel is not here: [`narrow_to_device_precision`]
+/// brings it into range in the graph.)
+fn arithmetic_scalar(scalar: Scalar, dtype: DType) -> Result<VpuScalar, Capability> {
     let value = literal_value(scalar);
     match dtype {
         DType::F16 => {
-            let value = if saturate && value.is_finite() {
-                value.clamp(-F16_MAX, F16_MAX)
-            } else {
-                value
-            };
             let bits = poot_quant::scalar::f32_to_f16(value);
             if !value.is_nan()
                 && poot_quant::scalar::f16_to_f32(bits).is_finite() == value.is_finite()
@@ -176,8 +149,7 @@ fn carried_scalar(scalar: Scalar) -> VpuScalar {
 fn lower_eqn(g: GraphTables<'_>, eqn: &Eqn, caps: &VpuCaps) -> Result<Lowered, PlanError> {
     let refuse = |missing| refusal_at(g, eqn, caps.target, missing);
     let out = g.aval(eqn.out);
-    let device_out = device_dtype(caps, out.dtype);
-    let out_elem = elem_of(device_out);
+    let out_elem = elem_of(out.dtype);
     let operand_dtype = |operand: &Operand| match operand {
         Operand::Value(id) => g.aval(*id).dtype,
         Operand::Lit(scalar) => scalar.dtype(),
@@ -203,17 +175,16 @@ fn lower_eqn(g: GraphTables<'_>, eqn: &Eqn, caps: &VpuCaps) -> Result<Lowered, P
         {
             computes(caps, dtype).map_err(refuse)?;
         }
-        let saturate =
-            narrowing_of(caps, out.dtype).is_some() && matches!(op, VpuOp::Add | VpuOp::Subtract);
-        // The contract's range holds for every literal of a narrowed equation but those of an additive one,
-        // which `arithmetic_scalar` brings into range on purpose (and refuses when NaN): anything else past the
-        // range would narrow to infinity.
-        if let Some(contract) = narrowing_of(caps, out.dtype).filter(|_| !saturate) {
+        // The contract's range holds for every literal of a narrowed equation but those of an additive one, which
+        // `narrow_to_device_precision` brought into range on purpose (a finite magnitude past it is a mask
+        // sentinel; `arithmetic_scalar` refuses a NaN): anything else past the range would narrow to infinity.
+        let additive = matches!(op, VpuOp::Add | VpuOp::Subtract);
+        if let Some(contract) = caps.narrowing.filter(|_| !additive) {
             for operand in &eqn.inputs {
                 if let Operand::Lit(scalar) = operand
                     && !contract.admits(literal_value(*scalar))
                 {
-                    return Err(refuse(Capability::NarrowingRange { dtype: out.dtype }));
+                    return Err(refuse(Capability::NarrowingRange { dtype: DType::F32 }));
                 }
             }
         }
@@ -222,7 +193,7 @@ fn lower_eqn(g: GraphTables<'_>, eqn: &Eqn, caps: &VpuCaps) -> Result<Lowered, P
             .iter()
             .map(|operand| match operand {
                 Operand::Value(id) => Ok(LoweredOperand::Value(*id)),
-                Operand::Lit(scalar) => arithmetic_scalar(*scalar, device_out, saturate)
+                Operand::Lit(scalar) => arithmetic_scalar(*scalar, out.dtype)
                     .map(LoweredOperand::Scalar)
                     .map_err(refuse),
             })
@@ -281,9 +252,9 @@ fn lower_eqn(g: GraphTables<'_>, eqn: &Eqn, caps: &VpuCaps) -> Result<Lowered, P
             // integer source is refused with its reason: FP16 holds integers exactly only up to 2048 and the
             // value of an index or position is not bounded by anything the planner reads.
             let source = operand_dtype(&eqn.inputs[0]);
-            if source == DType::I32 && device_out == DType::F16 {
+            if source == DType::I32 && out.dtype == DType::F16 {
                 return Err(refuse(Capability::IntegerToFloat {
-                    to: device_out,
+                    to: out.dtype,
                     exact_limit: F16_EXACT_INTEGERS,
                 }));
             }
@@ -416,7 +387,7 @@ pub(crate) fn plan_vpu_region(graph: &Graph, caps: &VpuCaps) -> Result<VpuRegion
     let mut inputs: Vec<VpuInput> = Vec::with_capacity(region.reads().len());
     for &id in region.reads() {
         numbering.insert(id, VpuValue(inputs.len() as u32));
-        inputs.push(input_of(g, caps, id)?);
+        inputs.push(input_of(g, id)?);
     }
     let mut nodes = Vec::with_capacity(lowered.len());
     for (eqn, lowered) in graph.eqns().iter().zip(lowered) {
@@ -451,104 +422,129 @@ pub(crate) fn plan_vpu_region(graph: &Graph, caps: &VpuCaps) -> Result<VpuRegion
         numbering.insert(eqn.out, value);
     }
     let outputs = region.writes().iter().map(|id| numbering[id]).collect();
-    let interior = VpuRegion {
+    Ok(VpuRegion {
         name: "poot_region".into(),
         inputs,
         nodes,
         outputs,
-    };
-    Ok(narrow_to_device_precision(g, caps, &region, interior))
+    })
 }
 
-/// The planner pass that makes the narrowing of F32 values to the device's arithmetic width an explicit step
-/// of the region (POOT-1178). `interior` is the region as [`lower_eqn`] planned it, every value the contract
-/// narrows already an F16 one; the pass gives it the program's ABI back. Each narrowed region input is bound as
-/// the F32 the program stores and followed by a [`VpuOp::NarrowEntry`] conversion, each narrowed result is
-/// followed by a [`VpuOp::WidenExit`] conversion back to F32, and nothing in between is converted: the
-/// contract bounds the region's error as a whole, so an interior reduction runs in the device's width once.
-/// A value the contract does not narrow (every F16 and I32 one) crosses the boundary untouched.
-fn narrow_to_device_precision(
-    g: GraphTables<'_>,
+/// The graph transform that makes the narrowing of F32 values to the device's arithmetic width explicit
+/// (POOT-1178, POOT-1215). Every F32 value the graph computes becomes an F16 one, each F32 value the region
+/// reads from outside (a weight, a slot, carried state) is converted once by a `Cast` placed before its first
+/// reader, and each narrowed value the graph publishes (the result, a witness, an export, a carried-state
+/// next value) is converted back by a `Cast` and published as the F32 value it was. Nothing in between is
+/// converted: the contract bounds the region's error as a whole, so an interior reduction runs in the
+/// device's width once. The casts are ordinary equations, so [`implied_numerics`] sees the narrowing a
+/// program carries.
+///
+/// A graph for a target with no contract is returned as it is: its F32 arithmetic is refused by the planner.
+///
+/// [`implied_numerics`]: poot_graph_ir::analysis::implied_numerics
+pub(crate) fn narrow_to_device_precision(
+    graph: &Graph,
     caps: &VpuCaps,
-    region: &crate::Region,
-    interior: VpuRegion,
-) -> VpuRegion {
-    let narrowed = |id: ValueId| narrowing_of(caps, g.aval(id).dtype).is_some();
-    let entries: Vec<(usize, ValueId)> = region
-        .reads()
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|&(_, id)| narrowed(id))
-        .collect();
-    // Node values are numbered after the inputs, so the entry conversions placed first push every interior
-    // node value up by their count; an input that is converted is read through its conversion.
-    let input_count = interior.inputs.len() as u32;
-    let shift = entries.len() as u32;
-    let entry_value: HashMap<u32, u32> = entries
-        .iter()
-        .enumerate()
-        .map(|(n, &(input, _))| (input as u32, input_count + n as u32))
-        .collect();
-    let remap = |value: VpuValue| {
-        if value.0 < input_count {
-            VpuValue(entry_value.get(&value.0).copied().unwrap_or(value.0))
-        } else {
-            VpuValue(value.0 + shift)
-        }
+) -> Result<Graph, EditError> {
+    let Some(contract) = caps.narrowing else {
+        return Ok(graph.clone());
     };
-    let mut inputs = interior.inputs;
-    let mut nodes =
-        Vec::with_capacity(entries.len() + interior.nodes.len() + region.writes().len());
-    for &(input, id) in &entries {
-        let narrowed_tensor = inputs[input].tensor.clone();
-        inputs[input].tensor.elem =
-            elem_of(g.aval(id).dtype).expect("an F32 value has a VPU element");
-        nodes.push(VpuNode {
-            origin: id.index() as u32,
-            op: VpuOp::NarrowEntry,
-            inputs: vec![VpuValue(input as u32)],
-            out: narrowed_tensor,
-        });
-    }
-    for mut node in interior.nodes {
-        for operand in &mut node.inputs {
-            *operand = remap(*operand);
+    let narrower = match caps.arithmetic() {
+        VpuArithmetic::F16 => DType::F16,
+    };
+    // The F32 values the region computes. An F32 `Iota` is not one: its range is its dtype's, so it is
+    // read through an entry conversion like a value from outside.
+    let narrowed: HashSet<ValueId> = graph
+        .eqns()
+        .iter()
+        .filter(|eqn| graph.aval(eqn.out).dtype == DType::F32)
+        .filter(|eqn| !matches!(eqn.op, OpKind::Iota { .. }))
+        .map(|eqn| eqn.out)
+        .collect();
+    let is_f32 = |id: ValueId| graph.aval(id).dtype == DType::F32;
+    let published: HashSet<ValueId> = std::iter::once(graph.result())
+        .chain(graph.witnesses().map(|witness| witness.value))
+        .chain(graph.exports().map(|export| export.value))
+        .chain(graph.state().map(|(_, next)| next))
+        .filter(|id| narrowed.contains(id))
+        .collect();
+
+    let mut edit = graph.edit();
+    let mut eqns = Vec::with_capacity(graph.eqns().len());
+    let mut entries: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut exits: HashMap<ValueId, ValueId> = HashMap::new();
+    for eqn in graph.eqns() {
+        let mut eqn = eqn.clone();
+        for operand in &mut eqn.inputs {
+            let Operand::Value(id) = operand else {
+                continue;
+            };
+            if !is_f32(*id) || narrowed.contains(id) {
+                continue;
+            }
+            let entry = *entries.entry(*id).or_insert_with(|| {
+                let narrowed = edit.values_mut().push(ValueMeta::new(
+                    TensorType::new(graph.aval(*id).shape.clone(), narrower),
+                    Storage::Device,
+                    None,
+                ));
+                eqns.push(Eqn {
+                    op: OpKind::Cast { to: narrower },
+                    inputs: vec![Operand::Value(*id)],
+                    out: narrowed,
+                    layer: eqn.layer,
+                });
+                narrowed
+            });
+            *operand = Operand::Value(entry);
         }
-        nodes.push(node);
-    }
-    let mut outputs = Vec::with_capacity(interior.outputs.len());
-    for (&id, &value) in region.writes().iter().zip(&interior.outputs) {
-        let value = remap(value);
-        if !narrowed(id) {
-            outputs.push(value);
-            continue;
+        if narrowed.contains(&eqn.out) {
+            // A finite literal of an additive equation past the contract's range is a mask sentinel acting as
+            // an infinity: it saturates to the range's edge. A multiplicative use would change the result
+            // (`x * 1e9` is not `x * 65504`), so it stays and the planner refuses it.
+            if matches!(eqn.op, OpKind::Binary(BinOp::Add | BinOp::Sub)) {
+                for operand in &mut eqn.inputs {
+                    if let Operand::Lit(Scalar::F32(value)) = operand
+                        && value.is_finite()
+                    {
+                        let edge = contract.max_magnitude as f32;
+                        *value = value.clamp(-edge, edge);
+                    }
+                }
+            }
+            edit.values_mut()[eqn.out].aval.dtype = narrower;
+            if let OpKind::Cast { to } = &mut eqn.op
+                && *to == DType::F32
+            {
+                *to = narrower;
+            }
         }
-        let aval = g.aval(id);
-        outputs.push(VpuValue(input_count + nodes.len() as u32));
-        nodes.push(VpuNode {
-            origin: id.index() as u32,
-            op: VpuOp::WidenExit,
-            inputs: vec![value],
-            out: VpuTensor {
-                elem: elem_of(aval.dtype).expect("an F32 value has a VPU element"),
-                shape: aval.shape.clone(),
-            },
-        });
+        let (out, layer) = (eqn.out, eqn.layer);
+        eqns.push(eqn);
+        if published.contains(&out) {
+            let widened = edit.values_mut().push(ValueMeta::new(
+                TensorType::new(graph.aval(out).shape.clone(), DType::F32),
+                Storage::Device,
+                None,
+            ));
+            eqns.push(Eqn {
+                op: OpKind::Cast { to: DType::F32 },
+                inputs: vec![Operand::Value(out)],
+                out: widened,
+                layer,
+            });
+            exits.insert(out, widened);
+        }
     }
-    VpuRegion {
-        name: interior.name,
-        inputs,
-        nodes,
-        outputs,
-    }
+    *edit.eqns_mut() = eqns;
+    edit.remap_results(|value| exits.get(&value).copied().unwrap_or(value));
+    edit.commit()
 }
 
-/// The region argument for value `id`, typed as the region's interior sees it (see
-/// [`narrow_to_device_precision`] for the ABI type).
-fn input_of(g: GraphTables<'_>, caps: &VpuCaps, id: ValueId) -> Result<VpuInput, PlanError> {
+/// The region argument for value `id`, typed as the graph stores it.
+fn input_of(g: GraphTables<'_>, id: ValueId) -> Result<VpuInput, PlanError> {
     let aval = g.aval(id);
-    let elem = elem_of(device_dtype(caps, aval.dtype)).ok_or(PlanError::UnrepresentableValue {
+    let elem = elem_of(aval.dtype).ok_or(PlanError::UnrepresentableValue {
         value: id,
         dtype: aval.dtype,
         gap: StorageGap::VpuDtype,
@@ -565,11 +561,11 @@ fn input_of(g: GraphTables<'_>, caps: &VpuCaps, id: ValueId) -> Result<VpuInput,
 #[cfg(test)]
 mod tests {
     use poot_codegen::{VpuRegion, emit_vpu};
+    use poot_graph_ir::analysis::Tier2Class;
     use poot_graph_ir::{BinOp, Builder, Graph, RedOp, Scalar, TensorType, Traced, UnOp};
-    use poot_target::{Queried, VendorCompilerId, VpuTargetId};
+    use poot_target::{NarrowingContract, Queried, VendorCompilerId, VpuTargetId};
 
     use super::*;
-    use crate::production_plan::Submission;
     use crate::{CompileError, CompileLimits, CompileOptions, Plan, Refusal, Target};
 
     fn caps() -> VpuCaps {
@@ -602,6 +598,12 @@ mod tests {
 
     fn f(dtype: DType, shape: &[usize]) -> TensorType {
         TensorType::new(shape.to_vec(), dtype)
+    }
+
+    /// The region the production path plans for `g`: the narrowing transform first, then the region.
+    fn narrowed_region(g: &Graph, caps: &VpuCaps) -> Result<VpuRegion, PlanError> {
+        let narrowed = narrow_to_device_precision(g, caps).expect("the narrowed graph is valid");
+        plan_vpu_region(&narrowed, caps)
     }
 
     fn refusal(result: Result<VpuRegion, PlanError>) -> Refusal {
@@ -877,7 +879,7 @@ mod tests {
     /// Under the narrowing contract a finite F32 literal past FP16's range saturates to the largest finite FP16
     /// value in an additive position (`Add`, `Sub`: the mask sentinel); an infinite literal is exact and stays
     /// infinite; a NaN literal is refused.
-    /// Mutation: drop the `saturate` clamp in `arithmetic_scalar`; the `1e9` literal is refused.
+    /// Mutation: drop the clamp of additive literals in `narrow_to_device_precision`; the `1e9` literal is refused.
     #[test]
     fn a_finite_additive_literal_past_f16_saturates_under_the_narrowing_contract() {
         let lowered = |op: BinOp, value: f32| {
@@ -885,7 +887,7 @@ mod tests {
                 let x = b.constant("x", f(DType::F32, &[2])).unwrap();
                 b.binary_scalar(op, x, Scalar::F32(value)).unwrap()
             });
-            plan_vpu_region(&g, &narrowing_caps())
+            narrowed_region(&g, &narrowing_caps())
         };
         let constant = |op: BinOp, value: f32| {
             lowered(op, value)
@@ -916,9 +918,26 @@ mod tests {
         );
     }
 
+    /// Saturation belongs to a narrowed equation: the same additive literal in an equation that was F16 as traced
+    /// is not a mask sentinel the contract covers, and stays refused under the contract.
+    /// Mutation: clamp the additive literals of every equation in `narrow_to_device_precision`, not only the ones
+    /// it narrowed; the native F16 add lowers and this row goes red.
+    #[test]
+    fn an_additive_literal_past_f16_in_a_native_f16_equation_is_not_saturated() {
+        let g = graph_of(|b| {
+            let x = b.constant("x", f(DType::F16, &[2])).unwrap();
+            b.binary_scalar(BinOp::Add, x, Scalar::F32(1.0e10)).unwrap()
+        });
+        assert_eq!(
+            refusal(narrowed_region(&g, &narrowing_caps())).missing,
+            Capability::DtypeLowering
+        );
+    }
+
     /// A literal past FP16's range in a multiplicative position is refused even under the contract, because
     /// `x * 1e9` saturated to `x * 65504` is a silent wrong result.
-    /// Mutation: make `saturate` true for every op in `lower_eqn`; `Mul` and `Div` by `1e9` lower.
+    /// Mutation: clamp the literals of every binary op in `narrow_to_device_precision`, not only `Add` and `Sub`; `Mul` and
+    /// `Div` by `1e9` lower.
     #[test]
     fn a_multiplicative_literal_past_f16_is_refused_under_the_narrowing_contract() {
         for op in [BinOp::Mul, BinOp::Div] {
@@ -927,7 +946,7 @@ mod tests {
                 b.binary_scalar(op, x, Scalar::F32(1.0e9)).unwrap()
             });
             assert_eq!(
-                refusal(plan_vpu_region(&g, &narrowing_caps())).missing,
+                refusal(narrowed_region(&g, &narrowing_caps())).missing,
                 Capability::NarrowingRange { dtype: DType::F32 },
                 "{op:?}"
             );
@@ -938,11 +957,11 @@ mod tests {
     /// +-65504 plans in any position; past it, a multiplicative or divisive one is a typed `NarrowingRange` refusal, while the additive literals 1180 saturates (`Add`, `Sub`,
     /// finite or infinite) are exempt and plan.
     /// Mutation: drop the `admits` check in `lower_eqn`; 65505 in `Mul` plans (F16 rounds it to 65504). Make
-    /// the check ignore `saturate`; the additive rows are refused.
+    /// drop the `additive` exemption from the check; the additive rows are refused.
     #[test]
     fn a_literal_outside_the_contracts_range_is_refused_unless_it_saturates() {
         let with = |op: BinOp, value: f32| {
-            plan_vpu_region(
+            narrowed_region(
                 &graph_of(|b| {
                     let x = b.constant("x", f(DType::F32, &[2])).unwrap();
                     b.binary_scalar(op, x, Scalar::F32(value)).unwrap()
@@ -980,11 +999,44 @@ mod tests {
             b.cast(x, DType::F32).unwrap()
         });
         assert_eq!(
-            refusal(plan_vpu_region(&g, &narrowing_caps())).missing,
+            refusal(narrowed_region(&g, &narrowing_caps())).missing,
             Capability::IntegerToFloat {
                 to: DType::F16,
                 exact_limit: 2048
             }
+        );
+    }
+
+    /// An F32 `Iota` under the narrowing contract keeps its F32 range, which FP16 could not hold, and is read
+    /// through an entry conversion like a value from outside; the add that reads it computes in F16.
+    /// Mutation: drop the `Iota` exclusion in `narrow_to_device_precision`; the retyped range is not a valid
+    /// graph and `narrowed_region` fails.
+    #[test]
+    fn an_f32_iota_under_the_contract_stays_f32_and_is_converted_on_entry() {
+        let g = graph_of(|b| {
+            let x = b.constant("x", f(DType::F32, &[4])).unwrap();
+            let range = b.iota(4).unwrap();
+            b.binary(BinOp::Add, x, range).unwrap()
+        });
+        let region = narrowed_region(&g, &narrowing_caps()).unwrap();
+        let kinds: Vec<_> = region
+            .nodes
+            .iter()
+            .map(|node| (node.op.clone(), node.out.elem))
+            .collect();
+        assert!(
+            kinds.contains(&(VpuOp::Iota { len: 4 }, VpuElem::F32)),
+            "{kinds:?}"
+        );
+        let add = kinds.iter().position(|(op, _)| *op == VpuOp::Add).unwrap();
+        assert_eq!(kinds[add].1, VpuElem::F16);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|(op, elem)| *op == VpuOp::Convert && *elem == VpuElem::F16)
+                .count(),
+            2,
+            "the weight and the range are each converted once on entry: {kinds:?}"
         );
     }
 
@@ -1092,7 +1144,7 @@ mod tests {
             target: VpuTargetId::Npu4,
             caps: caps(),
         };
-        let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+        let options = CompileOptions::new(CompileLimits::STANDARD);
         let compiled = |dtype: DType| {
             let g = graph_of(|b| {
                 let x = b.constant("x", f(dtype, &[2, 3])).unwrap();
@@ -1192,10 +1244,10 @@ mod tests {
     }
 
     /// `sum(x * w + x, axis 1)` over F32 `[2, 3]` under a narrowing contract: the region's IR text, pinned. The
-    /// two F32 arguments are narrowed by a `Convert` each on entry (`v0_narrow`, `v1_narrow`), the whole
+    /// two F32 arguments are narrowed by a `Convert` each on entry (`v5`, `v6`), the whole
     /// interior (`v2` multiply, `v3` add, `v4` sum) runs in FP16 with nothing converted between, and the F32
-    /// result is widened by one `Convert` (`v4_widen`) that is the only layer the `Result` reads.
-    /// Mutation: skip the `WidenExit` push in `narrow_to_device_precision`; the result is FP16 and the text differs.
+    /// result is widened by one `Convert` (`v7`) that is the only layer the `Result` reads.
+    /// Mutation: skip the exit `Cast` push in `narrow_to_device_precision`; the result is FP16 and the text differs.
     #[test]
     fn an_f32_chain_is_narrowed_at_the_region_boundary_only() {
         let g = graph_of(|b| {
@@ -1205,19 +1257,19 @@ mod tests {
             let shifted = b.binary(BinOp::Add, scaled, x).unwrap();
             b.reduce(RedOp::Sum, shifted, 1, false).unwrap()
         });
-        let region = plan_vpu_region(&g, &narrowing_caps()).unwrap();
+        let region = narrowed_region(&g, &narrowing_caps()).unwrap();
         let ir = emit_vpu(&region).unwrap();
         let expected = concat!(
             r#"<?xml version="1.0"?><net name="poot_region" version="11"><layers>"#,
             r#"<layer id="0" name="v0" type="Parameter" version="opset1"><data shape="2,3" element_type="f32"/><output><port id="0" precision="FP32" names="v0"><dim>2</dim><dim>3</dim></port></output></layer>"#,
             r#"<layer id="1" name="v1" type="Parameter" version="opset1"><data shape="2,3" element_type="f32"/><output><port id="0" precision="FP32" names="v1"><dim>2</dim><dim>3</dim></port></output></layer>"#,
-            r#"<layer id="2" name="v0_narrow" type="Convert" version="opset1"><data destination_type="f16"/><input><port id="0" precision="FP32"><dim>2</dim><dim>3</dim></port></input><output><port id="1" precision="FP16" names="v0_narrow"><dim>2</dim><dim>3</dim></port></output></layer>"#,
-            r#"<layer id="3" name="v1_narrow" type="Convert" version="opset1"><data destination_type="f16"/><input><port id="0" precision="FP32"><dim>2</dim><dim>3</dim></port></input><output><port id="1" precision="FP16" names="v1_narrow"><dim>2</dim><dim>3</dim></port></output></layer>"#,
+            r#"<layer id="2" name="v5" type="Convert" version="opset1"><data destination_type="f16"/><input><port id="0" precision="FP32"><dim>2</dim><dim>3</dim></port></input><output><port id="1" precision="FP16" names="v5"><dim>2</dim><dim>3</dim></port></output></layer>"#,
+            r#"<layer id="3" name="v6" type="Convert" version="opset1"><data destination_type="f16"/><input><port id="0" precision="FP32"><dim>2</dim><dim>3</dim></port></input><output><port id="1" precision="FP16" names="v6"><dim>2</dim><dim>3</dim></port></output></layer>"#,
             r#"<layer id="4" name="v2" type="Multiply" version="opset1"><data auto_broadcast="numpy"/><input><port id="0" precision="FP16"><dim>2</dim><dim>3</dim></port><port id="1" precision="FP16"><dim>2</dim><dim>3</dim></port></input><output><port id="2" precision="FP16" names="v2"><dim>2</dim><dim>3</dim></port></output></layer>"#,
             r#"<layer id="5" name="v3" type="Add" version="opset1"><data auto_broadcast="numpy"/><input><port id="0" precision="FP16"><dim>2</dim><dim>3</dim></port><port id="1" precision="FP16"><dim>2</dim><dim>3</dim></port></input><output><port id="2" precision="FP16" names="v3"><dim>2</dim><dim>3</dim></port></output></layer>"#,
             r#"<layer id="6" name="aux_6" type="Const" version="opset1"><data element_type="i64" shape="1" offset="0" size="8"/><output><port id="0" precision="I64"><dim>1</dim></port></output></layer>"#,
             r#"<layer id="7" name="v4" type="ReduceSum" version="opset1"><data keep_dims="false"/><input><port id="0" precision="FP16"><dim>2</dim><dim>3</dim></port><port id="1" precision="I64"><dim>1</dim></port></input><output><port id="2" precision="FP16" names="v4"><dim>2</dim></port></output></layer>"#,
-            r#"<layer id="8" name="v4_widen" type="Convert" version="opset1"><data destination_type="f32"/><input><port id="0" precision="FP16"><dim>2</dim></port></input><output><port id="1" precision="FP32" names="v4_widen"><dim>2</dim></port></output></layer>"#,
+            r#"<layer id="8" name="v7" type="Convert" version="opset1"><data destination_type="f32"/><input><port id="0" precision="FP16"><dim>2</dim></port></input><output><port id="1" precision="FP32" names="v7"><dim>2</dim></port></output></layer>"#,
             r#"<layer id="9" name="result_0" type="Result" version="opset1"><input><port id="0" precision="FP32"><dim>2</dim></port></input></layer>"#,
             r#"</layers><edges>"#,
             r#"<edge from-layer="0" from-port="0" to-layer="2" to-port="0"/><edge from-layer="1" from-port="0" to-layer="3" to-port="0"/>"#,
@@ -1228,14 +1280,14 @@ mod tests {
             r#"</edges></net>"#,
         );
         assert_eq!(ir.xml, expected);
-        assert_eq!(region.output_names().collect::<Vec<_>>(), ["v4_widen"]);
+        assert_eq!(region.output_names().collect::<Vec<_>>(), ["v7"]);
     }
 
     /// Only a value the contract narrows crosses the boundary through a conversion: an F16 argument and an F16
     /// result are bound as they are, an F32 argument beside them is narrowed once, and the interior reads each
     /// through the right value (the argument order does not decide which one is converted).
     /// Mutation: convert every region input in `narrow_to_device_precision`; the F16 argument gains a
-    /// `NarrowEntry` and the op list differs.
+    /// `Cast` and the op list differs.
     #[test]
     fn a_value_the_contract_does_not_narrow_crosses_the_boundary_untouched() {
         let g = graph_of(|b| {
@@ -1245,7 +1297,7 @@ mod tests {
             let c16 = b.cast(c, DType::F16).unwrap();
             b.binary(BinOp::Add, doubled, c16).unwrap()
         });
-        let region = plan_vpu_region(&g, &narrowing_caps()).unwrap();
+        let region = narrowed_region(&g, &narrowing_caps()).unwrap();
         let elems: Vec<_> = region
             .inputs
             .iter()
@@ -1255,16 +1307,16 @@ mod tests {
         let ops: Vec<_> = region.nodes.iter().map(|node| node.op.clone()).collect();
         assert_eq!(
             ops,
-            [VpuOp::NarrowEntry, VpuOp::Add, VpuOp::Convert, VpuOp::Add]
+            [VpuOp::Add, VpuOp::Convert, VpuOp::Convert, VpuOp::Add]
         );
         // Values 0 and 1 are the arguments, the node values follow: the F16 argument is read as it is, the F32
-        // one only through its conversion (value 2).
+        // one only through its entry conversion (value 3).
         let reads: Vec<_> = region
             .nodes
             .iter()
             .map(|node| node.inputs.iter().map(|v| v.0).collect::<Vec<_>>())
             .collect();
-        assert_eq!(reads, [vec![1], vec![0, 0], vec![2], vec![3, 4]]);
+        assert_eq!(reads, [vec![0, 0], vec![1], vec![3], vec![2, 4]]);
         assert_eq!(region.outputs, [poot_codegen::VpuValue(5)]);
         assert!(emit_vpu(&region).is_ok());
     }
@@ -1274,7 +1326,7 @@ mod tests {
     /// Mutation: make `computes` ignore the contract (`.ok_or(..)` on `None`); the compile is refused again.
     #[test]
     fn compile_for_an_intel_npu_with_a_contract_narrows_an_f32_graph() {
-        let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+        let options = CompileOptions::new(CompileLimits::STANDARD);
         let g = graph_of(|b| {
             let x = b.constant("x", f(DType::F32, &[2, 3])).unwrap();
             let y = b.constant("y", f(DType::F32, &[2, 3])).unwrap();
@@ -1294,13 +1346,10 @@ mod tests {
             .collect();
         assert_eq!(
             ops,
-            [
-                VpuOp::NarrowEntry,
-                VpuOp::NarrowEntry,
-                VpuOp::Add,
-                VpuOp::WidenExit
-            ]
+            [VpuOp::Convert, VpuOp::Convert, VpuOp::Add, VpuOp::Convert]
         );
+        // The narrowing is graph casts, so the program publishes the class of narrowed storage.
+        assert_eq!(program.numerics_class(), Tier2Class::NarrowStorage);
         assert!(matches!(
             crate::compile(&g, &target(caps()), &options),
             Err(CompileError::Plan(_))

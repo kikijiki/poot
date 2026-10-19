@@ -1,7 +1,7 @@
 //! B2 sliding-window attention oracle (hand-built graphs). The gemma3 per-layer mask selection and softcap
 //! config-wiring rows trace a model and live in `poot-models/tests/oracle_traces/swa_gemma3.rs`.
 
-use crate::{EvalBudget, EvalError, EvalOptions, Value};
+use crate::{EvalError, EvalOptions, Value};
 use poot_graph_ir::ValueId;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::attention_prefill;
@@ -51,7 +51,7 @@ fn eval_prefill_attn(
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?
+        crate::eval(&g, &values, EvalOptions::default())?
             .output
             .into_host()
     })()
@@ -263,7 +263,7 @@ fn causal_mask_from_pos_matches_host_built_mask_row_table() {
             posi,
             HostTensor::i32(vec![1, 1], vec![position as i32]).into(),
         );
-        let got = crate::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got = crate::eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -330,7 +330,7 @@ fn causal_mask_from_pos_prefill_shape_matches_visibility_pattern_and_flushes_eit
             posi,
             HostTensor::i32(vec![1, l], (0..l as i32).collect()).into(),
         );
-        let got = crate::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got = crate::eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

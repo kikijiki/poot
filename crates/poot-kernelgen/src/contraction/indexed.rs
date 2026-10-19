@@ -201,6 +201,10 @@ pub(crate) fn indexed_contraction(
             epilogue,
         ),
         Schedule::Tiled { tile } => indexed_tiled(name, tile, layout, lane, epilogue),
+        Schedule::RegisterTiled { .. } => Err(KernelGenError::Unsupported {
+            request: "indexed_contraction",
+            reason: "an indexed contraction is Tiled, not RegisterTiled",
+        }),
     }
 }
 

@@ -12,15 +12,12 @@
 //! replay is several submissions with a fence wait between them, never one past-watchdog submission
 //! (the same bounds `WgpuDevice` flushes on).
 //!
-//! `Eager` has no separate meaning here: `begin` always opens a recording, as every `Device` does, and
-//! `Engine::add_entry` refuses `Submission::Eager` before any method of this type runs.
-//!
 //! `copy` is `vkCmdCopyBuffer` in the same command stream, ordered by the barrier every command carries.
 
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
 };
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
 use poot_target::{Backend, BufferStorage, TargetId};
 use poot_vulkan_runtime::{
@@ -156,8 +153,8 @@ impl Device for VulkanDevice {
         })
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), VulkanGpuError> {
-        // Always opens a recording, regardless of `_submission` (see the module doc). Recording never
+    fn begin(&mut self) -> Result<(), VulkanGpuError> {
+        // Always opens a recording (see the module doc). Recording never
         // submits, so a failed begin/dispatch/copy/finish can never have mutated device state.
         assert!(self.open.is_none(), "begin inside an open step");
         let graph = self.ctx.begin_graph(self.timing)?;

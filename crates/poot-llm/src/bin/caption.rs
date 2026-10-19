@@ -12,7 +12,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, DriverOptions, PreparedSetLimits, open_executor, program_retention,
 };
@@ -27,7 +27,7 @@ use poot_models::registry::Registry;
 
 /// The driver options of one tower: `capacity` positions, prefill in pieces of at most `chunk`.
 fn options(capacity: usize, chunk: usize) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let nz = |n: usize| NonZeroUsize::new(n).expect("a positive size");
     DriverOptions {
         prefill: compile.clone(),

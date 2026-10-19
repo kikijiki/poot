@@ -19,9 +19,9 @@ use poot_graph_ir::{Graph, OpKind, Operand, ValueId};
 use poot_graph_plan::test_support::gpu_caps_mut;
 use poot_graph_plan::{
     CompileError, CompileLimits, CompileOptions, LegalizeError, Target, WeightFormats,
-    bind_packed_weights, compile, dtype_widen::prepare_target_graph, production_plan::Submission,
+    bind_packed_weights, compile, test_support::compiled_graph,
 };
-use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
+use poot_models::model::{Model, StepShape, StepSpec};
 use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::{WeightId, WeightRole};
 use poot_target::{AmdArch, Backend};
@@ -60,22 +60,14 @@ fn qwen35_stored_as(variant: &str) -> (Box<dyn Model>, Fixture) {
 
 fn shape(tokens: usize) -> StepShape {
     let n = |v| NonZeroUsize::new(v).unwrap();
-    StepShape {
-        rows: n(1),
-        tokens: n(tokens),
-        capacity: n(CAPACITY),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    }
+    StepShape::new(n(1), n(tokens), n(CAPACITY))
 }
 
 /// The family's decode graph, as the planner receives it.
 fn decode_graph(model: &dyn Model) -> Graph {
     let traced = model
         .trace(
-            Phase::Decode,
-            shape(1),
+            &StepSpec::step(shape(1)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("decode traces");
@@ -128,7 +120,12 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_lm_head_weight() {
     assert_eq!(traced.aval(traced_head).dtype, DType::BF16);
     assert_eq!(traced.aval(traced_head).shape, vec![vocab, hidden]);
 
-    let prepared = prepare_target_graph(&traced, Backend::SpirvVulkan).unwrap();
+    let prepared = compiled_graph(
+        &traced,
+        Backend::SpirvVulkan,
+        &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
+    )
+    .unwrap();
 
     // The typed walk uploads the checkpoint's BF16 matrix as packed u32 lanes, so preparation must
     // neither retype nor widen it.
@@ -209,7 +206,12 @@ fn qwen35_wgpu_prepared_graph_holds_no_widened_embedding_table() {
         "the traced graph must still gather the table, or this test proves nothing"
     );
 
-    let prepared = prepare_target_graph(&traced, Backend::SpirvVulkan).unwrap();
+    let prepared = compiled_graph(
+        &traced,
+        Backend::SpirvVulkan,
+        &poot_test_util::device_caps::default_caps_for(Backend::SpirvVulkan),
+    )
+    .unwrap();
 
     // The typed walk uploads the BF16 table as packed u32 lanes, so preparation must neither retype
     // nor widen it.
@@ -310,7 +312,7 @@ fn ptx_and_rocm_preparation_is_untouched_by_this_card() {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 fn target(backend: Backend) -> Target {
@@ -345,17 +347,16 @@ fn qwen35_decode_and_prefill_plan_on_every_backend() {
         let (model, _) = qwen35_stored_as(stored_as);
         let formats = WeightFormats::from_weight_map(model.weights());
         for backend in backends() {
-            for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
+            for (phase, tokens) in [("decode", 1), ("prefill", 4)] {
                 let traced = model
                     .trace(
-                        phase,
-                        shape(tokens),
+                        &StepSpec::step(shape(tokens)),
                         poot_graph_ir::TraceLimits::for_tests(),
                     )
                     .unwrap();
                 let graph = bind_packed_weights(&traced, &formats).unwrap();
                 compile(&graph, &target(backend), &options()).unwrap_or_else(|e| {
-                    panic!("{stored_as:?} {phase:?} does not compile for {backend:?}: {e}")
+                    panic!("{stored_as:?} {phase} does not compile for {backend:?}: {e}")
                 });
             }
         }

@@ -438,7 +438,6 @@ impl Emitter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::production_plan::Submission;
     use poot_graph_ir::{Builder, Graph, Slot, TensorType};
     use poot_target::Backend;
     use poot_test_util::device_caps::default_caps_for;
@@ -456,7 +455,7 @@ mod tests {
     }
 
     fn options() -> CompileOptions {
-        CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+        CompileOptions::new(CompileLimits::STANDARD)
     }
 
     /// SC-004: a plan naming a projection the graph lacks is refused by `compile` with the typed error.

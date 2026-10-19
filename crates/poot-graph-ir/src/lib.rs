@@ -45,9 +45,9 @@ pub use error::{
 pub use graph::{
     BoundaryId, ComputedConst, EditError, Eqn, ExecutionValidationFailure, Export, Graph,
     GraphEdit, GraphOutput, LayerIndex, LayerRuns, LayerTagError, MAX_VALIDATION_PACKET_BYTES,
-    Operand, OutputKind, Slot, SlotKey, StatePair, StateRole, Storage, ValidationId,
-    ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
-    ValueTable, Witness, WitnessLedger,
+    Operand, OutputKind, Slot, SlotKey, StatePair, StatePolicy, StateRole, StateRows, Storage,
+    ValidationId, ValidationPacketEntry, ValidationPacketError, ValidationPacketLayout, ValueId,
+    ValueMeta, ValueTable, Witness, WitnessLedger,
 };
 pub use index_guard::{
     GuardValues, GuardedIndex, IndexGuardEmitError, IndexGuardError, emit_index_guard,

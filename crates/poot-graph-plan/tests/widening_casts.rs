@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::{BinOp, FusedOp, OpKind, RowStep, UnOp};
 use poot_graph_ir::ops::rmsnorm;
 use poot_graph_ir::types::TensorType;
@@ -31,7 +31,7 @@ fn f32_values(n: usize, seed: u64) -> Vec<f32> {
 }
 
 fn output_bits(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Vec<u32> {
-    eval(g, inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(g, inputs, EvalOptions::default())
         .expect("the graph evaluates")
         .output
         .into_host()

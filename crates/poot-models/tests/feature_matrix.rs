@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use poot_graph_ir::Graph;
 use poot_graph_plan::{CompileError, Target, compile};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::registry::{ConfigSource, FamilyEntry, Registry};
 use poot_quant::format::{GroupMap, ScaleEncoding, WeightFormat};
 use poot_quant::weights::{WeightEntry, WeightStore};
@@ -243,19 +243,20 @@ fn format_graphs(format: Option<WeightFormat>) -> Vec<(&'static str, Graph)> {
         .expect("the builtin registry")
         .build(&raw, &store)
         .unwrap_or_else(|e| panic!("{format:?}: {e}"));
-    let trace = |phase, tokens, capacity| {
+    let trace = |tokens, capacity| {
         model
             .trace(
-                phase,
-                poot_models::test_support::dense::step(1, tokens, capacity, LogitRows::Last),
+                &StepSpec::step(poot_models::test_support::dense::step(
+                    1,
+                    tokens,
+                    capacity,
+                    LogitRows::Last,
+                )),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap_or_else(|e| panic!("{format:?}: {e}"))
     };
-    vec![
-        ("decode", trace(Phase::Decode, 1, CAP)),
-        ("prefill", trace(Phase::Prefill, 4, 4)),
-    ]
+    vec![("decode", trace(1, CAP)), ("prefill", trace(4, 4))]
 }
 
 // ---- table (c): the measured rows -------------------------------------------------------------

@@ -7,7 +7,7 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, NoSync, StepInputs};
 use poot_tensor::{HostTensor, HostView};
 use poot_wgpu_device::device::WgpuDevice;
@@ -18,9 +18,9 @@ use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey, Storage, ValueId, ValueMeta};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -38,8 +38,7 @@ fn try_gpu() -> Option<(Box<dyn Executor>, Target)> {
     Some((Box::new(poot_executor::Engine::new(device)), target))
 }
 
-/// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
-/// submission).
+/// Compile `g` for `target` through the executor contract's one staged program.
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     let g = g.clone();
     compile_staged(
@@ -49,7 +48,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the graph")
 }
@@ -328,7 +327,7 @@ fn elementwise_large_256_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -362,7 +361,7 @@ fn elementwise_large_1024_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -399,7 +398,7 @@ fn non_power_of_2_elementwise_gpu_matches_cpu() {
                 .iter()
                 .map(|(&id, t)| (id, Value::from(t.clone())))
                 .collect::<HashMap<_, _>>(),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .unwrap()
         .output
@@ -435,7 +434,7 @@ fn non_power_of_2_reduce_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -469,7 +468,7 @@ fn non_power_of_2_matmul_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -504,7 +503,7 @@ fn single_element_add_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -538,7 +537,7 @@ fn single_element_matmul_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -569,7 +568,7 @@ fn single_element_reduce_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -606,7 +605,7 @@ fn large_matmul_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -641,7 +640,7 @@ fn large_reduce_wide_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -680,7 +679,7 @@ fn row_vector_matmul_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -715,7 +714,7 @@ fn column_vector_matmul_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -753,7 +752,7 @@ fn high_dimensional_broadcast_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -794,7 +793,7 @@ fn rmsnorm_non_power_of_2_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -836,7 +835,7 @@ fn deep_fused_chain_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -911,7 +910,7 @@ fn wgpu_scatter_update_grid_over_65535_workgroups() {
     );
 
     // CPU oracle first (independent of any GPU dispatch-grid math).
-    let cpu_out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu_out = eval(&g, &inputs, EvalOptions::default())
         .expect("cpu eval scatter_update")
         .output
         .into_host()
@@ -987,7 +986,7 @@ fn wgpu_dyn_update_slice_grid_over_65535_workgroups() {
         HostTensor::i32(vec![], vec![pos as i32]).into(),
     );
 
-    let cpu_out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu_out = eval(&g, &inputs, EvalOptions::default())
         .expect("cpu eval dyn_update_slice")
         .output
         .into_host()
@@ -1090,7 +1089,7 @@ fn wgpu_scatter_shared_pool_chained_dus_grid_over_65535_workgroups() {
     );
     inputs.insert(phys.id(), HostTensor::i32(vec![batch], phys_data).into());
 
-    let cpu_out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu_out = eval(&g, &inputs, EvalOptions::default())
         .expect("cpu eval chained scatter_shared_pool")
         .output
         .into_host()
@@ -1172,7 +1171,7 @@ fn wgpu_binary_broadcast_grid_over_65535_workgroups() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .expect("cpu eval binary broadcast")
     .output
@@ -1258,7 +1257,7 @@ fn wgpu_transpose_grid_over_65535_workgroups_feeding_matmul() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .expect("cpu eval transpose+matmul")
     .output
@@ -1342,7 +1341,7 @@ fn wgpu_concat2_grid_over_65535_workgroups() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .expect("cpu eval concat2")
     .output
@@ -1412,7 +1411,7 @@ fn wgpu_cast_grid_over_65535_workgroups_every_element() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .expect("cpu eval cast i32->f32")
     .output
@@ -1482,7 +1481,7 @@ fn wgpu_gather_grid_over_65535_workgroups_every_element() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .expect("cpu eval gather")
     .output
@@ -1564,7 +1563,7 @@ fn sliding_window_mask_from_pos_gpu_matches_cpu() {
         HostTensor::i32(vec![1, l], (0..l as i32).collect()).into(),
     );
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1584,7 +1583,7 @@ fn sliding_window_mask_from_pos_gpu_matches_cpu() {
     // host-built mask that ignored `Slot::Pos` would return the first run's output unchanged here.
     let mut inputs2 = inputs.clone();
     inputs2.insert(posi, HostTensor::i32(vec![1, l], vec![2i32; l]).into());
-    let cpu2 = eval(&g, &inputs2, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu2 = eval(&g, &inputs2, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

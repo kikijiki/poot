@@ -1,10 +1,8 @@
-//! Input modalities and which of them a loaded model can take.
+//! The kinds of non-text content a chat request part can carry and which of them the server can lower.
 
-/// A kind of request input.
+/// A kind of non-text request input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Modality {
-    /// Plain text; every model takes it.
-    Text,
+pub(crate) enum Modality {
     /// A still image (PNG or JPEG bytes), lowered through an image front end.
     Image,
     /// A video clip, sampled to frames and lowered through a video-capable front end.
@@ -15,9 +13,8 @@ pub enum Modality {
 
 impl Modality {
     /// The lowercase name used in messages.
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
-            Modality::Text => "text",
             Modality::Image => "image",
             Modality::Video => "video",
             Modality::Audio => "audio",

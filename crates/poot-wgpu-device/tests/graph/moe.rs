@@ -300,7 +300,7 @@ fn moe_sparse_decode_with_separated_experts_matches_the_oracle() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let want = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -394,7 +394,7 @@ fn moe_grouped_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

@@ -420,14 +420,12 @@ pub fn const_named_weights(m: &MappedModel, g: &Graph) -> (WeightStore, WeightMa
 
 /// One contiguous-cache step of `rows` sequences of `tokens` new tokens over `capacity` positions.
 pub fn step(rows: usize, tokens: usize, capacity: usize, logits: LogitRows) -> StepShape {
-    StepShape {
-        rows: NonZeroUsize::new(rows).unwrap(),
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(capacity).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits,
-        hidden: None,
-    }
+    StepShape::new(
+        NonZeroUsize::new(rows).unwrap(),
+        NonZeroUsize::new(tokens).unwrap(),
+        NonZeroUsize::new(capacity).unwrap(),
+    )
+    .with_logits(logits)
 }
 
 /// [`step`] over one paged KV pool of `pool_slots` positions.
@@ -438,11 +436,8 @@ pub fn paged_step(
     pool_slots: usize,
     logits: LogitRows,
 ) -> StepShape {
-    StepShape {
-        kv: KvLayout::Paged {
-            pool_slots: NonZeroUsize::new(pool_slots).unwrap(),
-            seqs: NonZeroUsize::new(rows).unwrap(),
-        },
-        ..step(rows, tokens, capacity, logits)
-    }
+    step(rows, tokens, capacity, logits).with_kv(KvLayout::Paged {
+        pool_slots: NonZeroUsize::new(pool_slots).unwrap(),
+        seqs: NonZeroUsize::new(rows).unwrap(),
+    })
 }

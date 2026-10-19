@@ -16,12 +16,10 @@ use crate::components::moe::{self, GateUpForm, MoeParams, MoeWeights, Orientatio
 use crate::components::router::{RouterBias, RouterKind};
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    decoder_program, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::ModelSchema;
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::{GGUF_BASE, GGUF_SINK_ATTENTION};
 use crate::names::{
     ExpertNames, HF_BASE, HF_SINK_ATTENTION, MoeLayers, MoeNames, family_weights_routed,
@@ -235,6 +233,7 @@ pub(crate) struct GptOss {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -268,6 +267,9 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -275,7 +277,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -285,6 +286,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -293,13 +295,18 @@ impl Model for GptOss {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
@@ -408,9 +415,9 @@ mod family_tests {
     use crate::components::testing::{
         CAP, GGML_F32, GGML_Q8_0, assert_bf16_and_q8_0_trace_through_the_packed_transform,
         assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
-        close, f32_entry, gguf_dense_kvs, read_back_owned, step_shape, values,
+        close, f32_entry, gguf_dense_kvs, read_back_owned, values,
     };
-    use crate::model::LogitRows;
+    use crate::model::StepShape;
     use crate::registry::Registry;
     use poot_load::gguf::{GgufIndex, GgufValue};
 
@@ -426,7 +433,7 @@ mod family_tests {
 
     /// Logits at every position of the whole prompt prefilled in one step.
     fn prefill_logits(model: &dyn Model, store: &WeightStore) -> Vec<f32> {
-        run_step(model, store, Phase::Prefill, CAP, &PROMPT, 0, &[]).0
+        run_step(model, store, CAP, &PROMPT, 0, &[]).0
     }
 
     /// `x[k] . w[k, cols]` in f64, plus `bias`.
@@ -1019,20 +1026,11 @@ mod family_tests {
             assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
             let model = registry.build(&raw, &store).unwrap();
             let reference = model_of(&fixture_config(), &hf_store);
-            let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
-            let (want, want_state) =
-                run_step(&*reference, &hf_store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+            let (got, state) = run_step(&*model, &store, CAP, &PROMPT, 0, &[]);
+            let (want, want_state) = run_step(&*reference, &hf_store, CAP, &PROMPT, 0, &[]);
             close(&got, &want);
-            let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 5, &state);
-            let (want, _) = run_step(
-                &*reference,
-                &hf_store,
-                Phase::Decode,
-                CAP,
-                &[5],
-                5,
-                &want_state,
-            );
+            let (got, _) = run_step(&*model, &store, CAP, &[5], 5, &state);
+            let (want, _) = run_step(&*reference, &hf_store, CAP, &[5], 5, &want_state);
             close(&got, &want);
             let packed = model
                 .weights()
@@ -1052,24 +1050,17 @@ mod family_tests {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
         let n = |v| NonZeroUsize::new(v).unwrap();
-        let shape = |rows, tokens, capacity| StepShape {
-            rows: n(rows),
-            tokens: n(tokens),
-            capacity: n(capacity),
-            ..step_shape(1, 1, LogitRows::Last)
-        };
+        let shape = |rows, tokens, capacity| StepShape::new(n(rows), n(tokens), n(capacity));
         assert!(matches!(
             model.trace(
-                Phase::Decode,
-                shape(1, 2, 8),
+                &StepSpec::step(shape(1, 9, 8)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
             model.trace(
-                Phase::Prefill,
-                shape(1, 1, 65),
+                &StepSpec::step(shape(1, 1, 65)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })

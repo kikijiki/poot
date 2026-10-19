@@ -148,7 +148,6 @@ pub(crate) fn refusal_of(
     target: poot_graph_plan::Target,
 ) -> poot_graph_plan::Refusal {
     use poot_graph_plan::multi_device::topology::DeviceId;
-    use poot_graph_plan::production_plan::Submission;
     use poot_graph_plan::staged::{
         DevicePlacement, ExpertPlacement, Partition, StagedCompileError, TargetSet, compile_staged,
     };
@@ -160,7 +159,7 @@ pub(crate) fn refusal_of(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     ) else {
         panic!("the equation is refused for the NPU");
     };

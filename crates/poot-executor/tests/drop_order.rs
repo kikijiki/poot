@@ -14,8 +14,8 @@ use poot_executor::{Device, DeviceTime, Dispatch, Engine, Executor, NoSync, Step
 use poot_graph_ir::{BinOp, Builder, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
@@ -97,7 +97,7 @@ impl Device for LoggingDevice {
         Ok(())
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), Failed> {
+    fn begin(&mut self) -> Result<(), Failed> {
         Ok(())
     }
 
@@ -194,7 +194,7 @@ fn program() -> (StagedProgram, Arc<WeightStore>, Arc<WeightMap>) {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the fixture compiles for the fake target");
     (program, store, map)

@@ -21,7 +21,7 @@ use poot_graph_ir::{
 use poot_tensor::{DType, HostTensor};
 
 use super::helpers::fill;
-use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use crate::{EvalError, EvalOptions, Value, eval};
 
 /// `n` deterministic values in `[-scale, scale)`.
 fn data(shape: &[usize], seed: u64, scale: f32) -> HostTensor {
@@ -87,11 +87,8 @@ fn one_equation(op: OpKind, inputs: &[HostTensor]) -> (Graph, HashMap<ValueId, V
     })
 }
 
-fn evaluate(
-    (g, inputs): &(Graph, HashMap<ValueId, Value>),
-    budget: EvalBudget,
-) -> Result<HostTensor, EvalError> {
-    let output = eval(g, inputs, EvalOptions::new(budget))?.output;
+fn evaluate((g, inputs): &(Graph, HashMap<ValueId, Value>)) -> Result<HostTensor, EvalError> {
+    let output = eval(g, inputs, EvalOptions::default())?.output;
     Ok(output.into_host().expect("a dense output"))
 }
 
@@ -124,9 +121,9 @@ fn assert_composite_matches_chain(
     inputs: &[HostTensor],
     chain: impl FnOnce(&Builder, &[Traced]) -> Traced,
 ) {
-    let composite = evaluate(&one_equation(op, inputs), EvalBudget::UNBOUNDED)
+    let composite = evaluate(&one_equation(op, inputs))
         .unwrap_or_else(|error| panic!("{what}: the composite evaluates: {error}"));
-    let traced = evaluate(&graph_over(inputs, chain), EvalBudget::UNBOUNDED)
+    let traced = evaluate(&graph_over(inputs, chain))
         .unwrap_or_else(|error| panic!("{what}: the traced chain evaluates: {error}"));
     assert_bits_equal(&composite, &traced, what);
 }
@@ -396,24 +393,18 @@ fn every_rope_entry_point_agrees_bit_for_bit() {
         let pos = HostTensor::i32(vec![batch], positions.to_vec());
         let what = |entry: &str| format!("row {row} (d={d}, rot={rot}): {entry}");
 
-        let batched = evaluate(
-            &graph_over(
-                &[x.clone(), cos.clone(), sin.clone(), pos.clone()],
-                |b, t| ops::rope_batched(b, t[0], t[1], t[2], t[3], batch).unwrap(),
-            ),
-            EvalBudget::UNBOUNDED,
-        )
+        let batched = evaluate(&graph_over(
+            &[x.clone(), cos.clone(), sin.clone(), pos.clone()],
+            |b, t| ops::rope_batched(b, t[0], t[1], t[2], t[3], batch).unwrap(),
+        ))
         .unwrap();
-        let sectioned_batched = evaluate(
-            &graph_over(
-                &[x.clone(), cos.clone(), sin.clone(), pos.clone()],
-                |b, t| {
-                    let pos = vec![t[3]; sections.len()];
-                    ops::rope_sectioned_batched(b, t[0], t[1], t[2], &pos, sections, batch).unwrap()
-                },
-            ),
-            EvalBudget::UNBOUNDED,
-        )
+        let sectioned_batched = evaluate(&graph_over(
+            &[x.clone(), cos.clone(), sin.clone(), pos.clone()],
+            |b, t| {
+                let pos = vec![t[3]; sections.len()];
+                ops::rope_sectioned_batched(b, t[0], t[1], t[2], &pos, sections, batch).unwrap()
+            },
+        ))
         .unwrap();
         assert_bits_equal(
             &sectioned_batched,
@@ -428,21 +419,18 @@ fn every_rope_entry_point_agrees_bit_for_bit() {
             let x_row = HostTensor::f32(vec![1, heads, 1, d], x_row.to_vec());
             let batched_row = HostTensor::f32(vec![1, heads, 1, d], batched_row.to_vec());
             let scalar = HostTensor::i32(Vec::new(), vec![position]);
-            let rope = evaluate(
-                &graph_over(
-                    &[x_row.clone(), cos.clone(), sin.clone(), scalar.clone()],
-                    |b, t| ops::rope(b, t[0], t[1], t[2], t[3]).unwrap(),
-                ),
-                EvalBudget::UNBOUNDED,
-            )
+            let rope = evaluate(&graph_over(
+                &[x_row.clone(), cos.clone(), sin.clone(), scalar.clone()],
+                |b, t| ops::rope(b, t[0], t[1], t[2], t[3]).unwrap(),
+            ))
             .unwrap();
-            let sectioned = evaluate(
-                &graph_over(&[x_row, cos.clone(), sin.clone(), scalar], |b, t| {
+            let sectioned = evaluate(&graph_over(
+                &[x_row, cos.clone(), sin.clone(), scalar],
+                |b, t| {
                     let pos = vec![t[3]; sections.len()];
                     ops::rope_sectioned(b, t[0], t[1], t[2], &pos, sections).unwrap()
-                }),
-                EvalBudget::UNBOUNDED,
-            )
+                },
+            ))
             .unwrap();
             assert_bits_equal(&batched_row, &rope, &what("rope_batched vs rope"));
             assert_bits_equal(&sectioned, &rope, &what("rope_sectioned vs rope"));
@@ -451,11 +439,9 @@ fn every_rope_entry_point_agrees_bit_for_bit() {
 }
 
 /// SC-005: a prefill attention composite's decomposition materializes `[1, Hq, L, L]` scores behind a
-/// `[1, Hq, L, D]` result. Under a budget below the scores and above every operand and the result, the
-/// evaluation is a typed `Budget` error naming the composite equation (nothing publishes); unbounded,
-/// it evaluates to the traced chain's bits.
+/// `[1, Hq, L, D]` result and evaluates to the traced chain's bits.
 #[test]
-fn prefill_composite_scores_are_charged_to_the_budget() {
+fn prefill_composite_evaluates_to_the_traced_chain() {
     let (hq, l, d) = (2usize, 16usize, 4usize);
     let scale = 0.5f32;
     let inputs = [
@@ -466,36 +452,13 @@ fn prefill_composite_scores_are_charged_to_the_budget() {
     ];
     let op = OpKind::Attention(AttentionAttrs::new(1, scale, None));
     let graph = one_equation(op, &inputs);
-    let composite = graph.0.eqns()[0].out;
-    let scores = hq * l * l;
-    let limit = 300usize;
-    assert!(hq * l * d < limit && l * l < limit && scores > limit);
-
-    match evaluate(&graph, EvalBudget::bounded(limit as u64, u64::MAX)) {
-        Err(EvalError::Budget {
-            eqn,
-            resource,
-            needed,
-            limit: refused_at,
-        }) => {
-            assert_eq!(
-                (eqn, resource, needed, refused_at),
-                (composite, "elements", scores, limit)
-            );
-        }
-        other => panic!("a bounded prefill composite must be refused by the budget: {other:?}"),
-    }
-
-    let unbounded = evaluate(&graph, EvalBudget::UNBOUNDED).expect("unbounded evaluates");
-    let traced = evaluate(
-        &graph_over(&inputs, |b, t| {
-            ops::attention_prefill(b, t[0], t[1], t[2], 1, scale, t[3]).unwrap()
-        }),
-        EvalBudget::UNBOUNDED,
-    )
+    let composite = evaluate(&graph).expect("the composite evaluates");
+    let traced = evaluate(&graph_over(&inputs, |b, t| {
+        ops::attention_prefill(b, t[0], t[1], t[2], 1, scale, t[3]).unwrap()
+    }))
     .unwrap();
-    assert_bits_equal(&unbounded, &traced, "unbounded prefill composite");
-    assert_eq!(unbounded.dtype(), DType::F32);
+    assert_bits_equal(&composite, &traced, "prefill composite");
+    assert_eq!(composite.dtype(), DType::F32);
 }
 
 /// Card 556 review: an error a primitive raises inside a decomposition names the composite equation,
@@ -526,7 +489,7 @@ fn an_error_inside_a_decomposition_names_the_composite_equation() {
         ValueId::new(0),
         "the composite's id must differ from the inner placeholder's"
     );
-    match evaluate(&graph, EvalBudget::UNBOUNDED) {
+    match evaluate(&graph) {
         Err(EvalError::Unsupported { eqn, op, detail }) => {
             assert_eq!(
                 (eqn, op),
@@ -591,14 +554,11 @@ fn a_narrow_head_rounds_before_its_residual_in_the_composite_and_the_chain() {
             head: ContractionHead::MatMul,
             region: one_step_region(BinOp::Add),
         };
-        let composite = evaluate(&one_equation(op, &inputs), EvalBudget::UNBOUNDED).unwrap();
-        let chain = evaluate(
-            &graph_over(&inputs, |b, t| {
-                let head = b.matmul(t[0], t[1]).unwrap();
-                b.binary(BinOp::Add, head, t[2]).unwrap()
-            }),
-            EvalBudget::UNBOUNDED,
-        )
+        let composite = evaluate(&one_equation(op, &inputs)).unwrap();
+        let chain = evaluate(&graph_over(&inputs, |b, t| {
+            let head = b.matmul(t[0], t[1]).unwrap();
+            b.binary(BinOp::Add, head, t[2]).unwrap()
+        }))
         .unwrap();
         assert_eq!(
             composite.dtype(),
@@ -647,13 +607,10 @@ fn every_step_of_a_narrow_epilogue_rounds_through_the_head_dtype() {
         region,
     };
     // Inputs: A = [1], B = [1] (head 1.0), then the leaf `tie` read by both steps.
-    let composite = evaluate(
-        &one_equation(
-            op,
-            &[inputs[0].clone(), inputs[1].clone(), inputs[2].clone()],
-        ),
-        EvalBudget::UNBOUNDED,
-    )
+    let composite = evaluate(&one_equation(
+        op,
+        &[inputs[0].clone(), inputs[1].clone(), inputs[2].clone()],
+    ))
     .unwrap();
     assert_eq!(
         widened(&composite),

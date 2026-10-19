@@ -8,7 +8,6 @@ use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Executor, NoSync, StepInputs};
 use poot_graph_ir::{BinOp, Builder, TensorType};
 use poot_graph_plan::Target;
-use poot_graph_plan::production_plan::Submission;
 
 use crate::{Fixture, fixture_weights, staged, store_with};
 
@@ -51,7 +50,7 @@ pub fn run_coresident(
             .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
             .map_err(|e| format!("fixture {i}: load_weights: {e}"))?;
         let entry = exec
-            .add_entry(exe, &staged(fixture, target, Submission::Replay))
+            .add_entry(exe, &staged(fixture, target))
             .map_err(|e| format!("fixture {i}: add_entry: {e}"))?;
         loaded.push((exe, entry));
     }

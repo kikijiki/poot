@@ -11,20 +11,18 @@ use std::sync::Arc;
 
 use poot_executor::{Device, Dispatch, Engine};
 use poot_graph_ir::{BinOp, Graph, StateRole, TensorType};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId};
 use poot_llm::driver::capacity::Planner;
 use poot_llm::driver::placement::Placement;
 use poot_llm::driver::{
     Driver, DriverOptions, Head, Layout, ModelHandle, PoolShape, PreparedSetLimits, ServingShapes,
     Warm,
 };
-use poot_models::components::standard::Step;
+use poot_models::components::standard::{Step, decoder_program};
+use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
-    Phase, ShapeReason, StepShape, TraceError,
+    StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
@@ -68,6 +66,7 @@ impl Variant {
 #[derive(Debug)]
 struct Tiny {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
     variant: Variant,
 }
@@ -77,26 +76,16 @@ impl Model for Tiny {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
-        let refuse = |reason| {
-            Err(TraceError::ShapeUnsupported {
-                family: FAMILY,
-                shape,
-                reason,
-            })
-        };
-        if phase == Phase::Decode && shape.tokens.get() != 1 {
-            return refuse(ShapeReason::DecodeTokens);
-        }
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
         let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
@@ -172,6 +161,14 @@ fn build_tiny(raw: &RawConfig<'_>) -> Result<Box<dyn Model>, ModelError> {
             });
         }
     };
+    let program = match variant {
+        Variant::Dense | Variant::Windowed => decoder_program(VOCAB),
+        Variant::Recurrent => {
+            ProgramSpec::new(ProgramId::STEP, ModelOutput::Logits { vocab: VOCAB })
+                .carrying(StateSpec::recurrent("toy.state"))
+        }
+    };
+    let schema = ModelSchema::builder().step(program).build_for(FAMILY)?;
     Ok(Box::new(Tiny {
         variant,
         config: ModelConfig {
@@ -181,10 +178,10 @@ fn build_tiny(raw: &RawConfig<'_>) -> Result<Box<dyn Model>, ModelError> {
             eos: BTreeSet::from([EOS]),
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
         },
+        schema,
         weights: WeightMap::default(),
     }))
 }
@@ -293,7 +290,7 @@ impl Device for CountingDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), FakeError> {
@@ -332,7 +329,7 @@ impl Device for CountingDevice {
 }
 
 fn options(capacity: usize) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -387,15 +384,14 @@ fn planned_and_live(
         .unwrap()
     };
     let planned = planner
-        .plan(options(capacity), &shapes(layout), false)
+        .plan(options(capacity), &shapes(layout), &[])
         .unwrap();
     assert!(
         planned.residue.is_empty(),
         "a planning device releases everything it recorded"
     );
-    let mut driver =
-        Driver::new(Arc::clone(handle), Box::new(executor), options(capacity)).unwrap();
-    driver.prepare(&shapes(layout)).unwrap();
+    let driver = Driver::new(Arc::clone(handle), Box::new(executor), options(capacity)).unwrap();
+    let driver = driver.prepare(&shapes(layout)).unwrap();
     (
         planned.footprint.role_bytes(DeviceId(0)).unwrap(),
         driver.live_role_bytes(),

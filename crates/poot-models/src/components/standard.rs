@@ -28,21 +28,23 @@ use poot_graph_ir::{
 use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
 
+use super::embed::{EMBEDS, embeds_input};
 use super::embed::{EmbedInputs, Embedding};
 use super::head::{Head, HeadKind};
 use super::linear::{Weight, WeightError};
 use super::norm::{NormParams, NormWeights, norm, norm_with};
+use super::rope::{MROPE, mrope_input};
+use crate::io::{
+    Fill, ModelSchema, ModelSchemaBuilder, Presence, ProgramId, ProgramSpec, STATE_READ_TAG,
+    STATE_WRITE_TAG, StateSpec,
+};
 use crate::model::WiringError;
 use crate::model::{
-    ConfigReason, FamilyKey, KvLayout, LogitRows, ModelError, Phase, ShapeReason, StepShape,
+    ConfigReason, FamilyKey, KvLayout, LogitRows, ModelError, ModelOutput, ShapeReason, StepShape,
     TraceError,
 };
 use poot_graph_ir::Requirement;
 
-/// `Slot::Activation` tag of a paged step's `[rows]` state read index.
-pub const STATE_READ_SLOT: &str = "state_read";
-/// `Slot::WriteMap` tag of a paged step's `[rows]` state write map.
-pub const STATE_WRITE_SLOT: &str = "state_write";
 /// The state name of the hidden-state carry ([`Step::carry_hidden`]): one f32
 /// `[seqs, positions, width]` value, the same aval in every program of an executable.
 pub const HIDDEN_CARRY_STATE: &str = "hidden_carry";
@@ -203,18 +205,17 @@ impl Step {
         })
     }
 
-    /// A step whose inputs are tokens with caller-computed embedding rows over some positions
-    /// ([`EmbedInputs`]): the two extra inputs are declared after the token and position inputs.
-    /// `width` is the model's embedding width.
-    pub fn with_embeds(b: &Builder, shape: StepShape, width: usize) -> Result<Self, TraceError> {
-        let mut step = Self::new(b, shape)?;
-        step.embeds = Some(EmbedInputs::declare(
+    /// This step with caller-computed embedding rows over some positions ([`EmbedInputs`]): the two
+    /// extra inputs are declared after the token and position inputs. `width` is the model's embedding
+    /// width. A family calls it for a step that carries [`EMBEDS`](super::embed::EMBEDS).
+    pub fn with_embeds(mut self, b: &Builder, width: usize) -> Result<Self, TraceError> {
+        self.embeds = Some(EmbedInputs::declare(
             b,
-            shape.rows.get(),
-            shape.tokens.get(),
+            self.shape.rows.get(),
+            self.shape.tokens.get(),
             width,
         )?);
-        Ok(step)
+        Ok(self)
     }
 
     /// A step whose attention rotates by sectioned positions: `Slot::MropePosition`, `[3, rows * tokens]`
@@ -411,7 +412,7 @@ impl Step {
 
     /// Write the last position of `hidden` (`[rows, tokens, width]` F32) into row 0 of `carry` and
     /// keep rows `1..positions`: the row a following one-token step of a chain reads. The
-    /// [`Phase::Mtp`] program's write, the layer recycling its own output.
+    /// draft program's write, the layer recycling its own output.
     pub fn carry_last_hidden(
         &self,
         b: &Builder,
@@ -446,10 +447,10 @@ impl Step {
         let rows = StateRows {
             read: b.slot_named(
                 Slot::Activation,
-                STATE_READ_SLOT,
+                STATE_READ_TAG,
                 TensorType::new(vec![self.shape.rows.get()], DType::I32),
             )?,
-            write: b.write_map(STATE_WRITE_SLOT, self.shape.rows.get(), seqs)?,
+            write: b.write_map(STATE_WRITE_TAG, self.shape.rows.get(), seqs)?,
         };
         *declared = Some(rows);
         Ok(rows)
@@ -841,16 +842,13 @@ pub fn standard_stack(
     }
 }
 
-/// Refuse a step shape the dense decoder body cannot trace: a multi-token decode, a capacity above the model's maximum positions or more new tokens than the cache holds. The three phases that change a step's inputs and output ([`Phase::PrefillEmbeds`], [`Phase::Encode`] and [`Phase::Mtp`]) are refused: a family that traces the first two calls [`check_embeddable_step`], one that traces the third [`check_mtp_step`].
+/// Refuse a step shape the dense decoder body cannot trace: a capacity above the model's maximum
+/// positions, more new tokens than the cache holds, or a hidden-state carry narrower than the step.
 pub fn check_step(
     family: FamilyKey,
-    phase: Phase,
     shape: StepShape,
     max_positions: usize,
 ) -> Result<(), TraceError> {
-    if matches!(phase, Phase::PrefillEmbeds | Phase::Encode | Phase::Mtp) {
-        return Err(TraceError::PhaseUnsupported { family, phase });
-    }
     let refuse = |reason| {
         Err(TraceError::ShapeUnsupported {
             family,
@@ -858,9 +856,6 @@ pub fn check_step(
             reason,
         })
     };
-    if phase == Phase::Decode && shape.tokens.get() != 1 {
-        return refuse(ShapeReason::DecodeTokens);
-    }
     if shape.capacity.get() > max_positions {
         return refuse(ShapeReason::CapacityAboveMax { max: max_positions });
     }
@@ -878,60 +873,60 @@ pub fn check_step(
     Ok(())
 }
 
-/// The phases a family that calls [`check_embeddable_step`] traces: [`Phase::Mtp`] is not among them,
-/// so the family's match over the phase has no arm for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EmbeddablePhase {
-    /// A token prefill ([`Phase::Prefill`]).
-    Prefill,
-    /// A decode step ([`Phase::Decode`]).
-    Decode,
-    /// A prefill over supplied embeddings ([`Phase::PrefillEmbeds`]).
-    PrefillEmbeds,
-    /// An encoder pass ([`Phase::Encode`]).
-    Encode,
-}
-
-/// [`check_step`] for a family whose body also traces [`Phase::PrefillEmbeds`] and [`Phase::Encode`]:
-/// each is a prefill over the same cache shape, so each checks as one. [`Phase::Mtp`] is refused here,
-/// and the returned [`EmbeddablePhase`] is what the family dispatches on.
-pub fn check_embeddable_step(
+/// [`check_step`] for a family's draft program: the layer's step is checked as a prefill over the same
+/// cache shape, and it must name the hidden-state carry it reads.
+pub fn check_draft_step(
     family: FamilyKey,
-    phase: Phase,
-    shape: StepShape,
-    max_positions: usize,
-) -> Result<EmbeddablePhase, TraceError> {
-    let (embeddable, checked) = match phase {
-        Phase::Prefill => (EmbeddablePhase::Prefill, Phase::Prefill),
-        Phase::Decode => (EmbeddablePhase::Decode, Phase::Decode),
-        Phase::PrefillEmbeds => (EmbeddablePhase::PrefillEmbeds, Phase::Prefill),
-        Phase::Encode => (EmbeddablePhase::Encode, Phase::Prefill),
-        Phase::Mtp => return Err(TraceError::PhaseUnsupported { family, phase }),
-    };
-    check_step(family, checked, shape, max_positions)?;
-    Ok(embeddable)
-}
-
-/// [`check_step`] for a family whose body also traces [`Phase::Mtp`]: the layer's step is checked
-/// as a prefill over the same cache shape, and it must name the hidden-state carry it reads.
-pub fn check_mtp_step(
-    family: FamilyKey,
-    phase: Phase,
     shape: StepShape,
     max_positions: usize,
 ) -> Result<(), TraceError> {
-    if phase != Phase::Mtp {
-        return check_step(family, phase, shape, max_positions);
-    }
-    check_step(family, Phase::Prefill, shape, max_positions)?;
+    check_step(family, shape, max_positions)?;
     if shape.hidden.is_none() {
         return Err(TraceError::ShapeUnsupported {
             family,
             shape,
-            reason: ShapeReason::MtpWithoutCarry,
+            reason: ShapeReason::DraftWithoutCarry,
         });
     }
     Ok(())
+}
+
+/// The `draft` program of a model with a multi-token-prediction layer: logits over `vocab` from the
+/// layer's own KV cache, reading and writing the hidden-state carry.
+pub fn draft_program(vocab: usize) -> ProgramSpec {
+    ProgramSpec::new(ProgramId::DRAFT, ModelOutput::Logits { vocab })
+        .carrying(StateSpec::kv())
+        .carrying(StateSpec::hand_off())
+}
+
+/// The schema of a decoder whose prompt may supply embedding rows in place of some tokens' own
+/// ([`EMBEDS`], optional) and that also offers a decoder embedding pass (`encode`, returning hidden
+/// states). A `sectioned` model rotates by [`MROPE`] positions, defaulted to the text positions.
+pub fn embeddable_decoder_schema(
+    vocab: usize,
+    width: usize,
+    sectioned: bool,
+) -> ModelSchemaBuilder {
+    let mut step = decoder_program(vocab).reading(EMBEDS, Presence::Optional);
+    let mut encode = ProgramSpec::new(ProgramId::ENCODE, ModelOutput::Hidden { width })
+        .carrying(StateSpec::kv());
+    let mut schema = ModelSchema::builder().input(embeds_input(width));
+    if sectioned {
+        let positions = Presence::Defaulted(Fill::Positions);
+        step = step.reading(MROPE, positions.clone());
+        encode = encode.reading(MROPE, positions);
+        schema = schema.input(mrope_input());
+    }
+    schema.step(step).encode(encode)
+}
+
+/// The `step` program of a standard decoder: logits over `vocab`, carrying a KV cache and, when a
+/// step's shape asks for one, the hidden-state carry. A family adds the request inputs it reads and
+/// the further states it carries.
+pub fn decoder_program(vocab: usize) -> ProgramSpec {
+    ProgramSpec::new(ProgramId::STEP, ModelOutput::Logits { vocab })
+        .carrying(StateSpec::kv())
+        .carrying(StateSpec::hand_off())
 }
 
 /// The CPU-oracle harness the component tests share: a fixture weight store keyed by
@@ -941,7 +936,7 @@ pub(crate) mod oracle {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
-    use poot_eval::{EvalBudget, EvalOptions, Value};
+    use poot_eval::{EvalOptions, Value};
     use poot_graph_ir::{Graph, PackedSourceName, Slot, Storage, ValueId};
     use poot_quant::weights::{
         DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightStore, WeightView,
@@ -950,7 +945,7 @@ pub(crate) mod oracle {
     use poot_tensor::DType;
     use poot_tensor::HostTensor;
 
-    use crate::model::{HiddenCarry, KvLayout, LogitRows, StepShape};
+    use crate::model::{HiddenCarry, LogitRows, StepShape, StepSpec};
 
     /// Deterministic values in `[-0.5, 0.5)`.
     pub(crate) fn random(n: usize, seed: u64) -> Vec<f32> {
@@ -1367,7 +1362,7 @@ pub(crate) mod oracle {
             };
             inputs.insert(id, value);
         }
-        let eval = poot_eval::eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let eval = poot_eval::eval(g, &inputs, EvalOptions::default())
             .unwrap_or_else(|e| panic!("oracle: {e}"));
         let dense = |v: Value| {
             let host = v.into_host().unwrap();
@@ -1382,7 +1377,7 @@ pub(crate) mod oracle {
         )
     }
 
-    /// One step of `model` on the oracle: trace `phase` at `rows = 1` with logits at every token,
+    /// One step of `model` on the oracle: trace its `step` program at `rows = 1` with logits at every token (the last one for a single token),
     /// `tokens.len()` tokens from absolute position `start` over a cache of `capacity`; bind its
     /// packed weights through the packed-weight transform fed by the model's map; evaluate over
     /// `state` (zeros when empty).
@@ -1390,18 +1385,25 @@ pub(crate) mod oracle {
     pub(crate) fn run_step(
         model: &dyn crate::model::Model,
         store: &WeightStore,
-        phase: crate::model::Phase,
         capacity: usize,
         tokens: &[i32],
         start: i32,
         state: &[Vec<f32>],
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
-        let shape = |tokens, capacity| step_shape(tokens, capacity, LogitRows::All, None);
+        // A one-token step is the decode step, whose shape asks for the last position's logits (the
+        // only position it has): a family with a prefill granule refuses it otherwise.
+        let shape = |tokens, capacity| {
+            let logits = if tokens == 1 {
+                LogitRows::Last
+            } else {
+                LogitRows::All
+            };
+            step_shape(tokens, capacity, logits, None)
+        };
         run_shape(
             model,
             store,
-            phase,
-            shape(tokens.len(), capacity),
+            &StepSpec::step(shape(tokens.len(), capacity)),
             tokens,
             start,
             state,
@@ -1415,23 +1417,21 @@ pub(crate) mod oracle {
         logits: LogitRows,
         hidden: Option<HiddenCarry>,
     ) -> StepShape {
-        StepShape {
-            rows: std::num::NonZeroUsize::MIN,
-            tokens: std::num::NonZeroUsize::new(tokens).unwrap(),
-            capacity: std::num::NonZeroUsize::new(capacity).unwrap(),
-            kv: KvLayout::Contiguous,
-            logits,
-            hidden,
-        }
+        StepShape::new(
+            std::num::NonZeroUsize::MIN,
+            std::num::NonZeroUsize::new(tokens).unwrap(),
+            std::num::NonZeroUsize::new(capacity).unwrap(),
+        )
+        .with_logits(logits)
+        .with_hidden(hidden)
     }
 
-    /// [`run_step`] over a given `shape`: the carried state is `model`'s, in carry order, the hidden-state
-    /// carry last when the shape asks for one.
+    /// [`run_step`] over a given `spec` (program, shape, carried inputs): the carried state is
+    /// `model`'s, in carry order, the hidden-state carry last when the shape asks for one.
     pub(crate) fn run_shape(
         model: &dyn crate::model::Model,
         store: &WeightStore,
-        phase: crate::model::Phase,
-        shape: StepShape,
+        spec: &StepSpec,
         tokens: &[i32],
         start: i32,
         state: &[Vec<f32>],
@@ -1440,8 +1440,7 @@ pub(crate) mod oracle {
             poot_graph_ir::TraceLimits::for_tests(),
             model,
             store,
-            phase,
-            shape,
+            spec,
             tokens,
             start,
             state,
@@ -1454,14 +1453,17 @@ pub(crate) mod oracle {
         limits: poot_graph_ir::TraceLimits,
         model: &dyn crate::model::Model,
         store: &WeightStore,
-        phase: crate::model::Phase,
-        shape: StepShape,
+        spec: &StepSpec,
         tokens: &[i32],
         start: i32,
         state: &[Vec<f32>],
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
-        assert_eq!(shape.tokens.get(), tokens.len(), "one token per position");
-        let g = model.trace(phase, shape, limits).unwrap();
+        assert_eq!(
+            spec.shape.tokens.get(),
+            tokens.len(),
+            "one token per position"
+        );
+        let g = model.trace(spec, limits).unwrap();
         let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
         let g = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
         let zeros: Vec<Vec<f32>> = g
@@ -1524,7 +1526,6 @@ mod tests {
     use super::super::norm::NormKind;
     use super::oracle::{self, Fx};
     use super::*;
-    use crate::model::KvLayout;
 
     fn rms(x: &[f64], w: &[f32], eps: f64) -> Vec<f64> {
         let ms = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
@@ -1612,14 +1613,12 @@ mod tests {
         let run = |fx: &Fx, logits: LogitRows| {
             let map = fx.map();
             let sw = StackWeights::new(&map, vocab, w).unwrap();
-            let shape = StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::new(t).unwrap(),
-                capacity: NonZeroUsize::new(8).unwrap(),
-                kv: KvLayout::Contiguous,
-                logits,
-                hidden: None,
-            };
+            let shape = StepShape::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::new(t).unwrap(),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .with_logits(logits);
             let b = Builder::for_tests();
             let step = Step::new(&b, shape).unwrap();
             let out = standard_stack(
@@ -1683,16 +1682,14 @@ mod tests {
         let run = |tokens: &[i32], start: i32, hidden: bool, state: &[Vec<f32>]| {
             let map = fx.map();
             let sw = StackWeights::new(&map, vocab, w).unwrap();
-            let shape = StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::new(tokens.len()).unwrap(),
-                capacity: NonZeroUsize::new(8).unwrap(),
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::Last,
-                hidden: hidden.then(|| HiddenCarry {
-                    positions: NonZeroUsize::new(positions).unwrap(),
-                }),
-            };
+            let shape = StepShape::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::new(tokens.len()).unwrap(),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .with_hidden(hidden.then(|| HiddenCarry {
+                positions: NonZeroUsize::new(positions).unwrap(),
+            }));
             let b = Builder::for_tests();
             let step = Step::new(&b, shape).unwrap();
             let out = standard_stack(
@@ -1767,10 +1764,10 @@ mod tests {
             })
         };
         let mut shape = oracle::step_shape(4, 8, LogitRows::Last, None);
-        assert!(check_step(family, Phase::Prefill, shape, 8).is_ok());
+        assert!(check_step(family, shape, 8).is_ok());
         shape.hidden = carry(3);
         assert!(matches!(
-            check_step(family, Phase::Prefill, shape, 8),
+            check_step(family, shape, 8),
             Err(TraceError::ShapeUnsupported {
                 reason: ShapeReason::HiddenCarryNarrow {
                     positions: 3,
@@ -1780,7 +1777,7 @@ mod tests {
             })
         ));
         shape.hidden = carry(4);
-        assert!(check_step(family, Phase::Prefill, shape, 8).is_ok());
+        assert!(check_step(family, shape, 8).is_ok());
     }
 
     /// SC-001: the post-norm placement with a residual scale against its f64 definition
@@ -1867,14 +1864,12 @@ mod tests {
         let run = |params: StackParams| {
             let map = fx.map();
             let sw = StackWeights::new(&map, vocab, w).unwrap();
-            let shape = StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::new(t).unwrap(),
-                capacity: NonZeroUsize::new(8).unwrap(),
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::All,
-                hidden: None,
-            };
+            let shape = StepShape::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::new(t).unwrap(),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .with_logits(LogitRows::All);
             let b = Builder::for_tests();
             let step = Step::new(&b, shape).unwrap();
             let out = standard_stack(&b, &step, &sw, &params, 1, |_, _, x| Ok(x)).unwrap();
@@ -2133,14 +2128,12 @@ mod tests {
                 .unwrap()
                 .with_embed_norm(&map, w)
                 .unwrap();
-            let shape = StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::new(t).unwrap(),
-                capacity: NonZeroUsize::new(8).unwrap(),
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::All,
-                hidden: None,
-            };
+            let shape = StepShape::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::new(t).unwrap(),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .with_logits(LogitRows::All);
             let b = Builder::for_tests();
             let step = Step::new(&b, shape).unwrap();
             let params = StackParams::new(NormParams::of(NormKind::Layer, eps).unwrap());

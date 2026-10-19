@@ -148,7 +148,9 @@ lists transformations that changed the graph.
 Canonicalization preserves the primitive computation's rounding and arithmetic order. General scalar
 factoring across a contraction and replacing reciprocal multiplication with division are declined
 without an exact proof. `Program::numerical_declines()` reports the original candidate value and a
-typed reason; the graph remains compilable through its original operations. F32 multiplication by
+typed reason; the graph remains compilable through its original operations. `Program::declines()` reports
+the attention and RoPE chains the fusion matchers left alone: for a chain that nearly matched, it names the
+value and the first check that failed, and the graph keeps its original operations. F32 multiplication by
 one on a contraction operand is a proved identity that canonicalization can remove.
 
 Attention with an already-scaled query can still select a flash region: the scaled query remains a

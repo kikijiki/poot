@@ -26,7 +26,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_graph_ir::analysis::Tier2Class;
+use poot_graph_ir::analysis::{NumericsProperty, Tier2Class};
 use poot_graph_ir::{BoundaryId, Graph, TensorType, ValueId};
 use poot_quant::weights::{WeightId, WeightMap};
 use poot_target::BufferStorage;
@@ -211,6 +211,9 @@ pub struct StagedProgram {
     footprints: Vec<(DeviceId, ByteCategories)>,
     sync_points: Vec<SyncPoint>,
     tensor: Option<TensorParallel>,
+    /// What the transforms that cut the graph into stages (the tensor-parallel shard, the expert pool) did
+    /// to its arithmetic, which no stage's own program sees.
+    transform: NumericsProperty,
 }
 
 impl StagedProgram {
@@ -224,18 +227,21 @@ impl StagedProgram {
             footprints: Vec::new(),
             sync_points: Vec::new(),
             tensor: None,
+            transform: NumericsProperty::Exact,
         }
     }
 
-    /// The tier-2 comparison class this staged program publishes: the loosest class among its stages, since
-    /// the output a caller reads is the product of all of them. An output compared within this class's
-    /// [`Tier2Class::tolerance`] is within every stage's own.
+    /// The tier-2 comparison class this staged program publishes: the loosest of its stages' classes and of
+    /// the class of the transforms that cut it (a tensor-parallel shard sums the ranks' partials in a
+    /// different order than one device does), since the output a caller reads is the product of all of
+    /// them. An output compared within this class's [`Tier2Class::tolerance`] is within every stage's own.
     pub fn numerics_class(&self) -> Tier2Class {
         self.stages
             .iter()
             .map(|(_, _, program)| program.numerics_class())
             .max()
             .unwrap_or(Tier2Class::BitExact)
+            .max(self.transform.tier2_class())
     }
 
     /// Every stage with its device and program, in stage order.
@@ -267,6 +273,7 @@ impl StagedProgram {
             footprints: Vec::new(),
             sync_points: parts.sync_points,
             tensor: None,
+            transform: NumericsProperty::Exact,
         }
     }
 
@@ -470,6 +477,7 @@ pub fn compile_staged(
             let sharded = shard(&adapted, weights, *rule, world)?;
             devices::admit_collectives(&sharded, &placement)?;
             let ranked = expand_ranks(&sharded)?;
+            let numerics = sharded.numerics();
             let rank_devices = placement.stages.clone();
             placement.stages = ranked
                 .stage_ranks
@@ -483,6 +491,7 @@ pub fn compile_staged(
             let placed = pool::Placed {
                 graph: Cow::Owned(ranked.graph),
                 sites: Vec::new(),
+                numerics,
             };
             (placed, Some(tensor), Some(ranked.cuts))
         }
@@ -492,6 +501,7 @@ pub fn compile_staged(
             None,
         ),
     };
+    let transform = placed.numerics;
     let adapted = placed.graph;
 
     let uncut = match &rank_cuts {
@@ -505,6 +515,7 @@ pub fn compile_staged(
             only.device,
         );
         program.tensor = tensor;
+        program.transform = transform;
         return Ok(program);
     }
 
@@ -659,6 +670,7 @@ pub fn compile_staged(
         footprints,
         sync_points,
         tensor,
+        transform,
     })
 }
 

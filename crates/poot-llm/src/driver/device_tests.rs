@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileOptions, production_plan::Submission};
+use poot_graph_plan::CompileOptions;
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
@@ -18,12 +18,12 @@ use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
 
 use crate::GenerationControl;
 use crate::core::sampler::Sampler;
+use crate::driver::caps::PrepareRefused;
 use crate::driver::error::{DriverError, InvalidRequest};
-use crate::driver::step::PickPolicy;
 use crate::driver::{
     AdapterRef, Admission, BackendChoice, Driver, DriverOptions, GenerateRequest, Head, Layout,
     ModelHandle, PoolShape, PrefixOutcome, PrefixSkip, PreparedSetLimits, Release, RowWork, SeqId,
-    SeqRequest, ServingShapes, StepRow, Warm, open_executor,
+    SeqRequest, Serving, ServingShapes, State, StepRow, Warm, open_executor,
 };
 use poot_text::{ChatTemplate, TextCodec};
 
@@ -159,7 +159,7 @@ fn handle_with(weights: Weights, eos: u32, chat_template: ChatTemplate) -> Arc<M
 }
 
 pub(super) fn options(chunk: usize, capacity: usize) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let compile = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -187,7 +187,8 @@ pub(super) fn open(choice: BackendChoice) -> Option<Box<dyn poot_executor::Execu
     poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
 }
 
-fn driver(
+/// A driver nothing has prepared, for rows that encode, prepare their own shapes or time phases.
+fn bare_driver(
     choice: BackendChoice,
     handle: &Arc<ModelHandle>,
     chunk: usize,
@@ -197,6 +198,17 @@ fn driver(
     Some(Driver::new(Arc::clone(handle), executor, options(chunk, capacity)).unwrap())
 }
 
+/// A driver serving the contiguous layout with nothing prepared: `generate` prepares what its request
+/// needs.
+fn driver(
+    choice: BackendChoice,
+    handle: &Arc<ModelHandle>,
+    chunk: usize,
+    capacity: usize,
+) -> Option<Driver<Serving>> {
+    Some(bare_driver(choice, handle, chunk, capacity)?.serve(Layout::Contiguous))
+}
+
 /// A driver with the token-row encode shapes prepared: four rows, every length up to `capacity`.
 fn token_encoder(
     choice: BackendChoice,
@@ -204,7 +216,7 @@ fn token_encoder(
     chunk: usize,
     capacity: usize,
 ) -> Option<Driver> {
-    let mut driver = driver(choice, handle, chunk, capacity)?;
+    let mut driver = bare_driver(choice, handle, chunk, capacity)?;
     driver
         .prepare_encode(&crate::driver::EncodeShapes {
             rows: nz(4),
@@ -215,7 +227,7 @@ fn token_encoder(
 }
 
 pub(super) fn generate(
-    driver: &mut Driver,
+    driver: &mut Driver<Serving>,
     prompt: &[u32],
     max_new: usize,
     sampler: Sampler,
@@ -237,7 +249,11 @@ pub(super) fn generate(
 
 /// `max_new` greedy tokens and the log-probability the head gave each chosen token: a host-path
 /// request, so the head's output row is read back, not just its argmax.
-fn generate_traced(driver: &mut Driver, prompt: &[u32], max_new: usize) -> (Vec<u32>, Vec<f32>) {
+fn generate_traced(
+    driver: &mut Driver<Serving>,
+    prompt: &[u32],
+    max_new: usize,
+) -> (Vec<u32>, Vec<f32>) {
     let generated = driver
         .generate(
             GenerateRequest {
@@ -260,8 +276,8 @@ fn generate_traced(driver: &mut Driver, prompt: &[u32], max_new: usize) -> (Vec<
 /// constant token sequence cannot pass on the tokens alone, so the log-probabilities carry the claim.
 fn assert_same_trace(
     label: &str,
-    packed: &mut Driver,
-    twin: &mut Driver,
+    packed: &mut Driver<Serving>,
+    twin: &mut Driver<Serving>,
     prompt: &[u32],
     n: usize,
 ) {
@@ -715,7 +731,7 @@ fn chunked_prefill_equals_token_by_token(choice: BackendChoice) {
         2,
         "the 7-token prompt plans 3 + 3 + 1: prefill 3, and the one-token step the tail and decode share"
     );
-    let uploads = |driver: &Driver| {
+    let uploads = |driver: &Driver<Serving>| {
         driver
             .executor_stats()
             .memory
@@ -1260,7 +1276,8 @@ fn pooled_mixtral_decodes_the_recorded_tokens_with_evictions(choice: BackendChoi
     let mut driver = Driver::new(handle, executor, options(8, CAPACITY))
         .unwrap()
         .with_expert_pool(nz(MIXTRAL_POOL_ROWS))
-        .unwrap();
+        .unwrap()
+        .serve(Layout::Contiguous);
     let got = generate(&mut driver, recorded.prompt, 24, Sampler::greedy());
     assert_eq!(got, recorded.tokens, "pooled Mixtral on {choice:?}");
     let counters = driver.stats().residency;
@@ -1300,18 +1317,22 @@ fn pooled_mixtral_interleaves_chunks_prompts_and_resets(choice: BackendChoice) {
     let Some(pooled_executor) = open(choice) else {
         return;
     };
-    let mut plain = Driver::new(Arc::clone(&handle), plain_executor, options(8, CAPACITY)).unwrap();
+    let mut plain = Driver::new(Arc::clone(&handle), plain_executor, options(8, CAPACITY))
+        .unwrap()
+        .serve(Layout::Contiguous);
     let mut pooled = Driver::new(handle, pooled_executor, options(8, CAPACITY))
         .unwrap()
         .with_expert_pool(nz(MIXTRAL_POOL_ROWS))
-        .unwrap();
+        .unwrap()
+        .serve(Layout::Contiguous);
     let long: Vec<u32> = (0..20).map(|i| PROMPT[i % PROMPT.len()]).collect();
     let short: Vec<u32> = PROMPT.to_vec();
-    let round = |label: &str, prompt: &[u32], pooled: &mut Driver, plain: &mut Driver| {
-        let want = generate(plain, prompt, 6, Sampler::greedy());
-        let got = generate(pooled, prompt, 6, Sampler::greedy());
-        assert_eq!(got, want, "{label} on {choice:?}");
-    };
+    let round =
+        |label: &str, prompt: &[u32], pooled: &mut Driver<Serving>, plain: &mut Driver<Serving>| {
+            let want = generate(plain, prompt, 6, Sampler::greedy());
+            let got = generate(pooled, prompt, 6, Sampler::greedy());
+            assert_eq!(got, want, "{label} on {choice:?}");
+        };
     round("long prompt", &long, &mut pooled, &mut plain);
     round("short prompt", &short, &mut pooled, &mut plain);
     round("long prompt again", &long, &mut pooled, &mut plain);
@@ -1350,17 +1371,15 @@ fn oversized_chunk_driver(executor: Box<dyn poot_executor::Executor>, family: &s
 }
 
 /// Admit every prompt piece of the contiguous layout: the full chunk first.
-fn prepare_admitted(driver: &mut Driver) -> Result<(), DriverError> {
-    driver
-        .prepare(&ServingShapes {
-            layout: Layout::Contiguous,
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
-        .map(|_| ())
+fn prepare_admitted(driver: Driver) -> Result<Driver<Serving>, Box<PrepareRefused>> {
+    driver.prepare(&ServingShapes {
+        layout: Layout::Contiguous,
+        rows: &[NonZeroUsize::MIN],
+        heads: &[Head::GREEDY],
+        warm: Warm::Admitted,
+        windows: &[],
+        adapters: &[],
+    })
 }
 
 /// The refusal `family`'s trace gives for the oversized chunk, as the driver returns it.
@@ -1389,9 +1408,9 @@ fn a_refused_shape_is_typed_before_any_dispatch(choice: BackendChoice) {
     let Some(executor) = open(choice) else {
         return;
     };
-    let mut driver = oversized_chunk_driver(executor, "granite");
-    let error = prepare_admitted(&mut driver).unwrap_err();
-    assert_refused_by_the_trace(&error, "granite");
+    let refused = prepare_admitted(oversized_chunk_driver(executor, "granite")).unwrap_err();
+    assert_refused_by_the_trace(&refused.error, "granite");
+    let driver = refused.driver;
     assert_eq!(driver.stats().compiles, 0, "nothing compiled");
     assert_eq!(driver.stats().entries_added, 0, "nothing added");
     let executor = driver.executor_stats();
@@ -1420,13 +1439,13 @@ fn an_unsupported_request_is_the_same_variant_for_two_families(choice: BackendCh
     let Some(second) = open(choice) else {
         return;
     };
-    let mut drivers = [
+    let drivers = [
         ("granite", oversized_chunk_driver(first, "granite")),
         ("bloom", oversized_chunk_driver(second, "bloom")),
     ];
-    for (family, driver) in &mut drivers {
-        let error = prepare_admitted(driver).unwrap_err();
-        assert_refused_by_the_trace(&error, family);
+    for (family, driver) in drivers {
+        let refused = prepare_admitted(driver).unwrap_err();
+        assert_refused_by_the_trace(&refused.error, family);
     }
 }
 per_backend!(
@@ -2181,25 +2200,30 @@ fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice)
     let Some(first) = open(choice) else {
         return;
     };
-    let mut fp8_driver = Driver::new(Arc::clone(&fp8), first, options(8, CAPACITY)).unwrap();
+    let mut fp8_driver = Driver::new(Arc::clone(&fp8), first, options(8, CAPACITY))
+        .unwrap()
+        .serve(Layout::Contiguous);
     let mut dense_driver = Driver::new(
         Arc::clone(&dense),
         open(choice).unwrap(),
         options(8, CAPACITY),
     )
-    .unwrap();
+    .unwrap()
+    .serve(Layout::Contiguous);
     let mut granite_driver = Driver::new(
         Arc::clone(&granite),
         open(choice).unwrap(),
         options(8, CAPACITY),
     )
-    .unwrap();
+    .unwrap()
+    .serve(Layout::Contiguous);
     let mut granite_twin_driver = Driver::new(
         Arc::clone(&granite_twin),
         open(choice).unwrap(),
         options(8, CAPACITY),
     )
-    .unwrap();
+    .unwrap()
+    .serve(Layout::Contiguous);
     let got = generate(&mut fp8_driver, &PROMPT, 16, Sampler::greedy());
     let want = generate(&mut dense_driver, &PROMPT, 16, Sampler::greedy());
     assert_eq!(
@@ -2316,24 +2340,28 @@ fn packed_gguf_generates_like_its_dense_twin(
     }
     let long: [u32; 7] = [0, 3, 1, 2, 5, 7, 4];
     let short: [u32; 3] = [6, 1, 2];
-    let mut drivers = drivers.iter_mut();
+    let mut drivers = drivers.into_iter();
     for case in &cases {
         let (packed, twin, paged) = (
             drivers.next().unwrap(),
             drivers.next().unwrap(),
             drivers.next().unwrap(),
         );
-        assert_same_trace(case.arch, packed, twin, &long, 16);
-        let want = generate(twin, &long, 16, Sampler::greedy());
+        let (mut packed, mut twin) = (
+            packed.serve(Layout::Contiguous),
+            twin.serve(Layout::Contiguous),
+        );
+        assert_same_trace(case.arch, &mut packed, &mut twin, &long, 16);
+        let want = generate(&mut twin, &long, 16, Sampler::greedy());
 
         // Two sequences through the paged pool: the batched decode graph.
-        let want_short = generate(twin, &short, 12, Sampler::greedy());
-        prepare_serving(paged, pool_shape(8, 4), &[2], &[Head::GREEDY], &[]);
+        let want_short = generate(&mut twin, &short, 12, Sampler::greedy());
+        let mut paged = prepare_serving(paged, pool_shape(8, 4), &[2], &[Head::GREEDY], &[]);
         let mut lanes = vec![
-            Lane::open(paged, &long, 16, Sampler::greedy()).0,
-            Lane::open(paged, &short, 12, Sampler::greedy()).0,
+            Lane::open(&mut paged, &long, 16, Sampler::greedy()).0,
+            Lane::open(&mut paged, &short, 12, Sampler::greedy()).0,
         ];
-        run_to_end(paged, &mut lanes);
+        run_to_end(&mut paged, &mut lanes);
         assert_eq!(lanes[0].out, want, "{}: long lane", case.arch);
         assert_eq!(lanes[1].out, want_short, "{}: short lane", case.arch);
         for lane in &lanes {
@@ -2415,15 +2443,19 @@ mod checkpoint {
         let Some(first) = open(choice) else {
             return;
         };
-        let mut drivers =
-            vec![Driver::new(Arc::clone(&handle), first, options(chunks[0], 64)).unwrap()];
+        let mut drivers = vec![
+            Driver::new(Arc::clone(&handle), first, options(chunks[0], 64))
+                .unwrap()
+                .serve(Layout::Contiguous),
+        ];
         drivers.push(
             Driver::new(
                 Arc::clone(&handle),
                 open(choice).unwrap(),
                 options(chunks[1], 64),
             )
-            .unwrap(),
+            .unwrap()
+            .serve(Layout::Contiguous),
         );
         for (chunk, driver) in chunks.iter().zip(&mut drivers) {
             let got = generate(driver, prompt, 24, Sampler::greedy());
@@ -2438,7 +2470,9 @@ mod checkpoint {
         let Some(executor) = open(choice) else {
             return;
         };
-        let mut driver = Driver::new(Arc::clone(&handle), executor, options(8, 64)).unwrap();
+        let mut driver = Driver::new(Arc::clone(&handle), executor, options(8, 64))
+            .unwrap()
+            .serve(Layout::Contiguous);
         let prompt = "The capital of France is";
         let ids = handle.text().encode(prompt).unwrap();
         let tokens = generate(&mut driver, &ids, 10, Sampler::greedy());
@@ -2464,14 +2498,19 @@ mod checkpoint {
         let Some(first) = open(choice) else {
             return;
         };
-        let mut drivers = vec![Driver::new(Arc::clone(&handle), first, options(8, exact)).unwrap()];
+        let mut drivers = vec![
+            Driver::new(Arc::clone(&handle), first, options(8, exact))
+                .unwrap()
+                .serve(Layout::Contiguous),
+        ];
         drivers.push(
             Driver::new(
                 Arc::clone(&handle),
                 open(choice).unwrap(),
                 options(8, 10 * exact),
             )
-            .unwrap(),
+            .unwrap()
+            .serve(Layout::Contiguous),
         );
         let runs: Vec<Vec<u32>> = drivers
             .iter_mut()
@@ -2499,7 +2538,7 @@ mod checkpoint {
             return;
         };
         let mut second = open_driver(&handle, choice).unwrap();
-        let draw = |driver: &mut Driver, seed: u64| {
+        let draw = |driver: &mut Driver<Serving>, seed: u64| {
             generate(driver, &ids, 16, Sampler::new(0.8, 40, 1.0, seed))
         };
         let a = draw(&mut first, 7);
@@ -2524,7 +2563,9 @@ mod checkpoint {
         let Some(executor) = open(choice) else {
             return;
         };
-        let mut driver = Driver::new(Arc::clone(&handle), executor, options(8, 64)).unwrap();
+        let mut driver = Driver::new(Arc::clone(&handle), executor, options(8, 64))
+            .unwrap()
+            .serve(Layout::Contiguous);
         let prompt = "The capital of France is";
         let ids = handle.text().encode(prompt).unwrap();
         let tokens = generate(&mut driver, &ids, 8, Sampler::greedy());
@@ -2538,9 +2579,13 @@ mod checkpoint {
 
     /// A [`Driver`] over `handle` on `choice` with room for a long prompt, or `None` after a reported
     /// skip (the device does not open).
-    fn open_driver(handle: &Arc<ModelHandle>, choice: BackendChoice) -> Option<Driver> {
+    fn open_driver(handle: &Arc<ModelHandle>, choice: BackendChoice) -> Option<Driver<Serving>> {
         let executor = open(choice)?;
-        Some(Driver::new(Arc::clone(handle), executor, options(8, 128)).unwrap())
+        Some(
+            Driver::new(Arc::clone(handle), executor, options(8, 128))
+                .unwrap()
+                .serve(Layout::Contiguous),
+        )
     }
 
     const CAPITAL: &str = "The capital of France is";
@@ -2928,7 +2973,9 @@ mod checkpoint {
         let executor = open(choice)?;
         let mut limits = options(8, capacity);
         limits.prepared.max_retained_bytes = NonZeroU64::new(1 << 38).unwrap();
-        let mut driver = Driver::new(Arc::clone(&handle), executor, limits).unwrap();
+        let mut driver = Driver::new(Arc::clone(&handle), executor, limits)
+            .unwrap()
+            .serve(Layout::Contiguous);
         let generated = driver
             .generate(
                 GenerateRequest {
@@ -3325,14 +3372,19 @@ fn pool_shape(blocks: usize, max_seqs: usize) -> PoolShape {
     }
 }
 
+/// A contiguous-layout driver generating one sequence alone, the reference the batched rows equal.
+fn solo_driver(choice: BackendChoice, handle: &Arc<ModelHandle>) -> Option<Driver<Serving>> {
+    Some(serving_driver(choice, handle)?.serve(Layout::Contiguous))
+}
+
 /// Prepare the serving shapes the rows draw from.
 fn prepare_serving(
-    driver: &mut Driver,
+    driver: Driver,
     pool: PoolShape,
     rows: &[usize],
     heads: &[Head],
     windows: &[usize],
-) {
+) -> Driver<Serving> {
     let rows: Vec<_> = rows.iter().map(|&r| nz(r)).collect();
     let windows: Vec<_> = windows.iter().map(|&w| nz(w)).collect();
     driver
@@ -3344,7 +3396,7 @@ fn prepare_serving(
             windows: &windows,
             adapters: &[],
         })
-        .unwrap();
+        .unwrap()
 }
 
 /// One sequence a row drives to completion through the serving surface.
@@ -3359,41 +3411,33 @@ struct Lane {
 
 impl Lane {
     fn open(
-        driver: &mut Driver,
+        driver: &mut Driver<Serving>,
         prompt: &[u32],
         max_new: usize,
         sampler: Sampler,
     ) -> (Self, usize) {
-        Self::open_with(driver, prompt, max_new, sampler, None)
+        Self::open_with(driver, prompt, max_new, sampler, RequestInputs::none())
     }
 
     /// A lane whose prompt carries embedding rows in place of some tokens' embeddings.
     fn open_embeds(
-        driver: &mut Driver,
+        driver: &mut Driver<Serving>,
         prompt: &[u32],
-        embeds: PromptEmbeds,
+        embeds: RequestInputs,
         max_new: usize,
     ) -> (Self, usize) {
-        Self::open_with(driver, prompt, max_new, Sampler::greedy(), Some(embeds))
+        Self::open_with(driver, prompt, max_new, Sampler::greedy(), embeds)
     }
 
     fn open_with(
-        driver: &mut Driver,
+        driver: &mut Driver<Serving>,
         prompt: &[u32],
         max_new: usize,
         sampler: Sampler,
-        embeds: Option<PromptEmbeds>,
+        inputs: RequestInputs,
     ) -> (Self, usize) {
-        let request = SeqRequest {
-            prompt,
-            max_new,
-            adapter: AdapterRef::Base,
-        };
-        let admission = match embeds {
-            Some(embeds) => driver.open_with_embeds(request, embeds),
-            None => driver.open(request),
-        }
-        .unwrap();
+        let request = SeqRequest::new(prompt, max_new, AdapterRef::Base).with_inputs(inputs);
+        let admission = driver.open(request).unwrap();
         let Admission::Opened { seq, reused } = admission else {
             panic!("no room: {admission:?}");
         };
@@ -3418,17 +3462,14 @@ impl Lane {
                 upto: self.prompt.len(),
             }
         } else {
-            RowWork::Decode {
-                ahead: &[],
-                pick: PickPolicy::Greedy,
-            }
+            RowWork::Decode { ahead: &[] }
         }
     }
 }
 
 /// One step over `lanes[active]`, committing every token it returns. Returns whether the step mixed a
 /// prefilling row with at least two decoding rows.
-fn step_lanes(driver: &mut Driver, lanes: &mut [Lane], active: &[usize]) -> bool {
+fn step_lanes(driver: &mut Driver<Serving>, lanes: &mut [Lane], active: &[usize]) -> bool {
     let mut rows: Vec<StepRow<'_>> = lanes
         .iter_mut()
         .enumerate()
@@ -3457,7 +3498,7 @@ fn step_lanes(driver: &mut Driver, lanes: &mut [Lane], active: &[usize]) -> bool
 }
 
 /// Run every lane to its `max_new` tokens, one step per round over the unfinished ones.
-fn run_to_end(driver: &mut Driver, lanes: &mut [Lane]) {
+fn run_to_end(driver: &mut Driver<Serving>, lanes: &mut [Lane]) {
     while lanes.iter().any(|l| !l.done()) {
         let active: Vec<usize> = (0..lanes.len()).filter(|&i| !lanes[i].done()).collect();
         step_lanes(driver, lanes, &active);
@@ -3483,11 +3524,11 @@ fn mixed_step_matches_generate_of(
     handle: Arc<ModelHandle>,
     recorded: Option<&[Vec<u32>; 3]>,
 ) {
-    let Some(mut driver) = serving_driver(choice, &handle) else {
+    let Some(driver) = serving_driver(choice, &handle) else {
         return;
     };
     // The reference is the contiguous single row; both executors open before either runs.
-    let Some(mut reference) = serving_driver(choice, &handle) else {
+    let Some(mut reference) = solo_driver(choice, &handle) else {
         return;
     };
     let prompts: [&[u32]; 3] = [&LONG, &MEDIUM, &SHORT];
@@ -3501,7 +3542,7 @@ fn mixed_step_matches_generate_of(
             "{family}: the solo runs equal the recorded tokens"
         );
     }
-    prepare_serving(&mut driver, pool_shape(8, 4), &[3], &[Head::GREEDY], &[]);
+    let mut driver = prepare_serving(driver, pool_shape(8, 4), &[3], &[Head::GREEDY], &[]);
     let mut lanes: Vec<Lane> = prompts
         .iter()
         .map(|p| Lane::open(&mut driver, p, SERVING_MAX_NEW, Sampler::greedy()).0)
@@ -3623,21 +3664,22 @@ fn mixed_step_nemotron_h(choice: BackendChoice) {
 /// reset `StateScope::All` there; `second`'s state is zeroed mid-sequence and it diverges.
 fn readmit_matches_generate(choice: BackendChoice, family: &str) {
     let handle = recurrent_family_handle(family);
-    let Some(mut driver) = serving_driver(choice, &handle) else {
+    let Some(driver) = serving_driver(choice, &handle) else {
         return;
     };
-    let Some(mut reference) = serving_driver(choice, &handle) else {
+    let Some(mut reference) = solo_driver(choice, &handle) else {
         return;
     };
     let (long_prompt, short_prompt, third_prompt): (&[u32], &[u32], &[u32]) =
         (&LONG, &MEDIUM, &SHORT);
     let short_new = 3;
-    let solo =
-        |driver: &mut Driver, prompt: &[u32], new| generate(driver, prompt, new, Sampler::greedy());
+    let solo = |driver: &mut Driver<Serving>, prompt: &[u32], new| {
+        generate(driver, prompt, new, Sampler::greedy())
+    };
     let want_long = solo(&mut reference, long_prompt, SERVING_MAX_NEW);
     let want_short = solo(&mut reference, short_prompt, short_new);
     let want_third = solo(&mut reference, third_prompt, SERVING_MAX_NEW);
-    prepare_serving(&mut driver, pool_shape(8, 2), &[2], &[Head::GREEDY], &[]);
+    let mut driver = prepare_serving(driver, pool_shape(8, 2), &[2], &[Head::GREEDY], &[]);
     // The long sequence takes slot 0 and the short one slot 1: the slot that is recycled is not the
     // first, so the row a re-admission zeroes is not the row (or the KV pool position) 0.
     let mut lanes = vec![
@@ -3708,11 +3750,11 @@ fn shared_prompts() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 /// tokens differ.
 fn prefix_reuse_hits_and_matches_the_unshared_run(choice: BackendChoice) {
     let handle = family_handle("qwen2", NO_EOS);
-    let Some(mut driver) = serving_driver(choice, &handle) else {
+    let Some(driver) = serving_driver(choice, &handle) else {
         return;
     };
     // The reference is the contiguous single row; both executors open before either runs.
-    let Some(mut reference) = serving_driver(choice, &handle) else {
+    let Some(mut reference) = solo_driver(choice, &handle) else {
         return;
     };
     let (a, b, c) = shared_prompts();
@@ -3721,8 +3763,8 @@ fn prefix_reuse_hits_and_matches_the_unshared_run(choice: BackendChoice) {
         generate(&mut reference, &b, 4, Sampler::greedy()),
     );
     // Six blocks: A (39 positions) takes three, C (54) takes four of what remains.
-    prepare_serving(&mut driver, pool_shape(6, 2), &[1], &[Head::GREEDY], &[]);
-    let run = |driver: &mut Driver, prompt: &[u32]| {
+    let mut driver = prepare_serving(driver, pool_shape(6, 2), &[1], &[Head::GREEDY], &[]);
+    let run = |driver: &mut Driver<Serving>, prompt: &[u32]| {
         let (lane, reused) = Lane::open(driver, prompt, 4, Sampler::greedy());
         let mut lanes = [lane];
         run_to_end(driver, &mut lanes);
@@ -3763,15 +3805,15 @@ per_backend!(
 /// following tokens diverge.
 fn commit_keeps_fewer_than_returned(choice: BackendChoice) {
     let handle = family_handle("qwen2", NO_EOS);
-    let Some(mut driver) = serving_driver(choice, &handle) else {
+    let Some(driver) = serving_driver(choice, &handle) else {
         return;
     };
     // The reference is the contiguous single row; both executors open before either runs.
-    let Some(mut reference) = serving_driver(choice, &handle) else {
+    let Some(mut reference) = solo_driver(choice, &handle) else {
         return;
     };
     let want = generate(&mut reference, &MEDIUM, 8, Sampler::greedy());
-    prepare_serving(&mut driver, pool_shape(4, 1), &[1], &[Head::GREEDY], &[2]);
+    let mut driver = prepare_serving(driver, pool_shape(4, 1), &[1], &[Head::GREEDY], &[2]);
     let (lane, _) = Lane::open(&mut driver, &MEDIUM, 8, Sampler::greedy());
     let mut lanes = [lane];
     while lanes[0].out.is_empty() {
@@ -3779,13 +3821,10 @@ fn commit_keeps_fewer_than_returned(choice: BackendChoice) {
     }
     assert_eq!(lanes[0].out, want[..1]);
     let seq = lanes[0].seq;
-    let window = |driver: &mut Driver, lane: &mut Lane, ahead: &[u32]| {
+    let window = |driver: &mut Driver<Serving>, lane: &mut Lane, ahead: &[u32]| {
         let mut rows = [StepRow {
             seq,
-            work: RowWork::Decode {
-                ahead,
-                pick: PickPolicy::Greedy,
-            },
+            work: RowWork::Decode { ahead },
             sampler: &mut lane.sampler,
         }];
         driver.step(&mut rows).unwrap().remove(0).tokens
@@ -3835,11 +3874,11 @@ per_backend!(
 /// is the unmasked argmax and diverges.
 fn a_guided_row_takes_the_whole_step_to_the_logits_entry(choice: BackendChoice) {
     let handle = family_handle("qwen2", NO_EOS);
-    let Some(mut driver) = serving_driver(choice, &handle) else {
+    let Some(driver) = serving_driver(choice, &handle) else {
         return;
     };
     // The reference is the contiguous single row; both executors open before either runs.
-    let Some(mut reference) = serving_driver(choice, &handle) else {
+    let Some(mut reference) = solo_driver(choice, &handle) else {
         return;
     };
     let guided = |sampler: Sampler| {
@@ -3862,8 +3901,8 @@ fn a_guided_row_takes_the_whole_step_to_the_logits_entry(choice: BackendChoice) 
         generate(&mut reference, &SHORT, SERVING_MAX_NEW, Sampler::greedy()),
         "the mask changes the guided row's tokens, so a plain suffix cannot match"
     );
-    prepare_serving(
-        &mut driver,
+    let mut driver = prepare_serving(
+        driver,
         pool_shape(8, 2),
         &[2],
         &[Head::GREEDY, Head::Logits],
@@ -4290,7 +4329,7 @@ per_backend!(
 const GLM53_FLASH_REFERENCE_MTP_LOGITS: &str =
     include_str!("device_tests/glm53_flash_reference_mtp_logits.txt");
 
-/// POOT-1110: the `Phase::Mtp` program of the GLM-5.3-Flash fixture executes on the device through the
+/// POOT-1110: the `draft` program of the GLM-5.3-Flash fixture executes on the device through the
 /// executor contract (compile, load, add entry, step; no driver role) over the carry the target's own
 /// prefill wrote into the executable's shared state. The target prefills six tokens with a hidden-state
 /// carry; the MTP layer then catches up over all six positions with the token that follows each (the
@@ -4308,7 +4347,8 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
         staged::compile_staged,
     };
     use poot_models::components::standard::HIDDEN_CARRY_STATE;
-    use poot_models::model::{HiddenCarry, KvLayout, LogitRows, Phase, StepShape};
+    use poot_models::io::ProgramId;
+    use poot_models::model::{HiddenCarry, StepShape, StepSpec};
     use poot_tensor::HostView;
 
     const PREFIX: [i32; 6] = [3, 17, 40, 8, 25, 9];
@@ -4331,14 +4371,7 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
     let carry = HiddenCarry {
         positions: nz((K + 1).max(PREFIX.len())),
     };
-    let shape = |tokens: usize| StepShape {
-        rows: nz(1),
-        tokens: nz(tokens),
-        capacity: nz(16),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: Some(carry),
-    };
+    let shape = |tokens: usize| StepShape::new(nz(1), nz(tokens), nz(16)).with_hidden(Some(carry));
     let formats = WeightFormats::from_weight_map(model.weights());
     let exe = exec
         .load_weights(
@@ -4347,11 +4380,10 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
         )
         .unwrap();
     // One entry per program, all on the one executable: the carry is shared by its name and aval.
-    let mut entry = |phase: Phase, tokens: usize| {
+    let mut entry = |program: ProgramId, tokens: usize| {
         let graph = model
             .trace(
-                phase,
-                shape(tokens),
+                &StepSpec::new(program, shape(tokens)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -4359,7 +4391,7 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
             graph
                 .state()
                 .any(|(input, _)| graph.meta(input).name.as_deref() == Some(HIDDEN_CARRY_STATE)),
-            "{phase:?} at {tokens} tokens declares the carry"
+            "{program} at {tokens} tokens declares the carry"
         );
         let graph = bind_packed_weights(&graph, &formats).unwrap();
         let program = compile_staged(
@@ -4369,14 +4401,14 @@ fn glm53_flash_mtp_chain_matches_the_reference(choice: BackendChoice) {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
-        .unwrap_or_else(|e| panic!("{phase:?} at {tokens} tokens on {choice:?}: {e}"));
+        .unwrap_or_else(|e| panic!("{program} at {tokens} tokens on {choice:?}: {e}"));
         exec.add_entry(exe, &program).unwrap()
     };
-    let prefill = entry(Phase::Prefill, PREFIX.len());
-    let catch_up = entry(Phase::Mtp, PREFIX.len());
-    let chain = entry(Phase::Mtp, 1);
+    let prefill = entry(ProgramId::STEP, PREFIX.len());
+    let catch_up = entry(ProgramId::DRAFT, PREFIX.len());
+    let chain = entry(ProgramId::DRAFT, 1);
 
     let mut run = |entry, tokens: &[i32], start: i32| -> Vec<f32> {
         let shape = [1, tokens.len()];
@@ -4488,29 +4520,25 @@ per_backend!(
 // oracle on the same traced graph.
 // ---------------------------------------------------------------------------------------------
 
-/// The oracle's last-position logits after each step of `steps` (phase, first position, length) over
+/// The oracle's last-position logits after each step of `steps` (first position, length) over
 /// `tokens`, on `handle`'s model, its own traced graph (a cache of `capacity` positions) and weight
 /// map; the carried state flows from step to step. One row per step.
 fn oracle_step_logits(
     handle: &ModelHandle,
     tokens: &[u32],
-    steps: &[(Phase, usize, usize)],
+    steps: &[(usize, usize)],
     capacity: usize,
 ) -> Vec<Vec<f64>> {
     let model = handle.model();
     let mut state: Vec<poot_tensor::HostTensor> = Vec::new();
     let mut rows = Vec::new();
-    for &(phase, start, len) in steps {
-        let shape = StepShape {
-            rows: nz(1),
-            tokens: nz(len),
-            capacity: nz(capacity),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::Last,
-            hidden: None,
-        };
+    for &(start, len) in steps {
+        let shape = StepShape::new(nz(1), nz(len), nz(capacity));
         let graph = model
-            .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+            .trace(
+                &StepSpec::step(shape),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
         let graph = poot_graph_plan::bind_packed_weights(&graph, &formats).unwrap();
@@ -4578,10 +4606,10 @@ fn oracle_top5(handle: &ModelHandle, prompt: &[u32], capacity: usize) -> Vec<(u3
     // (none when the prompt is shorter than it) and a decode step for each remaining token.
     let granule = handle.model().config().prefill_granule.get();
     let aligned = n / granule * granule;
-    let steps: Vec<(Phase, usize, usize)> = (aligned > 0)
-        .then_some((Phase::Prefill, 0, aligned))
+    let steps: Vec<(usize, usize)> = (aligned > 0)
+        .then_some((0, aligned))
         .into_iter()
-        .chain((aligned..n).map(|at| (Phase::Decode, at, 1)))
+        .chain((aligned..n).map(|at| (at, 1)))
         .collect();
     let rows = oracle_step_logits(handle, prompt, &steps, capacity);
     let last = rows.last().expect("a prompt has at least one step");
@@ -4683,11 +4711,14 @@ moe_oracle_rows! {
 
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_graph_ir::{Slot, SlotKey};
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::components::embed::EMBEDS;
+use poot_models::io::{InputValue, ProgramId, RequestInputs};
+use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::registry::Fixture;
 use poot_tensor::HostTensor;
 
-use crate::driver::{EncodeRequest, EncodeRow, PromptEmbeds};
+use crate::driver::{EncodeRequest, EncodeRow};
+use crate::encoders::segment_inputs;
 
 /// The model of `family`'s fixture (or its named variant) as a handle, with the fixture's text
 /// services (ids are fed directly).
@@ -4715,16 +4746,19 @@ fn encoder_family_handle(family: &str, variant: Option<&str>) -> (Arc<ModelHandl
     (Arc::new(handle), fixture)
 }
 
-/// The oracle's output of `phase` over `slots`, from the handle's own weights.
+/// The oracle's output of `program` over `slots`, from the handle's own weights.
 fn oracle(
     handle: &ModelHandle,
-    phase: Phase,
+    program: ProgramId,
     shape: StepShape,
     slots: &[(SlotKey, HostTensor)],
 ) -> Vec<f32> {
     let model = handle.model();
     let graph = model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(
+            &StepSpec::new(program, shape),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let state: Vec<HostTensor> = graph
         .state()
@@ -4738,14 +4772,7 @@ fn oracle(
 }
 
 fn encode_shape(rows: usize, tokens: usize) -> StepShape {
-    StepShape {
-        rows: nz(rows),
-        tokens: nz(tokens),
-        capacity: nz(tokens),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
-    }
+    StepShape::new(nz(rows), nz(tokens), nz(tokens)).with_logits(LogitRows::All)
 }
 
 fn named(tag: &str) -> SlotKey {
@@ -4758,7 +4785,7 @@ fn oracle_bert(handle: &ModelHandle, ids: &[i32], types: &[i32]) -> Vec<f32> {
     let ints = |values: &[i32]| HostTensor::i32(vec![1, n], values.to_vec());
     oracle(
         handle,
-        Phase::Encode,
+        ProgramId::ENCODE,
         encode_shape(1, n),
         &[
             (SlotKey::new(Slot::Token, None), ints(ids)),
@@ -4786,12 +4813,49 @@ fn close(label: &str, got: &[f32], want: &[f32]) {
 const ENCODE_SHORT: [u32; 3] = [5, 17, 3];
 const ENCODE_LONG: [u32; 7] = [9, 2, 31, 4, 12, 6, 1];
 
-fn encode(driver: &mut Driver, rows: &[EncodeRow<'_>]) -> crate::driver::Encoded {
+fn encode<S: State>(driver: &mut Driver<S>, rows: &[EncodeRow<'_>]) -> crate::driver::Encoded {
     driver.encode(&EncodeRequest { rows }).unwrap()
 }
 
 fn as_i32(ids: &[u32]) -> Vec<i32> {
     ids.iter().map(|&t| t as i32).collect()
+}
+
+/// The request inputs of one 3x8x8 idefics3 frame: its normalized pixels, channel first.
+fn frame_inputs(pixels: &[f32]) -> RequestInputs {
+    RequestInputs::none().with(
+        poot_models::idefics3::PIXELS,
+        InputValue::Row(HostTensor::f32(vec![3, 8, 8], pixels.to_vec())),
+    )
+}
+
+/// The request input `embeds` of a prompt: `rows` (`positions.len() * width` values, row-major) at the
+/// prompt's `positions`.
+fn embed_inputs(width: usize, positions: Vec<usize>, rows: Vec<f32>) -> RequestInputs {
+    poot_models::components::embed::embeds_inputs(width, positions, rows).unwrap()
+}
+
+/// Greedy generation of `max_new` tokens from `prompt` with the request `inputs`.
+fn generate_inputs(
+    driver: &mut Driver<Serving>,
+    prompt: Vec<u32>,
+    max_new: usize,
+    inputs: RequestInputs,
+) -> Vec<u32> {
+    driver
+        .generate_with_inputs(
+            GenerateRequest {
+                prompt,
+                max_new,
+                sampler: Sampler::greedy(),
+                stops: Vec::new(),
+                ignore_eos: false,
+            },
+            inputs,
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap()
+        .tokens
 }
 
 /// SC-003 (device half): sentence embeddings of the `bert` fixture through `Driver::encode` equal
@@ -4805,26 +4869,16 @@ fn bert_encode_matches_the_oracle_whatever_the_padding(choice: BackendChoice) {
         return;
     };
     let width = 32;
+    let none = RequestInputs::none();
+    let token_row = |ids: &'static [u32]| EncodeRow {
+        tokens: Some(ids),
+        inputs: &none,
+    };
     let batch = encode(
         &mut driver,
-        &[
-            EncodeRow::Tokens {
-                ids: &ENCODE_SHORT,
-                types: &[],
-            },
-            EncodeRow::Tokens {
-                ids: &ENCODE_LONG,
-                types: &[],
-            },
-        ],
+        &[token_row(&ENCODE_SHORT), token_row(&ENCODE_LONG)],
     );
-    let alone = encode(
-        &mut driver,
-        &[EncodeRow::Tokens {
-            ids: &ENCODE_SHORT,
-            types: &[],
-        }],
-    );
+    let alone = encode(&mut driver, &[token_row(&ENCODE_SHORT)]);
     assert_eq!(batch.width, width);
     assert_eq!(batch.rows[0].len(), ENCODE_SHORT.len() * width);
     assert_eq!(batch.rows[1].len(), ENCODE_LONG.len() * width);
@@ -4862,9 +4916,17 @@ fn cross_encoder_scores_pairs_in_the_oracles_order(choice: BackendChoice) {
         (&[9, 2, 31, 4, 12], &[0, 0, 1, 1, 1]),
         (&[1, 6], &[0, 1]),
     ];
+    let segments: Vec<RequestInputs> = pairs
+        .iter()
+        .map(|&(_, types)| segment_inputs(types))
+        .collect();
     let rows: Vec<EncodeRow<'_>> = pairs
         .iter()
-        .map(|&(ids, types)| EncodeRow::Tokens { ids, types })
+        .zip(&segments)
+        .map(|(&(ids, _), inputs)| EncodeRow {
+            tokens: Some(ids),
+            inputs,
+        })
         .collect();
     let encoded = encode(&mut driver, &rows);
     let got: Vec<f32> = encoded.rows.iter().map(|row| row[0]).collect();
@@ -4906,26 +4968,20 @@ fn decoder_encode_matches_the_oracle_and_its_recorded_mean(choice: BackendChoice
         return;
     };
     let ids = [3u32, 17, 40, 8, 25];
+    let none = RequestInputs::none();
     let encoded = encode(
         &mut driver,
-        &[EncodeRow::Tokens {
-            ids: &ids,
-            types: &[],
+        &[EncodeRow {
+            tokens: Some(&ids),
+            inputs: &none,
         }],
     );
     let tokens = HostTensor::i32(vec![1, 5], as_i32(&ids));
     let pos = HostTensor::i32(vec![1, 5], (0..5).collect());
     let want = oracle(
         &handle,
-        Phase::Encode,
-        StepShape {
-            rows: nz(1),
-            tokens: nz(5),
-            capacity: nz(5),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::All,
-            hidden: None,
-        },
+        ProgramId::ENCODE,
+        encode_shape(1, 5),
         &[
             (SlotKey::new(Slot::Token, None), tokens),
             (SlotKey::new(Slot::Pos, None), pos),
@@ -4972,22 +5028,10 @@ fn prompt_embeds_replace_the_tokens_they_stand_for(choice: BackendChoice) {
             .flat_map(|&t| table[t as usize * w..(t as usize + 1) * w].to_vec())
             .collect()
     };
-    let with_embeds = |driver: &mut Driver, prompt: &[u32], positions: Vec<usize>, rows| {
-        driver
-            .generate_with_embeds(
-                GenerateRequest {
-                    prompt: prompt.to_vec(),
-                    max_new: 8,
-                    sampler: Sampler::greedy(),
-                    stops: Vec::new(),
-                    ignore_eos: false,
-                },
-                PromptEmbeds::new(w, positions, rows).unwrap(),
-                &mut |_: u32, _: &str| GenerationControl::Continue(()),
-            )
-            .unwrap()
-            .tokens
-    };
+    let with_embeds =
+        |driver: &mut Driver<Serving>, prompt: &[u32], positions: Vec<usize>, rows| {
+            generate_inputs(driver, prompt.to_vec(), 8, embed_inputs(w, positions, rows))
+        };
     // Placeholders (token 0) at positions 1 and 3, replaced by the rows of tokens 17 and 8.
     let plain = [3, 17, 40, 8, 25, 11, 2];
     let placeholders = [3, 0, 40, 0, 25, 11, 2];
@@ -5024,7 +5068,7 @@ per_backend!(
 /// const again; the second frame reads the first's and the row goes red.
 fn two_frames_of_one_size_embed_differently(choice: BackendChoice) {
     let (handle, _) = encoder_family_handle("idefics3_vision", None);
-    let Some(mut driver) = driver(choice, &handle, 16, 16) else {
+    let Some(mut driver) = bare_driver(choice, &handle, 16, 16) else {
         return;
     };
     let frame = |seed: u64| -> Vec<f32> {
@@ -5033,18 +5077,23 @@ fn two_frames_of_one_size_embed_differently(choice: BackendChoice) {
             .collect()
     };
     let (first, second) = (frame(1), frame(2));
-    fn row(pixels: &[f32]) -> EncodeRow<'_> {
-        EncodeRow::Frame {
-            pixels,
-            positions: 16,
+    let (first_inputs, second_inputs) = (frame_inputs(&first), frame_inputs(&second));
+    fn row(inputs: &RequestInputs) -> EncodeRow<'_> {
+        EncodeRow {
+            tokens: None,
+            inputs,
         }
     }
-    let one = |driver: &mut Driver, pixels: &[f32]| encode(driver, &[row(pixels)]).rows.remove(0);
-    let (a, b) = (one(&mut driver, &first), one(&mut driver, &second));
+    let one =
+        |driver: &mut Driver, inputs: &RequestInputs| encode(driver, &[row(inputs)]).rows.remove(0);
+    let (a, b) = (
+        one(&mut driver, &first_inputs),
+        one(&mut driver, &second_inputs),
+    );
     let model = |pixels: &[f32]| {
         oracle(
             &handle,
-            Phase::Encode,
+            ProgramId::ENCODE,
             encode_shape(1, 16),
             &[(
                 named("pixels"),
@@ -5056,7 +5105,7 @@ fn two_frames_of_one_size_embed_differently(choice: BackendChoice) {
     close("first frame", &a, &model(&first));
     close("second frame", &b, &model(&second));
     assert_ne!(a, b, "two different frames embed alike");
-    let both = encode(&mut driver, &[row(&first), row(&second)]);
+    let both = encode(&mut driver, &[row(&first_inputs), row(&second_inputs)]);
     close("first frame in a two-row step", &both.rows[0], &a);
     close("second frame in a two-row step", &both.rows[1], &b);
 }
@@ -5239,7 +5288,7 @@ fn smolvlm_request(
     vision_handle: &Arc<ModelHandle>,
     preprocess: &poot_models::vision::PreprocessConfig,
     rgb: &[f32],
-) -> (Vec<u32>, PromptEmbeds) {
+) -> (Vec<u32>, RequestInputs) {
     use poot_models::vision::idefics3_preprocess;
     use smolvlm_ids as ids;
 
@@ -5275,7 +5324,7 @@ fn smolvlm_request(
         .flat_map(|frame| {
             oracle(
                 vision_handle,
-                Phase::Encode,
+                ProgramId::ENCODE,
                 encode_shape(1, 16),
                 &[(
                     named("pixels"),
@@ -5284,14 +5333,14 @@ fn smolvlm_request(
             )
         })
         .collect();
-    (prompt, PromptEmbeds::new(24, positions, rows).unwrap())
+    (prompt, embed_inputs(24, positions, rows))
 }
 
 /// POOT-1046 (the SmolVLM front end on the required lanes): `Idefics3::caption` over a fixture
 /// checkpoint on disk equals the same text tower run on a prompt built by hand from token ids with the
 /// vision oracle's rows for the frames (tier 2): the front end's prompt, placeholder positions, per-frame
 /// encode and scatter all have to agree. A different image captions differently (the rows reach the
-/// logits). Mutation: scatter zeroed embeddings in `driver/step.rs`; both captions collapse to the
+/// logits). Mutation: bind zeroed embedding rows in `driver/bind.rs`; both captions collapse to the
 /// zero-row continuation and the row goes red.
 fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
     use crate::multimodal::ChatTurn;
@@ -5333,22 +5382,9 @@ fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
     // A 16x16 image splits into a 2x2 tile grid and a global frame. The two images are the extremes
     // of the pixel range, so their rows differ as much as the fixture's weights let them.
     let rgb_of = |value: f32| -> Vec<f32> { vec![value; 16 * 16 * 3] };
-    let expected = |driver: &mut Driver, rgb: &[f32]| -> Vec<u32> {
+    let expected = |driver: &mut Driver<Serving>, rgb: &[f32]| -> Vec<u32> {
         let (prompt, embeds) = smolvlm_request(&vision_handle, &preprocess, rgb);
-        driver
-            .generate_with_embeds(
-                GenerateRequest {
-                    prompt,
-                    max_new,
-                    sampler: Sampler::greedy(),
-                    stops: Vec::new(),
-                    ignore_eos: false,
-                },
-                embeds,
-                &mut |_: u32, _: &str| GenerationControl::Continue(()),
-            )
-            .unwrap()
-            .tokens
+        generate_inputs(driver, prompt, max_new, embeds)
     };
     let mut caption = |rgb: &[f32]| -> Vec<u32> {
         vlm.caption(
@@ -5404,11 +5440,11 @@ per_backend!(
 );
 
 /// POOT-1076: the SmolVLM text tower on the paged pool serves several prompts with embedding rows
-/// in one batched run, each token for token the single-row contiguous `generate_with_embeds`: three
+/// in one batched run, each token for token the single-row contiguous `generate_with_inputs`: three
 /// images' full prompts (equal length, different rows), a short prompt with its own rows at other
 /// positions, and a plain token prompt of another length, all stepped together so their prefill
-/// pieces share `PrefillEmbeds` steps. Mutation: bind row 0's embeds buffer for every row (in
-/// `run_plans`, scatter `embeds` of the first lane for all lanes); the other lanes read the wrong
+/// pieces share embeds-carrying steps. Mutation: bind row 0's embeds values for every row (in
+/// `bind::token_values`, read the first lane's values for all lanes); the other lanes read the wrong
 /// image's rows and the row goes red.
 fn smolvlm_batched_paged_embeds_match_single_row_runs(choice: BackendChoice) {
     use poot_models::vision::PreprocessConfig;
@@ -5423,9 +5459,9 @@ fn smolvlm_batched_paged_embeds_match_single_row_runs(choice: BackendChoice) {
         })
         .unwrap(),
     );
-    let (Some(mut reference), Some(mut driver)) = (
+    let (Some(mut reference), Some(driver)) = (
         driver(choice, &text_handle, 16, 128),
-        driver(choice, &text_handle, 16, 128),
+        bare_driver(choice, &text_handle, 16, 128),
     ) else {
         return;
     };
@@ -5446,16 +5482,19 @@ fn smolvlm_batched_paged_embeds_match_single_row_runs(choice: BackendChoice) {
         })
         .collect();
     let images = [rgb_of(0.0), rgb_of(255.0), quadrant];
-    let mut requests: Vec<(Vec<u32>, Option<PromptEmbeds>)> = images
+    let mut requests: Vec<(Vec<u32>, RequestInputs)> = images
         .iter()
         .map(|rgb| {
             let (prompt, embeds) = smolvlm_request(&vision_handle, &preprocess, rgb);
-            (prompt, Some(embeds))
+            (prompt, embeds)
         })
         .collect();
     // A short prompt: four placeholders at positions 2..6 take the first image's first four rows.
     let (_, first) = &requests[0];
-    let rows = first.as_ref().unwrap().rows_for(0..4);
+    let Some(InputValue::Tokens(first_rows)) = first.get(EMBEDS) else {
+        panic!("the image prompt carries embedding rows")
+    };
+    let rows = first_rows.data().as_f32().unwrap()[..4 * 24].to_vec();
     requests.push((
         vec![
             ids::IM_START,
@@ -5466,56 +5505,40 @@ fn smolvlm_batched_paged_embeds_match_single_row_runs(choice: BackendChoice) {
             ids::IMAGE,
             ids::QUESTION[0],
         ],
-        Some(PromptEmbeds::new(24, vec![2, 3, 4, 5], rows).unwrap()),
+        embed_inputs(24, vec![2, 3, 4, 5], rows),
     ));
     // A plain token prompt of yet another length shares the batch.
     requests.push((
         (0..21).map(|i| (i * 5 + 1) % 36).collect::<Vec<u32>>(),
-        None,
+        RequestInputs::none(),
     ));
 
     let want: Vec<Vec<u32>> = requests
         .iter()
-        .map(|(prompt, embeds)| match embeds {
-            Some(embeds) => {
-                reference
-                    .generate_with_embeds(
-                        GenerateRequest {
-                            prompt: prompt.clone(),
-                            max_new,
-                            sampler: Sampler::greedy(),
-                            stops: Vec::new(),
-                            ignore_eos: false,
-                        },
-                        embeds.clone(),
-                        &mut |_: u32, _: &str| GenerationControl::Continue(()),
-                    )
-                    .unwrap()
-                    .tokens
-            }
-            None => generate(&mut reference, prompt, max_new, Sampler::greedy()),
+        .map(|(prompt, inputs)| {
+            generate_inputs(&mut reference, prompt.clone(), max_new, inputs.clone())
         })
         .collect();
     assert_ne!(want[0], want[1], "the image rows reach the logits");
 
     let pool = pool_shape(20, 5);
-    prepare_serving(&mut driver, pool, &[5], &[Head::GREEDY], &[]);
+    let mut driver = prepare_serving(driver, pool, &[5], &[Head::GREEDY], &[]);
     driver
-        .prepare_embeds(&ServingShapes {
-            layout: Layout::Paged(pool),
-            rows: &[nz(5)],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
+        .prepare_carried(
+            &ServingShapes {
+                layout: Layout::Paged(pool),
+                rows: &[nz(5)],
+                heads: &[Head::GREEDY],
+                warm: Warm::Admitted,
+                windows: &[],
+                adapters: &[],
+            },
+            &[EMBEDS],
+        )
         .unwrap();
     let mut lanes: Vec<Lane> = requests
         .iter()
-        .map(|(prompt, embeds)| match embeds {
-            Some(embeds) => Lane::open_embeds(&mut driver, prompt, embeds.clone(), max_new).0,
-            None => Lane::open(&mut driver, prompt, max_new, Sampler::greedy()).0,
-        })
+        .map(|(prompt, inputs)| Lane::open_embeds(&mut driver, prompt, inputs.clone(), max_new).0)
         .collect();
     run_to_end(&mut driver, &mut lanes);
     for (i, lane) in lanes.iter().enumerate() {
@@ -5568,9 +5591,10 @@ fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: B
         })
         .unwrap(),
     );
-    let mut driver =
-        Driver::new(Arc::clone(&text_handle), batched_executor, options(16, 128)).unwrap();
-    let mut reference = Driver::new(text_handle, reference_executor, options(16, 128)).unwrap();
+    let driver = Driver::new(Arc::clone(&text_handle), batched_executor, options(16, 128)).unwrap();
+    let mut reference = Driver::new(text_handle, reference_executor, options(16, 128))
+        .unwrap()
+        .serve(Layout::Contiguous);
     let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
     let preprocess = poot_models::vision::PreprocessConfig {
         image_size: 8,
@@ -5641,20 +5665,7 @@ fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: B
                 .map(|word| u32::from(word.as_bytes()[0] - b'a')),
         );
         assert_eq!(
-            reference
-                .generate_with_embeds(
-                    GenerateRequest {
-                        prompt,
-                        max_new,
-                        sampler: Sampler::greedy(),
-                        stops: Vec::new(),
-                        ignore_eos: false,
-                    },
-                    embeds,
-                    &mut |_: u32, _: &str| GenerationControl::Continue(()),
-                )
-                .unwrap()
-                .tokens,
+            generate_inputs(&mut reference, prompt, max_new, embeds),
             want[i],
             "request {i}: caption equals the oracle-row run"
         );
@@ -5672,20 +5683,23 @@ fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: B
     assert_eq!(lengths.len(), 4, "four prompt lengths share the batch");
 
     let pool = pool_shape(24, 4);
-    prepare_serving(&mut driver, pool, &[4], &[Head::GREEDY], &[]);
+    let mut driver = prepare_serving(driver, pool, &[4], &[Head::GREEDY], &[]);
     driver
-        .prepare_embeds(&ServingShapes {
-            layout: Layout::Paged(pool),
-            rows: &[nz(4)],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
+        .prepare_carried(
+            &ServingShapes {
+                layout: Layout::Paged(pool),
+                rows: &[nz(4)],
+                heads: &[Head::GREEDY],
+                warm: Warm::Admitted,
+                windows: &[],
+                adapters: &[],
+            },
+            &[EMBEDS],
+        )
         .unwrap();
     let mut lanes: Vec<Lane> = prompts
         .iter()
-        .map(|p| Lane::open_embeds(&mut driver, &p.prompt, p.embeds.clone(), max_new).0)
+        .map(|p| Lane::open_embeds(&mut driver, &p.prompt, p.inputs.clone(), max_new).0)
         .collect();
     run_to_end(&mut driver, &mut lanes);
     for (i, lane) in lanes.iter().enumerate() {
@@ -5705,7 +5719,7 @@ per_backend!(
 /// POOT-1076: the paged prefix cache keys on tokens alone, so a prompt with embedding rows reuses no
 /// block and registers none. Two images give prompts of identical tokens and different rows: the
 /// second finds nothing to reuse and equals its own single-row run; the first's release reports
-/// `PromptEmbeds`; and a plain prompt of the same tokens afterwards reuses nothing either. Mutation:
+/// `RequestInputs`; and a plain prompt of the same tokens afterwards reuses nothing either. Mutation:
 /// admit the embeds prompt through `admit_prefix_for` and register it on release; the second image
 /// reuses the first's two blocks (and its tokens), and the row goes red.
 fn paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks(choice: BackendChoice) {
@@ -5720,9 +5734,9 @@ fn paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks(choice: Backend
         })
         .unwrap(),
     );
-    let (Some(mut reference), Some(mut driver)) = (
+    let (Some(mut reference), Some(driver)) = (
         driver(choice, &text_handle, 16, 128),
-        driver(choice, &text_handle, 16, 128),
+        bare_driver(choice, &text_handle, 16, 128),
     ) else {
         return;
     };
@@ -5738,21 +5752,8 @@ fn paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks(choice: Backend
     let (same_prompt, second) =
         smolvlm_request(&vision_handle, &preprocess, &vec![255.0; 16 * 16 * 3]);
     assert_eq!(prompt, same_prompt, "equal tokens, different rows");
-    let single = |driver: &mut Driver, embeds: &PromptEmbeds| {
-        driver
-            .generate_with_embeds(
-                GenerateRequest {
-                    prompt: prompt.clone(),
-                    max_new,
-                    sampler: Sampler::greedy(),
-                    stops: Vec::new(),
-                    ignore_eos: false,
-                },
-                embeds.clone(),
-                &mut |_: u32, _: &str| GenerationControl::Continue(()),
-            )
-            .unwrap()
-            .tokens
+    let single = |driver: &mut Driver<Serving>, inputs: &RequestInputs| {
+        generate_inputs(driver, prompt.clone(), max_new, inputs.clone())
     };
     let (want_first, want_second) = (
         single(&mut reference, &first),
@@ -5765,34 +5766,34 @@ fn paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks(choice: Backend
     let want_plain = generate(&mut reference, &prompt, max_new, Sampler::greedy());
 
     let pool = pool_shape(12, 2);
-    prepare_serving(&mut driver, pool, &[1], &[Head::GREEDY], &[]);
+    let mut driver = prepare_serving(driver, pool, &[1], &[Head::GREEDY], &[]);
     driver
-        .prepare_embeds(&ServingShapes {
-            layout: Layout::Paged(pool),
-            rows: &[nz(1)],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
+        .prepare_carried(
+            &ServingShapes {
+                layout: Layout::Paged(pool),
+                rows: &[nz(1)],
+                heads: &[Head::GREEDY],
+                warm: Warm::Admitted,
+                windows: &[],
+                adapters: &[],
+            },
+            &[EMBEDS],
+        )
         .unwrap();
-    let run = |driver: &mut Driver, embeds: Option<&PromptEmbeds>| {
-        let (lane, reused) = match embeds {
-            Some(embeds) => Lane::open_embeds(driver, &prompt, embeds.clone(), max_new),
-            None => Lane::open(driver, &prompt, max_new, Sampler::greedy()),
-        };
+    let run = |driver: &mut Driver<Serving>, inputs: &RequestInputs| {
+        let (lane, reused) = Lane::open_embeds(driver, &prompt, inputs.clone(), max_new);
         let mut lanes = [lane];
         run_to_end(driver, &mut lanes);
         let outcome = driver.release(lanes[0].seq, Release::Finished).unwrap();
         (lanes[0].out.clone(), reused, outcome)
     };
-    let (tokens, reused, outcome) = run(&mut driver, Some(&first));
+    let (tokens, reused, outcome) = run(&mut driver, &first);
     assert_eq!((tokens, reused), (want_first, 0));
-    assert_eq!(outcome, PrefixOutcome::Skipped(PrefixSkip::PromptEmbeds));
-    let (tokens, reused, _) = run(&mut driver, Some(&second));
+    assert_eq!(outcome, PrefixOutcome::Skipped(PrefixSkip::RequestInputs));
+    let (tokens, reused, _) = run(&mut driver, &second);
     assert_eq!(reused, 0, "another image's rows reuse no block");
     assert_eq!(tokens, want_second);
-    let (tokens, reused, _) = run(&mut driver, None);
+    let (tokens, reused, _) = run(&mut driver, &RequestInputs::none());
     assert_eq!(reused, 0, "the embeds prompts registered nothing");
     assert_eq!(tokens, want_plain);
 }
@@ -5814,26 +5815,11 @@ fn encode_refuses_what_it_cannot_batch(choice: BackendChoice) {
         DriverError::InvalidRequest(request) => request,
         other => panic!("{other:?}"),
     };
-    let mixed = driver.encode(&EncodeRequest {
-        rows: &[
-            EncodeRow::Tokens {
-                ids: &ENCODE_SHORT,
-                types: &[],
-            },
-            EncodeRow::Frame {
-                pixels: &[0.0],
-                positions: 1,
-            },
-        ],
-    });
-    assert_eq!(
-        refusal(mixed.unwrap_err()),
-        InvalidRequest::Encode(crate::driver::error::EncodeError::Mixed)
-    );
+    let none = RequestInputs::none();
     let empty = driver.encode(&EncodeRequest {
-        rows: &[EncodeRow::Tokens {
-            ids: &[],
-            types: &[],
+        rows: &[EncodeRow {
+            tokens: Some(&[]),
+            inputs: &none,
         }],
     });
     assert_eq!(
@@ -5841,9 +5827,9 @@ fn encode_refuses_what_it_cannot_batch(choice: BackendChoice) {
         InvalidRequest::Encode(crate::driver::error::EncodeError::EmptyRow { row: 0 })
     );
     let too_long = driver.encode(&EncodeRequest {
-        rows: &[EncodeRow::Tokens {
-            ids: &[1; 17],
-            types: &[],
+        rows: &[EncodeRow {
+            tokens: Some(&[1; 17]),
+            inputs: &none,
         }],
     });
     assert_eq!(
@@ -5854,6 +5840,29 @@ fn encode_refuses_what_it_cannot_batch(choice: BackendChoice) {
             max: 16
         }),
         "a row past the prepared length is a typed refusal"
+    );
+
+    // A step has one kind of row: a vision tower's token row beside a frame row (no tokens) is mixed.
+    let (vision, _) = encoder_family_handle("idefics3_vision", None);
+    let Some(mut vision_driver) = bare_driver(choice, &vision, 16, 16) else {
+        return;
+    };
+    let pixels = frame_inputs(&[0.0; 3 * 8 * 8]);
+    let mixed = vision_driver.encode(&EncodeRequest {
+        rows: &[
+            EncodeRow {
+                tokens: Some(&ENCODE_SHORT),
+                inputs: &pixels,
+            },
+            EncodeRow {
+                tokens: None,
+                inputs: &pixels,
+            },
+        ],
+    });
+    assert_eq!(
+        refusal(mixed.unwrap_err()),
+        InvalidRequest::Encode(crate::driver::error::EncodeError::Mixed)
     );
 }
 per_backend!(
@@ -6043,7 +6052,7 @@ fn qwen4exp_ple_histories_match_the_reference_on_the_cpu_oracle() {
 }
 
 /// The weight allocations and live weight bytes the executor holds.
-fn resident_weights(driver: &Driver) -> (u64, u64) {
+fn resident_weights<S: State>(driver: &Driver<S>) -> (u64, u64) {
     driver
         .executor_stats()
         .memory
@@ -6075,10 +6084,10 @@ fn qwen4exp_bf16_owners_are_not_widened_per_step(choice: BackendChoice) {
         })
         .sum();
     let embedding = (VOCAB * 32 * 2) as u64;
-    let Some(mut driver) = driver(choice, &handle, 8, CAPACITY) else {
+    let Some(driver) = bare_driver(choice, &handle, 8, CAPACITY) else {
         return;
     };
-    prepare_admitted(&mut driver).unwrap();
+    let mut driver = prepare_admitted(driver).unwrap();
     let loaded = resident_weights(&driver);
     assert!(
         loaded.1 <= stored,
@@ -6197,10 +6206,10 @@ const FOUR_ROW_GREEDY: [[u32; 24]; 4] = [
 /// is not its own. Mutation: swap two rows' block tables in the bind (`read` map); the tokens differ.
 fn paged_four_rows_equal_the_recorded_literals(choice: BackendChoice) {
     let handle = family_handle("qwen2", NO_EOS);
-    let Some(mut driver) = serving_driver(choice, &handle) else {
+    let Some(driver) = serving_driver(choice, &handle) else {
         return;
     };
-    prepare_serving(&mut driver, pool_shape(16, 4), &[4], &[Head::GREEDY], &[]);
+    let mut driver = prepare_serving(driver, pool_shape(16, 4), &[4], &[Head::GREEDY], &[]);
     let prompts: [&[u32]; 4] = [&LONG, &MEDIUM, &SHORT, &PROMPT];
     let mut lanes: Vec<Lane> = prompts
         .iter()
@@ -6370,7 +6379,7 @@ fn family_handle_over(family: &str, eos: u32, store: WeightStore) -> Arc<ModelHa
 }
 
 /// The bytes the live weight allocations hold, and how many allocations were ever made.
-fn weight_counters(driver: &Driver) -> (u64, u64) {
+fn weight_counters<S: State>(driver: &Driver<S>) -> (u64, u64) {
     let stats = driver.executor_stats();
     let (_, weights) = stats
         .memory
@@ -6389,7 +6398,7 @@ struct Traced {
 
 /// Drive `seq` for up to `steps` steps (prefill pieces included), committing every pick.
 fn drive(
-    driver: &mut Driver,
+    driver: &mut Driver<Serving>,
     seq: SeqId,
     prompt_len: usize,
     prefilled: &mut usize,
@@ -6405,10 +6414,7 @@ fn drive(
         let work = if *prefilled < prompt_len {
             RowWork::Prefill { upto: prompt_len }
         } else {
-            RowWork::Decode {
-                ahead: &[],
-                pick: PickPolicy::Greedy,
-            }
+            RowWork::Decode { ahead: &[] }
         };
         let result = {
             let mut rows = [StepRow {
@@ -6470,13 +6476,13 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
     let max_new = 6;
 
     // Every executor opens before any runs (the ROCm runtime does not survive a second open after a drop).
-    let Some(mut served) = serving_driver(choice, &handle) else {
+    let Some(served) = serving_driver(choice, &handle) else {
         return;
     };
     let reference = |adapter: &LoraAdapter| {
         let store = merged_store(&handle, adapter);
         let merged = family_handle_over("qwen2", NO_EOS, store);
-        serving_driver(choice, &merged).map(|driver| (driver, merged))
+        solo_driver(choice, &merged).map(|driver| (driver, merged))
     };
     let Some((mut ref_a, _keep_a)) = reference(&adapter_a) else {
         return;
@@ -6484,7 +6490,7 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
     let Some((mut ref_b, _keep_b)) = reference(&adapter_b) else {
         return;
     };
-    let record = |driver: &mut Driver| {
+    let record = |driver: &mut Driver<Serving>| {
         let generated = driver
             .generate(
                 GenerateRequest {
@@ -6513,10 +6519,24 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
         let (rows, heads) = ([nz(1)], [Head::GREEDY, Head::Logits]);
         (pool, rows, heads, adapters.to_vec())
     };
-    let prepare = |driver: &mut Driver, adapters: &[crate::driver::GenerationId]| {
+    let prepare = |driver: Driver, adapters: &[crate::driver::GenerationId]| {
         let (pool, rows, heads, adapters) = shapes(adapters);
         driver
             .prepare(&ServingShapes {
+                layout: Layout::Paged(pool),
+                rows: &rows,
+                heads: &heads,
+                warm: Warm::Prompts(&[prompt.len()]),
+                windows: &[],
+                adapters: &adapters,
+            })
+            .unwrap()
+    };
+    // The same shapes admitted again under the layout already served, with more adapters.
+    let extend = |driver: &mut Driver<Serving>, adapters: &[crate::driver::GenerationId]| {
+        let (pool, rows, heads, adapters) = shapes(adapters);
+        driver
+            .extend(&ServingShapes {
                 layout: Layout::Paged(pool),
                 rows: &rows,
                 heads: &heads,
@@ -6528,7 +6548,7 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
     };
 
     // The base alone.
-    prepare(&mut served, &[]);
+    let mut served = prepare(served, &[]);
     let (base_bytes, base_allocations) = weight_counters(&served);
     assert!(base_bytes > 0, "the base entries uploaded their weights");
 
@@ -6568,7 +6588,7 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
     let generation_a = served
         .capture_adapter_set(set(1), std::slice::from_ref(&adapter_a))
         .unwrap();
-    prepare(&mut served, &[generation_a]);
+    extend(&mut served, &[generation_a]);
     let (bytes_a, allocations_a) = weight_counters(&served);
     assert_eq!(
         bytes_a - base_bytes,
@@ -6582,13 +6602,9 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
         generation,
         index: crate::driver::LoraIdx::new(1).unwrap(),
     };
-    let open = |driver: &mut Driver, adapter| {
+    let open = |driver: &mut Driver<Serving>, adapter| {
         let Admission::Opened { seq, .. } = driver
-            .open(SeqRequest {
-                prompt: &prompt,
-                max_new,
-                adapter,
-            })
+            .open(SeqRequest::new(&prompt, max_new, adapter))
             .unwrap()
         else {
             panic!("no room");
@@ -6620,7 +6636,7 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
         generation_a, generation_b,
         "a new source is a new generation"
     );
-    prepare(&mut served, &[generation_a, generation_b]);
+    extend(&mut served, &[generation_a, generation_b]);
     let (bytes_b, allocations_b) = weight_counters(&served);
     assert_eq!(
         bytes_b - bytes_a,
@@ -6728,11 +6744,7 @@ fn qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle(choice: BackendChoic
         let (input, rows) = &inputs[n];
         fixture::oracle_logprobs(&dir, input, rows, &[])
     };
-    let apart = first_step(0)
-        .iter()
-        .zip(first_step(1))
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f32::max);
+    let apart = poot_test_util::max_abs_error(&first_step(0), &first_step(1));
     assert!(
         apart > 1e-2,
         "the two images' oracle distributions differ by {apart}"
@@ -6953,10 +6965,10 @@ fn ignore_eos_and_reverse_prompts_decide_where_a_text_run_ends_wgpu() {
 #[test]
 fn a_generations_phase_timings_partition_the_engine_wall_wgpu() {
     let handle = handle(Weights::ZeroHead, NO_EOS);
-    let Some(driver) = driver(BackendChoice::Wgpu, &handle, 4, CAPACITY) else {
+    let Some(driver) = bare_driver(BackendChoice::Wgpu, &handle, 4, CAPACITY) else {
         return;
     };
-    let mut driver = driver.with_phase_timing();
+    let mut driver = driver.with_phase_timing().serve(Layout::Contiguous);
     let mark = driver.executor_stats().timing.mark();
     let generation = driver
         .generate(

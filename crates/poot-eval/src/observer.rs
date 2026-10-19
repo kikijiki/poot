@@ -1,6 +1,5 @@
 //! `EvalOptions::observer`: a caller hook into the walk's per-equation publication, for allocation
-//! accounting and NaN diagnosis. Budgets and observers are options on the one walk, not separate
-//! walks.
+//! accounting and NaN diagnosis. An observer is an option on the one walk, not a separate walk.
 
 use poot_graph_ir::ValueId;
 use poot_tensor::DType;
@@ -23,18 +22,16 @@ pub enum Publication {
 pub trait EvalObserver {
     /// An equation's output was reserved: `eqn` is its position in `Graph::eqns`, `out` its value id.
     ///
-    /// `EvalBudget`/this hook are a materialization ceiling for the packed, cast and Spec-376 BF16
-    /// arms (`walk.rs`'s `opts.charge` call sites: `PackedDequant`,
-    /// `PackedRowGather`, an indexed `PackedContraction` (one `[out, K]` charge per expert decoded), `Cast`'s `I32 -> F32` and BF16 widens, and the Spec-376 `Widen`/`Gather`/
-    /// `WeightMatMul` arms) - the paths where one equation can
-    /// lazily materialize an allocation whose size depends on a checkpoint table far larger than the
-    /// graph's own declared shapes would suggest. Every intermediate of a
-    /// composite's decomposition charges too (Card 556), attributed to the composite equation: a
-    /// decomposed prefill attention materializes `[1, Hq, L, L]` scores behind a `[1, Hq, L, D]`
-    /// result. It is not a universal per-equation accounting: the dense arithmetic path (`Binary`,
-    /// `Reduce`, `MatMul`, `Gather`, ...) allocates a fresh buffer for nearly every equation too, but
-    /// never calls `charge`/this hook outside a decomposition, so `max_work_elements` bounds nothing
-    /// there and this fires only for the arms listed above.
+    /// This hook reports the materialization of the packed, cast and Spec-376 BF16 arms
+    /// (`walk.rs`'s `opts.allocated` call sites: `PackedDequant`, `PackedRowGather`, an indexed
+    /// `PackedContraction` (one `[out, K]` report per expert decoded), `Cast`'s `I32 -> F32` and BF16 widens,
+    /// and the Spec-376 `Widen`/`Gather`/`WeightMatMul` arms) - the paths where one equation can lazily
+    /// materialize an allocation whose size depends on a checkpoint table far larger than the graph's own
+    /// declared shapes would suggest. Every intermediate of a composite's decomposition reports too (Card
+    /// 556), attributed to the composite equation: a decomposed prefill attention materializes
+    /// `[1, Hq, L, L]` scores behind a `[1, Hq, L, D]` result. It is not a universal per-equation
+    /// accounting: the dense arithmetic path (`Binary`, `Reduce`, `MatMul`, `Gather`, ...) allocates a fresh
+    /// buffer for nearly every equation too, but never calls this hook outside a decomposition.
     fn allocation(&mut self, eqn: usize, out: ValueId, dtype: DType, bytes: usize) {
         let _ = (eqn, out, dtype, bytes);
     }

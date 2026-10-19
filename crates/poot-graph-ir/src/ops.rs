@@ -70,11 +70,6 @@ pub use attention::{
 };
 pub use block_top_k::block_top_k_packed;
 pub use linear::linear;
-#[cfg(any(test, feature = "test-support"))]
-pub use linear::{
-    PackedExpertStack, packed_block_diagonal_linear, packed_embedding, packed_indexed_linear,
-    packed_linear,
-};
 pub use moe::{
     canonical_router_scores, moe, moe_grouped, moe_grouped_prep, moe_sparse,
     stable_descending_rank, stable_descending_rank_masked, top_k_keep_mask,

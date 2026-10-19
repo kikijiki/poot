@@ -444,8 +444,6 @@ fn imported_choice(
 #[cfg(test)]
 mod tests {
     use crate::planner::{Graph, OpKind};
-
-    use crate::production_plan::Submission;
     use crate::types::DispatchPlanError;
     use poot_graph_ir::{AttentionAttrs, Builder, TensorType};
     use poot_kernelgen::{
@@ -478,8 +476,7 @@ mod tests {
         b.finish(out).unwrap()
     }
 
-    const OPTIONS: CompileOptions =
-        CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
+    const OPTIONS: CompileOptions = CompileOptions::new(crate::CompileLimits::STANDARD);
 
     fn target(backend: Backend) -> Target {
         Target::Gpu {
@@ -626,8 +623,8 @@ mod tests {
             ContractionSpec, ElementwiseSpec, Fold, FusedInput, FusedKernel, FusedScalarOp,
             FusedStep, LeafTy, MatmulShapes, MovementOp, MovementSpec, PackedContraction,
             PackedKernelOp, PackedKernelSpec, PackedRequest, PointwiseForm, PointwiseSpec,
-            RopeSpec, RowKernel, RowOp, RowSpec, ScanKernel, ScanPhase, ScanSpec, Schedule,
-            Storage, TileSize, TopKSpec, UnaryOp, ViewOperand,
+            RopeSpec, RowKernel, RowOp, RowSpec, ScanKernel, ScanSpec, Schedule, Storage, TileSize,
+            TopKSpec, UnaryOp, ViewOperand,
         };
         use poot_quant::format::WeightFormat;
 
@@ -773,7 +770,6 @@ mod tests {
                 width: 8,
                 cols: 16,
                 row_split,
-                phase: ScanPhase { start: 0, count: 8 },
             })
         };
 

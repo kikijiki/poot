@@ -2,9 +2,9 @@
 //! dense family. (Moved from `poot-eval/src/tests/qwen2_pipeline.rs`: a test that traces a model sits above
 //! the oracle, never inside it - POOT-1130.)
 
-use poot_eval::{EvalBudget, EvalOptions, Value};
+use poot_eval::{EvalOptions, Value};
 use poot_graph_ir::{ForwardSlotMap, Graph, Slot, Storage, ValueId};
-use poot_models::model::{LogitRows, Model, Phase};
+use poot_models::model::{LogitRows, Model, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_tensor::HostTensor;
 use poot_test_util::{assert_close_rel, fill, max_abs_error};
@@ -32,7 +32,6 @@ pub(super) fn tiny_qwen2(
 /// one `pool`-slot pool shared by every row.
 pub(super) fn trace_step(
     model: &dyn Model,
-    phase: Phase,
     (rows, tokens, capacity): (usize, usize, usize),
     pool: Option<usize>,
     logits: LogitRows,
@@ -42,7 +41,10 @@ pub(super) fn trace_step(
         Some(pool) => paged_step(rows, tokens, capacity, pool, logits),
     };
     model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(
+            &StepSpec::step(shape),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .expect("the shape traces")
 }
 
@@ -133,7 +135,7 @@ pub(super) fn eval_step(
         };
         inputs.insert(si, Value::from(carried));
     }
-    let evaluation = poot_eval::eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let evaluation = poot_eval::eval(g, &inputs, EvalOptions::default()).unwrap();
     Stepped {
         logits: evaluation.output.into_host().unwrap(),
         state: evaluation
@@ -150,7 +152,7 @@ pub(super) fn eval_step(
 #[test]
 fn qwen2_tiny_runs_end_to_end() {
     let model = tiny_qwen2(32, 16, 32, 16);
-    let g = trace_step(&*model, Phase::Decode, (1, 1, 8), None, LogitRows::Last);
+    let g = trace_step(&*model, (1, 1, 8), None, LogitRows::Last);
     let logits = eval_step(&g, &[5], &[3], None, None).logits;
     assert_eq!(logits.shape(), vec![1, 1, 32]);
     assert!(
@@ -170,19 +172,13 @@ fn fixed_kv_decode_matches_prefill() {
 
     // reference: prefill the first pos+1 tokens, take the last-position logits.
     let prefill_logits = |upto: usize| -> HostTensor {
-        let g = trace_step(
-            &*model,
-            Phase::Prefill,
-            (1, upto, cap),
-            None,
-            LogitRows::Last,
-        );
+        let g = trace_step(&*model, (1, upto, cap), None, LogitRows::Last);
         let pos: Vec<i32> = (0..upto as i32).collect();
         eval_step(&g, &tokens[..upto], &pos, None, None).logits
     };
 
     // fixed-KV decode: carry the per-layer caches across steps.
-    let g = trace_step(&*model, Phase::Decode, (1, 1, cap), None, LogitRows::Last);
+    let g = trace_step(&*model, (1, 1, cap), None, LogitRows::Last);
     let mut caches: Option<Vec<HostTensor>> = None;
     for (pos, &token) in tokens.iter().enumerate() {
         let out = eval_step(&g, &[token], &[pos as i32], None, caches.as_deref());
@@ -205,13 +201,7 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
     let tokens: Vec<i32> = vec![5, 11, 3, 20, 8, 1, 27];
 
     // --- one-shot paged prefill: the whole prompt in one forward. ---
-    let g_one = trace_step(
-        &*model,
-        Phase::Prefill,
-        (1, n, cap),
-        Some(pool_slots),
-        LogitRows::Last,
-    );
+    let g_one = trace_step(&*model, (1, n, cap), Some(pool_slots), LogitRows::Last);
     let (read, write) = paged_maps(
         pool_slots,
         &[PagedRow {
@@ -230,13 +220,7 @@ fn chunked_prefill_matches_one_shot_shared_pool() {
     let mut start = 0;
     while start < n {
         let l = chunk_size.min(n - start);
-        let g = trace_step(
-            &*model,
-            Phase::Prefill,
-            (1, l, cap),
-            Some(pool_slots),
-            LogitRows::Last,
-        );
+        let g = trace_step(&*model, (1, l, cap), Some(pool_slots), LogitRows::Last);
         assert_eq!(
             g.state().count(),
             g_one.state().count(),
@@ -345,13 +329,7 @@ fn chunked_prefill_redundant_decode_overwrite_error_growth_bounded() {
     // independent one-shot reference over the first `m` tokens (what the pool would hold after processing exactly this many
     // tokens in a single forward, no chunking, no redundant overwrite).
     let one_shot_pool = |m: usize| -> Vec<HostTensor> {
-        let g = trace_step(
-            &*model,
-            Phase::Prefill,
-            (1, m, cap),
-            Some(pool_slots),
-            LogitRows::Last,
-        );
+        let g = trace_step(&*model, (1, m, cap), Some(pool_slots), LogitRows::Last);
         let (read, write) = paged_maps(
             pool_slots,
             &[PagedRow {
@@ -366,26 +344,14 @@ fn chunked_prefill_redundant_decode_overwrite_error_growth_bounded() {
 
     // chunked prefill replaying `batch_engine_loop`'s two steps per iteration: a chunk write, then (unconditionally, as the
     // wide decode dispatch does) a single-token decode-shaped overwrite of the position the chunk just wrote.
-    let gd = trace_step(
-        &*model,
-        Phase::Decode,
-        (1, 1, cap),
-        Some(pool_slots),
-        LogitRows::Last,
-    );
+    let gd = trace_step(&*model, (1, 1, cap), Some(pool_slots), LogitRows::Last);
     let mut pool: Option<Vec<HostTensor>> = None;
     let mut pos = 0;
     let mut chunk_idx = 0;
     let mut checkpoints: Vec<(usize, f32)> = Vec::new(); // (chunks done, max abs pool error vs one-shot)
     while pos < n {
         let l = chunk_size.min(n - pos);
-        let g = trace_step(
-            &*model,
-            Phase::Prefill,
-            (1, l, cap),
-            Some(pool_slots),
-            LogitRows::Last,
-        );
+        let g = trace_step(&*model, (1, l, cap), Some(pool_slots), LogitRows::Last);
         let (read, write) = paged_maps(
             pool_slots,
             &[PagedRow {
@@ -432,7 +398,8 @@ fn chunked_prefill_redundant_decode_overwrite_error_growth_bounded() {
                 .iter()
                 .zip(reference.iter())
                 .map(|(a, r)| max_abs_error(a.as_f32().unwrap(), r.as_f32().unwrap()))
-                .fold(0.0f32, f32::max);
+                .max_by(f32::total_cmp)
+                .unwrap_or(0.0);
             checkpoints.push((chunk_idx, err));
         }
     }
@@ -492,13 +459,7 @@ fn speculative_verify_batched_matches_sequential_decode() {
     assert_eq!(drafts_row[0].len(), l - 1);
 
     // --- prefill both rows' prompts into one shared pool, threading state across both admissions. ---
-    let g_prefill = trace_step(
-        &*model,
-        Phase::Prefill,
-        (1, n, cap),
-        Some(pool_slots),
-        LogitRows::Last,
-    );
+    let g_prefill = trace_step(&*model, (1, n, cap), Some(pool_slots), LogitRows::Last);
     let mut pool_state: Option<Vec<HostTensor>> = None;
     for row in 0..batch {
         let (read, write) = paged_maps(
@@ -532,13 +493,7 @@ fn speculative_verify_batched_matches_sequential_decode() {
         .iter()
         .map(|slots| PagedRow { slots, start: pos })
         .collect();
-    let g_verify = trace_step(
-        &*model,
-        Phase::Prefill,
-        (batch, l, cap),
-        Some(pool_slots),
-        LogitRows::All,
-    );
+    let g_verify = trace_step(&*model, (batch, l, cap), Some(pool_slots), LogitRows::All);
     let (read, write) = paged_maps(pool_slots, &rows, l);
     let verify_tokens: Vec<i32> = query_row.iter().flatten().copied().collect();
     let verify_pos: Vec<i32> = (0..batch)
@@ -554,13 +509,7 @@ fn speculative_verify_batched_matches_sequential_decode() {
     assert_eq!(verify.logits.shape(), vec![batch, l, vocab]);
 
     // --- (b) sequential reference: the same l query tokens, one ordinary batched decode step at a time. ---
-    let g_decode = trace_step(
-        &*model,
-        Phase::Decode,
-        (batch, 1, cap),
-        Some(pool_slots),
-        LogitRows::Last,
-    );
+    let g_decode = trace_step(&*model, (batch, 1, cap), Some(pool_slots), LogitRows::Last);
     let mut seq_state = prefilled_pool.clone();
     let mut logits_seq = vec![0.0f32; batch * l * vocab];
     for i in 0..l {
@@ -650,13 +599,7 @@ fn draft_propose_round_schedule_matches_sequential_draft_decode() {
         best as i32
     };
 
-    let g = trace_step(
-        &*model,
-        Phase::Decode,
-        (batch, 1, cap),
-        None,
-        LogitRows::Last,
-    );
+    let g = trace_step(&*model, (batch, 1, cap), None, LogitRows::Last);
 
     // --- BATCHED: the round schedule `draft_propose_batch` drives, one call per round, both rows sharing one state. ---
     let mut state: Option<Vec<HostTensor>> = None;
@@ -699,7 +642,7 @@ fn draft_propose_round_schedule_matches_sequential_draft_decode() {
 
     // --- SEQUENTIAL reference: each row decoded on its own batch=1 graph, independently (no interleaving, holds, shared
     // call or shared state). ---
-    let g1 = trace_step(&*model, Phase::Decode, (1, 1, cap), None, LogitRows::Last);
+    let g1 = trace_step(&*model, (1, 1, cap), None, LogitRows::Last);
     for row in 0..batch {
         let mut state1: Option<Vec<HostTensor>> = None;
         let mut dl: Vec<f32> = Vec::new();
@@ -765,25 +708,13 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode() {
     };
 
     // --- build the first `s` positions' pool state via a paged step (pos=0..s). ---
-    let g0 = trace_step(
-        &*model,
-        Phase::Prefill,
-        (1, s, cap),
-        Some(pool_slots),
-        LogitRows::Last,
-    );
+    let g0 = trace_step(&*model, (1, s, cap), Some(pool_slots), LogitRows::Last);
     let (read, write) = paged(0, s);
     let pos0: Vec<i32> = (0..s as i32).collect();
     let pool_after_s = eval_step(&g0, &tokens[..s], &pos0, Some((&read, &write)), None).state;
 
     // --- (a) chunk-prefill the next l tokens at positions [s, s+l) in one forward. ---
-    let gc = trace_step(
-        &*model,
-        Phase::Prefill,
-        (1, l, cap),
-        Some(pool_slots),
-        LogitRows::Last,
-    );
+    let gc = trace_step(&*model, (1, l, cap), Some(pool_slots), LogitRows::Last);
     let (read, write) = paged(s, l);
     let posc: Vec<i32> = (s as i32..(s + l) as i32).collect();
     let chunk = eval_step(
@@ -795,13 +726,7 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode() {
     );
 
     // --- (b) step decode through the same l positions, one token at a time, from the same pool_after_s. ---
-    let gd = trace_step(
-        &*model,
-        Phase::Decode,
-        (1, 1, cap),
-        Some(pool_slots),
-        LogitRows::Last,
-    );
+    let gd = trace_step(&*model, (1, 1, cap), Some(pool_slots), LogitRows::Last);
     let mut pool = pool_after_s;
     let mut logits_decode = HostTensor::zeros(vec![1, 1, 32]);
     for i in 0..l {
@@ -855,7 +780,6 @@ fn paged_write_lands_mapped_tokens_and_keeps_padding_and_unnamed_slots() {
     let (rows, tokens, cap, pool_slots) = (2usize, 2usize, 3usize, 12usize);
     let g = trace_step(
         &*model,
-        Phase::Prefill,
         (rows, tokens, cap),
         Some(pool_slots),
         LogitRows::Last,

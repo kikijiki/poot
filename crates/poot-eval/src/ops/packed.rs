@@ -1,9 +1,7 @@
 //! Packed-quant ops: `PackedDequant` and `PackedRowGather`, and the shared carrier
 //! binding contract (card 642) every packed equation and its executors' pre-upload check share.
 //!
-//! Oracle allocation limits were a fixed const (`PACKED_ORACLE_MAX_ELEMENTS`/`BYTES`); `walk.rs` now
-//! charges every packed output against the caller's `EvalBudget` instead, so the limit is an option,
-//! not a hardcoded wall (deval A5).
+//! `walk.rs` reports every packed output's allocation to the caller's `EvalObserver`.
 
 use poot_graph_ir::{Graph, OpKind, Operand, ValueId, ValueTable};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, SourceRole};
@@ -300,7 +298,7 @@ pub(crate) fn packed_stack_components<'a>(
 
 /// `out[m, n] = sum over k of x[m, k] * decode(expert ids[m], n, k)`: the indexed packed contraction, evaluated
 /// by decoding only the experts the ids select. Rows are grouped by expert; each distinct selected expert is
-/// decoded once (`charge` is called per decode, so the caller's budget and observer see exactly the experts
+/// decoded once (`allocated` is called per decode, so the caller's observer sees exactly the experts
 /// read, never the whole table), and the unselected experts' bytes are never touched. Accumulation is the
 /// sequential `k` sum of the dense `IndexedMatMul` oracle over the same decoded weight, bit for bit.
 pub(crate) fn evaluate_packed_indexed(
@@ -309,7 +307,7 @@ pub(crate) fn evaluate_packed_indexed(
     stack: &PackedStack,
     out_shape: &[usize],
     eqn: ValueId,
-    mut charge: impl FnMut() -> Result<(), EvalError>,
+    mut allocated: impl FnMut(),
 ) -> Result<HostTensor, EvalError> {
     let [out, k] = stack.weight().shape();
     let m = x.shape()[0];
@@ -326,7 +324,7 @@ pub(crate) fn evaluate_packed_indexed(
     let mut data = vec![0.0f32; checked_packed_oracle_product(m, out, "rows_out")?];
     let mut weight = vec![0.0f32; checked_packed_oracle_product(out, k, "logical_values")?];
     for (expert, rows) in by_expert {
-        charge()?;
+        allocated();
         for (row, decoded) in weight.chunks_exact_mut(k).enumerate() {
             stack.decode_row(expert, row, decoded).map_err(|error| {
                 EvalError::from(PackedEvalError::Decode {

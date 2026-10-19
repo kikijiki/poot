@@ -8,11 +8,30 @@ use poot_graph_ir::{
     value_ranges,
 };
 
+/// A fusion the attention or rope matcher left alone on a near-miss chain, and the first check that
+/// failed. [`Program::declines`](crate::Program::declines) publishes them; the original arithmetic stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FusionDecline {
+    /// The result of the candidate equation, as the traced graph names it.
+    pub value: ValueId,
+    /// The check that failed.
+    pub reason: FusionDeclineReason,
+}
+
+/// Which matcher declined a candidate, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FusionDeclineReason {
+    /// The flash-attention matcher.
+    Attention(AttentionDecline),
+    /// The rope matcher.
+    Rope(RopeDecline),
+}
+
 /// Why the attention matcher did not fuse a candidate equation, in the order the checks run. The pass
 /// leaves the equation alone and records the first failing check (it never guesses); tests assert the
 /// exact reason for a near-miss.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum AttentionDecline {
+pub enum AttentionDecline {
     /// The root is not `MatMul(p, V)`.
     RootNotMatmul,
     /// The chain is not F32: the generated attention kernel reads and writes F32 only, so a BF16 or F16
@@ -59,7 +78,7 @@ pub(super) enum AttentionDecline {
 /// Why the rope matcher did not fuse a candidate equation. The same first-failing-check contract as
 /// [`AttentionDecline`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RopeDecline {
+pub enum RopeDecline {
     /// The root is not `Add(xc, rs)`.
     RootNotAdd,
     /// Neither addend is `Mul(rotate_half, sin)` with a `Concat` rotate-half.
@@ -869,6 +888,9 @@ impl AttnMatch {
 /// gets flash without a separate `_flash` variant. Best run on a `cse`'d graph. `compile` passes its own
 /// measured `target.caps.max_grid[0]` (wgpu's `gridDim.x` caps at 65535 and has no plan-time fallback
 /// from the op to the decomposition).
+///
+/// Also returns the near-miss candidates it left alone, each with its first failing check. A candidate that is
+/// not the softmax-normalized matmul shape at all (an ordinary matmul) is no near-miss and is not reported.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
     allow(
@@ -879,7 +901,7 @@ impl AttnMatch {
 pub fn flash_attention_capped(
     g: &Graph,
     max_prefill_groups: Option<usize>,
-) -> Result<Graph, EditError> {
+) -> Result<(Graph, Vec<FusionDecline>), EditError> {
     let mut prod: HashMap<ValueId, usize> = HashMap::new();
     for (i, e) in g.eqns().iter().enumerate() {
         prod.insert(e.out, i);
@@ -898,6 +920,7 @@ pub fn flash_attention_capped(
             }
         }
     };
+    let mut declines = Vec::new();
     let eqns: Vec<Eqn> = g
         .eqns()
         .iter()
@@ -908,10 +931,41 @@ pub fn flash_attention_capped(
                 out: e.out,
                 layer: e.layer,
             },
-            _ => e.clone(),
+            Ok(_) => e.clone(),
+            Err(reason) => {
+                if attention_near_miss(g, &prod, e, reason) {
+                    declines.push(FusionDecline {
+                        value: e.out,
+                        reason: FusionDeclineReason::Attention(reason),
+                    });
+                }
+                e.clone()
+            }
         })
         .collect();
-    with_eqns(g, eqns)
+    Ok((with_eqns(g, eqns)?, declines))
+}
+
+/// Whether `reason` is a failure past recognizing the softmax normalizer, the only point where a matmul
+/// is attention-shaped. A BF16 or F16 chain fails `NotF32` before that check runs, so it counts when its
+/// first operand is a `Div`.
+fn attention_near_miss(
+    g: &Graph,
+    prod: &HashMap<ValueId, usize>,
+    root: &Eqn,
+    reason: AttentionDecline,
+) -> bool {
+    match reason {
+        AttentionDecline::RootNotMatmul | AttentionDecline::NotDiv => false,
+        AttentionDecline::NotF32 => matches!(
+            root.inputs.first(),
+            Some(Operand::Value(p))
+                if prod
+                    .get(p)
+                    .is_some_and(|&i| matches!(g.eqns()[i].op, OpKind::Binary(BinOp::Div)))
+        ),
+        _ => true,
+    }
 }
 
 /// A matched RoPE rotate-half chain. `x` is the tensor the rotation applies to (width `rot` on the last
@@ -1096,6 +1150,9 @@ fn rope_types_as(
 /// `Add` core dead. Conservative and result-preserving (one semantic definition shared by tracing, the oracle and every lowering). Run on a `cse`'d graph, before
 /// flash/fuse; the dead intermediates need a following `dce`. It only rewrites the q/k rope, so it is
 /// independent of the flash-attention match.
+///
+/// Also returns the near-miss `Add`s it left alone, each with its first failing check. An `Add` that is not two
+/// `Mul`s around a rotate-half `Concat` is no near-miss and is not reported.
 #[cfg_attr(
     not(any(test, feature = "test-support")),
     allow(
@@ -1103,7 +1160,7 @@ fn rope_types_as(
         reason = "ADR-0113: `pub` only so the test-support re-export in lib.rs can name it; no production path leaves the crate"
     )
 )]
-pub fn rope_fusion(g: &Graph) -> Result<Graph, EditError> {
+pub fn rope_fusion(g: &Graph) -> Result<(Graph, Vec<FusionDecline>), EditError> {
     let mut prod: HashMap<ValueId, usize> = HashMap::new();
     for (i, e) in g.eqns().iter().enumerate() {
         prod.insert(e.out, i);
@@ -1178,6 +1235,7 @@ pub fn rope_fusion(g: &Graph) -> Result<Graph, EditError> {
 
     // Pass 2: emit the fused ops. Partial matches replace their Concat; every remaining Add that matches the
     // core (and was not consumed by a partial) becomes a FULL rope over `a` (rot == a's last dim).
+    let mut declines = Vec::new();
     let eqns: Vec<Eqn> = g
         .eqns()
         .iter()
@@ -1197,20 +1255,34 @@ pub fn rope_fusion(g: &Graph) -> Result<Graph, EditError> {
             // Full rope: a matched Add core (not consumed by a partial) whose `a` IS exactly the rotated
             // tensor (last dim == rot). Otherwise the Add is the core of an unmatched partial (its output
             // shape would be `rot`, not the full head dim) - leave it for the outer slice/concat.
-            if !consumed.contains(&e.out)
-                && let Ok((a, cos, sin, rot)) = match_rope_core(g, &prod, e)
-                && g.aval(a).shape.last().copied() == Some(rot)
-                && rope_types_as(g, a, cos, sin, rot, e.out)
-            {
-                return Eqn {
-                    op: OpKind::Rope { rot },
-                    inputs: vec![Operand::Value(a), Operand::Value(cos), Operand::Value(sin)],
-                    out: e.out,
-                    layer: e.layer,
-                };
+            if !consumed.contains(&e.out) {
+                match match_rope_core(g, &prod, e) {
+                    Ok((a, cos, sin, rot))
+                        if g.aval(a).shape.last().copied() == Some(rot)
+                            && rope_types_as(g, a, cos, sin, rot, e.out) =>
+                    {
+                        return Eqn {
+                            op: OpKind::Rope { rot },
+                            inputs: vec![
+                                Operand::Value(a),
+                                Operand::Value(cos),
+                                Operand::Value(sin),
+                            ],
+                            out: e.out,
+                            layer: e.layer,
+                        };
+                    }
+                    Ok(_) => {}
+                    // `RootNotAdd` and `NoRotateHalf` are every other `Add` in the graph.
+                    Err(RopeDecline::RootNotAdd | RopeDecline::NoRotateHalf) => {}
+                    Err(reason) => declines.push(FusionDecline {
+                        value: e.out,
+                        reason: FusionDeclineReason::Rope(reason),
+                    }),
+                }
             }
             e.clone()
         })
         .collect();
-    with_eqns(g, eqns)
+    Ok((with_eqns(g, eqns)?, declines))
 }

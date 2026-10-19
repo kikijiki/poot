@@ -149,7 +149,7 @@ The latest benchmark row per family and backend, from the stored results. A refu
   generates "Paris" with coherent text (about 5 decode tok/s, 12 prefill tok/s); its top-five comparison against the CPU
   oracle has not been run yet. It has not run on wgpu. DeepSeek-V4, MiniMax-M2, GLM-5.3-Flash and Qwen3.8-Flash-Next have only synthetic fixtures that match an
   independent f64 reference; no real public checkpoint of them has run.
-- The `bert` family runs on the driver's `Encode` step (`poot_llm::encoders`). `poot-serve` runs `Encode` steps for a
+- The `bert` family runs on the driver's `encode` step (`poot_llm::encoders`). `poot-serve` runs `encode` steps for a
   decoder's embeddings and reranking on wgpu and ROCm, and starts on a BERT checkpoint (embeddings and cross-encoder
   rerank); the encode shapes are fitted and prepared before it serves.
 - Per-channel E4M3 `compressed-tensors` projections load packed and use the shared generated lowering. See

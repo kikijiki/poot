@@ -15,10 +15,10 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
-    BackendChoice, Driver, DriverOptions, GenerateRequest, ModelHandle, PreparedSetLimits,
-    open_executor, program_retention,
+    BackendChoice, Driver, DriverOptions, GenerateRequest, Layout, ModelHandle, PreparedSetLimits,
+    Serving, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
@@ -106,7 +106,7 @@ fn fixture_checkpoint() -> poot_test_util::UniqueTempPath {
 }
 
 fn options(chunk: usize, capacity: usize) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let nz = |n| NonZeroUsize::new(n).unwrap();
     DriverOptions {
         prefill: compile.clone(),
@@ -129,12 +129,16 @@ fn driver(
     choice: BackendChoice,
     handle: &Arc<ModelHandle>,
     chunk: usize,
-) -> Option<Driver> {
+) -> Option<Driver<Serving>> {
     let executor = open_or_skip(backend, open_executor(choice))?;
-    Some(Driver::new(Arc::clone(handle), executor, options(chunk, 64)).unwrap())
+    Some(
+        Driver::new(Arc::clone(handle), executor, options(chunk, 64))
+            .unwrap()
+            .serve(Layout::Contiguous),
+    )
 }
 
-fn greedy(driver: &mut Driver, prompt: &[u32], max_new: usize) -> Vec<u32> {
+fn greedy(driver: &mut Driver<Serving>, prompt: &[u32], max_new: usize) -> Vec<u32> {
     driver
         .generate(
             GenerateRequest {

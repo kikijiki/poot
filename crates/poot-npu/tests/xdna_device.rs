@@ -348,7 +348,6 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
 #[test]
 fn every_buffer_is_released_when_the_executable_is_unloaded() {
     use poot_executor::{Executor, NoSync, StepInputs};
-    use poot_graph_plan::production_plan::Submission;
     use std::sync::Arc;
 
     let Some(mut npu) = npu() else { return };
@@ -373,10 +372,7 @@ fn every_buffer_is_released_when_the_executable_is_unloaded() {
         .expect("the weights load");
     let entry = npu
         .engine
-        .add_entry(
-            exe,
-            &poot_executor_parity::staged(fixture, target, Submission::Replay),
-        )
+        .add_entry(exe, &poot_executor_parity::staged(fixture, target))
         .expect("the entry compiles and loads");
     let mut inputs = StepInputs::new();
     for step in &fixture.steps[0] {
@@ -503,7 +499,6 @@ fn f32_bytes(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
 #[test]
 fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
     use poot_executor::{AieInvocation, Arg, Dispatch, LaunchKind};
-    use poot_graph_plan::production_plan::Submission;
     use poot_npu::XdnaError;
     use poot_runtime_common::BufferRole;
     use poot_target::{AieTargetId, BufferStorage};
@@ -541,7 +536,7 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
                         launch: LaunchKind,
                         inputs: &[Arg<'_, XdnaDevice>],
                         output: Arg<'_, XdnaDevice>| {
-        device.begin(Submission::Replay).unwrap();
+        device.begin().unwrap();
         let result = device.dispatch(Dispatch {
             kernel: &kernel,
             inputs,
@@ -592,7 +587,7 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
     ));
 
     // The refusals left the device usable: the valid dispatch runs and computes a + b.
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     device
         .dispatch(Dispatch {
             kernel: &kernel,
@@ -713,7 +708,6 @@ fn an_artifact_whose_last_binding_is_read_only_is_refused_at_load() {
 #[test]
 fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
     use poot_executor::{AieInvocation, Arg, Dispatch, LaunchKind};
-    use poot_graph_plan::production_plan::Submission;
     use poot_npu::XdnaError;
     use poot_runtime_common::BufferRole;
     use poot_target::{AieTargetId, BufferStorage};
@@ -748,7 +742,7 @@ fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
             elems: N as u32,
         },
     ];
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     device
         .dispatch(Dispatch {
             kernel: &kernel,

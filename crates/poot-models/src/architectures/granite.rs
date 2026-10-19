@@ -16,12 +16,10 @@ use crate::components::moe::{self, GateUpForm, MoeParams, MoeWeights};
 use crate::components::router::RouterKind;
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    decoder_program, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::ModelSchema;
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::GGUF_BASE;
 use crate::names::{
     ExpertNames, HF_BASE, MoeLayers, MoeNames, family_weights, family_weights_routed,
@@ -263,6 +261,7 @@ pub(crate) struct Granite {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -302,6 +301,9 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -309,7 +311,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Granite,
     };
@@ -319,6 +320,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -327,13 +329,18 @@ impl Model for Granite {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         if let Some(params) = &p.moe {
             moe::check_step(FAMILY, shape, params)?;
         }
@@ -507,16 +514,7 @@ mod family_tests {
         let fx = fixture();
         let run = |config: &serde_json::Value| {
             let model = model_of(config, &fx.store);
-            run_step(
-                &*model,
-                &fx.store,
-                Phase::Prefill,
-                CAP,
-                &[3, 17, 40],
-                0,
-                &[],
-            )
-            .0
+            run_step(&*model, &fx.store, CAP, &[3, 17, 40], 0, &[]).0
         };
         let base = run(&fx.config);
         for (key, value) in [
@@ -678,16 +676,8 @@ mod family_tests {
         assert_eq!(model.config().eos, BTreeSet::from([47]));
         let reference = model_of(&fixture_config(), &reference_store);
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
     }
@@ -734,7 +724,6 @@ mod moe_tests {
         CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
         close, f32_entry, gguf_dense_kvs, gguf_name_with_head, values,
     };
-    use crate::model::Phase;
     use crate::registry::{LoadModelError, Registry};
 
     use super::{FIXTURE_EXPERTS as EXPERTS, FIXTURE_INTER as INTER, FIXTURE_WIDTH as WIDTH};
@@ -993,27 +982,11 @@ mod moe_tests {
             &reference_store,
         );
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
-        let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-        let (want, _) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Decode,
-            CAP,
-            &[5],
-            4,
-            &want_state,
-        );
+        let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+        let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }
 

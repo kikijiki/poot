@@ -1,8 +1,7 @@
 //! Card 542a: planning for `PackedRowGather`/`PackedContraction` when the descriptor-driven table
 //! (`packed_block_float::PACKED_LOWERING`) admits the descriptor's format - the block-32 GGUF schemes
 //! today (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, MXFP4). A format the table does not admit for this op
-//! is not planned here, so `try_plan` below returns `Ok(None)` for it and the caller falls back to
-//! today's unconditional refusal.
+//! is refused by name with `Capability::PackedLowering`, naming the format and the op.
 //!
 //! `OpKind::PackedRowGather`/`PackedContraction` carry their carrier operands in
 //! `descriptor.sources()`'s role order (`op.rs`'s shape inference proves this at graph-build time), so
@@ -24,14 +23,16 @@ use crate::planner::{GraphTables, finalize};
 use crate::predicates::{GEMM_TILE, INDEXED_GEMV_MAX_ROWS, packed_contraction_m_per_block};
 use crate::refusal::Site;
 use poot_graph_ir::ContractionRows;
-use poot_kernelgen::{PackedContraction, PackedKernelOp, PackedRows, Schedule};
+use poot_kernelgen::{
+    PackedContraction, PackedKernelOp, PackedKernelSpec, PackedRows, RegisterTiling, Schedule,
+};
 use poot_target::{Backend, DeviceCaps};
 
-/// `Ok(None)` when card 542a's table does not admit this equation's descriptor for this op: the
-/// caller falls back to `Capability::ImportedKernelPlanning`, the same refusal every unadmitted
-/// imported op gets today.
+/// Plan one imported packed equation. A descriptor card 542a's table does not admit for this op is
+/// refused with `Capability::PackedLowering`; a standalone `PackedDequant`, which no kernel lowers, with
+/// `Capability::ImportedKernelPlanning`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn try_plan(
+pub(super) fn plan(
     g: GraphTables<'_>,
     eqn: &Eqn,
     out_shape: &[usize],
@@ -41,11 +42,13 @@ pub(super) fn try_plan(
     caps: &DeviceCaps,
     limits: BodyLimits,
     packed_operands: &[bool],
-) -> Result<Option<Planned>, PlanError> {
+) -> Result<Planned, PlanError> {
     match &eqn.op {
         // No standalone dequantize kernel exists: a `PackedDequant` that no contraction or row gather claims is
         // refused by `compile`'s escape gate, and one that reaches planning is the same by-name refusal.
-        OpKind::PackedDequant { .. } => Ok(None),
+        OpKind::PackedDequant { .. } => {
+            Err(Site::new(g, eqn, backend, limits).refuse(Capability::ImportedKernelPlanning))
+        }
         OpKind::PackedContraction { descriptor, rows } => try_plan_contraction(
             g,
             eqn,
@@ -90,7 +93,7 @@ pub(super) fn try_plan(
             limits,
             *descriptor,
         ),
-        _ => unreachable!("try_plan is called only for imported_ops!()"),
+        _ => unreachable!("plan is called only for imported_ops!()"),
     }
 }
 
@@ -108,16 +111,18 @@ fn try_plan_row_gather(
     caps: &DeviceCaps,
     limits: BodyLimits,
     descriptor: poot_quant::PackedWeight,
-) -> Result<Option<Planned>, PlanError> {
+) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
-    let spec = match crate::packed_block_float::select_packed_kernel(
+    let format = crate::packed_block_float::admit_packed(
         crate::packed_block_float::PACKED_LOWERING,
         descriptor,
-        PackedKernelOp::RowGather,
+        crate::packed_block_float::PackedKernelOpKind::RowGather,
         backend,
-    ) {
-        Ok(spec) => spec,
-        Err(_) => return Ok(None),
+    )
+    .map_err(|missing| site.refuse(missing))?;
+    let spec = PackedKernelSpec {
+        format,
+        op: PackedKernelOp::RowGather,
     };
     let k = descriptor.shape()[1];
     let mut planned = Planned::generated(
@@ -141,7 +146,7 @@ fn try_plan_row_gather(
         odt,
         caps,
     )?;
-    Ok(Some(planned))
+    Ok(planned)
 }
 
 /// `out[row, col] = sum over k of activation[row, k] * decode(weight_row(row, col), k)`: the
@@ -151,20 +156,23 @@ fn try_plan_row_gather(
 /// chosen from shapes alone
 /// (dquant.md D3, section 5): `M == 1` (one activation row per block) is `Schedule::Gemv`, its launch
 /// shape from the output count and the device's compute units ([`gemv_schedule`], card 653); `M > 1`
-/// is `Schedule::Tiled` (card 542b, dquant.md D6/Q9), so GGUF prefill does not fall back to
-/// `Schedule::Serial` now that Card 545b has deleted the hand-written `TiledRegionDequant` family.
-/// Card 658: `Schedule::Tiled` now lays its row-tiles out per block (`poot_kernelgen`'s
-/// `contraction_tiled` doc), so a block-diagonal split (`blocks > 1`) no longer needs `m_per_block` a
-/// multiple of `tile` and no longer falls back to the per-thread-unbounded `Schedule::Serial` (since
-/// deleted) - the same no-cooperative-loading shape that pathologically hung the watchdog at real
-/// prefill dimensions before Card 163. Never from the format, matching
-/// every other packed-kernel schedule choice.
+/// is `Schedule::RegisterTiled` (card 542b, dquant.md D6/Q9; POOT-1193), so prefill does not fall back to
+/// `Schedule::Serial` now that Card 545b has deleted the hand-written `TiledRegionDequant` family. Its lanes each
+/// accumulate a register tile, so one workgroup computes a [`Schedule::output_tile`]-sized output tile (chosen
+/// from `m_per_block`, `K` and the device by [`Schedule::register_tiled`]) and decodes each staged weight element
+/// once for all of its rows.
+/// Card 658: the row-tiles are laid out per block (`poot_kernelgen`'s `tiled_body` doc), so a block-diagonal
+/// split (`blocks > 1`) needs no `m_per_block` multiple of the tile edge and no longer falls back to the
+/// per-thread-unbounded `Schedule::Serial` (since deleted) - the same no-cooperative-loading shape that
+/// pathologically hung the watchdog at real prefill dimensions before Card 163. Never from the format,
+/// matching every other packed-kernel schedule choice.
 ///
-/// **Card 658 review F1/F2/F7: the Tiled grid is folded and checked, never truncated.** `tiles =
-/// blocks * ceil(m_per_block/tile) * ceil(out_per_block/tile)` is this schedule's real workgroup
-/// count ([`Schedule::grid_threads`] divided by `tile*tile`); above `caps.max_grid[0]` it is folded
+/// **Card 658 review F1/F2/F7: the tiled grid is folded and checked, never truncated.** `tiles =
+/// blocks * ceil(m_per_block/tile_rows) * ceil(out_per_block/tile_cols)` (the output tile's extents) is this
+/// schedule's real workgroup count ([`Schedule::grid_threads`] divided by the lane grid's `lanes*lanes`); above
+/// `caps.max_grid[0]` it is folded
 /// onto a 2-D `(x_groups, y_groups)` grid the body reconstructs as `gy*x_groups+gx`
-/// (`poot_kernelgen`'s `contraction_tiled` doc - the same `GroupY`-spill convention `gemv_lds`/
+/// (`poot_kernelgen`'s `tiled_body` doc - the same `GroupY`-spill convention `gemv_lds`/
 /// `attention_body` use, `x_groups` riding in `metadata[3]` rather than baked, matching this
 /// kernel family's own shape-in-metadata design). Above `caps.max_grid[1]` too, or on any `usize ->
 /// u32` overflow along the way, `try_plan_contraction` refuses with `Capability::DispatchGridLimit`/
@@ -186,11 +194,18 @@ fn try_plan_contraction(
     rows: ContractionRows,
     epilogue: Option<&FusedRegion>,
     packed_operands: &[bool],
-) -> Result<Option<Planned>, PlanError> {
+) -> Result<Planned, PlanError> {
     let site = Site::new(g, eqn, backend, limits);
+    let format = crate::packed_block_float::admit_packed(
+        crate::packed_block_float::PACKED_LOWERING,
+        descriptor,
+        crate::packed_block_float::PackedKernelOpKind::Contraction,
+        backend,
+    )
+    .map_err(|missing| site.refuse(missing))?;
     let k = descriptor.shape()[1];
     let out = descriptor.shape()[0];
-    let (schedule, meta, grid) = match rows {
+    let (schedule, launches) = match rows {
         ContractionRows::Blocks(blocks) => {
             let out_per_block = out / blocks;
             let m_per_block = packed_contraction_m_per_block(g, eqn, descriptor, blocks);
@@ -202,32 +217,44 @@ fn try_plan_contraction(
                     1,
                     1,
                 ];
-                (schedule, vec![k as u32, out_per_block as u32], grid)
+                let launch = PackedLaunch {
+                    grid,
+                    meta: vec![k as u32, out_per_block as u32],
+                };
+                (schedule, vec![launch])
             } else {
-                let tile = poot_kernelgen::TileSize::new(GEMM_TILE as u32)
-                    .map_err(|error| site.refuse(Capability::KernelGen(error)))?;
-                let schedule = Schedule::Tiled { tile };
-                let ts = tile.get() as usize;
+                let tiling = RegisterTiling::choose(m_per_block, k, caps);
+                let (tile_rows, tile_cols) = tiling.output_tile();
                 let tiles = blocks
-                    .checked_mul(m_per_block.div_ceil(ts))
-                    .and_then(|v| v.checked_mul(out_per_block.div_ceil(ts)))
+                    .checked_mul(m_per_block.div_ceil(tile_rows))
+                    .and_then(|v| v.checked_mul(out_per_block.div_ceil(tile_cols)))
                     .ok_or_else(|| site.refuse(Capability::DispatchSizeOverflow))?;
-                let FoldedTileGrid { x_groups, grid } = folded_tile_grid(site, tiles, ts, caps)?;
-                let meta = vec![k as u32, out_per_block as u32, m_per_block as u32, x_groups];
-                (schedule, meta, grid)
+                let per_dispatch = tiles_per_dispatch(tiles, tile_rows * tile_cols, k, caps);
+                let launches = (0..tiles)
+                    .step_by(per_dispatch)
+                    .map(|offset| {
+                        let count = (tiles - offset).min(per_dispatch);
+                        let FoldedTileGrid { x_groups, grid } =
+                            folded_tile_grid(site, count, tiling.lanes(), caps)?;
+                        let overflow = || site.refuse(Capability::DispatchSizeOverflow);
+                        let offset = u32::try_from(offset).map_err(|_| overflow())?;
+                        let meta = vec![
+                            k as u32,
+                            out_per_block as u32,
+                            m_per_block as u32,
+                            x_groups,
+                            offset,
+                        ];
+                        Ok(PackedLaunch { grid, meta })
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?;
+                (tiling.schedule(), launches)
             }
         }
         ContractionRows::Indexed { experts } => {
-            plan_indexed(site, g, eqn, descriptor, experts, caps)?
+            let (schedule, meta, grid) = plan_indexed(site, g, eqn, descriptor, experts, caps)?;
+            (schedule, vec![PackedLaunch { grid, meta }])
         }
-    };
-    let Ok(format) = crate::packed_block_float::admit_packed(
-        crate::packed_block_float::PACKED_LOWERING,
-        descriptor,
-        crate::packed_block_float::PackedKernelOpKind::Contraction,
-        backend,
-    ) else {
-        return Ok(None);
     };
     let epilogue = match epilogue {
         // The tiled schedule has no epilogue (the generator refuses it by name), and the fuse rule forms one
@@ -244,8 +271,7 @@ fn try_plan_contraction(
         )?),
         None => None,
     };
-    let mut planned = Planned::generated(
-        site,
+    let request = |PackedLaunch { grid, meta }: PackedLaunch| {
         KernelRequest::Contraction(ContractionSpec::Packed(PackedContraction {
             format,
             rows: match rows {
@@ -253,13 +279,20 @@ fn try_plan_contraction(
                 ContractionRows::Indexed { .. } => PackedRows::Indexed,
             },
             schedule,
-            epilogue,
+            epilogue: epilogue.clone(),
             grid,
             meta,
-        })),
-        backend,
-        caps,
-    )?;
+        }))
+    };
+    let mut planned = match <[PackedLaunch; 1]>::try_from(launches) {
+        Ok([launch]) => Planned::generated(site, request(launch), backend, caps)?,
+        Err(launches) => Planned::split(
+            launches
+                .into_iter()
+                .map(|launch| Planned::generated_dispatch(site, request(launch), backend, caps))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?,
+    };
     finalize(
         &mut planned,
         g,
@@ -270,7 +303,34 @@ fn try_plan_contraction(
         odt,
         caps,
     )?;
-    Ok(Some(planned))
+    Ok(planned)
+}
+
+/// One dispatch of a packed contraction: its thread grid and metadata buffer.
+struct PackedLaunch {
+    grid: [u32; 3],
+    meta: Vec<u32>,
+}
+
+/// How many tiles of a block-diagonal packed tiled contraction one dispatch covers: all of them on a device
+/// with no watchdog budget, else as many as keep a dispatch within `packed_tiled_work` multiply-accumulates
+/// (one tile is `tile_outputs * k` of them, `tile_outputs` the outputs one workgroup computes), and at least one; a chunk that folds is whole rows of the X grid.
+fn tiles_per_dispatch(tiles: usize, tile_outputs: usize, k: usize, caps: &DeviceCaps) -> usize {
+    let Some(budget) = caps.watchdog_budget else {
+        return tiles;
+    };
+    let per_tile = (tile_outputs * k).max(1) as u64;
+    let within_budget = usize::try_from(budget.packed_tiled_work / per_tile)
+        .unwrap_or(usize::MAX)
+        .clamp(1, tiles.max(1));
+    // A chunk that folds onto several grid rows is a whole number of them: the folded grid launches full rows,
+    // and a partial one would launch (and redo) the next chunk's first tiles.
+    let row = caps.max_grid[0].max(1) as usize;
+    if within_budget < tiles && within_budget > row {
+        within_budget - within_budget % row
+    } else {
+        within_budget
+    }
 }
 
 /// The `Schedule::Gemv` launch policy for a packed contraction with `outputs` output columns (card
@@ -390,10 +450,11 @@ fn packed_indexed_gemv(m: usize, n: usize, caps: &DeviceCaps) -> Option<Schedule
 
 #[cfg(test)]
 mod tests {
-    use crate::production_plan::Submission;
     use crate::types::Launch;
     use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
-    use poot_kernelgen::{ContractionSpec, KernelRequest, PackedContraction, Schedule};
+    use poot_kernelgen::{
+        ContractionSpec, KernelRequest, PackedContraction, RegisterTiling, Schedule,
+    };
     use poot_quant::PackedWeight;
     use poot_quant::format::WeightFormat;
     use poot_target::{Backend, DeviceCaps};
@@ -427,8 +488,10 @@ mod tests {
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]))
                 .unwrap();
             let weight = PackedWeight::try_new(WeightFormat::Q8_0, [n, k]).unwrap();
-            let out = poot_graph_ir::ops::packed_linear(&builder, x, "layer", weight, None, None)
-                .unwrap();
+            let out = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &builder, x, "layer", weight, None, None,
+            )
+            .unwrap();
             let target = Target::Gpu {
                 backend: Backend::SpirvVulkan,
                 caps: DeviceCaps {
@@ -437,7 +500,7 @@ mod tests {
                     ..DeviceCaps::wgpu_rdna3_igpu()
                 },
             };
-            let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
+            let options = CompileOptions::new(crate::CompileLimits::STANDARD);
             let program = compile(&builder.finish(out).unwrap(), &target, &options)
                 .unwrap_or_else(|error| panic!("{what}: {error}"));
             let (eqn, plan) = program
@@ -479,14 +542,14 @@ mod tests {
     }
 
     /// SC-001 (card 658, GPU-free): a block-diagonal `PackedContraction` (`blocks = 4`) whose
-    /// `m_per_block = 5` is not a multiple of `GEMM_TILE` (8) - the exact shape
-    /// `try_plan_contraction` used to refuse to `Schedule::Tiled` and fall back to the per-thread-
-    /// unbounded `Schedule::Serial` for - compiles to `Schedule::Tiled`,
+    /// `m_per_block = 5` is not a multiple of the 8-row lane grid - the exact shape
+    /// `try_plan_contraction` used to refuse to tile and fall back to the per-thread-
+    /// unbounded `Schedule::Serial` for - compiles to `Schedule::RegisterTiled`,
     /// never `Schedule::Serial`. Driven through `compile`, over
-    /// `ops::packed_block_diagonal_linear` (Card 385's block-diagonal builder, the same chain
+    /// `packed_graphs::packed_block_diagonal_linear` (Card 385's block-diagonal builder, the same chain
     /// `packed_block_diagonal_chain_is_recognized_as_one_contraction` proves folds to one
     /// `PackedContraction`). Mutation: restore the old `else if blocks == 1 { Tiled } else { Serial
-    /// }` arm in `try_plan_contraction`; the plan key goes from `...:Tiled { tile: 8 }:4` to
+    /// }` arm in `try_plan_contraction`; the plan key goes from `...:RegisterTiled { lanes: 8 }:4` to
     /// `...:Serial:4` and this test goes red.
     #[test]
     fn block_diagonal_ragged_m_per_block_compiles_to_tiled_not_serial() {
@@ -501,7 +564,7 @@ mod tests {
                 TensorType::f32(vec![blocks, m_per_block, k]),
             )
             .unwrap();
-        let out_value = poot_graph_ir::ops::packed_block_diagonal_linear(
+        let out_value = poot_graph_ir::test_support::packed_graphs::packed_block_diagonal_linear(
             &builder, x, "layer", descriptor, blocks, None,
         )
         .unwrap();
@@ -509,7 +572,7 @@ mod tests {
             backend: Backend::SpirvVulkan,
             caps: DeviceCaps::wgpu_rdna3_igpu(),
         };
-        let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
+        let options = CompileOptions::new(crate::CompileLimits::STANDARD);
         let program = compile(&builder.finish(out_value).unwrap(), &target, &options).unwrap();
         let (eqn, plan) = program
             .planned()
@@ -519,9 +582,8 @@ mod tests {
             panic!("expected a single dispatch, got {plan:?}");
         };
         let grid = launch.grid;
-        let schedule = Schedule::Tiled {
-            tile: poot_kernelgen::TileSize::new(super::GEMM_TILE as u32).unwrap(),
-        };
+        let schedule =
+            RegisterTiling::choose(m_per_block, k, &DeviceCaps::wgpu_rdna3_igpu()).schedule();
         let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
             PackedContraction {
                 format,
@@ -542,6 +604,135 @@ mod tests {
                 1
             ]
         );
+    }
+
+    /// POOT-1193, GPU-free: the FP8 prefill linear of Qwen3.8-27B on gfx1151 (`[128, 5120] x [17408, 5120]^T`,
+    /// block-scaled E4M3 with bf16 scales) plans the register-tiled GEMM and not the one-output-per-lane tile
+    /// that ran it at ~12 tok/s: a 16x16 lane grid (a 256-lane workgroup) whose lanes each own an 8x4 register
+    /// tile, so the 128 rows are one row-tile of [`Schedule::output_tile`] and the 17408 columns 272 column-tiles, and
+    /// `K = 5120` stages as four-value runs.
+    /// Driven through `compile` with the real ROCm capabilities. Mutation: plan the 8x8 output tile again
+    /// (the old `Schedule::Tiled` edge) - the schedule, the 272-tile grid and this row go red.
+    #[test]
+    fn a_fp8_prefill_linear_plans_the_register_tiled_gemm_on_gfx1151() {
+        let (m, k, n) = (128usize, 5120usize, 17408usize);
+        let descriptor = PackedWeight::try_new(
+            WeightFormat::E4m3Block128 {
+                scale: poot_quant::format::ScaleEncoding::Bf16,
+            },
+            [n, k],
+        )
+        .unwrap();
+        let builder = Builder::for_tests();
+        let x = builder
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]))
+            .unwrap();
+        let out = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &builder, x, "up_proj", descriptor, None, None,
+        )
+        .unwrap();
+        let target = Target::Gpu {
+            backend: Backend::AmdGcn(poot_target::AmdArch::gfx1151()),
+            caps: DeviceCaps::rocm_default(),
+        };
+        let options = CompileOptions::new(crate::CompileLimits::STANDARD);
+        let program = compile(&builder.finish(out).unwrap(), &target, &options).unwrap();
+        let (eqn, plan) = program
+            .planned()
+            .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
+            .unwrap_or_else(|| panic!("no PackedContraction planned"));
+        let Some(Dispatch { body, launch, .. }) = plan.single() else {
+            panic!("expected a single dispatch, got {plan:?}");
+        };
+        let KernelChoice::Generated(KernelRequest::Contraction(ContractionSpec::Packed(
+            PackedContraction { schedule, .. },
+        ))) = program.kernel_choice(eqn)
+        else {
+            panic!("a packed contraction is a generated contraction request");
+        };
+        let Schedule::RegisterTiled { lanes, rows, run } = *schedule else {
+            panic!("a prefill linear is the register-tiled GEMM, got {schedule:?}");
+        };
+        assert_eq!(
+            (lanes.get(), rows.get(), run.get()),
+            (16, 8, 4),
+            "128 rows fill the 16x16 lane grid's 128-row tile; K = 5120 stages as word-sized runs of byte codes"
+        );
+        let (tile_rows, tile_cols) = schedule.output_tile().unwrap();
+        assert_eq!((tile_rows, tile_cols), (128, 64));
+        let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+        assert_eq!(tiles, 272, "one row-tile of 128 by 272 column-tiles of 64");
+        assert_eq!(body.workgroup_size, [256, 1, 1]);
+        assert_eq!(launch.grid, [tiles as u32 * 256, 1, 1]);
+        assert_eq!(launch.meta, [k as u32, n as u32, m as u32, tiles as u32, 0]);
+    }
+
+    /// POOT-1263 (GPU-free): a packed tiled contraction (E4M3 here; the split is format-agnostic) whose multiply-accumulates exceed the device's
+    /// `packed_tiled_work` plans several dispatches over disjoint, contiguous, exhaustive tile ranges (each
+    /// dispatch's metadata carries its first tile), each within the budget; the same shape on a device with no
+    /// watchdog budget is one dispatch with offset 0. Driven through `compile`. Mutation: make
+    /// `tiles_per_dispatch` return `tiles` regardless of the budget; the wgpu row goes red (one dispatch). The tiles are the register-tiled schedule's (a 128 x 64 tile).
+    #[test]
+    fn a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges() {
+        let (m, n, k) = (2048usize, 16_384usize, 512usize);
+        let caps = DeviceCaps::wgpu_rdna3_igpu();
+        let (tile_rows, tile_cols) = RegisterTiling::choose(m, k, &caps).output_tile();
+        let tiles = m.div_ceil(tile_rows) * n.div_ceil(tile_cols);
+        let format = WeightFormat::E4m3Block128 {
+            scale: poot_quant::format::ScaleEncoding::Bf16,
+        };
+        let descriptor = PackedWeight::try_new(format, [n, k]).unwrap();
+        let plan_for = |caps: DeviceCaps| {
+            let builder = Builder::for_tests();
+            let x = builder
+                .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]))
+                .unwrap();
+            let out = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &builder, x, "layer", descriptor, None, None,
+            )
+            .unwrap();
+            let target = Target::Gpu {
+                backend: Backend::SpirvVulkan,
+                caps,
+            };
+            let options = CompileOptions::new(crate::CompileLimits::STANDARD);
+            let program = compile(&builder.finish(out).unwrap(), &target, &options).unwrap();
+            let (_, plan) = program
+                .planned()
+                .find(|(eqn, _)| matches!(eqn.op, OpKind::PackedContraction { .. }))
+                .expect("a PackedContraction is planned");
+            plan.dispatches()
+                .iter()
+                .map(|dispatch| (dispatch.launch().grid, dispatch.launch().meta.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let budget = caps.watchdog_budget.unwrap().packed_tiled_work;
+        let launches = plan_for(caps);
+        assert!(launches.len() > 1, "{} dispatch(es)", launches.len());
+        let mut next = 0usize;
+        for (grid, meta) in &launches {
+            let [_, out_per_block, m_per_block, x_groups, offset] = meta[..] else {
+                panic!("tiled metadata is [K, N, M, x_groups, tile_offset]: {meta:?}");
+            };
+            assert_eq!(offset as usize, next, "ranges are contiguous: {meta:?}");
+            let count = (x_groups * grid[1]) as usize;
+            let count = count.min(tiles - next);
+            assert!(
+                (count * tile_rows * tile_cols * k) as u64 <= budget,
+                "{count} tiles exceed the budget"
+            );
+            assert_eq!((out_per_block, m_per_block), (n as u32, m as u32));
+            next += count;
+        }
+        assert_eq!(next, tiles, "the ranges cover every tile");
+
+        let unbudgeted = plan_for(DeviceCaps {
+            watchdog_budget: None,
+            ..DeviceCaps::wgpu_rdna3_igpu()
+        });
+        assert_eq!(unbudgeted.len(), 1);
+        assert_eq!(unbudgeted[0].1[4], 0);
     }
 
     /// Builds a `[blocks, m_per_block, k]` block-diagonal activation against a `[blocks*out_per_block,
@@ -573,7 +764,7 @@ mod tests {
                 TensorType::f32(vec![blocks, m_per_block, k]),
             )
             .unwrap();
-        let out_value = poot_graph_ir::ops::packed_block_diagonal_linear(
+        let out_value = poot_graph_ir::test_support::packed_graphs::packed_block_diagonal_linear(
             &builder, x, "layer", descriptor, blocks, None,
         )
         .unwrap();
@@ -597,10 +788,10 @@ mod tests {
         }
     }
 
-    /// SC-001 (card 658 review F1/F2, GPU-free): `tiles = ceil(40/8) * ceil(8/8) = 5` exceeds a fixture
+    /// SC-001 (card 658 review F1/F2, GPU-free): `tiles = ceil(640/128) * ceil(8/64) = 5` exceeds a fixture
     /// `max_grid[0] = 4`, so `try_plan_contraction` folds onto `(x_groups, y_groups) = (4, 2)` rather
     /// than refusing or truncating - `y_groups <= max_grid[1] = 4`, so the fold fits. The plan's `grid`
-    /// carries the folded dims and `body.workgroup_size` stays the Tiled body's baked `[64, 1, 1]`:
+    /// carries the folded dims and `body.workgroup_size` stays the tiled body's baked `[64, 1, 1]`:
     /// `finalize`'s generic wg-bump never corrupts the 64-lane LDS tile for this arm
     /// (`kernel_mapping::shape_launch` exempts every packed contraction request by type).
     ///
@@ -608,7 +799,7 @@ mod tests {
     /// `(tiles_u32, 1)` - `grid` goes from `[256, 2, 1]` to `[320, 1, 1]` and this test goes red.
     #[test]
     fn over_cap_tiled_contraction_folds_onto_a_2d_grid_not_the_wg_bump() {
-        let (graph, index) = over_cap_tiled_eqn(1, 40, 8);
+        let (graph, index) = over_cap_tiled_eqn(1, 640, 8);
         let eqn = &graph.eqns()[index];
         let plan = crate::plan_eqn(
             &graph,
@@ -627,11 +818,11 @@ mod tests {
             panic!("expected a single dispatch, got {plan:?}");
         };
         let grid = *grid;
-        assert_eq!(grid, [4 * 64, 2, 1], "folded grid: x_groups=4, y_groups=2");
+        assert_eq!(grid, [4 * 256, 2, 1], "folded grid: x_groups=4, y_groups=2");
         assert_eq!(
             body.workgroup_size,
-            [64, 1, 1],
-            "the wg-bump must not touch this arm's baked 64-lane workgroup"
+            [256, 1, 1],
+            "the wg-bump must not touch this arm's baked 256-lane workgroup"
         );
         assert_eq!(
             meta.get(3),
@@ -640,7 +831,7 @@ mod tests {
         );
     }
 
-    /// SC-001 (card 658 review F1/F2, GPU-free): `tiles = ceil(200/8) * ceil(8/8) = 25` exceeds the
+    /// SC-001 (card 658 review F1/F2, GPU-free): `tiles = ceil(3200/128) * ceil(8/64) = 25` exceeds the
     /// fixture `max_grid[0] = 4`, and even folded (`y_groups = ceil(25/4) = 7`) exceeds `max_grid[1] =
     /// 4` too - no 2-D grid can address every tile, so `try_plan_contraction` refuses with
     /// `Capability::DispatchGridLimit` naming the equation, before any dispatch (SC-001's named
@@ -651,7 +842,7 @@ mod tests {
     /// test goes red.
     #[test]
     fn over_cap_tiled_contraction_refuses_when_even_the_fold_cannot_address_every_tile() {
-        let (graph, index) = over_cap_tiled_eqn(1, 200, 8);
+        let (graph, index) = over_cap_tiled_eqn(1, 3200, 8);
         let eqn = &graph.eqns()[index];
         let error = crate::plan_eqn(
             &graph,
@@ -678,8 +869,8 @@ mod tests {
     }
 
     /// SC-001 (card 669, GPU-free): the refusal `try_plan_contraction` raises while probing a claimed
-    /// over-cap block-diagonal contraction (`blocks = 2`, `m_per_block = 200`, `out_per_block = 8`,
-    /// `K = 32`, Q4_0: `tiles = 50`, `y_groups = 13` above the fixture `max_grid = [4, 4, 4]`) reaches
+    /// over-cap block-diagonal contraction (`blocks = 2`, `m_per_block = 1200`, `out_per_block = 8`,
+    /// `K = 32`, Q4_0: `tiles = 20`, `y_groups = 5` above the fixture `max_grid = [4, 4, 4]`) reaches
     /// the `compile()` caller as the typed `Capability::DispatchGridLimit` refusal naming the
     /// contracted equation. `revert_unplannable_rewrites` puts the decomposition back when the claim
     /// refuses, so the escape gate used to report the restored graph's downstream symptom
@@ -690,7 +881,7 @@ mod tests {
     /// escape error above and fails.
     #[test]
     fn over_cap_block_diagonal_compile_reports_the_grid_refusal_not_the_escape_symptom() {
-        let (blocks, m_per_block, out_per_block, k) = (2usize, 200usize, 8usize, 32usize);
+        let (blocks, m_per_block, out_per_block, k) = (2usize, 1200usize, 8usize, 32usize);
         let descriptor =
             PackedWeight::try_new(WeightFormat::Q4_0, [blocks * out_per_block, k]).unwrap();
         let builder = Builder::for_tests();
@@ -701,7 +892,7 @@ mod tests {
                 TensorType::f32(vec![blocks, m_per_block, k]),
             )
             .unwrap();
-        let out_value = poot_graph_ir::ops::packed_block_diagonal_linear(
+        let out_value = poot_graph_ir::test_support::packed_graphs::packed_block_diagonal_linear(
             &builder, x, "layer", descriptor, blocks, None,
         )
         .unwrap();
@@ -711,7 +902,7 @@ mod tests {
             backend: Backend::SpirvVulkan,
             caps: tiny_grid_caps(),
         };
-        let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
+        let options = CompileOptions::new(crate::CompileLimits::STANDARD);
         let Err(error) = compile(&graph, &target, &options) else {
             panic!("the over-cap contraction must not compile");
         };
@@ -750,7 +941,7 @@ mod tests {
         k: usize,
     ) -> (poot_graph_ir::Graph, usize) {
         let descriptor = PackedWeight::try_new(WeightFormat::Q8_0, [out, k]).unwrap();
-        let table = poot_graph_ir::ops::PackedExpertStack {
+        let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
             stack_id: "experts".to_string(),
             descriptor,
             experts,
@@ -766,7 +957,10 @@ mod tests {
                 TensorType::new(vec![rows], poot_tensor::DType::I32),
             )
             .unwrap();
-        let y = poot_graph_ir::ops::packed_indexed_linear(&builder, x, ids, &table).unwrap();
+        let y = poot_graph_ir::test_support::packed_graphs::packed_indexed_linear(
+            &builder, x, ids, &table,
+        )
+        .unwrap();
         let graph = builder.finish(y).unwrap();
         let index = graph
             .eqns()
@@ -859,11 +1053,11 @@ mod tests {
     }
 
     /// SC-001 (card 658, GPU-free): the real `wgpu_rdna3_igpu` grid cap, not a
-    /// fixture - `blocks = 4, m_per_block = 1030, out_per_block = 1024` is `out_numel = 4,218,880 >
+    /// fixture - `blocks = 8, m_per_block = 65536, out_per_block = 1024` is `out_numel = 536,870,912 >
     /// 4,194,240`, the exact `out_numel.div_ceil(64) > 65_535` threshold where `finalize`'s generic
     /// wg-bump would rewrite a one-thread-per-output body's workgroup from 64 to 256 - round 1's own
     /// reproduction showed a bumped Tiled body computes wrong values at this scale (`element 0: got
-    /// 120.47945 want 570.88153`). `tiles = 4 * ceil(1030/8) * ceil(1024/8) = 66,048` exceeds
+    /// 120.47945 want 570.88153`). `tiles = 8 * ceil(65536/128) * ceil(1024/64) = 65,536` exceeds
     /// `max_grid[0] = 65_535`, folding to `(x_groups, y_groups) = (65_535, 2)`. This is the one test
     /// that actually exercises `kernel_mapping::shape_launch`'s contraction exemption at the scale the
     /// hazard fires at - the fold-success/refusal rows above use a `max_grid: [4, 4, 4]` fixture four
@@ -871,10 +1065,10 @@ mod tests {
     ///
     /// Mutation: in `kernel_mapping::shape_launch` set `contraction` to `false` for every request
     /// (dropping the exemption from `custom_grid`). Red: `body.workgroup_size` comes back `[256, 1, 1]`,
-    /// not `[64, 1, 1]` - the generic bump fired on the 64-lane-baked Tiled body. Restored; green.
+    /// not `[64, 1, 1]` - the generic bump fired on the 256-lane-baked tiled body. Restored; green.
     #[test]
     fn over_cap_tiled_contraction_at_real_wgpu_caps_keeps_the_baked_workgroup() {
-        let (blocks, m_per_block, out_per_block) = (4usize, 1030usize, 1024usize);
+        let (blocks, m_per_block, out_per_block) = (8usize, 65536usize, 1024usize);
         let out_numel = blocks * m_per_block * out_per_block;
         assert!(
             out_numel > 4_194_240,
@@ -886,7 +1080,12 @@ mod tests {
             &graph,
             eqn,
             Backend::SpirvVulkan,
-            &DeviceCaps::wgpu_rdna3_igpu(),
+            // No watchdog budget: this row is the fold at real grid scale as one dispatch, not the budget split
+            // (`a_packed_tiled_contraction_over_the_watchdog_budget_splits_into_tile_ranges`).
+            &DeviceCaps {
+                watchdog_budget: None,
+                ..DeviceCaps::wgpu_rdna3_igpu()
+            },
             &crate::test_support::roomy_body_limits(),
         )
         .unwrap_or_else(|error| panic!("expected a bounded plan, got a refusal: {error}"));
@@ -901,12 +1100,12 @@ mod tests {
         let grid = *grid;
         assert_eq!(
             body.workgroup_size,
-            [64, 1, 1],
-            "finalize's wg-bump must not touch this arm's baked 64-lane workgroup at real scale"
+            [256, 1, 1],
+            "finalize's wg-bump must not touch this arm's baked 256-lane workgroup at real scale"
         );
         assert_eq!(
             grid,
-            [65_535 * 64, 2, 1],
+            [65_535 * 256, 2, 1],
             "folded grid at real wgpu caps: x_groups=65_535, y_groups=2"
         );
         assert_eq!(

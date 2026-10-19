@@ -7,10 +7,13 @@ use std::path::PathBuf;
 use poot_executor::ExecError;
 use poot_graph_ir::SlotMapError;
 use poot_graph_plan::{Refusal, staged::StagedCompileError};
-use poot_models::model::{ModelError, Phase, StepShape, TraceError};
+use poot_models::io::{InputError, InputId};
+use poot_models::model::{ModelError, StepShape, TraceError};
 use poot_models::registry::RegistryError;
 
 use crate::core::sampler::SamplerFault;
+use crate::driver::Program;
+use crate::driver::features::Incompatible;
 use crate::driver::lora::{AdapterError, GenerationId, LoraError};
 use crate::driver::step::SeqId;
 use crate::driver::suffix::Head;
@@ -19,7 +22,7 @@ use poot_text::{ChatTemplateError, TextError};
 /// Why the driver cannot serve something: the model, the registry or the planner has no way to.
 #[derive(Debug, thiserror::Error)]
 pub enum Unsupported {
-    /// The family refused to trace the step (a phase or shape it does not support).
+    /// The family refused to trace the step (a program or shape it does not support).
     #[error(transparent)]
     Trace(TraceError),
     /// The planner cannot lower one equation of the traced graph for the executor's target.
@@ -42,10 +45,13 @@ pub enum Unsupported {
     /// No registered family names the checkpoint's config.
     #[error(transparent)]
     Registry(RegistryError),
-    /// A slot the traced program declares has no binding in the driver (no role names it).
-    #[error("the program declares slot {key}, which the driver has no binding for")]
+    /// A slot the traced program declares is neither a step kind, a request input of the model's
+    /// schema nor an input of a driver-side graph addition: a defect of the family's wiring.
+    #[error("program {program} declares slot {key}, which no schema entry or driver pass binds")]
     UnboundSlot {
-        /// The slot key the traced program declares, which no role names.
+        /// The program whose graph declares the slot.
+        program: poot_models::io::ProgramId,
+        /// The slot key the traced program declares, which nothing binds.
         key: String,
     },
     /// This build has no executor for the requested backend; the backend's cargo feature of the same
@@ -72,17 +78,10 @@ pub enum Unsupported {
     /// The adapters do not stack against this model's weights.
     #[error(transparent)]
     Adapter(AdapterError),
-    /// The placement has no form of something the driver was asked for: a tensor-parallel driver loads
-    /// one executable whose weights are cut per rank, so a second executable over whole weights is
-    /// refused rather than served over weights the program does not bind; a draft model's layers are
-    /// not the target's, so the target's pipeline cut names nothing in them.
-    #[error("a {placement} placement has no form of {what}")]
-    Placement {
-        /// The placement's name, as `Placed::name` reports it.
-        placement: &'static str,
-        /// What the driver was asked to build that the placement has no form of.
-        what: &'static str,
-    },
+    /// Two features of the driver or of the request cannot be combined, by the one compatibility table in
+    /// `driver::features`.
+    #[error(transparent)]
+    Incompatible(Incompatible),
 }
 
 /// Why a [`DraftPolicy`](crate::driver::DraftPolicy) is refused at `prepare`.
@@ -98,28 +97,9 @@ pub enum SpeculationRefusal {
         /// The model's prefill granule, in tokens.
         granule: usize,
     },
-    /// The draft model carries recurrent state: the target's rollback does not cover the draft's, so
-    /// a rejected draft token would stay folded into it.
-    #[error("a draft model with recurrent state cannot be rolled back, only the target's is")]
-    RecurrentDraft,
     /// The draft model cannot propose tokens the target verifies.
     #[error("the draft model does not fit the target: {0}")]
     DraftMismatch(DraftMismatch),
-    /// The family's MTP program carries recurrent state. Only the target's decode program defines
-    /// the rollback's snapshot schema, so MTP-only recurrent state would never be restored after a
-    /// rejected draft.
-    #[error(
-        "the MTP program carries recurrent state, which a rejected draft cannot be rolled back out of"
-    )]
-    RecurrentMtp,
-    /// The MTP layer has the base weights only: an adapter changes the target's effective weights
-    /// and the layer would draft for a different model.
-    #[error("MTP speculation serves the base weights only, not adapter set generation {0:?}")]
-    MtpAdapters(GenerationId),
-    /// Beam search runs the target's programs without the hidden-state carry, so the MTP layer's
-    /// cache would not follow its rows.
-    #[error("beam search is not served under MTP speculation")]
-    MtpBeam,
 }
 
 /// How a draft model disagrees with the target it proposes for.
@@ -172,9 +152,6 @@ pub enum InvalidRequest {
         /// The model's vocabulary size.
         vocab: usize,
     },
-    /// `open` and `step` serve the shapes `Driver::prepare` admitted; nothing is admitted yet.
-    #[error("the driver has no serving shapes: call prepare first")]
-    NotPrepared,
     /// The id names no open sequence: never opened, or already released.
     #[error("sequence {0:?} is not open")]
     UnknownSeq(SeqId),
@@ -253,86 +230,22 @@ pub enum InvalidRequest {
     /// slot of the paged pool. No block count would help.
     #[error("every sequence slot is taken: release a sequence first")]
     SlotsBusy,
-    /// A paged pool shares earlier turns through its prefix cache (`open` finds them); only the contiguous
-    /// layout's one private cache is resumed in place.
-    #[error(
-        "a paged sequence cannot be resumed: open the next turn and the prefix cache reuses it"
-    )]
-    ResumePaged,
-    /// The sequence's prompt supplied embedding rows or sectioned positions that a new prompt does not.
-    #[error("sequence {0:?} was opened with prompt embeddings or positions and cannot be resumed")]
-    ResumeEmbedded(SeqId),
     /// The adapter reference the request names is not loaded, or its index is out of range.
     #[error(transparent)]
     Adapter(LoraError),
-    /// The embedding rows a prompt supplies do not fit it.
+    /// The request's input values do not satisfy the model's schema for the program that serves it.
     #[error(transparent)]
-    Embeds(EmbedsError),
-    /// The sectioned positions a prompt supplies do not fit it or its model.
-    #[error(transparent)]
-    Mrope(MropeError),
+    Input(InputError),
+    /// The request carries an input no prepared entry of its weights binds: the deployment was not
+    /// prepared for it ([`Driver::prepare_carried`](crate::driver::Driver::prepare_carried)).
+    #[error("no prepared entry binds input {input} under the request's weights")]
+    InputNotPrepared {
+        /// The input the request carries.
+        input: InputId,
+    },
     /// An encode request the driver cannot batch into one step.
     #[error(transparent)]
     Encode(EncodeError),
-}
-
-/// Why a prompt's sectioned (mRoPE) positions are refused.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MropeError {
-    /// The positions cover `positions` tokens, the prompt has `prompt`.
-    #[error("sectioned positions cover {positions} tokens, the prompt has {prompt}")]
-    Length {
-        /// Tokens the supplied positions cover.
-        positions: usize,
-        /// Tokens the prompt has.
-        prompt: usize,
-    },
-    /// The served model rotates at plain positions: it has no `Slot::MropePosition` to bind them to.
-    #[error("the model has no sectioned rotary positions: a prompt cannot supply them")]
-    NotSectioned,
-}
-
-/// Why a prompt's embedding rows are refused.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum EmbedsError {
-    /// `rows` holds `rows` values, not `positions * width`.
-    #[error("{positions} embedding rows of width {width} need {} values, got {rows}", positions * width)]
-    Length {
-        /// Embedding rows supplied.
-        positions: usize,
-        /// Values per embedding row.
-        width: usize,
-        /// Values the row buffer actually holds.
-        rows: usize,
-    },
-    /// The positions must be strictly ascending and inside the prompt.
-    #[error("embedding position {position} is out of order or outside the {prompt}-token prompt")]
-    Position {
-        /// The offending position.
-        position: usize,
-        /// The prompt's length in tokens.
-        prompt: usize,
-    },
-    /// The rows are not as wide as the model's embedding.
-    #[error("embedding rows are {got} wide, the model's embedding is {want}")]
-    Width {
-        /// Values per supplied row.
-        got: usize,
-        /// The model's embedding width.
-        want: usize,
-    },
-    /// Only the base weights have `PrefillEmbeds` entries: an adapter sequence cannot take embedding
-    /// rows.
-    #[error("a prompt with embedding rows cannot run under an adapter")]
-    Adapter,
-    /// A draft model prefills over the prompt's tokens and has no way to take the rows, so its
-    /// proposals for such a prompt would come from placeholder tokens.
-    #[error("a prompt with embedding rows cannot run under a draft-model speculation policy")]
-    DraftModel,
-    /// The MTP layer embeds the tokens the sequence holds, which are placeholders where the prompt
-    /// supplies rows.
-    #[error("a prompt with embedding rows cannot run under an MTP speculation policy")]
-    Mtp,
 }
 
 /// Why an encode request is refused.
@@ -341,10 +254,16 @@ pub enum EncodeError {
     /// An encode request with no rows.
     #[error("an encode request needs at least one row")]
     Empty,
-    /// One step has one kind of input: token rows or image frames.
-    #[error("an encode request cannot mix token rows and image frames")]
+    /// One step has one kind of row: every row's extent and carried inputs are the same.
+    #[error("an encode request cannot mix rows of different extents or inputs")]
     Mixed,
-    /// A token row with no tokens.
+    /// A row whose padded per-row inputs disagree on their leading extent.
+    #[error("encode row {row}: its per-row inputs have different leading extents")]
+    RaggedRow {
+        /// Index of the row in the request.
+        row: usize,
+    },
+    /// A row with no tokens and no extent of its own.
     #[error("encode row {row} has no tokens")]
     EmptyRow {
         /// Index of the empty row in the request.
@@ -353,29 +272,6 @@ pub enum EncodeError {
     /// The step's cache aliases an open sequence's.
     #[error("encode shares the cache of an open sequence: release it first")]
     SequenceOpen,
-    /// A row's token-type ids do not match its tokens.
-    #[error("encode row {row}: {types} token types for {tokens} tokens")]
-    TokenTypes {
-        /// Index of the row in the request.
-        row: usize,
-        /// Tokens the row has.
-        tokens: usize,
-        /// Token-type ids the row supplied.
-        types: usize,
-    },
-    /// A frame row whose pixel count is not what the vision tower takes per frame.
-    #[error("encode row {row}: a frame of {got} values, the step takes {want}")]
-    FrameLength {
-        /// Index of the row in the request.
-        row: usize,
-        /// Pixel values the row supplied.
-        got: usize,
-        /// Pixel values one frame takes.
-        want: usize,
-    },
-    /// The tower does not declare the grid inputs of a patch row (it is not a windowed vision tower).
-    #[error("the model takes no patch rows with a grid geometry")]
-    NoGeometry,
     /// A request of more token rows than the prepared shapes hold.
     #[error("an encode request of {rows} rows exceeds the {max} rows the engine is fitted for")]
     TooManyRows {
@@ -402,6 +298,21 @@ pub enum EncodeError {
 /// A [`DriverOptions`](crate::driver::DriverOptions) value the model cannot honor.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InvalidOptions {
+    /// An input to prepare entries for that the model's `step` program does not read as a carriable
+    /// one (a per-token input read at every step needs no entry of its own).
+    #[error("input {input} is not a carriable input of the model's step program")]
+    NotCarriable {
+        /// The input named.
+        input: InputId,
+    },
+    /// More carriable inputs than one deployment prepares combinations of.
+    #[error("{count} carriable inputs; a deployment prepares at most {max}")]
+    TooManyCarried {
+        /// The inputs named.
+        count: usize,
+        /// The most it prepares.
+        max: usize,
+    },
     /// Every prefill chunk starts at and is sized in multiples of the model's granule.
     #[error("prefill_chunk {chunk} is not a multiple of the model's prefill granule {granule}")]
     ChunkNotGranuleAligned {
@@ -476,10 +387,6 @@ pub enum InvalidOptions {
         /// The model's prefill granule in tokens.
         granule: usize,
     },
-    /// A caller-named verify window runs drafts the sequence may reject, and only the driver's own
-    /// speculative rounds snapshot recurrent state: the rejected drafts would already have advanced it.
-    #[error("a model with recurrent state cannot verify a window of drafts")]
-    RecurrentHasNoVerifyWindows,
     /// An MTP policy reads the hidden-state carry of its verify window: the options name none, or
     /// one narrower than the window (`k + 1` positions).
     #[error("an MTP policy of k = {k} needs a hidden-state carry window of at least {} positions, got {window:?}", k + 1)]
@@ -525,10 +432,10 @@ pub enum PreparedSetRefusal {
     },
     /// A step needs an entry `prepare` never admitted: new static schemas are admitted explicitly,
     /// never compiled by a step.
-    #[error("no prepared entry for {phase:?} {shape:?} {head:?} (adapters {adapters:?})")]
+    #[error("no prepared entry for {program:?} {shape:?} {head:?} (adapters {adapters:?})")]
     NotAdmitted {
-        /// The phase the step runs.
-        phase: Phase,
+        /// The driver service the step runs.
+        program: Program,
         /// The step's shape.
         shape: StepShape,
         /// The sampling head the step needs.

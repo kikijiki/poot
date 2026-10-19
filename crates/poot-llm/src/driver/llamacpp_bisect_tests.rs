@@ -21,10 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
+use poot_eval::{EvalOptions, Value, eval, materialize_dense};
 use poot_graph_ir::{PackedSourceName, Storage, ValueId};
 use poot_graph_plan::{WeightFormats, bind_packed_weights};
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::test_support::weight_map::Step;
 use poot_quant::PackedComponentRef;
 use poot_quant::weights::{WeightEntry, WeightId, WeightStore};
@@ -437,16 +437,9 @@ mod checkpoint_rows {
     fn oracle_sites(handle: &ModelHandle, ids: &[i32]) -> Vec<(Site, Vec<f32>)> {
         let model = handle.model();
         let n = NonZeroUsize::new(ids.len()).unwrap();
-        let shape = StepShape {
-            rows: NonZeroUsize::new(1).unwrap(),
-            tokens: n,
-            capacity: n,
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::All,
-            hidden: None,
-        };
+        let shape = StepShape::new(NonZeroUsize::new(1).unwrap(), n, n).with_logits(LogitRows::All);
         let graph = model
-            .trace(Phase::Prefill, shape, serving_trace_limits(n))
+            .trace(&StepSpec::step(shape), serving_trace_limits(n))
             .expect("trace the prefill");
         let graph = bind_packed_weights(&graph, &WeightFormats::from_weight_map(model.weights()))
             .expect("bind the packed weights");
@@ -455,7 +448,7 @@ mod checkpoint_rows {
         let (store, map) = (handle.shared_store(), model.weights());
         let ids_by_const: HashMap<String, WeightId> =
             map.iter().map(|(id, _, _)| (id.const_name(), id)).collect();
-        let step = Step::new(Phase::Prefill, ids, 0);
+        let step = Step::new(ids, 0);
         let slots = step.slots();
         let mut inputs: HashMap<ValueId, Value> = HashMap::new();
         for &id in graph.inputs() {
@@ -500,12 +493,8 @@ mod checkpoint_rows {
             };
             inputs.insert(id, value);
         }
-        let evaluation = eval(
-            &graph,
-            &inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-        )
-        .expect("evaluate the prefill");
+        let evaluation = eval(&graph, &inputs, EvalOptions::default().keep_environment())
+            .expect("evaluate the prefill");
         let environment = evaluation.environment.as_ref().expect("kept environment");
         let eqns = graph.eqns();
         let host = |eqn: usize| -> Vec<f32> {

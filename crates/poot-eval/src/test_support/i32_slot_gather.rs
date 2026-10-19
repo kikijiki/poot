@@ -223,7 +223,7 @@ impl I32SlotGatherVariant {
         let oracle = crate::eval(
             &self.graph,
             &self.inputs(&self.graph),
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
+            crate::EvalOptions::default(),
         )
         .map_err(|e| format!("CPU oracle: {e}"))?
         .output

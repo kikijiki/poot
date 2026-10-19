@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::{
     PackedDequantProductionError, recognize_packed_contractions, reject_packed_dequant_escapes,
 };
-use poot_graph_ir::ops::{packed_block_diagonal_linear, packed_linear};
+use poot_graph_ir::test_support::packed_graphs::{packed_block_diagonal_linear, packed_linear};
 use poot_graph_ir::{
     Builder, BuilderError, Graph, OpKind, Operand, PackedSourceName, Slot, TensorType, ValueId,
     packed_source_constants,
@@ -19,7 +19,7 @@ use poot_quant::{
     PackedWeight, SourceRole,
 };
 
-use poot_eval::{EvalBudget, EvalError, EvalOptions, PackedEvalError, Value, eval};
+use poot_eval::{EvalError, EvalOptions, PackedEvalError, Value, eval};
 use poot_tensor::{DType, HostTensor};
 
 /// Thread-local allocation byte counter (duplicated from `poot-eval/src/tests/allocation.rs`: an
@@ -80,13 +80,12 @@ use allocation::allocated_bytes;
 
 /// Card 554d FLAG (migration guide constraint 3, packed-oracle analogue): `walk.rs` deleted the fixed
 /// crate consts `PACKED_ORACLE_MAX_ELEMENTS`/`PACKED_ORACLE_MAX_BYTES` and `check_packed_oracle_allocation`,
-/// since the packed oracle's allocation limit is now an opt-in `EvalBudget` the caller states per call,
-/// not a hardcoded wall (see `ops/packed.rs`'s module doc). This constant mirrors the old fixed value
+/// since the packed oracle has no allocation limit (see `ops/packed.rs`'s module doc). This constant mirrors the old fixed value
 /// purely so this file's still-meaningful fixture ("a table far bigger than the old cap still evaluates
 /// uncapped", `a_packed_projection_past_the_oracle_cap_evaluates` below) keeps the same descriptive
 /// sanity assertion; it is NOT a reinstated limit and nothing here enforces it. That same function used
 /// to have a second half asserting that materializing the same weight past the cap is refused - removed,
-/// since the fixed cap it asserted against is gone and the uncapped `EvalBudget` this file states makes
+/// since the fixed cap it asserted against is gone and the uncapped oracle makes
 /// that materialization succeed instead; see the FLAG comment on the function itself. The packed
 /// oracle's own `OracleArithmeticOverflow` refusal (never a cap, an actual `usize` overflow) is still
 /// live and still tested: `packed_dequant_oracle_rejects_an_overflowing_activation_shape` below.
@@ -292,7 +291,7 @@ fn packed_dequant_eval_matches_independent_rows() {
                 )),
             ),
         ]);
-        let Value::Host(actual) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let Value::Host(actual) = eval(&graph, &inputs, EvalOptions::default())
             .map(|r| r.output)
             .unwrap()
         else {
@@ -347,7 +346,7 @@ fn packed_dequant_binding_reuses_payload_owner() {
     ]);
     drop(owner);
     assert!(weak.upgrade().is_some(), "bindings retain the owner");
-    let Value::Host(output) = eval(&graph, &bindings, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let Value::Host(output) = eval(&graph, &bindings, EvalOptions::default())
         .map(|r| r.output)
         .unwrap()
     else {
@@ -399,13 +398,13 @@ fn packed_dequant_fused_and_unfused_compositions_match() -> Result<(), BuilderEr
                 PackedComponentRef::new(Arc::clone(&owner), source.role()).into(),
             );
         }
-        let Value::Host(unfused) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let Value::Host(unfused) = eval(&graph, &inputs, EvalOptions::default())
             .map(|r| r.output)
             .unwrap()
         else {
             panic!("dense result");
         };
-        let Value::Host(fused) = eval(&fused, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let Value::Host(fused) = eval(&fused, &inputs, EvalOptions::default())
             .map(|r| r.output)
             .unwrap()
         else {
@@ -470,7 +469,7 @@ fn indexed_graph(
     x_data: &[f32],
     route: &[usize],
 ) -> (Graph, HashMap<ValueId, Value>) {
-    use poot_graph_ir::ops::{PackedExpertStack, packed_indexed_linear};
+    use poot_graph_ir::test_support::packed_graphs::{PackedExpertStack, packed_indexed_linear};
     let (m, k) = (route.len(), descriptor.shape()[1]);
     let table = PackedExpertStack {
         stack_id: "moe.experts".to_string(),
@@ -555,7 +554,7 @@ fn packed_indexed_linear_matches_the_per_row_expert_product() {
         }
     }
     let (graph, inputs) = indexed_graph(descriptor, &experts, &x_data, &route);
-    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::default())
         .map(|r| r.output)
         .unwrap()
     else {
@@ -602,7 +601,7 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
     let evaluation = eval(
         &graph,
         &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).observer(&mut allocations),
+        EvalOptions::default().observer(&mut allocations),
     )
     .unwrap();
     let Value::Host(got) = evaluation.output else {
@@ -641,13 +640,9 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
     .into_iter()
     .map(|(id, tensor)| (id, Value::Host(tensor)))
     .collect();
-    let Value::Host(want) = eval(
-        &dense,
-        &dense_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
+    let Value::Host(want) = eval(&dense, &dense_inputs, EvalOptions::default())
+        .unwrap()
+        .output
     else {
         panic!("dense result");
     };
@@ -674,7 +669,7 @@ fn the_indexed_oracle_decodes_only_the_selected_experts() {
 /// R467-009: the reversed `(W @ x^T)^T` spelling of `packed_linear`'s canonical `x @ W^T`, recognized as
 /// the same `PackedContraction` and matched against the unfused reversed composition through the
 /// generic dense-equation path, exactly like the sibling above. Built through the same public
-/// append-plan API `ops::packed_linear` itself uses (`Builder::append_plan`/`equation`), never a
+/// append-plan API `packed_graphs::packed_linear` itself uses (`Builder::append_plan`/`equation`), never a
 /// hand-poked `ValueMeta` (`key` is crate-private outside `poot-graph-ir`).
 ///
 /// The square case (`batch == k`) is the one that actually exercises the numeric comparison rather than
@@ -777,16 +772,15 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match() -> Resul
                 PackedComponentRef::new(Arc::clone(&owner), source.role()).into(),
             );
         }
-        let Value::Host(unfused) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let Value::Host(unfused) = eval(&graph, &inputs, EvalOptions::default())
             .map(|r| r.output)
             .unwrap()
         else {
             panic!("dense result");
         };
-        let Value::Host(fused_output) =
-            eval(&fused, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-                .map(|r| r.output)
-                .unwrap()
+        let Value::Host(fused_output) = eval(&fused, &inputs, EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap()
         else {
             panic!("dense result");
         };
@@ -811,7 +805,7 @@ fn transposed_packed_contraction_fused_and_unfused_compositions_match() -> Resul
     Ok(())
 }
 
-/// Card 385: `ops::packed_block_diagonal_linear`'s fused `PackedContraction { blocks, .. }` must match its unfused
+/// Card 385: `packed_graphs::packed_block_diagonal_linear`'s fused `PackedContraction { blocks, .. }` must match its unfused
 /// `PackedDequant -> Reshape -> Transpose([0,2,1]) -> MatMul` composition, evaluated through the generic dense-equation
 /// path (not a second hand-written reference). A wrong axis order in the fused path (e.g. reading
 /// `weight[j, block_base + output]` instead of `weight[block_base + output, j]`) diverges from the unfused result.
@@ -867,16 +861,15 @@ fn blocked_packed_contraction_fused_and_unfused_compositions_match() -> Result<(
                 PackedComponentRef::new(Arc::clone(&owner), source.role()).into(),
             );
         }
-        let Value::Host(unfused) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let Value::Host(unfused) = eval(&graph, &inputs, EvalOptions::default())
             .map(|r| r.output)
             .unwrap()
         else {
             panic!("dense result");
         };
-        let Value::Host(fused_output) =
-            eval(&fused, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-                .map(|r| r.output)
-                .unwrap()
+        let Value::Host(fused_output) = eval(&fused, &inputs, EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap()
         else {
             panic!("dense result");
         };
@@ -943,7 +936,7 @@ fn contract_through_the_oracle(
             Value::Packed(PackedComponentRef::new(Arc::clone(owner), *role)),
         );
     }
-    let Value::Host(output) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let Value::Host(output) = eval(&graph, &inputs, EvalOptions::default())
         .map(|r| r.output)
         .unwrap_or_else(|error| panic!("{label}: eval failed: {error}"))
     else {
@@ -2051,9 +2044,8 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderError> {
             let decoded = b.packed_dequant(&[source], descriptor).unwrap();
             let graph = b.finish(decoded).unwrap();
             let inputs = packed_inputs(&graph, &owner);
-            let (result, dequant_bytes) = allocated_bytes(|| {
-                eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output)
-            });
+            let (result, dequant_bytes) =
+                allocated_bytes(|| eval(&graph, &inputs, EvalOptions::default()).map(|r| r.output));
             assert!(matches!(result.unwrap(), Value::Host(_)));
 
             let b = Builder::for_tests();
@@ -2067,9 +2059,8 @@ fn packed_oracle_decode_work_is_linear_in_k() -> Result<(), BuilderError> {
                 activation.id(),
                 Value::Host(HostTensor::f32(vec![2, k], vec![0.5; 2 * k])),
             );
-            let (result, contraction_bytes) = allocated_bytes(|| {
-                eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output)
-            });
+            let (result, contraction_bytes) =
+                allocated_bytes(|| eval(&graph, &inputs, EvalOptions::default()).map(|r| r.output));
             assert!(matches!(result.unwrap(), Value::Host(_)));
 
             for (entry, bytes, per_value) in [
@@ -2157,7 +2148,7 @@ fn packed_contraction_oracle_decodes_gguf_rows_bit_exactly() -> Result<(), Build
                 );
             }
         }
-        let Value::Host(actual) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let Value::Host(actual) = eval(&graph, &inputs, EvalOptions::default())
             .map(|r| r.output)
             .unwrap()
         else {
@@ -2225,7 +2216,9 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
     let ids = b
         .slot(Slot::Token, TensorType::new(vec![3], DType::I32))
         .unwrap();
-    let out = poot_graph_ir::ops::packed_embedding(&b, ids, "embed", descriptor).unwrap();
+    let out =
+        poot_graph_ir::test_support::packed_graphs::packed_embedding(&b, ids, "embed", descriptor)
+            .unwrap();
     let graph = recognize_packed_row_gathers(&b.finish(out).unwrap()).unwrap();
     assert!(matches!(
         graph.eqns(),
@@ -2253,7 +2246,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
         ids.id(),
         HostTensor::i32(vec![3], wanted.iter().map(|&r| r as i32).collect()).into(),
     );
-    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::default())
         .map(|r| r.output)
         .unwrap()
     else {
@@ -2276,7 +2269,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
         HostTensor::i32(vec![3], vec![0, rows as i32, 1]).into(),
     );
     assert!(matches!(
-        eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output),
+        eval(&graph, &inputs, EvalOptions::default()).map(|r| r.output),
         Err(EvalError::Packed(PackedEvalError::Binding {
             field: "row_ids.range"
         }))
@@ -2285,7 +2278,7 @@ fn packed_row_gather_oracle_decodes_only_the_gathered_rows() {
         inputs.insert(ids.id(), HostTensor::i32(vec![3], vec![0, bad, 1]).into());
         assert!(
             matches!(
-                eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output),
+                eval(&graph, &inputs, EvalOptions::default()).map(|r| r.output),
                 Err(EvalError::Packed(PackedEvalError::Binding {
                     field: "row_ids.range"
                 }))
@@ -2364,7 +2357,7 @@ fn a_packed_projection_past_the_oracle_cap_evaluates() {
         x.id(),
         HostTensor::f32(vec![1, k], activation.clone()).into(),
     );
-    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::default())
         .map(|r| r.output)
         .expect("the projection is uncapped")
     else {
@@ -2388,85 +2381,4 @@ fn a_packed_projection_past_the_oracle_cap_evaluates() {
     // (bind `packed_source_constants`/`packed_dequant` over the same `owner.weight()`, then expect
     // `Err(EvalError::Packed(PackedEvalError::OracleLimit { resource: "elements", .. }))`). Removed;
     // see the doc comment above this function.
-}
-
-/// SC-008 (first clause): a `PackedContraction` above `EvalBudget::bounded(work, bytes)` is
-/// `EvalError::Budget { needed, limit }` with the literal element count of its first intermediate, the
-/// dequantized `[3, 35]` weight (Card 629: the contraction is a composite, so its decomposition's
-/// intermediates are charged); the same equation under `EvalBudget::UNBOUNDED` evaluates.
-///
-/// Mutation: drop the `opts.charge(...)` of `walk.rs::evaluate_composite`'s loop; the bounded row stops
-/// erroring and this test goes red.
-#[test]
-fn packed_contraction_above_budget_is_refused_unbounded_evaluates() -> Result<(), BuilderError> {
-    let owner = payload(WeightFormat::E2m1Row32, [3, 35]);
-    let descriptor = owner.weight();
-    let builder = Builder::for_tests();
-    let activation = builder
-        .slot_named(
-            Slot::Activation,
-            "budget-candidate",
-            TensorType::f32(vec![2, 35]),
-        )
-        .unwrap();
-    let output = packed_linear(&builder, activation, "budget.layer", descriptor, None, None)?;
-    let source = builder.finish(output).unwrap();
-    let direct = prepare_packed_dequant_production(&source).unwrap();
-    assert!(matches!(
-        direct.eqns(),
-        [poot_graph_ir::Eqn {
-            op: poot_graph_ir::OpKind::PackedContraction { .. },
-            ..
-        }]
-    ));
-
-    let candidate = &direct.eqns()[0];
-    let [
-        _,
-        poot_graph_ir::Operand::Value(weight_id),
-        poot_graph_ir::Operand::Value(scale_id),
-    ] = candidate.inputs.as_slice()
-    else {
-        panic!("candidate must retain activation, weight, and scale values");
-    };
-    let weight =
-        PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(OperandRole::Codes));
-    let scale = PackedComponentRef::new(Arc::clone(&owner), SourceRole::Planar(OperandRole::Scale));
-    let inputs = HashMap::from([
-        (
-            activation.id(),
-            Value::Host(HostTensor::f32(
-                vec![2, 35],
-                (0..70).map(|index| index as f32 / 17.0).collect(),
-            )),
-        ),
-        (*weight_id, Value::Packed(weight)),
-        (*scale_id, Value::Packed(scale)),
-    ]);
-
-    // The dequantized weight is [3, 35]: 105 elements, 420 bytes. A 3-element ceiling must refuse before
-    // evaluating.
-    let bounded = eval(
-        &direct,
-        &inputs,
-        EvalOptions::new(EvalBudget::bounded(3, 1_000_000)),
-    )
-    .expect_err("a PackedContraction past max_work_elements must refuse");
-    assert!(
-        matches!(
-            bounded,
-            EvalError::Budget {
-                resource: "elements",
-                needed: 105,
-                limit: 3,
-                ..
-            }
-        ),
-        "{bounded:?}"
-    );
-
-    let unbounded = eval(&direct, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .expect("UNBOUNDED must still evaluate the same contraction");
-    assert!(matches!(unbounded.output, Value::Host(_)));
-    Ok(())
 }

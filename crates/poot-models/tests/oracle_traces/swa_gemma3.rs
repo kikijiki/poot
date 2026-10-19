@@ -2,7 +2,7 @@
 //! registry's dense family and evaluated on the CPU oracle. (Moved from `poot-eval/src/tests/swa_gemma3.rs`;
 //! the windowed-mask arithmetic rows stay with the oracle.)
 
-use poot_eval::{EvalBudget, EvalOptions, Value};
+use poot_eval::{EvalOptions, Value};
 use poot_graph_ir::ValueId;
 use poot_tensor::HostTensor;
 use poot_test_util::{fill, max_abs_error};
@@ -47,7 +47,7 @@ pub(super) fn run_step(
             .unwrap_or_else(|| HostTensor::zeros(g.aval(input).shape.clone()));
         inputs.insert(input, Value::from(t));
     }
-    let evaluation = poot_eval::eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let evaluation = poot_eval::eval(g, &inputs, EvalOptions::default()).unwrap();
     let state = evaluation
         .state
         .into_iter()
@@ -93,15 +93,14 @@ fn gemma3_prefill_logits(
     window: Option<usize>,
     (n, cap): (usize, usize),
 ) -> Vec<f32> {
-    use poot_models::model::{LogitRows, Phase};
+    use poot_models::model::{LogitRows, StepSpec};
     use poot_models::test_support::dense::step;
 
     let m = gemma3(every, window);
     let g = m
         .model
         .trace(
-            Phase::Prefill,
-            step(1, n, cap, LogitRows::Last),
+            &StepSpec::step(step(1, n, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -195,7 +194,7 @@ fn gemma3_prefill_kv_per_layer_mask_selection() {
 ///    pos=5.
 #[test]
 fn gemma3_decode_per_layer_mask_selection() {
-    use poot_models::model::{LogitRows, Phase};
+    use poot_models::model::{LogitRows, StepSpec};
     use poot_models::test_support::dense::step;
 
     let cap = 8usize;
@@ -205,8 +204,7 @@ fn gemma3_decode_per_layer_mask_selection() {
         let g = m
             .model
             .trace(
-                Phase::Decode,
-                step(1, 1, cap, LogitRows::Last),
+                &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -259,7 +257,7 @@ fn gemma3_decode_per_layer_mask_selection() {
 ///   3. The window changes mask values only: a different `sliding_window` traces the same number of equations.
 #[test]
 fn config_wiring_softcap_changes_graph_and_output() {
-    use poot_models::model::{LogitRows, Phase};
+    use poot_models::model::{LogitRows, StepSpec};
     use poot_models::test_support::dense::{Dense, Family, step};
 
     let pos = 4usize;
@@ -276,8 +274,7 @@ fn config_wiring_softcap_changes_graph_and_output() {
             .f32_model();
         m.model
             .trace(
-                Phase::Decode,
-                step(1, 1, 8, LogitRows::Last),
+                &StepSpec::step(step(1, 1, 8, LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap()

@@ -120,6 +120,7 @@ poot-llm	driver::step::mtp_tests::mtp_serves_a_sampled_row_ptx
 poot-llm	driver::step::mtp_tests::mtp_two_rows_equal_off_ptx
 poot-llm::add_a_model	four_paged_rows_equal_single_row_runs_ptx
 poot-llm::add_a_model	generate_equals_the_oracle_tokens_ptx
+poot-llm::add_a_model	tagged_rows::tagged_generate_equals_the_oracle_tokens_ptx
 poot-llm::pooled_deepseek3	pooled_deepseek3_tokens_equal_the_recorded_literals_ptx
 poot-llm::pooled_gemma4	pooled_gemma4_decodes_the_unpooled_tokens_with_evictions_ptx
 poot-llm::pooled_qwen3moe	pooled_qwen3moe_tokens_equal_the_recorded_literals_ptx

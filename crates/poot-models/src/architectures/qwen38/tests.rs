@@ -18,7 +18,7 @@ use crate::components::standard::oracle::run_step;
 use crate::components::testing::values;
 use poot_quant::weights::WeightStore;
 
-use crate::model::{KvLayout, LogitRows};
+use crate::model::{KvLayout, LogitRows, StepShape};
 use crate::registry::Registry;
 
 /// The cache capacity the rows trace at: a multiple of the fixture's block of two, and exactly
@@ -751,7 +751,7 @@ impl Case {
             .unwrap() as usize
     }
 
-    /// One step of `tokens` from `start`: a decode for one token, a prefill for more.
+    /// One step of `tokens` from `start`: a decode for one token, a longer step for more.
     fn step(
         &self,
         model: &dyn Model,
@@ -759,15 +759,9 @@ impl Case {
         start: usize,
         state: &[Vec<f32>],
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
-        let phase = if tokens.len() == 1 {
-            Phase::Decode
-        } else {
-            Phase::Prefill
-        };
         run_step(
             model,
             &self.fixture.store,
-            phase,
             self.cap,
             tokens,
             start as i32,
@@ -791,18 +785,15 @@ impl Case {
 
     /// The names of the state a whole-prompt prefill carries, in the graph's order.
     fn state_names(&self, model: &dyn Model) -> Vec<String> {
-        let shape = StepShape {
-            rows: NonZeroUsize::MIN,
-            tokens: NonZeroUsize::new(self.tokens.len()).unwrap(),
-            capacity: NonZeroUsize::new(self.cap).unwrap(),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::All,
-            hidden: None,
-        };
+        let shape = StepShape::new(
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(self.tokens.len()).unwrap(),
+            NonZeroUsize::new(self.cap).unwrap(),
+        )
+        .with_logits(LogitRows::All);
         let g = model
             .trace(
-                Phase::Prefill,
-                shape,
+                &StepSpec::step(shape),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -993,33 +984,28 @@ fn chunked_prefill_and_decode_continue_to_the_same_logits_and_state() {
     }
 }
 
-/// SC-008 (the model's half): a prefill off the granule, and a cache that is not a whole number of
+/// SC-008 (the model's half): a step off the granule, and a cache that is not a whole number of
 /// blocks, are typed `ShapeUnsupported { Granule }` refusals from `Model::trace`, which builds no
 /// graph (so nothing can dispatch); a decode is never off the granule. Mutation: drop the granule
-/// check from `Qwen4Exp::trace`; the odd prefill traces and the refusal assertions go red.
+/// check from `Qwen4Exp::trace`; the odd step traces and the refusal assertions go red.
 #[test]
 fn a_shape_off_the_granule_is_a_typed_refusal() {
     use crate::model::{ShapeReason, TraceError};
 
     let model = built(&super::fixture());
     assert_eq!(model.config().prefill_granule.get(), 2);
-    let shape = |tokens: usize, capacity: usize| StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(capacity).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
+    let shape = |tokens: usize, capacity: usize| {
+        StepShape::new(
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(tokens).unwrap(),
+            NonZeroUsize::new(capacity).unwrap(),
+        )
+        .with_logits(LogitRows::All)
     };
-    for (phase, tokens, capacity) in [
-        (Phase::Prefill, 3, 8),
-        (Phase::Prefill, 1, 8),
-        (Phase::Prefill, 4, 7),
-    ] {
+    for (tokens, capacity) in [(3, 8), (4, 7)] {
         let refusal = model
             .trace(
-                phase,
-                shape(tokens, capacity),
+                &StepSpec::step(shape(tokens, capacity)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .expect_err("an off-granule shape is refused");
@@ -1037,8 +1023,7 @@ fn a_shape_off_the_granule_is_a_typed_refusal() {
     assert!(
         model
             .trace(
-                Phase::Prefill,
-                shape(4, 8),
+                &StepSpec::step(shape(4, 8)),
                 poot_graph_ir::TraceLimits::for_tests()
             )
             .is_ok()
@@ -1046,8 +1031,7 @@ fn a_shape_off_the_granule_is_a_typed_refusal() {
     assert!(
         model
             .trace(
-                Phase::Decode,
-                shape(1, 8),
+                &StepSpec::step(shape(1, 8).with_logits(LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests()
             )
             .is_ok()
@@ -1062,21 +1046,19 @@ fn a_paged_step_is_a_typed_indexer_refusal() {
     use crate::model::{ShapeReason, TraceError};
 
     let model = built(&super::fixture());
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(2).unwrap(),
-        capacity: NonZeroUsize::new(8).unwrap(),
-        kv: KvLayout::Paged {
-            pool_slots: NonZeroUsize::new(16).unwrap(),
-            seqs: NonZeroUsize::MIN,
-        },
-        logits: LogitRows::All,
-        hidden: None,
-    };
+    let shape = StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(8).unwrap(),
+    )
+    .with_kv(KvLayout::Paged {
+        pool_slots: NonZeroUsize::new(16).unwrap(),
+        seqs: NonZeroUsize::MIN,
+    })
+    .with_logits(LogitRows::All);
     let refusal = model
         .trace(
-            Phase::Prefill,
-            shape,
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect_err("a paged step is refused");
@@ -1101,18 +1083,15 @@ fn the_block_key_cache_is_declared_blocked() {
 
     let case = Case::new(super::fixture());
     let model = case.model();
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(2).unwrap(),
-        capacity: NonZeroUsize::new(case.cap).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
-    };
+    let shape = StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(case.cap).unwrap(),
+    )
+    .with_logits(LogitRows::All);
     let g = model
         .trace(
-            Phase::Prefill,
-            shape,
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -1231,18 +1210,15 @@ fn an_out_of_vocabulary_token_is_a_typed_validation_fault() {
 
     let fixture = super::fixture();
     let model = built(&fixture);
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(2).unwrap(),
-        capacity: NonZeroUsize::new(CAP).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
-    };
+    let shape = StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(CAP).unwrap(),
+    )
+    .with_logits(LogitRows::All);
     let g = model
         .trace(
-            Phase::Prefill,
-            shape,
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -1264,20 +1240,17 @@ fn packed_experts_trace_as_packed_weights_and_dense_ones_as_stored_stacks() {
     use poot_graph_ir::{OpKind, Storage};
     use poot_tensor::DType;
 
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(4).unwrap(),
-        capacity: NonZeroUsize::new(CAP).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
-    };
+    let shape = StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(4).unwrap(),
+        NonZeroUsize::new(CAP).unwrap(),
+    )
+    .with_logits(LogitRows::All);
     let analyze = |fixture: &Fixture| {
         let model = built(fixture);
         let g = model
             .trace(
-                Phase::Prefill,
-                shape,
+                &StepSpec::step(shape),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -1646,9 +1619,8 @@ fn a_checkpoint_with_sharded_ple_tables_matches_the_single_table() {
     let registry = Registry::builtin().unwrap();
     let sharded = registry.build(&fixture.raw(), &store).unwrap();
     let single = built(&fixture);
-    let step = |model: &dyn Model, store: &WeightStore| {
-        run_step(model, store, Phase::Prefill, CAP, &TOKENS, 0, &[])
-    };
+    let step =
+        |model: &dyn Model, store: &WeightStore| run_step(model, store, CAP, &TOKENS, 0, &[]);
     let (want, _) = step(single.as_ref(), &fixture.store);
     let (got, _) = step(sharded.as_ref(), &store);
     assert_eq!(

@@ -85,20 +85,24 @@ the weights, activations and state it reads and the values it returns, in host m
 
 The NPU computes in FP16, and a vendor compiler handed an F32 graph narrows it silently, so poot makes the
 narrowing a step of its own. When the device records a numerical contract (a bound on the normwise error of a
-narrowed region, measured on the device against the F32 CPU oracle), the planner converts each F32 argument
-of the graph to FP16 on entry, computes the whole graph in FP16 and converts each F32 result back on exit;
-nothing in between is converted op by op, so the contract bounds the graph's error as a whole. A target that
+narrowed region, measured on the device against the F32 CPU oracle), `compile` rewrites the graph itself
+(`narrow_to_device_precision`, the first pass for this target): each F32 argument is converted to FP16 by an
+explicit `Cast` equation on entry, the whole graph computes in FP16 and each F32 result is converted back by a
+`Cast` on exit; nothing in between is converted op by op, so the contract bounds the graph's error as a whole.
+The casts are ordinary equations, so the program's published numerics class sees the narrowing: it is
+`NarrowStorage`, the loosest comparison tolerance, and a result is compared against the oracle within it. A target that
 records no contract refuses an F32 arithmetic equation with a typed capability naming the missing contract,
 and BF16 arithmetic, which no contract covers, is refused as well. Data movement is bit exact in any width the
 device carries.
 
 The contract's bound holds only for values FP16 can hold, so the contract also records the largest magnitude an
 F32 value may have (65504). A literal beyond it is refused when the graph is planned, except the additive
-literals described below, which saturate on purpose. The device checks the graph's F32 inputs before each
-replay: a value beyond the range, or a NaN, is a typed error that names the argument and the element and runs
-nothing. The check reads every F32 argument on every replay, the weights included, so a weight outside the
-range is refused at the first replay that binds it, not when the graph is loaded or planned. An argument that
-an earlier command of the same recording writes is checked as that command's result instead. The F32 results
+literals described below, which saturate on purpose. The device checks F32 values where the host can see
+them. A weight is checked once, as it is uploaded: a weight beyond the range, or a NaN, is refused with
+`NarrowingRangeUpload`, which names the element, before any replay exists, and no replay reads it again. The
+graph's other F32 inputs are checked before each replay: a value beyond the range, or a NaN, is a typed
+error that names the argument and the element and runs nothing. An argument that an earlier command of the
+same recording writes is checked as that command's result instead, and so is a weight a recorded copy fills. The F32 results
 are checked after the replay too, since a result that left the range was computed outside what the bound was
 measured on. On the laptop NPU an F32 input of 65504 runs, an input of 65520 (which FP16 rounds to infinity)
 is refused, and a sum of two in-range inputs that exceeds the range comes back as a finite F32 and is refused

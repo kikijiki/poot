@@ -4,8 +4,7 @@
 //! A `packed_linear` graph (compiled, so `compile_staged` claims it as one `PackedContraction`) runs
 //! through the one contract path (capture on the entry's first step, replay every step after -
 //! Card 548: the eager/recorded/capture-replay distinction the pre-contract `RocmGraphExecutor` had
-//! three copies of collapses into this one path, since the contract admits `Submission::Replay`
-//! only), with the weight bound through the executable's `WeightStore` as a packed component -
+//! three copies of collapses into this one path), with the weight bound through the executable's `WeightStore` as a packed component -
 //! never a dense f32 copy.
 //!
 //! The activation is one-hot, so every output is exactly one decoded weight value (`y[o] =
@@ -27,9 +26,8 @@ use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Builder, Graph, PackedSourceName, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::test_support::gpu_caps;
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
-    staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -85,7 +83,7 @@ fn staged(target: Target, graph: &Graph) -> poot_graph_plan::staged::StagedProgr
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -209,7 +207,10 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, SlotKey, S
     let x = b
         .slot_named(Slot::Activation, "onehot", TensorType::f32(vec![1, K]))
         .unwrap();
-    let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+        &b, x, "layer", descriptor, None, None,
+    )
+    .unwrap();
     let pos = b
         .slot(Slot::Pos, TensorType::new(vec![], DType::I32))
         .unwrap();
@@ -392,8 +393,15 @@ fn packed_prefill_through_the_contract_is_bit_exact() {
         let x = b
             .slot_named(Slot::Activation, "onehot", TensorType::f32(vec![K, K]))
             .unwrap();
-        let y =
-            poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None).unwrap();
+        let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &b,
+            x,
+            "layer",
+            owner.weight(),
+            None,
+            None,
+        )
+        .unwrap();
         let cache = b
             .state_input(
                 "decoded",
@@ -622,7 +630,7 @@ fn run_indexed_case(
             ))
         })
         .collect();
-    let table = poot_graph_ir::ops::PackedExpertStack {
+    let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
         stack_id: "experts".to_string(),
         descriptor: owners_vec[0].weight(),
         experts: EXPERTS,
@@ -640,7 +648,8 @@ fn run_indexed_case(
             poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
         )
         .unwrap();
-    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_indexed_linear(&b, x, ids, &table)
+        .unwrap();
     let graph = b.finish(y).unwrap();
     let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
     let ids_key = graph.meta(ids.id()).slot_key().unwrap().clone();
@@ -867,7 +876,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
                     TensorType::new(shape.clone(), DType::I32),
                 )
                 .unwrap();
-            let rows = poot_graph_ir::ops::packed_embedding(
+            let rows = poot_graph_ir::test_support::packed_graphs::packed_embedding(
                 &b,
                 token,
                 "model.embed_tokens",
@@ -1124,8 +1133,15 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]))
                 .unwrap();
-            let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                .unwrap();
+            let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             let graph = b.finish(y).unwrap();
             let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
             let activation = fill(7 + m as u64, m * K);
@@ -1157,16 +1173,12 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
                 x.id(),
                 poot_tensor::HostTensor::f32(vec![m, K], activation).into(),
             );
-            let want = poot_eval::eval(
-                &graph,
-                &oracle_inputs,
-                poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-            )
-            .unwrap()
-            .output
-            .into_host()
-            .unwrap();
-            poot_executor_parity::assert_close(
+            let want = poot_eval::eval(&graph, &oracle_inputs, poot_eval::EvalOptions::default())
+                .unwrap()
+                .output
+                .into_host()
+                .unwrap();
+            poot_test_util::assert_close_scaled(
                 &got,
                 want.as_f32().unwrap(),
                 class.tolerance(),
@@ -1185,8 +1197,8 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
 /// ordinal, as card 628 first did; the Q4_K row goes red on wgpu while the other formats stay green.
 #[test]
 fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
-    use poot_executor_parity::assert_close;
     use poot_graph_ir::op::{BinOp, ContractionHead};
+    use poot_test_util::assert_close_scaled;
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
         return;
     };
@@ -1205,9 +1217,15 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]))
                 .unwrap();
-            let head =
-                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                    .unwrap();
+            let head = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             let out = if with_bias {
                 let bias = b.constant("bias", TensorType::f32(vec![OUT])).unwrap();
                 b.binary(BinOp::Add, head, bias).unwrap()
@@ -1267,7 +1285,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
                 .zip(&bias_values)
                 .map(|(head, bias)| head + bias)
                 .collect();
-            assert_close(
+            assert_close_scaled(
                 &fused,
                 &want,
                 0.0,
@@ -1290,9 +1308,9 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
 /// chain row go red.
 #[test]
 fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
-    use poot_executor_parity::assert_close;
     use poot_graph_ir::op::{BinOp, ContractionHead, UnOp};
     use poot_graph_ir::types::Scalar;
+    use poot_test_util::assert_close_scaled;
     let Some(device) = open_or_skip(DeviceBackend::Rocm, RocmDevice::new()) else {
         return;
     };
@@ -1312,9 +1330,15 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]))
                 .unwrap();
-            let head =
-                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                    .unwrap();
+            let head = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             if !with_chain {
                 let g = b.finish(head).unwrap();
                 let key = g.meta(x.id()).slot_key().unwrap().clone();
@@ -1392,7 +1416,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
                 .zip(&residual_values)
                 .map(|((head, bias), residual)| (head + bias).tanh() * 0.5 + residual)
                 .collect();
-            assert_close(
+            assert_close_scaled(
                 &fused,
                 &want,
                 1e-5,

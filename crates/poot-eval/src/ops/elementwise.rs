@@ -36,6 +36,13 @@ pub(crate) fn unary_f32(op: UnOp, x: &HostTensor) -> Result<HostTensor, EvalErro
     Ok(HostTensor::f32(x.shape().to_vec(), data))
 }
 
+/// The one definition of the F32 `Max` combiner, shared by `BinOp::Max` and `RedOp::Max`: max-number
+/// (`BinOp::Max`'s documented rule, `llvm.maxnum` in the LLVM-based lowerings): a NaN operand yields the other
+/// operand, and only two NaNs yield NaN.
+pub(crate) fn max_number(a: f32, b: f32) -> f32 {
+    a.max(b)
+}
+
 /// F32 `Binary` with numpy broadcasting to `out_shape`. Reads through [`HostTensor::to_f32`], so a
 /// BF16/F16 operand widens exactly.
 pub(crate) fn binary_f32(
@@ -56,7 +63,7 @@ pub(crate) fn binary_f32(
             BinOp::Sub => av - bv,
             BinOp::Mul => av * bv,
             BinOp::Div => av / bv,
-            BinOp::Max => av.max(bv),
+            BinOp::Max => max_number(av, bv),
             BinOp::Ge => (av >= bv) as i32 as f32,
             BinOp::GeU
             | BinOp::RemU
@@ -252,4 +259,26 @@ pub(crate) fn select<W: SelectLane>(
             if_false.words[at(if_false.shape, &strides[2])],
         )
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The float `Max` rule of `BinOp::Max` is max-number: `Max(NaN, 1)` is 1 in either operand order, and
+    /// only two NaNs give NaN.
+    ///
+    /// Mutation: make `max_number` return NaN when either operand is NaN; the first two cells come back NaN
+    /// and this goes red on `Max(NaN, 1) must be 1`.
+    #[test]
+    fn max_ignores_a_nan_operand_and_is_nan_only_for_two_nans() {
+        let a = HostTensor::f32(vec![4], vec![f32::NAN, 1.0, f32::NAN, 2.0]);
+        let b = HostTensor::f32(vec![4], vec![1.0, f32::NAN, f32::NAN, 1.0]);
+        let out = binary_f32(BinOp::Max, &a, &b, &[4]).unwrap();
+        let out = out.as_f32().unwrap();
+        assert_eq!(out[0], 1.0, "Max(NaN, 1) must be 1, got {}", out[0]);
+        assert_eq!(out[1], 1.0, "Max(1, NaN) must be 1, got {}", out[1]);
+        assert!(out[2].is_nan(), "Max(NaN, NaN) must be NaN, got {}", out[2]);
+        assert_eq!(out[3], 2.0);
+    }
 }

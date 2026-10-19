@@ -19,8 +19,8 @@ use poot_executor::{
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
@@ -276,7 +276,7 @@ impl Device for FakeDevice {
             .fold(0xcbf2_9ce4_8422_2325, |h, b| mix(h, u64::from(b))))
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), Injected> {
+    fn begin(&mut self) -> Result<(), Injected> {
         self.world.push(Op::Begin(self.index));
         self.open = Some(Vec::new());
         Ok(())
@@ -567,7 +567,7 @@ fn pipeline(g: &Graph, devices: &[u32]) -> StagedProgram {
                 devices: devices.iter().map(|&d| DeviceId(d)).collect(),
             },
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the layered fixture compiles as a pipeline on two PTX devices")
 }
@@ -590,7 +590,7 @@ fn probe_program(name: &str, device: u32) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(device)),
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -1211,7 +1211,7 @@ fn tensor_program(g: &Graph, map: &Arc<WeightMap>) -> StagedProgram {
                 weights: Arc::clone(map),
             },
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the MLP shards over two PTX devices")
 }

@@ -127,6 +127,7 @@ poot-llm	driver::step::mtp_tests::mtp_serves_a_sampled_row_rocm
 poot-llm	driver::step::mtp_tests::mtp_two_rows_equal_off_rocm
 poot-llm::add_a_model	four_paged_rows_equal_single_row_runs_rocm
 poot-llm::add_a_model	generate_equals_the_oracle_tokens_rocm
+poot-llm::add_a_model	tagged_rows::tagged_generate_equals_the_oracle_tokens_rocm
 poot-llm::beam	beam_matches_the_host_reference_rocm
 poot-llm::beam	paged_beam_runs_on_contiguous_entries_rocm
 poot-llm::beam	penalty_one_ranks_by_the_prompt_included_length_rocm
@@ -326,7 +327,7 @@ poot-rocm-runtime	tests::wait_completion_bounded_times_out
 poot-rocm-runtime	tests::wait_completion_bounded_wakes_when_signal_drops
 poot-rocm-runtime	tests::weight_and_activation_allocations_use_the_coarse_pool
 poot-serve::bin/poot-serve	tests::lifecycle::device::a_hot_loaded_adapter_serves_requests_and_unload_frees_it_rocm
-poot-serve::bin/poot-serve	tests::lifecycle::device::a_multimodal_job_through_the_loop_matches_generate_with_embeds_rocm
+poot-serve::bin/poot-serve	tests::lifecycle::device::a_multimodal_job_through_the_loop_matches_generate_with_inputs_rocm
 poot-serve::bin/poot-serve	tests::lifecycle::device::an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode_rocm
 poot-serve::bin/poot-serve	tests::lifecycle::device::an_encoder_checkpoint_serves_embeddings_on_the_device_rocm
 poot-serve::served_groups	a_model_without_an_mtp_layer_refuses_draft_mtp_startup_rocm

@@ -19,7 +19,7 @@ use poot_quant::weights::{
 use poot_tensor::DType;
 
 use super::standard::oracle::{self, run_step};
-use crate::model::{KvLayout, LogitRows, Model, ModelError, Phase, StepShape};
+use crate::model::{LogitRows, Model, ModelError, StepShape, StepSpec};
 use crate::registry::{FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::WeightMapError;
 
@@ -100,14 +100,12 @@ pub(crate) fn q8_0_store(store: &WeightStore, is_projection: impl Fn(&str) -> bo
 }
 
 pub(crate) fn step_shape(tokens: usize, capacity: usize, logits: LogitRows) -> StepShape {
-    StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(capacity).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits,
-        hidden: None,
-    }
+    StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(tokens).unwrap(),
+        NonZeroUsize::new(capacity).unwrap(),
+    )
+    .with_logits(logits)
 }
 
 /// `entry`'s model over `store`, panicking with the typed error.
@@ -174,7 +172,7 @@ fn assert_top5(got: &[f32], want: &Top5, label: &str) {
 pub(crate) fn assert_matches_recorded(model: &dyn Model, store: &WeightStore, rec: &Recorded) {
     let vocab = model.config().vocab;
     let prompt = [3, 17, 40, 8, 25];
-    let (logits, mut state) = run_step(model, store, Phase::Prefill, CAP, &prompt, 0, &[]);
+    let (logits, mut state) = run_step(model, store, CAP, &prompt, 0, &[]);
     assert_top5(
         &logits[(prompt.len() - 1) * vocab..],
         &rec.prefill,
@@ -182,7 +180,7 @@ pub(crate) fn assert_matches_recorded(model: &dyn Model, store: &WeightStore, re
     );
     for (i, token) in [11, 30, 2].into_iter().enumerate() {
         let pos = (prompt.len() + i) as i32;
-        let (logits, next) = run_step(model, store, Phase::Decode, CAP, &[token], pos, &state);
+        let (logits, next) = run_step(model, store, CAP, &[token], pos, &state);
         assert_top5(&logits, &rec.decode[i], &format!("decode step {i}"));
         state = next;
     }
@@ -195,15 +193,7 @@ pub(crate) fn assert_chunked_prefill_equals_decode(model: &dyn Model, store: &We
     let prompt = [3, 17, 40, 8, 25, 9];
     let (mut want, mut want_state) = (Vec::new(), Vec::new());
     for (i, &token) in prompt.iter().enumerate() {
-        let (logits, state) = run_step(
-            model,
-            store,
-            Phase::Decode,
-            CAP,
-            &[token],
-            i as i32,
-            &want_state,
-        );
+        let (logits, state) = run_step(model, store, CAP, &[token], i as i32, &want_state);
         want.extend(logits);
         want_state = state;
     }
@@ -211,7 +201,7 @@ pub(crate) fn assert_chunked_prefill_equals_decode(model: &dyn Model, store: &We
         let (mut got, mut state) = (Vec::new(), Vec::new());
         for (c, part) in prompt.chunks(chunk).enumerate() {
             let start = (c * chunk) as i32;
-            let (logits, next) = run_step(model, store, Phase::Prefill, CAP, part, start, &state);
+            let (logits, next) = run_step(model, store, CAP, part, start, &state);
             got.extend(logits);
             state = next;
         }
@@ -240,8 +230,7 @@ pub(crate) fn assert_bf16_and_q8_0_trace_through_the_packed_transform(
         let projections = projection_consts(&*model);
         let g = model
             .trace(
-                Phase::Prefill,
-                step_shape(prompt.len(), CAP, LogitRows::All),
+                &StepSpec::step(step_shape(prompt.len(), CAP, LogitRows::All)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -249,28 +238,12 @@ pub(crate) fn assert_bf16_and_q8_0_trace_through_the_packed_transform(
 
         let reference_store = decoded(&store);
         let reference = build(entry, &raw, &reference_store);
-        let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
-        let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-        let (want, _) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Decode,
-            CAP,
-            &[5],
-            4,
-            &want_state,
-        );
+        let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+        let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }
 }
@@ -391,8 +364,7 @@ pub(crate) fn assert_gguf_resolves_and_traces_packed(
     }
     let g = model
         .trace(
-            Phase::Prefill,
-            step_shape(4, CAP, LogitRows::All),
+            &StepSpec::step(step_shape(4, CAP, LogitRows::All)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -556,28 +528,12 @@ pub(crate) fn run_prompt(
     let aligned = prompt.len() / granule * granule;
     let (mut last, mut state) = (Vec::new(), Vec::new());
     if aligned > 0 {
-        let (logits, next) = run_step(
-            model,
-            store,
-            Phase::Prefill,
-            capacity,
-            &prompt[..aligned],
-            0,
-            &[],
-        );
+        let (logits, next) = run_step(model, store, capacity, &prompt[..aligned], 0, &[]);
         last = logits[(aligned - 1) * vocab..].to_vec();
         state = next;
     }
     for (pos, &token) in prompt.iter().enumerate().skip(aligned) {
-        (last, state) = run_step(
-            model,
-            store,
-            Phase::Decode,
-            capacity,
-            &[token],
-            pos as i32,
-            &state,
-        );
+        (last, state) = run_step(model, store, capacity, &[token], pos as i32, &state);
     }
     (last, state)
 }
@@ -605,15 +561,7 @@ pub(crate) fn greedy_tokens(
     let mut token = argmax(&logits);
     let mut tokens = vec![token as u32];
     for pos in prompt.len()..prompt.len() + new - 1 {
-        let (logits, next) = run_step(
-            model,
-            store,
-            Phase::Decode,
-            capacity,
-            &[token],
-            pos as i32,
-            &state,
-        );
+        let (logits, next) = run_step(model, store, capacity, &[token], pos as i32, &state);
         token = argmax(&logits);
         tokens.push(token as u32);
         state = next;

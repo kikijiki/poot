@@ -8,7 +8,7 @@
 //! decomposed trace" checks live with the pass that forms the op (`poot-graph-plan`'s
 //! `alibi_decode_flash_fusion.rs`); the flash-op tests here stage the op directly ([`stage_flash`]).
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::AttentionAttrs;
 use poot_graph_ir::Operand;
 use poot_graph_ir::builder::{Builder, Traced};
@@ -159,7 +159,7 @@ fn attention_masked_with_alibi_bias_matches_hand_rolled_reference() {
         mi,
         Value::from(HostTensor::f32(vec![1, hq, 1, cap], mask_data.clone())),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .map(|r| {
             r.output
                 .into_host()
@@ -298,7 +298,7 @@ fn flash_decode_per_head_alibi_mask_matches_reference_and_decomposition() {
             Value::from(HostTensor::f32(vec![1, hkv, cap, d], vd.clone())),
         );
         inputs.insert(mi, Value::from(HostTensor::f32(mask_shape, mask_data)));
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
@@ -346,7 +346,7 @@ fn flash_decode_per_head_alibi_mask_matches_reference_and_decomposition() {
         mi,
         Value::from(HostTensor::f32(vec![1, hq, 1, cap], mask_data.clone())),
     );
-    let decomposed = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let decomposed = eval(&g, &inputs, EvalOptions::default())
         .map(|r| {
             r.output
                 .into_host()
@@ -429,7 +429,7 @@ fn flash_decode_broadcast_mask_unchanged_batched() {
         mi,
         Value::from(HostTensor::f32(vec![bsz, 1, 1, cap], mask_data.clone())),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .map(|r| {
             r.output
                 .into_host()
@@ -503,7 +503,7 @@ fn flash_prefill_per_head_alibi_mask_matches_reference() {
             Value::from(HostTensor::f32(vec![1, hkv, l, d], vd.clone())),
         );
         inputs.insert(mi, Value::from(HostTensor::f32(mask_shape, mask_data)));
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
@@ -571,7 +571,7 @@ fn flash_prefill_broadcast_mask_unchanged() {
         mi,
         Value::from(HostTensor::f32(vec![1, 1, l, l], causal.clone())),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .map(|r| {
             r.output
                 .into_host()

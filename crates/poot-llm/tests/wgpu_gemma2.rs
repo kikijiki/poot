@@ -13,17 +13,17 @@ use poot_runtime_common::DeviceBackend;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, NoSync, StepInputs};
 use poot_graph_ir::op::{FusedOp, FusedOperand, OpKind, UnOp};
 use poot_graph_ir::{Graph, Slot, SlotKey, Storage, ValueId};
 use poot_graph_plan::{
     CompileOptions, KernelChoice, Target, cse, fuse, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_kernelgen::{KernelRequest, ScoreTransform};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -31,9 +31,7 @@ use poot_tensor::{DType, HostTensor, HostView};
 use poot_test_util::{assert_close_rel, max_abs_error};
 use poot_wgpu_device::device::WgpuDevice;
 
-/// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
-/// submission; fusion is submission-independent, so the structural assertions below see exactly the
-/// same graph the old `Submission::Eager` compile produced).
+/// Compile `g` for `target` through the executor contract's one staged program.
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     let g = g.clone();
     compile_staged(
@@ -43,7 +41,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the gemma2 graph")
 }
@@ -235,8 +233,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
         .f32_model()
         .model
         .trace(
-            Phase::Prefill,
-            step(1, n, n, LogitRows::Last),
+            &StepSpec::step(step(1, n, n, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -287,8 +284,7 @@ fn gemma2_softcap_flash_prefill_gpu_matches_cpu() {
     }
 
     let cpu_inputs = bind(&g, n, &tokens, true);
-    let cpu_eval =
-        eval(&g, &cpu_inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).expect("CPU oracle eval");
+    let cpu_eval = eval(&g, &cpu_inputs, EvalOptions::default()).expect("CPU oracle eval");
     let cpu_logits = cpu_eval.output.into_host().expect("dense output");
     let _cpu_state: Vec<HostTensor> = cpu_eval
         .state
@@ -506,8 +502,7 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu() {
         .f32_model()
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -548,7 +543,7 @@ fn gemma2_geglu_fused_decode_matches_unfused_and_cpu_on_gpu() {
     for (i, (si, _)) in g.state().enumerate() {
         cpu_inputs.insert(si, zero_state[i].clone().into());
     }
-    let cpu_eval = eval(&g, &cpu_inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let cpu_eval = eval(&g, &cpu_inputs, EvalOptions::default()).unwrap();
     let cpu = cpu_eval.output.into_host().unwrap();
     let _cpu_new_state: Vec<HostTensor> = cpu_eval
         .state

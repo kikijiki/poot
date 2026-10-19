@@ -19,9 +19,9 @@ use crate::timing::{DetailedTiming, TimingOptions};
 use crate::{Device, Dispatch, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, UnOp};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::WeightStore;
@@ -60,7 +60,7 @@ impl Control {
 
 struct FakeDevice {
     control: Control,
-    submission: Option<Submission>,
+    recording: bool,
     memory: poot_runtime_common::MemoryCounters,
 }
 
@@ -110,8 +110,8 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn begin(&mut self, submission: Submission) -> Result<(), FakeError> {
-        self.submission = Some(submission);
+    fn begin(&mut self) -> Result<(), FakeError> {
+        self.recording = true;
         Ok(())
     }
 
@@ -124,10 +124,7 @@ impl Device for FakeDevice {
     }
 
     fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(match self.submission.take() {
-            Some(Submission::Replay) => Some(()),
-            _ => None,
-        })
+        Ok(std::mem::take(&mut self.recording).then_some(()))
     }
 
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
@@ -219,7 +216,7 @@ fn staged(g: &poot_graph_ir::Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("fixture graph compiles for the fake target")
 }
@@ -228,7 +225,7 @@ fn new_engine(options: TimingOptions) -> (Engine<FakeDevice>, Control) {
     let control = Control::new();
     let device = FakeDevice {
         control: control.clone(),
-        submission: None,
+        recording: false,
         memory: poot_runtime_common::MemoryCounters::new(),
     };
     (Engine::with_timing(device, options), control)

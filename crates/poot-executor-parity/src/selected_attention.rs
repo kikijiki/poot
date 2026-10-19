@@ -6,7 +6,7 @@ use poot_eval::test_support::StepFixture;
 use poot_graph_ir::test_support::block_top_k::{grid_scores, reference_row};
 use poot_graph_ir::test_support::selected_attention::{Case, cases};
 use poot_graph_ir::{Builder, Outputs, SelectedAttentionAttrs, Slot, TensorType};
-use poot_graph_plan::{KernelChoice, Target, production_plan::Submission};
+use poot_graph_plan::{KernelChoice, Target};
 use poot_tensor::{DType, HostTensor};
 
 use crate::{Fixture, store_from_tensors};
@@ -148,7 +148,7 @@ fn build_with(
 /// `fixture`'s program, compiled for `target`, runs its one attention through the generated kernel, not a
 /// decomposition into dense primitives.
 fn assert_runs_the_kernel(fixture: &Fixture, target: Target) {
-    let staged = crate::staged(fixture, target, Submission::Replay);
+    let staged = crate::staged(fixture, target);
     let kernels = staged
         .stages()
         .flat_map(|(_, _, program)| {

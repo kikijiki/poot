@@ -7,10 +7,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use poot_llm::driver::error::FailureClass;
-use poot_llm::driver::{AdapterRef, DriverCaps, Encoded, ModelHandle, PromptEmbeds};
+use poot_llm::driver::{AdapterRef, DriverCaps, Encoded, ModelHandle};
 use poot_llm::encoders::Pooling;
 use poot_llm::{Sampler, TokenLogprob};
-use poot_models::mrope::MropePositionIds;
+use poot_models::io::RequestInputs;
 
 use crate::metrics::Metrics;
 use crate::vision::ImageClient;
@@ -18,31 +18,27 @@ use crate::vision::ImageClient;
 /// Global shutdown flag: set by the SIGINT/SIGTERM handler so the accept loop exits cleanly.
 pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// The prompt of a generation job, tokenized on the connection thread.
+/// The prompt of a generation job, tokenized on the connection thread: its token ids and the values a
+/// front end produced for the inputs its model declares (an image's embedding rows at the prompt's
+/// placeholders, sectioned positions). A prompt that carries inputs is opened with them and no prefix
+/// is matched or registered for it.
 #[derive(Clone)]
-pub(crate) enum PromptInput {
-    /// A text prompt as token ids.
-    Tokens(Vec<u32>),
-    /// A multimodal prompt: the token ids, and the embedding rows that stand in for the tokens at their
-    /// positions (an image's rows at its placeholders). The sequence is opened with the rows, and no
-    /// prefix is matched or registered for it.
-    Multimodal { tokens: Vec<u32>, rows: PromptRows },
-}
-
-/// What a multimodal prompt supplies besides its tokens.
-#[derive(Clone)]
-pub(crate) struct PromptRows {
-    pub(crate) embeds: PromptEmbeds,
-    /// Where each prompt token rotates, for a model with sectioned positions (Qwen2.5-VL): the
-    /// sequence is opened with them and its generated tokens continue from where they end.
-    pub(crate) mrope: Option<MropePositionIds>,
+pub(crate) struct PromptInput {
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) inputs: RequestInputs,
 }
 
 impl PromptInput {
-    pub(crate) fn tokens(&self) -> &[u32] {
-        match self {
-            PromptInput::Tokens(tokens) | PromptInput::Multimodal { tokens, .. } => tokens,
+    /// A text prompt: token ids and no inputs.
+    pub(crate) fn text(tokens: Vec<u32>) -> Self {
+        Self {
+            tokens,
+            inputs: RequestInputs::none(),
         }
+    }
+
+    pub(crate) fn tokens(&self) -> &[u32] {
+        &self.tokens
     }
 }
 

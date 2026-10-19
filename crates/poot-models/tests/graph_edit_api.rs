@@ -12,7 +12,7 @@ use poot_graph_ir::{
     ValidationId, ValueId, WitnessLedger,
 };
 use poot_graph_plan::{cse, dce, fuse};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 
 /// A tiny qwen2 decode step: a real traced graph with carried KV state.
@@ -26,8 +26,7 @@ fn qwen2_decode() -> Graph {
         .f32_model()
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, 4, LogitRows::Last),
+            &StepSpec::step(step(1, 1, 4, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the qwen2 decode traces")

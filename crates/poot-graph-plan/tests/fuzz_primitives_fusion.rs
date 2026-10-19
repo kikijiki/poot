@@ -3,7 +3,7 @@
 //! never depend on poot-graph-plan (its own architecture test); this crate already dev-depends on
 //! poot-eval, so an integration test here can drive both.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::Builder;
 use poot_graph_ir::op::{BinOp, OpKind, UnOp};
 use poot_graph_ir::types::TensorType;
@@ -103,14 +103,14 @@ fn fused_equals_unfused_elementwise_chain_all_fusable() {
         );
 
         // Assertion (b): bit-identical output.
-        let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let unfused = eval(&g, &inputs, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
                     .expect("fuzz_primitives tests evaluate dense graphs")
             })
             .expect("eval unfused");
-        let fused_out = eval(&fg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let fused_out = eval(&fg, &inputs, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
@@ -232,14 +232,14 @@ fn fused_equals_unfused_matmul_epilogue() {
         fusion_fired += 1;
 
         // Assertion (b): bit-identical output (matmul is exact f32; epilogue is exact elementwise).
-        let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let unfused = eval(&g, &inputs, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
                     .expect("fuzz_primitives tests evaluate dense graphs")
             })
             .expect("eval unfused");
-        let fused_out = eval(&fg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let fused_out = eval(&fg, &inputs, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()

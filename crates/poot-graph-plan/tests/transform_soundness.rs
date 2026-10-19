@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::analysis::dispatch_count;
 use poot_graph_ir::ops::{attention_masked, attention_masked_softcap};
 use poot_graph_ir::{
@@ -53,7 +53,7 @@ fn eval_graph(g: &Graph) -> HostTensor {
         .into_iter()
         .map(|(k, v)| (k, Value::from(v)))
         .collect();
-    eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(g, &inputs, EvalOptions::default())
         .unwrap_or_else(|e| panic!("oracle eval failed: {e}"))
         .output
         .into_host()
@@ -515,7 +515,7 @@ fn flash_decode_batched_matches_attention_masked() {
                 mask.id(),
                 Value::from(HostTensor::f32(vec![bsz, 1, 1, cap], md.clone())),
             );
-            eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            eval(&g, &inp, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()

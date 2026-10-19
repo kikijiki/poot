@@ -2,7 +2,7 @@ use poot_graph_ir::Slot;
 use poot_graph_ir::{Graph, OpKind, Storage};
 use std::num::NonZeroUsize;
 
-use crate::model::{KvLayout, LogitRows, Model, Phase, StepShape};
+use crate::model::{KvLayout, LogitRows, Model, StepShape, StepSpec};
 use crate::registry::Registry;
 
 /// The registry's `family` model over its own fixture checkpoint, its config adjusted by `tweak`
@@ -31,14 +31,9 @@ fn shape(
     logits: LogitRows,
 ) -> StepShape {
     let nz = |n| NonZeroUsize::new(n).unwrap();
-    StepShape {
-        rows: nz(rows),
-        tokens: nz(tokens),
-        capacity: nz(capacity),
-        kv,
-        logits,
-        hidden: None,
-    }
+    StepShape::new(nz(rows), nz(tokens), nz(capacity))
+        .with_kv(kv)
+        .with_logits(logits)
 }
 
 fn contiguous(rows: usize, tokens: usize, capacity: usize) -> StepShape {
@@ -90,8 +85,7 @@ fn decode_traces_and_validates() {
     let m = fixture_model("qwen2");
     let g = m
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -107,8 +101,7 @@ fn prefill_traces_and_validates_both_archs() {
         let m = fixture_model(family);
         let g = m
             .trace(
-                Phase::Prefill,
-                contiguous(1, 5, 8),
+                &StepSpec::step(contiguous(1, 5, 8)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -120,8 +113,7 @@ fn prefill_traces_and_validates_both_archs() {
 fn gemma3_decode_traces_with_state_pairs() {
     let g = fixture_model("gemma3")
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -133,8 +125,7 @@ fn gemma3_prefill_traces_with_state_pairs() {
     // the batched prefill must carry the SAME state pairs as the decode graph.
     let g = fixture_model("gemma3")
         .trace(
-            Phase::Prefill,
-            contiguous(1, 5, 16),
+            &StepSpec::step(contiguous(1, 5, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -155,8 +146,7 @@ fn optimize_fuses_flash_prefill_gemma_no_materialized_scores() {
 fn decode_traces_with_state_pairs() {
     let g = fixture_model("qwen2")
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -175,13 +165,12 @@ fn rope_fusion_collapses_every_rope_in_the_decode_graph() {
     let (layers, _, head_dim, _) = dims(&*m, "qwen2");
     let g = m
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     let base = dce(&cse(&g).unwrap()).unwrap();
-    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
+    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap().0).unwrap();
     let ropes: Vec<usize> = fused
         .eqns()
         .iter()
@@ -233,8 +222,7 @@ fn collapse_reshape_chains_shrinks_the_decode_graph() {
     // reshape_collapse_is_value_identical and the fusion-equivalence fuzzers).
     let g = fixture_model("qwen2")
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -260,8 +248,7 @@ fn prefill_traces_with_state_pairs_both_archs() {
     for family in ["qwen2", "qwen3"] {
         let g = fixture_model(family)
             .trace(
-                Phase::Prefill,
-                contiguous(1, 5, 8),
+                &StepSpec::step(contiguous(1, 5, 8)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -276,8 +263,7 @@ fn batched_decode_traces_with_state_pairs() {
     let m = fixture_model("qwen2");
     let g = m
         .trace(
-            Phase::Decode,
-            contiguous(3, 1, 16),
+            &StepSpec::step(contiguous(3, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -285,8 +271,7 @@ fn batched_decode_traces_with_state_pairs() {
     // B=1 must reduce to the same output shape as the scalar decode.
     let g1 = m
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -298,8 +283,7 @@ fn decode_handles_qwen3() {
     // arch-general: qwen3 (no bias, QK-norm) traces too.
     let g = fixture_model("qwen3")
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 8),
+            &StepSpec::step(contiguous(1, 1, 8)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -311,8 +295,7 @@ fn exactly_two_slots() {
     // A contiguous step declares `Slot::Token` and `Slot::Pos` and nothing else.
     let g = fixture_model("qwen2")
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -326,8 +309,7 @@ fn exactly_two_slots() {
 fn inputs_are_const_slot_or_state() {
     let g = fixture_model("qwen2")
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -351,8 +333,7 @@ fn assert_flash_fused_prefill(family: &str, kv: KvLayout) {
     let (layers, ..) = dims(&*m, family);
     let g = m
         .trace(
-            Phase::Prefill,
-            shape(1, n, n, kv, LogitRows::Last),
+            &StepSpec::step(shape(1, n, n, kv, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -391,10 +372,10 @@ fn optimize_fuses_flash_prefill_no_materialized_scores() {
     assert_flash_fused_prefill("qwen2", KvLayout::Contiguous);
 }
 
-/// A VLM prompt prefills through `Phase::PrefillEmbeds` (the caller's rows scattered over the
-/// embedded tokens), not plain `Prefill` (card 189). The embeds are a select ahead of the layers, so
+/// A VLM prompt prefills through a step carrying `EMBEDS` (the caller's rows scattered over the
+/// embedded tokens), not a plain step (card 189). The embeds are a select ahead of the layers, so
 /// this proves the flash-fusion guarantee of `optimize_fuses_flash_prefill_no_materialized_scores`
-/// for the phase the VLM text tower runs. `L=2048` is far from every fixture dimension, avoiding a
+/// for the step the VLM text tower runs. `L=2048` is far from every fixture dimension, avoiding a
 /// false positive where a per-row weight matmul or attention reshape collides with `L` on some axis
 /// and is miscounted as a score matrix.
 #[test]
@@ -404,8 +385,8 @@ fn optimize_fuses_flash_prefill_vlm_embeds_no_materialized_scores() {
     let (layers, ..) = dims(&*m, "qwen2");
     let g = m
         .trace(
-            Phase::PrefillEmbeds,
-            shape(1, n, n, KvLayout::Contiguous, LogitRows::Last),
+            &StepSpec::step(shape(1, n, n, KvLayout::Contiguous, LogitRows::Last))
+                .carrying(crate::components::embed::EMBEDS),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -442,8 +423,7 @@ fn cse_only_leaves_naive_materialized_scores() {
     let m = model("qwen2", |c| c["max_position_embeddings"] = 4096.into());
     let g = m
         .trace(
-            Phase::Prefill,
-            contiguous(1, n, n),
+            &StepSpec::step(contiguous(1, n, n)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -481,16 +461,14 @@ fn olmo2_prefill_traces_with_state_pairs() {
     let m = fixture_model("olmo2");
     let g = m
         .trace(
-            Phase::Prefill,
-            contiguous(1, 5, 16),
+            &StepSpec::step(contiguous(1, 5, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     assert_contiguous_state(&g, "olmo2", 1, 16);
     let decode = m
         .trace(
-            Phase::Decode,
-            contiguous(1, 1, 16),
+            &StepSpec::step(contiguous(1, 1, 16)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -569,24 +547,8 @@ mod vl {
         .1
         .unwrap();
         let tokens = [3, 17, 40, 8, 25];
-        let (a, _) = vl_step(
-            &*model,
-            &fixture.store,
-            Phase::Prefill,
-            &tokens,
-            0,
-            None,
-            &[],
-        );
-        let (b, _) = vl_step(
-            &*relocated,
-            &fixture.store,
-            Phase::Prefill,
-            &tokens,
-            0,
-            None,
-            &[],
-        );
+        let (a, _) = vl_step(&*model, &fixture.store, &tokens, 0, None, &[]);
+        let (b, _) = vl_step(&*relocated, &fixture.store, &tokens, 0, None, &[]);
         close(&a, &b);
     }
 
@@ -716,27 +678,25 @@ mod vl {
         );
     }
 
-    /// One step of `phase` over `tokens` from `start`, logits at every token, with the sectioned
+    /// One step over `tokens` from `start`, logits at every token, with the sectioned
     /// positions `mrope` (three axes of `tokens.len()` ids, `None` for the text positions on all
     /// three) over `state` (zeros when empty). Returns the logits and the carried state.
     fn vl_step(
         model: &dyn Model,
         store: &WeightStore,
-        phase: Phase,
         tokens: &[i32],
         start: i32,
         mrope: Option<[&[i32]; 3]>,
         state: &[Vec<f32>],
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let pos: Vec<i32> = (start..).take(tokens.len()).collect();
-        vl_step_at(model, store, phase, tokens, &pos, mrope, state)
+        vl_step_at(model, store, tokens, &pos, mrope, state)
     }
 
     /// [`vl_step`] with the cache positions `pos` given outright.
     fn vl_step_at(
         model: &dyn Model,
         store: &WeightStore,
-        phase: Phase,
         tokens: &[i32],
         pos: &[i32],
         mrope: Option<[&[i32]; 3]>,
@@ -744,8 +704,7 @@ mod vl {
     ) -> (Vec<f32>, Vec<Vec<f32>>) {
         let g = model
             .trace(
-                phase,
-                step_shape(tokens.len(), CAP, LogitRows::All),
+                &StepSpec::step(step_shape(tokens.len(), CAP, LogitRows::All)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -792,14 +751,12 @@ mod vl {
             fixture.store.iter().count(),
             "both fixtures hold the same tensors"
         );
-        let (want, plain_state) =
-            oracle::run_step(&*plain, &plain_store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
-        let (got, state) = vl_step(&*vl, &fixture.store, Phase::Prefill, &PROMPT, 0, None, &[]);
+        let (want, plain_state) = oracle::run_step(&*plain, &plain_store, CAP, &PROMPT, 0, &[]);
+        let (got, state) = vl_step(&*vl, &fixture.store, &PROMPT, 0, None, &[]);
         close(&got, &want);
         let (want, _) = oracle::run_step(
             &*plain,
             &plain_store,
-            Phase::Decode,
             CAP,
             &[11],
             PROMPT.len() as i32,
@@ -808,7 +765,6 @@ mod vl {
         let (got, _) = vl_step(
             &*vl,
             &fixture.store,
-            Phase::Decode,
             &[11],
             PROMPT.len() as i32,
             None,
@@ -833,20 +789,9 @@ mod vl {
         // Not a uniform shift: RoPE is relative, so moving every id alike changes no score.
         let moved: Vec<i32> = vec![0, 2, 3, 5, 7];
         let (text, moved) = (text.as_slice(), moved.as_slice());
-        let run = |axes: [&[i32]; 3]| {
-            vl_step(
-                &*vl,
-                &fixture.store,
-                Phase::Prefill,
-                &PROMPT,
-                0,
-                Some(axes),
-                &[],
-            )
-            .0
-        };
+        let run = |axes: [&[i32]; 3]| vl_step(&*vl, &fixture.store, &PROMPT, 0, Some(axes), &[]).0;
         let base = run([text, text, text]);
-        let (plain, _) = vl_step(&*vl, &fixture.store, Phase::Prefill, &PROMPT, 0, None, &[]);
+        let (plain, _) = vl_step(&*vl, &fixture.store, &PROMPT, 0, None, &[]);
         close(&base, &plain);
         // Independent reference: with all three axes on the moved ids the cache sits at the moved
         // positions too, and the tower is plain qwen2 at those positions (holes in the cache and all).
@@ -854,8 +799,7 @@ mod vl {
         let plain_store = (plain_entry().fixture)().store;
         let g = plain
             .trace(
-                Phase::Prefill,
-                step_shape(PROMPT.len(), CAP, LogitRows::All),
+                &StepSpec::step(step_shape(PROMPT.len(), CAP, LogitRows::All)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -876,7 +820,6 @@ mod vl {
         let (got, _) = vl_step_at(
             &*vl,
             &fixture.store,
-            Phase::Prefill,
             &PROMPT,
             moved,
             Some([moved, moved, moved]),

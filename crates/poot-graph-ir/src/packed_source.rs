@@ -3,7 +3,7 @@
 //! A packed weight enters a graph as one `I8` source constant per [`poot_quant::SourceRole`]
 //! [`poot_quant::PackedWeight::sources`] names, each named after the linear it belongs to. This
 //! module owns that spelling and the type each constant is staged with. Builders
-//! ([`crate::ops::packed_linear`]), planners, the CPU oracle, loaders, and model adapters all go
+//! (`packed_graphs::packed_linear`), planners, the CPU oracle, loaders, and model adapters all go
 //! through it, so the suffix and the source byte width exist in exactly one place.
 
 use std::fmt;

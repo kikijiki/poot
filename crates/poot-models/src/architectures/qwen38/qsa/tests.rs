@@ -15,7 +15,7 @@ use super::*;
 use crate::components::attention::carried_cache;
 use crate::components::norm::NormKind;
 use crate::components::standard::oracle::{Fx, random};
-use crate::model::{KvLayout, LogitRows, StepShape};
+use crate::model::{LogitRows, StepShape};
 use poot_tensor::DType;
 
 /// The indexer's shape under test.
@@ -84,14 +84,12 @@ fn views(state: &[Vec<f32>]) -> Vec<&[f32]> {
 }
 
 fn shape(rows: usize, tokens: usize, cap: usize) -> StepShape {
-    StepShape {
-        rows: rows.try_into().unwrap(),
-        tokens: tokens.try_into().unwrap(),
-        capacity: cap.try_into().unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
-    }
+    StepShape::new(
+        rows.try_into().unwrap(),
+        tokens.try_into().unwrap(),
+        cap.try_into().unwrap(),
+    )
+    .with_logits(LogitRows::All)
 }
 
 /// The full re-pool of `keys` `[rows, 1, cap, dim]`: the whole capacity pooled, normed and rotated.

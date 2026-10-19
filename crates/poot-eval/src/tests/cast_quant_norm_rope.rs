@@ -1,6 +1,6 @@
 //! Cast, i8 pack/quant round trips, layernorm/rmsnorm, fused pointwise/reduction fuzz, swiglu, rope.
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::Slot;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{rmsnorm, rope, swiglu};
@@ -40,7 +40,7 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), Value::from(HostTensor::f32(vec![6], vals.clone())));
     // `Cast(F32, BF16)` publishes a BF16 tensor of words.
-    let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -78,7 +78,7 @@ fn cast_f32_to_bf16_rounds_and_infers_dtype() {
             crate::ops::cast::narrow_f32(vec![3], &[0.5, 0.25, -0.75], DType::BF16).unwrap(),
         ),
     );
-    let o2 = eval(&g2, &in2, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let o2 = eval(&g2, &in2, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -102,7 +102,7 @@ fn cast_f32_to_f16_rounds_and_infers_dtype() {
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), Value::from(HostTensor::f32(vec![6], vals.clone())));
     // `Cast(F32, F16)` publishes an F16 tensor of words.
-    let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -137,7 +137,7 @@ fn cast_f32_to_f16_rounds_and_infers_dtype() {
                 .to_vec(),
         )),
     );
-    let o2 = eval(&g2, &in2, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let o2 = eval(&g2, &in2, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -183,7 +183,7 @@ fn matmul_f16_output_narrows_the_accumulator() {
         )),
     );
     // `matmul` narrows its F16-dtype output to f16 words; widen them to compare.
-    let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -236,7 +236,7 @@ fn pack_unpack_i8_graph_round_trips() {
         xi,
         Value::from(HostTensor::f32(vec![rows, cols], codes.clone())),
     );
-    let packed_t = eval(&gp, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let packed_t = eval(&gp, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -255,7 +255,7 @@ fn pack_unpack_i8_graph_round_trips() {
         x2i,
         Value::from(HostTensor::f32(vec![rows, cols], codes.clone())),
     );
-    let got = eval(&g, &in2, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &in2, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -300,7 +300,7 @@ fn packed_i8_survives_copy_ops_in_eval() {
             (0..rows).rev().map(|i| i as i32).collect(),
         )),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -328,7 +328,7 @@ fn packed_i8_survives_copy_ops_in_eval() {
         x2i,
         Value::from(HostTensor::f32(vec![rows, cols], codes.clone())),
     );
-    let got2 = eval(&g2, &in2, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got2 = eval(&g2, &in2, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -361,7 +361,7 @@ fn layernorm_matches_direct() {
     inputs.insert(xi, Value::from(HostTensor::f32(vec![1, 1, n], xd.clone())));
     inputs.insert(wi, Value::from(HostTensor::f32(vec![n], wd.clone())));
     inputs.insert(bi, Value::from(HostTensor::f32(vec![n], bd.clone())));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -395,7 +395,7 @@ fn rmsnorm_matches_direct() {
     let mut inputs = HashMap::new();
     inputs.insert(xi, Value::from(HostTensor::f32(vec![1, 1, n], xd.clone())));
     inputs.insert(wi, Value::from(HostTensor::f32(vec![n], wd.clone())));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -431,7 +431,7 @@ fn rmsnorm_and_layernorm_stay_accurate_at_real_hidden_dim_with_outlier_channels(
     let mut inputs = HashMap::new();
     inputs.insert(xi, Value::from(HostTensor::f32(vec![1, 1, n], xd.clone())));
     inputs.insert(wi, Value::from(HostTensor::f32(vec![n], wd.clone())));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -463,7 +463,7 @@ fn rmsnorm_and_layernorm_stay_accurate_at_real_hidden_dim_with_outlier_channels(
     inl.insert(xli, Value::from(HostTensor::f32(vec![1, 1, n], xd.clone())));
     inl.insert(wli, Value::from(HostTensor::f32(vec![n], wd.clone())));
     inl.insert(bli, Value::from(HostTensor::f32(vec![n], bd.clone())));
-    let gotl = eval(&gl, &inl, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let gotl = eval(&gl, &inl, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -508,7 +508,7 @@ fn swiglu_matches_direct() {
     let mut inputs = HashMap::new();
     inputs.insert(gi, Value::from(HostTensor::f32(vec![1, 1, n], gd.clone())));
     inputs.insert(ui, Value::from(HostTensor::f32(vec![1, 1, n], ud.clone())));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -558,7 +558,7 @@ fn rope_matches_direct() {
         Value::from(HostTensor::f32(vec![max_pos, d], sind.clone())),
     );
     inputs.insert(pi, Value::from(HostTensor::i32(vec![], vec![posv as i32])));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -616,7 +616,7 @@ fn rope_partial_matches_direct() {
         Value::from(HostTensor::f32(vec![max_pos, rot], sind.clone())),
     );
     inputs.insert(pi, Value::from(HostTensor::i32(vec![], vec![posv as i32])));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -659,7 +659,7 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
         x.id(),
         Value::from(poot_tensor::HostTensor::i32(vec![2], vec![0, 16_777_217])),
     )]);
-    let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+    let error = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
     assert!(
         matches!(
             &error,
@@ -684,7 +684,7 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
         x.id(),
         Value::from(HostTensor::f32(vec![2], vec![0.0, 1.5])),
     )]);
-    let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+    let error = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
     assert!(
         matches!(
             &error,
@@ -702,7 +702,7 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
         x.id(),
         Value::from(HostTensor::f32(vec![1], vec![f32::NAN])),
     )]);
-    let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+    let error = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
     let EvalError::Cast(fault) = &error else {
         panic!("expected a Cast fault, got {error:?}")
     };
@@ -721,7 +721,7 @@ fn cast_fault_carries_the_literal_from_to_index_and_value() {
         x.id(),
         Value::from(poot_tensor::HostTensor::i32(vec![2], vec![0, 300])),
     )]);
-    let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+    let error = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
     assert!(
         matches!(
             &error,
@@ -752,7 +752,7 @@ fn cast_table_literal_bits_sc002() {
             x.id(),
             Value::from(HostTensor::f32(vec![1], vec![f32::from_bits(bits)])),
         )]);
-        let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let out = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -801,7 +801,7 @@ fn cast_table_literal_bits_sc002() {
             x.id(),
             Value::Host(crate::fp8::e4m3fn_tensor(vec![1], vec![byte]).unwrap()),
         )]);
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -820,10 +820,7 @@ fn cast_table_literal_bits_sc002() {
         x.id(),
         Value::from(HostTensor::f32(vec![1], vec![448.0f32])),
     )]);
-    let Value::Host(encoded) = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .unwrap()
-        .output
-    else {
+    let Value::Host(encoded) = eval(&g, &inputs, EvalOptions::default()).unwrap().output else {
         panic!("Cast(F32, E4M3FN) must publish e4m3fn storage")
     };
     assert_eq!(encoded.view().bytes(), [0x7E]);
@@ -834,7 +831,7 @@ fn cast_table_literal_bits_sc002() {
     let y = b.cast(x, DType::I8).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = HashMap::from([(x.id(), Value::from(HostTensor::i32(vec![1], vec![127])))]);
-    let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

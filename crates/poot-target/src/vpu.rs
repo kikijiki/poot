@@ -80,8 +80,8 @@ impl VendorCompilerId {
 ///
 /// The bound holds only for finite values the narrowed width can hold: an F32 value beyond
 /// [`NarrowingContract::max_magnitude`] narrows to infinity and the error is unbounded. That range is a
-/// precondition of the contract, checked where the host can: literals when the region is planned, the region's
-/// F32 inputs before each replay and its F32 results after it.
+/// precondition of the contract, checked where the host can: literals when the region is planned, a constant once, as it is
+/// uploaded, the region's F32 inputs before each replay and its F32 results after it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NarrowingContract {
     /// The bound in parts per million of the reference result's largest magnitude.
@@ -117,5 +117,34 @@ impl VpuCaps {
     /// The float width this device computes in natively (a property of the part, not measured).
     pub const fn arithmetic(&self) -> VpuArithmetic {
         self.target.arithmetic()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FP16: NarrowingContract = NarrowingContract {
+        max_relative_error_ppm: 5_000,
+        max_magnitude: 65_504,
+    };
+
+    /// The range precondition at its edges: FP16's largest finite value is admitted, the next F32 above it, the
+    /// negative twin, NaN and both infinities are not.
+    /// Mutation: widen `admits` to `value.abs() <= self.max_magnitude as f32 + 1.0`; the 65504.5 row goes red.
+    #[test]
+    fn the_range_precondition_holds_at_the_edges_of_fp16() {
+        for admitted in [0.0, -0.0, 1.0, 65_504.0, -65_504.0] {
+            assert!(FP16.admits(admitted), "{admitted}");
+        }
+        for refused in [
+            65_504.5,
+            -65_504.5,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert!(!FP16.admits(refused), "{refused}");
+        }
     }
 }

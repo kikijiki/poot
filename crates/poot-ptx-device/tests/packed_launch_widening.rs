@@ -19,7 +19,7 @@ use poot_eval::Value;
 use poot_executor::Device;
 use poot_graph_ir::{Builder, Graph, PackedSourceName, Slot, TensorType, ValueId};
 use poot_graph_plan::test_support::gpu_caps;
-use poot_graph_plan::{CompileOptions, Target, compile, production_plan::Submission};
+use poot_graph_plan::{CompileOptions, Target, compile};
 use poot_ptx_device::PtxDevice;
 use poot_quant::format::WeightFormat;
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
@@ -39,7 +39,7 @@ fn compiled(gpu: &PtxDevice, graph: &Graph) -> Graph {
             backend: Backend::Nvptx,
             caps: gpu_caps(&Device::target(gpu)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the packed graph")
     .graph()
@@ -89,7 +89,7 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
             ))
         })
         .collect();
-    let table = poot_graph_ir::ops::PackedExpertStack {
+    let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
         stack_id: "experts".to_string(),
         descriptor: owners[0].weight(),
         experts: EXPERTS,
@@ -108,7 +108,8 @@ fn run_moe(gpu: &mut PtxDevice, out: usize, k: usize) -> (Vec<f32>, Vec<f32>) {
             poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
         )
         .unwrap();
-    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_indexed_linear(&b, x, ids, &table)
+        .unwrap();
     let graph = compiled(gpu, &b.finish(y).unwrap());
     assert!(
         matches!(
@@ -200,9 +201,13 @@ fn a_widened_row_gather_after_a_narrow_one_is_bit_exact() {
         let token = b
             .slot(Slot::Token, TensorType::new(vec![n], DType::I32))
             .unwrap();
-        let rows =
-            poot_graph_ir::ops::packed_embedding(&b, token, "model.embed_tokens", owner.weight())
-                .unwrap();
+        let rows = poot_graph_ir::test_support::packed_graphs::packed_embedding(
+            &b,
+            token,
+            "model.embed_tokens",
+            owner.weight(),
+        )
+        .unwrap();
         let graph = compiled(&gpu, &b.finish(rows).unwrap());
         assert!(
             graph

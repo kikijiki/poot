@@ -5,7 +5,7 @@
 //! a negative one, a subnormal, a negative subnormal).
 
 use poot_graph_ir::{Builder, TensorType};
-use poot_graph_plan::{ImportedKernel, KernelChoice, Target, production_plan::Submission};
+use poot_graph_plan::{ImportedKernel, KernelChoice, Target};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
@@ -97,7 +97,7 @@ pub fn assert_bit_exact(fixture: &Fixture, got: &HostTensor, oracle: &HostTensor
 /// `fixture`'s program, compiled for `target`, runs its one `Cast` through the imported `packed_bf16_to_f32`
 /// body, so a row shows the kernel it ran is the packed reader and not only that the words matched.
 pub fn assert_one_packed_cast(fixture: &Fixture, target: Target) {
-    let staged = crate::staged(fixture, target, Submission::Replay);
+    let staged = crate::staged(fixture, target);
     let kernels: Vec<ImportedKernel> = staged
         .stages()
         .flat_map(|(_, _, program)| {

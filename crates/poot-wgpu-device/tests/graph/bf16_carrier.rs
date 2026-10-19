@@ -31,7 +31,7 @@ fn bf16_host_tensor_binds_to_the_oracle_and_wgpu_without_widening() {
     let oracle = eval(
         &g,
         &HashMap::from([(x.id(), Value::from(input.clone()))]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output

@@ -683,6 +683,61 @@ pub enum StateRole {
     Handoff,
 }
 
+/// Which extent a state value's leading axis has in a step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StateRows {
+    /// The step's rows: a private cache, one row per step row.
+    StepRows,
+    /// The sequences a paged layout's state pool serves, one row each (the step's rows under a
+    /// contiguous layout).
+    PoolSeqs,
+    /// The slots of a paged layout's KV pool, addressed through the step's slot maps (the step's rows
+    /// under a contiguous layout).
+    PoolSlots,
+}
+
+/// What a driver may assume about a state value from its role alone: which extent its leading axis has,
+/// whether a rejected token's write must be rolled back, and whether it is the hand-off one program
+/// writes for another. The driver reads this and never matches a role, so a new role is an edit here
+/// and none in the driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StatePolicy {
+    /// The extent of the value's leading axis.
+    pub rows: StateRows,
+    /// Whether a rejected token folded into the value must be undone by restoring a snapshot.
+    pub rollback: bool,
+    /// Whether one program writes the value for a later program of the same driver step to read.
+    pub handoff: bool,
+}
+
+impl StateRole {
+    /// The policy a driver applies to a state value of this role.
+    pub const fn policy(self) -> StatePolicy {
+        match self {
+            StateRole::Positional { axis: 0 } => StatePolicy {
+                rows: StateRows::PoolSlots,
+                rollback: false,
+                handoff: false,
+            },
+            StateRole::Positional { .. } | StateRole::Blocked { .. } => StatePolicy {
+                rows: StateRows::StepRows,
+                rollback: false,
+                handoff: false,
+            },
+            StateRole::Recurrent => StatePolicy {
+                rows: StateRows::PoolSeqs,
+                rollback: true,
+                handoff: false,
+            },
+            StateRole::Handoff => StatePolicy {
+                rows: StateRows::PoolSeqs,
+                rollback: false,
+                handoff: true,
+            },
+        }
+    }
+}
+
 /// One `(state_in, state_out)` pair from [`Graph::state`], with the input's declared [`StateRole`] read
 /// alongside it. Built by [`Graph::state_pairs`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

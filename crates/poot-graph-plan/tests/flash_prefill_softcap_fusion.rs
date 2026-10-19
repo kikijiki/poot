@@ -9,7 +9,7 @@
 //! poot-eval must never depend on poot-graph-plan (its own architecture test); this crate already
 //! dev-depends on poot-eval, so an integration test here can drive both.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::ValueId;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::attention_prefill_softcap;
@@ -94,7 +94,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
         };
     let materialized = |softcap_opt: Option<f32>| -> HostTensor {
         let (g, inp) = trace(softcap_opt);
-        eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -123,7 +123,7 @@ fn flash_prefill_softcap_matches_attention_prefill_softcap_and_f64_reference() {
             got_softcap, softcap_opt,
             "fused op's softcap parameter does not match the traced graph's attn_logit_softcap"
         );
-        eval(&opt, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&opt, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

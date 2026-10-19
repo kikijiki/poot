@@ -10,9 +10,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
-    BackendChoice, Driver, DriverOptions, GenerateRequest, ModelHandle, PreparedSetLimits,
+    BackendChoice, Driver, DriverOptions, GenerateRequest, Layout, ModelHandle, PreparedSetLimits,
     open_executor,
 };
 use poot_llm::{GenerationControl, Sampler};
@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
     )?);
     let tokens = handle.text().encode(&prompt)?;
     let max_new = 32;
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let granule = handle.config().prefill_granule.get();
     let chunk = NonZeroUsize::new(128usize.div_ceil(granule) * granule).expect("nonzero");
     let options = DriverOptions {
@@ -58,7 +58,8 @@ fn main() -> anyhow::Result<()> {
         Arc::clone(&handle),
         open_executor(BackendChoice::Auto)?,
         options,
-    )?;
+    )?
+    .serve(Layout::Contiguous);
 
     print!("{prompt}");
     let _ = std::io::stdout().flush();

@@ -10,7 +10,7 @@ use poot_eval::test_support::StepFixture;
 use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, Engine, Executor, ExecutorStats, NoSync, StepInputs};
 use poot_executor_parity::Fixture;
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_test_util::assert_close_rel;
@@ -91,33 +91,7 @@ fn softcapped_qwen2_matches_the_oracle_on_vulkan() {
         let mut oracle = oracle_for(&softcapped.graph, &softcapped.store);
         poot_executor_parity::run_parity(exec.as_mut(), t, softcapped, &mut oracle)
             .unwrap_or_else(|e| panic!("{e}"));
-        // The softcap must be visible: the softcapped trace's oracle differs from the uncapped
-        // trace's by more than ten times the parity tolerance at some step.
-        let (mut capped_oracle, mut plain_oracle) = (
-            oracle_for(&softcapped.graph, &softcapped.store),
-            oracle_for(&uncapped.graph, &uncapped.store),
-        );
-        let largest = softcapped
-            .steps
-            .iter()
-            .zip(&uncapped.steps)
-            .map(|(capped_step, plain_step)| {
-                let capped = capped_oracle(capped_step);
-                let plain = plain_oracle(plain_step);
-                capped
-                    .as_f32()
-                    .expect("F32 oracle output")
-                    .iter()
-                    .zip(plain.as_f32().expect("F32 oracle output"))
-                    .map(|(c, p)| (c - p).abs() / p.abs().max(1.0))
-                    .fold(0.0f32, f32::max)
-            })
-            .fold(0.0f32, f32::max);
-        assert!(
-            largest > 5e-2,
-            "{}: the softcap barely changes the oracle (max relative difference {largest:.2e})",
-            softcapped.name
-        );
+        poot_executor_parity::assert_softcap_is_visible(softcapped, uncapped);
     }
 }
 
@@ -157,10 +131,7 @@ fn sixteen_replayed_steps_record_once() {
         )
         .unwrap();
     let entry = engine
-        .add_entry(
-            exe,
-            &poot_executor_parity::staged(&fixture, target, Submission::Replay),
-        )
+        .add_entry(exe, &poot_executor_parity::staged(&fixture, target))
         .unwrap();
     for (i, step) in fixture.steps.iter().enumerate() {
         let want = oracle(step);

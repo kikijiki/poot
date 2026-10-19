@@ -102,9 +102,11 @@ const FORBIDDEN_NORMAL: &[(&[&str], &str, &str)] = &[
             "poot-ptx-device",
             "poot-vulkan-device",
             "poot-npu",
+            "poot-llm",
         ],
         "poot-eval",
-        "executors and devices never run the CPU oracle (ruling E6, ADR-0102 decision 5)",
+        "executors, devices and the driver never run the CPU oracle: the host sampler is a plain exact function \
+         (ruling E6, ADR-0102 decision 5, POOT-1222)",
     ),
     (
         &[

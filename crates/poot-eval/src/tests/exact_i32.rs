@@ -5,7 +5,7 @@ use std::sync::Arc;
 use poot_graph_ir::{BinOp, Builder, Scalar, StateRole, TensorType, UnOp};
 
 use super::allocation::allocated_bytes;
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
 
@@ -37,7 +37,7 @@ fn exact_i32_binary_uses_authoritative_words_with_scalar_and_broadcast_forms() {
         y.id(),
         Value::from(i32_tensor(vec![1, 3], &[0, 1, i32::MIN])),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -82,14 +82,10 @@ fn signed_and_unsigned_i32_comparisons_diverge_at_the_sign_bit() {
         Value::from(i32_tensor(vec![4], &[0, 1, i32::MAX, i32::MIN])),
     );
     inputs.insert(zero.id(), Value::from(i32_tensor(vec![4], &[0; 4])));
-    let env = eval(
-        &g,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .unwrap()
-    .environment
-    .unwrap();
+    let env = eval(&g, &inputs, EvalOptions::default().keep_environment())
+        .unwrap()
+        .environment
+        .unwrap();
     assert_eq!(
         env[max.id()].as_ref().unwrap().as_host().unwrap().as_i32(),
         Some(&[0, 1, i32::MAX, 0][..])
@@ -142,7 +138,7 @@ fn unsigned_remainder_matches_u32_modulus_literals_above_the_sign_bit() {
     let mut inputs = HashMap::new();
     inputs.insert(x.id(), Value::from(i32_tensor(vec![5], &dividends)));
     inputs.insert(m.id(), Value::from(i32_tensor(vec![5], &divisors)));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -177,7 +173,7 @@ fn unsigned_remainder_matches_u32_modulus_literals_above_the_sign_bit() {
             (x0.id(), Value::from(i32_tensor(vec![1], &[1]))),
             (m0.id(), Value::from(i32_tensor(vec![1], &[0]))),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap_err();
     let message = err.to_string();
@@ -201,7 +197,7 @@ fn i32_broadcast_preserves_words_and_bounded_index_inputs_remain_compatible() {
         Value::from(i32_tensor(vec![2, 1], &[16_777_217, i32::MIN])),
     );
     assert_eq!(
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -240,7 +236,7 @@ fn i32_broadcast_preserves_words_and_bounded_index_inputs_remain_compatible() {
     );
     inputs.insert(index.id(), Value::from(HostTensor::i32(vec![], vec![2])));
     assert_eq!(
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -265,7 +261,7 @@ fn i32_words_are_exact_and_a_non_i32_bind_is_refused() {
         Value::from(HostTensor::i32(vec![1], vec![16_777_217])),
     )]);
     assert_eq!(
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -279,7 +275,7 @@ fn i32_words_are_exact_and_a_non_i32_bind_is_refused() {
         x.id(),
         Value::from(HostTensor::f32(vec![1], vec![16_777_216.0])),
     );
-    let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let error = eval(&g, &inputs, EvalOptions::default())
         .unwrap_err()
         .to_string();
     assert!(error.contains("different dtype"), "{error}");
@@ -306,14 +302,10 @@ fn exact_concat_combines_two_authoritative_i32_parts() {
         ),
         (legacy.id(), Value::from(HostTensor::i32(vec![1], vec![7]))),
     ]);
-    let env = eval(
-        &g,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .unwrap()
-    .environment
-    .unwrap();
+    let env = eval(&g, &inputs, EvalOptions::default().keep_environment())
+        .unwrap()
+        .environment
+        .unwrap();
     assert_eq!(
         env[joined.id()]
             .as_ref()
@@ -344,7 +336,7 @@ fn exact_i32_scalar_empty_overflow_and_error_precedence_are_total() {
                 scalar.id(),
                 Value::from(HostTensor::i32(vec![], vec![i32::MAX]))
             )]),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .unwrap()
         .output
@@ -394,14 +386,10 @@ fn exact_i32_bit_select_and_clz_match_wrapping_word_semantics() {
         Value::from(i32_tensor(vec![4], &[0, -1, i32::MIN, 1])),
     );
     inputs.insert(y.id(), Value::from(i32_tensor(vec![4], &[7, 0, 1, 33])));
-    let env = eval(
-        &g,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .unwrap()
-    .environment
-    .unwrap();
+    let env = eval(&g, &inputs, EvalOptions::default().keep_environment())
+        .unwrap()
+        .environment
+        .unwrap();
     let dense_ints = |id: poot_graph_ir::ValueId| -> Option<Vec<i32>> {
         env[id]
             .as_ref()
@@ -438,7 +426,7 @@ fn clz_of_zero_and_sign_bit_are_defined() {
     let got = eval(
         &g,
         &HashMap::from([(x.id(), Value::from(i32_tensor(vec![2], &[0, i32::MIN])))]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -468,7 +456,7 @@ fn select_takes_if_true_for_any_nonzero_condition_word() {
             (if_true.id(), Value::from(i32_tensor(vec![2], &[10, 10]))),
             (if_false.id(), Value::from(i32_tensor(vec![2], &[3, 3]))),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -542,7 +530,7 @@ fn exact_i32_gather_reads_a_bf16_data_source() {
             (table.id(), Value::Host(bf16_host(&[1.5, -2.25, 0.0, 8.0]))),
             (index.id(), exact_view(vec![2], [3, 1])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -576,7 +564,7 @@ fn exact_i32_gather_reads_an_f32_data_source() {
             ),
             (index.id(), exact_view(vec![2], [2, 0])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -603,7 +591,7 @@ fn exact_i32_gather_still_checks_bounds_on_a_bf16_data_source() {
             (table.id(), Value::Host(bf16_host(&[1.0, 2.0]))),
             (index.id(), exact_view(vec![1], [5])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     );
     // Card 555: a BF16 table + I32 index Gather is one answer, the same Spec 376
     // admission the Exact-BF16 lane always used, so the bounds check is now the one index rule's
@@ -639,9 +627,8 @@ fn exact_i32_gather_does_not_materialize_the_whole_bf16_source() {
         (index.id(), exact_view(vec![2], [3, ROWS as i32 - 1])),
     ]);
 
-    let (result, bytes) = allocated_bytes(|| {
-        eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|e| e.output)
-    });
+    let (result, bytes) =
+        allocated_bytes(|| eval(&graph, &inputs, EvalOptions::default()).map(|e| e.output));
     // Card 554d: a BF16 table + I32 index Gather is one answer now (the Spec 376 lane),
     // which keeps the two selected rows BF16-exact rather than widening them to a dense F32 result.
     let Value::Exact(ExactValue::Bf16(result)) = result.unwrap() else {
@@ -680,7 +667,7 @@ fn exact_i32_compare_sub_select_are_wordwise() {
         (left.id(), exact_view(vec![2], [i32::MIN, i32::MAX])),
         (right.id(), exact_view(vec![2], [0, -1])),
     ]);
-    let result = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let result = eval(&graph, &inputs, EvalOptions::default())
         .unwrap()
         .output;
     // Card 554d: the unified walk always publishes an I32 equation's output as `Value::Host`
@@ -705,7 +692,7 @@ fn exact_i32_compare_sub_select_are_wordwise() {
             (left.id(), exact_view(vec![1], [7])),
             (right.id(), exact_view(vec![1], [7])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -731,7 +718,7 @@ fn exact_i32_gather_preserves_large_words() {
             (table.id(), table_value.clone()),
             (index.id(), exact_view(vec![2], [0, 2])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -755,7 +742,7 @@ fn exact_i32_gather_preserves_large_words() {
                 (table.id(), table_value.clone()),
                 (index.id(), exact_view(vec![2], [1, bad])),
             ]),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         );
         let Err(EvalError::Index(fault)) = &outcome else {
             panic!("expected a bounds rejection, got {outcome:?}")
@@ -794,7 +781,7 @@ fn selected_cast_checks_before_allocation() {
             (table.id(), exact_view(vec![3], [0, 16_777_217, 2])),
             (index.id(), exact_view(vec![2], [0, 1])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap_err();
     // the exact-f32 integer range violation is `EvalError::Cast(CastFault)`, not a named
@@ -804,13 +791,9 @@ fn selected_cast_checks_before_allocation() {
         EvalError::Cast(fault) if fault.index == 1 && fault.value == crate::CastOperand::I32(16_777_217)
     ));
 
-    let result = eval(
-        &graph,
-        &valid_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output;
+    let result = eval(&graph, &valid_inputs, EvalOptions::default())
+        .unwrap()
+        .output;
     let Value::Host(result) = result else {
         panic!("expected selected f32")
     };
@@ -856,7 +839,7 @@ fn a_slot_outside_its_declared_range_is_refused_before_any_equation() {
                 ),
                 (token.id(), exact_view(vec![3], words)),
             ]),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
     };
 
@@ -921,7 +904,7 @@ fn i32_boundary_test_is_scalar_bounded() {
                 (table.id(), exact_view(vec![2], words)),
                 (index.id(), indices.clone()),
             ]),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
     };
     assert!(run([16_777_216, 2]).is_ok());
@@ -982,7 +965,7 @@ fn guarded_selector_publishes_in_range_ids_unchanged_on_cpu() {
             (table, exact_view(vec![4], [3, 0, 2, 1])),
             (indices, exact_view(vec![4], [0, 1, 2, 3])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -1007,7 +990,7 @@ fn guarded_selector_with_a_forged_bound_cannot_publish_inexact_lanes() {
             (table, exact_view(vec![4], [16_777_217, 0, 0, 0])),
             (indices, exact_view(vec![4], [0, 1, 2, 3])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     );
     // the exact-f32 integer range violation is now `EvalError::Cast(CastFault)`, not a
     // named `ExactI32Error` variant.
@@ -1032,7 +1015,7 @@ fn witness_counts_exactly_the_out_of_range_lanes() {
             (table, exact_view(vec![4], [-1, 4, 9, 1])),
             (indices, exact_view(vec![4], [0, 1, 2, 3])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap_err();
     let EvalError::Validation(failure) = error else {
@@ -1057,7 +1040,7 @@ fn cpu_exact_eval_checks_the_packet_before_publishing() {
             (table, exact_view(vec![4], [0, 1, 2, 7])),
             (indices, exact_view(vec![4], [0, 1, 2, 3])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     );
     assert!(
         matches!(result, Err(EvalError::Validation(_))),
@@ -1072,7 +1055,7 @@ fn cpu_exact_eval_checks_the_packet_before_publishing() {
                 (table, exact_view(vec![4], [0, 1, 2, 3])),
                 (indices, exact_view(vec![4], [0, 1, 2, 3])),
             ]),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .is_ok()
     );
@@ -1152,7 +1135,7 @@ fn exact_i32_reshape_is_a_view_over_the_same_words() {
             (rows, exact_view(vec![2], [0, 1])),
             (slots, exact_view(vec![3], [0, 1, 2])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -1184,7 +1167,7 @@ fn exact_i32_reshape_accepts_a_dense_carrier_too() {
             (rows, Value::from(i32_tensor(vec![2], &[0, 1]))),
             (slots, exact_view(vec![3], [0, 1, 2])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -1215,7 +1198,7 @@ fn exact_i32_index_arithmetic_is_wordwise_and_wrapping() {
             (rows, exact_view(vec![2], [1, 2])),
             (slots, exact_view(vec![3], [0, 1, 2])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -1234,7 +1217,7 @@ fn exact_i32_index_arithmetic_is_wordwise_and_wrapping() {
             (rows, exact_view(vec![2], [3, 2])),
             (slots, exact_view(vec![3], [0, 1, 2])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -1253,7 +1236,7 @@ fn exact_i32_index_arithmetic_is_wordwise_and_wrapping() {
             (rows, exact_view(vec![1], [i32::MAX])),
             (slots, exact_view(vec![1], [0])),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap_err();
     // Card 555: `ExactI32Error::GatherIndex` is gone; the Gather bounds check now reports through the
@@ -1296,24 +1279,15 @@ fn computed_gather_addresses_are_bounds_checked() {
         ])
     };
 
-    let result = eval(
-        &graph,
-        &bind([2, 0]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output;
+    let result = eval(&graph, &bind([2, 0]), EvalOptions::default())
+        .unwrap()
+        .output;
     let Value::Host(result) = result else {
         panic!("a dense table gathers to a dense tensor")
     };
     assert_eq!(result.as_f32().unwrap(), [2.0, 3.0]);
 
-    let error = eval(
-        &graph,
-        &bind([2, 3]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap_err();
+    let error = eval(&graph, &bind([2, 3]), EvalOptions::default()).unwrap_err();
     let EvalError::Index(fault) = &error else {
         panic!("expected a bounds rejection, got {error:?}")
     };
@@ -1376,7 +1350,7 @@ fn exact_i32_with_state_publishes_every_pair_in_graph_order() {
 
     let (graph, cache, counter) = state_carrying_graph();
     let inputs = state_carrying_bindings(cache, counter);
-    let evaluation = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let evaluation = eval(&graph, &inputs, EvalOptions::default()).unwrap();
     let (output, state) = (evaluation.output, evaluation.state);
 
     let Value::Host(output) = output else {
@@ -1447,13 +1421,9 @@ fn exact_i32_with_state_requires_the_dense_carrier() {
             Value::Host(HostTensor::f32(vec![2], vec![1.0, 2.0])),
         ),
     ]);
-    let state = eval(
-        &graph,
-        &dense_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .state;
+    let state = eval(&graph, &dense_inputs, EvalOptions::default())
+        .unwrap()
+        .state;
     let Value::Host(counter_out) = &state[0] else {
         panic!("expected a dense I32 state value, got {:?}", state[0])
     };
@@ -1467,12 +1437,7 @@ fn exact_i32_with_state_requires_the_dense_carrier() {
             Value::Host(HostTensor::f32(vec![2], vec![1.0, 2.0])),
         ),
     ]);
-    let error = eval(
-        &graph,
-        &exact_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap_err();
+    let error = eval(&graph, &exact_inputs, EvalOptions::default()).unwrap_err();
     assert!(
         matches!(
             &error,
@@ -1525,9 +1490,7 @@ fn exact_i32_with_state_publishes_shared_allocations() {
         (cache.id(), Value::Host(cache_in.clone())),
         (counter.id(), Value::Host(counter_in.clone())),
     ]);
-    let state = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .unwrap()
-        .state;
+    let state = eval(&graph, &inputs, EvalOptions::default()).unwrap().state;
 
     let Value::Host(cache_out) = &state[0] else {
         panic!("expected a dense cache, got {:?}", state[0])
@@ -1589,9 +1552,7 @@ fn exact_i32_dynamic_update_slice_writes_at_the_exact_position() {
             ),
             (position.id(), exact_view(vec![], [step as i32 + 1])),
         ]);
-        let state = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-            .unwrap()
-            .state;
+        let state = eval(&graph, &inputs, EvalOptions::default()).unwrap().state;
         carried = state.into_iter().next().expect("one carried cache");
     }
 
@@ -1638,7 +1599,7 @@ fn exact_i32_dynamic_update_slice_rejects_an_out_of_range_position() {
             ),
             (position.id(), exact_view(vec![], [bad_position])),
         ]);
-        let err = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let err = eval(&graph, &inputs, EvalOptions::default())
             .expect_err("an out-of-range position must fail closed");
         assert!(
             matches!(&err, EvalError::Index(fault) if fault.kind == expected_kind),
@@ -1680,7 +1641,7 @@ fn eval_i32_requires_an_i32_tensor() {
         (x.id(), Value::Host(f32_only)),
         (y.id(), Value::Host(HostTensor::i32(vec![2], vec![1, 2]))),
     ]);
-    let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let err = eval(&g, &inputs, EvalOptions::default())
         .expect_err("an I32 input that is not an I32 tensor must fail closed");
     assert!(
         matches!(

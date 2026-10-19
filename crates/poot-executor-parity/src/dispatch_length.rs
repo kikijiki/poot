@@ -21,9 +21,8 @@ use poot_graph_ir::op::{BinOp, RedOp};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
-    staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -83,8 +82,8 @@ impl<D: Device> Device for ShortActivations<D> {
     ) -> Result<Self::Kernel, Self::Error> {
         self.inner.load_kernel(key, kernel)
     }
-    fn begin(&mut self, submission: Submission) -> Result<(), Self::Error> {
-        self.inner.begin(submission)
+    fn begin(&mut self) -> Result<(), Self::Error> {
+        self.inner.begin()
     }
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
         self.dispatches.set(self.dispatches.get() + 1);
@@ -198,7 +197,7 @@ pub fn over_length_dispatch_is_refused<D: Device + 'static>(device: D) {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("the fixture compiles");
     let mut engine = Engine::new(device);

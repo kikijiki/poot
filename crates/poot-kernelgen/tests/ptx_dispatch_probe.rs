@@ -234,11 +234,7 @@ fn attention_leading_true_inf_mask_dispatches_and_matches_cpu_on_ptx() {
         "the attention kernel produced non-finite output on real PTX with a leading true-inf mask: {got:?}"
     );
     let want = attention_reference(&spec, &q, &k, &v, &mask);
-    let max_abs = got
-        .iter()
-        .zip(&want)
-        .map(|(g, w)| (g - w).abs())
-        .fold(0.0f32, f32::max);
+    let max_abs = poot_test_util::max_abs_error(&got, &want);
     assert!(
         max_abs < 1e-4,
         "attention PTX mismatch: got {got:?} want {want:?} (max_abs={max_abs:.3e})"
@@ -353,17 +349,7 @@ fn attention_fixture_bank_matches_cpu_on_ptx() {
             .collect();
         let got = run_attention_on_ptx(&ctx, name, &spec, [&q, &k, &v, &mask]);
         let want = attention_reference(&spec, &q, &k, &v, &mask);
-        let max_abs = got
-            .iter()
-            .zip(&want)
-            .map(|(g, w)| {
-                if (g - w).is_nan() {
-                    f32::INFINITY
-                } else {
-                    (g - w).abs()
-                }
-            })
-            .fold(0.0f32, f32::max);
+        let max_abs = poot_test_util::max_abs_error(&got, &want);
         assert!(
             max_abs < 1e-3,
             "{name}: attention PTX mismatch (max_abs={max_abs:.3e})"
@@ -454,17 +440,7 @@ fn attention_split_key_and_live_bound_match_cpu_on_ptx() {
             assert!(got.iter().all(|x| x.is_nan()), "len {live}: {got:?}");
             continue;
         }
-        let max_abs = got
-            .iter()
-            .zip(want)
-            .map(|(g, w)| {
-                if (g - w).is_nan() {
-                    f32::INFINITY
-                } else {
-                    (g - w).abs()
-                }
-            })
-            .fold(0.0f32, f32::max);
+        let max_abs = poot_test_util::max_abs_error(got, want);
         assert!(
             max_abs < 1e-3,
             "len {live}: PTX mismatch (max_abs={max_abs:.3e})"

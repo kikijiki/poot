@@ -20,16 +20,17 @@ use std::sync::Arc;
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{Device, Dispatch, Engine};
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType, UnOp};
-use poot_graph_plan::{CompileLimits, CompileOptions, Target, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target};
 use poot_llm::driver::{
     BackendChoice, Beam, BeamError, BeamRequest, DraftPolicy, Driver, DriverOptions, FinishReason,
     GenerateRequest, Head, Layout, LoadOptions, ModelHandle, PoolShape, PreparedSetLimits,
-    ServingShapes, Warm, open_executor, program_retention,
+    ServingShapes, State, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::components::standard::{Step, check_step};
+use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
-    FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
+    FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, StepShape, StepSpec,
     TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
@@ -153,6 +154,7 @@ const RECURRENT_ENTRY: FamilyEntry = FamilyEntry {
 #[derive(Debug)]
 struct Recurrentish {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
 }
 
@@ -165,10 +167,15 @@ fn build_recurrent(_: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>,
             eos: BTreeSet::from([EOS]),
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
         },
+        schema: ModelSchema::builder()
+            .step(
+                ProgramSpec::new(ProgramId::STEP, ModelOutput::Logits { vocab: VOCAB })
+                    .carrying(StateSpec::recurrent("toy.state")),
+            )
+            .build_for(RECURRENT)?,
         weights: WeightMap::default(),
     }))
 }
@@ -194,6 +201,10 @@ impl Model for Recurrentish {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
@@ -202,13 +213,9 @@ impl Model for Recurrentish {
     /// `-0.5 * (v - 47 * m)^2` with `m = (1 + tanh(1.2 * state . [-1, 1, -1, 1] - 1.8)) / 2`, a peak
     /// at the vocabulary position the state selects: it climbs toward the end-of-sequence token as
     /// tokens accumulate.
-    fn trace_into(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
-        check_step(RECURRENT, phase, shape, self.config.max_positions)?;
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
+        check_step(RECURRENT, shape, self.config.max_positions)?;
         let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let tokens = b.cast(
@@ -321,19 +328,11 @@ impl Oracle {
     /// The logits after the last of `tokens`, from one fresh prefill of the whole list at position 0.
     fn last_logits(&self, tokens: &[u32]) -> Vec<f32> {
         let n = tokens.len();
-        let shape = StepShape {
-            rows: NonZeroUsize::MIN,
-            tokens: nz(n),
-            capacity: nz(CAPACITY),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::Last,
-            hidden: None,
-        };
+        let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY));
         let graph = self
             .model
             .trace(
-                Phase::Prefill,
-                shape,
+                &StepSpec::step(shape),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -517,7 +516,7 @@ fn differs(a: &Reference, b: &Reference) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 fn options() -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -809,7 +808,7 @@ fn driver_of(handle: &Arc<ModelHandle>, executor: Box<dyn poot_executor::Executo
     Driver::new(Arc::clone(handle), executor, options()).unwrap()
 }
 
-fn beam_or_panic(driver: &mut Driver, request: BeamRequest) -> Vec<Beam> {
+fn beam_or_panic<S: State>(driver: &mut Driver<S>, request: BeamRequest) -> Vec<Beam> {
     driver.beam(request).unwrap_or_else(|e| panic!("{e}"))
 }
 
@@ -922,7 +921,7 @@ fn assert_width_one_beam_is_greedy(choice: BackendChoice, backend: DeviceBackend
     };
     let case = dense_case();
     let (handle, _dir) = handle_of(&case, "beam_greedy");
-    let mut driver = driver_of(&handle, executor);
+    let mut driver = driver_of(&handle, executor).serve(Layout::Contiguous);
     for prompt in GREEDY_PROMPTS {
         let generated = driver
             .generate(
@@ -997,8 +996,8 @@ fn assert_paged_beam_runs_on_contiguous_entries(choice: BackendChoice, backend: 
     let wanted = beam_or_panic(&mut contiguous, case.request());
     drop(contiguous);
 
-    let mut paged = driver_of(&handle, second);
-    paged
+    let paged = driver_of(&handle, second);
+    let mut paged = paged
         .prepare(&ServingShapes {
             layout: Layout::Paged(PoolShape {
                 blocks: nz(16),
@@ -1081,7 +1080,7 @@ impl Device for FakeDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), FakeError> {
@@ -1133,7 +1132,7 @@ fn fake_driver(fill: u8) -> (Driver, poot_test_util::UniqueTempPath) {
     (driver, dir)
 }
 
-fn beam_refusal(driver: &mut Driver, request: BeamRequest) -> BeamError {
+fn beam_refusal<S: State>(driver: &mut Driver<S>, request: BeamRequest) -> BeamError {
     driver.beam(request).expect_err("the request is refused")
 }
 
@@ -1143,8 +1142,8 @@ fn beam_refusal(driver: &mut Driver, request: BeamRequest) -> BeamError {
 #[test]
 fn beam_on_a_driver_with_an_open_sequence_is_busy_and_leaves_it_unharmed() {
     use poot_llm::driver::{AdapterRef, Admission, Release, RowWork, SeqRequest, StepRow};
-    let (mut driver, _dir) = fake_driver(0);
-    driver
+    let (driver, _dir) = fake_driver(0);
+    let mut driver = driver
         .prepare(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],
@@ -1156,11 +1155,7 @@ fn beam_on_a_driver_with_an_open_sequence_is_busy_and_leaves_it_unharmed() {
         .unwrap();
     let prompt = [3u32, 17, 8];
     let Admission::Opened { seq, .. } = driver
-        .open(SeqRequest {
-            prompt: &prompt,
-            max_new: 4,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(&prompt, 4, AdapterRef::Base))
         .unwrap()
     else {
         panic!("a fresh driver admits one sequence")

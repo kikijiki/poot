@@ -8,7 +8,7 @@ use poot_runtime_common::DeviceBackend;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, NoSync, StepInputs};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
@@ -16,9 +16,9 @@ use poot_graph_ir::ops::{attention_masked, rmsnorm, silu};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Graph, SlotKey, Storage, ValueId};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -37,8 +37,7 @@ fn try_gpu() -> Option<(Box<dyn Executor>, Target)> {
     Some((Box::new(poot_executor::Engine::new(device)), target))
 }
 
-/// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
-/// submission).
+/// Compile `g` for `target` through the executor contract's one staged program.
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     let g = g.clone();
     compile_staged(
@@ -48,7 +47,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the graph")
 }
@@ -246,7 +245,7 @@ fn elementwise_add_sub_mul_div_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -315,7 +314,7 @@ fn unary_tanh_erf_cross_backend() {
                 .iter()
                 .map(|(&id, t)| (id, Value::from(t.clone())))
                 .collect::<HashMap<_, _>>(),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .unwrap()
         .output
@@ -349,7 +348,7 @@ fn unary_neg_exp_log_sqrt_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -370,7 +369,7 @@ fn unary_neg_exp_log_sqrt_cross_backend() {
         &in2.iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -392,7 +391,7 @@ fn unary_neg_exp_log_sqrt_cross_backend() {
         &in3.iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -428,7 +427,7 @@ fn matmul_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -468,7 +467,7 @@ fn matmul_bias_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -505,7 +504,7 @@ fn reduce_sum_last_axis_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -542,7 +541,7 @@ fn reduce_max_last_axis_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -585,7 +584,7 @@ fn rmsnorm_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -642,7 +641,7 @@ fn masked_attention_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -683,7 +682,7 @@ fn ffn_block_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -724,7 +723,7 @@ fn broadcast_binary_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -759,7 +758,7 @@ fn transpose_slice_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -805,7 +804,7 @@ fn gather_axis0_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -932,7 +931,7 @@ fn sample_token_greedy_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -982,7 +981,7 @@ fn random_uniform_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -1129,7 +1128,7 @@ fn sample_token_gumbel_cross_backend() {
             HostTensor::f32(vec![rows, 3], params_data.clone()).into(),
         ),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1221,7 +1220,7 @@ fn sample_token_gumbel_topk_cross_backend() {
             HostTensor::i32(vec![rows], top_k_data.clone()).into(),
         ),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1342,7 +1341,7 @@ fn sample_token_topp_nucleus_matches_cpu_cross_backend() {
                 HostTensor::i32(vec![rows], top_k_data.clone()).into(),
             ),
         ]);
-        let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1450,7 +1449,7 @@ fn sample_token_gumbel_topk_topp_cross_backend() {
             HostTensor::i32(vec![rows], top_k_data.clone()).into(),
         ),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1555,7 +1554,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_cross_backend() {
             HostTensor::i32(vec![rows], top_k_data.clone()).into(),
         ),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1679,7 +1678,7 @@ fn layernorm_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -1715,7 +1714,7 @@ fn reduce_sum_nonpow2_wide_real_magnitude_cross_backend() {
                 .iter()
                 .map(|(&id, t)| (id, Value::from(t.clone())))
                 .collect::<HashMap<_, _>>(),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .unwrap()
         .output
@@ -1765,7 +1764,7 @@ fn reduce_max_nonpow2_wide_real_magnitude_cross_backend() {
                 .iter()
                 .map(|(&id, t)| (id, Value::from(t.clone())))
                 .collect::<HashMap<_, _>>(),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .unwrap()
         .output
@@ -1814,7 +1813,7 @@ fn dynamic_update_slice_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -1850,7 +1849,7 @@ fn non_power_of_2_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output
@@ -1884,7 +1883,7 @@ fn single_element_cross_backend() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect::<HashMap<_, _>>(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output

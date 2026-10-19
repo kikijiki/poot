@@ -24,7 +24,7 @@ use crate::api::{
 use crate::http::{error_body, respond_error, write_all_within};
 use crate::lifecycle::{ClientGone, GenerationRequest, peer_closed, submit, submit_encode};
 use crate::metrics::{InFlight, Metrics};
-use crate::types::{Completion, EncodeRow, GenerationError, PromptInput, PromptRows, Served};
+use crate::types::{Completion, EncodeRow, GenerationError, PromptInput, Served};
 use crate::vision::{ImageClient, ImageError, ImageTurn};
 
 /// Count only response-side transport failures. Explicit `Failed`, `Done`, and receiver cancellation are
@@ -160,7 +160,7 @@ fn shape_completion(served: &Served, req: &CompletionReq) -> Result<Shaped> {
     let lora_adapter =
         resolve_lora_adapter(&served.view, &req.lora_adapter).map_err(LoraAdapterError)?;
     Ok(Shaped {
-        prompt: PromptInput::Tokens(tokens),
+        prompt: PromptInput::text(tokens),
         stops,
         // Bound once, before any engine is asked to size an allocation from it.
         max_new: req.effective_max_tokens(),
@@ -215,7 +215,7 @@ fn shape_chat(served: &Served, req: &ChatReq, client_gone: ClientGone<'_>) -> Re
         }
         _ => {
             let (tokens, turn_stops) = chat_tokens_and_stops(&served.model, req)?;
-            (PromptInput::Tokens(tokens), turn_stops)
+            (PromptInput::text(tokens), turn_stops)
         }
     };
     let n = clamp_n(req.n);
@@ -283,12 +283,9 @@ fn image_prompt(
             ImageError::Interrupted(interrupted) => anyhow::Error::new(interrupted),
             failed @ ImageError::Failed(_) => anyhow::Error::new(failed),
         })?;
-    Ok(PromptInput::Multimodal {
+    Ok(PromptInput {
         tokens: prepared.prompt,
-        rows: PromptRows {
-            embeds: prepared.embeds,
-            mrope: prepared.mrope,
-        },
+        inputs: prepared.inputs,
     })
 }
 
@@ -932,7 +929,12 @@ pub(crate) fn handle_rerank(
     let req: RerankReq = parse_body(body)?;
     let ranked = if req.documents.is_empty() {
         Vec::new()
-    } else if matches!(served.model.config().output, ModelOutput::Scores { .. }) {
+    } else if served
+        .model
+        .schema()
+        .encode()
+        .is_some_and(|program| matches!(program.output(), ModelOutput::Scores { .. }))
+    {
         let rows = req
             .documents
             .iter()

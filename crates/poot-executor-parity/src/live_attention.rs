@@ -10,15 +10,14 @@ use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Graph, Slot, Storage};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostView};
 
-/// `graph` compiled for `target` on the executor contract's one shape: single stage, single device,
-/// `Submission::Replay`. Its own validations stay intact, so a validation under test is not stripped.
+/// `graph` compiled for `target` on the executor contract's one shape: single stage, single device. Its own validations stay intact, so a validation under test is not stripped.
 pub fn compile_live(graph: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         graph,
@@ -27,7 +26,7 @@ pub fn compile_live(graph: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the live-attention graph compiles")
 }

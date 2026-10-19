@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 
 use poot_graph_ir::Graph;
+use poot_graph_ir::analysis::NumericsProperty;
 
 use super::{ExpertPlacement, StagedCompileError};
 use crate::passes::{GraphBudget, PoolSite, StageSplitError, pool_experts};
@@ -16,6 +17,8 @@ pub(super) struct Placed<'g> {
     pub(super) graph: Cow<'g, Graph>,
     /// Each pooled selection and the equation that opens the stage after its sync.
     pub(super) sites: Vec<(PoolSite, usize)>,
+    /// What the placement did to the graph's arithmetic: nothing for a resident placement.
+    pub(super) numerics: NumericsProperty,
 }
 
 pub(super) fn apply<'g>(
@@ -27,6 +30,7 @@ pub(super) fn apply<'g>(
         ExpertPlacement::AllResident => Ok(Placed {
             graph,
             sites: Vec::new(),
+            numerics: NumericsProperty::Exact,
         }),
         ExpertPlacement::Pooled { slots_per_layer } => {
             let pooled = pool_experts(&graph, slots_per_layer, budget)?;
@@ -34,6 +38,7 @@ pub(super) fn apply<'g>(
             Ok(Placed {
                 graph: Cow::Owned(pooled.graph),
                 sites,
+                numerics: pooled.numerics,
             })
         }
     }

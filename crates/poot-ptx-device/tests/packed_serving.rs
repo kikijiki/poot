@@ -33,7 +33,7 @@ use poot_graph_ir::{
     BinOp, Builder, Graph, OpKind, PackedSourceName, Slot, StateRole, TensorType, ValueId,
 };
 use poot_graph_plan::test_support::gpu_caps;
-use poot_graph_plan::{CompileOptions, Target, compile, production_plan::Submission};
+use poot_graph_plan::{CompileOptions, Target, compile};
 use poot_ptx_device::PtxDevice;
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -112,7 +112,7 @@ fn compiled_graph(ptx: &PtxDevice, graph: &Graph) -> Graph {
     compile(
         graph,
         &target(ptx),
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the packed graph")
     .graph()
@@ -164,7 +164,10 @@ fn slot_decode_graph(descriptor: poot_quant::PackedWeight) -> (Graph, ValueId, V
     let x = b
         .slot_named(Slot::Activation, "onehot", TensorType::f32(vec![1, K]))
         .unwrap();
-    let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+        &b, x, "layer", descriptor, None, None,
+    )
+    .unwrap();
     let pos = b
         .slot(Slot::Pos, TensorType::new(vec![], DType::I32))
         .unwrap();
@@ -194,7 +197,10 @@ fn captured_decode_graph(descriptor: poot_quant::PackedWeight) -> Graph {
     let eye = b.constant("eye", TensorType::f32(vec![K, K])).unwrap();
     let row = b.gather_scalar(eye, 0, token).unwrap();
     let x = b.reshape(row, vec![1, K]).unwrap();
-    let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+        &b, x, "layer", descriptor, None, None,
+    )
+    .unwrap();
     let pos = b
         .slot(Slot::Pos, TensorType::new(vec![], DType::I32))
         .unwrap();
@@ -345,8 +351,15 @@ fn packed_prefill_through_serving_path_is_bit_exact_on_ptx() {
         let x = b
             .slot_named(Slot::Activation, "onehot", TensorType::f32(vec![K, K]))
             .unwrap();
-        let y =
-            poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None).unwrap();
+        let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &b,
+            x,
+            "layer",
+            owner.weight(),
+            None,
+            None,
+        )
+        .unwrap();
         let cache = b
             .state_input(
                 "decoded",
@@ -526,7 +539,7 @@ fn run_indexed_case(
             ))
         })
         .collect();
-    let table = poot_graph_ir::ops::PackedExpertStack {
+    let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
         stack_id: "experts".to_string(),
         descriptor: owners[0].weight(),
         experts: EXPERTS,
@@ -545,7 +558,8 @@ fn run_indexed_case(
             poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
         )
         .unwrap();
-    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_indexed_linear(&b, x, ids, &table)
+        .unwrap();
     let graph = b.finish(y).unwrap();
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in graph.inputs() {
@@ -711,7 +725,7 @@ fn packed_embedding_row_gather_is_bit_exact_on_ptx() {
             let token = b
                 .slot(Slot::Token, TensorType::new(shape.clone(), DType::I32))
                 .unwrap();
-            let rows = poot_graph_ir::ops::packed_embedding(
+            let rows = poot_graph_ir::test_support::packed_graphs::packed_embedding(
                 &b,
                 token,
                 "model.embed_tokens",
@@ -875,15 +889,11 @@ fn fill(seed: u64, count: usize) -> Vec<f32> {
 }
 
 fn oracle(graph: &Graph, inputs: &HashMap<ValueId, Value>) -> HostTensor {
-    poot_eval::eval(
-        graph,
-        inputs,
-        poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .unwrap()
+    poot_eval::eval(graph, inputs, poot_eval::EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap()
 }
 
 /// SC-001: Q4_K, Q8_0 and FP8 contractions through the packed loaders meet their tier-2 oracle contract. A
@@ -908,8 +918,15 @@ fn packed_loaders_match_the_oracle_on_every_output_on_ptx() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]))
                 .unwrap();
-            let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                .unwrap();
+            let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             let graph = b.finish(y).unwrap();
             let mut inputs = carriers(&graph, &owner);
             inputs.insert(
@@ -918,7 +935,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_ptx() {
             );
             let (got, class) = common::run_resident_classed(&mut ptx, &graph, &inputs);
             let want = oracle(&graph, &inputs);
-            poot_executor_parity::assert_close(
+            poot_test_util::assert_close_scaled(
                 got.as_f32().unwrap(),
                 want.as_f32().unwrap(),
                 class.tolerance(),
@@ -937,8 +954,8 @@ fn packed_loaders_match_the_oracle_on_every_output_on_ptx() {
 /// ordinal, as card 628 first did; the Q4_K row goes red on wgpu while the other formats stay green.
 #[test]
 fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_ptx() {
-    use poot_executor_parity::assert_close;
     use poot_graph_ir::op::BinOp;
+    use poot_test_util::assert_close_scaled;
     let Some(mut ptx) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
         return;
     };
@@ -958,9 +975,15 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_ptx() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]))
                 .unwrap();
-            let head =
-                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                    .unwrap();
+            let head = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             if !with_bias {
                 return (b.finish(head).unwrap(), x.id(), None);
             }
@@ -1005,7 +1028,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_ptx() {
                 .zip(&bias_values)
                 .map(|(head, bias)| head + bias)
                 .collect();
-            assert_close(
+            assert_close_scaled(
                 fused.as_f32().unwrap(),
                 &want,
                 0.0,
@@ -1027,9 +1050,9 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_ptx() {
 /// oracle row go red. Runs on the PTX pod.
 #[test]
 fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
-    use poot_executor_parity::assert_close;
     use poot_graph_ir::op::UnOp;
     use poot_graph_ir::types::Scalar;
+    use poot_test_util::assert_close_scaled;
     let Some(mut ptx) = open_or_skip(DeviceBackend::Ptx, PtxDevice::new()) else {
         return;
     };
@@ -1050,9 +1073,15 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]))
                 .unwrap();
-            let head =
-                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                    .unwrap();
+            let head = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             if !with_chain {
                 return (b.finish(head).unwrap(), x.id(), None);
             }
@@ -1112,7 +1141,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
             );
             let (fused, class) = common::run_resident_classed(&mut ptx, &graph, &inputs);
             if label == "generic bias" {
-                assert_close(
+                assert_close_scaled(
                     fused.as_f32().unwrap(),
                     oracle(&graph, &inputs).as_f32().unwrap(),
                     class.tolerance(),

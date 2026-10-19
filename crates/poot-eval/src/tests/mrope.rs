@@ -2,7 +2,7 @@
 //! reference for the distinct-per-section-position case, plus backward-compatibility checks (equal section positions
 //! must reduce bit-exact to plain `rope`/`rope_prefill`).
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{rope, rope_prefill, rope_sectioned, rope_sectioned_batched};
 use poot_graph_ir::types::TensorType;
@@ -102,7 +102,7 @@ fn mrope_matches_direct_reference_with_distinct_section_positions() {
     inputs.insert(pti, Value::from(HostTensor::i32(vec![], vec![pt as i32])));
     inputs.insert(phi, Value::from(HostTensor::i32(vec![], vec![ph as i32])));
     inputs.insert(pwi, Value::from(HostTensor::i32(vec![], vec![pw as i32])));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -187,7 +187,7 @@ fn mrope_batched_matches_independent_per_row_reference() {
             axes[2].iter().map(|&p| p as i32).collect(),
         )),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -250,7 +250,7 @@ fn mrope_matches_rope_bit_exact_when_section_positions_equal_decode() {
         inputs.insert(p0i, Value::from(HostTensor::i32(vec![], vec![posv as i32])));
         inputs.insert(p1i, Value::from(HostTensor::i32(vec![], vec![posv as i32])));
         inputs.insert(p2i, Value::from(HostTensor::i32(vec![], vec![posv as i32])));
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -284,7 +284,7 @@ fn mrope_matches_rope_bit_exact_when_section_positions_equal_decode() {
             Value::from(HostTensor::f32(vec![max_pos, d], sind.clone())),
         );
         inputs.insert(pi, Value::from(HostTensor::i32(vec![], vec![posv as i32])));
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -360,7 +360,7 @@ fn mrope_matches_rope_prefill_bit_exact_when_section_positions_equal_whole_seque
         inputs.insert(p0i, Value::from(HostTensor::i32(vec![l], posv.clone())));
         inputs.insert(p1i, Value::from(HostTensor::i32(vec![l], posv.clone())));
         inputs.insert(p2i, Value::from(HostTensor::i32(vec![l], posv.clone())));
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -392,7 +392,7 @@ fn mrope_matches_rope_prefill_bit_exact_when_section_positions_equal_whole_seque
             si,
             Value::from(HostTensor::f32(vec![max_pos, d], sind.clone())),
         );
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -458,7 +458,7 @@ fn mrope_partial_rotary_passes_through_untouched_dims() {
     );
     inputs.insert(pti, Value::from(HostTensor::i32(vec![], vec![pt as i32])));
     inputs.insert(phi, Value::from(HostTensor::i32(vec![], vec![ph as i32])));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -527,7 +527,7 @@ fn mrope_zero_width_section_traces_and_is_inert() {
         inputs.insert(pti, Value::from(HostTensor::i32(vec![], vec![pt as i32])));
         inputs.insert(phi, Value::from(HostTensor::i32(vec![], vec![ph as i32])));
         inputs.insert(pwi, Value::from(HostTensor::i32(vec![], vec![pw as i32])));
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

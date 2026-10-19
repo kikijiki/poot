@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::{EvalBudget, EvalOptions, Value};
+use crate::{EvalOptions, Value};
 use poot_graph_ir::{Builder, Graph, Slot, Storage, TensorType, ValueId};
 use poot_tensor::{DType, HostTensor};
 
@@ -79,7 +79,7 @@ pub fn check(backend: &str, got: &[i32]) -> Result<(), String> {
         .collect();
     let g = graph();
     let inputs = inputs(&g);
-    let oracle = crate::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let oracle = crate::eval(&g, &inputs, EvalOptions::default())
         .map_err(|e| format!("CPU oracle: {e}"))?
         .output
         .into_host()

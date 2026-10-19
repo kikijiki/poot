@@ -11,7 +11,7 @@ use poot_graph_ir::{
 use poot_tensor::HostTensor;
 use poot_test_util::fill;
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 
 /// What names an input binder across a split: stage graphs renumber their values, so a binder is
 /// identified by what the uncut graph declared, never by its id.
@@ -83,12 +83,8 @@ pub fn chain(graph: &Graph, stages: &[&Graph], inputs: &HashMap<ValueId, Value>)
                 (id, value.clone())
             })
             .collect();
-        let result = eval(
-            g,
-            &stage_inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-        )
-        .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
+        let result = eval(g, &stage_inputs, EvalOptions::default().keep_environment())
+            .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
         let environment = result.environment.expect("the environment was kept");
         for export in g.exports() {
             let value = environment[export.value]

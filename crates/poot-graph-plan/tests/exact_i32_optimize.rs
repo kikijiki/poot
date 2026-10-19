@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, ExactI32TensorView, ExactValue, Value, eval};
+use poot_eval::{EvalOptions, ExactI32TensorView, ExactValue, Value, eval};
 use poot_graph_ir::test_support::graph_fixtures as helpers;
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, UnOp, ValidationId, ValueId};
 use poot_tensor::DType;
@@ -85,7 +85,7 @@ fn optimized_exact_i32_region_matches_the_unoptimized_graph() {
                 (zero.id(), vec![4], vec![0; 4]),
                 (ones.id(), vec![4], vec![1; 4]),
             ]),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .unwrap();
         let result_b = eval(
@@ -95,7 +95,7 @@ fn optimized_exact_i32_region_matches_the_unoptimized_graph() {
                 (zero.id(), vec![4], vec![0; 4]),
                 (ones.id(), vec![4], vec![1; 4]),
             ]),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .unwrap();
         assert_eq!(
@@ -153,19 +153,15 @@ fn exact_i32_pack_region_replays_its_concat() {
         packed_source.id(),
         HostTensor::i32(vec![2, 2], vec![1, 2, 3, 4]).into(),
     )]);
-    let dense = eval(
-        &graph,
-        &dense_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .unwrap();
+    let dense = eval(&graph, &dense_inputs, EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
     let after = eval(
         &optimized,
         &i32_inputs(&[(packed_source.id(), vec![2, 2], vec![1, 2, 3, 4])]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .unwrap()
     .output;
@@ -217,16 +213,11 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
                 ),
             ])
         };
-        let result_a = eval(
-            &graph,
-            &inputs(&graph_state),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
-        )
-        .unwrap();
+        let result_a = eval(&graph, &inputs(&graph_state), EvalOptions::default()).unwrap();
         let result_b = eval(
             &optimized,
             &inputs(&optimized_state),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .unwrap();
         let out_a = result_a.output.as_host().unwrap().clone();
@@ -247,7 +238,7 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
         let env_a = eval(
             &graph,
             &inputs(&graph_state),
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+            EvalOptions::default().keep_environment(),
         )
         .unwrap()
         .environment
@@ -255,7 +246,7 @@ fn optimize_accepts_a_validation_bearing_stateful_graph_bit_for_bit() {
         let env_b = eval(
             &optimized,
             &inputs(&optimized_state),
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+            EvalOptions::default().keep_environment(),
         )
         .unwrap()
         .environment
@@ -341,18 +332,14 @@ fn pipeline_witness_output_survives_every_pass() {
             HostTensor::f32(vec![4], vec![0.5, 4.0, -1.0, 2.0]).into(),
         ),
     ]);
-    let before = eval(
-        &graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .unwrap()
-    .environment
-    .unwrap();
+    let before = eval(&graph, &inputs, EvalOptions::default().keep_environment())
+        .unwrap()
+        .environment
+        .unwrap();
     let after = eval(
         &optimized,
         &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+        EvalOptions::default().keep_environment(),
     )
     .unwrap()
     .environment

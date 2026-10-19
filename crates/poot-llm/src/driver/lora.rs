@@ -54,6 +54,19 @@ pub struct AdapterSet {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GenerationId(NonZeroU32);
 
+#[cfg(test)]
+pub(crate) mod test_only {
+    use super::*;
+
+    impl GenerationId {
+        /// A generation id no registry issued, for a test of a refusal that comes before the registry is
+        /// asked.
+        pub(crate) fn unissued(id: u32) -> Self {
+            Self(NonZeroU32::new(id).expect("an id is at least one"))
+        }
+    }
+}
+
 /// A request's adapter within a generation, 1-based: 0 is the base weights (`NO_ADAPTER`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LoraIdx(NonZeroU32);

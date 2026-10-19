@@ -9,6 +9,7 @@ mod dense;
 mod epilogue;
 mod gemv;
 mod indexed;
+mod tiled;
 
 pub(crate) use dense::dense_contraction;
 pub(crate) use epilogue::emit_epilogue;
@@ -18,6 +19,8 @@ pub(crate) use indexed::{
     IndexedTiledBody, IndexedTiledWeight, META_EXPERTS, META_N, META_PACKED_SLAB_WORDS, RowExpert,
     emit_poison, emit_row_expert, indexed_contraction, indexed_tiled_body,
 };
+
+pub(crate) use tiled::{TiledBody, TiledLaunch, tiled_body};
 
 use crate::KernelGenError;
 
@@ -36,15 +39,86 @@ pub enum Schedule {
         /// Contiguous `K` elements each lane reads per trip.
         unroll: u32,
     },
-    /// `M > 1`: LDS-staged tiles (542b), for a contraction with no block-diagonal split.
+    /// `M > 1`, an indexed (row-selected) contraction: LDS-staged tiles (542b), each lane computing one output of
+    /// the `tile x tile` tile its workgroup owns.
     Tiled {
         /// The edge of the square output tile one workgroup computes.
         tile: TileSize,
     },
+    /// `M > 1`, a plain (block-diagonal) contraction: LDS-staged tiles with a register tile per lane. A workgroup
+    /// of `lanes x lanes` lanes computes the [`Schedule::output_tile`] its lanes interleave, each accumulating a
+    /// `rows x 4` part of it, so one decoded weight value feeds `rows` FMAs per LDS read instead of one. `K` is
+    /// staged in runs of `run` consecutive values, which the weight's decode shares an address chain, word load
+    /// and scale across. [`RegisterTiling::choose`] picks the geometry from the shapes.
+    RegisterTiled {
+        /// The edge of the square lane grid one workgroup runs.
+        lanes: TileSize,
+        /// Output rows each lane accumulates.
+        rows: LaneRows,
+        /// Consecutive `K` values one lane loads and decodes at a time; divides `K`.
+        run: RunLength,
+    },
 }
 
-/// The tile edge of a [`Schedule::Tiled`] contraction, built only by [`TileSize::new`]. Card 658: a
-/// row-tile is laid out per block ([`Schedule::grid_threads`], `contraction_tiled`'s grid derivation),
+/// The output rows a [`Schedule::RegisterTiled`] lane accumulates, built only by [`LaneRows::covering`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LaneRows(pub(crate) u32);
+
+impl LaneRows {
+    /// The rows per lane for a workgroup of `lanes x lanes` lanes over `m_per_block` rows: 8 once the rows fill
+    /// a tile of 8 per lane, 4 for half of that, else 2, so a tile never computes many more rows than there are.
+    fn covering(m_per_block: usize, lanes: usize) -> Self {
+        Self(match m_per_block.div_ceil(lanes) {
+            rows if rows >= 8 => 8,
+            rows if rows >= 4 => 4,
+            _ => 2,
+        })
+    }
+
+    /// The rows per lane, at least 1.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The bare count, so a schedule's `Debug` (part of the planner's kernel key) reads `rows: 8`.
+impl std::fmt::Debug for LaneRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The run of consecutive `K` values a [`Schedule::RegisterTiled`] lane stages at a time, built only by
+/// [`RunLength::dividing`]: the longest run that divides `K`, so every run of a row is whole.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RunLength(u32);
+
+impl RunLength {
+    /// The longest run (at most four values: one word of byte codes) that divides `k`.
+    pub fn dividing(k: usize) -> Self {
+        Self(match k {
+            k if k.is_multiple_of(4) => 4,
+            k if k.is_multiple_of(2) => 2,
+            _ => 1,
+        })
+    }
+
+    /// The run's length, at least 1.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// The bare length, so a schedule's `Debug` (part of the planner's kernel key) reads `run: 4`.
+impl std::fmt::Debug for RunLength {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The tile edge of a [`Schedule::Tiled`] contraction (or the lane-grid edge of a [`Schedule::RegisterTiled`] one),
+/// built only by [`TileSize::new`]. Card 658: a
+/// row-tile is laid out per block ([`Schedule::grid_threads`], `tiled_body`'s grid derivation),
 /// so it never straddles two blocks' weights and this schedule serves any `blocks >= 1` - `m_per_block`
 /// need not be a multiple of `tile`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,7 +161,86 @@ impl Schedule {
                 let ts = tile.get() as usize;
                 blocks * m_per_block.div_ceil(ts) * out_per_block.div_ceil(ts) * ts * ts
             }
+            Schedule::RegisterTiled { lanes, rows, .. } => {
+                let (lanes, rows) = (lanes.get() as usize, rows.get() as usize);
+                blocks
+                    * m_per_block.div_ceil(tiled::tile_rows(lanes, rows))
+                    * out_per_block.div_ceil(tiled::tile_cols(lanes))
+                    * lanes
+                    * lanes
+            }
         }
+    }
+
+    /// The `(rows, columns)` of the output tile one workgroup of a tiled schedule computes, or `None` for the Gemv.
+    pub fn output_tile(self) -> Option<(usize, usize)> {
+        match self {
+            Schedule::Gemv { .. } => None,
+            Schedule::Tiled { tile } => Some((tile.get() as usize, tile.get() as usize)),
+            Schedule::RegisterTiled { lanes, rows, .. } => {
+                Some(RegisterTiling::output_tile_of(lanes, rows))
+            }
+        }
+    }
+}
+
+/// The geometry of a [`Schedule::RegisterTiled`] contraction, chosen from the shapes and the device by
+/// [`RegisterTiling::choose`]. It is the schedule's fields before they are wrapped, so a planner reads the lane
+/// grid and output tile it launches without destructuring the [`Schedule`] again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegisterTiling {
+    lanes: TileSize,
+    rows: LaneRows,
+    run: RunLength,
+}
+
+impl RegisterTiling {
+    /// The tiling for a block-diagonal contraction of `m_per_block` activation rows per block over a weight whose
+    /// rows hold `k` values, on `caps`: the 16x16 lane grid (a 128-row tile) once there are 128 rows and the
+    /// device runs 256-lane workgroups with room for its two tiles, else the 8x8 grid; rows per lane so the tile
+    /// does not far exceed the rows ([`LaneRows::covering`]); and the longest run that divides `k`. Chosen from
+    /// shapes and device limits alone, never from the format.
+    pub fn choose(m_per_block: usize, k: usize, caps: &poot_target::DeviceCaps) -> Self {
+        const WIDE: usize = 16;
+        const NARROW: usize = 8;
+        let wide_rows = tiled::tile_rows(WIDE, 8);
+        let fits = WIDE * WIDE <= caps.max_workgroup_invocations as usize
+            && WIDE * WIDE <= caps.max_workgroup_size[0] as usize
+            && tiled::lds_bytes(WIDE, 8) <= caps.lds_bytes as usize;
+        let lanes = if m_per_block >= wide_rows && fits {
+            WIDE
+        } else {
+            NARROW
+        };
+        Self {
+            lanes: TileSize(lanes as u32),
+            rows: LaneRows::covering(m_per_block, lanes),
+            run: RunLength::dividing(k),
+        }
+    }
+
+    /// The schedule that runs this tiling.
+    pub fn schedule(self) -> Schedule {
+        Schedule::RegisterTiled {
+            lanes: self.lanes,
+            rows: self.rows,
+            run: self.run,
+        }
+    }
+
+    /// The edge of the square lane grid one workgroup runs.
+    pub fn lanes(self) -> usize {
+        self.lanes.get() as usize
+    }
+
+    /// The `(rows, columns)` of the output tile one workgroup computes.
+    pub fn output_tile(self) -> (usize, usize) {
+        Self::output_tile_of(self.lanes, self.rows)
+    }
+
+    fn output_tile_of(lanes: TileSize, rows: LaneRows) -> (usize, usize) {
+        let (lanes, rows) = (lanes.get() as usize, rows.get() as usize);
+        (tiled::tile_rows(lanes, rows), tiled::tile_cols(lanes))
     }
 }
 

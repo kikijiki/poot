@@ -36,7 +36,7 @@ use poot_graph_ir::{BinOp, Builder, OpKind, Operand, RedOp, StateRole, TensorTyp
 use crate::exact_value::ExactValue;
 use crate::observer::EvalObserver;
 use crate::ops;
-use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use crate::{EvalError, EvalOptions, Value, eval};
 use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
 
@@ -53,22 +53,17 @@ fn eval_every_combination(
     graph: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, Value>,
 ) -> Result<Value, EvalError> {
-    let plain = eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output);
+    let plain = eval(graph, inputs, EvalOptions::default()).map(|r| r.output);
 
     let mut observer = NoOpObserver;
     let observed = eval(
         graph,
         inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).observer(&mut observer),
+        EvalOptions::default().observer(&mut observer),
     )
     .map(|r| r.output);
 
-    let kept = eval(
-        graph,
-        inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .map(|r| r.output);
+    let kept = eval(graph, inputs, EvalOptions::default().keep_environment()).map(|r| r.output);
 
     let combos: Vec<(&str, &Result<Value, EvalError>)> =
         vec![("observer", &observed), ("keep_environment", &kept)];
@@ -747,7 +742,7 @@ fn resume_appends_a_greedy_sample_head_and_keeps_state_unchanged() {
         ),
         (cache_in.id(), HostTensor::f32(vec![4], cache_data.clone())),
     ]);
-    let result = eval(&g2, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let result = eval(&g2, &inputs, EvalOptions::default()).unwrap();
     let token_out = result.output.as_host().unwrap();
     assert_eq!(
         token_out.as_i32(),
@@ -938,10 +933,7 @@ fn cast_bf16_to_e4m3fn_evaluates_a_walk_published_bf16() {
     let y = b.cast(bf16, DType::E4M3FN).unwrap();
     let g = b.finish(y).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![2], vec![1.0, 2.0]))]);
-    let Value::Host(got) = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .unwrap()
-        .output
-    else {
+    let Value::Host(got) = eval(&g, &inputs, EvalOptions::default()).unwrap().output else {
         panic!("Cast(BF16, E4M3FN) must publish e4m3fn storage")
     };
     // 1.0 and 2.0 round-trip exactly through BF16 and encode to E4M3's exact 1.0/2.0 bytes.
@@ -1088,7 +1080,7 @@ fn every_infer_admitted_pair_evaluates() {
     let g = b.finish(out).unwrap();
     let wrong_dtype = HostTensor::f32(vec![4], vec![1.0, 2.0, 3.0, 4.0]);
     let inputs = dense_inputs([(x.id(), wrong_dtype)]);
-    let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+    let error = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
     assert!(
         matches!(error, EvalError::Input { .. }),
         "expected EvalError::Input, got {error:?}"
@@ -1126,7 +1118,7 @@ fn f32_declared_input_bound_as_a_bf16_tensor_is_refused_at_bind_time() {
     let out = b.reshape(x, vec![4]).unwrap();
     let g = b.finish(out).unwrap();
     let inputs = dense_inputs([(x.id(), HostTensor::bf16(vec![4], vec![0u16; 4]))]);
-    let error = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+    let error = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
     assert!(
         matches!(error, EvalError::Input { .. }),
         "expected EvalError::Input, got {error:?}"
@@ -1177,7 +1169,7 @@ fn gather_index_faults_cover_every_data_dtype() {
         };
         let index_value = Value::from(HostTensor::i32(vec![], vec![bad]));
         let inputs = HashMap::from([(table.id(), table_value), (index.id(), index_value)]);
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output)
+        eval(&g, &inputs, EvalOptions::default()).map(|r| r.output)
     }
 
     let cases: [(i32, IndexFaultKind); 2] = [
@@ -1498,7 +1490,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
                 (src.id(), src_value.clone()),
                 (slots.id(), HostTensor::i32(vec![2], words.to_vec())),
             ]);
-            eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            eval(&g, &inputs, EvalOptions::default())
         };
 
         let out = run([1, 2]).unwrap().output.into_host().unwrap();
@@ -1550,7 +1542,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
             (update.id(), update_value.clone()),
             (index.id(), HostTensor::i32(vec![], vec![1])),
         ]);
-        let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let out = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1566,7 +1558,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
                 (update.id(), update_value.clone()),
                 (index.id(), HostTensor::i32(vec![], vec![bad])),
             ]);
-            let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+            let err = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
             let EvalError::Index(fault) = &err else {
                 panic!("DynamicUpdateSlice start {bad}: expected EvalError::Index, got {err:?}")
             };
@@ -1590,7 +1582,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
             ),
             (idx.id(), HostTensor::i32(vec![1], vec![2])),
         ]);
-        let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+        let err = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
         let EvalError::Index(fault) = &err else {
             panic!("IndexedMatMul expert id 2: expected EvalError::Index, got {err:?}")
         };
@@ -1605,7 +1597,7 @@ fn scatter_update_dynamic_update_slice_indexed_matmul_arg_top_k_route_through_in
         let out = b.arg_top_k(x, 2).unwrap();
         let g = b.finish(out).unwrap();
         let inputs = dense_inputs([(x.id(), HostTensor::f32(vec![4], vec![2.0, 0.5, 3.0, 1.0]))]);
-        let err = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err();
+        let err = eval(&g, &inputs, EvalOptions::default()).unwrap_err();
         let EvalError::Index(fault) = &err else {
             panic!("ArgTopK rank 0.5: expected EvalError::Index, got {err:?}")
         };

@@ -17,9 +17,10 @@ use poot_graph_ir::{
 use poot_models::components::embed::Embedding;
 use poot_models::components::ffn::{GatedFfnWeights, gated_ffn};
 use poot_models::components::standard::Step;
+use poot_models::io::{ModelSchema, ProgramId, ProgramSpec};
 use poot_models::model::{
-    ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
-    Phase, StepShape, TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, StepShape, StepSpec,
+    TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{
@@ -55,6 +56,17 @@ fn count(raw: &RawConfig<'_>, family: FamilyKey, field: &'static str) -> Result<
         })
 }
 
+/// A schema of one `step` program that carries no state: neither family keeps a cache.
+fn schema_of(family: FamilyKey, vocab: usize) -> ModelSchema {
+    ModelSchema::builder()
+        .step(ProgramSpec::new(
+            ProgramId::STEP,
+            ModelOutput::Logits { vocab },
+        ))
+        .build_for(family)
+        .expect("a stateless step program is a schema")
+}
+
 fn config_of(family: FamilyKey, vocab: usize) -> ModelConfig {
     ModelConfig {
         family,
@@ -63,7 +75,6 @@ fn config_of(family: FamilyKey, vocab: usize) -> ModelConfig {
         eos: BTreeSet::from([0]),
         bos: None,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     }
@@ -77,6 +88,7 @@ fn config_of(family: FamilyKey, vocab: usize) -> ModelConfig {
 #[derive(Debug)]
 struct Scripted {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
     constants: usize,
     unaries: usize,
@@ -90,16 +102,15 @@ impl Model for Scripted {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        _phase: Phase,
-        _shape: StepShape,
-        b: Builder,
-    ) -> Result<Graph, TraceError> {
+    fn trace_into(&self, _spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         BODY_CALLS.with(|calls| calls.set(calls.get() + 1));
         let ty = TensorType::f32(vec![4]);
         let first = b.constant(&"w".repeat(self.name_len), ty.clone())?;
@@ -121,6 +132,7 @@ fn build_scripted(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Mo
     let weights = WeightMap::builder(store).build();
     Ok(Box::new(Scripted {
         config: config_of(SCRIPTED, 4),
+        schema: schema_of(SCRIPTED, 4),
         weights,
         constants: count(raw, SCRIPTED, "constants")?,
         unaries: count(raw, SCRIPTED, "unaries")?,
@@ -165,14 +177,11 @@ fn scripted(constants: usize, unaries: usize, literals: usize, name_len: usize) 
 }
 
 fn shape(tokens: usize) -> StepShape {
-    StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(8).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    }
+    StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(tokens).unwrap(),
+        NonZeroUsize::new(8).unwrap(),
+    )
 }
 
 /// The SC-005 limits with one field set; every other resource is out of the way.
@@ -200,11 +209,11 @@ fn the_fifth_token_is_refused_before_the_tracer_body_runs() {
     let model = scripted(1, 0, 0, 1);
     let limits = only(4, 1 << 10, 1 << 10, ROOMY, ROOMY);
     BODY_CALLS.with(|calls| calls.set(0));
-    model.trace(Phase::Prefill, shape(4), limits).unwrap();
+    model.trace(&StepSpec::step(shape(4)), limits).unwrap();
     assert_eq!(BODY_CALLS.with(Cell::get), 1, "the exact boundary traces");
 
     BODY_CALLS.with(|calls| calls.set(0));
-    let refused = budget(model.trace(Phase::Prefill, shape(5), limits).unwrap_err());
+    let refused = budget(model.trace(&StepSpec::step(shape(5)), limits).unwrap_err());
     assert_eq!(
         (refused.resource, refused.limit, refused.requested),
         (BudgetResource::Tokens, 4, 5)
@@ -222,11 +231,11 @@ fn the_fifth_token_is_refused_before_the_tracer_body_runs() {
 fn the_ninth_value_is_refused_where_the_eighth_is_admitted() {
     let limits = only(4, 8, 1 << 10, ROOMY, ROOMY);
     scripted(8, 0, 0, 1)
-        .trace(Phase::Decode, shape(1), limits)
+        .trace(&StepSpec::step(shape(1)), limits)
         .unwrap();
     let refused = budget(
         scripted(9, 0, 0, 1)
-            .trace(Phase::Decode, shape(1), limits)
+            .trace(&StepSpec::step(shape(1)), limits)
             .unwrap_err(),
     );
     assert_eq!(
@@ -245,11 +254,11 @@ fn the_ninth_value_is_refused_where_the_eighth_is_admitted() {
 fn the_seventh_equation_is_refused_where_the_sixth_is_admitted() {
     let limits = only(4, 1 << 10, 6, ROOMY, ROOMY);
     scripted(1, 6, 0, 1)
-        .trace(Phase::Decode, shape(1), limits)
+        .trace(&StepSpec::step(shape(1)), limits)
         .unwrap();
     let refused = budget(
         scripted(1, 7, 0, 1)
-            .trace(Phase::Decode, shape(1), limits)
+            .trace(&StepSpec::step(shape(1)), limits)
             .unwrap_err(),
     );
     assert_eq!(
@@ -268,11 +277,11 @@ fn the_seventh_equation_is_refused_where_the_sixth_is_admitted() {
 fn the_thirty_sixth_literal_byte_is_refused_where_the_thirty_second_is_admitted() {
     let limits = only(4, 1 << 10, 1 << 10, 32, ROOMY);
     scripted(1, 0, 8, 1)
-        .trace(Phase::Decode, shape(1), limits)
+        .trace(&StepSpec::step(shape(1)), limits)
         .unwrap();
     let refused = budget(
         scripted(1, 0, 9, 1)
-            .trace(Phase::Decode, shape(1), limits)
+            .trace(&StepSpec::step(shape(1)), limits)
             .unwrap_err(),
     );
     assert_eq!(
@@ -294,7 +303,7 @@ fn an_owned_ceiling_below_a_controlled_name_refuses_before_the_name_is_copied() 
     // record's site, before the name exists.
     let admits = |ceiling: u64, name_len: usize| {
         scripted(1, 0, 0, name_len)
-            .trace(Phase::Decode, shape(1), only(4, 64, 64, 64, ceiling))
+            .trace(&StepSpec::step(shape(1)), only(4, 64, 64, 64, ceiling))
             .map(drop)
     };
     let smallest = (1..1 << 16)
@@ -322,6 +331,7 @@ const VOCAB: usize = 8;
 #[derive(Debug)]
 struct SharedLm {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
     embed: Embedding,
     ffn: GatedFfnWeights,
@@ -332,12 +342,16 @@ impl Model for SharedLm {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, _phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
-        let step = Step::new(&b, shape)?;
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
+        let step = Step::new(&b, spec.shape)?;
         let x = self.embed.embed(&b, step.tokens())?;
         let y = gated_ffn(&b, x, &self.ffn)?;
         Ok(step.finish(b, y)?)
@@ -377,6 +391,7 @@ fn build_shared(_raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Mod
     let ffn = GatedFfnWeights::new(&weights, 0, WIDTH, INTER).map_err(|e| e.for_family(SHARED))?;
     Ok(Box::new(SharedLm {
         config: config_of(SHARED, VOCAB),
+        schema: schema_of(SHARED, VOCAB),
         weights,
         embed,
         ffn,
@@ -415,7 +430,7 @@ fn shared_model() -> Box<dyn Model> {
 fn a_shared_component_charges_the_callers_budget_and_the_third_equation_is_refused() {
     let model = shared_model();
     let roomy = only(8, 1 << 10, 1 << 10, ROOMY, ROOMY);
-    let adequate = model.trace(Phase::Decode, shape(1), roomy).unwrap();
+    let adequate = model.trace(&StepSpec::step(shape(1)), roomy).unwrap();
     // The embedding gather and the gated FFN are the equations the limit counts.
     assert!(
         adequate.eqns().len() > 3,
@@ -423,7 +438,7 @@ fn a_shared_component_charges_the_callers_budget_and_the_third_equation_is_refus
     );
 
     let tight = only(8, 1 << 10, 2, ROOMY, ROOMY);
-    let refused = budget(model.trace(Phase::Decode, shape(1), tight).unwrap_err());
+    let refused = budget(model.trace(&StepSpec::step(shape(1)), tight).unwrap_err());
     assert_eq!(
         (
             refused.resource,
@@ -443,7 +458,7 @@ fn a_shared_component_charges_the_callers_budget_and_the_third_equation_is_refus
         ROOMY,
         ROOMY,
     );
-    let again = model.trace(Phase::Decode, shape(1), finite).unwrap();
+    let again = model.trace(&StepSpec::step(shape(1)), finite).unwrap();
     assert_eq!(
         format!("{again:?}"),
         format!("{adequate:?}"),
@@ -456,7 +471,11 @@ fn a_shared_component_charges_the_callers_budget_and_the_third_equation_is_refus
         ROOMY,
         ROOMY,
     );
-    let refused = budget(model.trace(Phase::Decode, shape(1), one_short).unwrap_err());
+    let refused = budget(
+        model
+            .trace(&StepSpec::step(shape(1)), one_short)
+            .unwrap_err(),
+    );
     assert_eq!(refused.resource, BudgetResource::Equations);
     assert_eq!(
         refused.attempted,

@@ -1,4 +1,4 @@
-//! BERT behind [`Model`] for [`Phase::Encode`]: the bidirectional post-norm encoder of the sentence
+//! BERT behind [`Model`], an `encode` model: the bidirectional post-norm encoder of the sentence
 //! embedders (MiniLM, BGE, E5) and, with the classifier head option, the cross-encoder rerankers
 //! (`BertForSequenceClassification`). Its step returns [`ModelOutput::Hidden`] (every position's final
 //! hidden state, pooled on the host) or, with the classifier, [`ModelOutput::Scores`] (the
@@ -6,13 +6,14 @@
 //!
 //! A step is `rows` right-padded sequences of `tokens` positions. Four inputs bind per step: the
 //! token ids and absolute positions the standard step declares, the segment id of every token
-//! ([`TOKEN_TYPE_SLOT`]) and which tokens are real ([`ATTENTION_MASK_SLOT`]); a padded token is never
+//! ([`TOKEN_TYPE`], a request input the driver defaults to zeros) and which tokens are real
+//! ([`StepInput::RealTokens`]); a padded token is never
 //! attended to, so a row's output does not depend on how far its batch pads it.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{BinOp, Builder, Graph, IndexRange, Slot, TensorType, Traced, ops};
+use poot_graph_ir::{BinOp, Builder, Graph, IndexRange, Slot, SlotKey, TensorType, Traced, ops};
 use poot_quant::weights::{
     AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
 };
@@ -24,9 +25,13 @@ use crate::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::{NormKind, NormParams, NormWeights, norm_with};
 use crate::components::standard::{LayerNorms, Step};
+use crate::io::{
+    Fill, InputId, Layout, ModelSchema, PadValue, Per, Presence as RequestPresence, ProgramId,
+    ProgramSpec, REAL_TOKENS_TAG, RequestForm, RequestInput,
+};
 use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason,
-    StepShape, TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, ShapeReason, StepSpec,
+    TraceError,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
@@ -35,12 +40,28 @@ use poot_text::ChatFormat;
 /// BERT's [`FamilyKey`]: the name its errors and receipts carry.
 pub const FAMILY: FamilyKey = FamilyKey::new("bert");
 
-/// The name of the `Slot::Activation` input holding every token's segment id, `[rows, tokens]` I32
-/// (0 for the first sentence, 1 for a cross-encoder's second).
-pub const TOKEN_TYPE_SLOT: &str = "token_type";
-/// The name of the `Slot::Activation` input marking the real tokens, `[rows, tokens]` I32: 1 for a
-/// token, 0 for the padding after a row's last token.
-pub const ATTENTION_MASK_SLOT: &str = "attention_mask";
+/// The request input holding every token's segment id (0 for the first sentence, 1 for a
+/// cross-encoder's second): dense I32, defaulted to zeros.
+pub const TOKEN_TYPE: InputId = InputId::new("token_type");
+/// The `Slot::Activation` tag of [`TOKEN_TYPE`], `[rows, tokens]` I32.
+const TOKEN_TYPE_TAG: &str = "token_type";
+
+/// The schema entry of [`TOKEN_TYPE`].
+fn token_type_input() -> RequestInput {
+    RequestInput::new(
+        TOKEN_TYPE,
+        SlotKey::new(Slot::Activation, Some(TOKEN_TYPE_TAG)),
+        RequestForm::new(
+            DType::I32,
+            Per::Token {
+                width: 1,
+                layout: Layout::TokenMajor,
+                presence: None,
+            },
+            PadValue::I32(0),
+        ),
+    )
+}
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -377,7 +398,7 @@ struct Classifier {
 }
 
 /// The built BERT encoder: its config, the name-resolved weights and the per-layer projections,
-/// ready to trace a [`Phase::Encode`] step. Owns its weights; holds no per-request state.
+/// ready to trace its `encode` program. Owns its weights; holds no per-request state.
 #[derive(Debug)]
 pub struct Bert {
     params: BertParams,
@@ -389,6 +410,7 @@ pub struct Bert {
     layers: Vec<Layer>,
     classifier: Option<Classifier>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -446,6 +468,17 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
             .map_err(weight_error)?,
         ),
     };
+    let output = match p.head {
+        BertHead::Embedding => ModelOutput::Hidden { width: p.width },
+        BertHead::Classifier { labels } => ModelOutput::Scores { labels },
+    };
+    let schema = ModelSchema::builder()
+        .input(token_type_input())
+        .encode(
+            ProgramSpec::new(ProgramId::ENCODE, output)
+                .reading(TOKEN_TYPE, RequestPresence::Defaulted(Fill::Pad)),
+        )
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -453,10 +486,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: BTreeSet::new(),
         bos: None,
         prompt_bos: None,
-        output: match p.head {
-            BertHead::Embedding => ModelOutput::Hidden { width: p.width },
-            BertHead::Classifier { labels } => ModelOutput::Scores { labels },
-        },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -471,6 +500,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         params: p,
         weights,
         config,
+        schema,
     }))
 }
 
@@ -489,18 +519,17 @@ impl Model for Bert {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        if phase != Phase::Encode {
-            return Err(TraceError::PhaseUnsupported {
-                family: FAMILY,
-                phase,
-            });
-        }
+        let shape = spec.shape;
         if shape.tokens.get() > p.max_positions {
             return Err(TraceError::ShapeUnsupported {
                 family: FAMILY,
@@ -513,10 +542,9 @@ impl Model for Bert {
         let step = Step::new(&b, shape)?.returning_hidden();
         let (rows, tokens) = (shape.rows.get(), shape.tokens.get());
         let ids = TensorType::new(vec![rows, tokens], DType::I32);
-        let types = b.slot_named(Slot::Activation, TOKEN_TYPE_SLOT, ids.clone())?;
+        let types = b.slot_named(Slot::Activation, TOKEN_TYPE_TAG, ids.clone())?;
         // A key is real (1) or padding (0): declared so the mask's `I32 -> F32` cast is proven exact.
-        let real =
-            b.slot_named_ranged(Slot::Activation, ATTENTION_MASK_SLOT, ids, IndexRange::FLAG)?;
+        let real = b.slot_named_ranged(Slot::Activation, REAL_TOKENS_TAG, ids, IndexRange::FLAG)?;
         // 0 for a real key, -1e9 for padding: the additive key mask every query shares.
         let mask = b.reshape(
             b.binary_scalar(
@@ -707,7 +735,8 @@ mod tests {
     use super::*;
     use crate::components::standard::oracle::{self, assert_matches_f64};
     use crate::components::testing::{build as built, values};
-    use crate::model::{KvLayout, LogitRows};
+    use crate::io::ProgramId;
+    use crate::model::{LogitRows, StepShape, StepSpec};
 
     /// A checkpoint tensor's values, by its HF name.
     fn tensor(store: &WeightStore, name: &str) -> Vec<f64> {
@@ -821,14 +850,12 @@ mod tests {
     }
 
     fn encode_shape(rows: usize, tokens: usize) -> StepShape {
-        StepShape {
-            rows: NonZeroUsize::new(rows).unwrap(),
-            tokens: NonZeroUsize::new(tokens).unwrap(),
-            capacity: NonZeroUsize::new(tokens).unwrap(),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::All,
-            hidden: None,
-        }
+        StepShape::new(
+            NonZeroUsize::new(rows).unwrap(),
+            NonZeroUsize::new(tokens).unwrap(),
+            NonZeroUsize::new(tokens).unwrap(),
+        )
+        .with_logits(LogitRows::All)
     }
 
     /// The model's `Encode` graph over padded rows of `lens` real tokens each, on the oracle.
@@ -852,8 +879,7 @@ mod tests {
         let pos: Vec<i32> = rows.iter().flat_map(|_| 0..tokens as i32).collect();
         let g = model
             .trace(
-                Phase::Encode,
-                encode_shape(rows.len(), tokens),
+                &StepSpec::encode(encode_shape(rows.len(), tokens)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -915,7 +941,10 @@ mod tests {
     fn the_classifier_head_scores_the_cls_position() {
         let fx = cross_encoder_fixture();
         let model = built(&ENTRY, &fx.raw(), &fx.store);
-        assert_eq!(model.config().output, ModelOutput::Scores { labels: 1 });
+        assert_eq!(
+            model.schema().encode().map(|p| p.output()),
+            Some(ModelOutput::Scores { labels: 1 })
+        );
         let got = encode(
             &*model,
             &fx.store,
@@ -950,16 +979,15 @@ mod tests {
         );
     }
 
-    /// A sequence longer than the position table is a typed refusal, and so is any phase but
-    /// `Encode`.
+    /// A sequence longer than the position table is a typed refusal, and so is any program but
+    /// `encode`.
     #[test]
-    fn a_shape_or_phase_it_cannot_trace_is_a_typed_refusal() {
+    fn a_shape_or_program_it_cannot_trace_is_a_typed_refusal() {
         let fx = fixture();
         let model = built(&ENTRY, &fx.raw(), &fx.store);
         assert!(matches!(
             model.trace(
-                Phase::Encode,
-                encode_shape(1, 17),
+                &StepSpec::encode(encode_shape(1, 17)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported {
@@ -969,12 +997,11 @@ mod tests {
         ));
         assert!(matches!(
             model.trace(
-                Phase::Prefill,
-                encode_shape(1, 4),
+                &StepSpec::step(encode_shape(1, 4)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
-            Err(TraceError::PhaseUnsupported {
-                phase: Phase::Prefill,
+            Err(TraceError::ProgramUnsupported {
+                program: ProgramId::STEP,
                 ..
             })
         ));

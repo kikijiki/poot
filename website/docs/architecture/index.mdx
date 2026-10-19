@@ -34,7 +34,7 @@ under "Where the code is today".
 ```text
 checkpoint -> loader -> typed weights
 config     -> Registry -> Model (a family: config, weight map, tracer)
-Model::trace(phase, step shape) -> Graph (primitives and compositions)
+Model::trace(step spec: program, shape, carried inputs) -> Graph (primitives and compositions)
 Graph + target + options -> compile -> Program, or a typed refusal
 program + weights -> executor: load, capture, replay per step
 Driver: token loop, sampling suffix, stops, KV slots  ->  serve: one scheduling loop

@@ -1,7 +1,7 @@
 //! The fixture corpus the plan-summary gate and the feature matrix compile.
 //!
 //! The registered part is not a list: it is `Registry::builtin().entries()` crossed with each entry's
-//! fixture (and its option fixtures) and the phases the fixture traces. A family registered with a
+//! fixture (and its option fixtures) and the programs the fixture traces. A family registered with a
 //! fixture joins the corpus, and so the matrix, with no edit here.
 //!
 //! The `parity` rows are the dense checkpoints `poot_models::test_support::dense` builds, at configurations the
@@ -13,8 +13,9 @@
 use std::sync::Arc;
 
 use poot_graph_ir::Graph;
+use poot_models::io::ProgramId;
 use poot_models::model::{
-    LogitRows, Model, ModelOutput, Phase, ShapeReason, StepShape, TraceError,
+    LogitRows, Model, ModelOutput, ShapeReason, StepShape, StepSpec, TraceError,
 };
 use poot_models::registry::{FamilyEntry, Registry};
 use poot_models::test_support::dense::{Dense, Family, step};
@@ -53,32 +54,32 @@ impl Row {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Shape {
     pub name: &'static str,
-    pub phase: Phase,
+    pub program: ProgramId,
     pub tokens: usize,
     pub capacity: usize,
 }
 
 const DECODE: Shape = Shape {
     name: "decode",
-    phase: Phase::Decode,
+    program: ProgramId::STEP,
     tokens: 1,
     capacity: CAP,
 };
 const PREFILL: Shape = Shape {
     name: "prefill",
-    phase: Phase::Prefill,
+    program: ProgramId::STEP,
     tokens: PROMPT,
     capacity: PROMPT,
 };
 const PREFILL_KV: Shape = Shape {
     name: "prefill_kv",
-    phase: Phase::Prefill,
+    program: ProgramId::STEP,
     tokens: PROMPT,
     capacity: CAP,
 };
 const ENCODE: Shape = Shape {
     name: "encode",
-    phase: Phase::Encode,
+    program: ProgramId::ENCODE,
     tokens: PROMPT,
     capacity: PROMPT,
 };
@@ -97,15 +98,19 @@ impl Fixtured {
             (entry.build)(&fixture.raw(), &fixture.store)
                 .unwrap_or_else(|e| panic!("{label}: the fixture does not build: {e}")),
         );
-        let shapes = match model.config().output {
+        let schema = model.schema();
+        let program = schema
+            .step()
+            .or(schema.encode())
+            .unwrap_or_else(|| panic!("{label}: the schema has no step or encode program"));
+        let shapes = match program.output() {
             // A family that returns logits is a decoder: decode, prefill, prefill into a larger cache.
             ModelOutput::Logits { .. } => vec![DECODE, PREFILL, PREFILL_KV],
             // An encoder is one forward over the whole input. A family that fixes the token count
             // (a vision tower: one patch per token) states it in its shape refusal.
             ModelOutput::Hidden { .. } | ModelOutput::Scores { .. } => {
                 let tokens = match model.trace(
-                    ENCODE.phase,
-                    encode_step(ENCODE.tokens),
+                    &StepSpec::encode(encode_step(ENCODE.tokens)),
                     poot_graph_ir::TraceLimits::for_tests(),
                 ) {
                     Err(TraceError::ShapeUnsupported {
@@ -128,6 +133,11 @@ impl Fixtured {
         }
     }
 
+    /// The built model.
+    pub(crate) fn model(&self) -> &dyn Model {
+        &*self.model
+    }
+
     /// The shapes this fixture is compiled at.
     pub(crate) fn shapes(&self) -> &[Shape] {
         &self.shapes
@@ -138,8 +148,10 @@ impl Fixtured {
         let traced = self
             .model
             .trace(
-                shape.phase,
-                step(1, shape.tokens, shape.capacity, LogitRows::Last),
+                &StepSpec::new(
+                    shape.program,
+                    step(1, shape.tokens, shape.capacity, LogitRows::Last),
+                ),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap_or_else(|e| panic!("{} {}: {e}", self.label, shape.name));
@@ -213,16 +225,16 @@ fn gemma() -> Dense {
         .with("sliding_window_pattern", 2)
 }
 
-/// A parity shape: its name, the phase, and `rows` sequences of `tokens` new tokens over `cap` positions.
-type ParityShape = (&'static str, Phase, usize, usize, usize);
+/// A parity shape: its name, the program, and `rows sequences of `tokens` new tokens over `cap` positions.
+type ParityShape = (&'static str, ProgramId, usize, usize, usize);
 
 /// A parity checkpoint: its name, its builder and the shapes it is traced at.
 type ParityCheckpoint<'a> = (&'a str, fn() -> Dense, &'a [ParityShape]);
 
-const PARITY_DECODE: ParityShape = ("decode", Phase::Decode, 1, 1, CAP);
-const PARITY_PREFILL: ParityShape = ("prefill", Phase::Prefill, 1, PROMPT, PROMPT);
-const PARITY_PREFILL_KV: ParityShape = ("prefill_kv", Phase::Prefill, 1, PROMPT, CAP);
-const PARITY_DECODE_BATCHED: ParityShape = ("decode_batched", Phase::Decode, BATCH, 1, CAP);
+const PARITY_DECODE: ParityShape = ("decode", ProgramId::STEP, 1, 1, CAP);
+const PARITY_PREFILL: ParityShape = ("prefill", ProgramId::STEP, 1, PROMPT, PROMPT);
+const PARITY_PREFILL_KV: ParityShape = ("prefill_kv", ProgramId::STEP, 1, PROMPT, CAP);
+const PARITY_DECODE_BATCHED: ParityShape = ("decode_batched", ProgramId::STEP, BATCH, 1, CAP);
 
 /// The dense parity rows, named `parity.<checkpoint>.<shape>`: each checkpoint at its shapes, last-token
 /// logits, then the qwen2 checkpoint with projections and head stored BF16 and the embedding F32 (the
@@ -257,7 +269,7 @@ fn parity_rows() -> Vec<Row> {
     ];
     let mut rows = Vec::new();
     for (checkpoint, make, shapes) in checkpoints {
-        for &(shape, phase, batch, tokens, cap) in shapes {
+        for &(shape, program, batch, tokens, cap) in shapes {
             rows.push(Row::new(
                 format!("parity.{checkpoint}.{shape}"),
                 move || {
@@ -265,8 +277,7 @@ fn parity_rows() -> Vec<Row> {
                         .f32_model()
                         .model
                         .trace(
-                            phase,
-                            step(batch, tokens, cap, LogitRows::Last),
+                            &StepSpec::new(program, step(batch, tokens, cap, LogitRows::Last)),
                             poot_graph_ir::TraceLimits::for_tests(),
                         )
                         .unwrap()
@@ -274,17 +285,16 @@ fn parity_rows() -> Vec<Row> {
             ));
         }
     }
-    for (shape, phase, tokens, cap) in [
-        ("decode", Phase::Decode, 1, CAP),
-        ("prefill", Phase::Prefill, PROMPT, PROMPT),
+    for (shape, program, tokens, cap) in [
+        ("decode", ProgramId::STEP, 1, CAP),
+        ("prefill", ProgramId::STEP, PROMPT, PROMPT),
     ] {
         rows.push(Row::new(format!("parity.qwen2_bf16.{shape}"), move || {
             dense(Family::Qwen2)
                 .build(Projections::Bf16, poot_tensor::DType::F32, None)
                 .model
                 .trace(
-                    phase,
-                    step(1, tokens, cap, LogitRows::Last),
+                    &StepSpec::new(program, step(1, tokens, cap, LogitRows::Last)),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap()

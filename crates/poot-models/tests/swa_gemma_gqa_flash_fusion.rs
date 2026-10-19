@@ -9,7 +9,7 @@
 
 use poot_graph_ir::op::OpKind;
 use poot_graph_plan::{cse, dce, flash_attention_capped};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 
 #[test]
@@ -27,12 +27,11 @@ fn swa_gqa_prefill_reaches_the_grouped_flash_path() {
     let g = m
         .model
         .trace(
-            Phase::Prefill,
-            step(1, 6, 6, LogitRows::Last),
+            &StepSpec::step(step(1, 6, 6, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
-    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
+    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap();
     let reps: Vec<usize> = fused
         .eqns()
         .iter()

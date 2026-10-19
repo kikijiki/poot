@@ -17,7 +17,6 @@ use poot_codegen::{
     VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue, emit_vpu, vpu_kernel_handle,
 };
 use poot_executor::{AieInvocation, Arg, Device, Dispatch, LaunchKind, VpuInvocation};
-use poot_graph_plan::production_plan::Submission;
 use poot_l0_runtime::L0Error;
 use poot_npu::{VpuConfig, VpuDevice, VpuError};
 use poot_quant::scalar::f32_to_f16;
@@ -144,7 +143,7 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
     let honest = LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest));
     let arg = |buffer, elems| Arg { buffer, elems };
 
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     let mut dispatch = |launch: LaunchKind, inputs: &[Arg<'_, VpuDevice>], output| {
         device.dispatch(Dispatch {
             kernel: &kernel,
@@ -279,7 +278,7 @@ fn a_replay_that_misses_its_deadline_poisons_the_device() {
                 .unwrap()
         })
         .collect();
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     let n = elems as u32;
     device
         .dispatch(Dispatch {
@@ -462,7 +461,7 @@ fn a_region_whose_precision_differs_from_the_compiled_graphs_is_refused_for_its_
 }
 
 /// `x + x` over an F32 `[1, 16]` argument, narrowed at the boundary the way the planner emits it
-/// (`NarrowEntry`, `Add`, `WidenExit`): the input `a` and the result `v3_widen` are F32 arguments the narrowing
+/// (`Convert`, `Add`, `Convert`): the input `a` and the result `v3` are F32 arguments the narrowing
 /// contract's range constrains.
 fn doubling_f32_artifact() -> VpuGraphArtifact {
     let tensor = |elem| VpuTensor {
@@ -482,14 +481,14 @@ fn doubling_f32_artifact() -> VpuGraphArtifact {
             tensor: tensor(VpuElem::F32),
         }],
         nodes: vec![
-            node(VpuOp::NarrowEntry, 0, VpuElem::F16),
+            node(VpuOp::Convert, 0, VpuElem::F16),
             VpuNode {
                 origin: 2,
                 op: VpuOp::Add,
                 inputs: vec![VpuValue(1), VpuValue(1)],
                 out: tensor(VpuElem::F16),
             },
-            node(VpuOp::WidenExit, 2, VpuElem::F32),
+            node(VpuOp::Convert, 2, VpuElem::F32),
         ],
         outputs: vec![VpuValue(3)],
     };
@@ -500,7 +499,7 @@ fn doubling_f32_artifact() -> VpuGraphArtifact {
         ir.xml.into_bytes(),
         ir.weights,
         vec![binding("a")],
-        vec![binding("v3_widen")],
+        vec![binding("v3")],
         vec![VpuLayer::new("v2", 2)],
     )
     .unwrap()
@@ -531,7 +530,7 @@ fn an_argument_a_recorded_execution_writes_is_range_checked_as_its_result() {
     };
     let (a, mid, out) = (alloc(&mut device), alloc(&mut device), alloc(&mut device));
     let launch = LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest));
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     for (input, output) in [(&a, &mid), (&mid, &out)] {
         device
             .dispatch(Dispatch {
@@ -570,13 +569,89 @@ fn an_argument_a_recorded_execution_writes_is_range_checked_as_its_result() {
     // The stale NaN in `mid` is the first execution's to overwrite; it is not an input of the replay.
     write(&mut device, &mid, f32::NAN);
     write(&mut device, &a, 1.0);
-    device.replay(&recording).expect("a written argument is not an input");
+    device
+        .replay(&recording)
+        .expect("a written argument is not an input");
     assert_eq!(read(&mut device), 4.0);
 
     // `a` is the replay's own input: past the range it is refused before anything runs.
     write(&mut device, &a, 65_520.0);
-    let Err(VpuError::NarrowingRange { role, binding, value, .. }) = device.replay(&recording) else {
+    let Err(VpuError::NarrowingRange {
+        role,
+        binding,
+        value,
+        ..
+    }) = device.replay(&recording)
+    else {
         panic!("an input past the range must be refused");
     };
     assert_eq!((role, binding, value), ("input", 0, 65_520.0));
+}
+
+/// A constant's range is read once, as it is uploaded, and never again: a weight bound as a graph input is
+/// not re-read on every replay (R2-L02-015), while the result is checked after each. A weight past the range is
+/// refused at its upload, before any replay exists.
+///
+/// Mutation: drop the `BufferRole::Weight` exemption in `RangeGuard::executed`; the weight is range-checked on
+/// every replay and the replay count goes from 3 to 6.
+#[test]
+fn a_constant_is_range_checked_at_its_upload_and_not_on_every_replay() {
+    let Some((_lock, mut device)) = device(VpuConfig::default()) else {
+        return;
+    };
+    let artifact = doubling_f32_artifact();
+    let digest = artifact.digest();
+    let kernel = device
+        .load_kernel("double", vpu_kernel_handle(artifact))
+        .expect("the doubling graph loads");
+    let weight = device
+        .allocate(BufferRole::Weight, BufferStorage::f32(), N)
+        .unwrap();
+    let out = device
+        .allocate(BufferRole::Staging, BufferStorage::f32(), N)
+        .unwrap();
+    let write = |device: &mut VpuDevice, value: f32| {
+        device.write_with(&weight, 0, 4 * N, &mut |_, bytes| {
+            for word in bytes.as_chunks_mut::<4>().0 {
+                *word = value.to_le_bytes();
+            }
+        })
+    };
+    assert!(matches!(
+        write(&mut device, 65_520.0),
+        Err(VpuError::NarrowingRangeUpload { index: 0, .. })
+    ));
+    write(&mut device, 1.0).expect("a weight inside the range uploads");
+    assert_eq!(device.constant_range_checks(), 2, "one check per upload");
+
+    device.begin().unwrap();
+    device
+        .dispatch(Dispatch {
+            kernel: &kernel,
+            inputs: &[Arg {
+                buffer: &weight,
+                elems: N as u32,
+            }],
+            output: Arg {
+                buffer: &out,
+                elems: N as u32,
+            },
+            launch: LaunchKind::VpuGraph(VpuInvocation::new(VpuTargetId::Npu4, digest)),
+            work: 1,
+        })
+        .unwrap();
+    let recording = device.finish().unwrap().expect("a recording");
+    for _ in 0..3 {
+        device.replay(&recording).expect("the weight is in range");
+    }
+    assert_eq!(
+        device.replay_range_checks(),
+        3,
+        "the result, once per replay"
+    );
+    assert_eq!(
+        device.constant_range_checks(),
+        2,
+        "no replay re-reads the weight"
+    );
 }

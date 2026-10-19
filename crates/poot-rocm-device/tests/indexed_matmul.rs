@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Engine};
 use poot_graph_ir::op::BinOp;
 use poot_graph_ir::{Builder, Graph, Storage, TensorType, ValueId};
@@ -178,15 +178,11 @@ fn oracle(program: &Program) -> HostTensor {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    eval(
-        &program.graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .unwrap()
+    eval(&program.graph, &inputs, EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap()
 }
 
 fn run(

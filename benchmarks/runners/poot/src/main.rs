@@ -40,12 +40,12 @@ use anyhow::Context;
 use serde_json::{json, Value};
 
 use poot_executor::DetailedTiming;
-use poot_graph_plan::{production_plan::Submission, CompileOptions};
+use poot_graph_plan::CompileOptions;
 use poot_llm::driver::error::DriverError;
 use poot_llm::driver::{
     open_executor, open_timed_executor, BackendChoice, Driver, DriverOptions, DriverStats,
-    GenerateRequest, Head, Layout, ModelHandle, PhaseTiming, PreparedSetLimits, ServingShapes,
-    Warm,
+    GenerateRequest, Head, Layout, ModelHandle, PhaseTiming, PreparedSetLimits, Serving,
+    ServingShapes, State, Warm,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
@@ -510,7 +510,7 @@ fn roofline_receipt(engine: &dyn Generate, before: PhaseTiming) -> Value {
 /// second executor after dropping the first, which the ROCm runtime does not survive in one process.
 struct DriverCell {
     handle: Arc<ModelHandle>,
-    driver: Driver,
+    driver: Driver<Serving>,
     /// The driver's counters before `Driver::prepare` ran.
     initial: PreparationCounters,
     /// The executor's timing snapshot when `reset_profile` last ran: the start of the profiled window.
@@ -520,7 +520,7 @@ struct DriverCell {
 }
 
 /// The preparation layers the driver and its executor count.
-fn driver_counters(driver: &Driver) -> PreparationCounters {
+fn driver_counters<S: State>(driver: &Driver<S>) -> PreparationCounters {
     counters_from(&driver.stats(), driver.executor_stats().recordings)
 }
 
@@ -542,7 +542,7 @@ fn curve_prefill_chunk(limit: Option<usize>, longest: usize) -> usize {
 }
 
 fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<DriverOptions> {
-    let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let compile = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     Ok(DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -728,14 +728,14 @@ fn open_driver(
         driver_options(capacity, chunk)?,
     )
     .context("open the driver")?;
-    let mut driver = if config.roofline {
+    let driver = if config.roofline {
         driver.with_phase_timing()
     } else {
         driver
     };
     let initial = driver_counters(&driver);
     // Every entry the cell's prompts plan to is compiled and added before the first timed token.
-    driver
+    let driver = driver
         .prepare(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],
@@ -744,6 +744,7 @@ fn open_driver(
             windows: &[],
             adapters: &[],
         })
+        .map_err(DriverError::from)
         .context("prepare the driver")?;
     Ok((
         Box::new(DriverCell {

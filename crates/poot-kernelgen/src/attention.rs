@@ -48,7 +48,6 @@ use crate::data_movement::Cfg;
 use crate::emit::{copy as copy_local, cu};
 use crate::fused::{FusedScalarOp, emit_scalar_op};
 use crate::helpers::{copy, elem, ld, slice_dtype, slice_f32};
-use crate::request::SerialWork;
 
 /// What the planner asks the attention generator for: the region's shape, its score transform, mask and
 /// bound, and the schedule that runs it.
@@ -119,17 +118,6 @@ impl AttentionSpec {
             AttentionSchedule::SplitKv { splits, .. } => Some(self.rows() * splits * (self.dv + 2)),
         }
     }
-
-    /// The serial work of one dispatch: `workgroups * lanes` threads, each stepping over its share of the
-    /// keys and, per key, over the key width (the score dot product) and the value width (the output update).
-    pub(crate) fn serial_work(&self) -> SerialWork {
-        let lanes = self.schedule.lanes();
-        SerialWork {
-            threads: (self.workgroups() * lanes) as u64,
-            steps_per_thread: (self.keys_per_workgroup().div_ceil(lanes) * (self.dk + self.dv))
-                as u64,
-        }
-    }
 }
 
 /// The combine stage of a split-KV attention: one workgroup of `lanes` threads per row, each lane a strided
@@ -159,13 +147,6 @@ impl AttentionCombineSpec {
                 dv: spec.dv,
                 lanes,
             }),
-        }
-    }
-
-    pub(crate) fn serial_work(&self) -> SerialWork {
-        SerialWork {
-            threads: (self.rows * self.lanes) as u64,
-            steps_per_thread: (self.dv.div_ceil(self.lanes) * self.splits) as u64,
         }
     }
 }

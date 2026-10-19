@@ -69,15 +69,15 @@ wgpu; `Auto` never picks `Vulkan`), then generate:
 ```rust
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
-use poot_graph_plan::production_plan::Submission;
 use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
-    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, PreparedSetLimits, open_executor,
+    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Layout, PreparedSetLimits,
+    open_executor,
 };
 use poot_llm::{GenerationControl, Sampler};
 
 let handle = Arc::new(handle);
-let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+let compile = CompileOptions::new(CompileLimits::STANDARD);
 let options = DriverOptions {
     prefill: compile.clone(),
     decode: compile,
@@ -96,7 +96,8 @@ let options = DriverOptions {
     hidden_window: None,    // Some(window): every program also writes a hidden-state carry;
                             // under Mtp, draft.carry_window() (the driver refuses otherwise)
 };
-let mut driver = Driver::new(Arc::clone(&handle), open_executor(BackendChoice::Auto)?, options)?;
+let mut driver = Driver::new(Arc::clone(&handle), open_executor(BackendChoice::Auto)?, options)?
+    .serve(Layout::Contiguous); // or `prepare(&shapes)`: the Serving driver is the one that generates
 let generation = driver.generate(
     GenerateRequest {
         prompt: handle.text().encode("The capital of France is")?,
@@ -142,7 +143,7 @@ let text = handle.text().decode(&ids)?;
 
 ## Sentence embeddings and reranking
 
-Embeddings and reranking come from BERT-class models, which run on the driver's `Encode` step on the device
+Embeddings and reranking come from BERT-class models, which run on the driver's `encode` step on the device
 you open. `SentenceEncoder` and `CrossEncoder` load a checkpoint and a backend, tokenize, run the step and
 do the host side (pooling, normalization, ranking). The load takes the most texts one call encodes; the encode
 entries for that many rows and every length up to the model's positions are prepared at load, and a larger call

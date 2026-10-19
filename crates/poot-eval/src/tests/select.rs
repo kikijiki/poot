@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use poot_graph_ir::{Builder, TensorType};
 use poot_tensor::{DType, HostTensor};
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 
 const QUIET_NAN_PAYLOAD: u32 = 0x7FC0_1234;
 const SIGNALING_NAN: u32 = 0x7F80_0001;
@@ -40,7 +40,7 @@ fn select_f32_bits(shape: &[usize], cond: &[i32], if_true: &[u32], if_false: &[u
         (t.id(), Value::from(floats(if_true))),
         (f.id(), Value::from(floats(if_false))),
     ]);
-    let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -150,7 +150,7 @@ fn float_select_broadcasts_the_condition() {
             )),
         ),
     ]);
-    let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -201,7 +201,7 @@ fn bf16_select_passes_half_width_bits_through() {
             )),
         ),
     ]);
-    let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -292,7 +292,7 @@ fn narrow_select_moves_exact_words_through_movement_ops() {
                 )),
             ),
         ]);
-        let out = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let out = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

@@ -18,11 +18,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_eval::test_support::weight_map_oracle::oracle_for;
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::Fixture;
 use poot_graph_ir::Storage;
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_kernel_ir::{Body, Statement};
 use poot_rocm_device::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
@@ -45,7 +45,7 @@ fn assert_matches_oracle(exec: &mut dyn Executor, target: Target, fixture: &Fixt
 
 /// The kernel bodies `fixture`'s program dispatches for `target`, each with its total thread grid.
 fn dispatched_bodies(fixture: &Fixture, target: Target) -> Vec<(Body, [u32; 3])> {
-    poot_executor_parity::staged(fixture, target, Submission::Replay)
+    poot_executor_parity::staged(fixture, target)
         .stages()
         .flat_map(|(_, _, program)| {
             program
@@ -57,16 +57,6 @@ fn dispatched_bodies(fixture: &Fixture, target: Target) -> Vec<(Body, [u32; 3])>
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-/// The largest `|a - b| / max(|b|, 1)` between two same-shaped F32 tensors.
-fn max_relative_difference(a: &HostTensor, b: &HostTensor) -> f32 {
-    a.as_f32()
-        .expect("F32 output")
-        .iter()
-        .zip(b.as_f32().expect("F32 output"))
-        .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
-        .fold(0.0, f32::max)
 }
 
 /// SC-001. Replaces `probe_arg_top_k_rocm_test` (`l = 3, e = 16, k = 4`: 12 output lanes, the partial
@@ -161,7 +151,10 @@ fn flash_attention_with_a_per_head_alibi_mask_matches_the_oracle_on_rocm() {
         );
         let per_head = oracle_for(&case.per_head.graph, &case.per_head.store)(&[]);
         let head0 = oracle_for(&case.head0_broadcast.graph, &case.head0_broadcast.store)(&[]);
-        let spread = max_relative_difference(&per_head, &head0);
+        let spread = poot_test_util::max_unit_floor_error(
+            per_head.as_f32().expect("F32 output"),
+            head0.as_f32().expect("F32 output"),
+        );
         assert!(
             spread > 2e-2,
             "{name}: the per-head mask barely changes the oracle (max relative difference {spread:.2e})"
@@ -190,8 +183,8 @@ fn decode_over_multi_head_and_multi_query_layouts_matches_the_oracle_on_rocm() {
 /// matmul-plus-bias contraction runs inside the recorded program) decoded over six steps through one
 /// entry. The entry records on its first step and replays after; each step matches the oracle, and
 /// after a state reset the same six steps replayed from the recording equal the first pass bit for
-/// bit, the first step against the recording step's own execution. (`Submission::Eager` no longer
-/// reaches an executor: the contract refuses it, Card 713, so there is no eager path to compare.)
+/// bit, the first step against the recording step's own execution. (There is no eager path to
+/// compare.)
 ///
 /// The KV caches are updated in place; the conv window and the recurrent matrix carry through the
 /// engine's explicit two-phase commit copies. The toy's weights are scaled so those two states move the
@@ -425,7 +418,7 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_rocm() {
                 (beta.id(), Value::from(heads(bd, H_V, 1))),
                 (state.id(), Value::from(carried.clone())),
             ]);
-            let step = eval(&graph, &bound, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+            let step = eval(&graph, &bound, EvalOptions::default()).unwrap();
             carried = step.state.into_iter().next().unwrap().into_host().unwrap();
             let token = step.output.into_host().unwrap();
             for hv in 0..H_V {
@@ -436,11 +429,7 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_rocm() {
         }
         let got = got.as_f32().unwrap();
         assert_eq!(got.len(), want.len(), "call {call}: output length");
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let worst = poot_test_util::max_abs_error(got, &want);
         assert!(
             worst < 1e-4,
             "call {call}: the chunked prefill differs from the sequential recurrence by {worst:.3e}"
@@ -453,7 +442,7 @@ fn chunked_gdn_prefill_matches_the_sequential_recurrence_on_rocm() {
 /// embedding), traced for one decode token, its weights bound by const name as stored (bf16 words
 /// for the projections), and one decode step per prompt token.
 fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
-    use poot_models::model::{LogitRows, Phase};
+    use poot_models::model::{LogitRows, StepSpec};
     use poot_models::registry::{RawConfig, Registry};
     use poot_models::test_support::dense::{const_named_weights, step};
     use poot_models::test_support::weight_map::MappedModel;
@@ -487,8 +476,7 @@ fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
     let graph = mapped
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, CAP, LogitRows::Last),
+            &StepSpec::step(step(1, 1, CAP, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();

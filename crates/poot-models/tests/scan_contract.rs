@@ -1,20 +1,19 @@
 //! The recurrence scan composite (POOT-634) through compile, for both families: a generated schedule whose
-//! body does not grow with the sequence, a launch count bounded by `max_dispatch_work`, distinct buffers for
+//! body does not grow with the sequence, one launch for the whole sequence, distinct buffers for
 //! `y` and `s_out`, and `s_out` published as state. No device.
 
 use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_graph_ir::{Graph, OpKind};
-use poot_graph_plan::device_validation::ResourceRefusal;
-use poot_graph_plan::test_support::{gpu_backend, gpu_caps, gpu_caps_mut};
+use poot_graph_plan::test_support::{gpu_caps, gpu_caps_mut};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, KernelChoice, Plan, PlanError,
-    Program, Target, compile, production_plan::Submission,
+    Program, Target, compile,
 };
 use poot_kernelgen::{KernelRequest, ScanKernel, ScanSpec};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::registry::Registry;
 use poot_models::test_support::dense::step;
-use poot_target::{AmdArch, Backend, DeviceCaps, Queried};
+use poot_target::{AmdArch, Backend};
 
 fn targets() -> [(&'static str, Target); 3] {
     [
@@ -38,11 +37,7 @@ fn targets() -> [(&'static str, Target); 3] {
 }
 
 fn compiled(graph: &Graph, target: &Target) -> Result<Program, CompileError> {
-    compile(
-        graph,
-        target,
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
-    )
+    compile(graph, target, &CompileOptions::new(CompileLimits::STANDARD))
 }
 
 fn families(len: usize) -> [ScanFixture; 2] {
@@ -112,18 +107,6 @@ fn graph_and_body_do_not_grow_with_the_chunk_count() {
             );
         }
     }
-}
-
-/// The bodies of the scan equation's dispatches, in launch order.
-fn scan_bodies(program: &Program) -> Vec<poot_kernel_ir::Body> {
-    let (_, plan) = program
-        .planned()
-        .find(|(eqn, _)| matches!(eqn.op, OpKind::Scan(_)))
-        .expect("the compiled program keeps the scan");
-    let Plan::Dispatches(dispatches) = plan else {
-        panic!("the scan launches: {plan:?}");
-    };
-    dispatches.iter().map(|d| d.body().clone()).collect()
 }
 
 /// `y` and `s_out` are distinct values with distinct buffers, both distinct from the packed result they
@@ -206,104 +189,21 @@ fn a_state_column_that_cannot_fit_is_refused_before_dispatch() {
     }
 }
 
-fn budgeted(target: &Target, budget: u64) -> Target {
-    Target::Gpu {
-        backend: gpu_backend(target),
-        caps: DeviceCaps {
-            max_dispatch_work: Queried::Known(budget),
-            ..gpu_caps(target)
-        },
-    }
-}
-
-/// A device without a calibrated bound runs the scan as one launch; a known `max_dispatch_work` splits it
-/// into launches that each stay within it and together cover every token; a bound below one token refuses
-/// naming the work, before any dispatch.
+/// A scan runs as one launch that covers every token, on every backend.
 #[test]
-fn the_work_bound_splits_the_sequence_or_refuses_before_dispatch() {
+fn a_scan_is_one_launch_over_the_whole_sequence() {
     for fixture in families(48) {
         for (name, target) in targets() {
             let label = format!("{:?} {name}", fixture.family);
-            let (whole, launches) = scan_plan(&compiled(&fixture.graph().graph, &target).unwrap());
+            let (spec, launches) = scan_plan(&compiled(&fixture.graph().graph, &target).unwrap());
+            assert_eq!(launches.len(), 1, "{label}: one launch");
+            assert_eq!(spec.len, 48, "{label}: the launch covers the sequence");
             assert_eq!(
-                launches.len(),
-                1,
-                "{label}: an unbounded device launches once"
-            );
-            assert_eq!((whole.phase.start, whole.phase.count), (0, 48), "{label}");
-            assert_eq!(
-                whole.kernel,
+                spec.kernel,
                 match fixture.family {
                     poot_graph_ir::ScanFamily::DeltaRule => ScanKernel::DeltaRule,
                     poot_graph_ir::ScanFamily::Ssd => ScanKernel::Ssd,
                 }
-            );
-
-            let token_work = {
-                let one = ScanSpec {
-                    phase: poot_kernelgen::ScanPhase { start: 0, count: 1 },
-                    ..whole.clone()
-                };
-                poot_kernelgen::KernelRequest::Scan(one)
-                    .requirements()
-                    .serial_work
-                    .unwrap()
-                    .total()
-            };
-            let budget = token_work * 10; // ten tokens per launch
-            let (first, launches) =
-                scan_plan(&compiled(&fixture.graph().graph, &budgeted(&target, budget)).unwrap());
-            assert_eq!(
-                first.phase.count, 10,
-                "{label}: tokens per launch under budget {budget}"
-            );
-            assert_eq!(
-                launches.len(),
-                48usize.div_ceil(10),
-                "{label}: launches cover the sequence"
-            );
-            // Launch `k` covers tokens `10k..` : its body is the body generated for exactly that phase.
-            let bodies =
-                scan_bodies(&compiled(&fixture.graph().graph, &budgeted(&target, budget)).unwrap());
-            for (k, body) in bodies.iter().enumerate() {
-                let start = k * first.phase.count;
-                let expected = ScanSpec {
-                    phase: poot_kernelgen::ScanPhase {
-                        start,
-                        count: first.phase.count.min(48 - start),
-                    },
-                    ..first.clone()
-                };
-                let generated = poot_kernelgen::generate(
-                    &KernelRequest::Scan(expected),
-                    &gpu_caps(&target),
-                    &poot_kernelgen::BodyLimits {
-                        max_instructions: std::num::NonZeroUsize::new(1 << 16).unwrap(),
-                        max_locals: std::num::NonZeroUsize::new(1 << 16).unwrap(),
-                    },
-                )
-                .unwrap();
-                assert_eq!(
-                    body, &generated.body,
-                    "{label}: launch {k} covers tokens {start}.."
-                );
-            }
-            let work = poot_kernelgen::KernelRequest::Scan(first)
-                .requirements()
-                .serial_work
-                .unwrap()
-                .total();
-            assert!(
-                work <= budget,
-                "{label}: a launch carries {work} > {budget}"
-            );
-
-            let missing = refusal(
-                compiled(&fixture.graph().graph, &budgeted(&target, token_work - 1)).unwrap_err(),
-            );
-            assert!(
-                matches!(missing, Capability::KernelResources(ResourceRefusal::DispatchWork { work, .. }) if work == token_work),
-                "{label}: a bound below one token refuses naming {token_work}: {missing:?}"
             );
         }
     }
@@ -406,7 +306,7 @@ fn per_head_states_stay_within_the_declared_resources() {
 
 const PROMPT: usize = 4;
 
-fn registered(family: &str, phase: Phase, rows: usize, tokens: usize, cap: usize) -> Graph {
+fn registered(family: &str, rows: usize, tokens: usize, cap: usize) -> Graph {
     let registry = Registry::builtin().expect("the builtin registry");
     // `family/variant` names one of the family's option fixtures (llama's Mixtral, granite's granitemoe).
     let (name, variant) = family.split_once('/').unwrap_or((family, ""));
@@ -430,8 +330,7 @@ fn registered(family: &str, phase: Phase, rows: usize, tokens: usize, cap: usize
         (entry.build)(&fixture.raw(), &fixture.store).unwrap_or_else(|e| panic!("{family}: {e}"));
     model
         .trace(
-            phase,
-            step(rows, tokens, cap, LogitRows::Last),
+            &StepSpec::step(step(rows, tokens, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap_or_else(|e| panic!("{family}: {e}"))
@@ -468,17 +367,17 @@ fn the_model_prefills_plan_bounded_generated_scans() {
         (
             "qwen4exp.prefill",
             ScanKernel::DeltaRule,
-            registered("qwen4exp", Phase::Prefill, 1, PROMPT, PROMPT),
+            registered("qwen4exp", 1, PROMPT, PROMPT),
         ),
         (
             "qwen3next.prefill",
             ScanKernel::DeltaRule,
-            registered("qwen3next", Phase::Prefill, 1, PROMPT, PROMPT),
+            registered("qwen3next", 1, PROMPT, PROMPT),
         ),
         (
             "nemotron_h.prefill",
             ScanKernel::Ssd,
-            registered("nemotron_h", Phase::Prefill, 1, PROMPT, PROMPT),
+            registered("nemotron_h", 1, PROMPT, PROMPT),
         ),
     ];
     for (name, kernel, graph) in &graphs {
@@ -487,26 +386,18 @@ fn the_model_prefills_plan_bounded_generated_scans() {
             let program = compile(
                 graph,
                 &target,
-                &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+                &CompileOptions::new(CompileLimits::STANDARD),
             )
             .unwrap_or_else(|e| panic!("{label}: {e:?}"));
             let planned = scans(&program);
             assert!(!planned.is_empty(), "{label}: the prefill plans no scan");
             for (spec, launches) in &planned {
                 assert_eq!(spec.kernel, *kernel, "{label}");
-                assert_eq!(
-                    *launches, 1,
-                    "{label}: an unbounded device launches the scan once"
-                );
+                assert_eq!(*launches, 1, "{label}: the scan launches once");
                 assert!(
                     spec.lds_bytes() <= u64::from(gpu_caps(&target).lds_bytes),
                     "{label}: LDS"
                 );
-                let work = KernelRequest::Scan(spec.clone())
-                    .requirements()
-                    .serial_work
-                    .expect("a scan declares its serial work");
-                assert!(work.total() > 0, "{label}");
             }
         }
     }
@@ -525,13 +416,13 @@ fn a_model_prefill_scan_gets_the_schedule_of_its_layout() {
         ("qwen3next", ScanKernel::DeltaRule),
         ("nemotron_h", ScanKernel::Ssd),
     ] {
-        let graph = registered(family, Phase::Prefill, 1, CAPACITY, CAPACITY);
+        let graph = registered(family, 1, CAPACITY, CAPACITY);
         for (target_name, target) in targets() {
             let label = format!("{family} on {target_name}");
             let program = compile(
                 &graph,
                 &target,
-                &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+                &CompileOptions::new(CompileLimits::STANDARD),
             )
             .unwrap_or_else(|e| panic!("{label}: {e:?}"));
             let planned = scans(&program);

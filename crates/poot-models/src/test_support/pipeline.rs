@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::model::{LogitRows, Phase};
+use crate::model::{LogitRows, StepSpec};
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, EntryId, ExecutableId, Executor, NoSync, StepInputs,
     WeightUpload,
@@ -28,8 +28,8 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
@@ -101,7 +101,7 @@ fn compile(g: &Graph, target: Target, devices: DevicePlacement) -> StagedProgram
             experts: ExpertPlacement::AllResident,
             devices,
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .unwrap_or_else(|error| panic!("compile_staged: {error}"))
 }
@@ -340,8 +340,7 @@ pub fn assert_qwen2_pipeline_matches_single_stage(
     let graph = model
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, CAP, LogitRows::Last),
+            &StepSpec::step(step(1, 1, CAP, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -552,8 +551,8 @@ impl<D: Device> Device for Counting<D> {
     ) -> Result<Self::Kernel, Self::Error> {
         self.inner.load_kernel(key, kernel)
     }
-    fn begin(&mut self, submission: Submission) -> Result<(), Self::Error> {
-        self.inner.begin(submission)
+    fn begin(&mut self) -> Result<(), Self::Error> {
+        self.inner.begin()
     }
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
         self.counts.dispatches.set(self.counts.dispatches.get() + 1);
@@ -628,8 +627,7 @@ fn decode_pair(exec: &mut dyn Executor, target: Target) -> (Pair, Vec<SlotValue>
     let graph = model
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, CAP, LogitRows::Last),
+            &StepSpec::step(step(1, 1, CAP, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();

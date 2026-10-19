@@ -10,16 +10,14 @@
 //! Mutation (guards `poot-kernelgen`'s `attention.rs`, applied once, observed red, restored): drop the
 //! `l *= exp(m_old - m_new)` rescale; both rows go red with the worst absolute error against the oracle.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::{ConstFixture, run_once};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{attention_masked, attention_prefill_softcap};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Graph, OpKind};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, KernelChoice, compile, production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, compile};
 use poot_kernelgen::KernelRequest;
 use poot_rocm_device::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
@@ -99,7 +97,7 @@ fn check(name: &str, case: &Case) {
     let program = compile(
         &case.graph,
         &target,
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .unwrap_or_else(|e| panic!("{name}: the attention graph compiles for ROCm: {e}"));
     let (eqn, _) = program
@@ -122,32 +120,16 @@ fn check(name: &str, case: &Case) {
         .zip(&case.consts)
         .map(|(&id, c)| (id, Value::from(c.tensor.clone())))
         .collect();
-    let want = eval(
-        &case.graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap_or_else(|e| panic!("{name}: oracle: {e}"))
-    .output
-    .into_host()
-    .unwrap();
+    let want = eval(&case.graph, &inputs, EvalOptions::default())
+        .unwrap_or_else(|e| panic!("{name}: oracle: {e}"))
+        .output
+        .into_host()
+        .unwrap();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     let got = run_once(&mut *exec, target, &case.graph, &case.consts, &[])
         .unwrap_or_else(|e| panic!("{name}: the attention runs through the contract: {e}"));
     assert_eq!(got.shape(), want.shape(), "{name}");
-    let worst = got
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(want.as_f32().unwrap())
-        .map(|(a, b)| {
-            if (a - b).is_nan() {
-                f32::INFINITY
-            } else {
-                (a - b).abs()
-            }
-        })
-        .fold(0.0f32, f32::max);
+    let worst = poot_test_util::max_abs_error(got.as_f32().unwrap(), want.as_f32().unwrap());
     assert!(
         worst <= 1e-3,
         "{name} ({lanes} lanes): differs from the oracle by {worst:.3e}"
@@ -205,21 +187,6 @@ fn prefill_into_a_cache_matches_the_oracle_on_rocm() {
 use poot_eval::test_support::live_attention::LiveAttentionFixture;
 use poot_executor::ExecError;
 use poot_executor_parity::live_attention::live_step;
-
-/// Worst absolute difference between two result vectors; a NaN on either side is infinite.
-fn worst_difference(got: &[f32], want: &[f32]) -> f32 {
-    assert_eq!(got.len(), want.len());
-    got.iter()
-        .zip(want)
-        .map(|(a, b)| {
-            if (a - b).is_nan() {
-                f32::INFINITY
-            } else {
-                (a - b).abs()
-            }
-        })
-        .fold(0.0, f32::max)
-}
 
 /// SC-001 on ROCm, Gemma2: a GQA decode with attention-logit softcapping, scores far past the cap, over more
 /// keys than lanes. Mutation: restore the decode softcap decline in `match_attention`; the chain stays
@@ -313,7 +280,7 @@ fn deepseek_v2_mla_split_key_decode_matches_the_oracle_on_rocm() {
     let program = compile(
         &graph,
         &target,
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the MLA graph compiles for ROCm");
     let (eqn, _) = program
@@ -337,14 +304,14 @@ fn deepseek_v2_mla_split_key_decode_matches_the_oracle_on_rocm() {
         .zip(&consts)
         .map(|(&id, c)| (id, Value::from(c.tensor.clone())))
         .collect();
-    let want = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(&graph, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
         .unwrap();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     let got = run_once(&mut *exec, target, &graph, &consts, &[]).expect("MLA runs on ROCm");
-    let worst = worst_difference(got.as_f32().unwrap(), want.as_f32().unwrap());
+    let worst = poot_test_util::max_abs_error(got.as_f32().unwrap(), want.as_f32().unwrap());
     assert!(worst <= 1e-3, "MLA differs from the oracle by {worst:.3e}");
 }
 
@@ -377,21 +344,17 @@ fn a_live_length_never_reads_the_poisoned_tail_on_rocm() {
         got.iter().all(|x| x.is_finite()),
         "poison reached the output: {got:?}"
     );
-    let cpu = eval(
-        &built.graph,
-        &inputs.values(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .unwrap();
+    let cpu = eval(&built.graph, &inputs.values(), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
     assert!(
-        worst_difference(&got, cpu.as_f32().unwrap()) <= 1e-3,
+        poot_test_util::max_abs_error(&got, cpu.as_f32().unwrap()) <= 1e-3,
         "vs the guarded graph"
     );
     assert!(
-        worst_difference(&got, &fixture.oracle(&inputs, &built, &[64])) <= 1e-3,
+        poot_test_util::max_abs_error(&got, &fixture.oracle(&inputs, &built, &[64])) <= 1e-3,
         "vs the first 64 keys"
     );
 }
@@ -431,7 +394,7 @@ fn an_out_of_range_live_length_publishes_nothing_on_rocm() {
         let got = live_step(&mut *exec, target, &built, &inputs)
             .unwrap_or_else(|e| panic!("len {len}: {e:?}"));
         assert!(
-            worst_difference(&got, &fixture.oracle(&inputs, &built, &[len])) <= 1e-3,
+            poot_test_util::max_abs_error(&got, &fixture.oracle(&inputs, &built, &[len])) <= 1e-3,
             "len {len}"
         );
     }
@@ -468,21 +431,17 @@ fn a_declined_live_attention_graph_runs_as_primitives_on_rocm() {
         got.iter().all(|x| x.is_finite()),
         "poison reached the output: {got:?}"
     );
-    let cpu = eval(
-        &built.graph,
-        &inputs.values(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .unwrap();
+    let cpu = eval(&built.graph, &inputs.values(), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
     assert!(
-        worst_difference(&got, cpu.as_f32().unwrap()) <= 1e-3,
+        poot_test_util::max_abs_error(&got, cpu.as_f32().unwrap()) <= 1e-3,
         "vs the guarded graph"
     );
     assert!(
-        worst_difference(&got, &fixture.oracle(&inputs, &built, &[5])) <= 1e-3,
+        poot_test_util::max_abs_error(&got, &fixture.oracle(&inputs, &built, &[5])) <= 1e-3,
         "vs the first 5 keys"
     );
 }
@@ -524,17 +483,14 @@ fn a_narrow_live_attention_graph_runs_on_rocm_and_never_reads_the_poisoned_tail(
                 got.iter().all(|x| x.is_finite()),
                 "{label}: poison reached the output: {got:?}"
             );
-            let cpu = eval(
-                &built.graph,
-                &inputs.values(),
-                EvalOptions::new(EvalBudget::UNBOUNDED),
-            )
-            .unwrap()
-            .output
-            .into_host()
-            .unwrap();
-            let vs_graph = worst_difference(&got, cpu.as_f32().unwrap());
-            let vs_oracle = worst_difference(&got, &fixture.oracle(&inputs, &built, &len));
+            let cpu = eval(&built.graph, &inputs.values(), EvalOptions::default())
+                .unwrap()
+                .output
+                .into_host()
+                .unwrap();
+            let vs_graph = poot_test_util::max_abs_error(&got, cpu.as_f32().unwrap());
+            let vs_oracle =
+                poot_test_util::max_abs_error(&got, &fixture.oracle(&inputs, &built, &len));
             eprintln!("{label}: vs guarded graph {vs_graph:.3e}, vs oracle {vs_oracle:.3e}");
             assert!(
                 vs_graph <= tier,

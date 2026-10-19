@@ -26,11 +26,9 @@ use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
 
-use crate::components::standard::{Step, check_step};
-use crate::model::{
-    FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason, StepShape,
-    TraceError,
-};
+use crate::components::standard::{Step, check_step, decoder_program};
+use crate::io::ModelSchema;
+use crate::model::{FamilyKey, Model, ModelConfig, ModelError, ShapeReason, StepSpec, TraceError};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
 
@@ -63,12 +61,16 @@ pub(crate) struct DeepseekV4 {
     weights: WeightMap,
     tower: stack::Tower,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
     let p = DeepseekV4Config::from_raw(raw)?;
     let weights = names::weights_of(&p, store)?;
     let tower = stack::Tower::new(&weights, &p).map_err(|e| e.for_family(FAMILY))?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -76,7 +78,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: p.granule,
         chat: ChatFormat::ChatML,
     };
@@ -85,6 +86,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         weights,
         tower,
         config,
+        schema,
     }))
 }
 
@@ -93,16 +95,21 @@ impl Model for DeepseekV4 {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         crate::components::moe::check_step(FAMILY, shape, &p.score_moe)?;
         let granule = p.granule.get();
-        if phase == Phase::Prefill && !shape.tokens.get().is_multiple_of(granule) {
+        if !shape.is_decode() && !shape.tokens.get().is_multiple_of(granule) {
             return Err(TraceError::ShapeUnsupported {
                 family: FAMILY,
                 shape,

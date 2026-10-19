@@ -10,13 +10,13 @@
 //! `a_grid_over_the_device_limit_is_refused_not_folded` in `poot-vulkan-runtime`: this device's own x limit
 //! is `u32::MAX`, so no launch here can exceed it.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::{ConstFixture, run_once};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{AttentionAttrs, OpKind};
-use poot_graph_plan::{CompileLimits, CompileOptions, compile, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, compile};
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::HostTensor;
@@ -65,7 +65,7 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
     let program = compile(
         &graph,
         &target,
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the flash prefill compiles for this device");
     let widest = program
@@ -96,7 +96,7 @@ fn flash_prefill_over_65535_workgroups_is_one_wide_dispatch_and_matches_the_orac
         .zip(&tensors)
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let want = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(&graph, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

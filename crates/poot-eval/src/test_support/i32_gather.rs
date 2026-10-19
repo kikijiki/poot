@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::{EvalBudget, EvalOptions, Value};
+use crate::{EvalOptions, Value};
 use poot_graph_ir::{Builder, Graph, Slot, Storage, TensorType, ValueId};
 use poot_tensor::{DType, HostTensor};
 
@@ -192,7 +192,7 @@ impl GatherCase {
                 .into_iter()
                 .map(|(id, t)| (id, Value::from(t)))
                 .collect(),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
+            EvalOptions::default(),
         )
         .map_err(|e| format!("CPU oracle: {e}"))?
         .output

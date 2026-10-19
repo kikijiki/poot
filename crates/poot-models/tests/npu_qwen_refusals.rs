@@ -7,14 +7,12 @@
 //! `poot-npu`'s `vpu_qwen` rows. The caps are SYNTHETIC (an NPU4 with a made-up compiler version): the table
 //! depends on the target's arithmetic width, not on a measurement.
 
-use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
-
-use poot_graph_plan::production_plan::Submission;
 use poot_graph_plan::{Target, vpu_refusals};
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::model::{StepShape, StepSpec};
 use poot_models::test_support::dense::{Dense, Family};
 use poot_target::{NarrowingContract, Queried, VendorCompilerId, VpuCaps, VpuTargetId};
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 
 const HIDDEN: usize = 896;
 const INTER: usize = 4864;
@@ -53,19 +51,15 @@ fn traced_block() -> poot_graph_ir::Graph {
         .head_dim(HEAD_DIM)
         .max_positions(64);
     let model = dense.f32_model();
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(TOKENS).unwrap(),
-        capacity: NonZeroUsize::new(TOKENS).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    };
+    let shape = StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(TOKENS).unwrap(),
+        NonZeroUsize::new(TOKENS).unwrap(),
+    );
     model
         .model
         .trace(
-            Phase::Prefill,
-            shape,
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -227,7 +221,7 @@ fn compile_outcome(graph: poot_graph_ir::Graph, target: Target) -> String {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     ) {
         Ok(_) => "compiled".to_string(),
         Err(error) => format!("{error:?}"),

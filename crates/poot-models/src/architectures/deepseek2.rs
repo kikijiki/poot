@@ -38,11 +38,12 @@ use crate::components::rope::RopeParams;
 use crate::components::router::{RouterBias, RouterKind, SigmoidTopK};
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    decoder_program, standard_layer, standard_stack,
 };
+use crate::io::ModelSchema;
 use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, ParamBlock, Phase,
-    StepShape, TraceError, WiringError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ParamBlock, StepSpec, TraceError,
+    WiringError,
 };
 use crate::names::{
     ExpertNames, MoeLayers, MoeNames, NameRow, Presence, SharedNames, Source, family_weights_routed,
@@ -846,6 +847,7 @@ pub(crate) struct Deepseek {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
     family: FamilyKey,
 }
 
@@ -919,6 +921,9 @@ pub(crate) fn build_family(
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(kind.family)?;
     let config = ModelConfig {
         family: kind.family,
         vocab: p.vocab,
@@ -926,7 +931,6 @@ pub(crate) fn build_family(
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -936,6 +940,7 @@ pub(crate) fn build_family(
         stack,
         layers,
         config,
+        schema,
         family: kind.family,
     }))
 }
@@ -945,13 +950,18 @@ impl Model for Deepseek {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(self.family, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(self.family, shape, p.max_positions)?;
         moe::check_step(self.family, shape, &p.moe)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
@@ -1177,8 +1187,7 @@ pub(crate) mod family_tests {
             let model = build(entry, &raw, &store);
             let g = model
                 .trace(
-                    Phase::Prefill,
-                    step_shape(prompt.len(), CAP, LogitRows::All),
+                    &StepSpec::step(step_shape(prompt.len(), CAP, LogitRows::All)),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
@@ -1227,28 +1236,12 @@ pub(crate) mod family_tests {
 
             let reference_store = decoded(&store);
             let reference = build(entry, &raw, &reference_store);
-            let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-            let (want, want_state) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Prefill,
-                CAP,
-                &prompt,
-                0,
-                &[],
-            );
+            let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+            let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
             close(&got, &want);
             close_all(&state, &want_state);
-            let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-            let (want, _) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Decode,
-                CAP,
-                &[5],
-                4,
-                &want_state,
-            );
+            let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+            let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
             close(&got, &want);
         }
     }
@@ -1489,28 +1482,12 @@ pub(crate) mod family_tests {
         let reference_store = decoded(&fixture.store);
         let reference = build(entry, &fixture.raw(), &reference_store);
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &gguf_store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, &gguf_store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
-        let (got, _) = run_step(&*model, &gguf_store, Phase::Decode, CAP, &[5], 4, &state);
-        let (want, _) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Decode,
-            CAP,
-            &[5],
-            4,
-            &want_state,
-        );
+        let (got, _) = run_step(&*model, &gguf_store, CAP, &[5], 4, &state);
+        let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }
 
@@ -1627,16 +1604,7 @@ pub(crate) mod family_tests {
                 },
                 &fixture.store,
             );
-            run_step(
-                &*model,
-                &fixture.store,
-                Phase::Prefill,
-                CAP,
-                &[3, 17, 40],
-                0,
-                &[],
-            )
-            .0
+            run_step(&*model, &fixture.store, CAP, &[3, 17, 40], 0, &[]).0
         };
         assert_ne!(run(1.0), run(3.0));
     }

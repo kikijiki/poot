@@ -6,9 +6,7 @@ use poot_llm::driver::error::FailureClass;
 use poot_llm::{Sampler, TokenLogprob};
 
 use crate::metrics::Metrics;
-use crate::types::{
-    ChoiceReply, Completion, FinishReason, GenEvent, Job, PerTokenInfo, PromptInput,
-};
+use crate::types::{ChoiceReply, Completion, FinishReason, GenEvent, Job, PerTokenInfo};
 use poot_llm::driver::stops::StopScanner;
 
 /// A request that holds an engine sequence: its committed tokens, its sampler and the channel back to
@@ -38,8 +36,7 @@ pub(crate) struct Slot<S> {
 impl<S> Slot<S> {
     /// Open `job` as `seq`, whose first `reused` prompt tokens are already resident.
     pub(crate) fn new(seq: S, job: Job, reused: usize, max_new: usize) -> Self {
-        let (PromptInput::Tokens(prompt) | PromptInput::Multimodal { tokens: prompt, .. }) =
-            job.prompt;
+        let prompt = job.prompt.tokens;
         Self {
             seq,
             prompt_len: prompt.len(),

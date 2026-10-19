@@ -3,11 +3,11 @@
 use poot_tensor::DType;
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{
     BinOp, Builder, Graph, OpKind, Scalar, StateRole, TensorType, UnOp, ValueId, ValueTable,
 };
-use poot_graph_plan::{CompileOptions, Target, canonicalize, compile, production_plan::Submission};
+use poot_graph_plan::{CompileOptions, Target, canonicalize, compile};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::HostTensor;
 
@@ -15,8 +15,7 @@ use poot_tensor::HostTensor;
 /// back, inlined at each call site below rather than kept behind a renamed `eval_all` shim - the
 /// deleted convenience's call shape (`env[value_id]` as `&Tensor`), rebuilt from
 /// `eval(..).environment` plus `Value::into_dense`.
-const OPTIONS: CompileOptions =
-    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+const OPTIONS: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
 
 fn target(backend: Backend) -> Target {
     Target::Gpu {
@@ -36,21 +35,18 @@ fn assert_observables(graph: &Graph, transformed: &Graph, inputs: &HashMap<Value
         .iter()
         .map(|(&k, v)| (k, Value::from(v.clone())))
         .collect();
-    let before: ValueTable<Option<HostTensor>> = eval(
-        graph,
-        &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .expect("primitive oracle")
-    .environment
-    .unwrap()
-    .into_iter()
-    .map(|v| v.map(|v| v.into_host().unwrap()))
-    .collect();
+    let before: ValueTable<Option<HostTensor>> =
+        eval(graph, &values, EvalOptions::default().keep_environment())
+            .expect("primitive oracle")
+            .environment
+            .unwrap()
+            .into_iter()
+            .map(|v| v.map(|v| v.into_host().unwrap()))
+            .collect();
     let after: ValueTable<Option<HostTensor>> = eval(
         transformed,
         &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+        EvalOptions::default().keep_environment(),
     )
     .expect("transformed oracle")
     .environment
@@ -138,21 +134,18 @@ fn finite_scaled_contraction_survives_compile() {
         .iter()
         .map(|(&k, v)| (k, Value::from(v.clone())))
         .collect();
-    let original: ValueTable<Option<HostTensor>> = eval(
-        &graph,
-        &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .unwrap()
-    .environment
-    .unwrap()
-    .into_iter()
-    .map(|v| v.map(|v| v.into_host().unwrap()))
-    .collect();
+    let original: ValueTable<Option<HostTensor>> =
+        eval(&graph, &values, EvalOptions::default().keep_environment())
+            .unwrap()
+            .environment
+            .unwrap()
+            .into_iter()
+            .map(|v| v.map(|v| v.into_host().unwrap()))
+            .collect();
     let compiled: ValueTable<Option<HostTensor>> = eval(
         program.graph(),
         &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+        EvalOptions::default().keep_environment(),
     )
     .unwrap()
     .environment
@@ -247,17 +240,14 @@ fn reciprocal_rounding_is_not_division() {
         .iter()
         .map(|(&k, v)| (k, Value::from(v.clone())))
         .collect();
-    let before: ValueTable<Option<HostTensor>> = eval(
-        &graph,
-        &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .unwrap()
-    .environment
-    .unwrap()
-    .into_iter()
-    .map(|v| v.map(|v| v.into_host().unwrap()))
-    .collect();
+    let before: ValueTable<Option<HostTensor>> =
+        eval(&graph, &values, EvalOptions::default().keep_environment())
+            .unwrap()
+            .environment
+            .unwrap()
+            .into_iter()
+            .map(|v| v.map(|v| v.into_host().unwrap()))
+            .collect();
     assert_ne!(
         before[output.id()].as_ref().unwrap().as_f32().unwrap()[0].to_bits(),
         (3.0f32 / 7.0).to_bits(),
@@ -315,7 +305,7 @@ fn narrow_contraction_rounds_before_fused_epilogue() {
         let compiled: ValueTable<Option<HostTensor>> = eval(
             program.graph(),
             &values,
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+            EvalOptions::default().keep_environment(),
         )
         .unwrap()
         .environment
@@ -377,7 +367,7 @@ fn explicit_narrow_casts_remain_between_contraction_and_epilogue() {
         let result: ValueTable<Option<HostTensor>> = eval(
             program.graph(),
             &values,
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+            EvalOptions::default().keep_environment(),
         )
         .unwrap()
         .environment
@@ -422,7 +412,7 @@ fn nonfinite_inputs_keep_ieee_classification() {
             let env: ValueTable<Option<HostTensor>> = eval(
                 candidate,
                 &values,
-                EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+                EvalOptions::default().keep_environment(),
             )
             .unwrap()
             .environment
@@ -672,21 +662,18 @@ fn underflow_before_contraction(scale_rhs: bool) {
         .iter()
         .map(|(&k, v)| (k, Value::from(v.clone())))
         .collect();
-    let before: ValueTable<Option<HostTensor>> = eval(
-        &graph,
-        &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .unwrap()
-    .environment
-    .unwrap()
-    .into_iter()
-    .map(|v| v.map(|v| v.into_host().unwrap()))
-    .collect();
+    let before: ValueTable<Option<HostTensor>> =
+        eval(&graph, &values, EvalOptions::default().keep_environment())
+            .unwrap()
+            .environment
+            .unwrap()
+            .into_iter()
+            .map(|v| v.map(|v| v.into_host().unwrap()))
+            .collect();
     let after: ValueTable<Option<HostTensor>> = eval(
         program.graph(),
         &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+        EvalOptions::default().keep_environment(),
     )
     .unwrap()
     .environment

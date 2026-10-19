@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use poot_executor::{AieInvocation, Arg, Device, DeviceTime, Dispatch, LaunchKind};
 use poot_graph_plan::Target;
-use poot_graph_plan::production_plan::Submission;
 use poot_runtime_common::{
     AieLinkedArtifact, AllocGuard, ArgAccess, BufferRole, CompiledKernel, KernelCode,
     MemoryCounterSnapshot, MemoryCounters,
@@ -566,7 +565,7 @@ impl Device for XdnaDevice {
         self.load_artifact(key, kernel.entry_point(), artifact)
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), XdnaError> {
+    fn begin(&mut self) -> Result<(), XdnaError> {
         self.healthy()?;
         if self.open.is_some() {
             return Err(XdnaError::AlreadyRecording);

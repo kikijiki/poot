@@ -4,7 +4,7 @@
     dead_code,
     reason = "shared by two test binaries (plan_summary, feature_matrix); each uses part of it"
 )]
-use poot_graph_plan::{CompileLimits, CompileOptions, Target, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target};
 use poot_target::{AmdArch, Backend};
 
 /// One planner target with the name its matrix column and its plan-summary file carry.
@@ -39,5 +39,5 @@ pub(crate) fn reference_targets() -> Vec<RefTarget> {
 
 /// The compile options every reference compile uses: replayed submission under the standard limits.
 pub(crate) fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }

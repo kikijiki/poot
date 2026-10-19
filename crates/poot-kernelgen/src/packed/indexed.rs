@@ -377,6 +377,9 @@ mod tests {
                     x_groups,
                 )
             }
+            Schedule::RegisterTiled { .. } => {
+                panic!("an indexed contraction is never RegisterTiled")
+            }
         };
         let mut buffers = vec![Buffer::from_f32s(x), Buffer::from_i32s(ids)];
         buffers.extend(case.sources.iter().map(|words| Buffer::from_u32s(words)));

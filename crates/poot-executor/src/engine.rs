@@ -27,9 +27,8 @@ use poot_graph_ir::{
 use poot_graph_plan::multi_device::PlanNodeId;
 use poot_graph_plan::{
     Plan, PoolSite, Program, Region, Sink, Source, Target, dispatch_work,
-    multi_device::topology::DeviceId, production_plan::Submission, staged::Link, staged::StageId,
-    staged::StagedProgram, staged::SyncPoint, staged::TargetSet, staged::Transfer,
-    validate_linked_artifact, value_ids,
+    multi_device::topology::DeviceId, staged::Link, staged::StageId, staged::StagedProgram,
+    staged::SyncPoint, staged::TargetSet, staged::Transfer, validate_linked_artifact, value_ids,
 };
 use poot_kernel_ir::Body;
 use poot_quant::SourceRole;
@@ -2160,14 +2159,13 @@ impl<D: Device> Engine<D> {
         exe: ExecutableId,
         entry_idx: usize,
         stage_idx: usize,
-        submission: Submission,
         walk_recording: bool,
         seams: &mut dyn StageSeams<D>,
     ) -> Result<Option<D::Recording>, ExecError> {
         self.check_not_poisoned()?;
         let target = self.target_id();
         let error = device_error(target);
-        if let Err(e) = self.device.begin(submission) {
+        if let Err(e) = self.device.begin() {
             self.abort_after_failure(exe, false);
             return Err(error(e));
         }
@@ -2263,7 +2261,6 @@ impl<D: Device> Engine<D> {
                     exe,
                     entry.index(),
                     stage_idx,
-                    Submission::Replay,
                     false,
                     &mut NoSeams,
                 )?);
@@ -2727,17 +2724,6 @@ impl<D: Device> Engine<D> {
         part: &EntryPart<'_>,
     ) -> Result<EntryId, ExecError> {
         self.check_not_poisoned()?;
-        // The contract admits Submission::Replay only. Refused here, before load_entry's first
-        // allocation - Submission::Eager survives as an enum and on the pre-contract executors
-        // (the bench prefill arm, PTX/ROCm/VLM/speculative), never here.
-        for &(_, stage_program) in &part.stages {
-            if stage_program.submission() != Submission::Replay {
-                return Err(LoadError::Unimplemented(
-                    "Submission::Eager (the contract admits Submission::Replay only)",
-                )
-                .into());
-            }
-        }
         // ADR-0103 amendment, boundary 2: no page of a changed (possibly truncated) checkpoint file is
         // read, and nothing is allocated, once the store's mapped files no longer match what was loaded.
         self.loaded(exe)?.binder.check_sources()?;
@@ -2835,14 +2821,7 @@ impl<D: Device> Engine<D> {
         stage_idx: usize,
         seams: &mut dyn StageSeams<D>,
     ) -> Result<D::Recording, ExecError> {
-        let recording = self.run_transaction(
-            exe,
-            entry.index(),
-            stage_idx,
-            Submission::Replay,
-            false,
-            seams,
-        )?;
+        let recording = self.run_transaction(exe, entry.index(), stage_idx, false, seams)?;
         Ok(recording.expect("every device finishes a recording"))
     }
 
@@ -3328,7 +3307,7 @@ mod kernel_identity_tests {
         ) -> Result<String, std::convert::Infallible> {
             Ok(key.to_string())
         }
-        fn begin(&mut self, _submission: Submission) -> Result<(), std::convert::Infallible> {
+        fn begin(&mut self) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
         fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), std::convert::Infallible> {
@@ -3568,7 +3547,7 @@ mod arena_slot_alloc_tests {
         ) -> Result<String, std::convert::Infallible> {
             Ok(key.to_string())
         }
-        fn begin(&mut self, _submission: Submission) -> Result<(), std::convert::Infallible> {
+        fn begin(&mut self) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
         fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), std::convert::Infallible> {
@@ -3698,7 +3677,7 @@ mod f16_packed_weight_upload_tests {
         ) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn begin(&mut self, _submission: Submission) -> Result<(), std::convert::Infallible> {
+        fn begin(&mut self) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
         fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), std::convert::Infallible> {
@@ -3819,7 +3798,7 @@ mod f16_packed_weight_upload_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the projection compiles");
         let exe = engine.load_weights(store, Arc::new(weights))?;
@@ -4152,7 +4131,7 @@ mod weight_source_tests {
         ) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn begin(&mut self, _submission: Submission) -> Result<(), std::convert::Infallible> {
+        fn begin(&mut self) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
         fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), std::convert::Infallible> {
@@ -4248,7 +4227,7 @@ mod weight_source_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the fixture compiles")
     }
@@ -4681,7 +4660,7 @@ mod weight_source_tests {
                     experts: ExpertPlacement::AllResident,
                     devices: DevicePlacement::Single(DeviceId(0)),
                 },
-                &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+                &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
             )
         };
         compiled(&graph(Some(IndexRange::below(4).unwrap())))
@@ -5314,7 +5293,7 @@ mod weight_source_tests {
                 },
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the routed fixture pools")
     }
@@ -5674,7 +5653,7 @@ mod weight_source_tests {
         ) -> Result<(), WriteFault> {
             Ok(())
         }
-        fn begin(&mut self, _submission: Submission) -> Result<(), WriteFault> {
+        fn begin(&mut self) -> Result<(), WriteFault> {
             Ok(())
         }
         fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), WriteFault> {
@@ -5771,10 +5750,7 @@ mod weight_source_tests {
                         },
                         devices: DevicePlacement::Single(DeviceId(0)),
                     },
-                    &CompileOptions::new(
-                        Submission::Replay,
-                        poot_graph_plan::CompileLimits::STANDARD,
-                    ),
+                    &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
                 )
                 .expect("the routed fixture pools")
             };
@@ -5917,7 +5893,7 @@ mod weight_source_tests {
         ) -> Result<(), Fault> {
             Ok(())
         }
-        fn begin(&mut self, _submission: Submission) -> Result<(), Fault> {
+        fn begin(&mut self) -> Result<(), Fault> {
             Ok(())
         }
         fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), Fault> {
@@ -5979,7 +5955,7 @@ mod weight_source_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the fixture compiles")
     }
@@ -6381,7 +6357,7 @@ mod aie_engine_tests {
             ));
             Ok(self.seen.loaded.len() - 1)
         }
-        fn begin(&mut self, _submission: Submission) -> Result<(), Self::Error> {
+        fn begin(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
         fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
@@ -6491,7 +6467,7 @@ mod aie_engine_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the add compiles for an AIE target");
         let exe = engine.load_weights(store, Arc::new(weights))?;
@@ -6740,7 +6716,7 @@ mod vpu_engine_tests {
             ));
             Ok(self.seen.loaded.len() - 1)
         }
-        fn begin(&mut self, _submission: Submission) -> Result<(), Self::Error> {
+        fn begin(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
         fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
@@ -6825,7 +6801,7 @@ mod vpu_engine_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .expect("the graph compiles for an Intel NPU target");
         let exe = engine.load_weights(store, Arc::new(weights))?;

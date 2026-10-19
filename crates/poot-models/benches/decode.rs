@@ -14,9 +14,9 @@
 use std::collections::HashMap;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use poot_eval::{EvalBudget, EvalOptions, Value};
+use poot_eval::{EvalOptions, Value};
 use poot_graph_ir::{Graph, Slot, Storage, ValueId};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::HostTensor;
@@ -35,11 +35,10 @@ fn model() -> MappedModel {
 }
 
 /// `m`'s step graph: one sequence of `tokens` new tokens over `cap` positions.
-fn trace(m: &MappedModel, phase: Phase, tokens: usize, cap: usize) -> poot_graph_ir::Graph {
+fn trace(m: &MappedModel, tokens: usize, cap: usize) -> poot_graph_ir::Graph {
     m.model
         .trace(
-            phase,
-            step(1, tokens, cap, LogitRows::Last),
+            &StepSpec::step(step(1, tokens, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -125,16 +124,9 @@ fn model_big() -> MappedModel {
 fn prefill_benches(c: &mut Criterion) {
     let model_b = model_big();
     c.bench_function("trace_prefill", |b| {
-        b.iter(|| {
-            trace(
-                black_box(&model_b),
-                Phase::Prefill,
-                black_box(64),
-                black_box(64),
-            )
-        })
+        b.iter(|| trace(black_box(&model_b), black_box(64), black_box(64)))
     });
-    let gb = trace(&model_b, Phase::Prefill, 64, 64);
+    let gb = trace(&model_b, 64, 64);
     c.bench_function("prefill_cse+fuse", |b| {
         b.iter(|| transform::fuse(&transform::cse(black_box(&gb)).unwrap()).unwrap())
     });
@@ -143,43 +135,35 @@ fn prefill_benches(c: &mut Criterion) {
     // prefill analogue of `eval_decode_step` / `_fused`.
     let model = model();
     for n in [16usize, 64usize] {
-        let g = trace(&model, Phase::Prefill, n, n);
+        let g = trace(&model, n, n);
         let inputs = bind(&g);
         let gf = transform::fuse(&transform::cse(&g).unwrap()).unwrap();
         c.bench_function(&format!("eval_prefill_{n}"), |b| {
             b.iter(|| {
-                poot_eval::eval(
-                    black_box(&g),
-                    black_box(&inputs),
-                    EvalOptions::new(EvalBudget::UNBOUNDED),
-                )
-                .and_then(|evaluation| {
-                    let state = evaluation
-                        .state
-                        .into_iter()
-                        .map(Value::into_host)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok((evaluation.output.into_host()?, state))
-                })
-                .unwrap()
+                poot_eval::eval(black_box(&g), black_box(&inputs), EvalOptions::default())
+                    .and_then(|evaluation| {
+                        let state = evaluation
+                            .state
+                            .into_iter()
+                            .map(Value::into_host)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok((evaluation.output.into_host()?, state))
+                    })
+                    .unwrap()
             })
         });
         c.bench_function(&format!("eval_prefill_{n}_fused"), |b| {
             b.iter(|| {
-                poot_eval::eval(
-                    black_box(&gf),
-                    black_box(&inputs),
-                    EvalOptions::new(EvalBudget::UNBOUNDED),
-                )
-                .and_then(|evaluation| {
-                    let state = evaluation
-                        .state
-                        .into_iter()
-                        .map(Value::into_host)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok((evaluation.output.into_host()?, state))
-                })
-                .unwrap()
+                poot_eval::eval(black_box(&gf), black_box(&inputs), EvalOptions::default())
+                    .and_then(|evaluation| {
+                        let state = evaluation
+                            .state
+                            .into_iter()
+                            .map(Value::into_host)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok((evaluation.output.into_host()?, state))
+                    })
+                    .unwrap()
             })
         });
     }
@@ -190,10 +174,10 @@ fn decode_benches(c: &mut Criterion) {
     let cap = 16;
 
     c.bench_function("trace_decode_masked", |b| {
-        b.iter(|| trace(black_box(&model), Phase::Decode, 1, black_box(cap)))
+        b.iter(|| trace(black_box(&model), 1, black_box(cap)))
     });
 
-    let g = trace(&model, Phase::Decode, 1, cap);
+    let g = trace(&model, 1, cap);
     c.bench_function("cse+fuse", |b| {
         b.iter(|| transform::fuse(&transform::cse(black_box(&g)).unwrap()).unwrap())
     });
@@ -204,64 +188,52 @@ fn decode_benches(c: &mut Criterion) {
     let inputs = bind(&g);
     c.bench_function("eval_decode_step", |b| {
         b.iter(|| {
-            poot_eval::eval(
-                black_box(&g),
-                black_box(&inputs),
-                EvalOptions::new(EvalBudget::UNBOUNDED),
-            )
-            .and_then(|evaluation| {
-                let state = evaluation
-                    .state
-                    .into_iter()
-                    .map(Value::into_host)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((evaluation.output.into_host()?, state))
-            })
-            .unwrap()
+            poot_eval::eval(black_box(&g), black_box(&inputs), EvalOptions::default())
+                .and_then(|evaluation| {
+                    let state = evaluation
+                        .state
+                        .into_iter()
+                        .map(Value::into_host)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((evaluation.output.into_host()?, state))
+                })
+                .unwrap()
         })
     });
     let gf = transform::fuse(&transform::cse(&g).unwrap()).unwrap();
     c.bench_function("eval_decode_step_fused", |b| {
         b.iter(|| {
-            poot_eval::eval(
-                black_box(&gf),
-                black_box(&inputs),
-                EvalOptions::new(EvalBudget::UNBOUNDED),
-            )
-            .and_then(|evaluation| {
-                let state = evaluation
-                    .state
-                    .into_iter()
-                    .map(Value::into_host)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((evaluation.output.into_host()?, state))
-            })
-            .unwrap()
+            poot_eval::eval(black_box(&gf), black_box(&inputs), EvalOptions::default())
+                .and_then(|evaluation| {
+                    let state = evaluation
+                        .state
+                        .into_iter()
+                        .map(Value::into_host)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((evaluation.output.into_host()?, state))
+                })
+                .unwrap()
         })
     });
 
     // Same pair at the larger config.
     let model_b = model_big();
     let cap_b = 64;
-    let gb = trace(&model_b, Phase::Decode, 1, cap_b);
+    let gb = trace(&model_b, 1, cap_b);
     let inputs_b = bind(&gb);
     let gbf = transform::fuse(&transform::cse(&gb).unwrap()).unwrap();
     c.bench_function("eval_decode_step_big", |b| {
         b.iter(|| {
-            poot_eval::eval(
-                black_box(&gb),
-                black_box(&inputs_b),
-                EvalOptions::new(EvalBudget::UNBOUNDED),
-            )
-            .and_then(|evaluation| {
-                let state = evaluation
-                    .state
-                    .into_iter()
-                    .map(Value::into_host)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((evaluation.output.into_host()?, state))
-            })
-            .unwrap()
+            poot_eval::eval(black_box(&gb), black_box(&inputs_b), EvalOptions::default())
+                .and_then(|evaluation| {
+                    let state = evaluation
+                        .state
+                        .into_iter()
+                        .map(Value::into_host)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((evaluation.output.into_host()?, state))
+                })
+                .unwrap()
         })
     });
     c.bench_function("eval_decode_step_big_fused", |b| {
@@ -269,7 +241,7 @@ fn decode_benches(c: &mut Criterion) {
             poot_eval::eval(
                 black_box(&gbf),
                 black_box(&inputs_b),
-                EvalOptions::new(EvalBudget::UNBOUNDED),
+                EvalOptions::default(),
             )
             .and_then(|evaluation| {
                 let state = evaluation

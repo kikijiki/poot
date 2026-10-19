@@ -792,7 +792,7 @@ mod layout_tests {
 
     use super::*;
     use crate::components::standard::oracle::{self, Fx};
-    use crate::model::{ConfigReason, KvLayout, LogitRows};
+    use crate::model::{ConfigReason, LogitRows};
 
     const FAMILY: FamilyKey = FamilyKey::new("moe-test");
     const WIDTH: usize = 6;
@@ -938,14 +938,12 @@ mod layout_tests {
         let b = Builder::for_tests();
         let step = Step::new(
             &b,
-            StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::new(TOKENS).unwrap(),
-                capacity: NonZeroUsize::new(8).unwrap(),
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::All,
-                hidden: None,
-            },
+            StepShape::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::new(TOKENS).unwrap(),
+                NonZeroUsize::new(8).unwrap(),
+            )
+            .with_logits(LogitRows::All),
         )
         .unwrap();
         let xs = b

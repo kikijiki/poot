@@ -22,9 +22,9 @@ use poot_executor::{
 use poot_graph_ir::{BinOp, BoundaryId, Builder, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement, staged::Link,
-    staged::Partition, staged::StageId, staged::StagedParts, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Link, staged::Partition,
+    staged::StageId, staged::StagedParts, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
@@ -146,7 +146,7 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), Injected> {
+    fn begin(&mut self) -> Result<(), Injected> {
         self.begins += 1;
         self.dispatched = 0;
         self.control.log.borrow_mut().push(Event::Begin);
@@ -312,7 +312,7 @@ fn compile(g: &poot_graph_ir::Graph, device: DeviceId, devices: DevicePlacement)
             experts: ExpertPlacement::AllResident,
             devices,
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the layered fixture compiles for the fake target")
 }
@@ -733,7 +733,7 @@ fn two_stages_declaring_one_slot_differently_conflict() {
         let out = b.binary(BinOp::Add, x, x).unwrap();
         b.finish(out).unwrap()
     };
-    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD);
     let mut parts = single(&g).into_parts();
     parts.stages.push((
         StageId(1),
@@ -770,7 +770,7 @@ fn an_export_viewing_carried_state_is_refused_at_load() {
                 .with_export(BoundaryId(view.id()), view),
         )
         .unwrap();
-    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD);
     let program = poot_graph_plan::compile(&graph, &target(), &options).unwrap();
     let error = load_refusal(
         StagedParts {

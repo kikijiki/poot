@@ -7,11 +7,11 @@
 //! poot-eval must never depend on poot-graph-plan (its own architecture test); this crate already
 //! dev-depends on poot-eval, so an integration test here can drive both.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::{Graph, Slot, Storage};
 use poot_graph_plan::{cse, dce, flash_attention_capped};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::registry::Registry;
 use poot_models::test_support::dense::step;
 use poot_quant::StoredBytes;
@@ -57,8 +57,8 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
 }
 
 /// The MPT registry fixture (ALiBi lives in the MPT and BLOOM families) over an F32 copy of its
-/// checkpoint, traced for `phase` with `tokens` new tokens over `cap` positions.
-fn mpt_graph(phase: Phase, tokens: usize, cap: usize) -> Graph {
+/// checkpoint, traced as one step of `tokens` new tokens over `cap` positions.
+fn mpt_graph(tokens: usize, cap: usize) -> Graph {
     let registry = Registry::builtin().unwrap();
     let entry = registry
         .entries()
@@ -88,8 +88,7 @@ fn mpt_graph(phase: Phase, tokens: usize, cap: usize) -> Graph {
         .expect("the mpt fixture builds");
     model
         .trace(
-            phase,
-            step(1, tokens, cap, LogitRows::Last),
+            &StepSpec::step(step(1, tokens, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -165,15 +164,11 @@ fn logits(g: &Graph, first_pos: i32, slopes: Option<&[f32]>) -> HostTensor {
     } else {
         g.clone()
     };
-    eval(
-        g,
-        &bind(g, first_pos, slopes),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .expect("the graph evaluates")
-    .output
-    .into_host()
-    .expect("a dense output")
+    eval(g, &bind(g, first_pos, slopes), EvalOptions::default())
+        .expect("the graph evaluates")
+        .output
+        .into_host()
+        .expect("a dense output")
 }
 
 fn count(g: &Graph, is: fn(&OpKind) -> bool) -> usize {
@@ -183,8 +178,8 @@ fn count(g: &Graph, is: fn(&OpKind) -> bool) -> usize {
 #[test]
 fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
     let (pos, cap) = (3usize, 8usize);
-    let g = mpt_graph(Phase::Decode, 1, cap);
-    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
+    let g = mpt_graph(1, cap);
+    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap();
     let n_flash = count(&fused, |op| matches!(op, OpKind::Attention(_)));
     assert_eq!(
         n_flash, LAYERS,
@@ -199,13 +194,8 @@ fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
 
     // The slopes must reach the fused op: zero slopes change the logits.
     let out_zero = logits(&fused, pos as i32, Some(&[0.0; HEADS]));
-    let max_diff = out_fused
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(out_zero.as_f32().unwrap())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let max_diff =
+        poot_test_util::max_abs_error(out_fused.as_f32().unwrap(), out_zero.as_f32().unwrap());
     assert!(
         max_diff > 1e-4,
         "the ALiBi slopes must change the flash-fused decode logits; max_diff={max_diff:.2e}"
@@ -221,8 +211,8 @@ fn alibi_decode_chain_fuses_to_flash_without_changing_logits() {
 #[test]
 fn alibi_prefill_chain_fuses_to_flash_without_changing_logits() {
     let l = 5usize;
-    let g = mpt_graph(Phase::Prefill, l, l);
-    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap()).unwrap();
+    let g = mpt_graph(l, l);
+    let fused = dce(&flash_attention_capped(&cse(&g).unwrap(), None).unwrap().0).unwrap();
     let n_flash = count(&fused, |op| matches!(op, OpKind::Attention(_)));
     assert_eq!(
         n_flash, LAYERS,
@@ -234,13 +224,8 @@ fn alibi_prefill_chain_fuses_to_flash_without_changing_logits() {
 
     // The slopes must reach the fused op: zero slopes change the logits.
     let out_zero = logits(&fused, 0, Some(&[0.0; HEADS]));
-    let max_diff = out_fused
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(out_zero.as_f32().unwrap())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let max_diff =
+        poot_test_util::max_abs_error(out_fused.as_f32().unwrap(), out_zero.as_f32().unwrap());
     assert!(
         max_diff > 1e-4,
         "the ALiBi slopes must change the flash-fused logits; max_diff={max_diff:.2e}"

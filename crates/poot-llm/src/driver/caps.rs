@@ -11,19 +11,25 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::op::SampleRule;
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::io::{InputId, InputSet, RequestInputs};
+use poot_models::model::{KvLayout, LogitRows, StepShape};
 
+use super::bind::{self, RowFeed};
 use super::block_table::BLOCK_SIZE;
 use super::chunks::Piece;
 use super::encode::{EncodeCaps, EncodeShapes};
-use super::error::{DriverError, InvalidOptions, InvalidRequest};
+use super::error::{DriverError, InvalidOptions};
 use poot_load::lora::LoraAdapter;
 
 use super::lora::{AdapterSet, AdapterStack, GenerationId};
+use super::sequences::Serving;
 use super::speculate::SpeculationCaps;
-use super::step::{Serving, serving_phase};
+use super::step::{Lane, RowPlan};
 use super::suffix::Head;
-use super::{Driver, EntryKey, ModelRole, Warm};
+use super::{Driver, EntryKey, Feature, FeatureSet, ModelRole, Program, State, Unprepared, Warm};
+
+/// The most carriable inputs one deployment prepares combinations of.
+const MAX_CARRIED_INPUTS: usize = 4;
 
 /// The paged pool a driver serves from: sized once, because state avals pin one pool per driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,9 +81,10 @@ pub struct ServingShapes<'a> {
 
 /// Whether a model's carried state is only positional KV (a rejected token's write is harmless) or
 /// folds every token into a value the driver cannot roll back.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StateResidency {
     /// Carried state is positional KV only: a rejected token's write is overwritten and harmless.
+    #[default]
     KvOnly,
     /// Some carried state folds every token into one value, so a rejected token must be rolled back
     /// by a snapshot.
@@ -103,15 +110,14 @@ pub struct WindowCap {
     pub width: NonZeroUsize,
 }
 
-/// Which inputs a driver accepts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputSet {
-    /// Token prompts: always.
-    pub tokens: bool,
-    /// Prompts with embedding rows in place of some tokens' ([`Driver::open_with_embeds`]): a
-    /// `PrefillEmbeds` entry is prepared.
-    pub embeds: bool,
-    /// [`Driver::encode`]: an `Encode` entry is prepared.
+/// Which inputs a driver accepts beyond a token prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputCaps {
+    /// The carriable request inputs (a sparse or per-row input the model declares) the target's `step`
+    /// entries bind: a request carrying one of them is served only if it is listed
+    /// ([`Driver::prepare_carried`]).
+    pub carried: Vec<InputId>,
+    /// [`Driver::encode`]: an `encode` entry is prepared.
     pub encode: bool,
 }
 
@@ -149,34 +155,100 @@ pub struct DriverCaps {
     pub windows: Vec<WindowCap>,
     /// The speculation the driver's draft policy serves; `None` under `DraftPolicy::Off`.
     pub speculation: Option<SpeculationCaps>,
-    /// Which input kinds the driver accepts.
-    pub inputs: InputSet,
+    /// Which inputs the driver accepts beyond a token prompt.
+    pub inputs: InputCaps,
     /// The token-row shapes [`Driver::prepare_encode`] admitted; `None` when none were.
     pub encode: Option<EncodeCaps>,
 }
 
-impl Driver {
-    /// Admit `shapes`: compile every entry of its product that is not prepared yet, then publish the
-    /// caps. Everything checkable is validated before anything compiles, and the layout and the paged
-    /// pool are published last, so a refused call leaves the driver as it was except for the entries
-    /// that compiled before the refusal, which stay prepared (an entry over the retention limits is a
-    /// typed refusal; in-flight work on retained entries is untouched).
-    pub fn prepare(&mut self, shapes: &ServingShapes<'_>) -> Result<&DriverCaps, DriverError> {
+impl Driver<Unprepared> {
+    /// A driver serving `layout`, with nothing prepared: [`Driver::generate`] prepares the entries its
+    /// request needs, and [`Driver::extend`] admits more. The layout is the driver's for life.
+    #[must_use]
+    pub fn serve(self, layout: Layout) -> Driver<Serving> {
+        let state = Serving::new(layout);
+        Driver {
+            handle: self.handle,
+            runtime: self.runtime,
+            settings: self.settings,
+            ledger: self.ledger,
+            speculation: self.speculation,
+            lora: self.lora,
+            stats: self.stats,
+            state,
+        }
+    }
+
+    /// Admit `shapes`: compile every entry of its product, then publish the caps and return the
+    /// driver that serves them. Everything checkable is validated before anything compiles. A refused
+    /// call gives the driver back with the refusal: the entries that compiled before it stay prepared
+    /// (an entry over the retention limits is a typed refusal), and nothing is published.
+    pub fn prepare(
+        self,
+        shapes: &ServingShapes<'_>,
+    ) -> Result<Driver<Serving>, Box<PrepareRefused>> {
+        let mut serving = self.serve(shapes.layout);
+        match serving.extend(shapes) {
+            Ok(_) => Ok(serving),
+            Err(error) => Err(Box::new(PrepareRefused {
+                driver: serving.unserve(),
+                error,
+            })),
+        }
+    }
+}
+
+/// A [`Driver::prepare`] the driver refused, with the driver it left behind.
+pub struct PrepareRefused {
+    /// The driver, still unprepared: entries compiled before the refusal stay prepared.
+    pub driver: Driver<Unprepared>,
+    /// Why the shapes were refused.
+    pub error: DriverError,
+}
+
+impl std::fmt::Debug for PrepareRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrepareRefused")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for PrepareRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for PrepareRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<Box<PrepareRefused>> for DriverError {
+    fn from(refused: Box<PrepareRefused>) -> Self {
+        refused.error
+    }
+}
+
+impl Driver<Serving> {
+    /// Admit `shapes` beside what is prepared: compile every entry of its product that is not prepared
+    /// yet, then publish the caps. `shapes` must name the layout the driver serves. Everything
+    /// checkable is validated before anything compiles; a refused call leaves the entries that
+    /// compiled before the refusal prepared (an entry over the retention limits is a typed refusal;
+    /// in-flight work on retained entries is untouched).
+    pub fn extend(&mut self, shapes: &ServingShapes<'_>) -> Result<&DriverCaps, DriverError> {
         if let Some(width) = shapes.windows.iter().find(|width| width.get() < 2) {
             return Err(InvalidOptions::WindowBelowTwo { width: width.get() }.into());
         }
-        match (self.layout, shapes.layout) {
-            (Some(held), asked) if held != asked => {
-                return Err(InvalidOptions::LayoutChanged.into());
-            }
-            (_, Layout::Contiguous) if shapes.rows.iter().any(|rows| rows.get() != 1) => {
-                return Err(InvalidOptions::ContiguousServesOneRow.into());
-            }
-            _ => {}
+        let held = self.state.layout();
+        if held != shapes.layout {
+            return Err(InvalidOptions::LayoutChanged.into());
         }
-        let verifies_windows = |residency: StateResidency| {
-            residency == StateResidency::Recurrent && !shapes.windows.is_empty()
-        };
+        if held == Layout::Contiguous && shapes.rows.iter().any(|rows| rows.get() != 1) {
+            return Err(InvalidOptions::ContiguousServesOneRow.into());
+        }
         self.check_draft()?;
         self.plan_hidden_carry();
         let kv = match shapes.layout {
@@ -184,8 +256,11 @@ impl Driver {
             Layout::Paged(pool) => pool.kv(),
         };
         let mut pieces = match shapes.warm {
-            Warm::Admitted => self.chunks.admitted_pieces(),
-            Warm::Prompts(lens) => lens.iter().flat_map(|&len| self.chunks.plan(len)).collect(),
+            Warm::Admitted => self.settings.chunks.admitted_pieces(),
+            Warm::Prompts(lens) => lens
+                .iter()
+                .flat_map(|&len| self.settings.chunks.plan(len))
+                .collect(),
         };
         pieces.push(Piece::Decode);
         let mut seen = HashSet::new();
@@ -204,9 +279,7 @@ impl Driver {
         }
         // The residency of this model is known once an entry compiled, before any window compiles.
         self.check_speculation_state()?;
-        if verifies_windows(self.residency) {
-            return Err(InvalidOptions::RecurrentHasNoVerifyWindows.into());
-        }
+        self.compose(FeatureSet::NONE.with_if(!shapes.windows.is_empty(), Feature::VerifyWindows))?;
         let adapters = std::iter::once(None).chain(shapes.adapters.iter().copied().map(Some));
         for adapters in adapters {
             for &rows in shapes.rows {
@@ -217,13 +290,26 @@ impl Driver {
             }
         }
         self.prepare_speculation(shapes, kv, &pieces)?;
-        if self.serving.is_none() {
-            self.serving = Some(Serving::new(shapes.layout));
-        }
-        self.layout = Some(shapes.layout);
-        Ok(self.refresh_caps(Some(shapes.layout)))
+        Ok(self.refresh_caps())
     }
 
+    /// This driver as it was before its layout was fixed: the prepared entries stay, the open
+    /// sequences and the pool go.
+    fn unserve(self) -> Driver<Unprepared> {
+        Driver {
+            handle: self.handle,
+            runtime: self.runtime,
+            settings: self.settings,
+            ledger: self.ledger,
+            speculation: self.speculation,
+            lora: self.lora,
+            stats: self.stats,
+            state: Unprepared,
+        }
+    }
+}
+
+impl<S: State> Driver<S> {
     /// Capture an adapter set: the generation already holding it, or a new one with `adapters` stacked
     /// against the model's weights. Entries for it exist once a `prepare` names it. The serve
     /// lifecycle's LoRA admin route is the caller.
@@ -241,6 +327,7 @@ impl Driver {
     pub fn unload_adapter_set(&mut self, generation: GenerationId) -> Result<(), DriverError> {
         self.lora.check_unloadable(generation)?;
         let dropped: Vec<EntryKey> = self
+            .ledger
             .entries
             .keys()
             .filter(|key| key.adapters == Some(generation))
@@ -251,22 +338,26 @@ impl Driver {
         // executor no longer has.
         let mut outcome = Ok(());
         for key in dropped {
-            let (id, exe) = (self.entries[&key].id, self.entries[&key].exe);
-            if let Err(error) = self.executor.remove_entry(exe, id) {
+            let (id, exe) = (self.ledger.entries[&key].id, self.ledger.entries[&key].exe);
+            if let Err(error) = self.runtime.executor.remove_entry(exe, id) {
                 outcome = Err(error.into());
                 break;
             }
-            let entry = self.entries.remove(&key).expect("collected from the map");
-            self.drop_holds(&entry.held);
+            let entry = self
+                .ledger
+                .entries
+                .remove(&key)
+                .expect("collected from the map");
+            self.ledger.drop_holds(&entry.held);
         }
         // The executable goes first: if it cannot unload, the generation stays registered and mapped, and a
         // retry unloads it. Only then does the map forget it and the registry drop the generation.
         if outcome.is_ok()
-            && let Some(&exe) = self.adapter_exes.get(&generation)
+            && let Some(&exe) = self.runtime.adapter_exes.get(&generation)
         {
-            match self.executor.unload(exe) {
+            match self.runtime.executor.unload(exe) {
                 Ok(()) => {
-                    self.adapter_exes.remove(&generation);
+                    self.runtime.adapter_exes.remove(&generation);
                 }
                 Err(error) => outcome = Err(error.into()),
             }
@@ -274,9 +365,7 @@ impl Driver {
         if outcome.is_ok() {
             let identities = self.lora.identities_of(generation);
             self.lora.unload(generation)?;
-            if let Some(serving) = self.serving.as_mut() {
-                serving.evict_identities(&identities);
-            }
+            self.state.evict_identities(&identities);
         }
         self.refresh_caps_if_published();
         outcome
@@ -284,9 +373,11 @@ impl Driver {
 
     /// The published caps; `None` until `prepare` has admitted a shape.
     pub fn caps(&self) -> Option<&DriverCaps> {
-        self.caps.as_ref()
+        self.ledger.caps.as_ref()
     }
+}
 
+impl Driver<Serving> {
     /// Admit the speculation of the driver's draft policy: a verify-window entry per row count beside
     /// decode, and under a draft model its own decode and prefill entries on a second executable.
     /// The window carries the greedy suffix, and the logits head when a request samples.
@@ -330,7 +421,9 @@ impl Driver {
         }
         Ok(())
     }
+}
 
+impl<S: State> Driver<S> {
     fn prepare_entry(
         &mut self,
         role: ModelRole,
@@ -340,40 +433,147 @@ impl Driver {
         head: Head,
         adapters: Option<GenerationId>,
     ) -> Result<(), DriverError> {
-        let key = EntryKey {
+        let key = self.step_key(
             role,
-            phase: serving_phase(tokens, logits),
-            shape: StepShape {
-                rows,
-                tokens: NonZeroUsize::new(tokens).expect("a piece carries at least one token"),
-                capacity: self.options.capacity,
-                kv,
-                logits,
-                hidden: self.hidden_of(role),
-            },
+            kv,
+            (tokens, logits),
+            rows,
             head,
             adapters,
-        };
+            InputSet::EMPTY,
+        );
         self.prepared(key).map(|_| ())
     }
 
-    /// Admit the `PrefillEmbeds` entries a prompt with embedding rows runs, beside the entries
-    /// [`Driver::prepare`] admitted: one per prefill piece `shapes.warm` plans, per head and row
-    /// count. `shapes` must name the layout a `prepare` already published.
-    pub fn prepare_embeds(
+    /// The key of the `step` entry of `tokens` tokens per row over `rows` rows that binds `carried`.
+    #[allow(clippy::too_many_arguments)]
+    fn step_key(
+        &self,
+        role: ModelRole,
+        kv: KvLayout,
+        (tokens, logits): (usize, LogitRows),
+        rows: NonZeroUsize,
+        head: Head,
+        adapters: Option<GenerationId>,
+        carried: InputSet,
+    ) -> EntryKey {
+        EntryKey {
+            role,
+            program: if role == ModelRole::Mtp {
+                Program::Draft
+            } else {
+                Program::Step
+            },
+            shape: StepShape::new(
+                rows,
+                NonZeroUsize::new(tokens).expect("a piece carries at least one token"),
+                self.settings.options.capacity,
+            )
+            .with_kv(kv)
+            .with_logits(logits)
+            .with_hidden(self.hidden_of(role)),
+            head,
+            adapters,
+            carried,
+        }
+    }
+
+    /// The request inputs among `inputs` the target's `step` program binds only on the steps that
+    /// carry them (cadence `Covers` or `AtStart`).
+    pub(super) fn carriable_in(&self, inputs: &RequestInputs) -> Vec<InputId> {
+        let schema = self.handle.model().schema();
+        let Some(program) = schema.step() else {
+            return Vec::new();
+        };
+        let carriable = schema.carriable(program);
+        let mut ids: Vec<InputId> = inputs
+            .iter()
+            .map(|(id, _)| id)
+            .filter(|&id| {
+                schema
+                    .index_of(id)
+                    .is_some_and(|index| carriable.contains(index))
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+}
+
+impl Driver<Serving> {
+    /// The carriable inputs the step of `lanes` and `plans` binds: the entry it runs declares exactly
+    /// those slots.
+    pub(super) fn carried_by(&self, lanes: &[Lane<'_>], plans: &[RowPlan]) -> InputSet {
+        let schema = self.handle.model().schema();
+        let Some(program) = schema.step() else {
+            return InputSet::EMPTY;
+        };
+        let serving = &self.state;
+        let feeds: Vec<RowFeed<'_>> = lanes
+            .iter()
+            .zip(plans)
+            .map(|(lane, plan)| RowFeed {
+                inputs: &serving.seqs[&lane.seq].inputs,
+                start: plan.start,
+                fed: plan.feed.len(),
+            })
+            .collect();
+        bind::carried(schema, program, &feeds)
+    }
+
+    /// Admit the entries a request with carriable inputs runs, beside the entries [`Driver::prepare`]
+    /// admitted: for every non-empty combination of `inputs` (which the model's `step` program reads
+    /// as carriable inputs) one entry per prefill piece `shapes.warm` plans, per head and row count.
+    /// `shapes` must name the layout a `prepare` already published. A request that carries an input
+    /// no prepared entry binds is refused at admission.
+    pub fn prepare_carried(
         &mut self,
         shapes: &ServingShapes<'_>,
+        inputs: &[InputId],
     ) -> Result<&DriverCaps, DriverError> {
-        if self.layout != Some(shapes.layout) {
-            return Err(InvalidRequest::NotPrepared.into());
+        if self.state.layout() != shapes.layout {
+            return Err(InvalidOptions::LayoutChanged.into());
         }
+        let schema = self.handle.model().schema();
+        let carriable = schema
+            .step()
+            .map_or(InputSet::EMPTY, |program| schema.carriable(program));
+        let mut indices = Vec::with_capacity(inputs.len());
+        for &id in inputs {
+            match schema.index_of(id) {
+                Some(index) if carriable.contains(index) => indices.push(index),
+                _ => return Err(InvalidOptions::NotCarriable { input: id }.into()),
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.len() > MAX_CARRIED_INPUTS {
+            return Err(InvalidOptions::TooManyCarried {
+                count: indices.len(),
+                max: MAX_CARRIED_INPUTS,
+            }
+            .into());
+        }
+        let combinations: Vec<InputSet> = (1u32..1 << indices.len())
+            .map(|mask| {
+                indices
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, _)| mask >> bit & 1 == 1)
+                    .fold(InputSet::EMPTY, |set, (_, &index)| set.with(index))
+            })
+            .collect();
         let kv = match shapes.layout {
             Layout::Contiguous => KvLayout::Contiguous,
             Layout::Paged(pool) => pool.kv(),
         };
         let pieces: Vec<Piece> = match shapes.warm {
-            Warm::Admitted => self.chunks.admitted_pieces(),
-            Warm::Prompts(lens) => lens.iter().flat_map(|&len| self.chunks.plan(len)).collect(),
+            Warm::Admitted => self.settings.chunks.admitted_pieces(),
+            Warm::Prompts(lens) => lens
+                .iter()
+                .flat_map(|&len| self.settings.chunks.plan(len))
+                .collect(),
         };
         let mut seen = HashSet::new();
         for piece in pieces {
@@ -385,29 +585,35 @@ impl Driver {
             }
             for &rows in shapes.rows {
                 for &head in shapes.heads {
-                    let key = EntryKey {
-                        role: ModelRole::Target,
-                        phase: Phase::PrefillEmbeds,
-                        shape: StepShape {
-                            rows,
-                            tokens,
-                            capacity: self.options.capacity,
+                    for &carried in &combinations {
+                        let key = self.step_key(
+                            ModelRole::Target,
                             kv,
-                            logits: LogitRows::Last,
-                            hidden: self.hidden_of(ModelRole::Target),
-                        },
-                        head,
-                        adapters: None,
-                    };
-                    self.prepared(key)?;
+                            (tokens.get(), LogitRows::Last),
+                            rows,
+                            head,
+                            None,
+                            carried,
+                        );
+                        self.prepared(key)?;
+                    }
                 }
             }
         }
-        Ok(self.refresh_caps(Some(shapes.layout)))
+        Ok(self.refresh_caps())
     }
 
-    /// Recompute the caps from the prepared entries of `layout`.
-    pub(super) fn refresh_caps(&mut self, layout: Option<Layout>) -> &DriverCaps {
+    /// Blocks free in the paged pool (cached prefix blocks count as held); `None` under the contiguous
+    /// layout.
+    pub fn free_blocks(&self) -> Option<usize> {
+        self.state.free_blocks()
+    }
+}
+
+impl<S: State> Driver<S> {
+    /// Recompute the caps from the prepared entries of the layout the driver serves.
+    pub(super) fn refresh_caps(&mut self) -> &DriverCaps {
+        let layout = self.state.admitted_layout();
         let kv = match layout {
             None | Some(Layout::Contiguous) => KvLayout::Contiguous,
             Some(Layout::Paged(pool)) => pool.kv(),
@@ -417,10 +623,11 @@ impl Driver {
         let mut heads = HeadSet::default();
         let mut windows = Vec::new();
         let mut generations = HashSet::new();
-        let target_entries = self.entries.keys().filter(|key| {
+        let target_entries = self.ledger.entries.keys().filter(|key| {
             key.role == ModelRole::Target
                 && key.shape.kv == kv
-                && matches!(key.phase, Phase::Prefill | Phase::Decode)
+                && key.program == Program::Step
+                && key.carried.is_empty()
         });
         for key in target_entries {
             let StepShape { rows, tokens, .. } = key.shape;
@@ -448,54 +655,63 @@ impl Driver {
         row_counts.sort();
         widths.sort();
         windows.sort_by_key(|w| (w.rows, w.width));
-        self.caps.insert(DriverCaps {
+        self.ledger.caps.insert(DriverCaps {
             rows: row_counts
                 .last()
                 .copied()
-                .or(self.encode_shapes.map(|shapes| shapes.rows))
+                .or(self.ledger.encode_shapes.map(|shapes| shapes.rows))
                 .unwrap_or(NonZeroUsize::MIN),
             row_counts,
             widths,
-            max_seq: self.options.capacity,
+            max_seq: self.settings.options.capacity,
             kv,
             kv_blocks: match layout {
                 None | Some(Layout::Contiguous) => 0,
                 Some(Layout::Paged(pool)) => pool.blocks.get(),
             },
-            state: self.residency,
+            state: self.ledger.residency,
             heads,
             lora: (!generations.is_empty()).then_some(LoraCaps {
                 generations: generations.len(),
             }),
             windows,
             speculation: self.speculation.policy.caps(),
-            inputs: InputSet {
-                tokens: true,
-                embeds: self
-                    .entries
-                    .keys()
-                    .any(|key| key.role == ModelRole::Target && key.phase == Phase::PrefillEmbeds),
-                encode: self
-                    .entries
-                    .keys()
-                    .any(|key| key.role == ModelRole::Target && key.phase == Phase::Encode),
-            },
-            encode: self.encode_shapes.map(EncodeShapes::caps),
+            inputs: self.input_caps(),
+            encode: self.ledger.encode_shapes.map(EncodeShapes::caps),
         })
+    }
+
+    /// The inputs beyond a token prompt the prepared entries accept.
+    fn input_caps(&self) -> InputCaps {
+        let schema = self.handle.model().schema();
+        let target = |key: &&EntryKey| key.role == ModelRole::Target;
+        let mut carried: Vec<InputId> = self
+            .ledger
+            .entries
+            .keys()
+            .filter(target)
+            .filter(|key| key.program == Program::Step)
+            .flat_map(|key| schema.ids_of(key.carried))
+            .collect();
+        carried.sort();
+        carried.dedup();
+        InputCaps {
+            carried,
+            encode: self
+                .ledger
+                .entries
+                .keys()
+                .filter(target)
+                .any(|key| key.program == Program::Encode),
+        }
     }
 
     /// Republish the caps when a layout has been admitted: an entry prepared outside `prepare`
     /// (an encode step's) changes what the driver accepts.
     pub(super) fn refresh_caps_if_published(&mut self) {
-        if self.layout.is_some() || self.encode_shapes.is_some() {
-            self.refresh_caps(self.layout);
+        if self.state.admitted_layout().is_some() || self.ledger.encode_shapes.is_some() {
+            self.refresh_caps();
         }
-    }
-
-    /// Blocks free in the paged pool (cached prefix blocks count as held); `None` before a paged
-    /// `prepare`.
-    pub fn free_blocks(&self) -> Option<usize> {
-        self.serving.as_ref().and_then(Serving::free_blocks)
     }
 }
 
@@ -510,7 +726,7 @@ fn piece_key(piece: Piece) -> (usize, LogitRows) {
 pub(crate) mod test_only {
     use super::*;
 
-    impl Driver {
+    impl<S: State> Driver<S> {
         /// Programs compiled so far: constant across steps drawn from the prepared set. The serving rows read
         /// it through [`Driver::stats`].
         pub(crate) fn compile_count(&self) -> u64 {

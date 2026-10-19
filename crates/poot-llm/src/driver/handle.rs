@@ -300,6 +300,25 @@ impl ModelHandle {
         Ok(Self { model, store, text })
     }
 
+    /// What the model's programs read, carry and require.
+    pub fn schema(&self) -> &poot_models::io::ModelSchema {
+        self.model.schema()
+    }
+
+    /// The request inputs the model's `step` program binds only on the steps that carry them (a sparse
+    /// per-token or per-row input): what a deployment that serves them passes to
+    /// [`Driver::prepare_carried`](crate::driver::Driver::prepare_carried).
+    pub fn carriable_inputs(&self) -> Vec<poot_models::io::InputId> {
+        let schema = self.model.schema();
+        let Some(program) = schema.step() else {
+            return Vec::new();
+        };
+        let carriable = schema.carriable(program);
+        let mut ids = schema.ids_of(carriable);
+        ids.sort();
+        ids
+    }
+
     /// The model's configuration.
     pub fn config(&self) -> &ModelConfig {
         self.model.config()

@@ -15,13 +15,12 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
-use poot_llm::driver::step::PickPolicy;
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
     AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest,
     Head, Layout, LoadOptions, ModelHandle, PoolShape, PreparedSetLimits, Release,
-    ResidencyCounters, RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm, open_executor,
-    program_retention,
+    ResidencyCounters, RowWork, SeqId, SeqRequest, Serving, ServingShapes, StepRow, Warm,
+    open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::{Fixture, Registry};
@@ -142,7 +141,7 @@ fn handle(scale: Option<f32>) -> Arc<ModelHandle> {
 }
 
 fn options(chunk: usize) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -170,7 +169,7 @@ fn open(choice: BackendChoice) -> Option<Box<dyn poot_executor::Executor>> {
     poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
 }
 
-fn generate(driver: &mut Driver, prompt: &[u32], max_new: usize) -> Vec<u32> {
+fn generate(driver: &mut Driver<Serving>, prompt: &[u32], max_new: usize) -> Vec<u32> {
     driver
         .generate(
             GenerateRequest {
@@ -200,11 +199,14 @@ fn pooled_qwen3next_decodes_the_unpooled_tokens_with_evictions(choice: BackendCh
     let Some(pooled_executor) = open(choice) else {
         return;
     };
-    let mut plain = Driver::new(Arc::clone(&handle), plain_executor, options(8)).unwrap();
+    let mut plain = Driver::new(Arc::clone(&handle), plain_executor, options(8))
+        .unwrap()
+        .serve(Layout::Contiguous);
     let mut pooled = Driver::new(handle, pooled_executor, options(8))
         .unwrap()
         .with_expert_pool(nz(POOL_ROWS))
-        .unwrap();
+        .unwrap()
+        .serve(Layout::Contiguous);
     assert_eq!(
         generate(&mut plain, &PROMPT, RECORDED.len()),
         RECORDED,
@@ -245,12 +247,8 @@ struct Lane {
 }
 
 impl Lane {
-    fn open(driver: &mut Driver, prompt: &'static [u32]) -> Self {
-        let request = SeqRequest {
-            prompt,
-            max_new: ROW_NEW,
-            adapter: AdapterRef::Base,
-        };
+    fn open(driver: &mut Driver<Serving>, prompt: &'static [u32]) -> Self {
+        let request = SeqRequest::new(prompt, ROW_NEW, AdapterRef::Base);
         let Admission::Opened { seq, reused } = driver.open(request).unwrap() else {
             panic!("no room for a sequence");
         };
@@ -268,16 +266,13 @@ impl Lane {
     }
 
     /// One step of this sequence alone: the next prompt chunk, or one decode token.
-    fn step(&mut self, driver: &mut Driver) {
+    fn step(&mut self, driver: &mut Driver<Serving>) {
         let work = if self.prefilled < self.prompt.len() {
             RowWork::Prefill {
                 upto: self.prompt.len(),
             }
         } else {
-            RowWork::Decode {
-                ahead: &[],
-                pick: PickPolicy::Greedy,
-            }
+            RowWork::Decode { ahead: &[] }
         };
         let mut rows = [StepRow {
             seq: self.seq,
@@ -299,20 +294,7 @@ impl Lane {
 /// The two sequences' tokens when stepped alternately, one row per step, through `driver`'s paged pool of
 /// two state rows: sequence 0 holds row 0 and sequence 1 holds row 1, so each step reads its row's state
 /// the other sequence's step has just left beside it.
-fn alternating_rows(driver: &mut Driver) -> [Vec<u32>; 2] {
-    driver
-        .prepare(&ServingShapes {
-            layout: Layout::Paged(PoolShape {
-                blocks: nz(8),
-                max_seqs: nz(2),
-            }),
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
-        .unwrap();
+fn alternating_rows(driver: &mut Driver<Serving>) -> [Vec<u32>; 2] {
     let mut lanes = [Lane::open(driver, &MEDIUM), Lane::open(driver, &SHORT)];
     while lanes.iter().any(|lane| !lane.done()) {
         for lane in lanes.iter_mut().filter(|lane| !lane.done()) {
@@ -340,10 +322,25 @@ fn pooled_qwen3next_keeps_each_state_row_across_alternating_steps(choice: Backen
     let Some(pooled_executor) = open(choice) else {
         return;
     };
-    let mut solo = Driver::new(Arc::clone(&handle), solo_executor, options(4)).unwrap();
-    let mut pooled = Driver::new(handle, pooled_executor, options(4))
+    let mut solo = Driver::new(Arc::clone(&handle), solo_executor, options(4))
+        .unwrap()
+        .serve(Layout::Contiguous);
+    let pooled = Driver::new(handle, pooled_executor, options(4))
         .unwrap()
         .with_expert_pool(nz(POOL_ROWS))
+        .unwrap();
+    let mut pooled = pooled
+        .prepare(&ServingShapes {
+            layout: Layout::Paged(PoolShape {
+                blocks: nz(8),
+                max_seqs: nz(2),
+            }),
+            rows: &[NonZeroUsize::MIN],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+        })
         .unwrap();
     for (row, prompt) in [&MEDIUM[..], &SHORT[..]].into_iter().enumerate() {
         assert_eq!(

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::Graph;
 use poot_graph_ir::ValueId;
 use poot_graph_ir::builder::Builder;
@@ -84,14 +84,10 @@ fn bits(tensor: &HostTensor) -> Vec<u32> {
 fn adr0099_s2_split_then_chain_matches_the_unsplit_graph() {
     let (graph, inputs) = layered_graph(3);
     assert_eq!(graph.eqns().len(), 9, "three equations per block");
-    let reference = eval(
-        &graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .expect("the unsplit graph evaluates")
-    .environment
-    .unwrap();
+    let reference = eval(&graph, &inputs, EvalOptions::default().keep_environment())
+        .expect("the unsplit graph evaluates")
+        .environment
+        .unwrap();
     let reference_output = reference[graph.result()]
         .as_ref()
         .expect("the unsplit graph computes its output")

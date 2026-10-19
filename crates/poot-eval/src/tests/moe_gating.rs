@@ -1,7 +1,7 @@
 //! scatter_axis0, ArgTopK, top-k gate, MoE dense/sparse/grouped references.
 
 use crate::ops::movement::scatter_axis0;
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::ValueId;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp};
@@ -37,7 +37,7 @@ fn scatter_axis0_inverts_a_permutation() {
     );
     // index = [2, 0, 1]: row 0 -> slot 2, row 1 -> slot 0, row 2 -> slot 1.
     inputs.insert(ii, Value::from(HostTensor::i32(vec![3], vec![2, 0, 1])));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -65,7 +65,7 @@ fn scatter_axis0_inverts_a_permutation() {
         Value::from(HostTensor::f32(vec![4], vec![0.0, 1.0, 2.0, 3.0])),
     );
     in2.insert(i2, Value::from(HostTensor::i32(vec![4], vec![3, 2, 1, 0])));
-    let got2 = eval(&g2, &in2, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got2 = eval(&g2, &in2, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -95,7 +95,7 @@ fn scatter_refuses_an_index_outside_the_rows() {
         let mut inputs = HashMap::new();
         inputs.insert(si, Value::from(HostTensor::f32(vec![3, 2], vec![0.0; 6])));
         inputs.insert(ii, Value::from(HostTensor::i32(vec![3], index.clone())));
-        match eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| {
+        match eval(&g, &inputs, EvalOptions::default()).map(|r| {
             r.output
                 .into_host()
                 .expect("moe_gating tests evaluate dense graphs")
@@ -147,7 +147,7 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
     let gr = br.finish(rank).unwrap();
     let mut rank_inputs = HashMap::new();
     rank_inputs.insert(lgi, Value::from(HostTensor::f32(vec![l, e], logits)));
-    let rank_t = eval(&gr, &rank_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let rank_t = eval(&gr, &rank_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -176,7 +176,7 @@ fn arg_top_k_matches_per_row_scatter_iota_rank_slice() {
     );
     let mut a_inputs = HashMap::new();
     a_inputs.insert(rki, Value::from(rank_t.clone()));
-    let got = eval(&ga, &a_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&ga, &a_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -250,7 +250,7 @@ fn ge_indicator_with_broadcast() {
         yi,
         Value::from(HostTensor::f32(vec![3], vec![1.0, 1.0, 1.0])),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -272,7 +272,7 @@ fn top_k_gate_selects_topk_and_normalizes() {
     let mut inputs = HashMap::new();
     inputs.insert(xi, Value::from(HostTensor::f32(vec![2, 4], xd)));
 
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -305,7 +305,7 @@ fn top_k_gate_composition_matches_sort_reference() {
     let mut inputs = HashMap::new();
     inputs.insert(xi, Value::from(HostTensor::f32(vec![rows, e], xd.clone())));
 
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -359,7 +359,7 @@ fn moe_matches_reference() {
         Value::from(HostTensor::f32(vec![e, i, h], wod.clone())),
     );
 
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -437,15 +437,11 @@ fn moe_sparse_matches_dense() {
         .unwrap();
     let dense_out = moe_dense(&bd, xd, rd, wid, wod, e, k, i).unwrap();
     let gd = bd.finish(dense_out).unwrap();
-    let dense = eval(
-        &gd,
-        &bind_by_name(&gd),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .expect("moe_gating tests evaluate dense graphs");
+    let dense = eval(&gd, &bind_by_name(&gd), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .expect("moe_gating tests evaluate dense graphs");
 
     let bs = Builder::for_tests();
     let xs = bs.constant("x", TensorType::f32(vec![1, 1, h])).unwrap();
@@ -458,15 +454,11 @@ fn moe_sparse_matches_dense() {
         .unwrap();
     let sparse_out = moe_sparse(&bs, xs, rs, wis, wos, e, k, i).unwrap();
     let gs = bs.finish(sparse_out).unwrap();
-    let sparse = eval(
-        &gs,
-        &bind_by_name(&gs),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .expect("moe_gating tests evaluate dense graphs");
+    let sparse = eval(&gs, &bind_by_name(&gs), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .expect("moe_gating tests evaluate dense graphs");
 
     assert_eq!(sparse.shape(), dense.shape(), "[1,1,H]");
     assert_close_rel(sparse.as_f32().unwrap(), dense.as_f32().unwrap(), 1e-5);
@@ -513,15 +505,11 @@ fn moe_grouped_matches_dense() {
         .unwrap();
     let dense_out = moe_dense(&bd, xd, rd, wid, wod, e, k, i).unwrap();
     let gd = bd.finish(dense_out).unwrap();
-    let dense = eval(
-        &gd,
-        &bind_by_name(&gd),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .expect("moe_gating tests evaluate dense graphs");
+    let dense = eval(&gd, &bind_by_name(&gd), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .expect("moe_gating tests evaluate dense graphs");
 
     let bg = Builder::for_tests();
     let xg = bg.constant("x", TensorType::f32(vec![1, l, h])).unwrap();
@@ -534,15 +522,11 @@ fn moe_grouped_matches_dense() {
         .unwrap();
     let grouped_out = moe_grouped(&bg, xg, rg, wig, wog, e, k, i).unwrap();
     let gg = bg.finish(grouped_out).unwrap();
-    let grouped = eval(
-        &gg,
-        &bind_by_name(&gg),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .expect("moe_gating tests evaluate dense graphs");
+    let grouped = eval(&gg, &bind_by_name(&gg), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .expect("moe_gating tests evaluate dense graphs");
 
     assert_eq!(grouped.shape(), dense.shape(), "[1,L,H]");
     // the summation order differs (dense reduces over E, grouped over k), so use a tolerance, not assert_eq.
@@ -613,7 +597,7 @@ fn eval_tied_route(route: RouteKind, scores: &[f32], k: usize, w_in: &[f32], w_o
             (id, Value::from(named[name].clone()))
         })
         .collect();
-    eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(&graph, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -799,7 +783,7 @@ fn deterministic_moe_routes_match_stable_sort_table() {
                 (id, Value::from(tensor))
             })
             .collect();
-        let got_gate = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got_gate = eval(&graph, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -871,7 +855,7 @@ fn deterministic_moe_routes_match_stable_sort_table() {
                 (id, Value::from(tensor))
             })
             .collect();
-        let got_route = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got_route = eval(&graph, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

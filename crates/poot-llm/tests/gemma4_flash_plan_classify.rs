@@ -11,8 +11,8 @@
 //! (32-wide heads) fall back, the fused count drops to the local layers' and each row fails.
 
 use poot_graph_ir::op::OpKind;
-use poot_graph_plan::{CompileOptions, Plan, Target, compile, production_plan::Submission};
-use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
+use poot_graph_plan::{CompileOptions, Plan, Target, compile};
+use poot_models::model::{Model, StepShape, StepSpec};
 use poot_models::registry::Registry;
 use poot_target::{AmdArch, Backend};
 use std::num::NonZeroUsize;
@@ -42,32 +42,27 @@ fn gemma4(variant: Option<&str>) -> Box<dyn Model> {
 }
 
 fn step(tokens: usize, capacity: usize) -> StepShape {
-    StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(capacity).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    }
+    StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(tokens).unwrap(),
+        NonZeroUsize::new(capacity).unwrap(),
+    )
 }
 
-/// The dispatches of every fused attention equation of `phase`'s graph compiled for `backend`: one
+/// The dispatches of every fused attention equation of the step graph compiled for `backend`: one
 /// entry per attention equation, each the dispatch count of its plan.
-fn attention_dispatches(
-    model: &dyn Model,
-    backend: Backend,
-    phase: Phase,
-    shape: StepShape,
-) -> Vec<usize> {
+fn attention_dispatches(model: &dyn Model, backend: Backend, shape: StepShape) -> Vec<usize> {
     let graph = model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(
+            &StepSpec::step(shape),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     let target = Target::Gpu {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     };
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     let program = compile(&graph, &target, &options).unwrap();
     program
         .planned()
@@ -87,12 +82,12 @@ fn assert_every_layer_is_flash(backend: Backend, label: &str) {
 }
 
 fn assert_every_layer_of_is_flash(model: &dyn Model, backend: Backend, label: &str) {
-    for (phase, shape) in [(Phase::Prefill, step(4, 8)), (Phase::Decode, step(1, 8))] {
-        let dispatches = attention_dispatches(model, backend, phase, shape);
-        eprintln!("gemma4 {label} {phase:?}: attention dispatches per layer {dispatches:?}");
+    for (phase, shape) in [("prefill", step(4, 8)), ("decode", step(1, 8))] {
+        let dispatches = attention_dispatches(model, backend, shape);
+        eprintln!("gemma4 {label} {phase}: attention dispatches per layer {dispatches:?}");
         assert_eq!(
             dispatches, [1; LAYERS],
-            "{label} {phase:?}: every attention layer is one fused flash dispatch"
+            "{label} {phase}: every attention layer is one fused flash dispatch"
         );
     }
 }

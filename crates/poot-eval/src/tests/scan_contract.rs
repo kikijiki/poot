@@ -12,7 +12,7 @@ use poot_graph_ir::{Builder, OpKind, Operand, ScanAttrs, ScanFamily, StateRole, 
 use poot_tensor::HostTensor;
 use poot_test_util::assert_close;
 
-use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use crate::{EvalError, EvalOptions, Value, eval};
 
 /// Evaluate `fixture`'s graph: `(y, s_out)`.
 fn run(fixture: &ScanFixture, inputs: &ScanInputs) -> Result<(Vec<f32>, Vec<f32>), EvalError> {
@@ -23,11 +23,7 @@ fn run(fixture: &ScanFixture, inputs: &ScanInputs) -> Result<(Vec<f32>, Vec<f32>
         .into_iter()
         .map(|(id, tensor)| (id, Value::from(tensor)))
         .collect();
-    let result = eval(
-        &scan.graph,
-        &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )?;
+    let result = eval(&scan.graph, &values, EvalOptions::default())?;
     let y = result.output.into_host().expect("dense y");
     let state = result.state.into_iter().next().expect("one carried state");
     Ok((
@@ -172,7 +168,7 @@ fn the_delta_rule_scan_is_bitwise_the_pre_card_chain() {
             )
         })
         .collect();
-    let result = eval(&chain, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let result = eval(&chain, &values, EvalOptions::default()).unwrap();
     let want_y = result.output.into_host().unwrap();
     let want_s = result
         .state
@@ -236,7 +232,7 @@ fn the_ssd_scan_matches_the_decode_loop_and_the_seeded_prefill() {
                 )
             })
             .collect();
-        let result = eval(&prefill, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+        let result = eval(&prefill, &values, EvalOptions::default()).unwrap();
         let want_y = result.output.into_host().unwrap();
         let want_h = result
             .state
@@ -299,7 +295,7 @@ fn the_ssd_scan_matches_the_decode_loop_and_the_seeded_prefill() {
                     )
                 })
                 .collect();
-            let result = eval(&decode, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+            let result = eval(&decode, &values, EvalOptions::default()).unwrap();
             let yt = result.output.into_host().unwrap();
             for h in 0..2 {
                 loop_y[(h * len + t) * 3..(h * len + t + 1) * 3]

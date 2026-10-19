@@ -18,10 +18,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
-    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, LoadOptions, ModelHandle,
-    PreparedSetLimits, open_executor, program_retention,
+    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Layout, LoadOptions,
+    ModelHandle, PreparedSetLimits, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::ModelOutput;
@@ -132,7 +132,10 @@ fn every_generating_family_is_in_a_served_group() {
         let model = registry
             .build(&fixture.raw(), &fixture.store)
             .unwrap_or_else(|error| panic!("{}: {error}", entry.family));
-        if !matches!(model.config().output, ModelOutput::Logits { .. }) {
+        if !matches!(
+            model.schema().step().map(|program| program.output()),
+            Some(ModelOutput::Logits { .. })
+        ) {
             continue;
         }
         let family = entry.family.as_str();
@@ -232,7 +235,7 @@ struct Reference {
 }
 
 fn driver_options() -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -259,7 +262,9 @@ fn references(
     samplers: Vec<Sampler>,
 ) -> Option<Vec<Reference>> {
     let executor = poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))?;
-    let mut driver = Driver::new(load(dir), executor, driver_options()).expect("a driver");
+    let mut driver = Driver::new(load(dir), executor, driver_options())
+        .expect("a driver")
+        .serve(Layout::Contiguous);
     Some(
         samplers
             .into_iter()
@@ -789,8 +794,8 @@ fn a_paged_pool_refuses_the_qwen4exp_indexer_startup_rocm() {
     );
 }
 
-/// `--draft-mtp` on a family with no MTP program stops startup with the family's typed phase refusal,
-/// before the listener binds. Mutation: build `DraftPolicy::Off` for the flag in `draft_policy`; the
+/// `--draft-mtp` on a family with no `draft` program stops startup with the family's typed program
+/// refusal (`TraceError::ProgramUnsupported`), before the listener binds. Mutation: build `DraftPolicy::Off` for the flag in `draft_policy`; the
 /// server starts and serves, and the row goes red.
 fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
     choice: BackendChoice,
@@ -803,8 +808,8 @@ fn a_model_without_an_mtp_layer_refuses_draft_mtp_startup(
     let dir = write_checkpoint("qwen2");
     let stderr = refused(&dir, flag, &["--draft-mtp".to_string(), "2".to_string()]);
     assert!(
-        stderr.contains("Mtp") || stderr.to_lowercase().contains("mtp"),
-        "the refusal does not name the MTP phase: {stderr}"
+        stderr.contains("has no program draft"),
+        "the refusal does not name the missing draft program: {stderr}"
     );
 }
 
@@ -1577,7 +1582,7 @@ fn small_png_of(fill: impl Fn(u32, u32) -> u8) -> Vec<u8> {
 /// positions (`Slot::MropePosition`, the image's tokens off their index) reach the engine's paged text
 /// driver, which equals the single-request contiguous reference. Different images generate differently
 /// (the rows reach the logits). A request the front end cannot lower is a typed 400. Mutation: replace the
-/// positions with zeros where `DriverEngine::open` hands them to `open_with_mrope`; the served generation
+/// positions with zeros where `DriverEngine::open` hands them to `Driver::open` as request inputs; the served generation
 /// leaves the reference's and the row goes red.
 fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
     use poot_llm::qwen_vl::{Qwen25Vl, Qwen25VlCheckpoint, Qwen25VlGenerate};

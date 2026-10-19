@@ -27,19 +27,17 @@
 //! stays green on wgpu, where the hazard did not fire at 512, 1024 or 4096 steps or at the crowded fixture:
 //! the plane-parity hazard has ROCm and PTX mutation coverage only.
 
-use poot_eval::{EvalBudget, EvalOptions, eval};
+use poot_eval::{EvalOptions, eval};
 use poot_executor::{Device, Engine, Executor};
-use poot_executor_parity::assert_close;
 use poot_executor_parity::scan::{check_steps, numerics_class, streamed_in_pieces};
 use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_graph_ir::{Graph, OpKind};
 use poot_graph_plan::test_support::gpu_caps;
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, KernelChoice, Target, compile, production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Target, compile};
 use poot_kernelgen::KernelRequest;
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
+use poot_test_util::assert_close_scaled;
 use poot_wgpu_device::device::WgpuDevice;
 
 fn oracle(
@@ -50,7 +48,7 @@ fn oracle(
         .iter()
         .map(|(&id, t)| (id, poot_eval::Value::from(t.clone())))
         .collect();
-    eval(graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(graph, &values, EvalOptions::default())
         .unwrap_or_else(|e| panic!("oracle: {e}"))
         .output
         .into_host()
@@ -68,7 +66,7 @@ fn planned_split(fixture: &ScanFixture, target: &Target) -> usize {
     let program = compile(
         &fixture.graph().graph,
         target,
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the scan compiles");
     let (eqn, _) = program
@@ -173,7 +171,7 @@ fn scan_schedules_match_the_oracle_in_every_regime_on_wgpu() {
     ] {
         let one_launch = check_steps(&mut *exec, target, long, long.len, 1, "long whole", &oracle);
         let pieces = streamed_in_pieces(&mut *exec, target, long, 16, "long pieces");
-        assert_close(
+        assert_close_scaled(
             &one_launch[0],
             &pieces,
             numerics_class(target, &long).tolerance(),

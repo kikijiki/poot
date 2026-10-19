@@ -4,6 +4,7 @@ use poot_graph_ir::RedOp;
 
 use poot_tensor::HostTensor;
 
+use super::elementwise::max_number;
 use crate::{EvalError, strides, unravel};
 
 pub(crate) fn reduce(
@@ -49,10 +50,47 @@ pub(crate) fn reduce(
             let v = x_view[base + a * x_st[axis]];
             acc = match op {
                 RedOp::Sum => acc + v,
-                RedOp::Max => acc.max(v),
+                RedOp::Max => max_number(acc, v),
             };
         }
         *slot = acc;
     }
     Ok(HostTensor::f32(out_shape, data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RedOp::Max` has `BinOp::Max`'s rule: NaN elements are skipped, and a row of only NaN is the identity, negative infinity.
+    ///
+    /// Mutation: use a propagating max in `max_number`; the first row comes back NaN and this goes red on
+    /// `a NaN element must be skipped`.
+    #[test]
+    fn a_reduced_row_skips_nan_elements_and_only_an_all_nan_row_is_nan() {
+        let x = HostTensor::f32(
+            vec![3, 3],
+            vec![
+                1.0,
+                f32::NAN,
+                3.0,
+                f32::NAN,
+                f32::NAN,
+                f32::NAN,
+                1.0,
+                2.0,
+                3.0,
+            ],
+        );
+        let out = reduce(RedOp::Max, &x, 1, false).unwrap();
+        let out = out.as_f32().unwrap();
+        assert_eq!(out[0], 3.0, "a NaN element must be skipped, got {}", out[0]);
+        assert_eq!(
+            out[1],
+            f32::NEG_INFINITY,
+            "an all-NaN row is -inf, got {}",
+            out[1]
+        );
+        assert_eq!(out[2], 3.0);
+    }
 }

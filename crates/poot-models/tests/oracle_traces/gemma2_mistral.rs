@@ -255,7 +255,7 @@ fn gemma2_decode_ref(
 // --- Gemma2 numeric eval tests ---
 
 use poot_graph_ir::Graph;
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_models::test_support::weight_map::MappedModel;
 
@@ -278,8 +278,7 @@ fn gemma2(window: usize, attn: Option<f32>, last: Option<f32>, vocab: usize) -> 
 fn decode_graph(m: &MappedModel, cap: usize) -> Graph {
     m.model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -288,8 +287,7 @@ fn decode_graph(m: &MappedModel, cap: usize) -> Graph {
 fn prefill_graph(m: &MappedModel, n: usize, cap: usize) -> Graph {
     m.model
         .trace(
-            Phase::Prefill,
-            step(1, n, cap, LogitRows::Last),
+            &StepSpec::step(step(1, n, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()

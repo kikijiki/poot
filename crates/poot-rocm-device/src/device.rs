@@ -23,7 +23,7 @@
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
 };
-use poot_graph_plan::{ImportedKernel, Target, production_plan::Submission};
+use poot_graph_plan::{ImportedKernel, Target};
 use poot_kernel_ir::Body;
 use poot_rocm_runtime::{
     BoundKernarg, DispatchSpan, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions,
@@ -238,10 +238,8 @@ impl Device for RocmDevice {
         Ok(RocmKernel { kernel: handle })
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), RocmGpuError> {
-        // Always opens a recording, regardless of `_submission` (see the module doc, mirroring
-        // `WgpuDevice::begin`): the contract's own restriction to Replay is enforced at
-        // `Engine::add_entry`, not here. Recording never touches the device (building a kernarg
+    fn begin(&mut self) -> Result<(), RocmGpuError> {
+        // Always opens a recording (see the module doc, mirroring `WgpuDevice::begin`). Recording never touches the device (building a kernarg
         // buffer is a host write into host-visible kernarg memory, not a dispatch), so a failed
         // begin/dispatch/copy/finish can never have mutated device state.
         assert!(self.open.is_none(), "begin inside an open step");

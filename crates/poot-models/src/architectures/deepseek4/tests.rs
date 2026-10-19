@@ -8,9 +8,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_graph_ir::Slot;
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target, compile};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{AmdArch, Backend, DeviceCaps};
@@ -19,7 +17,7 @@ use poot_tensor::DType;
 use super::*;
 use crate::components::standard::oracle::{eval, run_step};
 use crate::components::testing::{assert_missing_weight_is_named, build, close, close_all};
-use crate::model::{ConfigReason, KvLayout, LogitRows, Phase};
+use crate::model::{ConfigReason, LogitRows, StepShape};
 use crate::registry::Registry;
 use packed::{E4M3, FP4, literal, payload};
 use poot_quant::weights::{AttnRole, HandleFormat, WeightId, WeightMap, WeightRole};
@@ -40,22 +38,19 @@ fn finetune() -> Fixture {
 }
 
 fn shape(tokens: usize, capacity: usize, logits: LogitRows) -> StepShape {
-    StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(capacity).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits,
-        hidden: None,
-    }
+    StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(tokens).unwrap(),
+        NonZeroUsize::new(capacity).unwrap(),
+    )
+    .with_logits(logits)
 }
 
 /// The names of the state a one-token decode step carries, in carry order.
 fn state_names(model: &dyn Model, capacity: usize) -> Vec<String> {
     let g = model
         .trace(
-            Phase::Decode,
-            shape(1, capacity, LogitRows::All),
+            &StepSpec::step(shape(1, capacity, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -78,7 +73,6 @@ fn run_chunked(
         let (out, next) = run_step(
             model,
             store,
-            Phase::Prefill,
             capacity,
             &tokens[at..at + chunk],
             at as i32,
@@ -88,15 +82,7 @@ fn run_chunked(
         (state, at) = (next, at + chunk);
     }
     while at < tokens.len() {
-        let (out, next) = run_step(
-            model,
-            store,
-            Phase::Decode,
-            capacity,
-            &tokens[at..=at],
-            at as i32,
-            &state,
-        );
+        let (out, next) = run_step(model, store, capacity, &tokens[at..=at], at as i32, &state);
         logits.extend(out);
         (state, at) = (next, at + 1);
     }
@@ -311,8 +297,7 @@ fn the_hash_table_is_declared_in_the_expert_range() {
     let model = model_of(&fx);
     let g = model
         .trace(
-            Phase::Decode,
-            shape(1, CAPACITY, LogitRows::All),
+            &StepSpec::step(shape(1, CAPACITY, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -374,45 +359,28 @@ fn an_expert_count_that_cannot_bound_the_hash_table_is_a_typed_config_refusal() 
     }
 }
 
-/// The prefill granule: a prefill step must cover whole windows (a multiple of 4 here), a decode
-/// step is one token, and a capacity above the model's maximum is refused, each with its typed
-/// reason and before any graph is built. Mutation: drop the granule check in `trace`; the 6-token
-/// prefill traces and the row goes red.
+/// The prefill granule: a multi-token step must cover whole windows (a multiple of 4 here), a
+/// single-token step is the decode step and traces, and a capacity above the model's maximum is
+/// refused, each with its typed reason and before any graph is built. Mutation: drop the granule
+/// check in `trace`; the 6-token step traces and the row goes red.
 #[test]
 fn step_shapes_the_family_cannot_trace_are_typed_refusals() {
     let model = model_of(&fixture());
-    let reason = |phase, tokens, capacity| match model.trace(
-        phase,
-        shape(tokens, capacity, LogitRows::Last),
-        poot_graph_ir::TraceLimits::for_tests(),
-    ) {
+    let trace = |tokens, capacity| {
+        model.trace(
+            &StepSpec::step(shape(tokens, capacity, LogitRows::Last)),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+    };
+    let reason = |tokens, capacity| match trace(tokens, capacity) {
         Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     };
-    assert_eq!(
-        reason(Phase::Prefill, 6, CAPACITY),
-        ShapeReason::Granule { granule: 4 }
-    );
-    assert_eq!(
-        reason(Phase::Prefill, 1, CAPACITY),
-        ShapeReason::Granule { granule: 4 }
-    );
-    assert_eq!(
-        reason(Phase::Decode, 2, CAPACITY),
-        ShapeReason::DecodeTokens
-    );
-    assert_eq!(
-        reason(Phase::Decode, 1, 65),
-        ShapeReason::CapacityAboveMax { max: 64 }
-    );
-    for tokens in [4, 8] {
-        model
-            .trace(
-                Phase::Prefill,
-                shape(tokens, CAPACITY, LogitRows::Last),
-                poot_graph_ir::TraceLimits::for_tests(),
-            )
-            .unwrap();
+    assert_eq!(reason(6, CAPACITY), ShapeReason::Granule { granule: 4 });
+    assert_eq!(reason(2, CAPACITY), ShapeReason::Granule { granule: 4 });
+    assert_eq!(reason(1, 65), ShapeReason::CapacityAboveMax { max: 64 });
+    for tokens in [1, 4, 8] {
+        trace(tokens, CAPACITY).unwrap();
     }
 }
 
@@ -438,13 +406,25 @@ fn two_rows_do_not_share_state() {
         .map(|p| run_chunked(&*model, &fx.store, CAPACITY, &[4], p))
         .collect();
 
-    let two = |tokens: usize| StepShape {
-        rows: NonZeroUsize::new(2).unwrap(),
-        ..shape(tokens, CAPACITY, LogitRows::All)
+    let two = |tokens: usize| {
+        StepShape::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(tokens).unwrap(),
+            NonZeroUsize::new(CAPACITY).unwrap(),
+        )
+        // A one-token step is the decode step: the last position's logits.
+        .with_logits(if tokens == 1 {
+            LogitRows::Last
+        } else {
+            LogitRows::All
+        })
     };
-    let run = |phase, tokens: usize, ids: Vec<i32>, pos: Vec<i32>, state: Vec<Vec<f32>>| {
+    let run = |tokens: usize, ids: Vec<i32>, pos: Vec<i32>, state: Vec<Vec<f32>>| {
         let g = model
-            .trace(phase, two(tokens), poot_graph_ir::TraceLimits::for_tests())
+            .trace(
+                &StepSpec::step(two(tokens)),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()
@@ -463,19 +443,12 @@ fn two_rows_do_not_share_state() {
     };
     let prefix = |row: usize| prompts[row][..4].to_vec();
     let (logits, state) = run(
-        Phase::Prefill,
         4,
         [prefix(0), prefix(1)].concat(),
         (0..4).chain(0..4).collect(),
         Vec::new(),
     );
-    let (logits_after, state) = run(
-        Phase::Decode,
-        1,
-        vec![prompts[0][4], prompts[1][4]],
-        vec![4, 4],
-        state,
-    );
+    let (logits_after, state) = run(1, vec![prompts[0][4], prompts[1][4]], vec![4, 4], state);
     let vocab = model.config().vocab;
     for row in 0..2 {
         let (want, want_state) = &single[row];
@@ -770,29 +743,13 @@ fn a_granule_four_prompt_decodes_as_the_reference() {
     // The same tokens decoding every prompt token one at a time.
     let (mut logits, mut state) = (Vec::new(), Vec::new());
     for (pos, &token) in PROMPT.iter().enumerate() {
-        (logits, state) = run_step(
-            &*model,
-            &fx.store,
-            Phase::Decode,
-            32,
-            &[token],
-            pos as i32,
-            &state,
-        );
+        (logits, state) = run_step(&*model, &fx.store, 32, &[token], pos as i32, &state);
     }
     let argmax = |l: &[f32]| (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as i32;
     let mut token = argmax(&logits);
     let mut by_decode = vec![token as u32];
     for pos in PROMPT.len()..PROMPT.len() + 7 {
-        (logits, state) = run_step(
-            &*model,
-            &fx.store,
-            Phase::Decode,
-            32,
-            &[token],
-            pos as i32,
-            &state,
-        );
+        (logits, state) = run_step(&*model, &fx.store, 32, &[token], pos as i32, &state);
         token = argmax(&logits);
         by_decode.push(token as u32);
     }
@@ -818,14 +775,13 @@ fn backends() -> [Backend; 3] {
     ]
 }
 
-const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
 
-/// The traced and weight-bound graph of one step of `phase` at `tokens` tokens.
-fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
+/// The traced and weight-bound graph of one step of `tokens` tokens.
+fn bound_step(model: &dyn Model, tokens: usize) -> poot_graph_ir::Graph {
     let graph = model
         .trace(
-            phase,
-            shape(tokens, CAPACITY, LogitRows::Last),
+            &StepSpec::step(shape(tokens, CAPACITY, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -844,11 +800,11 @@ fn the_decode_and_prefill_graphs_compile_for_every_backend() {
     let (packed, _) = packed_and_decoded_fixture();
     for (label, fx) in [("dense", fixture()), ("packed", packed)] {
         let model = model_of(&fx);
-        for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
-            let graph = bound_step(&*model, phase, tokens);
+        for tokens in [1, 4] {
+            let graph = bound_step(&*model, tokens);
             for backend in backends() {
                 compile(&graph, &target_of(backend), &REPLAY)
-                    .unwrap_or_else(|e| panic!("{label} {phase:?} on {backend:?}: {e}"));
+                    .unwrap_or_else(|e| panic!("{label} {tokens}-token step on {backend:?}: {e}"));
             }
         }
     }
@@ -865,11 +821,11 @@ fn a_bf16_checkpoint_keeps_the_grouped_o_projection_bf16_resident() {
     let consts: Vec<String> = (0..4)
         .map(|layer| WeightId::layer(layer, WeightRole::Attn(AttnRole::OA)).const_name())
         .collect();
-    for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
-        let graph = bound_step(&*model, phase, tokens);
+    for tokens in [1, 4] {
+        let graph = bound_step(&*model, tokens);
         for backend in backends() {
             let program = compile(&graph, &target_of(backend), &REPLAY)
-                .unwrap_or_else(|e| panic!("{phase:?} on {backend:?}: {e}"));
+                .unwrap_or_else(|e| panic!("{tokens}-token step on {backend:?}: {e}"));
             let g = program.graph();
             for name in &consts {
                 let id = g
@@ -877,11 +833,13 @@ fn a_bf16_checkpoint_keeps_the_grouped_o_projection_bf16_resident() {
                     .iter_enumerated()
                     .find(|(_, meta)| meta.name.as_deref() == Some(name))
                     .map(|(id, _)| id)
-                    .unwrap_or_else(|| panic!("{phase:?} on {backend:?}: no const {name}"));
+                    .unwrap_or_else(|| {
+                        panic!("{tokens}-token step on {backend:?}: no const {name}")
+                    });
                 assert_eq!(
                     program.storage().storage(id).dtype(),
                     DType::BF16,
-                    "{phase:?} on {backend:?}: {name} is resident at its checkpoint dtype"
+                    "{tokens}-token step on {backend:?}: {name} is resident at its checkpoint dtype"
                 );
                 assert!(
                     !g.eqns().iter().any(|eqn| matches!(
@@ -891,7 +849,7 @@ fn a_bf16_checkpoint_keeps_the_grouped_o_projection_bf16_resident() {
                         eqn.inputs.first(),
                         Some(poot_graph_ir::Operand::Value(w)) if *w == id
                     )),
-                    "{phase:?} on {backend:?}: {name} has no widened F32 copy"
+                    "{tokens}-token step on {backend:?}: {name} has no widened F32 copy"
                 );
                 assert!(
                     g.eqns().iter().any(|eqn| matches!(
@@ -904,7 +862,7 @@ fn a_bf16_checkpoint_keeps_the_grouped_o_projection_bf16_resident() {
                         eqn.inputs.get(1),
                         Some(poot_graph_ir::Operand::Value(w)) if *w == id
                     )),
-                    "{phase:?} on {backend:?}: {name} is read by a grouped dense contraction"
+                    "{tokens}-token step on {backend:?}: {name} is read by a grouped dense contraction"
                 );
             }
         }
@@ -921,8 +879,8 @@ fn compile_preserves_every_witness_lane() {
     let fx = fixture();
     let model = model_of(&fx);
     let layers = 4;
-    for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
-        let graph = bound_step(&*model, phase, tokens);
+    for tokens in [1, 4] {
+        let graph = bound_step(&*model, tokens);
         let traced: Vec<(poot_graph_ir::ValidationId, String, usize)> = graph
             .witnesses()
             .map(|o| (o.id, o.name.to_owned(), graph.aval(o.value).numel()))
@@ -930,7 +888,7 @@ fn compile_preserves_every_witness_lane() {
         assert_eq!(
             traced.len(),
             3 * layers + 1,
-            "{phase:?}: three router witnesses per layer and the token guard"
+            "{tokens}-token step: three router witnesses per layer and the token guard"
         );
         for backend in backends() {
             let program = compile(&graph, &target_of(backend), &REPLAY).unwrap();
@@ -942,12 +900,12 @@ fn compile_preserves_every_witness_lane() {
                 .collect();
             assert_eq!(
                 compiled, traced,
-                "{phase:?} on {backend:?}: the packet layout"
+                "{tokens}-token step on {backend:?}: the packet layout"
             );
             assert_eq!(
                 layout.lane_count,
                 traced.iter().map(|(_, _, lanes)| lanes).sum::<usize>(),
-                "{phase:?} on {backend:?}: the lane count"
+                "{tokens}-token step on {backend:?}: the lane count"
             );
         }
     }
@@ -1056,11 +1014,10 @@ fn a_real_dims_layer_fixture_compiles_for_every_backend_real_dims() {
     let model = model_of(&fx);
     assert_eq!(model.config().prefill_granule.get(), 128);
     let capacity = 256;
-    for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 128)] {
+    for tokens in [1, 128] {
         let graph = model
             .trace(
-                phase,
-                shape(tokens, capacity, LogitRows::Last),
+                &StepSpec::step(shape(tokens, capacity, LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -1071,9 +1028,9 @@ fn a_real_dims_layer_fixture_compiles_for_every_backend_real_dims() {
         .unwrap();
         for backend in backends() {
             let program = compile(&graph, &target_of(backend), &REPLAY)
-                .unwrap_or_else(|e| panic!("{phase:?} on {backend:?}: {e}"));
+                .unwrap_or_else(|e| panic!("{tokens}-token step on {backend:?}: {e}"));
             eprintln!(
-                "real-dims V4 {phase:?} on {backend:?}: compiled, {} equations",
+                "real-dims V4 {tokens}-token step on {backend:?}: compiled, {} equations",
                 program.planned().count()
             );
         }

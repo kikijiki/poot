@@ -10,12 +10,11 @@
 //! value - an ordinary production entry, not a test-only accessor.
 
 use poot_graph_ir::test_support::const_weights::ConstWeights;
-use poot_graph_plan::production_plan::Submission;
 use poot_graph_plan::staged::{DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{
     BindError, Executor, ExecutorStats, LoadError, NoSync, StateScope, StepInputs,
 };
@@ -24,7 +23,7 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::test_support::{gpu_caps, gpu_caps_mut};
 use poot_graph_plan::{CompileOptions, Target, staged::compile_staged};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
@@ -50,8 +49,7 @@ fn decode_graph(dense: &Dense, cap: usize) -> Graph {
         .f32_model()
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -63,8 +61,7 @@ fn prefill_graph(dense: &Dense, n: usize, cap: usize) -> Graph {
         .f32_model()
         .model
         .trace(
-            Phase::Prefill,
-            step(1, n, cap, LogitRows::Last),
+            &StepSpec::step(step(1, n, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -132,11 +129,7 @@ fn wgpu_target(device: &WgpuDevice) -> Target {
     device.target()
 }
 
-fn staged(
-    g: &Graph,
-    target: Target,
-    submission: Submission,
-) -> poot_graph_plan::staged::StagedProgram {
+fn staged(g: &Graph, target: Target) -> poot_graph_plan::staged::StagedProgram {
     let g = g.clone();
     compile_staged(
         &g,
@@ -145,7 +138,7 @@ fn staged(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(submission, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -248,7 +241,7 @@ fn oracle_step(
         };
         inputs.insert(id, value);
     }
-    let evaluation = eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let evaluation = eval(g, &inputs, EvalOptions::default()).unwrap();
     for ((si, _), t) in g.state().zip(evaluation.state) {
         state.insert(
             g.meta(si).name.clone().unwrap(),
@@ -347,9 +340,7 @@ fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
     let store = store_for(&[&g]);
     let (named, map) = bind_graphs(&store, &[&g]);
     let exe = exec.load_weights(Arc::new(store.clone()), map).unwrap();
-    let decode = exec
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    let decode = exec.add_entry(exe, &staged(&named[0], target)).unwrap();
     let mut oracle_state = HashMap::new();
     for pos in 0..CAP {
         let token = ((pos * 7 + 3) % 32) as u32;
@@ -365,39 +356,6 @@ fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
     }
     let ExecutorStats { recordings, .. } = exec.stats();
     assert_eq!(recordings, 1, "one entry, one recording after 8 steps");
-}
-
-/// The contract admits `Submission::Replay` only. A `Submission::Eager`
-/// program is refused at `add_entry` with a typed error naming the missing capability, before any
-/// allocation (`load_entry` never runs, so `stats()` after the refusal is unchanged from before it -
-/// `Submission::Eager` survives only on the pre-contract executors, never through this entry point).
-/// Mutation: drop the `program.submission() != Submission::Replay` check in `Engine::add_entry`; an
-/// Eager program is accepted and the row goes red.
-#[test]
-fn eager_submission_is_refused_at_add_entry_before_any_allocation() {
-    let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
-        return;
-    };
-    let target = wgpu_target(&device);
-    let mut engine = poot_executor::Engine::new(device);
-    let g = decode_graph(&dense(), CAP);
-    let store = Arc::new(store_for(&[&g]));
-    let (named, map) = bind_graphs(&store, &[&g]);
-    let exe = engine.load_weights(store, map).unwrap();
-    let before = engine.stats();
-    let error = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Eager))
-        .expect_err("a Submission::Eager program must be refused at add_entry");
-    assert!(
-        matches!(error, poot_executor::ExecError::Load(ref e) if matches!(**e, poot_executor::LoadError::Unimplemented(_))),
-        "expected a typed LoadError::Unimplemented naming the missing capability, got {error:?}"
-    );
-    let after = engine.stats();
-    assert_eq!(
-        before.memory, after.memory,
-        "a refused add_entry must not allocate anything"
-    );
 }
 
 /// SC-004 (Z5) + SC-010: a prefill entry and a decode entry share state by (name, aval, storage).
@@ -418,12 +376,8 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
     let store = Arc::new(store_for(&[&prefill_g, &decode_g]));
     let (named, map) = bind_graphs(&store, &[&prefill_g, &decode_g]);
     let exe = engine.load_weights(store.clone(), map).unwrap();
-    let prefill = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
-    let decode = engine
-        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
-        .unwrap();
+    let prefill = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
+    let decode = engine.add_entry(exe, &staged(&named[1], target)).unwrap();
 
     // One state-probe entry per KV state name, sharing the real entries' buffers.
     let mut probes = Vec::new();
@@ -433,7 +387,7 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
             let name = meta.name.clone().unwrap();
             let probe_graph = state_probe_graph(&name, meta.aval.clone());
             let probe = engine
-                .add_entry(exe, &staged(&probe_graph, target, Submission::Replay))
+                .add_entry(exe, &staged(&probe_graph, target))
                 .unwrap();
             probes.push((name, probe, meta.aval.numel() * 4));
         }
@@ -510,12 +464,8 @@ fn remove_entry_frees_its_arena_and_leaves_the_other_entry_unaffected() {
     let store = Arc::new(store_for(&[&prefill_g, &decode_g]));
     let (named, map) = bind_graphs(&store, &[&prefill_g, &decode_g]);
     let exe = engine.load_weights(store.clone(), map).unwrap();
-    let prefill = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
-    let decode = engine
-        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
-        .unwrap();
+    let prefill = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
+    let decode = engine.add_entry(exe, &staged(&named[1], target)).unwrap();
 
     // Step both so each records once (recordings is otherwise 0 and the "unchanged" assertion below
     // would be vacuous).
@@ -593,12 +543,8 @@ fn unload_on_the_wgpu_engine_reads_zero_memory() {
     let store = Arc::new(store_for(&[&prefill_g, &decode_g]));
     let (named, map) = bind_graphs(&store, &[&prefill_g, &decode_g]);
     let exe = engine.load_weights(store.clone(), map).unwrap();
-    let prefill = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
-    let decode = engine
-        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
-        .unwrap();
+    let prefill = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
+    let decode = engine.add_entry(exe, &staged(&named[1], target)).unwrap();
     let prompt: Vec<u32> = (0..n as u32).collect();
     let values = slot_values(&prefill_g, &prompt, 0);
     engine
@@ -646,11 +592,9 @@ fn state_with_same_name_and_other_aval_is_refused() {
     let store = Arc::new(store_for(&[&g, &other]));
     let (named, map) = bind_graphs(&store, &[&g, &other]);
     let exe = engine.load_weights(store, map).unwrap();
-    engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    engine.add_entry(exe, &staged(&named[0], target)).unwrap();
     let err = engine
-        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
+        .add_entry(exe, &staged(&named[1], target))
         .unwrap_err();
     assert!(
         matches!(&err, poot_executor::ExecError::Bind(b) if matches!(**b, BindError::StateSchema { .. })),
@@ -706,9 +650,7 @@ fn mid_load_refusal_rolls_back_a_newly_allocated_state_and_leaves_the_existing_e
     let store = Arc::new(WeightStore::builder().build());
     let (named, map) = bind_graphs(&store, &[&g1, &g2]);
     let exe = engine.load_weights(store, map).unwrap();
-    let entry = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
     engine
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
         .unwrap()
@@ -718,7 +660,7 @@ fn mid_load_refusal_rolls_back_a_newly_allocated_state_and_leaves_the_existing_e
     assert_eq!(before.recordings, 1, "the first step records once");
 
     let err = engine
-        .add_entry(exe, &staged(&named[1], target, Submission::Replay))
+        .add_entry(exe, &staged(&named[1], target))
         .unwrap_err();
     assert!(
         matches!(&err, poot_executor::ExecError::Bind(b) if matches!(**b, BindError::StateSchema { .. })),
@@ -772,9 +714,7 @@ fn binder_and_target_refusals_are_typed() {
     let store = Arc::new(store_for(&[&g]));
     let (named, map) = bind_graphs(&store, &[&g]);
     let exe = engine.load_weights(store, map).unwrap();
-    let decode = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    let decode = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
     let values = slot_values(&g, &[1], 0);
 
     let missing = step_inputs(&values[1..]);
@@ -919,7 +859,7 @@ fn binder_and_target_refusals_are_typed() {
     let mut other = target;
     gpu_caps_mut(&mut other).max_grid[0] -= 1;
     let err = engine
-        .add_entry(exe, &staged(&named[0], other, Submission::Replay))
+        .add_entry(exe, &staged(&named[0], other))
         .unwrap_err();
     assert!(
         matches!(&err, poot_executor::ExecError::Load(l) if matches!(**l, LoadError::TargetMismatch { .. })),
@@ -986,9 +926,7 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps() {
     let store = Arc::new(builder.build());
     let (named, map) = bind_graphs(&store, &[&g]);
     let exe = engine.load_weights(store, map).unwrap();
-    let entry = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
 
     let mut oracle_a = vec![0.0f32; 4];
     let mut oracle_s = vec![0.0f32; 4];
@@ -1044,9 +982,7 @@ fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() 
     let store = store_for(&[&prefill_g]);
     let (named, map) = bind_graphs(&store, &[&prefill_g]);
     let exe = engine.load_weights(Arc::new(store.clone()), map).unwrap();
-    let prefill = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    let prefill = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
     let prompt: Vec<u32> = (0..n as u32).map(|t| t % 32).collect();
     let values = slot_values(&prefill_g, &prompt, 0);
     let mut oracle_state = HashMap::new();
@@ -1088,9 +1024,7 @@ fn single_decode_step_crosses_flush_work_by_summed_work_and_matches_the_oracle()
     let store = store_for(&[&g]);
     let (named, map) = bind_graphs(&store, &[&g]);
     let exe = engine.load_weights(Arc::new(store.clone()), map).unwrap();
-    let decode = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    let decode = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
     let values = slot_values(&g, &[0], 0);
     let mut oracle_state = HashMap::new();
     let expected = oracle_step(&g, &store, &values, &mut oracle_state);
@@ -1143,7 +1077,10 @@ fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) 
     let x = b
         .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, k]))
         .unwrap();
-    let y = poot_graph_ir::ops::packed_linear(&b, x, "linear0", descriptor, None, None).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+        &b, x, "linear0", descriptor, None, None,
+    )
+    .unwrap();
     let g = b.finish(y).unwrap();
 
     let store = {
@@ -1156,9 +1093,7 @@ fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) 
 
     let (named, map) = bind_graphs(&store, &[&g]);
     let exe = engine.load_weights(Arc::new(store), map).unwrap();
-    let entry = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
 
     let x_values = fill(k, 0xA5);
     let (x_id, _) = *g
@@ -1196,7 +1131,7 @@ fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) 
         };
         oracle_inputs.insert(id, value);
     }
-    let oracle = eval(&g, &oracle_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let oracle = eval(&g, &oracle_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1313,9 +1248,7 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
         .allocate(BufferRole::Output, BufferStorage::f32(), 4)
         .unwrap();
 
-    device
-        .begin(poot_graph_plan::production_plan::Submission::Replay)
-        .unwrap();
+    device.begin().unwrap();
     device
         .dispatch(Dispatch {
             kernel: &kernel,
@@ -1343,7 +1276,7 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
     let recording = device
         .finish()
         .unwrap()
-        .expect("Submission::Replay always returns a recording");
+        .expect("a device always returns a recording");
     device
         .replay(&recording)
         .expect("replay only re-encodes metadata; it never runs the dispatch itself");
@@ -1397,7 +1330,7 @@ fn wgpu_device_refuses_an_aie_launch_as_a_typed_error() {
         .allocate(BufferRole::Output, BufferStorage::f32(), 1)
         .unwrap();
 
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     let error = device
         .dispatch(Dispatch {
             kernel: &kernel,
@@ -1492,10 +1425,7 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
                 poot_graph_plan::multi_device::topology::DeviceId(0),
             ),
         },
-        &poot_graph_plan::CompileOptions::new(
-            Submission::Replay,
-            poot_graph_plan::CompileLimits::STANDARD,
-        ),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap();
 
@@ -1576,9 +1506,7 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
 
     let (named, map) = bind_graphs(&store, &[&g]);
     let exe = engine.load_weights(Arc::new(store), map).unwrap();
-    let entry = engine
-        .add_entry(exe, &staged(&named[0], target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&named[0], target)).unwrap();
 
     let idx_value: i32 = 2;
     let idx_bytes = idx_value.to_le_bytes();
@@ -1645,7 +1573,7 @@ fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
         };
         oracle_inputs.insert(id, value);
     }
-    let oracle = eval(&g, &oracle_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let oracle = eval(&g, &oracle_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

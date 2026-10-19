@@ -10,10 +10,10 @@
 
 use std::collections::HashMap as Map;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{Slot, Storage, ValueId};
-use poot_graph_plan::{CompileOptions, Target, compile, production_plan::Submission};
-use poot_models::model::{LogitRows, Phase};
+use poot_graph_plan::{CompileOptions, Target, compile};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_target::Backend;
 use poot_tensor::HostTensor;
@@ -49,14 +49,13 @@ fn tiny_legalize_model() -> poot_models::test_support::weight_map::MappedModel {
         .f32_model()
 }
 
-/// `tiny_legalize_model`'s step graph for `phase`: `tokens` new tokens over `cap` positions, logits
+/// `tiny_legalize_model`'s step graph: `tokens` new tokens over `cap` positions, logits
 /// at every position so the graph ends in the lm_head `MatMul` [`without_lm_head`] cuts at.
-fn trace(phase: Phase, tokens: usize, cap: usize) -> poot_graph_ir::Graph {
+fn trace(tokens: usize, cap: usize) -> poot_graph_ir::Graph {
     tiny_legalize_model()
         .model
         .trace(
-            phase,
-            step(1, tokens, cap, LogitRows::All),
+            &StepSpec::step(step(1, tokens, cap, LogitRows::All)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -141,7 +140,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
                 .collect(),
         )
     };
-    let gd = without_lm_head(trace(Phase::Decode, 1, cap));
+    let gd = without_lm_head(trace(1, cap));
     let mut di: Map<ValueId, Value> = Map::new();
     for &id in gd.inputs() {
         let m = gd.meta(id);
@@ -169,7 +168,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             Value::from(HostTensor::zeros(gd.aval(si).shape.clone())),
         );
     }
-    let hidden_dense = eval(&gd, &di, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let hidden_dense = eval(&gd, &di, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -179,7 +178,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
         backend: Backend::SpirvVulkan,
         caps: caps_hosting_only_the_tiny_embed(),
     };
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     let program = compile(&gd, &target, &options)
         .expect("the embed table hosts; nothing else in this fixture is oversized");
     let gh = program.graph();
@@ -226,7 +225,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             Value::from(HostTensor::zeros(gh.aval(si).shape.clone())),
         );
     }
-    let hidden_host = eval(gh, &hi, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let hidden_host = eval(gh, &hi, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -240,7 +239,7 @@ fn compile_hosts_the_decode_embed_gather_without_changing_hidden_state() {
 }
 
 /// Same as [`compile_hosts_the_decode_embed_gather_without_changing_hidden_state`], for the multi-row
-/// prefill step (`Phase::Prefill`, L>1) - the hosted `Slot::TokenEmbed` shape is `[l,hidden]` (one row
+/// prefill step (a `step` of L>1 tokens) - the hosted `Slot::TokenEmbed` shape is `[l,hidden]` (one row
 /// per prompt position), driven through `compile`.
 #[test]
 fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
@@ -259,7 +258,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         )
     };
 
-    let gd = without_lm_head(trace(Phase::Prefill, l, l));
+    let gd = without_lm_head(trace(l, l));
     let mut di: Map<ValueId, Value> = Map::new();
     for &id in gd.inputs() {
         let m = gd.meta(id);
@@ -291,7 +290,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             Value::from(HostTensor::zeros(gd.aval(si).shape.clone())),
         );
     }
-    let hidden_dense = eval(&gd, &di, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let hidden_dense = eval(&gd, &di, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -301,7 +300,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         backend: Backend::SpirvVulkan,
         caps: caps_hosting_only_the_tiny_embed(),
     };
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     let program = compile(&gd, &target, &options)
         .expect("the embed table hosts; nothing else in this fixture is oversized");
     let gh = program.graph();
@@ -345,7 +344,7 @@ fn compile_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             Value::from(HostTensor::zeros(gh.aval(si).shape.clone())),
         );
     }
-    let hidden_host = eval(gh, &hi, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let hidden_host = eval(gh, &hi, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

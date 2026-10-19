@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{Builder, Graph, OpKind, TensorType, UnOp, ValueId};
 use poot_graph_plan::fuse;
 use poot_tensor::HostTensor;
@@ -77,12 +77,12 @@ fn recip_tanh_erf_fused_region_matches_the_oracle() {
         .into_iter()
         .map(|(k, v)| (k, Value::from(v)))
         .collect();
-    let raw = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let raw = eval(&graph, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
         .unwrap();
-    let fused_out = eval(&fused, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let fused_out = eval(&fused, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

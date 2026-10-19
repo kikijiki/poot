@@ -524,8 +524,8 @@ pub fn assert_split_kv_pipeline_matches_the_oracle(
     use poot_graph_ir::test_support::const_weights::ConstWeights;
     use poot_graph_ir::{Slot, Storage};
     use poot_graph_plan::{
-        CompileLimits, CompileOptions, production_plan::Submission, staged::DevicePlacement,
-        staged::ExpertPlacement, staged::Partition, staged::compile_staged,
+        CompileLimits, CompileOptions, staged::DevicePlacement, staged::ExpertPlacement,
+        staged::Partition, staged::compile_staged,
     };
     use poot_quant::StoredBytes;
     use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -573,7 +573,7 @@ pub fn assert_split_kv_pipeline_matches_the_oracle(
                 devices: devices.to_vec(),
             },
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .map_err(|e| format!("compile_staged: {e}"))?;
     let mut planned = Vec::new();

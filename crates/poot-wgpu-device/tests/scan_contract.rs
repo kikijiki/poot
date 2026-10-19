@@ -3,15 +3,12 @@
 //! tier 2 of the CPU oracle's evaluation of the same graph (its decomposition), across consecutive steps
 //! whose carried state is the previous step's committed `s_out`. Sequences of 64, 1024 and 4096 positions run
 //! in one launch and, stepped in pieces, through the carried state; each is compared with the oracle and the
-//! two with each other. The multi-launch split a
-//! `max_dispatch_work` bound makes is proven on the interpreter (`poot-kernelgen/tests/scan.rs`) and the
-//! planner (`poot-graph-plan/tests/scan_contract.rs`): a real device's caps carry no calibrated bound, so it
-//! launches once.
+//! two with each other. The scan always launches once.
 //!
 //! Mutation (guards `poot-kernelgen`'s `scan.rs`, applied once with a fresh `POOT_KERNEL_CACHE_DIR`, observed
 //! red, restored): drop the final-state publish; the continuation steps go red.
 
-use poot_eval::{EvalBudget, EvalOptions, eval};
+use poot_eval::{EvalOptions, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::scan::{check_steps, measure, numerics_class, streamed_in_pieces};
 use poot_graph_ir::Graph;
@@ -21,7 +18,7 @@ use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_wgpu_device::device::WgpuDevice;
 
-use poot_executor_parity::assert_close;
+use poot_test_util::assert_close_scaled;
 
 fn oracle(
     graph: &Graph,
@@ -31,7 +28,7 @@ fn oracle(
         .iter()
         .map(|(&id, t)| (id, poot_eval::Value::from(t.clone())))
         .collect();
-    eval(graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(graph, &values, EvalOptions::default())
         .unwrap_or_else(|e| panic!("oracle: {e}"))
         .output
         .into_host()
@@ -112,7 +109,7 @@ fn long_scan_agrees_with_the_oracle_and_with_stepped_pieces_on_wgpu() {
                 16,
                 &format!("{label} pieces"),
             );
-            assert_close(
+            assert_close_scaled(
                 &whole[0],
                 &stepped,
                 numerics_class(target, &ScanFixture { len, ..base }).tolerance(),

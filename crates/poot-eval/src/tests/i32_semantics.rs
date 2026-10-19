@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use poot_graph_ir::{BinOp, Builder, Graph, Traced, ValueId};
 
-use crate::{EvalBudget, EvalOptions, ExactI32TensorView, ExactValue, Value, eval};
+use crate::{EvalOptions, ExactI32TensorView, ExactValue, Value, eval};
 use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
 
@@ -53,7 +53,7 @@ fn dense_bound_words(graph: &Graph, ids: &[ValueId], inputs: &[&[i32]]) -> Vec<i
             )
         })
         .collect();
-    let out = eval(graph, &bound, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(graph, &bound, EvalOptions::default())
         .expect("the one walk evaluates the I32 table through a dense binding")
         .output;
     out.into_host()
@@ -73,7 +73,7 @@ fn exact_bound_words(graph: &Graph, ids: &[ValueId], inputs: &[&[i32]]) -> Vec<i
             (id, Value::Exact(ExactValue::I32(view)))
         })
         .collect();
-    let out = eval(graph, &bound, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(graph, &bound, EvalOptions::default())
         .expect("the one walk evaluates the I32 table through an exact binding")
         .output;
     out.into_host()
@@ -164,7 +164,7 @@ fn exact_i32_add_published_as_the_output_evaluates_to_wrapped_words() {
         (left.id(), view([i32::MAX, -5])),
         (right.id(), view([1, 2])),
     ]);
-    let out = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&graph, &inputs, EvalOptions::default())
         .expect("an observable I32 Add is ordinary I32 arithmetic through the one walk")
         .output;
     let host = out

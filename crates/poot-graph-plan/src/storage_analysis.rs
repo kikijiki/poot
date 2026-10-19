@@ -309,8 +309,6 @@ fn value_storage_kind(
 
 #[cfg(test)]
 mod value_storage_tests {
-
-    use crate::production_plan::Submission;
     use crate::staged::{
         DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet, compile_staged,
     };
@@ -319,7 +317,6 @@ mod value_storage_tests {
     use poot_tensor::DType;
 
     use super::{GraphStorage, Plan};
-    use crate::dtype_widen::prepare_target_graph;
     use crate::planner::plan_eqn;
 
     /// The public `plan_value_storage` entry point was deleted (Card 626; its only callers were the
@@ -354,9 +351,9 @@ mod value_storage_tests {
         super::value_storage_of_plans(g, backend, plans.iter().map(Option::as_ref))
     }
 
-    /// `a x w -> f32` over two consts of the given dtypes, `m x 32 x 32`; mirrors
-    /// `dtype_widen::tests::const_matmul`.
-    fn const_matmul(m: usize, a_dtype: DType, w_dtype: DType) -> Graph {
+    /// `a x w^T -> f32` over two consts of the given dtypes, `m x 32` against a checkpoint-order `[32, 32]` weight;
+    /// mirrors `dtype_widen::tests::checkpoint_matmul`.
+    fn checkpoint_matmul(m: usize, a_dtype: DType, w_dtype: DType) -> Graph {
         let b = Builder::for_tests();
         let a = b
             .constant("a", TensorType::new(vec![m, 32], a_dtype))
@@ -364,7 +361,8 @@ mod value_storage_tests {
         let w = b
             .constant("w", TensorType::new(vec![32, 32], w_dtype))
             .unwrap();
-        let mm = b.matmul(a, w).unwrap();
+        let wt = b.transpose(w, vec![1, 0]).unwrap();
+        let mm = b.matmul(a, wt).unwrap();
         let g = b.finish(mm).unwrap();
         let out = g
             .eqns()
@@ -378,14 +376,14 @@ mod value_storage_tests {
         .unwrap()
     }
 
-    /// Card 526, Card 1011: [`fixture_value_storage`]'s per-value dtype is the const's declared dtype for every
+    /// Card 526, Card 1011: the compiled program's per-value storage dtype is the const's declared dtype for every
     /// const of every dense fixture graph, on every backend and AMD arch family: a BF16 const is planned BF16
     /// (packed or native), never F32. This is the general record every binder reads.
     ///
     /// Mutation: have `value_storage_kind` return `StorageKind::Dense(DType::F32)` for a BF16 const; the BF16
     /// rows go red naming the const.
     #[test]
-    fn fixture_value_storage_dtype_is_the_declared_dtype() {
+    fn program_storage_dtype_is_the_declared_dtype() {
         let backends = [
             Backend::SpirvVulkan,
             Backend::Nvptx,
@@ -394,29 +392,47 @@ mod value_storage_tests {
             Backend::AmdGcn(AmdArch::new("gfx1030", 32)),
             Backend::AmdGcn(AmdArch::new("gfx1200", 32)),
         ];
+        // (label, graph, whether every target must plan it)
         let graphs = [
             (
                 "mixed bf16 prefill",
-                const_matmul(32, DType::BF16, DType::BF16),
+                checkpoint_matmul(32, DType::BF16, DType::BF16),
+                false,
             ),
             (
                 "mixed bf16 decode",
-                const_matmul(1, DType::BF16, DType::BF16),
+                checkpoint_matmul(1, DType::BF16, DType::BF16),
+                false,
             ),
             (
                 "bf16 checkpoint prefill",
-                const_matmul(32, DType::F32, DType::BF16),
+                checkpoint_matmul(32, DType::F32, DType::BF16),
+                true,
             ),
             (
                 "bf16 checkpoint decode",
-                const_matmul(1, DType::F32, DType::BF16),
+                checkpoint_matmul(1, DType::F32, DType::BF16),
+                true,
             ),
         ];
         for backend in backends {
-            for (label, g) in &graphs {
-                let caps = poot_test_util::device_caps::default_caps_for(backend);
-                let prepared = prepare_target_graph(g, backend).unwrap();
-                let storage = fixture_value_storage(&prepared, backend, &caps);
+            for (label, g, must_plan) in &graphs {
+                let target = crate::Target::Gpu {
+                    backend,
+                    caps: poot_test_util::device_caps::default_caps_for(backend),
+                };
+                let options = crate::CompileOptions::new(crate::CompileLimits::STANDARD);
+                let program = match crate::compile(g, &target, &options) {
+                    Ok(program) => program,
+                    Err(crate::CompileError::Plan(error))
+                        if !must_plan && matches!(*error, crate::PlanError::Refused(_)) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("{label} on {backend:?}: {error}"),
+                };
+                let prepared = program.graph();
+                let storage = program.storage();
                 for id in prepared
                     .values()
                     .ids()
@@ -426,7 +442,7 @@ mod value_storage_tests {
                     let got = storage.storage(id).dtype();
                     assert_eq!(
                         got, want,
-                        "{label} on {backend:?} {id}: fixture_value_storage says {got:?}, the const is declared {want:?}"
+                        "{label} on {backend:?} {id}: the program's storage says {got:?}, the const is declared {want:?}"
                     );
                 }
             }
@@ -673,7 +689,7 @@ mod value_storage_tests {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD),
+            &CompileOptions::new(crate::CompileLimits::STANDARD),
         )
         .expect_err("a gather over a packed BF16 table has no lane to read");
         let crate::staged::StagedCompileError::Compile(crate::CompileError::Plan(plan)) = error
@@ -730,7 +746,7 @@ mod value_storage_tests {
                     experts: ExpertPlacement::AllResident,
                     devices: DevicePlacement::Single(DeviceId(0)),
                 },
-                &CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD),
+                &CompileOptions::new(crate::CompileLimits::STANDARD),
             )
             .unwrap();
             let (_, _, program) = staged.stages().next().unwrap();

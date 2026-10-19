@@ -1,6 +1,6 @@
 //! Attention and linear-attention decode/prefill, UT transform inverse, GDN chunked prefill, causal conv1d.
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::graph::StateRole;
 use poot_graph_ir::ops::{
@@ -49,7 +49,7 @@ fn attention_matches_direct() {
         vi,
         Value::from(HostTensor::f32(vec![1, hkv, s, d], vd.clone())),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -155,7 +155,7 @@ fn linear_attention_decode_gated_matches_direct() {
             si,
             Value::from(HostTensor::f32(vec![1, hq, dk, dv], sd.clone())),
         );
-        eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -216,7 +216,7 @@ fn linear_attention_prefill_matches_recurrence() {
         Value::from(HostTensor::f32(vec![1, hkv, l, dv], vd.clone())),
     );
     inputs.insert(mi, Value::from(HostTensor::f32(vec![1, 1, l, l], md)));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -283,7 +283,7 @@ fn ut_transform_inverse_reconstructs_identity() {
         attn_t.id(),
         Value::from(HostTensor::f32(vec![c, c], attn.clone())),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -353,7 +353,7 @@ fn ut_transform_inverse_reconstructs_identity_c64() {
         attn_t.id(),
         Value::from(HostTensor::f32(vec![c, c], attn.clone())),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -420,7 +420,7 @@ fn ut_transform_inverse_matches_forward_substitution_under_adversarial_input() {
         attn_t.id(),
         Value::from(HostTensor::f32(vec![c, c], attn.clone())),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -475,7 +475,7 @@ fn ut_transform_inverse_reconstructs_identity_batched() {
         attn_t.id(),
         Value::from(HostTensor::f32(vec![h, c, c], attn.clone())),
     );
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -634,7 +634,7 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
         );
         inp.insert(ds_in.id(), Value::from(state.clone()));
 
-        let (ot, new_states) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (ot, new_states) = eval(&dg, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -764,7 +764,7 @@ fn check_gdn_prefill_chunked_matches_decode_ex(
         Value::from(HostTensor::f32(vec![1, 1, c, c], tril_strict)),
     );
 
-    let (got_o, got_states) = eval(&cgraph, &cinp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let (got_o, got_states) = eval(&cgraph, &cinp, EvalOptions::default())
         .map(|r| {
             let state = r
                 .state
@@ -1006,7 +1006,7 @@ fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
             cts.id(),
             Value::from(HostTensor::f32(vec![1, 1, c, c], tril_strict.clone())),
         );
-        let (got_o, _) = eval(&cgraph, &cinp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (got_o, _) = eval(&cgraph, &cinp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -1059,7 +1059,7 @@ fn gdn_prefill_chunked_decay_magnitude_sweep_real_dims() {
                 Value::from(HostTensor::f32(vec![1, h_v, 1, 1], btt)),
             );
             inp.insert(ds_in.id(), Value::from(state.clone()));
-            let (ot, ns) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let (ot, ns) = eval(&dg, &inp, EvalOptions::default())
                 .map(|r| {
                     let state = r
                         .state
@@ -1231,7 +1231,7 @@ fn gdn_decode_continuation_one_level(
         cts.id(),
         Value::from(HostTensor::f32(vec![1, 1, c, c], tril_strict)),
     );
-    let (_, chunked_states) = eval(&cgraph, &cinp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let (_, chunked_states) = eval(&cgraph, &cinp, EvalOptions::default())
         .map(|r| {
             let state = r
                 .state
@@ -1306,7 +1306,7 @@ fn gdn_decode_continuation_one_level(
             Value::from(HostTensor::f32(vec![1, h_v, 1, 1], btt)),
         );
         inp.insert(ds_in.id(), Value::from(state.clone()));
-        let (ot, ns) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (ot, ns) = eval(&dg, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -1442,7 +1442,7 @@ fn cumulative_log_decay_scan_at_least_as_precise_as_matmul_cumsum() {
         Value::from(HostTensor::f32(vec![1, hv, c, 1], gd.clone())),
     );
     minp.insert(mt.id(), Value::from(HostTensor::f32(vec![1, 1, c, c], ti)));
-    let matmul_cum = eval(&mgraph, &minp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let matmul_cum = eval(&mgraph, &minp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1460,7 +1460,7 @@ fn cumulative_log_decay_scan_at_least_as_precise_as_matmul_cumsum() {
         sg.id(),
         Value::from(HostTensor::f32(vec![1, hv, c, 1], gd.clone())),
     );
-    let scan_cum = eval(&sgraph, &sinp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let scan_cum = eval(&sgraph, &sinp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1600,7 +1600,7 @@ fn gdn_prefill_chunked_matches_decode_at_extreme_within_chunk_decay_step() {
     );
     cin.insert(cti.id(), Value::from(HostTensor::f32(vec![1, 1, c, c], ti)));
     cin.insert(cts.id(), Value::from(HostTensor::f32(vec![1, 1, c, c], ts)));
-    let (got_o, got_s) = eval(&cgraph, &cin, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let (got_o, got_s) = eval(&cgraph, &cin, EvalOptions::default())
         .map(|r| {
             let state = r
                 .state
@@ -1678,7 +1678,7 @@ fn gdn_prefill_chunked_matches_decode_at_extreme_within_chunk_decay_step() {
             Value::from(HostTensor::f32(vec![1, h_v, 1, 1], vec![betad[t]])),
         );
         inp.insert(ds_in.id(), Value::from(state.clone()));
-        let (ot, ns) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (ot, ns) = eval(&dg, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -1742,7 +1742,7 @@ fn causal_conv1d_prefill_vs_decode_real_dims() {
         pw.id(),
         Value::from(HostTensor::f32(vec![k, conv_dim], wd.clone())),
     );
-    let got = eval(&pg, &pin, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&pg, &pin, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1782,7 +1782,7 @@ fn causal_conv1d_prefill_vs_decode_real_dims() {
             Value::from(HostTensor::f32(vec![k, conv_dim], wd.clone())),
         );
         inp.insert(dc.id(), Value::from(cache.clone()));
-        let (ot, ns) = eval(&dgg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (ot, ns) = eval(&dgg, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -1860,7 +1860,7 @@ fn linear_attention_prefill_per_head_gate_matches_recurrence() {
         Value::from(HostTensor::f32(vec![1, hkv, l, dv], vd.clone())),
     );
     inputs.insert(mi, Value::from(HostTensor::f32(vec![1, hq, l, l], md)));
-    let got = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1908,7 +1908,7 @@ fn reduce_over_non_last_axis_keepdim_is_correct() {
         x.id(),
         Value::from(HostTensor::f32(vec![a, b_, c], xd.clone())),
     );
-    let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1965,7 +1965,7 @@ fn causal_conv1d_decode_loop_matches_reference() {
         );
         inp.insert(w.id(), Value::from(HostTensor::f32(vec![k, c], wd.clone())));
         inp.insert(cache.id(), Value::from(caches[0].clone()));
-        let (o_t, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (o_t, new) = eval(&g, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -2041,7 +2041,7 @@ fn causal_conv1d_prefill_matches_decode() {
             Value::from(HostTensor::f32(vec![k, c], wd.clone())),
         );
         inp.insert(dcache.id(), Value::from(cache.clone()));
-        let (o_t, new_states) = eval(&dg, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (o_t, new_states) = eval(&dg, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -2075,7 +2075,7 @@ fn causal_conv1d_prefill_matches_decode() {
     let mut pinp = HashMap::new();
     pinp.insert(px.id(), Value::from(HostTensor::f32(vec![1, l, c], xd)));
     pinp.insert(pw.id(), Value::from(HostTensor::f32(vec![k, c], wd)));
-    let got = eval(&pg, &pinp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&pg, &pinp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

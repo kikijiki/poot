@@ -2,7 +2,7 @@
 //! `poot-kernelgen` reads a `poot_quant::format::FormatDescriptor` at generation time and emits one
 //! KIR decode per `(format, op)`. No kernel source here names a scheme; every per-format fact comes
 //! from the descriptor's own constants. 542a covers the block-32 formats and `Schedule::Gemv`; 542b
-//! adds the K-quant super-blocks' packed `SubScale`/`SubMin` sub-factors and `Schedule::Tiled` for
+//! adds the K-quant super-blocks' packed `SubScale`/`SubMin` sub-factors and `Schedule::RegisterTiled` for
 //! `M > 1` (card 658: every `M > 1` block-diagonal split too, never `Schedule::Serial`, deleted).
 
 mod decode_plan;
@@ -130,7 +130,7 @@ mod fixtures {
         BlockLayout, FieldEncoding, FloatFormat, OperandRole, Storage, ValueMap, WeightFormat,
     };
 
-    use crate::contraction::{Schedule, TileSize};
+    use crate::contraction::{LaneRows, RunLength, Schedule, TileSize};
 
     /// A codegen-safe (LLVM-identifier-safe) name fragment for a schedule: `{schedule:?}` on
     /// `Schedule::Gemv { .. }` contains `{`, `}` and a space, which breaks an AMDGCN/NVPTX global
@@ -145,6 +145,22 @@ mod fixtures {
             Schedule::Tiled {
                 tile: TileSize(tile),
             } => format!("tiled{tile}"),
+            Schedule::RegisterTiled {
+                lanes: TileSize(lanes),
+                rows,
+                run,
+            } => format!("register_tiled{lanes}x{}r{}", rows.get(), run.get()),
+        }
+    }
+
+    /// A [`Schedule::RegisterTiled`] of `lanes x lanes` lanes of two rows each (small tiles, so a few rows span
+    /// several) over a weight whose rows hold `k` values: the longest run of consecutive `K` values that divides `k`, as the planner picks it. Block formats' `k` is a
+    /// whole number of blocks, so any block width stands for it.
+    pub(super) fn register_tiled(lanes: u32, k: usize) -> Schedule {
+        Schedule::RegisterTiled {
+            lanes: TileSize::new(lanes).unwrap(),
+            rows: LaneRows(2),
+            run: RunLength::dividing(k),
         }
     }
 
@@ -484,6 +500,8 @@ mod planar_fixtures {
     };
     use poot_quant::{PackedWeight, SourceRole};
 
+    use crate::contraction::{RegisterTiling, Schedule};
+
     fn nz(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).unwrap()
     }
@@ -664,6 +682,63 @@ mod planar_fixtures {
             }
         }
         (sources, expected)
+    }
+
+    /// A prefill-sized planar contraction at the geometry the planner picks for it on `caps`: the 16x16 lane grid
+    /// of 8-row lanes (a 128 x 64 output tile), over more rows and columns than one tile so both edges are ragged.
+    /// Every device row that must run the wide workgroup on hardware (the interpreter rows above run the same
+    /// shapes) builds its launch from this one case.
+    pub(super) struct WideTile {
+        pub(super) format: WeightFormat,
+        pub(super) m: usize,
+        pub(super) out_rows: usize,
+        pub(super) schedule: Schedule,
+        pub(super) word_bufs: Vec<Vec<u32>>,
+        pub(super) activation: Vec<f32>,
+        pub(super) expected: Vec<f32>,
+    }
+
+    /// The [`WideTile`] for a weight row of `k` values: `E4m3Block128` (the FP8 checkpoints' format), `130` rows
+    /// and `70` columns, so each of the 128 x 64 tile's edges is partial. Panics if `caps` does not plan the wide
+    /// grid, so the row cannot silently run a narrower one.
+    pub(super) fn wide_tile(k: usize, caps: &poot_target::DeviceCaps) -> WideTile {
+        let format = WeightFormat::E4m3Block128 {
+            scale: ScaleEncoding::F32,
+        };
+        let (m, out_rows) = (130, 70);
+        let tiling = RegisterTiling::choose(m, k, caps);
+        assert_eq!(
+            (tiling.lanes(), tiling.output_tile()),
+            (16, (128, 64)),
+            "{m} rows on these caps must plan the 16x16 lane grid"
+        );
+        let (sources, decoded) = fixture(format, out_rows, k, 11);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let activation: Vec<f32> = (0..m * k)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state % 2000) as f32 - 1000.0) / 500.0
+            })
+            .collect();
+        let expected = (0..m * out_rows)
+            .map(|i| {
+                let (row, col) = (i / out_rows, i % out_rows);
+                (0..k)
+                    .map(|kk| activation[row * k + kk] * decoded[col * k + kk])
+                    .sum()
+            })
+            .collect();
+        WideTile {
+            format,
+            m,
+            out_rows,
+            schedule: tiling.schedule(),
+            word_bufs: pack_words(&sources),
+            activation,
+            expected,
+        }
     }
 
     /// Native source bytes as zero-filled `u32` words plus one zero guard word (D9), one per source
@@ -1003,7 +1078,7 @@ mod row_gather_tests {
 
 #[cfg(test)]
 mod contraction_tests {
-    //! SC-005 (card 542a, GPU-free rehearsal): `packed_kernel(Contraction)` (Gemv and Tiled,
+    //! SC-005 (card 542a, GPU-free rehearsal): `packed_kernel(Contraction)` (Gemv and RegisterTiled,
     //! blocks 1 and 2) run in the KIR interpreter is within tier-2 tolerance of a
     //! plain f32 reference contraction over `poot_quant::plan::decode_blocks`'s decode. Device rows
     //! (wgpu/ROCm/PTX) are separate, real-hardware evidence (the card's final report).
@@ -1013,10 +1088,10 @@ mod contraction_tests {
 
     use super::fixtures::{
         BLOCK32, GEMV_SCHEDULES, KQUANT, assert_close, contraction_fixture, pack_words,
-        schedule_tag,
+        register_tiled, schedule_tag,
     };
     use super::kernel::packed_contraction;
-    use crate::contraction::{Schedule, TileSize};
+    use crate::contraction::Schedule;
 
     fn run_case(
         format: poot_quant::format::WeightFormat,
@@ -1041,9 +1116,9 @@ mod contraction_tests {
         let words = pack_words(&bytes);
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
         // (unfolded), so `GroupY` always reads 0 and `g = gy*x_groups+gx` collapses to `gx`
-        // regardless of this value (card 658 review F1/F2's fold-aware grid, `contraction_tiled`'s
-        // doc).
-        let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0];
+        // regardless of this value (card 658 review F1/F2's fold-aware grid, `tiled_body`'s
+        // doc). metadata[4] (tile_offset) is 0: each of these runs one unsplit dispatch.
+        let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0, 0];
         let out_len = rows * out_per_block;
         let mut buffers = [
             Buffer::from_f32s(&activation),
@@ -1196,129 +1271,85 @@ mod contraction_tests {
         let error = packed_contraction(
             "tiled_epilogue",
             poot_quant::format::WeightFormat::Q8_0,
-            Schedule::Tiled {
-                tile: TileSize::new(4).unwrap(),
-            },
+            register_tiled(2, 32),
             Some(&epilogue),
             crate::PackedRows::Blocks,
         )
-        .expect_err("a packed Tiled contraction has no epilogue");
+        .expect_err("a packed RegisterTiled contraction has no epilogue");
         assert_eq!(
             error,
             crate::KernelGenError::Unsupported {
                 request: "packed_contraction",
-                reason: "a packed Tiled contraction has no epilogue",
+                reason: "a packed RegisterTiled contraction has no epilogue",
             }
         );
     }
 
-    /// SC-002 (card 542b, GPU-free rehearsal): `Contraction` `Schedule::Tiled` (`tile = 4`), `blocks =
-    /// 1`, for every block-32 and K-quant format - the new schedule 542b adds, over both format
-    /// families (`Schedule::Tiled` carries no per-format code, so a block-32 format that never needed
-    /// tiling before is as good a witness as a K-quant one). `m_per_block` (`out_per_block` follows it
-    /// 1:1 in this fixture, `contraction_fixture`'s doc) of 4 (tile-aligned) and 7 (ragged, three rows
-    /// short of two full tiles) against `tile = 4` exercise both the aligned and the ragged row/column
-    /// tile edges. 8 and 12 put more than one tile on each axis with `out_per_block` a multiple of
-    /// the tile, so the grid split `g -> (trow, tcol)` depends on `tiles_col = ceil(out / ts)`
-    /// exactly (mutants-m4 H6: at 4 there is one tile, and at 7 `(7 + 4) / 4 == (7 + 3) / 4`).
+    /// SC-002 (card 542b, GPU-free rehearsal): `Contraction` `Schedule::RegisterTiled` (`lanes = 2` of two
+    /// rows each: a 4x8 output tile), `blocks = 1`, for every block-32 and K-quant format - over both format
+    /// families (the schedule carries no per-format code, so a block-32 format is as good a witness as a
+    /// K-quant one). `m_per_block` (`out_per_block` follows it 1:1 in this fixture, `contraction_fixture`'s
+    /// doc) of 4 (exactly one tile), 7 and 8 (a second, ragged row-tile and a ragged column edge) and 12 (a
+    /// third row-tile and a second column-tile), so the grid split `g -> (trow, tcol)` depends on `tiles_col =
+    /// ceil(out / tile_cols)` exactly (mutants-m4 H6: at 12 `ceil(12/8) = 2` where `12/8 = 1`).
     ///
     /// Card 658: `blocks == 1` only through card 542b/545b - a `blocks > 1` (ADR-0109 block-diagonal)
     /// claim could have a row-tile straddle two blocks whenever `m_per_block` was not a multiple of
-    /// `tile`, so a straddling tile would read the wrong block's weight for some of its rows and the
+    /// the tile, so a straddling tile would read the wrong block's weight for some of its rows and the
     /// planner fell back to the per-thread-unbounded `Schedule::Serial` instead (since deleted:
-    /// nothing plans it any more). `contraction_tiled` now lays its tiles out per block (`b = g /
+    /// nothing plans it any more). `tiled_body` now lays its tiles out per block (`b = g /
     /// tiles_per_block`, fixed per workgroup), so this test's `blocks == 1` cases stay green unchanged.
     #[test]
     fn contraction_tiled_matches_reference_aligned_and_ragged() {
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            run_case(
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                4,
-                4,
-            );
-            run_case(
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                7,
-                7,
-            );
-            run_case(
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                8,
-                8,
-            );
-            run_case(
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                12,
-                12,
-            );
+            run_case(format, register_tiled(2, 32), 1, 4, 4);
+            run_case(format, register_tiled(2, 32), 1, 7, 7);
+            run_case(format, register_tiled(2, 32), 1, 8, 8);
+            run_case(format, register_tiled(2, 32), 1, 12, 12);
         }
     }
 
-    /// SC-002 (card 658, GPU-free rehearsal): `Contraction` `Schedule::Tiled` over a block-diagonal
+    /// SC-002 (card 658, GPU-free rehearsal): `Contraction` `Schedule::RegisterTiled` over a block-diagonal
     /// claim (`blocks = 3`) whose `m_per_block = 7` is not a multiple of `tile = 4` - the exact shape
-    /// `try_plan_contraction` used to refuse to `Schedule::Tiled` and fall back to the per-thread-
+    /// `try_plan_contraction` used to refuse to tile and fall back to the per-thread-
     /// unbounded `Schedule::Serial` for (`Serial` since deleted). Every
     /// output is checked against
     /// `contraction_fixture`'s block-diagonal reference (`reference_contraction`'s `b = row_idx /
     /// m_per_block`, a fresh partial sum per block), so a tile that reused another block's decoded
-    /// weight row - the straddling hazard `contraction_tiled`'s old doc named - would show up as a
+    /// weight row - the straddling hazard card 658 closed - would show up as a
     /// wrong value on every block boundary row, not just an out-of-range access. `out_per_block = 5`
     /// (also not a multiple of `tile`) exercises the ragged column edge at the same time.
-    /// Mutation: in `contraction_tiled`/`contraction_tiled_planar`, replace the tile-fixed `b` with the
+    /// Mutation: in `tiled_body`, replace the tile-fixed `b` with the
     /// old per-row derivation (`row.min(rows - 1) / m_per_block`, `row` from the global `(trow, tcol)`
     /// tile index rather than block-major `g`) - the row-tile at the block-2/block-3 boundary mixes
     /// block 1's weight into some of block 2's rows, and this test goes red.
     #[test]
     fn contraction_tiled_matches_reference_block_diagonal_ragged() {
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            run_case(
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                3,
-                7,
-                5,
-            );
+            run_case(format, register_tiled(2, 32), 3, 7, 5);
         }
     }
 
     /// SC-001 (card 658, GPU-free): dispatches the exact folded geometry
-    /// `try_plan_contraction` would plan for `blocks = 1, m_per_block = 20, out_per_block = 4, tile =
-    /// 4` on a device whose grid cap folds `tiles = ceil(20/4)*ceil(4/4) = 5` onto `(x_groups,
-    /// y_groups) = (4, 2)` (`metadata[3] = 4`) - `workgroups = [4, 2, 1]`, i.e. 8 workgroups for 5
-    /// real tiles. The 3 padding workgroups (`g in 5..8`) compute `b = g / tiles_per_block >= blocks`
-    /// (`tiles_per_block = 5` here, so `g in {5,6,7}` all land at `b = 1`), and the interpreter - unlike
+    /// `try_plan_contraction` would plan for `blocks = 1, m_per_block = 12, out_per_block = 4`, two lanes
+    /// of two rows (a 4x8 output tile), on a device whose grid cap folds `tiles = ceil(12/4)*ceil(4/8) = 3` onto
+    /// `(x_groups, y_groups) = (2, 2)` (`metadata[3] = 2`) - `workgroups = [2, 2, 1]`, i.e. 4 workgroups for 3
+    /// real tiles. The padding workgroup (`g = 3`) computes `b = g / tiles_per_block >= blocks`
+    /// (`tiles_per_block = 3` here, so `g = 3` lands at `b = 1`), and the interpreter - unlike
     /// wgpu/RADV's robust-buffer-access, which silently drops the same out-of-bounds store
     /// (`contraction_tiled_folded_grid_matches_reference_on_wgpu` runs this identical geometry on real
     /// hardware without ever catching it) - hard-faults on it.
     ///
-    /// Mutation: drop the `rows_ok` term from `storeok` (restore `storeok = rowok2 & colok2` alone, as
-    /// before this fix). Red: `InterpError::Fault { fault: OutOfBounds { .. }, .. }` ("buffer index 80
-    /// is out of bounds for length 80" for a `rows=20, out_per_block=4` Q4_0 fixture). Restored; green.
+    /// Mutation: drop the `in_range` term from `store_ok` (keep `row_ok & col_ok` alone, as
+    /// before card 658's fix). Red: `InterpError::Fault { fault: OutOfBounds { .. }, .. }` ("buffer index 160
+    /// is out of bounds for length 48" for a `rows=12, out_per_block=4` Q4_0 fixture). Restored; green.
     #[test]
     fn contraction_tiled_folded_grid_padding_workgroups_stay_in_bounds() {
-        let (blocks, m_per_block, out_per_block, tile) = (1usize, 20usize, 4usize, 4u32);
-        let ts = tile as usize;
-        let tiles = blocks * m_per_block.div_ceil(ts) * out_per_block.div_ceil(ts);
-        let (x_groups, y_groups) = (4u32, 2u32);
-        assert_eq!(tiles, 5, "fixture shape must need exactly 5 tiles");
+        let (blocks, m_per_block, out_per_block, tile) = (1usize, 12usize, 4usize, 2u32);
+        let (tile_rows, tile_cols) = register_tiled(tile, 32).output_tile().unwrap();
+        let tiles = blocks * m_per_block.div_ceil(tile_rows) * out_per_block.div_ceil(tile_cols);
+        let (x_groups, y_groups) = (2u32, 2u32);
+        assert_eq!(tiles, 3, "fixture shape must need exactly 3 tiles");
         assert!(
             (x_groups as usize) * (y_groups as usize) > tiles,
             "the fold must dispatch at least one padding workgroup for this to be a real test"
@@ -1326,9 +1357,7 @@ mod contraction_tests {
         for format in BLOCK32.into_iter().chain(KQUANT) {
             let (k, bytes, activation, expected) =
                 contraction_fixture(format, blocks, m_per_block, out_per_block);
-            let schedule = Schedule::Tiled {
-                tile: TileSize::new(tile).unwrap(),
-            };
+            let schedule = register_tiled(tile, 32);
             let body = packed_contraction(
                 &format!("contraction_folded_interp_{format:?}"),
                 format,
@@ -1339,7 +1368,13 @@ mod contraction_tests {
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
             let words = pack_words(&bytes);
-            let metadata = [k as u32, out_per_block as u32, m_per_block as u32, x_groups];
+            let metadata = [
+                k as u32,
+                out_per_block as u32,
+                m_per_block as u32,
+                x_groups,
+                0,
+            ];
             let rows = blocks * m_per_block;
             let out_len = rows * out_per_block;
             let mut buffers = [
@@ -1349,12 +1384,12 @@ mod contraction_tests {
                 Buffer::from_f32s(&vec![0.0; out_len]),
             ];
             run(&body, [x_groups, y_groups, 1], &mut buffers).unwrap_or_else(|error| {
-                panic!("{format:?}: interpreter: folded grid [4,2,1] (tiles=5): {error}")
+                panic!("{format:?}: interpreter: folded grid [2,2,1] (tiles=3): {error}")
             });
             let got = buffers[3].to_f32s().unwrap();
             assert_close(
                 format,
-                &format!("Contraction {schedule:?} folded grid=[4,2,1]"),
+                &format!("Contraction {schedule:?} folded grid=[2,2,1]"),
                 &got,
                 &expected,
             );
@@ -1389,7 +1424,7 @@ mod contraction_tests {
     }
 
     /// The K-quant sibling of `contraction_bodies_compile_for_spirv_nvptx_and_amdgcn`, plus the new
-    /// `Schedule::Tiled` on every format (block-32 and K-quant): sanity only, names the SPIR-V/NVPTX
+    /// `Schedule::RegisterTiled` on every format (block-32 and K-quant): sanity only, names the SPIR-V/NVPTX
     /// artifacts for the PTX pod batch.
     #[test]
     fn contraction_tiled_and_kquant_bodies_compile_for_spirv_nvptx_and_amdgcn() {
@@ -1414,9 +1449,7 @@ mod contraction_tests {
             }
         }
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            let schedule = Schedule::Tiled {
-                tile: TileSize::new(4).unwrap(),
-            };
+            let schedule = register_tiled(2, 32);
             let name = format!("contraction_{format:?}_{}", schedule_tag(schedule));
             let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
                 .unwrap();
@@ -1466,9 +1499,9 @@ mod contraction_tests {
         let words = pack_words(&bytes);
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
         // (unfolded), so `GroupY` always reads 0 and `g = gy*x_groups+gx` collapses to `gx`
-        // regardless of this value (card 658 review F1/F2's fold-aware grid, `contraction_tiled`'s
-        // doc).
-        let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0];
+        // regardless of this value (card 658 review F1/F2's fold-aware grid, `tiled_body`'s
+        // doc). metadata[4] (tile_offset) is 0: each of these runs one unsplit dispatch.
+        let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0, 0];
         let out_len = rows * out_per_block;
         let mut buffers = [
             KernelBuffer::read_only_f32(&activation),
@@ -1530,7 +1563,7 @@ mod contraction_tests {
         }
     }
 
-    /// SC-002 (card 542b, device tier 2): `Contraction` `Schedule::Tiled` for every block-32 and
+    /// SC-002 (card 542b, device tier 2): `Contraction` `Schedule::RegisterTiled` for every block-32 and
     /// K-quant format on the local wgpu (SPIR-V/RADV) device - the real-hardware counterpart of
     /// `contraction_tiled_matches_reference_aligned_and_ragged` (`blocks == 1` only; see its doc).
     #[test]
@@ -1543,34 +1576,16 @@ mod contraction_tests {
             }
         };
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            run_wgpu_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                4,
-                4,
-            );
-            run_wgpu_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                7,
-                7,
-            );
+            run_wgpu_case(&ctx, format, register_tiled(2, 32), 1, 4, 4);
+            run_wgpu_case(&ctx, format, register_tiled(2, 32), 1, 7, 7);
         }
     }
 
     /// SC-001/SC-002 (card 658, device tier 2, wgpu/RADV): the real-hardware counterpart of
-    /// `contraction_tiled_matches_reference_block_diagonal_ragged` - a block-diagonal `Schedule::Tiled`
+    /// `contraction_tiled_matches_reference_block_diagonal_ragged` - a block-diagonal `Schedule::RegisterTiled`
     /// claim (`blocks = 3`, `m_per_block = 7` not a multiple of `tile = 4`) completes under the GPU
     /// lock and matches the CPU oracle, proving the shape `try_plan_contraction` used to refuse to
-    /// `Schedule::Tiled` (falling back to the per-thread-unbounded `Schedule::Serial`) now dispatches
+    /// tile (falling back to the per-thread-unbounded `Schedule::Serial`) now dispatches
     /// bounded and correct on real hardware.
     #[test]
     fn contraction_tiled_matches_reference_block_diagonal_ragged_on_wgpu() {
@@ -1582,29 +1597,20 @@ mod contraction_tests {
             }
         };
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            run_wgpu_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                3,
-                7,
-                5,
-            );
+            run_wgpu_case(&ctx, format, register_tiled(2, 32), 3, 7, 5);
         }
     }
 
     /// SC-001 (card 658 review F1/F2, device tier 2, wgpu/RADV): the real-hardware counterpart of
     /// `packed_dequant::tests::over_cap_tiled_contraction_folds_onto_a_2d_grid_not_the_wg_bump` - a
-    /// `Schedule::Tiled` dispatch folded onto a 2-D `(x_groups, y_groups)` grid (`tiles =
-    /// ceil(20/4)*ceil(4/4) = 5` over a synthetic `x_groups` cap of 4, folding to `(4, 2)`, the smallest
+    /// `Schedule::RegisterTiled` dispatch folded onto a 2-D `(x_groups, y_groups)` grid (`tiles =
+    /// ceil(12/4)*ceil(4/8) = 3` over a synthetic `x_groups` cap of 2, folding to `(2, 2)`, the smallest
     /// shape that exercises a real `GroupY > 0` workgroup) matches the CPU oracle on real hardware, not
-    /// just the KIR interpreter - proving `contraction_tiled`'s `g = gy*x_groups+gx` reconstruction
+    /// just the KIR interpreter - proving `tiled_body`'s `g = gy*x_groups+gx` reconstruction
     /// (`metadata[3]`) is correct on the real SPIR-V/RADV lowering of `GroupY`, not only in the
     /// zero-cost interpreter path every other row here exercises at `GroupY == 0`.
     ///
-    /// Mutation: in `contraction_tiled`'s `g = gy*x_groups + gx`, zero the `x_groups` operand (`g =
+    /// Mutation: in `tiled_body`'s `g = gy*x_groups + gx`, zero the `x_groups` operand (`g =
     /// gy*0 + gx`), dropping `GroupY`'s contribution. Red on real wgpu/RADV: `Q4_0 ... folded
     /// grid=[64,2,1] (wgpu) element 64: got 0 want -55.689743` - element 64 is the first output of the
     /// fold's second row (`GroupY == 1`), which the mutated body never reaches. Restored; green again.
@@ -1617,11 +1623,12 @@ mod contraction_tests {
                 return;
             }
         };
-        let (blocks, m_per_block, out_per_block, tile) = (1usize, 20usize, 4usize, 4u32);
+        let (blocks, m_per_block, out_per_block, tile) = (1usize, 12usize, 4usize, 2u32);
         let ts = tile as usize;
-        let tiles = blocks * m_per_block.div_ceil(ts) * out_per_block.div_ceil(ts);
-        let (x_groups, y_groups) = (4u32, 2u32);
-        assert_eq!(tiles, 5, "fixture shape must need exactly 5 tiles");
+        let (tile_rows, tile_cols) = register_tiled(tile, 32).output_tile().unwrap();
+        let tiles = blocks * m_per_block.div_ceil(tile_rows) * out_per_block.div_ceil(tile_cols);
+        let (x_groups, y_groups) = (2u32, 2u32);
+        assert_eq!(tiles, 3, "fixture shape must need exactly 3 tiles");
         assert!(
             (x_groups as usize) * (y_groups as usize) >= tiles,
             "the folded grid must address every tile"
@@ -1629,9 +1636,7 @@ mod contraction_tests {
         for format in BLOCK32.into_iter().chain(KQUANT) {
             let (k, bytes, activation, expected) =
                 contraction_fixture(format, blocks, m_per_block, out_per_block);
-            let schedule = Schedule::Tiled {
-                tile: TileSize::new(tile).unwrap(),
-            };
+            let schedule = register_tiled(tile, 32);
             let name = format!("contraction_wgpu_folded_{format:?}");
             let body = packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
                 .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
@@ -1650,7 +1655,13 @@ mod contraction_tests {
             let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
             let words = pack_words(&bytes);
-            let metadata = [k as u32, out_per_block as u32, m_per_block as u32, x_groups];
+            let metadata = [
+                k as u32,
+                out_per_block as u32,
+                m_per_block as u32,
+                x_groups,
+                0,
+            ];
             let rows = blocks * m_per_block;
             let out_len = rows * out_per_block;
             let mut buffers = [
@@ -1681,7 +1692,7 @@ mod contraction_tests {
 
 #[cfg(test)]
 mod planar_contraction_tests {
-    //! SC-002 (card 542c, GPU-free rehearsal): `packed_kernel(Contraction)` (Gemv and Tiled,
+    //! SC-002 (card 542c, GPU-free rehearsal): `packed_kernel(Contraction)` (Gemv and RegisterTiled,
     //! dense rows) for every planar format run in the KIR interpreter is within
     //! tier-2 tolerance of a plain f32 reference contraction over `decode_planar_value` - the planar
     //! counterpart of `contraction_tests`.
@@ -1689,12 +1700,14 @@ mod planar_contraction_tests {
     use poot_kernel_ir::interp::{Buffer, run};
     use poot_kernel_ir::test_support::workgroups_covering;
 
-    use super::fixtures::{GEMV_SCHEDULES, assert_close};
+    use super::fixtures::{GEMV_SCHEDULES, assert_close, register_tiled};
     use super::kernel::packed_contraction;
     use super::planar_fixtures::{every_planar_format, fixture, pack_words};
-    use crate::contraction::{Schedule, TileSize};
+    use crate::contraction::{RegisterTiling, Schedule};
 
-    const K: usize = 17;
+    /// `K` values of a weight row: 17 leaves no run longer than one value, 18 stages in runs of two, 20 in
+    /// runs of four.
+    const KS: [usize; 3] = [17, 18, 20];
 
     fn reference_contraction(
         activation: &[f32],
@@ -1716,14 +1729,15 @@ mod planar_contraction_tests {
 
     fn run_case(
         format: poot_quant::format::WeightFormat,
+        k: usize,
         out_rows: usize,
         m: usize,
         schedule: Schedule,
     ) {
-        let (sources, decoded) = fixture(format, out_rows, K, 11);
+        let (sources, decoded) = fixture(format, out_rows, k, 11);
         let word_bufs = pack_words(&sources);
         let mut state = 0x2545_f491_4f6c_dd1du64;
-        let activation: Vec<f32> = (0..m * K)
+        let activation: Vec<f32> = (0..m * k)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 7;
@@ -1731,7 +1745,7 @@ mod planar_contraction_tests {
                 ((state % 2000) as f32 - 1000.0) / 500.0
             })
             .collect();
-        let expected = reference_contraction(&activation, &decoded, K, out_rows);
+        let expected = reference_contraction(&activation, &decoded, k, out_rows);
 
         let body = packed_contraction(
             &format!(
@@ -1745,7 +1759,7 @@ mod planar_contraction_tests {
         )
         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
-        let metadata = [K as u32, out_rows as u32, m as u32, 0]; // metadata[3] (x_groups): unused, unfolded grid
+        let metadata = [k as u32, out_rows as u32, m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
         let out_len = m * out_rows;
         let mut buffers: Vec<Buffer> = vec![Buffer::from_f32s(&activation)];
         buffers.extend(word_bufs.iter().map(|words| Buffer::from_u32s(words)));
@@ -1768,47 +1782,46 @@ mod planar_contraction_tests {
     #[test]
     fn contraction_gemv_matches_reference_for_every_planar_format() {
         for format in every_planar_format() {
-            for schedule in GEMV_SCHEDULES {
-                run_case(format, 11, 1, schedule);
+            for k in KS {
+                for schedule in GEMV_SCHEDULES {
+                    run_case(format, k, 11, 1, schedule);
+                }
             }
         }
     }
 
-    /// `out_rows = m = 8` and `12` put more than one tile on each axis with `out_rows` a multiple
-    /// of the tile: the grid split `g -> (trow, tcol)` depends on `tiles_col = ceil(out / ts)`
-    /// exactly (mutants-m4 H6), which `out_rows = 5` with a single row tile never exposes.
+    /// `out_rows = 5` and `m = 3` fit one 4x8 tile; `8x8`, `12x12` and `20x40` put more than one tile on each
+    /// axis, so the grid split `g -> (trow, tcol)` depends on `tiles_col = ceil(out / tile_cols)` exactly
+    /// (mutants-m4 H6). `K = 20` stages in four-value runs (the shared-scale and sliced-code path), `K = 18` in
+    /// runs of two and `K = 17` in single values.
     #[test]
     fn contraction_tiled_matches_reference_for_every_planar_format() {
         for format in every_planar_format() {
-            run_case(
-                format,
-                5,
-                3,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-            );
-            run_case(
-                format,
-                8,
-                8,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-            );
-            run_case(
-                format,
-                12,
-                12,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-            );
+            for k in KS {
+                for (out_rows, m) in [(5, 3), (8, 8), (12, 12), (20, 40)] {
+                    run_case(format, k, out_rows, m, register_tiled(2, k));
+                }
+            }
+        }
+    }
+
+    /// The geometries the planner actually picks ([`RegisterTiling::choose`]): the 8x8 lane grid with 2, 4 and 8
+    /// rows per lane (16-, 32- and 64-row tiles) and the 16x16 grid at 8 rows (a 128-row tile), over row counts
+    /// that are not multiples of the tile, for every planar format and a four-value run (`K = 20`). The 2-lane rows above cover the grid arithmetic cheaply; this one covers the shapes that run.
+    #[test]
+    fn contraction_tiled_matches_reference_at_the_planned_geometries() {
+        let caps = poot_target::DeviceCaps::rocm_default();
+        let k = 20;
+        for format in every_planar_format() {
+            for m in [9, 33, 70, 130] {
+                let schedule = RegisterTiling::choose(m, k, &caps).schedule();
+                run_case(format, k, 6, m, schedule);
+            }
         }
     }
 
     /// SC-002 (card 658 F6, GPU-free rehearsal): the planar front end's identical block-major rewrite
-    /// (`contraction_tiled_planar`) gets the same block-diagonal, ragged-`m_per_block` row the block
+    /// (`PlanarPlan` through `tiled_body`) gets the same block-diagonal, ragged-`m_per_block` row the block
     /// front end's `contraction_tiled_matches_reference_block_diagonal_ragged` already has - planar
     /// descriptors are admitted for `Contraction` on every backend and `packed_block_diagonal_linear`
     /// does not care about storage, so a planar block-diagonal claim is constructible in production.
@@ -1818,12 +1831,15 @@ mod planar_contraction_tests {
     fn contraction_tiled_matches_reference_block_diagonal_ragged_for_every_planar_format() {
         let (blocks, m_per_block, out_per_block) = (3usize, 7usize, 5usize);
         let out_rows = blocks * out_per_block;
-        for format in every_planar_format() {
-            let (sources, decoded) = fixture(format, out_rows, K, 11);
+        for (format, k) in every_planar_format()
+            .into_iter()
+            .flat_map(|format| KS.map(|k| (format, k)))
+        {
+            let (sources, decoded) = fixture(format, out_rows, k, 11);
             let word_bufs = pack_words(&sources);
             let rows = blocks * m_per_block;
             let mut state = 0x2545_f491_4f6c_dd1du64;
-            let activation: Vec<f32> = (0..rows * K)
+            let activation: Vec<f32> = (0..rows * k)
                 .map(|_| {
                     state ^= state << 13;
                     state ^= state >> 7;
@@ -1837,15 +1853,13 @@ mod planar_contraction_tests {
                     let col = i % out_per_block;
                     let b = row_idx / m_per_block;
                     let weight_row = b * out_per_block + col;
-                    (0..K)
-                        .map(|kk| activation[row_idx * K + kk] * decoded[weight_row * K + kk])
+                    (0..k)
+                        .map(|kk| activation[row_idx * k + kk] * decoded[weight_row * k + kk])
                         .sum()
                 })
                 .collect();
 
-            let schedule = Schedule::Tiled {
-                tile: TileSize::new(4).unwrap(),
-            };
+            let schedule = register_tiled(2, k);
             let body = packed_contraction(
                 &format!(
                     "contraction_planar_blockdiag_{}",
@@ -1858,7 +1872,7 @@ mod planar_contraction_tests {
             )
             .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
 
-            let metadata = [K as u32, out_per_block as u32, m_per_block as u32, 0];
+            let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0, 0];
             let out_len = rows * out_per_block;
             let mut buffers: Vec<Buffer> = vec![Buffer::from_f32s(&activation)];
             buffers.extend(word_bufs.iter().map(|words| Buffer::from_u32s(words)));
@@ -1903,10 +1917,10 @@ mod rocm_tests {
 
     use super::fixtures::{
         BLOCK32, GEMV_SCHEDULES, GatherCase, KQUANT, assert_close, contraction_fixture, fixture,
-        kquant_gather_cases, pack_words, schedule_tag,
+        kquant_gather_cases, pack_words, register_tiled, schedule_tag,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
-    use crate::contraction::{Schedule, TileSize};
+    use crate::contraction::Schedule;
 
     fn open_or_skip(test: &str) -> Option<RocmContext> {
         match RocmContext::new() {
@@ -2117,9 +2131,9 @@ mod rocm_tests {
         let words = pack_words(&bytes);
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
         // (unfolded), so `GroupY` always reads 0 and `g = gy*x_groups+gx` collapses to `gx`
-        // regardless of this value (card 658 review F1/F2's fold-aware grid, `contraction_tiled`'s
-        // doc).
-        let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0];
+        // regardless of this value (card 658 review F1/F2's fold-aware grid, `tiled_body`'s
+        // doc). metadata[4] (tile_offset) is 0: each of these runs one unsplit dispatch.
+        let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0, 0];
         let out_len = rows * out_per_block;
         let grid = (
             schedule.grid_threads(blocks, m_per_block, out_per_block) as u32,
@@ -2222,7 +2236,7 @@ mod rocm_tests {
         }
     }
 
-    /// SC-002 (card 542b, device tier 2): `Contraction` `Schedule::Tiled` for every block-32 and
+    /// SC-002 (card 542b, device tier 2): `Contraction` `Schedule::RegisterTiled` for every block-32 and
     /// K-quant format on real ROCm/HSA hardware - the ROCm counterpart of
     /// `contraction_tests::contraction_tiled_matches_reference_aligned_and_ragged_on_wgpu`
     /// (`blocks == 1` only; see its doc).
@@ -2234,26 +2248,8 @@ mod rocm_tests {
             return;
         };
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            run_contraction_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                4,
-                4,
-            );
-            run_contraction_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                7,
-                7,
-            );
+            run_contraction_case(&ctx, format, register_tiled(2, 32), 1, 4, 4);
+            run_contraction_case(&ctx, format, register_tiled(2, 32), 1, 7, 7);
         }
     }
 
@@ -2267,20 +2263,11 @@ mod rocm_tests {
             return;
         };
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            run_contraction_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                3,
-                7,
-                5,
-            );
+            run_contraction_case(&ctx, format, register_tiled(2, 32), 3, 7, 5);
         }
     }
 
-    /// SC-002 (card 542c, device tier 2): `Contraction` (Gemv, Tiled) for every planar format is
+    /// SC-002 (card 542c, device tier 2): `Contraction` (Gemv, RegisterTiled) for every planar format is
     /// within tier-2 tolerance of the reference on real ROCm/HSA hardware.
     #[test]
     fn contraction_matches_reference_for_every_planar_format_on_rocm() {
@@ -2289,12 +2276,12 @@ mod rocm_tests {
         else {
             return;
         };
-        let k = 17;
         let out_rows = 5;
-        for format in super::planar_fixtures::every_planar_format() {
-            for schedule in GEMV_SCHEDULES.into_iter().chain([Schedule::Tiled {
-                tile: TileSize::new(4).unwrap(),
-            }]) {
+        for (format, k) in super::planar_fixtures::every_planar_format()
+            .into_iter()
+            .flat_map(|format| [17usize, 18, 20].map(|k| (format, k)))
+        {
+            for schedule in GEMV_SCHEDULES.into_iter().chain([register_tiled(2, k)]) {
                 let (sources, decoded) = super::planar_fixtures::fixture(format, out_rows, k, 11);
                 let word_bufs = super::planar_fixtures::pack_words(&sources);
                 let m = match schedule {
@@ -2328,7 +2315,7 @@ mod rocm_tests {
                 let body =
                     packed_contraction(&name, format, schedule, None, crate::PackedRows::Blocks)
                         .unwrap_or_else(|error| panic!("{format:?}: packed_kernel: {error}"));
-                let metadata = [k as u32, out_rows as u32, m as u32, 0]; // metadata[3] (x_groups): unused, unfolded grid
+                let metadata = [k as u32, out_rows as u32, m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
                 let out_len = m * out_rows;
                 let grid = (schedule.grid_threads(1, m, out_rows) as u32, 1, 1);
                 let block = (body.workgroup_size[0], 1, 1);
@@ -2344,6 +2331,128 @@ mod rocm_tests {
                     &expected,
                 );
             }
+        }
+    }
+
+    /// POOT-1193 (device tier 2): the wide register-tiled GEMM the planner picks for a prefill linear, a 16x16 lane
+    /// grid (a 256-lane workgroup, 8 rows per lane, a 128 x 64 tile) of `E4m3Block128` over 130 rows and 70
+    /// columns, runs on real ROCm/HSA hardware and matches the reference: `K = 20` (a four-value run, a `K` tail
+    /// of 4 past the 16-value stage) and `K = 32` (whole stages). Mutation: `RegisterTiling::choose` never picks
+    /// the wide grid and `wide_tile` refuses the caps.
+    #[test]
+    fn contraction_wide_register_tile_matches_reference_on_rocm() {
+        let Some(ctx) = open_or_skip("contraction_wide_register_tile_matches_reference_on_rocm")
+        else {
+            return;
+        };
+        for k in [20usize, 32] {
+            let case =
+                super::planar_fixtures::wide_tile(k, &poot_target::DeviceCaps::rocm_default());
+            let name = format!("contraction_wide_rocm_k{k}");
+            let body = packed_contraction(
+                &name,
+                case.format,
+                case.schedule,
+                None,
+                crate::PackedRows::Blocks,
+            )
+            .unwrap_or_else(|error| panic!("{:?}: packed_kernel: {error}", case.format));
+            let metadata = [k as u32, case.out_rows as u32, case.m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
+            let grid = (
+                case.schedule.grid_threads(1, case.m, case.out_rows) as u32,
+                1,
+                1,
+            );
+            let block = (body.workgroup_size[0], 1, 1);
+            assert_eq!(block.0, 256, "the wide grid is a 256-lane workgroup");
+            let mut args: Vec<Arg<'_>> = vec![Arg::F32(&case.activation)];
+            args.extend(case.word_bufs.iter().map(|w| Arg::U32(w)));
+            args.push(Arg::U32(&metadata));
+            args.push(Arg::Out(case.m * case.out_rows));
+            let got = dispatch_and_download(&ctx, &name, &body, &args, grid, block);
+            assert_close(
+                case.format,
+                &format!("wide register tile K={k} (ROCm)"),
+                &got,
+                &case.expected,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod planar_wgpu_tests {
+    //! POOT-1193 (device tier 2): the wide register-tiled GEMM a prefill linear plans, on the local wgpu
+    //! (SPIR-V/RADV) device - the wgpu counterpart of `rocm_tests`' wide-tile row.
+
+    use poot_codegen::{GpuTarget, Target, artifact_path, compile_kernel, kernel_handle};
+    use poot_wgpu_runtime::{Context, KernelBuffer};
+
+    use super::fixtures::assert_close;
+    use super::kernel::packed_contraction;
+    use super::planar_fixtures::wide_tile;
+
+    /// A 16x16 lane grid (a 256-lane workgroup, 8 rows per lane, a 128 x 64 tile) of `E4m3Block128` over 130 rows
+    /// and 70 columns, `K = 20` (a four-value run and a `K` tail of 4) and `K = 32`, matches the reference.
+    /// Mutation: `RegisterTiling::choose` never picks the wide grid and `wide_tile` refuses the caps.
+    #[test]
+    fn contraction_wide_register_tile_matches_reference_on_wgpu() {
+        let ctx = match Context::new() {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                eprintln!("no GPU ({error}); skipping");
+                return;
+            }
+        };
+        for k in [20usize, 32] {
+            let case = wide_tile(k, &poot_target::DeviceCaps::wgpu_rdna3_igpu());
+            let name = format!("contraction_wide_wgpu_k{k}");
+            let body = packed_contraction(
+                &name,
+                case.format,
+                case.schedule,
+                None,
+                crate::PackedRows::Blocks,
+            )
+            .unwrap_or_else(|error| panic!("{:?}: packed_kernel: {error}", case.format));
+            assert_eq!(
+                body.workgroup_size[0], 256,
+                "the wide grid is a 256-lane workgroup"
+            );
+            let dir = std::env::temp_dir()
+                .join("poot-kernelgen-1193-wide")
+                .join(&name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
+            let artifact = compile_kernel(&body, GpuTarget::SpirvVulkan, &out_path)
+                .unwrap_or_else(|error| panic!("{:?}: compile: {error}", case.format));
+            let kernel = kernel_handle(&body, &artifact).unwrap();
+
+            let metadata = [k as u32, case.out_rows as u32, case.m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
+            let mut buffers = vec![KernelBuffer::read_only_f32(&case.activation)];
+            buffers.extend(
+                case.word_bufs
+                    .iter()
+                    .map(|w| KernelBuffer::read_only_u32(w)),
+            );
+            buffers.push(KernelBuffer::read_only_u32(&metadata));
+            buffers.push(KernelBuffer::write_f32(case.m * case.out_rows));
+            let threads = case.schedule.grid_threads(1, case.m, case.out_rows) as u32;
+            ctx.dispatch(
+                &name,
+                &kernel,
+                body.workgroup_size,
+                [threads, 1, 1],
+                &mut buffers,
+            )
+            .unwrap_or_else(|error| panic!("{:?}: dispatch: {error}", case.format));
+            let got = buffers.last().unwrap().as_f32();
+            assert_close(
+                case.format,
+                &format!("wide register tile K={k} (wgpu)"),
+                got,
+                &case.expected,
+            );
         }
     }
 }
@@ -2373,10 +2482,10 @@ mod ptx_tests {
 
     use super::fixtures::{
         BLOCK32, GEMV_SCHEDULES, GatherCase, KQUANT, assert_close, contraction_fixture, fixture,
-        kquant_gather_cases, pack_words, schedule_tag,
+        kquant_gather_cases, pack_words, register_tiled, schedule_tag,
     };
     use super::kernel::{PackedKernelOp, PackedKernelSpec, packed_contraction, packed_kernel};
-    use crate::contraction::{Schedule, TileSize};
+    use crate::contraction::Schedule;
 
     fn open_or_skip(test: &str) -> Option<PtxContext> {
         match PtxContext::new() {
@@ -2488,9 +2597,9 @@ mod ptx_tests {
         let activation_buf = ctx.upload_f32(&activation).expect("upload activation");
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
         // (unfolded), so `GroupY` always reads 0 and `g = gy*x_groups+gx` collapses to `gx`
-        // regardless of this value (card 658 review F1/F2's fold-aware grid, `contraction_tiled`'s
-        // doc).
-        let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0];
+        // regardless of this value (card 658 review F1/F2's fold-aware grid, `tiled_body`'s
+        // doc). metadata[4] (tile_offset) is 0: each of these runs one unsplit dispatch.
+        let metadata = [k as u32, out_per_block as u32, m_per_block as u32, 0, 0];
         let metadata_buf = upload_u32(ctx, &metadata);
         let out_len = rows * out_per_block;
         let out_buf = ctx.alloc_f32(out_len).expect("allocate out");
@@ -2606,7 +2715,7 @@ mod ptx_tests {
         }
     }
 
-    /// SC-002 (card 542b, device tier 2, M4 pod batch): `Contraction` `Schedule::Tiled` for every
+    /// SC-002 (card 542b, device tier 2, M4 pod batch): `Contraction` `Schedule::RegisterTiled` for every
     /// block-32 and K-quant format, the PTX counterpart of
     /// `rocm_tests::contraction_tiled_matches_reference_aligned_and_ragged_on_rocm` (`blocks == 1`
     /// only; see its doc).
@@ -2618,30 +2727,12 @@ mod ptx_tests {
             return;
         };
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            run_contraction_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                4,
-                4,
-            );
-            run_contraction_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                1,
-                7,
-                7,
-            );
+            run_contraction_case(&ctx, format, register_tiled(2, 32), 1, 4, 4);
+            run_contraction_case(&ctx, format, register_tiled(2, 32), 1, 7, 7);
         }
     }
 
-    /// SC-002/F3 (card 658 review, device tier 2, M4 pod batch): `Contraction` `Schedule::Tiled` over
+    /// SC-002/F3 (card 658 review, device tier 2, M4 pod batch): `Contraction` `Schedule::RegisterTiled` over
     /// a block-diagonal claim (`blocks = 3`, `m_per_block = 7` not a multiple of `tile = 4`) on real
     /// NVIDIA/PTX hardware - the PTX counterpart of
     /// `contraction_tests::contraction_tiled_matches_reference_block_diagonal_ragged`/
@@ -2656,16 +2747,7 @@ mod ptx_tests {
             return;
         };
         for format in BLOCK32.into_iter().chain(KQUANT) {
-            run_contraction_case(
-                &ctx,
-                format,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-                3,
-                7,
-                5,
-            );
+            run_contraction_case(&ctx, format, register_tiled(2, 32), 3, 7, 5);
         }
     }
 }
@@ -2683,12 +2765,14 @@ mod planar_ptx_tests {
     use poot_kernel_ir::Body;
     use poot_ptx_runtime::{PtxBuffer, PtxContext};
 
-    use super::fixtures::{GEMV_SCHEDULES, schedule_tag};
+    use super::fixtures::{GEMV_SCHEDULES, register_tiled, schedule_tag};
     use super::kernel::packed_contraction;
     use super::planar_fixtures::{every_planar_format, fixture, format_tag, pack_words};
-    use crate::contraction::{Schedule, TileSize};
+    use crate::contraction::Schedule;
 
-    const K: usize = 17;
+    /// `K` values of a weight row: 17 leaves no run longer than one value, 18 stages in runs of two, 20 in
+    /// runs of four.
+    const KS: [usize; 3] = [17, 18, 20];
 
     fn open_or_skip(test: &str) -> Option<PtxContext> {
         match PtxContext::new() {
@@ -2737,17 +2821,18 @@ mod planar_ptx_tests {
     fn run_case(
         ctx: &PtxContext,
         format: poot_quant::format::WeightFormat,
+        k: usize,
         out_rows: usize,
         schedule: Schedule,
     ) {
-        let (sources, decoded) = fixture(format, out_rows, K, 11);
+        let (sources, decoded) = fixture(format, out_rows, k, 11);
         let word_bufs = pack_words(&sources);
         let m = match schedule {
             Schedule::Gemv { .. } => 1,
             _ => 3,
         };
         let mut state = 0x2545_f491_4f6c_dd1du64;
-        let activation: Vec<f32> = (0..m * K)
+        let activation: Vec<f32> = (0..m * k)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 7;
@@ -2755,7 +2840,7 @@ mod planar_ptx_tests {
                 ((state % 2000) as f32 - 1000.0) / 500.0
             })
             .collect();
-        let expected = reference_contraction(&activation, &decoded, K, out_rows);
+        let expected = reference_contraction(&activation, &decoded, k, out_rows);
 
         let name = format!(
             "contraction_planar_ptx_{}_{}",
@@ -2770,7 +2855,7 @@ mod planar_ptx_tests {
             .map(|words| upload_u32(ctx, words))
             .collect();
         let activation_buf = ctx.upload_f32(&activation).expect("upload activation");
-        let metadata = [K as u32, out_rows as u32, m as u32, 0]; // metadata[3] (x_groups): unused, unfolded grid
+        let metadata = [k as u32, out_rows as u32, m as u32, 0, 0]; // [3] x_groups unused (unfolded), [4] tile_offset 0
         let metadata_buf = upload_u32(ctx, &metadata);
         let out_len = m * out_rows;
         let out_buf = ctx.alloc_f32(out_len).expect("allocate out");
@@ -2807,8 +2892,10 @@ mod planar_ptx_tests {
             return;
         };
         for format in every_planar_format() {
-            for schedule in GEMV_SCHEDULES {
-                run_case(&ctx, format, 11, schedule);
+            for k in KS {
+                for schedule in GEMV_SCHEDULES {
+                    run_case(&ctx, format, k, 11, schedule);
+                }
             }
         }
     }
@@ -2821,14 +2908,9 @@ mod planar_ptx_tests {
             return;
         };
         for format in every_planar_format() {
-            run_case(
-                &ctx,
-                format,
-                5,
-                Schedule::Tiled {
-                    tile: TileSize::new(4).unwrap(),
-                },
-            );
+            for k in KS {
+                run_case(&ctx, format, k, 5, register_tiled(2, k));
+            }
         }
     }
 }

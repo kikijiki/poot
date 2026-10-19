@@ -2,7 +2,7 @@
 //! order, gate on the validation packet, publish. Replaces the five walks this crate used to carry
 //! (`eval_env_unchecked`, the storage walk, the one-equation bridge, the exact-I32 walk, the BF16
 //! table): one function, one environment (`Value`), admission decided only by an equation's own
-//! operands, budgets and observers as options (not separate walks).
+//! operands and observers as options (not separate walks).
 
 use poot_tensor::{DType, HostData, HostTensor};
 use std::collections::HashMap;
@@ -25,38 +25,9 @@ use crate::ops::elementwise::{I32Operand, LaneOperand, SelectLane};
 use crate::resolve::Bf16Equation;
 use crate::{EvalError, Value, ops, resolve};
 
-/// A caller-stated ceiling on the packed/cast/Spec-376-BF16 arms' materialization (see
-/// [`EvalObserver::allocation`]'s doc for exactly which equations charge against it) and on every intermediate of a composite's decomposition (Card 556: a decomposed prefill
-/// attention materializes `[1, Hq, L, L]` scores behind a `[1, Hq, L, D]` result) - not a per-equation
-/// ceiling over the whole walk. `EvalOptions::new` takes one explicitly: there is no `Default`, so no
-/// caller evaluates unbounded by omission.
-#[derive(Clone, Copy, Debug)]
-pub struct EvalBudget {
-    max_work_elements: Option<u64>,
-    max_alloc_bytes: Option<u64>,
-}
-
-impl EvalBudget {
-    /// No ceiling: every allocation this walk would otherwise charge against a budget proceeds.
-    pub const UNBOUNDED: Self = EvalBudget {
-        max_work_elements: None,
-        max_alloc_bytes: None,
-    };
-
-    /// A budget with finite ceilings, for tests that need the budget refusal itself.
-    #[cfg(any(test, feature = "test-support"))]
-    pub const fn bounded(max_work_elements: u64, max_alloc_bytes: u64) -> Self {
-        EvalBudget {
-            max_work_elements: Some(max_work_elements),
-            max_alloc_bytes: Some(max_alloc_bytes),
-        }
-    }
-}
-
-/// Options for one [`eval`] call. The builder methods take and return `self`, so no field is public
-/// and no caller can skip stating a budget.
+/// Options for one [`eval`] call. The builder methods take and return `self`, so no field is public.
+#[derive(Default)]
 pub struct EvalOptions<'a> {
-    budget: EvalBudget,
     observer: Option<&'a mut dyn EvalObserver>,
     keep_environment: bool,
     /// The composite equation whose decomposition is being evaluated, if any: every charge made inside
@@ -68,17 +39,6 @@ pub struct EvalOptions<'a> {
 }
 
 impl<'a> EvalOptions<'a> {
-    /// Options with `budget`, no observer, and no kept environment.
-    pub fn new(budget: EvalBudget) -> Self {
-        EvalOptions {
-            budget,
-            observer: None,
-            keep_environment: false,
-            composite: None,
-            charged_by_composite: false,
-        }
-    }
-
     /// Attach an observer that sees each allocation the walk charges.
     pub fn observer(mut self, observer: &'a mut dyn EvalObserver) -> Self {
         self.observer = Some(observer);
@@ -91,42 +51,16 @@ impl<'a> EvalOptions<'a> {
         self
     }
 
-    fn charge(
-        &mut self,
-        eqn: ValueId,
-        idx: usize,
-        dtype: DType,
-        elements: usize,
-        bytes: usize,
-    ) -> Result<(), EvalError> {
+    /// Report an allocation the walk makes to the observer. Inside a decomposition the composite's own
+    /// intermediate loop reports each output, so an arm's report for it is not a second allocation.
+    fn allocated(&mut self, eqn: ValueId, idx: usize, dtype: DType, bytes: usize) {
         if self.charged_by_composite {
-            return Ok(());
+            return;
         }
         let eqn = self.composite.unwrap_or(eqn);
-        if let Some(limit) = self.budget.max_work_elements
-            && elements as u64 > limit
-        {
-            return Err(EvalError::Budget {
-                eqn,
-                resource: "elements",
-                needed: elements,
-                limit: limit as usize,
-            });
-        }
-        if let Some(limit) = self.budget.max_alloc_bytes
-            && bytes as u64 > limit
-        {
-            return Err(EvalError::Budget {
-                eqn,
-                resource: "bytes",
-                needed: bytes,
-                limit: limit as usize,
-            });
-        }
         if let Some(observer) = self.observer.as_deref_mut() {
             observer.allocation(idx, eqn, dtype, bytes);
         }
-        Ok(())
     }
 }
 
@@ -475,7 +409,7 @@ fn evaluate_equation(
         OpKind::PackedDequant { descriptor } => {
             let owner = ops::packed_components(g, eqn, env, descriptor)?;
             let [out, k] = descriptor.shape();
-            opts.charge(eqn.out, idx, DType::F32, out * k, out * k * 4)?;
+            opts.allocated(eqn.out, idx, DType::F32, out * k * 4);
             Ok(Value::Host(ops::evaluate_packed_dequant(
                 owner, descriptor,
             )?))
@@ -496,7 +430,7 @@ fn evaluate_equation(
             let [out, k] = descriptor.shape();
             let out_shape = g.aval(eqn.out).shape.clone();
             let outputs: usize = out_shape.iter().product();
-            opts.charge(eqn.out, idx, DType::F32, outputs, outputs * 4)?;
+            opts.allocated(eqn.out, idx, DType::F32, outputs * 4);
             Ok(Value::Host(ops::evaluate_packed_indexed(
                 &x,
                 &ids,
@@ -504,14 +438,14 @@ fn evaluate_equation(
                 &out_shape,
                 eqn.out,
                 // One decoded `[out, K]` expert at a time: charged per expert actually read.
-                || opts.charge(eqn.out, idx, DType::F32, out * k, out * k * 4),
+                || opts.allocated(eqn.out, idx, DType::F32, out * k * 4),
             )?))
         }
         OpKind::PackedRowGather { descriptor } => {
             let ids = ops::packed_row_ids(eqn, env)?;
             let owner = ops::packed_components(g, eqn, env, descriptor)?;
             let elements: usize = g.aval(eqn.out).shape.iter().product();
-            opts.charge(eqn.out, idx, DType::F32, elements, elements * 4)?;
+            opts.allocated(eqn.out, idx, DType::F32, elements * 4);
             Ok(Value::Host(ops::evaluate_packed_row_gather(
                 ids, owner, descriptor,
             )?))
@@ -581,7 +515,7 @@ impl Decompositions {
 /// Evaluate a composite equation from its decomposition with this same walk: bind the equation's
 /// operand values (as they are, so each primitive reads exactly what the replaced chain read) to the
 /// decomposition's operand placeholders, evaluate every primitive equation in order, and return the
-/// decomposition's output. Each intermediate is charged to the budget, attributed to the composite
+/// decomposition's output. Each intermediate is reported to the observer, attributed to the composite
 /// equation; the observer sees only the composite's own value, which the caller publishes. An error a
 /// primitive raises is attributed to the composite equation too ([`attributed_to`]).
 fn evaluate_composite(
@@ -703,7 +637,7 @@ fn block_top_k_pairs(layout: &poot_graph_ir::BlockTopKLayout) -> usize {
 }
 
 /// Evaluate `decomposition` over `bound`, the values of its operand placeholders in operand order: every
-/// primitive equation in order, each intermediate charged to the budget, the decomposition's output
+/// primitive equation in order, each intermediate reported to the observer, the decomposition's output
 /// returned.
 fn run_decomposition(
     decomposition: &Decomposition,
@@ -722,13 +656,12 @@ fn run_decomposition(
         // Every dense equation computes into a 4-byte-per-element F32 or I32 buffer before the
         // declared-dtype store.
         let elements = ops::element_count(&declared.shape)?;
-        opts.charge(
+        opts.allocated(
             inner_eqn.out,
             idx,
             declared.dtype,
-            elements,
             elements.saturating_mul(4),
-        )?;
+        );
         opts.charged_by_composite = true;
         let value = evaluate_equation(inner, inner_eqn, &inner_env, idx, opts, decompositions);
         opts.charged_by_composite = false;
@@ -823,17 +756,6 @@ fn attributed_to(composite: &Eqn, error: EvalError) -> EvalError {
             fault.eqn = eqn;
             EvalError::Index(fault)
         }
-        EvalError::Budget {
-            resource,
-            needed,
-            limit,
-            ..
-        } => EvalError::Budget {
-            eqn,
-            resource,
-            needed,
-            limit,
-        },
         EvalError::UseBeforeDef(_) => EvalError::UseBeforeDef(eqn),
         EvalError::Input { expected, got, .. } => EvalError::Input {
             value: eqn,
@@ -891,7 +813,7 @@ fn evaluate_cast(
         (DType::BF16, DType::F32) => {
             if let Value::Host(tensor) = env_value(env, input_id)? {
                 // A plain host BF16 value: its words widen exactly; no exact view to
-                // materialize, so no budget charge.
+                // materialize, so nothing is reported.
                 return Ok(Value::Host(HostTensor::f32(
                     out_shape.clone(),
                     tensor.to_f32()?.into_owned(),
@@ -899,7 +821,7 @@ fn evaluate_cast(
             }
             let view = crate::operand::bf16_view(eqn, 0, env)?;
             let elements = view.numel();
-            opts.charge(eqn.out, idx, DType::F32, elements, elements * 4)?;
+            opts.allocated(eqn.out, idx, DType::F32, elements * 4);
             let data = crate::operand::initialized_arc_slice(elements, |flat| view.value(flat));
             Ok(Value::Host(HostTensor::f32_arc(out_shape.clone(), data)))
         }
@@ -914,7 +836,7 @@ fn evaluate_cast(
         (DType::I32, DType::F32) => {
             let (words, _) = i32_words(eqn, 0, env)?;
             check_exact_range(&words)?;
-            opts.charge(eqn.out, idx, DType::F32, words.len(), words.len() * 4)?;
+            opts.allocated(eqn.out, idx, DType::F32, words.len() * 4);
             let data = crate::operand::initialized_arc_slice(words.len(), |i| words[i] as f32);
             Ok(Value::Host(HostTensor::f32_arc(out_shape.clone(), data)))
         }
@@ -1125,7 +1047,7 @@ fn evaluate_bf16(
     match equation {
         Bf16Equation::Widen => {
             let source = crate::operand::bf16_view(eqn, 0, env)?;
-            opts.charge(eqn.out, idx, DType::F32, source.numel(), source.numel() * 4)?;
+            opts.allocated(eqn.out, idx, DType::F32, source.numel() * 4);
             let data =
                 crate::operand::initialized_arc_slice(source.numel(), |flat| source.value(flat));
             Ok(Value::Host(HostTensor::f32_arc(out_shape.clone(), data)))
@@ -1159,7 +1081,7 @@ fn evaluate_bf16(
                 )
             };
             let elements: usize = out_shape.iter().product();
-            opts.charge(eqn.out, idx, DType::BF16, elements, elements * 2)?;
+            opts.allocated(eqn.out, idx, DType::BF16, elements * 2);
             let words: Arc<[u16]> = crate::operand::initialized_arc_slice(elements, |flat| {
                 table.word(source_flat(flat))
             });
@@ -1176,7 +1098,7 @@ fn evaluate_bf16(
             let activation = host_tensor(eqn, 0, env)?;
             let activation_values = activation.to_f32()?;
             let elements: usize = out_shape.iter().product();
-            opts.charge(eqn.out, idx, DType::F32, elements, elements * 4)?;
+            opts.allocated(eqn.out, idx, DType::F32, elements * 4);
             let mut data = crate::operand::initialized_arc_slice(elements, |_| 0.0f32);
             // The weight is a BF16 host tensor or an exact view; both read through the same
             // exact BF16 view, never widened ahead of the contraction.

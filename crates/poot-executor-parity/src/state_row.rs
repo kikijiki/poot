@@ -16,7 +16,7 @@ use std::sync::Arc;
 use poot_eval::test_support::StepFixture;
 use poot_executor::{BindError, ExecError, Executor, NoSync, StateScope};
 use poot_graph_ir::{BinOp, Builder, Graph, Scalar, Slot, SlotKey, StateRole, TensorType};
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_quant::weights::WeightStore;
 use poot_tensor::{DType, HostTensor};
 
@@ -169,7 +169,7 @@ fn run_dtype(exec: &mut dyn Executor, target: Target, dtype: DType) -> Result<()
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(&fixture))
         .map_err(|e| format!("load_weights: {e}"))?;
     let entry = exec
-        .add_entry(exe, &staged(&fixture, target, Submission::Replay))
+        .add_entry(exe, &staged(&fixture, target))
         .map_err(|e| format!("add_entry: {e}"))?;
     let mut model = Model {
         pool: [[0; WIDTH]; SLOTS],

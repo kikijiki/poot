@@ -90,15 +90,6 @@ impl Placed {
         self.targets.devices().iter().map(|&(id, _)| id).collect()
     }
 
-    /// The placement's name, for refusals.
-    pub(crate) fn name(&self) -> &'static str {
-        match self.placement {
-            Placement::Single => "single",
-            Placement::Pipeline { .. } => "pipeline",
-            Placement::Tensor { .. } => "tensor",
-        }
-    }
-
     /// Whether the placement divides the weights over ranks.
     pub(crate) fn is_tensor(&self) -> bool {
         matches!(self.placement, Placement::Tensor { .. })

@@ -14,6 +14,7 @@ rust-version.workspace = true
 test-support = [
     "dep:poot-executor",
     "dep:poot-executor-parity",
+    "dep:poot-test-util",
     "dep:poot-graph-plan",
     "dep:poot-profile",
     "dep:poot-runtime-common",
@@ -36,6 +37,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 poot-executor = { workspace = true, optional = true }
 poot-executor-parity = { workspace = true, optional = true }
+poot-test-util = { workspace = true, optional = true }
 poot-graph-plan = { workspace = true, optional = true }
 poot-profile = { workspace = true, optional = true }
 poot-runtime-common = { workspace = true, optional = true }
@@ -54,7 +56,7 @@ poot-test-util.workspace = true
 poot-eval = { workspace = true, features = ["test-support"] }
 poot-runtime-common.workspace = true
 # Card 534a: fold_dense_bf16_row_gathers is pub(crate) in poot-graph-plan now,
-# reachable only through prepare_target_graph. The planner's pass-soundness tests that trace models live
+# reachable only through compile. The planner's pass-soundness tests that trace models live
 # here (POOT-755): a model crate sits above the planner, never the reverse.
 poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-kernel-ir.workspace = true

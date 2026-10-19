@@ -11,9 +11,9 @@ use crate::predicates::{
     is_elementwise_2d_in, is_tiled_gemm_in,
 };
 use crate::refusal::{FusedStepGap, Site, refusal_at};
-use crate::types::{DispatchPlanError, Launch};
+use crate::types::DispatchPlanError;
 use poot_codegen::{AieAbiMismatch, AieFifo, AieLinkRecipe, AieTile, FifoEnd};
-use poot_kernelgen::{KernelRequirements, SerialWork};
+use poot_kernelgen::KernelRequirements;
 use poot_runtime_common::{
     AieArtifactError, AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess,
 };
@@ -22,9 +22,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use crate::device_validation::validate_kernel_resources;
-use crate::imported::{SAMPLER_LANES, SerialLoop};
 use crate::{Capability, KernelChoice, Plan, PlanError, Region, Sink, Source, value_ids};
-use poot_graph_ir::Operand;
 use poot_graph_ir::Scalar;
 use poot_graph_ir::op::BinOp as GBinOp;
 use poot_graph_ir::op::FusedOp;
@@ -246,7 +244,7 @@ pub(crate) fn finalize(
 ) -> Result<(), PlanError> {
     check_operand_bindings(planned, eqn)?;
     shape_launch(planned, g, eqn, out_shape, out_numel, backend, odt, caps)?;
-    validate_planned_resources(planned, g, eqn, out_numel, backend, caps)
+    validate_planned_resources(planned, g, eqn, backend, caps)
 }
 
 /// The AIE finalizer. An AIE core runs one sequential loop. Its schedule was chosen at generation (the
@@ -672,61 +670,16 @@ pub(crate) fn aie_region_recipe(
 }
 
 /// What a choice's kernel declares beyond its body: a generated request declares its own; a shipped
-/// template declares through [`ImportedKernel::needs`], and its serial work follows from the equation's
-/// shapes (see [`SerialLoop`]). `share` is the fraction of the equation's output this dispatch covers
-/// (`numerator / denominator`): a split plan's dispatches each carry their own launch's share.
-fn choice_requirements(
-    choice: &KernelChoice,
-    g: GraphTables<'_>,
-    eqn: &Eqn,
-    out_numel: usize,
-    share: (u128, u128),
-) -> KernelRequirements {
+/// template declares nothing, because every resource it uses is measured from its body.
+fn choice_requirements(choice: &KernelChoice) -> KernelRequirements {
     match choice {
         KernelChoice::Generated(request) => request.requirements(),
-        KernelChoice::Imported { kernel, .. } => {
-            let needs = kernel.needs();
-            let dim = |operand: usize, from_end: usize| match eqn.inputs.get(operand) {
-                Some(Operand::Value(id)) => {
-                    let shape = &g.aval(*id).shape;
-                    shape.len().checked_sub(from_end).map(|i| shape[i])
-                }
-                _ => None,
-            };
-            let out_numel = out_numel as u64;
-            let serial_work = match needs.serial {
-                SerialLoop::None => None,
-                SerialLoop::ContractionDepth => dim(0, 1).map(|k| (out_numel, k as u64)),
-                SerialLoop::RowVocab { passes } => dim(0, 1).map(|vocab| {
-                    // `[rows, 2]` output: one workgroup of lanes per row.
-                    let lanes = (out_numel / 2) * SAMPLER_LANES;
-                    (lanes, passes * (vocab as u64).div_ceil(SAMPLER_LANES))
-                }),
-            };
-            KernelRequirements {
-                subgroup_lanes: needs.subgroup_lanes,
-                serial_work: serial_work.map(|(threads, steps_per_thread)| SerialWork {
-                    // `share.0 <= share.1`, so the apportioned count never exceeds `threads`.
-                    threads: (u128::from(threads) * share.0).div_ceil(share.1.max(1)) as u64,
-                    steps_per_thread,
-                }),
-            }
-        }
-        // An AIE core has no workgroup, subgroup or dispatch-work budget: its limits are `AieCaps`, checked
-        // on the linked artifact (`validate_linked_artifact`).
-        KernelChoice::NoDispatch(_) | KernelChoice::Serialized { .. } => {
-            KernelRequirements::default()
-        }
+        // An AIE core has no workgroup or subgroup budget: its limits are `AieCaps`, checked on the linked
+        // artifact (`validate_linked_artifact`).
+        KernelChoice::Imported { .. }
+        | KernelChoice::NoDispatch(_)
+        | KernelChoice::Serialized { .. } => KernelRequirements::default(),
     }
-}
-
-/// The total thread count of one launch. `u128`: three `u32` extents cannot overflow it.
-fn launch_threads(launch: &Launch) -> u128 {
-    launch
-        .grid
-        .iter()
-        .map(|&extent| u128::from(extent))
-        .product()
 }
 
 /// The workgroup shape of a single-dispatch plan.
@@ -740,7 +693,6 @@ fn validate_planned_resources(
     planned: &Planned,
     g: GraphTables<'_>,
     eqn: &Eqn,
-    out_numel: usize,
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<(), PlanError> {
@@ -762,18 +714,10 @@ fn validate_planned_resources(
             }
         }
     }
-    let dispatches = planned.plan.dispatches();
-    // A dispatch covers the part of the output its launch's thread count is of the plan's total.
-    let total_threads: u128 = dispatches.iter().map(|d| launch_threads(d.launch())).sum();
-    for dispatch in dispatches {
-        // A zero-thread plan covers its output whole (nothing to apportion).
-        let share = match total_threads {
-            0 => (1, 1),
-            total => (launch_threads(dispatch.launch()), total),
-        };
+    for dispatch in planned.plan.dispatches() {
         validate_kernel_resources(
             dispatch.body(),
-            choice_requirements(dispatch.choice(), g, eqn, out_numel, share),
+            choice_requirements(dispatch.choice()),
             caps,
         )
         .map_err(refuse)?;

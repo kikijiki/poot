@@ -21,16 +21,16 @@ use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Graph, PackedSourceName, Storage, ValueId};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_ptx_device::PtxDevice;
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::HostTensor;
 
-/// `g` staged for the executor contract against `target` (Card 546a: `Submission::Replay` only).
+/// `g` staged for the executor contract against `target`.
 pub(crate) fn staged_program(g: &Graph, target: Target) -> StagedProgram {
     let g = g.clone();
     compile_staged(
@@ -40,7 +40,7 @@ pub(crate) fn staged_program(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("stage ptx graph")
 }
@@ -382,8 +382,8 @@ impl Device for PtxDeviceProxy<'_> {
     ) -> Result<Self::Kernel, Self::Error> {
         self.0.load_kernel(key, kernel)
     }
-    fn begin(&mut self, submission: Submission) -> Result<(), Self::Error> {
-        self.0.begin(submission)
+    fn begin(&mut self) -> Result<(), Self::Error> {
+        self.0.begin()
     }
     fn dispatch(&mut self, d: poot_executor::Dispatch<'_, Self>) -> Result<(), Self::Error> {
         // SAFETY-free reinterpretation: `Self::Buffer`/`Self::Kernel` are literally `PtxDevice`'s own

@@ -8,7 +8,7 @@
 use poot_tensor::DType;
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{Builder, OpKind, Storage, TensorType};
 use poot_tensor::HostTensor;
 
@@ -40,26 +40,18 @@ fn iota_matches_the_bound_range_oracle_and_folds_to_the_same_values() {
         bound.inputs()[0],
         Value::from(HostTensor::f32(vec![6], (0..6).map(|i| i as f32).collect())),
     );
-    let expected = eval(
-        &bound,
-        &bound_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .expect("oracle eval")
-    .output
-    .into_host()
-    .expect("dense oracle output");
+    let expected = eval(&bound, &bound_inputs, EvalOptions::default())
+        .expect("oracle eval")
+        .output
+        .into_host()
+        .expect("dense oracle output");
 
     let computed = computed_iota_graph();
-    let got = eval(
-        &computed,
-        &HashMap::new(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .expect("oracle eval")
-    .output
-    .into_host()
-    .expect("dense oracle output");
+    let got = eval(&computed, &HashMap::new(), EvalOptions::default())
+        .expect("oracle eval")
+        .output
+        .into_host()
+        .expect("dense oracle output");
     assert_eq!(
         got.as_f32().unwrap(),
         expected.as_f32().unwrap(),
@@ -81,15 +73,11 @@ fn iota_matches_the_bound_range_oracle_and_folds_to_the_same_values() {
         .copied()
         .find(|&id| matches!(folded.meta(id).storage, Storage::Computed(_)))
         .expect("the folded iota must be a computed graph constant");
-    let materialized = eval(
-        &folded,
-        &HashMap::new(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .expect("oracle eval")
-    .output
-    .into_host()
-    .expect("dense oracle output");
+    let materialized = eval(&folded, &HashMap::new(), EvalOptions::default())
+        .expect("oracle eval")
+        .output
+        .into_host()
+        .expect("dense oracle output");
     assert_eq!(
         materialized.as_f32().unwrap(),
         expected.as_f32().unwrap(),
@@ -107,7 +95,7 @@ fn the_i32_iota_is_exact_through_the_oracle_and_the_folded_constant() {
     let out = b.iota_i32(6).unwrap();
     let graph = b.finish(out).unwrap();
     let run = |g: &poot_graph_ir::Graph| {
-        eval(g, &HashMap::new(), EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(g, &HashMap::new(), EvalOptions::default())
             .expect("oracle eval")
             .output
             .into_host()

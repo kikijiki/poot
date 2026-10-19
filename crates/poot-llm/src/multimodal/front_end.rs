@@ -1,26 +1,29 @@
 //! The idefics3 / SmolVLM front end: the multimodal prompt as driver step inputs (POOT-739).
 //!
 //! A SmolVLM checkpoint is two registered families over one set of weights. The vision tower
-//! (`idefics3_vision`: SigLIP and the connector) is an `Encode`-only model run through its own
+//! (`idefics3_vision`: SigLIP and the connector) is an `encode`-only model run through its own
 //! [`Driver::encode`]; the text tower is the `llama` family parsed from the checkpoint's `text_config`.
 //! [`Idefics3`] preprocesses the images into frames, encodes each frame into the embedding rows the
 //! connector produces, builds the prompt around the `<image>` placeholders and generates on the text
-//! driver with those rows as step inputs (`StepInput::TokensWithEmbeds`): the frames' pixels and the
-//! rows are bound by value on every step, never baked into a program, so two images of the same size
+//! driver with those rows as a request input (`embeds`): the frames' pixels and the rows are bound by
+//! value on the steps that carry them, never baked into a program, so two images of the same size
 //! share every entry and nothing is evicted between them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use poot_models::idefics3::PIXELS;
+use poot_models::io::{InputValue, Per, RequestInputs};
 use poot_models::registry::{RawConfig, Registry};
 use poot_models::vision::{PreprocessConfig, idefics3_preprocess};
 use poot_quant::weights::{WeightKey, WeightStore};
+use poot_tensor::HostTensor;
 
 use crate::core::sampler::Sampler;
 use crate::driver::error::{DriverError, LoadError};
 use crate::driver::{
-    Driver, DriverOptions, EncodeRequest, EncodeRow, GenerateRequest, Generation, ModelHandle,
-    PromptEmbeds, TokenSink,
+    Driver, DriverOptions, EncodeRequest, EncodeRow, GenerateRequest, Generation, Layout,
+    ModelHandle, Serving, TokenSink,
 };
 use poot_text::{RenderedChat, TextCodec, TextError};
 
@@ -94,6 +97,12 @@ pub enum FrontEndError {
         /// Embedding rows the encoded frames produced.
         rows: usize,
     },
+    /// The vision tower does not declare the per-frame pixels input the front end binds.
+    #[error("the vision tower declares no pixels input")]
+    NoPixelsInput,
+    /// The embedding rows the frames produced are not the shape the prompt's input takes.
+    #[error(transparent)]
+    Values(#[from] poot_models::io::ValueError),
     /// A checkpoint file could not be read.
     #[error("{path}: {source}")]
     Io {
@@ -442,6 +451,7 @@ pub struct Idefics3Checkpoint {
     image_token: u32,
     patches: usize,
     visual_tokens: usize,
+    frame: Vec<usize>,
 }
 
 /// Whether `dir`'s `config.json` declares an idefics3 (SmolVLM) checkpoint. Any other directory, and
@@ -492,6 +502,15 @@ impl Idefics3Checkpoint {
         let text = Arc::new(ModelHandle::from_shared(
             &text_raw, text_store, registry, codec,
         )?);
+        let frame = match vision
+            .model()
+            .schema()
+            .input(PIXELS)
+            .map(|input| input.form().per())
+        {
+            Some(Per::Row { trailing, .. }) => trailing.clone(),
+            _ => return Err(FrontEndError::NoPixelsInput),
+        };
         Ok(Self {
             vision,
             text,
@@ -499,6 +518,7 @@ impl Idefics3Checkpoint {
             image_token: config.image_token,
             patches: config.patches,
             visual_tokens: config.visual_tokens,
+            frame,
         })
     }
 
@@ -513,22 +533,22 @@ impl Idefics3Checkpoint {
             text: Arc::clone(&self.text),
             preprocess: self.preprocess,
             image_token: self.image_token,
-            patches: self.patches,
             visual_tokens: self.visual_tokens,
+            frame: self.frame.clone(),
         })
     }
 }
 
 /// The image side of a SmolVLM: preprocessing, the vision tower on its own driver, and the prompt
 /// whose `<image>` placeholders the tower's rows replace. It produces what any text driver takes
-/// (token ids and [`PromptEmbeds`]); it never generates.
+/// (token ids and [`RequestInputs`]); it never generates.
 pub struct Idefics3FrontEnd {
     vision: Driver,
     text: Arc<ModelHandle>,
     preprocess: PreprocessConfig,
     image_token: u32,
-    patches: usize,
     visual_tokens: usize,
+    frame: Vec<usize>,
 }
 
 impl Idefics3FrontEnd {
@@ -548,10 +568,14 @@ impl Idefics3FrontEnd {
     pub fn encode_frames(&mut self, frames: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, FrontEndError> {
         let mut rows = Vec::with_capacity(frames.len());
         for pixels in frames {
+            let inputs = RequestInputs::none().with(
+                PIXELS,
+                InputValue::Row(HostTensor::f32(self.frame.clone(), pixels.clone())),
+            );
             let encoded = self.vision.encode(&EncodeRequest {
-                rows: &[EncodeRow::Frame {
-                    pixels,
-                    positions: self.patches,
+                rows: &[EncodeRow {
+                    tokens: None,
+                    inputs: &inputs,
                 }],
             })?;
             rows.push(
@@ -569,7 +593,7 @@ impl Idefics3FrontEnd {
     /// of the turns): render the turns through the checkpoint's chat template, preprocess each image
     /// into idefics3 frames, encode the frames, and expand each image's mark into the block whose
     /// `<image>` placeholders the frames' rows replace. The text driver serves it alone ([`Idefics3::caption`]) or beside other
-    /// requests' prompts (`Driver::open_with_embeds` on a paged pool).
+    /// requests' prompts (`Driver::open` with the request inputs on a paged pool).
     pub fn prepare_decoded(
         &mut self,
         images: &[Image<'_>],
@@ -622,13 +646,8 @@ impl Idefics3FrontEnd {
         }
         let encoded = self.encode_frames(&frames)?;
         let width = encoded[0].len() / self.visual_tokens;
-        let embeds = PromptEmbeds::new(width, positions, encoded.concat())
-            .map_err(|e| DriverError::from(crate::driver::error::InvalidRequest::Embeds(e)))?;
-        Ok(MultimodalPrompt {
-            prompt,
-            embeds,
-            mrope: None,
-        })
+        let inputs = super::prompt_inputs(width, positions, encoded.concat(), None)?;
+        Ok(MultimodalPrompt { prompt, inputs })
     }
 }
 
@@ -637,7 +656,7 @@ pub struct Idefics3 {
     /// The vision side: preprocessing and the vision tower's driver.
     pub images: Idefics3FrontEnd,
     /// The text tower's driver, which generates with the image rows as step inputs.
-    pub text: Driver,
+    pub text: Driver<Serving>,
 }
 
 impl Idefics3 {
@@ -653,7 +672,8 @@ impl Idefics3 {
         let checkpoint = Idefics3Checkpoint::read(dir, registry)?;
         Ok(Self {
             images: checkpoint.front_end(vision)?,
-            text: Driver::new(Arc::clone(&checkpoint.text), text.0, text.1)?,
+            text: Driver::new(Arc::clone(&checkpoint.text), text.0, text.1)?
+                .serve(Layout::Contiguous),
         })
     }
 
@@ -664,9 +684,9 @@ impl Idefics3 {
         request: &CaptionRequest<'_>,
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, FrontEndError> {
-        let MultimodalPrompt { prompt, embeds, .. } =
+        let MultimodalPrompt { prompt, inputs } =
             self.images.prepare_decoded(request.images, request.turns)?;
-        Ok(self.text.generate_with_embeds(
+        Ok(self.text.generate_with_inputs(
             GenerateRequest {
                 prompt,
                 max_new: request.max_new,
@@ -674,7 +694,7 @@ impl Idefics3 {
                 stops: Vec::new(),
                 ignore_eos: false,
             },
-            embeds,
+            inputs,
             sink,
         )?)
     }
@@ -1005,7 +1025,7 @@ mod tests {
 mod smolvlm {
     use std::num::{NonZeroU64, NonZeroUsize};
 
-    use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+    use poot_graph_plan::{CompileLimits, CompileOptions};
     use poot_runtime_common::DeviceBackend;
 
     use super::*;
@@ -1013,7 +1033,7 @@ mod smolvlm {
     use crate::driver::{BackendChoice, DraftPolicy, PreparedSetLimits, open_executor};
 
     fn options(capacity: usize, chunk: usize) -> DriverOptions {
-        let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+        let compile = CompileOptions::new(CompileLimits::STANDARD);
         let nz = |n: usize| NonZeroUsize::new(n).unwrap();
         DriverOptions {
             prefill: compile.clone(),

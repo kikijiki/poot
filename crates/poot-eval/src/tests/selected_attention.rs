@@ -11,7 +11,7 @@ use poot_graph_ir::{
 };
 use poot_tensor::{DType, HostTensor};
 
-use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use crate::{EvalError, EvalOptions, Value, eval};
 
 /// A graph over `q`, `k`, `v`, `ids` and `pos` constants whose output is the op's.
 struct Fixture {
@@ -85,7 +85,7 @@ fn run(case: &Case, [q, k, v]: &[Vec<f32>; 3]) -> Result<Vec<f32>, EvalError> {
             HostTensor::i32(vec![batch, lq], case.pos.clone()).into(),
         ),
     ]);
-    let result = eval(&f.graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+    let result = eval(&f.graph, &values, EvalOptions::default())?;
     Ok(result
         .output
         .into_host()
@@ -166,7 +166,7 @@ fn selecting_every_block_is_plain_causal_attention() {
             HostTensor::i32(vec![batch, lq], case.pos.clone()).into(),
         ),
     ]);
-    let plain = eval(&graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let plain = eval(&graph, &values, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

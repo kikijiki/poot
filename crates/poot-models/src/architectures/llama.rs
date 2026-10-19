@@ -15,19 +15,18 @@ use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
+use crate::components::embed::EMBEDS;
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
 use crate::components::linear::WeightError;
 use crate::components::moe::{self, MoeParams, MoeWeights};
 use crate::components::rope::{GGUF_ROPE_FREQS, rope_freq_factors};
 use crate::components::router::RouterKind;
 use crate::components::standard::{
-    BlockInput, EmbeddablePhase, LayerNorms, LayerParams, StackParams, StackWeights, Step,
-    check_embeddable_step, standard_layer, standard_stack,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    embeddable_decoder_schema, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::{ModelSchema, ProgramId};
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::GGUF_BASE;
 use crate::names::{
     ExpertNames, HF_BASE, MoeLayers, MoeNames, family_weights, family_weights_routed,
@@ -230,6 +229,7 @@ pub(crate) struct Llama {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -277,6 +277,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = embeddable_decoder_schema(p.vocab, p.width, false).build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -284,7 +285,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: p.chat,
     };
@@ -294,6 +294,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -302,20 +303,31 @@ impl Model for Llama {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        let phase = check_embeddable_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         if let Some(params) = &p.moe {
             moe::check_step(FAMILY, shape, params)?;
         }
-        let step = match phase {
-            EmbeddablePhase::Prefill | EmbeddablePhase::Decode => Step::new(&b, shape)?,
-            EmbeddablePhase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width)?,
-            EmbeddablePhase::Encode => Step::new(&b, shape)?.returning_hidden(),
+        let step = Step::new(&b, shape)?;
+        let step = if spec.program == ProgramId::ENCODE {
+            step.returning_hidden()
+        } else {
+            step
+        };
+        let step = if spec.carries(EMBEDS) {
+            step.with_embeds(&b, p.width)?
+        } else {
+            step
         };
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
@@ -409,7 +421,7 @@ mod tests {
         close, close_all, f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store,
         read_back_owned, step_shape, values,
     };
-    use crate::model::LogitRows;
+    use crate::model::{LogitRows, StepShape};
     use crate::registry::Registry;
 
     fn is_projection(key: &str) -> bool {
@@ -528,16 +540,7 @@ mod tests {
         let fx = fixture();
         let run = |window| {
             let model = model_of(&config_with("mistral", window), &fx.store);
-            run_step(
-                &*model,
-                &fx.store,
-                Phase::Prefill,
-                CAP,
-                &[3, 17, 40, 8, 25],
-                0,
-                &[],
-            )
-            .0
+            run_step(&*model, &fx.store, CAP, &[3, 17, 40, 8, 25], 0, &[]).0
         };
         assert_ne!(run(Some(3)), run(None), "the window must change the logits");
     }
@@ -566,8 +569,7 @@ mod tests {
             graphs.push(
                 model
                     .trace(
-                        Phase::Prefill,
-                        step_shape(3, CAP, LogitRows::All),
+                        &StepSpec::step(step_shape(3, CAP, LogitRows::All)),
                         poot_graph_ir::TraceLimits::for_tests(),
                     )
                     .unwrap(),
@@ -736,28 +738,12 @@ mod tests {
         let reference = model_of(&fixture_config(), &reference_store);
 
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         // The K cache holds rotated, permuted rows: compare the V cache and the next logits.
-        let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-        let (want, _) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Decode,
-            CAP,
-            &[5],
-            4,
-            &want_state,
-        );
+        let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+        let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
         close_all(
             &[state[1].clone(), state[3].clone()],
@@ -817,8 +803,7 @@ mod tests {
         let plain = model_of(&fixture_config(), &reference_store);
 
         let prompt = [3, 17, 40, 8, 22, 9, 31, 12];
-        let run =
-            |m: &dyn Model, s: &WeightStore| run_step(m, s, Phase::Prefill, CAP, &prompt, 0, &[]).0;
+        let run = |m: &dyn Model, s: &WeightStore| run_step(m, s, CAP, &prompt, 0, &[]).0;
         let got = run(&*model, &store);
         close(&got, &run(&*reference, &reference_store));
         assert!(
@@ -892,24 +877,17 @@ mod tests {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
         let n = |v| NonZeroUsize::new(v).unwrap();
-        let shape = |rows, tokens, capacity| StepShape {
-            rows: n(rows),
-            tokens: n(tokens),
-            capacity: n(capacity),
-            ..step_shape(1, 1, LogitRows::Last)
-        };
+        let shape = |rows, tokens, capacity| StepShape::new(n(rows), n(tokens), n(capacity));
         assert!(matches!(
             model.trace(
-                Phase::Decode,
-                shape(1, 2, 8),
+                &StepSpec::step(shape(1, 9, 8)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
             model.trace(
-                Phase::Prefill,
-                shape(1, 1, 65),
+                &StepSpec::step(shape(1, 1, 65)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })
@@ -934,7 +912,6 @@ mod moe_tests {
         close, f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store,
         read_back_owned, values,
     };
-    use crate::model::Phase;
     use crate::registry::{LoadModelError, Registry};
 
     use super::FIXTURE_EXPERTS as EXPERTS;
@@ -1148,27 +1125,11 @@ mod moe_tests {
             reference_store,
         );
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
-        let (got, _) = run_step(&*model, store, Phase::Decode, CAP, &[5], 4, &state);
-        let (want, _) = run_step(
-            &*reference,
-            reference_store,
-            Phase::Decode,
-            CAP,
-            &[5],
-            4,
-            &want_state,
-        );
+        let (got, _) = run_step(&*model, store, CAP, &[5], 4, &state);
+        let (want, _) = run_step(&*reference, reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }
 

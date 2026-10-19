@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use poot_executor::{Device, DeviceTime, Dispatch, Engine, Executor};
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use poot_target::{Backend, BufferStorage};
 use poot_tensor::HostTensor;
@@ -28,7 +28,7 @@ impl Answer {
 pub struct EchoDevice {
     answer: Answer,
     memory: poot_runtime_common::MemoryCounters,
-    submission: Option<Submission>,
+    recording: bool,
 }
 
 /// The echo device never fails; this is the type its `Device::Error` names.
@@ -49,7 +49,7 @@ pub fn echo_executor() -> (Box<dyn Executor>, Target, Answer) {
     let device = EchoDevice {
         answer: answer.clone(),
         memory: poot_runtime_common::MemoryCounters::default(),
-        submission: None,
+        recording: false,
     };
     let target = device.target();
     (Box::new(Engine::new(device)), target, answer)
@@ -95,8 +95,8 @@ impl Device for EchoDevice {
         Ok(())
     }
 
-    fn begin(&mut self, submission: Submission) -> Result<(), EchoError> {
-        self.submission = Some(submission);
+    fn begin(&mut self) -> Result<(), EchoError> {
+        self.recording = true;
         Ok(())
     }
 
@@ -109,10 +109,7 @@ impl Device for EchoDevice {
     }
 
     fn finish(&mut self) -> Result<Option<()>, EchoError> {
-        Ok(match self.submission.take() {
-            Some(Submission::Replay) => Some(()),
-            _ => None,
-        })
+        Ok(std::mem::take(&mut self.recording).then_some(()))
     }
 
     fn replay(&mut self, _recording: &()) -> Result<(), EchoError> {

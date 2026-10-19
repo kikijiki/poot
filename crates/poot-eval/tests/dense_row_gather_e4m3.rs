@@ -9,7 +9,7 @@
 //! - byte `0x40` (sign 0, exponent `1000` = 8, mantissa `000`) decodes to exactly `2.0`: `2^(8-7) * 1`.
 
 use poot_eval::fp8::e4m3fn_tensor;
-use poot_eval::{EvalBudget, EvalOptions, Value};
+use poot_eval::{EvalOptions, Value};
 use poot_graph_ir::{
     BinOp, DENSE_ROW_GATHER_SOURCE_DTYPES, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot,
     Storage, TensorType, ValueId, ValueMeta,
@@ -147,7 +147,7 @@ fn dense_row_gather_e4m3_reads_exact_rows() {
             Value::Host(HostTensor::i32(vec![2], index.to_vec())),
         );
         let output = dense_tensor(
-            poot_eval::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            poot_eval::eval(&g, &inputs, EvalOptions::default())
                 .map(|r| r.output)
                 .expect("gather-only graph evaluates"),
         );
@@ -175,8 +175,7 @@ fn dense_row_gather_e4m3_still_checks_bounds() {
     inputs.insert(table_id, Value::Host(table));
     // The table has 2 rows (valid indices 0..=1); 2 is out of range.
     inputs.insert(index_id, Value::Host(HostTensor::i32(vec![1], vec![2])));
-    let result =
-        poot_eval::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|r| r.output);
+    let result = poot_eval::eval(&g, &inputs, EvalOptions::default()).map(|r| r.output);
     // Card 555: the bounds check now routes through the one index rule's `EvalError::Index`,
     // not `Fp8Error::DenseRowGatherIndex`.
     let error = result.expect_err("expected a named out-of-range rejection");
@@ -208,7 +207,7 @@ fn dense_row_gather_e4m3_composes_with_downstream_scale() {
     inputs.insert(table_id, Value::Host(table));
     inputs.insert(index_id, Value::Host(HostTensor::i32(vec![2], vec![0, 1])));
     let output = dense_tensor(
-        poot_eval::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        poot_eval::eval(&g, &inputs, EvalOptions::default())
             .map(|r| r.output)
             .expect("gather-then-scale graph evaluates"),
     );

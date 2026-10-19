@@ -4,13 +4,13 @@
 use poot_tensor::DType;
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use poot_eval::{EvalError, EvalOptions, Value, eval};
 use poot_graph_ir::{
     BinOp, Eqn, ExecutionValidationFailure, Graph, MAX_VALIDATION_PACKET_BYTES, OpKind, Operand,
     Storage, ValidationId, ValueId, ValueMeta, ValueTable,
 };
 use poot_graph_plan::{collapse_reshape_chains, cse, dce, elide_noop_transposes, fuse};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_tensor::HostTensor;
 
@@ -20,8 +20,7 @@ fn qwen2_decode(dense: &Dense, cap: usize) -> Graph {
         .f32_model()
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the qwen2 decode traces")
@@ -194,12 +193,8 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
     ) -> (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) {
         let inputs_v: HashMap<ValueId, Value> =
             inputs.iter().map(|(&k, v)| (k, v.clone().into())).collect();
-        let result = eval(
-            graph,
-            &inputs_v,
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-        )
-        .expect("validation-bearing graph evaluates");
+        let result = eval(graph, &inputs_v, EvalOptions::default().keep_environment())
+            .expect("validation-bearing graph evaluates");
         let environment: ValueTable<Option<HostTensor>> = result
             .environment
             .expect("keep_environment was set")
@@ -250,7 +245,7 @@ fn qwen2_value_preserving_transforms_keep_validation_bits() {
     let failure = |graph: &Graph| -> ExecutionValidationFailure {
         let inputs_v: HashMap<ValueId, Value> =
             inputs.iter().map(|(&k, v)| (k, v.clone().into())).collect();
-        match eval(graph, &inputs_v, EvalOptions::new(EvalBudget::UNBOUNDED)) {
+        match eval(graph, &inputs_v, EvalOptions::default()) {
             Err(EvalError::Validation(failure)) => failure,
             other => panic!("expected a validation failure, got {other:?}"),
         }

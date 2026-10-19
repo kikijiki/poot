@@ -16,7 +16,6 @@ use std::time::Instant;
 use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Builder, Graph, TensorType, ops};
-use poot_graph_plan::production_plan::Submission;
 use poot_graph_plan::staged::{
     DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram, TargetSet, compile_staged,
 };
@@ -550,7 +549,7 @@ fn staged(g: &Graph, target: Target) -> Result<StagedProgram, String> {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .map_err(|e| format!("compile_staged: {e}"))
 }

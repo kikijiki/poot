@@ -124,7 +124,6 @@ fn caps_from_attributes(total_memory: u64, attrs: &CudaAttributes) -> poot_targe
             min_size: attrs.warp_size,
             max_size: attrs.warp_size,
         }),
-        max_dispatch_work: poot_target::Queried::Unknown,
         max_grid: attrs.max_grid,
         watchdog_budget: None,
         tensor_core: poot_target::TensorCoreSupport::from_cuda_compute_capability(

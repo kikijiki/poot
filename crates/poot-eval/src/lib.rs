@@ -46,7 +46,7 @@ pub use ops::sampling::{MASKED_LOGIT, top_p_threshold, top_p_token_mass};
 #[cfg(any(test, feature = "test-support"))]
 pub use routing::{top_k_gate, top_k_ids, top_k_mask};
 pub use value::{PackedEvalError, Value};
-pub use walk::{EvalBudget, EvalOptions, Evaluation, eval};
+pub use walk::{EvalOptions, Evaluation, eval};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

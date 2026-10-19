@@ -192,7 +192,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -219,7 +219,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
         sui,
         Value::from(HostTensor::f32(vec![rows, 1, cols], update_d)),
     );
-    let stat = eval(&gs, &sinputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let stat = eval(&gs, &sinputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -249,9 +249,7 @@ fn dyn_update_slice_dynamic_gpu_matches_static() {
 #[test]
 fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{
-        CompileOptions, KernelChoice, NoDispatch, Target, compile, production_plan::Submission,
-    };
+    use poot_graph_plan::{CompileOptions, KernelChoice, NoDispatch, Target, compile};
     use poot_kernelgen::{ContractionSpec, KernelRequest, ScoreTransform};
     use poot_target::{AmdArch, Backend};
 
@@ -284,7 +282,7 @@ fn the_kernel_choice_names_generated_imported_and_no_dispatch_equations() {
         backend,
         caps: poot_test_util::device_caps::default_caps_for(backend),
     };
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     let program = compile(&g, &target, &options).expect("the fixture compiles for AMDGCN");
     let choice_of = |want: fn(&OpKind) -> bool| {
         let (eqn, _) = program

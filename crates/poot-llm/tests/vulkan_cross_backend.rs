@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use poot_executor::{Device, Engine, Executor};
-use poot_graph_plan::production_plan::Submission;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_vulkan_device::VulkanDevice;
@@ -40,10 +39,7 @@ fn memory_counters_charge_the_roles_a_decode_entry_allocates_as_wgpu_does() {
             )
             .unwrap();
         device
-            .add_entry(
-                exe,
-                &poot_executor_parity::staged(&fixture, target, Submission::Replay),
-            )
+            .add_entry(exe, &poot_executor_parity::staged(&fixture, target))
             .unwrap();
         device.stats().memory
     };

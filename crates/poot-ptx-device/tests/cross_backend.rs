@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::ValueId;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
@@ -134,7 +134,7 @@ fn elementwise_add_ptx_matches_cpu() {
 
     let inputs = make_inputs(&[(ai, vec![n], fill(42, n)), (ci, vec![n], fill(99, n))]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -164,7 +164,7 @@ fn elementwise_mul_ptx_matches_cpu() {
 
     let inputs = make_inputs(&[(ai, vec![n], fill(201, n)), (ci, vec![n], fill(202, n))]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -193,7 +193,7 @@ fn elementwise_neg_ptx_matches_cpu() {
 
     let inputs = make_inputs(&[(xi, vec![n], fill(301, n))]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -228,7 +228,7 @@ fn matmul_ptx_matches_cpu() {
         (wi, vec![k, n], fill(402, k * n)),
     ]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -259,7 +259,7 @@ fn reduce_sum_ptx_matches_cpu() {
 
     let inputs = make_inputs(&[(xi, vec![rows, cols], fill(501, rows * cols))]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -289,7 +289,7 @@ fn reduce_max_last_axis_ptx_matches_cpu() {
 
     let inputs = make_inputs(&[(xi, vec![rows, cols], fill(511, rows * cols))]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -327,7 +327,7 @@ fn reduce_sum_nonpow2_wide_real_magnitude_ptx_matches_cpu() {
         let data = fill_real_magnitude(820 + i as u64, rows * cols);
         let inputs = make_inputs(&[(xi, vec![rows, cols], data.clone())]);
 
-        let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -378,7 +378,7 @@ fn reduce_max_nonpow2_wide_real_magnitude_ptx_matches_cpu() {
         let data = fill_real_magnitude(920 + i as u64, rows * cols);
         let inputs = make_inputs(&[(xi, vec![rows, cols], data.clone())]);
 
-        let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -431,7 +431,7 @@ fn rmsnorm_ptx_matches_cpu() {
     let wd: Vec<f32> = fill(932, n).iter().map(|v| 1.0 + v.abs()).collect();
     let inputs = make_inputs(&[(xi, vec![1, 1, n], xd), (wi, vec![n], wd)]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -469,7 +469,7 @@ fn layernorm_ptx_matches_cpu() {
         (bi, vec![n], bd),
     ]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -501,7 +501,7 @@ fn non_power_of_2_ptx_matches_cpu() {
 
     let inputs = make_inputs(&[(ai, vec![n], fill(601, n)), (ci, vec![n], fill(602, n))]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -532,7 +532,7 @@ fn single_element_ptx_matches_cpu() {
 
     let inputs = make_inputs(&[(ai, vec![1], vec![3.5]), (ci, vec![1], vec![2.5])]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -564,7 +564,7 @@ fn large_elementwise_ptx_matches_cpu() {
 
     let inputs = make_inputs(&[(ai, vec![n], fill(701, n)), (ci, vec![n], fill(702, n))]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -602,7 +602,7 @@ fn gather_axis0_ptx_matches_cpu() {
     let g = b.finish(out).unwrap();
     let mut inputs = make_inputs(&[(di, vec![n, d], fill(901, n * d))]);
     inputs.insert(ii, HostTensor::i32(vec![idx_count], vec![3, 0, 6]).into());
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -637,7 +637,7 @@ fn matmul_bias_ptx_matches_cpu() {
         (wi, vec![k, n], fill(402, k * n)),
         (bi, vec![n], fill(403, n)),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -670,7 +670,7 @@ fn broadcast_binary_ptx_matches_cpu() {
         (ai, vec![batch, rows, cols], fill(601, batch * rows * cols)),
         (bi, vec![cols], fill(602, cols)),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -698,7 +698,7 @@ fn transpose_slice_ptx_matches_cpu() {
     let xi = x.id();
     let g = b.finish(s).unwrap();
     let inputs = make_inputs(&[(xi, vec![r, c], fill(701, r * c))]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -732,7 +732,7 @@ fn elementwise_sub_div_ptx_matches_cpu() {
         *v = v.abs() + 0.5;
     }
     let inputs = make_inputs(&[(ai, vec![n], fill(801, n)), (ci, vec![n], cd)]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -758,7 +758,7 @@ fn unary_ptx_case(op: UnOp, xd: Vec<f32>, label: &str) {
     let xi = x.id();
     let g = b.finish(out).unwrap();
     let inputs = make_inputs(&[(xi, vec![n], xd)]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -826,7 +826,7 @@ fn unary_transcendental_ptx(op: UnOp, label: &str) {
     let xi = x.id();
     let g = b.finish(out).unwrap();
     let inputs = make_inputs(&[(xi, vec![n], TRANSCENDENTAL_TABLE.to_vec())]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -883,7 +883,7 @@ fn masked_attention_ptx_matches_cpu() {
         (vi, vec![1, hkv, cap, d], fill(503, hkv * cap * d)),
         (mi, vec![1, 1, 1, cap], vec![0.0, 0.0, -1.0e9, -1.0e9]),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -925,7 +925,7 @@ fn decomposed_prefill_attention_over_65535_query_groups_ptx_matches_cpu() {
         (vi, vec![1, hq, l, d], fill(603, hq * l * d)),
         (mi, vec![1, 1, l, l], causal),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1031,7 +1031,7 @@ fn sample_token_greedy_ptx_matches_cpu() {
     data[vocab + vocab - 1] = f32::NAN; // row 1, isolated from row 0's ties
     let inputs = make_inputs(&[(li, vec![rows, vocab], data)]);
 
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1070,7 +1070,7 @@ fn random_uniform_ptx_matches_cpu() {
     let seed_data: Vec<i32> = vec![0, 1, 0xDEADBEEFu32 as i32];
     let inputs: HashMap<ValueId, Value> =
         HashMap::from([(seed.id(), HostTensor::i32(vec![rows], seed_data).into())]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1178,7 +1178,7 @@ fn sample_token_topp_nucleus_ptx_matches_cpu() {
                 HostTensor::i32(vec![rows], top_k_data.clone()).into(),
             ),
         ]);
-        let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1267,7 +1267,7 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_ptx_matches_cpu() {
         (pi, HostTensor::f32(vec![rows, 4], params_data).into()),
         (top_k.id(), HostTensor::i32(vec![rows], top_k_data).into()),
     ]);
-    let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1323,9 +1323,7 @@ fn bf16_bits(x: f32) -> u16 {
 /// `tiled_region`; the nonzero inputs then differ and this row goes red. Runs on the PTX pod.
 #[test]
 fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
-    use poot_graph_plan::{
-        CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
-    };
+    use poot_graph_plan::{CompileLimits, CompileOptions, Target, compile};
     use poot_tensor::DType;
     let Some(mut ptx) = try_ptx() else { return };
     let target = Target::Gpu {
@@ -1369,12 +1367,8 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
                 ),
             ]);
             let g = b.finish(out).unwrap();
-            let fused_graph = compile(
-                &g,
-                &target,
-                &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
-            )
-            .expect("the graph compiles");
+            let fused_graph = compile(&g, &target, &CompileOptions::new(CompileLimits::STANDARD))
+                .expect("the graph compiles");
             let heads: Vec<_> = fused_graph
                 .graph()
                 .eqns()
@@ -1392,13 +1386,13 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
                 "{label}: one fused dense contraction"
             );
             let (fused, class) = common::run_resident_classed(&mut ptx, &g, &inputs);
-            let want = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let want = eval(&g, &inputs, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
                 .unwrap();
             assert_eq!(fused.shape(), want.shape(), "{label}: shape");
-            poot_executor_parity::assert_close(
+            poot_test_util::assert_close_scaled(
                 fused.as_f32().unwrap(),
                 want.as_f32().unwrap(),
                 class.tolerance(),
@@ -1415,9 +1409,7 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
 /// Runs on the PTX pod.
 #[test]
 fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
-    use poot_graph_plan::{
-        CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
-    };
+    use poot_graph_plan::{CompileLimits, CompileOptions, Target, compile};
     let Some(mut ptx) = try_ptx() else { return };
     let target = Target::Gpu {
         backend: poot_target::Backend::Nvptx,
@@ -1449,12 +1441,8 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
             ),
         ]);
         let g = b.finish(out).unwrap();
-        let fused_graph = compile(
-            &g,
-            &target,
-            &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
-        )
-        .expect("the graph compiles");
+        let fused_graph = compile(&g, &target, &CompileOptions::new(CompileLimits::STANDARD))
+            .expect("the graph compiles");
         let heads: Vec<_> = fused_graph
             .graph()
             .eqns()
@@ -1470,13 +1458,13 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
             "{label}: one fused matmul contraction"
         );
         let (fused, class) = common::run_resident_classed(&mut ptx, &g, &inputs);
-        let want = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let want = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
             .unwrap();
         assert_eq!(fused.shape(), want.shape(), "{label}: shape");
-        poot_executor_parity::assert_close(
+        poot_test_util::assert_close_scaled(
             fused.as_f32().unwrap(),
             want.as_f32().unwrap(),
             class.tolerance(),

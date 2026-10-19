@@ -11,7 +11,7 @@ use poot_llm::driver::error::FailureClass;
 
 use super::*;
 use crate::batch::engine::Exit;
-use crate::types::{AdminRequest, EncodeRow, PromptRows};
+use crate::types::{AdminRequest, EncodeRow};
 
 /// A request through the production `handle` and the full response text.
 pub(super) fn roundtrip(
@@ -572,12 +572,9 @@ fn a_multimodal_job_appears_in_the_request_metrics() {
     let metrics = Arc::new(test_metrics("multimodal-metrics"));
     let (served, engine) = serve_with_fake(counting_engine(1), tiny_model(), &metrics);
     let mut request = generation_request("ab", 2, false);
-    request.prompt = PromptInput::Multimodal {
+    request.prompt = PromptInput {
         tokens: tokens_of("ab"),
-        rows: PromptRows {
-            embeds: poot_llm::driver::PromptEmbeds::new(1, vec![0], vec![1.0]).unwrap(),
-            mrope: None,
-        },
+        inputs: embed_inputs(1, vec![0], vec![1.0]),
     };
     let completion = submit_one(&served.engine, &metrics, request, &|| false, |_, _| {
         GenerationControl::Continue(())
@@ -1484,10 +1481,10 @@ mod device {
     use std::num::{NonZeroU64, NonZeroUsize};
 
     use poot_executor::Executor;
-    use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+    use poot_graph_plan::{CompileLimits, CompileOptions};
     use poot_llm::driver::{
         AdapterRef, BackendChoice, DraftPolicy, Driver, DriverOptions, EncodeRequest,
-        EncodeRow as DriverRow, GenerateRequest, PreparedSetLimits, PromptEmbeds, open_executor,
+        EncodeRow as DriverRow, GenerateRequest, PreparedSetLimits, open_executor,
         program_retention,
     };
     use poot_runtime_common::DeviceBackend;
@@ -1553,7 +1550,7 @@ mod device {
     }
 
     fn options(chunk: usize, capacity: usize) -> DriverOptions {
-        let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+        let compile = CompileOptions::new(CompileLimits::STANDARD);
         DriverOptions {
             prefill: compile.clone(),
             decode: compile,
@@ -1620,7 +1617,7 @@ mod device {
 
     fn greedy_request(tokens: Vec<u32>, adapter: AdapterRef) -> GenerationRequest {
         GenerationRequest {
-            prompt: PromptInput::Tokens(tokens),
+            prompt: PromptInput::text(tokens),
             max_new: MAX_NEW,
             sampler: Sampler::greedy(),
             stop: Vec::new(),
@@ -1641,20 +1638,19 @@ mod device {
     }
 
     /// SC-007: a multimodal prompt served through the loop returns the tokens `Driver::generate` gives the
-    /// same prompt with the same `PromptEmbeds`, streamed piece by piece, and a plain prompt after it
+    /// same prompt with the same embedding-row request input, streamed piece by piece, and a plain prompt after it
     /// returns the plain tokens: the rows belong to their job. The embedding rows replace the placeholder
     /// tokens' own, so the run differs from the tokens-only run (the row's precondition). Mutation: open the
     /// sequence without the rows (`embeds: None` in `admit`); the tokens are the placeholders' and the row
     /// goes red. The layout is the contiguous one, the only one that takes embedding rows.
-    fn a_multimodal_job_through_the_loop_matches_generate_with_embeds(choice: BackendChoice) {
+    fn a_multimodal_job_through_the_loop_matches_generate_with_inputs(choice: BackendChoice) {
         let (handle, _) = qwen2();
         let placeholders = vec![3, 0, 40, 0, 25, 11, 2];
-        let embeds = PromptEmbeds::new(
+        let embeds = embed_inputs(
             64,
             vec![1, 3],
             fill(2 * 64, 7).iter().map(|v| v * 0.6).collect(),
-        )
-        .expect("two rows of the embedding width");
+        );
         let (tx, rx) = mpsc::channel::<EngineMsg>();
         let (ready_tx, ready_rx) = mpsc::channel();
         let metrics = Arc::new(test_metrics("vlm-device"));
@@ -1667,8 +1663,9 @@ mod device {
                     let _ = ready_tx.send(None);
                     return;
                 };
-                let mut driver =
-                    Driver::new(Arc::clone(&handle), executor, options(8, 64)).expect("driver");
+                let mut driver = Driver::new(Arc::clone(&handle), executor, options(8, 64))
+                    .expect("driver")
+                    .serve(Layout::Contiguous);
                 let mut sink = |_: u32, _: &str| GenerationControl::Continue(());
                 let request = |prompt: &[u32]| GenerateRequest {
                     prompt: prompt.to_vec(),
@@ -1678,8 +1675,8 @@ mod device {
                     ignore_eos: false,
                 };
                 let with = driver
-                    .generate_with_embeds(request(&placeholders), embeds, &mut sink)
-                    .expect("generate with embeds")
+                    .generate_with_inputs(request(&placeholders), embeds, &mut sink)
+                    .expect("generate with inputs")
                     .tokens;
                 let without = driver
                     .generate(request(&placeholders), &mut sink)
@@ -1710,12 +1707,9 @@ mod device {
 
         let pieces = Mutex::new(String::new());
         let mut request = greedy_request(Vec::new(), AdapterRef::Base);
-        request.prompt = PromptInput::Multimodal {
+        request.prompt = PromptInput {
             tokens: placeholders.clone(),
-            rows: PromptRows {
-                embeds,
-                mrope: None,
-            },
+            inputs: embeds,
         };
         request.stream = true;
         let completion = submit_one(tx, &metrics, request, &|| false, |piece, _| {
@@ -1725,7 +1719,7 @@ mod device {
         .expect("the multimodal job completes");
         assert_eq!(
             completion.tokens, with,
-            "the loop's tokens are generate_with_embeds'"
+            "the loop's tokens are generate_with_inputs'"
         );
         assert_eq!(
             *pieces.lock().unwrap(),
@@ -1821,11 +1815,16 @@ mod device {
                     })
                     .expect("the fresh driver prepares the same shapes");
                 let encode = |fresh: &mut Driver, rows: &[EncodeRow]| {
+                    let inputs: Vec<_> = rows
+                        .iter()
+                        .map(|row| poot_llm::encoders::segment_inputs(&row.types))
+                        .collect();
                     let driver_rows: Vec<DriverRow<'_>> = rows
                         .iter()
-                        .map(|row| DriverRow::Tokens {
-                            ids: &row.ids,
-                            types: &row.types,
+                        .zip(&inputs)
+                        .map(|(row, inputs)| DriverRow {
+                            tokens: Some(&row.ids),
+                            inputs,
                         })
                         .collect();
                     fresh
@@ -2262,9 +2261,9 @@ mod device {
     }
 
     per_backend!(
-        a_multimodal_job_through_the_loop_matches_generate_with_embeds,
-        a_multimodal_job_through_the_loop_matches_generate_with_embeds_wgpu,
-        a_multimodal_job_through_the_loop_matches_generate_with_embeds_rocm
+        a_multimodal_job_through_the_loop_matches_generate_with_inputs,
+        a_multimodal_job_through_the_loop_matches_generate_with_inputs_wgpu,
+        a_multimodal_job_through_the_loop_matches_generate_with_inputs_rocm
     );
     per_backend!(
         an_encoder_checkpoint_serves_embeddings_on_the_device,

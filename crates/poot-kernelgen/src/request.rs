@@ -95,25 +95,6 @@ pub struct Generated {
     pub launch: Launch,
 }
 
-/// The serial work a dispatch carries: `threads` invocations that each run `steps_per_thread` dependent
-/// steps (a contraction's K loop). The product is the conservative single-dispatch cost the device's
-/// `max_dispatch_work` bounds; `Dispatch::work` is a different quantity, the weight a run of dispatches
-/// batches into submits by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SerialWork {
-    /// Invocations launched.
-    pub threads: u64,
-    /// Dependent steps each invocation runs (a contraction's `K` loop).
-    pub steps_per_thread: u64,
-}
-
-impl SerialWork {
-    /// `threads * steps_per_thread`, saturating: the conservative cost of one dispatch.
-    pub fn total(self) -> u64 {
-        self.threads.saturating_mul(self.steps_per_thread)
-    }
-}
-
 /// What a kernel needs from the device that its `Body` does not state: declared by the generator (or by
 /// the imported-kernel manifest) beside the body and launch. The resources the body does state (static
 /// LDS, workgroup shape, matrix fragments) are measured from it by [`BodyUse::measure`], so a declaration
@@ -123,8 +104,6 @@ pub struct KernelRequirements {
     /// The subgroup lane count a fragment op's collective is written for; `None` when the body uses no
     /// subgroup collective.
     pub subgroup_lanes: Option<u32>,
-    /// The serial work of one dispatch; `None` when the kernel's per-thread loop is not modeled.
-    pub serial_work: Option<SerialWork>,
 }
 
 /// One matrix-fragment shape and operand dtype a body uses.
@@ -301,33 +280,6 @@ impl KernelRequest {
                 ContractionSpec::TensorCore { .. } | ContractionSpec::Coopmat { .. },
             ) => KernelRequirements {
                 subgroup_lanes: Some(FRAGMENT_COLLECTIVE_LANES),
-                serial_work: None,
-            },
-            Self::Contraction(ContractionSpec::Serial { shapes, .. }) => KernelRequirements {
-                subgroup_lanes: None,
-                serial_work: shapes.a_shape.last().map(|&k| SerialWork {
-                    threads: product(&shapes.out_shape),
-                    steps_per_thread: k as u64,
-                }),
-            },
-            Self::Contraction(ContractionSpec::DenseSerial { shapes, .. }) => KernelRequirements {
-                subgroup_lanes: None,
-                serial_work: shapes.b_shape.last().map(|&k| SerialWork {
-                    threads: product(&shapes.out_shape),
-                    steps_per_thread: k as u64,
-                }),
-            },
-            Self::Attention(spec) => KernelRequirements {
-                subgroup_lanes: None,
-                serial_work: Some(spec.serial_work()),
-            },
-            Self::AttentionCombine(spec) => KernelRequirements {
-                subgroup_lanes: None,
-                serial_work: Some(spec.serial_work()),
-            },
-            Self::Scan(spec) => KernelRequirements {
-                subgroup_lanes: None,
-                serial_work: Some(spec.serial_work()),
             },
             _ => KernelRequirements::default(),
         }
@@ -352,6 +304,9 @@ impl KernelRequest {
                         unroll,
                     } => format!("w{width}c{cols}u{unroll}"),
                     Schedule::Tiled { tile } => format!("tiled{}", tile.get()),
+                    Schedule::RegisterTiled { lanes, rows, run } => {
+                        format!("register_tiled{}x{}r{}", lanes.get(), rows.get(), run.get())
+                    }
                 };
                 let epilogue = epilogue.as_ref().map_or_else(String::new, |epilogue| {
                     format!(":epilogue{}", epilogue.steps.len())

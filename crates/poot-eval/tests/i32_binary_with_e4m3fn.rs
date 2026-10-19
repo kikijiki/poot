@@ -8,7 +8,7 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 
 use poot_eval::fp8::e4m3fn_tensor;
-use poot_eval::{EvalBudget, EvalOptions, Value};
+use poot_eval::{EvalOptions, Value};
 use poot_graph_ir::{
     BinOp, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot, Storage, TensorType, ValueId,
     ValueMeta,
@@ -85,7 +85,7 @@ fn i32_binary_evaluates_despite_an_unrelated_e4m3fn_value() {
     );
     inputs.insert(id_val, Value::Host(HostTensor::i32(vec![], vec![10])));
 
-    let output = poot_eval::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let output = poot_eval::eval(&g, &inputs, EvalOptions::default())
         .map(|r| r.output)
         .expect("I32 Binary arithmetic must evaluate despite the unrelated E4M3FN value present");
     let Value::Host(tensor) = output else {
@@ -111,7 +111,7 @@ fn i32_binary_result_tracks_a_different_id() {
     // local_row = -2 - 3 = -5; squared = (-5) * (-5) = 25.
     inputs.insert(id_val, Value::Host(HostTensor::i32(vec![], vec![-2])));
 
-    let output = poot_eval::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let output = poot_eval::eval(&g, &inputs, EvalOptions::default())
         .map(|r| r.output)
         .expect("I32 Binary arithmetic must evaluate despite the unrelated E4M3FN value present");
     let Value::Host(tensor) = output else {

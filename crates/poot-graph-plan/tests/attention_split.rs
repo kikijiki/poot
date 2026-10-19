@@ -7,14 +7,13 @@
 use poot_graph_ir::{AttentionAttrs, Builder, Graph, OpKind, Slot, TensorType};
 use poot_graph_plan::{
     CompileError, CompileOptions, DispatchPlan, KernelChoice, Plan, PlanError, Program, ScratchId,
-    Sink, Source, Target, compile, production_plan::Submission, value_ids,
+    Sink, Source, Target, compile, value_ids,
 };
 use poot_kernelgen::{AttentionSchedule, AttentionSpec, KernelRequest};
 use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_test_util::device_caps::default_caps_for;
 
-const OPTIONS: CompileOptions =
-    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+const OPTIONS: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
 
 fn target(backend: Backend, caps: DeviceCaps) -> Target {
     Target::Gpu { backend, caps }

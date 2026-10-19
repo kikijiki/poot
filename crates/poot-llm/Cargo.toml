@@ -12,7 +12,6 @@ rust-version.workspace = true
 poot-graph-ir.workspace = true
 poot-tensor.workspace = true
 poot-models.workspace = true
-poot-eval.workspace = true
 poot-target.workspace = true
 poot-load.workspace = true
 poot-wgpu-device.workspace = true

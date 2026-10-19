@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::time::Duration;
 
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_runtime_common::CompiledKernel;
 use poot_target::{AieTargetId, BufferStorage, VpuTargetId};
 
@@ -237,19 +237,14 @@ pub trait Device {
     ) -> Result<Self::Kernel, Self::Error>;
 
     /// Start a step's recording transaction: opens a recording that `finish` closes and `replay`
-    /// later submits, regardless of `submission`'s value. `submission` names the contract's
-    /// admitted mode (`Engine::add_entry` refuses `Submission::Eager` before `begin` ever runs); no
-    /// current `Device` impl gives `Eager` a different meaning here, including a caller driving one
-    /// directly, outside the contract (`poot-llm/tests/wgpu_executor_contract.rs`'s SC-015 fault probe
-    /// does exactly that).
-    fn begin(&mut self, submission: Submission) -> Result<(), Self::Error>;
+    /// later submits.
+    fn begin(&mut self) -> Result<(), Self::Error>;
     /// Record one kernel launch into the open recording, ordered after every earlier call of this step.
     fn dispatch(&mut self, dispatch: Dispatch<'_, Self>) -> Result<(), Self::Error>;
     /// Copy all of `src` into `dst` (same byte length), ordered after every earlier call of this step.
     fn copy(&mut self, src: &Self::Buffer, dst: &Self::Buffer) -> Result<(), Self::Error>;
     /// End a step, returning the recording `replay` later submits. Every current `Device` impl
-    /// returns `Some` unconditionally: nothing has run on the device yet, regardless of
-    /// `submission`.
+    /// returns `Some` unconditionally: nothing has run on the device yet.
     fn finish(&mut self) -> Result<Option<Self::Recording>, Self::Error>;
     /// Start a step's replays: called once per step, before the first of its (one per stage)
     /// [`Self::replay`] calls. A backend resets whatever it accumulates per step here (device-timing

@@ -24,7 +24,7 @@ fn rmsnorm_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -55,7 +55,9 @@ fn rope_fused_gpu_matches_cpu_decomposition() {
     // rotate-half decomposition run on the CPU oracle, bit-approximately (float-reorder tolerance).
     for (hq, d, rot) in [(3usize, 8usize, 8usize), (3, 8, 4)] {
         let (g, xi, ci, si) = build_rope_decomposition(hq, d, rot);
-        let opt = rope_fusion(&fold_iota(&cse(&g).unwrap()).unwrap()).unwrap();
+        let opt = rope_fusion(&fold_iota(&cse(&g).unwrap()).unwrap())
+            .unwrap()
+            .0;
         assert!(
             opt.eqns()
                 .iter()
@@ -74,7 +76,7 @@ fn rope_fused_gpu_matches_cpu_decomposition() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -129,7 +131,7 @@ fn ge_comparison_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -171,7 +173,7 @@ fn ge_comparison_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu2 = eval(&g2, &eval_in2, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu2 = eval(&g2, &eval_in2, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -223,7 +225,7 @@ fn layernorm_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -287,7 +289,7 @@ fn round_and_quantize_composition_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -337,7 +339,7 @@ fn gelu_erf_gpu_matches_true_erf_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -366,7 +368,7 @@ fn gelu_erf_gpu_matches_true_erf_cpu() {
         let gg = bb.finish(yy).unwrap();
         let mut ii = HashMap::new();
         ii.insert(id, Value::from(HostTensor::f32(vec![n], xd.clone())));
-        eval(&gg, &ii, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&gg, &ii, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -423,7 +425,7 @@ fn log_and_softplus_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

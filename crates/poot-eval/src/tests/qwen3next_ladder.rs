@@ -1,7 +1,7 @@
 //! Card 158 ArgTopK tie regression (the collapse-repro ladder and the qwen2 mixed K-quant reference this
 //! file used to carry were deleted with the quant-producer tracers, card 545a).
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp};
 use poot_graph_ir::types::TensorType;
@@ -48,7 +48,7 @@ fn card158_arg_top_k_ties_stay_in_range() {
             lgi,
             Value::from(HostTensor::f32(vec![1, e], logits.to_vec())),
         );
-        eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -98,7 +98,7 @@ fn card158_arg_top_k_ties_stay_in_range() {
             rki,
             Value::from(HostTensor::f32(vec![1, e], rank_data.to_vec())),
         );
-        eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

@@ -1,11 +1,9 @@
 //! POOT-745 at the compile level: what `compile_staged` produces for a pipeline, checked on the CPU
 //! oracle (ADR-0101 tier 1: a cut graph chained stage by stage equals the uncut graph bit for bit).
 //! The executor and the device lanes check the same programs run.
-
-use crate::production_plan::Submission;
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{
     BinOp, Builder, Graph, Scalar, Slot, SlotKey, StateRole, Storage, TensorType, UnOp,
     ValidationId, ValueId,
@@ -28,7 +26,7 @@ fn target() -> Target {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 fn partition(devices: DevicePlacement) -> Partition {
@@ -63,12 +61,7 @@ fn stage_graphs(program: &StagedProgram) -> Vec<&Graph> {
 }
 
 fn uncut(g: &Graph, inputs: &HashMap<ValueId, Value>) -> poot_eval::Evaluation {
-    eval(
-        g,
-        inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .expect("the uncut graph evaluates")
+    eval(g, inputs, EvalOptions::default().keep_environment()).expect("the uncut graph evaluates")
 }
 
 /// A graph whose boundaries stress what the exports must survive: four independent values leave
@@ -607,12 +600,8 @@ fn eval_pooled_syncing(
                 (id, value)
             })
             .collect();
-        let result = eval(
-            g,
-            &stage_inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-        )
-        .map_err(|error| (stage, error))?;
+        let result = eval(g, &stage_inputs, EvalOptions::default().keep_environment())
+            .map_err(|error| (stage, error))?;
         let environment = result.environment.expect("the environment was kept");
         for export in g.exports() {
             boundaries.insert(
@@ -674,6 +663,35 @@ fn a_pooled_moe_program_equals_the_unpooled_oracle_bit_for_bit() {
             "the host paged real selections"
         );
     }
+}
+
+/// POOT-1215: pooling translates expert ids in integer words and guards them; the only float work it adds is the
+/// guard's witness (a cast of the guard's flags and an F32 sum), so the transform is `Unfused`, no more, and a
+/// pooled program publishes what its stages do: the same class as the graph compiled resident.
+///
+/// Mutation: make `pool_experts` report `NumericsProperty::Reassociating` (or `Exact`); the transform assertion
+/// goes red.
+#[test]
+fn a_pooled_program_publishes_the_class_of_its_stages() {
+    use poot_graph_ir::analysis::NumericsProperty;
+    let graph = moe_model(1, 3);
+    let pooled_graph = crate::passes::pool_experts(
+        &graph,
+        4,
+        &crate::passes::GraphBudget::of(&options().limits),
+    )
+    .expect("the pool fits the step's demand");
+    assert_eq!(pooled_graph.numerics, NumericsProperty::Unfused);
+
+    let pooled = compile_pooled(&graph, 4).expect("the pool fits the step's demand");
+    let stages = pooled
+        .stages()
+        .map(|(_, _, stage)| stage.numerics_class())
+        .max()
+        .expect("a program has stages");
+    assert_eq!(pooled.numerics_class(), stages);
+    let resident = staged(&graph, DevicePlacement::Single(DeviceId(0)), &options());
+    assert_eq!(pooled.numerics_class(), resident.numerics_class());
 }
 
 /// POOT-1119: the translated ids of every pooled site pass through the canonical index guard `[0, P)`, whose

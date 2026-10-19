@@ -16,9 +16,10 @@ checkpoint dir or GGUF
   -> FamilyEntry::build(config, weights) -> Box<dyn Model>
   -> ModelHandle { model, weights, text codec }
   -> Driver::new(handle, executor, options)
-       Model::trace(phase, step shape) -> Graph
+       Model::schema() -> programs, request inputs, states      (what a step may bind)
+       Model::trace(program, step shape, carried inputs) -> Graph
        + sampling suffix -> compile -> one executable, one entry per specialization
-       -> Executor::step per token
+       -> bind every slot by kind -> Executor::step per token
 ```
 
 ## The Model
@@ -27,27 +28,31 @@ A family implements `poot_models::model::Model`:
 
 ```rust
 pub trait Model: Send + Sync {
-    fn config(&self) -> &ModelConfig;     // vocab, eos ids, output kind, chat format
+    fn config(&self) -> &ModelConfig;     // vocab, eos ids, chat format
+    fn schema(&self) -> &ModelSchema;     // programs, request inputs, states
     fn weights(&self) -> &WeightMap;      // which checkpoint tensors feed which typed role
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder)
+    fn trace_into(&self, spec: &StepSpec, b: Builder)
         -> Result<Graph, TraceError>;     // the family's tracer body
-    fn trace(&self, phase: Phase, shape: StepShape, limits: TraceLimits)
-        -> Result<Graph, TraceError>;     // provided: admits the token count, then calls trace_into
+    fn trace(&self, spec: &StepSpec, limits: TraceLimits)
+        -> Result<Graph, TraceError>;     // provided: checks the step, admits the token count, then calls trace_into
 }
 ```
 
-- `trace` builds the graph of one step under the caller's `TraceLimits`. A `StepShape` is the semantic shape of that step: `rows`
-  sequences of `tokens` new tokens each over a cache of `capacity` positions, a KV layout (contiguous, or
-  paged over a pool of slots), whether logits come back for the last token or all of them and, when
-  asked, a hidden-state carry.
-- A `Phase` is `Prefill`, `Decode`, `PrefillEmbeds` (a prefill whose prompt carries caller-computed
-  embedding rows, for example image rows), `Encode` (the whole input in one step, returning hidden states
-  or scores, for an embedding model, a reranker or a vision tower) or `Mtp` (a multi-token-prediction layer
-  run over the hidden-state carry and the host tokens that follow it; only GLM-5.3-Flash traces it and every
-  other family refuses it with a typed error). Prefill and decode are one body: token
-  and position inputs are typed slots and positions are absolute, so a prefill is a step that continues from
-  a position.
-- A shape or phase a family cannot trace is a typed `TraceError`, never a panic, and so is a step that
+- `trace` builds the graph of one step under the caller's `TraceLimits`. A `StepSpec` names the program to
+  trace, the `StepShape` and the carriable inputs the step binds. A `StepShape` is the semantic shape of that
+  step: `rows` sequences of `tokens` new tokens each over a cache of `capacity` positions, a KV layout
+  (contiguous, or paged over a pool of slots), whether logits come back for the last token or all of them and,
+  when asked, a hidden-state carry. It is built with `StepShape::new` and `with_*` setters, so a new field never
+  breaks a caller.
+- A model has at most three **programs**, named by the driver service that runs them: `step` (continue a
+  sequence's carried state and return logits; prefill and decode are one program, and decode is a step of one
+  token), `encode` (one stateless pass over whole rows, returning hidden states or scores, for an embedding
+  model, a reranker, a decoder's embedding pass or a vision tower) and `draft` (a multi-token-prediction layer
+  run over the hidden-state carry and the host tokens that follow it; only GLM-5.3-Flash has one). A family
+  declares only the programs it offers; a request for one it lacks is a typed `TraceError`.
+- A step's token and position inputs are typed slots and positions are absolute, so a prefill is a step that
+  continues from a position.
+- A shape a family cannot trace is a typed `TraceError`, never a panic, and so is a step that
   does not fit the caller's limits: `TraceError::Budget` names the exhausted resource (tokens, values,
   equations, scalar-literal bytes or owned bytes), the limit and the attempted total. The token count is
   checked before the tracer body runs and every other resource before the request it covers is allocated or
@@ -55,6 +60,35 @@ pub trait Model: Send + Sync {
   declares its router witnesses as validation outputs, which the executor checks before any readback.
 - The graph holds consts named by the weight map, not by checkpoint tensor names. The checkpoint's spelling
   lives in the family's name table; KV layout, batching and weight format are not the tracer's business.
+
+## The input schema
+
+A model's `ModelSchema` is the contract between the family and the driver for everything a step reads
+besides weights:
+
+- **Step inputs** are values the driver computes from its own geometry, the same for every family: the token
+  ids, their positions, a real-token mask, the KV read and write maps and the recurrent state rows. There is a
+  fixed list of them.
+- **Request inputs** are values a request supplies, produced by family code (for a vision-language model, the
+  image front end): embedding rows over some prompt positions, a sectioned-RoPE position table, a segment id
+  per token, a vision tower's pixels. A family declares as many as it needs, each with its slot, its element
+  type, its shape (one value per position, or one tensor per row), its pad value and whether a request may omit
+  it (required, defaulted to a fill, or optional).
+- **States** are the carried values of a program (KV cache, recurrent state, hidden-state carry). The traced
+  graph must carry exactly the states the program declares; `Model::trace` checks it.
+
+The driver resolves every slot of a traced program once, when it prepares the entry: it is a step input, a
+request input of the model's schema, or an input a driver pass added (the sampling suffix, the LoRA index, a
+beam reorder). A slot nothing binds is a typed refusal at prepare. At step time one generic routine binds each
+request input from the sequence's values, sliced by the positions each row feeds and padded elsewhere, so a
+family that declares a new request input needs no driver change.
+
+A request input that applies only to some steps (embedding rows over a few prompt positions, a tensor bound
+when a row starts) is a **carried** input: the step runs the program variant that declares its slots, one
+entry per combination `Driver::prepare_carried` warmed. Admission checks a request's values against the schema
+before the request takes a slot or a block: an input the model does not declare, a missing required input, a
+value of the wrong type or width, a dense value that does not cover the prompt, or a sparse position outside it
+is a typed `InputError`.
 
 ## Shared components
 
@@ -123,10 +157,10 @@ what the driver may retain.
 
 - **One executable, several entries.** The driver loads the handle's weights into the executor once, as one
   executable. Each specialization it needs is an entry on that executable, keyed by
-  `(Phase, StepShape, Head)`. Token ids, absolute positions, seeds and sampler parameters are bound inputs and
+  `(program, StepShape, Head, carried inputs)`. Token ids, absolute positions, seeds and sampler parameters are bound inputs and
   never specialize an entry; capacity sizes buffers and is part of the shape.
 - **Compile through the one entry point.** A step's graph comes from `Model::trace`, gets its sampling suffix
-  appended, and compiles through the shared compiler for the executor's own target. The driver does not branch
+  appended, and compiles (binding the checkpoint's packed weights first) through the shared compiler for the executor's own target. The driver does not branch
   on a backend.
 - **A finite, bounded set of entries.** An entry once prepared is never replaced, a new entry over the entry
   or retained-byte limit is a typed refusal before it is published, and `Driver::prepare` enumerates and warms
@@ -135,13 +169,25 @@ what the driver may retain.
   sampling step to the decode graph itself (`Head::Sample`), so the host reads back a token id and a non-finite
   flag, not the logits. A request with a logit bias or penalty, logprob recording, or a guided-decoding
   constraint needs the full logits and takes the one host sampling path (`Head::Logits`).
+- **Parts and states.** A driver is a composition of owned parts: the runtime (executor, executables,
+  placement), the settings, the prepared-set ledger, the speculation state, the adapter registry, the counters
+  and, once it serves, the open sequences with their KV store. A new driver is `Driver<Unprepared>`; `prepare`
+  takes it by value and returns the `Driver<Serving>` that has a layout, so `open`, `step`, `commit` and
+  `release` do not exist on a driver that was never prepared. A refused `prepare` hands the unprepared driver
+  back with the typed error.
+- **One table of what composes.** Features of the driver and of a request (a draft policy, a placement,
+  recurrent state, an adapter, beam search, request inputs, resuming a sequence, the paged pool) are checked
+  against one compatibility table when they meet, and a pair the table refuses is a single typed
+  `Incompatible` error naming both features and the reason. There is no per-pair check anywhere else.
 - **The serving surface.** The loop is `open`, `step`, `commit`, `release` over sequences and rows; `generate`
   is that surface driven for one row with a sink for the tokens, and holds no feed, pick or layout logic of
-  its own. `encode` runs an `Encode` step, and `generate_with_embeds` scatters caller-computed rows into a
-  prompt (the vision-language path). Rows, frames and embeddings are bound by value every step, never baked
-  into a program. Prompts with embedding rows (`open_with_embeds`) batch and page like any other sequence, but
-  they bypass the prefix cache, which keys on tokens alone: they reuse no cached block and register none. They
-  are refused under an adapter or a draft-model speculation policy.
+  its own. A request is one admission value: its prompt, its adapter and the `RequestInputs` its model
+  declares (`SeqRequest`, or `generate_with_inputs` for one row). `encode` runs an `encode` step over rows of
+  tokens and per-row inputs. Rows, frames and embeddings are bound by value, never baked into a program.
+  A sequence that carries request inputs batches and pages like any other, but it bypasses the prefix cache,
+  which keys on tokens alone: it reuses no cached block and registers none. Under an adapter whose entries
+  were not prepared for that input it is refused at admission, and a draft policy that cannot read the
+  inputs does not speculate on it: the row decodes one token.
 
 The CPU oracle is a test-side reference: tests evaluate a model's traced graph with `poot-eval` directly. It
 is not an executor the driver can choose.

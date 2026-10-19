@@ -3,7 +3,7 @@ use super::*;
 use crate::passes::cse_dce::dce_with_roots;
 use poot_graph_ir::Builder;
 use poot_graph_ir::analysis::{
-    NumericsError, NumericsProperty, Tier2Class, dispatch_count, implied_numerics,
+    NumericsDelta, NumericsProperty, Tier2Class, dispatch_count, implied_numerics,
     peak_transient_bytes,
 };
 use poot_graph_ir::graph::StateRole;
@@ -42,8 +42,9 @@ fn packed_graph() -> Result<Graph, poot_graph_ir::BuilderError> {
     let activation = b
         .constant("activation", TensorType::f32(vec![2, 35]))
         .unwrap();
-    let output =
-        poot_graph_ir::ops::packed_linear(&b, activation, "layer", descriptor, None, None)?;
+    let output = poot_graph_ir::test_support::packed_graphs::packed_linear(
+        &b, activation, "layer", descriptor, None, None,
+    )?;
     Ok(b.finish(output).unwrap())
 }
 
@@ -183,7 +184,7 @@ fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir
     let activation = builder
         .constant("alias.activation", TensorType::f32(vec![2, 35]))
         .unwrap();
-    let output = poot_graph_ir::ops::packed_linear(
+    let output = poot_graph_ir::test_support::packed_graphs::packed_linear(
         &builder,
         activation,
         "alias",
@@ -217,7 +218,7 @@ fn packed_dequant_fusion_matches_only_exact_linear() -> Result<(), poot_graph_ir
 #[test]
 fn packed_block_diagonal_chain_is_recognized_as_one_contraction()
 -> Result<(), poot_graph_ir::BuilderError> {
-    // out=8, k=35, blocks=4 -> block_out=2. Card 385: `ops::packed_block_diagonal_linear`'s
+    // out=8, k=35, blocks=4 -> block_out=2. Card 385: `packed_graphs::packed_block_diagonal_linear`'s
     // Reshape-before-Transpose chain must fold like the canonical chain; an unrecognized packed
     // dequant is a compile-time escape rejection, not a silently slow fallback.
     let descriptor = PackedWeight::try_new(WeightFormat::E2m1Row32, [8, 35]).unwrap();
@@ -225,7 +226,7 @@ fn packed_block_diagonal_chain_is_recognized_as_one_contraction()
     let activation = builder
         .constant("blocked.activation", TensorType::f32(vec![4, 5, 35]))
         .unwrap();
-    let output = poot_graph_ir::ops::packed_block_diagonal_linear(
+    let output = poot_graph_ir::test_support::packed_graphs::packed_block_diagonal_linear(
         &builder, activation, "blocked", descriptor, 4, None,
     )?;
     let graph = builder.finish(output).unwrap();
@@ -248,7 +249,7 @@ fn packed_block_diagonal_graph() -> Result<Graph, poot_graph_ir::BuilderError> {
     let activation = b
         .constant("blocked.activation", TensorType::f32(vec![4, 5, 35]))
         .unwrap();
-    let output = poot_graph_ir::ops::packed_block_diagonal_linear(
+    let output = poot_graph_ir::test_support::packed_graphs::packed_block_diagonal_linear(
         &b, activation, "blocked", descriptor, 4, None,
     )?;
     Ok(b.finish(output).unwrap())
@@ -499,7 +500,7 @@ fn flash_attention_fuses_a_distinct_value_head_width() {
         .unwrap();
     let out = attention_masked(&b, q, k, v, 1, 1.0, mask).unwrap();
     let g = b.finish(out).unwrap();
-    let optimized = flash_attention_capped(&g, None).unwrap();
+    let optimized = flash_attention_capped(&g, None).unwrap().0;
 
     assert_eq!(optimized.aval(optimized.result()).shape, vec![1, 2, 1, 2]);
     assert!(
@@ -541,7 +542,9 @@ fn flash_attention_declines_broadcast_kv() {
         let v = b.constant("v", TensorType::f32(kvs.to_vec())).unwrap();
         let mask = b.constant("mask", TensorType::f32(ms.to_vec())).unwrap();
         let out = attention_masked(&b, q, k, v, 1, 0.25, mask).unwrap();
-        let optimized = flash_attention_capped(&b.finish(out).unwrap(), None).unwrap();
+        let optimized = flash_attention_capped(&b.finish(out).unwrap(), None)
+            .unwrap()
+            .0;
         let flash: Vec<String> = optimized
             .eqns()
             .iter()
@@ -580,7 +583,10 @@ fn flash_graph(decode: bool) -> (Graph, [ValueId; 3]) {
         poot_graph_ir::ops::attention_prefill(&b, q, k, v, 1, 0.25, mask).unwrap()
     };
     // A tracer states attention as primitives; the flash op is the matcher's.
-    let g = dce(&flash_attention_capped(&b.finish(out).unwrap(), None).unwrap()).unwrap();
+    let g = dce(&flash_attention_capped(&b.finish(out).unwrap(), None)
+        .unwrap()
+        .0)
+    .unwrap();
     let flash = g.eqns().last().expect("the flash equation");
     assert!(
         matches!(flash.op, OpKind::Attention(_)),
@@ -666,7 +672,7 @@ fn rope_fusion_declines_a_chain_that_broadcasts_x_up() {
     ] {
         let g = rope_chain(x.clone(), table.clone());
         // The pass's result is a checked graph: an ill-typed rewrite is an `EditError`, not a graph.
-        let fused = rope_fusion(&g).unwrap_or_else(|e| {
+        let (fused, _) = rope_fusion(&g).unwrap_or_else(|e| {
             panic!("x {x:?}, cos {table:?}: rope_fusion left an ill-typed graph: {e}")
         });
         let got = fused
@@ -1345,7 +1351,7 @@ fn rope_fusion_full_collapses_the_rotate_half_chain() {
     let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos).unwrap();
     let g = b.finish(out).unwrap();
     let before = dispatch_count(&g);
-    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
+    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap().0).unwrap();
     let ropes = fused
         .eqns()
         .iter()
@@ -1394,7 +1400,7 @@ fn rope_fusion_partial_absorbs_passthrough() {
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
     let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos).unwrap();
     let g = b.finish(out).unwrap();
-    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
+    let fused = dce(&rope_fusion(&cse(&g).unwrap()).unwrap().0).unwrap();
     let ropes: Vec<&Eqn> = fused
         .eqns()
         .iter()
@@ -1446,7 +1452,7 @@ fn optimize_fuses_the_rope_chain_into_one_rope_op() {
     let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
     let out = poot_graph_ir::ops::rope(&b, x, cos, sin, pos).unwrap();
     let g = b.finish(out).unwrap();
-    let optimized = dce(&rope_fusion(&cse(&g).unwrap()).unwrap()).unwrap();
+    let optimized = dce(&rope_fusion(&cse(&g).unwrap()).unwrap().0).unwrap();
     assert_eq!(
         optimized
             .eqns()
@@ -1475,7 +1481,7 @@ fn rope_fusion_ignores_a_non_rope_add_of_two_muls() {
     let m1 = b.binary(BinOp::Mul, q, p).unwrap();
     let out = b.binary(BinOp::Add, m0, m1).unwrap();
     let g = b.finish(out).unwrap();
-    let fused = rope_fusion(&cse(&g).unwrap()).unwrap();
+    let fused = rope_fusion(&cse(&g).unwrap()).unwrap().0;
     assert!(
         !fused
             .eqns()
@@ -2333,9 +2339,9 @@ fn card533_optimize_passes_keep_witness_outputs() {
 
     let passes: [(&str, PassFn); 6] = [
         ("cse", cse),
-        ("rope_fusion", rope_fusion),
+        ("rope_fusion", |g| rope_fusion(g).map(|(g, _)| g)),
         ("flash_attention_capped", |g| {
-            flash_attention_capped(g, None)
+            flash_attention_capped(g, None).map(|(g, _)| g)
         }),
         ("dce", dce),
         ("fuse_contraction_epilogues", |g| {
@@ -2359,13 +2365,13 @@ fn card533_optimize_passes_keep_witness_outputs() {
     }
 }
 
-/// Card 533 SC-004: a pass whose declaration is weaker than the ops it actually produced is refused,
-/// and the pipeline publishes the tier-2 class its graph exhibits.
+/// Card 533 SC-004 (POOT-1215): what a pass produced is read off the graph before and after, not looked up
+/// by the pass's name. Fusing a pointwise chain replaces unfused arithmetic with a fused region.
 ///
-/// Mutation: set the `FUSE` declaration of `passes::declared` to `Exact`; `PassDeclaration::verify`
-/// returns `UnderDeclared { pass: "fuse", declared: Exact, implied: Reassociating }` and this test goes red.
+/// Mutation: build `NumericsDelta::between` with the produced fold over `before` instead of `after`; the
+/// produced class reads `Unfused` and this test goes red.
 #[test]
-fn card533_pass_numerics_are_checked_against_produced_ops() {
+fn card533_pass_numerics_are_read_off_the_produced_ops() {
     let b = Builder::for_tests();
     let x = b.constant("x", TensorType::f32([4])).unwrap();
     let y = b.constant("y", TensorType::f32([4])).unwrap();
@@ -2382,21 +2388,10 @@ fn card533_pass_numerics_are_checked_against_produced_ops() {
         "the pointwise chain must fuse, or this row proves nothing"
     );
     assert_eq!(implied_numerics(&fused), NumericsProperty::Reassociating);
-
-    let declaration = declared::FUSE;
-    assert_eq!(declaration.property, NumericsProperty::Reassociating);
-    declaration.verify(&fused).unwrap();
-
-    let misdeclared = PassDeclaration {
-        property: NumericsProperty::Exact,
-        ..declaration
-    };
     assert_eq!(
-        misdeclared.verify(&fused).unwrap_err(),
-        NumericsError::UnderDeclared {
-            pass: "fuse",
-            declared: NumericsProperty::Exact,
-            implied: NumericsProperty::Reassociating,
+        NumericsDelta::between(&graph, &fused),
+        NumericsDelta {
+            produced: NumericsProperty::Reassociating,
         }
     );
 }
@@ -3333,7 +3328,7 @@ fn card536a_scale_as_a_runtime_value_declines() {
 /// operand assertion goes red).
 #[test]
 fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
-    use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+    use poot_eval::{EvalOptions, Value, eval};
     use poot_graph_ir::OpClass;
     use poot_tensor::HostTensor;
 
@@ -3397,7 +3392,7 @@ fn a_traced_bias_linear_is_primitive_and_fuses_into_one_contraction_epilogue() {
     .map(|(id, tensor)| (id, Value::from(tensor)))
     .collect();
     let run = |g: &Graph| -> Vec<u32> {
-        eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(g, &inputs, EvalOptions::default())
             .expect("the graph evaluates")
             .output
             .into_host()
@@ -3426,7 +3421,7 @@ fn epilogues_of(g: &Graph) -> Vec<&Eqn> {
 /// The oracle's output bits of `g` over `[m, k]`, `[k, n]` and `[n]` data and any further `[m, n]` inputs
 /// the fixture declares, filled deterministically.
 fn eval_bits(g: &Graph) -> Vec<u32> {
-    use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+    use poot_eval::{EvalOptions, Value, eval};
     use poot_tensor::HostTensor;
 
     let inputs: HashMap<ValueId, Value> = g
@@ -3441,7 +3436,7 @@ fn eval_bits(g: &Graph) -> Vec<u32> {
             (id, Value::from(HostTensor::f32(shape, data)))
         })
         .collect();
-    eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(g, &inputs, EvalOptions::default())
         .expect("the graph evaluates")
         .output
         .into_host()

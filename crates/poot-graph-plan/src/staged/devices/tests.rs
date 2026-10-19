@@ -12,7 +12,6 @@ use poot_test_util::device_caps::default_caps_for;
 
 use crate::multi_device::{AccountingError, PlacementError};
 use crate::planner::test_only::per_eqn_plans_inside_compile;
-use crate::production_plan::Submission;
 use crate::staged::{
     DeviceId, DevicePlacement, ExpertPlacement, Partition, StageId, StagedCompileError,
     StagedProgram, TargetSet, compile_staged,
@@ -30,7 +29,7 @@ fn target(backend: Backend, budget: u64) -> Target {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 /// A pipeline over devices `0..stages`, cut after layers `0..stages - 1`.

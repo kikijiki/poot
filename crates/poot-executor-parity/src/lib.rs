@@ -60,9 +60,9 @@ use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{ForwardSlotMap, Graph, Slot, Storage, TensorType};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -394,7 +394,7 @@ pub fn assert_one_dense_contraction(fixture: &Fixture, target: Target) {
 /// the device will be asked to run, so a row can show it exercises the op it names (a flash kernel,
 /// a contraction) and not only that its output matched.
 pub fn planned_ops(fixture: &Fixture, target: Target) -> Vec<String> {
-    staged(fixture, target, Submission::Replay)
+    staged(fixture, target)
         .stages()
         .flat_map(|(_, _, program)| program.planned().map(|(eqn, _)| eqn.op.name()))
         .collect()
@@ -498,9 +498,8 @@ pub fn fixture_weights(fixture: &Fixture) -> Arc<poot_quant::weights::WeightMap>
     Arc::new(bound(fixture).1)
 }
 
-/// Compile `fixture.graph` for `target` under `submission`, single-stage, single-device (Card
-/// 546a's only shape).
-pub fn staged(fixture: &Fixture, target: Target, submission: Submission) -> StagedProgram {
+/// Compile `fixture.graph` for `target`, single-stage, single-device (Card 546a's only shape).
+pub fn staged(fixture: &Fixture, target: Target) -> StagedProgram {
     let g = bound(fixture).0;
     compile_staged(
         &g,
@@ -509,7 +508,7 @@ pub fn staged(fixture: &Fixture, target: Target, submission: Submission) -> Stag
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(submission, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -519,17 +518,6 @@ pub fn staged(fixture: &Fixture, target: Target, submission: Submission) -> Stag
 /// stateful oracle computation can thread its own state the same way the device does. It returns
 /// that step's expected output tensor.
 pub type Oracle<'a> = dyn FnMut(&[StepFixture]) -> HostTensor + 'a;
-
-/// ADR-0101 tier 2: every element of `got` within `tol * (1 + |want|)` of `want`; NaN fails.
-pub fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
-    assert_eq!(got.len(), want.len(), "{label}: element count");
-    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
-        assert!(
-            (g - w).abs() <= tol * (1.0 + w.abs()),
-            "{label}: element {i}: got {g}, want {w}"
-        );
-    }
-}
 
 /// How many tolerances the largest oracle element of a compared step must exceed.
 const SIGNAL_MARGIN: f32 = 10.0;
@@ -572,20 +560,8 @@ fn compare_step(class: Tier2Class, got: &HostTensor, want: &HostTensor) -> Resul
         ));
     }
     let tolerance = class.tolerance();
-    match got.iter().zip(want.iter()).position(|(&g, &w)| {
-        let bound = tolerance * w.abs().max(1.0);
-        // A NaN on either side is unordered, so it never agrees.
-        !matches!(
-            (g - w).abs().partial_cmp(&bound),
-            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
-        )
-    }) {
-        None => Ok(()),
-        Some(i) => Err(format!(
-            "element {i}: device {}, oracle {}, outside the {class:?} tolerance {tolerance}",
-            got[i], want[i]
-        )),
-    }
+    poot_test_util::check_close_unit_floor(&got, &want, tolerance)
+        .map_err(|worst| format!("{worst} outside the {class:?} tolerance {tolerance}"))
 }
 
 /// One named `Storage::Const` row for [`run_once`]: the checkpoint-style name a traced graph's
@@ -660,7 +636,7 @@ pub fn run_once(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .map_err(|e| format!("run_once: compile_staged: {e}"))?;
     let entry = exec
@@ -681,6 +657,37 @@ pub fn run_once(
     exec.unload(exe)
         .map_err(|e| format!("run_once: unload: {e}"))?;
     Ok(output)
+}
+
+/// The softcapped trace's oracle differs from the uncapped trace's at some step by more than `5e-2`, relative
+/// to `max(|uncapped|, 1)` (ten times the parity tolerance): a fixture whose softcap the oracle cannot see
+/// shows no device applying it. Panics on a NaN in either oracle output.
+pub fn assert_softcap_is_visible(softcapped: &Fixture, uncapped: &Fixture) {
+    use poot_eval::test_support::weight_map_oracle::oracle_for;
+    let (mut capped_oracle, mut plain_oracle) = (
+        oracle_for(&softcapped.graph, &softcapped.store),
+        oracle_for(&uncapped.graph, &uncapped.store),
+    );
+    let largest = softcapped
+        .steps
+        .iter()
+        .zip(&uncapped.steps)
+        .map(|(capped_step, plain_step)| {
+            let capped = capped_oracle(capped_step);
+            let plain = plain_oracle(plain_step);
+            poot_test_util::max_unit_floor_error(
+                capped.as_f32().expect("F32 oracle output"),
+                plain.as_f32().expect("F32 oracle output"),
+            )
+        })
+        .max_by(f32::total_cmp)
+        .expect("a fixture has at least one step");
+    assert!(
+        largest > 5e-2,
+        "{}: the softcap barely changes the oracle (max relative difference {largest:.2e}), so this \
+         fixture cannot show a device applying it",
+        softcapped.name
+    );
 }
 
 /// SC-002: load `fixture` onto `exec` at `target`, step through every declared step, and assert
@@ -711,7 +718,7 @@ pub fn run_parity(
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
-    let program = staged(fixture, target, Submission::Replay);
+    let program = staged(fixture, target);
     let class = program.numerics_class();
     let entry = exec
         .add_entry(exe, &program)
@@ -770,7 +777,7 @@ pub fn run_outputs(
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
     let entry = exec
-        .add_entry(exe, &staged(fixture, target, Submission::Replay))
+        .add_entry(exe, &staged(fixture, target))
         .map_err(|e| format!("{}: add_entry: {e}", fixture.name))?;
     let mut outputs = Vec::with_capacity(fixture.steps.len());
     for (i, step) in fixture.steps.iter().enumerate() {
@@ -820,7 +827,7 @@ pub fn run_device_times(
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
     let entry = exec
-        .add_entry(exe, &staged(fixture, target, Submission::Replay))
+        .add_entry(exe, &staged(fixture, target))
         .map_err(|e| format!("{}: add_entry: {e}", fixture.name))?;
     let step = fixture
         .steps
@@ -887,7 +894,7 @@ pub fn run_capture_replay(
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
-    let program = staged(fixture, target, Submission::Replay);
+    let program = staged(fixture, target);
     let class = program.numerics_class();
     let entry = exec
         .add_entry(exe, &program)
@@ -1041,7 +1048,7 @@ mod compare_tests {
     #[test]
     fn a_reassociating_program_is_compared_within_its_class_tolerance() {
         const PUBLISHED_REASSOCIATING: f32 = 1e-3;
-        let program = staged(&fused_chain(), target(), Submission::Replay);
+        let program = staged(&fused_chain(), target());
         let class = program.numerics_class();
         assert_eq!(
             class,
@@ -1083,6 +1090,38 @@ mod compare_tests {
         let err = run(2.0).expect_err("a device 2x the reassociating tolerance off must fail");
         assert!(err.contains("outside the Reassociating tolerance"), "{err}");
         run(0.5).expect("a device 0.5x the tolerance off must pass");
+    }
+
+    /// The comparator's negative rows (R2-C5-006): each way a device output can disagree with the oracle is
+    /// refused, and the matching output passes.
+    ///
+    /// Mutation: in `poot_test_util::Worst::of` drop the `error.is_nan()` arm (the NaN-blind form); the NaN row
+    /// passes and this goes red on `an all-NaN output must fail`.
+    #[test]
+    fn compare_step_refuses_nan_wrong_dtype_wrong_shape_and_empty() {
+        let class = Tier2Class::Reassociating;
+        let want = oracle_output();
+        compare_step(class, &want, &want).expect("the oracle's own output must agree");
+
+        let nan = HostTensor::f32(want.shape().to_vec(), vec![f32::NAN; want.numel()]);
+        let err = compare_step(class, &nan, &want).expect_err("an all-NaN output must fail");
+        assert!(err.contains("actual NaN"), "{err}");
+
+        let wrong_shape = HostTensor::f32(vec![want.numel()], vec![0.0; want.numel()]);
+        let err = compare_step(class, &wrong_shape, &want)
+            .expect_err("a differently shaped output must fail");
+        assert!(err.contains("vs the oracle's"), "{err}");
+
+        let wrong_dtype = HostTensor::i32(want.shape().to_vec(), vec![0; want.numel()]);
+        let err = compare_step(class, &wrong_dtype, &want)
+            .expect_err("a differently typed output must fail");
+        assert!(err.contains("vs the oracle's"), "{err}");
+
+        let empty = HostTensor::f32(vec![0], Vec::new());
+        assert!(
+            compare_step(class, &empty, &empty).is_err(),
+            "two empty outputs must be refused"
+        );
     }
 
     /// SC-003: an oracle output below the class's signal floor is refused, however close the device is,

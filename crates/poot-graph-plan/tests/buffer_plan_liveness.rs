@@ -18,15 +18,11 @@ use std::collections::HashMap;
 
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
 use poot_graph_ir::{Builder, Graph, Slot, TensorType, ValueId};
-use poot_graph_plan::{
-    CompileOptions, Plan, Program, ScratchId, Target, compile, production_plan::Submission,
-    value_ids,
-};
+use poot_graph_plan::{CompileOptions, Plan, Program, ScratchId, Target, compile, value_ids};
 use poot_target::{AmdArch, Backend};
 use poot_test_util::device_caps::default_caps_for;
 
-const OPTIONS: CompileOptions =
-    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+const OPTIONS: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
 
 fn targets() -> Vec<(&'static str, Target)> {
     [

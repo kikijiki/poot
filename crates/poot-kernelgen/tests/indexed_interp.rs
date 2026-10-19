@@ -107,6 +107,9 @@ fn run_indexed(
             let y_groups = tiles.div_ceil(x_groups);
             ([x_groups * (ts * ts) as u32, y_groups, 1], x_groups)
         }
+        kg::Schedule::RegisterTiled { .. } => {
+            panic!("an indexed contraction is never RegisterTiled")
+        }
     };
     let request =
         kg::KernelRequest::Contraction(kg::ContractionSpec::Indexed(kg::IndexedContraction {

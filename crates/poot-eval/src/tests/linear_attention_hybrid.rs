@@ -1,6 +1,6 @@
 //! Linear-attention fuzz, hybrid model loops, decay masks, mamba2 block, layer-level decode-vs-prefill.
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::builder::{Builder, Traced};
 use poot_graph_ir::graph::{Operand, StateRole};
 use poot_graph_ir::op::{BinOp, OpKind};
@@ -160,7 +160,7 @@ fn linear_attention_decode_gated_fuzz_matches_recurrence() {
                 Value::from(HostTensor::f32(vec![1, hq, dk, 1], gv)),
             );
             inp.insert(s_in.id(), Value::from(state.clone()));
-            let (ot, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let (ot, new) = eval(&g, &inp, EvalOptions::default())
                 .map(|r| {
                     let state = r
                         .state
@@ -300,7 +300,7 @@ fn mamba2_ssd_decode_fuzz_matches_recurrence() {
                 Value::from(HostTensor::f32(vec![1, hq, 1, 1], d_par.clone())),
             );
             inp.insert(h_in.id(), Value::from(hstate.clone()));
-            let (yt, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let (yt, new) = eval(&g, &inp, EvalOptions::default())
                 .map(|r| {
                     let state = r
                         .state
@@ -451,7 +451,7 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
                 Value::from(HostTensor::f32(vec![1, hq, 1, 1], d_par.clone())),
             );
             inp.insert(h_ind.id(), Value::from(hstate.clone()));
-            let (yt, new) = eval(&gd, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let (yt, new) = eval(&gd, &inp, EvalOptions::default())
                 .map(|r| {
                     let state = r
                         .state
@@ -567,12 +567,12 @@ fn mamba2_ssd_prefill_matches_decode_loop() {
             Value::from(HostTensor::f32(vec![1, hq, n, p], vec![0.0; hq * n * p])),
         );
 
-        let got_y_hm = eval(&gy, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got_y_hm = eval(&gy, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
             .expect("linear_attention_hybrid tests evaluate dense graphs");
-        let got_h = eval(&gh, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got_h = eval(&gh, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -647,7 +647,7 @@ fn causal_conv1d_decode_fuzz_matches_reference() {
                 Value::from(HostTensor::f32(vec![kk, c], wv.clone())),
             );
             inp.insert(cache.id(), Value::from(cv.clone()));
-            let (ot, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let (ot, new) = eval(&g, &inp, EvalOptions::default())
                 .map(|r| {
                     let state = r
                         .state
@@ -759,7 +759,7 @@ fn causal_conv1d_decode_batch_generalizes_from_batch1() {
                 );
                 inp.insert(w.id(), Value::from(HostTensor::f32(vec![k, c], wd.clone())));
                 inp.insert(cache.id(), Value::from(cv.clone()));
-                let (o_t, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+                let (o_t, new) = eval(&g, &inp, EvalOptions::default())
                     .map(|r| {
                         let state = r
                             .state
@@ -833,7 +833,7 @@ fn causal_conv1d_decode_batch_generalizes_from_batch1() {
             cache.id(),
             Value::from(HostTensor::f32(vec![b_batch, k - 1, c], cv_flat.clone())),
         );
-        let (o_t, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (o_t, new) = eval(&g, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -918,7 +918,7 @@ fn decay_mask_from_gates_fuzz_matches_cumprod() {
             tr.id(),
             Value::from(HostTensor::f32(vec![1, hh, l, l], tril)),
         );
-        let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got = eval(&g, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1002,7 +1002,7 @@ fn flash_prefill_matches_materialized_attention_prefill() {
                 m.id(),
                 Value::from(HostTensor::f32(vec![1, 1, l, l], mask.clone())),
             );
-            eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            eval(&g, &inp, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
@@ -1083,7 +1083,7 @@ fn flash_attention_matches_f64_reference_at_real_head_dim_and_sink_outlier() {
             m.id(),
             Value::from(HostTensor::f32(vec![1, 1, l, l], mask.clone())),
         );
-        eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1266,7 +1266,7 @@ fn hybrid_model_decode_loop_matches_prefill() {
     bind_w(&mut pin, &w1, &l1);
     pin.insert(cmd.id(), Value::from(HostTensor::f32(vec![1, 1, l, l], dm)));
     pin.insert(cmc.id(), Value::from(HostTensor::f32(vec![1, 1, l, l], cm)));
-    let want = eval(&gp, &pin, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(&gp, &pin, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1354,7 +1354,7 @@ fn hybrid_model_decode_loop_matches_prefill() {
         inp.insert(s_in.id(), Value::from(s_mat.clone()));
         inp.insert(kc_in.id(), Value::from(kc.clone()));
         inp.insert(vc_in.id(), Value::from(vc.clone()));
-        let (o_t, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (o_t, new) = eval(&g, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -1414,7 +1414,7 @@ fn decay_mask_from_gates_matches_reference() {
             tr.id(),
             Value::from(HostTensor::f32(vec![1, hh, l, l], tril.clone())),
         );
-        eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1510,7 +1510,7 @@ fn gated_linear_attention_prefill_with_in_graph_mask_matches_reference() {
         tr.id(),
         Value::from(HostTensor::f32(vec![1, hq, l, l], tril)),
     );
-    let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g, &inp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1676,7 +1676,7 @@ fn mamba2_block_decode_loop_matches_reference() {
         bind_w(&mut inp);
         inp.insert(conv_cache.id(), Value::from(cv_cache.clone()));
         inp.insert(h_in.id(), Value::from(h_state.clone()));
-        let (yt, new) = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (yt, new) = eval(&g, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -1840,7 +1840,7 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
         cmask.id(),
         Value::from(HostTensor::f32(vec![1, 1, l, l], md)),
     );
-    let want = eval(&gp, &pin, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(&gp, &pin, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1887,7 +1887,7 @@ fn linear_attention_layer_decode_loop_matches_prefill() {
         for (ci, (s, _)) in gd.state().enumerate() {
             inp.insert(s, Value::from(caches[ci].clone()));
         }
-        let (o_t, new) = eval(&gd, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (o_t, new) = eval(&gd, &inp, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -1970,7 +1970,7 @@ fn linear_attention_decode_loop_matches_prefill() {
         for (ci, (s, _)) in gd.state().enumerate() {
             inputs.insert(s, Value::from(caches[ci].clone()));
         }
-        let (o_t, new) = eval(&gd, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let (o_t, new) = eval(&gd, &inputs, EvalOptions::default())
             .map(|r| {
                 let state = r
                     .state
@@ -2022,7 +2022,7 @@ fn linear_attention_decode_loop_matches_prefill() {
     pin.insert(pki, Value::from(HostTensor::f32(vec![1, hkv, l, dk], kd)));
     pin.insert(pvi, Value::from(HostTensor::f32(vec![1, hkv, l, dv], vd)));
     pin.insert(pmi, Value::from(HostTensor::f32(vec![1, 1, l, l], md)));
-    let want = eval(&gp, &pin, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(&gp, &pin, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -2088,7 +2088,7 @@ fn mamba2_ssd_prefill_stays_finite_when_delta_a_underflows_the_gate() {
     put(tr.id(), vec![1, hq, l, l], tril);
     put(h.id(), vec![1, hq, n, p], h0);
     let run = |g: &poot_graph_ir::Graph| {
-        eval(g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(g, &inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
