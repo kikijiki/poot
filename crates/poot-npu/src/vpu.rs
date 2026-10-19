@@ -24,6 +24,7 @@
 //! write is freed. The failed recording and every buffer it names stay allocated and charged until the
 //! device itself drops.
 
+use std::cell::{Ref, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -32,8 +33,8 @@ use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, VpuInvocation
 use poot_graph_plan::Target;
 use poot_graph_plan::production_plan::Submission;
 use poot_l0_runtime::{
-    GraphDirection, GraphIr, GraphPrecision, L0Context, L0DeviceKind, L0Error, L0Graph,
-    L0HostBuffer, L0Recording, L0RecordingBuilder,
+    GraphDirection, GraphIr, GraphPrecision, L0Context, L0Error, L0Graph, L0HostBuffer,
+    L0Recording, L0RecordingBuilder,
 };
 use poot_runtime_common::{
     AllocGuard, BufferRole, CompiledKernel, KernelCode, MemoryCounterSnapshot, MemoryCounters,
@@ -248,9 +249,10 @@ fn l0(operation: &'static str) -> impl FnOnce(L0Error) -> VpuError {
 }
 
 /// One host buffer plus the charge it holds against the device's memory counters. The charge drops with the
-/// buffer.
+/// buffer. Writing the host buffer needs exclusive access; `VpuBuffer` handles are shared, so the cell checks it
+/// at runtime.
 struct BufferCell {
-    host: L0HostBuffer,
+    host: RefCell<L0HostBuffer>,
     storage: BufferStorage,
     _charge: AllocGuard,
 }
@@ -261,7 +263,7 @@ pub struct VpuBuffer(Rc<BufferCell>);
 
 impl VpuBuffer {
     fn bytes(&self) -> usize {
-        self.0.host.len()
+        self.0.host.borrow().len()
     }
 }
 
@@ -325,6 +327,7 @@ impl RangeCheck {
         self.buffer
             .0
             .host
+            .borrow()
             .read(0, &mut bytes)
             .map_err(l0("host read"))?;
         let (words, _) = bytes.as_chunks::<{ size_of::<f32>() }>();
@@ -390,7 +393,7 @@ impl VpuDevice {
     /// NPU4 (the only part this crate knows), the compiler version is read from the driver, and the memory
     /// budget is unknown (the driver reports no figure poot trusts).
     pub fn open_with(config: VpuConfig) -> Result<Self, VpuError> {
-        let context = L0Context::open(L0DeviceKind::Npu).map_err(l0("device open"))?;
+        let context = L0Context::open().map_err(l0("device open"))?;
         if context.vendor_id() != INTEL_VENDOR_ID {
             return Err(VpuError::NotIntel {
                 vendor: context.vendor_id(),
@@ -473,7 +476,9 @@ impl VpuDevice {
         let options = build_flags(key, artifact)?;
         let blob_key = BlobKey::new(artifact, self.compiler, &options);
         if let Some(blob) = self.cache.get(&blob_key)? {
-            match self.context.load_native_graph(&blob) {
+            // SAFETY: `blob` is what the cache returned for this exact region, compiler version and options; it
+            // stores only `native_binary` output and returns it only when its stored digest matches.
+            match unsafe { self.context.load_native_graph(&blob) } {
                 Ok(graph) => {
                     #[cfg(any(test, feature = "test-support"))]
                     {
@@ -608,7 +613,7 @@ impl Device for VpuDevice {
         let host = self.context.alloc_host(bytes).map_err(l0("host alloc"))?;
         let charge = self.counters.record_alloc(role, bytes as u64);
         Ok(VpuBuffer(Rc::new(BufferCell {
-            host,
+            host: RefCell::new(host),
             storage,
             _charge: charge,
         })))
@@ -697,7 +702,9 @@ impl Device for VpuDevice {
             .chain(std::iter::once(&dispatch.output))
             .collect();
         check_bindings(&kernel, &args)?;
-        let buffers: Vec<&L0HostBuffer> = args.iter().map(|arg| &arg.buffer.0.host).collect();
+        let hosts: Vec<Ref<'_, L0HostBuffer>> =
+            args.iter().map(|arg| arg.buffer.0.host.borrow()).collect();
+        let buffers: Vec<&L0HostBuffer> = hosts.iter().map(|host| &**host).collect();
         self.recording()?
             .execute_graph(&kernel.graph, &buffers)
             .map_err(l0("append graph execution"))?;
@@ -715,10 +722,7 @@ impl Device for VpuDevice {
                 // An input an earlier command of this recording writes holds nothing the host can check
                 // before the replay; its writer's result check covers it.
                 if matches!(direction, Direction::Input)
-                    && self
-                        .open_written
-                        .iter()
-                        .any(|w| Rc::ptr_eq(&w.0, &arg.buffer.0))
+                    && self.open_written.iter().any(|w| Rc::ptr_eq(&w.0, &arg.buffer.0))
                 {
                     continue;
                 }
@@ -745,7 +749,7 @@ impl Device for VpuDevice {
             });
         }
         self.recording()?
-            .copy(&dst.0.host, &src.0.host)
+            .copy(&dst.0.host.borrow(), &src.0.host.borrow())
             .map_err(l0("append copy"))?;
         self.open_written.push(dst.clone());
         Ok(())
@@ -816,6 +820,7 @@ impl Device for VpuDevice {
         // The buffer is the NPU's own pages: the whole range is one chunk, no staging copy.
         dst.0
             .host
+            .borrow_mut()
             .write(offset..end, |bytes| fill(offset..end, bytes))
             .map_err(l0("host write"))
     }
@@ -829,7 +834,7 @@ impl Device for VpuDevice {
                 len: src.bytes(),
             });
         }
-        src.0.host.read(0, out).map_err(l0("host read"))
+        src.0.host.borrow().read(0, out).map_err(l0("host read"))
     }
 
     fn synchronize(&mut self) -> Result<(), VpuError> {

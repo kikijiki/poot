@@ -5,9 +5,10 @@ use crate::bindings::{
 };
 use crate::buffer::Pool;
 use crate::error::check;
+use crate::hsaco::{BoundKernarg, KernelHandle};
 use crate::owner::HsaRuntimeOwner;
 use crate::queue::{QueueLayout, QueueRingProvenance, QueueRole, take_queue_reference};
-use crate::{RocmBuffer, RocmError, bindings, ffi, publication};
+use crate::{RocmError, bindings, ffi, publication};
 use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot};
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
@@ -383,8 +384,11 @@ impl DevicePoison {
 )]
 pub(crate) struct Held {
     pub(crate) staging: Option<StagingBuffer>,
-    /// The kernarg buffers of an enqueued batch: its packets read them until the batch completes.
-    pub(crate) kernargs: Vec<RocmBuffer>,
+    /// The kernels of an enqueued batch: its packets run their code objects until the batch completes.
+    pub(crate) kernels: Vec<KernelHandle>,
+    /// The bound kernargs of an enqueued batch: its packets read them, and the data buffers they
+    /// address, until the batch completes.
+    pub(crate) kernargs: Vec<BoundKernarg>,
     /// The completion signals of an enqueued batch's non-final packets, present only on a context
     /// built with [`RocmContextOptions::device_timing`]; the batch's own signal belongs to its final
     /// packet. Handles, not owners: destroyed only after proven completion, leaked with the rest of an
@@ -406,6 +410,7 @@ impl std::fmt::Debug for Held {
                 "staging_bytes",
                 &self.staging.as_ref().map(StagingBuffer::len),
             )
+            .field("kernels", &self.kernels.len())
             .field("kernargs", &self.kernargs.len())
             .field("dispatch_signals", &self.dispatch_signals.len())
             .finish()

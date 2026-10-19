@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use poot_codegen::{Target, compile, kernel_handle};
+use poot_codegen::{Target, compile_kernel, kernel_handle};
 use poot_kernel_ir::fixtures;
 use poot_kernel_ir::test_support::square_kernel;
 use poot_runtime_common::{BufferRole, CompiledKernel};
@@ -41,9 +41,9 @@ fn kernel_for(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel {
     let dir: PathBuf = std::env::temp_dir().join("poot-vulkan-runtime-test");
     std::fs::create_dir_all(&dir).unwrap();
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
-    compile(body, Target::SpirvVulkan, &out).expect("compile spirv");
-    let spv = std::fs::read(&out).unwrap();
-    kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, spv)
+    let artifact =
+        compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out).expect("compile spirv");
+    kernel_handle(body, &artifact).unwrap()
 }
 
 #[test]

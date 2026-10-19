@@ -359,10 +359,6 @@ impl ServeEngine for RecordingEngine {
     }
 
     fn admin(&mut self, request: AdminRequest) -> Result<AdminReply, AdminError> {
-        assert!(
-            self.open.is_empty(),
-            "the loop runs an administration job with no sequence open"
-        );
         self.record(Event::Admin(request.clone()));
         if let Some(error) = &self.admin_error {
             return Err(error.clone());

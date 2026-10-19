@@ -52,7 +52,7 @@ const SPEC: DenseSpec = DenseSpec {
     family: FAMILY,
     gguf: dense_keys!("minimax-m2"),
     hf_theta: 5_000_000.0,
-    gguf_theta: 5_000_000.0,
+    gguf_theta: Some(5_000_000.0),
     eps: 1e-6,
     eos: None,
 };

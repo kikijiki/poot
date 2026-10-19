@@ -917,7 +917,7 @@ fn device_bank(device: &mut Device<'_>) {
 /// wgpu (SPIR-V through the Vulkan runtime): skips with no adapter. Run serial under `/tmp/poot-gpu.lock`.
 #[test]
 fn the_movement_bank_matches_the_reference_on_wgpu() {
-    use poot_codegen::{Target, artifact_path, compile, kernel_handle};
+    use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
     let Ok(ctx) = poot_wgpu_runtime::Context::new() else {
         eprintln!("no wgpu device; skipping");
         return;
@@ -930,12 +930,9 @@ fn the_movement_bank_matches_the_reference_on_wgpu() {
         let name = format!("movement_{count}");
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = artifact_path(&dir, &name, Target::SpirvVulkan);
-        compile(&body, Target::SpirvVulkan, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let kernel = kernel_handle(
-            &body,
-            poot_codegen::GpuTarget::SpirvVulkan,
-            std::fs::read(&path).unwrap(),
-        );
+        let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &path)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let kernel = kernel_handle(&body, &artifact).unwrap();
         // Resident buffers, so the output starts as `launch.out` (an in-place scatter updates the pool
         // it is handed; every other op overwrites every word).
         let mut owned: Vec<_> = launch.data.iter().map(|w| ctx.upload_u32(w)).collect();
@@ -989,12 +986,10 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
         let name = format!("movement_{count}");
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = poot_codegen::artifact_path(&dir, &name, target);
-        poot_codegen::compile(&body, target, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let compiled = poot_codegen::kernel_handle(
-            &body,
-            poot_codegen::GpuTarget::AmdGcn(arch),
-            std::fs::read(&path).unwrap(),
-        );
+        let artifact =
+            poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::AmdGcn(arch), &path)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
         let module = ctx
             .load_hsaco(&compiled)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1014,16 +1009,11 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
         owned.push(ctx.upload_f32(&seed, BufferRole::Output).unwrap());
         let mut elements = vec![ElementKind::I32; inputs];
         elements.push(ElementKind::F32);
-        let kernarg = ctx
-            .allocate_kernarg(kernel.kernarg_size() as usize)
-            .unwrap();
-        let mut karg = vec![0u8; kernarg.byte_capacity()];
-        for (slot, buffer) in owned.iter().enumerate() {
-            karg[slot * 16..slot * 16 + 8].copy_from_slice(&buffer.device_ptr().to_le_bytes());
-            karg[slot * 16 + 8..slot * 16 + 16]
-                .copy_from_slice(&u64::from(buffer.elem_count()).to_le_bytes());
-        }
-        ctx.write_raw_bytes(&kernarg, 0, &karg).unwrap();
+        let slots: Vec<_> = owned
+            .iter()
+            .map(|buffer| (buffer, u64::from(buffer.elem_count())))
+            .collect();
+        let kernarg = ctx.bind_kernarg(&kernel, &slots).unwrap();
         let block_x = body.workgroup_size[0];
         let grid_x = (launch.spec.threads() as u32).div_ceil(block_x) * block_x;
         ctx.dispatch(
@@ -1043,7 +1033,7 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
 /// NVPTX: skips with no NVIDIA device (the PTX pod batch runs it).
 #[test]
 fn the_movement_bank_matches_the_reference_on_ptx() {
-    use poot_codegen::{Target, artifact_path, compile, kernel_handle};
+    use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
     use poot_ptx_runtime::PtxContext;
     let Ok(ctx) = PtxContext::new() else {
         eprintln!("no PTX device; skipping");
@@ -1057,12 +1047,9 @@ fn the_movement_bank_matches_the_reference_on_ptx() {
         let name = format!("movement_{count}");
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = artifact_path(&dir, &name, Target::Nvptx);
-        compile(&body, Target::Nvptx, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let kernel = kernel_handle(
-            &body,
-            poot_codegen::GpuTarget::Nvptx,
-            std::fs::read(&path).unwrap(),
-        );
+        let artifact = compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &path)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let kernel = kernel_handle(&body, &artifact).unwrap();
         let upload = |words: &[u32]| {
             let as_i32: Vec<i32> = words.iter().map(|&w| w as i32).collect();
             ctx.upload_i32(&as_i32).unwrap()

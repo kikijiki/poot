@@ -18,16 +18,17 @@ use std::num::NonZeroUsize;
 
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{
-    AttnRole, ExpertProj, GdnRole, NormRole, WeightId, WeightKey, WeightMap, WeightMapError,
-    WeightRole, WeightStore, WeightView,
+    AttnRole, ExpertProj, NormRole, WeightId, WeightKey, WeightMap, WeightMapBuilder,
+    WeightMapError, WeightRole, WeightStore, WeightView,
 };
 
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::gdn::{GdnHeadOrder, GdnParams, GdnWeights, gdn};
+use crate::components::gdn::{GdnParams, GdnWeights, gdn};
+use crate::components::gdn_names::{GdnTable, nextn_field, trunk_layers};
 use crate::components::linear::WeightError;
 use crate::components::moe::{self, MoeParams, MoeWeights};
-use crate::components::norm::{NormKind, NormParams};
+use crate::components::norm::NormParams;
 use crate::components::router::RouterKind;
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
@@ -55,13 +56,13 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     variants: &[],
 };
 
-/// Qwen3-Next's config facts: `Qwen3NextConfig`'s defaults and llama.cpp's GGUF base default. The
-/// class declares no `eos_token_id`: a checkpoint names it.
+/// Qwen3-Next's config facts: `Qwen3NextConfig`'s defaults. The class declares no `eos_token_id`: a
+/// checkpoint names it. A GGUF must name its RoPE base (`gguf_theta: None`).
 const SPEC: DenseSpec = DenseSpec {
     family: FAMILY,
     gguf: dense_keys!("qwen35moe"),
     hf_theta: 10_000.0,
-    gguf_theta: 10_000_000.0,
+    gguf_theta: None,
     eps: 1e-6,
     eos: None,
 };
@@ -89,6 +90,7 @@ const INTERVAL: Field = Field::new(
     "qwen35moe.full_attention_interval",
 );
 const ROTARY_DIM: Field = Field::new("", "qwen35moe.rope.dimension_count");
+const NEXTN_LAYERS: Field = nextn_field!("qwen35moe");
 
 /// One layer's mixer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +124,8 @@ impl Qwen3NextParams {
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, FAMILY);
         let dims = DenseDims::read_with_inter(&fields, &SPEC, EXPERT_INTER)?;
+        let layers = trunk_layers(&fields, NEXTN_LAYERS, dims.layers)?;
+        let table = names_of(raw).gdn;
         let hf = matches!(raw, RawConfig::HfJson { .. });
         if hf {
             for unsupported in ["attention_bias", "use_sliding_window"] {
@@ -153,15 +157,9 @@ impl Qwen3NextParams {
             }
         }
         // The residual-stream and projection norms: HF stores `(1 + w)`, a GGUF folds the one in.
-        let (norm_kind, eps) = (
-            if hf {
-                NormKind::RmsPlusOne
-            } else {
-                NormKind::Rms
-            },
-            dims.eps,
-        );
-        let norm = NormParams::of(norm_kind, eps).map_err(|e| e.for_family(FAMILY))?;
+        let eps = dims.eps;
+        let norm = NormParams::of(table.convention.norm_fold.norm_kind(), eps)
+            .map_err(|e| e.for_family(FAMILY))?;
         let rotary = match raw {
             RawConfig::HfJson { .. } => {
                 let factor = fields.float(Field::hf("partial_rotary_factor"), 0.25)?;
@@ -205,24 +203,15 @@ impl Qwen3NextParams {
         {
             return Err(fields.error(fields.key(INNER_SIZE), ConfigReason::Unsupported));
         }
-        let gdn = GdnParams::new(
-            key_heads,
-            value_heads,
-            head_dim,
-            fields.count(CONV_KERNEL, None)?,
-            NormParams::new(eps).map_err(|e| e.for_family(FAMILY))?,
-            if hf {
-                GdnHeadOrder::Grouped
-            } else {
-                GdnHeadOrder::Tiled
-            },
-        )
-        .map_err(|e| e.for_family(FAMILY))?;
-        let gdn = if hf {
-            gdn.with_fused_projections().with_log_decay()
-        } else {
-            gdn
-        };
+        let gdn = table
+            .params(
+                key_heads,
+                value_heads,
+                head_dim,
+                fields.count(CONV_KERNEL, None)?,
+                NormParams::new(eps).map_err(|e| e.for_family(FAMILY))?,
+            )
+            .map_err(|e| e.for_family(FAMILY))?;
 
         // HF's class default renormalizes the selected routes; llama.cpp's graph always does.
         let renormalize = fields.flag(NORM_TOPK_PROB, true)?;
@@ -239,7 +228,7 @@ impl Qwen3NextParams {
         .map_err(|e| e.for_family(FAMILY))?;
 
         Ok(Self {
-            kinds: layer_kinds(&fields, dims.layers)?,
+            kinds: layer_kinds(&fields, layers)?,
             layer: LayerParams::new(norm),
             stack: StackParams::new(norm),
             attention,
@@ -303,7 +292,7 @@ struct Names {
     attn_norm: &'static str,
     ffn_norm: &'static str,
     attention: AttentionNames,
-    gdn: GdnNames,
+    gdn: GdnTable,
     moe: MoeNames,
 }
 
@@ -314,17 +303,6 @@ struct AttentionNames {
     o: &'static str,
     q_norm: &'static str,
     k_norm: &'static str,
-}
-
-struct GdnNames {
-    /// HF: the fused projections; a GGUF: `qkv`, `z`, `beta` and `alpha` each its own.
-    fused: Option<(&'static str, &'static str)>,
-    split: Option<[&'static str; 4]>,
-    dt_bias: &'static str,
-    conv: &'static str,
-    a: &'static str,
-    norm: &'static str,
-    out: &'static str,
 }
 
 const HF_NAMES: Names = Names {
@@ -342,15 +320,7 @@ const HF_NAMES: Names = Names {
         q_norm: ".self_attn.q_norm.weight",
         k_norm: ".self_attn.k_norm.weight",
     },
-    gdn: GdnNames {
-        fused: Some((".linear_attn.in_proj_qkvz", ".linear_attn.in_proj_ba")),
-        split: None,
-        dt_bias: ".linear_attn.dt_bias",
-        conv: ".linear_attn.conv1d.weight",
-        a: ".linear_attn.A_log",
-        norm: ".linear_attn.norm.weight",
-        out: ".linear_attn.out_proj",
-    },
+    gdn: GdnTable::HF_FUSED,
     moe: MoeNames {
         prefix: "model.layers.",
         router: ".mlp.gate",
@@ -399,15 +369,7 @@ const GGUF_NAMES: Names = Names {
         q_norm: ".attn_q_norm.weight",
         k_norm: ".attn_k_norm.weight",
     },
-    gdn: GdnNames {
-        fused: None,
-        split: Some([".attn_qkv", ".attn_gate", ".ssm_beta", ".ssm_alpha"]),
-        dt_bias: ".ssm_dt.bias",
-        conv: ".ssm_conv1d.weight",
-        a: ".ssm_a",
-        norm: ".ssm_norm.weight",
-        out: ".ssm_out",
-    },
+    gdn: GdnTable::GGUF,
     moe: MoeNames {
         prefix: "blk.",
         router: ".ffn_gate_inp",
@@ -462,36 +424,46 @@ fn weights_of(
             stem.to_string()
         }
     };
-    let mut put = |id: WeightId, key: String| -> Result<(), ModelError> {
-        map.map(id, WeightView::Stored(WeightKey::from(key)))
-            .map_err(missing)?;
-        Ok(())
-    };
+    let put =
+        |map: &mut WeightMapBuilder<'_>, id: WeightId, key: String| -> Result<(), ModelError> {
+            map.map(id, WeightView::Stored(WeightKey::from(key)))
+                .map_err(missing)?;
+            Ok(())
+        };
 
     let embed = WeightId::model(WeightRole::Embed);
-    put(embed, names.embed.to_string())?;
+    put(&mut map, embed, names.embed.to_string())?;
     put(
+        &mut map,
         WeightId::model(WeightRole::FinalNorm),
         names.final_norm.to_string(),
     )?;
     let head = WeightId::model(WeightRole::Head);
     let head_key = linear(names.head);
     if store.contains(&head_key) {
-        put(head, head_key)?;
+        put(&mut map, head, head_key)?;
     } else if p.head_required {
         return Err(missing(WeightMapError::Missing {
             id: head,
             key: WeightKey::from(head_key),
         }));
     } else {
-        put(head, names.embed.to_string())?;
+        put(&mut map, head, names.embed.to_string())?;
     }
 
     for (l, kind) in p.kinds.iter().enumerate() {
         let layer = |suffix: &str| format!("{}{l}{suffix}", names.prefix);
         let id = |role| WeightId::layer(l, role);
-        put(id(WeightRole::Norm(NormRole::Attn)), layer(names.attn_norm))?;
-        put(id(WeightRole::Norm(NormRole::Ffn)), layer(names.ffn_norm))?;
+        put(
+            &mut map,
+            id(WeightRole::Norm(NormRole::Attn)),
+            layer(names.attn_norm),
+        )?;
+        put(
+            &mut map,
+            id(WeightRole::Norm(NormRole::Ffn)),
+            layer(names.ffn_norm),
+        )?;
         match kind {
             LayerKind::FullAttention => {
                 let a = &names.attention;
@@ -501,33 +473,24 @@ fn weights_of(
                     (AttnRole::V, a.v),
                     (AttnRole::O, a.o),
                 ] {
-                    put(id(WeightRole::Attn(role)), linear(&layer(stem)))?;
+                    put(&mut map, id(WeightRole::Attn(role)), linear(&layer(stem)))?;
                 }
-                put(id(WeightRole::Attn(AttnRole::QNorm)), layer(a.q_norm))?;
-                put(id(WeightRole::Attn(AttnRole::KNorm)), layer(a.k_norm))?;
+                put(
+                    &mut map,
+                    id(WeightRole::Attn(AttnRole::QNorm)),
+                    layer(a.q_norm),
+                )?;
+                put(
+                    &mut map,
+                    id(WeightRole::Attn(AttnRole::KNorm)),
+                    layer(a.k_norm),
+                )?;
             }
             LayerKind::LinearAttention => {
-                let g = &names.gdn;
-                let gdn = |role| id(WeightRole::Gdn(role));
-                if let Some((qkvz, ba)) = g.fused {
-                    put(gdn(GdnRole::Qkvz), linear(&layer(qkvz)))?;
-                    put(gdn(GdnRole::Ba), linear(&layer(ba)))?;
-                }
-                if let Some([qkv, z, beta, alpha]) = g.split {
-                    for (role, stem) in [
-                        (GdnRole::Qkv, qkv),
-                        (GdnRole::Z, z),
-                        (GdnRole::Beta, beta),
-                        (GdnRole::Alpha, alpha),
-                    ] {
-                        put(gdn(role), linear(&layer(stem)))?;
-                    }
-                }
-                put(gdn(GdnRole::DtBias), layer(g.dt_bias))?;
-                put(gdn(GdnRole::Conv), layer(g.conv))?;
-                put(gdn(GdnRole::A), layer(g.a))?;
-                put(gdn(GdnRole::GateNorm), layer(g.norm))?;
-                put(gdn(GdnRole::Out), linear(&layer(g.out)))?;
+                names
+                    .gdn
+                    .map_layer(&mut map, l, &layer, &linear)
+                    .map_err(missing)?;
             }
         }
     }
@@ -561,13 +524,17 @@ pub struct Qwen3Next {
     config: ModelConfig,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
-    let p = Qwen3NextParams::from_raw(raw)?;
-    let names = match raw.source() {
+/// The tensor names of the checkpoint format `raw` comes from.
+fn names_of(raw: &RawConfig<'_>) -> &'static Names {
+    match raw.source() {
         ConfigSource::HfModelType => &HF_NAMES,
         ConfigSource::GgufArchitecture => &GGUF_NAMES,
-    };
-    let weights = weights_of(&p, store, names)?;
+    }
+}
+
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+    let p = Qwen3NextParams::from_raw(raw)?;
+    let weights = weights_of(&p, store, names_of(raw))?;
     let weight_error = |e: WeightError| e.for_family(FAMILY);
     let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
     let layers =
@@ -783,6 +750,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::components::gdn_names::converter::{
+        HfProjections, LayerDims, layer_metadata, nextn_key, plus_one, write_layer,
+        write_nextn_block,
+    };
     use crate::components::standard::oracle::run_step;
     use crate::components::testing::{
         CAP, GGML_F32, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named,
@@ -1098,40 +1069,30 @@ mod tests {
     /// The GGUF checkpoint llama.cpp's converter writes for the HF `fixture`: separate projections
     /// (the fused `in_proj_qkvz` and `in_proj_ba` taken apart), every per-value-head tensor
     /// reordered from HF's grouped order to tiled, `ssm_a = -exp(A_log)`, the norms with their one
-    /// folded in (the GDN's gated norm has none), and the experts stacked. Written here from the
-    /// converter's rules, independently of the family's own GGUF reader.
+    /// folded in (the GDN's gated norm has none), the experts stacked and, when `nextn` is set, the
+    /// extra block the file appends for multi-token prediction. Written from the converter's rules
+    /// (`components::gdn_names::converter`), independently of the family's own GGUF reader.
     /// A GGUF tensor as the reader takes it: name, dims, GGML type and bytes.
     type GgufTensor = (String, Vec<u64>, u32, Vec<u8>);
 
-    fn gguf_of(fx: &Fixture) -> (Vec<(String, GgufValue)>, Vec<GgufTensor>) {
+    fn gguf_of(fx: &Fixture, nextn: bool) -> (Vec<(String, GgufValue)>, Vec<GgufTensor>) {
         let n = |f: &str| crate::registry::Fixture::count(&fx.config, f);
-        let (w, hd) = (n("hidden_size"), n("linear_key_head_dim"));
-        let (hk, hv) = (n("linear_num_key_heads"), n("linear_num_value_heads"));
-        let rep = hv / hk;
-        let (key_dim, value_dim) = (hk * hd, hv * hd);
-        let conv = 2 * key_dim + value_dim;
-        let kernel = n("linear_conv_kernel_dim");
+        let gdn = LayerDims {
+            width: n("hidden_size"),
+            key_heads: n("linear_num_key_heads"),
+            value_heads: n("linear_num_value_heads"),
+            head_dim: n("linear_key_head_dim"),
+            kernel: n("linear_conv_kernel_dim"),
+        };
+        let w = gdn.width;
         let experts = n("num_experts");
         let layers = n("num_hidden_layers");
         let vals = |key: &str| values(fx.store.get(key).unwrap_or_else(|| panic!("{key}")));
-        // The tiled position `t` of a value head holds grouped head `(t % hk) * rep + t / hk`.
-        let grouped_of = |t: usize| (t % hk) * rep + t / hk;
-        // Rows of `data` (`width` values each) grouped in blocks of `block` rows, the blocks of each
-        // run reordered: `data[head * block + r]`.
-        let reorder_blocks = |data: &[f32], width: usize, block: usize| -> Vec<f32> {
-            (0..hv)
-                .flat_map(|t| {
-                    let g = grouped_of(t);
-                    data[g * block * width..(g + 1) * block * width].to_vec()
-                })
-                .collect()
-        };
         let mut tensors: Vec<GgufTensor> = Vec::new();
         let mut put = |name: String, shape: Vec<usize>, data: Vec<f32>| {
             assert_eq!(data.len(), shape.iter().product::<usize>(), "{name}");
             tensors.push(gguf_tensor(&name, &f32_entry(shape, &data)));
         };
-        let plus_one = |v: Vec<f32>| v.into_iter().map(|x| x + 1.0).collect::<Vec<f32>>();
         let vocab = n("vocab_size");
         put(
             "token_embd.weight".into(),
@@ -1198,72 +1159,13 @@ mod tests {
                     plus_one(vals(&hf("self_attn.k_norm.weight"))),
                 );
             } else {
-                // `in_proj_qkvz` rows group per key head: `[q (hd) | k (hd) | v (rep * hd) | z (rep * hd)]`.
-                let qkvz = vals(&hf("linear_attn.in_proj_qkvz.weight"));
-                let block = 2 * hd + 2 * rep * hd;
-                let rows = |g: usize, from: usize, len: usize| {
-                    qkvz[(g * block + from) * w..(g * block + from + len) * w].to_vec()
-                };
-                let q: Vec<f32> = (0..hk).flat_map(|g| rows(g, 0, hd)).collect();
-                let k: Vec<f32> = (0..hk).flat_map(|g| rows(g, hd, hd)).collect();
-                let v_grouped: Vec<f32> = (0..hk).flat_map(|g| rows(g, 2 * hd, rep * hd)).collect();
-                let z_grouped: Vec<f32> = (0..hk)
-                    .flat_map(|g| rows(g, 2 * hd + rep * hd, rep * hd))
-                    .collect();
-                let v = reorder_blocks(&v_grouped, w, hd);
-                put(gg("attn_qkv.weight"), vec![conv, w], [q, k, v].concat());
-                put(
-                    gg("attn_gate.weight"),
-                    vec![value_dim, w],
-                    reorder_blocks(&z_grouped, w, hd),
+                write_layer(
+                    gdn,
+                    HfProjections::Fused,
+                    &|suffix| vals(&hf(&format!("linear_attn.{suffix}"))),
+                    &gg,
+                    &mut put,
                 );
-                // `in_proj_ba` rows group per key head: `[b (rep) | a (rep)]`.
-                let ba = vals(&hf("linear_attn.in_proj_ba.weight"));
-                let part = |from: usize| -> Vec<f32> {
-                    let grouped: Vec<f32> = (0..hk)
-                        .flat_map(|g| {
-                            ba[(g * 2 * rep + from) * w..(g * 2 * rep + from + rep) * w].to_vec()
-                        })
-                        .collect();
-                    reorder_blocks(&grouped, w, 1)
-                };
-                put(gg("ssm_beta.weight"), vec![hv, w], part(0));
-                put(gg("ssm_alpha.weight"), vec![hv, w], part(rep));
-                put(
-                    gg("ssm_dt.bias"),
-                    vec![hv],
-                    reorder_blocks(&vals(&hf("linear_attn.dt_bias")), 1, 1),
-                );
-                let a: Vec<f32> = vals(&hf("linear_attn.A_log"))
-                    .iter()
-                    .map(|a| -a.exp())
-                    .collect();
-                put(gg("ssm_a"), vec![hv], reorder_blocks(&a, 1, 1));
-                // The conv kernel `[conv, 1, K]` as `[conv, K]`, its value rows reordered.
-                let kernel_rows = vals(&hf("linear_attn.conv1d.weight"));
-                let split = 2 * key_dim * kernel;
-                let v_rows = reorder_blocks(&kernel_rows[split..], kernel, hd);
-                put(
-                    gg("ssm_conv1d.weight"),
-                    vec![conv, kernel],
-                    [kernel_rows[..split].to_vec(), v_rows].concat(),
-                );
-                put(
-                    gg("ssm_norm.weight"),
-                    vec![hd],
-                    vals(&hf("linear_attn.norm.weight")),
-                );
-                // `out_proj` `[w, value_dim]`: its columns follow the value heads.
-                let out = vals(&hf("linear_attn.out_proj.weight"));
-                let mut reordered: Vec<f32> = Vec::with_capacity(out.len());
-                for row in 0..w {
-                    for t in 0..hv {
-                        let g = grouped_of(t);
-                        reordered
-                            .extend(&out[row * value_dim + g * hd..row * value_dim + (g + 1) * hd]);
-                    }
-                }
-                put(gg("ssm_out.weight"), vec![w, value_dim], reordered);
             }
             let (inter, shared) = (
                 n("moe_intermediate_size"),
@@ -1305,14 +1207,20 @@ mod tests {
                 vals(&hf("mlp.shared_expert_gate.weight")),
             );
         }
+        if nextn {
+            write_nextn_block(w, layers, &mut put);
+        }
         let u = |v: usize| GgufValue::U32(v as u32);
-        let kvs = vec![
+        let mut kvs = vec![
             (
                 "general.architecture".to_string(),
                 GgufValue::Str("qwen35moe".into()),
             ),
             ("qwen35moe.embedding_length".to_string(), u(w)),
-            ("qwen35moe.block_count".to_string(), u(layers)),
+            (
+                "qwen35moe.block_count".to_string(),
+                u(layers + usize::from(nextn)),
+            ),
             (
                 "qwen35moe.attention.head_count".to_string(),
                 u(n("num_attention_heads")),
@@ -1344,12 +1252,6 @@ mod tests {
                         as usize,
                 ),
             ),
-            ("qwen35moe.ssm.inner_size".to_string(), u(value_dim)),
-            ("qwen35moe.ssm.state_size".to_string(), u(hd)),
-            ("qwen35moe.ssm.group_count".to_string(), u(hk)),
-            ("qwen35moe.ssm.time_step_rank".to_string(), u(hv)),
-            ("qwen35moe.ssm.conv_kernel".to_string(), u(kernel)),
-            ("qwen35moe.full_attention_interval".to_string(), u(4)),
             ("qwen35moe.expert_count".to_string(), u(experts)),
             (
                 "qwen35moe.expert_used_count".to_string(),
@@ -1376,35 +1278,97 @@ mod tests {
                 u(n("eos_token_id")),
             ),
         ];
+        kvs.extend(layer_metadata("qwen35moe", gdn, nextn));
         (kvs, tensors)
     }
 
     /// SC-005's checkpoint half: the GGUF the converter writes for the HF fixture (tiled value
     /// heads, separate projections, `ssm_a`, folded norms, stacked experts, a flat shared gate)
     /// resolves through the registry to this family and gives the same logits and carried state as
-    /// the HF model, prefill and decode, at every position. Mutation: read the GGUF with
-    /// `GdnHeadOrder::Grouped`; the value heads pair with the wrong key heads and the logits differ.
+    /// the HF model, prefill and decode, at every position, with and without the appended
+    /// multi-token-prediction block. Mutations: read the GGUF with `GdnHeadOrder::Grouped`, the value
+    /// heads pair with the wrong key heads and the logits differ; drop the `trunk_layers` call from
+    /// `Qwen3NextParams::from_raw`, the nextn block is traced as a fifth layer and the weight map
+    /// names tensors the file lacks.
     #[test]
     fn the_gguf_spelling_of_the_fixture_equals_the_hf_model() {
         let fx = fixture();
         let hf = model_of(&fx.config, &fx.store);
-        let (kvs, tensors) = gguf_of(&fx);
-        assert!(tensors.iter().all(|(_, _, ty, _)| *ty == GGML_F32));
-        let (index, store) = read_back_owned(&kvs, &tensors);
-        let registry = Registry::builtin().unwrap();
-        let raw = RawConfig::Gguf(&index);
-        assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
-        let gguf = registry.build(&raw, &store).unwrap();
         let prompt = [3, 17, 40, 8, 25, 9];
         let (want, want_state) = run_step(&*hf, &fx.store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (got, state) = run_step(&*gguf, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        close(&got, &want);
-        // The carried tensors differ in value-head order, so only the logits and the attention cache
-        // are comparable: the cache is the last two state values.
-        let kv = want_state.len() - 2;
-        close_all(&state[kv..], &want_state[kv..]);
-        let (got, _) = run_step(&*gguf, &store, Phase::Decode, CAP, &[5], 6, &state);
-        let (want, _) = run_step(&*hf, &fx.store, Phase::Decode, CAP, &[5], 6, &want_state);
-        close(&got, &want);
+        let (want_decode, _) = run_step(&*hf, &fx.store, Phase::Decode, CAP, &[5], 6, &want_state);
+        for nextn in [false, true] {
+            let (kvs, tensors) = gguf_of(&fx, nextn);
+            assert!(tensors.iter().all(|(_, _, ty, _)| *ty == GGML_F32));
+            let (index, store) = read_back_owned(&kvs, &tensors);
+            let registry = Registry::builtin().unwrap();
+            let raw = RawConfig::Gguf(&index);
+            assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
+            let gguf = registry.build(&raw, &store).unwrap();
+            let (got, state) = run_step(&*gguf, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
+            close(&got, &want);
+            // The carried tensors differ in value-head order, so only the logits and the attention
+            // cache are comparable: the cache is the last two state values.
+            let kv = want_state.len() - 2;
+            close_all(&state[kv..], &want_state[kv..]);
+            let (got, _) = run_step(&*gguf, &store, Phase::Decode, CAP, &[5], 6, &state);
+            close(&got, &want_decode);
+        }
+    }
+
+    /// SC-002: a GGUF that appends a multi-token-prediction block (`nextn_predict_layers = 1`) has
+    /// that block left out of the trunk: the stack is the fixture's four layers, not the five
+    /// `block_count` states, and a count that leaves no layer is a typed refusal naming the key.
+    /// Mutation: take `dims.layers` as the stack depth in `Qwen3NextParams::from_raw`.
+    #[test]
+    fn a_gguf_nextn_block_is_left_out_of_the_trunk() {
+        let fx = fixture();
+        let (kvs, tensors) = gguf_of(&fx, true);
+        let (index, _) = read_back_owned(&kvs, &tensors);
+        let p = Qwen3NextParams::from_raw(&RawConfig::Gguf(&index)).unwrap();
+        assert_eq!(p.kinds.len(), 4);
+        assert_eq!(p.kinds.last(), Some(&LayerKind::FullAttention));
+
+        let (mut kvs, tensors) = gguf_of(&fx, true);
+        for (key, value) in &mut kvs {
+            if *key == nextn_key("qwen35moe") {
+                *value = GgufValue::U32(5);
+            }
+        }
+        let (index, _) = read_back_owned(&kvs, &tensors);
+        let err = Qwen3NextParams::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ModelError::Config {
+                    field,
+                    reason: ConfigReason::Exceeds { max: 5 },
+                    ..
+                } if field == nextn_key("qwen35moe")
+            ),
+            "{err}"
+        );
+    }
+
+    /// SC-003: a GGUF header without `rope.freq_base` is refused as `Missing`, naming the key; it
+    /// has no default base. Mutation: set `SPEC.gguf_theta` to `Some(10_000_000.0)`.
+    #[test]
+    fn a_gguf_without_a_rope_base_is_refused() {
+        let fx = fixture();
+        let (mut kvs, tensors) = gguf_of(&fx, false);
+        kvs.retain(|(key, _)| key != "qwen35moe.rope.freq_base");
+        let (index, _) = read_back_owned(&kvs, &tensors);
+        let err = Qwen3NextParams::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ModelError::Config {
+                    field: "qwen35moe.rope.freq_base",
+                    reason: ConfigReason::Missing,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 }

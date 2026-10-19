@@ -188,14 +188,14 @@ fn submit_stops_forwarding_when_client_disconnects() {
 #[test]
 fn stop_list_accepts_string_or_array() {
     assert_eq!(
-        Stop::list(&Some(Stop::One("a".into()))),
+        Stop::list(&Some(Stop::One("a".into()))).unwrap(),
         vec!["a".to_string()]
     );
     assert_eq!(
-        Stop::list(&Some(Stop::Many(vec!["a".into(), "b".into()]))),
+        Stop::list(&Some(Stop::Many(vec!["a".into(), "b".into()]))).unwrap(),
         vec!["a".to_string(), "b".to_string()]
     );
-    assert!(Stop::list(&None).is_empty());
+    assert!(Stop::list(&None).unwrap().is_empty());
 }
 
 #[test]
@@ -204,13 +204,13 @@ fn stop_list_truncates_unbounded_stop_array_to_cap() {
     // limit -> millions of short strings); each drives an O(stops * text) per-token scan. `Stop::list`
     // must clamp the count at the boundary so the per-token cost stays a trivial constant.
     let many: Vec<String> = (0..10_000).map(|i| format!("s{i}")).collect();
-    let out = Stop::list(&Some(Stop::Many(many.clone())));
+    let out = Stop::list(&Some(Stop::Many(many.clone()))).unwrap();
     assert_eq!(out.len(), MAX_STOP_SEQUENCES, "stop count must be capped");
     // Truncation keeps the FIRST N (a prefix of the client's list), not a reordering.
     assert_eq!(out, many[..MAX_STOP_SEQUENCES]);
     // At or under the cap, the list is untouched.
     let few: Vec<String> = (0..MAX_STOP_SEQUENCES).map(|i| format!("s{i}")).collect();
-    assert_eq!(Stop::list(&Some(Stop::Many(few.clone()))), few);
+    assert_eq!(Stop::list(&Some(Stop::Many(few.clone()))).unwrap(), few);
 }
 
 #[test]

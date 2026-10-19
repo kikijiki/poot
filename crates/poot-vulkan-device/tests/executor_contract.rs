@@ -39,9 +39,9 @@ fn compile_for_vulkan(body: &poot_kernel_ir::Body, name: &str) -> CompiledKernel
     std::fs::create_dir_all(&dir).unwrap();
     let target = poot_codegen::Target::SpirvVulkan;
     let out = poot_codegen::artifact_path(&dir, name, target);
-    poot_codegen::compile(body, target, &out).expect("compile SPIR-V");
-    let spv = std::fs::read(&out).unwrap();
-    poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, spv)
+    let artifact = poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out)
+        .expect("compile SPIR-V");
+    poot_codegen::kernel_handle(body, &artifact).unwrap()
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {

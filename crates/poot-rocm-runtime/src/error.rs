@@ -170,17 +170,17 @@ pub enum RocmError {
         /// Bytes per element of the buffer.
         element_bytes: usize,
     },
-    /// A dispatch received a kernarg allocation whose capacity does not match the kernel ABI.
+    /// More buffers were bound than the kernel's kernarg segment has room for (16 bytes each).
     #[error(
-        "{op} kernarg size mismatch: kernel requires {expected} bytes, buffer has {actual} bytes"
+        "{op}: {slots} pointer/length pairs do not fit the kernel's {segment}-byte kernarg segment"
     )]
-    KernargSizeMismatch {
+    KernargSlotsExceedSegment {
         /// The runtime entry point that refused.
         op: &'static str,
-        /// Kernarg segment size the kernel ABI requires, in bytes.
-        expected: usize,
-        /// Capacity of the supplied kernarg allocation, in bytes.
-        actual: usize,
+        /// How many buffers the caller tried to bind.
+        slots: usize,
+        /// The kernel's kernarg segment size, in bytes.
+        segment: usize,
     },
     /// The queue's packet-ring memory and host-link facts could not be validated into a safe
     /// publication contract.

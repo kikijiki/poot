@@ -21,15 +21,20 @@ One place for `poot-serve` command-line options. Every setting is a flag: no env
 | `--draft-mtp K` | off | Speculate with the served model's own multi-token-prediction layer, `K` tokens a round. `K` is a positive integer and has no default. Exclusive with `--draft-lookup` and `--draft-model`. Startup is refused, with the driver's typed error, for a model with no MTP layer, one whose MTP layer carries recurrent state, adapters, beam search, and a device group (`--placement pipeline:` or `tensor:`). See [Speculative decoding](./speculative-decoding.md). |
 | `--chat-template JINJA`     | off                                 | Render chats through this jinja template instead of the model's own. A value with no jinja syntax names a built-in template, which poot lacks, and is refused at startup, as is a template that does not compile. A template that fails to render a request's conversation answers that request with an error; it never falls back to another format. Exclusive with `--chat-template-file`. Not supported for a vision-language checkpoint (SmolVLM), whose image chats render through the checkpoint's own template: startup refuses the flag there. |
 | `--chat-template-file FILE` | off                                 | Read the jinja chat template from `FILE`, with the same refusals as `--chat-template`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `--rows N`                  | `4` (decoder), `32` (encoder)       | Rows the engine is fitted for: concurrent sequences of a generative model, texts per request of an embedding or reranking model (a decoder's embeddings take the same rows). At least 1. The memory fit halves it until the workload fits, and `/health` reports the rows it settled on. |
+| `--max-seq N`               | `4096`                              | Positions per sequence of a generative model, or tokens per text of an embedding or reranking model, capped at the model's own limit. At least 1. The memory fit halves it (to a floor of 128) until the workload fits, and `/health` reports the value it settled on. |
 | `--expert-pool ROWS`        | off                                 | Page every routed expert table through a pool of `ROWS` resident rows per layer: the experts a step selects are made resident before they are read, least recently used rows making room. `ROWS` is at least the experts one token selects and below the model's expert count; a dense model is refused.                                                                                                                                                                                                                                               |
 
 Any `--` option not listed here is refused at startup. The three draft flags are mutually exclusive. A model whose recurrent state advances in granules of more than one token cannot speculate, and neither can a draft model with recurrent state, so a draft flag on either is refused at startup; `--draft-mtp` has the further refusals in its row above (see [Speculative decoding](./speculative-decoding.md#what-is-refused)).
 
 The listener opens once the model is prepared on the device, so a client gets connection refused while the server
 starts. `/health` is then `200` with `"status": "serving"` and the `backend`, `rows` and `max_seq` the engine plan
-settled on. `serving` means the device plan was admitted and the engine thread is running. A model whose entries
-are prepared on first use (a BERT encoder or cross-encoder) is refused at startup, because its device memory
-cannot be planned.
+settled on. `serving` means the device plan was admitted and the engine thread is running. An embedding or
+reranking model (a BERT encoder or cross-encoder, or any checkpoint whose output is hidden states or scores)
+is planned the same way as a generative one, and a decoder's embedding pass is planned beside its decode shapes:
+the encode shapes are fitted and prepared before `serving`, and a request never compiles or allocates on the
+device. One that does not fit stops startup with the capacity
+error.
 
 Logging uses `RUST_LOG` (default `info`). `SIGINT`/`SIGTERM` stop accepting connections and drain in-flight requests.
 

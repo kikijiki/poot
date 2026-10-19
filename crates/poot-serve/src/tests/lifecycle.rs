@@ -172,7 +172,7 @@ fn a_failed_encode_step_is_an_error_response_for_embeddings_and_rerank() {
         ),
     ] {
         let metrics = Arc::new(test_metrics("encode-failure"));
-        let mut fake = counting_engine(1);
+        let mut fake = counting_engine(8);
         fake.on_encode = Box::new(|_| Err(EngineError::Fault("device lost".into())));
         let (served, engine) = serve_with_fake(fake, Arc::clone(&model), &metrics);
         let response = roundtrip(&served, &metrics, "POST", path, body);
@@ -698,7 +698,7 @@ fn embeddings_and_rerank_go_through_encode_and_appear_in_the_request_metrics() {
             .len()
     };
     let metrics = Arc::new(test_metrics("encode-metrics"));
-    let (served, engine) = serve_with_fake(counting_engine(1), Arc::clone(&model), &metrics);
+    let (served, engine) = serve_with_fake(counting_engine(8), Arc::clone(&model), &metrics);
     let embeddings = roundtrip(
         &served,
         &metrics,
@@ -754,7 +754,7 @@ fn a_served_embeddings_request_is_answered_by_the_engine_thread() {
     type Ran = Vec<(std::thread::ThreadId, Vec<EncodeRow>)>;
     let ran_on: Arc<Mutex<Ran>> = Arc::default();
     let hook_ran_on = Arc::clone(&ran_on);
-    let mut fake = counting_engine(1);
+    let mut fake = counting_engine(8);
     fake.on_encode = Box::new(move |rows| {
         hook_ran_on
             .lock()
@@ -936,7 +936,7 @@ fn a_multimodal_job_opens_with_its_rows_and_skips_prefix_matching() {
 fn every_restored_route_answers_on_the_fixture() {
     let model = tiny_model();
     let metrics = Arc::new(test_metrics("restored-routes"));
-    let (served, engine) = serve_with_fake(counting_engine(1), Arc::clone(&model), &metrics);
+    let (served, engine) = serve_with_fake(counting_engine(8), Arc::clone(&model), &metrics);
     let rendered_tokens = |content: &str| {
         let msgs = serde_json::json!([{"role": "user", "content": content}]);
         let rendered = model.text().render_chat_value(&msgs, None).unwrap();
@@ -1077,7 +1077,7 @@ fn embeddings_are_pooled_and_normalized_and_every_option_is_honored_or_refused()
         vec![mean / norm, 1.0 / norm]
     };
     let metrics = Arc::new(test_metrics("embedding-values"));
-    let (served, engine) = serve_with_fake(counting_engine(1), Arc::clone(&model), &metrics);
+    let (served, engine) = serve_with_fake(counting_engine(8), Arc::clone(&model), &metrics);
     let response = roundtrip(
         &served,
         &metrics,
@@ -1189,7 +1189,7 @@ fn rerank_orders_documents_by_cosine_and_top_n_cuts_the_list() {
         .collect();
     want.sort_by(|x, y| y.1.total_cmp(&x.1));
     let metrics = Arc::new(test_metrics("rerank-order"));
-    let (served, engine) = serve_with_fake(counting_engine(1), Arc::clone(&model), &metrics);
+    let (served, engine) = serve_with_fake(counting_engine(8), Arc::clone(&model), &metrics);
     let response = roundtrip(
         &served,
         &metrics,
@@ -1740,15 +1740,38 @@ mod device {
         drop(engine);
     }
 
-    /// `Encode` jobs on the engine the server builds (the planned paged pool, started through
-    /// `EnginePlan::build`) after the engine served a request: each batch comes back as a fresh driver's
-    /// `Driver::encode` returns it, element for element, and the published caps now report the encode
-    /// entry. The batches differ in rows and padded length, which the real server meets on its second
-    /// request: a decoder's encode graph carries a cache of its own extent, so each shape needs an
-    /// executable of its own. The step runs with no sequence open (the loop's rule), on a driver that has
-    /// served, and the engine serves again afterwards.
+    /// A BERT-class encoder checkpoint starts through `EnginePlan::build` (its encode shapes fitted and
+    /// prepared before `Serving`) and serves on the device (POOT-1204 SC-003). `Encode` jobs on that
+    /// engine come back as a fresh driver's `Driver::encode` returns them, element for element, for
+    /// batches that differ in rows and padded length; the caps report the encode shapes; a
+    /// `/v1/embeddings` request through the production `http::handle` returns the pooled, unit-length
+    /// vector of the same hidden states; and nothing compiles after `Serving`. Mutation: restore the
+    /// startup refusal of encoders in `EnginePlan::build`; the engine does not start.
+    fn an_encoder_checkpoint_serves_embeddings_on_the_device(choice: BackendChoice) {
+        let handle = crate::tests::encoder_routes::encoder_handle(None);
+        encode_jobs_match_a_fresh_driver(choice, handle, 16, Some("w3 w17 w40"));
+    }
+
+    /// `Encode` jobs on the engine the server builds for a decoder (the planned paged pool plus its
+    /// fitted encode shapes, started through `EnginePlan::build`), after the engine served a request:
+    /// each batch comes back as a fresh driver's `Driver::encode` returns it, element for element, the
+    /// published caps report the encode shapes before any request, the step runs with no sequence open
+    /// on a driver that has served, nothing compiles after `Serving`, and the engine serves again
+    /// afterwards. Mutation: prepare encode entries lazily (skip them in the plan): the caps assertion
+    /// and the compile count go red.
     fn an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode(choice: BackendChoice) {
         let (handle, _) = qwen2();
+        encode_jobs_match_a_fresh_driver(choice, handle, 64, None);
+    }
+
+    /// The shared body: `positions` is the model's context. With `text` (an encoder), also a
+    /// `/v1/embeddings` request; without it (a decoder), generation requests around the encodes.
+    fn encode_jobs_match_a_fresh_driver(
+        choice: BackendChoice,
+        handle: Arc<ModelHandle>,
+        positions: usize,
+        text: Option<&str>,
+    ) {
         let batch = |rows: &[&[u32]]| -> Vec<EncodeRow> {
             rows.iter()
                 .map(|ids| EncodeRow {
@@ -1762,12 +1785,23 @@ mod device {
             batch(&[&[3], &[8, 25, 11, 2, 9, 4, 6, 1, 5, 7], &[40, 12]]),
             batch(&[&[3, 17, 40], &[8, 25, 11, 2, 9]]),
         ];
+        let rows = if text.is_some() {
+            crate::config::DEFAULT_ENCODE_ROWS
+        } else {
+            crate::config::DEFAULT_ROWS
+        };
+        let text = text.map(str::to_owned);
         let (tx, rx) = mpsc::channel::<EngineMsg>();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (compiles_tx, compiles_rx) = mpsc::channel();
         let metrics = Arc::new(test_metrics("encode-device"));
         let thread = {
-            let (handle, metrics, batches) =
-                (Arc::clone(&handle), Arc::clone(&metrics), batches.clone());
+            let (handle, metrics, batches, text) = (
+                Arc::clone(&handle),
+                Arc::clone(&metrics),
+                batches.clone(),
+                text.clone(),
+            );
             std::thread::spawn(move || {
                 // Every executor opens before any runs (the ROCm runtime does not survive a second open
                 // after a drop).
@@ -1776,27 +1810,49 @@ mod device {
                     let _ = ready_tx.send(None);
                     return;
                 };
-                let mut fresh = Driver::new(Arc::clone(&handle), oracle_executor, options(8, 64))
-                    .expect("driver");
+                let args = EngineArgs::new(choice, DraftPolicy::Off);
+                let mut fresh =
+                    Driver::new(Arc::clone(&handle), oracle_executor, options(8, positions))
+                        .expect("driver");
+                fresh
+                    .prepare_encode(&poot_llm::driver::EncodeShapes {
+                        rows,
+                        max_len: NonZeroUsize::new(positions).unwrap(),
+                    })
+                    .expect("the fresh driver prepares the same shapes");
+                let encode = |fresh: &mut Driver, rows: &[EncodeRow]| {
+                    let driver_rows: Vec<DriverRow<'_>> = rows
+                        .iter()
+                        .map(|row| DriverRow::Tokens {
+                            ids: &row.ids,
+                            types: &row.types,
+                        })
+                        .collect();
+                    fresh
+                        .encode(&EncodeRequest { rows: &driver_rows })
+                        .expect("the fresh driver encodes")
+                };
                 let want: Vec<_> = batches
                     .iter()
-                    .map(|rows| {
-                        let driver_rows: Vec<DriverRow<'_>> = rows
-                            .iter()
-                            .map(|row| DriverRow::Tokens {
-                                ids: &row.ids,
-                                types: &row.types,
-                            })
-                            .collect();
-                        fresh
-                            .encode(&EncodeRequest { rows: &driver_rows })
-                            .expect("the fresh driver encodes")
-                    })
+                    .map(|rows| encode(&mut fresh, rows))
                     .collect();
+                let sentence = text.as_deref().map(|text| {
+                    let tokens = handle
+                        .text()
+                        .encode_for_encoder(text, None)
+                        .expect("the fixture tokenizes the text");
+                    encode(
+                        &mut fresh,
+                        &[EncodeRow {
+                            ids: tokens.ids,
+                            types: tokens.types,
+                        }],
+                    )
+                });
                 let health = EngineHealth::starting();
                 let mut executor = Some(served_executor);
                 let started = EnginePlan::build(
-                    &EngineArgs::new(choice, DraftPolicy::Off),
+                    &args,
                     &handle,
                     |_| Ok(Opened::One(executor.take().expect("opened once"))),
                     device_budget,
@@ -1810,33 +1866,49 @@ mod device {
                     }
                     Err(error) => panic!("the engine starts: {error}"),
                 };
+                let compiles = driver.stats().compiles;
                 let view = EngineView::new(plan.caps.clone());
                 ready_tx
-                    .send(Some((want, view.clone())))
+                    .send(Some((want, sentence, view.clone(), compiles)))
                     .expect("report the oracle");
-                run_engine_thread(
+                let engine = run_engine_thread(
                     DriverEngine::new(driver, handle, view),
                     rx,
                     &metrics,
                     &health,
                 );
+                compiles_tx
+                    .send((compiles, engine.compiles()))
+                    .expect("the compile counts reach the test");
             })
         };
         let engine = Engine::new(tx, thread);
         let tx = engine.queue();
-        let Some((want, view)) = ready_rx.recv().expect("the engine thread starts") else {
+        let Some((want, sentence, view, _)) = ready_rx.recv().expect("the engine thread starts")
+        else {
             return;
         };
-        assert!(
-            !view.caps().inputs.encode,
-            "no encode entry is prepared before the first encode"
+        let fitted = view
+            .caps()
+            .encode
+            .expect("the caps carry the encode shapes");
+        assert_eq!(
+            (fitted.rows.get(), fitted.lengths.last().map(|l| l.get())),
+            (rows.get(), Some(positions)),
+            "the caps carry the shapes before any request"
         );
-        // The engine serves a request first: its sequence opens and closes before the encode step.
-        run(
-            tx,
-            &metrics,
-            greedy_request(PROMPT.to_vec(), AdapterRef::Base),
-        );
+        assert!(view.caps().inputs.encode, "encode entries are prepared");
+        let generates = |tx: &mpsc::Sender<EngineMsg>| {
+            let done = run(
+                tx,
+                &metrics,
+                greedy_request(PROMPT.to_vec(), AdapterRef::Base),
+            );
+            assert!(!done.tokens.is_empty());
+        };
+        if text.is_none() {
+            generates(tx);
+        }
         for (index, (rows, want)) in batches.into_iter().zip(&want).enumerate() {
             let got =
                 submit_encode(tx, &metrics, rows, &|| false).expect("the encode job completes");
@@ -1853,18 +1925,47 @@ mod device {
                 }
             }
         }
-        assert!(
-            view.caps().inputs.encode,
-            "the first encode published the entry it prepared"
-        );
-        // The engine keeps serving after the encodes.
-        let again = run(
-            tx,
-            &metrics,
-            greedy_request(PROMPT.to_vec(), AdapterRef::Base),
-        );
-        assert!(!again.tokens.is_empty());
+        if let (Some(text), Some(sentence)) = (&text, sentence) {
+            // The route: /v1/embeddings through the production handler returns the pooled sentence vector.
+            let served = Served {
+                model: Arc::clone(&handle),
+                engine: tx.clone(),
+                view,
+                pooling: poot_llm::encoders::Pooling::Mean,
+                images: None,
+                max_queue_wait: crate::tests::TEST_QUEUE_WAIT,
+            };
+            let response = roundtrip(
+                &served,
+                &metrics,
+                "POST",
+                "/v1/embeddings",
+                &format!(r#"{{"input":"{text}"}}"#),
+            );
+            assert_eq!(status_line(&response), "HTTP/1.1 200 OK", "{response}");
+            let embedding: Vec<f32> = json_body(&response)["data"][0]["embedding"]
+                .as_array()
+                .expect("an embedding")
+                .iter()
+                .map(|v| v.as_f64().expect("a number") as f32)
+                .collect();
+            let expected = poot_llm::encoders::pool(
+                &sentence.rows[0],
+                sentence.width,
+                poot_llm::encoders::Pooling::Mean,
+            );
+            assert_eq!(
+                embedding, expected,
+                "the route's vector is the pooled hidden states"
+            );
+            drop(served);
+        } else {
+            // The engine keeps serving after the encodes.
+            generates(tx);
+        }
         drop(engine);
+        let (at_serving, at_end) = compiles_rx.recv().expect("the engine thread ended cleanly");
+        assert_eq!(at_end, at_serving, "nothing compiles after Serving");
     }
 
     /// A PEFT adapter directory over every projection of every layer of the fixture, rank 2, `alpha` scaled:
@@ -2164,6 +2265,11 @@ mod device {
         a_multimodal_job_through_the_loop_matches_generate_with_embeds,
         a_multimodal_job_through_the_loop_matches_generate_with_embeds_wgpu,
         a_multimodal_job_through_the_loop_matches_generate_with_embeds_rocm
+    );
+    per_backend!(
+        an_encoder_checkpoint_serves_embeddings_on_the_device,
+        an_encoder_checkpoint_serves_embeddings_on_the_device_wgpu,
+        an_encoder_checkpoint_serves_embeddings_on_the_device_rocm
     );
     per_backend!(
         an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode,

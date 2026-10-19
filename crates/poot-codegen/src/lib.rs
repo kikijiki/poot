@@ -42,13 +42,11 @@ pub use aie::{
     AieAbiMismatch, AieCompileError, AieCompiled, AieFifo, AieIdentity, AieLinkRecipe, AieStage,
     AieTile, AieToolIdentity, AieTools, FifoEnd, RecipeFault, compile_aie,
 };
-pub use cache::{
-    Artifact, ArtifactTooLarge, KernelCache, KernelKey, epoch as kernel_cache_epoch,
-    kernel_cache_root,
-};
+pub use cache::{ArtifactTooLarge, KernelCache, KernelId, KernelKey, epoch as kernel_cache_epoch};
 pub use emit::emit_llvm_ir;
 pub use handle::{
-    GpuTarget, NoBodyTarget, NotAByteTarget, aie_kernel_handle, kernel_handle, vpu_kernel_handle,
+    ArtifactMismatch, CompiledArtifact, GpuTarget, NoBodyTarget, NotAByteTarget, aie_kernel_handle,
+    compile_kernel, kernel_handle, vpu_kernel_handle,
 };
 use poot_target::AmdArch;
 pub use spirv_postprocess::NoContractionError;
@@ -261,6 +259,9 @@ pub enum CompileError {
     /// published.
     #[error(transparent)]
     ArtifactTooLarge(#[from] cache::ArtifactTooLarge),
+    /// The cache is for a target whose kernel is not a byte artifact.
+    #[error(transparent)]
+    NotAByteTarget(#[from] NotAByteTarget),
 }
 
 /// Emit + `llc` a body to a target artifact written at `out`. Returns the emitted LLVM IR (for debugging

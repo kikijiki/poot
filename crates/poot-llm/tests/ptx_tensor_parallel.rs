@@ -15,7 +15,8 @@
 use std::sync::Arc;
 
 use poot_executor::{Coordinator, Device, Engine, Executor, NoSync};
-use poot_executor_parity::{TIER2, assert_close};
+use poot_executor_parity::assert_close;
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::{IndexRange, Slot};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, ShardRule, multi_device::topology::DeviceId,
@@ -96,7 +97,8 @@ fn logits<E: Executor>(
         .collect()
 }
 
-fn single_device(mapped: &MappedModel, steps: &[Step]) -> Vec<Vec<f32>> {
+/// The single-device program's logits for `steps`, and the numerics class that program publishes.
+fn single_device(mapped: &MappedModel, steps: &[Step]) -> (Vec<Vec<f32>>, Tier2Class) {
     let device = PtxDevice::open(0).unwrap();
     let target = device.target();
     let mut engine = Engine::new(device);
@@ -115,7 +117,10 @@ fn single_device(mapped: &MappedModel, steps: &[Step]) -> Vec<Vec<f32>> {
     )
     .expect("the fixture compiles on one device");
     let entry = engine.add_entry(exe, &program).unwrap();
-    logits(&mut engine, exe, entry, steps)
+    (
+        logits(&mut engine, exe, entry, steps),
+        program.numerics_class(),
+    )
 }
 
 /// A tensor-parallel coordinator that has prepared the fixture's decode entry on both devices.
@@ -173,7 +178,7 @@ fn assert_tensor_parallel_matches_single(
     label: &str,
 ) {
     let steps = decode(&TOKENS);
-    let want = single_device(mapped, &steps);
+    let (want, want_class) = single_device(mapped, &steps);
     assert!(
         want.windows(2).any(|pair| pair[0] != pair[1]),
         "{label}: constant logits prove nothing"
@@ -185,8 +190,9 @@ fn assert_tensor_parallel_matches_single(
         "{label}: the ranks exchange partial sums"
     );
     let got = logits(&mut group.coordinator, group.exe, group.entry, &steps);
+    let tolerance = want_class.max(group.program.numerics_class()).tolerance();
     for (step, (got, want)) in got.iter().zip(&want).enumerate() {
-        assert_close(got, want, TIER2, &format!("{label}: step {step}"));
+        assert_close(got, want, tolerance, &format!("{label}: step {step}"));
     }
     let counters = group.coordinator.counters();
     assert_eq!(

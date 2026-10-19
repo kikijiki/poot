@@ -1,5 +1,5 @@
 use crate::{
-    DeviceStoreFence, KernelHandle, QueuePublicationContract, RocmBuffer, RocmContext, RocmError,
+    BoundKernarg, DeviceStoreFence, KernelHandle, QueuePublicationContract, RocmContext, RocmError,
     bindings, publication,
 };
 use std::ffi::c_void;
@@ -92,7 +92,7 @@ pub(crate) unsafe fn write_kernel_dispatch_packet_body(
 }
 
 /// The kernarg address a dispatch entry contributes to its AQL packet. Production dispatches carry a
-/// [`RocmBuffer`], whose allocation only a live [`RocmContext`] can create (its `Drop` frees HSA
+/// [`BoundKernarg`], whose allocation only a live [`RocmContext`] can create (its `Drop` frees HSA
 /// memory through the `ResourceOwner` that made it), while the ring writer needs nothing but the
 /// address - so a model-free test supplies a synthetic one instead of a production-shaped buffer
 /// constructor (plan 558-648).
@@ -101,9 +101,9 @@ pub(crate) trait KernargAddress {
     fn kernarg_address(&self) -> *mut c_void;
 }
 
-impl KernargAddress for RocmBuffer {
+impl KernargAddress for BoundKernarg {
     fn kernarg_address(&self) -> *mut c_void {
-        self.alloc.as_ptr()
+        self.kernarg().alloc.as_ptr()
     }
 }
 
@@ -111,7 +111,7 @@ impl KernargAddress for RocmBuffer {
 /// `device_store_fence` touch - the ring pointer, the dispatches, the completion signal and the
 /// header value - with no `RocmContext` field, so a model-free test can construct it over a synthetic
 /// ring and assert publication behavior instead of reading source (card 617). `K` is the dispatches'
-/// kernarg source: [`RocmBuffer`] in production, a test newtype in `tests.rs`.
+/// kernarg source: [`BoundKernarg`] in production, a test newtype in `tests.rs`.
 ///
 /// `ring` is the live queue's `base_address`, so every slot index passed here (masked by the
 /// validated power-of-two queue size, after the queue half's `wait_for_space` proved the packet
@@ -189,7 +189,7 @@ impl<K: KernargAddress> AqlRingWriter<'_, K> {
 pub(crate) struct LiveAqlChunkSink<'a> {
     pub(crate) context: &'a RocmContext,
     pub(crate) doorbell: bindings::hsa_signal_t,
-    pub(crate) writer: AqlRingWriter<'a, RocmBuffer>,
+    pub(crate) writer: AqlRingWriter<'a, BoundKernarg>,
 }
 
 impl publication::AqlChunkSink for LiveAqlChunkSink<'_> {

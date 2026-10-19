@@ -743,7 +743,16 @@ impl RocmContext {
     /// Write raw bytes into an owned kernarg allocation, through whichever pool it was allocated from
     /// (Card 547a). The representation and byte range are validated before pointer arithmetic or
     /// host/DMA copy.
-    pub fn write_raw_bytes(
+    ///
+    /// Crate-private: a kernarg's bytes are device addresses, so the one safe way to fill one is
+    /// [`Self::bind_kernarg`], which also keeps the addressed buffers alive.
+    ///
+    /// ```compile_fail,E0624
+    /// fn write(ctx: &poot_rocm_runtime::RocmContext, buffer: &poot_rocm_runtime::RocmBuffer) {
+    ///     let _ = ctx.write_raw_bytes(buffer, 0, &[0u8; 8]);
+    /// }
+    /// ```
+    pub(crate) fn write_raw_bytes(
         &self,
         buf: &RocmBuffer,
         byte_offset: usize,

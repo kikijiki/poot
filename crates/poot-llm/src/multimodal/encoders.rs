@@ -17,8 +17,8 @@ use poot_models::registry::Registry;
 
 use crate::driver::error::DriverError;
 use crate::driver::{
-    DraftPolicy, Driver, DriverOptions, EncodeRequest, EncodeRow, Encoded, LoadOptions,
-    ModelHandle, PreparedSetLimits, program_retention,
+    DraftPolicy, Driver, DriverOptions, EncodeRequest, EncodeRow, EncodeShapes, Encoded,
+    LoadOptions, ModelHandle, PreparedSetLimits, program_retention,
 };
 use poot_text::TextError;
 
@@ -41,6 +41,7 @@ pub enum EncoderError {
 fn open(
     dir: &Path,
     executor: Box<dyn Executor>,
+    rows: NonZeroUsize,
 ) -> Result<(Driver, Arc<ModelHandle>), EncoderError> {
     let handle = Arc::new(ModelHandle::load(
         dir,
@@ -64,7 +65,12 @@ fn open(
         draft: DraftPolicy::Off,
         hidden_window: None,
     };
-    Ok((Driver::new(Arc::clone(&handle), executor, options)?, handle))
+    let mut driver = Driver::new(Arc::clone(&handle), executor, options)?;
+    driver.prepare_encode(&EncodeShapes {
+        rows,
+        max_len: positions,
+    })?;
+    Ok((driver, handle))
 }
 
 /// How a sentence-transformers model pools the encoder's token hidden states into one sentence
@@ -137,9 +143,14 @@ pub struct SentenceEncoder {
 }
 
 impl SentenceEncoder {
-    /// The sentence-transformers checkpoint in `dir` on `executor`, pooled as its `1_Pooling` says.
-    pub fn load(dir: &Path, executor: Box<dyn Executor>) -> Result<Self, EncoderError> {
-        let (driver, handle) = open(dir, executor)?;
+    /// The sentence-transformers checkpoint in `dir` on `executor`, pooled as its `1_Pooling` says, ready
+    /// to encode up to `rows` texts at once.
+    pub fn load(
+        dir: &Path,
+        executor: Box<dyn Executor>,
+        rows: NonZeroUsize,
+    ) -> Result<Self, EncoderError> {
+        let (driver, handle) = open(dir, executor, rows)?;
         Ok(Self {
             driver,
             handle,
@@ -208,9 +219,14 @@ pub struct CrossEncoder {
 }
 
 impl CrossEncoder {
-    /// The `BertForSequenceClassification` checkpoint in `dir` on `executor`.
-    pub fn load(dir: &Path, executor: Box<dyn Executor>) -> Result<Self, EncoderError> {
-        let (driver, handle) = open(dir, executor)?;
+    /// The `BertForSequenceClassification` checkpoint in `dir` on `executor`, ready to score up to `rows`
+    /// pairs at once.
+    pub fn load(
+        dir: &Path,
+        executor: Box<dyn Executor>,
+        rows: NonZeroUsize,
+    ) -> Result<Self, EncoderError> {
+        let (driver, handle) = open(dir, executor, rows)?;
         Ok(Self { driver, handle })
     }
 

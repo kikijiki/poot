@@ -1030,8 +1030,10 @@ pub(crate) fn build_object_plan(
                 status,
                 stderr,
             },
-            CompileError::NoContraction(_) | CompileError::ArtifactTooLarge(_) => {
-                unreachable!("only SPIR-V post-processing and bounded cache reads raise this")
+            CompileError::NoContraction(_)
+            | CompileError::ArtifactTooLarge(_)
+            | CompileError::NotAByteTarget(_) => {
+                unreachable!("only SPIR-V post-processing and the byte-kernel cache raise this")
             }
         })?;
         let bytes = std::fs::read(&out)?;
@@ -1157,23 +1159,6 @@ pub(crate) fn link_object(
     )?)
 }
 
-/// A removed-on-drop private scratch directory beside the cache entries.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn create(cache: &KernelCache, key: &crate::KernelKey) -> std::io::Result<Self> {
-        let path = cache.scratch_path(key, "work");
-        std::fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// A linked AIE artifact and whether this call built it.
 #[derive(Debug)]
 pub struct AieCompiled {
@@ -1202,9 +1187,9 @@ pub fn compile_aie(
     let identity = AieIdentity::new(bodies, recipe, &tools);
     let key = identity.cache_key();
     let built = cache.load_or_build(&key, max_artifact_bytes, || {
-        let scratch = Scratch::create(cache, &key)?;
-        let plan = build_object_plan(bodies, recipe, toolchain, &scratch.0)?;
-        Ok::<_, AieCompileError>(link_object(&plan, &tools, target, &scratch.0)?.to_bytes())
+        let scratch = cache.work_dir(&key)?;
+        let plan = build_object_plan(bodies, recipe, toolchain, scratch.path())?;
+        Ok::<_, AieCompileError>(link_object(&plan, &tools, target, scratch.path())?.to_bytes())
     })?;
     let artifact = AieLinkedArtifact::from_bytes(&built.bytes, target)?;
     // The identity is a 64-bit digest pair: an entry that does not describe this request (a stale file or a

@@ -15,6 +15,7 @@ use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
 
 use super::block_table::BLOCK_SIZE;
 use super::chunks::Piece;
+use super::encode::{EncodeCaps, EncodeShapes};
 use super::error::{DriverError, InvalidOptions, InvalidRequest};
 use poot_load::lora::LoraAdapter;
 
@@ -150,6 +151,8 @@ pub struct DriverCaps {
     pub speculation: Option<SpeculationCaps>,
     /// Which input kinds the driver accepts.
     pub inputs: InputSet,
+    /// The token-row shapes [`Driver::prepare_encode`] admitted; `None` when none were.
+    pub encode: Option<EncodeCaps>,
 }
 
 impl Driver {
@@ -218,7 +221,7 @@ impl Driver {
             self.serving = Some(Serving::new(shapes.layout));
         }
         self.layout = Some(shapes.layout);
-        Ok(self.refresh_caps(shapes.layout))
+        Ok(self.refresh_caps(Some(shapes.layout)))
     }
 
     /// Capture an adapter set: the generation already holding it, or a new one with `adapters` stacked
@@ -275,9 +278,7 @@ impl Driver {
                 serving.evict_identities(&identities);
             }
         }
-        if let Some(layout) = self.layout {
-            self.refresh_caps(layout);
-        }
+        self.refresh_caps_if_published();
         outcome
     }
 
@@ -402,14 +403,14 @@ impl Driver {
                 }
             }
         }
-        Ok(self.refresh_caps(shapes.layout))
+        Ok(self.refresh_caps(Some(shapes.layout)))
     }
 
     /// Recompute the caps from the prepared entries of `layout`.
-    fn refresh_caps(&mut self, layout: Layout) -> &DriverCaps {
+    pub(super) fn refresh_caps(&mut self, layout: Option<Layout>) -> &DriverCaps {
         let kv = match layout {
-            Layout::Contiguous => KvLayout::Contiguous,
-            Layout::Paged(pool) => pool.kv(),
+            None | Some(Layout::Contiguous) => KvLayout::Contiguous,
+            Some(Layout::Paged(pool)) => pool.kv(),
         };
         let mut row_counts = Vec::new();
         let mut widths = Vec::new();
@@ -448,14 +449,18 @@ impl Driver {
         widths.sort();
         windows.sort_by_key(|w| (w.rows, w.width));
         self.caps.insert(DriverCaps {
-            rows: row_counts.last().copied().unwrap_or(NonZeroUsize::MIN),
+            rows: row_counts
+                .last()
+                .copied()
+                .or(self.encode_shapes.map(|shapes| shapes.rows))
+                .unwrap_or(NonZeroUsize::MIN),
             row_counts,
             widths,
             max_seq: self.options.capacity,
             kv,
             kv_blocks: match layout {
-                Layout::Contiguous => 0,
-                Layout::Paged(pool) => pool.blocks.get(),
+                None | Some(Layout::Contiguous) => 0,
+                Some(Layout::Paged(pool)) => pool.blocks.get(),
             },
             state: self.residency,
             heads,
@@ -475,14 +480,15 @@ impl Driver {
                     .keys()
                     .any(|key| key.role == ModelRole::Target && key.phase == Phase::Encode),
             },
+            encode: self.encode_shapes.map(EncodeShapes::caps),
         })
     }
 
     /// Republish the caps when a layout has been admitted: an entry prepared outside `prepare`
     /// (an encode step's) changes what the driver accepts.
     pub(super) fn refresh_caps_if_published(&mut self) {
-        if let Some(layout) = self.layout {
-            self.refresh_caps(layout);
+        if self.layout.is_some() || self.encode_shapes.is_some() {
+            self.refresh_caps(self.layout);
         }
     }
 

@@ -58,7 +58,7 @@ fn serve_encode(
     let asked: Arc<Mutex<Vec<Vec<crate::types::EncodeRow>>>> = Arc::default();
     let hook_asked = Arc::clone(&asked);
     let mut answer = answer;
-    let mut fake = RecordingEngine::new(1);
+    let mut fake = RecordingEngine::new(8);
     fake.on_encode = Box::new(move |rows| {
         hook_asked.lock().unwrap().push(rows.to_vec());
         Ok(answer(rows))
@@ -145,4 +145,69 @@ fn an_encoder_embedder_answers_embeddings_through_the_engine() {
             "{vector:?}"
         );
     }
+}
+
+/// POOT-1204 SC-002: a request of more texts than the fitted rows, or a text longer than the fitted
+/// length, is a 400 that names the cap and its flag, and the engine is never asked. A request inside
+/// the caps runs. Mutation: remove `check_encode_fit` from `handlers::encode`; the request reaches the
+/// fake, answers 200, and the row goes red.
+#[test]
+fn an_embeddings_request_over_the_fitted_shapes_is_a_400_naming_the_cap() {
+    let model = encoder_handle(None);
+    let caps = crate::tests::test_encoder_caps(2, 8);
+    let metrics = Arc::new(test_metrics("encoder-caps"));
+    let (served, engine) = crate::tests::serve_with_fake_caps(
+        RecordingEngine::new(2),
+        Arc::clone(&model),
+        caps,
+        &metrics,
+    );
+    let too_many = super::lifecycle::roundtrip(
+        &served,
+        &metrics,
+        "POST",
+        "/v1/embeddings",
+        r#"{"input":["w1","w2","w3"]}"#,
+    );
+    // Eight tokens fit; nine plus the encoder's special tokens do not.
+    let long = ["w1"; 9].join(" ");
+    let too_long = super::lifecycle::roundtrip(
+        &served,
+        &metrics,
+        "POST",
+        "/v1/embeddings",
+        &format!(r#"{{"input":"{long}"}}"#),
+    );
+    let fits = super::lifecycle::roundtrip(
+        &served,
+        &metrics,
+        "POST",
+        "/v1/embeddings",
+        r#"{"input":["w1","w2"]}"#,
+    );
+    let asked = engine.finish(served).events();
+    assert_eq!(
+        status_line(&too_many),
+        "HTTP/1.1 400 Bad Request",
+        "{too_many}"
+    );
+    assert!(
+        too_many.contains("3 texts exceed the 2 rows") && too_many.contains("--rows"),
+        "{too_many}"
+    );
+    assert_eq!(
+        status_line(&too_long),
+        "HTTP/1.1 400 Bad Request",
+        "{too_long}"
+    );
+    assert!(
+        too_long.contains("over the 8") && too_long.contains("--max-seq"),
+        "{too_long}"
+    );
+    assert_eq!(status_line(&fits), "HTTP/1.1 200 OK", "{fits}");
+    assert_eq!(
+        asked,
+        vec![super::recording_engine::Event::Encode { rows: 2 }],
+        "only the request inside the caps reached the engine"
+    );
 }

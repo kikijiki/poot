@@ -186,7 +186,9 @@ pub trait Device {
     type Buffer: 'static;
     /// A loaded kernel (wgpu pipeline source, HSA code object, CUfunction).
     type Kernel: 'static;
-    /// A recorded step: replayable without re-walking the program.
+    /// A recorded step: replayable without re-walking the program. A recording owns what it addresses:
+    /// the code and every buffer a recorded dispatch binds stay alive until the recording drops and
+    /// any batch it enqueued completes, whatever the caller does with its own handles.
     type Recording: 'static;
     /// The device's failure type; the engine wraps it into [`crate::DeviceError`].
     type Error: std::error::Error + Send + Sync + 'static;

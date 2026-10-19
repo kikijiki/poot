@@ -4,8 +4,9 @@
 //! A blob is only valid for the exact region and compiler that produced it, so a cache entry is keyed by the
 //! full identity (POOT-ADR-0112 decision 8): the target part, the vendor compiler's version, the compiler
 //! option string, and the region's OpenVINO text and constants (which carry every shape and dtype). The key
-//! is stored inside the entry, and a lookup compares it whole, so a hash collision or a truncated file is a
-//! miss and never a wrong blob.
+//! is stored inside the entry, and a lookup compares it whole, so a hash collision is a miss and never a wrong
+//! blob. A digest of the blob is stored beside it and checked on every lookup: the driver does not validate a
+//! native blob, so a truncated or corrupted file must be a miss before it reaches the device.
 
 use std::fs;
 use std::io::{self, Write};
@@ -16,7 +17,10 @@ use poot_runtime_common::VpuGraphArtifact;
 use poot_target::VendorCompilerId;
 
 /// The magic that opens every cache file; a different layout would change it.
-const MAGIC: &[u8] = b"poot-vpu-blob-v1\n";
+const MAGIC: &[u8] = b"poot-vpu-blob-v2\n";
+
+/// The length of the blake3 digest stored between the key and the blob.
+const DIGEST_LEN: usize = blake3::OUT_LEN;
 
 /// The identity of a compiled region.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +97,7 @@ impl BlobCache {
             file.write_all(MAGIC)?;
             file.write_all(&(key.text.len() as u64).to_le_bytes())?;
             file.write_all(key.text.as_bytes())?;
+            file.write_all(blake3::hash(blob).as_bytes())?;
             file.write_all(blob)?;
             file.sync_all()?;
             fs::rename(&temp, dir.join(name))
@@ -105,13 +110,17 @@ impl BlobCache {
     }
 }
 
-/// The blob inside a cache file, when the file is whole and its stored key is `key`.
+/// The blob inside a cache file, when the file is whole, its stored key is `key` and the blob matches its digest.
 fn decode<'a>(key: &BlobKey, bytes: &'a [u8]) -> Option<&'a [u8]> {
     let rest = bytes.strip_prefix(MAGIC)?;
     let (len, rest) = rest.split_first_chunk::<8>()?;
     let len = usize::try_from(u64::from_le_bytes(*len)).ok()?;
     let stored = rest.get(..len)?;
-    (stored == key.text.as_bytes()).then(|| &rest[len..])
+    if stored != key.text.as_bytes() {
+        return None;
+    }
+    let (digest, blob) = rest[len..].split_first_chunk::<DIGEST_LEN>()?;
+    (blake3::hash(blob).as_bytes() == digest).then_some(blob)
 }
 
 #[cfg(test)]
@@ -194,6 +203,31 @@ mod tests {
             blob.iter().all(|&b| b == blob[0]),
             "one writer's payload, not a mixture"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A flipped byte in the blob, or a file cut short, is a miss: the driver does not validate a native blob.
+    ///
+    /// Mutation: return the blob without comparing its digest in `decode`; the corrupted entry is returned.
+    #[test]
+    fn a_corrupted_or_truncated_blob_is_a_miss() {
+        let dir = std::env::temp_dir().join(format!("poot-blob-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = BlobCache::new(Some(dir.clone()));
+        let key = key();
+        cache.put(&key, b"a whole blob").unwrap();
+        assert_eq!(
+            cache.get(&key).unwrap().as_deref(),
+            Some(&b"a whole blob"[..])
+        );
+        let path = dir.join(key.file_name());
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(cache.get(&key).unwrap(), None, "a flipped byte is a miss");
+        bytes.truncate(bytes.len() - 6);
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(cache.get(&key).unwrap(), None, "a truncated blob is a miss");
         let _ = fs::remove_dir_all(&dir);
     }
 }

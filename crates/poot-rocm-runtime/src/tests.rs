@@ -15,7 +15,7 @@ use crate::context::{
 };
 use crate::discovery::agent_isa_name;
 use crate::error::{check, describe};
-use crate::hsaco::{ModuleConstruction, kernel_symbol_matches, validate_kernarg_buffer};
+use crate::hsaco::{ModuleConstruction, kernel_symbol_matches};
 use crate::owner::ResourceOwner;
 use crate::queue::{
     QueueCreationPlan, QueueProperties, QueueRequest, QueueRingProvenance, QueueRole,
@@ -250,10 +250,10 @@ fn mock_buffer_sharing_with(
 }
 
 /// A finished mock module whose executable destruction goes to `owner`, sharing `poison`.
-fn mock_module(owner: Arc<dyn ResourceOwner>, poison: DevicePoison, exec: u64) -> HsacoModule {
+fn mock_module(owner: Arc<dyn ResourceOwner>, poison: DevicePoison, exec: u64) -> Arc<HsacoModule> {
     let mut construction = ModuleConstruction::new(owner, poison);
     construction.executable = Some(bindings::hsa_executable_t { handle: exec });
-    construction.finish(0x1, 16, 0, 0, "kernel.kd".into(), Arc::from([]))
+    Arc::new(construction.finish(0x1, 64, 0, 0, "kernel.kd".into(), Arc::from([])))
 }
 
 fn is_release(event: &CleanupEvent) -> bool {
@@ -710,25 +710,35 @@ fn raw_byte_range_and_kernarg_size_reject_before_boundary_calls() {
         .expect_err("out-of-range raw-byte write must fail");
     assert!(matches!(error, RocmError::RangeOutOfBounds { .. }));
     assert_eq!(calls.get(), 0);
+}
 
-    let kernel = KernelHandle::for_test(0, 24, 0, 0, &[]);
-    assert!(matches!(
-        validate_kernarg_buffer("test_dispatch", &kernel, &raw),
-        Err(RocmError::KernargSizeMismatch {
-            expected: 24,
-            actual: 16,
-            ..
-        })
-    ));
-    let typed = test_buffer(24, BufferStorage::f32());
-    let Err(RocmError::RepresentationMismatch {
-        expected, actual, ..
-    }) = validate_kernarg_buffer("test_dispatch", &kernel, &typed)
+/// More pointer/length pairs than the kernel's kernarg segment holds are refused before any kernarg is
+/// allocated. Mutation: drop the `required <= segment` filter in `bind_kernarg`; the call then writes
+/// past the segment (or allocates a too-small one) and this row sees `Ok`.
+#[test]
+fn bind_kernarg_refuses_more_buffers_than_the_segment_holds() {
+    let Some(ctx) =
+        open_context_or_skip("bind_kernarg_refuses_more_buffers_than_the_segment_holds")
     else {
-        panic!("expected a RepresentationMismatch for a typed buffer bound as kernarg");
+        return;
     };
-    assert_eq!(expected, BufferStorage::raw_bytes());
-    assert_eq!(actual, BufferStorage::f32());
+    let kernel = KernelHandle::for_test(0, 24, 0, 0, &[]);
+    let a = ctx.allocate_f32(4, BufferRole::Input).expect("allocate a");
+    let b = ctx.allocate_f32(4, BufferRole::Input).expect("allocate b");
+    let refused = ctx.bind_kernarg(&kernel, &[(&a, 4), (&b, 4)]);
+    assert!(
+        matches!(
+            refused,
+            Err(RocmError::KernargSlotsExceedSegment {
+                slots: 2,
+                segment: 24,
+                ..
+            })
+        ),
+        "got {refused:?}"
+    );
+    ctx.bind_kernarg(&kernel, &[(&a, 4)])
+        .expect("one pair fits a 24-byte segment");
 }
 
 #[test]
@@ -986,9 +996,9 @@ fn write_index(ctx: &RocmContext) -> u64 {
 
 /// A kernel handle and matching kernarg buffer for calls that must be refused or fail before any
 /// packet is written. `kernel_object` 0 is never executed by these tests.
-fn unexecuted_dispatch(ctx: &RocmContext) -> (KernelHandle, RocmBuffer) {
+fn unexecuted_dispatch(ctx: &RocmContext) -> (KernelHandle, BoundKernarg) {
     let kernel = KernelHandle::for_test(0, 64, 0, 0, &[]);
-    let kernarg = ctx.allocate_kernarg(64).expect("allocate_kernarg");
+    let kernarg = ctx.bind_kernarg(&kernel, &[]).expect("bind_kernarg");
     (kernel, kernarg)
 }
 
@@ -1223,18 +1233,12 @@ fn dispatch_timeout_keeps_code_object_and_argument_allocations() {
         .allocate_f32(64, BufferRole::Activation)
         .expect("allocate_f32");
     let kernarg = ctx
-        .allocate_kernarg(kernel.kernarg_size() as usize)
-        .expect("allocate_kernarg");
-    let mut args = Vec::new();
-    for buffer in [&data, &recorded_data] {
-        args.extend_from_slice(&buffer.device_ptr().to_le_bytes());
-    }
-    ctx.write_raw_bytes(&kernarg, 0, &args)
-        .expect("write kernarg");
+        .bind_kernarg(&kernel, &[(&data, 64), (&recorded_data, 1)])
+        .expect("bind_kernarg");
     let live_with_arguments = memory.total_live_bytes();
     assert_eq!(
         live_with_arguments,
-        live_before + data.byte_capacity() as u64 + kernarg.byte_capacity() as u64,
+        live_before + data.byte_capacity() as u64 + kernel.kernarg_size() as u64,
         "exactly the new data and kernarg allocations must be live"
     );
     claim_every_queue_slot(&ctx);
@@ -1262,6 +1266,82 @@ fn dispatch_timeout_keeps_code_object_and_argument_allocations() {
         memory.total_live_bytes(),
         live_with_arguments,
         "the kernarg and data allocations must stay live after their last handles drop"
+    );
+}
+
+/// POOT-1206 SC-001: a [`KernelHandle`] shares its module, so dropping the caller's module handle does
+/// not destroy the executable a handle's packets name by address; the last handle to drop does.
+/// Mutation: make the handle store the raw `kernel_object` again (no `Arc` of the module); the first
+/// release check then sees the executable destroyed while the handle lives (and the strong count is 1).
+#[test]
+fn a_kernel_handle_keeps_its_module_alive_after_the_caller_drops_it() {
+    let Some(ctx) =
+        open_context_or_skip("a_kernel_handle_keeps_its_module_alive_after_the_caller_drops_it")
+    else {
+        return;
+    };
+    let (owner, events) = recording_owner(1206);
+    let module = mock_module(Arc::clone(&owner), ctx.timeouts.device_poison(), 0x1206);
+    let kernel = ctx.lookup_kernel(&module, "kernel").expect("lookup_kernel");
+    assert_eq!(
+        Arc::strong_count(&module),
+        2,
+        "the handle must share the module"
+    );
+
+    drop(module);
+    let releases: Vec<CleanupEvent> = recorded(&events).into_iter().filter(is_release).collect();
+    assert_eq!(
+        releases,
+        vec![],
+        "a live kernel handle must keep the code object loaded"
+    );
+
+    drop(kernel);
+    let releases: Vec<CleanupEvent> = recorded(&events).into_iter().filter(is_release).collect();
+    assert_eq!(
+        releases,
+        vec![CleanupEvent::Executable {
+            runtime: 1206,
+            handle: 0x1206,
+        }],
+        "the last handle drops the module and destroys its executable exactly once"
+    );
+}
+
+/// POOT-1206 SC-002 (runtime half): a bound kernarg owns every data buffer it addresses, so the
+/// caller dropping its own handle does not free the allocation; dropping the kernarg does.
+/// Mutation: build the `BoundKernarg` without the buffer clones; the first live-bytes check sees the
+/// allocation already freed.
+#[test]
+fn dropping_a_bound_buffer_keeps_its_allocation_until_the_kernarg_drops() {
+    let Some(ctx) = open_context_or_skip(
+        "dropping_a_bound_buffer_keeps_its_allocation_until_the_kernarg_drops",
+    ) else {
+        return;
+    };
+    let kernel = KernelHandle::for_test(0, 64, 0, 0, &[]);
+    let memory = ctx.hsa.memory.clone();
+    let live_before = memory.snapshot(BufferRole::Activation).live_bytes;
+    let data = ctx
+        .allocate_f32(64, BufferRole::Activation)
+        .expect("allocate_f32");
+    let data_bytes = data.byte_capacity() as u64;
+    let bound = ctx
+        .bind_kernarg(&kernel, &[(&data, 64)])
+        .expect("bind_kernarg");
+
+    drop(data);
+    assert_eq!(
+        memory.snapshot(BufferRole::Activation).live_bytes,
+        live_before + data_bytes,
+        "the bound kernarg must keep the dropped buffer's allocation live"
+    );
+    drop(bound);
+    assert_eq!(
+        memory.snapshot(BufferRole::Activation).live_bytes,
+        live_before,
+        "dropping the kernarg releases the allocation"
     );
 }
 
@@ -2086,7 +2166,7 @@ fn compile_and_load(
     ctx: &RocmContext,
     name: &str,
     body: &poot_kernel_ir::Body,
-) -> (HsacoModule, poot_runtime_common::CompiledKernel) {
+) -> (Arc<HsacoModule>, poot_runtime_common::CompiledKernel) {
     let arch =
         poot_target::AmdArch::from_isa_name(ctx.isa_name(), ctx.wavefront()).unwrap_or_else(|e| {
             panic!(
@@ -2101,35 +2181,27 @@ fn compile_and_load(
     ));
     std::fs::create_dir_all(&dir).expect("create fixture artifact dir");
     let out = poot_codegen::artifact_path(&dir, name, target);
-    poot_codegen::compile(body, target, &out).unwrap_or_else(|e| panic!("compile {name}: {e}"));
-    let bytes = std::fs::read(&out).unwrap_or_else(|e| panic!("read compiled {name}: {e}"));
-    let kernel = poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::AmdGcn(arch), bytes);
+    let artifact = poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::AmdGcn(arch), &out)
+        .unwrap_or_else(|e| panic!("compile {name}: {e}"));
+    let kernel = poot_codegen::kernel_handle(body, &artifact).unwrap();
     let module = ctx
         .load_hsaco(&kernel)
         .unwrap_or_else(|e| panic!("load_hsaco {name}: {e}"));
     (module, kernel)
 }
 
-/// Write an `add`-shaped kernarg: 3 `(ptr: u64, len: u64)` pairs (a, b, c), matching `add_kernel`'s
+/// Bind an `add`-shaped kernarg: 3 `(ptr: u64, len: u64)` pairs (a, b, c), matching `add_kernel`'s
 /// declaration order.
-fn write_add_kernarg(
+fn bind_add_kernarg(
     ctx: &RocmContext,
-    kernarg: &RocmBuffer,
+    kernel: &KernelHandle,
     a: &RocmBuffer,
     b: &RocmBuffer,
     c: &RocmBuffer,
-) {
-    let mut karg = vec![0u8; kernarg.byte_capacity()];
-    let pair = |karg: &mut [u8], slot: usize, ptr: u64, len: u64| {
-        let off = slot * 16;
-        karg[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
-        karg[off + 8..off + 16].copy_from_slice(&len.to_le_bytes());
-    };
-    pair(&mut karg, 0, a.device_ptr(), a.elem_count() as u64);
-    pair(&mut karg, 1, b.device_ptr(), b.elem_count() as u64);
-    pair(&mut karg, 2, c.device_ptr(), c.elem_count() as u64);
-    ctx.write_raw_bytes(kernarg, 0, &karg)
-        .expect("write add kernarg");
+) -> BoundKernarg {
+    let len = |buffer: &RocmBuffer| u64::from(buffer.elem_count());
+    ctx.bind_kernarg(kernel, &[(a, len(a)), (b, len(b)), (c, len(c))])
+        .expect("bind add kernarg")
 }
 
 /// Card 608, SC-002 (ROCm, on the production dispatch path): a
@@ -2158,10 +2230,7 @@ fn dispatch_rejects_buffers_that_do_not_meet_the_compiled_schema() {
         .upload_f32(&[10.0, 20.0, 30.0, 40.0], BufferRole::Input)
         .expect("upload b");
     let c = ctx.allocate_f32(4, BufferRole::Output).expect("allocate c");
-    let kernarg = ctx
-        .allocate_kernarg(kernel.kernarg_size() as usize)
-        .expect("allocate kernarg");
-    write_add_kernarg(&ctx, &kernarg, &a, &b, &c);
+    let kernarg = bind_add_kernarg(&ctx, &kernel, &a, &b, &c);
     let grid = (4, 1, 1);
     let block = (4, 1, 1);
 
@@ -2270,10 +2339,7 @@ fn lookup_kernel_rejects_a_mismatched_entry_point_and_dispatches_the_right_kerne
         .upload_f32(&[10.0, 20.0, 30.0], BufferRole::Input)
         .expect("upload b");
     let c = ctx.allocate_f32(3, BufferRole::Output).expect("allocate c");
-    let add_kernarg = ctx
-        .allocate_kernarg(add_kernel.kernarg_size() as usize)
-        .expect("allocate add kernarg");
-    write_add_kernarg(&ctx, &add_kernarg, &a, &b, &c);
+    let add_kernarg = bind_add_kernarg(&ctx, &add_kernel, &a, &b, &c);
     ctx.dispatch(
         &add_kernel,
         &add_kernarg,
@@ -2294,15 +2360,14 @@ fn lookup_kernel_rejects_a_mismatched_entry_point_and_dispatches_the_right_kerne
         .expect("upload x");
     let y = ctx.allocate_f32(3, BufferRole::Output).expect("allocate y");
     let square_kernarg = ctx
-        .allocate_kernarg(square_kernel.kernarg_size() as usize)
-        .expect("allocate square kernarg");
-    let mut karg = vec![0u8; square_kernarg.byte_capacity()];
-    karg[0..8].copy_from_slice(&x.device_ptr().to_le_bytes());
-    karg[8..16].copy_from_slice(&(x.elem_count() as u64).to_le_bytes());
-    karg[16..24].copy_from_slice(&y.device_ptr().to_le_bytes());
-    karg[24..32].copy_from_slice(&(y.elem_count() as u64).to_le_bytes());
-    ctx.write_raw_bytes(&square_kernarg, 0, &karg)
-        .expect("write square kernarg");
+        .bind_kernarg(
+            &square_kernel,
+            &[
+                (&x, u64::from(x.elem_count())),
+                (&y, u64::from(y.elem_count())),
+            ],
+        )
+        .expect("bind square kernarg");
     ctx.dispatch(
         &square_kernel,
         &square_kernarg,
@@ -2345,32 +2410,6 @@ fn no_contract_fma_sensitive_rows(n: usize) -> Vec<(f32, f32, f32, f32)> {
     rows
 }
 
-/// Write a `no_contract_probe`-shaped kernarg: 5 `(ptr: u64, len: u64)` pairs (a, b, c, d, out), matching
-/// `no_contract_probe_kernel`'s declaration order.
-fn write_no_contract_kernarg(
-    ctx: &RocmContext,
-    kernarg: &RocmBuffer,
-    a: &RocmBuffer,
-    b: &RocmBuffer,
-    c: &RocmBuffer,
-    d: &RocmBuffer,
-    out: &RocmBuffer,
-) {
-    let mut karg = vec![0u8; kernarg.byte_capacity()];
-    let pair = |karg: &mut [u8], slot: usize, ptr: u64, len: u64| {
-        let off = slot * 16;
-        karg[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
-        karg[off + 8..off + 16].copy_from_slice(&len.to_le_bytes());
-    };
-    pair(&mut karg, 0, a.device_ptr(), a.elem_count() as u64);
-    pair(&mut karg, 1, b.device_ptr(), b.elem_count() as u64);
-    pair(&mut karg, 2, c.device_ptr(), c.elem_count() as u64);
-    pair(&mut karg, 3, d.device_ptr(), d.elem_count() as u64);
-    pair(&mut karg, 4, out.device_ptr(), out.elem_count() as u64);
-    ctx.write_raw_bytes(kernarg, 0, &karg)
-        .expect("write no_contract_probe kernarg");
-}
-
 /// Dispatch `no_contract_probe_kernel(marked)` on real ROCm/HSA hardware over `rows`, returning the
 /// downloaded `out` buffer.
 fn dispatch_no_contract_probe(
@@ -2398,10 +2437,14 @@ fn dispatch_no_contract_probe(
     let out_buf = ctx
         .allocate_f32(rows.len(), BufferRole::Output)
         .expect("allocate out");
+    // `no_contract_probe_kernel`'s declaration order: a, b, c, d, out.
     let kernarg = ctx
-        .allocate_kernarg(kernel.kernarg_size() as usize)
-        .expect("allocate kernarg");
-    write_no_contract_kernarg(ctx, &kernarg, &a_buf, &b_buf, &c_buf, &d_buf, &out_buf);
+        .bind_kernarg(
+            &kernel,
+            &[&a_buf, &b_buf, &c_buf, &d_buf, &out_buf]
+                .map(|buffer| (buffer, u64::from(buffer.elem_count()))),
+        )
+        .expect("bind no_contract_probe kernarg");
     let n = rows.len() as u32;
     ctx.dispatch(
         &kernel,

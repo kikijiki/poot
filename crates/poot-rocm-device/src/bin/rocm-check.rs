@@ -27,7 +27,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use poot_codegen::{CompileError, Target, artifact_path, compile, kernel_handle};
+use poot_codegen::{
+    ArtifactMismatch, CompileError, Target, artifact_path, compile_kernel, kernel_handle,
+};
 use poot_kernel_ir::fixtures;
 use poot_rocm_runtime::{
     DeviceStoreFence, QueuePublicationContract, RocmContext, RocmError,
@@ -140,14 +142,13 @@ fn run_add() -> Result<(), CheckError> {
     });
     let target = Target::AmdGcn(arch);
     let out = artifact_path(&dir, "add", target);
-    compile(&body, target, &out)?;
-    let hsaco_bytes = std::fs::read(&out)?;
+    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::AmdGcn(arch), &out)?;
     eprintln!(
         "compiled `add` to {} ({} bytes)",
         out.display(),
-        hsaco_bytes.len()
+        artifact.len()
     );
-    let kernel = kernel_handle(&body, poot_codegen::GpuTarget::AmdGcn(arch), hsaco_bytes);
+    let kernel = kernel_handle(&body, &artifact)?;
 
     // SC-001 inputs: a = 1..=64, b = 3*1..=64, c = a + b (64 elements, one workgroup).
     //
@@ -176,35 +177,11 @@ fn run_add() -> Result<(), CheckError> {
     let a_buf = ctx.upload_f32(&a, BufferRole::Input)?;
     let b_buf = ctx.upload_f32(&b, BufferRole::Input)?;
     let c_buf = ctx.allocate_f32(n, BufferRole::Output)?;
-    let kernarg_buf = ctx.allocate_kernarg(kernel.kernarg_size() as usize)?;
-
-    // Write kernarg layout: ptr a, i64 n_a, ptr b, i64 n_b, ptr c, i64 n_c.
-    // 48 bytes total = 3 * (8 byte ptr + 8 byte i64). On aarch64/x86_64 the layouts match.
-    #[repr(C)]
-    #[derive(Default)]
-    struct AddKernarg {
-        p_a: *const f32,
-        n_a: i64,
-        p_b: *const f32,
-        n_b: i64,
-        p_c: *mut f32,
-        n_c: i64,
-    }
-    let args = AddKernarg {
-        p_a: a_buf.device_ptr() as *const f32,
-        n_a: n as i64,
-        p_b: b_buf.device_ptr() as *const f32,
-        n_b: n as i64,
-        p_c: c_buf.device_ptr() as *mut f32,
-        n_c: n as i64,
-    };
-    let arg_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &args as *const AddKernarg as *const u8,
-            std::mem::size_of::<AddKernarg>(),
-        )
-    };
-    ctx.write_raw_bytes(&kernarg_buf, 0, arg_bytes)?;
+    // Kernarg layout: ptr a, i64 n_a, ptr b, i64 n_b, ptr c, i64 n_c (48 bytes).
+    let kernarg_buf = ctx.bind_kernarg(
+        &kernel,
+        &[(&a_buf, n as u64), (&b_buf, n as u64), (&c_buf, n as u64)],
+    )?;
 
     // Dispatch: 64 work-items in one workgroup (see the SC-001 note above).
     let elements = [a_buf.element(), b_buf.element(), c_buf.element()];
@@ -315,9 +292,8 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
         .unwrap_or_else(|_| AmdArch::new("gfx942", ctx.wavefront().max(64)));
     let target = Target::AmdGcn(arch);
     let out = artifact_path(&dir, "add-pcie-receipt", target);
-    compile(&body, target, &out)?;
-    let hsaco_bytes = std::fs::read(&out)?;
-    let compiled_kernel = kernel_handle(&body, poot_codegen::GpuTarget::AmdGcn(arch), hsaco_bytes);
+    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::AmdGcn(arch), &out)?;
+    let compiled_kernel = kernel_handle(&body, &artifact)?;
     let module = ctx.load_hsaco(&compiled_kernel)?;
     let add_kernel = ctx.lookup_kernel(&module, compiled_kernel.entry_point())?;
 
@@ -335,23 +311,10 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
     let mut total_doorbells = 0usize;
     let _ = take_issued_device_store_fence_count();
 
-    #[repr(C)]
-    struct AddKernarg {
-        p_a: *const f32,
-        n_a: i64,
-        p_b: *const f32,
-        n_b: i64,
-        p_c: *mut f32,
-        n_c: i64,
-    }
-
     for round in 0..rounds {
         let mut dispatches = Vec::with_capacity(packet_count);
         let mut c_bufs = Vec::with_capacity(packet_count);
         let mut wants = Vec::with_capacity(packet_count);
-        // Keep owned input buffers alive for the batch lifetime.
-        let mut owned_a = Vec::with_capacity(packet_count);
-        let mut owned_b = Vec::with_capacity(packet_count);
         let mut owned_k = Vec::with_capacity(packet_count);
 
         for pkt in 0..packet_count {
@@ -362,29 +325,15 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
             let a_buf = ctx.upload_f32(&a, BufferRole::Input)?;
             let b_buf = ctx.upload_f32(&b, BufferRole::Input)?;
             let c_buf = ctx.allocate_f32(n, BufferRole::Output)?;
-            let kernarg_buf = ctx.allocate_kernarg(add_kernel.kernarg_size() as usize)?;
-            let args = AddKernarg {
-                p_a: a_buf.device_ptr() as *const f32,
-                n_a: n as i64,
-                p_b: b_buf.device_ptr() as *const f32,
-                n_b: n as i64,
-                p_c: c_buf.device_ptr() as *mut f32,
-                n_c: n as i64,
-            };
-            let arg_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &args as *const AddKernarg as *const u8,
-                    std::mem::size_of::<AddKernarg>(),
-                )
-            };
-            ctx.write_raw_bytes(&kernarg_buf, 0, arg_bytes)?;
-            owned_a.push(a_buf);
-            owned_b.push(b_buf);
+            // The bound kernarg keeps `a_buf` and `b_buf` alive for the batch lifetime.
+            let kernarg_buf = ctx.bind_kernarg(
+                &add_kernel,
+                &[(&a_buf, n as u64), (&b_buf, n as u64), (&c_buf, n as u64)],
+            )?;
             owned_k.push(kernarg_buf);
             c_bufs.push(c_buf);
             wants.push(want);
         }
-        let _keep_inputs = (owned_a, owned_b);
         for kernarg in owned_k {
             dispatches.push((
                 add_kernel.clone(),
@@ -395,7 +344,7 @@ fn run_pcie_publication_receipt() -> Result<(), CheckError> {
         }
 
         let chunks_this = packet_count.div_ceil(chunk_size);
-        // All-F32 add kernarg (see `AddKernarg`/the SC-001 dispatch above), one entry per packet.
+        // All-F32 add kernarg (see the SC-001 dispatch above), one entry per packet.
         let elements = [ElementKind::F32, ElementKind::F32, ElementKind::F32];
         let elements_per_packet: Vec<&[ElementKind]> =
             std::iter::repeat_n(elements.as_slice(), dispatches.len()).collect();
@@ -554,6 +503,8 @@ fn format_bdf(domain: Option<u32>, bdfid: Option<u32>) -> String {
 enum CheckError {
     #[error(transparent)]
     Codegen(#[from] CompileError),
+    #[error(transparent)]
+    Artifact(#[from] ArtifactMismatch),
     #[error(transparent)]
     Rocm(#[from] RocmError),
     #[error("io: {0}")]

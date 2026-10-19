@@ -35,6 +35,7 @@ pub mod block_top_k;
 pub mod capture;
 pub mod coresident;
 pub mod dispatch_length;
+pub mod echo;
 pub mod gdn;
 pub mod i32_gather;
 pub mod launch;
@@ -55,6 +56,7 @@ use std::sync::Arc;
 
 use poot_eval::test_support::StepFixture;
 use poot_executor::{Executor, NoSync, StateScope, StepInputs};
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{ForwardSlotMap, Graph, Slot, Storage, TensorType};
 use poot_graph_plan::{
@@ -79,6 +81,11 @@ pub struct Fixture {
     pub steps: Vec<Vec<StepFixture>>,
 }
 
+/// The magnitude of the default fixture weights and activations. Small enough that a toy model stays out
+/// of saturation, large enough that its outputs sit well above the signal floor of their class
+/// ([`signal_floor`]), so a wrong device cannot hide inside the tolerance.
+const FILL_SCALE: f32 = 0.25;
+
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     (0..n)
@@ -86,7 +93,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
-            (((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * 0.1
+            (((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * FILL_SCALE
         })
         .collect()
 }
@@ -524,27 +531,61 @@ pub fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
     }
 }
 
-/// The tier-2 tolerance of a device step against the CPU oracle: `TIER2 * (1 + |want|)` per element.
-/// ADR-0101 (Backstage `adr/0101.md`, "Decision", item 2, "Tier 2, stated tolerance") derives the
-/// tolerance from the program's reassociation class and states no number; these programs are
-/// `Tier2Class::NarrowStorage` (`poot-graph-ir/src/analysis/numerics.rs`: BF16 and Q8_0 weights read
-/// by `DenseContraction`/`PackedContraction`, plus fused rows and RoPE), the widest class, and no
-/// class-to-tolerance table exists in the tree yet, so this stated bound is the row's own.
-pub const TIER2: f32 = 1e-3;
+/// How many tolerances the largest oracle element of a compared step must exceed.
+const SIGNAL_MARGIN: f32 = 10.0;
 
-/// Two F32 tensors agree in dtype and shape and within relative tolerance `rel` elementwise (CPU vs.
-/// GPU float ops are not bit-identical, so an oracle comparison needs tolerance; record-then-replay
-/// bit-exactness is a separate, narrower claim this function does not make). A NaN never agrees.
-fn tensors_close(a: &HostTensor, b: &HostTensor, rel: f32) -> bool {
-    a.dtype() == b.dtype()
-        && a.shape() == b.shape()
-        && match (a.to_f32(), b.to_f32()) {
-            (Ok(x), Ok(y)) => x
-                .iter()
-                .zip(y.iter())
-                .all(|(&x, &y)| (x - y).abs() <= rel * y.abs().max(1.0)),
-            _ => false,
-        }
+/// The magnitude the largest oracle element of a step must exceed for `class`. A step whose every element
+/// is below it passes however wrong the device is, because the tolerance is absolute below 1; such a
+/// fixture proves nothing and is refused rather than compared.
+fn signal_floor(class: Tier2Class) -> f32 {
+    class.tolerance() * SIGNAL_MARGIN
+}
+
+/// Compare one device step output with the oracle's within the tolerance of the program's `class`
+/// (ADR-0101 decision 2): same dtype and shape, and every element within
+/// `class.tolerance() * max(|oracle|, 1)`. CPU and device float ops are not bit-identical, so an
+/// oracle comparison needs the tolerance; record-then-replay bit-exactness is a separate, narrower
+/// claim this function does not make. A NaN never agrees.
+///
+/// The oracle output must also carry signal: its largest element must exceed
+/// [`signal_floor`]. Below the floor every element is inside the tolerance of zero, so a
+/// device that wrote nothing would pass; such a fixture is refused, not compared.
+fn compare_step(class: Tier2Class, got: &HostTensor, want: &HostTensor) -> Result<(), String> {
+    if got.dtype() != want.dtype() || got.shape() != want.shape() {
+        return Err(format!(
+            "{} {:?} vs the oracle's {} {:?}",
+            got.dtype(),
+            got.shape(),
+            want.dtype(),
+            want.shape()
+        ));
+    }
+    let (Ok(got), Ok(want)) = (got.to_f32(), want.to_f32()) else {
+        return Err("the output does not read as f32".to_string());
+    };
+    let signal = want.iter().fold(0.0f32, |most, v| most.max(v.abs()));
+    let floor = signal_floor(class);
+    if signal.partial_cmp(&floor) != Some(std::cmp::Ordering::Greater) {
+        return Err(format!(
+            "the oracle's largest element is {signal}, not above the {class:?} signal floor {floor}: \
+             the fixture cannot show a wrong device"
+        ));
+    }
+    let tolerance = class.tolerance();
+    match got.iter().zip(want.iter()).position(|(&g, &w)| {
+        let bound = tolerance * w.abs().max(1.0);
+        // A NaN on either side is unordered, so it never agrees.
+        !matches!(
+            (g - w).abs().partial_cmp(&bound),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        )
+    }) {
+        None => Ok(()),
+        Some(i) => Err(format!(
+            "element {i}: device {}, oracle {}, outside the {class:?} tolerance {tolerance}",
+            got[i], want[i]
+        )),
+    }
 }
 
 /// One named `Storage::Const` row for [`run_once`]: the checkpoint-style name a traced graph's
@@ -644,9 +685,23 @@ pub fn run_once(
 
 /// SC-002: load `fixture` onto `exec` at `target`, step through every declared step, and assert
 /// that each step's replayed output matches `oracle`'s independently-computed expectation for that
-/// same step, within relative tolerance - including a final repeat of step 0's inputs, so a
-/// pure-replay step (no new recording) is checked against the oracle too, not only the recording
-/// step (ADR-0101 tier 1).
+/// same step - including a final repeat of step 0's inputs, so a pure-replay step (no new recording)
+/// is checked against the oracle too, not only the recording step (ADR-0101 tier 2).
+///
+/// The tolerance is not a parameter: it is [`Tier2Class::tolerance`] of the class the compiled program
+/// publishes ([`StagedProgram::numerics_class`]), so a row cannot pick a looser bound than its program's
+/// passes allow. A step whose oracle output carries no signal above that tolerance is refused.
+///
+/// ```compile_fail
+/// fn with_a_tolerance(
+///     exec: &mut dyn poot_executor::Executor,
+///     target: poot_graph_plan::Target,
+///     fixture: &poot_executor_parity::Fixture,
+///     oracle: &mut poot_executor_parity::Oracle<'_>,
+/// ) {
+///     let _ = poot_executor_parity::run_parity(exec, target, fixture, oracle, 1e-2);
+/// }
+/// ```
 pub fn run_parity(
     exec: &mut dyn Executor,
     target: Target,
@@ -656,8 +711,10 @@ pub fn run_parity(
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
+    let program = staged(fixture, target, Submission::Replay);
+    let class = program.numerics_class();
     let entry = exec
-        .add_entry(exe, &staged(fixture, target, Submission::Replay))
+        .add_entry(exe, &program)
         .map_err(|e| format!("{}: add_entry: {e}", fixture.name))?;
     for (i, step) in fixture.steps.iter().enumerate() {
         let expected = oracle(step);
@@ -671,16 +728,12 @@ pub fn run_parity(
             .map_err(|e| format!("{}: step {i}: {e}", fixture.name))?
             .to_host()
             .map_err(|e| format!("{}: read {i}: {e}", fixture.name))?;
-        if !tensors_close(&got, &expected, 5e-3) {
-            return Err(format!(
-                "{}: step {i}'s replayed output does not match the oracle ({} {:?} vs {} {:?})",
-                fixture.name,
-                got.dtype(),
-                got.shape(),
-                expected.dtype(),
-                expected.shape()
-            ));
-        }
+        compare_step(class, &got, &expected).map_err(|e| {
+            format!(
+                "{}: step {i}'s replayed output does not match the oracle: {e}",
+                fixture.name
+            )
+        })?;
     }
     let first = &fixture.steps[0];
     let expected = oracle(first);
@@ -694,16 +747,12 @@ pub fn run_parity(
         .map_err(|e| format!("{}: repeat step: {e}", fixture.name))?
         .to_host()
         .map_err(|e| format!("{}: repeat read: {e}", fixture.name))?;
-    if !tensors_close(&got, &expected, 5e-3) {
-        return Err(format!(
-            "{}: the repeated replay step does not match the oracle ({} {:?} vs {} {:?})",
-            fixture.name,
-            got.dtype(),
-            got.shape(),
-            expected.dtype(),
-            expected.shape()
-        ));
-    }
+    compare_step(class, &got, &expected).map_err(|e| {
+        format!(
+            "{}: the repeated replay step does not match the oracle: {e}",
+            fixture.name
+        )
+    })?;
     exec.unload(exe)
         .map_err(|e| format!("{}: unload: {e}", fixture.name))?;
     Ok(())
@@ -824,7 +873,7 @@ pub fn receipt(
 
 /// Capture-and-replay repeatability. The entry's first step records and replays in one call; every
 /// later step is a pure replay. This steps `fixture` once, comparing each step to `oracle` within
-/// tolerance (as [`run_parity`] does, so a replay that drops a state commit diverges from the
+/// the program's class tolerance (as [`run_parity`] does, so a replay that drops a state commit diverges from the
 /// oracle), then resets the carried state and steps the same inputs again: this second pass runs
 /// every step, the first included, as a pure replay of the recording, and each step's output must
 /// equal the first pass's bit for bit (the first pass's first step is the recording step's own
@@ -838,8 +887,10 @@ pub fn run_capture_replay(
     let exe = exec
         .load_weights(Arc::new(fixture.store.clone()), fixture_weights(fixture))
         .map_err(|e| format!("{}: load_weights: {e}", fixture.name))?;
+    let program = staged(fixture, target, Submission::Replay);
+    let class = program.numerics_class();
     let entry = exec
-        .add_entry(exe, &staged(fixture, target, Submission::Replay))
+        .add_entry(exe, &program)
         .map_err(|e| format!("{}: add_entry: {e}", fixture.name))?;
     let mut first_pass = Vec::with_capacity(fixture.steps.len());
     for (i, step) in fixture.steps.iter().enumerate() {
@@ -854,16 +905,12 @@ pub fn run_capture_replay(
             .map_err(|e| format!("{}: step {i}: {e}", fixture.name))?
             .to_host()
             .map_err(|e| format!("{}: read {i}: {e}", fixture.name))?;
-        if !tensors_close(&got, &expected, 5e-3) {
-            return Err(format!(
-                "{}: step {i}'s output does not match the oracle ({} {:?} vs {} {:?})",
-                fixture.name,
-                got.dtype(),
-                got.shape(),
-                expected.dtype(),
-                expected.shape()
-            ));
-        }
+        compare_step(class, &got, &expected).map_err(|e| {
+            format!(
+                "{}: step {i}'s output does not match the oracle: {e}",
+                fixture.name
+            )
+        })?;
         first_pass.push(got);
     }
     exec.reset_state(exe, StateScope::All)
@@ -927,5 +974,132 @@ mod device_time_tests {
     fn unknown_device_time_is_refused_not_fabricated() {
         let err = step_device_time("row", &DeviceTime::Unknown).unwrap_err();
         assert!(err.contains("no timestamps"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use poot_graph_ir::analysis::Tier2Class;
+    use poot_graph_ir::{BinOp, Builder, TensorType, UnOp};
+    use poot_target::Backend;
+    use poot_tensor::HostTensor;
+    use poot_test_util::device_caps::default_caps_for;
+
+    use super::*;
+
+    /// A wgpu-shaped target: the class is read off the compiled program, which needs no device.
+    fn target() -> Target {
+        Target::Gpu {
+            backend: Backend::SpirvVulkan,
+            caps: default_caps_for(Backend::SpirvVulkan),
+        }
+    }
+
+    /// `exp(x * s) + bias` over constants: a float pointwise chain `compile` fuses into one region, so the
+    /// program publishes the reassociating class.
+    fn fused_chain() -> Fixture {
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![4, 8])).unwrap();
+        let s = b.constant("s", TensorType::f32(vec![4, 8])).unwrap();
+        let bias = b.constant("bias", TensorType::f32(vec![4, 8])).unwrap();
+        let scaled = b.binary(BinOp::Mul, x, s).unwrap();
+        let e = b.unary(UnOp::Exp, scaled).unwrap();
+        let out = b.binary(BinOp::Add, e, bias).unwrap();
+        let graph = b.finish(out).unwrap();
+        let store = store_for(&graph);
+        Fixture {
+            name: "fused_chain",
+            graph,
+            store,
+            steps: vec![Vec::new()],
+        }
+    }
+
+    /// The oracle's output: every element at magnitude one, past the signal floor of every class.
+    fn oracle_output() -> HostTensor {
+        HostTensor::f32(vec![4, 8], vec![1.0; 32])
+    }
+
+    /// `want` with every element moved by `multiple` of `tolerance` (the elements are one, so the bound
+    /// `tolerance * max(|want|, 1)` is `tolerance`).
+    fn perturbed(want: &HostTensor, tolerance: f32, multiple: f32) -> HostTensor {
+        let moved = want
+            .as_f32()
+            .unwrap()
+            .iter()
+            .map(|v| v + multiple * tolerance)
+            .collect();
+        HostTensor::f32(want.shape().to_vec(), moved)
+    }
+
+    /// SC-002: the class a parity row compares within is the one its compiled program publishes, and a
+    /// device result 2x that class's published tolerance off the oracle fails while one 0.5x off passes.
+    /// The published reassociating tolerance is pinned here as the ADR-0101 table's number.
+    ///
+    /// Mutation: make `Tier2Class::tolerance` return a constant `1e-2`; the 2x row passes and this goes
+    /// red on `a result 2x the tolerance off the oracle must fail`.
+    #[test]
+    fn a_reassociating_program_is_compared_within_its_class_tolerance() {
+        const PUBLISHED_REASSOCIATING: f32 = 1e-3;
+        let program = staged(&fused_chain(), target(), Submission::Replay);
+        let class = program.numerics_class();
+        assert_eq!(
+            class,
+            Tier2Class::Reassociating,
+            "the chain must fuse, or this row proves nothing about the reassociating class"
+        );
+        let want = oracle_output();
+        let far = perturbed(&want, PUBLISHED_REASSOCIATING, 2.0);
+        let err = compare_step(class, &far, &want)
+            .expect_err("a result 2x the tolerance off the oracle must fail");
+        assert!(err.contains("outside the Reassociating tolerance"), "{err}");
+        compare_step(
+            class,
+            &perturbed(&want, PUBLISHED_REASSOCIATING, 0.5),
+            &want,
+        )
+        .expect("a result 0.5x the tolerance off the oracle must pass");
+    }
+
+    /// SC-002, through `run_parity` itself: the real engine, compile and `run_parity` run over a device
+    /// that answers with the oracle moved by `multiple` of the reassociating tolerance. The wiring from the
+    /// program's class to the comparison is what fails here: a `run_parity` that compared within the
+    /// `NarrowStorage` bound (5x looser) would pass the 2x row.
+    ///
+    /// Mutation: in `run_parity` replace `program.numerics_class()` with `Tier2Class::NarrowStorage`; the
+    /// 2x row passes and this goes red on `a device 2x the reassociating tolerance off must fail`.
+    #[test]
+    fn run_parity_compares_within_the_class_of_the_program_it_ran() {
+        const PUBLISHED_REASSOCIATING: f32 = 1e-3;
+        let run = |multiple: f32| {
+            let (mut exec, target, answer) = crate::echo::echo_executor();
+            let want = oracle_output();
+            let mut oracle = |_: &[StepFixture]| {
+                answer.set(&perturbed(&want, PUBLISHED_REASSOCIATING, multiple));
+                want.clone()
+            };
+            run_parity(exec.as_mut(), target, &fused_chain(), &mut oracle)
+        };
+        let err = run(2.0).expect_err("a device 2x the reassociating tolerance off must fail");
+        assert!(err.contains("outside the Reassociating tolerance"), "{err}");
+        run(0.5).expect("a device 0.5x the tolerance off must pass");
+    }
+
+    /// SC-003: an oracle output below the class's signal floor is refused, however close the device is,
+    /// because a device that wrote nothing would agree with it.
+    ///
+    /// Mutation: delete the signal check in `compare_step`; the all-zero output passes and this goes red on
+    /// `an all-zero oracle output must be refused`.
+    #[test]
+    fn an_oracle_output_with_no_signal_is_refused() {
+        let class = Tier2Class::Reassociating;
+        let zeros = HostTensor::f32(vec![4, 8], vec![0.0; 32]);
+        let err = compare_step(class, &zeros, &zeros)
+            .expect_err("an all-zero oracle output must be refused");
+        assert!(err.contains("signal floor"), "{err}");
+        let faint = HostTensor::f32(vec![4, 8], vec![signal_floor(class) * 0.5; 32]);
+        assert!(compare_step(class, &faint, &faint).is_err());
+        compare_step(class, &oracle_output(), &oracle_output())
+            .expect("an output with signal agrees with itself");
     }
 }

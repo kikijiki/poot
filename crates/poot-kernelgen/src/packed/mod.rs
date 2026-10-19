@@ -780,7 +780,7 @@ mod row_gather_tests {
 
     #[test]
     fn row_gather_matches_decode_blocks_rows_on_wgpu_kquant() {
-        use poot_codegen::{Target, artifact_path, compile, kernel_handle};
+        use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
         use poot_wgpu_runtime::{Context, KernelBuffer};
 
         let ctx = match Context::new() {
@@ -813,10 +813,9 @@ mod row_gather_tests {
                 .join(&name);
             std::fs::create_dir_all(&dir).unwrap();
             let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-            compile(&body, Target::SpirvVulkan, &out_path)
+            let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
                 .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
-            let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel = kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spirv_bytes);
+            let kernel = kernel_handle(&body, &artifact).unwrap();
 
             let words = pack_words(&bytes);
             let mut buffers = [
@@ -933,7 +932,7 @@ mod row_gather_tests {
     /// rows on the local wgpu (SPIR-V/RADV) device.
     #[test]
     fn row_gather_matches_decode_blocks_rows_on_wgpu() {
-        use poot_codegen::{Target, artifact_path, compile, kernel_handle};
+        use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
         use poot_wgpu_runtime::{Context, KernelBuffer};
 
         let ctx = match Context::new() {
@@ -971,10 +970,9 @@ mod row_gather_tests {
                 .join(&name);
             std::fs::create_dir_all(&dir).unwrap();
             let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-            compile(&body, Target::SpirvVulkan, &out_path)
+            let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
                 .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
-            let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel = kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spirv_bytes);
+            let kernel = kernel_handle(&body, &artifact).unwrap();
 
             let words = pack_words(&bytes);
             let mut buffers = [
@@ -1444,7 +1442,7 @@ mod contraction_tests {
         m_per_block: usize,
         out_per_block: usize,
     ) {
-        use poot_codegen::{Target, artifact_path, compile, kernel_handle};
+        use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
         use poot_wgpu_runtime::KernelBuffer;
 
         let (k, bytes, activation, expected) =
@@ -1461,10 +1459,9 @@ mod contraction_tests {
             .join(&name);
         std::fs::create_dir_all(&dir).unwrap();
         let out_path = artifact_path(&dir, &name, Target::SpirvVulkan);
-        compile(&body, Target::SpirvVulkan, &out_path)
+        let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
             .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
-        let spirv_bytes = std::fs::read(&out_path).unwrap();
-        let kernel = kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spirv_bytes);
+        let kernel = kernel_handle(&body, &artifact).unwrap();
 
         let words = pack_words(&bytes);
         // metadata[3] (x_groups): 0 is fine here - every dispatch below is `[threads, 1, 1]`
@@ -1644,14 +1641,13 @@ mod contraction_tests {
             std::fs::create_dir_all(&dir).unwrap();
             let out_path =
                 poot_codegen::artifact_path(&dir, &name, poot_codegen::Target::SpirvVulkan);
-            poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out_path)
-                .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
-            let spirv_bytes = std::fs::read(&out_path).unwrap();
-            let kernel = poot_codegen::kernel_handle(
+            let artifact = poot_codegen::compile_kernel(
                 &body,
                 poot_codegen::GpuTarget::SpirvVulkan,
-                spirv_bytes,
-            );
+                &out_path,
+            )
+            .unwrap_or_else(|error| panic!("{format:?}: compile: {error}"));
+            let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
             let words = pack_words(&bytes);
             let metadata = [k as u32, out_per_block as u32, m_per_block as u32, x_groups];
@@ -1892,12 +1888,16 @@ mod rocm_tests {
     //! SC-004/SC-005 (card 542a, device tier 1/2): RowGather and Contraction (Gemv,
     //! blocks 1 and 2) for every block-32 format, dispatched on real
     //! ROCm/HSA hardware (gfx1151) - the AMDGCN counterpart of the wgpu row above, through the same
-    //! production path every real caller uses (`poot_codegen::compile` + `kernel_handle`, card 628's
+    //! production path every real caller uses (`poot_codegen::compile_kernel` + `kernel_handle`, card 628's
     //! `no_contract` tests' pattern). Skips (does not fail) with no HSA library or GPU agent, matching
     //! `poot-rocm-runtime`'s own device tests; run serial under `/tmp/poot-gpu.lock`.
 
     use poot_kernel_ir::Body;
-    use poot_rocm_runtime::{HsacoModule, RocmBuffer, RocmContext, RocmError};
+    use std::sync::Arc;
+
+    use poot_rocm_runtime::{
+        BoundKernarg, HsacoModule, KernelHandle, RocmBuffer, RocmContext, RocmError,
+    };
     use poot_runtime_common::{BufferRole, CompiledKernel};
     use poot_target::ElementKind;
 
@@ -1929,7 +1929,7 @@ mod rocm_tests {
         ctx: &RocmContext,
         name: &str,
         body: &Body,
-    ) -> (HsacoModule, CompiledKernel) {
+    ) -> (Arc<HsacoModule>, CompiledKernel) {
         let arch = poot_target::AmdArch::from_isa_name(ctx.isa_name(), ctx.wavefront())
             .unwrap_or_else(|error| panic!("{name}: could not classify device arch: {error}"));
         let target = poot_codegen::Target::AmdGcn(arch);
@@ -1938,11 +1938,10 @@ mod rocm_tests {
             .join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = poot_codegen::artifact_path(&dir, name, target);
-        poot_codegen::compile(body, target, &out)
-            .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
-        let bytes = std::fs::read(&out).unwrap_or_else(|error| panic!("{name}: read: {error}"));
-        let kernel =
-            poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::AmdGcn(arch), bytes);
+        let artifact =
+            poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::AmdGcn(arch), &out)
+                .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
+        let kernel = poot_codegen::kernel_handle(body, &artifact).unwrap();
         let module = ctx
             .load_hsaco(&kernel)
             .unwrap_or_else(|error| panic!("{name}: load_hsaco: {error}"));
@@ -1950,8 +1949,7 @@ mod rocm_tests {
     }
 
     /// Upload `u32` data through the f32-sized allocator (same 4-byte element width; a raw byte copy):
-    /// `poot-rocm-runtime`'s public transfer API has no `u32` variant, only `f32`, and
-    /// `write_raw_bytes` is typed to a `RawBytes`-declared buffer only. `f32::from_bits`/`to_bits`
+    /// `poot-rocm-runtime`'s public transfer API has no `u32` variant, only `f32`. `f32::from_bits`/`to_bits`
     /// round-trips every u32 bit pattern exactly (a total, lossless reinterpretation, never a numeric
     /// conversion), so uploading through the f32 path and reading the raw bits back device-side (the
     /// kernel's own `Ty::U32` params) is exact.
@@ -1963,15 +1961,16 @@ mod rocm_tests {
 
     /// One `(ptr: u64, len: u64)` kernarg pair per buffer, in the body's declared param order
     /// (`RocmContext::dispatch`'s doc: `(ptr, i64 len, ptr, i64 len, ...)`).
-    fn write_kernarg(ctx: &RocmContext, kernarg: &RocmBuffer, buffers: &[&RocmBuffer]) {
-        let mut karg = vec![0u8; kernarg.byte_capacity()];
-        for (slot, buf) in buffers.iter().enumerate() {
-            let off = slot * 16;
-            karg[off..off + 8].copy_from_slice(&buf.device_ptr().to_le_bytes());
-            karg[off + 8..off + 16].copy_from_slice(&u64::from(buf.elem_count()).to_le_bytes());
-        }
-        ctx.write_raw_bytes(kernarg, 0, &karg)
-            .expect("write kernarg");
+    fn bind_kernarg(
+        ctx: &RocmContext,
+        kernel: &KernelHandle,
+        buffers: &[&RocmBuffer],
+    ) -> BoundKernarg {
+        let slots: Vec<(&RocmBuffer, u64)> = buffers
+            .iter()
+            .map(|&buffer| (buffer, u64::from(buffer.elem_count())))
+            .collect();
+        ctx.bind_kernarg(kernel, &slots).expect("bind kernarg")
     }
 
     /// One buffer typed by its element kind, in the body's declared param order; `In` inputs are
@@ -2040,10 +2039,7 @@ mod rocm_tests {
             }
         }
         let refs: Vec<&RocmBuffer> = owned.iter().collect();
-        let kernarg = ctx
-            .allocate_kernarg(kernel.kernarg_size() as usize)
-            .expect("allocate kernarg");
-        write_kernarg(ctx, &kernarg, &refs);
+        let kernarg = bind_kernarg(ctx, &kernel, &refs);
         ctx.dispatch(&kernel, &kernarg, &elements, grid, block)
             .unwrap_or_else(|error| panic!("{name}: dispatch: {error}"));
         let mut got = vec![0.0f32; out_len];
@@ -2371,7 +2367,7 @@ mod ptx_tests {
     //! kernel) cannot arise here by construction, since there is no separate block argument to get
     //! wrong: `block` must be `body.workgroup_size`.
 
-    use poot_codegen::{Target, artifact_path, compile, kernel_handle};
+    use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
     use poot_kernel_ir::Body;
     use poot_ptx_runtime::{PtxBuffer, PtxContext};
 
@@ -2398,10 +2394,9 @@ mod ptx_tests {
             .join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = artifact_path(&dir, name, Target::Nvptx);
-        compile(body, Target::Nvptx, &out)
+        let artifact = compile_kernel(body, poot_codegen::GpuTarget::Nvptx, &out)
             .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
-        let bytes = std::fs::read(&out).unwrap_or_else(|error| panic!("{name}: read: {error}"));
-        kernel_handle(body, poot_codegen::GpuTarget::Nvptx, bytes)
+        kernel_handle(body, &artifact).unwrap()
     }
 
     /// Upload `u32` data through the i32-typed allocator (`u32 as i32` is a bit-preserving
@@ -2684,7 +2679,7 @@ mod planar_ptx_tests {
     //! source count needs no new harness). No local run is possible on this box (AMD Strix Halo, no
     //! NVIDIA device): unexercised until the PTX pod batch runs them.
 
-    use poot_codegen::{Target, artifact_path, compile, kernel_handle};
+    use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
     use poot_kernel_ir::Body;
     use poot_ptx_runtime::{PtxBuffer, PtxContext};
 
@@ -2711,10 +2706,9 @@ mod planar_ptx_tests {
             .join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = artifact_path(&dir, name, Target::Nvptx);
-        compile(body, Target::Nvptx, &out)
+        let artifact = compile_kernel(body, poot_codegen::GpuTarget::Nvptx, &out)
             .unwrap_or_else(|error| panic!("{name}: compile: {error}"));
-        let bytes = std::fs::read(&out).unwrap_or_else(|error| panic!("{name}: read: {error}"));
-        kernel_handle(body, poot_codegen::GpuTarget::Nvptx, bytes)
+        kernel_handle(body, &artifact).unwrap()
     }
 
     fn upload_u32(ctx: &PtxContext, data: &[u32]) -> PtxBuffer {

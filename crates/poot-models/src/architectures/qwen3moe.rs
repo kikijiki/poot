@@ -53,7 +53,7 @@ const SPEC: DenseSpec = DenseSpec {
     family: FAMILY,
     gguf: dense_keys!("qwen3moe"),
     hf_theta: 10_000.0,
-    gguf_theta: 1_000_000.0,
+    gguf_theta: Some(1_000_000.0),
     eps: 1e-6,
     eos: None,
 };

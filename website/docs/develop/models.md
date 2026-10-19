@@ -130,8 +130,8 @@ BERT-class encoder models for sentence embeddings and cross-encoder reranking.
 
 Safetensors is the usual format for HF-style encoder checkpoints. The `bert` family (an embedding encoder, or
 with the classifier head a cross-encoder) loads with `ModelHandle::load` and runs on the driver's `Encode` step on
-wgpu, ROCm and PTX; `poot_llm::encoders` is the library path. `poot-serve` does not start on an encoder
-checkpoint yet; its `/v1/embeddings` and `/v1/rerank` serve a decoder's embedding pass.
+wgpu, ROCm and PTX; `poot_llm::encoders` is the library path. `poot-serve` starts on an encoder
+checkpoint and serves `/v1/embeddings` and `/v1/rerank` from it, and from a decoder's embedding pass.
 
 ## Vision-language
 

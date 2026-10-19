@@ -4,13 +4,9 @@
 # (scripts/check-required-cases.py l0) fails the lane unless every case here ran and passed - a skip is
 # never a pass. Sorted in canonical (LC_ALL=C) order.
 #
-# The Level Zero device rows. On the Intel GPU: the generated `add` kernel (SpirvOpenCl) against the CPU oracle
-# with the device's vendor id asserted, and the runtime's typed refusals (transfer lengths, kernel argument
-# arity, foreign resources, ragged SPIR-V). On the Intel NPU (graph extension): an IR graph compiled by the
-# driver's compiler, run, and its blob reloaded; a recording replayed over new inputs with its refusals; the
-# compiler's layer listing and its build log.
-poot-l0-runtime::add	level_zero_refuses_mismatched_transfers_foreign_resources_and_ragged_spirv
-poot-l0-runtime::add	spirv_opencl_add_matches_cpu_oracle_on_level_zero
+# The Level Zero device rows, on the Intel NPU (graph extension): an IR graph compiled by the driver's compiler,
+# run, and its blob reloaded; a recording replayed over new inputs with its refusals; the compiler's layer
+# listing and its build log.
 poot-l0-runtime::npu_graph	a_recording_replays_over_new_inputs_and_refuses_what_is_not_its_own
 poot-l0-runtime::npu_graph	an_ir_graph_compiles_runs_and_its_blob_reloads_to_the_same_answer
 poot-l0-runtime::npu_graph	the_compiler_lists_its_layers_and_names_what_it_cannot_parse

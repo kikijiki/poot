@@ -33,7 +33,7 @@ use std::sync::Arc;
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::format::{ScaleEncoding, WeightFormat};
 use poot_quant::weights::{
-    AttnRole, FfnRole, GdnRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap,
+    AttnRole, FfnRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightMapBuilder,
     WeightMapError, WeightRole, WeightStore, WeightView,
 };
 use poot_quant::{OperandRole, PackedPayload, PackedWeight, SourceRole};
@@ -41,9 +41,10 @@ use poot_quant::{OperandRole, PackedPayload, PackedWeight, SourceRole};
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
-use crate::components::gdn::{GdnHeadOrder, GdnParams, GdnWeights, gdn};
+use crate::components::gdn::{GdnParams, GdnWeights, gdn};
+use crate::components::gdn_names::{GdnTable, nextn_field, trunk_layers};
 use crate::components::linear::WeightError;
-use crate::components::norm::{NormKind, NormParams};
+use crate::components::norm::NormParams;
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
     standard_layer, standard_stack,
@@ -73,12 +74,12 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
 const WRAPPER_TYPE: &str = "qwen3_5";
 
 /// Qwen3.5's config facts: `Qwen3_5TextConfig`'s defaults. The class declares no `eos_token_id`: a
-/// checkpoint names it. A GGUF names the base (`qwen35.rope.freq_base`) or gets llama.cpp's default.
+/// checkpoint names it. A GGUF must name the base (`gguf_theta: None`).
 const SPEC: DenseSpec = DenseSpec {
     family: FAMILY,
     gguf: dense_keys!("qwen35"),
     hf_theta: 10_000.0,
-    gguf_theta: 10_000_000.0,
+    gguf_theta: None,
     eps: 1e-6,
     eos: None,
 };
@@ -93,7 +94,7 @@ const INTERVAL: Field = Field::new("full_attention_interval", "qwen35.full_atten
 const ROTARY_DIM: Field = Field::new("", "qwen35.rope.dimension_count");
 /// Layers a GGUF appends after the stack for multi-token prediction: they count in `block_count`
 /// and have their own tensors, and the stack does not run them.
-const NEXTN_LAYERS: Field = Field::new("", "qwen35.nextn_predict_layers");
+const NEXTN_LAYERS: Field = nextn_field!("qwen35");
 
 /// One layer's mixer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +116,7 @@ struct Names {
     attn_norm: &'static str,
     ffn_norm: &'static str,
     attention: AttentionNames,
-    gdn: GdnNames,
+    gdn: GdnTable,
     ffn: [&'static str; 3],
 }
 
@@ -124,16 +125,6 @@ struct AttentionNames {
     projections: [&'static str; 4],
     q_norm: &'static str,
     k_norm: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GdnNames {
-    /// The `qkv`, `z`, `beta`, `alpha` and output projection stems.
-    projections: [&'static str; 5],
-    dt_bias: &'static str,
-    conv: &'static str,
-    a: &'static str,
-    norm: &'static str,
 }
 
 const TEXT_NAMES: Names = Names {
@@ -153,19 +144,7 @@ const TEXT_NAMES: Names = Names {
         q_norm: ".self_attn.q_norm.weight",
         k_norm: ".self_attn.k_norm.weight",
     },
-    gdn: GdnNames {
-        projections: [
-            ".linear_attn.in_proj_qkv",
-            ".linear_attn.in_proj_z",
-            ".linear_attn.in_proj_b",
-            ".linear_attn.in_proj_a",
-            ".linear_attn.out_proj",
-        ],
-        dt_bias: ".linear_attn.dt_bias",
-        conv: ".linear_attn.conv1d.weight",
-        a: ".linear_attn.A_log",
-        norm: ".linear_attn.norm.weight",
-    },
+    gdn: GdnTable::HF_SPLIT,
     ffn: [".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"],
 };
 
@@ -190,19 +169,7 @@ const GGUF_NAMES: Names = Names {
         q_norm: ".attn_q_norm.weight",
         k_norm: ".attn_k_norm.weight",
     },
-    gdn: GdnNames {
-        projections: [
-            ".attn_qkv",
-            ".attn_gate",
-            ".ssm_beta",
-            ".ssm_alpha",
-            ".ssm_out",
-        ],
-        dt_bias: ".ssm_dt.bias",
-        conv: ".ssm_conv1d.weight",
-        a: ".ssm_a",
-        norm: ".ssm_norm.weight",
-    },
+    gdn: GdnTable::GGUF,
     ffn: [".ffn_gate", ".ffn_up", ".ffn_down"],
 };
 
@@ -350,29 +317,12 @@ impl Qwen35Params {
         if !fields.flag(Field::hf("attn_output_gate"), true)? {
             return Err(fields.error("attn_output_gate", ConfigReason::Unsupported));
         }
-        // The stack is the blocks before the multi-token-prediction layers a GGUF appends.
-        let layers = match &raw {
-            RawConfig::HfJson { .. } => dims.layers,
-            RawConfig::Gguf(_) => {
-                let nextn = fields.opt_u64(NEXTN_LAYERS)?.unwrap_or(0);
-                usize::try_from(nextn)
-                    .ok()
-                    .and_then(|nextn| dims.layers.checked_sub(nextn))
-                    .filter(|&layers| layers > 0)
-                    .ok_or(fields.error(
-                        fields.key(NEXTN_LAYERS),
-                        ConfigReason::Exceeds { max: dims.layers },
-                    ))?
-            }
-        };
+        let layers = trunk_layers(&fields, NEXTN_LAYERS, dims.layers)?;
         // The residual-stream and projection norms: HF stores `(1 + w)`, a GGUF folds the one in.
         let eps = dims.eps;
         let eps_error = |_| fields.error("rms_norm_eps", ConfigReason::NotFinitePositive);
-        let norm_kind = match hf_text {
-            Some(_) => NormKind::RmsPlusOne,
-            None => NormKind::Rms,
-        };
-        let norm = NormParams::of(norm_kind, eps).map_err(eps_error)?;
+        let norm =
+            NormParams::of(names.gdn.convention.norm_fold.norm_kind(), eps).map_err(eps_error)?;
         let rotary = match hf_text {
             Some(text) => ((dims.head_dim as f32 * rotary_factor(&fields, text)?) as usize).max(1),
             None => match fields.opt_u64(ROTARY_DIM)? {
@@ -406,24 +356,16 @@ impl Qwen35Params {
         {
             return Err(fields.error(fields.key(INNER_SIZE), ConfigReason::Unsupported));
         }
-        let gdn = GdnParams::new(
-            key_heads,
-            value_heads,
-            head_dim,
-            fields.count(CONV_KERNEL, None)?,
-            NormParams::new(eps).map_err(eps_error)?,
-            match hf_text {
-                Some(_) => GdnHeadOrder::Grouped,
-                None => GdnHeadOrder::Tiled,
-            },
-        )
-        .map_err(|e| e.for_family(FAMILY))?;
-        // HF stores `A_log`; a GGUF stores `ssm_a`, already negative.
-        let gdn = if hf_text.is_some() {
-            gdn.with_log_decay()
-        } else {
-            gdn
-        };
+        let gdn = names
+            .gdn
+            .params(
+                key_heads,
+                value_heads,
+                head_dim,
+                fields.count(CONV_KERNEL, None)?,
+                NormParams::new(eps).map_err(eps_error)?,
+            )
+            .map_err(|e| e.for_family(FAMILY))?;
 
         Ok(Self {
             kinds: layer_kinds(&fields, hf_text, layers)?,
@@ -455,36 +397,46 @@ fn weights_of(p: &Qwen35Params, store: &WeightStore) -> Result<WeightMap, ModelE
     // The stored key of a linear: `{stem}.weight`, dense or the packed payload the loader publishes
     // under it.
     let linear = |stem: &str| format!("{stem}.weight");
-    let mut put = |id: WeightId, key: String| -> Result<(), ModelError> {
-        map.map(id, WeightView::Stored(WeightKey::from(key)))
-            .map_err(missing)?;
-        Ok(())
-    };
+    let put =
+        |map: &mut WeightMapBuilder<'_>, id: WeightId, key: String| -> Result<(), ModelError> {
+            map.map(id, WeightView::Stored(WeightKey::from(key)))
+                .map_err(missing)?;
+            Ok(())
+        };
 
     let embed = WeightId::model(WeightRole::Embed);
-    put(embed, names.embed.to_string())?;
+    put(&mut map, embed, names.embed.to_string())?;
     put(
+        &mut map,
         WeightId::model(WeightRole::FinalNorm),
         names.final_norm.to_string(),
     )?;
     let head = WeightId::model(WeightRole::Head);
     let head_key = linear(names.head);
     if store.contains(&head_key) {
-        put(head, head_key)?;
+        put(&mut map, head, head_key)?;
     } else if p.head_required {
         return Err(missing(WeightMapError::Missing {
             id: head,
             key: WeightKey::from(head_key),
         }));
     } else {
-        put(head, names.embed.to_string())?;
+        put(&mut map, head, names.embed.to_string())?;
     }
 
     for (l, kind) in p.kinds.iter().enumerate() {
         let layer = |suffix: &str| format!("{}{l}{suffix}", names.layers);
         let id = |role| WeightId::layer(l, role);
-        put(id(WeightRole::Norm(NormRole::Attn)), layer(names.attn_norm))?;
-        put(id(WeightRole::Norm(NormRole::Ffn)), layer(names.ffn_norm))?;
+        put(
+            &mut map,
+            id(WeightRole::Norm(NormRole::Attn)),
+            layer(names.attn_norm),
+        )?;
+        put(
+            &mut map,
+            id(WeightRole::Norm(NormRole::Ffn)),
+            layer(names.ffn_norm),
+        )?;
         match kind {
             LayerKind::FullAttention => {
                 let a = &names.attention;
@@ -495,31 +447,24 @@ fn weights_of(p: &Qwen35Params, store: &WeightStore) -> Result<WeightMap, ModelE
                     (AttnRole::V, v),
                     (AttnRole::O, o),
                 ] {
-                    put(id(WeightRole::Attn(role)), linear(&layer(stem)))?;
+                    put(&mut map, id(WeightRole::Attn(role)), linear(&layer(stem)))?;
                 }
-                put(id(WeightRole::Attn(AttnRole::QNorm)), layer(a.q_norm))?;
-                put(id(WeightRole::Attn(AttnRole::KNorm)), layer(a.k_norm))?;
+                put(
+                    &mut map,
+                    id(WeightRole::Attn(AttnRole::QNorm)),
+                    layer(a.q_norm),
+                )?;
+                put(
+                    &mut map,
+                    id(WeightRole::Attn(AttnRole::KNorm)),
+                    layer(a.k_norm),
+                )?;
             }
             LayerKind::LinearAttention => {
-                let g = &names.gdn;
-                let [qkv, z, beta, alpha, out] = g.projections;
-                for (role, stem) in [
-                    (GdnRole::Qkv, qkv),
-                    (GdnRole::Z, z),
-                    (GdnRole::Beta, beta),
-                    (GdnRole::Alpha, alpha),
-                    (GdnRole::Out, out),
-                ] {
-                    put(id(WeightRole::Gdn(role)), linear(&layer(stem)))?;
-                }
-                for (role, suffix) in [
-                    (GdnRole::DtBias, g.dt_bias),
-                    (GdnRole::Conv, g.conv),
-                    (GdnRole::A, g.a),
-                    (GdnRole::GateNorm, g.norm),
-                ] {
-                    put(id(WeightRole::Gdn(role)), layer(suffix))?;
-                }
+                names
+                    .gdn
+                    .map_layer(&mut map, l, &layer, &linear)
+                    .map_err(missing)?;
             }
         }
         let [gate, up, down] = names.ffn;
@@ -528,7 +473,7 @@ fn weights_of(p: &Qwen35Params, store: &WeightStore) -> Result<WeightMap, ModelE
             (FfnRole::Up, up),
             (FfnRole::Down, down),
         ] {
-            put(id(WeightRole::Ffn(role)), linear(&layer(stem)))?;
+            put(&mut map, id(WeightRole::Ffn(role)), linear(&layer(stem)))?;
         }
     }
     Ok(map.build())
@@ -901,6 +846,7 @@ const VARIANT_FINETUNE: FixtureVariant = ("finetune", finetune_fixture);
 mod tests {
     use std::collections::BTreeMap;
 
+    use poot_graph_ir::{Slot, TensorType};
     use poot_load::gguf::{
         GgufIndex, GgufValue, IdentityNames, TensorNameMap, gguf_plan, read_gguf,
     };
@@ -910,7 +856,11 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::components::standard::oracle::run_step;
+    use crate::components::gdn_names::converter::{
+        HfProjections, LayerDims, layer_metadata, nextn_key, plus_one, write_layer,
+        write_nextn_block,
+    };
+    use crate::components::standard::oracle::{eval, run_step};
     use crate::components::testing::{
         CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
         close, close_all, decoded, f32_entry, gguf_tensor, greedy_tokens, q8_0_store,
@@ -1751,12 +1701,14 @@ mod tests {
     fn gguf_of(fx: &Fixture, nextn: bool) -> (Vec<(String, GgufValue)>, Vec<GgufTensor>) {
         let (text, root) = text_of(fx);
         let n = |f: &str| Fixture::count(text, f);
-        let (w, hd) = (n("hidden_size"), n("linear_key_head_dim"));
-        let (hk, hv) = (n("linear_num_key_heads"), n("linear_num_value_heads"));
-        let rep = hv / hk;
-        let (key_dim, value_dim) = (hk * hd, hv * hd);
-        let conv = 2 * key_dim + value_dim;
-        let kernel = n("linear_conv_kernel_dim");
+        let gdn = LayerDims {
+            width: n("hidden_size"),
+            key_heads: n("linear_num_key_heads"),
+            value_heads: n("linear_num_value_heads"),
+            head_dim: n("linear_key_head_dim"),
+            kernel: n("linear_conv_kernel_dim"),
+        };
+        let w = gdn.width;
         let layers = n("num_hidden_layers");
         let (heads, kv, d) = (
             n("num_attention_heads"),
@@ -1765,23 +1717,11 @@ mod tests {
         );
         let (vocab, inter) = (n("vocab_size"), n("intermediate_size"));
         let vals = |key: &str| values(fx.store.get(key).unwrap_or_else(|| panic!("{key}")));
-        // The tiled position `t` of a value head holds grouped head `(t % hk) * rep + t / hk`.
-        let grouped_of = |t: usize| (t % hk) * rep + t / hk;
-        // Rows of `data` (`width` values each) in runs of `block` rows, the runs reordered.
-        let reorder_blocks = |data: &[f32], width: usize, block: usize| -> Vec<f32> {
-            (0..hv)
-                .flat_map(|t| {
-                    let g = grouped_of(t);
-                    data[g * block * width..(g + 1) * block * width].to_vec()
-                })
-                .collect()
-        };
         let mut tensors: Vec<GgufTensor> = Vec::new();
         let mut put = |name: String, shape: Vec<usize>, data: Vec<f32>| {
             assert_eq!(data.len(), shape.iter().product::<usize>(), "{name}");
             tensors.push(gguf_tensor(&name, &f32_entry(shape, &data)));
         };
-        let plus_one = |v: Vec<f32>| v.into_iter().map(|x| x + 1.0).collect::<Vec<f32>>();
         put(
             "token_embd.weight".into(),
             vec![vocab, w],
@@ -1834,67 +1774,13 @@ mod tests {
                     );
                 }
             } else {
-                // `in_proj_qkv` rows are `[q | k | v]`; only the value rows follow the value heads.
-                let qkv = vals(&hf("linear_attn.in_proj_qkv.weight"));
-                let split = 2 * key_dim * w;
-                put(
-                    gg("attn_qkv.weight"),
-                    vec![conv, w],
-                    [qkv[..split].to_vec(), reorder_blocks(&qkv[split..], w, hd)].concat(),
+                write_layer(
+                    gdn,
+                    HfProjections::Split,
+                    &|suffix| vals(&hf(&format!("linear_attn.{suffix}"))),
+                    &gg,
+                    &mut put,
                 );
-                put(
-                    gg("attn_gate.weight"),
-                    vec![value_dim, w],
-                    reorder_blocks(&vals(&hf("linear_attn.in_proj_z.weight")), w, hd),
-                );
-                put(
-                    gg("ssm_beta.weight"),
-                    vec![hv, w],
-                    reorder_blocks(&vals(&hf("linear_attn.in_proj_b.weight")), w, 1),
-                );
-                put(
-                    gg("ssm_alpha.weight"),
-                    vec![hv, w],
-                    reorder_blocks(&vals(&hf("linear_attn.in_proj_a.weight")), w, 1),
-                );
-                put(
-                    gg("ssm_dt.bias"),
-                    vec![hv],
-                    reorder_blocks(&vals(&hf("linear_attn.dt_bias")), 1, 1),
-                );
-                let a: Vec<f32> = vals(&hf("linear_attn.A_log"))
-                    .iter()
-                    .map(|a| -a.exp())
-                    .collect();
-                put(gg("ssm_a"), vec![hv], reorder_blocks(&a, 1, 1));
-                // The conv kernel `[conv, 1, K]` as `[conv, K]`, its value rows reordered.
-                let kernel_rows = vals(&hf("linear_attn.conv1d.weight"));
-                let split = 2 * key_dim * kernel;
-                put(
-                    gg("ssm_conv1d.weight"),
-                    vec![conv, kernel],
-                    [
-                        kernel_rows[..split].to_vec(),
-                        reorder_blocks(&kernel_rows[split..], kernel, hd),
-                    ]
-                    .concat(),
-                );
-                put(
-                    gg("ssm_norm.weight"),
-                    vec![hd],
-                    vals(&hf("linear_attn.norm.weight")),
-                );
-                // `out_proj` `[w, value_dim]`: its columns follow the value heads.
-                let out = vals(&hf("linear_attn.out_proj.weight"));
-                let mut reordered: Vec<f32> = Vec::with_capacity(out.len());
-                for row in 0..w {
-                    for t in 0..hv {
-                        let g = grouped_of(t);
-                        reordered
-                            .extend(&out[row * value_dim + g * hd..row * value_dim + (g + 1) * hd]);
-                    }
-                }
-                put(gg("ssm_out.weight"), vec![w, value_dim], reordered);
             }
             for (gguf, hf_name, rows, cols) in [
                 ("ffn_gate", "mlp.gate_proj", inter, w),
@@ -1909,16 +1795,7 @@ mod tests {
             }
         }
         if nextn {
-            // The multi-token-prediction block: an attention layer's tensors plus its own
-            // projection and norms, under the index after the last block. None are read.
-            let gg = |s: &str| format!("blk.{layers}.{s}");
-            let ones = |len: usize| vec![1.0; len];
-            put(gg("attn_norm.weight"), vec![w], ones(w));
-            put(gg("post_attention_norm.weight"), vec![w], ones(w));
-            put(gg("nextn.eh_proj.weight"), vec![w, 2 * w], ones(2 * w * w));
-            put(gg("nextn.enorm.weight"), vec![w], ones(w));
-            put(gg("nextn.hnorm.weight"), vec![w], ones(w));
-            put(gg("nextn.shared_head_norm.weight"), vec![w], ones(w));
+            write_nextn_block(w, layers, &mut put);
         }
         let u = |v: usize| GgufValue::U32(v as u32);
         let mut kvs = vec![
@@ -1954,12 +1831,6 @@ mod tests {
                         .as_f64()
                         .unwrap()) as usize),
             ),
-            ("qwen35.ssm.inner_size".to_string(), u(value_dim)),
-            ("qwen35.ssm.state_size".to_string(), u(hd)),
-            ("qwen35.ssm.group_count".to_string(), u(hk)),
-            ("qwen35.ssm.time_step_rank".to_string(), u(hv)),
-            ("qwen35.ssm.conv_kernel".to_string(), u(kernel)),
-            ("qwen35.full_attention_interval".to_string(), u(4)),
             (
                 "tokenizer.ggml.tokens".to_string(),
                 GgufValue::Array(
@@ -1973,9 +1844,7 @@ mod tests {
                 u(fx.config["eos_token_id"].as_u64().unwrap() as usize),
             ),
         ];
-        if nextn {
-            kvs.push(("qwen35.nextn_predict_layers".to_string(), u(1)));
-        }
+        kvs.extend(layer_metadata("qwen35", gdn, nextn));
         (kvs, tensors)
     }
 
@@ -2039,7 +1908,7 @@ mod tests {
         let fx = fixture();
         let (mut kvs, tensors) = gguf_of(&fx, true);
         for (key, value) in &mut kvs {
-            if key == "qwen35.nextn_predict_layers" {
+            if *key == nextn_key("qwen35") {
                 *value = GgufValue::U32(5);
             }
         }
@@ -2049,8 +1918,30 @@ mod tests {
             matches!(
                 err,
                 ModelError::Config {
-                    field: "qwen35.nextn_predict_layers",
+                    field,
                     reason: ConfigReason::Exceeds { max: 5 },
+                    ..
+                } if field == nextn_key("qwen35")
+            ),
+            "{err}"
+        );
+    }
+
+    /// SC-003: a GGUF header without `rope.freq_base` is refused as `Missing`, naming the key; it
+    /// has no default base. Mutation: set `SPEC.gguf_theta` to `Some(10_000_000.0)`.
+    #[test]
+    fn a_gguf_without_a_rope_base_is_refused() {
+        let fx = fixture();
+        let (mut kvs, tensors) = gguf_of(&fx, false);
+        kvs.retain(|(key, _)| key != "qwen35.rope.freq_base");
+        let (index, _) = read_back_owned(&kvs, &tensors);
+        let err = Qwen35Params::from_raw(&RawConfig::Gguf(&index)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ModelError::Config {
+                    field: "qwen35.rope.freq_base",
+                    reason: ConfigReason::Missing,
                     ..
                 }
             ),
@@ -2083,9 +1974,9 @@ mod tests {
     }
 
     /// Keeps exactly one tensor.
-    struct Only(&'static str);
+    struct Only<'a>(&'a str);
 
-    impl TensorNameMap for Only {
+    impl TensorNameMap for Only<'_> {
         fn weight_key(&self, name: &str) -> Option<WeightKey> {
             (name == self.0).then(|| WeightKey::from(name))
         }
@@ -2170,6 +2061,87 @@ mod tests {
             .unwrap();
     }
 
+    /// The committed llama.cpp activation `name` (`attn_norm-0` or `linear_attn_out-0`) of the real
+    /// file's first block: eight tokens by `width` f32, token-major.
+    fn llama_cpp_activation(name: &str) -> Vec<f32> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/llamacpp-dump/reference")
+            .join(format!("qwen35_gdn_layer0_{name}.f32"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let (words, rest) = bytes.as_chunks::<4>();
+        assert!(rest.is_empty(), "{} is not whole f32 words", path.display());
+        words.iter().map(|w| f32::from_le_bytes(*w)).collect()
+    }
+
+    /// SC-001: block 0 of the real file is a Gated DeltaNet layer; run on the CPU oracle over its
+    /// packed weights, it maps llama.cpp's own input to the activation llama.cpp computed. The input
+    /// (`attn_norm-0`, the layer's normed residual) and the output (`linear_attn_out-0`, after the
+    /// output projection, before the residual add) are what llama.cpp (release b9190, built by
+    /// `scripts/llamacpp-dump/build.sh` from the source `flake.lock` pins) computes for the eight
+    /// tokens in `scripts/llamacpp-dump/reference/tokens.txt` on the CPU; `reference.sh` regenerates
+    /// them from the real file. The oracle evaluates the same Q5_K / Q8_0 weights in f32, so the two
+    /// differ by summation order only (llama.cpp ran block 0 with its tensors widened to f32 by its own
+    /// `to_float`, so it quantizes no activations): observed 3.6e-6 of the largest activation. The
+    /// bound is [`BOUND`], a fixed figure until the numerics class of POOT-1214 publishes tier 2.
+    /// Mutation: flip the decay convention of
+    /// [`GdnTable::GGUF`] to `DecaySign::NegExp` (the layer exponentiates the stored decay): the
+    /// output departs from llama.cpp far beyond the bound.
+    #[test]
+    fn the_real_gguf_gdn_layer_matches_the_llama_cpp_activation() {
+        /// The largest deviation allowed, as a fraction of the reference's largest magnitude.
+        const BOUND: f32 = 1e-4;
+        let Some(index) = real_gguf() else {
+            return;
+        };
+        let (input, want) = (
+            llama_cpp_activation("attn_norm-0"),
+            llama_cpp_activation("linear_attn_out-0"),
+        );
+        let mut p = Qwen35Params::from_raw(&RawConfig::Gguf(&index)).unwrap();
+        p.kinds.truncate(1);
+        assert_eq!(p.kinds, [LayerKind::LinearAttention]);
+        let store = read_gguf(&index, &FirstBlocks { blocks: 1 }, default_workers()).unwrap();
+        let weights = weights_of(&p, &store).unwrap();
+        let w = GdnWeights::new(&weights, 0, p.width, &p.gdn).unwrap();
+        let tokens = input.len() / p.width;
+        assert_eq!((tokens, input.len(), want.len()), (8, 8 * 5120, 8 * 5120));
+
+        let b = Builder::for_tests();
+        let step = Step::new(&b, step_shape(tokens, CAP, LogitRows::All)).unwrap();
+        let x = b
+            .constant("x", TensorType::f32(vec![1, tokens, p.width]))
+            .unwrap();
+        let y = gdn(&b, &step, 0, x, &w, &p.gdn).unwrap();
+        let g = step.finish(b, y).unwrap();
+        let formats = poot_graph_plan::WeightFormats::from_weight_map(&weights);
+        let g = poot_graph_plan::bind_packed_weights(&g, &formats).unwrap();
+        let zeros: Vec<Vec<f32>> = g
+            .state()
+            .map(|(si, _)| vec![0.0; g.aval(si).numel()])
+            .collect();
+        let zeros: Vec<&[f32]> = zeros.iter().map(Vec::as_slice).collect();
+        let (ids, pos): (Vec<i32>, Vec<i32>) = (vec![0; tokens], (0..tokens as i32).collect());
+        let (got, _) = eval(
+            &g,
+            &store,
+            &weights,
+            &[("x", &input)],
+            &[(Slot::Token, &ids), (Slot::Pos, &pos)],
+            &zeros,
+        );
+        assert_eq!(got.len(), want.len());
+        let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst <= BOUND * scale,
+            "worst deviation {worst} against a largest activation of {scale}"
+        );
+    }
+
     /// Every tensor of the real file's header plans through the production name map (`IdentityNames`,
     /// what `poot-llm`'s driver loads a GGUF with): no tensor is refused for its type, including the
     /// file's one `IQ3_S` tensor (`blk.14.ffn_down.weight`, ggml type 21), and each of the 866 tensors is
@@ -2186,273 +2158,46 @@ mod tests {
         assert_eq!(plan.len(), index.tensors.len());
     }
 
-    /// Per-row dequant parity of the real file's tensors, one per quantization the file uses, against
-    /// an independent reference: a Python decoder written from the ggml format description, not from
-    /// this codebase. Each row is `(tensor, ggml type, row, first four values, sum, sum of absolute
-    /// values, position-weighted sum)`; the weighted sum fails a decoder that permutes values within
-    /// a block. Mutation: swap two entries of the IQ4_NL codebook; its rows go red.
+    /// Per-row dequant parity of the real file's tensors, one pair of rows per quantization the file
+    /// uses, against llama.cpp's own `to_float` (release b9190, `scripts/llamacpp-dump/dequant_rows.cpp`;
+    /// `reference.sh` regenerates `qwen35_dequant_rows.tsv` from the file). Each row is `(tensor, ggml
+    /// type, row, first four values, sum, sum of absolute values, position-weighted sum)`; the weighted
+    /// sum fails a decoder that permutes values within a block. Mutation: swap two entries of the IQ4_NL
+    /// codebook; its rows go red.
     #[test]
-    fn the_real_gguf_rows_dequantize_to_the_independent_reference() {
+    fn the_real_gguf_rows_dequantize_to_the_llama_cpp_reference() {
         let Some(index) = real_gguf() else {
             return;
         };
-        type Row = (&'static str, u32, usize, [f64; 4], f64, f64, f64);
-        let rows: &[Row] = &[
-            (
-                "blk.0.ssm_out.weight",
-                8,
-                0,
-                [
-                    -0.00839853286743164,
-                    0.0004420280456542969,
-                    -0.016355037689208984,
-                    0.003094196319580078,
-                ],
-                0.12331223487854004,
-                67.53328037261963,
-                3157.006844162941,
-            ),
-            (
-                "blk.0.ssm_out.weight",
-                8,
-                4999,
-                [
-                    -0.0012052059173583984,
-                    -0.025510191917419434,
-                    -0.0026112794876098633,
-                    0.007030367851257324,
-                ],
-                0.9801188707351685,
-                67.41092574596405,
-                2547.979104399681,
-            ),
-            (
-                "blk.0.ffn_up.weight",
-                11,
-                0,
-                [-0.0062732696533203125, 0.0, 0.0, -0.012546539306640625],
-                1.4600802659988403,
-                42.24352943897247,
-                3183.182289838791,
-            ),
-            (
-                "blk.0.ffn_up.weight",
-                11,
-                17407,
-                [
-                    -0.004596233367919922,
-                    0.018384933471679688,
-                    0.009192466735839844,
-                    -0.013788700103759766,
-                ],
-                0.14160776138305664,
-                39.07256269454956,
-                -1015.8740805387497,
-            ),
-            (
-                "token_embd.weight",
-                12,
-                0,
-                [
-                    0.0050776004791259766,
-                    -0.014770984649658203,
-                    0.022090673446655273,
-                    -0.01193547248840332,
-                ],
-                0.48461365699768066,
-                53.55117869377136,
-                2789.253961920738,
-            ),
-            (
-                "token_embd.weight",
-                12,
-                248319,
-                [
-                    -0.0061026811599731445,
-                    0.0036643147468566895,
-                    0.0025790929794311523,
-                    0.005834758281707764,
-                ],
-                -0.002151012420654297,
-                12.777710556983948,
-                -801.5010811090469,
-            ),
-            (
-                "blk.0.attn_qkv.weight",
-                13,
-                0,
-                [
-                    -0.020967066287994385,
-                    0.019797146320343018,
-                    -0.005114316940307617,
-                    0.02432650327682495,
-                ],
-                -2.6517106890678406,
-                70.83429199457169,
-                -6794.964012026787,
-            ),
-            (
-                "blk.0.attn_qkv.weight",
-                13,
-                10239,
-                [
-                    -0.018031716346740723,
-                    0.013255476951599121,
-                    0.00543367862701416,
-                    -0.00043267011642456055,
-                ],
-                -0.22943055629730225,
-                68.50152027606964,
-                -386.7722784280777,
-            ),
-            (
-                "output.weight",
-                14,
-                0,
-                [
-                    0.002249479293823242,
-                    0.034866929054260254,
-                    0.011247396469116211,
-                    -0.023619532585144043,
-                ],
-                -0.7459412813186646,
-                63.81504261493683,
-                -2536.782041847706,
-            ),
-            (
-                "output.weight",
-                14,
-                248319,
-                [
-                    0.009332656860351562,
-                    -0.0058329105377197266,
-                    -0.000874936580657959,
-                    0.0020415186882019043,
-                ],
-                0.23581111431121826,
-                18.694132685661316,
-                286.3414177298546,
-            ),
-            (
-                "blk.1.ffn_down.weight",
-                20,
-                0,
-                [
-                    -0.006921887397766113,
-                    0.0075151920318603516,
-                    0.010481715202331543,
-                    0.0075151920318603516,
-                ],
-                0.036003828048706055,
-                146.68103766441345,
-                -807.7595727443695,
-            ),
-            (
-                "blk.1.ffn_down.weight",
-                20,
-                5119,
-                [
-                    -0.01989305019378662,
-                    -0.008493661880493164,
-                    0.0049173831939697266,
-                    -0.008493661880493164,
-                ],
-                -0.10125672817230225,
-                146.02655589580536,
-                2242.7229819893837,
-            ),
-            (
-                "blk.0.ffn_down.weight",
-                23,
-                0,
-                [
-                    -0.002213001251220703,
-                    -0.00017023086547851562,
-                    -0.01515054702758789,
-                    -0.004255771636962891,
-                ],
-                -0.2318987250328064,
-                143.0832684636116,
-                11267.667894542217,
-            ),
-            (
-                "blk.0.ffn_down.weight",
-                23,
-                5119,
-                [
-                    0.00507354736328125,
-                    0.007076263427734375,
-                    -0.006542205810546875,
-                    -0.00293731689453125,
-                ],
-                0.08191466331481934,
-                143.04997551441193,
-                -2703.979759335518,
-            ),
-            (
-                "blk.0.ffn_gate.weight",
-                23,
-                0,
-                [
-                    -0.004884600639343262,
-                    -0.010355353355407715,
-                    -0.010355353355407715,
-                    0.006838440895080566,
-                ],
-                0.5269913077354431,
-                44.8743252158165,
-                1564.4970512390137,
-            ),
-            (
-                "blk.0.ffn_gate.weight",
-                23,
-                17407,
-                [
-                    0.011252522468566895,
-                    0.0027600526809692383,
-                    0.0027600526809692383,
-                    0.011252522468566895,
-                ],
-                0.1207500696182251,
-                40.048569321632385,
-                -504.0539869070053,
-            ),
-            // The file's one IQ3_S tensor, decoded by gguf-py (`gguf.quants.dequantize`) from the
-            // mapped file. Mutation: swap two entries of the IQ3_S grid; these rows go red.
-            (
-                "blk.14.ffn_down.weight",
-                21,
-                0,
-                [
-                    -0.00481027364730835,
-                    -0.0016034245491027832,
-                    0.011223971843719482,
-                    -0.00481027364730835,
-                ],
-                -0.030666470527648926,
-                155.01027309894562,
-                -1297.5106790065765,
-            ),
-            (
-                "blk.14.ffn_down.weight",
-                21,
-                5119,
-                [
-                    -0.013991475105285645,
-                    0.009993910789489746,
-                    -0.005996346473693848,
-                    -0.0019987821578979492,
-                ],
-                2.1222199201583862,
-                159.6358369588852,
-                21469.186687111855,
-            ),
-        ];
-        let mut tensors: BTreeMap<&str, WeightStore> = BTreeMap::new();
-        for &(name, ggml_type, row, head, sum, abs_sum, weighted) in rows {
+        type Row = (String, u32, usize, [f64; 4], f64, f64, f64);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/llamacpp-dump/reference/qwen35_dequant_rows.tsv");
+        let table =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let rows: Vec<Row> = table
+            .lines()
+            .map(|line| {
+                let cells: Vec<&str> = line.split('\t').collect();
+                assert_eq!(cells.len(), 10, "{line}");
+                let float = |i: usize| cells[i].parse::<f64>().unwrap();
+                (
+                    cells[0].to_string(),
+                    cells[1].parse().unwrap(),
+                    cells[2].parse().unwrap(),
+                    [float(3), float(4), float(5), float(6)],
+                    float(7),
+                    float(8),
+                    float(9),
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 18);
+        let mut tensors: BTreeMap<String, WeightStore> = BTreeMap::new();
+        for (name, ggml_type, row, head, sum, abs_sum, weighted) in rows {
+            let name = name.as_str();
             assert_eq!(index.tensors[name].ggml_type, ggml_type, "{name}");
             let store = tensors
-                .entry(name)
+                .entry(name.to_string())
                 .or_insert_with(|| read_gguf(&index, &Only(name), default_workers()).unwrap());
             let WeightEntry::Packed(payload) = store.get(name).unwrap() else {
                 panic!("{name} was widened to a dense tensor");

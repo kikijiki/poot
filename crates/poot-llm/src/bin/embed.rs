@@ -27,6 +27,11 @@ fn backend_choice(flag: Option<&str>) -> Result<BackendChoice> {
     })
 }
 
+/// The rows one step is prepared for: as many as the texts on the command line.
+fn rows_of(count: usize) -> Result<std::num::NonZeroUsize> {
+    std::num::NonZeroUsize::new(count).context("no text to encode")
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -50,7 +55,7 @@ fn main() -> Result<()> {
     let (dir, executor) = (Path::new(dir), open_executor(backend_choice(backend)?)?);
     match *mode {
         "embed" => {
-            let mut encoder = SentenceEncoder::load(dir, executor)?;
+            let mut encoder = SentenceEncoder::load(dir, executor, rows_of(rest.len())?)?;
             println!("pooling {:?}", encoder.pooling());
             let vectors = encoder.embed(rest)?;
             for (text, vector) in rest.iter().zip(&vectors).skip(1) {
@@ -63,9 +68,9 @@ fn main() -> Result<()> {
                 bail!(usage);
             };
             let ranked = if *mode == "rerank" {
-                SentenceEncoder::load(dir, executor)?.rerank(query, docs)?
+                SentenceEncoder::load(dir, executor, rows_of(rest.len())?)?.rerank(query, docs)?
             } else {
-                CrossEncoder::load(dir, executor)?.rerank(query, docs)?
+                CrossEncoder::load(dir, executor, rows_of(docs.len())?)?.rerank(query, docs)?
             };
             for (rank, (index, score)) in ranked.iter().enumerate() {
                 println!("{}. {score:+.3}  {}", rank + 1, docs[*index]);

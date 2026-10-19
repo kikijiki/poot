@@ -340,7 +340,7 @@ fn a_one_dispatch_grid_past_255_workgroups_matches_the_oracle_on_vulkan() {
     assert_matches_oracle(exec.as_mut(), target, &fixture);
 }
 
-/// A packed linear per scheme (Q4_0, Q8_0, AWQ, GPTQ), at the decode GEMV and at a few rows, and the canonical
+/// A packed linear per scheme (Q4_0, Q8_0, AWQ, GPTQ, IQ3_S), at the decode GEMV and at a few rows, and the canonical
 /// indexed and grouped expert chain (`PackedDequant -> Transpose -> Reshape -> Concat ->
 /// IndexedMatMul`, the traced graph, so the row survives the later contraction claim) over each, match the
 /// oracle at every step. The weights are real-magnitude (`|w| <= 0.25`, checked when the payload is built) and

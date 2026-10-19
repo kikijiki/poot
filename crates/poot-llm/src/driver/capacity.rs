@@ -40,7 +40,7 @@ use poot_target::BufferStorage;
 
 use super::error::DriverError;
 use super::placement::{Placed, Placement};
-use super::{Driver, DriverOptions, ModelHandle, ServingShapes};
+use super::{Driver, DriverOptions, EncodeShapes, ModelHandle, ServingShapes};
 
 /// One owner of device bytes: an allocation with an identity. Two records naming the same `(device, id)`
 /// are the same allocation (a shared weight, a shared state), whatever number of entries reference it.
@@ -617,6 +617,28 @@ impl Driver {
     }
 }
 
+/// Whether a model must encode or only does when its family traces the phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeNeed {
+    /// An encoder: a family that refuses `Encode` is an error.
+    Required,
+    /// A generative model: a family that refuses `Encode` serves generation only.
+    IfTraced,
+}
+
+/// The one encode preparation, planned and real: admit `shapes` on `driver` as `need` says. Returns
+/// whether the entries are prepared.
+pub fn prepare_encode(
+    driver: &mut Driver,
+    shapes: &EncodeShapes,
+    need: EncodeNeed,
+) -> Result<bool, DriverError> {
+    match need {
+        EncodeNeed::Required => driver.prepare_encode(shapes).map(|_| true),
+        EncodeNeed::IfTraced => driver.prepare_encode_if_traced(shapes),
+    }
+}
+
 /// Why a candidate could not be planned.
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
@@ -679,6 +701,38 @@ impl Planner {
         shapes: &ServingShapes<'_>,
         embeds: bool,
     ) -> Result<Planned, PlanError> {
+        self.plan_workload(options, Some((shapes, embeds)), None)
+    }
+
+    /// Plan one driver that serves `serving` and encodes `encode`: both preparations run on the same
+    /// recorded driver, so one footprint covers them. [`Planner::plan`] is the generation-only case.
+    pub fn plan_workload(
+        &self,
+        options: DriverOptions,
+        serving: Option<(&ServingShapes<'_>, bool)>,
+        encode: Option<(&EncodeShapes, EncodeNeed)>,
+    ) -> Result<Planned, PlanError> {
+        self.plan_with(options, |driver| {
+            if let Some((shapes, embeds)) = serving {
+                driver.prepare(shapes)?;
+                if embeds {
+                    driver.prepare_embeds(shapes)?;
+                }
+            }
+            if let Some((shapes, need)) = encode {
+                prepare_encode(driver, shapes, need)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Open a driver over recording devices, run the production `prepare` on it and read what it
+    /// allocated.
+    fn plan_with(
+        &self,
+        options: DriverOptions,
+        prepare: impl FnOnce(&mut Driver) -> Result<(), DriverError>,
+    ) -> Result<Planned, PlanError> {
         let records: Records = Arc::default();
         let counters: Vec<(DeviceId, MemoryCounters)> = self
             .placed
@@ -728,10 +782,7 @@ impl Planner {
         if let Some(slots) = self.pool {
             driver = driver.with_expert_pool(slots)?;
         }
-        driver.prepare(shapes)?;
-        if embeds {
-            driver.prepare_embeds(shapes)?;
-        }
+        prepare(&mut driver)?;
         let mut footprint = Footprint::new();
         for record in records.lock().expect("planning records").iter() {
             if record.live {

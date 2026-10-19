@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Builder, Graph, PackedSourceName, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::test_support::gpu_caps;
@@ -1033,7 +1034,8 @@ fn fill(seed: u64, count: usize) -> Vec<f32> {
 
 /// `graph` stepped once on `engine`, the packed weight bound as `owner`, the activation slot
 /// `x_key` bound to `activation` (`[rows, K]`) and every named dense `[OUT]`-or-`[1, OUT]` const in `consts`
-/// bound by name; the output read back.
+/// bound by name; the output read back, with the numerics class the compiled program publishes: the class
+/// the output is compared with the oracle within.
 #[allow(clippy::too_many_arguments)]
 fn run_dense_activation(
     engine: &mut Engine<RocmDevice>,
@@ -1043,7 +1045,7 @@ fn run_dense_activation(
     x_key: &SlotKey,
     activation: (&[usize], &[f32]),
     consts: &[(&str, &[usize], &[f32])],
-) -> Vec<f32> {
+) -> (Vec<f32>, Tier2Class) {
     let mut builder = WeightStore::builder();
     let mut seen = std::collections::HashSet::new();
     for &id in graph.inputs() {
@@ -1078,7 +1080,8 @@ fn run_dense_activation(
     let exe = engine
         .load_weights(Arc::clone(&store), Arc::new(weights.map()))
         .unwrap();
-    let entry = engine.add_entry(exe, &staged(target, &named)).unwrap();
+    let program = staged(target, &named);
+    let entry = engine.add_entry(exe, &program).unwrap();
     let activation_bytes = f32_bytes(activation.1);
     let values = [(
         x_key.clone(),
@@ -1094,7 +1097,7 @@ fn run_dense_activation(
         .unwrap();
     engine.remove_entry(exe, entry).unwrap();
     engine.unload(exe).unwrap();
-    bytemuck_f32(&bytes)
+    (bytemuck_f32(&bytes), program.numerics_class())
 }
 
 /// SC-001: Q4_K, Q8_0 and FP8 contractions through the packed loaders meet their tier-2 oracle contract. A
@@ -1126,7 +1129,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
             let graph = b.finish(y).unwrap();
             let x_key = graph.meta(x.id()).slot_key().unwrap().clone();
             let activation = fill(7 + m as u64, m * K);
-            let got = run_dense_activation(
+            let (got, class) = run_dense_activation(
                 &mut engine,
                 target,
                 &graph,
@@ -1166,7 +1169,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_rocm() {
             poot_executor_parity::assert_close(
                 &got,
                 want.as_f32().unwrap(),
-                poot_executor_parity::TIER2,
+                class.tolerance(),
                 &what,
             );
         }
@@ -1217,7 +1220,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
         };
 
         let (head_graph, head_key) = build(false);
-        let head = run_dense_activation(
+        let (head, _) = run_dense_activation(
             &mut engine,
             target,
             &head_graph,
@@ -1250,7 +1253,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_rocm() {
                 head.iter().map(|v| -v).collect::<Vec<f32>>(),
             ),
         ] {
-            let fused = run_dense_activation(
+            let (fused, _) = run_dense_activation(
                 &mut engine,
                 target,
                 &graph,
@@ -1334,7 +1337,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
 
         // The device head alone, to cancel against.
         let (head_graph, _, head_key) = build(false);
-        let head = run_dense_activation(
+        let (head, _) = run_dense_activation(
             &mut engine,
             target,
             &head_graph,
@@ -1369,7 +1372,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_standalone_head_chain_on_rocm() {
                 head.iter().map(|v| -v).collect::<Vec<f32>>(),
             ),
         ] {
-            let fused = run_dense_activation(
+            let (fused, _) = run_dense_activation(
                 &mut engine,
                 target,
                 &graph,

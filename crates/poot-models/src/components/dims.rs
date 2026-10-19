@@ -294,8 +294,9 @@ pub struct DenseSpec {
     pub gguf: DenseKeys,
     /// The RoPE base an HF config that names none gets.
     pub hf_theta: f32,
-    /// The RoPE base a GGUF that names none gets.
-    pub gguf_theta: f32,
+    /// The RoPE base a GGUF that names none gets; `None` makes `freq_base` mandatory (a header
+    /// without it is refused as `Missing`).
+    pub gguf_theta: Option<f32>,
     /// The RMSNorm epsilon a checkpoint that names none gets.
     pub eps: f32,
     /// The end-of-sequence id a checkpoint that declares none gets, if the family has one.
@@ -405,13 +406,24 @@ impl DenseDims {
                         .as_bool()
                         .ok_or(fields.error("tie_word_embeddings", ConfigReason::WrongType))?,
                 };
-                (fields.hf_rope_flavor(max_positions)?, !tied, spec.hf_theta)
+                (
+                    fields.hf_rope_flavor(max_positions)?,
+                    !tied,
+                    Some(spec.hf_theta),
+                )
             }
             RawConfig::Gguf(gguf) => (
                 gguf_rope_flavor(fields, gguf, spec)?,
                 false,
                 spec.gguf_theta,
             ),
+        };
+        let theta = match fields.opt_f32(theta_f)? {
+            Some(theta) => theta,
+            None => fields
+                .hf_rope_theta()?
+                .or(theta_default)
+                .ok_or(fields.error(k.theta, ConfigReason::Missing))?,
         };
         Ok(Self {
             vocab,
@@ -423,10 +435,7 @@ impl DenseDims {
             head_dim,
             eps: fields.float(eps_f, spec.eps)?,
             max_positions,
-            theta: match fields.opt_f32(theta_f)? {
-                Some(theta) => theta,
-                None => fields.hf_rope_theta()?.unwrap_or(theta_default),
-            },
+            theta,
             flavor,
             head_required,
             eos: fields.eos(spec.eos)?,

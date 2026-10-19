@@ -25,7 +25,7 @@
 //! driver, panic instead when `POOT_REQUIRE_PTX=1` (set by `just test-device-ptx` and the
 //! PTX pod runs), so a lane that was supposed to run this never reports a skip as a pass.
 
-use poot_codegen::{Target, artifact_path, compile, kernel_handle};
+use poot_codegen::{Target, artifact_path, compile_kernel, kernel_handle};
 use poot_kernel_ir::Body;
 use poot_ptx_runtime::PtxContext;
 use poot_runtime_common::BufferRole;
@@ -68,9 +68,9 @@ fn gumbel_select_nvptx_fma_sensitive_fixture_matches_cpu_oracle() {
     let dir = std::env::temp_dir().join("poot-ptx-device-gumbel-no-contract");
     std::fs::create_dir_all(&dir).unwrap();
     let out = artifact_path(&dir, "sample_gumbel_argmax_batched", Target::Nvptx);
-    compile(&body, Target::Nvptx, &out).expect("Gumbel asset must compile to NVPTX");
-    let ptx_bytes = std::fs::read(&out).expect("read compiled PTX");
-    let kernel = kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, ptx_bytes);
+    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out)
+        .expect("Gumbel asset must compile to NVPTX");
+    let kernel = kernel_handle(&body, &artifact).unwrap();
 
     let ctx = match PtxContext::new() {
         Ok(c) => c,

@@ -376,6 +376,27 @@ pub enum EncodeError {
     /// The tower does not declare the grid inputs of a patch row (it is not a windowed vision tower).
     #[error("the model takes no patch rows with a grid geometry")]
     NoGeometry,
+    /// A request of more token rows than the prepared shapes hold.
+    #[error("an encode request of {rows} rows exceeds the {max} rows the engine is fitted for")]
+    TooManyRows {
+        /// Rows the request carries.
+        rows: usize,
+        /// Rows the prepared shapes hold.
+        max: usize,
+    },
+    /// A token row longer than the longest prepared length.
+    #[error("encode row {row} has {tokens} tokens, over the {max} the engine is fitted for")]
+    RowTooLong {
+        /// Index of the row in the request.
+        row: usize,
+        /// Tokens the row has.
+        tokens: usize,
+        /// The longest prepared length.
+        max: usize,
+    },
+    /// Token rows on a driver that admitted no encode shapes: they are fitted at startup, never prepared on first use.
+    #[error("the driver admitted no encode shapes: token rows are prepared before serving")]
+    NotPrepared,
 }
 
 /// A [`DriverOptions`](crate::driver::DriverOptions) value the model cannot honor.
@@ -428,6 +449,9 @@ pub enum InvalidOptions {
     /// A driver admits one KV layout, and one pool size: state avals pin one cache per driver.
     #[error("the driver already admitted a different KV layout or pool size")]
     LayoutChanged,
+    /// A driver admits one set of encode shapes: its entries pin one row count and one longest row.
+    #[error("the driver already admitted different encode shapes")]
+    EncodeShapesChanged,
     /// A verify window is a query token plus at least one draft.
     #[error("a verify window of width {width} is narrower than two")]
     WindowBelowTwo {

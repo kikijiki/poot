@@ -1,17 +1,32 @@
-//! ssh / scp to the pod via the system OpenSSH client. Host-key checking is disabled because every
-//! run gets a fresh pod.
+//! ssh / scp to the pod via the system OpenSSH client. RunPod's API publishes no host key, so the
+//! first connection of a run records the pod's key in that run's own known-hosts file
+//! (`StrictHostKeyChecking=accept-new`) and every later connection of the run must match it.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
-/// An SSH connection to a pod: public host, the mapped 22/tcp port, and the private key path.
+/// An SSH connection to a pod: public host, the mapped 22/tcp port, the private key path, and the
+/// run's known-hosts file.
 #[derive(Debug, Clone)]
 pub(crate) struct Endpoint {
     pub host: String,
     pub port: u16,
     pub key: String,
+    pub known_hosts: PathBuf,
+}
+
+/// What `exec` needs from the machine it drives: [`Endpoint`] in production, a local shell in tests.
+/// Every remote command carries a deadline.
+pub(crate) trait Remote {
+    /// Block until the machine accepts ssh, or `timeout` elapses.
+    fn wait_ssh(&self, timeout: Duration) -> Result<()>;
+    /// Copy `local` to `remote`.
+    fn scp_up(&self, local: &str, remote: &str) -> Result<()>;
+    /// Run `cmd`, killing it at `deadline`. A non-zero exit is a [`Run`], not an error.
+    fn ssh_until(&self, cmd: &str, deadline: Instant) -> Result<Run, DeadlineError>;
 }
 
 /// Result of a remote command.
@@ -174,20 +189,24 @@ pub(crate) fn output_until(
 }
 
 impl Endpoint {
-    pub(crate) fn new(host: impl Into<String>, port: u16, key: impl Into<String>) -> Endpoint {
+    pub(crate) fn new(
+        host: impl Into<String>,
+        port: u16,
+        key: impl Into<String>,
+        known_hosts: impl Into<PathBuf>,
+    ) -> Endpoint {
         Endpoint {
             host: host.into(),
             port,
             key: key.into(),
+            known_hosts: known_hosts.into(),
         }
     }
 
     fn base_opts(&self) -> Vec<String> {
         let mut v: Vec<String> = [
             "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            "StrictHostKeyChecking=accept-new",
             "-o",
             "ConnectTimeout=15",
             "-o",
@@ -198,27 +217,16 @@ impl Endpoint {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        v.push("-o".to_string());
+        v.push(format!("UserKnownHostsFile={}", self.known_hosts.display()));
         v.push("-i".to_string());
         v.push(self.key.clone());
         v
     }
 
-    /// Run `cmd` on the pod, capturing output, killing the ssh child at `deadline`.
-    /// Does not fail on a non-zero exit; the caller inspects `code`.
-    ///
-    /// This is a buffered capture path: nothing streams before the command exits.
-    pub(crate) fn ssh_until(&self, cmd: &str, deadline: Instant) -> Result<Run, DeadlineError> {
-        if Instant::now() >= deadline {
-            return Err(DeadlineError::Timeout);
-        }
-        let mut c = self.ssh_command(cmd);
-        let out = output_until(&mut c, deadline)?;
-        Ok(run_from_output(out))
-    }
-
     /// Run `cmd` to completion, capturing output. No deadline: long exec payloads
     /// must not be killed by a budget they never opted into (R4/N1).
-    /// [`Self::ssh_until`] is the deadline variant.
+    /// [`Remote::ssh_until`] is the deadline variant.
     pub(crate) fn ssh(&self, cmd: &str) -> Result<Run> {
         let mut c = self.ssh_command(cmd);
         let out = output_plain(&mut c).map_err(|e| anyhow!("{e}"))?;
@@ -249,20 +257,6 @@ impl Endpoint {
             ));
         }
         Ok(r.stdout)
-    }
-
-    /// Upload `local` to `remote`. No deadline on the plain path (R4/N1).
-    /// `-r` lets directories copy whole and is a no-op for regular files.
-    pub(crate) fn scp_up(&self, local: &str, remote: &str) -> Result<()> {
-        let mut c = self.scp_up_command(local, remote);
-        let st = output_plain(&mut c).map_err(|e| anyhow!("{e}"))?;
-        if !st.status.success() {
-            return Err(anyhow!(
-                "scp up {local} -> {remote} failed (rc={:?})",
-                st.status.code()
-            ));
-        }
-        Ok(())
     }
 
     /// Shared scp-up argv builder so plain and `_until` options cannot drift.
@@ -298,10 +292,39 @@ impl Endpoint {
         }
         Ok(())
     }
+}
+
+impl Remote for Endpoint {
+    /// Run `cmd` on the pod, capturing output, killing the ssh child at `deadline`.
+    /// Does not fail on a non-zero exit; the caller inspects `code`.
+    ///
+    /// This is a buffered capture path: nothing streams before the command exits.
+    fn ssh_until(&self, cmd: &str, deadline: Instant) -> Result<Run, DeadlineError> {
+        if Instant::now() >= deadline {
+            return Err(DeadlineError::Timeout);
+        }
+        let mut c = self.ssh_command(cmd);
+        let out = output_until(&mut c, deadline)?;
+        Ok(run_from_output(out))
+    }
+
+    /// Upload `local` to `remote`. No deadline on the plain path (R4/N1).
+    /// `-r` lets directories copy whole and is a no-op for regular files.
+    fn scp_up(&self, local: &str, remote: &str) -> Result<()> {
+        let mut c = self.scp_up_command(local, remote);
+        let st = output_plain(&mut c).map_err(|e| anyhow!("{e}"))?;
+        if !st.status.success() {
+            return Err(anyhow!(
+                "scp up {local} -> {remote} failed (rc={:?})",
+                st.status.code()
+            ));
+        }
+        Ok(())
+    }
 
     /// Poll until an `echo` over SSH succeeds (PUBLIC_KEY injection lags the endpoint by tens of seconds),
     /// or `timeout` elapses.
-    pub(crate) fn wait_ssh(&self, timeout: Duration) -> Result<()> {
+    fn wait_ssh(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Ok(r) = self.ssh_until("echo ok", deadline)

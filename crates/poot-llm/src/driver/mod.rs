@@ -105,7 +105,7 @@ pub use caps::{
 };
 use chunks::ChunkPolicy;
 pub use embeds::PromptEmbeds;
-pub use encode::{EncodeRequest, EncodeRow, Encoded};
+pub use encode::{EncodeCaps, EncodeRequest, EncodeRow, EncodeShapes, Encoded};
 use error::{
     DriverError, InvalidOptions, InvalidRequest, PreparedSetRefusal, SpeculationRefusal,
     Unsupported,
@@ -723,6 +723,8 @@ pub struct Driver {
     /// The one layout `prepare` has admitted, and the caps it published.
     layout: Option<Layout>,
     caps: Option<DriverCaps>,
+    /// The token-row shapes [`Driver::prepare_encode`] admitted; `None` for a driver that serves none.
+    encode_shapes: Option<EncodeShapes>,
     /// Whether `generate` reports [`Generation::timing`] ([`Driver::with_phase_timing`]).
     time_phases: bool,
     /// The expert pool, when routed experts are paged ([`Driver::with_expert_pool`]).
@@ -930,6 +932,7 @@ impl Driver {
             serving: None,
             layout: None,
             caps: None,
+            encode_shapes: None,
             time_phases: false,
             pool: None,
             hidden: None,
@@ -1305,6 +1308,13 @@ impl Driver {
         phase: Phase,
     ) -> Result<Prepared, DriverError> {
         let id = self.executor.add_entry(exe, program)?;
+        let numerics = program.numerics_class();
+        tracing::debug!(
+            ?numerics,
+            tolerance = numerics.tolerance(),
+            ?phase,
+            "entry added"
+        );
         self.stats.entries_added += 1;
         self.hold(&reservation);
         Ok(Prepared {

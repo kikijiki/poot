@@ -24,7 +24,10 @@ use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot, Mem
 use poot_target::{AmdArch, Backend, DeviceCaps, Queried, TargetId};
 
 use super::*;
+use clap::Parser;
+
 use crate::admin::LoraAdminPolicy;
+use crate::config::ServeConfig;
 use crate::http::handle;
 use crate::tests::{load_handle, test_metrics, write_tiny_gguf};
 use poot_graph_plan::test_support::gpu_caps_mut;
@@ -98,7 +101,9 @@ fn an_exact_per_device_capacity_admits_each_placement_at_its_smallest_candidate(
         let capacity = needs.map(|bytes| bytes + SUPPORT_RESERVE_BYTES);
         let started = build_group_with_capacity(&args, &handle, &loaded, [0, 0], capacity, &health)
             .unwrap_or_else(|error| panic!("{label}: the exact capacity is refused: {error}"));
-        let Workload::Generate { rows, max_seq } = started.plan.workload;
+        let Workload::Generate { rows, max_seq } = started.plan.workload else {
+            panic!("a generative model plans generation");
+        };
         assert_eq!(
             (rows, max_seq),
             (smallest.rows, smallest.max_seq),
@@ -401,6 +406,15 @@ fn probe_reporting(
     (executor, add_entries)
 }
 
+/// The generation workload at `candidate`'s shapes.
+fn generate(candidate: impl std::borrow::Borrow<Candidate>) -> Workload {
+    let candidate = candidate.borrow();
+    Workload::Generate {
+        rows: candidate.rows,
+        max_seq: candidate.max_seq,
+    }
+}
+
 fn fixture_model() -> Arc<ModelHandle> {
     let path = write_tiny_gguf();
     let handle = load_handle(&path);
@@ -413,7 +427,7 @@ fn args(backend: BackendChoice) -> EngineArgs {
     EngineArgs {
         backend,
         placement: PlacementSpec::Single,
-        rows: NonZeroUsize::new(4).unwrap(),
+        rows: NonZeroUsize::new(4),
         max_seq: NonZeroUsize::new(64).unwrap(),
         draft: DraftPolicy::Off,
         embeds: false,
@@ -439,7 +453,7 @@ fn live_total(handle: &Arc<ModelHandle>, candidate: &Candidate) -> u64 {
     let mut driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
-        driver_options(handle, candidate.max_seq, DraftPolicy::Off),
+        driver_options(handle, generate(candidate), DraftPolicy::Off),
     )
     .expect("driver");
     let rows = [candidate.rows];
@@ -455,7 +469,7 @@ fn live_total(handle: &Arc<ModelHandle>, candidate: &Candidate) -> u64 {
 
 fn candidates(handle: &Arc<ModelHandle>, args: &EngineArgs) -> Vec<Candidate> {
     let max_seq = NonZeroUsize::new(args.max_seq.get().min(handle.config().max_positions)).unwrap();
-    domain(args.rows, max_seq)
+    domain(args.rows.unwrap(), max_seq)
 }
 
 /// Build the plan over `executor`, recording which backend choices `open` was called with.
@@ -658,7 +672,9 @@ fn the_search_admits_the_largest_fitting_candidate_and_refuses_the_next() {
         let budget = known(SUPPORT_RESERVE_BYTES + limit);
         let (started, _) = build_with(&args, &handle, executor, |_| budget.clone(), &health);
         let started = started.unwrap_or_else(|error| panic!("limit {limit}: {error}"));
-        let Workload::Generate { rows, max_seq } = started.plan.workload;
+        let Workload::Generate { rows, max_seq } = started.plan.workload else {
+            panic!("a generative model plans generation");
+        };
         assert_eq!(
             (rows, max_seq),
             (domain[expected].rows, domain[expected].max_seq),
@@ -694,7 +710,7 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
         let rows = [candidate.rows];
         let planned = planner
             .plan(
-                driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off),
                 &shapes_of(&candidate, &rows),
                 false,
             )
@@ -703,7 +719,7 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
         let mut driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
-            driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
+            driver_options(&handle, generate(candidate), DraftPolicy::Off),
         )
         .unwrap();
         driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
@@ -775,7 +791,7 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         let r = [candidate.rows];
         let planned = planner
             .plan(
-                driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off),
                 &shapes_of(candidate, &r),
                 false,
             )
@@ -814,7 +830,7 @@ fn startup_reads_the_weights_once_however_many_candidates_it_plans() {
         let mut driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
-            driver_options(&handle, chosen.max_seq, DraftPolicy::Off),
+            driver_options(&handle, generate(chosen), DraftPolicy::Off),
         )
         .expect("driver");
         let rows = [chosen.rows];
@@ -832,7 +848,9 @@ fn startup_reads_the_weights_once_however_many_candidates_it_plans() {
     let health = EngineHealth::starting();
     let (started, _) = build_with(&args, &handle, executor, |_| budget.clone(), &health);
     let started = started.expect("the last candidate fits");
-    let Workload::Generate { rows, max_seq } = started.plan.workload;
+    let Workload::Generate { rows, max_seq } = started.plan.workload else {
+        panic!("a generative model plans generation");
+    };
     assert_eq!(
         (rows, max_seq),
         (domain[last].rows, domain[last].max_seq),
@@ -861,7 +879,7 @@ fn loaded_kernels(handle: &Arc<ModelHandle>, candidate: &Candidate) -> HashSet<u
     let mut driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
-        driver_options(handle, candidate.max_seq, DraftPolicy::Off),
+        driver_options(handle, generate(candidate), DraftPolicy::Off),
     )
     .expect("driver");
     let rows = [candidate.rows];
@@ -894,7 +912,7 @@ fn a_planner_resolves_each_distinct_kernel_once_across_candidates() {
         let rows = [candidate.rows];
         planner
             .plan(
-                driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
+                driver_options(&handle, generate(candidate), DraftPolicy::Off),
                 &shapes_of(candidate, &rows),
                 false,
             )
@@ -1023,7 +1041,7 @@ fn admission_uses_the_fresh_budget_and_publishes_only_the_chosen_candidate() {
         let mut driver = Driver::new(
             Arc::clone(&handle),
             Box::new(reference),
-            driver_options(&handle, domain[k].max_seq, DraftPolicy::Off),
+            driver_options(&handle, generate(domain[k]), DraftPolicy::Off),
         )
         .expect("driver");
         let rows = [domain[k].rows];
@@ -1049,7 +1067,9 @@ fn admission_uses_the_fresh_budget_and_publishes_only_the_chosen_candidate() {
         &EngineHealth::starting(),
     );
     let started = started.expect("the k-th candidate fits the fresh budget");
-    let Workload::Generate { rows, max_seq } = started.plan.workload;
+    let Workload::Generate { rows, max_seq } = started.plan.workload else {
+        panic!("a generative model plans generation");
+    };
     assert_eq!((rows, max_seq), (domain[k].rows, domain[k].max_seq));
     assert_eq!(
         add_entries.load(Ordering::SeqCst),
@@ -1130,18 +1150,21 @@ fn live_allocations_are_admitted_against_the_budget_observed_after_prepare() {
     assert_eq!((required, available), (total, total - 1));
 }
 
-/// SC-005: an encoder or cross-encoder prepares its entries on first use, so its allocations cannot be
-/// accounted before `Serving`: startup refuses it with a typed variant before any device opens. Mutation:
-/// let `Workload::of` plan them; the build opens a device and publishes `Serving`.
+/// POOT-1204 SC-001: an embedding or rerank model is planned and prepared like a generative one: the
+/// fitted encode shapes compile before `Serving`, so a request afterwards compiles nothing, adds no
+/// executor entry and allocates no device byte. The request runs through the production
+/// `Driver::encode` on the counting fixture device. Mutation: skip the entry loop in
+/// `Driver::prepare_encode` and prepare on a miss in `Driver::encode` (the lazy path); the request
+/// adds an entry, compiles, and the counters move.
 #[test]
-fn encoder_models_are_refused_as_not_accounted_before_a_device_opens() {
+fn an_encoder_request_after_serving_compiles_and_allocates_nothing() {
     for (variant, label) in [
         (None, "hidden states"),
         (Some("cross_encoder"), "classifier scores"),
     ] {
         let handle = crate::tests::encoder_routes::encoder_handle(variant);
         let health = EngineHealth::starting();
-        let (executor, _) = probe(spirv_target(), 0);
+        let (executor, add_entries) = probe(spirv_target(), 0);
         let (result, opened) = build_with(
             &args(BackendChoice::Wgpu),
             &handle,
@@ -1149,16 +1172,152 @@ fn encoder_models_are_refused_as_not_accounted_before_a_device_opens() {
             roomy,
             &health,
         );
-        let Err(StartupError::NotAccounted { output }) = result else {
+        let Started { plan, mut driver } =
+            result.unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert_eq!(opened.len(), 1, "{label}");
+        assert!(matches!(health.state(), EngineState::Serving { .. }));
+        let Workload::Encode { rows, max_seq } = plan.workload else {
             panic!(
-                "{label}: expected the typed refusal, got {:?}",
-                result.err()
+                "{label}: an encoder is an encode workload, got {:?}",
+                plan.workload
             );
         };
-        assert!(output.contains(label), "{output}");
-        assert!(opened.is_empty(), "no device was opened");
-        assert_eq!(health.state(), EngineState::Starting);
+        assert_eq!(
+            (rows.get(), max_seq.get()),
+            (4, 16),
+            "{label}: the requested rows, the model's positions"
+        );
+        let fitted = plan
+            .caps
+            .encode
+            .as_ref()
+            .expect("the caps carry the encode shapes");
+        let lengths: Vec<usize> = fitted.lengths.iter().map(|len| len.get()).collect();
+        assert_eq!(lengths, [1, 2, 4, 8, 16], "{label}");
+
+        let entries = add_entries.load(Ordering::SeqCst);
+        let compiles = driver.stats().compiles;
+        let live = driver.live_role_bytes();
+        let ids = [1u32, 2, 3];
+        let rows = [
+            poot_llm::driver::EncodeRow::Tokens {
+                ids: &ids,
+                types: &[],
+            },
+            poot_llm::driver::EncodeRow::Tokens {
+                ids: &ids[..2],
+                types: &[],
+            },
+        ];
+        driver
+            .encode(&poot_llm::driver::EncodeRequest { rows: &rows })
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert_eq!(
+            add_entries.load(Ordering::SeqCst),
+            entries,
+            "{label}: no entry added"
+        );
+        assert_eq!(
+            driver.stats().compiles,
+            compiles,
+            "{label}: nothing compiled"
+        );
+        assert_eq!(driver.live_role_bytes(), live, "{label}: nothing allocated");
     }
+}
+
+/// POOT-1204 review: a generative model whose family traces an embedding pass plans its encode entries
+/// beside its decode ones, from the same fit, so a decoder keeps `/v1/embeddings` and `/v1/rerank` and a
+/// request after `Serving` compiles and allocates nothing. A family that refuses the `Encode` phase
+/// serves generation only: no encode caps. Mutation: skip the `IfTraced` encode preparation in
+/// `fit_and_prepare`: the decoder's caps carry no encode shapes and the request is refused.
+#[test]
+fn a_decoder_plans_its_embedding_pass_and_a_family_without_one_serves_generation_only() {
+    let decoder = dense_model();
+    let (executor, add_entries) = probe(spirv_target(), 0);
+    let health = EngineHealth::starting();
+    let (result, _) = build_with(
+        &args(BackendChoice::Wgpu),
+        &decoder,
+        executor,
+        roomy,
+        &health,
+    );
+    let Started { plan, mut driver } = result.expect("the decoder starts");
+    assert!(matches!(plan.workload, Workload::Generate { .. }));
+    let fitted = plan
+        .caps
+        .encode
+        .as_ref()
+        .expect("the decoder plans its embedding pass");
+    assert_eq!(
+        fitted.rows.get(),
+        plan.rows(),
+        "the encode rows are the fitted rows"
+    );
+    let (entries, compiles, live) = (
+        add_entries.load(Ordering::SeqCst),
+        driver.stats().compiles,
+        driver.live_role_bytes(),
+    );
+    let ids = [1u32, 2, 3];
+    driver
+        .encode(&poot_llm::driver::EncodeRequest {
+            rows: &[poot_llm::driver::EncodeRow::Tokens {
+                ids: &ids,
+                types: &[],
+            }],
+        })
+        .expect("the planned shape runs");
+    assert_eq!(
+        add_entries.load(Ordering::SeqCst),
+        entries,
+        "no entry added"
+    );
+    assert_eq!(driver.stats().compiles, compiles, "nothing compiled");
+    assert_eq!(driver.live_role_bytes(), live, "nothing allocated");
+
+    let recurrent = recurrent_handle();
+    let (executor, _) = probe(spirv_target(), 0);
+    let health = EngineHealth::starting();
+    let (result, _) = build_with(
+        &args(BackendChoice::Wgpu),
+        &recurrent,
+        executor,
+        roomy,
+        &health,
+    );
+    let started = result.expect("a family without an embedding pass still serves generation");
+    assert!(
+        started.plan.caps.encode.is_none(),
+        "{:?}",
+        started.plan.caps
+    );
+}
+
+/// POOT-1204 SC-004: `--rows` and `--max-seq` are the shapes the plan is fitted at, through the real
+/// parser and `engine_args`. A model with 1024 positions at `--rows 2 --max-seq 1024` is planned at
+/// exactly those shapes. Mutation: build `EngineArgs` from the defaults (hard-code 4 rows) in
+/// `engine_args`; the plan has four rows and the row goes red.
+#[test]
+fn rows_and_max_seq_flags_are_the_shapes_the_plan_is_fitted_at() {
+    let config = ServeConfig::try_parse_from(["poot-serve", "--rows", "2", "--max-seq", "1024"])
+        .expect("the flags parse");
+    let args = crate::startup::engine_args(&config, DraftPolicy::Off).expect("engine args");
+    let handle = dense_model_of(1024);
+    let health = EngineHealth::starting();
+    let (executor, _) = probe(spirv_target(), 0);
+    let (result, _) = build_with(&args, &handle, executor, roomy, &health);
+    let started = result.expect("a roomy device fits the requested shapes");
+    assert_eq!(
+        started.plan.workload,
+        Workload::Generate {
+            rows: NonZeroUsize::new(2).unwrap(),
+            max_seq: NonZeroUsize::new(1024).unwrap(),
+        }
+    );
+    assert_eq!(started.plan.caps.max_seq.get(), 1024);
+    assert_eq!(started.plan.caps.rows.get(), 2);
 }
 
 /// The budget is the runtime's live answer, not the figure the device queried when it opened. The target
@@ -1180,7 +1339,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
     let mut oracle = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
-        driver_options(&handle, first.max_seq, DraftPolicy::Off),
+        driver_options(&handle, generate(first), DraftPolicy::Off),
     )
     .unwrap();
     oracle.prepare(&shapes_of(&first, &[first.rows])).unwrap();
@@ -1217,7 +1376,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
             Planner::new(Arc::clone(&handle), &targets, Placement::Single)
                 .unwrap()
                 .plan(
-                    driver_options(&handle, c.max_seq, DraftPolicy::Off),
+                    driver_options(&handle, generate(c), DraftPolicy::Off),
                     &shapes_of(&c, &rows),
                     false,
                 )
@@ -1314,7 +1473,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let rows = [candidate.rows];
     let planned = planner
         .plan(
-            driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
+            driver_options(&handle, generate(candidate), DraftPolicy::Off),
             &shapes_of(&candidate, &rows),
             false,
         )
@@ -1329,7 +1488,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
     let mut driver = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
-        driver_options(&handle, candidate.max_seq, DraftPolicy::Off),
+        driver_options(&handle, generate(candidate), DraftPolicy::Off),
     )
     .unwrap();
     driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
@@ -1405,7 +1564,14 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
         let rows = [NonZeroUsize::new(rows).unwrap()];
         let planned = planner
             .plan(
-                driver_options(&handle, max_seq, DraftPolicy::Off),
+                driver_options(
+                    &handle,
+                    Workload::Generate {
+                        rows: rows[0],
+                        max_seq,
+                    },
+                    DraftPolicy::Off,
+                ),
                 &ServingShapes {
                     layout: Layout::Paged(pool),
                     rows: &rows,
@@ -1443,7 +1609,9 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
     let health = EngineHealth::starting();
     let (started, _) = build_with(&args, &handle, executor, roomy, &health);
     let started = started.expect("the recurrent family starts");
-    let Workload::Generate { rows, .. } = started.plan.workload;
+    let Workload::Generate { rows, .. } = started.plan.workload else {
+        panic!("a generative model plans generation");
+    };
     assert!(rows.get() > 1, "the fitted plan serves {rows} rows");
 }
 
@@ -1600,7 +1768,7 @@ fn smallest_candidate_bytes(
     let planned = Planner::new(Arc::clone(handle), &targets, placement)
         .expect("a planner")
         .plan(
-            driver_options(handle, candidate.max_seq, DraftPolicy::Off),
+            driver_options(handle, generate(candidate), DraftPolicy::Off),
             &shapes_of(&candidate, &rows),
             false,
         )
@@ -1780,6 +1948,11 @@ fn a_tensor_placement_of_an_unsplittable_model_is_a_typed_refusal() {
 
 /// A dense two-head qwen2 checkpoint the Megatron rule can divide over two ranks.
 fn dense_model() -> Arc<ModelHandle> {
+    dense_model_of(64)
+}
+
+/// [`dense_model`] with `positions` context positions.
+fn dense_model_of(positions: u32) -> Arc<ModelHandle> {
     use poot_load::gguf::{GgufValue, write_gguf};
     let (h, inter, vocab) = (8usize, 16usize, 8usize);
     let mut tensors = Vec::new();
@@ -1818,7 +1991,7 @@ fn dense_model() -> Arc<ModelHandle> {
         ("qwen2.attention.head_count", GgufValue::U32(2)),
         ("qwen2.attention.head_count_kv", GgufValue::U32(2)),
         ("qwen2.feed_forward_length", GgufValue::U32(inter as u32)),
-        ("qwen2.context_length", GgufValue::U32(64)),
+        ("qwen2.context_length", GgufValue::U32(positions)),
         ("tokenizer.ggml.eos_token_id", GgufValue::U32(7)),
         (
             "tokenizer.ggml.tokens",

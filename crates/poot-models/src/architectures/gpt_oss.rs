@@ -48,7 +48,7 @@ const SPEC: DenseSpec = DenseSpec {
     family: FAMILY,
     gguf: dense_keys!("gpt-oss"),
     hf_theta: 150_000.0,
-    gguf_theta: 150_000.0,
+    gguf_theta: Some(150_000.0),
     eps: 1e-5,
     eos: None,
 };

@@ -10,7 +10,7 @@
 //! `just test-device-ptx` and the PTX pod runs), so this test never reports a skip as a
 //! pass on a lane that was supposed to run it.
 
-use poot_codegen::{Target, artifact_path, compile};
+use poot_codegen::{Target, artifact_path, compile_kernel};
 use poot_kernelgen as kg;
 use poot_ptx_runtime::PtxContext;
 
@@ -40,9 +40,9 @@ fn wmma_tile_dispatches_and_matches_cpu_on_ptx() {
     let dir = std::env::temp_dir().join("poot-ptx-wmma-dispatch-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out = artifact_path(&dir, "wmma_tile_ptx", Target::Nvptx);
-    compile(&body, Target::Nvptx, &out).expect("wmma_tile must compile to PTX");
-    let ptx_bytes = std::fs::read(&out).expect("read compiled PTX");
-    let kernel = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, ptx_bytes);
+    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out)
+        .expect("wmma_tile must compile to PTX");
+    let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
     let a_data: Vec<f32> = (0..256).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
     let b_data: Vec<f32> = (0..256).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
@@ -134,9 +134,9 @@ fn run_attention_over_keys_on_ptx(
     let dir = std::env::temp_dir().join("poot-ptx-attention-dispatch-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out_path = artifact_path(&dir, name, Target::Nvptx);
-    compile(&body, Target::Nvptx, &out_path).expect("the attention kernel must compile to PTX");
-    let ptx_bytes = std::fs::read(&out_path).expect("read compiled PTX");
-    let kernel = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, ptx_bytes);
+    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out_path)
+        .expect("the attention kernel must compile to PTX");
+    let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
     let q_buf = ctx.upload_f32(q).expect("upload q");
     let k_buf = ctx.upload_f32(k).expect("upload k");

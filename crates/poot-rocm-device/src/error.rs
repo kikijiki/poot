@@ -1,6 +1,6 @@
 //! Error type for [`crate::device::RocmDevice`].
 
-use poot_codegen::CompileError;
+use poot_codegen::{ArtifactMismatch, CompileError};
 use poot_rocm_runtime::RocmError;
 use thiserror::Error;
 
@@ -17,6 +17,9 @@ pub enum RocmGpuError {
     /// Generating or compiling the device's copy kernel failed.
     #[error("copy kernel codegen: {0}")]
     Codegen(#[source] Box<CompileError>),
+    /// The copy kernel's compiled artifact is not the one compiled from its body.
+    #[error("copy kernel artifact: {0}")]
+    KernelArtifact(#[source] Box<ArtifactMismatch>),
     /// A host I/O operation failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -29,6 +32,12 @@ pub enum RocmGpuError {
 impl From<RocmError> for RocmGpuError {
     fn from(error: RocmError) -> Self {
         RocmGpuError::Rocm(Box::new(error))
+    }
+}
+
+impl From<ArtifactMismatch> for RocmGpuError {
+    fn from(error: ArtifactMismatch) -> Self {
+        RocmGpuError::KernelArtifact(Box::new(error))
     }
 }
 

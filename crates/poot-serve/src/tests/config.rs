@@ -59,6 +59,7 @@ fn defaults_are_the_documented_ones() {
     assert_eq!(config.draft_model, None);
     assert_eq!(config.rate_limit_rpm, 0);
     assert_eq!(config.max_connections, 4096);
+    assert_eq!((config.rows, config.max_seq.get()), (None, 4096));
     assert_eq!(config.max_pending_requests.get(), 256);
     assert_eq!(config.max_body_mib, 4);
     assert_eq!(config.max_image_body_mib, 64);
@@ -579,4 +580,25 @@ fn a_device_group_refuses_device_timing() {
     assert!(error.to_string().contains("--device-timing"), "{error}");
     let ok = self::config(&["--placement", "tensor:0,1"]);
     assert!(crate::startup::engine_args(&ok, DraftPolicy::Off).is_ok());
+}
+
+/// POOT-1204 SC-004: `--rows` and `--max-seq` take positive whole numbers; zero and text are refused at
+/// parse, naming the value. Mutation: parse them as plain `usize` (accept zero); the zero rows pass and
+/// the row goes red.
+#[test]
+fn rows_and_max_seq_are_positive_whole_numbers() {
+    let parsed = config(&["--rows", "2", "--max-seq", "1024"]);
+    assert_eq!(
+        (parsed.rows.map(|r| r.get()), parsed.max_seq.get()),
+        (Some(2), 1024)
+    );
+    for flags in [
+        ["--rows", "0"],
+        ["--rows", "-1"],
+        ["--rows", "many"],
+        ["--max-seq", "0"],
+    ] {
+        let error = parse(&flags).expect_err("a non-positive count is refused at parse");
+        assert!(error.contains(flags[1]), "{flags:?}: {error}");
+    }
 }

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::model::{KvLayout, LogitRows, Model, Phase, StepShape};
 use crate::registry::{RawConfig, Registry};
 use poot_executor::{ExecError, Executor, NoSync, StepInputs};
-use poot_executor_parity::{TIER2, assert_close};
+use poot_executor_parity::assert_close;
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::{Graph, Slot, SlotKey};
 use poot_graph_plan::{
     CompileOptions, Target, WeightFormats, bind_packed_weights, multi_device::topology::DeviceId,
@@ -430,10 +431,19 @@ pub fn compile(g: &Graph, target: Target) -> StagedProgram {
 /// The cache capacity every fixture step traces with.
 pub const CAPACITY: usize = 8;
 
+/// What [`run_steps`] returns: each step's logits, and the numerics class they are compared within.
+pub struct Run {
+    /// Each step's logits.
+    pub logits: Vec<Vec<f32>>,
+    /// The loosest class among the programs the steps ran: the class the run's logits are compared with an
+    /// oracle within, or with another run's (`a.class.max(b.class)`).
+    pub class: Tier2Class,
+}
+
 /// Load `store` bound through `map` on `exec`, then run `steps` in order over carried state (zero at
 /// the start), one entry per distinct (phase, token count), each traced over [`CAPACITY`].
 /// `prepare` rewrites each traced graph before it compiles (identity, or a legalize for a fixture
-/// cap). Returns each step's logits.
+/// cap). Returns each step's logits and the class of the programs it ran.
 pub fn run_steps(
     exec: &mut dyn Executor,
     target: Target,
@@ -442,17 +452,20 @@ pub fn run_steps(
     map: Arc<WeightMap>,
     steps: &[Step],
     prepare: &dyn Fn(Graph) -> Graph,
-) -> Result<Vec<Vec<f32>>, ExecError> {
+) -> Result<Run, ExecError> {
     let exe = exec.load_weights(store, Arc::clone(&map))?;
     let mut entries = HashMap::new();
     let mut logits = Vec::with_capacity(steps.len());
+    let mut class = Tier2Class::BitExact;
     for step in steps {
         let key = (step.phase, step.ids.len());
         let entry = match entries.get(&key) {
             Some(&entry) => entry,
             None => {
                 let g = prepare(trace(model, &map, step.phase, step.ids.len(), CAPACITY));
-                let entry = exec.add_entry(exe, &compile(&g, target))?;
+                let program = compile(&g, target);
+                class = class.max(program.numerics_class());
+                let entry = exec.add_entry(exe, &program)?;
                 entries.insert(key, entry);
                 entry
             }
@@ -463,7 +476,7 @@ pub fn run_steps(
         logits.push(out.as_f32().expect("f32 logits").to_vec());
     }
     exec.unload(exe)?;
-    Ok(logits)
+    Ok(Run { logits, class })
 }
 
 /// Token-by-token decode of `ids` from position 0.
@@ -530,8 +543,9 @@ pub fn check_matches_oracle(
         &|g| g,
     )
     .unwrap_or_else(|e| panic!("{projections:?}: {e}"));
+    let got_class = got.class;
     let mut state: Vec<HostTensor> = Vec::new();
-    for (step, got) in steps.iter().zip(&got) {
+    for (step, got) in steps.iter().zip(&got.logits) {
         let g = trace(
             m.model.as_ref(),
             &m.map,
@@ -550,7 +564,7 @@ pub fn check_matches_oracle(
         assert_close(
             got,
             want.as_f32().expect("f32 logits"),
-            TIER2,
+            got_class.tolerance(),
             &format!("{projections:?} {:?} at {}", step.phase, step.start),
         );
     }
@@ -580,18 +594,18 @@ pub fn check_chunked_prefill(exec: &mut dyn Executor, target: Target) {
             &|g| g,
         )
         .unwrap();
-        token_rows(&logits, DIMS.vocab)
+        (token_rows(&logits.logits, DIMS.vocab), logits.class)
     };
     let sequence: Vec<i32> = prompt.iter().chain(&decode).copied().collect();
-    let reference = run(exec, &decode_steps(&sequence));
+    let (reference, reference_class) = run(exec, &decode_steps(&sequence));
     for chunk in [1, 3, prompt.len()] {
-        let got = run(exec, &chunked_steps(&prompt, chunk, &decode));
+        let (got, class) = run(exec, &chunked_steps(&prompt, chunk, &decode));
         assert_eq!(got.len(), reference.len());
         for (position, (got, want)) in got.iter().zip(&reference).enumerate() {
             assert_close(
                 got,
                 want,
-                TIER2,
+                class.max(reference_class).tolerance(),
                 &format!("chunk {chunk}, position {position}"),
             );
         }
@@ -614,7 +628,7 @@ pub fn check_fused_views(exec: &mut dyn Executor, target: Target, projections: P
     };
     let separate = run(exec, Arc::clone(&m.store), Arc::clone(&m.map));
     let viewed = run(exec, store, map);
-    for (step, (got, want)) in viewed.iter().zip(&separate).enumerate() {
+    for (step, (got, want)) in viewed.logits.iter().zip(&separate.logits).enumerate() {
         let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
         let want: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
         assert!(
@@ -694,8 +708,9 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
             })
             .collect::<Vec<_>>()
     };
-    for (step, (got, want)) in chunked.iter().zip(&whole).enumerate() {
-        assert_close(got, want, TIER2, &format!("split head, step {step}"));
+    let tolerance = whole.class.max(chunked.class).tolerance();
+    for (step, (got, want)) in chunked.logits.iter().zip(&whole.logits).enumerate() {
+        assert_close(got, want, tolerance, &format!("split head, step {step}"));
         assert_eq!(
             greedy(got),
             greedy(want),
@@ -706,7 +721,7 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
 
 /// POOT-651: a qwen2.5-0.5B-shaped BF16 checkpoint whose head is tied to the embedding (two layers; vocab,
 /// hidden, heads and intermediate width are the real ones) decodes through the weight map. Every step's
-/// logits equal `oracle` within [`TIER2`], and the executable's `Weight` residency is exactly the stored tensors
+/// logits equal `oracle` within its program's numerics class, and the executable's `Weight` residency is exactly the stored tensors
 /// at two bytes per element: the tied head and the embedding share one packed BF16 buffer and no F32 copy of the
 /// head exists.
 pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedOracle<'_>) {
@@ -747,7 +762,8 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
     let exe = exec
         .load_weights(Arc::clone(&store), Arc::clone(&map))
         .unwrap();
-    let entry = exec.add_entry(exe, &compile(&g, target)).unwrap();
+    let program = compile(&g, target);
+    let entry = exec.add_entry(exe, &program).unwrap();
     let mut state: Vec<HostTensor> = g
         .state()
         .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
@@ -766,7 +782,7 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
         assert_close(
             got.as_f32().unwrap(),
             want.as_f32().unwrap(),
-            TIER2,
+            program.numerics_class().tolerance(),
             &format!("tied head, decode at {}", step.start),
         );
     }

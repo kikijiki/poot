@@ -2,6 +2,7 @@ use super::*;
 
 use super::recording_engine::peak_open;
 use crate::batch::engine::Exit;
+use crate::types::{AdminError, AdminJob, AdminReply, AdminRequest};
 
 /// SC-001: the loop clamps one step's prefill work to the token budget. Three rows of four prompt tokens
 /// are open at once on a four-wide engine (budget: the widest piece plus one token per row), so a step
@@ -252,4 +253,185 @@ fn the_loop_counts_the_drivers_accepted_drafts_not_the_tokens_a_round_returned()
     let (_, metrics, _) = serve(&mut engine, vec![JobSpec::new("ab", 3)]);
     assert_eq!(count(&metrics.speculative.skipped), 2);
     assert_eq!(count(&metrics.speculative.rounds), 0);
+}
+
+/// Queue `first`, then `admins` administration jobs, then `second`, close the queue and run the loop on
+/// this thread. Returns the replies of the administration jobs.
+fn serve_with_admin_jobs(
+    engine: &mut RecordingEngine,
+    first: JobSpec,
+    admins: usize,
+    second: Option<JobSpec>,
+) -> Vec<mpsc::Receiver<Result<AdminReply, AdminError>>> {
+    let (tx, rx) = mpsc::channel();
+    let (job, _first) = first.build();
+    tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
+    let mut replies = Vec::new();
+    for index in 0..admins {
+        let (reply, answer) = mpsc::channel();
+        tx.send(EngineMsg::Admin(AdminJob {
+            request: AdminRequest::Load {
+                name: format!("adapter{index}"),
+                path: format!("/adapters/{index}"),
+            },
+            reply,
+        }))
+        .unwrap();
+        replies.push(answer);
+    }
+    if let Some(second) = second {
+        let (job, _second) = second.build();
+        tx.send(EngineMsg::Generate(Box::new(job))).unwrap();
+    }
+    drop(tx);
+    let metrics = test_metrics("admin-bound");
+    assert_eq!(run_engine(engine, &rx, &metrics), Exit::Shutdown);
+    replies
+}
+
+/// POOT-1204 SC-005: queued administration jobs do not stall generation. Three jobs queue ahead of a
+/// second request; the loop runs at most `EXCLUSIVE_JOBS_PER_ITERATION` of them before the step, so the
+/// request's first step is the loop's first step and fewer than all three jobs ran before it; every job
+/// still runs. Mutation: run every queued exclusive job before admitting (strict FIFO, the loop of
+/// `for _ in 0..usize::MAX`): three jobs run before the request's step and the row goes red.
+#[test]
+fn queued_admin_jobs_delay_a_generation_request_by_no_more_than_the_iteration_bound() {
+    let mut engine = RecordingEngine::new(2);
+    let replies = serve_with_admin_jobs(
+        &mut engine,
+        JobSpec::new("aa", 6),
+        3,
+        Some(JobSpec::new("bb", 1)),
+    );
+    let events = engine.events();
+    let first_seq = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Step(rows) => Some(rows[0].0),
+            _ => None,
+        })
+        .expect("a step ran");
+    let second_step = events
+        .iter()
+        .position(|event| matches!(event, Event::Step(rows) if rows.iter().any(|(seq, _)| *seq != first_seq)))
+        .expect("the second request ran a step");
+    let before = &events[..second_step];
+    let admins_before = before
+        .iter()
+        .filter(|event| matches!(event, Event::Admin(_)))
+        .count();
+    let steps_before = before
+        .iter()
+        .filter(|event| matches!(event, Event::Step(_)))
+        .count();
+    assert_eq!(
+        steps_before, 0,
+        "the request joined the loop's first step: {events:?}"
+    );
+    assert!(
+        admins_before <= 1,
+        "{admins_before} administration jobs ran before the request's first step: {events:?}"
+    );
+    let ran = events
+        .iter()
+        .filter(|event| matches!(event, Event::Admin(_)))
+        .count();
+    assert_eq!(ran, 3, "every queued job still runs: {events:?}");
+    for reply in replies {
+        assert!(reply.try_recv().expect("answered").is_ok());
+    }
+}
+
+/// POOT-1204 SC-005: an administration job runs between steps while a sequence is open, not after it
+/// ends, and no more than the bound run between two steps. Mutation: wait for an empty engine before
+/// running them (the old rule): every job runs before the first step and the row goes red.
+#[test]
+fn admin_jobs_run_between_steps_of_an_open_sequence() {
+    let mut engine = RecordingEngine::new(1);
+    serve_with_admin_jobs(&mut engine, JobSpec::new("aa", 6), 3, None);
+    let events = engine.events();
+    let mut open = false;
+    let mut run_open = 0;
+    let mut since_step = 0;
+    for event in &events {
+        match event {
+            Event::Open { .. } => open = true,
+            Event::Release { .. } => open = false,
+            Event::Step(_) => since_step = 0,
+            Event::Admin(_) => {
+                since_step += 1;
+                assert!(
+                    since_step <= 1,
+                    "{since_step} jobs ran between two steps: {events:?}"
+                );
+                run_open += usize::from(open);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        run_open >= 2,
+        "jobs ran while the sequence was open: {events:?}"
+    );
+}
+
+/// POOT-1204 review: encode and administration jobs alternate when both wait, so a steady encode stream
+/// cannot starve an administration job. Three of each queue together; the log never runs two of one
+/// class back to back while the other class waits. Mutation: prefer encodes (take an encode whenever one
+/// is ready): the three encodes run before the first administration job and the row goes red.
+#[test]
+fn encode_and_admin_jobs_alternate_when_both_wait() {
+    let mut engine = RecordingEngine::new(2);
+    let (tx, rx) = mpsc::channel();
+    let mut answers = Vec::new();
+    // The guards cancel their jobs on drop: they live until the loop has run.
+    let mut guards = Vec::new();
+    for index in 0..3 {
+        let (reply, answer) = mpsc::channel();
+        let (guard, cancel) = crate::lifecycle::JobGuard::new();
+        tx.send(EngineMsg::Encode(crate::types::EncodeJob {
+            rows: vec![crate::types::EncodeRow {
+                ids: vec![index + 1],
+                types: Vec::new(),
+            }],
+            reply,
+            cancel,
+        }))
+        .unwrap();
+        answers.push(answer);
+        guards.push(guard);
+    }
+    let mut admins = Vec::new();
+    for index in 0..3 {
+        let (reply, answer) = mpsc::channel();
+        tx.send(EngineMsg::Admin(AdminJob {
+            request: AdminRequest::Load {
+                name: format!("adapter{index}"),
+                path: format!("/adapters/{index}"),
+            },
+            reply,
+        }))
+        .unwrap();
+        admins.push(answer);
+    }
+    drop(tx);
+    let metrics = test_metrics("alternate");
+    assert_eq!(run_engine(&mut engine, &rx, &metrics), Exit::Shutdown);
+    let classes: Vec<bool> = engine
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            Event::Encode { .. } => Some(true),
+            Event::Admin(_) => Some(false),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(classes.len(), 6, "every job ran: {classes:?}");
+    assert!(
+        classes.windows(2).all(|pair| pair[0] != pair[1]),
+        "the classes alternate while both wait: {classes:?}"
+    );
+    for answer in admins {
+        assert!(answer.try_recv().expect("answered").is_ok());
+    }
 }

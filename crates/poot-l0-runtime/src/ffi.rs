@@ -15,12 +15,9 @@ pub(crate) type ZeResult = u32;
 pub(crate) type Handle = *mut c_void;
 
 pub(crate) const ZE_RESULT_SUCCESS: ZeResult = 0;
-pub(crate) const ZE_INIT_FLAG_GPU_ONLY: u32 = 1;
 pub(crate) const ZE_INIT_FLAG_VPU_ONLY: u32 = 2;
 /// `ZE_RESULT_NOT_READY`: a wait with a timeout expired before the queue drained.
 pub(crate) const ZE_RESULT_NOT_READY: ZeResult = 1;
-#[cfg(feature = "test-support")]
-pub(crate) const ZE_MODULE_FORMAT_IL_SPIRV: u32 = 0;
 pub(crate) const ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS: u32 = 2;
 /// `ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE`.
 pub(crate) const ZE_QUEUE_GROUP_FLAG_COMPUTE: u32 = 1;
@@ -30,15 +27,7 @@ const STYPE_COMMAND_QUEUE_GROUP_PROPERTIES: u32 = 0x6;
 const STYPE_CONTEXT_DESC: u32 = 0xd;
 const STYPE_COMMAND_QUEUE_DESC: u32 = 0xe;
 const STYPE_COMMAND_LIST_DESC: u32 = 0xf;
-#[cfg(feature = "test-support")]
-const STYPE_DEVICE_MEM_ALLOC_DESC: u32 = 0x15;
 const STYPE_HOST_MEM_ALLOC_DESC: u32 = 0x16;
-#[cfg(feature = "test-support")]
-const STYPE_MODULE_DESC: u32 = 0x1b;
-#[cfg(feature = "test-support")]
-const STYPE_KERNEL_DESC: u32 = 0x1d;
-#[cfg(feature = "test-support")]
-const STYPE_KERNEL_PROPERTIES: u32 = 0x1e;
 // The graph extension's own structure-type numbering (`ze_graph_ext.h`).
 const STYPE_GRAPH_ARGUMENT_PROPERTIES: u32 = 0x4;
 const STYPE_GRAPH_DESC_2: u32 = 0xE;
@@ -152,101 +141,6 @@ impl CommandListDesc {
             p_next: std::ptr::null(),
             ordinal,
             flags: 0,
-        }
-    }
-}
-
-#[cfg(feature = "test-support")]
-/// `ze_module_desc_t`, for an `IL_SPIRV` module with no build flags and no specialization constants.
-#[repr(C)]
-pub(crate) struct ModuleDesc {
-    pub stype: u32,
-    pub p_next: *const c_void,
-    pub format: u32,
-    pub input_size: usize,
-    pub input_module: *const u8,
-    pub build_flags: *const c_char,
-    pub constants: *const c_void,
-}
-
-#[cfg(feature = "test-support")]
-impl ModuleDesc {
-    pub(crate) fn spirv(module: &[u8]) -> Self {
-        ModuleDesc {
-            stype: STYPE_MODULE_DESC,
-            p_next: std::ptr::null(),
-            format: ZE_MODULE_FORMAT_IL_SPIRV,
-            input_size: module.len(),
-            input_module: module.as_ptr(),
-            build_flags: c"".as_ptr(),
-            constants: std::ptr::null(),
-        }
-    }
-}
-
-#[cfg(feature = "test-support")]
-/// `ze_kernel_desc_t`.
-#[repr(C)]
-pub(crate) struct KernelDesc {
-    pub stype: u32,
-    pub p_next: *const c_void,
-    pub flags: u32,
-    pub kernel_name: *const c_char,
-}
-
-#[cfg(feature = "test-support")]
-impl KernelDesc {
-    pub(crate) fn named(name: &CStr) -> Self {
-        KernelDesc {
-            stype: STYPE_KERNEL_DESC,
-            p_next: std::ptr::null(),
-            flags: 0,
-            kernel_name: name.as_ptr(),
-        }
-    }
-}
-
-#[cfg(feature = "test-support")]
-/// `ze_kernel_properties_t`: the driver writes the whole 92-byte structure, of which only the argument count is
-/// read here.
-#[repr(C)]
-pub(crate) struct KernelProperties {
-    pub stype: u32,
-    pub p_next: *mut c_void,
-    pub num_kernel_args: u32,
-    tail: [u8; 72],
-}
-
-#[cfg(feature = "test-support")]
-impl KernelProperties {
-    pub(crate) fn new() -> Self {
-        KernelProperties {
-            stype: STYPE_KERNEL_PROPERTIES,
-            p_next: std::ptr::null_mut(),
-            num_kernel_args: 0,
-            tail: [0; 72],
-        }
-    }
-}
-
-#[cfg(feature = "test-support")]
-/// `ze_device_mem_alloc_desc_t`.
-#[repr(C)]
-pub(crate) struct DeviceMemAllocDesc {
-    pub stype: u32,
-    pub p_next: *const c_void,
-    pub flags: u32,
-    pub ordinal: u32,
-}
-
-#[cfg(feature = "test-support")]
-impl DeviceMemAllocDesc {
-    pub(crate) fn new() -> Self {
-        DeviceMemAllocDesc {
-            stype: STYPE_DEVICE_MEM_ALLOC_DESC,
-            p_next: std::ptr::null(),
-            flags: 0,
-            ordinal: 0,
         }
     }
 }
@@ -426,15 +320,6 @@ pub(crate) struct GraphTable {
     pub graph_initialize: Option<unsafe extern "C" fn(Handle) -> ZeResult>,
 }
 
-#[cfg(feature = "test-support")]
-/// `ze_group_count_t`.
-#[repr(C)]
-pub(crate) struct GroupCount {
-    pub x: u32,
-    pub y: u32,
-    pub z: u32,
-}
-
 /// Declare the Level Zero function table: one field per entry point, typed by its C signature, resolved from
 /// the loader by the symbol name. Every entry point returns a `ze_result_t`.
 macro_rules! level_zero_functions {
@@ -484,24 +369,6 @@ level_zero_functions! {
     );
     context_create = "zeContextCreate"(Handle, *const ContextDesc, *mut Handle);
     context_destroy = "zeContextDestroy"(Handle);
-    #[cfg(feature = "test-support")]
-    module_create = "zeModuleCreate"(Handle, Handle, *const ModuleDesc, *mut Handle, *mut Handle);
-    #[cfg(feature = "test-support")]
-    module_destroy = "zeModuleDestroy"(Handle);
-    #[cfg(feature = "test-support")]
-    kernel_create = "zeKernelCreate"(Handle, *const KernelDesc, *mut Handle);
-    #[cfg(feature = "test-support")]
-    kernel_set_group_size = "zeKernelSetGroupSize"(Handle, u32, u32, u32);
-    #[cfg(feature = "test-support")]
-    kernel_set_argument_value = "zeKernelSetArgumentValue"(Handle, u32, usize, *const c_void);
-    #[cfg(feature = "test-support")]
-    kernel_get_properties = "zeKernelGetProperties"(Handle, *mut KernelProperties);
-    #[cfg(feature = "test-support")]
-    kernel_destroy = "zeKernelDestroy"(Handle);
-    #[cfg(feature = "test-support")]
-    mem_alloc_device = "zeMemAllocDevice"(
-        Handle, *const DeviceMemAllocDesc, usize, usize, Handle, *mut *mut c_void
-    );
     mem_alloc_host = "zeMemAllocHost"(
         Handle, *const HostMemAllocDesc, usize, usize, *mut *mut c_void
     );
@@ -517,10 +384,6 @@ level_zero_functions! {
     );
     command_list_create = "zeCommandListCreate"(
         Handle, Handle, *const CommandListDesc, *mut Handle
-    );
-    #[cfg(feature = "test-support")]
-    command_list_append_launch_kernel = "zeCommandListAppendLaunchKernel"(
-        Handle, Handle, *const GroupCount, Handle, u32, *mut Handle
     );
     command_list_close = "zeCommandListClose"(Handle);
     command_queue_execute_command_lists = "zeCommandQueueExecuteCommandLists"(
@@ -569,12 +432,6 @@ mod tests {
         assert_eq!(size_of::<ContextDesc>(), 24);
         assert_eq!(size_of::<CommandQueueDesc>(), 40);
         assert_eq!(size_of::<CommandListDesc>(), 24);
-        assert_eq!(size_of::<ModuleDesc>(), 56);
-        assert_eq!(size_of::<KernelDesc>(), 32);
-        assert_eq!(size_of::<KernelProperties>(), 96);
-        assert_eq!(std::mem::offset_of!(KernelProperties, num_kernel_args), 16);
-        assert_eq!(size_of::<DeviceMemAllocDesc>(), 24);
-        assert_eq!(size_of::<GroupCount>(), 12);
         assert_eq!(size_of::<HostMemAllocDesc>(), 24);
         assert_eq!(size_of::<GraphDesc2>(), 56);
         assert_eq!(std::mem::offset_of!(GraphDesc2, flags), 48);

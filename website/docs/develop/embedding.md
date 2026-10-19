@@ -143,23 +143,28 @@ let text = handle.text().decode(&ids)?;
 
 Embeddings and reranking come from BERT-class models, which run on the driver's `Encode` step on the device
 you open. `SentenceEncoder` and `CrossEncoder` load a checkpoint and a backend, tokenize, run the step and
-do the host side (pooling, normalization, ranking):
+do the host side (pooling, normalization, ranking). The load takes the most texts one call encodes; the encode
+entries for that many rows and every length up to the model's positions are prepared at load, and a larger call
+is a typed refusal:
 
 ```rust
+use std::num::NonZeroUsize;
 use std::path::Path;
 use poot_llm::driver::{BackendChoice, open_executor};
 use poot_llm::encoders::{CrossEncoder, SentenceEncoder};
 
-let mut enc = SentenceEncoder::load(Path::new("/path/to/all-minilm"), open_executor(BackendChoice::Auto)?)?;
+let rows = NonZeroUsize::new(8).unwrap();
+let mut enc = SentenceEncoder::load(Path::new("/path/to/all-minilm"), open_executor(BackendChoice::Auto)?, rows)?;
 let vectors = enc.embed(&["a small domestic cat", "a young kitten"])?; // L2-normalized
 let ranked = enc.rerank("query", &["doc a", "doc b"])?;
 
-let mut ce = CrossEncoder::load(Path::new("/path/to/ms-marco-minilm"), open_executor(BackendChoice::Auto)?)?;
+let mut ce = CrossEncoder::load(Path::new("/path/to/ms-marco-minilm"), open_executor(BackendChoice::Auto)?, rows)?;
 let ranked = ce.rerank("query", &["doc a", "doc b"])?;
 ```
 
-A decoder's embedding pass is the same step: `Driver::encode` over token rows returns the final hidden state of
-every position, and the pooling is yours.
+A decoder's embedding pass is the same step: call `Driver::prepare_encode` with the rows and longest row you
+need, then `Driver::encode` over token rows returns the final hidden state of every position, and the pooling
+is yours. `encode` never compiles a token-row shape: one that was not prepared is a typed refusal.
 
 ## What not to do in-process
 

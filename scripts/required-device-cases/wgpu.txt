@@ -225,6 +225,7 @@ poot-llm::wgpu_weight_map_binding	the_tied_head_decodes_on_bf16_resident_weights
 poot-serve::bin/poot-serve	tests::lifecycle::device::a_hot_loaded_adapter_serves_requests_and_unload_frees_it_wgpu
 poot-serve::bin/poot-serve	tests::lifecycle::device::a_multimodal_job_through_the_loop_matches_generate_with_embeds_wgpu
 poot-serve::bin/poot-serve	tests::lifecycle::device::an_encode_job_on_the_serving_driver_matches_a_fresh_drivers_encode_wgpu
+poot-serve::bin/poot-serve	tests::lifecycle::device::an_encoder_checkpoint_serves_embeddings_on_the_device_wgpu
 poot-serve::bounded_drain_production	bounded_drain_production_completes_accepted_barrier_before_exit
 poot-serve::bounded_drain_production	bounded_drain_production_timeout_closes_accepted_barrier
 poot-serve::served_groups	a_model_without_an_mtp_layer_refuses_draft_mtp_startup_wgpu

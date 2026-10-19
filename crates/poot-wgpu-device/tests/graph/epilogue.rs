@@ -5,8 +5,8 @@
 use super::*;
 
 use poot_executor::StepInputs;
-use poot_executor_parity::{TIER2, assert_close as assert_tier2};
-use poot_graph_ir::analysis::dispatch_count;
+use poot_executor_parity::assert_close as assert_tier2;
+use poot_graph_ir::analysis::{Tier2Class, dispatch_count};
 use poot_graph_ir::op::{BinOp, ContractionHead, UnOp};
 use poot_graph_ir::types::Scalar;
 use poot_graph_plan::{CompileOptions, compile, production_plan::Submission};
@@ -48,13 +48,13 @@ fn bf16_bits(x: f32) -> u16 {
     ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
-/// `g` run once on `gpu`, every input a named const.
+/// `g` run once on `gpu`, every input a named const, with the numerics class the compiled program publishes.
 fn run_under(
     gpu: &mut dyn Executor,
     target: Target,
     g: &poot_graph_ir::Graph,
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
-) -> HostTensor {
+) -> (HostTensor, Tier2Class) {
     let mut builder = WeightStore::builder();
     for (&id, tensor) in inputs {
         let meta = g.meta(id);
@@ -83,7 +83,7 @@ fn run_under(
     gpu.unload(exe).unwrap();
     let out = g.aval(g.result());
     assert_eq!(out.dtype, DType::F32, "the wgpu rows read an f32 output");
-    HostTensor::f32(
+    let out = HostTensor::f32(
         out.shape.clone(),
         bytes
             .as_chunks::<4>()
@@ -91,7 +91,8 @@ fn run_under(
             .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-    )
+    );
+    (out, staged.numerics_class())
 }
 
 fn compiled(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::Program {
@@ -139,7 +140,7 @@ fn assert_fused_matches_oracle(
     inputs: &HashMap<poot_graph_ir::ValueId, HostTensor>,
     label: &str,
 ) {
-    let fused = run_under(gpu, target, g, inputs);
+    let (fused, class) = run_under(gpu, target, g, inputs);
     let oracle_inputs: HashMap<_, Value> = inputs
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -153,7 +154,7 @@ fn assert_fused_matches_oracle(
     assert_tier2(
         fused.as_f32().unwrap(),
         want.as_f32().unwrap(),
-        TIER2,
+        class.tolerance(),
         label,
     );
 }

@@ -20,8 +20,8 @@ engine thread, as `Encode` steps and adapter operations between requests. Operat
 | --------------------------- | ------------------------------------------------- |
 | `POST /v1/chat/completions` | Chat completion, streaming (SSE) or buffered JSON |
 | `POST /v1/completions`      | Raw text completion                               |
-| `POST /v1/embeddings`       | Embedding vectors (a decoder's embedding pass)    |
-| `POST /v1/rerank`           | Reranking scores (a decoder's embedding pass)     |
+| `POST /v1/embeddings`       | Embedding vectors (an encoder, or a decoder's embedding pass) |
+| `POST /v1/rerank`           | Reranking scores (an encoder, or a decoder's embedding pass) |
 | `GET /v1/models`            | List the served model(s)                          |
 | `GET /v1/models/{id}`       | Describe one served model                         |
 | `/v1/lora_adapters`         | LoRA administration: list, hot-load, unload       |

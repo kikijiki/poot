@@ -11,6 +11,7 @@ pub mod dsa;
 pub mod embed;
 pub mod ffn;
 pub mod gdn;
+pub(crate) mod gdn_names;
 pub mod head;
 pub mod kda;
 pub mod kv_stride;

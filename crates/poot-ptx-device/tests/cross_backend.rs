@@ -1391,7 +1391,7 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
                 }],
                 "{label}: one fused dense contraction"
             );
-            let fused = common::run_resident(&mut ptx, &g, &inputs);
+            let (fused, class) = common::run_resident_classed(&mut ptx, &g, &inputs);
             let want = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
                 .unwrap()
                 .output
@@ -1401,7 +1401,7 @@ fn a_dense_tiled_epilogue_matches_the_oracle_on_ptx() {
             poot_executor_parity::assert_close(
                 fused.as_f32().unwrap(),
                 want.as_f32().unwrap(),
-                poot_executor_parity::TIER2,
+                class.tolerance(),
                 &label,
             );
         }
@@ -1469,7 +1469,7 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
             [poot_graph_ir::op::ContractionHead::MatMul],
             "{label}: one fused matmul contraction"
         );
-        let fused = common::run_resident(&mut ptx, &g, &inputs);
+        let (fused, class) = common::run_resident_classed(&mut ptx, &g, &inputs);
         let want = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
             .unwrap()
             .output
@@ -1479,7 +1479,7 @@ fn a_tiled_matmul_epilogue_matches_the_oracle_on_ptx() {
         poot_executor_parity::assert_close(
             fused.as_f32().unwrap(),
             want.as_f32().unwrap(),
-            poot_executor_parity::TIER2,
+            class.tolerance(),
             &label,
         );
     }

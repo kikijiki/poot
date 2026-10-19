@@ -1,9 +1,14 @@
 //! The one place a [`poot_runtime_common::CompiledKernel`] is built (ADR-0102 amendment): every
 //! runtime dispatch, launch, load and replay entry point takes a `&CompiledKernel` instead of raw kernel
-//! bytes, and this crate is the sole caller of its `unsafe` constructor. Callers pass the artifact bytes
-//! [`compile`] or a [`crate::KernelCache`] produced for the same `body`/`target` pair; [`kernel_handle`]
-//! derives the entry point, the trap flag and the argument schema straight from `body`, so the schema
-//! cannot drift from what the emitter actually compiled.
+//! bytes, and this crate is the sole caller of its `unsafe` constructor. The bytes reach [`kernel_handle`]
+//! only inside a [`CompiledArtifact`], the sealed token [`compile_kernel`] and
+//! [`crate::KernelCache::load_or_compile`] return: it carries the [`KernelId`] of the body and target it was
+//! compiled for, and nothing outside this crate can build one from bytes. [`kernel_handle`] refuses a token
+//! of another body, then derives the entry point, the trap flag and the argument schema straight from
+//! `body`, so the schema cannot drift from what the emitter actually compiled.
+
+use std::path::Path;
+use std::sync::Arc;
 
 use poot_kernel_ir::{Body, Ty};
 use poot_runtime_common::{
@@ -11,7 +16,7 @@ use poot_runtime_common::{
 };
 use poot_target::{AieTargetId, Backend, ElementKind, TargetId};
 
-use crate::Target;
+use crate::{CompileError, KernelId, Target, compile};
 
 /// The native [`ElementKind`] a kernel buffer parameter's slice element type lowers to, or `None` for a
 /// type no runtime buffer carries. Every buffer parameter emitted for wgpu/Vulkan/ROCm/PTX dispatch is one
@@ -92,7 +97,8 @@ impl From<GpuTarget> for Target {
 }
 
 /// A target with no byte-artifact kernel handle: an AIE core's kernel is a linked artifact, and
-/// [`Target::SpirvOpenCl`] has no runtime [`Backend`] to dispatch it yet (the Level Zero runtime adds one).
+/// [`Target::SpirvOpenCl`] has no runtime [`Backend`] to dispatch it (no Level Zero GPU consumer exists; an Intel
+/// GPU backend is a future card).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0:?} has no byte-artifact kernel handle")]
 pub struct NotAByteTarget(pub Target);
@@ -139,15 +145,15 @@ impl GpuTarget {
         }
     }
 
-    fn code(self, bytes: Vec<u8>) -> KernelCode {
+    fn code(self, bytes: &[u8]) -> KernelCode {
         match self {
-            GpuTarget::SpirvVulkan => KernelCode::spirv_from_le_bytes(&bytes),
+            GpuTarget::SpirvVulkan => KernelCode::spirv_from_le_bytes(bytes),
             GpuTarget::Nvptx => {
-                let text = String::from_utf8(bytes)
+                let text = std::str::from_utf8(bytes)
                     .expect("PTX codegen output is not valid UTF-8 (a toolchain regression)");
-                KernelCode::Ptx(text.into_boxed_str())
+                KernelCode::Ptx(text.into())
             }
-            GpuTarget::AmdGcn(_) => KernelCode::Hsaco(bytes.into_boxed_slice()),
+            GpuTarget::AmdGcn(_) => KernelCode::Hsaco(bytes.into()),
         }
     }
 }
@@ -193,28 +199,127 @@ impl TryFrom<TargetId> for Target {
     }
 }
 
-/// Build the dispatchable [`CompiledKernel`] for `body`, from the artifact `bytes` [`crate::compile`] or a
-/// [`crate::KernelCache`] produced for the exact same `body`/`target` pair (untouched: not decoded,
-/// re-encoded, or taken from a different body's entry). This is the one place in the workspace that calls
-/// [`CompiledKernel::new`] for a byte artifact; every field it fills is read straight from `body`, so the
-/// handle's schema can never drift from what the emitter actually compiled.
+/// A compiled byte artifact (SPIR-V, PTX or an HSACO image) sealed to the kernel it was compiled from. Only
+/// this crate builds one, from the compiler's own output ([`compile_kernel`]) or from a cache entry that
+/// proved it was stored for this kernel ([`crate::KernelCache::load_or_compile`]); its fields are private
+/// and [`kernel_handle`] is the only consumer. Cloning shares the bytes.
+#[derive(Clone, Debug)]
+pub struct CompiledArtifact {
+    id: KernelId,
+    target: GpuTarget,
+    bytes: Arc<[u8]>,
+    built: bool,
+}
+
+impl CompiledArtifact {
+    pub(crate) fn new(id: KernelId, target: GpuTarget, bytes: Vec<u8>, built: bool) -> Self {
+        Self {
+            id,
+            target,
+            bytes: bytes.into(),
+            built,
+        }
+    }
+
+    /// The content id of the body and target this artifact was compiled for.
+    pub fn id(&self) -> KernelId {
+        self.id
+    }
+
+    /// The target this artifact was compiled for.
+    pub fn target(&self) -> GpuTarget {
+        self.target
+    }
+
+    /// The artifact's length in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the artifact is empty (a compiler that produced nothing).
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// `true` when producing this artifact ran the compiler, `false` when a verified cache entry served it.
+    pub fn built(&self) -> bool {
+        self.built
+    }
+}
+
+/// Compile `body` for `target` into `out` and return the sealed artifact read back from it. The one entry
+/// for a caller that compiles without a [`crate::KernelCache`]; `out`'s directory must exist.
+pub fn compile_kernel(
+    body: &Body,
+    target: GpuTarget,
+    out: &Path,
+) -> Result<CompiledArtifact, CompileError> {
+    let codegen = Target::from(target);
+    compile(body, codegen, out)?;
+    let bytes = std::fs::read(out)?;
+    Ok(CompiledArtifact::new(
+        KernelId::of(body, codegen),
+        target,
+        bytes,
+        true,
+    ))
+}
+
+/// A [`CompiledArtifact`] was presented with a body other than the one it was compiled from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "artifact {artifact} was compiled from another body or target than the one presented ({body})"
+)]
+pub struct ArtifactMismatch {
+    /// The id the artifact carries.
+    pub artifact: KernelId,
+    /// The id of the body and target the handle was requested for.
+    pub body: KernelId,
+}
+
+/// Build the dispatchable [`CompiledKernel`] for `body` from the sealed `artifact` compiled for it. This
+/// is the one place in the workspace that calls [`CompiledKernel::new`] for a byte artifact; every field it
+/// fills is read straight from `body`, so the handle's schema can never drift from what the emitter
+/// actually compiled. An artifact compiled from a different body (or for a different target) is an
+/// [`ArtifactMismatch`], never a handle.
+///
+/// There is no way to pass raw bytes:
+///
+/// ```compile_fail
+/// use poot_codegen::{GpuTarget, kernel_handle};
+///
+/// fn raw_bytes(body: &poot_kernel_ir::Body) {
+///     let _ = kernel_handle(body, GpuTarget::SpirvVulkan, vec![0u8; 4]);
+/// }
+/// ```
 ///
 /// # Panics
 ///
 /// Panics if `body`'s parameters are not all buffer-slice references with a runtime-representable element
 /// type - every body this crate's own emitter compiles for wgpu/Vulkan/ROCm/PTX dispatch has that shape,
 /// so a body that does not is a codegen bug, not a caller error.
-pub fn kernel_handle(body: &Body, target: GpuTarget, bytes: Vec<u8>) -> CompiledKernel {
-    let gpu = target;
+pub fn kernel_handle(
+    body: &Body,
+    artifact: &CompiledArtifact,
+) -> Result<CompiledKernel, ArtifactMismatch> {
+    let gpu = artifact.target;
+    let expected = KernelId::of(body, gpu.into());
+    if artifact.id != expected {
+        return Err(ArtifactMismatch {
+            artifact: artifact.id,
+            body: expected,
+        });
+    }
     let entry_point = gpu.entry_point(body);
     let args = arg_schema(body);
     let has_trap = body.has_trap();
-    let code = gpu.code(bytes);
-    // SAFETY: `code` is the artifact `compile`/`KernelCache` produced for this exact `body` and `target`
-    // (the caller's obligation, stated in this function's doc); `entry_point`, `args` and `has_trap` are
-    // read straight from that same `body`, so they describe the compiled code exactly, not a
-    // caller-guessed shape.
-    unsafe {
+    let code = gpu.code(&artifact.bytes);
+    // SAFETY: `artifact` is only constructible inside this crate, from the compiler's output for a body and
+    // target or from a cache entry whose recorded id matched, and it carries the id of that body and
+    // target; the id was just checked equal to `body`'s on that target, so `code` is the artifact compiled
+    // from this exact `body`. `entry_point`, `args` and `has_trap` are read straight from that same
+    // `body`, so they describe the compiled code exactly, not a caller-guessed shape.
+    Ok(unsafe {
         CompiledKernel::new(
             TargetId::Gpu(gpu.backend()),
             entry_point,
@@ -222,7 +327,7 @@ pub fn kernel_handle(body: &Body, target: GpuTarget, bytes: Vec<u8>) -> Compiled
             args,
             has_trap,
         )
-    }
+    })
 }
 
 /// The [`CompiledKernel`] for an AIE region's linked `artifact`. Its arguments are the artifact's shape
@@ -279,14 +384,40 @@ pub fn vpu_kernel_handle(artifact: VpuGraphArtifact) -> CompiledKernel {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
+    use crate::KernelCache;
     use poot_kernel_ir::fixtures::add_kernel;
     use poot_runtime_common::KernelArgError;
+
+    /// The sealed artifact a cache hands out for `body` when `bytes` were stored under its key: the same
+    /// path every production handle takes (`load_or_compile`), served from the cache so no toolchain is
+    /// needed.
+    fn cached_artifact(
+        name: &str,
+        body: &Body,
+        target: GpuTarget,
+        bytes: &[u8],
+    ) -> CompiledArtifact {
+        let dir =
+            std::env::temp_dir().join(format!("poot-handle-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = KernelCache::at(&dir, target.into());
+        cache.store(&cache.key(body), bytes).unwrap();
+        let artifact = cache
+            .load_or_compile(body, NonZeroU64::new(1 << 20).unwrap())
+            .expect("a stored entry is a hit");
+        assert!(!artifact.built(), "the artifact must come from the cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        artifact
+    }
 
     #[test]
     fn add_kernel_schema_is_two_reads_and_one_write_of_f32() {
         let body = add_kernel();
-        let handle = kernel_handle(&body, GpuTarget::SpirvVulkan, vec![0u8; 4]);
+        let artifact = cached_artifact("schema", &body, GpuTarget::SpirvVulkan, &[0u8; 4]);
+        let handle = kernel_handle(&body, &artifact).unwrap();
         assert_eq!(handle.entry_point(), "main");
         assert_eq!(handle.target(), TargetId::Gpu(Backend::SpirvVulkan));
         let args = handle.args();
@@ -302,20 +433,20 @@ mod tests {
     #[test]
     fn ptx_and_rocm_entry_points_are_the_body_name_not_main() {
         let body = add_kernel();
-        let ptx = kernel_handle(&body, GpuTarget::Nvptx, b"// ptx text".to_vec());
+        let ptx_artifact = cached_artifact("ptx", &body, GpuTarget::Nvptx, b"// ptx text");
+        let ptx = kernel_handle(&body, &ptx_artifact).unwrap();
         assert_eq!(ptx.entry_point(), body.name);
-        let rocm = kernel_handle(
-            &body,
-            GpuTarget::AmdGcn(crate::AmdArch::gfx1151()),
-            vec![0u8; 4],
-        );
+        let rocm_target = GpuTarget::AmdGcn(crate::AmdArch::gfx1151());
+        let rocm_artifact = cached_artifact("rocm", &body, rocm_target, &[0u8; 4]);
+        let rocm = kernel_handle(&body, &rocm_artifact).unwrap();
         assert_eq!(rocm.entry_point(), body.name);
     }
 
     #[test]
     fn schema_mismatch_from_a_wrong_element_kind_is_reported_by_index() {
         let body = add_kernel();
-        let handle = kernel_handle(&body, GpuTarget::SpirvVulkan, vec![0u8; 4]);
+        let artifact = cached_artifact("elements", &body, GpuTarget::SpirvVulkan, &[0u8; 4]);
+        let handle = kernel_handle(&body, &artifact).unwrap();
         // F32 and I32 share a 4-byte native word and are schema-compatible by design (see
         // `poot_runtime_common::kernel::element_kinds_compatible`); Bf16's 2-byte word is a genuine
         // width mismatch against this kernel's F32 schema.
@@ -328,6 +459,24 @@ mod tests {
                 actual: ElementKind::Bf16,
             })
         );
+    }
+
+    /// SC-002: an artifact compiled from body A cannot build a handle for body B, nor for the same body on
+    /// another target.
+    #[test]
+    fn an_artifact_of_another_body_or_target_builds_no_handle() {
+        let body_a = add_kernel();
+        let mut body_b = add_kernel();
+        body_b.name = "another_kernel".to_string();
+        let artifact = cached_artifact("mismatch", &body_a, GpuTarget::SpirvVulkan, &[0u8; 4]);
+
+        let wrong_body = kernel_handle(&body_b, &artifact).unwrap_err();
+        assert_eq!(wrong_body.artifact, artifact.id());
+        assert_ne!(wrong_body.body, artifact.id());
+
+        let nvptx = cached_artifact("mismatch-ptx", &body_a, GpuTarget::Nvptx, b"// ptx text");
+        assert_ne!(nvptx.id(), artifact.id(), "the target is part of the id");
+        assert!(kernel_handle(&body_a, &nvptx).is_ok());
     }
 
     /// A byte artifact can never be presented as an AIE kernel: the byte-handle constructor takes
@@ -345,6 +494,7 @@ mod tests {
     #[should_panic(expected = "must be a whole number of 4-byte words")]
     fn spirv_artifact_bytes_must_be_word_aligned() {
         let body = add_kernel();
-        let _ = kernel_handle(&body, GpuTarget::SpirvVulkan, vec![0u8; 5]);
+        let artifact = cached_artifact("misaligned", &body, GpuTarget::SpirvVulkan, &[0u8; 5]);
+        let _ = kernel_handle(&body, &artifact);
     }
 }

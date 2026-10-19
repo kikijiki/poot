@@ -26,6 +26,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::{BoundaryId, Graph, TensorType, ValueId};
 use poot_quant::weights::{WeightId, WeightMap};
 use poot_target::BufferStorage;
@@ -224,6 +225,17 @@ impl StagedProgram {
             sync_points: Vec::new(),
             tensor: None,
         }
+    }
+
+    /// The tier-2 comparison class this staged program publishes: the loosest class among its stages, since
+    /// the output a caller reads is the product of all of them. An output compared within this class's
+    /// [`Tier2Class::tolerance`] is within every stage's own.
+    pub fn numerics_class(&self) -> Tier2Class {
+        self.stages
+            .iter()
+            .map(|(_, _, program)| program.numerics_class())
+            .max()
+            .unwrap_or(Tier2Class::BitExact)
     }
 
     /// Every stage with its device and program, in stage order.

@@ -43,7 +43,10 @@ curl -i http://localhost:8080/v1/completions \
 A request that is invalid on its face is a `400` before the engine is asked: malformed JSON, a `max_tokens` that is not an integer, an unknown `lora_adapter`,
 an invalid guided-decoding constraint, image input the served model cannot take, `n` above the engine's rows (each choice is one concurrent job), or `logprobs` on a
 stream (a stream has nowhere to put them). `max_tokens` above the cap
-(32768) is clamped, not refused, and `n`, `logprobs` and `stop` are clamped the same way. Errors are
+(32768) is clamped, not refused, and `n`, `logprobs` and the number of `stop` strings (16) are clamped the same way.
+More than 10,000 `logit_bias` entries, a `stop` string over 1,024 bytes, or `stop` strings totalling over 4,096 bytes
+are a `400`, since each is paid at every generated token. A request without `seed` draws one from the operating system,
+so two identical sampled requests differ; a request with a `seed` is reproducible. Errors are
 OpenAI-shaped: `{"error": {"message", "type", "code"}}`. Over-limit requests get `429` with
 `Retry-After` when `--rate-limit-rpm` is set.
 
@@ -65,7 +68,7 @@ receipt or `[DONE]`.
 
 The model can be a safetensors directory or a single **GGUF** file. A causal decoder (Qwen2/3, Llama, Mistral,
 Mixtral, Gemma, Granite, Granite MoE, OLMo 2, OLMoE, Phi-3, SmolLM3, BLOOM, MPT, Qwen3-MoE, gpt-oss, Gemma 4,
-DeepSeek-V2/V3/V3.2, Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next) is served if compiling its graph for the chosen backend succeeds; a refusal names the equation and the missing capability. A BERT encoder or cross-encoder is refused at startup, because an encoder prepares its entries on first use and its memory cannot be planned; a decoder answers embeddings and rerank through its embedding pass. A SmolVLM (idefics3) or Qwen2.5-VL checkpoint also takes images; see [Multimodal](./multimodal.md). See the [feature matrix](../reference/feature-matrix.md) for what the
+DeepSeek-V2/V3/V3.2, Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next) is served if compiling its graph for the chosen backend succeeds; a refusal names the equation and the missing capability. A BERT encoder or cross-encoder is fitted and prepared like a decoder and serves `/v1/embeddings` and `/v1/rerank`; a decoder whose family has an embedding pass answers the same routes through it. A SmolVLM (idefics3) or Qwen2.5-VL checkpoint also takes images; see [Multimodal](./multimodal.md). See the [feature matrix](../reference/feature-matrix.md) for what the
 libraries support.
 
 Related: [Configuration reference](./configuration.md), [LoRA adapters](./lora-adapters.md),

@@ -553,10 +553,8 @@ fn legal_attention_regions_keep_selection_and_prescaled_query() {
                     .any(|d| d.reason == NumericalRewriteReason::ReciprocalRounding)
             );
         }
-        // Card 546b: `Program::reassociation_class` narrowed to `pub(crate)` (its one other
-        // cross-crate reader was deleted with poot-wgpu-device's cached-decode test suite); the general
-        // "a reassociating pass publishes `Tier2Class::Reassociating`" mechanism this `else` branch
-        // checked stays covered in-crate by
+        // The general "a reassociating pass publishes `Tier2Class::Reassociating`" mechanism (read
+        // through `Program::numerics_class`) is covered in-crate by
         // `compile::tests::compile_publishes_the_class_of_the_passes_that_changed_the_graph`.
         println!(
             "{name}: flash regions={}, diagnostics={:?}",

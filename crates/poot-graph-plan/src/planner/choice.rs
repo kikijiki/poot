@@ -103,6 +103,8 @@ impl KernelChoice {
         let mut hasher = blake3::Hasher::new();
         hasher.update(poot_codegen::kernel_cache_epoch(target).as_bytes());
         hasher.update(b"\n");
+        // The target itself, not only the flags the epoch folds in: two targets may share an epoch's flags.
+        hasher.update(format!("{target:?}\n").as_bytes());
         hasher.update(format!("{self:?}").as_bytes());
         ChoiceDigest(*hasher.finalize().as_bytes())
     }

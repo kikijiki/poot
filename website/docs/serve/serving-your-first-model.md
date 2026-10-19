@@ -9,7 +9,7 @@ sidebar_position: 2
 This walks through starting `poot-serve` on a checkpoint and calling it. It assumes you have already built
 poot inside `nix develop`. See [Develop: Build and test](../develop/build-and-test.md) if not.
 
-Today the server starts on any decoder the registry knows and serves completions, chat, embeddings, rerank and LoRA administration from one engine thread; see [Embeddings and reranking](./embeddings-and-reranking.md). This walkthrough uses a small decoder; the server refuses an encoder checkpoint at startup.
+Today the server starts on any decoder the registry knows and serves completions, chat, embeddings, rerank and LoRA administration from one engine thread; see [Embeddings and reranking](./embeddings-and-reranking.md). This walkthrough uses a small decoder; an embedding or reranking checkpoint (a BERT encoder or cross-encoder) starts the same way and serves only the embeddings and rerank routes.
 
 ## 1. Get a checkpoint
 
@@ -51,7 +51,7 @@ curl http://localhost:8080/v1/completions \
   Gemma, Granite, Granite MoE, OLMo 2, OLMoE, Phi-3, SmolLM3, BLOOM, MPT, Qwen3-MoE, gpt-oss, Gemma 4,
   DeepSeek-V2/V3/V3.2, Nemotron-H, Qwen3-Next, Qwen3.8-Flash-Next), BERT-class encoders (all-MiniLM, E5, BGE) and cross-encoders (ms-marco-MiniLM).
   A decoder serves generation from the scheduling loop, and its embeddings, reranking and LoRA routes run on the
-  same engine thread.
+  same engine thread. An encoder checkpoint serves embeddings and rerank only.
 - A checkpoint whose family the registry does not know is refused at startup with the registry's error naming its
   `model_type`. SmolVLM and Qwen2.5-VL checkpoints are served with image input ([Multimodal](./multimodal.md)).
 

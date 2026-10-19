@@ -34,7 +34,7 @@ use cli::{Cli, Command};
 use db::Db;
 use logging::{log, state_dir};
 use runpod::RunPod;
-use workflow::{cmd_exec, cmd_image, cmd_logs, cmd_run, cmd_status, reap, require_key};
+use workflow::{cmd_exec, cmd_image, cmd_logs, cmd_run, cmd_status, reap, runpod_api_key};
 
 pub use db::PodOwnerPrefix;
 pub use runpod::CreateSpec;
@@ -53,7 +53,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Status => cmd_status(&db, &state_db),
         Command::Reap(a) => {
-            let rp = RunPod::new(require_key(a.runpod_api_key)?)?;
+            let rp = RunPod::new(runpod_api_key()?)?;
             let n = reap(&db, &rp, a.all)?;
             log(format!("reaped {n} orphan pod(s)"));
             Ok(())
@@ -62,7 +62,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Serve(s) => web::serve(db, &s.addr),
         Command::Image(a) => cmd_image(&a),
         Command::Logs(a) => cmd_logs(&a),
-        Command::Exec(a) => cmd_exec(&db, a),
+        Command::Exec(a) => cmd_exec(&db, &state_db, a),
     }
 }
 

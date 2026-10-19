@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use poot_eval::Value;
 use poot_executor::{Device, EntryId, ExecutableId, Executor, NoSync, StepInputs};
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Graph, PackedSourceName, Storage, ValueId};
 use poot_graph_plan::{
@@ -178,7 +179,17 @@ pub(crate) fn run_resident(
     g: &Graph,
     inputs: &HashMap<ValueId, Value>,
 ) -> HostTensor {
-    run_resident_prepared(device, g, inputs, Graph::clone)
+    run_resident_classed(device, g, inputs).0
+}
+
+/// [`run_resident`] with the numerics class the compiled program publishes: the class a row compares the
+/// result with the oracle within.
+pub(crate) fn run_resident_classed(
+    device: &mut PtxDevice,
+    g: &Graph,
+    inputs: &HashMap<ValueId, Value>,
+) -> (HostTensor, Tier2Class) {
+    run_prepared(device, g, inputs, Graph::clone)
 }
 
 /// [`run_resident`] over `prepare(named)`: the graph with its consts named by the weight map, rewritten by
@@ -189,6 +200,15 @@ pub(crate) fn run_resident_prepared(
     inputs: &HashMap<ValueId, Value>,
     prepare: impl FnOnce(&Graph) -> Graph,
 ) -> HostTensor {
+    run_prepared(device, g, inputs, prepare).0
+}
+
+fn run_prepared(
+    device: &mut PtxDevice,
+    g: &Graph,
+    inputs: &HashMap<ValueId, Value>,
+    prepare: impl FnOnce(&Graph) -> Graph,
+) -> (HostTensor, Tier2Class) {
     let mut engine = poot_executor::Engine::new(PtxDeviceProxy(device));
     let (exe, named) = load_consts(&mut engine, g, inputs);
     let staged = staged_program(&prepare(&named), Device::target(engine.device()));
@@ -200,10 +220,11 @@ pub(crate) fn run_resident_prepared(
         .expect("read");
     engine.remove_entry(exe, entry).expect("remove_entry");
     engine.unload(exe).expect("unload");
-    HostTensor::f32(
+    let out = HostTensor::f32(
         g.aval(g.result()).shape.clone(),
         bytemuck::cast_slice::<u8, f32>(&bytes).to_vec(),
-    )
+    );
+    (out, staged.numerics_class())
 }
 
 /// Like [`run_resident`], for a graph whose output is I32 (card 551a: `SampleToken`'s `(token,

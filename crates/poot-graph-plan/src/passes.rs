@@ -3,7 +3,7 @@
 //! private, so nothing outside this crate can name a pass or sequence its own pipeline, and
 //! `poot_graph_ir::transform` (the pre-card-626 home) no longer exists at all. The read-only analyses
 //! that used to live alongside these passes - [`poot_graph_ir::analysis`]'s `NumericsProperty`,
-//! `PassDeclaration`/`PASS_DECLARATIONS`, `dispatch_count`, `peak_transient_bytes` - stay public in
+//! `dispatch_count`, `peak_transient_bytes` - stay public in
 //! `poot-graph-ir`, since they rewrite nothing and a caller may legitimately want to measure a graph
 //! without reaching a pass.
 //!
@@ -14,7 +14,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use poot_graph_ir::analysis::{NumericalRewriteDecline, NumericalRewriteReason};
+use poot_graph_ir::analysis::{
+    NumericalRewriteDecline, NumericalRewriteReason, NumericsError, NumericsProperty,
+    implied_numerics_of,
+};
 use poot_graph_ir::graph::{EditError, Eqn, Graph, Operand, Storage, ValueId, ValueMeta};
 use poot_graph_ir::op::{
     BinOp, ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, OpKind, RedOp,
@@ -46,6 +49,155 @@ pub(crate) fn with_eqns(g: &Graph, eqns: Vec<Eqn>) -> Result<Graph, EditError> {
     let mut edit = g.edit();
     *edit.eqns_mut() = eqns;
     edit.commit()
+}
+
+/// What one pass of [`crate::compile`]'s pipeline declares about the device arithmetic of the ops it
+/// produces (ADR-0101 decision 2). [`crate::compile`] runs a pass through its declaration, so a pass
+/// cannot run undeclared, and checks the declaration against the pass's output with
+/// [`Self::verify`]. The program publishes the strongest declaration among the passes that changed
+/// its graph.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PassDeclaration {
+    /// The pass's name as `compile` reports it.
+    pub(crate) pass: &'static str,
+    /// The numerics property the pass declares for the ops it produces.
+    pub(crate) property: NumericsProperty,
+    /// Whether an op is one the pass produces: [`Self::verify`] reads these ops in the output graph.
+    produces: fn(&OpKind) -> bool,
+}
+
+impl PassDeclaration {
+    const fn new(
+        pass: &'static str,
+        property: NumericsProperty,
+        produces: fn(&OpKind) -> bool,
+    ) -> Self {
+        Self {
+            pass,
+            property,
+            produces,
+        }
+    }
+
+    /// Check the declaration against the strongest property among the ops the pass produced in `out`.
+    /// Fails closed when the declaration is weaker than what the pass produced (a pass that
+    /// reassociates while claiming `Exact`).
+    pub(crate) fn verify(&self, out: &Graph) -> Result<(), NumericsError> {
+        let implied = implied_numerics_of(out, self.produces);
+        if self.property >= implied {
+            return Ok(());
+        }
+        Err(NumericsError::UnderDeclared {
+            pass: self.pass,
+            declared: self.property,
+            implied,
+        })
+    }
+}
+
+/// The declaration of every pass [`crate::compile`] runs, one constant per pass, named for it. A pass
+/// added to `compile` takes its declaration as its first argument, so one without a row does not build.
+pub(crate) mod declared {
+    use super::{NumericsProperty, OpKind, PassDeclaration};
+
+    fn nothing(_: &OpKind) -> bool {
+        false
+    }
+
+    pub(crate) const CANONICALIZE: PassDeclaration =
+        PassDeclaration::new("canonicalize", NumericsProperty::Exact, nothing);
+    pub(crate) const CSE: PassDeclaration =
+        PassDeclaration::new("cse", NumericsProperty::Exact, nothing);
+    pub(crate) const FOLD_IOTA: PassDeclaration =
+        PassDeclaration::new("fold_iota", NumericsProperty::Exact, nothing);
+    pub(crate) const ROPE_FUSION: PassDeclaration =
+        PassDeclaration::new("rope_fusion", NumericsProperty::Reassociating, |op| {
+            matches!(op, OpKind::Rope { .. })
+        });
+    pub(crate) const FLASH_ATTENTION_CAPPED: PassDeclaration = PassDeclaration::new(
+        "flash_attention_capped",
+        NumericsProperty::Reassociating,
+        |op| matches!(op, OpKind::Attention(_)),
+    );
+    pub(crate) const DCE: PassDeclaration =
+        PassDeclaration::new("dce", NumericsProperty::Exact, nothing);
+    // `compile` claims `ops::packed_linear`'s chains as `PackedContraction` right after `dce`, then
+    // refuses every `PackedDequant` left unclaimed (the escape gate), so no later pass sees a packed
+    // decode outside a contraction. The claim replaces a `PackedDequant` (already `Narrowing`) and its
+    // `MatMul` with one `PackedContraction` (`Narrowing`).
+    pub(crate) const RECOGNIZE_PACKED_CONTRACTIONS: PassDeclaration = PassDeclaration::new(
+        "recognize_packed_contractions",
+        NumericsProperty::Narrowing,
+        |op| matches!(op, OpKind::PackedContraction { .. }),
+    );
+    // The row-gather claim (a quantized embedding lookup) after the contraction claim, before the gate.
+    pub(crate) const RECOGNIZE_PACKED_ROW_GATHERS: PassDeclaration = PassDeclaration::new(
+        "recognize_packed_row_gathers",
+        NumericsProperty::Narrowing,
+        |op| matches!(op, OpKind::PackedRowGather { .. }),
+    );
+    pub(crate) const REJECT_PACKED_DEQUANT_ESCAPES: PassDeclaration = PassDeclaration::new(
+        "reject_packed_dequant_escapes",
+        NumericsProperty::Exact,
+        nothing,
+    );
+    // `compile` runs these four between `dce` and `fuse`, so the folds and the reduce legalization see
+    // the traced `MatMul`/`Transpose`, `Cast`/`Gather` and non-last-axis `Reduce` chains before `fuse`
+    // could absorb them into a region no target plans.
+    pub(crate) const FOLD_DENSE_CONTRACTIONS: PassDeclaration = PassDeclaration::new(
+        "fold_dense_contractions",
+        NumericsProperty::Narrowing,
+        |op| {
+            matches!(
+                op,
+                OpKind::DenseContraction { .. } | OpKind::GroupedDenseContraction { .. }
+            )
+        },
+    );
+    pub(crate) const FOLD_DENSE_BF16_ROW_GATHERS: PassDeclaration = PassDeclaration::new(
+        "fold_dense_bf16_row_gathers",
+        NumericsProperty::Narrowing,
+        |op| matches!(op, OpKind::DenseRowGather { .. }),
+    );
+    pub(crate) const LOWER_NONLAST_REDUCES: PassDeclaration =
+        PassDeclaration::new("lower_nonlast_reduces", NumericsProperty::Exact, nothing);
+    pub(crate) const WIDEN_MISMATCHED_MATMUL_DTYPES: PassDeclaration = PassDeclaration::new(
+        "widen_mismatched_matmul_dtypes",
+        NumericsProperty::Narrowing,
+        nothing,
+    );
+    // The contraction epilogue rule folds a contraction and the pointwise chain that consumes it into one
+    // equation. The lowering rounds the head through its declared dtype and every step through its own,
+    // so the fused result is the unfused program's, bit for bit, on the same schedule: an unfused
+    // contraction.
+    pub(crate) const FUSE_CONTRACTION_EPILOGUES: PassDeclaration = PassDeclaration::new(
+        "fuse_contraction_epilogues",
+        NumericsProperty::Unfused,
+        |op| matches!(op, OpKind::ContractionEpilogue { .. }),
+    );
+    pub(crate) const FUSE: PassDeclaration =
+        PassDeclaration::new("fuse", NumericsProperty::Reassociating, |op| {
+            matches!(op, OpKind::Fused(_) | OpKind::FusedRow(_))
+        });
+    // `fuse_widening_casts` rewrites a region's own steps: the `Cast` of a narrow weight becomes the
+    // region's first step. Widening a narrow float is exact and no op kind is produced that was not
+    // already counted, so the class of the result is read off its ops, as for every pass.
+    pub(crate) const FUSE_WIDENING_CASTS: PassDeclaration =
+        PassDeclaration::new("fuse_widening_casts", NumericsProperty::Exact, nothing);
+    // `fuse_index_casts` makes the `Cast` of an I32 word a step of the pointwise region that reads or
+    // writes it, wrapping a lone pointwise equation in a one-step region where it has none. The
+    // conversion is the cast kernel's own, so the class is the fused regions it produces.
+    pub(crate) const FUSE_INDEX_CASTS: PassDeclaration =
+        PassDeclaration::new("fuse_index_casts", NumericsProperty::Reassociating, |op| {
+            matches!(op, OpKind::Fused(_) | OpKind::FusedRow(_))
+        });
+    // `legalize` needs `Target::caps`; `compile` runs it as its own pass, between `dce` and `fuse`. Its
+    // rewrite shapes: a hosted-embed `Gather` replaced by a device `MatMul`-free lookup, or an oversized
+    // matmul weight split and rejoined by `Concat`.
+    pub(crate) const LEGALIZE: PassDeclaration =
+        PassDeclaration::new("legalize", NumericsProperty::Unfused, |op| {
+            matches!(op, OpKind::MatMul | OpKind::Concat { .. })
+        });
 }
 
 pub(crate) use budget::GraphBudget;

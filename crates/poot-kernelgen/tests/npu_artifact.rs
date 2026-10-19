@@ -915,7 +915,11 @@ fn a_wiring_that_is_not_a_region_is_a_typed_fault_at_construction() {
 
 fn assert_nothing_published(cache: &KernelCache) {
     assert_eq!(
-        entries(cache.dir()),
+        entries(
+            cache
+                .dir()
+                .expect("the cache sits at an explicit directory")
+        ),
         Vec::<String>::new(),
         "a failed AIE compile must leave no entry and no scratch in the cache"
     );
@@ -1067,7 +1071,7 @@ fn a_linked_artifact_is_published_once_and_served_by_identity() {
     )
     .unwrap();
     assert!(first.built);
-    assert_eq!(entries(cache.dir()).len(), 1);
+    assert_eq!(entries(cache.dir().unwrap()).len(), 1);
     let second = compile_aie(
         &[&body],
         &single_tile_recipe(AieTargetId::Xdna2, &abi),
@@ -1092,7 +1096,7 @@ fn a_linked_artifact_is_published_once_and_served_by_identity() {
         other.built,
         "equal element count, different dimensions: a different artifact"
     );
-    assert_eq!(entries(cache.dir()).len(), 2);
+    assert_eq!(entries(cache.dir().unwrap()).len(), 2);
     assert_eq!(other.artifact.abi().bindings()[0].dims(), &[3, 2]);
 }
 
@@ -1190,9 +1194,12 @@ fn a_stale_cache_entry_for_another_shape_is_refused() {
         LIMIT,
     )
     .unwrap();
-    cache
-        .store(&first.identity.cache_key(), &other.artifact.to_bytes())
-        .unwrap();
+    poot_codegen::test_support::plant_entry(
+        &cache,
+        &first.identity.cache_key(),
+        &other.artifact.to_bytes(),
+    )
+    .unwrap();
 
     let error = compile_aie(
         &[&body],

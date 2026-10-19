@@ -14,7 +14,7 @@ use crate::image_resolve::{DigestResolver, RegistryV2Resolver, pin_image};
 use crate::logging::{list_logs, log, logs_dir, read_log_tail, run_streaming, set_log_sink};
 use crate::manifest::{Model, parse_manifest_models, select_models};
 use crate::runpod::{CreateSpec, Pod, RunPod};
-use crate::ssh;
+use crate::ssh::{self, Remote};
 
 /// The RunPod operations the orchestrator uses. Production is [`RunPod`]; tests fake it.
 pub(crate) trait PodApi {
@@ -183,11 +183,131 @@ pub(crate) fn sh(cmd: &mut std::process::Command, what: &str) -> Result<String> 
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Margin on top of `--max-cmd` and `--keep-warm` in the default pod TTL: the upload, patch and setup
+/// steps that run before the command's own deadline starts.
+const POD_TTL_MARGIN: Duration = Duration::from_secs(30 * 60);
+
+/// Budget for the short fixed remote steps (arming the TTL, patching the binary), which run before the
+/// command's own `--max-cmd` deadline starts.
+const REMOTE_STEP_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// Where the pod-side TTL records the process group of its sleeper, so a later `exec` that adopts the
+/// pod can replace it.
+const POD_TTL_PID_FILE: &str = "/root/.poot-pod-ttl.pid";
+
+/// How long the pod lives before it removes itself: `--pod-ttl`, else the longest this `exec` can run.
+fn pod_ttl(a: &ExecArgs) -> Duration {
+    match a.pod_ttl {
+        Some(minutes) => Duration::from_secs(minutes * 60),
+        None => a.max_cmd + Duration::from_secs(a.keep_warm.unwrap_or(0) * 60) + POD_TTL_MARGIN,
+    }
+}
+
+/// The remote command that makes the pod remove itself after `ttl`, independent of this machine: a
+/// detached sleeper that runs `runpodctl remove pod` with the pod's own credentials (RunPod's REST
+/// DELETE refuses the pod's key). An ssh session does not inherit the container's environment, so the
+/// sleeper reads the pod id and key from the container's init process. It replaces a sleeper an earlier
+/// `exec` left on an adopted pod, and the command fails unless `runpodctl` exists and the new sleeper
+/// has started.
+fn pod_ttl_command(ttl: Duration) -> String {
+    let secs = ttl.as_secs();
+    format!(
+        "command -v runpodctl >/dev/null || {{ echo 'runpodctl is missing: the pod cannot remove itself' >&2; exit 1; }}; \
+         if [ -s {POD_TTL_PID_FILE} ]; then kill -- \"-$(cat {POD_TTL_PID_FILE})\" 2>/dev/null; fi; \
+         rm -f {POD_TTL_PID_FILE}; \
+         setsid sh -c 'echo $$ > {POD_TTL_PID_FILE}; \
+         pod_env() {{ tr \"\\0\" \"\\n\" </proc/1/environ | sed -n \"s/^$1=//p\"; }}; \
+         sleep {secs}; \
+         RUNPOD_API_KEY=$(pod_env RUNPOD_API_KEY) runpodctl remove pod \"$(pod_env RUNPOD_POD_ID)\"' \
+         </dev/null >/root/.poot-pod-ttl.log 2>&1 & \
+         for i in 1 2 3 4 5 6 7 8 9 10; do [ -s {POD_TTL_PID_FILE} ] && exit 0; sleep 0.2; done; \
+         echo 'the pod TTL sleeper did not start' >&2; exit 1"
+    )
+}
+
+/// The remote command that points an uploaded binary at the pod's glibc loader and makes it executable.
+/// Each step runs only if the one before succeeded, and none hides its errors: a binary that was not
+/// patched must fail the exec, not run and die with a misleading ENOENT.
+fn patch_command(remote: &str) -> String {
+    format!(
+        "{{ command -v patchelf >/dev/null || {{ apt-get update -qq && apt-get install -y -qq patchelf; }}; }} \
+         && patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 {remote} \
+         && chmod +x {remote}"
+    )
+}
+
+/// Run `cmd` on the remote, killing it at `deadline`. A timeout is the typed [`ssh::DeadlineError`]
+/// under the context, so callers can `downcast_ref` it.
+fn remote_run<R: Remote + ?Sized>(
+    remote: &R,
+    cmd: &str,
+    deadline: Instant,
+    what: &str,
+) -> Result<ssh::Run> {
+    remote
+        .ssh_until(cmd, deadline)
+        .with_context(|| format!("remote {what}"))
+}
+
+/// [`remote_run`], and fail on a non-zero exit with the command's stderr. Returns stdout.
+fn remote_checked<R: Remote + ?Sized>(
+    remote: &R,
+    cmd: &str,
+    deadline: Instant,
+    what: &str,
+) -> Result<String> {
+    let run = remote_run(remote, cmd, deadline, what)?;
+    if !run.ok() {
+        bail!(
+            "remote {what} failed (rc={}): {cmd}\n{}",
+            run.code,
+            run.stderr.trim()
+        );
+    }
+    Ok(run.stdout)
+}
+
+/// A per-run scratch directory: the patched runner binary, the build worktree and the run's ssh
+/// known-hosts file live here, so two runs never share a path. Removed when dropped.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Result<Scratch> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("poot-orch-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Ok(Scratch(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn known_hosts(&self) -> PathBuf {
+        self.0.join("known_hosts")
+    }
+
+    /// Where [`patchelf_for_pod`] puts the runner that `run` uploads.
+    fn runner(&self) -> PathBuf {
+        self.0.join("poot-bench-runner-pod")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            log(format!("could not remove {}: {e}", self.0.display()));
+        }
+    }
+}
+
 /// Provision a pod, optionally scp a binary, run a command, tear down. Reuses the bench pod machinery
-/// for poot tests on real NVIDIA hardware.
-pub(crate) fn cmd_exec(db: &Db, a: ExecArgs) -> Result<()> {
-    use ssh::Endpoint;
-    let rp = RunPod::new(require_key(a.runpod_api_key.clone())?)?;
+/// for poot tests on real NVIDIA hardware. SIGINT and SIGTERM tear the run's pod down; the pod also
+/// removes itself after its TTL even if this process is gone.
+pub(crate) fn cmd_exec(db: &Db, state_db: &str, a: ExecArgs) -> Result<()> {
+    let key = runpod_api_key()?;
+    let rp = RunPod::new(key.clone())?;
     // Finalize and reap any killed prior exec (stale row, leaked pod) first.
     reap(db, &rp, false)?;
     let ssh_key = expand_tilde(&a.ssh_key);
@@ -201,6 +321,32 @@ pub(crate) fn cmd_exec(db: &Db, a: ExecArgs) -> Result<()> {
     let run_id = new_exec_run_id();
     let logpath = logs_dir().join(format!("{run_id}.log"));
     set_log_sink(&logpath);
+    let scratch = Scratch::new("exec")?;
+    {
+        let state_db = state_db.to_string();
+        let run_id = run_id.clone();
+        let keep = a.keep;
+        let installed = install_signal_teardown(
+            move || match (Db::open(&state_db), RunPod::new(key.clone())) {
+                (Ok(hdb), Ok(hrp)) => {
+                    if let Err(e) = exec_signal_teardown(&hdb, &hrp, &run_id, keep) {
+                        log(format!("  {e:#}"));
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => log(format!(
+                    "signal received but run {run_id} could not be torn down and its pod may still \
+                     be billing: {e:#}"
+                )),
+            },
+            || std::process::exit(130),
+        );
+        if let Err(e) = installed {
+            log(format!(
+                "could not install SIGINT/SIGTERM teardown handler ({e}); a kill will leak this \
+                 run's pod until its TTL, `reap` or manual delete"
+            ));
+        }
+    }
     let resolver = RegistryV2Resolver::new()?;
     let ExecPod { pod_id, host, port } = acquire_exec_pod(
         db,
@@ -209,61 +355,72 @@ pub(crate) fn cmd_exec(db: &Db, a: ExecArgs) -> Result<()> {
         &a,
         &run_id,
         &ssh_key,
+        &scratch.known_hosts(),
         &env,
         PROVISION_POLL_INTERVAL,
     )?;
+    let remote = ssh::Endpoint::new(host, port, ssh_key, scratch.known_hosts());
+    exec_on_pod(db, &rp, &remote, &a, &run_id, &logpath, &pod_id)
+}
 
+/// Run `teardown` when the process gets SIGINT or SIGTERM, then `then`. The handler runs on its own
+/// thread, so it works while the main thread is blocked in a network call.
+fn install_signal_teardown(
+    teardown: impl Fn() + Send + 'static,
+    then: impl Fn() + Send + 'static,
+) -> Result<(), ctrlc::Error> {
+    ctrlc::set_handler(move || {
+        teardown();
+        then();
+    })
+}
+
+/// What the signal handler does for an `exec`: delete the run's pod (unless `--keep`) and mark the run
+/// terminal. The pod id comes from the run row, so a pod created a moment before the signal is found
+/// too. A refused delete leaves the run non-terminal, like the normal teardown.
+fn exec_signal_teardown<P: PodApi + ?Sized>(
+    db: &Db,
+    pods: &P,
+    run_id: &str,
+    keep: bool,
+) -> Result<()> {
+    match (db.pod_id_for_run(run_id)?, keep) {
+        (Some(pod_id), false) => {
+            log(format!(
+                "signal received: tearing down pod {pod_id} for exec {run_id}"
+            ));
+            finish_exec_pod(db, pods, run_id, &pod_id, "aborted")
+        }
+        (Some(pod_id), true) => {
+            log(format!(
+                "signal received: --keep leaves pod {pod_id} alive (reaped on the next run)"
+            ));
+            db.set_status(run_id, "aborted")
+        }
+        (None, _) => {
+            log("signal received: no pod to tear down (not yet provisioned)");
+            db.set_status(run_id, "aborted")
+        }
+    }
+}
+
+/// Everything `exec` does on the pod once it has one: arm the pod-side TTL, upload, set up, run the
+/// command under `--max-cmd`, then tear the pod down (or keep it) and record the run's status.
+fn exec_on_pod<P: PodApi + ?Sized, R: Remote + ?Sized>(
+    db: &Db,
+    pods: &P,
+    remote: &R,
+    a: &ExecArgs,
+    run_id: &str,
+    logpath: &Path,
+    pod_id: &str,
+) -> Result<()> {
     // Run the body, capturing the result so the pod is always torn down (unless --keep).
     // `Ok(bool)` means the command ran over SSH (so the pod's control plane is healthy) and the bool is
-    // its exit status; `Err` is a transport/environment failure (`wait_ssh`, `scp_up`, `ssh_checked`)
-    // before the command's result was known, i.e. a possibly half-broken pod. Card 407.
-    let body = || -> Result<bool> {
-        let ep = Endpoint::new(host.clone(), port, ssh_key.clone());
-        ep.wait_ssh(Duration::from_secs(a.ssh_timeout_s))?;
-        if let Some(bin) = &a.bin {
-            let base = std::path::Path::new(bin)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "binary".to_string());
-            let remote = format!("/root/{base}");
-            log(format!("scp {bin} -> {remote}"));
-            ep.scp_up(bin, &remote)?;
-            ep.ssh_checked(&format!(
-                "(command -v patchelf >/dev/null || (apt-get update -qq && apt-get install -y -qq patchelf)) >/dev/null 2>&1; \
-                 patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 {remote} 2>/dev/null; chmod +x {remote}"
-            ))?;
-        }
-        for up in &a.uploads {
-            let (local, remote) = up
-                .split_once(':')
-                .ok_or_else(|| anyhow!("--upload must be local:remote, got {up:?}"))?;
-            log(format!("scp {local} -> {remote}"));
-            ep.scp_up(local, remote)?;
-        }
-        if let Some(setup) = &a.setup {
-            log(format!("setup: {setup}"));
-            let out = ep.ssh_checked(setup)?;
-            if !out.trim().is_empty() {
-                log(out);
-            }
-        }
-        log(format!("exec: {}", a.cmd));
-        let run = ep.ssh(&a.cmd)?;
-        // Raw stdout goes to our stdout (callers parse the JSON last line) and verbatim into the run log.
-        print!("{}", run.stdout);
-        if !run.stderr.trim().is_empty() {
-            eprint!("{}", run.stderr);
-        }
-        append_raw(&logpath, "=== command stdout ===\n");
-        append_raw(&logpath, &run.stdout);
-        if !run.stderr.trim().is_empty() {
-            append_raw(&logpath, "=== command stderr ===\n");
-            append_raw(&logpath, &run.stderr);
-        }
-        // A non-zero exit is reported through the bool, not `Err`, to stay distinct from transport failures.
-        Ok(run.ok())
-    };
-    let result = body();
+    // its exit status; `Err` is a transport/environment failure (`wait_ssh`, `scp_up`, a failed
+    // remote step, the `--max-cmd` timeout) before the command's result was known, i.e. a possibly
+    // half-broken pod. Card 407.
+    let result = exec_body(remote, a, logpath);
 
     // Cap on keep-warm minutes after a non-zero exit: callers are likelier to abandon a red run than
     // come back and adopt the pod. An unmeasured guess (card 407).
@@ -284,7 +441,7 @@ pub(crate) fn cmd_exec(db: &Db, a: ExecArgs) -> Result<()> {
                     m.min(KEEP_WARM_RED_CEILING_MINUTES)
                 };
                 let until = iso_in_minutes(minutes);
-                db.set_warm(&run_id, &until).ok();
+                db.set_warm(run_id, &until).ok();
                 if *command_ok {
                     log(format!(
                         "--keep-warm: pod {pod_id} kept warm until {until} ({minutes} min); the next exec with image {} adopts it",
@@ -311,15 +468,15 @@ pub(crate) fn cmd_exec(db: &Db, a: ExecArgs) -> Result<()> {
                         " despite the command's non-zero exit"
                     }
                 ));
-                db.set_status(&run_id, if *command_ok { "done" } else { "failed" })
+                db.set_status(run_id, if *command_ok { "done" } else { "failed" })
                     .ok();
             } else {
                 log(format!("tearing down pod {pod_id}"));
                 teardown = finish_exec_pod(
                     db,
-                    &rp,
-                    &run_id,
-                    &pod_id,
+                    pods,
+                    run_id,
+                    pod_id,
                     if *command_ok { "done" } else { "failed" },
                 );
             }
@@ -330,12 +487,12 @@ pub(crate) fn cmd_exec(db: &Db, a: ExecArgs) -> Result<()> {
                 log(format!(
                     "--keep: leaving pod {pod_id} alive despite failure (reaped on the next run)"
                 ));
-                db.set_status(&run_id, "failed").ok();
+                db.set_status(run_id, "failed").ok();
             } else {
                 log(format!("tearing down pod {pod_id}"));
-                teardown = finish_exec_pod(db, &rp, &run_id, &pod_id, "failed");
+                teardown = finish_exec_pod(db, pods, run_id, pod_id, "failed");
             }
-            log(format!("EXEC_EXIT=1 ({e})"));
+            log(format!("EXEC_EXIT=1 ({e:#})"));
         }
     }
 
@@ -354,6 +511,80 @@ pub(crate) fn cmd_exec(db: &Db, a: ExecArgs) -> Result<()> {
         Ok(false) => Err(anyhow!("command exited non-zero")),
         Err(e) => Err(e),
     }
+}
+
+/// Wait for ssh, then arm the pod-side TTL before anything else runs, so every later failure (and this
+/// process dying) is bounded by it. Shared by `exec` and the sweep.
+fn ready_pod<R: Remote + ?Sized>(remote: &R, ssh_timeout: Duration, ttl: Duration) -> Result<()> {
+    remote.wait_ssh(ssh_timeout)?;
+    log(format!(
+        "pod removes itself after {} min",
+        ttl.as_secs() / 60
+    ));
+    remote_checked(
+        remote,
+        &pod_ttl_command(ttl),
+        Instant::now() + REMOTE_STEP_BUDGET,
+        "pod TTL",
+    )?;
+    Ok(())
+}
+
+/// How long a sweep pod lives: every model's repeats at the full `--sweep-timeout-s`, plus the margin
+/// for upload and setup.
+fn sweep_pod_ttl(a: &RunArgs, models: usize) -> Duration {
+    Duration::from_secs(a.sweep_timeout_s) * (a.repeats * models as u32) + POD_TTL_MARGIN
+}
+
+/// The remote half of `exec`. Setup and `--cmd` share one `--max-cmd` budget; the steps before it have a
+/// fixed one. Returns whether `--cmd` exited zero.
+fn exec_body<R: Remote + ?Sized>(remote: &R, a: &ExecArgs, logpath: &Path) -> Result<bool> {
+    ready_pod(remote, Duration::from_secs(a.ssh_timeout_s), pod_ttl(a))?;
+    if let Some(bin) = &a.bin {
+        let base = std::path::Path::new(bin)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "binary".to_string());
+        let remote_path = format!("/root/{base}");
+        log(format!("scp {bin} -> {remote_path}"));
+        remote.scp_up(bin, &remote_path)?;
+        remote_checked(
+            remote,
+            &patch_command(&remote_path),
+            Instant::now() + REMOTE_STEP_BUDGET,
+            "binary patch",
+        )?;
+    }
+    for up in &a.uploads {
+        let (local, remote_path) = up
+            .split_once(':')
+            .ok_or_else(|| anyhow!("--upload must be local:remote, got {up:?}"))?;
+        log(format!("scp {local} -> {remote_path}"));
+        remote.scp_up(local, remote_path)?;
+    }
+    let deadline = Instant::now() + a.max_cmd;
+    if let Some(setup) = &a.setup {
+        log(format!("setup: {setup}"));
+        let out = remote_checked(remote, setup, deadline, "setup")?;
+        if !out.trim().is_empty() {
+            log(out);
+        }
+    }
+    log(format!("exec: {} (at most {:?})", a.cmd, a.max_cmd));
+    let run = remote_run(remote, &a.cmd, deadline, "command")?;
+    // Raw stdout goes to our stdout (callers parse the JSON last line) and verbatim into the run log.
+    print!("{}", run.stdout);
+    if !run.stderr.trim().is_empty() {
+        eprint!("{}", run.stderr);
+    }
+    append_raw(logpath, "=== command stdout ===\n");
+    append_raw(logpath, &run.stdout);
+    if !run.stderr.trim().is_empty() {
+        append_raw(logpath, "=== command stderr ===\n");
+        append_raw(logpath, &run.stderr);
+    }
+    // A non-zero exit is reported through the bool, not `Err`, to stay distinct from transport failures.
+    Ok(run.ok())
 }
 
 /// The pod an `exec` runs on.
@@ -377,10 +608,10 @@ fn acquire_exec_pod<P: PodApi + ?Sized>(
     a: &ExecArgs,
     run_id: &str,
     ssh_key: &str,
+    known_hosts: &Path,
     env: &HashMap<String, String>,
     poll_interval: Duration,
 ) -> Result<ExecPod> {
-    use ssh::Endpoint;
     let image = match pin_image(resolver, &a.image) {
         Ok(image) => image,
         Err(e) => {
@@ -418,7 +649,7 @@ fn acquire_exec_pod<P: PodApi + ?Sized>(
     // the pod claim in one DB transaction, so two concurrent execs cannot take the same pod.
     let adopted: Option<ExecPod> = match db.find_warm_exec(&image)? {
         Some(w) if w.warm_until.as_str() > now_iso().as_str() => {
-            let ep = Endpoint::new(w.host.clone(), w.port, ssh_key.to_string());
+            let ep = ssh::Endpoint::new(w.host.clone(), w.port, ssh_key, known_hosts);
             if ep.wait_ssh(Duration::from_secs(20)).is_ok() {
                 if db.try_adopt_warm_exec(&w, run_id, &owner)? {
                     log(format!(
@@ -637,9 +868,13 @@ pub(crate) fn cmd_logs(a: &LogsArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn require_key(opt: Option<String>) -> Result<String> {
-    opt.filter(|k| !k.is_empty())
-        .ok_or_else(|| anyhow!("RUNPOD_API_KEY is not set (pass --runpod-api-key or the env var)"))
+/// The RunPod API key, read from `RUNPOD_API_KEY` only: a key given as a command-line argument is
+/// visible to every local user in the process list.
+pub(crate) fn runpod_api_key() -> Result<String> {
+    std::env::var("RUNPOD_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| anyhow!("RUNPOD_API_KEY is not set"))
 }
 
 pub(crate) fn cmd_status(db: &Db, state_db: &str) -> Result<()> {
@@ -767,10 +1002,11 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
     )?
     .trim()
     .to_string();
+    let scratch = Scratch::new("run")?;
     let poot_bin = match &a.poot_bin {
         // patchelf a prebuilt binary too: a nix-built one would fail execve on the pod (missing nix loader).
-        Some(p) => patchelf_for_pod(Path::new(p))?,
-        None => build_poot_runner(&a.git_ref, &sha)?,
+        Some(p) => patchelf_for_pod(Path::new(p), &scratch)?,
+        None => build_poot_runner(&a.git_ref, &sha, &scratch)?,
     };
     log(format!(
         "poot runner: {} (ref {} = {sha})",
@@ -783,7 +1019,7 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    let key = require_key(a.runpod_api_key.clone())?;
+    let key = runpod_api_key()?;
     let rp = RunPod::new(key.clone())?;
     // Reap orphans from a previous dead run (also finalizes killed exec rows).
     reap(&db, &rp, false)?;
@@ -834,7 +1070,7 @@ pub(crate) fn cmd_run(db: Db, state_db: String, a: RunArgs) -> Result<()> {
     }
 
     // Run the phases; always attempt teardown afterwards.
-    let result = run_phases(&db, &rp, &run, &models, &poot_bin, &a, &mut endpoint);
+    let result = run_phases(&db, &rp, &run, &models, &scratch, &a, &mut endpoint);
     // With --keep-pod the pod is released to idle for a later run to adopt; otherwise it is terminated.
     let pid = run.pod_id_now(&db);
     let status = match &result {
@@ -979,7 +1215,7 @@ fn run_phases(
     rp: &RunPod,
     run: &Run,
     models: &[Model],
-    poot_bin: &Path,
+    scratch: &Scratch,
     a: &RunArgs,
     endpoint: &mut Option<(String, u16)>,
 ) -> Result<()> {
@@ -1003,8 +1239,12 @@ fn run_phases(
         let _ = db.set_pod_endpoint(pid, &host, port);
         let _ = db.assign_pod(pid, &run.id);
     }
-    let ep = ssh::Endpoint::new(host, port, ssh_key);
-    ep.wait_ssh(Duration::from_secs(a.ssh_timeout_s))?;
+    let ep = ssh::Endpoint::new(host, port, ssh_key, scratch.known_hosts());
+    ready_pod(
+        &ep,
+        Duration::from_secs(a.ssh_timeout_s),
+        sweep_pod_ttl(a, models.len()),
+    )?;
     let gpu = ep
         .ssh("nvidia-smi --query-gpu=name --format=csv,noheader")
         .map(|r| r.stdout.trim().to_string())
@@ -1012,7 +1252,7 @@ fn run_phases(
     log(format!("pod GPU: {gpu}"));
 
     db.set_status(&run.id, "setup")?;
-    setup_pod(db, run, models, poot_bin, &ep, a)?;
+    setup_pod(db, run, models, &scratch.runner(), &ep, a)?;
 
     db.set_status(&run.id, "sweeping")?;
     sweep(db, rp, run, models, &ep, a, pod_id.as_deref())?;
@@ -1024,7 +1264,46 @@ fn run_phases(
     Ok(())
 }
 
-fn build_poot_runner(git_ref: &str, sha: &str) -> Result<PathBuf> {
+/// A detached git worktree of the requested ref, removed when dropped.
+struct Worktree {
+    repo: PathBuf,
+    path: PathBuf,
+}
+
+impl Worktree {
+    fn add(repo: &Path, path: PathBuf, sha: &str) -> Result<Worktree> {
+        sh(
+            std::process::Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&path)
+                .arg(sha)
+                .current_dir(repo),
+            "git worktree add",
+        )?;
+        Ok(Worktree {
+            repo: repo.to_path_buf(),
+            path,
+        })
+    }
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        if let Err(e) = sh(
+            std::process::Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&self.path)
+                .current_dir(&self.repo),
+            "git worktree remove",
+        ) {
+            log(format!("{e:#}"));
+        }
+    }
+}
+
+/// Build the runner at `git_ref` and return the patched copy in `scratch`. A ref other than HEAD builds in
+/// a throwaway worktree under `scratch` that is removed before this returns.
+fn build_poot_runner(git_ref: &str, sha: &str, scratch: &Scratch) -> Result<PathBuf> {
     let repo = repo_root()?;
     let head = sh(
         std::process::Command::new("git")
@@ -1035,24 +1314,17 @@ fn build_poot_runner(git_ref: &str, sha: &str) -> Result<PathBuf> {
     .trim()
     .to_string();
     // Build in place for HEAD; otherwise in a clean worktree of the requested ref (cold target, reproducible).
-    let (build_repo, _wt): (PathBuf, Option<PathBuf>) = if git_ref == "HEAD" || sha == head {
-        (repo.clone(), None)
+    let worktree = if git_ref == "HEAD" || sha == head {
+        None
     } else {
-        let wt = std::env::temp_dir().join(format!("poot-wt-{sha}"));
-        if !wt.exists() {
-            log(format!(
-                "adding worktree for {git_ref} at {} (cold build)",
-                wt.display()
-            ));
-            sh(
-                std::process::Command::new("git")
-                    .args(["worktree", "add", "--detach", wt.to_str().unwrap(), sha])
-                    .current_dir(&repo),
-                "git worktree add",
-            )?;
-        }
-        (wt.clone(), Some(wt))
+        let wt = scratch.path().join("worktree");
+        log(format!(
+            "adding worktree for {git_ref} at {} (cold build)",
+            wt.display()
+        ));
+        Some(Worktree::add(&repo, wt, sha)?)
     };
+    let build_repo = worktree.as_ref().map_or(repo, |wt| wt.path.clone());
 
     // The runner generates kernels at runtime, so a plain `cargo build --release` suffices.
     let runner_dir = build_repo.join("benchmarks").join("runners").join("poot");
@@ -1061,7 +1333,7 @@ fn build_poot_runner(git_ref: &str, sha: &str) -> Result<PathBuf> {
         runner_dir.display()
     ));
     let built = build_runner_artifact("cargo", &runner_dir)?;
-    patchelf_for_pod(&built)
+    patchelf_for_pod(&built, scratch)
 }
 
 const RUNNER_BIN: &str = "poot-bench-runner";
@@ -1121,28 +1393,29 @@ fn runner_executable(cargo_messages: &str, manifest: &Path) -> Result<PathBuf> {
     Ok(executable)
 }
 
-/// Copy a locally built binary to a temp path and patchelf its interpreter to the pod's glibc loader.
+/// Copy a locally built binary into `scratch` and patchelf its interpreter to the pod's glibc loader.
 /// A nix-built binary names the nix loader, absent on the pod, so `execve` fails with ENOENT (surfacing
 /// in the harness's Python as a misleading `FileNotFoundError`). Both the build-from-ref path and
-/// `--poot-bin` go through here (a `--poot-bin` that skipped it broke run-1781808494).
-fn patchelf_for_pod(src: &Path) -> Result<PathBuf> {
+/// `--poot-bin` go through here (a `--poot-bin` that skipped it broke run-1781808494). Without
+/// `patchelf` there is no binary to upload, so this refuses.
+fn patchelf_for_pod(src: &Path, scratch: &Scratch) -> Result<PathBuf> {
     if !src.exists() {
         bail!("poot runner not found: {}", src.display());
     }
-    let pod_bin = std::env::temp_dir().join("poot-bench-runner-pod");
-    std::fs::copy(src, &pod_bin)?;
-    if which("patchelf") {
-        sh(
-            std::process::Command::new("patchelf").args([
-                "--set-interpreter",
-                "/lib64/ld-linux-x86-64.so.2",
-                pod_bin.to_str().unwrap(),
-            ]),
-            "patchelf",
-        )?;
-    } else {
-        log("WARN: patchelf not found; the pod run may fail with rc 127 (nix interpreter)");
+    if !which("patchelf") {
+        bail!(
+            "patchelf not found: the runner would keep the nix loader and fail on the pod with rc 127 \
+             (install patchelf, or enter the devshell that provides it)"
+        );
     }
+    let pod_bin = scratch.runner();
+    std::fs::copy(src, &pod_bin)?;
+    sh(
+        std::process::Command::new("patchelf")
+            .args(["--set-interpreter", "/lib64/ld-linux-x86-64.so.2"])
+            .arg(&pod_bin),
+        "patchelf",
+    )?;
     Ok(pod_bin)
 }
 
@@ -2130,6 +2403,7 @@ mod tests {
             &exec_args(tag),
             "exec-1",
             "no-key",
+            Path::new("no-known-hosts"),
             &HashMap::new(),
             Duration::ZERO,
         )
@@ -2159,6 +2433,7 @@ mod tests {
             &exec_args("ghcr.io/kikijiki/poot-bench:latest"),
             "exec-1",
             "no-key",
+            Path::new("no-known-hosts"),
             &HashMap::new(),
             Duration::ZERO,
         )
@@ -2168,6 +2443,319 @@ mod tests {
         assert!(format!("{err:#}").contains("denied"), "{err:#}");
         assert_eq!(cloud.created.get(), 0, "no pod was created");
         assert!(db.recent_runs(10).unwrap().is_empty(), "no run row");
+    }
+
+    /// The sweep arms the same pod-side TTL, sized from its own budget: every model's repeats at the full
+    /// sweep timeout plus the margin. A sweep that skips `ready_pod` leaks its pod when killed.
+    #[test]
+    fn the_sweep_pod_ttl_covers_its_budget_and_is_armed_first() {
+        let Command::Run(a) = Cli::try_parse_from([
+            "poot-orchestrator",
+            "run",
+            "--sweep-timeout-s",
+            "600",
+            "--repeats",
+            "2",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("`run` parses to Command::Run");
+        };
+        let ttl = sweep_pod_ttl(&a, 3);
+        assert_eq!(ttl, Duration::from_secs(600 * 2 * 3) + POD_TTL_MARGIN);
+
+        let pod = LocalPod::new(0);
+        ready_pod(&pod, Duration::from_secs(1), ttl).unwrap();
+        assert_eq!(pod.commands(), [pod_ttl_command(ttl)]);
+    }
+
+    /// The signal handler and the main thread can both delete the pod; the second delete of a pod
+    /// RunPod already removed is tolerated and the run still ends terminal.
+    #[test]
+    fn a_second_delete_after_signal_teardown_is_tolerated() {
+        let db = Db::open(":memory:").unwrap();
+        db.create_run(&exec_run("exec-1")).unwrap();
+        db.set_pod("exec-1", "pod-1", None, None).unwrap();
+        let pods = SharedPods::default();
+        exec_signal_teardown(&db, &pods, "exec-1", false).unwrap();
+        finish_exec_pod(&db, &pods, "exec-1", "pod-1", "failed").unwrap();
+        assert_eq!(*pods.deleted.lock().unwrap(), ["pod-1", "pod-1"]);
+        assert_eq!(db.run_status("exec-1").unwrap().as_deref(), Some("failed"));
+    }
+
+    /// A scratch directory and what is in it are gone when it is dropped.
+    #[test]
+    fn scratch_is_removed_on_drop() {
+        let scratch = Scratch::new("drop").unwrap();
+        let dir = scratch.path().to_path_buf();
+        std::fs::write(scratch.known_hosts(), "x").unwrap();
+        assert!(dir.join("known_hosts").exists());
+        drop(scratch);
+        assert!(!dir.exists());
+    }
+
+    fn exec_args_with(extra: &[&str]) -> ExecArgs {
+        let argv = ["poot-orchestrator", "exec"]
+            .into_iter()
+            .chain(extra.iter().copied());
+        let Command::Exec(args) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("`exec` parses to Command::Exec");
+        };
+        args
+    }
+
+    /// A pod that is a local directory: remote commands run in a local `sh` with `/root/` rewritten to
+    /// the sandbox, through the production deadline path ([`ssh::output_until`]). Its `bin/` comes first
+    /// on `PATH`. Arming the pod-side TTL is recorded but not run: it would call RunPod.
+    struct LocalPod {
+        dir: PathBuf,
+        commands: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LocalPod {
+        fn new(patchelf_exit: i32) -> LocalPod {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = unique_temp_dir("pod");
+            std::fs::create_dir(dir.join("bin")).unwrap();
+            let patchelf = dir.join("bin/patchelf");
+            std::fs::write(
+                &patchelf,
+                format!("#!/bin/sh\necho 'patchelf: fake rc {patchelf_exit}' >&2\nexit {patchelf_exit}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&patchelf, std::fs::Permissions::from_mode(0o755)).unwrap();
+            LocalPod {
+                dir,
+                commands: Default::default(),
+            }
+        }
+
+        fn sandboxed(&self, text: &str) -> String {
+            text.replace("/root/", &format!("{}/", self.dir.display()))
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    impl Remote for LocalPod {
+        fn wait_ssh(&self, _timeout: Duration) -> Result<()> {
+            Ok(())
+        }
+
+        fn scp_up(&self, local: &str, remote: &str) -> Result<()> {
+            self.commands
+                .lock()
+                .unwrap()
+                .push(format!("scp {local} {remote}"));
+            std::fs::copy(local, self.sandboxed(remote))?;
+            Ok(())
+        }
+
+        fn ssh_until(&self, cmd: &str, deadline: Instant) -> Result<ssh::Run, ssh::DeadlineError> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            if cmd.contains(POD_TTL_PID_FILE) {
+                return Ok(ssh::Run {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            let path = format!(
+                "{}:{}",
+                self.dir.join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let mut c = std::process::Command::new("sh");
+            c.arg("-c").arg(self.sandboxed(cmd)).env("PATH", path);
+            let out = ssh::output_until(&mut c, deadline)?;
+            Ok(ssh::Run {
+                code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            })
+        }
+    }
+
+    /// A tracked exec run on `pod-1`, in a fresh in-memory state DB and a cloud that holds the pod.
+    fn exec_on_fake_pod(a: &ExecArgs, remote: &LocalPod) -> (Result<()>, Db, FakePods) {
+        let db = Db::open(":memory:").unwrap();
+        db.create_run(&exec_run("exec-1")).unwrap();
+        db.set_pod("exec-1", "pod-1", None, None).unwrap();
+        let cloud = FakePods::default();
+        cloud.seed("pod-1", "poot-orch-x-exec-1-a1", true);
+        let logpath = unique_temp_dir("log").join("exec-1.log");
+        let result = exec_on_pod(&db, &cloud, remote, a, "exec-1", &logpath, "pod-1");
+        (result, db, cloud)
+    }
+
+    /// SC-002: a remote command past `--max-cmd` is killed at the deadline with the typed timeout, and
+    /// the failed exec still tears the pod down. Giving the command a longer deadline than `--max-cmd`
+    /// lets `sleep 20` finish and this goes red.
+    #[test]
+    fn exec_kills_a_command_that_outlives_max_cmd() {
+        let pod = LocalPod::new(0);
+        let a = exec_args_with(&["--cmd", "sleep 20", "--max-cmd", "2s"]);
+        let started = Instant::now();
+        let (result, db, cloud) = exec_on_fake_pod(&a, &pod);
+        let elapsed = started.elapsed();
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ssh::DeadlineError>(),
+            Some(&ssh::DeadlineError::Timeout),
+            "{err:#}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(10),
+            "killed at --max-cmd, elapsed {elapsed:?}"
+        );
+        assert!(cloud.ids().is_empty(), "the pod was torn down");
+        assert_eq!(db.run_status("exec-1").unwrap().as_deref(), Some("failed"));
+    }
+
+    /// The pod-side TTL is the first remote command, and it is the default window: `--max-cmd` plus
+    /// `--keep-warm` plus the margin. Not arming it leaves a dead orchestrator's pod billing.
+    #[test]
+    fn exec_arms_the_pod_ttl_before_anything_else() {
+        let pod = LocalPod::new(0);
+        let a = exec_args_with(&["--cmd", "true", "--max-cmd", "10m", "--keep-warm", "20"]);
+        let (result, _db, _cloud) = exec_on_fake_pod(&a, &pod);
+        result.unwrap();
+        let commands = pod.commands();
+        let expected = pod_ttl_command(Duration::from_secs((10 + 20 + 30) * 60));
+        assert_eq!(commands.first(), Some(&expected), "{commands:?}");
+        assert!(expected.contains("sleep 3600;"), "{expected}");
+        assert_eq!(
+            pod_ttl(&exec_args_with(&["--cmd", "x", "--pod-ttl", "5"])).as_secs(),
+            300
+        );
+    }
+
+    /// SC-005: a patch step that fails fails the exec, and the command never runs. Chaining the steps
+    /// with `;` lets the trailing `chmod` succeed and this goes red. The control shows the same exec
+    /// running its command once the patch succeeds.
+    #[test]
+    fn a_failing_remote_patch_step_fails_the_exec() {
+        let bin = unique_temp_dir("bin").join("runner");
+        std::fs::write(&bin, "not an elf").unwrap();
+        let bin = bin.to_str().unwrap();
+
+        let broken = LocalPod::new(3);
+        let a = exec_args_with(&["--cmd", "echo ran", "--bin", bin]);
+        let (result, _db, _cloud) = exec_on_fake_pod(&a, &broken);
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("binary patch failed (rc=3)"), "{err}");
+        assert!(
+            !broken.commands().iter().any(|c| c == "echo ran"),
+            "the command must not run on an unpatched binary: {:?}",
+            broken.commands()
+        );
+
+        let sound = LocalPod::new(0);
+        let (result, _db, _cloud) = exec_on_fake_pod(&a, &sound);
+        result.unwrap();
+        assert!(sound.commands().iter().any(|c| c == "echo ran"));
+    }
+
+    /// A pod and a DB shared with the signal handler thread.
+    #[derive(Clone, Default)]
+    struct SharedPods {
+        deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl PodApi for SharedPods {
+        fn create_pod(&self, _spec: &CreateSpec<'_>) -> Result<Pod> {
+            unimplemented!("the pod already exists")
+        }
+        fn get_pod(&self, _id: &str) -> Result<Pod> {
+            unimplemented!("not used")
+        }
+        fn list_pods(&self) -> Result<Vec<Pod>> {
+            unimplemented!("not used")
+        }
+        fn delete_pod(&self, id: &str) -> Result<()> {
+            self.deleted.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+    }
+
+    /// SC-001: a SIGTERM delivered while `exec` is mid-command runs the teardown once: the pod is
+    /// deleted and the run row is terminal. Without the installed handler the signal kills this process.
+    #[test]
+    fn sigterm_during_an_exec_tears_the_pod_down_once() {
+        let state_db = unique_temp_dir("sig").join("state.db");
+        let state_db = state_db.to_str().unwrap().to_string();
+        {
+            let db = Db::open(&state_db).unwrap();
+            db.create_run(&exec_run("exec-1")).unwrap();
+            db.set_pod("exec-1", "pod-1", None, None).unwrap();
+        }
+        let pods = SharedPods::default();
+        let pod = std::sync::Arc::new(LocalPod::new(0));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        install_signal_teardown(
+            {
+                let (state_db, pods) = (state_db.clone(), pods.clone());
+                move || {
+                    let db = Db::open(&state_db).unwrap();
+                    exec_signal_teardown(&db, &pods, "exec-1", false).unwrap();
+                }
+            },
+            move || done_tx.send(()).unwrap(),
+        )
+        .unwrap();
+
+        let exec = {
+            let (state_db, pods, pod) = (state_db.clone(), pods.clone(), pod.clone());
+            std::thread::spawn(move || {
+                let db = Db::open(&state_db).unwrap();
+                let a = exec_args_with(&["--cmd", "sleep 20", "--max-cmd", "60s"]);
+                let logpath = unique_temp_dir("log").join("exec-1.log");
+                let _ = exec_on_pod(&db, &pods, &*pod, &a, "exec-1", &logpath, "pod-1");
+            })
+        };
+        let started = Instant::now();
+        while !pod.commands().iter().any(|c| c == "sleep 20") {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "exec never reached its command"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the SIGTERM handler ran its teardown");
+
+        assert_eq!(
+            *pods.deleted.lock().unwrap(),
+            ["pod-1"],
+            "terminated exactly once"
+        );
+        let db = Db::open(&state_db).unwrap();
+        assert_eq!(db.run_status("exec-1").unwrap().as_deref(), Some("aborted"));
+        drop(exec); // still inside `sleep 20`; the process exit ends it
+    }
+
+    /// `--keep` leaves the pod to the next `reap` but still marks the signalled run terminal.
+    #[test]
+    fn signal_teardown_with_keep_leaves_the_pod_and_ends_the_run() {
+        let db = Db::open(":memory:").unwrap();
+        db.create_run(&exec_run("exec-1")).unwrap();
+        db.set_pod("exec-1", "pod-1", None, None).unwrap();
+        let pods = SharedPods::default();
+        exec_signal_teardown(&db, &pods, "exec-1", true).unwrap();
+        assert!(pods.deleted.lock().unwrap().is_empty());
+        assert_eq!(db.run_status("exec-1").unwrap().as_deref(), Some("aborted"));
     }
 
     /// A stand-in `cargo` that insists on `--release --message-format=json` and prints `messages`.

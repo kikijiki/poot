@@ -292,6 +292,14 @@ pub enum LoadError {
         /// The compile failure.
         source: poot_codegen::CompileError,
     },
+    /// A compiled artifact was presented for a body it was not compiled from.
+    #[error("kernel {key}: {source}")]
+    KernelArtifact {
+        /// The plan key of the kernel.
+        key: String,
+        /// The mismatch.
+        source: poot_codegen::ArtifactMismatch,
+    },
     /// A graph input, a value's storage, or a program shape this card's contract does not implement.
     /// Never left as a silent fallback: each site names what it refused.
     #[error("not implemented: {0}")]

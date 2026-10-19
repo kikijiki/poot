@@ -1,11 +1,11 @@
-//! Per-pass numerics declarations and the tier-2 class a compiled program publishes (ADR-0101
-//! decision 2).
+//! Op-level numerics classification and the tier-2 class a compiled program publishes (ADR-0101
+//! decision 2). The per-pass declarations live with the passes, in `poot-graph-plan`.
 //!
 //! These classes describe device scheduling and comparison tolerances. They are not proofs of
 //! semantic equivalence: every graph rewrite must separately preserve the CPU computation, including
 //! intermediate rounding and every observable output and state value.
 //!
-//! A pass that rewrites floating-point work declares its device behavior:
+//! A pass that rewrites floating-point work declares its device behavior (in `poot-graph-plan`):
 //!
 //! - [`NumericsProperty::Exact`] preserves every result and carried value bit for bit, so the oracle's
 //!   tier-1 equality still holds.
@@ -18,9 +18,10 @@
 //!   precision the wider computation kept.
 //!
 //! The properties are ordered by severity, so the strongest one a graph exhibits is a fold. A compiled
-//! program publishes [`NumericsProperty::tier2_class`] of that fold. [`verify_pass_numerics`] checks a
-//! declaration against the ops the pass produced: a pass that reassociates while declaring `Exact` is
-//! refused instead of publishing a tolerance that is too tight.
+//! program publishes [`NumericsProperty::tier2_class`] of that fold, and a device result is compared with
+//! the oracle within [`Tier2Class::tolerance`]. [`implied_numerics_of`] reads the ops a pass produced, so
+//! its declaration can be checked: a pass that reassociates while declaring `Exact` is refused instead of
+//! publishing a tolerance that is too tight.
 
 use super::{Graph, OpKind, ValueId};
 use crate::types::{DType, DTypeClass, DTypeClassExt};
@@ -49,7 +50,6 @@ impl NumericsProperty {
     }
 
     /// The comparison class a program whose strongest property is `self` publishes.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn tier2_class(self) -> Tier2Class {
         match self {
             NumericsProperty::Exact => Tier2Class::BitExact,
@@ -61,11 +61,10 @@ impl NumericsProperty {
 }
 
 /// The tier-2 comparison class of a compiled program (ADR-0101 decision 2), derived from the strongest
-/// [`NumericsProperty`] its graph exhibits. A device is compared with the oracle within a tolerance
-/// sized by this class; [`Tier2Class::BitExact`] is the tier-1 bit-for-bit comparison, reachable only
-/// for a graph whose float arithmetic a device never executes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(test, feature = "test-support"))]
+/// [`NumericsProperty`] its graph exhibits and ordered like it. A device is compared with the oracle
+/// within [`Tier2Class::tolerance`]; [`Tier2Class::BitExact`] is the tier-1 bit-for-bit comparison,
+/// reachable only for a graph whose float arithmetic a device never executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier2Class {
     /// The graph runs no float arithmetic a device executes: compare every element bit for bit.
     BitExact,
@@ -76,6 +75,21 @@ pub enum Tier2Class {
     Reassociating,
     /// A pass narrowed storage: compare within the wider narrow-storage tolerance.
     NarrowStorage,
+}
+
+impl Tier2Class {
+    /// The one published table from a class to its comparison tolerance, relative to
+    /// `max(|oracle element|, 1)`: a device element agrees when `|device - oracle| <= tolerance *
+    /// max(|oracle element|, 1)`. Each class is looser than the one before it, because a pass of that
+    /// class does more to the arithmetic. Every parity comparison reads this table; no row picks its own.
+    pub const fn tolerance(self) -> f32 {
+        match self {
+            Tier2Class::BitExact => 0.0,
+            Tier2Class::Unfused => 1e-4,
+            Tier2Class::Reassociating => 1e-3,
+            Tier2Class::NarrowStorage => 5e-3,
+        }
+    }
 }
 
 /// The property a single op implies, independent of any pass declaration. `out_dtype` decides whether
@@ -133,63 +147,6 @@ pub fn implied_numerics(g: &Graph) -> NumericsProperty {
         .fold(NumericsProperty::Exact, NumericsProperty::strongest)
 }
 
-/// One pass `compile` (`poot-graph-plan`) runs, its numerics declaration, and the ops it produces (the
-/// set [`verify_pass_numerics`] reads the graph for).
-#[derive(Clone, Copy, Debug)]
-pub struct PassDeclaration {
-    /// The pass's name as `compile` reports it.
-    pub pass: &'static str,
-    /// The numerics property the pass declares for the ops it produces.
-    pub property: NumericsProperty,
-    /// Whether an op is one the pass produces; [`verify_pass_numerics`] checks the declaration against these ops in the output graph.
-    pub produces: fn(&OpKind) -> bool,
-}
-
-fn produces_nothing(_: &OpKind) -> bool {
-    false
-}
-
-fn produces_rope(op: &OpKind) -> bool {
-    matches!(op, OpKind::Rope { .. })
-}
-
-fn produces_flash(op: &OpKind) -> bool {
-    matches!(op, OpKind::Attention(_))
-}
-
-fn produces_fused(op: &OpKind) -> bool {
-    matches!(op, OpKind::Fused(_) | OpKind::FusedRow(_))
-}
-
-fn produces_contraction_epilogue(op: &OpKind) -> bool {
-    matches!(op, OpKind::ContractionEpilogue { .. })
-}
-
-fn produces_dense_contraction(op: &OpKind) -> bool {
-    matches!(
-        op,
-        OpKind::DenseContraction { .. } | OpKind::GroupedDenseContraction { .. }
-    )
-}
-
-fn produces_packed_contraction(op: &OpKind) -> bool {
-    matches!(op, OpKind::PackedContraction { .. })
-}
-
-fn produces_packed_row_gather(op: &OpKind) -> bool {
-    matches!(op, OpKind::PackedRowGather { .. })
-}
-
-fn produces_dense_row_gather(op: &OpKind) -> bool {
-    matches!(op, OpKind::DenseRowGather { .. })
-}
-
-/// `legalize`'s (`poot-graph-plan`) rewrite shapes: a hosted-embed `Gather` replaced by a device
-/// `MatMul`-free lookup, or an oversized matmul weight split and rejoined by `Concat`.
-fn produces_legalize_ops(op: &OpKind) -> bool {
-    matches!(op, OpKind::MatMul | OpKind::Concat { .. })
-}
-
 /// An arithmetic rewrite withheld because the graph supplies no exact numerical proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumericalRewriteReason {
@@ -207,126 +164,6 @@ pub struct NumericalRewriteDecline {
     /// The numerical condition that makes the rewrite unsound.
     pub reason: NumericalRewriteReason,
 }
-
-/// Every pass `compile` (`poot-graph-plan`) runs, with its numerics declaration, in `compile`'s
-/// pipeline order. Card 626: every pass function named here now lives in `poot-graph-plan` (a
-/// `pub(crate)` module there, reachable only through `compile`), so this table cannot reference a pass
-/// module's own constant or predicate without a dependency cycle (this crate is below
-/// `poot-graph-plan`); every `property` is inlined and every `produces` predicate reads only `OpKind`,
-/// duplicated locally rather than imported. A pass added to `compile` without a row here is a bug the
-/// pipeline's fail-closed check cannot see.
-pub const PASS_DECLARATIONS: &[PassDeclaration] = &[
-    PassDeclaration {
-        pass: "canonicalize",
-        property: NumericsProperty::Exact,
-        produces: produces_nothing,
-    },
-    PassDeclaration {
-        pass: "cse",
-        property: NumericsProperty::Exact,
-        produces: produces_nothing,
-    },
-    PassDeclaration {
-        pass: "fold_iota",
-        property: NumericsProperty::Exact,
-        produces: produces_nothing,
-    },
-    PassDeclaration {
-        pass: "rope_fusion",
-        property: NumericsProperty::Reassociating,
-        produces: produces_rope,
-    },
-    PassDeclaration {
-        pass: "flash_attention_capped",
-        property: NumericsProperty::Reassociating,
-        produces: produces_flash,
-    },
-    PassDeclaration {
-        pass: "dce",
-        property: NumericsProperty::Exact,
-        produces: produces_nothing,
-    },
-    // Card 642: `compile` claims `ops::packed_linear`'s chains as `PackedContraction`
-    // right after `dce`, then refuses every `PackedDequant` left unclaimed (Card 355's escape gate), so
-    // no later pass sees a packed decode outside a contraction. The claim replaces a `PackedDequant`
-    // (already `Narrowing`) and its `MatMul` with one `PackedContraction` (`Narrowing`).
-    PassDeclaration {
-        pass: "recognize_packed_contractions",
-        property: NumericsProperty::Narrowing,
-        produces: produces_packed_contraction,
-    },
-    // Card 545a: the row-gather claim (a quantized embedding lookup) after the
-    // contraction claim, before the gate.
-    PassDeclaration {
-        pass: "recognize_packed_row_gathers",
-        property: NumericsProperty::Narrowing,
-        produces: produces_packed_row_gather,
-    },
-    PassDeclaration {
-        pass: "reject_packed_dequant_escapes",
-        property: NumericsProperty::Exact,
-        produces: produces_nothing,
-    },
-    // Card 534a: `compile`'s pipeline runs these four between `dce` and `fuse`, so the folds and the
-    // reduce legalization see the traced `MatMul`/`Transpose`, `Cast`/`Gather` and non-last-axis
-    // `Reduce` chains before `fuse` could absorb them into a region no target plans.
-    PassDeclaration {
-        pass: "fold_dense_contractions",
-        property: NumericsProperty::Narrowing,
-        produces: produces_dense_contraction,
-    },
-    PassDeclaration {
-        pass: "fold_dense_bf16_row_gathers",
-        property: NumericsProperty::Narrowing,
-        produces: produces_dense_row_gather,
-    },
-    PassDeclaration {
-        pass: "lower_nonlast_reduces",
-        property: NumericsProperty::Exact,
-        produces: produces_nothing,
-    },
-    PassDeclaration {
-        pass: "widen_mismatched_matmul_dtypes",
-        property: NumericsProperty::Narrowing,
-        produces: produces_nothing,
-    },
-    // The contraction epilogue rule folds a contraction and the pointwise chain that consumes it into one
-    // equation. The lowering rounds the head through its declared dtype and every step through its own, so
-    // the fused result is the unfused program's, bit for bit, on the same schedule: an unfused contraction.
-    PassDeclaration {
-        pass: "fuse_contraction_epilogues",
-        property: NumericsProperty::Unfused,
-        produces: produces_contraction_epilogue,
-    },
-    PassDeclaration {
-        pass: "fuse",
-        property: NumericsProperty::Reassociating,
-        produces: produces_fused,
-    },
-    // `fuse_widening_casts` rewrites a region's own steps: the `Cast` of a narrow weight becomes the region's
-    // first step. Widening a narrow float is exact and no op kind is produced that was not already counted, so
-    // the class of the result is read off its ops, as for every pass.
-    PassDeclaration {
-        pass: "fuse_widening_casts",
-        property: NumericsProperty::Exact,
-        produces: produces_nothing,
-    },
-    // `fuse_index_casts` makes the `Cast` of an I32 word a step of the pointwise region that reads or writes
-    // it, wrapping a lone pointwise equation in a one-step region where it has none. The conversion is the
-    // cast kernel's own, so the class is the fused regions it produces.
-    PassDeclaration {
-        pass: "fuse_index_casts",
-        property: NumericsProperty::Reassociating,
-        produces: produces_fused,
-    },
-    // `legalize` needs `Target::caps` (card 522); `compile` (poot-graph-plan) runs it as its own pass,
-    // between `dce` and `fuse` (card 523a).
-    PassDeclaration {
-        pass: "legalize",
-        property: NumericsProperty::Unfused,
-        produces: produces_legalize_ops,
-    },
-];
 
 /// Why a pass's declaration is too weak for the graph it produced.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -346,25 +183,13 @@ pub enum NumericsError {
     },
 }
 
-/// Check a declaration against the strongest property among the ops the pass produces in `out`. Fails
-/// closed when the declaration is weaker than what it produced (a pass that reassociates while claiming
-/// `Exact`).
-pub fn verify_pass_numerics(
-    declaration: &PassDeclaration,
-    out: &Graph,
-) -> Result<(), NumericsError> {
-    let implied = out
-        .eqns()
+/// The strongest property among the equations of `g` whose op satisfies `produced`. A pass checks its
+/// declaration against this over the ops it produces, so a pass that reassociates while declaring `Exact`
+/// is refused instead of publishing a tolerance that is too tight.
+pub fn implied_numerics_of(g: &Graph, produced: impl Fn(&OpKind) -> bool) -> NumericsProperty {
+    g.eqns()
         .iter()
-        .filter(|eqn| (declaration.produces)(&eqn.op))
-        .map(|eqn| implied_op_numerics(&eqn.op, out.aval(eqn.out).dtype))
-        .fold(NumericsProperty::Exact, NumericsProperty::strongest);
-    if declaration.property >= implied {
-        return Ok(());
-    }
-    Err(NumericsError::UnderDeclared {
-        pass: declaration.pass,
-        declared: declaration.property,
-        implied,
-    })
+        .filter(|eqn| produced(&eqn.op))
+        .map(|eqn| implied_op_numerics(&eqn.op, g.aval(eqn.out).dtype))
+        .fold(NumericsProperty::Exact, NumericsProperty::strongest)
 }

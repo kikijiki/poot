@@ -32,7 +32,7 @@ poot-executor-parity.workspace = true
 poot-test-util.workspace = true
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 # Card 671: this crate's own `tests/graph/*.rs` call
-# `is_decode_gemv`/`is_tiled_gemm`/`reassociation_class`/`per_eqn_plans_outside_compile` directly; those are
+# `is_decode_gemv`/`is_tiled_gemm`/`per_eqn_plans_outside_compile` directly; those are
 # gated behind `test-support` in poot-graph-plan now.
 poot-graph-plan = { workspace = true, features = ["test-support"] }
 criterion.workspace = true

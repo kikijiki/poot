@@ -6,35 +6,15 @@ use crate::buffer::L0HostBuffer;
 use crate::error::{L0Error, check};
 use crate::ffi::{
     CommandQueueDesc, ContextDesc, DeviceProperties, Funcs, GraphTable, Handle, HostMemAllocDesc,
-    Loader, QueueGroupProperties, ZE_INIT_FLAG_GPU_ONLY, ZE_INIT_FLAG_VPU_ONLY,
-    ZE_QUEUE_GROUP_FLAG_COMPUTE,
+    Loader, QueueGroupProperties, ZE_INIT_FLAG_VPU_ONLY, ZE_QUEUE_GROUP_FLAG_COMPUTE,
 };
 
 /// Cache-line alignment for allocations.
 pub(crate) const ALLOC_ALIGNMENT: usize = 64;
 
-/// Which kind of Level Zero device a context opens: Level Zero initializes one kind of driver per `zeInit`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum L0DeviceKind {
-    /// A GPU: SPIR-V modules and kernel launches.
-    Gpu,
-    /// An NPU (VPU): vendor-compiled graphs through the `ZE_extension_graph` extension.
-    Npu,
-}
-
-impl L0DeviceKind {
-    const fn init_flag(self) -> u32 {
-        match self {
-            L0DeviceKind::Gpu => ZE_INIT_FLAG_GPU_ONLY,
-            L0DeviceKind::Npu => ZE_INIT_FLAG_VPU_ONLY,
-        }
-    }
-}
-
 /// What a context owns. Dropping the last [`L0Context`] handle destroys the queue and context; the loader
 /// library, the last field, closes after that.
 struct Inner {
-    kind: L0DeviceKind,
     device: Handle,
     context: Handle,
     queue: Handle,
@@ -42,31 +22,28 @@ struct Inner {
     ordinal: u32,
     /// The PCI vendor id the device reports (`0x8086` for Intel).
     vendor_id: u32,
-    /// The driver's graph extension table, for an NPU context. The driver owns it for as long as the loader
-    /// stays loaded, which is as long as `loader` below.
-    graph: Option<NonNull<GraphTable>>,
+    /// The driver's graph extension table. The driver owns it for as long as the loader stays loaded, which is
+    /// as long as `loader` below.
+    graph: NonNull<GraphTable>,
     loader: Loader,
 }
 
-/// A Level Zero device with a context and a compute queue. A handle is cheap to clone: every buffer, graph and
-/// recording keeps one, so the queue and context outlive them.
+/// A Level Zero NPU (VPU) device with a context and a compute queue. A handle is cheap to clone: every buffer,
+/// graph and recording keeps one, so the queue and context outlive them.
 #[derive(Clone)]
 pub struct L0Context(Rc<Inner>);
 
 impl L0Context {
-    /// `dlopen` the loader, initialize Level Zero for `kind` of driver and open the first device of the first
-    /// driver that has one.
-    pub fn open(kind: L0DeviceKind) -> Result<Self, L0Error> {
+    /// `dlopen` the loader, initialize Level Zero for the VPU drivers and open the first device of the first
+    /// driver that has one, with the `ZE_extension_graph` extension.
+    pub fn open() -> Result<Self, L0Error> {
         let loader = Loader::load()?;
         let funcs = &loader.funcs;
-        // SAFETY: plain Level Zero initialization; the flag selects one kind of driver.
-        check("zeInit", unsafe { (funcs.init)(kind.init_flag()) })?;
+        // SAFETY: plain Level Zero initialization; the flag selects the VPU drivers.
+        check("zeInit", unsafe { (funcs.init)(ZE_INIT_FLAG_VPU_ONLY) })?;
 
         let (driver, device) = first_device(funcs)?;
-        let graph = match kind {
-            L0DeviceKind::Gpu => None,
-            L0DeviceKind::Npu => Some(graph_table(funcs, driver)?),
-        };
+        let graph = graph_table(funcs, driver)?;
         let mut properties = DeviceProperties::new();
         // SAFETY: `device` is a live handle and `properties` is a correctly sized, typed structure.
         check("zeDeviceGetProperties", unsafe {
@@ -97,7 +74,6 @@ impl L0Context {
             return Err(error);
         }
         Ok(L0Context(Rc::new(Inner {
-            kind,
             device,
             context,
             queue,
@@ -108,26 +84,16 @@ impl L0Context {
         })))
     }
 
-    /// Which kind of device this context opened.
-    pub fn kind(&self) -> L0DeviceKind {
-        self.0.kind
-    }
-
     /// Whether `other` is a handle to this same context.
     pub(crate) fn same(&self, other: &L0Context) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
 
-    /// The graph extension's entry points, for an NPU context.
-    pub(crate) fn graph_table(&self) -> Result<&GraphTable, L0Error> {
-        match self.0.graph {
-            // SAFETY: the table pointer came from the driver of this context's loader, which is loaded until
-            // the last handle drops; the table is not written after the driver builds it.
-            Some(table) => Ok(unsafe { table.as_ref() }),
-            None => Err(L0Error::WrongDeviceKind {
-                needed: L0DeviceKind::Npu,
-            }),
-        }
+    /// The graph extension's entry points.
+    pub(crate) fn graph_table(&self) -> &GraphTable {
+        // SAFETY: the table pointer came from the driver of this context's loader, which is loaded until the
+        // last handle drops; the table is not written after the driver builds it.
+        unsafe { self.0.graph.as_ref() }
     }
 
     /// Allocate `len` bytes of host memory the device can address (`zeMemAllocHost`), zero-initialized by the
@@ -172,7 +138,7 @@ impl L0Context {
 impl Drop for Inner {
     fn drop(&mut self) {
         // SAFETY: the queue and context were created in `new` and are destroyed exactly once, here, after every
-        // buffer, module and kernel that borrows the context is gone; the loader closes after this returns.
+        // buffer, graph and recording that holds the context is gone; the loader closes after this returns.
         let queue = unsafe { (self.loader.funcs.command_queue_destroy)(self.queue) };
         if let Err(error) = check("zeCommandQueueDestroy", queue) {
             tracing::warn!(%error, "leaking a Level Zero command queue");
@@ -185,7 +151,7 @@ impl Drop for Inner {
     }
 }
 
-/// The first GPU device of the first driver that has one.
+/// The first device of the first driver that has one.
 fn first_device(funcs: &Funcs) -> Result<(Handle, Handle), L0Error> {
     let mut n_drivers = 0u32;
     // SAFETY: a null handle array asks for the count only.
@@ -216,7 +182,7 @@ fn first_device(funcs: &Funcs) -> Result<(Handle, Handle), L0Error> {
     Err(L0Error::NoDevice)
 }
 
-/// The ordinal of the first command queue group that can run compute kernels.
+/// The ordinal of the first command queue group that has compute queues.
 fn compute_queue_group(funcs: &Funcs, device: Handle) -> Result<u32, L0Error> {
     let mut count = 0u32;
     // SAFETY: `device` is a live handle; a null array asks for the count only.

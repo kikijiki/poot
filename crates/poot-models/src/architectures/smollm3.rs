@@ -74,7 +74,7 @@ const SPEC: DenseSpec = DenseSpec {
     family: FAMILY,
     gguf: dense_keys!("smollm3"),
     hf_theta: 2_000_000.0,
-    gguf_theta: 2_000_000.0,
+    gguf_theta: Some(2_000_000.0),
     eps: 1e-6,
     eos: Some(128_001),
 };

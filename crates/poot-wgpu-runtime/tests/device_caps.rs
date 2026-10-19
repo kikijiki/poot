@@ -71,7 +71,16 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
     // The tensor-core family is measured from `VK_KHR_cooperative_matrix` (via wgpu's own adapter-level
     // query), never parsed from the adapter's device-name string (card 522 review). Re-derive
     // independently from a fresh adapter query so a hardcoded family would disagree.
-    let expected_tensor_core = if info.backend == wgpu::Backend::Vulkan {
+    // `Context::new_async` requests the cooperative-matrix feature exactly when the adapter advertises
+    // it, so that feature is granted iff advertised; without it no family is reported.
+    let coopmat_granted = adapter
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+    let expected_tensor_core = if info.backend != wgpu::Backend::Vulkan {
+        poot_target::TensorCoreSupport::UnknownNotExposedByApi
+    } else if !coopmat_granted {
+        poot_target::TensorCoreSupport::None
+    } else {
         adapter
             .cooperative_matrix_properties()
             .into_iter()
@@ -87,8 +96,6 @@ fn wgpu_device_caps_matches_a_direct_adapter_query() {
             .fold(poot_target::TensorCoreSupport::None, |acc, x| {
                 acc.most_specific(x)
             })
-    } else {
-        poot_target::TensorCoreSupport::UnknownNotExposedByApi
     };
     assert_eq!(
         caps.tensor_core, expected_tensor_core,

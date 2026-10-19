@@ -14,6 +14,7 @@ rust-version.workspace = true
 test-support = []
 
 [dependencies]
+blake3.workspace = true
 poot-kernel-ir.workspace = true
 poot-runtime-common.workspace = true
 poot-target.workspace = true

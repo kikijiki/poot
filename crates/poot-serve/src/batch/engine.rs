@@ -39,6 +39,10 @@ use crate::types::{
 
 /// How long an idle loop waits for a job before it looks again.
 const IDLE_POLL: Duration = Duration::from_millis(10);
+/// The most encode and administration jobs one loop iteration runs before the step. Exclusive work runs
+/// between steps, so a generation request waits at most this many jobs, plus the step in flight, however
+/// many are queued; the rest run on the iterations after, each followed by a step.
+pub(crate) const EXCLUSIVE_JOBS_PER_ITERATION: usize = 1;
 /// The most often the executor's timing summary is published while the loop is stepping.
 const TIMING_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -147,7 +151,7 @@ pub(crate) trait ServeEngine {
     fn release(&mut self, seq: Self::Seq, mode: Release) -> Result<PrefixOutcome, EngineError>;
     /// One `Encode` step over token rows. The loop calls it with no sequence open.
     fn encode(&mut self, rows: &[EncodeRow]) -> Result<Encoded, EngineError>;
-    /// One LoRA administration operation. The loop calls it with no sequence open.
+    /// One LoRA administration operation. The loop calls it between steps, sequences open or not.
     fn admin(&mut self, request: AdminRequest) -> Result<AdminReply, AdminError>;
     /// `(free, total)` blocks of the paged KV pool.
     fn kv_blocks(&self) -> Option<(usize, usize)>;
@@ -446,16 +450,19 @@ impl ServeEngine for DriverEngine {
                 types: &row.types,
             })
             .collect();
-        let encoded = self.driver.encode(&EncodeRequest { rows: &rows })?;
-        // The first encode prepares an `Encode` entry, which changes what the driver accepts.
-        self.publish();
-        Ok(encoded)
+        Ok(self.driver.encode(&EncodeRequest { rows: &rows })?)
     }
 
     fn admin(&mut self, request: AdminRequest) -> Result<AdminReply, AdminError> {
         self.reap_retired();
         match request {
             AdminRequest::List => Ok(AdminReply::Adapters(self.adapters.infos())),
+            AdminRequest::Load { .. } if self.caps().row_counts.is_empty() => {
+                Err(AdminError::Refused {
+                    class: FailureClass::Request,
+                    reason: "the served model is an encoder: it generates nothing to adapt".into(),
+                })
+            }
             AdminRequest::Load { name, path } => {
                 if self
                     .adapters
@@ -540,6 +547,8 @@ struct Scheduler<'a, E: ServeEngine> {
     encodes: VecDeque<EncodeJob>,
     admins: VecDeque<AdminJob>,
     closed: bool,
+    /// The last exclusive job run was an encode: the next one prefers an administration job.
+    last_was_encode: bool,
     /// Steps ran since the executor's timing was last published.
     timing_dirty: bool,
     /// When the executor's timing was last published.
@@ -561,6 +570,7 @@ pub(crate) fn run_engine<E: ServeEngine>(
         encodes: VecDeque::new(),
         admins: VecDeque::new(),
         closed: false,
+        last_was_encode: false,
         timing_dirty: false,
         timing_published: None,
     };
@@ -582,9 +592,9 @@ impl<E: ServeEngine> Scheduler<'_, E> {
             }
             self.release_cancelled()?;
             self.run_exclusive()?;
-            // An encode or administration job waits for the engine to be empty, so nothing new opens
-            // until it ran: the running requests drain, then it goes first.
-            if self.encodes.is_empty() && self.admins.is_empty() {
+            // An encode job needs the engine empty (its cache would alias an open sequence's), so
+            // nothing new opens while one waits. An administration job does not: it ran between steps.
+            if self.encodes.is_empty() {
                 self.admit()?;
             }
             if self.slots.is_empty() {
@@ -684,23 +694,25 @@ impl<E: ServeEngine> Scheduler<'_, E> {
         }
     }
 
-    /// Run the queued encode and administration jobs once no sequence is open: an encode step shares
-    /// the cache of an open sequence, and an adapter change must not meet one mid-step.
+    /// Run at most [`EXCLUSIVE_JOBS_PER_ITERATION`] queued jobs that need the engine to themselves, between
+    /// steps. An encode step shares the cache of an open sequence, so it runs once none is open; an
+    /// administration job runs whatever is open: the driver keeps a generation a running request holds
+    /// until the request lets go.
     fn run_exclusive(&mut self) -> Result<(), String> {
-        if !self.slots.is_empty() {
-            return Ok(());
-        }
-        while let Some(job) = self.encodes.pop_front() {
-            self.encode(job)?;
-        }
-        while let Some(job) = self.admins.pop_front() {
-            match self.engine.admin(job.request) {
-                Ok(reply) => {
-                    let _ = job.reply.send(Ok(reply));
-                }
-                Err(error) => {
-                    let _ = job.reply.send(Err(error));
-                }
+        for _ in 0..EXCLUSIVE_JOBS_PER_ITERATION {
+            let encode_ready = self.slots.is_empty() && !self.encodes.is_empty();
+            let admin_ready = !self.admins.is_empty();
+            // The two classes alternate when both wait, so a steady stream of one never starves the other.
+            if encode_ready && !(admin_ready && self.last_was_encode) {
+                let job = self.encodes.pop_front().expect("checked non-empty");
+                self.last_was_encode = true;
+                self.encode(job)?;
+            } else if admin_ready {
+                let job = self.admins.pop_front().expect("checked non-empty");
+                self.last_was_encode = false;
+                let _ = job.reply.send(self.engine.admin(job.request));
+            } else {
+                break;
             }
         }
         Ok(())
@@ -1058,7 +1070,7 @@ impl Drop for DeathGuard {
     }
 }
 
-fn panic_reason(payload: &(dyn Any + Send)) -> String {
+pub(crate) fn panic_reason(payload: &(dyn Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
         .map(|reason| (*reason).to_string())

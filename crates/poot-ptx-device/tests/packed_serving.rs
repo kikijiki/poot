@@ -916,12 +916,12 @@ fn packed_loaders_match_the_oracle_on_every_output_on_ptx() {
                 x.id(),
                 HostTensor::f32(vec![m, K], fill(7 + m as u64, m * K)).into(),
             );
-            let got = common::run_resident(&mut ptx, &graph, &inputs);
+            let (got, class) = common::run_resident_classed(&mut ptx, &graph, &inputs);
             let want = oracle(&graph, &inputs);
             poot_executor_parity::assert_close(
                 got.as_f32().unwrap(),
                 want.as_f32().unwrap(),
-                poot_executor_parity::TIER2,
+                class.tolerance(),
                 &what,
             );
         }
@@ -1110,12 +1110,12 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_ptx() {
                 residual,
                 HostTensor::f32(vec![1, OUT], residual_values.clone()).into(),
             );
-            let fused = common::run_resident(&mut ptx, &graph, &inputs);
+            let (fused, class) = common::run_resident_classed(&mut ptx, &graph, &inputs);
             if label == "generic bias" {
                 assert_close(
                     fused.as_f32().unwrap(),
                     oracle(&graph, &inputs).as_f32().unwrap(),
-                    poot_executor_parity::TIER2,
+                    class.tolerance(),
                     &format!("{what}: fused vs the oracle"),
                 );
             } else {

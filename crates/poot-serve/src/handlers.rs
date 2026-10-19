@@ -116,6 +116,8 @@ struct Shaped {
     max_new: usize,
     /// The choices: one concurrent job each.
     n: usize,
+    /// The request's seed (its own, else one drawn from the OS); choice `i` samples from `seed + i`.
+    seed: u64,
     lora_adapter: AdapterRef,
 }
 
@@ -148,6 +150,9 @@ fn shape_completion(served: &Served, req: &CompletionReq) -> Result<Shaped> {
         )
         .into());
     }
+    req.sampling.check()?;
+    let stops = Stop::list(&req.stop)?;
+    let seed = req.sampling.resolve_seed()?;
     let caps = served.view.caps();
     let tokens = tokenize(&served.model, &req.prompt)?;
     let n = clamp_n(req.n);
@@ -156,19 +161,24 @@ fn shape_completion(served: &Served, req: &CompletionReq) -> Result<Shaped> {
         resolve_lora_adapter(&served.view, &req.lora_adapter).map_err(LoraAdapterError)?;
     Ok(Shaped {
         prompt: PromptInput::Tokens(tokens),
-        stops: Stop::list(&req.stop),
+        stops,
         // Bound once, before any engine is asked to size an allocation from it.
         max_new: req.effective_max_tokens(),
         n,
+        seed,
         lora_adapter,
     })
 }
 
 /// One choice's sampler: reseeded per choice so sampled choices differ (greedy ones are identical), with
 /// the request's logprobs and guided constraint. A constraint that cannot be built is the client's.
-fn completion_sampler(model: &ModelHandle, req: &CompletionReq, choice: usize) -> Result<Sampler> {
-    let mut sampler =
-        sampler_of(&req.sampling).reseed(req.sampling.seed.wrapping_add(choice as u64));
+fn completion_sampler(
+    model: &ModelHandle,
+    req: &CompletionReq,
+    seed: u64,
+    choice: usize,
+) -> Result<Sampler> {
+    let mut sampler = sampler_of(&req.sampling).reseed(seed.wrapping_add(choice as u64));
     if let Some(k) = req.logprobs {
         sampler = sampler.with_logprobs(clamp_logprobs(k));
     }
@@ -186,19 +196,22 @@ fn completion_sampler(model: &ModelHandle, req: &CompletionReq, choice: usize) -
     .map_err(|e| anyhow::Error::new(GuidedDecodeError(e)))
 }
 
-fn shape_chat(served: &Served, req: &ChatReq) -> Result<Shaped> {
+fn shape_chat(served: &Served, req: &ChatReq, client_gone: ClientGone<'_>) -> Result<Shaped> {
     if req.stream && req.logprobs {
         return Err(RefusedRequest(
             "logprobs are not streamed: send the request without `stream`".into(),
         )
         .into());
     }
+    req.sampling.check()?;
+    let user_stops = Stop::list(&req.stop)?;
+    let seed = req.sampling.resolve_seed()?;
     let caps = served.view.caps();
     // A modality nothing here can take is refused before any generation work.
     reject_unsupported_modality(served.images.is_some(), req)?;
     let (prompt, turn_stops) = match &served.images {
         Some(images) if req.messages.iter().any(|msg| !msg.image_urls.is_empty()) => {
-            (image_prompt(images, req)?, Vec::new())
+            (image_prompt(images, req, client_gone)?, Vec::new())
         }
         _ => {
             let (tokens, turn_stops) = chat_tokens_and_stops(&served.model, req)?;
@@ -210,13 +223,14 @@ fn shape_chat(served: &Served, req: &ChatReq) -> Result<Shaped> {
     let lora_adapter =
         resolve_lora_adapter(&served.view, &req.lora_adapter).map_err(LoraAdapterError)?;
     // Stop at the template's end marker(s) as well as user stop sequences.
-    let mut stops = Stop::list(&req.stop);
+    let mut stops = user_stops;
     stops.extend(turn_stops);
     Ok(Shaped {
         prompt,
         stops,
         max_new: req.effective_max_tokens(),
         n,
+        seed,
         lora_adapter,
     })
 }
@@ -225,7 +239,11 @@ fn shape_chat(served: &Served, req: &ChatReq) -> Result<Shaped> {
 /// conversation through the checkpoint's chat template, with an image part where each image sits, and
 /// lowers the images to the embedding rows at their placeholders. Each message's images come first in
 /// its content, then its text; the request's images are those of its messages in order.
-fn image_prompt(images: &ImageClient, req: &ChatReq) -> Result<PromptInput> {
+fn image_prompt(
+    images: &ImageClient,
+    req: &ChatReq,
+    client_gone: ClientGone<'_>,
+) -> Result<PromptInput> {
     let refuse = |reason: &str| anyhow::Error::new(RefusedRequest(reason.into()));
     // The tools go into the chat template, whose tool branch the image template does not have;
     // `stop`, `response_format` and the guided fields act on the sampler and the stop scanner, so they
@@ -258,10 +276,13 @@ fn image_prompt(images: &ImageClient, req: &ChatReq) -> Result<PromptInput> {
             text: message.content.clone().unwrap_or_default(),
         });
     }
-    let prepared = images.prepare(&urls, turns).map_err(|error| match error {
-        ImageError::Refused(refused) => anyhow::Error::new(refused),
-        ImageError::Failed(reason) => anyhow::anyhow!(reason),
-    })?;
+    let prepared = images
+        .prepare(&urls, turns, client_gone)
+        .map_err(|error| match error {
+            ImageError::Refused(refused) => anyhow::Error::new(refused),
+            ImageError::Interrupted(interrupted) => anyhow::Error::new(interrupted),
+            failed @ ImageError::Failed(_) => anyhow::Error::new(failed),
+        })?;
     Ok(PromptInput::Multimodal {
         tokens: prepared.prompt,
         rows: PromptRows {
@@ -271,9 +292,8 @@ fn image_prompt(images: &ImageClient, req: &ChatReq) -> Result<PromptInput> {
     })
 }
 
-fn chat_sampler(model: &ModelHandle, req: &ChatReq, choice: usize) -> Result<Sampler> {
-    let mut sampler =
-        sampler_of(&req.sampling).reseed(req.sampling.seed.wrapping_add(choice as u64));
+fn chat_sampler(model: &ModelHandle, req: &ChatReq, seed: u64, choice: usize) -> Result<Sampler> {
+    let mut sampler = sampler_of(&req.sampling).reseed(seed.wrapping_add(choice as u64));
     if req.logprobs {
         sampler = sampler.with_logprobs(clamp_logprobs(req.top_logprobs.unwrap_or(0)));
     }
@@ -320,7 +340,9 @@ pub(crate) fn stream_completion(
     // Validate before sending the 200 + SSE headers: a bad `guided_json`/`guided_regex`, a failed encode
     // or a refused request must be a 4xx, not a 200 followed by a broken stream.
     let prepared = shape_completion(served, req).and_then(|shaped| {
-        let choices = samplers(shaped.n, |i| completion_sampler(&served.model, req, i))?;
+        let choices = samplers(shaped.n, |i| {
+            completion_sampler(&served.model, req, shaped.seed, i)
+        })?;
         Ok((shaped, choices))
     });
     let (shaped, choices) = match prepared {
@@ -414,7 +436,9 @@ pub(crate) fn handle_completion(
 ) -> Result<String> {
     let _inflight = InFlight::enter(metrics);
     let shaped = shape_completion(served, req)?;
-    let choices = samplers(shaped.n, |i| completion_sampler(&served.model, req, i))?;
+    let choices = samplers(shaped.n, |i| {
+        completion_sampler(&served.model, req, shaped.seed, i)
+    })?;
     let completions = submit(
         &served.engine,
         metrics,
@@ -491,8 +515,10 @@ pub(crate) fn handle_chat(
     client_gone: ClientGone<'_>,
 ) -> Result<String> {
     let _inflight = InFlight::enter(metrics);
-    let shaped = shape_chat(served, req)?;
-    let choices = samplers(shaped.n, |i| chat_sampler(&served.model, req, i))?;
+    let shaped = shape_chat(served, req, client_gone)?;
+    let choices = samplers(shaped.n, |i| {
+        chat_sampler(&served.model, req, shaped.seed, i)
+    })?;
     let completions = submit(
         &served.engine,
         metrics,
@@ -575,9 +601,15 @@ pub(crate) fn stream_chat(
 ) -> Result<()> {
     let _inflight = InFlight::enter(metrics);
     let model = &metrics.model;
+    // A second handle on the socket, for the hang-up probe: the shaping of a request with images waits on
+    // the vision thread, and the token closure owns the writes.
+    let probe = stream.try_clone().ok();
+    let gone = || probe.as_ref().is_some_and(peer_closed);
     // Validate before sending the 200 + SSE headers (as in stream_completion).
-    let prepared = shape_chat(served, req).and_then(|shaped| {
-        let choices = samplers(shaped.n, |i| chat_sampler(&served.model, req, i))?;
+    let prepared = shape_chat(served, req, &gone).and_then(|shaped| {
+        let choices = samplers(shaped.n, |i| {
+            chat_sampler(&served.model, req, shaped.seed, i)
+        })?;
         Ok((shaped, choices))
     });
     let (shaped, choices) = match prepared {
@@ -591,8 +623,6 @@ pub(crate) fn stream_chat(
     let tools_mode = req.tools.is_some();
     let start = Instant::now();
     let mut ttft: Option<Duration> = None;
-    let probe = stream.try_clone().ok();
-    let gone = || probe.as_ref().is_some_and(peer_closed);
     // The first chunk of each choice announces the assistant role.
     for index in 0..shaped.n {
         let role = serde_json::json!({
@@ -756,6 +786,38 @@ fn encoder_row(model: &ModelHandle, first: &str, second: Option<&str>) -> Result
     })
 }
 
+/// Refuse `rows` the engine is not fitted for, naming the cap and the flag that sets it: the fitted
+/// shapes are the only ones prepared, and a step never compiles another.
+fn check_encode_fit(served: &Served, rows: &[EncodeRow]) -> Result<()> {
+    let Some(fitted) = served.view.caps().encode else {
+        return Err(RefusedRequest(
+            "this model has no embedding pass: it serves no embeddings or rerank".into(),
+        )
+        .into());
+    };
+    if rows.len() > fitted.rows.get() {
+        return Err(RefusedRequest(format!(
+            "{} texts exceed the {} rows the engine is fitted for (--rows)",
+            rows.len(),
+            fitted.rows
+        ))
+        .into());
+    }
+    let longest = fitted.lengths.last().map_or(0, |len| len.get());
+    if let Some((index, row)) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, row)| row.ids.len() > longest)
+    {
+        return Err(RefusedRequest(format!(
+            "text {index} has {} tokens, over the {longest} the engine is fitted for (--max-seq)",
+            row.ids.len()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// One `Encode` job over `rows`, answered by the engine thread; a failure is accounted here when it is a
 /// transport loss.
 fn encode(
@@ -764,6 +826,7 @@ fn encode(
     rows: Vec<EncodeRow>,
     client_gone: ClientGone<'_>,
 ) -> Result<Encoded> {
+    check_encode_fit(served, &rows)?;
     submit_encode(&served.engine, metrics, rows, client_gone).map_err(|error| {
         account_generation_error(metrics, &error);
         error.into()

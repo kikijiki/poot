@@ -4,7 +4,7 @@
 
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{Device, Engine, Executor};
-use poot_executor_parity::{TIER2, assert_close};
+use poot_executor_parity::assert_close;
 use poot_graph_ir::Slot;
 use poot_graph_plan::test_support::gpu_caps;
 use poot_models::model::Phase;
@@ -105,8 +105,14 @@ fn a_hosted_embed_gather_equals_the_device_gather() {
     };
     let device_gather = run(exec.as_mut(), &|g| g);
     let host_gather = run(exec.as_mut(), &hosted);
-    for (step, (got, want)) in host_gather.iter().zip(&device_gather).enumerate() {
-        assert_close(got, want, TIER2, &format!("hosted embed, step {step}"));
+    let tolerance = host_gather.class.max(device_gather.class).tolerance();
+    for (step, (got, want)) in host_gather
+        .logits
+        .iter()
+        .zip(&device_gather.logits)
+        .enumerate()
+    {
+        assert_close(got, want, tolerance, &format!("hosted embed, step {step}"));
     }
 }
 

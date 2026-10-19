@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use poot_codegen::{Target, compile, kernel_handle};
+use poot_codegen::{Target, compile_kernel, kernel_handle};
 use poot_kernel_ir::fixtures;
 use poot_runtime_common::BufferRole;
 use poot_target::BufferStorage;
@@ -42,9 +42,9 @@ fn compiled_add(body: &poot_kernel_ir::Body, name: &str) -> poot_runtime_common:
     let dir: PathBuf = std::env::temp_dir().join("poot-vulkan-check");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
-    compile(body, Target::SpirvVulkan, &out).expect("compile add kernel to SPIR-V");
-    let bytes = std::fs::read(&out).expect("read compiled .spv");
-    kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
+    let artifact = compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &out)
+        .expect("compile add kernel to SPIR-V");
+    kernel_handle(body, &artifact).unwrap()
 }
 
 fn run_add() -> i32 {

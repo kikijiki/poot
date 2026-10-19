@@ -227,12 +227,16 @@ fn bf16_const_cast_is_bit_exact_on_wgpu() {
     }
 }
 
-/// The packed linear per scheme (Q4_0, Q8_0, AWQ, GPTQ) at the decode GEMV and at a few rows, and the canonical
+/// The packed linear per scheme (Q4_0, Q8_0, AWQ, GPTQ, IQ3_S) at the decode GEMV and at a few rows, and the canonical
 /// indexed and grouped expert chain over each, compiled for wgpu, match the shared CPU oracle at every replayed
 /// step. The oracle binds each packed const as its component of the named role (`oracle_for`), so this row is the
 /// wgpu witness that the shared oracle's packed arm is live: with the arm gone a packed const binds as dense and
 /// the oracle panics in `materialize_dense`.
 /// Mutation: drop the packed-components arm of `poot_eval::test_support::weight_map_oracle::oracle_for`; every row goes red.
+/// Mutation (IQ3_S, POOT-1197): in `poot-kernelgen`'s `emit_signed_grid`, take the sign lane as `i % 7` instead
+/// of `i % 8`; the `packed_linear_iq3_s_*` rows go red. A change to the IQ3_S descriptor itself moves the kernel
+/// and this oracle together (both read it), so it cannot turn this row red; the CPU rows against llama.cpp
+/// (`iq3_s_blocks_decode_to_the_llamacpp_reference_bit_for_bit`) pin the descriptor.
 #[test]
 fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_wgpu() {
     let Ok(device) = WgpuDevice::new() else {

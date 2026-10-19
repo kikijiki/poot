@@ -19,12 +19,63 @@ use std::time::{Duration, SystemTime};
 
 use poot_kernel_ir::Body;
 
-use crate::{CompileError, Target, Toolchain, compile};
+use crate::{CompileError, CompiledArtifact, GpuTarget, Target, Toolchain, capability, compile};
 
-/// The content fingerprint of a kernel `Body` (a hash of its `Debug` form): the Body half of every
-/// [`KernelKey`], shared by the wgpu and PTX caches.
+/// The 64-bit content fingerprint of a kernel `Body` (a hash of its `Debug` form). Only the AIE identity
+/// text still names a body this way; every byte-artifact kernel is named by its [`KernelId`].
 pub(crate) fn body_fingerprint(body: &Body) -> u64 {
     poot_runtime_common::fnv1a_bytes(format!("{body:?}").as_bytes())
+}
+
+/// The 128-bit content identity of one compiled kernel: a blake3 hash over the target (its whole `Debug`
+/// form, so an AMD arch's wavefront width counts), the target's [`Capability`](crate::Capability) (what
+/// shapes a body for it) and the body's `Debug` text. Two bodies with equal text for different targets are
+/// different kernels, so they have different ids. The id names the cache entry and rides inside the
+/// [`CompiledArtifact`] token, which is how a handle refuses an artifact compiled from another body.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct KernelId([u8; 16]);
+
+impl KernelId {
+    /// The id of `body` compiled for `target`.
+    pub(crate) fn of(body: &Body, target: Target) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"poot-kernel-id-v2\0");
+        hasher.update(format!("{target:?}\0{:?}\0", capability(target)).as_bytes());
+        hasher.update(format!("{body:?}").as_bytes());
+        Self::truncated(hasher.finalize())
+    }
+
+    /// The id of a linked AIE artifact: its core-object and link identity digests, side by side.
+    fn of_aie(core_digest: u64, link_digest: u64) -> Self {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&core_digest.to_be_bytes());
+        bytes[8..].copy_from_slice(&link_digest.to_be_bytes());
+        Self(bytes)
+    }
+
+    fn truncated(hash: blake3::Hash) -> Self {
+        Self(
+            hash.as_bytes()[..16]
+                .try_into()
+                .expect("a blake3 hash is 32 bytes"),
+        )
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Self(bytes.try_into().ok()?))
+    }
+}
+
+impl std::fmt::Display for KernelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl std::fmt::Debug for KernelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KernelId({self})")
+    }
 }
 
 /// The `poot-codegen` source-tree hash, computed at build time by `build.rs` from `src/**/*.rs` and
@@ -82,7 +133,7 @@ fn epoch_canonical(target: Target) -> String {
 
 /// The toolchain/codegen epoch for `target`: a 16-hex-digit fingerprint of the compiler binary and
 /// version, linked device libs, codegen flags, and `poot-codegen`'s own source. Artifacts from a
-/// different epoch are never consulted (see [`kernel_cache_root`]).
+/// different epoch are never consulted (see `kernel_cache_root`).
 pub fn epoch(target: Target) -> String {
     format!(
         "{:016x}",
@@ -276,88 +327,128 @@ fn kill_switch_active() -> bool {
     }
 }
 
-/// Base directory for the shared cache (before the `<epoch>/<mcpu>` split), independent of `target`.
-/// Order: `$POOT_KERNEL_CACHE_DIR` verbatim, else `$XDG_CACHE_HOME/poot/kernels`, else
-/// `$HOME/.cache/poot/kernels`, else `temp_dir()/poot-kernels`.
-fn resolve_base_dir() -> PathBuf {
+/// Base directory for the shared cache (before the `<kind>/<epoch>/<mcpu>` split), independent of
+/// `target`. Order: `$POOT_KERNEL_CACHE_DIR` verbatim, else `$XDG_CACHE_HOME/poot/kernels`, else
+/// `$HOME/.cache/poot/kernels`. `None` when none of them is set: a shared temp directory is not a place
+/// to keep executable kernels, so there is no further fallback.
+fn resolve_base_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("POOT_KERNEL_CACHE_DIR")
         && !dir.is_empty()
     {
-        return PathBuf::from(dir);
+        return Some(PathBuf::from(dir));
     }
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
         && !xdg.is_empty()
     {
-        return PathBuf::from(xdg).join("poot").join("kernels");
+        return Some(PathBuf::from(xdg).join("poot").join("kernels"));
     }
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("poot")
-            .join("kernels");
+        return Some(
+            PathBuf::from(home)
+                .join(".cache")
+                .join("poot")
+                .join("kernels"),
+        );
     }
-    std::env::temp_dir().join("poot-kernels")
+    None
 }
 
-/// Resolve the on-disk root for a persistent, epoch-scoped kernel artifact cache and ensure it exists.
-/// `kind` names the caller's kernel family (e.g. `"rocm"`) so backends sharing a base directory do not
-/// collide on the same epoch directory.
-///
-/// Returns `<base>/<kind>/<epoch>/<mcpu-or-target>`; the content-addressed filename is still
-/// `RocmGraphExecutor::artifact_name`'s job. The directory is created (best effort) with a plaintext
-/// `EPOCH` sidecar on first creation, so a mismatch can be diagnosed by hand. The first call per process for
-/// a `<kind>` also prunes that root's old epochs and abandoned scratch ([`RETAINED_EPOCHS`],
-/// [`EPOCH_MIN_AGE`], [`SCRATCH_MIN_AGE`]), and adopting an existing epoch refreshes its last-use time; a failed removal never fails the call.
-///
-/// `POOT_KERNEL_CACHE=0`/`off`/`false` bypasses all of this and returns a per-process directory under
-/// `temp_dir()` (still a real directory, since `compile()` needs an output path).
-///
-/// Never hard-fails: if the resolved base cannot be created or written, falls back to
-/// `temp_dir()/poot-<kind>` and logs a `tracing::warn!` (`HOME` may be unusable on RunPod images and
-/// containers).
-pub fn kernel_cache_root(kind: &str, target: Target) -> PathBuf {
-    if kill_switch_active() {
-        return std::env::temp_dir().join(format!("poot-{kind}-{}", std::process::id()));
+/// The user id this process runs as: the owner of its own `/proc/self`. `None` where that cannot be read,
+/// and a cache directory is then not trusted.
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+/// Make `path` a directory only this user can use: created `0700` when absent, and when present a real
+/// directory (never a symlink) owned by `uid`, tightened to `0700` if it was wider. Cached kernels are
+/// loaded into GPU drivers, so a directory another user can write into is a code-injection point.
+fn ensure_private_dir(path: &Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
     }
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{path:?} is not a real directory"
+        )));
+    }
+    if meta.uid() != uid {
+        return Err(std::io::Error::other(format!(
+            "{path:?} is owned by another user"
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Resolve the on-disk root for a persistent, epoch-scoped kernel artifact cache and ensure it exists, or
+/// `None` when there is no safe place for one. `kind` names the caller's kernel family (e.g. `"rocm"`) so
+/// backends sharing a base directory do not collide on the same epoch directory.
+///
+/// Returns `<base>/<kind>/<epoch>/<mcpu-or-target>`. The `<kind>`, `<epoch>` and `<mcpu>` directories are
+/// private to the user (`0700`, owner-checked, never a symlink; see [`ensure_private_dir`]). A plaintext
+/// `EPOCH` sidecar is written on first creation, so a mismatch can be diagnosed by hand. The first call per
+/// process for a `<kind>` also prunes that root's old epochs and abandoned scratch ([`RETAINED_EPOCHS`],
+/// [`EPOCH_MIN_AGE`], [`SCRATCH_MIN_AGE`]), and adopting an existing epoch refreshes its last-use time; a
+/// failed removal never fails the call.
+///
+/// `None` is a disabled cache, not a degraded one: `POOT_KERNEL_CACHE=0`/`off`/`false`, no base directory
+/// in the environment, or a base that cannot be created or is not the user's own. The cause is logged with
+/// `tracing::warn!`. Nothing is written anywhere else.
+fn kernel_cache_root(kind: &str, target: Target) -> Option<PathBuf> {
+    if kill_switch_active() {
+        return None;
+    }
+    let Some(base_dir) = resolve_base_dir() else {
+        tracing::warn!(
+            "no kernel cache directory (POOT_KERNEL_CACHE_DIR, XDG_CACHE_HOME, HOME all unset); the cache is disabled"
+        );
+        return None;
+    };
+    let Some(uid) = current_uid() else {
+        tracing::warn!("cannot tell which user owns the kernel cache; the cache is disabled");
+        return None;
+    };
 
     let epoch_hex = epoch(target);
     let arch_component = match target {
         Target::AmdGcn(arch) => arch.mcpu().to_string(),
         other => format!("{other:?}"),
     };
-    let base = resolve_base_dir().join(kind);
+    let base = base_dir.join(kind);
     let epoch_dir = base.join(&epoch_hex);
     let dir = epoch_dir.join(&arch_component);
 
-    match std::fs::create_dir_all(&dir) {
-        Ok(()) => {
-            let epoch_file = epoch_dir.join(EPOCH_SIDECAR);
-            if epoch_file.exists() {
-                refresh_epoch_sidecar(&epoch_file);
-            } else {
-                // Best effort: a diagnostic sidecar; a failed write must not stop compilation.
-                let _ = std::fs::write(&epoch_file, epoch_canonical(target));
-            }
-            prune_kind_root_once(&base, &epoch_hex);
-            dir
-        }
-        Err(error) => {
-            tracing::warn!(
-                ?dir,
-                %error,
-                "could not create persistent kernel cache dir; falling back to a temp_dir root"
-            );
-            let fallback = std::env::temp_dir().join(format!("poot-{kind}"));
-            let _ = std::fs::create_dir_all(&fallback);
-            fallback
-        }
+    let created = std::fs::create_dir_all(&base_dir).and_then(|()| {
+        [&base, &epoch_dir, &dir]
+            .into_iter()
+            .try_for_each(|path| ensure_private_dir(path, uid))
+    });
+    if let Err(error) = created {
+        tracing::warn!(?dir, %error, "kernel cache directory is unusable; the cache is disabled");
+        return None;
     }
+    let epoch_file = epoch_dir.join(EPOCH_SIDECAR);
+    if epoch_file.exists() {
+        refresh_epoch_sidecar(&epoch_file);
+    } else {
+        // Best effort: a diagnostic sidecar; a failed write must not stop compilation.
+        let _ = std::fs::write(&epoch_file, epoch_canonical(target));
+    }
+    prune_kind_root_once(&base, &epoch_hex);
+    Some(dir)
 }
 
 /// The per-target directory family under the shared base, so backends sharing a base directory do not
-/// collide. AMDGCN matches the `kind` the ROCm executor passes to [`kernel_cache_root`] directly.
+/// collide. AMDGCN matches the `kind` the ROCm executor passes to `kernel_cache_root` directly.
 fn cache_kind(target: Target) -> &'static str {
     match target {
         Target::Nvptx => "ptx",
@@ -380,50 +471,55 @@ pub(crate) fn codegen_src_hash() -> &'static str {
 pub(crate) fn aie_entry_key(core_digest: u64, link_digest: u64) -> KernelKey {
     KernelKey {
         name: format!("a{core_digest:016x}{link_digest:016x}.aie"),
-        fingerprint: link_digest,
+        id: KernelId::of_aie(core_digest, link_digest),
     }
 }
 
-/// Every cache entry starts with this magic, then the little-endian [`entry_digest`], then the artifact.
-const ENTRY_MAGIC: &[u8; 8] = b"POOTKC01";
-const ENTRY_HEADER_LEN: usize = ENTRY_MAGIC.len() + size_of::<u64>();
+/// Every cache entry starts with this magic, then the [`KernelId`] the entry was stored for, then the
+/// [`entry_digest`], then the artifact.
+const ENTRY_MAGIC: &[u8; 8] = b"POOTKC02";
+const ENTRY_ID_LEN: usize = size_of::<KernelId>();
+const ENTRY_DIGEST_LEN: usize = blake3::OUT_LEN;
+const ENTRY_HEADER_LEN: usize = ENTRY_MAGIC.len() + ENTRY_ID_LEN + ENTRY_DIGEST_LEN;
 
-/// The name of one cache entry: the codegen epoch, the target and the Body fingerprint. Two kernels share
-/// a key only if the same toolchain and emitter would produce the same artifact from the same Body.
+/// The name of one cache entry: the codegen epoch, the target and the kernel's content id. Two kernels
+/// share a key only if the same toolchain and emitter would produce the same artifact from the same Body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelKey {
     name: String,
-    fingerprint: u64,
+    id: KernelId,
 }
 
 impl KernelKey {
-    /// The entry's file name (`k<epoch>-<body fingerprint>.<ext>`).
+    /// The entry's file name (`k<epoch>-<kernel id>.<ext>`).
     pub fn as_str(&self) -> &str {
         &self.name
     }
 
-    /// The Body fingerprint half of the key, as [`body_fingerprint`] computed it.
-    pub fn fingerprint(&self) -> u64 {
-        self.fingerprint
+    /// The content id half of the key: the id of the body the entry is for, on the cache's target.
+    pub fn id(&self) -> KernelId {
+        self.id
     }
 }
 
 /// The one key function every backend's disk cache uses. Pure: it reads no environment and touches no disk,
 /// so the epoch and target it is given are exactly what scopes the entry.
-pub(crate) fn kernel_entry_key(epoch: &str, target: Target, fingerprint: u64) -> KernelKey {
+fn kernel_entry_key(epoch: &str, target: Target, id: KernelId) -> KernelKey {
     KernelKey {
-        name: format!("k{epoch}-{fingerprint:016x}.{}", target.output_ext()),
-        fingerprint,
+        name: format!("k{epoch}-{id}.{}", target.output_ext()),
+        id,
     }
 }
 
-/// FNV-1a over the key name and the artifact bytes. Binding the name means an entry copied or renamed to
-/// another key (say, out of an older epoch's directory) fails its check instead of being loaded.
-fn entry_digest(key: &KernelKey, artifact: &[u8]) -> u64 {
-    let mut bytes = Vec::with_capacity(key.name.len() + artifact.len());
-    bytes.extend_from_slice(key.name.as_bytes());
-    bytes.extend_from_slice(artifact);
-    poot_runtime_common::fnv1a_bytes(&bytes)
+/// blake3 over the key name, the key's id and the artifact bytes. Binding the name means an entry copied or
+/// renamed to another key (say, out of an older epoch's directory) fails its check instead of being loaded.
+fn entry_digest(key: &KernelKey, artifact: &[u8]) -> [u8; ENTRY_DIGEST_LEN] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(key.name.len() as u64).to_le_bytes());
+    hasher.update(key.name.as_bytes());
+    hasher.update(&key.id.0);
+    hasher.update(artifact);
+    *hasher.finalize().as_bytes()
 }
 
 /// A compiled artifact is longer than the caller's `max_artifact_bytes`. Raised before the bytes are
@@ -474,35 +570,40 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, Arti
     Ok(Ok(bytes))
 }
 
-/// A kernel artifact and whether this call had to build it (a compile, as opposed to a verified hit).
+/// A cache entry's bytes and whether this call had to build them (a build, as opposed to a verified hit).
+/// Only the cache's own callers see it: a byte kernel leaves this crate as a [`CompiledArtifact`], which
+/// carries the id of the body it was compiled from.
 #[derive(Debug)]
-pub struct Artifact {
-    /// The artifact's contents: SPIR-V, PTX or an HSACO image, as the target emits.
-    pub bytes: Vec<u8>,
-    /// `true` when this call ran the compiler, `false` when a verified cache entry was served.
-    pub built: bool,
+pub(crate) struct Artifact {
+    pub(crate) bytes: Vec<u8>,
+    /// `true` when this call ran the builder, `false` when a verified cache entry was served.
+    pub(crate) built: bool,
 }
 
 /// One target's persistent kernel artifact cache, scoped by the codegen [`epoch`] both by directory (an
 /// old epoch's directory is never consulted) and by key (an entry carries its epoch in its name and its
-/// digest). Every entry is verified on read: a truncated, corrupted or misplaced file is a miss, never a
-/// load. Shared by the wgpu and PTX backends; entries are content-addressed, so concurrent
+/// digest). Every entry is verified on read: a truncated, corrupted, misplaced or foreign-body file is a
+/// miss, never a load. Shared by the wgpu and PTX backends; entries are content-addressed, so concurrent
 /// processes writing the same key write the same bytes.
+///
+/// A cache may be disabled (`dir()` is `None`): it then keeps nothing, and every
+/// kernel is compiled in a private scratch directory that is removed before the call returns.
 #[derive(Debug, Clone)]
 pub struct KernelCache {
-    dir: PathBuf,
+    dir: Option<PathBuf>,
     epoch: String,
     target: Target,
 }
 
 impl KernelCache {
-    /// The cache under the shared persistent root for `target` (see [`kernel_cache_root`]).
+    /// The cache under the shared persistent root for `target` (see `kernel_cache_root`), or a disabled
+    /// cache when that root cannot be a safe, private directory.
     pub fn open(target: Target) -> Self {
-        Self::with_epoch(
-            kernel_cache_root(cache_kind(target), target),
-            epoch(target),
+        Self {
+            dir: kernel_cache_root(cache_kind(target), target),
+            epoch: epoch(target),
             target,
-        )
+        }
     }
 
     /// The cache rooted at an explicit directory instead of the shared one, keyed by `target`'s epoch.
@@ -511,33 +612,43 @@ impl KernelCache {
     }
 
     fn with_epoch(dir: PathBuf, epoch: String, target: Target) -> Self {
-        Self { dir, epoch, target }
+        Self {
+            dir: Some(dir),
+            epoch,
+            target,
+        }
     }
 
-    /// The directory the cache's entries and scratch files live in.
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// The directory the cache's entries and scratch files live in, `None` when the cache is disabled (it
+    /// keeps nothing, and still compiles).
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 
     /// The entry key for `body` under this cache's epoch and target.
     pub fn key(&self, body: &Body) -> KernelKey {
-        kernel_entry_key(&self.epoch, self.target, body_fingerprint(body))
+        kernel_entry_key(&self.epoch, self.target, KernelId::of(body, self.target))
     }
 
-    fn entry_path(&self, key: &KernelKey) -> PathBuf {
-        self.dir.join(key.as_str())
+    fn entry_path(dir: &Path, key: &KernelKey) -> PathBuf {
+        dir.join(key.as_str())
     }
 
-    /// The verified artifact for `key`, or `None` on a miss. A file that fails the magic or digest check is
-    /// a miss (logged), so the caller rebuilds and [`store`](Self::store) replaces it. An entry whose
-    /// artifact is longer than `max_artifact_bytes` is [`ArtifactTooLarge`], never read whole: a rebuild
-    /// would produce the same oversize artifact, so it is not a miss either.
-    pub fn load(
+    /// The verified artifact for `key`, or `None` on a miss (and always on a disabled cache). A file that
+    /// fails the magic, id or digest check is a miss (logged), so the caller rebuilds and
+    /// [`store`](Self::store) replaces it. The id recorded in the entry must be the id `key` names: an
+    /// entry written for another body is never served as this one. An entry whose artifact is longer than
+    /// `max_artifact_bytes` is [`ArtifactTooLarge`], never read whole: a rebuild would produce the same
+    /// oversize artifact, so it is not a miss either.
+    pub(crate) fn load(
         &self,
         key: &KernelKey,
         max_artifact_bytes: NonZeroU64,
     ) -> Result<Option<Vec<u8>>, ArtifactTooLarge> {
-        let path = self.entry_path(key);
+        let Some(dir) = &self.dir else {
+            return Ok(None);
+        };
+        let path = Self::entry_path(dir, key);
         let entry_limit = max_artifact_bytes
             .get()
             .saturating_add(ENTRY_HEADER_LEN as u64);
@@ -555,20 +666,19 @@ impl KernelCache {
                 return Ok(None);
             }
         };
-        let header_ok = bytes.len() >= ENTRY_HEADER_LEN && bytes.starts_with(ENTRY_MAGIC);
-        let recorded = header_ok.then(|| {
-            u64::from_le_bytes(
-                bytes[ENTRY_MAGIC.len()..ENTRY_HEADER_LEN]
-                    .try_into()
-                    .expect("the header slice is 8 bytes"),
-            )
-        });
-        if recorded
-            != Some(entry_digest(
-                key,
-                &bytes[ENTRY_HEADER_LEN.min(bytes.len())..],
-            ))
-        {
+        if bytes.len() < ENTRY_HEADER_LEN || !bytes.starts_with(ENTRY_MAGIC) {
+            tracing::warn!(?path, "kernel cache entry has no valid header; rebuilding");
+            return Ok(None);
+        }
+        let id_end = ENTRY_MAGIC.len() + ENTRY_ID_LEN;
+        if KernelId::from_bytes(&bytes[ENTRY_MAGIC.len()..id_end]) != Some(key.id) {
+            tracing::warn!(
+                ?path,
+                "kernel cache entry was stored for another kernel; rebuilding"
+            );
+            return Ok(None);
+        }
+        if bytes[id_end..ENTRY_HEADER_LEN] != entry_digest(key, &bytes[ENTRY_HEADER_LEN..]) {
             tracing::warn!(
                 ?path,
                 "kernel cache entry failed its digest check; rebuilding"
@@ -576,39 +686,53 @@ impl KernelCache {
             return Ok(None);
         }
         bytes.drain(..ENTRY_HEADER_LEN);
-        if let Some(epoch_dir) = self.dir.parent() {
+        if let Some(epoch_dir) = dir.parent() {
             refresh_epoch_sidecar(&epoch_dir.join(EPOCH_SIDECAR));
         }
         Ok(Some(bytes))
     }
 
     /// Publish `artifact` under `key`: written to a unique temp file beside the entry, then renamed onto
-    /// it, so a concurrent reader never sees a partial file.
-    pub fn store(&self, key: &KernelKey, artifact: &[u8]) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+    /// it, so a concurrent reader never sees a partial file. A disabled cache publishes nothing.
+    pub(crate) fn store(&self, key: &KernelKey, artifact: &[u8]) -> std::io::Result<()> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(dir)?;
         let mut entry = Vec::with_capacity(ENTRY_HEADER_LEN + artifact.len());
         entry.extend_from_slice(ENTRY_MAGIC);
-        entry.extend_from_slice(&entry_digest(key, artifact).to_le_bytes());
+        entry.extend_from_slice(&key.id.0);
+        entry.extend_from_slice(&entry_digest(key, artifact));
         entry.extend_from_slice(artifact);
-        let staged = self.scratch_path(key, "tmp");
+        let staged = self.scratch_path(dir, key, "tmp");
         std::fs::write(&staged, &entry)
-            .and_then(|()| std::fs::rename(&staged, self.entry_path(key)))
+            .and_then(|()| std::fs::rename(&staged, Self::entry_path(dir, key)))
             .inspect_err(|_| {
                 let _ = std::fs::remove_file(&staged);
             })
     }
 
     /// `llc` `body` to bytes without touching the cache entries. The scratch artifact is unique per call
-    /// and removed before returning, so a failed compile leaves the directory as it found it. The
-    /// artifact is read under `max_artifact_bytes`: a longer one is [`ArtifactTooLarge`] and is never held
-    /// in memory.
-    pub fn compile_body(
+    /// and removed before returning, so a failed compile leaves the directory as it found it; a disabled
+    /// cache compiles in a [`PrivateScratch`] instead. The artifact is read under `max_artifact_bytes`: a
+    /// longer one is [`ArtifactTooLarge`] and is never held in memory.
+    fn compile_body(
         &self,
         body: &Body,
         max_artifact_bytes: NonZeroU64,
     ) -> Result<Vec<u8>, CompileError> {
-        std::fs::create_dir_all(&self.dir)?;
-        let scratch = self.scratch_path(&self.key(body), "out");
+        let private;
+        let dir = match &self.dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                dir.as_path()
+            }
+            None => {
+                private = WorkDir::private()?;
+                private.path()
+            }
+        };
+        let scratch = self.scratch_path(dir, &self.key(body), "out");
         let compiled = compile(body, self.target, &scratch);
         let bytes = compiled.and_then(|_| {
             read_bounded(&scratch, max_artifact_bytes.get())?.map_err(CompileError::from)
@@ -619,7 +743,7 @@ impl KernelCache {
 
     /// The artifact for `key`: a verified hit, else `build`'s output, stored before it is returned. A hit
     /// or a build longer than `max_artifact_bytes` is [`ArtifactTooLarge`] and nothing is published.
-    pub fn load_or_build<E: From<std::io::Error> + From<ArtifactTooLarge>>(
+    pub(crate) fn load_or_build<E: From<std::io::Error> + From<ArtifactTooLarge>>(
         &self,
         key: &KernelKey,
         max_artifact_bytes: NonZeroU64,
@@ -637,27 +761,78 @@ impl KernelCache {
         Ok(Artifact { bytes, built: true })
     }
 
-    /// The artifact for `body`: a verified hit, else an `llc` compile, stored before it is returned, all
-    /// under `max_artifact_bytes`.
+    /// The compiled kernel for `body`: a verified hit, else an `llc` compile, stored before it is
+    /// returned, all under `max_artifact_bytes`. The result is the only thing [`kernel_handle`] accepts,
+    /// and it carries the id of `body` on this cache's target.
+    ///
+    /// [`kernel_handle`]: crate::kernel_handle
     pub fn load_or_compile(
         &self,
         body: &Body,
         max_artifact_bytes: NonZeroU64,
-    ) -> Result<Artifact, CompileError> {
-        self.load_or_build(&self.key(body), max_artifact_bytes, || {
+    ) -> Result<CompiledArtifact, CompileError> {
+        let target = GpuTarget::try_from(self.target)?;
+        let key = self.key(body);
+        let artifact = self.load_or_build(&key, max_artifact_bytes, || {
             self.compile_body(body, max_artifact_bytes)
-        })
+        })?;
+        Ok(CompiledArtifact::new(
+            key.id,
+            target,
+            artifact.bytes,
+            artifact.built,
+        ))
     }
 
-    /// A path beside the entries that no other call in any process shares.
-    pub(crate) fn scratch_path(&self, key: &KernelKey, suffix: &str) -> PathBuf {
+    /// A private working directory for the build of `key`: beside the entries when the cache is enabled,
+    /// else a [`WorkDir::private`] one. Removed when dropped.
+    pub(crate) fn work_dir(&self, key: &KernelKey) -> std::io::Result<WorkDir> {
+        match &self.dir {
+            Some(dir) => {
+                let path = self.scratch_path(dir, key, "work");
+                std::fs::create_dir_all(&path)?;
+                Ok(WorkDir(path))
+            }
+            None => WorkDir::private(),
+        }
+    }
+
+    /// A path in `dir` beside the entries that no other call in any process shares.
+    fn scratch_path(&self, dir: &Path, key: &KernelKey, suffix: &str) -> PathBuf {
         static NONCE: AtomicU64 = AtomicU64::new(0);
         let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
-        self.dir.join(format!(
+        dir.join(format!(
             "{}.{}.{nonce}.{suffix}",
             key.as_str(),
             std::process::id()
         ))
+    }
+}
+
+/// A working directory for one build, removed when dropped.
+pub(crate) struct WorkDir(PathBuf);
+
+impl WorkDir {
+    /// A fresh directory only this user can enter, for a build whose cache is disabled.
+    fn private() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("poot-scratch-{}-{nonce}", std::process::id()));
+        // `create` fails on an existing path, symlink included, so the directory is ours.
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -697,7 +872,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&want);
         unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &want) };
 
-        let dir = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()));
+        let dir = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()))
+            .expect("an explicit, creatable directory is a cache root");
         assert!(
             dir.starts_with(&want),
             "POOT_KERNEL_CACHE_DIR must take priority over XDG/HOME: got {dir:?}, want under {want:?}"
@@ -719,7 +895,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&want);
         unsafe { std::env::set_var("XDG_CACHE_HOME", &want) };
 
-        let dir = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()));
+        let dir = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()))
+            .expect("a creatable XDG cache home is a cache root");
         assert!(
             dir.starts_with(want.join("poot").join("kernels")),
             "must root under $XDG_CACHE_HOME/poot/kernels when POOT_KERNEL_CACHE_DIR is unset: {dir:?}"
@@ -729,8 +906,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&want);
     }
 
+    /// SC-004: a cache directory that cannot be created disables the cache; it does not move it to a shared
+    /// temp directory. The kernel still compiles, in a private scratch directory that is gone afterwards, so
+    /// nothing is left under `temp_dir()`. Mutation: fall back to `temp_dir()/poot-<kind>` when the
+    /// directory cannot be created; the cache reports enabled and a directory is left under the temp dir.
     #[test]
-    fn cache_root_falls_back_to_temp_dir_when_root_is_unwritable() {
+    fn an_unwritable_cache_dir_disables_the_cache_and_still_compiles() {
         let _guard = ENV_LOCK.lock().unwrap();
         unset_all_cache_env();
         // A path under a regular file always fails `create_dir_all` with ENOTDIR, without needing root
@@ -739,47 +920,107 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").unwrap();
         let impossible = blocker.join("sub").join("dir");
         unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &impossible) };
+        let temp = unique_tmp("unwritable-temp-dir");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let outer_temp = std::env::var_os("TMPDIR");
+        unsafe { std::env::set_var("TMPDIR", &temp) };
 
-        let dir = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()));
+        let cache = KernelCache::open(Target::Nvptx);
+        let compiled = cache.load_or_compile(&sample_body("unwritable_cache"), ROOMY);
+
+        match outer_temp {
+            Some(outer) => unsafe { std::env::set_var("TMPDIR", outer) },
+            None => unsafe { std::env::remove_var("TMPDIR") },
+        }
+        unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
+        let left: Vec<_> = std::fs::read_dir(&temp)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&temp);
+        let _ = std::fs::remove_file(&blocker);
+
+        assert_eq!(cache.dir(), None, "an unwritable root disables the cache");
+        let compiled = compiled.expect("a disabled cache still compiles");
+        assert!(compiled.built() && !compiled.is_empty());
         assert!(
-            dir.starts_with(std::env::temp_dir()),
-            "an unwritable root must fall back to temp_dir(), got {dir:?}"
+            left.is_empty(),
+            "nothing may be left under the temp dir: {left:?}"
         );
-        assert!(
-            !dir.starts_with(&impossible),
-            "must not silently succeed under the unwritable path"
+    }
+
+    /// With no cache location in the environment at all the cache is disabled, not placed in `temp_dir()`.
+    #[test]
+    fn no_cache_location_in_the_environment_disables_the_cache() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unset_all_cache_env();
+        let home = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+        let root = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()));
+        if let Some(home) = home {
+            unsafe { std::env::set_var("HOME", home) };
+        }
+        assert_eq!(root, None);
+    }
+
+    /// A cache directory is private to the user: created `0700`, a wider existing one is tightened, and one
+    /// that is a symlink is refused. Mutation: skip the symlink check; the cache opens through the link.
+    #[test]
+    fn cache_directories_are_private_and_never_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENV_LOCK.lock().unwrap();
+        unset_all_cache_env();
+        let base = unique_tmp("private-dirs");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("rocm")).unwrap();
+        std::fs::set_permissions(base.join("rocm"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &base) };
+        let target = Target::AmdGcn(AmdArch::gfx1151());
+
+        let dir = kernel_cache_root("rocm", target).expect("an existing own directory is usable");
+        for private in [
+            dir.as_path(),
+            dir.parent().unwrap(),
+            base.join("rocm").as_path(),
+        ] {
+            let mode = std::fs::metadata(private).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{private:?} must be private to the user");
+        }
+
+        let elsewhere = unique_tmp("private-dirs-elsewhere");
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, base.join("ptx")).unwrap();
+        assert_eq!(
+            kernel_cache_root("ptx", Target::Nvptx),
+            None,
+            "a symlinked kind directory is not the user's own"
         );
 
         unsafe { std::env::remove_var("POOT_KERNEL_CACHE_DIR") };
-        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
-    fn kill_switch_returns_a_distinct_per_process_dir() {
+    fn the_kill_switch_disables_the_cache() {
         let _guard = ENV_LOCK.lock().unwrap();
         unset_all_cache_env();
-        unsafe { std::env::set_var("POOT_KERNEL_CACHE", "0") };
-        let dir_a = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()));
-
-        unsafe { std::env::set_var("POOT_KERNEL_CACHE", "off") };
-        let dir_b = kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151()));
-
-        // The kill-switch dir is per process, so both calls return the same path: a temp_dir() path
-        // distinct from any shared-cache root, stable for one process's own compiles.
-        assert!(dir_a.starts_with(std::env::temp_dir()));
-        assert_eq!(
-            dir_a, dir_b,
-            "kill switch must key the fallback dir on pid, not on call count"
-        );
-        assert!(
-            dir_a
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .contains(&std::process::id().to_string()),
-            "kill-switch dir must be pid-scoped: {dir_a:?}"
-        );
-
+        for value in ["0", "off", "FALSE"] {
+            unsafe { std::env::set_var("POOT_KERNEL_CACHE", value) };
+            assert_eq!(
+                kernel_cache_root("rocm", Target::AmdGcn(AmdArch::gfx1151())),
+                None,
+                "POOT_KERNEL_CACHE={value}"
+            );
+            assert!(
+                KernelCache::open(Target::SpirvVulkan).dir().is_none(),
+                "POOT_KERNEL_CACHE={value}"
+            );
+        }
         unsafe { std::env::remove_var("POOT_KERNEL_CACHE") };
     }
 
@@ -997,20 +1238,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// SC-003: the wgpu and PTX key paths fingerprint the same Body identically, and different Bodies
-    /// differently; only the epoch and target half of the key may differ between the two.
+    /// SC-003: one body on two targets is two kernels. The caches share an epoch string and a file
+    /// extension, so only the target half of the id tells the Vulkan and OpenCL SPIR-V keys apart; and
+    /// different bodies on one target differ. Mutation: leave the target out of `KernelId::of`; the keys
+    /// are equal.
     #[test]
-    fn spirv_and_ptx_keys_share_the_body_fingerprint() {
-        let dir = unique_tmp("shared-fingerprint");
-        let body = sample_body("shared_fingerprint");
-        let spirv = KernelCache::at(&dir, Target::SpirvVulkan).key(&body);
-        let ptx = KernelCache::at(&dir, Target::Nvptx).key(&body);
+    fn one_body_on_two_targets_has_two_keys() {
+        let dir = unique_tmp("target-in-key");
+        let body = sample_body("target_in_key");
+        let epoch = "0000000000000001";
+        let vulkan = KernelCache::with_epoch(dir.clone(), epoch.into(), Target::SpirvVulkan);
+        let opencl = KernelCache::with_epoch(dir.clone(), epoch.into(), Target::SpirvOpenCl);
+        assert_eq!(
+            Target::SpirvVulkan.output_ext(),
+            Target::SpirvOpenCl.output_ext(),
+            "the fixture needs two targets that share an extension"
+        );
 
-        assert_eq!(spirv.fingerprint(), ptx.fingerprint());
-        assert_eq!(spirv.fingerprint(), body_fingerprint(&body));
-        assert_ne!(spirv, ptx, "the target must be in the key");
-        let other = KernelCache::at(&dir, Target::Nvptx).key(&sample_body("some_other_kernel"));
-        assert_ne!(ptx.fingerprint(), other.fingerprint());
+        assert_ne!(vulkan.key(&body).id(), opencl.key(&body).id());
+        assert_ne!(vulkan.key(&body), opencl.key(&body));
+        let other = vulkan.key(&sample_body("some_other_kernel"));
+        assert_ne!(vulkan.key(&body).id(), other.id());
+        let gfx1100 = KernelId::of(&body, Target::AmdGcn(AmdArch::new("gfx1100", 32)));
+        let gfx1151 = KernelId::of(&body, Target::AmdGcn(AmdArch::gfx1151()));
+        assert_ne!(gfx1100, gfx1151, "an AMD arch is part of the target");
+    }
+
+    /// SC-002: an entry whose recorded id is another kernel's is a miss even when its digest is intact (the
+    /// digest binds the key, which a file copied between two keys' names can satisfy). Mutation: skip the
+    /// id comparison in `load`; the foreign artifact is served.
+    #[test]
+    fn an_entry_stored_for_another_body_is_a_miss() {
+        let dir = unique_tmp("foreign-id");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = KernelCache::with_epoch(dir.clone(), "0000000000000001".into(), Target::Nvptx);
+        let key = cache.key(&sample_body("wanted"));
+        let foreign = cache.key(&sample_body("foreign")).id();
+        assert_ne!(foreign, key.id());
+
+        let artifact = b"artifact of the foreign body";
+        let mut entry = ENTRY_MAGIC.to_vec();
+        entry.extend_from_slice(&foreign.0);
+        entry.extend_from_slice(&entry_digest(&key, artifact));
+        entry.extend_from_slice(artifact);
+        std::fs::write(dir.join(key.as_str()), &entry).unwrap();
+
+        assert_eq!(load(&cache, &key), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn limit(bytes: u64) -> NonZeroU64 {
@@ -1129,7 +1404,7 @@ mod tests {
         unsafe { std::env::set_var("POOT_KERNEL_CACHE_DIR", &want) };
 
         let target = Target::AmdGcn(AmdArch::gfx1151());
-        let dir = kernel_cache_root("rocm", target);
+        let dir = kernel_cache_root("rocm", target).expect("an explicit, creatable directory");
         let artifact_path = crate::artifact_path(&dir, "some_kernel_abc123", target);
         let (scratch_ll, scratch_tmp) = crate::compile_scratch_paths(&artifact_path, 12345, 0);
 
@@ -1181,12 +1456,12 @@ mod tests {
         let artifact = Path::new("/cache/kernel_ab12.hsaco");
         let (ll, tmp) = crate::compile_scratch_paths(artifact, 4242, 7);
         let cache = KernelCache::at("/cache", Target::SpirvVulkan);
-        let key = kernel_entry_key("0123456789abcdef", Target::SpirvVulkan, 9);
+        let key = kernel_entry_key("0123456789abcdef", Target::SpirvVulkan, KernelId([9; 16]));
         for scratch in [
             ll,
             tmp,
-            cache.scratch_path(&key, "tmp"),
-            cache.scratch_path(&key, "out"),
+            cache.scratch_path(Path::new("/cache"), &key, "tmp"),
+            cache.scratch_path(Path::new("/cache"), &key, "out"),
         ] {
             let name = scratch.file_name().unwrap().to_str().unwrap();
             assert!(

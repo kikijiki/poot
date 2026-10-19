@@ -1463,6 +1463,9 @@ mod tests {
             ),
             "got {error:?}"
         );
-        assert!(!cache.dir().exists() || std::fs::read_dir(cache.dir()).unwrap().next().is_none());
+        let dir = cache
+            .dir()
+            .expect("the cache sits at an explicit directory");
+        assert!(!dir.exists() || std::fs::read_dir(dir).unwrap().next().is_none());
     }
 }

@@ -6,9 +6,16 @@
 use poot_llm::driver::{BackendChoice, open_executor};
 use poot_llm::encoders::{CrossEncoder, Pooling, SentenceEncoder};
 
+/// Texts or pairs one step is prepared for.
+const ROWS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
+
 fn sentence_encoder(dir: &std::path::Path) -> SentenceEncoder {
-    SentenceEncoder::load(dir, open_executor(BackendChoice::Wgpu).expect("open wgpu"))
-        .expect("load the encoder")
+    SentenceEncoder::load(
+        dir,
+        open_executor(BackendChoice::Wgpu).expect("open wgpu"),
+        ROWS,
+    )
+    .expect("load the encoder")
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -120,8 +127,12 @@ fn cross_encoder_reranks() {
     else {
         return;
     };
-    let mut ce = CrossEncoder::load(&dir, open_executor(BackendChoice::Wgpu).expect("open wgpu"))
-        .expect("load the cross-encoder");
+    let mut ce = CrossEncoder::load(
+        &dir,
+        open_executor(BackendChoice::Wgpu).expect("open wgpu"),
+        ROWS,
+    )
+    .expect("load the cross-encoder");
     let query = "How many people live in Berlin?";
     let relevant = "Berlin has a population of 3,520,031 registered inhabitants in an area of 891.82 \
                     square kilometers.";

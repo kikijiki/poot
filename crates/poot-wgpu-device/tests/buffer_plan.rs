@@ -243,10 +243,10 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
     std::fs::create_dir_all(&dir).unwrap();
     let out_path =
         poot_codegen::artifact_path(&dir, "sc002_len_probe", poot_codegen::Target::SpirvVulkan);
-    poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out_path)
-        .expect("len_probe must compile to SpirV");
-    let spv = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv);
+    let artifact =
+        poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+            .expect("len_probe must compile to SpirV");
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let kernel = device
         .load_kernel("sc002_len_probe", compiled)
         .expect("load the len_probe kernel");

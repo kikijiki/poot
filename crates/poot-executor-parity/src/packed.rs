@@ -1,5 +1,5 @@
 //! Packed-linear fixtures at real weight magnitude: one projection per quantization scheme (Q4_0,
-//! Q8_0, AWQ, GPTQ), and the indexed expert contraction over a stacked table of each.
+//! Q8_0, AWQ, GPTQ, IQ3_S), and the indexed expert contraction over a stacked table of each.
 //!
 //! The codes are every bit pattern, but each stored scale is a plausible magnitude, so a decoded
 //! weight is of the order of a trained one (`|w| <= 0.25`) and the activation is of unit order: a
@@ -25,29 +25,33 @@ use poot_eval::test_support::StepFixture;
 use crate::{Fixture, fill};
 
 /// The contraction length of every fixture: a multiple of every scheme's group (a Q4_0/Q8_0 block of
-/// 32, the AWQ group of 64, four GPTQ groups of 64) and of the planar pack width.
+/// 32, the AWQ group of 64, four GPTQ groups of 64, the IQ3_S super-block of 256) and of the planar pack width.
 const K: usize = 256;
 /// Output channels of one linear.
 const OUT: usize = 8;
-/// The largest decoded weight magnitude the payloads are scaled to.
+/// The largest decoded weight magnitude the payloads are scaled to, unless a scheme states its own.
 const PEAK: f32 = 0.25;
 /// Experts of a chain, and rows routed through it.
 const EXPERTS: usize = 3;
 const ROWS: usize = 5;
 
 /// One quantization scheme: its format, the largest code magnitude its decode multiplies a scale by
-/// (so a scale of `PEAK / max_code` keeps the decoded weight within `PEAK`), and the fixture names of
+/// (so a scale of `peak / max_code` keeps the decoded weight within `peak`), and the fixture names of
 /// its decode (`M = 1`) and few-row (`M = 4`) linears, and of its indexed expert contraction.
 struct Scheme {
     format: fn() -> WeightFormat,
+    /// The largest decoded weight magnitude: a lattice quant's typical weight is a fraction of its
+    /// largest (a random grid point and sub-scale), so its peak is higher for the outputs to be of order one.
+    peak: f32,
     max_code: f32,
     linear_m1: &'static str,
     linear_m4: &'static str,
     experts: &'static str,
 }
 
-const SCHEMES: [Scheme; 4] = [
+const SCHEMES: [Scheme; 5] = [
     Scheme {
+        peak: PEAK,
         format: || WeightFormat::Q4_0,
         max_code: 8.0,
         linear_m1: "packed_linear_q4_0_m1",
@@ -55,6 +59,7 @@ const SCHEMES: [Scheme; 4] = [
         experts: "packed_experts_q4_0",
     },
     Scheme {
+        peak: PEAK,
         format: || WeightFormat::Q8_0,
         max_code: 127.0,
         linear_m1: "packed_linear_q8_0_m1",
@@ -62,6 +67,7 @@ const SCHEMES: [Scheme; 4] = [
         experts: "packed_experts_q8_0",
     },
     Scheme {
+        peak: PEAK,
         format: || WeightFormat::Awq {
             group_size: NonZeroUsize::new(64).unwrap(),
         },
@@ -71,6 +77,7 @@ const SCHEMES: [Scheme; 4] = [
         experts: "packed_experts_awq",
     },
     Scheme {
+        peak: PEAK,
         format: || WeightFormat::Gptq {
             groups: GroupMap::Indexed {
                 groups: NonZeroUsize::new(4).unwrap(),
@@ -80,6 +87,15 @@ const SCHEMES: [Scheme; 4] = [
         linear_m1: "packed_linear_gptq_m1",
         linear_m4: "packed_linear_gptq_m4",
         experts: "packed_experts_gptq",
+    },
+    // The largest decoded magnitude is a grid point of 15 times an odd-integer sub-scale of 31.
+    Scheme {
+        peak: 2.0 * PEAK,
+        format: || WeightFormat::Iq3_S,
+        max_code: 15.0 * 31.0,
+        linear_m1: "packed_linear_iq3_s_m1",
+        linear_m4: "packed_linear_iq3_s_m4",
+        experts: "packed_experts_iq3_s",
     },
 ];
 
@@ -110,7 +126,7 @@ pub(crate) fn f16_bits(value: f32) -> u16 {
 /// Write the `index`th scale of a payload (in `[0.5, 1.0) * peak / max_code`) into `out`, as `float`.
 fn write_scale(float: FloatFormat, out: &mut [u8], index: u64, scheme: &Scheme) {
     let unit = (random_bytes(1, index.wrapping_mul(0x9E37_79B9) | 1)[0] as f32) / 256.0;
-    let scale = PEAK / scheme.max_code * (0.5 + 0.5 * unit);
+    let scale = scheme.peak / scheme.max_code * (0.5 + 0.5 * unit);
     match float {
         FloatFormat::F32 => out[..4].copy_from_slice(&scale.to_le_bytes()),
         FloatFormat::F16 => out[..2].copy_from_slice(&f16_bits(scale).to_le_bytes()),
@@ -185,9 +201,10 @@ fn real_magnitude_payload(scheme: &Scheme, seed: u64) -> Arc<PackedPayload> {
         peak = row.iter().fold(peak, |peak, w| peak.max(w.abs()));
     }
     assert!(
-        peak > PEAK / 8.0 && peak <= PEAK * 1.001,
-        "{format:?}: decoded peak {peak} outside ({}, {PEAK}]",
-        PEAK / 8.0
+        peak > scheme.peak / 8.0 && peak <= scheme.peak * 1.001,
+        "{format:?}: decoded peak {peak} outside ({}, {}]",
+        scheme.peak / 8.0,
+        scheme.peak
     );
     Arc::new(payload)
 }
