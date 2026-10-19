@@ -54,8 +54,7 @@ pub(crate) struct QueueLayout {
 /// Authoritative packet-ring facts for the current cooperative GWS queue creator. ROCr's
 /// cooperative path allocates the ring with `HSA_AMD_QUEUE_CREATE_SYSTEM_MEM`; do not substitute
 /// device-memory or coherent-device facts without changing that creator.
-pub(crate) fn cooperative_gws_publication_facts() -> (Option<QueueRingMemory>, Option<QueueHostLink>)
-{
+fn cooperative_gws_publication_facts() -> (Option<QueueRingMemory>, Option<QueueHostLink>) {
     (Some(QueueRingMemory::HostCoherent), None)
 }
 
@@ -101,6 +100,19 @@ impl QueueCreationPlan {
         match self {
             Self::CooperativeGws => QueueRole::Cooperative,
             Self::PcieDeviceMemoryRingReceipt => QueueRole::PcieDeviceRingReceipt,
+        }
+    }
+
+    /// The ring memory and host link this plan's queue is created with: the facts
+    /// `QueuePublication::validate` turns into the publication contract. One owner for both plans, so a
+    /// creation arm cannot spell its own.
+    pub(crate) fn publication_facts(self) -> (Option<QueueRingMemory>, Option<QueueHostLink>) {
+        match self {
+            Self::CooperativeGws => cooperative_gws_publication_facts(),
+            Self::PcieDeviceMemoryRingReceipt => (
+                Some(QueueRingMemory::DeviceMemory),
+                Some(QueueHostLink::Pcie),
+            ),
         }
     }
 

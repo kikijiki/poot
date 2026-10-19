@@ -31,7 +31,7 @@ LLM generation uses the same engine: trace a model into a graph, then run that g
 | `poot-wgpu-runtime`                   | Host `Context` + typed launchers for imported kernels            |
 
 `poot-graph-plan::compile` owns optimization, legalization and planning. It returns a `Program` for a
-typed target. The executor contract consumes that program: `compile_staged` wraps `compile` for one
+typed target. The executor contract consumes that program: `staged::compile_staged` wraps `compile` for one
 device, `Executor::add_entry` loads the staged program, the first `step` records it, and every later
 `step` replays it.
 
@@ -93,7 +93,8 @@ Use the compiler entry instead of assembling a production pass sequence:
 
 ```rust
 use poot_executor::Device;
-use poot_graph_plan::{compile, CompileLimits, CompileOptions, Submission, Target};
+use poot_graph_plan::production_plan::Submission;
+use poot_graph_plan::{compile, CompileLimits, CompileOptions, Target};
 use poot_wgpu_device::device::WgpuDevice;
 
 let device = WgpuDevice::new()?;
@@ -110,7 +111,7 @@ error before it builds the excess: `CompileError::Expansion` for a graph, a plan
 limit bounds the artifact's bytes only, not the memory or time the external compiler uses.
 
 The program exposes its graph, equation plans, storage/slot decisions and numerics. The executor
-contract consumes the staged form: `compile_staged` wraps `compile` for one device and hands the
+contract consumes the staged form: `staged::compile_staged` wraps `compile` for one device and hands the
 `StagedProgram` to `Executor::add_entry`. For a CPU-only illustration of individual fusion passes:
 
 ```bash
@@ -125,12 +126,14 @@ The wgpu backend runs the same contract as PTX and ROCm: build a `WgpuDevice`, w
 ```rust
 use std::sync::Arc;
 
-use poot_executor::{Device, Engine, Executor, HostView, NoSync, StepInputs};
+use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
+use poot_tensor::HostView;
 use poot_wgpu_device::device::WgpuDevice;
-use poot_graph_plan::{
-    compile_staged, CompileLimits, CompileOptions, DeviceId, DevicePlacement, ExpertPlacement,
-    Partition, Submission, TargetSet,
+use poot_graph_plan::production_plan::Submission;
+use poot_graph_plan::staged::{
+    compile_staged, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
 };
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_quant::weights::{WeightMap, WeightStore};
 
 // use Builder / ops::* to trace the graph, as above; each Storage::Const the graph declares is a

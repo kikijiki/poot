@@ -11,7 +11,11 @@ The server validates the constraint before it asks the engine: an invalid `guide
 Constraints are bounded so one request cannot exhaust the server. A `guided_regex` longer than 4096 bytes, a
 `guided_grammar` longer than 16 KiB, or a `guided_json` or `response_format` schema whose JSON text is longer than
 16 KiB is a `400`. So is a pattern whose compiled automaton is too large, for example a long counted repetition
-over an alternation such as `(a|b)*a(a|b){17}`; the error names the regex and the size limit it hit.
+over an alternation such as `(a|b)*a(a|b){17}`; the error names the regex and the size limit it hit. The
+automaton is built within 256 KiB of working memory, so a pattern that needs more is refused rather than slowly
+built. A `guided_json` schema is compiled to a regex first, and that regex may not pass 256 KiB: a schema that
+repeats its parts, such as arrays nested many levels deep or many optional properties, is a `400` when it
+compiles past that bound.
 
 The constraint applies to the bytes each token adds to the output, read from the model's vocabulary. A
 word-initial token of a SentencePiece model counts as its leading space plus the word, so a pattern that starts

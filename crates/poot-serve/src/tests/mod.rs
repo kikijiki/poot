@@ -60,6 +60,7 @@ mod config;
 mod drain;
 pub(crate) mod encoder_routes;
 mod engine_loop;
+mod hostile_http;
 mod http_parse;
 mod lifecycle;
 mod other;

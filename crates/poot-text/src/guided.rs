@@ -167,10 +167,19 @@ impl TextCodec {
 
 /// Largest compiled DFA (bytes) a client pattern may build. A pattern past it is refused with a 400.
 const DFA_SIZE_LIMIT: usize = 1 << 20;
-/// Largest working set (bytes) the DFA determinization may use before it gives up.
-const DETERMINIZE_SIZE_LIMIT: usize = 1 << 20;
+/// Largest working set (bytes) the DFA determinization may use before it gives up. Determinization
+/// has no time limit of its own and its work grows with this one (a Unicode-class pattern measured
+/// 7.1 s at 1 MiB and 1.9 s at 256 KiB before refusal), so the bound on one request's CPU is this
+/// constant.
+const DETERMINIZE_SIZE_LIMIT: usize = 1 << 18;
 /// Largest Thompson NFA (bytes) a client pattern may build, which bounds the work before determinization.
 const NFA_SIZE_LIMIT: usize = 1 << 20;
+/// Longest regex text (bytes) a JSON Schema may compile to. The schema compiler inlines a subschema
+/// wherever it is used (an array repeats its item, an object with optional properties repeats its tail,
+/// a `$ref` expands in place), so a small schema can name text that grows exponentially in its depth;
+/// the text is refused past this bound while it is being built, before the regex engine sees it. A
+/// schema that fits is further bounded by the NFA and DFA limits above.
+const MAX_SCHEMA_REGEX_BYTES: usize = 1 << 18;
 /// Most per-state token masks one request keeps ([`StateMasks`]); the cache clears past it.
 const STATE_MASK_CAP: usize = 1024;
 
@@ -1151,9 +1160,30 @@ pub(crate) fn json_schema_to_regex(schema: &serde_json::Value) -> Result<String>
         root.pointer(ptr)
             .with_context(|| format!("guided_json: $ref {r:?} does not resolve in the schema"))
     }
+    // Refuse regex text that would pass [`MAX_SCHEMA_REGEX_BYTES`] once `len` more bytes are counted.
+    fn within_bound(len: usize) -> Result<()> {
+        if len > MAX_SCHEMA_REGEX_BYTES {
+            bail!(
+                "guided_json: the schema compiles to more than {MAX_SCHEMA_REGEX_BYTES} bytes of regex"
+            );
+        }
+        Ok(())
+    }
+    // One schema node's regex, held to the bound. Every composite below builds from children that
+    // passed through here, so a node never holds more than a small multiple of the bound.
+    fn value_regex(
+        schema: &serde_json::Value,
+        ws: &str,
+        root: &serde_json::Value,
+        active: &mut Vec<String>,
+    ) -> Result<String> {
+        let regex = node_regex(schema, ws, root, active)?;
+        within_bound(regex.len())?;
+        Ok(regex)
+    }
     // `root` is the whole schema document ($ref targets resolve against it); `active` is the stack of refs
     // currently being expanded, so a recursive ref (one already on its own path) is rejected, not looped.
-    fn value_regex(
+    fn node_regex(
         schema: &serde_json::Value,
         ws: &str,
         root: &serde_json::Value,
@@ -1184,14 +1214,25 @@ pub(crate) fn json_schema_to_regex(schema: &serde_json::Value) -> Result<String>
                 bail!("guided_json: oneOf/anyOf needs at least one subschema");
             }
             let mut alts: Vec<String> = Vec::with_capacity(subs.len());
+            let mut total = 0usize;
             for s in subs {
-                alts.push(value_regex(s, ws, root, active)?);
+                let alt = value_regex(s, ws, root, active)?;
+                total += alt.len() + 1;
+                within_bound(total)?;
+                alts.push(alt);
             }
             return Ok(format!("(?:{})", alts.join("|")));
         }
         // an `enum` of scalar literals: an alternation of their regex-escaped JSON serializations.
         if let Some(serde_json::Value::Array(variants)) = schema.get("enum") {
-            let alts: Vec<String> = variants.iter().map(literal_regex).collect::<Result<_>>()?;
+            let mut alts: Vec<String> = Vec::with_capacity(variants.len());
+            let mut total = 0usize;
+            for variant in variants {
+                let alt = literal_regex(variant)?;
+                total += alt.len() + 1;
+                within_bound(total)?;
+                alts.push(alt);
+            }
             return Ok(format!("(?:{})", alts.join("|")));
         }
         let ty = schema
@@ -1309,12 +1350,15 @@ pub(crate) fn json_schema_to_regex(schema: &serde_json::Value) -> Result<String>
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect());
         // each property: ("key" ws : ws <value>, is_required). Keys are in serde_json's sorted order.
         let mut entries: Vec<(String, bool)> = Vec::with_capacity(props.len());
+        let mut total = 0usize;
         for (key, sub) in props {
             let part = format!(
                 "\"{}\"{ws}:{ws}{}",
                 esc(key),
                 value_regex(sub, ws, root, active)?
             );
+            total += part.len();
+            within_bound(total)?;
             let req = required
                 .as_ref()
                 .is_none_or(|set| set.contains(key.as_str()));
@@ -1328,6 +1372,10 @@ pub(crate) fn json_schema_to_regex(schema: &serde_json::Value) -> Result<String>
         let n = entries.len();
         let sep = format!("{ws},{ws}");
         let any_required = entries.iter().any(|(_, r)| *r);
+        // Each first-present choice repeats the properties after it: the optional prefix of a long
+        // all-optional object costs quadratic text, counted here before any of it is built.
+        let first_choices = entries.iter().take_while(|(_, r)| !*r).count() + 1;
+        within_bound(first_choices.saturating_mul(total))?;
         let mut alts: Vec<String> = Vec::new();
         for first in 0..n {
             if entries[..first].iter().any(|(_, r)| *r) {

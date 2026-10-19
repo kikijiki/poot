@@ -21,13 +21,13 @@ use crate::ffi::{Funcs, Hsa};
 use crate::owner::{HsaRuntimeOwner, ResourceOwner};
 use crate::queue::{
     DEVICE_RING_OVERRIDE_AT_FIRST_HSA_LOAD, QueueCreationPlan, QueueLayout, QueueProperties,
-    cooperative_gws_publication_facts, destroy_queue_reference, device_ring_override_present,
-    queue_request, validate_created_queue, validate_queue_plan_provenance,
+    destroy_queue_reference, device_ring_override_present, queue_request, validate_created_queue,
+    validate_queue_plan_provenance,
 };
 use crate::replay::replay_graph_chunk_size;
 use crate::{
-    HsaStatus, QueueHostLink, QueueHostTarget, QueuePublicationContract, QueueRingMemory,
-    RocmBuffer, RocmContext, RocmContextOptions, RocmError, bindings, publication,
+    HsaStatus, QueueHostTarget, QueuePublicationContract, RocmBuffer, RocmContext,
+    RocmContextOptions, RocmError, bindings, publication,
 };
 use poot_runtime_common::BufferRole;
 use poot_target::BufferStorage;
@@ -202,7 +202,7 @@ impl RocmContext {
             QueueCreationPlan::CooperativeGws => {
                 // ROCr builds the cooperative GWS queue through CreateInterceptibleQueue with the explicit
                 // HSA_AMD_QUEUE_CREATE_SYSTEM_MEM allocation flag.
-                let (ring_memory, host_link) = cooperative_gws_publication_facts();
+                let (ring_memory, host_link) = plan.publication_facts();
                 (ring_memory, host_link, None)
             }
             QueueCreationPlan::PcieDeviceMemoryRingReceipt => {
@@ -224,8 +224,7 @@ impl RocmContext {
                 }
                 // ROCr's HSA_ALLOCATE_QUEUE_DEV_MEM=1 (set before hsa_init) selects
                 // HSA_AMD_QUEUE_CREATE_DEVICE_MEM_RING_BUF for ordinary MULTI/SINGLE creates.
-                let ring_memory = Some(QueueRingMemory::DeviceMemory);
-                let host_link = Some(QueueHostLink::Pcie);
+                let (ring_memory, host_link) = plan.publication_facts();
                 // SAFETY: discovery contract; BDFID and DOMAIN are `uint32_t` attributes.
                 let bdfid =
                     unsafe { amd_agent_u32_info(&hsa.funcs, gpu_agent, HSA_AMD_AGENT_INFO_BDFID) };

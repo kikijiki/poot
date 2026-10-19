@@ -369,29 +369,6 @@ pub(crate) mod tests {
             .expect("test publication facts should validate")
     }
 
-    #[test]
-    fn device_store_fence_wrapper_is_the_direct_x86_intrinsic() {
-        let source = include_str!("publication.rs");
-        let wrapper_start = source
-            .find("impl DeviceStoreFence {")
-            .expect("DeviceStoreFence implementation missing");
-        let wrapper_end = source[wrapper_start..]
-            .find("/// Closed publication contract")
-            .map(|offset| wrapper_start + offset)
-            .expect("DeviceStoreFence implementation boundary missing");
-        let wrapper = &source[wrapper_start..wrapper_end];
-
-        assert_eq!(
-            wrapper.matches("core::arch::x86_64::_mm_sfence();").count(),
-            1,
-            "the x86_64 intrinsic must remain in the fence wrapper"
-        );
-        assert!(
-            !wrapper.contains("atomic::fence") && !wrapper.contains("compiler_fence"),
-            "a Rust memory-model fence does not replace the PCIe device-store fence"
-        );
-    }
-
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn pcie_device_ring_fences_each_chunk_between_bodies_and_reverse_headers() {

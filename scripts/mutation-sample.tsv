@@ -1,0 +1,10 @@
+# The committed cargo-mutants sample (scripts/mutation-sample.sh, checked by scripts/check-mutation-sample.py).
+# sampled: poot-load gguf/format.rs (every mutant) and the range, shard-name and safetensors header checks of
+# gguf.rs, dtype.rs and safetensors.rs; tests: the whole poot-load suite. Measured 2026-10-19.
+# The first sample of format.rs had 13 survivors (array stride and bound arithmetic, the rank cap, the split
+# count check); the hostile_inputs rows added with the report caught them all.
+sampled	poot-load: gguf/format.rs; gguf.rs, dtype.rs, safetensors.rs header and range checks
+mutants	204
+caught	168
+unviable	36
+survivors	0

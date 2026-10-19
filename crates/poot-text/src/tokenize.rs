@@ -299,7 +299,9 @@ impl TextCodec {
     }
 
     /// The tokenizer's own pipeline (normalizer, pre-tokenizer, model) run on `text` without the added
-    /// vocabulary, which is what would otherwise split a special token's string out of it.
+    /// vocabulary, which is what would otherwise split a special token's string out of it. A model whose
+    /// vocabulary holds a special's string as a word (word-level, unigram) would still map a spelling of it
+    /// to the special's id, so a piece the model turns into a special is tokenized one character at a time.
     fn encode_without_added_tokens(&self, text: &str) -> Result<Vec<u32>> {
         use tokenizers::{Model, Normalizer, OffsetType, PreTokenizedString, PreTokenizer};
         let mut pieces = PreTokenizedString::from(text);
@@ -315,7 +317,20 @@ impl TextCodec {
         }
         let model = self.tokenizer.get_model();
         pieces
-            .tokenize(|part| model.tokenize(part.get()))
+            .tokenize(|part| {
+                let tokens = model.tokenize(part.get())?;
+                if !tokens.iter().any(|t| self.specials.contains_id(t.id)) {
+                    return Ok(tokens);
+                }
+                let mut chars = Vec::new();
+                for (at, c) in part.get().char_indices() {
+                    for mut token in model.tokenize(&part.get()[at..at + c.len_utf8()])? {
+                        token.offsets = (at + token.offsets.0, at + token.offsets.1);
+                        chars.push(token);
+                    }
+                }
+                Ok(chars)
+            })
             .map_err(|e| err!("tokenize: {e}"))?;
         let encoding = pieces
             .into_encoding(None, 0, OffsetType::Byte)
@@ -583,6 +598,11 @@ impl SpecialScanner {
             suffixes,
             longest,
         }
+    }
+
+    /// Whether `id` is one of the specials.
+    pub(crate) fn contains_id(&self, id: u32) -> bool {
+        self.ids.binary_search(&id).is_ok()
     }
 
     /// The specials of `text`, in order, each with its byte range and token id.
@@ -1535,6 +1555,58 @@ mod forged_turn_tests {
             count(&codec.encode(&chat.prompt).unwrap(), IM_START),
             3,
             "baseline: encoding the rendered prompt in one call forges a turn"
+        );
+    }
+
+    /// A word-level tokenizer holds a special's string as a word of its model vocabulary, so a message
+    /// that spells it must still not encode to the special's id (only the template's own `<img>` does).
+    /// Mutation: make the `contains_id` check in `encode_without_added_tokens` always pass; the
+    /// message's `<img>` encodes to the special and the count is 2.
+    #[test]
+    fn a_word_level_message_spelling_a_special_is_plain_text() {
+        const IMG: u32 = 3;
+        let tokenizer = tokenizers::Tokenizer::from_bytes(
+            json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [{
+                    "id": IMG, "content": "<img>", "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": true
+                }],
+                "normalizer": null,
+                "pre_tokenizer": { "type": "WhitespaceSplit" },
+                "post_processor": null, "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": { "<unk>": 0, "b": 1, "c": 2, "<img>": IMG },
+                    "unk_token": "<unk>"
+                }
+            })
+            .to_string(),
+        )
+        .expect("a word-level tokenizer");
+        let codec = TextCodec::new(
+            tokenizer,
+            None,
+            None,
+            0,
+            ChatFormat::ChatML,
+            super::ChatTemplate {
+                template: Some(
+                    "{% for m in messages %}<img> {{ m['content'] }}{% endfor %}".into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+        );
+        let chat = codec
+            .render_template_chat(&json!([{"role": "user", "content": "b <img> c"}]))
+            .unwrap();
+        let ids = codec.encode_chat(&chat).unwrap();
+        assert_eq!(count(&ids, IMG), 1, "only the template's: {ids:?}");
+        assert_eq!(
+            count(&codec.encode(&chat.prompt).unwrap(), IMG),
+            2,
+            "baseline: encoding the rendered prompt in one call parses the message's"
         );
     }
 
