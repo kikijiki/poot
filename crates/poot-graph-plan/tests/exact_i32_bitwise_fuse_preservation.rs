@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{BinOp, Builder, Scalar, TensorType, UnOp};
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
@@ -49,7 +49,7 @@ fn fuse_preserves_the_exact_i32_bit_select_and_clz_chain() {
             Value::from(HostTensor::i32(vec![4], vec![7, 0, 1, 33])),
         ),
     ]);
-    let options = || EvalOptions::new(EvalBudget::UNBOUNDED);
+    let options = || EvalOptions::default();
 
     let unfused = ints(eval(&g, &inputs, options()).unwrap().output);
     // Lane 0 by hand: select(and=0, or=7, xor=7) = 7; or-ed with shl 0, shr 0, not -1, clz 32 = -1.

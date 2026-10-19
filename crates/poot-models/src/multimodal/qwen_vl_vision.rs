@@ -1,4 +1,4 @@
-//! The Qwen2.5-VL vision tower behind [`Model`], a model whose only phase is [`Phase::Encode`]: the
+//! The Qwen2.5-VL vision tower behind [`Model`], a model whose only program is `encode`: the
 //! 3-D patch embedding, a stack of RMSNorm transformer blocks with 2-D rotary attention (windowed in
 //! all but a few blocks, full per frame in those), and the patch merger. One step is `rows` images
 //! (or videos) of the same patch count; each returns the `patches / merge^2` embedding rows the text
@@ -28,21 +28,25 @@ use std::num::NonZeroUsize;
 
 use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeTable};
 use poot_graph_ir::{
-    BinOp, Builder, ComputedConst, Graph, Scalar, Slot, TensorType, Traced, UnOp, ops,
+    BinOp, Builder, ComputedConst, Graph, Scalar, Slot, SlotKey, TensorType, Traced, UnOp, ops,
 };
 use poot_quant::weights::{
     AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
 };
-use poot_tensor::DType;
+use poot_tensor::{DType, HostTensor};
 
-use super::idefics3::PIXELS_SLOT;
+use super::idefics3::{PIXELS, PIXELS_TAG};
 use crate::components::dims::{Field, Fields};
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::{NormKind, NormParams, norm};
+use crate::io::{
+    InputId, InputValue, ModelSchema, PadValue, Per, Presence as RequestPresence, ProgramId,
+    ProgramSpec, RequestForm, RequestInput, RequestInputs,
+};
 use crate::model::WiringError;
 use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason,
-    StepShape, TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, ShapeReason, StepSpec,
+    TraceError,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
@@ -51,17 +55,44 @@ use poot_text::ChatFormat;
 /// The Qwen2.5-VL vision tower's [`FamilyKey`]: a family of its own beside the text tower's.
 pub const FAMILY: FamilyKey = FamilyKey::new("qwen2_5_vl_vision");
 
-/// The `Slot::Activation` inputs of a step beside [`PIXELS_SLOT`] (`[rows, patches, patch_dim]` F32,
-/// each patch flattened `[channel, t, i, j]`, the convolution weight's own layout): the patch's grid
-/// row and column (`[rows, patches]` I32), its attention window and its frame (`[rows, patches]` F32
-/// ids, equal ids attend to each other).
-pub const POS_H_SLOT: &str = "pos_h";
-/// The grid column of each patch, `[rows, patches]` I32 (the width-axis rotary position).
-pub const POS_W_SLOT: &str = "pos_w";
-/// The attention window id of each patch, `[rows, patches]` F32.
-pub const WINDOW_SLOT: &str = "window";
-/// The frame id of each patch, `[rows, patches]` F32 (the mask of the full-attention blocks).
-pub const FRAME_SLOT: &str = "frame";
+/// The request inputs of a step beside [`PIXELS`] (`[rows, patches, patch_dim]` F32, each patch
+/// flattened `[channel, t, i, j]`, the convolution weight's own layout): the patch's grid row and
+/// column (`[rows, patches]` I32), its attention window and its frame (`[rows, patches]` F32 ids,
+/// equal ids attend to each other). Each is one tensor per image, padded to the step's patch count.
+pub const POS_H: InputId = InputId::new("pos_h");
+/// The grid column of each patch (the width-axis rotary position), I32.
+pub const POS_W: InputId = InputId::new("pos_w");
+/// The attention window id of each patch, F32.
+pub const WINDOW_IDS: InputId = InputId::new("window");
+/// The frame id of each patch, F32 (the mask of the full-attention blocks).
+pub const FRAME_IDS: InputId = InputId::new("frame");
+
+/// `Slot::Activation` tags of the four grid inputs.
+const POS_H_TAG: &str = "pos_h";
+const POS_W_TAG: &str = "pos_w";
+const WINDOW_TAG: &str = "window";
+const FRAME_TAG: &str = "frame";
+
+/// A per-image tensor of `dtype` over `[patches, ..trailing]`, padded to the step's patch count.
+fn patch_input(id: InputId, tag: &str, dtype: DType, trailing: Vec<usize>) -> RequestInput {
+    let pad = match dtype {
+        DType::I32 => PadValue::I32(0),
+        _ => PadValue::F32(0.0),
+    };
+    RequestInput::new(
+        id,
+        SlotKey::new(Slot::Activation, Some(tag)),
+        RequestForm::new(
+            dtype,
+            Per::Row {
+                trailing,
+                padded: true,
+                valid: None,
+            },
+            pad,
+        ),
+    )
+}
 
 /// The base of the vision tower's rotary frequencies (`VisionRotaryEmbedding`'s default).
 const ROTARY_THETA: f32 = 10_000.0;
@@ -305,6 +336,22 @@ pub struct PatchGeometry {
 }
 
 impl PatchGeometry {
+    /// The request values of one image's encode row: its patch `pixels` (`[patches, patch_dim]`) and the
+    /// four grid tensors, which the driver binds beside it.
+    pub fn inputs(&self, pixels: HostTensor) -> RequestInputs {
+        let patches = self.pos_h.len();
+        let ints =
+            |values: &[i32]| InputValue::Row(HostTensor::i32(vec![patches], values.to_vec()));
+        let floats =
+            |values: &[f32]| InputValue::Row(HostTensor::f32(vec![patches], values.to_vec()));
+        RequestInputs::none()
+            .with(PIXELS, InputValue::Row(pixels))
+            .with(POS_H, ints(&self.pos_h))
+            .with(POS_W, ints(&self.pos_w))
+            .with(WINDOW_IDS, floats(&self.window))
+            .with(FRAME_IDS, floats(&self.frame))
+    }
+
     fn new([t, h, w]: [usize; 3], merge: usize, window_cells: usize) -> Result<Self, GridError> {
         if t == 0 || h == 0 || w == 0 {
             return Err(GridError::Zero([t, h, w]));
@@ -444,6 +491,7 @@ pub struct Qwen25VlVision {
     merger_out_bias: Weight,
     blocks: Vec<Block>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -489,6 +537,29 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
     };
     let (patch, merger_norm, merger_up, merger_up_bias, merger_out, merger_out_bias) =
         rest().map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .input(patch_input(
+            PIXELS,
+            PIXELS_TAG,
+            DType::F32,
+            vec![p.patch_dim()],
+        ))
+        .input(patch_input(POS_H, POS_H_TAG, DType::I32, vec![]))
+        .input(patch_input(POS_W, POS_W_TAG, DType::I32, vec![]))
+        .input(patch_input(WINDOW_IDS, WINDOW_TAG, DType::F32, vec![]))
+        .input(patch_input(FRAME_IDS, FRAME_TAG, DType::F32, vec![]))
+        .encode(
+            [PIXELS, POS_H, POS_W, WINDOW_IDS, FRAME_IDS]
+                .into_iter()
+                .fold(
+                    ProgramSpec::new(
+                        ProgramId::ENCODE,
+                        ModelOutput::Hidden { width: p.out_width },
+                    ),
+                    |program, input| program.reading(input, RequestPresence::Required),
+                ),
+        )
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: 0,
@@ -496,7 +567,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: BTreeSet::new(),
         bos: None,
         prompt_bos: None,
-        output: ModelOutput::Hidden { width: p.out_width },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -511,6 +581,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         merger_out_bias,
         blocks,
         config,
+        schema,
     }))
 }
 
@@ -625,18 +696,17 @@ impl Model for Qwen25VlVision {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        if phase != Phase::Encode {
-            return Err(TraceError::PhaseUnsupported {
-                family: FAMILY,
-                phase,
-            });
-        }
+        let shape = spec.shape;
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: FAMILY,
@@ -658,14 +728,14 @@ impl Model for Qwen25VlVision {
         let slot =
             |tag, ty: TensorType| Ok::<_, TraceError>(b.slot_named(Slot::Activation, tag, ty)?);
         let pixels = slot(
-            PIXELS_SLOT,
+            PIXELS_TAG,
             TensorType::f32(vec![rows, patches, p.patch_dim()]),
         )?;
         let ids = vec![rows, patches];
-        let pos_h = slot(POS_H_SLOT, TensorType::new(ids.clone(), DType::I32))?;
-        let pos_w = slot(POS_W_SLOT, TensorType::new(ids.clone(), DType::I32))?;
-        let window = slot(WINDOW_SLOT, TensorType::f32(ids.clone()))?;
-        let frame = slot(FRAME_SLOT, TensorType::f32(ids))?;
+        let pos_h = slot(POS_H_TAG, TensorType::new(ids.clone(), DType::I32))?;
+        let pos_w = slot(POS_W_TAG, TensorType::new(ids.clone(), DType::I32))?;
+        let window = slot(WINDOW_TAG, TensorType::f32(ids.clone()))?;
+        let frame = slot(FRAME_TAG, TensorType::f32(ids))?;
         let window_mask = same_id_mask(&b, window)?;
         let frame_mask = same_id_mask(&b, frame)?;
         let rotary = self.rotary(&b, pos_h, pos_w)?;
@@ -793,7 +863,8 @@ mod tests {
     use super::*;
     use crate::components::standard::oracle::{self, assert_matches_f64};
     use crate::components::testing::{build as built, values};
-    use crate::model::{KvLayout, LogitRows};
+    use crate::io::ProgramId;
+    use crate::model::{LogitRows, StepShape, StepSpec};
 
     /// The image the rows below run: two frames of a 6 x 8 patch grid, so 3 x 4 merge cells per frame
     /// against 2 x 2-cell windows (windows cut by the bottom edge), 96 patches in all.
@@ -977,14 +1048,12 @@ mod tests {
     }
 
     fn encode_shape(rows: usize, patches: usize) -> StepShape {
-        StepShape {
-            rows: NonZeroUsize::new(rows).unwrap(),
-            tokens: NonZeroUsize::new(patches).unwrap(),
-            capacity: NonZeroUsize::new(patches).unwrap(),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::All,
-            hidden: None,
-        }
+        StepShape::new(
+            NonZeroUsize::new(rows).unwrap(),
+            NonZeroUsize::new(patches).unwrap(),
+            NonZeroUsize::new(patches).unwrap(),
+        )
+        .with_logits(LogitRows::All)
     }
 
     /// The tower of `fx` on one image of `grid`: the step's merged rows in the processor's order.
@@ -999,8 +1068,7 @@ mod tests {
         let geometry = params.geometry(grid).unwrap();
         let g = model
             .trace(
-                Phase::Encode,
-                encode_shape(1, geometry.patches()),
+                &StepSpec::encode(encode_shape(1, geometry.patches())),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -1170,7 +1238,7 @@ mod tests {
         );
     }
 
-    /// A phase other than `Encode`, a patch count the merge does not divide and one past the cap are
+    /// A program other than `encode`, a patch count the merge does not divide and one past the cap are
     /// typed refusals.
     #[test]
     fn a_step_it_cannot_trace_is_a_typed_refusal() {
@@ -1178,19 +1246,17 @@ mod tests {
         let model = built(&ENTRY, &fx.raw(), &fx.store);
         assert!(matches!(
             model.trace(
-                Phase::Prefill,
-                encode_shape(1, 16),
+                &StepSpec::step(encode_shape(1, 16)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
-            Err(TraceError::PhaseUnsupported {
-                phase: Phase::Prefill,
+            Err(TraceError::ProgramUnsupported {
+                program: ProgramId::STEP,
                 ..
             })
         ));
         assert!(matches!(
             model.trace(
-                Phase::Encode,
-                encode_shape(1, 18),
+                &StepSpec::encode(encode_shape(1, 18)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported {
@@ -1200,8 +1266,7 @@ mod tests {
         ));
         assert!(matches!(
             model.trace(
-                Phase::Encode,
-                encode_shape(1, MAX_PATCHES + 4),
+                &StepSpec::encode(encode_shape(1, MAX_PATCHES + 4)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported {

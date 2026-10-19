@@ -9,7 +9,7 @@ mod common;
 use common::{slot_maps, step, token_pos, zero_state};
 use poot_graph_ir::Graph;
 use poot_graph_plan::passes_without_target;
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step as step_shape};
 use poot_models::test_support::weight_map::MappedModel;
 use poot_tensor::HostTensor;
@@ -39,8 +39,7 @@ fn tiny() -> MappedModel {
 fn decode_graph(m: &MappedModel, cap: usize) -> Graph {
     m.model
         .trace(
-            Phase::Decode,
-            step_shape(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step_shape(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -50,8 +49,7 @@ fn decode_graph(m: &MappedModel, cap: usize) -> Graph {
 fn verify_graph(m: &MappedModel, l: usize, cap: usize) -> Graph {
     m.model
         .trace(
-            Phase::Prefill,
-            step_shape(1, l, cap, LogitRows::All),
+            &StepSpec::step(step_shape(1, l, cap, LogitRows::All)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -92,8 +90,7 @@ fn paged_decode_matches_contiguous_decode_cpu() {
     let paged = m
         .model
         .trace(
-            Phase::Decode,
-            paged_step(1, 1, cap, cap, LogitRows::Last),
+            &StepSpec::step(paged_step(1, 1, cap, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();

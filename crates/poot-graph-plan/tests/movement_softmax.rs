@@ -4,7 +4,7 @@
 //! poot-eval must never depend on poot-graph-plan (its own architecture test); this crate already
 //! dev-depends on poot-eval, so an integration test here can drive both.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, UnOp};
 use poot_graph_ir::types::TensorType;
@@ -64,7 +64,7 @@ fn reshape_collapse_is_value_identical() {
         );
         m
     };
-    let opts = || EvalOptions::new(EvalBudget::UNBOUNDED);
+    let opts = || EvalOptions::default();
     let base = eval(&g, &inputs, opts())
         .unwrap()
         .output
@@ -239,7 +239,7 @@ fn fused_equals_unfused_over_random_movement_graphs() {
         if !g.eqns().is_empty() {
             had_eqns += 1;
         }
-        let base = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let base = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -261,7 +261,7 @@ fn fused_equals_unfused_over_random_movement_graphs() {
             ),
             ("fuse(cse).unwrap()", fuse(&cse(&g).unwrap()).unwrap()),
         ] {
-            let got = eval(&gg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let got = eval(&gg, &inputs, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
@@ -326,12 +326,12 @@ fn fused_multi_axis_broadcast_leaf_matches_unfused() {
             fg.eqns().len()
         );
 
-        let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let unfused = eval(&g, &inputs, EvalOptions::default())
             .expect("eval unfused")
             .output
             .into_host()
             .unwrap();
-        let fused = eval(&fg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let fused = eval(&fg, &inputs, EvalOptions::default())
             .expect("eval fused")
             .output
             .into_host()
@@ -379,7 +379,7 @@ fn fused_pointwise_over_empty_tensor_edges() {
         inputs.insert(x.id(), Value::from(HostTensor::f32(shape.clone(), vec![])));
         inputs.insert(y.id(), Value::from(HostTensor::f32(shape.clone(), vec![])));
 
-        let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let unfused = eval(&g, &inputs, EvalOptions::default())
             .unwrap_or_else(|e| {
                 panic!("shape {shape:?}: eval (unfused) failed on an empty tensor: {e}")
             })
@@ -397,7 +397,7 @@ fn fused_pointwise_over_empty_tensor_edges() {
         );
 
         let fg = fuse(&cse(&g).unwrap()).unwrap();
-        let fused = eval(&fg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let fused = eval(&fg, &inputs, EvalOptions::default())
             .unwrap_or_else(|e| {
                 panic!("shape {shape:?}: eval (fused) failed on an empty tensor: {e}")
             })
@@ -420,13 +420,11 @@ fn compile_chooses_the_generated_tiled_gemm_for_m_over_one_only() {
     // matmul, and records it as the plan's kernel choice (the graph keeps a plain `MatMul`). A decode
     // GEMV (M==1) does not take it.
     use poot_graph_ir::op::OpKind;
-    use poot_graph_plan::{
-        CompileOptions, KernelChoice, Target, compile, production_plan::Submission,
-    };
+    use poot_graph_plan::{CompileOptions, KernelChoice, Target, compile};
     use poot_kernelgen::{ContractionSpec, KernelRequest};
     use poot_target::{AmdArch, Backend};
 
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
     let target = Target::Gpu {
         backend,

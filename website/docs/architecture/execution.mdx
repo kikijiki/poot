@@ -51,20 +51,19 @@ complete token step is not allocation-free and need not be one submit.
 A backend-neutral contract now lives in `poot-executor`: one generic `Engine<D>` over a thin
 per-backend `Device` trait implements an object-safe `Executor` (`target_set`, `load_weights`,
 `add_entry`, `step`, `reset_state`, `remove_entry`, `stats`, `unload`), so the driver above it never
-branches on a backend. `Submission::Replay` is the contract's only admitted mode; `Submission::Eager`
-is a typed refusal there. The three `Device` implementations are `poot-wgpu-device`'s `WgpuDevice`,
+branches on a backend. A step is recorded once and replayed. The three `Device` implementations are `poot-wgpu-device`'s `WgpuDevice`,
 `poot-rocm-device`'s `RocmDevice` and `poot-ptx-device`'s `PtxDevice`. `load_weights` takes the weight store and a weight map, which binds each weight a graph names by its typed role; a const the map
 does not name is unbound, even when a store key spells its name.
 
 The `poot-llm` driver drives this contract on every backend ([Models, Registry and the
 Driver](./driver.mdx)): `Driver::new` loads a `ModelHandle`'s weights once, as one executable (through the
 model's weight map), and each step shape it needs is an entry added to that executable, from the family's
-`trace` for that shape, compiled for the executor's target. Entries are keyed by phase, step shape and sampling
-suffix, so a token, a position or a sampler parameter never makes a new one. Every causal family that generates is registered and runs on the driver, and
-so do the rest: `Driver::encode` runs an `Encode` step (a BERT encoder's embeddings and reranking, a decoder's
-hidden states, a vision tower's frames). Token-row shapes are prepared up front by `Driver::prepare_encode` and a step never compiles one; a vision tower's frames still prepare on first use, and a prompt can supply embedding rows in place of some tokens'
-(`Driver::generate_with_embeds`), which is how the vision-language caption path scatters its image rows. Those
-rows and a frame's pixels are bound by value on every step, never baked into a program. Greedy and plain-temperature generation (including top-k/top-p/min-p)
+`trace` for that shape, compiled for the executor's target. Entries are keyed by program, step shape, sampling
+suffix and the carried inputs they bind, so a token, a position or a sampler parameter never makes a new one. Every causal family that generates is registered and runs on the driver, and
+so do the rest: `Driver::encode` runs an `encode` step (a BERT encoder's embeddings and reranking, a decoder's
+hidden states, a vision tower's frames). Token-row shapes are prepared up front by `Driver::prepare_encode` and a step never compiles one; a vision tower's frames still prepare on first use, and a prompt can supply values for the inputs its model declares, such as embedding rows in place of some tokens'
+(`Driver::generate_with_inputs`), which is how the vision-language caption path scatters its image rows. Those
+rows and a frame's pixels are bound by value, never baked into a program. Greedy and plain-temperature generation (including top-k/top-p/min-p)
 pick the next token on-device: a sampling step is appended to the decode graph itself, and the host
 reads back only the chosen token id and a non-finite flag, not the full logits. A request with logit-bias/penalty, logprob recording, or a guided-decoding constraint still reads the full logits
 back and picks on the host, since those transforms are host-side. `poot-serve` runs the driver in one scheduling loop that admits requests into

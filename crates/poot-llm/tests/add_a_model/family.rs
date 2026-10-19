@@ -26,11 +26,11 @@ use poot_models::components::norm::{NormKind, NormParams};
 use poot_models::components::rope::RopeParams;
 use poot_models::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    decoder_program, standard_layer, standard_stack,
 };
+use poot_models::io::ModelSchema;
 use poot_models::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_quant::weights::{
@@ -205,6 +205,7 @@ struct Neoxish {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -224,6 +225,9 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -231,7 +235,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -241,6 +244,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -249,18 +253,18 @@ impl Model for Neoxish {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];

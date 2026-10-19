@@ -5,13 +5,13 @@
 use super::*;
 
 use poot_executor::StepInputs;
-use poot_executor_parity::assert_close as assert_tier2;
 use poot_graph_ir::analysis::{Tier2Class, dispatch_count};
 use poot_graph_ir::op::{BinOp, ContractionHead, UnOp};
 use poot_graph_ir::types::Scalar;
-use poot_graph_plan::{CompileOptions, compile, production_plan::Submission};
+use poot_graph_plan::{CompileOptions, compile};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
+use poot_test_util::assert_close_scaled;
 
 /// `tanh(head + bias) * 0.5 + residual`: a bias, a representative pointwise activation, a literal scale and a
 /// residual add, each value read once, so the whole chain is one epilogue.
@@ -99,7 +99,7 @@ fn compiled(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::Progr
     compile(
         g,
         target,
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("the graph compiles")
 }
@@ -145,13 +145,13 @@ fn assert_fused_matches_oracle(
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let want = eval(g, &oracle_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(g, &oracle_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
         .unwrap();
     assert_eq!(fused.shape(), want.shape(), "{label}: shape");
-    assert_tier2(
+    assert_close_scaled(
         fused.as_f32().unwrap(),
         want.as_f32().unwrap(),
         class.tolerance(),
@@ -387,7 +387,7 @@ fn a_narrow_head_is_refused_by_name_on_wgpu() {
     let Err(error) = poot_graph_plan::compile(
         &g,
         &spirv_fixture_target(),
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     ) else {
         panic!("a bf16 head must not plan on wgpu");
     };

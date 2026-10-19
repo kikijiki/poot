@@ -6,16 +6,15 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::model::{KvLayout, LogitRows, Model, Phase, StepShape};
+use crate::model::{LogitRows, Model, StepShape, StepSpec};
 use crate::registry::{RawConfig, Registry};
 use poot_executor::{ExecError, Executor, NoSync, StepInputs};
-use poot_executor_parity::assert_close;
 use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::{Graph, Slot, SlotKey};
 use poot_graph_plan::{
     CompileOptions, Target, WeightFormats, bind_packed_weights, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{
@@ -24,6 +23,7 @@ use poot_quant::weights::{
 };
 use poot_quant::{PackedPayload, StoredBytes};
 use poot_tensor::{DType, HostTensor, HostView};
+use poot_test_util::assert_close_scaled;
 
 /// A qwen2 checkpoint's dimensions.
 #[derive(Clone, Copy, Debug)]
@@ -333,8 +333,6 @@ pub fn fused(m: &MappedModel) -> (Arc<WeightStore>, Arc<WeightMap>) {
 /// One step of `tokens` new tokens from absolute position `start`.
 #[derive(Clone, Debug)]
 pub struct Step {
-    /// The phase the step traces.
-    pub phase: Phase,
     /// The new token ids.
     pub ids: Vec<i32>,
     /// The absolute position of the first new token.
@@ -347,10 +345,9 @@ pub struct Step {
 impl Step {
     /// A single-row step of `ids` from absolute position `start`, with its token and position inputs
     /// encoded once.
-    pub fn new(phase: Phase, ids: &[i32], start: usize) -> Self {
+    pub fn new(ids: &[i32], start: usize) -> Self {
         let pos: Vec<i32> = (start..start + ids.len()).map(|p| p as i32).collect();
         Self {
-            phase,
             ids: ids.to_vec(),
             start,
             shape: [1, ids.len()],
@@ -391,25 +388,20 @@ impl Step {
     }
 }
 
-/// `model`'s graph for `phase` with `tokens` new tokens over a cache of `capacity`, logits at every
-/// token, its packed weights bound from `map`.
-pub fn trace(
-    model: &dyn Model,
-    map: &WeightMap,
-    phase: Phase,
-    tokens: usize,
-    capacity: usize,
-) -> Graph {
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(capacity).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
-    };
+/// `model`'s graph for a `step` program of `tokens` new tokens over a cache of `capacity`, logits at
+/// every token, its packed weights bound from `map`.
+pub fn trace(model: &dyn Model, map: &WeightMap, tokens: usize, capacity: usize) -> Graph {
+    let shape = StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(tokens).unwrap(),
+        NonZeroUsize::new(capacity).unwrap(),
+    )
+    .with_logits(LogitRows::All);
     let g = model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(
+            &StepSpec::step(shape),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     bind_packed_weights(&g, &WeightFormats::from_weight_map(map)).unwrap()
 }
@@ -423,7 +415,7 @@ pub fn compile(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap_or_else(|e| panic!("compile: {e}"))
 }
@@ -441,7 +433,7 @@ pub struct Run {
 }
 
 /// Load `store` bound through `map` on `exec`, then run `steps` in order over carried state (zero at
-/// the start), one entry per distinct (phase, token count), each traced over [`CAPACITY`].
+/// the start), one entry per distinct token count, each traced over [`CAPACITY`].
 /// `prepare` rewrites each traced graph before it compiles (identity, or a legalize for a fixture
 /// cap). Returns each step's logits and the class of the programs it ran.
 pub fn run_steps(
@@ -458,11 +450,11 @@ pub fn run_steps(
     let mut logits = Vec::with_capacity(steps.len());
     let mut class = Tier2Class::BitExact;
     for step in steps {
-        let key = (step.phase, step.ids.len());
+        let key = step.ids.len();
         let entry = match entries.get(&key) {
             Some(&entry) => entry,
             None => {
-                let g = prepare(trace(model, &map, step.phase, step.ids.len(), CAPACITY));
+                let g = prepare(trace(model, &map, step.ids.len(), CAPACITY));
                 let program = compile(&g, target);
                 class = class.max(program.numerics_class());
                 let entry = exec.add_entry(exe, &program)?;
@@ -483,7 +475,7 @@ pub fn run_steps(
 pub fn decode_steps(ids: &[i32]) -> Vec<Step> {
     ids.iter()
         .enumerate()
-        .map(|(pos, &id)| Step::new(Phase::Decode, &[id], pos))
+        .map(|(pos, &id)| Step::new(&[id], pos))
         .collect()
 }
 
@@ -492,7 +484,7 @@ pub fn chunked_steps(prompt: &[i32], chunk: usize, decode: &[i32]) -> Vec<Step> 
     let mut steps: Vec<Step> = prompt
         .chunks(chunk)
         .scan(0, |start, ids| {
-            let step = Step::new(Phase::Prefill, ids, *start);
+            let step = Step::new(ids, *start);
             *start += ids.len();
             Some(step)
         })
@@ -501,7 +493,7 @@ pub fn chunked_steps(prompt: &[i32], chunk: usize, decode: &[i32]) -> Vec<Step> 
         decode
             .iter()
             .enumerate()
-            .map(|(i, &id)| Step::new(Phase::Decode, &[id], prompt.len() + i)),
+            .map(|(i, &id)| Step::new(&[id], prompt.len() + i)),
     );
     steps
 }
@@ -529,10 +521,7 @@ pub fn check_matches_oracle(
     bind: &dyn Fn(&WeightMap, &WeightStore) -> WeightMap,
 ) {
     let m = qwen2(DIMS, projections, DType::BF16);
-    let steps = [
-        Step::new(Phase::Prefill, &[3, 1, 4], 0),
-        Step::new(Phase::Decode, &[1], 3),
-    ];
+    let steps = [Step::new(&[3, 1, 4], 0), Step::new(&[1], 3)];
     let got = run_steps(
         exec,
         target,
@@ -546,13 +535,7 @@ pub fn check_matches_oracle(
     let got_class = got.class;
     let mut state: Vec<HostTensor> = Vec::new();
     for (step, got) in steps.iter().zip(&got.logits) {
-        let g = trace(
-            m.model.as_ref(),
-            &m.map,
-            step.phase,
-            step.ids.len(),
-            CAPACITY,
-        );
+        let g = trace(m.model.as_ref(), &m.map, step.ids.len(), CAPACITY);
         if state.is_empty() {
             state = g
                 .state()
@@ -561,11 +544,11 @@ pub fn check_matches_oracle(
         }
         let (want, next) = oracle(&g, &m.store, &m.map, &step.slots(), &state);
         state = next;
-        assert_close(
+        assert_close_scaled(
             got,
             want.as_f32().expect("f32 logits"),
             got_class.tolerance(),
-            &format!("{projections:?} {:?} at {}", step.phase, step.start),
+            &format!("{projections:?} at {}", step.start),
         );
     }
 }
@@ -602,7 +585,7 @@ pub fn check_chunked_prefill(exec: &mut dyn Executor, target: Target) {
         let (got, class) = run(exec, &chunked_steps(&prompt, chunk, &decode));
         assert_eq!(got.len(), reference.len());
         for (position, (got, want)) in got.iter().zip(&reference).enumerate() {
-            assert_close(
+            assert_close_scaled(
                 got,
                 want,
                 class.max(reference_class).tolerance(),
@@ -618,10 +601,7 @@ pub fn check_chunked_prefill(exec: &mut dyn Executor, target: Target) {
 pub fn check_fused_views(exec: &mut dyn Executor, target: Target, projections: Projections) {
     let m = qwen2(DIMS, projections, DType::BF16);
     let (store, map) = fused(&m);
-    let steps = [
-        Step::new(Phase::Prefill, &[3, 1, 4], 0),
-        Step::new(Phase::Decode, &[1], 3),
-    ];
+    let steps = [Step::new(&[3, 1, 4], 0), Step::new(&[1], 3)];
     let run = |exec: &mut dyn Executor, store, map| {
         run_steps(exec, target, m.model.as_ref(), store, map, &steps, &|g| g)
             .unwrap_or_else(|e| panic!("{projections:?}: {e}"))
@@ -650,10 +630,7 @@ pub const SPLIT_LIMIT: u64 = 4096;
 pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
     // An F32 embedding: its hosted rows are an F32 slot, so no kernel computes in bf16 on the embed path.
     let m = qwen2(DIMS, Projections::Bf16, DType::F32);
-    let steps = [
-        Step::new(Phase::Prefill, &[3, 1, 4], 0),
-        Step::new(Phase::Decode, &[1], 3),
-    ];
+    let steps = [Step::new(&[3, 1, 4], 0), Step::new(&[1], 3)];
     let Target::Gpu { mut caps, .. } = target else {
         panic!("the split-head check legalizes against GPU limits; {target:?} has none");
     };
@@ -710,7 +687,7 @@ pub fn check_split_head(exec: &mut dyn Executor, target: Target) {
     };
     let tolerance = whole.class.max(chunked.class).tolerance();
     for (step, (got, want)) in chunked.logits.iter().zip(&whole.logits).enumerate() {
-        assert_close(got, want, tolerance, &format!("split head, step {step}"));
+        assert_close_scaled(got, want, tolerance, &format!("split head, step {step}"));
         assert_eq!(
             greedy(got),
             greedy(want),
@@ -758,7 +735,7 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
         .unwrap();
     let map = Arc::new(model.weights().clone());
 
-    let g = trace(model.as_ref(), &map, Phase::Decode, 1, CAPACITY);
+    let g = trace(model.as_ref(), &map, 1, CAPACITY);
     let exe = exec
         .load_weights(Arc::clone(&store), Arc::clone(&map))
         .unwrap();
@@ -768,10 +745,7 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
         .state()
         .map(|(input, _)| HostTensor::zeros(g.aval(input).shape.clone()))
         .collect();
-    for step in [
-        Step::new(Phase::Decode, &[3], 0),
-        Step::new(Phase::Decode, &[1], 1),
-    ] {
+    for step in [Step::new(&[3], 0), Step::new(&[1], 1)] {
         let got = exec
             .step(exe, entry, &step.inputs(), &mut NoSync)
             .unwrap()
@@ -779,7 +753,7 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
             .unwrap();
         let (want, next) = oracle(&g, &store, &map, &step.slots(), &state);
         state = next;
-        assert_close(
+        assert_close_scaled(
             got.as_f32().unwrap(),
             want.as_f32().unwrap(),
             program.numerics_class().tolerance(),

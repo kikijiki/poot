@@ -58,20 +58,21 @@ use std::sync::Arc;
 
 use poot_executor::ExecutableId;
 use poot_graph_plan::WeightFormats;
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::io::{InputSet, RequestInputs};
+use poot_models::model::{KvLayout, LogitRows, StepShape};
 
+use super::bind::{Binder, PassInput, RequestFrame, StepColumns};
 use super::chunks::Piece;
 use super::error::{
     DraftMismatch, DriverError, PreparedSetRefusal, SpeculationRefusal, Unsupported,
 };
 use super::handle::ModelHandle;
 use super::lora::GenerationId;
+use super::sequences::Serving;
 use super::snapshot::copy_rows;
-use super::step::{Lane, Readback, RowPlan, SeqId, StepRow, serving_phase};
+use super::step::{Lane, Readback, RowPlan, SeqId, StepRow};
 use super::suffix::{self, Head};
-use super::{
-    Driver, EntryKey, ModelRole, ServingShapes, SlotRole, StateResidency, StepData, window_wall,
-};
+use super::{Driver, EntryKey, ModelRole, Program, ServingShapes, StateResidency, window_wall};
 use crate::core::sampler::{Sampler, SamplerFault};
 use poot_text::TextCodec;
 
@@ -96,7 +97,7 @@ pub enum DraftPolicy {
         /// Most drafts proposed per round.
         k: NonZeroUsize,
     },
-    /// Propose with the served model's own multi-token-prediction layer (`Phase::Mtp`), `k` tokens a
+    /// Propose with the served model's own multi-token-prediction layer (the `draft` program), `k` tokens a
     /// round: one layer over the target's hidden state and the host-known token that follows it,
     /// chained `k` deep. `k` is required: the evidence says 1 for GLM and 2 to 3 are worth
     /// measuring, so no value is the default. The layer runs on the target's executable, reads the
@@ -175,6 +176,10 @@ pub enum NotSpeculated {
     NoRoom,
     /// The policy found nothing to propose (prompt lookup: no earlier match).
     NoProposal,
+    /// The sequence carries request inputs the draft cannot read: a draft program or a draft model
+    /// serves a sequence only if it reads every input the sequence carries, and its entries bind no
+    /// carriable input.
+    Inputs,
 }
 
 /// Rounds the driver's policy ran, by outcome: the engine's own acceptance accounting.
@@ -192,6 +197,8 @@ pub struct SpeculationStats {
     pub skipped_no_room: u64,
     /// Decode rows that decoded one token because nothing was proposed.
     pub skipped_no_proposal: u64,
+    /// Decode rows that decoded one token because their sequence carries inputs the draft cannot read.
+    pub skipped_inputs: u64,
     /// Verified rows that rejected a draft, so their recurrent state was restored from its snapshot
     /// and replayed. Zero for positional state.
     pub restored: u64,
@@ -213,6 +220,7 @@ impl SpeculationStats {
             RowSpeculation::NotSpeculated(NotSpeculated::NoProposal) => {
                 self.skipped_no_proposal += 1;
             }
+            RowSpeculation::NotSpeculated(NotSpeculated::Inputs) => self.skipped_inputs += 1,
         }
     }
 
@@ -225,6 +233,7 @@ impl SpeculationStats {
             skipped_sampler: self.skipped_sampler - earlier.skipped_sampler,
             skipped_no_room: self.skipped_no_room - earlier.skipped_no_room,
             skipped_no_proposal: self.skipped_no_proposal - earlier.skipped_no_proposal,
+            skipped_inputs: self.skipped_inputs - earlier.skipped_inputs,
             restored: self.restored - earlier.restored,
             replayed: self.replayed - earlier.replayed,
         }
@@ -450,7 +459,7 @@ pub(super) struct SpecRow {
     pub(super) proposal: Proposal,
 }
 
-impl Driver {
+impl Driver<Serving> {
     /// Refuse a draft the target cannot verify, before anything compiles or uploads.
     pub(super) fn check_draft(&self) -> Result<(), DriverError> {
         let DraftPolicy::DraftModel { handle: draft, .. } = &self.speculation.policy else {
@@ -462,10 +471,10 @@ impl Driver {
                 draft: drafted.vocab,
                 target: target.vocab,
             })
-        } else if drafted.max_positions < self.options.capacity.get() {
+        } else if drafted.max_positions < self.settings.options.capacity.get() {
             Some(DraftMismatch::Positions {
                 draft: drafted.max_positions,
-                capacity: self.options.capacity.get(),
+                capacity: self.settings.options.capacity.get(),
             })
         } else if !same_token_ids(draft.text(), self.handle.text(), target.vocab) {
             Some(DraftMismatch::Tokens)
@@ -480,12 +489,39 @@ impl Driver {
         }
     }
 
+    /// Whether the draft policy serves a sequence that carries `inputs`: a draft program or a draft
+    /// model must read every input the sequence carries, and the entries it runs bind no carriable
+    /// input (a sequence that carries one is not speculated). Prompt lookup reads tokens only.
+    pub(super) fn drafts_for(&self, inputs: &RequestInputs) -> bool {
+        let program = match &self.speculation.policy {
+            DraftPolicy::Off | DraftPolicy::PromptLookup { .. } => return true,
+            DraftPolicy::DraftModel { handle, .. } => handle.model().schema().step(),
+            DraftPolicy::Mtp { .. } => self.handle.model().schema().draft(),
+        };
+        let schema = match &self.speculation.policy {
+            DraftPolicy::DraftModel { handle, .. } => handle.model().schema(),
+            _ => self.handle.model().schema(),
+        };
+        let Some(program) = program else {
+            return inputs.is_empty();
+        };
+        let carriable = schema.carriable(program);
+        inputs.iter().all(|(id, _)| {
+            program.presence_of(id).is_some()
+                && schema
+                    .index_of(id)
+                    .is_some_and(|index| !carriable.contains(index))
+        })
+    }
+
     /// Refuse speculation on a model whose recurrent state the rollback cannot cover, read from the
     /// state roles and the config of what compiled. The snapshot copies every `Recurrent` pair of the
     /// program, so the one case left is a granule above one token, which the replay chunk cannot
     /// honor.
     pub(super) fn check_speculation_state(&self) -> Result<(), DriverError> {
-        if self.speculation.policy.caps().is_none() || self.residency != StateResidency::Recurrent {
+        if self.speculation.policy.caps().is_none()
+            || self.ledger.residency != StateResidency::Recurrent
+        {
             return Ok(());
         }
         let granule = self.handle.config().prefill_granule.get();
@@ -509,6 +545,7 @@ impl Driver {
         let formats = WeightFormats::from_weight_map(handle.model().weights());
         let weights = Arc::new(handle.model().weights().clone());
         let exe = self
+            .runtime
             .executor
             .load_weights(handle.shared_store().clone(), weights)?;
         self.speculation.draft = Some(DraftScope {
@@ -560,7 +597,7 @@ impl Driver {
                 // would fold into recurrent state, so a recurrent model's window is as wide as its
                 // drafts; its rows are grouped by width and each width is a prepared entry.
                 plan.feed.extend_from_slice(&proposal.drafts);
-                if self.residency != StateResidency::Recurrent {
+                if self.ledger.residency != StateResidency::Recurrent {
                     let window = self
                         .speculation
                         .policy
@@ -590,17 +627,17 @@ impl Driver {
     ) -> EntryKey {
         EntryKey {
             role,
-            phase: Phase::Decode,
-            shape: StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::MIN,
-                capacity: self.options.capacity,
-                kv,
-                logits: LogitRows::Last,
-                hidden: self.hidden_of(role),
-            },
+            program: Program::Step,
+            shape: StepShape::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::MIN,
+                self.settings.options.capacity,
+            )
+            .with_kv(kv)
+            .with_hidden(self.hidden_of(role)),
             head: Head::GREEDY,
             adapters,
+            carried: InputSet::EMPTY,
         }
     }
 
@@ -609,7 +646,7 @@ impl Driver {
     /// reads is indexed by the step's columns, so a left-padded row would hand the layer the wrong
     /// positions: both need every row at exactly its own width.
     pub(super) fn groups_rows_by_width(&self) -> bool {
-        self.residency == StateResidency::Recurrent
+        self.ledger.residency == StateResidency::Recurrent
             || matches!(self.speculation.policy, DraftPolicy::Mtp { .. })
     }
 
@@ -641,7 +678,7 @@ impl Driver {
         if !self.groups_rows_by_width() {
             return Ok(());
         }
-        let recurrent = self.residency == StateResidency::Recurrent;
+        let recurrent = self.ledger.residency == StateResidency::Recurrent;
         let sampled = shapes.heads.iter().any(|&head| head != Head::GREEDY);
         let heads: &[Head] = if sampled {
             &[Head::GREEDY, Head::Logits]
@@ -654,22 +691,23 @@ impl Driver {
                     self.prepared(self.rollback_key(role, kv, adapters))?;
                 }
             }
-            let capacity = self.options.capacity;
+            let capacity = self.settings.options.capacity;
             let hidden = self.hidden_of(ModelRole::Target);
             for &rows in shapes.rows {
                 let key = |width: usize, logits: LogitRows, head: Head| EntryKey {
                     role: ModelRole::Target,
-                    phase: serving_phase(width, logits),
-                    shape: StepShape {
+                    program: Program::Step,
+                    shape: StepShape::new(
                         rows,
-                        tokens: NonZeroUsize::new(width).expect("a width is at least one"),
+                        NonZeroUsize::new(width).expect("a width is at least one"),
                         capacity,
-                        kv,
-                        logits,
-                        hidden,
-                    },
+                    )
+                    .with_kv(kv)
+                    .with_logits(logits)
+                    .with_hidden(hidden),
                     head,
                     adapters,
+                    carried: InputSet::EMPTY,
                 };
                 if recurrent {
                     for width in 1..=speculation.k.get() {
@@ -728,17 +766,17 @@ impl Driver {
             for &width in &widths {
                 self.prepared(EntryKey {
                     role: ModelRole::Mtp,
-                    phase: Phase::Mtp,
-                    shape: StepShape {
+                    program: Program::Draft,
+                    shape: StepShape::new(
                         rows,
-                        tokens: NonZeroUsize::new(width).expect("a width is at least one"),
-                        capacity: self.options.capacity,
-                        kv,
-                        logits: LogitRows::Last,
-                        hidden,
-                    },
+                        NonZeroUsize::new(width).expect("a width is at least one"),
+                        self.settings.options.capacity,
+                    )
+                    .with_kv(kv)
+                    .with_hidden(hidden),
                     head: Head::GREEDY,
                     adapters: None,
+                    carried: InputSet::EMPTY,
                 })?;
             }
         }
@@ -753,13 +791,14 @@ impl Driver {
         adapter: Option<GenerationId>,
         slots: &[usize],
     ) -> Result<(), DriverError> {
-        let kv = self.serving.as_ref().expect("a step is served").kv();
+        let kv = self.state.kv();
         let key = self.rollback_key(role, kv, adapter);
         let entry = self
+            .ledger
             .entries
             .get(&key)
             .ok_or(PreparedSetRefusal::NotAdmitted {
-                phase: key.phase,
+                program: key.program,
                 shape: key.shape,
                 head: key.head,
                 adapters: key.adapters,
@@ -768,19 +807,20 @@ impl Driver {
         let rows = entry
             .slots
             .iter()
-            .find(|spec| spec.role == SlotRole::BeamRows)
+            .find(|spec| matches!(spec.binder, Binder::Pass(PassInput::BeamRows)))
             .expect("a rollback entry declares its row index")
             .shape[0];
-        let data = StepData {
+        let columns = StepColumns {
             beam_rows: copy_rows(rows, slots),
-            ..StepData::default()
+            ..StepColumns::default()
         };
         let started = self
+            .settings
             .time_phases
-            .then(|| self.executor.stats().timing.mark());
-        self.execute(&entry, &data)?;
+            .then(|| self.runtime.executor.stats().timing.mark());
+        self.execute(&entry, &columns, &RequestFrame::empty())?;
         if let Some(started) = started {
-            let wall = window_wall(&self.executor.stats().timing, &started);
+            let wall = window_wall(&self.runtime.executor.stats().timing, &started);
             let timing = &mut self.stats.rollback;
             let kind = match role {
                 ModelRole::Snapshot => &mut timing.snapshots,
@@ -799,10 +839,10 @@ impl Driver {
         rows: &[StepRow<'_>],
         plans: &[RowPlan],
     ) -> Result<(), DriverError> {
-        if self.residency != StateResidency::Recurrent {
+        if self.ledger.residency != StateResidency::Recurrent {
             return Ok(());
         }
-        let serving = self.serving.as_ref().expect("a step is served");
+        let serving = &self.state;
         let mut speculating = rows
             .iter()
             .zip(plans)
@@ -827,10 +867,10 @@ impl Driver {
         &mut self,
         settled: &[(SeqId, usize, usize, usize)],
     ) -> Result<(), DriverError> {
-        if self.residency != StateResidency::Recurrent || settled.is_empty() {
+        if self.ledger.residency != StateResidency::Recurrent || settled.is_empty() {
             return Ok(());
         }
-        let serving = self.serving.as_ref().expect("a step is served");
+        let serving = &self.state;
         let mut replays: Vec<(SeqId, usize, Vec<u32>)> = Vec::new();
         let mut slots = Vec::new();
         let mut adapter = None;
@@ -871,7 +911,6 @@ impl Driver {
                     start: *start,
                     picks: 0,
                     prefill: true,
-                    embeds: false,
                     spec: None,
                     not_speculated: None,
                 })
@@ -886,16 +925,17 @@ impl Driver {
                 ModelRole::Target,
                 group.len(),
                 width,
-                (false, false),
+                (false, InputSet::EMPTY),
                 Some(Head::GREEDY),
                 adapter,
             )?;
             let started = self
+                .settings
                 .time_phases
-                .then(|| self.executor.stats().timing.mark());
+                .then(|| self.runtime.executor.stats().timing.mark());
             self.run_plans(&mut lanes, &plans, key)?;
             if let Some(started) = started {
-                let wall = window_wall(&self.executor.stats().timing, &started);
+                let wall = window_wall(&self.runtime.executor.stats().timing, &started);
                 self.stats.rollback.replays.steps += 1;
                 self.stats.rollback.replays.wall += wall;
             }
@@ -905,9 +945,7 @@ impl Driver {
 
     /// The committed tokens of `seq`: its prompt and the generated tokens the caller has kept.
     fn committed(&self, seq: SeqId) -> Vec<u32> {
-        self.serving.as_ref().expect("a step is served").seqs[&seq]
-            .tokens
-            .clone()
+        self.state.seqs[&seq].tokens.clone()
     }
 
     /// Up to `room` draft tokens from the draft model. It first catches up to the committed tokens it
@@ -1006,11 +1044,17 @@ impl Driver {
             start: position,
             picks: usize::from(pick.is_some()),
             prefill: false,
-            embeds: false,
             spec: None,
             not_speculated: None,
         };
-        let key = self.step_entry(ModelRole::Draft, 1, 1, (false, false), Some(head), None)?;
+        let key = self.step_entry(
+            ModelRole::Draft,
+            1,
+            1,
+            (false, InputSet::EMPTY),
+            Some(head),
+            None,
+        )?;
         let mut idle = Sampler::greedy();
         let mut lanes = [Lane {
             seq,
@@ -1040,7 +1084,10 @@ impl Driver {
         if self.speculation.draft.is_none() {
             return Ok(());
         }
-        let prefilled: Vec<usize> = (0..plans.len()).filter(|&i| plans[i].prefill).collect();
+        let serving = &self.state;
+        let prefilled: Vec<usize> = (0..plans.len())
+            .filter(|&i| plans[i].prefill && self.drafts_for(&serving.seqs[&rows[i].seq].inputs))
+            .collect();
         let Some(width) = prefilled.iter().map(|&i| plans[i].feed.len()).max() else {
             return Ok(());
         };
@@ -1048,7 +1095,7 @@ impl Driver {
             ModelRole::Draft,
             prefilled.len(),
             width,
-            (false, false),
+            (false, InputSet::EMPTY),
             Some(Head::GREEDY),
             None,
         )?;
@@ -1068,7 +1115,6 @@ impl Driver {
                 start: plans[i].start,
                 picks: 0,
                 prefill: true,
-                embeds: false,
                 spec: None,
                 not_speculated: None,
             })
@@ -1098,7 +1144,7 @@ impl Driver {
             ModelRole::Mtp,
             seqs.len(),
             width,
-            (false, false),
+            (false, InputSet::EMPTY),
             Some(Head::GREEDY),
             None,
         )?;
@@ -1130,7 +1176,7 @@ impl Driver {
         rows: &[StepRow<'_>],
         plans: &[RowPlan],
     ) -> Result<HashMap<SeqId, Vec<u32>>, DriverError> {
-        let serving = self.serving.as_ref().expect("a step is served");
+        let serving = &self.state;
         // The row's sequence, the tokens it holds, how many drafts it may take, and what it has.
         let mut chains: Vec<(SeqId, usize, usize, Vec<u32>)> = Vec::new();
         for (row, plan) in rows.iter().zip(plans) {
@@ -1166,7 +1212,6 @@ impl Driver {
                         start: committed - 2 + drafts.len(),
                         picks: 1,
                         prefill: false,
-                        embeds: false,
                         spec: None,
                         not_speculated: None,
                     }
@@ -1201,10 +1246,13 @@ impl Driver {
         if !matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
             return Ok(());
         }
-        let serving = self.serving.as_ref().expect("a step is served");
+        let serving = &self.state;
         let mut covers: Vec<Cover> = Vec::new();
         for (row, plan) in rows.iter().zip(plans) {
             let seq = &serving.seqs[&row.seq];
+            if !self.drafts_for(&seq.inputs) {
+                continue;
+            }
             let picked = &seq.pending;
             let feed = if plan.prefill {
                 let n = plan.feed.len();
@@ -1233,7 +1281,6 @@ impl Driver {
                     feed,
                     start: plan.start,
                     prefill: true,
-                    embeds: false,
                     spec: None,
                     not_speculated: None,
                 },
@@ -1257,7 +1304,6 @@ impl Driver {
                     start: cover.plan.start,
                     picks: cover.plan.picks,
                     prefill: true,
-                    embeds: false,
                     spec: None,
                     not_speculated: None,
                 })

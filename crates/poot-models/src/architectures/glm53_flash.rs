@@ -12,24 +12,25 @@
 //! expert plus routed experts chosen by the sigmoid router with a selection-only bias
 //! ([`crate::components::moe`]); both gate with the clamped SwiGLU.
 //!
-//! One body traces every phase. The mixers carry their conv windows, matrix states and caches, so a
+//! One body traces every step shape. The mixers carry their conv windows, matrix states and caches, so a
 //! prefill chunk continues from the positions already written and one token is a decode step. Every
 //! dimension, count and the schedule is the checkpoint's: a fine-tune with fewer layers or experts
 //! is the same family.
 //!
-//! The checkpoint's multi-token-prediction layer is traced by [`Phase::Mtp`] ([`mtp`]): a DSA block
+//! The checkpoint's multi-token-prediction layer is traced by the `draft` program ([`mtp`]): a DSA block
 //! over the hidden-state carry and a host token. A checkpoint that stores no such layer, or more than
 //! one (the reference cycles them by draft step, which a step shape does not name), refuses the
-//! phase typed.
+//! program typed.
 
 use poot_graph_ir::{Builder, Graph};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_tensor::DType;
 
-use crate::components::standard::{Step, check_mtp_step};
-use crate::model::{
-    FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape, TraceError,
+use crate::components::standard::{
+    Step, check_draft_step, check_step, decoder_program, draft_program,
 };
+use crate::io::{ModelSchema, ProgramId, StateSpec};
+use crate::model::{FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
 
@@ -62,12 +63,19 @@ pub struct Glm53Flash {
     weights: WeightMap,
     tower: stack::Tower,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
     let p = Glm53Config::from_raw(raw)?;
     let weights = names::weights_of(&p, store)?;
     let tower = stack::Tower::new(&weights, &p).map_err(|e| e.for_family(FAMILY))?;
+    let mut schema =
+        ModelSchema::builder().step(decoder_program(p.vocab).carrying(StateSpec::recurrent("kda")));
+    if tower.has_draft(&p) {
+        schema = schema.draft(draft_program(p.vocab));
+    }
+    let schema = schema.build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -75,7 +83,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: std::num::NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -84,6 +91,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         weights,
         tower,
         config,
+        schema,
     }))
 }
 
@@ -92,27 +100,36 @@ impl Model for Glm53Flash {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_mtp_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        let draft = spec.program == ProgramId::DRAFT;
+        if draft {
+            check_draft_step(FAMILY, shape, p.max_positions)?;
+        } else {
+            check_step(FAMILY, shape, p.max_positions)?;
+        }
         if let Some(moe) = &p.moe {
             crate::components::moe::check_step(FAMILY, shape, moe)?;
         }
         let step = Step::new(&b, shape)?;
-        let logits = match phase {
-            Phase::Mtp => {
-                self.tower
-                    .trace_mtp(&b, &step, p)?
-                    .ok_or(TraceError::PhaseUnsupported {
-                        family: FAMILY,
-                        phase,
-                    })?
-            }
-            _ => self.tower.trace(&b, &step, p)?,
+        let logits = if draft {
+            self.tower
+                .trace_mtp(&b, &step, p)?
+                .ok_or(TraceError::ProgramUnsupported {
+                    family: FAMILY,
+                    program: spec.program,
+                })?
+        } else {
+            self.tower.trace(&b, &step, p)?
         };
         Ok(step.finish(b, logits)?)
     }

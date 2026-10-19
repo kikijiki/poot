@@ -9,7 +9,7 @@ use poot_graph_ir::test_support::block_top_k::{reference_row, selection_cases};
 use poot_graph_ir::{BlockTopKAttrs, Builder, Outputs, ShapeError, TensorType, Traced, ValueId};
 use poot_tensor::{DType, HostTensor};
 
-use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use crate::{EvalError, EvalOptions, Value, eval};
 
 /// A graph over scores `[rows, 1, tokens, blocks]` and positions `[rows, tokens]` whose output is the
 /// op's packed result.
@@ -58,11 +58,7 @@ fn run(
             HostTensor::i32(vec![rows, tokens], pos.to_vec()).into(),
         ),
     ]);
-    let result = eval(
-        &fixture.graph,
-        &values,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )?;
+    let result = eval(&fixture.graph, &values, EvalOptions::default())?;
     let packed = result.output.into_host().expect("dense result");
     assert_eq!(
         packed.shape(),

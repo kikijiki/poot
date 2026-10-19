@@ -1073,14 +1073,12 @@ mod tests {
         let b = Builder::for_tests();
         let step = Step::new(
             &b,
-            StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::new(t).unwrap(),
-                capacity: NonZeroUsize::new(CAP).unwrap(),
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::All,
-                hidden: None,
-            },
+            StepShape::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::new(t).unwrap(),
+                NonZeroUsize::new(CAP).unwrap(),
+            )
+            .with_logits(LogitRows::All),
         )
         .unwrap();
         let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH])).unwrap();
@@ -1364,14 +1362,12 @@ mod tests {
         let b = Builder::for_tests();
         let step = Step::new(
             &b,
-            StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::MIN,
-                capacity: NonZeroUsize::new(CAP).unwrap(),
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::All,
-                hidden: None,
-            },
+            StepShape::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::MIN,
+                NonZeroUsize::new(CAP).unwrap(),
+            )
+            .with_logits(LogitRows::All),
         )
         .unwrap();
         let xs = b.constant("x", TensorType::f32(vec![1, 1, WIDTH])).unwrap();
@@ -1413,14 +1409,13 @@ mod tests {
             let b = Builder::for_tests();
             let step = Step::new(
                 &b,
-                StepShape {
-                    rows: NonZeroUsize::MIN,
-                    tokens: NonZeroUsize::MIN,
-                    capacity: NonZeroUsize::new(CAP).unwrap(),
-                    kv,
-                    logits: LogitRows::All,
-                    hidden: None,
-                },
+                StepShape::new(
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::new(CAP).unwrap(),
+                )
+                .with_kv(kv)
+                .with_logits(LogitRows::All),
             )
             .unwrap();
             let xs = b.constant("x", TensorType::f32(vec![1, 1, WIDTH])).unwrap();
@@ -1659,14 +1654,12 @@ mod tests {
             let b = Builder::for_tests();
             let step = Step::new(
                 &b,
-                StepShape {
-                    rows: NonZeroUsize::MIN,
-                    tokens: NonZeroUsize::new(t).unwrap(),
-                    capacity: NonZeroUsize::new(cap).unwrap(),
-                    kv: KvLayout::Contiguous,
-                    logits: LogitRows::All,
-                    hidden: None,
-                },
+                StepShape::new(
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::new(t).unwrap(),
+                    NonZeroUsize::new(cap).unwrap(),
+                )
+                .with_logits(LogitRows::All),
             )
             .unwrap();
             let xs = b.constant("x", TensorType::f32(vec![1, t, WIDTH])).unwrap();
@@ -1847,14 +1840,13 @@ mod tests {
         };
         let step = Step::new(
             &b,
-            StepShape {
-                rows: NonZeroUsize::new(rows).unwrap(),
-                tokens: NonZeroUsize::new(t).unwrap(),
-                capacity: NonZeroUsize::new(CAP).unwrap(),
-                kv,
-                logits: LogitRows::All,
-                hidden: None,
-            },
+            StepShape::new(
+                NonZeroUsize::new(rows).unwrap(),
+                NonZeroUsize::new(t).unwrap(),
+                NonZeroUsize::new(CAP).unwrap(),
+            )
+            .with_kv(kv)
+            .with_logits(LogitRows::All),
         )
         .unwrap();
         let xs = b

@@ -343,7 +343,6 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
                 max_workgroup_size: [1, 1, 1],
                 max_workgroup_invocations: 1,
                 subgroup: poot_target::Queried::Unknown,
-                max_dispatch_work: poot_target::Queried::Unknown,
                 max_grid: [65_535, 65_535, 65_535],
                 watchdog_budget: None,
                 tensor_core: poot_target::TensorCoreSupport::UnknownNotExposedByApi,

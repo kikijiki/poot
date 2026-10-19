@@ -49,6 +49,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
+use poot_graph_ir::analysis::NumericsProperty;
 use poot_graph_ir::graph::{Eqn, Graph, LayerIndex, Operand, Storage, ValueId};
 use poot_graph_ir::op::{BinOp, OpKind, RedOp, UnOp};
 use poot_graph_ir::{PackedSourceName, TensorType, ValueMeta, ValueTable, packed_source_type};
@@ -164,6 +165,25 @@ pub struct ShardedGraph {
     pub collectives: Vec<ValueId>,
     /// The number of ranks the graph was sharded for.
     pub world: NonZeroU32,
+}
+
+impl ShardedGraph {
+    /// The numerics this transform declares. An `AllReduce(Sum)` adds the ranks' partial sums in rank
+    /// order, a different summation order from the contraction one device runs over the whole axis, so a
+    /// graph with one is [`NumericsProperty::Reassociating`]; a column-parallel cut and an `AllGather` only
+    /// move values and stay exact.
+    pub fn numerics(&self) -> NumericsProperty {
+        let reduces = self
+            .graph
+            .eqns()
+            .iter()
+            .any(|eqn| matches!(eqn.op, OpKind::AllReduce { .. }));
+        if reduces {
+            NumericsProperty::Reassociating
+        } else {
+            NumericsProperty::Exact
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

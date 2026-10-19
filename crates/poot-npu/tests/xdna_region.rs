@@ -24,7 +24,6 @@ use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
 use poot_executor_parity::Fixture;
 use poot_graph_ir::{BinOp, Builder, Outputs, Slot, StateRole, TensorType};
-use poot_graph_plan::production_plan::Submission;
 use poot_npu::{XdnaConfig, XdnaDevice};
 use poot_quant::weights::WeightStore;
 use poot_runtime_common::BufferRole;
@@ -198,10 +197,7 @@ fn a_chain_region_returns_one_value_and_allocates_nothing_for_the_rest() {
         .expect("the weights load");
     let entry = npu
         .engine
-        .add_entry(
-            exe,
-            &poot_executor_parity::staged(&fixture, target, Submission::Replay),
-        )
+        .add_entry(exe, &poot_executor_parity::staged(&fixture, target))
         .expect("the chain loads");
     assert_eq!(contexts(&npu.engine), 1, "six equations, one artifact");
     let live = |engine: &Engine<XdnaDevice>, role: BufferRole| -> u64 {
@@ -305,10 +301,7 @@ fn a_six_equation_region_is_one_run_per_step() {
             .expect("the weights load");
         let entry = npu
             .engine
-            .add_entry(
-                exe,
-                &poot_executor_parity::staged(fixture, target, Submission::Replay),
-            )
+            .add_entry(exe, &poot_executor_parity::staged(fixture, target))
             .expect("the entry loads");
         (exe, entry)
     };
@@ -686,7 +679,7 @@ fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
                 elems: ELEMENTS as u32,
             })
             .collect();
-        device.begin(Submission::Replay).unwrap();
+        device.begin().unwrap();
         device
             .dispatch(Dispatch {
                 kernel: &kernel,

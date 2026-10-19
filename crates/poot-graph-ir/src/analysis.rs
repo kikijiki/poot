@@ -3,7 +3,7 @@
 //! pass, and every pass now lives in `poot-graph-plan` (card 626: `compile` is the one pipeline, so
 //! this crate publishes no way to rewrite a graph outside it). What stays here is the pure functions
 //! that read a graph's ops to classify them, independent of which crate runs the pass that produced
-//! them, and the class-to-tolerance table; each pass declares its own numerics in `poot-graph-plan`.
+//! them, and the class-to-tolerance table, and the delta a rewrite caused.
 
 use crate::graph::{Graph, ValueId};
 #[cfg(any(test, feature = "test-support"))]
@@ -15,8 +15,8 @@ mod numerics;
 mod stats;
 
 pub use numerics::{
-    NumericalRewriteDecline, NumericalRewriteReason, NumericsError, NumericsProperty, Tier2Class,
-    implied_numerics, implied_numerics_of,
+    NumericalRewriteDecline, NumericalRewriteReason, NumericsDelta, NumericsError,
+    NumericsProperty, Tier2Class, implied_numerics,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use stats::{dispatch_count, peak_transient_bytes};

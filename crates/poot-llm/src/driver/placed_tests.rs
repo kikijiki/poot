@@ -22,17 +22,18 @@ use poot_executor::{
 };
 use poot_graph_ir::{BinOp, Graph};
 use poot_graph_plan::{
-    CompileOptions, ShardRule, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::StagedProgram, staged::TargetSet,
+    CompileOptions, ShardRule, Target, multi_device::topology::DeviceId, staged::StagedProgram,
+    staged::TargetSet,
 };
 use poot_kernel_ir::interp::{Buffer, run};
 use poot_kernel_ir::{Body, Ty};
 use poot_models::components::attention::{AttentionParams, AttentionWeights, attention};
 use poot_models::components::linear::{Weight, linear};
-use poot_models::components::standard::Step;
+use poot_models::components::standard::{Step, decoder_program};
+use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
-    ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, Phase,
-    ShapeReason, StepShape, TraceError,
+    ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
+    StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::StoredBytes;
@@ -50,12 +51,12 @@ use poot_text::ChatFormat;
 use super::capacity::{AllocationOwner, Footprint, Planner};
 use super::error::{DriverError, InvalidOptions, Unsupported};
 use super::placement::Placement;
-use super::step::PickPolicy;
 use super::tests::tiny_text;
 use super::{
-    AdapterRef, Admission, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, Head,
-    Layout, ModelHandle, PoolShape, PreparedSetLimits, Retention, RowWork, SeqRequest,
-    ServingShapes, StepRow, Warm,
+    AdapterRef, Admission, DraftPolicy, Driver, DriverOptions, EncodeShapes, Feature,
+    GenerateRequest, Generation, GenerationId, Head, Incompatible, Layout, ModelHandle, PoolShape,
+    PreparedSetLimits, Retention, RowWork, SeqRequest, Serving, ServingShapes, State, StepRow,
+    Warm,
 };
 use crate::GenerationControl;
 use crate::core::sampler::Sampler;
@@ -91,6 +92,7 @@ fn head() -> WeightId {
 #[derive(Debug)]
 struct Mlp {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
 }
 
@@ -99,16 +101,16 @@ impl Model for Mlp {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        _phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
         if shape.capacity.get() > self.config.max_positions {
             return Err(TraceError::ShapeUnsupported {
                 family: MLP,
@@ -184,7 +186,14 @@ fn build_mlp(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>,
     }
     map.map(head(), WeightView::Stored(WeightKey::from("head")))
         .unwrap();
+    let schema = ModelSchema::builder()
+        .step(
+            ProgramSpec::new(ProgramId::STEP, ModelOutput::Logits { vocab: VOCAB })
+                .carrying(StateSpec::hand_off()),
+        )
+        .build_for(MLP)?;
     Ok(Box::new(Mlp {
+        schema,
         config: ModelConfig {
             family: MLP,
             vocab: VOCAB,
@@ -192,7 +201,6 @@ fn build_mlp(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>,
             eos: BTreeSet::from([EOS]),
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
         },
@@ -283,6 +291,7 @@ fn attn_weight(role: AttnRole) -> WeightId {
 #[derive(Debug)]
 struct Attn {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
 }
 
@@ -291,16 +300,16 @@ impl Model for Attn {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        _phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
         if shape.capacity.get() > self.config.max_positions {
             return Err(TraceError::ShapeUnsupported {
                 family: ATTN,
@@ -372,7 +381,11 @@ fn build_attn(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>
         map.map(id, WeightView::Stored(WeightKey::from(key)))
             .unwrap();
     }
+    let schema = ModelSchema::builder()
+        .step(decoder_program(VOCAB))
+        .build_for(ATTN)?;
     Ok(Box::new(Attn {
+        schema,
         config: ModelConfig {
             family: ATTN,
             vocab: VOCAB,
@@ -380,7 +393,6 @@ fn build_attn(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>
             eos: BTreeSet::from([EOS]),
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
         },
@@ -658,7 +670,7 @@ impl Device for Interp {
             .ok_or_else(|| fault(format!("no recorded body for kernel {key}")))
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), InterpFault> {
+    fn begin(&mut self) -> Result<(), InterpFault> {
         self.open = Some(Vec::new());
         Ok(())
     }
@@ -801,7 +813,7 @@ impl Collectives for Interp {
 // ---------------------------------------------------------------------------------------------
 
 fn options() -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let compile = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -860,7 +872,7 @@ fn tensor() -> Placement {
     }
 }
 
-fn generate(driver: &mut Driver) -> Generation {
+fn generate(driver: &mut Driver<Serving>) -> Generation {
     driver
         .generate(
             GenerateRequest {
@@ -875,7 +887,7 @@ fn generate(driver: &mut Driver) -> Generation {
         .expect("the request generates")
 }
 
-fn weight_bytes(driver: &Driver) -> u64 {
+fn weight_bytes<S: State>(driver: &Driver<S>) -> u64 {
     driver
         .live_role_bytes()
         .into_iter()
@@ -890,7 +902,8 @@ fn weight_bytes(driver: &Driver) -> u64 {
 /// The fixture decodes something worth comparing: several distinct tokens, not one repeated.
 #[test]
 fn the_single_device_reference_decodes_a_varied_sequence() {
-    let (mut driver, _) = single(&handle());
+    let (driver, _) = single(&handle());
+    let mut driver = driver.serve(Layout::Contiguous);
     let tokens = generate(&mut driver).tokens;
     // The same model evaluated by hand in f64: a constant sequence would let a dropped boundary or a
     // missing reduction go unseen.
@@ -905,10 +918,12 @@ fn the_single_device_reference_decodes_a_varied_sequence() {
 #[test]
 fn a_two_device_pipeline_decodes_the_single_device_tokens() {
     let handle = handle();
-    let (mut reference, _) = single(&handle);
+    let (reference, _) = single(&handle);
+    let mut reference = reference.serve(Layout::Contiguous);
     let want = generate(&mut reference).tokens;
 
-    let (mut driver, world) = placed(&handle, pipeline()).expect("the pipeline opens");
+    let (driver, world) = placed(&handle, pipeline()).expect("the pipeline opens");
+    let mut driver = driver.serve(Layout::Contiguous);
     let got = generate(&mut driver).tokens;
     assert_eq!(got, want, "pipeline tokens against the single device's");
     assert_eq!(driver.placement(), &pipeline());
@@ -934,11 +949,13 @@ fn a_two_device_pipeline_decodes_the_single_device_tokens() {
 #[test]
 fn a_tensor_placement_decodes_the_single_device_tokens() {
     let handle = handle();
-    let (mut reference, _) = single(&handle);
+    let (reference, _) = single(&handle);
+    let mut reference = reference.serve(Layout::Contiguous);
     let want = generate(&mut reference).tokens;
     let whole = weight_bytes(&reference);
 
-    let (mut driver, world) = placed(&handle, tensor()).expect("the tensor placement opens");
+    let (driver, world) = placed(&handle, tensor()).expect("the tensor placement opens");
+    let mut driver = driver.serve(Layout::Contiguous);
     let got = generate(&mut driver).tokens;
     assert_eq!(
         got, want,
@@ -986,29 +1003,133 @@ fn a_placement_that_disagrees_with_the_devices_is_a_typed_refusal() {
     ));
 }
 
+/// A driver opened over `placement` with `draft`: the refusal `Driver::placed` returns for a draft
+/// policy the placement has no form of.
+pub(in crate::driver) fn witness_draft_placement(
+    draft: DraftPolicy,
+    placement: Placement,
+) -> DriverError {
+    let world = Rc::new(World::default());
+    let mut opts = options();
+    opts.draft = draft;
+    let Err(error) = Driver::placed(Arc::clone(&handle()), coordinator(&world), opts, placement)
+    else {
+        panic!("a draft policy opened over a placement");
+    };
+    error
+}
+
+/// A draft model's layers are not the target's, so a placement that cuts or divides layers refuses it.
+pub(in crate::driver) fn witness_draft_model_placement(placed_as: Feature) -> DriverError {
+    let handle = handle();
+    witness_draft_placement(
+        DraftPolicy::DraftModel {
+            handle: Arc::clone(&handle),
+            k: nz(2),
+        },
+        placement_of(placed_as),
+    )
+}
+
+/// The MTP layer's carry and cache sit on one device past the target's stages.
+pub(in crate::driver) fn witness_mtp_placement(placed_as: Feature) -> DriverError {
+    witness_draft_placement(DraftPolicy::Mtp { k: nz(2) }, placement_of(placed_as))
+}
+
+/// The placement a placement feature names.
+fn placement_of(feature: Feature) -> Placement {
+    match feature {
+        Feature::PipelinePlacement => pipeline(),
+        Feature::TensorPlacement => tensor(),
+        other => panic!("{other} is not a placement"),
+    }
+}
+
+/// A tensor placement loads one executable whose weights are cut per rank, so `prepare` of a request
+/// under an adapter generation is refused before the registry is asked whether the generation exists.
+pub(in crate::driver) fn witness_tensor_adapters() -> DriverError {
+    let (driver, _) = placed(&handle(), tensor()).expect("the tensor placement opens");
+    driver
+        .prepare(&ServingShapes {
+            adapters: &[GenerationId::unissued(1)],
+            ..serving()
+        })
+        .expect_err("an adapter generation under a tensor placement is refused")
+        .error
+}
+
+/// A tensor placement loads one executable, so an encode step beside it is refused.
+pub(in crate::driver) fn witness_tensor_encode() -> DriverError {
+    let (mut driver, _) = placed(&handle(), tensor()).expect("the tensor placement opens");
+    driver
+        .prepare_encode(&EncodeShapes {
+            rows: nz(1),
+            max_len: nz(2),
+        })
+        .expect_err("an encode step under a tensor placement is refused")
+}
+
 /// A draft model's layers are not the target's, so a placement that cuts or divides layers refuses it.
 #[test]
 fn a_draft_model_has_no_placed_form() {
-    let handle = handle();
-    for placement in [pipeline(), tensor()] {
-        let world = Rc::new(World::default());
-        let mut opts = options();
-        opts.draft = DraftPolicy::DraftModel {
-            handle: Arc::clone(&handle),
-            k: nz(2),
-        };
-        let Err(error) = Driver::placed(Arc::clone(&handle), coordinator(&world), opts, placement)
-        else {
-            panic!("a draft model opened over a placement");
-        };
+    for placed_as in [Feature::PipelinePlacement, Feature::TensorPlacement] {
+        let error = witness_draft_model_placement(placed_as);
         assert!(
             matches!(
                 error,
-                DriverError::Unsupported(Unsupported::Placement { .. })
+                DriverError::Unsupported(Unsupported::Incompatible(Incompatible {
+                    first: Feature::DraftModel,
+                    second,
+                    ..
+                })) if second == placed_as
             ),
             "got {error}"
         );
     }
+}
+
+/// The MTP layer has no placed form either, and a tensor placement serves no adapter and no encode
+/// step beside its one executable. Mutation: drop the placement arms of `config_features`; each opens.
+#[test]
+fn an_mtp_layer_an_adapter_and_an_encode_step_have_no_tensor_or_pipeline_form() {
+    for placed_as in [Feature::PipelinePlacement, Feature::TensorPlacement] {
+        let error = witness_mtp_placement(placed_as);
+        assert!(
+            matches!(
+                error,
+                DriverError::Unsupported(Unsupported::Incompatible(Incompatible {
+                    first: Feature::Mtp,
+                    second,
+                    ..
+                })) if second == placed_as
+            ),
+            "got {error}"
+        );
+    }
+    let error = witness_tensor_adapters();
+    assert!(
+        matches!(
+            error,
+            DriverError::Unsupported(Unsupported::Incompatible(Incompatible {
+                first: Feature::Adapters,
+                second: Feature::TensorPlacement,
+                ..
+            }))
+        ),
+        "got {error}"
+    );
+    let error = witness_tensor_encode();
+    assert!(
+        matches!(
+            error,
+            DriverError::Unsupported(Unsupported::Incompatible(Incompatible {
+                first: Feature::Encode,
+                second: Feature::TensorPlacement,
+                ..
+            }))
+        ),
+        "got {error}"
+    );
 }
 
 fn serving() -> ServingShapes<'static> {
@@ -1048,7 +1169,7 @@ fn the_planner_keeps_a_footprint_per_device() {
         let one = TargetSet::single(DeviceId(0), target());
         Planner::new(Arc::clone(&handle), &one, Placement::Single)
             .unwrap()
-            .plan(options(), &shapes, false)
+            .plan(options(), &shapes, &[])
             .unwrap()
     };
     let whole = per_device(&reference.footprint, BufferRole::Weight)[0];
@@ -1063,7 +1184,7 @@ fn the_planner_keeps_a_footprint_per_device() {
     ] {
         let planned = Planner::new(Arc::clone(&handle), &targets, placement.clone())
             .unwrap()
-            .plan(options(), &shapes, false)
+            .plan(options(), &shapes, &[])
             .unwrap();
         let weights = per_device(&planned.footprint, BufferRole::Weight);
         assert!(
@@ -1098,10 +1219,10 @@ fn each_devices_planned_role_bytes_equal_its_own_prepared_counters() {
     for placement in [pipeline(), tensor()] {
         let planned = Planner::new(Arc::clone(&handle), &targets, placement.clone())
             .unwrap()
-            .plan(options(), &shapes, false)
+            .plan(options(), &shapes, &[])
             .unwrap();
-        let (mut driver, _) = placed(&handle, placement.clone()).unwrap();
-        driver.prepare(&shapes).expect("the shapes prepare");
+        let (driver, _) = placed(&handle, placement.clone()).unwrap();
+        let driver = driver.prepare(&shapes).expect("the shapes prepare");
         let live = driver.live_device_bytes();
         assert_eq!(live.len(), 2, "{placement:?}: one entry per device");
         for role in [BufferRole::Weight, BufferRole::State] {
@@ -1124,7 +1245,7 @@ fn every_planned_owner_names_a_device_of_the_placement() {
     let targets = TargetSet::new(vec![(DeviceId(0), target()), (DeviceId(1), target())]).unwrap();
     let planned = Planner::new(Arc::clone(&handle), &targets, tensor())
         .unwrap()
-        .plan(options(), &serving(), false)
+        .plan(options(), &serving(), &[])
         .unwrap();
     let owners: Vec<&AllocationOwner> = planned.footprint.owners().collect();
     assert!(!owners.is_empty());
@@ -1158,7 +1279,7 @@ fn the_fit_refuses_a_short_rank_of_either_placement_naming_it() {
         let planner = Planner::new(Arc::clone(&handle), &targets, placement.clone()).unwrap();
         let plan = |_: &u8| {
             planner
-                .plan(options(), &shapes, false)
+                .plan(options(), &shapes, &[])
                 .map_err(super::capacity::PlanFailure::Fatal)
         };
         let reference = plan(&0).unwrap();
@@ -1209,17 +1330,13 @@ fn paged_serving() -> ServingShapes<'static> {
 
 /// Greedy decode of `max_new` tokens from a three-token prompt through the paged serving surface: one
 /// sequence on the shared pool, a block table, the slot maps bound each step.
-fn paged_tokens(driver: &mut Driver, max_new: usize) -> Vec<u32> {
-    driver
+fn paged_tokens(driver: Driver, max_new: usize) -> Vec<u32> {
+    let mut driver = driver
         .prepare(&paged_serving())
         .expect("the paged shapes prepare");
     let prompt = [1u32, 2, 3];
     let Admission::Opened { seq, .. } = driver
-        .open(SeqRequest {
-            prompt: &prompt,
-            max_new,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(&prompt, max_new, AdapterRef::Base))
         .expect("the sequence opens")
     else {
         panic!("the pool has room for one sequence")
@@ -1241,10 +1358,7 @@ fn paged_tokens(driver: &mut Driver, max_new: usize) -> Vec<u32> {
             .commit(seq, 1, &mut sampler)
             .expect("the pick commits");
         tokens.push(token);
-        work = RowWork::Decode {
-            ahead: &[],
-            pick: PickPolicy::Greedy,
-        };
+        work = RowWork::Decode { ahead: &[] };
     }
     tokens
 }
@@ -1266,14 +1380,14 @@ fn pool_bytes(world: usize) -> u64 {
 #[test]
 fn a_paged_tensor_placement_decodes_the_single_device_tokens() {
     let handle = attn_handle();
-    let (mut reference, _) = single(&handle);
-    let want = paged_tokens(&mut reference, 8);
+    let (reference, _) = single(&handle);
+    let want = paged_tokens(reference, 8);
     // Several distinct tokens, not one repeated: a wrong head in a pool or a lost scatter would
     // otherwise decode the same constant.
     assert_eq!(want, [4, 6, 1, 4, 1, 6, 1, 1]);
 
-    let (mut driver, world) = placed(&handle, tensor()).expect("the tensor placement opens");
-    let got = paged_tokens(&mut driver, 8);
+    let (driver, world) = placed(&handle, tensor()).expect("the tensor placement opens");
+    let got = paged_tokens(driver, 8);
     assert_eq!(
         got, want,
         "paged tensor-parallel tokens against the single device's"
@@ -1306,7 +1420,7 @@ fn each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepare
     let one = TargetSet::single(DeviceId(0), target());
     let reference = Planner::new(Arc::clone(&handle), &one, Placement::Single)
         .unwrap()
-        .plan(options(), &shapes, false)
+        .plan(options(), &shapes, &[])
         .unwrap();
     let whole = per_device(&reference.footprint, BufferRole::State)[0];
     assert_eq!(
@@ -1317,7 +1431,7 @@ fn each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepare
 
     let planned = Planner::new(Arc::clone(&handle), &targets, tensor())
         .unwrap()
-        .plan(options(), &shapes, false)
+        .plan(options(), &shapes, &[])
         .unwrap();
     let state = per_device(&planned.footprint, BufferRole::State);
     assert_eq!(
@@ -1331,8 +1445,8 @@ fn each_ranks_paged_kv_footprint_is_its_heads_of_the_pool_and_equals_the_prepare
         "the ranks hold the pool once"
     );
 
-    let (mut driver, _) = placed(&handle, tensor()).unwrap();
-    driver.prepare(&shapes).expect("the paged shapes prepare");
+    let (driver, _) = placed(&handle, tensor()).unwrap();
+    let driver = driver.prepare(&shapes).expect("the paged shapes prepare");
     for (index, (device, roles)) in driver.live_device_bytes().iter().enumerate() {
         let live = roles
             .iter()

@@ -7,9 +7,7 @@ mod reference;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::Slot;
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target, compile};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_tensor::DType;
@@ -17,7 +15,7 @@ use poot_tensor::DType;
 use super::*;
 use crate::components::standard::oracle::{eval, run_shape, run_step, step_shape};
 use crate::components::testing::{assert_missing_weight_is_named, build, close, close_all, values};
-use crate::model::{ConfigReason, HiddenCarry, KvLayout, LogitRows, Phase, ShapeReason};
+use crate::model::{ConfigReason, HiddenCarry, LogitRows, ShapeReason, StepShape};
 use crate::registry::Registry;
 use reference::Reference;
 use std::collections::BTreeMap;
@@ -33,22 +31,19 @@ fn model_of(fx: &Fixture) -> Box<dyn Model> {
 }
 
 fn shape(tokens: usize, capacity: usize, logits: LogitRows) -> StepShape {
-    StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(capacity).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits,
-        hidden: None,
-    }
+    StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(tokens).unwrap(),
+        NonZeroUsize::new(capacity).unwrap(),
+    )
+    .with_logits(logits)
 }
 
 /// The names of the state a one-token decode step carries, in carry order.
 fn state_names(model: &dyn Model, capacity: usize) -> Vec<String> {
     let g = model
         .trace(
-            Phase::Decode,
-            shape(1, capacity, LogitRows::All),
+            &StepSpec::step(shape(1, capacity, LogitRows::All)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -71,7 +66,6 @@ fn run_chunked(
         let (out, next) = run_step(
             model,
             store,
-            Phase::Prefill,
             capacity,
             &tokens[at..at + chunk],
             at as i32,
@@ -81,15 +75,7 @@ fn run_chunked(
         (state, at) = (next, at + chunk);
     }
     while at < tokens.len() {
-        let (out, next) = run_step(
-            model,
-            store,
-            Phase::Decode,
-            capacity,
-            &tokens[at..=at],
-            at as i32,
-            &state,
-        );
+        let (out, next) = run_step(model, store, capacity, &tokens[at..=at], at as i32, &state);
         logits.extend(out);
         (state, at) = (next, at + 1);
     }
@@ -270,8 +256,7 @@ fn the_hidden_carry_is_the_references_post_norm_stream_mean_for_a_chunk_a_window
     let (logits, after_chunk) = run_shape(
         &*model,
         &fx.store,
-        Phase::Prefill,
-        step(LogitRows::Last, 6, Some(carry)),
+        &StepSpec::step(step(LogitRows::Last, 6, Some(carry))),
         &tokens[..6],
         0,
         &[],
@@ -287,8 +272,7 @@ fn the_hidden_carry_is_the_references_post_norm_stream_mean_for_a_chunk_a_window
     let (_, after_window) = run_shape(
         &*model,
         &fx.store,
-        Phase::Prefill,
-        step(LogitRows::All, 3, Some(carry)),
+        &StepSpec::step(step(LogitRows::All, 3, Some(carry))),
         &tokens[6..9],
         6,
         &after_chunk,
@@ -305,8 +289,7 @@ fn the_hidden_carry_is_the_references_post_norm_stream_mean_for_a_chunk_a_window
     let (_, after_replay) = run_shape(
         &*model,
         &fx.store,
-        Phase::Prefill,
-        step(LogitRows::Last, 2, Some(carry)),
+        &StepSpec::step(step(LogitRows::Last, 2, Some(carry))),
         &tokens[6..8],
         6,
         &restored,
@@ -335,40 +318,26 @@ fn driver_pieces_of_four_and_two_equal_six_decode_steps() {
 }
 
 /// The step shapes the family cannot trace are typed refusals before any graph is built: a
-/// multi-token decode, and a capacity above the model's maximum. The family has no granule: any
-/// prefill length traces.
+/// capacity above the model's maximum and more tokens than the cache holds. The family has no
+/// granule: any step length traces.
 #[test]
 fn step_shapes_the_family_cannot_trace_are_typed_refusals() {
     let model = model_of(&fixture());
-    let reason = |phase, tokens, capacity| match model.trace(
-        phase,
-        shape(tokens, capacity, LogitRows::Last),
-        poot_graph_ir::TraceLimits::for_tests(),
-    ) {
+    let trace = |tokens, capacity| {
+        model.trace(
+            &StepSpec::step(shape(tokens, capacity, LogitRows::Last)),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+    };
+    let reason = |tokens, capacity| match trace(tokens, capacity) {
         Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     };
-    assert_eq!(
-        reason(Phase::Decode, 2, CAPACITY),
-        ShapeReason::DecodeTokens
-    );
-    assert_eq!(
-        reason(Phase::Decode, 1, 65),
-        ShapeReason::CapacityAboveMax { max: 64 }
-    );
-    assert_eq!(
-        reason(Phase::Prefill, 17, CAPACITY),
-        ShapeReason::TokensAboveCapacity
-    );
+    assert_eq!(reason(1, 65), ShapeReason::CapacityAboveMax { max: 64 });
+    assert_eq!(reason(17, CAPACITY), ShapeReason::TokensAboveCapacity);
     assert_eq!(model.config().prefill_granule.get(), 1);
     for tokens in [1, 3, 6] {
-        model
-            .trace(
-                Phase::Prefill,
-                shape(tokens, CAPACITY, LogitRows::Last),
-                poot_graph_ir::TraceLimits::for_tests(),
-            )
-            .unwrap();
+        trace(tokens, CAPACITY).unwrap();
     }
 }
 
@@ -393,13 +362,20 @@ fn two_rows_do_not_share_state() {
         .map(|p| run_chunked(&*model, &fx.store, CAPACITY, &[3], p))
         .collect();
 
-    let two = |tokens: usize| StepShape {
-        rows: NonZeroUsize::new(2).unwrap(),
-        ..shape(tokens, CAPACITY, LogitRows::All)
+    let two = |tokens: usize| {
+        StepShape::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(tokens).unwrap(),
+            NonZeroUsize::new(CAPACITY).unwrap(),
+        )
+        .with_logits(LogitRows::All)
     };
-    let run = |phase, tokens: usize, ids: Vec<i32>, pos: Vec<i32>, state: Vec<Vec<f32>>| {
+    let run = |tokens: usize, ids: Vec<i32>, pos: Vec<i32>, state: Vec<Vec<f32>>| {
         let g = model
-            .trace(phase, two(tokens), poot_graph_ir::TraceLimits::for_tests())
+            .trace(
+                &StepSpec::step(two(tokens)),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let zeros: Vec<Vec<f32>> = g
             .state()
@@ -418,19 +394,12 @@ fn two_rows_do_not_share_state() {
     };
     let prefix = |row: usize| prompts[row][..3].to_vec();
     let (logits, state) = run(
-        Phase::Prefill,
         3,
         [prefix(0), prefix(1)].concat(),
         (0..3).chain(0..3).collect(),
         Vec::new(),
     );
-    let (logits_after, state) = run(
-        Phase::Decode,
-        1,
-        vec![prompts[0][3], prompts[1][3]],
-        vec![3, 3],
-        state,
-    );
+    let (logits_after, state) = run(1, vec![prompts[0][3], prompts[1][3]], vec![3, 3], state);
     let vocab = model.config().vocab;
     for row in 0..2 {
         let (want, want_state) = &single[row];
@@ -837,14 +806,13 @@ fn backends() -> [Backend; 3] {
     ]
 }
 
-const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
 
-/// The traced and weight-bound graph of one step of `phase` at `tokens` tokens.
-fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
+/// The traced and weight-bound graph of one step of `tokens` tokens.
+fn bound_step(model: &dyn Model, tokens: usize) -> poot_graph_ir::Graph {
     let graph = model
         .trace(
-            phase,
-            shape(tokens, CAPACITY, LogitRows::Last),
+            &StepSpec::step(shape(tokens, CAPACITY, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -863,11 +831,11 @@ fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::
 fn the_decode_and_prefill_graphs_compile_for_every_backend() {
     for (label, fx) in [("fixture", fixture()), ("finetune", finetune_fixture())] {
         let model = model_of(&fx);
-        for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
-            let graph = bound_step(&*model, phase, tokens);
+        for tokens in [1, 4] {
+            let graph = bound_step(&*model, tokens);
             for backend in backends() {
                 compile(&graph, &target_of(backend), &REPLAY)
-                    .unwrap_or_else(|e| panic!("{label} {phase:?} on {backend:?}: {e}"));
+                    .unwrap_or_else(|e| panic!("{label} {tokens}-token step on {backend:?}: {e}"));
             }
         }
     }
@@ -881,8 +849,8 @@ fn compile_preserves_every_witness_lane() {
     let fx = fixture();
     let model = model_of(&fx);
     let routed_layers = 3;
-    for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
-        let graph = bound_step(&*model, phase, tokens);
+    for tokens in [1, 4] {
+        let graph = bound_step(&*model, tokens);
         let traced: Vec<(poot_graph_ir::ValidationId, String, usize)> = graph
             .witnesses()
             .map(|o| (o.id, o.name.to_owned(), graph.aval(o.value).numel()))
@@ -890,7 +858,7 @@ fn compile_preserves_every_witness_lane() {
         assert_eq!(
             traced.len(),
             3 * routed_layers,
-            "{phase:?}: three router witnesses per routed layer"
+            "{tokens}-token step: three router witnesses per routed layer"
         );
         for backend in backends() {
             let program = compile(&graph, &target_of(backend), &REPLAY).unwrap();
@@ -902,12 +870,12 @@ fn compile_preserves_every_witness_lane() {
                 .collect();
             assert_eq!(
                 compiled, traced,
-                "{phase:?} on {backend:?}: the packet layout"
+                "{tokens}-token step on {backend:?}: the packet layout"
             );
             assert_eq!(
                 layout.lane_count,
                 traced.iter().map(|(_, _, lanes)| lanes).sum::<usize>(),
-                "{phase:?} on {backend:?}: the lane count"
+                "{tokens}-token step on {backend:?}: the lane count"
             );
         }
     }
@@ -923,14 +891,13 @@ type NamedState = BTreeMap<String, Vec<f32>>;
 fn run_named(
     model: &dyn Model,
     store: &WeightStore,
-    phase: Phase,
-    step: StepShape,
+    step: &StepSpec,
     tokens: &[i32],
     start: i32,
     state: &mut NamedState,
 ) -> Vec<f32> {
     let graph = model
-        .trace(phase, step, poot_graph_ir::TraceLimits::for_tests())
+        .trace(step, poot_graph_ir::TraceLimits::for_tests())
         .unwrap();
     let names: Vec<String> = graph
         .state()
@@ -946,7 +913,7 @@ fn run_named(
                 .unwrap_or_else(|| vec![0.0; graph.aval(input).numel()])
         })
         .collect();
-    let (logits, next) = run_shape(model, store, phase, step, tokens, start, &input);
+    let (logits, next) = run_shape(model, store, step, tokens, start, &input);
     state.extend(names.into_iter().zip(next));
     logits
 }
@@ -961,7 +928,7 @@ fn argmax(row: &[f32]) -> usize {
 
 const CARRY_NAME: &str = crate::components::standard::HIDDEN_CARRY_STATE;
 
-/// Run the traced `Phase::Mtp` chain the driver of a round would: the target prefills `prefix` with
+/// Run the traced `draft` chain the driver of a round would: the target prefills `prefix` with
 /// the carry, then the layer catches up over every position with the token that follows it (the last
 /// with `bonus`), then `k - 1` one-token steps, each fed the greedy token of the step before and the
 /// post-norm state that step left in the carry. Returns every draft step's logits and tokens.
@@ -980,8 +947,7 @@ fn traced_mtp_chain(
     run_named(
         &*model,
         &fx.store,
-        Phase::Prefill,
-        step_shape(n, CAPACITY, LogitRows::Last, Some(carry)),
+        &StepSpec::step(step_shape(n, CAPACITY, LogitRows::Last, Some(carry))),
         prefix,
         0,
         &mut target,
@@ -989,13 +955,13 @@ fn traced_mtp_chain(
     // The layer's program has its own caches and reads the carry the target wrote.
     let mut mtp = NamedState::new();
     mtp.insert(CARRY_NAME.to_string(), target[CARRY_NAME].clone());
-    let mtp_step = |tokens: usize| step_shape(tokens, CAPACITY, LogitRows::Last, Some(carry));
+    let mtp_step =
+        |tokens: usize| StepSpec::draft(step_shape(tokens, CAPACITY, LogitRows::Last, Some(carry)));
     let following: Vec<i32> = prefix[1..].iter().copied().chain([bonus]).collect();
     let mut logits = vec![run_named(
         &*model,
         &fx.store,
-        Phase::Mtp,
-        mtp_step(n),
+        &mtp_step(n),
         &following,
         0,
         &mut mtp,
@@ -1006,8 +972,7 @@ fn traced_mtp_chain(
         logits.push(run_named(
             &*model,
             &fx.store,
-            Phase::Mtp,
-            mtp_step(1),
+            &mtp_step(1),
             &[token],
             (n - 1 + i) as i32,
             &mut mtp,
@@ -1017,7 +982,7 @@ fn traced_mtp_chain(
     (logits, drafts)
 }
 
-/// SC-001 (POOT-1110): the traced `Phase::Mtp` program over the hidden-state carry equals a
+/// SC-001 (POOT-1110): the traced `draft` program over the hidden-state carry equals a
 /// from-scratch f64 chain for `k = 3`, at every draft step's every logit and every drawn token. The
 /// reference runs the target and the layer one position at a time with no carry and no cache but its
 /// own history; the traced run catches up over the whole prefix in one step of width `n`, then
@@ -1054,21 +1019,23 @@ fn the_traced_mtp_chain_over_the_carry_equals_the_from_scratch_chain_for_k_3() {
     }
 }
 
-/// The layer's step needs the carry it reads: a `Phase::Mtp` shape that names none is a typed
+/// The layer's step needs the carry it reads: a `draft` shape that names none is a typed
 /// refusal before any graph is built, and a carry narrower than the step's tokens is the carry's own
-/// refusal. Mutation: drop the `MtpWithoutCarry` return in `check_mtp_step`; the shape traces the
+/// refusal. Mutation: drop the `DraftWithoutCarry` return in `check_draft_step`; the shape traces the
 /// layer over a carry that does not exist (or panics at the `expect`) and the row goes red.
 #[test]
 fn an_mtp_step_without_a_carry_or_with_a_narrow_one_is_a_typed_refusal() {
     let model = model_of(&fixture());
-    let refusal =
-        |shape| match model.trace(Phase::Mtp, shape, poot_graph_ir::TraceLimits::for_tests()) {
-            Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
-            other => panic!("expected a shape refusal, got {:?}", other.map(|_| ())),
-        };
+    let refusal = |shape| match model.trace(
+        &StepSpec::draft(shape),
+        poot_graph_ir::TraceLimits::for_tests(),
+    ) {
+        Err(TraceError::ShapeUnsupported { reason, .. }) => reason,
+        other => panic!("expected a shape refusal, got {:?}", other.map(|_| ())),
+    };
     assert_eq!(
         refusal(shape(1, CAPACITY, LogitRows::Last)),
-        ShapeReason::MtpWithoutCarry
+        ShapeReason::DraftWithoutCarry
     );
     let narrow = HiddenCarry {
         positions: NonZeroUsize::new(2).unwrap(),
@@ -1083,20 +1050,23 @@ fn an_mtp_step_without_a_carry_or_with_a_narrow_one_is_a_typed_refusal() {
 }
 
 /// A checkpoint that stores no MTP layer, or more than one (the reference cycles them by draft step,
-/// which a step shape does not name), refuses `Phase::Mtp` typed and still traces its text phases.
+/// which a step shape does not name), refuses the `draft` program typed and still traces its `step` program.
 /// Mutation: drop the `count == 1` filter in `Tower::trace_mtp`; the two-layer checkpoint traces the
 /// first layer for every step and the row goes red.
 #[test]
-fn a_checkpoint_without_exactly_one_mtp_layer_refuses_the_phase_typed() {
+fn a_checkpoint_without_exactly_one_mtp_layer_refuses_the_draft_program_typed() {
     let carry = HiddenCarry {
         positions: NonZeroUsize::new(4).unwrap(),
     };
     let step = step_shape(1, CAPACITY, LogitRows::Last, Some(carry));
     let model = model_of(&finetune_fixture());
     assert!(matches!(
-        model.trace(Phase::Mtp, step, poot_graph_ir::TraceLimits::for_tests()),
-        Err(TraceError::PhaseUnsupported {
-            phase: Phase::Mtp,
+        model.trace(
+            &StepSpec::draft(step),
+            poot_graph_ir::TraceLimits::for_tests()
+        ),
+        Err(TraceError::ProgramUnsupported {
+            program: ProgramId::DRAFT,
             ..
         })
     ));
@@ -1113,26 +1083,29 @@ fn a_checkpoint_without_exactly_one_mtp_layer_refuses_the_phase_typed() {
         &fx.store,
     );
     assert!(matches!(
-        model.trace(Phase::Mtp, step, poot_graph_ir::TraceLimits::for_tests()),
-        Err(TraceError::PhaseUnsupported {
-            phase: Phase::Mtp,
+        model.trace(
+            &StepSpec::draft(step),
+            poot_graph_ir::TraceLimits::for_tests()
+        ),
+        Err(TraceError::ProgramUnsupported {
+            program: ProgramId::DRAFT,
             ..
         })
     ));
     model
         .trace(
-            Phase::Decode,
-            shape(1, CAPACITY, LogitRows::Last),
+            &StepSpec::step(shape(1, CAPACITY, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
 }
 
-/// Every other registered family refuses `Phase::Mtp` typed, whatever the shape: the phase is the
-/// family's to opt into, and none but this one does. Mutation: let `check_step` pass `Phase::Mtp`
-/// through; the dense decoders trace an ordinary step for it and the row goes red naming the family.
+/// Every other registered family refuses the `draft` program typed, whatever the shape: the program
+/// is the family's to opt into, and none but this one does. Mutation: declare a `draft` program in
+/// a dense decoder's schema; it traces an ordinary step for it and the row goes red naming the
+/// family.
 #[test]
-fn every_other_family_refuses_phase_mtp_typed() {
+fn every_other_family_refuses_the_draft_program_typed() {
     let carry = HiddenCarry {
         positions: NonZeroUsize::new(4).unwrap(),
     };
@@ -1145,12 +1118,16 @@ fn every_other_family_refuses_phase_mtp_typed() {
         }
         let fx = (entry.fixture)();
         let model = build(entry, &fx.raw(), &fx.store);
-        match model.trace(Phase::Mtp, step, poot_graph_ir::TraceLimits::for_tests()) {
-            Err(TraceError::PhaseUnsupported {
-                phase: Phase::Mtp, ..
+        match model.trace(
+            &StepSpec::draft(step),
+            poot_graph_ir::TraceLimits::for_tests(),
+        ) {
+            Err(TraceError::ProgramUnsupported {
+                program: ProgramId::DRAFT,
+                ..
             }) => refused += 1,
             other => panic!(
-                "{} must refuse Phase::Mtp typed, got {:?}",
+                "{} must refuse the draft program typed, got {:?}",
                 entry.family,
                 other.map(|_| ())
             ),
@@ -1174,8 +1151,7 @@ fn the_mtp_graphs_compile_for_every_backend() {
     for tokens in [1, 6] {
         let graph = model
             .trace(
-                Phase::Mtp,
-                step_shape(tokens, CAPACITY, LogitRows::Last, Some(carry)),
+                &StepSpec::draft(step_shape(tokens, CAPACITY, LogitRows::Last, Some(carry))),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -1261,7 +1237,7 @@ fn the_kda_token_loop_is_bounded_by_the_callers_token_and_equation_limits() {
     let model = model_of(&fx);
     let roomy = TraceLimits::for_tests();
     let six = shape(6, CAPACITY, LogitRows::Last);
-    let full = model.trace(Phase::Prefill, six, roomy).unwrap();
+    let full = model.trace(&StepSpec::step(six), roomy).unwrap();
     assert!(
         full.eqns().len() > 6,
         "the unrolled prefill is larger than the limit under test"
@@ -1272,7 +1248,7 @@ fn the_kda_token_loop_is_bounded_by_the_callers_token_and_equation_limits() {
         max_literal_bytes: NonZeroU64::new(1 << 20).unwrap(),
         ..roomy
     };
-    let Err(TraceError::Budget(refused)) = model.trace(Phase::Prefill, six, tokens) else {
+    let Err(TraceError::Budget(refused)) = model.trace(&StepSpec::step(six), tokens) else {
         panic!("a 6-token step under max_tokens = 4 must be the typed budget refusal");
     };
     assert_eq!(refused.resource, BudgetResource::Tokens);
@@ -1280,14 +1256,14 @@ fn the_kda_token_loop_is_bounded_by_the_callers_token_and_equation_limits() {
     assert_eq!(refused.attempted, Attempted::Total(6));
     // The exact boundary traces.
     model
-        .trace(Phase::Prefill, shape(4, CAPACITY, LogitRows::Last), tokens)
+        .trace(&StepSpec::step(shape(4, CAPACITY, LogitRows::Last)), tokens)
         .unwrap();
 
     let equations = TraceLimits {
         max_eqns: NonZeroUsize::new(6).unwrap(),
         ..roomy
     };
-    let Err(TraceError::Budget(refused)) = model.trace(Phase::Prefill, six, equations) else {
+    let Err(TraceError::Budget(refused)) = model.trace(&StepSpec::step(six), equations) else {
         panic!("the seventh equation must be the typed budget refusal");
     };
     assert_eq!(refused.resource, BudgetResource::Equations);

@@ -3,7 +3,7 @@
 //! must never depend on poot-graph-plan (its own architecture test); this crate already dev-depends
 //! on poot-eval, so an integration test here can drive both.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::{BinOp, UnOp};
 use poot_graph_ir::ops::rope;
 use poot_graph_ir::types::TensorType;
@@ -73,12 +73,12 @@ fn fused_pointwise_chain_is_bit_identical_to_unfused() {
     inputs.insert(bi, Value::from(HostTensor::f32(vec![1, 1, n], fill(n, 22))));
     inputs.insert(ci, Value::from(HostTensor::f32(vec![1, 1, n], fill(n, 33))));
 
-    let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let unfused = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
         .expect("cast_quant_norm_rope tests evaluate dense graphs");
-    let fused = eval(&fg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let fused = eval(&fg, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -150,12 +150,12 @@ fn fused_equals_unfused_over_random_pointwise_graphs() {
         if fg.eqns().len() < g.eqns().len() {
             fused_count += 1;
         }
-        let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let unfused = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
             .expect("cast_quant_norm_rope tests evaluate dense graphs");
-        let fused = eval(&fg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let fused = eval(&fg, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -279,12 +279,12 @@ fn fused_equals_unfused_over_random_reduction_graphs() {
             )),
         );
         let fg = fuse(&cse(&g).unwrap()).unwrap();
-        let unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let unfused = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
             .expect("cast_quant_norm_rope tests evaluate dense graphs");
-        let fused = eval(&fg, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let fused = eval(&fg, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -352,7 +352,7 @@ fn rope_fusion_eval_matches_unfused_full() {
     // full rotary: eval(rope_fusion(g)) == eval(g) approximately; checks match_rope fired without
     // changing numerics.
     let (g, inputs) = rope_graph_and_inputs(8, 8);
-    let fused = poot_graph_plan::rope_fusion(&cse(&g).unwrap()).unwrap();
+    let fused = poot_graph_plan::rope_fusion(&cse(&g).unwrap()).unwrap().0;
     assert!(
         fused
             .eqns()
@@ -360,12 +360,12 @@ fn rope_fusion_eval_matches_unfused_full() {
             .any(|e| matches!(e.op, poot_graph_ir::op::OpKind::Rope { .. })),
         "rope_fusion should fire on the full-rotary chain"
     );
-    let got_unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got_unfused = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
         .expect("cast_quant_norm_rope tests evaluate dense graphs");
-    let got_fused = eval(&fused, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got_fused = eval(&fused, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -381,7 +381,7 @@ fn rope_fusion_eval_matches_unfused_full() {
 fn rope_fusion_eval_matches_unfused_partial() {
     // partial rotary (rot=4 of D=8): the fused Rope op passes [rot, D) through; eval stays bit-approximate.
     let (g, inputs) = rope_graph_and_inputs(8, 4);
-    let fused = poot_graph_plan::rope_fusion(&cse(&g).unwrap()).unwrap();
+    let fused = poot_graph_plan::rope_fusion(&cse(&g).unwrap()).unwrap().0;
     let rope_eqn = fused
         .eqns()
         .iter()
@@ -391,12 +391,12 @@ fn rope_fusion_eval_matches_unfused_partial() {
         rope_eqn.op,
         poot_graph_ir::op::OpKind::Rope { rot: 4 }
     ));
-    let got_unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got_unfused = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
         .expect("cast_quant_norm_rope tests evaluate dense graphs");
-    let got_fused = eval(&fused, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got_fused = eval(&fused, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -414,12 +414,12 @@ fn optimize_preserves_rope_numerics() {
     for (d, rot) in [(8usize, 8usize), (8, 4)] {
         let (g, inputs) = rope_graph_and_inputs(d, rot);
         let opt = passes_without_target(&g).unwrap();
-        let got_unfused = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got_unfused = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
             .expect("cast_quant_norm_rope tests evaluate dense graphs");
-        let got_opt = eval(&opt, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got_opt = eval(&opt, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

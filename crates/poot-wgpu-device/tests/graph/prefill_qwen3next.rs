@@ -25,7 +25,7 @@ fn gpu_ut_transform_matches_cpu_c64() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -92,7 +92,7 @@ fn gpu_attention_prefill_matches_cpu_l64() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -170,7 +170,7 @@ fn gpu_attention_prefill_matches_cpu_past_matmul_grid_cap() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -276,7 +276,7 @@ fn gpu_attention_prefill_matches_cpu_real_d() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

@@ -15,13 +15,11 @@ use poot_executor::{
     ExecutableId, Executor, ExecutorStats, HostSync, NativeCounters, StateScope, StepInputs,
     StepOutputs, SupportBound,
 };
-use poot_graph_plan::{
-    Capability, Target, production_plan::Submission, staged::StagedProgram, staged::TargetSet,
-};
+use poot_graph_plan::{Capability, Target, staged::StagedProgram, staged::TargetSet};
 use poot_llm::driver::{BackendChoice, DraftPolicy, ModelHandle};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters};
-use poot_target::{AmdArch, Backend, DeviceCaps, Queried, TargetId};
+use poot_target::{AmdArch, Backend, DeviceCaps, TargetId};
 
 use super::*;
 use clap::Parser;
@@ -275,7 +273,7 @@ impl Device for FixtureDevice {
         }
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FixtureError> {
+    fn begin(&mut self) -> Result<(), FixtureError> {
         Ok(())
     }
     fn dispatch(&mut self, _dispatch: Dispatch<'_, Self>) -> Result<(), FixtureError> {
@@ -450,14 +448,14 @@ fn known(bytes: u64) -> Budget {
 /// roles: the byte count a budget row sets its limit from, not read from the planner.
 fn live_total(handle: &Arc<ModelHandle>, candidate: &Candidate) -> u64 {
     let (executor, _) = probe(spirv_target(), 0);
-    let mut driver = Driver::new(
+    let driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
         driver_options(handle, generate(candidate), DraftPolicy::Off),
     )
     .expect("driver");
     let rows = [candidate.rows];
-    driver
+    let driver = driver
         .prepare(&shapes_of(candidate, &rows))
         .expect("the candidate prepares");
     driver
@@ -576,13 +574,13 @@ fn health_is_503_starting_while_prepare_runs_and_200_serving_after() {
     assert!(rows > 0, "a generation plan serves at least one row");
 }
 
-/// A target for a ROCm device whose per-dispatch work bound is below what the model's smallest
-/// dispatch needs: the planner refuses it on that target, naming the op and the capability.
-fn amd_target_missing_dispatch_work() -> Target {
+/// A target for a ROCm device whose workgroup holds one invocation, below what the model's smallest
+/// kernel needs: the planner refuses it on that target, naming the op and the capability.
+fn amd_target_missing_workgroup_invocations() -> Target {
     Target::Gpu {
         backend: Backend::AmdGcn(AmdArch::gfx1151()),
         caps: DeviceCaps {
-            max_dispatch_work: Queried::Known(1),
+            max_workgroup_invocations: 1,
             ..DeviceCaps::rocm_default()
         },
     }
@@ -597,7 +595,7 @@ fn amd_target_missing_dispatch_work() -> Target {
 fn a_rocm_backend_missing_a_capability_fails_with_the_typed_refusal() {
     let handle = fixture_model();
     let health = EngineHealth::starting();
-    let (executor, add_entries) = probe(amd_target_missing_dispatch_work(), 0);
+    let (executor, add_entries) = probe(amd_target_missing_workgroup_invocations(), 0);
     let (result, opened) = build_with(
         &args(BackendChoice::Rocm),
         &handle,
@@ -633,7 +631,7 @@ fn a_rocm_backend_missing_a_capability_fails_with_the_typed_refusal() {
 fn a_refusal_on_the_resolved_backend_is_not_retried_elsewhere() {
     let handle = fixture_model();
     let health = EngineHealth::starting();
-    let (executor, _) = probe(amd_target_missing_dispatch_work(), 0);
+    let (executor, _) = probe(amd_target_missing_workgroup_invocations(), 0);
     let (result, opened) = build_with(
         &args(BackendChoice::Auto),
         &handle,
@@ -712,17 +710,17 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
             .plan(
                 driver_options(&handle, generate(candidate), DraftPolicy::Off),
                 &shapes_of(&candidate, &rows),
-                false,
+                &[],
             )
             .expect("plans");
         let (executor, _) = probe(spirv_target(), 0);
-        let mut driver = Driver::new(
+        let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
             driver_options(&handle, generate(candidate), DraftPolicy::Off),
         )
         .unwrap();
-        driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
+        let driver = driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
         assert_eq!(
             planned.weight_bytes_read, 0,
             "{candidate:?}: planning reads no weights"
@@ -793,7 +791,7 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
             .plan(
                 driver_options(&handle, generate(candidate), DraftPolicy::Off),
                 &shapes_of(candidate, &r),
-                false,
+                &[],
             )
             .unwrap();
         let mut roles: Vec<String> = planned
@@ -827,14 +825,14 @@ fn startup_reads_the_weights_once_however_many_candidates_it_plans() {
     let reference_reads = {
         let (executor, _) = probe(spirv_target(), 0);
         let chosen = domain[last];
-        let mut driver = Driver::new(
+        let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(executor),
             driver_options(&handle, generate(chosen), DraftPolicy::Off),
         )
         .expect("driver");
         let rows = [chosen.rows];
-        driver
+        let driver = driver
             .prepare(&shapes_of(&chosen, &rows))
             .expect("the candidate prepares");
         driver.executor_stats().weight_bytes_read
@@ -876,14 +874,14 @@ fn loaded_kernels(handle: &Arc<ModelHandle>, candidate: &Candidate) -> HashSet<u
         capacity_bytes: None,
         loaded_kernels: Some(Arc::clone(&loaded)),
     });
-    let mut driver = Driver::new(
+    let driver = Driver::new(
         Arc::clone(handle),
         Box::new(executor),
         driver_options(handle, generate(candidate), DraftPolicy::Off),
     )
     .expect("driver");
     let rows = [candidate.rows];
-    driver
+    let driver = driver
         .prepare(&shapes_of(candidate, &rows))
         .expect("the candidate prepares");
     drop(driver);
@@ -914,7 +912,7 @@ fn a_planner_resolves_each_distinct_kernel_once_across_candidates() {
             .plan(
                 driver_options(&handle, generate(candidate), DraftPolicy::Off),
                 &shapes_of(candidate, &rows),
-                false,
+                &[],
             )
             .expect("plans")
     };
@@ -1038,14 +1036,14 @@ fn admission_uses_the_fresh_budget_and_publishes_only_the_chosen_candidate() {
     let k = 2;
     let (reference, reference_entries) = probe(spirv_target(), 0);
     {
-        let mut driver = Driver::new(
+        let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(reference),
             driver_options(&handle, generate(domain[k]), DraftPolicy::Off),
         )
         .expect("driver");
         let rows = [domain[k].rows];
-        driver
+        let _prepared = driver
             .prepare(&shapes_of(&domain[k], &rows))
             .expect("prepares");
     }
@@ -1199,14 +1197,15 @@ fn an_encoder_request_after_serving_compiles_and_allocates_nothing() {
         let compiles = driver.stats().compiles;
         let live = driver.live_role_bytes();
         let ids = [1u32, 2, 3];
+        let none = poot_models::io::RequestInputs::none();
         let rows = [
-            poot_llm::driver::EncodeRow::Tokens {
-                ids: &ids,
-                types: &[],
+            poot_llm::driver::EncodeRow {
+                tokens: Some(&ids),
+                inputs: &none,
             },
-            poot_llm::driver::EncodeRow::Tokens {
-                ids: &ids[..2],
-                types: &[],
+            poot_llm::driver::EncodeRow {
+                tokens: Some(&ids[..2]),
+                inputs: &none,
             },
         ];
         driver
@@ -1261,11 +1260,12 @@ fn a_decoder_plans_its_embedding_pass_and_a_family_without_one_serves_generation
         driver.live_role_bytes(),
     );
     let ids = [1u32, 2, 3];
+    let none = poot_models::io::RequestInputs::none();
     driver
         .encode(&poot_llm::driver::EncodeRequest {
-            rows: &[poot_llm::driver::EncodeRow::Tokens {
-                ids: &ids,
-                types: &[],
+            rows: &[poot_llm::driver::EncodeRow {
+                tokens: Some(&ids),
+                inputs: &none,
             }],
         })
         .expect("the planned shape runs");
@@ -1336,13 +1336,13 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
     gpu_caps_mut(&mut target).memory_budget_bytes = Some(u64::MAX / 2);
     // The independent oracle: what the first candidate allocates on a counting device.
     let (executor, _) = probe(target, 0);
-    let mut oracle = Driver::new(
+    let oracle = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
         driver_options(&handle, generate(first), DraftPolicy::Off),
     )
     .unwrap();
-    oracle.prepare(&shapes_of(&first, &[first.rows])).unwrap();
+    let oracle = oracle.prepare(&shapes_of(&first, &[first.rows])).unwrap();
     let first_bytes: u64 = oracle.live_role_bytes().iter().map(|&(_, b)| b).sum();
     drop(oracle);
 
@@ -1378,7 +1378,7 @@ fn a_lower_live_budget_than_the_open_time_figure_refuses_the_plan() {
                 .plan(
                     driver_options(&handle, generate(c), DraftPolicy::Off),
                     &shapes_of(&c, &rows),
-                    false,
+                    &[],
                 )
                 .unwrap()
                 .footprint
@@ -1475,7 +1475,7 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
         .plan(
             driver_options(&handle, generate(candidate), DraftPolicy::Off),
             &shapes_of(&candidate, &rows),
-            false,
+            &[],
         )
         .expect("plans");
     let weight = |roles: Vec<(BufferRole, u64)>| {
@@ -1485,13 +1485,13 @@ fn planned_weight_bytes_equal_the_stored_tensor_bytes() {
             .map_or(0, |(_, b)| b)
     };
     let (executor, _) = probe(spirv_target(), 0);
-    let mut driver = Driver::new(
+    let driver = Driver::new(
         Arc::clone(&handle),
         Box::new(executor),
         driver_options(&handle, generate(candidate), DraftPolicy::Off),
     )
     .unwrap();
-    driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
+    let driver = driver.prepare(&shapes_of(&candidate, &rows)).unwrap();
     let live = weight(driver.live_role_bytes());
     assert!(live > 0, "the fixture carries weights");
     assert_eq!(
@@ -1580,7 +1580,7 @@ fn a_recurrent_family_plans_many_rows_and_its_state_bytes_grow_with_the_sequence
                     windows: &[],
                     adapters: &[],
                 },
-                false,
+                &[],
             )
             .unwrap_or_else(|error| panic!("seqs {seqs} rows {rows:?}: {error}"));
         planned
@@ -1770,7 +1770,7 @@ fn smallest_candidate_bytes(
         .plan(
             driver_options(handle, generate(candidate), DraftPolicy::Off),
             &shapes_of(&candidate, &rows),
-            false,
+            &[],
         )
         .expect("the candidate plans");
     [DeviceId(0), DeviceId(1)].map(|device| planned.footprint.device_bytes(device).unwrap())

@@ -7,9 +7,7 @@
 
 use std::num::NonZeroUsize;
 
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target, compile};
 use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_target::{AmdArch, Backend, DeviceCaps};
 
@@ -19,7 +17,7 @@ use crate::components::testing::{
     CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build, close_all,
     q8_0_store, step_shape, values,
 };
-use crate::model::{KvLayout, LogitRows, ShapeReason};
+use crate::model::{LogitRows, ShapeReason, StepShape};
 use crate::registry::Registry;
 
 const PROMPT: [i32; 4] = [3, 17, 40, 8];
@@ -271,21 +269,13 @@ fn assert_matches_the_reference(config: &serde_json::Value, store: &WeightStore,
         .enumerate()
         .flat_map(|(position, &token)| reference.step(token, position))
         .collect();
-    let (got, state) = run_step(&*model, store, Phase::Prefill, CAP, prompt, 0, &[]);
+    let (got, state) = run_step(&*model, store, CAP, prompt, 0, &[]);
     oracle::assert_matches_f64(&got, &want, 1e-4);
     close_all(&state, &reference.state(CAP));
 
     let next = 5;
     let want = reference.step(next, prompt.len());
-    let (got, state) = run_step(
-        &*model,
-        store,
-        Phase::Decode,
-        CAP,
-        &[next],
-        prompt.len() as i32,
-        &state,
-    );
+    let (got, state) = run_step(&*model, store, CAP, &[next], prompt.len() as i32, &state);
     oracle::assert_matches_f64(&got, &want, 1e-4);
     close_all(&state, &reference.state(CAP));
 }
@@ -312,15 +302,7 @@ fn three_positions_carry_keys_then_values_equal_to_the_reference() {
     let mut state = Vec::new();
     for (position, token) in [3, 17, 40].into_iter().enumerate() {
         let want = reference.step(token, position);
-        let (got, next) = run_step(
-            &*model,
-            &fx.store,
-            Phase::Decode,
-            CAP,
-            &[token],
-            position as i32,
-            &state,
-        );
+        let (got, next) = run_step(&*model, &fx.store, CAP, &[token], position as i32, &state);
         oracle::assert_matches_f64(&got, &want, 1e-4);
         state = next;
     }
@@ -485,8 +467,7 @@ fn a_step_above_the_cache_is_a_typed_refusal() {
     let model = model_of(&fx.config, &fx.store);
     let shape = step_shape(CAP + 1, CAP, LogitRows::All);
     match model.trace(
-        Phase::Prefill,
-        shape,
+        &StepSpec::step(shape),
         poot_graph_ir::TraceLimits::for_tests(),
     ) {
         Err(TraceError::ShapeUnsupported { reason, .. }) => {
@@ -515,18 +496,18 @@ fn backends() -> [Backend; 3] {
     ]
 }
 
-/// The traced and weight-bound graph of one step of `phase` at `tokens` tokens.
-fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::new(tokens).unwrap(),
-        capacity: NonZeroUsize::new(CAP).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    };
+/// The traced and weight-bound graph of one step of `tokens` tokens.
+fn bound_step(model: &dyn Model, tokens: usize) -> poot_graph_ir::Graph {
+    let shape = StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(tokens).unwrap(),
+        NonZeroUsize::new(CAP).unwrap(),
+    );
     let graph = model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(
+            &StepSpec::step(shape),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     poot_graph_plan::bind_packed_weights(
         &graph,
@@ -535,7 +516,7 @@ fn bound_step(model: &dyn Model, phase: Phase, tokens: usize) -> poot_graph_ir::
     .unwrap()
 }
 
-const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
 
 /// SC-006 (compile half): the decode and the prefill graphs compile for the wgpu, PTX and ROCm
 /// targets. Mutation: skip the BF16-retyping step `compile` runs for the target
@@ -544,11 +525,11 @@ const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLi
 fn the_decode_and_prefill_graphs_compile_for_every_backend() {
     let fx = fixture();
     let model = model_of(&fx.config, &fx.store);
-    for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
-        let graph = bound_step(&*model, phase, tokens);
+    for tokens in [1, 4] {
+        let graph = bound_step(&*model, tokens);
         for backend in backends() {
             compile(&graph, &target_of(backend), &REPLAY)
-                .unwrap_or_else(|e| panic!("{phase:?} on {backend:?}: {e}"));
+                .unwrap_or_else(|e| panic!("{tokens}-token step on {backend:?}: {e}"));
         }
     }
 }
@@ -561,15 +542,15 @@ fn compile_preserves_every_witness_lane() {
     let fx = fixture();
     let model = model_of(&fx.config, &fx.store);
     let layers = Dims::of(&fx.config).layers;
-    for (phase, tokens) in [(Phase::Decode, 1), (Phase::Prefill, 4)] {
-        let graph = bound_step(&*model, phase, tokens);
+    for tokens in [1, 4] {
+        let graph = bound_step(&*model, tokens);
         let traced: Vec<(poot_graph_ir::ValidationId, String, usize)> = graph
             .witnesses()
             .map(|o| (o.id, o.name.to_owned(), graph.aval(o.value).numel()))
             .collect();
         assert!(
             traced.len() >= 3 * layers,
-            "{phase:?}: the trace declares {} witnesses",
+            "{tokens}-token step: the trace declares {} witnesses",
             traced.len()
         );
         for backend in backends() {
@@ -582,12 +563,12 @@ fn compile_preserves_every_witness_lane() {
                 .collect();
             assert_eq!(
                 compiled, traced,
-                "{phase:?} on {backend:?}: the packet layout"
+                "{tokens}-token step on {backend:?}: the packet layout"
             );
             assert_eq!(
                 layout.lane_count,
                 traced.iter().map(|(_, _, lanes)| lanes).sum::<usize>(),
-                "{phase:?} on {backend:?}: the lane count"
+                "{tokens}-token step on {backend:?}: the lane count"
             );
         }
     }

@@ -9,7 +9,7 @@
 //! The multi-token-prediction layers the checkpoint stores after the text layers
 //! (`num_nextn_predict_layers` of them, at the layer indices past the text stack) have a DSA block
 //! with no hyper-connections and the four tensors that fuse the embedding with the hidden state and
-//! norm the output ([`MtpRole`]). The first one is mapped and traced ([`Phase::Mtp`]); the others,
+//! norm the output ([`MtpRole`]). The first one is mapped and traced (the `draft` program); the others,
 //! and the embedding and head copies a layer may store (the shared head reads the target's), are
 //! claimed as known: the map's [`LoadReport`](poot_quant::weights::LoadReport) lists them as known,
 //! not unknown.

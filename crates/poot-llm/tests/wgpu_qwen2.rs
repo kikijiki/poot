@@ -12,15 +12,15 @@ use poot_runtime_common::device_skip::open_or_skip;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Executor, NoSync, StepInputs};
 use poot_graph_ir::{ForwardSlotMap, Graph, Slot, SlotKey, Storage, ValueId, ValueTable};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
-use poot_models::model::{LogitRows, Phase, StepShape};
+use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -28,8 +28,7 @@ use poot_tensor::{DType, HostTensor, HostView};
 use poot_test_util::{assert_close_rel, max_abs_error};
 use poot_wgpu_device::device::WgpuDevice;
 
-/// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
-/// submission).
+/// Compile `g` for `target` through the executor contract's one staged program.
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     let g = g.clone();
     compile_staged(
@@ -39,7 +38,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the qwen2 graph")
 }
@@ -239,12 +238,15 @@ fn tiny() -> Dense {
         .max_positions(16)
 }
 
-/// `dense`'s graph for `phase` at `shape`, as an ordinary graph.
-fn trace(dense: &Dense, phase: Phase, shape: StepShape) -> Graph {
+/// `dense`'s step graph at `shape`, as an ordinary graph.
+fn trace(dense: &Dense, shape: StepShape) -> Graph {
     dense
         .f32_model()
         .model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(
+            &StepSpec::step(shape),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -324,7 +326,7 @@ fn cpu_step(
             .unwrap_or_else(|| HostTensor::zeros(g.aval(si).shape.clone()));
         cpu_inputs.insert(si, carried.into());
     }
-    let r = eval(g, &cpu_inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let r = eval(g, &cpu_inputs, EvalOptions::default()).unwrap();
     let out = r.output.into_host().unwrap();
     let next = r
         .state
@@ -377,7 +379,7 @@ fn assert_replay_matches_cpu(g: &Graph, feeds: &[Feed], label: &str) {
 
 /// A one-token decode step at position `pos` over a cache of 8 positions, and its feed.
 fn tiny_decode_graph() -> (Graph, Feed) {
-    let g = trace(&tiny(), Phase::Decode, step(1, 1, 8, LogitRows::Last));
+    let g = trace(&tiny(), step(1, 1, 8, LogitRows::Last));
     (g, Feed::new(vec![5], vec![3]))
 }
 
@@ -415,13 +417,16 @@ fn flash_attention_pass_prefill_gpu_matches_cpu() {
     let tokens = [5, 9, 2, 14, 7, 1];
     let l = tokens.len();
     // cap == the prompt: the flash pass recognises the square causal prefill, not a prompt over a longer cache.
-    let g = trace(&tiny(), Phase::Prefill, step(1, l, l, LogitRows::Last));
+    let g = trace(&tiny(), step(1, l, l, LogitRows::Last));
     let feed = Feed::new(tokens.to_vec(), (0..l as i32).collect());
     let fused = dce(&flash_attention_capped(
-        &rope_fusion(&fold_iota(&cse(&canonicalize(&g).unwrap()).unwrap()).unwrap()).unwrap(),
+        &rope_fusion(&fold_iota(&cse(&canonicalize(&g).unwrap()).unwrap()).unwrap())
+            .unwrap()
+            .0,
         None,
     )
-    .unwrap())
+    .unwrap()
+    .0)
     .unwrap();
     assert!(
         fused
@@ -453,7 +458,7 @@ fn prefill_runs_a_flash_fused_compiled_graph_and_matches_cpu() {
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
     let n = 64usize;
     let dense = tiny().max_positions(128);
-    let g = trace(&dense, Phase::Prefill, step(1, n, n, LogitRows::Last));
+    let g = trace(&dense, step(1, n, n, LogitRows::Last));
     let feed = Feed::new(
         (0..n).map(|i| (i % dense.vocab) as i32).collect(),
         (0..n as i32).collect(),
@@ -478,12 +483,8 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
     let dense = tiny();
     let n = slot_map.len();
     let (hkv, d) = (dense.kv_heads, dense.head_dim.unwrap());
-    let g_cont = trace(&dense, Phase::Prefill, step(1, n, cap, LogitRows::Last));
-    let g_paged = trace(
-        &dense,
-        Phase::Prefill,
-        paged_step(1, n, cap, pool, LogitRows::Last),
-    );
+    let g_cont = trace(&dense, step(1, n, cap, LogitRows::Last));
+    let g_paged = trace(&dense, paged_step(1, n, cap, pool, LogitRows::Last));
     let tokens: Vec<i32> = (0..n).map(|j| (j % dense.vocab) as i32).collect();
     let pos: Vec<i32> = (0..n as i32).collect();
     // position p -> slot_map[p]; positions past the prompt read slot 0 (they are masked).
@@ -499,7 +500,7 @@ fn assert_paged_prefill_matches_contiguous(slot_map: &[usize], cap: usize, pool:
         eval(
             g,
             &bind(g, feed, true),
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
+            EvalOptions::default().keep_environment(),
         )
         .unwrap()
         .environment
@@ -714,11 +715,7 @@ fn paged_decode_kv_gpu_matches_cpu() {
     // non-identity layout: logical t -> physical slot cap-1-t. The graph writes logical pos `p` at slot_map[p] and
     // reads by gathering slot_map[t], so it must reconstruct logical order regardless.
     let read: Vec<i32> = (0..cap).map(|t| (cap - 1 - t) as i32).collect();
-    let g = trace(
-        &tiny(),
-        Phase::Decode,
-        paged_step(1, 1, cap, cap, LogitRows::Last),
-    );
+    let g = trace(&tiny(), paged_step(1, 1, cap, cap, LogitRows::Last));
     let feeds: Vec<Feed> = tokens
         .iter()
         .enumerate()
@@ -739,7 +736,6 @@ fn batched_paged_decode_gpu_matches_cpu() {
     let vocab = tiny().vocab;
     let g = trace(
         &tiny(),
-        Phase::Decode,
         paged_step(batch, 1, cap, batch * cap, LogitRows::Last),
     );
     // row r owns slots [r*cap, r*cap+cap), reversed.
@@ -768,7 +764,6 @@ fn batched_shared_pool_decode_gpu_matches_cpu() {
     let vocab = tiny().vocab;
     let g = trace(
         &tiny(),
-        Phase::Decode,
         paged_step(batch, 1, cap, pool_slots, LogitRows::Last),
     );
     // global interleaved slot map [B, cap]: (row r, pos t) -> t*B + r for used positions, else slot 0.
@@ -801,11 +796,7 @@ fn batched_shared_pool_decode_gpu_matches_cpu() {
 fn qwen2_masked_decode_gpu_matches_cpu() {
     let tokens = [5, 9, 2, 14, 7];
     // the decode graph is built once (depends only on cap) and replayed for every position.
-    let g = trace(
-        &tiny(),
-        Phase::Decode,
-        step(1, 1, tokens.len(), LogitRows::Last),
-    );
+    let g = trace(&tiny(), step(1, 1, tokens.len(), LogitRows::Last));
     let feeds: Vec<Feed> = tokens
         .iter()
         .enumerate()
@@ -829,7 +820,7 @@ fn qwen2_live_bound_decode_gpu_matches_cpu_at_the_first_a_middle_and_the_last_po
         .heads(4, 2)
         .head_dim(4)
         .max_positions(CAP);
-    let g = trace(&dense, Phase::Decode, step(1, 1, CAP, LogitRows::Last));
+    let g = trace(&dense, step(1, 1, CAP, LogitRows::Last));
     let feeds: Vec<Feed> = (0..CAP)
         .map(|pos| Feed::new(vec![(pos as i32 * 7 + 3) % 32], vec![pos as i32]))
         .collect();
@@ -849,11 +840,14 @@ fn real_dense() -> Dense {
 }
 
 /// `dense`'s decode graph over `cap` positions, from a zero checkpoint.
-fn real_trace(dense: &Dense, phase: Phase, shape: StepShape) -> Graph {
+fn real_trace(dense: &Dense, shape: StepShape) -> Graph {
     dense
         .zeroed_model(DType::BF16)
         .model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(
+            &StepSpec::step(shape),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap()
 }
 
@@ -884,12 +878,7 @@ fn fusion_dispatch_reduction_on_real_qwen2_config() {
     }
 
     let cap = 64;
-    let base = cse(&real_trace(
-        &real_dense(),
-        Phase::Decode,
-        step(1, 1, cap, LogitRows::Last),
-    ))
-    .unwrap();
+    let base = cse(&real_trace(&real_dense(), step(1, 1, cap, LogitRows::Last))).unwrap();
     let fused = fuse(&base).unwrap();
 
     let before = count_dispatches(&base);
@@ -974,12 +963,7 @@ fn fusion_decode_latency_on_gpu() {
     let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
     let cap = 64;
     let feed = Feed::new(vec![5], vec![16]);
-    let base = cse(&real_trace(
-        &real_dense(),
-        Phase::Decode,
-        step(1, 1, cap, LogitRows::Last),
-    ))
-    .unwrap();
+    let base = cse(&real_trace(&real_dense(), step(1, 1, cap, LogitRows::Last))).unwrap();
     let fused = fuse(&base).unwrap();
 
     let iters = 100;
@@ -1066,16 +1050,8 @@ fn chunked_prefill_at_nonzero_start_matches_stepped_decode_gpu() {
         .paged(read.clone(), write)
     };
 
-    let g_prefill = trace(
-        &dense,
-        Phase::Prefill,
-        paged_step(1, l, cap, pool_slots, LogitRows::Last),
-    );
-    let g_decode = trace(
-        &dense,
-        Phase::Decode,
-        paged_step(1, 1, cap, pool_slots, LogitRows::Last),
-    );
+    let g_prefill = trace(&dense, paged_step(1, l, cap, pool_slots, LogitRows::Last));
+    let g_decode = trace(&dense, paged_step(1, 1, cap, pool_slots, LogitRows::Last));
     // One merged store (by const name) for both graphs, loaded fresh per path below so each path
     // starts from independent zero state.
     let merged_store = || -> WeightStore {

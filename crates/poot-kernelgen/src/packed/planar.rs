@@ -21,7 +21,7 @@ use super::decode_plan::Factors;
 use super::float_decode::emit_float_decode;
 use super::source::Source;
 use crate::KernelGenError;
-use crate::emit::{Emit, bin, copy, cu};
+use crate::emit::{Emit, bin, c32, copy, cu};
 
 fn reject(format: WeightFormat, reason: &'static str) -> KernelGenError {
     KernelGenError::UnsupportedDescriptor { format, reason }
@@ -187,6 +187,118 @@ impl PlanarPlan {
         }
     }
 
+    /// The `count` logical values `(o, k0 + j)` for `j in 0..count` of one weight row, `k0` a multiple of `count`
+    /// and every index below `k_total`: [`Self::emit_factors`] and [`Self::emit_value`] per element, except that
+    /// the run shares what its elements share. A scale its elements cannot straddle (a `K` extent that `count`
+    /// divides) is decoded once. A `Float` format whose codes are one unpacked stored element per `K` index
+    /// reads the whole run as one `count * bits` field (at most 32 bits) and slices it, so the address chain and
+    /// the word loads are emitted once per run instead of once per element.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_run(
+        &self,
+        e: &mut Emit,
+        src: &[Source],
+        o: Local,
+        k0: Local,
+        count: usize,
+        k_total: Local,
+        out_total: Local,
+    ) -> Vec<Local> {
+        let shared = self
+            .run_shares_factors(count)
+            .then(|| self.emit_factors(e, src, o, k0, k_total, out_total));
+        let codes = self.operands[self.codes];
+        let FieldEncoding::Float(format) = codes.encoding else {
+            return self.emit_run_elements(e, src, o, k0, count, k_total, out_total, shared);
+        };
+        let field_bits = codes.bits * count as u32;
+        let sliced = self.value == ValueMap::Float
+            && codes.packing.is_none()
+            && codes.major == Major::OutMajor
+            && codes.grid[1] == Extent::Values(1)
+            && field_bits <= 32;
+        if count == 1 || !sliced {
+            return self.emit_run_elements(e, src, o, k0, count, k_total, out_total, shared);
+        }
+        let bit = self.emit_operand_bit(e, src, &codes, o, k0, k_total, out_total);
+        let field = src[self.codes].read_bits(e, bit, field_bits);
+        let mask = (1u32 << codes.bits) - 1;
+        (0..count)
+            .map(|j| {
+                let shifted = match j {
+                    0 => field,
+                    _ => bin(
+                        e,
+                        Ty::U32,
+                        BinOp::Shr,
+                        copy(field),
+                        c32(j as u32 * codes.bits),
+                    ),
+                };
+                let code = bin(e, Ty::U32, BinOp::BitAnd, copy(shifted), c32(mask));
+                let value = emit_float_decode(e, format, code);
+                let own;
+                let factors = match &shared {
+                    Some(factors) => factors,
+                    None => {
+                        let k_index = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
+                        own = self.emit_factors(e, src, o, k_index, k_total, out_total);
+                        &own
+                    }
+                };
+                match factors.scale {
+                    Some(scale) => e.let_(
+                        Ty::F32,
+                        Rvalue::BinaryOp(BinOp::Mul, copy(scale), copy(value)),
+                    ),
+                    None => value,
+                }
+            })
+            .collect()
+    }
+
+    /// [`Self::emit_run`]'s element-by-element form: each element addresses its own codes, and decodes its own
+    /// factors unless `shared` holds the run's.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_run_elements(
+        &self,
+        e: &mut Emit,
+        src: &[Source],
+        o: Local,
+        k0: Local,
+        count: usize,
+        k_total: Local,
+        out_total: Local,
+        shared: Option<Factors>,
+    ) -> Vec<Local> {
+        (0..count)
+            .map(|j| {
+                let k_index = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
+                let own;
+                let factors = match &shared {
+                    Some(factors) => factors,
+                    None => {
+                        own = self.emit_factors(e, src, o, k_index, k_total, out_total);
+                        &own
+                    }
+                };
+                self.emit_value(e, src, o, k_index, k_total, out_total, factors)
+            })
+            .collect()
+    }
+
+    /// Whether every element of a run of `count` (starting at a multiple of `count`) has the same factors: the
+    /// scale's `K` extent is a multiple of `count`, or whole, or there is no scale.
+    fn run_shares_factors(&self, count: usize) -> bool {
+        match self.scale.map(|position| self.operands[position].grid[1]) {
+            None | Some(Extent::Whole) => true,
+            Some(Extent::Values(values)) => values.is_multiple_of(count),
+            Some(Extent::Group) => self
+                .group_size()
+                .is_some_and(|size| size.is_multiple_of(count)),
+        }
+    }
+
     /// `operand`'s raw stored bits at logical `(o, k)`: `poot_quant::decode::read_planar`'s
     /// `element`/`lane`/`stored_shape`/bit-offset chain, emitted.
     #[allow(clippy::too_many_arguments)]
@@ -195,6 +307,22 @@ impl PlanarPlan {
         e: &mut Emit,
         src: &[Source],
         source_index: usize,
+        operand: &PlanarOperand,
+        o: Local,
+        k: Local,
+        k_total: Local,
+        out_total: Local,
+    ) -> Local {
+        let bit = self.emit_operand_bit(e, src, operand, o, k, k_total, out_total);
+        src[source_index].read_bits(e, bit, operand.bits)
+    }
+
+    /// The bit offset in `operand`'s source of the stored bits at logical `(o, k)`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_operand_bit(
+        &self,
+        e: &mut Emit,
+        src: &[Source],
         operand: &PlanarOperand,
         o: Local,
         k: Local,
@@ -252,8 +380,7 @@ impl PlanarPlan {
             copy(lane),
             cu(operand.bits as usize),
         );
-        let bit = bin(e, Ty::Usize, BinOp::Add, copy(base_bit), copy(lane_bit));
-        src[source_index].read_bits(e, bit, operand.bits)
+        bin(e, Ty::Usize, BinOp::Add, copy(base_bit), copy(lane_bit))
     }
 
     /// The static per-group K-value count (`GroupMap::Contiguous`'s size), when this format's

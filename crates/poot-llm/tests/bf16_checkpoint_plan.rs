@@ -6,12 +6,12 @@
 //! than a blanket retype:
 //!
 //! - Every BF16 weight const stays BF16, so the raw graph's mixed-dtype matmuls are rejected by name
-//!   before `prepare_target_graph`, and the fold then reads each projection's weight as stored through a
+//!   before `compile`'s preparation, and the fold then reads each projection's weight as stored through a
 //!   `DenseContraction` (residency; no f32 device shadow). A BF16 `[K, N]` decode projection has no lowering
 //!   (`matmul_bf16_column_gemv`) and is refused rather than widened.
 //!
 //! Synthetic configs reproduce the operand shapes without loading weights. Covers the tracer's
-//! dtype choice, `prepare_target_graph`, and `plan_eqn`'s mixed-dtype rejection.
+//! dtype choice, `compile`'s preparation (`test_support::compiled_graph`), and `plan_eqn`'s mixed-dtype rejection.
 
 use poot_tensor::DType;
 use std::collections::BTreeSet;
@@ -20,8 +20,8 @@ use poot_graph_plan::passes_without_target;
 
 use poot_graph_ir::{Eqn, Graph, OpKind, Operand, Storage, ValueId};
 use poot_graph_plan::test_support::plan_eqn;
-use poot_graph_plan::{PlanError, dtype_widen::prepare_target_graph};
-use poot_models::model::{LogitRows, Phase};
+use poot_graph_plan::{PlanError, test_support::compiled_graph};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_target::Backend;
 
@@ -36,13 +36,12 @@ fn olmo2_like(family: Family) -> Dense {
         .max_positions(4096)
 }
 
-/// `dense`'s BF16 checkpoint traced at `phase` (`tokens` new tokens over `cap` positions).
-fn traced(dense: &Dense, phase: Phase, tokens: usize, cap: usize) -> Graph {
+/// `dense`'s BF16 checkpoint traced as one step program (`tokens` new tokens over `cap` positions).
+fn traced(dense: &Dense, tokens: usize, cap: usize) -> Graph {
     let m = dense.zeroed_model(DType::BF16);
     m.model
         .trace(
-            phase,
-            step(1, tokens, cap, LogitRows::Last),
+            &StepSpec::step(step(1, tokens, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -141,16 +140,15 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
     let graphs = [
         (
             "olmo2 prefill",
-            passes_without_target(&traced(&olmo2, Phase::Prefill, n, cap)).unwrap(),
+            passes_without_target(&traced(&olmo2, n, cap)).unwrap(),
         ),
         (
             "olmo2 decode",
-            passes_without_target(&traced(&olmo2, Phase::Decode, 1, cap)).unwrap(),
+            passes_without_target(&traced(&olmo2, 1, cap)).unwrap(),
         ),
         (
             "qwen2 prefill",
-            passes_without_target(&traced(&olmo2_like(Family::Qwen2), Phase::Prefill, n, cap))
-                .unwrap(),
+            passes_without_target(&traced(&olmo2_like(Family::Qwen2), n, cap)).unwrap(),
         ),
     ];
 
@@ -188,7 +186,12 @@ fn bf16_prefill_and_decode_graphs_plan_on_wgpu_and_rocm() {
                     .join("; "),
             );
 
-            let prepared = prepare_target_graph(g, backend).unwrap();
+            let prepared = compiled_graph(
+                g,
+                backend,
+                &poot_test_util::device_caps::default_caps_for(backend),
+            )
+            .unwrap();
             let failures = plan_failures(&prepared, backend);
             assert!(
                 failures.is_empty(),

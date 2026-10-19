@@ -1,6 +1,6 @@
 //! The gated delta-net decode op against a hand-rolled recurrence.
 
-use crate::{EvalBudget, EvalError, EvalOptions, Value};
+use crate::{EvalError, EvalOptions, Value};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::gated_delta_net_decode;
 use poot_graph_ir::types::TensorType;
@@ -89,7 +89,7 @@ fn gated_delta_net_decode_matches_recurrence() {
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                 .collect();
-            let evaluation = crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+            let evaluation = crate::eval(&g, &values, EvalOptions::default())?;
             let state = evaluation
                 .state
                 .into_iter()
@@ -223,8 +223,7 @@ fn gated_delta_net_decode_batch_generalizes_from_batch1() {
                         .iter()
                         .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                         .collect();
-                    let evaluation =
-                        crate::eval(&g_graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+                    let evaluation = crate::eval(&g_graph, &values, EvalOptions::default())?;
                     let state = evaluation
                         .state
                         .into_iter()
@@ -313,8 +312,7 @@ fn gated_delta_net_decode_batch_generalizes_from_batch1() {
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                 .collect();
-            let evaluation =
-                crate::eval(&g_graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+            let evaluation = crate::eval(&g_graph, &values, EvalOptions::default())?;
             let state = evaluation
                 .state
                 .into_iter()

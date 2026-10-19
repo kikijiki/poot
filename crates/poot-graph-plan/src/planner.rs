@@ -219,9 +219,9 @@ pub use choice::Planned;
 pub(crate) use choice::PlannedDispatch;
 pub use choice::{KernelChoice, NoDispatch};
 pub(crate) use matmul::epilogue_head_lowers;
-pub(crate) use vpu::plan_vpu_region;
 #[cfg(any(test, feature = "test-support"))]
 pub use vpu::vpu_refusals;
+pub(crate) use vpu::{narrow_to_device_precision, plan_vpu_region};
 
 use std::cell::Cell;
 
@@ -596,7 +596,7 @@ fn plan_gpu_eqn(
         // Card 542a: a block-32 descriptor (the seven GGUF schemes `packed_block_float::
         // PACKED_LOWERING` admits) reaches here through the descriptor-driven lowering table.
         let odt = g.aval(eqn.out).dtype;
-        if let Some(planned) = packed_dequant::try_plan(
+        return packed_dequant::plan(
             g,
             eqn,
             out_shape,
@@ -606,18 +606,14 @@ fn plan_gpu_eqn(
             caps,
             limits,
             packed_operands,
-        )? {
-            return Ok(planned);
-        }
-        return Err(site.refuse(Capability::ImportedKernelPlanning));
+        );
     }
     let ids = value_ids(eqn);
 
     // Spec 149 SC-005d/e/f/g/h/i/j/k/n: only storage-aware executor entry points bind the packed
     // representation. The shared planner exposes Cast/Reshape/Transpose/Slice/Gather/Concat/Broadcast/
-    // DynamicUpdateSlice/ScatterUpdate bodies here for SPIR-V/wgpu and bounded PTX typed capture. Legacy
-    // tensor-only entry points call `validate_graph_execution` first. Every other op/backend keeps a
-    // named rejection before scalar type selection can reinterpret E4M3FN as f32/i8/i32.
+    // DynamicUpdateSlice/ScatterUpdate bodies here for SPIR-V/wgpu and bounded PTX typed capture. Every
+    // other op/backend keeps a named rejection before scalar type selection can reinterpret E4M3FN as f32/i8/i32.
     let has_e4m3fn_input = ids.iter().any(|&id| g.aval(id).dtype == DType::E4M3FN);
     if g.aval(eqn.out).dtype == DType::E4M3FN || has_e4m3fn_input {
         if matches!(eqn.op, OpKind::Gather { .. })

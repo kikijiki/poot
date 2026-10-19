@@ -5,7 +5,7 @@ use poot_graph_ir::{Builder, OpKind, Operand, Slot, TensorType, packed_source_co
 use poot_quant::format::{ScaleEncoding, WeightFormat};
 use poot_quant::{OperandRole, PackedComponentRef, PackedPayload, PackedWeight, SourceRole};
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_tensor::HostTensor;
 
 fn fixture_e4m3_value(byte: u8) -> f32 {
@@ -107,7 +107,7 @@ fn run_case(x_shape: Vec<usize>, x_data: Vec<f32>, bytes: Vec<Vec<u8>>, scales: 
         );
     }
 
-    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let Value::Host(got) = eval(&graph, &inputs, EvalOptions::default())
         .expect("packed E4M3PerChannel CPU eval")
         .output
     else {

@@ -9,7 +9,7 @@ use poot_graph_ir::{BinOp, Builder, StateRole, TensorType, ValueId};
 use poot_tensor::HostTensor;
 
 use crate::walk::releases_after_each_equation;
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 
 fn dense(values: Vec<f32>) -> Value {
     HostTensor::f32(vec![values.len()], values).into()
@@ -80,13 +80,8 @@ fn a_value_is_released_after_its_last_reader_and_a_root_never_is() {
 #[test]
 fn releasing_dead_values_changes_neither_the_result_nor_the_carried_state() {
     let (graph, _, _, inputs) = chain();
-    let released = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
-    let kept = eval(
-        &graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .unwrap();
+    let released = eval(&graph, &inputs, EvalOptions::default()).unwrap();
+    let kept = eval(&graph, &inputs, EvalOptions::default().keep_environment()).unwrap();
     let host = |value: &Value| match value {
         Value::Host(tensor) => tensor.as_f32().unwrap().to_vec(),
         other => panic!("a dense value, got {other:?}"),
@@ -129,12 +124,7 @@ impl crate::observer::EvalObserver for LiveProbe {
 fn the_walk_really_drops_dead_values_while_it_runs() {
     let (graph, _, [a, sum, _c, _next, _state], inputs) = chain();
     let mut probe = LiveProbe::default();
-    eval(
-        &graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).observer(&mut probe),
-    )
-    .unwrap();
+    eval(&graph, &inputs, EvalOptions::default().observer(&mut probe)).unwrap();
     let (_, gone) = probe.gone_at.last().expect("four equations ran");
     assert!(
         gone.contains(&a) && gone.contains(&sum),

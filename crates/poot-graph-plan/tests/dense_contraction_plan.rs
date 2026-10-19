@@ -8,7 +8,6 @@
 use poot_graph_ir::{BinOp, Builder, Graph, OpKind, Operand, RedOp, StateRole, TensorType, Traced};
 use poot_graph_plan::{
     CompileError, CompileOptions, KernelChoice, PlanError, Program, StorageGap, Target, compile,
-    production_plan::Submission,
 };
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 use poot_target::{AmdArch, Backend, BufferStorage, DeviceCaps};
@@ -39,7 +38,7 @@ fn target(backend: Backend) -> Target {
 
 /// `g` compiled for `backend` through the full pipeline.
 fn program(g: &Graph, backend: Backend) -> Program {
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     compile(g, &target(backend), &options).expect("the graph compiles")
 }
 
@@ -297,7 +296,7 @@ fn an_f16_weight_with_a_second_reader_is_not_folded() {
         .binary(BinOp::Add, total_sum(&b, y), total_sum(&b, rows))
         .unwrap();
     let g = b.finish(total).unwrap();
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
         match compile(&g, &target(backend), &options) {
             Ok(program) => assert_eq!(
@@ -356,7 +355,7 @@ fn a_packed_f16_weight_with_a_native_reader_is_a_typed_refusal() {
         matmul.inputs[1] = Operand::Value(w.id());
     })
     .unwrap();
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
         match compile(&g, &target(backend), &options) {
             Err(CompileError::Plan(plan)) => match *plan {
@@ -565,7 +564,7 @@ fn a_matmul_head_off_the_tiled_route_never_takes_the_tiled_epilogue() {
             [ChainKept, ChainKept, ChainKept],
         ),
     ];
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     for (name, graph, expected) in &cases {
         for (backend, expected) in backends().into_iter().zip(expected) {
             let label = format!("{name} on {backend:?}");
@@ -722,7 +721,7 @@ fn a_blocked_weight_with_a_second_consumer_is_not_folded() {
         )
         .unwrap()
     });
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     for backend in backends() {
         // Unfolded, the BF16 transposed view has no lowering on the packed-lane wgpu target (a typed refusal of
         // the transpose); the native-BF16 targets plan the chain as traced. Never a grouped contraction.
@@ -774,8 +773,7 @@ fn a_grouped_weight_that_is_not_bf16_keeps_the_traced_chain() {
             .matmul(x, b.transpose(blocks, vec![0, 2, 1]).unwrap())
             .unwrap();
         let g = b.finish(out).unwrap();
-        let options =
-            CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+        let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
         for backend in backends() {
             // F32 plans the chain as traced; F16 has no lowering for the mixed matmul (a typed refusal).
             match compile(&g, &target(backend), &options) {

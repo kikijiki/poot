@@ -9,7 +9,7 @@
 //! never depend on poot-graph-plan (its own architecture test); this crate already dev-depends on
 //! poot-eval, so an integration test here can drive both.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::Builder;
 use poot_graph_ir::ops::rope_sectioned;
 use poot_graph_ir::types::TensorType;
@@ -59,7 +59,7 @@ fn rope_fusion_matches_and_is_result_preserving_on_sectioned_rope() {
         pos_w.id(),
     );
     let g = b.finish(out).unwrap();
-    let g2 = rope_fusion(&cse(&g).unwrap()).unwrap();
+    let g2 = rope_fusion(&cse(&g).unwrap()).unwrap().0;
     let has_rope_op = g2
         .eqns()
         .iter()
@@ -92,12 +92,12 @@ fn rope_fusion_matches_and_is_result_preserving_on_sectioned_rope() {
     inputs.insert(phi, Value::from(HostTensor::i32(vec![], vec![ph as i32])));
     inputs.insert(pwi, Value::from(HostTensor::i32(vec![], vec![pw as i32])));
 
-    let want = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(&g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
         .unwrap();
-    let got = eval(&g2, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(&g2, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

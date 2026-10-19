@@ -3,12 +3,12 @@ use std::collections::HashMap;
 
 use poot_graph_ir::{Builder, Graph, OpKind, ShapeError, Slot, TensorType, ValueId};
 
-use crate::{EvalBudget, EvalError, EvalOptions, ExactBf16Error, ExactValue, Value, eval};
+use crate::{EvalError, EvalOptions, ExactBf16Error, ExactValue, Value, eval};
 use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
 
 /// Card 534a: `fold_dense_contractions`/`fold_dense_bf16_row_gathers` moved
-/// into `poot-graph-plan`, `pub(crate)` there, reachable only through `prepare_target_graph`. This
+/// into `poot-graph-plan`, `pub(crate)` there, reachable only through `compile`. This
 /// crate (the CPU evaluator) must never depend on `poot-graph-plan`, even for tests -
 /// `poot_eval_does_not_depend_on_graph_plan` (`exact_i32.rs`) guards the Cargo.toml directly, since
 /// the oracle stays below the planner. `Builder` has no method for either op either way (compiler-only:
@@ -99,7 +99,7 @@ fn bf16_cast_decodes_words_bit_exactly() {
     let output = eval(
         &graph,
         &HashMap::from([(source.id(), Value::from(view))]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .map(|r| r.output)
     .unwrap();
@@ -133,13 +133,9 @@ fn bf16_gather_reads_the_selected_rows() {
         ])
     };
 
-    let output = eval(
-        &graph,
-        &inputs(vec![2, 0, 3]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .map(|r| r.output)
-    .unwrap();
+    let output = eval(&graph, &inputs(vec![2, 0, 3]), EvalOptions::default())
+        .map(|r| r.output)
+        .unwrap();
     let expected = [
         WORDS[4].1, WORDS[5].1, WORDS[0].1, WORDS[1].1, WORDS[6].1, WORDS[7].1,
     ];
@@ -159,12 +155,7 @@ fn bf16_gather_reads_the_selected_rows() {
             crate::ops::index_rule::IndexFaultKind::Negative,
         ),
     ] {
-        let output = eval(
-            &graph,
-            &inputs(ids),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output);
+        let output = eval(&graph, &inputs(ids), EvalOptions::default()).map(|r| r.output);
         assert!(matches!(
             &output,
             Err(EvalError::Index(fault))
@@ -196,7 +187,7 @@ fn bf16_gather_reads_the_selected_rows() {
                 Value::Host(HostTensor::i32(vec![2], vec![2, 0])),
             ),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .map(|r| r.output)
     .unwrap();
@@ -226,7 +217,7 @@ fn bf16_weight_matmul_decodes_the_weight_and_keeps_f32_precision() {
             (weight.id(), Value::from(table(&[2, 3]))),
             (x.id(), Value::Host(HostTensor::f32(vec![1, 3], activation))),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .map(|r| r.output)
     .unwrap();
@@ -279,7 +270,7 @@ fn dense_contraction_matches_the_mixed_matmul_definition() {
                 Value::Host(HostTensor::f32(vec![1, 3], activation.clone())),
             ),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .map(|r| r.output)
     .unwrap();
@@ -336,13 +327,9 @@ fn dense_row_gather_matches_gather_then_widen() {
             (token.id(), Value::Host(HostTensor::i32(vec![3], ids))),
         ])
     };
-    let output = eval(
-        &graph,
-        &inputs(vec![2, 0, 3]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .map(|r| r.output)
-    .unwrap();
+    let output = eval(&graph, &inputs(vec![2, 0, 3]), EvalOptions::default())
+        .map(|r| r.output)
+        .unwrap();
     let expected = [
         WORDS[4].1, WORDS[5].1, WORDS[0].1, WORDS[1].1, WORDS[6].1, WORDS[7].1,
     ];
@@ -363,12 +350,7 @@ fn dense_row_gather_matches_gather_then_widen() {
             crate::ops::index_rule::IndexFaultKind::Negative,
         ),
     ] {
-        let output = eval(
-            &graph,
-            &inputs(ids),
-            EvalOptions::new(EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output);
+        let output = eval(&graph, &inputs(ids), EvalOptions::default()).map(|r| r.output);
         assert!(matches!(
             &output,
             Err(EvalError::Index(fault))
@@ -436,7 +418,7 @@ fn dense_row_gather_matches_gather_then_widen() {
                 Value::Host(HostTensor::i32(vec![3], vec![2, 0, 3])),
             ),
         ]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .map(|r| r.output);
     let output = output.unwrap();
@@ -459,7 +441,7 @@ fn bf16_reshape_aliases_contiguous_views_only() {
     let output = eval(
         &graph,
         &HashMap::from([(source.id(), Value::from(view))]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .map(|r| r.output);
     let Value::Exact(ExactValue::Bf16(output)) = output.unwrap() else {
@@ -486,7 +468,7 @@ fn bf16_reshape_aliases_contiguous_views_only() {
     let output = eval(
         &graph,
         &HashMap::from([(source.id(), Value::from(table(&[2, 3])))]),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
+        EvalOptions::default(),
     )
     .map(|r| r.output);
     assert!(matches!(
@@ -534,61 +516,6 @@ fn matmul_rejects_bf16_weight_on_the_left_at_infer_time() {
 // there is no way to force this failure anymore. Not reinstated with an invented fallible-reservation
 // hook (would require editing `walk.rs`/`operand.rs`, outside this file and outside a mechanical
 // migration's authority).
-
-/// SC-008 (second clause): a derived BF16 value (a gathered table row set) consumed by a non-`Gather`
-/// equation (the widening `Cast(BF16, F32)`) above `EvalBudget`'s `max_alloc_bytes` is
-/// `EvalError::Budget`. (A plain `Value::Host` BF16 widens exactly with no charge, so the row reads
-/// the derived carrier.)
-///
-/// Mutation: drop the `opts.charge(...)` call in `walk.rs::evaluate_cast`'s `(DType::BF16,
-/// DType::F32)` arm; the bounded call stops erroring and this test goes red.
-#[test]
-fn bf16_widening_cast_above_budget_is_refused() {
-    let builder = Builder::for_tests();
-    let source = builder
-        .constant("table", TensorType::new([4, 2], DType::BF16))
-        .unwrap();
-    let token = builder
-        .slot(Slot::Token, TensorType::new([3], DType::I32))
-        .unwrap();
-    let rows = builder.gather(source, 0, token).unwrap();
-    let widened = builder.cast(rows, DType::F32).unwrap();
-    let graph = builder.finish(widened).unwrap();
-    let inputs = HashMap::from([
-        (source.id(), Value::from(table(&[4, 2]))),
-        (
-            token.id(),
-            Value::Host(HostTensor::i32(vec![3], vec![2, 0, 3])),
-        ),
-    ]);
-
-    // 6 gathered elements decode to 24 F32 bytes; a 20-byte ceiling must refuse before any byte is
-    // written (the 12-byte BF16 gather itself fits).
-    let bounded = eval(
-        &graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::bounded(1_000, 20)),
-    )
-    .expect_err("a derived BF16 value widened past max_alloc_bytes must refuse");
-    assert!(
-        matches!(
-            bounded,
-            EvalError::Budget {
-                resource: "bytes",
-                needed: 24,
-                limit: 20,
-                ..
-            }
-        ),
-        "{bounded:?}"
-    );
-
-    // The same cast under UNBOUNDED evaluates (every other test in this file already relies on this;
-    // restated here so the budget row is self-contained).
-    let unbounded = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .expect("UNBOUNDED must still evaluate the same cast");
-    assert!(matches!(unbounded.output, Value::Host(_)));
-}
 
 /// SC-003: an F32 chain containing a BF16 `Gather`, an I32 `Binary` and a `Select`
 /// evaluates to the same bits whether it stands alone or an unrelated `F32 -> E4M3FN -> F32` branch
@@ -649,7 +576,7 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
     let (bf16_table, idx, cond, zero, one, sum) = chain(&b);
     let graph_a = b.finish(sum).unwrap();
     let inputs_a = common_inputs(bf16_table.id(), idx.id(), cond.id(), zero.id(), one.id());
-    let out_a = eval(&graph_a, &inputs_a, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out_a = eval(&graph_a, &inputs_a, EvalOptions::default())
         .expect("the chain alone must evaluate")
         .output;
 
@@ -668,7 +595,7 @@ fn an_unrelated_e4m3fn_branch_does_not_change_an_otherwise_ordinary_mixed_dtype_
         e4m3_in.id(),
         Value::Host(HostTensor::f32(vec![2], vec![0.0, 0.0])),
     );
-    let out_b = eval(&graph_b, &inputs_b, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out_b = eval(&graph_b, &inputs_b, EvalOptions::default())
         .expect("the chain plus an unrelated E4M3FN branch must also evaluate")
         .output;
 

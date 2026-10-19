@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result, bail};
 use poot_llm::driver::{AdapterRef, DriverCaps, ModelHandle};
-use poot_llm::{Modality, Sampler, TokenLogprob};
+use poot_llm::{Sampler, TokenLogprob};
+
+use crate::modality::Modality;
 use poot_text::TextCodec;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};

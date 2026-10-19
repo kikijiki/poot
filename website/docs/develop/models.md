@@ -129,7 +129,7 @@ run; the matrix says what is verified.
 BERT-class encoder models for sentence embeddings and cross-encoder reranking.
 
 Safetensors is the usual format for HF-style encoder checkpoints. The `bert` family (an embedding encoder, or
-with the classifier head a cross-encoder) loads with `ModelHandle::load` and runs on the driver's `Encode` step on
+with the classifier head a cross-encoder) loads with `ModelHandle::load` and runs on the driver's `encode` step on
 wgpu, ROCm and PTX; `poot_llm::encoders` is the library path. `poot-serve` starts on an encoder
 checkpoint and serves `/v1/embeddings` and `/v1/rerank` from it, and from a decoder's embedding pass.
 
@@ -137,9 +137,9 @@ checkpoint and serves `/v1/embeddings` and `/v1/rerank` from it, and from a deco
 
 SmolVLM, idefics3, and Qwen2.5-VL.
 
-Multimodal chat: the vision tower (an `Encode`-only model) and the text decoder (the `llama` family read from the
+Multimodal chat: the vision tower (an `encode`-only model) and the text decoder (the `llama` family read from the
 checkpoint's `text_config`) are two registered families over one checkpoint, each on its own driver. The library
-path is `poot_llm::front_end::Idefics3` and the `poot-caption` binary. Qwen2.5-VL is the same shape (`qwen2_5_vl_vision` and the `qwen2_5_vl` text decoder with sectioned RoPE; `poot_llm::qwen_vl::Qwen25Vl`). Serving covers both families: `poot_llm::read_image_checkpoint` finds the vision-language checkpoint in a model directory and returns an `ImageCheckpoint`, which opens an `ImageFrontEnd` that turns a conversation and its images into the prompt's tokens, embedding rows and, for Qwen2.5-VL, its sectioned positions (see [Multimodal](../serve/multimodal.md)). ROCm and
+path is `poot_llm::front_end::Idefics3` and the `poot-caption` binary. Qwen2.5-VL is the same shape (`qwen2_5_vl_vision` and the `qwen2_5_vl` text decoder with sectioned RoPE; `poot_llm::qwen_vl::Qwen25Vl`). Serving covers both families: `poot_llm::read_image_checkpoint` finds the vision-language checkpoint in a model directory and returns an `ImageCheckpoint`, which opens an `ImageFrontEnd` that turns a conversation and its images into the prompt's tokens and the request inputs its text model declares: the embedding rows and, for Qwen2.5-VL, its sectioned positions (see [Multimodal](../serve/multimodal.md)). ROCm and
 PTX GPU verification is thinner than wgpu for some modalities; see the matrix before relying on it.
 
 ## Adding a model
@@ -147,7 +147,8 @@ PTX GPU verification is thinner than wgpu for some modalities; see the matrix be
 A new family touches only its own code. The driver, planner, executors and serve code do not change. The
 repository checks this with a test (`crates/poot-llm/tests/add_a_model/`) that defines a small decoder family
 inside the test, outside every production crate, and serves it through the public API. Its `family.rs`
-is the worked example. A family is four things, plus a checkpoint to load:
+is the worked example; `tagged.rs` beside it adds a request input the driver has never heard of. A family
+is five things, plus a checkpoint to load:
 
 1. **A config type.** Read the checkpoint's `config.json` once, check every value, and keep the result in a
    typed struct, so tracing cannot fail on a bad config.
@@ -158,7 +159,13 @@ is the worked example. A family is four things, plus a checkpoint to load:
    embedding, the layers, the final norm and the head, and `standard_layer` for the residual pair, with the
    family's own attention and MLP in the closures (the MLP closure receives a `BlockInput`: its `block` is the
    normalized input, and `residual` is the stream it joins).
-4. **A registry entry.** A `FamilyEntry` names the `model_type` (or GGUF architecture) that selects the
+4. **An input schema.** `Model::schema` returns a `ModelSchema`: the programs the model offers (`step`, and
+   `encode` or `draft` when it has them), the states each carries, and the request inputs it reads, each with
+   its slot, element type, shape, pad value and whether a request may omit it. A plain decoder is
+   `ModelSchema::builder().step(decoder_program(vocab)).build_for(FAMILY)`. A family that needs a value no
+   shipped family does (a tag per token, a per-row tensor) declares it here and traces it as a slot; the
+   driver binds it from the request's `RequestInputs` with no driver change.
+5. **A registry entry.** A `FamilyEntry` names the `model_type` (or GGUF architecture) that selects the
    family, a build function and a small fixture checkpoint. The build function takes the raw config and the
    weights and returns the `Model`; the model's `ModelConfig` carries what the driver needs to know without
    naming the family: the vocabulary size, the maximum positions, the end-of-sequence ids, the prefill

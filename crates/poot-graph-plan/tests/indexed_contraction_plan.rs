@@ -8,7 +8,6 @@ use poot_graph_ir::op::{BinOp, ContractionHead, RedOp};
 use poot_graph_ir::{Builder, Graph, OpKind, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, KernelChoice, Plan, Program, Target, compile,
-    production_plan::Submission,
 };
 use poot_kernelgen::{ContractionSpec, IndexedContraction, KernelRequest, Schedule, WeightLayout};
 use poot_target::{AmdArch, Backend, BufferStorage, DeviceCaps};
@@ -38,7 +37,7 @@ fn target(backend: Backend) -> Target {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 /// `g` compiled for `backend` through the full pipeline.
@@ -116,6 +115,7 @@ fn decode_shape_plans_the_gemv_on_every_backend_and_prefill_the_segmented_tiled(
                 match request.schedule {
                     Schedule::Gemv { .. } => gemv,
                     Schedule::Tiled { .. } => !gemv,
+                    Schedule::RegisterTiled { .. } => false,
                 },
                 "{label}: {:?}",
                 request.schedule

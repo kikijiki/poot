@@ -7,7 +7,7 @@
 
 use poot_graph_ir::OpKind;
 use poot_graph_plan as transform;
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 
 fn main() {
@@ -25,8 +25,7 @@ fn main() {
     let g = model
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("trace the decode step");

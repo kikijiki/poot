@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
+use crate::{EvalOptions, Value, eval, materialize_dense};
 use poot_graph_ir::{Graph, PackedSourceName, SlotKey, Storage, ValueId};
 use poot_quant::weights::{WeightEntry, WeightId, WeightMap, WeightStore, WeightView};
 use poot_quant::{PackedComponentRef, PackedPayload, PackedStack, PackedStackComponentRef};
@@ -94,8 +94,8 @@ pub fn eval_mapped(
         };
         inputs.insert(id, value);
     }
-    let evaluation = eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .unwrap_or_else(|e| panic!("oracle: {e}"));
+    let evaluation =
+        eval(g, &inputs, EvalOptions::default()).unwrap_or_else(|e| panic!("oracle: {e}"));
     let host = |v: Value| v.into_host().expect("a dense tensor");
     (
         host(evaluation.output),
@@ -168,7 +168,7 @@ pub fn oracle_for<'a>(
             };
             inputs.insert(id, value);
         }
-        let evaluation = eval(graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+        let evaluation = eval(graph, &inputs, EvalOptions::default()).unwrap();
         for ((si, _), t) in graph.state().zip(evaluation.state) {
             state.insert(
                 graph.meta(si).name.clone().unwrap(),

@@ -323,7 +323,8 @@ impl<'a> ContentMarks<'a> {
         tools: Option<&serde_json::Value>,
     ) -> std::result::Result<Self, ChatTemplateError> {
         const PRIVATE_USE: std::ops::RangeInclusive<char> = '\u{E000}'..='\u{F8FF}';
-        let mut used = vec![false; (*PRIVATE_USE.end() as usize) - (*PRIVATE_USE.start() as usize) + 1];
+        let mut used =
+            vec![false; (*PRIVATE_USE.end() as usize) - (*PRIVATE_USE.start() as usize) + 1];
         let mut note = |text: &str| {
             for c in text.chars().filter(|c| PRIVATE_USE.contains(c)) {
                 used[c as usize - *PRIVATE_USE.start() as usize] = true;

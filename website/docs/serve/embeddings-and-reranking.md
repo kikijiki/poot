@@ -6,7 +6,7 @@ sidebar_position: 7
 
 # Embeddings and reranking
 
-`/v1/embeddings` and `/v1/rerank` run the model as `Encode` steps on the engine thread, so they share its queue
+`/v1/embeddings` and `/v1/rerank` run the model as `encode` steps on the engine thread, so they share its queue
 and its request metrics. The encode shapes are fitted to the device memory and prepared at startup, before
 `/health` reports `serving`: a request compiles nothing and allocates nothing on the device.
 
@@ -56,6 +56,6 @@ Every request counts in the request metrics: its latency, and the tokens it enco
 
 ## In a program
 
-Both run on the driver's `Encode` step, on wgpu, ROCm or PTX. `SentenceEncoder` returns L2-normalized vectors,
+Both run on the driver's `encode` step, on wgpu, ROCm or PTX. `SentenceEncoder` returns L2-normalized vectors,
 so a dot product is the cosine similarity; `CrossEncoder` returns the classifier's raw logit. See
 [Embedding poot](../develop/embedding.md) for the API.

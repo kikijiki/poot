@@ -18,19 +18,21 @@
 //! in the official release, K-quant and IQ4 blocks in a GGUF), the BF16 owners are never widened per
 //! step.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use poot_graph_ir::{Builder, Graph};
+use poot_graph_ir::{Builder, Graph, StateRole};
 use poot_quant::format::{OperandRole, ScaleEncoding, WeightFormat};
 use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
 use poot_quant::{PackedPayload, PackedWeight, SourceRole, StoredBytes};
 
 use crate::components::linear::WeightError;
 use crate::components::moe;
-use crate::components::standard::{Step, check_step};
+use crate::components::standard::{Step, check_step, decoder_program};
+use crate::io::{ModelSchema, StateSpec};
 use crate::model::{
-    FamilyKey, KvLayout, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason,
-    StepShape, TraceError,
+    ConfigReason, FamilyKey, KvLayout, Model, ModelConfig, ModelError, ShapeReason, StepSpec,
+    TraceError,
 };
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
@@ -73,6 +75,7 @@ pub(crate) struct Qwen4Exp {
     weights: WeightMap,
     body: trace::Weights,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -81,6 +84,27 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
     p.moe = p.moe.with_gate_up(gate_up);
     let weights = config::weights_of(&p, store, names)?;
     let body = trace::Weights::new(&weights, &p).map_err(|e: WeightError| e.for_family(FAMILY))?;
+    let mut step = decoder_program(p.vocab);
+    if p.kinds.contains(&LayerKind::LinearAttention) {
+        step = step.carrying(StateSpec::recurrent("gdn"));
+    }
+    if p.kinds.contains(&LayerKind::FullAttention) {
+        let ratio = u32::try_from(p.ratio.get())
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or(ModelError::Config {
+                family: FAMILY,
+                field: "indexer_compress_ratio",
+                reason: ConfigReason::Exceeds {
+                    max: u32::MAX as usize,
+                },
+            })?;
+        step = step.carrying(StateSpec::new(
+            "index_blocks",
+            StateRole::Blocked { axis: 2, ratio },
+        ));
+    }
+    let schema = ModelSchema::builder().step(step).build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -88,7 +112,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: p.ratio,
         chat: ChatFormat::ChatML,
     };
@@ -97,6 +120,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         weights,
         body,
         config,
+        schema,
     }))
 }
 
@@ -105,18 +129,23 @@ impl Model for Qwen4Exp {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
         // The indexer pools whole blocks of the cache, and a prefill reads and writes whole blocks.
         let granule = p.ratio.get();
         let off_granule = !shape.capacity.get().is_multiple_of(granule)
-            || (phase == Phase::Prefill && !shape.tokens.get().is_multiple_of(granule));
+            || (!shape.is_decode() && !shape.tokens.get().is_multiple_of(granule));
         if off_granule {
             return Err(TraceError::ShapeUnsupported {
                 family: FAMILY,

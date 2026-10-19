@@ -34,13 +34,14 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_models::model::{KvLayout, LogitRows, StepShape};
+use poot_models::io::{InputSet, ProgramId, RequestInputs};
+use poot_models::model::{StepShape, StepSpec};
 
+use super::bind::{self, RequestFrame, RowFeed, Side, StepColumns};
 use super::chunks::Piece;
 use super::error::{InvalidRequest, PreparedSetRefusal, Unsupported};
-use super::step::serving_phase;
 use super::{
-    Driver, DriverError, EntryKey, FinishReason, Head, ModelRole, Prepared, StepData, host_sample,
+    Driver, DriverError, EntryKey, FinishReason, Head, ModelRole, Program, State, host_sample,
     reorder,
 };
 
@@ -193,7 +194,7 @@ fn top_logprobs(logits: &[f32], k: usize) -> Option<Vec<(u32, f32)>> {
     Some(ranked)
 }
 
-impl Driver {
+impl<S: State> Driver<S> {
     /// Beam search over `request.prompt` ([module docs](self)). The driver must have no open
     /// sequence. Every shape it runs is prepared here, within the prepared-set limits: the prompt's
     /// prefill pieces and the decode step at `rows = width`, and the row gather.
@@ -212,17 +213,14 @@ impl Driver {
             return Ok(Vec::new());
         }
         self.check_admission(&prompt, max_new)?;
-        let open = self
-            .serving
-            .as_ref()
-            .map_or(0, |serving| serving.seqs.len());
+        let open = self.state.open_sequences();
         if open > 0 {
             return Err(BeamError::Busy { open });
         }
         self.prepare_beam(width, prompt.len())?;
-        if self.residency == super::StateResidency::Recurrent {
+        if self.ledger.residency == super::StateResidency::Recurrent {
             // A recurrent state folds every token in: the prompt must start from zero.
-            self.reset_exe(self.exe)?;
+            self.reset_exe(self.runtime.exe)?;
         }
 
         let handle = Arc::clone(&self.handle);
@@ -299,24 +297,22 @@ impl Driver {
     fn beam_key(&self, rows: NonZeroUsize, tokens: usize) -> EntryKey {
         EntryKey {
             role: ModelRole::Beam,
-            phase: serving_phase(tokens, LogitRows::Last),
-            shape: StepShape {
+            program: Program::Step,
+            shape: StepShape::new(
                 rows,
-                tokens: NonZeroUsize::new(tokens).expect("a step carries a token"),
-                capacity: self.options.capacity,
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::Last,
-                hidden: None,
-            },
+                NonZeroUsize::new(tokens).expect("a step carries a token"),
+                self.settings.options.capacity,
+            ),
             head: Head::Logits,
             adapters: None,
+            carried: InputSet::EMPTY,
         }
     }
 
     /// Prepare the prefill pieces of a `prompt_len`-token prompt, the decode step and the row gather,
     /// each at `rows` rows.
     fn prepare_beam(&mut self, rows: NonZeroUsize, prompt_len: usize) -> Result<(), DriverError> {
-        let mut pieces = self.chunks.plan(prompt_len);
+        let mut pieces = self.settings.chunks.plan(prompt_len);
         pieces.push(Piece::Decode);
         for piece in pieces {
             let tokens = match piece {
@@ -331,11 +327,11 @@ impl Driver {
     /// The row gather for `rows` rows, compiled from the decode entry's state avals and added to the
     /// same executable, so it moves the state the decode entry carries.
     fn prepare_reorder(&mut self, rows: NonZeroUsize) -> Result<(), DriverError> {
-        if self.reorders.contains_key(&rows) {
+        if self.ledger.reorders.contains_key(&rows) {
             return Ok(());
         }
         let held = self.prepared_entries();
-        let limit = self.options.prepared.max_entries.get();
+        let limit = self.settings.options.prepared.max_entries.get();
         if held >= limit {
             return Err(PreparedSetRefusal::Entries { held, limit }.into());
         }
@@ -343,23 +339,34 @@ impl Driver {
         let graph = self
             .handle
             .model()
-            .trace(decode.phase, decode.shape, self.options.trace)
+            .trace(&StepSpec::step(decode.shape), self.settings.options.trace)
             .map_err(Unsupported::Trace)?;
-        let graph = reorder::reorder_graph(&graph, self.options.trace)
+        let graph = reorder::reorder_graph(&graph, self.settings.options.trace)
             .map_err(|error| Unsupported::RowGraph(Box::new(error)))?;
-        let slots = Prepared::slots_of(&graph)?;
+        let slots = bind::resolve_passes(&graph, ProgramId::STEP)?;
         let output = graph.aval(graph.result()).shape.clone();
-        let program = self.compile(&graph, &self.options.decode.clone())?;
+        let program = self.compile(
+            &graph,
+            &self.runtime.formats,
+            &self.settings.options.decode.clone(),
+        )?;
         let reservation = self.admit(&program)?;
-        let entry = self.add_entry(self.exe, &program, reservation, slots, output, decode.phase)?;
-        self.reorders.insert(rows, entry);
+        let entry = self.add_entry(
+            self.runtime.exe,
+            &program,
+            reservation,
+            slots,
+            output,
+            (decode.program, decode.shape),
+        )?;
+        self.ledger.reorders.insert(rows, entry);
         Ok(())
     }
 
     /// Prefill `prompt` in row 0 of the `rows`-row entries, the other rows masked. Returns the
     /// `[rows, vocab]` logits of the prompt's last position; only row 0 holds the prompt's.
     fn beam_prefill(&mut self, rows: NonZeroUsize, prompt: &[u32]) -> Result<Vec<f32>, BeamError> {
-        let pieces = self.chunks.plan(prompt.len());
+        let pieces = self.settings.chunks.plan(prompt.len());
         let mut start = 0;
         let mut logits = Vec::new();
         for (i, piece) in pieces.iter().enumerate() {
@@ -367,18 +374,32 @@ impl Driver {
                 Piece::Prefill(n) => n.get(),
                 Piece::Decode => 1,
             };
-            let entry = self.entries[&self.beam_key(rows, n)].clone();
-            let mut data = StepData {
+            let entry = self.ledger.entries[&self.beam_key(rows, n)].clone();
+            let mut columns = StepColumns {
                 tokens: vec![0; rows.get() * n],
                 pos: vec![0; rows.get() * n],
+                real: vec![0; rows.get() * n],
                 lora: vec![0; rows.get()],
-                ..StepData::default()
+                ..StepColumns::default()
             };
             for j in 0..n {
-                data.tokens[j] = prompt[start + j] as i32;
-                data.pos[j] = (start + j) as i32;
+                columns.tokens[j] = prompt[start + j] as i32;
+                columns.pos[j] = (start + j) as i32;
+                columns.real[j] = 1;
             }
-            let mut outputs = self.execute(&entry, &data)?;
+            let none = RequestInputs::none();
+            let feeds = [RowFeed {
+                inputs: &none,
+                start,
+                fed: n,
+            }];
+            let frame = RequestFrame {
+                rows: rows.get(),
+                tokens: n,
+                side: Side::Left,
+                feeds: &feeds,
+            };
+            let mut outputs = self.execute(&entry, &columns, &frame)?;
             if i + 1 == pieces.len() {
                 logits = host_sample::read_logits(&mut outputs)?;
             }
@@ -395,22 +416,38 @@ impl Driver {
         prompt: &[u32],
         live: &[Hypothesis],
     ) -> Result<Vec<f32>, BeamError> {
-        let entry = self.entries[&self.beam_key(rows, 1)].clone();
-        let mut data = StepData {
+        let entry = self.ledger.entries[&self.beam_key(rows, 1)].clone();
+        let mut columns = StepColumns {
             tokens: vec![0; rows.get()],
             pos: vec![0; rows.get()],
+            real: vec![0; rows.get()],
             lora: vec![0; rows.get()],
-            ..StepData::default()
+            ..StepColumns::default()
         };
         for (row, beam) in live.iter().enumerate() {
             let last = *beam
                 .tokens
                 .last()
                 .expect("a live beam has generated a token");
-            data.tokens[row] = last as i32;
-            data.pos[row] = (prompt.len() + beam.tokens.len() - 1) as i32;
+            columns.tokens[row] = last as i32;
+            columns.pos[row] = (prompt.len() + beam.tokens.len() - 1) as i32;
+            columns.real[row] = 1;
         }
-        let mut outputs = self.execute(&entry, &data)?;
+        let none = RequestInputs::none();
+        let feeds: Vec<RowFeed<'_>> = (0..live.len())
+            .map(|row| RowFeed {
+                inputs: &none,
+                start: usize::try_from(columns.pos[row]).expect("a position is not negative"),
+                fed: 1,
+            })
+            .collect();
+        let frame = RequestFrame {
+            rows: rows.get(),
+            tokens: 1,
+            side: Side::Left,
+            feeds: &feeds,
+        };
+        let mut outputs = self.execute(&entry, &columns, &frame)?;
         Ok(host_sample::read_logits(&mut outputs)?)
     }
 
@@ -428,12 +465,12 @@ impl Driver {
         {
             return Ok(());
         }
-        let entry = self.reorders[&rows].clone();
-        let data = StepData {
+        let entry = self.ledger.reorders[&rows].clone();
+        let columns = StepColumns {
             beam_rows: index,
-            ..StepData::default()
+            ..StepColumns::default()
         };
-        self.execute(&entry, &data)?;
+        self.execute(&entry, &columns, &RequestFrame::empty())?;
         Ok(())
     }
 }

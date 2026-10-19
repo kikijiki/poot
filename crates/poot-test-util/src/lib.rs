@@ -248,6 +248,7 @@ impl Worst {
     }
 
     fn of_f32(actual: &[f32], expected: &[f32], error_of: impl Fn(f64, f64) -> f64) -> Self {
+        assert!(!actual.is_empty(), "{NOTHING_TO_COMPARE}");
         Self::of(
             actual.iter().map(|&v| f64::from(v)),
             expected.iter().map(|&v| f64::from(v)),
@@ -272,6 +273,9 @@ impl Worst {
         )
     }
 }
+
+/// The panic of every comparison of two empty outputs, which would agree with any oracle.
+const NOTHING_TO_COMPARE: &str = "nothing to compare: an empty output agrees with any oracle";
 
 fn abs_error(actual: f64, expected: f64) -> f64 {
     (actual - expected).abs()
@@ -308,6 +312,53 @@ pub fn assert_close_rel(actual: &[f32], expected: &[f32], tol: f32) {
     );
 }
 
+/// `|actual - expected|` relative to `max(|expected|, 1)`: absolute below 1, relative above.
+fn unit_floor_error(actual: f64, expected: f64) -> f64 {
+    (actual - expected).abs() / expected.abs().max(1.0)
+}
+
+/// `Ok` when every element of `actual` is within `tol * max(|expected|, 1)` of `expected`, else the report of the
+/// worst element. The one definition of the tier-2 element bound (ADR-0101): a NaN, or an infinity where
+/// `expected` is not the same infinity, is never within it. Panics on a length mismatch or two empty slices.
+pub fn check_close_unit_floor(actual: &[f32], expected: &[f32], tol: f32) -> Result<(), String> {
+    let worst = Worst::of_f32(actual, expected, unit_floor_error);
+    if worst.error <= f64::from(tol) {
+        Ok(())
+    } else {
+        Err(worst.describe_f32("worst error"))
+    }
+}
+
+/// `|actual - expected|` relative to `1 + |expected|`.
+fn scaled_error(actual: f64, expected: f64) -> f64 {
+    (actual - expected).abs() / (1.0 + expected.abs())
+}
+
+/// Asserts every element of `actual` is within `tol * (1 + |expected|)` of `expected`, prefixing the panic with
+/// `label`. NaN and infinities fail as in [`assert_close`].
+#[track_caller]
+pub fn assert_close_scaled(actual: &[f32], expected: &[f32], tol: f32, label: &str) {
+    let worst = Worst::of_f32(actual, expected, scaled_error);
+    assert!(
+        worst.error <= f64::from(tol),
+        "{label}: {} exceeds tolerance {tol}",
+        worst.describe_f32("worst scaled error")
+    );
+}
+
+/// The largest `|actual - expected| / max(|expected|, 1)`, for tests that bound it against a tolerance. Panics,
+/// naming the element, on a NaN or a non-finite difference, so the returned error is always finite.
+#[track_caller]
+pub fn max_unit_floor_error(actual: &[f32], expected: &[f32]) -> f32 {
+    let worst = Worst::of_f32(actual, expected, unit_floor_error);
+    assert!(
+        worst.error.is_finite(),
+        "{}",
+        worst.describe_f32("non-finite value")
+    );
+    worst.error as f32
+}
+
 /// The largest absolute error between `actual` and `expected`, for tests that print it or bound it against
 /// something other than a fixed tolerance. Panics, naming the element, on a NaN or a non-finite difference,
 /// so the returned error is always finite.
@@ -325,6 +376,7 @@ pub fn max_abs_error(actual: &[f32], expected: &[f32]) -> f32 {
 /// [`max_abs_error`] against an `f64` reference, for tests whose ground truth is computed in double precision.
 #[track_caller]
 pub fn max_abs_error_f64(actual: &[f32], expected: &[f64]) -> f64 {
+    assert!(!actual.is_empty(), "{NOTHING_TO_COMPARE}");
     let worst = Worst::of(
         actual.iter().map(|&v| f64::from(v)),
         expected.iter().copied(),
@@ -636,6 +688,144 @@ mod tests {
     #[should_panic(expected = "non-finite value at index 1: actual NaN")]
     fn max_abs_error_f64_rejects_a_nan_actual() {
         max_abs_error_f64(&[1.0, f32::NAN], &[1.0, 2.0]);
+    }
+
+    /// `fold(<seed>, f32::max)`, assembled so this file does not itself contain the pattern it forbids.
+    fn fold_with_max(seed: &str) -> String {
+        format!("fold({seed}, {}::max)", "f32")
+    }
+
+    /// The 1-based lines of `source` that close a zero-seeded `f32::max` fold whose preceding lines take an
+    /// `.abs()`. `f32::max` returns the non-NaN operand, so such a fold over an all-NaN output is 0 and passes
+    /// any tolerance (R2-L05-002).
+    fn nan_blind_folds(source: &str) -> Vec<usize> {
+        let closers = ["0.0", "0.0f32"].map(fold_with_max);
+        let lines: Vec<&str> = source.lines().collect();
+        (0..lines.len())
+            .filter(|&i| {
+                closers
+                    .iter()
+                    .any(|closer| lines[i].contains(closer.as_str()))
+            })
+            .filter(|&i| {
+                lines[i.saturating_sub(8)..=i]
+                    .iter()
+                    .any(|l| l.contains(".abs()"))
+            })
+            .map(|i| i + 1)
+            .collect()
+    }
+
+    #[test]
+    fn nan_blind_folds_finds_a_fold_over_a_difference_and_nothing_else() {
+        let difference = format!(
+            "a.iter()\n    .map(|(x, y)| (x - y).abs())\n    .{};",
+            fold_with_max("0.0f32")
+        );
+        assert_eq!(nan_blind_folds(&difference), [3]);
+        let relative = format!(
+            "v.map(|(x, y)| (x - y).abs() / y.abs().max(1.0))\n    .{}",
+            fold_with_max("0.0")
+        );
+        assert_eq!(nan_blind_folds(&relative), [2]);
+        let row_max = format!(
+            "let top = scores.iter().copied().{};",
+            fold_with_max("f32::NEG_INFINITY")
+        );
+        assert!(
+            nan_blind_folds(&row_max).is_empty(),
+            "a row maximum is not a difference"
+        );
+    }
+
+    /// No file in `crates/` folds `|a - b|` with `f32::max` (R2-L05-002): use `poot_test_util::max_abs_error`,
+    /// `max_unit_floor_error` or `assert_close`, which fail on a NaN.
+    ///
+    /// Mutation: add a zero-seeded `f32::max` fold over `(a - b).abs()` to any `.rs` file under `crates/`; this
+    /// goes red naming the file and line.
+    #[test]
+    fn no_test_folds_a_difference_with_f32_max() {
+        fn rust_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name != "target") {
+                        rust_files(&path, found);
+                    }
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        rust_files(&crates, &mut files);
+        assert!(
+            files.len() > 100,
+            "the scan found only {} files",
+            files.len()
+        );
+        let mut offenders = Vec::new();
+        for file in files {
+            let Ok(source) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for line in nan_blind_folds(&source) {
+                offenders.push(format!("{}:{line}", file.display()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a NaN-blind fold of a difference (use poot_test_util::max_abs_error): {offenders:#?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "nan: worst scaled error at index 1: actual NaN")]
+    fn assert_close_scaled_rejects_a_nan_and_names_the_label() {
+        assert_close_scaled(&[1.0, f32::NAN], &[1.0, 1.0], 1e-3, "nan");
+    }
+
+    #[test]
+    fn assert_close_scaled_bounds_the_error_by_one_plus_the_expected_magnitude() {
+        assert_close_scaled(&[11.0], &[10.0], 0.1, "inside: 1 <= 0.1 * 11");
+        let message = panic_message(|| assert_close_scaled(&[11.2], &[10.0], 0.1, "outside"));
+        assert!(message.contains("outside: worst scaled error"), "{message}");
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing to compare")]
+    fn assert_close_scaled_rejects_two_empty_outputs() {
+        assert_close_scaled(&[], &[], 1.0, "empty");
+    }
+
+    #[test]
+    fn check_close_unit_floor_refuses_nan_and_off_tolerance_and_accepts_within() {
+        check_close_unit_floor(&[1.0, 10.5], &[1.0, 10.0], 0.05).expect("0.5 <= 0.05 * 10");
+        let err =
+            check_close_unit_floor(&[1.0, 11.0], &[1.0, 10.0], 0.05).expect_err("1.0 > 0.05 * 10");
+        assert!(err.contains("index 1"), "{err}");
+        let err =
+            check_close_unit_floor(&[f32::NAN], &[1.0], f32::MAX).expect_err("NaN never agrees");
+        assert!(err.contains("actual NaN"), "{err}");
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing to compare")]
+    fn assert_close_rejects_two_empty_outputs() {
+        assert_close(&[], &[], 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite value at index 1: actual NaN")]
+    fn max_unit_floor_error_rejects_a_nan_actual() {
+        max_unit_floor_error(&[1.0, f32::NAN], &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn max_unit_floor_error_is_absolute_below_one_and_relative_above() {
+        assert_eq!(max_unit_floor_error(&[0.5, 10.0], &[0.0, 12.0]), 0.5);
+        assert_eq!(max_unit_floor_error(&[0.5, 10.0], &[0.25, 20.0]), 0.5);
     }
 
     #[test]

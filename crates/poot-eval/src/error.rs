@@ -169,18 +169,6 @@ pub enum EvalError {
     /// A cast whose value cannot round-trip; boxed to keep the error small.
     #[error(transparent)]
     Cast(Box<CastFault>),
-    /// A `PackedContraction`/packed table read, or a materialization, exceeded `EvalOptions`'s budget.
-    #[error("eqn {eqn} needs {needed} {resource}, budget allows {limit}")]
-    Budget {
-        /// The equation (the enclosing composite, inside a decomposition) that exceeded the budget.
-        eqn: ValueId,
-        /// Which budget was exceeded: `"elements"` or `"bytes"`.
-        resource: &'static str,
-        /// What the equation asked for, in `resource`'s unit.
-        needed: usize,
-        /// What the budget allows, in `resource`'s unit.
-        limit: usize,
-    },
     /// A slot input holds a word outside the range its graph declares for it (POOT-726): the same
     /// refusal a device executor gives at bind, raised before any equation runs.
     #[error(transparent)]

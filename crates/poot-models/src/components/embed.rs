@@ -1,10 +1,14 @@
 //! The token embedding: rows of the `[vocab, width]` table gathered by token id.
 
-use poot_graph_ir::{Builder, Slot, TensorType, Traced};
+use poot_graph_ir::{Builder, Slot, SlotKey, TensorType, Traced};
 use poot_quant::weights::{WeightId, WeightMap, WeightRole};
-use poot_tensor::DType;
+use poot_tensor::{DType, HostTensor};
 
 use super::linear::{Weight, WeightError};
+use crate::io::{
+    InputId, InputValue, Layout, PadValue, Per, RequestForm, RequestInput, RequestInputs,
+    TokenValues, ValueError,
+};
 use crate::model::TraceError;
 
 /// The model's `[vocab, width]` embedding table.
@@ -37,14 +41,48 @@ impl Embedding {
     }
 }
 
-/// The name of the `Slot::Activation` input holding a step's caller-computed embedding rows,
-/// `[rows, tokens, width]` F32.
-pub const EMBEDS_SLOT: &str = "embeds";
-/// The name of the `Slot::Activation` input marking where those rows apply, `[rows, tokens]` I32:
-/// nonzero where the row replaces the token's embedding.
-pub const EMBEDS_AT_SLOT: &str = "embeds_at";
+/// The request input holding the caller-computed embedding rows a prompt supplies in place of some
+/// tokens' own (a multimodal prompt's image rows): sparse per-token values the driver binds on every
+/// prefill step that covers one of their positions.
+pub const EMBEDS: InputId = InputId::new("embeds");
+/// The `Slot::Activation` tag of the embedding rows, `[rows, tokens, width]` F32.
+const EMBEDS_TAG: &str = "embeds";
+/// The `Slot::Activation` tag marking where those rows apply, `[rows, tokens]` I32: nonzero where the
+/// row replaces the token's embedding.
+const EMBEDS_AT_TAG: &str = "embeds_at";
 
-/// A step's `StepInput::TokensWithEmbeds` inputs: embedding rows the caller computed (a vision
+/// The schema entry of [`EMBEDS`] for a model of embedding width `width`: optional sparse F32 rows with
+/// the presence mask the step scatters them by.
+pub fn embeds_input(width: usize) -> RequestInput {
+    RequestInput::new(
+        EMBEDS,
+        SlotKey::new(Slot::Activation, Some(EMBEDS_TAG)),
+        RequestForm::new(
+            DType::F32,
+            Per::Token {
+                width,
+                layout: Layout::TokenMajor,
+                presence: Some(SlotKey::new(Slot::Activation, Some(EMBEDS_AT_TAG))),
+            },
+            PadValue::F32(0.0),
+        ),
+    )
+}
+
+/// The request inputs of a prompt that supplies embedding rows in place of the embeddings of some of its
+/// tokens: `rows` holds `positions.len() * width` values, row-major, one `width`-wide row per entry of
+/// `positions` (strictly ascending prompt positions).
+pub fn embeds_inputs(
+    width: usize,
+    positions: Vec<usize>,
+    rows: Vec<f32>,
+) -> Result<RequestInputs, ValueError> {
+    let count = positions.len();
+    let values = TokenValues::sparse(positions, HostTensor::f32(vec![count, width], rows))?;
+    Ok(RequestInputs::none().with(EMBEDS, InputValue::Tokens(values)))
+}
+
+/// A step's [`EMBEDS`] inputs: embedding rows the caller computed (a vision
 /// tower's output for a prompt's image placeholders) and the positions they replace.
 #[derive(Clone, Copy, Debug)]
 pub struct EmbedInputs {
@@ -63,18 +101,18 @@ impl EmbedInputs {
         Ok(Self {
             rows: b.slot_named(
                 Slot::Activation,
-                EMBEDS_SLOT,
+                EMBEDS_TAG,
                 TensorType::f32(vec![rows, tokens, width]),
             )?,
             at: b.slot_named(
                 Slot::Activation,
-                EMBEDS_AT_SLOT,
+                EMBEDS_AT_TAG,
                 TensorType::new(vec![rows, tokens], DType::I32),
             )?,
         })
     }
 
-    /// `x` (`[rows, tokens, width]`, F32) with the caller's rows where [`EMBEDS_AT_SLOT`] is set. A
+    /// `x` (`[rows, tokens, width]`, F32) with the caller's rows where the presence mask is set. A
     /// select, so the unused rows of the input (zeros at the other positions) never reach the result.
     pub fn scatter(&self, b: &Builder, x: Traced) -> Result<Traced, TraceError> {
         let shape = b.aval(x)?.shape;

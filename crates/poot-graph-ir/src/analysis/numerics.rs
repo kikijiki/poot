@@ -1,11 +1,11 @@
 //! Op-level numerics classification and the tier-2 class a compiled program publishes (ADR-0101
-//! decision 2). The per-pass declarations live with the passes, in `poot-graph-plan`.
+//! decision 2). A pass's contribution is derived from the graphs it rewrote ([`NumericsDelta`]).
 //!
 //! These classes describe device scheduling and comparison tolerances. They are not proofs of
 //! semantic equivalence: every graph rewrite must separately preserve the CPU computation, including
 //! intermediate rounding and every observable output and state value.
 //!
-//! A pass that rewrites floating-point work declares its device behavior (in `poot-graph-plan`):
+//! A graph rewrite is described by the strongest of these over the equations it produced:
 //!
 //! - [`NumericsProperty::Exact`] preserves every result and carried value bit for bit, so the oracle's
 //!   tier-1 equality still holds.
@@ -19,11 +19,13 @@
 //!
 //! The properties are ordered by severity, so the strongest one a graph exhibits is a fold. A compiled
 //! program publishes [`NumericsProperty::tier2_class`] of that fold, and a device result is compared with
-//! the oracle within [`Tier2Class::tolerance`]. [`implied_numerics_of`] reads the ops a pass produced, so
-//! its declaration can be checked: a pass that reassociates while declaring `Exact` is refused instead of
-//! publishing a tolerance that is too tight.
+//! the oracle within [`Tier2Class::tolerance`]. [`NumericsDelta`] reads the ops a rewrite produced off the two
+//! graphs, so a pass that reassociates cannot publish a tolerance that is too tight.
+
+use std::collections::HashMap;
 
 use super::{Graph, OpKind, ValueId};
+use crate::graph::Eqn;
 use crate::types::{DType, DTypeClass, DTypeClassExt};
 
 /// Device scheduling behavior (ADR-0101 decision 2), ordered by severity. This describes comparison
@@ -183,13 +185,30 @@ pub enum NumericsError {
     },
 }
 
-/// The strongest property among the equations of `g` whose op satisfies `produced`. A pass checks its
-/// declaration against this over the ops it produces, so a pass that reassociates while declaring `Exact`
-/// is refused instead of publishing a tolerance that is too tight.
-pub fn implied_numerics_of(g: &Graph, produced: impl Fn(&OpKind) -> bool) -> NumericsProperty {
-    g.eqns()
-        .iter()
-        .filter(|eqn| produced(&eqn.op))
-        .map(|eqn| implied_op_numerics(&eqn.op, g.aval(eqn.out).dtype))
-        .fold(NumericsProperty::Exact, NumericsProperty::strongest)
+/// What a rewrite did to a graph's device arithmetic, read off the two graphs and nothing else: the strongest
+/// property among the equations it produced. An equation is produced when its output is new or its op or output
+/// type changed. A pass declares nothing: the program's class absorbs what it produced, so a pass that
+/// introduces a reassociating op cannot publish a tolerance that is too tight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NumericsDelta {
+    /// The strongest property among the equations the rewrite added or changed.
+    pub produced: NumericsProperty,
+}
+
+impl NumericsDelta {
+    /// The delta of rewriting `before` into `after`.
+    pub fn between(before: &Graph, after: &Graph) -> Self {
+        let before_at: HashMap<ValueId, &Eqn> = before.eqns().iter().map(|e| (e.out, e)).collect();
+        let class = |g: &Graph, eqn: &Eqn| implied_op_numerics(&eqn.op, g.aval(eqn.out).dtype);
+        let same = |old: &Eqn, new: &Eqn| {
+            old.op == new.op && before.aval(old.out).dtype == after.aval(new.out).dtype
+        };
+        let produced = after
+            .eqns()
+            .iter()
+            .filter(|new| before_at.get(&new.out).is_none_or(|old| !same(old, new)))
+            .map(|eqn| class(after, eqn))
+            .fold(NumericsProperty::Exact, NumericsProperty::strongest);
+        Self { produced }
+    }
 }

@@ -45,7 +45,6 @@ pub use multimodal::{
     MultimodalPrompt, encoders, front_end, qwen_vl, read_image_checkpoint,
 };
 
-pub use core::modality::Modality;
 pub use core::sampler::{Sampler, SamplerFault, TokenLogprob};
 pub use multimodal::qwen_vl_chat::{
     Qwen25VlChatContent, Qwen25VlChatImageFileError, Qwen25VlChatMessage,

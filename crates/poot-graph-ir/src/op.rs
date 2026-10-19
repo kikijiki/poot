@@ -71,7 +71,10 @@ pub enum BinOp {
     Mul,
     /// Division, `a / b`.
     Div,
-    /// Elementwise maximum.
+    /// Elementwise maximum. On floats it is max-number: a NaN operand is ignored and the other operand is the
+    /// result, NaN only when both are NaN. This is `llvm.maxnum`, which the LLVM-based lowerings emit, and
+    /// [`crate::ops::canonical_router_scores`] relies on it to turn NaN scores into numbers. Integer `Max` is the
+    /// plain signed maximum.
     Max,
     /// Elementwise `a >= b -> 1.0` else `0.0` (the comparison/indicator primitive). Output dtype follows the
     /// operands like the arithmetic ops. All other comparisons derive from it: `gt(a,b) = 1 - ge(b,a)`,
@@ -105,7 +108,8 @@ pub enum BinOp {
 pub enum RedOp {
     /// Sum of the reduced elements.
     Sum,
-    /// Maximum of the reduced elements.
+    /// Maximum of the reduced elements, with the float max-number rule of [`BinOp::Max`]: NaN elements are
+    /// ignored, so a row of only NaN reduces to the identity, negative infinity.
     Max,
 }
 
@@ -128,6 +132,57 @@ pub enum SampleRule {
     /// bisection, tier 2 on the noise/membership boundary). Operands: `logits`, `noise`, `params =
     /// [inv_temp, floor_offset, noise_scale, top_p]` (one extra column versus the other rules), `top_k`.
     GumbelTopKTopP,
+}
+
+impl SampleRule {
+    /// The rule a temperature draw's `top_k`/`top_p` knobs select (`top_k == 0` and `top_p >= 1.0` mean
+    /// "disabled"; min-p rides in every Gumbel-family rule's `params`). The one classification the
+    /// device suffix, the host sampler and the oracle's operand lists all read, so a request cannot be
+    /// a different rule on two paths.
+    pub const fn for_truncation(top_k: usize, top_p: f32) -> Self {
+        if top_p < 1.0 {
+            Self::GumbelTopKTopP
+        } else if top_k > 0 {
+            Self::GumbelTopK
+        } else {
+            Self::Gumbel
+        }
+    }
+
+    /// Whether the rule truncates to the `top_k` largest logits (it declares the `top_k` operand).
+    pub const fn has_top_k(self) -> bool {
+        matches!(self, Self::GumbelTopK | Self::GumbelTopKTopP)
+    }
+
+    /// Whether the rule truncates to the top-p nucleus (it carries the fourth `params` column).
+    pub const fn has_top_p(self) -> bool {
+        matches!(self, Self::GumbelTopKTopP)
+    }
+
+    /// The number of `params` columns the rule reads: `[inv_temp, floor_offset, noise_scale]`, plus
+    /// `top_p` for [`SampleRule::GumbelTopKTopP`]. `Greedy` reads no `params` operand.
+    pub const fn params_cols(self) -> usize {
+        match self {
+            Self::Greedy => 0,
+            Self::Gumbel | Self::GumbelTopK => 3,
+            Self::GumbelTopKTopP => 4,
+        }
+    }
+}
+
+/// The `RandomUniform` value at flat index `idx` under `seed`: `u = (2 * (hash32(seed, idx) >> 9) + 1) *
+/// 2^-24`, an exact I32->F32 conversion and a power-of-two multiply, always in `[2^-24, 1 - 2^-24]`. The
+/// one definition of the per-element noise coordinate, read by the host sampler (the device kernels and
+/// the oracle compute the same value; tier 1, ADR-0101).
+pub fn random_uniform_at(seed: u32, idx: u32) -> f32 {
+    let mantissa = (crate::ops::sampling::hash32(seed, idx) >> 9) as i32;
+    (2.0f32 * (mantissa as f32) + 1.0f32) * 5.9604645e-8f32
+}
+
+/// Standard Gumbel(0,1) noise from a uniform `u` in `(0, 1)`: `-ln(-ln(u))`, the scalar form of
+/// [`crate::ops::sampling::gumbel`]'s graph composition (tier 2 against a device `log`, ADR-0114).
+pub fn gumbel_noise(u: f32) -> f32 {
+    -(-u.ln()).ln()
 }
 
 /// A scalar pointwise op inside a fused region (the subset G5a fuses). A composition of these over the region's
@@ -746,9 +801,9 @@ pub enum OpKind {
     /// block (Card 385): `out[b, i, j] = sum over k of activation[b, i, k] * decode(weight[b * (out / blocks) + j,
     /// k])`, `b` ranging over `blocks`. `Blocks(1)` is the ordinary dense contraction (the activation may be any
     /// rank ending in `K`); `Blocks(n > 1)` requires a rank-3 `[n, M, K]` activation and produces `[n, M, out /
-    /// n]`. See [`crate::ops::packed_linear`] and [`crate::ops::packed_block_diagonal_linear`].
+    /// n]`. See `packed_graphs::packed_linear` and `packed_graphs::packed_block_diagonal_linear`.
     /// [`ContractionRows::Indexed`] contracts each row of `x [M, K]` against its own expert of a stacked table
-    /// (the routed MoE projection, [`crate::ops::packed_indexed_linear`]); one field, not a second variant,
+    /// (the routed MoE projection, `packed_graphs::packed_indexed_linear`); one field, not a second variant,
     /// because both are the same index map over the same descriptor-driven decode.
     PackedContraction {
         /// The packed weight the activation is contracted against.
@@ -986,6 +1041,13 @@ pub enum OpKind {
     /// when `non_finite_index >= 0`, so the output is fully determined even though the driver (card
     /// 551b) never commits a faulted row's token. F32 logits only (every other dtype is a typed
     /// `ShapeError`); see [`crate::ops::sampling::sample_head`].
+    ///
+    /// A primitive with a closed rule set, not a composite: its top-k and top-p floors are value-threshold
+    /// bisections over the row (a data-dependent search no elementwise or last-axis reduction composition
+    /// states), and the contract's tiers are stated per rule (ADR-0114). The rule set is the
+    /// [`SampleRule`] enum, exhaustively matched at every consumer, so a new rule is a compile error
+    /// at each one rather than an open extension point. The exact host sampler is the reference for the
+    /// distribution (`poot-llm`'s `Sampler`), never this op's evaluator.
     SampleToken {
         /// Which sampler the operand list and semantics follow.
         rule: SampleRule,

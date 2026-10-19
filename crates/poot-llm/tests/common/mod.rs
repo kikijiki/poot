@@ -76,7 +76,7 @@ pub(crate) fn assert_prefill_fills_cache_like_token_by_token(
     layers: usize,
     tol: f32,
 ) {
-    use poot_models::model::{LogitRows, Phase};
+    use poot_models::model::{LogitRows, StepSpec};
     use poot_models::test_support::dense::step as step_shape;
 
     let n = 5usize; // prompt length
@@ -88,8 +88,7 @@ pub(crate) fn assert_prefill_fills_cache_like_token_by_token(
     let gd = m
         .model
         .trace(
-            Phase::Decode,
-            step_shape(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step_shape(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -107,8 +106,7 @@ pub(crate) fn assert_prefill_fills_cache_like_token_by_token(
     let gp = m
         .model
         .trace(
-            Phase::Prefill,
-            step_shape(1, n, cap, LogitRows::Last),
+            &StepSpec::step(step_shape(1, n, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();

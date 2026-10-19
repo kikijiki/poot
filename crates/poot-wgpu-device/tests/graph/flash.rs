@@ -85,7 +85,7 @@ fn flash_decode_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -167,7 +167,7 @@ fn attention_decode_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -279,7 +279,7 @@ fn attention_over_many_key_tiles_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -360,7 +360,7 @@ fn attention_prefill_into_a_cache_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -473,7 +473,7 @@ fn attention_batched_decode_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -560,7 +560,7 @@ fn attention_prefill_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -648,7 +648,7 @@ fn attention_prefill_d512_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -740,7 +740,7 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -813,7 +813,7 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
                 .iter()
                 .map(|(&id, t)| (id, Value::from(t.clone())))
                 .collect();
-            let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let cpu = eval(&g, &eval_inputs, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
@@ -875,7 +875,7 @@ fn synthesized_production_kernels_random_shapes_match_cpu() {
                 .iter()
                 .map(|(&id, t)| (id, Value::from(t.clone())))
                 .collect();
-            let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let cpu = eval(&g, &eval_inputs, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
@@ -989,7 +989,7 @@ fn flash_decode_batched_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1156,7 +1156,7 @@ fn flash_decode_gpu_matches_cpu_over_random_shapes() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1252,7 +1252,7 @@ fn flash_prefill_gpu_2d_grid_over_65535_workgroups() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1326,7 +1326,7 @@ fn decomposed_prefill_attention_over_65535_query_groups_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1427,7 +1427,7 @@ fn flash_prefill_gpu_matches_cpu_over_random_shapes() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1516,7 +1516,7 @@ fn synthesized_tiled_region_element_by_element_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1579,7 +1579,7 @@ fn synthesized_tiled_region_chunked_large_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1682,7 +1682,7 @@ fn flash_per_head_alibi_mask_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1894,25 +1894,14 @@ fn device_vs_oracle(
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
         .unwrap();
     let got = run_via_contract(gpu, target, g, &inputs);
     assert_eq!(got.shape(), cpu.shape());
-    got.as_f32()
-        .unwrap()
-        .iter()
-        .zip(cpu.as_f32().unwrap())
-        .map(|(a, b)| {
-            if (a - b).is_nan() {
-                f32::INFINITY
-            } else {
-                (a - b).abs()
-            }
-        })
-        .fold(0.0, f32::max)
+    poot_test_util::max_abs_error(got.as_f32().unwrap(), cpu.as_f32().unwrap())
 }
 
 /// SC-001 on wgpu, Gemma2: a GQA decode with attention-logit softcapping (scores reach well past the cap) is

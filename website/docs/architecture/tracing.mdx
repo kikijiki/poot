@@ -37,8 +37,8 @@ finished `Graph` is always well formed, and a pass changes it only through an ed
 
 ## From a family to a step
 
-A model family lives in `poot-models` and implements the `Model` trait. Its `trace_into(phase, shape, builder)` builds the
-graph of one step (callers use `trace(phase, shape, limits)`, which checks the token count before the body runs and hands it a builder that charges the caller's limits): a `StepShape` gives the rows, the new tokens per row, the cache capacity, the KV layout
+A model family lives in `poot-models` and implements the `Model` trait. Its `trace_into(spec, builder)` builds the
+graph of one step (callers use `trace(spec, limits)`, which checks the step against the model's schema and its token count before the body runs and hands it a builder that charges the caller's limits): a `StepSpec` names the program and the carried inputs, and its `StepShape` gives the rows, the new tokens per row, the cache capacity, the KV layout
 (contiguous or paged), whether logits come back for the last token or every token and, when asked, a
 hidden-state carry. A dense decoder is a
 short call of the shared residual pair in `poot_models::components::standard`:

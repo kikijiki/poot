@@ -21,7 +21,6 @@ use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, NoSync};
 use poot_executor_parity::{Fixture, fixture_weights, staged};
 use poot_graph_ir::{BinOp, Builder, Slot, TensorType, Traced, UnOp};
-use poot_graph_plan::production_plan::Submission;
 use poot_tensor::DType;
 
 use vpu_common::{constant, npu, store, x_step};
@@ -198,9 +197,7 @@ fn run_fragment(fixture: &Fixture) {
     )
     .unwrap();
     let compile_started = Instant::now();
-    let entry =
-        poot_executor::Executor::add_entry(exec, exe, &staged(fixture, target, Submission::Replay))
-            .unwrap();
+    let entry = poot_executor::Executor::add_entry(exec, exe, &staged(fixture, target)).unwrap();
     let compile = compile_started.elapsed();
     let mut oracle = oracle_for(&fixture.graph, &fixture.store);
     let mut worst = 0.0f32;

@@ -4,7 +4,7 @@
 
 use poot_graph_ir::ComputedConst;
 use poot_graph_ir::Storage;
-use poot_models::model::{LogitRows, Model, Phase};
+use poot_models::model::{LogitRows, Model};
 use poot_models::registry::Registry;
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -20,7 +20,7 @@ use super::qwen2_pipeline::{eval_step, trace_step};
 fn bloom_alibi_decode_skips_rope() {
     let (model, cap) = (bloom_f32_model(), 8usize);
     let vocab = model.config().vocab;
-    let g = trace_step(&*model, Phase::Decode, (1, 1, cap), None, LogitRows::Last);
+    let g = trace_step(&*model, (1, 1, cap), None, LogitRows::Last);
 
     // FR-002: no rope tables declared on the ALiBi path.
     for id in g.inputs() {

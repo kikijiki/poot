@@ -7,23 +7,13 @@
 //! entry carries; [`rule_of`] gates which requests the suffix can express (R-551b-2: penalties, bias,
 //! logprobs and a guided-decoding constraint still need the host path); [`SuffixRows`] derives one
 //! device row's `seed`/`params`/`top_k` from a [`Sampler`]'s knobs; [`read_tokens`] turns the suffix's
-//! `[rows, 2]` I32 readback into a token or Card 601's typed fault; [`eval_sample_token`] runs the
-//! identical `SampleToken`/`RandomUniform` semantics on the host, through `poot-eval`'s own walk, so
-//! [`Sampler::pick`]'s host draw and a device suffix row cannot drift apart (R-551b-2).
+//! `[rows, 2]` I32 readback into a token or Card 601's typed fault. The host draw is not here: [`Sampler::pick`]
+//! is a plain exact function (ADR-0114 amendment), and a device row is held to it by the nucleus-mass tolerance.
 
-use std::collections::HashMap;
-
-use poot_eval::{EvalBudget, EvalOptions, Value};
 use poot_graph_ir::builder::Resumed;
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::ops::sampling::sample_head;
-use std::num::{NonZeroU64, NonZeroUsize};
-
-use poot_graph_ir::{
-    Builder, BuilderError, Graph, Outputs, Slot, TensorType, TraceLimits, ValueId,
-};
-use poot_tensor::DType;
-use poot_tensor::HostTensor;
+use poot_graph_ir::{Builder, BuilderError, Graph, Outputs, TraceLimits};
 
 use crate::core::sampler::{Sampler, SamplerFault};
 
@@ -62,26 +52,11 @@ pub(crate) fn with_head(g: Graph, head: Head, limits: TraceLimits) -> Result<Gra
     }
 }
 
-/// Which [`SampleRule`] a temperature draw's `top_k`/`top_p` knobs select (R-551a-4's three rule
-/// shapes beyond `Greedy`): shared by [`rule_of`] (the device gate) and [`Sampler::pick_from`] (every
-/// host draw, regardless of whether the request is eligible for the device suffix), so the two
-/// classifications cannot drift. `top_k <= 0`/`top_p >= 1.0` mean "disabled", matching the kernel/
-/// oracle convention (deval.md section 8.1).
-pub(crate) fn temperature_rule(top_k: usize, top_p: f32) -> SampleRule {
-    if top_p < 1.0 {
-        SampleRule::GumbelTopKTopP
-    } else if top_k > 0 {
-        SampleRule::GumbelTopK
-    } else {
-        SampleRule::Gumbel
-    }
-}
-
 /// Card 551b: `None` when `sampler`'s request needs the host path (a penalty,
 /// bias, logprob recording or a guided-decoding constraint - anything [`Sampler::is_greedy`]/
 /// [`Sampler::is_simple_temperature`] reject), `Some(rule)` otherwise. Greedy always maps to
 /// [`SampleRule::Greedy`] (SC-003 needs the device suffix's non-finite readback on the greedy path
-/// too, not just sampled); a simple temperature draw maps through [`temperature_rule`].
+/// too, not just sampled); a simple temperature draw maps through [`SampleRule::for_truncation`].
 pub(crate) fn rule_of(sampler: &Sampler) -> Option<SampleRule> {
     if sampler.is_greedy() {
         return Some(SampleRule::Greedy);
@@ -89,12 +64,11 @@ pub(crate) fn rule_of(sampler: &Sampler) -> Option<SampleRule> {
     if !sampler.is_simple_temperature() {
         return None;
     }
-    Some(temperature_rule(sampler.top_k, sampler.top_p))
+    Some(SampleRule::for_truncation(sampler.top_k, sampler.top_p))
 }
 
 /// This row's `params` column vector (card 551a: `[inv_temp, floor_offset, noise_scale]`, `+top_p`
-/// for [`SampleRule::GumbelTopKTopP`]), shared by [`SuffixRows::push`] (a device row) and
-/// [`eval_sample_token`] (the host draw), so the two cannot drift. `floor_offset` folds min-p into a
+/// for [`SampleRule::GumbelTopKTopP`]), read by [`SuffixRows::for_seed`] (a device row). `floor_offset` folds min-p into a
 /// logit floor in the *raw* (unscaled) logit space `sample_one_row` compares against: keeping index
 /// `i` needs `logits[i] >= max + floor_offset`, i.e. `exp((logits[i]-max)/T) >= min_p`, i.e.
 /// `floor_offset = T * ln(min_p)` (`-inf` disables the floor when `min_p <= 0`). `noise_scale` is
@@ -108,16 +82,14 @@ fn row_params(rule: SampleRule, temperature: f32, min_p: f32, top_p: f32) -> Vec
         f32::NEG_INFINITY
     };
     let mut params = vec![inv_temp, floor_offset, 1.0f32];
-    if matches!(rule, SampleRule::GumbelTopKTopP) {
+    if rule.has_top_p() {
         params.push(top_p);
     }
     params
 }
 
 /// A device suffix row's `seed`/`params`/`top_k` for one decode step (card 551a R-551a-4; R-551b-2):
-/// built from a [`Sampler`]'s current knobs and its next [`Sampler::next_device_seed`] draw - the
-/// identical derivation [`eval_sample_token`]'s host pick uses, so a seeded `Sampler` gives the same
-/// token whether this step's pick runs on the host or through a device suffix entry.
+/// built from a [`Sampler`]'s current knobs and its next [`Sampler::next_device_seed`] draw.
 pub(crate) struct SuffixRows {
     pub(crate) seed: i32,
     pub(crate) params: Vec<f32>,
@@ -149,8 +121,7 @@ impl SuffixRows {
             "SuffixRows: Greedy declares no sampler-slot inputs to fill"
         );
         let params = row_params(rule, sampler.temperature, sampler.min_p, sampler.top_p);
-        let top_k = matches!(rule, SampleRule::GumbelTopK | SampleRule::GumbelTopKTopP)
-            .then_some(sampler.top_k as i32);
+        let top_k = rule.has_top_k().then_some(sampler.top_k as i32);
         SuffixRows {
             seed,
             params,
@@ -178,93 +149,4 @@ pub(crate) fn read_tokens(bytes: &[u8]) -> std::result::Result<u32, SamplerFault
         });
     }
     Ok(token as u32)
-}
-
-/// What the standalone graph of one host draw may build. The suffix [`sample_head`] emits is a fixed
-/// handful of equations whatever the vocabulary (its extents are in the types, not the equation
-/// count): a few dozen values and equations, no literal beyond the rule's scalars. The caps are an
-/// order of magnitude above that and far below anything a host notices; `max_tokens` is a model
-/// trace's bound and has no meaning for a one-row graph.
-const HOST_SAMPLE_LIMITS: TraceLimits = TraceLimits {
-    max_tokens: NonZeroUsize::MIN,
-    max_values: NonZeroUsize::new(1 << 10).unwrap(),
-    max_eqns: NonZeroUsize::new(1 << 10).unwrap(),
-    max_literal_bytes: NonZeroU64::new(1 << 12).unwrap(),
-    max_owned_bytes: NonZeroU64::new(1 << 20).unwrap(),
-};
-
-/// Why a host draw's standalone graph could not be built or evaluated.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum HostSampleError {
-    #[error(transparent)]
-    Build(#[from] BuilderError),
-    #[error(transparent)]
-    Eval(#[from] poot_eval::EvalError),
-    /// The evaluated suffix did not publish the I32 `(token, non-finite)` pair `SampleToken` defines.
-    #[error("the sampling suffix did not publish an I32 (token, non-finite) pair")]
-    Output,
-}
-
-/// Evaluate `SampleToken(rule)` over one row of already-adjusted `logits` (bias/penalties/the
-/// guided-decoding mask: the caller's job, as [`Sampler::pick`] does before ever reaching this) on
-/// the host, through a standalone graph run by `poot-eval`'s own walk (the identical
-/// `OpKind::SampleToken`/`OpKind::RandomUniform` arms [`with_head`]'s device suffix compiles): the
-/// host pick's math and a device suffix row cannot drift apart, because both resolve through the
-/// same production op semantics (R-551b-2) - a seeded `Sampler` on the same logits gives the same
-/// token either way. `seed` is this row's [`Sampler::next_device_seed`] draw.
-///
-/// `rule` must not be [`SampleRule::Greedy`] (greedy has a closed-form host answer,
-/// the sampler's greedy pick, and needs no noise/params graph).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn eval_sample_token(
-    rule: SampleRule,
-    logits: &[f32],
-    seed: u32,
-    temperature: f32,
-    min_p: f32,
-    top_k: usize,
-    top_p: f32,
-) -> Result<(i32, i32), HostSampleError> {
-    debug_assert_ne!(
-        rule,
-        SampleRule::Greedy,
-        "eval_sample_token: Greedy has a closed-form host answer (argmax), call that instead"
-    );
-    let b = Builder::new(HOST_SAMPLE_LIMITS);
-    let vocab = logits.len();
-    let logits_in = b.slot(Slot::Activation, TensorType::new(vec![vocab], DType::F32))?;
-    let head = sample_head(&b, logits_in, rule)?;
-    let g = b.finish(head.out)?;
-
-    let mut inputs: HashMap<ValueId, Value> = HashMap::new();
-    inputs.insert(
-        logits_in.id(),
-        HostTensor::f32(vec![vocab], logits.to_vec()).into(),
-    );
-    if let Some(seed_id) = head.seed {
-        inputs.insert(
-            seed_id.id(),
-            HostTensor::i32(vec![], vec![seed as i32]).into(),
-        );
-    }
-    if let Some(params_id) = head.params {
-        let params = row_params(rule, temperature, min_p, top_p);
-        inputs.insert(
-            params_id.id(),
-            HostTensor::f32(vec![params.len()], params).into(),
-        );
-    }
-    if let Some(top_k_id) = head.top_k {
-        inputs.insert(
-            top_k_id.id(),
-            HostTensor::i32(vec![], vec![top_k as i32]).into(),
-        );
-    }
-
-    let result = poot_eval::eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?;
-    let out = result.output.into_host()?;
-    match out.as_i32() {
-        Some([token, non_finite, ..]) => Ok((*token, *non_finite)),
-        _ => Err(HostSampleError::Output),
-    }
 }

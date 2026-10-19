@@ -3,18 +3,16 @@
 //!
 //! A recording is the ADR-0003 re-encode list: every dispatch's pipeline, length buffer and bind
 //! group are built once while recording, and `replay` re-encodes them into one submit per run of
-//! dispatches. `begin` always opens a recording and never submits, regardless of `Submission`
-//! (`Engine` refuses `Submission::Eager` at `add_entry`, before any
-//! `Device` method ever runs, but `WgpuDevice` is a general `Device` impl a caller may still drive
-//! directly, outside the contract - `poot-llm/tests/wgpu_executor_contract.rs`'s SC-015 fault-probe
-//! row does exactly that); recording never touches the device (wgpu's `build_cached_dispatch` only
+//! dispatches. `begin` always opens a recording and never submits (`WgpuDevice` is a general `Device`
+//! impl a caller may drive directly, outside the contract - `poot-llm/tests/wgpu_executor_contract.rs`'s
+//! SC-015 fault-probe row does exactly that); recording never touches the device (wgpu's `build_cached_dispatch` only
 //! resolves metadata), so `begin`/`dispatch`/`copy`/`finish` failing can never have mutated device
 //! state, and `abort` only needs to drop the attempted recording's buffered metadata.
 
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
 };
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_runtime_common::{BufferRole, CompiledKernel};
 use poot_target::{Backend, BufferStorage, TargetId};
 use poot_wgpu_runtime::{CachedDispatch, Context, DeviceBuffer, RuntimeError};
@@ -188,8 +186,8 @@ impl Device for WgpuDevice {
         })
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), RuntimeError> {
-        // Always opens a recording, regardless of `_submission` (see the module doc): the
+    fn begin(&mut self) -> Result<(), RuntimeError> {
+        // Always opens a recording (see the module doc): the
         // contract's own restriction to Replay is enforced at `Engine::add_entry`, not here.
         assert!(self.open.is_none(), "begin inside an open step");
         self.open = Some(Vec::new());

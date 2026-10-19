@@ -15,19 +15,19 @@ use poot_executor::{
 };
 use poot_graph_ir::{BinOp, Graph, Slot, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, Target, production_plan::Submission, staged::StagedProgram,
-    staged::TargetSet,
+    CompileLimits, CompileOptions, Target, staged::StagedProgram, staged::TargetSet,
 };
 use poot_llm::driver::error::{DriverError, PreparedSetRefusal, Unsupported};
 use poot_llm::driver::{
     Driver, DriverOptions, GenerateRequest, Head, Layout, ModelHandle, PoolShape,
-    PreparedSetLimits, Retention, ServingShapes, SharedOwner, Warm,
+    PreparedSetLimits, Retention, Serving, ServingShapes, SharedOwner, State, Unprepared, Warm,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::components::standard::Step;
+use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
-    Phase, ShapeReason, StepShape, TraceError,
+    ShapeReason, StepShape, StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
@@ -52,11 +52,12 @@ fn nz(n: usize) -> NonZeroUsize {
 // state folded with every token. Registered through the public `Registry`, like any third-party family.
 // ---------------------------------------------------------------------------------------------
 
-type TraceLog = Arc<Mutex<Vec<(Phase, StepShape)>>>;
+type TraceLog = Arc<Mutex<Vec<StepShape>>>;
 
 #[derive(Debug)]
 struct Tiny {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
     log: TraceLog,
     recurrent: bool,
@@ -67,16 +68,16 @@ impl Model for Tiny {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: TINY,
@@ -85,13 +86,10 @@ impl Model for Tiny {
             })
         };
         let granule = self.config.prefill_granule.get();
-        if phase == Phase::Decode && shape.tokens.get() != 1 {
-            return refuse(ShapeReason::DecodeTokens);
-        }
-        if phase == Phase::Prefill && !shape.tokens.get().is_multiple_of(granule) {
+        if !shape.is_decode() && !shape.tokens.get().is_multiple_of(granule) {
             return refuse(ShapeReason::Granule { granule });
         }
-        self.log.lock().unwrap().push((phase, shape));
+        self.log.lock().unwrap().push(shape);
         let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
@@ -152,8 +150,16 @@ fn build_tiny(raw: &RawConfig<'_>, log: TraceLog) -> Result<Box<dyn Model>, Mode
         field: "granule",
         reason: ConfigReason::Zero,
     })?;
+    let recurrent = config.get("state").and_then(|v| v.as_str()) == Some("recurrent");
+    let program = ProgramSpec::new(ProgramId::STEP, ModelOutput::Logits { vocab: VOCAB });
+    let program = if recurrent {
+        program.carrying(StateSpec::recurrent("toy.state"))
+    } else {
+        program
+    };
     Ok(Box::new(Tiny {
-        recurrent: config.get("state").and_then(|v| v.as_str()) == Some("recurrent"),
+        recurrent,
+        schema: ModelSchema::builder().step(program).build_for(TINY)?,
         config: ModelConfig {
             family: TINY,
             vocab: VOCAB,
@@ -161,7 +167,6 @@ fn build_tiny(raw: &RawConfig<'_>, log: TraceLog) -> Result<Box<dyn Model>, Mode
             eos: BTreeSet::from([EOS]),
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
             prefill_granule: granule,
             chat: ChatFormat::ChatML,
         },
@@ -250,7 +255,7 @@ impl Device for FakeDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), FakeError> {
@@ -308,8 +313,8 @@ impl Device for FakeDevice {
 /// What the driver asked of the executor.
 #[derive(Default)]
 struct Asked {
-    /// `(phase, shape)` of each entry, in `add_entry` order, from the family's trace log.
-    entries: Vec<(EntryId, (Phase, StepShape))>,
+    /// `shape` of each entry, in `add_entry` order, from the family's trace log.
+    entries: Vec<(EntryId, StepShape)>,
     steps: Vec<EntryId>,
     resets: usize,
     /// Fail the next `add_entry`, after the driver has measured and reserved the entry.
@@ -385,8 +390,8 @@ impl Executor for Wrapped {
 // The rig.
 // ---------------------------------------------------------------------------------------------
 
-struct Rig {
-    driver: Driver,
+struct Rig<S: State = Unprepared> {
+    driver: Driver<S>,
     asked: Rc<RefCell<Asked>>,
     log: TraceLog,
     /// The checkpoint directory, removed when the rig drops.
@@ -454,7 +459,7 @@ fn rig(options: RigOptions) -> Rig {
         asked: asked.clone(),
         log: log.clone(),
     };
-    let compile = CompileOptions::new(Submission::Replay, options.limits);
+    let compile = CompileOptions::new(options.limits);
     let driver = Driver::new(
         Arc::new(handle),
         Box::new(executor),
@@ -482,6 +487,58 @@ fn rig(options: RigOptions) -> Rig {
     }
 }
 
+impl Rig<Unprepared> {
+    /// Prepares `shapes`, which the rig's driver must admit.
+    fn prepare(self, shapes: &ServingShapes<'_>) -> Rig<Serving> {
+        let Rig {
+            driver,
+            asked,
+            log,
+            _checkpoint,
+        } = self;
+        Rig {
+            driver: driver.prepare(shapes).unwrap(),
+            asked,
+            log,
+            _checkpoint,
+        }
+    }
+
+    /// Prepares `shapes`, which the driver must refuse: the rig as the refusal left it, and the cause.
+    fn prepare_refused(self, shapes: &ServingShapes<'_>) -> (Rig, DriverError) {
+        let Rig {
+            driver,
+            asked,
+            log,
+            _checkpoint,
+        } = self;
+        let refused = driver.prepare(shapes).unwrap_err();
+        let rig = Rig {
+            driver: refused.driver,
+            asked,
+            log,
+            _checkpoint,
+        };
+        (rig, refused.error)
+    }
+
+    /// Serves `layout` with nothing prepared: what `generate` prepares for its request.
+    fn serve(self, layout: Layout) -> Rig<Serving> {
+        let Rig {
+            driver,
+            asked,
+            log,
+            _checkpoint,
+        } = self;
+        Rig {
+            driver: driver.serve(layout),
+            asked,
+            log,
+            _checkpoint,
+        }
+    }
+}
+
 fn contiguous(heads: &[Head]) -> ServingShapes<'_> {
     ServingShapes {
         layout: Layout::Contiguous,
@@ -503,7 +560,7 @@ fn request(prompt: &[u32], max_new: usize) -> GenerateRequest {
     }
 }
 
-fn generate(rig: &mut Rig, request: GenerateRequest) {
+fn generate(rig: &mut Rig<Serving>, request: GenerateRequest) {
     rig.driver
         .generate(request, &mut |_: u32, _: &str| {
             GenerationControl::Continue(())
@@ -556,16 +613,13 @@ fn one_shared_kernel(_: &StagedProgram) -> Retention {
 /// the third enters and the typed refusal assertion fails.
 #[test]
 fn the_third_distinct_owner_is_refused_by_count_and_the_first_two_keep_serving() {
-    let mut rig = rig(RigOptions {
+    let rig = rig(RigOptions {
         max_entries: 2,
         max_retained_bytes: 96,
         charge: one_kernel_per_extent,
         ..RigOptions::default()
     });
-    let err = rig
-        .driver
-        .prepare(&contiguous(&[Head::GREEDY]))
-        .unwrap_err();
+    let (rig, err) = rig.prepare_refused(&contiguous(&[Head::GREEDY]));
     assert!(
         matches!(
             err,
@@ -577,6 +631,7 @@ fn the_third_distinct_owner_is_refused_by_count_and_the_first_two_keep_serving()
     assert_eq!(rig.driver.retained_bytes(), 64);
     // The first admitted piece is the full chunk: a 4-token prompt replays it.
     let before = rig.driver.stats().compiles;
+    let mut rig = rig.serve(Layout::Contiguous);
     generate(&mut rig, request(&[1; 4], 1));
     assert_eq!(rig.driver.stats().compiles, before);
 }
@@ -585,16 +640,13 @@ fn the_third_distinct_owner_is_refused_by_count_and_the_first_two_keep_serving()
 /// and no counter moves. Mutation: skip the byte check; the second owner enters.
 #[test]
 fn the_second_owner_is_refused_by_bytes_without_moving_the_counters() {
-    let mut rig = rig(RigOptions {
+    let rig = rig(RigOptions {
         max_entries: 4,
         max_retained_bytes: 63,
         charge: one_kernel_per_extent,
         ..RigOptions::default()
     });
-    let err = rig
-        .driver
-        .prepare(&contiguous(&[Head::GREEDY]))
-        .unwrap_err();
+    let (rig, err) = rig.prepare_refused(&contiguous(&[Head::GREEDY]));
     assert!(
         matches!(
             err,
@@ -619,7 +671,7 @@ fn the_second_owner_is_refused_by_bytes_without_moving_the_counters() {
 /// assertions fail. Mutation: drop the private bytes; the total is 96.
 #[test]
 fn a_shared_owner_is_charged_once_and_private_bytes_separately() {
-    let mut rig = rig(RigOptions {
+    let rig = rig(RigOptions {
         charge: |program| {
             let mut retention = one_kernel_per_extent(program);
             retention.private = 8;
@@ -628,11 +680,11 @@ fn a_shared_owner_is_charged_once_and_private_bytes_separately() {
         ..RigOptions::default()
     });
     let heads = [Head::GREEDY, Head::Logits];
-    rig.driver.prepare(&contiguous(&heads)).unwrap();
+    let rig = rig.prepare(&contiguous(&heads));
     assert_eq!(rig.driver.prepared_entries(), 6);
     assert_eq!(rig.driver.retained_bytes(), 3 * 32 + 6 * 8);
 
-    let mut tight = self::rig(RigOptions {
+    let tight = self::rig(RigOptions {
         max_retained_bytes: 143,
         charge: |program| {
             let mut retention = one_kernel_per_extent(program);
@@ -641,7 +693,7 @@ fn a_shared_owner_is_charged_once_and_private_bytes_separately() {
         },
         ..RigOptions::default()
     });
-    let err = tight.driver.prepare(&contiguous(&heads)).unwrap_err();
+    let (_, err) = tight.prepare_refused(&contiguous(&heads));
     assert!(
         matches!(
             err,
@@ -660,11 +712,11 @@ fn a_shared_owner_is_charged_once_and_private_bytes_separately() {
 /// hold it. Mutation: key an owner by entry rather than by its key; every entry is charged 40.
 #[test]
 fn one_kernel_shared_by_every_entry_is_charged_once() {
-    let mut rig = rig(RigOptions {
+    let rig = rig(RigOptions {
         charge: one_shared_kernel,
         ..RigOptions::default()
     });
-    rig.driver.prepare(&contiguous(&[Head::GREEDY])).unwrap();
+    let rig = rig.prepare(&contiguous(&[Head::GREEDY]));
     assert_eq!(rig.driver.prepared_entries(), 3);
     assert_eq!(rig.driver.retained_bytes(), 32 + 3 * 8);
 }
@@ -675,7 +727,7 @@ fn one_kernel_shared_by_every_entry_is_charged_once() {
 /// 40 bytes held and the counters row goes red.
 #[test]
 fn a_failed_load_after_reservation_leaves_the_counters_where_they_were() {
-    let mut rig = rig(RigOptions {
+    let rig = rig(RigOptions {
         charge: |program| {
             let mut retention = one_kernel_per_extent(program);
             retention.private = 8;
@@ -683,7 +735,7 @@ fn a_failed_load_after_reservation_leaves_the_counters_where_they_were() {
         },
         ..RigOptions::default()
     });
-    rig.driver.prepare(&contiguous(&[Head::GREEDY])).unwrap();
+    let mut rig = rig.prepare(&contiguous(&[Head::GREEDY]));
     let held = (
         rig.driver.prepared_entries(),
         rig.driver.retained_bytes(),
@@ -693,7 +745,7 @@ fn a_failed_load_after_reservation_leaves_the_counters_where_they_were() {
     // A new schema (the logits head): the load of its first entry fails.
     rig.asked.borrow_mut().fail_add = true;
     let heads = [Head::GREEDY, Head::Logits];
-    let err = rig.driver.prepare(&contiguous(&heads)).unwrap_err();
+    let err = rig.driver.extend(&contiguous(&heads)).unwrap_err();
     assert!(matches!(err, DriverError::Device(_)), "{err:?}");
     assert_eq!(
         (
@@ -705,8 +757,8 @@ fn a_failed_load_after_reservation_leaves_the_counters_where_they_were() {
         "a failed attempt holds nothing"
     );
 
-    rig.driver.prepare(&contiguous(&heads)).unwrap();
-    let mut clean = self::rig(RigOptions {
+    rig.driver.extend(&contiguous(&heads)).unwrap();
+    let clean = self::rig(RigOptions {
         charge: |program| {
             let mut retention = one_kernel_per_extent(program);
             retention.private = 8;
@@ -714,7 +766,7 @@ fn a_failed_load_after_reservation_leaves_the_counters_where_they_were() {
         },
         ..RigOptions::default()
     });
-    clean.driver.prepare(&contiguous(&heads)).unwrap();
+    let clean = clean.prepare(&contiguous(&heads));
     assert_eq!(
         rig.driver.retained_bytes(),
         clean.driver.retained_bytes(),
@@ -730,17 +782,14 @@ fn a_failed_load_after_reservation_leaves_the_counters_where_they_were() {
 /// one-byte cap admits the entry and the refusal assertion fails.
 #[test]
 fn an_artifact_over_the_program_limit_fails_the_load_and_holds_nothing() {
-    let mut rig = rig(RigOptions {
+    let rig = rig(RigOptions {
         limits: CompileLimits {
             max_artifact_bytes: NonZeroU64::new(1).unwrap(),
             ..CompileLimits::STANDARD
         },
         ..RigOptions::default()
     });
-    let err = rig
-        .driver
-        .prepare(&contiguous(&[Head::GREEDY]))
-        .unwrap_err();
+    let (rig, err) = rig.prepare_refused(&contiguous(&[Head::GREEDY]));
     let DriverError::Device(ExecError::Load(load)) = &err else {
         panic!("expected a load refusal, got {err:?}");
     };
@@ -760,8 +809,8 @@ fn an_artifact_over_the_program_limit_fails_the_load_and_holds_nothing() {
         "the failed entry holds nothing"
     );
 
-    let mut roomy = self::rig(RigOptions::default());
-    roomy.driver.prepare(&contiguous(&[Head::GREEDY])).unwrap();
+    let roomy = self::rig(RigOptions::default());
+    let roomy = roomy.prepare(&contiguous(&[Head::GREEDY]));
     assert_eq!(roomy.driver.prepared_entries(), 3);
 }
 
@@ -772,13 +821,13 @@ fn an_artifact_over_the_program_limit_fails_the_load_and_holds_nothing() {
 /// none, so the compile delta row fails.
 #[test]
 fn a_new_schema_compiles_once_and_a_warmed_set_never_compiles_again() {
-    let mut rig = rig(RigOptions::default());
-    rig.driver.prepare(&contiguous(&[Head::GREEDY])).unwrap();
+    let rig = rig(RigOptions::default());
+    let mut rig = rig.prepare(&contiguous(&[Head::GREEDY]));
     let greedy = rig.driver.stats();
     assert_eq!((greedy.compiles, rig.driver.prepared_entries()), (3, 3));
 
     let heads = [Head::GREEDY, Head::Logits];
-    rig.driver.prepare(&contiguous(&heads)).unwrap();
+    rig.driver.extend(&contiguous(&heads)).unwrap();
     let both = rig.driver.stats();
     assert_eq!(
         (
@@ -788,7 +837,7 @@ fn a_new_schema_compiles_once_and_a_warmed_set_never_compiles_again() {
         (3, 6),
         "the logits head compiles its own three entries, once"
     );
-    rig.driver.prepare(&contiguous(&heads)).unwrap();
+    rig.driver.extend(&contiguous(&heads)).unwrap();
     assert_eq!(
         rig.driver.stats().compiles,
         both.compiles,
@@ -809,8 +858,8 @@ fn a_new_schema_compiles_once_and_a_warmed_set_never_compiles_again() {
         .steps
         .iter()
         .filter_map(|step| asked.entries.iter().find(|(id, _)| id == step))
-        .filter(|(_, (phase, _))| *phase == Phase::Prefill)
-        .map(|(_, (_, shape))| shape.tokens.get())
+        .filter(|(_, shape)| !shape.is_decode())
+        .map(|(_, shape)| shape.tokens.get())
         .take(1 + 2 + 3)
         .collect();
     assert_eq!(
@@ -827,7 +876,7 @@ fn a_new_schema_compiles_once_and_a_warmed_set_never_compiles_again() {
 /// `Model::trace`; the family is traced for 6 tokens and the trace-log assertion fails.
 #[test]
 fn a_step_above_the_trace_limit_is_refused_before_the_family_traces_it() {
-    let mut rig = rig(RigOptions {
+    let rig = rig(RigOptions {
         granule: 2,
         chunk: 4,
         max_trace_tokens: 4,
@@ -843,22 +892,20 @@ fn a_step_above_the_trace_limit_is_refused_before_the_family_traces_it() {
         windows.to_vec()
     };
     let at_limit = shapes(&window(4));
-    rig.driver
-        .prepare(&ServingShapes {
-            layout: Layout::Paged(pool),
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Prompts(&[]),
-            windows: &at_limit,
-            adapters: &[],
-        })
-        .expect("a window at the trace limit is admitted");
+    let mut rig = rig.prepare(&ServingShapes {
+        layout: Layout::Paged(pool),
+        rows: &[NonZeroUsize::MIN],
+        heads: &[Head::GREEDY],
+        warm: Warm::Prompts(&[]),
+        windows: &at_limit,
+        adapters: &[],
+    });
     let traced = rig.log.lock().unwrap().len();
 
     let over = shapes(&window(6));
     let err = rig
         .driver
-        .prepare(&ServingShapes {
+        .extend(&ServingShapes {
             layout: Layout::Paged(pool),
             rows: &[NonZeroUsize::MIN],
             heads: &[Head::GREEDY],
@@ -884,11 +931,11 @@ fn a_step_above_the_trace_limit_is_refused_before_the_family_traces_it() {
             .lock()
             .unwrap()
             .iter()
-            .all(|(_, shape)| shape.tokens.get() <= 4),
+            .all(|shape| shape.tokens.get() <= 4),
         "no traced step exceeds the limit"
     );
     assert!(matches!(
-        rig.log.lock().unwrap()[0].1.kv,
+        rig.log.lock().unwrap()[0].kv,
         KvLayout::Paged { .. }
     ));
 }
@@ -905,22 +952,23 @@ fn a_prompt_over_the_trace_limit_runs_as_legal_chunks_on_one_continuing_state() 
         chunk: 4,
         max_trace_tokens: 4,
         ..RigOptions::default()
-    });
+    })
+    .serve(Layout::Contiguous);
     generate(&mut rig, request(&[1; 6], 1));
     let asked = rig.asked.borrow();
-    let shapes: Vec<(Phase, usize)> = asked
+    let shapes: Vec<usize> = asked
         .steps
         .iter()
         .map(|step| {
-            let (_, (phase, shape)) = asked
+            let (_, shape) = asked
                 .entries
                 .iter()
                 .find(|(id, _)| id == step)
                 .expect("a step runs a prepared entry");
-            (*phase, shape.tokens.get())
+            shape.tokens.get()
         })
         .collect();
-    assert_eq!(shapes[..2], [(Phase::Prefill, 4), (Phase::Prefill, 2)]);
+    assert_eq!(shapes[..2], [4, 2]);
     assert_eq!(asked.resets, 1, "the state continues across chunks");
 }
 
@@ -964,7 +1012,7 @@ fn qwen2_rig(trace: poot_graph_ir::TraceLimits) -> Qwen2Rig {
     let handle = Arc::new(
         ModelHandle::load(&dir, &registry, &poot_llm::driver::LoadOptions::default()).unwrap(),
     );
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let driver = Driver::new(
         handle,
         Box::new(Engine::new(FakeDevice)),
@@ -1033,26 +1081,19 @@ fn the_shipped_qwen2_path_consumes_the_callers_limits_and_refuses_with_the_exact
     use poot_graph_ir::{AllocationSite, Attempted, BudgetResource, TraceLimits};
 
     let roomy = TraceLimits::for_tests_with_tokens(nz(8));
-    let mut reference = qwen2_rig(roomy);
-    reference.driver.prepare(&with_window(3)).unwrap();
+    let reference = qwen2_rig(roomy);
+    let reference_driver = reference.driver.prepare(&with_window(3)).unwrap();
     let (entries, retained) = (
-        reference.driver.prepared_entries(),
-        reference.driver.retained_bytes(),
+        reference_driver.prepared_entries(),
+        reference_driver.retained_bytes(),
     );
     assert!(entries >= 2, "a decode entry and a 3-token window");
 
     // Adequate finite limits: exactly the graphs' sizes, the same prepared set.
-    let shape = |tokens: usize| StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: nz(tokens),
-        capacity: nz(16),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    };
+    let shape = |tokens: usize| StepShape::new(NonZeroUsize::MIN, nz(tokens), nz(16));
     let model = &reference.model;
-    let biggest = model.trace(Phase::Prefill, shape(3), roomy).unwrap();
-    let decode = model.trace(Phase::Decode, shape(1), roomy).unwrap();
+    let biggest = model.trace(&StepSpec::step(shape(3)), roomy).unwrap();
+    let decode = model.trace(&StepSpec::step(shape(1)), roomy).unwrap();
     let adequate = TraceLimits {
         max_tokens: nz(4),
         max_values: nz(biggest.values().len().max(decode.values().len()) + 16),
@@ -1060,49 +1101,49 @@ fn the_shipped_qwen2_path_consumes_the_callers_limits_and_refuses_with_the_exact
         max_literal_bytes: NonZeroU64::new(1 << 20).unwrap(),
         max_owned_bytes: NonZeroU64::new(1 << 30).unwrap(),
     };
-    let mut adequate_rig = qwen2_rig(adequate);
-    adequate_rig.driver.prepare(&with_window(3)).unwrap();
-    assert_eq!(adequate_rig.driver.prepared_entries(), entries);
-    assert_eq!(adequate_rig.driver.retained_bytes(), retained);
+    let adequate_rig = qwen2_rig(adequate);
+    let adequate_driver = adequate_rig.driver.prepare(&with_window(3)).unwrap();
+    assert_eq!(adequate_driver.prepared_entries(), entries);
+    assert_eq!(adequate_driver.retained_bytes(), retained);
 
     // `max_tokens = 4`: a 5-token window is refused before the family traces it, and what was
     // prepared before stays.
-    let mut rig = qwen2_rig(adequate);
-    rig.driver.prepare(&decode_only()).unwrap();
-    let held = (rig.driver.prepared_entries(), rig.driver.retained_bytes());
-    let compiles = rig.driver.stats().compiles;
-    let refused = trace_budget(&rig.driver.prepare(&with_window(5)).unwrap_err());
+    let rig = qwen2_rig(adequate);
+    let mut driver = rig.driver.prepare(&decode_only()).unwrap();
+    let held = (driver.prepared_entries(), driver.retained_bytes());
+    let compiles = driver.stats().compiles;
+    let refused = trace_budget(&driver.extend(&with_window(5)).unwrap_err());
     assert_eq!(
         (refused.resource, refused.limit, refused.requested),
         (BudgetResource::Tokens, 4, 5)
     );
     assert_eq!(refused.attempted, Attempted::Total(5));
     assert_eq!(refused.site, AllocationSite::TokenRequest);
-    assert_eq!(
-        (rig.driver.prepared_entries(), rig.driver.retained_bytes()),
-        held
-    );
-    assert_eq!(rig.driver.stats().compiles, compiles, "nothing compiled");
+    assert_eq!((driver.prepared_entries(), driver.retained_bytes()), held);
+    assert_eq!(driver.stats().compiles, compiles, "nothing compiled");
 
     // `max_eqns = 2`: the third attempted equation is refused where it is attempted, the driver
     // returns the exact typed cause, nothing is published, and asking again changes nothing.
-    let mut rig = qwen2_rig(TraceLimits {
+    let rig = qwen2_rig(TraceLimits {
         max_eqns: nz(2),
         ..roomy
     });
-    let compiles = rig.driver.stats().compiles;
+    let mut driver = rig.driver;
+    let compiles = driver.stats().compiles;
     for _ in 0..2 {
-        let refused = trace_budget(&rig.driver.prepare(&decode_only()).unwrap_err());
+        let refusal = driver.prepare(&decode_only()).unwrap_err();
+        let refused = trace_budget(&refusal.error);
+        driver = refusal.driver;
         assert_eq!(refused.resource, BudgetResource::Equations);
         assert_eq!((refused.limit, refused.used, refused.requested), (2, 2, 1));
         assert_eq!(refused.attempted, Attempted::Total(3));
         assert_eq!(refused.site, AllocationSite::EquationRecord);
         assert_eq!(
-            (rig.driver.prepared_entries(), rig.driver.retained_bytes()),
+            (driver.prepared_entries(), driver.retained_bytes()),
             (0, 0),
             "the refusal published an entry"
         );
-        assert_eq!(rig.driver.stats().compiles, compiles);
+        assert_eq!(driver.stats().compiles, compiles);
     }
 
     // An owned-byte ceiling below the family's records: the smallest ceiling that admits the decode
@@ -1112,7 +1153,7 @@ fn the_shipped_qwen2_path_consumes_the_callers_limits_and_refuses_with_the_exact
             max_owned_bytes: NonZeroU64::new(ceiling).unwrap(),
             ..roomy
         };
-        model.trace(Phase::Decode, shape(1), limits).map(drop)
+        model.trace(&StepSpec::step(shape(1)), limits).map(drop)
     };
     let (mut low, mut high) = (1u64, 1u64 << 24);
     assert!(admits(high).is_ok());
@@ -1128,14 +1169,16 @@ fn the_shipped_qwen2_path_consumes_the_callers_limits_and_refuses_with_the_exact
         max_owned_bytes: NonZeroU64::new(low - 1).unwrap(),
         ..roomy
     };
-    let mut rig = qwen2_rig(ceiling);
-    let refused = trace_budget(&rig.driver.prepare(&decode_only()).unwrap_err());
+    let rig = qwen2_rig(ceiling);
+    let refusal = rig.driver.prepare(&decode_only()).unwrap_err();
+    let refused = trace_budget(&refusal.error);
+    let driver = refusal.driver;
     assert_eq!(refused.resource, BudgetResource::OwnedBytes);
     assert_eq!(refused.limit, low - 1);
     assert!(refused.used + refused.requested > low - 1);
     // The Driver names the same allocation the model's own trace refuses at under that ceiling.
     let direct = model
-        .trace(Phase::Decode, shape(1), ceiling)
+        .trace(&StepSpec::step(shape(1)), ceiling)
         .map(drop)
         .unwrap_err();
     let TraceError::Budget(direct) = direct else {
@@ -1143,8 +1186,5 @@ fn the_shipped_qwen2_path_consumes_the_callers_limits_and_refuses_with_the_exact
     };
     assert_eq!(refused.site, direct.site);
     assert_eq!(refused.site, AllocationSite::FinalState);
-    assert_eq!(
-        (rig.driver.prepared_entries(), rig.driver.retained_bytes()),
-        (0, 0)
-    );
+    assert_eq!((driver.prepared_entries(), driver.retained_bytes()), (0, 0));
 }

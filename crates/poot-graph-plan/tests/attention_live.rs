@@ -8,7 +8,7 @@ use poot_graph_plan::passes_without_target;
 use std::collections::HashMap;
 
 use poot_eval::test_support::live_attention::{Inputs, LiveAttentionFixture, LiveAttentionGraph};
-use poot_eval::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use poot_eval::{EvalError, EvalOptions, Value, eval};
 use poot_graph_ir::ops::{attention_masked_softcap, repeat_kv};
 use poot_graph_ir::{
     AttentionAttrs, BinOp, Builder, Eqn, Graph, KeyLayout, KvBound, OpKind, Operand, Scalar,
@@ -16,14 +16,13 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::{
     Capability, CompileError, CompileOptions, KernelChoice, Plan, PlanError, Target, compile,
-    production_plan::Submission,
 };
 use poot_kernelgen::{AttentionSchedule, AttentionSpec, KernelRequest, ScoreTransform};
 use poot_target::{AmdArch, Backend};
 use poot_test_util::assert_close;
 
 fn evaluate(graph: &Graph, inputs: &HashMap<ValueId, Value>) -> Result<Vec<f32>, EvalError> {
-    let output = eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?
+    let output = eval(graph, inputs, EvalOptions::default())?
         .output
         .into_host()
         .expect("a dense attention output");
@@ -361,7 +360,7 @@ fn planned_attention(graph: &Graph, target: &Target) -> (AttentionSpec, usize) {
     let program = compile(
         graph,
         target,
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("the fixture compiles");
     let mut found = program
@@ -560,7 +559,7 @@ fn a_declined_live_graph_plans_on_every_target() {
         let program = compile(
             &built.graph,
             &target,
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .unwrap_or_else(|e| panic!("{name}: the declined live graph must plan: {e}"));
         assert!(
@@ -666,7 +665,7 @@ fn a_narrow_live_graph_plans_its_selects_natively_and_spirv_refuses_them() {
             let result = compile(
                 &built.graph,
                 &target,
-                &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+                &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
             );
             if name == "spirv" {
                 let Err(CompileError::Plan(error)) = result else {

@@ -17,9 +17,9 @@ use poot_executor::{
 };
 use poot_graph_ir::{BinOp, Builder, StateRole, TensorType};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -57,7 +57,7 @@ struct Control {
 
 struct FaultyDevice {
     control: Control,
-    submission: Option<Submission>,
+    recording: bool,
     /// `Buffer = ()` has no handle whose `Drop` could release an allocation, so this never
     /// decrements: every call just leaks its guard (Card 547a - `Engine::stats().memory` now reads
     /// this instead of its own tally, so the fake device must track what it was asked to allocate).
@@ -106,11 +106,11 @@ impl Device for FaultyDevice {
         Ok(())
     }
 
-    fn begin(&mut self, submission: Submission) -> Result<(), FaultyError> {
+    fn begin(&mut self) -> Result<(), FaultyError> {
         if self.control.failures.borrow().begin {
             return Err(FaultyError("begin"));
         }
-        self.submission = Some(submission);
+        self.recording = true;
         Ok(())
     }
 
@@ -133,10 +133,7 @@ impl Device for FaultyDevice {
         if self.control.failures.borrow().finish {
             return Err(FaultyError("finish"));
         }
-        Ok(match self.submission.take() {
-            Some(Submission::Replay) => Some(()),
-            _ => None,
-        })
+        Ok(std::mem::take(&mut self.recording).then_some(()))
     }
 
     fn replay(&mut self, _recording: &()) -> Result<(), FaultyError> {
@@ -231,7 +228,7 @@ fn fixture() -> (
     (g, store, map)
 }
 
-fn staged(g: &poot_graph_ir::Graph, target: Target, submission: Submission) -> StagedProgram {
+fn staged(g: &poot_graph_ir::Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
         &TargetSet::single(DeviceId(0), target),
@@ -239,7 +236,7 @@ fn staged(g: &poot_graph_ir::Graph, target: Target, submission: Submission) -> S
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(submission, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("fixture graph compiles for the fake target")
 }
@@ -248,7 +245,7 @@ fn new_engine() -> (Engine<FaultyDevice>, Control) {
     let control = Control::default();
     let device = FaultyDevice {
         control: control.clone(),
-        submission: None,
+        recording: false,
         memory: poot_runtime_common::MemoryCounters::new(),
     };
     (Engine::new(device), control)
@@ -277,9 +274,7 @@ fn begin_failure_aborts_exactly_once_and_leaves_no_open_recording() {
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     control.failures.borrow_mut().begin = true;
     let error = step_err(
@@ -299,7 +294,7 @@ fn begin_failure_aborts_exactly_once_and_leaves_no_open_recording() {
         .expect("read the now-successful step's output");
 }
 
-/// SC-020 (dispatch point): under the contract's only admitted mode, `Submission::Replay`, a
+/// SC-020 (dispatch point): under the contract's only submission mode, a
 /// dispatch failure can only happen during the first step's recording pass (every later step only
 /// replays) - and recording never touches the device (ADR-0003: the walk records metadata, nothing
 /// runs until `replay`), so the failure cannot have mutated state. The engine aborts exactly once,
@@ -311,9 +306,7 @@ fn dispatch_failure_during_recording_aborts_once_and_does_not_mark_needs_reset()
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     control.failures.borrow_mut().dispatch = true;
     let error = step_err(
@@ -341,9 +334,7 @@ fn copy_failure_during_recording_aborts_once_and_does_not_mark_needs_reset() {
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     control.failures.borrow_mut().copy = true;
     let error = step_err(
@@ -370,9 +361,7 @@ fn finish_failure_during_recording_aborts_once_and_does_not_mark_needs_reset() {
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     control.failures.borrow_mut().finish = true;
     let error = step_err(
@@ -392,7 +381,7 @@ fn finish_failure_during_recording_aborts_once_and_does_not_mark_needs_reset() {
         .expect("read the retried step's output");
 }
 
-/// SC-020 (replay point): the first `Submission::Replay` step records successfully (recording never
+/// SC-020 (replay point): the first step records successfully (recording never
 /// touches the device, so it cannot itself fail here); the SECOND step replays, and a replay
 /// failure really has submitted (partial) work, so it too marks `NeedsReset`.
 #[test]
@@ -401,9 +390,7 @@ fn replay_failure_aborts_once_and_marks_needs_reset() {
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     engine
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
@@ -445,9 +432,7 @@ fn synchronize_fault_surfaces_as_exec_error_fault_from_step_with_no_output_read(
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     control.failures.borrow_mut().synchronize = true;
     control.failures.borrow_mut().classify_as_fault = true;
@@ -485,9 +470,7 @@ fn non_fault_synchronize_failure_aborts_and_marks_needs_reset() {
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     control.failures.borrow_mut().synchronize = true;
     let error = step_err(
@@ -518,9 +501,7 @@ fn failed_abort_poisons_the_device_and_reset_cannot_clear_it() {
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
 
     control.failures.borrow_mut().dispatch = true;
     control.failures.borrow_mut().abort = true;
@@ -559,9 +540,7 @@ fn carried_state_has_no_ping_pong_pair() {
     let (g, store, map) = fixture();
     let exe = engine.load_weights(store, map).unwrap();
     let target = engine.device().target();
-    let entry = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
     engine
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
         .unwrap()
@@ -569,9 +548,7 @@ fn carried_state_has_no_ping_pong_pair() {
         .unwrap();
     // A second entry over the identical graph/state pair must share the same two state buffers
     // (Z5: name/aval/storage match), not allocate its own second pair.
-    let entry2 = engine
-        .add_entry(exe, &staged(&g, target, Submission::Replay))
-        .unwrap();
+    let entry2 = engine.add_entry(exe, &staged(&g, target)).unwrap();
     engine
         .step(exe, entry2, &StepInputs::new(), &mut NoSync)
         .unwrap()

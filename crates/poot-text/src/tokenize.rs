@@ -1659,7 +1659,10 @@ mod forged_turn_tests {
         }
         let spellable = |text| spelled(&codec, text);
         assert_eq!(spellable("a <|im_start|> b"), ["<|im_start|>"]);
-        assert_eq!(spellable("a <|im_start|><|im_end|>"), ["<|im_start|><|im_end|>"]);
+        assert_eq!(
+            spellable("a <|im_start|><|im_end|>"),
+            ["<|im_start|><|im_end|>"]
+        );
         assert_eq!(spellable("go <|im_"), ["<|im_"]);
         assert_eq!(spellable("start|> go"), ["start|>"]);
         assert_eq!(spellable("a < b > c"), Vec::<&str>::new());

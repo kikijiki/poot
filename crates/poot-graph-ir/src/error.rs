@@ -247,20 +247,6 @@ pub enum BuilderError {
         /// The slot kind.
         slot: Slot,
     },
-    /// A packed linear's id is empty, so its source constants could not be named.
-    #[error("packed linear id at row {index} must not be empty")]
-    EmptyPackedLinearId {
-        /// The row of the offending linear in the call's list.
-        index: usize,
-    },
-    /// A block-diagonal packed linear's output width is not divisible by its block count.
-    #[error("packed block-diagonal out={out} is not divisible by blocks={blocks}")]
-    PackedBlockDiagonalBlocks {
-        /// The output width.
-        out: usize,
-        /// The block count.
-        blocks: usize,
-    },
     /// An operand has a type other than the one the composition requires.
     #[error("operand {value} has type {actual}, expected {expected}")]
     OperandType {

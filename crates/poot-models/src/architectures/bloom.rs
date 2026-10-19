@@ -43,12 +43,10 @@ use crate::components::norm::{NormKind, NormParams};
 use crate::components::rope::RopeParams;
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    decoder_program, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::ModelSchema;
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::GGUF_BLOOM;
 use crate::names::{FusedDims, NameRow, Presence, Source, family_weights_fused};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
@@ -302,6 +300,7 @@ pub(crate) struct Bloom {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -333,6 +332,9 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -340,7 +342,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -350,6 +351,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -358,13 +360,18 @@ impl Model for Bloom {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
@@ -533,19 +540,10 @@ mod family_tests {
         }
         let bare = bare.build();
         let prompt = [3, 17, 40];
-        let (got, _) = run_step(
-            &*model_of(&fx.config, &bare),
-            &bare,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, _) = run_step(&*model_of(&fx.config, &bare), &bare, CAP, &prompt, 0, &[]);
         let (want, _) = run_step(
             &*model_of(&fx.config, &fx.store),
             &fx.store,
-            Phase::Prefill,
             CAP,
             &prompt,
             0,
@@ -748,16 +746,8 @@ mod family_tests {
         // The HF reference has no `lm_head.weight`: its head is tied to the embedding too.
         let reference = model_of(&fixture_config(), &reference_store);
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
     }

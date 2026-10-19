@@ -41,15 +41,18 @@ pub use request::{
     AieOp, BodyUse, CastSpec, ContractionSpec, ElementwiseSpec, ErrorBound, Fold, FragmentUse,
     Generated, I32Binary, IndexedContraction, KernelRequest, KernelRequirements, Launch,
     MatmulShapes, NumericalContract, PackedContraction, PackedRequest, PackedRows, PointwiseForm,
-    PointwiseSpec, RopeSpec, RowSpec, SerialWork, SerializedAccess, SerializedBinding,
-    SerializedGenerated, TopKSpec, UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand, fold_groups,
-    generate, serialized_schedule,
+    PointwiseSpec, RopeSpec, RowSpec, SerializedAccess, SerializedBinding, SerializedGenerated,
+    TopKSpec, UnaryOp, UnmeasurableLds, ValueBinary, ViewOperand, fold_groups, generate,
+    serialized_schedule,
 };
-pub use scan::{ScanKernel, ScanPhase, ScanSpec};
+pub use scan::{ScanKernel, ScanSpec};
 
 // The types a request carries (the planner builds them), and `view_eff_strides`, the planner's strided-view
 // legality predicate shares with the generators.
-pub use contraction::{Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep, Schedule, TileSize};
+pub use contraction::{
+    Epilogue, EpilogueInput, EpilogueLeaf, EpilogueStep, LaneRows, RegisterTiling, RunLength,
+    Schedule, TileSize,
+};
 pub use fused::{
     FusedInput, FusedKernel, FusedScalarOp, FusedStep, LeafTy, RowKernel, RowOp, RowReduce,
 };

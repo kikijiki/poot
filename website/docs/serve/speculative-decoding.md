@@ -44,6 +44,7 @@ A decode row under a draft policy decodes one token, with the same output it wou
 
 - `NotSpeculated::Sampler`: the row's sampler has a penalty, a logit bias, a constraint or logprob recording. The window's acceptance does not reproduce those draws.
 - `NotSpeculated::NoRoom`: the sequence is too near its capacity to hold a verify window.
+- `NotSpeculated::Inputs`: the sequence carries request inputs (embedding rows, sectioned positions) the draft cannot read, so it is not speculated.
 - `NotSpeculated::NoProposal`: the policy proposed nothing (prompt lookup found no earlier match; the MTP layer has no draft because the sequence's last result was committed in part).
 
 A row that verified drafts reports `Verified { proposed, accepted }`; a prefill row, a row with a caller-supplied `ahead` window, and every row under `Off` report `NotApplicable`. `Driver::stats().speculation` sums these over the driver's life: rounds, proposed and accepted drafts (the acceptance rate is accepted over proposed), and one counter per `NotSpeculated` reason.
@@ -54,16 +55,16 @@ The `speculation_bench` example of `poot-llm` runs one policy on one checkpoint 
 
 ## What is refused
 
-`Driver::prepare` returns a typed `Unsupported::Speculation` error, before anything compiles or uploads where it can:
+`Driver::prepare` returns a typed `Unsupported::Speculation` or `Unsupported::Incompatible` error, before anything compiles or uploads where it can. `Incompatible` names the two features that cannot be combined and the reason, from the one table the driver checks every combination against:
 
 - `RecurrentGranule { granule }`: the model's recurrent state advances in granules of more than one token. The replay chunk after a rejection is not a multiple of the granule, so these models do not speculate. The check reads the state roles of the compiled program and the model's granule, never a model name.
-- `RecurrentDraft`: the draft model carries recurrent state. Only the target's state is rolled back, so a rejected draft token would stay folded into the draft's.
+- `Incompatible` draft model and recurrent draft state: the draft model carries recurrent state. Only the target's state is rolled back, so a rejected draft token would stay folded into the draft's.
 - `DraftMismatch`: the draft model's vocabulary is larger than the target's, its tokenizer gives a token another id, or it holds fewer positions than the driver's capacity.
-- `RecurrentMtp`: the model's MTP program carries recurrent state. The rollback's snapshot schema is the target's decode program, so state only the layer holds would never be restored after a rejected draft.
-- `MtpAdapters`: an adapter set was named under `--draft-mtp`. The layer drafts for the base weights; an adapter changes what the target computes.
-- `MtpBeam`: beam search under `--draft-mtp`. A beam runs the target's programs without the hidden-state carry the layer reads.
+- `Incompatible` MTP and recurrent draft state: the model's MTP program carries recurrent state. The rollback's snapshot schema is the target's decode program, so state only the layer holds would never be restored after a rejected draft.
+- `Incompatible` MTP and adapters: an adapter set was named under `--draft-mtp`. The layer drafts for the base weights; an adapter changes what the target computes.
+- `Incompatible` MTP and beam search: beam search under `--draft-mtp`. A beam runs the target's programs without the hidden-state carry the layer reads.
 
-Under `--draft-mtp` a model whose family traces no MTP program is refused with the family's own typed phase refusal, a device group (`--placement pipeline:` or `tensor:`) is refused with the placement named, a prompt with embedding rows is refused when it is opened (the layer would embed the placeholder tokens the rows replace), and prefix reuse is turned off: the layer's cache at a block's last position depends on the token after the block, so a finished sequence registers no blocks and a later prompt reuses none. A resumed conversation reuses one position less than without the policy.
+Under `--draft-mtp` a model whose family traces no MTP program is refused with the family's own typed program refusal, a device group (`--placement pipeline:` or `tensor:`) is refused with the placement named, a prompt that carries request inputs such as embedding rows is admitted but not speculated (the layer would embed the placeholder tokens the rows replace), so its rows decode one token a step, and prefix reuse is turned off: the layer's cache at a block's last position depends on the token after the block, so a finished sequence registers no blocks and a later prompt reuses none. A resumed conversation reuses one position less than without the policy.
 
 `poot-serve` reports the same refusals at startup, before the listener binds: a `--draft-model` that does not load or does not fit, a draft flag on a model with a recurrent granule above one token, or `--draft-mtp` on a model with no MTP layer, stops the server with the driver's typed error. A request whose sampler the verify window cannot check (a penalty, `logit_bias`, logprobs or a constraint) decodes one token a step and is counted in `speculative_skipped_rows`.
 

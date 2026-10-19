@@ -28,9 +28,9 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::test_support::gpu_caps;
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::format::{GroupMap, WeightFormat};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -41,8 +41,7 @@ use poot_runtime_common::DeviceBackend;
 use poot_tensor::{HostTensor, HostView};
 use poot_wgpu_device::device::WgpuDevice;
 
-/// Compile `g` for `target` with `Submission::Replay` (Card 546b: the contract admits no other
-/// submission).
+/// Compile `g` for `target` through the executor contract's one staged program.
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     let g = g.clone();
     compile_staged(
@@ -52,7 +51,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the packed graph")
 }
@@ -241,7 +240,10 @@ fn packed_graph(descriptor: poot_quant::PackedWeight, m: usize) -> PackedGraph {
     let x = b
         .slot_named(Slot::Activation, "onehot", TensorType::f32(vec![m, K]))
         .unwrap();
-    let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", descriptor, None, None).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+        &b, x, "layer", descriptor, None, None,
+    )
+    .unwrap();
     if m == 1 {
         let pos = b.slot(Slot::Pos, TensorType::scalar(DType::I32)).unwrap();
         let cache = b
@@ -621,7 +623,7 @@ fn run_indexed_case(
             ))
         })
         .collect();
-    let table = poot_graph_ir::ops::PackedExpertStack {
+    let table = poot_graph_ir::test_support::packed_graphs::PackedExpertStack {
         stack_id: "experts".to_string(),
         descriptor: owners[0].weight(),
         experts: EXPERTS,
@@ -640,7 +642,8 @@ fn run_indexed_case(
             poot_graph_ir::IndexRange::below(EXPERTS).unwrap(),
         )
         .unwrap();
-    let y = poot_graph_ir::ops::packed_indexed_linear(&b, x, ids, &table).unwrap();
+    let y = poot_graph_ir::test_support::packed_graphs::packed_indexed_linear(&b, x, ids, &table)
+        .unwrap();
     let g = b.finish(y).unwrap();
     let mut inputs: HashMap<ValueId, Value> = HashMap::new();
     for &id in g.inputs() {
@@ -872,7 +875,7 @@ fn packed_embedding_row_gather_is_bit_exact() {
             let token = b
                 .slot(Slot::Token, TensorType::new(shape.clone(), DType::I32))
                 .unwrap();
-            let rows = poot_graph_ir::ops::packed_embedding(
+            let rows = poot_graph_ir::test_support::packed_graphs::packed_embedding(
                 &b,
                 token,
                 "model.embed_tokens",
@@ -1057,15 +1060,11 @@ fn a_dense_traced_q6_k_expert_stack_binds_and_matches_the_oracle() {
         };
         dense.insert(id, value.into());
     }
-    let oracle = poot_eval::eval(
-        &traced,
-        &dense,
-        poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-    )
-    .expect("CPU oracle")
-    .output
-    .into_host()
-    .expect("dense oracle");
+    let oracle = poot_eval::eval(&traced, &dense, poot_eval::EvalOptions::default())
+        .expect("CPU oracle")
+        .output
+        .into_host()
+        .expect("dense oracle");
     assert_eq!(got.len(), oracle.as_f32().unwrap().len());
     for (i, (got, want)) in got.iter().zip(oracle.as_f32().unwrap().iter()).enumerate() {
         let (m, o) = (i / OUT, i % OUT);
@@ -1252,8 +1251,15 @@ fn packed_loaders_match_the_oracle_on_every_output_on_wgpu() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]))
                 .unwrap();
-            let y = poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                .unwrap();
+            let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             let graph = b.finish(y).unwrap();
             let mut inputs = carriers(&graph, &owner);
             inputs.insert(
@@ -1262,18 +1268,118 @@ fn packed_loaders_match_the_oracle_on_every_output_on_wgpu() {
             );
             let (got, class) = run_dense_activation(&mut *exec, target, &graph, &inputs);
             let oracle_inputs = inputs.clone();
-            let want = poot_eval::eval(
-                &graph,
-                &oracle_inputs,
-                poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-            )
-            .unwrap()
-            .output
-            .into_host()
-            .unwrap();
+            let want = poot_eval::eval(&graph, &oracle_inputs, poot_eval::EvalOptions::default())
+                .unwrap()
+                .output
+                .into_host()
+                .unwrap();
             assert_eq!(got.len(), want.shape().iter().product::<usize>(), "{what}");
-            poot_executor_parity::assert_close(
+            poot_test_util::assert_close_scaled(
                 &got,
+                want.as_f32().unwrap(),
+                class.tolerance(),
+                &what,
+            );
+        }
+    }
+}
+
+/// POOT-1263: a packed tiled contraction over the device's watchdog budget runs as several dispatches over
+/// disjoint tile ranges (each reading its first tile from the metadata) and still meets the oracle. The first
+/// case, `[2048, 256] x [16384, 256]^T` (8.6e9 multiply-accumulates, just past the wgpu budget of 8e9), plans two
+/// dispatches for every loader format. The second is a Qwen3.8-27B-FP8 MLP projection at a 2048-token forward (one projection, not the whole forward),
+/// `[2048, 5120] x [17408, 5120]^T` (1.8e11), which as one dispatch lost the device; it runs here as its budgeted
+/// split. Each row asserts the plan is split, then compares the device output rows around and across the split
+/// with the oracle, which evaluates just those rows (they are independent of the others).
+/// Mutation 1: make `tiles_per_dispatch` ignore the budget; the plan is one dispatch (the second case would
+/// be the one that loses the device, so it is not run unbudgeted). Mutation 2: drop the `tile_offset` add in
+/// `contraction_tiled` (and its planar twin); the second dispatch recomputes the first tiles and the rows of the
+/// second range stay zero.
+#[test]
+fn a_packed_tiled_contraction_over_the_watchdog_budget_matches_the_oracle_on_wgpu() {
+    use poot_quant::format::ScaleEncoding;
+    const M: usize = 2048;
+    let fp8 = WeightFormat::E4m3Block128 {
+        scale: ScaleEncoding::Bf16,
+    };
+    let Some(device) =
+        poot_runtime_common::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+    else {
+        return;
+    };
+    let target = device.target();
+    let mut exec: Box<dyn Executor> = Box::new(poot_executor::Engine::new(device));
+    // Rows of the second dispatch's range, the rows either side of the first split, and the last.
+    let rows = [0usize, 1, 1870, 1871, 1872, 1873, 1900, M - 1];
+    let cases = [
+        (16_384usize, 256usize, loader_formats()),
+        (17_408, 5120, vec![fp8]),
+    ];
+    for (n, k, formats) in cases {
+        for (seed, format) in formats.into_iter().enumerate() {
+            let owner = Arc::new(poot_quant::test_support::packed::prescribed_scale_payload(
+                format,
+                [n, k],
+                seed as u64 + 91,
+            ));
+            let what = format!("{format:?} [{M}, {k}] x [{n}, {k}]^T");
+            let activation = fill(9, M * k);
+            let build = |m: usize| {
+                let b = Builder::for_tests();
+                let x = b
+                    .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, k]))
+                    .unwrap();
+                let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                    &b,
+                    x,
+                    "layer",
+                    owner.weight(),
+                    None,
+                    None,
+                )
+                .unwrap();
+                (b.finish(y).unwrap(), x.id())
+            };
+
+            let (graph, x) = build(M);
+            let mut inputs = carriers(&graph, &owner);
+            inputs.insert(x, HostTensor::f32(vec![M, k], activation.clone()).into());
+            let program = staged(&graph, target);
+            let dispatches: Vec<usize> = program
+                .stages()
+                .next()
+                .unwrap()
+                .2
+                .planned()
+                .map(|(_, plan)| plan.dispatches().len())
+                .collect();
+            let [count] = dispatches[..] else {
+                panic!("{what}: one contraction equation, got {dispatches:?}");
+            };
+            assert!(count > 1, "{what}: the contraction is split by budget");
+            let (got, class) = run_dense_activation(&mut *exec, target, &graph, &inputs);
+
+            let (picked_graph, picked_x) = build(rows.len());
+            let mut picked = carriers(&picked_graph, &owner);
+            let picked_rows: Vec<f32> = rows
+                .iter()
+                .flat_map(|&row| activation[row * k..(row + 1) * k].iter().copied())
+                .collect();
+            picked.insert(
+                picked_x,
+                HostTensor::f32(vec![rows.len(), k], picked_rows).into(),
+            );
+            let want = poot_eval::eval(&picked_graph, &picked, poot_eval::EvalOptions::default())
+                .unwrap()
+                .output
+                .into_host()
+                .unwrap();
+            let got_rows: Vec<f32> = rows
+                .iter()
+                .flat_map(|&row| got[row * n..(row + 1) * n].iter().copied())
+                .collect();
+            poot_test_util::assert_close_scaled(
+                &got_rows,
                 want.as_f32().unwrap(),
                 class.tolerance(),
                 &what,
@@ -1291,8 +1397,8 @@ fn packed_loaders_match_the_oracle_on_every_output_on_wgpu() {
 /// ordinal, as card 628 first did; the Q4_K row goes red on wgpu while the other formats stay green.
 #[test]
 fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
-    use poot_executor_parity::assert_close;
     use poot_graph_ir::op::{BinOp, ContractionHead};
+    use poot_test_util::assert_close_scaled;
     let Some(device) =
         poot_runtime_common::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
     else {
@@ -1316,9 +1422,15 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]))
                 .unwrap();
-            let head =
-                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                    .unwrap();
+            let head = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             if !with_bias {
                 return (b.finish(head).unwrap(), x.id(), None);
             }
@@ -1365,7 +1477,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
                 .zip(&bias_values)
                 .map(|(head, bias)| head + bias)
                 .collect();
-            assert_close(
+            assert_close_scaled(
                 &fused,
                 &want,
                 0.0,
@@ -1387,9 +1499,9 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
 /// oracle row go red.
 #[test]
 fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
-    use poot_executor_parity::assert_close;
     use poot_graph_ir::op::{BinOp, ContractionHead, UnOp};
     use poot_graph_ir::types::Scalar;
+    use poot_test_util::assert_close_scaled;
     let Some(device) =
         poot_runtime_common::device_skip::open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
     else {
@@ -1414,9 +1526,15 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![1, K]))
                 .unwrap();
-            let head =
-                poot_graph_ir::ops::packed_linear(&b, x, "layer", owner.weight(), None, None)
-                    .unwrap();
+            let head = poot_graph_ir::test_support::packed_graphs::packed_linear(
+                &b,
+                x,
+                "layer",
+                owner.weight(),
+                None,
+                None,
+            )
+            .unwrap();
             if !with_chain {
                 return (b.finish(head).unwrap(), x.id(), None);
             }
@@ -1477,17 +1595,13 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
                 HostTensor::f32(vec![1, OUT], residual_values.clone()).into(),
             );
             let (fused, class) = run_dense_activation(&mut *exec, target, &graph, &inputs);
-            let oracle = poot_eval::eval(
-                &graph,
-                &inputs,
-                poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-            )
-            .unwrap()
-            .output
-            .into_host()
-            .unwrap();
+            let oracle = poot_eval::eval(&graph, &inputs, poot_eval::EvalOptions::default())
+                .unwrap()
+                .output
+                .into_host()
+                .unwrap();
             if label == "generic bias" {
-                assert_close(
+                assert_close_scaled(
                     &fused,
                     oracle.as_f32().unwrap(),
                     class.tolerance(),

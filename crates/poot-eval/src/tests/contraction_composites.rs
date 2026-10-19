@@ -20,7 +20,7 @@ use poot_quant::{
 };
 use poot_tensor::{DType, HostTensor};
 
-use crate::{EvalBudget, EvalError, EvalOptions, Value, eval};
+use crate::{EvalError, EvalOptions, Value, eval};
 
 fn nonzero(value: usize) -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(value).unwrap()
@@ -468,8 +468,7 @@ fn host_bits(value: Value) -> Vec<u32> {
 }
 
 fn evaluate(graph: &Graph, inputs: &HashMap<ValueId, Value>) -> Result<Vec<u32>, EvalError> {
-    eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .map(|evaluation| host_bits(evaluation.output))
+    eval(graph, inputs, EvalOptions::default()).map(|evaluation| host_bits(evaluation.output))
 }
 
 /// A GGUF block-format payload of `shape` with deterministic pseudo-random blocks whose f16 factors are all
@@ -940,12 +939,7 @@ fn a_decomposition_reports_one_allocation_per_intermediate() {
     let case = e2m1_case();
     let (graph, inputs) = packed_contraction(&payload_of(&case), 1, activation(&[2, 35]));
     let mut seen = Allocations::default();
-    eval(
-        &graph,
-        &inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).observer(&mut seen),
-    )
-    .unwrap();
+    eval(&graph, &inputs, EvalOptions::default().observer(&mut seen)).unwrap();
     assert_eq!(seen.0, [8 * 35 * 4, 35 * 8 * 4, 2 * 8 * 4]);
 }
 

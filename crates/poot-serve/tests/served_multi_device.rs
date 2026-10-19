@@ -20,11 +20,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use poot_executor::{Collectives, Coordinator};
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::Sampler;
 use poot_llm::driver::{
-    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, LoadOptions,
-    ModelHandle, PreparedSetLimits, open_executor, open_group, program_retention,
+    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, Layout,
+    LoadOptions, ModelHandle, PreparedSetLimits, open_executor, open_group, program_retention,
 };
 use poot_load::gguf::{GgufValue, write_gguf};
 use poot_models::registry::Registry;
@@ -202,7 +202,8 @@ fn driver_generation(
         executor,
         driver_options(handle, nz(tokens.len() + MAX_NEW)),
     )
-    .expect("the driver builds");
+    .expect("the driver builds")
+    .serve(Layout::Contiguous);
     let mut text = String::new();
     let generation = driver
         .generate(
@@ -223,7 +224,7 @@ fn driver_generation(
 }
 
 fn driver_options(handle: &ModelHandle, capacity: NonZeroUsize) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let granule = handle.config().prefill_granule;
     // A multiple of the granule within the window, never below one granule.
     let chunk = nz((capacity.get().min(128) / granule).max(1) * granule.get());

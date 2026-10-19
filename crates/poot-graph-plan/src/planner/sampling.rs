@@ -25,9 +25,14 @@ use poot_target::{Backend, BufferStorage, DeviceCaps};
 /// over about 150 workgroups, many enough that the combine stage stays a handful of steps per lane.
 const ARGMAX_CHUNK: usize = 1024;
 
+/// The largest vocabulary whose indices an f32 holds exactly: the partials scratch and the published pair
+/// carry each winner's index as an f32 (`2^24` is the last power of two below which every integer is exact).
+const ARGMAX_MAX_EXACT_VOCAB: usize = 1 << 24;
+
 /// The greedy pick as two dispatches over one scratch. `ArgmaxChunk` takes the metadata `[vocab, chunk,
 /// groups]` on a `groups x rows` grid (rows on Y); `ArgmaxCombine` takes `[groups, vocab]` on a `rows`
-/// grid (rows on X). A row count or chunk count past the target's grid limit on its axis is refused with
+/// grid (rows on X). A vocabulary past [`ARGMAX_MAX_EXACT_VOCAB`] is refused with
+/// [`Capability::ArgmaxIndexNotExact`] (its indices are not exact f32). A row count or chunk count past the target's grid limit on its axis is refused with
 /// [`Capability::DispatchGridAxisLimit`], never launched truncated.
 fn greedy(
     g: GraphTables<'_>,
@@ -37,6 +42,17 @@ fn greedy(
     backend: Backend,
     caps: &DeviceCaps,
 ) -> Result<Planned, PlanError> {
+    if vocab > ARGMAX_MAX_EXACT_VOCAB {
+        return Err(refusal_at(
+            g,
+            eqn,
+            backend,
+            Capability::ArgmaxIndexNotExact {
+                vocab,
+                limit: ARGMAX_MAX_EXACT_VOCAB,
+            },
+        ));
+    }
     // At least one chunk, so an empty vocabulary still publishes its `(0, -1)` pair.
     let groups = vocab.div_ceil(ARGMAX_CHUNK).max(1);
     for (axis, workgroups) in [(0, groups.max(rows)), (1, rows)] {
@@ -257,6 +273,54 @@ mod tests {
                     (BufferStorage::f32(), rows * groups * 3),
                     "{backend:?} {rows}x{vocab}: partials scratch"
                 );
+            }
+        }
+    }
+
+    /// POOT-1222 SC-003: a vocabulary of `2^24 + 1` is refused for the f32 argmax route with the typed
+    /// `ArgmaxIndexNotExact` naming the vocabulary and the limit, on every backend; `2^24` (every index
+    /// exact) plans.
+    ///
+    /// Mutation: delete the `ARGMAX_MAX_EXACT_VOCAB` check in `greedy`; the `2^24 + 1` row plans and the
+    /// refusal assertion fails.
+    #[test]
+    fn greedy_refuses_a_vocabulary_whose_indices_are_not_exact_f32() {
+        for backend in [
+            Backend::Nvptx,
+            Backend::SpirvVulkan,
+            Backend::AmdGcn(AmdArch::gfx1151()),
+        ] {
+            let plan_vocab = |vocab: usize| {
+                let graph = greedy_graph(1, vocab);
+                let eqn = graph
+                    .eqns()
+                    .iter()
+                    .find(|e| matches!(e.op, OpKind::SampleToken { .. }))
+                    .unwrap();
+                let mut caps = default_caps_for(backend);
+                caps.max_grid = [u32::MAX; 3];
+                crate::planner::plan_eqn_compiled(
+                    &graph,
+                    eqn,
+                    &Target::Gpu { backend, caps },
+                    &HashMap::new(),
+                    &crate::test_support::roomy_body_limits(),
+                )
+            };
+            plan_vocab(1 << 24).unwrap_or_else(|e| panic!("{backend:?}: 2^24 plans: {e}"));
+            match plan_vocab((1 << 24) + 1) {
+                Err(crate::PlanError::Refused(refusal)) => assert_eq!(
+                    refusal.missing,
+                    Capability::ArgmaxIndexNotExact {
+                        vocab: (1 << 24) + 1,
+                        limit: 1 << 24
+                    },
+                    "{backend:?}"
+                ),
+                other => panic!(
+                    "{backend:?}: expected a refusal, got {:?}",
+                    other.map(|p| p.choice)
+                ),
             }
         }
     }

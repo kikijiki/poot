@@ -12,7 +12,7 @@ use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::Executor;
 use poot_graph_ir::op::FusedOp;
 use poot_graph_ir::{Builder, IndexRange, OpKind, Slot, TensorType, Traced, UnOp};
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::{DType, HostTensor};
@@ -213,7 +213,7 @@ fn check_bit_exact(fixture: &Fixture, who: &str, got: &HostTensor) -> Result<(),
 /// plain `Select` equation, the fused cases run one `Fused` region that holds the select as a step. A row
 /// then shows which lowering produced its words.
 fn check_lowering(fixture: &Fixture, target: Target) -> Result<(), String> {
-    let staged = crate::staged(fixture, target, Submission::Replay);
+    let staged = crate::staged(fixture, target);
     let (mut plain, mut fused) = (0, 0);
     for (_, _, program) in staged.stages() {
         for (eqn, _) in program.planned() {
@@ -423,10 +423,7 @@ pub fn assert_two_byte_select_is_refused(target: Target) {
         let refused = poot_graph_plan::compile(
             &fixture.graph,
             &target,
-            &poot_graph_plan::CompileOptions::new(
-                Submission::Replay,
-                poot_graph_plan::CompileLimits::STANDARD,
-            ),
+            &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         );
         let Err(CompileError::Plan(error)) = refused else {
             panic!("{}: the two-byte select must be refused", fixture.name);

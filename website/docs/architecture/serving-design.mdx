@@ -11,7 +11,7 @@ import ContinuousBatchingDiagram from "@site/src/components/architecture/Continu
 `poot-serve` is an OpenAI-compatible HTTP server. It parses and bounds requests, loads any registered
 model as a `ModelHandle`, and serves `/v1/completions` and `/v1/chat/completions` from one scheduling loop
 over the driver's `step`. `/v1/embeddings`, `/v1/rerank` and the LoRA administration routes run on the same
-engine thread, as `Encode` steps and adapter operations between requests. Operator guides live under
+engine thread, as `encode` steps and adapter operations between requests. Operator guides live under
 [Serving](../serve/index.md).
 
 ## API

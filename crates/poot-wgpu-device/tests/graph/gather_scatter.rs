@@ -43,7 +43,7 @@ fn scatter_axis0_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -101,7 +101,7 @@ fn arg_top_k_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -178,7 +178,7 @@ fn gather_nonaxis0_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -242,7 +242,7 @@ fn gather_nonaxis0_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -380,7 +380,7 @@ fn gather_nonaxis0_gpu_matches_cpu_over_random_shapes() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -452,7 +452,7 @@ fn scatter_update_gpu_matches_cpu() {
         inputs.insert(base.id(), carried.clone().into());
         inputs.insert(src.id(), values[0].tensor.clone().into());
         inputs.insert(slots.id(), values[1].tensor.clone().into());
-        let result = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+        let result = eval(&g, &inputs, EvalOptions::default()).unwrap();
         carried = result.output.into_host().unwrap();
         want.push(carried.clone());
     }
@@ -834,7 +834,7 @@ fn gather_composition_gpu_matches_cpu_over_random_graphs() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -976,7 +976,7 @@ fn scatter_composition_gpu_matches_cpu_over_random_graphs() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1032,11 +1032,11 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
         return;
     };
 
-    // Card 546b: the contract admits `Submission::Replay` only (`staged_replay`), never the `Submission::Eager`
+    // Card 546b: the contract replays only (`staged_replay`), never the eager path
     // of the deleted `GpuExecutor::run_resident_kv` + raw `&[DeviceBuffer]` state. The bug this
     // row guards (an I32 `Slot::Pos` read as both a `Gather` index and a `Cast`/`DynamicUpdateSlice`
     // source, `planner/cast.rs`'s mirror-lane `Plan::Alias`) is a `compile`-time lane decision, not an
-    // execution-model one, so `Submission::Replay` exercises the identical planner path. The Dus/
+    // execution-model one, so the replayed program exercises the identical planner path. The Dus/
     // CastDus variants carry a seeded (non-zero) `Storage::State` "cache": since `add_entry` only ever
     // zero-allocates a fresh state buffer (no seed-by-name upload exists on the contract), a tiny
     // priming entry writes the seed into that shared, name-keyed state buffer first (Z5: two entries on
@@ -1046,10 +1046,8 @@ fn i32_slot_gather_variants_compiled_match_cpu_bit_exact() {
         // matching `variant.inputs`'s signature; `staged_replay` below compiles it a second time into a
         // `StagedProgram` for the engine, mirroring `legalize.rs`'s already-landed split test (compile
         // once to inspect/bind, `run_via_contract`/`staged_replay` compiles again to execute).
-        let options = poot_graph_plan::CompileOptions::new(
-            poot_graph_plan::production_plan::Submission::Replay,
-            poot_graph_plan::CompileLimits::STANDARD,
-        );
+        let options =
+            poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
         let program = poot_graph_plan::compile(&variant.graph, &target, &options)
             .map_err(|e| format!("compile: {e}"))?;
         let graph = program.graph().clone();

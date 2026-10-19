@@ -2,12 +2,13 @@
 //! beside the engine thread that serves the text tower.
 //!
 //! A chat request with images is lowered here to what the engine already takes: the prompt's token ids
-//! and the embedding rows that replace its `<image>` placeholders ([`PromptInput::Multimodal`]). The
+//! and the request inputs the text model declares, the embedding rows that replace its `<image>`
+//! placeholders among them ([`PromptInput`]). The
 //! tower runs one `Encode` step per frame, so a request's images are encoded off the engine thread and
 //! the engine's decode loop never waits for them. An executor is not `Send`, so the driver is built
 //! on the worker thread and only the requests and their results cross it.
 //!
-//! [`PromptInput::Multimodal`]: crate::types::PromptInput::Multimodal
+//! [`PromptInput`]: crate::types::PromptInput
 
 use std::io::Cursor;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, DriverOptions, PreparedSetLimits, open_executor, program_retention,
 };
@@ -80,7 +81,7 @@ pub(crate) enum ImageError {
 /// The driver options of the vision tower: a frame is one `Encode` step, so the capacity and the
 /// prefill piece are both the frame's patches.
 fn vision_options(patches: usize) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let patches = NonZeroUsize::new(patches).expect("a frame has patches");
     DriverOptions {
         prefill: compile.clone(),

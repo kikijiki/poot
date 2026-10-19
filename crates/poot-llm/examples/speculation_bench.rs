@@ -31,10 +31,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
-    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, LoadOptions, ModelHandle,
-    PreparedSetLimits, open_executor,
+    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Layout, LoadOptions,
+    ModelHandle, PreparedSetLimits, open_executor,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
@@ -142,7 +142,7 @@ fn main() -> Result<()> {
 
     let granule = target.config().prefill_granule.get();
     let chunk = NonZeroUsize::new(128usize.div_ceil(granule) * granule).expect("nonzero");
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let options = DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -165,6 +165,7 @@ fn main() -> Result<()> {
     if timed {
         driver = driver.with_phase_timing();
     }
+    let mut driver = driver.serve(Layout::Contiguous);
 
     let mut rates = Vec::new();
     let mut hash = 0;

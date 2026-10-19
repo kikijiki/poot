@@ -9267,7 +9267,7 @@ nemotron_h.decode	41	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd232
 nemotron_h.decode	42	broadcast [1, 4, 1, 1]	compute	generated:movement	310581be5f45063f	1	4,1,1	-
 nemotron_h.decode	43	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v91
 nemotron_h.decode	44	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v76
-nemotron_h.decode	45	scan ssd chunk=64	compute	generated:scan	6dd602e22d8a0912	1	32,1,1	-
+nemotron_h.decode	45	scan ssd chunk=64	compute	generated:scan	c24884ff1eef1b05	1	32,1,1	-
 nemotron_h.decode	46	slice ax=2 0..1	compute	generated:movement	19c9f34929b0c878	1	32,1,1	-
 nemotron_h.decode	47	slice ax=2 1..5	compute	generated:movement	35dc8a8a49ba08a2	1	128,1,1	-
 nemotron_h.decode	48	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v96
@@ -9338,7 +9338,7 @@ nemotron_h.decode	112	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd23
 nemotron_h.decode	113	broadcast [1, 4, 1, 1]	compute	generated:movement	310581be5f45063f	1	4,1,1	-
 nemotron_h.decode	114	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v288
 nemotron_h.decode	115	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v273
-nemotron_h.decode	116	scan ssd chunk=64	compute	generated:scan	6dd602e22d8a0912	1	32,1,1	-
+nemotron_h.decode	116	scan ssd chunk=64	compute	generated:scan	c24884ff1eef1b05	1	32,1,1	-
 nemotron_h.decode	117	slice ax=2 0..1	compute	generated:movement	19c9f34929b0c878	1	32,1,1	-
 nemotron_h.decode	118	slice ax=2 1..5	compute	generated:movement	35dc8a8a49ba08a2	1	128,1,1	-
 nemotron_h.decode	119	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v293
@@ -9404,7 +9404,7 @@ nemotron_h.prefill	48	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd23
 nemotron_h.prefill	49	broadcast [1, 4, 1, 1]	compute	generated:movement	310581be5f45063f	1	4,1,1	-
 nemotron_h.prefill	50	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v91
 nemotron_h.prefill	51	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v76
-nemotron_h.prefill	52	scan ssd chunk=64	compute	generated:scan	bb9ef7fdefbdbedc	1	32,1,1	-
+nemotron_h.prefill	52	scan ssd chunk=64	compute	generated:scan	5f80084fe9e3883e	1	32,1,1	-
 nemotron_h.prefill	53	slice ax=2 0..4	compute	generated:movement	419ff4f3c73c1b74	1	128,1,1	-
 nemotron_h.prefill	54	slice ax=2 4..8	compute	generated:movement	c7b4be80751d35e0	1	128,1,1	-
 nemotron_h.prefill	55	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v96
@@ -9486,7 +9486,7 @@ nemotron_h.prefill	130	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd2
 nemotron_h.prefill	131	broadcast [1, 4, 1, 1]	compute	generated:movement	310581be5f45063f	1	4,1,1	-
 nemotron_h.prefill	132	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v264
 nemotron_h.prefill	133	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v249
-nemotron_h.prefill	134	scan ssd chunk=64	compute	generated:scan	bb9ef7fdefbdbedc	1	32,1,1	-
+nemotron_h.prefill	134	scan ssd chunk=64	compute	generated:scan	5f80084fe9e3883e	1	32,1,1	-
 nemotron_h.prefill	135	slice ax=2 0..4	compute	generated:movement	419ff4f3c73c1b74	1	128,1,1	-
 nemotron_h.prefill	136	slice ax=2 4..8	compute	generated:movement	c7b4be80751d35e0	1	128,1,1	-
 nemotron_h.prefill	137	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v269
@@ -9555,7 +9555,7 @@ nemotron_h.prefill_kv	48	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1f
 nemotron_h.prefill_kv	49	broadcast [1, 4, 1, 1]	compute	generated:movement	310581be5f45063f	1	4,1,1	-
 nemotron_h.prefill_kv	50	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v91
 nemotron_h.prefill_kv	51	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v76
-nemotron_h.prefill_kv	52	scan ssd chunk=64	compute	generated:scan	bb9ef7fdefbdbedc	1	32,1,1	-
+nemotron_h.prefill_kv	52	scan ssd chunk=64	compute	generated:scan	5f80084fe9e3883e	1	32,1,1	-
 nemotron_h.prefill_kv	53	slice ax=2 0..4	compute	generated:movement	419ff4f3c73c1b74	1	128,1,1	-
 nemotron_h.prefill_kv	54	slice ax=2 4..8	compute	generated:movement	c7b4be80751d35e0	1	128,1,1	-
 nemotron_h.prefill_kv	55	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v96
@@ -9637,7 +9637,7 @@ nemotron_h.prefill_kv	130	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1
 nemotron_h.prefill_kv	131	broadcast [1, 4, 1, 1]	compute	generated:movement	310581be5f45063f	1	4,1,1	-
 nemotron_h.prefill_kv	132	reshape [1, 4, 1, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v264
 nemotron_h.prefill_kv	133	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v249
-nemotron_h.prefill_kv	134	scan ssd chunk=64	compute	generated:scan	bb9ef7fdefbdbedc	1	32,1,1	-
+nemotron_h.prefill_kv	134	scan ssd chunk=64	compute	generated:scan	5f80084fe9e3883e	1	32,1,1	-
 nemotron_h.prefill_kv	135	slice ax=2 0..4	compute	generated:movement	419ff4f3c73c1b74	1	128,1,1	-
 nemotron_h.prefill_kv	136	slice ax=2 4..8	compute	generated:movement	c7b4be80751d35e0	1	128,1,1	-
 nemotron_h.prefill_kv	137	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v269
@@ -16808,7 +16808,7 @@ qwen3next.prefill	60	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232
 qwen3next.prefill	61	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen3next.prefill	62	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v45
 qwen3next.prefill	63	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen3next.prefill	64	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen3next.prefill	64	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen3next.prefill	65	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v113 strides=[384, 96, 8, 1] offset=0
 qwen3next.prefill	66	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen3next.prefill	67	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v25
@@ -16949,7 +16949,7 @@ qwen3next.prefill	201	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd23
 qwen3next.prefill	202	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen3next.prefill	203	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v320
 qwen3next.prefill	204	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen3next.prefill	205	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen3next.prefill	205	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen3next.prefill	206	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v388 strides=[384, 96, 8, 1] offset=0
 qwen3next.prefill	207	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen3next.prefill	208	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v300
@@ -17080,7 +17080,7 @@ qwen3next.prefill	332	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd23
 qwen3next.prefill	333	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen3next.prefill	334	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v595
 qwen3next.prefill	335	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen3next.prefill	336	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen3next.prefill	336	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen3next.prefill	337	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v663 strides=[384, 96, 8, 1] offset=0
 qwen3next.prefill	338	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen3next.prefill	339	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v575
@@ -17316,7 +17316,7 @@ qwen3next.prefill_kv	60	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd
 qwen3next.prefill_kv	61	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen3next.prefill_kv	62	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v45
 qwen3next.prefill_kv	63	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen3next.prefill_kv	64	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen3next.prefill_kv	64	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen3next.prefill_kv	65	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v113 strides=[384, 96, 8, 1] offset=0
 qwen3next.prefill_kv	66	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen3next.prefill_kv	67	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v25
@@ -17457,7 +17457,7 @@ qwen3next.prefill_kv	201	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1f
 qwen3next.prefill_kv	202	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen3next.prefill_kv	203	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v320
 qwen3next.prefill_kv	204	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen3next.prefill_kv	205	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen3next.prefill_kv	205	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen3next.prefill_kv	206	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v388 strides=[384, 96, 8, 1] offset=0
 qwen3next.prefill_kv	207	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen3next.prefill_kv	208	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v300
@@ -17588,7 +17588,7 @@ qwen3next.prefill_kv	332	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1f
 qwen3next.prefill_kv	333	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen3next.prefill_kv	334	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v595
 qwen3next.prefill_kv	335	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen3next.prefill_kv	336	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen3next.prefill_kv	336	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen3next.prefill_kv	337	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v663 strides=[384, 96, 8, 1] offset=0
 qwen3next.prefill_kv	338	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen3next.prefill_kv	339	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v575
@@ -18045,7 +18045,7 @@ qwen35.prefill	45	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0
 qwen35.prefill	46	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35.prefill	47	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v36
 qwen35.prefill	48	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35.prefill	49	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35.prefill	49	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35.prefill	50	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v104 strides=[384, 96, 8, 1] offset=0
 qwen35.prefill	51	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35.prefill	52	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v20
@@ -18109,7 +18109,7 @@ qwen35.prefill	109	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	
 qwen35.prefill	110	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35.prefill	111	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v183
 qwen35.prefill	112	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35.prefill	113	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35.prefill	113	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35.prefill	114	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v251 strides=[384, 96, 8, 1] offset=0
 qwen35.prefill	115	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35.prefill	116	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v167
@@ -18173,7 +18173,7 @@ qwen35.prefill	173	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	
 qwen35.prefill	174	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35.prefill	175	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v330
 qwen35.prefill	176	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35.prefill	177	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35.prefill	177	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35.prefill	178	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v398 strides=[384, 96, 8, 1] offset=0
 qwen35.prefill	179	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35.prefill	180	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v314
@@ -18290,7 +18290,7 @@ qwen35.prefill_kv	45	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232
 qwen35.prefill_kv	46	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35.prefill_kv	47	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v36
 qwen35.prefill_kv	48	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35.prefill_kv	49	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35.prefill_kv	49	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35.prefill_kv	50	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v104 strides=[384, 96, 8, 1] offset=0
 qwen35.prefill_kv	51	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35.prefill_kv	52	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v20
@@ -18354,7 +18354,7 @@ qwen35.prefill_kv	109	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd23
 qwen35.prefill_kv	110	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35.prefill_kv	111	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v183
 qwen35.prefill_kv	112	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35.prefill_kv	113	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35.prefill_kv	113	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35.prefill_kv	114	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v251 strides=[384, 96, 8, 1] offset=0
 qwen35.prefill_kv	115	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35.prefill_kv	116	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v167
@@ -18418,7 +18418,7 @@ qwen35.prefill_kv	173	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd23
 qwen35.prefill_kv	174	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35.prefill_kv	175	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v330
 qwen35.prefill_kv	176	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35.prefill_kv	177	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35.prefill_kv	177	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35.prefill_kv	178	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v398 strides=[384, 96, 8, 1] offset=0
 qwen35.prefill_kv	179	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35.prefill_kv	180	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v314
@@ -18771,7 +18771,7 @@ qwen35/text.prefill	45	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd2
 qwen35/text.prefill	46	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/text.prefill	47	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v36
 qwen35/text.prefill	48	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/text.prefill	49	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/text.prefill	49	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/text.prefill	50	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v104 strides=[384, 96, 8, 1] offset=0
 qwen35/text.prefill	51	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/text.prefill	52	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v20
@@ -18835,7 +18835,7 @@ qwen35/text.prefill	109	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd
 qwen35/text.prefill	110	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/text.prefill	111	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v183
 qwen35/text.prefill	112	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/text.prefill	113	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/text.prefill	113	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/text.prefill	114	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v251 strides=[384, 96, 8, 1] offset=0
 qwen35/text.prefill	115	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/text.prefill	116	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v167
@@ -18899,7 +18899,7 @@ qwen35/text.prefill	173	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd
 qwen35/text.prefill	174	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/text.prefill	175	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v330
 qwen35/text.prefill	176	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/text.prefill	177	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/text.prefill	177	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/text.prefill	178	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v398 strides=[384, 96, 8, 1] offset=0
 qwen35/text.prefill	179	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/text.prefill	180	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v314
@@ -19016,7 +19016,7 @@ qwen35/text.prefill_kv	45	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1
 qwen35/text.prefill_kv	46	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/text.prefill_kv	47	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v36
 qwen35/text.prefill_kv	48	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/text.prefill_kv	49	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/text.prefill_kv	49	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/text.prefill_kv	50	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v104 strides=[384, 96, 8, 1] offset=0
 qwen35/text.prefill_kv	51	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/text.prefill_kv	52	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v20
@@ -19080,7 +19080,7 @@ qwen35/text.prefill_kv	109	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b
 qwen35/text.prefill_kv	110	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/text.prefill_kv	111	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v183
 qwen35/text.prefill_kv	112	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/text.prefill_kv	113	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/text.prefill_kv	113	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/text.prefill_kv	114	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v251 strides=[384, 96, 8, 1] offset=0
 qwen35/text.prefill_kv	115	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/text.prefill_kv	116	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v167
@@ -19144,7 +19144,7 @@ qwen35/text.prefill_kv	173	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b
 qwen35/text.prefill_kv	174	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/text.prefill_kv	175	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v330
 qwen35/text.prefill_kv	176	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/text.prefill_kv	177	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/text.prefill_kv	177	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/text.prefill_kv	178	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v398 strides=[384, 96, 8, 1] offset=0
 qwen35/text.prefill_kv	179	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/text.prefill_kv	180	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v314
@@ -19452,8 +19452,8 @@ qwen35/fp8.prefill	0	dense_row_gather bf16	compute	imported:packedbf16rowgather	
 qwen35/fp8.prefill	1	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill	2	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill	3	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill	4	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill	5	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill	4	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill	5	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill	6	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	4,1,1	-
 qwen35/fp8.prefill	7	fused n_in=1 steps=2	compute	generated:pointwise	91249a4436058652	1	4,1,1	-
 qwen35/fp8.prefill	8	contraction_epilogue Dense { weight: BF16 } n_in=1 steps=4	compute	generated:contraction	b95d22e6ff195959	1	64,1,1	-
@@ -19497,7 +19497,7 @@ qwen35/fp8.prefill	45	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd23
 qwen35/fp8.prefill	46	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/fp8.prefill	47	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v36
 qwen35/fp8.prefill	48	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/fp8.prefill	49	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/fp8.prefill	49	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/fp8.prefill	50	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v104 strides=[384, 96, 8, 1] offset=0
 qwen35/fp8.prefill	51	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/fp8.prefill	52	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v20
@@ -19505,21 +19505,21 @@ qwen35/fp8.prefill	53	transpose [0, 2, 1, 3]	view	nodispatch:view	bf92db02ffef3f
 qwen35/fp8.prefill	54	fused_row n_in=3 steps=13	compute	generated:row	d32de4625e1295cd	1	128,1,1	-
 qwen35/fp8.prefill	55	transpose [0, 2, 1, 3]	compute	generated:movement	3984eeb9c444ecb8	1	128,1,1	-
 qwen35/fp8.prefill	56	reshape [1, 4, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v121
-qwen35/fp8.prefill	57	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill	57	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill	58	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill	59	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill	60	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill	61	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill	62	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill	63	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
+qwen35/fp8.prefill	62	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill	63	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
 qwen35/fp8.prefill	64	fused n_in=2 steps=5	compute	generated:pointwise	af450d82e2968aba	1	256,1,1	-
-qwen35/fp8.prefill	65	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2c67ddfd1160a6dd	1	256,1,1	meta=[64, 32, 4, 4]
+qwen35/fp8.prefill	65	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	f9b39d5d188d72b9	1	64,1,1	meta=[64, 32, 4, 1, 0]
 qwen35/fp8.prefill	66	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill	67	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill	68	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill	69	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill	70	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill	71	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill	70	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill	71	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill	72	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	4,1,1	-
 qwen35/fp8.prefill	73	fused n_in=1 steps=2	compute	generated:pointwise	91249a4436058652	1	4,1,1	-
 qwen35/fp8.prefill	74	contraction_epilogue Dense { weight: BF16 } n_in=1 steps=4	compute	generated:contraction	b95d22e6ff195959	1	64,1,1	-
@@ -19563,7 +19563,7 @@ qwen35/fp8.prefill	111	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd2
 qwen35/fp8.prefill	112	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/fp8.prefill	113	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v183
 qwen35/fp8.prefill	114	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/fp8.prefill	115	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/fp8.prefill	115	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/fp8.prefill	116	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v251 strides=[384, 96, 8, 1] offset=0
 qwen35/fp8.prefill	117	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/fp8.prefill	118	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v167
@@ -19571,21 +19571,21 @@ qwen35/fp8.prefill	119	transpose [0, 2, 1, 3]	view	nodispatch:view	bf92db02ffef3
 qwen35/fp8.prefill	120	fused_row n_in=3 steps=13	compute	generated:row	d32de4625e1295cd	1	128,1,1	-
 qwen35/fp8.prefill	121	transpose [0, 2, 1, 3]	compute	generated:movement	3984eeb9c444ecb8	1	128,1,1	-
 qwen35/fp8.prefill	122	reshape [1, 4, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v268
-qwen35/fp8.prefill	123	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill	123	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill	124	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill	125	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill	126	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill	127	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill	128	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill	129	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
+qwen35/fp8.prefill	128	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill	129	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
 qwen35/fp8.prefill	130	fused n_in=2 steps=5	compute	generated:pointwise	af450d82e2968aba	1	256,1,1	-
-qwen35/fp8.prefill	131	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2c67ddfd1160a6dd	1	256,1,1	meta=[64, 32, 4, 4]
+qwen35/fp8.prefill	131	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	f9b39d5d188d72b9	1	64,1,1	meta=[64, 32, 4, 1, 0]
 qwen35/fp8.prefill	132	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill	133	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill	134	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill	135	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill	136	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill	137	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill	136	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill	137	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill	138	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	4,1,1	-
 qwen35/fp8.prefill	139	fused n_in=1 steps=2	compute	generated:pointwise	91249a4436058652	1	4,1,1	-
 qwen35/fp8.prefill	140	contraction_epilogue Dense { weight: BF16 } n_in=1 steps=4	compute	generated:contraction	b95d22e6ff195959	1	64,1,1	-
@@ -19629,7 +19629,7 @@ qwen35/fp8.prefill	177	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd2
 qwen35/fp8.prefill	178	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/fp8.prefill	179	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v330
 qwen35/fp8.prefill	180	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/fp8.prefill	181	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/fp8.prefill	181	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/fp8.prefill	182	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v398 strides=[384, 96, 8, 1] offset=0
 qwen35/fp8.prefill	183	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/fp8.prefill	184	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v314
@@ -19637,22 +19637,22 @@ qwen35/fp8.prefill	185	transpose [0, 2, 1, 3]	view	nodispatch:view	bf92db02ffef3
 qwen35/fp8.prefill	186	fused_row n_in=3 steps=13	compute	generated:row	d32de4625e1295cd	1	128,1,1	-
 qwen35/fp8.prefill	187	transpose [0, 2, 1, 3]	compute	generated:movement	3984eeb9c444ecb8	1	128,1,1	-
 qwen35/fp8.prefill	188	reshape [1, 4, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v415
-qwen35/fp8.prefill	189	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill	189	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill	190	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill	191	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill	192	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill	193	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill	194	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill	195	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
+qwen35/fp8.prefill	194	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill	195	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
 qwen35/fp8.prefill	196	fused n_in=2 steps=5	compute	generated:pointwise	af450d82e2968aba	1	256,1,1	-
-qwen35/fp8.prefill	197	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2c67ddfd1160a6dd	1	256,1,1	meta=[64, 32, 4, 4]
+qwen35/fp8.prefill	197	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	f9b39d5d188d72b9	1	64,1,1	meta=[64, 32, 4, 1, 0]
 qwen35/fp8.prefill	198	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill	199	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill	200	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill	201	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill	202	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill	203	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5900967d056077b6	1	128,1,1	meta=[32, 16, 4, 2]
-qwen35/fp8.prefill	204	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5900967d056077b6	1	128,1,1	meta=[32, 16, 4, 2]
+qwen35/fp8.prefill	202	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill	203	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	fce42b27dd189886	1	64,1,1	meta=[32, 16, 4, 1, 0]
+qwen35/fp8.prefill	204	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	fce42b27dd189886	1	64,1,1	meta=[32, 16, 4, 1, 0]
 qwen35/fp8.prefill	205	reshape [1, 4, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v458
 qwen35/fp8.prefill	206	slice ax=3 0..8	compute	generated:movement	cebe1f65d655ee5e	1	128,1,1	-
 qwen35/fp8.prefill	207	slice ax=3 8..16	compute	generated:movement	bb4e5b795dbbd326	1	128,1,1	-
@@ -19686,15 +19686,15 @@ qwen35/fp8.prefill	234	attention n_rep=2 scale=0.35355338 softcap=None mask=Addi
 qwen35/fp8.prefill	235	transpose [0, 2, 1, 3]	compute	generated:movement	3984eeb9c444ecb8	1	128,1,1	-
 qwen35/fp8.prefill	236	reshape [1, 4, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v551
 qwen35/fp8.prefill	237	fused n_in=2 steps=5	compute	generated:pointwise	0d3073e95641b2fa	1	128,1,1	-
-qwen35/fp8.prefill	238	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill	238	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill	239	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill	240	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill	241	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill	242	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill	243	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill	244	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
+qwen35/fp8.prefill	243	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill	244	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
 qwen35/fp8.prefill	245	fused n_in=2 steps=5	compute	generated:pointwise	af450d82e2968aba	1	256,1,1	-
-qwen35/fp8.prefill	246	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2c67ddfd1160a6dd	1	256,1,1	meta=[64, 32, 4, 4]
+qwen35/fp8.prefill	246	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	f9b39d5d188d72b9	1	64,1,1	meta=[64, 32, 4, 1, 0]
 qwen35/fp8.prefill	247	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill	248	slice ax=1 3..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v586 strides=[128, 32, 1] offset=96
 qwen35/fp8.prefill	249	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
@@ -19705,8 +19705,8 @@ qwen35/fp8.prefill_kv	0	dense_row_gather bf16	compute	imported:packedbf16rowgath
 qwen35/fp8.prefill_kv	1	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill_kv	2	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill_kv	3	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill_kv	4	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill_kv	5	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill_kv	4	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill_kv	5	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	6	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	4,1,1	-
 qwen35/fp8.prefill_kv	7	fused n_in=1 steps=2	compute	generated:pointwise	91249a4436058652	1	4,1,1	-
 qwen35/fp8.prefill_kv	8	contraction_epilogue Dense { weight: BF16 } n_in=1 steps=4	compute	generated:contraction	b95d22e6ff195959	1	64,1,1	-
@@ -19750,7 +19750,7 @@ qwen35/fp8.prefill_kv	45	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1f
 qwen35/fp8.prefill_kv	46	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/fp8.prefill_kv	47	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v36
 qwen35/fp8.prefill_kv	48	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/fp8.prefill_kv	49	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/fp8.prefill_kv	49	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/fp8.prefill_kv	50	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v104 strides=[384, 96, 8, 1] offset=0
 qwen35/fp8.prefill_kv	51	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/fp8.prefill_kv	52	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v20
@@ -19758,21 +19758,21 @@ qwen35/fp8.prefill_kv	53	transpose [0, 2, 1, 3]	view	nodispatch:view	bf92db02ffe
 qwen35/fp8.prefill_kv	54	fused_row n_in=3 steps=13	compute	generated:row	d32de4625e1295cd	1	128,1,1	-
 qwen35/fp8.prefill_kv	55	transpose [0, 2, 1, 3]	compute	generated:movement	3984eeb9c444ecb8	1	128,1,1	-
 qwen35/fp8.prefill_kv	56	reshape [1, 4, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v121
-qwen35/fp8.prefill_kv	57	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill_kv	57	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	58	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill_kv	59	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill_kv	60	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill_kv	61	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill_kv	62	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill_kv	63	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
+qwen35/fp8.prefill_kv	62	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill_kv	63	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
 qwen35/fp8.prefill_kv	64	fused n_in=2 steps=5	compute	generated:pointwise	af450d82e2968aba	1	256,1,1	-
-qwen35/fp8.prefill_kv	65	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2c67ddfd1160a6dd	1	256,1,1	meta=[64, 32, 4, 4]
+qwen35/fp8.prefill_kv	65	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	f9b39d5d188d72b9	1	64,1,1	meta=[64, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	66	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill_kv	67	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill_kv	68	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill_kv	69	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill_kv	70	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill_kv	71	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill_kv	70	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill_kv	71	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	72	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	4,1,1	-
 qwen35/fp8.prefill_kv	73	fused n_in=1 steps=2	compute	generated:pointwise	91249a4436058652	1	4,1,1	-
 qwen35/fp8.prefill_kv	74	contraction_epilogue Dense { weight: BF16 } n_in=1 steps=4	compute	generated:contraction	b95d22e6ff195959	1	64,1,1	-
@@ -19816,7 +19816,7 @@ qwen35/fp8.prefill_kv	111	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1
 qwen35/fp8.prefill_kv	112	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/fp8.prefill_kv	113	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v183
 qwen35/fp8.prefill_kv	114	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/fp8.prefill_kv	115	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/fp8.prefill_kv	115	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/fp8.prefill_kv	116	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v251 strides=[384, 96, 8, 1] offset=0
 qwen35/fp8.prefill_kv	117	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/fp8.prefill_kv	118	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v167
@@ -19824,21 +19824,21 @@ qwen35/fp8.prefill_kv	119	transpose [0, 2, 1, 3]	view	nodispatch:view	bf92db02ff
 qwen35/fp8.prefill_kv	120	fused_row n_in=3 steps=13	compute	generated:row	d32de4625e1295cd	1	128,1,1	-
 qwen35/fp8.prefill_kv	121	transpose [0, 2, 1, 3]	compute	generated:movement	3984eeb9c444ecb8	1	128,1,1	-
 qwen35/fp8.prefill_kv	122	reshape [1, 4, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v268
-qwen35/fp8.prefill_kv	123	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill_kv	123	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	124	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill_kv	125	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill_kv	126	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill_kv	127	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill_kv	128	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill_kv	129	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
+qwen35/fp8.prefill_kv	128	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill_kv	129	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
 qwen35/fp8.prefill_kv	130	fused n_in=2 steps=5	compute	generated:pointwise	af450d82e2968aba	1	256,1,1	-
-qwen35/fp8.prefill_kv	131	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2c67ddfd1160a6dd	1	256,1,1	meta=[64, 32, 4, 4]
+qwen35/fp8.prefill_kv	131	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	f9b39d5d188d72b9	1	64,1,1	meta=[64, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	132	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill_kv	133	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill_kv	134	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill_kv	135	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill_kv	136	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill_kv	137	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill_kv	136	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill_kv	137	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	138	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	4,1,1	-
 qwen35/fp8.prefill_kv	139	fused n_in=1 steps=2	compute	generated:pointwise	91249a4436058652	1	4,1,1	-
 qwen35/fp8.prefill_kv	140	contraction_epilogue Dense { weight: BF16 } n_in=1 steps=4	compute	generated:contraction	b95d22e6ff195959	1	64,1,1	-
@@ -19882,7 +19882,7 @@ qwen35/fp8.prefill_kv	177	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1
 qwen35/fp8.prefill_kv	178	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen35/fp8.prefill_kv	179	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v330
 qwen35/fp8.prefill_kv	180	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen35/fp8.prefill_kv	181	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen35/fp8.prefill_kv	181	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen35/fp8.prefill_kv	182	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v398 strides=[384, 96, 8, 1] offset=0
 qwen35/fp8.prefill_kv	183	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen35/fp8.prefill_kv	184	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v314
@@ -19890,22 +19890,22 @@ qwen35/fp8.prefill_kv	185	transpose [0, 2, 1, 3]	view	nodispatch:view	bf92db02ff
 qwen35/fp8.prefill_kv	186	fused_row n_in=3 steps=13	compute	generated:row	d32de4625e1295cd	1	128,1,1	-
 qwen35/fp8.prefill_kv	187	transpose [0, 2, 1, 3]	compute	generated:movement	3984eeb9c444ecb8	1	128,1,1	-
 qwen35/fp8.prefill_kv	188	reshape [1, 4, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v415
-qwen35/fp8.prefill_kv	189	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill_kv	189	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	190	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill_kv	191	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill_kv	192	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill_kv	193	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill_kv	194	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill_kv	195	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
+qwen35/fp8.prefill_kv	194	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill_kv	195	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
 qwen35/fp8.prefill_kv	196	fused n_in=2 steps=5	compute	generated:pointwise	af450d82e2968aba	1	256,1,1	-
-qwen35/fp8.prefill_kv	197	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2c67ddfd1160a6dd	1	256,1,1	meta=[64, 32, 4, 4]
+qwen35/fp8.prefill_kv	197	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	f9b39d5d188d72b9	1	64,1,1	meta=[64, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	198	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill_kv	199	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill_kv	200	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill_kv	201	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill_kv	202	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill_kv	203	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5900967d056077b6	1	128,1,1	meta=[32, 16, 4, 2]
-qwen35/fp8.prefill_kv	204	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5900967d056077b6	1	128,1,1	meta=[32, 16, 4, 2]
+qwen35/fp8.prefill_kv	202	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill_kv	203	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	fce42b27dd189886	1	64,1,1	meta=[32, 16, 4, 1, 0]
+qwen35/fp8.prefill_kv	204	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	fce42b27dd189886	1	64,1,1	meta=[32, 16, 4, 1, 0]
 qwen35/fp8.prefill_kv	205	reshape [1, 4, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v458
 qwen35/fp8.prefill_kv	206	slice ax=3 0..8	compute	generated:movement	cebe1f65d655ee5e	1	128,1,1	-
 qwen35/fp8.prefill_kv	207	slice ax=3 8..16	compute	generated:movement	bb4e5b795dbbd326	1	128,1,1	-
@@ -19939,15 +19939,15 @@ qwen35/fp8.prefill_kv	234	attention n_rep=2 scale=0.35355338 softcap=None mask=A
 qwen35/fp8.prefill_kv	235	transpose [0, 2, 1, 3]	compute	generated:movement	3984eeb9c444ecb8	1	128,1,1	-
 qwen35/fp8.prefill_kv	236	reshape [1, 4, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v551
 qwen35/fp8.prefill_kv	237	fused n_in=2 steps=5	compute	generated:pointwise	0d3073e95641b2fa	1	128,1,1	-
-qwen35/fp8.prefill_kv	238	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2651861e2d27905e	1	256,1,1	meta=[32, 32, 4, 4]
+qwen35/fp8.prefill_kv	238	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	ae83da8210b1806c	1	64,1,1	meta=[32, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	239	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill_kv	240	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen35/fp8.prefill_kv	241	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
 qwen35/fp8.prefill_kv	242	fused_row n_in=2 steps=7	compute	generated:row	35a80135bca27320	1	128,1,1	-
-qwen35/fp8.prefill_kv	243	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
-qwen35/fp8.prefill_kv	244	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	5836e1bc920f63d4	1	512,1,1	meta=[32, 64, 4, 8]
+qwen35/fp8.prefill_kv	243	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
+qwen35/fp8.prefill_kv	244	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	3848276e175b6e5d	1	128,1,1	meta=[32, 64, 4, 2, 0]
 qwen35/fp8.prefill_kv	245	fused n_in=2 steps=5	compute	generated:pointwise	af450d82e2968aba	1	256,1,1	-
-qwen35/fp8.prefill_kv	246	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	2c67ddfd1160a6dd	1	256,1,1	meta=[64, 32, 4, 4]
+qwen35/fp8.prefill_kv	246	packed_contraction e4m3block128 { scale: bf16 }	compute_meta	generated:contraction	f9b39d5d188d72b9	1	64,1,1	meta=[64, 32, 4, 1, 0]
 qwen35/fp8.prefill_kv	247	add	compute	generated:elementwise	5ca8e6a17192a4fb	1	128,1,1	-
 qwen35/fp8.prefill_kv	248	slice ax=1 3..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v586 strides=[128, 32, 1] offset=96
 qwen35/fp8.prefill_kv	249	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
@@ -20113,7 +20113,7 @@ qwen35/finetune.prefill	43	reshape [1, 4, 3, 1]	alias	nodispatch:alias	393ffe84b
 qwen35/finetune.prefill	44	transpose [0, 2, 1, 3]	compute	generated:movement	44970c4fc2f6f3f4	1	12,1,1	-
 qwen35/finetune.prefill	45	reshape [1, 4, 3, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v36
 qwen35/finetune.prefill	46	transpose [0, 2, 1, 3]	compute	generated:movement	44970c4fc2f6f3f4	1	12,1,1	-
-qwen35/finetune.prefill	47	scan delta_rule chunk=4	compute	generated:scan	97f3c432837a908d	1	24,1,1	-
+qwen35/finetune.prefill	47	scan delta_rule chunk=4	compute	generated:scan	567d5a8713c3667d	1	24,1,1	-
 qwen35/finetune.prefill	48	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v104 strides=[288, 96, 8, 1] offset=0
 qwen35/finetune.prefill	49	slice ax=2 4..12	compute	generated:movement	65a4633b02ae7408	1	192,1,1	-
 qwen35/finetune.prefill	50	reshape [1, 4, 3, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v20
@@ -20228,7 +20228,7 @@ qwen35/finetune.prefill_kv	43	reshape [1, 4, 3, 1]	alias	nodispatch:alias	393ffe
 qwen35/finetune.prefill_kv	44	transpose [0, 2, 1, 3]	compute	generated:movement	44970c4fc2f6f3f4	1	12,1,1	-
 qwen35/finetune.prefill_kv	45	reshape [1, 4, 3, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v36
 qwen35/finetune.prefill_kv	46	transpose [0, 2, 1, 3]	compute	generated:movement	44970c4fc2f6f3f4	1	12,1,1	-
-qwen35/finetune.prefill_kv	47	scan delta_rule chunk=4	compute	generated:scan	97f3c432837a908d	1	24,1,1	-
+qwen35/finetune.prefill_kv	47	scan delta_rule chunk=4	compute	generated:scan	567d5a8713c3667d	1	24,1,1	-
 qwen35/finetune.prefill_kv	48	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v104 strides=[288, 96, 8, 1] offset=0
 qwen35/finetune.prefill_kv	49	slice ax=2 4..12	compute	generated:movement	65a4633b02ae7408	1	192,1,1	-
 qwen35/finetune.prefill_kv	50	reshape [1, 4, 3, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v20
@@ -21050,7 +21050,7 @@ qwen4exp.prefill	62	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b
 qwen4exp.prefill	63	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen4exp.prefill	64	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v71
 qwen4exp.prefill	65	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen4exp.prefill	66	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen4exp.prefill	66	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen4exp.prefill	67	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v139 strides=[384, 96, 8, 1] offset=0
 qwen4exp.prefill	68	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen4exp.prefill	69	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v55
@@ -21375,7 +21375,7 @@ qwen4exp.prefill	387	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232
 qwen4exp.prefill	388	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen4exp.prefill	389	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1179
 qwen4exp.prefill	390	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen4exp.prefill	391	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen4exp.prefill	391	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen4exp.prefill	392	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v1247 strides=[384, 96, 8, 1] offset=0
 qwen4exp.prefill	393	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen4exp.prefill	394	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1163
@@ -21746,7 +21746,7 @@ qwen4exp.prefill_kv	62	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd2
 qwen4exp.prefill_kv	63	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen4exp.prefill_kv	64	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v71
 qwen4exp.prefill_kv	65	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen4exp.prefill_kv	66	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen4exp.prefill_kv	66	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen4exp.prefill_kv	67	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v139 strides=[384, 96, 8, 1] offset=0
 qwen4exp.prefill_kv	68	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen4exp.prefill_kv	69	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v55
@@ -22071,7 +22071,7 @@ qwen4exp.prefill_kv	387	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd
 qwen4exp.prefill_kv	388	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen4exp.prefill_kv	389	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1179
 qwen4exp.prefill_kv	390	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen4exp.prefill_kv	391	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen4exp.prefill_kv	391	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen4exp.prefill_kv	392	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v1247 strides=[384, 96, 8, 1] offset=0
 qwen4exp.prefill_kv	393	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen4exp.prefill_kv	394	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1163
@@ -23121,7 +23121,7 @@ qwen4exp/packed.prefill	62	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b
 qwen4exp/packed.prefill	63	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen4exp/packed.prefill	64	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v71
 qwen4exp/packed.prefill	65	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen4exp/packed.prefill	66	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen4exp/packed.prefill	66	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen4exp/packed.prefill	67	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v139 strides=[384, 96, 8, 1] offset=0
 qwen4exp/packed.prefill	68	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen4exp/packed.prefill	69	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v55
@@ -23443,7 +23443,7 @@ qwen4exp/packed.prefill	384	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84
 qwen4exp/packed.prefill	385	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen4exp/packed.prefill	386	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1180
 qwen4exp/packed.prefill	387	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen4exp/packed.prefill	388	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen4exp/packed.prefill	388	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen4exp/packed.prefill	389	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v1248 strides=[384, 96, 8, 1] offset=0
 qwen4exp/packed.prefill	390	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen4exp/packed.prefill	391	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1164
@@ -23808,7 +23808,7 @@ qwen4exp/packed.prefill_kv	62	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe
 qwen4exp/packed.prefill_kv	63	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen4exp/packed.prefill_kv	64	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v71
 qwen4exp/packed.prefill_kv	65	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen4exp/packed.prefill_kv	66	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen4exp/packed.prefill_kv	66	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen4exp/packed.prefill_kv	67	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v139 strides=[384, 96, 8, 1] offset=0
 qwen4exp/packed.prefill_kv	68	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen4exp/packed.prefill_kv	69	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v55
@@ -24130,7 +24130,7 @@ qwen4exp/packed.prefill_kv	384	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ff
 qwen4exp/packed.prefill_kv	385	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
 qwen4exp/packed.prefill_kv	386	reshape [1, 4, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1180
 qwen4exp/packed.prefill_kv	387	transpose [0, 2, 1, 3]	compute	generated:movement	517a8e593d6fc98e	1	16,1,1	-
-qwen4exp/packed.prefill_kv	388	scan delta_rule chunk=4	compute	generated:scan	ae0730dc8571ab5a	1	32,1,1	-
+qwen4exp/packed.prefill_kv	388	scan delta_rule chunk=4	compute	generated:scan	833aaeae87138938	1	32,1,1	-
 qwen4exp/packed.prefill_kv	389	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v1248 strides=[384, 96, 8, 1] offset=0
 qwen4exp/packed.prefill_kv	390	slice ax=2 4..12	compute	generated:movement	98f1f4077d2c3d39	1	256,1,1	-
 qwen4exp/packed.prefill_kv	391	reshape [1, 4, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1164
@@ -25175,7 +25175,7 @@ qwen4exp/finetune.prefill	215	reshape [1, 4, 3, 1]	alias	nodispatch:alias	393ffe
 qwen4exp/finetune.prefill	216	transpose [0, 2, 1, 3]	compute	generated:movement	44970c4fc2f6f3f4	1	12,1,1	-
 qwen4exp/finetune.prefill	217	reshape [1, 4, 3, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v842
 qwen4exp/finetune.prefill	218	transpose [0, 2, 1, 3]	compute	generated:movement	44970c4fc2f6f3f4	1	12,1,1	-
-qwen4exp/finetune.prefill	219	scan delta_rule chunk=4	compute	generated:scan	f2208739c73378e1	1	12,1,1	-
+qwen4exp/finetune.prefill	219	scan delta_rule chunk=4	compute	generated:scan	f9f7f327efdb7f01	1	12,1,1	-
 qwen4exp/finetune.prefill	220	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v900 strides=[96, 32, 4, 1] offset=0
 qwen4exp/finetune.prefill	221	slice ax=2 4..8	compute	generated:movement	59c4d0d728222369	1	48,1,1	-
 qwen4exp/finetune.prefill	222	reshape [1, 4, 3, 4]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v826
@@ -25707,7 +25707,7 @@ qwen4exp/finetune.prefill_kv	215	reshape [1, 4, 3, 1]	alias	nodispatch:alias	393
 qwen4exp/finetune.prefill_kv	216	transpose [0, 2, 1, 3]	compute	generated:movement	44970c4fc2f6f3f4	1	12,1,1	-
 qwen4exp/finetune.prefill_kv	217	reshape [1, 4, 3, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v842
 qwen4exp/finetune.prefill_kv	218	transpose [0, 2, 1, 3]	compute	generated:movement	44970c4fc2f6f3f4	1	12,1,1	-
-qwen4exp/finetune.prefill_kv	219	scan delta_rule chunk=4	compute	generated:scan	f2208739c73378e1	1	12,1,1	-
+qwen4exp/finetune.prefill_kv	219	scan delta_rule chunk=4	compute	generated:scan	f9f7f327efdb7f01	1	12,1,1	-
 qwen4exp/finetune.prefill_kv	220	slice ax=2 0..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v900 strides=[96, 32, 4, 1] offset=0
 qwen4exp/finetune.prefill_kv	221	slice ax=2 4..8	compute	generated:movement	59c4d0d728222369	1	48,1,1	-
 qwen4exp/finetune.prefill_kv	222	reshape [1, 4, 3, 4]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v826

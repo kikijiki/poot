@@ -139,7 +139,6 @@ pub(crate) fn refusal_of(
     target: poot_graph_plan::Target,
 ) -> poot_graph_plan::Refusal {
     use poot_graph_plan::multi_device::topology::DeviceId;
-    use poot_graph_plan::production_plan::Submission;
     use poot_graph_plan::staged::{
         DevicePlacement, ExpertPlacement, Partition, StagedCompileError, TargetSet, compile_staged,
     };
@@ -151,7 +150,7 @@ pub(crate) fn refusal_of(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     ) else {
         panic!("the equation is admitted for the NPU");
     };
@@ -215,7 +214,11 @@ pub(crate) fn worst_against(
                 };
             }
             ErrorBound::OperandUlps(ulps) => {
-                let larger = operands.iter().map(|op| op[i].abs()).fold(0.0f32, f32::max);
+                let larger = operands
+                    .iter()
+                    .map(|op| op[i].abs())
+                    .max_by(f32::total_cmp)
+                    .unwrap_or(0.0);
                 ulps as f32 * larger * f32::EPSILON
             }
             ErrorBound::TermsUlps(ulps) => ulps as f32 * terms[i] * f32::EPSILON,

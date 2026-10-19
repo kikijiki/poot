@@ -9,6 +9,7 @@
 pub mod block_top_k;
 pub mod const_weights;
 pub mod graph_fixtures;
+pub mod packed_graphs;
 pub mod scan;
 pub mod selected_attention;
 

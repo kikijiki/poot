@@ -8,8 +8,8 @@
 //! `/tmp/poot-gpu.lock`.
 
 use poot_executor::{Arg, Device, Dispatch};
+use poot_graph_plan::ImportedKernel;
 use poot_graph_plan::test_support::gpu_caps;
-use poot_graph_plan::{ImportedKernel, production_plan::Submission};
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_runtime_common::{BufferRole, CompiledKernel, DeviceBackend};
 use poot_target::{BufferStorage, ElementKind, LogicalDType};
@@ -148,7 +148,7 @@ fn dispatch_reads_the_argument_element_count_not_the_buffer_capacity() {
     let a = f32_buffer(&mut device, BufferRole::Input, &[1.0, 2.0, 3.0, 4.0]);
     let b = f32_buffer(&mut device, BufferRole::Input, &[10.0, 20.0, 30.0, 40.0]);
     let out = f32_buffer(&mut device, BufferRole::Output, &[-1.0; 4]);
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     device
         .dispatch(Dispatch {
             kernel: &kernel,
@@ -194,7 +194,7 @@ fn an_aie_launch_is_a_typed_refusal_on_vulkan() {
     let a = f32_buffer(&mut device, BufferRole::Input, &[1.0; 4]);
     let b = f32_buffer(&mut device, BufferRole::Input, &[1.0; 4]);
     let out = f32_buffer(&mut device, BufferRole::Output, &[0.0; 4]);
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     let error = device
         .dispatch(Dispatch {
             kernel: &kernel,
@@ -253,7 +253,7 @@ fn a_copy_is_ordered_between_the_dispatches_around_it() {
     let sum = f32_buffer(&mut device, BufferRole::Activation, &vec![0.0; n]);
     let copy = f32_buffer(&mut device, BufferRole::Activation, &vec![0.0; n]);
     let out = f32_buffer(&mut device, BufferRole::Output, &vec![0.0; n]);
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     record_add(&mut device, &kernel, &x, &b, &sum, n);
     device.copy(&sum, &copy).unwrap();
     record_add(&mut device, &kernel, &copy, &b, &out, n);
@@ -287,7 +287,7 @@ fn copy_round_trips_every_element_width_with_no_sentinel_left() {
         let payload: Vec<u8> = (0..elems * width).map(|i| i as u8 + 1).collect();
         poot_executor::write_slice(&mut device, &src, 0, &payload).unwrap();
         poot_executor::write_slice(&mut device, &dst, 0, &vec![0xAA; dst.byte_len()]).unwrap();
-        device.begin(Submission::Replay).unwrap();
+        device.begin().unwrap();
         device.copy(&src, &dst).unwrap();
         let recording = device.finish().unwrap().expect("a recording");
         device.replay(&recording).unwrap();
@@ -325,7 +325,7 @@ fn a_long_recording_is_cut_into_several_submissions_and_replays_exactly() {
     let pong = f32_buffer(&mut device, BufferRole::Activation, &[0.0; 4]);
     let chain = |device: &mut VulkanDevice, dispatches: usize, work: u64| {
         poot_executor::write_slice(device, &ping, 0, &f32_bytes(&[0.0; 4])).unwrap();
-        device.begin(Submission::Replay).unwrap();
+        device.begin().unwrap();
         for i in 0..dispatches {
             let (src, dst) = if i % 2 == 0 {
                 (&ping, &pong)
@@ -414,7 +414,7 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
     .unwrap();
     let data = f32_buffer(&mut device, BufferRole::Input, &[10.0, 20.0, 30.0, 40.0]);
     let out = f32_buffer(&mut device, BufferRole::Output, &[0.0; 4]);
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     device
         .dispatch(Dispatch {
             kernel: &kernel,

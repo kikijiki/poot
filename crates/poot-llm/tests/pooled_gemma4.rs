@@ -12,10 +12,10 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
-    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, LoadOptions, ModelHandle,
-    PreparedSetLimits, open_executor, program_retention,
+    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Layout, LoadOptions,
+    ModelHandle, PreparedSetLimits, Serving, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::{Fixture, Registry};
@@ -91,7 +91,7 @@ fn moe_handle() -> Arc<ModelHandle> {
 }
 
 fn options() -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -119,7 +119,7 @@ fn open(choice: BackendChoice) -> Option<Box<dyn poot_executor::Executor>> {
     poot_runtime_common::device_skip::open_or_skip(backend, open_executor(choice))
 }
 
-fn generate(driver: &mut Driver, prompt: &[u32], max_new: usize) -> Vec<u32> {
+fn generate(driver: &mut Driver<Serving>, prompt: &[u32], max_new: usize) -> Vec<u32> {
     driver
         .generate(
             GenerateRequest {
@@ -149,11 +149,14 @@ fn pooled_gemma4_decodes_the_unpooled_tokens_with_evictions(choice: BackendChoic
     let Some(pooled_executor) = open(choice) else {
         return;
     };
-    let mut plain = Driver::new(Arc::clone(&handle), plain_executor, options()).unwrap();
+    let mut plain = Driver::new(Arc::clone(&handle), plain_executor, options())
+        .unwrap()
+        .serve(Layout::Contiguous);
     let mut pooled = Driver::new(handle, pooled_executor, options())
         .unwrap()
         .with_expert_pool(nz(POOL_ROWS))
-        .unwrap();
+        .unwrap()
+        .serve(Layout::Contiguous);
     assert_eq!(
         generate(&mut plain, &PROMPT, NEW_TOKENS),
         RECORDED,

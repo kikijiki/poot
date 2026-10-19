@@ -5,9 +5,7 @@
 //! ([`PtxContext::begin_capture`]), `dispatch`/`copy` enqueue onto the capturing stream (recorded,
 //! not run - `PtxContext::dispatch_dev` already records during an open capture), `finish` ends the
 //! capture into a replayable [`PtxGraphExec`] (via [`PtxContext::end_capture`]), and `replay` is one
-//! `cuGraphLaunch` ([`PtxContext::launch_timed`]). `begin` always opens a capture and never submits,
-//! regardless of `Submission` (matching `WgpuDevice`'s doc): the contract's
-//! own restriction to `Replay` is enforced at `Engine::add_entry`, not here.
+//! `cuGraphLaunch` ([`PtxContext::launch_timed`]). `begin` always opens a capture and never submits.
 //!
 //! `Device::copy` (S46-6) is one generated copy kernel - [`poot_kernelgen::broadcast_dt`]
 //! with matching in/out shapes, the same body `poot-rocm-device`'s native state commit already uses -
@@ -18,7 +16,7 @@
 //! exact `ElementKind`) is exactly what lets one bit-mover kernel serve either storage in its class.
 
 use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, MeasuredDeviceTime};
-use poot_graph_plan::{Target, production_plan::Submission};
+use poot_graph_plan::Target;
 use poot_kernel_ir::Ty;
 use poot_ptx_runtime::{PtxBuffer, PtxContext, PtxError, PtxGraphExec, PtxSpan};
 use poot_runtime_common::{BufferRole, CompiledKernel};
@@ -144,9 +142,8 @@ impl Device for PtxDevice {
         })
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), PtxGpuError> {
-        // Always opens a capture, regardless of `_submission` (see the module doc): the contract's
-        // own restriction to Replay is enforced at `Engine::add_entry`, not here.
+    fn begin(&mut self) -> Result<(), PtxGpuError> {
+        // Always opens a capture (see the module doc).
         Ok(self.ctx.begin_capture()?)
     }
 

@@ -9,7 +9,7 @@
 //! image and video through the vision driver into the merged rows the processor's placeholders stand
 //! for, and generates on the text driver with those rows as step inputs
 //! (`StepInput::TokensWithEmbeds`) and the prompt's positions bound to `Slot::MropePosition`
-//! ([`Driver::generate_with_mrope`]): the pixels, the rows and the positions are bound by value on
+//! ([`Driver::generate_with_inputs`]): the pixels, the rows and the positions are bound by value on
 //! every step, never baked into a program.
 
 use std::path::{Path, PathBuf};
@@ -34,12 +34,13 @@ use super::{
     MultimodalPrompt,
 };
 use crate::core::sampler::Sampler;
-use crate::driver::error::{DriverError, InvalidRequest, LoadError};
+use crate::driver::error::{DriverError, LoadError};
 use crate::driver::{
-    Driver, DriverOptions, EncodeRequest, EncodeRow, GenerateRequest, Generation, LoadOptions,
-    ModelHandle, PromptEmbeds, TokenSink,
+    Driver, DriverOptions, EncodeRequest, EncodeRow, GenerateRequest, Generation, Layout,
+    LoadOptions, ModelHandle, Serving, TokenSink,
 };
-use poot_models::mrope::{MropePositionIds, MropeProcessorFpsInput, MropeVisualKind};
+use poot_models::io::RequestInputs;
+use poot_models::mrope::{MropeProcessorFpsInput, MropeVisualKind};
 use poot_text::TextCodec;
 
 /// Why a Qwen2.5-VL checkpoint cannot load or a request cannot run.
@@ -101,6 +102,10 @@ pub enum Qwen25VlError {
     /// The vision driver failed encoding the media, or the text driver failed generating.
     #[error(transparent)]
     Driver(#[from] DriverError),
+    /// The embedding rows or positions the request assembly produced are not the shape the text
+    /// model's inputs take.
+    #[error(transparent)]
+    Values(#[from] poot_models::io::ValueError),
 }
 
 /// Why a chat request cannot run: it does not assemble, or what it assembled does not.
@@ -151,24 +156,21 @@ pub struct Qwen25VlFrontEnd {
     params: Qwen25VlVisionParams,
 }
 
-/// A Qwen2.5-VL request lowered to what the text driver takes: unlike [`MultimodalPrompt`], the
-/// sectioned positions are not optional.
+/// A Qwen2.5-VL request lowered to what the text driver takes: the prompt's token ids and the values
+/// for the text model's inputs (the embedding rows over the placeholders and the sectioned positions).
 #[derive(Clone, Debug)]
 pub struct Qwen25VlPrompt {
     /// The prompt's token ids, the image and video placeholders included.
     pub prompt: Vec<u32>,
-    /// The embedding rows that replace the placeholders.
-    pub embeds: PromptEmbeds,
-    /// Where every prompt token rotates (`Slot::MropePosition`).
-    pub mrope: MropePositionIds,
+    /// The embedding rows that replace the placeholders and where every prompt token rotates.
+    pub inputs: RequestInputs,
 }
 
 impl From<Qwen25VlPrompt> for MultimodalPrompt {
     fn from(prompt: Qwen25VlPrompt) -> Self {
         Self {
             prompt: prompt.prompt,
-            embeds: prompt.embeds,
-            mrope: Some(prompt.mrope),
+            inputs: prompt.inputs,
         }
     }
 }
@@ -176,7 +178,7 @@ impl From<Qwen25VlPrompt> for MultimodalPrompt {
 /// A loaded Qwen2.5-VL: the image side and the text tower, each on its own driver.
 pub struct Qwen25Vl {
     images: Qwen25VlFrontEnd,
-    text: Driver,
+    text: Driver<Serving>,
 }
 
 fn read_config(path: &Path) -> Result<serde_json::Value, Qwen25VlError> {
@@ -325,10 +327,12 @@ impl Qwen25VlFrontEnd {
                 .ok_or(Qwen25VlError::Patches { kind, patch_dim })?;
             *at = end;
             let ordered = geometry.to_window_order(pixels, patch_dim);
+            let pixels = HostTensor::f32(vec![geometry.patches(), patch_dim], ordered);
+            let inputs = geometry.inputs(pixels);
             let encoded = self.vision.encode(&EncodeRequest {
-                rows: &[EncodeRow::Patches {
-                    pixels: &ordered,
-                    geometry: &geometry,
+                rows: &[EncodeRow {
+                    tokens: None,
+                    inputs: &inputs,
                 }],
             })?;
             let item = encoded
@@ -363,13 +367,8 @@ impl Qwen25VlFrontEnd {
                 rows: rows.len() / width,
             });
         }
-        let embeds = PromptEmbeds::new(width, positions, rows)
-            .map_err(|e| DriverError::from(InvalidRequest::Embeds(e)))?;
-        Ok(Qwen25VlPrompt {
-            prompt,
-            embeds,
-            mrope: input.mrope_positions().clone(),
-        })
+        let inputs = super::prompt_inputs(width, positions, rows, Some(input.mrope_positions()))?;
+        Ok(Qwen25VlPrompt { prompt, inputs })
     }
 }
 
@@ -495,7 +494,8 @@ impl Qwen25Vl {
         let checkpoint = Qwen25VlCheckpoint::read(dir, registry)?;
         Ok(Self {
             images: checkpoint.front_end(vision)?,
-            text: Driver::new(Arc::clone(&checkpoint.text), text.0, text.1)?,
+            text: Driver::new(Arc::clone(&checkpoint.text), text.0, text.1)?
+                .serve(Layout::Contiguous),
         })
     }
 
@@ -505,7 +505,7 @@ impl Qwen25Vl {
     }
 
     /// The text tower's driver.
-    pub fn text(&self) -> &Driver {
+    pub fn text(&self) -> &Driver<Serving> {
         &self.text
     }
 
@@ -533,12 +533,8 @@ impl Qwen25Vl {
         generate: Qwen25VlGenerate,
         sink: &mut dyn TokenSink,
     ) -> Result<Generation, Qwen25VlError> {
-        let Qwen25VlPrompt {
-            prompt,
-            embeds,
-            mrope,
-        } = self.images.prepare_input(input)?;
-        Ok(self.text.generate_with_mrope(
+        let Qwen25VlPrompt { prompt, inputs } = self.images.prepare_input(input)?;
+        Ok(self.text.generate_with_inputs(
             GenerateRequest {
                 prompt,
                 max_new: generate.max_new,
@@ -546,8 +542,7 @@ impl Qwen25Vl {
                 stops: Vec::new(),
                 ignore_eos: false,
             },
-            embeds,
-            mrope,
+            inputs,
             sink,
         )?)
     }
@@ -562,7 +557,8 @@ pub(crate) mod fixture {
 
     use poot_eval::test_support::weight_map_oracle::eval_mapped;
     use poot_graph_ir::{Slot, SlotKey};
-    use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape};
+    use poot_models::components::embed::EMBEDS;
+    use poot_models::model::{LogitRows, Model, StepShape, StepSpec};
     use poot_models::mrope::MropeVisualKind;
     use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
     use poot_tensor::HostTensor;
@@ -816,15 +812,9 @@ pub(crate) mod fixture {
             let n = geometry.patches();
             let graph = vision
                 .trace(
-                    Phase::Encode,
-                    StepShape {
-                        rows: nz(1),
-                        tokens: nz(n),
-                        capacity: nz(n),
-                        kv: KvLayout::Contiguous,
-                        logits: LogitRows::All,
-                        hidden: None,
-                    },
+                    &StepSpec::encode(
+                        StepShape::new(nz(1), nz(n), nz(n)).with_logits(LogitRows::All),
+                    ),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
@@ -861,8 +851,8 @@ pub(crate) mod fixture {
     }
 
     /// The log-probabilities (natural log softmax) of every vocabulary token after `input`'s prompt and
-    /// the `generated` tokens that follow it, on the CPU oracle: the text tower's `PrefillEmbeds`
-    /// graph over the whole sequence, with `rows` scattered over the placeholders, the prompt at its
+    /// the `generated` tokens that follow it, on the CPU oracle: the text tower's `step`
+    /// graph (carrying the embedding rows) over the whole sequence, with `rows` scattered over the placeholders, the prompt at its
     /// sectioned positions and each generated token one further than the last on every axis.
     pub(crate) fn oracle_logprobs(
         dir: &Path,
@@ -905,15 +895,12 @@ pub(crate) mod fixture {
         assert_eq!(next * width, rows.len(), "one row per placeholder");
         let graph = text
             .trace(
-                Phase::PrefillEmbeds,
-                StepShape {
-                    rows: nz(1),
-                    tokens: nz(n),
-                    capacity: nz(text.config().max_positions),
-                    kv: KvLayout::Contiguous,
-                    logits: LogitRows::Last,
-                    hidden: None,
-                },
+                &StepSpec::step(StepShape::new(
+                    nz(1),
+                    nz(n),
+                    nz(text.config().max_positions),
+                ))
+                .carrying(EMBEDS),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();

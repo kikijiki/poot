@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{Builder, TensorType, ValueId};
 use poot_tensor::{DType, HostTensor};
@@ -145,12 +145,7 @@ impl TopPGraph {
             .into(),
         );
         inputs.insert(self.top_k, HostTensor::i32(vec![1], vec![0]).into());
-        let out = eval(
-            &self.graph,
-            &inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED),
-        )
-        .unwrap();
+        let out = eval(&self.graph, &inputs, EvalOptions::default()).unwrap();
         let tensor = out.output.into_host().unwrap();
         let words = tensor.as_i32().unwrap();
         assert_eq!(words[1], -1, "no non-finite logit in these rows");

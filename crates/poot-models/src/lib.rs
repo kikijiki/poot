@@ -9,6 +9,7 @@
 
 mod architectures;
 pub mod components;
+pub mod io;
 pub mod model;
 mod multimodal;
 pub mod names;

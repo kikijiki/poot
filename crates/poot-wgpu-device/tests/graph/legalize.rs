@@ -8,7 +8,7 @@
 
 use super::*;
 use poot_graph_plan::test_support::gpu_caps;
-use poot_graph_plan::{CompileOptions, Target, compile, production_plan::Submission};
+use poot_graph_plan::{CompileOptions, Target, compile};
 use poot_target::{Backend, DeviceCaps};
 
 #[test]
@@ -39,7 +39,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
             ..gpu_caps(&target)
         },
     };
-    let options = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     let program =
         compile(&g, &split_target, &options).expect("an oversized matmul weight always splits");
     let gh = program.graph();
@@ -61,7 +61,7 @@ fn compile_split_matmul_matches_cpu_on_real_wgpu_hardware() {
         };
         cpu_inputs.insert(id, Value::from(t));
     }
-    let cpu = eval(&g, &cpu_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &cpu_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

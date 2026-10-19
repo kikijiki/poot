@@ -4,14 +4,13 @@
 
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{Device, Engine, Executor};
-use poot_executor_parity::assert_close;
 use poot_graph_ir::Slot;
 use poot_graph_plan::test_support::gpu_caps;
-use poot_models::model::Phase;
 use poot_models::test_support::weight_map::{self as fixture, DIMS, Projections, Qwen2Dims, Step};
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::DType;
+use poot_test_util::assert_close_scaled;
 use poot_wgpu_device::device::WgpuDevice;
 
 fn engine() -> Option<(Box<dyn Executor>, poot_graph_plan::Target)> {
@@ -87,10 +86,7 @@ fn a_hosted_embed_gather_equals_the_device_gather() {
         );
         g
     };
-    let steps = [
-        Step::new(Phase::Prefill, &[200, 1, 77], 0),
-        Step::new(Phase::Decode, &[255], 3),
-    ];
+    let steps = [Step::new(&[200, 1, 77], 0), Step::new(&[255], 3)];
     let run = |exec: &mut dyn Executor, prepare: &dyn Fn(_) -> _| {
         fixture::run_steps(
             exec,
@@ -112,7 +108,7 @@ fn a_hosted_embed_gather_equals_the_device_gather() {
         .zip(&device_gather.logits)
         .enumerate()
     {
-        assert_close(got, want, tolerance, &format!("hosted embed, step {step}"));
+        assert_close_scaled(got, want, tolerance, &format!("hosted embed, step {step}"));
     }
 }
 

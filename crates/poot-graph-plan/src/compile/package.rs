@@ -206,7 +206,6 @@ mod tests {
     use poot_target::{AieCaps, AieTargetId, Backend, Queried};
 
     use super::*;
-    use crate::production_plan::Submission;
     use crate::{AieLimitRefusal, CompileLimits, CompileOptions, PlanError, Program, compile};
 
     /// SYNTHETIC limits, roomy unless a row narrows one: not a device measurement (the NPU rows pin the
@@ -233,11 +232,7 @@ mod tests {
             target: AieTargetId::Xdna2,
             caps,
         };
-        compile(
-            g,
-            &target,
-            &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
-        )
+        compile(g, &target, &CompileOptions::new(CompileLimits::STANDARD))
     }
 
     /// `x` through `len` chained equations alternating add and mul by a constant `c`.
@@ -491,7 +486,7 @@ mod tests {
         let program = compile(
             &chain(3),
             &target,
-            &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+            &CompileOptions::new(CompileLimits::STANDARD),
         )
         .unwrap();
         assert!(program.regions().is_empty());
@@ -531,12 +526,7 @@ mod tests {
                 narrowing: None,
             },
         };
-        let program = compile(
-            &g,
-            &target,
-            &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
-        )
-        .unwrap();
+        let program = compile(&g, &target, &CompileOptions::new(CompileLimits::STANDARD)).unwrap();
         assert_eq!(members(&program), vec![0..6]);
         let region = &program.regions()[0];
         let graph = program.graph();

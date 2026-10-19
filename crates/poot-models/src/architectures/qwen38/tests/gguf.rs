@@ -1216,15 +1216,9 @@ fn the_converted_checkpoint_matches_the_hf_logits_and_state() {
     ] {
         let (mut logits, mut state, mut at) = (Vec::new(), Vec::new(), 0);
         for len in plan.iter().copied() {
-            let phase = if len == 1 {
-                Phase::Decode
-            } else {
-                Phase::Prefill
-            };
             let (out, next) = run_step(
                 &*model,
                 &gguf_store,
-                phase,
                 case.cap,
                 &tokens[at..at + len],
                 at as i32,

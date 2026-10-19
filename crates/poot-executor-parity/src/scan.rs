@@ -20,18 +20,18 @@ use poot_graph_ir::test_support::scan::{ScanFixture, ScanGraph};
 use poot_graph_ir::{Graph, ValueId};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_tensor::HostTensor;
 
-use crate::assert_close;
+use poot_test_util::assert_close_scaled;
 
 /// The oracle's evaluation of a graph over bound host tensors: its one output.
 pub type Oracle<'a> = dyn Fn(&Graph, &HashMap<ValueId, HostTensor>) -> HostTensor + 'a;
 
-const OPTIONS: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+const OPTIONS: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
 
 /// The scan `whole` stepped in pieces of `piece` positions through one entry of `target` and assembled into the one packed result a single step over the
 /// whole sequence has: per head, the `y` rows of every piece then the last piece's state rows.  The pieces are not
@@ -114,7 +114,7 @@ fn run_steps(
         if let Some(oracle_eval) = oracle_eval {
             let want = oracle_eval(&oracle.graph, &step.bind(&oracle, &window));
             assert_eq!(got.shape(), want.shape(), "{label}: step {index} shape");
-            assert_close(
+            assert_close_scaled(
                 got.as_f32().unwrap(),
                 want.as_f32().unwrap(),
                 class.tolerance(),

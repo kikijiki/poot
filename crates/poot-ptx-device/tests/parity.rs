@@ -169,24 +169,20 @@ fn batched_multi_block_wmma_matmul_matches_the_oracle_on_ptx() {
     let t = device.target();
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     let fixture = poot_executor_parity::launch::wmma_bf16_batched_fixture();
-    let multiplies_on_tensor_cores = poot_executor_parity::staged(
-        &fixture,
-        t,
-        poot_graph_plan::production_plan::Submission::Replay,
-    )
-    .stages()
-    .flat_map(|(_, _, program)| {
-        program
-            .planned()
-            .filter_map(|(_, plan)| plan.single().map(|dispatch| dispatch.body().clone()))
-            .collect::<Vec<_>>()
-    })
-    .any(|body| {
-        body.blocks
-            .iter()
-            .flat_map(|block| &block.statements)
-            .any(|statement| matches!(statement, poot_kernel_ir::Statement::WmmaMma { .. }))
-    });
+    let multiplies_on_tensor_cores = poot_executor_parity::staged(&fixture, t)
+        .stages()
+        .flat_map(|(_, _, program)| {
+            program
+                .planned()
+                .filter_map(|(_, plan)| plan.single().map(|dispatch| dispatch.body().clone()))
+                .collect::<Vec<_>>()
+        })
+        .any(|body| {
+            body.blocks
+                .iter()
+                .flat_map(|block| &block.statements)
+                .any(|statement| matches!(statement, poot_kernel_ir::Statement::WmmaMma { .. }))
+        });
     assert!(
         multiplies_on_tensor_cores,
         "{}: no dispatched kernel multiplies on the WMMA tensor cores",

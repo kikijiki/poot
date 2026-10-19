@@ -6,7 +6,7 @@
 mod common;
 
 use common::{step, token_pos, zero_state};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step as step_shape};
 
 #[test]
@@ -25,16 +25,14 @@ fn olmo2_decode_matches_prefill_first_token() {
     let pg = m
         .model
         .trace(
-            Phase::Prefill,
-            step_shape(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step_shape(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     let dg = m
         .model
         .trace(
-            Phase::Decode,
-            step_shape(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step_shape(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();

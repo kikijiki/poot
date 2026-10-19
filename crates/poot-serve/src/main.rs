@@ -47,6 +47,8 @@ mod lifecycle;
 
 mod metrics;
 
+mod modality;
+
 #[cfg(test)]
 mod tests;
 

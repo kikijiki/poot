@@ -1,7 +1,7 @@
 //! Masked attention, softcap, matmul and the in-place slot write, evaluated on the CPU oracle against
 //! hand-computed references. (The qwen2 model-trace rows live in `poot-models/tests/oracle_traces`.)
 
-use crate::{EvalBudget, EvalOptions, Value};
+use crate::{EvalOptions, Value};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{attention, attention_masked, attention_softcap, softcap};
 use poot_graph_ir::types::TensorType;
@@ -54,7 +54,7 @@ fn masked_attention_equals_sliced() {
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                 .collect();
-            crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+            crate::eval(&g, &values, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
@@ -86,7 +86,7 @@ fn masked_attention_equals_sliced() {
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                 .collect();
-            crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+            crate::eval(&g, &values, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
@@ -118,7 +118,7 @@ fn softcap_evaluates_to_c_tanh_and_approaches_identity() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        crate::eval(&g, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -145,7 +145,7 @@ fn softcap_evaluates_to_c_tanh_and_approaches_identity() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        crate::eval(&g2, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        crate::eval(&g2, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -188,7 +188,7 @@ fn attention_softcap_matches_reference_and_differs_from_uncapped() {
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                 .collect();
-            crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+            crate::eval(&g, &values, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
@@ -252,7 +252,7 @@ fn matmul_matches_naive() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        crate::eval(&g, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -299,7 +299,7 @@ fn dynamic_update_slice_writes_one_slot() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        let evaluation = crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+        let evaluation = crate::eval(&g, &values, EvalOptions::default()).unwrap();
         let state = evaluation
             .state
             .into_iter()

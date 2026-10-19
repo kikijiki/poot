@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use poot_graph_ir::analysis::{NumericsDelta, NumericsProperty};
 use poot_graph_ir::graph::ValueMeta;
 use poot_graph_ir::graph::{
     BoundaryId, Eqn, Graph, GraphEdit, Operand, Slot, SlotKey, Storage, ValidationId, ValueId,
@@ -79,6 +80,10 @@ pub struct PoolSpec {
 /// A graph with its expert tables pooled, and where each site cuts it.
 pub(crate) struct Pooled {
     pub graph: Graph,
+    /// What pooling produced, read off the graph before and after: the slot translation and its index
+    /// guard move and compare integer words, and the guard's witness sums their flags in F32, so a pooled
+    /// program computes its float values as the resident one and adds one unfused reduction.
+    pub numerics: NumericsProperty,
     pub spec: PoolSpec,
     /// `cuts[i]` is the equation of the translating `Gather` of `spec.sites[i]`: the first equation
     /// of the stage that follows the site's sync.
@@ -350,8 +355,10 @@ pub(crate) fn pool_experts(
     }
     *pooled.eqns_mut() = eqns;
 
+    let graph = pooled.commit_adding_witnesses(&added)?;
     Ok(Pooled {
-        graph: pooled.commit_adding_witnesses(&added)?,
+        numerics: NumericsDelta::between(g, &graph).produced,
+        graph,
         spec: PoolSpec { sites },
         cuts,
     })

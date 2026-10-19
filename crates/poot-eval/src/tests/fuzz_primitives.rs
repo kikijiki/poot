@@ -1,6 +1,6 @@
 //! Primitive-op fuzz: reduce, matmul, transpose, broadcast, elementwise, softmax, fused chains/epilogues.
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
 use poot_graph_ir::ops::softmax;
@@ -174,7 +174,7 @@ fn fuzz_reduce_all_axes_and_keepdim() {
                         x.id(),
                         Value::from(HostTensor::f32(shape.to_vec(), xd.clone())),
                     );
-                    let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+                    let got = eval(&g, &inp, EvalOptions::default())
                         .map(|r| {
                             r.output
                                 .into_host()
@@ -258,7 +258,7 @@ fn fuzz_matmul_random_shapes() {
             bv.id(),
             Value::from(HostTensor::f32(b_shape.to_vec(), bd.clone())),
         );
-        let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got = eval(&g, &inp, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
@@ -333,7 +333,7 @@ fn fuzz_transpose_correctness() {
             x.id(),
             Value::from(HostTensor::f32(shape.to_vec(), xd.clone())),
         );
-        let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got = eval(&g, &inp, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
@@ -401,7 +401,7 @@ fn fuzz_broadcast_correctness() {
             x.id(),
             Value::from(HostTensor::f32(in_shape.to_vec(), xd.clone())),
         );
-        let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got = eval(&g, &inp, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
@@ -450,7 +450,7 @@ fn fuzz_elementwise_correctness() {
                 x.id(),
                 Value::from(HostTensor::f32(vec![width], xd.clone())),
             );
-            let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let got = eval(&g, &inp, EvalOptions::default())
                 .map(|r| {
                     r.output
                         .into_host()
@@ -478,7 +478,7 @@ fn fuzz_elementwise_correctness() {
                 x.id(),
                 Value::from(HostTensor::f32(vec![width], xd.clone())),
             );
-            let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let got = eval(&g, &inp, EvalOptions::default())
                 .map(|r| {
                     r.output
                         .into_host()
@@ -513,7 +513,7 @@ fn fuzz_elementwise_correctness() {
                 x.id(),
                 Value::from(HostTensor::f32(vec![width], xd.clone())),
             );
-            let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let got = eval(&g, &inp, EvalOptions::default())
                 .map(|r| {
                     r.output
                         .into_host()
@@ -557,7 +557,7 @@ fn fuzz_elementwise_correctness() {
                 bv.id(),
                 Value::from(HostTensor::f32(vec![width], bd.clone())),
             );
-            let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let got = eval(&g, &inp, EvalOptions::default())
                 .map(|r| {
                     r.output
                         .into_host()
@@ -612,7 +612,7 @@ fn fuzz_softmax_vs_independent_formula() {
             x.id(),
             Value::from(HostTensor::f32(shape.to_vec(), xd.clone())),
         );
-        let got = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let got = eval(&g, &inp, EvalOptions::default())
             .map(|r| {
                 r.output
                     .into_host()
@@ -671,7 +671,7 @@ fn softmax_stays_accurate_at_extreme_score_magnitude() {
         x.id(),
         Value::from(HostTensor::f32(vec![l], scores.clone())),
     );
-    let two_pass = eval(&g, &inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let two_pass = eval(&g, &inp, EvalOptions::default())
         .map(|r| {
             r.output
                 .into_host()

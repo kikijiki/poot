@@ -71,3 +71,18 @@ pub fn gpu_backend(target: &Target) -> Backend {
         }
     }
 }
+
+/// The graph `compile` hands the planner for `g` on the GPU target `backend` with `caps`: the one preparation
+/// pipeline every target runs, for tests that assert on the prepared graph.
+pub fn compiled_graph(
+    g: &Graph,
+    backend: Backend,
+    caps: &DeviceCaps,
+) -> Result<Graph, crate::CompileError> {
+    let target = Target::Gpu {
+        backend,
+        caps: *caps,
+    };
+    let options = crate::CompileOptions::new(crate::CompileLimits::STANDARD);
+    Ok(crate::compile(g, &target, &options)?.graph().clone())
+}

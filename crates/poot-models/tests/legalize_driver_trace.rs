@@ -12,13 +12,12 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
-use poot_eval::{EvalBudget, EvalOptions, Value, eval, materialize_dense};
+use poot_eval::{EvalOptions, Value, eval, materialize_dense};
 use poot_graph_ir::{Slot, SlotKey, Storage, ValueId};
 use poot_graph_plan::{
     CompileError, CompileLimits, CompileOptions, LegalizeError, Target, compile,
-    production_plan::Submission,
 };
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::model::{StepShape, StepSpec};
 use poot_models::registry::{RawConfig, Registry};
 use poot_quant::weights::{WeightEntry, WeightMap, WeightStore};
 use poot_target::{Backend, DeviceCaps};
@@ -40,7 +39,7 @@ fn caps(max_buffer_bytes: u64) -> DeviceCaps {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 struct Driver {
@@ -58,19 +57,15 @@ fn driver_trace() -> Driver {
         generation: fixture.generation.as_ref(),
     };
     let model = registry.build(&raw, &fixture.store).unwrap();
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::MIN,
-        capacity: NonZeroUsize::new(CAPACITY).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    };
+    let shape = StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(CAPACITY).unwrap(),
+    );
     Driver {
         graph: model
             .trace(
-                Phase::Decode,
-                shape,
+                &StepSpec::step(shape),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap(),
@@ -208,7 +203,7 @@ fn driver_compile_splits_transposed_weights_under_a_small_buffer_limit() {
         "the head's chunks partition its rows once"
     );
 
-    let split = eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let split = eval(g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

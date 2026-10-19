@@ -7,7 +7,7 @@ use poot_graph_ir::Graph;
 use poot_quant::weights::WeightStore;
 
 use super::dense::{Dense, Family, step};
-use crate::model::{LogitRows, Phase};
+use crate::model::{LogitRows, StepSpec};
 
 /// The qwen2 dimensions of the decode and prefill fixtures.
 fn fixture_dense(family: Family) -> Dense {
@@ -42,8 +42,7 @@ pub(crate) fn decode_fixture(
     let g = m
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -81,8 +80,7 @@ fn prefill_fixture(
     let g = m
         .model
         .trace(
-            Phase::Prefill,
-            step(1, n, cap, LogitRows::All),
+            &StepSpec::step(step(1, n, cap, LogitRows::All)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();

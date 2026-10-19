@@ -13,11 +13,13 @@ use std::sync::{Arc, Mutex};
 
 use poot_executor::{Device, Dispatch, Engine};
 use poot_graph_ir::{BinOp, Graph, Slot, SlotKey};
-use poot_graph_plan::{CompileLimits, CompileOptions, Target, production_plan::Submission};
-use poot_models::components::standard::{Step, check_mtp_step};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target};
+use poot_models::components::embed::{EMBEDS, embeds_input};
+use poot_models::components::standard::{Step, check_draft_step, check_step};
+use poot_models::io::{ModelSchema, Presence, ProgramId, ProgramSpec, RequestInputs, StateSpec};
 use poot_models::model::{
-    FamilyKey, HiddenCarry, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
-    Phase, StepShape, TraceError,
+    FamilyKey, HiddenCarry, LogitRows, Model, ModelConfig, ModelError, ModelOutput, StepShape,
+    StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
@@ -29,16 +31,14 @@ use poot_text::ChatFormat;
 use crate::core::sampler::Sampler;
 use crate::driver::block_table::BLOCK_SIZE;
 use crate::driver::device_tests::{NO_EOS, fixture_text, nz, open, options};
-use crate::driver::error::{
-    DriverError, EmbedsError, InvalidOptions, InvalidRequest, SpeculationRefusal, Unsupported,
-};
+use crate::driver::error::{DriverError, InvalidOptions, Unsupported};
 use crate::driver::speculate::{NotSpeculated, ProposalObserver};
-use crate::driver::step::PickPolicy;
 use crate::driver::tests::tiny_text;
 use crate::driver::{
-    AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, Head, Layout,
-    ModelHandle, PassTiming, PoolShape, PrefixOutcome, PrefixSkip, PreparedSetLimits, Release,
-    RowResult, RowSpeculation, RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm,
+    AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, Feature,
+    GenerationId, Head, Incompatible, Layout, LoraIdx, ModelHandle, PassTiming, PoolShape,
+    PrefixOutcome, PrefixSkip, PreparedSetLimits, Release, RowResult, RowSpeculation, RowWork,
+    SeqId, SeqRequest, Serving, ServingShapes, StepRow, Warm,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -57,7 +57,7 @@ enum Kind {
     Plain,
     /// An MTP program that carries a `Recurrent` value of its own.
     RecurrentMtp,
-    /// A family with no MTP program: `Phase::Mtp` is refused.
+    /// A family with no MTP program: its schema declares no `draft` program.
     NoMtp,
     /// A target whose own programs fold a `Recurrent` value, beside a KV-only MTP program.
     RecurrentTarget,
@@ -87,6 +87,7 @@ impl Kind {
 #[derive(Debug)]
 struct Toy {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
     kind: Kind,
 }
@@ -96,21 +97,27 @@ impl Model for Toy {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
-        if self.kind == Kind::NoMtp && phase == Phase::Mtp {
-            return Err(TraceError::PhaseUnsupported { family: TOY, phase });
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
+        let draft = spec.program == ProgramId::DRAFT;
+        if draft {
+            check_draft_step(TOY, shape, TOY_CAPACITY)?;
+        } else {
+            check_step(TOY, shape, TOY_CAPACITY)?;
         }
-        check_mtp_step(TOY, phase, shape, TOY_CAPACITY)?;
-        let step = Step::new(&b, shape)?;
+        let mut step = Step::new(&b, shape)?;
+        let embeds = spec.carries(EMBEDS);
+        if embeds {
+            step = step.with_embeds(&b, TOY_WIDTH)?;
+        }
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let token = b.cast(
             b.guard_index_bounds(step.tokens(), TOY_VOCAB)
@@ -119,11 +126,15 @@ impl Model for Toy {
             DType::F32,
         )?;
         let seed = b.binary(BinOp::Add, token, b.cast(step.pos(), DType::F32)?)?;
-        let hidden = b.broadcast(b.reshape(seed, vec![rows, n, 1])?, vec![rows, n, TOY_WIDTH])?;
-        let state = if phase == Phase::Mtp {
+        let mut hidden =
+            b.broadcast(b.reshape(seed, vec![rows, n, 1])?, vec![rows, n, TOY_WIDTH])?;
+        if let Some(rows_in) = step.embeds() {
+            hidden = rows_in.scatter(&b, hidden)?;
+        }
+        let state = if draft {
             let carry = step
                 .hidden_carry(&b, TOY_WIDTH)?
-                .expect("check_mtp_step requires the carry");
+                .expect("check_draft_step requires the carry");
             let read = step.carried_hidden(&b, &carry)?;
             if self.kind == Kind::RecurrentMtp {
                 let own = step.recurrent_state(&b, "toy.mtp", DType::F32, &[TOY_WIDTH])?;
@@ -163,7 +174,30 @@ fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, Mod
     let RawConfig::HfJson { config, .. } = raw else {
         panic!("the fixture is an HF checkpoint")
     };
+    let kind = Kind::parse(config["kind"].as_str().expect("a toy kind"));
+    // The graphs carry the hand-off and the recurrent values the kind folds, and no KV cache:
+    // `trace` checks the schema declares exactly the states the traced graph carries. The `step`
+    // program reads the embedding rows as an optional carriable input.
+    let mut step = ProgramSpec::new(ProgramId::STEP, ModelOutput::Logits { vocab: TOY_VOCAB })
+        .carrying(StateSpec::hand_off())
+        .reading(EMBEDS, Presence::Optional);
+    if kind == Kind::RecurrentTarget {
+        step = step.carrying(StateSpec::recurrent("toy.target"));
+    }
+    let mut schema = ModelSchema::builder()
+        .input(embeds_input(TOY_WIDTH))
+        .step(step);
+    if kind != Kind::NoMtp {
+        let mut draft =
+            ProgramSpec::new(ProgramId::DRAFT, ModelOutput::Logits { vocab: TOY_VOCAB })
+                .carrying(StateSpec::hand_off());
+        if kind == Kind::RecurrentMtp {
+            draft = draft.carrying(StateSpec::recurrent("toy.mtp"));
+        }
+        schema = schema.draft(draft);
+    }
     Ok(Box::new(Toy {
+        schema: schema.build_for(TOY)?,
         config: ModelConfig {
             family: TOY,
             vocab: TOY_VOCAB,
@@ -171,12 +205,11 @@ fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, Mod
             eos: BTreeSet::from([TOY_VOCAB as u32 - 1]),
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: TOY_VOCAB },
             prefill_granule: nz(1),
             chat: ChatFormat::ChatML,
         },
         weights: WeightMap::default(),
-        kind: Kind::parse(config["kind"].as_str().expect("a toy kind")),
+        kind,
     }))
 }
 
@@ -253,7 +286,7 @@ impl Device for FakeDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), FakeError> {
@@ -303,7 +336,7 @@ fn mtp(k: usize) -> DraftPolicy {
 
 /// The options of a toy driver under `draft`, its carry window as the policy derives it.
 fn toy_options(draft: DraftPolicy) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -347,15 +380,14 @@ fn paged() -> Layout {
 }
 
 /// Open `prompt`, prefill it in the driver's own pieces and commit the first token.
-fn open_prefilled(driver: &mut Driver, prompt: &[u32], max_new: usize) -> (SeqId, usize) {
-    let Admission::Opened { seq, reused } = driver
-        .open(SeqRequest {
-            prompt,
-            max_new,
-            adapter: AdapterRef::Base,
-        })
-        .unwrap()
-    else {
+fn open_prefilled(driver: &mut Driver<Serving>, prompt: &[u32], max_new: usize) -> (SeqId, usize) {
+    open_prefilled_with(driver, SeqRequest::new(prompt, max_new, AdapterRef::Base))
+}
+
+/// [`open_prefilled`] for a request that may carry inputs.
+fn open_prefilled_with(driver: &mut Driver<Serving>, request: SeqRequest<'_>) -> (SeqId, usize) {
+    let prompt = request.prompt;
+    let Admission::Opened { seq, reused } = driver.open(request).unwrap() else {
         panic!("the driver admits the sequence")
     };
     let mut sampler = Sampler::greedy();
@@ -387,19 +419,16 @@ impl ProposalObserver for RecordProposals {
 
 /// Install a proposal recorder on `driver`; the oracle rows compare what was proposed, which no stat or
 /// event carries.
-fn log_proposals(driver: &mut Driver) -> ProposalLog {
+fn log_proposals(driver: &mut Driver<Serving>) -> ProposalLog {
     let log = ProposalLog::default();
     driver.speculation.observer = Some(Box::new(RecordProposals(Arc::clone(&log))));
     log
 }
 
-fn decode(driver: &mut Driver, seq: SeqId, sampler: &mut Sampler) -> RowResult {
+fn decode(driver: &mut Driver<Serving>, seq: SeqId, sampler: &mut Sampler) -> RowResult {
     let mut rows = [StepRow {
         seq,
-        work: RowWork::Decode {
-            ahead: &[],
-            pick: PickPolicy::Greedy,
-        },
+        work: RowWork::Decode { ahead: &[] },
         sampler,
     }];
     driver.step(&mut rows).unwrap().remove(0)
@@ -438,20 +467,31 @@ fn an_mtp_policy_without_a_carry_window_is_refused_typed() {
     assert!(toy_driver(Kind::Plain, mtp(2)).is_ok());
 }
 
+/// `Mtp` with the draft program carrying recurrent state, refused by `prepare` of a family whose MTP
+/// program folds a recurrent value.
+pub(in crate::driver) fn witness_mtp_recurrent_draft_state() -> DriverError {
+    toy_driver(Kind::RecurrentMtp, mtp(2))
+        .unwrap()
+        .prepare(&toy_shapes(Layout::Contiguous))
+        .expect_err("a recurrent MTP program is refused")
+        .error
+}
+
 /// A family whose MTP program carries recurrent state is refused typed at `prepare`: the snapshot
 /// schema is the target's decode program, so the state would never be rolled back. A KV-only MTP
-/// program prepares. Mutation: drop the `RecurrentMtp` return in `Driver::prepared`; the family
+/// program prepares. Mutation: drop the `RecurrentDraftState` compose in `Driver::prepared`; the family
 /// prepares and the row is red.
 #[test]
 fn an_mtp_program_with_recurrent_state_is_refused_typed() {
-    let mut driver = toy_driver(Kind::RecurrentMtp, mtp(2)).unwrap();
-    let error = driver
-        .prepare(&toy_shapes(Layout::Contiguous))
-        .expect_err("a recurrent MTP program is refused");
+    let error = witness_mtp_recurrent_draft_state();
     assert!(
         matches!(
             error,
-            DriverError::Unsupported(Unsupported::Speculation(SpeculationRefusal::RecurrentMtp))
+            DriverError::Unsupported(Unsupported::Incompatible(Incompatible {
+                first: Feature::Mtp,
+                second: Feature::RecurrentDraftState,
+                ..
+            }))
         ),
         "{error:?}"
     );
@@ -461,20 +501,21 @@ fn an_mtp_program_with_recurrent_state_is_refused_typed() {
         .expect("a KV-only MTP program prepares");
 }
 
-/// A family with no MTP program is refused by its own tracer, typed, before anything compiles.
-/// Mutation: none of the driver's; the refusal is the family's `check_mtp_step` through
-/// `Unsupported::Trace`.
+/// A family whose schema declares no `draft` program is refused typed before anything compiles.
+/// Mutation: none of the driver's; the refusal is `Program::spec_in` (the schema has no draft
+/// program), reported through `Unsupported::Trace`.
 #[test]
 fn a_family_without_an_mtp_program_is_refused_typed() {
-    let mut driver = toy_driver(Kind::NoMtp, mtp(2)).unwrap();
+    let driver = toy_driver(Kind::NoMtp, mtp(2)).unwrap();
     let error = driver
         .prepare(&toy_shapes(Layout::Contiguous))
-        .expect_err("a family with no MTP program is refused");
+        .expect_err("a family with no MTP program is refused")
+        .error;
     assert!(
         matches!(
             error,
-            DriverError::Unsupported(Unsupported::Trace(TraceError::PhaseUnsupported {
-                phase: Phase::Mtp,
+            DriverError::Unsupported(Unsupported::Trace(TraceError::ProgramUnsupported {
+                program: ProgramId::DRAFT,
                 ..
             }))
         ),
@@ -482,60 +523,109 @@ fn a_family_without_an_mtp_program_is_refused_typed() {
     );
 }
 
+/// `Mtp` with beam search, refused by `beam`.
+pub(in crate::driver) fn witness_mtp_beam() -> crate::driver::beam::BeamError {
+    use crate::driver::beam::BeamRequest;
+    let mut driver = toy_driver(Kind::Plain, mtp(2)).unwrap();
+    driver
+        .beam(BeamRequest {
+            prompt: vec![1, 2, 3],
+            max_new: 2,
+            width: nz(2),
+            length_penalty: 0.0,
+            ignore_eos: true,
+        })
+        .expect_err("beam search is refused under an MTP policy")
+}
+
+/// `Mtp` with an adapter, refused by `open` of a request that names one: the layer drafts for the base
+/// weights, so the refusal comes before the registry is asked whether the generation exists.
+pub(in crate::driver) fn witness_mtp_adapters() -> DriverError {
+    let mut driver = toy_driver(Kind::Plain, mtp(2))
+        .unwrap()
+        .prepare(&toy_shapes(Layout::Contiguous))
+        .unwrap();
+    let adapter = AdapterRef::Adapter {
+        generation: GenerationId::unissued(1),
+        index: LoraIdx::new(1).expect("an index of one"),
+    };
+    driver
+        .open(SeqRequest::new(&[1, 2, 3], 4, adapter))
+        .expect_err("an adapter request is refused under an MTP policy")
+}
+
 /// Beam search runs the target's programs without the carry: refused typed under an MTP policy.
-/// Mutation: drop the `MtpBeam` return in `Driver::prepared`; the search goes on into the beam's own
+/// Mutation: drop the `Beam` compose in `Driver::prepared`; the search goes on into the beam's own
 /// preparation, which this family has no state for, and the row is red.
 #[test]
 fn beam_search_is_refused_typed_under_an_mtp_policy() {
-    use crate::driver::beam::{BeamError, BeamRequest};
-    let request = || BeamRequest {
-        prompt: vec![1, 2, 3],
-        max_new: 2,
-        width: nz(2),
-        length_penalty: 0.0,
-        ignore_eos: true,
-    };
-    let mut driver = toy_driver(Kind::Plain, mtp(2)).unwrap();
-    let error = driver
-        .beam(request())
-        .expect_err("beam search is refused under an MTP policy");
+    use crate::driver::beam::BeamError;
+    let error = witness_mtp_beam();
     assert!(
         matches!(
             error,
-            BeamError::Driver(DriverError::Unsupported(Unsupported::Speculation(
-                SpeculationRefusal::MtpBeam
+            BeamError::Driver(DriverError::Unsupported(Unsupported::Incompatible(
+                Incompatible {
+                    first: Feature::Mtp,
+                    second: Feature::Beam,
+                    ..
+                }
             )))
         ),
         "{error:?}"
     );
 }
 
-/// A prompt with embedding rows cannot run under an MTP policy: the layer would embed the placeholder
-/// tokens the rows replace. Mutation: drop the `Mtp` return in `open_embedded`; the sequence opens and
-/// the row is red.
+/// A prompt with embedding rows runs under an MTP policy but is never speculated: the layer would
+/// embed the placeholder tokens the rows replace, so a draft program that does not read the sequence's
+/// request inputs serves no sequence that carries one. The row decodes one token, reports
+/// `NotSpeculated::Inputs`, counts `skipped_inputs` and asks the policy for no proposal; the control,
+/// the same prompt without rows, speculates. Mutation: drop the `drafts_for` arm of the decode row's
+/// speculation choice in `Driver::step`; the sequence speculates, its proposal is observed and the
+/// first assertion is red.
 #[test]
-fn a_prompt_with_embedding_rows_is_refused_under_an_mtp_policy() {
-    use crate::driver::embeds::PromptEmbeds;
-    let mut driver = toy_driver(Kind::Plain, mtp(2)).unwrap();
-    driver.prepare(&toy_shapes(Layout::Contiguous)).unwrap();
-    let embeds = PromptEmbeds::new(TOY_WIDTH, vec![1], vec![0.0; TOY_WIDTH]).unwrap();
-    let error = driver
-        .open_with_embeds(
-            SeqRequest {
-                prompt: &[1, 2, 3],
-                max_new: 2,
-                adapter: AdapterRef::Base,
-            },
-            embeds,
-        )
-        .expect_err("embedding rows are refused");
-    assert!(
-        matches!(
-            error,
-            DriverError::InvalidRequest(InvalidRequest::Embeds(EmbedsError::Mtp))
-        ),
-        "{error:?}"
+fn a_prompt_with_embedding_rows_is_not_speculated_under_an_mtp_policy() {
+    let embeds =
+        poot_models::components::embed::embeds_inputs(TOY_WIDTH, vec![1], vec![0.0; TOY_WIDTH])
+            .unwrap();
+    let run = |inputs: RequestInputs| {
+        let shapes = toy_shapes(Layout::Contiguous);
+        let mut driver = toy_driver(Kind::Plain, mtp(2))
+            .unwrap()
+            .prepare(&shapes)
+            .unwrap();
+        driver.prepare_carried(&shapes, &[EMBEDS]).unwrap();
+        let proposals = log_proposals(&mut driver);
+        let request = SeqRequest::new(&[1, 2, 3, 4], 16, AdapterRef::Base).with_inputs(inputs);
+        let (seq, _) = open_prefilled_with(&mut driver, request);
+        let mut sampler = Sampler::greedy();
+        let result = decode(&mut driver, seq, &mut sampler);
+        let made = proposals.lock().unwrap().len();
+        (result, made, driver.stats().speculation)
+    };
+    let (result, made, stats) = run(embeds);
+    assert_eq!(
+        result.speculation,
+        RowSpeculation::NotSpeculated(NotSpeculated::Inputs)
     );
+    assert_eq!(
+        result.tokens.len(),
+        1,
+        "an unspeculated row decodes one token"
+    );
+    assert_eq!((made, stats.skipped_inputs, stats.rounds), (0, 1, 0));
+
+    let (control, made, stats) = run(RequestInputs::none());
+    assert!(
+        matches!(control.speculation, RowSpeculation::Verified { .. }),
+        "control: without rows the same prompt speculates: {:?}",
+        control.speculation
+    );
+    assert_eq!(
+        control.tokens[0], result.tokens[0],
+        "both rows decode the same first token"
+    );
+    assert!(made > 0 && stats.rounds == 1 && stats.skipped_inputs == 0);
 }
 
 /// Prefix reuse under an MTP policy is refused, typed: the layer's cache at a block's last position
@@ -548,16 +638,14 @@ fn a_prompt_with_embedding_rows_is_refused_under_an_mtp_policy() {
 fn prefix_reuse_is_refused_under_an_mtp_policy() {
     let prompt: Vec<u32> = (0..2 * BLOCK_SIZE as u32 + 1).map(|i| 1 + i % 9).collect();
     let run = |draft: DraftPolicy| {
-        let mut driver = toy_driver(Kind::Plain, draft).unwrap();
-        driver.prepare(&toy_shapes(paged())).unwrap();
+        let mut driver = toy_driver(Kind::Plain, draft)
+            .unwrap()
+            .prepare(&toy_shapes(paged()))
+            .unwrap();
         let (seq, _) = open_prefilled(&mut driver, &prompt, 4);
         let outcome = driver.release(seq, Release::Finished).unwrap();
         let Admission::Opened { reused, .. } = driver
-            .open(SeqRequest {
-                prompt: &prompt,
-                max_new: 4,
-                adapter: AdapterRef::Base,
-            })
+            .open(SeqRequest::new(&prompt, 4, AdapterRef::Base))
             .unwrap()
         else {
             panic!("the pool admits the sequence")
@@ -589,8 +677,10 @@ fn prefix_reuse_is_refused_under_an_mtp_policy() {
 #[test]
 fn a_resumed_sequence_reuses_one_position_less_under_an_mtp_policy() {
     let reused = |kind: Kind, draft: DraftPolicy| {
-        let mut driver = toy_driver(kind, draft).unwrap();
-        driver.prepare(&toy_shapes(Layout::Contiguous)).unwrap();
+        let mut driver = toy_driver(kind, draft)
+            .unwrap()
+            .prepare(&toy_shapes(Layout::Contiguous))
+            .unwrap();
         let (seq, _) = open_prefilled(&mut driver, &[1, 2, 3, 4, 5, 6], 8);
         driver.resume(seq, &[1, 2, 3, 4, 5, 6, 7, 8], 8).unwrap()
     };
@@ -623,8 +713,10 @@ fn a_resumed_sequence_reuses_one_position_less_under_an_mtp_policy() {
 /// stale draft and the first assertion is red.
 #[test]
 fn a_short_commit_leaves_no_stale_draft() {
-    let mut driver = toy_driver(Kind::Plain, mtp(2)).unwrap();
-    driver.prepare(&toy_shapes(Layout::Contiguous)).unwrap();
+    let mut driver = toy_driver(Kind::Plain, mtp(2))
+        .unwrap()
+        .prepare(&toy_shapes(Layout::Contiguous))
+        .unwrap();
     let (seq, _) = open_prefilled(&mut driver, &[1, 2, 3, 4], 16);
     let mut sampler = Sampler::greedy();
     // The fake device picks token 0 for every position and the layer's draft is token 0 too, so
@@ -740,17 +832,13 @@ fn oracle_drafts(handle: &ModelHandle, tokens: &[u32], k: usize) -> Vec<u32> {
     };
     let formats = poot_graph_plan::WeightFormats::from_weight_map(model.weights());
     let mut state: BTreeMap<String, HostTensor> = BTreeMap::new();
-    let mut run = |phase: Phase, fed: &[u32], start: usize| -> Vec<f32> {
-        let shape = StepShape {
-            rows: nz(1),
-            tokens: nz(fed.len()),
-            capacity: nz(CAPACITY),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::Last,
-            hidden: Some(carry),
-        };
+    let mut run = |program: ProgramId, fed: &[u32], start: usize| -> Vec<f32> {
+        let shape = StepShape::new(nz(1), nz(fed.len()), nz(CAPACITY)).with_hidden(Some(carry));
         let graph = model
-            .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+            .trace(
+                &StepSpec::new(program, shape),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
             .unwrap();
         let graph = poot_graph_plan::bind_packed_weights(&graph, &formats).unwrap();
         let slots = [
@@ -800,11 +888,11 @@ fn oracle_drafts(handle: &ModelHandle, tokens: &[u32], k: usize) -> Vec<u32> {
             .unwrap()
             .0 as u32
     };
-    run(Phase::Prefill, tokens, 0);
-    let mut drafts = vec![argmax(&run(Phase::Mtp, &tokens[1..], 0))];
+    run(ProgramId::STEP, tokens, 0);
+    let mut drafts = vec![argmax(&run(ProgramId::DRAFT, &tokens[1..], 0))];
     for j in 1..k {
         let last = *drafts.last().unwrap();
-        drafts.push(argmax(&run(Phase::Mtp, &[last], n - 2 + j)));
+        drafts.push(argmax(&run(ProgramId::DRAFT, &[last], n - 2 + j)));
     }
     drafts
 }
@@ -821,7 +909,12 @@ struct Served {
     proposals: Vec<(Vec<u32>, Vec<u32>)>,
 }
 
-fn prepare(driver: &mut Driver, prompts: &[usize], layout: Layout, rows: &[NonZeroUsize]) {
+fn prepare(
+    driver: Driver,
+    prompts: &[usize],
+    layout: Layout,
+    rows: &[NonZeroUsize],
+) -> Driver<Serving> {
     driver
         .prepare(&ServingShapes {
             layout,
@@ -831,28 +924,28 @@ fn prepare(driver: &mut Driver, prompts: &[usize], layout: Layout, rows: &[NonZe
             windows: &[],
             adapters: &[],
         })
-        .unwrap_or_else(|e| panic!("{e}"));
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// `NEW` tokens after `prompt` through `open`/`step`/`commit`, each round committed whole (a
-/// recurrent row's state holds its folded kept prefix). `proposals` pairs each round's proposed
-/// drafts with the committed tokens it followed.
-fn serve(driver: &mut Driver, prompt: &[u32], sampler: &mut Sampler) -> Served {
-    let log = log_proposals(driver);
+/// `driver` prepared for one `prompt` on the contiguous layout, the shapes [`serve`] runs.
+fn prepare_one(driver: Driver, prompt: &[u32]) -> Driver<Serving> {
     prepare(
         driver,
         &[prompt.len()],
         Layout::Contiguous,
         &[NonZeroUsize::MIN],
-    );
+    )
+}
+
+/// `NEW` tokens after `prompt` through `open`/`step`/`commit`, each round committed whole (a
+/// recurrent row's state holds its folded kept prefix). `proposals` pairs each round's proposed
+/// drafts with the committed tokens it followed.
+fn serve(driver: &mut Driver<Serving>, prompt: &[u32], sampler: &mut Sampler) -> Served {
+    let log = log_proposals(driver);
     let compiled = driver.stats().compiles;
     let (seq, _) = {
         let Admission::Opened { seq, reused } = driver
-            .open(SeqRequest {
-                prompt,
-                max_new: NEW,
-                adapter: AdapterRef::Base,
-            })
+            .open(SeqRequest::new(prompt, NEW, AdapterRef::Base))
             .unwrap()
         else {
             panic!("a fresh driver admits one sequence")
@@ -918,13 +1011,15 @@ fn is_full(round: &RowSpeculation) -> bool {
 /// rejected draft enters the output and the tokens leave `Off`'s.
 fn mtp_greedy_equals_off(choice: BackendChoice) {
     let handle = glm_handle(FixtureHead::Random);
-    let Some(mut off) = glm_driver(choice, &handle, DraftPolicy::Off) else {
+    let Some(off) = glm_driver(choice, &handle, DraftPolicy::Off) else {
         return;
     };
+    let mut off = prepare_one(off, &PROMPT);
     let reference = serve(&mut off, &PROMPT, &mut Sampler::greedy());
-    let mut driver = glm_driver(choice, &handle, mtp(K))
+    let driver = glm_driver(choice, &handle, mtp(K))
         .expect("the device opened a moment ago")
         .with_phase_timing();
+    let mut driver = prepare_one(driver, &PROMPT);
     let served = serve(&mut driver, &PROMPT, &mut Sampler::greedy());
     assert_eq!(
         served.tokens, reference.tokens,
@@ -983,11 +1078,13 @@ fn mtp_greedy_equals_off(choice: BackendChoice) {
 /// assertion is red.
 fn mtp_all_accepted_equals_off(choice: BackendChoice) {
     let handle = glm_handle(FixtureHead::Zeroed);
-    let Some(mut off) = glm_driver(choice, &handle, DraftPolicy::Off) else {
+    let Some(off) = glm_driver(choice, &handle, DraftPolicy::Off) else {
         return;
     };
+    let mut off = prepare_one(off, &PROMPT);
     let reference = serve(&mut off, &PROMPT, &mut Sampler::greedy());
-    let mut driver = glm_driver(choice, &handle, mtp(K)).expect("the device opened a moment ago");
+    let driver = glm_driver(choice, &handle, mtp(K)).expect("the device opened a moment ago");
+    let mut driver = prepare_one(driver, &PROMPT);
     let served = serve(&mut driver, &PROMPT, &mut Sampler::greedy());
     assert_eq!(
         served.tokens, reference.tokens,
@@ -1016,9 +1113,10 @@ fn mtp_all_accepted_equals_off(choice: BackendChoice) {
 /// carry's column 0 the chain recycles). Each moves the second round's drafts and the row is red.
 fn mtp_proposals_equal_the_oracle_chain(choice: BackendChoice) {
     let handle = glm_handle(FixtureHead::Random);
-    let Some(mut driver) = glm_driver(choice, &handle, mtp(K)) else {
+    let Some(driver) = glm_driver(choice, &handle, mtp(K)) else {
         return;
     };
+    let mut driver = prepare_one(driver, &PROMPT);
     let served = serve(&mut driver, &PROMPT, &mut Sampler::greedy());
     assert!(
         served.rounds.iter().any(is_partial),
@@ -1058,17 +1156,14 @@ fn mtp_two_rows_equal_off(choice: BackendChoice) {
         max_seqs: nz(2),
     });
     let rows = [nz(1), nz(2)];
-    let serve_pair = |driver: &mut Driver| -> Pair {
+    let prepare_pair =
+        |driver: Driver| prepare(driver, &[PROMPT.len(), OTHER_PROMPT.len()], layout, &rows);
+    let serve_pair = |driver: &mut Driver<Serving>| -> Pair {
         let log = log_proposals(driver);
-        prepare(driver, &[PROMPT.len(), OTHER_PROMPT.len()], layout, &rows);
         let mut seqs = Vec::new();
         for prompt in [&PROMPT[..], &OTHER_PROMPT[..]] {
             let Admission::Opened { seq, .. } = driver
-                .open(SeqRequest {
-                    prompt,
-                    max_new: NEW,
-                    adapter: AdapterRef::Base,
-                })
+                .open(SeqRequest::new(prompt, NEW, AdapterRef::Base))
                 .unwrap()
             else {
                 panic!("the pool admits both sequences")
@@ -1093,10 +1188,7 @@ fn mtp_two_rows_equal_off(choice: BackendChoice) {
                 }
                 let (seq, len) = seqs[i];
                 let step_work = if prefilled[i] {
-                    RowWork::Decode {
-                        ahead: &[],
-                        pick: PickPolicy::Greedy,
-                    }
+                    RowWork::Decode { ahead: &[] }
                 } else {
                     RowWork::Prefill { upto: len }
                 };
@@ -1133,12 +1225,14 @@ fn mtp_two_rows_equal_off(choice: BackendChoice) {
         }
         (out, proposals)
     };
-    let Some(mut off) = glm_driver(choice, &handle, DraftPolicy::Off) else {
+    let Some(off) = glm_driver(choice, &handle, DraftPolicy::Off) else {
         return;
     };
+    let mut off = prepare_pair(off);
     let reference = serve_pair(&mut off);
     assert!(reference.1.is_empty(), "Off proposes nothing");
-    let mut driver = glm_driver(choice, &handle, mtp(K)).expect("the device opened a moment ago");
+    let driver = glm_driver(choice, &handle, mtp(K)).expect("the device opened a moment ago");
+    let mut driver = prepare_pair(driver);
     let (served, proposals) = serve_pair(&mut driver);
     assert_eq!(
         served, reference.0,
@@ -1162,9 +1256,10 @@ fn mtp_two_rows_equal_off(choice: BackendChoice) {
 /// proposal. Mutation: decline sampled rows for MTP in `speculation_sampler_ok`; no round verifies.
 fn mtp_serves_a_sampled_row(choice: BackendChoice) {
     let handle = glm_handle(FixtureHead::Random);
-    let Some(mut driver) = glm_driver(choice, &handle, mtp(K)) else {
+    let Some(driver) = glm_driver(choice, &handle, mtp(K)) else {
         return;
     };
+    let mut driver = prepare_one(driver, &PROMPT);
     let served = serve(&mut driver, &PROMPT, &mut Sampler::new(1.0, 0, 1.0, 0x5EED));
     assert_eq!(served.tokens.len(), NEW);
     assert!(
@@ -1208,20 +1303,10 @@ fn mtp_prefill_catch_up_is_not_a_decode_pass(choice: BackendChoice) {
     let Some(driver) = glm_driver(choice, &handle, mtp(K)) else {
         return;
     };
-    let mut driver = driver.with_phase_timing();
+    let mut driver = prepare_one(driver.with_phase_timing(), &PROMPT);
     let sampler = &mut Sampler::greedy();
-    prepare(
-        &mut driver,
-        &[PROMPT.len()],
-        Layout::Contiguous,
-        &[NonZeroUsize::MIN],
-    );
     let Admission::Opened { seq, .. } = driver
-        .open(SeqRequest {
-            prompt: &PROMPT,
-            max_new: NEW,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(&PROMPT, NEW, AdapterRef::Base))
         .unwrap()
     else {
         panic!("a fresh driver admits one sequence")

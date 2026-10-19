@@ -14,7 +14,7 @@ use poot_graph_ir::{
 
 use crate::fp8::encode_e4m3fn_tensor;
 use crate::observer::{EvalObserver, Publication};
-use crate::{EvalBudget, EvalError, EvalOptions, ExactI32TensorView, Value, eval};
+use crate::{EvalError, EvalOptions, ExactI32TensorView, Value, eval};
 use poot_graph_ir::test_support::graph_fixtures;
 use poot_tensor::HostTensor;
 
@@ -183,16 +183,11 @@ fn eval_rejects_the_same_lane_regardless_of_options() {
     for (name, fixture) in dense_fixtures {
         let (graph, values) = fixture(f32::NAN);
         assert_same_failure(
-            eval(&graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err(),
+            eval(&graph, &values, EvalOptions::default()).unwrap_err(),
             f32::NAN.to_bits(),
         );
         assert_same_failure(
-            eval(
-                &graph,
-                &values,
-                EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-            )
-            .unwrap_err(),
+            eval(&graph, &values, EvalOptions::default().keep_environment()).unwrap_err(),
             f32::NAN.to_bits(),
         );
         let _ = name;
@@ -206,7 +201,7 @@ fn eval_rejects_the_same_lane_regardless_of_options() {
     for (name, fixture) in storage_fixtures {
         let (graph, values) = fixture(f32::NAN);
         assert_same_failure(
-            eval(&graph, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap_err(),
+            eval(&graph, &values, EvalOptions::default()).unwrap_err(),
             f32::NAN.to_bits(),
         );
         let _ = name;
@@ -234,8 +229,8 @@ fn empty_validation_graph_is_compatible() {
     }
 
     let (empty, plain, inputs) = build();
-    let plain_result = eval(&plain, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
-    let empty_result = eval(&empty, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let plain_result = eval(&plain, &inputs, EvalOptions::default()).unwrap();
+    let empty_result = eval(&empty, &inputs, EvalOptions::default()).unwrap();
     let plain_output = plain_result.output.into_host().unwrap();
     assert_eq!(plain_output.as_f32().unwrap(), &[15.0]);
     assert_eq!(
@@ -279,7 +274,7 @@ fn cpu_publication_observer_stays_untouched_on_failure() {
                     passes,
                     state_values + extra,
                     |observer| {
-                        let mut opts = EvalOptions::new(EvalBudget::UNBOUNDED).observer(observer);
+                        let mut opts = EvalOptions::default().observer(observer);
                         if keep_environment {
                             opts = opts.keep_environment();
                         }
@@ -299,7 +294,7 @@ fn cpu_publication_observer_stays_untouched_on_failure() {
         for (witness, passes) in [(1.0, false), (0.0, true)] {
             let (graph, values) = fixture(witness);
             assert_publications(shape, witness, passes, expected, |observer| {
-                let opts = EvalOptions::new(EvalBudget::UNBOUNDED).observer(observer);
+                let opts = EvalOptions::default().observer(observer);
                 eval(&graph, &values, opts).map(drop)
             });
         }

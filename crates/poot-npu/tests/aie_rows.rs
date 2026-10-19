@@ -23,7 +23,6 @@ use poot_executor::Device;
 use poot_executor_parity::Fixture;
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::{Builder, Eqn, RedOp, Slot, TensorType};
-use poot_graph_plan::production_plan::Submission;
 use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Target, compile};
 use poot_kernelgen::{ErrorBound, NumericalContract};
 use poot_tensor::{DType, HostTensor};
@@ -42,7 +41,7 @@ fn planned_contract(
     let program = compile(
         &fixture.graph,
         target,
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+        &CompileOptions::new(CompileLimits::STANDARD),
     )
     .expect("the graph compiles for the NPU");
     let selected: Vec<&Eqn> = program

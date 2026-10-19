@@ -2,7 +2,6 @@
 //! handles cannot free memory a replay still reads.
 
 use poot_executor::Device;
-use poot_graph_plan::production_plan::Submission;
 use poot_rocm_device::device::RocmDevice;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_runtime_common::{BufferRole, DeviceBackend};
@@ -34,7 +33,7 @@ fn dropping_a_bound_buffer_keeps_its_allocation_until_the_recording_drops() {
     let bound = live_activation_bytes(&device);
     assert_eq!(bound, before + 2 * 64 * 4, "both buffers are live");
 
-    device.begin(Submission::Replay).expect("begin");
+    device.begin().expect("begin");
     device.copy(&src, &dst).expect("record the copy");
     let recording = device
         .finish()

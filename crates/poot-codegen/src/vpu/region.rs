@@ -89,9 +89,7 @@ impl VpuOp {
             | VpuOp::Transpose { .. }
             | VpuOp::Broadcast
             | VpuOp::Slice { .. }
-            | VpuOp::Convert
-            | VpuOp::NarrowEntry
-            | VpuOp::WidenExit => Some(1),
+            | VpuOp::Convert => Some(1),
             VpuOp::Add
             | VpuOp::Subtract
             | VpuOp::Multiply
@@ -120,14 +118,9 @@ pub struct VpuNode {
 }
 
 impl VpuNode {
-    /// The IR layer name the node's value goes by: the equation's (`v<origin>`), or the boundary
-    /// conversion's, which shares its `origin` with a neighbour and so names its direction.
+    /// The IR layer name the node's value goes by: the equation's (`v<origin>`).
     fn layer_name(&self) -> String {
-        match self.op {
-            VpuOp::NarrowEntry => format!("v{}_narrow", self.origin),
-            VpuOp::WidenExit => format!("v{}_widen", self.origin),
-            _ => format!("v{}", self.origin),
-        }
+        format!("v{}", self.origin)
     }
 }
 
@@ -574,7 +567,7 @@ fn lower_node(e: &mut Emitter, node: &VpuNode) -> Result<(), VpuEmitError> {
             &with(&operands),
             &node.out,
         ),
-        VpuOp::Convert | VpuOp::NarrowEntry | VpuOp::WidenExit => e.op_layer(
+        VpuOp::Convert => e.op_layer(
             &name,
             "Convert",
             "opset1",

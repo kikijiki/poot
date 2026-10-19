@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{
     Device, Dispatch, Engine, EntryId, ExecutableId, Executor, ExecutorStats, NoSync, StepInputs,
 };
@@ -21,11 +21,10 @@ use poot_graph_ir::ops::sampling::sample_head;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{Graph, Slot, SlotKey, Storage, TensorType, ValueId};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
-    staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
 };
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_ptx_device::PtxDevice;
 use poot_quant::StoredBytes;
@@ -40,8 +39,8 @@ const VOCAB: usize = 32;
 const HIDDEN: usize = 16;
 
 /// The fixture's qwen2 (16 hidden, 4 heads over 2 key-value heads, F32 consts) traced by the
-/// registry's family for `phase` over `tokens` new tokens and `CAP` cached positions.
-fn qwen2_graph(phase: Phase, tokens: usize) -> Graph {
+/// registry's family for one step over `tokens` new tokens and `CAP` cached positions.
+fn qwen2_graph(tokens: usize) -> Graph {
     let m = Dense::new(Family::Qwen2)
         .vocab(VOCAB)
         .dims(HIDDEN, 32, 2)
@@ -51,19 +50,18 @@ fn qwen2_graph(phase: Phase, tokens: usize) -> Graph {
         .f32_model();
     m.model
         .trace(
-            phase,
-            step(1, tokens, CAP, LogitRows::Last),
+            &StepSpec::step(step(1, tokens, CAP, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
 }
 
 fn prefill_graph(n: usize) -> Graph {
-    qwen2_graph(Phase::Prefill, n)
+    qwen2_graph(n)
 }
 
 fn decode_graph() -> Graph {
-    qwen2_graph(Phase::Decode, 1)
+    qwen2_graph(1)
 }
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
@@ -119,11 +117,7 @@ fn map_source(weights: ConstWeights<'_>) -> Arc<poot_quant::weights::WeightMap> 
     Arc::new(weights.map())
 }
 
-fn staged(
-    g: &Graph,
-    target: Target,
-    submission: Submission,
-) -> poot_graph_plan::staged::StagedProgram {
+fn staged(g: &Graph, target: Target) -> poot_graph_plan::staged::StagedProgram {
     let g = g.clone();
     compile_staged(
         &g,
@@ -132,7 +126,7 @@ fn staged(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(submission, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -233,7 +227,7 @@ fn oracle_step(
         };
         inputs.insert(id, value);
     }
-    let evaluation = eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let evaluation = eval(g, &inputs, EvalOptions::default()).unwrap();
     for ((si, _), t) in g.state().zip(evaluation.state) {
         state.insert(
             g.meta(si).name.clone().unwrap(),
@@ -309,10 +303,10 @@ fn sc001_dense_decode_golden_records_each_entry_once_ptx() {
         .load_weights(Arc::clone(&store), map_source(weights))
         .unwrap();
     let prefill = engine
-        .add_entry(exe, &staged(&prefill_named, target, Submission::Replay))
+        .add_entry(exe, &staged(&prefill_named, target))
         .unwrap();
     let decode = engine
-        .add_entry(exe, &staged(&decode_named, target, Submission::Replay))
+        .add_entry(exe, &staged(&decode_named, target))
         .unwrap();
 
     let mut oracle_state = HashMap::new();
@@ -372,7 +366,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
         let (ai, ci) = (a.id(), c.id());
         let g = b.finish(out).unwrap();
         let inputs = make_inputs(&[(ai, vec![n], fill(n, 701)), (ci, vec![n], fill(n, 702))]);
-        let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -398,7 +392,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
             (ai, vec![m, k], fill(m * k, 703)),
             (wi, vec![k, n], fill(k * n, 704)),
         ]);
-        let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -420,7 +414,7 @@ fn sc002_parity_suite_has_real_per_op_bite_ptx() {
         let xi = x.id();
         let g = b.finish(out).unwrap();
         let inputs = make_inputs(&[(xi, vec![rows, cols], fill(rows * cols, 705))]);
-        let cpu = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -460,9 +454,7 @@ fn sc007_memory_counters_track_each_role_ptx() {
     let exe = engine
         .load_weights(Arc::clone(&store), map_source(weights))
         .unwrap();
-    let decode = engine
-        .add_entry(exe, &staged(&named, target, Submission::Replay))
-        .unwrap();
+    let decode = engine.add_entry(exe, &staged(&named, target)).unwrap();
     let values = slot_values(&g, &[5], 0);
     let _ = engine
         .step(exe, decode, &step_inputs(&values), &mut NoSync)
@@ -528,8 +520,8 @@ impl Device for FaultyOnceDevice {
     ) -> Result<Self::Kernel, Self::Error> {
         self.inner.load_kernel(key, kernel)
     }
-    fn begin(&mut self, submission: Submission) -> Result<(), Self::Error> {
-        self.inner.begin(submission)
+    fn begin(&mut self) -> Result<(), Self::Error> {
+        self.inner.begin()
     }
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
         if self.armed {
@@ -611,15 +603,11 @@ fn sc009_failure_injection_aborts_once_and_retains_other_executables_ptx() {
     let exe_bad = engine
         .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
-    let decode_bad = engine
-        .add_entry(exe_bad, &staged(&named, target, Submission::Replay))
-        .unwrap();
+    let decode_bad = engine.add_entry(exe_bad, &staged(&named, target)).unwrap();
     let exe_ok = engine
         .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
-    let decode_ok = engine
-        .add_entry(exe_ok, &staged(&named, target, Submission::Replay))
-        .unwrap();
+    let decode_ok = engine.add_entry(exe_ok, &staged(&named, target)).unwrap();
 
     let values = slot_values(&g, &[5], 0);
     let failed = engine.step(exe_bad, decode_bad, &step_inputs(&values), &mut NoSync);
@@ -692,8 +680,8 @@ impl Device for FaultyOnceSyncDevice {
     ) -> Result<Self::Kernel, Self::Error> {
         self.inner.load_kernel(key, kernel)
     }
-    fn begin(&mut self, submission: Submission) -> Result<(), Self::Error> {
-        self.inner.begin(submission)
+    fn begin(&mut self) -> Result<(), Self::Error> {
+        self.inner.begin()
     }
     fn dispatch(&mut self, d: Dispatch<'_, Self>) -> Result<(), Self::Error> {
         self.inner.dispatch(Dispatch {
@@ -791,15 +779,11 @@ fn sc010_sc011_fixture() -> Option<(
     let exe_bad = engine
         .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
-    let decode_bad = engine
-        .add_entry(exe_bad, &staged(&named, target, Submission::Replay))
-        .unwrap();
+    let decode_bad = engine.add_entry(exe_bad, &staged(&named, target)).unwrap();
     let exe_ok = engine
         .load_weights(Arc::clone(&store), source.clone())
         .unwrap();
-    let decode_ok = engine
-        .add_entry(exe_ok, &staged(&named, target, Submission::Replay))
-        .unwrap();
+    let decode_ok = engine.add_entry(exe_ok, &staged(&named, target)).unwrap();
 
     let values = slot_values(&g, &[5], 0);
     // First step on exe_bad: records + replays + syncs for real, allocating its real buffers.
@@ -976,9 +960,7 @@ fn card551b_sc001_device_suffix_matches_host_oracle_ptx() {
     let exe = engine
         .load_weights(Arc::clone(&store), map_source(weights))
         .unwrap();
-    let entry = engine
-        .add_entry(exe, &staged(&named, target, Submission::Replay))
-        .unwrap();
+    let entry = engine.add_entry(exe, &staged(&named, target)).unwrap();
 
     let mut oracle_state = HashMap::new();
     let mut device_tokens = Vec::new();
@@ -1069,9 +1051,7 @@ fn card551b_sc003_nan_logits_are_a_typed_fault_ptx() {
         let exe = engine
             .load_weights(Arc::clone(&store), map_source(weights))
             .unwrap();
-        let entry = engine
-            .add_entry(exe, &staged(&named, target, Submission::Replay))
-            .unwrap();
+        let entry = engine.add_entry(exe, &staged(&named, target)).unwrap();
 
         let mut values = slot_values(&base_for_slots, &[poisoned_token], 0);
         if let (Some(seed_id), Some(params_id)) = (seed_id, params_id) {

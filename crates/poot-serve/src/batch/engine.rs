@@ -14,14 +14,14 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use poot_llm::driver::error::{DriverError, FailureClass};
-use poot_llm::driver::step::PickPolicy;
 use poot_llm::driver::{
     AdapterRef, AdapterSet, AdapterSource, AdapterSpec, Admission, Driver, EncodeRequest, Encoded,
     GenerationId, Head, Layout, LoraIdx, ModelHandle, PoolShape, PrefixOutcome, Release,
-    RowSpeculation, RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm,
+    RowSpeculation, RowWork, SeqId, SeqRequest, Serving, ServingShapes, StepRow, Warm,
 };
 use poot_llm::{Sampler, TokenLogprob};
 use poot_load::lora::LoraAdapter;
+use poot_models::io::RequestInputs;
 use poot_profile::TimingSnapshot;
 
 use crate::batch::commit::{
@@ -34,7 +34,7 @@ use crate::metrics::Metrics;
 use crate::types::{
     AccountedGenerationFailure, AdapterInfo, AdminError, AdminJob, AdminReply, AdminRequest,
     Completion, EncodeJob, EncodeReply, EncodeRow, EngineMsg, EngineView, FinishReason, GenEvent,
-    Job, PromptInput, PromptRows, deliver_terminal,
+    Job, deliver_terminal,
 };
 
 /// How long an idle loop waits for a job before it looks again.
@@ -114,9 +114,9 @@ pub(crate) struct OpenRequest<'a> {
     /// The most tokens that will be committed after the prompt: their KV blocks are reserved at open.
     pub(crate) max_new: usize,
     pub(crate) adapter: AdapterRef,
-    /// Embedding rows that stand in for the prompt tokens at their positions, and the sectioned
-    /// positions of a model that rotates at them: the sequence matches and registers no prefix.
-    pub(crate) rows: Option<&'a PromptRows>,
+    /// The values a front end produced for the inputs the model declares (embedding rows standing in
+    /// for prompt tokens, sectioned positions): the sequence matches and registers no prefix.
+    pub(crate) inputs: &'a RequestInputs,
 }
 
 /// The driver's serving surface as the loop uses it, plus the text services a request needs.
@@ -215,14 +215,14 @@ impl AdapterBook {
 
 /// A prepared [`Driver`] and the loaded model it serves.
 pub(crate) struct DriverEngine {
-    driver: Driver,
+    driver: Driver<Serving>,
     handle: Arc<ModelHandle>,
     view: EngineView,
     adapters: AdapterBook,
 }
 
 impl DriverEngine {
-    pub(crate) fn new(driver: Driver, handle: Arc<ModelHandle>, view: EngineView) -> Self {
+    pub(crate) fn new(driver: Driver<Serving>, handle: Arc<ModelHandle>, view: EngineView) -> Self {
         Self {
             driver,
             handle,
@@ -264,7 +264,7 @@ impl DriverEngine {
         if caps.heads.with_logits {
             heads.push(Head::Logits);
         }
-        self.driver.prepare(&ServingShapes {
+        self.driver.extend(&ServingShapes {
             layout,
             rows: &caps.row_counts,
             heads: &heads,
@@ -374,26 +374,11 @@ impl ServeEngine for DriverEngine {
             prompt,
             max_new,
             adapter,
-            rows,
+            inputs,
         } = request;
-        let seq = SeqRequest {
-            prompt,
-            max_new,
-            adapter,
-        };
-        let admission = match rows {
-            Some(PromptRows {
-                embeds,
-                mrope: Some(positions),
-            }) => self
-                .driver
-                .open_with_mrope(seq, embeds.clone(), positions.clone())?,
-            Some(PromptRows {
-                embeds,
-                mrope: None,
-            }) => self.driver.open_with_embeds(seq, embeds.clone())?,
-            None => self.driver.open(seq)?,
-        };
+        let admission = self
+            .driver
+            .open(SeqRequest::new(prompt, max_new, adapter).with_inputs(inputs.clone()))?;
         Ok(match admission {
             Admission::Opened { seq, reused } => Opening::Opened { seq, reused },
             Admission::NoRoom { needed_blocks } => Opening::NoRoom { needed_blocks },
@@ -407,10 +392,7 @@ impl ServeEngine for DriverEngine {
                 seq: row.seq,
                 work: match row.work {
                     Work::Prefill { upto } => RowWork::Prefill { upto },
-                    Work::Decode => RowWork::Decode {
-                        ahead: &[],
-                        pick: PickPolicy::Greedy,
-                    },
+                    Work::Decode => RowWork::Decode { ahead: &[] },
                 },
                 sampler: &mut *row.sampler,
             })
@@ -443,11 +425,16 @@ impl ServeEngine for DriverEngine {
     }
 
     fn encode(&mut self, rows: &[EncodeRow]) -> Result<Encoded, EngineError> {
+        let inputs: Vec<RequestInputs> = rows
+            .iter()
+            .map(|row| poot_llm::encoders::segment_inputs(&row.types))
+            .collect();
         let rows: Vec<poot_llm::driver::EncodeRow<'_>> = rows
             .iter()
-            .map(|row| poot_llm::driver::EncodeRow::Tokens {
-                ids: &row.ids,
-                types: &row.types,
+            .zip(&inputs)
+            .map(|(row, inputs)| poot_llm::driver::EncodeRow {
+                tokens: Some(&row.ids),
+                inputs,
             })
             .collect();
         Ok(self.driver.encode(&EncodeRequest { rows: &rows })?)
@@ -781,10 +768,7 @@ impl<E: ServeEngine> Scheduler<'_, E> {
                 prompt: front.prompt.tokens(),
                 max_new,
                 adapter: front.lora_adapter,
-                rows: match &front.prompt {
-                    PromptInput::Tokens(_) => None,
-                    PromptInput::Multimodal { rows, .. } => Some(rows),
-                },
+                inputs: &front.prompt.inputs,
             };
             match self.engine.open(request) {
                 Ok(Opening::Opened { seq, reused }) => {

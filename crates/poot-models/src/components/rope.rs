@@ -7,16 +7,39 @@
 //! positions.
 
 use poot_graph_ir::rope_table::{RopeFlavor, RopeSpec, RopeSpecError, RopeTable, rope_tables};
-use poot_graph_ir::{BinOp, Builder, Traced, UnOp, ops};
+use poot_graph_ir::{BinOp, Builder, Slot, SlotKey, Traced, UnOp, ops};
 
 use poot_quant::weights::WeightEntry;
 use poot_tensor::DType;
 
 use super::standard::ParamError;
+use crate::io::{InputId, Layout, PadValue, Per, RequestForm, RequestInput};
 use crate::model::TraceError;
 use crate::model::WiringError;
 use crate::model::last_axis;
 use crate::model::{ConfigReason, FamilyKey, ModelError};
+
+/// The request input carrying a prompt's sectioned rotary positions (`Slot::MropePosition`): three
+/// I32 axes (temporal, height, width) per token, axis-major `[3, rows * tokens]`. A request without it
+/// rotates every token at its own position on all three axes, which is plain RoPE.
+pub const MROPE: InputId = InputId::new("mrope");
+
+/// The schema entry of [`MROPE`]: dense three-axis positions, defaulted by the program that reads it.
+pub fn mrope_input() -> RequestInput {
+    RequestInput::new(
+        MROPE,
+        SlotKey::new(Slot::MropePosition, None),
+        RequestForm::new(
+            DType::I32,
+            Per::Token {
+                width: 3,
+                layout: Layout::AxisMajor,
+                presence: None,
+            },
+            PadValue::I32(0),
+        ),
+    )
+}
 
 /// Which dims a rotation pairs: the two halves of the rotary width (HF checkpoints), or adjacent
 /// even/odd dims (llama.cpp's GGUF Q/K rows, stored permuted for that layout). Both rotate the same
@@ -287,14 +310,14 @@ fn llama3_flavor_from_factors(
         Some(factors),
     );
     let decoded = rope_tables(rotary, LLAMA3_DECODE_POSITIONS, theta, &flavor, None);
-    let worst = stored
+    // `<=` is false for a NaN, so a NaN table entry is never within the tolerance.
+    let agrees = stored
         .cos
         .iter()
         .zip(&decoded.cos)
         .chain(stored.sin.iter().zip(&decoded.sin))
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    if worst > LLAMA3_DECODE_TOLERANCE {
+        .all(|(a, b)| (a - b).abs() <= LLAMA3_DECODE_TOLERANCE);
+    if !agrees {
         return Err(ConfigReason::Unsupported);
     }
     Ok(flavor)

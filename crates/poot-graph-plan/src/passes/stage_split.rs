@@ -658,7 +658,7 @@ mod tests {
     //! trace through `compile_staged` is poot-models' `staged_qwen2_oracle.rs`.
 
     use poot_eval::test_support::stage_chain::{bind_decode, bits, chain};
-    use poot_eval::{EvalBudget, EvalOptions, eval};
+    use poot_eval::{EvalOptions, eval};
 
     use crate::unit_helpers::{LAYERS, layered_decode};
 
@@ -677,8 +677,8 @@ mod tests {
         );
 
         let inputs = bind_decode(&graph);
-        let whole = eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-            .expect("the whole graph evaluates");
+        let whole =
+            eval(&graph, &inputs, EvalOptions::default()).expect("the whole graph evaluates");
         assert!(
             graph.state().next().is_some(),
             "a decode step carries its KV cache"

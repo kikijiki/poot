@@ -3,7 +3,7 @@
 //! graph, element by element and bit for bit, and plans every optimized equation on each backend.
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::analysis::dispatch_count;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, OpKind, UnOp};
@@ -41,12 +41,12 @@ fn inputs(g: &Graph) -> HashMap<ValueId, Value> {
 /// bit (a NaN never equals).
 fn assert_optimize_preserves(name: &str, raw: &Graph, optimized: &Graph) {
     let ins = inputs(raw);
-    let want = eval(raw, &ins, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let want = eval(raw, &ins, EvalOptions::default())
         .unwrap_or_else(|e| panic!("{name}: raw eval: {e}"))
         .output
         .into_host()
         .unwrap_or_else(|e| panic!("{name}: raw output not dense: {e}"));
-    let got = eval(optimized, &ins, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let got = eval(optimized, &ins, EvalOptions::default())
         .unwrap_or_else(|e| panic!("{name}: optimized eval: {e}"))
         .output
         .into_host()

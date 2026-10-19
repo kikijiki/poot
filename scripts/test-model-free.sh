@@ -61,7 +61,7 @@ readonly gate_policy=(
   "poot-kernel-intrinsics|host|"
   "poot-kernelgen|reviewed|"
   "poot-l0-runtime|host|"
-  "poot-npu|excluded|every test dispatches on the XDNA2 NPU and builds only with the xdna feature under nix develop .#npu"
+  "poot-npu|host|"
   "poot-llm|reviewed|"
   "poot-load|reviewed|"
   "poot-models|reviewed|"

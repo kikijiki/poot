@@ -1,8 +1,7 @@
-//! The idefics3 / SmolVLM vision tower behind [`Model`], a model whose only phase is
-//! [`Phase::Encode`]: a SigLIP encoder over image frames and the connector (pixel shuffle, then the
+//! The idefics3 / SmolVLM vision tower behind [`Model`], a model whose only program is `encode`: a SigLIP encoder over image frames and the connector (pixel shuffle, then the
 //! projection into the text tower's embedding width). One step is `rows` frames; each returns the
 //! `patches / scale^2` embedding rows the text tower takes in place of the prompt's `<image>`
-//! placeholders (`StepInput::TokensWithEmbeds`).
+//! placeholders ([`EMBEDS`](crate::components::embed::EMBEDS)).
 //!
 //! The checkpoint holds the tower beside the text tower (`model.text_model.`), which a second registry
 //! resolve builds as the `llama` family; this family reads its own rows (`model.vision_model.`,
@@ -15,10 +14,11 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use poot_graph_ir::{BinOp, Builder, Graph, Slot, TensorType, Traced};
+use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, TensorType, Traced};
 use poot_quant::weights::{
     AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
 };
+use poot_tensor::DType;
 
 use crate::architectures::bert::{Projection, bidirectional_attention};
 use crate::components::dims::{Field, Fields};
@@ -26,9 +26,13 @@ use crate::components::ffn::{Gelu, PlainMlpWeights, plain_mlp};
 use crate::components::linear::{Weight, WeightError, linear};
 use crate::components::norm::{NormKind, NormParams, NormWeights, norm_with};
 use crate::components::standard::LayerNorms;
+use crate::io::{
+    InputId, ModelSchema, PadValue, Per, Presence as RequestPresence, ProgramId, ProgramSpec,
+    RequestForm, RequestInput,
+};
 use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, ShapeReason,
-    StepShape, TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, ShapeReason, StepSpec,
+    TraceError,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
@@ -37,9 +41,11 @@ use poot_text::ChatFormat;
 /// The idefics3 vision tower's [`FamilyKey`]: a family of its own beside the text tower's.
 pub const FAMILY: FamilyKey = FamilyKey::new("idefics3_vision");
 
-/// The name of the `Slot::Activation` input holding the frames, `[rows, channels, size, size]` F32:
-/// normalized pixels, channel first.
-pub const PIXELS_SLOT: &str = "pixels";
+/// The request input holding a frame (or, for the windowed tower, a row of patches): normalized
+/// pixels, channel first. One tensor per encode row.
+pub const PIXELS: InputId = InputId::new("pixels");
+/// The `Slot::Activation` tag of [`PIXELS`]: `[rows, channels, size, size]` F32 for this tower.
+pub(super) const PIXELS_TAG: &str = "pixels";
 
 pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
     family: FAMILY,
@@ -245,6 +251,7 @@ pub struct Idefics3Vision {
     connector: Weight,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -286,6 +293,32 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
     };
     let (patch, patch_bias, positions, post_norm, connector) =
         build_rest().map_err(weight_error)?;
+    let frame = RequestInput::new(
+        PIXELS,
+        SlotKey::new(Slot::Activation, Some(PIXELS_TAG)),
+        RequestForm::new(
+            DType::F32,
+            Per::Row {
+                trailing: vec![p.channels, p.image_size, p.image_size],
+                padded: false,
+                valid: None,
+            },
+            PadValue::F32(0.0),
+        ),
+    );
+    let schema = ModelSchema::builder()
+        .input(frame)
+        .encode(
+            ProgramSpec::new(
+                ProgramId::ENCODE,
+                ModelOutput::Hidden {
+                    width: p.text_width,
+                },
+            )
+            .reading(PIXELS, RequestPresence::Required)
+            .with_positions(NonZeroUsize::new(p.patches()).expect("a tower has patches")),
+        )
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: 0,
@@ -293,9 +326,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: BTreeSet::new(),
         bos: None,
         prompt_bos: None,
-        output: ModelOutput::Hidden {
-            width: p.text_width,
-        },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -309,6 +339,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         connector,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -338,18 +369,17 @@ impl Model for Idefics3Vision {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        if phase != Phase::Encode {
-            return Err(TraceError::PhaseUnsupported {
-                family: FAMILY,
-                phase,
-            });
-        }
+        let shape = spec.shape;
         if shape.tokens.get() != p.patches() {
             return Err(TraceError::ShapeUnsupported {
                 family: FAMILY,
@@ -362,7 +392,7 @@ impl Model for Idefics3Vision {
         let grid = s / patch;
         let pixels = b.slot_named(
             Slot::Activation,
-            PIXELS_SLOT,
+            PIXELS_TAG,
             TensorType::f32(vec![rows, c, s, s]),
         )?;
         // The strided convolution as an im2col: each patch flattened in `[channel, i, j]` order, the
@@ -507,7 +537,8 @@ mod tests {
     use crate::architectures::bert::reference::{dense, layer_norm};
     use crate::components::standard::oracle::{self, assert_matches_f64};
     use crate::components::testing::{build as built, values};
-    use crate::model::{KvLayout, LogitRows};
+    use crate::io::ProgramId;
+    use crate::model::{LogitRows, StepShape, StepSpec};
 
     fn get(store: &WeightStore, name: &str) -> Vec<f64> {
         values(store.get(name).unwrap_or_else(|| panic!("{name}")))
@@ -643,14 +674,12 @@ mod tests {
     }
 
     fn encode_shape(rows: usize, patches: usize) -> StepShape {
-        StepShape {
-            rows: NonZeroUsize::new(rows).unwrap(),
-            tokens: NonZeroUsize::new(patches).unwrap(),
-            capacity: NonZeroUsize::new(patches).unwrap(),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::All,
-            hidden: None,
-        }
+        StepShape::new(
+            NonZeroUsize::new(rows).unwrap(),
+            NonZeroUsize::new(patches).unwrap(),
+            NonZeroUsize::new(patches).unwrap(),
+        )
+        .with_logits(LogitRows::All)
     }
 
     fn frames(rows: usize, seed: u64) -> Vec<f32> {
@@ -660,8 +689,7 @@ mod tests {
     fn run(model: &dyn Model, store: &WeightStore, rows: usize, pixels: &[f32]) -> Vec<f32> {
         let g = model
             .trace(
-                Phase::Encode,
-                encode_shape(rows, 16),
+                &StepSpec::encode(encode_shape(rows, 16)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -700,7 +728,7 @@ mod tests {
         assert_ne!(got[..out], got[out..], "two different frames embed alike");
     }
 
-    /// Anything but a frame of the tower's own patch count, and any phase but `Encode`, is a typed
+    /// Anything but a frame of the tower's own patch count, and any program but `encode`, is a typed
     /// refusal.
     #[test]
     fn a_shape_or_phase_it_cannot_trace_is_a_typed_refusal() {
@@ -708,20 +736,18 @@ mod tests {
         let model = built(&ENTRY, &fx.raw(), &fx.store);
         assert!(matches!(
             model.trace(
-                Phase::Encode,
-                encode_shape(1, 15),
+                &StepSpec::encode(encode_shape(1, 15)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
             model.trace(
-                Phase::Prefill,
-                encode_shape(1, 16),
+                &StepSpec::step(encode_shape(1, 16)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
-            Err(TraceError::PhaseUnsupported {
-                phase: Phase::Prefill,
+            Err(TraceError::ProgramUnsupported {
+                program: ProgramId::STEP,
                 ..
             })
         ));

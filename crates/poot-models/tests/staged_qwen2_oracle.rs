@@ -8,15 +8,13 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use poot_eval::test_support::stage_chain::{bind_decode, bits, chain};
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{Graph, Slot, ValueId};
 use poot_graph_plan::staged::{
     DeviceId, DevicePlacement, ExpertPlacement, Partition, StagedProgram, TargetSet, compile_staged,
 };
-use poot_graph_plan::{
-    CollectiveKind, CompileLimits, CompileOptions, LoraPlan, Target, production_plan::Submission,
-};
-use poot_models::model::{LogitRows, Phase};
+use poot_graph_plan::{CollectiveKind, CompileLimits, CompileOptions, LoraPlan, Target};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_quant::weights::LoraTarget;
 use poot_target::Backend;
@@ -38,8 +36,7 @@ fn qwen2_decode_rows(layers: usize, rows: usize) -> Graph {
         .f32_model()
         .model
         .trace(
-            Phase::Decode,
-            step(rows, 1, 6, LogitRows::Last),
+            &StepSpec::step(step(rows, 1, 6, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the qwen2 fixture traces a decode step")
@@ -57,7 +54,7 @@ fn target() -> Target {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 fn partition(devices: DevicePlacement) -> Partition {
@@ -92,12 +89,7 @@ fn stage_graphs(program: &StagedProgram) -> Vec<&Graph> {
 }
 
 fn uncut(g: &Graph, inputs: &HashMap<ValueId, Value>) -> poot_eval::Evaluation {
-    eval(
-        g,
-        inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-    )
-    .expect("the uncut graph evaluates")
+    eval(g, inputs, EvalOptions::default().keep_environment()).expect("the uncut graph evaluates")
 }
 
 /// SC-001 (oracle half): qwen2's decode step cut after layers 0 and 1, compiled stage by stage and
@@ -158,12 +150,8 @@ fn a_lora_graph_cut_across_stages_equals_the_unpartitioned_adapted_graph() {
         .iter()
         .map(|&id| (id, adapted_input(single_graph, id, &graph, &inputs)))
         .collect();
-    let one = eval(
-        single_graph,
-        &adapted_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .expect("the adapted graph evaluates");
+    let one = eval(single_graph, &adapted_inputs, EvalOptions::default())
+        .expect("the adapted graph evaluates");
 
     let chained = chain(single_graph, &stage_graphs(&cut), &adapted_inputs);
     assert_eq!(

@@ -59,9 +59,7 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
         .allocate(BufferRole::Output, BufferStorage::f32(), rows)
         .unwrap();
 
-    device
-        .begin(poot_graph_plan::production_plan::Submission::Replay)
-        .unwrap();
+    device.begin().unwrap();
     device
         .dispatch(poot_executor::Dispatch {
             kernel: &kernel,
@@ -83,7 +81,7 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
     let recording = device
         .finish()
         .unwrap()
-        .expect("Submission::Replay always returns a recording");
+        .expect("a device always returns a recording");
     device
         .replay(&recording)
         .expect("replay the rowsum_for dispatch");
@@ -148,9 +146,7 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
         .allocate(BufferRole::Output, BufferStorage::f32(), rows * d)
         .unwrap();
 
-    device
-        .begin(poot_graph_plan::production_plan::Submission::Replay)
-        .unwrap();
+    device.begin().unwrap();
     device
         .dispatch(poot_executor::Dispatch {
             kernel: &kernel,
@@ -182,7 +178,7 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
     let recording = device
         .finish()
         .unwrap()
-        .expect("Submission::Replay always returns a recording");
+        .expect("a device always returns a recording");
     device
         .replay(&recording)
         .expect("replay the rmsnorm_dyn dispatch");

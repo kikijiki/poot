@@ -20,31 +20,30 @@
 //! is verified in a window step of the policy's width; the row's result is the accepted drafts and
 //! one more token, and `commit(kept)` keeps a prefix of it like any other result.
 
-use std::collections::HashMap;
 use std::num::NonZeroU64;
 
 use poot_graph_ir::ForwardSlotMap;
 use poot_graph_ir::op::SampleRule;
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
-use poot_models::mrope::MropePositionIds;
+use poot_models::io::{InputError, InputSet, InputValue, ProgramId, RequestInputs, StepInput};
+use poot_models::model::{KvLayout, LogitRows, StepShape, TraceError};
 
+use super::bind::{Binder, RequestFrame, RowFeed, Side, StepColumns};
 use super::block_table::{BLOCK_SIZE, PagedKvCache, PoolExhausted};
-use super::caps::{Layout, PoolShape, StateResidency};
+use super::caps::StateResidency;
 use super::chunks::Piece;
-use super::embeds::PromptEmbeds;
-use super::error::{DriverError, EmbedsError, InvalidRequest, MropeError, PreparedSetRefusal};
+use super::error::{DriverError, InvalidRequest, PreparedSetRefusal, Unsupported};
 use super::lora::{AdapterRef, GenerationId};
-use super::mrope::rotary_position;
-use super::prefix_cache::{PrefixIdentity, PrefixOutcome, PrefixSkip};
+use super::prefix_cache::{PrefixOutcome, PrefixSkip};
+use super::sequences::{KvStore, Seq, Serving};
 use super::speculate::{
     self, DraftPolicy, NotSpeculated, PassTiming, Proposal, RowSpeculation, SpecRow, StepTime,
 };
 use super::suffix::{self, Head, SuffixRows};
-use super::{Driver, EntryKey, ModelRole, SlotRole, StepData, host_sample, window_wall};
+use super::{Driver, EntryKey, Feature, FeatureSet, ModelRole, Program, host_sample, window_wall};
 use crate::core::sampler::{Sampler, TokenLogprob};
 
 #[cfg(test)]
-mod mtp_tests;
+pub(super) mod mtp_tests;
 
 /// A driver-issued sequence id, never reused while the driver lives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -58,7 +57,7 @@ impl SeqId {
 }
 
 /// A sequence to admit.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SeqRequest<'a> {
     /// The prompt's token ids.
     pub prompt: &'a [u32],
@@ -67,6 +66,38 @@ pub struct SeqRequest<'a> {
     pub max_new: usize,
     /// The weights the sequence runs under: the base model or one adapter.
     pub adapter: AdapterRef,
+    /// The values the request supplies for inputs its model's `step` program reads (a multimodal
+    /// prompt's embedding rows, sectioned positions); empty for a plain token prompt. Checked against
+    /// the model's schema at admission, owned by the sequence, rebound on every step that carries them
+    /// and again if the sequence is recomputed.
+    pub inputs: RequestInputs,
+}
+
+impl<'a> SeqRequest<'a> {
+    /// The features of a request: what it asks of the driver beyond a token prompt, computed once at
+    /// admission and composed with the driver's own.
+    fn features_of(adapter: AdapterRef, inputs: &RequestInputs) -> FeatureSet {
+        FeatureSet::NONE
+            .with_if(adapter.generation().is_some(), Feature::Adapters)
+            .with_if(!inputs.is_empty(), Feature::RequestInputs)
+    }
+
+    /// A plain token prompt: no request inputs.
+    pub fn new(prompt: &'a [u32], max_new: usize, adapter: AdapterRef) -> Self {
+        Self {
+            prompt,
+            max_new,
+            adapter,
+            inputs: RequestInputs::none(),
+        }
+    }
+
+    /// This request supplying `inputs` beside its prompt.
+    #[must_use]
+    pub fn with_inputs(mut self, inputs: RequestInputs) -> Self {
+        self.inputs = inputs;
+        self
+    }
 }
 
 /// The outcome of [`Driver::open`].
@@ -98,27 +129,15 @@ pub enum RowWork<'a> {
         upto: usize,
     },
     /// Feed the sequence's last committed token followed by `ahead` (verify-window drafts), and pick
-    /// at every fed position: `ahead.len() + 1` tokens, the model's choice after each prefix, by
-    /// `pick`. With nothing ahead it is a plain decode step and the row's own sampler picks; under a
-    /// draft policy it is a speculative step, and the row returns the accepted drafts and one more
+    /// at every fed position: `ahead.len() + 1` tokens, the model's greedy choice after each prefix.
+    /// With nothing ahead it is a plain decode step and the row's own sampler picks; under a draft
+    /// policy it is a speculative step, and the row returns the accepted drafts and one more
     /// (`1..=k+1` tokens).
     Decode {
         /// Verify-window draft tokens to feed after the last committed token; empty for a plain
         /// decode.
         ahead: &'a [u32],
-        /// How each position of the window picks.
-        pick: PickPolicy,
     },
-}
-
-/// How a verify window picks at each of its positions. Only the greedy argmax is accepted today; a
-/// sampled window (speculative sampling's residual draws) is a further variant, so callers match
-/// with a wildcard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PickPolicy {
-    /// The argmax at every position.
-    Greedy,
 }
 
 /// One row of a step: a sequence, its work and the sampler its pick goes through.
@@ -153,104 +172,9 @@ pub struct RowResult {
 pub enum Release {
     /// The sequence is done and its state is dropped.
     Finished,
-    /// The sequence will be recomputed. One opened with `open_with_embeds` must be reopened with it.
+    /// The sequence will be recomputed: it registers no prefix. Its request inputs travel with the
+    /// request, so the caller reopens it through [`Driver::open`] like any other.
     Preempted,
-}
-
-/// One open sequence.
-#[derive(Debug)]
-pub(super) struct Seq {
-    /// The sequence's slot in the paged cache: its block table.
-    pub(super) slot: usize,
-    /// The prompt, then the committed generated tokens.
-    pub(super) tokens: Vec<u32>,
-    prompt_len: usize,
-    /// Prompt positions whose K/V is resident: reused at open, then advanced by prefill.
-    done: usize,
-    /// Positions the block table covers: the prompt and `max_new`.
-    reserved: usize,
-    pub(super) adapter: AdapterRef,
-    identity: PrefixIdentity,
-    seeded: bool,
-    /// The last step's picks, until `commit` takes them.
-    pub(super) pending: Vec<u32>,
-    /// The tokens of `pending` a recurrent state already holds: a verified row's result, whose kept
-    /// prefix the round folded (or replayed) into it. Zero for a row whose state folds nothing ahead.
-    folded: usize,
-    /// A commit kept fewer tokens than `folded`, so the recurrent state holds tokens the sequence
-    /// dropped. Only a release, or a resume that resets the row, ends it.
-    state_ahead: bool,
-    /// Rows the prompt supplies in place of its tokens' embeddings, bound on every prefill step
-    /// that covers one.
-    embeds: Option<PromptEmbeds>,
-    /// The sectioned rotary positions of the prompt, bound on every step; absent, every token
-    /// rotates at its text position.
-    mrope: Option<MropePositionIds>,
-}
-
-/// Where the open sequences keep their K/V.
-#[derive(Debug)]
-enum KvStore {
-    /// The one private cache of a single sequence: no block table, no prefix reuse.
-    Contiguous,
-    /// The shared paged pool.
-    Paged {
-        pool: PoolShape,
-        cache: PagedKvCache,
-    },
-}
-
-/// The KV store, the open sequences and their slots.
-#[derive(Debug)]
-pub(super) struct Serving {
-    kv: KvStore,
-    pub(super) seqs: HashMap<SeqId, Seq>,
-    pub(super) free_slots: Vec<usize>,
-    next_seq: u64,
-}
-
-impl Serving {
-    pub(super) fn new(layout: Layout) -> Self {
-        let (kv, max_seqs) = match layout {
-            Layout::Contiguous => (KvStore::Contiguous, 1),
-            Layout::Paged(pool) => (
-                KvStore::Paged {
-                    pool,
-                    cache: PagedKvCache::new(pool.max_seqs.get(), pool.blocks.get()),
-                },
-                pool.max_seqs.get(),
-            ),
-        };
-        Self {
-            kv,
-            seqs: HashMap::new(),
-            free_slots: (0..max_seqs).rev().collect(),
-            next_seq: 0,
-        }
-    }
-
-    /// The layout every entry this driver runs has.
-    pub(super) fn kv(&self) -> KvLayout {
-        match &self.kv {
-            KvStore::Contiguous => KvLayout::Contiguous,
-            KvStore::Paged { pool, .. } => pool.kv(),
-        }
-    }
-
-    /// Blocks free in the paged pool; `None` under the contiguous layout.
-    pub(super) fn free_blocks(&self) -> Option<usize> {
-        match &self.kv {
-            KvStore::Contiguous => None,
-            KvStore::Paged { cache, .. } => Some(cache.free_blocks()),
-        }
-    }
-
-    /// Drop the cached prefix blocks of an unloaded adapter generation.
-    pub(super) fn evict_identities(&mut self, identities: &[PrefixIdentity]) {
-        if let KvStore::Paged { cache, .. } = &mut self.kv {
-            cache.evict_identities(identities);
-        }
-    }
 }
 
 /// One row of a step, planned: what it feeds and where.
@@ -262,9 +186,6 @@ pub(super) struct RowPlan {
     pub(super) picks: usize,
     /// A prefill piece (as opposed to a decode token).
     pub(super) prefill: bool,
-    /// The piece covers a position the sequence's embedding rows replace: the step runs the
-    /// `PrefillEmbeds` entry.
-    pub(super) embeds: bool,
     /// Set for a decode row under a draft policy: what the policy proposed for it.
     pub(super) spec: Option<SpecRow>,
     /// Set for a decode row under a draft policy that cannot speculate on it: the sampler is one
@@ -392,39 +313,26 @@ impl Readback {
     }
 }
 
-/// The phase a serving entry traces: a single-token step is the decode step whether its rows decode or
-/// prefill their last prompt token (the graphs are the same), so a deployment that serves one-token
-/// steps prepares one entry per row count, not two.
-pub(super) fn serving_phase(tokens: usize, logits: LogitRows) -> Phase {
-    if tokens == 1 && logits == LogitRows::Last {
-        Phase::Decode
-    } else {
-        Phase::Prefill
-    }
-}
-
-impl Driver {
-    /// Admit `request`: reuse the cached prefix blocks its identity matches, reserve blocks for the
-    /// rest of the prompt and `max_new` tokens. A pool that cannot hold it, after dropping cached
-    /// prefixes nothing references, is [`Admission::NoRoom`].
+impl Driver<Serving> {
+    /// Admit `request`: check its inputs against the model's schema, reuse the cached prefix blocks its
+    /// identity matches, reserve blocks for the rest of the prompt and `max_new` tokens. A pool that
+    /// cannot hold it, after dropping cached prefixes nothing references, is [`Admission::NoRoom`].
+    ///
+    /// A sequence that carries request inputs reuses no cached prefix and registers none: the prefix
+    /// cache keys on tokens alone, which these values change the meaning of.
     pub fn open(&mut self, request: SeqRequest<'_>) -> Result<Admission, DriverError> {
-        self.open_seq(request, None, None)
-    }
-
-    fn open_seq(
-        &mut self,
-        request: SeqRequest<'_>,
-        embeds: Option<PromptEmbeds>,
-        mrope: Option<MropePositionIds>,
-    ) -> Result<Admission, DriverError> {
         let SeqRequest {
             prompt,
             max_new,
             adapter,
+            inputs,
         } = request;
         let reserved = self.check_admission(prompt, max_new)?;
-        let residency = self.residency;
-        let serving = self.serving.as_mut().ok_or(InvalidRequest::NotPrepared)?;
+        let features = SeqRequest::features_of(adapter, &inputs);
+        self.compose(features)?;
+        self.check_inputs(&inputs, prompt.len(), adapter)?;
+        let residency = self.ledger.residency;
+        let serving = &mut self.state;
         let Some(&slot) = serving.free_slots.last() else {
             return Ok(Admission::NoRoom { needed_blocks: 0 });
         };
@@ -433,9 +341,9 @@ impl Driver {
         let reused = match &mut serving.kv {
             KvStore::Contiguous => 0,
             KvStore::Paged { cache, .. } => {
-                // Embedding rows change what the same tokens mean: such a prompt reuses no cached prefix.
+                // Request inputs change what the same tokens mean: such a prompt reuses no cached prefix.
                 let admit = |cache: &mut PagedKvCache| {
-                    if embeds.is_some() {
+                    if !inputs.is_empty() {
                         cache
                             .admit_unshared(slot, prompt.len(), max_new)
                             .map(|()| 0)
@@ -467,15 +375,13 @@ impl Driver {
             // the slot and sequence are taken; a failure gives the lease and the blocks back.
             if let Err(error) = self.reset_row_state(slot) {
                 self.lora.release(adapter);
-                if let Some(KvStore::Paged { cache, .. }) =
-                    self.serving.as_mut().map(|serving| &mut serving.kv)
-                {
+                if let KvStore::Paged { cache, .. } = &mut self.state.kv {
                     cache.reset(slot);
                 }
                 return Err(error);
             }
         }
-        let serving = self.serving.as_mut().expect("checked above");
+        let serving = &mut self.state;
         serving.free_slots.pop();
         serving.next_seq += 1;
         let seq = SeqId(NonZeroU64::new(serving.next_seq).expect("the counter starts at one"));
@@ -493,23 +399,83 @@ impl Driver {
                 pending: Vec::new(),
                 folded: 0,
                 state_ahead: false,
-                embeds,
-                mrope,
+                inputs,
             },
         );
         self.speculation.open(seq, reused);
         Ok(Admission::Opened { seq, reused })
     }
 
+    /// Check a request's input values before it holds anything: they satisfy the model's schema for the
+    /// `step` program, and the prepared set binds every carriable input the request carries under the
+    /// request's weights ([`Driver::prepare_carried`]).
+    fn check_inputs(
+        &self,
+        inputs: &RequestInputs,
+        prompt: usize,
+        adapter: AdapterRef,
+    ) -> Result<(), DriverError> {
+        let schema = self.handle.model().schema();
+        let program = schema
+            .step()
+            .ok_or(Unsupported::Trace(TraceError::ProgramUnsupported {
+                family: self.handle.config().family,
+                program: ProgramId::STEP,
+            }))?;
+        schema
+            .check_request(program, inputs, prompt)
+            .map_err(InvalidRequest::Input)?;
+        let generation = adapter.generation();
+        for id in self.carriable_in(inputs) {
+            let index = schema
+                .index_of(id)
+                .expect("a carriable input is one the schema declares");
+            let entry = self
+                .ledger
+                .entries
+                .iter()
+                .find(|(key, _)| {
+                    key.role == ModelRole::Target
+                        && key.program == Program::Step
+                        && key.adapters == generation
+                        && key.carried.contains(index)
+                })
+                .map(|(_, entry)| entry)
+                .ok_or(InvalidRequest::InputNotPrepared { input: id })?;
+            // A per-row value is padded into the extent its program was traced at: a longer one has
+            // nowhere to go, and is refused here rather than at the bind.
+            if let Some(InputValue::Row(tensor)) = inputs.get(id) {
+                let slot = entry.slots.iter().find_map(|slot| match &slot.binder {
+                    Binder::Request(request) if request.is_value_of(id) => Some(&slot.shape),
+                    _ => None,
+                });
+                let held = slot.map(|shape| shape[1..].iter().product::<usize>());
+                if held.is_some_and(|held| tensor.numel() > held) {
+                    return Err(DriverError::from(InvalidRequest::Input(
+                        InputError::Support {
+                            id,
+                            what: "a per-row value is longer than the extent the program was traced at",
+                        },
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Zero slot `slot`'s row of every executable's state.
     fn reset_row_state(&mut self, slot: usize) -> Result<(), DriverError> {
         let scope = poot_executor::StateScope::Row(slot);
-        self.executor.reset_state(self.exe, scope.clone())?;
+        self.runtime
+            .executor
+            .reset_state(self.runtime.exe, scope.clone())?;
         if let Some(draft) = &self.speculation.draft {
-            self.executor.reset_state(draft.exe, scope.clone())?;
+            self.runtime
+                .executor
+                .reset_state(draft.exe, scope.clone())?;
         }
-        for &exe in self.adapter_exes.values() {
-            self.executor.reset_state(exe, scope.clone())?;
+        for &exe in self.runtime.adapter_exes.values() {
+            self.runtime.executor.reset_state(exe, scope.clone())?;
         }
         Ok(())
     }
@@ -530,20 +496,24 @@ impl Driver {
         max_new: usize,
     ) -> Result<usize, DriverError> {
         let reserved = self.check_admission(prompt, max_new)?;
-        let residency = self.residency;
-        let serving = self.serving.as_mut().ok_or(InvalidRequest::NotPrepared)?;
-        if !matches!(serving.kv, KvStore::Contiguous) {
-            return Err(InvalidRequest::ResumePaged.into());
-        }
+        let carries_inputs = self
+            .state
+            .seqs
+            .get(&seq)
+            .is_some_and(|state| !state.inputs.is_empty());
+        self.compose(
+            FeatureSet::NONE
+                .with(Feature::Resume)
+                .with_if(carries_inputs, Feature::RequestInputs),
+        )?;
+        let residency = self.ledger.residency;
+        let serving = &mut self.state;
         let state = serving
             .seqs
             .get_mut(&seq)
             .ok_or(InvalidRequest::UnknownSeq(seq))?;
         if !state.pending.is_empty() {
             return Err(InvalidRequest::UncommittedResult(seq).into());
-        }
-        if state.embeds.is_some() || state.mrope.is_some() {
-            return Err(InvalidRequest::ResumeEmbedded(seq).into());
         }
         // A decode step writes the K/V of the token it feeds, so the last committed token has none.
         let resident = state.done.max(state.tokens.len() - 1);
@@ -570,11 +540,7 @@ impl Driver {
             // reset leaves the sequence as it was.
             self.reset_row_state(slot)?;
         }
-        let state = self
-            .serving
-            .as_mut()
-            .and_then(|serving| serving.seqs.get_mut(&seq))
-            .expect("looked up above");
+        let state = self.state.seqs.get_mut(&seq).expect("looked up above");
         state.tokens = prompt.to_vec();
         state.prompt_len = prompt.len();
         state.done = reused;
@@ -587,92 +553,14 @@ impl Driver {
         Ok(reused)
     }
 
-    /// [`Driver::open`] for a prompt that supplies embedding rows in place of some tokens'
-    /// embeddings (`embeds`). Its prefill steps run the `PrefillEmbeds` entries
-    /// ([`Driver::prepare_embeds`]); decode steps are ordinary. Under the paged layout the prompt
-    /// reuses no cached prefix and registers none: the prefix cache keys on tokens alone, which these
-    /// rows change the meaning of. An adapter sequence is refused (only the base weights have
-    /// `PrefillEmbeds` entries), and so is any sequence under a draft-model policy (the draft prefills
-    /// over placeholder tokens); prompt lookup speculates on the tokens and is fine. A preempted
-    /// embeds sequence is recomputed: reopen it with this method, not [`Driver::open`], or its
-    /// prefill would run over the placeholders.
-    pub fn open_with_embeds(
-        &mut self,
-        request: SeqRequest<'_>,
-        embeds: PromptEmbeds,
-    ) -> Result<Admission, DriverError> {
-        self.open_embedded(request, embeds, None)
-    }
-
-    /// [`Driver::open_with_embeds`] for a model that rotates at sectioned positions
-    /// (`Slot::MropePosition`, Qwen2.5-VL's text tower): the prompt's image tokens do not sit at their
-    /// index, so `positions` (the processor's, one entry per prompt token) says where every token of
-    /// the prompt rotates, and generated tokens continue from where it ends. A preempted sequence is
-    /// reopened with the same positions. A model without sectioned positions refuses the sequence here.
-    pub fn open_with_mrope(
-        &mut self,
-        request: SeqRequest<'_>,
-        embeds: PromptEmbeds,
-        positions: MropePositionIds,
-    ) -> Result<Admission, DriverError> {
-        if positions.len() != request.prompt.len() {
-            return Err(InvalidRequest::Mrope(MropeError::Length {
-                positions: positions.len(),
-                prompt: request.prompt.len(),
-            })
-            .into());
-        }
-        self.open_embedded(request, embeds, Some(positions))
-    }
-
-    fn open_embedded(
-        &mut self,
-        request: SeqRequest<'_>,
-        embeds: PromptEmbeds,
-        mrope: Option<MropePositionIds>,
-    ) -> Result<Admission, DriverError> {
-        if self.serving.is_none() {
-            return Err(InvalidRequest::NotPrepared.into());
-        }
-        if request.adapter != AdapterRef::Base {
-            return Err(InvalidRequest::Embeds(EmbedsError::Adapter).into());
-        }
-        if matches!(self.speculation.policy, DraftPolicy::DraftModel { .. }) {
-            return Err(InvalidRequest::Embeds(EmbedsError::DraftModel).into());
-        }
-        if matches!(self.speculation.policy, DraftPolicy::Mtp { .. }) {
-            return Err(InvalidRequest::Embeds(EmbedsError::Mtp).into());
-        }
-        embeds
-            .check_prompt(request.prompt.len())
-            .map_err(InvalidRequest::Embeds)?;
-        // The prepared entries say whether the model takes sectioned positions: refuse before the
-        // sequence holds a slot or blocks.
-        if mrope.is_some()
-            && !self.entries.iter().any(|(key, entry)| {
-                key.role == ModelRole::Target
-                    && entry
-                        .slots
-                        .iter()
-                        .any(|spec| spec.role == SlotRole::MropePosition)
-            })
-        {
-            return Err(InvalidRequest::Mrope(MropeError::NotSectioned).into());
-        }
-        self.open_seq(request, Some(embeds), mrope)
-    }
-
     /// Run one step over `rows`. Each row's sampler picks its token: the suffix entry when every
     /// picking row shares a suffix-expressible rule, otherwise the logits entry and the host path.
     /// The picks are not part of any sequence until [`Driver::commit`].
     pub fn step(&mut self, rows: &mut [StepRow<'_>]) -> Result<Vec<RowResult>, DriverError> {
-        if self.serving.is_none() {
-            return Err(InvalidRequest::NotPrepared.into());
-        }
         if rows.is_empty() {
             return Err(InvalidRequest::EmptyStep.into());
         }
-        let max_rows = self.caps.as_ref().map_or(0, |caps| caps.rows.get());
+        let max_rows = self.ledger.caps.as_ref().map_or(0, |caps| caps.rows.get());
         if rows.len() > max_rows {
             return Err(InvalidRequest::TooManyRows {
                 rows: rows.len(),
@@ -682,7 +570,7 @@ impl Driver {
         }
         let mut plans = self.plan_rows(rows)?;
         self.propose(rows, &mut plans)?;
-        let serving = self.serving.as_ref().expect("checked above");
+        let serving = &self.state;
         for row in rows.iter_mut() {
             let seq = &serving.seqs[&row.seq];
             if !seq.seeded {
@@ -748,8 +636,8 @@ impl Driver {
         }
         self.mirror_prefill(rows, &plans)?;
 
-        let recurrent = self.residency == StateResidency::Recurrent;
-        let serving = self.serving.as_mut().expect("checked above");
+        let recurrent = self.ledger.residency == StateResidency::Recurrent;
+        let serving = &mut self.state;
         let mut results = Vec::with_capacity(rows.len());
         let mut settled = Vec::new();
         for ((row, plan), tokens) in rows.iter_mut().zip(&plans).zip(picked) {
@@ -827,7 +715,7 @@ impl Driver {
                 .map(|plan| plan.feed.len())
                 .max()
                 .unwrap_or(1);
-            let embeds = group_plans.iter().any(|plan| plan.embeds);
+            let carried = self.carried_by(&group_lanes, &group_plans);
             let window = group_plans.iter().any(|plan| plan.picks > 1);
             let verifies = group_plans.iter().any(|plan| !plan.drafts().is_empty());
             let ran = self
@@ -835,7 +723,7 @@ impl Driver {
                     ModelRole::Target,
                     group.len(),
                     tokens,
-                    (window, embeds),
+                    (window, carried),
                     head,
                     adapter,
                 )
@@ -877,7 +765,7 @@ impl Driver {
         plans: &[RowPlan],
         key: EntryKey,
     ) -> Result<Readback, DriverError> {
-        let entry = self.entries[&key].clone();
+        let entry = self.ledger.entries[&key].clone();
         let StepShape {
             rows: entry_rows,
             tokens: width,
@@ -886,72 +774,38 @@ impl Driver {
             ..
         } = key.shape;
         let (entry_rows, width, capacity) = (entry_rows.get(), width.get(), capacity.get());
-        let mut data = StepData {
+        let mut columns = StepColumns {
             tokens: vec![0; entry_rows * width],
             pos: vec![0; entry_rows * width],
+            real: vec![0; entry_rows * width],
             lora: vec![0; entry_rows],
-            ..StepData::default()
+            ..StepColumns::default()
         };
         // The forward write maps, one entry per flat token (KV) and per step row (recurrent state): -1
         // writes nothing, so padding and masked rows leave the pool alone.
         let mut kv_write = Vec::new();
         if let KvLayout::Paged { .. } = kv {
-            data.read = vec![0; entry_rows * capacity];
+            columns.kv_read = vec![0; entry_rows * capacity];
             kv_write = vec![ForwardSlotMap::PADDING; entry_rows * width];
         }
         // A recurrent state pool: masked rows read pool row 0 and write nothing.
         let pools_state = entry
             .slots
             .iter()
-            .any(|spec| spec.role == SlotRole::StateWrite);
+            .any(|spec| matches!(spec.binder, Binder::Step(StepInput::StateWriteRows)));
         let mut state_write = Vec::new();
         if pools_state {
-            data.state_read = vec![0; entry_rows];
+            columns.state_read = vec![0; entry_rows];
             state_write = vec![ForwardSlotMap::PADDING; entry_rows];
         }
-        let hidden = if key.phase == Phase::PrefillEmbeds {
-            let spec = entry
-                .slots
-                .iter()
-                .find(|spec| spec.role == SlotRole::Embeds)
-                .expect("a PrefillEmbeds program declares its embedding rows");
-            data.embeds = vec![0.0; spec.shape.iter().product()];
-            data.embeds_at = vec![0; entry_rows * width];
-            spec.shape[2]
-        } else {
-            0
-        };
-        let serving = self.serving.as_ref().expect("a step is served");
-        let supplies = lanes
-            .iter()
-            .any(|lane| serving.seqs[&lane.seq].mrope.is_some());
-        // Axis-major `[3, entry_rows * width]`; a row without positions of its own, and the padding,
-        // rotate at their text positions like `Slot::Pos`.
-        let mut mrope = supplies.then(|| vec![0; 3 * entry_rows * width]);
+        let serving = &self.state;
         for (i, (lane, plan)) in lanes.iter().zip(plans).enumerate() {
             let seq = &serving.seqs[&lane.seq];
             let n = plan.feed.len();
-            if let Some(embeds) = seq.embeds.as_ref().filter(|_| plan.embeds) {
-                if embeds.width() != hidden {
-                    return Err(InvalidRequest::Embeds(EmbedsError::Width {
-                        got: embeds.width(),
-                        want: hidden,
-                    })
-                    .into());
-                }
-                for j in 0..n {
-                    // Left padding: the piece's tokens are the last `n` columns of the step.
-                    if let Some(row) = embeds.row_at(plan.start + j) {
-                        let column = i * width + (width - n) + j;
-                        data.embeds[column * hidden..(column + 1) * hidden].copy_from_slice(row);
-                        data.embeds_at[column] = 1;
-                    }
-                }
-            }
             let map = match &serving.kv {
                 KvStore::Paged { cache, .. } => {
                     let map = cache.slot_mapping(seq.slot, capacity);
-                    data.read[i * capacity..(i + 1) * capacity]
+                    columns.kv_read[i * capacity..(i + 1) * capacity]
                         .iter_mut()
                         .zip(&map)
                         .for_each(|(dst, &slot)| *dst = slot as i32);
@@ -960,10 +814,10 @@ impl Driver {
                 KvStore::Contiguous => None,
             };
             if pools_state {
-                data.state_read[i] = seq.slot as i32;
+                columns.state_read[i] = seq.slot as i32;
                 state_write[i] = seq.slot as i32;
             }
-            data.lora[i] = seq.adapter.row_value();
+            columns.lora[i] = seq.adapter.row_value();
             for k in 0..width {
                 // Left padding: the row's real tokens are the last `n` of the step's width.
                 let real = k.checked_sub(width - n);
@@ -971,43 +825,30 @@ impl Driver {
                 match real {
                     Some(j) => {
                         let position = plan.start + j;
-                        data.tokens[at] = plan.feed[j] as i32;
-                        data.pos[at] = position as i32;
-                        if let Some(mrope) = &mut mrope {
-                            let axes = seq
-                                .mrope
-                                .as_ref()
-                                .map_or([position as i32; 3], |ids| rotary_position(ids, position));
-                            for (axis, value) in axes.into_iter().enumerate() {
-                                mrope[axis * entry_rows * width + at] = value;
-                            }
-                        }
+                        columns.tokens[at] = plan.feed[j] as i32;
+                        columns.pos[at] = position as i32;
+                        columns.real[at] = 1;
                         if let Some(map) = &map
                             && position < seq.reserved
                         {
                             kv_write[at] = map[position] as i32;
                         }
                     }
-                    None => {
-                        data.pos[at] = plan.start as i32;
-                        if let Some(mrope) = &mut mrope {
-                            let axes = seq.mrope.as_ref().map_or([plan.start as i32; 3], |ids| {
-                                rotary_position(ids, plan.start)
-                            });
-                            for (axis, value) in axes.into_iter().enumerate() {
-                                mrope[axis * entry_rows * width + at] = value;
-                            }
-                        }
-                    }
+                    None => columns.pos[at] = plan.start as i32,
                 }
             }
         }
-        data.mrope = mrope;
+        // The request values the lanes' sequences carry, held apart from the pool so the step can
+        // borrow the driver mutably while it binds them.
+        let owned: Vec<RequestInputs> = lanes
+            .iter()
+            .map(|lane| serving.seqs[&lane.seq].inputs.clone())
+            .collect();
         // Each pool slot has one owner: a block table that handed two tokens one slot is refused here.
         if let KvLayout::Paged { pool_slots, seqs } = kv {
-            data.write = ForwardSlotMap::new(kv_write, pool_slots.get())?;
+            columns.kv_write = ForwardSlotMap::new(kv_write, pool_slots.get())?;
             if pools_state {
-                data.state_write = ForwardSlotMap::new(state_write, seqs.get())?;
+                columns.state_write = ForwardSlotMap::new(state_write, seqs.get())?;
             }
         }
         // Sampler inputs of a non-greedy suffix: one row each, placeholders for rows that do not pick
@@ -1038,10 +879,25 @@ impl Driver {
                     top_k.push(top_k[0]);
                 }
             }
-            (data.seed, data.params, data.top_k) = (seed, params, top_k);
+            (columns.seed, columns.params, columns.top_k) = (seed, params, top_k);
         }
 
-        let mut outputs = self.execute(&entry, &data)?;
+        let feeds: Vec<RowFeed<'_>> = owned
+            .iter()
+            .zip(plans)
+            .map(|(inputs, plan)| RowFeed {
+                inputs,
+                start: plan.start,
+                fed: plan.feed.len(),
+            })
+            .collect();
+        let frame = RequestFrame {
+            rows: entry_rows,
+            tokens: width,
+            side: Side::Left,
+            feeds: &feeds,
+        };
+        let mut outputs = self.execute(&entry, &columns, &frame)?;
         let positions = match key.shape.logits {
             LogitRows::Last => 1,
             LogitRows::All => width,
@@ -1089,10 +945,11 @@ impl Driver {
         account: fn(&mut PassTiming) -> &mut StepTime,
         pass: impl FnOnce(&mut Self) -> Result<T, DriverError>,
     ) -> Result<T, DriverError> {
-        let started = (self.time_phases && counts).then(|| self.executor.stats().timing.mark());
+        let started = (self.settings.time_phases && counts)
+            .then(|| self.runtime.executor.stats().timing.mark());
         let result = pass(self)?;
         if let Some(started) = started {
-            let wall = window_wall(&self.executor.stats().timing, &started);
+            let wall = window_wall(&self.runtime.executor.stats().timing, &started);
             let tally = account(&mut self.stats.passes);
             tally.steps += 1;
             tally.wall += wall;
@@ -1110,7 +967,7 @@ impl Driver {
         kept: usize,
         sampler: &mut Sampler,
     ) -> Result<(), DriverError> {
-        let serving = self.serving.as_mut().ok_or(InvalidRequest::NotPrepared)?;
+        let serving = &mut self.state;
         let state = serving
             .seqs
             .get_mut(&seq)
@@ -1139,9 +996,9 @@ impl Driver {
     /// speculates with an MTP layer (its cache at a block's last position depends on the token after
     /// the block, and a shared block cannot be rewritten).
     pub fn release(&mut self, seq: SeqId, mode: Release) -> Result<PrefixOutcome, DriverError> {
-        let residency = self.residency;
+        let residency = self.ledger.residency;
         let mtp = matches!(self.speculation.policy, DraftPolicy::Mtp { .. });
-        let serving = self.serving.as_mut().ok_or(InvalidRequest::NotPrepared)?;
+        let serving = &mut self.state;
         let state = serving
             .seqs
             .remove(&seq)
@@ -1155,9 +1012,9 @@ impl Driver {
                 } else if mtp {
                     cache.reset(state.slot);
                     PrefixOutcome::Skipped(PrefixSkip::MtpState)
-                } else if state.embeds.is_some() {
+                } else if !state.inputs.is_empty() {
                     cache.reset(state.slot);
-                    PrefixOutcome::Skipped(PrefixSkip::PromptEmbeds)
+                    PrefixOutcome::Skipped(PrefixSkip::RequestInputs)
                 } else if mode == Release::Preempted {
                     cache.reset(state.slot);
                     PrefixOutcome::Skipped(PrefixSkip::Preempted)
@@ -1182,8 +1039,8 @@ impl Driver {
 
     /// Plan what each row feeds and picks, refusing a row the sequence's state cannot take.
     fn plan_rows(&self, rows: &[StepRow<'_>]) -> Result<Vec<RowPlan>, DriverError> {
-        let serving = self.serving.as_ref().expect("checked by the caller");
-        let capacity = self.options.capacity.get();
+        let serving = &self.state;
+        let capacity = self.settings.options.capacity.get();
         let granule = self.handle.config().prefill_granule.get();
         let mut seen = Vec::with_capacity(rows.len());
         let mut plans = Vec::with_capacity(rows.len());
@@ -1216,7 +1073,7 @@ impl Driver {
                     // A piece starts at and is sized in multiples of the granule; until the start is
                     // aligned (a reused prefix need not be) the row advances one token at a time.
                     let n = if seq.done.is_multiple_of(granule) {
-                        match self.chunks.plan(upto - seq.done).first() {
+                        match self.settings.chunks.plan(upto - seq.done).first() {
                             Some(Piece::Prefill(n)) => n.get(),
                             _ => 1,
                         }
@@ -1228,16 +1085,11 @@ impl Driver {
                         start: seq.done,
                         picks: usize::from(seq.done + n == seq.prompt_len),
                         prefill: true,
-                        embeds: seq
-                            .embeds
-                            .as_ref()
-                            .is_some_and(|embeds| embeds.covers(seq.done, seq.done + n)),
                         spec: None,
                         not_speculated: None,
                     }
                 }
-                RowWork::Decode { ahead, pick } => {
-                    let PickPolicy::Greedy = pick;
+                RowWork::Decode { ahead } => {
                     if seq.done < seq.prompt_len || seq.tokens.len() == seq.prompt_len {
                         return Err(InvalidRequest::DecodeBeforePrefill(row.seq).into());
                     }
@@ -1263,6 +1115,9 @@ impl Driver {
                     // sampler is one the window verifies; any other row decodes one token.
                     let (spec, not_speculated) = match self.speculation.policy.caps() {
                         Some(_) if !ahead.is_empty() => (None, None),
+                        Some(_) if !self.drafts_for(&seq.inputs) => {
+                            (None, Some(NotSpeculated::Inputs))
+                        }
                         Some(_) if !speculate::speculation_sampler_ok(row.sampler) => {
                             (None, Some(NotSpeculated::Sampler))
                         }
@@ -1287,7 +1142,6 @@ impl Driver {
                         feed,
                         start,
                         prefill: false,
-                        embeds: false,
                         spec,
                         not_speculated,
                     }
@@ -1331,7 +1185,8 @@ impl Driver {
         // No row picks: the output is unread, so any prepared head of the shape serves. A rule the
         // prepared set has no suffix entry for picks on the host from the logits head, as `HeadSet` says.
         let prepared = |rule| {
-            self.caps
+            self.ledger
+                .caps
                 .as_ref()
                 .is_some_and(|caps| caps.heads.suffix.contains(&rule))
         };
@@ -1351,30 +1206,30 @@ impl Driver {
         role: ModelRole,
         live: usize,
         width: usize,
-        (window, embeds): (bool, bool),
+        (window, carried): (bool, InputSet),
         head: Option<Head>,
         adapters: Option<super::lora::GenerationId>,
     ) -> Result<EntryKey, DriverError> {
-        let serving = self.serving.as_ref().expect("checked by the caller");
+        let serving = &self.state;
         let logits = if window {
             LogitRows::All
         } else {
             LogitRows::Last
         };
-        let phase = if role == ModelRole::Mtp {
-            Phase::Mtp
-        } else if embeds {
-            Phase::PrefillEmbeds
+        let program = if role == ModelRole::Mtp {
+            Program::Draft
         } else {
-            serving_phase(width, logits)
+            Program::Step
         };
         let kv = serving.kv();
         let mut candidates: Vec<EntryKey> = self
+            .ledger
             .entries
             .keys()
             .filter(|key| {
                 key.role == role
-                    && key.phase == phase
+                    && key.program == program
+                    && key.carried == carried
                     && head.is_none_or(|head| key.head == head)
                     && key.adapters == adapters
                     && key.shape.tokens.get() == width
@@ -1394,15 +1249,15 @@ impl Driver {
         });
         candidates.first().copied().ok_or_else(|| {
             PreparedSetRefusal::NotAdmitted {
-                phase,
-                shape: StepShape {
-                    rows: std::num::NonZeroUsize::new(live).expect("a step has a row"),
-                    tokens: std::num::NonZeroUsize::new(width).expect("a step has a token"),
-                    capacity: self.options.capacity,
-                    kv,
-                    logits,
-                    hidden: self.hidden_of(role),
-                },
+                program,
+                shape: StepShape::new(
+                    std::num::NonZeroUsize::new(live).expect("a step has a row"),
+                    std::num::NonZeroUsize::new(width).expect("a step has a token"),
+                    self.settings.options.capacity,
+                )
+                .with_kv(kv)
+                .with_logits(logits)
+                .with_hidden(self.hidden_of(role)),
                 head: head.unwrap_or(Head::GREEDY),
                 adapters,
             }

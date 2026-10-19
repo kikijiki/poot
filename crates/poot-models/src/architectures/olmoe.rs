@@ -17,12 +17,10 @@ use crate::components::moe::{self, MoeParams, MoeWeights};
 use crate::components::router::RouterKind;
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    decoder_program, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::ModelSchema;
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
 use crate::names::{
     ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
@@ -180,6 +178,7 @@ pub(crate) struct Olmoe {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -213,6 +212,9 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -220,7 +222,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -230,6 +231,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -238,13 +240,18 @@ impl Model for Olmoe {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
@@ -328,7 +335,7 @@ pub(crate) mod moe_support {
         CAP, build, close, close_all, declared_dtype, decoded, gguf_tensor, q8_0_store,
         read_back_owned, step_shape,
     };
-    use crate::model::{LogitRows, Phase};
+    use crate::model::{LogitRows, StepSpec};
     use crate::registry::{FamilyEntry, Fixture};
 
     /// SC-004's HF half for a routed family: the BF16 `fixture` store and its Q8_0 copy (each tensor
@@ -351,8 +358,7 @@ pub(crate) mod moe_support {
             let model = build(entry, &raw, &store);
             let g = model
                 .trace(
-                    Phase::Prefill,
-                    step_shape(prompt.len(), CAP, LogitRows::All),
+                    &StepSpec::step(step_shape(prompt.len(), CAP, LogitRows::All)),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
@@ -414,28 +420,12 @@ pub(crate) mod moe_support {
 
             let reference_store = decoded(&store);
             let reference = build(entry, &raw, &reference_store);
-            let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-            let (want, want_state) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Prefill,
-                CAP,
-                &prompt,
-                0,
-                &[],
-            );
+            let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+            let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
             close(&got, &want);
             close_all(&state, &want_state);
-            let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-            let (want, _) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Decode,
-                CAP,
-                &[5],
-                4,
-                &want_state,
-            );
+            let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+            let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
             close(&got, &want);
         }
     }
@@ -483,9 +473,7 @@ pub(crate) mod moe_support {
 #[cfg(test)]
 mod family_tests {
     use poot_graph_ir::OpKind;
-    use poot_graph_plan::{
-        CompileLimits, CompileOptions, Plan, Target, compile, production_plan::Submission,
-    };
+    use poot_graph_plan::{CompileLimits, CompileOptions, Plan, Target, compile};
     use poot_load::gguf::GgufValue;
     use poot_quant::weights::{MoeRole, WeightRole};
     use poot_target::{AmdArch, Backend, DeviceCaps};
@@ -500,7 +488,7 @@ mod family_tests {
         CAP, assert_chunked_prefill_equals_decode, assert_missing_weight_is_named, build as built,
         close, decoded, q8_0_store, step_shape,
     };
-    use crate::model::{KvLayout, LogitRows};
+    use crate::model::LogitRows;
     use crate::registry::Registry;
     use poot_quant::weights::WeightKey;
 
@@ -558,16 +546,7 @@ mod family_tests {
             let mut config = fx.config.clone();
             config["norm_topk_prob"] = json!(norm);
             let model = model_of(&config, &fx.store);
-            run_step(
-                &*model,
-                &fx.store,
-                Phase::Prefill,
-                CAP,
-                &[3, 17, 40],
-                0,
-                &[],
-            )
-            .0
+            run_step(&*model, &fx.store, CAP, &[3, 17, 40], 0, &[]).0
         };
         assert_ne!(run(true), run(false));
     }
@@ -639,15 +618,10 @@ mod family_tests {
     }
 
     fn assert_no_expert_transpose(model: &dyn Model) {
-        let shape = StepShape {
-            logits: LogitRows::Last,
-            kv: KvLayout::Contiguous,
-            ..step_shape(1, CAP, LogitRows::Last)
-        };
+        let shape = step_shape(1, CAP, LogitRows::Last);
         let graph = model
             .trace(
-                Phase::Decode,
-                shape,
+                &StepSpec::step(shape),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -669,7 +643,7 @@ mod family_tests {
                     Backend::AmdGcn(_) => DeviceCaps::rocm_default(),
                 },
             };
-            let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+            let options = CompileOptions::new(CompileLimits::STANDARD);
             let program = compile(&graph, &target, &options).unwrap();
             let launched: Vec<String> = program
                 .planned()
@@ -778,27 +752,11 @@ mod family_tests {
             }
             let reference = model_of(&fixture_config(), &reference_store);
             let prompt = [3, 17, 40, 8];
-            let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-            let (want, want_state) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Prefill,
-                CAP,
-                &prompt,
-                0,
-                &[],
-            );
+            let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+            let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
             close(&got, &want);
-            let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-            let (want, _) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Decode,
-                CAP,
-                &[5],
-                4,
-                &want_state,
-            );
+            let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+            let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
             close(&got, &want);
         }
     }

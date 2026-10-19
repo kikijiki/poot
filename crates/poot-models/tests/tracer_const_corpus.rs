@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use poot_graph_ir::{Graph, Storage};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 
 const LAYERS: usize = 2;
@@ -32,7 +32,7 @@ struct Row {
 }
 
 /// A dense family at the corpus dimensions, traced through `Model::trace` at `shape`.
-fn dense_trace(family: Family, phase: Phase, shape: poot_models::model::StepShape) -> Graph {
+fn dense_trace(family: Family, spec: StepSpec) -> Graph {
     let mut dense = Dense::new(family)
         .vocab(24)
         .dims(16, 16, LAYERS)
@@ -45,12 +45,12 @@ fn dense_trace(family: Family, phase: Phase, shape: poot_models::model::StepShap
     dense
         .f32_model()
         .model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(&spec, poot_graph_ir::TraceLimits::for_tests())
         .unwrap_or_else(|e| panic!("{family:?}: {e}"))
 }
 
 /// `family`'s registry fixture, traced through `Model::trace` at `shape`.
-fn registered_trace(family: &str, phase: Phase, shape: poot_models::model::StepShape) -> Graph {
+fn registered_trace(family: &str, spec: StepSpec) -> Graph {
     let registry = poot_models::registry::Registry::builtin().expect("the builtin registry");
     let entry = registry
         .entries()
@@ -61,7 +61,7 @@ fn registered_trace(family: &str, phase: Phase, shape: poot_models::model::StepS
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     // A routed family declares router witnesses; the corpus counts consts, which they do not touch.
     let traced = model
-        .trace(phase, shape, poot_graph_ir::TraceLimits::for_tests())
+        .trace(&spec, poot_graph_ir::TraceLimits::for_tests())
         .expect("the fixture traces");
     let mut plain = poot_graph_ir::GraphEdit::new();
     *plain.values_mut() = traced.values().clone();
@@ -85,8 +85,7 @@ fn corpus() -> Vec<Row> {
             build: |_, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    Phase::Decode,
-                    step(1, 1, cap, LogitRows::Last),
+                    StepSpec::step(step(1, 1, cap, LogitRows::Last)),
                 )
             },
         },
@@ -95,8 +94,7 @@ fn corpus() -> Vec<Row> {
             build: |_, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    Phase::Decode,
-                    step(2, 1, cap, LogitRows::Last),
+                    StepSpec::step(step(2, 1, cap, LogitRows::Last)),
                 )
             },
         },
@@ -105,8 +103,7 @@ fn corpus() -> Vec<Row> {
             build: |_, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    Phase::Decode,
-                    paged_step(2, 1, cap, 2 * cap, LogitRows::Last),
+                    StepSpec::step(paged_step(2, 1, cap, 2 * cap, LogitRows::Last)),
                 )
             },
         },
@@ -115,8 +112,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    Phase::Prefill,
-                    step(1, prompt, cap, LogitRows::All),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::All)),
                 )
             },
         },
@@ -125,8 +121,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    Phase::Prefill,
-                    paged_step(1, prompt, cap, cap, LogitRows::Last),
+                    StepSpec::step(paged_step(1, prompt, cap, cap, LogitRows::Last)),
                 )
             },
         },
@@ -135,8 +130,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    Phase::Prefill,
-                    paged_step(2, prompt, cap, 2 * cap, LogitRows::Last),
+                    StepSpec::step(paged_step(2, prompt, cap, 2 * cap, LogitRows::Last)),
                 )
             },
         },
@@ -145,8 +139,8 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Qwen2,
-                    Phase::PrefillEmbeds,
-                    step(1, prompt, cap, LogitRows::Last),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::Last))
+                        .carrying(poot_models::components::embed::EMBEDS),
                 )
             },
         },
@@ -155,8 +149,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Qwen3,
-                    Phase::Prefill,
-                    step(1, prompt, cap, LogitRows::All),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::All)),
                 )
             },
         },
@@ -165,8 +158,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Olmo2,
-                    Phase::Prefill,
-                    step(1, prompt, cap, LogitRows::All),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::All)),
                 )
             },
         },
@@ -175,8 +167,7 @@ fn corpus() -> Vec<Row> {
             build: |_, cap| {
                 dense_trace(
                     Family::Olmo2,
-                    Phase::Decode,
-                    step(1, 1, cap, LogitRows::Last),
+                    StepSpec::step(step(1, 1, cap, LogitRows::Last)),
                 )
             },
         },
@@ -185,8 +176,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Gemma3,
-                    Phase::Prefill,
-                    step(1, prompt, cap, LogitRows::All),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::All)),
                 )
             },
         },
@@ -195,8 +185,7 @@ fn corpus() -> Vec<Row> {
             build: |_, cap| {
                 dense_trace(
                     Family::Gemma3,
-                    Phase::Decode,
-                    step(1, 1, cap, LogitRows::Last),
+                    StepSpec::step(step(1, 1, cap, LogitRows::Last)),
                 )
             },
         },
@@ -205,8 +194,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 dense_trace(
                     Family::Gemma2,
-                    Phase::Prefill,
-                    step(1, prompt, cap, LogitRows::All),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::All)),
                 )
             },
         },
@@ -215,8 +203,7 @@ fn corpus() -> Vec<Row> {
             build: |_, cap| {
                 dense_trace(
                     Family::Gemma2,
-                    Phase::Decode,
-                    step(1, 1, cap, LogitRows::Last),
+                    StepSpec::step(step(1, 1, cap, LogitRows::Last)),
                 )
             },
         },
@@ -225,15 +212,14 @@ fn corpus() -> Vec<Row> {
             build: |prompt, _| {
                 registered_trace(
                     "bloom",
-                    Phase::Prefill,
-                    step(1, prompt, prompt, LogitRows::Last),
+                    StepSpec::step(step(1, prompt, prompt, LogitRows::Last)),
                 )
             },
         },
         Row {
             name: "bloom.decode",
             build: |_, cap| {
-                registered_trace("bloom", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+                registered_trace("bloom", StepSpec::step(step(1, 1, cap, LogitRows::Last)))
             },
         },
         Row {
@@ -241,15 +227,14 @@ fn corpus() -> Vec<Row> {
             build: |prompt, _| {
                 registered_trace(
                     "mpt",
-                    Phase::Prefill,
-                    step(1, prompt, prompt, LogitRows::Last),
+                    StepSpec::step(step(1, prompt, prompt, LogitRows::Last)),
                 )
             },
         },
         Row {
             name: "mpt.decode",
             build: |_, cap| {
-                registered_trace("mpt", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+                registered_trace("mpt", StepSpec::step(step(1, 1, cap, LogitRows::Last)))
             },
         },
         Row {
@@ -257,21 +242,23 @@ fn corpus() -> Vec<Row> {
             build: |prompt, _| {
                 registered_trace(
                     "smollm3",
-                    Phase::Prefill,
-                    step(1, prompt, prompt, LogitRows::Last),
+                    StepSpec::step(step(1, prompt, prompt, LogitRows::Last)),
                 )
             },
         },
         Row {
             name: "smollm3.decode",
             build: |_, cap| {
-                registered_trace("smollm3", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+                registered_trace("smollm3", StepSpec::step(step(1, 1, cap, LogitRows::Last)))
             },
         },
         Row {
             name: "qwen3next.decode",
             build: |_, cap| {
-                registered_trace("qwen3next", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+                registered_trace(
+                    "qwen3next",
+                    StepSpec::step(step(1, 1, cap, LogitRows::Last)),
+                )
             },
         },
         Row {
@@ -279,8 +266,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 registered_trace(
                     "qwen3next",
-                    Phase::Prefill,
-                    step(1, prompt, cap, LogitRows::All),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::All)),
                 )
             },
         },
@@ -288,7 +274,7 @@ fn corpus() -> Vec<Row> {
         Row {
             name: "qwen4exp.decode",
             build: |_, cap| {
-                registered_trace("qwen4exp", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+                registered_trace("qwen4exp", StepSpec::step(step(1, 1, cap, LogitRows::Last)))
             },
         },
         Row {
@@ -296,15 +282,14 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 registered_trace(
                     "qwen4exp",
-                    Phase::Prefill,
-                    step(1, prompt, cap, LogitRows::All),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::All)),
                 )
             },
         },
         Row {
             name: "qwen4exp.decode_batched",
             build: |_, cap| {
-                registered_trace("qwen4exp", Phase::Decode, step(2, 1, cap, LogitRows::Last))
+                registered_trace("qwen4exp", StepSpec::step(step(2, 1, cap, LogitRows::Last)))
             },
         },
         // No paged row: the indexer's block-key cache is refused under a paged layout (POOT-1148
@@ -312,7 +297,7 @@ fn corpus() -> Vec<Row> {
         Row {
             name: "qwen35.decode",
             build: |_, cap| {
-                registered_trace("qwen35", Phase::Decode, step(1, 1, cap, LogitRows::Last))
+                registered_trace("qwen35", StepSpec::step(step(1, 1, cap, LogitRows::Last)))
             },
         },
         Row {
@@ -320,8 +305,7 @@ fn corpus() -> Vec<Row> {
             build: |prompt, cap| {
                 registered_trace(
                     "qwen35",
-                    Phase::Prefill,
-                    step(1, prompt, cap, LogitRows::All),
+                    StepSpec::step(step(1, prompt, cap, LogitRows::All)),
                 )
             },
         },

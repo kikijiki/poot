@@ -9,7 +9,6 @@ use poot_graph_ir::{Graph, Operand, Storage, ValueId};
 use poot_graph_plan::passes_without_target;
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Plan, Program, Target, compile, compute_views, plan_eqn_views,
-    production_plan::Submission,
 };
 use poot_target::{AmdArch, Backend};
 use poot_tensor::DType as GDt;
@@ -21,7 +20,7 @@ fn compiled(g: &Graph, backend: Backend) -> Program {
         backend,
         caps: default_caps_for(backend),
     };
-    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD);
     compile(g, &target, &options).expect("the graph compiles")
 }
 
@@ -39,7 +38,6 @@ fn dispatch_count_planned(g: &Graph, backend: Backend) -> usize {
 /// the structure is read), as an ordinary graph.
 fn dense_graph(
     dense: poot_models::test_support::dense::Dense,
-    phase: poot_models::model::Phase,
     tokens: usize,
     cap: usize,
     logits: poot_models::model::LogitRows,
@@ -49,8 +47,7 @@ fn dense_graph(
         .zeroed_model(GDt::BF16)
         .model
         .trace(
-            phase,
-            step(1, tokens, cap, logits),
+            &poot_models::model::StepSpec::step(step(1, tokens, cap, logits)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the family traces this step")
@@ -80,13 +77,7 @@ fn qwen3_0_6b() -> poot_models::test_support::dense::Dense {
 
 /// One decode token of a real config over `cap` positions.
 fn real_decode_graph(dense: poot_models::test_support::dense::Dense, cap: usize) -> Graph {
-    dense_graph(
-        dense,
-        poot_models::model::Phase::Decode,
-        1,
-        cap,
-        poot_models::model::LogitRows::Last,
-    )
+    dense_graph(dense, 1, cap, poot_models::model::LogitRows::Last)
 }
 
 /// Dispatches per token of the 24-layer Qwen2.5-0.5B real-config decode graph (the legacy tracer planned 415).
@@ -165,7 +156,7 @@ fn dispatch_count_planned_regression_on_real_qwen2_decode_configs() {
 #[test]
 fn a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_the_pools() {
     use poot_graph_ir::KeyLayout;
-    use poot_models::model::{LogitRows, Phase};
+    use poot_models::model::{LogitRows, StepSpec};
     use poot_models::test_support::dense::paged_step;
 
     let (cap, layers) = (64usize, 24usize);
@@ -173,8 +164,7 @@ fn a_paged_decode_of_the_real_qwen2_config_dispatches_no_gather_or_transpose_of_
         .zeroed_model(GDt::BF16)
         .model
         .trace(
-            Phase::Decode,
-            paged_step(1, 1, cap, 4 * cap, LogitRows::Last),
+            &StepSpec::step(paged_step(1, 1, cap, 4 * cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the family traces a paged decode step");
@@ -268,7 +258,7 @@ fn planned_graph_summary(g: &Graph, backend: Backend) -> Vec<String> {
 /// differently) when an operand name contains "qwen".
 #[test]
 fn planning_a_graph_does_not_depend_on_its_value_names() {
-    use poot_models::model::{LogitRows, Phase};
+    use poot_models::model::LogitRows;
     use poot_models::test_support::dense::{Dense, Family};
 
     let mut graphs = Vec::new();
@@ -279,8 +269,8 @@ fn planning_a_graph_does_not_depend_on_its_value_names() {
             .heads(4, 2)
             .head_dim(4)
             .max_positions(16);
-        let decode = dense_graph(dense.clone(), Phase::Decode, 1, 16, LogitRows::Last);
-        let prefill = dense_graph(dense, Phase::Prefill, 8, 16, LogitRows::Last);
+        let decode = dense_graph(dense.clone(), 1, 16, LogitRows::Last);
+        let prefill = dense_graph(dense, 8, 16, LogitRows::Last);
         graphs.push(passes_without_target(&decode).unwrap());
         graphs.push(decode);
         graphs.push(passes_without_target(&prefill).unwrap());

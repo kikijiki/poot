@@ -464,7 +464,8 @@ impl Family {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ModelConfig, ModelOutput, Phase, StepShape, TraceError};
+    use crate::io::ModelSchema;
+    use crate::model::{ModelConfig, StepSpec, TraceError};
     use poot_graph_ir::Graph;
     use poot_quant::StoredBytes;
     use poot_quant::weights::WeightMap;
@@ -511,7 +512,7 @@ mod tests {
     #[test]
     fn every_fixture_greedy_decodes_a_non_constant_sequence() {
         use crate::components::standard::oracle::run_step;
-        use crate::model::{ModelOutput, Phase};
+        use crate::model::ModelOutput;
 
         fn argmax(logits: &[f32]) -> i32 {
             let mut best = 0;
@@ -533,7 +534,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {e}", entry.family));
             // An encoder returns hidden states or scores, not logits: it has no decode to greedy
             // through (its own tests cover its `Encode` step).
-            let ModelOutput::Logits { .. } = model.config().output else {
+            let Some(ModelOutput::Logits { .. }) = model.schema().step().map(|p| p.output()) else {
                 continue;
             };
             let (capacity, prompt) = (16, [1, 2, 3]);
@@ -545,7 +546,6 @@ mod tests {
                 let (logits, next) = run_step(
                     &*model,
                     &fixture.store,
-                    Phase::Decode,
                     capacity,
                     &[token],
                     pos as i32,
@@ -585,15 +585,13 @@ mod tests {
         fn config(&self) -> &ModelConfig {
             unreachable!("never built")
         }
+        fn schema(&self) -> &ModelSchema {
+            unreachable!("never built")
+        }
         fn weights(&self) -> &WeightMap {
             unreachable!("never built")
         }
-        fn trace_into(
-            &self,
-            _: Phase,
-            _: StepShape,
-            _: poot_graph_ir::Builder,
-        ) -> Result<Graph, TraceError> {
+        fn trace_into(&self, _: &StepSpec, _: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
             unreachable!("never built")
         }
     }
@@ -705,7 +703,6 @@ mod tests {
             eos,
             bos: Some(151643),
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: 151936 },
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
         };

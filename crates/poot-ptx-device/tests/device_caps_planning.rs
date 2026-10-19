@@ -6,9 +6,7 @@
 use poot_executor::Device;
 use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, KernelChoice, compile, production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, compile};
 use poot_kernelgen::{ContractionSpec, KernelRequest};
 use poot_ptx_device::device::PtxDevice;
 use poot_runtime_common::DeviceBackend;
@@ -63,7 +61,7 @@ fn a_live_device_reports_caps_the_fragment_kernel_plans_against() {
         draft.values_mut()[out].aval.dtype = DType::F32;
     })
     .unwrap();
-    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD);
     let program = compile(&graph, &target, &options)
         .unwrap_or_else(|error| panic!("the live caps must admit the fragment kernel: {error}"));
     let (eqn, _) = program

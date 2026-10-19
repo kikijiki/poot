@@ -212,7 +212,12 @@ impl Tower {
         })
     }
 
-    /// The step's logits of a [`Phase::Mtp`] step; `None` when the checkpoint stores no MTP layer.
+    /// Whether the checkpoint stores the one MTP layer the `draft` program traces.
+    pub(super) fn has_draft(&self, cfg: &Glm53Config) -> bool {
+        self.mtp.is_some() && cfg.mtp.is_some_and(|mtp| mtp.count == 1)
+    }
+
+    /// The step's logits of a `draft` step; `None` when the checkpoint stores no MTP layer.
     pub(super) fn trace_mtp(
         &self,
         b: &Builder,

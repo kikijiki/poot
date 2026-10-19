@@ -10,8 +10,10 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use poot_graph_ir::ops::{PackedExpertStack, packed_indexed_linear};
-use poot_graph_ir::{Builder, Slot, TensorType, ops};
+use poot_graph_ir::test_support::packed_graphs::{
+    PackedExpertStack, packed_indexed_linear, packed_linear,
+};
+use poot_graph_ir::{Builder, Slot, TensorType};
 use poot_quant::StoredBytes;
 use poot_quant::format::{
     FieldEncoding, FloatFormat, GroupMap, OperandRole, Storage as FormatStorage, WeightFormat,
@@ -242,7 +244,7 @@ pub fn packed_linear_fixtures() -> Vec<Fixture> {
             let x = b
                 .slot_named(Slot::Activation, "x", TensorType::f32(vec![m, K]))
                 .unwrap();
-            let y = ops::packed_linear(&b, x, "layer", payload.weight(), None, None).unwrap();
+            let y = packed_linear(&b, x, "layer", payload.weight(), None, None).unwrap();
             let graph = b.finish(y).unwrap();
             let key = graph.meta(x.id()).slot_key().unwrap().clone();
             let steps = (0..2)

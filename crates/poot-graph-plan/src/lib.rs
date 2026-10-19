@@ -38,9 +38,6 @@ pub mod multi_device;
 /// backend upload consume these contracts but remain separate integration layers.
 pub mod packed_block_float;
 
-/// Graph-level production planning for atomic multi-equation replacements.
-pub mod production_plan;
-
 /// Native capture state-dependency analysis and simultaneous commit planning (card 325).
 pub mod state_commit;
 
@@ -85,9 +82,10 @@ pub use imported::ImportedKernel;
 pub use imported::{AssetDest, AssetEntry, MANIFEST};
 pub use kernel_mapping::{AieAbiRefusal, AieLimitRefusal, aie_shape_abi, validate_linked_artifact};
 pub use passes::{
-    BoundaryDescriptor, ExpertStackRefusal, LegalizeError, PackedBindError, PackedConst,
-    PackedDequantErrorContext, PackedDequantProductionError, PackedLayout, PoolError, PoolSite,
-    PoolSpec, PooledWeight, ShardError, ShardRule, ShardedGraph, StageSplitError, WeightFormats,
+    AttentionDecline, BoundaryDescriptor, ExpertStackRefusal, FusionDecline, FusionDeclineReason,
+    LegalizeError, PackedBindError, PackedConst, PackedDequantErrorContext,
+    PackedDequantProductionError, PackedLayout, PoolError, PoolSite, PoolSpec, PooledWeight,
+    RopeDecline, ShardError, ShardRule, ShardedGraph, StageSplitError, WeightFormats,
     WeightFormatsError, bind_packed_weights, recognize_packed_contractions,
     recognize_packed_row_gathers, routed_step_demand, shard,
 };

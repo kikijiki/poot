@@ -10,7 +10,7 @@
 
 use poot_graph_plan::{Plan, dtype_widen::widen_mismatched_matmul_dtypes};
 use poot_llm::driver::block_table::BLOCK_SIZE;
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step};
 use poot_target::Backend;
 use poot_tensor::DType;
@@ -57,8 +57,7 @@ fn ptx_paged_engine_plan_classify_qwen2_n_slots_2() {
     let g = m
         .model
         .trace(
-            Phase::Decode,
-            paged_step(n_slots, 1, cap, pool_slots, LogitRows::Last),
+            &StepSpec::step(paged_step(n_slots, 1, cap, pool_slots, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();

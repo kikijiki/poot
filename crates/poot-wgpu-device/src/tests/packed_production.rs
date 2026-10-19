@@ -13,9 +13,9 @@ use poot_graph_ir::builder::Builder;
 use poot_graph_ir::types::{Scalar, TensorType};
 use poot_graph_ir::{Graph, OpKind, Slot};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{WeightEntry, WeightStore};
@@ -37,8 +37,7 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Compile `g` for `target` through the contract's one staged program: single stage, single device,
-/// `Submission::Replay` (the only submission the engine admits, Card 546a).
+/// Compile `g` for `target` through the contract's one staged program: single stage, single device.
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
@@ -47,7 +46,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -64,7 +63,7 @@ fn packed_linear_case(
     m: usize,
     seed: u64,
 ) {
-    use poot_graph_ir::ops::packed_linear;
+    use poot_graph_ir::test_support::packed_graphs::packed_linear;
 
     let owner = Arc::new(poot_quant::test_support::packed::random_payload(
         format,
@@ -190,7 +189,7 @@ fn packed_linear_real_projection_dims_gpu_matches_dense() {
 /// back-to-back replay steps of the same entry with identical inputs must match bit for bit.
 #[test]
 fn wgpu_q6k_gemv_determinism_probe() {
-    use poot_graph_ir::ops::packed_linear;
+    use poot_graph_ir::test_support::packed_graphs::packed_linear;
     use poot_test_util::max_abs_error;
 
     let Some(device) = wgpu() else {

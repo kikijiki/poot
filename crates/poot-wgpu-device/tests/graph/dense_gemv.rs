@@ -4,9 +4,7 @@
 use poot_eval::test_support::StepFixture;
 use poot_executor_parity::{Fixture, run_outputs};
 use poot_graph_ir::{Builder, OpKind, Slot, TensorType};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, KernelChoice, Target, compile, production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Target, compile};
 use poot_kernelgen::{ContractionSpec, KernelRequest, Schedule};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -107,7 +105,7 @@ fn gemv_case(dtype: DType, k: usize, n: usize) -> GemvCase {
     }
 }
 
-const OPTIONS: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+const OPTIONS: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
 
 /// Output widths `N` that reach every launch the planner admits on a device with `compute_units` compute units
 /// (at least two), none a multiple of its `cols`: `cols` 4 while `ceil(N / 4)` still launches `2 x compute_units`

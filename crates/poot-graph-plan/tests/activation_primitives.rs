@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{geglu, gelu, gelu_erf, sigmoid, silu, softcap, softplus, swiglu};
 use poot_graph_ir::types::TensorType;
@@ -105,7 +105,7 @@ fn eval_bits(g: &Graph, inputs: HashMap<ValueId, HostTensor>) -> Vec<u32> {
         .into_iter()
         .map(|(k, v)| (k, Value::from(v)))
         .collect();
-    eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

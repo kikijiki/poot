@@ -12,7 +12,10 @@
 //!   built-in family.
 //! - Device half: `Driver::generate` on a real device equals the oracle's tokens.
 
+mod driver_is_family_free;
 mod family;
+mod tagged;
+mod tagged_rows;
 
 use std::cell::Cell;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -29,17 +32,16 @@ use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::{Slot, SlotKey};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, WeightFormats, bind_packed_weights, compile,
-    production_plan::Submission, staged::StagedProgram, staged::TargetSet,
+    staged::StagedProgram, staged::TargetSet,
 };
 use poot_llm::driver::error::{DriverError, InvalidOptions, Unsupported};
-use poot_llm::driver::step::PickPolicy;
 use poot_llm::driver::{
     AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest,
     Head, Layout, LoadOptions, ModelHandle, PoolShape, PreparedSetLimits, Release, RowWork,
     SeqRequest, ServingShapes, StepRow, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::model::{KvLayout, LogitRows, Model, Phase, StepShape, TraceError};
+use poot_models::model::{KvLayout, Model, StepShape, StepSpec, TraceError};
 use poot_models::registry::{ConfigSource, Fixture, Registry, RegistryError};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
@@ -114,14 +116,7 @@ fn load(dir: &Path) -> ModelHandle {
 // ---------------------------------------------------------------------------------------------
 
 fn shape(tokens: usize) -> StepShape {
-    StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: nz(tokens),
-        capacity: nz(CAPACITY),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    }
+    StepShape::new(NonZeroUsize::MIN, nz(tokens), nz(CAPACITY))
 }
 
 /// One oracle step: `tokens` at positions `start..`, over the carried `state` (zeros on the first
@@ -129,14 +124,16 @@ fn shape(tokens: usize) -> StepShape {
 fn oracle_step(
     model: &dyn Model,
     store: &WeightStore,
-    phase: Phase,
     tokens: &[u32],
     start: usize,
     state: &mut Vec<HostTensor>,
 ) -> Vec<f32> {
     let n = tokens.len();
     let graph = model
-        .trace(phase, shape(n), poot_graph_ir::TraceLimits::for_tests())
+        .trace(
+            &StepSpec::step(shape(n)),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
         .unwrap();
     if state.is_empty() {
         *state = graph
@@ -184,20 +181,12 @@ fn oracle_tokens(
     decode_position: impl Fn(usize) -> usize,
 ) -> Vec<(u32, f32)> {
     let mut state = Vec::new();
-    let mut out = vec![greedy(&oracle_step(
-        model,
-        store,
-        Phase::Prefill,
-        prompt,
-        0,
-        &mut state,
-    ))];
+    let mut out = vec![greedy(&oracle_step(model, store, prompt, 0, &mut state))];
     for i in 1..new {
         let last = out[i - 1].0;
         out.push(greedy(&oracle_step(
             model,
             store,
-            Phase::Decode,
             &[last],
             decode_position(prompt.len() + i - 1),
             &mut state,
@@ -262,20 +251,19 @@ fn the_fixture_family_registers_loads_and_compiles_for_every_reference_target() 
             },
         ),
     ];
-    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD);
     let formats = WeightFormats::from_weight_map(model.weights());
     for (name, target) in &targets {
-        for (phase, tokens) in [(Phase::Prefill, 4), (Phase::Decode, 1)] {
+        for (step, tokens) in [("prefill", 4), ("decode", 1)] {
             let graph = model
                 .trace(
-                    phase,
-                    shape(tokens),
+                    &StepSpec::step(shape(tokens)),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
             let graph = bind_packed_weights(&graph, &formats).unwrap();
             compile(&graph, target, &options)
-                .unwrap_or_else(|e| panic!("{phase:?} does not compile for {name}: {e}"));
+                .unwrap_or_else(|e| panic!("{step} does not compile for {name}: {e}"));
         }
     }
 }
@@ -342,14 +330,7 @@ fn the_oracle_decodes_the_pinned_tokens() {
     let mut prefix = PROMPT.to_vec();
     for (i, &token) in tokens.iter().enumerate() {
         let mut fresh = Vec::new();
-        let logits = oracle_step(
-            &*model,
-            &fixture.store,
-            Phase::Prefill,
-            &prefix,
-            0,
-            &mut fresh,
-        );
+        let logits = oracle_step(&*model, &fixture.store, &prefix, 0, &mut fresh);
         assert_eq!(
             greedy(&logits).0,
             token,
@@ -384,7 +365,12 @@ fn the_pinned_tokens_depend_on_the_decode_position() {
 #[error("fake device error")]
 struct FakeError;
 
-struct FakeDevice;
+/// The fake device; it keeps every byte run the engine uploads (inputs among them), so a row can see what
+/// the driver bound.
+#[derive(Clone, Default)]
+struct FakeDevice {
+    writes: Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+}
 
 impl Device for FakeDevice {
     type Buffer = ();
@@ -422,7 +408,7 @@ impl Device for FakeDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), FakeError> {
@@ -441,9 +427,12 @@ impl Device for FakeDevice {
         &mut self,
         _dst: &(),
         _offset: usize,
-        _len: usize,
-        _fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
+        len: usize,
+        fill: &mut dyn FnMut(std::ops::Range<usize>, &mut [u8]),
     ) -> Result<(), FakeError> {
+        let mut bytes = vec![0; len];
+        fill(0..len, &mut bytes);
+        self.writes.borrow_mut().push(bytes);
         Ok(())
     }
     /// Every row picks token 1: the sampling suffix answers `[token, non_finite_index]`, the logits
@@ -529,7 +518,7 @@ impl Executor for Counting {
 }
 
 fn driver_options(chunk: usize, max_trace_tokens: usize) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -558,7 +547,7 @@ fn fake_driver(
     write_checkpoint(&dir, &family::fixture());
     let loads = Rc::new(Cell::new(0));
     let executor = Counting {
-        inner: Engine::new(FakeDevice),
+        inner: Engine::new(FakeDevice::default()),
         loads: loads.clone(),
     };
     let driver = Driver::new(Arc::new(load(&dir)), Box::new(executor), options);
@@ -568,17 +557,15 @@ fn fake_driver(
 const GREEDY: Head = Head::GREEDY;
 const SAMPLED: Head = Head::Sample(SampleRule::Gumbel);
 
-fn warm_admitted(driver: &mut Driver, heads: &[Head]) -> Result<(), DriverError> {
-    driver
-        .prepare(&ServingShapes {
-            layout: Layout::Contiguous,
-            rows: &[NonZeroUsize::MIN],
-            heads,
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
-        .map(|_| ())
+fn admitted(heads: &[Head]) -> ServingShapes<'_> {
+    ServingShapes {
+        layout: Layout::Contiguous,
+        rows: &[NonZeroUsize::MIN],
+        heads,
+        warm: Warm::Admitted,
+        windows: &[],
+        adapters: &[],
+    }
 }
 
 fn request(prompt_len: usize, sampler: Sampler) -> GenerateRequest {
@@ -598,8 +585,10 @@ fn request(prompt_len: usize, sampler: Sampler) -> GenerateRequest {
 #[test]
 fn the_driver_prepares_the_fixture_family_with_no_family_branch() {
     let (driver, _, _dir) = fake_driver(driver_options(4, 64));
-    let mut driver = driver.unwrap();
-    warm_admitted(&mut driver, &[GREEDY, SAMPLED]).unwrap_or_else(|e| panic!("{e}"));
+    let driver = driver
+        .unwrap()
+        .prepare(&admitted(&[GREEDY, SAMPLED]))
+        .unwrap_or_else(|e| panic!("{e}"));
     // chunk 4 over granule 1: the step extents 4, 2 and 1 (the one-token step serves decode and a
     // one-token prefill tail), for two heads.
     assert_eq!(driver.prepared_entries(), 2 * 3);
@@ -620,8 +609,8 @@ fn the_fixture_familys_third_equation_is_refused_under_max_eqns_2() {
     let mut options = driver_options(4, 64);
     options.trace.max_eqns = nz(2);
     let (driver, _, _dir) = fake_driver(options);
-    let mut driver = driver.unwrap();
-    let refused = warm_admitted(&mut driver, &[GREEDY]).unwrap_err();
+    let refusal = driver.unwrap().prepare(&admitted(&[GREEDY])).unwrap_err();
+    let (refused, driver) = (refusal.error, refusal.driver);
     let DriverError::Unsupported(Unsupported::Trace(TraceError::Budget(budget))) = &refused else {
         panic!("expected the typed trace-budget cause: {refused:?}");
     };
@@ -675,8 +664,10 @@ fn a_chunk_above_the_trace_limit_is_refused_before_construction_for_an_external_
 #[test]
 fn replaying_the_prepared_set_compiles_nothing_as_positions_and_seeds_change() {
     let (driver, _, _dir) = fake_driver(driver_options(4, 64));
-    let mut driver = driver.unwrap();
-    warm_admitted(&mut driver, &[GREEDY, SAMPLED]).unwrap();
+    let mut driver = driver
+        .unwrap()
+        .prepare(&admitted(&[GREEDY, SAMPLED]))
+        .unwrap();
     let warmed = driver.stats();
     let entries = driver.prepared_entries();
     assert_eq!(warmed.compiles as usize, entries);
@@ -737,7 +728,9 @@ fn assert_generate_matches_the_oracle(choice: BackendChoice, backend: DeviceBack
     .collect();
     assert_eq!(oracle, PINNED);
 
-    let mut driver = Driver::new(handle, executor, driver_options(8, 64)).unwrap();
+    let mut driver = Driver::new(handle, executor, driver_options(8, 64))
+        .unwrap()
+        .serve(Layout::Contiguous);
     let generation = driver
         .generate(
             GenerateRequest {
@@ -798,27 +791,19 @@ fn bits(values: &[f32]) -> Vec<u32> {
 fn oracle_paged_step(
     model: &dyn Model,
     store: &WeightStore,
-    phase: Phase,
     feed: &[Vec<u32>],
     start: usize,
     state: &mut Vec<HostTensor>,
 ) -> Vec<f32> {
     let (rows, n) = (feed.len(), feed[0].len());
     let pool = rows * CAPACITY;
+    let shape = StepShape::new(nz(rows), nz(n), nz(CAPACITY)).with_kv(KvLayout::Paged {
+        pool_slots: nz(pool),
+        seqs: nz(rows),
+    });
     let graph = model
         .trace(
-            phase,
-            StepShape {
-                rows: nz(rows),
-                tokens: nz(n),
-                capacity: nz(CAPACITY),
-                kv: KvLayout::Paged {
-                    pool_slots: nz(pool),
-                    seqs: nz(rows),
-                },
-                logits: LogitRows::Last,
-                hidden: None,
-            },
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -877,38 +862,22 @@ fn four_paged_rows_equal_four_single_row_runs_on_the_oracle() {
     let model = fixture_model(&fixture);
     let feed: Vec<Vec<u32>> = ROW_PROMPTS.iter().map(|p| p.to_vec()).collect();
     let mut pool = Vec::new();
-    let paged_prefill =
-        oracle_paged_step(&*model, &fixture.store, Phase::Prefill, &feed, 0, &mut pool);
+    let paged_prefill = oracle_paged_step(&*model, &fixture.store, &feed, 0, &mut pool);
     let vocab = paged_prefill.len() / feed.len();
     let next: Vec<Vec<u32>> = (0..feed.len())
         .map(|r| vec![greedy(&paged_prefill[r * vocab..(r + 1) * vocab]).0])
         .collect();
-    let paged_decode =
-        oracle_paged_step(&*model, &fixture.store, Phase::Decode, &next, 4, &mut pool);
+    let paged_decode = oracle_paged_step(&*model, &fixture.store, &next, 4, &mut pool);
 
     for (r, prompt) in ROW_PROMPTS.iter().enumerate() {
         let mut state = Vec::new();
-        let prefill = oracle_step(
-            &*model,
-            &fixture.store,
-            Phase::Prefill,
-            prompt,
-            0,
-            &mut state,
-        );
+        let prefill = oracle_step(&*model, &fixture.store, prompt, 0, &mut state);
         assert_eq!(
             bits(&paged_prefill[r * vocab..(r + 1) * vocab]),
             bits(&prefill),
             "row {r}: the paged prefill differs from the single-row run"
         );
-        let decode = oracle_step(
-            &*model,
-            &fixture.store,
-            Phase::Decode,
-            &next[r],
-            4,
-            &mut state,
-        );
+        let decode = oracle_step(&*model, &fixture.store, &next[r], 4, &mut state);
         assert_eq!(
             bits(&paged_decode[r * vocab..(r + 1) * vocab]),
             bits(&decode),
@@ -941,8 +910,10 @@ fn assert_four_paged_rows_equal_single_row_runs(choice: BackendChoice, backend: 
     let dir = poot_test_util::unique_temp_path("neoxish_four_rows_checkpoint");
     write_checkpoint(&dir, &fixture);
     let handle = Arc::new(load(&dir));
-    let mut alone = Driver::new(Arc::clone(&handle), reference, driver_options(8, 64)).unwrap();
-    let mut batched = Driver::new(handle, executor, driver_options(8, 64)).unwrap();
+    let mut alone = Driver::new(Arc::clone(&handle), reference, driver_options(8, 64))
+        .unwrap()
+        .serve(Layout::Contiguous);
+    let batched = Driver::new(handle, executor, driver_options(8, 64)).unwrap();
 
     let want: Vec<Vec<u32>> = ROW_PROMPTS
         .iter()
@@ -963,7 +934,7 @@ fn assert_four_paged_rows_equal_single_row_runs(choice: BackendChoice, backend: 
         })
         .collect();
 
-    batched
+    let mut batched = batched
         .prepare(&ServingShapes {
             layout: Layout::Paged(PoolShape {
                 blocks: nz(8),
@@ -986,11 +957,7 @@ fn assert_four_paged_rows_equal_single_row_runs(choice: BackendChoice, backend: 
         .iter()
         .map(|prompt| {
             let admission = batched
-                .open(SeqRequest {
-                    prompt,
-                    max_new: NEW_TOKENS,
-                    adapter: AdapterRef::Base,
-                })
+                .open(SeqRequest::new(prompt, NEW_TOKENS, AdapterRef::Base))
                 .unwrap();
             let Admission::Opened { seq, reused } = admission else {
                 panic!("no room for a row: {admission:?}");
@@ -1014,10 +981,7 @@ fn assert_four_paged_rows_equal_single_row_runs(choice: BackendChoice, backend: 
                     work: if lane.prefilled < prompt.len() {
                         RowWork::Prefill { upto: prompt.len() }
                     } else {
-                        RowWork::Decode {
-                            ahead: &[],
-                            pick: PickPolicy::Greedy,
-                        }
+                        RowWork::Decode { ahead: &[] }
                     },
                     sampler: &mut lane.sampler,
                 })

@@ -32,12 +32,10 @@ use crate::components::norm::NormParams;
 use crate::components::router::RouterKind;
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    decoder_program, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::{ModelSchema, StateSpec};
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::{ExpertNames, MoeNames, SharedNames, map_moe_layer};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
 use poot_text::ChatFormat;
@@ -522,6 +520,7 @@ pub struct Qwen3Next {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 /// The tensor names of the checkpoint format `raw` comes from.
@@ -559,6 +558,11 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
             })
             .collect::<Result<Vec<_>, WeightError>>()
             .map_err(weight_error)?;
+    let mut step = decoder_program(p.vocab);
+    if p.kinds.contains(&LayerKind::LinearAttention) {
+        step = step.carrying(StateSpec::recurrent("gdn"));
+    }
+    let schema = ModelSchema::builder().step(step).build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -566,7 +570,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -576,6 +579,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -584,13 +588,18 @@ impl Model for Qwen3Next {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         moe::check_step(FAMILY, shape, &p.moe)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(
@@ -791,8 +800,7 @@ mod tests {
         let model = model_of(&fx.config, &fx.store);
         let g = model
             .trace(
-                Phase::Decode,
-                step_shape(1, CAP, LogitRows::Last),
+                &StepSpec::step(step_shape(1, CAP, LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -879,28 +887,12 @@ mod tests {
             assert_eq!(packed > 0, label == "q8_0", "{label}: {packed} packed");
             let reference_store = decoded(&store);
             let reference = model_of(&fx.config, &reference_store);
-            let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-            let (want, want_state) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Prefill,
-                CAP,
-                &prompt,
-                0,
-                &[],
-            );
+            let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+            let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
             close(&got, &want);
             close_all(&state, &want_state);
-            let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-            let (want, _) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Decode,
-                CAP,
-                &[5],
-                4,
-                &want_state,
-            );
+            let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+            let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
             close(&got, &want);
         }
     }
@@ -1295,8 +1287,8 @@ mod tests {
         let fx = fixture();
         let hf = model_of(&fx.config, &fx.store);
         let prompt = [3, 17, 40, 8, 25, 9];
-        let (want, want_state) = run_step(&*hf, &fx.store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want_decode, _) = run_step(&*hf, &fx.store, Phase::Decode, CAP, &[5], 6, &want_state);
+        let (want, want_state) = run_step(&*hf, &fx.store, CAP, &prompt, 0, &[]);
+        let (want_decode, _) = run_step(&*hf, &fx.store, CAP, &[5], 6, &want_state);
         for nextn in [false, true] {
             let (kvs, tensors) = gguf_of(&fx, nextn);
             assert!(tensors.iter().all(|(_, _, ty, _)| *ty == GGML_F32));
@@ -1305,13 +1297,13 @@ mod tests {
             let raw = RawConfig::Gguf(&index);
             assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
             let gguf = registry.build(&raw, &store).unwrap();
-            let (got, state) = run_step(&*gguf, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
+            let (got, state) = run_step(&*gguf, &store, CAP, &prompt, 0, &[]);
             close(&got, &want);
             // The carried tensors differ in value-head order, so only the logits and the attention
             // cache are comparable: the cache is the last two state values.
             let kv = want_state.len() - 2;
             close_all(&state[kv..], &want_state[kv..]);
-            let (got, _) = run_step(&*gguf, &store, Phase::Decode, CAP, &[5], 6, &state);
+            let (got, _) = run_step(&*gguf, &store, CAP, &[5], 6, &state);
             close(&got, &want_decode);
         }
     }

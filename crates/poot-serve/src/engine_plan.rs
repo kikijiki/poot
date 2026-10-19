@@ -18,20 +18,20 @@ use poot_executor::{Collectives, Coordinator, Device, Executor, SharedKernelsMis
 use poot_graph_plan::multi_device::DeviceSpec;
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Refusal, ShardRule, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::TargetSet,
+    staged::DevicePlacement, staged::TargetSet,
 };
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_llm::driver::capacity::{
     Budget, CapacityRefusal, EncodeNeed, Fit, FitError, Observation, PlanError, PlanFailure,
     Planner, prepare_encode, verify_prepared,
 };
-use poot_llm::driver::error::{DriverError, InvalidRequest, Unsupported};
+use poot_llm::driver::error::{DriverError, Unsupported};
 use poot_llm::driver::placement::{BalanceError, LayerBytes, Placement, balance_layers};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverCaps, DriverOptions, EncodeShapes, Head, Layout,
-    ModelHandle, PoolShape, PreparedSetLimits, ServingShapes, Warm, program_retention,
+    ModelHandle, PoolShape, PreparedSetLimits, Serving, ServingShapes, Warm, program_retention,
 };
-use poot_models::model::ModelOutput;
+use poot_models::io::ModelSchema;
 use poot_target::{Backend as TargetBackend, TargetId};
 
 use crate::config::{DEFAULT_ENCODE_ROWS, DEFAULT_MAX_SEQ, DEFAULT_ROWS, PlacementSpec};
@@ -128,17 +128,19 @@ pub(crate) enum Workload {
 }
 
 impl Workload {
-    /// The workload a model's output asks for, at the shapes requested.
-    fn of(output: ModelOutput, rows: Option<NonZeroUsize>, max_seq: NonZeroUsize) -> Self {
-        match output {
-            ModelOutput::Logits { .. } => Workload::Generate {
+    /// The workload a model's programs ask for, at the shapes requested: a model that serves a sequence
+    /// (has a `step` program) generates; one that only encodes does that.
+    fn of(schema: &ModelSchema, rows: Option<NonZeroUsize>, max_seq: NonZeroUsize) -> Self {
+        if schema.step().is_some() {
+            Workload::Generate {
                 rows: rows.unwrap_or(DEFAULT_ROWS),
                 max_seq,
-            },
-            ModelOutput::Hidden { .. } | ModelOutput::Scores { .. } => Workload::Encode {
+            }
+        } else {
+            Workload::Encode {
                 rows: rows.unwrap_or(DEFAULT_ENCODE_ROWS),
                 max_seq,
-            },
+            }
         }
     }
 
@@ -421,7 +423,7 @@ fn domain(rows: NonZeroUsize, max_seq: NonZeroUsize) -> Vec<Candidate> {
 
 fn driver_options(handle: &ModelHandle, workload: Workload, draft: DraftPolicy) -> DriverOptions {
     let max_seq = workload.max_seq();
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     // The largest granule multiple within the chunk budget and the capacity, and never below one granule.
     let granule = handle.config().prefill_granule.get();
     let chunk =
@@ -480,7 +482,7 @@ fn encode_shapes_of(candidate: &Candidate) -> EncodeShapes {
 /// A started engine: the plan the gauges read and the driver the serving loop will run.
 pub(crate) struct Started {
     pub(crate) plan: EnginePlan,
-    pub(crate) driver: Driver,
+    pub(crate) driver: Driver<Serving>,
 }
 
 /// What an open produced. The variant is the placement the engine runs: a group is opened as the
@@ -612,7 +614,7 @@ impl EnginePlan {
         let config = handle.config();
         let max_seq = NonZeroUsize::new(args.max_seq.get().min(config.max_positions))
             .expect("a model has positions");
-        let workload = Workload::of(config.output, args.rows, max_seq);
+        let workload = Workload::of(handle.schema(), args.rows, max_seq);
         let opened = open(args).map_err(|source| StartupError::Device {
             choice: args.backend,
             source,
@@ -640,12 +642,11 @@ impl EnginePlan {
             workload,
             &mut observe,
         )?;
-        // `prepare` published them: a driver without caps is a bug in the preparation, reported as the
-        // driver's own typed refusal.
+        // Both preparations publish the caps.
         let caps = driver
             .caps()
             .cloned()
-            .ok_or_else(|| DriverError::from(InvalidRequest::NotPrepared))?;
+            .expect("prepare and prepare_encode publish the caps");
         let observed = observe(&driver.observation());
         let workload = workload.fitted(&candidate);
         let budget = BudgetReport {
@@ -678,7 +679,7 @@ impl EnginePlan {
 /// The candidate the fit chose, prepared on the real executor.
 struct Fitted {
     candidate: Candidate,
-    driver: Driver,
+    driver: Driver<Serving>,
     /// The bytes the chosen plan allocates on each device, in rank order.
     planned: Vec<(DeviceId, u64)>,
     planning_weight_bytes_read: u64,
@@ -687,6 +688,16 @@ struct Fitted {
 
 /// Fit the workload to the devices, then prepare the chosen shapes on the real executor and check what
 /// it allocated.
+/// The request inputs the deployment serves beyond a token prompt: every carriable input of the
+/// model's `step` program when a front end supplies them (`args.embeds`), none for a text-only server.
+fn carried_inputs(args: &EngineArgs, handle: &ModelHandle) -> Vec<poot_models::io::InputId> {
+    if args.embeds {
+        handle.carriable_inputs()
+    } else {
+        Vec::new()
+    }
+}
+
 fn fit_and_prepare(
     args: &EngineArgs,
     handle: &Arc<ModelHandle>,
@@ -706,12 +717,13 @@ fn fit_and_prepare(
         &domain(workload.rows(), workload.max_seq()),
         |candidate| {
             let rows = [candidate.rows];
+            let carried = carried_inputs(args, handle);
             let options = driver_options(handle, workload.fitted(candidate), args.draft.clone());
             let encode = encode_shapes_of(candidate);
             match workload {
                 Workload::Generate { .. } => planner.plan_workload(
                     options,
-                    Some((&shapes_of(candidate, &rows), args.embeds)),
+                    Some((&shapes_of(candidate, &rows), carried.as_slice())),
                     Some((&encode, EncodeNeed::IfTraced)),
                 ),
                 Workload::Encode { .. } => {
@@ -756,26 +768,34 @@ fn fit_and_prepare(
         driver = driver.with_expert_pool(slots)?;
     }
     let rows = [chosen.rows];
-    match workload {
+    let driver = match workload {
         Workload::Generate { .. } => {
-            driver.prepare(&shapes_of(&chosen, &rows))?;
-            if args.embeds {
-                driver.prepare_embeds(&shapes_of(&chosen, &rows))?;
+            let mut driver = driver
+                .prepare(&shapes_of(&chosen, &rows))
+                .map_err(DriverError::from)?;
+            let carried = carried_inputs(args, handle);
+            if !carried.is_empty() {
+                driver.prepare_carried(&shapes_of(&chosen, &rows), &carried)?;
             }
             prepare_encode(
                 &mut driver,
                 &encode_shapes_of(&chosen),
                 EncodeNeed::IfTraced,
             )?;
+            driver
         }
         Workload::Encode { .. } => {
+            // An encode workload opens no sequence: it serves the contiguous layout with nothing prepared
+            // beyond its token rows.
+            let mut driver = driver.serve(Layout::Contiguous);
             prepare_encode(
                 &mut driver,
                 &encode_shapes_of(&chosen),
                 EncodeNeed::Required,
             )?;
+            driver
         }
-    }
+    };
     verify_prepared(
         &footprint,
         &driver.live_device_bytes(),

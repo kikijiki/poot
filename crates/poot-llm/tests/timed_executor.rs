@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use poot_executor::DetailedTiming;
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Head, Layout, LoadOptions,
     ModelHandle, PreparedSetLimits, ServingShapes, Warm, open_executor, open_timed_executor,
@@ -65,7 +65,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
 }
 
 fn options() -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -90,9 +90,9 @@ fn profiled_generation(executor: Box<dyn poot_executor::Executor>) -> (Vec<u32>,
     let mut registry = Registry::builtin().unwrap();
     registry.register(family::ENTRY).unwrap();
     let handle = Arc::new(ModelHandle::load(&dir, &registry, &LoadOptions::default()).unwrap());
-    let mut driver = Driver::new(handle, executor, options()).unwrap();
+    let driver = Driver::new(handle, executor, options()).unwrap();
     let prompt = vec![1, 2, 3, 4];
-    driver
+    let mut driver = driver
         .prepare(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],

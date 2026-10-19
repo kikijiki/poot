@@ -50,6 +50,12 @@ pub use xrt::XrtError;
 
 #[cfg(feature = "vpu")]
 mod blob_cache;
+// The range policy is pure and its rows run on every host; only the `vpu` device consumes it.
+#[cfg_attr(
+    not(any(test, feature = "vpu")),
+    expect(dead_code, reason = "consumed by the `vpu` device alone")
+)]
+mod range_guard;
 #[cfg(feature = "vpu")]
 mod vpu;
 

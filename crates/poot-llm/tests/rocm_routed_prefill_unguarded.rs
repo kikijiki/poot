@@ -22,7 +22,7 @@ use poot_executor::{Device, Engine, Executor, NoSync};
 use poot_graph_ir::Graph;
 use poot_graph_plan::{KernelChoice, Target};
 use poot_kernelgen::{ContractionSpec, KernelRequest};
-use poot_models::model::{Model, Phase};
+use poot_models::model::Model;
 use poot_models::registry::Registry;
 use poot_models::test_support::weight_map::{self, Step};
 use poot_quant::weights::{WeightMap, WeightStore};
@@ -63,7 +63,7 @@ fn fixture() -> Fixture {
 /// The prefill of the whole prompt: tokens inside the vocabulary and away from its end-of-sequence id.
 fn prompt() -> Step {
     let ids: Vec<i32> = (0..PROMPT as i32).map(|t| (3 * t + 1) % 40).collect();
-    Step::new(Phase::Prefill, &ids, 0)
+    Step::new(&ids, 0)
 }
 
 fn is_tiled(choice: &KernelChoice) -> bool {
@@ -91,10 +91,7 @@ fn plan(graph: &Graph, target: &Target, experts: usize) -> PlanFacts {
     let program = poot_graph_plan::compile(
         graph,
         target,
-        &poot_graph_plan::CompileOptions::new(
-            poot_graph_plan::production_plan::Submission::Replay,
-            poot_graph_plan::CompileLimits::STANDARD,
-        ),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("the prefill compiles");
     let router_shape = [PROMPT, experts];
@@ -232,13 +229,7 @@ fn routed_prefill_unguarded_rocm() {
     let target = device.target();
     let fixture = fixture();
     let step = prompt();
-    let graph = weight_map::trace(
-        &*fixture.model,
-        &fixture.map,
-        Phase::Prefill,
-        PROMPT,
-        weight_map::CAPACITY,
-    );
+    let graph = weight_map::trace(&*fixture.model, &fixture.map, PROMPT, weight_map::CAPACITY);
     // The plan rows run before anything executes: a plan without the passes is a red row without a launch.
     let facts = plan(&graph, &target, 4);
     // The QSA layer's attention is the block-selected op, planned straight to its kernel: no dense attention

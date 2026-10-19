@@ -2,7 +2,7 @@
 //! length is not bounded) stays generic primitives, key ends in exact I32 included, and a live PTX device runs it.
 
 use poot_eval::test_support::live_attention::{LiveAttentionFixture, LiveAttentionGraph};
-use poot_eval::{EvalBudget, EvalOptions, eval};
+use poot_eval::{EvalOptions, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_executor_parity::live_attention::{compile_live, live_step};
 use poot_graph_plan::{KernelChoice, Target};
@@ -58,15 +58,11 @@ fn a_declined_live_attention_graph_runs_as_primitives_on_ptx() {
         got.iter().all(|x| x.is_finite()),
         "poison reached the output: {got:?}"
     );
-    let cpu = eval(
-        &built.graph,
-        &inputs.values(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .unwrap();
+    let cpu = eval(&built.graph, &inputs.values(), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
     let want = fixture.oracle(&inputs, &built, &[5]);
     for (label, reference) in [
         ("guarded graph", cpu.as_f32().unwrap()),
@@ -124,31 +120,17 @@ fn a_narrow_live_attention_graph_runs_on_ptx_and_never_reads_the_poisoned_tail()
                 got.iter().all(|x| x.is_finite()),
                 "{label}: poison reached the output: {got:?}"
             );
-            let cpu = eval(
-                &built.graph,
-                &inputs.values(),
-                EvalOptions::new(EvalBudget::UNBOUNDED),
-            )
-            .unwrap()
-            .output
-            .into_host()
-            .unwrap();
+            let cpu = eval(&built.graph, &inputs.values(), EvalOptions::default())
+                .unwrap()
+                .output
+                .into_host()
+                .unwrap();
             let want = fixture.oracle(&inputs, &built, &len);
             for (reference_label, reference) in [
                 ("guarded graph", cpu.as_f32().unwrap()),
                 ("first keys", &want[..]),
             ] {
-                let worst = got
-                    .iter()
-                    .zip(reference)
-                    .map(|(g, w)| {
-                        if (g - w).is_nan() {
-                            f32::INFINITY
-                        } else {
-                            (g - w).abs()
-                        }
-                    })
-                    .fold(0.0, f32::max);
+                let worst = poot_test_util::max_abs_error(&got, reference);
                 assert!(
                     worst <= tier,
                     "{label}: vs the {reference_label}: worst difference {worst:.3e}"

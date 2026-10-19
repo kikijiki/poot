@@ -679,6 +679,9 @@ fn indexed_kernel(
     let x_groups = match schedule {
         kg::Schedule::Gemv { .. } => 0,
         kg::Schedule::Tiled { tile } => (threads / (tile.get() * tile.get()) as usize) as u32,
+        kg::Schedule::RegisterTiled { .. } => {
+            panic!("an indexed contraction is never RegisterTiled")
+        }
     };
     let request =
         kg::KernelRequest::Contraction(kg::ContractionSpec::Indexed(kg::IndexedContraction {

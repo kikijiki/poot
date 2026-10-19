@@ -8,7 +8,6 @@ use crate::predicates::{
     DenseGemvLaunch, ELEMENTWISE_2D_WIDTH, GEMM_TILE, GEMV_WIDTH, GraphTables,
     dense_decode_gemv_in, dense_gemv_launch, is_elementwise_2d_in,
 };
-use crate::production_plan::Submission;
 use crate::refusal::RefusalDtypes;
 use crate::types::{DispatchPlanError, Launch, ScratchDecl};
 use poot_graph_ir::test_support::graph_fixtures::derive;
@@ -22,7 +21,7 @@ use poot_kernelgen::{
     PointwiseSpec, ValueBinary,
 };
 use poot_target::{
-    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, Queried, TargetId, TensorCoreSupport,
+    AmdArch, Backend, DECODE_GEMV_CHUNK_TRIGGER, DeviceCaps, TargetId, TensorCoreSupport,
     WatchdogBudget,
 };
 use poot_tensor::DType as GDt;
@@ -30,10 +29,6 @@ use poot_test_util::device_caps::default_caps_for;
 use std::collections::HashMap;
 
 use super::*;
-use crate::device_validation::ResourceRefusal;
-use crate::graph_validation::test_only::{
-    validate_graph_execution, validate_wgpu_tensor_execution,
-};
 use poot_graph_ir::op::BinOp as GBinOp;
 use poot_graph_ir::op::UnOp as GUnOp;
 use poot_kernelgen as kg;
@@ -1039,7 +1034,7 @@ fn a_biased_checkpoint_orientation_projection_is_one_contraction_with_bias_and_n
                     backend,
                     caps: default_caps_for(backend),
                 },
-                &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+                &CompileOptions::new(CompileLimits::STANDARD),
             )
             .unwrap_or_else(|e| panic!("{backend:?} {weight:?}: {e}"));
             let ops: Vec<&OpKind> = program.graph().eqns().iter().map(|e| &e.op).collect();
@@ -2518,46 +2513,6 @@ fn e4m3fn_gather_rejects_empty_output_and_non_i32_indices_by_name() {
 }
 
 #[test]
-fn e4m3fn_zero_eqn_identity_graph_is_rejected_before_executor_binding() {
-    let constant_graph = {
-        let b = Builder::for_tests();
-        let x = b
-            .constant("raw", TensorType::new(vec![3, 5], GDt::E4M3FN))
-            .unwrap();
-        b.finish(x).unwrap()
-    };
-    let slot_graph = {
-        let b = Builder::for_tests();
-        let x = b
-            .slot(
-                poot_graph_ir::Slot::TokenEmbed,
-                TensorType::new(vec![3, 5], GDt::E4M3FN),
-            )
-            .unwrap();
-        b.finish(x).unwrap()
-    };
-
-    for graph in [&constant_graph, &slot_graph] {
-        assert!(
-            graph.eqns().is_empty(),
-            "regression requires an identity graph"
-        );
-        let err = validate_graph_execution(graph).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                PlanError::UnrepresentableValue {
-                    value,
-                    dtype: GDt::E4M3FN,
-                    gap: StorageGap::E4m3RawBytes,
-                } if value == graph.result()
-            ),
-            "{err:?}"
-        );
-    }
-}
-
-#[test]
 fn tensorcore_selected_only_for_nvptx_bf16_aligned() {
     // NVPTX + bf16 + all dims 16-aligned -> tensor cores (the `tc:` tag).
     let g = matmul_graph(16, 32, 16, GDt::BF16);
@@ -3133,15 +3088,11 @@ fn widen_preserves_cpu_oracle_numerics() {
             w_data.iter().map(|v| (v.to_bits() >> 16) as u16).collect(),
         )),
     );
-    let unwidened = poot_eval::eval(
-        &g,
-        &inputs,
-        poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-    )
-    .expect("cpu eval (unwidened)")
-    .output
-    .into_host()
-    .expect("dense unwidened output");
+    let unwidened = poot_eval::eval(&g, &inputs, poot_eval::EvalOptions::default())
+        .expect("cpu eval (unwidened)")
+        .output
+        .into_host()
+        .expect("dense unwidened output");
 
     for backend in [
         Backend::SpirvVulkan,
@@ -3149,15 +3100,11 @@ fn widen_preserves_cpu_oracle_numerics() {
         Backend::AmdGcn(AmdArch::gfx1151()),
     ] {
         let gw = widen_mismatched_matmul_dtypes(&g, backend).unwrap();
-        let widened = poot_eval::eval(
-            &gw,
-            &inputs,
-            poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-        )
-        .expect("cpu eval (widened)")
-        .output
-        .into_host()
-        .expect("dense widened output");
+        let widened = poot_eval::eval(&gw, &inputs, poot_eval::EvalOptions::default())
+            .expect("cpu eval (widened)")
+            .output
+            .into_host()
+            .expect("dense widened output");
         assert_eq!(
             widened.as_f32().unwrap(),
             unwidened.as_f32().unwrap(),
@@ -3177,15 +3124,11 @@ fn widen_preserves_cpu_oracle_numerics() {
         gf.inputs()[1],
         poot_eval::Value::from(poot_tensor::HostTensor::f32(vec![k, n], w_data)),
     );
-    let f32_ref = poot_eval::eval(
-        &gf,
-        &inputs_f32,
-        poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-    )
-    .expect("cpu eval (f32 reference)")
-    .output
-    .into_host()
-    .expect("dense f32 reference output");
+    let f32_ref = poot_eval::eval(&gf, &inputs_f32, poot_eval::EvalOptions::default())
+        .expect("cpu eval (f32 reference)")
+        .output
+        .into_host()
+        .expect("dense f32 reference output");
     assert_eq!(
         unwidened.as_f32().unwrap(),
         f32_ref.as_f32().unwrap(),
@@ -3812,7 +3755,7 @@ fn compiled(g: &Graph, backend: Backend) -> Program {
         backend,
         caps: default_caps_for(backend),
     };
-    let options = CompileOptions::new(Submission::Replay, crate::CompileLimits::STANDARD);
+    let options = CompileOptions::new(crate::CompileLimits::STANDARD);
     compile(g, &target, &options).expect("the matmul compiles")
 }
 
@@ -3964,7 +3907,7 @@ fn a_collective_inside_a_stage_graph_is_refused_by_compile() {
                 backend,
                 caps: default_caps_for(backend),
             };
-            let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+            let options = CompileOptions::new(CompileLimits::STANDARD);
             match compile(&g, &target, &options) {
                 Err(CompileError::Plan(error)) => match *error {
                     PlanError::Refused(refusal) => {
@@ -5053,14 +4996,10 @@ fn attention_lanes_follow_the_device_workgroup_memory() {
 /// The plan records the implemented streaming schedule and the exact resources it needs, over a fixed bank:
 /// short and long prefill, low- and high-head decode, and a D = 256 softcapped prefill. Per row the request
 /// names `Streaming { lanes }`, the dispatch body states `lanes * (dv + 2) * 4` bytes of workgroup memory
-/// and a `[lanes, 1, 1]` workgroup, and the kernel declares the serial work one thread does (its share of
-/// the keys, twice over the head width). Finalization enforces the declaration: a device whose dispatch
-/// budget is exactly that work admits the equation, one step less refuses with `DispatchWork` naming it.
-/// Mutation: drop the attention arm of `KernelRequest::requirements` (an under-declaration), or bypass
-/// resource finalization in the planner; the one-step-short row is admitted and goes red.
+/// and a `[lanes, 1, 1]` workgroup.
 #[test]
-fn the_streaming_schedule_records_its_exact_resources_and_finalization_enforces_them() {
-    // (fixture, backend, lanes, workgroup-memory bytes, threads, steps per thread), from the shapes by hand.
+fn the_streaming_schedule_records_its_exact_resources() {
+    // (fixture, backend, lanes, workgroup-memory bytes), from the shapes by hand.
     let wgpu = Backend::SpirvVulkan;
     let rows = [
         (
@@ -5068,16 +5007,12 @@ fn the_streaming_schedule_records_its_exact_resources_and_finalization_enforces_
             wgpu,
             32usize,
             8448usize,
-            8 * 16 * 32,
-            16u64.div_ceil(32) * 2 * 64,
         ),
         (
             AttentionFixture::prefill("long prefill", 8, 4, 512, 128),
             wgpu,
             16,
             8320,
-            8 * 512 * 16,
-            512u64.div_ceil(16) * 2 * 128,
         ),
         // 192 keys is under two 128-key chunks: the rows are few but a split has nothing to gain.
         (
@@ -5085,27 +5020,21 @@ fn the_streaming_schedule_records_its_exact_resources_and_finalization_enforces_
             wgpu,
             16,
             8320,
-            2 * 16,
-            192u64.div_ceil(16) * 2 * 128,
         ),
         (
             AttentionFixture::decode("high-head decode", 4, 32, 4, 2048, 128),
             Backend::AmdGcn(AmdArch::gfx1151()),
             64,
             4 * (64 * 128 + 2 * 64),
-            4 * 32 * 64,
-            2048u64.div_ceil(64) * 2 * 128,
         ),
         (
             AttentionFixture::prefill("softcap prefill D=256", 4, 2, 24, 256).softcapped(50.0),
             Backend::Nvptx,
             32,
             4 * (32 * 256 + 2 * 32),
-            4 * 24 * 32,
-            24u64.div_ceil(32) * 2 * 256,
         ),
     ];
-    for (fixture, backend, lanes, lds_bytes, threads, steps) in rows {
+    for (fixture, backend, lanes, lds_bytes) in rows {
         let caps = default_caps_for(backend);
         let (plan, choice) = attention_planned(fixture, backend, &caps)
             .unwrap_or_else(|e| panic!("{}: {e:?}", fixture.name));
@@ -5124,54 +5053,15 @@ fn the_streaming_schedule_records_its_exact_resources_and_finalization_enforces_
             "{}: workgroup",
             fixture.name
         );
-        let KernelChoice::Generated(request) = &choice else {
-            unreachable!("asserted generated above")
-        };
-        let work = kg::SerialWork {
-            threads: threads as u64,
-            steps_per_thread: steps,
-        };
-        assert_eq!(
-            request.requirements().serial_work,
-            Some(work),
-            "{}: declared serial work",
-            fixture.name
-        );
-
-        let budgeted = |budget: u64| DeviceCaps {
-            max_dispatch_work: Queried::Known(budget),
-            ..caps
-        };
-        attention_planned(fixture, backend, &budgeted(work.total()))
-            .unwrap_or_else(|e| panic!("{}: the exact budget admits: {e:?}", fixture.name));
-        let refusal = refusal_of(
-            attention_planned(fixture, backend, &budgeted(work.total() - 1)).map(|(plan, _)| plan),
-            fixture.name,
-        );
-        assert!(
-            matches!(
-                refusal.missing,
-                Capability::KernelResources(ResourceRefusal::DispatchWork { work: w, .. })
-                    if w == work.total()
-            ),
-            "{}: one step short must refuse naming {} steps, got {:?}",
-            fixture.name,
-            work.total(),
-            refusal.missing
-        );
     }
 }
 
-/// POOT-1113: the split-KV plan records the exact resources of both its launches, and finalization enforces
-/// them. A 2-row decode over 1024 keys on the wgpu caps plans 8 splits of 128 keys over 16 lanes: stage one is
-/// `rows * splits` workgroups of `lanes` threads, each walking its chunk twice over the head width (`dk + dv`),
-/// with `lanes * (dv + 2) * 4` bytes of workgroup memory; the combine is one workgroup of `lanes` threads per
-/// row, each reducing its share of `dv` channels over the splits, with no workgroup memory. A device whose
-/// dispatch budget is stage one's work admits the equation; one step less refuses naming it.
-/// Mutation: drop the attention arm of `KernelRequest::requirements` for the split schedule (an
-/// under-declaration of stage one); the one-step-short row is admitted and goes red.
+/// POOT-1113: the split-KV plan records the exact resources of both its launches. A 2-row decode over 1024
+/// keys on the wgpu caps plans 8 splits of 128 keys over 16 lanes: stage one is `rows * splits` workgroups of
+/// `lanes` threads with `lanes * (dv + 2) * 4` bytes of workgroup memory; the combine is one workgroup of
+/// `lanes` threads per row with no workgroup memory.
 #[test]
-fn the_split_kv_plan_records_the_exact_resources_of_both_launches_and_finalization_enforces_them() {
+fn the_split_kv_plan_records_the_exact_resources_of_both_launches() {
     let backend = Backend::SpirvVulkan;
     let caps = default_caps_for(backend);
     let fixture = AttentionFixture::decode("low-head long decode", 1, 2, 1, 1024, 128);
@@ -5193,49 +5083,6 @@ fn the_split_kv_plan_records_the_exact_resources_of_both_launches_and_finalizati
     assert_eq!(used(&dispatches[0]).workgroup, [lanes as u32, 1, 1]);
     assert_eq!(used(&dispatches[1]).lds_bytes, 0);
     assert_eq!(used(&dispatches[1]).workgroup, [lanes as u32, 1, 1]);
-
-    let stage_one = kg::SerialWork {
-        threads: (2 * splits * lanes) as u64,
-        steps_per_thread: 128u64.div_ceil(lanes as u64) * (128 + 128),
-    };
-    let combine = kg::SerialWork {
-        threads: (2 * lanes) as u64,
-        steps_per_thread: 128u64.div_ceil(lanes as u64) * splits as u64,
-    };
-    assert!(combine.total() < stage_one.total(), "stage one binds");
-    let KernelChoice::Generated(request) = &choice else {
-        unreachable!("asserted generated above")
-    };
-    assert_eq!(request.requirements().serial_work, Some(stage_one));
-    assert_eq!(
-        kg::AttentionCombineSpec::of(attention_spec(&choice)).map(|spec| {
-            kg::KernelRequest::AttentionCombine(spec)
-                .requirements()
-                .serial_work
-        }),
-        Some(Some(combine))
-    );
-
-    let budgeted = |budget: u64| DeviceCaps {
-        max_dispatch_work: Queried::Known(budget),
-        ..caps
-    };
-    attention_planned(fixture, backend, &budgeted(stage_one.total()))
-        .expect("the exact budget admits both launches");
-    let refusal = refusal_of(
-        attention_planned(fixture, backend, &budgeted(stage_one.total() - 1)).map(|(plan, _)| plan),
-        fixture.name,
-    );
-    assert!(
-        matches!(
-            refusal.missing,
-            Capability::KernelResources(ResourceRefusal::DispatchWork { work, .. })
-                if work == stage_one.total()
-        ),
-        "one step short must refuse naming {} steps, got {:?}",
-        stage_one.total(),
-        refusal.missing
-    );
 }
 
 /// Regression: `is_elementwise_2d` used to gate every arm on `dtype == F32`, including Binary/Unary/
@@ -6060,80 +5907,6 @@ fn dense_bf16_decode_gemv_selection_rows() {
     }
 }
 
-/// Card 380 P1. `validate_wgpu_tensor_execution` is the fail-closed half of the packed-BF16 contract: the
-/// typed value walk stores BF16 as packed u32 lanes and checks every plan against that, and every other
-/// wgpu entry point (which binds `Arc<[f32]>` tensors) rejects a BF16 value by name instead of uploading
-/// f32 words for a kernel that reads packed lanes.
-///
-/// The device test `wgpu_resident_kv_rejects_a_bf16_contraction_weight` drives the same rejection through
-/// the executor contract; this one covers it without a device.
-#[test]
-fn card380_wgpu_tensor_execution_rejects_every_bf16_value() {
-    // The card 380 shape: the contraction weight survives preparation as BF16, safe only on the typed walk.
-    let prepared =
-        widen_mismatched_matmul_dtypes(&dense_contraction_graph(1, 32, 16), Backend::SpirvVulkan)
-            .unwrap();
-    let weight = const_id(&prepared, "w");
-    assert_eq!(prepared.aval(weight).dtype, GDt::BF16);
-    let error = validate_wgpu_tensor_execution(&prepared)
-        .expect_err("a BF16 value must be rejected on the wgpu tensor lane");
-    assert!(
-        matches!(
-            error,
-            PlanError::UnrepresentableValue {
-                value,
-                dtype: GDt::BF16,
-                gap: StorageGap::Bf16PackedLanes,
-            } if value == weight
-        ),
-        "the rejection must name bf16 and the value: {error:?}"
-    );
-
-    // The other way a BF16 value reaches a prepared wgpu graph: a plain gather of a BF16 table, which would
-    // otherwise fail in SPIR-V codegen with an opaque message.
-    let bld = Builder::for_tests();
-    let table = bld
-        .constant("table", TensorType::new(vec![4, 3], GDt::BF16))
-        .unwrap();
-    let index = bld
-        .constant("index", TensorType::new(vec![2], GDt::I32))
-        .unwrap();
-    let gathered = bld.gather(table, 0, index).unwrap();
-    let widened =
-        widen_mismatched_matmul_dtypes(&bld.finish(gathered).unwrap(), Backend::SpirvVulkan)
-            .unwrap();
-    assert!(
-        !widened
-            .eqns()
-            .iter()
-            .any(|eqn| matches!(eqn.op, OpKind::Cast { to: GDt::BF16 })),
-        "the table is not retyped, so nothing casts it back to BF16"
-    );
-    assert!(
-        matches!(
-            validate_wgpu_tensor_execution(&widened)
-                .expect_err("a BF16 table must be rejected too"),
-            PlanError::UnrepresentableValue {
-                dtype: GDt::BF16,
-                gap: StorageGap::Bf16PackedLanes,
-                ..
-            }
-        ),
-        "the BF16 table must be rejected for being BF16, not for some other reason"
-    );
-
-    // An all-F32 graph is untouched.
-    let f32_only =
-        widen_mismatched_matmul_dtypes(&matmul_graph(1, 32, 16, GDt::F32), Backend::SpirvVulkan)
-            .unwrap();
-    validate_wgpu_tensor_execution(&f32_only).expect("an all-F32 prepared graph still executes");
-
-    // Scoped to wgpu: the shared admission path PTX and ROCm also call still accepts the same BF16
-    // graph, because both have narrow BF16 storage.
-    validate_graph_execution(&prepared)
-        .expect("PTX and ROCm must not be gated by a wgpu limitation");
-}
-
 /// The dense Gemv arm of the packed-reader planner passes the one finalizer like every other arm: on a device
 /// whose workgroup holds one invocation fewer than the Gemv's `width`, planning the folded M == 1 contraction is
 /// a typed `WorkgroupInvocations` refusal naming both figures, not a plan a loader would receive. (`compile`
@@ -6250,7 +6023,7 @@ fn bf16_projection_contraction_choice(
         b.matmul(x, w).unwrap()
     };
     let graph = b.finish(out).unwrap();
-    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD);
     let target = Target::Gpu {
         backend,
         caps: default_caps_for(backend),
@@ -6512,90 +6285,4 @@ fn a_scratch_past_the_buffer_limit_is_refused_by_finalize() {
             max_buffer_bytes: caps.max_buffer_bytes,
         }
     );
-}
-
-/// POOT-1115 decision 3, a deliberate tightening: an imported kernel's serial work is apportioned over
-/// the dispatches of an unequal split by each launch's share of the plan, not divided evenly by the
-/// dispatch count. A 4096 x 4096 F32 imported tiled GEMM on RADV splits its tile groups at the device's
-/// tile ceiling into full dispatches and a one-group remainder; a full dispatch carries more than an even
-/// share of the output, so its serial work is the bound.
-///
-/// The plan is `tiled_gemm_plan`'s (the matmul route's own constructor) through `finalize`: the compile
-/// pipeline prefers the generated tiled region for this shape, so the imported route is not reached by
-/// `compile` today.
-///
-/// Mutation: apportion by `(1, dispatches.len())` in `validate_planned_resources` (the old even split);
-/// one step short of the largest dispatch's work is then admitted and the refusal below goes red.
-#[test]
-fn an_unequal_tile_split_apportions_serial_work_by_launch_share() {
-    use crate::device_validation::ResourceRefusal;
-    use crate::kernel_mapping::finalize;
-
-    let (m, k, n) = (4096usize, 8usize, 4096usize);
-    let g = matmul_graph(m, k, n, GDt::F32);
-    let backend = Backend::SpirvVulkan;
-    let caps = default_caps_for(backend);
-    let eqn = g
-        .eqns()
-        .iter()
-        .find(|eqn| matches!(eqn.op, OpKind::MatMul))
-        .expect("a matmul eqn");
-    let shape = g.aval(eqn.out).shape.clone();
-    let out_numel = numel(&shape);
-    let split = |caps: &DeviceCaps| {
-        let mut planned = crate::predicates::tiled_gemm_plan(backend, m, k, n, caps)?;
-        finalize(
-            &mut planned,
-            GraphTables::from(&g),
-            eqn,
-            &shape,
-            out_numel,
-            backend,
-            GDt::F32,
-            caps,
-        )
-        .map(|()| planned)
-    };
-    let planned = split(&caps).expect("an unbudgeted device admits the split");
-    let launches: Vec<u128> = planned
-        .plan
-        .dispatches()
-        .iter()
-        .map(|d| d.launch().grid.iter().map(|&e| u128::from(e)).product())
-        .collect();
-    let last = launches.len() - 1;
-    assert!(launches.len() > 1, "the GEMM splits: {launches:?}");
-    assert!(
-        launches[0] > launches[last],
-        "the split is unequal: {launches:?}"
-    );
-    let total: u128 = launches.iter().sum();
-    let (out, steps) = (out_numel as u128, k as u128);
-    let first_work = (out * launches[0]).div_ceil(total) * steps;
-    let even_work = out.div_ceil(launches.len() as u128) * steps;
-    assert!(
-        first_work > even_work,
-        "the tightening: {first_work} vs {even_work}"
-    );
-
-    let budgeted = |budget: u128| DeviceCaps {
-        max_dispatch_work: Queried::Known(budget as u64),
-        ..caps
-    };
-    split(&budgeted(first_work)).expect("the exact budget admits the largest dispatch");
-    match split(&budgeted(first_work - 1)) {
-        Err(PlanError::Refused(refusal)) => assert!(
-            matches!(
-                refusal.missing,
-                Capability::KernelResources(ResourceRefusal::DispatchWork { work, .. })
-                    if u128::from(work) == first_work
-            ),
-            "got {:?}",
-            refusal.missing
-        ),
-        other => panic!(
-            "one step short must refuse, got {:?}",
-            other.map(|p| p.plan)
-        ),
-    }
 }

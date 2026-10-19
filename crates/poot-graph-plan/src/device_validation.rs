@@ -476,24 +476,13 @@ pub enum ResourceRefusal {
         /// Bytes of workgroup memory the device offers.
         available: u32,
     },
-    /// One dispatch carries more serial steps than the device's calibrated bound.
-    #[error("one dispatch carries {work} serial steps; the device bounds a dispatch at {budget}")]
-    DispatchWork {
-        /// Serial steps one dispatch carries.
-        work: u64,
-        /// The device's bound on serial steps per dispatch.
-        budget: u64,
-    },
 }
 
 /// Check one kernel against `caps` before any loader sees it. `body` states the resources the kernel
 /// uses; `declared` states what the body cannot (see [`KernelRequirements`]). The
 /// resources the body states are measured from it, so a declaration that understates one is refused, not
-/// believed. An `Unknown` subgroup or matrix-hardware capability cannot prove a requirement and refuses; an
-/// `Unknown` `max_dispatch_work` means no calibrated bound exists, and the dispatch is admitted. Every
-/// production `DeviceCaps` default keeps `max_dispatch_work` `Unknown` until POOT-634 calibrates it, so only
-/// fixture caps exercise the work refusal today. The launch's
-/// workgroup count is not checked here: a host folds an oversized 1-D launch onto Y (`fold_grid`), so
+/// believed. An `Unknown` subgroup or matrix-hardware capability cannot prove a requirement and refuses. The
+/// launch's workgroup count is not checked here: a host folds an oversized 1-D launch onto Y (`fold_grid`), so
 /// whether a count fits is that fold's rule, and the host refuses with its own typed `GridCap`.
 pub(crate) fn validate_kernel_resources(
     body: &Body,
@@ -553,14 +542,6 @@ pub(crate) fn validate_kernel_resources(
         return Err(ResourceRefusal::StaticLds {
             needed: used.lds_bytes,
             available: caps.lds_bytes,
-        });
-    }
-    if let (Some(work), Queried::Known(budget)) = (declared.serial_work, caps.max_dispatch_work)
-        && work.total() > budget
-    {
-        return Err(ResourceRefusal::DispatchWork {
-            work: work.total(),
-            budget,
         });
     }
     Ok(())

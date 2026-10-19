@@ -4,16 +4,13 @@
 
 use poot_graph_ir::{OpKind, Operand, Storage};
 use poot_kernelgen::{ContractionSpec, KernelRequest};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_target::{AmdArch, Backend, BufferStorage};
 use poot_tensor::DType;
 use poot_test_util::device_caps::default_caps_for;
 
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, KernelChoice, Target, compile, numel,
-    production_plan::Submission,
-};
+use poot_graph_plan::{CompileLimits, CompileOptions, KernelChoice, Target, compile, numel};
 
 const VOCAB: usize = 151936;
 const HIDDEN: usize = 896;
@@ -31,8 +28,7 @@ fn qwen2_5_0_5b_decode() -> poot_graph_ir::Graph {
         .zeroed_model(DType::BF16)
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, 64, LogitRows::Last),
+            &StepSpec::step(step(1, 1, 64, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -48,7 +44,7 @@ fn qwen2_5_0_5b_decode() -> poot_graph_ir::Graph {
 #[test]
 fn the_tied_head_decode_runs_the_bf16_gemv_over_bf16_resident_weight() {
     let graph = qwen2_5_0_5b_decode();
-    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD);
     for backend in [Backend::SpirvVulkan, Backend::AmdGcn(AmdArch::gfx1151())] {
         let target = Target::Gpu {
             backend,

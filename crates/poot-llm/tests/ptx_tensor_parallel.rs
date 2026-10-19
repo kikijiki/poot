@@ -15,19 +15,18 @@
 use std::sync::Arc;
 
 use poot_executor::{Coordinator, Device, Engine, Executor, NoSync};
-use poot_executor_parity::assert_close;
 use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::{IndexRange, Slot};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, ShardRule, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
-use poot_models::model::Phase;
 use poot_models::test_support::dense::{Dense, Family};
 use poot_models::test_support::weight_map::{MappedModel, Step, decode_steps, trace};
 use poot_ptx_device::PtxDevice;
 use poot_runtime_common::DeviceBackend;
+use poot_test_util::assert_close_scaled;
 
 const TOKENS: [i32; 6] = [3, 11, 7, 29, 5, 17];
 
@@ -74,7 +73,7 @@ fn open_two() -> Option<Vec<PtxDevice>> {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 fn logits<E: Executor>(
@@ -105,7 +104,7 @@ fn single_device(mapped: &MappedModel, steps: &[Step]) -> (Vec<Vec<f32>>, Tier2C
     let exe = engine
         .load_weights(Arc::clone(&mapped.store), Arc::clone(&mapped.map))
         .unwrap();
-    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let g = trace(&*mapped.model, &mapped.map, 1, CAPACITY);
     let program = compile_staged(
         &g,
         &TargetSet::single(DeviceId(0), target),
@@ -140,7 +139,7 @@ fn tensor_parallel(devices: Vec<PtxDevice>, mapped: &MappedModel) -> Group {
             .collect(),
     )
     .unwrap();
-    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let g = trace(&*mapped.model, &mapped.map, 1, CAPACITY);
     let program = compile_staged(
         &g,
         &set,
@@ -192,7 +191,7 @@ fn assert_tensor_parallel_matches_single(
     let got = logits(&mut group.coordinator, group.exe, group.entry, &steps);
     let tolerance = want_class.max(group.program.numerics_class()).tolerance();
     for (step, (got, want)) in got.iter().zip(&want).enumerate() {
-        assert_close(got, want, tolerance, &format!("{label}: step {step}"));
+        assert_close_scaled(got, want, tolerance, &format!("{label}: step {step}"));
     }
     let counters = group.coordinator.counters();
     assert_eq!(
@@ -295,7 +294,7 @@ fn sixteen_tensor_parallel_steps_upload_the_weight_shares_once_on_ptx() {
 #[test]
 fn the_long_run_stays_inside_the_traced_position_range() {
     let mapped = Dense::new(Family::Qwen2).dims(64, 96, 3).model();
-    let g = trace(&*mapped.model, &mapped.map, Phase::Decode, 1, CAPACITY);
+    let g = trace(&*mapped.model, &mapped.map, 1, CAPACITY);
     let pos = g
         .slots()
         .iter()

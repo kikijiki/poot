@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use poot_eval::{EvalBudget, EvalOptions, ExactI32TensorView, Value, eval};
+use poot_eval::{EvalOptions, ExactI32TensorView, Value, eval};
 use poot_graph_ir::Builder;
 
 /// Selected words. Both the Gather result and the f32 cast result are `SELECTED * 4` bytes.
@@ -155,7 +155,7 @@ fn selected_cast_allocates_only_its_published_result() {
         ),
     ]);
     let (result, records) =
-        record_large_allocations(|| eval(&graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)));
+        record_large_allocations(|| eval(&graph, &inputs, EvalOptions::default()));
 
     let Value::Host(tensor) = result.unwrap().output else {
         panic!("selected cast must publish a dense f32 result")

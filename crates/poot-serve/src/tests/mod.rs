@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use poot_llm::driver::{
-    AdapterRef, DriverCaps, HeadSet, InputSet, LoadOptions, ModelHandle, RowSpeculation,
+    AdapterRef, DriverCaps, HeadSet, InputCaps, Layout, LoadOptions, ModelHandle, RowSpeculation,
     StateResidency,
 };
 use poot_llm::encoders::Pooling;
@@ -73,7 +73,8 @@ mod terminal_done;
 mod write_deadline;
 
 use recording_engine::{
-    Event, FakeSeq, JobSpec, RecordingEngine, Submitted, outcome, refused, serve, tokens_of,
+    Event, FakeSeq, JobSpec, RecordingEngine, Submitted, embed_inputs, outcome, refused, serve,
+    tokens_of,
 };
 
 /// What a scripted generation of the test double returns: the generated tokens and text, and why it
@@ -181,9 +182,8 @@ pub(crate) fn test_caps(rows: usize) -> DriverCaps {
         lora: None,
         windows: Vec::new(),
         speculation: None,
-        inputs: InputSet {
-            tokens: true,
-            embeds: false,
+        inputs: InputCaps {
+            carried: Vec::new(),
             encode: true,
         },
         // A generative family that traces an embedding pass encodes at the rows it decodes with.
@@ -208,9 +208,8 @@ pub(crate) fn test_encoder_caps(rows: usize, max_len: usize) -> DriverCaps {
         row_counts: Vec::new(),
         widths: Vec::new(),
         max_seq: shapes.max_len,
-        inputs: InputSet {
-            tokens: false,
-            embeds: false,
+        inputs: InputCaps {
+            carried: Vec::new(),
             encode: true,
         },
         encode: Some(poot_llm::driver::EncodeCaps {
@@ -233,8 +232,8 @@ pub(crate) fn served_over(
 /// The caps a fake of `rows` rows publishes for `model`: decode rows for a generative model, encode
 /// shapes for an encoder.
 fn default_caps(model: &ModelHandle, rows: usize) -> DriverCaps {
-    match model.config().output {
-        poot_models::model::ModelOutput::Logits { .. } => test_caps(rows),
+    match model.schema().step().map(|program| program.output()) {
+        Some(poot_models::model::ModelOutput::Logits { .. }) => test_caps(rows),
         _ => test_encoder_caps(rows, 16),
     }
 }
@@ -354,7 +353,7 @@ pub(crate) fn submit_one(
 /// A generation request over the tokens of `prompt` (one token per character).
 pub(crate) fn generation_request(prompt: &str, max_new: usize, stream: bool) -> GenerationRequest {
     GenerationRequest {
-        prompt: PromptInput::Tokens(tokens_of(prompt)),
+        prompt: PromptInput::text(tokens_of(prompt)),
         max_new,
         sampler: Sampler::greedy(),
         stop: Vec::new(),

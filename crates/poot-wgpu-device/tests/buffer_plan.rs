@@ -38,9 +38,9 @@ use poot_executor::{Arg, Device, Dispatch, Engine, Executor, NoSync, StepInputs}
 use poot_graph_ir::op::RedOp;
 use poot_graph_ir::{Builder, TensorType};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -109,8 +109,7 @@ fn bytemuck_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-const REPLAY: CompileOptions =
-    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
 
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
@@ -265,7 +264,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
         .allocate(BufferRole::Output, BufferStorage::f32(), 1)
         .unwrap();
 
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     device
         .dispatch(Dispatch {
             kernel: &kernel,
@@ -287,7 +286,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
     let recording = device
         .finish()
         .unwrap()
-        .expect("Submission::Replay always returns a recording");
+        .expect("a device always returns a recording");
     device
         .replay(&recording)
         .expect("replay only re-encodes metadata; it never runs the dispatch itself");

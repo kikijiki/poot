@@ -19,13 +19,13 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::Device;
 use poot_graph_ir::op::{FusedOp, FusedOperand, OpKind, UnOp};
 use poot_graph_ir::{Slot, Storage, ValueId};
 use poot_graph_plan::test_support::gpu_caps;
-use poot_graph_plan::{CompileOptions, Target, compile, production_plan::Submission};
-use poot_models::model::{LogitRows, Phase};
+use poot_graph_plan::{CompileOptions, Target, compile};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_ptx_device::PtxDevice;
 use poot_runtime_common::DeviceBackend;
@@ -101,8 +101,7 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
     let g = m
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -141,7 +140,7 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
     let fused = compile(
         &g,
         &target,
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the gemma2 GeGLU decode graph, full pipeline");
     assert!(
@@ -184,8 +183,8 @@ fn gemma2_geglu_fused_decode_matches_the_cpu_oracle_ptx() {
     for (i, (si, _)) in g.state().enumerate() {
         cpu_inputs.insert(si, zero_state[i].clone().into());
     }
-    let cpu_eval = eval(&g, &cpu_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
-        .expect("cpu oracle eval_with_state");
+    let cpu_eval =
+        eval(&g, &cpu_inputs, EvalOptions::default()).expect("cpu oracle eval_with_state");
     let cpu = cpu_eval.output.into_host().expect("dense output");
     let _cpu_new_state: Vec<HostTensor> = cpu_eval
         .state

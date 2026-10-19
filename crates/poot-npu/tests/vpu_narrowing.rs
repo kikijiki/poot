@@ -22,7 +22,6 @@ use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, NoSync};
 use poot_executor_parity::{Fixture, fixture_weights, staged};
 use poot_graph_ir::{BinOp, Builder, Scalar, Slot, TensorType, Traced, UnOp};
-use poot_graph_plan::production_plan::Submission;
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore, WeightStoreBuilder};
 use poot_tensor::{DType, HostTensor};
@@ -184,9 +183,7 @@ fn measure(fixture: &Fixture) -> Option<(f32, f32)> {
         fixture_weights(fixture),
     )
     .unwrap();
-    let entry =
-        poot_executor::Executor::add_entry(exec, exe, &staged(fixture, target, Submission::Replay))
-            .unwrap();
+    let entry = poot_executor::Executor::add_entry(exec, exe, &staged(fixture, target)).unwrap();
     let mut oracle = oracle_for(&fixture.graph, &fixture.store);
     let mut worst = 0.0f32;
     for (i, step) in fixture.steps.iter().enumerate() {
@@ -314,15 +311,12 @@ fn an_f32_value_outside_the_narrowing_range_is_a_typed_error() {
         fixture_weights(&fixture),
     )
     .unwrap();
-    let entry = poot_executor::Executor::add_entry(
-        &mut npu.engine,
-        exe,
-        &staged(&fixture, target, Submission::Replay),
-    )
-    .unwrap();
+    let entry = poot_executor::Executor::add_entry(&mut npu.engine, exe, &staged(&fixture, target))
+        .unwrap();
 
     let range_error = |result: Result<Vec<f32>, poot_executor::ExecError>| {
-        let poot_executor::ExecError::Device(device) = result.as_ref().expect_err("the value is refused")
+        let poot_executor::ExecError::Device(device) =
+            result.as_ref().expect_err("the value is refused")
         else {
             panic!("a device refusal, got {result:?}");
         };

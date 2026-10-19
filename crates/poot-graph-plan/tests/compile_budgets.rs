@@ -12,7 +12,6 @@ use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, ExpansionError, GraphResource,
     KernelChoice, LegalizeError, PlanError, Target, compile, legalize, plan_eqn_choice,
-    production_plan::Submission,
 };
 use poot_kernelgen::{BodyLimits, BodyResource, BodyStage, KernelGenError, KernelRequest};
 use poot_target::Backend;
@@ -28,7 +27,7 @@ fn wgpu() -> Target {
 }
 
 fn options(limits: CompileLimits) -> CompileOptions {
-    CompileOptions::new(Submission::Replay, limits)
+    CompileOptions::new(limits)
 }
 
 fn nz(n: usize) -> NonZeroUsize {

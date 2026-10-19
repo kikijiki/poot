@@ -16,15 +16,19 @@ use poot_executor::{
     Device, Dispatch, Engine, EntryId, ExecError, ExecutableId, Executor, ExecutorStats, HostSync,
     StateScope, StepInputs, StepOutputs,
 };
-use poot_graph_ir::{BinOp, Graph, StateRole, TensorType};
-use poot_graph_plan::{
-    CompileOptions, Target, production_plan::Submission, staged::StagedProgram, staged::TargetSet,
-};
+use poot_graph_ir::{BinOp, Graph, Slot, SlotKey, StateRole, TensorType};
+use poot_graph_plan::{CompileOptions, Target, staged::StagedProgram, staged::TargetSet};
+use poot_models::components::embed::{EMBEDS, embeds_input};
 use poot_models::components::linear::{Weight, linear};
+use poot_models::components::rope::{MROPE, mrope_input};
 use poot_models::components::standard::Step;
+use poot_models::io::{
+    Fill, InputId, ModelSchema, PadValue, Per, Presence, ProgramId, ProgramSpec, RequestForm,
+    RequestInput, StateSpec,
+};
 use poot_models::model::{
-    ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, Phase,
-    ShapeReason, StepShape, TraceError,
+    ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
+    StepShape, StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::StoredBytes;
@@ -45,8 +49,9 @@ use crate::driver::error::{
     DriverError, InvalidOptions, InvalidRequest, LoadError, PreparedSetRefusal, Unsupported,
 };
 use crate::driver::{
-    Driver, DriverOptions, FinishReason, GenerateRequest, Generation, Head, Layout, LoadOptions,
-    ModelHandle, PreparedSetLimits, Retention, ServingShapes, Warm,
+    Driver, DriverOptions, Feature, FinishReason, GenerateRequest, Generation, Head, Incompatible,
+    Layout, LoadOptions, ModelHandle, PreparedSetLimits, Retention, Serving, ServingShapes, State,
+    Unprepared, Warm,
 };
 use poot_text::{ChatTemplate, ChatTemplateError, ChatTemplateOverride, TextCodec};
 
@@ -63,7 +68,25 @@ fn nz(n: usize) -> NonZeroUsize {
 // own slots (its logits depend on the last token and position, so both slots stay live).
 // ---------------------------------------------------------------------------------------------
 
-type TraceLog = Arc<Mutex<Vec<(Phase, StepShape)>>>;
+type TraceLog = Arc<Mutex<Vec<(StepKind, StepShape)>>>;
+
+/// How a traced step is used: the model has one `step` program, so the kind is read off the shape
+/// (one token per row, last logits row only, is a decode step), as the driver classifies it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepKind {
+    Prefill,
+    Decode,
+}
+
+impl StepKind {
+    fn of(shape: StepShape) -> Self {
+        if shape.is_decode() {
+            Self::Decode
+        } else {
+            Self::Prefill
+        }
+    }
+}
 
 const TINY: FamilyKey = FamilyKey::new("tiny");
 
@@ -81,7 +104,18 @@ pub(super) enum Variant {
     /// The projection of [`Variant::Lora`] and one `StateRole::Positional` `[rows, 2, capacity, 4]` cache
     /// the step folds in place: the weights and the cache a read-traffic row counts.
     Positional,
+    /// Nothing carried; the step reads sectioned positions (`components::rope::MROPE`, defaulted to
+    /// the text positions), as a Qwen-VL text tower does.
+    Sectioned,
+    /// Nothing carried; the step may carry one padded per-row tensor ([`ROWS`], optional, bound when a
+    /// row starts) of at most [`ROWS_EXTENT`] values.
+    Rows,
 }
+
+/// The request input of the [`Variant::Rows`] family: a per-row I32 tensor padded to [`ROWS_EXTENT`].
+pub(super) const ROWS: InputId = InputId::new("rows");
+/// The leading extent the [`Variant::Rows`] family traces its per-row tensor at.
+pub(super) const ROWS_EXTENT: usize = 4;
 
 impl Variant {
     fn parse(name: Option<&str>) -> Option<Self> {
@@ -91,6 +125,8 @@ impl Variant {
             Some("bad_row_axis") => Self::BadRowAxis,
             Some("lora") => Self::Lora,
             Some("positional") => Self::Positional,
+            Some("sectioned") => Self::Sectioned,
+            Some("rows") => Self::Rows,
             Some(_) => return None,
         })
     }
@@ -102,6 +138,8 @@ impl Variant {
             Self::BadRowAxis => "bad_row_axis",
             Self::Lora => "lora",
             Self::Positional => "positional",
+            Self::Sectioned => "sectioned",
+            Self::Rows => "rows",
         }
     }
 
@@ -114,6 +152,7 @@ impl Variant {
 #[derive(Debug)]
 struct Tiny {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
     log: TraceLog,
     variant: Variant,
@@ -124,16 +163,17 @@ impl Model for Tiny {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
+        let kind = StepKind::of(shape);
         let refuse = |reason| {
             Err(TraceError::ShapeUnsupported {
                 family: TINY,
@@ -142,10 +182,7 @@ impl Model for Tiny {
             })
         };
         let granule = self.config.prefill_granule.get();
-        if phase == Phase::Decode && shape.tokens.get() != 1 {
-            return refuse(ShapeReason::DecodeTokens);
-        }
-        if phase == Phase::Prefill && !shape.tokens.get().is_multiple_of(granule) {
+        if kind == StepKind::Prefill && !shape.tokens.get().is_multiple_of(granule) {
             return refuse(ShapeReason::Granule { granule });
         }
         if shape.capacity.get() > self.config.max_positions {
@@ -156,8 +193,21 @@ impl Model for Tiny {
         if shape.tokens > shape.capacity {
             return refuse(ShapeReason::TokensAboveCapacity);
         }
-        self.log.lock().unwrap().push((phase, shape));
-        let step = Step::new(&b, shape)?;
+        self.log.lock().unwrap().push((kind, shape));
+        let mut step = Step::new(&b, shape)?;
+        if spec.carries(EMBEDS) {
+            step = step.with_embeds(&b, 4)?;
+        }
+        if self.variant == Variant::Sectioned {
+            step = step.with_mrope(&b)?;
+        }
+        if spec.carries(ROWS) {
+            b.slot_named(
+                Slot::Activation,
+                "rows_in",
+                TensorType::new(vec![shape.rows.get(), ROWS_EXTENT], DType::I32),
+            )?;
+        }
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         // The logits rows the shape asks for: every position under `All`, else the last.
         let first = if shape.logits == LogitRows::All {
@@ -180,7 +230,7 @@ impl Model for Tiny {
         let pos = b.cast(b.slice(step.pos(), 1, first, n)?, DType::F32)?;
         let seed = b.binary(BinOp::Add, token, pos)?;
         match self.variant {
-            Variant::Plain => {}
+            Variant::Plain | Variant::Rows => {}
             Variant::Recurrent => {
                 let state = step.recurrent_state(&b, "toy.state", DType::F32, &[4])?;
                 // The last position's seed, whatever width the step has.
@@ -199,7 +249,7 @@ impl Model for Tiny {
                 let folded = b.binary(BinOp::Add, state, spread)?;
                 step.carry(state, folded);
             }
-            Variant::Lora => {}
+            Variant::Lora | Variant::Sectioned => {}
             Variant::Positional => {
                 let cache = b.state_input(
                     "toy.kv",
@@ -216,6 +266,27 @@ impl Model for Tiny {
                 .expect("the lora variant's store holds its projection");
             let inputs = b.broadcast(b.reshape(seed, vec![rows, out, 1])?, vec![rows, out, 4])?;
             logits = b.binary(BinOp::Add, logits, linear(&b, inputs, &q, None)?)?;
+        }
+        // The request inputs the step reads reach its logits, so their slots stay live in the graph.
+        let mut seen = Vec::new();
+        if let Some(embeds) = step.embeds() {
+            let at = b.cast(step.pos(), DType::F32)?;
+            let base = b.broadcast(b.reshape(at, vec![rows, n, 1])?, vec![rows, n, 4])?;
+            seen.push(b.slice(embeds.scatter(&b, base)?, 2, 0, 1)?);
+        }
+        if let Some(mrope) = step.mrope() {
+            let temporal = b.cast(
+                b.guard_index_bounds(b.slice(mrope, 0, 0, 1)?, VOCAB)
+                    .expect("the sectioned positions are a rank-2 I32 tensor")
+                    .guarded,
+                DType::F32,
+            )?;
+            seen.push(b.reshape(temporal, vec![rows, n, 1])?);
+        }
+        for column in seen {
+            let column = b.slice(column, 1, first, n)?;
+            let spread = b.broadcast(column, vec![rows, out, VOCAB])?;
+            logits = b.binary(BinOp::Add, logits, spread)?;
         }
         Ok(step.finish(b, logits)?)
     }
@@ -263,8 +334,54 @@ fn build_tiny(
             field: "state",
             reason: ConfigReason::Unsupported,
         })?;
+    // The states the graph carries: the schema declares exactly them, as `trace` checks. The `encode`
+    // program is the same graph (the fake's output is its logits).
+    let program = |id| {
+        let program = ProgramSpec::new(id, ModelOutput::Logits { vocab: VOCAB });
+        match variant {
+            Variant::Plain | Variant::Lora | Variant::Sectioned | Variant::Rows => program,
+            Variant::Recurrent | Variant::BadRowAxis => {
+                program.carrying(StateSpec::recurrent("toy.state"))
+            }
+            Variant::Positional => program.carrying(StateSpec::kv()),
+        }
+    };
+    let mut step = program(ProgramId::STEP);
+    // Every variant may carry embedding rows over a prompt's positions (`EMBEDS`, optional); the
+    // sectioned one also reads `MROPE`, defaulted to the text positions.
+    step = step.reading(EMBEDS, Presence::Optional);
+    let mut schema = ModelSchema::builder().input(embeds_input(4));
+    if variant == Variant::Sectioned {
+        step = step.reading(MROPE, Presence::Defaulted(Fill::Positions));
+        schema = schema.input(mrope_input());
+    }
+    if variant == Variant::Rows {
+        step = step.reading(ROWS, Presence::Optional);
+        schema = schema.input(RequestInput::new(
+            ROWS,
+            SlotKey::new(Slot::Activation, Some("rows_in")),
+            RequestForm::new(
+                DType::I32,
+                Per::Row {
+                    trailing: vec![],
+                    padded: true,
+                    valid: None,
+                },
+                PadValue::I32(0),
+            ),
+        ));
+    }
+    let schema = schema
+        .step(step)
+        .encode(if variant == Variant::Rows {
+            program(ProgramId::ENCODE).reading(ROWS, Presence::Optional)
+        } else {
+            program(ProgramId::ENCODE)
+        })
+        .build_for(TINY)?;
     Ok(Box::new(Tiny {
         variant,
+        schema,
         config: ModelConfig {
             family: TINY,
             vocab: VOCAB,
@@ -272,7 +389,6 @@ fn build_tiny(
             eos,
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
             prefill_granule: granule,
             chat: ChatFormat::ChatML,
         },
@@ -360,7 +476,7 @@ pub(super) fn tiny_text() -> TextCodec {
 /// What one replayed step had bound.
 #[derive(Clone, Debug, Default)]
 struct StepRecord {
-    phase: Option<Phase>,
+    kind: Option<StepKind>,
     shape: Option<StepShape>,
     tokens: Vec<i32>,
     positions: Vec<i32>,
@@ -376,8 +492,8 @@ type Script = Box<dyn FnMut(&StepRecord, usize) -> Vec<u8>>;
 
 struct World {
     script: Script,
-    /// `(phase, shape)` of each entry in `add_entry` order, from the model's trace log.
-    entries: Vec<(Phase, StepShape)>,
+    /// `(kind, shape)` of each entry in `add_entry` order, from the model's trace log.
+    entries: Vec<(StepKind, StepShape)>,
     /// Input-role buffers allocated by each entry, in graph input order.
     entry_inputs: Vec<Vec<usize>>,
     allocated: Vec<(BufferRole, usize, ElementKind)>,
@@ -488,7 +604,7 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
 
@@ -516,7 +632,7 @@ impl Device for FakeDevice {
         else {
             return Ok(());
         };
-        let (phase, shape) = world.entries[entry];
+        let (kind, shape) = world.entries[entry];
         let bound = |world: &World, ordinal: usize| -> (ElementKind, Vec<u8>) {
             let id = world.entry_inputs[entry].get(ordinal).copied();
             (
@@ -533,7 +649,7 @@ impl Device for FakeDevice {
         // Input buffers are allocated in graph input order: token, pos, then the sampler suffix's
         // seed, params and top_k when the head declares them.
         let record = StepRecord {
-            phase: Some(phase),
+            kind: Some(kind),
             shape: Some(shape),
             tokens: ints_at(&world, 0),
             positions: ints_at(&world, 1),
@@ -731,9 +847,27 @@ fn favoring(token: usize) -> Vec<f32> {
     row
 }
 
-struct Rig {
-    driver: Driver,
+struct Rig<S: State = Unprepared> {
+    driver: Driver<S>,
     world: Shared,
+}
+
+impl Rig {
+    /// The rig serving the contiguous layout, nothing prepared: a request prepares what it needs.
+    fn serve(self) -> Rig<Serving> {
+        Rig {
+            driver: self.driver.serve(Layout::Contiguous),
+            world: self.world,
+        }
+    }
+
+    /// The rig serving `shapes`, or the typed refusal (the refused rig's driver is dropped).
+    fn prepare(self, shapes: &ServingShapes<'_>) -> Result<Rig<Serving>, DriverError> {
+        Ok(Rig {
+            driver: self.driver.prepare(shapes)?,
+            world: self.world,
+        })
+    }
 }
 
 pub(super) struct RigOptions {
@@ -823,7 +957,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
         world: world.clone(),
         log,
     };
-    let compile = CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+    let compile = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
     let handle = Arc::new(handle);
     let draft = match options.draft_model_k {
         Some(k) => crate::driver::DraftPolicy::DraftModel {
@@ -857,8 +991,8 @@ thread_local! {
     static TRACE_LOG: RefCell<Option<TraceLog>> = const { RefCell::new(None) };
 }
 
-fn rig_default(script: Script) -> Rig {
-    build_rig(RigOptions::default(), script).unwrap()
+fn rig_default(script: Script) -> Rig<Serving> {
+    build_rig(RigOptions::default(), script).unwrap().serve()
 }
 
 /// The shapes of `generate`'s single contiguous row: every admitted prefill piece and decode at one
@@ -884,19 +1018,19 @@ fn request(prompt: &[u32], max_new: usize, sampler: Sampler) -> GenerateRequest 
     }
 }
 
-fn run(rig: &mut Rig, request: GenerateRequest) -> Result<Generation, DriverError> {
+fn run(rig: &mut Rig<Serving>, request: GenerateRequest) -> Result<Generation, DriverError> {
     rig.driver.generate(request, &mut |_: u32, _: &str| {
         GenerationControl::Continue(())
     })
 }
 
-/// The `(phase, tokens)` of every replayed step, in order.
-fn step_shapes(rig: &Rig) -> Vec<(Phase, usize)> {
+/// The `(kind, tokens)` of every replayed step, in order.
+fn step_shapes(rig: &Rig<Serving>) -> Vec<(StepKind, usize)> {
     rig.world
         .borrow()
         .steps
         .iter()
-        .map(|s| (s.phase.unwrap(), s.tokens.len()))
+        .map(|s| (s.kind.unwrap(), s.tokens.len()))
         .collect()
 }
 
@@ -1056,7 +1190,9 @@ fn pos_is_the_live_position_whatever_the_capacity() {
         capacity: 64,
         ..RigOptions::default()
     };
-    let mut rig = build_rig(options, logits_script(vec![favoring(1)])).unwrap();
+    let mut rig = build_rig(options, logits_script(vec![favoring(1)]))
+        .unwrap()
+        .serve();
     run(&mut rig, request(&[5, 6, 7], 3, Sampler::greedy())).unwrap();
     let world = rig.world.borrow();
     let positions: Vec<Vec<i32>> = world.steps.iter().map(|s| s.positions.clone()).collect();
@@ -1144,7 +1280,7 @@ fn a_sampled_request_binds_its_sampler_slots_and_discarded_steps_leave_the_strea
 }
 
 /// The token count of every replayed step, in order.
-fn piece_sizes(rig: &Rig) -> Vec<usize> {
+fn piece_sizes(rig: &Rig<Serving>) -> Vec<usize> {
     step_shapes(rig).into_iter().map(|(_, n)| n).collect()
 }
 
@@ -1174,14 +1310,25 @@ fn a_tail_below_the_granule_runs_as_decode_steps() {
         granule: 2,
         ..RigOptions::default()
     };
-    let mut rig = build_rig(options(), logits_script(vec![favoring(1)])).unwrap();
+    let mut rig = build_rig(options(), logits_script(vec![favoring(1)]))
+        .unwrap()
+        .serve();
     run(&mut rig, request(&[1; 5], 1, Sampler::greedy())).unwrap();
-    assert_eq!(step_shapes(&rig), [(Phase::Prefill, 4), (Phase::Decode, 1)]);
-    let mut rig = build_rig(options(), logits_script(vec![favoring(1)])).unwrap();
+    assert_eq!(
+        step_shapes(&rig),
+        [(StepKind::Prefill, 4), (StepKind::Decode, 1)]
+    );
+    let mut rig = build_rig(options(), logits_script(vec![favoring(1)]))
+        .unwrap()
+        .serve();
     run(&mut rig, request(&[1; 7], 1, Sampler::greedy())).unwrap();
     assert_eq!(
         step_shapes(&rig),
-        [(Phase::Prefill, 4), (Phase::Prefill, 2), (Phase::Decode, 1)]
+        [
+            (StepKind::Prefill, 4),
+            (StepKind::Prefill, 2),
+            (StepKind::Decode, 1)
+        ]
     );
 }
 
@@ -1195,8 +1342,8 @@ fn a_prepared_set_replays_without_compiling() {
         capacity: 32,
         ..RigOptions::default()
     };
-    let mut rig = build_rig(options, logits_script(vec![favoring(1), favoring(2)])).unwrap();
-    rig.driver.prepare(&contiguous(&[Head::GREEDY])).unwrap();
+    let rig = build_rig(options, logits_script(vec![favoring(1), favoring(2)])).unwrap();
+    let mut rig = rig.prepare(&contiguous(&[Head::GREEDY])).unwrap();
     let warmed = rig.driver.stats();
     let entries = rig.driver.prepared_entries();
     for (prompt, max_new) in [(vec![1u32; 4], 3usize), (vec![2; 7], 4), (vec![3; 11], 5)] {
@@ -1231,11 +1378,12 @@ fn the_entry_limit_refuses_the_third_and_keeps_the_first_two() {
         capacity: 8,
         ..RigOptions::default()
     };
-    let mut rig = build_rig(options, logits_script(vec![favoring(1)])).unwrap();
-    let err = rig
+    let rig = build_rig(options, logits_script(vec![favoring(1)])).unwrap();
+    let refused = rig
         .driver
         .prepare(&contiguous(&[Head::GREEDY]))
         .unwrap_err();
+    let err = refused.error;
     assert!(
         matches!(
             err,
@@ -1243,6 +1391,11 @@ fn the_entry_limit_refuses_the_third_and_keeps_the_first_two() {
         ),
         "{err:?}"
     );
+    // the refusal gives the driver back with the two entries it prepared.
+    let mut rig = Rig {
+        driver: refused.driver.serve(Layout::Contiguous),
+        world: rig.world,
+    };
     assert_eq!(rig.driver.prepared_entries(), 2);
     assert_eq!(rig.driver.retained_bytes(), 64);
     // the first admitted candidate is prefill(4): a 4-token prompt replays it.
@@ -1274,11 +1427,12 @@ fn the_byte_limit_refuses_the_second_without_moving_the_counters() {
         charge: |_| Retention::private(32),
         ..RigOptions::default()
     };
-    let mut rig = build_rig(options, logits_script(vec![favoring(1)])).unwrap();
-    let err = rig
+    let rig = build_rig(options, logits_script(vec![favoring(1)])).unwrap();
+    let refused = rig
         .driver
         .prepare(&contiguous(&[Head::GREEDY]))
         .unwrap_err();
+    let (err, driver) = (refused.error, refused.driver);
     assert!(
         matches!(
             err,
@@ -1291,8 +1445,8 @@ fn the_byte_limit_refuses_the_second_without_moving_the_counters() {
         ),
         "{err:?}"
     );
-    assert_eq!(rig.driver.prepared_entries(), 1);
-    assert_eq!(rig.driver.retained_bytes(), 32);
+    assert_eq!(driver.prepared_entries(), 1);
+    assert_eq!(driver.retained_bytes(), 32);
     assert_eq!(rig.world.borrow().add_entry_calls, 1);
 }
 
@@ -1983,6 +2137,8 @@ fn a_pin_is_checked_over_the_mapping_not_the_path() {
     );
 }
 
+#[path = "feature_tests.rs"]
+mod feature_tests;
 #[path = "serving_tests.rs"]
 mod serving_tests;
 
@@ -2022,8 +2178,9 @@ fn phase_timing_is_reported_only_when_asked_for() {
     let mut plain = rig_default(logits_script(vec![favoring(1)]));
     let generation = run(&mut plain, request(&[1, 2, 3], 2, Sampler::greedy())).unwrap();
     assert_eq!(generation.timing, None);
-    let mut timed = rig_default(logits_script(vec![favoring(1)]));
+    let mut timed = build_rig(RigOptions::default(), logits_script(vec![favoring(1)])).unwrap();
     timed.driver = timed.driver.with_phase_timing();
+    let mut timed = timed.serve();
     let generation = run(&mut timed, request(&[1, 2, 3], 2, Sampler::greedy())).unwrap();
     let timing = generation.timing.expect("a timed driver reports phases");
     assert_eq!(timing.prefill.tokens, 3);
@@ -2032,7 +2189,7 @@ fn phase_timing_is_reported_only_when_asked_for() {
 /// One turn of `conversation` over the whole `context`: the generation, and the positions each prefill
 /// and decode step of the turn fed (the steps the rig recorded since the turn began).
 fn turn(
-    rig: &mut Rig,
+    rig: &mut Rig<Serving>,
     conversation: &mut crate::driver::Conversation,
     context: &[u32],
     max_new: usize,
@@ -2116,7 +2273,9 @@ fn a_recurrent_conversation_resumes_only_over_what_its_state_consumed() {
         variant: Variant::Recurrent,
         ..RigOptions::default()
     };
-    let mut rig = build_rig(options(), logits_script(vec![favoring(1)])).unwrap();
+    let mut rig = build_rig(options(), logits_script(vec![favoring(1)]))
+        .unwrap()
+        .serve();
     let mut conversation = crate::driver::Conversation::default();
     turn(&mut rig, &mut conversation, &[5, 6, 7], 3);
     let resets = rig.world.borrow().state_writes.len();
@@ -2129,7 +2288,9 @@ fn a_recurrent_conversation_resumes_only_over_what_its_state_consumed() {
         "the state of the shared run was kept"
     );
 
-    let mut rig = build_rig(options(), logits_script(vec![favoring(1)])).unwrap();
+    let mut rig = build_rig(options(), logits_script(vec![favoring(1)]))
+        .unwrap()
+        .serve();
     let mut conversation = crate::driver::Conversation::default();
     turn(&mut rig, &mut conversation, &[5, 6, 7], 3);
     let resets = rig.world.borrow().state_writes.len();
@@ -2144,6 +2305,52 @@ fn a_recurrent_conversation_resumes_only_over_what_its_state_consumed() {
         resets + 1,
         "the row's state restarted from zero"
     );
+}
+
+/// `Resume` on a paged pool: a paged sequence shares earlier turns through the prefix cache, so the
+/// conversation's next turn is refused `resume`.
+pub(super) fn witness_resume_paged() -> DriverError {
+    let mut paged = build_rig(RigOptions::default(), logits_script(vec![favoring(1)]))
+        .unwrap()
+        .prepare(&ServingShapes {
+            layout: Layout::Paged(crate::driver::PoolShape {
+                blocks: nz(4),
+                max_seqs: nz(1),
+            }),
+            rows: &[NonZeroUsize::MIN],
+            heads: &[Head::GREEDY],
+            warm: Warm::Admitted,
+            windows: &[],
+            adapters: &[],
+        })
+        .unwrap();
+    let mut conversation = crate::driver::Conversation::default();
+    let (_, _) = turn(&mut paged, &mut conversation, &[5, 6, 7], 2);
+    paged
+        .driver
+        .generate_turn(
+            &mut conversation,
+            request(&[5, 6, 7, 1, 1, 8], 1, Sampler::greedy()),
+            &mut |_: u32, _: &str| GenerationControl::Continue(()),
+        )
+        .unwrap_err()
+}
+
+/// `DraftModel` with a draft that carries recurrent state: the rig's own recurrent model as its draft,
+/// refused when `prepare` compiles the draft's entry.
+pub(super) fn witness_recurrent_draft_model() -> DriverError {
+    build_rig(
+        RigOptions {
+            variant: Variant::Recurrent,
+            draft_model_k: Some(nz(2)),
+            ..RigOptions::default()
+        },
+        logits_script(vec![favoring(1)]),
+    )
+    .unwrap()
+    .prepare(&contiguous(&[Head::GREEDY]))
+    .map(|_| ())
+    .expect_err("a draft model with recurrent state is refused")
 }
 
 /// POOT-1094 SC-005: a conversation holds the contiguous layout's one slot between its turns and
@@ -2163,35 +2370,15 @@ fn a_conversation_holds_its_slot_until_it_ends_and_a_paged_one_is_not_resumed() 
     rig.driver.end_conversation(conversation).unwrap();
     run(&mut rig, request(&[1, 2], 1, Sampler::greedy())).unwrap();
 
-    let mut paged = rig_default(logits_script(vec![favoring(1)]));
-    paged
-        .driver
-        .prepare(&ServingShapes {
-            layout: Layout::Paged(crate::driver::PoolShape {
-                blocks: nz(4),
-                max_seqs: nz(1),
-            }),
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
-        .unwrap();
-    let mut conversation = crate::driver::Conversation::default();
-    let (_, _) = turn(&mut paged, &mut conversation, &[5, 6, 7], 2);
-    let refused = paged
-        .driver
-        .generate_turn(
-            &mut conversation,
-            request(&[5, 6, 7, 1, 1, 8], 1, Sampler::greedy()),
-            &mut |_: u32, _: &str| GenerationControl::Continue(()),
-        )
-        .unwrap_err();
+    let refused = witness_resume_paged();
     assert!(
         matches!(
             refused,
-            DriverError::InvalidRequest(InvalidRequest::ResumePaged)
+            DriverError::Unsupported(Unsupported::Incompatible(Incompatible {
+                first: Feature::Resume,
+                second: Feature::PagedKv,
+                ..
+            }))
         ),
         "{refused:?}"
     );
@@ -2225,7 +2412,7 @@ fn a_failed_run_with_nothing_else_open_recovers_its_executables() {
 #[test]
 fn a_pooled_driver_keeps_graphs_without_routed_experts_resident() {
     let mut rig = rig_default(logits_script(vec![favoring(1)]));
-    rig.driver.pool = Some(super::ExpertPool {
+    rig.driver.runtime.pool = Some(super::ExpertPool {
         slots: nz(3),
         managers: HashMap::new(),
     });
@@ -2246,7 +2433,8 @@ fn read_bytes_are_the_weights_per_step_plus_the_cache_per_attended_position() {
         },
         logits_script(vec![favoring(1)]),
     )
-    .unwrap();
+    .unwrap()
+    .serve();
     run(&mut rig, request(&[1, 2, 3], 4, Sampler::greedy())).unwrap();
     let weights = (VOCAB * 4 * 4) as u64;
     let per_position = (2 * 4 * 4) as u64;
@@ -2255,7 +2443,7 @@ fn read_bytes_are_the_weights_per_step_plus_the_cache_per_attended_position() {
             .borrow()
             .steps
             .iter()
-            .filter(|step| (step.phase == Some(Phase::Decode)) == decode)
+            .filter(|step| (step.kind == Some(StepKind::Decode)) == decode)
             .map(|step| {
                 let attended: i64 = step.positions.iter().map(|&p| i64::from(p) + 1).sum();
                 weights + per_position * attended as u64

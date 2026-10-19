@@ -6,9 +6,10 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use poot_graph_ir::{Builder, Graph, TensorType};
+use poot_models::io::{ModelSchema, ProgramId, ProgramSpec};
 use poot_models::model::{
-    ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
-    Phase, StepShape, TraceError,
+    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, StepShape, StepSpec,
+    TraceError,
 };
 use poot_models::registry::{
     ConfigSource, FamilyEntry, Fixture, LoadModelError, RawConfig, Registry, RegistryError,
@@ -25,6 +26,7 @@ const FAKE: FamilyKey = FamilyKey::new("fake-lm");
 #[derive(Debug)]
 struct FakeLm {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
     width: usize,
 }
@@ -34,16 +36,15 @@ impl Model for FakeLm {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        _phase: Phase,
-        _shape: StepShape,
-        b: Builder,
-    ) -> Result<Graph, TraceError> {
+    fn trace_into(&self, _spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let embed = b.constant(
             &WeightId::model(WeightRole::Embed).const_name(),
             TensorType::f32(vec![self.config.vocab, self.width]),
@@ -93,10 +94,16 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
             eos,
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab },
             prefill_granule: NonZeroUsize::MIN,
             chat: ChatFormat::ChatML,
         },
+        schema: ModelSchema::builder()
+            .step(ProgramSpec::new(
+                ProgramId::STEP,
+                ModelOutput::Logits { vocab },
+            ))
+            .build_for(FAKE)
+            .expect("a stateless step program is a schema"),
         weights: weights.build(),
         width,
     }))
@@ -138,14 +145,11 @@ const ENTRY: FamilyEntry = FamilyEntry {
 };
 
 fn decode_shape() -> StepShape {
-    StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::MIN,
-        capacity: NonZeroUsize::new(8).unwrap(),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    }
+    StepShape::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::MIN,
+        NonZeroUsize::new(8).unwrap(),
+    )
 }
 
 #[test]
@@ -169,8 +173,7 @@ fn an_externally_registered_family_resolves_by_model_type_and_builds() {
 
     let graph = model
         .trace(
-            Phase::Decode,
-            decode_shape(),
+            &StepSpec::step(decode_shape()),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();

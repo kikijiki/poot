@@ -15,16 +15,15 @@ use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::components::attention::{AttentionParams, AttentionWeights, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
+use crate::components::embed::EMBEDS;
 use crate::components::ffn::{GatedFfnWeights, gated_ffn};
 use crate::components::linear::WeightError;
 use crate::components::standard::{
-    BlockInput, EmbeddablePhase, LayerNorms, LayerParams, StackParams, StackWeights, Step,
-    check_embeddable_step, standard_layer, standard_stack,
+    BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
+    embeddable_decoder_schema, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::{ModelSchema, ProgramId};
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::GGUF_BASE;
 use crate::names::{HF_BASE, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
@@ -234,6 +233,7 @@ pub struct Qwen2 {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -267,6 +267,8 @@ fn build_from(
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = embeddable_decoder_schema(p.vocab, p.width, p.attention.is_sectioned())
+        .build_for(family)?;
     let config = ModelConfig {
         family,
         vocab: p.vocab,
@@ -274,7 +276,6 @@ fn build_from(
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -285,6 +286,7 @@ fn build_from(
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -293,17 +295,28 @@ impl Model for Qwen2 {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        let phase = check_embeddable_step(self.family, phase, shape, p.max_positions)?;
-        let step = match phase {
-            EmbeddablePhase::Prefill | EmbeddablePhase::Decode => Step::new(&b, shape)?,
-            EmbeddablePhase::PrefillEmbeds => Step::with_embeds(&b, shape, p.width)?,
-            EmbeddablePhase::Encode => Step::new(&b, shape)?.returning_hidden(),
+        let shape = spec.shape;
+        check_step(self.family, shape, p.max_positions)?;
+        let step = Step::new(&b, shape)?;
+        let step = if spec.program == ProgramId::ENCODE {
+            step.returning_hidden()
+        } else {
+            step
+        };
+        let step = if spec.carries(EMBEDS) {
+            step.with_embeds(&b, p.width)?
+        } else {
+            step
         };
         let step = if p.attention.is_sectioned() {
             step.with_mrope(&b)?
@@ -391,7 +404,7 @@ mod tests {
         assert_chunked_prefill_equals_decode, assert_matches_recorded, build as build_ok, close,
         close_all, f32_entry, projection_consts, q8_0_store as q8_0_of, values,
     };
-    use crate::model::{KvLayout, LogitRows, ShapeReason};
+    use crate::model::{LogitRows, ShapeReason, StepShape};
     use crate::registry::Registry;
 
     const VOCAB: usize = 48;
@@ -428,7 +441,7 @@ mod tests {
         let model = model(&fx.raw(), &fx.store);
         let shape = step_shape(3, CAP, LogitRows::All);
         let roomy = TraceLimits::for_tests();
-        let graph = model.trace(Phase::Prefill, shape, roomy).unwrap();
+        let graph = model.trace(&StepSpec::step(shape), roomy).unwrap();
 
         let exact = TraceLimits {
             max_tokens: NonZeroUsize::new(3).unwrap(),
@@ -437,15 +450,14 @@ mod tests {
             max_literal_bytes: NonZeroU64::new(1 << 20).unwrap(),
             max_owned_bytes: NonZeroU64::new(1 << 30).unwrap(),
         };
-        let under_exact = model.trace(Phase::Prefill, shape, exact).unwrap();
+        let under_exact = model.trace(&StepSpec::step(shape), exact).unwrap();
         crate::components::testing::assert_same_graph(&under_exact, &graph);
         let tokens = [5, 9, 2];
         let want = run_shape_under(
             roomy,
             &*model,
             &fx.store,
-            Phase::Prefill,
-            shape,
+            &StepSpec::step(shape),
             &tokens,
             0,
             &[],
@@ -454,8 +466,7 @@ mod tests {
             exact,
             &*model,
             &fx.store,
-            Phase::Prefill,
-            shape,
+            &StepSpec::step(shape),
             &tokens,
             0,
             &[],
@@ -470,7 +481,7 @@ mod tests {
             max_eqns: NonZeroUsize::new(2).unwrap(),
             ..roomy
         };
-        let refused = match model.trace(Phase::Prefill, shape, tight) {
+        let refused = match model.trace(&StepSpec::step(shape), tight) {
             Err(TraceError::Budget(budget)) => budget,
             other => panic!("expected the typed budget refusal, got {other:?}"),
         };
@@ -546,7 +557,7 @@ mod tests {
             .collect()
     }
 
-    /// One `PrefillEmbeds` step of `PROMPT` on the oracle: the logits at every position, with
+    /// One `step` of `PROMPT` carrying `EMBEDS` on the oracle: the logits at every position, with
     /// `embeds` (`[tokens, width]`) over the positions `at` marks.
     fn prefill_embeds(
         model: &dyn Model,
@@ -558,8 +569,7 @@ mod tests {
         let shape = crate::components::testing::step_shape(tokens.len(), CAP, LogitRows::All);
         let g = model
             .trace(
-                Phase::PrefillEmbeds,
-                shape,
+                &StepSpec::step(shape).carrying(crate::components::embed::EMBEDS),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -581,7 +591,7 @@ mod tests {
         .0
     }
 
-    /// SC-001 (model half): `PrefillEmbeds` scatters the caller's rows over the embedded tokens.
+    /// SC-001 (model half): a step carrying `EMBEDS` scatters the caller's rows over the embedded tokens.
     /// Rows equal to the table rows of the tokens they replace change nothing; a row that is another
     /// token's embedding gives that token's logits; with nothing marked the rows are never read.
     /// Mutation: ignore the mask (take the rows at every position); the unmarked case goes red.
@@ -592,7 +602,7 @@ mod tests {
         let w = 64;
         let table = values(fx.store.get("model.embed_tokens.weight").unwrap());
         let row = |t: i32| &table[t as usize * w..(t as usize + 1) * w];
-        let (plain, _) = run_step(&*model, &fx.store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+        let (plain, _) = run_step(&*model, &fx.store, CAP, &PROMPT, 0, &[]);
 
         // Table rows over positions 1 and 3: the same logits as the tokens.
         let mut embeds = vec![0.0; PROMPT.len() * w];
@@ -609,7 +619,7 @@ mod tests {
         let mut embeds = vec![0.0; PROMPT.len() * w];
         embeds[2 * w..3 * w].copy_from_slice(row(7));
         let swapped = [3, 17, 7, 8, 25];
-        let (want, _) = run_step(&*model, &fx.store, Phase::Prefill, CAP, &swapped, 0, &[]);
+        let (want, _) = run_step(&*model, &fx.store, CAP, &swapped, 0, &[]);
         let got = prefill_embeds(&*model, &fx.store, &PROMPT, &embeds, &[0, 0, 1, 0, 0]);
         close(&got, &want);
         assert_ne!(got, plain, "the replaced row did not reach the logits");
@@ -622,8 +632,8 @@ mod tests {
         );
     }
 
-    /// SC-004: the `Encode` phase returns the head's input, the final-norm hidden state of every
-    /// position: its product with the head weight is the `Prefill` logits at every position (tier
+    /// SC-004: the `encode` program returns the head's input, the final-norm hidden state of every
+    /// position: its product with the head weight is the `step` logits at every position (tier
     /// 2), and mean pooling it on the host gives the recorded sentence vector. Mutation: take the
     /// hidden state one layer early (skip the last layer); the head product no longer equals the
     /// logits and this goes red.
@@ -632,10 +642,22 @@ mod tests {
         let fx = fixture();
         let model = model(&fx.raw(), &fx.store);
         let w = 64;
-        let (hidden, state) = run_step(&*model, &fx.store, Phase::Encode, CAP, &PROMPT, 0, &[]);
+        let encode = StepSpec::encode(crate::components::testing::step_shape(
+            PROMPT.len(),
+            CAP,
+            LogitRows::All,
+        ));
+        let (hidden, state) = crate::components::standard::oracle::run_shape(
+            &*model,
+            &fx.store,
+            &encode,
+            &PROMPT,
+            0,
+            &[],
+        );
         assert_eq!(hidden.len(), PROMPT.len() * w);
         let _ = state;
-        let (logits, _) = run_step(&*model, &fx.store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+        let (logits, _) = run_step(&*model, &fx.store, CAP, &PROMPT, 0, &[]);
         let head: Vec<f64> = values(fx.store.get("lm_head.weight").unwrap())
             .into_iter()
             .map(f64::from)
@@ -781,31 +803,18 @@ mod tests {
         let fx = fixture();
         let model = model(&fx.raw(), &fx.store);
         let n = |v| NonZeroUsize::new(v).unwrap();
-        let shape = |rows, tokens, capacity| StepShape {
-            rows: n(rows),
-            tokens: n(tokens),
-            capacity: n(capacity),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::Last,
-            hidden: None,
-        };
+        let shape = |rows, tokens, capacity| StepShape::new(n(rows), n(tokens), n(capacity));
         let cases = [
-            (Phase::Decode, shape(1, 2, 8), ShapeReason::DecodeTokens),
-            (
-                Phase::Prefill,
-                shape(1, 1, 65),
-                ShapeReason::CapacityAboveMax { max: 64 },
-            ),
-            (
-                Phase::Prefill,
-                shape(1, 9, 8),
-                ShapeReason::TokensAboveCapacity,
-            ),
+            (shape(1, 1, 65), ShapeReason::CapacityAboveMax { max: 64 }),
+            (shape(1, 9, 8), ShapeReason::TokensAboveCapacity),
         ];
-        for (phase, shape, want) in cases {
-            match model.trace(phase, shape, poot_graph_ir::TraceLimits::for_tests()) {
+        for (shape, want) in cases {
+            match model.trace(
+                &StepSpec::step(shape),
+                poot_graph_ir::TraceLimits::for_tests(),
+            ) {
                 Err(TraceError::ShapeUnsupported { reason, .. }) => assert_eq!(reason, want),
-                other => panic!("{phase:?} {shape:?}: {other:?}"),
+                other => panic!("{shape:?}: {other:?}"),
             }
         }
     }
@@ -942,16 +951,8 @@ mod tests {
 
         let reference = tied_reference(&reference_store);
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
     }
@@ -1007,18 +1008,15 @@ mod tests {
         ));
 
         let prompt = [3, 17, 40, 8];
-        let shape = StepShape {
-            rows: NonZeroUsize::MIN,
-            tokens: NonZeroUsize::new(prompt.len()).unwrap(),
-            capacity: NonZeroUsize::new(CAP).unwrap(),
-            kv: KvLayout::Contiguous,
-            logits: LogitRows::All,
-            hidden: None,
-        };
+        let shape = StepShape::new(
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(prompt.len()).unwrap(),
+            NonZeroUsize::new(CAP).unwrap(),
+        )
+        .with_logits(LogitRows::All);
         let g = model
             .trace(
-                Phase::Prefill,
-                shape,
+                &StepSpec::step(shape),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -1053,15 +1051,7 @@ mod tests {
             &zeros,
         );
         let reference = tied_reference(&reference_store);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
     }

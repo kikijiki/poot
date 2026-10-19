@@ -1,4 +1,4 @@
-//! GLM-5.3-Flash's multi-token-prediction layer behind [`Phase::Mtp`]: the layer the checkpoint
+//! GLM-5.3-Flash's multi-token-prediction layer behind the `draft` program: the layer the checkpoint
 //! stores after the text stack, which guesses the token after next from a position's hidden state
 //! and the host-known token that follows it.
 //!
@@ -76,7 +76,7 @@ impl MtpLayer {
     }
 
     /// The step's logits: the layer over the carry's first `tokens` rows and the step's host tokens.
-    /// The step shape names the carry ([`check_mtp_step`](crate::components::standard::check_mtp_step)).
+    /// The step shape names the carry ([`check_draft_step`](crate::components::standard::check_draft_step)).
     /// The post-norm state of the last position goes back into row 0 of the carry, the row a
     /// following one-token step reads; under [`LogitRows::Last`] only that position has logits.
     pub(super) fn trace(

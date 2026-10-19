@@ -11,9 +11,8 @@
 //! - [`ScanKernel::Ssd`] (`rows == N`, `width == P`): `h[:,j] <- exp(delta A) h[:,j] + delta B x[j]` and
 //!   `y[j] = C . h[:,j] + D x[j]`.
 //!
-//! The sequence loop is a runtime `while`, so the body is the same size for every length. A launch covers the
-//! token range of its [`ScanPhase`]; a longer sequence is several launches, each reading the carried state the
-//! previous one left in the packed result and writing it back, so one dispatch's serial work stays bounded.
+//! The sequence loop is a runtime `while`, so the body is the same size for every length. One launch covers the
+//! whole sequence.
 //!
 //! The result is the packed `[1, H, len + rows, width]` tensor of `OpKind::Scan` (see `poot_graph_ir::ScanLayout`):
 //! rows `..len` the sequence output, rows `len..` the final state. Parameters: the family's operands in
@@ -28,7 +27,6 @@ use crate::attention::{
 use crate::data_movement::Cfg;
 use crate::emit::cu;
 use crate::helpers::{copy, elem, ld, slice_f32};
-use crate::request::SerialWork;
 
 /// Which recurrence a scan kernel runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,16 +46,6 @@ impl ScanKernel {
     }
 }
 
-/// The token range one launch covers: `count` tokens from `start`. The first phase (`start == 0`) reads the
-/// carried state from the state operand; every later one reads it from the packed result's state rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScanPhase {
-    /// First token of the range.
-    pub start: usize,
-    /// Tokens in the range.
-    pub count: usize,
-}
-
 /// What the planner asks the scan generator for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanSpec {
@@ -65,7 +53,7 @@ pub struct ScanSpec {
     pub kernel: ScanKernel,
     /// Heads, each with its own independent state.
     pub heads: usize,
-    /// The whole sequence length (the packed result's layout), of which `phase` runs a part.
+    /// The sequence length (the packed result's layout).
     pub len: usize,
     /// The state's rows (`D` for the delta rule, `N` for SSD).
     pub rows: usize,
@@ -80,8 +68,6 @@ pub struct ScanSpec {
     /// rule and one for SSD. The split reassociates each dot product, so its result differs from the
     /// unsplit one in f32 rounding only.
     pub row_split: usize,
-    /// The token range this launch covers.
-    pub phase: ScanPhase,
 }
 
 impl ScanSpec {
@@ -115,32 +101,6 @@ impl ScanSpec {
             2 * self.row_split * self.state_cols()
         }
     }
-
-    /// The serial work of this launch: every lane steps once per token of its phase, over about three
-    /// passes of its share of the state column.
-    pub(crate) fn serial_work(&self) -> SerialWork {
-        SerialWork {
-            threads: (self.workgroups() * self.cols) as u64,
-            steps_per_thread: (self.phase.count * self.steps_per_token()) as u64,
-        }
-    }
-
-    fn steps_per_token(&self) -> usize {
-        3 * (self.rows / self.row_split) + (self.row_split - 1)
-    }
-
-    /// The most tokens one launch may cover so its serial work stays within `budget`, at least one.
-    pub fn tokens_within(&self, budget: u64) -> usize {
-        let per_token = SerialWork {
-            threads: (self.workgroups() * self.cols) as u64,
-            steps_per_thread: self.steps_per_token() as u64,
-        }
-        .total()
-        .max(1);
-        usize::try_from(budget / per_token)
-            .unwrap_or(usize::MAX)
-            .max(1)
-    }
 }
 
 const GENERATOR: &str = "scan_body";
@@ -163,7 +123,6 @@ fn validate(spec: &ScanSpec) -> Result<(), KernelGenError> {
         ("width", spec.width),
         ("cols", spec.cols),
         ("row_split", spec.row_split),
-        ("phase.count", spec.phase.count),
     ] {
         if value == 0 {
             return Err(below_one(what, value));
@@ -178,15 +137,6 @@ fn validate(spec: &ScanSpec) -> Result<(), KernelGenError> {
                 divisor: spec.row_split,
             });
         }
-    }
-    let end = spec.phase.start.saturating_add(spec.phase.count);
-    if end > spec.len {
-        return Err(KernelGenError::ExceedsBound {
-            generator: GENERATOR,
-            what: "phase end".to_string(),
-            value: end,
-            bound: spec.len,
-        });
     }
     if spec.kernel == ScanKernel::DeltaRule && spec.rows != spec.width {
         return Err(KernelGenError::ExceedsBound {
@@ -313,7 +263,7 @@ fn guarded(c: &mut Cfg, guard: Option<poot_kernel_ir::Local>, f: impl FnOnce(&mu
     }
 }
 
-/// One lane's whole run over its share of column `col` of head `h`: load the state, step the phase's tokens,
+/// One lane's whole run over its share of column `col` of head `h`: load the state, step every token,
 /// publish the state. `masked` is the guard the stores sit under when a split launch needs every lane on
 /// the barrier path; the column's first lane alone writes the sequence output.
 fn scan_column(
@@ -330,7 +280,6 @@ fn scan_column(
         len,
         rows,
         width,
-        phase,
         ..
     } = *spec;
     let Operands {
@@ -350,66 +299,55 @@ fn scan_column(
     };
     // Load this lane's share of the state column.
     my_rows(c, spec, lane, |c, r| {
-        let value = if phase.start == 0 {
-            let head = uc(c, BinOp::Mul, h, rows * width);
-            let row = uc(c, BinOp::Mul, r, width);
-            let at = ubin(c, BinOp::Add, head, row);
-            let at = ubin(c, BinOp::Add, at, col);
-            c.let_(Ty::F32, Rvalue::Use(copy(elem(state_in, at))))
-        } else {
-            let at = state_at(c, r);
-            c.let_(Ty::F32, Rvalue::Use(copy(elem(out, at))))
-        };
+        let head = uc(c, BinOp::Mul, h, rows * width);
+        let row = uc(c, BinOp::Mul, r, width);
+        let at = ubin(c, BinOp::Add, head, row);
+        let at = ubin(c, BinOp::Add, at, col);
+        let value = c.let_(Ty::F32, Rvalue::Use(copy(elem(state_in, at))));
         let slot = state_slot(c, spec, r, lane);
         lds_write(c, STATE, slot, local_op(value));
     });
-    count_to(
-        c,
-        cu(phase.start),
-        cu(phase.start + phase.count),
-        1,
-        |c, t| {
-            let pos = {
-                let head = uc(c, BinOp::Mul, h, len);
-                ubin(c, BinOp::Add, head, t)
+    count_to(c, cu(0), cu(len), 1, |c, t| {
+        let pos = {
+            let head = uc(c, BinOp::Mul, h, len);
+            ubin(c, BinOp::Add, head, t)
+        };
+        let o_acc = match kernel {
+            ScanKernel::DeltaRule => delta_rule_step(
+                c,
+                spec,
+                [input(0), input(1), input(2), input(3), input(4)],
+                pos,
+                col,
+                lane,
+            ),
+            ScanKernel::Ssd => ssd_step(
+                c,
+                spec,
+                [input(0), input(1), input(2), input(3), input(4), input(5)],
+                pos,
+                h,
+                col,
+                lane,
+            ),
+        };
+        // Every lane of a column holds the reduced value; the column's first lane writes it.
+        guarded(c, masked, |c| {
+            let write = |c: &mut Cfg| {
+                let oi = uc(c, BinOp::Mul, t, width);
+                let oi = ubin(c, BinOp::Add, out_base, oi);
+                let oi = ubin(c, BinOp::Add, oi, col);
+                c.assign(elem(out, oi), Rvalue::Use(local_op(o_acc)));
             };
-            let o_acc = match kernel {
-                ScanKernel::DeltaRule => delta_rule_step(
-                    c,
-                    spec,
-                    [input(0), input(1), input(2), input(3), input(4)],
-                    pos,
-                    col,
-                    lane,
-                ),
-                ScanKernel::Ssd => ssd_step(
-                    c,
-                    spec,
-                    [input(0), input(1), input(2), input(3), input(4), input(5)],
-                    pos,
-                    h,
-                    col,
-                    lane,
-                ),
-            };
-            // Every lane of a column holds the reduced value; the column's first lane writes it.
-            guarded(c, masked, |c| {
-                let write = |c: &mut Cfg| {
-                    let oi = uc(c, BinOp::Mul, t, width);
-                    let oi = ubin(c, BinOp::Add, out_base, oi);
-                    let oi = ubin(c, BinOp::Add, oi, col);
-                    c.assign(elem(out, oi), Rvalue::Use(local_op(o_acc)));
-                };
-                match lane.first_row {
-                    None => write(c),
-                    Some(first_row) => {
-                        let first = c.bin(Ty::Bool, BinOp::Eq, local_op(first_row), cu(0));
-                        c.if_then(first, write);
-                    }
+            match lane.first_row {
+                None => write(c),
+                Some(first_row) => {
+                    let first = c.bin(Ty::Bool, BinOp::Eq, local_op(first_row), cu(0));
+                    c.if_then(first, write);
                 }
-            });
-        },
-    );
+            }
+        });
+    });
     // Publish the state column into the packed result's trailing rows.
     guarded(c, masked, |c| {
         my_rows(c, spec, lane, |c, r| {

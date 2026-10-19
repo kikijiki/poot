@@ -4,20 +4,18 @@
 //! executor contract's capture-on-first-step default (Card 548: `Engine::step` records once, replays every step after) safe for this graph
 //! on ROCm.
 //!
-//! Builds the graph with `Model::trace` of the qwen2 family (a paged decode step over a checkpoint of zeros) and applies the pre-`compile` pass chain locally, which classifies the fused equations
-//! `compile` plans.
+//! Builds the graph with `Model::trace` of the qwen2 family (a paged decode step over a checkpoint of zeros) and classifies the fused equations of the graph `compile` plans.
 
 #![cfg(feature = "rocm")]
 
 use poot_graph_plan::test_support::plan_eqn;
-use poot_graph_plan::{Plan, dtype_widen::prepare_target_graph};
+use poot_graph_plan::{Plan, test_support::compiled_graph};
 use poot_llm::driver::block_table::BLOCK_SIZE;
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step};
 use poot_target::{AmdArch, Backend};
 use poot_tensor::DType;
 
-use poot_graph_plan::passes_without_target;
 use std::collections::BTreeMap;
 
 /// qwen2.5-0.5b dims (a BF16 checkpoint of zeros: only the traced graph is read).
@@ -56,15 +54,18 @@ fn rocm_batched_decode_plan_classify_qwen2_n_slots_2() {
     let g = m
         .model
         .trace(
-            Phase::Decode,
-            paged_step(n_slots, 1, cap, pool_slots, LogitRows::Last),
+            &StepSpec::step(paged_step(n_slots, 1, cap, pool_slots, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     let backend = Backend::AmdGcn(AmdArch::gfx1151());
-    // The pre-`compile` passes, so the equations classified are the fused ones `compile` plans: the
-    // BF16 checkpoint's dense contractions are folded and its mixed-dtype matmuls widened as `compile` does.
-    let g = prepare_target_graph(&passes_without_target(&g).unwrap(), backend).unwrap();
+    // The graph `compile` plans: the equations classified are the fused ones.
+    let g = compiled_graph(
+        &g,
+        backend,
+        &poot_test_util::device_caps::default_caps_for(backend),
+    )
+    .unwrap();
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
     for eqn in g.eqns() {
         let plan = plan_eqn(

@@ -14,6 +14,7 @@ use poot_quant::format::{
 };
 
 use super::float_decode::emit_float_decode;
+use super::kernel::emit_block_address;
 use super::source::Source;
 use crate::KernelGenError;
 use crate::emit::{Emit, bin, c32, copy, cu, select_u32};
@@ -200,6 +201,51 @@ impl DecodePlan {
     ) -> Local {
         let bits = self.emit_field_bits(e, src, block_bit, field, i);
         emit_encoded_number(e, field.encoding, field.width(), bits)
+    }
+
+    /// The `count` logical values `(row, k0 + j)` for `j in 0..count`, `k0` a multiple of `count` and every index
+    /// below `k_total`. A run of `count` elements starting at a multiple of `count` stays inside one block when
+    /// `count` divides the block, so the block is addressed once; when `count` also divides the factor run, the
+    /// run's factors are decoded once and shared by all its elements. Otherwise each element addresses its own
+    /// block and decodes its own factors.
+    pub(crate) fn emit_run(
+        &self,
+        e: &mut Emit,
+        src: Source,
+        row: Local,
+        k0: Local,
+        count: usize,
+        k_total: Local,
+    ) -> Vec<Local> {
+        let values = self.values();
+        let run_block = values
+            .is_multiple_of(count)
+            .then(|| emit_block_address(e, values, row, k0, k_total));
+        let run_factors = run_block
+            .filter(|_| self.factor_run().is_multiple_of(count))
+            .map(|(block, first)| self.emit_factors(e, src, block, first));
+        (0..count)
+            .map(|j| {
+                let (block, i_in_block) = match run_block {
+                    Some((block, first)) => {
+                        (block, bin(e, Ty::Usize, BinOp::Add, copy(first), cu(j)))
+                    }
+                    None => {
+                        let k_index = bin(e, Ty::Usize, BinOp::Add, copy(k0), cu(j));
+                        emit_block_address(e, values, row, k_index, k_total)
+                    }
+                };
+                let own_factors;
+                let factors = match &run_factors {
+                    Some(factors) => factors,
+                    None => {
+                        own_factors = self.emit_factors(e, src, block, i_in_block);
+                        &own_factors
+                    }
+                };
+                self.emit_value(e, src, block, i_in_block, factors)
+            })
+            .collect()
     }
 
     /// The `Scale * SubScale` and `Min * SubMin` factors covering in-block index `i` (dquant.md's

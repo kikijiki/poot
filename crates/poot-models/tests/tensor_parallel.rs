@@ -11,27 +11,29 @@ use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::assert_close;
+use poot_eval::{EvalOptions, Value, eval};
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::builder::Builder;
+use poot_graph_ir::{BinOp, RedOp};
 use poot_graph_ir::{ComputedConst, Graph, Slot, SlotKey, Storage, TensorType, ValueId};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, LoraPlan, ShardError, ShardRule, Target,
-    multi_device::topology::DeviceId, production_plan::Submission, shard, staged::DevicePlacement,
-    staged::ExpertPlacement, staged::Partition, staged::StagedCompileError, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    multi_device::topology::DeviceId, shard, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::StagedCompileError, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_models::test_support::weight_map::MappedModel;
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{
-    AttnRole, DenseWeight, LoraRole, LoraTarget, MlaRole, WeightEntry, WeightId, WeightMap,
-    WeightRole, WeightStore, WeightView,
+    AttnRole, DenseWeight, FfnRole, LoraRole, LoraTarget, MlaRole, WeightEntry, WeightId,
+    WeightMap, WeightRole, WeightStore, WeightView,
 };
 use poot_quant::{PackedPayload, PackedWeight, SourceRole};
 use poot_target::{Backend, TargetId};
 use poot_tensor::{DType, HostTensor};
+use poot_test_util::assert_close_scaled;
 use poot_test_util::device_caps::default_caps_for;
 
 const WORLD: u32 = 2;
@@ -55,7 +57,7 @@ fn target(backend: Backend) -> Target {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 fn devices() -> Vec<DeviceId> {
@@ -105,8 +107,7 @@ fn decode_graph(mapped: &MappedModel, rows: usize) -> Graph {
     mapped
         .model
         .trace(
-            Phase::Decode,
-            step(rows, 1, 6, LogitRows::Last),
+            &StepSpec::step(step(rows, 1, 6, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the fixture traces a decode step")
@@ -117,8 +118,7 @@ fn paged_decode_graph(mapped: &MappedModel, rows: usize, pool_slots: usize) -> G
     mapped
         .model
         .trace(
-            Phase::Decode,
-            paged_step(rows, 1, CAPACITY, pool_slots, LogitRows::Last),
+            &StepSpec::step(paged_step(rows, 1, CAPACITY, pool_slots, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the fixture traces a paged decode step")
@@ -378,12 +378,8 @@ fn walk(
                 (id, tensor)
             })
             .collect();
-        let result = eval(
-            g,
-            &inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-        )
-        .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
+        let result = eval(g, &inputs, EvalOptions::default().keep_environment())
+            .unwrap_or_else(|error| panic!("stage {index} did not evaluate: {error}"));
         let environment = result.environment.expect("the environment was kept");
         for export in g.exports() {
             let value = environment[export.value]
@@ -440,7 +436,7 @@ fn whole(
             (id, Value::from(value))
         })
         .collect();
-    let result = eval(graph, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).expect("evaluates");
+    let result = eval(graph, &inputs, EvalOptions::default()).expect("evaluates");
     let state = graph
         .state()
         .zip(result.state)
@@ -486,7 +482,7 @@ fn assert_walk_matches(
 ) {
     let walked = walk(program, weights, step, extra);
     let (output, state) = whole(graph, weights, step, extra);
-    assert_close(
+    assert_close_scaled(
         walked.output.as_f32().unwrap(),
         output.as_f32().unwrap(),
         program.numerics_class().tolerance(),
@@ -499,7 +495,7 @@ fn assert_walk_matches(
                 .get(&(name.clone(), rank))
                 .unwrap_or_else(|| panic!("{label}: rank {rank} wrote no {name}"));
             let want = slice_to(want, got.shape(), rank);
-            assert_close(
+            assert_close_scaled(
                 got.as_f32().unwrap(),
                 want.as_f32().unwrap(),
                 program.numerics_class().tolerance(),
@@ -507,6 +503,68 @@ fn assert_walk_matches(
             );
         }
     }
+}
+
+/// POOT-1215 SC-002: a sharded program publishes the class of its shard. The ranks sum their partial products
+/// in rank order, a different summation order from one device's contraction, so the staged program is
+/// `Reassociating` whatever its stages' own classes are; the whole graph compiled on one device is not.
+///
+/// Mutation: make `ShardedGraph::numerics` return `NumericsProperty::Exact`; the sharded program publishes the
+/// loosest class of its stages instead and the equality below goes red.
+#[test]
+fn a_sharded_program_publishes_reassociating() {
+    // A column-parallel `up` feeds a row-parallel `down`: the down product is a partial the ranks reduce.
+    let (up, down) = (
+        WeightId::layer(0, WeightRole::Ffn(FfnRole::Up)),
+        WeightId::layer(0, WeightRole::Ffn(FfnRole::Down)),
+    );
+    let mut store = WeightStore::builder();
+    store.insert("up", dense_entry(&[8, 6])).unwrap();
+    store.insert("down", dense_entry(&[6, 8])).unwrap();
+    let store = store.build();
+    let mut map = WeightMap::builder(&store);
+    map.map(up, WeightView::Stored("up".into())).unwrap();
+    map.map(down, WeightView::Stored("down".into())).unwrap();
+    let map = map.build();
+    let b = Builder::for_tests();
+    let x = b
+        .slot(Slot::Activation, TensorType::f32(vec![1, 1, 6]))
+        .unwrap();
+    let w_up = b
+        .constant(&up.const_name(), TensorType::f32(vec![8, 6]))
+        .unwrap();
+    let w_down = b
+        .constant(&down.const_name(), TensorType::f32(vec![6, 8]))
+        .unwrap();
+    // Elementwise products and reductions, not matmuls: a contraction against a weight is folded into a
+    // narrowed-storage op, which would hide what the shard declares.
+    let x4 = b.reshape(x, vec![1, 1, 1, 6]).unwrap();
+    let up_products = b.binary(BinOp::Mul, x4, w_up).unwrap();
+    let hidden = b.reduce(RedOp::Sum, up_products, 3, false).unwrap();
+    let down_products = b.binary(BinOp::Mul, hidden, w_down).unwrap();
+    let out = b.reduce(RedOp::Sum, down_products, 2, false).unwrap();
+    let graph = b.finish(out).unwrap();
+    let world = NonZeroU32::new(WORLD).unwrap();
+    let sharded = shard(&graph, &map, ShardRule::Megatron, world).expect("an up/down pair shards");
+    assert!(
+        sharded
+            .graph
+            .eqns()
+            .iter()
+            .any(|eqn| matches!(eqn.op, poot_graph_ir::OpKind::AllReduce { .. })),
+        "a row-parallel product is reduced across the ranks"
+    );
+    let program = compile(&graph, &Arc::new(map), &options()).expect("it compiles");
+    let stages = program
+        .stages()
+        .map(|(_, _, stage)| stage.numerics_class())
+        .max()
+        .expect("a program has stages");
+    assert!(
+        stages < Tier2Class::Reassociating,
+        "the stages alone must publish less, or this row cannot tell the shard's declaration: {stages:?}"
+    );
+    assert_eq!(program.numerics_class(), Tier2Class::Reassociating);
 }
 
 /// SC-001: the sharded qwen2 decode step, walked by rank (host collectives are the exchanged
@@ -642,8 +700,15 @@ fn shard_refuses_a_q4_k_column_split_mid_block() {
         let wq = b.transpose(wq, vec![1, 0]).unwrap();
         let h = b.matmul(x, wq).unwrap();
         let weight = PackedWeight::try_new(WeightFormat::Q4_K, [4, k]).unwrap();
-        let y = poot_graph_ir::ops::packed_linear(&b, h, &id.const_name(), weight, None, None)
-            .expect("a packed linear");
+        let y = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &b,
+            h,
+            &id.const_name(),
+            weight,
+            None,
+            None,
+        )
+        .expect("a packed linear");
         (b.finish(y).unwrap(), map)
     };
     let world = NonZeroU32::new(WORLD).unwrap();

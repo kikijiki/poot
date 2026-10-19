@@ -11,16 +11,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, WeightFormats, bind_packed_weights, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StageId,
-    staged::TargetSet, staged::compile_staged,
+    CompileLimits, CompileOptions, WeightFormats, bind_packed_weights, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StageId, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_llm::driver::{
-    BackendChoice, Driver, DriverOptions, GenerateRequest, LoadOptions, ModelHandle,
-    PreparedSetLimits, open_executor, program_retention,
+    BackendChoice, Driver, DriverOptions, GenerateRequest, Layout, LoadOptions, ModelHandle,
+    PreparedSetLimits, Serving, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::model::{StepShape, StepSpec};
 use poot_models::registry::{RawConfig, Registry};
 use poot_runtime_common::DeviceBackend;
 use poot_target::{AmdArch, Backend, DeviceCaps};
@@ -100,7 +100,7 @@ fn write_checkpoint(
 }
 
 fn options() -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -117,7 +117,7 @@ fn options() -> DriverOptions {
     }
 }
 
-fn generate(driver: &mut Driver, prompt: &[u32], max_new: usize) -> Vec<u32> {
+fn generate(driver: &mut Driver<Serving>, prompt: &[u32], max_new: usize) -> Vec<u32> {
     driver
         .generate(
             GenerateRequest {
@@ -147,7 +147,8 @@ fn pooled_tokens_equal_the_recorded_literals(choice: BackendChoice, backend: Dev
     let mut driver = Driver::new(handle, executor, options())
         .unwrap()
         .with_expert_pool(nz(POOL_ROWS))
-        .unwrap();
+        .unwrap()
+        .serve(Layout::Contiguous);
     let got = generate(&mut driver, &PROMPT, 24);
     assert_eq!(got, TOKENS, "pooled {FAMILY} on {choice:?}");
     let counters = driver.stats().residency;
@@ -208,18 +209,10 @@ fn pooled_deepseek3_stages_run_the_contraction_and_pointwise_passes() {
         generation: None,
     };
     let model = (entry.build)(&raw, &fixture.store).unwrap();
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: NonZeroUsize::MIN,
-        capacity: nz(CAPACITY),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    };
+    let shape = StepShape::new(NonZeroUsize::MIN, NonZeroUsize::MIN, nz(CAPACITY));
     let graph = model
         .trace(
-            Phase::Decode,
-            shape,
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -245,7 +238,7 @@ fn pooled_deepseek3_stages_run_the_contraction_and_pointwise_passes() {
                     experts,
                     devices: DevicePlacement::Single(device),
                 },
-                &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+                &CompileOptions::new(CompileLimits::STANDARD),
             )
             .unwrap_or_else(|e| panic!("{label}: {FAMILY} compiles: {e}"))
         };

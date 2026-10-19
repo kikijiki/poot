@@ -29,23 +29,24 @@ use poot_executor::{
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::StagedProgram, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
+    staged::TargetSet, staged::compile_staged,
 };
 use poot_llm::Sampler;
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_llm::driver::error::{DriverError, InvalidRequest, SpeculationRefusal, Unsupported};
 use poot_llm::driver::speculate::{SpeculationStats, propose_lookup, spec_sample_round};
-use poot_llm::driver::step::PickPolicy;
 use poot_llm::driver::{
-    AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, Head, Layout,
-    LoadOptions, ModelHandle, PoolShape, PreparedSetLimits, Release, RowResult, RowSpeculation,
-    RowWork, SeqId, SeqRequest, ServingShapes, StepRow, Warm, open_executor, program_retention,
+    AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, Feature, Head,
+    Incompatible, Layout, LoadOptions, ModelHandle, PoolShape, PreparedSetLimits, Release,
+    RowResult, RowSpeculation, RowWork, SeqId, SeqRequest, Serving, ServingShapes, State, StepRow,
+    Unprepared, Warm, open_executor, program_retention,
 };
 use poot_models::components::standard::{Step, check_step};
+use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
     FamilyKey, HiddenCarry, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
-    Phase, StepShape, TraceError,
+    StepShape, StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
@@ -117,7 +118,7 @@ fn fixture_handle(family: FamilyKey) -> (Arc<ModelHandle>, poot_test_util::Uniqu
 }
 
 fn options(draft: DraftPolicy) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -164,6 +165,7 @@ const RECURRENT_ENTRY: FamilyEntry = FamilyEntry {
 #[derive(Debug)]
 struct Recurrentish {
     config: ModelConfig,
+    schema: ModelSchema,
     weights: WeightMap,
 }
 
@@ -180,10 +182,15 @@ fn build_recurrent(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model
             eos: BTreeSet::from([VOCAB as u32 - 1]),
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
             prefill_granule: nz(granule),
             chat: ChatFormat::ChatML,
         },
+        schema: ModelSchema::builder()
+            .step(
+                ProgramSpec::new(ProgramId::STEP, ModelOutput::Logits { vocab: VOCAB })
+                    .carrying(StateSpec::recurrent("toy.state")),
+            )
+            .build_for(RECURRENT)?,
         weights: WeightMap::default(),
     }))
 }
@@ -214,17 +221,17 @@ impl Model for Recurrentish {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
-        check_step(RECURRENT, phase, shape, self.config.max_positions)?;
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
+        check_step(RECURRENT, shape, self.config.max_positions)?;
         let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let first = if shape.logits == LogitRows::All {
@@ -333,7 +340,7 @@ impl Device for FakeDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), FakeError> {
@@ -379,17 +386,15 @@ impl Device for FakeDevice {
     }
 }
 
-fn prepare_contiguous(driver: &mut Driver) -> Result<(), DriverError> {
-    driver
-        .prepare(&ServingShapes {
-            layout: Layout::Contiguous,
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
-        .map(|_| ())
+fn contiguous() -> ServingShapes<'static> {
+    ServingShapes {
+        layout: Layout::Contiguous,
+        rows: &[NonZeroUsize::MIN],
+        heads: &[Head::GREEDY],
+        warm: Warm::Admitted,
+        windows: &[],
+        adapters: &[],
+    }
 }
 
 fn fake_driver(handle: Arc<ModelHandle>, draft: DraftPolicy) -> Driver {
@@ -404,9 +409,11 @@ fn fake_driver(handle: Arc<ModelHandle>, draft: DraftPolicy) -> Driver {
 #[test]
 fn a_granule_two_recurrent_family_refuses_speculation_and_granule_one_prepares() {
     let (coarse, _dir) = recurrent_handle(2);
-    let mut driver = fake_driver(coarse, lookup(2));
-    let error = prepare_contiguous(&mut driver)
+    let driver = fake_driver(coarse, lookup(2));
+    let refused = driver
+        .prepare(&contiguous())
         .expect_err("a replay chunk is not a multiple of a two-token granule");
+    let (error, driver) = (refused.error, refused.driver);
     let DriverError::Unsupported(Unsupported::Speculation(refusal)) = error else {
         panic!("not a speculation refusal: {error:?}");
     };
@@ -417,8 +424,9 @@ fn a_granule_two_recurrent_family_refuses_speculation_and_granule_one_prepares()
     );
 
     let (fine, _dir) = recurrent_handle(1);
-    let mut driver = fake_driver(fine, lookup(2));
-    prepare_contiguous(&mut driver).unwrap_or_else(|e| panic!("{e}"));
+    let driver = fake_driver(fine, lookup(2))
+        .prepare(&contiguous())
+        .unwrap_or_else(|e| panic!("{e}"));
     let caps = driver.caps().unwrap();
     let speculation = caps.speculation.expect("the policy is published");
     assert_eq!((speculation.k.get(), speculation.window.get()), (K, K + 1));
@@ -439,19 +447,28 @@ fn a_granule_two_recurrent_family_refuses_speculation_and_granule_one_prepares()
 fn a_recurrent_draft_model_is_refused() {
     let (target, _target_dir) = dense_handle();
     let (draft, _draft_dir) = recurrent_handle(1);
-    let mut driver = fake_driver(
+    let driver = fake_driver(
         target,
         DraftPolicy::DraftModel {
             handle: draft,
             k: nz(K),
         },
     );
-    let error =
-        prepare_contiguous(&mut driver).expect_err("a recurrent draft cannot be rolled back");
-    let DriverError::Unsupported(Unsupported::Speculation(refusal)) = error else {
-        panic!("not a speculation refusal: {error:?}");
-    };
-    assert_eq!(refusal, SpeculationRefusal::RecurrentDraft);
+    let refused = driver
+        .prepare(&contiguous())
+        .expect_err("a recurrent draft cannot be rolled back");
+    let (error, driver) = (refused.error, refused.driver);
+    assert!(
+        matches!(
+            error,
+            DriverError::Unsupported(Unsupported::Incompatible(Incompatible {
+                first: Feature::DraftModel,
+                second: Feature::RecurrentDraftState,
+                ..
+            }))
+        ),
+        "not a draft-model/recurrent-draft-state refusal: {error:?}"
+    );
     assert!(
         driver.caps().is_none(),
         "a refused prepare publishes nothing"
@@ -460,7 +477,7 @@ fn a_recurrent_draft_model_is_refused() {
 
 /// One verified round of the fake device, which reads every pick as token 0, so prompt lookup over a prompt of
 /// zeros proposes drafts that all verify.
-fn verified_round(driver: &mut Driver) -> (SeqId, RowResult) {
+fn verified_round(driver: &mut Driver<Serving>) -> (SeqId, RowResult) {
     let (seq, _) = open_prefilled(driver, &[0, 0, 0, 0], 8);
     let result = decode_step(driver, seq, &mut Sampler::greedy());
     assert!(
@@ -482,8 +499,9 @@ fn verified_round(driver: &mut Driver) -> (SeqId, RowResult) {
 #[test]
 fn a_short_commit_of_a_verified_recurrent_result_refuses_the_next_step() {
     let (handle, _dir) = recurrent_handle(1);
-    let mut driver = fake_driver(Arc::clone(&handle), lookup(1));
-    prepare_contiguous(&mut driver).unwrap_or_else(|e| panic!("{e}"));
+    let mut driver = fake_driver(Arc::clone(&handle), lookup(1))
+        .prepare(&contiguous())
+        .unwrap_or_else(|e| panic!("{e}"));
     let (seq, result) = verified_round(&mut driver);
     assert!(
         result.tokens.len() >= 2,
@@ -495,10 +513,7 @@ fn a_short_commit_of_a_verified_recurrent_result_refuses_the_next_step() {
     let mut sampler = Sampler::greedy();
     let mut rows = [StepRow {
         seq,
-        work: RowWork::Decode {
-            ahead: &[],
-            pick: PickPolicy::Greedy,
-        },
+        work: RowWork::Decode { ahead: &[] },
         sampler: &mut sampler,
     }];
     let error = driver
@@ -513,8 +528,9 @@ fn a_short_commit_of_a_verified_recurrent_result_refuses_the_next_step() {
     );
 
     // The whole result keeps the state and the sequence consistent: the next step runs.
-    let mut whole = fake_driver(handle, lookup(1));
-    prepare_contiguous(&mut whole).unwrap_or_else(|e| panic!("{e}"));
+    let mut whole = fake_driver(handle, lookup(1))
+        .prepare(&contiguous())
+        .unwrap_or_else(|e| panic!("{e}"));
     let (seq, result) = verified_round(&mut whole);
     whole
         .commit(seq, result.tokens.len(), &mut Sampler::greedy())
@@ -528,16 +544,13 @@ fn a_short_commit_of_a_verified_recurrent_result_refuses_the_next_step() {
 
 /// One decode step of `seq` under the driver's policy.
 fn decode_step(
-    driver: &mut Driver,
+    driver: &mut Driver<Serving>,
     seq: poot_llm::driver::SeqId,
     sampler: &mut Sampler,
 ) -> RowResult {
     let mut rows = [StepRow {
         seq,
-        work: RowWork::Decode {
-            ahead: &[],
-            pick: PickPolicy::Greedy,
-        },
+        work: RowWork::Decode { ahead: &[] },
         sampler,
     }];
     driver
@@ -555,14 +568,14 @@ struct Served {
 /// `new` tokens after `prompt` through `open`/`step`/`commit`, committing each round whole (a
 /// recurrent row's state holds its folded kept prefix, so a round is kept entirely or not at all).
 fn serve(
-    driver: &mut Driver,
+    driver: &mut Driver<Serving>,
     prompt: &[u32],
     new: usize,
     sampler: &mut Sampler,
     heads: &[Head],
 ) -> Served {
     driver
-        .prepare(&ServingShapes {
+        .extend(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],
             heads,
@@ -573,11 +586,7 @@ fn serve(
         .unwrap_or_else(|e| panic!("{e}"));
     let compiled = driver.stats().compiles;
     let Admission::Opened { seq, .. } = driver
-        .open(SeqRequest {
-            prompt,
-            max_new: new,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(prompt, new, AdapterRef::Base))
         .unwrap()
     else {
         panic!("a fresh driver admits one sequence")
@@ -646,9 +655,10 @@ fn assert_greedy_lookup_equals_off(
     prompt: &[u32],
 ) {
     let (handle, _dir) = fixture_handle(family);
-    let Some(mut off) = device_driver(&handle, choice, backend, DraftPolicy::Off) else {
+    let Some(off) = device_driver(&handle, choice, backend, DraftPolicy::Off) else {
         return;
     };
+    let mut off = off.serve(Layout::Contiguous);
     let reference = serve(
         &mut off,
         prompt,
@@ -656,8 +666,9 @@ fn assert_greedy_lookup_equals_off(
         &mut Sampler::greedy(),
         &[Head::GREEDY],
     );
-    let mut driver =
-        device_driver(&handle, choice, backend, lookup(1)).expect("the device opened a moment ago");
+    let mut driver = device_driver(&handle, choice, backend, lookup(1))
+        .expect("the device opened a moment ago")
+        .serve(Layout::Contiguous);
     let served = serve(
         &mut driver,
         prompt,
@@ -780,7 +791,7 @@ impl Probed {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         };
-        let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+        let options = CompileOptions::new(CompileLimits::STANDARD);
         let program = compile_staged(&graph, &self.inner.target_set(), &partition, &options)
             .unwrap_or_else(|e| panic!("the probe of {name} compiles: {e}"));
         let entry = self.inner.add_entry(exe, &program)?;
@@ -851,13 +862,27 @@ impl Executor for Probed {
 }
 
 /// A driver whose recurrent state `shared` can read.
-struct Probing {
-    driver: Driver,
+struct Probing<S: State = Unprepared> {
+    driver: Driver<S>,
     shared: Rc<RefCell<ProbeShared>>,
     schema: Vec<(String, TensorType)>,
 }
 
-impl Probing {
+impl Probing<Unprepared> {
+    /// The same probe over the driver once it has prepared `shapes`.
+    fn prepare(self, shapes: &ServingShapes<'_>) -> Probing<Serving> {
+        Probing {
+            driver: self
+                .driver
+                .prepare(shapes)
+                .unwrap_or_else(|e| panic!("{e}")),
+            shared: self.shared,
+            schema: self.schema,
+        }
+    }
+}
+
+impl<S: State> Probing<S> {
     /// Read the recurrent state before the next step the driver issues.
     fn arm(&self) {
         self.shared.borrow_mut().armed.clone_from(&self.schema);
@@ -887,15 +912,11 @@ fn probe_schema(
     let model = (entry(family).build)(&fixture.raw(), &fixture.store).unwrap();
     let graph = model
         .trace(
-            Phase::Decode,
-            StepShape {
-                rows: NonZeroUsize::MIN,
-                tokens: NonZeroUsize::MIN,
-                capacity: nz(CAPACITY),
-                kv,
-                logits: LogitRows::Last,
-                hidden: hidden.map(|positions| HiddenCarry { positions }),
-            },
+            &StepSpec::step(
+                StepShape::new(NonZeroUsize::MIN, NonZeroUsize::MIN, nz(CAPACITY))
+                    .with_kv(kv)
+                    .with_hidden(hidden.map(|positions| HiddenCarry { positions })),
+            ),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -953,13 +974,9 @@ fn probing_driver(
 
 /// Open `prompt` on a prepared driver and prefill it, returning the sequence and its first token
 /// (committed).
-fn open_prefilled(driver: &mut Driver, prompt: &[u32], max_new: usize) -> (SeqId, u32) {
+fn open_prefilled(driver: &mut Driver<Serving>, prompt: &[u32], max_new: usize) -> (SeqId, u32) {
     let Admission::Opened { seq, .. } = driver
-        .open(SeqRequest {
-            prompt,
-            max_new,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(prompt, max_new, AdapterRef::Base))
         .unwrap()
     else {
         panic!("a fresh driver admits the sequence")
@@ -983,17 +1000,15 @@ fn open_prefilled(driver: &mut Driver, prompt: &[u32], max_new: usize) -> (SeqId
     (seq, first)
 }
 
-fn prepare_for(driver: &mut Driver, prompt_len: usize) {
-    driver
-        .prepare(&ServingShapes {
-            layout: Layout::Contiguous,
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Prompts(&[prompt_len]),
-            windows: &[],
-            adapters: &[],
-        })
-        .unwrap_or_else(|e| panic!("{e}"));
+fn prepare_for(probing: Probing, prompt_len: usize) -> Probing<Serving> {
+    probing.prepare(&ServingShapes {
+        layout: Layout::Contiguous,
+        rows: &[NonZeroUsize::MIN],
+        heads: &[Head::GREEDY],
+        warm: Warm::Prompts(&[prompt_len]),
+        windows: &[],
+        adapters: &[],
+    })
 }
 
 /// SC-001: on `family`'s fixture with `k = 3`, a round whose first draft verifies and whose second
@@ -1012,7 +1027,7 @@ fn assert_partial_accept_replays_the_kept_prefix(
     prompt: &[u32],
 ) {
     let (handle, _dir) = fixture_handle(family);
-    let Some(mut speculating) = probing_driver(
+    let Some(speculating) = probing_driver(
         family,
         &handle,
         choice,
@@ -1023,7 +1038,7 @@ fn assert_partial_accept_replays_the_kept_prefix(
     ) else {
         return;
     };
-    prepare_for(&mut speculating.driver, prompt.len());
+    let mut speculating = prepare_for(speculating, prompt.len());
     let (seq, query) = open_prefilled(&mut speculating.driver, prompt, 8);
     let mut sampler = Sampler::greedy();
     let round = decode_step(&mut speculating.driver, seq, &mut sampler);
@@ -1048,7 +1063,7 @@ fn assert_partial_accept_replays_the_kept_prefix(
     // The reference: the prompt in the same pieces, then [query, accepted draft] as one piece.
     let mut replayed = prompt.to_vec();
     replayed.extend([query, kept[0]]);
-    let Some(mut reference) = probing_driver(
+    let Some(reference) = probing_driver(
         family,
         &handle,
         choice,
@@ -1059,14 +1074,10 @@ fn assert_partial_accept_replays_the_kept_prefix(
     ) else {
         panic!("the device opened a moment ago")
     };
-    prepare_for(&mut reference.driver, prompt.len());
+    let mut reference = prepare_for(reference, prompt.len());
     let Admission::Opened { seq, .. } = reference
         .driver
-        .open(SeqRequest {
-            prompt: &replayed,
-            max_new: 8,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(&replayed, 8, AdapterRef::Base))
         .unwrap()
     else {
         panic!("a fresh driver admits the sequence")
@@ -1181,17 +1192,14 @@ fn a_partial_accept_replays_the_kept_prefix_on_mamba2_ptx() {
 const BATCH_ROUNDS: usize = 9;
 
 /// One decode step over `seqs` (greedy rows), each result kept whole.
-fn decode_rows(driver: &mut Driver, seqs: &[SeqId]) -> Vec<RowResult> {
+fn decode_rows(driver: &mut Driver<Serving>, seqs: &[SeqId]) -> Vec<RowResult> {
     let mut samplers: Vec<Sampler> = seqs.iter().map(|_| Sampler::greedy()).collect();
     let mut rows: Vec<StepRow<'_>> = seqs
         .iter()
         .zip(&mut samplers)
         .map(|(&seq, sampler)| StepRow {
             seq,
-            work: RowWork::Decode {
-                ahead: &[],
-                pick: PickPolicy::Greedy,
-            },
+            work: RowWork::Decode { ahead: &[] },
             sampler,
         })
         .collect();
@@ -1214,7 +1222,7 @@ fn paged_probing_driver(
     backend: DeviceBackend,
     policy: DraftPolicy,
     prompts: &[&[u32]],
-) -> Option<Probing> {
+) -> Option<Probing<Serving>> {
     let pool = PoolShape {
         blocks: nz(16),
         max_seqs: nz(2),
@@ -1223,20 +1231,16 @@ fn paged_probing_driver(
         pool_slots: nz(pool.blocks.get() * BLOCK_SIZE),
         seqs: pool.max_seqs,
     };
-    let mut probing = probing_driver(family, handle, choice, backend, policy, kv, None)?;
+    let probing = probing_driver(family, handle, choice, backend, policy, kv, None)?;
     let lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
-    probing
-        .driver
-        .prepare(&ServingShapes {
-            layout: Layout::Paged(pool),
-            rows: &[nz(2)],
-            heads: &[Head::GREEDY],
-            warm: Warm::Prompts(&lens),
-            windows: &[],
-            adapters: &[],
-        })
-        .unwrap_or_else(|e| panic!("{e}"));
-    Some(probing)
+    Some(probing.prepare(&ServingShapes {
+        layout: Layout::Paged(pool),
+        rows: &[nz(2)],
+        heads: &[Head::GREEDY],
+        warm: Warm::Prompts(&lens),
+        windows: &[],
+        adapters: &[],
+    }))
 }
 
 /// The first row slot (sequence slot 0) of every recurrent value of a two-sequence pool.
@@ -1412,18 +1416,10 @@ fn oracle_rows(family: FamilyKey, tokens: &[u32]) -> Vec<Vec<f32>> {
     let n = tokens.len();
     let fixture = (entry(family).fixture)();
     let model = (entry(family).build)(&fixture.raw(), &fixture.store).unwrap();
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: nz(n),
-        capacity: nz(CAPACITY),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
-    };
+    let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY)).with_logits(LogitRows::All);
     let graph = model
         .trace(
-            Phase::Prefill,
-            shape,
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -1518,9 +1514,10 @@ fn assert_sampled_lookup_matches_the_host_replay(
     backend: DeviceBackend,
 ) {
     let (handle, _dir) = fixture_handle(family);
-    let Some(mut driver) = device_driver(&handle, choice, backend, lookup(1)) else {
+    let Some(driver) = device_driver(&handle, choice, backend, lookup(1)) else {
         return;
     };
+    let mut driver = driver.serve(Layout::Contiguous);
     let (reference, restoring) = sampled_reference(family, &SAMPLED_PROMPT, NEW_TOKENS, SEED);
     assert!(
         restoring > 0,
@@ -1606,7 +1603,7 @@ fn median(mut xs: Vec<f64>) -> f64 {
 /// Run `driver` over `prompt` `COST_ITERS` times: the generated tokens, the median engine decode rate
 /// and the counters the runs added.
 fn timed_generate(
-    driver: &mut Driver,
+    driver: &mut Driver<Serving>,
     prompt: &[u32],
 ) -> (
     Vec<u32>,
@@ -1649,6 +1646,7 @@ fn timed_generate(
         skipped_sampler: a.skipped_sampler - b.skipped_sampler,
         skipped_no_room: a.skipped_no_room - b.skipped_no_room,
         skipped_no_proposal: a.skipped_no_proposal - b.skipped_no_proposal,
+        skipped_inputs: a.skipped_inputs - b.skipped_inputs,
         restored: a.restored - b.restored,
         replayed: a.replayed - b.replayed,
     };
@@ -1674,10 +1672,11 @@ fn measure_cost(family: FamilyKey, label: &str, choice: BackendChoice, backend: 
     let Some(off) = device_driver(&handle, choice, backend, DraftPolicy::Off) else {
         return;
     };
-    let mut off = off.with_phase_timing();
+    let mut off = off.with_phase_timing().serve(Layout::Contiguous);
     let mut on = device_driver(&handle, choice, backend, lookup(1))
         .expect("the device opened a moment ago")
-        .with_phase_timing();
+        .with_phase_timing()
+        .serve(Layout::Contiguous);
     for prompt in cost_prompts() {
         let (reference, off_rate, _, _) = timed_generate(&mut off, &prompt);
         let (tokens, on_rate, spec, rollback) = timed_generate(&mut on, &prompt);
@@ -1756,18 +1755,14 @@ fn shadow_state_share_of_the_state_budget() {
             let pool_slots = 4 * BLOCK_SIZE * n_slots;
             let graph = model
                 .trace(
-                    Phase::Decode,
-                    StepShape {
-                        rows: nz(1),
-                        tokens: NonZeroUsize::MIN,
-                        capacity: nz(CAPACITY),
-                        kv: KvLayout::Paged {
-                            pool_slots: nz(pool_slots),
-                            seqs: nz(n_slots),
-                        },
-                        logits: LogitRows::Last,
-                        hidden: None,
-                    },
+                    &StepSpec::step(
+                        StepShape::new(nz(1), NonZeroUsize::MIN, nz(CAPACITY)).with_kv(
+                            KvLayout::Paged {
+                                pool_slots: nz(pool_slots),
+                                seqs: nz(n_slots),
+                            },
+                        ),
+                    ),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap();
@@ -1817,7 +1812,7 @@ fn carry_after(
     prompt: &[u32],
     extra: &[u32],
 ) -> Vec<f32> {
-    let mut reference = probing_driver(
+    let reference = probing_driver(
         poot_models::glm53_flash::FAMILY,
         handle,
         choice,
@@ -1827,15 +1822,11 @@ fn carry_after(
         Some(nz(K + 1)),
     )
     .expect("the device opened a moment ago");
-    prepare_admitted(&mut reference.driver);
+    let mut reference = prepare_admitted(reference);
     let tokens = [prompt, extra].concat();
     let Admission::Opened { seq, .. } = reference
         .driver
-        .open(SeqRequest {
-            prompt: &tokens,
-            max_new: 8,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(&tokens, 8, AdapterRef::Base))
         .unwrap()
     else {
         panic!("a fresh driver admits the sequence")
@@ -1863,17 +1854,8 @@ fn carry_after(
     reference.read().remove(0)
 }
 
-fn prepare_admitted(driver: &mut Driver) {
-    driver
-        .prepare(&ServingShapes {
-            layout: Layout::Contiguous,
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
-        .unwrap_or_else(|e| panic!("{e}"));
+fn prepare_admitted(probing: Probing) -> Probing<Serving> {
+    probing.prepare(&contiguous())
 }
 
 /// POOT-1109 SC-002: a speculative round on GLM (KDA recurrent state, so it snapshots, runs a window
@@ -1887,7 +1869,7 @@ fn prepare_admitted(driver: &mut Driver) {
 fn assert_a_restore_leaves_the_hidden_carry_alone(choice: BackendChoice, backend: DeviceBackend) {
     let family = poot_models::glm53_flash::FAMILY;
     let (handle, _dir) = fixture_handle(family);
-    let Some(mut speculating) = probing_driver(
+    let Some(speculating) = probing_driver(
         family,
         &handle,
         choice,
@@ -1898,7 +1880,7 @@ fn assert_a_restore_leaves_the_hidden_carry_alone(choice: BackendChoice, backend
     ) else {
         return;
     };
-    prepare_admitted(&mut speculating.driver);
+    let mut speculating = prepare_admitted(speculating);
     for prompt in candidate_prompts().take(48) {
         let (seq, query) = open_prefilled(&mut speculating.driver, &prompt, 8);
         let mut history = prompt.clone();
@@ -1926,11 +1908,7 @@ fn assert_a_restore_leaves_the_hidden_carry_alone(choice: BackendChoice, backend
         assert_eq!(window.len(), K + 1);
         let want = carry_after(&handle, choice, backend, &prompt, &window);
         assert_eq!(got.len(), want.len(), "the carry is [1, K + 1, width]");
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(g, w)| (g - w).abs() / (1.0 + w.abs()))
-            .fold(0.0f32, f32::max);
+        let worst = poot_test_util::max_unit_floor_error(&got, &want);
         assert!(
             worst < 1e-4,
             "after a round that accepted {accepted} of {proposed} the carry differs from the \

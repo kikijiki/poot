@@ -253,26 +253,6 @@ pub fn bf16_const_feeds_only_packed_readers(
     consumed
 }
 
-/// Card 534a: the graph-level BF16-packed-weight recognition (`fold_dense_contractions`,
-/// `fold_dense_bf16_row_gathers`) and non-last-axis reduce legalization (`lower_nonlast_reduces`)
-/// every target needs before its own dtype widening, in the one order every caller ran them in before
-/// this card: the folds must see the traced `MatMul`/`Transpose` and
-/// `Cast`/`Gather` chains before `fuse` or the dtype widening rewrite them, and the reduce legalization
-/// must run before `fuse` can absorb a non-last-axis `Reduce` into a region no target plans.
-///
-/// `compile`'s pipeline runs this between `dce` and `fuse`; the typed exact-value walk (Card 534b) runs
-/// it standalone, because the rest of `compile`'s pipeline (fusion, tiling) would reassociate the
-/// bit-exact arithmetic that walk's contract requires. One function for every caller closes the R481-003
-/// drift: wgpu's copy ran `lower_nonlast_reduces`, ROCm's and PTX's did not, so a MiniMax-M2 decode graph
-/// planned on wgpu and refused on ROCm and PTX for a pass gap, not a real capability difference.
-#[cfg(any(test, feature = "test-support"))]
-pub fn prepare_target_graph(g: &Graph, backend: Backend) -> Result<Graph, EditError> {
-    let folded = fold_dense_contractions(g)?;
-    let folded = fold_dense_bf16_row_gathers(&folded)?;
-    let folded = lower_nonlast_reduces(&folded)?;
-    widen_mismatched_matmul_dtypes(&folded, backend)
-}
-
 /// A rewritten equation's operand map, keyed by the `ValueId` it reads: which equation index
 /// produces it. Local to the two folds below (their own copy of `poot-graph-ir`'s private
 /// `packed_consumer_map`/`value_input`/`is_graph_escape`, kept small rather than widening
@@ -323,7 +303,7 @@ fn value_input(eqn: &Eqn, position: usize) -> Option<ValueId> {
 /// equation is dropped, so input, state, and validation bindings stay valid. Idempotent: a folded
 /// graph has no `Transpose` left to match.
 ///
-/// `pub(crate)`: reachable only through [`prepare_target_graph`] (Card 534a SC-001).
+/// `pub(crate)`: reachable only through `compile` (Card 534a SC-001).
 ///
 /// ```compile_fail,E0425
 /// let g = poot_graph_ir::Graph::default();
@@ -498,7 +478,7 @@ pub(crate) fn fold_dense_contractions(g: &Graph) -> Result<Graph, EditError> {
 /// and lose their producers, as the transpose does in the contraction fold. Idempotent: a folded graph
 /// holds no `Cast { to: F32 }` over a `Gather`.
 ///
-/// `pub(crate)`: reachable only through [`prepare_target_graph`] (Card 534a SC-001).
+/// `pub(crate)`: reachable only through `compile` (Card 534a SC-001).
 ///
 /// ```compile_fail,E0425
 /// let g = poot_graph_ir::Graph::default();
@@ -653,13 +633,13 @@ pub(crate) fn fold_dense_bf16_row_gathers(g: &Graph) -> Result<Graph, EditError>
 ///   survive.
 /// - Idempotent: a graph with no non-last reduce (or a lowered one) comes back unchanged.
 ///
-/// Card 534a runs it for every backend, through [`prepare_target_graph`] (`compile`'s pipeline, and
+/// Card 534a runs it for every backend, through `compile`'s pipeline (and
 /// the typed exact-value walk): before that card, only the wgpu copy of this preparation ran it, so a
 /// MiniMax-M2 or GLM-5.3-Flash MoE gating reduce planned on wgpu and refused on ROCm and PTX
 /// even though ROCm and PTX plan `Reduce` through the same `plan_eqn`, not a
 /// separate planner.
 ///
-/// `pub(crate)`: reachable only through [`prepare_target_graph`] (Card 534a SC-001).
+/// `pub(crate)`: reachable only through `compile` (Card 534a SC-001).
 ///
 /// ```compile_fail,E0425
 /// let g = poot_graph_ir::Graph::default();
@@ -939,10 +919,11 @@ mod tests {
     use poot_target::Backend;
     use poot_tensor::DType;
 
-    use super::prepare_target_graph;
+    use crate::test_support::compiled_graph;
 
-    /// `a x w -> f32` over two consts of the given dtypes, `m x 32 x 32`.
-    fn const_matmul(m: usize, a_dtype: DType, w_dtype: DType) -> Graph {
+    /// `a x w^T -> f32` over two consts of the given dtypes, `m x 32` against a checkpoint-order `[32, 32]` weight:
+    /// the shape a model traces, which `compile` folds into a dense contraction that reads the weight as stored.
+    fn checkpoint_matmul(m: usize, a_dtype: DType, w_dtype: DType) -> Graph {
         let b = Builder::for_tests();
         let a = b
             .constant("a", TensorType::new(vec![m, 32], a_dtype))
@@ -950,7 +931,8 @@ mod tests {
         let w = b
             .constant("w", TensorType::new(vec![32, 32], w_dtype))
             .unwrap();
-        let mm = b.matmul(a, w).unwrap();
+        let wt = b.transpose(w, vec![1, 0]).unwrap();
+        let mm = b.matmul(a, wt).unwrap();
         let g = b.finish(mm).unwrap();
         let out = g
             .eqns()
@@ -961,14 +943,15 @@ mod tests {
         derive(&g, |draft| draft.values_mut()[out].aval.dtype = DType::F32).unwrap()
     }
 
-    /// Card 1011: no pass retypes a BF16 const, on any backend or AMD arch family, over the mixed-bf16 and
-    /// checkpoint matmuls (a prefill matmul no backend has a packed reader for included): the declared dtype
-    /// of every const is the dtype it was traced with, so the executor uploads the stored words.
+    /// Card 1011: no pass retypes a BF16 const, on any backend or AMD arch family, over the checkpoint matmuls
+    /// (a prefill matmul no backend has a packed reader for included): the declared dtype of every const is the
+    /// dtype it was traced with, so the executor uploads the stored words. A BF16 activation has no lowering on
+    /// some targets; there `compile` refuses by name (`Refusal`) instead of retyping anything to plan it.
     ///
     /// Mutation: retype every BF16 const to F32 at the top of `widen_mismatched_matmul_dtypes`; every row
     /// of this test goes red naming the const.
     #[test]
-    fn prepare_target_graph_never_retypes_a_bf16_const() {
+    fn compile_never_retypes_a_bf16_const() {
         let backends = [
             Backend::SpirvVulkan,
             Backend::Nvptx,
@@ -977,27 +960,41 @@ mod tests {
             Backend::AmdGcn(AmdArch::new("gfx1030", 32)),
             Backend::AmdGcn(AmdArch::new("gfx1200", 32)),
         ];
+        // (label, graph, whether every target must plan it)
         let graphs = [
             (
                 "mixed bf16 prefill",
-                const_matmul(32, DType::BF16, DType::BF16),
+                checkpoint_matmul(32, DType::BF16, DType::BF16),
+                false,
             ),
             (
                 "mixed bf16 decode",
-                const_matmul(1, DType::BF16, DType::BF16),
+                checkpoint_matmul(1, DType::BF16, DType::BF16),
+                false,
             ),
             (
                 "bf16 checkpoint prefill",
-                const_matmul(32, DType::F32, DType::BF16),
+                checkpoint_matmul(32, DType::F32, DType::BF16),
+                true,
             ),
             (
                 "bf16 checkpoint decode",
-                const_matmul(1, DType::F32, DType::BF16),
+                checkpoint_matmul(1, DType::F32, DType::BF16),
+                true,
             ),
         ];
         for backend in backends {
-            for (label, g) in &graphs {
-                let prepared = prepare_target_graph(g, backend).unwrap();
+            for (label, g, must_plan) in &graphs {
+                let caps = poot_test_util::device_caps::default_caps_for(backend);
+                let prepared = match compiled_graph(g, backend, &caps) {
+                    Ok(prepared) => prepared,
+                    Err(crate::CompileError::Plan(error))
+                        if !must_plan && matches!(*error, crate::PlanError::Refused(_)) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("{label} on {backend:?}: {error}"),
+                };
                 for id in g
                     .values()
                     .ids()
@@ -1076,17 +1073,17 @@ mod tensor_core_weight_tests {
     }
 }
 
-/// Card 534a SC-002: `prepare_target_graph` is the one preparation function feeding every target
+/// Card 534a SC-002: `compile` is the one preparation pipeline feeding every target
 /// (R481-003's stated fix), so a MiniMax-M2-shaped MoE gating reduce over axis 0 - which the wgpu-only
 /// `lower_nonlast_reduces` copy used to leave unlowered for ROCm and PTX - now legalizes identically on
 /// every backend.
 #[cfg(test)]
-mod prepare_target_graph_tests {
+mod compile_preparation_tests {
     use poot_graph_ir::{Builder, OpKind, RedOp, TensorType};
     use poot_target::{AmdArch, Backend};
     use poot_tensor::DType;
 
-    use super::prepare_target_graph;
+    use crate::test_support::compiled_graph;
 
     /// A tiny MoE-router-shaped graph: `top_k`-style expert weights summed on axis 0 (a non-last-axis
     /// reduce), the same shape MiniMax-M2's gating sum traces.
@@ -1106,7 +1103,12 @@ mod prepare_target_graph_tests {
             Backend::Nvptx,
             Backend::AmdGcn(AmdArch::gfx1151()),
         ] {
-            let prepared = prepare_target_graph(&moe_gate_reduce_graph(), backend).unwrap();
+            let prepared = compiled_graph(
+                &moe_gate_reduce_graph(),
+                backend,
+                &poot_test_util::device_caps::default_caps_for(backend),
+            )
+            .unwrap();
             assert!(
                 !prepared
                     .eqns()
@@ -1140,7 +1142,12 @@ mod prepare_target_graph_tests {
         let g = b.finish(out).unwrap();
 
         for backend in [Backend::SpirvVulkan, Backend::Nvptx] {
-            let prepared = prepare_target_graph(&g, backend).unwrap();
+            let prepared = compiled_graph(
+                &g,
+                backend,
+                &poot_test_util::device_caps::default_caps_for(backend),
+            )
+            .unwrap();
             assert_eq!(prepared.aval(weight.id()).dtype, DType::BF16, "{backend:?}");
             assert!(
                 prepared.eqns().iter().any(|eqn| matches!(
@@ -1366,7 +1373,7 @@ mod fold_dense_bf16_tests {
     /// bit, on a weight whose `[N, K]` and `[K, N]` readings differ.
     #[test]
     fn folded_f32_contraction_evaluates_as_the_traced_matmul() {
-        use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+        use poot_eval::{EvalOptions, Value, eval};
         use poot_tensor::HostTensor;
         use std::collections::HashMap;
 
@@ -1394,7 +1401,7 @@ mod fold_dense_bf16_tests {
             Value::from(HostTensor::f32(vec![7, 5], fill(35, 2))),
         );
         let run = |g: &Graph| {
-            eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            eval(g, &inputs, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()
@@ -1791,29 +1798,21 @@ mod lower_nonlast_reduces_tests {
 
             for original in [bare, graph] {
                 let bound = inputs(x.id());
-                let base = poot_eval::eval(
-                    &original,
-                    &bound,
-                    poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-                )
-                .unwrap()
-                .output
-                .into_host()
-                .unwrap();
+                let base = poot_eval::eval(&original, &bound, poot_eval::EvalOptions::default())
+                    .unwrap()
+                    .output
+                    .into_host()
+                    .unwrap();
                 let lowered = lower_nonlast_reduces(&original).unwrap();
                 assert!(
                     all_reduces_are_last_axis(&lowered),
                     "lowered graph still holds a non-last-axis reduce (op={op:?}, keepdim={keepdim})"
                 );
-                let out = poot_eval::eval(
-                    &lowered,
-                    &bound,
-                    poot_eval::EvalOptions::new(poot_eval::EvalBudget::UNBOUNDED),
-                )
-                .unwrap()
-                .output
-                .into_host()
-                .unwrap();
+                let out = poot_eval::eval(&lowered, &bound, poot_eval::EvalOptions::default())
+                    .unwrap()
+                    .output
+                    .into_host()
+                    .unwrap();
 
                 assert_eq!(out.shape(), base.shape(), "op={op:?}, keepdim={keepdim}");
                 let bits = |t: &poot_tensor::HostTensor| {

@@ -13,7 +13,7 @@ use poot_graph_plan::device_validation::ResourceRefusal;
 use poot_graph_plan::test_support::{gpu_caps, gpu_caps_mut};
 use poot_graph_plan::{
     Capability, CompileError, CompileLimits, CompileOptions, KernelChoice, Plan, PlanError,
-    Program, Target, compile, production_plan::Submission,
+    Program, Target, compile,
 };
 use poot_kernel_ir::{Body, Ty, WmmaDtype, WmmaShape};
 use poot_kernelgen::{ContractionSpec, FragmentUse, KernelRequest};
@@ -22,7 +22,7 @@ use poot_tensor::DType;
 use poot_test_util::device_caps::default_caps_for;
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 fn target(backend: Backend, caps: DeviceCaps) -> Target {
@@ -445,65 +445,6 @@ fn the_cooperative_matrix_kernel_is_refused_without_subgroups() {
     assert!(loader.loaded.is_empty());
 }
 
-/// `[1, h, m, k] @ [1, h, k, n]` f32: two batched operands (no shared weight), which no tiled or GEMV
-/// kernel takes, so the planner picks the one-thread-per-output serial kernel.
-fn serial_contraction_graph(h: usize, m: usize, k: usize, n: usize) -> poot_graph_ir::Graph {
-    let b = Builder::for_tests();
-    let a = b.constant("a", TensorType::f32(vec![1, h, m, k])).unwrap();
-    let w = b.constant("w", TensorType::f32(vec![1, h, k, n])).unwrap();
-    let out = b.matmul(a, w).unwrap();
-    b.finish(out).unwrap()
-}
-
-/// SC-002: a long serial contraction under a deliberately small per-dispatch budget. `threads * K`
-/// serial steps is the dispatch's conservative work; a device bounding a dispatch at exactly that admits
-/// it, one step less refuses it before any loader (the executor cannot batch around a single dispatch
-/// that is itself too long), and the same budget admits the shorter contraction the budget was not
-/// meant to stop.
-///
-/// Mutation: delete the `caps.max_dispatch_work` check in `validate_kernel_resources`; the over-budget
-/// compile succeeds and `resource_refusal` panics with "the program compiled".
-#[test]
-fn a_long_serial_contraction_over_the_dispatch_budget_is_refused_before_dispatch() {
-    let backend = Backend::AmdGcn(AmdArch::gfx1151());
-    let roomy = target(backend, default_caps_for(backend));
-    let (h, m, k, n) = (2, 3, 4096, 5);
-    let graph = serial_contraction_graph(h, m, k, n);
-    let (_, result) = compile_and_load(&graph, &roomy);
-    let program = result.expect("the roomy device plans it");
-    assert!(
-        matches!(
-            generated_contraction(&program),
-            ContractionSpec::Serial { .. }
-        ),
-        "the fixture must take the serial kernel"
-    );
-    let work = (h * m * n * k) as u64;
-
-    let mut exact = roomy;
-    gpu_caps_mut(&mut exact).max_dispatch_work = Queried::Known(work);
-    let (loader, result) = compile_and_load(&graph, &exact);
-    result.expect("a budget equal to the dispatch's work admits it");
-    assert_eq!(loader.loaded.len(), 1);
-
-    let mut small = roomy;
-    gpu_caps_mut(&mut small).max_dispatch_work = Queried::Known(work - 1);
-    let (loader, result) = compile_and_load(&graph, &small);
-    assert_eq!(
-        resource_refusal(result, "one step over the budget"),
-        ResourceRefusal::DispatchWork {
-            work,
-            budget: work - 1,
-        }
-    );
-    assert!(loader.loaded.is_empty());
-
-    let short = serial_contraction_graph(h, m, k / 64, n);
-    let (loader, result) = compile_and_load(&short, &small);
-    result.expect("the same budget admits the short contraction");
-    assert_eq!(loader.loaded.len(), 1);
-}
-
 /// `a + b` over `n` f32 elements: one thread per element, so a device whose grid cap is below
 /// `n / 64` workgroups gets its workgroup widened to 256 by `finalize`.
 fn add_graph(n: usize) -> poot_graph_ir::Graph {
@@ -550,49 +491,4 @@ fn a_finalizer_workgroup_bump_is_reflected_in_the_plan_key() {
         plain_key, tight_key,
         "two different bodies ({plain_wg:?} and {tight_wg:?}) share the plan key {plain_key}"
     );
-}
-
-/// `a [1, m, k] f32 @ w [n, k] bf16 ^T`: folded by `compile` into the dense BF16 contraction, whose
-/// `M > 1` arm plans the imported one-thread-per-output body.
-fn imported_kernel(program: &Program) -> poot_graph_plan::ImportedKernel {
-    match choice_of(program) {
-        KernelChoice::Imported { kernel, .. } => *kernel,
-        other => panic!("expected an imported kernel, got {other:?}"),
-    }
-}
-
-/// Imported contractions loop over K per thread, so they declare serial work and a device's
-/// `max_dispatch_work` bounds them like a generated serial contraction: `output elements * K` steps. A
-/// budget equal to the work admits the imported kernel; one step less refuses the plan (the coalesced
-/// GEMV, no alternative).
-///
-/// Mutation: in `ImportedKernel::needs`, move the contraction family to `ImportedNeeds::NONE`; the
-/// one-step-short compile still plans the imported kernel and the row fails ("the program compiled").
-#[test]
-fn imported_contractions_are_bounded_by_the_dispatch_work_budget() {
-    let (backend, graph, work) = (Backend::SpirvVulkan, imported_gemv_graph(), 512u64 * 256);
-    let what = "coalesced gemv";
-    let roomy = target(backend, default_caps_for(backend));
-    let (_, result) = compile_and_load(&graph, &roomy);
-    let program = result.unwrap_or_else(|error| panic!("{what}: {error}"));
-    let _ = imported_kernel(&program);
-
-    let mut exact = roomy;
-    gpu_caps_mut(&mut exact).max_dispatch_work = Queried::Known(work);
-    let (loader, result) = compile_and_load(&graph, &exact);
-    result.unwrap_or_else(|error| panic!("{what}: a budget equal to the work admits it: {error}"));
-    assert_eq!(loader.loaded.len(), 1, "{what}");
-
-    let mut short = roomy;
-    gpu_caps_mut(&mut short).max_dispatch_work = Queried::Known(work - 1);
-    let (loader, result) = compile_and_load(&graph, &short);
-    assert_eq!(
-        resource_refusal(result, what),
-        ResourceRefusal::DispatchWork {
-            work,
-            budget: work - 1,
-        },
-        "{what}"
-    );
-    assert!(loader.loaded.is_empty(), "{what}");
 }

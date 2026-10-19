@@ -11,6 +11,8 @@ use poot_quant::weights::{HandleFormat, WeightId, WeightMap, WeightMapError};
 
 use poot_text::ChatFormat;
 
+use crate::io::{InputId, ModelSchema, ProgramId, SchemaError, StateMismatch};
+
 /// A family's display name (`"qwen2"`): for messages and receipts only; nothing dispatches on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FamilyKey(&'static str);
@@ -36,18 +38,18 @@ impl fmt::Display for FamilyKey {
 /// What a traced step returns per row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelOutput {
-    /// A vocabulary logit vector per position ([`Phase::Prefill`], [`Phase::Decode`], [`Phase::Mtp`]).
+    /// A vocabulary logit vector per position (a `step` or `draft` program).
     Logits {
         /// The vocabulary size: the logit vector's width.
         vocab: usize,
     },
-    /// The final hidden state of every position, `width` wide ([`Phase::Encode`]).
+    /// The final hidden state of every position, `width` wide (an `encode` program).
     Hidden {
         /// The model's hidden width.
         width: usize,
     },
     /// One `labels`-wide score vector per row, read at the first position: a cross-encoder's
-    /// classifier ([`Phase::Encode`]).
+    /// classifier (an `encode` program).
     Scores {
         /// The classifier's label count.
         labels: usize,
@@ -74,41 +76,12 @@ pub struct ModelConfig {
     /// mandatory BOS (Gemma 2 and 3). A family without one leaves its prompts as the tokenizer encodes
     /// them.
     pub prompt_bos: Option<u32>,
-    /// What a traced step returns per row.
-    pub output: ModelOutput,
     /// Semantic alignment of a prefill step: a prefill's token count is a multiple of it (1 except
     /// for compressed attention). It never limits how large a step may be.
     pub prefill_granule: NonZeroUsize,
     /// The fallback chat format, used only when the checkpoint ships no jinja `chat_template` (the
     /// template itself is tokenizer data, not model config).
     pub chat: ChatFormat,
-}
-
-/// Which program of a model a step traces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Phase {
-    /// New prompt tokens continuing from the absolute positions already cached; the step writes its
-    /// KV (and recurrent state) and returns logits per [`LogitRows`].
-    Prefill,
-    /// One new token per row against the cache: the same body as prefill with `tokens = 1`.
-    Decode,
-    /// A prefill whose step inputs are the prompt's tokens with caller-computed embedding rows
-    /// scattered over some positions (`StepInput::TokensWithEmbeds`): a multimodal prompt's image
-    /// rows. A family that takes them traces it as [`Phase::Prefill`] over the embedded inputs.
-    PrefillEmbeds,
-    /// The whole input in one step, returning the final hidden states of every position
-    /// (`HeadKind::Hidden`; [`ModelOutput::Hidden`]) for the host to pool or score: an encoder's
-    /// forward, or a decoder's embedding pass. A step carries no cache a later step reads.
-    Encode,
-    /// The multi-token-prediction layer over the hidden-state carry (POOT-1110): a step of `tokens`
-    /// positions whose `Slot::Pos` input holds the absolute position `p` of each hidden row the
-    /// carry holds and whose `Slot::Token` input holds the host token that follows it, `t[p + 1]`.
-    /// The program reads the first `tokens` rows of the [`HiddenCarry`] the step's shape carries,
-    /// continues the layer's own cache, and returns the logits of the next-next token. It writes its
-    /// own post-norm hidden state of the step's last position into row 0 of the carry, the row a
-    /// following one-token `Mtp` step of a draft chain reads. A family that does not trace it refuses
-    /// it typed in [`check_step`](crate::components::standard::check_step).
-    Mtp,
 }
 
 /// How the traced step's KV cache is laid out.
@@ -143,7 +116,27 @@ pub enum LogitRows {
 
 /// The semantic shape of one traced step: `rows` sequences of `tokens` new tokens each, against a
 /// cache of `capacity` positions.
+///
+/// Built with [`StepShape::new`] and the `with_*` setters, so a new field never breaks a call site: the
+/// struct is `#[non_exhaustive]`, and a literal outside this crate does not compile.
+///
+/// ```compile_fail
+/// use std::num::NonZeroUsize;
+/// use poot_models::model::{KvLayout, LogitRows, StepShape};
+///
+/// let one = NonZeroUsize::MIN;
+/// let _ = StepShape {
+///     rows: one,
+///     tokens: one,
+///     capacity: one,
+///     kv: KvLayout::Contiguous,
+///     logits: LogitRows::Last,
+///     hidden: None,
+///     row_extent: None,
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct StepShape {
     /// Sequences in the step.
     pub rows: NonZeroUsize,
@@ -157,6 +150,61 @@ pub struct StepShape {
     pub logits: LogitRows,
     /// The hidden-state carry the step also writes, when its caller asks for one.
     pub hidden: Option<HiddenCarry>,
+    /// The padded leading extent of the step's per-row request inputs
+    /// ([`Per::Row`](crate::io::Per::Row)): a vision tower's patch count, an encoder-decoder's source
+    /// length. `None` for a step none of whose inputs is a padded row tensor.
+    pub row_extent: Option<NonZeroUsize>,
+}
+
+impl StepShape {
+    /// A step of `rows` sequences of `tokens` new tokens against `capacity` cache positions, over a
+    /// contiguous cache, returning the last position's logits, carrying no hidden state and with no
+    /// row extent.
+    pub const fn new(rows: NonZeroUsize, tokens: NonZeroUsize, capacity: NonZeroUsize) -> Self {
+        Self {
+            rows,
+            tokens,
+            capacity,
+            kv: KvLayout::Contiguous,
+            logits: LogitRows::Last,
+            hidden: None,
+            row_extent: None,
+        }
+    }
+
+    /// Whether the step is a decode step: one token per row, the last position's logits. A property of
+    /// the shape, not a program of its own: the body that traces it is the one every step runs.
+    pub fn is_decode(&self) -> bool {
+        self.tokens.get() == 1 && self.logits == LogitRows::Last
+    }
+
+    /// This shape over `kv`.
+    #[must_use]
+    pub const fn with_kv(mut self, kv: KvLayout) -> Self {
+        self.kv = kv;
+        self
+    }
+
+    /// This shape producing logits at `logits`.
+    #[must_use]
+    pub const fn with_logits(mut self, logits: LogitRows) -> Self {
+        self.logits = logits;
+        self
+    }
+
+    /// This shape also writing the hidden-state carry `hidden`.
+    #[must_use]
+    pub const fn with_hidden(mut self, hidden: Option<HiddenCarry>) -> Self {
+        self.hidden = hidden;
+        self
+    }
+
+    /// This shape with padded row inputs of `row_extent` leading positions.
+    #[must_use]
+    pub const fn with_row_extent(mut self, row_extent: Option<NonZeroUsize>) -> Self {
+        self.row_extent = row_extent;
+        self
+    }
 }
 
 /// A request that a step write its final hidden state, at every position of the step and before any
@@ -170,57 +218,144 @@ pub struct HiddenCarry {
     pub positions: NonZeroUsize,
 }
 
-/// One model behind the driver: its config, its weights and its tracer.
+/// One traced step: which program, at what shape, and which carriable request inputs (cadence
+/// [`Covers`](crate::io::Cadence::Covers) or [`AtStart`](crate::io::Cadence::AtStart)) the step
+/// binds. A carriable input is declared by the program variant a step runs when it carries it, so
+/// input variation is data over the schema and never a program of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StepSpec {
+    /// The program to trace: one of the schema's.
+    pub program: ProgramId,
+    /// The step's shape.
+    pub shape: StepShape,
+    /// The carriable inputs the step binds, ascending.
+    pub carried: Vec<InputId>,
+}
+
+impl StepSpec {
+    /// A step of `program` at `shape` carrying no carriable input.
+    pub fn new(program: ProgramId, shape: StepShape) -> Self {
+        Self {
+            program,
+            shape,
+            carried: Vec::new(),
+        }
+    }
+
+    /// A step of the `step` program (serve a sequence) at `shape`.
+    pub fn step(shape: StepShape) -> Self {
+        Self::new(ProgramId::STEP, shape)
+    }
+
+    /// A step of the `encode` program (one stateless pass over whole rows) at `shape`.
+    pub fn encode(shape: StepShape) -> Self {
+        Self::new(ProgramId::ENCODE, shape)
+    }
+
+    /// A step of the `draft` program (the draft head over the hidden-state carry) at `shape`.
+    pub fn draft(shape: StepShape) -> Self {
+        Self::new(ProgramId::DRAFT, shape)
+    }
+
+    /// This step also carrying `input`.
+    #[must_use]
+    pub fn carrying(mut self, input: InputId) -> Self {
+        if let Err(at) = self.carried.binary_search(&input) {
+            self.carried.insert(at, input);
+        }
+        self
+    }
+
+    /// Whether the step carries `input`.
+    pub fn carries(&self, input: InputId) -> bool {
+        self.carried.binary_search(&input).is_ok()
+    }
+}
+
+/// One model behind the driver: its config, its input schema, its weights and its tracer.
 pub trait Model: Send + Sync + fmt::Debug {
     /// The family-neutral facts the driver needs.
     fn config(&self) -> &ModelConfig;
+
+    /// What the model's programs read, carry and require: the contract the driver binds every input
+    /// of a traced program by.
+    fn schema(&self) -> &ModelSchema;
 
     /// The model's weight map: every typed weight id the tracer declares, with its handle (shape and
     /// format).
     fn weights(&self) -> &WeightMap;
 
-    /// The body of one traced step: trace `phase` at `shape` into `b`, a builder already charging
-    /// the caller's [`TraceLimits`]. A shape the family cannot trace is a typed refusal, never a
-    /// panic. Callers use `<dyn Model>::trace`, which checks the step's token count first; the
-    /// trait has no `trace` method a family could override, so the admission cannot be skipped.
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError>;
+    /// The body of one traced step: trace `spec.program` at `spec.shape` into `b`, a builder already
+    /// charging the caller's [`TraceLimits`]. A shape the family cannot trace is a typed refusal,
+    /// never a panic. Callers use `<dyn Model>::trace`, which checks the step against the schema and
+    /// its token count first; the trait has no `trace` method a family could override, so the
+    /// admission cannot be skipped.
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError>;
 }
 
 impl dyn Model + '_ {
-    /// The graph of one step of `phase` at `shape` under the caller's `limits`.
+    /// The graph of one step `step` under the caller's `limits`.
     ///
-    /// A step of more tokens than `limits.max_tokens` is refused before the tracer body runs; every
-    /// value, equation, literal and owned allocation the body makes is charged against the same
-    /// limits, so a refusal names the exact resource and nothing past it was built. This is an
-    /// inherent method of the trait object, so no family can replace it:
+    /// A step of a program the schema does not declare, or one carrying an input that program does not
+    /// read as a carriable one, is refused before the tracer body runs. So is a step of more tokens
+    /// than `limits.max_tokens`; every value, equation, literal and owned allocation the body makes is
+    /// charged against the same limits, so a refusal names the exact resource and nothing past it was
+    /// built. This is an inherent method of the trait object, so no family can replace it:
     ///
     /// ```compile_fail
     /// use poot_graph_ir::{Builder, Graph, TraceLimits};
-    /// use poot_models::model::{Model, ModelConfig, Phase, StepShape, TraceError};
+    /// use poot_models::io::ModelSchema;
+    /// use poot_models::model::{Model, ModelConfig, StepSpec, TraceError};
     /// use poot_quant::weights::WeightMap;
     ///
     /// #[derive(Debug)]
     /// struct Skips;
     /// impl Model for Skips {
     ///     fn config(&self) -> &ModelConfig { unimplemented!() }
+    ///     fn schema(&self) -> &ModelSchema { unimplemented!() }
     ///     fn weights(&self) -> &WeightMap { unimplemented!() }
-    ///     fn trace_into(&self, _: Phase, _: StepShape, _: Builder) -> Result<Graph, TraceError> {
+    ///     fn trace_into(&self, _: &StepSpec, _: Builder) -> Result<Graph, TraceError> {
     ///         unimplemented!()
     ///     }
     ///     // a family cannot provide its own admission-free entry point
-    ///     fn trace(&self, _: Phase, _: StepShape, _: TraceLimits) -> Result<Graph, TraceError> {
+    ///     fn trace(&self, _: &StepSpec, _: TraceLimits) -> Result<Graph, TraceError> {
     ///         unimplemented!()
     ///     }
     /// }
     /// ```
-    pub fn trace(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        limits: TraceLimits,
-    ) -> Result<Graph, TraceError> {
-        limits.admit_tokens(shape.tokens)?;
-        self.trace_into(phase, shape, Builder::new(limits))
+    pub fn trace(&self, step: &StepSpec, limits: TraceLimits) -> Result<Graph, TraceError> {
+        let schema = self.schema();
+        let family = self.config().family;
+        let program = schema
+            .program(step.program)
+            .ok_or(TraceError::ProgramUnsupported {
+                family,
+                program: step.program,
+            })?;
+        let carriable = schema.carriable(program);
+        for &input in &step.carried {
+            let carriable_here = schema
+                .index_of(input)
+                .is_some_and(|index| carriable.contains(index));
+            if !carriable_here {
+                return Err(TraceError::NotCarriable {
+                    family,
+                    program: step.program,
+                    input,
+                });
+            }
+        }
+        limits.admit_tokens(step.shape.tokens)?;
+        let graph = self.trace_into(step, Builder::new(limits))?;
+        program
+            .check_states(graph.state_pairs().map(|pair| pair.role))
+            .map_err(|source| TraceError::StateMismatch {
+                family,
+                program: step.program,
+                source,
+            })?;
+        Ok(graph)
     }
 }
 
@@ -266,8 +401,6 @@ pub enum ConfigReason {
 /// Why a family refuses a step shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeReason {
-    /// A [`Phase::Decode`] step of other than one token.
-    DecodeTokens,
     /// The step's cache capacity exceeds the checkpoint's `max_positions`.
     CapacityAboveMax {
         /// The checkpoint's `max_positions`.
@@ -321,9 +454,8 @@ pub enum ShapeReason {
     },
     /// A hidden-state carry written by a step that asked for none.
     HiddenCarryUnrequested,
-    /// A [`Phase::Mtp`] step whose shape names no hidden-state carry: there is nothing for the
-    /// layer to read.
-    MtpWithoutCarry,
+    /// A draft step whose shape names no hidden-state carry: there is nothing for the layer to read.
+    DraftWithoutCarry,
     /// A paged-KV step of a family whose indexer keeps a per-row block-key cache. The cache's paging
     /// granule (a page must hold whole blocks) belongs to the paged-KV owner, POOT-1148; until it
     /// decides, the indexer refuses a paged layout rather than invent one.
@@ -373,6 +505,14 @@ pub enum ModelError {
         /// The format the checkpoint stores it in.
         format: HandleFormat,
     },
+    /// The schema the family built is malformed.
+    #[error("{family}: malformed input schema: {source}")]
+    Schema {
+        /// The family whose schema is malformed.
+        family: FamilyKey,
+        /// What is wrong with it.
+        source: SchemaError,
+    },
     /// A guarantee the family's wiring relies on does not hold.
     #[error("{family}: {source}")]
     Wiring {
@@ -398,7 +538,7 @@ pub enum ModelError {
 
 /// A guarantee the config reader or a step check establishes before tracing does not hold where a
 /// shared component needs it: the family's wiring is defective (a parameter block a layer kind needs
-/// is missing, a step input a phase carries is absent). Never a property of a checkpoint; reported as a
+/// is missing, a step input a program carries is absent). Never a property of a checkpoint; reported as a
 /// value so the tracer path has no panic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WiringError {
@@ -406,7 +546,7 @@ pub enum WiringError {
     #[error("a layer needs the {0} parameters, which the config did not read")]
     MissingParams(ParamBlock),
     /// A program that reads the hidden-state carry was traced for a step whose shape names none:
-    /// the phase check ([`check_mtp_step`](crate::components::standard::check_mtp_step)) refuses it.
+    /// the draft check ([`check_draft_step`](crate::components::standard::check_draft_step)) refuses it.
     #[error("the step's shape names no hidden-state carry")]
     MissingHiddenCarry,
     /// An MLA attention was given a key-position selector but a plain (not low-rank) query: the
@@ -520,13 +660,33 @@ pub(crate) fn last_axis(operation: &'static str, shape: &[usize]) -> Result<usiz
 /// A model refused to trace a step.
 #[derive(Debug, thiserror::Error)]
 pub enum TraceError {
-    #[error("{family} does not trace phase {phase:?}")]
-    /// The family does not trace `phase`.
-    PhaseUnsupported {
+    /// The model's schema declares no program `program`.
+    #[error("{family} has no program {program}")]
+    ProgramUnsupported {
         /// The family that refused.
         family: FamilyKey,
-        /// The refused phase.
-        phase: Phase,
+        /// The program asked for.
+        program: ProgramId,
+    },
+    /// The step carries an input the program does not read as a carriable one.
+    #[error("{family}: program {program} cannot carry input {input}")]
+    NotCarriable {
+        /// The family that refused.
+        family: FamilyKey,
+        /// The program.
+        program: ProgramId,
+        /// The input the step carried.
+        input: InputId,
+    },
+    /// The traced graph's carried states are not the ones the program declares.
+    #[error("{family}: program {program}: {source}")]
+    StateMismatch {
+        /// The family whose schema and tracer disagree.
+        family: FamilyKey,
+        /// The program.
+        program: ProgramId,
+        /// How they disagree.
+        source: StateMismatch,
     },
     /// The family cannot trace this step shape.
     #[error("{family} cannot trace shape {shape:?}: {reason:?}")]

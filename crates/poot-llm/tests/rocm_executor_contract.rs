@@ -5,20 +5,18 @@
 //! SC-009 is the required-device-lane gate, not a test here).
 
 #![cfg(feature = "rocm")]
-
-use poot_graph_plan::production_plan::Submission;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Arg, Device, Dispatch, Engine, Executor, ExecutorStats, NoSync, StepInputs};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{BinOp, Builder, Graph, StateRole, TensorType};
 use poot_graph_plan::ImportedKernel;
 use poot_graph_plan::test_support::{gpu_backend, gpu_caps};
 use poot_kernel_ir::Body;
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -72,8 +70,7 @@ fn decode_graph_over(cap: usize) -> Graph {
         .f32_model();
     m.model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -138,10 +135,7 @@ fn decode_staged(
                 poot_graph_plan::multi_device::topology::DeviceId(0),
             ),
         },
-        &poot_graph_plan::CompileOptions::new(
-            poot_graph_plan::production_plan::Submission::Replay,
-            poot_graph_plan::CompileLimits::STANDARD,
-        ),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -367,7 +361,7 @@ fn oracle_decode_step(
         };
         inputs.insert(id, value);
     }
-    let evaluation = eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+    let evaluation = eval(g, &inputs, EvalOptions::default()).unwrap();
     for ((si, _), t) in g.state().zip(evaluation.state) {
         state.insert(g.meta(si).name.clone().unwrap(), t.into_host().unwrap());
     }
@@ -662,7 +656,7 @@ fn copy_round_trips_every_narrow_element_width_with_no_sentinel_corruption() {
             .unwrap_or_else(|e| panic!("{name}: write src: {e}"));
         poot_executor::write_slice(&mut device, &dst_sentinel, 0, &sentinel_pattern)
             .unwrap_or_else(|e| panic!("{name}: write dst_sentinel: {e}"));
-        device.begin(Submission::Replay).unwrap();
+        device.begin().unwrap();
         device
             .copy(&src, &dst)
             .unwrap_or_else(|e| panic!("{name}: copy: {e}"));
@@ -751,7 +745,7 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
         .unwrap_or(0);
     assert!(live_before > 0, "the probe output buffer must be charged");
 
-    device.begin(Submission::Replay).unwrap();
+    device.begin().unwrap();
     device
         .dispatch(Dispatch {
             kernel: &kernel,
@@ -1063,7 +1057,7 @@ fn sliding_window_mask_from_pos_rocm_matches_cpu() {
     const_inputs.insert(ki, HostTensor::f32(vec![1, hkv, l, d], kd.clone()).into());
     const_inputs.insert(vi, HostTensor::f32(vec![1, hkv, l, d], vd.clone()).into());
     const_inputs.insert(posi, HostTensor::i32(vec![1, l], posd.clone()).into());
-    let cpu = eval(&g, &const_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &const_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1121,7 +1115,7 @@ fn sliding_window_mask_from_pos_rocm_matches_cpu() {
     let cpu_shifted = {
         let mut shifted_inputs = const_inputs.clone();
         shifted_inputs.insert(posi, HostTensor::i32(vec![1, l], shifted).into());
-        eval(&g, &shifted_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &shifted_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

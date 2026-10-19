@@ -7,7 +7,7 @@
 //! emit the flash ops, so the "flash trace equals decomposed trace" checks that were here are that
 //! file's pass-soundness rows (the pass forms the op from the traced chain).
 
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::LogitRows;
 use poot_test_util::assert_close_rel;
 
 use super::qwen2_pipeline::{eval_step, tiny_qwen2, trace_step};
@@ -21,8 +21,8 @@ fn masked_decode_does_not_depend_on_capacity() {
     let tokens: Vec<i32> = vec![5, 9, 2, 14, 7, 1];
     let (tight, wide) = (tokens.len(), 2 * tokens.len());
 
-    let g_tight = trace_step(&*model, Phase::Decode, (1, 1, tight), None, LogitRows::Last);
-    let g_wide = trace_step(&*model, Phase::Decode, (1, 1, wide), None, LogitRows::Last);
+    let g_tight = trace_step(&*model, (1, 1, tight), None, LogitRows::Last);
+    let g_wide = trace_step(&*model, (1, 1, wide), None, LogitRows::Last);
     let (mut tight_caches, mut wide_caches) = (None, None);
     for (pos, &token) in tokens.iter().enumerate() {
         let a = eval_step(

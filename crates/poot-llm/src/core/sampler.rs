@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use poot_graph_ir::op::{SampleRule, gumbel_noise, random_uniform_at};
 use poot_text::Constraint;
 
 /// The index of the largest logit (the first on a tie). A [`SamplerFault`] when `v` holds a NaN or `+inf`, or no
@@ -40,16 +41,6 @@ pub enum SamplerFault {
     NoFiniteLogit {
         /// The row's length (0 for an empty row).
         len: usize,
-    },
-    /// The device-matching host draw's own graph evaluation failed (card 551b):
-    /// `pick_from`'s `suffix::eval_sample_token` call is built and bound by `pick_from`
-    /// itself, so a failure here (e.g. an allocation/budget limit) is not data-dependent the way
-    /// the other two faults are, but it is still a real `poot_eval::eval` error the production host
-    /// pick must surface through this `Result` rather than panic on.
-    #[error("sampling evaluation failed: {message}")]
-    Eval {
-        /// The evaluator's error, rendered.
-        message: String,
     },
 }
 
@@ -152,10 +143,8 @@ impl Sampler {
 
     /// Whether this row can sample on the GPU via an on-device top-p-Gumbel-max kernel instead of the host
     /// `pick()` path (card 148): min-p folds into a logit floor, top-k into a bisected count threshold, and
-    /// top-p into a bisected integer-mass threshold (each token's mass is the fixed-point integer
-    /// `poot_eval::top_p_token_mass`, summed exactly, so the sum is order-independent and GPU==CPU
-    /// bit-exact). Same "no
-    /// penalties/bias/logprobs/guided" bar as [`Self::is_greedy`].
+    /// top-p into a bisected integer-mass threshold (the nucleus the device selects is held to the exact
+    /// host nucleus by the ADR-0114 mass tolerance). Same "no penalties/bias/logprobs/guided" bar as [`Self::is_greedy`].
     pub fn is_simple_temperature(&self) -> bool {
         self.temperature > 0.0
             && !self.adjusts_logits()
@@ -280,12 +269,10 @@ impl Sampler {
         ((s >> 40) as f32) / ((1u64 << 24) as f32)
     }
 
-    /// The next decode step's device-style `RandomUniform` seed (card 551b, R-551b-2): both the host
-    /// pick ([`Self::pick_from`]'s Gumbel-max draw, via `suffix::eval_sample_token`) and a
-    /// device suffix row ([`crate::driver::suffix::SuffixRows::push`]) consume one of these
-    /// per decode step, so a seeded `Sampler` used on either path draws the identical per-step
-    /// noise. A distinct draw from [`Self::uniform`]'s own stream position (callers never mix the
-    /// two per step).
+    /// The next decode step's `RandomUniform` seed (card 551b, R-551b-2): both the host pick
+    /// ([`Self::pick_from`]) and a device suffix row ([`crate::driver::suffix::SuffixRows::push`]) consume
+    /// one per decode step, so a seeded `Sampler` on either path draws the identical per-step noise. A
+    /// distinct draw from [`Self::uniform`]'s own stream position (callers never mix the two per step).
     pub(crate) fn next_device_seed(&mut self) -> u32 {
         (self.next_u64() >> 32) as u32
     }
@@ -402,115 +389,87 @@ impl Sampler {
         });
     }
 
-    /// The min-p / top-k / top-p truncated, unnormalized candidate list (`(token id, exp((logit-max)/T))`)
-    /// for a temperature > 0 draw. Shared by [`Self::pick_from`] (one inverse-CDF draw) and [`Self::probs`]
-    /// (the full distribution for speculative sampling's accept/reject math), so the two cannot drift on
-    /// what "the sampler's distribution" means. Greedy (temperature <= 0) is the caller's job (a one-hot
-    /// distribution).
-    fn truncated_candidates(&self, logits: &[f32]) -> Vec<(usize, f32)> {
-        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut cand: Vec<(usize, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| (i, ((l - max) / self.temperature).exp()))
+    /// The min-p / top-k / top-p truncated, unnormalized candidate list (`(token id, exp((logit-max)/T))`,
+    /// the top token's weight exactly 1) for a temperature > 0 draw, in `(logit descending, index
+    /// ascending)` order: the contract's tie rule ([`SampleRule`]). The exact reference
+    /// distribution (ADR-0114 amendment): weights and the nucleus mass are summed in f64, the top-p
+    /// nucleus is the smallest prefix whose mass reaches `top_p` of the survivors' total, and no
+    /// quantization or search threshold stands between the logits and the set. Which truncations apply is
+    /// [`SampleRule::for_truncation`], the classification the device suffix reads. Shared by
+    /// [`Self::pick_from`] (one inverse-CDF draw) and [`Self::probs`] (the full distribution for
+    /// speculative sampling's accept/reject math), so the two cannot drift. Greedy (temperature <= 0) is
+    /// the caller's job (a one-hot distribution); `-inf` logits (masked tokens) carry no weight.
+    fn truncated_candidates(&self, logits: &[f32]) -> Vec<(usize, f64)> {
+        let rule = SampleRule::for_truncation(self.top_k, self.top_p);
+        let max = f64::from(logits.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        let temperature = f64::from(self.temperature);
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        // `check_pickable` admits no NaN, so the comparison is total; the sort is stable, so ties keep
+        // index order.
+        order.sort_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cand: Vec<(usize, f64)> = order
+            .into_iter()
+            .map(|i| (i, ((f64::from(logits[i]) - max) / temperature).exp()))
+            .filter(|&(_, w)| w > 0.0)
             .collect();
-        // descending by probability for min-p / top-k / top-p.
-        cand.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        // min-p: drop the tail below min_p * (top prob). cand is unnormalized exp, sorted descending, so
-        // the ratio to cand[0] is the probability ratio - no normalization needed.
-        if let Some(&(_, top)) = cand.first().filter(|_| self.min_p > 0.0) {
-            let floor = self.min_p * top;
-            let cut = cand.iter().position(|c| c.1 < floor).unwrap_or(cand.len());
-            cand.truncate(cut.max(1));
+        // min-p: weights are relative to the top token's (1), so the floor is `min_p` itself.
+        if self.min_p > 0.0 {
+            let floor = f64::from(self.min_p);
+            cand.truncate(cand.partition_point(|c| c.1 >= floor).max(1));
         }
-        if self.top_k > 0 && self.top_k < cand.len() {
+        // `GumbelTopKTopP` also declares the top-k operand when `top_k` is 0 (disabled), so the rule alone
+        // does not say a cut applies.
+        if rule.has_top_k() && self.top_k > 0 {
             cand.truncate(self.top_k);
         }
-        if self.top_p <= 0.0 {
-            cand.truncate(1);
-        } else if self.top_p < 1.0 {
-            // The oracle's nucleus (`poot-eval`'s `sample_one_row`), so `probs()` (built from this list)
-            // describes the set `pick_from`'s `eval_sample_token` draws from (R-551b-2's "one sampling
-            // semantics" extended to top-p). Both sum `top_p_token_mass` integers (exact, `2^-24` of the
-            // top token per unit) and cut at `top_p_threshold`; `cand` is the min-p/top-k floor's
-            // surviving set sorted descending, so the prefix sum is the oracle's `mass_at(thresh)`
-            // restricted to it.
-            let inv_temp = 1.0 / self.temperature;
-            let mass = |c: &(usize, f32)| {
-                u64::from(poot_eval::top_p_token_mass(logits[c.0], max, inv_temp))
-            };
-            let tp_thresh = poot_eval::top_p_threshold(cand.iter().map(mass).sum(), self.top_p);
-            let mut cum = 0u64;
-            let mut cut = cand.len();
-            for (i, c) in cand.iter().enumerate() {
-                cum += mass(c);
-                if cum >= tp_thresh {
-                    cut = i + 1;
-                    break;
-                }
+        if rule.has_top_p() {
+            if self.top_p <= 0.0 {
+                cand.truncate(1);
+            } else {
+                let target = f64::from(self.top_p) * cand.iter().map(|c| c.1).sum::<f64>();
+                let mut cum = 0.0f64;
+                let cut = cand
+                    .iter()
+                    .position(|c| {
+                        cum += c.1;
+                        cum >= target
+                    })
+                    .map_or(cand.len(), |i| i + 1);
+                cand.truncate(cut);
             }
-            // The oracle cuts by VALUE (`v >= t_p`), so two candidates at the identical logit (and
-            // therefore the identical unnormalized `exp`) are always kept or dropped together; a
-            // sorted-list rank cut can split such a tie if it lands between them (`sort_unstable_by`
-            // makes no promise about their relative order). Extend the cut past any trailing ties
-            // with the just-included candidate so this list never disagrees with the oracle.
-            while cut < cand.len() && cand[cut].1 == cand[cut - 1].1 {
-                cut += 1;
-            }
-            cand.truncate(cut.max(1));
         }
         cand
     }
 
-    /// The temperature + truncation draw over (already-adjusted) logits. R-551b-2: this is no
-    /// longer its own inverse-CDF draw over the xorshift stream - it evaluates the identical
-    /// `SampleToken`/`RandomUniform` semantics a device suffix row would (`suffix::
-    /// eval_sample_token`, through `poot-eval`'s own walk), so the host pick and a device suffix
-    /// agree bit-for-bit given the same seed and the same (already-adjusted) logits.
+    /// The temperature + truncation draw over (already-adjusted) logits: the Gumbel-max trick over
+    /// [`Self::truncated_candidates`], the exact distribution, as a plain function of the logits, the knobs
+    /// and this step's [`Self::next_device_seed`] (no graph, no evaluator: ADR-0102 decision 5). The
+    /// noise is `RandomUniform`'s own value at the token's index and the score is the rule's
+    /// `logits[i] * inv_temp + noise[i]` (two roundings), ties to the lowest index (`poot-graph-ir`'s
+    /// [`SampleRule`] semantics), so given the same kept set a device suffix row picks the same token
+    /// from the same seed. The kept sets differ only at a top-p boundary the device's integer-mass
+    /// bisection places within the ADR-0114 tolerance.
     fn pick_from(&mut self, logits: &[f32]) -> Result<usize, SamplerFault> {
         if self.temperature <= 0.0 {
             return argmax(logits);
         }
         check_pickable(logits)?;
-        // `OpKind::SampleToken`'s non-finite column flags ANY non-finite value, including a masked
-        // `-inf` (card 551a SC-004 pins this for the device suffix, whose production callers never
-        // see a masked row - `rule_of` routes those to the host). The host path's contract is
-        // different and pre-existing (`check_pickable` already passed, so `-inf` here is a
-        // legitimately masked token, never a fault): write the oracle's `MASKED_LOGIT` stand-in, which
-        // carries no mass and which the oracle's top-k / top-p floor ignores. `check_pickable`
-        // guarantees at least one strictly finite logit, so it is never the row's max.
-        let patched: Option<Vec<f32>> = logits.contains(&f32::NEG_INFINITY).then(|| {
-            logits
-                .iter()
-                .map(|&v| {
-                    if v == f32::NEG_INFINITY {
-                        poot_eval::MASKED_LOGIT
-                    } else {
-                        v
-                    }
-                })
-                .collect()
-        });
-        let logits = patched.as_deref().unwrap_or(logits);
-        let rule = crate::driver::suffix::temperature_rule(self.top_k, self.top_p);
+        let cand = self.truncated_candidates(logits);
         let seed = self.next_device_seed();
-        let (token, non_finite) = crate::driver::suffix::eval_sample_token(
-            rule,
-            logits,
-            seed,
-            self.temperature,
-            self.min_p,
-            self.top_k,
-            self.top_p,
-        )
-        .map_err(|e| SamplerFault::Eval {
-            message: e.to_string(),
-        })?;
-        debug_assert!(
-            non_finite < 0,
-            "check_pickable already rejected a non-finite logit in this row, and -inf was patched out above"
-        );
-        Ok(token as usize)
+        let inv_temp = 1.0 / self.temperature;
+        let mut best: Option<(usize, f32)> = None;
+        for &(i, _) in &cand {
+            let noise = gumbel_noise(random_uniform_at(seed, i as u32));
+            let score = logits[i] * inv_temp + noise;
+            if best.is_none_or(|(b, v)| score > v || (score == v && i < b)) {
+                best = Some((i, score));
+            }
+        }
+        Ok(best.expect("the top token always survives").0)
     }
 
     /// The full-vocab probability distribution [`Self::pick_from`] draws from, given already-adjusted logits
@@ -528,9 +487,9 @@ impl Sampler {
         }
         check_pickable(logits)?;
         let cand = self.truncated_candidates(logits);
-        let total: f32 = cand.iter().map(|c| c.1).sum();
-        for &(i, p) in &cand {
-            v[i] = p / total;
+        let total: f64 = cand.iter().map(|c| c.1).sum();
+        for &(i, w) in &cand {
+            v[i] = (w / total) as f32;
         }
         Ok(v)
     }
@@ -570,6 +529,10 @@ impl Sampler {
 
 #[cfg(test)]
 mod sampler_tests {
+    use std::collections::HashMap;
+
+    use poot_graph_ir::op::SampleRule;
+
     use super::argmax;
     use super::{Constraint, Sampler, SamplerFault};
 
@@ -769,33 +732,30 @@ mod sampler_tests {
         }
     }
 
-    /// R486-006 (RU-5): the top-p cut is inclusive (`cum >= top_p`). The candidate weights are exactly
-    /// `1.0, 0.75, 0.25` (the max logit is `exp(0) == 1`, the others are `exp(ln(0.75))`/`exp(ln(0.25))`,
-    /// which round-trip through f32), so the running (quantized, ADR-0114) mass after the top
-    /// candidate is exactly half of the total. `top_p = 0.5` must therefore keep the top candidate
-    /// and stop; the `>=` -> `>` mutation takes one more and the literal candidate set changes.
+    /// R486-006 (RU-5): the top-p cut is inclusive (`cum >= top_p * total`). Two tokens at the same logit
+    /// have weight exactly 1 each, so the running mass after the first is exactly half of the total in
+    /// f64: `top_p = 0.5` keeps the first (lower index) and stops. The `>=` -> `>` mutation takes the
+    /// second too and the literal candidate set changes.
     #[test]
     fn top_p_boundary_is_inclusive() {
-        let logits = [0.0f32, 0.75f32.ln(), 0.25f32.ln()];
         let s = Sampler::new(1.0, 0, 0.5, 11);
         assert_eq!(
-            s.truncated_candidates(&logits),
+            s.truncated_candidates(&[0.0, 0.0]),
             vec![(0, 1.0)],
-            "mass exactly equal to top_p ends the nucleus (cum >= top_p)"
+            "mass exactly equal to top_p ends the nucleus (cum >= top_p), ties by lower index first"
         );
     }
 
     /// R486-006 (RU-6): the min-p cut drops only weights strictly below `min_p * top`; a token equal to
-    /// the floor survives. With `min_p = 0.75` and unnormalized top `1.0`, the floor is exactly `0.75`
-    /// and the token at `exp(ln(0.75))` sits on it. The `<` -> `<=` mutation drops it and the literal
-    /// candidate set changes.
+    /// the floor survives. With `min_p = 1.0` the floor is exactly the top weight `1.0`, and the second
+    /// token (the same logit) sits on it. The `>=` -> `>` mutation drops it and the literal candidate set
+    /// changes.
     #[test]
     fn min_p_boundary_keeps_tokens_equal_to_the_floor() {
-        let logits = [0.0f32, 0.75f32.ln(), 0.25f32.ln()];
-        let s = Sampler::new(1.0, 0, 1.0, 11).with_min_p(0.75);
+        let s = Sampler::new(1.0, 0, 1.0, 11).with_min_p(1.0);
         assert_eq!(
-            s.truncated_candidates(&logits),
-            vec![(0, 1.0), (1, 0.75)],
+            s.truncated_candidates(&[0.0, 0.0, -1.0]),
+            vec![(0, 1.0), (1, 1.0)],
             "a token equal to the min-p floor survives (weight < floor drops)"
         );
     }
@@ -1249,17 +1209,11 @@ mod sampler_tests {
                     );
                     minp_c += 1;
                 }
-                // top-p collapse (card 551b): the exact real-number nucleus for a tiny
-                // `top_p` can differ from the production quantized bisection's by one low-weight
-                // candidate (ADR-0114: top-p's membership boundary is tier 2), so this asserts
-                // against `truncated_candidates`'s own quantized nucleus (now the same semantics
-                // `pick_from` draws through) instead of real-valued `p_top` math - a genuine
-                // cross-check between this Rust mirror and `pick_from`'s independent
-                // `eval_sample_token` call, not a tautology.
+                // top-p collapse: a singleton exact nucleus must be the argmax pick.
                 if build().truncated_candidates(&logits).len() == 1 {
                     assert_eq!(
                         pick, argmax,
-                        "a singleton quantized top-p/min-p/top-k nucleus must be the pick"
+                        "a singleton top-p/min-p/top-k nucleus must be the pick"
                     );
                     topp_collapse_c += 1;
                 }
@@ -1323,15 +1277,10 @@ mod sampler_tests {
 
     #[test]
     fn probs_matches_pick_from_empirically() {
-        // `probs` must be the SAME distribution `pick_from`'s Gumbel-max draw samples from,
-        // including a real top-p nucleus with NO other truncation active (SC-002, card 677):
-        // `truncated_candidates`'s top-p cut mirrors the device's quantized tier-2 bisection
-        // (ADR-0114), the same semantics `pick_from` draws through via `eval_sample_token`, so
-        // `probs()` and `pick_from()` agree on which candidates even have nonzero mass - including
-        // when top-p alone does the truncating (min_p=0, top_k=0 here), which needs the oracle's
-        // pre-top-p floor to start from a finite bound rather than `-inf` (card 677, found by card
-        // 551b's review). Check by drawing many samples with `pick` and comparing the empirical
-        // histogram to `probs`'s output via chi-squared (deterministic seed, no flakiness).
+        // `probs` must be the SAME distribution `pick_from` draws from, including a real top-p
+        // nucleus with NO other truncation active (SC-002, card 677). Check by drawing many samples
+        // with `pick` and comparing the empirical histogram to `probs`'s output via chi-squared
+        // (deterministic seed, no flakiness).
         let logits = [2.0f32, 1.0, 0.5, 0.5, -1.0, 3.0, 0.2, 1.5];
         let s_probs = Sampler::new(0.8, 0, 0.95, 1);
         let expected = s_probs.probs(&logits).unwrap();
@@ -1489,6 +1438,180 @@ mod sampler_tests {
                 "{name}: host nucleus size vs exact f64"
             );
             assert_eq!(kept, reference, "{name}: host nucleus members");
+        }
+    }
+
+    /// SC-002 (draws): with penalties and a logit bias active (the rows the device cannot sample), the
+    /// host draw follows the exact distribution. The expected distribution is computed here, apart from
+    /// the sampler: the adjustments by hand, then the exact f64 softmax and nucleus. 100k draws, chi-square
+    /// against the `p = 0.001` critical value of the nucleus's degrees of freedom.
+    ///
+    /// Mutation: round the candidate weights to `2^-4` in `truncated_candidates`; the statistic exceeds
+    /// the critical value.
+    #[test]
+    fn host_draws_with_penalties_and_bias_follow_the_exact_distribution() {
+        // chi-square critical values at p = 0.001, indexed by degrees of freedom.
+        const CRITICAL: [f64; 9] = [0.0, 10.83, 13.82, 16.27, 18.47, 20.52, 22.46, 24.32, 26.12];
+        let logits = [2.0f32, 1.6, 1.5, 1.2, 0.9, 0.4, 0.0, -0.5, -1.0];
+        let (temperature, top_p) = (0.9f32, 0.92f32);
+        let mut s = Sampler::new(temperature, 0, top_p, 20_261_018)
+            .with_penalties(1.3, 0.2, 0.1)
+            .with_logit_bias(HashMap::from([(4u32, 0.8f32), (8, -3.0)]));
+        for (token, times) in [(0u32, 3), (2, 1), (5, 2)] {
+            for _ in 0..times {
+                s.observe(token);
+            }
+        }
+        // The adjustments by hand: bias first, then each seen token's repetition / presence / frequency.
+        let mut adjusted = logits;
+        adjusted[4] += 0.8;
+        adjusted[8] -= 3.0;
+        for (token, count) in [(0usize, 3.0f32), (2, 1.0), (5, 2.0)] {
+            let l = adjusted[token];
+            adjusted[token] = (if l > 0.0 { l / 1.3 } else { l * 1.3 }) - 0.2 - 0.1 * count;
+        }
+        let tagged: Vec<(u32, f32)> = (0..).zip(adjusted.iter().copied()).collect();
+        let nucleus = exact_nucleus(&tagged, temperature, top_p);
+        let max = adjusted.iter().copied().fold(f32::MIN, f32::max);
+        let weight = |i: u32| {
+            ((f64::from(adjusted[i as usize]) - f64::from(max)) / f64::from(temperature)).exp()
+        };
+        let total: f64 = nucleus.iter().map(|&i| weight(i)).sum();
+        assert!(
+            (3..CRITICAL.len() + 1).contains(&nucleus.len()),
+            "the fixture needs a multi-token nucleus, got {}",
+            nucleus.len()
+        );
+
+        let n = 100_000u64;
+        let mut counts = vec![0u64; logits.len()];
+        for _ in 0..n {
+            counts[s.pick(&logits).unwrap()] += 1;
+        }
+        for (i, &c) in counts.iter().enumerate() {
+            assert!(
+                c == 0 || nucleus.contains(&(i as u32)),
+                "token {i} drawn outside the exact nucleus {nucleus:?}"
+            );
+        }
+        let chi2: f64 = nucleus
+            .iter()
+            .map(|&i| {
+                let e = weight(i) / total * n as f64;
+                (counts[i as usize] as f64 - e).powi(2) / e
+            })
+            .sum();
+        let critical = CRITICAL[nucleus.len() - 1];
+        assert!(
+            chi2 < critical,
+            "chi-squared {chi2:.2} over the {}-token nucleus exceeds the p=0.001 value {critical}: counts {counts:?}",
+            nucleus.len()
+        );
+    }
+
+    /// The support of the device schedule's draw: `SampleToken(GumbelTopKTopP)` evaluated by the oracle (the
+    /// bit-exact reference of the device kernels, ADR-0114 tier 1) over `rows` identical copies of `logits`
+    /// with distinct seeds, as a test-local graph. Returns the tokens drawn, ascending.
+    fn device_support(logits: &[f32], temperature: f32, top_p: f32, rows: usize) -> Vec<usize> {
+        use poot_eval::{EvalOptions, Value};
+        use poot_graph_ir::ops::sampling::sample_head;
+        use poot_graph_ir::{Builder, Slot, TensorType};
+        use poot_tensor::{DType, HostTensor};
+
+        let vocab = logits.len();
+        let b = Builder::for_tests();
+        let logits_in = b
+            .slot(
+                Slot::Activation,
+                TensorType::new(vec![rows, vocab], DType::F32),
+            )
+            .unwrap();
+        let head = sample_head(&b, logits_in, SampleRule::GumbelTopKTopP).unwrap();
+        let g = b.finish(head.out).unwrap();
+        let row_params = [1.0 / temperature, f32::NEG_INFINITY, 1.0, top_p];
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            logits_in.id(),
+            Value::from(HostTensor::f32(
+                vec![rows, vocab],
+                logits.iter().copied().cycle().take(rows * vocab).collect(),
+            )),
+        );
+        inputs.insert(
+            head.seed.unwrap().id(),
+            Value::from(HostTensor::i32(vec![rows], (0..rows as i32).collect())),
+        );
+        inputs.insert(
+            head.params.unwrap().id(),
+            Value::from(HostTensor::f32(
+                vec![rows, 4],
+                row_params.iter().copied().cycle().take(rows * 4).collect(),
+            )),
+        );
+        inputs.insert(
+            head.top_k.unwrap().id(),
+            Value::from(HostTensor::i32(vec![rows], vec![0; rows])),
+        );
+        let out = poot_eval::eval(&g, &inputs, EvalOptions::default())
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap();
+        let pairs = out.as_i32().unwrap();
+        let mut tokens: Vec<usize> = pairs.chunks(2).map(|p| p[0] as usize).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        tokens
+    }
+
+    /// SC-002 (mass): the nucleus the device schedule selects is held to the exact reference by the
+    /// ADR-0114 tolerance `epsilon = vocab * 2^-25` of probability mass (every token's integer mass rounds
+    /// by at most half a unit of `2^-24` of the top token). The device support is a prefix of the exact
+    /// order; its mass reaches `top_p - epsilon`, and dropping its last token leaves less than `top_p +
+    /// epsilon`. The host nucleus (the support of `probs`) meets the same bounds exactly.
+    ///
+    /// The device half evaluates the oracle (`poot_eval`, the bit-exact reference of the device kernels), so
+    /// it goes red for a change to the oracle's top-p, never for one to the host sampler.
+    ///
+    /// Mutations: in `truncated_candidates` cut the nucleus one token early (`i` instead of `i + 1`); the
+    /// host row's lower bound fails. In poot-eval's `top_p_threshold` halve the product (`top_p * total /
+    /// 2.0`); the device row's lower bound fails.
+    #[test]
+    fn device_nucleus_mass_is_within_the_adr_0114_tolerance_of_the_exact_nucleus() {
+        let weights = [0.3f64, 0.2, 0.15, 0.1, 0.08, 0.06, 0.04, 0.03, 0.025, 0.015];
+        let logits: Vec<f32> = weights.iter().map(|w| w.ln() as f32).collect();
+        let total: f64 = weights.iter().sum();
+        let epsilon = logits.len() as f64 * 2f64.powi(-25);
+        for top_p in [0.3f32, 0.5, 0.8, 0.95] {
+            let mass = |tokens: &[usize]| tokens.iter().map(|&i| weights[i] / total).sum::<f64>();
+            let check = |who: &str, support: Vec<usize>| {
+                let size = support.len();
+                assert_eq!(
+                    support,
+                    (0..size).collect::<Vec<_>>(),
+                    "{who} top_p={top_p}: the nucleus is a prefix of the descending order"
+                );
+                assert!(
+                    mass(&support) >= f64::from(top_p) - epsilon,
+                    "{who} top_p={top_p}: nucleus mass {} below {top_p} - {epsilon}",
+                    mass(&support)
+                );
+                assert!(
+                    mass(&support[..size - 1]) < f64::from(top_p) + epsilon,
+                    "{who} top_p={top_p}: the nucleus without its last token already holds {}",
+                    mass(&support[..size - 1])
+                );
+            };
+            let probs = Sampler::new(1.0, 0, top_p, 1).probs(&logits).unwrap();
+            check(
+                "host",
+                (0..)
+                    .zip(&probs)
+                    .filter(|(_, p)| **p > 0.0)
+                    .map(|(i, _)| i)
+                    .collect(),
+            );
+            check("device", device_support(&logits, 1.0, top_p, 4096));
         }
     }
 

@@ -47,12 +47,10 @@ use crate::components::linear::WeightError;
 use crate::components::norm::NormParams;
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, StackParams, StackWeights, Step, check_step,
-    standard_layer, standard_stack,
+    decoder_program, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::{ModelSchema, StateSpec};
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, FixtureVariant, RawConfig};
 use poot_text::ChatFormat;
 
@@ -499,6 +497,7 @@ pub(crate) struct Qwen35 {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -532,6 +531,11 @@ fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<Box<dyn Model>, Mode
             })
             .collect::<Result<Vec<_>, WeightError>>()
             .map_err(weight_error)?;
+    let mut step = decoder_program(p.vocab);
+    if p.kinds.contains(&LayerKind::LinearAttention) {
+        step = step.carrying(StateSpec::recurrent("gdn"));
+    }
+    let schema = ModelSchema::builder().step(step).build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -539,7 +543,6 @@ fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<Box<dyn Model>, Mode
         eos: p.eos.clone(),
         bos: p.bos,
         prompt_bos: None,
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
@@ -549,6 +552,7 @@ fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<Box<dyn Model>, Mode
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -557,13 +561,18 @@ impl Model for Qwen35 {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(
             &b,
@@ -866,7 +875,7 @@ mod tests {
         close, close_all, decoded, f32_entry, gguf_tensor, greedy_tokens, q8_0_store,
         read_back_owned, step_shape, values,
     };
-    use crate::model::LogitRows;
+    use crate::model::{LogitRows, StepShape};
     use crate::registry::Registry;
 
     fn model_of(config: &serde_json::Value, store: &WeightStore) -> Box<dyn Model> {
@@ -1276,22 +1285,14 @@ mod tests {
         let model = model_of(config, store);
         let mut reference = HfReference::new(store, root, text);
         let (want, want_state) = reference_steps(&mut reference, &PROMPT, 0);
-        let (got, state) = run_step(&*model, store, Phase::Prefill, CAP, &PROMPT, 0, &[]);
+        let (got, state) = run_step(&*model, store, CAP, &PROMPT, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
         let mut state = state;
         for (i, &token) in DECODE.iter().enumerate() {
             let position = PROMPT.len() + i;
             let (want, want_state) = reference_steps(&mut reference, &[token], position);
-            let (got, next) = run_step(
-                &*model,
-                store,
-                Phase::Decode,
-                CAP,
-                &[token],
-                position as i32,
-                &state,
-            );
+            let (got, next) = run_step(&*model, store, CAP, &[token], position as i32, &state);
             close(&got, &want);
             close_all(&next, &want_state);
             state = next;
@@ -1385,27 +1386,11 @@ mod tests {
             let model = model_of(&fx.config, &fx.store);
             assert_chunked_prefill_equals_decode(&*model, &fx.store);
             let prompt = [3, 44, 41, 8, 25, 9];
-            let (whole, whole_state) =
-                run_step(&*model, &fx.store, Phase::Prefill, CAP, &prompt, 0, &[]);
-            let (mut got, mut state) = run_step(
-                &*model,
-                &fx.store,
-                Phase::Prefill,
-                CAP,
-                &prompt[..3],
-                0,
-                &[],
-            );
+            let (whole, whole_state) = run_step(&*model, &fx.store, CAP, &prompt, 0, &[]);
+            let (mut got, mut state) = run_step(&*model, &fx.store, CAP, &prompt[..3], 0, &[]);
             for (i, &token) in prompt[3..].iter().enumerate() {
-                let (logits, next) = run_step(
-                    &*model,
-                    &fx.store,
-                    Phase::Decode,
-                    CAP,
-                    &[token],
-                    (3 + i) as i32,
-                    &state,
-                );
+                let (logits, next) =
+                    run_step(&*model, &fx.store, CAP, &[token], (3 + i) as i32, &state);
                 got.extend(logits);
                 state = next;
             }
@@ -1422,8 +1407,7 @@ mod tests {
         let model = model_of(&fx.config, &fx.store);
         let g = model
             .trace(
-                Phase::Decode,
-                step_shape(1, CAP, LogitRows::Last),
+                &StepSpec::step(step_shape(1, CAP, LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -1475,28 +1459,12 @@ mod tests {
             assert_eq!(packed > 0, label == "q8_0", "{label}: {packed} packed");
             let reference_store = decoded(&store);
             let reference = model_of(&fx.config, &reference_store);
-            let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-            let (want, want_state) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Prefill,
-                CAP,
-                &prompt,
-                0,
-                &[],
-            );
+            let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+            let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
             close(&got, &want);
             close_all(&state, &want_state);
-            let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-            let (want, _) = run_step(
-                &*reference,
-                &reference_store,
-                Phase::Decode,
-                CAP,
-                &[5],
-                4,
-                &want_state,
-            );
+            let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+            let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
             close(&got, &want);
         }
     }
@@ -1665,23 +1633,17 @@ mod tests {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
         let n = |v| NonZeroUsize::new(v).unwrap();
-        let shape = |tokens, capacity| StepShape {
-            tokens: n(tokens),
-            capacity: n(capacity),
-            ..step_shape(1, 1, LogitRows::Last)
-        };
+        let shape = |tokens, capacity| StepShape::new(n(1), n(tokens), n(capacity));
         assert!(matches!(
             model.trace(
-                Phase::Decode,
-                shape(2, 8),
+                &StepSpec::step(shape(9, 8)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
             model.trace(
-                Phase::Prefill,
-                shape(1, 65),
+                &StepSpec::step(shape(1, 65)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })
@@ -1859,8 +1821,8 @@ mod tests {
         let fx = fixture();
         let hf = model_of(&fx.config, &fx.store);
         let prompt = [3, 17, 40, 8, 25, 9];
-        let (want, want_state) = run_step(&*hf, &fx.store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want_decode, _) = run_step(&*hf, &fx.store, Phase::Decode, CAP, &[5], 6, &want_state);
+        let (want, want_state) = run_step(&*hf, &fx.store, CAP, &prompt, 0, &[]);
+        let (want_decode, _) = run_step(&*hf, &fx.store, CAP, &[5], 6, &want_state);
         for nextn in [false, true] {
             let (kvs, tensors) = gguf_of(&fx, nextn);
             let (index, store) = read_back_owned(&kvs, &tensors);
@@ -1868,13 +1830,13 @@ mod tests {
             let raw = RawConfig::Gguf(&index);
             assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
             let gguf = registry.build(&raw, &store).unwrap();
-            let (got, state) = run_step(&*gguf, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
+            let (got, state) = run_step(&*gguf, &store, CAP, &prompt, 0, &[]);
             close(&got, &want);
             // The carried tensors differ in value-head order, so only the logits and the attention
             // cache (the last two state values) are comparable.
             let kv = want_state.len() - 2;
             close_all(&state[kv..], &want_state[kv..]);
-            let (got, _) = run_step(&*gguf, &store, Phase::Decode, CAP, &[5], 6, &state);
+            let (got, _) = run_step(&*gguf, &store, CAP, &[5], 6, &state);
             close(&got, &want_decode);
         }
     }
@@ -2054,8 +2016,7 @@ mod tests {
         let model = assemble(p, &store).unwrap();
         model
             .trace(
-                Phase::Prefill,
-                step_shape(2, 8, LogitRows::Last),
+                &StepSpec::step(step_shape(2, 8, LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap();
@@ -2131,11 +2092,7 @@ mod tests {
         );
         assert_eq!(got.len(), want.len());
         let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(g, w)| (g - w).abs())
-            .fold(0.0f32, f32::max);
+        let worst = poot_test_util::max_abs_error(&got, &want);
         assert!(
             worst <= BOUND * scale,
             "worst deviation {worst} against a largest activation of {scale}"

@@ -615,7 +615,7 @@ impl PreparedAppendResult {
 
 /// The `MatMulDequant` family is deleted (card 545b): `Builder` has no `matmul_dequant` or
 /// `indexed_matmul_dequant` method, and `poot_graph_ir` exports no `QuantScheme`. `PackedDequant` /
-/// `PackedContraction` (built through [`crate::ops::packed_linear`] and friends) are the only quantized
+/// `PackedContraction` (built through `packed_graphs::packed_linear` and friends) are the only quantized
 /// primitives left.
 ///
 /// ```compile_fail,E0599

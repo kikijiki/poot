@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use poot_executor::{Device, Dispatch, Engine};
 use poot_graph_ir::{BinOp, Graph, StateRole, TensorType};
-use poot_graph_plan::{CompileLimits, CompileOptions, Target, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions, Target};
 use poot_models::components::standard::{HIDDEN_CARRY_STATE, Step, check_step};
+use poot_models::io::{ModelSchema, ProgramId, ProgramSpec, StateSpec};
 use poot_models::model::{
-    FamilyKey, HiddenCarry, LogitRows, Model, ModelConfig, ModelError, ModelOutput, Phase,
-    ShapeReason, StepShape, TraceError,
+    FamilyKey, HiddenCarry, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
+    StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
@@ -24,11 +25,12 @@ use poot_target::{Backend, DeviceCaps};
 use poot_tensor::DType;
 use poot_text::ChatFormat;
 
+use super::caps::PrepareRefused;
 use super::error::{DriverError, Unsupported};
 use super::tests::tiny_text;
 use super::{
     DraftPolicy, Driver, DriverOptions, Head, Layout, ModelHandle, ModelRole, PreparedSetLimits,
-    ServingShapes, StateResidency, Warm, snapshot,
+    Program, Serving, ServingShapes, StateResidency, Warm, snapshot,
 };
 
 const VOCAB: usize = 12;
@@ -79,6 +81,7 @@ impl Kind {
 struct Carrier {
     config: ModelConfig,
     weights: WeightMap,
+    schema: ModelSchema,
     kind: Kind,
 }
 
@@ -87,17 +90,17 @@ impl Model for Carrier {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(
-        &self,
-        phase: Phase,
-        shape: StepShape,
-        b: poot_graph_ir::Builder,
-    ) -> Result<Graph, TraceError> {
-        check_step(CARRIER, phase, shape, CAPACITY)?;
+    fn trace_into(&self, spec: &StepSpec, b: poot_graph_ir::Builder) -> Result<Graph, TraceError> {
+        let shape = spec.shape;
+        check_step(CARRIER, shape, CAPACITY)?;
         let step = Step::new(&b, shape)?;
         let (n, rows) = (shape.tokens.get(), shape.rows.get());
         let token = b.cast(
@@ -148,7 +151,17 @@ fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>,
     let RawConfig::HfJson { config, .. } = raw else {
         panic!("the fixture is an HF checkpoint")
     };
+    let kind = Kind::parse(config["carrier"].as_str().expect("a carrier kind"));
+    // The graph carries the hand-off (a KV-only family has no cache of its own) and, for the
+    // recurrent kind, one recurrent state: the schema declares exactly that, as `trace` checks.
+    let mut step = ProgramSpec::new(ProgramId::STEP, ModelOutput::Logits { vocab: VOCAB })
+        .carrying(StateSpec::hand_off());
+    if kind == Kind::Recurrent {
+        step = step.carrying(StateSpec::recurrent("toy.state"));
+    }
+    let schema = ModelSchema::builder().step(step).build_for(CARRIER)?;
     Ok(Box::new(Carrier {
+        schema,
         config: ModelConfig {
             family: CARRIER,
             vocab: VOCAB,
@@ -156,12 +169,11 @@ fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>,
             eos: BTreeSet::from([VOCAB as u32 - 1]),
             bos: None,
             prompt_bos: None,
-            output: ModelOutput::Logits { vocab: VOCAB },
             prefill_granule: nz(1),
             chat: ChatFormat::ChatML,
         },
         weights: WeightMap::default(),
-        kind: Kind::parse(config["carrier"].as_str().expect("a carrier kind")),
+        kind,
     }))
 }
 
@@ -237,7 +249,7 @@ impl Device for FakeDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), FakeError> {
@@ -279,7 +291,7 @@ impl Device for FakeDevice {
 /// A driver over the carrier `kind` speculating `k` tokens a round, its carry sized for the round's
 /// window (`k + 1`), as the policy that consumes the carry sizes it.
 fn driver_of(kind: Kind, k: usize, carry: bool) -> Driver {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let draft = DraftPolicy::PromptLookup {
         ngram: nz(1),
         k: nz(k),
@@ -305,22 +317,24 @@ fn driver_of(kind: Kind, k: usize, carry: bool) -> Driver {
     .unwrap()
 }
 
-fn prepare(driver: &mut Driver, windows: &[NonZeroUsize]) -> Result<(), DriverError> {
-    driver
-        .prepare(&ServingShapes {
-            layout: Layout::Contiguous,
-            rows: &[NonZeroUsize::MIN],
-            heads: &[Head::GREEDY],
-            warm: Warm::Admitted,
-            windows,
-            adapters: &[],
-        })
-        .map(|_| ())
+fn prepare(
+    driver: Driver,
+    windows: &[NonZeroUsize],
+) -> Result<Driver<Serving>, Box<PrepareRefused>> {
+    driver.prepare(&ServingShapes {
+        layout: Layout::Contiguous,
+        rows: &[NonZeroUsize::MIN],
+        heads: &[Head::GREEDY],
+        warm: Warm::Admitted,
+        windows,
+        adapters: &[],
+    })
 }
 
 /// The carry aval (`[rows, positions, width]`) each prepared target program declares, by key.
-fn carry_avals(driver: &Driver) -> Vec<(super::EntryKey, Option<Vec<usize>>)> {
+fn carry_avals(driver: &Driver<Serving>) -> Vec<(super::EntryKey, Option<Vec<usize>>)> {
     driver
+        .ledger
         .entries
         .keys()
         .filter(|key| key.role == ModelRole::Target)
@@ -329,8 +343,7 @@ fn carry_avals(driver: &Driver) -> Vec<(super::EntryKey, Option<Vec<usize>>)> {
                 .handle
                 .model()
                 .trace(
-                    key.phase,
-                    key.shape,
+                    &StepSpec::new(key.program.id(), key.shape),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .expect("a prepared key traces");
@@ -355,15 +368,15 @@ fn carry_avals(driver: &Driver) -> Vec<(super::EntryKey, Option<Vec<usize>>)> {
 #[test]
 fn a_kv_only_family_with_the_carry_stays_kv_only_and_every_target_program_declares_one_aval() {
     for (k, positions) in [(2, CHUNK), (5, 6)] {
-        let mut driver = driver_of(Kind::Kv, k, true);
-        prepare(&mut driver, &[]).unwrap_or_else(|e| panic!("k = {k}: {e}"));
+        let driver =
+            prepare(driver_of(Kind::Kv, k, true), &[]).unwrap_or_else(|e| panic!("k = {k}: {e}"));
         assert_eq!(
             driver.caps().unwrap().state,
             StateResidency::KvOnly,
             "the carry is never rolled back, so it is not recurrent state"
         );
         assert_eq!(
-            driver.hidden,
+            driver.settings.hidden,
             Some(HiddenCarry {
                 positions: nz(positions)
             })
@@ -380,9 +393,10 @@ fn a_kv_only_family_with_the_carry_stays_kv_only_and_every_target_program_declar
             "every target program declares the one carry aval"
         );
         for (key, _) in &avals {
-            assert_eq!(key.shape.hidden, driver.hidden, "{key:?}");
+            assert_eq!(key.shape.hidden, driver.settings.hidden, "{key:?}");
         }
         for key in driver
+            .ledger
             .entries
             .keys()
             .filter(|key| key.role != ModelRole::Target)
@@ -398,16 +412,17 @@ fn a_kv_only_family_with_the_carry_stays_kv_only_and_every_target_program_declar
 /// carry and its shadow too and the assertion is red.
 #[test]
 fn the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched() {
-    let mut driver = driver_of(Kind::Recurrent, 2, true);
-    prepare(&mut driver, &[]).unwrap_or_else(|e| panic!("{e}"));
+    let driver =
+        prepare(driver_of(Kind::Recurrent, 2, true), &[]).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(driver.caps().unwrap().state, StateResidency::Recurrent);
     assert_eq!(
-        driver.hidden,
+        driver.settings.hidden,
         Some(HiddenCarry {
             positions: nz(CHUNK)
         })
     );
     let rollback_keys: Vec<_> = driver
+        .ledger
         .entries
         .keys()
         .filter(|key| matches!(key.role, ModelRole::Snapshot | ModelRole::Restore))
@@ -416,21 +431,23 @@ fn the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched() {
     assert!(
         rollback_keys
             .iter()
-            .all(|key| key.shape.hidden == driver.hidden),
+            .all(|key| key.shape.hidden == driver.settings.hidden),
         "the rollback copies trace the target's decode program, carry included"
     );
     let decode = driver
+        .ledger
         .entries
         .keys()
-        .find(|key| key.role == ModelRole::Target && key.phase == Phase::Decode)
+        .find(|key| {
+            key.role == ModelRole::Target && key.program == Program::Step && key.shape.is_decode()
+        })
         .copied()
         .expect("a decode program");
     let schema = driver
         .handle
         .model()
         .trace(
-            decode.phase,
-            decode.shape,
+            &StepSpec::new(decode.program.id(), decode.shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -464,8 +481,9 @@ fn the_rollback_copies_recurrent_state_and_leaves_the_carry_untouched() {
 fn a_carry_aval_that_differs_from_the_request_is_refused_typed() {
     let positions = CHUNK;
     for (carry, expected) in [(true, Some(positions)), (false, None)] {
-        let mut driver = driver_of(Kind::Wide, 2, carry);
-        let error = prepare(&mut driver, &[]).expect_err("a mismatched carry is refused");
+        let refused = prepare(driver_of(Kind::Wide, 2, carry), &[])
+            .expect_err("a mismatched carry is refused");
+        let (driver, error) = (refused.driver, refused.error);
         let DriverError::Unsupported(Unsupported::Trace(TraceError::ShapeUnsupported {
             family,
             reason,
@@ -497,8 +515,9 @@ fn a_carry_aval_that_differs_from_the_request_is_refused_typed() {
 /// `prepare` succeeds and the assertion is red.
 #[test]
 fn a_family_that_ignores_the_request_is_refused_typed() {
-    let mut driver = driver_of(Kind::Ignoring, 2, true);
-    let error = prepare(&mut driver, &[]).expect_err("an unwritten carry is refused");
+    let error = prepare(driver_of(Kind::Ignoring, 2, true), &[])
+        .expect_err("an unwritten carry is refused")
+        .error;
     let DriverError::Unsupported(Unsupported::Trace(TraceError::ShapeUnsupported {
         reason, ..
     })) = error

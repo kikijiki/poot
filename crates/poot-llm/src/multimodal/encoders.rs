@@ -1,7 +1,7 @@
 //! The encoder front ends over [`Driver::encode`]: sentence embeddings, bi-encoder reranking and
 //! cross-encoder reranking (POOT-739).
 //!
-//! The model side is the registered `bert` family (or a decoder family's `Encode` phase): it returns
+//! The model side is the registered `bert` family (or a decoder family's `encode` program): it returns
 //! every position's final hidden state, or a cross-encoder's classifier score. What a sentence vector
 //! is, the pooling of those hidden states and their normalization, is the host's: [`Pooling`] and
 //! [`pool`] are plain arithmetic on the rows the driver returns, so they are exact and need no
@@ -12,8 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use poot_executor::Executor;
-use poot_graph_plan::{CompileLimits, CompileOptions, production_plan::Submission};
+use poot_graph_plan::{CompileLimits, CompileOptions};
+use poot_models::bert::TOKEN_TYPE;
+use poot_models::io::{InputValue, RequestInputs, TokenValues};
 use poot_models::registry::Registry;
+use poot_tensor::HostTensor;
 
 use crate::driver::error::DriverError;
 use crate::driver::{
@@ -50,7 +53,7 @@ fn open(
     )?);
     let positions = NonZeroUsize::new(handle.config().max_positions)
         .expect("a model has at least one position");
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let options = DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -177,11 +180,16 @@ impl SentenceEncoder {
         if tokens.iter().any(|row| row.ids.is_empty()) {
             return Err(EncoderError::EmptyText);
         }
+        let inputs: Vec<RequestInputs> = tokens
+            .iter()
+            .map(|row| segment_inputs(&row.types))
+            .collect();
         let rows: Vec<EncodeRow<'_>> = tokens
             .iter()
-            .map(|row| EncodeRow::Tokens {
-                ids: &row.ids,
-                types: &row.types,
+            .zip(&inputs)
+            .map(|(row, inputs)| EncodeRow {
+                tokens: Some(&row.ids),
+                inputs,
             })
             .collect();
         Ok(self.driver.encode(&EncodeRequest { rows: &rows })?)
@@ -209,6 +217,18 @@ impl SentenceEncoder {
             query.iter().zip(doc).map(|(a, b)| a * b).sum::<f32>()
         })))
     }
+}
+
+/// The request inputs of an encoder row whose tokens carry segment ids `types`: the dense segment
+/// column when some token is in a later segment, nothing (the model's default, all zeros) otherwise.
+pub fn segment_inputs(types: &[u32]) -> RequestInputs {
+    if types.iter().all(|&kind| kind == 0) {
+        return RequestInputs::none();
+    }
+    let words: Vec<i32> = types.iter().map(|&kind| kind as i32).collect();
+    let values = TokenValues::dense(HostTensor::i32(vec![words.len(), 1], words))
+        .expect("a column of segment ids is [tokens, 1]");
+    RequestInputs::none().with(TOKEN_TYPE, InputValue::Tokens(values))
 }
 
 /// A cross-encoder reranker (`BertForSequenceClassification`): scores a query and a document
@@ -246,11 +266,16 @@ impl CrossEncoder {
             .iter()
             .map(|doc| self.handle.text().encode_for_encoder(query, Some(doc)))
             .collect::<Result<Vec<_>, _>>()?;
+        let inputs: Vec<RequestInputs> = pairs
+            .iter()
+            .map(|pair| segment_inputs(&pair.types))
+            .collect();
         let rows: Vec<EncodeRow<'_>> = pairs
             .iter()
-            .map(|pair| EncodeRow::Tokens {
-                ids: &pair.ids,
-                types: &pair.types,
+            .zip(&inputs)
+            .map(|(pair, inputs)| EncodeRow {
+                tokens: Some(&pair.ids),
+                inputs,
             })
             .collect();
         let encoded = self.driver.encode(&EncodeRequest { rows: &rows })?;

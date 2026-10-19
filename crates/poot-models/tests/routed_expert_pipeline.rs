@@ -6,12 +6,11 @@
 use poot_graph_ir::OpKind;
 use poot_graph_plan::{
     CompileLimits, CompileOptions, KernelChoice, Program, Target, compile,
-    multi_device::topology::DeviceId, production_plan::Submission, routed_expert_sites,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
-    staged::compile_staged,
+    multi_device::topology::DeviceId, routed_expert_sites, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::TargetSet, staged::compile_staged,
 };
 use poot_kernelgen::{ContractionSpec, KernelRequest};
-use poot_models::model::Phase;
+use poot_models::model::StepSpec;
 use poot_target::{AmdArch, Backend, DeviceCaps};
 use poot_test_util::device_caps::default_caps_for;
 
@@ -22,39 +21,37 @@ fn wgpu() -> Target {
     }
 }
 
-const REPLAY: CompileOptions = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(CompileLimits::STANDARD);
 
-/// The first `phase` step of the granitemoe registry fixture (two routed layers, four experts) at
+/// The first step of the granitemoe registry fixture (two routed layers, four experts) at
 /// `tokens` tokens: the production family's own trace, not a hand-built graph.
-fn granitemoe_step(phase: Phase, tokens: usize) -> poot_graph_ir::Graph {
-    granitemoe_step_and_weights(phase, tokens).0
+fn granitemoe_step(tokens: usize) -> poot_graph_ir::Graph {
+    granitemoe_step_and_weights(tokens).0
 }
 
 /// [`granitemoe_step`] with the model's weight map and the fixture store it binds.
 fn granitemoe_step_and_weights(
-    phase: Phase,
     tokens: usize,
 ) -> (
     poot_graph_ir::Graph,
     poot_quant::weights::WeightMap,
     poot_quant::weights::WeightStore,
 ) {
-    registered_step_and_weights("granite", Some("granitemoe"), phase, tokens)
+    registered_step_and_weights("granite", Some("granitemoe"), tokens)
 }
 
-/// The first `phase` step of a registered family's fixture (its `variant` fixture when named) at
+/// The first step of a registered family's fixture (its `variant` fixture when named) at
 /// `tokens` tokens, with the model's weight map and the store it binds.
 fn registered_step_and_weights(
     family: &str,
     variant: Option<&str>,
-    phase: Phase,
     tokens: usize,
 ) -> (
     poot_graph_ir::Graph,
     poot_quant::weights::WeightMap,
     poot_quant::weights::WeightStore,
 ) {
-    use poot_models::model::{KvLayout, LogitRows, StepShape};
+    use poot_models::model::StepShape;
     use std::num::NonZeroUsize;
 
     let registry = poot_models::registry::Registry::builtin().expect("the builtin registry");
@@ -78,15 +75,7 @@ fn registered_step_and_weights(
     let n = |v| NonZeroUsize::new(v).unwrap();
     let graph = model
         .trace(
-            phase,
-            StepShape {
-                rows: n(1),
-                tokens: n(tokens),
-                capacity: n(8),
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::Last,
-                hidden: None,
-            },
+            &StepSpec::step(StepShape::new(n(1), n(tokens), n(8))),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the fixture traces");
@@ -160,8 +149,8 @@ fn routed_expert_prefill_runs_the_full_pipeline_on_every_preset() {
         ),
         ("wgpu", wgpu()),
     ];
-    let (prefill, map, store) = granitemoe_step_and_weights(Phase::Prefill, 4);
-    let decode = granitemoe_step(Phase::Decode, 1);
+    let (prefill, map, store) = granitemoe_step_and_weights(4);
+    let decode = granitemoe_step(1);
     assert!(
         !routed_expert_sites(&prefill).is_empty(),
         "prefill has a site"
@@ -229,7 +218,7 @@ fn every_moe_family_prefill_has_routed_expert_sites_and_runs_every_pass_on_rocm(
         devices: DevicePlacement::Single(DeviceId(0)),
     };
     for (family, variant) in MOE_FAMILIES {
-        let prefill = registered_step_and_weights(family, variant, Phase::Prefill, 4).0;
+        let prefill = registered_step_and_weights(family, variant, 4).0;
         assert!(
             !routed_expert_sites(&prefill).is_empty(),
             "{family}: the prefill finds no routed-expert site"
@@ -279,13 +268,12 @@ fn qwen3next_prefill_tiles_its_routers_and_runs_every_pass_on_every_preset() {
         ),
         ("wgpu", wgpu()),
     ];
-    let (prefill, map, store) =
-        registered_step_and_weights("qwen3next", None, Phase::Prefill, TOKENS);
+    let (prefill, map, store) = registered_step_and_weights("qwen3next", None, TOKENS);
     assert!(
         !routed_expert_sites(&prefill).is_empty(),
         "the prefill's routers contract several rows"
     );
-    let decode = registered_step_and_weights("qwen3next", None, Phase::Decode, 1).0;
+    let decode = registered_step_and_weights("qwen3next", None, 1).0;
     let prompt: Vec<i32> = (0..TOKENS as i32).map(|t| (3 * t + 1) % 48).collect();
     let want = oracle_logits(&prefill, &map, &store, &prompt);
     for (label, target) in &presets {
@@ -345,7 +333,7 @@ fn router_choices_are_serial(program: &Program, tokens: usize, experts: usize) -
 /// router plans serial and this row goes red.
 #[test]
 fn routed_prefill_router_takes_the_tiled_schedule_on_every_preset() {
-    let g = granitemoe_step(Phase::Prefill, 4);
+    let g = granitemoe_step(4);
     for (label, target) in [
         (
             "ROCm",

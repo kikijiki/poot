@@ -58,32 +58,6 @@ fn softcapped_qwen2_matches_the_oracle_on_ptx() {
         let mut oracle = oracle_for(&softcapped.graph, &softcapped.store);
         poot_executor_parity::run_parity(exec.as_mut(), t, softcapped, &mut oracle)
             .unwrap_or_else(|e| panic!("{e}"));
-        // The softcap must be visible: the softcapped trace's oracle differs from the uncapped
-        // trace's by more than ten times the parity tolerance at some step.
-        let (mut capped_oracle, mut plain_oracle) = (
-            oracle_for(&softcapped.graph, &softcapped.store),
-            oracle_for(&uncapped.graph, &uncapped.store),
-        );
-        let largest = softcapped
-            .steps
-            .iter()
-            .zip(&uncapped.steps)
-            .map(|(capped_step, plain_step)| {
-                let capped = capped_oracle(capped_step);
-                let plain = plain_oracle(plain_step);
-                capped
-                    .as_f32()
-                    .expect("F32 oracle output")
-                    .iter()
-                    .zip(plain.as_f32().expect("F32 oracle output"))
-                    .map(|(c, p)| (c - p).abs() / p.abs().max(1.0))
-                    .fold(0.0f32, f32::max)
-            })
-            .fold(0.0f32, f32::max);
-        assert!(
-            largest > 5e-2,
-            "{}: the softcap barely changes the oracle (max relative difference {largest:.2e})",
-            softcapped.name
-        );
+        poot_executor_parity::assert_softcap_is_visible(softcapped, uncapped);
     }
 }

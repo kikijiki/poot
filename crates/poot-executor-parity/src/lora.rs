@@ -13,8 +13,8 @@ use poot_executor::{Executor, NoSync, StepInputs};
 use poot_graph_ir::{Builder, Slot, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, LoraPlan, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::TargetSet, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
@@ -88,16 +88,10 @@ pub fn assert_batched_lora_matches_merged_weights(
                 all.extend(row);
             }
         }
-        let distance = |a: &[f32], b: &[f32]| {
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
-        };
         let (d01, d02, d12) = (
-            distance(&all_rows[0], &all_rows[1]),
-            distance(&all_rows[0], &all_rows[2]),
-            distance(&all_rows[1], &all_rows[2]),
+            poot_test_util::max_abs_error(&all_rows[0], &all_rows[1]),
+            poot_test_util::max_abs_error(&all_rows[0], &all_rows[2]),
+            poot_test_util::max_abs_error(&all_rows[1], &all_rows[2]),
         );
         assert!(
             d01 > 1e-3 && d02 > 1e-3 && d12 > 1e-3,
@@ -243,7 +237,7 @@ fn run_projection(
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD).with_lora(plan),
+        &CompileOptions::new(CompileLimits::STANDARD).with_lora(plan),
     )
     .unwrap_or_else(|e| panic!("{lora_target:?}: compile_staged: {e}"));
     let exe = exec

@@ -21,12 +21,10 @@ use crate::components::linear::WeightError;
 use crate::components::norm::{NormKind, NormParams};
 use crate::components::standard::{
     BlockInput, LayerNorms, LayerParams, NormPlacement, ParamError, StackParams, StackWeights,
-    Step, check_step, standard_layer, standard_stack,
+    Step, check_step, decoder_program, standard_layer, standard_stack,
 };
-use crate::model::{
-    ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape,
-    TraceError,
-};
+use crate::io::ModelSchema;
+use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::{GGUF_BASE, GGUF_SANDWICH_NORMS};
 use crate::names::{HF_BASE, HF_SANDWICH_NORMS, family_weights, hf_base_shapes};
 use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
@@ -209,6 +207,7 @@ pub(crate) struct Gemma2 {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -230,6 +229,9 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -238,7 +240,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         bos: p.bos,
         // Gemma is trained with a mandatory BOS (`<bos>` is id 2 in every Gemma vocabulary).
         prompt_bos: Some(p.bos.unwrap_or(GEMMA_BOS)),
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Gemma,
     };
@@ -248,6 +249,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -256,13 +258,18 @@ impl Model for Gemma2 {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
@@ -332,7 +339,7 @@ mod family_tests {
         close, f32_entry, gguf_dense_kvs, gguf_name_with_head, gguf_tensor, q8_0_store,
         read_back_owned, step_shape, values, with_norm_offsets_folded,
     };
-    use crate::model::LogitRows;
+    use crate::model::{LogitRows, StepShape};
     use crate::registry::Registry;
 
     fn is_projection(key: &str) -> bool {
@@ -411,8 +418,7 @@ mod family_tests {
         let trace = |config: &serde_json::Value| {
             model_of(config, &fx.store)
                 .trace(
-                    Phase::Prefill,
-                    step_shape(3, CAP, LogitRows::All),
+                    &StepSpec::step(step_shape(3, CAP, LogitRows::All)),
                     poot_graph_ir::TraceLimits::for_tests(),
                 )
                 .unwrap()
@@ -424,7 +430,6 @@ mod family_tests {
             run_step(
                 &*model_of(config, &fx.store),
                 &fx.store,
-                Phase::Prefill,
                 CAP,
                 &[3, 17, 40, 8, 25],
                 0,
@@ -564,7 +569,6 @@ mod family_tests {
             run_step(
                 &*model_of(config, &store),
                 &store,
-                Phase::Prefill,
                 CAP,
                 &[3, 17, 40],
                 0,
@@ -636,27 +640,11 @@ mod family_tests {
         hf["query_pre_attn_scalar"] = json!(16.0);
         let reference = model_of(&hf, &reference_store);
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, Phase::Prefill, CAP, &prompt, 0, &[]);
-        let (want, want_state) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Prefill,
-            CAP,
-            &prompt,
-            0,
-            &[],
-        );
+        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
-        let (got, _) = run_step(&*model, &store, Phase::Decode, CAP, &[5], 4, &state);
-        let (want, _) = run_step(
-            &*reference,
-            &reference_store,
-            Phase::Decode,
-            CAP,
-            &[5],
-            4,
-            &want_state,
-        );
+        let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+        let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }
 
@@ -697,24 +685,17 @@ mod family_tests {
         let fx = fixture();
         let model = model_of(&fx.config, &fx.store);
         let n = |v| NonZeroUsize::new(v).unwrap();
-        let shape = |rows, tokens, capacity| StepShape {
-            rows: n(rows),
-            tokens: n(tokens),
-            capacity: n(capacity),
-            ..step_shape(1, 1, LogitRows::Last)
-        };
+        let shape = |rows, tokens, capacity| StepShape::new(n(rows), n(tokens), n(capacity));
         assert!(matches!(
             model.trace(
-                Phase::Decode,
-                shape(1, 2, 8),
+                &StepSpec::step(shape(1, 9, 8)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })
         ));
         assert!(matches!(
             model.trace(
-                Phase::Prefill,
-                shape(1, 1, 65),
+                &StepSpec::step(shape(1, 1, 65)),
                 poot_graph_ir::TraceLimits::for_tests()
             ),
             Err(TraceError::ShapeUnsupported { .. })
@@ -769,8 +750,7 @@ mod family_tests {
         let model = model_of(&config, &store.build());
         model
             .trace(
-                Phase::Prefill,
-                step_shape(n, n, LogitRows::Last),
+                &StepSpec::step(step_shape(n, n, LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap()

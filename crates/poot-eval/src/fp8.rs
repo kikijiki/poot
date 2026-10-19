@@ -306,13 +306,9 @@ mod tests {
             graph.inputs()[0],
             poot_tensor::HostTensor::f32(vec![2], vec![1.0, 2.0]).into(),
         )]);
-        let message = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .unwrap_err()
-        .to_string();
+        let message = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .unwrap_err()
+            .to_string();
         assert!(message.contains("e4m3fn"), "{message}");
         assert!(message.contains("Value::Host"), "{message}");
     }
@@ -330,13 +326,9 @@ mod tests {
             graph.inputs()[0],
             poot_tensor::HostTensor::f32(vec![2], vec![1.0, 2.0]).into(),
         )]);
-        let output = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .unwrap()
-        .output;
+        let output = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .unwrap()
+            .output;
         let crate::Value::Host(tensor) = output else {
             panic!("expected an E4M3Fn result, got {output:?}")
         };
@@ -360,13 +352,9 @@ mod tests {
             x.id(),
             crate::Value::Host(e4m3fn_tensor(vec![2, 5], bytes.clone()).unwrap()),
         )]);
-        let got = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap();
+        let got = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap();
         let crate::Value::Host(got) = got else {
             panic!("reshape must retain e4m3fn storage")
         };
@@ -394,13 +382,9 @@ mod tests {
             x.id(),
             crate::Value::Host(poot_tensor::HostTensor::f32(vec![2, 5], values.clone())),
         )]);
-        let got = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap();
+        let got = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap();
         let crate::Value::Host(got) = got else {
             panic!("decode must return dense f32 storage")
         };
@@ -425,13 +409,9 @@ mod tests {
         let raw_bytes = raw.view().bytes().as_ptr();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(raw))]);
 
-        let got = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap();
+        let got = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap();
         let crate::Value::Host(got) = got else {
             panic!("same-dtype Cast must retain e4m3fn storage")
         };
@@ -459,13 +439,9 @@ mod tests {
         let raw_bytes = raw.view().bytes().as_ptr();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(raw))]);
 
-        let got = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap();
+        let got = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap();
         assert_eq!(got.physical_bytes(), 16);
         let crate::Value::Host(got) = got else {
             panic!("zero-equation identity must return e4m3fn storage")
@@ -496,12 +472,7 @@ mod tests {
         let input_ptr = input.view().bytes().as_ptr();
         let inputs = HashMap::from([(state.id(), crate::Value::Host(input))]);
 
-        let result = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .unwrap();
+        let result = crate::eval(&graph, &inputs, crate::EvalOptions::default()).unwrap();
         let (output, carried) = (result.output, result.state);
         assert_eq!(carried.len(), 1);
         assert_eq!(output.physical_bytes(), 16);
@@ -558,12 +529,7 @@ mod tests {
                     crate::Value::Host(poot_tensor::HostTensor::i32(vec![], vec![position])),
                 ),
             ]);
-            let result = crate::eval(
-                &graph,
-                &inputs,
-                crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-            )
-            .unwrap();
+            let result = crate::eval(&graph, &inputs, crate::EvalOptions::default()).unwrap();
             let (output, state_values) = (result.output, result.state);
             assert_eq!(state_values.len(), 1);
             assert_eq!(output, state_values[0]);
@@ -611,13 +577,9 @@ mod tests {
         // Card 554d: `walk::preflight_bindings` catches this the same way for any input (not a
         // state-specific "generic value storage" check): an E4M3FN-declared value bound as a plain
         // `Value::Host` is a typed `EvalError::Input` mismatch, checked before any equation runs.
-        let message = crate::eval(
-            &graph,
-            &wrong,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .unwrap_err()
-        .to_string();
+        let message = crate::eval(&graph, &wrong, crate::EvalOptions::default())
+            .unwrap_err()
+            .to_string();
         assert!(message.contains("e4m3fn"), "{message}");
         assert!(message.contains("Value::Host"), "{message}");
     }
@@ -634,13 +596,9 @@ mod tests {
         let input = e4m3fn_tensor(vec![2, 5], bytes).unwrap();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
 
-        let got = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap();
+        let got = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap();
         let crate::Value::Host(got) = got else {
             panic!("Transpose must retain e4m3fn storage")
         };
@@ -663,13 +621,9 @@ mod tests {
         let input = e4m3fn_tensor(vec![2, 5], bytes).unwrap();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
 
-        let got = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap();
+        let got = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap();
         let crate::Value::Host(got) = got else {
             panic!("Slice must retain e4m3fn storage")
         };
@@ -698,13 +652,10 @@ mod tests {
                 crate::Value::Host(e4m3fn_tensor(vec![2, 2], vec![0xff, 6, 7, 8]).unwrap()),
             ),
         ]);
-        let crate::Value::Host(got) = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap() else {
+        let crate::Value::Host(got) = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap()
+        else {
             panic!("Concat must retain e4m3fn storage")
         };
         assert_eq!(got.view().bytes(), [0x7f, 1, 2, 0xff, 6, 3, 4, 5, 7, 8]);
@@ -734,13 +685,9 @@ mod tests {
             ),
         ]);
 
-        let got = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap();
+        let got = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap();
         let crate::Value::Host(got) = got else {
             panic!("Gather must retain e4m3fn storage")
         };
@@ -823,13 +770,11 @@ mod tests {
                 );
             }
 
-            let crate::Value::Host(got) = crate::eval(
-                &graph,
-                &inputs,
-                crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-            )
-            .map(|r| r.output)
-            .unwrap() else {
+            let crate::Value::Host(got) =
+                crate::eval(&graph, &inputs, crate::EvalOptions::default())
+                    .map(|r| r.output)
+                    .unwrap()
+            else {
                 panic!("DynamicUpdateSlice must retain e4m3fn storage")
             };
             let mut expected = operand_bytes;
@@ -883,14 +828,10 @@ mod tests {
             ),
         ]);
 
-        let message = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap_err()
-        .to_string();
+        let message = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap_err()
+            .to_string();
         assert!(message.contains("different dtype"), "{message}");
 
         let builder = Builder::for_tests();
@@ -920,14 +861,10 @@ mod tests {
             ),
         ]);
 
-        let message = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap_err()
-        .to_string();
+        let message = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap_err()
+            .to_string();
         assert!(message.contains("different dtype"), "{message}");
     }
 
@@ -942,13 +879,9 @@ mod tests {
         let input = e4m3fn_tensor(vec![1, 3], vec![0x7f, 0xff, 0x01]).unwrap();
         let inputs = HashMap::from([(x.id(), crate::Value::Host(input))]);
 
-        let got = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap();
+        let got = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap();
         let crate::Value::Host(got) = got else {
             panic!("Broadcast must retain e4m3fn storage")
         };
@@ -985,13 +918,10 @@ mod tests {
                 crate::Value::Host(poot_tensor::HostTensor::i32(vec![2], vec![2, 0])),
             ),
         ]);
-        let crate::Value::Host(got) = crate::eval(
-            &graph,
-            &inputs,
-            crate::EvalOptions::new(crate::EvalBudget::UNBOUNDED),
-        )
-        .map(|r| r.output)
-        .unwrap() else {
+        let crate::Value::Host(got) = crate::eval(&graph, &inputs, crate::EvalOptions::default())
+            .map(|r| r.output)
+            .unwrap()
+        else {
             panic!("ScatterUpdate must retain e4m3fn storage")
         };
         assert_eq!(

@@ -4,9 +4,7 @@
 
 use std::num::NonZeroUsize;
 
-use poot_graph_plan::{
-    CompileError, CompileLimits, CompileOptions, Target, compile, production_plan::Submission,
-};
+use poot_graph_plan::{CompileError, CompileLimits, CompileOptions, Target, compile};
 use poot_target::Backend;
 use poot_test_util::device_caps::default_caps_for;
 
@@ -18,7 +16,7 @@ fn wgpu() -> Target {
 }
 
 fn options(limits: CompileLimits) -> CompileOptions {
-    CompileOptions::new(Submission::Replay, limits)
+    CompileOptions::new(limits)
 }
 
 fn nz(n: usize) -> NonZeroUsize {
@@ -32,7 +30,7 @@ fn nz(n: usize) -> NonZeroUsize {
 #[test]
 fn a_real_model_trace_under_explicit_limits_reaches_compile_and_each_budget_refuses_alone() {
     use poot_graph_ir::TraceLimits;
-    use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+    use poot_models::model::{StepShape, StepSpec};
     use poot_models::registry::Registry;
 
     let registry = Registry::builtin().unwrap();
@@ -44,23 +42,16 @@ fn a_real_model_trace_under_explicit_limits_reaches_compile_and_each_budget_refu
         .expect("qwen2 is shipped");
     let fixture = (entry.fixture)();
     let model = registry.build(&fixture.raw(), &fixture.store).unwrap();
-    let shape = |tokens: usize| StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: nz(tokens),
-        capacity: nz(16),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::Last,
-        hidden: None,
-    };
+    let shape = |tokens: usize| StepShape::new(NonZeroUsize::MIN, nz(tokens), nz(16));
     let roomy = TraceLimits::for_tests();
-    let traced = model.trace(Phase::Decode, shape(1), roomy).unwrap();
+    let traced = model.trace(&StepSpec::step(shape(1)), roomy).unwrap();
     let exact = TraceLimits {
         max_tokens: nz(1),
         max_values: nz(traced.values().len()),
         max_eqns: nz(traced.eqns().len()),
         ..roomy
     };
-    let graph = model.trace(Phase::Decode, shape(1), exact).unwrap();
+    let graph = model.trace(&StepSpec::step(shape(1)), exact).unwrap();
     compile(&graph, &wgpu(), &options(CompileLimits::STANDARD))
         .expect("an exactly traced step compiles");
 
@@ -82,6 +73,6 @@ fn a_real_model_trace_under_explicit_limits_reaches_compile_and_each_budget_refu
         max_tokens: nz(4),
         ..roomy
     };
-    model.trace(Phase::Prefill, shape(4), four).unwrap();
-    assert!(model.trace(Phase::Prefill, shape(6), four).is_err());
+    model.trace(&StepSpec::step(shape(4)), four).unwrap();
+    assert!(model.trace(&StepSpec::step(shape(6)), four).is_err());
 }

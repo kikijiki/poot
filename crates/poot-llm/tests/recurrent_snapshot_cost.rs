@@ -23,8 +23,7 @@ use poot_executor::{DetailedTiming, Device, Dispatch, Engine, Executor, NoSync, 
 use poot_graph_ir::{Builder, Graph, Slot, SlotKey, StateRole, TensorType};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
-    production_plan::Submission, staged::DevicePlacement, staged::ExpertPlacement,
-    staged::Partition, staged::compile_staged,
+    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::compile_staged,
 };
 use poot_llm::driver::capacity::Planner;
 use poot_llm::driver::error::DriverError;
@@ -34,7 +33,7 @@ use poot_llm::driver::{
     ModelHandle, PreparedSetLimits, ServingShapes, Warm, open_timed_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::model::{FamilyKey, LogitRows, Phase};
+use poot_models::model::{FamilyKey, LogitRows, StepSpec};
 use poot_models::registry::{FamilyEntry, Fixture, Registry};
 use poot_models::test_support::dense::step as step_shape;
 use poot_models::test_support::weight_map::MappedModel;
@@ -106,7 +105,7 @@ fn write_checkpoint(dir: &Path, fixture: &Fixture) {
 }
 
 fn options() -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -144,8 +143,7 @@ impl Carried {
 fn decode_graph(m: &MappedModel, rows: usize) -> Graph {
     m.model
         .trace(
-            Phase::Decode,
-            step_shape(rows, 1, CAPACITY, LogitRows::Last),
+            &StepSpec::step(step_shape(rows, 1, CAPACITY, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -353,7 +351,7 @@ impl Device for CountingDevice {
     ) -> Result<(), CountingError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), CountingError> {
+    fn begin(&mut self) -> Result<(), CountingError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), CountingError> {
@@ -399,7 +397,7 @@ fn partition() -> Partition {
 }
 
 fn compile_options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 /// The state bytes the production planner publishes for one decode row of the fixture checkpoint.
@@ -424,7 +422,7 @@ fn planned_state_bytes(family: FamilyKey) -> u64 {
                 windows: &[],
                 adapters: &[],
             },
-            false,
+            &[],
         )
         .unwrap();
     planned
@@ -788,7 +786,8 @@ fn generate(
         Arc::clone(handle),
         executor,
         DriverOptions { draft, ..options() },
-    )?;
+    )?
+    .serve(Layout::Contiguous);
     // A repeating prompt and a one-token n-gram, so prompt lookup proposes drafts the random fixture
     // then rejects: a rejected draft left folded in the GDN state would change what greedy decode
     // generates.

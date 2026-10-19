@@ -4,12 +4,12 @@
 
 use std::collections::BTreeSet;
 
-use poot_llm::driver::{Encoded, PrefixOutcome, PrefixSkip, PromptEmbeds, Release, RowSpeculation};
+use poot_llm::driver::{Encoded, PrefixOutcome, PrefixSkip, Release, RowSpeculation};
+use poot_models::io::RequestInputs;
 
 use super::*;
 use crate::types::{
     AdapterInfo, AdminError, AdminReply, AdminRequest, ChoiceEvents, ChoiceReply, EncodeRow,
-    PromptRows,
 };
 
 /// The block the fake's prefix cache registers and reuses in: whole multiples of it.
@@ -225,7 +225,7 @@ impl ServeEngine for RecordingEngine {
             return Ok(Opening::NoRoom { needed_blocks: 0 });
         }
         let prompt = request.prompt.to_vec();
-        let embeds = request.rows.is_some();
+        let embeds = !request.inputs.is_empty();
         let common = self
             .registered
             .iter()
@@ -446,6 +446,13 @@ pub(crate) struct JobSpec {
     pub(crate) overdue: bool,
 }
 
+/// The request inputs of a multimodal prompt: `rows` (`positions.len() * width` values, row-major) of
+/// embedding rows at the prompt's `positions`.
+pub(crate) fn embed_inputs(width: usize, positions: Vec<usize>, rows: Vec<f32>) -> RequestInputs {
+    poot_models::components::embed::embeds_inputs(width, positions, rows)
+        .expect("ordered positions over rows of the width")
+}
+
 /// One token per character, its code point: the prompts the tests write as strings.
 pub(crate) fn tokens_of(prompt: &str) -> Vec<u32> {
     prompt.chars().map(u32::from).collect()
@@ -489,16 +496,13 @@ impl JobSpec {
         let reply = replies.remove(0);
         let cancel = Arc::new(AtomicBool::new(false));
         let tokens = tokens_of(&self.prompt);
-        let prompt = if self.embeds {
-            PromptInput::Multimodal {
-                tokens,
-                rows: PromptRows {
-                    embeds: PromptEmbeds::new(1, vec![0], vec![1.0]).expect("one row of one value"),
-                    mrope: None,
-                },
-            }
-        } else {
-            PromptInput::Tokens(tokens)
+        let prompt = PromptInput {
+            inputs: if self.embeds {
+                embed_inputs(1, vec![0], vec![1.0])
+            } else {
+                RequestInputs::none()
+            },
+            tokens,
         };
         let job = Job {
             prompt,

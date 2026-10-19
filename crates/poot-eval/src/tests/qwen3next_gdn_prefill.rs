@@ -1,6 +1,6 @@
 //! The chunked gated delta-net core against the sequential one on realistic inputs, and the Mamba2 core paths.
 
-use crate::{EvalBudget, EvalError, EvalOptions, Value};
+use crate::{EvalError, EvalOptions, Value};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::graph::StateRole;
 use poot_graph_ir::ops::{gated_delta_net_decode, gdn_prefill_chunked, mamba2_ssd_decode};
@@ -137,13 +137,9 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                 .collect();
-            let environment = crate::eval(
-                &fg,
-                &values,
-                EvalOptions::new(EvalBudget::UNBOUNDED).keep_environment(),
-            )?
-            .environment
-            .expect("keep_environment was set");
+            let environment = crate::eval(&fg, &values, EvalOptions::default().keep_environment())?
+                .environment
+                .expect("keep_environment was set");
             environment
                 .into_iter()
                 .map(|slot| slot.map(Value::into_host).transpose())
@@ -229,8 +225,7 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
                     .iter()
                     .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                     .collect();
-                let evaluation =
-                    crate::eval(&dg, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+                let evaluation = crate::eval(&dg, &values, EvalOptions::default())?;
                 let state = evaluation
                     .state
                     .into_iter()
@@ -317,8 +312,7 @@ fn gdn_core_on_realistic_frontend_inputs_per_head_real_dims() {
                     .iter()
                     .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                     .collect();
-                let evaluation =
-                    crate::eval(&cgraph, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+                let evaluation = crate::eval(&cgraph, &values, EvalOptions::default())?;
                 let state = evaluation
                     .state
                     .into_iter()
@@ -460,7 +454,7 @@ fn mamba_core_path_decode_loop_matches_reference() {
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                 .collect();
-            let evaluation = crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+            let evaluation = crate::eval(&g, &values, EvalOptions::default())?;
             let state = evaluation
                 .state
                 .into_iter()
@@ -580,7 +574,7 @@ fn mamba2_ssd_decode_matches_recurrence() {
                 .iter()
                 .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
                 .collect();
-            let evaluation = crate::eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+            let evaluation = crate::eval(&g, &values, EvalOptions::default())?;
             let state = evaluation
                 .state
                 .into_iter()

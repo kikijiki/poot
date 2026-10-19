@@ -25,20 +25,18 @@ use poot_executor::{
 };
 use poot_graph_ir::{Slot, SlotKey};
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, Target, production_plan::Submission, staged::StagedProgram,
-    staged::TargetSet,
+    CompileLimits, CompileOptions, Target, staged::StagedProgram, staged::TargetSet,
 };
 use poot_llm::driver::error::{DraftMismatch, DriverError, SpeculationRefusal, Unsupported};
 use poot_llm::driver::speculate::{DRAFT_STREAM_SALT, propose_lookup, spec_sample_round};
-use poot_llm::driver::step::PickPolicy;
 use poot_llm::driver::{
     AdapterRef, Admission, BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest,
     Head, Layout, LoadOptions, ModelHandle, NotSpeculated, PoolShape, PositionAcceptance,
-    PreparedSetLimits, Release, RowResult, RowSpeculation, RowWork, SeqRequest, ServingShapes,
-    SpeculationStats, StepRow, Warm, open_executor, program_retention,
+    PreparedSetLimits, Release, RowResult, RowSpeculation, RowWork, SeqRequest, Serving,
+    ServingShapes, SpeculationStats, StepRow, Warm, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape};
+use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::registry::{Fixture, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
@@ -203,7 +201,7 @@ impl Device for FakeDevice {
     ) -> Result<(), FakeError> {
         Ok(())
     }
-    fn begin(&mut self, _submission: Submission) -> Result<(), FakeError> {
+    fn begin(&mut self) -> Result<(), FakeError> {
         Ok(())
     }
     fn dispatch(&mut self, _d: Dispatch<'_, Self>) -> Result<(), FakeError> {
@@ -294,7 +292,7 @@ impl Executor for Counting {
 }
 
 fn options(draft: DraftPolicy) -> DriverOptions {
-    let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let compile = CompileOptions::new(CompileLimits::STANDARD);
     DriverOptions {
         prefill: compile.clone(),
         decode: compile,
@@ -333,17 +331,15 @@ fn fake_driver(target: Arc<ModelHandle>, draft: DraftPolicy) -> (Driver, Rc<Cell
     (driver, loads)
 }
 
-fn prepare(driver: &mut Driver, heads: &[Head]) -> Result<(), DriverError> {
-    driver
-        .prepare(&ServingShapes {
-            layout: Layout::Contiguous,
-            rows: &[NonZeroUsize::MIN],
-            heads,
-            warm: Warm::Admitted,
-            windows: &[],
-            adapters: &[],
-        })
-        .map(|_| ())
+fn contiguous(heads: &[Head]) -> ServingShapes<'_> {
+    ServingShapes {
+        layout: Layout::Contiguous,
+        rows: &[NonZeroUsize::MIN],
+        heads,
+        warm: Warm::Admitted,
+        windows: &[],
+        adapters: &[],
+    }
 }
 
 fn refusal(error: DriverError) -> SpeculationRefusal {
@@ -362,8 +358,10 @@ fn refusal(error: DriverError) -> SpeculationRefusal {
 #[test]
 fn the_dense_fixture_prepares_and_publishes_its_window() {
     let (dense, _dir) = target_handle();
-    let (mut driver, _) = fake_driver(dense, lookup());
-    prepare(&mut driver, &[Head::GREEDY]).unwrap_or_else(|e| panic!("{e}"));
+    let (driver, _) = fake_driver(dense, lookup());
+    let driver = driver
+        .prepare(&contiguous(&[Head::GREEDY]))
+        .unwrap_or_else(|e| panic!("{e}"));
     let caps = driver.caps().unwrap();
     let speculation = caps.speculation.expect("the policy is published");
     assert_eq!((speculation.k.get(), speculation.window.get()), (K, K + 1));
@@ -381,36 +379,32 @@ fn the_dense_fixture_prepares_and_publishes_its_window() {
 #[test]
 fn the_policy_compiles_one_window_entry_per_head_and_off_compiles_none() {
     let (target, _dir) = target_handle();
-    let (mut off, _) = fake_driver(target.clone(), DraftPolicy::Off);
-    prepare(&mut off, &[Head::GREEDY]).unwrap();
+    let (off, _) = fake_driver(target.clone(), DraftPolicy::Off);
+    let off = off.prepare(&contiguous(&[Head::GREEDY])).unwrap();
     assert!(off.caps().unwrap().windows.is_empty());
     assert!(off.caps().unwrap().speculation.is_none());
     let without = off.prepared_entries();
 
-    let (mut greedy, _) = fake_driver(target.clone(), lookup());
-    prepare(&mut greedy, &[Head::GREEDY]).unwrap();
+    let (greedy, _) = fake_driver(target.clone(), lookup());
+    let greedy = greedy.prepare(&contiguous(&[Head::GREEDY])).unwrap();
     assert_eq!(greedy.prepared_entries(), without + 1);
 
-    let (mut sampled, _) = fake_driver(target, lookup());
-    prepare(
-        &mut sampled,
-        &[
+    let (sampled, _) = fake_driver(target, lookup());
+    let sampled = sampled
+        .prepare(&contiguous(&[
             Head::GREEDY,
             Head::Sample(poot_graph_ir::op::SampleRule::Gumbel),
-        ],
-    )
-    .unwrap();
+        ]))
+        .unwrap();
     let sampled_off = {
         let (target, _dir) = target_handle();
-        let (mut off, _) = fake_driver(target, DraftPolicy::Off);
-        prepare(
-            &mut off,
-            &[
+        let (off, _) = fake_driver(target, DraftPolicy::Off);
+        let off = off
+            .prepare(&contiguous(&[
                 Head::GREEDY,
                 Head::Sample(poot_graph_ir::op::SampleRule::Gumbel),
-            ],
-        )
-        .unwrap();
+            ]))
+            .unwrap();
         off.prepared_entries()
     };
     assert_eq!(
@@ -424,9 +418,12 @@ fn the_policy_compiles_one_window_entry_per_head_and_off_compiles_none() {
 /// executor has loaded only the target's weights and no entry exists.
 fn assert_refused_before_any_work(draft: Arc<ModelHandle>) -> DraftMismatch {
     let (target, _dir) = target_handle();
-    let (mut driver, loads) = fake_driver(target, draft_model(draft));
+    let (driver, loads) = fake_driver(target, draft_model(draft));
     assert_eq!(loads.get(), 1, "the target's weights");
-    let error = prepare(&mut driver, &[Head::GREEDY]).expect_err("the draft does not fit");
+    let refused = driver
+        .prepare(&contiguous(&[Head::GREEDY]))
+        .expect_err("the draft does not fit");
+    let (error, driver) = (refused.error, refused.driver);
     let SpeculationRefusal::DraftMismatch(mismatch) = refusal(error) else {
         panic!("not a draft mismatch")
     };
@@ -515,16 +512,13 @@ fn a_draft_with_fewer_positions_than_the_capacity_is_refused_before_any_upload()
 
 /// One decode step of `seq` under the driver's policy, committing nothing.
 fn decode_step(
-    driver: &mut Driver,
+    driver: &mut Driver<Serving>,
     seq: poot_llm::driver::SeqId,
     sampler: &mut Sampler,
 ) -> RowResult {
     let mut rows = [StepRow {
         seq,
-        work: RowWork::Decode {
-            ahead: &[],
-            pick: PickPolicy::Greedy,
-        },
+        work: RowWork::Decode { ahead: &[] },
         sampler,
     }];
     driver
@@ -535,17 +529,13 @@ fn decode_step(
 
 /// Open `prompt` on a prepared driver, prefill it and commit its first token.
 fn open_prefilled(
-    driver: &mut Driver,
+    driver: &mut Driver<Serving>,
     prompt: &[u32],
     max_new: usize,
     sampler: &mut Sampler,
 ) -> poot_llm::driver::SeqId {
     let Admission::Opened { seq, .. } = driver
-        .open(SeqRequest {
-            prompt,
-            max_new,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(prompt, max_new, AdapterRef::Base))
         .unwrap()
     else {
         panic!("a fresh driver admits one sequence")
@@ -583,18 +573,10 @@ fn oracle_rows(store: &WeightStore, tokens: &[u32]) -> Vec<Vec<f32>> {
     let n = tokens.len();
     let fixture = family::fixture();
     let model = registry().build(&fixture.raw(), store).unwrap();
-    let shape = StepShape {
-        rows: NonZeroUsize::MIN,
-        tokens: nz(n),
-        capacity: nz(CAPACITY),
-        kv: KvLayout::Contiguous,
-        logits: LogitRows::All,
-        hidden: None,
-    };
+    let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY)).with_logits(LogitRows::All);
     let graph = model
         .trace(
-            Phase::Prefill,
-            shape,
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
@@ -638,7 +620,12 @@ fn nothing(_: u32, _: &str) -> GenerationControl {
 }
 
 /// `new` tokens after `prompt` by `Driver::generate`, ignoring the end-of-sequence token.
-fn generate(driver: &mut Driver, prompt: &[u32], new: usize, sampler: Sampler) -> Vec<u32> {
+fn generate(
+    driver: &mut Driver<Serving>,
+    prompt: &[u32],
+    new: usize,
+    sampler: Sampler,
+) -> Vec<u32> {
     driver
         .generate(
             GenerateRequest {
@@ -657,14 +644,14 @@ fn generate(driver: &mut Driver, prompt: &[u32], new: usize, sampler: Sampler) -
 /// `new` tokens after `prompt` through the serving surface (`open`, `step`, `commit`): what each
 /// step returned is kept, so a caller can see how many tokens a round committed.
 fn serve(
-    driver: &mut Driver,
+    driver: &mut Driver<Serving>,
     prompt: &[u32],
     new: usize,
     sampler: &mut Sampler,
     heads: &[Head],
 ) -> (Vec<u32>, Vec<usize>) {
     driver
-        .prepare(&ServingShapes {
+        .extend(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],
             heads,
@@ -675,16 +662,12 @@ fn serve(
         .unwrap_or_else(|e| panic!("{e}"));
     let compiled = driver.stats().compiles;
     let Admission::Opened { seq, .. } = driver
-        .open(SeqRequest {
-            prompt,
-            max_new: new,
-            adapter: AdapterRef::Base,
-        })
+        .open(SeqRequest::new(prompt, new, AdapterRef::Base))
         .unwrap()
     else {
         panic!("a fresh driver admits one sequence")
     };
-    let step = |driver: &mut Driver, work, sampler: &mut Sampler| -> RowResult {
+    let step = |driver: &mut Driver<Serving>, work, sampler: &mut Sampler| -> RowResult {
         let mut rows = [StepRow { seq, work, sampler }];
         driver
             .step(&mut rows)
@@ -705,14 +688,7 @@ fn serve(
         if out.len() == new {
             break;
         }
-        result = step(
-            driver,
-            RowWork::Decode {
-                ahead: &[],
-                pick: PickPolicy::Greedy,
-            },
-            sampler,
-        );
+        result = step(driver, RowWork::Decode { ahead: &[] }, sampler);
     }
     driver.release(seq, Release::Finished).unwrap();
     assert_eq!(
@@ -769,7 +745,8 @@ fn assert_off_equals_the_oracle(choice: BackendChoice, backend: DeviceBackend) {
         return;
     };
     let (target, _dir) = target_handle();
-    let mut off = device_driver(target.clone(), executor, DraftPolicy::Off);
+    let mut off =
+        device_driver(target.clone(), executor, DraftPolicy::Off).serve(Layout::Contiguous);
     for prompt in [&REPETITIVE[..], &VARIED[..]] {
         let generated = generate(&mut off, prompt, NEW_TOKENS, Sampler::greedy());
         assert_eq!(
@@ -814,7 +791,7 @@ fn assert_greedy_speculation_equals_off(
     let (target, _target_dir) = target_handle();
     let reference = oracle_greedy(target.store(), prompt, NEW_TOKENS);
     let (policy, _dir) = policy();
-    let mut driver = device_driver(target, executor, policy);
+    let mut driver = device_driver(target, executor, policy).serve(Layout::Contiguous);
     let spoken = generate(&mut driver, prompt, NEW_TOKENS, Sampler::greedy());
     assert_eq!(
         spoken, reference,
@@ -1014,7 +991,7 @@ fn assert_sampled_speculation_matches_the_host_replay(
         SEED,
     );
 
-    let mut driver = device_driver(target, executor, draft_model(draft));
+    let mut driver = device_driver(target, executor, draft_model(draft)).serve(Layout::Contiguous);
     let mut sampler = Sampler::new(1.0, 0, 1.0, SEED);
     let heads = [Head::Sample(poot_graph_ir::op::SampleRule::Gumbel)];
     let (served, rounds) = serve(&mut driver, &PROMPT, NEW_TOKENS, &mut sampler, &heads);
@@ -1056,8 +1033,8 @@ fn assert_rows_report_why_they_did_not_speculate(choice: BackendChoice, backend:
         return;
     };
     let (target, _dir) = target_handle();
-    let mut driver = device_driver(target, executor, lookup());
-    driver
+    let driver = device_driver(target, executor, lookup());
+    let mut driver = driver
         .prepare(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],
@@ -1069,7 +1046,7 @@ fn assert_rows_report_why_they_did_not_speculate(choice: BackendChoice, backend:
         .unwrap_or_else(|e| panic!("{e}"));
     let mut expected = SpeculationStats::default();
     let mut expected_positions = PositionAcceptance::default();
-    let mut round = |driver: &mut Driver,
+    let mut round = |driver: &mut Driver<Serving>,
                      prompt: &[u32],
                      max_new: usize,
                      sampler: &mut Sampler,
@@ -1102,6 +1079,9 @@ fn assert_rows_report_why_they_did_not_speculate(choice: BackendChoice, backend:
                 }
                 RowSpeculation::NotSpeculated(NotSpeculated::NoProposal) => {
                     expected.skipped_no_proposal += 1;
+                }
+                RowSpeculation::NotSpeculated(NotSpeculated::Inputs) => {
+                    expected.skipped_inputs += 1;
                 }
             }
             let kept = result.tokens.len().min(max_new - generated);
@@ -1207,10 +1187,11 @@ fn assert_a_speculating_sequence_fills_its_capacity(choice: BackendChoice, backe
     else {
         return;
     };
-    let mut off = device_driver(target.clone(), reference_executor, DraftPolicy::Off);
+    let mut off = device_driver(target.clone(), reference_executor, DraftPolicy::Off)
+        .serve(Layout::Contiguous);
     let reference = generate(&mut off, prompt, new, Sampler::greedy());
     assert_eq!(reference.len(), new);
-    let mut driver = device_driver(target, executor, lookup());
+    let mut driver = device_driver(target, executor, lookup()).serve(Layout::Contiguous);
     let (served, rounds) = serve(
         &mut driver,
         prompt,
@@ -1262,8 +1243,8 @@ fn assert_a_window_past_the_capacity_is_refused_at_plan_time(
         return;
     };
     let (target, _dir) = target_handle();
-    let mut driver = device_driver(target, executor, DraftPolicy::Off);
-    driver
+    let driver = device_driver(target, executor, DraftPolicy::Off);
+    let mut driver = driver
         .prepare(&ServingShapes {
             layout: Layout::Contiguous,
             rows: &[NonZeroUsize::MIN],
@@ -1281,10 +1262,7 @@ fn assert_a_window_past_the_capacity_is_refused_at_plan_time(
     let ahead = vec![1u32; CAPACITY - prompt.len()];
     let mut rows = [StepRow {
         seq,
-        work: RowWork::Decode {
-            ahead: &ahead,
-            pick: PickPolicy::Greedy,
-        },
+        work: RowWork::Decode { ahead: &ahead },
         sampler: &mut sampler,
     }];
     let error = driver.step(&mut rows).unwrap_err();
@@ -1299,10 +1277,7 @@ fn assert_a_window_past_the_capacity_is_refused_at_plan_time(
     let ahead = vec![1u32; K];
     let mut rows = [StepRow {
         seq,
-        work: RowWork::Decode {
-            ahead: &ahead,
-            pick: PickPolicy::Greedy,
-        },
+        work: RowWork::Decode { ahead: &ahead },
         sampler: &mut sampler,
     }];
     driver.step(&mut rows).unwrap_or_else(|e| panic!("{e}"));
@@ -1365,7 +1340,7 @@ fn assert_sampled_prompt_lookup_matches_the_host_replay(
         ngram: nz(1),
         k: nz(K),
     };
-    let mut driver = device_driver(target, executor, policy);
+    let mut driver = device_driver(target, executor, policy).serve(Layout::Contiguous);
     let mut sampler = Sampler::new(COLD, 0, 1.0, SEED);
     let heads = [Head::Sample(poot_graph_ir::op::SampleRule::Gumbel)];
     let (served, rounds) = serve(&mut driver, &prompt, NEW_TOKENS, &mut sampler, &heads);
@@ -1415,12 +1390,12 @@ struct PagedOutput {
 /// row's next prefill piece or decode round, so a short prompt decodes (and speculates) while a long
 /// one is still prefilling. Each row commits what its step returned, up to `new` tokens.
 fn serve_paged(
-    driver: &mut Driver,
+    driver: Driver,
     mut rows: Vec<PagedRow>,
     new: usize,
     heads: &[Head],
 ) -> Vec<PagedOutput> {
-    driver
+    let mut driver = driver
         .prepare(&ServingShapes {
             layout: Layout::Paged(PoolShape {
                 blocks: nz(16),
@@ -1438,11 +1413,7 @@ fn serve_paged(
         .iter()
         .map(|row| {
             match driver
-                .open(SeqRequest {
-                    prompt: &row.prompt,
-                    max_new: new,
-                    adapter: AdapterRef::Base,
-                })
+                .open(SeqRequest::new(&row.prompt, new, AdapterRef::Base))
                 .unwrap()
             {
                 Admission::Opened { seq, .. } => seq,
@@ -1469,10 +1440,7 @@ fn serve_paged(
             .map(|(i, row)| StepRow {
                 seq: seqs[i],
                 work: if prefilled[i] {
-                    RowWork::Decode {
-                        ahead: &[],
-                        pick: PickPolicy::Greedy,
-                    }
+                    RowWork::Decode { ahead: &[] }
                 } else {
                     RowWork::Prefill {
                         upto: row.prompt.len(),
@@ -1529,7 +1497,7 @@ fn assert_two_paged_greedy_rows_equal_off(choice: BackendChoice, backend: Device
         .iter()
         .map(|prompt| oracle_greedy(target.store(), prompt, NEW_TOKENS))
         .collect();
-    let mut driver = device_driver(target, executor, lookup());
+    let driver = device_driver(target, executor, lookup());
     let rows = prompts
         .iter()
         .map(|prompt| PagedRow {
@@ -1537,7 +1505,7 @@ fn assert_two_paged_greedy_rows_equal_off(choice: BackendChoice, backend: Device
             sampler: Sampler::greedy(),
         })
         .collect();
-    let served = serve_paged(&mut driver, rows, NEW_TOKENS, &[Head::GREEDY]);
+    let served = serve_paged(driver, rows, NEW_TOKENS, &[Head::GREEDY]);
     for (i, (row, reference)) in served.iter().zip(&references).enumerate() {
         assert_eq!(&row.tokens, reference, "row {i} differs from Off");
         assert!(
@@ -1595,7 +1563,7 @@ fn assert_paged_mixed_draft_rows_match(choice: BackendChoice, backend: DeviceBac
     };
     let references = [replay(&short_prompt, SEED), replay(&long_prompt, SEED + 1)];
 
-    let mut driver = device_driver(target.clone(), executor, draft_model(draft.clone()));
+    let driver = device_driver(target.clone(), executor, draft_model(draft.clone()));
     let rows = vec![
         PagedRow {
             prompt: greedy_prompt,
@@ -1616,7 +1584,7 @@ fn assert_paged_mixed_draft_rows_match(choice: BackendChoice, backend: DeviceBac
         Head::Sample(poot_graph_ir::op::SampleRule::Gumbel),
         Head::Logits,
     ];
-    let served = serve_paged(&mut driver, rows, NEW_TOKENS, &heads);
+    let served = serve_paged(driver, rows, NEW_TOKENS, &heads);
     assert_eq!(
         served[0].tokens, greedy_reference,
         "the greedy row differs from Off"

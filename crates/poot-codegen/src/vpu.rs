@@ -120,13 +120,6 @@ pub enum VpuOp {
     },
     /// `Convert` to the node's output element type.
     Convert,
-    /// The `Convert` that narrows a region input to the device's arithmetic width on entry (POOT-1178). Its
-    /// `origin` is the input's value id; the layer is named `v<origin>_narrow`.
-    NarrowEntry,
-    /// The `Convert` that widens a narrowed result back to the width the program stores it in on exit
-    /// (POOT-1178). Its `origin` is the result's equation; the layer is named `v<origin>_widen`, and that
-    /// layer, not the narrowed one, is the result.
-    WidenExit,
     /// The range `0..len` as a rank-1 `Const` of the node's element type (`F32` or `I32`). No operands.
     Iota {
         /// The number of elements.

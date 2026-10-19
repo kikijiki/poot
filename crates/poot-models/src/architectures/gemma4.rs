@@ -22,11 +22,11 @@ use crate::components::linear::{Weight, WeightError};
 use crate::components::moe::{MoeWeights, moe};
 use crate::components::norm::norm;
 use crate::components::standard::{
-    LayerNorms, LayerScale, StackWeights, Step, check_step, standard_layer, standard_stack,
+    LayerNorms, LayerScale, StackWeights, Step, check_step, decoder_program, standard_layer,
+    standard_stack,
 };
-use crate::model::{
-    FamilyKey, Model, ModelConfig, ModelError, ModelOutput, Phase, StepShape, TraceError,
-};
+use crate::io::ModelSchema;
+use crate::model::{FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::{
     GGUF_BASE, GGUF_GEMMA4, GGUF_GEMMA4_MOE, GGUF_QK_NORM, GGUF_SANDWICH_NORMS,
 };
@@ -234,6 +234,7 @@ pub struct Gemma4 {
     stack: StackWeights,
     layers: Vec<Layer>,
     config: ModelConfig,
+    schema: ModelSchema,
 }
 
 fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
@@ -298,6 +299,9 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         })
         .collect::<Result<Vec<_>, WeightError>>()
         .map_err(weight_error)?;
+    let schema = ModelSchema::builder()
+        .step(decoder_program(p.vocab))
+        .build_for(FAMILY)?;
     let config = ModelConfig {
         family: FAMILY,
         vocab: p.vocab,
@@ -306,7 +310,6 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         bos: p.bos,
         // Gemma is trained with a mandatory BOS.
         prompt_bos: Some(p.bos.unwrap_or(GEMMA_BOS)),
-        output: ModelOutput::Logits { vocab: p.vocab },
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Gemma,
     };
@@ -316,6 +319,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         stack,
         layers,
         config,
+        schema,
     }))
 }
 
@@ -324,13 +328,18 @@ impl Model for Gemma4 {
         &self.config
     }
 
+    fn schema(&self) -> &ModelSchema {
+        &self.schema
+    }
+
     fn weights(&self) -> &WeightMap {
         &self.weights
     }
 
-    fn trace_into(&self, phase: Phase, shape: StepShape, b: Builder) -> Result<Graph, TraceError> {
+    fn trace_into(&self, spec: &StepSpec, b: Builder) -> Result<Graph, TraceError> {
         let p = &self.params;
-        check_step(FAMILY, phase, shape, p.max_positions)?;
+        let shape = spec.shape;
+        check_step(FAMILY, shape, p.max_positions)?;
         let step = Step::new(&b, shape)?;
         let logits = standard_stack(&b, &step, &self.stack, &p.stack, p.layers, |b, l, x| {
             let layer = &self.layers[l];
@@ -804,7 +813,7 @@ mod tests {
         let model = model_of(fx, &fx.store);
         let prompt = [3usize, 17, 40, 8, 25, 9, 11];
         let tokens: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-        let (got, _) = run_step(&*model, &fx.store, Phase::Prefill, CAP, &tokens, 0, &[]);
+        let (got, _) = run_step(&*model, &fx.store, CAP, &tokens, 0, &[]);
         let reference = Reference {
             store: &fx.store,
             text: &fx.config["text_config"],
@@ -841,7 +850,7 @@ mod tests {
         let model = model_of(&fx, &store);
         let prompt = [3usize, 17, 40, 8, 25];
         let tokens: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-        let (got, _) = run_step(&*model, &store, Phase::Prefill, CAP, &tokens, 0, &[]);
+        let (got, _) = run_step(&*model, &store, CAP, &tokens, 0, &[]);
         let reference = Reference {
             store: &fx.store,
             text: &fx.config["text_config"],
@@ -1040,8 +1049,8 @@ mod tests {
             .build(&RawConfig::Gguf(&index), &store)
             .unwrap_or_else(|e| panic!("{e}"));
         let tokens = [3, 17, 40, 8, 25, 9, 11];
-        let (want, _) = run_step(&*hf, &fx.store, Phase::Prefill, CAP, &tokens, 0, &[]);
-        let (got, _) = run_step(&*gguf, &store, Phase::Prefill, CAP, &tokens, 0, &[]);
+        let (want, _) = run_step(&*hf, &fx.store, CAP, &tokens, 0, &[]);
+        let (got, _) = run_step(&*gguf, &store, CAP, &tokens, 0, &[]);
         crate::components::testing::close(&got, &want);
     }
 

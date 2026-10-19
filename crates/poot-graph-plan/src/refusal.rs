@@ -89,6 +89,15 @@ pub enum Capability {
         /// The target's limit along it.
         limit: usize,
     },
+    /// The greedy pick publishes each winner's index as an f32 (the partials scratch and the `[rows, 2]`
+    /// pair), and an f32 holds every integer only up to `2^24`: a vocabulary past `limit` has indices the
+    /// route would round, so the planner refuses it instead of returning a wrong token id.
+    ArgmaxIndexNotExact {
+        /// The logits' last-axis extent.
+        vocab: usize,
+        /// The largest vocabulary whose every index is an exact f32 integer (`2^24`).
+        limit: usize,
+    },
     /// The op has no I32 kernel (reduction, row fusion, a division without total exact semantics, a unary
     /// that is not an exact integer primitive, a remainder by a literal zero). Every such refusal names a
     /// missing kernel: an I32 value is always stored as I32 words.
@@ -256,10 +265,6 @@ pub enum FusedStepGap {
 /// wrong element width. Unlike a [`Refusal`], this concerns a value, not an equation, and no target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageGap {
-    /// E4M3FN values need authoritative raw bytes or packed-row storage.
-    E4m3RawBytes,
-    /// BF16 values need the packed u32 lanes only the typed value walk and the decode BF16 GEMV lane store.
-    Bf16PackedLanes,
     /// An F16 dense-contraction weight is stored packed two elements per `u32` word (Card 1007), so it must be a
     /// const no other equation reads and no output observes.
     F16PackedLanes,
@@ -425,6 +430,10 @@ impl fmt::Display for Capability {
                 f,
                 "the dispatch needs {workgroups} workgroups along grid axis {axis}, above the target's limit {limit}"
             ),
+            Capability::ArgmaxIndexNotExact { vocab, limit } => write!(
+                f,
+                "the argmax route carries token indices as f32, exact only up to {limit}; a vocabulary of {vocab} would round them"
+            ),
             Capability::ExactI32Op => f.write_str("no I32 kernel for this op"),
             Capability::UnfoldedIota => f.write_str(
                 "iota must be folded to a computed constant before planning (transform::fold_iota)",
@@ -539,12 +548,6 @@ impl fmt::Display for FusedStepGap {
 impl fmt::Display for StorageGap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StorageGap::E4m3RawBytes => f.write_str(
-                "generic executor tensors carry neither authoritative raw bytes nor packed-row storage",
-            ),
-            StorageGap::Bf16PackedLanes => f.write_str(
-                "an executor tensor is four-byte f32 words, not the packed u32 lanes a BF16 consumer reads",
-            ),
             StorageGap::F16PackedLanes => f.write_str(
                 "a packed-F16 dense-contraction weight must be a const read only by dense contractions, \
                  not a computed value, an output or a buffer another kernel reads natively",

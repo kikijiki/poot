@@ -218,7 +218,7 @@ fn masked_attention_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -261,7 +261,7 @@ fn swiglu_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -387,7 +387,7 @@ fn fused_gpu_matches_cpu_over_random_graphs() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -557,7 +557,7 @@ fn movement_gpu_matches_cpu_over_random_graphs() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

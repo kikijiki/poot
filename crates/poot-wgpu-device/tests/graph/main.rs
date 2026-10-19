@@ -22,7 +22,7 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor};
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::ops::{attention_masked, rmsnorm};
@@ -136,10 +136,7 @@ fn staged_replay(
                 poot_graph_plan::multi_device::topology::DeviceId(0),
             ),
         },
-        &poot_graph_plan::CompileOptions::new(
-            poot_graph_plan::production_plan::Submission::Replay,
-            poot_graph_plan::CompileLimits::STANDARD,
-        ),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .unwrap()
 }
@@ -441,15 +438,11 @@ fn check_gdn_prefill_chunked_gpu(
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(
-            &graph,
-            &eval_inputs,
-            EvalOptions::new(EvalBudget::UNBOUNDED),
-        )
-        .unwrap()
-        .output
-        .into_host()
-        .unwrap();
+        let cpu = eval(&graph, &eval_inputs, EvalOptions::default())
+            .unwrap()
+            .output
+            .into_host()
+            .unwrap();
         let got = run_via_contract(exec, target, &graph, &inputs);
         assert_eq!(
             got.shape(),
@@ -491,10 +484,7 @@ fn compile_full(g: &poot_graph_ir::Graph, target: &Target) -> poot_graph_plan::P
     poot_graph_plan::compile(
         g,
         target,
-        &poot_graph_plan::CompileOptions::new(
-            poot_graph_plan::production_plan::Submission::Replay,
-            poot_graph_plan::CompileLimits::STANDARD,
-        ),
+        &poot_graph_plan::CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("the graph compiles")
 }

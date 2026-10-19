@@ -9,12 +9,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{Graph, GraphEdit, KvBound, OpKind, Operand, Slot, ValueId};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, Program, Target, compile, production_plan::Submission,
-};
-use poot_models::model::{LogitRows, Phase};
+use poot_graph_plan::{CompileLimits, CompileOptions, Program, Target, compile};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_target::{AmdArch, Backend};
 use poot_tensor::{DType, HostTensor};
@@ -38,8 +36,7 @@ fn decode_graph() -> Graph {
         .zeroed_model(DType::BF16)
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, CAPACITY, LogitRows::Last),
+            &StepSpec::step(step(1, 1, CAPACITY, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("Qwen3 traces a decode step")
@@ -50,7 +47,7 @@ fn compiled(g: &Graph, backend: Backend) -> Program {
         backend,
         caps: default_caps_for(backend),
     };
-    let options = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
+    let options = CompileOptions::new(CompileLimits::STANDARD);
     compile(g, &target, &options).expect("the decode graph compiles")
 }
 
@@ -106,7 +103,7 @@ fn live_length(g: &Graph, len: ValueId) -> i32 {
     draft.set_result(len);
     let pruned = draft.commit().expect("the length slice is a graph");
     let inputs = HashMap::from([(*pos, Value::from(HostTensor::i32(vec![1, 1], vec![POS])))]);
-    let out = eval(&pruned, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let out = eval(&pruned, &inputs, EvalOptions::default())
         .expect("the length evaluates")
         .output
         .into_host()

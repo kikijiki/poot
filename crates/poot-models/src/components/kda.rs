@@ -511,10 +511,12 @@ mod tests {
         let p = params();
         let w = KdaWeights::new(&fx.map(), 0, WIDTH, &p).unwrap();
         let b = Builder::for_tests();
-        let shape = crate::model::StepShape {
-            rows: std::num::NonZeroUsize::new(2).unwrap(),
-            ..step_shape(TOKENS, CAP, LogitRows::All)
-        };
+        let shape = crate::model::StepShape::new(
+            std::num::NonZeroUsize::new(2).unwrap(),
+            std::num::NonZeroUsize::new(TOKENS).unwrap(),
+            std::num::NonZeroUsize::new(CAP).unwrap(),
+        )
+        .with_logits(LogitRows::All);
         let step = Step::new(&b, shape).unwrap();
         let xs = b
             .constant("x", TensorType::f32(vec![2, TOKENS, WIDTH]))

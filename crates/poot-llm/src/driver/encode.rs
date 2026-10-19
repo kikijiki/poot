@@ -1,10 +1,11 @@
-//! [`Driver::encode`]: one `Encode` step over a batch of rows, returning each row's final hidden
-//! states (or scores) for the host to pool or rank (POOT-739, dmodel `Phase::Encode`).
+//! [`Driver::encode`]: one `encode` step over a batch of rows, returning each row's final hidden
+//! states (or scores) for the host to pool or rank (POOT-739).
 //!
-//! The rows are either token sequences (an embedding or reranking encoder, or a decoder's embedding
-//! pass), image frames (a vision tower of a fixed grid) or patch rows (a vision tower whose windows
-//! depend on the image's grid). A step runs on one entry of its shape, prepared on first
-//! use like `generate`'s and kept under the same limits; token rows are different: their entries are
+//! A row is a token sequence (an embedding or reranking encoder, or a decoder's embedding pass), a set
+//! of per-row request inputs (a vision tower's image values and grid), or both: [`EncodeRow`] is generic and
+//! its values are checked against the model's schema like a served request's. A step runs on one entry
+//! of its shape, prepared on first use like `generate`'s and kept under the same limits; token rows
+//! are different: their entries are
 //! admitted by [`Driver::prepare_encode`] before serving, at a fixed row count and every power-of-two
 //! length up to the longest row, and a step runs on the smallest prepared length holding its longest
 //! row (a padded position is masked, never attended to; a padded row is dropped from the answer). A
@@ -14,15 +15,20 @@
 
 use std::num::NonZeroUsize;
 
-use poot_executor::{ExecError, ExecutableId};
-use poot_models::model::{KvLayout, LogitRows, Phase, StepShape, TraceError};
-use poot_models::qwen_vl_vision::PatchGeometry;
+use std::sync::Arc;
 
+use poot_executor::{ExecError, ExecutableId};
+use poot_models::io::{
+    InputSet, InputValue, ModelSchema, Per, ProgramId, ProgramSpec, RequestInputs,
+};
+use poot_models::model::{LogitRows, StepShape, TraceError};
+
+use super::bind::{self, RequestFrame, RowFeed, Side, StepColumns};
 use super::caps::DriverCaps;
 use super::error::{DriverError, EncodeError, InvalidOptions, InvalidRequest, Unsupported};
 use super::host_sample;
 use super::suffix::Head;
-use super::{Driver, EntryKey, ModelRole, SlotRole, StepData};
+use super::{Driver, EntryKey, Feature, Incompatible, ModelRole, Program, State};
 
 /// The token-row shapes a driver prepares for encoding: `rows` rows per step, every length a step
 /// can pad to up to `max_len`.
@@ -64,39 +70,22 @@ pub struct EncodeCaps {
     pub lengths: Vec<NonZeroUsize>,
 }
 
-/// One row of an encode step.
+/// One row of an encode step: the token ids of an encoder's or a decoder's embedding pass, the values
+/// of the inputs the `encode` program reads for it (a segment id per token, a tower's image values and
+/// grid), or both. Its extent is its token count, else the leading extent of its per-row inputs, else
+/// the positions the program fixes.
 #[derive(Clone, Copy, Debug)]
-pub enum EncodeRow<'a> {
-    /// A token sequence, with each token's segment id (`types` is empty for all-zero ids; a
-    /// cross-encoder's second sentence carries ones).
-    Tokens {
-        /// Token ids of the row.
-        ids: &'a [u32],
-        /// Segment id of each token, or empty for all zeros.
-        types: &'a [u32],
-    },
-    /// One image frame of a vision tower: its normalized pixels, channel first, and the positions
-    /// (patches) the tower traces per frame.
-    Frame {
-        /// Normalized pixel values, channel first.
-        pixels: &'a [f32],
-        /// Positions (patches) the tower traces for the frame.
-        positions: usize,
-    },
-    /// One image or video of a windowed vision tower: its patches in the tower's window order
-    /// (`patch_dim` values each) and the grid facts the tower attends and rotates by.
-    Patches {
-        /// The patches' pixel values in the tower's window order.
-        pixels: &'a [f32],
-        /// Grid facts the tower attends and rotates by.
-        geometry: &'a PatchGeometry,
-    },
+pub struct EncodeRow<'a> {
+    /// The row's token ids; `None` for a row of a program that reads none (a vision tower's).
+    pub tokens: Option<&'a [u32]>,
+    /// The values the row supplies for the program's request inputs.
+    pub inputs: &'a RequestInputs,
 }
 
-/// What one [`Driver::encode`] step runs: every row of one kind.
+/// What one [`Driver::encode`] step runs: every row of one extent.
 #[derive(Clone, Copy, Debug)]
 pub struct EncodeRequest<'a> {
-    /// The rows of the step; every row is one kind.
+    /// The rows of the step; every row has the same extent and carries the same inputs.
     pub rows: &'a [EncodeRow<'a>],
 }
 
@@ -111,7 +100,7 @@ pub struct Encoded {
     pub rows: Vec<Vec<f32>>,
 }
 
-impl Driver {
+impl<S: State> Driver<S> {
     /// Turn a failed encode step into the driver's answer. The step graph's cache is scratch no later
     /// step reads, so a device failure that left the device usable (a fault, a failed transaction) is
     /// proven recoverable by resetting the executable's state: that is [`DriverError::EncodeStep`].
@@ -133,14 +122,18 @@ impl Driver {
     /// caps. This is the only place token-row entries are compiled; [`Driver::encode`] refuses a shape
     /// that is not prepared.
     pub fn prepare_encode(&mut self, shapes: &EncodeShapes) -> Result<&DriverCaps, DriverError> {
-        if self.encode_shapes.is_some_and(|held| held != *shapes) {
+        if self
+            .ledger
+            .encode_shapes
+            .is_some_and(|held| held != *shapes)
+        {
             return Err(InvalidOptions::EncodeShapesChanged.into());
         }
         for len in shapes.lengths() {
             self.prepared(Self::token_key(shapes.rows, len))?;
         }
-        self.encode_shapes = Some(*shapes);
-        Ok(self.refresh_caps(self.layout))
+        self.ledger.encode_shapes = Some(*shapes);
+        Ok(self.refresh_caps())
     }
 
     /// [`Driver::prepare_encode`] for a model that may not encode at all (a generative family whose body
@@ -150,44 +143,38 @@ impl Driver {
         match self.prepare_encode(shapes) {
             Ok(_) => Ok(true),
             Err(DriverError::Unsupported(
-                Unsupported::Trace(TraceError::PhaseUnsupported { .. })
-                | Unsupported::Placement { .. },
+                Unsupported::Trace(TraceError::ProgramUnsupported { .. })
+                | Unsupported::Incompatible(Incompatible {
+                    first: Feature::Encode,
+                    ..
+                }),
             )) => Ok(false),
             Err(other) => Err(other),
         }
     }
 
-    fn token_key(rows: NonZeroUsize, tokens: NonZeroUsize) -> EntryKey {
+    /// The entry key of an encode step of `rows` rows of `tokens` positions each, carrying the
+    /// carriable inputs `carried` and, when the rows hold padded per-row inputs, their leading extent.
+    fn encode_key(
+        rows: NonZeroUsize,
+        tokens: NonZeroUsize,
+        row_extent: Option<NonZeroUsize>,
+        carried: InputSet,
+    ) -> EntryKey {
         EntryKey {
             role: ModelRole::Target,
-            phase: Phase::Encode,
-            shape: StepShape {
-                rows,
-                tokens,
-                capacity: tokens,
-                kv: KvLayout::Contiguous,
-                logits: LogitRows::All,
-                hidden: None,
-            },
+            program: Program::Encode,
+            shape: StepShape::new(rows, tokens, tokens)
+                .with_logits(LogitRows::All)
+                .with_row_extent(row_extent),
             head: Head::Logits,
             adapters: None,
+            carried,
         }
     }
 
-    /// The lazily prepared entry of a frame or patch step: its shape comes from the image, so it is
-    /// prepared on first use. Not reachable from the engine thread (it only sends token rows), but it is
-    /// reachable from a served image chat: the vision worker's own driver encodes frames after startup,
-    /// outside the engine plan's fit. Making that a prepared, accounted shape is the driver input
-    /// contract (POOT-1224).
-    fn prepared_frames(
-        &mut self,
-        rows: usize,
-        positions: usize,
-    ) -> Result<(EntryKey, super::Prepared), DriverError> {
-        let tokens = NonZeroUsize::new(positions).expect("a row has a position");
-        let key = Self::token_key(NonZeroUsize::new(rows).expect("checked non-empty"), tokens);
-        let entry = self.prepared(key)?;
-        Ok((key, entry))
+    fn token_key(rows: NonZeroUsize, tokens: NonZeroUsize) -> EntryKey {
+        Self::encode_key(rows, tokens, None, InputSet::EMPTY)
     }
 
     /// Run one encode step over `request`'s rows.
@@ -196,145 +183,140 @@ impl Driver {
         if rows.is_empty() {
             return Err(InvalidRequest::Encode(EncodeError::Empty).into());
         }
-        if self
-            .serving
-            .as_ref()
-            .is_some_and(|serving| !serving.seqs.is_empty())
-        {
+        if self.state.open_sequences() > 0 {
             return Err(InvalidRequest::Encode(EncodeError::SequenceOpen).into());
         }
         let n = rows.len();
-        // The key's row count: a token step runs at the prepared rows (the rest pad), any other kind at
-        // the request's own.
-        let (key, entry) = match rows[0] {
-            EncodeRow::Tokens { .. } => {
-                let shapes = self
-                    .encode_shapes
-                    .ok_or(InvalidRequest::Encode(EncodeError::NotPrepared))?;
-                if n > shapes.rows.get() {
-                    return Err(InvalidRequest::Encode(EncodeError::TooManyRows {
-                        rows: n,
-                        max: shapes.rows.get(),
+        let handle = Arc::clone(&self.handle);
+        let schema = handle.model().schema();
+        let program =
+            schema
+                .encode()
+                .ok_or(Unsupported::Trace(TraceError::ProgramUnsupported {
+                    family: handle.config().family,
+                    program: ProgramId::ENCODE,
+                }))?;
+        // Each row's extent: its tokens, its padded per-row inputs' leading axis, else the positions
+        // the program fixes. Checked once, here, like a served request's inputs.
+        let mut extents = Vec::with_capacity(n);
+        for (row, entry) in rows.iter().enumerate() {
+            let tokens = entry.tokens.map_or(0, <[u32]>::len);
+            if entry.tokens.is_some() && tokens == 0 {
+                return Err(InvalidRequest::Encode(EncodeError::EmptyRow { row }).into());
+            }
+            schema
+                .check_request(program, entry.inputs, tokens)
+                .map_err(InvalidRequest::Input)?;
+            let padded = padded_extent(schema, program, entry.inputs)
+                .map_err(|()| InvalidRequest::Encode(EncodeError::RaggedRow { row }))?;
+            let positions = if tokens > 0 {
+                tokens
+            } else {
+                padded
+                    .or(program.positions().map(NonZeroUsize::get))
+                    .ok_or(InvalidRequest::Encode(EncodeError::EmptyRow { row }))?
+            };
+            // A row of no positions has nothing to encode (and no entry shape).
+            if positions == 0 {
+                return Err(InvalidRequest::Encode(EncodeError::EmptyRow { row }).into());
+            }
+            extents.push((positions, padded));
+        }
+        let with_tokens = rows[0].tokens.is_some();
+        if rows.iter().any(|row| row.tokens.is_some() != with_tokens) {
+            return Err(InvalidRequest::Encode(EncodeError::Mixed).into());
+        }
+        let row_extent = extents[0].1.and_then(NonZeroUsize::new);
+        if extents
+            .iter()
+            .any(|&(_, padded)| padded.and_then(NonZeroUsize::new) != row_extent)
+        {
+            return Err(InvalidRequest::Encode(EncodeError::Mixed).into());
+        }
+        let fed: Vec<usize> = extents.iter().map(|&(positions, _)| positions).collect();
+        let feeds: Vec<RowFeed<'_>> = rows
+            .iter()
+            .zip(&fed)
+            .map(|(row, &fed)| RowFeed {
+                inputs: row.inputs,
+                start: 0,
+                fed,
+            })
+            .collect();
+        let carried = bind::carried(schema, program, &feeds);
+        // A token step runs at the prepared rows and the prepared length that holds its longest row (the
+        // rest pad); any other step at the request's own rows and extent.
+        let (key, entry) = if with_tokens {
+            let shapes = self
+                .ledger
+                .encode_shapes
+                .ok_or(InvalidRequest::Encode(EncodeError::NotPrepared))?;
+            if n > shapes.rows.get() {
+                return Err(InvalidRequest::Encode(EncodeError::TooManyRows {
+                    rows: n,
+                    max: shapes.rows.get(),
+                })
+                .into());
+            }
+            let mut longest = 0;
+            for (row, &tokens) in fed.iter().enumerate() {
+                if tokens > shapes.max_len.get() {
+                    return Err(InvalidRequest::Encode(EncodeError::RowTooLong {
+                        row,
+                        tokens,
+                        max: shapes.max_len.get(),
                     })
                     .into());
                 }
-                let mut longest = 0;
-                for (row, entry) in rows.iter().enumerate() {
-                    let EncodeRow::Tokens { ids, types } = *entry else {
-                        return Err(InvalidRequest::Encode(EncodeError::Mixed).into());
-                    };
-                    if ids.is_empty() {
-                        return Err(InvalidRequest::Encode(EncodeError::EmptyRow { row }).into());
-                    }
-                    if !types.is_empty() && types.len() != ids.len() {
-                        return Err(InvalidRequest::Encode(EncodeError::TokenTypes {
-                            row,
-                            tokens: ids.len(),
-                            types: types.len(),
-                        })
-                        .into());
-                    }
-                    if ids.len() > shapes.max_len.get() {
-                        return Err(InvalidRequest::Encode(EncodeError::RowTooLong {
-                            row,
-                            tokens: ids.len(),
-                            max: shapes.max_len.get(),
-                        })
-                        .into());
-                    }
-                    longest = longest.max(ids.len());
-                }
-                let len = shapes
-                    .lengths()
-                    .into_iter()
-                    .find(|len| len.get() >= longest)
-                    .expect("the longest length is max_len, which holds every checked row");
-                let key = Self::token_key(shapes.rows, len);
-                let entry = self
-                    .entries
-                    .get(&key)
-                    .cloned()
-                    .ok_or(InvalidRequest::Encode(EncodeError::NotPrepared))?;
-                (key, entry)
+                longest = longest.max(tokens);
             }
-            EncodeRow::Patches { geometry, .. } => {
-                let positions = geometry.patches();
-                if rows.iter().any(
-                    |row| !matches!(row, EncodeRow::Patches { geometry, .. } if geometry.patches() == positions),
-                ) {
-                    return Err(InvalidRequest::Encode(EncodeError::Mixed).into());
-                }
-                self.prepared_frames(n, positions)?
+            let len = shapes
+                .lengths()
+                .into_iter()
+                .find(|len| len.get() >= longest)
+                .expect("the longest length is max_len, which holds every checked row");
+            let key = Self::encode_key(shapes.rows, len, row_extent, carried);
+            let entry = self
+                .ledger
+                .entries
+                .get(&key)
+                .cloned()
+                .ok_or(InvalidRequest::Encode(EncodeError::NotPrepared))?;
+            (key, entry)
+        } else {
+            let positions = NonZeroUsize::new(fed[0]).expect("a row has a position");
+            if fed.iter().any(|&f| f != positions.get()) {
+                return Err(InvalidRequest::Encode(EncodeError::Mixed).into());
             }
-            EncodeRow::Frame { positions, .. } => {
-                if rows.iter().any(
-                    |row| !matches!(row, EncodeRow::Frame { positions: p, .. } if *p == positions),
-                ) {
-                    return Err(InvalidRequest::Encode(EncodeError::Mixed).into());
-                }
-                self.prepared_frames(n, positions)?
-            }
+            let rows = NonZeroUsize::new(n).expect("checked non-empty");
+            let key = Self::encode_key(rows, positions, row_extent, carried);
+            let entry = self.prepared(key)?;
+            (key, entry)
         };
         let batch = key.shape.rows.get();
         let width = key.shape.tokens.get();
-        let mut data = StepData {
+        let mut columns = StepColumns {
             tokens: vec![0; batch * width],
             pos: (0..batch).flat_map(|_| 0..width as i32).collect(),
-            token_type: vec![0; batch * width],
-            attention_mask: vec![0; batch * width],
-            ..StepData::default()
+            real: vec![0; batch * width],
+            ..StepColumns::default()
         };
-        let frame = entry
-            .slots
-            .iter()
-            .find(|spec| spec.role == SlotRole::Pixels)
-            .map(|spec| spec.shape[1..].iter().product::<usize>());
         for (i, row) in rows.iter().enumerate() {
-            match *row {
-                EncodeRow::Tokens { ids, types } => {
-                    for (j, &id) in ids.iter().enumerate() {
-                        data.tokens[i * width + j] = id as i32;
-                        data.attention_mask[i * width + j] = 1;
-                        if let Some(&kind) = types.get(j) {
-                            data.token_type[i * width + j] = kind as i32;
-                        }
-                    }
-                }
-                EncodeRow::Patches { pixels, geometry } => {
-                    if !entry.slots.iter().any(|spec| spec.role == SlotRole::Window) {
-                        return Err(InvalidRequest::Encode(EncodeError::NoGeometry).into());
-                    }
-                    let want = frame.unwrap_or(0);
-                    if pixels.len() != want {
-                        return Err(InvalidRequest::Encode(EncodeError::FrameLength {
-                            row: i,
-                            got: pixels.len(),
-                            want,
-                        })
-                        .into());
-                    }
-                    data.pixels.extend_from_slice(pixels);
-                    data.pos_h.extend_from_slice(geometry.pos_h());
-                    data.pos_w.extend_from_slice(geometry.pos_w());
-                    data.window.extend_from_slice(geometry.window());
-                    data.frame.extend_from_slice(geometry.frame());
-                }
-                EncodeRow::Frame { pixels, .. } => {
-                    let want = frame.unwrap_or(0);
-                    if pixels.len() != want {
-                        return Err(InvalidRequest::Encode(EncodeError::FrameLength {
-                            row: i,
-                            got: pixels.len(),
-                            want,
-                        })
-                        .into());
-                    }
-                    data.pixels.extend_from_slice(pixels);
+            let held = fed[i];
+            for j in 0..held {
+                columns.real[i * width + j] = 1;
+                if let Some(tokens) = row.tokens {
+                    columns.tokens[i * width + j] = tokens[j] as i32;
                 }
             }
         }
-
-        let mut outputs = match self.execute(&entry, &data) {
+        let frame = RequestFrame {
+            rows: batch,
+            tokens: width,
+            side: Side::Right,
+            feeds: &feeds,
+        };
+        let mut outputs = match self.execute(&entry, &columns, &frame) {
             Ok(outputs) => outputs,
             Err(error) => return Err(self.recover_encode(entry.exe, error)),
         };
@@ -344,14 +326,15 @@ impl Driver {
         };
         debug_assert_eq!(out_rows, batch);
         let per_row = positions * out_width;
-        let rows = rows
+        let rows = fed
             .iter()
             .enumerate()
-            .map(|(i, row)| {
-                let kept = match *row {
-                    // A hidden-state model returns every padded position; its real ones lead.
-                    EncodeRow::Tokens { ids, .. } if positions == width => ids.len(),
-                    _ => positions,
+            .map(|(i, &held)| {
+                // A hidden-state model returns every padded position; its real ones lead.
+                let kept = if with_tokens && positions == width {
+                    held
+                } else {
+                    positions
                 };
                 out[i * per_row..i * per_row + kept * out_width].to_vec()
             })
@@ -362,4 +345,31 @@ impl Driver {
             rows,
         })
     }
+}
+
+/// The leading extent of the padded per-row inputs `inputs` holds for `program`: `None` when it holds
+/// none, `Err` when two of them disagree.
+fn padded_extent(
+    schema: &ModelSchema,
+    program: &ProgramSpec,
+    inputs: &RequestInputs,
+) -> Result<Option<usize>, ()> {
+    let mut extent = None;
+    for (id, _) in program.reads() {
+        let Some(input) = schema.input(*id) else {
+            continue;
+        };
+        let Per::Row { padded: true, .. } = input.form().per() else {
+            continue;
+        };
+        let Some(InputValue::Row(tensor)) = inputs.get(*id) else {
+            continue;
+        };
+        let leading = tensor.shape().first().copied().unwrap_or(0);
+        if extent.is_some_and(|held| held != leading) {
+            return Err(());
+        }
+        extent = Some(leading);
+    }
+    Ok(extent)
 }

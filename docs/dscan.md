@@ -69,12 +69,7 @@ whole-sequence prefill within tier 2 (bitwise when the sequence fits one chunk).
   instructions at `L = 8, 64, 4096`).
 - Lanes per workgroup: the widest power of two (at most 64) whose `rows * lanes` floats fit the device's
   workgroup memory. Not even one column fitting is `Capability::ScanLds`, a typed refusal before dispatch.
-- Work bound: a launch covers a token range (`ScanPhase`). The first launch reads the carried state from the state
-  operand; later launches read it from the packed result's state rows, where the previous launch left it, and
-  write it back. With a known `DeviceCaps::max_dispatch_work` the planner emits as many launches as keep every
-  launch's declared serial work (`threads * steps_per_thread`, `steps_per_thread = tokens * 3 * rows`) within it;
-  a bound below one token is refused by the resource check (`DispatchWork`). A device with an uncalibrated
-  (`Unknown`) bound runs one launch. The dispatch count is a plan property, not an acceptance constant.
+- One launch covers the whole sequence. The dispatch count is a plan property: a scan is one dispatch.
 
 ## Limits and what is not here
 
@@ -90,13 +85,11 @@ whole-sequence prefill within tier 2 (bitwise when the sequence fits one chunk).
   `research/1052-chunk-parallel-scan-prototype/`; revisit only if a device (PTX has no number) shows a win.
   Streaming time is linear in `L`: 3.9 ms at `L = 64`, 60 ms at `L = 1024` (wgpu, 32 heads, `D = 128`; the
   unrolled primitive chain is 7.2 and 113 ms with 107 and 1577 dispatches).
-- No production `DeviceCaps` carries a calibrated `max_dispatch_work`; the multi-launch split is exercised by the
-  planner (synthetic caps) and the kernel interpreter, never by a real device.
+- There is no per-dispatch work bound: no device runtime can calibrate one, so the scan is never split into token
+  ranges and a long sequence is one launch whose serial work grows with it.
 - KDA's per-channel gate is not covered: GLM-5.3 has no prefill and keeps its primitive decode.
 - The three Gumbel sampling kernels run one 64-lane workgroup per row, and each lane strides the row's
-  vocabulary once per pass (2, 32 and 63 passes by rule, counting each bisection step). `max_dispatch_work` bounds that as `rows * 64` threads of `passes * ceil(vocab / 64)` steps. A row's
-  reduction cannot cross launches, so an over-budget sampling dispatch is refused with the typed `DispatchWork`
-  resource refusal, not split. Only synthetic caps carry a bound today, so no device row exercises it. The
-  greedy pick is not one of these: it runs as two dispatches (`ArgmaxChunk` over 1024-logit chunks, then
-  `ArgmaxCombine` per row) whose per-lane loops are bounded by `vocab / 1024`, so they carry no
-  `DispatchWork` bound.
+  vocabulary once per pass (2, 32 and 63 passes by rule, counting each bisection step). A row's reduction
+  cannot cross launches, so a sampling dispatch is never split, and no work bound refuses it. The greedy pick is
+  not one of these: it runs as two dispatches (`ArgmaxChunk` over 1024-logit chunks, then `ArgmaxCombine` per
+  row) whose per-lane loops are bounded by `vocab / 1024`.

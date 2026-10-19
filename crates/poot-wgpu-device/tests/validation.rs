@@ -7,7 +7,7 @@ use poot_runtime_common::DeviceBackend;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use poot_eval::{EvalBudget, EvalError, EvalOptions, Value};
+use poot_eval::{EvalError, EvalOptions, Value};
 use poot_executor::{Device, ExecError, Executor, NoSync, StepInputs};
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_graph_ir::{
@@ -16,9 +16,9 @@ use poot_graph_ir::{
 };
 use poot_graph_plan::{
     CompileError, CompileOptions, PlanError, Target, device_validation::DeviceWitnessRejection,
-    multi_device::topology::DeviceId, production_plan::Submission, staged::DevicePlacement,
-    staged::ExpertPlacement, staged::Partition, staged::StagedCompileError, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    multi_device::topology::DeviceId, staged::DevicePlacement, staged::ExpertPlacement,
+    staged::Partition, staged::StagedCompileError, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -32,8 +32,7 @@ fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Compile `g` (already `Graph`-typed, its own validations intact - unlike this
 /// file's other migrated helpers, this one must NOT route through a `with_validations(Vec::new())`
-/// type-coercion step, which would silently strip the very validations under test) for `target` with
-/// `Submission::Replay` (Card 546b: the contract admits no other submission).
+/// type-coercion step, which would silently strip the very validations under test) for `target`.
 fn staged(g: &Graph, target: Target) -> StagedProgram {
     compile_staged(
         g,
@@ -42,7 +41,7 @@ fn staged(g: &Graph, target: Target) -> StagedProgram {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect("compile the validation graph")
 }
@@ -177,8 +176,7 @@ fn finite_input() -> Vec<f32> {
 }
 
 fn cpu_failure(graph: &Graph, inputs: &HashMap<ValueId, Value>) -> ExecutionValidationFailure {
-    match poot_eval::eval(graph, inputs, EvalOptions::new(EvalBudget::UNBOUNDED)).map(|e| e.output)
-    {
+    match poot_eval::eval(graph, inputs, EvalOptions::default()).map(|e| e.output) {
         Err(EvalError::Validation(failure)) => failure,
         other => panic!("the CPU oracle must reject this input, got {other:?}"),
     }
@@ -232,7 +230,7 @@ fn wgpu_validation_ge_ieee_edges_match_cpu() {
     .unwrap();
     let inputs: HashMap<ValueId, Value> =
         HashMap::from([(x.id(), HostTensor::f32(vec![8], edges.clone()).into())]);
-    let expected = poot_eval::eval(&passing, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let expected = poot_eval::eval(&passing, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -379,7 +377,7 @@ fn wgpu_validation_prefill_refuses_noncanonical_witness_at_compile_staged() {
             experts: ExpertPlacement::AllResident,
             devices: DevicePlacement::Single(DeviceId(0)),
         },
-        &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+        &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
     )
     .expect_err("a noncanonical witness must be refused at compile_staged");
     match error {
@@ -614,15 +612,11 @@ fn wgpu_live_attention_never_reads_the_poisoned_tail() {
         got.iter().all(|x| x.is_finite()),
         "poison reached the output: {got:?}"
     );
-    let cpu = poot_eval::eval(
-        &built.graph,
-        &inputs.values(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .unwrap();
+    let cpu = poot_eval::eval(&built.graph, &inputs.values(), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
     assert_within("vs the guarded graph", &got, cpu.as_f32().unwrap(), 1e-4);
     assert_within(
         "vs the first 64 keys",
@@ -666,7 +660,7 @@ fn wgpu_live_attention_two_byte_branches_are_a_typed_refusal() {
                 experts: ExpertPlacement::AllResident,
                 devices: DevicePlacement::Single(DeviceId(0)),
             },
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         );
         let Err(StagedCompileError::Compile(CompileError::Plan(error))) = refused else {
             panic!("{dtype:?}: the two-byte select must be refused, got {refused:?}");
@@ -782,15 +776,11 @@ fn wgpu_live_attention_declined_graph_runs_as_primitives() {
         got.iter().all(|x| x.is_finite()),
         "poison reached the output: {got:?}"
     );
-    let cpu = poot_eval::eval(
-        &built.graph,
-        &inputs.values(),
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .unwrap()
-    .output
-    .into_host()
-    .unwrap();
+    let cpu = poot_eval::eval(&built.graph, &inputs.values(), EvalOptions::default())
+        .unwrap()
+        .output
+        .into_host()
+        .unwrap();
     assert_within("vs the guarded graph", &got, cpu.as_f32().unwrap(), 1e-4);
     assert_within(
         "vs the first 5 keys",

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::{EvalBudget, EvalOptions, Value, eval};
+use crate::{EvalOptions, Value, eval};
 use poot_graph_ir::ops::{
     AttentionKeys, attention_live, attention_masked_softcap, causal_mask_from_pos,
 };
@@ -294,7 +294,7 @@ impl LiveAttentionFixture {
                     Value::from(HostTensor::f32(vec![1, 1, 1, n], vec![0.0; n])),
                 ),
             ]);
-            let row = eval(&graph, &bound, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let row = eval(&graph, &bound, EvalOptions::default())
                 .expect("the oracle row evaluates")
                 .output
                 .into_host()

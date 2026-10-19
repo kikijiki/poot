@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::{BinOp, FusedOp, OpKind, UnOp};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Builder, Eqn, Graph, Operand, Slot, ValueId};
@@ -12,7 +12,7 @@ use poot_graph_plan::passes_without_target;
 use poot_tensor::{DType, HostTensor};
 
 fn output_bits(g: &Graph, inputs: &HashMap<ValueId, Value>) -> Vec<u32> {
-    eval(g, inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(g, inputs, EvalOptions::default())
         .expect("the graph evaluates")
         .output
         .into_host()

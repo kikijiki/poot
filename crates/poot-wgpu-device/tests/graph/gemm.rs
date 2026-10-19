@@ -73,7 +73,7 @@ fn tiled_gemm_large_n_under_tile_threshold_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -145,7 +145,7 @@ fn tiled_gemm_tile_count_threshold_gated_and_correct() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inp, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -189,7 +189,7 @@ fn large_elementwise_readback_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -243,7 +243,7 @@ fn lm_head_gemv_2d_grid_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -316,7 +316,7 @@ fn decode_gemv_chunked_at_bloom_lm_head_n_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inp, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inp, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -370,7 +370,7 @@ fn concat_n_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -437,7 +437,7 @@ fn concat_n_rank4_axis2_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -578,12 +578,8 @@ fn indexed_oracle(program: &IndexedProgram) -> Result<HostTensor, poot_eval::Eva
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    eval(
-        &program.graph,
-        &eval_inputs,
-        EvalOptions::new(EvalBudget::UNBOUNDED),
-    )
-    .map(|evaluation| evaluation.output.into_host().unwrap())
+    eval(&program.graph, &eval_inputs, EvalOptions::default())
+        .map(|evaluation| evaluation.output.into_host().unwrap())
 }
 
 fn bits(t: &HostTensor) -> Vec<u32> {
@@ -899,7 +895,7 @@ fn tiled_gemm_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -933,7 +929,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
     // epilogue; every matmul lowers to the generated tiled GEMM (Card 557). Small well-conditioned
     // values keep the f32 dot near-exact.
     use poot_graph_ir::op::{ContractionHead, OpKind};
-    use poot_graph_plan::{CompileOptions, compile, production_plan::Submission};
+    use poot_graph_plan::{CompileOptions, compile};
     let _gpu_guard = gpu_lock();
     let Some((mut gpu, target)) = open_engine_or_skip() else {
         return;
@@ -990,7 +986,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
         let program = compile(
             &g,
             &spirv_fixture_target(),
-            &CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD),
+            &CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD),
         )
         .unwrap();
         let (eqn, _) = program
@@ -1029,7 +1025,7 @@ fn tiled_gemm_random_shapes_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1118,7 +1114,7 @@ fn synthesized_tiled_gemm_choice_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1182,7 +1178,7 @@ fn chunked_large_tiled_gemm_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1311,7 +1307,7 @@ fn batched_tiled_gemm_random_shapes_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -1383,7 +1379,7 @@ fn tiled_gemm_then_bias_add_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1438,7 +1434,7 @@ fn batched_tiled_gemm_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -1494,7 +1490,7 @@ fn rank4_batched_tiled_gemm_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

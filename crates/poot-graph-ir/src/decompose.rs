@@ -43,7 +43,7 @@ pub struct Decomposition {
 /// - `ContractionEpilogue { head, region }`: the head op over its two operands, then the region's steps with
 ///   local 0 the head's result (the dtype the head declares: a narrow head has already rounded).
 /// - `PackedContraction { descriptor, rows: Blocks(blocks) }`: `PackedDequant` of the carriers, then the `MatMul`
-///   of `ops::packed_linear` (`blocks == 1`) or `ops::packed_block_diagonal_linear` (`blocks > 1`). An
+///   of `packed_graphs::packed_linear` (`blocks == 1`) or `packed_graphs::packed_block_diagonal_linear` (`blocks > 1`). An
 ///   `Indexed` one is a primitive: the oracle decodes only the experts the row ids select.
 /// - `DenseContraction { .. }`: `MatMul(activation, Transpose([1, 0], w))`, the chain the dense fold replaces.
 /// - `GroupedDenseContraction { groups, .. }`: `MatMul(activation, Transpose([0, 2, 1], Reshape([groups, N, K], w)))`,
@@ -276,8 +276,8 @@ fn ill_typed_is_none(
 }
 
 /// A packed contraction: the weight dequantized to `[out, k]` F32, then the activation contracted against
-/// it. `blocks == 1` is `ops::packed_linear`'s chain, `MatMul(activation, Transpose([1, 0], w))`.
-/// `blocks > 1` states [`ops::packed_block_diagonal_linear`]'s semantics: the weight is grouped into
+/// it. `blocks == 1` is `packed_graphs::packed_linear`'s chain, `MatMul(activation, Transpose([1, 0], w))`.
+/// `blocks > 1` states `packed_graphs::packed_block_diagonal_linear`'s semantics: the weight is grouped into
 /// `[blocks, out / blocks, k]` before the `[0, 2, 1]` transpose, so each `[blocks, M, k]` activation block
 /// contracts only against its own weight block. The dequantized weight is a real intermediate (an
 /// `[out, k]` F32 tensor), which the evaluator charges to its budget.

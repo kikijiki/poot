@@ -3,11 +3,11 @@
 //! must never depend on poot-graph-plan (its own architecture test); this crate already dev-depends
 //! on poot-eval, so an integration test here can drive both.
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::op::OpKind;
 use poot_graph_ir::{Graph, Slot, Storage, ValueId};
 use poot_graph_plan::{cse, dce, fuse, legalize};
-use poot_models::model::{LogitRows, Phase};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_tensor::HostTensor;
 use poot_test_util::assert_close_rel;
@@ -45,8 +45,7 @@ fn decode_graph(model: &poot_models::test_support::weight_map::MappedModel, cap:
     model
         .model
         .trace(
-            Phase::Decode,
-            step(1, 1, cap, LogitRows::Last),
+            &StepSpec::step(step(1, 1, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -91,7 +90,7 @@ fn cse_preserves_results() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -102,7 +101,7 @@ fn cse_preserves_results() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        eval(&c, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&c, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -158,7 +157,7 @@ fn fuse_preserves_qwen2_results_and_shrinks() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        eval(&g, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&g, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -169,7 +168,7 @@ fn fuse_preserves_qwen2_results_and_shrinks() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        eval(&fg, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&fg, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -201,12 +200,11 @@ fn tiny_legalize_model() -> poot_models::test_support::weight_map::MappedModel {
 
 /// [`tiny_legalize_model`]'s step graph: `tokens` new tokens over `cap` positions, logits at every
 /// position so the graph ends in the lm_head `MatMul` [`without_lm_head`] cuts at.
-fn legalize_graph(phase: Phase, tokens: usize, cap: usize) -> Graph {
+fn legalize_graph(tokens: usize, cap: usize) -> Graph {
     tiny_legalize_model()
         .model
         .trace(
-            phase,
-            step(1, tokens, cap, LogitRows::All),
+            &StepSpec::step(step(1, tokens, cap, LogitRows::All)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -311,7 +309,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
                 .collect(),
         )
     };
-    let gd = without_lm_head(legalize_graph(Phase::Decode, 1, cap));
+    let gd = without_lm_head(legalize_graph(1, cap));
     let mut di: Map<ValueId, HostTensor> = Map::new();
     for &id in gd.inputs() {
         let m = gd.meta(id);
@@ -335,7 +333,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        let evaluation = eval(&gd, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+        let evaluation = eval(&gd, &values, EvalOptions::default()).unwrap();
         let state = evaluation
             .state
             .into_iter()
@@ -388,7 +386,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        let evaluation = eval(&gh, &values, EvalOptions::new(EvalBudget::UNBOUNDED)).unwrap();
+        let evaluation = eval(&gh, &values, EvalOptions::default()).unwrap();
         let state = evaluation
             .state
             .into_iter()
@@ -408,7 +406,7 @@ fn legalize_hosts_the_decode_embed_gather_without_changing_hidden_state() {
 #[test]
 fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
     // Same equivalence as `legalize_hosts_the_decode_embed_gather_without_changing_hidden_state`, for
-    // the multi-row prefill step (`Phase::Prefill`, L>1): the hosted `Slot::TokenEmbed` shape is
+    // the multi-row prefill step (a `step` of L>1 tokens): the hosted `Slot::TokenEmbed` shape is
     // `[l,hidden]` (one row per prompt position).
     use std::collections::HashMap as Map;
 
@@ -427,7 +425,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
         )
     };
 
-    let gd = without_lm_head(legalize_graph(Phase::Prefill, l, l));
+    let gd = without_lm_head(legalize_graph(l, l));
     let mut di: Map<ValueId, HostTensor> = Map::new();
     for &id in gd.inputs() {
         let m = gd.meta(id);
@@ -454,7 +452,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        eval(&gd, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&gd, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -502,7 +500,7 @@ fn legalize_hosts_the_prefill_embed_gather_without_changing_hidden_state() {
             .iter()
             .map(|(&id, tensor)| (id, Value::from(tensor.clone())))
             .collect();
-        eval(&gh, &values, EvalOptions::new(EvalBudget::UNBOUNDED))
+        eval(&gh, &values, EvalOptions::default())
             .unwrap()
             .output
             .into_host()

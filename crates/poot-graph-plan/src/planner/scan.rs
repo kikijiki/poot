@@ -1,11 +1,6 @@
 //! Scan equation planning: a bounded streaming schedule for the GDN delta rule and the Mamba2 SSD.
 //!
-//! A scan's packed result `[1, H, L + S, W]` is written by one or more launches of the streaming scan kernel.
-//! Each launch covers a token range (its phase) and hands the carried state to the next through the result's
-//! own state rows, so the serial work of one dispatch is the phase's, not the sequence's: a device with a
-//! known `max_dispatch_work` gets as many launches as keep every one within it, one without a calibrated
-//! bound gets one launch. A single token that cannot fit the bound is refused by the resource check, never
-//! launched.
+//! A scan's packed result `[1, H, L + S, W]` is written by one launch of the streaming scan kernel.
 //!
 //! The workgroup shape is [`scan_geometry`]: one lane per state column, or, for a long sequence whose unsplit
 //! launch leaves the device under-filled, each column's rows shared between `split` lanes so the per-token
@@ -15,8 +10,8 @@ use super::{BodyLimits, Capability, Eqn, KernelRequest, OpKind, PlanError, Plann
 use crate::planner::GraphTables;
 use crate::refusal::Site;
 use poot_graph_ir::{ScanFamily, ScanLayout};
-use poot_kernelgen::{ScanKernel, ScanPhase, ScanSpec};
-use poot_target::{Backend, DeviceCaps, Queried};
+use poot_kernelgen::{ScanKernel, ScanSpec};
+use poot_target::{Backend, DeviceCaps};
 
 /// The most state columns one workgroup owns.
 const MAX_COLS: usize = 64;
@@ -116,7 +111,7 @@ pub(super) fn plan(
             lds_bytes: caps.lds_bytes,
         })
     })?;
-    let whole = ScanSpec {
+    let spec = ScanSpec {
         kernel: match attrs.family {
             ScanFamily::DeltaRule => ScanKernel::DeltaRule,
             ScanFamily::Ssd => ScanKernel::Ssd,
@@ -127,30 +122,6 @@ pub(super) fn plan(
         width: layout.width,
         cols: state_cols.min(layout.width) * split,
         row_split: split,
-        phase: ScanPhase {
-            start: 0,
-            count: layout.len,
-        },
     };
-    let per_launch = match caps.max_dispatch_work {
-        Queried::Known(budget) => whole.tokens_within(budget).min(layout.len),
-        Queried::Unknown => layout.len,
-    };
-    let phase = |start: usize| ScanSpec {
-        phase: ScanPhase {
-            start,
-            count: per_launch.min(layout.len - start),
-        },
-        ..whole.clone()
-    };
-    if per_launch == layout.len {
-        return Planned::generated(site, KernelRequest::Scan(whole), backend, caps);
-    }
-    let launches = (0..layout.len)
-        .step_by(per_launch)
-        .map(|start| {
-            Planned::generated_dispatch(site, KernelRequest::Scan(phase(start)), backend, caps)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Planned::split(launches)
+    Planned::generated(site, KernelRequest::Scan(spec), backend, caps)
 }

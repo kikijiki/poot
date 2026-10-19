@@ -30,9 +30,8 @@ use poot_executor::{
     Collectives, Coordinator, Device, DeviceTime, Dispatch, Engine, ExecError, Executor,
     NativeCounters, SharedKernels, SharedKernelsMismatch, SupportBound, WeightUpload,
 };
-use poot_graph_plan::{
-    Target, multi_device::topology::DeviceId, production_plan::Submission, staged::TargetSet,
-};
+use poot_graph_plan::{Target, multi_device::topology::DeviceId, staged::TargetSet};
+use poot_models::io::InputId;
 use poot_runtime_common::{
     AllocGuard, BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters,
 };
@@ -40,7 +39,7 @@ use poot_target::BufferStorage;
 
 use super::error::DriverError;
 use super::placement::{Placed, Placement};
-use super::{Driver, DriverOptions, EncodeShapes, ModelHandle, ServingShapes};
+use super::{Driver, DriverOptions, EncodeShapes, ModelHandle, ServingShapes, State};
 
 /// One owner of device bytes: an allocation with an identity. Two records naming the same `(device, id)`
 /// are the same allocation (a shared weight, a shared state), whatever number of entries reference it.
@@ -566,16 +565,17 @@ pub fn verify_prepared(
     budget.admit(&actual, ledger)
 }
 
-impl Driver {
+impl<S: State> Driver<S> {
     /// How this driver's model is placed over its executor's devices.
     pub fn placement(&self) -> &Placement {
-        self.placed.placement()
+        self.runtime.placed.placement()
     }
 
     /// The live bytes per role of each device, from the executor's per-device counters, for the roles
     /// that have allocated.
     pub fn live_device_bytes(&self) -> LiveBytes {
-        self.executor
+        self.runtime
+            .executor
             .device_memory()
             .into_iter()
             .map(|memory| {
@@ -607,17 +607,17 @@ impl Driver {
 
     /// The targets the executor drives, as it reports them now.
     pub fn targets(&self) -> TargetSet {
-        self.executor.target_set()
+        self.runtime.executor.target_set()
     }
 
     /// Each device's memory as the executor reports it now, with the bytes this driver already holds
     /// on it.
     pub fn observation(&self) -> Observation {
-        Observation::of(&*self.executor)
+        Observation::of(&*self.runtime.executor)
     }
 }
 
-/// Whether a model must encode or only does when its family traces the phase.
+/// Whether a model must encode or only does when its family has an `encode` program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeNeed {
     /// An encoder: a family that refuses `Encode` is an error.
@@ -628,8 +628,8 @@ pub enum EncodeNeed {
 
 /// The one encode preparation, planned and real: admit `shapes` on `driver` as `need` says. Returns
 /// whether the entries are prepared.
-pub fn prepare_encode(
-    driver: &mut Driver,
+pub fn prepare_encode<S: State>(
+    driver: &mut Driver<S>,
     shapes: &EncodeShapes,
     need: EncodeNeed,
 ) -> Result<bool, DriverError> {
@@ -692,16 +692,16 @@ impl Planner {
     }
 
     /// Prepare `shapes` under `options` on [`PlanningDevice`]s and return what that allocated; with
-    /// `embeds`, the `PrefillEmbeds` entries ([`Driver::prepare_embeds`]) too. The preparation is the
+    /// `carried`, the entries that bind those carriable inputs ([`Driver::prepare_carried`]) too. The preparation is the
     /// production one; only the devices are recorders, so nothing is uploaded and nothing is left
     /// behind when this returns.
     pub fn plan(
         &self,
         options: DriverOptions,
         shapes: &ServingShapes<'_>,
-        embeds: bool,
+        carried: &[InputId],
     ) -> Result<Planned, PlanError> {
-        self.plan_workload(options, Some((shapes, embeds)), None)
+        self.plan_workload(options, Some((shapes, carried)), None)
     }
 
     /// Plan one driver that serves `serving` and encodes `encode`: both preparations run on the same
@@ -709,29 +709,35 @@ impl Planner {
     pub fn plan_workload(
         &self,
         options: DriverOptions,
-        serving: Option<(&ServingShapes<'_>, bool)>,
+        serving: Option<(&ServingShapes<'_>, &[InputId])>,
         encode: Option<(&EncodeShapes, EncodeNeed)>,
     ) -> Result<Planned, PlanError> {
-        self.plan_with(options, |driver| {
-            if let Some((shapes, embeds)) = serving {
-                driver.prepare(shapes)?;
-                if embeds {
-                    driver.prepare_embeds(shapes)?;
+        match serving {
+            Some((shapes, carried)) => self.plan_with(options, |driver| {
+                let mut driver = driver.prepare(shapes)?;
+                if !carried.is_empty() {
+                    driver.prepare_carried(shapes, carried)?;
                 }
-            }
-            if let Some((shapes, need)) = encode {
-                prepare_encode(driver, shapes, need)?;
-            }
-            Ok(())
-        })
+                if let Some((shapes, need)) = encode {
+                    prepare_encode(&mut driver, shapes, need)?;
+                }
+                Ok(driver)
+            }),
+            None => self.plan_with(options, |mut driver| {
+                if let Some((shapes, need)) = encode {
+                    prepare_encode(&mut driver, shapes, need)?;
+                }
+                Ok(driver)
+            }),
+        }
     }
 
     /// Open a driver over recording devices, run the production `prepare` on it and read what it
     /// allocated.
-    fn plan_with(
+    fn plan_with<S: State>(
         &self,
         options: DriverOptions,
-        prepare: impl FnOnce(&mut Driver) -> Result<(), DriverError>,
+        prepare: impl FnOnce(Driver) -> Result<Driver<S>, DriverError>,
     ) -> Result<Planned, PlanError> {
         let records: Records = Arc::default();
         let counters: Vec<(DeviceId, MemoryCounters)> = self
@@ -782,7 +788,7 @@ impl Planner {
         if let Some(slots) = self.pool {
             driver = driver.with_expert_pool(slots)?;
         }
-        prepare(&mut driver)?;
+        let driver = prepare(driver)?;
         let mut footprint = Footprint::new();
         for record in records.lock().expect("planning records").iter() {
             if record.live {
@@ -909,7 +915,7 @@ impl Device for PlanningDevice {
         Ok(())
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), PlanningOnly> {
+    fn begin(&mut self) -> Result<(), PlanningOnly> {
         Ok(())
     }
 
@@ -1512,7 +1518,7 @@ mod tests {
             if let Some(slots) = pool {
                 planner = planner.with_expert_pool(NonZeroUsize::new(slots).unwrap());
             }
-            planner.plan(options(8, 32), &shapes, false).unwrap()
+            planner.plan(options(8, 32), &shapes, &[]).unwrap()
         };
         let weight_bytes = |planned: &Planned| {
             planned
@@ -1555,7 +1561,7 @@ mod tests {
             counters,
             records: Records::default(),
         };
-        let mut driver = Driver::new(
+        let driver = Driver::new(
             Arc::clone(&handle),
             Box::new(Engine::new(device)),
             options(8, 32),
@@ -1563,7 +1569,7 @@ mod tests {
         .unwrap()
         .with_expert_pool(NonZeroUsize::new(POOL).unwrap())
         .unwrap();
-        driver.prepare(&shapes).unwrap();
+        let driver = driver.prepare(&shapes).unwrap();
         assert!(driver.prepared_entries() >= 2, "two entries share the pool");
         let mut live: Vec<_> = driver
             .live_role_bytes()

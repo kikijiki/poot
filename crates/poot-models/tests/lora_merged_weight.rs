@@ -6,12 +6,10 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{Graph, Slot, Storage, ValueId};
-use poot_graph_plan::{
-    CompileLimits, CompileOptions, LoraPlan, Target, compile, production_plan::Submission,
-};
-use poot_models::model::{LogitRows, Phase};
+use poot_graph_plan::{CompileLimits, CompileOptions, LoraPlan, Target, compile};
+use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_quant::weights::{LoraRole, LoraTarget, WeightId, WeightRole};
 use poot_target::Backend;
@@ -29,7 +27,7 @@ fn target() -> Target {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions::new(Submission::Replay, CompileLimits::STANDARD)
+    CompileOptions::new(CompileLimits::STANDARD)
 }
 
 /// Deterministic fill in [-1, 1) keyed by `seed`.
@@ -74,8 +72,7 @@ fn decode(rows: usize) -> Graph {
     qwen2()
         .model
         .trace(
-            Phase::Decode,
-            step(rows, 1, 8, LogitRows::Last),
+            &StepSpec::step(step(rows, 1, 8, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap()
@@ -201,7 +198,7 @@ fn run(g: &Graph, overrides: &HashMap<String, Vec<f32>>, tokens: &[i32], lora: &
         };
         inputs.insert(id, Value::from(tensor));
     }
-    eval(g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    eval(g, &inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()

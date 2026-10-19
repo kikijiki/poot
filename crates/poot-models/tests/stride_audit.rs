@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use poot_graph_ir::op::BinOp;
 use poot_graph_ir::{Builder, Graph, Outputs, Slot, StateRole, Storage, TensorType, ValueId};
 use poot_graph_plan::{Plan, Program, compile};
-use poot_models::model::{LogitRows, Phase, StepShape};
+use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::registry::Registry;
 use poot_models::test_support::dense::{Dense, Family, paged_step, step};
 use poot_target::dram_channels::{MAX_ALIAS, alias_factor};
@@ -165,8 +165,7 @@ fn real_decode(dense: &Dense, shape: StepShape) -> Graph {
         .zeroed_model(DType::BF16)
         .model
         .trace(
-            Phase::Decode,
-            shape,
+            &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the family traces a decode step")

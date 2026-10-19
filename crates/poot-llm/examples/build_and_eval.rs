@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{Builder, TensorType, TraceLimits, ops};
 use poot_tensor::HostTensor;
 
@@ -52,7 +52,7 @@ fn main() {
         Value::from(HostTensor::f32(vec![1, 1, n], xv.clone())),
     );
     inputs.insert(w.id(), Value::from(HostTensor::f32(vec![n], wv)));
-    let y = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let y = eval(&g, &inputs, EvalOptions::default())
         .expect("eval")
         .output
         .into_host()
@@ -66,13 +66,7 @@ fn main() {
     println!("input    : {xv:?}");
     println!("rmsnorm  : {:?}", y.as_f32().unwrap());
     println!("reference: {want:?}");
-    let max_err = y
-        .as_f32()
-        .unwrap()
-        .iter()
-        .zip(&want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let max_err = poot_test_util::max_abs_error(y.as_f32().unwrap(), &want);
     println!("max abs error vs reference: {max_err:.2e}");
     assert!(max_err <= 1e-5, "rmsnorm eval diverged from reference");
 }

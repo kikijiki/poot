@@ -54,7 +54,7 @@ mod tests {
     use super::*;
     use crate::components::standard::oracle::run_step;
     use crate::components::testing::{CAP, build};
-    use crate::model::{ConfigReason, Phase};
+    use crate::model::ConfigReason;
 
     #[test]
     fn a_missing_required_tensor_is_named_before_any_trace() {
@@ -102,16 +102,7 @@ mod tests {
                 generation: None,
             };
             let model = build(&ENTRY, &raw, &fx.store);
-            run_step(
-                &*model,
-                &fx.store,
-                Phase::Prefill,
-                CAP,
-                &[3, 17, 40, 8, 25, 9],
-                0,
-                &[],
-            )
-            .0
+            run_step(&*model, &fx.store, CAP, &[3, 17, 40, 8, 25, 9], 0, &[]).0
         };
         assert_ne!(run(1), run(64));
         // Keeping every position is the full-attention model: a selection wider than the longest

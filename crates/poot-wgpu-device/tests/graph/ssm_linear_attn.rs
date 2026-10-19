@@ -30,7 +30,7 @@ fn causal_conv1d_decode_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -103,7 +103,7 @@ fn in_graph_decay_mask_gated_linear_attention_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -175,7 +175,7 @@ fn mamba2_ssd_decode_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -273,7 +273,7 @@ fn mamba_core_path_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -402,7 +402,7 @@ fn mamba2_block_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -474,7 +474,7 @@ fn linear_attention_decode_gated_gpu_matches_cpu() {
             .iter()
             .map(|(&id, t)| (id, Value::from(t.clone())))
             .collect();
-        let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+        let cpu = eval(&g, &eval_inputs, EvalOptions::default())
             .unwrap()
             .output
             .into_host()
@@ -542,7 +542,7 @@ fn linear_attention_prefill_gpu_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -591,7 +591,7 @@ fn gpu_causal_conv1d_prefill_matches_cpu() {
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
         .collect();
-    let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+    let cpu = eval(&g, &eval_inputs, EvalOptions::default())
         .unwrap()
         .output
         .into_host()
@@ -699,7 +699,7 @@ fn mamba2_ssd_decode_gpu_fuzz_matches_cpu() {
                 .iter()
                 .map(|(&id, t)| (id, Value::from(t.clone())))
                 .collect();
-            let cpu = eval(&g, &eval_inputs, EvalOptions::new(EvalBudget::UNBOUNDED))
+            let cpu = eval(&g, &eval_inputs, EvalOptions::default())
                 .unwrap()
                 .output
                 .into_host()

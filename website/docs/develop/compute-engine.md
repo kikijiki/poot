@@ -44,7 +44,7 @@ an LLM checkpoint to use them:
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
-use poot_eval::{EvalBudget, EvalOptions, Value, eval};
+use poot_eval::{EvalOptions, Value, eval};
 use poot_graph_ir::{Builder, TensorType, TraceLimits, ops};
 use poot_tensor::HostTensor;
 
@@ -65,7 +65,7 @@ let g = b.finish(out)?;
 let mut inputs = HashMap::new();
 inputs.insert(x.id(), Value::from(HostTensor::f32(vec![1, 1, n], vec![1.0; n])));
 inputs.insert(w.id(), Value::from(HostTensor::f32(vec![n], vec![1.0; n])));
-let y = eval(&g, &inputs, EvalOptions::new(EvalBudget::UNBOUNDED))?;
+let y = eval(&g, &inputs, EvalOptions::default())?;
 ```
 
 A `Builder` is created with the limits its caller states (`TraceLimits`: values, equations, bytes of scalar
@@ -78,7 +78,7 @@ builder itself requests, not allocator overhead or device memory.
 `Builder::constant` registers a named const/input binder. At eval time you supply a `HashMap<ValueId,
 Value>` keyed by those ids (`Value::from(HostTensor::f32(shape, data))` for an F32 tensor). A bound tensor must have exactly the
 dtype the graph declares for that input: the evaluator never narrows or widens at bind, so a BF16 input
-is bound from BF16 words (`HostTensor::bf16`). Shapes are static on the graph. `EvalOptions` carries the work budget; `EvalBudget::UNBOUNDED` disables it. The result is
+is bound from BF16 words (`HostTensor::bf16`). Shapes are static on the graph. `EvalOptions` carries an optional observer and whether to keep the environment. The result is
 an `Evaluation`; its `.output` is the primary output `Value`.
 
 Try it:
@@ -93,13 +93,12 @@ Use the compiler entry instead of assembling a production pass sequence:
 
 ```rust
 use poot_executor::Device;
-use poot_graph_plan::production_plan::Submission;
 use poot_graph_plan::{compile, CompileLimits, CompileOptions, Target};
 use poot_wgpu_device::device::WgpuDevice;
 
 let device = WgpuDevice::new()?;
 let target: Target = device.target(); // a GPU target: backend plus measured DeviceCaps
-let program = compile(&g, &target, &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD))?;
+let program = compile(&g, &target, &CompileOptions::new(CompileLimits::STANDARD))?;
 ```
 
 `CompileLimits` bounds what one compile may construct: the value and equation counts of every graph a
@@ -129,7 +128,6 @@ use std::sync::Arc;
 use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
 use poot_tensor::HostView;
 use poot_wgpu_device::device::WgpuDevice;
-use poot_graph_plan::production_plan::Submission;
 use poot_graph_plan::staged::{
     compile_staged, DeviceId, DevicePlacement, ExpertPlacement, Partition, TargetSet,
 };
@@ -151,7 +149,7 @@ let staged = compile_staged(
         experts: ExpertPlacement::AllResident,
         devices: DevicePlacement::Single(DeviceId(0)),
     },
-    &CompileOptions::new(Submission::Replay, CompileLimits::STANDARD),
+    &CompileOptions::new(CompileLimits::STANDARD),
 )?;
 
 let mut exec = Engine::new(device);

@@ -262,7 +262,7 @@ struct PackedContractionCandidate {
     blocks: usize,
 }
 
-/// Recognize `ops::packed_linear`'s canonical chain: `PackedDequant -> Transpose([1,0]) -> optional
+/// Recognize `packed_graphs::packed_linear`'s canonical chain: `PackedDequant -> Transpose([1,0]) -> optional
 /// Reshape -> MatMul`. The optional reshape (`packed_linear`'s `alias_weight_shape`) follows the
 /// transpose, so this chain can only express an ordinary `[out, k]` dequant - never a view that needs to
 /// split the stored rows into blocks before the transpose (Card 385).
@@ -314,7 +314,7 @@ fn recognize_canonical_packed_chain(
     })
 }
 
-/// Recognize `ops::packed_block_diagonal_linear`'s chain: `PackedDequant -> Reshape([blocks, out /
+/// Recognize `packed_graphs::packed_block_diagonal_linear`'s chain: `PackedDequant -> Reshape([blocks, out /
 /// blocks, k]) -> Transpose([0,2,1]) -> MatMul`. The reshape runs before the transpose, the mirror of
 /// the canonical chain above; it reaches the grouped `[blocks, in_per_group, out / blocks]` view a
 /// stored `[out, k]` pair cannot otherwise expose (Card 385). `blocks` is read from the reshape in the
@@ -366,8 +366,8 @@ fn recognize_blocked_packed_chain(
     })
 }
 
-/// Recognize the reversed spelling of `ops::packed_linear`'s canonical chain: `y = x @ W^T`
-/// written as `y = (W @ x^T)^T` instead. `ops::packed_linear`'s canonical `PackedDequant` output is
+/// Recognize the reversed spelling of `packed_graphs::packed_linear`'s canonical chain: `y = x @ W^T`
+/// written as `y = (W @ x^T)^T` instead. `packed_graphs::packed_linear`'s canonical `PackedDequant` output is
 /// already `[out, k]` (the dense sibling below needs a `Transpose` to reach that layout, but a packed
 /// dequant starts there), so this spelling needs no transpose on the weight side at all: the dequant
 /// (or dequant-then-reshape, matching the canonical chain's optional alias reshape) feeds the *first*
@@ -757,16 +757,22 @@ mod tests {
         PackedWeight::try_new(WeightFormat::E2m1Row32, [3, 64]).unwrap()
     }
 
-    /// The canonical `y = x @ W^T` graph `ops::packed_linear` emits: `[0] PackedDequant, [1]
+    /// The canonical `y = x @ W^T` graph `packed_graphs::packed_linear` emits: `[0] PackedDequant, [1]
     /// Transpose([1,0]), [2] MatMul(activation, transposed)`.
     fn canonical_graph() -> Graph {
         let b = Builder::for_tests();
         let activation = b
             .constant("activation", TensorType::f32(vec![2, 64]))
             .unwrap();
-        let out =
-            poot_graph_ir::ops::packed_linear(&b, activation, "layer", descriptor(), None, None)
-                .unwrap();
+        let out = poot_graph_ir::test_support::packed_graphs::packed_linear(
+            &b,
+            activation,
+            "layer",
+            descriptor(),
+            None,
+            None,
+        )
+        .unwrap();
         b.finish(out).unwrap()
     }
 

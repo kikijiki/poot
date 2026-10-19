@@ -376,7 +376,6 @@ mod resources {
     fn a_workgroup_that_is_not_whole_subgroups_is_refused() {
         let requirements = KernelRequirements {
             subgroup_lanes: Some(32),
-            serial_work: None,
         };
         let refusal = validate_kernel_resources(
             &body([48, 1, 1], vec![fragment_statement()]),
@@ -416,11 +415,9 @@ mod resources {
         });
         let fits = KernelRequirements {
             subgroup_lanes: Some(32),
-            serial_work: None,
         };
         let outside = KernelRequirements {
             subgroup_lanes: Some(64),
-            serial_work: None,
         };
         let launch = body([64, 1, 1], vec![]);
         assert_eq!(validate_kernel_resources(&launch, fits, &caps), Ok(()));

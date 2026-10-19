@@ -31,7 +31,6 @@ use std::time::Duration;
 
 use poot_executor::{Arg, Device, DeviceTime, Dispatch, LaunchKind, VpuInvocation};
 use poot_graph_plan::Target;
-use poot_graph_plan::production_plan::Submission;
 use poot_l0_runtime::{
     GraphDirection, GraphIr, GraphPrecision, L0Context, L0Error, L0Graph, L0HostBuffer,
     L0Recording, L0RecordingBuilder,
@@ -46,6 +45,7 @@ use poot_target::{
 };
 
 use crate::blob_cache::{BlobCache, BlobKey};
+use crate::range_guard::{Direction, GuardArg, RangeCheck, RangeGuard, RangeViolation};
 
 /// The PCI vendor id of Intel.
 const INTEL_VENDOR_ID: u32 = 0x8086;
@@ -212,6 +212,29 @@ pub enum VpuError {
         /// The largest magnitude the contract admits.
         max_magnitude: u32,
     },
+    /// A weight uploaded with an F32 element outside the narrowing contract's range.
+    #[error(
+        "constant upload: element {index} is {value}, outside the narrowing contract's range of +-{max_magnitude}"
+    )]
+    NarrowingRangeUpload {
+        /// The first offending element of the upload.
+        index: usize,
+        /// Its value.
+        value: f32,
+        /// The largest magnitude the contract admits.
+        max_magnitude: u32,
+    },
+    /// An upload into an F32 weight that does not cover whole words at a word-aligned offset, so a word of it
+    /// could not be range-checked.
+    #[error(
+        "constant upload of {len} bytes at byte {offset} does not cover whole F32 words, so its range cannot be checked"
+    )]
+    UnalignedConstantUpload {
+        /// The upload's start, in bytes.
+        offset: usize,
+        /// The upload's length, in bytes.
+        len: usize,
+    },
     /// A byte range outside a buffer.
     #[error("range {offset}..{end} is outside a {len}-byte buffer")]
     Range {
@@ -244,6 +267,40 @@ pub enum VpuError {
     Poisoned,
 }
 
+impl From<RangeViolation> for VpuError {
+    fn from(violation: RangeViolation) -> Self {
+        match violation {
+            RangeViolation::Upload {
+                index,
+                value,
+                max_magnitude,
+            } => VpuError::NarrowingRangeUpload {
+                index,
+                value,
+                max_magnitude,
+            },
+            RangeViolation::Misaligned { offset, len } => {
+                VpuError::UnalignedConstantUpload { offset, len }
+            }
+            RangeViolation::Replay {
+                key,
+                role,
+                binding,
+                index,
+                value,
+                max_magnitude,
+            } => VpuError::NarrowingRange {
+                key,
+                role,
+                binding,
+                index,
+                value,
+                max_magnitude,
+            },
+        }
+    }
+}
+
 fn l0(operation: &'static str) -> impl FnOnce(L0Error) -> VpuError {
     move |source| VpuError::L0 { operation, source }
 }
@@ -254,12 +311,19 @@ fn l0(operation: &'static str) -> impl FnOnce(L0Error) -> VpuError {
 struct BufferCell {
     host: RefCell<L0HostBuffer>,
     storage: BufferStorage,
+    role: BufferRole,
     _charge: AllocGuard,
 }
 
 /// A buffer of the Intel NPU device: host memory the NPU addresses. Cloning shares it.
 #[derive(Clone)]
 pub struct VpuBuffer(Rc<BufferCell>);
+
+impl PartialEq for VpuBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 impl VpuBuffer {
     fn bytes(&self) -> usize {
@@ -290,64 +354,7 @@ struct Binding {
 #[derive(Clone)]
 pub struct VpuRecording {
     list: L0Recording,
-    ranges: Rc<[RangeCheck]>,
-}
-
-/// Whether a range-checked argument is read before the replay (an input) or after it (a result).
-#[derive(Clone, Copy)]
-enum Direction {
-    Input,
-    Result,
-}
-
-impl Direction {
-    const fn name(self) -> &'static str {
-        match self {
-            Direction::Input => "input",
-            Direction::Result => "result",
-        }
-    }
-}
-
-/// One F32 argument of a recorded graph execution, checked against the narrowing contract's range. An input is
-/// read before the replay and so is recorded only if no earlier command of the recording writes its buffer; a
-/// result is read after the replay, which also covers a written buffer a later execution reads.
-struct RangeCheck {
-    key: String,
-    binding: usize,
-    direction: Direction,
-    buffer: VpuBuffer,
-    elements: usize,
-}
-
-impl RangeCheck {
-    /// Read the argument and refuse its first element outside `contract`'s range.
-    fn check(&self, contract: &NarrowingContract) -> Result<(), VpuError> {
-        let mut bytes = vec![0u8; self.elements * size_of::<f32>()];
-        self.buffer
-            .0
-            .host
-            .borrow()
-            .read(0, &mut bytes)
-            .map_err(l0("host read"))?;
-        let (words, _) = bytes.as_chunks::<{ size_of::<f32>() }>();
-        let outside = words
-            .iter()
-            .map(|&word| f32::from_le_bytes(word))
-            .enumerate()
-            .find(|&(_, value)| !contract.admits(value));
-        match outside {
-            None => Ok(()),
-            Some((index, value)) => Err(VpuError::NarrowingRange {
-                key: self.key.clone(),
-                role: self.direction.name(),
-                binding: self.binding,
-                index,
-                value,
-                max_magnitude: contract.max_magnitude,
-            }),
-        }
-    }
+    ranges: Rc<[RangeCheck<VpuBuffer>]>,
 }
 
 /// The Intel NPU as an executor [`Device`].
@@ -360,12 +367,8 @@ pub struct VpuDevice {
     /// The vendor compiler's version, part of every blob's identity.
     compiler: VendorCompilerId,
     open: Option<L0RecordingBuilder>,
-    /// The range checks of the open recording's graph executions.
-    open_ranges: Vec<RangeCheck>,
-    /// The buffers a command already in the open recording writes (a graph execution's result, a copy's
-    /// destination). Such a buffer holds stale data when a replay starts, so it is never range-checked as an
-    /// input; it is checked as the result of its writer.
-    open_written: Vec<VpuBuffer>,
+    /// The narrowing contract's range guard; `None` when the device records no contract.
+    guard: Option<RangeGuard<VpuBuffer>>,
     poisoned: bool,
     /// Recordings a failed replay was running. They stay alive (and with them every buffer they name): the
     /// graph is not known to be idle, so nothing it may still write can be freed under it.
@@ -421,8 +424,7 @@ impl VpuDevice {
             cache,
             compiler,
             open: None,
-            open_ranges: Vec::new(),
-            open_written: Vec::new(),
+            guard: caps.narrowing.map(RangeGuard::new),
             poisoned: false,
             quarantine: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
@@ -456,6 +458,19 @@ impl VpuDevice {
     #[cfg(any(test, feature = "test-support"))]
     pub const fn cache_hits(&self) -> u64 {
         self.cache_hits
+    }
+
+    /// How many constant uploads the range guard checked. A weight is checked once, as it is written.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn constant_range_checks(&self) -> u64 {
+        self.guard.as_ref().map_or(0, |guard| guard.constant_checks)
+    }
+
+    /// How many input and result reads the range guard made on replays: one per checked argument per replay,
+    /// and none for a constant.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replay_range_checks(&self) -> u64 {
+        self.guard.as_ref().map_or(0, |guard| guard.replay_checks)
     }
 
     fn healthy(&self) -> Result<(), VpuError> {
@@ -615,6 +630,7 @@ impl Device for VpuDevice {
         Ok(VpuBuffer(Rc::new(BufferCell {
             host: RefCell::new(host),
             storage,
+            role,
             _charge: charge,
         })))
     }
@@ -674,7 +690,7 @@ impl Device for VpuDevice {
         })))
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), VpuError> {
+    fn begin(&mut self) -> Result<(), VpuError> {
         self.healthy()?;
         if self.open.is_some() {
             return Err(VpuError::AlreadyRecording);
@@ -708,35 +724,27 @@ impl Device for VpuDevice {
         self.recording()?
             .execute_graph(&kernel.graph, &buffers)
             .map_err(l0("append graph execution"))?;
-        if self.caps.narrowing.is_some() {
-            let inputs = dispatch.inputs.len();
-            for (binding, (arg, bound)) in args.iter().zip(&kernel.bindings).enumerate() {
-                if bound.storage.element() != ElementKind::F32 {
-                    continue;
-                }
-                let direction = if binding < inputs {
-                    Direction::Input
-                } else {
-                    Direction::Result
-                };
-                // An input an earlier command of this recording writes holds nothing the host can check
-                // before the replay; its writer's result check covers it.
-                if matches!(direction, Direction::Input)
-                    && self.open_written.iter().any(|w| Rc::ptr_eq(&w.0, &arg.buffer.0))
-                {
-                    continue;
-                }
-                self.open_ranges.push(RangeCheck {
-                    key: kernel.key.clone(),
-                    binding,
-                    direction,
-                    buffer: arg.buffer.clone(),
-                    elements: usize::try_from(bound.elements)
-                        .expect("check_bindings sized the argument"),
-                });
-            }
+        if let Some(guard) = &mut self.guard {
+            let guard_arg = |arg: &Arg<'_, Self>, bound: &Binding| {
+                (
+                    GuardArg {
+                        buffer: arg.buffer.clone(),
+                        role: arg.buffer.0.role,
+                        elements: usize::try_from(bound.elements)
+                            .expect("check_bindings sized the argument"),
+                    },
+                    bound.storage.element(),
+                )
+            };
+            let (output, inputs) = args.split_last().expect("a dispatch has an output");
+            let inputs: Vec<_> = inputs
+                .iter()
+                .zip(&kernel.bindings)
+                .map(|(arg, bound)| guard_arg(arg, bound))
+                .collect();
+            let output = guard_arg(output, &kernel.bindings[inputs.len()]);
+            guard.executed(&kernel.key, &inputs, output);
         }
-        self.open_written.push(dispatch.output.buffer.clone());
         Ok(())
     }
 
@@ -751,15 +759,19 @@ impl Device for VpuDevice {
         self.recording()?
             .copy(&dst.0.host.borrow(), &src.0.host.borrow())
             .map_err(l0("append copy"))?;
-        self.open_written.push(dst.clone());
+        if let Some(guard) = &mut self.guard {
+            guard.copied(dst, dst.0.storage.element(), dst.bytes() / size_of::<f32>());
+        }
         Ok(())
     }
 
     fn finish(&mut self) -> Result<Option<VpuRecording>, VpuError> {
         let mut builder = self.open.take().ok_or(VpuError::NotRecording)?;
         let list = builder.finish().map_err(l0("close recording"))?;
-        let ranges = std::mem::take(&mut self.open_ranges).into();
-        self.open_written.clear();
+        let ranges = self
+            .guard
+            .as_mut()
+            .map_or_else(|| Rc::from([]), RangeGuard::finished);
         Ok(Some(VpuRecording { list, ranges }))
     }
 
@@ -769,16 +781,9 @@ impl Device for VpuDevice {
         {
             self.runs += 1;
         }
-        let contract = self.caps.narrowing;
         // An input the contract does not cover is refused before it reaches the device; nothing ran.
-        if let Some(contract) = &contract {
-            for check in recording
-                .ranges
-                .iter()
-                .filter(|c| matches!(c.direction, Direction::Input))
-            {
-                check.check(contract)?;
-            }
+        if let Some(guard) = &mut self.guard {
+            guard.verify(&recording.ranges, Direction::Input, read_argument)?;
         }
         let ran = self
             .context
@@ -789,14 +794,8 @@ impl Device for VpuDevice {
             return ran;
         }
         // A result that left the range overflowed inside the region; the device is healthy, the result is not.
-        if let Some(contract) = &contract {
-            for check in recording
-                .ranges
-                .iter()
-                .filter(|c| matches!(c.direction, Direction::Result))
-            {
-                check.check(contract)?;
-            }
+        if let Some(guard) = &mut self.guard {
+            guard.verify(&recording.ranges, Direction::Result, read_argument)?;
         }
         ran
     }
@@ -817,12 +816,24 @@ impl Device for VpuDevice {
                 end: offset.saturating_add(len),
                 len: dst.bytes(),
             })?;
-        // The buffer is the NPU's own pages: the whole range is one chunk, no staging copy.
+        // The buffer is the NPU's own pages: the whole range is one chunk, no staging copy. A constant's range
+        // is read from these bytes, once, as they are written.
+        let (role, element) = (dst.0.role, dst.0.storage.element());
+        let mut admitted = Ok(());
+        let guard = &mut self.guard;
         dst.0
             .host
             .borrow_mut()
-            .write(offset..end, |bytes| fill(offset..end, bytes))
-            .map_err(l0("host write"))
+            .write(offset..end, |bytes| {
+                fill(offset..end, bytes);
+                if let Some(guard) = guard {
+                    admitted = guard
+                        .uploaded(role, element, offset, bytes)
+                        .map_err(VpuError::from);
+                }
+            })
+            .map_err(l0("host write"))?;
+        admitted
     }
 
     fn read(&mut self, src: &VpuBuffer, out: &mut [u8]) -> Result<(), VpuError> {
@@ -851,10 +862,23 @@ impl Device for VpuDevice {
     fn abort(&mut self) -> Result<(), VpuError> {
         // A partially built recording is dropped whole; nothing has run on the device for it.
         self.open = None;
-        self.open_ranges.clear();
-        self.open_written.clear();
+        if let Some(guard) = &mut self.guard {
+            guard.aborted();
+        }
         Ok(())
     }
+}
+
+/// The contents of the first `bytes` bytes of an argument's buffer.
+fn read_argument(buffer: &VpuBuffer, bytes: usize) -> Result<Vec<u8>, VpuError> {
+    let mut contents = vec![0u8; bytes];
+    buffer
+        .0
+        .host
+        .borrow()
+        .read(0, &mut contents)
+        .map_err(l0("host read"))?;
+    Ok(contents)
 }
 
 /// The compiled graph's arguments are the region's ABI, argument for argument: the same names in the same

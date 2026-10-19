@@ -338,6 +338,9 @@ pub struct WatchdogBudget {
     pub scatter_update_work: u64,
     /// `out_elems * K` for an unchunked indexed (MoE) dequant matmul.
     pub indexed_dequant_work: u64,
+    /// Multiply-accumulates (`rows * out * K`) for an unsplit packed tiled contraction. Above it the plan is
+    /// several dispatches over disjoint tile ranges (POOT-1263).
+    pub packed_tiled_work: u64,
 }
 
 /// Hardware/driver defects the planner must route around by construction. `None` means "not known to be
@@ -367,11 +370,6 @@ pub struct DeviceCaps {
     pub max_workgroup_invocations: u32,
     /// Subgroup (warp/wavefront) support, as the device reports it.
     pub subgroup: Queried<SubgroupSupport>,
-    /// The largest conservative work (threads times serial steps per thread) one dispatch may carry
-    /// before it risks a watchdog reset; `Unknown` where no bound is calibrated for the device. A single
-    /// dispatch is bounded by this, separately from how dispatches batch into submits
-    /// (`Dispatch::work`).
-    pub max_dispatch_work: Queried<u64>,
     /// The per-dimension dispatch grid ceiling (`gridDim.{x,y,z}` or the HSA/CUDA equivalent).
     pub max_grid: [u32; 3],
     /// The iGPU display-watchdog chunk budgets, or `None` on a device with no such watchdog.
@@ -416,6 +414,18 @@ pub struct DeviceCaps {
 /// proven-safe 201088 and the proven-hanging 250880.
 pub const DECODE_GEMV_CHUNK_TRIGGER: u64 = 220_000;
 
+/// POOT-1263: multiply-accumulates one packed tiled-contraction dispatch may carry on a device with the
+/// display watchdog ([`WatchdogBudget::packed_tiled_work`]). A Qwen3.8-27B-FP8 prefill forward of 2048
+/// tokens ran one dispatch per projection (up to ~1.8e11 multiply-accumulates) and lost the device.
+///
+/// Calibration: POOT-1182 measured about 4 tok/s prefill, i.e. ~1e11 multiply-accumulates per second for the
+/// E4M3 tiled body, so 8e9 is ~80 ms per dispatch. That is two orders below the ~1.5 s display-watchdog window
+/// cards 163/258 measured, and above `serial_dequant_work`'s 4e8 (a slower serial kernel) so a 27B prefill is
+/// ~25 dispatches per projection rather than thousands. Verified only up to the `[2048,5120]x[17408,5120]ᵀ`
+/// projection split on this box (`a_packed_tiled_contraction_over_the_watchdog_budget_matches_the_oracle_on_wgpu`);
+/// the full 2048-token forward was not run. It is not tuned: a slower body or device wants a smaller value.
+pub const PACKED_TILED_CHUNK_WORK: u64 = 8_000_000_000;
+
 /// Strix Halo's (gfx1151, Radeon 8060S) compute units, as HSA reports them: the RDNA3 default for
 /// [`DeviceCaps::wgpu_rdna3_igpu`] (wgpu has no compute-unit query) and [`DeviceCaps::rocm_default`]
 /// (a live ROCm context reports its own agent's count).
@@ -449,13 +459,13 @@ impl DeviceCaps {
                 min_size: 32,
                 max_size: 64,
             }),
-            max_dispatch_work: Queried::Unknown,
             max_grid: [65_535, 65_535, 65_535],
             watchdog_budget: Some(WatchdogBudget {
                 decode_gemv_out_elems: DECODE_GEMV_CHUNK_TRIGGER,
                 serial_dequant_work: 400_000_000,
                 scatter_update_work: 1_000_000,
                 indexed_dequant_work: 800_000_000,
+                packed_tiled_work: PACKED_TILED_CHUNK_WORK,
             }),
             tensor_core: TensorCoreSupport::Wmma16x16x16Rdna3,
             known_miscompiles: KnownMiscompiles {
@@ -479,7 +489,6 @@ impl DeviceCaps {
             max_workgroup_invocations: AMDGPU_MAX_WORKGROUP_INVOCATIONS,
             // The wavefront size is per device (32 or 64): only a live agent query knows it.
             subgroup: Queried::Unknown,
-            max_dispatch_work: Queried::Unknown,
             max_grid: [u32::MAX, u32::MAX, u32::MAX],
             watchdog_budget: None,
             tensor_core: TensorCoreSupport::None,
@@ -501,7 +510,6 @@ impl DeviceCaps {
                 min_size: 32,
                 max_size: 32,
             }),
-            max_dispatch_work: Queried::Unknown,
             max_grid: [u32::MAX, 65_535, 65_535],
             watchdog_budget: None,
             tensor_core: TensorCoreSupport::NvidiaWmma16x16x16Sm80,

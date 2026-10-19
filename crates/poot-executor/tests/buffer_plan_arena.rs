@@ -28,9 +28,9 @@ use poot_executor::{
 use poot_graph_ir::op::RedOp;
 use poot_graph_ir::{BinOp, Builder, TensorType};
 use poot_graph_plan::{
-    CompileOptions, Target, multi_device::topology::DeviceId, production_plan::Submission,
-    staged::DevicePlacement, staged::ExpertPlacement, staged::Partition, staged::StagedProgram,
-    staged::TargetSet, staged::compile_staged,
+    CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::ExpertPlacement, staged::Partition, staged::StagedProgram, staged::TargetSet,
+    staged::compile_staged,
 };
 use poot_quant::StoredBytes;
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
@@ -42,8 +42,7 @@ type Graph = poot_graph_ir::Graph;
 
 const K: usize = 64;
 
-const REPLAY: CompileOptions =
-    CompileOptions::new(Submission::Replay, poot_graph_plan::CompileLimits::STANDARD);
+const REPLAY: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
 
 fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_quant::weights::WeightMap>) {
     let b = Builder::for_tests();
@@ -165,7 +164,7 @@ impl Device for RecordingDevice {
         Ok(())
     }
 
-    fn begin(&mut self, _submission: Submission) -> Result<(), std::convert::Infallible> {
+    fn begin(&mut self) -> Result<(), std::convert::Infallible> {
         Ok(())
     }
 

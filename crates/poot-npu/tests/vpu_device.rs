@@ -643,7 +643,6 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
 #[test]
 fn every_buffer_is_released_when_the_executable_is_unloaded() {
     use poot_executor::{Executor, NoSync, StepInputs};
-    use poot_graph_plan::production_plan::Submission;
     use std::sync::Arc;
 
     let Some(mut npu) = npu() else { return };
@@ -667,10 +666,7 @@ fn every_buffer_is_released_when_the_executable_is_unloaded() {
         .expect("the weights load");
     let entry = npu
         .engine
-        .add_entry(
-            exe,
-            &poot_executor_parity::staged(fixture, target, Submission::Replay),
-        )
+        .add_entry(exe, &poot_executor_parity::staged(fixture, target))
         .expect("the entry compiles and loads");
     let mut inputs = StepInputs::new();
     for step in &fixture.steps[0] {
