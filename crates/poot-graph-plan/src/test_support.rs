@@ -6,8 +6,8 @@
 //! ADR-0113: `is_decode_gemv`/`is_tiled_gemm` had no production caller at all (production routes through
 //! this crate's private `_in` twins) and were deleted; their cross-crate callers assert on the `Plan`
 //! [`plan_eqn`] returns instead of calling a test-only predicate.
-//! `reassociation_class` and `per_eqn_plans_outside_compile` read this crate's private state
-//! (`recorded_numerics`, a crate-private thread-local counter) and stay beside it under
+//! `per_eqn_plans_outside_compile` reads this crate's private state (a crate-private thread-local
+//! counter) and stays beside it under
 //! `#[cfg(any(test, feature = "test-support"))]` (ADR-0113 point 2); their consumers call them directly
 //! through that feature, not through a forwarder here (a forwarder whose only purpose is to be a non-test
 //! reference is laundering, ADR-0113's Context).

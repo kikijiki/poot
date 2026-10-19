@@ -11,13 +11,15 @@
 //!   imports + compiles its Stable MIR. The body stays ordinary Rust that rustc type/borrow-checks - the
 //!   macro does no codegen, defines no DSL.
 //! - **Host pass** (this crate's default build, what an ordinary `cargo build` links): emit a typed launch
-//!   wrapper with the original name and signature plus a leading `&Context`, that dispatches the kernel's
-//!   cached SPIR-V via `poot_wgpu_runtime::Context::launch`. The body is not re-emitted, so kernel bodies need
+//!   wrapper with the original name and signature plus a leading `&Context`, that dispatches the kernel via
+//!   `poot_wgpu_runtime::Context::launch`. The body is not re-emitted, so kernel bodies need
 //!   not be host-compatible. The wrapper builds its `CompiledKernel` with `poot_codegen::kernel_handle`
-//!   from the kernel-IR `Body` the device pass compiled (card 608):
+//!   from the kernel-IR `Body` the device pass compiled (card 608), over the artifact
+//!   `poot_codegen::KernelCache::load_or_compile` returns for that same `Body`:
 //!   `poot-codegen` stays the only place that constructs a `CompiledKernel`, so a `#[kernel]`'s schema and
-//!   trap flag always come from the verified `Body`, never guessed from the Rust signature. The wrapper
-//!   looks the SPIR-V and `Body` up by name via `crate::poot_kernel_spv`/`crate::poot_kernel_body` (the
+//!   trap flag always come from the verified `Body`, never guessed from the Rust signature, and the code
+//!   always comes from that `Body`'s own compile. The wrapper
+//!   looks the `Body` up by name via `crate::poot_kernel_body` (the
 //!   host crate `include!`s the pootc-generated `poot_cache.rs` at its crate root, and so needs
 //!   `poot-codegen`, `poot-kernel-ir` and `serde_json` as dependencies alongside `poot-wgpu-runtime`). The
 //!   kernel's writable `&mut [T]` output must be its last parameter (the binding order).
@@ -142,13 +144,17 @@ fn host_wrapper(func: &ItemFn) -> syn::Result<TokenStream2> {
             // Card 608: the handle comes from `poot_codegen::kernel_handle`
             // against the device pass's own cached `Body`, exactly like `poot-codegen`'s other callers, so
             // this wrapper never constructs a `CompiledKernel` itself and the schema/trap flag can never
-            // drift from what the device pass actually compiled.
+            // drift from what the device pass actually compiled. The code is that same `Body` compiled (or
+            // served from the kernel cache), sealed to it: raw bytes cannot build a handle (POOT-1207).
             let body = crate::poot_kernel_body(#name_str);
-            let kernel = ::poot_codegen::kernel_handle(
-                &body,
-                ::poot_codegen::GpuTarget::SpirvVulkan,
-                crate::poot_kernel_spv(#name_str).to_vec(),
-            );
+            let artifact = ::poot_codegen::KernelCache::open(::poot_codegen::Target::SpirvVulkan)
+                .load_or_compile(
+                    &body,
+                    ::core::num::NonZeroU64::new(256 << 20).expect("a non-zero artifact limit"),
+                )
+                .unwrap_or_else(|error| panic!("kernel {:?} did not compile: {error}", #name_str));
+            let kernel = ::poot_codegen::kernel_handle(&body, &artifact)
+                .expect("the artifact was compiled from this very body");
             ctx.launch(&kernel, &[#(#inputs),*], #output)
         }
     })

@@ -32,6 +32,16 @@ const DEFAULT_MAX_IMAGE_BODY_MIB: usize = 64;
 /// The largest body cap a flag accepts, in MiB, so the byte count never overflows.
 const MAX_BODY_MIB: usize = 1024;
 
+/// Decode rows the server asks for before the memory fit reduces them.
+pub(crate) const DEFAULT_ROWS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+/// Texts per request an embedding or reranking model is fitted for before the memory fit reduces them.
+/// An encoder holds activations only, no KV pool, so its rows are cheap; 32 covers a rerank of 31
+/// documents and a query, where decode's 4 would refuse the common case.
+pub(crate) const DEFAULT_ENCODE_ROWS: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+/// Positions per sequence (or tokens per encoded row) the server asks for before the memory fit reduces
+/// them, and before the model's own limit caps them.
+pub(crate) const DEFAULT_MAX_SEQ: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+
 /// The most steps `--timing-max-steps` accepts. The engine thread copies the retained detail each time it
 /// publishes (at most every 250 ms); these maxima keep that copy to a few milliseconds
 /// (`tests::telemetry::publishing_the_largest_accepted_detail_stays_cheap`).
@@ -106,6 +116,15 @@ pub(crate) struct ServeConfig {
     /// fails startup.
     #[arg(long, default_value = "single", value_name = "PLACEMENT", value_parser = parse_placement)]
     pub(crate) placement: PlacementSpec,
+    /// Rows the engine is fitted for: concurrent sequences of a generative model (default 4), texts per
+    /// request of an embedding or rerank model (default 32; a generative model's embeddings take the
+    /// same rows). The memory fit may reduce it. At least 1.
+    #[arg(long, value_name = "N", value_parser = parse_rows)]
+    pub(crate) rows: Option<NonZeroUsize>,
+    /// Positions per sequence of a generative model, or tokens per text of an embedding or rerank model,
+    /// before the model's own limit caps it. The memory fit may reduce it. At least 1.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_MAX_SEQ, value_parser = parse_max_seq)]
+    pub(crate) max_seq: NonZeroUsize,
     /// Speculate by prompt lookup: propose the K tokens that followed the latest earlier occurrence of
     /// the sequence's last NGRAM tokens, written `NGRAM:K` (split at the first colon). Exclusive with
     /// `--draft-model`.
@@ -420,6 +439,14 @@ fn positive(text: &str, what: &str) -> Result<NonZeroUsize, String> {
     text.trim()
         .parse::<NonZeroUsize>()
         .map_err(|_| format!("{what} {text:?} is not a positive integer"))
+}
+
+fn parse_rows(raw: &str) -> Result<NonZeroUsize, String> {
+    positive(raw, "the row count")
+}
+
+fn parse_max_seq(raw: &str) -> Result<NonZeroUsize, String> {
+    positive(raw, "the position count")
 }
 
 fn parse_expert_pool(raw: &str) -> Result<NonZeroUsize, String> {

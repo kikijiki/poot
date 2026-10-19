@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use poot_codegen::{VpuElem, VpuInput, VpuNode, VpuOp, VpuRegion, VpuTensor, VpuValue, emit_vpu};
-use poot_l0_runtime::{GraphDirection, GraphIr, GraphPrecision, L0Context, L0DeviceKind, L0Error};
+use poot_l0_runtime::{GraphDirection, GraphIr, GraphPrecision, L0Context, L0Error};
 use poot_quant::scalar::f32_to_f16;
 
 const N: usize = 16;
@@ -43,7 +43,7 @@ fn words(values: impl Iterator<Item = f32>) -> Vec<u8> {
 }
 
 fn npu() -> L0Context {
-    L0Context::open(L0DeviceKind::Npu).expect("an NPU context")
+    L0Context::open().expect("an NPU context")
 }
 
 /// An IR graph compiles, reports the arguments the compiler built, runs, and its native blob loads without the
@@ -99,7 +99,7 @@ fn an_ir_graph_compiles_runs_and_its_blob_reloads_to_the_same_answer() {
     );
 
     let run = |graph: &poot_l0_runtime::L0Graph| {
-        let buffers: Vec<_> = (0..3).map(|_| context.alloc_host(2 * N).unwrap()).collect();
+        let mut buffers: Vec<_> = (0..3).map(|_| context.alloc_host(2 * N).unwrap()).collect();
         let a = words((0..N).map(|i| i as f32));
         let b = words((0..N).map(|i| 0.5 * i as f32));
         buffers[0]
@@ -125,7 +125,8 @@ fn an_ir_graph_compiles_runs_and_its_blob_reloads_to_the_same_answer() {
 
     let blob = compiled.native_binary().unwrap();
     assert!(blob.len() > 1000, "a whole blob: {} bytes", blob.len());
-    let loaded = context.load_native_graph(&blob).expect("the blob loads");
+    // SAFETY: `blob` is the unmodified `native_binary` of a graph this context's compiler just built.
+    let loaded = unsafe { context.load_native_graph(&blob) }.expect("the blob loads");
     assert_eq!(loaded.arguments(), compiled.arguments());
     assert_eq!(
         run(&loaded),
@@ -151,8 +152,8 @@ fn a_recording_replays_over_new_inputs_and_refuses_what_is_not_its_own() {
             "",
         )
         .unwrap();
-    let a = context.alloc_host(2 * N).unwrap();
-    let b = context.alloc_host(2 * N).unwrap();
+    let mut a = context.alloc_host(2 * N).unwrap();
+    let mut b = context.alloc_host(2 * N).unwrap();
     let out = context.alloc_host(2 * N).unwrap();
 
     let mut builder = context.begin_recording().unwrap();

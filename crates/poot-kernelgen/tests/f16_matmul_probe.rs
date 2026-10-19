@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use poot_codegen::{Target, artifact_path, compile};
+use poot_codegen::{Target, artifact_path, compile_kernel};
 use poot_kernel_ir::Ty;
 use poot_kernelgen as kg;
 use poot_runtime_common::BufferRole;
@@ -72,7 +72,8 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
     let dir: PathBuf = std::env::temp_dir().join("poot-f16-matmul-probe");
     std::fs::create_dir_all(&dir).unwrap();
     let out = artifact_path(&dir, "f16mm", Target::SpirvVulkan);
-    compile(&body, Target::SpirvVulkan, &out).expect("F16 matmul must compile to SPIR-V");
+    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out)
+        .expect("F16 matmul must compile to SPIR-V");
     if which("spirv-val") {
         let v = std::process::Command::new("spirv-val")
             .arg(&out)
@@ -96,9 +97,7 @@ fn f16_matmul_compiles_valid_spirv_and_matches_cpu_on_radv() {
             return;
         }
     };
-    let spv_bytes = std::fs::read(&out).unwrap();
-    let kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv_bytes);
+    let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1 - 0.3).collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05 + 0.2).collect();
     let a_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), m * k);

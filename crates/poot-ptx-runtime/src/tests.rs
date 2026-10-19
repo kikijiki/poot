@@ -1448,7 +1448,7 @@ fn no_contract_fma_sensitive_rows(n: usize) -> Vec<(f32, f32, f32, f32)> {
 }
 
 /// Compile `poot_kernel_ir::test_support::no_contract_probe_kernel(marked)` for `Target::Nvptx` through the
-/// real production toolchain (the same `poot_codegen::compile`/`kernel_handle` pair every other backend's
+/// real production toolchain (the same `poot_codegen::compile_kernel`/`kernel_handle` pair every other backend's
 /// device test uses - `poot-wgpu-runtime`'s `no_contract_tests`, `poot-rocm-runtime`'s `no_contract_*`).
 fn no_contract_nvptx_kernel(marked: bool) -> poot_runtime_common::CompiledKernel {
     let tag = if marked { "marked" } else { "unmarked" };
@@ -1460,11 +1460,9 @@ fn no_contract_nvptx_kernel(marked: bool) -> poot_runtime_common::CompiledKernel
         &format!("no_contract_{tag}"),
         poot_codegen::Target::Nvptx,
     );
-    poot_codegen::compile(&body, poot_codegen::Target::Nvptx, &out)
+    let artifact = poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out)
         .unwrap_or_else(|e| panic!("compile no_contract_{tag}: {e}"));
-    let bytes =
-        std::fs::read(&out).unwrap_or_else(|e| panic!("read compiled no_contract_{tag}: {e}"));
-    poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, bytes)
+    poot_codegen::kernel_handle(&body, &artifact).unwrap()
 }
 
 /// SC-001 (dquant.md section 7 R1): the marked packed-dequant-style `a*b - c*d` kernel

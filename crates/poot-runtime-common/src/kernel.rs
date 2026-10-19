@@ -125,7 +125,8 @@ impl CompiledKernel {
     ///
     /// # Safety
     ///
-    /// `code` must be machine code `poot-codegen` compiled for `target` from a
+    /// Only `poot_codegen::kernel_handle` calls this, over a sealed `CompiledArtifact` whose content id
+    /// matches the body it is given. `code` must be machine code `poot-codegen` compiled for `target` from a
     /// [`poot_kernel_ir::Body`](https://docs.rs/poot-kernel-ir) that passed `Body::verify`, whose entry
     /// point is `entry_point`, whose parameters are exactly `args` in binding order (each argument's
     /// native element kind and whether the kernel writes it), and whose `has_trap` equals

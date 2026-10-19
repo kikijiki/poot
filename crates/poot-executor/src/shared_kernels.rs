@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
-use poot_codegen::{ArtifactTooLarge, CompileError};
+use poot_codegen::{ArtifactTooLarge, CompileError, CompiledArtifact, KernelId};
 use poot_target::TargetId;
 
-/// Compiled kernel artifacts, keyed by the kernel body's content fingerprint
-/// (`poot_codegen::KernelKey::fingerprint`, the same key `Engine::kernel` indexes by), shared by every
+/// Compiled kernel artifacts, keyed by the kernel's content id
+/// (`poot_codegen::KernelKey::id`, the same key `Engine::kernel` indexes by), shared by every
 /// engine built with [`Engine::with_shared_kernels`](crate::Engine::with_shared_kernels).
 ///
 /// The startup fit plans many candidates, each through its own planning `Engine`; the candidates draw on
@@ -20,7 +20,7 @@ use poot_target::TargetId;
 #[derive(Clone, Debug)]
 pub struct SharedKernels {
     target: TargetId,
-    artifacts: Arc<Mutex<HashMap<u64, Arc<[u8]>>>>,
+    artifacts: Arc<Mutex<HashMap<KernelId, CompiledArtifact>>>,
 }
 
 /// An engine was given a [`SharedKernels`] it cannot use.
@@ -56,25 +56,25 @@ impl SharedKernels {
         self.target
     }
 
-    /// The artifact for `fingerprint` and whether `resolve` ran for it. `resolve` runs under the table's
+    /// The artifact for `id` and whether `resolve` ran for it. `resolve` runs under the table's
     /// lock, so concurrent engines never resolve one kernel twice; a failed resolution stores nothing. A
     /// stored artifact longer than `max_artifact_bytes` is [`ArtifactTooLarge`], as a cache hit would be.
     pub(crate) fn get_or_resolve(
         &self,
-        fingerprint: u64,
+        id: KernelId,
         max_artifact_bytes: NonZeroU64,
-        resolve: impl FnOnce() -> Result<Vec<u8>, CompileError>,
-    ) -> Result<(Arc<[u8]>, bool), CompileError> {
+        resolve: impl FnOnce() -> Result<CompiledArtifact, CompileError>,
+    ) -> Result<(CompiledArtifact, bool), CompileError> {
         let mut artifacts = self.artifacts.lock().expect("shared kernel table");
-        let (bytes, resolved) = match artifacts.get(&fingerprint) {
-            Some(bytes) => (Arc::clone(bytes), false),
+        let (artifact, resolved) = match artifacts.get(&id) {
+            Some(artifact) => (artifact.clone(), false),
             None => {
-                let bytes: Arc<[u8]> = resolve()?.into();
-                artifacts.insert(fingerprint, Arc::clone(&bytes));
-                (bytes, true)
+                let artifact = resolve()?;
+                artifacts.insert(id, artifact.clone());
+                (artifact, true)
             }
         };
-        let length = bytes.len() as u64;
+        let length = artifact.len() as u64;
         if length > max_artifact_bytes.get() {
             return Err(ArtifactTooLarge {
                 bytes: length,
@@ -82,6 +82,6 @@ impl SharedKernels {
             }
             .into());
         }
-        Ok((bytes, resolved))
+        Ok((artifact, resolved))
     }
 }

@@ -90,7 +90,7 @@ pub struct HsacoModule {
     pub(crate) exec: bindings::hsa_executable_t,
     /// Runtime-allocated `kernel_object` handle (from `HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT`).
     /// Goes in the AQL packet's `kernel_object` field.
-    pub kernel_object: u64,
+    pub(crate) kernel_object: u64,
     /// Kernarg buffer size in bytes (from the kernel descriptor).
     pub kernarg_size: u32,
     /// Group segment (LDS) size in bytes (from the kernel descriptor).
@@ -292,7 +292,7 @@ impl RocmContext {
     pub fn load_hsaco(
         &self,
         kernel: &poot_runtime_common::CompiledKernel,
-    ) -> Result<HsacoModule, RocmError> {
+    ) -> Result<Arc<HsacoModule>, RocmError> {
         let poot_runtime_common::KernelCode::Hsaco(hsaco) = kernel.code() else {
             return Err(RocmError::WrongKernelTarget {
                 actual: kernel.target(),
@@ -454,21 +454,21 @@ impl RocmContext {
         );
         // 8. Transfer the executable to the module. Dropping `construction` destroys the reader; the
         // executable is owned by the returned module.
-        Ok(construction.finish(
+        Ok(Arc::new(construction.finish(
             kernel_object,
             kernarg_size,
             group_segment_size,
             private_segment_size,
             sym_name,
             Arc::from(kernel.args()),
-        ))
+        )))
     }
 
     /// Look up a kernel symbol in a loaded module. `HsacoModule` already holds the runtime-allocated
     /// `kernel_object` handle (`HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT`), so this is constant-time.
     pub fn lookup_kernel(
         &self,
-        module: &HsacoModule,
+        module: &Arc<HsacoModule>,
         kernel: &str,
     ) -> Result<KernelHandle, RocmError> {
         if !kernel_symbol_matches(&module.kernel_symbol, kernel) {
@@ -478,13 +478,9 @@ impl RocmContext {
             )));
         }
         // The runtime allocated `kernel_object` for the exact symbol at load; after the identity check
-        // above, pass it through to the AQL packet.
+        // above, the handle shares the module, so the code object lives as long as any handle does.
         Ok(KernelHandle {
-            kernel_object: module.kernel_object,
-            kernarg_size: module.kernarg_size,
-            group_segment_size: module.group_segment_size,
-            private_segment_size: module.private_segment_size,
-            args: Arc::clone(&module.args),
+            module: Arc::clone(module),
         })
     }
 
@@ -568,8 +564,8 @@ impl RocmContext {
         ))
     }
 
-    /// Dispatch a single kernel and wait on its completion signal. The kernarg buffer must already
-    /// hold the kernel's args (the `(ptr, i64 len, ptr, i64 len, ...)` sequence for slice-bearing
+    /// Dispatch a single kernel and wait on its completion signal. `kernarg` was built by
+    /// [`Self::bind_kernarg`] (the `(ptr, i64 len, ptr, i64 len, ...)` sequence for slice-bearing
     /// kernels). `grid_x * grid_y * grid_z` work-items in `block_x * block_y * block_z` blocks (the
     /// workgroup size; 64 or 128 for gfx1151).
     ///
@@ -586,12 +582,11 @@ impl RocmContext {
     pub fn dispatch(
         &self,
         kernel: &KernelHandle,
-        kernarg: &RocmBuffer,
+        kernarg: &BoundKernarg,
         elements: &[poot_target::ElementKind],
         grid: (u32, u32, u32),
         block: (u32, u32, u32),
     ) -> Result<(), RocmError> {
-        validate_kernarg_buffer("dispatch", kernel, kernarg)?;
         poot_runtime_common::check_element_schema(kernel.args(), elements)?;
         self.enqueue(
             &[(kernel.clone(), kernarg.clone(), grid, block)],
@@ -605,12 +600,13 @@ impl RocmContext {
     /// (BARRIER bit set). Only the last packet has a completion signal (on a context built with
     /// [`RocmContextOptions::device_timing`] every packet has its own); otherwise earlier ones use
     /// `HSA_SIGNAL_INVALID`. The batch is complete only after [`Self::synchronize`] (or any call that
-    /// synchronizes first, like [`Self::read_bytes`]) returns: until then the caller keeps every
-    /// buffer the packets bind alive (the kernarg buffers are held here), and enqueues of later
-    /// batches order after this one behind the barrier.
+    /// synchronizes first, like [`Self::read_bytes`]) returns: until then the batch holds each
+    /// dispatch's kernel (and so its code object) and bound kernarg (and so every data buffer it
+    /// binds), whatever the caller does with its own handles, and enqueues of later batches order after
+    /// this one behind the barrier.
     ///
-    /// Each entry is `(kernel, kernarg, grid, block)`. Every owned kernarg buffer must already hold the
-    /// kernel's args and have the exact kernel-declared byte capacity. `elements[i]` is `dispatches[i]`'s
+    /// Each entry is `(kernel, kernarg, grid, block)`, the kernarg bound to that kernel
+    /// ([`Self::bind_kernarg`]). `elements[i]` is `dispatches[i]`'s
     /// packed buffers' native element kinds (see [`Self::dispatch`]); checked against `dispatches[i].0`'s
     /// schema before any submission (card 608, SC-002).
     ///
@@ -620,7 +616,7 @@ impl RocmContext {
     #[allow(clippy::type_complexity)]
     pub fn enqueue_graph_batched(
         &self,
-        dispatches: &[(KernelHandle, RocmBuffer, (u32, u32, u32), (u32, u32, u32))],
+        dispatches: &[(KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32))],
         elements: &[&[poot_target::ElementKind]],
     ) -> Result<usize, RocmError> {
         let n = dispatches.len();
@@ -632,8 +628,7 @@ impl RocmContext {
             n,
             "enqueue_graph_batched: dispatches and elements must be reported pairwise (caller bug)"
         );
-        for ((kernel, kernarg, _, _), &elems) in dispatches.iter().zip(elements) {
-            validate_kernarg_buffer("enqueue_graph_batched", kernel, kernarg)?;
+        for ((kernel, _, _, _), &elems) in dispatches.iter().zip(elements) {
             poot_runtime_common::check_element_schema(kernel.args(), elems)?;
         }
         self.enqueue(dispatches, "enqueue_graph_batched")
@@ -653,7 +648,7 @@ impl RocmContext {
     #[allow(clippy::type_complexity)]
     fn enqueue(
         &self,
-        dispatches: &[(KernelHandle, RocmBuffer, (u32, u32, u32), (u32, u32, u32))],
+        dispatches: &[(KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32))],
         tag: &'static str,
     ) -> Result<usize, RocmError> {
         self.ensure_not_poisoned(tag)?;
@@ -745,6 +740,10 @@ impl RocmContext {
                 signal: completion,
                 held: Held {
                     staging: None,
+                    kernels: dispatches
+                        .iter()
+                        .map(|(kernel, _, _, _)| kernel.clone())
+                        .collect(),
                     kernargs: dispatches
                         .iter()
                         .map(|(_, kernarg, _, _)| kernarg.clone())
@@ -929,103 +928,153 @@ impl RocmContext {
     }
 }
 
-/// Per-launch kernel metadata queried from the executable symbol.
+/// A kernel of a loaded [`HsacoModule`]: shares the module, so the code object its packets name by
+/// address lives as long as any handle (or recording holding one) does.
 ///
-/// Fields are private (card 608): the only constructor is [`RocmContext::lookup_kernel`], which queries
-/// them from a genuinely loaded [`HsacoModule`], so safe code cannot forge a `kernel_object` that points
-/// an AQL packet at an arbitrary address. It also carries the argument schema `load_hsaco` copied from the
-/// `CompiledKernel` it loaded (card 608), so `RocmContext::dispatch`/
-/// `enqueue_graph_batched` can check a dispatch's bound buffers before submission even though a ROCm
-/// kernarg is one opaque byte blob by then.
+/// The only constructor is [`RocmContext::lookup_kernel`], which takes a genuinely loaded module, so
+/// safe code cannot forge a `kernel_object` that points an AQL packet at an arbitrary address. The handle
+/// also carries the argument schema `load_hsaco` copied from the `CompiledKernel` it loaded (card 608),
+/// so `RocmContext::dispatch`/`enqueue_graph_batched` can check a dispatch's bound buffers before
+/// submission even though a ROCm kernarg is one opaque byte blob by then.
 ///
 /// ```compile_fail,E0451
-/// fn forge() -> poot_rocm_runtime::KernelHandle {
-///     poot_rocm_runtime::KernelHandle {
-///         kernel_object: 0,
-///         kernarg_size: 0,
-///         group_segment_size: 0,
-///         private_segment_size: 0,
-///         args: std::sync::Arc::from([]),
-///     }
+/// fn forge(module: std::sync::Arc<poot_rocm_runtime::HsacoModule>) -> poot_rocm_runtime::KernelHandle {
+///     poot_rocm_runtime::KernelHandle { module }
+/// }
+/// ```
+///
+/// The raw code-object address is not readable from outside the crate:
+///
+/// ```compile_fail,E0624
+/// fn raw(kernel: &poot_rocm_runtime::KernelHandle) -> u64 {
+///     kernel.kernel_object()
 /// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct KernelHandle {
-    /// EXEC symbol handle. Goes in the AQL packet's `kernel_object` field.
-    kernel_object: u64,
-    /// Kernarg buffer size in bytes (must be allocated at least this large).
-    kernarg_size: u32,
-    /// Group segment (LDS) size in bytes (must be in the AQL packet's `group_segment_size`).
-    group_segment_size: u32,
-    /// Private segment (scratch) size in bytes per work-item.
-    private_segment_size: u32,
-    /// Copied from [`HsacoModule::args`] (see the struct doc).
-    args: Arc<[poot_runtime_common::ArgSchema]>,
+    module: Arc<HsacoModule>,
 }
 
 impl KernelHandle {
     /// The AQL packet's `kernel_object` field.
-    pub fn kernel_object(&self) -> u64 {
-        self.kernel_object
+    pub(crate) fn kernel_object(&self) -> u64 {
+        self.module.kernel_object
     }
 
     /// The kernarg buffer's required byte capacity.
     pub fn kernarg_size(&self) -> u32 {
-        self.kernarg_size
+        self.module.kernarg_size
     }
 
     /// The AQL packet's `group_segment_size` field.
     pub fn group_segment_size(&self) -> u32 {
-        self.group_segment_size
+        self.module.group_segment_size
     }
 
     /// The AQL packet's `private_segment_size` field.
     pub fn private_segment_size(&self) -> u32 {
-        self.private_segment_size
+        self.module.private_segment_size
     }
 
     /// This kernel's argument schema, one entry per data buffer it binds, in binding order (card 608):
     /// copied from the `CompiledKernel` `load_hsaco` loaded it from.
     pub fn args(&self) -> &[poot_runtime_common::ArgSchema] {
-        &self.args
+        &self.module.args
     }
 }
 
-pub(crate) fn validate_kernarg_buffer(
-    op: &'static str,
-    kernel: &KernelHandle,
-    kernarg: &RocmBuffer,
-) -> Result<(), RocmError> {
-    if kernarg.storage() != BufferStorage::raw_bytes() {
-        return Err(RocmError::RepresentationMismatch {
-            op,
-            expected: BufferStorage::raw_bytes(),
-            actual: kernarg.storage(),
-        });
-    }
-    let expected = kernel.kernarg_size() as usize;
-    if kernarg.byte_capacity() != expected {
-        return Err(RocmError::KernargSizeMismatch {
-            op,
-            expected,
-            actual: kernarg.byte_capacity(),
-        });
-    }
-    Ok(())
+/// A kernarg segment together with the data buffers whose device addresses it holds. The packet reads
+/// both until its batch completes, so a recording owns this value (the PTX model): dropping the caller's
+/// own handle to a bound buffer cannot free memory a recorded dispatch still addresses. Built only by
+/// [`RocmContext::bind_kernarg`], the one place a buffer's address is written into a kernarg.
+///
+/// ```compile_fail,E0451
+/// fn forge(kernarg: poot_rocm_runtime::RocmBuffer) -> poot_rocm_runtime::BoundKernarg {
+///     poot_rocm_runtime::BoundKernarg { kernarg, buffers: Vec::new().into() }
+/// }
+/// ```
+#[derive(Clone)]
+pub struct BoundKernarg {
+    kernarg: RocmBuffer,
+    /// Held, never read: keeps each bound allocation alive for the kernarg's lifetime.
+    #[allow(
+        dead_code,
+        reason = "owned so a bound buffer outlives the packets that address it"
+    )]
+    buffers: Arc<[RocmBuffer]>,
 }
 
-/// Allocate an owned kernarg buffer of `size` bytes. It comes from the fine-grained kernarg-capable
-/// pool, is freed when its last [`RocmBuffer`] handle drops, and is initialized through the context's
-/// selected host-write or DMA strategy.
+impl std::fmt::Debug for BoundKernarg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundKernarg")
+            .field(
+                "kernarg_ptr",
+                &format_args!("0x{:x}", self.kernarg.device_ptr()),
+            )
+            .field("buffers", &self.buffers.len())
+            .finish()
+    }
+}
+
+impl BoundKernarg {
+    pub(crate) fn kernarg(&self) -> &RocmBuffer {
+        &self.kernarg
+    }
+}
+
 impl RocmContext {
-    /// Allocate a zeroed kernarg buffer of `size` bytes; see the impl-level note on its pool and lifetime.
-    pub fn allocate_kernarg(&self, size: usize) -> Result<RocmBuffer, RocmError> {
+    /// Allocate a zeroed kernarg buffer of `size` bytes from the fine-grained kernarg-capable pool; it is
+    /// freed when its last [`RocmBuffer`] handle drops and initialized through the context's selected
+    /// host-write or DMA strategy.
+    ///
+    /// Crate-private: a kernarg's contents are device addresses, so safe code outside the crate builds
+    /// one only through [`Self::bind_kernarg`], which keeps the addressed buffers alive with it.
+    ///
+    /// ```compile_fail,E0624
+    /// fn raw(ctx: &poot_rocm_runtime::RocmContext) {
+    ///     let _ = ctx.allocate_kernarg(16);
+    /// }
+    /// ```
+    pub(crate) fn allocate_kernarg(&self, size: usize) -> Result<RocmBuffer, RocmError> {
         self.allocate_zeroed(
             "allocate_kernarg",
             size,
             BufferStorage::raw_bytes(),
             BufferRole::Meta,
         )
+    }
+
+    /// Build `kernel`'s kernarg segment from flat `(device pointer, length)` pairs, one per entry of
+    /// `buffers` in the kernel's declared parameter order (the output last), where each length is in the
+    /// kernel body's own unit. The result owns the kernarg allocation and a clone of every bound buffer,
+    /// so a recording of it keeps the data alive until it drops and its last batch completes.
+    pub fn bind_kernarg(
+        &self,
+        kernel: &KernelHandle,
+        buffers: &[(&RocmBuffer, u64)],
+    ) -> Result<BoundKernarg, RocmError> {
+        let segment = kernel.kernarg_size() as usize;
+        let required = buffers
+            .len()
+            .checked_mul(16)
+            .filter(|&required| required <= segment)
+            .ok_or(RocmError::KernargSlotsExceedSegment {
+                op: "bind_kernarg",
+                slots: buffers.len(),
+                segment,
+            })?;
+        let kernarg = self.allocate_kernarg(segment)?;
+        let mut bytes = vec![0u8; required];
+        for (slot, (buffer, len)) in buffers.iter().enumerate() {
+            let offset = slot * 16;
+            bytes[offset..offset + 8].copy_from_slice(&buffer.device_ptr().to_le_bytes());
+            bytes[offset + 8..offset + 16].copy_from_slice(&len.to_le_bytes());
+        }
+        self.write_raw_bytes(&kernarg, 0, &bytes)?;
+        Ok(BoundKernarg {
+            kernarg,
+            buffers: buffers.iter().map(|&(buffer, _)| buffer.clone()).collect(),
+        })
     }
 }
 
@@ -1044,13 +1093,28 @@ pub(crate) mod test_only {
             private_segment_size: u32,
             args: &[poot_runtime_common::ArgSchema],
         ) -> Self {
+            let mut construction =
+                ModuleConstruction::new(Arc::new(NoopOwner), DevicePoison::default());
+            construction.executable = Some(bindings::hsa_executable_t { handle: 0 });
             KernelHandle {
-                kernel_object,
-                kernarg_size,
-                group_segment_size,
-                private_segment_size,
-                args: Arc::from(args),
+                module: Arc::new(construction.finish(
+                    kernel_object,
+                    kernarg_size,
+                    group_segment_size,
+                    private_segment_size,
+                    "kernel.kd".into(),
+                    Arc::from(args),
+                )),
             }
         }
+    }
+
+    /// An owner for synthetic modules: nothing was created, so nothing is released.
+    struct NoopOwner;
+
+    impl ResourceOwner for NoopOwner {
+        fn free_memory(&self, _ptr: *mut c_void) {}
+        fn destroy_reader(&self, _reader: bindings::hsa_code_object_reader_t) {}
+        fn destroy_executable(&self, _executable: bindings::hsa_executable_t) {}
     }
 }

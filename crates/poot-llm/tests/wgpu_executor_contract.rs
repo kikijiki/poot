@@ -1284,10 +1284,10 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
     std::fs::create_dir_all(&dir).unwrap();
     let out_path =
         poot_codegen::artifact_path(&dir, "sc015_assert_trap", poot_codegen::Target::SpirvVulkan);
-    poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out_path)
-        .expect("assert_trap must compile to SpirV");
-    let spv = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv);
+    let artifact =
+        poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+            .expect("assert_trap must compile to SpirV");
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let kernel = device
         .load_kernel("sc015_assert_trap", compiled)
         .expect("load the assert_trap kernel");
@@ -1381,13 +1381,13 @@ fn wgpu_device_refuses_an_aie_launch_as_a_typed_error() {
     std::fs::create_dir_all(&dir).unwrap();
     let out_path =
         poot_codegen::artifact_path(&dir, "aie_launch_probe", poot_codegen::Target::SpirvVulkan);
-    poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out_path)
-        .expect("len_probe must compile to SPIR-V");
-    let spv = std::fs::read(&out_path).unwrap();
+    let artifact =
+        poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+            .expect("len_probe must compile to SPIR-V");
     let kernel = device
         .load_kernel(
             "aie_launch_probe",
-            poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv),
+            poot_codegen::kernel_handle(&body, &artifact).unwrap(),
         )
         .expect("load the probe kernel");
     let input = device

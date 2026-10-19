@@ -1,6 +1,6 @@
 [package]
 name = "poot-l0-runtime"
-description = "poot Level Zero runtime: dispatch of poot-emitted OpenCL SPIR-V kernels on Intel GPUs through the dlopen'd Level Zero loader (libze_loader.so.1)"
+description = "poot Level Zero runtime: vendor-compiled graph execution on Intel NPUs through the dlopen'd Level Zero loader (libze_loader.so.1)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -8,24 +8,15 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[features]
-# The GPU half (SPIR-V modules, device buffers, kernel launches) until the Intel GPU `Device` consumes it
-# (POOT-ADR-0113). The NPU half is production: `poot-npu`'s `vpu` feature drives it.
-test-support = []
-
 [dependencies]
 libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-poot-l0-runtime = { path = ".", features = ["test-support"] }
-# The Intel-device row compiles the `add` fixture for `Target::SpirvOpenCl` and checks the device output
-# against the kernel-IR interpreter, the CPU oracle.
+# The NPU rows emit a VPU region with poot-codegen and build its F16 inputs with poot-quant.
 poot-codegen.workspace = true
 poot-quant.workspace = true
-bytemuck.workspace = true
-poot-kernel-ir = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

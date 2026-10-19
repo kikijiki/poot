@@ -321,7 +321,7 @@ fn a_one_dispatch_grid_past_255_workgroups_matches_the_oracle_on_rocm() {
 
 /// SC-003. Replaces the deleted dequant probes (`dequant_probes.rs` GPTQ, AWQ, Q8_0 and Q4_0, and
 /// `probe_indexed_matmul_dequant_rocm_test` and `probe_grouped_dequant_gemm_rocm_test`, whose dequant
-/// matmul ops Card 712 deleted). A packed linear per scheme (Q4_0, Q8_0, AWQ, GPTQ), at the decode GEMV
+/// matmul ops Card 712 deleted). A packed linear per scheme (Q4_0, Q8_0, AWQ, GPTQ, IQ3_S), at the decode GEMV
 /// and at a few rows, and the canonical indexed and grouped expert chain (`PackedDequant ->
 /// Transpose -> Reshape -> Concat -> IndexedMatMul`, the traced graph, so the row survives the later
 /// contraction claim) over each, match the oracle at every step. The weights are real-magnitude

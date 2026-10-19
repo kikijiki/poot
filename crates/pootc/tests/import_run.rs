@@ -123,6 +123,28 @@ fn kernel_intrinsics_extern() -> String {
     )
 }
 
+/// The dispatchable handle for `body` over the artifact pootc staged for it. A handle is built only from a
+/// sealed artifact, so `body` is compiled afresh and the staged bytes must be byte-identical to that compile:
+/// the kernel that runs is then both the one pootc published and the one `body` compiles to.
+fn staged_handle(
+    body: &Body,
+    target: poot_codegen::GpuTarget,
+    staged: &[u8],
+    name: &str,
+) -> CompiledKernel {
+    let dir = std::env::temp_dir().join("pootc-sealed-artifacts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = poot_codegen::artifact_path(&dir, name, poot_codegen::Target::from(target));
+    let artifact = poot_codegen::compile_kernel(body, target, &out)
+        .unwrap_or_else(|error| panic!("recompiling {name}: {error}"));
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        staged,
+        "{name}: the artifact pootc staged is not what its Body compiles to"
+    );
+    poot_codegen::kernel_handle(body, &artifact).unwrap()
+}
+
 /// Compile `kernel_file` with pootc (which emits `<src_name>.spv`) and return the dispatchable
 /// [`CompiledKernel`] (card 608) plus the imported Body's `param_count` and `has_trap()` (from the
 /// emitted `.kir.json`; the third element is `needs_error_word` for tests that assert on it directly,
@@ -155,8 +177,12 @@ fn pootc_compile(kernel_file: &str, src_name: &str) -> (CompiledKernel, u32, boo
         .unwrap_or_else(|_| panic!("pootc should have emitted {src_name}.spv"));
     let param_count = body.param_count;
     let has_trap = body.has_trap();
-    let compiled_kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, bytes);
+    let compiled_kernel = staged_handle(
+        &body,
+        poot_codegen::GpuTarget::SpirvVulkan,
+        &bytes,
+        src_name,
+    );
     (compiled_kernel, param_count, has_trap)
 }
 
@@ -456,8 +482,12 @@ fn llc_spin_depth4_and_reproducer() {
     let kir_json = std::fs::read_to_string(out_dir.join("llc_spin_depth4_and.kir.json"))
         .expect("pootc must publish llc_spin_depth4_and.kir.json");
     let body: Body = serde_json::from_str(&kir_json).expect("llc_spin_depth4_and.kir.json parses");
-    let compiled_kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, compiled_kernel);
+    let compiled_kernel = staged_handle(
+        &body,
+        poot_codegen::GpuTarget::SpirvVulkan,
+        &compiled_kernel,
+        "llc_spin_depth4_and",
+    );
 
     // llc rebuilds the selection merges from exactly the CFG this pass shapes, so the module has to be
     // strictly valid, not merely tolerated by RADV.
@@ -703,8 +733,12 @@ fn assert_trap_traps_on_ptx() {
         body.has_trap(),
         "assert_trap's data[idx[i]] bounds check is a real Assert; the compiled body must have a trap"
     );
-    let ptx_kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, ptx.into_bytes());
+    let ptx_kernel = staged_handle(
+        &body,
+        poot_codegen::GpuTarget::Nvptx,
+        ptx.as_bytes(),
+        "assert_trap",
+    );
 
     let ctx = match poot_ptx_runtime::PtxContext::new() {
         Ok(c) => c,
@@ -1200,7 +1234,6 @@ fn imported_kernel_matches_kernelgen_reduce_last() {
     // kernelgen's `reduce_last` bakes `cols` as a const (a Body per width); the imported `rowsum_dyn` reads
     // `cols` at runtime, so one Body covers all widths. Both are dispatched on the GPU and their outputs must
     // be identical for each width.
-    use poot_codegen::Target;
     use poot_kernel_ir::BinOp;
 
     let kernel = manifest_path("tests/kernels/rowsum_dyn.rs");
@@ -1224,11 +1257,10 @@ fn imported_kernel_matches_kernelgen_reduce_last() {
         let body =
             poot_kernelgen::reduce_last_dt("rl", poot_kernel_ir::Ty::F32, BinOp::Add, cols, 0.0);
         let kg_path = std::env::temp_dir().join(format!("pootc_kg_rl_{cols}.spv"));
-        poot_codegen::compile(&body, Target::SpirvVulkan, &kg_path)
-            .expect("compile kernelgen reduce_last");
-        let kg_spv = std::fs::read(&kg_path).unwrap();
-        let kg_kernel =
-            poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, kg_spv);
+        let kg_artifact =
+            poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &kg_path)
+                .expect("compile kernelgen reduce_last");
+        let kg_kernel = poot_codegen::kernel_handle(&body, &kg_artifact).unwrap();
         let mut kg_bufs = [
             KernelBuffer::read_only_f32(&x),
             KernelBuffer::write_f32(rows),
@@ -1313,7 +1345,6 @@ fn imported_lds_reduction_matches_kernelgen() {
     // card 044 / spec 054 (SC-002): a workgroup-parallel LDS sum-reduction authored in ordinary Rust (64 lanes
     // write to the workgroup-local array, a barrier, lane 0 sums), matching kernelgen's `wg_sum`. The first
     // imported cooperative kernel: barrier + LDS array.
-    use poot_codegen::Target;
 
     let kernel = manifest_path("tests/kernels/wg_reduce.rs");
     let (compiled_kernel, params, _needs_error_word) = pootc_compile(kernel, "wg_reduce");
@@ -1342,9 +1373,10 @@ fn imported_lds_reduction_matches_kernelgen() {
     // kernelgen's wg_sum, run the same way; must match.
     let kg = poot_kernel_ir::test_support::wg_sum("kg_wg_sum", 64);
     let kg_path = std::env::temp_dir().join("pootc_kg_wg_sum.spv");
-    poot_codegen::compile(&kg, Target::SpirvVulkan, &kg_path).expect("compile kernelgen wg_sum");
-    let kg_spv = std::fs::read(&kg_path).unwrap();
-    let kg_kernel = poot_codegen::kernel_handle(&kg, poot_codegen::GpuTarget::SpirvVulkan, kg_spv);
+    let kg_artifact =
+        poot_codegen::compile_kernel(&kg, poot_codegen::GpuTarget::SpirvVulkan, &kg_path)
+            .expect("compile kernelgen wg_sum");
+    let kg_kernel = poot_codegen::kernel_handle(&kg, &kg_artifact).unwrap();
     let mut kg_bufs = [KernelBuffer::read_only_f32(&a), KernelBuffer::write_f32(1)];
     ctx.dispatch("kg", &kg_kernel, wg, threads, &mut kg_bufs)
         .expect("dispatch kernelgen wg_sum");
@@ -2329,11 +2361,10 @@ fn imported_atomic_add_sum_smoke_runs_on_gpu() {
         "atomic_add_sum_smoke",
         poot_codegen::Target::SpirvVulkan,
     );
-    poot_codegen::compile(&body, poot_codegen::Target::SpirvVulkan, &out_path)
-        .expect("atomic_add_sum_smoke must compile to SPIR-V");
-    let spv = std::fs::read(&out_path).unwrap();
-    let compiled_kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv);
+    let artifact =
+        poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+            .expect("atomic_add_sum_smoke must compile to SPIR-V");
+    let compiled_kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
     let _gpu_guard = gpu_lock();
     let ctx = match Context::new() {
@@ -2806,8 +2837,6 @@ fn barrier_in_branchy_loop_runs_on_gpu() {
     // The runtime half of card 100 SC-002: dispatch a kernel with a bounds-guard branch inside a barrier'd
     // loop on RADV and check it against a CPU reference (it used to emit invalid SPIR-V and SIGSEGV the
     // driver). out[lane] = sum over chunks k of (a[k*W + lane] if k*W+lane < len else 0).
-    use poot_codegen::Target;
-    let _ = Target::SpirvVulkan;
 
     let kernel = manifest_path("tests/kernels/barrier_branch_loop.rs");
     let (compiled_kernel, params, _needs_error_word) = pootc_compile(kernel, "barrier_branch_loop");

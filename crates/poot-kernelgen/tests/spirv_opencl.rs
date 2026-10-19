@@ -1,9 +1,8 @@
-//! `Target::SpirvOpenCl` (OpenCL-flavoured SPIR-V for Level Zero devices): generated and fixture bodies lower
+//! `Target::SpirvOpenCl` (OpenCL-flavoured SPIR-V; no runtime consumes it, an Intel GPU backend is a future card): generated and fixture bodies lower
 //! through the real `compile()` path (`llc`, triple `spirv64-unknown-unknown`) to modules `spirv-val` accepts
 //! under `--target-env spv1.4` (the backend's output version), and the constructs OpenCL SPIR-V cannot
 //! express are typed refusals. Needs `llc` and `spirv-val` (the devshell); a missing tool fails the test, it
-//! does not skip it. The device row is `spirv_opencl_add_matches_cpu_oracle_on_level_zero` in
-//! `poot-l0-runtime`'s `tests/add.rs`.
+//! does not skip it. There is no device row.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

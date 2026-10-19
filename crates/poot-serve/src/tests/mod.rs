@@ -64,6 +64,7 @@ mod http_parse;
 mod lifecycle;
 mod other;
 mod recording_engine;
+mod request_caps;
 mod scheduling;
 mod streaming;
 mod telemetry;
@@ -182,8 +183,40 @@ pub(crate) fn test_caps(rows: usize) -> DriverCaps {
         inputs: InputSet {
             tokens: true,
             embeds: false,
-            encode: false,
+            encode: true,
         },
+        // A generative family that traces an embedding pass encodes at the rows it decodes with.
+        encode: Some(poot_llm::driver::EncodeCaps {
+            rows,
+            lengths: [1, 2, 4, 8, 16]
+                .map(|len| std::num::NonZeroUsize::new(len).expect("nonzero"))
+                .to_vec(),
+        }),
+    }
+}
+
+/// The caps an encoder engine publishes: `rows` rows per step and every length up to `max_len` tokens,
+/// no decode rows.
+pub(crate) fn test_encoder_caps(rows: usize, max_len: usize) -> DriverCaps {
+    let shapes = poot_llm::driver::EncodeShapes {
+        rows: std::num::NonZeroUsize::new(rows).expect("at least one row"),
+        max_len: std::num::NonZeroUsize::new(max_len).expect("at least one token"),
+    };
+    DriverCaps {
+        rows: shapes.rows,
+        row_counts: Vec::new(),
+        widths: Vec::new(),
+        max_seq: shapes.max_len,
+        inputs: InputSet {
+            tokens: false,
+            embeds: false,
+            encode: true,
+        },
+        encode: Some(poot_llm::driver::EncodeCaps {
+            rows: shapes.rows,
+            lengths: shapes.lengths(),
+        }),
+        ..test_caps(rows)
     }
 }
 
@@ -192,11 +225,29 @@ pub(crate) fn served_over(
     model: Arc<ModelHandle>,
     rows: usize,
 ) -> (Arc<Served>, Receiver<EngineMsg>) {
+    let caps = default_caps(&model, rows);
+    served_with_caps(model, caps)
+}
+
+/// The caps a fake of `rows` rows publishes for `model`: decode rows for a generative model, encode
+/// shapes for an encoder.
+fn default_caps(model: &ModelHandle, rows: usize) -> DriverCaps {
+    match model.config().output {
+        poot_models::model::ModelOutput::Logits { .. } => test_caps(rows),
+        _ => test_encoder_caps(rows, 16),
+    }
+}
+
+/// [`served_over`] with the caps the engine publishes named.
+pub(crate) fn served_with_caps(
+    model: Arc<ModelHandle>,
+    caps: DriverCaps,
+) -> (Arc<Served>, Receiver<EngineMsg>) {
     let (engine, queue) = mpsc::channel();
     let served = Served {
         model,
         engine,
-        view: EngineView::new(test_caps(rows)),
+        view: EngineView::new(caps),
         pooling: Pooling::Mean,
         images: None,
         max_queue_wait: TEST_QUEUE_WAIT,
@@ -223,7 +274,18 @@ pub(crate) fn serve_with_fake(
     model: Arc<ModelHandle>,
     metrics: &Arc<Metrics>,
 ) -> (Arc<Served>, EngineThread) {
-    let (served, queue) = served_over(model, engine.rows);
+    let caps = default_caps(&model, engine.rows);
+    serve_with_fake_caps(engine, model, caps, metrics)
+}
+
+/// [`serve_with_fake`] with the caps the engine publishes named.
+pub(crate) fn serve_with_fake_caps(
+    engine: RecordingEngine,
+    model: Arc<ModelHandle>,
+    caps: DriverCaps,
+    metrics: &Arc<Metrics>,
+) -> (Arc<Served>, EngineThread) {
+    let (served, queue) = served_with_caps(model, caps);
     let health = EngineHealth::serving_for_test("fake", engine.rows, engine.max_seq);
     let metrics = Arc::clone(metrics);
     let join = std::thread::spawn(move || run_engine_thread(engine, queue, &metrics, &health));

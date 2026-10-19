@@ -13,8 +13,10 @@ not served yet.
 The server loads the checkpoint as two registered families over one set of weights. The text decoder runs on the
 engine's driver as for any model, with its embedding-row entries prepared. The vision tower runs on its own driver
 and thread, opened before the engine so the engine fits its workload to the memory the tower left. A request's
-images are decoded and encoded there, off the engine thread (SmolVLM splits them into frames first), and the
-prompt's image placeholders then take the tower's rows. The sequence opens with those rows; no prefix is matched
+images are decoded and encoded there, off the engine thread (SmolVLM splits them into frames first). A panic of that
+thread turns `GET /health` to `dead` and fails the requests waiting on it with a `500`; a request waits at most five
+minutes for it and stops waiting when its client hangs up. The prompt's image placeholders then take the
+tower's rows. The sequence opens with those rows; no prefix is matched
 or registered for it. For Qwen2.5-VL the request also carries the prompt's rotary position table: the image's
 tokens sit at their own temporal, height and width positions, and the sequence opens with that table and continues
 from where it ends.
@@ -24,7 +26,7 @@ A request with images can hold a whole conversation: system, user and assistant 
 own chat template, with each image where its message carries it (a message's images come before its text), and each
 image's placeholders then take its frames' rows. The `image_url` parts are `data:` URIs with base64 PNG or JPEG
 content. The server fetches no URLs, so a URL, an image that does not decode, a message text that spells
-`<image>`, `tools`, `tool_choice`, a tool call or a tool message (the image chat template has no tool branch), too many frames (SmolVLM), or an image over the tower's patch limit (Qwen2.5-VL) is a `400`. `stop`, `response_format` and the guided fields apply as usual. A checkpoint without an
+`<image>`, more than 16 images in one request (refused before any base64 is decoded), images whose headers declare more than 64 Mi pixels together (refused before any pixel is decoded), `tools`, `tool_choice`, a tool call or a tool message (the image chat template has no tool branch), too many frames (SmolVLM), or an image over the tower's patch limit (Qwen2.5-VL) is a `400`. `stop`, `response_format` and the guided fields apply as usual. A checkpoint without an
 image front end refuses an image part with a `400` `unsupported_capability` error, and so does a video or audio part
 on any checkpoint, instead of dropping the part.
 

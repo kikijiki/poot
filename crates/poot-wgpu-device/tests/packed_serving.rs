@@ -15,6 +15,7 @@
 //! Mutation (role swap): in `bind_resident`'s packed-source arm, upload the component's owner with the
 //! first two source roles exchanged; the AWQ and GPTQ rows go red.
 
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::const_weights::ConstWeights;
 use poot_tensor::DType;
 use std::collections::HashMap;
@@ -1199,13 +1200,14 @@ fn fill(seed: u64, count: usize) -> Vec<f32> {
 }
 
 /// `y = x @ W^T` over a packed `[OUT, K]` weight with a dense `[m, K]` activation (every product contributes),
-/// run on `exec`, as one step reading the output.
+/// run on `exec`, as one step reading the output, with the numerics class the compiled program publishes: the class
+/// the output is compared with the oracle within.
 fn run_dense_activation(
     exec: &mut dyn Executor,
     target: Target,
     graph: &Graph,
     inputs: &HashMap<ValueId, Value>,
-) -> Vec<f32> {
+) -> (Vec<f32>, Tier2Class) {
     let (store, slot_binds) = split_consts_and_slots(graph, inputs);
     let (bound, map) = ConstWeights::bind(graph, &store);
     let program = staged(&bound, target);
@@ -1221,7 +1223,7 @@ fn run_dense_activation(
     );
     exec.remove_entry(exe, entry).unwrap();
     exec.unload(exe).unwrap();
-    out
+    (out, program.numerics_class())
 }
 
 /// SC-001: Q4_K, Q8_0 and FP8 contractions through the packed loaders meet their tier-2 oracle contract. A
@@ -1258,7 +1260,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_wgpu() {
                 x.id(),
                 HostTensor::f32(vec![m, K], fill(7 + m as u64, m * K)).into(),
             );
-            let got = run_dense_activation(&mut *exec, target, &graph, &inputs);
+            let (got, class) = run_dense_activation(&mut *exec, target, &graph, &inputs);
             let oracle_inputs = inputs.clone();
             let want = poot_eval::eval(
                 &graph,
@@ -1273,7 +1275,7 @@ fn packed_loaders_match_the_oracle_on_every_output_on_wgpu() {
             poot_executor_parity::assert_close(
                 &got,
                 want.as_f32().unwrap(),
-                poot_executor_parity::TIER2,
+                class.tolerance(),
                 &what,
             );
         }
@@ -1328,7 +1330,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
         let (head_graph, head_x, _) = build(false);
         let mut head_inputs = carriers(&head_graph, &owner);
         head_inputs.insert(head_x, activation.clone().into());
-        let head = run_dense_activation(&mut *exec, target, &head_graph, &head_inputs);
+        let (head, _) = run_dense_activation(&mut *exec, target, &head_graph, &head_inputs);
 
         let (graph, x, bias) = build(true);
         let bias = bias.unwrap();
@@ -1357,7 +1359,7 @@ fn a_packed_gemv_head_is_shared_with_the_standalone_gemv_on_wgpu() {
             let mut inputs = carriers(&graph, &owner);
             inputs.insert(x, activation.clone().into());
             inputs.insert(bias, HostTensor::f32(vec![OUT], bias_values.clone()).into());
-            let fused = run_dense_activation(&mut *exec, target, &graph, &inputs);
+            let (fused, _) = run_dense_activation(&mut *exec, target, &graph, &inputs);
             let want: Vec<f32> = head
                 .iter()
                 .zip(&bias_values)
@@ -1439,7 +1441,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
         let (head_graph, head_x, _) = build(false);
         let mut head_inputs = carriers(&head_graph, &owner);
         head_inputs.insert(head_x, activation.clone().into());
-        let head = run_dense_activation(&mut *exec, target, &head_graph, &head_inputs);
+        let (head, _) = run_dense_activation(&mut *exec, target, &head_graph, &head_inputs);
         let head_scale = head.iter().fold(0.0f32, |m, v| m.max(v.abs()));
 
         let (graph, x, leaves) = build(true);
@@ -1474,7 +1476,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
                 residual,
                 HostTensor::f32(vec![1, OUT], residual_values.clone()).into(),
             );
-            let fused = run_dense_activation(&mut *exec, target, &graph, &inputs);
+            let (fused, class) = run_dense_activation(&mut *exec, target, &graph, &inputs);
             let oracle = poot_eval::eval(
                 &graph,
                 &inputs,
@@ -1488,7 +1490,7 @@ fn a_packed_gemv_epilogue_agrees_with_the_oracle_on_wgpu() {
                 assert_close(
                     &fused,
                     oracle.as_f32().unwrap(),
-                    poot_executor_parity::TIER2,
+                    class.tolerance(),
                     &format!("{what}: fused vs the oracle"),
                 );
             } else {

@@ -197,6 +197,23 @@ fn driver(
     Some(Driver::new(Arc::clone(handle), executor, options(chunk, capacity)).unwrap())
 }
 
+/// A driver with the token-row encode shapes prepared: four rows, every length up to `capacity`.
+fn token_encoder(
+    choice: BackendChoice,
+    handle: &Arc<ModelHandle>,
+    chunk: usize,
+    capacity: usize,
+) -> Option<Driver> {
+    let mut driver = driver(choice, handle, chunk, capacity)?;
+    driver
+        .prepare_encode(&crate::driver::EncodeShapes {
+            rows: nz(4),
+            max_len: nz(capacity),
+        })
+        .unwrap();
+    Some(driver)
+}
+
 pub(super) fn generate(
     driver: &mut Driver,
     prompt: &[u32],
@@ -4784,7 +4801,7 @@ fn as_i32(ids: &[u32]) -> Vec<i32> {
 /// by how far they are padded and the row goes red.
 fn bert_encode_matches_the_oracle_whatever_the_padding(choice: BackendChoice) {
     let (handle, _) = encoder_family_handle("bert", None);
-    let Some(mut driver) = driver(choice, &handle, 16, 16) else {
+    let Some(mut driver) = token_encoder(choice, &handle, 16, 16) else {
         return;
     };
     let width = 32;
@@ -4816,11 +4833,14 @@ fn bert_encode_matches_the_oracle_whatever_the_padding(choice: BackendChoice) {
     close("short row in a batch", &batch.rows[0], &short);
     close("long row in a batch", &batch.rows[1], &long);
     close("short row alone", &alone.rows[0], &short);
-    let caps = driver.caps();
-    assert!(
-        caps.is_none(),
-        "an encode-only driver publishes no serving caps"
+    let caps = driver.caps().expect("prepare_encode publishes the caps");
+    assert_eq!(
+        caps.encode.as_ref().map(|encode| encode.rows.get()),
+        Some(4),
+        "the caps carry the prepared encode shapes"
     );
+    assert_eq!(caps.kv_blocks, 0, "an encoder holds no KV pool");
+    assert!(caps.inputs.encode && caps.widths.is_empty(), "{caps:?}");
 }
 per_backend!(
     bert_encode_matches_the_oracle_whatever_the_padding,
@@ -4834,7 +4854,7 @@ per_backend!(
 /// ranking they give is the oracle's.
 fn cross_encoder_scores_pairs_in_the_oracles_order(choice: BackendChoice) {
     let (handle, _) = encoder_family_handle("bert", Some("cross_encoder"));
-    let Some(mut driver) = driver(choice, &handle, 16, 16) else {
+    let Some(mut driver) = token_encoder(choice, &handle, 16, 16) else {
         return;
     };
     let pairs: [(&[u32], &[u32]); 3] = [
@@ -4882,7 +4902,7 @@ const RECORDED_MEAN: [f32; 4] = [-0.6346052, 0.3129701, 0.27594122, -0.24472162]
 /// row goes red.
 fn decoder_encode_matches_the_oracle_and_its_recorded_mean(choice: BackendChoice) {
     let (handle, _) = encoder_family_handle("qwen2", None);
-    let Some(mut driver) = driver(choice, &handle, 4, CAPACITY) else {
+    let Some(mut driver) = token_encoder(choice, &handle, 4, CAPACITY) else {
         return;
     };
     let ids = [3u32, 17, 40, 8, 25];
@@ -5787,7 +5807,7 @@ per_backend!(
 /// and a request of mixed kinds or an empty row is a typed refusal.
 fn encode_refuses_what_it_cannot_batch(choice: BackendChoice) {
     let (handle, _) = encoder_family_handle("bert", None);
-    let Some(mut driver) = driver(choice, &handle, 16, 16) else {
+    let Some(mut driver) = token_encoder(choice, &handle, 16, 16) else {
         return;
     };
     let refusal = |error: DriverError| match error {
@@ -5826,9 +5846,14 @@ fn encode_refuses_what_it_cannot_batch(choice: BackendChoice) {
             types: &[],
         }],
     });
-    assert!(
-        matches!(too_long.unwrap_err(), DriverError::Unsupported(_)),
-        "a row past the model's positions is the family's typed refusal"
+    assert_eq!(
+        refusal(too_long.unwrap_err()),
+        InvalidRequest::Encode(crate::driver::error::EncodeError::RowTooLong {
+            row: 0,
+            tokens: 17,
+            max: 16
+        }),
+        "a row past the prepared length is a typed refusal"
     );
 }
 per_backend!(

@@ -283,14 +283,13 @@ test-device-vpu:
         {{nextest}} --profile device-vpu -p poot-npu --features vpu --test-threads=1 -E '{{npu_selection}}'
     scripts/check-required-cases.py vpu
 
-# Level Zero device rows (POOT-1163, POOT-1164) through poot-l0-runtime: the generated `add` kernel, compiled to
-# OpenCL SPIR-V, on the Intel GPU against the CPU oracle, and the Intel NPU's graph extension (IR compiled by the
-# driver's graph compiler, blob reload, recordings). It runs in `nix develop .#npu-intel` (the Level Zero loader,
-# compute runtime, IGC, gmmlib and the NPU driver stack on LD_LIBRARY_PATH) on the Lunar Lake laptop. The rows are
+# Level Zero device rows (POOT-1164) through poot-l0-runtime: the Intel NPU's graph extension (IR compiled by the
+# driver's graph compiler, blob reload, recordings). There is no Level Zero GPU path. It runs in `nix develop .#npu-intel` (the Level Zero loader,
+# NPU driver stack on LD_LIBRARY_PATH) on the Lunar Lake laptop. The rows are
 # `#[ignore]`d, so they are run by test binary; no device means the context open fails and the recipe fails.
 test-device-l0:
     nix develop .#npu-intel -c cargo nextest run --profile device-l0 -p poot-l0-runtime --run-ignored only \
-        -E 'binary_id(=poot-l0-runtime::add) | binary_id(=poot-l0-runtime::npu_graph)'
+        -E 'binary_id(=poot-l0-runtime::npu_graph)'
     scripts/check-required-cases.py l0
 
 # The poot-llm tests that exist only under `--features rocm`. Nothing else builds the feature,

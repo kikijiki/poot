@@ -4,9 +4,11 @@ use anyhow::{Context, Result, bail};
 use poot_llm::driver::{AdapterRef, DriverCaps, ModelHandle};
 use poot_llm::{Modality, Sampler, TokenLogprob};
 use poot_text::TextCodec;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{EngineView, GenerationError};
+use crate::vision::ImageError;
 
 /// Sampling knobs shared by `/v1/completions` and `/v1/chat/completions`, flattened into both
 /// request structs. All optional; defaults are greedy with no penalties.
@@ -18,8 +20,10 @@ pub(crate) struct SamplingParams {
     pub(crate) top_k: usize,
     #[serde(default = "default_top_p")]
     pub(crate) top_p: f32,
+    /// The sampling seed. Absent, the request draws one from the OS ([`SamplingParams::resolve_seed`]);
+    /// a given seed makes the request reproducible.
     #[serde(default)]
-    pub(crate) seed: u64,
+    pub(crate) seed: Option<u64>,
     #[serde(default)]
     pub(crate) min_p: f32,
     /// HF/CTRL multiplicative repetition penalty (1.0 = off).
@@ -34,13 +38,44 @@ pub(crate) struct SamplingParams {
     pub(crate) logit_bias: std::collections::HashMap<String, f32>,
 }
 
+/// Most `logit_bias` entries a request may carry: the bias is applied to the logits at every token on
+/// the engine thread, so its size is paid per token.
+pub(crate) const MAX_LOGIT_BIAS_ENTRIES: usize = 10_000;
+
+impl SamplingParams {
+    /// Refuse a request whose sampling knobs cost more per token than the cap allows.
+    pub(crate) fn check(&self) -> Result<(), RefusedRequest> {
+        let entries = self.logit_bias.len();
+        if entries > MAX_LOGIT_BIAS_ENTRIES {
+            return Err(RefusedRequest(format!(
+                "`logit_bias` has {entries} entries: the limit is {MAX_LOGIT_BIAS_ENTRIES}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The seed of the request: the one it gave, else one drawn from the OS, so two unseeded requests
+    /// sample differently. Draw once per request; its choices are offset from it.
+    pub(crate) fn resolve_seed(&self) -> Result<u64> {
+        if let Some(seed) = self.seed {
+            return Ok(seed);
+        }
+        let mut bytes = [0u8; 8];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("the OS random source failed"))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+}
+
 /// Build a sampler from the request's optional fields (default greedy). A positive temperature
-/// enables the temperature/top-k/top-p/min-p draw; penalties and logit_bias apply on either path.
+/// enables the temperature/top-k/top-p/min-p draw; penalties and logit_bias apply on either path. The
+/// caller seeds each choice's stream with [`Sampler::reseed`] from [`SamplingParams::resolve_seed`].
 pub(crate) fn sampler_of(p: &SamplingParams) -> Sampler {
     let base = if p.temperature <= 0.0 {
         Sampler::greedy()
     } else {
-        Sampler::new(p.temperature, p.top_k, p.top_p, p.seed)
+        Sampler::new(p.temperature, p.top_k, p.top_p, 0)
     };
     // OpenAI sends logit_bias keys as token-id strings; parse them to ids and drop any non-numeric key.
     let bias = p
@@ -217,6 +252,11 @@ pub(crate) fn reject_unsupported_modality(
 /// Refuse `n` choices the engine has no rows to run at once: each choice is one job, and a request is
 /// answered only when every choice is, so more choices than rows could never all be served together.
 pub(crate) fn check_choices(n: usize, caps: &DriverCaps) -> anyhow::Result<()> {
+    if caps.row_counts.is_empty() {
+        return Err(anyhow::Error::new(RefusedRequest(
+            "this model serves embeddings and rerank only: it generates no text".into(),
+        )));
+    }
     if n > caps.rows.get() {
         return Err(anyhow::Error::new(RefusedRequest(format!(
             "n = {n} choices exceed the engine's {} rows: each choice is one concurrent job",
@@ -241,6 +281,8 @@ pub(crate) fn classify_handler_error(e: &anyhow::Error) -> (u16, &'static str) {
         (400, "unsupported_capability")
     } else if let Some(error) = e.downcast_ref::<GenerationError>() {
         (error.stream_status(), error.error_type())
+    } else if e.downcast_ref::<ImageError>().is_some() {
+        (500, "image_front_end_error")
     } else {
         (500, "server_error")
     }
@@ -472,6 +514,10 @@ pub(crate) fn clamp_logprobs(k: usize) -> usize {
 /// pins a worker doing millions of `contains` per token for up to `MAX_NEW_TOKENS_CAP` tokens. OpenAI
 /// caps `stop` at 4; 16 leaves headroom. Truncated, not rejected, like `clamp_n`/`clamp_logprobs`.
 pub(crate) const MAX_STOP_SEQUENCES: usize = 16;
+/// Longest single `stop` string, in bytes; a longer one is a 400. The scan is `O(bytes)` per token.
+pub(crate) const MAX_STOP_BYTES: usize = 1024;
+/// Most bytes all of a request's kept `stop` strings may hold together; more is a 400.
+pub(crate) const MAX_TOTAL_STOP_BYTES: usize = 4096;
 
 /// OpenAI's `stop` is a string or an array of strings; accept either.
 #[derive(Deserialize)]
@@ -481,17 +527,30 @@ pub(crate) enum Stop {
     Many(Vec<String>),
 }
 impl Stop {
-    /// The untrusted-input chokepoint for every `stop` consumer: truncate to `MAX_STOP_SEQUENCES` here
-    /// so the count is bounded once at the boundary, before any per-token scan (engine-derived
-    /// chat-template stops appended downstream are few and trusted).
-    pub(crate) fn list(opt: &Option<Stop>) -> Vec<String> {
+    /// The untrusted-input chokepoint for every `stop` consumer: truncate to `MAX_STOP_SEQUENCES` and
+    /// refuse a string over `MAX_STOP_BYTES` or kept strings over `MAX_TOTAL_STOP_BYTES` here, so the
+    /// per-token scan is bounded once at the boundary (engine-derived chat-template stops appended
+    /// downstream are few and trusted).
+    pub(crate) fn list(opt: &Option<Stop>) -> Result<Vec<String>, RefusedRequest> {
         let mut v = match opt {
             Some(Stop::One(s)) => vec![s.clone()],
             Some(Stop::Many(v)) => v.clone(),
             None => Vec::new(),
         };
         v.truncate(MAX_STOP_SEQUENCES);
-        v
+        if let Some(long) = v.iter().find(|stop| stop.len() > MAX_STOP_BYTES) {
+            return Err(RefusedRequest(format!(
+                "a `stop` string is {} bytes long: the limit is {MAX_STOP_BYTES}",
+                long.len()
+            )));
+        }
+        let total: usize = v.iter().map(String::len).sum();
+        if total > MAX_TOTAL_STOP_BYTES {
+            return Err(RefusedRequest(format!(
+                "`stop` strings total {total} bytes: the limit is {MAX_TOTAL_STOP_BYTES}"
+            )));
+        }
+        Ok(v)
     }
 }
 

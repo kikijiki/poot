@@ -474,7 +474,7 @@ pub fn binary(name: &str, op: BinOp) -> Body {
 mod tests {
     use std::path::PathBuf;
 
-    use poot_codegen::{Target, compile};
+    use poot_codegen::{GpuTarget, Target, compile_kernel};
     use poot_wgpu_runtime::{Context, KernelBuffer};
 
     use super::test_only::vec4_add_splat;
@@ -483,9 +483,8 @@ mod tests {
         let dir: PathBuf = std::env::temp_dir().join("poot-kernelgen-test").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
-        compile(body, Target::SpirvVulkan, &out).expect("compile");
-        let bytes = std::fs::read(&out).unwrap();
-        poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
+        let artifact = compile_kernel(body, GpuTarget::SpirvVulkan, &out).expect("compile");
+        poot_codegen::kernel_handle(body, &artifact).unwrap()
     }
 
     fn ctx() -> Option<Context> {

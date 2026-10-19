@@ -1537,4 +1537,54 @@ mod tests {
             );
         }
     }
+
+    /// `IQ3_S` blocks decode to llama.cpp's `dequantize_row_iq3_s`, bit for bit in f32: eight synthetic
+    /// blocks and three runs of eight blocks of the real Qwen3.8-27B tensor `blk.14.ffn_down.weight`.
+    /// The data and the C++ generator that wrote it are `tests/data/iq3_s_reference.{tsv,cpp}`.
+    /// Mutation: change one entry of `IQ3S_GRID`; every row goes red.
+    #[test]
+    fn iq3_s_blocks_decode_to_the_llamacpp_reference_bit_for_bit() {
+        const ROWS: &str = include_str!("../tests/data/iq3_s_reference.tsv");
+        let unhex = |hex: &str| -> Vec<u8> {
+            (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let layout = IQ3_S;
+        let Storage::Blocks(block) = layout.storage else {
+            panic!("IQ3_S is a block format");
+        };
+        let mut rows = 0;
+        for line in ROWS.lines().filter(|line| !line.starts_with('#')) {
+            let mut columns = line.split('\t');
+            let (source, bytes, expected) = (
+                columns.next().unwrap(),
+                unhex(columns.next().unwrap()),
+                unhex(columns.next().unwrap()),
+            );
+            assert_eq!(bytes.len(), 8 * block.bytes, "{source}");
+            let mut decoded = vec![0.0f32; 8 * block.values];
+            layout.decode_blocks(&bytes, &mut decoded).unwrap();
+            let expected: Vec<f32> = expected
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .collect();
+            assert_eq!(decoded.len(), expected.len(), "{source}");
+            if let Some(at) =
+                (0..decoded.len()).find(|&i| decoded[i].to_bits() != expected[i].to_bits())
+            {
+                panic!(
+                    "{source}: value {at} decodes to {} ({:#010x}), llama.cpp says {} ({:#010x})",
+                    decoded[at],
+                    decoded[at].to_bits(),
+                    expected[at],
+                    expected[at].to_bits()
+                );
+            }
+            rows += 1;
+        }
+        assert_eq!(rows, 4, "one synthetic and three real runs");
+    }
 }

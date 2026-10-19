@@ -59,7 +59,12 @@ pub(crate) fn decode_fixture(
     }
 }
 
-/// A prefill fixture of `dense`: one `n`-token forward over `cap` positions.
+/// A prefill fixture of `dense` over `cap` positions: an `n`-token forward that returns the logits of
+/// every position, then a second `n`-token forward at positions `n..2n`. The second step attends over
+/// the cache the first wrote, so a cache entry the first step stored wrongly (or a prefill that drops
+/// its cache write) moves the second step's logits; comparing one step's last position alone sees
+/// neither. One graph carries both steps: the second is the same prefill program one chunk later, the
+/// shape chunked prefill and prefix reuse execute.
 fn prefill_fixture(
     name: &'static str,
     dense: &Dense,
@@ -67,18 +72,30 @@ fn prefill_fixture(
     cap: usize,
     store: impl Fn(&Graph) -> WeightStore,
 ) -> Fixture {
+    assert!(
+        2 * n <= cap,
+        "{name}: two {n}-token chunks need {} cache positions, the fixture has {cap}",
+        2 * n
+    );
     let m = dense.f32_model();
     let g = m
         .model
         .trace(
             Phase::Prefill,
-            step(1, n, cap, LogitRows::Last),
+            step(1, n, cap, LogitRows::All),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
     let store = store(&g);
-    let prompt: Vec<u32> = (0..n as u32).map(|t| (t * 11 + 2) % 32).collect();
-    let steps = vec![step_fixtures(&g, &prompt, 0)];
+    let chunk = |start: usize| -> Vec<u32> {
+        (start..start + n)
+            .map(|t| ((t * 11 + 2) % 32) as u32)
+            .collect()
+    };
+    let steps = vec![
+        step_fixtures(&g, &chunk(0), 0),
+        step_fixtures(&g, &chunk(n), n),
+    ];
     Fixture {
         name,
         graph: g,
@@ -87,7 +104,7 @@ fn prefill_fixture(
     }
 }
 
-/// A qwen2 prefill fixture: one `n`-token forward.
+/// A qwen2 prefill fixture: [`prefill_fixture`] over the qwen2 body.
 pub fn qwen2_prefill_fixture(n: usize, cap: usize) -> Fixture {
     prefill_fixture(
         "qwen2_prefill",
@@ -172,4 +189,130 @@ pub fn head_layout_decode_fixtures(cap: usize) -> Vec<Fixture> {
         decode_fixture(name, &dense, cap, store_for)
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use poot_graph_ir::Slot;
+    use poot_tensor::HostTensor;
+
+    use super::*;
+
+    /// Prefill parity compares every position and a step that reads the prefilled cache: the logits come
+    /// back for all `n` positions of a step, and the second step starts where the first ended.
+    ///
+    /// Mutation: trace the prefill with `LogitRows::Last`; the result has one row and this goes red on the
+    /// output shape.
+    #[test]
+    fn the_prefill_fixture_returns_every_position_and_reads_its_own_cache() {
+        let (n, cap) = (4, 8);
+        let fixture = qwen2_prefill_fixture(n, cap);
+        let logits = fixture.graph.aval(fixture.graph.result());
+        assert_eq!(
+            logits.shape,
+            [1, n, 32],
+            "one logit row per prefilled position"
+        );
+        assert_eq!(
+            fixture.steps.len(),
+            2,
+            "a prefill and a step over its cache"
+        );
+        let positions = |step: usize| -> Vec<i32> {
+            let pos = fixture.steps[step]
+                .iter()
+                .find(|row| row.key.role() == Slot::Pos)
+                .expect("a prefill step binds positions");
+            pos.tensor.as_i32().unwrap().to_vec()
+        };
+        assert_eq!(positions(0), [0, 1, 2, 3]);
+        assert_eq!(
+            positions(1),
+            [4, 5, 6, 7],
+            "the second step starts after the cache the first wrote"
+        );
+    }
+
+    /// A prefill fixture's tokens with the token at position 3 replaced: the cache entry stored at
+    /// position 3 then differs from the oracle's.
+    fn corrupted_first_step(fixture: &Fixture) -> Vec<poot_eval::test_support::StepFixture> {
+        let tokens: Vec<u32> = (0..4u32)
+            .map(|t| {
+                let token = (t * 11 + 2) % 32;
+                if t == 3 { (token + 5) % 32 } else { token }
+            })
+            .collect();
+        step_fixtures(&fixture.graph, &tokens, 0)
+    }
+
+    /// The CPU oracle for `fixture`, the same one every device lane uses.
+    fn cpu_oracle(
+        fixture: &Fixture,
+    ) -> impl FnMut(&[poot_eval::test_support::StepFixture]) -> HostTensor {
+        poot_eval::test_support::weight_map_oracle::oracle_for(&fixture.graph, &fixture.store)
+    }
+
+    /// Prefill parity compares every position: a device whose logits are right at the last position and
+    /// wrong at position 1 fails step 0. Runs the real `run_parity` over the echo device.
+    ///
+    /// Mutation: trace the prefill with `LogitRows::Last` (compare the last position only); the logits
+    /// have one row and this goes red on `the prefill returns a row per position`.
+    #[test]
+    fn a_wrong_logit_at_a_non_final_position_fails_the_prefill() {
+        let (n, cap) = (4, 8);
+        let fixture = qwen2_prefill_fixture(n, cap);
+        let (mut exec, target, answer) = poot_executor_parity::echo::echo_executor();
+        let mut oracle = cpu_oracle(&fixture);
+        let mut calls = 0;
+        let mut checked = |step: &[poot_eval::test_support::StepFixture]| {
+            let want = oracle(step);
+            let mut device = want.as_f32().unwrap().to_vec();
+            if calls == 0 {
+                assert_eq!(
+                    want.shape(),
+                    [1, n, 32],
+                    "the prefill returns a row per position"
+                );
+                device[32..64].iter_mut().for_each(|v| *v += 1.0);
+            }
+            calls += 1;
+            answer.set(&HostTensor::f32(want.shape().to_vec(), device));
+            want
+        };
+        let err = poot_executor_parity::run_parity(exec.as_mut(), target, &fixture, &mut checked)
+            .expect_err("a wrong position-1 logit must fail the prefill");
+        assert!(err.contains("step 0"), "{err}");
+    }
+
+    /// A cache entry stored wrongly at position 3 by the prefill is caught by the step that reads it. The
+    /// device's step-0 logits are the oracle's, so only the second step can show the corruption: its
+    /// answers come from an oracle that prefilled a different token at position 3.
+    ///
+    /// Mutation: drop the second step from `prefill_fixture`; `run_parity` passes and this goes red on
+    /// `a corrupted cache entry must fail the step that reads it`.
+    #[test]
+    fn a_corrupted_cache_entry_fails_the_step_that_reads_it() {
+        let fixture = qwen2_prefill_fixture(4, 8);
+        let (mut exec, target, answer) = poot_executor_parity::echo::echo_executor();
+        let mut clean = cpu_oracle(&fixture);
+        let mut corrupt = cpu_oracle(&fixture);
+        let corrupted = corrupted_first_step(&fixture);
+        let mut calls = 0;
+        let mut oracle = |step: &[poot_eval::test_support::StepFixture]| {
+            let want = clean(step);
+            let device = if calls == 0 {
+                // The corrupt device prefills the wrong token, but its logits are reported correctly.
+                corrupt(&corrupted);
+                want.clone()
+            } else {
+                corrupt(step)
+            };
+            calls += 1;
+            answer.set(&device);
+            want
+        };
+        let err = poot_executor_parity::run_parity(exec.as_mut(), target, &fixture, &mut oracle)
+            .expect_err("a corrupted cache entry must fail the step that reads it");
+        assert!(err.contains("step 1"), "{err}");
+    }
 }

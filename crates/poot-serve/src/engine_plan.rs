@@ -22,29 +22,25 @@ use poot_graph_plan::{
 };
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_llm::driver::capacity::{
-    Budget, CapacityRefusal, Fit, FitError, Observation, PlanError, PlanFailure, Planner,
-    verify_prepared,
+    Budget, CapacityRefusal, EncodeNeed, Fit, FitError, Observation, PlanError, PlanFailure,
+    Planner, prepare_encode, verify_prepared,
 };
 use poot_llm::driver::error::{DriverError, InvalidRequest, Unsupported};
 use poot_llm::driver::placement::{BalanceError, LayerBytes, Placement, balance_layers};
 use poot_llm::driver::{
-    BackendChoice, DraftPolicy, Driver, DriverCaps, DriverOptions, Head, Layout, ModelHandle,
-    PoolShape, PreparedSetLimits, ServingShapes, Warm, program_retention,
+    BackendChoice, DraftPolicy, Driver, DriverCaps, DriverOptions, EncodeShapes, Head, Layout,
+    ModelHandle, PoolShape, PreparedSetLimits, ServingShapes, Warm, program_retention,
 };
 use poot_models::model::ModelOutput;
 use poot_target::{Backend as TargetBackend, TargetId};
 
-use crate::config::PlacementSpec;
+use crate::config::{DEFAULT_ENCODE_ROWS, DEFAULT_MAX_SEQ, DEFAULT_ROWS, PlacementSpec};
 
 /// Bytes kept back on every device for allocations the planner cannot see: recordings, staging and
 /// driver state a runtime makes on its own. A bound, not a measurement; the live counters are checked
 /// against the budget less this after prepare.
 pub(crate) const SUPPORT_RESERVE_BYTES: u64 = 256 << 20;
 
-/// Decode rows the server asks for before the memory fit reduces them.
-const DEFAULT_ROWS: usize = 4;
-/// Positions per sequence the server asks for before the memory fit reduces them.
-const DEFAULT_MAX_SEQ: usize = 4096;
 /// The fewest positions per sequence the fit will offer.
 const MIN_MAX_SEQ: usize = 128;
 /// The prefill chunk, in tokens, rounded down to the model's granule and capped by the capacity.
@@ -53,13 +49,14 @@ const PREFILL_CHUNK_TOKENS: usize = 128;
 const MAX_ENTRIES: usize = 64;
 const MAX_RETAINED_BYTES: u64 = 1 << 32;
 
-/// What the operator asked for. Absent fields take the defaults above.
+/// What the operator asked for. Absent fields take the defaults of [`crate::config`].
 #[derive(Clone, Debug)]
 pub(crate) struct EngineArgs {
     pub(crate) backend: BackendChoice,
     /// Which devices run the model, and how.
     pub(crate) placement: PlacementSpec,
-    pub(crate) rows: NonZeroUsize,
+    /// Rows to ask the fit for first; `None` takes the default of the workload the model's output asks for.
+    pub(crate) rows: Option<NonZeroUsize>,
     pub(crate) max_seq: NonZeroUsize,
     /// How decode rows propose tokens to verify; `Off` serves one token a step.
     pub(crate) draft: DraftPolicy,
@@ -78,8 +75,17 @@ impl EngineArgs {
             draft,
             embeds: false,
             expert_pool: None,
-            rows: NonZeroUsize::new(DEFAULT_ROWS).expect("nonzero"),
-            max_seq: NonZeroUsize::new(DEFAULT_MAX_SEQ).expect("nonzero"),
+            rows: None,
+            max_seq: DEFAULT_MAX_SEQ,
+        }
+    }
+
+    /// The rows and positions to ask the fit for first.
+    pub(crate) fn with_shape(self, rows: Option<NonZeroUsize>, max_seq: NonZeroUsize) -> Self {
+        Self {
+            rows,
+            max_seq,
+            ..self
         }
     }
 
@@ -102,33 +108,58 @@ impl EngineArgs {
     }
 }
 
-/// What the server runs the model for. Only generation is planned: an encoder or cross-encoder prepares
-/// its entries on first use, so their allocations cannot be accounted before `Serving`, and startup
-/// refuses them ([`StartupError::NotAccounted`]) until their routes exist (POOT-589).
+/// What the server runs the model for, by what its output is: a generative model decodes over a paged
+/// pool and, when its family traces an embedding pass, also encodes token rows at the same fitted
+/// shapes; an embedding or rerank model only encodes. Either way the shapes are fitted and prepared
+/// before `Serving`; nothing compiles or allocates on the first request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Workload {
-    /// Generation over a paged pool: the rows and positions the memory fit settled on.
+    /// Generation over a paged pool: the rows and positions the memory fit settled on. The same shapes
+    /// carry the encode entries of a family that traces them.
     Generate {
+        rows: NonZeroUsize,
+        max_seq: NonZeroUsize,
+    },
+    /// Encoding: `rows` rows per step and every length up to `max_seq` tokens.
+    Encode {
         rows: NonZeroUsize,
         max_seq: NonZeroUsize,
     },
 }
 
 impl Workload {
-    /// The workload a model's output asks for, or the refusal when its allocations cannot be accounted.
-    fn of(
-        output: ModelOutput,
-        rows: NonZeroUsize,
-        max_seq: NonZeroUsize,
-    ) -> Result<Self, StartupError> {
+    /// The workload a model's output asks for, at the shapes requested.
+    fn of(output: ModelOutput, rows: Option<NonZeroUsize>, max_seq: NonZeroUsize) -> Self {
         match output {
-            ModelOutput::Logits { .. } => Ok(Workload::Generate { rows, max_seq }),
-            ModelOutput::Hidden { .. } => Err(StartupError::NotAccounted {
-                output: "hidden states (embeddings)",
-            }),
-            ModelOutput::Scores { .. } => Err(StartupError::NotAccounted {
-                output: "classifier scores (rerank)",
-            }),
+            ModelOutput::Logits { .. } => Workload::Generate {
+                rows: rows.unwrap_or(DEFAULT_ROWS),
+                max_seq,
+            },
+            ModelOutput::Hidden { .. } | ModelOutput::Scores { .. } => Workload::Encode {
+                rows: rows.unwrap_or(DEFAULT_ENCODE_ROWS),
+                max_seq,
+            },
+        }
+    }
+
+    /// The same workload at the shapes the fit chose.
+    fn fitted(self, candidate: &Candidate) -> Self {
+        let (rows, max_seq) = (candidate.rows, candidate.max_seq);
+        match self {
+            Workload::Generate { .. } => Workload::Generate { rows, max_seq },
+            Workload::Encode { .. } => Workload::Encode { rows, max_seq },
+        }
+    }
+
+    fn rows(self) -> NonZeroUsize {
+        match self {
+            Workload::Generate { rows, .. } | Workload::Encode { rows, .. } => rows,
+        }
+    }
+
+    fn max_seq(self) -> NonZeroUsize {
+        match self {
+            Workload::Generate { max_seq, .. } | Workload::Encode { max_seq, .. } => max_seq,
         }
     }
 }
@@ -184,11 +215,9 @@ pub(crate) struct EnginePlan {
 }
 
 impl EnginePlan {
-    /// The decode rows the engine serves; zero for a workload with no decode slots.
+    /// The rows the engine serves: decode slots, or texts per encode step.
     pub(crate) fn rows(&self) -> usize {
-        match self.workload {
-            Workload::Generate { rows, .. } => rows.get(),
-        }
+        self.workload.rows().get()
     }
 
     /// The label the gauges and `/health` report for the resolved backend.
@@ -291,13 +320,10 @@ impl EngineHealth {
 
     /// Publish `Serving` for `plan`. Called after `prepare` and the live accounting, never before.
     fn serving(&self, plan: &EnginePlan) {
-        let max_seq = match plan.workload {
-            Workload::Generate { max_seq, .. } => max_seq.get(),
-        };
         *self.0.write().expect("engine health lock") = EngineState::Serving {
             backend: plan.backend_label(),
             rows: plan.rows(),
-            max_seq,
+            max_seq: plan.workload.max_seq().get(),
         };
     }
 }
@@ -324,12 +350,6 @@ pub(crate) enum StartupError {
     /// No layer pipeline over the devices holds the model's weights.
     #[error("the model has no balanced pipeline over the devices: {0}")]
     Pipeline(#[source] BalanceError),
-    /// The model's workload prepares its entries on first use, so its allocations cannot be accounted
-    /// before `Serving`. Refused rather than served unaccounted.
-    #[error(
-        "{output} models are prepared on first use and not accounted: refused until their routes exist"
-    )]
-    NotAccounted { output: &'static str },
     #[error(transparent)]
     Driver(DriverError),
     /// The planner's shared kernel table was bound to another backend than its planning engine's: a
@@ -399,11 +419,8 @@ fn domain(rows: NonZeroUsize, max_seq: NonZeroUsize) -> Vec<Candidate> {
     }
 }
 
-fn driver_options(
-    handle: &ModelHandle,
-    max_seq: NonZeroUsize,
-    draft: DraftPolicy,
-) -> DriverOptions {
+fn driver_options(handle: &ModelHandle, workload: Workload, draft: DraftPolicy) -> DriverOptions {
+    let max_seq = workload.max_seq();
     let compile = CompileOptions::new(Submission::Replay, CompileLimits::STANDARD);
     // The largest granule multiple within the chunk budget and the capacity, and never below one granule.
     let granule = handle.config().prefill_granule.get();
@@ -415,7 +432,17 @@ fn driver_options(
         decode: compile,
         capacity: max_seq,
         prefill_chunk: chunk,
-        trace: poot_llm::driver::serving_trace_limits(chunk),
+        // An encode step carries every row's tokens at once: the limit covers the widest one, and a
+        // generation workload's prefill chunk.
+        trace: poot_llm::driver::serving_trace_limits(
+            NonZeroUsize::new(match workload {
+                Workload::Generate { rows, max_seq } => {
+                    (rows.get() * max_seq.get()).max(chunk.get())
+                }
+                Workload::Encode { rows, max_seq } => rows.get() * max_seq.get(),
+            })
+            .expect("nonzero"),
+        ),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(MAX_ENTRIES).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(MAX_RETAINED_BYTES).expect("nonzero"),
@@ -439,6 +466,14 @@ fn shapes_of<'a>(candidate: &Candidate, rows: &'a [NonZeroUsize; 1]) -> ServingS
         warm: Warm::Admitted,
         windows: &[],
         adapters: &[],
+    }
+}
+
+/// The token rows an encode workload prepares: the candidate's rows, every length up to its longest.
+fn encode_shapes_of(candidate: &Candidate) -> EncodeShapes {
+    EncodeShapes {
+        rows: candidate.rows,
+        max_len: candidate.max_seq,
     }
 }
 
@@ -577,8 +612,7 @@ impl EnginePlan {
         let config = handle.config();
         let max_seq = NonZeroUsize::new(args.max_seq.get().min(config.max_positions))
             .expect("a model has positions");
-        // Refused before any device opens: an unaccounted workload never touches the device.
-        Workload::of(config.output, args.rows, max_seq)?;
+        let workload = Workload::of(config.output, args.rows, max_seq);
         let opened = open(args).map_err(|source| StartupError::Device {
             choice: args.backend,
             source,
@@ -603,7 +637,7 @@ impl EnginePlan {
             launch,
             &targets,
             &placement,
-            max_seq,
+            workload,
             &mut observe,
         )?;
         // `prepare` published them: a driver without caps is a bug in the preparation, reported as the
@@ -613,10 +647,7 @@ impl EnginePlan {
             .cloned()
             .ok_or_else(|| DriverError::from(InvalidRequest::NotPrepared))?;
         let observed = observe(&driver.observation());
-        let workload = Workload::Generate {
-            rows: candidate.rows,
-            max_seq: candidate.max_seq,
-        };
+        let workload = workload.fitted(&candidate);
         let budget = BudgetReport {
             devices: planned
                 .into_iter()
@@ -654,15 +685,15 @@ struct Fitted {
     planning_kernels_resolved: u64,
 }
 
-/// Fit the generation workload to the devices, then prepare the chosen shapes on the real executor and
-/// check what it allocated.
+/// Fit the workload to the devices, then prepare the chosen shapes on the real executor and check what
+/// it allocated.
 fn fit_and_prepare(
     args: &EngineArgs,
     handle: &Arc<ModelHandle>,
     launch: Launch,
     targets: &TargetSet,
     placement: &Placement,
-    max_seq: NonZeroUsize,
+    workload: Workload,
     observe: &mut impl FnMut(&Observation) -> Budget,
 ) -> Result<Fitted, StartupError> {
     let mut planner = Planner::new(Arc::clone(handle), targets, placement.clone())?;
@@ -672,20 +703,26 @@ fn fit_and_prepare(
     let mut planning_weight_bytes_read = 0u64;
     let mut planning_kernels_resolved = 0u64;
     let fit = poot_llm::driver::capacity::fit(
-        &domain(args.rows, max_seq),
+        &domain(workload.rows(), workload.max_seq()),
         |candidate| {
             let rows = [candidate.rows];
-            planner
-                .plan(
-                    driver_options(handle, candidate.max_seq, args.draft.clone()),
-                    &shapes_of(candidate, &rows),
-                    args.embeds,
-                )
-                .inspect(|planned| {
-                    planning_weight_bytes_read += planned.weight_bytes_read;
-                    planning_kernels_resolved += planned.kernels_resolved;
-                })
-                .map_err(PlanFailure::Fatal)
+            let options = driver_options(handle, workload.fitted(candidate), args.draft.clone());
+            let encode = encode_shapes_of(candidate);
+            match workload {
+                Workload::Generate { .. } => planner.plan_workload(
+                    options,
+                    Some((&shapes_of(candidate, &rows), args.embeds)),
+                    Some((&encode, EncodeNeed::IfTraced)),
+                ),
+                Workload::Encode { .. } => {
+                    planner.plan_workload(options, None, Some((&encode, EncodeNeed::Required)))
+                }
+            }
+            .inspect(|planned| {
+                planning_weight_bytes_read += planned.weight_bytes_read;
+                planning_kernels_resolved += planned.kernels_resolved;
+            })
+            .map_err(PlanFailure::Fatal)
         },
         // One observation per admission, never the budget read once before the search.
         || observe(&Observation::of(launch.executor())),
@@ -712,16 +749,32 @@ fn fit_and_prepare(
         .collect::<Result<Vec<_>, _>>()?;
     let mut driver = launch.driver(
         Arc::clone(handle),
-        driver_options(handle, chosen.max_seq, args.draft.clone()),
+        driver_options(handle, workload.fitted(&chosen), args.draft.clone()),
         placement.clone(),
     )?;
     if let Some(slots) = args.expert_pool {
         driver = driver.with_expert_pool(slots)?;
     }
     let rows = [chosen.rows];
-    driver.prepare(&shapes_of(&chosen, &rows))?;
-    if args.embeds {
-        driver.prepare_embeds(&shapes_of(&chosen, &rows))?;
+    match workload {
+        Workload::Generate { .. } => {
+            driver.prepare(&shapes_of(&chosen, &rows))?;
+            if args.embeds {
+                driver.prepare_embeds(&shapes_of(&chosen, &rows))?;
+            }
+            prepare_encode(
+                &mut driver,
+                &encode_shapes_of(&chosen),
+                EncodeNeed::IfTraced,
+            )?;
+        }
+        Workload::Encode { .. } => {
+            prepare_encode(
+                &mut driver,
+                &encode_shapes_of(&chosen),
+                EncodeNeed::Required,
+            )?;
+        }
     }
     verify_prepared(
         &footprint,

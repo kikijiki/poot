@@ -29,8 +29,8 @@
 
 use poot_eval::{EvalBudget, EvalOptions, eval};
 use poot_executor::{Device, Engine, Executor};
-use poot_executor_parity::scan::{check_steps, streamed_in_pieces};
-use poot_executor_parity::{TIER2, assert_close};
+use poot_executor_parity::assert_close;
+use poot_executor_parity::scan::{check_steps, numerics_class, streamed_in_pieces};
 use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_graph_ir::{Graph, OpKind};
 use poot_graph_plan::test_support::gpu_caps;
@@ -176,7 +176,7 @@ fn scan_schedules_match_the_oracle_in_every_regime_on_wgpu() {
         assert_close(
             &one_launch[0],
             &pieces,
-            TIER2,
+            numerics_class(target, &long).tolerance(),
             "split schedule against unsplit pieces",
         );
     }

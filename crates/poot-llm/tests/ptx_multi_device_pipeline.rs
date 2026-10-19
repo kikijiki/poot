@@ -19,7 +19,8 @@ use poot_executor::{
     Collectives, Coordinator, CoordinatorCounters, Device, DeviceTime, Dispatch, Engine, ExecError,
     Executor, NativeCounters, NoSync, SupportBound,
 };
-use poot_executor_parity::{TIER2, assert_close};
+use poot_executor_parity::assert_close;
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::{IndexRange, Slot};
 use poot_graph_plan::{
     CompileLimits, CompileOptions, Target, multi_device::topology::DeviceId,
@@ -92,13 +93,14 @@ fn targets(first: Target, second: Target) -> TargetSet {
     TargetSet::new(vec![(DeviceId(0), first), (DeviceId(1), second)]).unwrap()
 }
 
-/// `model`'s decode logits for `steps` on one device, all stages of `placement` on device 0.
+/// `model`'s decode logits for `steps` on one device, all stages of `placement` on device 0, and the numerics
+/// class the program publishes.
 fn single_device(
     device: PtxDevice,
     mapped: &MappedModel,
     steps: &[Step],
     after_layers: &[usize],
-) -> Vec<Vec<f32>> {
+) -> (Vec<Vec<f32>>, Tier2Class) {
     let target = device.target();
     let mut engine = Engine::new(device);
     let exe = engine
@@ -114,10 +116,9 @@ fn single_device(
             devices: vec![DeviceId(0); after_layers.len() + 1],
         }
     };
-    let entry = engine
-        .add_entry(exe, &compile(&g, &set, placement))
-        .unwrap();
-    steps
+    let program = compile(&g, &set, placement);
+    let entry = engine.add_entry(exe, &program).unwrap();
+    let logits = steps
         .iter()
         .map(|step| {
             engine
@@ -129,12 +130,15 @@ fn single_device(
                 .expect("f32 logits")
                 .to_vec()
         })
-        .collect()
+        .collect();
+    (logits, program.numerics_class())
 }
 
 /// A coordinator that has run some steps of one entry.
 struct Pipelined<D: Collectives> {
     logits: Vec<Vec<f32>>,
+    /// The numerics class the pipelined program publishes.
+    class: Tier2Class,
     counters: CoordinatorCounters,
     coordinator: Coordinator<D>,
     exe: poot_executor::ExecutableId,
@@ -186,6 +190,7 @@ fn pipelined<D: Collectives>(
     let counters = coordinator.counters();
     Pipelined {
         logits,
+        class: program.numerics_class(),
         counters,
         coordinator,
         exe,
@@ -229,7 +234,7 @@ fn assert_two_device_matches_single(mapped: &MappedModel, after_layers: &[usize]
         return;
     };
     let steps = decode(&TOKENS);
-    let want = single_device(PtxDevice::open(0).unwrap(), mapped, &steps, &[]);
+    let (want, want_class) = single_device(PtxDevice::open(0).unwrap(), mapped, &steps, &[]);
     assert_non_constant(&want, label);
     let mut placement = vec![0u32; after_layers.len() + 1];
     for (stage, slot) in placement.iter_mut().enumerate() {
@@ -242,8 +247,9 @@ fn assert_two_device_matches_single(mapped: &MappedModel, after_layers: &[usize]
         after_layers,
         &placement,
     );
+    let tolerance = want_class.max(run.class).tolerance();
     for (step, (got, want)) in run.logits.iter().zip(&want).enumerate() {
-        assert_close(got, want, TIER2, &format!("{label}: step {step}"));
+        assert_close(got, want, tolerance, &format!("{label}: step {step}"));
     }
     for device in &run.counters.devices {
         assert!(
@@ -357,10 +363,11 @@ fn rank_zero_to_rank_one_to_rank_zero_never_consumes_a_prior_generation_on_ptx()
     let mapped = Dense::new(Family::Qwen2).dims(64, 96, 3).model();
     let tokens: Vec<i32> = (0..24).map(|i| (i * 7 + 2) % 48).collect();
     let steps = decode(&tokens);
-    let want = single_device(PtxDevice::open(0).unwrap(), &mapped, &steps, &[0, 1]);
+    let (want, _) = single_device(PtxDevice::open(0).unwrap(), &mapped, &steps, &[0, 1]);
     assert_non_constant(&want, "three-stage reference");
     let Pipelined {
         logits,
+        class: _,
         counters: prepared,
         mut coordinator,
         exe,
@@ -605,7 +612,7 @@ fn a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx(
     };
     let mapped = Dense::new(Family::Qwen2).model();
     let steps = decode(&TOKENS[..3]);
-    let want = single_device(PtxDevice::open(0).unwrap(), &mapped, &steps, &[0]);
+    let (want, want_class) = single_device(PtxDevice::open(0).unwrap(), &mapped, &steps, &[0]);
 
     let fail_at = Rc::new(Cell::new(Some(1)));
     let wrap = |inner: PtxDevice| FailingFinish {
@@ -646,6 +653,7 @@ fn a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx(
     assert_eq!(coordinator.counters().devices[0].sessions, 0);
 
     fail_at.set(None);
+    let tolerance = want_class.max(program.numerics_class()).tolerance();
     for (index, step) in steps.iter().enumerate() {
         let got = coordinator
             .step(exe, entry, &step.inputs(), &mut NoSync)
@@ -655,7 +663,12 @@ fn a_capture_failure_on_the_later_rank_aborts_cleanly_and_the_retry_runs_on_ptx(
             .as_f32()
             .unwrap()
             .to_vec();
-        assert_close(&got, &want[index], TIER2, &format!("retry step {index}"));
+        assert_close(
+            &got,
+            &want[index],
+            tolerance,
+            &format!("retry step {index}"),
+        );
     }
     let recorded: Vec<(u64, u64)> = coordinator
         .stats()

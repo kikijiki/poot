@@ -9,9 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# ADR-0113: `reassociation_class`/`per_eqn_plans_outside_compile` have no production caller anywhere in the
-# workspace - they read this crate's own private state (`recorded_numerics`, a crate-private thread-local
-# counter), so they cannot move to poot-test-util and stay here gated. A default build never has them;
+# ADR-0113: `per_eqn_plans_outside_compile` has no production caller anywhere in the
+# workspace - it reads this crate's own private state (a crate-private thread-local
+# counter), so it cannot move to poot-test-util and stays here gated. A default build never has it;
 # consumers (this crate's own tests, poot-wgpu-device's tests) call them directly through this feature, never
 # through a forwarder. (`is_decode_gemv`/`is_tiled_gemm` were the same shape but had no private-state reason
 # to stay - deleted; their callers now check the planned `Plan` instead.) The `test_support` module (plan_eqn,
@@ -36,7 +36,7 @@ blake3.workspace = true
 poot-quant = { workspace = true, features = ["test-support"] }
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 # This crate's own `tests/*.rs` integration binaries see its `test_support` (`plan_eqn`, the GPU-target
-# accessors) and the gated `reassociation_class`/`per_eqn_plans_outside_compile` (ADR-0113) through this
+# accessors) and the gated `per_eqn_plans_outside_compile` (ADR-0113) through this
 # self edge; they only see the crate's pub API, not its in-crate `*_analyzed` entry point.
 poot-graph-plan = { path = ".", features = ["test-support"] }
 poot-codegen = { workspace = true, features = ["test-support"] }

@@ -1,6 +1,14 @@
 //! Command-line schema.
 
+use std::time::Duration;
+
 use clap::{Args, Parser, Subcommand};
+
+/// The most `--keep-warm` minutes `exec` accepts: a kept pod bills until its window ends.
+pub(crate) const MAX_KEEP_WARM_MINUTES: u64 = 240;
+
+/// The longest `--max-cmd` `exec` accepts.
+pub(crate) const MAX_CMD_CEILING: Duration = Duration::from_secs(12 * 3600);
 
 /// A CLI input error surfaced by clap's value parsers (typed, not `anyhow`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -10,6 +18,34 @@ pub(crate) enum CliError {
          (e.g. EU-RO-1)"
     )]
     DataCenter(String),
+    #[error("invalid duration {0:?}: expected a whole number plus s, m or h (e.g. 90s, 30m, 2h)")]
+    Duration(String),
+    #[error("duration {0:?} must be longer than zero and at most 12h")]
+    DurationRange(String),
+}
+
+/// Parse `--max-cmd`: a whole number of seconds, minutes or hours, above zero and at most
+/// [`MAX_CMD_CEILING`].
+pub(crate) fn parse_max_cmd(raw: &str) -> Result<Duration, CliError> {
+    let raw = raw.trim();
+    let split = raw
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| CliError::Duration(raw.to_string()))?;
+    let (digits, unit) = raw.split_at(split);
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| CliError::Duration(raw.to_string()))?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n.saturating_mul(60),
+        "h" => n.saturating_mul(3600),
+        _ => return Err(CliError::Duration(raw.to_string())),
+    };
+    let d = Duration::from_secs(secs);
+    if d.is_zero() || d > MAX_CMD_CEILING {
+        return Err(CliError::DurationRange(raw.to_string()));
+    }
+    Ok(d)
 }
 
 /// Parse one `--data-center` id: non-empty, uppercase letters, digits, and dashes only.
@@ -64,11 +100,17 @@ pub(crate) enum Command {
 
 #[derive(Args)]
 pub(crate) struct ExecArgs {
-    #[arg(long, env = "RUNPOD_API_KEY", hide_env_values = true)]
-    pub(crate) runpod_api_key: Option<String>,
-    /// the command to run on the pod (stdout/stderr are streamed back).
+    /// the command to run on the pod (its output is printed when it exits).
     #[arg(long)]
     pub(crate) cmd: String,
+    /// longest the setup and `--cmd` may run on the pod before ssh is killed and the exec fails with a
+    /// timeout (`90s`, `30m`, `2h`; at most 12h). The pod is torn down afterwards.
+    #[arg(long, default_value = "2h", value_parser = parse_max_cmd)]
+    pub(crate) max_cmd: Duration,
+    /// minutes after which the pod removes itself, whether or not this machine is still running.
+    /// Default: `--max-cmd` plus `--keep-warm` plus a 30 minute margin for upload and setup.
+    #[arg(long, value_name = "MINUTES", value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) pod_ttl: Option<u64>,
     /// a local binary to scp to /root/ before running (patchelf'd to the stock glibc loader).
     #[arg(long)]
     pub(crate) bin: Option<String>,
@@ -123,12 +165,17 @@ pub(crate) struct ExecArgs {
     pub(crate) provision_timeout_s: u64,
     #[arg(long, default_value_t = 600)]
     pub(crate) ssh_timeout_s: u64,
-    /// keep the pod alive after the run (debug). It is still reaped on the next `run`/`reap`.
+    /// keep the pod alive after the run (debug). It is still reaped on the next `run`/`reap`, and removes
+    /// itself through the pod-side TTL (`--max-cmd` plus 30 minutes unless `--pod-ttl` says otherwise).
     #[arg(long)]
     pub(crate) keep: bool,
     /// keep the pod warm for this many minutes so the next `exec` with the same image adopts it (skipping
-    /// provision and the image pull). Reaped once the window passes. Supersedes `--keep`.
-    #[arg(long, value_name = "MINUTES")]
+    /// provision and the image pull). Reaped once the window passes. Supersedes `--keep`. At most 240.
+    #[arg(
+        long,
+        value_name = "MINUTES",
+        value_parser = clap::value_parser!(u64).range(1..=MAX_KEEP_WARM_MINUTES)
+    )]
     pub(crate) keep_warm: Option<u64>,
 }
 
@@ -205,8 +252,6 @@ pub(crate) struct RunArgs {
     /// SSH private key (its .pub is injected as the pod PUBLIC_KEY).
     #[arg(long, default_value = "~/.ssh/id_ed25519")]
     pub(crate) ssh_key: String,
-    #[arg(long, env = "RUNPOD_API_KEY", hide_env_values = true)]
-    pub(crate) runpod_api_key: Option<String>,
     #[arg(long, default_value_t = 4)]
     pub(crate) provision_attempts: u32,
     /// seconds to wait for a pod's SSH endpoint. The poot-bench image is ~34 GB, so a cold pull takes minutes.
@@ -221,7 +266,8 @@ pub(crate) struct RunArgs {
     /// `bench compare` baseline needs 5.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) repeats: u32,
-    /// do NOT terminate the pod at the end (debug). It will still be reaped on the next run.
+    /// do NOT terminate the pod at the end (debug). It will still be reaped on the next run. It removes
+    /// itself through the pod-side TTL (every model's repeats at `--sweep-timeout-s`, plus 30 minutes).
     #[arg(long)]
     pub(crate) keep_pod: bool,
     /// skip building the poot runner; use this prebuilt binary.
@@ -248,8 +294,6 @@ impl RunArgs {
 
 #[derive(Args)]
 pub(crate) struct ReapArgs {
-    #[arg(long, env = "RUNPOD_API_KEY", hide_env_values = true)]
-    pub(crate) runpod_api_key: Option<String>,
     /// terminate ALL pods with the name prefix, even ones tied to an in-progress run (force cleanup).
     #[arg(long)]
     pub(crate) all: bool,
@@ -323,6 +367,80 @@ mod tests {
         assert!(
             err.to_string().contains("data-center id"),
             "parse error should carry the typed message: {err}"
+        );
+    }
+
+    /// SC-003: `--keep-warm` above the cap is refused at parse time; the cap itself is accepted.
+    /// Removing the range from the value parser makes 100000 parse and this red.
+    #[test]
+    fn exec_keep_warm_is_capped() {
+        let over = Cli::try_parse_from([
+            "poot-orchestrator",
+            "exec",
+            "--cmd",
+            "true",
+            "--keep-warm",
+            "100000",
+        ]);
+        let Err(err) = over else {
+            panic!("--keep-warm 100000 must be refused");
+        };
+        assert!(err.to_string().contains("100000"), "{err}");
+
+        let at_cap = Cli::try_parse_from([
+            "poot-orchestrator",
+            "exec",
+            "--cmd",
+            "true",
+            "--keep-warm",
+            &MAX_KEEP_WARM_MINUTES.to_string(),
+        ])
+        .unwrap();
+        match at_cap.command {
+            Command::Exec(a) => assert_eq!(a.keep_warm, Some(MAX_KEEP_WARM_MINUTES)),
+            _ => panic!("expected exec"),
+        }
+    }
+
+    /// `--max-cmd` is mandatory in effect (2h default), parses s/m/h and refuses zero, junk and values
+    /// above the ceiling.
+    #[test]
+    fn exec_max_cmd_parses_defaults_and_refuses() {
+        assert_eq!(parse_max_cmd("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_max_cmd("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_max_cmd("12h").unwrap(), MAX_CMD_CEILING);
+        for bad in ["", "2", "s", "2d", "1.5h", "-1s", "2 s x"] {
+            assert!(
+                matches!(parse_max_cmd(bad), Err(CliError::Duration(_))),
+                "{bad:?}"
+            );
+        }
+        for bad in ["0s", "13h", "99999999999999999h"] {
+            assert!(
+                matches!(
+                    parse_max_cmd(bad),
+                    Err(CliError::DurationRange(_)) | Err(CliError::Duration(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        let Command::Exec(a) = Cli::try_parse_from(["poot-orchestrator", "exec", "--cmd", "x"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected exec");
+        };
+        assert_eq!(a.max_cmd, Duration::from_secs(2 * 3600));
+        assert!(
+            Cli::try_parse_from([
+                "poot-orchestrator",
+                "exec",
+                "--cmd",
+                "x",
+                "--runpod-api-key",
+                "k"
+            ])
+            .is_err()
         );
     }
 }

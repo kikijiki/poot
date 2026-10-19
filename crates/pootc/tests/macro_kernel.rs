@@ -203,7 +203,18 @@ fn kernel_attribute_is_discovered_by_pootc() {
     let kir_json =
         std::fs::read_to_string(out_dir.join("add.kir.json")).expect("add.kir.json emitted");
     let body: Body = serde_json::from_str(&kir_json).expect("add.kir.json parses");
-    let kernel = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv);
+    // A handle is built only from a sealed artifact: recompile the Body, and require the staged SPIR-V to be
+    // byte-identical to it, so the kernel that runs is both what pootc published and what the Body compiles to.
+    let sealed_out = out_dir.join("add.sealed.spv");
+    let artifact =
+        poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &sealed_out)
+            .expect("recompile the add Body");
+    assert_eq!(
+        std::fs::read(&sealed_out).unwrap(),
+        spv,
+        "the artifact pootc staged is not what its Body compiles to"
+    );
+    let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 
     let _gpu = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ctx = match Context::new() {

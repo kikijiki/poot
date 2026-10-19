@@ -13,7 +13,7 @@
 
 use poot_eval::{EvalBudget, EvalOptions, eval};
 use poot_executor::{Device, Engine, Executor};
-use poot_executor_parity::scan::{check_steps, measure, streamed_in_pieces};
+use poot_executor_parity::scan::{check_steps, measure, numerics_class, streamed_in_pieces};
 use poot_graph_ir::Graph;
 use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_graph_plan::Target;
@@ -21,7 +21,7 @@ use poot_rocm_device::device::RocmDevice;
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 
-use poot_executor_parity::{TIER2, assert_close};
+use poot_executor_parity::assert_close;
 
 fn oracle(
     graph: &Graph,
@@ -115,7 +115,7 @@ fn long_scan_agrees_with_the_oracle_and_with_stepped_pieces_on_rocm() {
             assert_close(
                 &whole[0],
                 &stepped,
-                TIER2,
+                numerics_class(target, &ScanFixture { len, ..base }).tolerance(),
                 &format!("{label}: one launch against stepped pieces"),
             );
         }

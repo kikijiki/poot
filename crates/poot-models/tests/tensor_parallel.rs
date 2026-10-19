@@ -12,7 +12,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
-use poot_executor_parity::{TIER2, assert_close};
+use poot_executor_parity::assert_close;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::{ComputedConst, Graph, Slot, SlotKey, Storage, TensorType, ValueId};
 use poot_graph_plan::{
@@ -489,7 +489,7 @@ fn assert_walk_matches(
     assert_close(
         walked.output.as_f32().unwrap(),
         output.as_f32().unwrap(),
-        TIER2,
+        program.numerics_class().tolerance(),
         &format!("{label}: output"),
     );
     for (name, want) in &state {
@@ -502,7 +502,7 @@ fn assert_walk_matches(
             assert_close(
                 got.as_f32().unwrap(),
                 want.as_f32().unwrap(),
-                TIER2,
+                program.numerics_class().tolerance(),
                 &format!("{label}: rank {rank} {name}"),
             );
         }

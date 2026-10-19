@@ -159,6 +159,7 @@
             pkgs.mesa                     # RADV/ANV Vulkan ICD, from this flake's own pinned glibc (see shellHook)
 
             pkgs.pkg-config
+            pkgs.patchelf # poot-orchestrator points the runner at the pod's glibc loader
 
             # ROCm / HSA stack for the AMD iGPU path (card 106). clr (HIP runtime) is not linked: raw HSA via
             # libhsa-runtime64.so.1 from rocm-runtime. The AMDGPU compiler (amdclang, with the device

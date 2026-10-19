@@ -57,7 +57,7 @@ fn measure(
     let graph = graph(rows, row_stride_bytes);
     let (slot, _) = graph.slots().first().expect("one slot");
     let key = graph.meta(*slot).slot_key().expect("a slot key").clone();
-    let (exe, entry) = load_graph_entry(exec, target, &graph, "strided read");
+    let (exe, entry, _) = load_graph_entry(exec, target, &graph, "strided read");
     let shape = vec![rows, row_stride_bytes / 4];
     let data = HostTensor::f32(shape.clone(), vec![1.0; rows * shape[1]]);
     let mut times = Vec::with_capacity(runs);

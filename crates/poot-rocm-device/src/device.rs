@@ -20,46 +20,39 @@
 //! generated typed kernel's `&[f32]`/`&[i32]`/... parameters and `copy_words`'s `&[u32]` parameters
 //! disagree on what "one element" means for any dtype narrower or wider than 4 bytes).
 
-use std::sync::Arc;
-
 use poot_executor::{
     Arg, Device, DeviceTime, Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime,
 };
 use poot_graph_plan::{ImportedKernel, Target, production_plan::Submission};
 use poot_kernel_ir::Body;
 use poot_rocm_runtime::{
-    DispatchSpan, HsacoModule, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions, RocmError,
+    BoundKernarg, DispatchSpan, KernelHandle, RocmBuffer, RocmContext, RocmContextOptions,
+    RocmError,
 };
 use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
 use poot_target::{AmdArch, Backend, BufferStorage, ElementKind, TargetId};
 
 use crate::error::RocmGpuError;
 
-/// One loaded kernel: its HSA executable (kept alive for the `kernel_object` handle) and launch
-/// metadata.
+/// One loaded kernel: its handle shares the HSA executable, so the code object stays loaded for as
+/// long as any handle (or recording holding one) does.
 pub struct RocmKernel {
-    module: Arc<HsacoModule>,
     kernel: KernelHandle,
 }
 
-/// One recorded AQL dispatch: the kernarg buffer and the module that keeps its `kernel_object` valid,
-/// held for the recording's lifetime (the kernarg's device pointer is baked into the packet at replay
-/// time, so the buffer must outlive every replay).
+/// One recorded AQL dispatch. A recording owns what it addresses: the kernel handle keeps the code
+/// object loaded and the bound kernarg keeps the kernarg segment and every data buffer whose device
+/// address it holds, so neither can be freed while the recording (or a batch it enqueued) lives.
 struct CapturedAql {
-    #[allow(
-        dead_code,
-        reason = "held so the kernel_object stays valid for the recording's lifetime"
-    )]
-    module: Arc<HsacoModule>,
     kernel: KernelHandle,
-    kernarg: RocmBuffer,
+    kernarg: BoundKernarg,
     elements: Box<[ElementKind]>,
     grid: (u32, u32, u32),
     block: (u32, u32, u32),
 }
 
 /// One flattened entry of [`poot_rocm_runtime::RocmContext::enqueue_graph_batched`]'s dispatch list.
-type BatchedDispatch = (KernelHandle, RocmBuffer, (u32, u32, u32), (u32, u32, u32));
+type BatchedDispatch = (KernelHandle, BoundKernarg, (u32, u32, u32), (u32, u32, u32));
 
 /// A recorded step: the AQL packets captured between `begin` and `finish`, which `replay` re-enqueues
 /// on the context's queue.
@@ -127,7 +120,7 @@ impl RocmDevice {
             .push(aql);
     }
 
-    /// Build one kernarg buffer of flat `(ptr: u64, len: u64)` pairs, `[in0, in1, ..., out]` (the
+    /// Bind one kernarg of flat `(ptr: u64, len: u64)` pairs, `[in0, in1, ..., out]` (the
     /// output last; a launch metadata buffer is already the last entry of `inputs` by the
     /// time `Engine::walk` calls `dispatch`, so there is no separate meta slot to carry here - mirrors
     /// `poot-wgpu-device`'s single flat kernarg layout, ROCm's own flavor of "one dispatch, one buffer").
@@ -138,42 +131,15 @@ impl RocmDevice {
     /// 2x/4x; `poot-target::ElementKind` has no element wider than 4 bytes today, so there is no
     /// under-report case to name). Callers pass each buffer's length explicitly so this one writer
     /// serves both without silently assuming every element is 4 bytes wide; [`copy_word_count`]
-    /// computes the copy-specific one.
-    fn build_kernarg(
+    /// computes the copy-specific one. The result owns a clone of every bound buffer.
+    fn bind_kernarg(
         &self,
         kernel: &KernelHandle,
         in_bufs: &[(&RocmBuffer, u64)],
         out_buf: (&RocmBuffer, u64),
-    ) -> Result<RocmBuffer, RocmGpuError> {
-        let kernarg_size = kernel.kernarg_size() as usize;
-        let slots = in_bufs
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| RocmGpuError::Graph("kernarg slot count overflow".to_string()))?;
-        let required = slots
-            .checked_mul(16)
-            .ok_or_else(|| RocmGpuError::Graph("kernarg byte count overflow".to_string()))?;
-        if required > kernarg_size {
-            return Err(RocmGpuError::Graph(format!(
-                "kernel kernarg segment is {kernarg_size} bytes, but {slots} flat pointer/length \
-                 pairs require {required}"
-            )));
-        }
-        let kernarg_buf = self.ctx.allocate_kernarg(kernarg_size)?;
-        let mut karg = vec![0u8; kernarg_size];
-        let write_pair = |karg: &mut [u8], slot: usize, ptr: u64, len: u64| {
-            let off = slot * 16;
-            karg[off..off + 8].copy_from_slice(&ptr.to_le_bytes());
-            karg[off + 8..off + 16].copy_from_slice(&len.to_le_bytes());
-        };
-        let mut slot = 0;
-        for &(buf, len) in in_bufs {
-            write_pair(&mut karg, slot, buf.device_ptr(), len);
-            slot += 1;
-        }
-        write_pair(&mut karg, slot, out_buf.0.device_ptr(), out_buf.1);
-        self.ctx.write_raw_bytes(&kernarg_buf, 0, &karg)?;
-        Ok(kernarg_buf)
+    ) -> Result<BoundKernarg, RocmGpuError> {
+        let slots: Vec<(&RocmBuffer, u64)> = in_bufs.iter().copied().chain([out_buf]).collect();
+        Ok(self.ctx.bind_kernarg(kernel, &slots)?)
     }
 }
 
@@ -218,14 +184,14 @@ fn compile_copy_words_kernel(
     let body: Body = ImportedKernel::CopyWords.body().clone();
     let workgroup = body.workgroup_size;
     let target = poot_codegen::Target::AmdGcn(arch);
-    let tmp = poot_codegen::kernel_cache_root("rocm", target);
-    let out_path = poot_codegen::artifact_path(&tmp, "copy_words", target);
-    poot_codegen::compile(&body, target, &out_path)?;
-    let bytes = std::fs::read(&out_path)?;
-    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::AmdGcn(arch), bytes);
-    let module = Arc::new(ctx.load_hsaco(&compiled)?);
+    let artifact = poot_codegen::KernelCache::open(target).load_or_compile(
+        &body,
+        poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+    )?;
+    let compiled = poot_codegen::kernel_handle(&body, &artifact)?;
+    let module = ctx.load_hsaco(&compiled)?;
     let kernel = ctx.lookup_kernel(&module, compiled.entry_point())?;
-    Ok((RocmKernel { module, kernel }, workgroup))
+    Ok((RocmKernel { kernel }, workgroup))
 }
 
 impl Device for RocmDevice {
@@ -267,12 +233,9 @@ impl Device for RocmDevice {
         _key: &str,
         kernel: CompiledKernel,
     ) -> Result<RocmKernel, RocmGpuError> {
-        let module = Arc::new(self.ctx.load_hsaco(&kernel)?);
+        let module = self.ctx.load_hsaco(&kernel)?;
         let handle = self.ctx.lookup_kernel(&module, kernel.entry_point())?;
-        Ok(RocmKernel {
-            module,
-            kernel: handle,
-        })
+        Ok(RocmKernel { kernel: handle })
     }
 
     fn begin(&mut self, _submission: Submission) -> Result<(), RocmGpuError> {
@@ -313,7 +276,7 @@ impl Device for RocmDevice {
             .map(|a: &Arg<'_, Self>| (a.buffer, u64::from(a.elems)))
             .collect();
         let out_buf = d.output.buffer;
-        let kernarg = self.build_kernarg(
+        let kernarg = self.bind_kernarg(
             &d.kernel.kernel,
             &in_pairs,
             (out_buf, u64::from(d.output.elems)),
@@ -322,7 +285,6 @@ impl Device for RocmDevice {
         elements.push(d.output.buffer.element());
         let (grid, block) = padded_launch(threads, workgroup);
         self.push(CapturedAql {
-            module: Arc::clone(&d.kernel.module),
             kernel: d.kernel.kernel.clone(),
             kernarg,
             elements: elements.into_boxed_slice(),
@@ -346,11 +308,9 @@ impl Device for RocmDevice {
             )));
         }
         let words = copy_word_count(src_bytes, src.elem_count());
-        let kernarg =
-            self.build_kernarg(&self.copy_kernel.kernel, &[(src, words)], (dst, words))?;
+        let kernarg = self.bind_kernarg(&self.copy_kernel.kernel, &[(src, words)], (dst, words))?;
         let (grid, block) = padded_launch([words as u32, 1, 1], self.copy_workgroup);
         self.push(CapturedAql {
-            module: Arc::clone(&self.copy_kernel.module),
             kernel: self.copy_kernel.kernel.clone(),
             kernarg,
             elements: Box::new([ElementKind::I32, ElementKind::I32]),

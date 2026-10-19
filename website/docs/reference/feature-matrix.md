@@ -125,7 +125,7 @@ The latest benchmark row per family and backend, from the stored results. A refu
 
 | Family | Backend | Result | Run |
 | --- | --- | --- | --- |
-| `qwen35` | ptx | <span class="matrix-status matrix-status--yes">Measured</span> | `2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb` |
+| `qwen35` | ptx | <span class="matrix-status matrix-status--yes">Measured</span> | `2026-10-18-h100-qwen3-8-27b-fp8-ptx-b00cb7feb-run2` |
 | `qwen35` | wgpu | <span class="matrix-status matrix-status--yes">Measured</span> | `2026-10-18-strix-halo-qwen3-8-27b-fp8-wgpu-4c8945ee1` |
 <!-- generated:feature-matrix:end -->
 
@@ -150,7 +150,8 @@ The latest benchmark row per family and backend, from the stored results. A refu
   oracle has not been run yet. It has not run on wgpu. DeepSeek-V4, MiniMax-M2, GLM-5.3-Flash and Qwen3.8-Flash-Next have only synthetic fixtures that match an
   independent f64 reference; no real public checkpoint of them has run.
 - The `bert` family runs on the driver's `Encode` step (`poot_llm::encoders`). `poot-serve` runs `Encode` steps for a
-  decoder's embeddings and reranking on wgpu and ROCm; it does not start on a BERT checkpoint yet.
+  decoder's embeddings and reranking on wgpu and ROCm, and starts on a BERT checkpoint (embeddings and cross-encoder
+  rerank); the encode shapes are fitted and prepared before it serves.
 - Per-channel E4M3 `compressed-tensors` projections load packed and use the shared generated lowering. See
   [Using quantized checkpoints](../serve/quantized-checkpoints.md).
 
@@ -187,7 +188,7 @@ ROCm; the PTX run is pending, and the matrix cells above describe the resident p
 | LoRA adapter serving (hot-load, per-request selection)                                               | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^lora-scope]    |
 | Tensor parallelism (multi-GPU)                                                                       | <span class="matrix-status matrix-status--no">No</span> (not supported) | <span class="matrix-status matrix-status--no">No</span> (not supported) | <span class="matrix-status matrix-status--yes">Yes</span> (served on a two-GPU NVLink pair; four-GPU decode only) |
 | Structured/guided decoding (regex, JSON schema, grammar, choice, forced tool calls)                  | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
-| Embeddings (`/v1/embeddings`) and reranking (`/v1/rerank`), decoder checkpoints                       | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
+| Embeddings (`/v1/embeddings`) and reranking (`/v1/rerank`), decoder and BERT-class checkpoints       | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--no">No</span> (no served test)[^ptx-served] |
 | Prometheus metrics (`/metrics/prometheus`)                                                           | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                | <span class="matrix-status matrix-status--yes">Yes</span>                                |
 
 [^device-sample]:

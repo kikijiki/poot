@@ -1496,12 +1496,97 @@ fn mrope_positions_on_a_model_without_sectioned_rope_are_refused_before_admissio
 
 fn encode_tokens(driver: &mut Driver) -> Result<crate::driver::Encoded, DriverError> {
     let ids = [1u32, 2];
+    driver.prepare_encode(&crate::driver::EncodeShapes {
+        rows: NonZeroUsize::MIN,
+        max_len: NonZeroUsize::new(ids.len()).unwrap(),
+    })?;
     driver.encode(&crate::driver::EncodeRequest {
         rows: &[crate::driver::EncodeRow::Tokens {
             ids: &ids,
             types: &[],
         }],
     })
+}
+
+fn encode_request(
+    driver: &mut Driver,
+    rows: &[&[u32]],
+) -> Result<crate::driver::Encoded, DriverError> {
+    let rows: Vec<crate::driver::EncodeRow<'_>> = rows
+        .iter()
+        .map(|ids| crate::driver::EncodeRow::Tokens { ids, types: &[] })
+        .collect();
+    driver.encode(&crate::driver::EncodeRequest { rows: &rows })
+}
+
+/// POOT-1204: a token step runs only on an entry `prepare_encode` admitted. Mutation: prepare the
+/// entry on a miss in `encode` (restore the lazy path): the first request compiles and succeeds.
+#[test]
+fn token_rows_are_refused_until_encode_shapes_are_prepared() {
+    let mut rig = rig_default(picks_one());
+    let error = encode_request(&mut rig.driver, &[&[1, 2]]).expect_err("nothing is prepared");
+    assert!(
+        matches!(
+            error,
+            DriverError::InvalidRequest(InvalidRequest::Encode(
+                crate::driver::error::EncodeError::NotPrepared
+            ))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        rig.driver.stats().compiles,
+        0,
+        "the refusal compiled nothing"
+    );
+}
+
+/// POOT-1204: a request of more rows or a longer row than the prepared shapes is a typed refusal that
+/// compiles nothing, and a shorter or narrower one runs on the prepared entries. Mutation: drop the
+/// `TooManyRows` or `RowTooLong` check: the request pads past the entry and the row goes red.
+#[test]
+fn token_rows_over_the_prepared_shapes_are_refused_and_smaller_ones_run() {
+    use crate::driver::error::EncodeError;
+    let mut rig = rig_default(picks_one());
+    rig.driver
+        .prepare_encode(&crate::driver::EncodeShapes {
+            rows: NonZeroUsize::new(2).unwrap(),
+            max_len: NonZeroUsize::new(4).unwrap(),
+        })
+        .expect("the shapes prepare");
+    let compiled = rig.driver.stats().compiles;
+
+    let error = encode_request(&mut rig.driver, &[&[1], &[1], &[1]]).expect_err("three rows");
+    assert!(
+        matches!(
+            error,
+            DriverError::InvalidRequest(InvalidRequest::Encode(EncodeError::TooManyRows {
+                rows: 3,
+                max: 2
+            }))
+        ),
+        "{error:?}"
+    );
+    let error = encode_request(&mut rig.driver, &[&[1, 2, 3, 4, 5]]).expect_err("five tokens");
+    assert!(
+        matches!(
+            error,
+            DriverError::InvalidRequest(InvalidRequest::Encode(EncodeError::RowTooLong {
+                row: 0,
+                tokens: 5,
+                max: 4
+            }))
+        ),
+        "{error:?}"
+    );
+
+    let one = encode_request(&mut rig.driver, &[&[1, 2, 3]]).expect("one short row runs");
+    assert_eq!(one.rows.len(), 1, "padded rows are dropped from the answer");
+    assert_eq!(
+        rig.driver.stats().compiles,
+        compiled,
+        "serving never compiles"
+    );
 }
 
 /// POOT-1084 SC-001: a device error from one `Encode` step is that step's failure, not the driver's.

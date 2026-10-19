@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use poot_eval::{EvalBudget, EvalOptions, Value, eval};
 use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::builder::Builder;
 use poot_graph_ir::op::{BinOp, RedOp, UnOp};
 use poot_graph_ir::ops::{attention_masked, attention_prefill};
@@ -1905,13 +1906,13 @@ fn sample_token_gumbel_topp_only_excludes_untruncated_winner_rocm_matches_cpu() 
 // would perform.
 
 /// `g` run once on `engine`; every input is a named const of its own dtype and the output is returned as the
-/// graph declares it.
+/// graph declares it, with the numerics class the compiled program publishes.
 fn run_under(
     engine: &mut Engine<RocmDevice>,
     target: Target,
     g: &Graph,
     inputs: &HashMap<ValueId, HostTensor>,
-) -> HostTensor {
+) -> (HostTensor, Tier2Class) {
     let mut builder = WeightStore::builder();
     for (&id, tensor) in inputs {
         let meta = g.meta(id);
@@ -1967,7 +1968,7 @@ fn run_under(
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     };
-    match out.dtype {
+    let host = match out.dtype {
         DType::F32 => HostTensor::f32(
             out.shape.clone(),
             bytes
@@ -1980,7 +1981,8 @@ fn run_under(
         DType::BF16 => HostTensor::bf16(out.shape.clone(), words()),
         DType::F16 => HostTensor::f16(out.shape.clone(), words()),
         other => panic!("unexpected output dtype {other:?}"),
-    }
+    };
+    (host, staged.numerics_class())
 }
 
 /// The compiled program holds exactly one `ContractionEpilogue`, over `head`.
@@ -2023,7 +2025,7 @@ fn assert_fused_matches_oracle(
     inputs: &HashMap<ValueId, HostTensor>,
     label: &str,
 ) -> HostTensor {
-    let fused = run_under(engine, target, g, inputs);
+    let (fused, class) = run_under(engine, target, g, inputs);
     let oracle_inputs: HashMap<ValueId, Value> = inputs
         .iter()
         .map(|(&id, t)| (id, Value::from(t.clone())))
@@ -2037,7 +2039,7 @@ fn assert_fused_matches_oracle(
     poot_executor_parity::assert_close(
         &fused.to_f32().unwrap(),
         &want.to_f32().unwrap(),
-        poot_executor_parity::TIER2,
+        class.tolerance(),
         label,
     );
     fused

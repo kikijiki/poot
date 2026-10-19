@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use poot_codegen::{Target, artifact_path, compile};
+use poot_codegen::{Target, artifact_path, compile_kernel};
 use poot_kernel_ir::test_support::wmma_tile;
 use poot_kernelgen as kg;
 use poot_runtime_common::BufferRole;
@@ -42,7 +42,8 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
         eprintln!("llc not on PATH; skipping the coopmat dispatch probe");
         return;
     }
-    compile(&body, Target::SpirvVulkan, &out).expect("coopmat tile must compile to SPIR-V");
+    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out)
+        .expect("coopmat tile must compile to SPIR-V");
     if which("spirv-val") {
         let v = std::process::Command::new("spirv-val")
             .args(["--target-env", "vulkan1.3"])
@@ -67,9 +68,7 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
             return;
         }
     };
-    let spv_bytes = std::fs::read(&out).unwrap();
-    let kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv_bytes);
+    let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let a_data: Vec<f32> = (0..256).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
     let b_data: Vec<f32> = (0..256).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
     let a_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), 256);
@@ -143,7 +142,7 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
         eprintln!("llc not on PATH; skipping the coopmat multi-tile dispatch probe");
         return;
     }
-    compile(&body, Target::SpirvVulkan, &out)
+    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out)
         .expect("coopmat multi-tile matmul must compile to SPIR-V");
     if which("spirv-val") {
         let v = std::process::Command::new("spirv-val")
@@ -167,9 +166,7 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
             return;
         }
     };
-    let spv_bytes = std::fs::read(&out).unwrap();
-    let kernel =
-        poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::SpirvVulkan, spv_bytes);
+    let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.04).collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
     let a_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), m * k);

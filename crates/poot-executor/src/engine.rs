@@ -68,7 +68,7 @@ pub struct Engine<D: Device> {
     /// the planner's display `key` string: two equations can share a display key while compiling to
     /// different bodies (SC-024), and a string-keyed fast path here would alias the second one onto
     /// the first's kernel before ever reaching `kernel_cache`'s own content-keyed lookup below.
-    kernel_index: HashMap<u64, usize>,
+    kernel_index: HashMap<poot_codegen::KernelId, usize>,
     /// The AIE regions this engine loaded: by the region's link recipe and the fingerprint of the body on
     /// every tile (one body can sit in more than one region, and one region shape can run other bodies),
     /// with the loaded index and the invocation its dispatches carry. Empty for a GPU device.
@@ -150,6 +150,10 @@ struct ResidentWeight<D: Device> {
 }
 
 struct Loaded<D: Device> {
+    // Field order is drop order: the entries, whose recordings address the weights, state and resident
+    // buffers below, drop first. A recording owns what it addresses ([`Device::Recording`]), so this
+    // order is what a device that records raw addresses relies on, not a second owner.
+    entries: Vec<Option<Entry<D>>>,
     binder: WeightBinder,
     /// This executable's reference to each upload it binds, indexed by [`Loc::Weight`]: the
     /// uploads outlive every recording and pending release of this executable.
@@ -158,7 +162,6 @@ struct Loaded<D: Device> {
     /// Pool tables and maps, one per canonical site table ([`ResidentKey`]), shared by every entry
     /// that pages the same stored bytes and filled by host syncs, never by a step's inputs.
     resident: Vec<ResidentBuf<D>>,
-    entries: Vec<Option<Entry<D>>>,
     /// Set after a state-mutating failure; the next `step` refuses until `reset_state(All)` clears
     /// it (core review CR30).
     needs_reset: bool,
@@ -683,41 +686,41 @@ impl<D: Device> Engine<D> {
         max_artifact_bytes: NonZeroU64,
     ) -> Result<usize, ExecError> {
         let cache = kernel_cache_of(&self.kernel_cache, target_of(&self.device))?;
-        let fingerprint = cache.key(body).fingerprint();
-        if let Some(&index) = self.kernel_index.get(&fingerprint) {
+        let id = cache.key(body).id();
+        if let Some(&index) = self.kernel_index.get(&id) {
             return Ok(index);
         }
-        let resolve = || {
-            cache
-                .load_or_compile(body, max_artifact_bytes)
-                .map(|artifact| artifact.bytes)
-        };
+        let resolve = || cache.load_or_compile(body, max_artifact_bytes);
         let codegen_error = |source| LoadError::Codegen {
             key: key.to_string(),
             source,
         };
-        let bytes = match &self.shared_kernels {
+        let artifact = match &self.shared_kernels {
             Some(shared) => {
-                let (bytes, resolved) = shared
-                    .get_or_resolve(fingerprint, max_artifact_bytes, resolve)
+                let (artifact, resolved) = shared
+                    .get_or_resolve(id, max_artifact_bytes, resolve)
                     .map_err(codegen_error)?;
                 self.kernels_resolved += u64::from(resolved);
-                bytes.to_vec()
+                artifact
             }
             None => {
                 self.kernels_resolved += 1;
                 resolve().map_err(codegen_error)?
             }
         };
-        let compiled =
-            poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::from(backend), bytes);
+        let compiled = poot_codegen::kernel_handle(body, &artifact).map_err(|source| {
+            LoadError::KernelArtifact {
+                key: key.to_string(),
+                source,
+            }
+        })?;
         let kernel = self
             .device
             .load_kernel(key, compiled)
             .map_err(device_error(backend.into()))?;
         self.kernels.push(kernel);
         let index = self.kernels.len() - 1;
-        self.kernel_index.insert(fingerprint, index);
+        self.kernel_index.insert(id, index);
         Ok(index)
     }
 
@@ -748,7 +751,7 @@ impl<D: Device> Engine<D> {
             let mut text = recipe.canonical();
             let cache = kernel_cache_of(&self.kernel_cache, TargetId::Aie(target))?;
             for body in &bodies {
-                text.push_str(&format!("{:016x}\n", cache.key(body).fingerprint()));
+                text.push_str(&format!("{}\n", cache.key(body).id()));
             }
             text
         };

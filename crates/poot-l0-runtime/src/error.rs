@@ -1,7 +1,5 @@
-use std::ffi::NulError;
-
 /// A Level Zero runtime failure. [`L0Error::LibraryNotFound`] and [`L0Error::NoDevice`] are the typed
-/// "this machine has no Level Zero GPU" signals a device row turns into a skip.
+/// "this machine has no Level Zero NPU" signals a device row turns into a skip.
 #[derive(Debug, thiserror::Error)]
 pub enum L0Error {
     /// `libze_loader.so.1` is not on the loader path. `0` carries the OS `dlopen` message.
@@ -18,46 +16,31 @@ pub enum L0Error {
         /// The raw `ze_result_t`.
         result: u32,
     },
-    /// The loader found no driver with a GPU device (no Intel compute runtime on the library path, or no GPU).
-    #[error("no Level Zero GPU device is visible")]
+    /// The loader found no driver with an NPU device (no Intel NPU driver on the library path, or no NPU).
+    #[error("no Level Zero NPU device is visible")]
     NoDevice,
-    /// The device has no command queue group that can run compute kernels.
+    /// The device has no compute command queue group.
     #[error("the Level Zero device has no compute command queue group")]
     NoComputeQueue,
-    /// A kernel name contained an interior NUL byte.
-    #[error("invalid kernel name: {0}")]
-    InvalidKernelName(#[from] NulError),
-    /// SPIR-V is a sequence of 32-bit words; the module bytes were not a whole number of them.
-    #[error("SPIR-V module of {len} bytes is not a whole number of 4-byte words")]
-    MisalignedSpirv {
-        /// The byte length passed in.
-        len: usize,
-    },
-    /// An upload or download did not match its buffer's length.
-    #[error("host slice of {host} bytes does not match the {device}-byte device buffer")]
+    /// A copy between buffers of different lengths.
+    #[error("copy of a {host}-byte buffer into a {device}-byte buffer")]
     TransferLength {
         /// The host slice length in bytes.
         host: usize,
         /// The device buffer length in bytes.
         device: usize,
     },
-    /// A dispatch bound a different number of arguments than the kernel has parameters.
-    #[error("kernel takes {expected} arguments but the dispatch bound {given}")]
+    /// An execution bound a different number of buffers than the graph has arguments.
+    #[error("graph takes {expected} arguments but the execution bound {given}")]
     ArgumentCount {
-        /// The kernel's parameter count.
+        /// The graph's argument count.
         expected: u32,
-        /// The number of arguments the dispatch passed.
+        /// The number of buffers the execution passed.
         given: usize,
     },
     /// The driver does not provide an extension this runtime needs.
     #[error("the Level Zero driver has no `{0}` extension")]
     MissingExtension(&'static str),
-    /// The operation needs another kind of device than the context opened.
-    #[error("this operation needs a {needed:?} context")]
-    WrongDeviceKind {
-        /// The device kind the operation needs.
-        needed: crate::L0DeviceKind,
-    },
     /// The driver's graph compiler rejected a graph. `log` is the build log it left, which names the layer.
     #[error("graph creation returned ze_result_t 0x{result:x}: {log}")]
     GraphBuild {
@@ -88,7 +71,7 @@ pub enum L0Error {
         /// The buffer length.
         len: usize,
     },
-    /// A buffer or kernel created by one context was given to another.
+    /// A buffer, graph or recording created by one context was given to another.
     #[error("{what} belongs to a different Level Zero context")]
     ForeignResource {
         /// Which resource kind was foreign.

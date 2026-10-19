@@ -603,10 +603,10 @@ impl Idefics3FrontEnd {
             }
         }
         let rendered = render_conversation(self.text.text(), turns)?;
-        let prompt = self
-            .text
-            .text()
-            .encode_chat(&expand_images(&rendered, &grids, self.visual_tokens)?)?;
+        let prompt =
+            self.text
+                .text()
+                .encode_chat(&expand_images(&rendered, &grids, self.visual_tokens)?)?;
         let positions: Vec<usize> = prompt
             .iter()
             .enumerate()
@@ -805,7 +805,9 @@ mod tests {
             ChatTurn::user(1, "c"),
         ];
         let rendered = render_conversation(&codec, &turns).unwrap();
-        let prompt = expand_images(&rendered, &[(0, 0), (1, 2)], 3).unwrap().prompt;
+        let prompt = expand_images(&rendered, &[(0, 0), (1, 2)], 3)
+            .unwrap()
+            .prompt;
         assert_eq!(
             prompt,
             format!(

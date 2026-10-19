@@ -15,8 +15,8 @@ use std::num::NonZeroUsize;
 
 use poot_load::gguf::GgufIndex;
 use poot_quant::weights::{
-    AttnRole, ExpertProj, GdnRole, HyperRole, HyperSite, PleRole, QsaRole, WeightId, WeightKey,
-    WeightMap, WeightMapBuilder, WeightMapError, WeightRole, WeightStore, WeightView,
+    AttnRole, ExpertProj, HyperRole, HyperSite, PleRole, QsaRole, WeightId, WeightKey, WeightMap,
+    WeightMapBuilder, WeightMapError, WeightRole, WeightStore, WeightView,
 };
 
 use super::gated_residual::HyperParams;
@@ -24,9 +24,10 @@ use super::qsa::QsaParams;
 use super::{FAMILY, LayerKind};
 use crate::components::attention::{AttentionParams, QkNorm};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
-use crate::components::gdn::{GdnHeadOrder, GdnParams};
+use crate::components::gdn::GdnParams;
+use crate::components::gdn_names::GdnTable;
 use crate::components::moe::{GateUpForm, MoeParams};
-use crate::components::norm::{NormKind, NormParams};
+use crate::components::norm::NormParams;
 use crate::components::ple::{NgramHash, PleParams, PleSpec};
 use crate::components::rope::RopeParams;
 use crate::components::router::RouterKind;
@@ -35,12 +36,12 @@ use crate::model::{ConfigReason, ModelError};
 use crate::names::{ExpertNames, MoeNames, SharedNames, map_moe_layer};
 use crate::registry::RawConfig;
 
-/// The config facts the HF `qwen4_exp` class and llama.cpp's `qwen4exp` default.
+/// The config facts the HF `qwen4_exp` class defaults; a GGUF must name its RoPE base.
 const SPEC: DenseSpec = DenseSpec {
     family: FAMILY,
     gguf: dense_keys!("qwen4exp"),
     hf_theta: 10_000.0,
-    gguf_theta: 10_000_000.0,
+    gguf_theta: None,
     eps: 1e-6,
     eos: None,
 };
@@ -102,6 +103,20 @@ pub(super) enum Layout {
     Hf,
     /// A GGUF as llama.cpp's converter writes it.
     Gguf,
+}
+
+impl Layout {
+    /// The format's GDN tensor names and stored conventions. Unlike `qwen35` and `qwen3next`, the
+    /// `qwen4exp` GGUF reader has no multi-token-prediction rule: no `qwen4exp.nextn_predict_layers`
+    /// key is known (llama.cpp's pinned release has no `qwen4exp` architecture, and the real
+    /// UD-Q2_K_XL tensor list has no `nextn` tensors), so `block_count` is the stack's depth. A file
+    /// that appends such blocks would need `trunk_layers` applied here, with a fixture row.
+    fn gdn(self) -> GdnTable {
+        match self {
+            Self::Hf => GdnTable::HF_SPLIT,
+            Self::Gguf => GdnTable::GGUF,
+        }
+    }
 }
 
 /// Qwen4Exp's typed config.
@@ -197,11 +212,9 @@ impl Qwen4ExpParams {
         };
 
         // HF stores every `Qwen4ExpTextRMSNorm` scale as an offset from one; a GGUF folds the one in.
-        let norm_kind = match layout {
-            Layout::Hf => NormKind::RmsPlusOne,
-            Layout::Gguf => NormKind::Rms,
-        };
-        let norm = NormParams::of(norm_kind, dims.eps).map_err(param_error)?;
+        let table = layout.gdn();
+        let norm = NormParams::of(table.convention.norm_fold.norm_kind(), dims.eps)
+            .map_err(param_error)?;
         let rotary = match raw {
             RawConfig::HfJson { .. } => {
                 let factor = fields
@@ -237,25 +250,16 @@ impl Qwen4ExpParams {
         {
             return Err(fields.error(fields.key(INNER_SIZE), ConfigReason::Unsupported));
         }
-        // The gated norm scale is plain (not an offset from one) in both formats. HF stores the
-        // decay as `A_log` with the value heads grouped by key head; a GGUF stores `-exp(A_log)`
-        // with the value heads in tiled order.
-        let gdn = GdnParams::new(
-            key_heads,
-            value_heads,
-            head_dim,
-            fields.count(CONV_KERNEL, None)?,
-            NormParams::new(dims.eps).map_err(param_error)?,
-            match layout {
-                Layout::Hf => GdnHeadOrder::Grouped,
-                Layout::Gguf => GdnHeadOrder::Tiled,
-            },
-        )
-        .map_err(param_error)?;
-        let gdn = match layout {
-            Layout::Hf => gdn.with_log_decay(),
-            Layout::Gguf => gdn,
-        };
+        // The gated norm scale is plain (not an offset from one) in both formats.
+        let gdn = table
+            .params(
+                key_heads,
+                value_heads,
+                head_dim,
+                fields.count(CONV_KERNEL, None)?,
+                NormParams::new(dims.eps).map_err(param_error)?,
+            )
+            .map_err(param_error)?;
 
         let renormalize = fields.flag(NORM_TOPK_PROB, true)?;
         let moe = MoeParams::new(
@@ -583,7 +587,6 @@ struct Names {
     attn_gate: HyperNames,
     mlp_gate: HyperNames,
     attention: AttentionNames,
-    gdn: GdnNames,
     ple: PleNames,
 }
 
@@ -610,18 +613,6 @@ struct IndexerNames {
     proj: IndexerProj,
     q_norm: &'static str,
     k_norm: &'static str,
-}
-
-struct GdnNames {
-    qkv: &'static str,
-    z: &'static str,
-    beta: &'static str,
-    alpha: &'static str,
-    out: &'static str,
-    dt_bias: &'static str,
-    conv: &'static str,
-    a: &'static str,
-    norm: &'static str,
 }
 
 struct PleNames {
@@ -780,17 +771,6 @@ const HF_NAMES: Names = Names {
             k_norm: ".self_attn.indexer.k_layernorm.weight",
         },
     },
-    gdn: GdnNames {
-        qkv: ".linear_attn.in_proj_qkv",
-        z: ".linear_attn.in_proj_z",
-        beta: ".linear_attn.in_proj_b",
-        alpha: ".linear_attn.in_proj_a",
-        out: ".linear_attn.out_proj",
-        dt_bias: ".linear_attn.dt_bias",
-        conv: ".linear_attn.conv1d.weight",
-        a: ".linear_attn.A_log",
-        norm: ".linear_attn.norm.weight",
-    },
     ple: PleNames {
         table: PleTable::PerLayer(".ple.ple_embedding.ngram_embedding"),
         key: ".ple.key_proj",
@@ -841,17 +821,6 @@ const GGUF_NAMES: Names = Names {
             q_norm: ".indexer.q_norm.weight",
             k_norm: ".indexer.k_norm.weight",
         },
-    },
-    gdn: GdnNames {
-        qkv: ".attn_qkv",
-        z: ".attn_gate",
-        beta: ".ssm_beta",
-        alpha: ".ssm_alpha",
-        out: ".ssm_out",
-        dt_bias: ".ssm_dt.bias",
-        conv: ".ssm_conv1d.weight",
-        a: ".ssm_a",
-        norm: ".ssm_norm.weight",
     },
     ple: PleNames {
         table: PleTable::Model(GGUF_PLE_TABLE),
@@ -1078,25 +1047,10 @@ pub(super) fn weights_of(
                 }
             }
             LayerKind::LinearAttention => {
-                let g = &names.gdn;
-                let gdn = |role| id(WeightRole::Gdn(role));
-                for (role, stem) in [
-                    (GdnRole::Qkv, g.qkv),
-                    (GdnRole::Z, g.z),
-                    (GdnRole::Beta, g.beta),
-                    (GdnRole::Alpha, g.alpha),
-                    (GdnRole::Out, g.out),
-                ] {
-                    put(&mut map, gdn(role), linear(&layer(stem)))?;
-                }
-                for (role, key) in [
-                    (GdnRole::DtBias, g.dt_bias),
-                    (GdnRole::Conv, g.conv),
-                    (GdnRole::A, g.a),
-                    (GdnRole::GateNorm, g.norm),
-                ] {
-                    put(&mut map, gdn(role), layer(key))?;
-                }
+                p.layout
+                    .gdn()
+                    .map_layer(&mut map, l, &layer, &linear)
+                    .map_err(missing)?;
             }
         }
     }

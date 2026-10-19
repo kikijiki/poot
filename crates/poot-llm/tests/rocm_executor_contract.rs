@@ -723,15 +723,13 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
     // through `RocmDevice`'s own `Device` methods - never a private `RocmContext`/queue internal.
     let codegen_target = poot_codegen::Target::AmdGcn(arch);
     let body: Body = ImportedKernel::SpinBusy.body().clone();
-    let tmp = poot_codegen::kernel_cache_root("rocm-sc011", codegen_target);
-    let out_path = poot_codegen::artifact_path(&tmp, "spin_busy_sc011", codegen_target);
-    poot_codegen::compile(&body, codegen_target, &out_path).expect("spin_busy must compile");
-    let bytes = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(
-        &body,
-        poot_codegen::GpuTarget::try_from(codegen_target).expect("a byte-artifact target"),
-        bytes,
-    );
+    let artifact = poot_codegen::KernelCache::open(codegen_target)
+        .load_or_compile(
+            &body,
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )
+        .expect("spin_busy must compile");
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let kernel = device
         .load_kernel("spin_busy_sc011", compiled)
         .expect("load the spin_busy kernel");

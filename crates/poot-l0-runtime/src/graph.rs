@@ -12,7 +12,7 @@ use std::ptr::null_mut;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::buffer::L0HostBuffer;
+use crate::buffer::{HostLease, L0HostBuffer};
 use crate::context::L0Context;
 use crate::error::{L0Error, check};
 use crate::ffi::{
@@ -104,7 +104,7 @@ impl L0Graph {
 
     /// The compiled blob, which [`L0Context::load_native_graph`] loads without compiling again.
     pub fn native_binary(&self) -> Result<Vec<u8>, L0Error> {
-        let table = self.0.context.graph_table()?;
+        let table = self.0.context.graph_table();
         let get = table
             .get_native_binary
             .ok_or(L0Error::MissingSymbol("pfnGetNativeBinary"))?;
@@ -125,9 +125,7 @@ impl L0Graph {
 
 impl Drop for GraphInner {
     fn drop(&mut self) {
-        let Ok(table) = self.context.graph_table() else {
-            return;
-        };
+        let table = self.context.graph_table();
         let Some(destroy) = table.destroy else {
             return;
         };
@@ -143,7 +141,7 @@ impl Drop for GraphInner {
 impl L0Context {
     /// What the driver's graph compiler reports for the device.
     pub fn graph_device_properties(&self) -> Result<GraphDeviceProperties, L0Error> {
-        let table = self.graph_table()?;
+        let table = self.graph_table();
         let get = table
             .device_get_graph_properties_2
             .ok_or(L0Error::MissingSymbol("pfnDeviceGetGraphProperties2"))?;
@@ -172,7 +170,14 @@ impl L0Context {
     }
 
     /// Create a graph from a blob [`L0Graph::native_binary`] returned.
-    pub fn load_native_graph(&self, blob: &[u8]) -> Result<L0Graph, L0Error> {
+    ///
+    /// # Safety
+    ///
+    /// `blob` must be exactly the bytes [`L0Graph::native_binary`] returned for a graph of the same driver
+    /// compiler version on this device, unmodified (a caller that stores blobs checks a digest over them). The
+    /// driver does not validate a native blob: it links the bytes into the device's executable as they are, so
+    /// a forged or truncated blob is arbitrary code or arbitrary offsets on the device.
+    pub unsafe fn load_native_graph(&self, blob: &[u8]) -> Result<L0Graph, L0Error> {
         self.create_graph(ZE_GRAPH_FORMAT_NATIVE, blob, "")
     }
 
@@ -182,7 +187,7 @@ impl L0Context {
         input: &[u8],
         build_flags: &str,
     ) -> Result<L0Graph, L0Error> {
-        let table = self.graph_table()?;
+        let table = self.graph_table();
         let create = table.create_2.ok_or(L0Error::MissingSymbol("pfnCreate2"))?;
         let flags = CString::new(build_flags).map_err(|_| L0Error::GraphString)?;
         let desc = GraphDesc2::new(format, input, &flags, ZE_GRAPH_FLAG_DISABLE_CACHING);
@@ -206,9 +211,7 @@ impl L0Context {
 
     /// The build log of the last failed graph creation on this thread (the driver keeps one).
     fn last_build_log(&self) -> String {
-        let Ok(table) = self.graph_table() else {
-            return String::new();
-        };
+        let table = self.graph_table();
         let Some(get) = table.build_log_get_string else {
             return String::new();
         };
@@ -236,7 +239,7 @@ impl L0Context {
         ir: &GraphIr<'_>,
         build_flags: &str,
     ) -> Result<Vec<String>, L0Error> {
-        let table = self.graph_table()?;
+        let table = self.graph_table();
         let create = table
             .query_network_create_2
             .ok_or(L0Error::MissingSymbol("pfnQueryNetworkCreate2"))?;
@@ -295,7 +298,6 @@ impl L0Context {
 
     /// Start a recording: a command list that graph executions and copies are appended to.
     pub fn begin_recording(&self) -> Result<L0RecordingBuilder, L0Error> {
-        self.graph_table()?;
         let desc = CommandListDesc::new(self.ordinal());
         let mut list = null_mut();
         // SAFETY: the context and device are live and `desc` outlives the call.
@@ -362,7 +364,7 @@ impl GraphInner {
     /// Read the graph's arguments and run the initialization stage the driver asks for.
     fn initialize(&mut self) -> Result<(), L0Error> {
         let context = self.context.clone();
-        let table = context.graph_table()?;
+        let table = context.graph_table();
         let get_properties = table
             .get_properties_2
             .ok_or(L0Error::MissingSymbol("pfnGetProperties2"))?;
@@ -450,7 +452,7 @@ impl Drop for OwnedList {
 pub struct L0RecordingBuilder {
     list: Option<OwnedList>,
     graphs: Vec<L0Graph>,
-    buffers: Vec<L0HostBuffer>,
+    buffers: Vec<HostLease>,
 }
 
 impl L0RecordingBuilder {
@@ -469,7 +471,7 @@ impl L0RecordingBuilder {
         buffers: &[&L0HostBuffer],
     ) -> Result<(), L0Error> {
         let context = graph.0.context.clone();
-        let table = context.graph_table()?;
+        let table = context.graph_table();
         if buffers.len() != graph.0.arguments.len() {
             return Err(L0Error::ArgumentCount {
                 expected: u32::try_from(graph.0.arguments.len()).unwrap_or(u32::MAX),
@@ -503,7 +505,7 @@ impl L0RecordingBuilder {
             execute(list, graph.0.handle, null_mut(), null_mut(), 0, null_mut())
         })?;
         self.graphs.push(graph.clone());
-        self.buffers.extend(buffers.iter().map(|&b| b.clone()));
+        self.buffers.extend(buffers.iter().map(|b| b.lease()));
         Ok(())
     }
 
@@ -536,8 +538,8 @@ impl L0RecordingBuilder {
                 null_mut(),
             )
         })?;
-        self.buffers.push(dst.clone());
-        self.buffers.push(src.clone());
+        self.buffers.push(dst.lease());
+        self.buffers.push(src.lease());
         Ok(())
     }
 
@@ -567,7 +569,7 @@ fn list_context(builder: &L0RecordingBuilder) -> &L0Context {
 struct RecordingInner {
     list: OwnedList,
     _graphs: Vec<L0Graph>,
-    _buffers: Vec<L0HostBuffer>,
+    _buffers: Vec<HostLease>,
 }
 
 /// A closed command list of graph executions and copies. Cloning shares it; it replays any number of times.

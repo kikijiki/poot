@@ -3,8 +3,8 @@ use super::*;
 use crate::passes::cse_dce::dce_with_roots;
 use poot_graph_ir::Builder;
 use poot_graph_ir::analysis::{
-    NumericsError, NumericsProperty, PASS_DECLARATIONS, PassDeclaration, Tier2Class,
-    dispatch_count, implied_numerics, peak_transient_bytes, verify_pass_numerics,
+    NumericsError, NumericsProperty, Tier2Class, dispatch_count, implied_numerics,
+    peak_transient_bytes,
 };
 use poot_graph_ir::graph::StateRole;
 use poot_graph_ir::op::{BinOp, RedOp};
@@ -2362,7 +2362,7 @@ fn card533_optimize_passes_keep_witness_outputs() {
 /// Card 533 SC-004: a pass whose declaration is weaker than the ops it actually produced is refused,
 /// and the pipeline publishes the tier-2 class its graph exhibits.
 ///
-/// Mutation: set the `fuse` row of `PASS_DECLARATIONS` to `Exact`; `verify_pass_numerics`
+/// Mutation: set the `FUSE` declaration of `passes::declared` to `Exact`; `PassDeclaration::verify`
 /// returns `UnderDeclared { pass: "fuse", declared: Exact, implied: Reassociating }` and this test goes red.
 #[test]
 fn card533_pass_numerics_are_checked_against_produced_ops() {
@@ -2383,19 +2383,16 @@ fn card533_pass_numerics_are_checked_against_produced_ops() {
     );
     assert_eq!(implied_numerics(&fused), NumericsProperty::Reassociating);
 
-    let declaration = PASS_DECLARATIONS
-        .iter()
-        .find(|declaration| declaration.pass == "fuse")
-        .expect("fuse is declared");
+    let declaration = declared::FUSE;
     assert_eq!(declaration.property, NumericsProperty::Reassociating);
-    verify_pass_numerics(declaration, &fused).unwrap();
+    declaration.verify(&fused).unwrap();
 
     let misdeclared = PassDeclaration {
         property: NumericsProperty::Exact,
-        ..*declaration
+        ..declaration
     };
     assert_eq!(
-        verify_pass_numerics(&misdeclared, &fused).unwrap_err(),
+        misdeclared.verify(&fused).unwrap_err(),
         NumericsError::UnderDeclared {
             pass: "fuse",
             declared: NumericsProperty::Exact,

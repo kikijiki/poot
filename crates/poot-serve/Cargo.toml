@@ -27,6 +27,8 @@ poot-text.workspace = true
 clap.workspace = true
 # `encoding_format: base64` embeddings.
 base64.workspace = true
+# An image's header is read for its size before any pixel is decoded; the served VLM rows encode PNGs with it.
+image.workspace = true
 anyhow.workspace = true
 ring.workspace = true
 subtle.workspace = true
@@ -50,8 +52,6 @@ poot-quant = { workspace = true, features = ["test-support"] }
 # The dtype of the synthetic LoRA adapter the device rows write.
 poot-tensor.workspace = true
 poot-graph-ir = { workspace = true, features = ["test-support"] }
-# The image the served VLM row sends is a PNG it encodes.
-image.workspace = true
 
 [lints]
 workspace = true

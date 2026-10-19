@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use poot_executor::{DeviceTime, Executor, NoSync, StateScope, StepInputs};
+use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::scan::{ScanFixture, ScanGraph};
 use poot_graph_ir::{Graph, ValueId};
 use poot_graph_plan::{
@@ -25,7 +26,7 @@ use poot_graph_plan::{
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_tensor::HostTensor;
 
-use crate::{TIER2, assert_close};
+use crate::assert_close;
 
 /// The oracle's evaluation of a graph over bound host tensors: its one output.
 pub type Oracle<'a> = dyn Fn(&Graph, &HashMap<ValueId, HostTensor>) -> HostTensor + 'a;
@@ -100,7 +101,7 @@ fn run_steps(
 
     let scan = step.packed_slot_graph();
     let oracle = step.packed_graph();
-    let (exe, entry) = load_graph_entry(exec, target, &scan.graph, label);
+    let (exe, entry, class) = load_graph_entry(exec, target, &scan.graph, label);
 
     let layout_rows = step.len + step.state_rows_of();
     let mut oracle_state = inputs.operands.last().unwrap().clone();
@@ -116,7 +117,7 @@ fn run_steps(
             assert_close(
                 got.as_f32().unwrap(),
                 want.as_f32().unwrap(),
-                TIER2,
+                class.tolerance(),
                 &format!("{label}: step {index} packed result (y rows then s_out rows)"),
             );
             // The oracle's next carried state is the state rows of its own packed result.
@@ -135,14 +136,19 @@ fn run_steps(
     results
 }
 
-/// Load an executable with no weights and one entry for `graph` compiled for `target`. A fixture graph
+/// Load an executable with no weights and one entry for `graph` compiled for `target`, and the numerics
+/// class that entry's program publishes: the class a result of it is compared within. A fixture graph
 /// built here binds no weights: its operands are activation slots and carried state.
 pub(crate) fn load_graph_entry(
     exec: &mut dyn Executor,
     target: Target,
     graph: &Graph,
     label: &str,
-) -> (poot_executor::ExecutableId, poot_executor::EntryId) {
+) -> (
+    poot_executor::ExecutableId,
+    poot_executor::EntryId,
+    Tier2Class,
+) {
     let store = WeightStore::builder().build();
     let map = WeightMap::builder(&store).build();
     let exe = exec.load_weights(Arc::new(store), Arc::new(map)).unwrap();
@@ -157,7 +163,25 @@ pub(crate) fn load_graph_entry(
     )
     .unwrap_or_else(|e| panic!("{label}: the graph compiles: {e}"));
     let entry = exec.add_entry(exe, &staged).unwrap();
-    (exe, entry)
+    (exe, entry, staged.numerics_class())
+}
+
+/// The numerics class the program of the scan `fixture` publishes on `target`: the class two device results of
+/// that scan (a single launch and its stepped pieces) are compared within. Pieces and the whole differ in length
+/// only, which the class does not read, so any length of one family and shape gives the one answer.
+pub fn numerics_class(target: Target, fixture: &ScanFixture) -> Tier2Class {
+    let scan = fixture.packed_slot_graph();
+    compile_staged(
+        &scan.graph,
+        &TargetSet::single(DeviceId(0), target),
+        &Partition {
+            experts: ExpertPlacement::AllResident,
+            devices: DevicePlacement::Single(DeviceId(0)),
+        },
+        &OPTIONS,
+    )
+    .unwrap_or_else(|e| panic!("the scan graph compiles: {e}"))
+    .numerics_class()
 }
 
 /// One step of `entry` over `window`'s sequence operands; the packed result.
@@ -198,7 +222,7 @@ pub fn timed_step(
     fixture: &ScanFixture,
 ) -> (DeviceTime, Vec<f32>) {
     let scan = fixture.packed_slot_graph();
-    let (exe, entry) = load_graph_entry(exec, target, &scan.graph, "device time");
+    let (exe, entry, _) = load_graph_entry(exec, target, &scan.graph, "device time");
     let bound = fixture.bind(&scan, &fixture.inputs(7));
     let mut step_inputs = StepInputs::new();
     for &id in &scan.operands[..scan.operands.len() - 1] {
@@ -233,7 +257,7 @@ pub fn measure(
     runs: usize,
 ) -> StepTime {
     let scan = fixture.packed_slot_graph();
-    let (exe, entry) = load_graph_entry(exec, target, &scan.graph, "measure");
+    let (exe, entry, _) = load_graph_entry(exec, target, &scan.graph, "measure");
     let inputs = fixture.inputs(7);
     let bound = fixture.bind(&scan, &inputs);
     let mut samples = Vec::new();

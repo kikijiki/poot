@@ -85,6 +85,7 @@ pub(crate) fn engine_args(config: &ServeConfig, draft: DraftPolicy) -> Result<En
         "--device-timing is not recorded over a device group: use it with --placement single"
     );
     Ok(EngineArgs::new(config.backend, draft)
+        .with_shape(config.rows, config.max_seq)
         .with_placement(config.placement.clone())
         .with_expert_pool(config.expert_pool))
 }
@@ -370,7 +371,7 @@ pub(crate) fn run() -> Result<()> {
     let draft = draft_policy(&config)?;
     // The vision tower opens first, so the engine fits its workload to the memory the tower left.
     let images = checkpoint
-        .map(|checkpoint| spawn_image_front_end(&mut workers, checkpoint, config.backend))
+        .map(|checkpoint| spawn_image_front_end(&mut workers, &health, checkpoint, config.backend))
         .transpose()?;
     let args = engine_args(&config, draft)?;
     let (metrics, view) = spawn_engine(

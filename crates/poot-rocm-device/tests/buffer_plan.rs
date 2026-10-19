@@ -163,16 +163,13 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_rocm(
     };
     let codegen_target = poot_codegen::Target::AmdGcn(arch);
     let body = poot_kernel_ir::test_support::len_probe_kernel();
-    let dir = poot_codegen::kernel_cache_root("rocm-sc002-len-probe", codegen_target);
-    let out_path = poot_codegen::artifact_path(&dir, "sc002_len_probe", codegen_target);
-    poot_codegen::compile(&body, codegen_target, &out_path)
+    let artifact = poot_codegen::KernelCache::open(codegen_target)
+        .load_or_compile(
+            &body,
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )
         .expect("len_probe must compile to HSACO");
-    let bytes = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(
-        &body,
-        poot_codegen::GpuTarget::try_from(codegen_target).expect("a byte-artifact target"),
-        bytes,
-    );
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let kernel = device
         .load_kernel("sc002_len_probe", compiled)
         .expect("load the len_probe kernel");
@@ -248,16 +245,13 @@ fn an_aie_launch_is_a_typed_refusal_on_rocm() {
     };
     let codegen_target = poot_codegen::Target::AmdGcn(arch);
     let body = poot_kernel_ir::test_support::len_probe_kernel();
-    let dir = poot_codegen::kernel_cache_root("rocm-aie-launch-refusal", codegen_target);
-    let out_path = poot_codegen::artifact_path(&dir, "aie_launch_probe", codegen_target);
-    poot_codegen::compile(&body, codegen_target, &out_path)
+    let artifact = poot_codegen::KernelCache::open(codegen_target)
+        .load_or_compile(
+            &body,
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )
         .expect("len_probe must compile to HSACO");
-    let bytes = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(
-        &body,
-        poot_codegen::GpuTarget::try_from(codegen_target).expect("a byte-artifact target"),
-        bytes,
-    );
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let kernel = device
         .load_kernel("aie_launch_probe", compiled)
         .expect("load the probe kernel");

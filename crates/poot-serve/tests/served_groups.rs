@@ -1374,7 +1374,7 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     refused(&remote, "data: URIs");
     let mut garbage = chat_with_image(&black);
     garbage["messages"][0]["content"][1]["image_url"]["url"] = "data:image/png;base64,AAAA".into();
-    refused(&garbage, "decode image");
+    refused(&garbage, "does not decode");
     // A text that spells the image mark would take another image's rows, so it is refused.
     let mut spelled = chat_with_image(&black);
     spelled["messages"][0]["content"][0]["text"] = "b <image> c".into();

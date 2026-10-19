@@ -884,12 +884,10 @@ mod step_encode_allocation_tests {
         let dir = std::env::temp_dir().join("poot-wgpu-runtime-dispatch-alloc-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = poot_codegen::artifact_path(&dir, name, poot_codegen::Target::SpirvVulkan);
-        poot_codegen::compile(body, poot_codegen::Target::SpirvVulkan, &path).unwrap();
-        poot_codegen::kernel_handle(
-            body,
-            poot_codegen::GpuTarget::SpirvVulkan,
-            std::fs::read(path).unwrap(),
-        )
+        let artifact =
+            poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::SpirvVulkan, &path)
+                .unwrap();
+        poot_codegen::kernel_handle(body, &artifact).unwrap()
     }
 
     fn cached(

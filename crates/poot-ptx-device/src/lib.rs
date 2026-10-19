@@ -26,6 +26,9 @@ pub enum PtxGpuError {
     /// Generating or compiling a kernel for the `Nvptx` target failed.
     #[error("codegen: {0}")]
     Codegen(#[source] Box<poot_codegen::CompileError>),
+    /// A compiled kernel artifact is not the one compiled from the body it was presented with.
+    #[error("kernel artifact: {0}")]
+    KernelArtifact(#[source] Box<poot_codegen::ArtifactMismatch>),
     /// Planning the graph for this device failed.
     #[error("plan: {0}")]
     Plan(#[source] Box<poot_graph_plan::PlanError>),

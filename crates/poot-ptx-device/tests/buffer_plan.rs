@@ -170,13 +170,13 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_ptx()
     const SLOT_CAPACITY: usize = 64;
 
     let body = poot_kernel_ir::test_support::len_probe_kernel();
-    let dir = poot_codegen::kernel_cache_root("ptx-sc002-len-probe", poot_codegen::Target::Nvptx);
-    let out_path =
-        poot_codegen::artifact_path(&dir, "sc002_len_probe", poot_codegen::Target::Nvptx);
-    poot_codegen::compile(&body, poot_codegen::Target::Nvptx, &out_path)
+    let artifact = poot_codegen::KernelCache::open(poot_codegen::Target::Nvptx)
+        .load_or_compile(
+            &body,
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )
         .expect("len_probe must compile to PTX");
-    let bytes = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, bytes);
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let kernel = device
         .load_kernel("sc002_len_probe", compiled)
         .expect("load the len_probe kernel");
@@ -246,14 +246,13 @@ fn an_aie_launch_is_a_typed_refusal_on_ptx() {
         return;
     };
     let body = poot_kernel_ir::test_support::len_probe_kernel();
-    let dir =
-        poot_codegen::kernel_cache_root("ptx-aie-launch-refusal", poot_codegen::Target::Nvptx);
-    let out_path =
-        poot_codegen::artifact_path(&dir, "aie_launch_probe", poot_codegen::Target::Nvptx);
-    poot_codegen::compile(&body, poot_codegen::Target::Nvptx, &out_path)
+    let artifact = poot_codegen::KernelCache::open(poot_codegen::Target::Nvptx)
+        .load_or_compile(
+            &body,
+            poot_graph_plan::CompileLimits::STANDARD.max_artifact_bytes,
+        )
         .expect("len_probe must compile to PTX");
-    let bytes = std::fs::read(&out_path).unwrap();
-    let compiled = poot_codegen::kernel_handle(&body, poot_codegen::GpuTarget::Nvptx, bytes);
+    let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let kernel = device
         .load_kernel("aie_launch_probe", compiled)
         .expect("load the probe kernel");

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use poot_codegen::emit_llvm_ir;
-use poot_codegen::{Target, compile};
+use poot_codegen::{GpuTarget, Target, compile, compile_kernel};
 use poot_kernel_ir::test_support::{wg_sum, workgroup_fence_spin_wait};
 use poot_kernel_ir::{
     BasicBlock, BinOp, Body, LocalDecl, MathOp, MemoryOrdering, MemoryScope, Statement, Terminator,
@@ -52,9 +52,8 @@ fn spv(body: &Body, name: &str) -> poot_runtime_common::CompiledKernel {
     let dir: PathBuf = std::env::temp_dir().join("poot-kernelgen-test").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
-    compile(body, Target::SpirvVulkan, &out).expect("compile");
-    let bytes = std::fs::read(&out).unwrap();
-    poot_codegen::kernel_handle(body, poot_codegen::GpuTarget::SpirvVulkan, bytes)
+    let artifact = compile_kernel(body, GpuTarget::SpirvVulkan, &out).expect("compile");
+    poot_codegen::kernel_handle(body, &artifact).unwrap()
 }
 
 /// The compiled SPIR-V word count of a handle `spv()` built, for callers that just want to assert a

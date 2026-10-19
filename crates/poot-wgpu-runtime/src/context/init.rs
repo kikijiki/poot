@@ -122,12 +122,23 @@ impl Context {
             .map_err(|e| RuntimeError::NoAdapter(e.to_string()))?;
 
         // PASSTHROUGH_SHADERS is required for raw SPIR-V; the rest are enabled only if available.
-        let mut features = wgpu::Features::PASSTHROUGH_SHADERS;
+        // SHADER_I16 and SHADER_INT64 are required too: the codegen's SPIR-V may declare the Int16 and
+        // Int64 capabilities and `DeviceCaps` has no field to plan around their absence, so an adapter
+        // without them is refused at open (`DeviceInit`) instead of running modules that declare a
+        // capability the device never enabled. `shaderInt16`/`shaderInt64` are reported by every
+        // Vulkan driver this backend targets (RADV, NVIDIA, Intel, lavapipe), and `poot-vulkan-runtime`
+        // enables both wherever they exist.
+        let mut features = wgpu::Features::PASSTHROUGH_SHADERS
+            | wgpu::Features::SHADER_I16
+            | wgpu::Features::SHADER_INT64;
         for opt in [
             wgpu::Features::SHADER_F64,
             wgpu::Features::SHADER_FLOAT32_ATOMIC,
             wgpu::Features::SHADER_F16,
             wgpu::Features::SUBGROUP,
+            // Cooperative matrices: wgpu-hal enables the Vulkan memory model and its device scope
+            // together with this feature, which the matrix kernels' SPIR-V declares.
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
         ] {
             if adapter.features().contains(opt) {
                 features |= opt;
@@ -154,13 +165,23 @@ impl Context {
         limits.max_storage_buffer_binding_size = a.max_storage_buffer_binding_size;
         limits.max_compute_workgroups_per_dimension = a.max_compute_workgroups_per_dimension;
 
+        // Experimental features need the opt-in token, and only the cooperative-matrix feature is
+        // experimental here, so the token is given exactly when that feature is requested.
+        let experimental_features =
+            if features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+                // SAFETY: the only experimental feature requested is cooperative matrices; the kernels
+                // using it are `spirv-val`-clean.
+                unsafe { wgpu::ExperimentalFeatures::enabled() }
+            } else {
+                wgpu::ExperimentalFeatures::default()
+            };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("poot-wgpu-runtime"),
                 required_features: features,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
-                experimental_features: wgpu::ExperimentalFeatures::default(),
+                experimental_features,
                 trace: wgpu::Trace::Off,
             })
             .await
@@ -187,32 +208,14 @@ impl Context {
         // ceiling (if any) is not actually available to a dispatch on this device.
         let lds_bytes = device.limits().max_compute_workgroup_storage_size;
         // Card 522 review: measured from `VK_KHR_cooperative_matrix` (via wgpu's own
-        // `Adapter::cooperative_matrix_properties`, populated at adapter-capability-probe time, no
-        // feature/extension request needed to read it), never parsed from the adapter's device-name
-        // string - Mesa RADV reports a marketing codename ("AMD Radeon 8060S Graphics (RADV
-        // STRIX_HALO)"), not a gfx code, so a name-based classifier would wrongly call this device's
-        // real RDNA3 WMMA hardware absent. Every reported config is folded (a device can report more
-        // than one shape); `wgpu::Backend::Vulkan` is the only backend this crate confirms the property
-        // list is meaningfully populated for, so any other backend says `UnknownNotExposedByApi`.
-        let tensor_core = if adapter_info.backend == wgpu::Backend::Vulkan {
-            adapter
-                .cooperative_matrix_properties()
-                .into_iter()
-                .map(|c| {
-                    poot_target::TensorCoreSupport::from_cooperative_matrix_config(
-                        c.m_size,
-                        c.n_size,
-                        c.k_size,
-                        c.ab_type == wgpu::CooperativeScalarType::F16,
-                        c.cr_type == wgpu::CooperativeScalarType::F32,
-                    )
-                })
-                .fold(poot_target::TensorCoreSupport::None, |acc, x| {
-                    acc.most_specific(x)
-                })
-        } else {
-            poot_target::TensorCoreSupport::UnknownNotExposedByApi
-        };
+        // `Adapter::cooperative_matrix_properties`), never parsed from the adapter's device-name
+        // string - Mesa RADV reports a marketing codename, not a gfx code. Reported only for what
+        // the device was granted (`device.features()`), not what the adapter advertises.
+        let tensor_core = granted_tensor_core(
+            adapter_info.backend,
+            device.features(),
+            &adapter.cooperative_matrix_properties(),
+        );
         // Card 653: wgpu has no compute-unit query, so read AMD's own Vulkan
         // shader-core properties through the wgpu-hal adapter where the driver exposes them; any other
         // device plans against the RDNA3 default, the one device family this backend's launch policy
@@ -375,6 +378,38 @@ impl Context {
     }
 }
 
+/// The matrix-hardware family a device reports: every cooperative-matrix configuration folded (a
+/// device can report more than one shape), but only when `granted` holds the cooperative-matrix
+/// feature, since a kernel using it on a device created without it declares an unenabled capability.
+/// `wgpu::Backend::Vulkan` is the only backend whose property list is meaningfully populated, so any
+/// other backend says `UnknownNotExposedByApi`.
+fn granted_tensor_core(
+    backend: wgpu::Backend,
+    granted: wgpu::Features,
+    properties: &[wgpu::CooperativeMatrixProperties],
+) -> poot_target::TensorCoreSupport {
+    if backend != wgpu::Backend::Vulkan {
+        return poot_target::TensorCoreSupport::UnknownNotExposedByApi;
+    }
+    if !granted.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
+        return poot_target::TensorCoreSupport::None;
+    }
+    properties
+        .iter()
+        .map(|c| {
+            poot_target::TensorCoreSupport::from_cooperative_matrix_config(
+                c.m_size,
+                c.n_size,
+                c.k_size,
+                c.ab_type == wgpu::CooperativeScalarType::F16,
+                c.cr_type == wgpu::CooperativeScalarType::F32,
+            )
+        })
+        .fold(poot_target::TensorCoreSupport::None, |acc, x| {
+            acc.most_specific(x)
+        })
+}
+
 /// The adapter's compute units through [`crate::amd_vulkan_compute_units`]; `None` off Vulkan.
 fn probe_amd_compute_units(adapter: &wgpu::Adapter) -> Option<u32> {
     // SAFETY: `as_hal` yields the live wgpu-hal Vulkan adapter for the guard's lifetime, so its
@@ -422,6 +457,54 @@ impl LaunchCaps {
                 poot_target::SubgroupSupport::Absent
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tensor_core_tests {
+    use super::*;
+
+    fn f16_16x16x16() -> wgpu::CooperativeMatrixProperties {
+        wgpu::CooperativeMatrixProperties {
+            m_size: 16,
+            n_size: 16,
+            k_size: 16,
+            ab_type: wgpu::CooperativeScalarType::F16,
+            cr_type: wgpu::CooperativeScalarType::F32,
+            saturating_accumulation: false,
+        }
+    }
+
+    /// SC-001: an adapter that advertises cooperative matrices but whose device was created without
+    /// the feature reports no tensor core; with the feature granted the same properties are reported.
+    /// Mutation: read the properties without checking `granted` and the first assertion fails.
+    #[test]
+    fn tensor_core_is_reported_only_for_a_granted_feature() {
+        let props = [f16_16x16x16()];
+        let ungranted = granted_tensor_core(
+            wgpu::Backend::Vulkan,
+            wgpu::Features::PASSTHROUGH_SHADERS,
+            &props,
+        );
+        assert_eq!(ungranted, poot_target::TensorCoreSupport::None);
+        let granted = granted_tensor_core(
+            wgpu::Backend::Vulkan,
+            wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
+            &props,
+        );
+        assert_ne!(granted, poot_target::TensorCoreSupport::None);
+    }
+
+    #[test]
+    fn a_non_vulkan_backend_is_unknown_whatever_was_granted() {
+        assert_eq!(
+            granted_tensor_core(
+                wgpu::Backend::Metal,
+                wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,
+                &[f16_16x16x16()],
+            ),
+            poot_target::TensorCoreSupport::UnknownNotExposedByApi
+        );
     }
 }
 
@@ -495,6 +578,14 @@ mod launch_caps_device_receipt {
             fixture.max_workgroup_invocations
         );
         assert_eq!(live.subgroup, fixture.subgroup);
+        // Granted, not merely advertised: the device holds the cooperative-matrix feature that the
+        // reported matrix hardware depends on.
+        assert_eq!(live.tensor_core, fixture.tensor_core);
+        assert!(
+            ctx.device
+                .features()
+                .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        );
     }
 }
 
