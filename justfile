@@ -50,7 +50,7 @@ test: test-model-free
 
 # the model-free gate: dead-pub and unused-dependency checks, docs-path references, the inventory and lane self-tests, device-probe
 # self-test, then every model-free test and doctest
-test-model-free: dead-pub machete docs-paths diagrams-check aie-link-driver npu-build vpu-build crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
+test-model-free: dead-pub machete docs-paths variant-coverage mutation-sample-report diagrams-check aie-link-driver npu-build vpu-build crates-stale-names cargo-freshness test-model-free-inventory test-lane-coverage test-bench-runner
     scripts/with-required-backend.sh --self-test
     scripts/test-model-free.sh run
 
@@ -96,6 +96,18 @@ diagrams-check:
 docs-paths:
     scripts/check-docs-paths.py --self-test
     scripts/check-docs-paths.py
+
+# every variant of the registered error and refusal enums names a covering test in scripts/variant-coverage.tsv (or is a
+# listed gap), and each listed test still exists and still names its variant (POOT-1221)
+variant-coverage:
+    scripts/check-variant-coverage.py --self-test
+    scripts/check-variant-coverage.py
+
+# the committed cargo-mutants sample report is consistent; the sample itself is `scripts/mutation-sample.sh` (nightly or by
+# hand, about 15 minutes) and fails when survivors rise above the committed count (POOT-1221)
+mutation-sample-report:
+    scripts/check-mutation-sample.py --self-test
+    scripts/check-mutation-sample.py
 
 # worktrees share a slot target dir, so cargo must decide freshness by source content, not mtime (POOT-1037)
 cargo-freshness:

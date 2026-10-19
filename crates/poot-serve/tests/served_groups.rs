@@ -1337,6 +1337,9 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     ];
     let expected_conversation = caption(&[&black, &white], &conversation);
     let expected_last_turn_alone = caption(&[&white], &[ChatTurn::user(1, "c d")]);
+    // A question that spells the image mark is the client's text: it takes no image's rows (the front
+    // end's `Placeholders` check would refuse a prompt that did), so the caption is the driver's.
+    let expected_spelled = caption(&[&black], &[ChatTurn::user(1, "b <image> c")]);
     drop(caption);
     drop(vlm);
     assert_ne!(
@@ -1375,10 +1378,19 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     let mut garbage = chat_with_image(&black);
     garbage["messages"][0]["content"][1]["image_url"]["url"] = "data:image/png;base64,AAAA".into();
     refused(&garbage, "does not decode");
-    // A text that spells the image mark would take another image's rows, so it is refused.
+    // A text that spells the image mark is plain text, not a second image: it is served, and the caption
+    // is the driver's. Mutation: drop the `contains_id` check in `TextCodec::encode_without_added_tokens`;
+    // the word-level fixture maps the spelled mark to the image token and the request is refused with
+    // `Placeholders` (21 tokens for 20 rows).
     let mut spelled = chat_with_image(&black);
     spelled["messages"][0]["content"][0]["text"] = "b <image> c".into();
-    refused(&spelled, "<image> marks");
+    let (status, served) = server.chat(&spelled);
+    assert_eq!(status, 200, "{served}");
+    assert_eq!(
+        served["choices"][0]["message"]["content"].as_str().unwrap(),
+        expected_spelled.trim_end(),
+        "{flag}: the served caption of a spelled mark differs from Idefics3::caption's"
+    );
     // A tool result has no place in the image chat template.
     let mut tool_result = chat_with_image(&black);
     tool_result["messages"]

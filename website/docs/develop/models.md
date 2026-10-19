@@ -69,7 +69,7 @@ blocks of `indexer_compress_ratio` tokens and its tail runs as decode steps. Rou
 checkpoint stores them: dense stacks, packed E4M3 tensors per expert, or a GGUF's stacked K-quant, IQ4, IQ2_XS,
 IQ3_XXS and IQ3_S tensors kept packed, one owner per expert (UD-Q2_K_XL stores the expert gate and up stacks as
 IQ2_XS and IQ3_XXS). A GGUF stores the n-gram hash constants as metadata and the table as one tensor, and poot reads
-both as stored. A tensor of a type poot has no format for (for example IQ2_XXS or IQ2_S) is refused by tensor name and
+both as stored. A tensor of a type poot has no format for (for example `Q8_K` or an IQ1 type) is refused by tensor name and
 type. The vision tower is not loaded. A token outside the vocabulary stops the step with a validation error naming the
 n-gram embedding's layer. The official
 checkpoint stores the n-gram table as 128 E4M3 row-range shards under one scale; each shard stays a resident weight

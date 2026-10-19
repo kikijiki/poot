@@ -629,33 +629,49 @@ pub(crate) fn handle(
         deadline: deadline_after(accepted, limits.request_timeout),
     });
     // Set once the request's body (if it declared one) has been read in full.
-    let mut body_unread = true;
-    let answered = serve(
-        &mut stream,
-        &mut reader,
-        &mut body_unread,
+    let mut connection = Connection {
+        stream: &mut stream,
+        reader: &mut reader,
+        body_unread: true,
+    };
+    let shared = Shared {
         served,
         health,
         metrics,
         limits,
         lora_admin_policy,
-    );
+    };
+    let answered = serve(&mut connection, &shared);
+    let body_unread = connection.body_unread;
     if body_unread {
         close_with_body_unread(&stream, &mut reader);
     }
     answered
 }
 
-fn serve(
-    stream: &mut TcpStream,
-    reader: &mut BufReader<DeadlineStream>,
-    body_unread: &mut bool,
-    served: &Served,
-    health: &EngineHealth,
-    metrics: &Metrics,
-    limits: &Limits,
-    lora_admin_policy: &LoraAdminPolicy,
-) -> Result<()> {
+/// The state of one connection's request: the socket, its buffered reader, and whether the request's
+/// body (if it declared one) is still unread.
+struct Connection<'a> {
+    stream: &'a mut TcpStream,
+    reader: &'a mut BufReader<DeadlineStream>,
+    body_unread: bool,
+}
+
+/// The server-wide handles every connection's request is routed against.
+struct Shared<'a> {
+    served: &'a Served,
+    health: &'a EngineHealth,
+    metrics: &'a Metrics,
+    limits: &'a Limits,
+    lora_admin_policy: &'a LoraAdminPolicy,
+}
+
+fn serve(connection: &mut Connection<'_>, shared: &Shared<'_>) -> Result<()> {
+    let Connection {
+        stream,
+        reader,
+        body_unread,
+    } = connection;
     let head = match read_request_head_from(reader) {
         Ok(head) => head,
         Err(failure) => return refuse(stream, failure),
@@ -666,17 +682,25 @@ fn serve(
             reader,
             body_unread,
             &head,
-            served,
-            limits,
-            lora_admin_policy,
+            shared.served,
+            shared.limits,
+            shared.lora_admin_policy,
         );
     }
     match head.method.as_str() {
         "GET" => {
             *body_unread = head.content_length.is_some_and(|length| length > 0);
-            serve_get(stream, &head.path, health, metrics)
+            serve_get(stream, &head.path, shared.health, shared.metrics)
         }
-        "POST" => serve_model(stream, reader, body_unread, head, served, metrics, limits),
+        "POST" => serve_model(
+            stream,
+            reader,
+            body_unread,
+            head,
+            shared.served,
+            shared.metrics,
+            shared.limits,
+        ),
         _ => respond_error(stream, 405, "method not allowed", "invalid_request_error"),
     }
 }

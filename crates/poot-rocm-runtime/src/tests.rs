@@ -19,8 +19,8 @@ use crate::hsaco::{ModuleConstruction, kernel_symbol_matches};
 use crate::owner::ResourceOwner;
 use crate::queue::{
     QueueCreationPlan, QueueProperties, QueueRequest, QueueRingProvenance, QueueRole,
-    cooperative_gws_publication_facts, destroy_queue_reference, device_ring_override_present,
-    queue_request, validate_created_queue, validate_queue_plan_provenance,
+    destroy_queue_reference, device_ring_override_present, queue_request, validate_created_queue,
+    validate_queue_plan_provenance,
 };
 use poot_runtime_common::{BufferRole, MemoryCounters, fnv1a};
 use poot_target::{BufferStorage, ElementKind};
@@ -1779,39 +1779,6 @@ fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
     a.iter().zip(b.iter()).position(|(x, y)| x != y)
 }
 
-// Structural guards. Two wiring facts still cannot be observed model-free: `enqueue` builds
-// its publisher directly from the live `RocmContext` (its HSA queue, doorbell and function table),
-// and queue creation records provenance only an HSA queue creation can prove. Each guard below reads
-// only the one production file that owns the fact, extracts one item body, and asserts the call that
-// wires it. They are kept small and named as structural; every behavior the wiring produces is a
-// behavior test elsewhere in this file (the body writer, the ring writer's body writes, completion
-// signal and fence effect, the publication contract table and the cooperative GWS facts). Each was
-// observed red under the mutation named on it.
-
-fn rust_item_body<'a>(source: &'a str, signature: &str) -> &'a str {
-    let start = source
-        .find(signature)
-        .unwrap_or_else(|| panic!("missing signature `{signature}`"));
-    let after = &source[start..];
-    let brace = after
-        .find('{')
-        .unwrap_or_else(|| panic!("missing body for `{signature}`"));
-    let mut depth = 0usize;
-    for (offset, ch) in after[brace..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &after[brace..=brace + offset];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unbalanced body for `{signature}`");
-}
-
 #[test]
 fn production_body_writer_leaves_header_invalid_on_synthetic_ring() {
     let kernel = KernelHandle::for_test(0x1111_2222_3333_4444, 16, 32, 64, &[]);
@@ -2026,81 +1993,50 @@ fn ring_writer_device_store_fence_issues_the_architecture_fence() {
     );
 }
 
-/// STRUCTURAL GUARD. `enqueue` needs a live `RocmContext` (its HSA queue, doorbell and
-/// function table) and every model-free input yields the same contract either way, so the wiring is
-/// read from source: the publisher behind `enqueue_graph_batched` publishes through the contract the
-/// context retained, never a hard-coded one. The fence half of this guard became the behavior test
-/// `ring_writer_device_store_fence_issues_the_architecture_fence` (card 617). Mutation observed red:
-/// `enqueue` validates a fresh `QueuePublication` from hard-coded `QueueRingMemory` facts.
+/// The publication contract each queue-creation plan hands the queue it creates, through the same
+/// `publication_facts` and `QueuePublication::validate` that queue construction runs. The cooperative
+/// GWS plan's ring is system memory (host-coherent, no fence); the receipt-only plan's is device memory
+/// over PCIe, which on x86 is the store-fence contract. Mutation: `publication_facts` answers the device
+/// ring for `CooperativeGws`, or system memory for the receipt plan; both rows go red.
 #[test]
-fn structural_replay_publishes_through_the_retained_contract() {
-    let replay = rust_item_body(include_str!("hsaco.rs"), "fn enqueue(");
-    assert!(
-        replay.contains(".queue_publication") && replay.contains("publish_chunks"),
-        "replay must consume the retained context publication contract"
-    );
-    assert!(
-        !replay.contains("QueuePublication::validate")
-            && !replay.contains("QueueRingMemory::")
-            && !replay.contains("QueuePublicationContract::"),
-        "replay must not hard-code a publication contract in place of the retained field"
-    );
-}
-
-#[test]
-fn cooperative_gws_construction_records_host_coherent_system_memory_provenance() {
+fn each_creation_plan_publishes_through_its_own_ring_contract() {
+    let gws = QueueCreationPlan::CooperativeGws.publication_facts();
     assert_eq!(
-        cooperative_gws_publication_facts(),
+        gws,
         (Some(QueueRingMemory::HostCoherent), None),
-        "current cooperative GWS creator has explicit system-memory ring provenance"
+        "the cooperative GWS creator has explicit system-memory ring provenance"
     );
-    assert_ne!(
-        cooperative_gws_publication_facts(),
+    let validated =
+        publication::QueuePublication::validate(gws.0, gws.1, QueueHostTarget::Other("test-host"))
+            .expect("host-coherent facts validate on any host");
+    assert_eq!(validated.contract(), QueuePublicationContract::HostCoherent);
+
+    let receipt = QueueCreationPlan::PcieDeviceMemoryRingReceipt.publication_facts();
+    assert_eq!(
+        receipt,
         (
             Some(QueueRingMemory::DeviceMemory),
-            Some(QueueHostLink::Coherent)
+            Some(QueueHostLink::Pcie)
         ),
-        "must not silently claim coherent device-memory provenance for the GWS queue"
+        "the receipt-only plan is the PCIe device ring"
     );
-
-    let validated = publication::QueuePublication::validate(
-        cooperative_gws_publication_facts().0,
-        cooperative_gws_publication_facts().1,
+    let on_unproven_host = publication::QueuePublication::validate(
+        receipt.0,
+        receipt.1,
         QueueHostTarget::Other("test-host"),
-    )
-    .expect("host-coherent facts must validate");
-    assert_eq!(validated.contract(), QueuePublicationContract::HostCoherent);
-}
-
-/// STRUCTURAL GUARD. Queue creation needs HSA, so which facts each creation plan records is read
-/// from `new_inner`: the cooperative GWS plan takes its provenance from
-/// `cooperative_gws_publication_facts` (tested above) and never hard-codes the device-ring facts the
-/// receipt-only plan owns. Mutation observed red: the `CooperativeGws` arm records
-/// `QueueRingMemory::DeviceMemory` directly.
-#[test]
-fn structural_gws_queue_creation_takes_its_facts_from_the_provenance_helper() {
-    let construction = rust_item_body(include_str!("transfer.rs"), "fn new_inner(");
-    assert!(
-        construction.contains("cooperative_gws_publication_facts()"),
-        "queue construction must take publication facts from the cooperative GWS provenance helper"
     );
     assert!(
-        construction.contains("QueueCreationPlan::CooperativeGws")
-            && construction.contains("QueueCreationPlan::PcieDeviceMemoryRingReceipt"),
-        "construction must keep production GWS and receipt-only device-ring plans distinct"
+        on_unproven_host.is_err(),
+        "a PCIe device ring on a host with no proven fence is refused, not published through"
     );
-    let gws_arm_start = construction
-        .find("QueueCreationPlan::CooperativeGws")
-        .expect("CooperativeGws arm missing");
-    let receipt_arm_start = construction
-        .find("QueueCreationPlan::PcieDeviceMemoryRingReceipt")
-        .expect("PcieDeviceMemoryRingReceipt arm missing");
-    let gws_arm = &construction[gws_arm_start..receipt_arm_start];
-    assert!(
-        gws_arm.contains("cooperative_gws_publication_facts()")
-            && !gws_arm.contains("QueueRingMemory::DeviceMemory")
-            && !gws_arm.contains("QueueHostLink::Pcie"),
-        "cooperative GWS arm must not hard-code device-ring publication facts"
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        publication::QueuePublication::validate(receipt.0, receipt.1, QueueHostTarget::X86)
+            .expect("x86 has the store fence")
+            .contract(),
+        QueuePublicationContract::PcieDeviceMemory {
+            fence: DeviceStoreFence::X86StoreFence
+        }
     );
 }
 

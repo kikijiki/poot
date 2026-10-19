@@ -1148,18 +1148,19 @@ mod template_failure_tests {
         assert!(why.contains("roles must alternate"), "got: {why}");
     }
 
-    /// SC-003: a template recursing to 2^40 calls spends its fuel and is refused, quickly. Mutation: no fuel
-    /// (the render never ends).
+    /// SC-003: a template whose recursion costs far more than the chat budget (2^20 calls, finite without a
+    /// bound) spends the fuel and is refused with the budget named. The bound is the engine's instruction
+    /// count, not elapsed time, so load cannot move it. Mutation: no fuel (the render completes).
     #[test]
-    fn a_recursive_template_spends_its_fuel_within_100_ms() {
-        let template = "{% macro f(n) %}{% if n < 40 %}{{ f(n + 1) }}{{ f(n + 1) }}{% endif %}x{% endmacro %}{{ f(0) }}";
-        let started = std::time::Instant::now();
+    fn a_recursive_template_spends_its_fuel_and_is_refused() {
+        let template = "{% macro f(n) %}{% if n < 20 %}{{ f(n + 1) }}{{ f(n + 1) }}{% endif %}x{% endmacro %}{{ f(0) }}";
         let why = render_error(template, &user("hi"));
-        assert!(why.contains("instructions"), "got: {why}");
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(100),
-            "took {:?}",
-            started.elapsed()
+            why.contains(&format!(
+                "the template spent its budget of {} instructions",
+                RenderBudget::CHAT.fuel
+            )),
+            "got: {why}"
         );
     }
 

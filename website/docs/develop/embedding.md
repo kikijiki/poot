@@ -69,7 +69,8 @@ wgpu; `Auto` never picks `Vulkan`), then generate:
 ```rust
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
-use poot_graph_plan::{CompileLimits, CompileOptions, Submission};
+use poot_graph_plan::production_plan::Submission;
+use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, PreparedSetLimits, open_executor,
 };

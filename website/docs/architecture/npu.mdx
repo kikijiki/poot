@@ -128,7 +128,7 @@ Nothing else is verified. Every other equation is refused by the planner with a 
 contract (the NPU computes in FP16), and converts through BF16 or an integer. Softmax, attention and
 collectives are not recognized as composites, and no model runs on the Intel NPU. A literal FP16 cannot hold
 is refused (`NarrowingRange`), unless the target records the narrowing contract and the literal is the operand
-of an add or subtract: then a finite F32 literal saturates to ±65504 (a mask sentinel acting as an infinity).
+of an add or subtract: then a finite F32 literal saturates to +/-65504 (a mask sentinel acting as an infinity).
 A multiplicative use stays refused, an infinite literal stays infinite and a NaN literal is refused. An integer
 converted to a float is refused as `IntegerToFloat`, because FP16 holds integers exactly only up to 2048. The
 index of a runtime `dynamic_update_slice` must select a window that fits: the CPU oracle rejects an
