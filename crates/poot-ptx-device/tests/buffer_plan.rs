@@ -213,10 +213,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_ptx()
             work: 1,
         })
         .unwrap();
-    let recording = device
-        .finish()
-        .unwrap()
-        .expect("a device always returns a recording");
+    let recording = device.finish().unwrap();
     device
         .replay(&recording)
         .expect("replay only re-encodes metadata; it never runs the dispatch itself");

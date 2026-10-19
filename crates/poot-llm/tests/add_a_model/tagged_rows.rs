@@ -60,7 +60,10 @@ fn load(dir: &Path) -> ModelHandle {
 }
 
 fn tagged_model(fixture: &Fixture) -> Box<dyn Model> {
-    registry().build(&fixture.raw(), &fixture.store).unwrap()
+    registry()
+        .build(&fixture.raw(), &fixture.store)
+        .unwrap()
+        .model
 }
 
 /// The request inputs of [`PROMPT`] with `tags` at its positions.

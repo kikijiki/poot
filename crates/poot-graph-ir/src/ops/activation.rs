@@ -72,6 +72,7 @@ pub fn decay_mask_from_gates(
 /// [`decay_mask_from_gates`], `exp(cumlog[t] - cumlog[j])` on and below the diagonal and `0` above.
 /// A caller whose log gates are known directly (Mamba2's `Delta * A`) forms the prefix sum once
 /// and shares it with its other consumers, with no `exp`/`log` round trip.
+#[cfg(any(test, feature = "test-support"))]
 pub fn decay_mask_from_cumlog(
     b: &Builder,
     cumlog: Traced,

@@ -26,7 +26,7 @@ use crate::io::{ModelSchema, ProgramId};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::GGUF_BASE;
 use crate::names::{HF_BASE, family_weights, hf_base_shapes};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 /// qwen2's [`FamilyKey`].
@@ -45,16 +45,6 @@ pub(crate) const ENTRY: FamilyEntry = FamilyEntry {
 
 /// The Qwen2.5-VL text tower: the qwen2 body with sectioned RoPE over `Slot::MropePosition`.
 pub const VL_FAMILY: FamilyKey = FamilyKey::new("qwen2_5_vl");
-
-/// The text tower's entry: registered beside the vision tower that feeds it
-/// ([`qwen_vl_vision`](crate::qwen_vl_vision)).
-pub(crate) const VL_ENTRY: FamilyEntry = FamilyEntry {
-    family: VL_FAMILY,
-    keys: &[(ConfigSource::HfModelType, "qwen2_5_vl")],
-    build: build_vl,
-    fixture: vl_fixture,
-    variants: &[],
-};
 
 /// qwen2's config facts: HF's `Qwen2Config` defaults, and llama.cpp's GGUF defaults (a `1e6` base
 /// when the GGUF omits it). The class declares no `eos_token_id`: a checkpoint names it.
@@ -124,7 +114,10 @@ impl Qwen2Params {
     /// check: the qwen2 body holds no q/k norm tensors.
     pub fn from_vl_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let fields = Fields::new(raw, VL_FAMILY);
-        let RawConfig::HfJson { config, generation } = raw else {
+        let RawConfig::HfJson {
+            config, generation, ..
+        } = raw
+        else {
             return Err(fields.error("model_type", ConfigReason::Unsupported));
         };
         if config.get("model_type").and_then(|v| v.as_str()) != Some("qwen2_5_vl") {
@@ -135,6 +128,7 @@ impl Qwen2Params {
         let raw = &RawConfig::HfJson {
             config: &plain,
             generation: *generation,
+            preprocessor: None,
         };
         if !fields.flag(Field::hf("attention_bias"), true)? {
             return Err(fields.error("attention_bias", ConfigReason::Unsupported));
@@ -236,11 +230,13 @@ pub struct Qwen2 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     build_from(FAMILY, Qwen2Params::from_raw(raw)?, raw, store)
 }
 
-fn build_vl(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+/// The Qwen2.5-VL text tower alone: the model container of a `qwen2_5_vl` checkpoint adds its vision tower
+/// and front end around it (`multimodal::qwen_vl`).
+pub(crate) fn build_vl(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     build_from(VL_FAMILY, Qwen2Params::from_vl_raw(raw)?, raw, store)
 }
 
@@ -249,7 +245,7 @@ fn build_from(
     p: Qwen2Params,
     raw: &RawConfig<'_>,
     store: &WeightStore,
-) -> Result<Box<dyn Model>, ModelError> {
+) -> Result<ModelParts, ModelError> {
     let rows = match raw.source() {
         ConfigSource::HfModelType => HF_BASE,
         ConfigSource::GgufArchitecture => GGUF_BASE,
@@ -279,7 +275,7 @@ fn build_from(
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Qwen2 {
+    Ok(ModelParts::new(Box::new(Qwen2 {
         family,
         params: p,
         weights,
@@ -287,7 +283,7 @@ fn build_from(
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Qwen2 {
@@ -360,14 +356,14 @@ pub(crate) fn fixture_config() -> serde_json::Value {
 
 /// The Qwen2.5-VL text tower's fixture config: the qwen2 fixture with the released config's keys
 /// (`model_type`, `rope_scaling` naming `mrope` and its sections over the 8 rotary pairs).
-fn vl_fixture_config() -> serde_json::Value {
+pub(crate) fn vl_fixture_config() -> serde_json::Value {
     let mut config = fixture_config();
     config["model_type"] = "qwen2_5_vl".into();
     config["rope_scaling"] = serde_json::json!({"type": "mrope", "mrope_section": [2, 3, 3]});
     config
 }
 
-fn vl_fixture() -> Fixture {
+pub(crate) fn vl_fixture() -> Fixture {
     let config = vl_fixture_config();
     let shapes = hf_base_shapes(&config, true);
     Fixture::bf16(config, shapes)
@@ -690,6 +686,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -785,6 +782,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         };
         build(&raw, &fx.store).unwrap();
 
@@ -935,9 +933,9 @@ mod tests {
         let model = registry
             .build(&raw, &store)
             .unwrap_or_else(|e| panic!("{e}"));
-        let projections = projection_consts(&*model);
+        let projections = projection_consts(&*model.model);
         assert_eq!(projections.len(), 14);
-        for (id, _, handle) in model.weights().iter() {
+        for (id, _, handle) in model.model.weights().iter() {
             if projections.contains(&id.const_name()) {
                 assert!(
                     matches!(handle.format, poot_quant::weights::HandleFormat::Packed(_)),
@@ -946,12 +944,12 @@ mod tests {
                 );
             }
         }
-        assert_tied(&*model);
-        assert_eq!(model.config().eos, BTreeSet::from([47]));
+        assert_tied(&*model.model);
+        assert_eq!(model.model.config().eos, BTreeSet::from([47]));
 
         let reference = tied_reference(&reference_store);
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (got, state) = run_step(&*model.model, &store, CAP, &prompt, 0, &[]);
         let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
@@ -977,6 +975,7 @@ mod tests {
             &RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             },
             store,
         )

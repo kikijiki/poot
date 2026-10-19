@@ -5,12 +5,13 @@
 
 use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, Engine, Executor};
+use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_wgpu_device::device::WgpuDevice;
 
 #[test]
 fn parity_table_matches_the_oracle_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new()) else {
         return;
     };
     let t = device.target();
@@ -36,8 +37,7 @@ fn parity_table_matches_the_oracle_on_wgpu() {
 /// `AttentionParams::with_softcap`; the softcapped and uncapped traces coincide and this row goes red.
 #[test]
 fn softcapped_qwen2_matches_the_oracle_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new()) else {
         return;
     };
     let t = device.target();

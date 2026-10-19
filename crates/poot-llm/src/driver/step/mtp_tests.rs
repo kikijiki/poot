@@ -21,7 +21,7 @@ use poot_models::model::{
     FamilyKey, HiddenCarry, LogitRows, Model, ModelConfig, ModelError, ModelOutput, StepShape,
     StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
@@ -170,7 +170,7 @@ impl Model for Toy {
     }
 }
 
-fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
         panic!("the fixture is an HF checkpoint")
     };
@@ -196,7 +196,7 @@ fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, Mod
         }
         schema = schema.draft(draft);
     }
-    Ok(Box::new(Toy {
+    Ok(ModelParts::new(Box::new(Toy {
         schema: schema.build_for(TOY)?,
         config: ModelConfig {
             family: TOY,
@@ -210,7 +210,7 @@ fn build_toy(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, Mod
         },
         weights: WeightMap::default(),
         kind,
-    }))
+    })))
 }
 
 fn toy_handle(kind: Kind) -> Arc<ModelHandle> {
@@ -223,6 +223,7 @@ fn toy_handle(kind: Kind) -> Arc<ModelHandle> {
             fixture: || Fixture {
                 config: serde_json::json!({}),
                 generation: None,
+                preprocessor: None,
                 store: WeightStore::default(),
             },
             variants: &[],
@@ -235,6 +236,7 @@ fn toy_handle(kind: Kind) -> Arc<ModelHandle> {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, WeightStore::default(), &registry, |_| Ok(tiny_text()))
@@ -295,8 +297,8 @@ impl Device for FakeDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())
@@ -784,6 +786,7 @@ fn glm_handle(head: FixtureHead) -> Arc<ModelHandle> {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let mut store = WeightStore::builder();
     for (key, entry) in fixture.store.iter() {

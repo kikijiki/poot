@@ -95,8 +95,8 @@ impl Device for Recorder {
     fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), Never> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, Never> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), Never> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), Never> {
         Ok(())

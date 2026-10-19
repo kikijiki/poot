@@ -29,7 +29,7 @@ fn a_detailed_timing_pipeline_step_reports_every_stage_wgpu() {
         return;
     };
     if !device.has_device_timestamps() {
-        eprintln!("skip: the adapter has no TIMESTAMP_QUERY");
+        poot_runtime_common::device_skip::skip_unsupported(DeviceBackend::Wgpu, "TIMESTAMP_QUERY");
         return;
     }
     let target = device.target();

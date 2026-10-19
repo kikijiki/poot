@@ -35,7 +35,7 @@ use poot_models::model::{
     ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
     StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
     AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole,
@@ -160,7 +160,7 @@ impl Model for Mlp {
     }
 }
 
-fn build_mlp(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build_mlp(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
         unreachable!("the fixture family names only HF configs")
     };
@@ -192,7 +192,7 @@ fn build_mlp(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>,
                 .carrying(StateSpec::hand_off()),
         )
         .build_for(MLP)?;
-    Ok(Box::new(Mlp {
+    Ok(ModelParts::new(Box::new(Mlp {
         schema,
         config: ModelConfig {
             family: MLP,
@@ -205,7 +205,7 @@ fn build_mlp(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>,
             chat: ChatFormat::ChatML,
         },
         weights: map.build(),
-    }))
+    })))
 }
 
 /// Values on a quarter grid, so every product and sum of the fixture is exact in f32. `mul` and `salt`
@@ -256,6 +256,7 @@ fn handle() -> Arc<ModelHandle> {
             fixture: || Fixture {
                 config: serde_json::json!({"model_type": "mlp2", "max_positions": 32}),
                 generation: None,
+                preprocessor: None,
                 store: WeightStore::default(),
             },
             variants: &[],
@@ -265,6 +266,7 @@ fn handle() -> Arc<ModelHandle> {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, store(), &registry, |_| Ok(tiny_text()))
@@ -357,7 +359,7 @@ impl Model for Attn {
     }
 }
 
-fn build_attn(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build_attn(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
         unreachable!("the fixture family names only HF configs")
     };
@@ -384,7 +386,7 @@ fn build_attn(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>
     let schema = ModelSchema::builder()
         .step(decoder_program(VOCAB))
         .build_for(ATTN)?;
-    Ok(Box::new(Attn {
+    Ok(ModelParts::new(Box::new(Attn {
         schema,
         config: ModelConfig {
             family: ATTN,
@@ -397,7 +399,7 @@ fn build_attn(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>
             chat: ChatFormat::ChatML,
         },
         weights: map.build(),
-    }))
+    })))
 }
 
 /// The patterns were picked so the greedy decode wanders over several tokens.
@@ -422,6 +424,7 @@ fn attn_handle() -> Arc<ModelHandle> {
             fixture: || Fixture {
                 config: serde_json::json!({"model_type": "attn1", "max_positions": 32}),
                 generation: None,
+                preprocessor: None,
                 store: WeightStore::default(),
             },
             variants: &[],
@@ -431,6 +434,7 @@ fn attn_handle() -> Arc<ModelHandle> {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, attn_store(), &registry, |_| Ok(tiny_text()))
@@ -705,10 +709,10 @@ impl Device for Interp {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<Rc<Vec<Recorded>>>, InterpFault> {
-        Ok(Some(Rc::new(
+    fn finish(&mut self) -> Result<Rc<Vec<Recorded>>, InterpFault> {
+        Ok(Rc::new(
             self.open.take().expect("finish closes a recording"),
-        )))
+        ))
     }
 
     fn replay(&mut self, recording: &Rc<Vec<Recorded>>) -> Result<(), InterpFault> {

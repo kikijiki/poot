@@ -149,6 +149,7 @@ fn handle_with(weights: Weights, eos: u32, chat_template: ChatTemplate) -> Arc<M
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, store, &registry, |_| {
@@ -368,6 +369,7 @@ fn gemma4_sampled_differs_from_greedy(choice: BackendChoice) {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let handle = Arc::new(
         ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| {
@@ -443,6 +445,7 @@ fn family_sampled_differs_from_greedy(family: &str, choice: BackendChoice) {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let handle = Arc::new(
         ModelHandle::from_checkpoint(&raw, zero_head(&fixture.store), &registry, |_| {
@@ -484,6 +487,7 @@ fn family_decode_reuses_one_program_across_positions(
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let handle = Arc::new(
         ModelHandle::from_checkpoint(&raw, scaled(&fixture.store, 4.0), &registry, |_| {
@@ -635,17 +639,15 @@ per_backend!(
 /// The Qwen2.5-VL text tower over the qwen2 fixture's own tensors.
 fn vl_handle() -> Arc<ModelHandle> {
     let registry = Registry::builtin().unwrap();
-    let entry = registry
-        .entries()
-        .iter()
-        .find(|entry| entry.family == poot_models::qwen2::model::VL_FAMILY)
-        .expect("the text tower is a shipped family");
-    let fixture = (entry.fixture)();
+    let fixture = poot_models::test_support::vlm::qwen_vl_fixture();
     let mut config = fixture.config.clone();
+    // Without a `vision_config` the checkpoint serves as its text model alone.
+    config.as_object_mut().unwrap().remove("vision_config");
     config["eos_token_id"] = serde_json::json!(NO_EOS);
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, fixture.store, &registry, |_| Ok(fixture_text()))
@@ -1153,6 +1155,7 @@ fn recorded_family_handle_with(recorded: &RecordedFamily, restore: &Restore) -> 
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| Ok(fixture_text()))
@@ -1584,7 +1587,7 @@ fn an_unreadable_or_malformed_config_is_attributed_to_its_path() {
         Err(DriverError::Load(LoadError::Io { path, .. })) => assert_eq!(path, config),
         other => panic!("expected the missing config named by path, got {other:?}"),
     }
-    std::fs::write(&config, r#"{"model_type": "qwen2_5_vl", "hidden_size": "#).unwrap();
+    std::fs::write(&config, r#"{"model_type": "tiny", "hidden_size": "#).unwrap();
     match load(&dir) {
         Err(DriverError::Load(LoadError::Json { path, .. })) => assert_eq!(path, config),
         other => panic!("expected the malformed config named by path, got {other:?}"),
@@ -1606,17 +1609,17 @@ fn a_config_repeating_a_rope_key_is_refused_by_model_handle_load() {
     for (key, text) in [
         (
             "rope_scaling",
-            r#"{"model_type": "qwen2_5_vl", "rope_scaling": {"type": "mrope", "mrope_section": [2, 3, 3]},
+            r#"{"model_type": "tiny", "rope_scaling": {"type": "mrope", "mrope_section": [2, 3, 3]},
                 "rope_scaling": {"type": "mrope", "mrope_section": [1, 3, 4]}}"#,
         ),
         (
             "rope_parameters",
-            r#"{"model_type": "qwen2_5_vl", "rope_parameters": {"rope_type": "mrope", "mrope_section": [2, 3, 3]},
+            r#"{"model_type": "tiny", "rope_parameters": {"rope_type": "mrope", "mrope_section": [2, 3, 3]},
                 "rope_parameters": {"rope_type": "mrope", "mrope_section": [1, 3, 4]}}"#,
         ),
         (
             "mrope_section",
-            r#"{"model_type": "qwen2_5_vl",
+            r#"{"model_type": "tiny",
                 "rope_scaling": {"type": "mrope", "mrope_section": [2, 3, 3], "mrope_section": [1, 3, 4]}}"#,
         ),
     ] {
@@ -2625,7 +2628,7 @@ mod checkpoint {
         );
     }
 
-    /// A secret word stated once at the start of ~5900 tokens of filler, asked for at the end. The
+    /// A secret word stated once at the start of ~5800 tokens of filler (480 sentences of about 12 tokens each), asked for at the end. The
     /// rescaled low-frequency band (`rope_freqs.weight`) is what carries that long-range lookup:
     /// plain RoPE answers a distractor word instead (measured, Card 1019). The filler carries digits and
     /// the prompt gets its BOS from `encode`, both as llama.cpp tokenizes them.
@@ -2637,7 +2640,7 @@ mod checkpoint {
         let Some(mut driver) = driver(choice, &handle, 64, 8192) else {
             return;
         };
-        let filler: String = (0..730)
+        let filler: String = (0..480)
             .map(|i| {
                 format!(
                     "The {} crate no. {i} holds {} bolts. ",
@@ -3165,6 +3168,8 @@ mod checkpoint {
             "loads the Llama-3.2-1B Q4_K_M GGUF onto the GPU; needs >= 40Gi available";
         smollm2_gguf_coherent: "smollm2-135m-gguf/SmolLM2-135M-Instruct-Q8_0.gguf", names_paris,
             "loads the SmolLM2-135M Q8_0 GGUF (llama arch) onto the GPU; needs >= 40Gi available";
+        gemma2_coherent: "gemma-2-2b-it", names_paris,
+            "loads gemma-2-2b-it (softcapped attention, GeGLU) onto the GPU; needs >= 40Gi available";
         gemma3_coherent: "gemma-3-1b-it", names_paris,
             "loads gemma-3-1b-it onto the GPU; needs >= 40Gi available";
         gemma3_gguf_coherent: "gemma-3-1b-gguf/gemma-3-1b-it-Q4_K_M.gguf", continues_in_english,
@@ -3319,6 +3324,7 @@ fn family_handle(family: &str, eos: u32) -> Arc<ModelHandle> {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, fixture.store.clone(), &registry, |_| {
@@ -3344,6 +3350,7 @@ fn recurrent_family_handle(family: &str) -> Arc<ModelHandle> {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, scaled(&fixture.store, 4.0), &registry, |_| {
@@ -3984,6 +3991,7 @@ fn poisoned_router_handle(family: &str, key_to_poison: &str) -> Arc<ModelHandle>
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(
         ModelHandle::from_checkpoint(&raw, store.build(), &registry, |_| Ok(fixture_text()))
@@ -4824,7 +4832,7 @@ fn as_i32(ids: &[u32]) -> Vec<i32> {
 /// The request inputs of one 3x8x8 idefics3 frame: its normalized pixels, channel first.
 fn frame_inputs(pixels: &[f32]) -> RequestInputs {
     RequestInputs::none().with(
-        poot_models::idefics3::PIXELS,
+        poot_models::io::InputId::new("pixels"),
         InputValue::Row(HostTensor::f32(vec![3, 8, 8], pixels.to_vec())),
     )
 }
@@ -5067,8 +5075,9 @@ per_backend!(
 /// Both frames in one two-row step equal the two single-frame steps. Mutation: bind `pixels` as a
 /// const again; the second frame reads the first's and the row goes red.
 fn two_frames_of_one_size_embed_differently(choice: BackendChoice) {
-    let (handle, _) = encoder_family_handle("idefics3_vision", None);
-    let Some(mut driver) = bare_driver(choice, &handle, 16, 16) else {
+    let (handle, _) = smolvlm_fixture_handle();
+    let tower = Arc::clone(&handle.towers()[0].1);
+    let Some(mut driver) = bare_driver(choice, &tower, 16, 16) else {
         return;
     };
     let frame = |seed: u64| -> Vec<f32> {
@@ -5092,7 +5101,7 @@ fn two_frames_of_one_size_embed_differently(choice: BackendChoice) {
     );
     let model = |pixels: &[f32]| {
         oracle(
-            &handle,
+            &tower,
             ProgramId::ENCODE,
             encode_shape(1, 16),
             &[(
@@ -5177,88 +5186,48 @@ fn smolvlm_tokenizer() -> Tokenizer {
     tokenizer
 }
 
-/// The SmolVLM fixture: the registry's `idefics3_vision` weights (8-pixel frames, 16 patches, 4 visual
-/// tokens of the 24-wide text tower) beside a 24-wide llama text tower, in one HF directory with the
-/// checkpoint's `config.json`, `preprocessor_config.json` and tokenizer. Returns the directory and the
-/// text tower's own fixture (for the oracle's expectation).
-fn smolvlm_fixture_dir() -> (poot_test_util::UniqueTempPath, Fixture) {
+/// The registry's SmolVLM fixture: a SmolVLM of 8-pixel frames (16 patches, 4 visual tokens of the
+/// 24-wide llama text tower), as the registry builds it in memory.
+fn smolvlm_fixture_handle() -> (Arc<ModelHandle>, Fixture) {
     let registry = Registry::builtin().unwrap();
-    let vision = (registry
-        .entries()
-        .iter()
-        .find(|entry| entry.family.as_str() == "idefics3_vision")
-        .unwrap()
-        .fixture)();
-    let text_config = serde_json::json!({
-        "model_type": "llama",
-        "vocab_size": smolvlm_ids::VOCAB,
-        "hidden_size": 24,
-        "intermediate_size": 48,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 2,
-        "rms_norm_eps": 1e-6,
-        "max_position_embeddings": 128,
-        "rope_theta": 10000.0,
-        "tie_word_embeddings": false,
-        "eos_token_id": NO_EOS,
-    });
-    let (h, inter, vocab) = (24, 48, smolvlm_ids::VOCAB);
-    let mut shapes = vec![
-        ("model.embed_tokens.weight".to_string(), vec![vocab, h]),
-        ("model.norm.weight".to_string(), vec![h]),
-        ("lm_head.weight".to_string(), vec![vocab, h]),
-    ];
-    for l in 0..2 {
-        let k = |s: &str| format!("model.layers.{l}.{s}");
-        shapes.extend([
-            (k("input_layernorm.weight"), vec![h]),
-            (k("post_attention_layernorm.weight"), vec![h]),
-            (k("self_attn.q_proj.weight"), vec![h, h]),
-            (k("self_attn.k_proj.weight"), vec![h, h]),
-            (k("self_attn.v_proj.weight"), vec![h, h]),
-            (k("self_attn.o_proj.weight"), vec![h, h]),
-            (k("mlp.gate_proj.weight"), vec![inter, h]),
-            (k("mlp.up_proj.weight"), vec![inter, h]),
-            (k("mlp.down_proj.weight"), vec![h, inter]),
-        ]);
+    let fixture = poot_models::test_support::vlm::smolvlm_fixture();
+    let handle =
+        ModelHandle::from_checkpoint(&fixture.raw(), fixture.store.clone(), &registry, |_| {
+            Ok(fixture_text())
+        })
+        .unwrap();
+    (Arc::new(handle), fixture)
+}
+
+/// The SmolVLM fixture as an HF directory with the checkpoint's `config.json`,
+/// `preprocessor_config.json`, tokenizer and chat template, loaded the way a server loads it. The text
+/// tower's weights are scaled up so the image rows reach the greedy token.
+fn smolvlm_checkpoint() -> (poot_test_util::UniqueTempPath, Arc<ModelHandle>) {
+    let (_, fixture) = smolvlm_fixture_handle();
+    let text_keys = |name: &str| name.starts_with("model.text_model.") || name == "lm_head.weight";
+    let mut text = WeightStore::builder();
+    for (key, entry) in fixture.store.iter().filter(|(k, _)| text_keys(k.as_str())) {
+        text.insert(key.clone(), entry.clone()).unwrap();
     }
-    let text = Fixture::bf16(text_config.clone(), shapes);
-    let text = Fixture {
-        store: scaled(&text.store, 8.0),
-        ..text
-    };
-    let tensor = |name: String, weight: &WeightEntry| {
-        let WeightEntry::Dense(dense) = weight else {
-            panic!("the fixture is dense")
-        };
-        ArchiveTensor {
-            name,
-            dtype: "BF16",
-            shape: dense.shape().to_vec(),
-            bytes: dense.bytes().as_slice().to_vec(),
-        }
-    };
-    let mut tensors: Vec<ArchiveTensor> = vision
+    let text = scaled(&text.build(), 8.0);
+    let tensors: Vec<ArchiveTensor> = fixture
         .store
         .iter()
-        .map(|(key, weight)| tensor(key.as_str().to_string(), weight))
+        .map(|(key, entry)| {
+            let entry = text.get(key.as_str()).unwrap_or(entry);
+            let WeightEntry::Dense(dense) = entry else {
+                panic!("the fixture is dense")
+            };
+            ArchiveTensor {
+                name: key.as_str().to_string(),
+                dtype: "BF16",
+                shape: dense.shape().to_vec(),
+                bytes: dense.bytes().as_slice().to_vec(),
+            }
+        })
         .collect();
-    tensors.extend(text.store.iter().map(|(key, weight)| {
-        let name = key.as_str();
-        let name = name.strip_prefix("model.").map_or_else(
-            || name.to_string(),
-            |rest| format!("model.text_model.{rest}"),
-        );
-        tensor(name, weight)
-    }));
-    let config = serde_json::json!({
-        "model_type": "idefics3",
-        "vision_config": vision.config,
-        "text_config": text_config,
-        "scale_factor": 2,
-        "image_token_id": smolvlm_ids::IMAGE,
-    });
+    let mut config = fixture.config.clone();
+    config["text_config"]["eos_token_id"] = NO_EOS.into();
     let dir = write_hf_checkpoint("smolvlm", &config, &tensors);
     smolvlm_tokenizer()
         .save(dir.join("tokenizer.json"), false)
@@ -5270,35 +5239,117 @@ fn smolvlm_fixture_dir() -> (poot_test_util::UniqueTempPath, Fixture) {
     .unwrap();
     std::fs::write(
         dir.join("preprocessor_config.json"),
-        serde_json::json!({
-            "size": { "longest_edge": 16 },
-            "rescale_factor": 1.0 / 255.0,
-            "image_mean": [0.5, 0.5, 0.5],
-            "image_std": [0.5, 0.5, 0.5],
-        })
-        .to_string(),
+        fixture.preprocessor.unwrap().to_string(),
     )
     .unwrap();
-    (dir, text)
+    let handle = ModelHandle::load(
+        &dir,
+        &Registry::builtin().unwrap(),
+        &crate::driver::LoadOptions::default(),
+    )
+    .unwrap();
+    (dir, Arc::new(handle))
 }
 
-/// The prompt a SmolVLM front end builds for a 16x16 `rgb` image (a 2x2 tile grid and a global
-/// frame, four visual tokens each) and the vision oracle's rows for its frames, by hand from token ids.
+/// An HF directory carries its front end's `preprocessor_config.json` to the registry entry: the
+/// loaded handle holds the vision tower and the front end. Mutation: build `RawConfig::HfJson` in
+/// `ModelHandle::load_hf` with `preprocessor: None`; the load is refused (`preprocessor_config` missing).
+#[test]
+fn a_vlm_directory_loads_with_its_tower_and_front_end() {
+    let (_dir, handle) = smolvlm_checkpoint();
+    assert_eq!(handle.towers().len(), 1);
+    assert!(handle.front_end().is_some());
+}
+
+/// The towers of `handle` on `executors` (one per tower), keeping the inputs of every row they encode:
+/// the frames the front end made, which the by-hand requests below feed to the CPU oracle.
+struct RecordingTowers {
+    drivers: crate::TowerDrivers,
+    rows: Vec<RequestInputs>,
+}
+
+impl RecordingTowers {
+    fn open(
+        handle: &ModelHandle,
+        executor: Box<dyn poot_executor::Executor>,
+        positions: usize,
+    ) -> Self {
+        let mut executor = Some(executor);
+        let drivers = crate::TowerDrivers::open(handle, |_, _| {
+            Ok::<_, DriverError>((
+                executor.take().expect("one tower"),
+                options(positions, positions),
+            ))
+        })
+        .unwrap();
+        Self {
+            drivers,
+            rows: Vec::new(),
+        }
+    }
+}
+
+impl poot_models::multimodal::front_end::Towers for RecordingTowers {
+    fn encode(
+        &mut self,
+        tower: poot_models::multimodal::front_end::TowerId,
+        inputs: &RequestInputs,
+    ) -> Result<Vec<f32>, poot_models::multimodal::front_end::TowerError> {
+        self.rows.push(inputs.clone());
+        self.drivers.encode(tower, inputs)
+    }
+}
+
+/// The 16x16 image of `value` everywhere.
+fn solid_image(value: u8, side: usize) -> poot_models::multimodal::front_end::Image {
+    poot_models::multimodal::front_end::Image::from_rgb8(side, side, vec![value; side * side * 3])
+        .unwrap()
+}
+
+/// A 16x16 image black in the top-left quadrant and white elsewhere.
+fn quadrant_image(black: usize) -> poot_models::multimodal::front_end::Image {
+    let rgb = (0..16 * 16)
+        .flat_map(|p| {
+            let (y, x) = (p / 16, p % 16);
+            let v = if (y / 8) * 2 + x / 8 == black { 0 } else { 255 };
+            [v, v, v]
+        })
+        .collect();
+    poot_models::multimodal::front_end::Image::from_rgb8(16, 16, rgb).unwrap()
+}
+
+/// What the front end lowers `image` and `question` to, with the frames it encoded.
+fn lower(
+    handle: &ModelHandle,
+    towers: &mut RecordingTowers,
+    image: &poot_models::multimodal::front_end::Image,
+    question: &str,
+) -> poot_models::multimodal::front_end::Prepared {
+    use poot_models::multimodal::front_end::{ChatTurn, Media};
+    towers.rows.clear();
+    handle
+        .front_end()
+        .expect("the SmolVLM fixture has a front end")
+        .prepare(
+            &[ChatTurn::user(1, question)],
+            &mut [Media::Image(image)],
+            towers,
+            handle.text(),
+        )
+        .expect("the front end lowers the request")
+}
+
+/// The prompt a SmolVLM front end builds for a 16x16 image (a 2x2 tile grid and a global frame, four
+/// visual tokens each) asking `question`, and the vision oracle's rows for the `frames` it encoded,
+/// by hand from token ids.
 fn smolvlm_request(
-    vision_handle: &Arc<ModelHandle>,
-    preprocess: &poot_models::vision::PreprocessConfig,
-    rgb: &[f32],
+    tower: &ModelHandle,
+    frames: &[RequestInputs],
+    question: &[u32],
 ) -> (Vec<u32>, RequestInputs) {
-    use poot_models::vision::idefics3_preprocess;
     use smolvlm_ids as ids;
 
-    let split = idefics3_preprocess(rgb, 16, 16, preprocess).unwrap();
-    assert_eq!(
-        (split.rows, split.cols),
-        (2, 2),
-        "the fixture image tiles 2x2"
-    );
-    assert_eq!(split.frames.len(), 5, "four tiles and the global frame");
+    assert_eq!(frames.len(), 5, "four tiles and the global frame");
     let mut prompt = vec![ids::IM_START, ids::USER];
     let mut positions = Vec::new();
     let mut placeholders = |prompt: &mut Vec<u32>| {
@@ -5316,19 +5367,22 @@ fn smolvlm_request(
     prompt.extend([ids::FAKE, ids::GLOBAL]);
     placeholders(&mut prompt);
     prompt.push(ids::FAKE);
-    prompt.extend(ids::QUESTION);
+    prompt.extend(question);
     prompt.extend([ids::END_OF_UTTERANCE, ids::ASSISTANT]);
-    let rows: Vec<f32> = split
-        .frames
+    let rows: Vec<f32> = frames
         .iter()
-        .flat_map(|frame| {
+        .flat_map(|inputs| {
+            let Some(InputValue::Row(pixels)) = inputs.get(poot_models::io::InputId::new("pixels"))
+            else {
+                panic!("a frame carries its pixels")
+            };
             oracle(
-                vision_handle,
+                tower,
                 ProgramId::ENCODE,
                 encode_shape(1, 16),
                 &[(
                     named("pixels"),
-                    HostTensor::f32(vec![1, 3, 8, 8], frame.clone()),
+                    HostTensor::f32(vec![1, 3, 8, 8], pixels.as_f32().unwrap().to_vec()),
                 )],
             )
         })
@@ -5336,100 +5390,50 @@ fn smolvlm_request(
     (prompt, embed_inputs(24, positions, rows))
 }
 
-/// POOT-1046 (the SmolVLM front end on the required lanes): `Idefics3::caption` over a fixture
-/// checkpoint on disk equals the same text tower run on a prompt built by hand from token ids with the
-/// vision oracle's rows for the frames (tier 2): the front end's prompt, placeholder positions, per-frame
-/// encode and scatter all have to agree. A different image captions differently (the rows reach the
-/// logits). Mutation: bind zeroed embedding rows in `driver/bind.rs`; both captions collapse to the
-/// zero-row continuation and the row goes red.
+/// POOT-1046 (the SmolVLM front end on the required lanes): the front end of a fixture checkpoint
+/// loaded from disk lowers an image and a question to a request whose generation equals the same text
+/// tower's on a prompt built by hand from token ids with the vision oracle's rows for the frames (tier
+/// 2): the front end's prompt, placeholder positions, per-frame encode and scatter all have to agree.
+/// A different image captions differently (the rows reach the logits). Mutation: bind zeroed
+/// embedding rows in `driver/bind.rs`; both captions collapse to the zero-row continuation and the row
+/// goes red.
 fn smolvlm_caption_matches_the_oracle_rows(choice: BackendChoice) {
-    use crate::multimodal::ChatTurn;
-    use crate::multimodal::front_end::{CaptionRequest, Idefics3, Image};
-    use poot_models::vision::PreprocessConfig;
-
-    let (dir, text) = smolvlm_fixture_dir();
-    let (Some(vision_executor), Some(text_executor)) = (open(choice), open(choice)) else {
+    let (_dir, handle) = smolvlm_checkpoint();
+    let tower = Arc::clone(&handle.towers()[0].1);
+    let (Some(vision_executor), Some(mut caption_driver), Some(mut text_driver)) = (
+        open(choice),
+        driver(choice, &handle, 64, 128),
+        driver(choice, &handle, 64, 128),
+    ) else {
         return;
     };
-    let registry = Registry::builtin().unwrap();
-    let mut vlm = Idefics3::load(
-        &dir,
-        &registry,
-        (vision_executor, options(16, 16)),
-        (text_executor, options(64, 128)),
-    )
-    .expect("load the fixture SmolVLM");
-    assert_eq!(vlm.images.visual_tokens(), 4);
-
-    let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
-    let text_handle = Arc::new(
-        ModelHandle::from_checkpoint(&text.raw(), text.store.clone(), &registry, |_| {
-            Ok(fixture_text())
-        })
-        .unwrap(),
-    );
-    let Some(mut text_driver) = driver(choice, &text_handle, 64, 128) else {
-        return;
-    };
-    let preprocess = PreprocessConfig {
-        image_size: 8,
-        longest_edge: 16,
-        rescale_factor: 1.0 / 255.0,
-        mean: [0.5; 3],
-        std: [0.5; 3],
-    };
+    let mut towers = RecordingTowers::open(&handle, vision_executor, 16);
     let max_new = 8;
+    let question = smolvlm_ids::QUESTION;
+    let mut compare = |image: &poot_models::multimodal::front_end::Image| -> Vec<u32> {
+        let prepared = lower(&handle, &mut towers, image, "b c d");
+        let got = generate_inputs(
+            &mut caption_driver,
+            prepared.prompt,
+            max_new,
+            prepared.inputs,
+        );
+        let (prompt, embeds) = smolvlm_request(&tower, &towers.rows, &question);
+        assert_eq!(
+            got,
+            generate_inputs(&mut text_driver, prompt, max_new, embeds),
+            "the caption equals the oracle-row run"
+        );
+        got
+    };
     // A 16x16 image splits into a 2x2 tile grid and a global frame. The two images are the extremes
     // of the pixel range, so their rows differ as much as the fixture's weights let them.
-    let rgb_of = |value: f32| -> Vec<f32> { vec![value; 16 * 16 * 3] };
-    let expected = |driver: &mut Driver<Serving>, rgb: &[f32]| -> Vec<u32> {
-        let (prompt, embeds) = smolvlm_request(&vision_handle, &preprocess, rgb);
-        generate_inputs(driver, prompt, max_new, embeds)
-    };
-    let mut caption = |rgb: &[f32]| -> Vec<u32> {
-        vlm.caption(
-            &CaptionRequest {
-                images: &[Image {
-                    rgb,
-                    height: 16,
-                    width: 16,
-                }],
-                turns: &[ChatTurn::user(1, "b c d")],
-                max_new,
-            },
-            &mut |_: u32, _: &str| GenerationControl::Continue(()),
-        )
-        .expect("caption")
-        .tokens
-    };
-    let (first, second) = (rgb_of(0.0), rgb_of(255.0));
-    let (got_first, got_second) = (caption(&first), caption(&second));
-    assert_eq!(got_first, expected(&mut text_driver, &first), "first image");
-    assert_eq!(
-        got_second,
-        expected(&mut text_driver, &second),
-        "second image on the same front end"
-    );
+    let (got_first, got_second) = (compare(&solid_image(0, 16)), compare(&solid_image(255, 16)));
     assert_ne!(got_first, got_second, "the image rows reach the logits");
     // Solid images give every tile the same rows; an image with one black quadrant gives that tile
     // its own, so the order the frames go into the prompt is part of the caption.
     for quadrant in 0..4 {
-        let image: Vec<f32> = (0..16 * 16)
-            .flat_map(|p| {
-                let (y, x) = (p / 16, p % 16);
-                let v = if (y / 8) * 2 + x / 8 == quadrant {
-                    0.0
-                } else {
-                    255.0
-                };
-                [v, v, v]
-            })
-            .collect();
-        assert_eq!(
-            caption(&image),
-            expected(&mut text_driver, &image),
-            "an image whose tile {quadrant} differs"
-        );
+        compare(&quadrant_image(quadrant));
     }
 }
 per_backend!(
@@ -5447,46 +5451,25 @@ per_backend!(
 /// `bind::token_values`, read the first lane's values for all lanes); the other lanes read the wrong
 /// image's rows and the row goes red.
 fn smolvlm_batched_paged_embeds_match_single_row_runs(choice: BackendChoice) {
-    use poot_models::vision::PreprocessConfig;
     use smolvlm_ids as ids;
 
-    let (_dir, text) = smolvlm_fixture_dir();
-    let registry = Registry::builtin().unwrap();
-    let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
-    let text_handle = Arc::new(
-        ModelHandle::from_checkpoint(&text.raw(), text.store.clone(), &registry, |_| {
-            Ok(fixture_text())
-        })
-        .unwrap(),
-    );
-    let (Some(mut reference), Some(driver)) = (
-        driver(choice, &text_handle, 16, 128),
-        bare_driver(choice, &text_handle, 16, 128),
+    let (_dir, handle) = smolvlm_checkpoint();
+    let tower = Arc::clone(&handle.towers()[0].1);
+    let (Some(vision_executor), Some(mut reference), Some(driver)) = (
+        open(choice),
+        driver(choice, &handle, 16, 128),
+        bare_driver(choice, &handle, 16, 128),
     ) else {
         return;
     };
-    let preprocess = PreprocessConfig {
-        image_size: 8,
-        longest_edge: 16,
-        rescale_factor: 1.0 / 255.0,
-        mean: [0.5; 3],
-        std: [0.5; 3],
-    };
+    let mut towers = RecordingTowers::open(&handle, vision_executor, 16);
     let max_new = 6;
-    let rgb_of = |value: f32| -> Vec<f32> { vec![value; 16 * 16 * 3] };
-    let quadrant: Vec<f32> = (0..16 * 16)
-        .flat_map(|p| {
-            let (y, x) = (p / 16, p % 16);
-            let v = if y < 8 && x < 8 { 0.0 } else { 255.0 };
-            [v, v, v]
-        })
-        .collect();
-    let images = [rgb_of(0.0), rgb_of(255.0), quadrant];
+    let images = [solid_image(0, 16), solid_image(255, 16), quadrant_image(0)];
     let mut requests: Vec<(Vec<u32>, RequestInputs)> = images
         .iter()
-        .map(|rgb| {
-            let (prompt, embeds) = smolvlm_request(&vision_handle, &preprocess, rgb);
-            (prompt, embeds)
+        .map(|image| {
+            lower(&handle, &mut towers, image, "b c d");
+            smolvlm_request(&tower, &towers.rows, &ids::QUESTION)
         })
         .collect();
     // A short prompt: four placeholders at positions 2..6 take the first image's first four rows.
@@ -5555,131 +5538,70 @@ per_backend!(
     smolvlm_batched_paged_embeds_match_single_row_runs_ptx
 );
 
-/// POOT-1075: requests lowered by the SmolVLM front end (`Idefics3FrontEnd::prepare`: preprocess,
-/// per-frame vision encode, prompt, placeholder positions) and served together on a paged text
-/// driver equal each request's own `Idefics3::caption` token for token. The requests differ in image
-/// (solid black, solid white, one black quadrant, a single-frame 8x8 image) and in question length,
-/// so their prompts have four lengths and their rows differ. Mutation: in `Idefics3FrontEnd::encode_frames`
-/// return the first frame's rows for every frame (`encoded[0]` cloned per frame); every request
-/// carries the same rows, the images stop reaching the logits and the row goes red.
+/// POOT-1075: requests lowered by the SmolVLM front end (preprocess, per-frame vision encode, prompt,
+/// placeholder positions) and served together on a paged text driver equal each request's own
+/// single-row run token for token. The requests differ in image (solid black, solid white, one black
+/// quadrant, a single-frame 8x8 image) and in question length, so their prompts have four lengths and
+/// their rows differ. Mutation: in `Idefics3FrontEnd::encode_frames` return the first frame's rows for
+/// every frame (`encoded[0]` cloned per frame); every request carries the same rows, the images stop
+/// reaching the logits and the row goes red.
 fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: BackendChoice) {
-    use crate::multimodal::ChatTurn;
-    use crate::multimodal::front_end::{CaptionRequest, Idefics3, Image};
-
-    let (dir, text) = smolvlm_fixture_dir();
+    let (_dir, handle) = smolvlm_checkpoint();
+    let tower = Arc::clone(&handle.towers()[0].1);
     // Every executor opens before any runs (the ROCm runtime does not survive a second open after a drop).
-    let (
-        Some(vision_executor),
-        Some(text_executor),
-        Some(batched_executor),
-        Some(reference_executor),
-    ) = (open(choice), open(choice), open(choice), open(choice))
+    let (Some(vision_executor), Some(batched), Some(single), Some(reference)) =
+        (open(choice), open(choice), open(choice), open(choice))
     else {
         return;
     };
-    let registry = Registry::builtin().unwrap();
-    let mut vlm = Idefics3::load(
-        &dir,
-        &registry,
-        (vision_executor, options(16, 16)),
-        (text_executor, options(16, 128)),
-    )
-    .expect("load the fixture SmolVLM");
-    let text_handle = Arc::new(
-        ModelHandle::from_checkpoint(&text.raw(), text.store.clone(), &registry, |_| {
-            Ok(fixture_text())
-        })
-        .unwrap(),
-    );
-    let driver = Driver::new(Arc::clone(&text_handle), batched_executor, options(16, 128)).unwrap();
-    let mut reference = Driver::new(text_handle, reference_executor, options(16, 128))
+    let mut towers = RecordingTowers::open(&handle, vision_executor, 16);
+    let driver = Driver::new(Arc::clone(&handle), batched, options(16, 128)).unwrap();
+    let mut single = Driver::new(Arc::clone(&handle), single, options(16, 128))
         .unwrap()
         .serve(Layout::Contiguous);
-    let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
-    let preprocess = poot_models::vision::PreprocessConfig {
-        image_size: 8,
-        longest_edge: 16,
-        rescale_factor: 1.0 / 255.0,
-        mean: [0.5; 3],
-        std: [0.5; 3],
-    };
+    let mut reference = Driver::new(Arc::clone(&handle), reference, options(16, 128))
+        .unwrap()
+        .serve(Layout::Contiguous);
 
     let max_new = 6;
-    let solid = |value: f32, side: usize| -> Vec<f32> { vec![value; side * side * 3] };
-    let quadrant: Vec<f32> = (0..16 * 16)
-        .flat_map(|p| {
-            let (y, x) = (p / 16, p % 16);
-            let v = if y < 8 && x < 8 { 0.0 } else { 255.0 };
-            [v, v, v]
-        })
-        .collect();
-    let (black, white, small) = (solid(0.0, 16), solid(255.0, 16), solid(255.0, 8));
-    fn image(rgb: &[f32], side: usize) -> Image<'_> {
-        Image {
-            rgb,
-            height: side,
-            width: side,
-        }
-    }
-    let cases: [(Image<'_>, &str); 4] = [
-        (image(&black, 16), "b c d"),
-        (image(&white, 16), "b c d e f"),
-        (image(&quadrant, 16), "b"),
-        (image(&small, 8), "b c d e f g h"),
+    let (black, white, quadrant, small) = (
+        solid_image(0, 16),
+        solid_image(255, 16),
+        quadrant_image(0),
+        solid_image(255, 8),
+    );
+    let cases = [
+        (&black, "b c d"),
+        (&white, "b c d e f"),
+        (&quadrant, "b"),
+        (&small, "b c d e f g h"),
     ];
-    let turns: Vec<[ChatTurn<'_>; 1]> = cases
+    let prepared: Vec<_> = cases
         .iter()
-        .map(|(_, question)| [ChatTurn::user(1, question)])
+        .map(|(image, question)| lower(&handle, &mut towers, image, question))
         .collect();
-    let requests: Vec<CaptionRequest<'_>> = cases
+    let want: Vec<Vec<u32>> = prepared
         .iter()
-        .zip(&turns)
-        .map(|((image, _), turns)| CaptionRequest {
-            images: std::slice::from_ref(image),
-            turns,
-            max_new,
-        })
-        .collect();
-
-    let want: Vec<Vec<u32>> = requests
-        .iter()
-        .map(|request| {
-            vlm.caption(request, &mut |_: u32, _: &str| {
-                GenerationControl::Continue(())
-            })
-            .expect("caption")
-            .tokens
-        })
+        .map(|p| generate_inputs(&mut single, p.prompt.clone(), max_new, p.inputs.clone()))
         .collect();
     assert_ne!(want[0], want[1], "the image rows reach the logits");
     // The front end's lowering is also checked against the vision oracle's rows on a prompt built by
     // hand (the 16x16 images; a shared path would otherwise be equal to itself on both sides).
     for (i, (image, question)) in cases.iter().take(3).enumerate() {
-        let (mut prompt, embeds) = smolvlm_request(&vision_handle, &preprocess, image.rgb);
-        // The by-hand prompt ends `... question end_of_utterance assistant`; swap in this question.
-        let tail = prompt.len() - 2;
-        prompt.splice(
-            tail - smolvlm_ids::QUESTION.len()..tail,
-            question
-                .split(' ')
-                .map(|word| u32::from(word.as_bytes()[0] - b'a')),
-        );
+        lower(&handle, &mut towers, image, question);
+        let question_ids: Vec<u32> = question
+            .split(' ')
+            .map(|word| u32::from(word.as_bytes()[0] - b'a'))
+            .collect();
+        let (prompt, embeds) = smolvlm_request(&tower, &towers.rows, &question_ids);
         assert_eq!(
             generate_inputs(&mut reference, prompt, max_new, embeds),
             want[i],
             "request {i}: caption equals the oracle-row run"
         );
     }
-    let prompts: Vec<crate::multimodal::MultimodalPrompt> = requests
-        .iter()
-        .map(|request| {
-            vlm.images
-                .prepare_decoded(request.images, request.turns)
-                .expect("prepare")
-        })
-        .collect();
     let lengths: std::collections::BTreeSet<usize> =
-        prompts.iter().map(|p| p.prompt.len()).collect();
+        prepared.iter().map(|p| p.prompt.len()).collect();
     assert_eq!(lengths.len(), 4, "four prompt lengths share the batch");
 
     let pool = pool_shape(24, 4);
@@ -5697,7 +5619,7 @@ fn smolvlm_front_end_requests_served_batched_equal_single_row_captions(choice: B
             &[EMBEDS],
         )
         .unwrap();
-    let mut lanes: Vec<Lane> = prompts
+    let mut lanes: Vec<Lane> = prepared
         .iter()
         .map(|p| Lane::open_embeds(&mut driver, &p.prompt, p.inputs.clone(), max_new).0)
         .collect();
@@ -5723,34 +5645,21 @@ per_backend!(
 /// admit the embeds prompt through `admit_prefix_for` and register it on release; the second image
 /// reuses the first's two blocks (and its tokens), and the row goes red.
 fn paged_embeds_prompts_neither_reuse_nor_register_prefix_blocks(choice: BackendChoice) {
-    use poot_models::vision::PreprocessConfig;
-
-    let (_dir, text) = smolvlm_fixture_dir();
-    let registry = Registry::builtin().unwrap();
-    let (vision_handle, _) = encoder_family_handle("idefics3_vision", None);
-    let text_handle = Arc::new(
-        ModelHandle::from_checkpoint(&text.raw(), text.store.clone(), &registry, |_| {
-            Ok(fixture_text())
-        })
-        .unwrap(),
-    );
-    let (Some(mut reference), Some(driver)) = (
-        driver(choice, &text_handle, 16, 128),
-        bare_driver(choice, &text_handle, 16, 128),
+    let (_dir, handle) = smolvlm_checkpoint();
+    let tower = Arc::clone(&handle.towers()[0].1);
+    let (Some(vision_executor), Some(mut reference), Some(driver)) = (
+        open(choice),
+        driver(choice, &handle, 16, 128),
+        bare_driver(choice, &handle, 16, 128),
     ) else {
         return;
     };
-    let preprocess = PreprocessConfig {
-        image_size: 8,
-        longest_edge: 16,
-        rescale_factor: 1.0 / 255.0,
-        mean: [0.5; 3],
-        std: [0.5; 3],
-    };
+    let mut towers = RecordingTowers::open(&handle, vision_executor, 16);
     let max_new = 6;
-    let (prompt, first) = smolvlm_request(&vision_handle, &preprocess, &vec![0.0; 16 * 16 * 3]);
-    let (same_prompt, second) =
-        smolvlm_request(&vision_handle, &preprocess, &vec![255.0; 16 * 16 * 3]);
+    lower(&handle, &mut towers, &solid_image(0, 16), "b c d");
+    let (prompt, first) = smolvlm_request(&tower, &towers.rows, &smolvlm_ids::QUESTION);
+    lower(&handle, &mut towers, &solid_image(255, 16), "b c d");
+    let (same_prompt, second) = smolvlm_request(&tower, &towers.rows, &smolvlm_ids::QUESTION);
     assert_eq!(prompt, same_prompt, "equal tokens, different rows");
     let single = |driver: &mut Driver<Serving>, inputs: &RequestInputs| {
         generate_inputs(driver, prompt.clone(), max_new, inputs.clone())
@@ -5843,7 +5752,8 @@ fn encode_refuses_what_it_cannot_batch(choice: BackendChoice) {
     );
 
     // A step has one kind of row: a vision tower's token row beside a frame row (no tokens) is mixed.
-    let (vision, _) = encoder_family_handle("idefics3_vision", None);
+    let (smolvlm, _) = smolvlm_fixture_handle();
+    let vision = Arc::clone(&smolvlm.towers()[0].1);
     let Some(mut vision_driver) = bare_driver(choice, &vision, 16, 16) else {
         return;
     };
@@ -6374,6 +6284,7 @@ fn family_handle_over(family: &str, eos: u32, store: WeightStore) -> Arc<ModelHa
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     Arc::new(ModelHandle::from_checkpoint(&raw, store, &registry, |_| Ok(fixture_text())).unwrap())
 }
@@ -6720,63 +6631,376 @@ per_backend!(
     adapter_generation_replacement_is_isolated_and_freed_ptx
 );
 
+/// The Qwen2.5-VL fixture's 48-word vocabulary: the vision markers and the tokens around them.
+mod qwen_vl_ids {
+    pub(super) const VOCAB: usize = 48;
+    pub(super) const VISION_START: (&str, u32) = ("<|vision_start|>", 40);
+    pub(super) const IMAGE_PAD: (&str, u32) = ("<|image_pad|>", 41);
+    pub(super) const VIDEO_PAD: (&str, u32) = ("<|video_pad|>", 42);
+    pub(super) const VISION_END: (&str, u32) = ("<|vision_end|>", 43);
+    pub(super) const IM_END: (&str, u32) = ("<|im_end|>", 47);
+}
+
+/// A word-level tokenizer: word `t<i>` is token `i` but for `user`, `hello` and the vision markers.
+fn qwen_vl_tokenizer() -> Tokenizer {
+    use qwen_vl_ids as ids;
+    let mut vocab: HashMap<String, u32> = (0..ids::VOCAB as u32)
+        .map(|id| (format!("t{id}"), id))
+        .collect();
+    let markers = [
+        ids::VISION_START,
+        ids::IMAGE_PAD,
+        ids::VIDEO_PAD,
+        ids::VISION_END,
+        ids::IM_END,
+    ];
+    for (word, id) in [("user", 2), ("hello", 4)].into_iter().chain(markers) {
+        vocab.retain(|_, v| *v != id);
+        vocab.insert(word.to_string(), id);
+    }
+    let mut tokenizer = Tokenizer::new(
+        WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("t0".to_string())
+            .build()
+            .unwrap(),
+    );
+    tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+    let specials: Vec<tokenizers::AddedToken> = markers
+        .iter()
+        .map(|&(word, _)| tokenizers::AddedToken::from(word, true))
+        .collect();
+    tokenizer.add_special_tokens(&specials);
+    tokenizer
+}
+
+/// The registry's Qwen2.5-VL fixture (the text model and the vision tower over one set of weights, all
+/// multiplied by `factor`: the fixtures' random weights are small enough that a tiny tower's logits
+/// barely depend on its inputs) as an HF directory with the checkpoint's `config.json`, the processor
+/// config `preprocessor`, the 48-word tokenizer and a chat template; loaded the way a server loads it.
+fn qwen_vl_checkpoint(
+    factor: f32,
+    preprocessor: Option<serde_json::Value>,
+) -> (poot_test_util::UniqueTempPath, Arc<ModelHandle>) {
+    let fixture = poot_models::test_support::vlm::qwen_vl_fixture();
+    let keep = |name: &str| name.contains("norm") || name.contains("ln_q");
+    let scaled_store = {
+        let mut out = WeightStore::builder();
+        for (key, entry) in fixture.store.iter() {
+            let WeightEntry::Dense(dense) = entry else {
+                panic!("the fixture is dense")
+            };
+            let bytes: Vec<u8> = if keep(key.as_str()) {
+                dense.bytes().as_slice().to_vec()
+            } else {
+                dense
+                    .bytes()
+                    .as_slice()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|&pair| {
+                        let value = f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16);
+                        (((value * factor).to_bits() >> 16) as u16).to_le_bytes()
+                    })
+                    .collect()
+            };
+            let dense =
+                DenseWeight::try_new(dense.dtype(), dense.shape().to_vec(), bytes.into()).unwrap();
+            out.insert(key.clone(), WeightEntry::Dense(dense)).unwrap();
+        }
+        out.build()
+    };
+    let tensors: Vec<ArchiveTensor> = scaled_store
+        .iter()
+        .map(|(key, entry)| {
+            let WeightEntry::Dense(dense) = entry else {
+                panic!("the fixture is dense")
+            };
+            ArchiveTensor {
+                name: key.as_str().to_string(),
+                dtype: "BF16",
+                shape: dense.shape().to_vec(),
+                bytes: dense.bytes().as_slice().to_vec(),
+            }
+        })
+        .collect();
+    let dir = write_hf_checkpoint("qwen_vl", &fixture.config, &tensors);
+    qwen_vl_tokenizer()
+        .save(dir.join("tokenizer.json"), false)
+        .unwrap();
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        serde_json::json!({ "chat_template": poot_test_util::qwen_vl::CHAT_TEMPLATE }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("preprocessor_config.json"),
+        preprocessor
+            .unwrap_or_else(|| fixture.preprocessor.clone().unwrap())
+            .to_string(),
+    )
+    .unwrap();
+    let handle = ModelHandle::load(
+        &dir,
+        &Registry::builtin().unwrap(),
+        &crate::driver::LoadOptions::default(),
+    )
+    .unwrap();
+    (dir, Arc::new(handle))
+}
+
+/// A `height x width` RGB image whose pixels differ with `seed`.
+fn qwen_vl_image(
+    height: usize,
+    width: usize,
+    seed: u8,
+) -> poot_models::multimodal::front_end::Image {
+    let rgb = (0..height * width * 3)
+        .map(|i| {
+            (i as u8)
+                .wrapping_mul(37)
+                .wrapping_add(seed.wrapping_mul(91))
+        })
+        .collect();
+    poot_models::multimodal::front_end::Image::from_rgb8(height, width, rgb).unwrap()
+}
+
+/// The vision tower `handle` runs on its driver, each row also evaluated on the CPU oracle over the same
+/// inputs and compared (tier 2).
+struct OracleCheckedTowers {
+    drivers: crate::TowerDrivers,
+    tower: Arc<ModelHandle>,
+    checked: usize,
+}
+
+impl OracleCheckedTowers {
+    fn open(handle: &ModelHandle, executor: Box<dyn poot_executor::Executor>) -> Self {
+        let mut executor = Some(executor);
+        let drivers = crate::TowerDrivers::open(handle, |_, positions| {
+            Ok::<_, DriverError>((executor.take().expect("one tower"), options(64, 64))).inspect(
+                |_| {
+                    assert!(
+                        positions.get() >= 64,
+                        "the tower takes the fixture's images"
+                    )
+                },
+            )
+        })
+        .unwrap();
+        Self {
+            drivers,
+            tower: Arc::clone(&handle.towers()[0].1),
+            checked: 0,
+        }
+    }
+}
+
+impl poot_models::multimodal::front_end::Towers for OracleCheckedTowers {
+    fn encode(
+        &mut self,
+        tower: poot_models::multimodal::front_end::TowerId,
+        inputs: &RequestInputs,
+    ) -> Result<Vec<f32>, poot_models::multimodal::front_end::TowerError> {
+        let device = self.drivers.encode(tower, inputs)?;
+        let model = self.tower.model();
+        let schema = model.schema();
+        let one_row = |value: &InputValue| {
+            let InputValue::Row(tensor) = value else {
+                panic!("a tower row's inputs are per-row tensors")
+            };
+            let mut shape = vec![1];
+            shape.extend_from_slice(tensor.shape());
+            match tensor.dtype() {
+                poot_tensor::DType::I32 => {
+                    HostTensor::i32(shape, tensor.as_i32().unwrap().to_vec())
+                }
+                _ => HostTensor::f32(shape, tensor.as_f32().unwrap().to_vec()),
+            }
+        };
+        let slots: Vec<(SlotKey, HostTensor)> = inputs
+            .iter()
+            .map(|(id, value)| (schema.input(id).unwrap().slot().clone(), one_row(value)))
+            .collect();
+        let patches = slots
+            .iter()
+            .map(|(_, tensor)| tensor.shape()[1])
+            .next()
+            .unwrap();
+        let graph = model
+            .trace(
+                &StepSpec::encode(
+                    StepShape::new(nz(1), nz(patches), nz(patches)).with_logits(LogitRows::All),
+                ),
+                poot_graph_ir::TraceLimits::for_tests(),
+            )
+            .unwrap();
+        let (want, _) = eval_mapped(&graph, self.tower.store(), model.weights(), &slots, &[]);
+        close("the tower's rows", &device, want.as_f32().unwrap());
+        self.checked += 1;
+        Ok(device)
+    }
+}
+
+/// The log-probabilities (natural log softmax) of every vocabulary token after `prepared`'s prompt and
+/// the `generated` tokens that follow it, on the CPU oracle: the text tower's `step` graph (carrying the
+/// embedding rows) over the whole sequence, with the rows scattered over the placeholders, the prompt at
+/// its sectioned positions and each generated token one further than the last on every axis.
+fn qwen_vl_oracle_logprobs(
+    handle: &ModelHandle,
+    prepared: &poot_models::multimodal::front_end::Prepared,
+    generated: &[u32],
+) -> Vec<f32> {
+    use poot_models::io::{Fill, Support};
+    let model = handle.model();
+    let prompt: Vec<u32> = prepared.prompt.iter().chain(generated).copied().collect();
+    let n = prompt.len();
+    let Some(InputValue::Tokens(rows)) = prepared.inputs.get(EMBEDS) else {
+        panic!("the prompt carries embedding rows")
+    };
+    let Some(InputValue::Tokens(sections)) =
+        prepared.inputs.get(poot_models::components::rope::MROPE)
+    else {
+        panic!("the prompt carries its sectioned positions")
+    };
+    let width = rows.width();
+    let Support::Sparse(placeholders) = rows.support() else {
+        panic!("the rows sit at the placeholders")
+    };
+    let mut embeds = vec![0.0f32; n * width];
+    let mut at = vec![0i32; n];
+    for (row, &position) in placeholders.iter().enumerate() {
+        embeds[position * width..(position + 1) * width]
+            .copy_from_slice(&rows.data().as_f32().unwrap()[row * width..(row + 1) * width]);
+        at[position] = 1;
+    }
+    let table = sections.data().as_i32().unwrap();
+    // Past the prompt every axis continues from the collapsed position after its last token.
+    let Fill::Advance { from, step } = sections.beyond() else {
+        panic!("the positions advance past the prompt")
+    };
+    let positions: Vec<i32> = (0..3)
+        .flat_map(|axis| {
+            (0..prepared.prompt.len())
+                .map(move |i| table[i * 3 + axis])
+                .chain((0..generated.len() as i32).map(move |k| from[axis] + k * step))
+        })
+        .collect();
+    let graph = model
+        .trace(
+            &StepSpec::step(StepShape::new(
+                nz(1),
+                nz(n),
+                nz(model.config().max_positions),
+            ))
+            .carrying(EMBEDS),
+            poot_graph_ir::TraceLimits::for_tests(),
+        )
+        .unwrap();
+    let state: Vec<HostTensor> = graph
+        .state()
+        .map(|(input, _)| HostTensor::zeros(graph.aval(input).shape.clone()))
+        .collect();
+    let activation = |tag| SlotKey::new(Slot::Activation, Some(tag));
+    let slots = [
+        (
+            SlotKey::new(Slot::Token, None),
+            HostTensor::i32(vec![1, n], prompt.iter().map(|&t| t as i32).collect()),
+        ),
+        (
+            SlotKey::new(Slot::Pos, None),
+            HostTensor::i32(vec![1, n], (0..n as i32).collect()),
+        ),
+        (
+            SlotKey::new(Slot::MropePosition, None),
+            HostTensor::i32(vec![3, n], positions),
+        ),
+        (
+            activation("embeds"),
+            HostTensor::f32(vec![1, n, width], embeds),
+        ),
+        (activation("embeds_at"), HostTensor::i32(vec![1, n], at)),
+    ];
+    let (logits, _) = eval_mapped(&graph, handle.store(), model.weights(), &slots, &state);
+    let logits = logits.as_f32().unwrap();
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
+    logits.iter().map(|&l| l - max - sum.ln()).collect()
+}
+
+/// What the front end of the Qwen2.5-VL `handle` lowers `image` and the question `hello t1` to.
+fn qwen_vl_lower(
+    handle: &ModelHandle,
+    towers: &mut dyn poot_models::multimodal::front_end::Towers,
+    image: &poot_models::multimodal::front_end::Image,
+) -> Result<
+    poot_models::multimodal::front_end::Prepared,
+    poot_models::multimodal::front_end::FrontEndError,
+> {
+    use poot_models::multimodal::front_end::{ChatTurn, Media};
+    handle.front_end().expect("a Qwen2.5-VL front end").prepare(
+        &[ChatTurn::user(1, "hello t1")],
+        &mut [Media::Image(image)],
+        towers,
+        handle.text(),
+    )
+}
+
 /// POOT-650 SC-001: a Qwen2.5-VL image-plus-prompt request generates through `Driver` with the front
 /// end producing the step inputs (the vision tower's rows through `Driver::encode`, the prompt's
 /// sectioned positions bound to `Slot::MropePosition`), and the log-probabilities of every vocabulary
 /// token at the first step, and at the two decode steps after it, match the CPU oracle's over the same
 /// inputs (tier 2: every element within `1e-4 * (1 + |want|)`), for two different images through one
-/// front end. The oracle's two images' distributions differ by far more than the tolerance, so a row
-/// that ignored the image could not pass; the decode steps run at the positions that continue after
-/// the image. Mutation: feed zeroed image embeddings (`Qwen25Vl::generate` scatters zero rows); the
-/// log-probabilities leave the oracle's.
+/// front end; the tower's rows are the oracle's too. The oracle's two images' distributions differ by
+/// far more than the tolerance, so a row that ignored the image could not pass; the decode steps run at
+/// the positions that continue after the image. Mutation: feed zeroed image embeddings (zero the rows
+/// in the front end's `prompt_inputs`); the log-probabilities leave the oracle's.
 fn qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle(choice: BackendChoice) {
-    use crate::multimodal::qwen_vl::{Qwen25Vl, Qwen25VlGenerate, fixture};
-
     const NEW: usize = 3;
-    let dir = fixture::checkpoint("sc001", 2.0);
-    let (first, second) = (fixture::image(12, 8, 1), fixture::image(12, 8, 2));
-    let inputs = [&first, &second].map(|image| {
-        let input = fixture::assemble(&dir, &fixture::messages(image));
-        let rows = fixture::oracle_rows(&dir, &input);
-        (input, rows)
-    });
-    let first_step = |n: usize| {
-        let (input, rows) = &inputs[n];
-        fixture::oracle_logprobs(&dir, input, rows, &[])
+    let (_dir, handle) = qwen_vl_checkpoint(2.0, None);
+    let (first, second) = (qwen_vl_image(12, 8, 1), qwen_vl_image(12, 8, 2));
+    let (Some(vision), Some(text)) = (open(choice), open(choice)) else {
+        return;
     };
-    let apart = poot_test_util::max_abs_error(&first_step(0), &first_step(1));
+    let mut towers = OracleCheckedTowers::open(&handle, vision);
+    let mut text = Driver::new(Arc::clone(&handle), text, options(16, 32))
+        .unwrap()
+        .serve(Layout::Contiguous);
+    let prepared =
+        [&first, &second].map(|image| qwen_vl_lower(&handle, &mut towers, image).unwrap());
+    assert_eq!(towers.checked, 2, "each image's tower row was checked");
+    let apart = poot_test_util::max_abs_error(
+        &qwen_vl_oracle_logprobs(&handle, &prepared[0], &[]),
+        &qwen_vl_oracle_logprobs(&handle, &prepared[1], &[]),
+    );
     assert!(
         apart > 1e-2,
         "the two images' oracle distributions differ by {apart}"
     );
-
-    let (Some(vision), Some(text)) = (open(choice), open(choice)) else {
-        return;
-    };
-    let mut vlm = Qwen25Vl::load(
-        &dir,
-        &Registry::builtin().unwrap(),
-        (vision, options(64, 64)),
-        (text, options(16, 32)),
-    )
-    .unwrap();
-    for (n, (input, rows)) in inputs.iter().enumerate() {
-        let generation = vlm
-            .generate(
-                input,
-                Qwen25VlGenerate {
+    for (n, prepared) in prepared.iter().enumerate() {
+        let generation = text
+            .generate_with_inputs(
+                GenerateRequest {
+                    prompt: prepared.prompt.clone(),
                     max_new: NEW,
-                    sampler: Sampler::greedy().with_logprobs(fixture::VOCAB),
+                    sampler: Sampler::greedy().with_logprobs(qwen_vl_ids::VOCAB),
+                    stops: Vec::new(),
+                    ignore_eos: false,
                 },
+                prepared.inputs.clone(),
                 &mut |_: u32, _: &str| GenerationControl::Continue(()),
             )
             .unwrap();
         assert_eq!(generation.tokens.len(), NEW, "image {n}");
         for step in 0..NEW {
             // Step `k` is the distribution after the prompt and the `k` tokens generated before it.
-            let want = fixture::oracle_logprobs(&dir, input, rows, &generation.tokens[..step]);
+            let want = qwen_vl_oracle_logprobs(&handle, prepared, &generation.tokens[..step]);
             let record = &generation.logprobs[step];
-            assert_eq!(record.top.len(), fixture::VOCAB, "image {n} step {step}");
+            assert_eq!(
+                record.top.len(),
+                qwen_vl_ids::VOCAB,
+                "image {n} step {step}"
+            );
             let worst = record
                 .top
                 .iter()
@@ -6802,70 +7026,52 @@ per_backend!(
     qwen25_vl_image_prompt_first_step_matches_the_cpu_oracle_ptx
 );
 
-/// POOT-650: an image of more patches than the vision tower takes in one step (4100 against 4096) is a
-/// typed `CapacityAboveMax` refusal through `Qwen25Vl::generate`, from the vision driver's first
-/// prepare: no encode step and no generation step runs and nothing panics. Mutation: raise
-/// `MAX_PATCHES` in the tower to 8192; the image encodes and generates and the row goes red.
+/// POOT-650: an image of more patches than the vision tower takes in one step (4100 against 4096) is
+/// refused by the front end as the client's (the tower's own bound, `MAX_PATCHES`), before any encode
+/// step: no encode step and no generation step runs and nothing panics. Mutation: raise `MAX_PATCHES`
+/// in the tower to 8192; the front end admits the image, the tower's trace refuses or runs it, and the
+/// row goes red.
 fn qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal(choice: BackendChoice) {
-    use crate::driver::error::Unsupported;
-    use crate::multimodal::qwen_vl::{Qwen25Vl, Qwen25VlError, Qwen25VlGenerate, fixture};
-    use poot_models::model::{ShapeReason, TraceError};
+    use poot_models::multimodal::front_end::FrontEndError;
 
-    let dir = fixture::checkpoint("patch_cap", 2.0);
-    std::fs::write(
-        dir.join("preprocessor_config.json"),
-        r#"{"do_resize":false,"min_pixels":1,"max_pixels":1048576,"patch_size":2,
-           "temporal_patch_size":2,"merge_size":2}"#,
-    )
-    .unwrap();
-    // 164 x 100 pixels of 2-pixel patches: an 82 x 50 grid, 4100 patches.
-    let image = fixture::image(164, 100, 1);
-    let input = fixture::assemble(&dir, &fixture::messages(&image));
-    assert_eq!(
-        input.media.image_grids[0].height * input.media.image_grids[0].width,
-        4100
+    let (_dir, handle) = qwen_vl_checkpoint(
+        2.0,
+        Some(serde_json::json!({
+            "do_resize": false, "min_pixels": 1, "max_pixels": 1048576, "patch_size": 2,
+            "temporal_patch_size": 2, "merge_size": 2,
+        })),
     );
+    // 164 x 100 pixels of 2-pixel patches: an 82 x 50 grid, 4100 patches.
+    let image = qwen_vl_image(164, 100, 1);
     let (Some(vision), Some(text)) = (open(choice), open(choice)) else {
         return;
     };
-    let mut vlm = Qwen25Vl::load(
-        &dir,
-        &Registry::builtin().unwrap(),
-        (
-            vision,
+    let mut vision = Some(vision);
+    let mut towers = crate::TowerDrivers::open(&handle, |_, positions| {
+        assert_eq!(positions.get(), 4096, "the tower's own bound");
+        Ok::<_, DriverError>((
+            vision.take().expect("one tower"),
             // The driver's own trace bound is out of the way: the refusal is the tower's.
             DriverOptions {
                 trace: poot_graph_ir::TraceLimits::for_tests_with_tokens(nz(8192)),
                 ..options(4096, 4096)
             },
-        ),
-        (text, options(16, 32)),
-    )
+        ))
+    })
     .unwrap();
-    let error = vlm
-        .generate(
-            &input,
-            Qwen25VlGenerate {
-                max_new: 1,
-                sampler: Sampler::greedy(),
-            },
-            &mut |_: u32, _: &str| GenerationControl::Continue(()),
-        )
-        .unwrap_err();
+    let text = Driver::new(Arc::clone(&handle), text, options(16, 32)).unwrap();
+    let error = qwen_vl_lower(&handle, &mut towers, &image).unwrap_err();
     assert!(
-        matches!(
-            error,
-            Qwen25VlError::Driver(DriverError::Unsupported(Unsupported::Trace(
-                TraceError::ShapeUnsupported {
-                    reason: ShapeReason::CapacityAboveMax { max: 4096 },
-                    ..
-                }
-            )))
-        ),
+        matches!(&error, FrontEndError::Refused(reason) if reason.contains("4100")),
         "{error:?}"
     );
-    assert_eq!(vlm.vision().stats().steps, 0, "no encode step ran");
-    assert_eq!(vlm.text().stats().steps, 0, "no generation step ran");
+    let tower_id = handle.towers()[0].0;
+    assert_eq!(
+        towers.driver(tower_id).unwrap().stats().steps,
+        0,
+        "no encode step ran"
+    );
+    assert_eq!(text.stats().steps, 0, "no generation step ran");
 }
 per_backend!(
     qwen25_vl_an_image_past_the_patch_cap_is_a_typed_refusal,

@@ -13,6 +13,7 @@ Capability	ZeroElementE4m3	covered	crates/poot-graph-plan/src/tests.rs	e4m3fn_sc
 Capability	DispatchSizeOverflow	covered	crates/poot-graph-plan/src/compile.rs	compile_splits_a_stack_past_the_bit_offset_range_and_refuses_one_expert_past_it
 Capability	DispatchGridLimit	covered	crates/poot-graph-plan/src/compile.rs	compile_refuses_a_dispatch_beyond_the_target_grid
 Capability	DispatchGridAxisLimit	covered	crates/poot-graph-plan/src/planner/sampling.rs	greedy_refuses_a_grid_past_the_target_limit
+Capability	ArgmaxIndexNotExact	covered	crates/poot-graph-plan/src/planner/sampling.rs	greedy_refuses_a_vocabulary_whose_indices_are_not_exact_f32
 Capability	ExactI32Op	gap	-	-
 Capability	UnfoldedIota	covered	crates/poot-graph-plan/src/tests.rs	planner_refuses_an_unfolded_iota_with_a_typed_refusal
 Capability	FusedStep	gap	-	-

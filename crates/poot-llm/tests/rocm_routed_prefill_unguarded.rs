@@ -52,9 +52,9 @@ fn fixture() -> Fixture {
         .expect("qwen4exp is registered");
     let fixture = (entry.fixture)();
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
-    let map = Arc::new(model.weights().clone());
+    let map = Arc::new(model.model.weights().clone());
     Fixture {
-        model,
+        model: model.model,
         store: Arc::new(fixture.store),
         map,
     }

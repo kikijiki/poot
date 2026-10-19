@@ -9,16 +9,39 @@ use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+/// Construction-time options for [`Context::new_with_options`]: typed configuration, never an
+/// environment read in library code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextOptions {
+    /// How long a submission's fence wait may take before the device counts as hung: the wait then
+    /// fails with [`RuntimeError::WaitTimeout`] and poisons the device.
+    pub wait_timeout: Duration,
+}
+
+impl Default for ContextOptions {
+    fn default() -> Self {
+        Self {
+            wait_timeout: Duration::from_secs(600),
+        }
+    }
+}
 
 impl Context {
     /// Create a Vulkan instance (no surface/swapchain), pick the first physical device with a
     /// `VK_QUEUE_COMPUTE_BIT` queue family (no graphics/present requirement, spec 133 FR-002), and open a
     /// logical device and queue on it.
     pub fn new() -> Result<Self, RuntimeError> {
-        Self::new_inner().map_err(require_gpu_check)
+        Self::new_with_options(ContextOptions::default())
     }
 
-    pub(crate) fn new_inner() -> Result<Self, RuntimeError> {
+    /// [`Self::new`] with explicit [`ContextOptions`].
+    pub fn new_with_options(options: ContextOptions) -> Result<Self, RuntimeError> {
+        Self::new_inner(options).map_err(require_gpu_check)
+    }
+
+    pub(crate) fn new_inner(options: ContextOptions) -> Result<Self, RuntimeError> {
         // SAFETY: `Entry::load` dlopens the system Vulkan loader (libvulkan.so.1); the usual `ash` dynamic-loading contract.
         let entry = unsafe { ash::Entry::load()? };
 
@@ -185,6 +208,7 @@ impl Context {
             queue,
             Arc::new(AshResourceDispatch),
             validation,
+            options.wait_timeout,
         ));
 
         // Confirm a HOST_VISIBLE|HOST_COHERENT memory type exists (FR-003's UMA path) before returning a `Context` whose first buffer alloc would fail.

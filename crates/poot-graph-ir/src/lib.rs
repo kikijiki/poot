@@ -12,6 +12,7 @@ pub mod builder;
 #[cfg(test)]
 mod builder_budget_tests;
 /// Composite ops defined by their decomposition into primitives (Card 556, ADR-0101 tier 1).
+#[cfg(any(test, feature = "test-support"))]
 pub mod decompose;
 pub mod error;
 pub mod graph;
@@ -35,9 +36,10 @@ pub use budget::{AllocationSite, Attempted, BudgetResource, TraceBudgetExceeded,
 #[cfg(any(test, feature = "test-support"))]
 pub use budget::{Charged, Ledger, LedgerEvent, Reservation};
 pub use builder::{
-    BlockTopKResult, Builder, BuilderAppendAccounting, BuilderAppendPlan, LayerScope, Outputs,
-    PreparedBuilderAppend, ScanResult, Traced, WitnessDeclaration,
+    BlockTopKResult, Builder, LayerScope, Outputs, ScanResult, Traced, WitnessDeclaration,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use builder::{BuilderAppendAccounting, BuilderAppendPlan, PreparedBuilderAppend};
 pub use error::{
     BuilderCollection, BuilderError, BuilderValueNamespace, FusedOperandReason,
     GraphValidationError, Requirement, ScanReason, ShapeError,
@@ -59,9 +61,10 @@ pub use op::{
     MaskOperand, OpClass, OpKind, RedOp, ScanAttrs, ScanFamily, ScanLayout, SelectedAttentionAttrs,
     SelectedAttentionLayout, UnOp,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use packed_source::packed_source_constants;
 pub use packed_source::{
-    PackedSourceName, packed_source_constants, packed_source_type, packed_stack_source_constants,
-    packed_stack_source_type,
+    PackedSourceName, packed_source_type, packed_stack_source_constants, packed_stack_source_type,
 };
 pub use range::{IndexRange, RangeFacts, value_ranges};
 pub use slot_map::{ForwardSlotMap, SlotMapError};

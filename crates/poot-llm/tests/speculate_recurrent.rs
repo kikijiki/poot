@@ -48,7 +48,7 @@ use poot_models::model::{
     FamilyKey, HiddenCarry, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
     StepShape, StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{Backend, DeviceCaps};
@@ -169,12 +169,12 @@ struct Recurrentish {
     weights: WeightMap,
 }
 
-fn build_recurrent(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build_recurrent(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
         panic!("the fixture is an HF checkpoint")
     };
     let granule = config["prefill_granule"].as_u64().unwrap_or(1) as usize;
-    Ok(Box::new(Recurrentish {
+    Ok(ModelParts::new(Box::new(Recurrentish {
         config: ModelConfig {
             family: RECURRENT,
             vocab: VOCAB,
@@ -192,7 +192,7 @@ fn build_recurrent(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model
             )
             .build_for(RECURRENT)?,
         weights: WeightMap::default(),
-    }))
+    })))
 }
 
 fn recurrent_fixture() -> Fixture {
@@ -212,6 +212,7 @@ fn recurrent_fixture_with(granule: usize) -> Fixture {
             "prefill_granule": granule,
         }),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }
@@ -349,8 +350,8 @@ impl Device for FakeDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())
@@ -911,6 +912,7 @@ fn probe_schema(
     let fixture = (entry(family).fixture)();
     let model = (entry(family).build)(&fixture.raw(), &fixture.store).unwrap();
     let graph = model
+        .model
         .trace(
             &StepSpec::step(
                 StepShape::new(NonZeroUsize::MIN, NonZeroUsize::MIN, nz(CAPACITY))
@@ -1418,6 +1420,7 @@ fn oracle_rows(family: FamilyKey, tokens: &[u32]) -> Vec<Vec<f32>> {
     let model = (entry(family).build)(&fixture.raw(), &fixture.store).unwrap();
     let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY)).with_logits(LogitRows::All);
     let graph = model
+        .model
         .trace(
             &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
@@ -1437,7 +1440,13 @@ fn oracle_rows(family: FamilyKey, tokens: &[u32]) -> Vec<Vec<f32>> {
             HostTensor::i32(vec![1, n], (0..n as i32).collect()),
         ),
     ];
-    let (logits, _) = eval_mapped(&graph, &fixture.store, model.weights(), &slots, &state);
+    let (logits, _) = eval_mapped(
+        &graph,
+        &fixture.store,
+        model.model.weights(),
+        &slots,
+        &state,
+    );
     logits
         .as_f32()
         .expect("f32 logits")
@@ -1754,6 +1763,7 @@ fn shadow_state_share_of_the_state_budget() {
         for n_slots in [1usize, 8, 32] {
             let pool_slots = 4 * BLOCK_SIZE * n_slots;
             let graph = model
+                .model
                 .trace(
                     &StepSpec::step(
                         StepShape::new(nz(1), NonZeroUsize::MIN, nz(CAPACITY)).with_kv(

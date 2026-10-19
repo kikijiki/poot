@@ -62,6 +62,10 @@ pub enum RocmError {
         /// The runtime entry point that refused.
         op: &'static str,
     },
+    /// The device reported a fault and is gone: a queue error, a GPU memory fault or a reset. The
+    /// context is poisoned by this error; every later call is [`RocmError::ContextPoisoned`].
+    #[error("the GPU device was lost: {0}")]
+    DeviceLost(DeviceFault),
     /// A dispatch whose grid or workgroup size no well-formed AQL packet can carry, refused before any
     /// ring slot was reserved.
     #[error("{op} refused dispatch {dispatch} (grid {grid:?}, workgroup {block:?}): {violation}")]
@@ -207,8 +211,39 @@ pub enum RocmError {
     DeviceRingQueueCreate(HsaStatus),
 }
 
+/// What the device reported when it was lost, as ROCr delivered it to the queue error callback or the
+/// system event handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DeviceFault {
+    /// The HSA queue was inactivated by an asynchronous error (for example an invalid packet).
+    #[error("queue error {0}")]
+    QueueError(HsaStatus),
+    /// A kernel accessed memory the GPU cannot reach.
+    #[error("memory fault at {address:#x} (reason mask {reason_mask:#x})")]
+    MemoryFault {
+        /// The virtual address accessed.
+        address: u64,
+        /// `hsa_amd_memory_fault_reason_t` bits.
+        reason_mask: u32,
+    },
+    /// The GPU hit a hardware exception and was reset.
+    #[error("hardware exception (reset cause {reset_cause:#x})")]
+    HardwareException {
+        /// `hsa_amd_hw_exception_reset_cause_t` bits.
+        reset_cause: u32,
+    },
+    /// The GPU reported a memory error.
+    #[error("memory error at {address:#x} (reason mask {reason_mask:#x})")]
+    MemoryError {
+        /// The virtual address involved.
+        address: u64,
+        /// `hsa_amd_memory_error_reason_t` bits.
+        reason_mask: u32,
+    },
+}
+
 /// Human-readable HSA status. `Display` prints the textual name (static table) and the raw hex code.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HsaStatus {
     /// The raw `hsa_status_t` returned by the failing HSA call.
     pub code: hsa_status_t,

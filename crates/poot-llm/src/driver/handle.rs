@@ -1,6 +1,8 @@
 //! [`ModelHandle`]: a loaded checkpoint, immutable and shared by every driver (Card 734). It holds the
-//! family's [`Model`] built through a [`Registry`], the checkpoint's weights exactly as stored, and the
-//! [`TextCodec`] of its tokenizer and chat template. It names no family and no backend.
+//! family's model container built through a [`Registry`] ([`ModelParts`]: the served [`Model`] and, for a
+//! vision-language family, its towers and front end), the checkpoint's weights exactly as stored, and the
+//! [`TextCodec`] of its tokenizer and chat template. The checkpoint's config files are read here, once.
+//! It names no family and no backend.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -11,7 +13,8 @@ use poot_load::gguf::{GgufIndex, IdentityNames, read_gguf, shard_paths};
 use poot_load::packed_safetensors::{FilePin, Sha256Digest, check_pin_reader};
 use poot_load::plan::default_workers;
 use poot_models::model::{Model, ModelConfig};
-use poot_models::registry::{FamilyEntry, RawConfig, Registry};
+use poot_models::multimodal::front_end::{FrontEnd, TowerId};
+use poot_models::registry::{FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
 use poot_quant::weights::WeightStore;
 
@@ -124,12 +127,16 @@ pub(super) fn check_integrity(
     Ok(())
 }
 
-/// A model, its weights and its text services.
+/// A model, its weights and its text services, and for a vision-language model its towers and the
+/// front end that runs them.
 #[derive(Debug)]
 pub struct ModelHandle {
     model: Box<dyn Model>,
     store: Arc<WeightStore>,
-    text: TextCodec,
+    /// The checkpoint's text services; a tower's handle shares its model's, and never tokenizes.
+    text: Arc<TextCodec>,
+    towers: Vec<(TowerId, Arc<ModelHandle>)>,
+    front_end: Option<Arc<dyn FrontEnd>>,
 }
 
 /// The id a guided constraint forces once its pattern is complete: the lowest declared end-of-sequence
@@ -167,7 +174,7 @@ fn resolve<'r>(
 
 impl ModelHandle {
     /// Load `path`: a directory is an HF checkpoint (`config.json`, `generation_config.json` when it
-    /// ships one, safetensors and `tokenizer.json`), a file is a GGUF. The family is resolved from the
+    /// ships one, `preprocessor_config.json` when it ships one, safetensors and `tokenizer.json`), a file is a GGUF. The family is resolved from the
     /// config before any weight is read, so an unregistered family is refused without reading the
     /// checkpoint's tensors; the one resolve then builds the model.
     pub fn load(
@@ -201,9 +208,15 @@ impl ModelHandle {
             .exists()
             .then(|| read_json(&generation_path))
             .transpose()?;
+        let preprocessor_path = dir.join("preprocessor_config.json");
+        let preprocessor = preprocessor_path
+            .exists()
+            .then(|| read_json(&preprocessor_path))
+            .transpose()?;
         let raw = RawConfig::HfJson {
             config: &config,
             generation: generation.as_ref(),
+            preprocessor: preprocessor.as_ref(),
         };
         let family = resolve(&raw, registry)?;
         let files = poot_load::safetensors::map_weight_files(dir).map_err(LoadError::from)?;
@@ -269,26 +282,23 @@ impl ModelHandle {
         })
     }
 
-    /// Build the family `raw` names over a store the caller shares: one section of a multimodal
-    /// checkpoint, whose towers are each a family of their own over the same bytes.
-    pub(crate) fn from_shared(
-        raw: &RawConfig<'_>,
-        store: Arc<WeightStore>,
-        registry: &Registry,
-        text: impl FnOnce(&ModelConfig) -> Result<TextCodec, LoadError>,
-    ) -> Result<Self, DriverError> {
-        Self::build(resolve(raw, registry)?, raw, store, text)
-    }
-
-    /// Build `family`'s model over `store`, then its text services from the model's own config.
+    /// Build `family`'s model container over `store`, then its text services from the served model's own
+    /// config. The served model reads the container's section of `store` when it names one; every tower
+    /// reads the checkpoint's own names.
     fn build(
         family: &FamilyEntry,
         raw: &RawConfig<'_>,
         store: Arc<WeightStore>,
         text: impl FnOnce(&ModelConfig) -> Result<TextCodec, LoadError>,
     ) -> Result<Self, DriverError> {
-        let model = (family.build)(raw, &store).map_err(DriverError::Model)?;
-        let report = model.weights().report(&store);
+        let ModelParts {
+            model,
+            store: served,
+            towers,
+            front_end,
+        } = (family.build)(raw, &store).map_err(DriverError::Model)?;
+        let served = served.map_or_else(|| Arc::clone(&store), Arc::new);
+        let report = model.weights().report(&served);
         tracing::info!(
             family = %model.config().family,
             loaded = report.loaded.len(),
@@ -296,8 +306,27 @@ impl ModelHandle {
             unknown = report.unknown.len(),
             "checkpoint tensors"
         );
-        let text = text(model.config())?;
-        Ok(Self { model, store, text })
+        let text = Arc::new(text(model.config())?);
+        let towers = towers
+            .into_iter()
+            .map(|tower| {
+                let handle = Self {
+                    model: tower.model,
+                    store: Arc::clone(&store),
+                    text: Arc::clone(&text),
+                    towers: Vec::new(),
+                    front_end: None,
+                };
+                (tower.id, Arc::new(handle))
+            })
+            .collect();
+        Ok(Self {
+            model,
+            store: served,
+            text,
+            towers,
+            front_end: front_end.map(Arc::from),
+        })
     }
 
     /// What the model's programs read, carry and require.
@@ -327,6 +356,17 @@ impl ModelHandle {
     /// The tokenizer and chat template built from the checkpoint.
     pub fn text(&self) -> &TextCodec {
         &self.text
+    }
+
+    /// The model's front end, when it takes media (a vision-language family): the thing that turns a
+    /// conversation with images into a prompt and its request inputs.
+    pub fn front_end(&self) -> Option<&Arc<dyn FrontEnd>> {
+        self.front_end.as_ref()
+    }
+
+    /// The towers the front end runs, each as a handle a [`Driver`](crate::driver::Driver) is built over.
+    pub fn towers(&self) -> &[(TowerId, Arc<ModelHandle>)] {
+        &self.towers
     }
 
     pub(crate) fn model(&self) -> &dyn Model {

@@ -30,7 +30,7 @@ use poot_models::model::{
     ConfigReason, FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
     StepShape, StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
     AttnRole, DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore,
@@ -298,7 +298,7 @@ fn build_tiny(
     raw: &RawConfig<'_>,
     store: &WeightStore,
     log: TraceLog,
-) -> Result<Box<dyn Model>, ModelError> {
+) -> Result<ModelParts, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
         unreachable!("the fake family names only HF configs")
     };
@@ -379,7 +379,7 @@ fn build_tiny(
             program(ProgramId::ENCODE)
         })
         .build_for(TINY)?;
-    Ok(Box::new(Tiny {
+    Ok(ModelParts::new(Box::new(Tiny {
         variant,
         schema,
         config: ModelConfig {
@@ -394,7 +394,7 @@ fn build_tiny(
         },
         weights: tiny_weights(variant, store),
         log,
-    }))
+    })))
 }
 
 /// The one projection the lora variant carries.
@@ -616,8 +616,8 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
 
     /// A replay is one step: the writes since the last one, grouped by the entry that owns them,
@@ -917,6 +917,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
             fixture: || Fixture {
                 config: tiny_config(1, 16, Variant::Plain),
                 generation: None,
+                preprocessor: None,
                 store: WeightStore::default(),
             },
             variants: &[],
@@ -926,6 +927,7 @@ fn build_rig(options: RigOptions, script: Script) -> Result<Rig, DriverError> {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let handle =
         ModelHandle::from_checkpoint(&raw, tiny_store(options.variant), &registry, |_| {
@@ -1532,6 +1534,7 @@ fn an_unregistered_family_is_a_typed_refusal() {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let err =
         ModelHandle::from_checkpoint(&raw, WeightStore::default(), &Registry::empty(), |_| {

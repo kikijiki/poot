@@ -660,7 +660,7 @@ fn copy_round_trips_every_narrow_element_width_with_no_sentinel_corruption() {
         device
             .copy(&src, &dst)
             .unwrap_or_else(|e| panic!("{name}: copy: {e}"));
-        let recording = device.finish().unwrap().expect("Replay always records");
+        let recording = device.finish().unwrap();
         device
             .replay(&recording)
             .unwrap_or_else(|e| panic!("{name}: replay: {e}"));
@@ -764,7 +764,7 @@ fn a_timed_out_dispatch_through_the_device_trait_retains_its_allocations_and_poi
             work: 1,
         })
         .unwrap();
-    let recording = device.finish().unwrap().expect("Replay always records");
+    let recording = device.finish().unwrap();
     device
         .replay(&recording)
         .expect("replay only enqueues: the spin is still running when it returns");

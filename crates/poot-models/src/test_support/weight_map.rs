@@ -177,11 +177,13 @@ pub fn qwen2(dims: Qwen2Dims, projections: Projections, embed: DType) -> MappedM
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let model = Registry::builtin()
         .unwrap()
         .build(&raw, &store)
-        .unwrap_or_else(|e| panic!("{e}"));
+        .unwrap_or_else(|e| panic!("{e}"))
+        .model;
     let map = Arc::new(model.weights().clone());
     MappedModel {
         model,
@@ -729,10 +731,12 @@ pub fn check_tied_head(exec: &mut dyn Executor, target: Target, oracle: &MappedO
             &RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             },
             &store,
         )
-        .unwrap();
+        .unwrap()
+        .model;
     let map = Arc::new(model.weights().clone());
 
     let g = trace(model.as_ref(), &map, 1, CAPACITY);

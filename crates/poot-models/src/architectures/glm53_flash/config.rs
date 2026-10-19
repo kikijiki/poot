@@ -111,7 +111,10 @@ impl Glm53Config {
     /// `Unsupported`); the per-layer schedule comes from `layer_types` and the dense-layer prefix.
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         // The family is HF-only: a GGUF never names it.
-        let RawConfig::HfJson { config, generation } = raw else {
+        let RawConfig::HfJson {
+            config, generation, ..
+        } = raw
+        else {
             return Err(ModelError::Config {
                 family: FAMILY,
                 field: "general.architecture",
@@ -122,6 +125,7 @@ impl Glm53Config {
         let raw = RawConfig::HfJson {
             config: &text,
             generation: *generation,
+            preprocessor: None,
         };
         let fields = Fields::new(&raw, FAMILY);
         let param = |e: ParamError| e.for_family(FAMILY);

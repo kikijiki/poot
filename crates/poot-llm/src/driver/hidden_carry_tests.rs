@@ -18,7 +18,7 @@ use poot_models::model::{
     FamilyKey, HiddenCarry, LogitRows, Model, ModelConfig, ModelError, ModelOutput, ShapeReason,
     StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
@@ -147,7 +147,7 @@ impl Model for Carrier {
     }
 }
 
-fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
         panic!("the fixture is an HF checkpoint")
     };
@@ -160,7 +160,7 @@ fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>,
         step = step.carrying(StateSpec::recurrent("toy.state"));
     }
     let schema = ModelSchema::builder().step(step).build_for(CARRIER)?;
-    Ok(Box::new(Carrier {
+    Ok(ModelParts::new(Box::new(Carrier {
         schema,
         config: ModelConfig {
             family: CARRIER,
@@ -174,7 +174,7 @@ fn build_carrier(raw: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>,
         },
         weights: WeightMap::default(),
         kind,
-    }))
+    })))
 }
 
 fn handle_of(kind: Kind) -> Arc<ModelHandle> {
@@ -187,6 +187,7 @@ fn handle_of(kind: Kind) -> Arc<ModelHandle> {
             fixture: || Fixture {
                 config: serde_json::json!({}),
                 generation: None,
+                preprocessor: None,
                 store: WeightStore::default(),
             },
             variants: &[],
@@ -199,6 +200,7 @@ fn handle_of(kind: Kind) -> Arc<ModelHandle> {
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let handle =
         ModelHandle::from_checkpoint(&raw, WeightStore::default(), &registry, |_| Ok(tiny_text()))
@@ -258,8 +260,8 @@ impl Device for FakeDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())

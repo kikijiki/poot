@@ -153,7 +153,7 @@ fn run_add() -> Result<(), CheckError> {
     // SC-001 inputs: a = 1..=64, b = 3*1..=64, c = a + b (64 elements, one workgroup).
     //
     // Strix Halo's iGPU only schedules 1 workgroup per AQL packet on the current gfx1151 / ROCm 7.2.3 combo,
-    // capped at 64 work-items (2 wavefronts of 32); 106d's cooperative queue is the multi-workgroup path. This
+    // capped at 64 work-items (2 wavefronts of 32). This
     // exercises one workgroup per dispatch and checks the IR's global-id computation
     // (`workgroup_id * workgroup_size + workitem_id`). Reports
     // `OK: c[0]=4.0 c[63]=67.0 (oracle=cpu, 1 workgroup of 64)`.

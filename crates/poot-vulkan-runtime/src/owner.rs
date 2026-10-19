@@ -5,6 +5,7 @@ use ash::vk;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 /// Shared owner for the complete native parent chain. Every child that can escape `Context` holds one.
 ///
@@ -30,6 +31,8 @@ pub(crate) struct DeviceOwner {
     /// the owning context's submits.
     queue: Mutex<vk::Queue>,
     poisoned: AtomicBool,
+    /// How long a submission's fence wait may take before the device counts as hung.
+    wait_timeout: Duration,
     /// The validation-layer message counter, present only under `POOT_VULKAN_VALIDATION`; destroyed
     /// before the instance, and a nonzero count fails the teardown.
     validation: Option<Validation>,
@@ -46,6 +49,7 @@ impl DeviceOwner {
         queue: vk::Queue,
         dispatch: Arc<dyn ResourceDispatch>,
         validation: Option<Validation>,
+        wait_timeout: Duration,
     ) -> Self {
         DeviceOwner {
             device,
@@ -54,6 +58,7 @@ impl DeviceOwner {
             dispatch,
             queue: Mutex::new(queue),
             poisoned: AtomicBool::new(false),
+            wait_timeout,
             validation,
             memory: poot_runtime_common::MemoryCounters::new(),
         }
@@ -80,7 +85,8 @@ impl DeviceOwner {
     /// [`RuntimeError::Vk`] and the caller may destroy what it built. Any other submit failure
     /// (`VK_ERROR_DEVICE_LOST` is the spec's signal that it could not keep that guarantee) and any failed
     /// fence wait after a successful submit leave the work possibly pending: the device is poisoned and
-    /// the call returns [`RuntimeError::SubmissionLost`], after which the caller must destroy nothing.
+    /// the call returns [`RuntimeError::SubmissionLost`] (or [`RuntimeError::WaitTimeout`] when the fence
+    /// outlasted the configured bound), after which the caller must destroy nothing.
     ///
     /// # Safety
     ///
@@ -115,9 +121,18 @@ impl DeviceOwner {
             }
         }
         // SAFETY: `fence` is a child of this device that the submission above signals.
-        if let Err(e) = unsafe { self.dispatch.wait_for_fences(&self.device, &[fence]) } {
+        if let Err(e) = unsafe {
+            self.dispatch
+                .wait_for_fences(&self.device, &[fence], self.wait_timeout)
+        } {
             self.poisoned.store(true, Ordering::Release);
-            return Err(RuntimeError::SubmissionLost(e));
+            return Err(if e == vk::Result::TIMEOUT {
+                RuntimeError::WaitTimeout {
+                    secs: self.wait_timeout.as_secs(),
+                }
+            } else {
+                RuntimeError::SubmissionLost(e)
+            });
         }
         Ok(())
     }

@@ -34,7 +34,7 @@ use crate::model::{
     ConfigReason, FamilyKey, KvLayout, Model, ModelConfig, ModelError, ShapeReason, StepSpec,
     TraceError,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 mod config;
@@ -78,7 +78,7 @@ pub(crate) struct Qwen4Exp {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let mut p = Qwen4ExpParams::from_raw(raw)?;
     let (names, gate_up) = config::expert_layout(p.layout, store);
     p.moe = p.moe.with_gate_up(gate_up);
@@ -115,13 +115,13 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: p.ratio,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Qwen4Exp {
+    Ok(ModelParts::new(Box::new(Qwen4Exp {
         params: p,
         weights,
         body,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Qwen4Exp {
@@ -231,6 +231,7 @@ pub(crate) fn hf_shapes(config: &serde_json::Value, experts: Experts) -> Vec<(St
     let params = Qwen4ExpParams::from_raw(&RawConfig::HfJson {
         config,
         generation: None,
+        preprocessor: None,
     })
     .expect("the config is valid");
     let (vocab, w) = (n("vocab_size"), n("hidden_size"));

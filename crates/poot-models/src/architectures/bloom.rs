@@ -49,7 +49,7 @@ use crate::io::ModelSchema;
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::GGUF_BLOOM;
 use crate::names::{FusedDims, NameRow, Presence, Source, family_weights_fused};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 // The `bloom` family behind [`Model`]: LayerNorm blocks with biases, an embedding LayerNorm,
@@ -303,7 +303,7 @@ pub(crate) struct Bloom {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = BloomParams::from_raw(raw)?;
     let rows = match raw.source() {
         ConfigSource::HfModelType if store.contains("word_embeddings.weight") => HF_ROWS_BARE,
@@ -345,14 +345,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Bloom {
+    Ok(ModelParts::new(Box::new(Bloom {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Bloom {
@@ -483,6 +483,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -509,7 +510,7 @@ mod family_tests {
     fn the_fallback_chat_format_is_chatml() {
         let fixture = fixture();
         let model = (ENTRY.build)(&fixture.raw(), &fixture.store).unwrap();
-        assert_eq!(model.config().chat, ChatFormat::ChatML);
+        assert_eq!(model.model.config().chat, ChatFormat::ChatML);
     }
 
     #[test]
@@ -576,6 +577,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),

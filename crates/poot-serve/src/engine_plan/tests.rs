@@ -282,8 +282,8 @@ impl Device for FixtureDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FixtureError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FixtureError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FixtureError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FixtureError> {
         Ok(())

@@ -63,7 +63,7 @@ use crate::io::ModelSchema;
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::GGUF_MPT;
 use crate::names::{FusedDims, FusedPart, NameRow, Presence, Source, family_weights_fused};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 // The `mpt` family behind [`Model`]: bias-free LayerNorm blocks, ALiBi attention over a fused
@@ -291,7 +291,7 @@ pub(crate) struct Mpt {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = MptParams::from_raw(raw)?;
     let rows = match raw.source() {
         ConfigSource::HfModelType => HF_ROWS,
@@ -338,14 +338,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Mpt {
+    Ok(ModelParts::new(Box::new(Mpt {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Mpt {
@@ -459,6 +459,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -469,7 +470,7 @@ mod family_tests {
     fn the_fallback_chat_format_is_chatml() {
         let fixture = fixture();
         let model = (ENTRY.build)(&fixture.raw(), &fixture.store).unwrap();
-        assert_eq!(model.config().chat, ChatFormat::ChatML);
+        assert_eq!(model.model.config().chat, ChatFormat::ChatML);
     }
 
     #[test]
@@ -506,6 +507,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -588,6 +590,7 @@ mod family_tests {
             &RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             },
             &fx.store,
         ) {

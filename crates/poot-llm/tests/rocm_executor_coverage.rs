@@ -463,13 +463,14 @@ fn qwen05b_fixture(checkpoint: &std::path::Path, prompt: &[u32]) -> Fixture {
             &RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             },
             &stored,
         )
         .unwrap_or_else(|e| panic!("{e}"));
-    let map = Arc::new(model.weights().clone());
+    let map = Arc::new(model.model.weights().clone());
     let mapped = MappedModel {
-        model,
+        model: model.model,
         store: Arc::new(stored),
         map,
     };

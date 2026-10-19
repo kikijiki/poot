@@ -62,7 +62,8 @@ Every registered family's fixture graphs (decode and prefill for a decoder, one 
 | `gpt_oss` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `granite` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `granite/granitemoe` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
-| `idefics3_vision` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `idefics3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `idefics3/vision` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `llama` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `llama/mixtral` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `minimax_m2` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
@@ -74,7 +75,7 @@ Every registered family's fixture graphs (decode and prefill for a decoder, one 
 | `phi3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen2` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen2_5_vl` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
-| `qwen2_5_vl_vision` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
+| `qwen2_5_vl/vision` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen3` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen35` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |
 | `qwen35/finetune` | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> | <span class="matrix-status matrix-status--yes">Plans</span> |

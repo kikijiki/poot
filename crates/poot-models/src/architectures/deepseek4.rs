@@ -29,7 +29,7 @@ use poot_tensor::DType;
 use crate::components::standard::{Step, check_step, decoder_program};
 use crate::io::ModelSchema;
 use crate::model::{FamilyKey, Model, ModelConfig, ModelError, ShapeReason, StepSpec, TraceError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 mod config;
@@ -64,7 +64,7 @@ pub(crate) struct DeepseekV4 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = DeepseekV4Config::from_raw(raw)?;
     let weights = names::weights_of(&p, store)?;
     let tower = stack::Tower::new(&weights, &p).map_err(|e| e.for_family(FAMILY))?;
@@ -81,13 +81,13 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: p.granule,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(DeepseekV4 {
+    Ok(ModelParts::new(Box::new(DeepseekV4 {
         params: p,
         weights,
         tower,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for DeepseekV4 {
@@ -372,6 +372,7 @@ fn fixture_of(config: serde_json::Value) -> Fixture {
     Fixture {
         config,
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }

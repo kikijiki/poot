@@ -69,6 +69,23 @@ reads back only the chosen token id and a non-finite flag, not the full logits. 
 back and picks on the host, since those transforms are host-side. `poot-serve` runs the driver in one scheduling loop that admits requests into
 slots and fits the KV cache to the device ([Continuous batching](../serve/continuous-batching.md)).
 
+## Failure handling
+
+A device fault is a typed error on every backend, and it never aborts the process. On ROCm a fault
+reaches the context through the HSA queue error callback and the system event handler; on PTX it is a
+sticky CUDA error; on wgpu it is the device-lost callback. The call that observes it returns a
+device-lost error, the context is poisoned, and every later call is refused as poisoned without touching
+the device. Once a device cannot clean up after a failed step, the engine itself is poisoned and refuses
+all work.
+
+Every wait for the device is bounded by a configured timeout (600 seconds by default) on ROCm, wgpu and
+raw Vulkan. A wait that outlasts it fails with a typed timeout error and poisons the context, so a hung
+device surfaces as an error instead of a hang.
+
+A step that fails after it replayed leaves the executable needing a complete state reset: a kernel
+assert, a rejected validation packet and a device failure all mark it, and `step` refuses until
+`reset_state` clears it.
+
 ## Verification
 
 `poot-eval` is the CPU reference: one evaluation walk, `poot_eval::eval(&graph, &inputs, EvalOptions)`,

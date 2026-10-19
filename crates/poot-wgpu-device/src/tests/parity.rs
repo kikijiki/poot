@@ -7,19 +7,24 @@ use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::Executor;
 use poot_executor::{Device, Engine};
 use poot_executor_parity::Fixture;
+use poot_runtime_common::DeviceBackend;
+use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::HostTensor;
+
+fn wgpu() -> Option<WgpuDevice> {
+    open_or_skip(DeviceBackend::Wgpu, WgpuDevice::new())
+}
 
 fn target(device: &WgpuDevice) -> poot_graph_plan::Target {
     device.target()
 }
 
 /// Every fixture against its oracle on an engine over the device. `before` runs on each fixture with the
-/// target it will be compiled for. `None` when no adapter opens.
-fn run_each(
-    fixtures: &[Fixture],
-    before: impl Fn(&Fixture, poot_graph_plan::Target),
-) -> Option<()> {
-    let device = WgpuDevice::new().ok()?;
+/// target it will be compiled for. Skips when no adapter opens (a failure when wgpu is required).
+fn run_each(fixtures: &[Fixture], before: impl Fn(&Fixture, poot_graph_plan::Target)) {
+    let Some(device) = wgpu() else {
+        return;
+    };
     let t = target(&device);
     let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
     for fixture in fixtures {
@@ -28,7 +33,6 @@ fn run_each(
         poot_executor_parity::run_parity(exec.as_mut(), t, fixture, &mut oracle)
             .unwrap_or_else(|e| panic!("{e}"));
     }
-    Some(())
 }
 
 /// Card 645 SC-001: `matmul(x, transpose(w))` over an F32 `[N, K]` weight, at `M = 1` (the decode GEMV), `4` and `33`
@@ -38,14 +42,10 @@ fn run_each(
 /// Mutation: in the F32 GEMV body read B as `[K, N]` (`gemv_lds`, `WeightLayout::Nk` arm); the `M = 1` row goes red.
 #[test]
 fn checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
-    if run_each(
+    run_each(
         &poot_executor_parity::checkpoint_projection_fixtures(),
         |_, _| {},
-    )
-    .is_none()
-    {
-        eprintln!("skip: no wgpu adapter");
-    }
+    );
 }
 
 /// Card 736: the ALiBi attention BLOOM and MPT trace (`alibi_mask_from_pos` over a
@@ -56,8 +56,7 @@ fn checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
 /// odd-index series of the second half); the reference comparison goes red.
 #[test]
 fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -80,14 +79,10 @@ fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_wgpu() {
 /// red.
 #[test]
 fn f16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
-    if run_each(
+    run_each(
         &poot_executor_parity::checkpoint_projection_f16_fixtures(),
         poot_executor_parity::assert_one_dense_contraction,
-    )
-    .is_none()
-    {
-        eprintln!("skip: no wgpu adapter");
-    }
+    );
 }
 
 /// Card 1024: `matmul(x, transpose(w))` over a BF16 `[N, K]` const, at `M = 1` (the decode GEMV), `4` and `33`
@@ -98,14 +93,10 @@ fn f16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
 /// rows go red.
 #[test]
 fn bf16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
-    if run_each(
+    run_each(
         &poot_executor_parity::checkpoint_projection_bf16_fixtures(),
         poot_executor_parity::assert_one_dense_contraction,
-    )
-    .is_none()
-    {
-        eprintln!("skip: no wgpu adapter");
-    }
+    );
 }
 
 /// POOT-1048: a grouped projection `matmul(x, transpose(reshape(w, [G, N, K]), [0, 2, 1]))` over a BF16 `[G * N, K]`
@@ -117,14 +108,10 @@ fn bf16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {
 /// rows go red.
 #[test]
 fn bf16_grouped_projection_matches_the_oracle_on_wgpu() {
-    if run_each(
+    run_each(
         &poot_executor_parity::grouped_projection_bf16_fixtures(),
         poot_executor_parity::assert_one_grouped_dense_contraction,
-    )
-    .is_none()
-    {
-        eprintln!("skip: no wgpu adapter");
-    }
+    );
 }
 
 /// Card 546b: `run_once` is the executor-contract replacement for the deleted pre-contract `run`
@@ -140,8 +127,7 @@ fn run_once_matches_a_hand_computed_elementwise_add() {
     use poot_graph_ir::op::BinOp;
     use poot_graph_ir::{Slot, TensorType};
 
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -182,8 +168,7 @@ fn run_once_matches_a_hand_computed_elementwise_add() {
 /// (`poot-kernelgen`'s `fused.rs`), with a fresh `POOT_KERNEL_CACHE_DIR`; every row goes red.
 #[test]
 fn select_is_bitwise_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -197,8 +182,7 @@ fn select_is_bitwise_on_wgpu() {
 /// (`planner/elementwise.rs`); the compile succeeds and this row goes red.
 #[test]
 fn two_byte_select_is_refused_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     poot_executor_parity::select::assert_two_byte_select_is_refused(target(&device));
@@ -212,8 +196,7 @@ fn two_byte_select_is_refused_on_wgpu() {
 /// asset with a fresh `POOT_KERNEL_CACHE_DIR`), or change its shift; this row goes red.
 #[test]
 fn bf16_const_cast_is_bit_exact_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -239,8 +222,7 @@ fn bf16_const_cast_is_bit_exact_on_wgpu() {
 /// (`iq3_s_blocks_decode_to_the_llamacpp_reference_bit_for_bit`) pin the descriptor.
 #[test]
 fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -268,8 +250,7 @@ fn packed_linears_and_the_indexed_expert_contraction_match_the_oracle_on_wgpu() 
 /// guarded by `served_qwen4exp_*`, not by this row.
 #[test]
 fn state_pool_rows_reset_independently_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -289,8 +270,7 @@ fn state_pool_rows_reset_independently_on_wgpu() {
 /// goes red on every step.
 #[test]
 fn split_kv_decode_matches_the_oracle_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -307,8 +287,7 @@ fn split_kv_decode_matches_the_oracle_on_wgpu() {
 /// names (`read[b * lk + t]` becomes `t` in `KeyRows::Paged`); both steps go red against the oracle.
 #[test]
 fn paged_attention_reads_the_pools_in_place_and_matches_the_oracle_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -321,8 +300,7 @@ fn paged_attention_reads_the_pools_in_place_and_matches_the_oracle_on_wgpu() {
 /// replays the captured two-launch plan, and every step's output equals the first pass's bit for bit.
 #[test]
 fn split_kv_decode_replay_equals_the_recording_step_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -349,8 +327,7 @@ fn split_kv_decode_replay_equals_the_recording_step_on_wgpu() {
 /// rows whose maximum sits in the last chunk go red.
 #[test]
 fn greedy_sample_token_is_exact_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -362,8 +339,7 @@ fn greedy_sample_token_is_exact_on_wgpu() {
 /// while all of them stay loaded and alternate.
 #[test]
 fn executables_over_one_graph_and_different_data_each_compute_their_own_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -382,8 +358,7 @@ fn executables_over_one_graph_and_different_data_each_compute_their_own_on_wgpu(
 /// ascending by block); the ties case goes red.
 #[test]
 fn block_top_k_selects_what_the_plain_selection_selects_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);
@@ -406,8 +381,7 @@ fn block_top_k_selects_what_the_plain_selection_selects_on_wgpu() {
 /// block that is not their own and the first case goes red.
 #[test]
 fn selected_attention_reads_exactly_the_selected_blocks_on_wgpu() {
-    let Ok(device) = WgpuDevice::new() else {
-        eprintln!("skip: no wgpu adapter");
+    let Some(device) = wgpu() else {
         return;
     };
     let t = target(&device);

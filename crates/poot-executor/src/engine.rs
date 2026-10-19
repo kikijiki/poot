@@ -2161,7 +2161,7 @@ impl<D: Device> Engine<D> {
         stage_idx: usize,
         walk_recording: bool,
         seams: &mut dyn StageSeams<D>,
-    ) -> Result<Option<D::Recording>, ExecError> {
+    ) -> Result<D::Recording, ExecError> {
         self.check_not_poisoned()?;
         let target = self.target_id();
         let error = device_error(target);
@@ -2272,7 +2272,7 @@ impl<D: Device> Engine<D> {
                 .and_then(Option::as_mut)
                 .ok_or(LoadError::UnknownHandle)?;
             for (stage, recording) in e.stages.iter_mut().zip(recorded) {
-                stage.recording = recording;
+                stage.recording = Some(recording);
                 stage.recordings += 1;
             }
         }
@@ -2516,10 +2516,11 @@ impl<D: Device> Engine<D> {
         let error = device_error(target);
         let sync_t0 = Instant::now();
         if let Err(err) = self.device.synchronize() {
-            // A kernel-assert fault surfaces here (Z10): not a device-level failure, so it does not
-            // poison the engine or mark the executable NeedsReset - the device itself is in a
-            // consistent, reusable state, the program result is simply faulted.
+            // A kernel-assert fault surfaces here (Z10): the device itself is in a consistent,
+            // reusable state, so the engine is not poisoned. The replay already committed state
+            // before the trap, so the executable needs a reset like any other failed step.
             if let Some((kernel, code)) = self.device.classify_fault(&err) {
+                self.mark_needs_reset(exe);
                 return Err(ExecError::Fault { kernel, code });
             }
             // CR30: a non-fault synchronize failure (e.g. a device timeout) can
@@ -2533,7 +2534,11 @@ impl<D: Device> Engine<D> {
         // whatever `unload` deferred into `pending_release` - has completed. Safe to finally drop.
         self.pending_release.clear();
         self.residency.retain(|_, upload| upload.strong_count() > 0);
-        self.check_validation(exe, entry.index())?;
+        if let Err(rejected) = self.check_validation(exe, entry.index()) {
+            // The rejected step's carried state was already committed; it is not steppable.
+            self.mark_needs_reset(exe);
+            return Err(rejected);
+        }
         Ok(wait_dur)
     }
 
@@ -2821,8 +2826,7 @@ impl<D: Device> Engine<D> {
         stage_idx: usize,
         seams: &mut dyn StageSeams<D>,
     ) -> Result<D::Recording, ExecError> {
-        let recording = self.run_transaction(exe, entry.index(), stage_idx, false, seams)?;
-        Ok(recording.expect("every device finishes a recording"))
+        self.run_transaction(exe, entry.index(), stage_idx, false, seams)
     }
 
     /// Publish one recording per stage of `entry`, in stage order.
@@ -3316,8 +3320,8 @@ mod kernel_identity_tests {
         fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn finish(&mut self) -> Result<Option<()>, std::convert::Infallible> {
-            Ok(None)
+        fn finish(&mut self) -> Result<(), std::convert::Infallible> {
+            Ok(())
         }
         fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
@@ -3556,8 +3560,8 @@ mod arena_slot_alloc_tests {
         fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn finish(&mut self) -> Result<Option<()>, std::convert::Infallible> {
-            Ok(None)
+        fn finish(&mut self) -> Result<(), std::convert::Infallible> {
+            Ok(())
         }
         fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
@@ -3686,8 +3690,8 @@ mod f16_packed_weight_upload_tests {
         fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn finish(&mut self) -> Result<Option<()>, std::convert::Infallible> {
-            Ok(None)
+        fn finish(&mut self) -> Result<(), std::convert::Infallible> {
+            Ok(())
         }
         fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
             Ok(())
@@ -4140,8 +4144,8 @@ mod weight_source_tests {
         fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), std::convert::Infallible> {
             Ok(())
         }
-        fn finish(&mut self) -> Result<Option<()>, std::convert::Infallible> {
-            Ok(Some(()))
+        fn finish(&mut self) -> Result<(), std::convert::Infallible> {
+            Ok(())
         }
         fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {
             if let Some(log) = &self.log {
@@ -5662,8 +5666,8 @@ mod weight_source_tests {
         fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), WriteFault> {
             Ok(())
         }
-        fn finish(&mut self) -> Result<Option<()>, WriteFault> {
-            Ok(Some(()))
+        fn finish(&mut self) -> Result<(), WriteFault> {
+            Ok(())
         }
         fn replay(&mut self, _recording: &()) -> Result<(), WriteFault> {
             Ok(())
@@ -5902,8 +5906,8 @@ mod weight_source_tests {
         fn copy(&mut self, _src: &Held, _dst: &Held) -> Result<(), Fault> {
             Ok(())
         }
-        fn finish(&mut self) -> Result<Option<()>, Fault> {
-            Ok(Some(()))
+        fn finish(&mut self) -> Result<(), Fault> {
+            Ok(())
         }
         fn replay(&mut self, _recording: &()) -> Result<(), Fault> {
             if self.fail_replay.load(std::sync::atomic::Ordering::Relaxed) {
@@ -6369,8 +6373,8 @@ mod aie_engine_tests {
         fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn finish(&mut self) -> Result<Option<()>, Self::Error> {
-            Ok(Some(()))
+        fn finish(&mut self) -> Result<(), Self::Error> {
+            Ok(())
         }
         fn replay(&mut self, _recording: &()) -> Result<(), Self::Error> {
             Ok(())
@@ -6728,8 +6732,8 @@ mod vpu_engine_tests {
         fn copy(&mut self, _src: &usize, _dst: &usize) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn finish(&mut self) -> Result<Option<()>, Self::Error> {
-            Ok(Some(()))
+        fn finish(&mut self) -> Result<(), Self::Error> {
+            Ok(())
         }
         fn replay(&mut self, _recording: &()) -> Result<(), Self::Error> {
             Ok(())

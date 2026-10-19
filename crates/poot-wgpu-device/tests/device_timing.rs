@@ -29,7 +29,7 @@ fn timed_wgpu_device_reads_a_nonzero_device_time_for_a_known_kernel() {
         return;
     };
     if !device.has_device_timestamps() {
-        eprintln!("skip: the adapter has no TIMESTAMP_QUERY");
+        poot_runtime_common::device_skip::skip_unsupported(DeviceBackend::Wgpu, "TIMESTAMP_QUERY");
         return;
     }
     let target = device.target();

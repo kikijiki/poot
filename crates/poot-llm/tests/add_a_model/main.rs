@@ -14,8 +14,11 @@
 
 mod driver_is_family_free;
 mod family;
+mod no_model_type_reads;
 mod tagged;
 mod tagged_rows;
+mod vlm;
+mod vlm_rows;
 
 use std::cell::Cell;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -196,7 +199,10 @@ fn oracle_tokens(
 }
 
 fn fixture_model(fixture: &Fixture) -> Box<dyn Model> {
-    registry().build(&fixture.raw(), &fixture.store).unwrap()
+    registry()
+        .build(&fixture.raw(), &fixture.store)
+        .unwrap()
+        .model
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -252,10 +258,11 @@ fn the_fixture_family_registers_loads_and_compiles_for_every_reference_target() 
         ),
     ];
     let options = CompileOptions::new(CompileLimits::STANDARD);
-    let formats = WeightFormats::from_weight_map(model.weights());
+    let formats = WeightFormats::from_weight_map(model.model.weights());
     for (name, target) in &targets {
         for (step, tokens) in [("prefill", 4), ("decode", 1)] {
             let graph = model
+                .model
                 .trace(
                     &StepSpec::step(shape(tokens)),
                     poot_graph_ir::TraceLimits::for_tests(),
@@ -417,8 +424,8 @@ impl Device for FakeDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())

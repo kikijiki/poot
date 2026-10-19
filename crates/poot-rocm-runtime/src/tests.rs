@@ -30,39 +30,32 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::hsaco::await_below_one;
+use crate::hsaco::{Awaited, await_below_one};
 
 #[test]
 fn hsa_queue_constants_match_the_public_abi() {
     assert_eq!(bindings::HSA_QUEUE_TYPE_MULTI, 0);
     assert_eq!(bindings::test_only::HSA_QUEUE_TYPE_SINGLE, 1);
-    assert_eq!(bindings::HSA_QUEUE_TYPE_COOPERATIVE, 2);
     assert_eq!(bindings::HSA_QUEUE_FEATURE_KERNEL_DISPATCH, 1);
 }
 
 #[test]
 fn queue_role_and_ring_provenance_are_independent_contracts() {
-    let cooperative = QueueCreationPlan::CooperativeGws;
+    let production = QueueCreationPlan::SystemMemoryRing;
+    assert_eq!(production.role(), QueueRole::SystemMemoryRing);
     assert_eq!(
-        queue_request(cooperative, 16_384),
-        QueueRequest {
-            queue_type: 2,
-            size: 16_384,
-        }
-    );
-    assert_eq!(cooperative.role(), QueueRole::Cooperative);
-    assert_eq!(
-        cooperative.provenance(),
-        QueueRingProvenance::CooperativeGwsSystemMemory
+        production.provenance(),
+        QueueRingProvenance::OrdinarySystemMemory
     );
 
     let receipt = QueueCreationPlan::PcieDeviceMemoryRingReceipt;
     assert_eq!(
-        queue_request(receipt, 16_384),
+        queue_request(16_384),
         QueueRequest {
             queue_type: 0,
             size: 16_384,
-        }
+        },
+        "both plans create an ordinary MULTI queue"
     );
     assert_eq!(receipt.role(), QueueRole::PcieDeviceRingReceipt);
     assert_eq!(
@@ -90,21 +83,23 @@ fn device_ring_provenance_fails_closed_unless_the_override_held_throughout() {
         ));
     }
 
-    for (override_at_load, override_now) in
-        [(false, false), (true, true), (true, false), (false, true)]
-    {
-        validate_queue_plan_provenance(
-            QueueCreationPlan::CooperativeGws,
-            override_at_load,
-            override_now,
-        )
-        .unwrap();
+    // The production ring is in system memory only while the device-memory switch is off.
+    let production = QueueCreationPlan::SystemMemoryRing;
+    validate_queue_plan_provenance(production, false, false).unwrap();
+    for (override_at_load, override_now) in [(true, true), (true, false), (false, true)] {
+        assert!(matches!(
+            validate_queue_plan_provenance(production, override_at_load, override_now),
+            Err(RocmError::QueueRingProvenanceConflict {
+                role: QueueRole::SystemMemoryRing,
+                ..
+            })
+        ));
     }
 }
 
 #[test]
 fn returned_queue_contract_is_validated_before_use() {
-    let request = queue_request(QueueCreationPlan::PcieDeviceMemoryRingReceipt, 16_384);
+    let request = queue_request(16_384);
     validate_created_queue(
         request,
         QueueProperties {
@@ -1660,8 +1655,9 @@ fn completion_wait_policy_spins_before_it_blocks() {
             if polls < 4 { 1 } else { 0 }
         },
         || panic!("a signal that dropped inside the spin window must not reach the blocked wait"),
+        || false,
     );
-    assert!(done);
+    assert_eq!(done, Awaited::Completed);
     assert_eq!(polls, 4);
 
     // Past the window (zero here) the blocked wait is used, and its value decides.
@@ -1674,8 +1670,9 @@ fn completion_wait_policy_spins_before_it_blocks() {
             blocked_calls += 1;
             if blocked_calls < 3 { 1 } else { 0 }
         },
+        || false,
     );
-    assert!(done);
+    assert_eq!(done, Awaited::Completed);
     assert_eq!(blocked_calls, 3);
 }
 
@@ -1698,8 +1695,9 @@ fn completion_wait_policy_times_out_on_a_signal_that_never_drops() {
             std::thread::sleep(std::time::Duration::from_millis(1));
             1
         },
+        || false,
     );
-    assert!(!done);
+    assert_eq!(done, Awaited::TimedOut);
     assert!(
         blocked_calls >= 1,
         "the blocked wait must run after the spin window"
@@ -1711,8 +1709,34 @@ fn completion_wait_policy_times_out_on_a_signal_that_never_drops() {
         std::time::Duration::from_secs(60),
         || panic!("a zero timeout must not spin"),
         || 1,
+        || false,
     );
-    assert!(!done);
+    assert_eq!(done, Awaited::TimedOut);
+}
+
+/// A wait on a signal the device will never drop ends the moment the device reports a fault, long
+/// before the timeout. Mutation: drop the `device_lost` checks from `await_below_one`; the wait runs
+/// to the 60 s timeout and reports `TimedOut`.
+#[test]
+fn completion_wait_policy_stops_at_a_reported_device_fault() {
+    let start = std::time::Instant::now();
+    for window in [
+        std::time::Duration::from_secs(60),
+        std::time::Duration::ZERO,
+    ] {
+        let done = await_below_one(
+            std::time::Duration::from_secs(60),
+            window,
+            || 1,
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                1
+            },
+            || true,
+        );
+        assert_eq!(done, Awaited::DeviceLost);
+    }
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
 }
 
 /// Card 252 round 8: logs this box's `HSA_AGENT_INFO_QUEUE_MAX_SIZE` and whether
@@ -1994,17 +2018,17 @@ fn ring_writer_device_store_fence_issues_the_architecture_fence() {
 }
 
 /// The publication contract each queue-creation plan hands the queue it creates, through the same
-/// `publication_facts` and `QueuePublication::validate` that queue construction runs. The cooperative
-/// GWS plan's ring is system memory (host-coherent, no fence); the receipt-only plan's is device memory
+/// `publication_facts` and `QueuePublication::validate` that queue construction runs. The production
+/// plan's ring is system memory (host-coherent, no fence); the receipt-only plan's is device memory
 /// over PCIe, which on x86 is the store-fence contract. Mutation: `publication_facts` answers the device
-/// ring for `CooperativeGws`, or system memory for the receipt plan; both rows go red.
+/// ring for `SystemMemoryRing`, or system memory for the receipt plan; both rows go red.
 #[test]
 fn each_creation_plan_publishes_through_its_own_ring_contract() {
-    let gws = QueueCreationPlan::CooperativeGws.publication_facts();
+    let gws = QueueCreationPlan::SystemMemoryRing.publication_facts();
     assert_eq!(
         gws,
         (Some(QueueRingMemory::HostCoherent), None),
-        "the cooperative GWS creator has explicit system-memory ring provenance"
+        "the production creator has system-memory ring provenance"
     );
     let validated =
         publication::QueuePublication::validate(gws.0, gws.1, QueueHostTarget::Other("test-host"))
@@ -2870,4 +2894,122 @@ fn write_host_bytes(
     ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
         out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
     })
+}
+
+/// Dispatch the real `add` fixture with an output pointer into a page no allocation maps, so the first
+/// store takes a GPU memory fault whatever else the process has mapped (a wild store through a mapped
+/// address would corrupt it instead of faulting). The pointer comes from a mock allocation whose owner
+/// frees nothing.
+fn dispatch_out_of_bounds_store(ctx: &RocmContext) -> Result<(), RocmError> {
+    const UNMAPPED: usize = 0x0000_1000_0000_0000;
+    let body = poot_kernel_ir::fixtures::add_kernel();
+    let (module, compiled) = compile_and_load(ctx, "add", &body);
+    let kernel = ctx
+        .lookup_kernel(&module, compiled.entry_point())
+        .expect("lookup add");
+    let a = ctx
+        .upload_f32(&[1.0; 4], BufferRole::Input)
+        .expect("upload a");
+    let b = ctx
+        .upload_f32(&[1.0; 4], BufferRole::Input)
+        .expect("upload b");
+    let (owner, _events) = recording_owner(1);
+    let wild = mock_buffer(UNMAPPED, owner);
+    let kernarg = ctx
+        .bind_kernarg(&kernel, &[(&a, 4), (&b, 4), (&wild, 4)])
+        .expect("bind kernarg");
+    ctx.dispatch(
+        &kernel,
+        &kernarg,
+        &[ElementKind::F32, ElementKind::F32, ElementKind::F32],
+        (4, 1, 1),
+        (4, 1, 1),
+    )
+}
+
+/// SC-001 (memory fault half): a kernel that stores through an unmapped pointer takes a GPU memory
+/// fault. The process survives, the dispatch returns the typed `DeviceLost` with what the GPU
+/// reported, and every later call on the context is refused as poisoned. Mutation: skip
+/// `watch_agent_faults` in `new_inner`; ROCr aborts the process on the fault (red: SIGABRT, "Memory
+/// access fault by GPU node-1"). The queue-error half is
+/// `an_invalid_aql_packet_inactivates_the_queue_into_a_typed_fault`.
+#[test]
+fn an_out_of_bounds_store_is_a_typed_device_lost_and_poisons_the_context() {
+    let Some(ctx) = open_context_or_skip("an_out_of_bounds_store_is_a_typed_device_lost") else {
+        return;
+    };
+    let lost = dispatch_out_of_bounds_store(&ctx);
+    assert!(
+        matches!(
+            lost,
+            Err(RocmError::DeviceLost(DeviceFault::MemoryFault { .. }))
+        ),
+        "got {lost:?}"
+    );
+    assert!(ctx.is_poisoned());
+    let next = ctx.synchronize();
+    assert!(
+        matches!(next, Err(RocmError::ContextPoisoned { .. })),
+        "the step after a lost device must be refused as poisoned, got {next:?}"
+    );
+}
+
+/// The queue error callback ROCr calls for an inactivated queue records the status and poisons.
+/// Mutation: make `queue_error_callback` a no-op; the context stays healthy (red).
+#[test]
+fn the_queue_error_callback_records_the_fault_and_poisons() {
+    let mut leaks = TimeoutLeaks::default();
+    let data = leaks.arm_queue_callback();
+    assert!(!leaks.is_poisoned());
+    // SAFETY: `data` is the pointer `arm_queue_callback` produced and the queue is not real.
+    unsafe {
+        crate::queue::queue_error_callback(0x1009, std::ptr::null_mut(), data);
+    }
+    assert!(leaks.is_poisoned());
+    assert_eq!(
+        leaks.fault(),
+        Some(DeviceFault::QueueError(crate::HsaStatus { code: 0x1009 }))
+    );
+}
+
+/// SC-001 (queue error half): a malformed AQL packet (an undefined packet type) makes ROCr inactivate
+/// the queue and report `HSA_STATUS_ERROR_INVALID_PACKET_FORMAT` to the queue error callback. The
+/// process survives and the context records the fault and poisons. Mutation: pass `None` instead of
+/// `Some(queue_error_callback)` to `hsa_queue_create`; ROCr's default handler aborts the process
+/// (red: SIGABRT, "Queue at ... inactivated due to async error").
+#[test]
+fn an_invalid_aql_packet_inactivates_the_queue_into_a_typed_fault() {
+    let Some(ctx) = open_context_or_skip("an_invalid_aql_packet_inactivates_the_queue") else {
+        return;
+    };
+    // SAFETY: `ctx.queue` is the context's live queue; the packet slot is reserved with the write index
+    // before it is written, and the header is stored last, as the AQL protocol requires.
+    unsafe {
+        let layout = &*(ctx.queue as *const crate::queue::QueueLayout);
+        let index = (ctx.hsa.funcs.hsa_queue_add_write_index_acq_rel)(ctx.queue, 1);
+        let slot =
+            (layout.base_address as *mut u8).add((index % u64::from(layout.size)) as usize * 64);
+        std::ptr::write_bytes(slot, 0, 64);
+        // Packet type 7 is not an AQL packet type.
+        std::ptr::write_volatile(slot as *mut u16, 7);
+        (ctx.hsa.funcs.hsa_signal_store_release)(layout.doorbell_signal, index as i64);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let fault = loop {
+        if let Some(fault) = ctx.timeouts.fault() {
+            break fault;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queue error callback never fired"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(matches!(fault, DeviceFault::QueueError(_)), "got {fault:?}");
+    assert!(ctx.is_poisoned());
+    let next = ctx.synchronize();
+    assert!(
+        matches!(next, Err(RocmError::ContextPoisoned { .. })),
+        "got {next:?}"
+    );
 }

@@ -33,3 +33,5 @@ ComputePipeline
 SeqCst
 # The vendor's family name in prose; the code spells the family `minimax_m2` and `MiniMaxM2`.
 MiniMax
+# A ggml tensor type poot deliberately has no format for; the pages name it as an example of a refused type.
+Q8_K

@@ -55,6 +55,7 @@ fn driver_trace() -> Driver {
     let raw = RawConfig::HfJson {
         config: &fixture.config,
         generation: fixture.generation.as_ref(),
+        preprocessor: None,
     };
     let model = registry.build(&raw, &fixture.store).unwrap();
     let shape = StepShape::new(
@@ -64,13 +65,14 @@ fn driver_trace() -> Driver {
     );
     Driver {
         graph: model
+            .model
             .trace(
                 &StepSpec::step(shape),
                 poot_graph_ir::TraceLimits::for_tests(),
             )
             .unwrap(),
         store: fixture.store,
-        map: model.weights().clone(),
+        map: model.model.weights().clone(),
     }
 }
 

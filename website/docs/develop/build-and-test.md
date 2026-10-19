@@ -45,15 +45,25 @@ just test-device-rocm      # poot-rocm-device resident probes and packed-serving
 just test-rocm-feature     # the tests that exist only under --features rocm, in release
 just test-device-ptx       # one PTX probe, on an NVIDIA machine
 just test-real-dims        # tests named *_real_dims, in release
-just test-optional         # the whole workspace; device tests skip without a device
+just test-checkpoint       # CPU rows over the small checkpoints in ~/models; a missing model fails
+just test-checkpoint-wgpu  # every real-checkpoint device row on wgpu (one per model family at least), device and models required
+just test-checkpoint-rocm  # the same rows on ROCm (also -ptx on an NVIDIA pod, and -vulkan)
+just test-checkpoint-large # rows that read a 20B+ checkpoint: a pod or host that holds them, never the dev box
+just test-real-dims-long   # the real-dimension rows that take minutes, in release
 just bench                 # both criterion benches (CPU decode, wgpu op dispatch)
 ```
 
 A test that loads a checkpoint finds it only through `POOT_MODELS_DIR`, the directory that holds the models; test code
-has no default. With the variable unset the test skips and prints the model's name, and with `POOT_REQUIRE_MODELS=1` an
-unset variable fails the test naming it. A model missing from the directory always skips. The checkpoint lanes
-(`just test-rocm-feature` and `just test-optional`) set `POOT_MODELS_DIR` to `~/models` unless you export another
-directory, and `just test-rocm-feature` also sets `POOT_REQUIRE_MODELS=1`.
+has no default. Outside the checkpoint lanes an unset variable, or a model missing from the directory, skips the test
+and prints the model's name. With `POOT_REQUIRE_MODELS=1` either one fails the test, naming the variable or the model.
+The checkpoint lanes (`just test-checkpoint`, `just test-checkpoint-wgpu`, `just test-checkpoint-rocm` and the other checkpoint lanes, and
+`just test-rocm-feature`) set `POOT_MODELS_DIR` to `~/models` unless you export another directory, and set
+`POOT_REQUIRE_MODELS=1`, so a lane over a models directory that lacks a model fails instead of passing on skips.
+
+Each checkpoint lane runs its rows by exact name (an `#[ignore]`d row too): `scripts/required-checkpoint-cases.txt` for
+the CPU lanes, the `checkpoint-wgpu.txt`, `checkpoint-rocm.txt`, `checkpoint-ptx.txt` and `checkpoint-vulkan.txt` lists in `scripts/required-device-cases/` for the device lanes, which also fail a row that
+skipped. The lists are hand-maintained. A `checkpoint` test or an `#[ignore]`d test that is in no lane's list, and a row
+that names no test, all fail `just test-lane-coverage`; an ignored test no lane runs is deleted.
 
 `scripts/test-model-free.sh` decides which packages the default lane covers. Its `gate_policy` names every
 workspace package and either gates it or excludes it with a reason, and the lane fails when a package is missing
@@ -62,7 +72,7 @@ the script generates from the test binaries: run `just test-model-free-inventory
 deleting a test. In most packages a test's class is derived (`model-free`, or `real-dims` for a test whose name ends
 in `_real_dims`). In packages that mix host tests with device or checkpoint tests (`poot-llm`, `poot-load`,
 `poot-models`, `poot-serve`, `pootc`, `poot-kernelgen` and the runtime crates) you choose `model-free`,
-`checkpoint` (loads a model; `just test-optional` runs it) or `device` (dispatches on a device) for each new test
+`checkpoint` (loads a model; a row of `scripts/required-checkpoint-cases.txt`, run by a `just test-checkpoint*` lane) or `device` (dispatches on a device) for each new test
 by reading it. `scripts/test-model-free.sh self-test` (also `just test-model-free-inventory`) checks the checker
 and the lane against known-bad inventories.
 

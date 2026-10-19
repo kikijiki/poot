@@ -77,4 +77,5 @@ fn bloom_f32_model() -> Box<dyn Model> {
     registry
         .build(&fixture.raw(), &store.build())
         .unwrap_or_else(|e| panic!("{e}"))
+        .model
 }

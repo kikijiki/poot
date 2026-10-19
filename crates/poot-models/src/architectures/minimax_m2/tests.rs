@@ -254,6 +254,7 @@ fn model_of(config: &serde_json::Value, store: &WeightStore) -> Box<dyn Model> {
     let raw = RawConfig::HfJson {
         config,
         generation: None,
+        preprocessor: None,
     };
     build(&ENTRY, &raw, store)
 }
@@ -341,7 +342,7 @@ fn a_finetune_like_config_builds_traces_and_matches_its_reference() {
     assert_matches_the_reference(&fx.config, &fx.store, &PROMPT);
     let registry = Registry::builtin().unwrap();
     let model = registry.build(&fx.raw(), &fx.store).unwrap();
-    assert_eq!(model.config().family, FAMILY);
+    assert_eq!(model.model.config().family, FAMILY);
 }
 
 /// SC-003: a store missing one required tensor, a router, its bias or one expert's projection
@@ -369,6 +370,7 @@ fn config_error_of(config: &serde_json::Value) -> (&'static str, ConfigReason) {
     let raw = RawConfig::HfJson {
         config,
         generation: None,
+        preprocessor: None,
     };
     match build_error(&raw) {
         ModelError::Config { field, reason, .. } => (field, reason),

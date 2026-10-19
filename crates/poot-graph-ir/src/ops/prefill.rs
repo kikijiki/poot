@@ -1,7 +1,6 @@
-use super::{
-    BinOp, Builder, BuilderError, DType, RedOp, Requirement, Scalar, Traced, UnOp, repeat_kv,
-    repeat_kv_tiled,
-};
+use super::{BinOp, Builder, BuilderError, DType, RedOp, Requirement, Scalar, Traced, UnOp};
+#[cfg(any(test, feature = "test-support"))]
+use super::{repeat_kv, repeat_kv_tiled};
 #[cfg(any(test, feature = "test-support"))]
 use super::{rope_partial, softcap};
 
@@ -200,6 +199,7 @@ fn mask_visibility(
 /// `mask[h,t,j] = prod_{j<i<=t} g_h[i]` (bounded in `[0,1]` for decay gates, so numerically stable).
 /// Per-channel gating (the GLA gate inside `D_k`) does not reduce to a scalar `(h,t,j)` mask and needs
 /// a chunked scan.
+#[cfg(any(test, feature = "test-support"))]
 pub fn linear_attention_prefill(
     b: &Builder,
     q: Traced,
@@ -243,6 +243,7 @@ pub fn linear_attention_prefill(
 /// `Neg`, `Sub` (the zero trick), and `Concat` (the top-right block is zero, so
 /// `out = concat_rows(concat_cols(A_inv, zeros), concat_cols(neg_DBA, D_inv))`). No new `OpKind`
 /// (FR-002/FR-003).
+#[cfg(any(test, feature = "test-support"))]
 pub fn unit_lower_triangular_inverse(b: &Builder, attn: Traced) -> Result<Traced, BuilderError> {
     let shape = b.aval(attn)?.shape;
     let rank = shape.len();
@@ -282,6 +283,7 @@ pub fn unit_lower_triangular_inverse(b: &Builder, attn: Traced) -> Result<Traced
 ///
 /// The first level is folded: `S_2 = I + P_1 @ I = I + P_1` (an `Add`, not a `MatMul`), and the last
 /// level's `P_C` is never needed, so both are skipped.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn ut_inverse_neumann_doubling(
     b: &Builder,
     attn: Traced,
@@ -324,6 +326,7 @@ pub(crate) fn ut_inverse_neumann_doubling(
 /// corners of a `[.., 2s, 2s]` block with zero off-diagonal blocks (`zeros = ident - ident`),
 /// assembled by two column-concats and one row-concat. `c` must be a power of two. ~`4*log2(c) + 4`
 /// eqns (28 at `c=64`).
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn identity_like(
     b: &Builder,
     like: Traced,
@@ -351,6 +354,7 @@ pub(crate) fn identity_like(
 /// [`unit_lower_triangular_inverse`]'s base case): slice one position of `x`, subtract it from
 /// itself, and [`Builder::broadcast`] the size-1 axis up to `pad`. Concat appends it after `x`. A
 /// no-op when `pad == 0`.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn zero_pad_seq(
     b: &Builder,
     x: Traced,
@@ -386,6 +390,7 @@ pub(crate) fn zero_pad_seq(
 /// giving exactly `0`) recover the correct local difference, which `gdn_prefill_chunked` relies on
 /// for its masked-diagonal and state-carry terms. This function only tightens the precision of `G_i`;
 /// `gdn_prefill_chunked` keeps its subtract-then-mask-then-exp-once structure.
+#[cfg(any(test, feature = "test-support"))]
 pub fn cumulative_log_decay_scan(
     b: &Builder,
     g: Traced,
@@ -456,6 +461,7 @@ pub fn cumulative_log_decay_scan(
 /// `k`/`v`/`beta` never contribute, zero `g` never changes cumulative decay). Returns
 /// `(o [1,H_v,L,D], s_out [1,H_v,D,D])`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn gdn_prefill_chunked(
     b: &Builder,
     q: Traced,           // [1,H_k,L,D] L2-normed, UNSCALED
@@ -577,6 +583,7 @@ pub fn gdn_prefill_chunked(
 /// `Decomposition` carry it; `crate::ScanLayout` names the rows). The chain is [`gdn_prefill_chunked`]
 /// itself with its triangular tables computed in-graph, so there is one semantic definition.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn scan_delta_rule_packed(
     b: &Builder,
     q: Traced,
@@ -603,6 +610,7 @@ pub fn scan_delta_rule_packed(
 }
 
 /// The lower triangle (`row >= col + shift`, as F32 ones) as `[1, 1, c, c]`, computed from `Iota`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn lower_triangle(b: &Builder, c: usize, shift: f32) -> Result<Traced, BuilderError> {
     let ramp = b.iota(c)?;
     let row = b.broadcast(b.reshape(ramp, vec![c, 1])?, vec![c, c])?;

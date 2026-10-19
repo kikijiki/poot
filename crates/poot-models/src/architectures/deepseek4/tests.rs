@@ -1001,6 +1001,7 @@ fn zero_checkpoint(config: serde_json::Value) -> Fixture {
     Fixture {
         config,
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }

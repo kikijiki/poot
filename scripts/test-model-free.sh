@@ -32,7 +32,7 @@ export POOT_MODEL_FREE_ACTIVE=$mode
 #             invocation (`run-isolated`, `just test-bench-runner`). It is bin-only and has no real-dims lane.
 #   reviewed  the package holds tests that need a device or a checkpoint next to host-only ones, so each test's
 #             class is chosen by hand in the inventory and a new test has no default class: model-free; checkpoint
-#             (loads a model, runs in `just test-optional`); or device (dispatches, and `just test-lane-coverage`
+#             (loads a model, a row of scripts/required-checkpoint-cases.txt); or device (dispatches, and `just test-lane-coverage`
 #             requires a device lane to select it). Nothing trusts that choice for devices: the lane runs with
 #             every device required and hidden, so a device test classed model-free fails the lane (see
 #             `lane_environment`).

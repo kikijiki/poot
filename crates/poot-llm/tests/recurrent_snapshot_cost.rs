@@ -78,9 +78,9 @@ fn mapped(family: FamilyKey) -> MappedModel {
     let entry = entry(family);
     let fixture = (entry.fixture)();
     let model = (entry.build)(&fixture.raw(), &fixture.store).unwrap();
-    let map = Arc::new(model.weights().clone());
+    let map = Arc::new(model.model.weights().clone());
     MappedModel {
-        model,
+        model: model.model,
         store: Arc::new(fixture.store),
         map,
     }
@@ -360,8 +360,8 @@ impl Device for CountingDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), CountingError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, CountingError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), CountingError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), CountingError> {
         Ok(())

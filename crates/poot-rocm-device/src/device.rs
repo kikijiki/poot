@@ -318,9 +318,9 @@ impl Device for RocmDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<RocmRecording>, RocmGpuError> {
+    fn finish(&mut self) -> Result<RocmRecording, RocmGpuError> {
         let aqls = self.open.take().expect("finish without begin");
-        Ok(Some(RocmRecording { aqls }))
+        Ok(RocmRecording { aqls })
     }
 
     fn begin_step(&mut self) -> Result<(), RocmGpuError> {

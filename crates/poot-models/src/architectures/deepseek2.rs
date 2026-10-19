@@ -48,7 +48,7 @@ use crate::model::{
 use crate::names::{
     ExpertNames, MoeLayers, MoeNames, NameRow, Presence, SharedNames, Source, family_weights_routed,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek2");
@@ -851,7 +851,7 @@ pub(crate) struct Deepseek {
     family: FamilyKey,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     build_family(V2, raw, store)
 }
 
@@ -860,7 +860,7 @@ pub(crate) fn build_family(
     kind: Kind,
     raw: &RawConfig<'_>,
     store: &WeightStore,
-) -> Result<Box<dyn Model>, ModelError> {
+) -> Result<ModelParts, ModelError> {
     let p = DeepseekConfig::from_raw(raw, kind)?;
     let low_rank = p.mla.q_rank().is_some();
     let hf = matches!(raw.source(), ConfigSource::HfModelType);
@@ -934,7 +934,7 @@ pub(crate) fn build_family(
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Deepseek {
+    Ok(ModelParts::new(Box::new(Deepseek {
         params: p,
         weights,
         stack,
@@ -942,7 +942,7 @@ pub(crate) fn build_family(
         config,
         schema,
         family: kind.family,
-    }))
+    })))
 }
 
 impl Model for Deepseek {
@@ -1467,6 +1467,7 @@ pub(crate) mod family_tests {
         let model = registry.build(&raw, &gguf_store).unwrap();
         assert!(
             model
+                .model
                 .weights()
                 .iter()
                 .all(|(id, _, _)| !matches!(id.role, WeightRole::Mla(MlaRole::KvB))),
@@ -1474,6 +1475,7 @@ pub(crate) mod family_tests {
         );
         assert!(
             model
+                .model
                 .weights()
                 .iter()
                 .any(|(id, _, _)| id.role == WeightRole::Mla(MlaRole::KB)),
@@ -1482,11 +1484,11 @@ pub(crate) mod family_tests {
         let reference_store = decoded(&fixture.store);
         let reference = build(entry, &fixture.raw(), &reference_store);
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &gguf_store, CAP, &prompt, 0, &[]);
+        let (got, state) = run_step(&*model.model, &gguf_store, CAP, &prompt, 0, &[]);
         let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
         close_all(&state, &want_state);
-        let (got, _) = run_step(&*model, &gguf_store, CAP, &[5], 4, &state);
+        let (got, _) = run_step(&*model.model, &gguf_store, CAP, &[5], 4, &state);
         let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }
@@ -1499,6 +1501,7 @@ pub(crate) mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match (entry.build)(&raw, &fixture.store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -1601,6 +1604,7 @@ pub(crate) mod family_tests {
                 &RawConfig::HfJson {
                     config: &config,
                     generation: None,
+                    preprocessor: None,
                 },
                 &fixture.store,
             );

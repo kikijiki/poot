@@ -78,10 +78,13 @@ pub(crate) trait ResourceDispatch: Send + Sync {
         submits: &[vk::SubmitInfo<'_>],
         fence: vk::Fence,
     ) -> Result<(), vk::Result>;
+    /// Wait for every fence, for at most `timeout`; a fence still unsignaled then is
+    /// `Err(vk::Result::TIMEOUT)`.
     unsafe fn wait_for_fences(
         &self,
         device: &ash::Device,
         fences: &[vk::Fence],
+        timeout: std::time::Duration,
     ) -> Result<(), vk::Result>;
     unsafe fn destroy_fence(&self, device: &ash::Device, fence: vk::Fence);
     unsafe fn destroy_descriptor_pool(&self, device: &ash::Device, pool: vk::DescriptorPool);
@@ -222,9 +225,11 @@ impl ResourceDispatch for AshResourceDispatch {
         &self,
         device: &ash::Device,
         fences: &[vk::Fence],
+        timeout: std::time::Duration,
     ) -> Result<(), vk::Result> {
+        let nanoseconds = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         // SAFETY: a pure forward: the caller upholds this trait method's contract, which is ash's.
-        unsafe { device.wait_for_fences(fences, true, u64::MAX) }
+        unsafe { device.wait_for_fences(fences, true, nanoseconds) }
     }
     unsafe fn destroy_fence(&self, device: &ash::Device, fence: vk::Fence) {
         // SAFETY: a pure forward: the caller upholds this trait method's contract, which is ash's.

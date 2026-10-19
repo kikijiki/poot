@@ -1,0 +1,8 @@
+# Required cases for `just test-checkpoint-vulkan`, one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py checkpoint-vulkan) fails the lane unless every case here ran and passed - a skip is
+# never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# Real-checkpoint device rows (checkpoint-vulkan), run by exact name with POOT_REQUIRE_MODELS=1 and the backend required.
+poot-llm::vulkan_generate	qwen2_5_0_5b_greedy_tokens_equal_the_recorded_literals_on_vulkan

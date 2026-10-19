@@ -38,7 +38,6 @@ fn load(
 #[test]
 fn rowsum_for_asset_matches_cpu_on_wgpu() {
     let Some(mut device) = wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let body = ImportedKernel::RowsumFor.body().clone();
@@ -78,10 +77,7 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
             work: rows as u64,
         })
         .unwrap();
-    let recording = device
-        .finish()
-        .unwrap()
-        .expect("a device always returns a recording");
+    let recording = device.finish().unwrap();
     device
         .replay(&recording)
         .expect("replay the rowsum_for dispatch");
@@ -104,7 +100,6 @@ fn rowsum_for_asset_matches_cpu_on_wgpu() {
 #[test]
 fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
     let Some(mut device) = wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let body = ImportedKernel::RmsnormDyn.body().clone();
@@ -175,10 +170,7 @@ fn rmsnorm_dyn_asset_matches_cpu_on_wgpu() {
             work: rows as u64,
         })
         .unwrap();
-    let recording = device
-        .finish()
-        .unwrap()
-        .expect("a device always returns a recording");
+    let recording = device.finish().unwrap();
     device
         .replay(&recording)
         .expect("replay the rmsnorm_dyn dispatch");

@@ -28,7 +28,7 @@ use crate::io::ModelSchema;
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM, GGUF_SANDWICH_NORMS};
 use crate::names::{HF_BASE, HF_QK_NORM, HF_SANDWICH_NORMS, family_weights, hf_base_shapes};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 /// The Gemma vocabulary's `<bos>` id, for a config that names none.
@@ -193,7 +193,7 @@ pub(crate) struct Gemma3 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = Gemma3Params::from_raw(raw)?;
     let tables: [&[_]; 3] = match raw.source() {
         ConfigSource::HfModelType => [HF_BASE, HF_QK_NORM, HF_SANDWICH_NORMS],
@@ -226,14 +226,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Gemma,
     };
-    Ok(Box::new(Gemma3 {
+    Ok(ModelParts::new(Box::new(Gemma3 {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Gemma3 {
@@ -347,6 +347,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -484,7 +485,8 @@ mod tests {
             build(
                 &RawConfig::HfJson {
                     config: &bad,
-                    generation: None
+                    generation: None,
+                    preprocessor: None
                 },
                 &fx.store
             ),
@@ -533,6 +535,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),

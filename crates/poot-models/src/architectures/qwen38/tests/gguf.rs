@@ -1166,6 +1166,7 @@ fn built_from_gguf(
     Registry::builtin()
         .expect("the builtin registry")
         .build(&RawConfig::Gguf(index), store)
+        .map(|parts| parts.model)
 }
 
 /// SC-006: the converted fixture has exactly the tensors, with exactly the shapes, the shape table

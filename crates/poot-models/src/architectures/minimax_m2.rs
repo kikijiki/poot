@@ -30,7 +30,7 @@ use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, Step
 use crate::names::{
     ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("minimax_m2");
@@ -182,7 +182,7 @@ pub(crate) struct MiniMaxM2 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = MiniMaxM2Config::from_raw(raw)?;
     let sparse = vec![true; p.layers];
     let weights = family_weights_routed(
@@ -222,14 +222,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(MiniMaxM2 {
+    Ok(ModelParts::new(Box::new(MiniMaxM2 {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for MiniMaxM2 {

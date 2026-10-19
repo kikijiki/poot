@@ -33,7 +33,7 @@ use poot_models::model::{
     FamilyKey, LogitRows, Model, ModelConfig, ModelError, ModelOutput, StepShape, StepSpec,
     TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{Backend, DeviceCaps};
@@ -115,6 +115,7 @@ fn sharpened(fixture: &Fixture, factor: f32) -> Fixture {
     Fixture {
         config: fixture.config.clone(),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }
@@ -158,8 +159,8 @@ struct Recurrentish {
     weights: WeightMap,
 }
 
-fn build_recurrent(_: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
-    Ok(Box::new(Recurrentish {
+fn build_recurrent(_: &RawConfig<'_>, _: &WeightStore) -> Result<ModelParts, ModelError> {
+    Ok(ModelParts::new(Box::new(Recurrentish {
         config: ModelConfig {
             family: RECURRENT,
             vocab: VOCAB,
@@ -177,7 +178,7 @@ fn build_recurrent(_: &RawConfig<'_>, _: &WeightStore) -> Result<Box<dyn Model>,
             )
             .build_for(RECURRENT)?,
         weights: WeightMap::default(),
-    }))
+    })))
 }
 
 fn recurrent_fixture() -> Fixture {
@@ -192,6 +193,7 @@ fn recurrent_fixture() -> Fixture {
             "eos_token_id": EOS,
         }),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }
@@ -319,7 +321,7 @@ impl Oracle {
     fn new(fixture: &Fixture, noise: f32) -> Self {
         let model = registry().build(&fixture.raw(), &fixture.store).unwrap();
         Self {
-            model,
+            model: model.model,
             store: fixture.store.clone(),
             noise,
         }
@@ -1089,8 +1091,8 @@ impl Device for FakeDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())

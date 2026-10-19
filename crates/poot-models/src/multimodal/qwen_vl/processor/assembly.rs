@@ -1,0 +1,695 @@
+use crate::multimodal::mrope::{
+    MropeGrid, MropePositionError, MropeProcessorFpsInput, MropeProcessorTimingError,
+    MropeSampledFramesPerSecond, MropeSecondsPerGridStep, MropeTemporalPatchSize, MropeVisualKind,
+};
+use std::mem::MaybeUninit;
+use std::sync::Arc;
+
+use poot_tensor::{DType, HostData, HostTensor};
+
+use super::MAX_VIDEO_FRAMES;
+use super::config::Qwen25VlImageProcessorConfig;
+use super::preprocess::{Qwen25VlTemporalLayoutError, qwen25_vl_temporal_layout};
+use crate::multimodal::qwen_vl::media::Qwen25VlProcessorMedia;
+
+/// Ordered Qwen2.5-VL image processor output, concatenated in processor item order.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Qwen25VlProcessedImages {
+    /// Patches of every image, `[rows, feature_width]` (`feature_width = channels * temporal_patch_size * patch_size^2`), images in order.
+    pub pixel_values: HostTensor,
+    /// One `[temporal, height, width]` patch grid per image, in the order of the rows.
+    pub grids: Vec<MropeGrid>,
+}
+
+impl Qwen25VlProcessedImages {
+    /// Borrow this batch as the image-only portion of the existing processed-media handoff.
+    pub(crate) fn processor_media(&self) -> Qwen25VlProcessorMedia<'_> {
+        Qwen25VlProcessorMedia {
+            pixel_values: Some(&self.pixel_values),
+            image_grids: &self.grids,
+            pixel_values_videos: None,
+            video_grids: &[],
+        }
+    }
+}
+
+/// Processor-compatible output for one ordered set of caller-sampled decoded video frames.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Qwen25VlProcessedVideo {
+    /// This video's patches, `[rows, feature_width]`, after temporal padding.
+    pub pixel_values_videos: HostTensor,
+    /// The video's patch grid.
+    pub grid: MropeGrid,
+    /// The frame rate the frames were sampled at, as the processor reports it.
+    pub sampled_frames_per_second: MropeSampledFramesPerSecond,
+    /// Seconds one temporal grid step spans, `temporal_patch_size / sampled_frames_per_second`.
+    pub seconds_per_grid_step: MropeSecondsPerGridStep,
+    /// Frames merged into one temporal patch.
+    pub temporal_patch_size: MropeTemporalPatchSize,
+    /// Frames the sampler selected.
+    pub sampled_frame_count: usize,
+    /// Frames after repeating the last one up to a multiple of `temporal_patch_size`.
+    pub padded_frame_count: usize,
+}
+
+impl Qwen25VlProcessedVideo {
+    /// Borrow this result as the video-only portion of the existing processed-media handoff.
+    pub(crate) fn processor_media(&self) -> Qwen25VlProcessorMedia<'_> {
+        Qwen25VlProcessorMedia {
+            pixel_values: None,
+            image_grids: &[],
+            pixel_values_videos: Some(&self.pixel_values_videos),
+            video_grids: std::slice::from_ref(&self.grid),
+        }
+    }
+}
+
+/// Owned Qwen2.5-VL processor output assembled from already-processed media.
+///
+/// Images and videos stay separate tensors; their cross-kind order is carried only by the rendered
+/// prompt and marker-span validation.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Qwen25VlProcessedMedia {
+    /// Patches of every image, `[rows, feature_width]`; `None` when the request has no image.
+    pub pixel_values: Option<HostTensor>,
+    /// One patch grid per image, in the order of the rows of `pixel_values`.
+    pub image_grids: Vec<MropeGrid>,
+    /// Patches of every video concatenated in video order; `None` when the request has no video.
+    pub pixel_values_videos: Option<HostTensor>,
+    /// One patch grid per video, in the order of the rows of `pixel_values_videos`.
+    pub video_grids: Vec<MropeGrid>,
+    pub(crate) temporal_patch_size: MropeTemporalPatchSize,
+    pub(crate) sampled_frames_per_second: Vec<f64>,
+}
+
+impl Qwen25VlProcessedMedia {
+    /// Borrow the owned per-kind tensors and grids through the existing processor-media handoff.
+    pub(crate) fn processor_media(&self) -> Qwen25VlProcessorMedia<'_> {
+        Qwen25VlProcessorMedia {
+            pixel_values: self.pixel_values.as_ref(),
+            image_grids: &self.image_grids,
+            pixel_values_videos: self.pixel_values_videos.as_ref(),
+            video_grids: &self.video_grids,
+        }
+    }
+
+    /// Borrow the retained per-video sampled FPS values through the existing timing-input shape.
+    pub(crate) fn processor_fps_input(&self) -> MropeProcessorFpsInput<'_> {
+        MropeProcessorFpsInput::PerVideo(&self.sampled_frames_per_second)
+    }
+}
+
+/// Why already-processed images and videos do not assemble into one processor output.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum Qwen25VlProcessedMediaAssemblyError {
+    /// The processor's feature width overflows `usize`.
+    #[error("Qwen2.5-VL processed-media feature width overflows usize")]
+    FeatureWidthOverflow,
+    /// The image batch's tensor and grids are inconsistent.
+    #[error("invalid Qwen2.5-VL processed image batch: {0}")]
+    ImageMedia(#[source] crate::multimodal::qwen_vl::media::Qwen25VlProcessorMediaError),
+    /// The image tensor's feature width is not the one the processor config implies.
+    #[error(
+        "Qwen2.5-VL processed image feature width is {actual}; processor config requires {expected}"
+    )]
+    ImageFeatureWidth {
+        /// `channels * temporal_patch_size * patch_size^2` from the config.
+        expected: usize,
+        /// The tensor's second dimension.
+        actual: usize,
+    },
+    /// An image grid is not a valid patch grid.
+    #[error("invalid Qwen2.5-VL processed image grid {index}: {source}")]
+    ImageGrid {
+        /// Index of the image grid among the images.
+        index: usize,
+        /// Why the grid is refused.
+        #[source]
+        source: MropePositionError,
+    },
+    /// An image grid has a temporal dimension other than one.
+    #[error("Qwen2.5-VL processed image grid {index} has temporal dimension {actual}; expected 1")]
+    ImageGridTemporal {
+        /// Index of the image grid among the images.
+        index: usize,
+        /// The grid's temporal dimension.
+        actual: usize,
+    },
+    /// A video's tensor and grid are inconsistent.
+    #[error("invalid Qwen2.5-VL processed video {index}: {source}")]
+    VideoMedia {
+        /// Index of the video among the videos.
+        index: usize,
+        /// What is inconsistent.
+        #[source]
+        source: crate::multimodal::qwen_vl::media::Qwen25VlProcessorMediaError,
+    },
+    /// A video tensor's feature width is not the one the processor config implies.
+    #[error(
+        "Qwen2.5-VL processed video {index} feature width is {actual}; processor config requires {expected}"
+    )]
+    VideoFeatureWidth {
+        /// Index of the video among the videos.
+        index: usize,
+        /// `channels * temporal_patch_size * patch_size^2` from the config.
+        expected: usize,
+        /// The tensor's second dimension.
+        actual: usize,
+    },
+    /// A video was processed with a different temporal patch size than the config's.
+    #[error(
+        "Qwen2.5-VL processed video {index} temporal patch size is {actual}; processor config requires {expected}"
+    )]
+    VideoTemporalPatchSize {
+        /// Index of the video among the videos.
+        index: usize,
+        /// The config's temporal patch size.
+        expected: usize,
+        /// The video's temporal patch size.
+        actual: usize,
+    },
+    /// A video has no sampled frame.
+    #[error("Qwen2.5-VL processed video {index} has no sampled frames")]
+    VideoEmptySampledFrames {
+        /// Index of the video among the videos.
+        index: usize,
+    },
+    /// A video has more sampled frames than the cap.
+    #[error(
+        "Qwen2.5-VL processed video {index} has {actual} sampled frames, exceeding the {limit}-frame cap"
+    )]
+    VideoTooManySampledFrames {
+        /// Index of the video among the videos.
+        index: usize,
+        /// The video's sampled frame count.
+        actual: usize,
+        /// The cap, `MAX_VIDEO_FRAMES`.
+        limit: usize,
+    },
+    /// Padding a video's frame count to a temporal patch multiple overflows `usize`.
+    #[error("Qwen2.5-VL processed video {index} padded frame count overflows usize")]
+    VideoPaddedFrameCountOverflow {
+        /// Index of the video among the videos.
+        index: usize,
+    },
+    /// A video's padded frame count is not a multiple of its temporal patch size, or is smaller than its sampled count.
+    #[error(
+        "Qwen2.5-VL processed video {index} sampled count {sampled_frame_count} with temporal patch size {temporal_patch_size} pads to incompatible count {padded_frame_count}"
+    )]
+    VideoIncompatibleTemporalPadding {
+        /// Index of the video among the videos.
+        index: usize,
+        /// Frames the sampler selected.
+        sampled_frame_count: usize,
+        /// Frames merged into one temporal patch.
+        temporal_patch_size: usize,
+        /// The padded frame count found.
+        padded_frame_count: usize,
+    },
+    /// A video's padded frame count exceeds the frame cap.
+    #[error(
+        "Qwen2.5-VL processed video {index} has {sampled_frame_count} sampled frames and derived padded count {padded_frame_count}, exceeding the {limit}-frame cap"
+    )]
+    VideoTooManyPaddedFrames {
+        /// Index of the video among the videos.
+        index: usize,
+        /// Frames the sampler selected.
+        sampled_frame_count: usize,
+        /// The padded frame count derived from it.
+        padded_frame_count: usize,
+        /// The cap, `MAX_VIDEO_FRAMES`.
+        limit: usize,
+    },
+    /// A video records a padded frame count that differs from the one its sampled count and temporal patch size give.
+    #[error(
+        "Qwen2.5-VL processed video {index} records padded frame count {actual}; sampled count and temporal patch size require {expected}"
+    )]
+    VideoPaddedFrameCount {
+        /// Index of the video among the videos.
+        index: usize,
+        /// The padded frame count derived.
+        expected: usize,
+        /// The padded frame count the video records.
+        actual: usize,
+    },
+    /// A video's grid is not a valid patch grid.
+    #[error("invalid Qwen2.5-VL processed video grid {index}: {source}")]
+    VideoGrid {
+        /// Index of the video among the videos.
+        index: usize,
+        /// Why the grid is refused.
+        #[source]
+        source: MropePositionError,
+    },
+    /// A video grid's temporal dimension differs from the padded frame count over the temporal patch size.
+    #[error(
+        "Qwen2.5-VL processed video {index} grid temporal dimension is {actual}; padded frame count requires {expected}"
+    )]
+    VideoGridTemporal {
+        /// Index of the video among the videos.
+        index: usize,
+        /// The temporal dimension the padded frame count requires.
+        expected: usize,
+        /// The grid's temporal dimension.
+        actual: usize,
+    },
+    /// A video's frame rate and temporal patch size do not form valid timing.
+    #[error("validate Qwen2.5-VL processed video {index} timing: {source}")]
+    VideoTiming {
+        /// Index of the video among the videos.
+        index: usize,
+        /// Why the timing is refused.
+        #[source]
+        source: MropeProcessorTimingError,
+    },
+    /// A video's recorded seconds-per-grid-step is not the value its temporal patch size and sampled frame rate give.
+    #[error(
+        "Qwen2.5-VL processed video {index} seconds per grid step has bits {actual:#018x}; expected {expected:#018x} from temporal patch size and sampled FPS"
+    )]
+    VideoSecondsPerGridStep {
+        /// Index of the video among the videos.
+        index: usize,
+        /// IEEE-754 bits of the expected value.
+        expected: u64,
+        /// IEEE-754 bits of the recorded value.
+        actual: u64,
+    },
+    /// Summing the videos' rows overflows `usize`.
+    #[error("Qwen2.5-VL combined processed-video row count overflows usize at video {index}")]
+    VideoRowCountOverflow {
+        /// The video at which the sum overflowed.
+        index: usize,
+    },
+    /// The combined videos' element count overflows `usize`.
+    #[error("Qwen2.5-VL combined processed-video element count overflows usize")]
+    VideoElementCountOverflow,
+    /// The combined videos' byte size overflows `usize`.
+    #[error("Qwen2.5-VL combined processed-video byte count overflows usize")]
+    VideoByteCountOverflow,
+    /// A video's tensor has a dtype other than the first video's.
+    #[error("Qwen2.5-VL processed video {index} has dtype {actual}; expected {expected}")]
+    VideoDtypeMismatch {
+        /// Index of the video among the videos.
+        index: usize,
+        /// The dtype of the first video's tensor.
+        expected: DType,
+        /// The dtype of this video's tensor.
+        actual: DType,
+    },
+    /// Reserving memory for the combined tensor failed.
+    #[error("Qwen2.5-VL processed-media assembly could not reserve memory for {stage}")]
+    Allocation {
+        /// The buffer that failed to allocate.
+        stage: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Qwen25VlCombinedVideoLayout {
+    pub(crate) rows: usize,
+    pub(crate) feature_width: usize,
+    pub(crate) elements: usize,
+    pub(crate) dtype: DType,
+}
+
+pub(super) struct Qwen25VlAssembledVideos {
+    pub(crate) pixel_values: Option<HostTensor>,
+    pub(crate) grids: Vec<MropeGrid>,
+    pub(crate) sampled_frames_per_second: Vec<f64>,
+}
+
+/// Assemble already-processed Qwen2.5-VL image and video outputs into owned per-kind processor tensors.
+///
+/// Consumes its sources. An image batch and a single video tensor are moved without copying; two or
+/// more videos are concatenated here. All validation and count arithmetic complete before any output
+/// reservation or copy.
+pub(crate) fn assemble_qwen2_5_vl_processed_media(
+    images: Option<Qwen25VlProcessedImages>,
+    videos: Vec<Qwen25VlProcessedVideo>,
+    config: &Qwen25VlImageProcessorConfig,
+) -> Result<Qwen25VlProcessedMedia, Qwen25VlProcessedMediaAssemblyError> {
+    let expected_feature_width = qwen25_vl_processor_feature_width(config)?;
+    let temporal_patch_size = MropeTemporalPatchSize::new(config.temporal_patch_size)
+        .expect("validated image processor temporal patch size must be nonzero");
+
+    if let Some(images) = &images {
+        images
+            .processor_media()
+            .validate()
+            .map_err(Qwen25VlProcessedMediaAssemblyError::ImageMedia)?;
+        let actual = images.pixel_values.shape()[1];
+        if actual != expected_feature_width {
+            return Err(Qwen25VlProcessedMediaAssemblyError::ImageFeatureWidth {
+                expected: expected_feature_width,
+                actual,
+            });
+        }
+        for (index, grid) in images.grids.iter().copied().enumerate() {
+            validate_qwen25_vl_processed_grid(MropeVisualKind::Image, grid, config.merge_size)
+                .map_err(|source| Qwen25VlProcessedMediaAssemblyError::ImageGrid {
+                    index,
+                    source,
+                })?;
+            if grid.temporal != 1 {
+                return Err(Qwen25VlProcessedMediaAssemblyError::ImageGridTemporal {
+                    index,
+                    actual: grid.temporal,
+                });
+            }
+        }
+    }
+
+    for (index, video) in videos.iter().enumerate() {
+        video
+            .processor_media()
+            .validate()
+            .map_err(|source| Qwen25VlProcessedMediaAssemblyError::VideoMedia { index, source })?;
+        let actual = video.pixel_values_videos.shape()[1];
+        if actual != expected_feature_width {
+            return Err(Qwen25VlProcessedMediaAssemblyError::VideoFeatureWidth {
+                index,
+                expected: expected_feature_width,
+                actual,
+            });
+        }
+        if video.temporal_patch_size != temporal_patch_size {
+            return Err(
+                Qwen25VlProcessedMediaAssemblyError::VideoTemporalPatchSize {
+                    index,
+                    expected: temporal_patch_size.get(),
+                    actual: video.temporal_patch_size.get(),
+                },
+            );
+        }
+        if video.sampled_frame_count == 0 {
+            return Err(Qwen25VlProcessedMediaAssemblyError::VideoEmptySampledFrames { index });
+        }
+        if video.sampled_frame_count > MAX_VIDEO_FRAMES {
+            return Err(
+                Qwen25VlProcessedMediaAssemblyError::VideoTooManySampledFrames {
+                    index,
+                    actual: video.sampled_frame_count,
+                    limit: MAX_VIDEO_FRAMES,
+                },
+            );
+        }
+        let temporal_layout =
+            qwen25_vl_temporal_layout(video.sampled_frame_count, video.temporal_patch_size.get())
+                .map_err(|source| processed_media_temporal_layout_error(index, source))?;
+        if video.padded_frame_count != temporal_layout.padded_frame_count {
+            return Err(Qwen25VlProcessedMediaAssemblyError::VideoPaddedFrameCount {
+                index,
+                expected: temporal_layout.padded_frame_count,
+                actual: video.padded_frame_count,
+            });
+        }
+        validate_qwen25_vl_processed_grid(MropeVisualKind::Video, video.grid, config.merge_size)
+            .map_err(|source| Qwen25VlProcessedMediaAssemblyError::VideoGrid { index, source })?;
+        if video.grid.temporal != temporal_layout.grid_temporal {
+            return Err(Qwen25VlProcessedMediaAssemblyError::VideoGridTemporal {
+                index,
+                expected: temporal_layout.grid_temporal,
+                actual: video.grid.temporal,
+            });
+        }
+        let expected_seconds = MropeSecondsPerGridStep::from_qwen2_5_vl_processor(
+            video.temporal_patch_size,
+            video.sampled_frames_per_second,
+        )
+        .map_err(|source| Qwen25VlProcessedMediaAssemblyError::VideoTiming { index, source })?;
+        if video.seconds_per_grid_step.get().to_bits() != expected_seconds.get().to_bits() {
+            return Err(
+                Qwen25VlProcessedMediaAssemblyError::VideoSecondsPerGridStep {
+                    index,
+                    expected: expected_seconds.get().to_bits(),
+                    actual: video.seconds_per_grid_step.get().to_bits(),
+                },
+            );
+        }
+    }
+    let combined_video = qwen25_vl_combined_video_layout(
+        videos.iter().map(|video| {
+            (
+                video.pixel_values_videos.shape()[0],
+                video.pixel_values_videos.dtype(),
+            )
+        }),
+        expected_feature_width,
+    )?;
+
+    let (pixel_values, image_grids) = match images {
+        Some(images) => (Some(images.pixel_values), images.grids),
+        None => (None, Vec::new()),
+    };
+    let assembled_videos = assemble_qwen25_vl_videos(videos, combined_video)?;
+
+    Ok(Qwen25VlProcessedMedia {
+        pixel_values,
+        image_grids,
+        pixel_values_videos: assembled_videos.pixel_values,
+        video_grids: assembled_videos.grids,
+        temporal_patch_size,
+        sampled_frames_per_second: assembled_videos.sampled_frames_per_second,
+    })
+}
+
+fn qwen25_vl_processor_feature_width(
+    config: &Qwen25VlImageProcessorConfig,
+) -> Result<usize, Qwen25VlProcessedMediaAssemblyError> {
+    config
+        .patch_size
+        .checked_mul(config.patch_size)
+        .and_then(|patch_area| patch_area.checked_mul(config.temporal_patch_size))
+        .and_then(|temporal_area| temporal_area.checked_mul(3))
+        .ok_or(Qwen25VlProcessedMediaAssemblyError::FeatureWidthOverflow)
+}
+
+fn validate_qwen25_vl_processed_grid(
+    kind: MropeVisualKind,
+    grid: MropeGrid,
+    merge: usize,
+) -> Result<(), MropePositionError> {
+    if merge == 0 {
+        return Err(MropePositionError::ZeroSpatialMerge);
+    }
+    for (axis, dimension) in [
+        ("temporal", grid.temporal),
+        ("height", grid.height),
+        ("width", grid.width),
+    ] {
+        if dimension == 0 {
+            return Err(MropePositionError::ZeroGridDimension { kind, axis });
+        }
+    }
+    for (axis, dimension) in [("height", grid.height), ("width", grid.width)] {
+        if !dimension.is_multiple_of(merge) {
+            return Err(MropePositionError::NonDivisibleGrid {
+                kind,
+                axis,
+                dimension,
+                merge,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn processed_media_temporal_layout_error(
+    index: usize,
+    source: Qwen25VlTemporalLayoutError,
+) -> Qwen25VlProcessedMediaAssemblyError {
+    match source {
+        Qwen25VlTemporalLayoutError::PaddedFrameCountOverflow => {
+            Qwen25VlProcessedMediaAssemblyError::VideoPaddedFrameCountOverflow { index }
+        }
+        Qwen25VlTemporalLayoutError::IncompatibleTemporalPadding {
+            sampled_frame_count,
+            temporal_patch_size,
+            padded_frame_count,
+        } => Qwen25VlProcessedMediaAssemblyError::VideoIncompatibleTemporalPadding {
+            index,
+            sampled_frame_count,
+            temporal_patch_size,
+            padded_frame_count,
+        },
+        Qwen25VlTemporalLayoutError::TooManyPaddedFrames {
+            sampled_frame_count,
+            padded_frame_count,
+        } => Qwen25VlProcessedMediaAssemblyError::VideoTooManyPaddedFrames {
+            index,
+            sampled_frame_count,
+            padded_frame_count,
+            limit: MAX_VIDEO_FRAMES,
+        },
+    }
+}
+
+pub(super) fn qwen25_vl_combined_video_layout<I>(
+    video_parts: I,
+    feature_width: usize,
+) -> Result<Qwen25VlCombinedVideoLayout, Qwen25VlProcessedMediaAssemblyError>
+where
+    I: IntoIterator<Item = (usize, DType)> + Clone,
+{
+    let mut rows = 0usize;
+    for (index, (part_rows, _)) in video_parts.clone().into_iter().enumerate() {
+        rows = rows
+            .checked_add(part_rows)
+            .ok_or(Qwen25VlProcessedMediaAssemblyError::VideoRowCountOverflow { index })?;
+    }
+    let elements = rows
+        .checked_mul(feature_width)
+        .ok_or(Qwen25VlProcessedMediaAssemblyError::VideoElementCountOverflow)?;
+    let dtype = video_parts
+        .clone()
+        .into_iter()
+        .next()
+        .map_or(DType::F32, |(_, dtype)| dtype);
+    elements
+        .checked_mul(dtype.byte_size())
+        .ok_or(Qwen25VlProcessedMediaAssemblyError::VideoByteCountOverflow)?;
+    for (index, (_, part_dtype)) in video_parts.into_iter().enumerate() {
+        if part_dtype != dtype {
+            return Err(Qwen25VlProcessedMediaAssemblyError::VideoDtypeMismatch {
+                index,
+                expected: dtype,
+                actual: part_dtype,
+            });
+        }
+    }
+    Ok(Qwen25VlCombinedVideoLayout {
+        rows,
+        feature_width,
+        elements,
+        dtype,
+    })
+}
+
+pub(super) fn assemble_qwen25_vl_videos(
+    mut videos: Vec<Qwen25VlProcessedVideo>,
+    layout: Qwen25VlCombinedVideoLayout,
+) -> Result<Qwen25VlAssembledVideos, Qwen25VlProcessedMediaAssemblyError> {
+    let mut grids = Vec::new();
+    grids.try_reserve_exact(videos.len()).map_err(|_| {
+        Qwen25VlProcessedMediaAssemblyError::Allocation {
+            stage: "video grids",
+        }
+    })?;
+    let mut fps = Vec::new();
+    fps.try_reserve_exact(videos.len()).map_err(|_| {
+        Qwen25VlProcessedMediaAssemblyError::Allocation {
+            stage: "video FPS values",
+        }
+    })?;
+
+    if videos.is_empty() {
+        return Ok(Qwen25VlAssembledVideos {
+            pixel_values: None,
+            grids,
+            sampled_frames_per_second: fps,
+        });
+    }
+    if videos.len() == 1 {
+        let video = videos.pop().expect("one video remains");
+        grids.push(video.grid);
+        fps.push(video.sampled_frames_per_second.get());
+        return Ok(Qwen25VlAssembledVideos {
+            pixel_values: Some(video.pixel_values_videos),
+            grids,
+            sampled_frames_per_second: fps,
+        });
+    }
+
+    for video in &videos {
+        grids.push(video.grid);
+        fps.push(video.sampled_frames_per_second.get());
+    }
+    // Every part shares `layout.dtype` (checked by `qwen25_vl_combined_video_layout`), so the
+    // concatenation runs in the parts' own storage class: bf16/f16 pixels stay 16-bit words.
+    let parts: Vec<&HostTensor> = videos
+        .iter()
+        .map(|video| &video.pixel_values_videos)
+        .collect();
+    let offsets: Vec<usize> = parts.iter().map(|part| part.numel()).collect();
+    let tensor = gather_from(
+        &parts,
+        vec![layout.rows, layout.feature_width],
+        offsets
+            .iter()
+            .enumerate()
+            .flat_map(|(part, &len)| (0..len).map(move |k| (part, k))),
+    );
+    debug_assert_eq!(tensor.numel(), layout.elements);
+    Ok(Qwen25VlAssembledVideos {
+        pixel_values: Some(tensor),
+        grids,
+        sampled_frames_per_second: fps,
+    })
+}
+
+/// One tensor of `shape` gathered from several same-dtype sources: element `d` is element
+/// `order[d].1` of source `order[d].0` (the parts concatenated, whatever their storage class).
+pub(crate) fn gather_from(
+    srcs: &[&HostTensor],
+    shape: Vec<usize>,
+    order: impl Iterator<Item = (usize, usize)>,
+) -> HostTensor {
+    let dtype = srcs[0].dtype();
+    assert!(
+        srcs.iter().all(|src| src.dtype() == dtype),
+        "gather: every source must share one dtype"
+    );
+    let count: usize = shape.iter().product();
+    let data = match srcs[0].data() {
+        HostData::F32(_) => {
+            HostData::F32(gather_arc(&slices(srcs, HostTensor::as_f32), count, order))
+        }
+        HostData::I32(_) => {
+            HostData::I32(gather_arc(&slices(srcs, HostTensor::as_i32), count, order))
+        }
+        HostData::Half(_) => {
+            HostData::Half(gather_arc(&slices(srcs, HostTensor::as_half), count, order))
+        }
+        HostData::Bytes(_) => {
+            // An element is `byte_size` consecutive bytes, so its byte order is the element
+            // order expanded: one generic loop covers every width (E4M3FN, I8, I64, ...).
+            let width = dtype.byte_size();
+            let byte_order =
+                order.flat_map(move |(s, k)| (0..width).map(move |b| (s, k * width + b)));
+            let bytes: Vec<&[u8]> = srcs.iter().map(|src| src.view().bytes()).collect();
+            HostData::Bytes(gather_arc(&bytes, count * width, byte_order))
+        }
+    };
+    HostTensor::new(dtype, shape, data)
+        .expect("a gather writes exactly the destination shape's elements in the source's class")
+}
+
+fn slices<'a, T>(
+    srcs: &[&'a HostTensor],
+    words: impl Fn(&'a HostTensor) -> Option<&'a [T]>,
+) -> Vec<&'a [T]> {
+    srcs.iter()
+        .map(|src| words(src).expect("one dtype means one storage class"))
+        .collect()
+}
+
+fn gather_arc<T: Copy>(
+    srcs: &[&[T]],
+    count: usize,
+    order: impl Iterator<Item = (usize, usize)>,
+) -> Arc<[T]> {
+    let mut out: Arc<[MaybeUninit<T>]> = Arc::new_uninit_slice(count);
+    let buf = Arc::get_mut(&mut out).expect("freshly allocated Arc has exactly one owner");
+    let mut written = 0;
+    for (slot, (s, k)) in buf.iter_mut().zip(order) {
+        slot.write(srcs[s][k]);
+        written += 1;
+    }
+    assert_eq!(
+        written, count,
+        "gather: `order` must yield every destination element"
+    );
+    // SAFETY: `buf` has `count` slots and the loop wrote `written == count` of them (the zip stops
+    // at the shorter side, and the assert rules out a short `order`), each exactly once.
+    unsafe { out.assume_init() }
+}

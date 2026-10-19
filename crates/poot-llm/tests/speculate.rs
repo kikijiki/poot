@@ -140,6 +140,7 @@ fn perturbed(fixture: &Fixture, scale: f32) -> Fixture {
     Fixture {
         config: fixture.config.clone(),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }
@@ -210,8 +211,8 @@ impl Device for FakeDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())
@@ -575,6 +576,7 @@ fn oracle_rows(store: &WeightStore, tokens: &[u32]) -> Vec<Vec<f32>> {
     let model = registry().build(&fixture.raw(), store).unwrap();
     let shape = StepShape::new(NonZeroUsize::MIN, nz(n), nz(CAPACITY)).with_logits(LogitRows::All);
     let graph = model
+        .model
         .trace(
             &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
@@ -594,7 +596,7 @@ fn oracle_rows(store: &WeightStore, tokens: &[u32]) -> Vec<Vec<f32>> {
             HostTensor::i32(vec![1, n], (0..n as i32).collect()),
         ),
     ];
-    let (logits, _) = eval_mapped(&graph, store, model.weights(), &slots, &state);
+    let (logits, _) = eval_mapped(&graph, store, model.model.weights(), &slots, &state);
     logits
         .as_f32()
         .expect("f32 logits")

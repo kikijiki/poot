@@ -927,8 +927,8 @@ impl Device for PlanningDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<()>, PlanningOnly> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), PlanningOnly> {
+        Ok(())
     }
 
     fn replay(&mut self, _recording: &()) -> Result<(), PlanningOnly> {

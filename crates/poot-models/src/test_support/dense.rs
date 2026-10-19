@@ -355,11 +355,13 @@ impl Dense {
         let raw = RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         };
         let model = Registry::builtin()
             .unwrap()
             .build(&raw, &store)
-            .unwrap_or_else(|e| panic!("{:?}: {e}", self.family));
+            .unwrap_or_else(|e| panic!("{:?}: {e}", self.family))
+            .model;
         let map = Arc::new(model.weights().clone());
         MappedModel {
             model,

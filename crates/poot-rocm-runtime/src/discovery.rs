@@ -7,10 +7,10 @@
 
 use crate::bindings::{
     HSA_AGENT_INFO_DEVICE, HSA_AGENT_INFO_ISA, HSA_AGENT_INFO_NAME, HSA_AGENT_INFO_VENDOR_NAME,
-    HSA_AGENT_INFO_WAVEFRONT_SIZE, HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES,
-    HSA_AMD_AGENT_INFO_MEMORY_AVAIL, HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES,
-    HSA_AMD_AGENT_INFO_PRODUCT_NAME, HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO,
-    HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED,
+    HSA_AGENT_INFO_WAVEFRONT_SIZE, HSA_AMD_AGENT_INFO_MEMORY_AVAIL,
+    HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES, HSA_AMD_AGENT_INFO_PRODUCT_NAME,
+    HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO, HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS,
+    HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED,
     HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED,
     HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT,
     HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, HSA_AMD_MEMORY_POOL_INFO_LOCATION,
@@ -337,22 +337,6 @@ pub(crate) unsafe fn cpu_to_pool_link_types(
         ))?;
         let link_types = hops.iter().map(|hop| hop.link_type).collect();
         Ok((num_hops, link_types))
-    }
-}
-
-pub(crate) unsafe fn amd_cooperative_queues(funcs: &Funcs, agent: hsa_agent_t) -> Option<u32> {
-    let mut val: u32 = 0;
-    // SAFETY: `HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES` writes a `uint32_t` into `val`.
-    let status = unsafe {
-        check((funcs.hsa_agent_get_info)(
-            agent,
-            HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES,
-            &mut val as *mut _ as *mut c_void,
-        ))
-    };
-    match status {
-        Ok(()) => Some(val),
-        Err(_) => None,
     }
 }
 

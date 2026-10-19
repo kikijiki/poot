@@ -37,6 +37,22 @@ pub fn open_or_skip_with<T, E: std::fmt::Display>(
     }
 }
 
+/// Skip a row whose device opened but lacks a capability the row needs (`what`), panicking first when `backend` is
+/// required: a lane that claims the device claims the capability too.
+pub fn skip_unsupported(backend: DeviceBackend, what: &str) {
+    skip_unsupported_with(backend, |name| std::env::var(name).ok(), what);
+}
+
+/// [`skip_unsupported`] with an injected environment reader, for a test that sets only one variable.
+pub fn skip_unsupported_with(
+    backend: DeviceBackend,
+    get: impl Fn(&str) -> Option<String>,
+    what: &str,
+) {
+    let what = backend.fail_if_required(get, what);
+    eprintln!("SKIP: {} device lacks {what}", backend.label());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +85,26 @@ mod tests {
         assert_eq!(
             open_or_skip_with(DeviceBackend::Ptx, env_with(&["POOT_REQUIRE_ROCM"]), opened),
             None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "required wgpu device unavailable")]
+    fn a_missing_capability_fails_when_the_backend_is_required() {
+        skip_unsupported_with(
+            DeviceBackend::Wgpu,
+            env_with(&["POOT_REQUIRE_WGPU"]),
+            "TIMESTAMP_QUERY",
+        );
+    }
+
+    #[test]
+    fn a_missing_capability_is_a_skip_when_the_backend_is_not_required() {
+        skip_unsupported_with(DeviceBackend::Wgpu, |_| None, "TIMESTAMP_QUERY");
+        skip_unsupported_with(
+            DeviceBackend::Wgpu,
+            env_with(&["POOT_REQUIRE_ROCM"]),
+            "TIMESTAMP_QUERY",
         );
     }
 }

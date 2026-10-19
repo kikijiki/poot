@@ -13,7 +13,7 @@ use poot_graph_plan::test_support::gpu_caps;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_runtime_common::{BufferRole, CompiledKernel, DeviceBackend};
 use poot_target::{BufferStorage, ElementKind, LogicalDType};
-use poot_vulkan_device::{VulkanDevice, VulkanKernel};
+use poot_vulkan_device::{VulkanDevice, VulkanGpuError, VulkanKernel};
 use std::path::PathBuf;
 
 fn vulkan() -> Option<VulkanDevice> {
@@ -173,7 +173,7 @@ fn dispatch_reads_the_argument_element_count_not_the_buffer_capacity() {
             work: 4,
         })
         .unwrap();
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
     device.replay(&recording).unwrap();
     device.synchronize().unwrap();
     assert_eq!(read_f32(&mut device, &out), [11.0, 22.0, -1.0, -1.0]);
@@ -257,7 +257,7 @@ fn a_copy_is_ordered_between_the_dispatches_around_it() {
     record_add(&mut device, &kernel, &x, &b, &sum, n);
     device.copy(&sum, &copy).unwrap();
     record_add(&mut device, &kernel, &copy, &b, &out, n);
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
     device.replay(&recording).unwrap();
     device.synchronize().unwrap();
     assert_eq!(read_f32(&mut device, &out), vec![3.0; n]);
@@ -289,7 +289,7 @@ fn copy_round_trips_every_element_width_with_no_sentinel_left() {
         poot_executor::write_slice(&mut device, &dst, 0, &vec![0xAA; dst.byte_len()]).unwrap();
         device.begin().unwrap();
         device.copy(&src, &dst).unwrap();
-        let recording = device.finish().unwrap().expect("a recording");
+        let recording = device.finish().unwrap();
         device.replay(&recording).unwrap();
         device.synchronize().unwrap();
         let mut got = vec![0u8; dst.byte_len()];
@@ -357,7 +357,7 @@ fn a_long_recording_is_cut_into_several_submissions_and_replays_exactly() {
                 })
                 .unwrap();
         }
-        device.finish().unwrap().expect("a recording")
+        device.finish().unwrap()
     };
 
     let long = chain(&mut device, 1030, 4);
@@ -439,7 +439,7 @@ fn a_kernel_assert_is_a_fault_raised_at_synchronize() {
             work: 4,
         })
         .unwrap();
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
     device
         .replay(&recording)
         .expect("a fired assert is not a replay failure");
@@ -521,4 +521,76 @@ fn an_over_length_dispatch_is_refused_by_the_engine_on_vulkan() {
         return;
     };
     poot_executor_parity::dispatch_length::over_length_dispatch_is_refused(device);
+}
+
+/// Replay one large `add` on `device` and return how long the replay's fence waits took, or the error.
+/// The recording is built before the clock starts.
+fn timed_big_add(device: &mut VulkanDevice) -> (Result<(), VulkanGpuError>, std::time::Duration) {
+    let n = 1usize << 27;
+    let kernel = add_kernel(device);
+    let a = device
+        .allocate(BufferRole::Input, BufferStorage::f32(), n)
+        .unwrap();
+    let b = device
+        .allocate(BufferRole::Input, BufferStorage::f32(), n)
+        .unwrap();
+    let out = device
+        .allocate(BufferRole::Output, BufferStorage::f32(), n)
+        .unwrap();
+    device.begin().unwrap();
+    record_add(device, &kernel, &a, &b, &out, n);
+    let recording = device.finish().unwrap();
+    let start = std::time::Instant::now();
+    let replayed = device.replay(&recording);
+    (replayed, start.elapsed())
+}
+
+/// SC-004 (real Vulkan device): a fence wait that outlasts the configured bound fails with the typed
+/// `WaitTimeout` after about that bound, long before the dispatch finishes, and poisons the device; the
+/// next call is `Poisoned`. A first device measures the dispatch; the second waits a quarter of it.
+/// Mutation: pass `Duration::MAX` to `wait_for_fences` in `DeviceOwner::submit_and_wait`; the replay
+/// waits for the whole dispatch and returns `Ok` (red).
+#[test]
+fn a_real_fence_wait_past_its_bound_times_out_and_poisons() {
+    let Some(mut measuring) = vulkan() else {
+        return;
+    };
+    let (drained, full) = timed_big_add(&mut measuring);
+    drained.expect("the dispatch drains under the default bound");
+    drop(measuring);
+    let bound = (full / 4).max(std::time::Duration::from_millis(1));
+    assert!(
+        full >= bound * 2,
+        "the dispatch ({full:?}) must outlast the bound ({bound:?}) by a wide margin"
+    );
+    let Some(mut device) = open_or_skip(
+        DeviceBackend::Vulkan,
+        VulkanDevice::new_with_options(poot_vulkan_runtime::ContextOptions {
+            wait_timeout: bound,
+        }),
+    ) else {
+        return;
+    };
+    let (timed_out, elapsed) = timed_big_add(&mut device);
+    assert!(
+        matches!(
+            &timed_out,
+            Err(VulkanGpuError::Runtime(error))
+                if matches!(**error, poot_vulkan_runtime::RuntimeError::WaitTimeout { .. })
+        ),
+        "got {timed_out:?} after {elapsed:?}"
+    );
+    assert!(
+        elapsed < full,
+        "the wait ended at {elapsed:?}, not within the bound {bound:?} of a {full:?} dispatch"
+    );
+    let refused = device.synchronize().and_then(|()| device.abort());
+    assert!(
+        matches!(
+            &refused,
+            Err(VulkanGpuError::Runtime(error))
+                if matches!(**error, poot_vulkan_runtime::RuntimeError::Poisoned { .. })
+        ),
+        "got {refused:?}"
+    );
 }

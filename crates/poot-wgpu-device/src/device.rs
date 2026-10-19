@@ -15,7 +15,7 @@ use poot_executor::{
 use poot_graph_plan::Target;
 use poot_runtime_common::{BufferRole, CompiledKernel};
 use poot_target::{Backend, BufferStorage, TargetId};
-use poot_wgpu_runtime::{CachedDispatch, Context, DeviceBuffer, RuntimeError};
+use poot_wgpu_runtime::{CachedDispatch, Context, ContextOptions, DeviceBuffer, RuntimeError};
 use std::num::NonZeroUsize;
 
 /// One loaded kernel: its compiled code and the plan key the pipeline cache and labels use.
@@ -59,8 +59,13 @@ impl WgpuDevice {
     /// A device in counters-only mode: replays request no timestamps and [`Device::device_time`] is
     /// `Unknown`. Fails with the runtime's adapter or device-init error when no adapter can be opened.
     pub fn new() -> Result<Self, RuntimeError> {
+        Self::new_with_options(ContextOptions::default())
+    }
+
+    /// [`Self::new`] with explicit runtime [`ContextOptions`]: the bound on every wait for the device.
+    pub fn new_with_options(options: ContextOptions) -> Result<Self, RuntimeError> {
         Ok(Self {
-            ctx: Context::new()?,
+            ctx: Context::new_with_options(options)?,
             open: None,
         })
     }
@@ -168,7 +173,7 @@ impl Device for WgpuDevice {
         storage: BufferStorage,
         elems: usize,
     ) -> Result<DeviceBuffer, RuntimeError> {
-        Ok(self.ctx.alloc_storage(role, storage, elems))
+        self.ctx.alloc_storage(role, storage, elems)
     }
 
     fn buffer_elems(&self, buffer: &Self::Buffer) -> usize {
@@ -235,9 +240,9 @@ impl Device for WgpuDevice {
         })
     }
 
-    fn finish(&mut self) -> Result<Option<WgpuRecording>, RuntimeError> {
+    fn finish(&mut self) -> Result<WgpuRecording, RuntimeError> {
         let items = self.open.take().expect("finish without begin");
-        Ok(Some(WgpuRecording { items }))
+        Ok(WgpuRecording { items })
     }
 
     /// Card 552: discards any leftover pending/accumulated device timing from a previous

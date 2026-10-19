@@ -1,6 +1,48 @@
 use crate::buffer::checked_write_range;
 use crate::{Context, DeviceBuffer, RuntimeError};
 use poot_runtime_common::BufferRole;
+use std::sync::{Arc, Mutex};
+
+/// The outcomes of the `map_async` calls one readback registered. wgpu reports a failed map to the
+/// callback only, and reading a range that failed to map panics, so a readback keeps each result and
+/// checks them all after its wait, before it touches a mapped range.
+#[derive(Default)]
+pub(crate) struct MapSet {
+    results: Vec<MapResult>,
+}
+
+/// What a map callback delivered; `None` until it has run.
+type MapResult = Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>;
+
+impl MapSet {
+    /// Map `slice` for reading and remember how that went.
+    pub(crate) fn read(&mut self, slice: wgpu::BufferSlice<'_>) {
+        let result = Arc::new(Mutex::new(None));
+        let callback = Arc::clone(&result);
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            *callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mapped);
+        });
+        self.results.push(result);
+    }
+
+    /// The first failed map, as a typed error; a map whose callback never ran is a failure too.
+    pub(crate) fn check(&self) -> Result<(), RuntimeError> {
+        for result in &self.results {
+            match result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                Some(Ok(())) => {}
+                Some(Err(error)) => return Err(RuntimeError::MapFailed(error)),
+                None => return Err(RuntimeError::MapNotCompleted),
+            }
+        }
+        Ok(())
+    }
+}
 
 impl Context {
     /// Read a device buffer back to host f32 (staging copy).
@@ -36,18 +78,15 @@ impl Context {
         self.native_submits.set(self.native_submits.get() + 1);
         self.record_submit(poot_runtime_common::CallPurpose::Readback);
         self.queue.submit(Some(enc.finish()));
-        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let mut maps = MapSet::default();
+        maps.read(staging.slice(..));
         for (_, fs, _) in &staged_faults {
-            fs.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            maps.read(fs.slice(..));
         }
         self.waits.set(self.waits.get() + 1);
         self.record_wait(poot_runtime_common::CallPurpose::Readback);
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| RuntimeError::Readback(e.to_string()))?;
+        self.wait_idle()?;
+        maps.check()?;
         let data = staging.slice(..).get_mapped_range();
         self.record_transfer(
             poot_runtime_common::CallPurpose::Readback,
@@ -99,18 +138,15 @@ impl Context {
         self.native_submits.set(self.native_submits.get() + 1);
         self.record_submit(poot_runtime_common::CallPurpose::Readback);
         self.queue.submit(Some(enc.finish()));
-        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let mut maps = MapSet::default();
+        maps.read(staging.slice(..));
         for (_, fs, _) in &staged_faults {
-            fs.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            maps.read(fs.slice(..));
         }
         self.waits.set(self.waits.get() + 1);
         self.record_wait(poot_runtime_common::CallPurpose::Readback);
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| RuntimeError::Readback(e.to_string()))?;
+        self.wait_idle()?;
+        maps.check()?;
         {
             let data = staging.slice(..).get_mapped_range();
             out.copy_from_slice(&data[..out.len()]);
@@ -135,17 +171,14 @@ impl Context {
         self.native_submits.set(self.native_submits.get() + 1);
         self.record_submit(poot_runtime_common::CallPurpose::Validation);
         self.queue.submit(Some(enc.finish()));
+        let mut maps = MapSet::default();
         for (_, fs, _) in &staged_faults {
-            fs.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            maps.read(fs.slice(..));
         }
         self.waits.set(self.waits.get() + 1);
         self.record_wait(poot_runtime_common::CallPurpose::Validation);
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| RuntimeError::Readback(e.to_string()))?;
+        self.wait_idle()?;
+        maps.check()?;
         self.check_staged_faults(&staged_faults)
     }
 
@@ -250,18 +283,15 @@ pub(crate) mod test_only {
             self.native_submits.set(self.native_submits.get() + 1);
             self.record_submit(poot_runtime_common::CallPurpose::Readback);
             self.queue.submit(Some(enc.finish()));
-            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let mut maps = MapSet::default();
+            maps.read(staging.slice(..));
             for (_, fs, _) in &staged_faults {
-                fs.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+                maps.read(fs.slice(..));
             }
             self.waits.set(self.waits.get() + 1);
             self.record_wait(poot_runtime_common::CallPurpose::Readback);
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: None,
-                })
-                .map_err(|e| RuntimeError::Readback(e.to_string()))?;
+            self.wait_idle()?;
+            maps.check()?;
             let data = staging.slice(..).get_mapped_range();
             self.record_transfer(
                 poot_runtime_common::CallPurpose::Readback,

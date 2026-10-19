@@ -1,0 +1,54 @@
+# Required cases of the non-device checkpoint and ignored-test lanes, one per line:
+# lane<TAB>binary_id<TAB>test_name (binary_id and test_name are the identity nextest and JUnit report).
+# Hand-maintained, sorted by lane, binary id, test name (LC_ALL=C), and never generated from a run. A lane is a
+# `just` recipe that runs its rows by exact name (an `#[ignore]`d row too: scripts/check-lane-coverage.py
+# `--lane-filter <lane>` prints the filterset), and the `checkpoint*` lanes set POOT_REQUIRE_MODELS=1, so a
+# model missing from the models directory fails the row instead of skipping it.
+# scripts/check-lane-coverage.py (`just test-lane-coverage`) fails when an inventory row of class `checkpoint`
+# is in no lane, when an `#[ignore]`d test is in no lane's list (here or in scripts/required-device-cases/), and
+# when a row here names no test.
+#
+#   checkpoint           `just test-checkpoint`: CPU rows over the small checkpoints in ~/models; the dev box.
+#   checkpoint-large     `just test-checkpoint-large`: rows that read a 20B+ checkpoint (header or tensors):
+#                        NEVER on the dev box; a pod or host with the checkpoints and the memory for them.
+#   npu-toolchain        `just test-npu-toolchain`: the rows that need the pinned Peano llc and the IRON driver.
+#   real-dims-long       `just test-real-dims-long`: real-dimension rows too slow for `just test-real-dims`.
+#   regen-kernel-assets  `just regen-kernel-assets`: the generator that rewrites the committed kernel assets.
+#
+# The device lanes' rows (wgpu, ROCm, PTX, Vulkan, and the large-checkpoint twins) are the `checkpoint-<backend>`
+# and `checkpoint-large-<backend>` lists in scripts/required-device-cases/, which the required-case gate reads.
+checkpoint	poot-llm	driver::device_tests::checkpoint::a_gptq_checkpoint_loads_its_linears_packed_with_no_dense_copy
+checkpoint	poot-llm	driver::llamacpp_bisect_tests::checkpoint_rows::qwen2_5_0_5b_q8_0_follows_llamacpp_through_every_layer
+checkpoint	poot-llm	driver::llamacpp_kl_tests::checkpoint_rows::one_perturbed_dequant_scale_exceeds_the_gate
+checkpoint	poot-llm	driver::llamacpp_kl_tests::checkpoint_rows::qwen2_5_0_5b_q4_k_m_follows_llamacpp
+checkpoint	poot-llm	driver::llamacpp_kl_tests::checkpoint_rows::qwen2_5_0_5b_q8_0_follows_llamacpp
+checkpoint	poot-llm	driver::llamacpp_kl_tests::checkpoint_rows::qwen3_0_6b_q8_0_follows_llamacpp
+checkpoint	poot-llm	driver::text_checkpoint_tests::chat_template_checkpoints::multi_turn_tool_conversation_renders
+checkpoint	poot-llm	driver::text_checkpoint_tests::chat_template_checkpoints::real_qwen_template_renders_with_role_markers
+checkpoint	poot-llm	driver::text_checkpoint_tests::chat_template_checkpoints::tools_render_into_the_qwen_prompt_and_none_is_unchanged
+checkpoint	poot-llm	driver::text_checkpoint_tests::gemma_tokenizer::gguf_spm_matches_hf_tokenizer
+checkpoint	poot-llm	driver::text_checkpoint_tests::gemma_tokenizer::phi3_tokenizer_roundtrips
+checkpoint	poot-llm	driver::text_checkpoint_tests::llama3_golden_tests::encode_equals_llama_cpp_token_ids
+checkpoint	poot-llm	driver::text_checkpoint_tests::llama3_golden_tests::qwen2_encode_equals_llama_cpp_token_ids
+checkpoint	poot-llm	driver::text_checkpoint_tests::phi3_gguf_inspect_legacy::phi3_gguf_chat_special_tokens_are_single_ids
+checkpoint	poot-llm	driver::text_checkpoint_tests::phi3_gguf_inspect_legacy::phi3_gguf_metadata
+checkpoint	poot-llm::bf16_load_rss_gate	resident_load_of_a_real_bf16_checkpoint_peaks_under_one_point_five_x_file_size
+checkpoint	poot-llm::gguf_load_rss	model_handle_load_gguf_peaks_near_one_x_file_size
+checkpoint	poot-load	gguf::tests::parses_real_qwen2_gguf
+checkpoint	poot-load::gguf_reader_rss	read_gguf_of_q4_k_m_maps_without_anonymous_copies
+checkpoint	poot-load::gguf_reader_rss	read_gguf_of_q8_0_maps_without_anonymous_copies
+checkpoint	poot-serve::bin/poot-serve	tests::streaming::streaming_rejects_bad_guided_with_400_before_headers
+checkpoint-large	poot-llm	driver::text_checkpoint_tests::chat_template_checkpoints::real_gemma4_chat_template_renders_via_jinja_not_the_chatformat_fallback
+checkpoint-large	poot-llm::coherence	gptoss_20b_gguf_harmony_chat_template_renders
+checkpoint-large	poot-load::gguf_whole_file_plan	every_tensor_of_every_local_qwen38_gguf_maps_to_a_format
+checkpoint-large	poot-load::gguf_whole_file_plan	the_27b_iq3_s_tensor_plans_as_one_packed_iq3_s_owner
+checkpoint-large	poot-models	architectures::qwen38_27b::tests::every_tensor_of_the_real_gguf_plans_through_the_production_name_map
+checkpoint-large	poot-models	architectures::qwen38_27b::tests::the_real_gguf_config_reads_into_the_pinned_dimensions
+checkpoint-large	poot-models	architectures::qwen38_27b::tests::the_real_gguf_first_blocks_bind_packed_and_trace
+checkpoint-large	poot-models	architectures::qwen38_27b::tests::the_real_gguf_gdn_layer_matches_the_llama_cpp_activation
+checkpoint-large	poot-models	architectures::qwen38_27b::tests::the_real_gguf_rows_dequantize_to_the_llama_cpp_reference
+npu-toolchain	poot-kernelgen::llc	aie_kernels_lower_to_aie2p_via_peano
+npu-toolchain	poot-kernelgen::npu_artifact	a_real_peano_and_iron_toolchain_links_a_loadable_artifact
+real-dims-long	poot-eval	tests::selected_attention::the_definition_attends_over_the_selected_keys_at_32k_and_128k_real_dims
+real-dims-long	poot-models	architectures::qwen38::qsa::tests::the_32k_selection_matches_a_full_repool_real_dims
+regen-kernel-assets	pootc::import_run	regen_kernel_assets

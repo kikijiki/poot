@@ -1,4 +1,5 @@
 use crate::buffer::{check_device_args, check_kernel_buffer_args, resolve_groups, x_extent};
+use crate::context::readback::MapSet;
 use crate::pipeline::{DeviceTimingResult, EncodeItem, spirv_words};
 use crate::timestamps::storage_entry;
 use crate::{
@@ -333,12 +334,7 @@ impl Context {
             let oldest = self.pending_device_timing.borrow_mut().remove(0);
             self.waits.set(self.waits.get() + 1);
             self.record_wait(poot_runtime_common::CallPurpose::Timing);
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: None,
-                })
-                .map_err(|e| RuntimeError::Readback(e.to_string()))?;
+            self.wait_idle()?;
             let period = self.queue.get_timestamp_period() as f64;
             self.drained_device_timing
                 .borrow_mut()
@@ -361,6 +357,7 @@ impl Context {
         &self,
         items: impl ExactSizeIterator<Item = EncodeItem<'a>> + Clone,
     ) -> Result<(), RuntimeError> {
+        self.health.check_live("submit")?;
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -666,25 +663,22 @@ impl Context {
         self.queue.submit(Some(encoder.finish()));
         self.submits.set(self.submits.get() + 1); // one compute submit (per-op dispatch path)
 
+        let mut maps = MapSet::default();
         for s in staging.iter().flatten() {
-            s.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            maps.read(s.slice(..));
         }
         if let Some(stg) = &err_staging {
-            stg.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            maps.read(stg.slice(..));
         }
         for (_, fs, _) in &staged_faults {
-            fs.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            maps.read(fs.slice(..));
         }
         self.waits.set(self.waits.get() + 1);
         // Card 552 SC-007: one dominant purpose (reading results back), same reasoning as the
         // submission above.
         self.record_wait(poot_runtime_common::CallPurpose::Readback);
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| RuntimeError::Readback(e.to_string()))?;
+        self.wait_idle()?;
+        maps.check()?;
         for (stg, b) in staging.iter().zip(buffers.iter_mut()) {
             if let Some(stg) = stg {
                 let data = stg.slice(..).get_mapped_range();

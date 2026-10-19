@@ -1,12 +1,12 @@
-//! DeepSeek-V3.2 behind [`Model`]: V3's MLA attention and sigmoid-routed MoE (see
+//! DeepSeek-V3.2 behind [`Model`](crate::model::Model): V3's MLA attention and sigmoid-routed MoE (see
 //! [`super::deepseek2`], which holds the body the DeepSeek families share) with DeepSeek sparse
 //! attention ([`crate::components::dsa`]): a lightning indexer scores the cached positions and
 //! each query attends to the `index_topk` best of them. The indexer reads the low-rank query, so a
 //! config without `q_lora_rank` is refused.
 
 use super::deepseek2::{Kind, Scoring, build_family, hf_shapes};
-use crate::model::{FamilyKey, Model, ModelError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::model::{FamilyKey, ModelError};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_quant::weights::WeightStore;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek32");
@@ -25,7 +25,7 @@ const KIND: Kind = Kind {
     dsa: true,
 };
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     build_family(KIND, raw, store)
 }
 
@@ -100,6 +100,7 @@ mod tests {
             let raw = RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             };
             let model = build(&ENTRY, &raw, &fx.store);
             run_step(&*model, &fx.store, CAP, &[3, 17, 40, 8, 25, 9], 0, &[]).0
@@ -132,6 +133,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         };
         match (ENTRY.build)(&raw, &fx.store) {
             Err(ModelError::Config { field, reason, .. }) => {

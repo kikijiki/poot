@@ -243,9 +243,8 @@ pub trait Device {
     fn dispatch(&mut self, dispatch: Dispatch<'_, Self>) -> Result<(), Self::Error>;
     /// Copy all of `src` into `dst` (same byte length), ordered after every earlier call of this step.
     fn copy(&mut self, src: &Self::Buffer, dst: &Self::Buffer) -> Result<(), Self::Error>;
-    /// End a step, returning the recording `replay` later submits. Every current `Device` impl
-    /// returns `Some` unconditionally: nothing has run on the device yet.
-    fn finish(&mut self) -> Result<Option<Self::Recording>, Self::Error>;
+    /// End a step, returning the recording `replay` later submits. Nothing has run on the device yet.
+    fn finish(&mut self) -> Result<Self::Recording, Self::Error>;
     /// Start a step's replays: called once per step, before the first of its (one per stage)
     /// [`Self::replay`] calls. A backend resets whatever it accumulates per step here (device-timing
     /// records), so a step that failed before `device_time` drained them cannot leak into this one

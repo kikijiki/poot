@@ -15,8 +15,8 @@
 //!
 //! Without `POOT_MODELS_DIR` the rows skip with a printed SKIP line, so they hold only where a lane sets
 //! `POOT_REQUIRE_MODELS=1`, which turns the skip into a failure (as does a models directory that holds
-//! no Qwen3.8 GGUF). `just test-optional` runs this binary (no selector filter) but exports only the
-//! models directory; the lane that requires it is POOT-1217's `just test-checkpoint`.
+//! no Qwen3.8 GGUF). Both rows are in the `checkpoint-large` lane of `scripts/required-checkpoint-cases.txt`
+//! (`just test-checkpoint-large`), which sets the variable.
 
 use std::path::{Path, PathBuf};
 

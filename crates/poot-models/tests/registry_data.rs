@@ -57,7 +57,7 @@ const SHIPPED: &[(ConfigSource, &str, &str)] = &[
     (Hf, "nemotron_h", "nemotron_h"),
     (Hf, "deepseek_v4", "deepseek4"),
     (Hf, "bert", "bert"),
-    (Hf, "idefics3_vision", "idefics3_vision"),
+    (Hf, "idefics3", "idefics3"),
     (Hf, "qwen3_next", "qwen3next"),
     (Gguf, "qwen35moe", "qwen3next"),
     (Hf, "qwen3_5", "qwen35"),
@@ -69,7 +69,6 @@ const SHIPPED: &[(ConfigSource, &str, &str)] = &[
     // top-level `model_type`, so it is not a key.
     (Hf, "glm5_next", "glm53_flash"),
     (Hf, "qwen2_5_vl", "qwen2_5_vl"),
-    (Hf, "qwen2_5_vl_vision", "qwen2_5_vl_vision"),
 ];
 
 #[test]
@@ -93,6 +92,7 @@ fn builtin_resolves_every_shipped_key_to_one_family_and_knows_no_other() {
             let raw = RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             };
             let entry = registry
                 .resolve(&raw)

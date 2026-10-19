@@ -332,6 +332,7 @@ impl HostTensor {
     }
 
     /// The same payload under a new shape of the same element count (the allocation is shared).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reshaped(&self, shape: Vec<usize>) -> Result<Self, CarrierError> {
         Self::new(self.dtype, shape, self.data.clone())
     }

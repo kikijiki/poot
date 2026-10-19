@@ -207,9 +207,9 @@ fn mapped_fixture(model_type: &str) -> MappedModel {
     let fixture = (entry.fixture)();
     let model = (entry.build)(&fixture.raw(), &fixture.store)
         .unwrap_or_else(|error| panic!("{model_type} fixture: {error}"));
-    let map = Arc::new(model.weights().clone());
+    let map = Arc::new(model.model.weights().clone());
     MappedModel {
-        model,
+        model: model.model,
         store: Arc::new(fixture.store),
         map,
     }
@@ -515,7 +515,7 @@ impl Device for FailingFinish {
         self.inner.copy(src, dst)
     }
 
-    fn finish(&mut self) -> Result<Option<Self::Recording>, PtxGpuError> {
+    fn finish(&mut self) -> Result<Self::Recording, PtxGpuError> {
         let finishes = self.finishes.get() + 1;
         self.finishes.set(finishes);
         if self.fail_at.get() == Some(finishes) {

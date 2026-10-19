@@ -451,71 +451,6 @@ mod tests {
 
     const F16_ONE: [u8; 2] = [0x00, 0x3C]; // 1.0 in f16, little-endian
 
-    // Differential probe: the same weights live in the Q8_0 (near-lossless) and Q4_K_M GGUFs.
-    // Dequants shared tensors from each and reports cosine similarity and type; a wrong Q4_K/Q6_K
-    // dequant shows as low correlation (uniform-value unit tests cannot catch a position bug).
-    // Run: cargo test -p poot-load q4km_vs_q8 -- --ignored --nocapture
-    #[test]
-    #[ignore = "differential debug probe; needs both GGUFs under POOT_MODELS_DIR"]
-    fn q4km_vs_q8_tensor_correlation() {
-        let Some(q8) = poot_test_util::model_path(poot_test_util::checkpoint!(
-            "qwen2.5-0.5b-gguf/qwen2.5-0.5b-instruct-q8_0.gguf"
-        )) else {
-            return;
-        };
-        // Quant file to check against the Q8_0 reference.
-        let Some(q4) = poot_test_util::model_path(poot_test_util::checkpoint!(
-            "qwen2.5-0.5b-gguf/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-        )) else {
-            return;
-        };
-        let (g8, g4) = (WholeGguf::load(&q8).unwrap(), WholeGguf::load(&q4).unwrap());
-        // Type distribution in the q4_k_m file.
-        let mut counts: std::collections::BTreeMap<u32, usize> = Default::default();
-        for t in g4.tensors.values() {
-            *counts.entry(t.ggml_type).or_default() += 1;
-        }
-        eprintln!("q4_k_m ggml_type counts: {counts:?}");
-        let names = [
-            "token_embd.weight",
-            "output.weight",
-            "blk.0.attn_q.weight",
-            "blk.0.ffn_gate.weight",
-            "blk.0.ffn_down.weight",
-            "blk.0.attn_v.weight",
-        ];
-        for n in names {
-            let (Some(a), Some(b)) = (g4.tensors.get(n), g8.tensors.get(n)) else {
-                eprintln!(
-                    "{n}: missing in one file (q4={:?})",
-                    g4.tensors.get(n).map(|t| t.ggml_type)
-                );
-                continue;
-            };
-            let (ty4, ty8) = (a.ggml_type, b.ggml_type);
-            let da = g4.dequant(n).unwrap().as_f32().unwrap().to_vec();
-            let db = g8.dequant(n).unwrap().as_f32().unwrap().to_vec();
-            let cos = cosine(&da, &db);
-            eprintln!(
-                "{n}: q4_type={ty4} q8_type={ty8} n={} cos={cos:.4} | q4[0..4]={:?} q8[0..4]={:?}",
-                da.len(),
-                &da[..4.min(da.len())],
-                &db[..4.min(db.len())],
-            );
-        }
-    }
-
-    fn cosine(a: &[f32], b: &[f32]) -> f32 {
-        let n = a.len().min(b.len());
-        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
-        for i in 0..n {
-            dot += a[i] as f64 * b[i] as f64;
-            na += (a[i] as f64).powi(2);
-            nb += (b[i] as f64).powi(2);
-        }
-        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
-    }
-
     #[test]
     fn q4_k_block_dequants_to_known_values() {
         // One super-block: d=1, dmin=0, every sub-block scale=1 min=0, every q4 nibble=1 -> all weights 1.
@@ -1025,65 +960,6 @@ mod tests {
             WholeGguf::from_bytes(ok).is_ok(),
             "a valid 2-D tensor must still parse"
         );
-    }
-
-    #[test]
-    #[ignore = "diagnostic: print tensor ggml types for each layer; needs POOT_MODELS_DIR (and optionally POOT_DIAG_LAYERS)"]
-    fn diag_gguf_tensor_types() {
-        let Some(path) = poot_test_util::model_path(poot_test_util::checkpoint!(
-            "qwen2.5-0.5b-gguf/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-        )) else {
-            return;
-        };
-        let n_layers: usize = std::env::var("POOT_DIAG_LAYERS")
-            .unwrap_or_else(|_| "2".to_string())
-            .parse()
-            .expect("numeric POOT_DIAG_LAYERS");
-        let g = WholeGguf::load(&path).expect("load gguf");
-        let type_name = |t: u32| {
-            match t {
-                0 => "F32",
-                1 => "F16",
-                2 => "Q4_0",
-                3 => "Q4_1",
-                6 => "Q5_0",
-                7 => "Q5_1",
-                8 => "Q8_0",
-                10 => "Q2_K",
-                11 => "Q3_K",
-                12 => "Q4_K",
-                13 => "Q5_K",
-                14 => "Q6_K",
-                15 => "Q8_K",
-                30 => "BF16",
-                x => return format!("?({})", x),
-            }
-            .to_string()
-        };
-        let projs = [
-            "attn_q.weight",
-            "attn_k.weight",
-            "attn_v.weight",
-            "attn_output.weight",
-            "ffn_gate.weight",
-            "ffn_up.weight",
-            "ffn_down.weight",
-        ];
-        for i in 0..n_layers {
-            for p in &projs {
-                let name = format!("blk.{i}.{p}");
-                if let Some(info) = g.tensors.get(&name) {
-                    eprintln!(
-                        "blk.{i}.{}: {} dims={:?}",
-                        p,
-                        type_name(info.ggml_type),
-                        info.dims
-                    );
-                } else {
-                    eprintln!("blk.{i}.{p}: MISSING");
-                }
-            }
-        }
     }
 
     /// Card 543 SC-004: every ggml type id 0..=39 maps through [`weight_format_of`] to its format or

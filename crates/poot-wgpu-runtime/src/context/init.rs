@@ -1,6 +1,8 @@
 use crate::require::require_gpu_check;
 use crate::timestamps::storage_entry;
-use crate::{CachedPipeline, Context, DeviceTimingAccumulator, RuntimeError};
+use crate::{
+    CachedPipeline, Context, ContextOptions, DeviceHealth, DeviceTimingAccumulator, RuntimeError,
+};
 use poot_runtime_common::CompiledKernel;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -9,7 +11,12 @@ use std::collections::HashMap;
 impl Context {
     /// A context with device-timing off (the default; no per-dispatch overhead).
     pub fn new() -> Result<Self, RuntimeError> {
-        pollster::block_on(Self::new_async(false, 0)).map_err(require_gpu_check)
+        Self::new_with_options(ContextOptions::default())
+    }
+
+    /// [`Self::new`] with explicit [`ContextOptions`].
+    pub fn new_with_options(options: ContextOptions) -> Result<Self, RuntimeError> {
+        pollster::block_on(Self::new_async(false, 0, options)).map_err(require_gpu_check)
     }
 
     /// A context for the typed Card 552 timing path. `max_in_flight_queries` is the declared bound
@@ -21,6 +28,7 @@ impl Context {
         pollster::block_on(Self::new_async(
             max_in_flight_queries > 0,
             max_in_flight_queries,
+            ContextOptions::default(),
         ))
         .map_err(require_gpu_check)
     }
@@ -107,6 +115,7 @@ impl Context {
     pub(crate) async fn new_async(
         device_timing: bool,
         max_in_flight_queries: usize,
+        options: ContextOptions,
     ) -> Result<Self, RuntimeError> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -246,7 +255,14 @@ impl Context {
                 panic!("[poot-wgpu-debug] uncaptured wgpu error (see diagnostics above): {err}");
             }));
         }
+        let health = std::sync::Arc::new(DeviceHealth::default());
+        let lost = std::sync::Arc::clone(&health);
+        device.set_device_lost_callback(move |reason, message| {
+            lost.lose(format!("{reason:?}: {message}"));
+        });
         let mut context = Context {
+            health,
+            wait_timeout: options.wait_timeout,
             _instance: instance,
             _adapter: adapter,
             device,

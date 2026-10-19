@@ -25,7 +25,7 @@ use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
 use crate::names::{
     ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("olmoe");
@@ -181,7 +181,7 @@ pub(crate) struct Olmoe {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = OlmoeConfig::from_raw(raw)?;
     let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
         ConfigSource::HfModelType => ([HF_BASE, HF_QK_NORM], &HF_MOE),
@@ -225,14 +225,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Olmoe {
+    Ok(ModelParts::new(Box::new(Olmoe {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Olmoe {
@@ -500,6 +500,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -555,6 +556,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -738,6 +740,7 @@ mod family_tests {
             assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
             let model = registry.build(&raw, &store).unwrap();
             let stacks: Vec<_> = model
+                .model
                 .weights()
                 .iter()
                 .filter(|(id, _, handle)| {
@@ -752,10 +755,10 @@ mod family_tests {
             }
             let reference = model_of(&fixture_config(), &reference_store);
             let prompt = [3, 17, 40, 8];
-            let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+            let (got, state) = run_step(&*model.model, &store, CAP, &prompt, 0, &[]);
             let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
             close(&got, &want);
-            let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+            let (got, _) = run_step(&*model.model, &store, CAP, &[5], 4, &state);
             let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
             close(&got, &want);
         }

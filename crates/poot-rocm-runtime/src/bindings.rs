@@ -21,6 +21,8 @@ pub type hsa_status_t = u32;
 
 /// `HSA_STATUS_SUCCESS = 0`, the only success code.
 pub const HSA_STATUS_SUCCESS: hsa_status_t = 0;
+/// `HSA_STATUS_ERROR = 0x1000`, the generic failure (also an already-registered system event handler).
+pub const HSA_STATUS_ERROR: hsa_status_t = 0x1000;
 
 // Opaque agent / queue / pool / signal handles (all 64-bit)
 
@@ -94,14 +96,11 @@ pub const HSA_DEVICE_TYPE_CPU: u32 = 0;
 pub const HSA_DEVICE_TYPE_GPU: u32 = 1;
 
 // hsa.h queue types
-// Values match installed ROCm `hsa.h` (`HSA_QUEUE_TYPE_MULTI = 0`, `SINGLE = 1`,
-// `COOPERATIVE = 2`). Do not swap MULTI/SINGLE: ROCr's device-memory ring path and ordinary
-// publication go through MULTI (=0).
+// Values match installed ROCm `hsa.h` (`HSA_QUEUE_TYPE_MULTI = 0`, `SINGLE = 1`). Do not swap
+// MULTI/SINGLE: ROCr's device-memory ring path and ordinary publication go through MULTI (=0).
 
 /// Queue type: several producers may enqueue (ROCr's ordinary queue).
 pub const HSA_QUEUE_TYPE_MULTI: hsa_queue_type32_t = 0;
-/// Queue type: a cooperative queue (GWS-capable), required by persistent cooperative kernels.
-pub const HSA_QUEUE_TYPE_COOPERATIVE: hsa_queue_type32_t = 2;
 
 // hsa.h queue feature bits
 
@@ -125,8 +124,6 @@ pub const HSA_AMD_AGENT_INFO_BDFID: u32 = 0xA006;
 pub const HSA_AMD_AGENT_INFO_PRODUCT_NAME: u32 = 0xA009;
 /// AMD agent attribute: the PCI domain (`uint32_t`).
 pub const HSA_AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
-/// AMD agent attribute: whether the agent supports cooperative queues (`bool`).
-pub const HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES: u32 = 0xA010;
 /// Bit-mask (`uint8_t[8]`) of agent memory properties. Test bits with `hsa_flag_isset64` using
 /// [`HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU`] as the bit index (the enum value is `1 << 0`, not a
 /// mask against the first byte).
@@ -298,6 +295,76 @@ pub type HsaAmdMemoryPoolIterateCb =
 /// `hsa_queue_create` callback (the asynchronous error callback; `None` is passed).
 pub type HsaQueueCreateCb =
     Option<unsafe extern "C" fn(status: hsa_status_t, queue: *mut hsa_queue_t, data: *mut c_void)>;
+
+/// `hsa_amd_event_type_t` value of a GPU memory fault.
+pub const HSA_AMD_GPU_MEMORY_FAULT_EVENT: u32 = 0;
+/// `hsa_amd_event_type_t` value of a GPU hardware exception (a reset).
+pub const HSA_AMD_GPU_HW_EXCEPTION_EVENT: u32 = 1;
+/// `hsa_amd_event_type_t` value of a GPU memory error.
+pub const HSA_AMD_GPU_MEMORY_ERROR_EVENT: u32 = 2;
+
+/// `hsa_amd_gpu_memory_fault_info_t`: where and why the GPU faulted.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct hsa_amd_gpu_memory_fault_info_t {
+    /// The agent where the fault occurred.
+    pub agent: hsa_agent_t,
+    /// The virtual address accessed.
+    pub virtual_address: u64,
+    /// `hsa_amd_memory_fault_reason_t` bits.
+    pub fault_reason_mask: u32,
+}
+
+/// `hsa_amd_gpu_hw_exception_info_t`: a GPU reset and its cause.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct hsa_amd_gpu_hw_exception_info_t {
+    /// The agent where the exception occurred.
+    pub agent: hsa_agent_t,
+    /// `hsa_amd_hw_exception_reset_type_t` bits.
+    pub reset_type: u32,
+    /// `hsa_amd_hw_exception_reset_cause_t` bits.
+    pub reset_cause: u32,
+}
+
+/// `hsa_amd_gpu_memory_error_info_t`: a memory error the GPU reported.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct hsa_amd_gpu_memory_error_info_t {
+    /// The agent where the error occurred.
+    pub agent: hsa_agent_t,
+    /// The virtual address involved.
+    pub virtual_address: u64,
+    /// `hsa_amd_memory_error_reason_t` bits.
+    pub error_reason_mask: u32,
+}
+
+/// The payload union of [`hsa_amd_event_t`]; the active member follows `event_type`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union hsa_amd_event_payload_t {
+    /// Valid for [`HSA_AMD_GPU_MEMORY_FAULT_EVENT`].
+    pub memory_fault: hsa_amd_gpu_memory_fault_info_t,
+    /// Valid for [`HSA_AMD_GPU_HW_EXCEPTION_EVENT`].
+    pub hw_exception: hsa_amd_gpu_hw_exception_info_t,
+    /// Valid for [`HSA_AMD_GPU_MEMORY_ERROR_EVENT`].
+    pub memory_error: hsa_amd_gpu_memory_error_info_t,
+}
+
+/// `hsa_amd_event_t`: one AMD system event delivered to the registered handler.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct hsa_amd_event_t {
+    /// `hsa_amd_event_type_t`.
+    pub event_type: u32,
+    /// The event's data, selected by `event_type`.
+    pub payload: hsa_amd_event_payload_t,
+}
+
+/// `hsa_amd_register_system_event_handler` callback. Return `HSA_STATUS_SUCCESS` once the event is
+/// handled.
+pub type HsaAmdSystemEventCb =
+    unsafe extern "C" fn(event: *const hsa_amd_event_t, data: *mut c_void) -> hsa_status_t;
 
 // Code-object / executable / signal handles (HSACO loading + AQL dispatch)
 
@@ -524,6 +591,10 @@ unsafe extern "C" {
         agent_ptr: *mut *mut c_void,
     ) -> hsa_status_t;
     pub(crate) fn hsa_amd_memory_unlock(host_ptr: *mut c_void) -> hsa_status_t;
+    pub(crate) fn hsa_amd_register_system_event_handler(
+        callback: HsaAmdSystemEventCb,
+        data: *mut c_void,
+    ) -> hsa_status_t;
     pub(crate) fn hsa_code_object_reader_create_from_memory(
         code_object: *const c_void,
         size: usize,

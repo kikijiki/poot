@@ -3,8 +3,8 @@
 //! tracer forgets `layer_scope` (or opens it late, or drops a layer) cannot be layer-cut by the stage
 //! split; this row finds it without a per-family test.
 //!
-//! The corpus is `Registry::builtin().entries()` crossed with each entry's fixtures (the same walk the
-//! plan-summary gate uses), so a family registered with a fixture joins this row with no edit here.
+//! The corpus is `Registry::builtin().entries()` crossed with each entry's fixtures and the towers of their
+//! containers (the same walk the plan-summary gate uses), so a family registered with a fixture joins this row with no edit here.
 //! `Family::ALL` itself is crate-private; its drift row is
 //! `registry::tests::family_all_lists_every_variant_once_and_builtin_registers_exactly_them`.
 //!
@@ -43,26 +43,14 @@ fn configured_layers(config: &Value) -> usize {
         .unwrap_or_else(|| panic!("fixture config names no layer count: {config}")) as usize
 }
 
-/// Every fixture with its configured layer count, in the corpus order.
+/// Every fixture (a registered model and each tower of its container) with its configured layer count,
+/// in the corpus order.
 fn fixtures_with_layers(registry: &Registry) -> Vec<(Fixtured, usize)> {
-    let mut configs = Vec::new();
-    for entry in registry.entries() {
-        configs.push((entry.family.as_str().to_string(), (entry.fixture)().config));
-        for (variant, make) in entry.variants {
-            configs.push((
-                format!("{}/{variant}", entry.family.as_str()),
-                make().config,
-            ));
-        }
-    }
-    let fixtured = fixtured(registry);
-    assert_eq!(fixtured.len(), configs.len());
-    fixtured
+    fixtured(registry)
         .into_iter()
-        .zip(configs)
-        .map(|(f, (label, config))| {
-            assert_eq!(f.label, label, "corpus order drifted from the entry walk");
-            (f, configured_layers(&config))
+        .map(|f| {
+            let layers = configured_layers(&f.config);
+            (f, layers)
         })
         .collect()
 }

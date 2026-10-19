@@ -6,15 +6,13 @@
 //!   oracle's evaluation of the same graph (its decomposition), the carried state each side's own.
 //! - [`streamed_in_pieces`]: a long scan stepped in short pieces through the entry's committed state, assembled into
 //!   the one packed result a single launch over the whole sequence must equal.
-//! - [`measure`]: median step time of a scan, for timing receipts.
 //! - [`device_time_of_step`], [`timed_step`]: the [`DeviceTime`] a device reports for one scan step
 //!   (POOT-1072), and that step's packed result.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
-use poot_executor::{DeviceTime, Executor, NoSync, StateScope, StepInputs};
+use poot_executor::{DeviceTime, Executor, NoSync, StepInputs};
 use poot_graph_ir::analysis::Tier2Class;
 use poot_graph_ir::test_support::scan::{ScanFixture, ScanGraph};
 use poot_graph_ir::{Graph, ValueId};
@@ -237,52 +235,4 @@ pub fn timed_step(
     drop(out);
     exec.unload(exe).unwrap();
     (time, packed.as_f32().unwrap().to_vec())
-}
-
-/// One scan's step time: the host wall time of a step (inputs staged, output read back) and, where the
-/// backend reports it, the device time of its dispatches.
-#[derive(Clone, Copy, Debug)]
-pub struct StepTime {
-    /// Host wall milliseconds of the step, inputs staged and output read back.
-    pub wall_ms: f64,
-    /// Device milliseconds of the step's dispatches, or `None` when the backend reports no device time.
-    pub device_ms: Option<f64>,
-}
-
-/// The median over `runs` steps of the scan `fixture` on `target`, after one warm-up step.
-pub fn measure(
-    exec: &mut dyn Executor,
-    target: Target,
-    fixture: &ScanFixture,
-    runs: usize,
-) -> StepTime {
-    let scan = fixture.packed_slot_graph();
-    let (exe, entry, _) = load_graph_entry(exec, target, &scan.graph, "measure");
-    let inputs = fixture.inputs(7);
-    let bound = fixture.bind(&scan, &inputs);
-    let mut samples = Vec::new();
-    for run in 0..=runs {
-        let mut step_inputs = StepInputs::new();
-        for &id in &scan.operands[..scan.operands.len() - 1] {
-            let key = scan.graph.meta(id).slot_key().unwrap().clone();
-            step_inputs.push(key, bound[&id].shape(), bound[&id].view());
-        }
-        let start = Instant::now();
-        let mut out = exec
-            .step(exe, entry, &step_inputs, &mut NoSync)
-            .expect("the scan steps");
-        let device_ms = match out.device_time() {
-            DeviceTime::Measured(m) => m.sum_of_dispatch_durations.map(|d| d.as_secs_f64() * 1e3),
-            DeviceTime::Unknown => None,
-        };
-        out.to_host().expect("the packed result reads back");
-        let wall_ms = start.elapsed().as_secs_f64() * 1e3;
-        exec.reset_state(exe, StateScope::All).unwrap();
-        if run > 0 {
-            samples.push(StepTime { wall_ms, device_ms });
-        }
-    }
-    exec.unload(exe).unwrap();
-    samples.sort_by(|a, b| a.wall_ms.total_cmp(&b.wall_ms));
-    samples[samples.len() / 2]
 }

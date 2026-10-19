@@ -9,6 +9,10 @@ use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// The fence-wait bound every mock context is built with.
+const WAIT_BOUND: Duration = Duration::from_millis(50);
 
 use ash::vk::Handle;
 
@@ -29,6 +33,8 @@ enum FailPoint {
     QueueSubmitOutOfMemory,
     /// `vkQueueSubmit` fails with device loss: no guarantee that nothing was queued.
     QueueSubmitDeviceLost,
+    /// The submission is accepted but its fence is never signalled (a hung device).
+    FenceNeverSignalled,
     /// `vkWaitForFences` fails after a successful submit.
     WaitForFences,
 }
@@ -233,12 +239,21 @@ impl ResourceDispatch for MockDispatch {
         &self,
         _device: &ash::Device,
         _fences: &[ash::vk::Fence],
+        timeout: std::time::Duration,
     ) -> Result<(), ash::vk::Result> {
         self.event("wait_for_fences");
-        if self.fail_at() == Some(FailPoint::WaitForFences) {
-            Err(ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY)
-        } else {
-            Ok(())
+        match self.fail_at() {
+            Some(FailPoint::WaitForFences) => Err(ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY),
+            // A fence nothing signals: it blocks for the whole bound, then reports the timeout. With no
+            // bound it would block forever, which is the hang the bound exists to prevent.
+            Some(FailPoint::FenceNeverSignalled) => {
+                if timeout >= Duration::from_secs(3600) {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+                std::thread::sleep(timeout);
+                Err(ash::vk::Result::TIMEOUT)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -325,6 +340,7 @@ fn mock_context(fail_at: Option<FailPoint>) -> (Context, Arc<MockDispatch>) {
         ash::vk::Queue::from_raw(3),
         dispatch,
         None,
+        WAIT_BOUND,
     ));
     (
         Context {
@@ -739,6 +755,36 @@ fn failed_fence_wait_after_submit_poisons_and_leaks_everything() {
     assert!(
         teardown.iter().all(|event| !DESTROY_EVENTS.contains(event)),
         "nothing a lost submission could reference may be destroyed; got {teardown:?}"
+    );
+}
+
+/// SC-004 (raw Vulkan): a fence nothing signals ends the wait at the configured bound with the typed
+/// `WaitTimeout`, poisons the device, and leaks instead of destroying. Mutation: pass `Duration::MAX`
+/// to `wait_for_fences` in `DeviceOwner::submit_and_wait`; the mock fence then blocks for an hour and
+/// the test hangs to the harness timeout (red).
+#[test]
+fn a_fence_that_never_signals_times_out_within_the_bound_and_poisons() {
+    let (context, mock, graph, buffer) = mock_replayable_graph(FailPoint::FenceNeverSignalled);
+    let start = std::time::Instant::now();
+    let result = graph.replay();
+    assert!(
+        matches!(result, Err(RuntimeError::WaitTimeout { secs: 0 })),
+        "got {result:?}"
+    );
+    assert!(start.elapsed() >= WAIT_BOUND && start.elapsed() < WAIT_BOUND * 20);
+    assert!(matches!(
+        graph.replay(),
+        Err(RuntimeError::Poisoned { op: "replay" })
+    ));
+    let after_loss = mock.events().len();
+    drop(graph);
+    drop(buffer);
+    drop(context);
+    assert!(
+        mock.events()[after_loss..]
+            .iter()
+            .all(|event| !DESTROY_EVENTS.contains(event)),
+        "a hung submission may still reference everything: nothing is destroyed"
     );
 }
 

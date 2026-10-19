@@ -9,4 +9,6 @@ pub mod fixtures;
 #[cfg(feature = "test-support")]
 pub mod pipeline;
 #[cfg(feature = "test-support")]
+pub mod vlm;
+#[cfg(feature = "test-support")]
 pub mod weight_map;

@@ -127,6 +127,7 @@ mod reference {
             let params = Qwen4ExpParams::from_raw(&RawConfig::HfJson {
                 config,
                 generation: None,
+                preprocessor: None,
             })
             .unwrap();
             Self {
@@ -808,6 +809,7 @@ fn built(fixture: &Fixture) -> Box<dyn Model> {
     registry
         .build(&fixture.raw(), &fixture.store)
         .unwrap_or_else(|e| panic!("{e}"))
+        .model
 }
 
 /// Tier 2 (ADR-0101): `got` within `1e-4 * (1 + |want|)` of `want` at every element, NaN failing; the
@@ -1333,6 +1335,7 @@ fn from_raw_refuses_what_the_family_cannot_configure() {
         Qwen4ExpParams::from_raw(&RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         })
         .expect_err("the config is refused")
     };
@@ -1622,7 +1625,7 @@ fn a_checkpoint_with_sharded_ple_tables_matches_the_single_table() {
     let step =
         |model: &dyn Model, store: &WeightStore| run_step(model, store, CAP, &TOKENS, 0, &[]);
     let (want, _) = step(single.as_ref(), &fixture.store);
-    let (got, _) = step(sharded.as_ref(), &store);
+    let (got, _) = step(sharded.model.as_ref(), &store);
     assert_eq!(
         got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
         want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()

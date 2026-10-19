@@ -1,5 +1,5 @@
 mod alloc;
 mod dispatch;
 pub(crate) mod graph;
-mod init;
+pub(crate) mod init;
 mod pipeline;

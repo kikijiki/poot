@@ -3018,45 +3018,6 @@ mod surface_bytes_and_limits {
         )
     }
 
-    /// Guided decode-rate row: the host cost of one mask step on a 32k vocabulary where about 12% of the
-    /// tokens are allowed. Prints ns/step; run by name with `--run-ignored` and compare a build with the
-    /// per-state cache against one without it (see the card). A timing is not an assertion.
-    #[test]
-    #[ignore = "timing row, not a correctness test: prints ns/step"]
-    fn guided_mask_step_rate_row() {
-        use tokenizers::Tokenizer;
-        use tokenizers::models::wordlevel::WordLevel;
-        let letters = b"abcdefghijklmnopqrstuvwxyz";
-        let vocab = (0..32_000u32)
-            .map(|i| (format!("{}{i}", letters[i as usize % 26] as char), i))
-            .chain([("<unk>".to_string(), 32_000u32)])
-            .collect();
-        let model = WordLevel::builder()
-            .vocab(vocab)
-            .unk_token("<unk>".to_string())
-            .build()
-            .unwrap();
-        let codec = TextCodec::new(
-            Tokenizer::new(model),
-            None,
-            None,
-            32_000,
-            ChatFormat::ChatML,
-            crate::tokenize::ChatTemplate::default(),
-        );
-        let mut constraint = codec.build_regex_constraint("([a-c][0-9]+)+").unwrap();
-        let steps = 300u32;
-        let started = std::time::Instant::now();
-        let mut allowed_len = 0;
-        for _ in 0..steps {
-            let (allowed, _) = constraint.allowed_next();
-            allowed_len = allowed.len();
-            constraint.advance(0); // token `a0`
-        }
-        let per_step = started.elapsed() / steps;
-        eprintln!("guided mask step: {per_step:?}/step, {allowed_len} of 32000 tokens allowed");
-    }
-
     #[test]
     fn a_revisited_state_reads_its_cached_mask() {
         let codec = numeric_codec();

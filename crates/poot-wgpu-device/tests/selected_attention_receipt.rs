@@ -24,7 +24,7 @@ fn block_top_k_and_selected_attention_device_times() {
         return;
     };
     if !device.has_device_timestamps() {
-        eprintln!("skip: the adapter has no TIMESTAMP_QUERY");
+        poot_runtime_common::device_skip::skip_unsupported(DeviceBackend::Wgpu, "TIMESTAMP_QUERY");
         return;
     }
     let target = device.target();

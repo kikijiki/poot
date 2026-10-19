@@ -2,14 +2,19 @@
 //!
 //! The caller owns tokenization and supplies the tokenizer's special-token ids explicitly. This module
 //! validates the resulting image/video marker spans, turns them into a resolved layout, and implements
-//! Qwen2-VL unit-temporal-stride plus Qwen2.5-VL caller-resolved timestamp scaling. A pure config boundary
+//! unit-temporal-stride images plus Qwen2.5-VL caller-resolved timestamp scaling for videos. A pure config boundary
 //! resolves only metadata present in HF `config.json`; it does not resolve token strings, derive video grid
 //! timing, or inspect vision embeddings.
+
+use crate::architectures::qwen2::model::VL_FAMILY;
+use crate::components::dims::{Field, Fields};
+use crate::model::{ConfigReason, ModelError};
+use crate::registry::RawConfig;
 
 /// The largest position exactly mirrored by `poot_eval::Tensor`'s f32 compatibility payload.
 /// The authoritative I32 payload can represent more, but the CPU oracle still reads gather indices
 /// through that mirror, so accepting a larger host position would make source verification lossy.
-pub const MAX_EXACT_MROPE_POSITION: usize = 1 << 24;
+pub(crate) const MAX_EXACT_MROPE_POSITION: usize = 1 << 24;
 
 /// Which kind of visual input a placeholder span carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,7 +27,7 @@ pub enum MropeVisualKind {
 
 /// The semantic role of a special token the span discovery recognizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MropeSpecialTokenKind {
+pub(crate) enum MropeSpecialTokenKind {
     /// The delimiter that opens a visual placeholder span.
     VisionStart,
     /// The placeholder repeated once per merged image token.
@@ -44,7 +49,7 @@ impl std::fmt::Display for MropeSpecialTokenKind {
 /// Tokenizer-specific ids needed to recognize one Qwen-VL visual marker span. The caller resolves these
 /// ids from its tokenizer/config; span discovery deliberately does not assign ids to token strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MropeSpecialTokenIds {
+pub(crate) struct MropeSpecialTokenIds {
     /// The id of the vision-start delimiter.
     pub vision_start: u32,
     /// The id of the image placeholder.
@@ -55,7 +60,7 @@ pub struct MropeSpecialTokenIds {
 
 impl MropeSpecialTokenIds {
     /// The three ids as given, unchecked; [`Self::try_new`] refuses a duplicate.
-    pub const fn new(vision_start: u32, image: u32, video: u32) -> Self {
+    pub(crate) const fn new(vision_start: u32, image: u32, video: u32) -> Self {
         Self {
             vision_start,
             image,
@@ -64,7 +69,11 @@ impl MropeSpecialTokenIds {
     }
 
     /// Construct a marker set only when every semantic role has a distinct token ID.
-    pub fn try_new(vision_start: u32, image: u32, video: u32) -> Result<Self, MropeSpanError> {
+    pub(crate) fn try_new(
+        vision_start: u32,
+        image: u32,
+        video: u32,
+    ) -> Result<Self, MropeSpanError> {
         let ids = Self::new(vision_start, image, video);
         ids.validate()?;
         Ok(ids)
@@ -104,312 +113,71 @@ impl MropeSpecialTokenIds {
     }
 }
 
-const MROPE_SPECIAL_TOKEN_ROLE_ORDER: [MropeSpecialTokenKind; 3] = [
-    MropeSpecialTokenKind::VisionStart,
-    MropeSpecialTokenKind::Image,
-    MropeSpecialTokenKind::Video,
-];
-
-/// Processor/template-owned marker string for one Qwen-VL mRoPE semantic role.
+/// Validated mRoPE values read directly from a Qwen2.5-VL HF `config.json`.
 ///
-/// The tokenizer, not this record, maps the string to a token ID.
+/// The model config contains the marker IDs and (when explicitly present) temporal position tokens per
+/// second. The rotary section widths are the text model's to read. The config does not contain
+/// processor-derived seconds per grid step, so this type intentionally has no `MropeSecondsPerGridStep`
+/// field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MropeProcessorSpecialToken<'a> {
-    /// The semantic role the marker plays.
-    pub role: MropeSpecialTokenKind,
-    /// The marker string, as the processor or chat template spells it.
-    pub token: &'a str,
-}
-
-impl<'a> MropeProcessorSpecialToken<'a> {
-    /// A marker record for `role`.
-    pub const fn new(role: MropeSpecialTokenKind, token: &'a str) -> Self {
-        Self { role, token }
-    }
-}
-
-/// Tokenizer-owned string-to-ID record.
-///
-/// This in-memory shape lets tests and future adapters preserve duplicate source metadata when that metadata
-/// is representable. A live `tokenizers::Tokenizer::token_to_id` adapter can instead synthesize unique records.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MropeTokenizerSpecialToken<'a> {
-    /// The marker string.
-    pub token: &'a str,
-    /// The id the tokenizer assigns it.
-    pub id: u32,
-}
-
-impl<'a> MropeTokenizerSpecialToken<'a> {
-    /// A tokenizer record mapping `token` to `id`.
-    pub const fn new(token: &'a str, id: u32) -> Self {
-        Self { token, id }
-    }
-}
-
-/// Why processor markers, tokenizer ids and config ids do not reconcile into one marker set.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MropeSpecialTokenReconcileError {
-    /// The processor metadata names no marker for `role`.
-    #[error("mRoPE processor metadata is missing {role} special token")]
-    MissingProcessorSpecialToken {
-        /// The role with no marker.
-        role: MropeSpecialTokenKind,
-    },
-    /// The processor metadata names more than one marker for `role`.
-    #[error("mRoPE processor metadata has duplicate {role} special-token records")]
-    DuplicateProcessorSpecialToken {
-        /// The role with several markers.
-        role: MropeSpecialTokenKind,
-    },
-    /// Two roles share one marker string.
-    #[error("mRoPE processor marker {token:?} is assigned to both {first} and {second}")]
-    DuplicateProcessorMarker {
-        /// The shared marker string.
-        token: String,
-        /// The first role carrying it.
-        first: MropeSpecialTokenKind,
-        /// The second role carrying it.
-        second: MropeSpecialTokenKind,
-    },
-    /// The tokenizer has no id for a role's marker string.
-    #[error("mRoPE tokenizer has no ID for {role} marker {token:?}")]
-    UnknownTokenizerSpecialToken {
-        /// The role whose marker is unknown.
-        role: MropeSpecialTokenKind,
-        /// The marker string.
-        token: String,
-    },
-    #[error(
-        "mRoPE tokenizer has duplicate records for marker {token:?}: IDs {first_id} and {second_id}"
-    )]
-    /// The tokenizer carries two records for one marker string, with different ids.
-    DuplicateTokenizerSpecialToken {
-        /// The marker string.
-        token: String,
-        /// The first record's id.
-        first_id: u32,
-        /// The second record's id.
-        second_id: u32,
-    },
-    /// Two roles resolve to the same tokenizer id.
-    #[error("mRoPE tokenizer ID {token_id} is assigned to both {first} and {second}")]
-    DuplicateTokenizerSpecialTokenId {
-        /// The shared id.
-        token_id: u32,
-        /// The first role carrying it.
-        first: MropeSpecialTokenKind,
-        /// The second role carrying it.
-        second: MropeSpecialTokenKind,
-    },
-    #[error(
-        "mRoPE {role} marker {token:?} resolves to tokenizer ID {tokenizer_id}, but config metadata declares {config_id}"
-    )]
-    /// The tokenizer's id for a role disagrees with the id `config.json` declares.
-    ConfigSpecialTokenMismatch {
-        /// The role that disagrees.
-        role: MropeSpecialTokenKind,
-        /// The marker string.
-        token: String,
-        /// The id the tokenizer resolves the marker to.
-        tokenizer_id: u32,
-        /// The id the config declares.
-        config_id: u32,
-    },
-}
-
-/// Reconcile processor marker strings, tokenizer string IDs, and config metadata into existing mRoPE IDs.
-///
-/// The tokenizer records are authoritative for string-to-ID mapping. Config metadata must agree with the
-/// resolved semantic IDs before callers can feed span discovery or position assembly.
-pub fn reconcile_mrope_special_token_ids(
-    processor_tokens: &[MropeProcessorSpecialToken<'_>],
-    tokenizer_tokens: &[MropeTokenizerSpecialToken<'_>],
-    config: &MropeConfigMetadata,
-) -> Result<MropeSpecialTokenIds, MropeSpecialTokenReconcileError> {
-    let mut role_tokens = [None; 3];
-    for role in MROPE_SPECIAL_TOKEN_ROLE_ORDER {
-        let mut matches = processor_tokens
-            .iter()
-            .filter(|record| record.role == role)
-            .map(|record| record.token);
-        let Some(token) = matches.next() else {
-            return Err(MropeSpecialTokenReconcileError::MissingProcessorSpecialToken { role });
-        };
-        if matches.next().is_some() {
-            return Err(MropeSpecialTokenReconcileError::DuplicateProcessorSpecialToken { role });
-        }
-        role_tokens[mrope_special_token_role_index(role)] = Some(token);
-    }
-    // Every role was matched above, so each slot is filled; a missing one is the same refusal.
-    let [Some(vision_start), Some(image), Some(video)] = role_tokens else {
-        let missing = MROPE_SPECIAL_TOKEN_ROLE_ORDER
-            .into_iter()
-            .find(|&role| role_tokens[mrope_special_token_role_index(role)].is_none())
-            .unwrap_or(MROPE_SPECIAL_TOKEN_ROLE_ORDER[0]);
-        return Err(
-            MropeSpecialTokenReconcileError::MissingProcessorSpecialToken { role: missing },
-        );
-    };
-    let role_tokens = [vision_start, image, video];
-
-    for first_index in 0..MROPE_SPECIAL_TOKEN_ROLE_ORDER.len() {
-        for second_index in first_index + 1..MROPE_SPECIAL_TOKEN_ROLE_ORDER.len() {
-            let first = MROPE_SPECIAL_TOKEN_ROLE_ORDER[first_index];
-            let second = MROPE_SPECIAL_TOKEN_ROLE_ORDER[second_index];
-            let first_token = role_tokens[first_index];
-            let second_token = role_tokens[second_index];
-            if first_token == second_token {
-                return Err(MropeSpecialTokenReconcileError::DuplicateProcessorMarker {
-                    token: first_token.to_string(),
-                    first,
-                    second,
-                });
-            }
-        }
-    }
-
-    let mut role_ids = [0u32; 3];
-    for role in MROPE_SPECIAL_TOKEN_ROLE_ORDER {
-        let index = mrope_special_token_role_index(role);
-        let token = role_tokens[index];
-        let mut matches = tokenizer_tokens
-            .iter()
-            .filter(|record| record.token == token)
-            .map(|record| record.id);
-        let Some(id) = matches.next() else {
-            return Err(
-                MropeSpecialTokenReconcileError::UnknownTokenizerSpecialToken {
-                    role,
-                    token: token.to_string(),
-                },
-            );
-        };
-        if let Some(second_id) = matches.next() {
-            return Err(
-                MropeSpecialTokenReconcileError::DuplicateTokenizerSpecialToken {
-                    token: token.to_string(),
-                    first_id: id,
-                    second_id,
-                },
-            );
-        }
-        role_ids[index] = id;
-    }
-
-    for first_index in 0..MROPE_SPECIAL_TOKEN_ROLE_ORDER.len() {
-        for second_index in first_index + 1..MROPE_SPECIAL_TOKEN_ROLE_ORDER.len() {
-            if role_ids[first_index] == role_ids[second_index] {
-                return Err(
-                    MropeSpecialTokenReconcileError::DuplicateTokenizerSpecialTokenId {
-                        token_id: role_ids[first_index],
-                        first: MROPE_SPECIAL_TOKEN_ROLE_ORDER[first_index],
-                        second: MROPE_SPECIAL_TOKEN_ROLE_ORDER[second_index],
-                    },
-                );
-            }
-        }
-    }
-
-    let config_ids = config.special_token_ids();
-    for role in MROPE_SPECIAL_TOKEN_ROLE_ORDER {
-        let index = mrope_special_token_role_index(role);
-        let tokenizer_id = role_ids[index];
-        let config_id = mrope_special_token_id_for_role(config_ids, role);
-        if tokenizer_id != config_id {
-            return Err(
-                MropeSpecialTokenReconcileError::ConfigSpecialTokenMismatch {
-                    role,
-                    token: role_tokens[index].to_string(),
-                    tokenizer_id,
-                    config_id,
-                },
-            );
-        }
-    }
-
-    Ok(MropeSpecialTokenIds::new(
-        role_ids[0],
-        role_ids[1],
-        role_ids[2],
-    ))
-}
-
-const fn mrope_special_token_role_index(role: MropeSpecialTokenKind) -> usize {
-    match role {
-        MropeSpecialTokenKind::VisionStart => 0,
-        MropeSpecialTokenKind::Image => 1,
-        MropeSpecialTokenKind::Video => 2,
-    }
-}
-
-const fn mrope_special_token_id_for_role(
-    ids: MropeSpecialTokenIds,
-    role: MropeSpecialTokenKind,
-) -> u32 {
-    match role {
-        MropeSpecialTokenKind::VisionStart => ids.vision_start,
-        MropeSpecialTokenKind::Image => ids.image,
-        MropeSpecialTokenKind::Video => ids.video,
-    }
-}
-
-/// Validated mRoPE values read directly from a Qwen2-VL or Qwen2.5-VL HF `config.json`.
-///
-/// The model config contains the section widths, marker IDs, and (for Qwen2.5-VL when explicitly
-/// present) temporal position tokens per second. It does not contain processor-derived seconds per grid
-/// step, so this type intentionally has no `MropeSecondsPerGridStep` field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MropeConfigMetadata {
-    mrope_section: [usize; 3],
+pub(crate) struct MropeConfigMetadata {
     special_token_ids: MropeSpecialTokenIds,
     temporal_tokens_per_second: Option<MropeTemporalTokensPerSecond>,
 }
 
 impl MropeConfigMetadata {
-    /// The per-axis rotary section widths `[temporal, height, width]`, in rotary pairs.
-    pub const fn mrope_section(&self) -> [usize; 3] {
-        self.mrope_section
+    /// The marker ids and temporal token rate of the checkpoint `raw` describes.
+    pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, MropeConfigMetadataError> {
+        let fields = Fields::new(raw, VL_FAMILY);
+        let id = |field: Field| {
+            fields
+                .token(field)?
+                .ok_or_else(|| fields.error(field.hf, ConfigReason::Missing))
+        };
+        let special_token_ids = MropeSpecialTokenIds::try_new(
+            id(Field::hf("vision_start_token_id"))?,
+            id(Field::hf("image_token_id"))?,
+            id(Field::hf("video_token_id"))?,
+        )?;
+        let rate = match raw {
+            RawConfig::HfJson { config, .. } => config
+                .get("vision_config")
+                .and_then(|vision| vision.get("tokens_per_second"))
+                .filter(|rate| !rate.is_null()),
+            RawConfig::Gguf(_) => None,
+        };
+        let temporal_tokens_per_second = rate
+            .map(|rate| {
+                rate.as_f64().ok_or_else(|| {
+                    fields.error("vision_config.tokens_per_second", ConfigReason::WrongType)
+                })
+            })
+            .transpose()?
+            .map(MropeTemporalTokensPerSecond::new)
+            .transpose()?;
+        Ok(Self {
+            special_token_ids,
+            temporal_tokens_per_second,
+        })
     }
 
     /// The marker ids the config declares.
-    pub const fn special_token_ids(&self) -> MropeSpecialTokenIds {
+    pub(crate) const fn special_token_ids(&self) -> MropeSpecialTokenIds {
         self.special_token_ids
     }
 
     /// The temporal position tokens per second, when the config states them (Qwen2.5-VL).
-    pub const fn temporal_tokens_per_second(&self) -> Option<MropeTemporalTokensPerSecond> {
+    pub(crate) const fn temporal_tokens_per_second(&self) -> Option<MropeTemporalTokensPerSecond> {
         self.temporal_tokens_per_second
-    }
-}
-
-impl TryFrom<poot_load::qwen_vl::QwenVlHfMetadata> for MropeConfigMetadata {
-    type Error = MropeConfigMetadataError;
-
-    fn try_from(raw: poot_load::qwen_vl::QwenVlHfMetadata) -> Result<Self, Self::Error> {
-        let special_token_ids = MropeSpecialTokenIds::try_new(
-            raw.vision_start_token_id(),
-            raw.image_token_id(),
-            raw.video_token_id(),
-        )?;
-        let temporal_tokens_per_second = raw
-            .temporal_tokens_per_second()
-            .map(MropeTemporalTokensPerSecond::new)
-            .transpose()?;
-        Ok(Self {
-            mrope_section: raw.mrope_section(),
-            special_token_ids,
-            temporal_tokens_per_second,
-        })
     }
 }
 
 /// Why `config.json`'s mRoPE metadata cannot become a [`MropeConfigMetadata`].
 #[derive(Debug, thiserror::Error)]
-pub enum MropeConfigMetadataError {
-    /// The loader could not read the metadata.
+pub(crate) enum MropeConfigMetadataError {
+    /// A marker id is absent or not a token id, or the temporal rate has another type.
     #[error(transparent)]
-    Load(#[from] poot_load::qwen_vl::QwenVlHfMetadataError),
+    Config(#[from] ModelError),
     /// The declared marker ids are not distinct.
     #[error(transparent)]
     SpecialTokenIds(#[from] MropeSpanError),
@@ -429,7 +197,7 @@ impl std::fmt::Display for MropeVisualKind {
 
 /// Raw vision-grid dimensions before the spatial merge performed by the vision connector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MropeGrid {
+pub(crate) struct MropeGrid {
     /// Temporal steps.
     pub temporal: usize,
     /// Patches along the height, before the spatial merge.
@@ -440,7 +208,7 @@ pub struct MropeGrid {
 
 impl MropeGrid {
     /// A grid of `temporal` steps over `height` by `width` patches.
-    pub const fn new(temporal: usize, height: usize, width: usize) -> Self {
+    pub(crate) const fn new(temporal: usize, height: usize, width: usize) -> Self {
         Self {
             temporal,
             height,
@@ -452,7 +220,7 @@ impl MropeGrid {
     ///
     /// Cached Transformers 4.49.0 uses `prod(grid_thw) // merge_size**2` for prompt pad expansion. That
     /// quotient equals this count when height and width are divisible by merge size.
-    pub fn merged_token_count(
+    pub(crate) fn merged_token_count(
         self,
         spatial_merge_size: usize,
         kind: MropeVisualKind,
@@ -484,25 +252,25 @@ impl std::fmt::Display for MropeTimingUnit {
 /// The processor owns frame sampling and timestamp/FPS interpretation. This type only makes the unit
 /// explicit and rejects values that cannot define a forward temporal scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MropeSecondsPerGridStep(f64);
+pub(crate) struct MropeSecondsPerGridStep(f64);
 
 impl Eq for MropeSecondsPerGridStep {}
 
 impl MropeSecondsPerGridStep {
     /// Seconds per grid step; a non-finite or non-positive value is a typed error.
-    pub fn new(value: f64) -> Result<Self, MropePositionError> {
+    pub(crate) fn new(value: f64) -> Result<Self, MropePositionError> {
         validate_timing(value, MropeTimingUnit::SecondsPerGridStep)?;
         Ok(Self(value))
     }
 
     /// The value in seconds.
-    pub const fn get(self) -> f64 {
+    pub(crate) const fn get(self) -> f64 {
         self.0
     }
 
     /// Resolve the processor-owned portion of Qwen2.5-VL video timing: Transformers 4.49.0 computes
     /// `second_per_grid_t = temporal_patch_size / fps`, and this keeps that division in one place.
-    pub fn from_qwen2_5_vl_processor(
+    pub(crate) fn from_qwen2_5_vl_processor(
         temporal_patch_size: MropeTemporalPatchSize,
         sampled_frames_per_second: MropeSampledFramesPerSecond,
     ) -> Result<Self, MropeProcessorTimingError> {
@@ -514,11 +282,11 @@ impl MropeSecondsPerGridStep {
 
 /// Qwen2.5-VL processor temporal patch size, in sampled frames per temporal vision-grid step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MropeTemporalPatchSize(usize);
+pub(crate) struct MropeTemporalPatchSize(usize);
 
 impl MropeTemporalPatchSize {
     /// A patch size in frames; zero is a typed error.
-    pub fn new(value: usize) -> Result<Self, MropeProcessorTimingError> {
+    pub(crate) fn new(value: usize) -> Result<Self, MropeProcessorTimingError> {
         if value == 0 {
             return Err(MropeProcessorTimingError::ZeroTemporalPatchSize);
         }
@@ -526,7 +294,7 @@ impl MropeTemporalPatchSize {
     }
 
     /// The patch size in sampled frames.
-    pub const fn get(self) -> usize {
+    pub(crate) const fn get(self) -> usize {
         self.0
     }
 }
@@ -536,13 +304,13 @@ impl MropeTemporalPatchSize {
 /// Upstream may broadcast one rate or accept one value per video. This type represents the already-selected
 /// per-video value, keeping broadcast and video-count reconciliation in processor/model-input assembly.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MropeSampledFramesPerSecond(f64);
+pub(crate) struct MropeSampledFramesPerSecond(f64);
 
 impl Eq for MropeSampledFramesPerSecond {}
 
 impl MropeSampledFramesPerSecond {
     /// A frame rate; a non-finite or non-positive value is a typed error.
-    pub fn new(value: f64) -> Result<Self, MropeProcessorTimingError> {
+    pub(crate) fn new(value: f64) -> Result<Self, MropeProcessorTimingError> {
         if !value.is_finite() {
             return Err(MropeProcessorTimingError::NonFiniteSampledFramesPerSecond);
         }
@@ -553,7 +321,7 @@ impl MropeSampledFramesPerSecond {
     }
 
     /// The rate in frames per second.
-    pub const fn get(self) -> f64 {
+    pub(crate) const fn get(self) -> f64 {
         self.0
     }
 }
@@ -562,7 +330,7 @@ impl MropeSampledFramesPerSecond {
 ///
 /// This type assigns no processor default. `PerVideo` values remain in processor order.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum MropeProcessorFpsInput<'a> {
+pub(crate) enum MropeProcessorFpsInput<'a> {
     /// One rate for every video.
     Scalar(f64),
     /// One rate per video, in processor order.
@@ -570,30 +338,30 @@ pub enum MropeProcessorFpsInput<'a> {
 }
 
 /// The fixed FPS used by the Qwen2.5-VL processor when its caller omits `videos_kwargs.fps`.
-pub const QWEN2_5_VL_PROCESSOR_DEFAULT_FPS: f64 = 2.0;
+pub(crate) const QWEN2_5_VL_PROCESSOR_DEFAULT_FPS: f64 = 2.0;
 
 /// Caller-resolved number of mRoPE temporal position tokens per second.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MropeTemporalTokensPerSecond(f64);
+pub(crate) struct MropeTemporalTokensPerSecond(f64);
 
 impl Eq for MropeTemporalTokensPerSecond {}
 
 impl MropeTemporalTokensPerSecond {
     /// Tokens per second; a non-finite or non-positive value is a typed error.
-    pub fn new(value: f64) -> Result<Self, MropePositionError> {
+    pub(crate) fn new(value: f64) -> Result<Self, MropePositionError> {
         validate_timing(value, MropeTimingUnit::TemporalTokensPerSecond)?;
         Ok(Self(value))
     }
 
     /// The rate in temporal position tokens per second.
-    pub const fn get(self) -> f64 {
+    pub(crate) const fn get(self) -> f64 {
         self.0
     }
 }
 
 /// Complete already-resolved Qwen2.5-VL temporal scaling metadata for one video grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MropeVideoTiming {
+pub(crate) struct MropeVideoTiming {
     /// Seconds one temporal grid step of the video covers.
     pub seconds_per_grid_step: MropeSecondsPerGridStep,
     /// The model's temporal position tokens per second.
@@ -602,7 +370,7 @@ pub struct MropeVideoTiming {
 
 impl MropeVideoTiming {
     /// The timing of one video from its two resolved values.
-    pub const fn new(
+    pub(crate) const fn new(
         seconds_per_grid_step: MropeSecondsPerGridStep,
         temporal_tokens_per_second: MropeTemporalTokensPerSecond,
     ) -> Self {
@@ -617,7 +385,7 @@ impl MropeVideoTiming {
     /// Transformers 4.49.0 computes `second_per_grid_t = temporal_patch_size / fps`. The two typed
     /// processor values must already reflect the caller's sampling decision; this function assigns no default
     /// and does not inspect video data or frame counts.
-    pub fn from_qwen2_5_vl_processor(
+    pub(crate) fn from_qwen2_5_vl_processor(
         temporal_patch_size: MropeTemporalPatchSize,
         sampled_frames_per_second: MropeSampledFramesPerSecond,
         config: &MropeConfigMetadata,
@@ -638,7 +406,7 @@ impl MropeVideoTiming {
 /// Transformers 4.49.0 broadcasts a numeric FPS to the number of video grids and otherwise requires one
 /// FPS value per grid. This pure boundary takes only that count, validates every explicit rate before
 /// config-dependent timing resolution, and reuses the one-video timing constructor for each output.
-pub fn assemble_qwen2_5_vl_video_timings(
+pub(crate) fn assemble_qwen2_5_vl_video_timings(
     video_count: usize,
     temporal_patch_size: MropeTemporalPatchSize,
     fps: MropeProcessorFpsInput<'_>,
@@ -680,7 +448,7 @@ pub fn assemble_qwen2_5_vl_video_timings(
 /// broadcast or per-video list validation as [`assemble_qwen2_5_vl_video_timings`]. `Some` preserves the
 /// caller's explicit scalar/list input; `None` is the only case that selects the default. This boundary has
 /// no access to video data, grids, timestamps, or frame counts.
-pub fn assemble_qwen2_5_vl_video_timings_with_default(
+pub(crate) fn assemble_qwen2_5_vl_video_timings_with_default(
     video_count: usize,
     temporal_patch_size: MropeTemporalPatchSize,
     fps: Option<MropeProcessorFpsInput<'_>>,
@@ -701,7 +469,7 @@ pub fn assemble_qwen2_5_vl_video_timings_with_default(
 /// Tokenization, grid construction, and tokenizer/config ID reconciliation remain caller-owned. The config
 /// metadata is used for the model's temporal-token rate when video timings are needed.
 #[derive(Clone, Copy, Debug)]
-pub struct Qwen25VlMropePositionInput<'a> {
+pub(crate) struct Qwen25VlMropePositionInput<'a> {
     /// The tokenized prompt.
     pub tokens: &'a [u32],
     /// The marker ids reconciled for this tokenizer and config.
@@ -722,7 +490,7 @@ pub struct Qwen25VlMropePositionInput<'a> {
 
 /// Why mRoPE positions could not be assembled from a tokenized prompt.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MropePositionAssemblyError {
+pub(crate) enum MropePositionAssemblyError {
     /// Span discovery refused the prompt.
     #[error(transparent)]
     Span(#[from] MropeSpanError),
@@ -738,12 +506,12 @@ pub enum MropePositionAssemblyError {
 }
 
 /// Assemble Qwen2.5-VL mRoPE positions from an already-tokenized prompt. Span discovery runs before timing
-/// resolution; discovered video segments become timestamped segments in video-list order, and the existing
-/// position constructor builds the result.
-pub fn assemble_qwen2_5_vl_mrope_positions(
+/// resolution; discovered video spans become timestamped segments in video-list order, and the position
+/// constructor builds the result.
+pub(crate) fn assemble_qwen2_5_vl_mrope_positions(
     input: Qwen25VlMropePositionInput<'_>,
 ) -> Result<MropePositionIds, MropePositionAssemblyError> {
-    let segments = discover_mrope_segments(
+    let spans = discover_mrope_spans(
         input.tokens,
         input.special_tokens,
         input.image_grids,
@@ -758,38 +526,48 @@ pub fn assemble_qwen2_5_vl_mrope_positions(
     )?;
 
     let mut next_video_timing = timings.into_iter();
-    let timestamped_segments = segments
+    let segments = spans
         .into_iter()
-        .map(|segment| match segment {
-            MropeSegment::Video(grid) => {
+        .map(|span| match span {
+            MropeSpan::Text(len) => Ok(MropeSegment::Text(len)),
+            MropeSpan::Image(grid) => Ok(MropeSegment::Image(grid)),
+            MropeSpan::Video(grid) => {
                 let timing = next_video_timing
                     .next()
                     .ok_or(MropePositionAssemblyError::VideoTimingCount)?;
                 Ok(MropeSegment::TimestampedVideo { grid, timing })
             }
-            segment => Ok(segment),
         })
         .collect::<Result<Vec<_>, MropePositionAssemblyError>>()?;
     debug_assert!(next_video_timing.next().is_none());
 
     Ok(build_mrope_position_ids(
-        &timestamped_segments,
+        &segments,
         input.spatial_merge_size,
     )?)
 }
 
-/// An already-resolved prompt segment. Text lengths include every non-placeholder token in that run,
-/// including the vision-start delimiter preceding a visual placeholder span and any following
-/// processor-specific delimiter.
+/// A run of a tokenized prompt as span discovery sees it: text, or the placeholders of one image or
+/// video, whose temporal scale is not yet known.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MropeSegment {
+pub(crate) enum MropeSpan {
+    /// A run of this many text tokens, including every non-placeholder token (the vision-start
+    /// delimiter preceding a visual placeholder run and any following processor-specific delimiter).
+    Text(usize),
+    /// An image placeholder run over this grid.
+    Image(MropeGrid),
+    /// A video placeholder run over this grid.
+    Video(MropeGrid),
+}
+
+/// An already-resolved prompt segment: a [`MropeSpan`] whose video timing the caller has resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MropeSegment {
     /// A run of this many text tokens, advancing all three axes together.
     Text(usize),
     /// An image placeholder run over this grid.
     Image(MropeGrid),
-    /// Qwen2-VL compatibility path. Temporal positions have unit stride.
-    Video(MropeGrid),
-    /// Qwen2.5-VL path. The caller has already resolved timing and model-rate metadata.
+    /// A video placeholder run, its temporal positions scaled by the resolved timing.
     TimestampedVideo {
         /// The video's raw grid.
         grid: MropeGrid,
@@ -961,7 +739,7 @@ pub enum MropePositionError {
 
 /// Why the Qwen2.5-VL processor's timing inputs cannot become video timings.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MropeProcessorTimingError {
+pub(crate) enum MropeProcessorTimingError {
     /// The temporal patch size is zero.
     #[error("mRoPE processor temporal patch size must be nonzero")]
     ZeroTemporalPatchSize,
@@ -991,7 +769,7 @@ pub enum MropeProcessorTimingError {
 
 /// Why a tokenized prompt's visual marker spans are refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum MropeSpanError {
+pub(crate) enum MropeSpanError {
     /// Two marker roles share one token id.
     #[error("mRoPE special-token id {token_id} is assigned to both {first} and {second}")]
     DuplicateSpecialTokenId {
@@ -1092,13 +870,13 @@ pub enum MropeSpanError {
 /// runs; only the placeholder run becomes a visual segment. Image and video grids are consumed independently
 /// in marker order. Discovery validates the complete prompt before returning, so an error never exposes a
 /// partial segment list.
-pub fn discover_mrope_segments(
+pub(crate) fn discover_mrope_spans(
     tokens: &[u32],
     special_tokens: MropeSpecialTokenIds,
     image_grids: &[MropeGrid],
     video_grids: &[MropeGrid],
     spatial_merge_size: usize,
-) -> Result<Vec<MropeSegment>, MropeSpanError> {
+) -> Result<Vec<MropeSpan>, MropeSpanError> {
     special_tokens.validate()?;
     if spatial_merge_size == 0 {
         return Err(MropePositionError::ZeroSpatialMerge.into());
@@ -1210,10 +988,10 @@ pub fn discover_mrope_segments(
                     }
                 }
 
-                append_text_segment(&mut segments, index + 1 - text_start);
+                append_text_span(&mut segments, index + 1 - text_start);
                 segments.push(match kind {
-                    MropeVisualKind::Image => MropeSegment::Image(grid),
-                    MropeVisualKind::Video => MropeSegment::Video(grid),
+                    MropeVisualKind::Image => MropeSpan::Image(grid),
+                    MropeVisualKind::Video => MropeSpan::Video(grid),
                 });
                 text_start = marker_index + expected;
                 index = text_start;
@@ -1221,7 +999,7 @@ pub fn discover_mrope_segments(
         }
     }
 
-    append_text_segment(&mut segments, tokens.len() - text_start);
+    append_text_span(&mut segments, tokens.len() - text_start);
     if image_index != image_grids.len() {
         return Err(MropeSpanError::ExtraGrids {
             kind: MropeVisualKind::Image,
@@ -1239,23 +1017,23 @@ pub fn discover_mrope_segments(
     Ok(segments)
 }
 
-fn append_text_segment(segments: &mut Vec<MropeSegment>, len: usize) {
+fn append_text_span(spans: &mut Vec<MropeSpan>, len: usize) {
     if len == 0 {
         return;
     }
-    if let Some(MropeSegment::Text(previous)) = segments.last_mut() {
+    if let Some(MropeSpan::Text(previous)) = spans.last_mut() {
         *previous += len;
     } else {
-        segments.push(MropeSegment::Text(len));
+        spans.push(MropeSpan::Text(len));
     }
 }
 
 /// Construct Qwen-VL mRoPE ids from an already-resolved prompt layout.
 ///
-/// Images and `MropeSegment::Video` use Qwen2-VL unit temporal stride. A `TimestampedVideo` consumes
-/// explicit timing units already resolved by the caller and applies Qwen2.5-VL temporal scaling. Both
-/// paths produce the same `MropePositionIds` contract used by binders and schedulers.
-pub fn build_mrope_position_ids(
+/// Images use unit temporal stride. A `TimestampedVideo` consumes explicit timing units already
+/// resolved by the caller and applies Qwen2.5-VL temporal scaling. Both produce the
+/// `MropePositionIds` contract used by binders and schedulers.
+pub(crate) fn build_mrope_position_ids(
     segments: &[MropeSegment],
     spatial_merge_size: usize,
 ) -> Result<MropePositionIds, MropePositionError> {
@@ -1287,13 +1065,6 @@ pub fn build_mrope_position_ids(
                 grid,
                 spatial_merge_size,
                 MropeVisualKind::Image,
-            )?,
-            MropeSegment::Video(grid) => append_grid(
-                &mut axes,
-                &mut base,
-                grid,
-                spatial_merge_size,
-                MropeVisualKind::Video,
             )?,
             MropeSegment::TimestampedVideo { grid, timing } => append_timestamped_video_grid(
                 &mut axes,
@@ -1466,33 +1237,27 @@ mod tests {
     const VISION_START: u32 = 10;
     const IMAGE: u32 = 12;
     const VIDEO: u32 = 13;
-    const VISION_START_TOKEN: &str = "<|vision_start|>";
-    const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
-    const VIDEO_PAD_TOKEN: &str = "<|video_pad|>";
 
-    /// Parse an HF `config.json` the way the loader does: the raw reader, then the validating `TryFrom`.
+    /// Read the mRoPE metadata of an HF `config.json`.
     fn config_metadata(json: &[u8]) -> Result<MropeConfigMetadata, MropeConfigMetadataError> {
-        poot_load::qwen_vl::QwenVlHfMetadata::from_slice(json)?.try_into()
+        let config: serde_json::Value = serde_json::from_slice(json).unwrap();
+        MropeConfigMetadata::from_raw(&RawConfig::HfJson {
+            config: &config,
+            generation: None,
+            preprocessor: None,
+        })
+    }
+
+    /// A video segment whose temporal positions advance one per grid step.
+    fn unit_video(grid: MropeGrid) -> MropeSegment {
+        MropeSegment::TimestampedVideo {
+            grid,
+            timing: video_timing(1.0, 1.0),
+        }
     }
 
     fn special_tokens() -> MropeSpecialTokenIds {
         MropeSpecialTokenIds::new(VISION_START, IMAGE, VIDEO)
-    }
-
-    fn processor_special_tokens() -> [MropeProcessorSpecialToken<'static>; 3] {
-        [
-            MropeProcessorSpecialToken::new(MropeSpecialTokenKind::VisionStart, VISION_START_TOKEN),
-            MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Image, IMAGE_PAD_TOKEN),
-            MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Video, VIDEO_PAD_TOKEN),
-        ]
-    }
-
-    fn tokenizer_special_tokens() -> [MropeTokenizerSpecialToken<'static>; 3] {
-        [
-            MropeTokenizerSpecialToken::new(VISION_START_TOKEN, VISION_START),
-            MropeTokenizerSpecialToken::new(IMAGE_PAD_TOKEN, IMAGE),
-            MropeTokenizerSpecialToken::new(VIDEO_PAD_TOKEN, VIDEO),
-        ]
     }
 
     fn video_timing(
@@ -1536,9 +1301,8 @@ mod tests {
 
     #[test]
     fn mrope_config_metadata_constructs_existing_domain_types_exactly() {
-        let qwen2 = qwen_vl_config_json("qwen2_vl", [151652, 151655, 151656], None);
-        let metadata = config_metadata(qwen2.as_bytes()).unwrap();
-        assert_eq!(metadata.mrope_section(), [16, 24, 24]);
+        let without_rate = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], None);
+        let metadata = config_metadata(without_rate.as_bytes()).unwrap();
         assert_eq!(
             metadata.special_token_ids(),
             MropeSpecialTokenIds::new(151652, 151655, 151656)
@@ -1584,15 +1348,15 @@ mod tests {
             ));
         }
 
-        for value in ["NaN", "Infinity", "-Infinity", "1e400"] {
-            let json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some(value));
-            assert!(matches!(
-                config_metadata(json.as_bytes()),
-                Err(MropeConfigMetadataError::Load(
-                    poot_load::qwen_vl::QwenVlHfMetadataError::Json(_)
-                ))
-            ));
-        }
+        let wrong_type =
+            qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], Some("\"fast\""));
+        assert!(matches!(
+            config_metadata(wrong_type.as_bytes()),
+            Err(MropeConfigMetadataError::Config(ModelError::Config {
+                reason: ConfigReason::WrongType,
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -1994,8 +1758,8 @@ mod tests {
             ))
         );
 
-        for model_type in ["qwen2_vl", "qwen2_5_vl"] {
-            let config_json = qwen_vl_config_json(model_type, [151652, 151655, 151656], None);
+        {
+            let config_json = qwen_vl_config_json("qwen2_5_vl", [151652, 151655, 151656], None);
             let metadata = config_metadata(config_json.as_bytes()).unwrap();
             assert_eq!(
                 MropeVideoTiming::from_qwen2_5_vl_processor(
@@ -2008,53 +1772,14 @@ mod tests {
         }
     }
 
-    /// Independent Qwen2-VL unit-stride reference; shares no production helpers.
-    fn legacy_unit_stride_reference(
-        segments: &[MropeSegment],
-        merge: usize,
-    ) -> ([Vec<i32>; 3], i32) {
-        let mut axes = [Vec::new(), Vec::new(), Vec::new()];
-        let mut base = 0usize;
-        for &segment in segments {
-            match segment {
-                MropeSegment::Text(len) => {
-                    for position in base..base + len {
-                        axes[0].push(position as i32);
-                        axes[1].push(position as i32);
-                        axes[2].push(position as i32);
-                    }
-                    base += len;
-                }
-                MropeSegment::Image(grid) | MropeSegment::Video(grid) => {
-                    let height = grid.height / merge;
-                    let width = grid.width / merge;
-                    for temporal in 0..grid.temporal {
-                        for row in 0..height {
-                            for col in 0..width {
-                                axes[0].push((base + temporal) as i32);
-                                axes[1].push((base + row) as i32);
-                                axes[2].push((base + col) as i32);
-                            }
-                        }
-                    }
-                    base += grid.temporal.max(height).max(width);
-                }
-                MropeSegment::TimestampedVideo { .. } => {
-                    panic!("legacy reference accepts only pre-amendment segment variants")
-                }
-            }
-        }
-        (axes, base as i32)
-    }
-
     #[test]
     fn mrope_span_discovery_emits_exact_all_text_and_mixed_layouts() {
         assert_eq!(
-            discover_mrope_segments(&[1, 2, 3], special_tokens(), &[], &[], 2),
-            Ok(vec![MropeSegment::Text(3)])
+            discover_mrope_spans(&[1, 2, 3], special_tokens(), &[], &[], 2),
+            Ok(vec![MropeSpan::Text(3)])
         );
         assert_eq!(
-            discover_mrope_segments(&[], special_tokens(), &[], &[], 2),
+            discover_mrope_spans(&[], special_tokens(), &[], &[], 2),
             Ok(vec![])
         );
 
@@ -2071,18 +1796,24 @@ mod tests {
             VIDEO,
             3,
         ];
-        let segments =
-            discover_mrope_segments(&tokens, special_tokens(), &[image], &[video], 2).unwrap();
+        let spans = discover_mrope_spans(&tokens, special_tokens(), &[image], &[video], 2).unwrap();
         assert_eq!(
-            segments,
+            spans,
             vec![
-                MropeSegment::Text(2),
-                MropeSegment::Image(image),
-                MropeSegment::Text(2),
-                MropeSegment::Video(video),
-                MropeSegment::Text(1),
+                MropeSpan::Text(2),
+                MropeSpan::Image(image),
+                MropeSpan::Text(2),
+                MropeSpan::Video(video),
+                MropeSpan::Text(1),
             ]
         );
+        let segments = [
+            MropeSegment::Text(2),
+            MropeSegment::Image(image),
+            MropeSegment::Text(2),
+            unit_video(video),
+            MropeSegment::Text(1),
+        ];
         assert_eq!(
             build_mrope_position_ids(&segments, 2).unwrap().len(),
             tokens.len()
@@ -2092,7 +1823,7 @@ mod tests {
     #[test]
     fn mrope_span_discovery_rejects_ambiguous_and_orphan_markers() {
         assert_eq!(
-            discover_mrope_segments(
+            discover_mrope_spans(
                 &[],
                 MropeSpecialTokenIds::new(VISION_START, IMAGE, IMAGE),
                 &[],
@@ -2111,7 +1842,7 @@ mod tests {
             (VIDEO, MropeSpecialTokenKind::Video),
         ] {
             assert_eq!(
-                discover_mrope_segments(&[1, token], special_tokens(), &[], &[], 2),
+                discover_mrope_spans(&[1, token], special_tokens(), &[], &[], 2),
                 Err(MropeSpanError::MarkerOutsideSpan { marker, index: 1 })
             );
         }
@@ -2120,28 +1851,28 @@ mod tests {
     #[test]
     fn mrope_span_discovery_rejects_malformed_or_nested_spans() {
         assert_eq!(
-            discover_mrope_segments(&[VISION_START, VISION_START], special_tokens(), &[], &[], 2),
+            discover_mrope_spans(&[VISION_START, VISION_START], special_tokens(), &[], &[], 2),
             Err(MropeSpanError::NestedVisionStart {
                 start_index: 0,
                 index: 1,
             })
         );
         assert_eq!(
-            discover_mrope_segments(&[VISION_START], special_tokens(), &[], &[], 2),
+            discover_mrope_spans(&[VISION_START], special_tokens(), &[], &[], 2),
             Err(MropeSpanError::MissingVisualMarker {
                 start_index: 0,
                 index: 1,
             })
         );
         assert_eq!(
-            discover_mrope_segments(&[VISION_START, 99], special_tokens(), &[], &[], 2,),
+            discover_mrope_spans(&[VISION_START, 99], special_tokens(), &[], &[], 2,),
             Err(MropeSpanError::MissingVisualMarker {
                 start_index: 0,
                 index: 1,
             })
         );
         assert_eq!(
-            discover_mrope_segments(
+            discover_mrope_spans(
                 &[VISION_START, IMAGE, VISION_START],
                 special_tokens(),
                 &[MropeGrid::new(1, 2, 4)],
@@ -2154,7 +1885,7 @@ mod tests {
             })
         );
         assert_eq!(
-            discover_mrope_segments(
+            discover_mrope_spans(
                 &[VISION_START, IMAGE, VIDEO],
                 special_tokens(),
                 &[MropeGrid::new(1, 2, 4)],
@@ -2169,7 +1900,7 @@ mod tests {
             })
         );
         assert_eq!(
-            discover_mrope_segments(
+            discover_mrope_spans(
                 &[VISION_START, IMAGE, 99],
                 special_tokens(),
                 &[MropeGrid::new(1, 2, 4)],
@@ -2190,7 +1921,7 @@ mod tests {
         let image_span = [VISION_START, IMAGE];
         let video_span = [VISION_START, VIDEO];
         assert_eq!(
-            discover_mrope_segments(&image_span, special_tokens(), &[], &[], 2),
+            discover_mrope_spans(&image_span, special_tokens(), &[], &[], 2),
             Err(MropeSpanError::MissingGrid {
                 kind: MropeVisualKind::Image,
                 start_index: 0,
@@ -2198,7 +1929,7 @@ mod tests {
             })
         );
         assert_eq!(
-            discover_mrope_segments(&video_span, special_tokens(), &[], &[], 2),
+            discover_mrope_spans(&video_span, special_tokens(), &[], &[], 2),
             Err(MropeSpanError::MissingGrid {
                 kind: MropeVisualKind::Video,
                 start_index: 0,
@@ -2206,7 +1937,7 @@ mod tests {
             })
         );
         assert_eq!(
-            discover_mrope_segments(&[], special_tokens(), &[MropeGrid::new(1, 2, 2)], &[], 2,),
+            discover_mrope_spans(&[], special_tokens(), &[MropeGrid::new(1, 2, 2)], &[], 2,),
             Err(MropeSpanError::ExtraGrids {
                 kind: MropeVisualKind::Image,
                 first_unused: 0,
@@ -2214,7 +1945,7 @@ mod tests {
             })
         );
         assert_eq!(
-            discover_mrope_segments(&[], special_tokens(), &[], &[MropeGrid::new(1, 2, 2)], 2,),
+            discover_mrope_spans(&[], special_tokens(), &[], &[MropeGrid::new(1, 2, 2)], 2,),
             Err(MropeSpanError::ExtraGrids {
                 kind: MropeVisualKind::Video,
                 first_unused: 0,
@@ -2222,7 +1953,7 @@ mod tests {
             })
         );
         assert_eq!(
-            discover_mrope_segments(
+            discover_mrope_spans(
                 &image_span,
                 special_tokens(),
                 &[MropeGrid::new(1, 2, 4)],
@@ -2237,7 +1968,7 @@ mod tests {
             })
         );
         assert_eq!(
-            discover_mrope_segments(
+            discover_mrope_spans(
                 &[VISION_START, IMAGE, IMAGE, IMAGE],
                 special_tokens(),
                 &[MropeGrid::new(1, 2, 4)],
@@ -2250,7 +1981,7 @@ mod tests {
             })
         );
         assert_eq!(
-            discover_mrope_segments(&[], special_tokens(), &[], &[], 0),
+            discover_mrope_spans(&[], special_tokens(), &[], &[], 0),
             Err(MropeSpanError::Grid(MropePositionError::ZeroSpatialMerge))
         );
     }
@@ -2271,7 +2002,7 @@ mod tests {
                 MropeSegment::Text(2),
                 MropeSegment::Image(MropeGrid::new(1, 4, 6)),
                 MropeSegment::Text(1),
-                MropeSegment::Video(MropeGrid::new(2, 2, 4)),
+                unit_video(MropeGrid::new(2, 2, 4)),
                 MropeSegment::Text(2),
             ],
             2,
@@ -2300,8 +2031,7 @@ mod tests {
             build_mrope_position_ids(&[MropeSegment::Image(MropeGrid::new(1, 2, 4))], 2).unwrap();
         assert_eq!(image.axes(), [&[0, 0], &[0, 0], &[0, 1]]);
 
-        let video =
-            build_mrope_position_ids(&[MropeSegment::Video(MropeGrid::new(2, 2, 2))], 2).unwrap();
+        let video = build_mrope_position_ids(&[unit_video(MropeGrid::new(2, 2, 2))], 2).unwrap();
         assert_eq!(video.axes(), [&[0, 1], &[0, 0], &[0, 0]]);
     }
 
@@ -2321,7 +2051,7 @@ mod tests {
         let video = build_mrope_position_ids(
             &[
                 MropeSegment::Text(1),
-                MropeSegment::Video(MropeGrid::new(2, 2, 2)),
+                unit_video(MropeGrid::new(2, 2, 2)),
                 MropeSegment::Text(1),
             ],
             2,
@@ -2531,233 +2261,6 @@ mod tests {
     }
 
     #[test]
-    fn mrope_special_token_reconciliation_matches_records() {
-        let config_json = qwen_vl_config_json(
-            "qwen2_5_vl",
-            [VISION_START as u64, IMAGE as u64, VIDEO as u64],
-            Some("4"),
-        );
-        let metadata = config_metadata(config_json.as_bytes()).unwrap();
-        let processor_tokens = processor_special_tokens();
-        let tokenizer_tokens = tokenizer_special_tokens();
-
-        let reconciled =
-            reconcile_mrope_special_token_ids(&processor_tokens, &tokenizer_tokens, &metadata)
-                .unwrap();
-        assert_eq!(reconciled, special_tokens());
-    }
-
-    #[test]
-    fn mrope_special_token_reconciliation_rejects_source_metadata_failures() {
-        let config_json = qwen_vl_config_json(
-            "qwen2_5_vl",
-            [VISION_START as u64, IMAGE as u64, VIDEO as u64],
-            Some("4"),
-        );
-        let metadata = config_metadata(config_json.as_bytes()).unwrap();
-        let tokenizer_tokens = tokenizer_special_tokens();
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &[
-                    MropeProcessorSpecialToken::new(
-                        MropeSpecialTokenKind::VisionStart,
-                        VISION_START_TOKEN,
-                    ),
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Video, VIDEO_PAD_TOKEN),
-                ],
-                &tokenizer_tokens,
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::MissingProcessorSpecialToken {
-                    role: MropeSpecialTokenKind::Image,
-                }
-            )
-        );
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &[
-                    MropeProcessorSpecialToken::new(
-                        MropeSpecialTokenKind::VisionStart,
-                        VISION_START_TOKEN,
-                    ),
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Image, IMAGE_PAD_TOKEN),
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Image, "<image2>"),
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Video, VIDEO_PAD_TOKEN),
-                ],
-                &tokenizer_tokens,
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::DuplicateProcessorSpecialToken {
-                    role: MropeSpecialTokenKind::Image,
-                }
-            )
-        );
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &[
-                    MropeProcessorSpecialToken::new(
-                        MropeSpecialTokenKind::VisionStart,
-                        VISION_START_TOKEN,
-                    ),
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Image, IMAGE_PAD_TOKEN),
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Video, IMAGE_PAD_TOKEN),
-                ],
-                &tokenizer_tokens,
-                &metadata,
-            ),
-            Err(MropeSpecialTokenReconcileError::DuplicateProcessorMarker {
-                token: IMAGE_PAD_TOKEN.to_string(),
-                first: MropeSpecialTokenKind::Image,
-                second: MropeSpecialTokenKind::Video,
-            })
-        );
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &processor_special_tokens(),
-                &[
-                    MropeTokenizerSpecialToken::new(VISION_START_TOKEN, VISION_START),
-                    MropeTokenizerSpecialToken::new(IMAGE_PAD_TOKEN, IMAGE),
-                ],
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::UnknownTokenizerSpecialToken {
-                    role: MropeSpecialTokenKind::Video,
-                    token: VIDEO_PAD_TOKEN.to_string(),
-                }
-            )
-        );
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &processor_special_tokens(),
-                &[
-                    MropeTokenizerSpecialToken::new(VISION_START_TOKEN, VISION_START),
-                    MropeTokenizerSpecialToken::new(IMAGE_PAD_TOKEN, IMAGE),
-                    MropeTokenizerSpecialToken::new(IMAGE_PAD_TOKEN, 99),
-                    MropeTokenizerSpecialToken::new(VIDEO_PAD_TOKEN, VIDEO),
-                ],
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::DuplicateTokenizerSpecialToken {
-                    token: IMAGE_PAD_TOKEN.to_string(),
-                    first_id: IMAGE,
-                    second_id: 99,
-                }
-            )
-        );
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &processor_special_tokens(),
-                &[
-                    MropeTokenizerSpecialToken::new(VISION_START_TOKEN, VISION_START),
-                    MropeTokenizerSpecialToken::new(IMAGE_PAD_TOKEN, IMAGE),
-                    MropeTokenizerSpecialToken::new(VIDEO_PAD_TOKEN, IMAGE),
-                ],
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::DuplicateTokenizerSpecialTokenId {
-                    token_id: IMAGE,
-                    first: MropeSpecialTokenKind::Image,
-                    second: MropeSpecialTokenKind::Video,
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn mrope_special_token_reconciliation_rejects_config_role_mismatch() {
-        let config_json = qwen_vl_config_json(
-            "qwen2_5_vl",
-            [VISION_START as u64, 99, VIDEO as u64],
-            Some("4"),
-        );
-        let metadata = config_metadata(config_json.as_bytes()).unwrap();
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &processor_special_tokens(),
-                &tokenizer_special_tokens(),
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::ConfigSpecialTokenMismatch {
-                    role: MropeSpecialTokenKind::Image,
-                    token: IMAGE_PAD_TOKEN.to_string(),
-                    tokenizer_id: IMAGE,
-                    config_id: 99,
-                }
-            )
-        );
-    }
-
-    #[test]
-    fn mrope_special_token_reconciliation_has_deterministic_error_ordering() {
-        let config_json = qwen_vl_config_json("qwen2_5_vl", [100, 101, 102], None);
-        let metadata = config_metadata(config_json.as_bytes()).unwrap();
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &[
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Image, IMAGE_PAD_TOKEN),
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Image, "<image2>"),
-                    MropeProcessorSpecialToken::new(MropeSpecialTokenKind::Video, VIDEO_PAD_TOKEN),
-                ],
-                &[],
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::MissingProcessorSpecialToken {
-                    role: MropeSpecialTokenKind::VisionStart,
-                }
-            )
-        );
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &processor_special_tokens(),
-                &[MropeTokenizerSpecialToken::new(VISION_START_TOKEN, 100)],
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::UnknownTokenizerSpecialToken {
-                    role: MropeSpecialTokenKind::Image,
-                    token: IMAGE_PAD_TOKEN.to_string(),
-                }
-            )
-        );
-
-        assert_eq!(
-            reconcile_mrope_special_token_ids(
-                &processor_special_tokens(),
-                &[
-                    MropeTokenizerSpecialToken::new(VISION_START_TOKEN, 100),
-                    MropeTokenizerSpecialToken::new(IMAGE_PAD_TOKEN, 999),
-                    MropeTokenizerSpecialToken::new(VIDEO_PAD_TOKEN, 998),
-                ],
-                &metadata,
-            ),
-            Err(
-                MropeSpecialTokenReconcileError::ConfigSpecialTokenMismatch {
-                    role: MropeSpecialTokenKind::Image,
-                    token: IMAGE_PAD_TOKEN.to_string(),
-                    tokenizer_id: 999,
-                    config_id: 101,
-                }
-            )
-        );
-    }
-
-    #[test]
     fn mrope_qwen25_position_assembly_uses_default_and_preserves_zero_video_behavior() {
         let config_json = qwen_vl_config_json(
             "qwen2_5_vl",
@@ -2921,40 +2424,6 @@ mod tests {
     }
 
     #[test]
-    fn mrope_qwen2_unit_stride_layout_is_byte_identical_to_legacy_reference() {
-        let segments = [
-            MropeSegment::Text(2),
-            MropeSegment::Image(MropeGrid::new(1, 4, 6)),
-            MropeSegment::Text(1),
-            MropeSegment::Video(MropeGrid::new(3, 2, 4)),
-            MropeSegment::Text(2),
-        ];
-        let (reference_axes, reference_next) = legacy_unit_stride_reference(&segments, 2);
-        let ids = build_mrope_position_ids(&segments, 2).unwrap();
-
-        assert_eq!(
-            ids.axes(),
-            [&reference_axes[0], &reference_axes[1], &reference_axes[2]]
-        );
-        assert_eq!(
-            ids.next_text_position(),
-            MropePosition::collapsed(reference_next)
-        );
-        let reference_packed = reference_axes.concat();
-        assert_eq!(ids.packed(), reference_packed);
-        let got_bytes: Vec<u8> = ids
-            .packed()
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect();
-        let reference_bytes: Vec<u8> = reference_packed
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect();
-        assert_eq!(got_bytes, reference_bytes);
-    }
-
-    #[test]
     fn mrope_layout_validation_is_typed() {
         assert_eq!(
             build_mrope_position_ids(&[MropeSegment::Text(1)], 0),
@@ -2968,7 +2437,7 @@ mod tests {
             })
         );
         assert_eq!(
-            build_mrope_position_ids(&[MropeSegment::Video(MropeGrid::new(1, 3, 2))], 2),
+            build_mrope_position_ids(&[unit_video(MropeGrid::new(1, 3, 2))], 2),
             Err(MropePositionError::NonDivisibleGrid {
                 kind: MropeVisualKind::Video,
                 axis: "height",

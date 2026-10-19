@@ -2455,6 +2455,7 @@ impl ScanFamily {
     /// The operands with a sequence axis (axis 2, length `L`), a prefix of the operand list: a chunk window of
     /// the scan slices exactly these. The remaining operands are per-head parameters, then the carried state
     /// (always the last operand).
+    #[cfg(any(test, feature = "test-support"))]
     pub const fn sequence_operands(self) -> std::ops::Range<usize> {
         match self {
             Self::DeltaRule => 0..5,

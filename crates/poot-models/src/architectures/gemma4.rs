@@ -31,7 +31,7 @@ use crate::names::gguf::{
     GGUF_BASE, GGUF_GEMMA4, GGUF_GEMMA4_MOE, GGUF_QK_NORM, GGUF_SANDWICH_NORMS,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 mod config;
@@ -237,7 +237,7 @@ pub struct Gemma4 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let mut p = Gemma4Params::from_raw(raw)?;
     let mut tables: Vec<&[NameRow]> = match raw.source() {
         ConfigSource::HfModelType => vec![HF_ROWS],
@@ -313,14 +313,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Gemma,
     };
-    Ok(Box::new(Gemma4 {
+    Ok(ModelParts::new(Box::new(Gemma4 {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Gemma4 {
@@ -1050,7 +1050,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let tokens = [3, 17, 40, 8, 25, 9, 11];
         let (want, _) = run_step(&*hf, &fx.store, CAP, &tokens, 0, &[]);
-        let (got, _) = run_step(&*gguf, &store, CAP, &tokens, 0, &[]);
+        let (got, _) = run_step(&*gguf.model, &store, CAP, &tokens, 0, &[]);
         crate::components::testing::close(&got, &want);
     }
 
@@ -1102,6 +1102,7 @@ mod tests {
             let raw = RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             };
             match build(&raw, &fx.store) {
                 Err(ModelError::Config {

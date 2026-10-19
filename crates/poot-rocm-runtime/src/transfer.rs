@@ -13,16 +13,15 @@ use crate::context::{
 use crate::discovery::{
     GpuPicker, PoolState, agent_isa_name, agent_name, agent_vendor, agent_wavefront_size,
     amd_agent_is_apu, amd_agent_memory_avail, amd_agent_product_name, amd_agent_u32_info,
-    amd_cooperative_queues, amd_pool_size, cpu_to_pool_link_types, enable_device_timing,
-    first_cpu_agent,
+    amd_pool_size, cpu_to_pool_link_types, enable_device_timing, first_cpu_agent,
 };
 use crate::error::check;
 use crate::ffi::{Funcs, Hsa};
 use crate::owner::{HsaRuntimeOwner, ResourceOwner};
 use crate::queue::{
     DEVICE_RING_OVERRIDE_AT_FIRST_HSA_LOAD, QueueCreationPlan, QueueLayout, QueueProperties,
-    destroy_queue_reference, device_ring_override_present, queue_request, validate_created_queue,
-    validate_queue_plan_provenance,
+    destroy_queue_reference, device_ring_override_present, queue_error_callback, queue_request,
+    validate_created_queue, validate_queue_plan_provenance, watch_agent_faults,
 };
 use crate::replay::replay_graph_chunk_size;
 use crate::{
@@ -36,8 +35,9 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 impl RocmContext {
-    /// Initialize HSA, pick the first GPU agent, walk its memory pools, and create one cooperative GWS
-    /// queue at max size (system-memory ring). Single-threaded; the context is `!Send`.
+    /// Initialize HSA, pick the first GPU agent, walk its memory pools, and create one ordinary queue
+    /// at max size (system-memory ring) whose faults poison the context. Single-threaded; the context
+    /// is `!Send`.
     pub fn new() -> Result<Self, RocmError> {
         Self::new_with_options(RocmContextOptions::default())
     }
@@ -45,7 +45,7 @@ impl RocmContext {
     /// [`Self::new`] with an explicit [`RocmContextOptions`] (Card 548): the one
     /// construction-time seam for the bounded-wait ceiling, never an environment read.
     pub fn new_with_options(options: RocmContextOptions) -> Result<Self, RocmError> {
-        Self::new_inner(QueueCreationPlan::CooperativeGws, options).map_err(require_gpu_check)
+        Self::new_inner(QueueCreationPlan::SystemMemoryRing, options).map_err(require_gpu_check)
     }
 
     /// Receipt-only constructor: use ROCr's `HSA_ALLOCATE_QUEUE_DEV_MEM=1` device-memory packet ring,
@@ -54,8 +54,8 @@ impl RocmContext {
     ///
     /// The process must be launched with `HSA_ALLOCATE_QUEUE_DEV_MEM=1` (ROCr reads it once at load);
     /// without it construction fails with [`RocmError::QueueRingProvenanceConflict`]. The library does
-    /// not set it: mutating the environment can race other threads. Does not change production
-    /// cooperative-GWS construction or Card 276 admission policy.
+    /// not set it: mutating the environment can race other threads. Does not change production queue
+    /// construction or Card 276 admission policy.
     pub fn new_for_pcie_device_ring_publication_receipt() -> Result<Self, RocmError> {
         Self::new_inner(
             QueueCreationPlan::PcieDeviceMemoryRingReceipt,
@@ -120,12 +120,10 @@ impl RocmContext {
         // SAFETY: discovery contract (above).
         let wavefront = unsafe { agent_wavefront_size(&hsa.funcs, gpu_agent)? };
         // SAFETY: discovery contract (above).
-        let coop_q = unsafe { amd_cooperative_queues(&hsa.funcs, gpu_agent) };
-        // SAFETY: discovery contract (above).
         let isa = unsafe { agent_isa_name(&hsa.funcs, gpu_agent)? };
         info!(
             "picked GPU agent: name={name:?} vendor={vendor:?} product={product:?} \
-             wavefront={wavefront} coop_queues={coop_q:?} isa={isa:?}"
+             wavefront={wavefront} isa={isa:?}"
         );
 
         // Walk the GPU agent's memory pools: a coarse device pool (output buffers) and a fine system pool
@@ -199,9 +197,9 @@ impl RocmContext {
 
         let queue_ring_provenance = plan.provenance();
         let (ring_memory, host_link, mut device_ring_receipt) = match plan {
-            QueueCreationPlan::CooperativeGws => {
-                // ROCr builds the cooperative GWS queue through CreateInterceptibleQueue with the explicit
-                // HSA_AMD_QUEUE_CREATE_SYSTEM_MEM allocation flag.
+            QueueCreationPlan::SystemMemoryRing => {
+                // ROCr allocates an ordinary queue's ring in system memory; the provenance check above
+                // refused HSA_ALLOCATE_QUEUE_DEV_MEM, the one switch that moves it.
                 let (ring_memory, host_link) = plan.publication_facts();
                 (ring_memory, host_link, None)
             }
@@ -258,22 +256,27 @@ impl RocmContext {
             host_link,
             QueueHostTarget::current(),
         )?;
-        let request = queue_request(plan, max_size);
+        let request = queue_request(max_size);
         let mut queue: *mut hsa_queue_t = std::ptr::null_mut();
-        // No error callback: ROCr 7.2.3 serves a COOPERATIVE queue from the agent's internal GWS queue
-        // (`GpuAgent::InitGWS`), created with `core::Queue::DefaultErrorHandler`, so a callback passed
-        // here is never invoked (measured, POOT-1039). On a queue fault that handler prints `Queue at
-        // .. inactivated due to async error` and aborts the process; with `HSA_ENABLE_QUEUE_FAULT_MESSAGE=0`
-        // it returns and the queue stays dead until the bounded wait times out.
-        // SAFETY: `gpu_agent` belongs to the initialized runtime; no error callback or data; `queue`
-        // is a valid out-pointer.
+        // Faults reach the context two ways. The queue error callback sees a queue ROCr inactivated
+        // (an invalid packet); its default handler prints `Queue at .. inactivated due to async error`
+        // and aborts the process (four sightings, POOT-1039). A kernel's GPU memory fault is a system
+        // event instead, which also aborts unless a handler is registered. Both record the fault and
+        // poison the context. A COOPERATIVE queue would bypass the callback: ROCr serves it from the
+        // agent's internal GWS queue, created with the default handler (measured, POOT-1039).
+        let mut timeouts = TimeoutLeaks::default();
+        watch_agent_faults(&hsa.funcs, gpu_agent, &timeouts.device_poison())?;
+        let callback_data = timeouts.arm_queue_callback();
+        // SAFETY: `gpu_agent` belongs to the initialized runtime; the callback matches the type and its
+        // data is a reference `timeouts` keeps alive while the queue can call back; `queue` is a valid
+        // out-pointer.
         let create_status = unsafe {
             (hsa.funcs.hsa_queue_create)(
                 gpu_agent,
                 request.size,
                 request.queue_type,
-                None,
-                std::ptr::null_mut(),
+                Some(queue_error_callback),
+                callback_data,
                 0,
                 0,
                 &mut queue,
@@ -374,7 +377,7 @@ impl RocmContext {
             device_ring_receipt,
             vram_total_bytes,
             compute_units,
-            timeouts: TimeoutLeaks::default(),
+            timeouts,
             pending: Mutex::default(),
             upload_ring: Mutex::default(),
             batch_waits: Arc::default(),
@@ -884,6 +887,10 @@ impl RocmContext {
                 let read = (self.hsa.funcs.hsa_queue_load_read_index_scacquire)(queue);
                 if read >= write_at_submit {
                     break;
+                }
+                // A lost device never advances the read index: fail at once, with what it reported.
+                if let Some(fault) = self.timeouts.fault() {
+                    return Err(RocmError::DeviceLost(fault));
                 }
                 // Wall-clock guard, checked only once the spin has stalled, so the hot path pays nothing. Fails
                 // fast on a hung dispatch instead of spinning forever at 99% CPU.

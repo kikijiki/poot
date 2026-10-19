@@ -44,14 +44,14 @@ fn a_real_model_trace_under_explicit_limits_reaches_compile_and_each_budget_refu
     let model = registry.build(&fixture.raw(), &fixture.store).unwrap();
     let shape = |tokens: usize| StepShape::new(NonZeroUsize::MIN, nz(tokens), nz(16));
     let roomy = TraceLimits::for_tests();
-    let traced = model.trace(&StepSpec::step(shape(1)), roomy).unwrap();
+    let traced = model.model.trace(&StepSpec::step(shape(1)), roomy).unwrap();
     let exact = TraceLimits {
         max_tokens: nz(1),
         max_values: nz(traced.values().len()),
         max_eqns: nz(traced.eqns().len()),
         ..roomy
     };
-    let graph = model.trace(&StepSpec::step(shape(1)), exact).unwrap();
+    let graph = model.model.trace(&StepSpec::step(shape(1)), exact).unwrap();
     compile(&graph, &wgpu(), &options(CompileLimits::STANDARD))
         .expect("an exactly traced step compiles");
 
@@ -73,6 +73,6 @@ fn a_real_model_trace_under_explicit_limits_reaches_compile_and_each_budget_refu
         max_tokens: nz(4),
         ..roomy
     };
-    model.trace(&StepSpec::step(shape(4)), four).unwrap();
-    assert!(model.trace(&StepSpec::step(shape(6)), four).is_err());
+    model.model.trace(&StepSpec::step(shape(4)), four).unwrap();
+    assert!(model.model.trace(&StepSpec::step(shape(6)), four).is_err());
 }

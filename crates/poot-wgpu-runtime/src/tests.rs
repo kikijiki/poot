@@ -940,7 +940,9 @@ fn bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_time
     let bytes: Vec<u8> = want_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
     assert_eq!(bytes.len(), elems * 2, "fixture bytes must be elems * 2");
 
-    let buf = ctx.alloc_storage(BufferRole::Activation, BufferStorage::bf16(), elems);
+    let buf = ctx
+        .alloc_storage(BufferRole::Activation, BufferStorage::bf16(), elems)
+        .expect("alloc");
     write_host_bytes(&ctx, &buf, 0, &bytes).expect("write_with");
 
     let mut got = vec![0u8; elems * 2];
@@ -988,7 +990,9 @@ fn read_bytes_past_the_buffers_end_is_a_typed_refusal_not_a_wgpu_panic_gpu() {
         return;
     };
     let elems = 17usize; // odd count: real capacity (34 bytes) is itself not a multiple of 4.
-    let buf = ctx.alloc_storage(BufferRole::Activation, BufferStorage::bf16(), elems);
+    let buf = ctx
+        .alloc_storage(BufferRole::Activation, BufferStorage::bf16(), elems)
+        .expect("alloc");
 
     let mut too_long = vec![0u8; elems * 4]; // real capacity is elems * 2 = 34 bytes.
     let err = ctx
@@ -1176,6 +1180,70 @@ mod device_timing_tests {
         (ctx.download_f32(&out).unwrap(), ctx.submits() - before)
     }
 
+    /// Submit one large add on `ctx` and return how long `poll_wait` took to drain it, or the error.
+    fn timed_big_add(ctx: &Context) -> (Result<(), crate::RuntimeError>, std::time::Duration) {
+        let add = kernel(&poot_kernel_ir::fixtures::add_kernel(), "bound-add");
+        let elems = 1usize << 27;
+        let a = ctx.alloc_f32(elems);
+        let b = ctx.alloc_f32(elems);
+        let out = ctx.alloc_f32(elems);
+        let d = cached(
+            ctx,
+            "bound-0",
+            "bound-add",
+            &add,
+            &[&a, &b],
+            &out,
+            elems as u32,
+        );
+        ctx.submit_cached(&[&d]).unwrap();
+        let start = std::time::Instant::now();
+        let waited = ctx.poll_wait();
+        (waited, start.elapsed())
+    }
+
+    /// SC-004 (wgpu): a wait that outlasts its configured bound fails with the typed `WaitTimeout`
+    /// within about that bound, long before the dispatch drains, and poisons the context; the next
+    /// call is `Poisoned`. A first context measures how long the dispatch takes; the second waits for a
+    /// quarter of that. Mutation: pass `timeout: None` in `Context::wait_idle`; the wait runs until the
+    /// dispatch finishes and returns `Ok` (red).
+    #[test]
+    fn a_wait_past_its_bound_times_out_and_poisons_the_context() {
+        let Some(measuring) = open_or_skip(DeviceBackend::Wgpu, Context::new()) else {
+            return;
+        };
+        let (drained, full) = timed_big_add(&measuring);
+        drained.expect("an unbounded-enough wait drains the dispatch");
+        drop(measuring);
+        let bound = (full / 4).max(std::time::Duration::from_millis(1));
+        assert!(
+            full >= bound * 2,
+            "the dispatch ({full:?}) must outlast the bound ({bound:?}) by a wide margin"
+        );
+        let Some(ctx) = open_or_skip(
+            DeviceBackend::Wgpu,
+            Context::new_with_options(crate::ContextOptions {
+                wait_timeout: bound,
+            }),
+        ) else {
+            return;
+        };
+        let (timed_out, elapsed) = timed_big_add(&ctx);
+        assert!(
+            matches!(timed_out, Err(crate::RuntimeError::WaitTimeout { .. })),
+            "got {timed_out:?} after {elapsed:?}"
+        );
+        assert!(
+            elapsed < full,
+            "the wait ended at {elapsed:?}, not within the bound {bound:?} of a {full:?} dispatch"
+        );
+        let refused = ctx.poll_wait();
+        assert!(
+            matches!(refused, Err(crate::RuntimeError::Poisoned { .. })),
+            "got {refused:?}"
+        );
+    }
+
     /// Card 552: the one `submit_encoded` path - a counters-only context and a detailed-
     /// timing context running the identical batch produce bit-identical output and the same
     /// `submits()` delta (one `queue.submit` per `submit_cached` call either way); only the compute-
@@ -1344,7 +1412,9 @@ fn a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed() 
     };
     let words =
         |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
-    let buf = ctx.alloc_storage(BufferRole::State, BufferStorage::f32(), 4);
+    let buf = ctx
+        .alloc_storage(BufferRole::State, BufferStorage::f32(), 4)
+        .expect("alloc");
     write_host_bytes(&ctx, &buf, 0, &words(&[1.0, 2.0, 3.0, 4.0])).unwrap();
     write_host_bytes(&ctx, &buf, 4, &words(&[9.0, 9.0])).unwrap();
     let mut got = vec![0u8; 16];

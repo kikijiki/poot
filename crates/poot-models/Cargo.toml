@@ -33,8 +33,11 @@ poot-load.workspace = true
 # `Model::weights` returns a `WeightMap`; `RawConfig::HfJson` carries the parsed `config.json`
 # and `generation_config.json`.
 poot-quant.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The Qwen2.5-VL image processor resizes with the `image` crate's cubic filter.
+image.workspace = true
 poot-executor = { workspace = true, optional = true }
 poot-executor-parity = { workspace = true, optional = true }
 poot-test-util = { workspace = true, optional = true }
