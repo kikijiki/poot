@@ -40,6 +40,8 @@ struct Failures {
     /// Z10) when set, `None` (a real device-level failure, e.g. a timeout) when clear.
     synchronize: bool,
     classify_as_fault: bool,
+    /// Make `read` return nonzero words: a validation packet read back this way is rejected.
+    reads_are_nonzero: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,11 +131,12 @@ impl Device for FaultyDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<()>, FaultyError> {
+    fn finish(&mut self) -> Result<(), FaultyError> {
         if self.control.failures.borrow().finish {
             return Err(FaultyError("finish"));
         }
-        Ok(std::mem::take(&mut self.recording).then_some(()))
+        self.recording = false;
+        Ok(())
     }
 
     fn replay(&mut self, _recording: &()) -> Result<(), FaultyError> {
@@ -154,7 +157,11 @@ impl Device for FaultyDevice {
     }
 
     fn read(&mut self, _src: &(), out: &mut [u8]) -> Result<(), FaultyError> {
-        out.fill(0);
+        out.fill(if self.control.failures.borrow().reads_are_nonzero {
+            1
+        } else {
+            0
+        });
         Ok(())
     }
 
@@ -425,7 +432,8 @@ fn replay_failure_aborts_once_and_marks_needs_reset() {
 /// never calls `step`, so a mutation that made `step` wrap every synchronize error as a plain
 /// `ExecError::Device` instead of asking `classify_fault` first would not be caught there). No
 /// output is read: `step` returns `Err` before ever constructing a `StepOutputs`. A fault is not a
-/// device-level failure (Z10): no abort, no poison, no NeedsReset - the device stays usable.
+/// device-level failure (Z10): no abort and no poison, the device stays usable. The replay already
+/// committed state before the trap, so the executable is `NeedsReset` until a complete reset.
 #[test]
 fn synchronize_fault_surfaces_as_exec_error_fault_from_step_with_no_output_read() {
     let (mut engine, control) = new_engine();
@@ -453,9 +461,19 @@ fn synchronize_fault_surfaces_as_exec_error_fault_from_step_with_no_output_read(
     );
 
     control.failures.borrow_mut().synchronize = false;
+    let error = step_err(
+        &mut engine,
+        exe,
+        entry,
+        "a faulted step committed state, so the executable must refuse the next step",
+    );
+    assert!(matches!(error, ExecError::NeedsReset(id) if id == exe));
+    engine
+        .reset_state(exe, StateScope::All)
+        .expect("a complete reset clears NeedsReset: a fault never poisons the device");
     engine
         .step(exe, entry, &StepInputs::new(), &mut NoSync)
-        .expect("a fault never poisons or marks NeedsReset: the device stays usable")
+        .expect("the reset executable steps again")
         .read()
         .expect("read the now-successful step's output");
 }
@@ -571,4 +589,85 @@ fn carried_state_has_no_ping_pong_pair() {
         "two f32[2] states with no ping-pong pair must total 16 bytes, stats={:?}",
         stats.memory
     );
+}
+
+/// A graph with one validation witness (`1` where `a` is unordered with itself, else `0`) and no
+/// constants: `output = a + s`, witness over `a`.
+fn validated_fixture() -> (
+    poot_graph_ir::Graph,
+    Arc<WeightStore>,
+    Arc<poot_quant::weights::WeightMap>,
+) {
+    let b = Builder::for_tests();
+    let a = b
+        .state_input("a", TensorType::f32(vec![2]), StateRole::Recurrent)
+        .unwrap();
+    let s = b
+        .state_input("s", TensorType::f32(vec![2]), StateRole::Recurrent)
+        .unwrap();
+    let output = b.binary(BinOp::Add, a, s).unwrap();
+    let ordered = b.binary(BinOp::Ge, a, a).unwrap();
+    let flipped = b
+        .binary_scalar(BinOp::Mul, ordered, poot_graph_ir::Scalar::F32(-1.0))
+        .unwrap();
+    let unordered = b
+        .binary_scalar(BinOp::Add, flipped, poot_graph_ir::Scalar::F32(1.0))
+        .unwrap();
+    let g = poot_graph_ir::test_support::graph_fixtures::finish_with_state_and_validations(
+        b,
+        output,
+        &[(a, output), (s, output)],
+        &[(poot_graph_ir::ValidationId(1), "unordered", unordered)],
+    )
+    .unwrap();
+    let store = Arc::new(WeightStore::builder().build());
+    let mut names = poot_graph_ir::test_support::const_weights::ConstWeights::new(&store);
+    let g = names.graph(&g);
+    let map = Arc::new(names.map());
+    (g, store, map)
+}
+
+/// A step whose validation packet is rejected committed its state before the check, so the executable
+/// is `NeedsReset`: the next step is refused, a complete reset clears it, and the device is not
+/// poisoned. Mutation: delete `mark_needs_reset` from the rejected-validation branch of
+/// `Engine::complete`; the second step runs instead of being refused (red).
+#[test]
+fn a_rejected_validation_packet_marks_needs_reset() {
+    let (mut engine, control) = new_engine();
+    let (g, store, map) = validated_fixture();
+    let exe = engine.load_weights(store, map).unwrap();
+    let target = engine.device().target();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
+
+    control.failures.borrow_mut().reads_are_nonzero = true;
+    let error = step_err(
+        &mut engine,
+        exe,
+        entry,
+        "a nonzero witness lane must be rejected",
+    );
+    assert!(matches!(error, ExecError::Validation(_)), "got {error:?}");
+    assert_eq!(
+        *control.aborts.borrow(),
+        0,
+        "a rejected packet is not a device failure"
+    );
+
+    control.failures.borrow_mut().reads_are_nonzero = false;
+    let error = step_err(
+        &mut engine,
+        exe,
+        entry,
+        "the rejected step committed state, so the executable must refuse the next step",
+    );
+    assert!(
+        matches!(error, ExecError::NeedsReset(id) if id == exe),
+        "got {error:?}"
+    );
+    engine
+        .reset_state(exe, StateScope::All)
+        .expect("a complete reset clears NeedsReset");
+    engine
+        .step(exe, entry, &StepInputs::new(), &mut NoSync)
+        .expect("the reset executable steps again");
 }

@@ -32,7 +32,7 @@ use poot_models::io::ModelSchema;
 use poot_models::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_quant::weights::{
     AttnRole, DenseWeight, FfnRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap,
     WeightRole, WeightStore, WeightView,
@@ -208,7 +208,7 @@ struct Neoxish {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = NeoxishParams::from_raw(raw)?;
     let weights = weight_map(&p, store)?;
     let weight_error = |e: WeightError| e.for_family(FAMILY);
@@ -238,14 +238,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Neoxish {
+    Ok(ModelParts::new(Box::new(Neoxish {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Neoxish {
@@ -377,6 +377,7 @@ pub(crate) fn fixture() -> Fixture {
     Fixture {
         config,
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }

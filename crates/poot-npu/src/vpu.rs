@@ -765,14 +765,14 @@ impl Device for VpuDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<VpuRecording>, VpuError> {
+    fn finish(&mut self) -> Result<VpuRecording, VpuError> {
         let mut builder = self.open.take().ok_or(VpuError::NotRecording)?;
         let list = builder.finish().map_err(l0("close recording"))?;
         let ranges = self
             .guard
             .as_mut()
             .map_or_else(|| Rc::from([]), RangeGuard::finished);
-        Ok(Some(VpuRecording { list, ranges }))
+        Ok(VpuRecording { list, ranges })
     }
 
     fn replay(&mut self, recording: &VpuRecording) -> Result<(), VpuError> {

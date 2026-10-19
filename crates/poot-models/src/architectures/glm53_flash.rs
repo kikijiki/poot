@@ -31,7 +31,7 @@ use crate::components::standard::{
 };
 use crate::io::{ModelSchema, ProgramId, StateSpec};
 use crate::model::{FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 mod config;
@@ -66,7 +66,7 @@ pub struct Glm53Flash {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = Glm53Config::from_raw(raw)?;
     let weights = names::weights_of(&p, store)?;
     let tower = stack::Tower::new(&weights, &p).map_err(|e| e.for_family(FAMILY))?;
@@ -86,13 +86,13 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: std::num::NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Glm53Flash {
+    Ok(ModelParts::new(Box::new(Glm53Flash {
         params: p,
         weights,
         tower,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Glm53Flash {
@@ -483,6 +483,7 @@ fn fixture_of(config: serde_json::Value) -> Fixture {
     Fixture {
         config,
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }

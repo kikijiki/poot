@@ -222,6 +222,9 @@ impl publication::AqlChunkSink for LiveAqlChunkSink<'_> {
             if write_index + packet_count as u64 - read_index <= queue_size {
                 return Ok(());
             }
+            if let Some(fault) = self.context.timeouts.fault() {
+                return Err(RocmError::DeviceLost(fault));
+            }
             spins = spins.wrapping_add(1);
             if spins & 0xFFFF == 0 && start.elapsed().as_secs() >= timeout {
                 return Err(RocmError::QueueWaitTimeout(timeout, "upload back-pressure"));

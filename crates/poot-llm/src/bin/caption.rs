@@ -1,7 +1,7 @@
-//! poot-caption: caption an image with a vision-language model. Loads a SmolVLM / idefics3 or a
-//! Qwen2.5-VL checkpoint (its vision tower and its text tower, each on a driver), decodes the image
-//! and prints a caption. A Qwen2.5-VL checkpoint also takes an animated PNG as a video, sampled at
-//! the processor's default two frames per second.
+//! poot-caption: caption an image with a vision-language model. Loads the checkpoint (its text decoder
+//! and the vision towers its registry entry holds, each on a driver), decodes the image and prints a
+//! caption. A checkpoint whose front end takes video (Qwen2.5-VL) also takes an animated PNG as a video,
+//! sampled at the processor's default two frames per second.
 //!
 //! Usage: `poot-caption <model_dir> <image_path> [question] [--backend B]`
 //!
@@ -10,19 +10,18 @@
 use std::io::Write;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
-    BackendChoice, DraftPolicy, DriverOptions, PreparedSetLimits, open_executor, program_retention,
+    BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Layout, LoadOptions,
+    ModelHandle, PreparedSetLimits, open_executor, program_retention,
 };
-use poot_llm::front_end::{CaptionRequest, Idefics3, decode_image};
-use poot_llm::qwen_vl::{Qwen25Vl, Qwen25VlGenerate};
 use poot_llm::{
-    ChatTurn, GenerationControl, Qwen25VlApng, Qwen25VlApngError, Qwen25VlApngFrameSource,
-    Qwen25VlChatContent, Qwen25VlChatMessage, Qwen25VlChatMessageContent, Sampler,
+    Apng, ApngError, FrontEndSession, GenerationControl, Sampler, decode_image, tower_options,
 };
-use poot_models::mrope::{MropeProcessorFpsInput, QWEN2_5_VL_PROCESSOR_DEFAULT_FPS};
+use poot_models::multimodal::front_end::{ChatTurn, Media, Video};
 use poot_models::registry::Registry;
 
 /// The driver options of one tower: `capacity` positions, prefill in pieces of at most `chunk`.
@@ -54,63 +53,6 @@ fn backend_choice(flag: Option<&str>) -> Result<BackendChoice> {
         Some("vulkan") => BackendChoice::Vulkan,
         Some(other) => bail!("--backend {other}: expected wgpu, rocm, ptx, vulkan or auto"),
     })
-}
-
-/// Caption `media` with the Qwen2.5-VL checkpoint `model_dir`: an animated PNG is a video, anything
-/// else an image.
-fn caption_qwen_vl(
-    model_dir: &str,
-    media: &str,
-    question: &str,
-    choice: BackendChoice,
-) -> Result<()> {
-    let bytes = std::fs::read(media).with_context(|| format!("read {media}"))?;
-    let mut vlm = Qwen25Vl::load(
-        Path::new(model_dir),
-        &Registry::builtin()?,
-        (open_executor(choice)?, options(4096, 4096)),
-        (open_executor(choice)?, options(8192, 256)),
-    )
-    .context("load the VLM")?;
-    let apng = match Qwen25VlApng::from_bytes(&bytes) {
-        Ok(apng) => Some(apng),
-        Err(Qwen25VlApngError::StaticPng) => None,
-        Err(error) => return Err(error).with_context(|| format!("probe {media}")),
-    };
-    let media_path = Path::new(media);
-    let (part, fps, mut sources): (_, _, Vec<Qwen25VlApngFrameSource<'_>>) = match &apng {
-        Some(apng) => (
-            Qwen25VlChatContent::Video(apng.metadata()),
-            Some(MropeProcessorFpsInput::Scalar(
-                QWEN2_5_VL_PROCESSOR_DEFAULT_FPS,
-            )),
-            vec![apng.frame_source().context("open the video frames")?],
-        ),
-        None => (Qwen25VlChatContent::ImagePath(media_path), None, Vec::new()),
-    };
-    let messages = [Qwen25VlChatMessage {
-        role: "user",
-        content: Qwen25VlChatMessageContent::Parts(vec![part, Qwen25VlChatContent::Text(question)]),
-    }];
-    let generation = vlm
-        .generate_chat(
-            &messages,
-            fps,
-            &mut sources,
-            Qwen25VlGenerate {
-                max_new: 64,
-                sampler: Sampler::greedy(),
-            },
-            &mut |_: u32, piece: &str| {
-                print!("{piece}");
-                std::io::stdout().flush().ok();
-                GenerationControl::Continue(())
-            },
-        )
-        .context("caption")?;
-    println!();
-    tracing::info!(tokens = generation.tokens.len(), finish = ?generation.finish, "caption complete");
-    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -150,36 +92,61 @@ fn main() -> Result<()> {
         .unwrap_or("Can you describe this image?");
     let choice = backend_choice(backend)?;
 
-    let config = std::fs::read(Path::new(model_dir.as_str()).join("config.json"))
-        .with_context(|| format!("read {model_dir}/config.json"))?;
-    let config: serde_json::Value = serde_json::from_slice(&config).context("parse config.json")?;
-    if config["model_type"] == "qwen2_5_vl" {
-        return caption_qwen_vl(model_dir, image_path, question, choice);
-    }
+    let handle = Arc::new(
+        ModelHandle::load(
+            Path::new(model_dir.as_str()),
+            &Registry::builtin()?,
+            &LoadOptions::default(),
+        )
+        .context("load the checkpoint")?,
+    );
+    let mut session = FrontEndSession::open(Arc::clone(&handle), |_, positions| {
+        Ok::<_, anyhow::Error>((open_executor(choice)?, tower_options(positions)))
+    })
+    .context("open the vision towers")?
+    .context("the checkpoint is not a vision-language model: its family has no front end")?;
 
     let bytes = std::fs::read(image_path).with_context(|| format!("read {image_path}"))?;
-    let image = decode_image(&bytes).context("decode image")?;
-    eprintln!(
-        "loaded {image_path} ({}x{}); loading model from {model_dir}...",
-        image.width, image.height
-    );
+    eprintln!("loaded {image_path}; loading model from {model_dir}...");
+    // An animated PNG is a video; any other file is one image.
+    let apng = match Apng::from_bytes(&bytes) {
+        Ok(apng) => Some(apng),
+        Err(ApngError::StaticPng) => None,
+        Err(error) => return Err(error).with_context(|| format!("probe {image_path}")),
+    };
+    let image;
+    let mut frames;
+    let mut media = match &apng {
+        Some(apng) => {
+            frames = apng.frame_source().context("open the video frames")?;
+            vec![Media::Video(Video {
+                metadata: apng.metadata(),
+                frames: &mut frames,
+            })]
+        }
+        None => {
+            image = decode_image(&bytes).context("decode image")?;
+            vec![Media::Image(&image)]
+        }
+    };
+    let prepared = session
+        .prepare(&[ChatTurn::user(1, question)], &mut media)
+        .context("prepare the prompt")?;
 
-    // The text tower holds the whole prompt (up to 17 frames of 64 rows each and the question) and the
-    // 64 new tokens; the vision tower is one frame per step.
-    let mut vlm = Idefics3::load(
-        Path::new(model_dir),
-        &Registry::builtin()?,
-        (open_executor(choice)?, options(1024, 1024)),
-        (open_executor(choice)?, options(8192, 256)),
-    )
-    .context("load the VLM")?;
-    let generation = vlm
-        .caption(
-            &CaptionRequest {
-                images: &[image.as_image()],
-                turns: &[ChatTurn::user(1, question)],
+    // The text decoder holds the whole prompt (every frame's rows and the question) and the 64 new tokens.
+    let mut text = Driver::new(handle, open_executor(choice)?, options(8192, 256))
+        .context("open the text decoder")?
+        .serve(Layout::Contiguous);
+    let generation = text
+        .generate_with_inputs(
+            GenerateRequest {
+                prompt: prepared.prompt,
                 max_new: 64,
+                sampler: Sampler::greedy(),
+                stops: Vec::new(),
+                ignore_eos: false,
             },
+            prepared.inputs,
             &mut |_: u32, piece: &str| {
                 print!("{piece}");
                 std::io::stdout().flush().ok();

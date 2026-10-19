@@ -29,7 +29,7 @@ use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
     ShapeReason, StepShape, StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::BufferRole;
 use poot_target::{Backend, DeviceCaps};
@@ -130,7 +130,7 @@ thread_local! {
     static TRACE_LOG: RefCell<Option<TraceLog>> = const { RefCell::new(None) };
 }
 
-fn build_tiny(raw: &RawConfig<'_>, log: TraceLog) -> Result<Box<dyn Model>, ModelError> {
+fn build_tiny(raw: &RawConfig<'_>, log: TraceLog) -> Result<ModelParts, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
         unreachable!("the family names only HF configs")
     };
@@ -157,7 +157,7 @@ fn build_tiny(raw: &RawConfig<'_>, log: TraceLog) -> Result<Box<dyn Model>, Mode
     } else {
         program
     };
-    Ok(Box::new(Tiny {
+    Ok(ModelParts::new(Box::new(Tiny {
         recurrent,
         schema: ModelSchema::builder().step(program).build_for(TINY)?,
         config: ModelConfig {
@@ -172,7 +172,7 @@ fn build_tiny(raw: &RawConfig<'_>, log: TraceLog) -> Result<Box<dyn Model>, Mode
         },
         weights: WeightMap::default(),
         log,
-    }))
+    })))
 }
 
 /// The family's tokenizer, a word-level vocabulary over `a`..`k`.
@@ -264,8 +264,8 @@ impl Device for FakeDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())
@@ -445,6 +445,7 @@ fn rig(options: RigOptions) -> Rig {
             fixture: || Fixture {
                 config: serde_json::json!({"model_type": "budget-tiny", "granule": 1, "max_positions": 16}),
                 generation: None,
+                preprocessor: None,
                 store: WeightStore::default(),
             },
             variants: &[],
@@ -1034,7 +1035,7 @@ fn qwen2_rig(trace: poot_graph_ir::TraceLimits) -> Qwen2Rig {
     .unwrap();
     Qwen2Rig {
         driver,
-        model,
+        model: model.model,
         _checkpoint: dir,
     }
 }

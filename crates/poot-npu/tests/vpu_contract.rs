@@ -214,7 +214,7 @@ fn a_dispatch_that_is_not_the_graphs_abi_is_refused_before_it_runs() {
             bytes.copy_from_slice(&words((0..N).map(|i| 100.0 + i as f32)))
         })
         .unwrap();
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
     device.replay(&recording).unwrap();
     let mut got = [0u8; 32];
     device.read(&out, &mut got).unwrap();
@@ -301,7 +301,7 @@ fn a_replay_that_misses_its_deadline_poisons_the_device() {
             work: 1,
         })
         .unwrap();
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
 
     let Err(VpuError::L0 { source, .. }) = device.replay(&recording) else {
         panic!("a 1 microsecond deadline cannot hold a 2048-cube matmul");
@@ -548,7 +548,7 @@ fn an_argument_a_recorded_execution_writes_is_range_checked_as_its_result() {
             })
             .unwrap();
     }
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
     let write = |device: &mut VpuDevice, buffer: &_, value: f32| {
         device
             .write_with(buffer, 0, 4 * N, &mut |_, bytes| {
@@ -640,7 +640,7 @@ fn a_constant_is_range_checked_at_its_upload_and_not_on_every_replay() {
             work: 1,
         })
         .unwrap();
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
     for _ in 0..3 {
         device.replay(&recording).expect("the weight is in range");
     }

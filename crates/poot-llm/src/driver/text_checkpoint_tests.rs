@@ -351,7 +351,14 @@ mod gemma_tokenizer {
         let codec =
             TextCodec::from_gguf(&vocab, vocab.eos_token_id.unwrap_or(0), ChatFormat::ChatML)
                 .expect("build gguf spm-bpe tokenizer");
-        let ours = codec.tokenizer();
+        let bos = vocab.bos_token_id.expect("the gemma GGUF names its BOS");
+        // `TextCodec::encode` is the one encoder (the SentencePiece port) and frames the text with BOS; the HF
+        // tokenizer is the reference and adds nothing.
+        let ours = |text: &str| {
+            let ids = codec.encode(text).unwrap();
+            assert_eq!(ids.first(), Some(&bos), "BOS leads {text:?}");
+            ids[1..].to_vec()
+        };
         let hf = Tokenizer::from_file(tjson).expect("load tokenizer.json");
         // Validated: whole-word text (space-separated, no attached punctuation) tokenizes bit-exactly vs HF
         // via the ignore_merges + U+2581-split path, including the SentencePiece dummy-space prefix (a leading
@@ -363,13 +370,13 @@ mod gemma_tokenizer {
         let exact = ["The capital of France is", "def add a b return a plus b"];
         let wip = ["Hello, world!", "Multi-token   spaces and mixed text."];
         for s in exact {
-            let a = ours.encode(s, false).unwrap().get_ids().to_vec();
+            let a = ours(s);
             let b = hf.encode(s, false).unwrap().get_ids().to_vec();
             assert_eq!(a, b, "whole-word sample should match HF exactly: {s:?}");
             eprintln!("exact {s:?} -> {} ids", a.len());
         }
         for s in wip {
-            let a = ours.encode(s, false).unwrap().get_ids().to_vec();
+            let a = ours(s);
             let b = hf.encode(s, false).unwrap().get_ids().to_vec();
             eprintln!("wip   {s:?} match={}\n  gguf={a:?}\n  hf  ={b:?}", a == b);
         }

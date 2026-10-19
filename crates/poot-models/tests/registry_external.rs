@@ -12,7 +12,8 @@ use poot_models::model::{
     TraceError,
 };
 use poot_models::registry::{
-    ConfigSource, FamilyEntry, Fixture, LoadModelError, RawConfig, Registry, RegistryError,
+    ConfigSource, FamilyEntry, Fixture, LoadModelError, ModelParts, RawConfig, Registry,
+    RegistryError,
 };
 use poot_quant::weights::{
     DenseWeight, WeightEntry, WeightId, WeightMap, WeightRole, WeightStore, WeightView,
@@ -72,7 +73,7 @@ fn usize_field(raw: &RawConfig<'_>, field: &'static str) -> Result<usize, ModelE
         })
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let vocab = usize_field(raw, "vocab_size")?;
     let width = usize_field(raw, "hidden_size")?;
     let mut weights = WeightMap::builder(store);
@@ -86,7 +87,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
             source,
         })?;
     let eos = BTreeSet::from([usize_field(raw, "eos_token_id")? as u32]);
-    Ok(Box::new(FakeLm {
+    Ok(ModelParts::new(Box::new(FakeLm {
         config: ModelConfig {
             family: FAKE,
             vocab,
@@ -106,7 +107,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
             .expect("a stateless step program is a schema"),
         weights: weights.build(),
         width,
-    }))
+    })))
 }
 
 fn fixture() -> Fixture {
@@ -129,6 +130,7 @@ fn fixture() -> Fixture {
             "eos_token_id": 2
         }),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }
@@ -164,7 +166,10 @@ fn an_externally_registered_family_resolves_by_model_type_and_builds() {
         FAKE
     );
 
-    let model = registry.build(&raw, &fx.store).expect("fake-lm builds");
+    let model = registry
+        .build(&raw, &fx.store)
+        .expect("fake-lm builds")
+        .model;
     assert_eq!(model.config().family, FAKE);
     assert_eq!(model.config().vocab, 3);
     assert_eq!(model.config().eos, BTreeSet::from([2]));
@@ -193,6 +198,7 @@ fn an_unregistered_model_type_is_a_typed_refusal_naming_the_missing_registration
     let raw = RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let err = registry.resolve(&raw).unwrap_err();
     assert_eq!(
@@ -217,6 +223,7 @@ fn an_unregistered_model_type_is_a_typed_refusal_naming_the_missing_registration
     let raw = RawConfig::HfJson {
         config: &keyless,
         generation: None,
+        preprocessor: None,
     };
     assert_eq!(
         registry.resolve(&raw).unwrap_err(),

@@ -24,7 +24,7 @@ use poot_models::io::{
 use poot_models::model::{
     FamilyKey, Model, ModelConfig, ModelError, ModelOutput, StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_quant::weights::{
     DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore, WeightView,
 };
@@ -86,7 +86,7 @@ fn tag_input() -> RequestInput {
     )
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let fields = Fields::new(raw, FAMILY);
     let vocab = fields.vocab()?;
     let width = fields.count(Field::hf("hidden_size"), None)?;
@@ -129,14 +129,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Tagged {
+    Ok(ModelParts::new(Box::new(Tagged {
         embed: Embedding::new(&weights, vocab, width).map_err(|e| e.for_family(FAMILY))?,
         tags: weight(WeightRole::TypeEmbed, &[tags, width])?,
         head: weight(WeightRole::Head, &[vocab, width])?,
         weights,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Tagged {
@@ -223,6 +223,7 @@ pub(crate) fn fixture() -> Fixture {
     Fixture {
         config: fixture_config(),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }

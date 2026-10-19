@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{DriverError, sys};
 
@@ -146,6 +146,28 @@ pub(crate) struct PtxOwner {
     /// every allocation this context has made.
     pub(crate) memory: poot_runtime_common::MemoryCounters,
     pub(crate) counters: OwnerCounters,
+    /// The first device fault any call observed. Once set, the owner refuses every driver call.
+    pub(crate) lost: OnceLock<DriverError>,
+}
+
+/// Whether a CUDA error means the device or context cannot run work any more. These are the
+/// sticky errors: every later call on the context returns the same one.
+fn is_device_fault(error: DriverError) -> bool {
+    use sys::CUresult as R;
+    matches!(
+        error.0,
+        R::CUDA_ERROR_ECC_UNCORRECTABLE
+            | R::CUDA_ERROR_ILLEGAL_ADDRESS
+            | R::CUDA_ERROR_LAUNCH_TIMEOUT
+            | R::CUDA_ERROR_ASSERT
+            | R::CUDA_ERROR_HARDWARE_STACK_ERROR
+            | R::CUDA_ERROR_ILLEGAL_INSTRUCTION
+            | R::CUDA_ERROR_MISALIGNED_ADDRESS
+            | R::CUDA_ERROR_INVALID_ADDRESS_SPACE
+            | R::CUDA_ERROR_INVALID_PC
+            | R::CUDA_ERROR_LAUNCH_FAILED
+            | R::CUDA_ERROR_NVLINK_UNCORRECTABLE
+    )
 }
 
 // SAFETY: every field here is either a plain address (the `sys::CU*` handles and
@@ -164,6 +186,25 @@ unsafe impl Send for PtxOwner {}
 unsafe impl Sync for PtxOwner {}
 
 impl PtxOwner {
+    /// The error for a driver failure a call observed: a device fault poisons the owner and becomes
+    /// [`PtxError::DeviceLost`], anything else stays a plain driver error.
+    pub(crate) fn observe(&self, error: DriverError) -> PtxError {
+        if is_device_fault(error) {
+            let _ = self.lost.set(error);
+            PtxError::DeviceLost(error)
+        } else {
+            PtxError::Driver(error)
+        }
+    }
+
+    /// Refuse a call on a poisoned owner before it touches the driver.
+    pub(crate) fn ensure_healthy(&self) -> Result<(), PtxError> {
+        match self.lost.get() {
+            Some(&cause) => Err(PtxError::Poisoned { cause }),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn current_guard(&self) -> Result<CurrentContextGuard, DriverError> {
         CurrentContextGuard::activate(&self.driver, self.ctx).map_err(|error| error.source)
     }
@@ -172,10 +213,11 @@ impl PtxOwner {
         &self,
         operation: impl FnOnce(&dyn CudaDriver) -> Result<T, DriverError>,
     ) -> Result<T, PtxError> {
+        self.ensure_healthy()?;
         let guard = self.current_guard()?;
         let result = operation(self.driver.as_ref());
         guard.restore()?;
-        result.map_err(PtxError::Driver)
+        result.map_err(|error| self.observe(error))
     }
 }
 
@@ -236,5 +278,6 @@ pub(crate) fn construct_owner(
         modules: Mutex::new(Vec::new()),
         memory: poot_runtime_common::MemoryCounters::new(),
         counters: OwnerCounters::default(),
+        lost: OnceLock::new(),
     }))
 }

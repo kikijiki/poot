@@ -16200,80 +16200,250 @@ bert/cross_encoder.encode	67	fused_row n_in=3 steps=9	compute	generated:row	5e5e
 bert/cross_encoder.encode	68	slice ax=1 0..1	compute	generated:movement	c06117d3629792de	1	32,1,1	-
 bert/cross_encoder.encode	69	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=3	compute_meta	generated:contraction	c48f84580f581fc4	1	4096,1,1	meta=[32, 32]
 bert/cross_encoder.encode	70	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute_meta	generated:contraction	66f9e761f489aede	1	256,1,1	meta=[32, 1]
-idefics3_vision.encode	0	reshape [1, 3, 4, 2, 4, 2]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v0
-idefics3_vision.encode	1	transpose [0, 2, 4, 1, 3, 5]	compute	generated:movement	f75b82fac048e38a	1	192,1,1	-
-idefics3_vision.encode	2	reshape [1, 16, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v2
-idefics3_vision.encode	3	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	192,1,1	-
-idefics3_vision.encode	4	reshape [16, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v5
-idefics3_vision.encode	5	contraction_epilogue Dense { weight: F32 } n_in=3 steps=4	compute	generated:contraction	9be656bc5f9506a4	1	128,1,1	-
-idefics3_vision.encode	6	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
-idefics3_vision.encode	7	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
-idefics3_vision.encode	8	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v30 strides=[0, 0, 1] offset=0
-idefics3_vision.encode	9	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
-idefics3_vision.encode	10	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
-idefics3_vision.encode	11	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v39
-idefics3_vision.encode	12	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
-idefics3_vision.encode	13	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
-idefics3_vision.encode	14	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v48
-idefics3_vision.encode	15	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
-idefics3_vision.encode	16	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
-idefics3_vision.encode	17	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v57
-idefics3_vision.encode	18	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
-idefics3_vision.encode	19	transpose [0, 1, 3, 2]	compute	generated:movement	a4b54f5d027326b6	1	256,1,1	-
-idefics3_vision.encode	20	matmul	compute_meta	imported:tiledgemmbatched	892a1d1ceddc8a58	1	256,1,1	meta=[2, 16, 8, 16]
-idefics3_vision.encode	21	mul	compute	generated:elementwise	b676beddcd9d21a9	1	512,1,1	-
-idefics3_vision.encode	22	fused_row n_in=1 steps=3	compute	generated:row	aba3b3cb7699142a	1	512,1,1	-
-idefics3_vision.encode	23	fused_row n_in=1 steps=2	compute	generated:row	ed26f2fc2b82efd7	1	512,1,1	-
-idefics3_vision.encode	24	matmul	compute_meta	imported:tiledgemmbatched	892a1d1ceddc8a58	1	128,1,1	meta=[2, 16, 16, 8]
-idefics3_vision.encode	25	transpose [0, 2, 1, 3]	compute	generated:movement	d005cf7be4aad2c2	1	256,1,1	-
-idefics3_vision.encode	26	reshape [1, 16, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v69
-idefics3_vision.encode	27	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	122954c8f4f1fcb3	1	128,1,1	-
-idefics3_vision.encode	28	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
-idefics3_vision.encode	29	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
-idefics3_vision.encode	30	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v92 strides=[0, 0, 1] offset=0
-idefics3_vision.encode	31	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
-idefics3_vision.encode	32	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	c3aa0f4b9c83ecf2	1	256,1,1	-
-idefics3_vision.encode	33	fused n_in=1 steps=9	compute	generated:pointwise	19e0deda537d9ae6	1	512,1,1	-
-idefics3_vision.encode	34	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	4b8fb660f1456cf1	1	128,1,1	-
-idefics3_vision.encode	35	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
-idefics3_vision.encode	36	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
-idefics3_vision.encode	37	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v132 strides=[0, 0, 1] offset=0
-idefics3_vision.encode	38	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
-idefics3_vision.encode	39	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
-idefics3_vision.encode	40	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v141
-idefics3_vision.encode	41	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
-idefics3_vision.encode	42	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
-idefics3_vision.encode	43	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v150
-idefics3_vision.encode	44	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
-idefics3_vision.encode	45	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
-idefics3_vision.encode	46	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v159
-idefics3_vision.encode	47	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
-idefics3_vision.encode	48	transpose [0, 1, 3, 2]	compute	generated:movement	a4b54f5d027326b6	1	256,1,1	-
-idefics3_vision.encode	49	matmul	compute_meta	imported:tiledgemmbatched	892a1d1ceddc8a58	1	256,1,1	meta=[2, 16, 8, 16]
-idefics3_vision.encode	50	mul	compute	generated:elementwise	b676beddcd9d21a9	1	512,1,1	-
-idefics3_vision.encode	51	fused_row n_in=1 steps=3	compute	generated:row	aba3b3cb7699142a	1	512,1,1	-
-idefics3_vision.encode	52	fused_row n_in=1 steps=2	compute	generated:row	ed26f2fc2b82efd7	1	512,1,1	-
-idefics3_vision.encode	53	matmul	compute_meta	imported:tiledgemmbatched	892a1d1ceddc8a58	1	128,1,1	meta=[2, 16, 16, 8]
-idefics3_vision.encode	54	transpose [0, 2, 1, 3]	compute	generated:movement	d005cf7be4aad2c2	1	256,1,1	-
-idefics3_vision.encode	55	reshape [1, 16, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v171
-idefics3_vision.encode	56	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	122954c8f4f1fcb3	1	128,1,1	-
-idefics3_vision.encode	57	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
-idefics3_vision.encode	58	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
-idefics3_vision.encode	59	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v194 strides=[0, 0, 1] offset=0
-idefics3_vision.encode	60	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
-idefics3_vision.encode	61	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	c3aa0f4b9c83ecf2	1	256,1,1	-
-idefics3_vision.encode	62	fused n_in=1 steps=9	compute	generated:pointwise	19e0deda537d9ae6	1	512,1,1	-
-idefics3_vision.encode	63	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	4b8fb660f1456cf1	1	128,1,1	-
-idefics3_vision.encode	64	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
-idefics3_vision.encode	65	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
-idefics3_vision.encode	66	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v234 strides=[0, 0, 1] offset=0
-idefics3_vision.encode	67	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
-idefics3_vision.encode	68	reshape [1, 4, 2, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v236
-idefics3_vision.encode	69	transpose [0, 2, 1, 3]	compute	generated:movement	782022db2743b9fc	1	256,1,1	-
-idefics3_vision.encode	70	reshape [1, 2, 2, 64]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v238
-idefics3_vision.encode	71	transpose [0, 2, 1, 3]	compute	generated:movement	44b58f9aa6390d9a	1	256,1,1	-
-idefics3_vision.encode	72	reshape [1, 4, 64]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v240
-idefics3_vision.encode	73	dense_contraction bf16	compute	generated:contraction	ecedfb937dbd3208	1	192,1,1	-
+idefics3.decode	0	dense_row_gather bf16	compute	imported:packedbf16rowgather	01ee42a98d9ef4ad	1	24,1,1	-
+idefics3.decode	1	fused_row n_in=2 steps=8	compute	generated:row	585ce4e29c6618c6	1	24,1,1	-
+idefics3.decode	2	dense_contraction bf16	compute_meta	generated:contraction	2e0fe464f89c8f24	1	3072,1,1	meta=[24, 24]
+idefics3.decode	3	dense_contraction bf16	compute_meta	generated:contraction	2e0fe464f89c8f24	1	3072,1,1	meta=[24, 24]
+idefics3.decode	4	dense_contraction bf16	compute_meta	generated:contraction	2e0fe464f89c8f24	1	3072,1,1	meta=[24, 24]
+idefics3.decode	5	reshape [1, 2, 1, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v16
+idefics3.decode	6	reshape [1, 2, 1, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v19
+idefics3.decode	7	reshape [1, 2, 1, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v22
+idefics3.decode	8	gather ax=0	compute	generated:movement	ff770fee24683196	1	12,1,1	-
+idefics3.decode	9	reshape [1, 1, 1, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v30
+idefics3.decode	10	gather ax=0	compute	generated:movement	ff770fee24683196	1	12,1,1	-
+idefics3.decode	11	reshape [1, 1, 1, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v33
+idefics3.decode	12	rope rot=12	compute	generated:rope	aea348ba2f8a66a9	1	24,1,1	-
+idefics3.decode	13	rope rot=12	compute	generated:rope	aea348ba2f8a66a9	1	24,1,1	-
+idefics3.decode	14	slice ax=1 0..1	compute	generated:movement	e3e018a5dedc425a	1	1,1,1	-
+idefics3.decode	15	reshape []	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v49
+idefics3.decode	16	dyn_update_slice ax=2	compute	generated:movement	4dc0e1b47d8b6eb7	1	192,1,1	-
+idefics3.decode	17	dyn_update_slice ax=2	compute	generated:movement	4dc0e1b47d8b6eb7	1	192,1,1	-
+idefics3.decode	18	reshape [1, 1, 1, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1
+idefics3.decode	19	reshape [1, 1, 1, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v57
+idefics3.decode	20	fused n_in=2 steps=4	compute	generated:pointwise	fa13ce140429154f	1	8,1,1	-
+idefics3.decode	21	reshape [1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1
+idefics3.decode	22	fused n_in=1 steps=6	compute	generated:pointwise	1c8018cb6fe0413a	1	1,1,1	-
+idefics3.decode	23	attention n_rep=1 scale=0.28867513 softcap=None mask=Additive key=Single bound=Live	compute	generated:attention	02dcd8bc76c43686	1	128,1,1	schedule=streaming lanes=64 lds=3584 key=single bound=live(v70)
+idefics3.decode	24	reshape [1, 1, 24]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v95
+idefics3.decode	25	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute_meta	generated:contraction	88ce36ed768426ff	1	3072,1,1	meta=[24, 24]
+idefics3.decode	26	fused_row n_in=2 steps=8	compute	generated:row	585ce4e29c6618c6	1	24,1,1	-
+idefics3.decode	27	dense_contraction bf16	compute_meta	generated:contraction	924738a3885ab8ce	1	6144,1,1	meta=[24, 48]
+idefics3.decode	28	fused n_in=1 steps=4	compute	generated:pointwise	77073e62541bc187	1	48,1,1	-
+idefics3.decode	29	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute_meta	generated:contraction	e4995a987ad0494a	1	6144,1,1	meta=[24, 48]
+idefics3.decode	30	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute_meta	generated:contraction	f0f3e9d74705e809	1	3072,1,1	meta=[48, 24]
+idefics3.decode	31	fused_row n_in=2 steps=8	compute	generated:row	585ce4e29c6618c6	1	24,1,1	-
+idefics3.decode	32	dense_contraction bf16	compute_meta	generated:contraction	2e0fe464f89c8f24	1	3072,1,1	meta=[24, 24]
+idefics3.decode	33	dense_contraction bf16	compute_meta	generated:contraction	2e0fe464f89c8f24	1	3072,1,1	meta=[24, 24]
+idefics3.decode	34	dense_contraction bf16	compute_meta	generated:contraction	2e0fe464f89c8f24	1	3072,1,1	meta=[24, 24]
+idefics3.decode	35	reshape [1, 2, 1, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v137
+idefics3.decode	36	reshape [1, 2, 1, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v140
+idefics3.decode	37	reshape [1, 2, 1, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v143
+idefics3.decode	38	rope rot=12	compute	generated:rope	aea348ba2f8a66a9	1	24,1,1	-
+idefics3.decode	39	rope rot=12	compute	generated:rope	aea348ba2f8a66a9	1	24,1,1	-
+idefics3.decode	40	dyn_update_slice ax=2	compute	generated:movement	4dc0e1b47d8b6eb7	1	192,1,1	-
+idefics3.decode	41	dyn_update_slice ax=2	compute	generated:movement	4dc0e1b47d8b6eb7	1	192,1,1	-
+idefics3.decode	42	attention n_rep=1 scale=0.28867513 softcap=None mask=Additive key=Single bound=Live	compute	generated:attention	02dcd8bc76c43686	1	128,1,1	schedule=streaming lanes=64 lds=3584 key=single bound=live(v70)
+idefics3.decode	43	reshape [1, 1, 24]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v216
+idefics3.decode	44	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute_meta	generated:contraction	88ce36ed768426ff	1	3072,1,1	meta=[24, 24]
+idefics3.decode	45	fused_row n_in=2 steps=8	compute	generated:row	585ce4e29c6618c6	1	24,1,1	-
+idefics3.decode	46	dense_contraction bf16	compute_meta	generated:contraction	924738a3885ab8ce	1	6144,1,1	meta=[24, 48]
+idefics3.decode	47	fused n_in=1 steps=4	compute	generated:pointwise	77073e62541bc187	1	48,1,1	-
+idefics3.decode	48	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute_meta	generated:contraction	e4995a987ad0494a	1	6144,1,1	meta=[24, 48]
+idefics3.decode	49	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute_meta	generated:contraction	f0f3e9d74705e809	1	3072,1,1	meta=[48, 24]
+idefics3.decode	50	fused_row n_in=2 steps=8	compute	generated:row	585ce4e29c6618c6	1	24,1,1	-
+idefics3.decode	51	dense_contraction bf16	compute_meta	generated:contraction	924738a3885ab8ce	1	6144,1,1	meta=[24, 48]
+idefics3.prefill	0	dense_row_gather bf16	compute	imported:packedbf16rowgather	01ee42a98d9ef4ad	1	96,1,1	-
+idefics3.prefill	1	fused_row n_in=2 steps=8	compute	generated:row	5efa3fb29e73f2be	1	96,1,1	-
+idefics3.prefill	2	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill	3	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill	4	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill	5	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v16
+idefics3.prefill	6	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill	7	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v19
+idefics3.prefill	8	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill	9	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v22
+idefics3.prefill	10	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill	11	gather ax=0	compute	generated:movement	363d2acffb16936d	1	48,1,1	-
+idefics3.prefill	12	reshape [1, 1, 4, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v30
+idefics3.prefill	13	gather ax=0	compute	generated:movement	363d2acffb16936d	1	48,1,1	-
+idefics3.prefill	14	reshape [1, 1, 4, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v33
+idefics3.prefill	15	rope rot=12	compute	generated:rope	ac23604325297500	1	96,1,1	-
+idefics3.prefill	16	rope rot=12	compute	generated:rope	ac23604325297500	1	96,1,1	-
+idefics3.prefill	17	slice ax=1 0..1	compute	generated:movement	9ce09ddecb85c9bb	1	1,1,1	-
+idefics3.prefill	18	reshape []	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v49
+idefics3.prefill	19	dyn_update_slice ax=2	compute	generated:movement	596f1eb1c6dc972f	1	96,1,1	-
+idefics3.prefill	20	dyn_update_slice ax=2	compute	generated:movement	596f1eb1c6dc972f	1	96,1,1	-
+idefics3.prefill	21	reshape [1, 1, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1
+idefics3.prefill	22	reshape [1, 1, 1, 4]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v57
+idefics3.prefill	23	fused n_in=2 steps=4	compute	generated:pointwise	dd8b981d1e23e4f5	1	16,1,1	-
+idefics3.prefill	24	attention n_rep=1 scale=0.28867513 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	f238fe92a50cc501	1	512,1,1	schedule=streaming lanes=64 lds=3584 key=single bound=capacity
+idefics3.prefill	25	transpose [0, 2, 1, 3]	compute	generated:movement	d160877f5cf5f102	1	96,1,1	-
+idefics3.prefill	26	reshape [1, 4, 24]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v72
+idefics3.prefill	27	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	b8629f6fb27d0bcd	1	192,1,1	-
+idefics3.prefill	28	fused_row n_in=2 steps=8	compute	generated:row	5efa3fb29e73f2be	1	96,1,1	-
+idefics3.prefill	29	dense_contraction bf16	compute	generated:contraction	53dfb70a2f106553	1	384,1,1	-
+idefics3.prefill	30	fused n_in=1 steps=4	compute	generated:pointwise	fd3862c822da3e77	1	192,1,1	-
+idefics3.prefill	31	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	bf0b0af7250ff697	1	384,1,1	-
+idefics3.prefill	32	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	d324c362da9579f7	1	192,1,1	-
+idefics3.prefill	33	fused_row n_in=2 steps=8	compute	generated:row	5efa3fb29e73f2be	1	96,1,1	-
+idefics3.prefill	34	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill	35	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill	36	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill	37	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v113
+idefics3.prefill	38	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill	39	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v116
+idefics3.prefill	40	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill	41	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v119
+idefics3.prefill	42	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill	43	rope rot=12	compute	generated:rope	ac23604325297500	1	96,1,1	-
+idefics3.prefill	44	rope rot=12	compute	generated:rope	ac23604325297500	1	96,1,1	-
+idefics3.prefill	45	dyn_update_slice ax=2	compute	generated:movement	596f1eb1c6dc972f	1	96,1,1	-
+idefics3.prefill	46	dyn_update_slice ax=2	compute	generated:movement	596f1eb1c6dc972f	1	96,1,1	-
+idefics3.prefill	47	attention n_rep=1 scale=0.28867513 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	f238fe92a50cc501	1	512,1,1	schedule=streaming lanes=64 lds=3584 key=single bound=capacity
+idefics3.prefill	48	transpose [0, 2, 1, 3]	compute	generated:movement	d160877f5cf5f102	1	96,1,1	-
+idefics3.prefill	49	reshape [1, 4, 24]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v169
+idefics3.prefill	50	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	b8629f6fb27d0bcd	1	192,1,1	-
+idefics3.prefill	51	fused_row n_in=2 steps=8	compute	generated:row	5efa3fb29e73f2be	1	96,1,1	-
+idefics3.prefill	52	dense_contraction bf16	compute	generated:contraction	53dfb70a2f106553	1	384,1,1	-
+idefics3.prefill	53	fused n_in=1 steps=4	compute	generated:pointwise	fd3862c822da3e77	1	192,1,1	-
+idefics3.prefill	54	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	bf0b0af7250ff697	1	384,1,1	-
+idefics3.prefill	55	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	d324c362da9579f7	1	192,1,1	-
+idefics3.prefill	56	slice ax=1 3..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v198 strides=[96, 24, 1] offset=72
+idefics3.prefill	57	fused_row n_in=2 steps=8	compute	generated:row	d179f7dcc3d994ec	1	24,1,1	-
+idefics3.prefill	58	dense_contraction bf16	compute_meta	generated:contraction	924738a3885ab8ce	1	6144,1,1	meta=[24, 48]
+idefics3.prefill_kv	0	dense_row_gather bf16	compute	imported:packedbf16rowgather	01ee42a98d9ef4ad	1	96,1,1	-
+idefics3.prefill_kv	1	fused_row n_in=2 steps=8	compute	generated:row	5efa3fb29e73f2be	1	96,1,1	-
+idefics3.prefill_kv	2	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill_kv	3	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill_kv	4	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill_kv	5	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v16
+idefics3.prefill_kv	6	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill_kv	7	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v19
+idefics3.prefill_kv	8	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill_kv	9	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v22
+idefics3.prefill_kv	10	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill_kv	11	gather ax=0	compute	generated:movement	11263aa8452ea259	1	48,1,1	-
+idefics3.prefill_kv	12	reshape [1, 1, 4, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v30
+idefics3.prefill_kv	13	gather ax=0	compute	generated:movement	11263aa8452ea259	1	48,1,1	-
+idefics3.prefill_kv	14	reshape [1, 1, 4, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v33
+idefics3.prefill_kv	15	rope rot=12	compute	generated:rope	ac23604325297500	1	96,1,1	-
+idefics3.prefill_kv	16	rope rot=12	compute	generated:rope	ac23604325297500	1	96,1,1	-
+idefics3.prefill_kv	17	slice ax=1 0..1	compute	generated:movement	9ce09ddecb85c9bb	1	1,1,1	-
+idefics3.prefill_kv	18	reshape []	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v49
+idefics3.prefill_kv	19	dyn_update_slice ax=2	compute	generated:movement	5cf01c674fd9cbc6	1	192,1,1	-
+idefics3.prefill_kv	20	dyn_update_slice ax=2	compute	generated:movement	5cf01c674fd9cbc6	1	192,1,1	-
+idefics3.prefill_kv	21	reshape [1, 1, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v1
+idefics3.prefill_kv	22	reshape [1, 1, 1, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v57
+idefics3.prefill_kv	23	fused n_in=2 steps=4	compute	generated:pointwise	8114ce0d57af10f5	1	32,1,1	-
+idefics3.prefill_kv	24	attention n_rep=1 scale=0.28867513 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	3371e197e77f45c5	1	512,1,1	schedule=streaming lanes=64 lds=3584 key=single bound=capacity
+idefics3.prefill_kv	25	transpose [0, 2, 1, 3]	compute	generated:movement	d160877f5cf5f102	1	96,1,1	-
+idefics3.prefill_kv	26	reshape [1, 4, 24]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v72
+idefics3.prefill_kv	27	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	b8629f6fb27d0bcd	1	192,1,1	-
+idefics3.prefill_kv	28	fused_row n_in=2 steps=8	compute	generated:row	5efa3fb29e73f2be	1	96,1,1	-
+idefics3.prefill_kv	29	dense_contraction bf16	compute	generated:contraction	53dfb70a2f106553	1	384,1,1	-
+idefics3.prefill_kv	30	fused n_in=1 steps=4	compute	generated:pointwise	fd3862c822da3e77	1	192,1,1	-
+idefics3.prefill_kv	31	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	bf0b0af7250ff697	1	384,1,1	-
+idefics3.prefill_kv	32	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	d324c362da9579f7	1	192,1,1	-
+idefics3.prefill_kv	33	fused_row n_in=2 steps=8	compute	generated:row	5efa3fb29e73f2be	1	96,1,1	-
+idefics3.prefill_kv	34	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill_kv	35	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill_kv	36	dense_contraction bf16	compute	generated:contraction	1f029e8b2c0dd434	1	192,1,1	-
+idefics3.prefill_kv	37	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v113
+idefics3.prefill_kv	38	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill_kv	39	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v116
+idefics3.prefill_kv	40	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill_kv	41	reshape [1, 4, 2, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v119
+idefics3.prefill_kv	42	transpose [0, 2, 1, 3]	compute	generated:movement	22508d9a9ef9edf2	1	96,1,1	-
+idefics3.prefill_kv	43	rope rot=12	compute	generated:rope	ac23604325297500	1	96,1,1	-
+idefics3.prefill_kv	44	rope rot=12	compute	generated:rope	ac23604325297500	1	96,1,1	-
+idefics3.prefill_kv	45	dyn_update_slice ax=2	compute	generated:movement	5cf01c674fd9cbc6	1	192,1,1	-
+idefics3.prefill_kv	46	dyn_update_slice ax=2	compute	generated:movement	5cf01c674fd9cbc6	1	192,1,1	-
+idefics3.prefill_kv	47	attention n_rep=1 scale=0.28867513 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	3371e197e77f45c5	1	512,1,1	schedule=streaming lanes=64 lds=3584 key=single bound=capacity
+idefics3.prefill_kv	48	transpose [0, 2, 1, 3]	compute	generated:movement	d160877f5cf5f102	1	96,1,1	-
+idefics3.prefill_kv	49	reshape [1, 4, 24]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v169
+idefics3.prefill_kv	50	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	b8629f6fb27d0bcd	1	192,1,1	-
+idefics3.prefill_kv	51	fused_row n_in=2 steps=8	compute	generated:row	5efa3fb29e73f2be	1	96,1,1	-
+idefics3.prefill_kv	52	dense_contraction bf16	compute	generated:contraction	53dfb70a2f106553	1	384,1,1	-
+idefics3.prefill_kv	53	fused n_in=1 steps=4	compute	generated:pointwise	fd3862c822da3e77	1	192,1,1	-
+idefics3.prefill_kv	54	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	bf0b0af7250ff697	1	384,1,1	-
+idefics3.prefill_kv	55	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=1	compute	generated:contraction	d324c362da9579f7	1	192,1,1	-
+idefics3.prefill_kv	56	slice ax=1 3..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v198 strides=[96, 24, 1] offset=72
+idefics3.prefill_kv	57	fused_row n_in=2 steps=8	compute	generated:row	d179f7dcc3d994ec	1	24,1,1	-
+idefics3.prefill_kv	58	dense_contraction bf16	compute_meta	generated:contraction	924738a3885ab8ce	1	6144,1,1	meta=[24, 48]
+idefics3/vision.encode	0	reshape [1, 3, 4, 2, 4, 2]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v0
+idefics3/vision.encode	1	transpose [0, 2, 4, 1, 3, 5]	compute	generated:movement	f75b82fac048e38a	1	192,1,1	-
+idefics3/vision.encode	2	reshape [1, 16, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v2
+idefics3/vision.encode	3	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	192,1,1	-
+idefics3/vision.encode	4	reshape [16, 12]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v5
+idefics3/vision.encode	5	contraction_epilogue Dense { weight: F32 } n_in=3 steps=4	compute	generated:contraction	9be656bc5f9506a4	1	128,1,1	-
+idefics3/vision.encode	6	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
+idefics3/vision.encode	7	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
+idefics3/vision.encode	8	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v30 strides=[0, 0, 1] offset=0
+idefics3/vision.encode	9	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
+idefics3/vision.encode	10	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
+idefics3/vision.encode	11	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v39
+idefics3/vision.encode	12	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
+idefics3/vision.encode	13	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
+idefics3/vision.encode	14	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v48
+idefics3/vision.encode	15	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
+idefics3/vision.encode	16	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
+idefics3/vision.encode	17	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v57
+idefics3/vision.encode	18	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
+idefics3/vision.encode	19	transpose [0, 1, 3, 2]	compute	generated:movement	a4b54f5d027326b6	1	256,1,1	-
+idefics3/vision.encode	20	matmul	compute_meta	imported:tiledgemmbatched	892a1d1ceddc8a58	1	256,1,1	meta=[2, 16, 8, 16]
+idefics3/vision.encode	21	mul	compute	generated:elementwise	b676beddcd9d21a9	1	512,1,1	-
+idefics3/vision.encode	22	fused_row n_in=1 steps=3	compute	generated:row	aba3b3cb7699142a	1	512,1,1	-
+idefics3/vision.encode	23	fused_row n_in=1 steps=2	compute	generated:row	ed26f2fc2b82efd7	1	512,1,1	-
+idefics3/vision.encode	24	matmul	compute_meta	imported:tiledgemmbatched	892a1d1ceddc8a58	1	128,1,1	meta=[2, 16, 16, 8]
+idefics3/vision.encode	25	transpose [0, 2, 1, 3]	compute	generated:movement	d005cf7be4aad2c2	1	256,1,1	-
+idefics3/vision.encode	26	reshape [1, 16, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v69
+idefics3/vision.encode	27	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	122954c8f4f1fcb3	1	128,1,1	-
+idefics3/vision.encode	28	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
+idefics3/vision.encode	29	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
+idefics3/vision.encode	30	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v92 strides=[0, 0, 1] offset=0
+idefics3/vision.encode	31	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
+idefics3/vision.encode	32	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	c3aa0f4b9c83ecf2	1	256,1,1	-
+idefics3/vision.encode	33	fused n_in=1 steps=9	compute	generated:pointwise	19e0deda537d9ae6	1	512,1,1	-
+idefics3/vision.encode	34	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	4b8fb660f1456cf1	1	128,1,1	-
+idefics3/vision.encode	35	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
+idefics3/vision.encode	36	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
+idefics3/vision.encode	37	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v132 strides=[0, 0, 1] offset=0
+idefics3/vision.encode	38	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
+idefics3/vision.encode	39	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
+idefics3/vision.encode	40	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v141
+idefics3/vision.encode	41	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
+idefics3/vision.encode	42	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
+idefics3/vision.encode	43	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v150
+idefics3/vision.encode	44	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
+idefics3/vision.encode	45	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	792015ad8e8635fe	1	128,1,1	-
+idefics3/vision.encode	46	reshape [1, 16, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v159
+idefics3/vision.encode	47	transpose [0, 2, 1, 3]	compute	generated:movement	cf32d92bd2722a02	1	256,1,1	-
+idefics3/vision.encode	48	transpose [0, 1, 3, 2]	compute	generated:movement	a4b54f5d027326b6	1	256,1,1	-
+idefics3/vision.encode	49	matmul	compute_meta	imported:tiledgemmbatched	892a1d1ceddc8a58	1	256,1,1	meta=[2, 16, 8, 16]
+idefics3/vision.encode	50	mul	compute	generated:elementwise	b676beddcd9d21a9	1	512,1,1	-
+idefics3/vision.encode	51	fused_row n_in=1 steps=3	compute	generated:row	aba3b3cb7699142a	1	512,1,1	-
+idefics3/vision.encode	52	fused_row n_in=1 steps=2	compute	generated:row	ed26f2fc2b82efd7	1	512,1,1	-
+idefics3/vision.encode	53	matmul	compute_meta	imported:tiledgemmbatched	892a1d1ceddc8a58	1	128,1,1	meta=[2, 16, 16, 8]
+idefics3/vision.encode	54	transpose [0, 2, 1, 3]	compute	generated:movement	d005cf7be4aad2c2	1	256,1,1	-
+idefics3/vision.encode	55	reshape [1, 16, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v171
+idefics3/vision.encode	56	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	122954c8f4f1fcb3	1	128,1,1	-
+idefics3/vision.encode	57	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
+idefics3/vision.encode	58	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
+idefics3/vision.encode	59	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v194 strides=[0, 0, 1] offset=0
+idefics3/vision.encode	60	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
+idefics3/vision.encode	61	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	c3aa0f4b9c83ecf2	1	256,1,1	-
+idefics3/vision.encode	62	fused n_in=1 steps=9	compute	generated:pointwise	19e0deda537d9ae6	1	512,1,1	-
+idefics3/vision.encode	63	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	4b8fb660f1456cf1	1	128,1,1	-
+idefics3/vision.encode	64	fused_row n_in=1 steps=3	compute	generated:row	73197ab7a22bd693	1	256,1,1	-
+idefics3/vision.encode	65	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	16,1,1	-
+idefics3/vision.encode	66	broadcast [1, 16, 16]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v234 strides=[0, 0, 1] offset=0
+idefics3/vision.encode	67	fused_row n_in=3 steps=9	compute	generated:row	7e86e3258f8bb986	1	256,1,1	-
+idefics3/vision.encode	68	reshape [1, 4, 2, 32]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v236
+idefics3/vision.encode	69	transpose [0, 2, 1, 3]	compute	generated:movement	782022db2743b9fc	1	256,1,1	-
+idefics3/vision.encode	70	reshape [1, 2, 2, 64]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v238
+idefics3/vision.encode	71	transpose [0, 2, 1, 3]	compute	generated:movement	44b58f9aa6390d9a	1	256,1,1	-
+idefics3/vision.encode	72	reshape [1, 4, 64]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v240
+idefics3/vision.encode	73	dense_contraction bf16	compute	generated:contraction	ecedfb937dbd3208	1	192,1,1	-
 qwen3next.decode	0	dense_row_gather bf16	compute	imported:packedbf16rowgather	01ee42a98d9ef4ad	1	32,1,1	-
 qwen3next.decode	1	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	32,1,1	-
 qwen3next.decode	2	add	compute	generated:elementwise	f97093ce2d1da756	1	32,1,1	-
@@ -31266,124 +31436,124 @@ qwen2_5_vl.prefill_kv	77	contraction_epilogue Dense { weight: BF16 } n_in=2 step
 qwen2_5_vl.prefill_kv	78	slice ax=1 3..4	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v335 strides=[256, 64, 1] offset=192
 qwen2_5_vl.prefill_kv	79	fused_row n_in=2 steps=8	compute	generated:row	21ae6dd7a37ea8c1	1	64,1,1	-
 qwen2_5_vl.prefill_kv	80	dense_contraction bf16	compute_meta	generated:contraction	fbac25e17185e3f2	1	6144,1,1	meta=[64, 48]
-qwen2_5_vl_vision.encode	0	reshape [1, 1, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v3
-qwen2_5_vl_vision.encode	1	broadcast [1, 1, 4, 4]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v5 strides=[0, 0, 1, 0] offset=0
-qwen2_5_vl_vision.encode	2	reshape [1, 1, 1, 4]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v3
-qwen2_5_vl_vision.encode	3	broadcast [1, 1, 4, 4]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v7 strides=[0, 0, 0, 1] offset=0
-qwen2_5_vl_vision.encode	4	fused n_in=2 steps=5	compute	generated:pointwise	4ee65aceddf39ea4	1	16,1,1	-
-qwen2_5_vl_vision.encode	5	reshape [1, 1, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v4
-qwen2_5_vl_vision.encode	6	broadcast [1, 1, 4, 4]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v14 strides=[0, 0, 1, 0] offset=0
-qwen2_5_vl_vision.encode	7	reshape [1, 1, 1, 4]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v4
-qwen2_5_vl_vision.encode	8	broadcast [1, 1, 4, 4]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v16 strides=[0, 0, 0, 1] offset=0
-qwen2_5_vl_vision.encode	9	fused n_in=2 steps=5	compute	generated:pointwise	4ee65aceddf39ea4	1	16,1,1	-
-qwen2_5_vl_vision.encode	10	gather ax=0	compute	generated:movement	291fc32bec5279ba	1	16,1,1	-
-qwen2_5_vl_vision.encode	11	slice ax=2 0..2	compute	generated:movement	474109c79f1570f7	1	8,1,1	-
-qwen2_5_vl_vision.encode	12	gather ax=0	compute	generated:movement	291fc32bec5279ba	1	16,1,1	-
-qwen2_5_vl_vision.encode	13	slice ax=2 0..2	compute	generated:movement	474109c79f1570f7	1	8,1,1	-
-qwen2_5_vl_vision.encode	14	concat ax=2	compute	generated:movement	a55cfbc334e41c0a	1	32,1,1	-
-qwen2_5_vl_vision.encode	15	reshape [1, 1, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v28
-qwen2_5_vl_vision.encode	16	gather ax=0	compute	generated:movement	291fc32bec5279ba	1	16,1,1	-
-qwen2_5_vl_vision.encode	17	slice ax=2 0..2	compute	generated:movement	474109c79f1570f7	1	8,1,1	-
-qwen2_5_vl_vision.encode	18	gather ax=0	compute	generated:movement	291fc32bec5279ba	1	16,1,1	-
-qwen2_5_vl_vision.encode	19	slice ax=2 0..2	compute	generated:movement	474109c79f1570f7	1	8,1,1	-
-qwen2_5_vl_vision.encode	20	concat ax=2	compute	generated:movement	a55cfbc334e41c0a	1	32,1,1	-
-qwen2_5_vl_vision.encode	21	reshape [1, 1, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v35
-qwen2_5_vl_vision.encode	22	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	384,1,1	-
-qwen2_5_vl_vision.encode	23	reshape [16, 24]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v38
-qwen2_5_vl_vision.encode	24	dense_contraction f32	compute	generated:contraction	a06781ec08ffecb1	1	128,1,1	-
-qwen2_5_vl_vision.encode	25	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	26	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	766fe5322b775f47	1	384,1,1	-
-qwen2_5_vl_vision.encode	27	slice ax=2 0..16	compute	generated:movement	768263cb53453698	1	64,1,1	-
-qwen2_5_vl_vision.encode	28	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v58
-qwen2_5_vl_vision.encode	29	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	30	slice ax=2 16..32	compute	generated:movement	d044f9f0b893e9b7	1	64,1,1	-
-qwen2_5_vl_vision.encode	31	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v61
-qwen2_5_vl_vision.encode	32	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	33	slice ax=2 32..48	compute	generated:movement	cb3b8cd6e7397ab9	1	64,1,1	-
-qwen2_5_vl_vision.encode	34	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v64
-qwen2_5_vl_vision.encode	35	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	36	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
-qwen2_5_vl_vision.encode	37	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
-qwen2_5_vl_vision.encode	38	attention n_rep=1 scale=0.35355338 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	28583f83a2d0fae7	1	512,1,1	schedule=streaming lanes=64 lds=2560 key=single bound=capacity
-qwen2_5_vl_vision.encode	39	transpose [0, 2, 1, 3]	compute	generated:movement	c7d0610e89276eef	1	64,1,1	-
-qwen2_5_vl_vision.encode	40	reshape [1, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v91
-qwen2_5_vl_vision.encode	41	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	1654a170bf1680fe	1	128,1,1	-
-qwen2_5_vl_vision.encode	42	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	43	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	a67352511075a222	1	192,1,1	-
-qwen2_5_vl_vision.encode	44	fused n_in=1 steps=4	compute	generated:pointwise	2db9405be6ff0912	1	96,1,1	-
-qwen2_5_vl_vision.encode	45	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	dd91ae43c7a8e98c	1	192,1,1	-
-qwen2_5_vl_vision.encode	46	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	6209b1df3ee264ed	1	128,1,1	-
-qwen2_5_vl_vision.encode	47	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	48	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	766fe5322b775f47	1	384,1,1	-
-qwen2_5_vl_vision.encode	49	slice ax=2 0..16	compute	generated:movement	768263cb53453698	1	64,1,1	-
-qwen2_5_vl_vision.encode	50	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v153
-qwen2_5_vl_vision.encode	51	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	52	slice ax=2 16..32	compute	generated:movement	d044f9f0b893e9b7	1	64,1,1	-
-qwen2_5_vl_vision.encode	53	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v156
-qwen2_5_vl_vision.encode	54	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	55	slice ax=2 32..48	compute	generated:movement	cb3b8cd6e7397ab9	1	64,1,1	-
-qwen2_5_vl_vision.encode	56	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v159
-qwen2_5_vl_vision.encode	57	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	58	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
-qwen2_5_vl_vision.encode	59	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
-qwen2_5_vl_vision.encode	60	attention n_rep=1 scale=0.35355338 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	28583f83a2d0fae7	1	512,1,1	schedule=streaming lanes=64 lds=2560 key=single bound=capacity
-qwen2_5_vl_vision.encode	61	transpose [0, 2, 1, 3]	compute	generated:movement	c7d0610e89276eef	1	64,1,1	-
-qwen2_5_vl_vision.encode	62	reshape [1, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v186
-qwen2_5_vl_vision.encode	63	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	1654a170bf1680fe	1	128,1,1	-
-qwen2_5_vl_vision.encode	64	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	65	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	a67352511075a222	1	192,1,1	-
-qwen2_5_vl_vision.encode	66	fused n_in=1 steps=4	compute	generated:pointwise	2db9405be6ff0912	1	96,1,1	-
-qwen2_5_vl_vision.encode	67	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	dd91ae43c7a8e98c	1	192,1,1	-
-qwen2_5_vl_vision.encode	68	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	6209b1df3ee264ed	1	128,1,1	-
-qwen2_5_vl_vision.encode	69	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	70	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	766fe5322b775f47	1	384,1,1	-
-qwen2_5_vl_vision.encode	71	slice ax=2 0..16	compute	generated:movement	768263cb53453698	1	64,1,1	-
-qwen2_5_vl_vision.encode	72	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v248
-qwen2_5_vl_vision.encode	73	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	74	slice ax=2 16..32	compute	generated:movement	d044f9f0b893e9b7	1	64,1,1	-
-qwen2_5_vl_vision.encode	75	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v251
-qwen2_5_vl_vision.encode	76	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	77	slice ax=2 32..48	compute	generated:movement	cb3b8cd6e7397ab9	1	64,1,1	-
-qwen2_5_vl_vision.encode	78	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v254
-qwen2_5_vl_vision.encode	79	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	80	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
-qwen2_5_vl_vision.encode	81	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
-qwen2_5_vl_vision.encode	82	attention n_rep=1 scale=0.35355338 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	28583f83a2d0fae7	1	512,1,1	schedule=streaming lanes=64 lds=2560 key=single bound=capacity
-qwen2_5_vl_vision.encode	83	transpose [0, 2, 1, 3]	compute	generated:movement	c7d0610e89276eef	1	64,1,1	-
-qwen2_5_vl_vision.encode	84	reshape [1, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v281
-qwen2_5_vl_vision.encode	85	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	1654a170bf1680fe	1	128,1,1	-
-qwen2_5_vl_vision.encode	86	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	87	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	a67352511075a222	1	192,1,1	-
-qwen2_5_vl_vision.encode	88	fused n_in=1 steps=4	compute	generated:pointwise	2db9405be6ff0912	1	96,1,1	-
-qwen2_5_vl_vision.encode	89	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	dd91ae43c7a8e98c	1	192,1,1	-
-qwen2_5_vl_vision.encode	90	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	6209b1df3ee264ed	1	128,1,1	-
-qwen2_5_vl_vision.encode	91	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	92	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	766fe5322b775f47	1	384,1,1	-
-qwen2_5_vl_vision.encode	93	slice ax=2 0..16	compute	generated:movement	768263cb53453698	1	64,1,1	-
-qwen2_5_vl_vision.encode	94	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v343
-qwen2_5_vl_vision.encode	95	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	96	slice ax=2 16..32	compute	generated:movement	d044f9f0b893e9b7	1	64,1,1	-
-qwen2_5_vl_vision.encode	97	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v346
-qwen2_5_vl_vision.encode	98	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	99	slice ax=2 32..48	compute	generated:movement	cb3b8cd6e7397ab9	1	64,1,1	-
-qwen2_5_vl_vision.encode	100	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v349
-qwen2_5_vl_vision.encode	101	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
-qwen2_5_vl_vision.encode	102	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
-qwen2_5_vl_vision.encode	103	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
-qwen2_5_vl_vision.encode	104	attention n_rep=1 scale=0.35355338 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	28583f83a2d0fae7	1	512,1,1	schedule=streaming lanes=64 lds=2560 key=single bound=capacity
-qwen2_5_vl_vision.encode	105	transpose [0, 2, 1, 3]	compute	generated:movement	c7d0610e89276eef	1	64,1,1	-
-qwen2_5_vl_vision.encode	106	reshape [1, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v376
-qwen2_5_vl_vision.encode	107	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	1654a170bf1680fe	1	128,1,1	-
-qwen2_5_vl_vision.encode	108	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	109	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	a67352511075a222	1	192,1,1	-
-qwen2_5_vl_vision.encode	110	fused n_in=1 steps=4	compute	generated:pointwise	2db9405be6ff0912	1	96,1,1	-
-qwen2_5_vl_vision.encode	111	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	dd91ae43c7a8e98c	1	192,1,1	-
-qwen2_5_vl_vision.encode	112	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	6209b1df3ee264ed	1	128,1,1	-
-qwen2_5_vl_vision.encode	113	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
-qwen2_5_vl_vision.encode	114	reshape [1, 1, 64]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v430
-qwen2_5_vl_vision.encode	115	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute_meta	generated:contraction	0ffca66c0399e180	1	8192,1,1	meta=[64, 64]
-qwen2_5_vl_vision.encode	116	fused n_in=1 steps=5	compute	generated:pointwise	5408296861e7b50d	1	64,1,1	-
-qwen2_5_vl_vision.encode	117	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute_meta	generated:contraction	0ffca66c0399e180	1	8192,1,1	meta=[64, 64]
+qwen2_5_vl/vision.encode	0	reshape [1, 1, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v3
+qwen2_5_vl/vision.encode	1	broadcast [1, 1, 4, 4]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v5 strides=[0, 0, 1, 0] offset=0
+qwen2_5_vl/vision.encode	2	reshape [1, 1, 1, 4]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v3
+qwen2_5_vl/vision.encode	3	broadcast [1, 1, 4, 4]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v7 strides=[0, 0, 0, 1] offset=0
+qwen2_5_vl/vision.encode	4	fused n_in=2 steps=5	compute	generated:pointwise	4ee65aceddf39ea4	1	16,1,1	-
+qwen2_5_vl/vision.encode	5	reshape [1, 1, 4, 1]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v4
+qwen2_5_vl/vision.encode	6	broadcast [1, 1, 4, 4]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v14 strides=[0, 0, 1, 0] offset=0
+qwen2_5_vl/vision.encode	7	reshape [1, 1, 1, 4]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v4
+qwen2_5_vl/vision.encode	8	broadcast [1, 1, 4, 4]	view	nodispatch:view	bf92db02ffef3ffc	0	-	src=v16 strides=[0, 0, 0, 1] offset=0
+qwen2_5_vl/vision.encode	9	fused n_in=2 steps=5	compute	generated:pointwise	4ee65aceddf39ea4	1	16,1,1	-
+qwen2_5_vl/vision.encode	10	gather ax=0	compute	generated:movement	291fc32bec5279ba	1	16,1,1	-
+qwen2_5_vl/vision.encode	11	slice ax=2 0..2	compute	generated:movement	474109c79f1570f7	1	8,1,1	-
+qwen2_5_vl/vision.encode	12	gather ax=0	compute	generated:movement	291fc32bec5279ba	1	16,1,1	-
+qwen2_5_vl/vision.encode	13	slice ax=2 0..2	compute	generated:movement	474109c79f1570f7	1	8,1,1	-
+qwen2_5_vl/vision.encode	14	concat ax=2	compute	generated:movement	a55cfbc334e41c0a	1	32,1,1	-
+qwen2_5_vl/vision.encode	15	reshape [1, 1, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v28
+qwen2_5_vl/vision.encode	16	gather ax=0	compute	generated:movement	291fc32bec5279ba	1	16,1,1	-
+qwen2_5_vl/vision.encode	17	slice ax=2 0..2	compute	generated:movement	474109c79f1570f7	1	8,1,1	-
+qwen2_5_vl/vision.encode	18	gather ax=0	compute	generated:movement	291fc32bec5279ba	1	16,1,1	-
+qwen2_5_vl/vision.encode	19	slice ax=2 0..2	compute	generated:movement	474109c79f1570f7	1	8,1,1	-
+qwen2_5_vl/vision.encode	20	concat ax=2	compute	generated:movement	a55cfbc334e41c0a	1	32,1,1	-
+qwen2_5_vl/vision.encode	21	reshape [1, 1, 4, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v35
+qwen2_5_vl/vision.encode	22	cast f32	compute	imported:packedbf16tof32	05c944b59030a31c	1	384,1,1	-
+qwen2_5_vl/vision.encode	23	reshape [16, 24]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v38
+qwen2_5_vl/vision.encode	24	dense_contraction f32	compute	generated:contraction	a06781ec08ffecb1	1	128,1,1	-
+qwen2_5_vl/vision.encode	25	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	26	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	766fe5322b775f47	1	384,1,1	-
+qwen2_5_vl/vision.encode	27	slice ax=2 0..16	compute	generated:movement	768263cb53453698	1	64,1,1	-
+qwen2_5_vl/vision.encode	28	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v58
+qwen2_5_vl/vision.encode	29	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	30	slice ax=2 16..32	compute	generated:movement	d044f9f0b893e9b7	1	64,1,1	-
+qwen2_5_vl/vision.encode	31	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v61
+qwen2_5_vl/vision.encode	32	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	33	slice ax=2 32..48	compute	generated:movement	cb3b8cd6e7397ab9	1	64,1,1	-
+qwen2_5_vl/vision.encode	34	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v64
+qwen2_5_vl/vision.encode	35	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	36	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
+qwen2_5_vl/vision.encode	37	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
+qwen2_5_vl/vision.encode	38	attention n_rep=1 scale=0.35355338 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	28583f83a2d0fae7	1	512,1,1	schedule=streaming lanes=64 lds=2560 key=single bound=capacity
+qwen2_5_vl/vision.encode	39	transpose [0, 2, 1, 3]	compute	generated:movement	c7d0610e89276eef	1	64,1,1	-
+qwen2_5_vl/vision.encode	40	reshape [1, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v91
+qwen2_5_vl/vision.encode	41	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	1654a170bf1680fe	1	128,1,1	-
+qwen2_5_vl/vision.encode	42	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	43	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	a67352511075a222	1	192,1,1	-
+qwen2_5_vl/vision.encode	44	fused n_in=1 steps=4	compute	generated:pointwise	2db9405be6ff0912	1	96,1,1	-
+qwen2_5_vl/vision.encode	45	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	dd91ae43c7a8e98c	1	192,1,1	-
+qwen2_5_vl/vision.encode	46	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	6209b1df3ee264ed	1	128,1,1	-
+qwen2_5_vl/vision.encode	47	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	48	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	766fe5322b775f47	1	384,1,1	-
+qwen2_5_vl/vision.encode	49	slice ax=2 0..16	compute	generated:movement	768263cb53453698	1	64,1,1	-
+qwen2_5_vl/vision.encode	50	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v153
+qwen2_5_vl/vision.encode	51	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	52	slice ax=2 16..32	compute	generated:movement	d044f9f0b893e9b7	1	64,1,1	-
+qwen2_5_vl/vision.encode	53	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v156
+qwen2_5_vl/vision.encode	54	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	55	slice ax=2 32..48	compute	generated:movement	cb3b8cd6e7397ab9	1	64,1,1	-
+qwen2_5_vl/vision.encode	56	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v159
+qwen2_5_vl/vision.encode	57	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	58	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
+qwen2_5_vl/vision.encode	59	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
+qwen2_5_vl/vision.encode	60	attention n_rep=1 scale=0.35355338 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	28583f83a2d0fae7	1	512,1,1	schedule=streaming lanes=64 lds=2560 key=single bound=capacity
+qwen2_5_vl/vision.encode	61	transpose [0, 2, 1, 3]	compute	generated:movement	c7d0610e89276eef	1	64,1,1	-
+qwen2_5_vl/vision.encode	62	reshape [1, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v186
+qwen2_5_vl/vision.encode	63	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	1654a170bf1680fe	1	128,1,1	-
+qwen2_5_vl/vision.encode	64	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	65	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	a67352511075a222	1	192,1,1	-
+qwen2_5_vl/vision.encode	66	fused n_in=1 steps=4	compute	generated:pointwise	2db9405be6ff0912	1	96,1,1	-
+qwen2_5_vl/vision.encode	67	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	dd91ae43c7a8e98c	1	192,1,1	-
+qwen2_5_vl/vision.encode	68	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	6209b1df3ee264ed	1	128,1,1	-
+qwen2_5_vl/vision.encode	69	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	70	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	766fe5322b775f47	1	384,1,1	-
+qwen2_5_vl/vision.encode	71	slice ax=2 0..16	compute	generated:movement	768263cb53453698	1	64,1,1	-
+qwen2_5_vl/vision.encode	72	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v248
+qwen2_5_vl/vision.encode	73	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	74	slice ax=2 16..32	compute	generated:movement	d044f9f0b893e9b7	1	64,1,1	-
+qwen2_5_vl/vision.encode	75	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v251
+qwen2_5_vl/vision.encode	76	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	77	slice ax=2 32..48	compute	generated:movement	cb3b8cd6e7397ab9	1	64,1,1	-
+qwen2_5_vl/vision.encode	78	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v254
+qwen2_5_vl/vision.encode	79	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	80	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
+qwen2_5_vl/vision.encode	81	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
+qwen2_5_vl/vision.encode	82	attention n_rep=1 scale=0.35355338 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	28583f83a2d0fae7	1	512,1,1	schedule=streaming lanes=64 lds=2560 key=single bound=capacity
+qwen2_5_vl/vision.encode	83	transpose [0, 2, 1, 3]	compute	generated:movement	c7d0610e89276eef	1	64,1,1	-
+qwen2_5_vl/vision.encode	84	reshape [1, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v281
+qwen2_5_vl/vision.encode	85	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	1654a170bf1680fe	1	128,1,1	-
+qwen2_5_vl/vision.encode	86	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	87	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	a67352511075a222	1	192,1,1	-
+qwen2_5_vl/vision.encode	88	fused n_in=1 steps=4	compute	generated:pointwise	2db9405be6ff0912	1	96,1,1	-
+qwen2_5_vl/vision.encode	89	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	dd91ae43c7a8e98c	1	192,1,1	-
+qwen2_5_vl/vision.encode	90	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	6209b1df3ee264ed	1	128,1,1	-
+qwen2_5_vl/vision.encode	91	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	92	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	766fe5322b775f47	1	384,1,1	-
+qwen2_5_vl/vision.encode	93	slice ax=2 0..16	compute	generated:movement	768263cb53453698	1	64,1,1	-
+qwen2_5_vl/vision.encode	94	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v343
+qwen2_5_vl/vision.encode	95	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	96	slice ax=2 16..32	compute	generated:movement	d044f9f0b893e9b7	1	64,1,1	-
+qwen2_5_vl/vision.encode	97	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v346
+qwen2_5_vl/vision.encode	98	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	99	slice ax=2 32..48	compute	generated:movement	cb3b8cd6e7397ab9	1	64,1,1	-
+qwen2_5_vl/vision.encode	100	reshape [1, 4, 2, 8]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v349
+qwen2_5_vl/vision.encode	101	transpose [0, 2, 1, 3]	compute	generated:movement	5d1520a8a23b42e3	1	64,1,1	-
+qwen2_5_vl/vision.encode	102	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
+qwen2_5_vl/vision.encode	103	rope rot=8	compute	generated:rope	2e952ba476805d6e	1	64,1,1	-
+qwen2_5_vl/vision.encode	104	attention n_rep=1 scale=0.35355338 softcap=None mask=Additive key=Single bound=Capacity	compute	generated:attention	28583f83a2d0fae7	1	512,1,1	schedule=streaming lanes=64 lds=2560 key=single bound=capacity
+qwen2_5_vl/vision.encode	105	transpose [0, 2, 1, 3]	compute	generated:movement	c7d0610e89276eef	1	64,1,1	-
+qwen2_5_vl/vision.encode	106	reshape [1, 4, 16]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v376
+qwen2_5_vl/vision.encode	107	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	1654a170bf1680fe	1	128,1,1	-
+qwen2_5_vl/vision.encode	108	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	109	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute	generated:contraction	a67352511075a222	1	192,1,1	-
+qwen2_5_vl/vision.encode	110	fused n_in=1 steps=4	compute	generated:pointwise	2db9405be6ff0912	1	96,1,1	-
+qwen2_5_vl/vision.encode	111	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	dd91ae43c7a8e98c	1	192,1,1	-
+qwen2_5_vl/vision.encode	112	contraction_epilogue Dense { weight: BF16 } n_in=3 steps=3	compute	generated:contraction	6209b1df3ee264ed	1	128,1,1	-
+qwen2_5_vl/vision.encode	113	fused_row n_in=2 steps=8	compute	generated:row	66021e143d6ca12e	1	64,1,1	-
+qwen2_5_vl/vision.encode	114	reshape [1, 1, 64]	alias	nodispatch:alias	393ffe84b1fd232b	0	-	src=v430
+qwen2_5_vl/vision.encode	115	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute_meta	generated:contraction	0ffca66c0399e180	1	8192,1,1	meta=[64, 64]
+qwen2_5_vl/vision.encode	116	fused n_in=1 steps=5	compute	generated:pointwise	5408296861e7b50d	1	64,1,1	-
+qwen2_5_vl/vision.encode	117	contraction_epilogue Dense { weight: BF16 } n_in=2 steps=2	compute_meta	generated:contraction	0ffca66c0399e180	1	8192,1,1	meta=[64, 64]
 parity.qwen2.decode	0	gather ax=0	compute	generated:movement	9e2fa21eb181af6e	1	16,1,1	-
 parity.qwen2.decode	1	fused_row n_in=2 steps=7	compute	generated:row	2a11d9c162454969	1	16,1,1	-
 parity.qwen2.decode	2	contraction_epilogue Dense { weight: F32 } n_in=2 steps=1	compute_meta	generated:contraction	1d9cc5cde9008535	1	3072,1,1	meta=[16, 24]

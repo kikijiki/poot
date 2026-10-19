@@ -87,6 +87,10 @@ pub const AMD_RADV_SAFE_MAX_BUFFER_BYTES: u64 = 1_342_177_280; // 1.25 GiB
 /// }
 /// ```
 pub struct Context {
+    /// What the device-lost callback and the bounded waits report; see [`DeviceHealth`].
+    health: std::sync::Arc<DeviceHealth>,
+    /// How long a wait for the device may take before it counts as hung.
+    wait_timeout: std::time::Duration,
     _instance: wgpu::Instance,
     _adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,
@@ -243,4 +247,5 @@ pub unsafe fn amd_vulkan_compute_units(
 mod tests;
 
 pub use context::counters::{RuntimeCounterSnapshot, RuntimeCounters};
-pub use context::transfer::WRITE_CHUNK_BYTES;
+pub(crate) use context::transfer::DeviceHealth;
+pub use context::transfer::{ContextOptions, WRITE_CHUNK_BYTES};

@@ -1,16 +1,18 @@
 use crate::bindings::{
-    HSA_QUEUE_FEATURE_KERNEL_DISPATCH, HSA_QUEUE_TYPE_COOPERATIVE, HSA_QUEUE_TYPE_MULTI,
-    hsa_queue_t,
+    HSA_AMD_GPU_HW_EXCEPTION_EVENT, HSA_AMD_GPU_MEMORY_ERROR_EVENT, HSA_AMD_GPU_MEMORY_FAULT_EVENT,
+    HSA_QUEUE_FEATURE_KERNEL_DISPATCH, HSA_QUEUE_TYPE_MULTI, HSA_STATUS_SUCCESS, hsa_amd_event_t,
+    hsa_queue_t, hsa_status_t,
 };
-use crate::{QueueHostLink, QueueRingMemory, RocmError, bindings};
+use crate::context::{DevicePoison, PoisonState};
+use crate::{DeviceFault, HsaStatus, QueueHostLink, QueueRingMemory, RocmError, bindings, ffi};
 use std::ffi::{OsString, c_void};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, Weak};
 
 /// Immutable purpose of the context's sole HSA queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueRole {
-    /// Runtime-owned GWS queue required by persistent cooperative kernels.
-    Cooperative,
+    /// The production queue: an ordinary MULTI queue whose packet ring lives in system memory.
+    SystemMemoryRing,
     /// Receipt-only ordinary queue with a forced PCIe device-memory ring.
     PcieDeviceRingReceipt,
 }
@@ -18,8 +20,8 @@ pub enum QueueRole {
 /// Authoritative creation route for the packet ring, independent of the HSA queue type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueRingProvenance {
-    /// ROCr's cooperative GWS creator with its explicit system-memory-ring flag.
-    CooperativeGwsSystemMemory,
+    /// ROCr's ordinary queue creator with `HSA_ALLOCATE_QUEUE_DEV_MEM` unset: a system-memory ring.
+    OrdinarySystemMemory,
     /// Card 333's receipt-only ordinary queue with the device-memory-ring override enabled.
     PcieDeviceMemoryReceipt,
 }
@@ -51,10 +53,11 @@ pub(crate) struct QueueLayout {
     pub id: u64,
 }
 
-/// Authoritative packet-ring facts for the current cooperative GWS queue creator. ROCr's
-/// cooperative path allocates the ring with `HSA_AMD_QUEUE_CREATE_SYSTEM_MEM`; do not substitute
-/// device-memory or coherent-device facts without changing that creator.
-fn cooperative_gws_publication_facts() -> (Option<QueueRingMemory>, Option<QueueHostLink>) {
+/// Authoritative packet-ring facts for the production queue creator. ROCr's ordinary queue creator
+/// allocates the ring in system memory unless `HSA_ALLOCATE_QUEUE_DEV_MEM` is set, which
+/// [`validate_queue_plan_provenance`] refuses for this plan; do not substitute device-memory or
+/// coherent-device facts without changing that creator.
+fn system_memory_ring_publication_facts() -> (Option<QueueRingMemory>, Option<QueueHostLink>) {
     (Some(QueueRingMemory::HostCoherent), None)
 }
 
@@ -70,7 +73,7 @@ pub(crate) fn validate_queue_plan_provenance(
     override_now: bool,
 ) -> Result<(), RocmError> {
     let valid = match plan {
-        QueueCreationPlan::CooperativeGws => true,
+        QueueCreationPlan::SystemMemoryRing => !override_at_load && !override_now,
         QueueCreationPlan::PcieDeviceMemoryRingReceipt => override_at_load && override_now,
     };
     if valid {
@@ -86,19 +89,20 @@ pub(crate) fn validate_queue_plan_provenance(
 
 /// Queue creation plan for [`RocmContext`] construction.
 ///
-/// Production keeps the cooperative GWS / system-memory ring. The PCIe device-ring variant is
-/// receipt-only: it requests ROCr's `HSA_ALLOCATE_QUEUE_DEV_MEM` path and creates an ordinary MULTI
-/// queue, without Card 276's MULTI admission or pooled-MoE policy.
+/// Production creates an ordinary MULTI queue with a system-memory ring. The PCIe device-ring variant
+/// is receipt-only: it requests ROCr's `HSA_ALLOCATE_QUEUE_DEV_MEM` path and creates the same kind of
+/// queue with the ring in device memory, without Card 276's MULTI admission or pooled-MoE policy.
+/// Both pass an error callback, so a queue fault is recorded instead of aborting the process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueueCreationPlan {
-    CooperativeGws,
+    SystemMemoryRing,
     PcieDeviceMemoryRingReceipt,
 }
 
 impl QueueCreationPlan {
     pub(crate) const fn role(self) -> QueueRole {
         match self {
-            Self::CooperativeGws => QueueRole::Cooperative,
+            Self::SystemMemoryRing => QueueRole::SystemMemoryRing,
             Self::PcieDeviceMemoryRingReceipt => QueueRole::PcieDeviceRingReceipt,
         }
     }
@@ -108,7 +112,7 @@ impl QueueCreationPlan {
     /// creation arm cannot spell its own.
     pub(crate) fn publication_facts(self) -> (Option<QueueRingMemory>, Option<QueueHostLink>) {
         match self {
-            Self::CooperativeGws => cooperative_gws_publication_facts(),
+            Self::SystemMemoryRing => system_memory_ring_publication_facts(),
             Self::PcieDeviceMemoryRingReceipt => (
                 Some(QueueRingMemory::DeviceMemory),
                 Some(QueueHostLink::Pcie),
@@ -118,18 +122,15 @@ impl QueueCreationPlan {
 
     pub(crate) const fn provenance(self) -> QueueRingProvenance {
         match self {
-            Self::CooperativeGws => QueueRingProvenance::CooperativeGwsSystemMemory,
+            Self::SystemMemoryRing => QueueRingProvenance::OrdinarySystemMemory,
             Self::PcieDeviceMemoryRingReceipt => QueueRingProvenance::PcieDeviceMemoryReceipt,
         }
     }
 }
 
-pub(crate) fn queue_request(plan: QueueCreationPlan, agent_max_queue_size: u32) -> QueueRequest {
+pub(crate) fn queue_request(agent_max_queue_size: u32) -> QueueRequest {
     QueueRequest {
-        queue_type: match plan {
-            QueueCreationPlan::CooperativeGws => HSA_QUEUE_TYPE_COOPERATIVE,
-            QueueCreationPlan::PcieDeviceMemoryRingReceipt => HSA_QUEUE_TYPE_MULTI,
-        },
+        queue_type: HSA_QUEUE_TYPE_MULTI,
         size: agent_max_queue_size,
     }
 }
@@ -189,4 +190,104 @@ pub(crate) fn destroy_queue_reference<R>(
     destroy: impl FnOnce(*mut hsa_queue_t) -> R,
 ) -> Option<R> {
     take_queue_reference(queue).map(destroy)
+}
+
+/// The `hsa_queue_create` error callback: ROCr inactivates the queue after an asynchronous error and
+/// calls this instead of its default handler, which prints and aborts the process. `data` is the
+/// queue's [`DevicePoison::queue_callback_data`].
+pub(crate) unsafe extern "C" fn queue_error_callback(
+    status: hsa_status_t,
+    _queue: *mut hsa_queue_t,
+    data: *mut c_void,
+) {
+    // SAFETY: `data` is the pointer `queue_callback_data` produced for this queue; the context keeps
+    // it alive for as long as the queue can still call back (see `TimeoutLeaks`).
+    let state = unsafe { PoisonState::from_callback_data(data) };
+    state.lose(DeviceFault::QueueError(HsaStatus { code: status }));
+}
+
+/// The contexts a system event can concern: each live context's GPU agent and its poison state.
+static LIVE_CONTEXTS: Mutex<Vec<(u64, Weak<PoisonState>)>> = Mutex::new(Vec::new());
+
+/// Make `poison` receive the faults of the GPU `agent` and ensure the process's one HSA system event
+/// handler is installed. Without a handler ROCr aborts the process on a GPU memory fault.
+pub(crate) fn watch_agent_faults(
+    funcs: &ffi::Funcs,
+    agent: bindings::hsa_agent_t,
+    poison: &DevicePoison,
+) -> Result<(), RocmError> {
+    {
+        let mut live = LIVE_CONTEXTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live.retain(|(_, state)| state.strong_count() > 0);
+        live.push((agent.handle, poison.downgrade()));
+    }
+    // SAFETY: `system_event_handler` matches the callback type and stays valid as long as the library
+    // is loaded; the data pointer is unused.
+    let status = unsafe {
+        (funcs.hsa_amd_register_system_event_handler)(system_event_handler, std::ptr::null_mut())
+    };
+    // HSA reports a second registration as the generic `HSA_STATUS_ERROR`. This crate is the only
+    // registrant and its handler serves every context, so the handler is already installed.
+    if status == HSA_STATUS_SUCCESS || status == bindings::HSA_STATUS_ERROR {
+        Ok(())
+    } else {
+        Err(RocmError::Driver(HsaStatus { code: status }))
+    }
+}
+
+/// The system event handler: a GPU fault or reset loses every context on the agent it names.
+unsafe extern "C" fn system_event_handler(
+    event: *const hsa_amd_event_t,
+    _data: *mut c_void,
+) -> hsa_status_t {
+    // SAFETY: HSA passes a valid event that lives for the duration of the call.
+    let event = unsafe { &*event };
+    // SAFETY: the union member read is the one `event_type` selects.
+    let (agent, fault) = unsafe {
+        match event.event_type {
+            HSA_AMD_GPU_MEMORY_FAULT_EVENT => {
+                let info = event.payload.memory_fault;
+                (
+                    info.agent.handle,
+                    DeviceFault::MemoryFault {
+                        address: info.virtual_address,
+                        reason_mask: info.fault_reason_mask,
+                    },
+                )
+            }
+            HSA_AMD_GPU_HW_EXCEPTION_EVENT => {
+                let info = event.payload.hw_exception;
+                (
+                    info.agent.handle,
+                    DeviceFault::HardwareException {
+                        reset_cause: info.reset_cause,
+                    },
+                )
+            }
+            HSA_AMD_GPU_MEMORY_ERROR_EVENT => {
+                let info = event.payload.memory_error;
+                (
+                    info.agent.handle,
+                    DeviceFault::MemoryError {
+                        address: info.virtual_address,
+                        reason_mask: info.error_reason_mask,
+                    },
+                )
+            }
+            _ => return HSA_STATUS_SUCCESS,
+        }
+    };
+    let live = LIVE_CONTEXTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (watched, state) in live.iter() {
+        if *watched == agent
+            && let Some(state) = state.upgrade()
+        {
+            state.lose(fault);
+        }
+    }
+    HSA_STATUS_SUCCESS
 }

@@ -597,7 +597,7 @@ fn a_dispatch_that_is_not_the_kernels_abi_is_refused_before_it_runs() {
             work: 0,
         })
         .expect("the valid dispatch is recorded");
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
     device.begin_step().unwrap();
     device.replay(&recording).expect("the recording runs");
     device.synchronize().unwrap();
@@ -755,7 +755,7 @@ fn a_run_that_misses_its_deadline_poisons_the_device_and_keeps_its_buffers() {
             work: 0,
         })
         .unwrap();
-    let recording = device.finish().unwrap().expect("a recording");
+    let recording = device.finish().unwrap();
     device.begin_step().unwrap();
 
     let error = device

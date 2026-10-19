@@ -3,9 +3,8 @@
 //!
 //! Every entry is a row of the model inventory (Backstage `projects/poot/docs/model-inventory.md`, section
 //! "Referenced checkpoints and local directory names"), and this table mirrors the part of that list that tests
-//! load. A name that is not here does not compile, because `model_path` skips a model that is missing from the
-//! models directory even under `POOT_REQUIRE_MODELS=1`: a wrong name would skip forever and no lane would
-//! ever fail. Backstage `projects/poot/docs/check_model_inventory.py` fails any entry that is not an inventory
+//! load. A name that is not here does not compile, so a misspelled or invented name cannot reach a lane, where
+//! `model_path` skips a model missing from the models directory (a failure under `POOT_REQUIRE_MODELS=1`). Backstage `projects/poot/docs/check_model_inventory.py` fails any entry that is not an inventory
 //! row, so the table cannot drift from the inventory either.
 //!
 //! One entry per line, as a plain string literal, so the check can read this file.
@@ -19,6 +18,7 @@ pub const CHECKPOINTS: &[&str] = &[
     "deepseek2-lite",
     "deepseek2-tiny",
     "deepseek3-tiny",
+    "gemma-2-2b-it",
     "gemma-3-1b-gguf",
     "gemma-3-1b-it",
     "gemma-4-31B-it-GGUF",

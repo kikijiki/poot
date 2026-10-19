@@ -238,6 +238,7 @@ fn format_graphs(format: Option<WeightFormat>) -> Vec<(&'static str, Graph)> {
     let raw = poot_models::registry::RawConfig::HfJson {
         config: &config,
         generation: None,
+        preprocessor: None,
     };
     let model = Registry::builtin()
         .expect("the builtin registry")
@@ -245,6 +246,7 @@ fn format_graphs(format: Option<WeightFormat>) -> Vec<(&'static str, Graph)> {
         .unwrap_or_else(|e| panic!("{format:?}: {e}"));
     let trace = |tokens, capacity| {
         model
+            .model
             .trace(
                 &StepSpec::step(poot_models::test_support::dense::step(
                     1,

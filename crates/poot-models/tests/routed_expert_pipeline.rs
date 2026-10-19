@@ -74,12 +74,13 @@ fn registered_step_and_weights(
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     let n = |v| NonZeroUsize::new(v).unwrap();
     let graph = model
+        .model
         .trace(
             &StepSpec::step(StepShape::new(n(1), n(tokens), n(8))),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .expect("the fixture traces");
-    (graph, model.weights().clone(), fixture.store)
+    (graph, model.model.weights().clone(), fixture.store)
 }
 
 /// The CPU oracle's output for `g` over the granitemoe fixture's weights and a fixed `tokens` prompt at

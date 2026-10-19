@@ -442,6 +442,7 @@ fn shifted(fx: &Fixture, key: &str, delta: f32) -> Fixture {
     Fixture {
         config: fx.config.clone(),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }
@@ -525,6 +526,7 @@ fn a_multi_token_prediction_layer_is_loaded_and_its_shared_copies_are_known() {
         &RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         },
         &fx.store,
     );
@@ -571,6 +573,7 @@ fn the_shared_copies_and_a_second_layer_are_known_and_not_loaded() {
         &RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         },
         &store,
     );
@@ -1079,6 +1082,7 @@ fn a_checkpoint_without_exactly_one_mtp_layer_refuses_the_draft_program_typed() 
         &RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         },
         &fx.store,
     );
@@ -1194,6 +1198,7 @@ fn with_nan_embedding_row(fx: &Fixture, token: usize) -> Fixture {
     Fixture {
         config: fx.config.clone(),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }

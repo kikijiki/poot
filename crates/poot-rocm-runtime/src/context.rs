@@ -8,7 +8,7 @@ use crate::error::check;
 use crate::hsaco::{BoundKernarg, KernelHandle};
 use crate::owner::HsaRuntimeOwner;
 use crate::queue::{QueueLayout, QueueRingProvenance, QueueRole, take_queue_reference};
-use crate::{RocmError, bindings, ffi, publication};
+use crate::{DeviceFault, RocmError, bindings, ffi, publication};
 use poot_runtime_common::{AllocGuard, BufferRole, MemoryCounterSnapshot};
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
@@ -363,15 +363,69 @@ impl RocmContext {
 /// raw device addresses, so the runtime cannot tell which allocations or code objects a hung packet
 /// uses; once set, no [`Drop`] of that runtime frees an allocation or destroys an executable.
 #[derive(Clone, Default)]
-pub(crate) struct DevicePoison(Arc<std::sync::atomic::AtomicBool>);
+pub(crate) struct DevicePoison(Arc<PoisonState>);
+
+/// The shared state behind [`DevicePoison`]: the flag, and the fault that set it when the device
+/// reported one. HSA callback threads write it, so it holds no allocation and takes no lock.
+#[derive(Default)]
+pub(crate) struct PoisonState {
+    poisoned: std::sync::atomic::AtomicBool,
+    fault: std::sync::OnceLock<DeviceFault>,
+}
+
+impl PoisonState {
+    /// Record the device's own report of a fault and poison. The first fault is kept: later ones are
+    /// consequences of it.
+    pub(crate) fn lose(&self, fault: DeviceFault) {
+        let _ = self.fault.set(fault);
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    /// The state behind a pointer [`DevicePoison::queue_callback_data`] produced.
+    ///
+    /// # Safety
+    ///
+    /// `data` came from `queue_callback_data` and its reference has not been released.
+    pub(crate) unsafe fn from_callback_data<'a>(data: *mut c_void) -> &'a Self {
+        // SAFETY: caller contract.
+        unsafe { &*(data as *const Self) }
+    }
+}
 
 impl DevicePoison {
     pub(crate) fn poison(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.poisoned.store(true, Ordering::Release);
     }
 
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.poisoned.load(Ordering::Acquire)
+    }
+
+    /// The fault the device reported, if it did: a poison without one is a timeout or another host
+    /// decision.
+    pub(crate) fn fault(&self) -> Option<DeviceFault> {
+        self.0.fault.get().copied()
+    }
+
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<PoisonState> {
+        Arc::downgrade(&self.0)
+    }
+
+    /// The `data` pointer of the queue's error callback. It owns one reference to the state, because
+    /// a queue that is leaked after a poison can still call back: [`TimeoutLeaks`] gives the
+    /// reference back only when it destroyed the queue.
+    pub(crate) fn queue_callback_data(&self) -> *mut c_void {
+        Arc::into_raw(Arc::clone(&self.0)) as *mut c_void
+    }
+
+    /// Return the reference [`Self::queue_callback_data`] took.
+    ///
+    /// # Safety
+    ///
+    /// The queue was created with that pointer, is destroyed, and the reference was not yet released.
+    unsafe fn release_queue_callback_data(&self) {
+        // SAFETY: caller contract; the pointer is the one `Arc::into_raw` returned for this state.
+        drop(unsafe { Arc::from_raw(Arc::as_ptr(&self.0)) });
     }
 }
 
@@ -441,6 +495,8 @@ pub(crate) struct TimeoutLeaks {
     poison: DevicePoison,
     abandoned: Mutex<Vec<Abandoned>>,
     queues: Vec<*mut hsa_queue_t>,
+    /// Whether a queue was created with this poison's callback reference.
+    callback_armed: bool,
 }
 
 impl TimeoutLeaks {
@@ -452,9 +508,20 @@ impl TimeoutLeaks {
         self.poison.is_poisoned()
     }
 
+    /// The fault the device reported, if it did.
+    pub(crate) fn fault(&self) -> Option<DeviceFault> {
+        self.poison.fault()
+    }
+
     /// The poison flag that allocations and modules created from this context share.
     pub(crate) fn device_poison(&self) -> DevicePoison {
         self.poison.clone()
+    }
+
+    /// Hand out the queue error callback's `data`, which the queue then holds until it is destroyed.
+    pub(crate) fn arm_queue_callback(&mut self) -> *mut c_void {
+        self.callback_armed = true;
+        self.poison.queue_callback_data()
     }
 
     /// Take ownership of an abandoned submission and poison the context.
@@ -495,6 +562,12 @@ impl Drop for TimeoutLeaks {
         );
         std::mem::forget(abandoned);
         std::mem::forget(std::mem::take(&mut self.queues));
+        // The queue was destroyed unless it is on the leak list, and a destroyed queue cannot call
+        // back; a leaked one keeps the reference with it.
+        if self.callback_armed && !self.is_poisoned() {
+            // SAFETY: the callback was armed for this poison's queue, which is destroyed (not poisoned).
+            unsafe { self.poison.release_queue_callback_data() };
+        }
     }
 }
 

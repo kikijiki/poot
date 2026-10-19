@@ -6,14 +6,14 @@
 use std::cell::Cell;
 use std::io::Cursor;
 
-use poot_llm::{ChatTurn, ImageFrontEnd, ImageRequestError, MultimodalPrompt};
+use poot_models::multimodal::front_end::{ChatTurn, FrontEndError, Prepared};
 
 use super::*;
 use crate::api::{MAX_LOGIT_BIAS_ENTRIES, MAX_STOP_BYTES, MAX_TOTAL_STOP_BYTES, RefusedRequest};
 use crate::engine_plan::{Death, EngineState};
 use crate::handlers::handle_completion;
 use crate::vision::{
-    ImageError, MAX_IMAGE_PIXELS_PER_REQUEST, MAX_IMAGES_PER_REQUEST, admit_images,
+    ImageError, ImageLowering, MAX_IMAGE_PIXELS_PER_REQUEST, MAX_IMAGES_PER_REQUEST, admit_images,
     spawn_vision_thread,
 };
 
@@ -33,19 +33,19 @@ struct FakeFrontEnd {
     calls: Arc<AtomicUsize>,
 }
 
-impl ImageFrontEnd for FakeFrontEnd {
+impl ImageLowering for FakeFrontEnd {
     fn prepare(
         &mut self,
         _images: &[&[u8]],
         _turns: &[ChatTurn<'_>],
-    ) -> Result<MultimodalPrompt, ImageRequestError> {
+    ) -> Result<Prepared, FrontEndError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match &self.behaviour {
-            Behaviour::Refuse => Err(ImageRequestError::Refused("the fake refuses".into())),
+            Behaviour::Refuse => Err(FrontEndError::Refused("the fake refuses".into())),
             Behaviour::Panic => panic!("the fake vision tower broke"),
             Behaviour::Hang(gate) => {
                 let _ = gate.recv();
-                Err(ImageRequestError::Refused("released".into()))
+                Err(FrontEndError::Refused("released".into()))
             }
         }
     }

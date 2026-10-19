@@ -74,6 +74,8 @@ struct World {
     fail_finish_at: Cell<Option<usize>>,
     finishes: Cell<usize>,
     fail_abort: Cell<bool>,
+    /// The device whose `synchronize` fails with an error `classify_fault` names a kernel assert.
+    fault_sync_on: Cell<Option<usize>>,
     /// Directed routes the fake refuses to open.
     refused_routes: RefCell<Vec<(usize, usize)>>,
     /// Free memory every device reports; `None` is a device that cannot say.
@@ -302,7 +304,7 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<Rc<Recording>>, Injected> {
+    fn finish(&mut self) -> Result<Rc<Recording>, Injected> {
         let finishes = self.world.finishes.get() + 1;
         self.world.finishes.set(finishes);
         if self.world.fail_finish_at.get() == Some(finishes) {
@@ -311,7 +313,7 @@ impl Device for FakeDevice {
         self.world.push(Op::Finish(self.index));
         self.graphs += 1;
         let ops = self.open.take().expect("finish closes a recording");
-        Ok(Some(Rc::new(Recording { ops })))
+        Ok(Rc::new(Recording { ops }))
     }
 
     fn begin_step(&mut self) -> Result<(), Injected> {
@@ -385,7 +387,14 @@ impl Device for FakeDevice {
 
     fn synchronize(&mut self) -> Result<(), Injected> {
         self.world.push(Op::Synchronize(self.index));
+        if self.world.fault_sync_on.get() == Some(self.index) {
+            return Err(Injected(self.index, "synchronize"));
+        }
         Ok(())
+    }
+
+    fn classify_fault(&self, error: &Injected) -> Option<(String, u32)> {
+        (error.1 == "synchronize").then(|| ("fake_kernel".to_string(), 9))
     }
 
     fn device_time(&self) -> DeviceTime {
@@ -1377,4 +1386,44 @@ fn a_tensor_parallel_program_on_a_non_peer_route_refuses_before_device_work() {
     assert_eq!(world.count(|op| matches!(op, Op::Replay(..))), 0);
     assert_eq!(world.allocations.get(), before, "nothing was allocated");
     assert_eq!(world.events_created.get(), 0);
+}
+
+/// A kernel fault on one device of a coordinated step leaves every rank's executable needing a
+/// reset: the other ranks replayed their stages and committed state before the fault surfaced, so
+/// the carried state of a rank that completed cleanly is just as stale. The probe of rank 0's state is
+/// refused after a fault on rank 1. Mutation: restore the `Validation | Fault` exclusion before the
+/// coordinator's `poison(engines)` call; rank 0's probe steps instead of being refused (red).
+#[test]
+fn a_fault_on_one_rank_requires_a_reset_on_every_rank() {
+    let world = Rc::new(World::new());
+    let mut rig = coordinated(&world, &[0, 1, 0]);
+    world.fault_sync_on.set(Some(1));
+    let values = inputs_for(0);
+    let shape = [4usize];
+    let mut inputs = StepInputs::new();
+    step_inputs(&values, &shape, &mut inputs);
+    let error = match rig.exec.step(rig.exe, rig.entry, &inputs, &mut NoSync) {
+        Err(error) => error,
+        Ok(_) => panic!("the injected fault must fail the step"),
+    };
+    assert!(
+        matches!(error, ExecError::Fault { code: 9, .. }),
+        "got {error:?}"
+    );
+    world.fault_sync_on.set(None);
+    let refused = match rig
+        .exec
+        .step(rig.exe, rig.probes[0], &StepInputs::new(), &mut NoSync)
+    {
+        Err(error) => error,
+        Ok(_) => panic!("rank 0 committed state before rank 1 faulted: it must need a reset"),
+    };
+    assert!(
+        matches!(refused, ExecError::NeedsReset(_)),
+        "got {refused:?}"
+    );
+    rig.exec
+        .reset_state(rig.exe, poot_executor::StateScope::All)
+        .expect("a complete reset clears every rank");
+    run(&mut rig, 0);
 }

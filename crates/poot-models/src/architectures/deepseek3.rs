@@ -1,12 +1,12 @@
-//! DeepSeek-V3 behind [`Model`]: V2's MLA attention and routed MoE (see [`super::deepseek2`], which
+//! DeepSeek-V3 behind [`Model`](crate::model::Model): V2's MLA attention and routed MoE (see [`super::deepseek2`], which
 //! holds the body this family shares) with a sigmoid router: `sigmoid(logits)` scores, a learned
 //! per-expert bias that shifts which experts are selected but not the weight they contribute,
 //! group-limited selection by the sum of each group's two best biased scores, the selected
 //! unbiased scores renormalized (`norm_topk_prob`) and scaled by `routed_scaling_factor`.
 
 use super::deepseek2::{Kind, Scoring, build_family, hf_shapes};
-use crate::model::{FamilyKey, Model, ModelError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::model::{FamilyKey, ModelError};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_quant::weights::WeightStore;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("deepseek3");
@@ -25,7 +25,7 @@ const KIND: Kind = Kind {
     dsa: false,
 };
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     build_family(KIND, raw, store)
 }
 

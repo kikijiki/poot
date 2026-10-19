@@ -32,7 +32,7 @@ use crate::names::{
     ExpertNames, HF_BASE, MoeLayers, MoeNames, family_weights, family_weights_routed,
     hf_base_shapes,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_quant::weights::ExpertProj;
 use poot_text::ChatFormat;
 
@@ -232,7 +232,7 @@ pub(crate) struct Llama {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let mut p = LlamaParams::from_raw(raw)?;
     let (rows, moe_names) = match raw.source() {
         ConfigSource::HfModelType => (HF_BASE, &HF_MOE),
@@ -288,14 +288,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: p.chat,
     };
-    Ok(Box::new(Llama {
+    Ok(ModelParts::new(Box::new(Llama {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Llama {
@@ -441,6 +441,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -559,6 +560,7 @@ mod tests {
             let raw = RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             };
             assert_eq!(
                 registry.resolve(&raw).unwrap().family,
@@ -568,6 +570,7 @@ mod tests {
             let model = registry.build(&raw, &fx.store).unwrap();
             graphs.push(
                 model
+                    .model
                     .trace(
                         &StepSpec::step(step_shape(3, CAP, LogitRows::All)),
                         poot_graph_ir::TraceLimits::for_tests(),
@@ -613,6 +616,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -804,7 +808,7 @@ mod tests {
 
         let prompt = [3, 17, 40, 8, 22, 9, 31, 12];
         let run = |m: &dyn Model, s: &WeightStore| run_step(m, s, CAP, &prompt, 0, &[]).0;
-        let got = run(&*model, &store);
+        let got = run(&*model.model, &store);
         close(&got, &run(&*reference, &reference_store));
         assert!(
             got.iter()
@@ -938,9 +942,10 @@ mod moe_tests {
         let fx = mixtral_fixture();
         assert_eq!(registry.resolve(&fx.raw()).unwrap().family, FAMILY);
         let model = registry.build(&fx.raw(), &fx.store).unwrap();
-        assert!(has_router(&*model));
-        assert_eq!(model.config().chat, ChatFormat::Mistral);
+        assert!(has_router(&*model.model));
+        assert_eq!(model.model.config().chat, ChatFormat::Mistral);
         let routers = model
+            .model
             .weights()
             .iter()
             .filter(|(id, _, _)| id.role == WeightRole::Moe(MoeRole::Router))
@@ -1002,6 +1007,7 @@ mod moe_tests {
             let raw = RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             };
             match build(&raw, &fx.store) {
                 Err(ModelError::Config {
@@ -1113,7 +1119,7 @@ mod moe_tests {
         assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
         let model = registry.build(&raw, store).unwrap();
         assert!(
-            has_router(&*model),
+            has_router(&*model.model),
             "expert_count = 4 resolves with experts"
         );
         let reference = built(
@@ -1121,14 +1127,15 @@ mod moe_tests {
             &RawConfig::HfJson {
                 config: &mixtral_config(),
                 generation: None,
+                preprocessor: None,
             },
             reference_store,
         );
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, store, CAP, &prompt, 0, &[]);
+        let (got, state) = run_step(&*model.model, store, CAP, &prompt, 0, &[]);
         let (want, want_state) = run_step(&*reference, reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
-        let (got, _) = run_step(&*model, store, CAP, &[5], 4, &state);
+        let (got, _) = run_step(&*model.model, store, CAP, &[5], 4, &state);
         let (want, _) = run_step(&*reference, reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }
@@ -1165,8 +1172,8 @@ mod moe_tests {
             let (index, store) = read_back_owned(&kvs, &tensors);
             let registry = Registry::builtin().unwrap();
             let model = registry.build(&RawConfig::Gguf(&index), &store).unwrap();
-            assert!(!has_router(&*model), "expert_count {experts:?}");
-            assert_eq!(model.config().family, FAMILY);
+            assert!(!has_router(&*model.model), "expert_count {experts:?}");
+            assert_eq!(model.model.config().family, FAMILY);
         }
     }
 

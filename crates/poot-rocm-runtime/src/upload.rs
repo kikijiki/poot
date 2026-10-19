@@ -290,6 +290,7 @@ impl crate::owner::HsaRuntimeOwner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         signals.iter().all(|&signal| {
+            // A free has no context to ask about a fault: it waits out its bound and leaks.
             crate::hsaco::await_below_one(
                 FREE_WAIT,
                 std::time::Duration::from_millis(2),
@@ -306,7 +307,8 @@ impl crate::owner::HsaRuntimeOwner {
                         bindings::HSA_WAIT_STATE_BLOCKED,
                     )
                 },
-            )
+                || false,
+            ) == crate::hsaco::Awaited::Completed
         })
     }
 }

@@ -298,6 +298,12 @@ fnptr!(
 );
 
 fnptr!(
+    HsaAmdRegisterSystemEventHandler,
+    bindings::hsa_status_t,
+    bindings::HsaAmdSystemEventCb,
+    *mut c_void
+);
+fnptr!(
     HsaExecutableGetSymbolByName,
     bindings::hsa_status_t,
     bindings::hsa_executable_t,
@@ -359,6 +365,7 @@ declared_as! {
     HsaAmdMemoryFill = hsa_amd_memory_fill;
     HsaAmdMemoryLock = hsa_amd_memory_lock;
     HsaAmdMemoryUnlock = hsa_amd_memory_unlock;
+    HsaAmdRegisterSystemEventHandler = hsa_amd_register_system_event_handler;
     HsaCodeObjectReaderCreateFromMemory = hsa_code_object_reader_create_from_memory;
     HsaCodeObjectReaderDestroy = hsa_code_object_reader_destroy;
     HsaExecutableCreateAlt = hsa_executable_create_alt;
@@ -448,6 +455,8 @@ pub struct Funcs {
     pub hsa_amd_memory_lock: HsaAmdMemoryLock,
     /// `hsa_amd_memory_unlock`: unpins memory pinned by `hsa_amd_memory_lock`.
     pub hsa_amd_memory_unlock: HsaAmdMemoryUnlock,
+    /// `hsa_amd_register_system_event_handler`: registers the process's one GPU fault handler.
+    pub hsa_amd_register_system_event_handler: HsaAmdRegisterSystemEventHandler,
     // code-object + executable + symbols + signals
     /// `hsa_code_object_reader_create_from_memory`: creates a code-object reader over an in-memory image.
     pub hsa_code_object_reader_create_from_memory: HsaCodeObjectReaderCreateFromMemory,
@@ -516,6 +525,7 @@ impl Funcs {
             hsa_amd_memory_fill: sym!(hsa_amd_memory_fill),
             hsa_amd_memory_lock: sym!(hsa_amd_memory_lock),
             hsa_amd_memory_unlock: sym!(hsa_amd_memory_unlock),
+            hsa_amd_register_system_event_handler: sym!(hsa_amd_register_system_event_handler),
             hsa_code_object_reader_create_from_memory: sym!(
                 hsa_code_object_reader_create_from_memory
             ),

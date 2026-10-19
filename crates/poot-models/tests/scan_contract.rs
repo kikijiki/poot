@@ -329,6 +329,7 @@ fn registered(family: &str, rows: usize, tokens: usize, cap: usize) -> Graph {
     let model =
         (entry.build)(&fixture.raw(), &fixture.store).unwrap_or_else(|e| panic!("{family}: {e}"));
     model
+        .model
         .trace(
             &StepSpec::step(step(rows, tokens, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),

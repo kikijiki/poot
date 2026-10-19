@@ -3,7 +3,8 @@
 //! A checkpoint loads as a [`driver::ModelHandle`] (its family from the registry, its weights as
 //! stored, its text services) and generates through [`driver::Driver`], which also runs `Encode`
 //! steps (encoder embeddings and reranking, a vision tower) and prompts with embedding rows in place
-//! of tokens' own. A multimodal checkpoint's front end ([`front_end`]) drives the towers' drivers.
+//! of tokens' own. A multimodal checkpoint's front end belongs to its registry entry; [`FrontEndSession`]
+//! runs it on the towers' drivers.
 //!
 //! # The graph passes are sealed behind `compile` (Card 626, SC-001)
 //!
@@ -41,36 +42,8 @@ pub mod driver;
 mod multimodal;
 
 pub use multimodal::{
-    ChatTurn, ImageCheckpoint, ImageCheckpointError, ImageFrontEnd, ImageRequestError,
-    MultimodalPrompt, encoders, front_end, qwen_vl, read_image_checkpoint,
+    Apng, ApngError, ApngFrames, FrontEndSession, ImageDecodeError, TowerDrivers, decode_image,
+    encoders, tower_options,
 };
 
 pub use core::sampler::{Sampler, SamplerFault, TokenLogprob};
-pub use multimodal::qwen_vl_chat::{
-    Qwen25VlChatContent, Qwen25VlChatImageFileError, Qwen25VlChatMessage,
-    Qwen25VlChatMessageContent, Qwen25VlChatRequestError,
-};
-pub use multimodal::qwen_vl_image::{
-    QWEN2_5_VL_MAX_RAW_MEDIA_ITEMS, Qwen25VlApng, Qwen25VlApngError, Qwen25VlApngFrameSource,
-    Qwen25VlDecodedFrameSource, Qwen25VlDecodedImage, Qwen25VlImageDecodeError,
-    Qwen25VlImagePreprocessError, Qwen25VlImageProcessorConfig, Qwen25VlImageProcessorConfigError,
-    Qwen25VlImageProcessorConfigValidationError, Qwen25VlPadExpansionError,
-    Qwen25VlProcessedImages, Qwen25VlProcessedMedia, Qwen25VlProcessedMediaAssemblyError,
-    Qwen25VlProcessedVideo, Qwen25VlRawMediaInput, Qwen25VlRawRequestAssemblyError,
-    Qwen25VlRawRequestMropeModelInput, Qwen25VlRawRequestMropeModelInputRequest,
-    Qwen25VlRawVideoPreprocessError, Qwen25VlSampledVideo, Qwen25VlVideoMetadata,
-    Qwen25VlVideoPreprocessError, Qwen25VlVideoSamplePlan, Qwen25VlVideoSamplingError,
-    assemble_qwen2_5_vl_processed_media, assemble_qwen2_5_vl_raw_request_mrope_model_input,
-    decode_qwen2_5_vl_image, load_qwen2_5_vl_image_processor_config,
-    plan_qwen2_5_vl_video_sampling, preprocess_qwen2_5_vl_images_with_config,
-    preprocess_qwen2_5_vl_raw_video_with_config, preprocess_qwen2_5_vl_video_with_config,
-};
-pub use multimodal::qwen_vl_mrope::{
-    Qwen25VlMropeModelInput, Qwen25VlMropeModelInputError, Qwen25VlMropeModelInputView,
-    Qwen25VlProcessorMedia, Qwen25VlProcessorMediaError, Qwen25VlProcessorMediaKind,
-    Qwen25VlProcessorMediaMropeModelInput, Qwen25VlProcessorMediaMropeModelInputError,
-    Qwen25VlProcessorMediaMropeModelInputRequest, Qwen25VlRenderedPromptMropeModelInput,
-    Qwen25VlRenderedPromptMropeModelInputError, Qwen25VlRenderedPromptMropeModelInputRequest,
-    QwenVlMropeMetadata, QwenVlMropeMetadataLoadError, QwenVlMropeSourceMetadata,
-    load_qwen_vl_mrope_source_metadata,
-};

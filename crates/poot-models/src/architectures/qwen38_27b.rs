@@ -51,7 +51,7 @@ use crate::components::standard::{
 };
 use crate::io::{ModelSchema, StateSpec};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, FixtureVariant, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, FixtureVariant, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen35");
@@ -286,13 +286,16 @@ impl Qwen35Params {
     pub(crate) fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         let text;
         let (raw, names) = match raw {
-            RawConfig::HfJson { config, generation } => {
+            RawConfig::HfJson {
+                config, generation, ..
+            } => {
                 let (config, names) = text_config(config)?;
                 text = config;
                 (
                     RawConfig::HfJson {
                         config: &text,
                         generation: *generation,
+                        preprocessor: None,
                     },
                     names,
                 )
@@ -500,12 +503,12 @@ pub(crate) struct Qwen35 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     assemble(Qwen35Params::from_raw(raw)?, store)
 }
 
 /// The model of `p` over the weights `store` holds.
-fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let weights = weights_of(&p, store)?;
     let weight_error = |e: WeightError| e.for_family(FAMILY);
     let stack = StackWeights::new(&weights, p.vocab, p.width).map_err(weight_error)?;
@@ -546,14 +549,14 @@ fn assemble(p: Qwen35Params, store: &WeightStore) -> Result<Box<dyn Model>, Mode
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Qwen35 {
+    Ok(ModelParts::new(Box::new(Qwen35 {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Qwen35 {
@@ -882,6 +885,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -1502,6 +1506,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -1603,6 +1608,7 @@ mod tests {
         let p = Qwen35Params::from_raw(&RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         })
         .unwrap();
         assert_eq!(
@@ -1830,13 +1836,13 @@ mod tests {
             let raw = RawConfig::Gguf(&index);
             assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
             let gguf = registry.build(&raw, &store).unwrap();
-            let (got, state) = run_step(&*gguf, &store, CAP, &prompt, 0, &[]);
+            let (got, state) = run_step(&*gguf.model, &store, CAP, &prompt, 0, &[]);
             close(&got, &want);
             // The carried tensors differ in value-head order, so only the logits and the attention
             // cache (the last two state values) are comparable.
             let kv = want_state.len() - 2;
             close_all(&state[kv..], &want_state[kv..]);
-            let (got, _) = run_step(&*gguf, &store, CAP, &[5], 6, &state);
+            let (got, _) = run_step(&*gguf.model, &store, CAP, &[5], 6, &state);
             close(&got, &want_decode);
         }
     }
@@ -2015,6 +2021,7 @@ mod tests {
         }
         let model = assemble(p, &store).unwrap();
         model
+            .model
             .trace(
                 &StepSpec::step(step_shape(2, 8, LogitRows::Last)),
                 poot_graph_ir::TraceLimits::for_tests(),

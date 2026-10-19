@@ -71,11 +71,17 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
     let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let a_data: Vec<f32> = (0..256).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
     let b_data: Vec<f32> = (0..256).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
-    let a_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), 256);
+    let a_buf = ctx
+        .alloc_storage(BufferRole::Input, BufferStorage::f16(), 256)
+        .expect("alloc");
     write_host_bytes(&ctx, &a_buf, 0, &f16_encode(&a_data)).unwrap();
-    let b_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), 256);
+    let b_buf = ctx
+        .alloc_storage(BufferRole::Input, BufferStorage::f16(), 256)
+        .expect("alloc");
     write_host_bytes(&ctx, &b_buf, 0, &f16_encode(&b_data)).unwrap();
-    let out_buf = ctx.alloc_storage(BufferRole::Output, BufferStorage::f32(), 256);
+    let out_buf = ctx
+        .alloc_storage(BufferRole::Output, BufferStorage::f32(), 256)
+        .expect("alloc");
     ctx.dispatch_dev(
         "k",
         &kernel,
@@ -169,11 +175,17 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
     let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.04).collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 19) as f32 - 9.0) * 0.04).collect();
-    let a_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), m * k);
+    let a_buf = ctx
+        .alloc_storage(BufferRole::Input, BufferStorage::f16(), m * k)
+        .expect("alloc");
     write_host_bytes(&ctx, &a_buf, 0, &f16_encode(&a_data)).unwrap();
-    let b_buf = ctx.alloc_storage(BufferRole::Input, BufferStorage::f16(), k * n);
+    let b_buf = ctx
+        .alloc_storage(BufferRole::Input, BufferStorage::f16(), k * n)
+        .expect("alloc");
     write_host_bytes(&ctx, &b_buf, 0, &f16_encode(&b_data)).unwrap();
-    let out_buf = ctx.alloc_storage(BufferRole::Output, BufferStorage::f32(), m * n);
+    let out_buf = ctx
+        .alloc_storage(BufferRole::Output, BufferStorage::f32(), m * n)
+        .expect("alloc");
     let tiles_m = m / 16;
     let tiles_n = n / 16;
     let num_tiles = tiles_m * tiles_n;

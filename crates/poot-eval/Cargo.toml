@@ -14,21 +14,21 @@ rust-version.workspace = true
 # 132) is its only remaining caller, a dev-dependent crate reached through this feature edge, never a
 # forwarder. (Literal crate name omitted here: `poot_eval_does_not_depend_on_graph_plan` string-matches
 # this file for it - the dependency runs the other way, a dev-only cycle Cargo allows.)
-test-support = ["dep:poot-test-util", "poot-graph-ir/test-support", "poot-quant/test-support"]
+test-support = ["dep:poot-test-util"]
 
+# poot-eval is dev-only (every dependent takes it through `test-support` from a dev-dependency), so it reads the
+# test-only API of the IR, quant and tensor crates unconditionally (POOT-ADR-0113): the oracle's decompositions
+# (`decompose`), packed bindings, `f32_to_bf16` and `reshaped` have no other user.
 [dependencies]
-poot-graph-ir.workspace = true
-poot-quant.workspace = true
-poot-tensor.workspace = true
+poot-graph-ir = { workspace = true, features = ["test-support"] }
+poot-quant = { workspace = true, features = ["test-support"] }
+poot-tensor = { workspace = true, features = ["test-support"] }
 libm.workspace = true
 # `fill`, the seeded fill the live-attention fixture draws its operands from; present only under `test-support`.
 poot-test-util = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
-poot-graph-ir = { workspace = true, features = ["test-support"] }
-# `WeightMap::materialize`/`materialize_stack`, the weight-map oracle's reference decode (ADR-0113).
-poot-quant = { workspace = true, features = ["test-support"] }
 poot-target.workspace = true
 poot-test-util.workspace = true
 

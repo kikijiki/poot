@@ -1,5 +1,6 @@
 //! The one family registry (ADR-0104): a checkpoint's config names its family, and the
-//! family's [`FamilyEntry`] builds its [`Model`]. Families are data: any crate adds one with
+//! family's [`FamilyEntry`] builds its [`ModelParts`]: the served [`Model`] and, for a vision-language
+//! family, its towers and front end (ADR-0117 d6). Families are data: any crate adds one with
 //! [`Registry::register`]. The shipped families are the closed [`Family`] enum, whose exhaustive
 //! match is the completeness check ADR-0074 keeps (a drift test, not a support list). The driver and
 //! the loader take a `&Registry`; there is no global registry.
@@ -15,6 +16,7 @@ use poot_load::gguf::GgufIndex;
 use poot_quant::weights::WeightStore;
 
 use crate::model::{ConfigReason, FamilyKey, Model, ModelError};
+use crate::multimodal::front_end::{FrontEnd, TowerId};
 
 /// A checkpoint's raw config, as a family parses it.
 #[derive(Clone, Copy)]
@@ -25,6 +27,9 @@ pub enum RawConfig<'a> {
         config: &'a serde_json::Value,
         /// The parsed `generation_config.json`, when present.
         generation: Option<&'a serde_json::Value>,
+        /// The parsed `preprocessor_config.json`, when the checkpoint ships one: the image processor
+        /// of a vision-language family.
+        preprocessor: Option<&'a serde_json::Value>,
     },
     /// A GGUF checkpoint's metadata.
     Gguf(&'a GgufIndex),
@@ -52,8 +57,15 @@ impl fmt::Debug for RawConfig<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("RawConfig");
         s.field("source", &self.source());
-        if let RawConfig::HfJson { config, generation } = self {
-            s.field("config", config).field("generation", generation);
+        if let RawConfig::HfJson {
+            config,
+            generation,
+            preprocessor,
+        } = self
+        {
+            s.field("config", config)
+                .field("generation", generation)
+                .field("preprocessor", preprocessor);
         }
         s.finish_non_exhaustive()
     }
@@ -90,7 +102,9 @@ impl RawConfig<'_> {
         };
         let mut eos = BTreeSet::new();
         match self {
-            RawConfig::HfJson { config, generation } => {
+            RawConfig::HfJson {
+                config, generation, ..
+            } => {
                 let files = [
                     ("config.json eos_token_id", Some(*config)),
                     ("generation_config.json eos_token_id", *generation),
@@ -135,6 +149,8 @@ pub struct Fixture {
     pub config: serde_json::Value,
     /// The `generation_config.json`, when the fixture ships one.
     pub generation: Option<serde_json::Value>,
+    /// The `preprocessor_config.json`, when the fixture ships one.
+    pub preprocessor: Option<serde_json::Value>,
     /// The synthetic weights, shaped from `config`.
     pub store: WeightStore,
 }
@@ -185,6 +201,7 @@ impl Fixture {
         Self {
             config,
             generation: None,
+            preprocessor: None,
             store: store.build(),
         }
     }
@@ -194,12 +211,72 @@ impl Fixture {
         RawConfig::HfJson {
             config: &self.config,
             generation: self.generation.as_ref(),
+            preprocessor: self.preprocessor.as_ref(),
         }
     }
 }
 
-/// Builds a family's [`Model`] from a raw config and the checkpoint's weights.
-pub type BuildModel = fn(&RawConfig<'_>, &WeightStore) -> Result<Box<dyn Model>, ModelError>;
+/// A vision tower of a model container: an `encode`-only model its family's front end runs.
+#[derive(Debug)]
+pub struct Tower {
+    /// The name the front end runs the tower under.
+    pub id: TowerId,
+    /// The tower's model, built over the checkpoint's own weights.
+    pub model: Box<dyn Model>,
+}
+
+/// What a family's entry builds from a checkpoint (the model container, ADR-0117 d6): the served
+/// model and, for a vision-language family, the towers and the front end that prepares its media.
+#[derive(Debug)]
+pub struct ModelParts {
+    /// The served model: the text decoder of a vision-language checkpoint.
+    pub model: Box<dyn Model>,
+    /// The weights `model` reads, when the family keys its served model under a section of the
+    /// checkpoint's names (idefics3's `model.text_model.`): the section re-keyed, sharing the stored
+    /// bytes. `None` when `model` reads the checkpoint's own names. The towers always read those.
+    pub store: Option<WeightStore>,
+    /// The encode-only models the front end runs.
+    pub towers: Vec<Tower>,
+    /// Preprocessing and prompt assembly for media; `None` for a family that serves token prompts and
+    /// text chat only.
+    pub front_end: Option<Box<dyn FrontEnd>>,
+}
+
+impl ModelParts {
+    /// A container of `model` alone: no towers, no front end, the checkpoint's own weights.
+    pub fn new(model: Box<dyn Model>) -> Self {
+        Self {
+            model,
+            store: None,
+            towers: Vec::new(),
+            front_end: None,
+        }
+    }
+
+    /// The served model reads `store`, a re-keyed section of the checkpoint.
+    #[must_use]
+    pub fn with_store(mut self, store: WeightStore) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Add the tower `id` the front end runs.
+    #[must_use]
+    pub fn with_tower(mut self, id: TowerId, model: Box<dyn Model>) -> Self {
+        self.towers.push(Tower { id, model });
+        self
+    }
+
+    /// The family's front end.
+    #[must_use]
+    pub fn with_front_end(mut self, front_end: Box<dyn FrontEnd>) -> Self {
+        self.front_end = Some(front_end);
+        self
+    }
+}
+
+/// Builds a family's [`ModelParts`] from a raw config and the checkpoint's weights.
+pub type BuildModel = fn(&RawConfig<'_>, &WeightStore) -> Result<ModelParts, ModelError>;
 
 /// A named extra fixture of a family: `(option name, fixture)`.
 pub type FixtureVariant = (&'static str, fn() -> Fixture);
@@ -211,7 +288,7 @@ pub struct FamilyEntry {
     pub family: FamilyKey,
     /// The config keys that name this family, each with the config source it is read from.
     pub keys: &'static [(ConfigSource, &'static str)],
-    /// Builds the family's [`Model`].
+    /// Builds the family's [`ModelParts`].
     pub build: BuildModel,
     /// The family's base test fixture.
     pub fixture: fn() -> Fixture,
@@ -339,12 +416,12 @@ impl Registry {
             })
     }
 
-    /// Resolve `raw`'s family and build its model over `store`.
+    /// Resolve `raw`'s family and build its model container over `store`.
     pub fn build(
         &self,
         raw: &RawConfig<'_>,
         store: &WeightStore,
-    ) -> Result<Box<dyn Model>, LoadModelError> {
+    ) -> Result<ModelParts, LoadModelError> {
         let entry = self.resolve(raw)?;
         Ok((entry.build)(raw, store)?)
     }
@@ -383,13 +460,12 @@ pub(crate) enum Family {
     NemotronH,
     DeepseekV4,
     Bert,
-    Idefics3Vision,
+    Idefics3,
     Qwen3Next,
     Qwen35,
     Qwen4Exp,
     Glm53Flash,
-    Qwen25VlText,
-    Qwen25VlVision,
+    Qwen25Vl,
 }
 
 impl Family {
@@ -417,13 +493,12 @@ impl Family {
         Family::NemotronH,
         Family::DeepseekV4,
         Family::Bert,
-        Family::Idefics3Vision,
+        Family::Idefics3,
         Family::Qwen3Next,
         Family::Qwen35,
         Family::Qwen4Exp,
         Family::Glm53Flash,
-        Family::Qwen25VlText,
-        Family::Qwen25VlVision,
+        Family::Qwen25Vl,
     ];
 
     pub(crate) const fn entry(self) -> FamilyEntry {
@@ -450,13 +525,12 @@ impl Family {
             Family::NemotronH => crate::nemotron_h::ENTRY,
             Family::DeepseekV4 => deepseek4::ENTRY,
             Family::Bert => crate::bert::ENTRY,
-            Family::Idefics3Vision => crate::idefics3::ENTRY,
+            Family::Idefics3 => crate::multimodal::IDEFICS3,
             Family::Qwen3Next => crate::qwen3next::ENTRY,
             Family::Qwen35 => qwen38_27b::ENTRY,
             Family::Qwen4Exp => qwen38::ENTRY,
             Family::Glm53Flash => crate::glm53_flash::ENTRY,
-            Family::Qwen25VlText => crate::qwen2::model::VL_ENTRY,
-            Family::Qwen25VlVision => crate::qwen_vl_vision::ENTRY,
+            Family::Qwen25Vl => crate::multimodal::QWEN_VL,
         }
     }
 }
@@ -529,9 +603,10 @@ mod tests {
         assert!(!registry.entries().is_empty());
         for entry in registry.entries() {
             let fixture = (entry.fixture)();
-            let model = registry
+            let parts = registry
                 .build(&fixture.raw(), &fixture.store)
                 .unwrap_or_else(|e| panic!("{}: {e}", entry.family));
+            let (model, store) = (parts.model, parts.store.unwrap_or(fixture.store));
             // An encoder returns hidden states or scores, not logits: it has no decode to greedy
             // through (its own tests cover its `Encode` step).
             let Some(ModelOutput::Logits { .. }) = model.schema().step().map(|p| p.output()) else {
@@ -539,18 +614,12 @@ mod tests {
             };
             let (capacity, prompt) = (16, [1, 2, 3]);
             let (logits, mut state) =
-                crate::components::testing::run_prompt(&*model, &fixture.store, capacity, &prompt);
+                crate::components::testing::run_prompt(&*model, &store, capacity, &prompt);
             let mut token = argmax(&logits);
             let mut sequence = vec![token];
             for pos in prompt.len()..prompt.len() + 8 {
-                let (logits, next) = run_step(
-                    &*model,
-                    &fixture.store,
-                    capacity,
-                    &[token],
-                    pos as i32,
-                    &state,
-                );
+                let (logits, next) =
+                    run_step(&*model, &store, capacity, &[token], pos as i32, &state);
                 token = argmax(&logits);
                 sequence.push(token);
                 state = next;
@@ -600,10 +669,11 @@ mod tests {
         FamilyEntry {
             family: FamilyKey::new(family),
             keys,
-            build: |_, _| Ok(Box::new(Unbuildable)),
+            build: |_, _| Ok(ModelParts::new(Box::new(Unbuildable))),
             fixture: || Fixture {
                 config: serde_json::json!({}),
                 generation: None,
+                preprocessor: None,
                 store: WeightStore::default(),
             },
             variants: &[],
@@ -693,6 +763,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config: &config,
             generation: Some(&generation),
+            preprocessor: None,
         };
         let family = FamilyKey::new("qwen2");
         let eos = raw.eos_token_ids(family).unwrap();
@@ -715,6 +786,7 @@ mod tests {
         let err = RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         }
         .eos_token_ids(FamilyKey::new("x"))
         .unwrap_err();
@@ -778,13 +850,12 @@ mod tests {
                 Family::NemotronH => 19,
                 Family::DeepseekV4 => 20,
                 Family::Bert => 21,
-                Family::Idefics3Vision => 22,
+                Family::Idefics3 => 22,
                 Family::Qwen3Next => 23,
                 Family::Qwen35 => 24,
                 Family::Qwen4Exp => 25,
                 Family::Glm53Flash => 26,
-                Family::Qwen25VlText => 27,
-                Family::Qwen25VlVision => 28,
+                Family::Qwen25Vl => 27,
             }
         }
     }

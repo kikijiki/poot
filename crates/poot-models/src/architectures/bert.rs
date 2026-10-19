@@ -34,7 +34,7 @@ use crate::model::{
     TraceError,
 };
 use crate::names::{NameRow, Presence, Source, family_weights};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 /// BERT's [`FamilyKey`]: the name its errors and receipts carry.
@@ -413,7 +413,7 @@ pub struct Bert {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = BertParams::from_raw(raw)?;
     let encoder = if store.contains("embeddings.word_embeddings.weight") {
         HF_ROWS_BARE
@@ -489,7 +489,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Bert {
+    Ok(ModelParts::new(Box::new(Bert {
         word: Embedding::new(&weights, p.vocab, w).map_err(weight_error)?,
         positions: model_weight(WeightRole::PosEmbed, &[p.max_positions, w])
             .map_err(weight_error)?,
@@ -501,7 +501,7 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         weights,
         config,
         schema,
-    }))
+    })))
 }
 
 /// The F32 rows of `table` (`[n, width]`) at `ids` (`[rows, tokens]` I32): `[rows, tokens, width]`.
@@ -1016,6 +1016,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         };
         let err = build(&raw, &fx.store).unwrap_err();
         assert!(err.to_string().contains("hidden_act"), "{err}");

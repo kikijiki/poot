@@ -1,0 +1,64 @@
+# Required cases for `just test-checkpoint-ptx`, one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py checkpoint-ptx) fails the lane unless every case here ran and passed - a skip is
+# never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# Real-checkpoint device rows (checkpoint-ptx), run by exact name with POOT_REQUIRE_MODELS=1 and the backend required.
+poot-llm	driver::device_tests::checkpoint::awq_packed_decode::ptx
+poot-llm	driver::device_tests::checkpoint::bloom_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::bloom_gguf_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::deepseek2_tiny::ptx
+poot-llm	driver::device_tests::checkpoint::deepseek2_tiny_gguf::ptx
+poot-llm	driver::device_tests::checkpoint::deepseek3_tiny::ptx
+poot-llm	driver::device_tests::checkpoint::deepseek3_tiny_gguf::ptx
+poot-llm	driver::device_tests::checkpoint::fp8_packed_decode::ptx
+poot-llm	driver::device_tests::checkpoint::gemma2_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::gemma3_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::gemma3_gguf_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::gemma4_moe_tiny_recorded::ptx
+poot-llm	driver::device_tests::checkpoint::gptoss_tiny::ptx
+poot-llm	driver::device_tests::checkpoint::gptoss_tiny_gguf::ptx
+poot-llm	driver::device_tests::checkpoint::gptq_packed_decode::ptx
+poot-llm	driver::device_tests::checkpoint::granite_dense_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::granite_moe_1b_gguf::ptx
+poot-llm	driver::device_tests::checkpoint::granitemoe_tiny::ptx
+poot-llm	driver::device_tests::checkpoint::guided_choice_on_qwen2::ptx
+poot-llm	driver::device_tests::checkpoint::guided_gbnf_repetition_on_qwen2::ptx
+poot-llm	driver::device_tests::checkpoint::guided_gbnf_sentence_on_qwen2::ptx
+poot-llm	driver::device_tests::checkpoint::guided_json_const_on_qwen2::ptx
+poot-llm	driver::device_tests::checkpoint::guided_json_multi_field_on_qwen2::ptx
+poot-llm	driver::device_tests::checkpoint::guided_json_object_on_qwen2::ptx
+poot-llm	driver::device_tests::checkpoint::guided_tool_call_on_qwen2::ptx
+poot-llm	driver::device_tests::checkpoint::lite_mistral_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::llama3_gguf_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::llama3_gguf_long_context::ptx
+poot-llm	driver::device_tests::checkpoint::mixtral_tiny::ptx
+poot-llm	driver::device_tests::checkpoint::mixtral_tiny_gguf::ptx
+poot-llm	driver::device_tests::checkpoint::mpt_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::mpt_gguf_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::olmo2_bf16_decodes::ptx
+poot-llm	driver::device_tests::checkpoint::olmo2_gguf_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::olmoe_1b_7b::ptx
+poot-llm	driver::device_tests::checkpoint::olmoe_tiny::ptx
+poot-llm	driver::device_tests::checkpoint::olmoe_tiny_gguf::ptx
+poot-llm	driver::device_tests::checkpoint::phi3_gguf_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::qwen2_bf16_recorded::ptx
+poot-llm	driver::device_tests::checkpoint::qwen2_greedy_reference::ptx
+poot-llm	driver::device_tests::checkpoint::qwen2_masked_decode_capacity_independent::ptx
+poot-llm	driver::device_tests::checkpoint::qwen2_q4_k_m_chat_answer_repeats::ptx
+poot-llm	driver::device_tests::checkpoint::qwen2_q4_k_m_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::qwen2_q8_0_chat_answer_repeats::ptx
+poot-llm	driver::device_tests::checkpoint::qwen2_q8_0_recorded::ptx
+poot-llm	driver::device_tests::checkpoint::qwen2_sampled_decode_seeded::ptx
+poot-llm	driver::device_tests::checkpoint::qwen3_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::qwen3_gguf_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::qwen3_moe_sparse::ptx
+poot-llm	driver::device_tests::checkpoint::qwen3_moe_sparse_gguf::ptx
+poot-llm	driver::device_tests::checkpoint::qwen3_moe_tiny::ptx
+poot-llm	driver::device_tests::checkpoint::smollm2_gguf_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::smollm3_coherent::ptx
+poot-llm	driver::device_tests::checkpoint::smollm3_gguf_oracle::ptx
+poot-llm	driver::device_tests::checkpoint::tinyllama_coherent::ptx
+poot-llm::smolvlm_checkpoint	caption_matches_the_recorded_vlm_runner_tokens_ptx
+poot-llm::smolvlm_checkpoint	two_captions_on_one_front_end_are_not_stale_ptx

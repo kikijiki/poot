@@ -87,6 +87,7 @@ fn mpt_graph(tokens: usize, cap: usize) -> Graph {
         .build(&fixture.raw(), &f32_store.build())
         .expect("the mpt fixture builds");
     model
+        .model
         .trace(
             &StepSpec::step(step(1, tokens, cap, LogitRows::Last)),
             poot_graph_ir::TraceLimits::for_tests(),

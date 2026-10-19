@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverOptions, GenerateRequest, Layout, LoadOptions,
-    ModelHandle, PreparedSetLimits, open_executor, program_retention,
+    ModelHandle, PreparedSetLimits, Serving, open_executor, program_retention,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::ModelOutput;
@@ -77,6 +77,7 @@ const DENSE: &[&str] = &[
     "smollm3",
     "phi3",
     "qwen2_5_vl",
+    "idefics3",
 ];
 /// Fixture stores: real packed MoE serving waits for POOT-762 (R-632-8).
 const MOE: &[&str] = &[
@@ -131,7 +132,8 @@ fn every_generating_family_is_in_a_served_group() {
         let fixture = (entry.fixture)();
         let model = registry
             .build(&fixture.raw(), &fixture.store)
-            .unwrap_or_else(|error| panic!("{}: {error}", entry.family));
+            .unwrap_or_else(|error| panic!("{}: {error}", entry.family))
+            .model;
         if !matches!(
             model.schema().step().map(|program| program.output()),
             Some(ModelOutput::Logits { .. })
@@ -201,8 +203,19 @@ fn write_fixture(fixture: Fixture) -> poot_test_util::UniqueTempPath {
     std::fs::create_dir_all(&dir).unwrap();
     let mut config = fixture.config.clone();
     config["eos_token_id"] = serde_json::json!(NO_EOS);
+    // A vision-language checkpoint keeps its text model's config in `text_config`.
+    if let Some(text) = config.get_mut("text_config") {
+        text["eos_token_id"] = serde_json::json!(NO_EOS);
+    }
     let tokenizer = tokenizer_json(vocab_of(&config));
     std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    if let Some(preprocessor) = &fixture.preprocessor {
+        std::fs::write(
+            dir.join("preprocessor_config.json"),
+            preprocessor.to_string(),
+        )
+        .unwrap();
+    }
     std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
     poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &fixture.store);
     dir
@@ -545,6 +558,7 @@ served_rows! {
     "smollm3" => served_smollm3_wgpu, served_smollm3_rocm;
     "phi3" => served_phi3_wgpu, served_phi3_rocm;
     "qwen2_5_vl" => served_qwen2_5_vl_wgpu, served_qwen2_5_vl_rocm;
+    "idefics3" => served_idefics3_wgpu, served_idefics3_rocm;
     "qwen3moe" => served_qwen3moe_wgpu, served_qwen3moe_rocm;
     "olmoe" => served_olmoe_wgpu, served_olmoe_rocm;
     "llama/mixtral" => served_mixtral_wgpu, served_mixtral_rocm;
@@ -1055,11 +1069,77 @@ fn scaled_except(
     out.build()
 }
 
+/// The in-process reference of a vision-language checkpoint: its front end on a vision driver and its
+/// text model on a driver of its own, the single-request contiguous run a served request must equal.
+struct VlmReference {
+    handle: Arc<ModelHandle>,
+    session: poot_llm::FrontEndSession,
+    text: Driver<Serving>,
+}
+
+impl VlmReference {
+    fn open(
+        handle: &Arc<ModelHandle>,
+        vision: Box<dyn poot_executor::Executor>,
+        text: Box<dyn poot_executor::Executor>,
+        text_options: DriverOptions,
+    ) -> Self {
+        let mut vision = Some(vision);
+        let session = poot_llm::FrontEndSession::open(Arc::clone(handle), |_, positions| {
+            Ok::<_, poot_llm::driver::error::DriverError>((
+                vision.take().expect("one tower"),
+                poot_llm::tower_options(positions),
+            ))
+        })
+        .expect("open the vision towers")
+        .expect("a vision-language checkpoint has a front end");
+        Self {
+            handle: Arc::clone(handle),
+            session,
+            text: Driver::new(Arc::clone(handle), text, text_options)
+                .expect("a text driver")
+                .serve(Layout::Contiguous),
+        }
+    }
+
+    /// The greedy `max_new` tokens of `turns` over the encoded `images`, as text.
+    fn generate(
+        &mut self,
+        images: &[&Vec<u8>],
+        turns: &[poot_models::multimodal::front_end::ChatTurn<'_>],
+        max_new: usize,
+    ) -> String {
+        let images: Vec<&[u8]> = images.iter().map(|png| png.as_slice()).collect();
+        let prepared = self
+            .session
+            .prepare_images(&images, turns)
+            .expect("the front end lowers the request");
+        let generation = self
+            .text
+            .generate_with_inputs(
+                GenerateRequest {
+                    prompt: prepared.prompt,
+                    max_new,
+                    sampler: Sampler::greedy(),
+                    stops: Vec::new(),
+                    ignore_eos: false,
+                },
+                prepared.inputs,
+                &mut |_: u32, _: &str| GenerationControl::Continue(()),
+            )
+            .expect("generate");
+        self.handle
+            .text()
+            .decode(&generation.tokens)
+            .expect("decode the generation")
+    }
+}
+
 /// The SmolVLM fixture: ids of the tokenizer's words, then the idefics3 markers the front end's prompt
 /// names, then a filler up to the vocabulary. `b c d` is the question.
 mod smolvlm {
-    use poot_models::registry::{Fixture, Registry};
-    use poot_quant::weights::{WeightKey, WeightStore};
+    use poot_models::registry::Registry;
+    use poot_quant::weights::WeightStore;
 
     pub(super) const IMAGE: u32 = 42;
     pub(super) const VOCAB: usize = 48;
@@ -1122,74 +1202,35 @@ mod smolvlm {
         super::scaled_except(store, factor, |name| name.contains("norm"))
     }
 
-    /// The registry's `idefics3_vision` weights (8-pixel frames, 16 patches, 4 visual tokens of the
-    /// 24-wide text tower) beside a 24-wide llama text tower, written as one HF directory with the
-    /// checkpoint's `config.json`, `preprocessor_config.json` and tokenizer.
+    /// The registry's `idefics3` fixture (8-pixel frames, 16 patches, 4 visual tokens of the 24-wide llama
+    /// text tower) as one HF directory with the checkpoint's `config.json`, `preprocessor_config.json` and
+    /// tokenizer.
     pub(super) fn write_checkpoint(no_eos: u32) -> poot_test_util::UniqueTempPath {
         let registry = Registry::builtin().unwrap();
-        let vision = (registry
+        let fixture = (registry
             .entries()
             .iter()
-            .find(|entry| entry.family.as_str() == "idefics3_vision")
+            .find(|entry| entry.family.as_str() == "idefics3")
             .unwrap()
             .fixture)();
-        let text_config = serde_json::json!({
-            "model_type": "llama",
-            "vocab_size": VOCAB,
-            "hidden_size": 24,
-            "intermediate_size": 48,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 2,
-            "rms_norm_eps": 1e-6,
-            "max_position_embeddings": 128,
-            "rope_theta": 10000.0,
-            "tie_word_embeddings": false,
-            "eos_token_id": no_eos,
-        });
-        let (h, inter) = (24, 48);
-        let mut shapes = vec![
-            ("model.embed_tokens.weight".to_string(), vec![VOCAB, h]),
-            ("model.norm.weight".to_string(), vec![h]),
-            ("lm_head.weight".to_string(), vec![VOCAB, h]),
-        ];
-        for l in 0..2 {
-            let k = |s: &str| format!("model.layers.{l}.{s}");
-            shapes.extend([
-                (k("input_layernorm.weight"), vec![h]),
-                (k("post_attention_layernorm.weight"), vec![h]),
-                (k("self_attn.q_proj.weight"), vec![h, h]),
-                (k("self_attn.k_proj.weight"), vec![h, h]),
-                (k("self_attn.v_proj.weight"), vec![h, h]),
-                (k("self_attn.o_proj.weight"), vec![h, h]),
-                (k("mlp.gate_proj.weight"), vec![inter, h]),
-                (k("mlp.up_proj.weight"), vec![inter, h]),
-                (k("mlp.down_proj.weight"), vec![h, inter]),
-            ]);
+        // The text tower's weights are scaled up so the image rows reach the greedy token.
+        let mut text = WeightStore::builder();
+        for (key, entry) in fixture.store.iter().filter(|(key, _)| {
+            key.as_str().starts_with("model.text_model.") || key.as_str() == "lm_head.weight"
+        }) {
+            text.insert(key.clone(), entry.clone()).unwrap();
         }
-        let text = Fixture::bf16(text_config.clone(), shapes);
-        let text = scaled(&text.store, 8.0);
+        let text = scaled(&text.build(), 8.0);
         let mut store = WeightStore::builder();
-        for (key, entry) in vision.store.iter() {
+        for (key, entry) in fixture.store.iter() {
+            let entry = text.get(key.as_str()).unwrap_or(entry);
             store.insert(key.clone(), entry.clone()).unwrap();
-        }
-        for (key, entry) in text.iter() {
-            let name = key.as_str();
-            let name = name.strip_prefix("model.").map_or_else(
-                || name.to_string(),
-                |rest| format!("model.text_model.{rest}"),
-            );
-            store.insert(WeightKey::new(name), entry.clone()).unwrap();
         }
         let dir = poot_test_util::unique_temp_path("served_smolvlm_checkpoint");
         std::fs::create_dir_all(&dir).unwrap();
-        let config = serde_json::json!({
-            "model_type": "idefics3",
-            "vision_config": vision.config,
-            "text_config": text_config,
-            "scale_factor": 2,
-            "image_token_id": IMAGE,
-        });
+        let mut config = fixture.config.clone();
+        config["text_config"]["eos_token_id"] = no_eos.into();
+        assert_eq!(config["image_token_id"], IMAGE);
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
         std::fs::write(dir.join("tokenizer.json"), tokenizer_json().to_string()).unwrap();
         std::fs::write(
@@ -1200,13 +1241,7 @@ mod smolvlm {
         .unwrap();
         std::fs::write(
             dir.join("preprocessor_config.json"),
-            serde_json::json!({
-                "size": { "longest_edge": 16 },
-                "rescale_factor": 1.0 / 255.0,
-                "image_mean": [0.5, 0.5, 0.5],
-                "image_std": [0.5, 0.5, 0.5],
-            })
-            .to_string(),
+            fixture.preprocessor.unwrap().to_string(),
         )
         .unwrap();
         poot_quant::test_support::safetensors::write(
@@ -1262,22 +1297,21 @@ impl Server {
 
 /// A served image request returns the caption the driver gives the same image: the image front end in
 /// the server (preprocess, vision tower, prompt) and the engine's paged text driver together equal
-/// `Idefics3::caption` in this process (the single-request, contiguous reference). Two different images
+/// the in-process caption of the same front end and text driver (the single-request, contiguous reference). Two different images
 /// caption differently (the rows reach the logits), and a request that cannot be lowered is a typed
 /// 400, not a dropped image. Mutation: zero the rows in `vision::ImageClient::prepare`; the served
-/// caption is the zero-row continuation, equal for both images, and the row goes red.
+/// caption is the zero-row continuation, equal for both images, and the row goes red. Mutation (the
+/// registry binds each front end to its checkpoint): swap the `keys` of the `idefics3` and `qwen2_5_vl`
+/// entries, so each checkpoint is built by the other's preprocessor; observed on wgpu, this row,
+/// `served_qwen_vl_caption`, `served_idefics3_wgpu` and `served_qwen2_5_vl_wgpu` all fail to load their
+/// fixture (`config field scale_factor: Missing`, `config field model_type: Unsupported`) and go red.
 fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
-    use poot_llm::front_end::{
-        CaptionRequest, DecodedImage, Idefics3, Idefics3Checkpoint, decode_image,
-    };
-    use poot_llm::{ChatTurn, ImageCheckpoint as _};
+    use poot_models::multimodal::front_end::ChatTurn;
 
     let dir = smolvlm::write_checkpoint(NO_EOS);
     let black = png_of(|_, _| 0);
     let white = png_of(|_, _| 255);
     let quadrant = png_of(|x, y| if x < 8 && y < 8 { 0 } else { 255 });
-    let registry = Registry::builtin().unwrap();
-    let checkpoint = Idefics3Checkpoint::read(&dir, &registry).expect("read the fixture SmolVLM");
     let options = |capacity: usize| {
         let mut options = driver_options();
         options.capacity = nz(capacity);
@@ -1291,36 +1325,10 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     ) else {
         return;
     };
-    let mut vlm = Idefics3::load(
-        &dir,
-        &registry,
-        (vision, options(16)),
-        (text, options(CAPACITY * 2)),
-    )
-    .expect("load the fixture SmolVLM in this process");
+    let handle = load(&dir);
+    let mut vlm = VlmReference::open(&handle, vision, text, options(CAPACITY * 2));
     // The driver's caption of a conversation: the reference the served one must equal.
-    let mut caption = |pngs: &[&Vec<u8>], turns: &[ChatTurn<'_>]| -> String {
-        let decoded: Vec<_> = pngs
-            .iter()
-            .map(|png| decode_image(png).expect("decode the fixture image"))
-            .collect();
-        let images: Vec<_> = decoded.iter().map(DecodedImage::as_image).collect();
-        let generation = vlm
-            .caption(
-                &CaptionRequest {
-                    images: &images,
-                    turns,
-                    max_new: 8,
-                },
-                &mut |_: u32, _: &str| GenerationControl::Continue(()),
-            )
-            .expect("caption");
-        checkpoint
-            .text()
-            .text()
-            .decode(&generation.tokens)
-            .expect("decode the caption")
-    };
+    let mut caption = |pngs: &[&Vec<u8>], turns: &[ChatTurn<'_>]| vlm.generate(pngs, turns, 8);
     let expected: Vec<String> = [&black, &white, &quadrant]
         .into_iter()
         .map(|png| caption(&[png], &[ChatTurn::user(1, "b c d")]))
@@ -1329,13 +1337,13 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     let conversation = [
         ChatTurn {
             role: "system",
-            images: 0,
+            media: 0,
             text: "b",
         },
         ChatTurn::user(1, "b c d"),
         ChatTurn {
             role: "assistant",
-            images: 0,
+            media: 0,
             text: "e f",
         },
         ChatTurn::user(1, "c d"),
@@ -1367,7 +1375,7 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
         assert_eq!(
             served["choices"][0]["message"]["content"].as_str().unwrap(),
             want.trim_end(),
-            "{flag}: the served caption differs from Idefics3::caption's"
+            "{flag}: the served caption differs from the in-process caption"
         );
     }
 
@@ -1394,7 +1402,7 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     assert_eq!(
         served["choices"][0]["message"]["content"].as_str().unwrap(),
         expected_spelled.trim_end(),
-        "{flag}: the served caption of a spelled mark differs from Idefics3::caption's"
+        "{flag}: the served caption of a spelled mark differs from the in-process caption"
     );
     // A tool result has no place in the image chat template.
     let mut tool_result = chat_with_image(&black);
@@ -1425,7 +1433,7 @@ fn served_smolvlm_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     assert_eq!(
         served["choices"][0]["message"]["content"].as_str().unwrap(),
         expected_conversation.trim_end(),
-        "{flag}: the served conversation differs from Idefics3::caption's"
+        "{flag}: the served conversation differs from the in-process caption"
     );
 
     // Tools would be dropped by the image prompt, so they are refused rather than ignored. Mutation:
@@ -1470,8 +1478,6 @@ mod qwen_vl {
     const VIDEO_PAD: (&str, u32) = ("<|video_pad|>", 42);
     const VISION_END: (&str, u32) = ("<|vision_end|>", 43);
     const IM_END: (&str, u32) = ("<|im_end|>", 47);
-    const CHAT_TEMPLATE: &str =
-        "{% for message in messages %}{{ message.role }} {{ message.content }}\n{% endfor %}";
 
     /// A word-level tokenizer: word `t<i>` is token `i` but for `user`, `hello` and the markers.
     fn tokenizer_json() -> serde_json::Value {
@@ -1513,52 +1519,32 @@ mod qwen_vl {
         (entry.fixture)()
     }
 
-    /// Both towers' fixtures (the weights multiplied by `factor`, norm scales and the merger's `ln_q`
-    /// kept) as one checkpoint directory: `config.json` with the text tower on top and `vision_config`
-    /// nested.
+    /// The registry's Qwen2.5-VL fixture (the text and vision towers over one set of weights, multiplied by
+    /// `factor`, norm scales and the merger's `ln_q` kept) as one checkpoint directory: `config.json` with
+    /// the text model on top and `vision_config` nested.
     pub(super) fn write_checkpoint(factor: f32, no_eos: u32) -> poot_test_util::UniqueTempPath {
         let registry = Registry::builtin().unwrap();
-        let text = fixture_of(&registry, "qwen2_5_vl");
-        let vision = fixture_of(&registry, "qwen2_5_vl_vision");
+        let fixture = fixture_of(&registry, "qwen2_5_vl");
         let dir = poot_test_util::unique_temp_path("served_qwen_vl_checkpoint");
         std::fs::create_dir_all(&dir).unwrap();
         let keep = |name: &str| name.contains("norm") || name.contains("ln_q");
-        let mut store = WeightStore::builder();
-        for (key, entry) in super::scaled_except(&text.store, factor, keep)
-            .iter()
-            .chain(super::scaled_except(&vision.store, factor, keep).iter())
-        {
-            store.insert(key.clone(), entry.clone()).unwrap();
-        }
-        poot_quant::test_support::safetensors::write(
-            &dir.join("model.safetensors"),
-            &store.build(),
-        );
-        let mut config = text.config.clone();
-        let mut vision_config = vision.config.clone();
-        vision_config.as_object_mut().unwrap().remove("model_type");
-        vision_config["tokens_per_second"] = 2.into();
-        config["vision_config"] = vision_config;
-        config["vision_start_token_id"] = VISION_START.1.into();
-        config["image_token_id"] = IMAGE_PAD.1.into();
-        config["video_token_id"] = VIDEO_PAD.1.into();
+        let store: WeightStore = super::scaled_except(&fixture.store, factor, keep);
+        poot_quant::test_support::safetensors::write(&dir.join("model.safetensors"), &store);
+        let mut config = fixture.config.clone();
         config["eos_token_id"] = no_eos.into();
+        assert_eq!(config["image_token_id"], IMAGE_PAD.1);
+        assert_eq!(config["vision_start_token_id"], VISION_START.1);
+        assert_eq!(config["video_token_id"], VIDEO_PAD.1);
         std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
         std::fs::write(
             dir.join("preprocessor_config.json"),
-            r#"{"do_resize":false,"min_pixels":1,"max_pixels":4096,"patch_size":2,
-               "temporal_patch_size":2,"merge_size":2}"#,
+            fixture.preprocessor.unwrap().to_string(),
         )
         .unwrap();
         std::fs::write(
             dir.join("tokenizer_config.json"),
-            serde_json::json!({
-                "vision_start_token": VISION_START.0,
-                "image_token": IMAGE_PAD.0,
-                "video_token": VIDEO_PAD.0,
-                "chat_template": CHAT_TEMPLATE,
-            })
-            .to_string(),
+            serde_json::json!({ "chat_template": poot_test_util::qwen_vl::CHAT_TEMPLATE })
+                .to_string(),
         )
         .unwrap();
         std::fs::write(dir.join("tokenizer.json"), tokenizer_json().to_string()).unwrap();
@@ -1577,19 +1563,16 @@ fn small_png_of(fill: impl Fn(u32, u32) -> u8) -> Vec<u8> {
     png
 }
 
-/// A served image request on a Qwen2.5-VL checkpoint returns the generation `Qwen25Vl::generate_chat`
-/// gives the same image and question in this process: the vision tower's rows and the prompt's sectioned
+/// A served image request on a Qwen2.5-VL checkpoint returns the generation the same front end and text
+/// driver give the same image and question in this process: the vision tower's rows and the prompt's sectioned
 /// positions (`Slot::MropePosition`, the image's tokens off their index) reach the engine's paged text
 /// driver, which equals the single-request contiguous reference. Different images generate differently
 /// (the rows reach the logits). A request the front end cannot lower is a typed 400. Mutation: replace the
 /// positions with zeros where `DriverEngine::open` hands them to `Driver::open` as request inputs; the served generation
-/// leaves the reference's and the row goes red.
+/// leaves the reference's and the row goes red. The registry mutation of `served_smolvlm_caption` (swap
+/// the two entries' `keys`) also turns this row red.
 fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
-    use poot_llm::qwen_vl::{Qwen25Vl, Qwen25VlCheckpoint, Qwen25VlGenerate};
-    use poot_llm::{
-        ImageCheckpoint as _, Qwen25VlApngFrameSource, Qwen25VlChatContent, Qwen25VlChatMessage,
-        Qwen25VlChatMessageContent, decode_qwen2_5_vl_image,
-    };
+    use poot_models::multimodal::front_end::ChatTurn;
 
     const QUESTION: &str = "hello";
     let dir = qwen_vl::write_checkpoint(2.0, NO_EOS);
@@ -1598,13 +1581,10 @@ fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
         small_png_of(|_, _| 255),
         small_png_of(|x, y| if x < 4 && y < 6 { 0 } else { 255 }),
     ];
-    let registry = Registry::builtin().unwrap();
-    let checkpoint =
-        Qwen25VlCheckpoint::read(&dir, &registry).expect("read the fixture Qwen2.5-VL");
-    let options = |chunk: usize, capacity: usize| {
+    let options = |capacity: usize| {
         let mut options = driver_options();
         options.capacity = nz(capacity);
-        options.prefill_chunk = nz(chunk);
+        options.prefill_chunk = nz(capacity);
         options.trace.max_tokens = nz(capacity);
         options
     };
@@ -1614,43 +1594,11 @@ fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
     ) else {
         return;
     };
-    let mut vlm = Qwen25Vl::load(
-        &dir,
-        &registry,
-        (vision, options(64, 64)),
-        (text, options(32, 32)),
-    )
-    .expect("load the fixture Qwen2.5-VL in this process");
+    let handle = load(&dir);
+    let mut vlm = VlmReference::open(&handle, vision, text, options(32));
     let expected: Vec<String> = pngs
         .iter()
-        .map(|png| {
-            let image = decode_qwen2_5_vl_image(png).expect("decode the fixture image");
-            let messages = [Qwen25VlChatMessage {
-                role: "user",
-                content: Qwen25VlChatMessageContent::Parts(vec![
-                    Qwen25VlChatContent::Image(&image),
-                    Qwen25VlChatContent::Text(QUESTION),
-                ]),
-            }];
-            let mut no_videos: [Qwen25VlApngFrameSource<'_>; 0] = [];
-            let generation = vlm
-                .generate_chat(
-                    &messages,
-                    None,
-                    &mut no_videos,
-                    Qwen25VlGenerate {
-                        max_new: 8,
-                        sampler: Sampler::greedy(),
-                    },
-                    &mut |_: u32, _: &str| GenerationControl::Continue(()),
-                )
-                .expect("generate");
-            checkpoint
-                .text()
-                .text()
-                .decode(&generation.tokens)
-                .expect("decode the generation")
-        })
+        .map(|png| vlm.generate(&[png], &[ChatTurn::user(1, QUESTION)], 8))
         .collect();
     drop(vlm);
     assert_ne!(
@@ -1674,7 +1622,7 @@ fn served_qwen_vl_caption(choice: BackendChoice, backend: DeviceBackend, flag: &
         assert_eq!(
             served["choices"][0]["message"]["content"].as_str().unwrap(),
             want.trim_end(),
-            "{flag}: the served generation differs from Qwen25Vl::generate_chat's"
+            "{flag}: the served generation differs from the in-process generation"
         );
     }
 
@@ -1706,7 +1654,7 @@ fn served_qwen_vl_caption_rocm() {
 /// than the vision tower takes in one step (4100 against 4096) is a 400 from the tower's own bound, not a
 /// dropped image or a server fault; and the same checkpoint without a `vision_config` serves as the text
 /// model it is, whose image part is the typed `unsupported_capability` refusal. Mutation: stop mapping the
-/// driver's trace-limit refusal to `Refused` in `Qwen25VlFrontEnd::prepare`; the oversize image is a 500 and
+/// tower's patch cap into a `Refused` in `Qwen25VlFrontEnd::prepare`; the oversize image is a 500 and
 /// the row goes red.
 fn served_qwen_vl_refusals(choice: BackendChoice, backend: DeviceBackend, flag: &str) {
     // The refusals are the server's, not the device's: skip when the backend is absent.

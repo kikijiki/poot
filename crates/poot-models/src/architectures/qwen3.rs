@@ -21,7 +21,7 @@ use crate::io::ModelSchema;
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
 use crate::names::{HF_BASE, HF_QK_NORM, family_weights, hf_base_shapes};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen3");
@@ -110,7 +110,7 @@ pub(crate) struct Qwen3 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = Qwen3Params::from_raw(raw)?;
     let tables: [&[_]; 2] = match raw.source() {
         ConfigSource::HfModelType => [HF_BASE, HF_QK_NORM],
@@ -142,14 +142,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Qwen3 {
+    Ok(ModelParts::new(Box::new(Qwen3 {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Qwen3 {
@@ -242,6 +242,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -328,6 +329,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),

@@ -30,7 +30,7 @@ use crate::components::standard::{
 };
 use crate::io::{ModelSchema, StateSpec};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 /// Nemotron-H's [`FamilyKey`].
@@ -305,7 +305,7 @@ pub struct NemotronH {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = NemotronHConfig::from_raw(raw)?;
     let weights = weights_of(&p, store)?;
     let weight_error = |e: WeightError| e.for_family(FAMILY);
@@ -359,14 +359,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(NemotronH {
+    Ok(ModelParts::new(Box::new(NemotronH {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for NemotronH {
@@ -516,6 +516,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         build(&ENTRY, &raw, store)
     }
@@ -689,6 +690,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build_model(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -697,7 +699,7 @@ mod tests {
     }
 
     fn build_model(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
-        (ENTRY.build)(raw, store)
+        (ENTRY.build)(raw, store).map(|parts| parts.model)
     }
 
     /// A pattern character the family does not know and a pattern whose length is not the layer

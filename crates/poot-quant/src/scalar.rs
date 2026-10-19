@@ -72,6 +72,7 @@ pub fn f32_to_f16(v: f32) -> u16 {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Round an f32 to bf16 bits (round-to-nearest, ties-to-even) and return the 16-bit pattern.
 /// NaN keeps its sign: a quiet NaN stays quiet with its high payload bits, and a signaling NaN is
 /// quieted (bf16 has no signaling NaN). Infinities, the sign, and the exponent range carry through;

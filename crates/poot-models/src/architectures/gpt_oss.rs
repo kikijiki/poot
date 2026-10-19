@@ -24,7 +24,7 @@ use crate::names::gguf::{GGUF_BASE, GGUF_SINK_ATTENTION};
 use crate::names::{
     ExpertNames, HF_BASE, HF_SINK_ATTENTION, MoeLayers, MoeNames, family_weights_routed,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("gpt_oss");
@@ -236,7 +236,7 @@ pub(crate) struct GptOss {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = GptOssConfig::from_raw(raw)?;
     let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
         ConfigSource::HfModelType => ([HF_BASE, HF_SINK_ATTENTION], &HF_MOE),
@@ -280,14 +280,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(GptOss {
+    Ok(ModelParts::new(Box::new(GptOss {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for GptOss {
@@ -425,6 +425,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -765,6 +766,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -1026,13 +1028,14 @@ mod family_tests {
             assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
             let model = registry.build(&raw, &store).unwrap();
             let reference = model_of(&fixture_config(), &hf_store);
-            let (got, state) = run_step(&*model, &store, CAP, &PROMPT, 0, &[]);
+            let (got, state) = run_step(&*model.model, &store, CAP, &PROMPT, 0, &[]);
             let (want, want_state) = run_step(&*reference, &hf_store, CAP, &PROMPT, 0, &[]);
             close(&got, &want);
-            let (got, _) = run_step(&*model, &store, CAP, &[5], 5, &state);
+            let (got, _) = run_step(&*model.model, &store, CAP, &[5], 5, &state);
             let (want, _) = run_step(&*reference, &hf_store, CAP, &[5], 5, &want_state);
             close(&got, &want);
             let packed = model
+                .model
                 .weights()
                 .iter()
                 .filter(|(_, _, handle)| matches!(handle.format, HandleFormat::Packed(_)))

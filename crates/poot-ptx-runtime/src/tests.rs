@@ -49,6 +49,8 @@ pub(crate) struct MockCleanup {
     current: Mutex<Option<usize>>,
     fail_next_set: Mutex<bool>,
     fail_set_target: Mutex<Option<usize>>,
+    /// The error `launch_graph` returns, when set.
+    launch_error: Mutex<Option<sys::CUresult>>,
 }
 
 impl MockCleanup {
@@ -152,7 +154,10 @@ impl CudaDriver for MockCleanup {
         _stream: sys::CUstream,
     ) -> Result<(), DriverError> {
         self.record_context_dependent("operation:launch_graph");
-        Ok(())
+        match *self.launch_error.lock().unwrap() {
+            Some(error) => Err(DriverError(error)),
+            None => Ok(()),
+        }
     }
 
     fn synchronize_stream(&self, _stream: sys::CUstream) -> Result<(), DriverError> {
@@ -199,6 +204,7 @@ pub(crate) fn mock_owner(mock: &Arc<MockCleanup>) -> Arc<PtxOwner> {
         modules: Mutex::new(Vec::new()),
         memory: poot_runtime_common::MemoryCounters::new(),
         counters: Default::default(),
+        lost: Default::default(),
     })
 }
 
@@ -938,6 +944,7 @@ fn mock_owner_on(mock: &Arc<MockCleanup>, device: sys::CUdevice, context: usize)
         modules: Mutex::new(Vec::new()),
         memory: poot_runtime_common::MemoryCounters::new(),
         counters: Default::default(),
+        lost: Default::default(),
     })
 }
 
@@ -1614,4 +1621,102 @@ fn write_host_bytes(
     ctx.write_with(buf, offset, bytes.len(), &mut |range, out| {
         out.copy_from_slice(&bytes[range.start - offset..range.end - offset]);
     })
+}
+
+fn mock_graph(mock: &Arc<MockCleanup>) -> PtxGraphExec {
+    let owner = mock_owner(mock);
+    instantiate_graph(owner, fake_graph(23), Vec::new(), |exec| {
+        *exec = fake_graph_exec(29);
+        Ok(())
+    })
+    .expect("mock graph")
+}
+
+/// SC-002 (model-free half): a launch the driver fails with a sticky device fault is the typed
+/// `DeviceLost`, poisons the owner, and the next launch is `Poisoned` without touching the driver. A
+/// recoverable driver error is neither. Mutation: delete the `lost.set` in `PtxOwner::observe`; the
+/// next launch reaches the driver again (red). The pod run drives the same path with a real kernel.
+#[test]
+fn a_sticky_device_fault_is_device_lost_and_the_next_call_is_poisoned() {
+    let mock = Arc::new(MockCleanup::default());
+    let graph = mock_graph(&mock);
+
+    *mock.launch_error.lock().unwrap() = Some(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY);
+    assert!(matches!(graph.launch(), Err(PtxError::Driver(_))));
+    graph
+        .owner
+        .ensure_healthy()
+        .expect("an OOM is not a lost device");
+
+    *mock.launch_error.lock().unwrap() = Some(sys::CUresult::CUDA_ERROR_ILLEGAL_ADDRESS);
+    let lost = graph.launch();
+    assert!(
+        matches!(
+            lost,
+            Err(PtxError::DeviceLost(DriverError(
+                sys::CUresult::CUDA_ERROR_ILLEGAL_ADDRESS
+            )))
+        ),
+        "got {lost:?}"
+    );
+    assert!(graph.owner.ensure_healthy().is_err());
+
+    mock.clear();
+    let next = graph.launch();
+    assert!(
+        matches!(
+            next,
+            Err(PtxError::Poisoned {
+                cause: DriverError(sys::CUresult::CUDA_ERROR_ILLEGAL_ADDRESS)
+            })
+        ),
+        "got {next:?}"
+    );
+    assert!(
+        mock.snapshot().is_empty(),
+        "a poisoned owner must not touch the driver"
+    );
+}
+
+/// SC-002 (device half, run on a pod): the `add` fixture dispatched with lengths its buffers cannot
+/// meet stores far out of bounds. The synchronize that surfaces the fault returns the typed
+/// `DeviceLost`, the context is poisoned, and the next call is `Poisoned`. Mutation: skip the
+/// `lost.set` in `PtxOwner::observe`; the next call reaches the driver and returns the sticky
+/// `Driver` error instead of `Poisoned` (red). Skips with no CUDA device.
+#[test]
+fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
+    let Ok(ctx) = PtxContext::new() else {
+        eprintln!("SKIP an_out_of_bounds_store_is_device_lost: no NVIDIA GPU");
+        return;
+    };
+    let body = poot_kernel_ir::fixtures::add_kernel();
+    let dir = std::env::temp_dir().join("poot-ptx-runtime-device-lost-test");
+    std::fs::create_dir_all(&dir).expect("create fixture artifact dir");
+    let out = poot_codegen::artifact_path(&dir, "add", poot_codegen::Target::Nvptx);
+    let artifact = poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out)
+        .expect("compile add");
+    let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
+
+    let a = ctx.upload_f32(&[1.0; 4]).expect("upload a");
+    let b = ctx.upload_f32(&[1.0; 4]).expect("upload b");
+    let c = ctx.alloc_f32(4).expect("alloc c");
+    let wild = 1u32 << 30;
+    ctx.dispatch_dev(
+        "add",
+        &kernel,
+        [256, 1, 1],
+        [u32::MAX - 255, 1, 1],
+        &[&a, &b],
+        &[wild, wild],
+        &c,
+        wild,
+    )
+    .expect("the launch itself is accepted: the fault is asynchronous");
+    let lost = ctx.synchronize();
+    assert!(matches!(lost, Err(PtxError::DeviceLost(_))), "got {lost:?}");
+    let next = ctx.synchronize();
+    assert!(
+        matches!(next, Err(PtxError::Poisoned { .. })),
+        "got {next:?}"
+    );
 }

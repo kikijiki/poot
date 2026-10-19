@@ -25,7 +25,7 @@ use crate::names::{
     ExpertNames, HF_BASE, MoeLayers, MoeNames, family_weights, family_weights_routed,
     hf_base_shapes,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 // The `granite` family behind [`Model`]: the standard stack and layer with Granite's four scalar
@@ -264,7 +264,7 @@ pub(crate) struct Granite {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = GraniteConfig::from_raw(raw)?;
     let (rows, moe_names) = match raw.source() {
         ConfigSource::HfModelType => (HF_BASE, &HF_MOE),
@@ -314,14 +314,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Granite,
     };
-    Ok(Box::new(Granite {
+    Ok(ModelParts::new(Box::new(Granite {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Granite {
@@ -458,6 +458,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -563,6 +564,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -747,11 +749,11 @@ mod moe_tests {
         let fx = moe_fixture();
         assert_eq!(registry.resolve(&fx.raw()).unwrap().family, FAMILY);
         let model = registry.build(&fx.raw(), &fx.store).unwrap();
-        assert!(has_router(&*model));
-        assert_eq!(model.config().chat, ChatFormat::Granite);
+        assert!(has_router(&*model.model));
+        assert_eq!(model.model.config().chat, ChatFormat::Granite);
         let dense = fixture();
         assert!(!has_router(
-            &*registry.build(&dense.raw(), &dense.store).unwrap()
+            &*registry.build(&dense.raw(), &dense.store).unwrap().model
         ));
     }
 
@@ -815,6 +817,7 @@ mod moe_tests {
             let raw = RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             };
             match build(&raw, &fx.store) {
                 Err(ModelError::Config {
@@ -950,6 +953,7 @@ mod moe_tests {
         assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
         let model = registry.build(&raw, &store).unwrap();
         let stacks: Vec<_> = model
+            .model
             .weights()
             .iter()
             .filter(|(id, _, _)| matches!(id.role, WeightRole::Moe(MoeRole::Stack(..))))
@@ -978,14 +982,15 @@ mod moe_tests {
             &RawConfig::HfJson {
                 config: &moe_config(),
                 generation: None,
+                preprocessor: None,
             },
             &reference_store,
         );
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (got, state) = run_step(&*model.model, &store, CAP, &prompt, 0, &[]);
         let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
-        let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+        let (got, _) = run_step(&*model.model, &store, CAP, &[5], 4, &state);
         let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }

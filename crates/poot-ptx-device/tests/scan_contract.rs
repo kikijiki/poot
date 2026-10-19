@@ -10,7 +10,7 @@
 
 use poot_eval::{EvalOptions, eval};
 use poot_executor::{Device, Engine, Executor};
-use poot_executor_parity::scan::{check_steps, measure, numerics_class, streamed_in_pieces};
+use poot_executor_parity::scan::{check_steps, numerics_class, streamed_in_pieces};
 use poot_graph_ir::Graph;
 use poot_graph_ir::test_support::scan::ScanFixture;
 use poot_graph_plan::Target;
@@ -114,30 +114,6 @@ fn long_scan_agrees_with_the_oracle_and_with_stepped_pieces_on_ptx() {
                 &stepped,
                 numerics_class(target, &ScanFixture { len, ..base }).tolerance(),
                 &format!("{label}: one launch against stepped pieces"),
-            );
-        }
-    }
-}
-
-/// The timing receipt: step time of the scan at a Qwen3-Next head shape (32 heads,
-/// `D = 128`) and a Nemotron-H one. Measurement, not acceptance: run by exact name
-/// under the GPU lock with `--no-capture` (the receipt in `docs/dscan.md`).
-#[test]
-#[ignore = "measurement; run by exact name under the GPU lock"]
-fn measure_scan_time_on_ptx() {
-    let Some((mut exec, target)) = open() else {
-        return;
-    };
-    for base in [
-        ScanFixture::delta_rule(32, 0, 128, 64),
-        ScanFixture::ssd(64, 0, 64, 128, 64),
-    ] {
-        for len in [64, 256, 1024, 4096] {
-            let fixture = ScanFixture { len, ..base };
-            let time = measure(&mut *exec, target, &fixture, 5);
-            eprintln!(
-                "MEASURE {:?} L={len}: wall={:.2}ms device={:?}",
-                fixture.family, time.wall_ms, time.device_ms
             );
         }
     }

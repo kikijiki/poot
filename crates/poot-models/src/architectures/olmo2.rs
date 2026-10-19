@@ -24,7 +24,7 @@ use crate::names::gguf::{GGUF_BASE, GGUF_POST_NORMS, GGUF_QK_NORM};
 use crate::names::{
     HF_BASE, HF_QK_NORM, NameRow, Presence, family_weights, hf_base_shapes, layer_tensor,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("olmo2");
@@ -125,7 +125,7 @@ pub(crate) struct Olmo2 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = Olmo2Params::from_raw(raw)?;
     let tables: [&[NameRow]; 3] = match raw.source() {
         ConfigSource::HfModelType => [HF_BASE, HF_QK_NORM, HF_POST_NORMS],
@@ -157,14 +157,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Olmo2,
     };
-    Ok(Box::new(Olmo2 {
+    Ok(ModelParts::new(Box::new(Olmo2 {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Olmo2 {
@@ -268,6 +268,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -353,6 +354,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),

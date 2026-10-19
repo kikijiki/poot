@@ -1,0 +1,11 @@
+# Required cases for `just test-checkpoint-large-rocm`, one per line:
+# binary_id<TAB>test_name, the identity the lane's JUnit report carries as classname and name.
+# Hand-maintained: never generated from the justfile's selection. The gate
+# (scripts/check-required-cases.py checkpoint-large-rocm) fails the lane unless every case here ran and passed - a skip is
+# never a pass. Sorted in canonical (LC_ALL=C) order.
+#
+# Real-checkpoint device rows (checkpoint-large-rocm), run by exact name with POOT_REQUIRE_MODELS=1 and the backend required. 20B+ or otherwise large checkpoints: a pod or host with the memory, NEVER the dev box.
+poot-llm	driver::device_tests::checkpoint::deepseek2_lite::rocm
+poot-llm	driver::device_tests::checkpoint::gptoss_20b_gguf::rocm
+poot-llm	driver::device_tests::checkpoint::mixtral_8x7b_gguf::rocm
+poot-llm	driver::device_tests::checkpoint::qwen35_27b_fp8_receipt::rocm

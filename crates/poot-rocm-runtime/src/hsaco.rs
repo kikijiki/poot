@@ -20,10 +20,22 @@ use std::sync::Arc;
 /// small readback.
 const COMPLETION_SPIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How [`await_below_one`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Awaited {
+    /// The signal dropped below 1.
+    Completed,
+    /// The timeout elapsed first.
+    TimedOut,
+    /// The device reported a fault, so the signal will not drop.
+    DeviceLost,
+}
+
 /// The wait policy of [`RocmContext::wait_completion_bounded`], over the signal's two reads: polls
 /// `load` (a relaxed signal load) for `spin_window`, then repeats `blocked` (a bounded blocked wait that
-/// returns the signal value) until the signal is below 1 (`true`) or `timeout` elapses (`false`). The
-/// spin window is clamped by `timeout`, so a zero timeout never spins.
+/// returns the signal value) until the signal is below 1 ([`Awaited::Completed`]), `device_lost`
+/// reports a fault ([`Awaited::DeviceLost`]) or `timeout` elapses ([`Awaited::TimedOut`]). The spin
+/// window is clamped by `timeout`, so a zero timeout never spins.
 /// A signal that drops inside the window never reaches `blocked`, which on this stack sleeps its whole
 /// hint even for a finished signal.
 pub(crate) fn await_below_one(
@@ -31,7 +43,8 @@ pub(crate) fn await_below_one(
     spin_window: std::time::Duration,
     mut load: impl FnMut() -> i64,
     mut blocked: impl FnMut() -> i64,
-) -> bool {
+    device_lost: impl Fn() -> bool,
+) -> Awaited {
     let start = std::time::Instant::now();
     let spin_window = spin_window.min(timeout);
     while start.elapsed() < spin_window {
@@ -39,16 +52,22 @@ pub(crate) fn await_below_one(
             // Pairs with the device's release store of the signal: what the packet or copy wrote is
             // visible to the caller's reads.
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            return true;
+            return Awaited::Completed;
+        }
+        if device_lost() {
+            return Awaited::DeviceLost;
         }
         std::hint::spin_loop();
     }
     loop {
         if blocked() < 1 {
-            return true;
+            return Awaited::Completed;
+        }
+        if device_lost() {
+            return Awaited::DeviceLost;
         }
         if start.elapsed() >= timeout {
-            return false;
+            return Awaited::TimedOut;
         }
     }
 }
@@ -533,7 +552,7 @@ impl RocmContext {
         tag: &'static str,
         held: Held,
     ) -> Result<Held, RocmError> {
-        let completed = await_below_one(
+        let awaited = await_below_one(
             self.wait_timeout,
             COMPLETION_SPIN_WINDOW,
             // SAFETY: `completion` is a live signal this context created and has not destroyed.
@@ -550,18 +569,19 @@ impl RocmContext {
                     bindings::HSA_WAIT_STATE_BLOCKED,
                 )
             },
+            || self.timeouts.fault().is_some(),
         );
-        if completed {
+        if awaited == Awaited::Completed {
             return Ok(held);
         }
         self.timeouts.abandon(Abandoned {
             signal: completion,
             held,
         });
-        Err(RocmError::QueueWaitTimeout(
-            self.wait_timeout.as_secs(),
-            tag,
-        ))
+        Err(match self.timeouts.fault() {
+            Some(fault) if awaited == Awaited::DeviceLost => RocmError::DeviceLost(fault),
+            _ => RocmError::QueueWaitTimeout(self.wait_timeout.as_secs(), tag),
+        })
     }
 
     /// Dispatch a single kernel and wait on its completion signal. `kernarg` was built by

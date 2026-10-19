@@ -413,6 +413,7 @@ impl HeldCharge {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn meter(&self) -> &Meter {
         &self.meter
     }

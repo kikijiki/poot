@@ -207,16 +207,18 @@ fn pooled_qwen3moe_stages_run_the_contraction_and_pointwise_passes() {
     let raw = RawConfig::HfJson {
         config: &fixture.config,
         generation: None,
+        preprocessor: None,
     };
     let model = (entry.build)(&raw, &fixture.store).unwrap();
     let shape = StepShape::new(NonZeroUsize::MIN, NonZeroUsize::MIN, nz(CAPACITY));
     let graph = model
+        .model
         .trace(
             &StepSpec::step(shape),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
-    let formats = WeightFormats::from_weight_map(model.weights());
+    let formats = WeightFormats::from_weight_map(model.model.weights());
     let graph = bind_packed_weights(&graph, &formats).unwrap();
     let presets = [
         ("wgpu", Backend::SpirvVulkan, DeviceCaps::wgpu_rdna3_igpu()),

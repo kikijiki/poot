@@ -160,6 +160,7 @@ impl PtxContext {
     /// Make this context's primary context current on the calling thread. Every driver-touching method
     /// starts here, so a thread that drives several contexts never issues a call into the wrong one.
     fn bind(&self) -> Result<(), PtxError> {
+        self.owner.ensure_healthy()?;
         // SAFETY: `owner.ctx` is the primary context this context retained; it stays alive while `owner`
         // does.
         unsafe { result::ctx::set_current(self.owner.ctx) }?;
@@ -218,8 +219,14 @@ impl PtxContext {
         self.refuse_during_capture("synchronize")?;
         self.bind()?;
         // SAFETY: `owner.stream` is this context's live stream, destroyed only when `owner` drops.
-        unsafe { result::stream::synchronize(self.owner.stream) }?;
-        Ok(())
+        unsafe { result::stream::synchronize(self.owner.stream) }
+            .map_err(|error| self.owner.observe(error))
+    }
+
+    /// Refuse with [`PtxError::Poisoned`] when a device fault poisoned this context. Teardown paths
+    /// ask it, since they would otherwise succeed against a context that can never run work again.
+    pub fn ensure_healthy(&self) -> Result<(), PtxError> {
+        self.owner.ensure_healthy()
     }
 
     /// Upload f32 data to a fresh device buffer (H2D, synchronous).
@@ -415,7 +422,8 @@ impl PtxContext {
             // stream; the driver stages pageable `data` before returning, and the stream is synchronized below
             // before `data` can be released. No capture is open (every caller refuses first), so the copy is
             // not recorded into a graph.
-            unsafe { result::memcpy_htod_async(dst, data, self.owner.stream) }?;
+            unsafe { result::memcpy_htod_async(dst, data, self.owner.stream) }
+                .map_err(|error| self.owner.observe(error))?;
             self.synchronize()?;
             Ok(())
         })
@@ -439,7 +447,8 @@ impl PtxContext {
             );
             // SAFETY: `b` is a live allocation holding `byte_len` bytes (checked by `checked_copy`), `out` has
             // exactly that many bytes (checked above), and the stream has finished every write to `b`.
-            unsafe { result::memcpy_dtoh_sync(&mut out[..], b.ptr()) }?;
+            unsafe { result::memcpy_dtoh_sync(&mut out[..], b.ptr()) }
+                .map_err(|error| self.owner.observe(error))?;
             Ok(out)
         })
     }
@@ -514,7 +523,8 @@ impl PtxContext {
         self.bind()?;
         // SAFETY: both events are live and were recorded on this context's stream; the caller is
         // responsible for having synchronized first (documented above).
-        let ms = unsafe { result::event::elapsed(first.start.event, last.stop.event) }?;
+        let ms = unsafe { result::event::elapsed(first.start.event, last.stop.event) }
+            .map_err(|error| self.owner.observe(error))?;
         Ok(Some(Duration::from_secs_f64(ms as f64 / 1000.0)))
     }
 
@@ -682,7 +692,8 @@ impl PtxContext {
         // SAFETY: both ranges were checked against their live allocations, the copy is enqueued on this
         // context's live stream (current, bound above) in capture mode, and direct access to the
         // destination's device was enabled before the capture.
-        unsafe { result::memcpy_dtod_async(dst.ptr(), src.ptr(), bytes, self.owner.stream) }?;
+        unsafe { result::memcpy_dtod_async(dst.ptr(), src.ptr(), bytes, self.owner.stream) }
+            .map_err(|error| self.owner.observe(error))?;
         self.capture.retain(src);
         self.capture.retain(dst);
         OwnerCounters::bump(&self.owner.counters.peer_copies);
@@ -740,7 +751,8 @@ impl PtxContext {
         self.synchronize()?;
         // SAFETY: `_range` proved `out.len()` lies inside `buf`'s live allocation, and the stream has
         // finished every write to it.
-        unsafe { result::memcpy_dtoh_sync(out, buf.ptr()) }?;
+        unsafe { result::memcpy_dtoh_sync(out, buf.ptr()) }
+            .map_err(|error| self.owner.observe(error))?;
         Ok(())
     }
 
@@ -812,7 +824,8 @@ impl PtxContext {
         // waits for the device work in flight. The kernel text is trusted to index its slices within `len`, as
         // poot-codegen's emitter does; this runtime does not verify it.
         unsafe {
-            result::launch_kernel(func, grid, block, 0, self.owner.stream, &mut params)?;
+            result::launch_kernel(func, grid, block, 0, self.owner.stream, &mut params)
+                .map_err(|error| self.owner.observe(error))?;
         }
         Ok(())
     }

@@ -278,7 +278,10 @@ fn state_probe_graph(name: &str, aval: TensorType) -> Graph {
 }
 
 fn require_wgpu() -> Option<WgpuDevice> {
-    WgpuDevice::new().ok()
+    poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        WgpuDevice::new(),
+    )
 }
 
 /// POOT-1100 LP-3 (wgpu): `Device::write_with` puts every byte at its address across staging chunks. A
@@ -289,7 +292,6 @@ fn require_wgpu() -> Option<WgpuDevice> {
 #[test]
 fn lp3_wgpu_write_with_is_exact_across_staging_chunks() {
     let Some(mut device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     poot_executor_parity::write_probe::chunked_write_is_exact(
@@ -307,7 +309,6 @@ fn lp3_wgpu_write_with_is_exact_across_staging_chunks() {
 fn the_wgpu_device_reports_live_free_memory_within_its_open_time_ceiling() {
     use poot_executor::Device;
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let ceiling = gpu_caps(&device.target())
@@ -331,7 +332,6 @@ fn the_wgpu_device_reports_live_free_memory_within_its_open_time_ceiling() {
 #[test]
 fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -365,7 +365,6 @@ fn qwen2_decode_on_the_contract_matches_the_oracle_and_records_once() {
 #[test]
 fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -453,7 +452,6 @@ fn prefill_and_decode_entries_share_state_and_reset_without_rerecording() {
 #[test]
 fn remove_entry_frees_its_arena_and_leaves_the_other_entry_unaffected() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -532,7 +530,6 @@ fn remove_entry_frees_its_arena_and_leaves_the_other_entry_unaffected() {
 #[test]
 fn unload_on_the_wgpu_engine_reads_zero_memory() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -582,7 +579,6 @@ fn unload_on_the_wgpu_engine_reads_zero_memory() {
 #[test]
 fn state_with_same_name_and_other_aval_is_refused() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -615,7 +611,6 @@ fn state_with_same_name_and_other_aval_is_refused() {
 #[test]
 fn mid_load_refusal_rolls_back_a_newly_allocated_state_and_leaves_the_existing_entry_unaffected() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -705,7 +700,6 @@ fn mid_load_refusal_rolls_back_a_newly_allocated_state_and_leaves_the_existing_e
 #[test]
 fn binder_and_target_refusals_are_typed() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -875,7 +869,6 @@ fn binder_and_target_refusals_are_typed() {
 #[test]
 fn two_phase_state_commit_matches_the_oracle_after_four_steps() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -966,7 +959,6 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps() {
 #[test]
 fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -1014,7 +1006,6 @@ fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() 
 #[test]
 fn single_decode_step_crosses_flush_work_by_summed_work_and_matches_the_oracle() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -1060,7 +1051,6 @@ fn single_decode_step_crosses_flush_work_by_summed_work_and_matches_the_oracle()
 /// `Unbound` and every one of these rows goes red together.
 fn packed_linear_matches_the_oracle(format: WeightFormat, out: usize, k: usize) {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -1211,7 +1201,6 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
     use poot_target::BufferStorage;
 
     let Some(mut device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let body: poot_kernel_ir::Body = poot_graph_plan::ImportedKernel::AssertTrap.body().clone();
@@ -1273,10 +1262,7 @@ fn wgpu_device_classifies_a_kernel_assert_fault_from_synchronize() {
             work: 4,
         })
         .unwrap();
-    let recording = device
-        .finish()
-        .unwrap()
-        .expect("a device always returns a recording");
+    let recording = device.finish().unwrap();
     device
         .replay(&recording)
         .expect("replay only re-encodes metadata; it never runs the dispatch itself");
@@ -1306,7 +1292,6 @@ fn wgpu_device_refuses_an_aie_launch_as_a_typed_error() {
     use std::num::NonZeroU32;
 
     let Some(mut device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let body = poot_kernel_ir::test_support::len_probe_kernel();
@@ -1372,7 +1357,6 @@ fn wgpu_device_refuses_an_aie_launch_as_a_typed_error() {
 #[test]
 fn planted_bad_validation_packet_fails_before_any_output_readback() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);
@@ -1459,7 +1443,6 @@ fn planted_bad_validation_packet_fails_before_any_output_readback() {
 #[test]
 fn bf16_embed_weight_feeds_gather_and_decode_gemv_with_no_host_f32_copy() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = wgpu_target(&device);

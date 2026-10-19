@@ -5,7 +5,6 @@
 pub mod gguf;
 pub mod lora;
 pub mod packed_safetensors;
-pub mod qwen_vl;
 
 // New split modules
 pub mod config;

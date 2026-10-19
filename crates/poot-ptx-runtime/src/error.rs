@@ -9,6 +9,17 @@ pub enum PtxError {
     /// The CUDA driver (via `cudarc`) returned an error.
     #[error("CUDA driver error: {0}")]
     Driver(#[from] DriverError),
+    /// The device faulted (a kernel's illegal access, a launch failure, an unrecoverable ECC error):
+    /// CUDA reports these as sticky errors that destroy the context's usefulness. The context is
+    /// poisoned by this error; every later call is [`PtxError::Poisoned`].
+    #[error("CUDA device lost: {0}")]
+    DeviceLost(DriverError),
+    /// An earlier call lost the device, so this call was refused before it touched the driver.
+    #[error("CUDA context poisoned by an earlier device fault: {cause}")]
+    Poisoned {
+        /// The fault that poisoned the context.
+        cause: DriverError,
+    },
     /// The kernel text or entry name could not be loaded as a PTX module; carries the reason.
     #[error("invalid kernel text or entry name: {0}")]
     BadKernel(String),

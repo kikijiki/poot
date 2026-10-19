@@ -11,10 +11,8 @@
 pub mod checkpoints;
 pub mod contained_child;
 pub mod device_caps;
-mod hang_guard;
+pub mod qwen_vl;
 pub mod smolvlm;
-
-pub use hang_guard::{ALLOW_GPU_HANG_VARIABLE, GpuHangOptIn, require_gpu_hang_opt_in};
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -133,8 +131,9 @@ macro_rules! checkpoint {
 /// This is the one place a test finds a checkpoint: there is no default directory, so a run on any machine
 /// names its models directory explicitly through `POOT_MODELS_DIR`. With the variable unset the test skips,
 /// unless `POOT_REQUIRE_MODELS=1`, which panics naming the variable so a lane that must run checkpoint tests
-/// cannot pass by skipping them all. A model missing from the directory always skips, with its name printed;
-/// [`checkpoint!`] is what keeps a misspelled name from being that skip.
+/// cannot pass by skipping them all. A model missing from the directory skips, with its name printed, unless
+/// `POOT_REQUIRE_MODELS=1` too: then it panics naming the model and the directory, so the checkpoint lane
+/// (`just test-checkpoint`) fails on a missing model instead of passing on a SKIP.
 ///
 /// ```text
 /// let Some(dir) = poot_test_util::model_path(poot_test_util::checkpoint!("qwen2.5-0.5b")) else {
@@ -161,6 +160,11 @@ pub fn model_path_with(
     };
     let path = std::path::Path::new(&models_dir).join(checkpoint.path);
     if !path.exists() {
+        assert!(
+            get(REQUIRE_MODELS_VARIABLE).as_deref() != Some("1"),
+            "model {checkpoint} not found under {MODELS_DIR_VARIABLE}={models_dir} but \
+             {REQUIRE_MODELS_VARIABLE}=1: a checkpoint lane fails on a missing model"
+        );
         eprintln!("SKIP: model {checkpoint} not found under {MODELS_DIR_VARIABLE}={models_dir}");
         return None;
     }
@@ -593,16 +597,37 @@ mod tests {
     }
 
     #[test]
-    fn model_path_skips_a_missing_model_even_when_models_are_required() {
+    fn model_path_panics_naming_the_model_when_it_is_missing_and_models_are_required() {
+        let models = unique_temp_path("models");
+        std::fs::create_dir_all(&*models).unwrap();
+        let models_dir = models.to_str().unwrap().to_string();
+
+        let message = panic_message(|| {
+            model_path_with(
+                env(&[
+                    ("POOT_MODELS_DIR", &models_dir),
+                    ("POOT_REQUIRE_MODELS", "1"),
+                ]),
+                checkpoint!("qwen2.5-0.5b"),
+            );
+        });
+
+        assert!(
+            message.contains("qwen2.5-0.5b")
+                && message.contains("POOT_REQUIRE_MODELS=1")
+                && message.contains(&models_dir),
+            "the panic names the model, the requirement and the directory, got: {message}"
+        );
+    }
+
+    #[test]
+    fn model_path_skips_a_missing_model_when_models_are_not_required() {
         let models = unique_temp_path("models");
         std::fs::create_dir_all(&*models).unwrap();
         let models_dir = models.to_str().unwrap();
 
         let found = model_path_with(
-            env(&[
-                ("POOT_MODELS_DIR", models_dir),
-                ("POOT_REQUIRE_MODELS", "1"),
-            ]),
+            env(&[("POOT_MODELS_DIR", models_dir)]),
             checkpoint!("qwen2.5-0.5b"),
         );
 

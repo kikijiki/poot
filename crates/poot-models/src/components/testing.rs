@@ -114,7 +114,9 @@ pub(crate) fn build(
     raw: &RawConfig<'_>,
     store: &WeightStore,
 ) -> Box<dyn Model> {
-    (entry.build)(raw, store).unwrap_or_else(|e| panic!("{}: {e}", entry.family))
+    (entry.build)(raw, store)
+        .unwrap_or_else(|e| panic!("{}: {e}", entry.family))
+        .model
 }
 
 /// The graph const names of every projection weight a model maps: the attention Q/K/V/O and every
@@ -351,9 +353,9 @@ pub(crate) fn assert_gguf_resolves_and_traces_packed(
     let model = registry
         .build(&raw, store)
         .unwrap_or_else(|e| panic!("{}: {e}", entry.family));
-    let consts = projection_consts(&*model);
+    let consts = projection_consts(&*model.model);
     assert_eq!(consts.len(), projections);
-    for (id, _, handle) in model.weights().iter() {
+    for (id, _, handle) in model.model.weights().iter() {
         if consts.contains(&id.const_name()) {
             assert!(
                 matches!(handle.format, HandleFormat::Packed(_)),
@@ -363,13 +365,14 @@ pub(crate) fn assert_gguf_resolves_and_traces_packed(
         }
     }
     let g = model
+        .model
         .trace(
             &StepSpec::step(step_shape(4, CAP, LogitRows::All)),
             poot_graph_ir::TraceLimits::for_tests(),
         )
         .unwrap();
-    assert_packed_binding(&*model, &g, &consts, true, "gguf");
-    model
+    assert_packed_binding(&*model.model, &g, &consts, true, "gguf");
+    model.model
 }
 
 /// `store` with every tensor whose key contains `norm` replaced by its F32 values plus one: the

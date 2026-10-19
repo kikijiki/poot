@@ -16,7 +16,7 @@ fn model(family: &str, tweak: impl FnOnce(&mut serde_json::Value)) -> Box<dyn Mo
         .unwrap_or_else(|| panic!("no family {family}"));
     let mut fixture = (entry.fixture)();
     tweak(&mut fixture.config);
-    (entry.build)(&fixture.raw(), &fixture.store).unwrap()
+    (entry.build)(&fixture.raw(), &fixture.store).unwrap().model
 }
 
 fn fixture_model(family: &str) -> Box<dyn Model> {
@@ -490,7 +490,7 @@ mod vl {
     use poot_graph_ir::Slot;
     use poot_quant::weights::WeightStore;
 
-    use super::super::model::{VL_ENTRY, VL_FAMILY};
+    use super::super::model::{VL_FAMILY, build_vl, vl_fixture};
     use super::*;
     use crate::components::standard::oracle;
     use crate::components::testing::{CAP, close, step_shape};
@@ -502,9 +502,9 @@ mod vl {
     fn build(
         tweak: impl FnOnce(&mut serde_json::Value),
     ) -> (Fixture, Result<Box<dyn Model>, ModelError>) {
-        let mut fixture = (VL_ENTRY.fixture)();
+        let mut fixture = vl_fixture();
         tweak(&mut fixture.config);
-        let built = (VL_ENTRY.build)(&fixture.raw(), &fixture.store);
+        let built = build_vl(&fixture.raw(), &fixture.store).map(|parts| parts.model);
         (fixture, built)
     }
 

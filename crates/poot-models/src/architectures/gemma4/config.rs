@@ -181,11 +181,14 @@ impl Gemma4Params {
     /// a field the family cannot serve is a typed [`ModelError::Config`] naming it.
     pub fn from_raw(raw: &RawConfig<'_>) -> Result<Self, ModelError> {
         match raw {
-            RawConfig::HfJson { config, generation } => {
+            RawConfig::HfJson {
+                config, generation, ..
+            } => {
                 let text = text_config(config)?;
                 let raw = RawConfig::HfJson {
                     config: &text,
                     generation: *generation,
+                    preprocessor: None,
                 };
                 let fields = Fields::new(&raw, FAMILY);
                 let tower = hf_tower(&fields, &text, config)?;

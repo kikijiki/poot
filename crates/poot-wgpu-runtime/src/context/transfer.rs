@@ -6,6 +6,63 @@ use poot_target::BufferStorage;
 use poot_target::{ElementKind, LogicalDType};
 use wgpu::util::DeviceExt;
 
+/// Construction-time options for [`Context::new_with_options`]: typed configuration, never an
+/// environment read in library code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextOptions {
+    /// How long a wait for the device may take before the context counts it as hung: the wait then
+    /// fails with [`RuntimeError::WaitTimeout`] and poisons the context.
+    pub wait_timeout: std::time::Duration,
+}
+
+impl Default for ContextOptions {
+    fn default() -> Self {
+        Self {
+            wait_timeout: std::time::Duration::from_secs(600),
+        }
+    }
+}
+
+/// Whether the device is still usable. Shared with wgpu's device-lost callback, which runs on a wgpu
+/// thread: it records why the device is gone, and a bounded wait that expires poisons the context the
+/// same way, so every later call is refused.
+#[derive(Default)]
+pub(crate) struct DeviceHealth {
+    poisoned: std::sync::atomic::AtomicBool,
+    lost: std::sync::OnceLock<String>,
+}
+
+impl DeviceHealth {
+    /// The device is gone for `reason`; the first reason is kept.
+    pub(crate) fn lose(&self, reason: String) {
+        let _ = self.lost.set(reason);
+        self.poison();
+    }
+
+    pub(crate) fn poison(&self) {
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Refuse `op` once the context is poisoned.
+    pub(crate) fn check_live(&self, op: &'static str) -> Result<(), RuntimeError> {
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::Poisoned { op });
+        }
+        Ok(())
+    }
+
+    /// The typed error for a device wgpu reported lost, if it did.
+    pub(crate) fn check_not_lost(&self) -> Result<(), RuntimeError> {
+        match self.lost.get() {
+            Some(reason) => Err(RuntimeError::DeviceLost {
+                reason: reason.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
 impl Context {
     // Device-resident path: keep intermediates on the GPU across dispatches (no per-op host round-trip).
     // Upload inputs once, dispatch over persistent buffers, download only the final output. This is the
@@ -173,16 +230,37 @@ impl Context {
     /// resident prefill executor calls this after each batched `submit_cached` flush so the submitted
     /// work retires and its transient per-dispatch resources (length buffers, bind groups held by the
     /// flushed `CachedDispatch`es) are freed, bounding in-flight submissions and live objects over a very
-    /// large prefill (~1e5 dispatches). Nothing is read back.
+    /// large prefill (~1e5 dispatches). Nothing is read back. Bounded like every wait on the device.
     pub fn poll_wait(&self) -> Result<(), RuntimeError> {
         self.waits.set(self.waits.get() + 1);
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| RuntimeError::Readback(e.to_string()))?;
-        Ok(())
+        self.wait_idle()
+    }
+
+    /// The one wait for the device: drains the queue for at most the configured bound. A bound that
+    /// passes poisons the context and fails with [`RuntimeError::WaitTimeout`]; a device wgpu reported
+    /// lost while waiting fails with [`RuntimeError::DeviceLost`]. Every later call is refused as
+    /// [`RuntimeError::Poisoned`].
+    pub(crate) fn wait_idle(&self) -> Result<(), RuntimeError> {
+        self.health.check_live("wait")?;
+        let polled = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(self.wait_timeout),
+        });
+        match polled {
+            Ok(_) => self.health.check_not_lost(),
+            Err(wgpu::PollError::Timeout) => {
+                self.health.poison();
+                Err(RuntimeError::WaitTimeout {
+                    secs: self.wait_timeout.as_secs(),
+                })
+            }
+            Err(wgpu::PollError::WrongSubmissionIndex(requested, successful)) => {
+                Err(RuntimeError::WrongSubmissionIndex {
+                    requested,
+                    successful,
+                })
+            }
+        }
     }
 
     /// A zero-filled, writable, readable buffer of `elems` native elements of `storage`, charged to
@@ -193,8 +271,17 @@ impl Context {
         role: poot_runtime_common::BufferRole,
         storage: BufferStorage,
         elems: usize,
-    ) -> DeviceBuffer {
+    ) -> Result<DeviceBuffer, RuntimeError> {
+        self.health.check_live("alloc_storage")?;
         let bytes = (elems.max(1) * storage.element().byte_width()).div_ceil(4) * 4;
+        if bytes as u64 > self.max_buffer_size {
+            return Err(RuntimeError::AllocationTooLarge {
+                role,
+                bytes,
+                limit: self.max_buffer_size,
+            });
+        }
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("{role:?}")),
             size: bytes as wgpu::BufferAddress,
@@ -203,14 +290,17 @@ impl Context {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        if pollster::block_on(scope.pop()).is_some() {
+            return Err(RuntimeError::OutOfMemory { role, bytes });
+        }
         self.buffer_allocs.set(self.buffer_allocs.get() + 1);
-        DeviceBuffer {
+        Ok(DeviceBuffer {
             buf,
             elem_count: elems.max(1) as u32,
             id: next_buffer_id(),
             storage,
             _guard: self.tag_alloc(role, bytes),
-        }
+        })
     }
 
     /// Overwrite `len` bytes of `buf` from byte `offset` (a whole number of its elements, padded to a

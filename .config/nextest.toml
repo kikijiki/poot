@@ -72,3 +72,31 @@ store-success-output = true
 [profile.device-l0.junit]
 path = "results.xml"
 store-success-output = true
+
+[profile.device-checkpoint-wgpu.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-checkpoint-rocm.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-checkpoint-ptx.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-checkpoint-vulkan.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-checkpoint-large-wgpu.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-checkpoint-large-rocm.junit]
+path = "results.xml"
+store-success-output = true
+
+[profile.device-checkpoint-large-ptx.junit]
+path = "results.xml"
+store-success-output = true

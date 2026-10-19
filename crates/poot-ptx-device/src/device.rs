@@ -221,9 +221,9 @@ impl Device for PtxDevice {
         )?)
     }
 
-    fn finish(&mut self) -> Result<Option<PtxRecording>, PtxGpuError> {
+    fn finish(&mut self) -> Result<PtxRecording, PtxGpuError> {
         let exec = self.ctx.end_capture()?;
-        Ok(Some(PtxRecording { exec }))
+        Ok(PtxRecording { exec })
     }
 
     fn begin_step(&mut self) -> Result<(), PtxGpuError> {
@@ -277,7 +277,9 @@ impl Device for PtxDevice {
         // (e.g. a mid-launch error) reaches here too, and this guarantees no pending span survives
         // into whatever runs next.
         self.pending_spans.clear();
-        Ok(())
+        // A lost device can never run work again. Reporting that here, rather than succeeding, lets
+        // the engine poison itself and refuse every later call instead of re-failing each one.
+        Ok(self.ctx.ensure_healthy()?)
     }
 }
 

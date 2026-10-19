@@ -12,7 +12,6 @@ use poot_llm::driver::{
     DraftPolicy, LoadOptions, ModelHandle, open_executor, open_group, open_timed_executor,
 };
 use poot_llm::encoders::Pooling;
-use poot_llm::{ImageCheckpoint, read_image_checkpoint};
 use poot_models::registry::Registry;
 
 use crate::admin::LoraAdminPolicyMode;
@@ -189,27 +188,18 @@ fn load_model(model_dir: &str, options: &LoadOptions) -> Result<Arc<ModelHandle>
     Ok(model)
 }
 
-/// The served model, and the image front end of a vision-language checkpoint.
-type LoadedModel = (Arc<ModelHandle>, Option<Arc<dyn ImageCheckpoint>>);
-
-/// Load the served model. A vision-language checkpoint (SmolVLM, Qwen2.5-VL) is served by its text tower,
-/// with its image front end beside it; any other checkpoint is the model itself.
-fn load_served(model_dir: &str, options: &LoadOptions) -> Result<LoadedModel> {
-    let path = std::path::Path::new(model_dir);
-    let registry = Registry::builtin().context("build the family registry")?;
-    let checkpoint =
-        read_image_checkpoint(path, &registry).context("load vision-language model")?;
-    match checkpoint {
-        Some(checkpoint) => {
-            anyhow::ensure!(
-                options.chat_template.is_none(),
-                "--chat-template is not supported for a vision-language checkpoint: its image chats render through the checkpoint's own template"
-            );
-            tracing::info!(model_dir, "loaded vision-language model");
-            Ok((Arc::clone(checkpoint.text()), Some(checkpoint)))
-        }
-        None => Ok((load_model(model_dir, options)?, None)),
+/// Load the served model. A vision-language checkpoint (SmolVLM, Qwen2.5-VL) is its text model with its
+/// image front end beside it (the handle holds both); any other checkpoint is the model itself.
+fn load_served(model_dir: &str, options: &LoadOptions) -> Result<Arc<ModelHandle>> {
+    let model = load_model(model_dir, options)?;
+    if model.front_end().is_some() {
+        anyhow::ensure!(
+            options.chat_template.is_none(),
+            "--chat-template is not supported for a vision-language checkpoint: its image chats render through the checkpoint's own template"
+        );
+        tracing::info!(model_dir, "loaded vision-language model");
     }
+    Ok(model)
 }
 
 /// Start the engine thread and wait for it to report its plan. The device is opened, the workload fitted
@@ -365,13 +355,14 @@ pub(crate) fn run() -> Result<()> {
     // driver moves to the engine thread, which runs the one scheduling loop over it: generation,
     // embeddings, rerank and LoRA administration are messages on its one queue.
     let health = EngineHealth::starting();
-    let (model, checkpoint) = load_served(&model_dir, &load_options)?;
+    let model = load_served(&model_dir, &load_options)?;
     let mut workers = WorkerRegistry::new();
     let (job_tx, job_rx) = mpsc::channel::<EngineMsg>();
     let draft = draft_policy(&config)?;
-    // The vision tower opens first, so the engine fits its workload to the memory the tower left.
-    let images = checkpoint
-        .map(|checkpoint| spawn_image_front_end(&mut workers, &health, checkpoint, config.backend))
+    // The vision towers open first, so the engine fits its workload to the memory the towers left.
+    let images = model
+        .front_end()
+        .map(|_| spawn_image_front_end(&mut workers, &health, Arc::clone(&model), config.backend))
         .transpose()?;
     let args = engine_args(&config, draft)?;
     let (metrics, view) = spawn_engine(

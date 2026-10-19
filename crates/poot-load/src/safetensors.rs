@@ -325,8 +325,9 @@ pub fn load_mapped_weight_store(
     build_store(safetensors_plan(files)?, workers)
 }
 
-/// [`map_weight_files`] then [`load_mapped_weight_store`] on [`default_workers`], for a caller with no
+/// [`map_weight_files`] then [`load_mapped_weight_store`] on [`default_workers`], for a test with no
 /// files to pin.
+#[cfg(any(test, feature = "test-support"))]
 pub fn load_weight_store(dir: impl AsRef<Path>) -> Result<WeightStore, LoadError> {
     load_mapped_weight_store(&map_weight_files(dir)?, default_workers())
 }

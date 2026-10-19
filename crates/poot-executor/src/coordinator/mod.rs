@@ -1141,11 +1141,8 @@ impl<D: Device + Collectives> Coordinator<D> {
             }
         }
         let Some(error) = first else { return Ok(()) };
-        // A validation failure or a kernel fault leaves every device reusable; anything else may
-        // have run some stages' commits.
-        if !matches!(error, ExecError::Validation(_) | ExecError::Fault { .. }) {
-            poison(engines.as_mut_slice());
-        }
+        // Every rank replayed its stages and committed state, whatever the failure was.
+        poison(engines.as_mut_slice());
         Err(error)
     }
 }

@@ -939,47 +939,6 @@ fn decomposed_prefill_attention_over_65535_query_groups_ptx_matches_cpu() {
     );
 }
 
-/// Card 258 cross-backend data point: the PTX twin
-/// of `crates/poot-wgpu-device/tests/cross_backend.rs::large_vocab_lm_head_transpose_matmul_does_not_hang`: a bare
-/// `transpose([250880,1024]) -> matmul` graph at BLOOM's tied-lm_head shape on the PTX executor. Card 258's
-/// hypothesis is a display-watchdog TDR specific to the wgpu/RADV iGPU (a compute-only NVIDIA GPU has none), so
-/// this checks whether `poot-graph-plan`'s `is_decode_gemv` plan is slow or wrong at this scale on PTX too
-/// (a general planning gap) or fine (the watchdog is the whole story). Run on a RunPod NVIDIA pod
-/// through `poot-orchestrator exec`.
-#[test]
-#[ignore = "diagnostic: allocates a ~1GB weight, mirroring the wgpu twin's own ignore convention (crates/ \
-            poot-wgpu-device/tests/cross_backend.rs); run manually with --ignored, ideally on a RunPod NVIDIA pod \
-            since no local NVIDIA hardware is assumed"]
-fn large_vocab_lm_head_transpose_matmul_does_not_hang_ptx() {
-    let mut ptx = match try_ptx() {
-        Some(g) => g,
-        None => return,
-    };
-    let (hidden, vocab) = (1024usize, 250880usize);
-    let b = Builder::for_tests();
-    let hstate = b
-        .constant("hidden", TensorType::f32(vec![1, 1, hidden]))
-        .unwrap();
-    let w = b
-        .constant("lm_head.weight", TensorType::f32(vec![vocab, hidden]))
-        .unwrap();
-    let wt = b.transpose(w, vec![1, 0]).unwrap(); // [hidden, vocab]
-    let out = b.matmul(hstate, wt).unwrap(); // [1,1,vocab]
-    let (hi, wi) = (hstate.id(), w.id());
-    let g = b.finish(out).unwrap();
-
-    let inputs = make_inputs(&[
-        (hi, vec![1, 1, hidden], fill(1, hidden)),
-        (wi, vec![vocab, hidden], fill(2, vocab * hidden)),
-    ]);
-
-    let t0 = std::time::Instant::now();
-    let got = common::run_resident(&mut ptx, &g, &inputs);
-    eprintln!("PTX large lm_head transpose+matmul: {:?}", t0.elapsed());
-    assert_eq!(got.as_f32().unwrap().len(), vocab);
-    assert!(got.as_f32().unwrap().iter().all(|v| v.is_finite()));
-}
-
 // ── Sampling primitives (card 551a) ──
 
 /// Card 551a (SC-001, SC-002, SC-005, SC-007): `OpKind::SampleToken { rule: Greedy }` through the full

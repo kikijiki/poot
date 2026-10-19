@@ -8,6 +8,7 @@ poot-ptx-device::bin/ptx-check	tests::missing_fixture_is_skipped_not_run	host-on
 poot-ptx-device::bin/ptx-check	tests::staged_fixture_is_run_not_skipped	host-only check of the ptx-check binary's fixture handling: needs no device, and runs under `just test`
 poot-ptx-runtime	context::caps_tests::a_pre_ampere_device_has_no_matrix_hardware_for_poots_kernels	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
 poot-ptx-runtime	context::caps_tests::every_attribute_lands_in_its_own_caps_field	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
+poot-ptx-runtime	tests::a_sticky_device_fault_is_device_lost_and_the_next_call_is_poisoned	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
 poot-ptx-runtime	tests::allocation_arithmetic_is_checked_before_native_allocation	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
 poot-ptx-runtime	tests::allocation_initialization_failure_frees_before_returning	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`
 poot-ptx-runtime	tests::bf16_packed_word_rejected_by_dense_i32_bind	mock-driver unit test of the runtime crate: drives no device, and runs under `just test`

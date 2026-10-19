@@ -107,6 +107,14 @@ pub enum RuntimeError {
     /// [`RuntimeError::Poisoned`]) and everything it could reference is leaked, not destroyed.
     #[error("a submitted command buffer was lost ({0}); the Vulkan device is poisoned")]
     SubmissionLost(vk::Result),
+    /// A submission's fence was still unsignaled when the configured wait bound passed, so the device
+    /// may be hung. The device is poisoned (see [`RuntimeError::Poisoned`]) and everything it could
+    /// reference is leaked, not destroyed.
+    #[error("a submission's fence wait timed out after {secs}s; the Vulkan device is poisoned")]
+    WaitTimeout {
+        /// The configured bound, in whole seconds.
+        secs: u64,
+    },
     /// A call was refused because an earlier submission was lost (see [`RuntimeError::SubmissionLost`]).
     #[error("{op} refused: an earlier submission was lost, so this Vulkan device is poisoned")]
     Poisoned {

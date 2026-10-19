@@ -303,6 +303,8 @@ poot-rocm-runtime	tests::a_small_write_pins_a_small_ring_slot
 poot-rocm-runtime	tests::a_write_at_an_offset_leaves_its_neighbours_intact_and_bad_ranges_are_typed
 poot-rocm-runtime	tests::agent_enumeration_works
 poot-rocm-runtime	tests::allocate_returns_zeroed_device_memory_after_dirty_reuse
+poot-rocm-runtime	tests::an_invalid_aql_packet_inactivates_the_queue_into_a_typed_fault
+poot-rocm-runtime	tests::an_out_of_bounds_store_is_a_typed_device_lost_and_poisons_the_context
 poot-rocm-runtime	tests::bf16_round_trips_through_the_storage_typed_primitives_with_exactly_elems_times_2_bytes
 poot-rocm-runtime	tests::bind_kernarg_refuses_more_buffers_than_the_segment_holds
 poot-rocm-runtime	tests::device_caps_matches_a_direct_hsa_query
@@ -346,6 +348,7 @@ poot-serve::served_groups	served_glm53_flash_rocm
 poot-serve::served_groups	served_gpt_oss_rocm
 poot-serve::served_groups	served_granite_rocm
 poot-serve::served_groups	served_granitemoe_rocm
+poot-serve::served_groups	served_idefics3_rocm
 poot-serve::served_groups	served_llama_rocm
 poot-serve::served_groups	served_lookup_speculation_returns_the_off_tokens_rocm
 poot-serve::served_groups	served_minimax_m2_rocm

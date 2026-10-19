@@ -23,9 +23,58 @@ pub enum RuntimeError {
     /// driver's message.
     #[error("device init failed: {0}")]
     DeviceInit(String),
-    /// Mapping or reading a staging buffer back to the host failed; the payload is the wgpu message.
-    #[error("readback failed: {0}")]
-    Readback(String),
+    /// Mapping a staging buffer for readback failed; wgpu delivered the error to the map callback.
+    #[error("readback map failed: {0}")]
+    MapFailed(#[source] wgpu::BufferAsyncError),
+    /// A readback's wait returned but a staging map had not completed.
+    #[error("a readback map had not completed when the wait returned")]
+    MapNotCompleted,
+    /// A bounded wait for the device found work still unfinished when the configured bound passed, so
+    /// the device may be hung. The context is poisoned by this error.
+    #[error("a device wait timed out after {secs}s; the wgpu context is poisoned")]
+    WaitTimeout {
+        /// The configured bound, in whole seconds.
+        secs: u64,
+    },
+    /// A wait named a submission wgpu never returned; unreachable while waits take no index.
+    #[error("waited on submission {requested}, but the last successful one is {successful}")]
+    WrongSubmissionIndex {
+        /// The submission index waited on.
+        requested: u64,
+        /// The last submission wgpu accepted.
+        successful: u64,
+    },
+    /// wgpu reported the device lost (a driver error, a reset, or `destroy`). The context is poisoned
+    /// by this error; every later call is [`RuntimeError::Poisoned`].
+    #[error("the wgpu device was lost: {reason}")]
+    DeviceLost {
+        /// The reason and message wgpu's device-lost callback delivered.
+        reason: String,
+    },
+    /// A call was refused because an earlier wait timed out or the device was lost.
+    #[error("{op} refused: the wgpu context is poisoned by an earlier device loss or timeout")]
+    Poisoned {
+        /// The refused operation, for the message.
+        op: &'static str,
+    },
+    /// An allocation larger than the device's `max_buffer_size`, refused before wgpu sees it.
+    #[error("a {bytes}-byte {role:?} allocation exceeds the device's {limit}-byte buffer limit")]
+    AllocationTooLarge {
+        /// What the buffer is for.
+        role: poot_runtime_common::BufferRole,
+        /// The padded byte size requested.
+        bytes: usize,
+        /// The device's `max_buffer_size`.
+        limit: u64,
+    },
+    /// The device had no memory for an allocation.
+    #[error("the device is out of memory for a {bytes}-byte {role:?} allocation")]
+    OutOfMemory {
+        /// What the buffer is for.
+        role: poot_runtime_common::BufferRole,
+        /// The padded byte size requested.
+        bytes: usize,
+    },
     /// A dispatch grid exceeds the device's `max_compute_workgroups_per_dimension`: `.0` is the requested
     /// grid, `.1` the per-dimension limit it was checked against.
     #[error(

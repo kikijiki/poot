@@ -61,6 +61,7 @@ fn registered_trace(family: &str, spec: StepSpec) -> Graph {
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
     // A routed family declares router witnesses; the corpus counts consts, which they do not touch.
     let traced = model
+        .model
         .trace(&spec, poot_graph_ir::TraceLimits::for_tests())
         .expect("the fixture traces");
     let mut plain = poot_graph_ir::GraphEdit::new();

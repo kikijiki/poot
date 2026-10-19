@@ -692,7 +692,7 @@ fn a_reordered_chain_is_its_own_artifact_and_computes_its_own_function() {
                 work: 0,
             })
             .expect("the dispatch is recorded");
-        let recording = device.finish().unwrap().expect("a recording");
+        let recording = device.finish().unwrap();
         device.begin_step().unwrap();
         device.replay(&recording).expect("the recording runs");
         device.synchronize().unwrap();

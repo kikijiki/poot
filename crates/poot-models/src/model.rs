@@ -521,6 +521,14 @@ pub enum ModelError {
         /// The guarantee that does not hold.
         source: WiringError,
     },
+    /// The family's front end or tower could not be built from the checkpoint's config.
+    #[error("{family}: front end: {source}")]
+    FrontEnd {
+        /// The family that refused.
+        family: FamilyKey,
+        /// Why its front end's config is refused.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// A stored value the family cannot read: element `index` (row-major) of the index table `id`
     /// is `value`, outside the I32 range its tracer indexes with.
     #[error("{family}: weight {id} element {index} is {value}, outside the I32 range")]

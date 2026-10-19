@@ -625,9 +625,9 @@ impl Device for XdnaDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<XdnaRecording>, XdnaError> {
+    fn finish(&mut self) -> Result<XdnaRecording, XdnaError> {
         let ops = self.open.take().ok_or(XdnaError::NotRecording)?;
-        Ok(Some(XdnaRecording(ops.into())))
+        Ok(XdnaRecording(ops.into()))
     }
 
     fn replay(&mut self, recording: &XdnaRecording) -> Result<(), XdnaError> {

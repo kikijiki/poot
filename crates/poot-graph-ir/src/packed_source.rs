@@ -189,6 +189,7 @@ pub fn packed_stack_source_constants(
 /// Every source constant of one packed weight, in [`PackedWeight::sources`] order: the name to
 /// stage and the type to stage it with. One constant per source - the registered E4M3/E2M1 cells
 /// stage exactly two (weight, scale); other schemes stage as many as their descriptor names.
+#[cfg(any(test, feature = "test-support"))]
 pub fn packed_source_constants(
     linear_id: &str,
     weight: PackedWeight,

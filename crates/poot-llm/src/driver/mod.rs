@@ -1003,7 +1003,7 @@ impl<S: State> Driver<S> {
     }
 
     /// The answer to a failed run of the one-row surface: `error` itself, after the executables were
-    /// reset when it left one needing it (a device failure, a fault, a refused host sync or an
+    /// reset when it left one needing it (a device failure, a fault, a rejected validation packet, a refused host sync or an
     /// executable already refusing steps) and nothing else depends on their state. Open sequences
     /// would lose their cache to a reset, and a paged layout's registered prefixes would point at
     /// zeroed blocks, so only a driver with no open sequence on the contiguous layout recovers;
@@ -1014,6 +1014,7 @@ impl<S: State> Driver<S> {
             DriverError::Device(
                 ExecError::Device(_)
                     | ExecError::Fault { .. }
+                    | ExecError::Validation(_)
                     | ExecError::NeedsReset(_)
                     | ExecError::Host(_)
             )

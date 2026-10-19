@@ -109,8 +109,8 @@ impl Device for LoggingDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<LoggedRecording>, Failed> {
-        Ok(Some(LoggedRecording(Rc::clone(&self.log))))
+    fn finish(&mut self) -> Result<LoggedRecording, Failed> {
+        Ok(LoggedRecording(Rc::clone(&self.log)))
     }
 
     fn begin_step(&mut self) -> Result<(), Failed> {

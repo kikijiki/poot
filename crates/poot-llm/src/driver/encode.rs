@@ -107,7 +107,10 @@ impl<S: State> Driver<S> {
     /// A poisoned device, a failed reset or any other error is returned as it came.
     fn recover_encode(&mut self, exe: ExecutableId, error: DriverError) -> DriverError {
         let DriverError::Device(
-            step @ (ExecError::Device(_) | ExecError::Fault { .. } | ExecError::NeedsReset(_)),
+            step @ (ExecError::Device(_)
+            | ExecError::Fault { .. }
+            | ExecError::Validation(_)
+            | ExecError::NeedsReset(_)),
         ) = error
         else {
             return error;

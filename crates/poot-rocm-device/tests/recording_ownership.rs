@@ -35,10 +35,7 @@ fn dropping_a_bound_buffer_keeps_its_allocation_until_the_recording_drops() {
 
     device.begin().expect("begin");
     device.copy(&src, &dst).expect("record the copy");
-    let recording = device
-        .finish()
-        .expect("finish")
-        .expect("a recording device returns one");
+    let recording = device.finish().expect("finish");
     drop(src);
     drop(dst);
 

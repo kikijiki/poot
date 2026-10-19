@@ -137,9 +137,17 @@ checkpoint and serves `/v1/embeddings` and `/v1/rerank` from it, and from a deco
 
 SmolVLM, idefics3, and Qwen2.5-VL.
 
-Multimodal chat: the vision tower (an `encode`-only model) and the text decoder (the `llama` family read from the
-checkpoint's `text_config`) are two registered families over one checkpoint, each on its own driver. The library
-path is `poot_llm::front_end::Idefics3` and the `poot-caption` binary. Qwen2.5-VL is the same shape (`qwen2_5_vl_vision` and the `qwen2_5_vl` text decoder with sectioned RoPE; `poot_llm::qwen_vl::Qwen25Vl`). Serving covers both families: `poot_llm::read_image_checkpoint` finds the vision-language checkpoint in a model directory and returns an `ImageCheckpoint`, which opens an `ImageFrontEnd` that turns a conversation and its images into the prompt's tokens and the request inputs its text model declares: the embedding rows and, for Qwen2.5-VL, its sectioned positions (see [Multimodal](../serve/multimodal.md)). ROCm and
+Multimodal chat: each of these is one registry entry keyed by the checkpoint's own `model_type` (`idefics3`,
+`qwen2_5_vl`) whose build function returns a model container. The container holds the text decoder (the `llama`
+family read from the checkpoint's `text_config` for SmolVLM; the `qwen2` body with sectioned RoPE for Qwen2.5-VL),
+the vision tower (an `encode`-only model) and the family's front end. The front end preprocesses the images
+(SmolVLM splits them into frames; Qwen2.5-VL resizes and patches them, and takes a video as sampled frames),
+runs the tower on each item and renders the conversation through the checkpoint's own chat template. It returns
+the prompt's tokens and the request inputs the text model declares: the embedding rows at the image
+placeholders and, for Qwen2.5-VL, the prompt's sectioned positions (see [Multimodal](../serve/multimodal.md)).
+`poot-llm` keeps only what is not family-specific: decoding an image's bytes, decoding an animated PNG's frames,
+and `FrontEndSession`, which runs a loaded model's front end on one driver per tower. The library path is
+`ModelHandle::load`, `ModelHandle::front_end` and `FrontEndSession`, and the `poot-caption` binary. ROCm and
 PTX GPU verification is thinner than wgpu for some modalities; see the matrix before relying on it.
 
 ## Adding a model
@@ -166,8 +174,10 @@ is five things, plus a checkpoint to load:
    shipped family does (a tag per token, a per-row tensor) declares it here and traces it as a slot; the
    driver binds it from the request's `RequestInputs` with no driver change.
 5. **A registry entry.** A `FamilyEntry` names the `model_type` (or GGUF architecture) that selects the
-   family, a build function and a small fixture checkpoint. The build function takes the raw config and the
-   weights and returns the `Model`; the model's `ModelConfig` carries what the driver needs to know without
+   family, a build function and a small fixture checkpoint. The build function takes the raw config (the
+   parsed `config.json`, and the `generation_config.json` and `preprocessor_config.json` when the checkpoint
+   ships them) and the weights and returns the model container, `ModelParts`: for a text family just the model,
+   built with `ModelParts::new`. The model's `ModelConfig` carries what the driver needs to know without
    naming the family: the vocabulary size, the maximum positions, the end-of-sequence ids, the prefill
    granule and the fallback chat format. Register the entry with `Registry::register`, then pass the registry
    to `ModelHandle::load`.
@@ -178,6 +188,18 @@ refused. The worked example writes a small word-level tokenizer for its fixture.
 
 There is no support list to edit. A family runs on a backend when its graph compiles for that backend, and a
 refusal is a typed error that names the equation and the missing capability.
+
+### Adding a vision-language model
+
+A vision-language family adds two parts to its container, both built by the same registry entry and both its own
+code: the vision towers (each an `encode`-only `Model`, added with `ModelParts::with_tower`) and a front end
+(`ModelParts::with_front_end`). The front end implements `FrontEnd::prepare`: it receives the conversation's
+turns, the decoded images (or video clips) in the order of the turns, a `Towers` handle that runs a tower on one
+row of request inputs and returns its embedding rows, and the model's text codec. It returns the prompt's token
+ids and the `RequestInputs` the text model declares. The image resize, patching, chat assembly and position
+tables all live in the family's module, beside its tracer; `poot-llm` and `poot-serve` name no family. The test
+`crates/poot-llm/tests/add_a_model/vlm.rs` registers such a family from outside the production crates and serves
+an image request through `FrontEndSession` with no edit to `poot-llm`.
 
 ## Next steps
 

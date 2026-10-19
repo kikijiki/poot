@@ -244,6 +244,7 @@ poot-serve::served_groups	served_glm53_flash_wgpu
 poot-serve::served_groups	served_gpt_oss_wgpu
 poot-serve::served_groups	served_granite_wgpu
 poot-serve::served_groups	served_granitemoe_wgpu
+poot-serve::served_groups	served_idefics3_wgpu
 poot-serve::served_groups	served_llama_wgpu
 poot-serve::served_groups	served_lookup_speculation_returns_the_off_tokens_wgpu
 poot-serve::served_groups	served_minimax_m2_wgpu
@@ -363,6 +364,7 @@ poot-wgpu-runtime	tests::cached_pass_packing::grouped_cached_dependencies_bindin
 poot-wgpu-runtime	tests::cached_pass_packing::grouped_cached_fault_order_reset_and_repeated_delivery_gpu
 poot-wgpu-runtime	tests::cached_pass_packing::grouped_cached_invalid_late_grid_prevents_successful_return_gpu
 poot-wgpu-runtime	tests::cached_pass_packing::grouped_cached_profile_empty_and_singleton_contract_gpu
+poot-wgpu-runtime	tests::device_timing_tests::a_wait_past_its_bound_times_out_and_poisons_the_context
 poot-wgpu-runtime	tests::device_timing_tests::counters_only_and_detailed_contexts_agree_on_output_and_submit_count_gpu
 poot-wgpu-runtime	tests::device_timing_tests::discard_device_timing_prevents_cross_step_contamination_gpu
 poot-wgpu-runtime	tests::device_timing_tests::max_in_flight_queries_bound_is_enforced_gpu

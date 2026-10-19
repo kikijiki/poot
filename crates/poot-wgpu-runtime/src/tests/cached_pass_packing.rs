@@ -57,11 +57,17 @@ fn dependency_chain(ctx: &Context, passes: usize) -> Vec<Vec<f32>> {
     let add = kernel(&fixtures::add_kernel(), "packing-add");
     let square = kernel(&square_kernel(), "packing-square");
     let inputs: Vec<_> = (0..4)
-        .map(|_| ctx.alloc_storage(BufferRole::Input, BufferStorage::f32(), 129))
+        .map(|_| {
+            ctx.alloc_storage(BufferRole::Input, BufferStorage::f32(), 129)
+                .expect("alloc")
+        })
         .collect();
     // X, T (short), Y, Z, O. Whole-buffer clone aliases retain the same native identity.
     let outputs: Vec<_> = [129, 5, 129, 129, 129]
-        .map(|n| ctx.alloc_storage(BufferRole::Output, BufferStorage::f32(), n))
+        .map(|n| {
+            ctx.alloc_storage(BufferRole::Output, BufferStorage::f32(), n)
+                .expect("alloc")
+        })
         .into();
     let alias = outputs[0].clone();
     assert_eq!(alias.id(), outputs[0].id());

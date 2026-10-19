@@ -68,7 +68,8 @@ impl UploadRing {
         let slot = &mut self.slots[index];
         if slot.in_flight {
             // SAFETY: `event` is a live event recorded on the context's stream after the slot's copy.
-            unsafe { result::event::synchronize(slot.event) }?;
+            unsafe { result::event::synchronize(slot.event) }
+                .map_err(|error| self.owner.observe(error))?;
             slot.in_flight = false;
         }
         self.next = (index + 1) % RING_SLOTS;

@@ -180,8 +180,8 @@ impl Device for RecordingDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<()>, std::convert::Infallible> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), std::convert::Infallible> {
+        Ok(())
     }
 
     fn replay(&mut self, _recording: &()) -> Result<(), std::convert::Infallible> {

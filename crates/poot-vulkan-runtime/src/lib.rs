@@ -82,6 +82,7 @@ use crate::owner::DeviceOwner;
 use ash::vk;
 pub use buffer::DeviceBuffer;
 pub use context::graph::Binding;
+pub use context::init::ContextOptions;
 pub use error::RuntimeError;
 pub use graph::{
     DispatchTime, GraphDeviceTime, GraphTiming, KernelFault, RecordingGraph, Replay, VulkanGraph,

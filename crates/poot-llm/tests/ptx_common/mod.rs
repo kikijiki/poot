@@ -274,7 +274,7 @@ impl Device for PtxDeviceProxy<'_> {
     fn copy(&mut self, src: &Self::Buffer, dst: &Self::Buffer) -> Result<(), Self::Error> {
         self.0.copy(src, dst)
     }
-    fn finish(&mut self) -> Result<Option<Self::Recording>, Self::Error> {
+    fn finish(&mut self) -> Result<Self::Recording, Self::Error> {
         self.0.finish()
     }
     fn replay(&mut self, recording: &Self::Recording) -> Result<(), Self::Error> {

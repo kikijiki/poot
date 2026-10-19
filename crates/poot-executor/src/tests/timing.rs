@@ -123,8 +123,9 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(std::mem::take(&mut self.recording).then_some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        self.recording = false;
+        Ok(())
     }
 
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {

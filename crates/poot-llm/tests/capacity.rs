@@ -24,7 +24,7 @@ use poot_models::model::{
     ConfigReason, FamilyKey, KvLayout, LogitRows, Model, ModelConfig, ModelError, ModelOutput,
     StepSpec, TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{WeightMap, WeightStore};
 use poot_runtime_common::{BufferRole, MemoryCounters};
 use poot_target::{Backend, DeviceCaps};
@@ -145,7 +145,7 @@ impl Model for Tiny {
     }
 }
 
-fn build_tiny(raw: &RawConfig<'_>) -> Result<Box<dyn Model>, ModelError> {
+fn build_tiny(raw: &RawConfig<'_>) -> Result<ModelParts, ModelError> {
     let RawConfig::HfJson { config, .. } = raw else {
         unreachable!("the family names only HF configs")
     };
@@ -169,7 +169,7 @@ fn build_tiny(raw: &RawConfig<'_>) -> Result<Box<dyn Model>, ModelError> {
         }
     };
     let schema = ModelSchema::builder().step(program).build_for(FAMILY)?;
-    Ok(Box::new(Tiny {
+    Ok(ModelParts::new(Box::new(Tiny {
         variant,
         config: ModelConfig {
             family: FAMILY,
@@ -183,7 +183,7 @@ fn build_tiny(raw: &RawConfig<'_>) -> Result<Box<dyn Model>, ModelError> {
         },
         schema,
         weights: WeightMap::default(),
-    }))
+    })))
 }
 
 /// The family's tokenizer, a word-level vocabulary over `a`..`k`.
@@ -229,6 +229,7 @@ fn checkpoint(variant: Variant) -> (poot_test_util::UniqueTempPath, ModelHandle)
             fixture: || Fixture {
                 config: serde_json::json!({"model_type": "capacity-tiny", "state": "dense"}),
                 generation: None,
+                preprocessor: None,
                 store: WeightStore::default(),
             },
             variants: &[],
@@ -299,8 +300,8 @@ impl Device for CountingDevice {
     fn copy(&mut self, _src: &(), _dst: &()) -> Result<(), FakeError> {
         Ok(())
     }
-    fn finish(&mut self) -> Result<Option<()>, FakeError> {
-        Ok(Some(()))
+    fn finish(&mut self) -> Result<(), FakeError> {
+        Ok(())
     }
     fn replay(&mut self, _recording: &()) -> Result<(), FakeError> {
         Ok(())

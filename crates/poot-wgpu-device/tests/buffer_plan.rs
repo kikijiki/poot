@@ -131,7 +131,10 @@ fn oracle(a: &[f32], b: &[f32], c: f32) -> f32 {
 }
 
 fn require_wgpu() -> Option<WgpuDevice> {
-    WgpuDevice::new().ok()
+    poot_runtime_common::device_skip::open_or_skip(
+        poot_runtime_common::DeviceBackend::Wgpu,
+        WgpuDevice::new(),
+    )
 }
 
 /// SC-001: peak arena bytes below the naive per-value sum, output equal to the CPU oracle.
@@ -144,7 +147,6 @@ fn require_wgpu() -> Option<WgpuDevice> {
 #[test]
 fn disjoint_lifetimes_reuse_one_slot_and_match_the_oracle() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = device.target();
@@ -194,7 +196,6 @@ fn disjoint_lifetimes_reuse_one_slot_and_match_the_oracle() {
 #[test]
 fn a_short_value_reusing_a_larger_slot_publishes_its_own_length_not_the_slots() {
     let Some(device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     let target = device.target();
@@ -231,7 +232,6 @@ fn a_short_value_reusing_a_larger_slot_publishes_its_own_length_not_the_slots() 
 #[test]
 fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
     let Some(mut device) = require_wgpu() else {
-        eprintln!("skip: no wgpu adapter");
         return;
     };
     const REAL_LEN: usize = 4;
@@ -283,10 +283,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
             work: 1,
         })
         .unwrap();
-    let recording = device
-        .finish()
-        .unwrap()
-        .expect("a device always returns a recording");
+    let recording = device.finish().unwrap();
     device
         .replay(&recording)
         .expect("replay only re-encodes metadata; it never runs the dispatch itself");

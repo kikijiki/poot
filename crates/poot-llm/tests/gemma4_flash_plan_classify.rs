@@ -38,7 +38,10 @@ fn gemma4(variant: Option<&str>) -> Box<dyn Model> {
             make()
         }
     };
-    registry.build(&fixture.raw(), &fixture.store).unwrap()
+    registry
+        .build(&fixture.raw(), &fixture.store)
+        .unwrap()
+        .model
 }
 
 fn step(tokens: usize, capacity: usize) -> StepShape {

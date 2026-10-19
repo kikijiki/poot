@@ -108,8 +108,9 @@ impl Device for EchoDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<()>, EchoError> {
-        Ok(std::mem::take(&mut self.recording).then_some(()))
+    fn finish(&mut self) -> Result<(), EchoError> {
+        self.recording = false;
+        Ok(())
     }
 
     fn replay(&mut self, _recording: &()) -> Result<(), EchoError> {

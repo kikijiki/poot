@@ -21,8 +21,8 @@ use poot_graph_plan::Target;
 use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot};
 use poot_target::{Backend, BufferStorage, TargetId};
 use poot_vulkan_runtime::{
-    Binding, Context, DeviceBuffer, GraphTiming, KernelFault, Pipeline, RecordingGraph,
-    RuntimeError, VulkanGraph,
+    Binding, Context, ContextOptions, DeviceBuffer, GraphDeviceTime, GraphTiming, KernelFault,
+    Pipeline, RecordingGraph, RuntimeError, VulkanGraph,
 };
 use std::sync::Arc;
 
@@ -33,6 +33,36 @@ use crate::error::VulkanGpuError;
 /// on, a production default and not environment-tunable (ADR-0104 decision 5's precedent).
 const FLUSH_EVERY: usize = 1024;
 const FLUSH_WORK: u64 = 4_000_000;
+
+/// Add one replay's measured time to the step's: durations sum, the spans of successive submissions
+/// add (the gap between them is not device time), and each dispatch keeps its place in the step.
+fn accumulate_time(step: &mut DeviceTime, replay: GraphDeviceTime) {
+    let measured = match step {
+        DeviceTime::Measured(measured) => measured,
+        DeviceTime::Unknown => {
+            *step = DeviceTime::Measured(MeasuredDeviceTime {
+                sum_of_dispatch_durations: Some(std::time::Duration::ZERO),
+                device_span: Some(std::time::Duration::ZERO),
+                dispatches: Vec::new(),
+            });
+            let DeviceTime::Measured(measured) = step else {
+                unreachable!("just set")
+            };
+            measured
+        }
+    };
+    let earlier = measured.dispatches.len();
+    measured.sum_of_dispatch_durations = measured
+        .sum_of_dispatch_durations
+        .map(|sum| sum + replay.sum_of_dispatch_durations);
+    measured.device_span = measured.device_span.map(|span| span + replay.device_span);
+    measured
+        .dispatches
+        .extend(replay.dispatches.into_iter().map(|d| DispatchDeviceTime {
+            index: earlier + d.index,
+            duration: d.duration,
+        }));
+}
 
 /// One loaded kernel: the plan key it is cached and labelled under, and its pipeline.
 pub struct VulkanKernel {
@@ -73,11 +103,16 @@ impl VulkanDevice {
     /// A device in counters-only mode: replays write no timestamps and [`Device::device_time`] is
     /// `Unknown` (Card 552: the counters-only path asks nothing extra of the device).
     pub fn new() -> Result<Self, VulkanGpuError> {
-        Self::with_timing(GraphTiming::Off)
+        Self::new_with_options(ContextOptions::default())
     }
 
-    fn with_timing(timing: GraphTiming) -> Result<Self, VulkanGpuError> {
-        let ctx = Context::new()?;
+    /// [`Self::new`] with explicit runtime [`ContextOptions`]: the bound on every fence wait.
+    pub fn new_with_options(options: ContextOptions) -> Result<Self, VulkanGpuError> {
+        Self::with_timing(GraphTiming::Off, options)
+    }
+
+    fn with_timing(timing: GraphTiming, options: ContextOptions) -> Result<Self, VulkanGpuError> {
+        let ctx = Context::new_with_options(options)?;
         if timing == GraphTiming::PerDispatch && !ctx.timestamps_supported() {
             return Err(poot_vulkan_runtime::RuntimeError::TimestampsUnavailable.into());
         }
@@ -217,30 +252,26 @@ impl Device for VulkanDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<VulkanGraph>, VulkanGpuError> {
+    fn finish(&mut self) -> Result<VulkanGraph, VulkanGpuError> {
         let step = self.open.take().expect("finish without begin");
-        Ok(Some(self.ctx.end_graph(step.graph)?))
+        Ok(self.ctx.end_graph(step.graph)?)
+    }
+
+    fn begin_step(&mut self) -> Result<(), VulkanGpuError> {
+        // The previous step's staged fault and timing are stale; the replays of this step accumulate.
+        self.fault = None;
+        self.time = DeviceTime::Unknown;
+        Ok(())
     }
 
     fn replay(&mut self, recording: &VulkanGraph) -> Result<(), VulkanGpuError> {
-        // Whatever the previous step staged is stale the moment a new replay starts.
-        self.fault = None;
-        self.time = DeviceTime::Unknown;
         let replay = recording.replay()?;
-        self.fault = replay.fault;
+        // The first trap of the step is the one reported: later stages ran on state it left.
+        if self.fault.is_none() {
+            self.fault = replay.fault;
+        }
         if let Some(time) = replay.time {
-            self.time = DeviceTime::Measured(MeasuredDeviceTime {
-                sum_of_dispatch_durations: Some(time.sum_of_dispatch_durations),
-                device_span: Some(time.device_span),
-                dispatches: time
-                    .dispatches
-                    .into_iter()
-                    .map(|d| DispatchDeviceTime {
-                        index: d.index,
-                        duration: d.duration,
-                    })
-                    .collect(),
-            });
+            accumulate_time(&mut self.time, time);
         }
         Ok(())
     }

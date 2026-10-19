@@ -11,12 +11,11 @@ mod architectures;
 pub mod components;
 pub mod io;
 pub mod model;
-mod multimodal;
+pub mod multimodal;
 pub mod names;
 pub mod registry;
 
 pub use architectures::{bert, gemma4, glm53_flash, nemotron_h, qwen2, qwen3next};
-pub use multimodal::{idefics3, mrope, qwen_vl_vision, vision};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

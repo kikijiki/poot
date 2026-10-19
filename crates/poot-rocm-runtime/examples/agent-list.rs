@@ -1,6 +1,5 @@
 //! `rocminfo`-style diagnostic: initializes HSA, enumerates every agent (CPU + GPU) through the raw
-//! FFI, and prints the chosen GPU agent's gfx id, queue limits, wavefront size and cooperative-queue
-//! capability. With `HSA_OVERRIDE_GFX_VERSION=11.5.1` (set by the flake) the ISA name is `gfx1151` on
+//! FFI, and prints the chosen GPU agent's gfx id, queue limits, wavefront size. With `HSA_OVERRIDE_GFX_VERSION=11.5.1` (set by the flake) the ISA name is `gfx1151` on
 //! Strix Halo (spec 063 FR-002).
 //!
 //! Exits 0 on success; exits 1 with a diagnostic when ROCm is missing or no GPU is visible.
@@ -60,12 +59,11 @@ fn main() {
 fn print_agent_detail(funcs: &Funcs, agent: poot_rocm_runtime::bindings::hsa_agent_t) {
     use poot_rocm_runtime::bindings::{
         HSA_AGENT_INFO_NAME, HSA_AGENT_INFO_QUEUE_MAX_SIZE, HSA_AGENT_INFO_VENDOR_NAME,
-        HSA_AGENT_INFO_WAVEFRONT_SIZE, HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES,
+        HSA_AGENT_INFO_WAVEFRONT_SIZE,
     };
     let mut name = [0i8; 64];
     let mut vendor = [0i8; 64];
     let mut wavefront: u32 = 0;
-    let mut coop_q: u32 = 0;
     let mut max_q: u32 = 0;
     unsafe {
         if (funcs.hsa_agent_get_info)(agent, HSA_AGENT_INFO_NAME, name.as_mut_ptr() as *mut _) == 0
@@ -87,14 +85,6 @@ fn print_agent_detail(funcs: &Funcs, agent: poot_rocm_runtime::bindings::hsa_age
         ) == 0
         {
             println!("  wavefront:   {wavefront}");
-        }
-        if (funcs.hsa_agent_get_info)(
-            agent,
-            HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES,
-            &mut coop_q as *mut _ as *mut _,
-        ) == 0
-        {
-            println!("  coop queues: {coop_q}");
         }
         if (funcs.hsa_agent_get_info)(
             agent,

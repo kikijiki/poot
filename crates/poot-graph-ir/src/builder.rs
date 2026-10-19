@@ -6,16 +6,21 @@
 //! ([`crate::budget`]) before it allocates or appends. A refused request changes nothing.
 
 use std::cell::{Cell, RefCell};
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::budget::{AllocationSite, Charge, HeldCharge, Meter, TraceLimits};
-use crate::error::{BuilderCollection, BuilderError, BuilderValueNamespace, Requirement};
+#[cfg(any(test, feature = "test-support"))]
+use crate::error::BuilderValueNamespace;
+use crate::error::{BuilderCollection, BuilderError, Requirement};
+#[cfg(any(test, feature = "test-support"))]
+use crate::graph::ValueTable;
 use crate::graph::{
     BoundaryId, ComputedConst, EditError, Eqn, Export, Graph, GraphEdit, GraphOutput, LayerIndex,
-    Operand, Slot, SlotKey, StateRole, Storage, ValidationId, ValueId, ValueMeta, ValueTable,
+    Operand, Slot, SlotKey, StateRole, Storage, ValidationId, ValueId, ValueMeta,
 };
 use crate::op::{OpKind, SampleRule};
 use crate::range::IndexRange;
@@ -59,6 +64,7 @@ impl Traced {
 }
 
 /// Checked accounting for a prepared transactional append.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuilderAppendAccounting {
     /// Values (input binders and equation results) the plan staged.
@@ -79,6 +85,7 @@ pub struct BuilderAppendAccounting {
 ///
 /// A plan charges the builder's budget for the type snapshot it took and for everything it stages, and
 /// gives the charge back when it is dropped without committing.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct BuilderAppendPlan {
     brand: BuilderBrand,
@@ -100,17 +107,17 @@ pub struct BuilderAppendPlan {
     snapshot: Charge,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug)]
 enum DeclaredAppendResult {
-    #[cfg(any(test, feature = "test-support"))]
     StagedInput(ValueId),
     EquationOutput(ValueId),
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl DeclaredAppendResult {
     fn value(self) -> ValueId {
         match self {
-            #[cfg(any(test, feature = "test-support"))]
             Self::StagedInput(value) => value,
             Self::EquationOutput(value) => value,
         }
@@ -309,6 +316,7 @@ fn infer_equation(
         })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl BuilderAppendPlan {
     fn next_value_id(&self) -> Result<ValueId, BuilderError> {
         self.staged_id(self.values.len())
@@ -414,7 +422,6 @@ impl BuilderAppendPlan {
     }
 
     /// Atomically stage a named non-Device input binder and declare that plan-owned input as the result.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn input_result(
         &mut self,
         name: impl Into<String>,
@@ -576,6 +583,7 @@ impl BuilderAppendPlan {
 }
 
 /// A fully checked append. Neither `Clone` nor reusable.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct PreparedBuilderAppend {
     brand: BuilderBrand,
@@ -589,6 +597,7 @@ pub struct PreparedBuilderAppend {
     plan: Option<BuilderAppendPlan>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PreparedBuilderAppend {
     /// The checked counts this append staged, as validated by `prepare`.
     pub fn accounting(&self) -> BuilderAppendAccounting {
@@ -596,17 +605,17 @@ impl PreparedBuilderAppend {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 enum PreparedAppendResult {
-    #[cfg(any(test, feature = "test-support"))]
     StagedInput(ValueId),
     EquationOutput(ValueId),
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PreparedAppendResult {
     fn value(&self) -> ValueId {
         match *self {
-            #[cfg(any(test, feature = "test-support"))]
             Self::StagedInput(value) => value,
             Self::EquationOutput(value) => value,
         }
@@ -865,6 +874,7 @@ fn checked_op_sizes(op: &OpKind, inputs: &[TensorType]) -> Result<(), BuilderErr
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn staged_namespace(
     plan: &BuilderAppendPlan,
     value: ValueId,
@@ -880,6 +890,7 @@ fn staged_namespace(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn live_name_namespace(g: &Graph, name: &str) -> Option<BuilderValueNamespace> {
     let (value, _) = g
         .values()
@@ -898,6 +909,7 @@ fn live_name_namespace(g: &Graph, name: &str) -> Option<BuilderValueNamespace> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn validate_append_result(
     plan: &BuilderAppendPlan,
     live_value_count: usize,
@@ -918,7 +930,6 @@ fn validate_append_result(
         (DeclaredAppendResult::EquationOutput(_), Storage::Device) => {
             Ok(PreparedAppendResult::EquationOutput(value))
         }
-        #[cfg(any(test, feature = "test-support"))]
         (
             DeclaredAppendResult::StagedInput(_),
             Storage::Const | Storage::Computed(_) | Storage::Slot(_) | Storage::State,
@@ -1169,6 +1180,7 @@ impl Builder {
     ///
     /// The plan snapshots every value type of the builder; the snapshot is charged against the budget
     /// before it is cloned and given back when the plan is dropped or committed.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn append_plan(&self, packed_rows: usize) -> Result<BuilderAppendPlan, BuilderError> {
         let g = self.g.borrow();
         let site = AllocationSite::PlanSnapshot;
@@ -1226,6 +1238,7 @@ impl Builder {
     }
 
     /// Validate an entire staged fragment without changing the live graph.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn preflight_append(
         &self,
         plan: BuilderAppendPlan,
@@ -1458,6 +1471,7 @@ impl Builder {
     /// The plan's staged storage was charged when it was staged; it becomes the graph's, and only the
     /// type snapshot is given back. A refused commit changes neither the graph nor the generation, and
     /// the plan keeps every charge it holds.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn commit_append(
         &self,
         prepared: &mut PreparedBuilderAppend,
@@ -2013,11 +2027,13 @@ impl Builder {
 
     /// Pack int8 codes into i32 words, 4 per word along the last axis (spec 048). Output is `I32` with last dim
     /// `ceil(L/4)`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn pack_i8(&self, x: Traced) -> Result<Traced, BuilderError> {
         self.emit(OpKind::PackI8, vec![self.operand(x)?])
     }
 
     /// Unpack `len` int8 codes from i32 words (inverse of [`Builder::pack_i8`]). Output is `F32` with last dim `len`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn unpack_i8(&self, codes: Traced, len: usize) -> Result<Traced, BuilderError> {
         self.emit(OpKind::UnpackI8 { len }, vec![self.operand(codes)?])
     }
@@ -2376,6 +2392,7 @@ impl Builder {
     ///
     /// # Errors
     /// [`BuilderError::LiteralOutOfRange`] when `index` does not fit the `I32` literal.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn dynamic_update_slice(
         &self,
         operand: Traced,

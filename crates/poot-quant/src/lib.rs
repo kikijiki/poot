@@ -27,6 +27,7 @@ mod tests;
 pub mod weights;
 
 use std::fmt;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 
 use content::ContentCheck;
@@ -464,6 +465,7 @@ struct PayloadSource {
     bytes: StoredBytes,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// A no-copy runtime binding for one component of an immutable packed payload.
 ///
 /// Cloning this value clones only the outer [`Arc<PackedPayload>`]. The source byte owners stay
@@ -474,6 +476,7 @@ pub struct PackedComponentRef {
     role: SourceRole,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PackedComponentRef {
     /// Bind `role` of `owner`. The role is not checked here: [`Self::bytes`] panics if it is not one of the payload's sources.
     pub fn new(owner: Arc<PackedPayload>, role: SourceRole) -> Self {
@@ -506,6 +509,7 @@ impl PackedComponentRef {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// The experts of one routed projection as one table: `experts` packed weights of one format and shape,
 /// held as their own payloads and read together as a stacked `[experts, out, K]` weight. A stacked
 /// table is never one payload: each expert keeps its own source bytes (ADR-0109), and the device
@@ -521,6 +525,7 @@ pub struct PackedStack {
     owners: Vec<Arc<PackedPayload>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PackedStack {
     /// Stack `owners` in order: refused when empty or when the experts differ in format or shape.
     pub fn try_new(owners: Vec<Arc<PackedPayload>>) -> Result<Self, PackedWeightError> {
@@ -564,6 +569,7 @@ impl PackedStack {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PartialEq for PackedStack {
     fn eq(&self, other: &Self) -> bool {
         self.owners.len() == other.owners.len()
@@ -575,8 +581,10 @@ impl PartialEq for PackedStack {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Eq for PackedStack {}
 
+#[cfg(any(test, feature = "test-support"))]
 /// A no-copy runtime binding for one source role of a [`PackedStack`] (the stacked counterpart of
 /// [`PackedComponentRef`]): cloning clones only the outer [`Arc`].
 #[derive(Clone, Debug)]
@@ -585,6 +593,7 @@ pub struct PackedStackComponentRef {
     role: SourceRole,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PackedStackComponentRef {
     /// Bind `role` of `stack`. The role is not checked here.
     pub fn new(stack: Arc<PackedStack>, role: SourceRole) -> Self {
@@ -627,12 +636,14 @@ impl PackedStackComponentRef {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PartialEq for PackedStackComponentRef {
     fn eq(&self, other: &Self) -> bool {
         self.role == other.role && self.same_owner(other)
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Eq for PackedStackComponentRef {}
 
 /// The device transport of one packed source's bytes (dquant.md D9): its native bytes, unchanged,
@@ -655,12 +666,14 @@ pub fn packed_source_words(bytes: &[u8]) -> Vec<u32> {
     words
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PartialEq for PackedComponentRef {
     fn eq(&self, other: &Self) -> bool {
         self.role == other.role && self.same_owner(other)
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Eq for PackedComponentRef {}
 
 /// Authoritative, immutable source storage for one packed weight.

@@ -22,7 +22,7 @@ use poot_models::model::{
     ConfigReason, FamilyKey, Model, ModelConfig, ModelError, ModelOutput, StepShape, StepSpec,
     TraceError,
 };
-use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig, Registry};
+use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
 use poot_quant::weights::{
     DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightStore, WeightView,
 };
@@ -128,9 +128,9 @@ impl Model for Scripted {
     }
 }
 
-fn build_scripted(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build_scripted(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let weights = WeightMap::builder(store).build();
-    Ok(Box::new(Scripted {
+    Ok(ModelParts::new(Box::new(Scripted {
         config: config_of(SCRIPTED, 4),
         schema: schema_of(SCRIPTED, 4),
         weights,
@@ -138,7 +138,7 @@ fn build_scripted(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Mo
         unaries: count(raw, SCRIPTED, "unaries")?,
         literals: count(raw, SCRIPTED, "literals")?,
         name_len: count(raw, SCRIPTED, "name_len")?,
-    }))
+    })))
 }
 
 fn scripted_fixture() -> Fixture {
@@ -147,6 +147,7 @@ fn scripted_fixture() -> Fixture {
             "model_type": "scripted", "constants": 1, "unaries": 0, "literals": 0, "name_len": 1
         }),
         generation: None,
+        preprocessor: None,
         store: WeightStore::default(),
     }
 }
@@ -171,9 +172,13 @@ fn scripted(constants: usize, unaries: usize, literals: usize, name_len: usize) 
             "name_len": name_len,
         }),
         generation: None,
+        preprocessor: None,
         store: WeightStore::default(),
     };
-    registry.build(&fixture.raw(), &fixture.store).unwrap()
+    registry
+        .build(&fixture.raw(), &fixture.store)
+        .unwrap()
+        .model
 }
 
 fn shape(tokens: usize) -> StepShape {
@@ -364,7 +369,7 @@ fn dense(shape: &[usize]) -> WeightEntry {
     WeightEntry::Dense(DenseWeight::try_new(DType::F32, shape.to_vec(), bytes).unwrap())
 }
 
-fn build_shared(_raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build_shared(_raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let wrap = |source| ModelError::Weight {
         family: SHARED,
         source,
@@ -389,13 +394,13 @@ fn build_shared(_raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Mod
     let weights = map.build();
     let embed = Embedding::new(&weights, VOCAB, WIDTH).map_err(|e| e.for_family(SHARED))?;
     let ffn = GatedFfnWeights::new(&weights, 0, WIDTH, INTER).map_err(|e| e.for_family(SHARED))?;
-    Ok(Box::new(SharedLm {
+    Ok(ModelParts::new(Box::new(SharedLm {
         config: config_of(SHARED, VOCAB),
         schema: schema_of(SHARED, VOCAB),
         weights,
         embed,
         ffn,
-    }))
+    })))
 }
 
 fn shared_fixture() -> Fixture {
@@ -407,6 +412,7 @@ fn shared_fixture() -> Fixture {
     Fixture {
         config: serde_json::json!({ "model_type": "shared-components" }),
         generation: None,
+        preprocessor: None,
         store: store.build(),
     }
 }
@@ -423,7 +429,10 @@ fn shared_model() -> Box<dyn Model> {
     let mut registry = Registry::empty();
     registry.register(SHARED_ENTRY).unwrap();
     let fixture = shared_fixture();
-    registry.build(&fixture.raw(), &fixture.store).unwrap()
+    registry
+        .build(&fixture.raw(), &fixture.store)
+        .unwrap()
+        .model
 }
 
 #[test]

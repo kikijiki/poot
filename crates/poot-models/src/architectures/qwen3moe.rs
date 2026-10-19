@@ -32,7 +32,7 @@ use crate::names::gguf::{GGUF_BASE, GGUF_QK_NORM};
 use crate::names::{
     ExpertNames, HF_BASE, HF_QK_NORM, MoeLayers, MoeNames, family_weights_routed, hf_base_shapes,
 };
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("qwen3moe");
@@ -259,7 +259,7 @@ pub(crate) struct Qwen3Moe {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = Qwen3MoeParams::from_raw(raw)?;
     let (tables, names): ([&[_]; 2], &MoeNames) = match raw.source() {
         ConfigSource::HfModelType => ([HF_BASE, HF_QK_NORM], &HF_MOE),
@@ -311,14 +311,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Qwen3Moe {
+    Ok(ModelParts::new(Box::new(Qwen3Moe {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Qwen3Moe {
@@ -457,6 +457,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -633,6 +634,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -700,6 +702,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config: &config,
             generation: None,
+            preprocessor: None,
         };
         assert_eq!(Qwen3MoeParams::from_raw(&raw).unwrap().sparse, [true, true]);
     }
@@ -716,6 +719,7 @@ mod tests {
             let raw = RawConfig::HfJson {
                 config: &config,
                 generation: None,
+                preprocessor: None,
             };
             Qwen3MoeParams::from_raw(&raw).unwrap().sparse
         };
@@ -804,7 +808,7 @@ mod tests {
             [false, true]
         );
         let experts = WeightId::layer(1, WeightRole::Moe(MoeRole::Stack(ExpertProj::Gate)));
-        let handle = model.weights().handle(experts).unwrap();
+        let handle = model.model.weights().handle(experts).unwrap();
         assert!(matches!(
             handle.format,
             poot_quant::weights::HandleFormat::Packed(_)
@@ -814,13 +818,13 @@ mod tests {
             3,
             "the experts are one stack: {handle:?}"
         );
-        assert_eq!(model.config().eos, BTreeSet::from([47]));
+        assert_eq!(model.model.config().eos, BTreeSet::from([47]));
         let reference = model_of(&fixture_config(), &reference_store);
         let prompt = [3, 17, 40, 8];
-        let (got, state) = run_step(&*model, &store, CAP, &prompt, 0, &[]);
+        let (got, state) = run_step(&*model.model, &store, CAP, &prompt, 0, &[]);
         let (want, want_state) = run_step(&*reference, &reference_store, CAP, &prompt, 0, &[]);
         close(&got, &want);
-        let (got, _) = run_step(&*model, &store, CAP, &[5], 4, &state);
+        let (got, _) = run_step(&*model.model, &store, CAP, &[5], 4, &state);
         let (want, _) = run_step(&*reference, &reference_store, CAP, &[5], 4, &want_state);
         close(&got, &want);
     }

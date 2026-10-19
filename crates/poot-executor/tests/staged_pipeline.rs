@@ -165,11 +165,11 @@ impl Device for FakeDevice {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<u32>, Injected> {
+    fn finish(&mut self) -> Result<u32, Injected> {
         self.control.log.borrow_mut().push(Event::Finish);
         self.recordings += 1;
         self.recorded.push(self.dispatched);
-        Ok(Some(self.recordings))
+        Ok(self.recordings)
     }
 
     fn begin_step(&mut self) -> Result<(), Injected> {

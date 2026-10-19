@@ -109,7 +109,7 @@ impl<D: Device> Device for ShortActivations<D> {
     fn copy(&mut self, src: &Self::Buffer, dst: &Self::Buffer) -> Result<(), Self::Error> {
         self.inner.copy(src, dst)
     }
-    fn finish(&mut self) -> Result<Option<Self::Recording>, Self::Error> {
+    fn finish(&mut self) -> Result<Self::Recording, Self::Error> {
         self.inner.finish()
     }
     fn begin_step(&mut self) -> Result<(), Self::Error> {

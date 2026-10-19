@@ -67,7 +67,7 @@ mod upload;
 pub use aql::{DeviceRingReceiptProvenance, DispatchAxis, DispatchGeometryViolation};
 pub use buffer::RocmBuffer;
 pub use context::{DispatchSpan, RocmContext, RocmContextOptions, UploadStrategy};
-pub use error::{HsaStatus, RocmError};
+pub use error::{DeviceFault, HsaStatus, RocmError};
 pub use hsaco::{BoundKernarg, HsacoModule, KernelHandle};
 pub use publication::{
     DeviceStoreFence, QueueHostLink, QueueHostTarget, QueuePublicationContract,

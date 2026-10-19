@@ -411,7 +411,6 @@ mod tests {
     /// `compile_schedule` stack, which made this an external-only consumer that `pub(crate)` cannot
     /// serve). The enabling capability for the fused tensor-core dequant gemm.
     #[test]
-    #[ignore = "probe: compiles wmma_loadlds_probe, checks the LDS WMMA load"]
     fn wmma_loadlds_nvptx() {
         let dir = std::env::temp_dir().join("poot-wmma-lds");
         std::fs::create_dir_all(&dir).unwrap();

@@ -55,7 +55,7 @@ fn qwen35_stored_as(variant: &str) -> (Box<dyn Model>, Fixture) {
         }
     };
     let model = (entry.build)(&fixture.raw(), &fixture.store).expect("the fixture builds");
-    (model, fixture)
+    (model.model, fixture)
 }
 
 fn shape(tokens: usize) -> StepShape {

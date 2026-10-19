@@ -1,28 +1,25 @@
-//! The image side of a vision-language checkpoint: the vision tower's driver on a thread of its own,
-//! beside the engine thread that serves the text tower.
+//! The image side of a vision-language checkpoint: the model's front end and its towers' drivers on a
+//! thread of their own, beside the engine thread that serves the text model.
 //!
 //! A chat request with images is lowered here to what the engine already takes: the prompt's token ids
-//! and the request inputs the text model declares, the embedding rows that replace its `<image>`
-//! placeholders among them ([`PromptInput`]). The
-//! tower runs one `Encode` step per frame, so a request's images are encoded off the engine thread and
-//! the engine's decode loop never waits for them. An executor is not `Send`, so the driver is built
+//! and the request inputs the text model declares, the embedding rows that replace its image
+//! placeholders among them ([`PromptInput`]). The towers run one `Encode` step per item, so a request's
+//! images are encoded off the engine thread and the engine's decode loop never waits for them. An executor is not `Send`, so the driver is built
 //! on the worker thread and only the requests and their results cross it.
 //!
 //! [`PromptInput`]: crate::types::PromptInput
 
 use std::io::Cursor;
-use std::num::{NonZeroU64, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use poot_graph_plan::{CompileLimits, CompileOptions};
-use poot_llm::driver::{
-    BackendChoice, DraftPolicy, DriverOptions, PreparedSetLimits, open_executor, program_retention,
-};
-use poot_llm::{ChatTurn, ImageCheckpoint, ImageFrontEnd, ImageRequestError, MultimodalPrompt};
+use poot_llm::driver::{BackendChoice, ModelHandle, open_executor};
+use poot_llm::{FrontEndSession, tower_options};
+use poot_models::multimodal::front_end::{ChatTurn, FrontEndError, Prepared};
 
 use crate::api::RefusedRequest;
 use crate::batch::engine::panic_reason;
@@ -54,7 +51,7 @@ pub(crate) struct ImageTurn {
 struct VisionJob {
     images: Vec<Vec<u8>>,
     turns: Vec<ImageTurn>,
-    reply: Sender<Result<MultimodalPrompt, ImageRequestError>>,
+    reply: Sender<Result<Prepared, FrontEndError>>,
 }
 
 /// What a connection thread holds of the image front end: the queue to the vision thread.
@@ -78,40 +75,42 @@ pub(crate) enum ImageError {
     Interrupted(GenerationError),
 }
 
-/// The driver options of the vision tower: a frame is one `Encode` step, so the capacity and the
-/// prefill piece are both the frame's patches.
-fn vision_options(patches: usize) -> DriverOptions {
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
-    let patches = NonZeroUsize::new(patches).expect("a frame has patches");
-    DriverOptions {
-        prefill: compile.clone(),
-        decode: compile,
-        capacity: patches,
-        prefill_chunk: patches,
-        trace: poot_llm::driver::serving_trace_limits(patches),
-        prepared: PreparedSetLimits {
-            max_entries: NonZeroUsize::new(64).expect("nonzero"),
-            max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
-        },
-        charge: program_retention,
-        draft: DraftPolicy::Off,
-        hidden_window: None,
+/// What the vision thread runs: the lowering of a conversation's encoded images to a prompt. A
+/// [`FrontEndSession`] is the production one; a row of the serving tests supplies its own.
+pub(crate) trait ImageLowering {
+    /// Decode `images` (PNG or JPEG bytes, in the order of the turns), run the model's towers on them
+    /// and render the conversation `turns` into the prompt.
+    fn prepare(
+        &mut self,
+        images: &[&[u8]],
+        turns: &[ChatTurn<'_>],
+    ) -> Result<Prepared, FrontEndError>;
+}
+
+impl ImageLowering for FrontEndSession {
+    fn prepare(
+        &mut self,
+        images: &[&[u8]],
+        turns: &[ChatTurn<'_>],
+    ) -> Result<Prepared, FrontEndError> {
+        self.prepare_images(images, turns)
     }
 }
 
-/// Start the vision thread for `checkpoint` on `backend` and wait for its driver to open, so a device
-/// that refuses the tower is a startup error before the listener binds.
+/// Start the vision thread for `model` on `backend` and wait for its towers' drivers to open, so a device
+/// that refuses a tower is a startup error before the listener binds.
 pub(crate) fn spawn_image_front_end(
     workers: &mut WorkerRegistry,
     health: &EngineHealth,
-    checkpoint: std::sync::Arc<dyn ImageCheckpoint>,
+    model: Arc<ModelHandle>,
     backend: BackendChoice,
 ) -> Result<ImageClient> {
     spawn_vision_thread(workers, health, IMAGE_PREPARE_DEADLINE, move || {
-        let executor = open_executor(backend).map_err(anyhow::Error::from)?;
-        checkpoint
-            .front_end((executor, vision_options(checkpoint.patches())))
-            .map_err(anyhow::Error::from)
+        let session = FrontEndSession::open(model, |_, positions| {
+            Ok::<_, anyhow::Error>((open_executor(backend)?, tower_options(positions)))
+        })?
+        .context("the model takes no images")?;
+        Ok(Box::new(session))
     })
 }
 
@@ -122,7 +121,7 @@ pub(crate) fn spawn_vision_thread(
     workers: &mut WorkerRegistry,
     health: &EngineHealth,
     deadline: Duration,
-    open: impl FnOnce() -> Result<Box<dyn ImageFrontEnd>> + Send + 'static,
+    open: impl FnOnce() -> Result<Box<dyn ImageLowering>> + Send + 'static,
 ) -> Result<ImageClient> {
     let (jobs_tx, jobs_rx) = mpsc::channel::<VisionJob>();
     let (started_tx, started_rx) = mpsc::channel::<Result<()>>();
@@ -160,7 +159,7 @@ pub(crate) fn spawn_vision_thread(
 }
 
 /// Lower jobs until every sender is gone.
-fn run_vision_thread(front_end: &mut dyn ImageFrontEnd, jobs: &mpsc::Receiver<VisionJob>) {
+fn run_vision_thread(front_end: &mut dyn ImageLowering, jobs: &mpsc::Receiver<VisionJob>) {
     while let Ok(job) = jobs.recv() {
         let images: Vec<&[u8]> = job.images.iter().map(Vec::as_slice).collect();
         let turns: Vec<_> = job
@@ -168,7 +167,7 @@ fn run_vision_thread(front_end: &mut dyn ImageFrontEnd, jobs: &mpsc::Receiver<Vi
             .iter()
             .map(|turn| ChatTurn {
                 role: &turn.role,
-                images: turn.images,
+                media: turn.images,
                 text: &turn.text,
             })
             .collect();
@@ -247,7 +246,7 @@ impl ImageClient {
         urls: &[String],
         turns: Vec<ImageTurn>,
         client_gone: ClientGone<'_>,
-    ) -> Result<MultimodalPrompt, ImageError> {
+    ) -> Result<Prepared, ImageError> {
         let images = admit_images(urls, image_bytes)?;
         let (reply, answer) = mpsc::channel();
         self.jobs
@@ -259,16 +258,16 @@ impl ImageClient {
             .map_err(|_| ImageError::Failed("the vision thread is gone".into()))?;
         let prepared = self.await_answer(&answer, client_gone)?;
         prepared.map_err(|error| match error {
-            ImageRequestError::Refused(reason) => RefusedRequest(reason).into(),
-            failed @ ImageRequestError::Failed(_) => ImageError::Failed(failed.to_string()),
+            FrontEndError::Refused(reason) => RefusedRequest(reason).into(),
+            failed @ FrontEndError::Failed(_) => ImageError::Failed(failed.to_string()),
         })
     }
 
     fn await_answer(
         &self,
-        answer: &mpsc::Receiver<Result<MultimodalPrompt, ImageRequestError>>,
+        answer: &mpsc::Receiver<Result<Prepared, FrontEndError>>,
         client_gone: ClientGone<'_>,
-    ) -> Result<Result<MultimodalPrompt, ImageRequestError>, ImageError> {
+    ) -> Result<Result<Prepared, FrontEndError>, ImageError> {
         let deadline = Instant::now() + self.deadline;
         loop {
             if drain_cancellation_requested() {

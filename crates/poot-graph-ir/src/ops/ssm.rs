@@ -1,9 +1,8 @@
-use super::{
-    BinOp, Builder, BuilderError, Requirement, Scalar, Traced, UnOp, decay_mask_from_cumlog,
-    linear_attention_prefill,
-};
+use super::{BinOp, Builder, BuilderError, Requirement, Scalar, Traced, UnOp};
 #[cfg(any(test, feature = "test-support"))]
 use super::{RedOp, repeat_kv};
+#[cfg(any(test, feature = "test-support"))]
+use super::{decay_mask_from_cumlog, linear_attention_prefill};
 
 /// Gated linear-attention decode (card 038), the decode step of linear attention (Qwen3.5 /
 /// MiniMax-style recurrence): each head carries a fixed-size recurrent state matrix
@@ -105,6 +104,7 @@ pub fn mamba2_ssd_decode(
 /// SSM state), `tril[1,Hq,L,L]` (lower-triangular ones including the diagonal, per-head-broadcast, as
 /// [`decay_mask_from_cumlog`] expects). Returns `(y[1,Hq,L,P], h_out[1,Hq,N,P])`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn mamba2_ssd_prefill(
     b: &Builder,
     x: Traced,
@@ -153,6 +153,7 @@ pub fn mamba2_ssd_prefill(
 /// exactly `mamba2_ssd_prefill`; a longer one is the same recurrence with the O(L^2) mask bounded to
 /// `chunk^2`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn scan_ssd_packed(
     b: &Builder,
     x: Traced,

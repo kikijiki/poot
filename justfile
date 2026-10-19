@@ -37,7 +37,8 @@ nextest := "cargo nextest run --no-tests=fail --no-fail-fast --lib --bins --test
 
 # The directory that holds the checkpoints model tests load. A test finds a model only through
 # POOT_MODELS_DIR (there is no default in test code), so the checkpoint lanes set it here, where a developer
-# sees it: override it in the environment. A model missing from it still skips, with its name printed.
+# sees it: override it in the environment. Outside the checkpoint lanes a model missing from it skips, with its name
+# printed; the checkpoint lanes also set POOT_REQUIRE_MODELS=1, which makes a missing model a failure.
 models_dir := env("POOT_MODELS_DIR", home_directory() / "models")
 
 # The default lane covers every workspace package except those that need a device (`gate_policy` in
@@ -63,7 +64,7 @@ test-bench-runner:
     scripts/test-model-free.sh run-isolated {{isolated_package}}
 
 # Fail when a test runs in no lane. A test is covered when it is model-free or real-dims (the model-free lane), a
-# checkpoint test (`just test-optional` and the checkpoint recipes, with a model), or matched by one of the
+# checkpoint test (a row of scripts/required-checkpoint-cases.txt, run by the `test-checkpoint*` recipes), or matched by one of the
 # selections above; a device test or a test of a package outside the inventory that matches none is the gap this
 # gate exists to close (card 1058: 155 of 239 poot-wgpu-device tests once ran nowhere).
 test-lane-coverage:
@@ -182,14 +183,98 @@ feature-matrix-regen:
 test-real-dims:
     scripts/test-model-free.sh run-real-dims --release
 
-# Optional broad coverage. Successful-test output is shown because many optional model/device tests pass
-# after printing a runtime SKIP. This lane does not prove hardware coverage, and ignored tests (including
-# large checkpoints) stay ignored.
+# Checkpoint lanes. A lane's rows are listed by hand: scripts/required-checkpoint-cases.txt for the CPU lanes,
+# scripts/required-device-cases/checkpoint-<backend>.txt for the device lanes (the required-case gate reads those
+# too). Each recipe runs its lane's rows by exact name (an `#[ignore]`d row too: `--run-ignored all` is safe only
+# because the filterset names every row) with POOT_REQUIRE_MODELS=1, so a model missing from the models directory
+# fails its row instead of printing a SKIP. A device lane also requires its backend and runs the required-case
+# gate, which fails a row that skipped. `test-lane-coverage` fails when a checkpoint test or an ignored test is
+# in no lane's list and when a listed row names no test.
 
-# optional broad coverage: every workspace test and doctest, device tests skipping without a device
-test-optional:
-    POOT_MODELS_DIR={{models_dir}} cargo nextest run --workspace --lib --bins --tests --no-fail-fast --success-output final
-    cargo test --workspace --doc
+# checkpoint lane: CPU rows over the small checkpoints in the models directory; a missing model fails
+test-checkpoint:
+    POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --run-ignored all -p poot-llm -p poot-load -p poot-serve \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint)"
+
+# rows that read a 20B+ checkpoint (never on the dev box: a pod or host that holds the checkpoints and the memory)
+test-checkpoint-large:
+    POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --run-ignored all -p poot-llm -p poot-load -p poot-models \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large)"
+
+# every real-checkpoint device row on wgpu, wgpu and the models required, then the required-case gate
+test-checkpoint-wgpu:
+    scripts/check-required-cases.py --self-test
+    scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
+        env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --profile device-checkpoint-wgpu --run-ignored all -p poot-llm \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-wgpu)"
+    scripts/check-required-cases.py checkpoint-wgpu
+
+# every real-checkpoint device row on ROCm, ROCm and the models required, then the required-case gate
+test-checkpoint-rocm:
+    scripts/check-required-cases.py --self-test
+    scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
+        env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --profile device-checkpoint-rocm --run-ignored all -p poot-llm --features poot-llm/rocm \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-rocm)"
+    scripts/check-required-cases.py checkpoint-rocm
+
+# every real-checkpoint device row on PTX (an NVIDIA pod that holds the models), then the required-case gate
+test-checkpoint-ptx:
+    scripts/check-required-cases.py --self-test
+    scripts/with-required-backend.sh POOT_REQUIRE_PTX \
+        env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --profile device-checkpoint-ptx --run-ignored all -p poot-llm \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-ptx)"
+    scripts/check-required-cases.py checkpoint-ptx
+
+# the real-checkpoint row on the raw Vulkan device, then the required-case gate
+test-checkpoint-vulkan:
+    scripts/check-required-cases.py --self-test
+    scripts/with-required-backend.sh POOT_REQUIRE_VULKAN \
+        env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --profile device-checkpoint-vulkan --run-ignored all -p poot-llm \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-vulkan)"
+    scripts/check-required-cases.py checkpoint-vulkan
+
+# the 20B+ device rows on wgpu: NEVER on the dev box (a pod or host with the checkpoints and the memory)
+test-checkpoint-large-wgpu:
+    scripts/check-required-cases.py --self-test
+    scripts/with-required-backend.sh POOT_REQUIRE_WGPU \
+        env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --profile device-checkpoint-large-wgpu --run-ignored all -p poot-llm \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large-wgpu)"
+    scripts/check-required-cases.py checkpoint-large-wgpu
+
+# the 20B+ device rows on ROCm: NEVER on the dev box
+test-checkpoint-large-rocm:
+    scripts/check-required-cases.py --self-test
+    scripts/with-required-backend.sh POOT_REQUIRE_ROCM \
+        env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --profile device-checkpoint-large-rocm --run-ignored all -p poot-llm --features poot-llm/rocm \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large-rocm)"
+    scripts/check-required-cases.py checkpoint-large-rocm
+
+# the 20B+ device rows on PTX (an NVIDIA pod with the memory for them)
+test-checkpoint-large-ptx:
+    scripts/check-required-cases.py --self-test
+    scripts/with-required-backend.sh POOT_REQUIRE_PTX \
+        env POOT_MODELS_DIR={{models_dir}} POOT_REQUIRE_MODELS=1 \
+        {{nextest}} --profile device-checkpoint-large-ptx --run-ignored all -p poot-llm \
+        -E "$(scripts/check-lane-coverage.py --lane-filter checkpoint-large-ptx)"
+    scripts/check-required-cases.py checkpoint-large-ptx
+
+# the real-dimension rows too slow for `test-real-dims` (minutes on the CPU oracle), in release
+test-real-dims-long:
+    {{nextest}} --release --run-ignored all -p poot-eval -p poot-models \
+        -E "$(scripts/check-lane-coverage.py --lane-filter real-dims-long)"
+
+# the rows that need the pinned Peano llc and the IRON link driver; without them the compile is a typed error
+test-npu-toolchain:
+    nix develop .#npu -c {{nextest}} --run-ignored all -p poot-kernelgen \
+        -E "$(scripts/check-lane-coverage.py --lane-filter npu-toolchain)"
 
 # Device-lane selection. Each lane's nextest filterset is defined once, here, and used twice: by the lane
 # recipe, and by `test-lane-coverage`, which fails when a device test (or any test of a package the
@@ -400,7 +485,7 @@ bench:
 # `poot_graph_plan::MANIFEST`, the one list (card 559; `committed_assets_match_their_kernel_sources`
 # checks the same list and fails if an asset goes stale).
 regen-kernel-assets:
-    cargo test -p pootc --test import_run regen_kernel_assets -- --ignored
+    cargo nextest run --no-tests=fail --test import_run --run-ignored all -p pootc -E "$(scripts/check-lane-coverage.py --lane-filter regen-kernel-assets)"
 
 # ---- docs hygiene -----------------------------------------------------------
 

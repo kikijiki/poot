@@ -37,7 +37,7 @@ use crate::components::standard::{
 use crate::io::{ModelSchema, StateSpec};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::{ExpertNames, MoeNames, SharedNames, map_moe_layer};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 /// Qwen3-Next's [`FamilyKey`].
@@ -531,7 +531,7 @@ fn names_of(raw: &RawConfig<'_>) -> &'static Names {
     }
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = Qwen3NextParams::from_raw(raw)?;
     let weights = weights_of(&p, store, names_of(raw))?;
     let weight_error = |e: WeightError| e.for_family(FAMILY);
@@ -573,14 +573,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::ChatML,
     };
-    Ok(Box::new(Qwen3Next {
+    Ok(ModelParts::new(Box::new(Qwen3Next {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Qwen3Next {
@@ -776,6 +776,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -917,6 +918,7 @@ mod tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match (ENTRY.build)(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),
@@ -1026,6 +1028,7 @@ mod tests {
             Qwen3NextParams::from_raw(&RawConfig::HfJson {
                 config,
                 generation: None,
+                preprocessor: None,
             })
             .unwrap()
             .kinds
@@ -1297,13 +1300,13 @@ mod tests {
             let raw = RawConfig::Gguf(&index);
             assert_eq!(registry.resolve(&raw).unwrap().family, FAMILY);
             let gguf = registry.build(&raw, &store).unwrap();
-            let (got, state) = run_step(&*gguf, &store, CAP, &prompt, 0, &[]);
+            let (got, state) = run_step(&*gguf.model, &store, CAP, &prompt, 0, &[]);
             close(&got, &want);
             // The carried tensors differ in value-head order, so only the logits and the attention
             // cache are comparable: the cache is the last two state values.
             let kv = want_state.len() - 2;
             close_all(&state[kv..], &want_state[kv..]);
-            let (got, _) = run_step(&*gguf, &store, CAP, &[5], 6, &state);
+            let (got, _) = run_step(&*gguf.model, &store, CAP, &[5], 6, &state);
             close(&got, &want_decode);
         }
     }

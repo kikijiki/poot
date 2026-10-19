@@ -27,7 +27,7 @@ use crate::io::ModelSchema;
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
 use crate::names::gguf::{GGUF_BASE, GGUF_SANDWICH_NORMS};
 use crate::names::{HF_BASE, HF_SANDWICH_NORMS, family_weights, hf_base_shapes};
-use crate::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
+use crate::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
 use poot_text::ChatFormat;
 
 /// The Gemma vocabulary's `<bos>` id, for a config that names none.
@@ -210,7 +210,7 @@ pub(crate) struct Gemma2 {
     schema: ModelSchema,
 }
 
-fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, ModelError> {
+fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<ModelParts, ModelError> {
     let p = Gemma2Params::from_raw(raw)?;
     let tables: [&[_]; 2] = match raw.source() {
         ConfigSource::HfModelType => [HF_BASE, HF_SANDWICH_NORMS],
@@ -243,14 +243,14 @@ fn build(raw: &RawConfig<'_>, store: &WeightStore) -> Result<Box<dyn Model>, Mod
         prefill_granule: NonZeroUsize::MIN,
         chat: ChatFormat::Gemma,
     };
-    Ok(Box::new(Gemma2 {
+    Ok(ModelParts::new(Box::new(Gemma2 {
         params: p,
         weights,
         stack,
         layers,
         config,
         schema,
-    }))
+    })))
 }
 
 impl Model for Gemma2 {
@@ -350,6 +350,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         built(&ENTRY, &raw, store)
     }
@@ -487,6 +488,7 @@ mod family_tests {
         let raw = RawConfig::HfJson {
             config,
             generation: None,
+            preprocessor: None,
         };
         match build(&raw, &fixture().store) {
             Err(ModelError::Config { field, reason, .. }) => (field, reason),

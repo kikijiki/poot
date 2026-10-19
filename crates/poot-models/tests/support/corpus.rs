@@ -1,8 +1,9 @@
 //! The fixture corpus the plan-summary gate and the feature matrix compile.
 //!
 //! The registered part is not a list: it is `Registry::builtin().entries()` crossed with each entry's
-//! fixture (and its option fixtures) and the programs the fixture traces. A family registered with a
-//! fixture joins the corpus, and so the matrix, with no edit here.
+//! fixture (and its option fixtures), the towers of the model container each fixture builds
+//! (`<family>/<tower>`), and the programs each model traces. A family registered with a fixture joins
+//! the corpus, and so the matrix, with no edit here.
 //!
 //! The `parity` rows are the dense checkpoints `poot_models::test_support::dense` builds, at configurations the
 //! registered fixtures do not cover (a bias, a mixed-width bf16 upload, a batched decode).
@@ -88,16 +89,37 @@ const ENCODE: Shape = Shape {
 pub(crate) struct Fixtured {
     /// The family key, or `family/variant` for one of the family's option fixtures.
     pub label: String,
+    /// The config JSON the model reads: the fixture's own for the served model, its `vision_config` for a
+    /// tower.
+    pub config: serde_json::Value,
     model: Arc<dyn Model>,
     shapes: Vec<Shape>,
 }
 
 impl Fixtured {
-    fn build(label: String, entry: &FamilyEntry, fixture: poot_models::registry::Fixture) -> Self {
-        let model: Arc<dyn Model> = Arc::from(
-            (entry.build)(&fixture.raw(), &fixture.store)
-                .unwrap_or_else(|e| panic!("{label}: the fixture does not build: {e}")),
-        );
+    /// The corpus rows of a fixture's model container: its served model, then each tower under
+    /// `<label>/<tower>`.
+    fn build(
+        label: String,
+        entry: &FamilyEntry,
+        fixture: poot_models::registry::Fixture,
+    ) -> Vec<Self> {
+        let parts = (entry.build)(&fixture.raw(), &fixture.store)
+            .unwrap_or_else(|e| panic!("{label}: the fixture does not build: {e}"));
+        let towers = parts.towers.into_iter().map(|tower| {
+            Self::of(
+                format!("{label}/{}", tower.id),
+                fixture.config["vision_config"].clone(),
+                tower.model,
+            )
+        });
+        std::iter::once(Self::of(label.clone(), fixture.config.clone(), parts.model))
+            .chain(towers)
+            .collect()
+    }
+
+    fn of(label: String, config: serde_json::Value, model: Box<dyn Model>) -> Self {
+        let model: Arc<dyn Model> = Arc::from(model);
         let schema = model.schema();
         let program = schema
             .step()
@@ -128,6 +150,7 @@ impl Fixtured {
         };
         Self {
             label,
+            config,
             model,
             shapes,
         }
@@ -172,13 +195,13 @@ fn encode_step(tokens: usize) -> StepShape {
 pub(crate) fn fixtured(registry: &Registry) -> Vec<Fixtured> {
     let mut out = Vec::new();
     for entry in registry.entries() {
-        out.push(Fixtured::build(
+        out.extend(Fixtured::build(
             entry.family.as_str().to_string(),
             entry,
             (entry.fixture)(),
         ));
         for (variant, make) in entry.variants {
-            out.push(Fixtured::build(
+            out.extend(Fixtured::build(
                 format!("{}/{variant}", entry.family.as_str()),
                 entry,
                 make(),
