@@ -4,38 +4,14 @@
 //! [`Driver`] over an executor of its own, with the tower's positions as its capacity, so the engine
 //! that serves the text model fits its workload to the memory the towers left.
 
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 
 use poot_executor::Executor;
-use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_models::io::RequestInputs;
 use poot_models::multimodal::front_end::{TowerError, TowerId, Towers};
 
 use crate::driver::error::DriverError;
-use crate::driver::{
-    DraftPolicy, Driver, DriverOptions, EncodeRequest, EncodeRow, ModelHandle, PreparedSetLimits,
-    program_retention, serving_trace_limits,
-};
-
-/// The driver options of a tower of `positions` positions: an `encode` step is stateless and takes the
-/// tower's whole extent, so the capacity and the prefill piece are both `positions`.
-pub fn tower_options(positions: NonZeroUsize) -> DriverOptions {
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
-    DriverOptions {
-        prefill: compile.clone(),
-        decode: compile,
-        capacity: positions,
-        prefill_chunk: positions,
-        trace: serving_trace_limits(positions),
-        prepared: PreparedSetLimits {
-            max_entries: NonZeroUsize::new(64).expect("nonzero"),
-            max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
-        },
-        charge: program_retention,
-        draft: DraftPolicy::Off,
-        hidden_window: None,
-    }
-}
+use crate::driver::{Driver, DriverOptions, EncodeRequest, EncodeRow, ModelHandle};
 
 /// One driver per tower of a loaded model.
 pub struct TowerDrivers {
@@ -44,7 +20,7 @@ pub struct TowerDrivers {
 
 impl TowerDrivers {
     /// Open a driver for each tower of `handle`. `open` supplies the executor and driver options of a
-    /// tower from the tower's name and its positions (usually [`tower_options`] over a fresh executor);
+    /// tower from the tower's name and its positions (usually [`DriverOptions::tower`] over a fresh executor);
     /// an executor refusal is `open`'s error, a driver refusal converts into `E`.
     pub fn open<E: From<DriverError>>(
         handle: &ModelHandle,

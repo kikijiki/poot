@@ -2,11 +2,15 @@
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod device_skip;
+mod dl;
 mod identity;
 mod kernel;
 mod memory;
+mod ring;
 pub mod telemetry;
 mod vpu;
+pub mod vulkan_probe;
+pub use dl::{DlError, Library, LoadScope};
 pub use identity::DeviceIdentity;
 pub use kernel::{
     AieArena, AieArtifactError, AieBinding, AieLinkedArtifact, AieShapeAbi, ArgAccess, ArgSchema,
@@ -15,6 +19,7 @@ pub use kernel::{
 #[cfg(any(test, feature = "test-support"))]
 pub use kernel::{AieBindError, AieBound, check_aie_bindings};
 pub use memory::{AllocGuard, BufferRole, MemoryCounterSnapshot, MemoryCounters};
+pub use ring::{RING_SLOTS, RingCursor, UPLOAD_CHUNK_BYTES, chunks, overlaps, slot_bytes};
 pub use telemetry::{
     CallCounts, CallPurpose, Coverage, ExecutionCounters, TransferCounts, TransferDirection,
 };

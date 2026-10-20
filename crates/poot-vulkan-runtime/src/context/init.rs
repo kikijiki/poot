@@ -1,10 +1,12 @@
+use super::select::{DeviceFacts, pick_device};
 use crate::driver::AshResourceDispatch;
 use crate::features::DeviceFeatures;
 use crate::resources::require_gpu_check;
-use crate::util::{bytemuck_cast_i8_to_u8, find_memory_type};
+use crate::util::bytemuck_cast_i8_to_u8;
 use crate::validation::Validation;
 use crate::{Context, DeviceOwner, RuntimeError, validation};
 use ash::vk;
+use poot_runtime_common::vulkan_probe::{amd_vulkan_compute_units, device_local_heap_budget};
 use poot_runtime_common::{BufferRole, MemoryCounterSnapshot};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,9 +31,9 @@ impl Default for ContextOptions {
 }
 
 impl Context {
-    /// Create a Vulkan instance (no surface/swapchain), pick the first physical device with a
-    /// `VK_QUEUE_COMPUTE_BIT` queue family (no graphics/present requirement, spec 133 FR-002), and open a
-    /// logical device and queue on it.
+    /// Create a Vulkan instance (no surface/swapchain), pick the best-ranked physical device with a
+    /// `VK_QUEUE_COMPUTE_BIT` queue family (no graphics/present requirement, spec 133 FR-002) and a
+    /// mappable device-local memory type (see `select`), and open a logical device and queue on it.
     pub fn new() -> Result<Self, RuntimeError> {
         Self::new_with_options(ContextOptions::default())
     }
@@ -97,23 +99,29 @@ impl Context {
                 return Err(e.into());
             }
         };
-        let mut chosen: Option<(vk::PhysicalDevice, u32)> = None;
-        for &pd in &physical_devices {
-            // SAFETY: `pd` came from `enumerate_physical_devices` on this same `instance`.
-            let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
-            if let Some(idx) = families
-                .iter()
-                .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            {
-                chosen = Some((pd, idx as u32));
-                break;
+        let facts: Vec<DeviceFacts> = physical_devices
+            .iter()
+            .map(|&pd| {
+                // SAFETY: `pd` came from `enumerate_physical_devices` on this same `instance`.
+                unsafe {
+                    DeviceFacts {
+                        device_type: instance.get_physical_device_properties(pd).device_type,
+                        queue_families: instance.get_physical_device_queue_family_properties(pd),
+                        memory: instance.get_physical_device_memory_properties(pd),
+                    }
+                }
+            })
+            .collect();
+        let picked = match pick_device(&facts) {
+            Ok(picked) => picked,
+            Err(refusal) => {
+                // SAFETY: no device/queue was ever created from this instance; this is its sole owner.
+                unsafe { instance.destroy_instance(None) };
+                return Err(refusal);
             }
-        }
-        let Some((physical_device, queue_family_index)) = chosen else {
-            // SAFETY: no device/queue was ever created from this instance; this is its sole owner.
-            unsafe { instance.destroy_instance(None) };
-            return Err(RuntimeError::NoComputeDevice);
         };
+        let (physical_device, queue_family_index) =
+            (physical_devices[picked.device], picked.queue_family);
 
         // SAFETY: `physical_device` is from this instance's own enumeration.
         let device_extensions =
@@ -211,23 +219,12 @@ impl Context {
             options.wait_timeout,
         ));
 
-        // Confirm a HOST_VISIBLE|HOST_COHERENT memory type exists (FR-003's UMA path) before returning a `Context` whose first buffer alloc would fail.
         // SAFETY: `physical_device` is valid for this instance.
         let mem_props = unsafe {
             owner
                 .instance
                 .get_physical_device_memory_properties(physical_device)
         };
-        if find_memory_type(
-            &mem_props,
-            u32::MAX,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .is_none()
-        {
-            // `owner` is still unique, so its drop tears down device then instance while retaining Entry.
-            return Err(RuntimeError::NoHostVisibleMemory);
-        }
 
         // SAFETY: `physical_device` is valid for this instance.
         let props = unsafe {
@@ -251,8 +248,8 @@ impl Context {
         let max_workgroup_count = props.limits.max_compute_work_group_count;
 
         // Card 522 review M1: measured once here, from the same `props`/`mem_props` queries this
-        // constructor already made (the `mem_props` above, queried for the HOST_VISIBLE|HOST_COHERENT
-        // check, carries the same heap data a device-local-max query would); `Context::device_caps`
+        // constructor already made (the `mem_props` above, queried for the memory
+        // type, carries the same heap data a device-local-max query would); `Context::device_caps`
         // returns this stored value forever after, never re-querying the driver.
         let device_local_max = mem_props.memory_heaps[..mem_props.memory_heap_count as usize]
             .iter()
@@ -272,7 +269,7 @@ impl Context {
         let (max_buffer_bytes, watchdog_budget, known_miscompiles) = if is_amd_radv {
             let d = poot_target::DeviceCaps::wgpu_rdna3_igpu();
             (
-                measured_max_buffer.min(poot_wgpu_runtime::AMD_RADV_SAFE_MAX_BUFFER_BYTES),
+                measured_max_buffer.min(poot_target::AMD_RADV_SAFE_MAX_BUFFER_BYTES),
                 d.watchdog_budget,
                 d.known_miscompiles,
             )
@@ -294,10 +291,8 @@ impl Context {
         // Card 653: AMD's shader-core properties where the driver exposes them, else
         // the RDNA3 default, as the wgpu runtime does.
         // SAFETY: `physical_device` is from this instance's own enumeration.
-        let compute_units = unsafe {
-            poot_wgpu_runtime::amd_vulkan_compute_units(&owner.instance, physical_device)
-        }
-        .unwrap_or(poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units);
+        let compute_units = unsafe { amd_vulkan_compute_units(&owner.instance, physical_device) }
+            .unwrap_or(poot_target::DeviceCaps::wgpu_rdna3_igpu().compute_units);
         // SAFETY: `physical_device` is from this instance's own enumeration; the extension list was
         // read from the same device.
         let subgroup = unsafe {
@@ -422,49 +417,9 @@ impl Context {
         self.memory_budget.then(|| {
             // SAFETY: `physical_device` is from this instance's own enumeration, and `memory_budget` says the
             // device implements `VK_EXT_memory_budget`.
-            let heaps = unsafe { device_local_heap_budget(&self.instance, self.physical_device) };
-            heaps.budget.saturating_sub(heaps.usage)
+            unsafe { device_local_heap_budget(&self.instance, self.physical_device) }.free()
         })
     }
-}
-
-/// The summed `VK_EXT_memory_budget` figures of a device's device-local heaps.
-struct HeapBudget {
-    /// What the OS lets this process use.
-    budget: u64,
-    /// What this process already holds.
-    usage: u64,
-}
-
-/// The device-local heaps' budget and usage, in one `VK_EXT_memory_budget` read.
-///
-/// # Safety
-/// `physical_device` must come from `instance`'s own enumeration, and the device must implement
-/// `VK_EXT_memory_budget`.
-unsafe fn device_local_heap_budget(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-) -> HeapBudget {
-    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-    // SAFETY: the caller's contract; `props2` and its chain outlive the call.
-    unsafe { instance.get_physical_device_memory_properties2(physical_device, &mut props2) };
-    let mem = props2.memory_properties;
-    let device_local = (0..mem.memory_heap_count as usize).filter(|&i| {
-        mem.memory_heaps[i]
-            .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-    });
-    device_local.fold(
-        HeapBudget {
-            budget: 0,
-            usage: 0,
-        },
-        |sum, i| HeapBudget {
-            budget: sum.budget + budget.heap_budget[i],
-            usage: sum.usage + budget.heap_usage[i],
-        },
-    )
 }
 
 /// The largest single `vkAllocateMemory` this device allows (`VkPhysicalDeviceMaintenance3Properties`,

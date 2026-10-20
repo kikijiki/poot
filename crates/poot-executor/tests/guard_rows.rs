@@ -56,6 +56,13 @@ impl Device for Recorder {
     type Recording = ();
     type Error = Never;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> poot_graph_plan::Target {
         poot_graph_plan::Target::Gpu {
             backend: Backend::SpirvVulkan,

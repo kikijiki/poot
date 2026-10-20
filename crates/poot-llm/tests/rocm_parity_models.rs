@@ -2,7 +2,6 @@
 //! their softcapped twins run on ROCm through the executor contract and every replayed step matches the CPU
 //! oracle within tolerance (ADR-0101 tier 1). The fixtures trace `poot-models`, which sits above the device
 //! crate, so these rows live here; the model-free table is `poot-rocm-device/tests/parity.rs`.
-#![cfg(feature = "rocm")]
 
 use poot_eval::test_support::weight_map_oracle::oracle_for;
 use poot_executor::{Device, Engine, Executor};

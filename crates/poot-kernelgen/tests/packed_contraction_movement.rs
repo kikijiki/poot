@@ -930,7 +930,7 @@ fn the_movement_bank_matches_the_reference_on_wgpu() {
         let name = format!("movement_{count}");
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = artifact_path(&dir, &name, Target::SpirvVulkan);
-        let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &path)
+        let artifact = compile_kernel(&body, poot_target::Backend::SpirvVulkan, &path)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         let kernel = kernel_handle(&body, &artifact).unwrap();
         // Resident buffers, so the output starts as `launch.out` (an in-place scatter updates the pool
@@ -987,7 +987,7 @@ fn the_movement_bank_matches_the_reference_on_rocm() {
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = poot_codegen::artifact_path(&dir, &name, target);
         let artifact =
-            poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::AmdGcn(arch), &path)
+            poot_codegen::compile_kernel(&body, poot_target::Backend::AmdGcn(arch), &path)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
         let module = ctx
@@ -1047,7 +1047,7 @@ fn the_movement_bank_matches_the_reference_on_ptx() {
         let name = format!("movement_{count}");
         let body = poot_kernelgen::movement_body(&name, &launch.spec, None).unwrap();
         let path = artifact_path(&dir, &name, Target::Nvptx);
-        let artifact = compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &path)
+        let artifact = compile_kernel(&body, poot_target::Backend::Nvptx, &path)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         let kernel = kernel_handle(&body, &artifact).unwrap();
         let upload = |words: &[u32]| {

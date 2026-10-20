@@ -19,8 +19,8 @@ use poot_graph_ir::op::SampleRule;
 use poot_graph_ir::ops::sampling::SampleSpec;
 use poot_graph_plan::multi_device::DeviceSpec;
 use poot_graph_plan::{
-    CompileLimits, CompileOptions, Refusal, ShardRule, multi_device::topology::DeviceId,
-    staged::DevicePlacement, staged::TargetSet,
+    Refusal, ShardRule, multi_device::topology::DeviceId, staged::DevicePlacement,
+    staged::TargetSet,
 };
 use poot_llm::driver::block_table::BLOCK_SIZE;
 use poot_llm::driver::capacity::{
@@ -31,7 +31,7 @@ use poot_llm::driver::error::{DriverError, Unsupported};
 use poot_llm::driver::placement::{BalanceError, LayerBytes, Placement, balance_layers};
 use poot_llm::driver::{
     BackendChoice, DraftPolicy, Driver, DriverCaps, DriverOptions, EncodeShapes, Head, Layout,
-    ModelHandle, PoolShape, PreparedSetLimits, Serving, ServingShapes, Warm, program_retention,
+    ModelHandle, PoolShape, PreparedSetLimits, Serving, ServingShapes, Warm,
 };
 use poot_models::io::ModelSchema;
 use poot_target::{Backend as TargetBackend, TargetId};
@@ -426,17 +426,12 @@ fn domain(rows: NonZeroUsize, max_seq: NonZeroUsize) -> Vec<Candidate> {
 
 fn driver_options(handle: &ModelHandle, workload: Workload, draft: DraftPolicy) -> DriverOptions {
     let max_seq = workload.max_seq();
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
     // The largest granule multiple within the chunk budget and the capacity, and never below one granule.
     let granule = handle.config().prefill_granule.get();
     let chunk =
         NonZeroUsize::new((PREFILL_CHUNK_TOKENS.min(max_seq.get()) / granule).max(1) * granule)
             .expect("a granule multiple is nonzero");
     DriverOptions {
-        prefill: compile.clone(),
-        decode: compile,
-        capacity: max_seq,
-        prefill_chunk: chunk,
         // An encode step carries every row's tokens at once: the limit covers the widest one, and a
         // generation workload's prefill chunk.
         trace: poot_llm::driver::serving_trace_limits(
@@ -452,10 +447,7 @@ fn driver_options(handle: &ModelHandle, workload: Workload, draft: DraftPolicy) 
             max_entries: NonZeroUsize::new(MAX_ENTRIES).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(MAX_RETAINED_BYTES).expect("nonzero"),
         },
-        charge: program_retention,
-        // The window the policy reads the hidden-state carry over; none for a policy that reads none.
-        hidden_window: draft.carry_window(),
-        draft,
+        ..DriverOptions::generation(max_seq, chunk).with_draft(draft)
     }
 }
 

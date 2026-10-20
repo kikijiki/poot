@@ -6,8 +6,6 @@
 //!
 //! Skips cleanly with no AMD GPU/HSA runtime.
 
-#![cfg(feature = "rocm")]
-
 use poot_executor::{Device, Engine};
 use poot_models::test_support::pipeline::{
     Agreement, Counting, assert_export_fixture_matches_single_stage, assert_pipeline_waits_once,

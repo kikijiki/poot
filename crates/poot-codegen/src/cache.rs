@@ -19,7 +19,8 @@ use std::time::{Duration, SystemTime};
 
 use poot_kernel_ir::Body;
 
-use crate::{CompileError, CompiledArtifact, GpuTarget, Target, Toolchain, capability, compile};
+use crate::{CompileError, CompiledArtifact, Target, Toolchain, capability, compile};
+use poot_target::Backend;
 
 /// The 64-bit content fingerprint of a kernel `Body` (a hash of its `Debug` form). Only the AIE identity
 /// text still names a body this way; every byte-artifact kernel is named by its [`KernelId`].
@@ -771,7 +772,7 @@ impl KernelCache {
         body: &Body,
         max_artifact_bytes: NonZeroU64,
     ) -> Result<CompiledArtifact, CompileError> {
-        let target = GpuTarget::try_from(self.target)?;
+        let target = Backend::try_from(self.target)?;
         let key = self.key(body);
         let artifact = self.load_or_build(&key, max_artifact_bytes, || {
             self.compile_body(body, max_artifact_bytes)

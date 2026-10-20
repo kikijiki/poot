@@ -716,6 +716,43 @@ impl PtxContext {
         Ok(())
     }
 
+    /// Record a copy of all of `src` into `dst`, both buffers of this context and of equal byte capacity, in
+    /// the open capture: a native device-to-device copy node, ordered after everything captured before it,
+    /// of any byte length and whatever either buffer's element kind. The graph keeps both buffers alive.
+    pub fn copy_buffer(&self, src: &PtxBuffer, dst: &PtxBuffer) -> Result<(), PtxError> {
+        self.require_capture("copy_buffer")?;
+        let owned = |buffer: &PtxBuffer| {
+            buffer
+                .alloc
+                .owner
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, &self.owner))
+        };
+        if !owned(src) || !owned(dst) {
+            return Err(PtxError::ForeignHandle { op: "copy_buffer" });
+        }
+        let bytes = src.byte_capacity();
+        if bytes != dst.byte_capacity() {
+            return Err(PtxError::CopyLength {
+                src: bytes,
+                dst: dst.byte_capacity(),
+            });
+        }
+        // The same allocation is already its own copy, and overlapping ranges are not a legal memcpy.
+        if bytes == 0 || src.ptr() == dst.ptr() {
+            return Ok(());
+        }
+        self.bind()?;
+        // SAFETY: both ranges are the whole of live allocations of this context (checked above), distinct
+        // allocations so they do not overlap, and the copy is enqueued on this context's live stream
+        // (current, bound above) in capture mode; the graph retains both buffers below.
+        unsafe { result::memcpy_dtod_async(dst.ptr(), src.ptr(), bytes, self.owner.stream) }
+            .map_err(|error| self.owner.observe(error))?;
+        self.capture.retain(src);
+        self.capture.retain(dst);
+        Ok(())
+    }
+
     /// A zero-filled device buffer holding `elems` native elements of `storage`, charged to `role`
     /// (Card 547a: the storage-typed, role-typed allocation the executor contract's memory service
     /// needs, instead of one allocator per dtype; mirrors `poot_wgpu_runtime::Context::alloc_storage`).
@@ -731,7 +768,7 @@ impl PtxContext {
 
     /// Overwrite `len` bytes of `buf` from byte `offset`, dtype-agnostic (Card 547a: mirrors
     /// `poot_wgpu_runtime::Context::write_with`). `fill(range, out)` gets consecutive destination ranges
-    /// covering `offset..offset + len` (at most [`crate::UPLOAD_CHUNK_BYTES`] each) and writes every byte of `out`,
+    /// covering `offset..offset + len` (at most [`poot_runtime_common::UPLOAD_CHUNK_BYTES`] each) and writes every byte of `out`,
     /// a pinned slot of the upload ring that is copied to the device asynchronously on this context's
     /// stream while the next is filled. The copies may still be running on return: the stream orders every
     /// later launch and readback after them. Freeing `buf` with copies still queued is sound only because

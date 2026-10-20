@@ -4,7 +4,7 @@
 
 use poot_eval::test_support::StepFixture;
 use poot_graph_ir::test_support::block_top_k::{grid_scores, reference_row};
-use poot_graph_ir::{BlockTopKAttrs, Builder, Outputs, Slot, TensorType};
+use poot_graph_ir::{Builder, IndexRange, Outputs, Slot, TensorType, ops};
 use poot_graph_plan::{KernelChoice, Target};
 use poot_tensor::{DType, HostTensor};
 
@@ -92,13 +92,17 @@ fn case(
     let scores_in = b
         .constant("scores", TensorType::f32(vec![rows, 1, tokens, blocks]))
         .unwrap();
+    let furthest = pos.iter().copied().max().expect("a case has a query");
     let pos_in = b
-        .slot(Slot::Pos, TensorType::new(vec![rows, tokens], DType::I32))
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![rows, tokens], DType::I32),
+            IndexRange::new(0, i64::from(furthest) + 1).unwrap(),
+        )
         .unwrap();
-    let result = b
-        .block_top_k(BlockTopKAttrs { ratio, k }, scores_in, pos_in)
-        .unwrap();
-    let graph = b.finish(Outputs::new(result.packed)).unwrap();
+    // The tracer's composition; `compile` forms the `BlockTopK` the row runs the kernel of.
+    let packed = ops::block_top_k_packed(&b, scores_in, pos_in, ratio, k).unwrap();
+    let graph = b.finish(Outputs::new(packed)).unwrap();
     let step = || {
         vec![StepFixture {
             key: graph

@@ -30,7 +30,10 @@ use crate::components::standard::{
 };
 use crate::io::{ModelSchema, ProgramId};
 use crate::model::{ConfigReason, FamilyKey, Model, ModelConfig, ModelError, StepSpec, TraceError};
-use crate::names::{MoeLayers, MoeNames, NameRow, family_weights, family_weights_routed};
+use crate::names::{
+    FusedDims, MoeLayers, MoeNames, NameRow, family_weights, family_weights_fused,
+    family_weights_routed,
+};
 use crate::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig};
 
 /// What a standard-stack family declares: the keys that name it, its config and its tensor names.
@@ -142,14 +145,30 @@ pub(crate) fn weights_with_experts(
     names: &MoeNames,
     params: &StandardParams,
 ) -> Result<WeightMap, ModelError> {
+    // The rows per head, for the tables whose Q/K rows are stored paired per head.
+    let fused = FusedDims {
+        head_dim: params
+            .attention
+            .first()
+            .map_or(0, AttentionParams::head_dim),
+        ..FusedDims::NONE
+    };
     match params.routed() {
-        None => family_weights(family, store, tables, params.layers, params.head_required),
+        None => family_weights_fused(
+            family,
+            store,
+            tables,
+            params.layers,
+            params.head_required,
+            fused,
+        ),
         Some(moe) => family_weights_routed(
             family,
             store,
             tables,
             params.layers,
             params.head_required,
+            fused,
             MoeLayers {
                 names,
                 sparse: &params
@@ -161,6 +180,31 @@ pub(crate) fn weights_with_experts(
             },
         ),
     }
+}
+
+/// The Q/K rows of a llama-architecture GGUF are paired over a whole head ([`crate::names::Source::PairedHeads`]),
+/// which is the half-split layout of the rotation only when the rotation spans the whole head: refuse a layer
+/// that rotates fewer dims.
+pub(crate) fn require_whole_head_rotation(
+    family: FamilyKey,
+    params: &StandardParams,
+) -> Result<(), ModelError> {
+    for attention in &params.attention {
+        match attention.rotary() {
+            Some(rotary) if rotary != attention.head_dim() => {
+                return Err(ModelError::Config {
+                    family,
+                    field: "rope.dimension_count",
+                    reason: ConfigReason::Mismatch {
+                        expected: attention.head_dim(),
+                        found: rotary,
+                    },
+                });
+            }
+            Some(_) | None => {}
+        }
+    }
+    Ok(())
 }
 
 /// The registry entry of family `F`.

@@ -31,17 +31,19 @@ use poot_quant::weights::{WeightMap, WeightStore};
 
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::model::{ConfigReason, FamilyKey, ModelError};
-use crate::names::gguf::GGUF_BASE;
+use crate::names::gguf::{GGUF_BASE, GGUF_PAIRED_QK};
 #[cfg(feature = "test-support")]
 use crate::names::hf_base_shapes;
-use crate::names::{HF_BASE, family_weights};
+use crate::names::{FusedDims, HF_BASE, NameRow, family_weights_fused};
 #[cfg(feature = "test-support")]
 use crate::registry::Fixture;
 use crate::registry::{ConfigSource, FamilyEntry, RawConfig};
 use poot_text::{ChatFormat, HermesToolCodec};
 use std::sync::Arc;
 
-use crate::components::standard_family::{StandardFamily, StandardParams, entry};
+use crate::components::standard_family::{
+    StandardFamily, StandardParams, entry, require_whole_head_rotation,
+};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("smollm3");
 
@@ -112,11 +114,7 @@ impl StandardFamily for Smollm3 {
                 return Err(fields.error(unsupported, ConfigReason::Unsupported));
             }
         }
-        let mut base = dims.attention(&fields, &SPEC, false)?;
-        // A GGUF stores Q/K permuted for interleaved RoPE, as llama's does.
-        if matches!(raw, RawConfig::Gguf(_)) {
-            base = base.with_interleaved_rope();
-        }
+        let base = dims.attention(&fields, &SPEC, false)?;
         let attention = rotates(&fields, dims.layers)?
             .into_iter()
             .map(|rope| if rope { base } else { base.without_rope() })
@@ -139,11 +137,26 @@ impl StandardFamily for Smollm3 {
         store: &WeightStore,
         params: &mut StandardParams,
     ) -> Result<WeightMap, ModelError> {
-        let rows = match raw.source() {
-            ConfigSource::HfModelType => HF_BASE,
-            ConfigSource::GgufArchitecture => GGUF_BASE,
+        // A GGUF stores Q/K permuted for interleaved RoPE, as llama's does.
+        let tables: &[&[NameRow]] = match raw.source() {
+            ConfigSource::HfModelType => &[HF_BASE],
+            ConfigSource::GgufArchitecture => {
+                require_whole_head_rotation(FAMILY, params)?;
+                &[GGUF_BASE, GGUF_PAIRED_QK]
+            }
         };
-        family_weights(FAMILY, store, &[rows], params.layers, params.head_required)
+        let fused = FusedDims {
+            head_dim: params.attention[0].head_dim(),
+            ..FusedDims::NONE
+        };
+        family_weights_fused(
+            FAMILY,
+            store,
+            tables,
+            params.layers,
+            params.head_required,
+            fused,
+        )
     }
 }
 

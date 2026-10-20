@@ -70,7 +70,6 @@ pub use context::PtxContext;
 pub use error::PtxError;
 pub use graph::{PtxGraphExec, PtxSpan, PtxSyncEvent};
 pub use owner::NativeCounters;
-pub use upload::UPLOAD_CHUNK_BYTES;
 
 #[cfg(test)]
 mod tests;

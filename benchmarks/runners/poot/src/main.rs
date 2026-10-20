@@ -45,7 +45,6 @@ use anyhow::Context;
 use serde_json::{json, Value};
 
 use poot_executor::DetailedTiming;
-use poot_graph_plan::CompileOptions;
 use poot_llm::driver::error::DriverError;
 use poot_llm::driver::{
     open_executor, open_timed_executor, BackendChoice, Driver, DriverOptions, DriverStats,
@@ -73,30 +72,17 @@ const COMPUTE_DTYPE: &str = "f32";
 /// The context every decode-curve point cycles to reach its exact length.
 const CURVE_BASE_PHRASE: &str = "The quick brown fox jumps over the lazy dog. ";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Backend {
-    Ptx,
-    Rocm,
-    Wgpu,
-}
+/// The backends a benchmark row can name: a row's identity is the device that ran it, so `auto` is not one.
+const BACKENDS: [BackendChoice; 3] = [BackendChoice::Ptx, BackendChoice::Rocm, BackendChoice::Wgpu];
 
-impl Backend {
-    const ALL: [Backend; 3] = [Backend::Ptx, Backend::Rocm, Backend::Wgpu];
-
-    fn label(self) -> &'static str {
-        match self {
-            Backend::Ptx => "ptx",
-            Backend::Rocm => "rocm",
-            Backend::Wgpu => "wgpu",
-        }
-    }
-
-    fn parse(name: &str) -> anyhow::Result<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|backend| backend.label() == name)
-            .ok_or_else(|| anyhow::anyhow!("unknown backend {name:?} (supported: ptx, rocm, wgpu)"))
-    }
+/// The `--backend` of a run: one of [`BACKENDS`], parsed by [`BackendChoice`]'s own `FromStr`.
+fn parse_backend(name: &str) -> anyhow::Result<BackendChoice> {
+    let choice: BackendChoice = name.parse()?;
+    anyhow::ensure!(
+        BACKENDS.contains(&choice),
+        "backend {name:?} is not benchmarked (supported: ptx, rocm, wgpu)"
+    );
+    Ok(choice)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,7 +187,7 @@ struct Config {
     warmup: usize,
     iters: usize,
     precision: String,
-    backend: Backend,
+    backend: BackendChoice,
     /// Single mode: fill the prompt's KV in one batched forward instead of one token at a time.
     prefill: bool,
     json: bool,
@@ -318,7 +304,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Invocation> {
             .copied()
             .unwrap_or("f32")
             .to_string(),
-        backend: Backend::parse(values.get("--backend").copied().unwrap_or("ptx"))?,
+        backend: parse_backend(values.get("--backend").copied().unwrap_or("ptx"))?,
         prefill: switches.contains("--prefill"),
         json: switches.contains("--json"),
         profile: switches.contains("--profile"),
@@ -557,20 +543,14 @@ fn curve_prefill_chunk(limit: Option<usize>, longest: usize) -> usize {
 }
 
 fn driver_options(capacity: NonZeroUsize, chunk: usize) -> anyhow::Result<DriverOptions> {
-    let compile = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+    let chunk = NonZeroUsize::new(chunk).context("a prefill chunk holds a token")?;
     Ok(DriverOptions {
-        prefill: compile.clone(),
-        decode: compile,
-        capacity,
-        prefill_chunk: NonZeroUsize::new(chunk).context("a prefill chunk holds a token")?,
         trace: poot_llm::driver::serving_trace_limits(capacity),
         prepared: PreparedSetLimits {
             max_entries: NonZeroUsize::new(64).expect("nonzero"),
             max_retained_bytes: NonZeroU64::new(8 << 30).expect("nonzero"),
         },
-        charge: poot_llm::driver::program_retention,
-        draft: poot_llm::driver::DraftPolicy::Off,
-        hidden_window: None,
+        ..DriverOptions::generation(capacity, chunk)
     })
 }
 
@@ -753,11 +733,7 @@ fn open_driver(
     // Before an executor opens: a request the checkpoint does not hold needs no device.
     let precision = ensure_store_holds(&config.precision, handle.store())?;
     let checkpoint_digest = checkpoint_digest(handle.store());
-    let backend = match config.backend {
-        Backend::Ptx => BackendChoice::Ptx,
-        Backend::Rocm => BackendChoice::Rocm,
-        Backend::Wgpu => BackendChoice::Wgpu,
-    };
+    let backend = config.backend;
     let (longest, chunk, prompts) = match config.mode {
         Mode::Single => {
             let prompt = handle.text().encode(&single_prompt(config)?)?.len();
@@ -1176,7 +1152,7 @@ fn measure(
 fn identity(
     engine: Option<Engine>,
     family: Option<&str>,
-    backend: Backend,
+    backend: BackendChoice,
     mode: Mode,
     precision: &str,
 ) -> Value {
@@ -1187,7 +1163,7 @@ fn identity(
         "build_features": BUILD_FEATURES,
         "rustc_version": RUSTC_VERSION,
         "family": family,
-        "backend": backend.label(),
+        "backend": backend.name(),
         "mode": mode.label(),
         "precision": precision,
     });
@@ -1222,7 +1198,7 @@ fn measure_single(
             config.warmup,
             config.iters,
             config.prefill,
-            config.backend.label()
+            config.backend.name()
         );
     }
     let run_once = |engine: &mut dyn Generate| {
@@ -1387,7 +1363,7 @@ fn measure_curve(
         config.osl,
         config.warmup,
         config.iters,
-        config.backend.label()
+        config.backend.name()
     );
     let mut curve: Vec<Value> = Vec::new();
     let mut caveats: Vec<String> = Vec::new();
@@ -1761,6 +1737,8 @@ mod tests {
 
     fn window(sum: Option<Duration>, span: Option<Duration>) -> poot_profile::WindowReport {
         poot_profile::WindowReport {
+            target: poot_target::TargetId::Gpu(poot_target::Backend::Nvptx),
+            build: poot_profile::BuildIdentity::current(),
             entries: vec![0],
             steps: 1,
             host: poot_profile::HostTiming::default(),
@@ -1797,16 +1775,17 @@ mod tests {
     /// device timestamps, it reports `unknown`. Mutation: restore the ROCm refusal in `parse_args`.
     #[test]
     fn profile_is_accepted_on_every_backend() {
-        for backend in Backend::ALL {
-            let config = config(&["--profile", "--backend", backend.label()]);
-            assert!(config.profile, "{}", backend.label());
+        for backend in BACKENDS {
+            let config = config(&["--profile", "--backend", backend.name()]);
+            assert!(config.profile, "{}", backend.name());
             assert_eq!(config.backend, backend);
         }
     }
 
     fn refused() -> anyhow::Error {
-        anyhow::Error::from(DriverError::Unsupported(Unsupported::Backend {
-            backend: "stub_backend",
+        anyhow::Error::from(DriverError::Unsupported(Unsupported::UnboundSlot {
+            program: poot_models::io::ProgramId::STEP,
+            key: "stub_backend".to_string(),
         }))
         .context("generate")
     }
@@ -1826,8 +1805,8 @@ mod tests {
     /// SC-001: the warmup, the measured runs and the curve rows are the same for every backend value.
     #[test]
     fn every_backend_runs_the_same_measure_protocol() {
-        for backend in Backend::ALL {
-            let label = backend.label();
+        for backend in BACKENDS {
+            let label = backend.name();
 
             let mut single = config(&[
                 "--warmup",
@@ -1902,7 +1881,7 @@ mod tests {
 
     /// Run the harness's own runner-result validation over `line`, as the harness would before it turns
     /// the line into a row. The runner and the harness must agree on one contract, and the harness owns it.
-    fn harness_accepts(line: &Value, curve: bool, gen_tokens: usize, backend: Backend) {
+    fn harness_accepts(line: &Value, curve: bool, gen_tokens: usize, backend: BackendChoice) {
         let line = &as_release_line(line);
         let harness = format!("{}/../../harness", manifest_dir());
         let script = format!(
@@ -1913,7 +1892,7 @@ mod tests {
              validate_runner_result(json.load(sys.stdin), framework='poot', precision='bf16', \
              scenario=scenario, gen_tokens={gen_tokens}, backend={backend:?})\n",
             curve = if curve { "True" } else { "False" },
-            backend = backend.label(),
+            backend = backend.name(),
         );
         let mut child = Command::new("python3")
             .args(["-c", &script])
@@ -1954,7 +1933,7 @@ mod tests {
                 "--gen-tokens",
                 "6",
             ]);
-            config.backend = Backend::Rocm;
+            config.backend = BackendChoice::Rocm;
             let outcome = measure(&config, &mut Stub::new(), &resolved("stub_family"));
             let line = result_line(&config, None, outcome).unwrap();
             let text = line.to_string();
@@ -1963,7 +1942,7 @@ mod tests {
             assert_eq!(line["framework"], "poot");
             assert_eq!(line["build_sha"], BUILD_SHA);
             assert_eq!(line["family"], "stub_family");
-            harness_accepts(&line, mode == Mode::DecodeCurve, 6, Backend::Rocm);
+            harness_accepts(&line, mode == Mode::DecodeCurve, 6, BackendChoice::Rocm);
         }
     }
 
@@ -1993,7 +1972,7 @@ mod tests {
                     args.push("--profile");
                 }
                 let mut config = config(&args);
-                config.backend = Backend::Rocm;
+                config.backend = BackendChoice::Rocm;
                 let outcome = measure(&config, &mut Stub::new(), &resolved("stub_family"));
                 let line = result_line(&config, None, outcome).unwrap();
                 let expected = if profile {
@@ -2013,7 +1992,7 @@ mod tests {
                         "{mode:?} profile={profile}"
                     );
                 }
-                harness_accepts(&line, mode == Mode::DecodeCurve, 6, Backend::Rocm);
+                harness_accepts(&line, mode == Mode::DecodeCurve, 6, BackendChoice::Rocm);
             }
         }
     }
@@ -2050,7 +2029,7 @@ mod tests {
     }
 
     /// The reason the harness records for `line`, read through the harness's own `runner_refusal`.
-    fn harness_refusal(line: &Value, backend: Backend) -> String {
+    fn harness_refusal(line: &Value, backend: BackendChoice) -> String {
         let line = &as_release_line(line);
         let harness = format!("{}/../../harness", manifest_dir());
         let script = format!(
@@ -2058,7 +2037,7 @@ mod tests {
              sys.path.insert(0, {harness:?})\n\
              from result_contract import runner_refusal\n\
              print(runner_refusal(json.load(sys.stdin), framework='poot', backend={backend:?}))\n",
-            backend = backend.label(),
+            backend = backend.name(),
         );
         let mut child = Command::new("python3")
             .args(["-c", &script])
@@ -2090,7 +2069,7 @@ mod tests {
     #[test]
     fn a_refusal_is_recorded_as_the_runners_own_text() {
         let mut config = config(&["--warmup", "1", "--iters", "1"]);
-        config.backend = Backend::Wgpu;
+        config.backend = BackendChoice::Wgpu;
         let mut stub = Stub::new();
         stub.fail_prompt = true;
         stub.error = refused;
@@ -2137,7 +2116,7 @@ mod tests {
         let dir = config_only_checkpoint("unserved", r#"{"model_type": "stub_arch"}"#);
         let mut config = config(&["--precision", "bf16"]);
         config.weights = Weights::Safetensors(dir.display().to_string());
-        config.backend = Backend::Rocm;
+        config.backend = BackendChoice::Rocm;
         let line = run(&config).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
@@ -2147,7 +2126,7 @@ mod tests {
             reason.contains("no family is registered") && reason.contains("stub_arch"),
             "{reason}"
         );
-        assert_eq!(harness_refusal(&line, Backend::Rocm), reason);
+        assert_eq!(harness_refusal(&line, BackendChoice::Rocm), reason);
         // The registry resolved no family, so the row names none.
         assert_eq!(line["family"], Value::Null);
     }
@@ -2284,7 +2263,7 @@ mod tests {
             "--iters",
             "1",
         ]);
-        config.backend = Backend::Ptx;
+        config.backend = BackendChoice::Ptx;
         let mut stub = Stub::new();
         stub.fail_at_isl = Some(16);
         stub.error = || anyhow::anyhow!("CUDA out of memory\nbacktrace");
@@ -2373,7 +2352,7 @@ mod tests {
             ),
             (128, 2, 5, 128)
         );
-        assert_eq!(defaults.backend, Backend::Ptx);
+        assert_eq!(defaults.backend, BackendChoice::Ptx);
         assert_eq!(defaults.mode, Mode::Single);
         assert!(matches!(defaults.weights, Weights::Safetensors(_)));
 
@@ -2418,13 +2397,13 @@ mod tests {
         let line = identity(
             Some(Engine::Driver),
             Some("qwen2"),
-            Backend::Wgpu,
+            BackendChoice::Wgpu,
             Mode::Single,
             "bf16",
         );
         assert_eq!(line["engine"], "driver");
         assert_eq!(line["family"], "qwen2");
-        let declined = identity(None, None, Backend::Wgpu, Mode::Single, "bf16");
+        let declined = identity(None, None, BackendChoice::Wgpu, Mode::Single, "bf16");
         assert!(declined.get("engine").is_none());
         assert_eq!(declined["family"], Value::Null);
     }
@@ -2434,8 +2413,9 @@ mod tests {
     #[test]
     fn a_driver_refusal_is_a_recorded_refusal() {
         let unregistered =
-            DriverError::Unsupported(poot_llm::driver::error::Unsupported::Backend {
-                backend: "rocm",
+            DriverError::Unsupported(poot_llm::driver::error::Unsupported::UnboundSlot {
+                program: poot_models::io::ProgramId::STEP,
+                key: "rocm".to_string(),
             });
         let error = anyhow::Error::from(unregistered).context("load /m");
         assert!(refusal(&error).is_some_and(

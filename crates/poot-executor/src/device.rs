@@ -8,7 +8,8 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::time::Duration;
 
-use poot_graph_plan::Target;
+use poot_graph_plan::{ImportedKernel, Target};
+use poot_kernel_ir::Body;
 use poot_runtime_common::CompiledKernel;
 use poot_target::{AieTargetId, BufferStorage, VpuTargetId};
 
@@ -50,6 +51,57 @@ pub enum DeviceTime {
     Unknown,
     /// The device attempted to measure the step; each measure inside may still be absent.
     Measured(MeasuredDeviceTime),
+}
+
+/// The kernel a device with no native buffer copy copies state with, compiled by the engine for the device's
+/// target: one thread per `u32` word of the buffer (the planner's `copy_words` kernel,
+/// [`ImportedKernel::CopyWords`]), so it moves any storage byte for byte whatever its element kind. The
+/// engine owns the body and the compile; the device only loads and launches it ([`CopyMechanism::Kernel`]).
+pub struct CopyKernel {
+    kernel: CompiledKernel,
+    workgroup: [u32; 3],
+}
+
+impl CopyKernel {
+    /// The body every device's state copy compiles from.
+    pub fn body() -> &'static Body {
+        ImportedKernel::CopyWords.body()
+    }
+
+    /// `kernel`, which must be [`Self::body`] compiled for the device's target: the engine compiles it through
+    /// its kernel cache, a test driving a device directly through its own.
+    pub fn new(kernel: CompiledKernel) -> Self {
+        Self {
+            kernel,
+            workgroup: Self::body().workgroup_size,
+        }
+    }
+
+    /// The compiled kernel, to load into the device's runtime.
+    pub fn kernel(&self) -> &CompiledKernel {
+        &self.kernel
+    }
+
+    /// Threads per workgroup the kernel was compiled for; a copy of `words` words launches `words` threads
+    /// over it.
+    pub fn workgroup(&self) -> [u32; 3] {
+        self.workgroup
+    }
+}
+
+/// How a device implements [`Device::copy`].
+pub enum CopyMechanism<'a, E> {
+    /// The runtime copies buffer to buffer itself.
+    Native,
+    /// The device launches the engine's [`CopyKernel`]; the sink receives it.
+    Kernel(Box<dyn CopyKernelSink<E> + 'a>),
+}
+
+/// Where the engine delivers the [`CopyKernel`] of a kernel-copying device: loaded once per device, before the
+/// first `copy`.
+pub trait CopyKernelSink<E> {
+    /// Keep `kernel` for the copies the device records.
+    fn load(&mut self, kernel: CopyKernel) -> Result<(), E>;
 }
 
 /// One kernel-dispatch argument: the buffer, and this value's own native device-element count (Card
@@ -193,6 +245,11 @@ pub trait Device {
     /// The device's failure type; the engine wraps it into [`crate::DeviceError`].
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// The name of the runtime this device runs on, as an error and a log line label it (`wgpu`, `vulkan`,
+    /// `rocm`, `ptx`): the device states it, because two runtimes can execute one planner target (wgpu and raw
+    /// Vulkan both lower to SPIR-V), so no target determines it.
+    fn backend_name(&self) -> &'static str;
+
     /// The compile target this device executes.
     fn target(&self) -> Target;
 
@@ -222,6 +279,14 @@ pub trait Device {
         None
     }
 
+    /// How this device implements [`Self::copy`]: a native buffer copy, or the engine's [`CopyKernel`] for a
+    /// device whose recording has no buffer-copy command (ROCm: HSA's copy engine is a queue of its own, not a
+    /// packet of the dispatch stream). Required, so a device states its mechanism; a kernel-copying device
+    /// hands back the [`CopyKernelSink`] that receives the kernel. The engine compiles the kernel for the
+    /// device's target through the same cache as every plan kernel and loads it once, before the first
+    /// `copy`; a device that copies natively never sees one.
+    fn copy_mechanism(&mut self) -> CopyMechanism<'_, Self::Error>;
+
     /// A zero-filled buffer holding `elems` native elements of `storage`.
     fn allocate(
         &mut self,
@@ -248,7 +313,10 @@ pub trait Device {
     fn begin(&mut self) -> Result<(), Self::Error>;
     /// Record one kernel launch into the open recording, ordered after every earlier call of this step.
     fn dispatch(&mut self, dispatch: Dispatch<'_, Self>) -> Result<(), Self::Error>;
-    /// Copy all of `src` into `dst` (same byte length), ordered after every earlier call of this step.
+    /// Copy all of `src` into `dst`, ordered after every earlier call of this step: every byte of `src`, of
+    /// any length, whatever the element kind of either buffer. The two hold the same number of bytes;
+    /// anything else is a device error. This is the one state-commit primitive: a native buffer copy, or
+    /// the engine's kernel where [`Self::copy_mechanism`] says the runtime has none.
     fn copy(&mut self, src: &Self::Buffer, dst: &Self::Buffer) -> Result<(), Self::Error>;
     /// End a step, returning the recording `replay` later submits. Nothing has run on the device yet.
     fn finish(&mut self) -> Result<Self::Recording, Self::Error>;

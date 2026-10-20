@@ -1798,12 +1798,12 @@ dependencies = [
  "anyhow",
  "blake3",
  "poot-executor",
- "poot-graph-plan",
  "poot-llm",
  "poot-models",
  "poot-profile",
  "poot-quant",
  "poot-runtime-common",
+ "poot-target",
  "poot-tensor",
  "serde_json",
  "tokenizers",
@@ -1857,6 +1857,7 @@ dependencies = [
 name = "poot-executor-parity"
 version = "0.0.0"
 dependencies = [
+ "poot-codegen",
  "poot-eval",
  "poot-executor",
  "poot-graph-ir",
@@ -1942,9 +1943,9 @@ dependencies = [
 name = "poot-l0-runtime"
 version = "0.0.0"
 dependencies = [
- "libc",
  "poot-codegen",
  "poot-quant",
+ "poot-runtime-common",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2080,6 +2081,7 @@ name = "poot-profile"
 version = "0.0.0"
 dependencies = [
  "poot-runtime-common",
+ "poot-target",
 ]
 
 [[package]]
@@ -2162,13 +2164,14 @@ dependencies = [
  "poot-target",
  "thiserror 2.0.18",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "poot-runtime-common"
 version = "0.0.0"
 dependencies = [
+ "ash",
+ "libc",
  "poot-target",
 ]
 
@@ -2275,7 +2278,7 @@ dependencies = [
  "poot-kernel-ir",
  "poot-runtime-common",
  "poot-target",
- "poot-wgpu-runtime",
+ "poot-test-util",
  "thiserror 2.0.18",
 ]
 
@@ -2308,7 +2311,6 @@ dependencies = [
 name = "poot-wgpu-runtime"
 version = "0.0.0"
 dependencies = [
- "ash",
  "bytemuck",
  "pollster",
  "poot-codegen",
@@ -2333,6 +2335,7 @@ dependencies = [
  "poot-kernelgen",
  "poot-ptx-runtime",
  "poot-runtime-common",
+ "poot-target",
  "poot-test-util",
  "poot-wgpu-runtime",
  "serde_json",

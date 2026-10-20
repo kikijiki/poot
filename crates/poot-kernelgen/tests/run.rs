@@ -4,13 +4,14 @@
 use std::path::PathBuf;
 
 use poot_codegen::emit_llvm_ir;
-use poot_codegen::{GpuTarget, Target, compile, compile_kernel};
+use poot_codegen::{Target, compile, compile_kernel};
 use poot_kernel_ir::test_support::{wg_sum, workgroup_fence_spin_wait};
 use poot_kernel_ir::{
     BasicBlock, BinOp, Body, LocalDecl, MathOp, MemoryOrdering, MemoryScope, Statement, Terminator,
     Ty, UnOp,
 };
 use poot_kernelgen as kg;
+use poot_target::Backend;
 use poot_target::BufferStorage;
 use poot_wgpu_runtime::{Context, KernelBuffer};
 
@@ -52,7 +53,7 @@ fn spv(body: &Body, name: &str) -> poot_runtime_common::CompiledKernel {
     let dir: PathBuf = std::env::temp_dir().join("poot-kernelgen-test").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
-    let artifact = compile_kernel(body, GpuTarget::SpirvVulkan, &out).expect("compile");
+    let artifact = compile_kernel(body, Backend::SpirvVulkan, &out).expect("compile");
     poot_codegen::kernel_handle(body, &artifact).unwrap()
 }
 
@@ -103,6 +104,7 @@ fn attention_spec(
         },
         mask,
         bound: kg::KeyBound::Static,
+        sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes },
     }
 }

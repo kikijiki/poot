@@ -74,6 +74,13 @@ impl Device for FakeDevice {
     type Recording = ();
     type Error = FakeError;
 
+    fn copy_mechanism(&mut self) -> crate::CopyMechanism<'_, Self::Error> {
+        crate::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,

@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use poot_llm::FrontEndSession;
+use poot_llm::driver::DriverOptions;
 use poot_llm::driver::{BackendChoice, ModelHandle, open_executor};
-use poot_llm::{FrontEndSession, tower_options};
 use poot_models::multimodal::front_end::{ChatTurn, FrontEndError, Prepared};
 
 use crate::api::RefusedRequest;
@@ -107,7 +108,7 @@ pub(crate) fn spawn_image_front_end(
 ) -> Result<ImageClient> {
     spawn_vision_thread(workers, health, IMAGE_PREPARE_DEADLINE, move || {
         let session = FrontEndSession::open(model, |_, positions| {
-            Ok::<_, anyhow::Error>((open_executor(backend)?, tower_options(positions)))
+            Ok::<_, anyhow::Error>((open_executor(backend)?, DriverOptions::tower(positions)))
         })?
         .context("the model takes no images")?;
         Ok(Box::new(session))
@@ -138,14 +139,7 @@ pub(crate) fn spawn_vision_thread(
             if started_tx.send(Ok(())).is_err() {
                 return;
             }
-            let run = catch_unwind(AssertUnwindSafe(|| {
-                run_vision_thread(front_end.as_mut(), &jobs_rx);
-            }));
-            if let Err(payload) = run {
-                let reason = panic_reason(payload.as_ref());
-                tracing::error!(reason, "vision thread panicked");
-                health.die(Death::Panicked(reason));
-            }
+            run_vision_thread(front_end.as_mut(), &jobs_rx, &health);
         })
         .context("spawn the vision thread")?;
     started_rx
@@ -158,21 +152,42 @@ pub(crate) fn spawn_vision_thread(
     })
 }
 
-/// Lower jobs until every sender is gone.
-fn run_vision_thread(front_end: &mut dyn ImageLowering, jobs: &mpsc::Receiver<VisionJob>) {
+/// Lower jobs until every sender is gone. A panic in the front end publishes `Dead` to `/health` and only
+/// then drops the job's reply, so the request it fails never observes a still-serving server.
+fn run_vision_thread(
+    front_end: &mut dyn ImageLowering,
+    jobs: &mpsc::Receiver<VisionJob>,
+    health: &EngineHealth,
+) {
     while let Ok(job) = jobs.recv() {
-        let images: Vec<&[u8]> = job.images.iter().map(Vec::as_slice).collect();
-        let turns: Vec<_> = job
-            .turns
-            .iter()
-            .map(|turn| ChatTurn {
-                role: &turn.role,
-                media: turn.images,
-                text: &turn.text,
-            })
-            .collect();
-        let prepared = front_end.prepare(&images, &turns);
-        let _ = job.reply.send(prepared);
+        let VisionJob {
+            images,
+            turns,
+            reply,
+        } = job;
+        let lowered = catch_unwind(AssertUnwindSafe(|| {
+            let images: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
+            let turns: Vec<_> = turns
+                .iter()
+                .map(|turn| ChatTurn {
+                    role: &turn.role,
+                    media: turn.images,
+                    text: &turn.text,
+                })
+                .collect();
+            front_end.prepare(&images, &turns)
+        }));
+        match lowered {
+            Ok(prepared) => {
+                let _ = reply.send(prepared);
+            }
+            Err(payload) => {
+                let reason = panic_reason(payload.as_ref());
+                tracing::error!(reason, "vision thread panicked");
+                health.die(Death::Panicked(reason));
+                return;
+            }
+        }
     }
 }
 

@@ -16,4 +16,4 @@ mod towers;
 pub use apng::{Apng, ApngError, ApngFrames};
 pub use decode::{ImageDecodeError, decode_image};
 pub use session::FrontEndSession;
-pub use towers::{TowerDrivers, tower_options};
+pub use towers::TowerDrivers;

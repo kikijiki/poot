@@ -126,6 +126,13 @@ impl Device for RecordingDevice {
     type Recording = ();
     type Error = std::convert::Infallible;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> Target {
         fake_target()
     }

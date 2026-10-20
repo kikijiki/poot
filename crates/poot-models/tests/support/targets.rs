@@ -28,10 +28,26 @@ pub(crate) fn preset(column: &'static str, id: &'static str, backend: Backend) -
     }
 }
 
-/// wgpu (SPIR-V for Vulkan), ROCm (AMD GCN, gfx1151) and PTX (NVIDIA).
+/// raw Vulkan: SPIR-V for the `poot-vulkan-runtime` device, over the caps that runtime measured on this
+/// box's RADV iGPU, not wgpu's. The two lower to the same SPIR-V and plan differently because their devices
+/// differ (workgroup memory, workgroup and grid limits).
+pub(crate) fn vulkan_target() -> RefTarget {
+    RefTarget {
+        column: "Vulkan",
+        id: "vulkan",
+        target: Target::Gpu {
+            backend: Backend::SpirvVulkan,
+            caps: poot_test_util::device_caps::vulkan_rdna3_igpu(),
+        },
+    }
+}
+
+/// wgpu (SPIR-V for Vulkan), raw Vulkan (SPIR-V, its own device caps), ROCm (AMD GCN, gfx1151) and PTX
+/// (NVIDIA).
 pub(crate) fn reference_targets() -> Vec<RefTarget> {
     vec![
         preset("wgpu", "spirv_vulkan", Backend::SpirvVulkan),
+        vulkan_target(),
         preset("ROCm", "amd_gcn", Backend::AmdGcn(AmdArch::gfx1151())),
         preset("PTX", "nvptx", Backend::Nvptx),
     ]

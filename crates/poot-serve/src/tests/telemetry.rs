@@ -26,10 +26,20 @@ fn measured(ms: u64) -> DeviceCoverage {
     })
 }
 
+/// A snapshot of the SPIR-V target that keeps `ring` steps and `records` dispatch records.
+fn empty_snapshot(ring: usize, records: usize) -> TimingSnapshot {
+    TimingSnapshot::new(
+        poot_target::TargetId::Gpu(poot_target::Backend::SpirvVulkan),
+        poot_profile::BuildIdentity::current(),
+        ring,
+        records,
+    )
+}
+
 /// `steps` steps of one entry, each with one dispatch of detail, into a ring that keeps `ring` steps.
 fn snapshot(ring: usize, steps: u64, device: DeviceCoverage) -> TimingSnapshot {
     use poot_profile::DispatchTiming;
-    let mut snapshot = TimingSnapshot::new(ring, ring * 4);
+    let mut snapshot = empty_snapshot(ring, ring * 4);
     for replay in 0..steps {
         let dispatches = if ring == 0 {
             Vec::new()
@@ -42,7 +52,7 @@ fn snapshot(ring: usize, steps: u64, device: DeviceCoverage) -> TimingSnapshot {
                     .then(|| Duration::from_millis(3)),
             }]
         };
-        snapshot.record(1, replay, "fixture", host(10), device, dispatches);
+        snapshot.record(1, replay, host(10), device, dispatches);
     }
     snapshot
 }
@@ -137,14 +147,14 @@ fn detailed_export_reports_truncated_coverage_and_perturbation() {
 /// complete. Mutation: count unmeasured steps as sampled.
 #[test]
 fn sampled_detail_is_reported_as_sampled() {
-    let mut snapshot = TimingSnapshot::new(16, 64);
+    let mut snapshot = empty_snapshot(16, 64);
     for replay in 0..6u64 {
         let device = if replay % 3 == 0 {
             measured(2)
         } else {
             DeviceCoverage::Unknown
         };
-        snapshot.record(1, replay, "fixture", host(10), device, Vec::new());
+        snapshot.record(1, replay, host(10), device, Vec::new());
     }
     assert_eq!(
         TimingExport::of(&snapshot).detail,
@@ -175,7 +185,7 @@ fn publishing_the_largest_accepted_detail_stays_cheap() {
 
     const STEPS: u64 = 1 << 14;
     const RECORDS_PER_STEP: usize = 16; // 16384 steps x 16 = 262144 records, the dispatch maximum
-    let mut snapshot = TimingSnapshot::new(STEPS as usize, STEPS as usize * RECORDS_PER_STEP);
+    let mut snapshot = empty_snapshot(STEPS as usize, STEPS as usize * RECORDS_PER_STEP);
     for replay in 0..STEPS {
         let dispatches = (0..RECORDS_PER_STEP)
             .map(|dispatch_index| DispatchTiming {
@@ -185,7 +195,7 @@ fn publishing_the_largest_accepted_detail_stays_cheap() {
                 device: Some(Duration::from_micros(3)),
             })
             .collect();
-        snapshot.record(1, replay, "fixture", host(1), measured(1), dispatches);
+        snapshot.record(1, replay, host(1), measured(1), dispatches);
     }
     let started = Instant::now();
     let copy = snapshot.clone();

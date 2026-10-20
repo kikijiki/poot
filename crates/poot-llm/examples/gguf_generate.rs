@@ -6,14 +6,12 @@
 //! Run: `cargo run -p poot-llm --release --example gguf_generate -- /path/to/model.gguf ["a prompt"]`
 
 use std::io::Write;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
-use poot_graph_plan::{CompileLimits, CompileOptions};
 use poot_llm::driver::{
-    BackendChoice, Driver, DriverOptions, GenerateRequest, Layout, ModelHandle, PreparedSetLimits,
-    open_executor,
+    BackendChoice, Driver, DriverOptions, GenerateRequest, Layout, ModelHandle, open_executor,
 };
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::registry::Registry;
@@ -37,23 +35,12 @@ fn main() -> anyhow::Result<()> {
     )?);
     let tokens = handle.text().encode(&prompt)?;
     let max_new = 32;
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
     let granule = handle.config().prefill_granule.get();
     let chunk = NonZeroUsize::new(128usize.div_ceil(granule) * granule).expect("nonzero");
-    let options = DriverOptions {
-        prefill: compile.clone(),
-        decode: compile,
-        capacity: NonZeroUsize::new(tokens.len() + max_new).expect("nonzero"),
-        prefill_chunk: chunk,
-        trace: poot_llm::driver::serving_trace_limits(chunk),
-        prepared: PreparedSetLimits {
-            max_entries: NonZeroUsize::new(64).expect("nonzero"),
-            max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
-        },
-        charge: poot_llm::driver::program_retention,
-        draft: poot_llm::driver::DraftPolicy::Off,
-        hidden_window: None,
-    };
+    let options = DriverOptions::generation(
+        NonZeroUsize::new(tokens.len() + max_new).expect("nonzero"),
+        chunk,
+    );
     let mut driver = Driver::new(
         Arc::clone(&handle),
         open_executor(BackendChoice::Auto)?,

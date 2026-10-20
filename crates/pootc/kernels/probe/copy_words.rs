@@ -1,8 +1,9 @@
-//! A raw word-for-word copy kernel: ROCm's `Device::copy` expresses the executor
-//! contract's two-phase commit copy as one generated kernel dispatch (an AQL packet the batched
-//! capture/replay model can record), never a raw HSA memcpy mid-recording. One thread per `u32`
-//! word, so it is dtype-agnostic: the caller always sizes the dispatch by word count, regardless of
-//! the buffer's logical dtype.
+//! A raw word-for-word copy kernel: the executor engine's state-commit copy for a device whose recording
+//! has no buffer-copy command (`CopyMechanism::Kernel`, ROCm: HSA's copy engine is a queue of its own, not
+//! an AQL packet the batched replay could order against). The engine compiles it for the device's target
+//! and hands it over as a `CopyKernel`; the device launches it as one dispatch in the recording. One
+//! thread per `u32` word, so it is dtype-agnostic: the caller always sizes the dispatch by word count,
+//! regardless of the buffer's logical dtype.
 
 #![crate_type = "lib"]
 use poot_kernel_intrinsics::thread_index;

@@ -405,17 +405,22 @@ struct LaneCases {
 }
 
 impl LaneCases {
-    /// Read the lists of the wgpu, ROCm and PTX lanes.
+    /// Read the lists of the wgpu, raw Vulkan, ROCm and PTX lanes.
     fn read(root: &Path) -> Self {
-        let lanes = [("wgpu", "wgpu"), ("ROCm", "rocm"), ("PTX", "ptx")]
-            .into_iter()
-            .map(|(column, lane)| {
-                let path = root.join(format!("scripts/required-device-cases/{lane}.txt"));
-                let text = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-                (column, Self::parse(&text))
-            })
-            .collect();
+        let lanes = [
+            ("wgpu", "wgpu"),
+            ("Vulkan", "vulkan"),
+            ("ROCm", "rocm"),
+            ("PTX", "ptx"),
+        ]
+        .into_iter()
+        .map(|(column, lane)| {
+            let path = root.join(format!("scripts/required-device-cases/{lane}.txt"));
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            (column, Self::parse(&text))
+        })
+        .collect();
         Self { lanes }
     }
 
@@ -941,6 +946,40 @@ fn the_page_is_what_the_generator_renders() {
     );
 }
 
+/// POOT-1231 SC-001: the matrix has a raw Vulkan column, and it is compiled for the reference caps of the raw
+/// Vulkan device (`poot_test_util::device_caps::vulkan_rdna3_igpu`, the figures `poot-vulkan-runtime` measures), not for
+/// wgpu's. Both lower to SPIR-V, so only the caps tell the columns apart. Mutation: build the `Vulkan`
+/// reference target from `preset("Vulkan", "vulkan", Backend::SpirvVulkan)` (wgpu's caps): the caps equal
+/// wgpu's and this goes red.
+#[test]
+fn the_raw_vulkan_column_is_rendered_from_its_own_reference_caps() {
+    let targets = reference_targets();
+    let caps_of = |column: &str| match targets
+        .iter()
+        .find(|t| t.column == column)
+        .unwrap_or_else(|| panic!("the matrix has no {column} column"))
+        .target
+    {
+        Target::Gpu { caps, .. } => caps,
+        ref other => panic!("the {column} column is a GPU target, got {other:?}"),
+    };
+    let (vulkan, wgpu) = (caps_of("Vulkan"), caps_of("wgpu"));
+    assert_eq!(vulkan, poot_test_util::device_caps::vulkan_rdna3_igpu());
+    assert_ne!(
+        vulkan, wgpu,
+        "the raw Vulkan column is compiled for wgpu's device caps"
+    );
+    let rendered = families_table(&registry(), &targets);
+    let header = rendered
+        .lines()
+        .find(|line| line.starts_with("| Family"))
+        .expect("a header row");
+    assert!(
+        header.contains("| Vulkan |"),
+        "the rendered table has no Vulkan column: {header}"
+    );
+}
+
 /// The ops the XDNA2 table shows as planned are the ops the NPU page lists as verified, and no others.
 /// The page's verified list is the part of "What runs" before "Nothing else is verified" (the XDNA2
 /// half, before the Intel section). Mutation: add an op to `npu_ops` that plans but that the page does not
@@ -1164,7 +1203,11 @@ fn a_lane_count_is_the_cases_that_exercise_the_feature() {
                 poot-llm\tdriver::device_tests::guided_requests_ptx\n\
                 \n";
     let lanes = LaneCases {
-        lanes: vec![("PTX", LaneCases::parse(text)), ("wgpu", Vec::new())],
+        lanes: vec![
+            ("PTX", LaneCases::parse(text)),
+            ("wgpu", Vec::new()),
+            ("Vulkan", Vec::new()),
+        ],
     };
     let count = |column, name| {
         let feature = features()
@@ -1179,7 +1222,7 @@ fn a_lane_count_is_the_cases_that_exercise_the_feature() {
     assert_eq!(count("wgpu", "Guided decoding"), 0);
     let rendered = lanes_table(&lanes, &reference_targets());
     assert!(
-        rendered.contains("Guided decoding (regex, JSON schema, grammar) | <span class=\"matrix-status matrix-status--unverified\">No case</span> | <span class=\"matrix-status matrix-status--unverified\">No case</span> | <span class=\"matrix-status matrix-status--lane\">Required</span> 2 cases"),
+        rendered.contains("Guided decoding (regex, JSON schema, grammar) | <span class=\"matrix-status matrix-status--unverified\">No case</span> | <span class=\"matrix-status matrix-status--unverified\">No case</span> | <span class=\"matrix-status matrix-status--unverified\">No case</span> | <span class=\"matrix-status matrix-status--lane\">Required</span> 2 cases"),
         "{rendered}"
     );
 }
@@ -1314,7 +1357,7 @@ fn every_device_lane_requires_planning_against_its_attached_device() {
         .into_iter()
         .find(|f| f.name.starts_with("Planning against the attached device"))
         .expect("a listed feature");
-    for column in ["wgpu", "ROCm", "PTX"] {
+    for column in ["wgpu", "Vulkan", "ROCm", "PTX"] {
         assert!(
             lanes.count(column, &feature) > 0,
             "the {column} lane requires no case that plans against its attached device's caps"

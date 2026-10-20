@@ -119,9 +119,8 @@ a pod) needs a host glibc of at least 2.39, or the toolchain libraries bundled a
 
 ## Backends and features
 
-Production backends are selected at runtime with `--backend wgpu|rocm|ptx|vulkan`. ROCm needs
-`cargo build --features rocm` (or `--features rocm` on the specific binary you run). PTX and wgpu build
-with default features in the dev shell.
+Production backends are selected at runtime with `--backend wgpu|rocm|ptx|vulkan`. Every backend is built into
+every binary; a backend whose device is absent is refused when it opens, and `auto` probes devices, not features.
 
 See [Backends](../architecture/backends.mdx) for codegen targets, dispatch models, and capability
 notes. For serve-time backend choice, see [Picking a backend](../serve/choosing-a-backend.md).

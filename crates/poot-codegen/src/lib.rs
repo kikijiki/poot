@@ -45,7 +45,7 @@ pub use aie::{
 pub use cache::{ArtifactTooLarge, KernelCache, KernelId, KernelKey, epoch as kernel_cache_epoch};
 pub use emit::emit_llvm_ir;
 pub use handle::{
-    ArtifactMismatch, CompiledArtifact, GpuTarget, NoBodyTarget, NotAByteTarget, aie_kernel_handle,
+    ArtifactMismatch, CompiledArtifact, NoBodyTarget, NotAByteTarget, aie_kernel_handle,
     compile_kernel, kernel_handle, vpu_kernel_handle,
 };
 use poot_target::AmdArch;

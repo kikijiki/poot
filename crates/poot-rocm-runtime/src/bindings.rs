@@ -17,193 +17,193 @@ use std::ffi::{c_char, c_void};
 // Status type
 
 /// HSA status code (32-bit). Zero is success; nonzero is error class + specific error.
-pub type hsa_status_t = u32;
+pub(crate) type hsa_status_t = u32;
 
 /// `HSA_STATUS_SUCCESS = 0`, the only success code.
-pub const HSA_STATUS_SUCCESS: hsa_status_t = 0;
+pub(crate) const HSA_STATUS_SUCCESS: hsa_status_t = 0;
 /// `HSA_STATUS_ERROR = 0x1000`, the generic failure (also an already-registered system event handler).
-pub const HSA_STATUS_ERROR: hsa_status_t = 0x1000;
+pub(crate) const HSA_STATUS_ERROR: hsa_status_t = 0x1000;
 
 // Opaque agent / queue / pool / signal handles (all 64-bit)
 
 /// HSA agent handle. `handle == 0` means "no agent".
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct hsa_agent_t {
+pub(crate) struct hsa_agent_t {
     /// Opaque 64-bit runtime handle; 0 is the null handle.
-    pub handle: u64,
+    pub(crate) handle: u64,
 }
 
 /// HSA ISA handle. Same layout as `hsa_agent_t` but a different object class: passing one where the
 /// other is expected returns `HSA_STATUS_ERROR_INVALID_INDEX`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct hsa_isa_t {
+pub(crate) struct hsa_isa_t {
     /// Opaque 64-bit runtime handle; 0 is the null handle.
-    pub handle: u64,
+    pub(crate) handle: u64,
 }
 
 /// HSA signal handle. A signal is a 64-bit value visible to both CPU and GPU.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct hsa_signal_t {
+pub(crate) struct hsa_signal_t {
     /// Opaque 64-bit runtime handle; 0 is the null handle.
-    pub handle: u64,
+    pub(crate) handle: u64,
 }
 
 /// HSA queue handle. A queue is a ring of AQL packets; opaque to the host.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct hsa_queue_t {
+pub(crate) struct hsa_queue_t {
     _private: [u8; 0],
 }
 
 /// AMD memory pool handle (AMD extension; distinct from the plain HSA region handle).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct hsa_amd_memory_pool_t {
+pub(crate) struct hsa_amd_memory_pool_t {
     /// Opaque 64-bit runtime handle; 0 is the null handle.
-    pub handle: u64,
+    pub(crate) handle: u64,
 }
 
 /// Signal value type. 64-bit signed in `HSA_LARGE_MODEL` (which is what amdgcn uses).
-pub type hsa_signal_value_t = i64;
+pub(crate) type hsa_signal_value_t = i64;
 
 /// Queue type enum (32-bit).
-pub type hsa_queue_type32_t = u32;
+pub(crate) type hsa_queue_type32_t = u32;
 
 // hsa.h agent info attribute ids
 
 /// `hsa_agent_get_info` attribute: the agent's name, a NUL-terminated string.
-pub const HSA_AGENT_INFO_NAME: u32 = 0;
+pub(crate) const HSA_AGENT_INFO_NAME: u32 = 0;
 /// `hsa_agent_get_info` attribute: the agent's vendor name, a NUL-terminated string.
-pub const HSA_AGENT_INFO_VENDOR_NAME: u32 = 1;
+pub(crate) const HSA_AGENT_INFO_VENDOR_NAME: u32 = 1;
 /// `hsa_agent_get_info` attribute: the largest queue the agent supports, in packets (`uint32_t`).
-pub const HSA_AGENT_INFO_QUEUE_MAX_SIZE: u32 = 14;
+pub(crate) const HSA_AGENT_INFO_QUEUE_MAX_SIZE: u32 = 14;
 /// `hsa_agent_get_info` attribute: the agent's wavefront width in work-items (`uint32_t`).
-pub const HSA_AGENT_INFO_WAVEFRONT_SIZE: u32 = 6;
+pub(crate) const HSA_AGENT_INFO_WAVEFRONT_SIZE: u32 = 6;
 /// Returns an `hsa_device_type_t` (CPU=0, GPU=1, DSP=2). Query this for device type, not
 /// `HSA_AGENT_INFO_FEATURE` (a feature bitmask).
-pub const HSA_AGENT_INFO_DEVICE: u32 = 17;
+pub(crate) const HSA_AGENT_INFO_DEVICE: u32 = 17;
 /// `hsa_agent_get_info` attribute: the agent's first ISA, an [`hsa_isa_t`].
-pub const HSA_AGENT_INFO_ISA: u32 = 19;
+pub(crate) const HSA_AGENT_INFO_ISA: u32 = 19;
 
 // hsa.h device types
 
 /// `hsa_device_type_t` value of a CPU agent.
-pub const HSA_DEVICE_TYPE_CPU: u32 = 0;
+pub(crate) const HSA_DEVICE_TYPE_CPU: u32 = 0;
 /// `hsa_device_type_t` value of a GPU agent.
-pub const HSA_DEVICE_TYPE_GPU: u32 = 1;
+pub(crate) const HSA_DEVICE_TYPE_GPU: u32 = 1;
 
 // hsa.h queue types
 // Values match installed ROCm `hsa.h` (`HSA_QUEUE_TYPE_MULTI = 0`, `SINGLE = 1`). Do not swap
 // MULTI/SINGLE: ROCr's device-memory ring path and ordinary publication go through MULTI (=0).
 
 /// Queue type: several producers may enqueue (ROCr's ordinary queue).
-pub const HSA_QUEUE_TYPE_MULTI: hsa_queue_type32_t = 0;
+pub(crate) const HSA_QUEUE_TYPE_MULTI: hsa_queue_type32_t = 0;
 
 // hsa.h queue feature bits
 
 /// Queue feature bit: the queue accepts kernel-dispatch AQL packets.
-pub const HSA_QUEUE_FEATURE_KERNEL_DISPATCH: u32 = 1;
+pub(crate) const HSA_QUEUE_FEATURE_KERNEL_DISPATCH: u32 = 1;
 
 // hsa.h ISA info attribute ids
 
 /// `hsa_isa_get_info` attribute: the ISA name's length in bytes (`uint32_t`).
-pub const HSA_ISA_INFO_NAME_LENGTH: u32 = 0;
+pub(crate) const HSA_ISA_INFO_NAME_LENGTH: u32 = 0;
 /// `hsa_isa_get_info` attribute: the ISA name string (for example `amdgcn-amd-amdhsa--gfx1151`).
-pub const HSA_ISA_INFO_NAME: u32 = 1;
+pub(crate) const HSA_ISA_INFO_NAME: u32 = 1;
 
 // hsa_ext_amd.h agent info attribute ids (extension range)
 
 /// The agent's compute-unit count (`uint32_t`).
-pub const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
+pub(crate) const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
 /// AMD agent attribute: the PCI bus/device/function id (`uint32_t`).
-pub const HSA_AMD_AGENT_INFO_BDFID: u32 = 0xA006;
+pub(crate) const HSA_AMD_AGENT_INFO_BDFID: u32 = 0xA006;
 /// AMD agent attribute: the marketing product name, a NUL-terminated string.
-pub const HSA_AMD_AGENT_INFO_PRODUCT_NAME: u32 = 0xA009;
+pub(crate) const HSA_AMD_AGENT_INFO_PRODUCT_NAME: u32 = 0xA009;
 /// AMD agent attribute: the PCI domain (`uint32_t`).
-pub const HSA_AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
+pub(crate) const HSA_AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
 /// Bit-mask (`uint8_t[8]`) of agent memory properties. Test bits with `hsa_flag_isset64` using
 /// [`HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU`] as the bit index (the enum value is `1 << 0`, not a
 /// mask against the first byte).
-pub const HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES: u32 = 0xA114;
+pub(crate) const HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES: u32 = 0xA114;
 /// Bit index for `hsa_flag_isset64` on MEMORY_PROPERTIES (header value `1 << 0`). Do not `&` it
 /// against the raw property bytes.
-pub const HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU: u32 = 1 << 0;
+pub(crate) const HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU: u32 = 1 << 0;
 /// "The amount of memory available in bytes across all global pools owned by the agent" (uint64_t),
 /// per `hsa_ext_amd.h`. The ROCm/HSA analogue of CUDA's `cuMemGetInfo` free component; present at
 /// slot 0xA015 in ROCm runtime headers 6.4.3, 7.2.3 and TheRock 7.13.0a20260515. There is no "used"
 /// attribute; `RocmContext::vram_free_bytes` reads this value.
-pub const HSA_AMD_AGENT_INFO_MEMORY_AVAIL: u32 = 0xA015;
+pub(crate) const HSA_AMD_AGENT_INFO_MEMORY_AVAIL: u32 = 0xA015;
 
 // hsa_ext_amd.h memory pool info attribute ids
 
 /// Memory-pool attribute: the pool's `hsa_amd_segment_t` (`HSA_AMD_SEGMENT_GLOBAL` for device-visible pools).
-pub const HSA_AMD_MEMORY_POOL_INFO_SEGMENT: u32 = 0;
+pub(crate) const HSA_AMD_MEMORY_POOL_INFO_SEGMENT: u32 = 0;
 /// Memory-pool attribute: the pool's `HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_*` bitmask (`uint32_t`).
-pub const HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS: u32 = 1;
+pub(crate) const HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS: u32 = 1;
 /// Size of this pool in bytes (`size_t` in the header, read as `u64`; ROCm/HSA is 64-bit only).
 /// Summed over every `HSA_AMD_SEGMENT_GLOBAL` pool of the GPU agent, this is the "total" half of the
 /// VRAM metric (used = total - `HSA_AMD_AGENT_INFO_MEMORY_AVAIL`).
-pub const HSA_AMD_MEMORY_POOL_INFO_SIZE: u32 = 2;
+pub(crate) const HSA_AMD_MEMORY_POOL_INFO_SIZE: u32 = 2;
 /// Memory-pool attribute: the pool's `HSA_AMD_MEMORY_POOL_LOCATION_*` value (`uint32_t`).
-pub const HSA_AMD_MEMORY_POOL_INFO_LOCATION: u32 = 17;
+pub(crate) const HSA_AMD_MEMORY_POOL_INFO_LOCATION: u32 = 17;
 /// Memory-pool attribute: whether the application may allocate from the pool (`bool`).
-pub const HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED: u32 = 5;
+pub(crate) const HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED: u32 = 5;
 
 // hsa_ext_amd.h segment + location enum values
 
 /// `hsa_amd_segment_t` value of a global-segment pool.
-pub const HSA_AMD_SEGMENT_GLOBAL: u32 = 0;
+pub(crate) const HSA_AMD_SEGMENT_GLOBAL: u32 = 0;
 /// Pool location value: memory attached to a CPU.
-pub const HSA_AMD_MEMORY_POOL_LOCATION_CPU: u32 = 0;
+pub(crate) const HSA_AMD_MEMORY_POOL_LOCATION_CPU: u32 = 0;
 /// Pool location value: memory attached to a GPU.
-pub const HSA_AMD_MEMORY_POOL_LOCATION_GPU: u32 = 1;
+pub(crate) const HSA_AMD_MEMORY_POOL_LOCATION_GPU: u32 = 1;
 
 // hsa_ext_amd.h global-flag bitmasks
 
 /// Pool global flag: the pool may hold kernel-argument segments.
-pub const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1;
+pub(crate) const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT: u32 = 1;
 /// Pool global flag: fine-grained pool (host and device coherent).
-pub const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 2;
+pub(crate) const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED: u32 = 2;
 /// Pool global flag: coarse-grained pool (coherence only at synchronisation points).
-pub const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 4;
+pub(crate) const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 4;
 /// Pool global flag: fine-grained across the extended (system) scope.
-pub const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED: u32 = 8;
+pub(crate) const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_EXTENDED_SCOPE_FINE_GRAINED: u32 = 8;
 
 // hsa_ext_amd.h agent<->pool relationship attrs + link types
 
 /// Agent-to-pool attribute: the number of link hops on the path (`uint32_t`).
-pub const HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS: u32 = 1;
+pub(crate) const HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS: u32 = 1;
 /// Agent-to-pool attribute: an array of [`hsa_amd_memory_pool_link_info_t`], one per hop.
-pub const HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO: u32 = 2;
+pub(crate) const HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO: u32 = 2;
 
 /// `link_type` value of a PCIe hop.
-pub const HSA_AMD_LINK_INFO_TYPE_PCIE: u32 = 2;
+pub(crate) const HSA_AMD_LINK_INFO_TYPE_PCIE: u32 = 2;
 
 /// One hop on the path from an agent to a foreign memory pool (`hsa_amd_memory_pool_link_info_t`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct hsa_amd_memory_pool_link_info_t {
+pub(crate) struct hsa_amd_memory_pool_link_info_t {
     /// Minimum latency across the hop, in nanoseconds.
-    pub min_latency: u32,
+    pub(crate) min_latency: u32,
     /// Maximum latency across the hop, in nanoseconds.
-    pub max_latency: u32,
+    pub(crate) max_latency: u32,
     /// Minimum bandwidth across the hop, in MB/s.
-    pub min_bandwidth: u32,
+    pub(crate) min_bandwidth: u32,
     /// Maximum bandwidth across the hop, in MB/s.
-    pub max_bandwidth: u32,
+    pub(crate) max_bandwidth: u32,
     /// Whether 32-bit atomics are supported across the hop.
-    pub atomic_support_32bit: bool,
+    pub(crate) atomic_support_32bit: bool,
     /// Whether 64-bit atomics are supported across the hop.
-    pub atomic_support_64bit: bool,
+    pub(crate) atomic_support_64bit: bool,
     /// Whether the hop keeps both ends coherent.
-    pub coherent_support: bool,
+    pub(crate) coherent_support: bool,
     /// The hop's `HSA_AMD_LINK_INFO_TYPE_*` value.
-    pub link_type: u32,
+    pub(crate) link_type: u32,
     /// NUMA distance across the hop.
-    pub numa_distance: u32,
+    pub(crate) numa_distance: u32,
 }
 
 // AQL kernel dispatch packet (hsa.h `hsa_kernel_dispatch_packet_t`)
@@ -215,11 +215,11 @@ pub struct hsa_amd_memory_pool_link_info_t {
 ///   bits  8..8  = HSA_PACKET_HEADER_BARRIER (0/1)
 ///   bits  9..10 = HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE (0/1/2)
 ///   bits 11..12 = HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE (0/1/2)
-pub type hsa_packet_header_t = u16;
+pub(crate) type hsa_packet_header_t = u16;
 
 /// Bit field of `setup` for a kernel dispatch packet:
 ///   bits 0..1 = number of dimensions - 1 (1-D = 0, 2-D = 1, 3-D = 2)
-pub type hsa_kernel_dispatch_packet_setup_t = u16;
+pub(crate) type hsa_kernel_dispatch_packet_setup_t = u16;
 
 // AQL kernel-dispatch packet. The HSA Foundation `hsa_kernel_dispatch_packet_s` is conditional on
 // `HSA_LARGE_MODEL` (Strix Halo + amd64): the LITTLE_ENDIAN branch has an extra `reserved1` u32
@@ -242,37 +242,37 @@ pub type hsa_kernel_dispatch_packet_setup_t = u16;
 /// A 64-byte AQL kernel-dispatch packet (HSA_LARGE_MODEL layout, see the layout table above).
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
-pub struct hsa_kernel_dispatch_packet_t {
+pub(crate) struct hsa_kernel_dispatch_packet_t {
     /// Packet header: type, barrier bit and acquire/release fence scopes. Published last.
-    pub header: hsa_packet_header_t,
+    pub(crate) header: hsa_packet_header_t,
     /// Dimension count minus one in bits 0..1.
-    pub setup: hsa_kernel_dispatch_packet_setup_t,
+    pub(crate) setup: hsa_kernel_dispatch_packet_setup_t,
     /// Workgroup size along x, in work-items.
-    pub workgroup_size_x: u16,
+    pub(crate) workgroup_size_x: u16,
     /// Workgroup size along y, in work-items.
-    pub workgroup_size_y: u16,
+    pub(crate) workgroup_size_y: u16,
     /// Workgroup size along z, in work-items.
-    pub workgroup_size_z: u16,
+    pub(crate) workgroup_size_z: u16,
     /// Reserved by the spec; zero.
-    pub reserved0: u16,
+    pub(crate) reserved0: u16,
     /// Grid size along x, in work-items (not workgroups).
-    pub grid_size_x: u32,
+    pub(crate) grid_size_x: u32,
     /// Grid size along y, in work-items.
-    pub grid_size_y: u32,
+    pub(crate) grid_size_y: u32,
     /// Grid size along z, in work-items.
-    pub grid_size_z: u32,
+    pub(crate) grid_size_z: u32,
     /// Per-work-item scratch (private) segment size, in bytes.
-    pub private_segment_size: u32,
+    pub(crate) private_segment_size: u32,
     /// Per-workgroup group (LDS) segment size, in bytes.
-    pub group_segment_size: u32,
+    pub(crate) group_segment_size: u32,
     /// The kernel's code handle (`HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT`).
-    pub kernel_object: u64,
+    pub(crate) kernel_object: u64,
     /// Address of the kernel-argument segment the kernel reads its arguments from.
-    pub kernarg_address: *mut c_void,
+    pub(crate) kernarg_address: *mut c_void,
     /// Reserved by the spec; zero.
-    pub reserved2: u64,
+    pub(crate) reserved2: u64,
     /// Signal decremented when the dispatch completes; handle 0 means none.
-    pub completion_signal: hsa_signal_t,
+    pub(crate) completion_signal: hsa_signal_t,
 }
 
 // The struct must be exactly 64 bytes (the AQL slot size) under HSA_LARGE_MODEL; otherwise
@@ -285,85 +285,85 @@ const _: () = assert!(
 // C callback types (declared so ffi.rs's `unsafe extern "C" fn(...)` items type-check)
 
 /// `hsa_iterate_agents` callback. Return 0 to continue, nonzero to stop.
-pub type HsaAgentIterateCb =
+pub(crate) type HsaAgentIterateCb =
     unsafe extern "C" fn(agent: hsa_agent_t, data: *mut c_void) -> hsa_status_t;
 
 /// `hsa_amd_agent_iterate_memory_pools` callback. Return 0 to continue, nonzero to stop.
-pub type HsaAmdMemoryPoolIterateCb =
+pub(crate) type HsaAmdMemoryPoolIterateCb =
     unsafe extern "C" fn(pool: hsa_amd_memory_pool_t, data: *mut c_void) -> hsa_status_t;
 
 /// `hsa_queue_create` callback (the asynchronous error callback; `None` is passed).
-pub type HsaQueueCreateCb =
+pub(crate) type HsaQueueCreateCb =
     Option<unsafe extern "C" fn(status: hsa_status_t, queue: *mut hsa_queue_t, data: *mut c_void)>;
 
 /// `hsa_amd_event_type_t` value of a GPU memory fault.
-pub const HSA_AMD_GPU_MEMORY_FAULT_EVENT: u32 = 0;
+pub(crate) const HSA_AMD_GPU_MEMORY_FAULT_EVENT: u32 = 0;
 /// `hsa_amd_event_type_t` value of a GPU hardware exception (a reset).
-pub const HSA_AMD_GPU_HW_EXCEPTION_EVENT: u32 = 1;
+pub(crate) const HSA_AMD_GPU_HW_EXCEPTION_EVENT: u32 = 1;
 /// `hsa_amd_event_type_t` value of a GPU memory error.
-pub const HSA_AMD_GPU_MEMORY_ERROR_EVENT: u32 = 2;
+pub(crate) const HSA_AMD_GPU_MEMORY_ERROR_EVENT: u32 = 2;
 
 /// `hsa_amd_gpu_memory_fault_info_t`: where and why the GPU faulted.
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct hsa_amd_gpu_memory_fault_info_t {
+pub(crate) struct hsa_amd_gpu_memory_fault_info_t {
     /// The agent where the fault occurred.
-    pub agent: hsa_agent_t,
+    pub(crate) agent: hsa_agent_t,
     /// The virtual address accessed.
-    pub virtual_address: u64,
+    pub(crate) virtual_address: u64,
     /// `hsa_amd_memory_fault_reason_t` bits.
-    pub fault_reason_mask: u32,
+    pub(crate) fault_reason_mask: u32,
 }
 
 /// `hsa_amd_gpu_hw_exception_info_t`: a GPU reset and its cause.
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct hsa_amd_gpu_hw_exception_info_t {
+pub(crate) struct hsa_amd_gpu_hw_exception_info_t {
     /// The agent where the exception occurred.
-    pub agent: hsa_agent_t,
+    pub(crate) agent: hsa_agent_t,
     /// `hsa_amd_hw_exception_reset_type_t` bits.
-    pub reset_type: u32,
+    pub(crate) reset_type: u32,
     /// `hsa_amd_hw_exception_reset_cause_t` bits.
-    pub reset_cause: u32,
+    pub(crate) reset_cause: u32,
 }
 
 /// `hsa_amd_gpu_memory_error_info_t`: a memory error the GPU reported.
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct hsa_amd_gpu_memory_error_info_t {
+pub(crate) struct hsa_amd_gpu_memory_error_info_t {
     /// The agent where the error occurred.
-    pub agent: hsa_agent_t,
+    pub(crate) agent: hsa_agent_t,
     /// The virtual address involved.
-    pub virtual_address: u64,
+    pub(crate) virtual_address: u64,
     /// `hsa_amd_memory_error_reason_t` bits.
-    pub error_reason_mask: u32,
+    pub(crate) error_reason_mask: u32,
 }
 
 /// The payload union of [`hsa_amd_event_t`]; the active member follows `event_type`.
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub union hsa_amd_event_payload_t {
+pub(crate) union hsa_amd_event_payload_t {
     /// Valid for [`HSA_AMD_GPU_MEMORY_FAULT_EVENT`].
-    pub memory_fault: hsa_amd_gpu_memory_fault_info_t,
+    pub(crate) memory_fault: hsa_amd_gpu_memory_fault_info_t,
     /// Valid for [`HSA_AMD_GPU_HW_EXCEPTION_EVENT`].
-    pub hw_exception: hsa_amd_gpu_hw_exception_info_t,
+    pub(crate) hw_exception: hsa_amd_gpu_hw_exception_info_t,
     /// Valid for [`HSA_AMD_GPU_MEMORY_ERROR_EVENT`].
-    pub memory_error: hsa_amd_gpu_memory_error_info_t,
+    pub(crate) memory_error: hsa_amd_gpu_memory_error_info_t,
 }
 
 /// `hsa_amd_event_t`: one AMD system event delivered to the registered handler.
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct hsa_amd_event_t {
+pub(crate) struct hsa_amd_event_t {
     /// `hsa_amd_event_type_t`.
-    pub event_type: u32,
+    pub(crate) event_type: u32,
     /// The event's data, selected by `event_type`.
-    pub payload: hsa_amd_event_payload_t,
+    pub(crate) payload: hsa_amd_event_payload_t,
 }
 
 /// `hsa_amd_register_system_event_handler` callback. Return `HSA_STATUS_SUCCESS` once the event is
 /// handled.
-pub type HsaAmdSystemEventCb =
+pub(crate) type HsaAmdSystemEventCb =
     unsafe extern "C" fn(event: *const hsa_amd_event_t, data: *mut c_void) -> hsa_status_t;
 
 // Code-object / executable / signal handles (HSACO loading + AQL dispatch)
@@ -371,123 +371,123 @@ pub type HsaAmdSystemEventCb =
 /// Code object reader (opaque; freed via `hsa_code_object_reader_destroy`).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct hsa_code_object_reader_t {
+pub(crate) struct hsa_code_object_reader_t {
     /// Opaque 64-bit runtime handle; 0 is the null handle.
-    pub handle: u64,
+    pub(crate) handle: u64,
 }
 
 /// HSA executable handle. Created by `hsa_executable_create_alt`, loaded with one or more
 /// code objects, and frozen before symbol queries are valid.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct hsa_executable_t {
+pub(crate) struct hsa_executable_t {
     /// Opaque 64-bit runtime handle; 0 is the null handle.
-    pub handle: u64,
+    pub(crate) handle: u64,
 }
 
 /// Loaded code object handle (returned by `hsa_executable_load_agent_code_object`); only passed back
 /// to the runtime on free.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct hsa_loaded_code_object_t {
+pub(crate) struct hsa_loaded_code_object_t {
     /// Opaque 64-bit runtime handle; 0 is the null handle.
-    pub handle: u64,
+    pub(crate) handle: u64,
 }
 
 /// Float rounding mode for the executable: `HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT = 1`
 /// (round-to-nearest-even).
-pub type hsa_default_float_rounding_mode_t = u32;
+pub(crate) type hsa_default_float_rounding_mode_t = u32;
 
 /// Profile: `HSA_PROFILE_FULL = 1` (only full profile is supported for amdgcn kernels).
-pub const HSA_PROFILE_FULL: u32 = 1;
+pub(crate) const HSA_PROFILE_FULL: u32 = 1;
 /// `hsa_default_float_rounding_mode_t` value: the default mode (round-to-nearest-even).
-pub const HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT: u32 = 1;
+pub(crate) const HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT: u32 = 1;
 
 /// `hsa_profile_t` enum, aliased to u32 for the C ABI.
-pub type hsa_profile_t = u32;
+pub(crate) type hsa_profile_t = u32;
 
 /// `hsa_executable_symbol_t` is opaque (resolves to a kernel-object handle).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct hsa_executable_symbol_t {
+pub(crate) struct hsa_executable_symbol_t {
     /// Opaque 64-bit runtime handle; 0 is the null handle.
-    pub handle: u64,
+    pub(crate) handle: u64,
 }
 
 /// Executable symbol info attributes queried.
-pub const HSA_EXECUTABLE_SYMBOL_INFO_TYPE: u32 = 0;
+pub(crate) const HSA_EXECUTABLE_SYMBOL_INFO_TYPE: u32 = 0;
 /// Symbol attribute: the symbol name's length in bytes (`uint32_t`).
-pub const HSA_EXECUTABLE_SYMBOL_INFO_NAME_LENGTH: u32 = 1;
+pub(crate) const HSA_EXECUTABLE_SYMBOL_INFO_NAME_LENGTH: u32 = 1;
 /// Symbol attribute: the symbol name string.
-pub const HSA_EXECUTABLE_SYMBOL_INFO_NAME: u32 = 2;
+pub(crate) const HSA_EXECUTABLE_SYMBOL_INFO_NAME: u32 = 2;
 /// Symbol attribute: the kernel's code handle for a dispatch packet's `kernel_object` (`uint64_t`).
-pub const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT: u32 = 22;
+pub(crate) const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT: u32 = 22;
 /// Symbol attribute: the kernel-argument segment size, in bytes (`uint32_t`).
-pub const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE: u32 = 11;
+pub(crate) const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE: u32 = 11;
 /// Symbol attribute: the kernel's static group (LDS) segment size, in bytes (`uint32_t`).
-pub const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE: u32 = 13;
+pub(crate) const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE: u32 = 13;
 /// Symbol attribute: the kernel's per-work-item private segment size, in bytes (`uint32_t`).
-pub const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE: u32 = 14;
+pub(crate) const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE: u32 = 14;
 
 /// Symbol kinds (returned by `HSA_EXECUTABLE_SYMBOL_INFO_TYPE`): `HSA_SYMBOL_KIND_VARIABLE = 0`,
 /// `HSA_SYMBOL_KIND_KERNEL = 1`, `HSA_SYMBOL_KIND_INDIRECT_FUNCTION = 2`.
-pub const HSA_SYMBOL_KIND_KERNEL: u32 = 1;
+pub(crate) const HSA_SYMBOL_KIND_KERNEL: u32 = 1;
 
 /// Callback signature for `hsa_executable_iterate_symbols`.
-pub type hsa_executable_iterate_symbols_cb_t = Option<
+pub(crate) type hsa_executable_iterate_symbols_cb_t = Option<
     unsafe extern "C" fn(hsa_executable_t, hsa_executable_symbol_t, *mut c_void) -> hsa_status_t,
 >;
 
 // hsa.h signal wait conditions (for hsa_signal_wait_scacquire's condition arg)
 
 /// Signal wait condition: wait while the value is less than the compare value.
-pub const HSA_SIGNAL_CONDITION_LT: u32 = 0;
+pub(crate) const HSA_SIGNAL_CONDITION_LT: u32 = 0;
 
 // hsa.h system info attribute ids (for hsa_system_get_info)
 
 /// The HSA runtime's major version (`uint16_t`).
-pub const HSA_SYSTEM_INFO_VERSION_MAJOR: u32 = 0;
+pub(crate) const HSA_SYSTEM_INFO_VERSION_MAJOR: u32 = 0;
 
 /// The HSA runtime's minor version (`uint16_t`).
-pub const HSA_SYSTEM_INFO_VERSION_MINOR: u32 = 1;
+pub(crate) const HSA_SYSTEM_INFO_VERSION_MINOR: u32 = 1;
 
 /// The system timestamp's increase rate in Hz (`uint64_t`); the unit of
 /// [`hsa_amd_profiling_dispatch_time_t`] ticks.
-pub const HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY: u32 = 3;
+pub(crate) const HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY: u32 = 3;
 
 /// `hsa_amd_profiling_dispatch_time_t`: a dispatch's start and end, in system-timestamp ticks.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct hsa_amd_profiling_dispatch_time_t {
+pub(crate) struct hsa_amd_profiling_dispatch_time_t {
     /// Dispatch start, in system-timestamp ticks.
-    pub start: u64,
+    pub(crate) start: u64,
     /// Dispatch end, in system-timestamp ticks.
-    pub end: u64,
+    pub(crate) end: u64,
 }
 
 // hsa.h wait states (for hsa_signal_wait_scacquire's state_hint arg)
 
 /// Wait-state hint: the waiter may block (sleep) rather than spin.
-pub const HSA_WAIT_STATE_BLOCKED: u32 = 1;
+pub(crate) const HSA_WAIT_STATE_BLOCKED: u32 = 1;
 
 // C enum parameter types (each an `int`-sized enum in the headers)
 
 /// C enum parameter type of an `hsa_agent_get_info` attribute id.
-pub type hsa_agent_info_t = u32;
+pub(crate) type hsa_agent_info_t = u32;
 /// C enum parameter type of an `hsa_isa_get_info` attribute id.
-pub type hsa_isa_info_t = u32;
+pub(crate) type hsa_isa_info_t = u32;
 /// C enum parameter type of an `hsa_system_get_info` attribute id.
-pub type hsa_system_info_t = u32;
+pub(crate) type hsa_system_info_t = u32;
 /// C enum parameter type of a signal wait condition.
-pub type hsa_signal_condition_t = u32;
+pub(crate) type hsa_signal_condition_t = u32;
 /// C enum parameter type of a signal wait-state hint.
-pub type hsa_wait_state_t = u32;
+pub(crate) type hsa_wait_state_t = u32;
 /// C enum parameter type of a memory-pool attribute id.
-pub type hsa_amd_memory_pool_info_t = u32;
+pub(crate) type hsa_amd_memory_pool_info_t = u32;
 /// C enum parameter type of an agent-to-pool attribute id.
-pub type hsa_amd_agent_memory_pool_info_t = u32;
+pub(crate) type hsa_amd_agent_memory_pool_info_t = u32;
 /// C enum parameter type of an executable-symbol attribute id.
-pub type hsa_executable_symbol_info_t = u32;
+pub(crate) type hsa_executable_symbol_info_t = u32;
 
 // Header declarations of every HSA function the crate calls, transcribed from ROCm 7.2.3
 // `hsa/hsa.h` and `hsa/hsa_ext_amd.h` with the header's parameter names. The crate never calls or
@@ -554,7 +554,6 @@ unsafe extern "C" {
     pub(crate) fn hsa_queue_load_read_index_relaxed(queue: *const hsa_queue_t) -> u64;
     pub(crate) fn hsa_queue_add_write_index_relaxed(queue: *const hsa_queue_t, value: u64) -> u64;
     pub(crate) fn hsa_queue_add_write_index_acq_rel(queue: *const hsa_queue_t, value: u64) -> u64;
-    pub(crate) fn hsa_queue_store_write_index_relaxed(queue: *const hsa_queue_t, value: u64);
     pub(crate) fn hsa_amd_agent_iterate_memory_pools(
         agent: hsa_agent_t,
         callback: Option<HsaAmdMemoryPoolIterateCb>,

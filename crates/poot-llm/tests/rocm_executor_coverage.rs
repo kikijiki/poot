@@ -12,8 +12,6 @@
 //! Each row names the deleted probe it replaces and the mutation that turns it red; the mutations
 //! guard code outside this file, so each was applied once, observed red, and restored.
 
-#![cfg(feature = "rocm")]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

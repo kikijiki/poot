@@ -7,6 +7,7 @@
 //! weights of a toy graph.
 
 pub mod block_top_k;
+pub mod composites;
 pub mod const_weights;
 pub mod graph_fixtures;
 pub mod packed_graphs;

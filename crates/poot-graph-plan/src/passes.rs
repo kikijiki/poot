@@ -36,6 +36,7 @@ mod packed;
 mod packed_bind;
 mod pool;
 mod routed_experts;
+mod selection;
 mod sharding;
 pub(crate) mod stage_split;
 mod widen;
@@ -102,6 +103,7 @@ pub(crate) use pool::pool_experts;
 pub use pool::{PoolError, PoolSite, PoolSpec, PooledWeight, routed_step_demand};
 #[cfg(any(test, feature = "test-support"))]
 pub use routed_experts::{RoutedExpertSite, routed_expert_sites};
+pub(crate) use selection::form_selection;
 pub(crate) use sharding::expand_ranks;
 pub use sharding::{ShardError, ShardRule, ShardedGraph, shard};
 pub use stage_split::BoundaryDescriptor;
@@ -117,6 +119,7 @@ pub(crate) use widen::{fuse_index_casts, fuse_widening_casts};
 pub fn passes_without_target(g: &Graph) -> Result<Graph, EditError> {
     let g = cse(&canonicalize(g)?)?;
     let g = flash_attention_capped(&rope_fusion(&fold_iota(&g)?)?.0, Some(65_535))?.0;
+    let g = form_selection(&g)?;
     let g = fuse_contraction_epilogues(&dce(&g)?, |_, _| true)?;
     fuse_index_casts(&fuse_widening_casts(&fuse(&g)?)?)
 }

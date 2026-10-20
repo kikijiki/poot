@@ -70,7 +70,7 @@ impl Context {
     }
 
     /// The **effective** single-buffer limit for allocation planning: `min` of the raw device
-    /// `max_buffer_size` and [`AMD_RADV_SAFE_MAX_BUFFER_BYTES`] on AMD Vulkan (RADV) adapters,
+    /// `max_buffer_size` and [`poot_target::AMD_RADV_SAFE_MAX_BUFFER_BYTES`] on AMD Vulkan (RADV) adapters,
     /// else the raw limit. This is the number exact-model traces must consume (Card 453 D1);
     /// see the constant's doc for the observed RADV gfx-ring wedge at the raw device max.
     pub fn effective_max_buffer_size(&self) -> u64 {
@@ -210,7 +210,7 @@ impl Context {
         let is_amd_radv =
             adapter_info.backend == wgpu::Backend::Vulkan && adapter_info.vendor == 0x1002;
         let effective_max_buffer_size = if is_amd_radv {
-            max_buffer_size.min(crate::AMD_RADV_SAFE_MAX_BUFFER_BYTES)
+            max_buffer_size.min(poot_target::AMD_RADV_SAFE_MAX_BUFFER_BYTES)
         } else {
             max_buffer_size
         };
@@ -430,13 +430,13 @@ fn granted_tensor_core(
         })
 }
 
-/// The adapter's compute units through [`crate::amd_vulkan_compute_units`]; `None` off Vulkan.
+/// The adapter's compute units through [`poot_runtime_common::vulkan_probe::amd_vulkan_compute_units`]; `None` off Vulkan.
 fn probe_amd_compute_units(adapter: &wgpu::Adapter) -> Option<u32> {
     // SAFETY: `as_hal` yields the live wgpu-hal Vulkan adapter for the guard's lifetime, so its
     // instance and physical device are valid for the call.
     unsafe {
         let hal = adapter.as_hal::<wgpu_hal::vulkan::Api>()?;
-        crate::amd_vulkan_compute_units(
+        poot_runtime_common::vulkan_probe::amd_vulkan_compute_units(
             hal.shared_instance().raw_instance(),
             hal.raw_physical_device(),
         )

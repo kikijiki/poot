@@ -168,7 +168,7 @@ pub(super) fn attend(
             b.concat(3, &[window, c.mask])?,
         ),
     };
-    let out = ops::attention_prefill_with_sink(
+    let out = ops::attention_masked_sinks(
         b,
         local.q,
         keys,
@@ -177,8 +177,6 @@ pub(super) fn attend(
         a.scale,
         mask,
         w.sinks.declare_f32(b)?,
-        a.heads,
-        t,
     )?;
     // Undo the rotation the value picked up from the key it shares.
     let out = rotate_tail(b, out, &local.rows.inverse(b)?, a.rope_dim)?;

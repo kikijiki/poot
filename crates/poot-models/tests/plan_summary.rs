@@ -508,10 +508,10 @@ fn plan_summary_rendering_is_deterministic() {
 
 /// Card 557 SC-003: a tracer states primitives and `ops::` compositions only. Every corpus graph, as
 /// traced and before `compile`, holds no compiler-fusion or schedule-choice composite (`OpClass::
-/// Composite`: the flash ops, `Rope`, `ContractionEpilogue` and the fused regions; the packed and dense claims
-/// are `Primitive` until Card 629 gives them a decomposition). The authorized bounded semantic source
-/// carriers are the recurrence `Scan` (it states a recurrence and its bounded expansion, not a schedule) and
-/// the indexer's `BlockTopK` and `SelectedAttention` (they state a selection and the attention over it, with a dense oracle definition, not a schedule). Then `compile`'s passes do form composites, so
+/// Composite`: the flash ops, `Rope`, `ContractionEpilogue`, the fused regions, `BlockTopK` and
+/// `SelectedAttention`; the packed and dense claims are `Primitive` until Card 629 gives them a
+/// decomposition). The one authorized bounded semantic source carrier is the recurrence `Scan` (it states a
+/// recurrence and its bounded expansion, not a schedule). Then `compile`'s passes do form composites, so
 /// the check is not vacuous. Mutation: emit `ContractionEpilogue` from `ops::linear`, or mark one of those ops
 /// `OpClass::Primitive` and trace it; this row names the graph and equation.
 #[test]
@@ -524,12 +524,7 @@ fn every_corpus_trace_is_primitive_before_compile() {
     for row in corpus(&registry()) {
         let g = row.graph();
         for (i, eqn) in g.eqns().iter().enumerate() {
-            if matches!(
-                eqn.op,
-                poot_graph_ir::OpKind::Scan(_)
-                    | poot_graph_ir::OpKind::BlockTopK(_)
-                    | poot_graph_ir::OpKind::SelectedAttention(_)
-            ) {
+            if matches!(eqn.op, poot_graph_ir::OpKind::Scan(_)) {
                 continue;
             }
             assert_eq!(
@@ -686,10 +681,11 @@ fn a_launch_grid_one_workgroup_short_is_caught() {
 }
 
 /// Launch counts, written out. A digest changes whenever anything about a plan does; these numbers are
-/// the ones a reviewer can hold the planner to. One decode step of the two-layer dense qwen2 launches 38
+/// the ones a reviewer can hold the planner to. One decode step of the two-layer dense qwen2 launches 37
 /// kernels (a token gather, two layers of norm, Q/K/V projections, two rotaries, two cache updates,
 /// attention, output projection, norm and the gate/up/down feed-forward, then the final norm and the
-/// head), and qwen3 adds one query-norm and one key-norm launch per layer: 38 + 2 * 2 = 42. The counts
+/// head; the attention states its causal mask by the position, so no launch builds one), and qwen3 adds one
+/// query-norm and one key-norm launch per layer: 37 + 2 * 2 = 41. The counts
 /// are the same on every target because no target here lacks a fusion another has. The same graph takes
 /// far fewer launches than it has equations. Mutation: disable a fusion pass (for example
 /// `fuse_contraction_epilogues`): the launch count rises and the row names the graph and the target.
@@ -698,8 +694,8 @@ fn literal_launch_counts() {
     let registry = registry();
     let corpus = corpus(&registry);
     for (name, launches) in [
-        ("parity.qwen2.decode", 38usize),
-        ("parity.qwen3.decode", 42),
+        ("parity.qwen2.decode", 37usize),
+        ("parity.qwen3.decode", 41),
     ] {
         let graph = corpus
             .iter()

@@ -1195,7 +1195,7 @@ impl VlmReference {
         let session = poot_llm::FrontEndSession::open(Arc::clone(handle), |_, positions| {
             Ok::<_, poot_llm::driver::error::DriverError>((
                 vision.take().expect("one tower"),
-                poot_llm::tower_options(positions),
+                poot_llm::driver::DriverOptions::tower(positions),
             ))
         })
         .expect("open the vision towers")

@@ -4,8 +4,8 @@ use super::{
     NumericalRewriteReason, OpKind, Operand, RedOp, Scalar, Storage, UnOp, ValueId, with_eqns,
 };
 use poot_graph_ir::{
-    AttentionAttrs, ComputedConst, IndexRange, KeyLayout, KvBound, RangeFacts, ValueTable,
-    value_ranges,
+    AttentionAttrs, ComputedConst, IndexRange, KeyLayout, KvBound, MaskOperand, RangeFacts,
+    SinkOperand, ValueTable, ops::MASK_HIDDEN, value_ranges,
 };
 
 /// A fusion the attention or rope matcher left alone on a near-miss chain, and the first check that
@@ -45,6 +45,12 @@ pub enum AttentionDecline {
     NotExp,
     /// `shifted` is not `Sub(scores, m)`.
     NotSub,
+    /// The normalizer adds a sink mass (or the row maximum folds a sink logit) but the sink spelling is not
+    /// the one [`poot_graph_ir::ops::attention_masked_sinks`] emits: `m = Max(rowmax, sinks)`, `denom =
+    /// Add(Sum(e), Exp(Sub(sinks, m)))`, both over the same `sinks`.
+    SinkChain,
+    /// The sink logits are not `Reshape(sinks [Hq], [1, Hq, 1, 1])`.
+    SinkLogits,
     /// `m` is not a keepdim `Max` over the same `scores` on the last axis.
     RowMax,
     /// `scores` is not `Add(pre_mask, mask)` with one operand the scaled `Q K^T` product.
@@ -73,6 +79,9 @@ pub enum AttentionDecline {
     LiveLengthUnproved,
     /// The fused op's own typing rule disagrees with the region it would replace (infer-and-compare).
     TypeMismatch,
+    /// A prefill-shaped attention whose `Hq * Lq` workgroup count is over the target's grid cap: the fused
+    /// kernel launches one workgroup per query row and the target has no plan-time fallback for a larger grid.
+    PrefillGrid,
 }
 
 /// Why the rope matcher did not fuse a candidate equation. The same first-failing-check contract as
@@ -216,9 +225,13 @@ pub(super) struct AttnMatch {
     pub(super) key: KeyLayout,
     /// The pre-GQA-repeat value, or the value pool of a paged one.
     pub(super) v: ValueId,
+    /// The mask operand: the additive tensor, or the `[B, Lq]` positions of a causal mask.
     pub(super) mask: ValueId,
+    pub(super) mask_kind: MaskOperand,
     /// The proved live length `[B]`, when the chain is the guarded live-capacity composite.
     pub(super) len: Option<ValueId>,
+    /// The per-head sink logits `[Hq]`, when the softmax carries a sink.
+    pub(super) sinks: Option<ValueId>,
     pub(super) n_rep: usize,
     pub(super) scale: f32,
     pub(super) decode: bool, // M==1 (decode) vs M>1 (prefill)
@@ -664,14 +677,28 @@ pub(super) fn match_attention(
     let denom =
         val(div.inputs.get(1).ok_or(AttentionDecline::NotDiv)?).ok_or(AttentionDecline::NotDiv)?;
 
-    // denom = ReduceSum(e, last, keepdim) over the SAME e
+    // denom = ReduceSum(e, last, keepdim) over the SAME e; with a sink, denom = Add(that sum, the sink mass)
     let denom_eqn = pe(denom).ok_or(AttentionDecline::Denom)?;
-    match &denom_eqn.op {
+    let (sum_eqn, sink_mass) = match (&denom_eqn.op, two_values(&denom_eqn.inputs)) {
+        (OpKind::Binary(BinOp::Add), Some((a, b))) => {
+            // The sum is the addend that reduces `e`; the other is the sink's mass.
+            let reduces = |v: ValueId| {
+                pe(v).filter(|eqn| matches!(eqn.op, OpKind::Reduce { op: RedOp::Sum, .. }))
+            };
+            match (reduces(a), reduces(b)) {
+                (Some(sum), _) => (sum, Some(b)),
+                (None, Some(sum)) => (sum, Some(a)),
+                (None, None) => return Err(AttentionDecline::Denom),
+            }
+        }
+        _ => (denom_eqn, None),
+    };
+    match &sum_eqn.op {
         OpKind::Reduce {
             op: RedOp::Sum,
             axis,
             keepdim: true,
-        } if val(denom_eqn.inputs.first().ok_or(AttentionDecline::Denom)?) == Some(e)
+        } if val(sum_eqn.inputs.first().ok_or(AttentionDecline::Denom)?) == Some(e)
             && *axis == last_axis(e) => {}
         _ => return Err(AttentionDecline::Denom),
     }
@@ -692,17 +719,49 @@ pub(super) fn match_attention(
     let m =
         val(sub.inputs.get(1).ok_or(AttentionDecline::NotSub)?).ok_or(AttentionDecline::NotSub)?;
 
-    // m = ReduceMax(scores, last, keepdim) over the SAME scores
+    // m = ReduceMax(scores, last, keepdim) over the SAME scores; with a sink, m = Max(that, sinks)
     let m_eqn = pe(m).ok_or(AttentionDecline::RowMax)?;
-    match &m_eqn.op {
+    let (row_max, sink_logits) = match (&m_eqn.op, two_values(&m_eqn.inputs)) {
+        (OpKind::Binary(BinOp::Max), Some((row_max, logits))) => (row_max, Some(logits)),
+        _ => (m, None),
+    };
+    let row_max_eqn = pe(row_max).ok_or(AttentionDecline::RowMax)?;
+    match &row_max_eqn.op {
         OpKind::Reduce {
             op: RedOp::Max,
             axis,
             keepdim: true,
-        } if val(m_eqn.inputs.first().ok_or(AttentionDecline::RowMax)?) == Some(scores)
+        } if val(row_max_eqn.inputs.first().ok_or(AttentionDecline::RowMax)?) == Some(scores)
             && *axis == last_axis(scores) => {}
         _ => return Err(AttentionDecline::RowMax),
     }
+    // The sink is either in both the maximum and the normalizer, over the same logits, or in neither.
+    let sinks = match (sink_logits, sink_mass) {
+        (None, None) => None,
+        (Some(logits), Some(mass)) => {
+            let mass_eqn = pe(mass).ok_or(AttentionDecline::SinkChain)?;
+            let [Operand::Value(shifted_sink)] = mass_eqn.inputs.as_slice() else {
+                return Err(AttentionDecline::SinkChain);
+            };
+            let shifted_sink = pe(*shifted_sink).ok_or(AttentionDecline::SinkChain)?;
+            if !matches!(mass_eqn.op, OpKind::Unary(UnOp::Exp))
+                || !matches!(shifted_sink.op, OpKind::Binary(BinOp::Sub))
+                || two_values(&shifted_sink.inputs) != Some((logits, m))
+            {
+                return Err(AttentionDecline::SinkChain);
+            }
+            let heads = *g
+                .aval(logits)
+                .shape
+                .get(1)
+                .ok_or(AttentionDecline::SinkLogits)?;
+            Some(
+                reshaped_from(g, prod, logits, &[1, heads, 1, 1])
+                    .ok_or(AttentionDecline::SinkLogits)?,
+            )
+        }
+        _ => return Err(AttentionDecline::SinkChain),
+    };
 
     // The live bound's score guard: `scores = Select(active, added, -inf)`. Without it `scores` is the
     // additive-mask add itself.
@@ -796,6 +855,12 @@ pub(super) fn match_attention(
         Some((k, v)) => (k.pool, v.pool, Some(k.read)),
         None => (key.head, v, None),
     };
+    // A mask built by `causal_mask_from_pos` over this score row is stated by its positions instead of
+    // read from a tensor; any other mask (ALiBi's bias, a padding mask) stays the additive operand.
+    let (mask, mask_kind) = match match_causal_mask(g, prod, mask, &g.aval(q).shape, lk) {
+        Some((positions, window)) => (positions, MaskOperand::Causal { window }),
+        None => (mask, MaskOperand::Additive),
+    };
     let m = AttnMatch {
         q,
         k,
@@ -810,7 +875,9 @@ pub(super) fn match_attention(
         },
         v,
         mask,
+        mask_kind,
         len: live_len,
+        sinks,
         n_rep: key.n_rep,
         scale,
         decode,
@@ -828,6 +895,72 @@ pub(super) fn match_attention(
         return Err(AttentionDecline::TypeMismatch);
     }
     Ok(m)
+}
+
+/// `mask` as `ops::causal_mask_from_pos(pos, lk, window)`, exactly as the helper emits it: the positions
+/// `[B, Lq]` of the query `q_shape` and the window. `None` for any other mask, and for positions that are
+/// not one row per query (a broadcast positions tensor is not the fused operand).
+fn match_causal_mask(
+    g: &Graph,
+    prod: &HashMap<ValueId, usize>,
+    mask: ValueId,
+    q_shape: &[usize],
+    lk: usize,
+) -> Option<(ValueId, Option<usize>)> {
+    let producer = |v: ValueId| prod.get(&v).map(|&i| &g.eqns()[i]);
+    let binary = |v: ValueId, op: BinOp| {
+        producer(v)
+            .filter(|eqn| matches!(&eqn.op, OpKind::Binary(o) if *o == op))
+            .map(|eqn| eqn.inputs.as_slice())
+    };
+    // mask = Mul(Sub(visible, 1.0), -MASK_HIDDEN)
+    let (bias, scalar) = value_and_scalar(binary(mask, BinOp::Mul)?)?;
+    if scalar != Scalar::F32(-MASK_HIDDEN) {
+        return None;
+    }
+    let (visible, scalar) = value_and_scalar(binary(bias, BinOp::Sub)?)?;
+    if scalar != Scalar::F32(1.0) {
+        return None;
+    }
+    // visible = Ge(pos_col, keys_row), times `Ge(keys_row, pos_col - (window - 1))` under a window
+    let (causal, window) = match binary(visible, BinOp::Mul) {
+        None => (visible, None),
+        Some(inputs) => {
+            let (causal, in_window) = two_values(inputs)?;
+            let (keys_row, lower) = two_values(binary(in_window, BinOp::Ge)?)?;
+            let (pos_col, scalar) = value_and_scalar(binary(lower, BinOp::Sub)?)?;
+            let Scalar::F32(span) = scalar else {
+                return None;
+            };
+            let causal_inputs = binary(causal, BinOp::Ge)?;
+            if two_values(causal_inputs) != Some((pos_col, keys_row))
+                || span < 0.0
+                || span.fract() != 0.0
+            {
+                return None;
+            }
+            (causal, Some(span as usize + 1))
+        }
+    };
+    let (pos_col, keys_row) = two_values(binary(causal, BinOp::Ge)?)?;
+    // keys_row = reshape(iota_f32(lk), [1,1,1,lk]); pos_col = reshape(cast_f32(pos), [rows,1,tokens,1])
+    let keys = reshaped_from(g, prod, keys_row, &[1, 1, 1, lk])?;
+    if iota_len(g, prod, keys, DType::F32) != Some(lk) {
+        return None;
+    }
+    let &[batch, _, tokens, _] = g.aval(pos_col).shape.as_slice() else {
+        return None;
+    };
+    let cast = reshaped_from(g, prod, pos_col, &[batch, 1, tokens, 1])?;
+    let cast = producer(cast).filter(|eqn| matches!(&eqn.op, OpKind::Cast { to: DType::F32 }))?;
+    let [Operand::Value(positions)] = cast.inputs.as_slice() else {
+        return None;
+    };
+    let positions_type = g.aval(*positions);
+    (positions_type.dtype == DType::I32
+        && positions_type.shape == [batch, tokens]
+        && matches!(q_shape, [b, _, l, _] if (*b, *l) == (batch, tokens)))
+    .then_some((*positions, window))
 }
 
 /// Whether the graph proves `len` in `1..=lk` on every output an executor publishes (POOT-726).
@@ -861,18 +994,25 @@ impl AttnMatch {
             } else {
                 KvBound::Capacity
             },
+            sink: if self.sinks.is_some() {
+                SinkOperand::PerHead
+            } else {
+                SinkOperand::Absent
+            },
+            mask: self.mask_kind,
             ..AttentionAttrs::new(self.n_rep, self.scale, self.softcap)
         })
     }
 
-    /// The fused op's operands: `[q, k, v, mask]`, then the shared key part or the slot map, then the live
-    /// length.
+    /// The fused op's operands: `[q, k, v, mask or positions]`, then the shared key part or the slot map,
+    /// then the live length, then the sink logits.
     pub(super) fn operands(&self) -> Vec<ValueId> {
         [self.q, self.k, self.v, self.mask]
             .into_iter()
             .chain(self.k_shared)
             .chain(self.read)
             .chain(self.len)
+            .chain(self.sinks)
             .collect()
     }
 }
@@ -931,7 +1071,13 @@ pub fn flash_attention_capped(
                 out: e.out,
                 layer: e.layer,
             },
-            Ok(_) => e.clone(),
+            Ok(_) => {
+                declines.push(FusionDecline {
+                    value: e.out,
+                    reason: FusionDeclineReason::Attention(AttentionDecline::PrefillGrid),
+                });
+                e.clone()
+            }
             Err(reason) => {
                 if attention_near_miss(g, &prod, e, reason) {
                     declines.push(FusionDecline {
@@ -946,26 +1092,30 @@ pub fn flash_attention_capped(
     Ok((with_eqns(g, eqns)?, declines))
 }
 
-/// Whether `reason` is a failure past recognizing the softmax normalizer, the only point where a matmul
-/// is attention-shaped. A BF16 or F16 chain fails `NotF32` before that check runs, so it counts when its
-/// first operand is a `Div`.
+/// Whether `reason` is a failure of a softmax-weighted matmul: a contraction whose left operand is a `Div`
+/// of an `Exp`. Anything else with a `Div` in front of a matmul (a sigmoid-gelu quotient, a plain
+/// normalization) is no attention candidate and reports nothing. A BF16 or F16 chain fails `NotF32` before
+/// the normalizer is checked, so it counts under the same shape test.
 fn attention_near_miss(
     g: &Graph,
     prod: &HashMap<ValueId, usize>,
     root: &Eqn,
     reason: AttentionDecline,
 ) -> bool {
-    match reason {
-        AttentionDecline::RootNotMatmul | AttentionDecline::NotDiv => false,
-        AttentionDecline::NotF32 => matches!(
-            root.inputs.first(),
-            Some(Operand::Value(p))
-                if prod
-                    .get(p)
-                    .is_some_and(|&i| matches!(g.eqns()[i].op, OpKind::Binary(BinOp::Div)))
-        ),
-        _ => true,
+    if matches!(
+        reason,
+        AttentionDecline::RootNotMatmul | AttentionDecline::NotDiv
+    ) {
+        return false;
     }
+    let producer = |operand: Option<&Operand>| match operand {
+        Some(Operand::Value(value)) => prod.get(value).map(|&i| &g.eqns()[i]),
+        _ => None,
+    };
+    producer(root.inputs.first())
+        .filter(|div| matches!(div.op, OpKind::Binary(BinOp::Div)))
+        .and_then(|div| producer(div.inputs.first()))
+        .is_some_and(|numerator| matches!(numerator.op, OpKind::Unary(UnOp::Exp)))
 }
 
 /// A matched RoPE rotate-half chain. `x` is the tensor the rotation applies to (width `rot` on the last

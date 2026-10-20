@@ -22,7 +22,7 @@ use crate::queue::{
     destroy_queue_reference, device_ring_override_present, queue_request, validate_created_queue,
     validate_queue_plan_provenance,
 };
-use poot_runtime_common::{BufferRole, MemoryCounters, fnv1a};
+use poot_runtime_common::{BufferRole, MemoryCounters, UPLOAD_CHUNK_BYTES, fnv1a};
 use poot_target::{BufferStorage, ElementKind};
 use std::cell::Cell;
 use std::ffi::{OsString, c_void};
@@ -2141,7 +2141,7 @@ fn compile_and_load(
     ));
     std::fs::create_dir_all(&dir).expect("create fixture artifact dir");
     let out = poot_codegen::artifact_path(&dir, name, target);
-    let artifact = poot_codegen::compile_kernel(body, poot_codegen::GpuTarget::AmdGcn(arch), &out)
+    let artifact = poot_codegen::compile_kernel(body, poot_target::Backend::AmdGcn(arch), &out)
         .unwrap_or_else(|e| panic!("compile {name}: {e}"));
     let kernel = poot_codegen::kernel_handle(body, &artifact).unwrap();
     let module = ctx

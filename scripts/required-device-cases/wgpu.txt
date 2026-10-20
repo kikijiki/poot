@@ -11,6 +11,7 @@
 # binary: card 559's imported_kernel_tests are the only real dispatch consumers of the
 # rowsum_for/rmsnorm_dyn committed assets, so they must run here, not just in the staleness test.
 poot-executor	engine::kernel_identity_tests::colliding_display_keys_with_different_bodies_never_alias_in_either_order
+poot-executor::cr30_lifecycle	a_device_failure_is_labelled_with_the_runtime_that_raised_it
 poot-executor::cr30_lifecycle	begin_failure_aborts_exactly_once_and_leaves_no_open_recording
 poot-executor::cr30_lifecycle	carried_state_has_no_ping_pong_pair
 poot-executor::cr30_lifecycle	copy_failure_during_recording_aborts_once_and_does_not_mark_needs_reset
@@ -300,6 +301,8 @@ poot-wgpu-device::buffer_plan	a_short_value_reusing_a_larger_slot_publishes_its_
 poot-wgpu-device::buffer_plan	an_over_length_dispatch_is_refused_by_the_engine_on_wgpu
 poot-wgpu-device::buffer_plan	disjoint_lifetimes_reuse_one_slot_and_match_the_oracle
 poot-wgpu-device::buffer_plan	len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity
+poot-wgpu-device::copy	copy_between_unequal_lengths_is_refused_on_wgpu
+poot-wgpu-device::copy	copy_of_an_odd_byte_length_is_exact_on_wgpu
 poot-wgpu-device::cross_backend	i32_table_gather_is_exact_beyond_f32_cross_backend
 poot-wgpu-device::cross_backend	sample_token_gumbel_cross_backend
 poot-wgpu-device::cross_backend	sample_token_gumbel_topk_cross_backend
@@ -317,9 +320,13 @@ poot-wgpu-device::graph	epilogue::a_dense_tiled_epilogue_matches_the_oracle_on_w
 poot-wgpu-device::graph	epilogue::a_narrow_head_is_refused_by_name_on_wgpu
 poot-wgpu-device::graph	epilogue::a_serial_matmul_epilogue_matches_the_oracle_on_wgpu
 poot-wgpu-device::graph	epilogue::a_tiled_matmul_epilogue_matches_the_oracle_on_wgpu
+poot-wgpu-device::graph	flash::causal_decode_gpu_matches_cpu
+poot-wgpu-device::graph	flash::causal_prefill_into_a_cache_gpu_matches_cpu
 poot-wgpu-device::graph	flash::decomposed_prefill_attention_over_65535_query_groups_matches_cpu
 poot-wgpu-device::graph	flash::deepseek_v2_mla_split_key_decode_gpu_matches_cpu
 poot-wgpu-device::graph	flash::gemma2_softcap_decode_gpu_matches_cpu
+poot-wgpu-device::graph	flash::sink_decode_gpu_matches_cpu
+poot-wgpu-device::graph	flash::sink_prefill_into_a_cache_gpu_matches_cpu
 poot-wgpu-device::graph	gather_scatter::i32_slot_gather_variants_compiled_match_cpu_bit_exact
 poot-wgpu-device::graph	gemm::indexed_matmul_bf16_experts_match_the_oracle_bit_for_bit
 poot-wgpu-device::graph	gemm::indexed_matmul_checkpoint_order_experts_match_the_oracle_bit_for_bit

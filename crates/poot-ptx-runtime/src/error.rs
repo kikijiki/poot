@@ -136,6 +136,14 @@ pub enum PtxError {
         /// CUDA ordinal of the device whose memory would be read.
         to: i32,
     },
+    /// A whole-buffer copy between buffers of different byte capacity.
+    #[error("copy_buffer between buffers of {src} and {dst} bytes")]
+    CopyLength {
+        /// Byte capacity of the source.
+        src: usize,
+        /// Byte capacity of the destination.
+        dst: usize,
+    },
     /// The destination's device was never enabled with `PtxContext::enable_peer_access`.
     #[error("copy_to_peer refused: direct access to the destination's device was not enabled")]
     PeerNotEnabled,

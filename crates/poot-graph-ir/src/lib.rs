@@ -36,9 +36,7 @@ pub mod weight_ref;
 pub use budget::{AllocationSite, Attempted, BudgetResource, TraceBudgetExceeded, TraceLimits};
 #[cfg(any(test, feature = "test-support"))]
 pub use budget::{Charged, Ledger, LedgerEvent, Reservation};
-pub use builder::{
-    BlockTopKResult, Builder, LayerScope, Outputs, ScanResult, Traced, WitnessDeclaration,
-};
+pub use builder::{Builder, LayerScope, Outputs, ScanResult, Traced, WitnessDeclaration};
 #[cfg(any(test, feature = "test-support"))]
 pub use builder::{BuilderAppendAccounting, BuilderAppendPlan, PreparedBuilderAppend};
 pub use error::{
@@ -60,7 +58,7 @@ pub use op::{
     AttentionAttrs, BinOp, BlockTopKAttrs, BlockTopKLayout, ContractionRows,
     DENSE_CONTRACTION_WEIGHT_DTYPES, DENSE_ROW_GATHER_SOURCE_DTYPES, KeyLayout, KvBound,
     MaskOperand, OpClass, OpKind, RedOp, ScanAttrs, ScanFamily, ScanLayout, SelectedAttentionAttrs,
-    SelectedAttentionLayout, UnOp,
+    SelectedAttentionLayout, SinkOperand, UnOp,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use packed_source::packed_source_constants;

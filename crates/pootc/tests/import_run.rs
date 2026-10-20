@@ -128,7 +128,7 @@ fn kernel_intrinsics_extern() -> String {
 /// the kernel that runs is then both the one pootc published and the one `body` compiles to.
 fn staged_handle(
     body: &Body,
-    target: poot_codegen::GpuTarget,
+    target: poot_target::Backend,
     staged: &[u8],
     name: &str,
 ) -> CompiledKernel {
@@ -177,12 +177,7 @@ fn pootc_compile(kernel_file: &str, src_name: &str) -> (CompiledKernel, u32, boo
         .unwrap_or_else(|_| panic!("pootc should have emitted {src_name}.spv"));
     let param_count = body.param_count;
     let has_trap = body.has_trap();
-    let compiled_kernel = staged_handle(
-        &body,
-        poot_codegen::GpuTarget::SpirvVulkan,
-        &bytes,
-        src_name,
-    );
+    let compiled_kernel = staged_handle(&body, poot_target::Backend::SpirvVulkan, &bytes, src_name);
     (compiled_kernel, param_count, has_trap)
 }
 
@@ -484,7 +479,7 @@ fn llc_spin_depth4_and_reproducer() {
     let body: Body = serde_json::from_str(&kir_json).expect("llc_spin_depth4_and.kir.json parses");
     let compiled_kernel = staged_handle(
         &body,
-        poot_codegen::GpuTarget::SpirvVulkan,
+        poot_target::Backend::SpirvVulkan,
         &compiled_kernel,
         "llc_spin_depth4_and",
     );
@@ -735,7 +730,7 @@ fn assert_trap_traps_on_ptx() {
     );
     let ptx_kernel = staged_handle(
         &body,
-        poot_codegen::GpuTarget::Nvptx,
+        poot_target::Backend::Nvptx,
         ptx.as_bytes(),
         "assert_trap",
     );
@@ -1258,7 +1253,7 @@ fn imported_kernel_matches_kernelgen_reduce_last() {
             poot_kernelgen::reduce_last_dt("rl", poot_kernel_ir::Ty::F32, BinOp::Add, cols, 0.0);
         let kg_path = std::env::temp_dir().join(format!("pootc_kg_rl_{cols}.spv"));
         let kg_artifact =
-            poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &kg_path)
+            poot_codegen::compile_kernel(&body, poot_target::Backend::SpirvVulkan, &kg_path)
                 .expect("compile kernelgen reduce_last");
         let kg_kernel = poot_codegen::kernel_handle(&body, &kg_artifact).unwrap();
         let mut kg_bufs = [
@@ -1374,7 +1369,7 @@ fn imported_lds_reduction_matches_kernelgen() {
     let kg = poot_kernel_ir::test_support::wg_sum("kg_wg_sum", 64);
     let kg_path = std::env::temp_dir().join("pootc_kg_wg_sum.spv");
     let kg_artifact =
-        poot_codegen::compile_kernel(&kg, poot_codegen::GpuTarget::SpirvVulkan, &kg_path)
+        poot_codegen::compile_kernel(&kg, poot_target::Backend::SpirvVulkan, &kg_path)
             .expect("compile kernelgen wg_sum");
     let kg_kernel = poot_codegen::kernel_handle(&kg, &kg_artifact).unwrap();
     let mut kg_bufs = [KernelBuffer::read_only_f32(&a), KernelBuffer::write_f32(1)];
@@ -2351,7 +2346,7 @@ fn imported_atomic_add_sum_smoke_runs_on_gpu() {
         poot_codegen::Target::SpirvVulkan,
     );
     let artifact =
-        poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+        poot_codegen::compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out_path)
             .expect("atomic_add_sum_smoke must compile to SPIR-V");
     let compiled_kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 

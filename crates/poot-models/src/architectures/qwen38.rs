@@ -19,7 +19,6 @@
 //! step.
 
 use std::num::NonZeroU32;
-#[cfg(feature = "test-support")]
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph, StateRole};

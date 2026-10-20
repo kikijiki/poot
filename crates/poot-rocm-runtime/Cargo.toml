@@ -16,16 +16,10 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# For the agent-list example to surface tracing::info! lines from RocmContext::new.
-tracing-subscriber.workspace = true
 # SC-002/SC-003 (card 608): compiles real AMDGCN fixture kernels to exercise
 # the schema check and entry-point selection on the production dispatch path, not a hand-rolled artifact.
 poot-codegen.workspace = true
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
-
-[[example]]
-name = "agent-list"
-path = "examples/agent-list.rs"
 
 [lints]
 workspace = true

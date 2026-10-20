@@ -191,6 +191,8 @@ poot-ptx-device::buffer_plan	an_aie_launch_is_a_typed_refusal_on_ptx
 poot-ptx-device::buffer_plan	an_over_length_dispatch_is_refused_by_the_engine_on_ptx
 poot-ptx-device::buffer_plan	len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity_on_ptx
 poot-ptx-device::buffer_plan	lp3_ptx_write_with_is_exact_across_ring_chunks
+poot-ptx-device::copy	copy_between_unequal_lengths_is_refused_on_ptx
+poot-ptx-device::copy	copy_of_an_odd_byte_length_is_exact_on_ptx
 poot-ptx-device::cross_backend	a_dense_tiled_epilogue_matches_the_oracle_on_ptx
 poot-ptx-device::cross_backend	a_tiled_matmul_epilogue_matches_the_oracle_on_ptx
 poot-ptx-device::cross_backend	broadcast_binary_ptx_matches_cpu

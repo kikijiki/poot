@@ -2,7 +2,7 @@
 //!
 //! Spec 133 P1: device, pipeline, and single dispatch from poot's existing `Target::SpirvVulkan` `.spv`
 //! output (no naga, no re-emission). The binding ABI matches `poot-wgpu-runtime`'s (wgpu) exactly, so the same
-//! `.spv` dispatches unmodified on either backend (this crate's `run_add` test cross-checks both):
+//! `.spv` dispatches unmodified on either backend:
 //!
 //! - Descriptor set 0. Storage buffers at bindings `0..N-1` are the kernel's data buffers in the order
 //!   the caller passes them: inputs first, then the single output last (as in

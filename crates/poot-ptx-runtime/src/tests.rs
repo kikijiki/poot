@@ -1467,7 +1467,7 @@ fn no_contract_nvptx_kernel(marked: bool) -> poot_runtime_common::CompiledKernel
         &format!("no_contract_{tag}"),
         poot_codegen::Target::Nvptx,
     );
-    let artifact = poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out)
+    let artifact = poot_codegen::compile_kernel(&body, poot_target::Backend::Nvptx, &out)
         .unwrap_or_else(|e| panic!("compile no_contract_{tag}: {e}"));
     poot_codegen::kernel_handle(&body, &artifact).unwrap()
 }
@@ -1693,7 +1693,7 @@ fn an_out_of_bounds_store_is_device_lost_and_poisons_the_context() {
     let dir = std::env::temp_dir().join("poot-ptx-runtime-device-lost-test");
     std::fs::create_dir_all(&dir).expect("create fixture artifact dir");
     let out = poot_codegen::artifact_path(&dir, "add", poot_codegen::Target::Nvptx);
-    let artifact = poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::Nvptx, &out)
+    let artifact = poot_codegen::compile_kernel(&body, poot_target::Backend::Nvptx, &out)
         .expect("compile add");
     let kernel = poot_codegen::kernel_handle(&body, &artifact).unwrap();
 

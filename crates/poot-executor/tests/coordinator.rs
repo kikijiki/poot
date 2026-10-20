@@ -223,6 +223,13 @@ impl Device for FakeDevice {
     type Recording = Rc<Recording>;
     type Error = Injected;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> Target {
         target()
     }

@@ -17,7 +17,7 @@ poot-load.workspace = true
 poot-wgpu-device.workspace = true
 poot-ptx-device.workspace = true
 poot-vulkan-device.workspace = true
-poot-rocm-device = { workspace = true, optional = true }
+poot-rocm-device.workspace = true
 # Tokenization, chat templates and guided constraints: the checkpoint's text services.
 poot-text.workspace = true
 # The multimodal front end loads its own tokenizer for the mrope special tokens.
@@ -25,7 +25,7 @@ tokenizers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image.workspace = true
-# Binaries only: the `cli` feature turns it on and the three bins that use it require that feature.
+# Binary only: the `cli` feature turns it on and the `poot` bin that uses it requires that feature.
 # The library's own API is `thiserror` types throughout (`TextError`, `driver::error::DriverError`).
 anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
@@ -58,8 +58,8 @@ poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-runtime-common = { workspace = true, features = ["test-support"] }
 poot-eval = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
-# The `cli` feature for this package's own tests: it builds the `poot-generate` binary, which the
-# `tests/poot_generate_cli.rs` rows spawn (`CARGO_BIN_EXE_poot-generate`), in every lane that builds the tests.
+# The `cli` feature for this package's own tests: it builds the `poot` binary, which the
+# `tests/poot_generate_cli.rs` rows spawn (`CARGO_BIN_EXE_poot`), in every lane that builds the tests.
 poot-llm = { workspace = true, features = ["cli"] }
 # `write_gguf` and `sha256_digest`, the checkpoint writer and hasher the driver tests build with (ADR-0113).
 poot-load = { workspace = true, features = ["test-support"] }
@@ -73,8 +73,8 @@ poot-test-util.workspace = true
 poot-executor-parity.workspace = true
 # The dense family fixtures (`poot_models::test_support::dense`): the graphs the plan and equivalence tests trace.
 poot-models = { workspace = true, features = ["test-support"] }
-# `AmdArch` (poot-codegen) for a CPU-only `#[cfg(feature = "rocm")]` test that classifies prefill-graph
-# eqns without touching a GPU (no HSA/driver linkage).
+# `AmdArch` (poot-codegen) for a CPU-only test that classifies prefill-graph eqns without touching a GPU
+# (no HSA/driver linkage).
 poot-codegen.workspace = true
 # The boxed-cause chain test constructs each backend's runtime error type to check that `source()` reaches
 # it. Already transitive dependencies of the backend crates; listed only so the test can name the types.
@@ -84,11 +84,8 @@ poot-ptx-runtime.workspace = true
 poot-rocm-runtime.workspace = true
 
 [features]
-# `anyhow`, `clap` and `tracing-subscriber` for the `poot-generate`, `poot-caption` and `poot-embed` binaries (a bin
-# cannot carry its own dependency).
+# `anyhow`, `clap` and `tracing-subscriber` for the `poot` binary (a bin cannot carry its own dependency).
 cli = ["dep:anyhow", "dep:clap", "dep:tracing-subscriber"]
-# ROCm/HSA GPU path.
-rocm = ["dep:poot-rocm-device"]
 # ADR-0113: `Budget::with`, the budget builder poot-serve's engine-plan tests assemble device budgets with;
 # no production caller (the production budget is observed from the device). Enabled only from
 # `[dev-dependencies]` edges.
@@ -99,18 +96,8 @@ name = "poot_llm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "poot-generate"
-path = "src/main.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "poot-caption"
-path = "src/bin/caption.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "poot-embed"
-path = "src/bin/embed.rs"
+name = "poot"
+path = "src/bin/poot/main.rs"
 required-features = ["cli"]
 
 [lints]

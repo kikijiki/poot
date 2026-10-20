@@ -231,6 +231,13 @@ impl Device for FixtureDevice {
     type Recording = ();
     type Error = FixtureError;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "fake"
+    }
+
     fn target(&self) -> Target {
         self.target
     }
@@ -777,6 +784,8 @@ fn every_candidates_planned_bytes_equal_a_real_preparation_without_reading_weigh
 /// Input fell with POOT-1148: the paged write map is `[rows * tokens]` words instead of one word per pool
 /// slot (55224 -> 44952 at four rows). `Meta` moved with POOT-1146: the greedy pick is two dispatches
 /// (chunk and combine) with their own metadata words where it was one, 868 -> 980 and 1220 -> 1332 bytes.
+/// POOT-1238 states the causal mask by the query positions, so the mask the attention read is no longer an
+/// activation: 2091972 -> 1577492 at four rows (1046196 -> 788956 at two, 523308 -> 394748 at one).
 /// POOT-1268 prepares five sampling heads in place of the greedy suffix and the logits head (the argmax,
 /// a plain draw, the adjusted draw, the guided draw and the guided draw with logprobs), so every entry
 /// shape exists five times and the adjusted heads carry the sampler's history pool (`State` grew by 128, 64 and 32 bytes at
@@ -798,17 +807,17 @@ fn the_planned_footprints_match_the_numbers_the_full_load_pass_produced() {
         (
             4,
             64,
-            "Activation=2091972 Input=117980 Meta=5264 State=12416 Weight=5344",
+            "Activation=1577492 Input=117980 Meta=5264 State=12416 Weight=5344",
         ),
         (
             2,
             64,
-            "Activation=1046196 Input=82188 Meta=5264 State=6208 Weight=5344",
+            "Activation=788956 Input=82188 Meta=5264 State=6208 Weight=5344",
         ),
         (
             1,
             64,
-            "Activation=523308 Input=64292 Meta=6144 State=3104 Weight=5344",
+            "Activation=394748 Input=64292 Meta=6144 State=3104 Weight=5344",
         ),
     ];
     let domain = candidates(&handle, &args);

@@ -1314,6 +1314,17 @@ pub enum WeightView {
         /// The half-open row range of the entry's leading axis.
         rows: std::ops::Range<usize>,
     },
+    /// The leading-axis rows of one entry in the order `order` names: row `i` of the view is stored row
+    /// `order[i]`. Nothing is copied until a binder reads the view, which lays each row's bytes down in
+    /// that order (llama.cpp's Q/K rows stored permuted for its interleaved RoPE, read back in the
+    /// half-split order the model traces). Every index is a row of the entry; an index may repeat or be
+    /// left out, so a view of a subset of the rows is one too.
+    RowOrder {
+        /// The entry the rows are read from.
+        key: WeightKey,
+        /// For each row of the view, the stored row it reads.
+        order: Arc<[usize]>,
+    },
     /// An index table stored as I64, read as I32 (DeepSeek-V4's `tid2eid`): every value is
     /// range-checked when the map is built, so a table that does not fit I32 is refused before any
     /// trace. The one view whose bytes are derived rather than cut from the store.
@@ -1339,6 +1350,7 @@ impl WeightView {
             Self::Stored(key)
             | Self::IndexNarrow(key)
             | Self::RowRange { key, .. }
+            | Self::RowOrder { key, .. }
             | Self::BlockColumns { key, .. } => std::slice::from_ref(key),
             Self::RowStack(keys) | Self::ExpertStack(keys) => keys,
         }
@@ -1420,6 +1432,25 @@ pub enum WeightMapError {
         rows: std::ops::Range<usize>,
         /// Rows the entry has.
         available: usize,
+    },
+    /// A [`WeightView::RowOrder`] that is empty or names a row the entry does not have.
+    RowOrderOutOfBounds {
+        /// The weight being mapped.
+        id: WeightId,
+        /// The first stored row the order names past the entry (`0` for an empty order).
+        row: usize,
+        /// Rows the entry has.
+        available: usize,
+    },
+    /// An entry whose `rows` are not a whole number of heads of an even `head_dim` rows each, so a per-head
+    /// row order cannot be built over it.
+    HeadRows {
+        /// The weight being mapped.
+        id: WeightId,
+        /// Rows the entry has.
+        rows: usize,
+        /// Rows per head.
+        head_dim: usize,
     },
     /// [`WeightView::RowStack`] parts that do not share one format and one row shape.
     MixedParts {
@@ -1574,6 +1605,14 @@ impl fmt::Display for WeightMapError {
             } => write!(
                 f,
                 "weight {id}: rows {rows:?} are not a non-empty range of the entry's {available} rows"
+            ),
+            Self::RowOrderOutOfBounds { id, row, available } => write!(
+                f,
+                "weight {id}: a row order must name at least one row of the entry's {available} rows; row {row} is past them"
+            ),
+            Self::HeadRows { id, rows, head_dim } => write!(
+                f,
+                "weight {id}: {rows} rows are not a whole number of heads of {head_dim} (an even count) rows"
             ),
             Self::MixedParts { id, first, other } => write!(
                 f,
@@ -1870,6 +1909,10 @@ impl WeightMap {
                     key: key.clone(),
                     rows: rows.start + range.start..rows.start + range.end,
                 },
+                (WeightView::RowOrder { key, order }, 0) => WeightView::RowOrder {
+                    key: key.clone(),
+                    order: order[range].into(),
+                },
                 (
                     WeightView::BlockColumns {
                         key,
@@ -1962,6 +2005,24 @@ fn check_row_range(
         });
     }
     Ok(())
+}
+
+fn check_row_order(
+    id: WeightId,
+    key: &WeightKey,
+    entry: &WeightEntry,
+    order: &[usize],
+) -> Result<(), WeightMapError> {
+    let available = row_count(id, key, entry)?;
+    match order.iter().find(|&&row| row >= available) {
+        Some(&row) => Err(WeightMapError::RowOrderOutOfBounds { id, row, available }),
+        None if order.is_empty() => Err(WeightMapError::RowOrderOutOfBounds {
+            id,
+            row: 0,
+            available,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Check that `cols` is a non-empty range of axis `axis` (at least 1) of `entry`, and, for a packed
@@ -2095,6 +2156,25 @@ fn view_handle(
                 }
                 WeightEntry::Packed(payload) => {
                     PackedPayload::gathered_weight(&[payload.as_ref()], rows.len())
+                        .map(packed_handle)
+                        .map_err(packed_error(id))
+                }
+            }
+        }
+        WeightView::RowOrder { key, order } => {
+            let entry = stored(id, key, store)?;
+            check_row_order(id, key, entry, order)?;
+            match entry {
+                WeightEntry::Dense(dense) => {
+                    let mut shape = dense.shape().to_vec();
+                    shape[0] = order.len();
+                    Ok(WeightHandle {
+                        format: HandleFormat::Dense(dense.dtype()),
+                        shape,
+                    })
+                }
+                WeightEntry::Packed(payload) => {
+                    PackedPayload::gathered_weight(&[payload.as_ref()], order.len())
                         .map(packed_handle)
                         .map_err(packed_error(id))
                 }
@@ -2235,6 +2315,32 @@ fn materialize_view(
                     .map_err(packed_error(id))
             }
         },
+        WeightView::RowOrder { key, order } => {
+            let entry = stored(id, key, store)?;
+            check_row_order(id, key, entry, order)?;
+            match entry {
+                WeightEntry::Dense(dense) => {
+                    let row_bytes = dense.bytes().len() / dense.shape()[0];
+                    let source = dense.bytes().as_slice();
+                    let mut bytes = Vec::with_capacity(order.len() * row_bytes);
+                    for &row in order.iter() {
+                        bytes.extend_from_slice(&source[row * row_bytes..(row + 1) * row_bytes]);
+                    }
+                    let mut shape = dense.shape().to_vec();
+                    shape[0] = order.len();
+                    Ok(WeightEntry::Dense(DenseWeight {
+                        dtype: dense.dtype(),
+                        shape,
+                        bytes: StoredBytes::from(bytes),
+                    }))
+                }
+                WeightEntry::Packed(payload) => {
+                    PackedPayload::gather_rows(&[payload.as_ref()], order)
+                        .map(|gathered| WeightEntry::Packed(Arc::new(gathered)))
+                        .map_err(packed_error(id))
+                }
+            }
+        }
         WeightView::RowStack(parts) => {
             let entries = parts
                 .iter()

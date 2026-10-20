@@ -309,3 +309,64 @@ fn a_ranged_const_must_be_i32() {
     ));
     assert_eq!(b.generation(), 0, "a refused declaration appends nothing");
 }
+
+/// The I32 range of `F32 -> I32` casts of expressions over two F32 inputs, to test what `f32_bounds` proves.
+fn cast_range(build: impl FnOnce(&Builder, crate::Traced) -> crate::Traced) -> IndexRange {
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let y = b.constant("y", TensorType::f32(vec![4])).unwrap();
+    let indicator = b.binary(BinOp::Ge, x, y).unwrap();
+    let expr = build(&b, indicator);
+    let cast = b.cast(expr, DType::I32).unwrap();
+    range_of(b, cast)
+}
+
+/// A comparison is `{0, 1}`, so an indicator times its complement is in `[0, 1]` and its cast is proven
+/// `[0, 2)`. Mutation: widen the `Ge` bounds in `f32_bounds` to `(0.0, 2.0)`; the product is `[0, 4]` and this
+/// row goes red (the control row of the next test reads `[0, 7)` for `[0, 4)` too).
+#[test]
+fn an_indicator_times_its_complement_casts_to_zero_or_one() {
+    let range = cast_range(|b, ind| {
+        let not = b
+            .binary_scalar(
+                BinOp::Add,
+                b.binary_scalar(BinOp::Mul, ind, Scalar::F32(-1.0)).unwrap(),
+                Scalar::F32(1.0),
+            )
+            .unwrap();
+        b.binary(BinOp::Mul, ind, not).unwrap()
+    });
+    assert_eq!(range, r(0, 2));
+}
+
+/// Bounds the F32 arithmetic could round (above 2^24) or that are not whole numbers prove nothing: the cast is
+/// every word. Mutation: drop the `EXACT_F32` check in `exact_bounds`; the first case is proven `[0, 20000001)`
+/// and this row goes red.
+#[test]
+fn bounds_past_the_exact_f32_integers_or_not_whole_prove_nothing() {
+    let scaled = |scale: f32| {
+        cast_range(move |b, ind| {
+            b.binary_scalar(BinOp::Mul, ind, Scalar::F32(scale))
+                .unwrap()
+        })
+    };
+    assert_eq!(scaled(20_000_000.0), IndexRange::I32, "above 2^24");
+    assert_eq!(scaled(0.5), IndexRange::I32, "not whole");
+    assert_eq!(
+        scaled(3.0),
+        r(0, 4),
+        "control: a whole bound within 2^24 is proven"
+    );
+}
+
+/// An operand nothing bounds (an F32 input) makes the product unbounded: the cast is every word.
+#[test]
+fn an_unbounded_f32_operand_proves_nothing() {
+    let b = Builder::for_tests();
+    let x = b.constant("x", TensorType::f32(vec![4])).unwrap();
+    let y = b.constant("y", TensorType::f32(vec![4])).unwrap();
+    let ind = b.binary(BinOp::Ge, x, y).unwrap();
+    let product = b.binary(BinOp::Mul, ind, x).unwrap();
+    let cast = b.cast(product, DType::I32).unwrap();
+    assert_eq!(range_of(b, cast), IndexRange::I32);
+}

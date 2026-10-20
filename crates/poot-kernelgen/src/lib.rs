@@ -29,8 +29,8 @@ mod tiled_region;
 mod wmma;
 
 pub use attention::{
-    AttentionCombineSpec, AttentionSchedule, AttentionSpec, KeyBound, KeyLayout, MaskKind,
-    ScoreTransform,
+    AttentionCombineSpec, AttentionSchedule, AttentionSink, AttentionSpec, KeyBound, KeyLayout,
+    MaskKind, ScoreTransform,
 };
 
 // The one generation seam. `poot-graph-plan` plans every generated kernel through `generate` and the request
@@ -94,8 +94,9 @@ pub use wmma::{matmul_tensorcore, matmul_tensorcore_coopmat};
 pub(crate) mod unit_helpers {
     use std::path::PathBuf;
 
-    use poot_codegen::{GpuTarget, Target, compile, compile_kernel};
+    use poot_codegen::{Target, compile, compile_kernel};
     use poot_kernel_ir::Body;
+    use poot_target::Backend;
 
     pub(crate) fn spv(body: &Body, name: &str) -> poot_runtime_common::CompiledKernel {
         let dir: PathBuf = std::env::temp_dir()
@@ -103,7 +104,7 @@ pub(crate) mod unit_helpers {
             .join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let out = poot_codegen::artifact_path(&dir, name, Target::SpirvVulkan);
-        let artifact = compile_kernel(body, GpuTarget::SpirvVulkan, &out).expect("compile");
+        let artifact = compile_kernel(body, Backend::SpirvVulkan, &out).expect("compile");
         poot_codegen::kernel_handle(body, &artifact).unwrap()
     }
 

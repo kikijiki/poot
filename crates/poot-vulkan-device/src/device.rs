@@ -131,8 +131,11 @@ impl VulkanDevice {
     }
 
     /// Cut the open command buffer first if `work` would overflow it, then account for one command.
-    fn make_room(&mut self, work: u64) -> Result<(), VulkanGpuError> {
-        let step = self.open.as_mut().expect("command outside begin/finish");
+    fn make_room(&mut self, op: &'static str, work: u64) -> Result<(), VulkanGpuError> {
+        let step = self
+            .open
+            .as_mut()
+            .ok_or(VulkanGpuError::NotRecording { op })?;
         if step.would_overflow(work) {
             self.ctx.cut_graph(&mut step.graph)?;
             step.commands_since_cut = 0;
@@ -147,6 +150,13 @@ impl Device for VulkanDevice {
     type Kernel = VulkanKernel;
     type Recording = VulkanGraph;
     type Error = VulkanGpuError;
+
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "vulkan"
+    }
 
     fn target(&self) -> Target {
         Target::Gpu {
@@ -191,7 +201,9 @@ impl Device for VulkanDevice {
     fn begin(&mut self) -> Result<(), VulkanGpuError> {
         // Always opens a recording (see the module doc). Recording never
         // submits, so a failed begin/dispatch/copy/finish can never have mutated device state.
-        assert!(self.open.is_none(), "begin inside an open step");
+        if self.open.is_some() {
+            return Err(VulkanGpuError::AlreadyRecording);
+        }
         let graph = self.ctx.begin_graph(self.timing)?;
         self.open = Some(OpenStep {
             graph,
@@ -218,7 +230,7 @@ impl Device for VulkanDevice {
                 .into());
             }
         };
-        self.make_room(d.work)?;
+        self.make_room("dispatch", d.work)?;
         // Each argument's own element count from the plan, never the bound buffer's capacity (an arena
         // slot's buffer is sized to its largest occupant; Card 547b). The output is last.
         let args: Vec<Binding<'_>> = d
@@ -230,7 +242,10 @@ impl Device for VulkanDevice {
                 elems: a.elems,
             })
             .collect();
-        let step = self.open.as_mut().expect("dispatch outside begin/finish");
+        let step = self
+            .open
+            .as_mut()
+            .ok_or(VulkanGpuError::NotRecording { op: "dispatch" })?;
         self.ctx.record_dispatch(
             &mut step.graph,
             &d.kernel.key,
@@ -245,15 +260,21 @@ impl Device for VulkanDevice {
     }
 
     fn copy(&mut self, src: &DeviceBuffer, dst: &DeviceBuffer) -> Result<(), VulkanGpuError> {
-        self.make_room(0)?;
-        let step = self.open.as_mut().expect("copy outside begin/finish");
+        self.make_room("copy", 0)?;
+        let step = self
+            .open
+            .as_mut()
+            .ok_or(VulkanGpuError::NotRecording { op: "copy" })?;
         self.ctx.record_copy(&mut step.graph, src, dst)?;
         step.commands_since_cut += 1;
         Ok(())
     }
 
     fn finish(&mut self) -> Result<VulkanGraph, VulkanGpuError> {
-        let step = self.open.take().expect("finish without begin");
+        let step = self
+            .open
+            .take()
+            .ok_or(VulkanGpuError::NotRecording { op: "finish" })?;
         Ok(self.ctx.end_graph(step.graph)?)
     }
 
@@ -305,8 +326,8 @@ impl Device for VulkanDevice {
 
     fn abort(&mut self) -> Result<(), VulkanGpuError> {
         // Recording never submits (see the module doc): dropping the attempted recording is the whole
-        // cleanup. `begin` panics (not errors) on a double-open, so `self.open` is the only Rust-level
-        // state abort must clear, plus whatever the failed step staged.
+        // cleanup. `self.open` is the only Rust-level state abort must clear, plus whatever the failed step
+        // staged.
         self.open = None;
         self.fault = None;
         self.time = DeviceTime::Unknown;
@@ -322,7 +343,9 @@ impl Device for VulkanDevice {
     fn classify_fault(&self, error: &VulkanGpuError) -> Option<(String, u32)> {
         match error {
             VulkanGpuError::Fault { kernel, code } => Some((kernel.clone(), *code)),
-            VulkanGpuError::Runtime(_) => None,
+            VulkanGpuError::Runtime(_)
+            | VulkanGpuError::AlreadyRecording
+            | VulkanGpuError::NotRecording { .. } => None,
         }
     }
 }

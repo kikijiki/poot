@@ -1,7 +1,7 @@
+use super::select::BUFFER_MEMORY;
 use crate::resources::allocate_buffer_resources;
 use crate::util::find_memory_type;
 use crate::{Context, DeviceBuffer, RuntimeError};
-use ash::vk;
 use poot_runtime_common::BufferRole;
 use poot_target::BufferStorage;
 
@@ -19,11 +19,7 @@ impl Context {
                 .get_physical_device_memory_properties(self.physical_device)
         };
         let resources = allocate_buffer_resources(&self.owner, byte_len, |reqs| {
-            find_memory_type(
-                &mem_props,
-                reqs.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
+            find_memory_type(&mem_props, reqs.memory_type_bits, BUFFER_MEMORY)
         })?;
         let buffer = DeviceBuffer::from_resources(resources, byte_len, storage, role, &self.owner);
         // `vkAllocateMemory` contents are undefined; the contract hands out zero-filled buffers.

@@ -1,5 +1,5 @@
 //! `--backend` through the production `poot-serve` binary: the flag reaches the engine plan and a
-//! backend the build or the host cannot satisfy is refused at the process boundary, before the listener
+//! backend the host cannot satisfy is refused at the process boundary, before the listener
 //! binds. A parse that dropped the flag and resolved `Auto` would name another device in the error.
 
 use poot_test_util::contained_child::ContainChild;
@@ -28,6 +28,10 @@ fn run_with(args: &[&str]) -> (Option<i32>, String) {
         .contained()
         .arg(&path)
         .arg("127.0.0.1:0")
+        // No HSA agent is visible, so a ROCm open fails on a host with an AMD GPU as on one without. The
+        // lane's "device required" switch would turn that failure into a panic of the open path.
+        .env("ROCR_VISIBLE_DEVICES", "")
+        .env_remove("POOT_REQUIRE_ROCM")
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -68,11 +72,11 @@ fn run_with(args: &[&str]) -> (Option<i32>, String) {
     }
 }
 
-/// `--backend rocm` is accepted by the parser and reaches `open_executor` as ROCm: this build has no
-/// ROCm executor, so startup fails naming the ROCm device, not `Auto`'s or another backend's. Mutation:
-/// pass `Auto` regardless of the flag; the error names `Auto` and the row goes red.
+/// `--backend rocm` is accepted by the parser and reaches `open_executor` as ROCm, in a default build: with
+/// no HSA agent visible, startup fails naming the ROCm device, not `Auto`'s or another backend's. Mutation:
+/// pass `Auto` regardless of the flag; `Auto` opens wgpu or PTX, the server starts and the row goes red.
 #[test]
-fn a_named_backend_the_build_cannot_open_is_refused_by_name() {
+fn a_named_backend_the_host_cannot_open_is_refused_by_name() {
     let (code, output) = run_with(&["--backend", "rocm"]);
     assert_ne!(code, Some(0), "{output}");
     assert!(output.contains("open the Rocm device"), "{output}");

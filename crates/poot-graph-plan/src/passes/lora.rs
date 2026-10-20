@@ -27,7 +27,7 @@ use poot_graph_ir::builder::Resumed;
 use poot_graph_ir::graph::{Eqn, Graph, Operand, Storage, ValueId, ValueMeta};
 use poot_graph_ir::op::{BinOp, OpKind};
 use poot_graph_ir::types::TensorType;
-use poot_graph_ir::{Builder, IndexRange, PackedSourceName, Slot, ValueTable};
+use poot_graph_ir::{Builder, IndexRange, Slot, ValueTable, WeightRef};
 use poot_quant::weights::{LoraRole, LoraTarget, WeightId, WeightRole};
 use poot_tensor::DType;
 
@@ -175,8 +175,8 @@ pub(crate) fn apply_lora(
         )?
         .id();
     let scale = b
-        .constant(
-            &WeightId::model(WeightRole::Lora(LoraRole::Scale)).const_name(),
+        .weight(
+            WeightRef::whole(WeightId::model(WeightRole::Lora(LoraRole::Scale))),
             TensorType::f32(vec![stack]),
         )?
         .id();
@@ -188,14 +188,14 @@ pub(crate) fn apply_lora(
         let a = WeightId::layer(site.layer, WeightRole::Lora(LoraRole::A(site.target)));
         let bb = WeightId::layer(site.layer, WeightRole::Lora(LoraRole::B(site.target)));
         let factor_a = b
-            .constant(
-                &a.const_name(),
+            .weight(
+                WeightRef::whole(a),
                 TensorType::f32(vec![stack, site.in_dim, rank]),
             )?
             .id();
         let factor_b = b
-            .constant(
-                &bb.const_name(),
+            .weight(
+                WeightRef::whole(bb),
                 TensorType::f32(vec![stack, rank, site.out_dim]),
             )?
             .id();
@@ -325,12 +325,15 @@ fn sites(g: &Graph, plan: &LoraPlan) -> Vec<Site> {
         else {
             continue;
         };
-        let Some(weight) = weight_name(g, &producer, *w) else {
+        let Some(id) = weight_id(g, &producer, *w) else {
             continue;
         };
-        let Some((layer, target)) = projection(&weight, &plan.projections) else {
+        let (Some(layer), Some(target)) = (id.layer, LoraTarget::of(id.role)) else {
             continue;
         };
+        if !plan.projections.contains(&target) {
+            continue;
+        }
         let &[in_dim, out_dim] = g.aval(*w).shape.as_slice() else {
             continue;
         };
@@ -339,7 +342,7 @@ fn sites(g: &Graph, plan: &LoraPlan) -> Vec<Site> {
             x: *x,
             layer,
             target,
-            weight,
+            weight: id.const_name(),
             in_dim,
             out_dim,
         });
@@ -347,13 +350,14 @@ fn sites(g: &Graph, plan: &LoraPlan) -> Vec<Site> {
     found
 }
 
-/// The const name of the weight a contraction's right operand is: the const itself, a transpose of it,
-/// or the `PackedDequant` of its source tensors, whichever way the tracer spelled the linear.
-fn weight_name(
+/// The mapped weight a contraction's right operand is: the const itself, a transpose of it, or the
+/// `PackedDequant` of its source tensors, whichever way the tracer spelled the linear. The identity
+/// is the [`WeightRef`] the tracer declared on the constant, never its name.
+fn weight_id(
     g: &Graph,
     producer: &ValueTable<Option<usize>>,
     operand: ValueId,
-) -> Option<String> {
+) -> Option<WeightId> {
     let through = match producer[operand].map(|e| &g.eqns()[e]) {
         Some(Eqn {
             op: OpKind::Transpose { perm },
@@ -365,38 +369,19 @@ fn weight_name(
         },
         _ => operand,
     };
-    match producer[through].map(|e| &g.eqns()[e]) {
-        None => {
-            let meta = g.meta(through);
-            (meta.storage == Storage::Const)
-                .then(|| meta.name.clone())
-                .flatten()
-        }
+    let source = match producer[through].map(|e| &g.eqns()[e]) {
+        None => through,
         Some(Eqn {
             op: OpKind::PackedDequant { .. },
             inputs,
             ..
-        }) => {
-            let Some(&Operand::Value(source)) = inputs.first() else {
-                return None;
-            };
-            let name = g.meta(source).name.as_deref()?;
-            Some(PackedSourceName::parse(name)?.linear_id().to_string())
-        }
-        Some(_) => None,
-    }
-}
-
-/// `(layer, target)` when `name` is the const name of a layer weight whose role is one of `targets`.
-fn projection(name: &str, targets: &[LoraTarget]) -> Option<(usize, LoraTarget)> {
-    let rest = name.strip_prefix("w.l")?;
-    let (layer, role) = rest.split_once('.')?;
-    let layer = layer.parse().ok()?;
-    targets
-        .iter()
-        .copied()
-        .find(|target| target.weight_role().spelling() == role)
-        .map(|target| (layer, target))
+        }) => match inputs.first() {
+            Some(&Operand::Value(source)) => source,
+            _ => return None,
+        },
+        Some(_) => return None,
+    };
+    Some(g.meta(source).weight()?.id())
 }
 
 /// Appends values and equations to the graph under rewrite, each through the budget, with each
@@ -458,7 +443,8 @@ mod tests {
         CompileOptions::new(CompileLimits::STANDARD)
     }
 
-    /// SC-004: a plan naming a projection the graph lacks is refused by `compile` with the typed error.
+    /// SC-003: a plan naming a projection the graph lacks is refused by `compile` with the typed error.
+    /// Mutation: skip the `NoProjection` check; the plan compiles and its adapters are silently ignored.
     #[test]
     fn a_projection_the_graph_lacks_is_a_typed_compile_refusal() {
         let b = Builder::for_tests();
@@ -466,9 +452,11 @@ mod tests {
             .slot_named(Slot::Activation, "x", TensorType::f32(vec![ROWS, 1, 4]))
             .unwrap();
         let w = b
-            .constant(
-                &WeightId::layer(0, WeightRole::Attn(poot_quant::weights::AttnRole::Q))
-                    .const_name(),
+            .weight(
+                WeightRef::whole(WeightId::layer(
+                    0,
+                    WeightRole::Attn(poot_quant::weights::AttnRole::Q),
+                )),
                 TensorType::f32(vec![4, 4]),
             )
             .unwrap();
@@ -501,6 +489,25 @@ mod tests {
         compile(&g, &target(), &with_plan).expect("a plan for a present projection compiles");
     }
 
+    /// A site is found by the weight identity the tracer declared, not by the constant's name: a constant
+    /// spelled `w.l0.attn.q` with no declared identity is no projection.
+    #[test]
+    fn a_constant_named_like_a_projection_without_its_identity_is_no_site() {
+        let b = Builder::for_tests();
+        let x = b
+            .slot_named(Slot::Activation, "x", TensorType::f32(vec![ROWS, 1, 4]))
+            .unwrap();
+        let w = b
+            .constant("w.l0.attn.q", TensorType::f32(vec![4, 4]))
+            .unwrap();
+        let y = b.matmul(x, b.transpose(w, vec![1, 0]).unwrap()).unwrap();
+        let g = b.finish(y).unwrap();
+        assert_eq!(
+            refused(&g, q_plan(ROWS, vec![LoraTarget::AttnQ])),
+            LoraError::NoProjection(LoraTarget::AttnQ)
+        );
+    }
+
     /// A one-projection graph `x [elements, 1, 4] @ q^T` with `x` and `q` in `dtype`.
     fn q_graph(elements: usize, dtype: DType) -> Graph {
         let b = Builder::for_tests();
@@ -512,9 +519,11 @@ mod tests {
             )
             .unwrap();
         let w = b
-            .constant(
-                &WeightId::layer(0, WeightRole::Attn(poot_quant::weights::AttnRole::Q))
-                    .const_name(),
+            .weight(
+                WeightRef::whole(WeightId::layer(
+                    0,
+                    WeightRole::Attn(poot_quant::weights::AttnRole::Q),
+                )),
                 TensorType::new(vec![4, 4], dtype),
             )
             .unwrap();

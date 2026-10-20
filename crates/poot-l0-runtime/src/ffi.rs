@@ -7,7 +7,7 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use crate::error::L0Error;
-use crate::platform::LibHandle;
+use poot_runtime_common::{Library, LoadScope};
 
 /// `ze_result_t`.
 pub(crate) type ZeResult = u32;
@@ -335,11 +335,11 @@ macro_rules! level_zero_functions {
             /// # Safety
             ///
             /// `lib` must be a Level Zero loader, whose exported symbols have the signatures declared here.
-            unsafe fn resolve(lib: &LibHandle) -> Result<Self, L0Error> {
+            unsafe fn resolve(lib: &Library) -> Result<Self, L0Error> {
                 Ok(Funcs {
                     $( $(#[$meta])* $field: {
                         let symbol = lib
-                            .sym(
+                            .symbol(
                                 CStr::from_bytes_with_nul(concat!($symbol, "\0").as_bytes())
                                     .expect("a symbol literal has no interior NUL"),
                             )
@@ -398,7 +398,7 @@ level_zero_functions! {
 /// it is closed after the table is dropped.
 pub(crate) struct Loader {
     pub funcs: Funcs,
-    _lib: LibHandle,
+    _lib: Library,
 }
 
 impl Loader {
@@ -411,7 +411,8 @@ impl Loader {
     pub(crate) fn open(soname: &CStr) -> Result<Self, L0Error> {
         // SAFETY: the loader's initializers are sound to run in any process; a non-loader library named
         // here fails symbol resolution below rather than being called.
-        let lib = unsafe { LibHandle::open(soname) }.map_err(L0Error::LibraryNotFound)?;
+        let lib = unsafe { Library::open(soname, LoadScope::Local) }
+            .map_err(|error| L0Error::LibraryNotFound(error.to_string()))?;
         // SAFETY: the library was opened under a name the caller gives as a Level Zero loader.
         let funcs = unsafe { Funcs::resolve(&lib) }?;
         Ok(Loader { funcs, _lib: lib })

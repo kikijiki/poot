@@ -8,7 +8,7 @@ sidebar_position: 7
 
 poot traces model forwards into a primitive graph and runs them on its own kernels. This page lists
 families by architecture shape. It does not duplicate the full backend tables; use the [feature
-matrix](../reference/feature-matrix.md) for what compiles on wgpu, ROCm and PTX.
+matrix](../reference/feature-matrix.md) for what compiles on wgpu, raw Vulkan, ROCm and PTX.
 
 Checkpoint formats: **safetensors** (including GPTQ, AWQ, and FP8 layouts) and **GGUF** (one file, or a split set
 named by any of its `-0000N-of-0000M.gguf` shards, with embedded config and tokenizer). Both work from the library (`poot-llm`). A dense decoder loads as a
@@ -147,7 +147,7 @@ the prompt's tokens and the request inputs the text model declares: the embeddin
 placeholders and, for Qwen2.5-VL, the prompt's sectioned positions (see [Multimodal](../serve/multimodal.md)).
 `poot-llm` keeps only what is not family-specific: decoding an image's bytes, decoding an animated PNG's frames,
 and `FrontEndSession`, which runs a loaded model's front end on one driver per tower. The library path is
-`ModelHandle::load`, `ModelHandle::front_end` and `FrontEndSession`, and the `poot-caption` binary. ROCm and
+`ModelHandle::load`, `ModelHandle::front_end` and `FrontEndSession`, and the `poot caption` command. ROCm and
 PTX GPU verification is thinner than wgpu for some modalities; see the matrix before relying on it.
 
 ## Adding a model

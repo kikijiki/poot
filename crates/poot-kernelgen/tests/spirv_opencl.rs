@@ -102,6 +102,7 @@ fn attention_decode_body() -> Body {
         },
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Static,
+        sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
     };
     let limits = kg::BodyLimits {

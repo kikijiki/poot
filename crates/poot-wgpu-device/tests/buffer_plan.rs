@@ -243,7 +243,7 @@ fn len_probe_reads_the_operand_own_length_never_a_larger_slots_capacity() {
     let out_path =
         poot_codegen::artifact_path(&dir, "sc002_len_probe", poot_codegen::Target::SpirvVulkan);
     let artifact =
-        poot_codegen::compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out_path)
+        poot_codegen::compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out_path)
             .expect("len_probe must compile to SpirV");
     let compiled = poot_codegen::kernel_handle(&body, &artifact).unwrap();
     let kernel = device

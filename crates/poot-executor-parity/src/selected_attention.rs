@@ -5,7 +5,7 @@
 use poot_eval::test_support::StepFixture;
 use poot_graph_ir::test_support::block_top_k::{grid_scores, reference_row};
 use poot_graph_ir::test_support::selected_attention::{Case, cases};
-use poot_graph_ir::{Builder, Outputs, SelectedAttentionAttrs, Slot, TensorType};
+use poot_graph_ir::{Builder, IndexRange, Outputs, Slot, TensorType, ops};
 use poot_graph_plan::{KernelChoice, Target};
 use poot_tensor::{DType, HostTensor};
 
@@ -82,32 +82,38 @@ fn build_with(
     let v_in = b
         .constant("v", TensorType::f32(vec![batch, hkv, lk, d]))
         .unwrap();
+    let blocks = lk.div_ceil(case.ratio);
+    // The words a real step declares (a block id or `-1`, a position inside the cache): the mask's casts to
+    // F32 are proven exact from them.
     let ids_in = b
-        .slot_named(
+        .slot_named_ranged(
             Slot::Token,
             "ids",
             TensorType::new(vec![batch, 1, lq, case.k], DType::I32),
+            IndexRange::new(-1, blocks as i64).unwrap(),
         )
         .unwrap();
     let pos_in = b
-        .slot(Slot::Pos, TensorType::new(vec![batch, lq], DType::I32))
-        .unwrap();
-    let out = b
-        .selected_attention(
-            SelectedAttentionAttrs {
-                n_rep: case.n_rep,
-                scale: case.scale(),
-                softcap: None,
-                ratio: case.ratio,
-                k: case.k,
-            },
-            q_in,
-            k_in,
-            v_in,
-            ids_in,
-            pos_in,
+        .slot_ranged(
+            Slot::Pos,
+            TensorType::new(vec![batch, lq], DType::I32),
+            IndexRange::below(lk).unwrap(),
         )
         .unwrap();
+    // The tracer's composition; `compile` forms the `SelectedAttention` the row runs the kernel of.
+    let out = ops::selected_attention(
+        &b,
+        q_in,
+        k_in,
+        v_in,
+        ids_in,
+        pos_in,
+        case.n_rep,
+        case.scale(),
+        None,
+        case.ratio,
+    )
+    .unwrap();
     let graph = b.finish(Outputs::new(out)).unwrap();
     let step = || {
         [

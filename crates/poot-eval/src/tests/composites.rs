@@ -180,6 +180,146 @@ fn flash_prefill_composite_is_the_traced_prefill_attention() {
     );
 }
 
+/// A per-head sink: `Attention { sink: PerHead }` is `ops::attention_masked_sinks` (bit for bit), and both
+/// equal the definition written out in `f64` — the sink is one more logit in each row's softmax that
+/// weighs into the maximum and the normalizer and has no value row. Sinks above and below the scores both
+/// occur, so a sink dropped from the maximum or from the normalizer changes the result.
+#[test]
+fn sink_composite_is_the_traced_sink_attention_and_the_softmax_with_one_more_logit() {
+    let (hkv, n_rep, l, d) = (2usize, 2usize, 5usize, 8usize);
+    let hq = hkv * n_rep;
+    let scale = 0.35f32;
+    let sinks = HostTensor::f32(vec![hq], vec![-3.0, 0.5, 2.0, 6.0]);
+    let inputs = [
+        data(&[1, hq, l, d], 31, 1.0),
+        data(&[1, hkv, l, d], 32, 1.0),
+        data(&[1, hkv, l, d], 33, 1.0),
+        causal_mask(&[1, 1, l, l], 0),
+        sinks.clone(),
+    ];
+    assert_composite_matches_chain(
+        "sink prefill",
+        OpKind::Attention(AttentionAttrs {
+            sink: poot_graph_ir::SinkOperand::PerHead,
+            ..AttentionAttrs::new(n_rep, scale, None)
+        }),
+        &inputs,
+        |b, t| ops::attention_masked_sinks(b, t[0], t[1], t[2], n_rep, scale, t[3], t[4]).unwrap(),
+    );
+
+    let composite = evaluate(&one_equation(
+        OpKind::Attention(AttentionAttrs {
+            sink: poot_graph_ir::SinkOperand::PerHead,
+            ..AttentionAttrs::new(n_rep, scale, None)
+        }),
+        &inputs,
+    ))
+    .unwrap();
+    let [q, k, v, mask, sink] = [0, 1, 2, 3, 4].map(|i| inputs[i].as_f32().unwrap());
+    let got = composite.as_f32().unwrap();
+    for h in 0..hq {
+        for i in 0..l {
+            let scores: Vec<f64> = (0..l)
+                .map(|t| {
+                    let dot: f64 = (0..d)
+                        .map(|c| {
+                            f64::from(q[(h * l + i) * d + c])
+                                * f64::from(k[((h / n_rep) * l + t) * d + c])
+                        })
+                        .sum();
+                    dot * f64::from(scale) + f64::from(mask[i * l + t])
+                })
+                .collect();
+            let top = scores.iter().copied().fold(f64::from(sink[h]), f64::max);
+            let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
+            let denominator = weights.iter().sum::<f64>() + (f64::from(sink[h]) - top).exp();
+            for c in 0..d {
+                let want: f64 = (0..l)
+                    .map(|t| weights[t] * f64::from(v[((h / n_rep) * l + t) * d + c]))
+                    .sum::<f64>()
+                    / denominator;
+                let at = (h * l + i) * d + c;
+                assert!(
+                    (f64::from(got[at]) - want).abs() < 1e-5,
+                    "head {h} row {i} channel {c}: {} vs {want}",
+                    got[at]
+                );
+            }
+        }
+    }
+}
+
+/// A causal mask stated by its positions: `Attention { mask: Causal { window } }` is the attention under
+/// `ops::causal_mask_from_pos` (bit for bit), and both equal the visibility written out in `f64`: key `t` is
+/// seen by the query at position `p` when `t <= p` and `p - t < window`. The positions are not `0..L`, so a
+/// kernel that assumed the row index as the position reads other keys.
+#[test]
+fn causal_composite_is_the_traced_attention_under_the_mask_of_its_positions() {
+    let (hkv, n_rep, l, cap, d) = (2usize, 2usize, 3usize, 7usize, 8usize);
+    let hq = hkv * n_rep;
+    let scale = 0.35f32;
+    let positions = [1i32, 4, 6];
+    for window in [None, Some(3)] {
+        let inputs = [
+            data(&[1, hq, l, d], 41, 1.0),
+            data(&[1, hkv, cap, d], 42, 1.0),
+            data(&[1, hkv, cap, d], 43, 1.0),
+            HostTensor::i32(vec![1, l], positions.to_vec()),
+        ];
+        let op = OpKind::Attention(AttentionAttrs {
+            mask: poot_graph_ir::MaskOperand::Causal { window },
+            ..AttentionAttrs::new(n_rep, scale, None)
+        });
+        assert_composite_matches_chain("causal attention", op.clone(), &inputs, |b, t| {
+            let mask = ops::causal_mask_from_pos(b, t[3], cap, window).unwrap();
+            ops::attention_masked(b, t[0], t[1], t[2], n_rep, scale, mask).unwrap()
+        });
+
+        let composite = evaluate(&one_equation(op, &inputs)).unwrap();
+        let [q, k, v] = [0, 1, 2].map(|i| inputs[i].as_f32().unwrap());
+        let got = composite.as_f32().unwrap();
+        for h in 0..hq {
+            for (i, &position) in positions.iter().enumerate() {
+                let visible: Vec<usize> = (0..cap)
+                    .filter(|&t| {
+                        t as i32 <= position
+                            && window.is_none_or(|w| position - (t as i32) < w as i32)
+                    })
+                    .collect();
+                let scores: Vec<f64> = visible
+                    .iter()
+                    .map(|&t| {
+                        let dot: f64 = (0..d)
+                            .map(|c| {
+                                f64::from(q[(h * l + i) * d + c])
+                                    * f64::from(k[((h / n_rep) * cap + t) * d + c])
+                            })
+                            .sum();
+                        dot * f64::from(scale)
+                    })
+                    .collect();
+                let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
+                let denominator: f64 = weights.iter().sum();
+                for c in 0..d {
+                    let want: f64 = visible
+                        .iter()
+                        .zip(&weights)
+                        .map(|(&t, w)| w * f64::from(v[((h / n_rep) * cap + t) * d + c]))
+                        .sum::<f64>()
+                        / denominator;
+                    let at = (h * l + i) * d + c;
+                    assert!(
+                        (f64::from(got[at]) - want).abs() < 1e-5,
+                        "window {window:?} head {h} row {i} channel {c}: {} vs {want}",
+                        got[at]
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// SC-002 (prefill, softcap): `Attention { softcap: Some(c) }` is
 /// `ops::attention_prefill_softcap` with the same cap. The scores reach past the cap, so a dropped or
 /// different softcap changes the bits.

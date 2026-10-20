@@ -45,7 +45,7 @@ fn per_position(
 /// `pos` `[B, Lq]` I32 that selected the blocks `ids` `[B, 1, Lq, K]` I32 (`-1` is no block) of `ratio`
 /// positions: a key is read when it is causal (`j <= pos`) and in a selected block or in the query's own
 /// unfinished block (the one `pos` is in, when `pos` is not its last position).
-fn selected_block_mask(
+pub fn selected_block_mask(
     b: &Builder,
     ids: Traced,
     pos: Traced,
@@ -138,6 +138,7 @@ pub fn selected_attention(
         scale,
         mask,
         softcap,
+        None,
         None,
     )
 }

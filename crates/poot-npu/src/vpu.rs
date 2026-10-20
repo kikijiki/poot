@@ -602,6 +602,13 @@ impl Device for VpuDevice {
     type Recording = VpuRecording;
     type Error = VpuError;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "intel-npu"
+    }
+
     fn target(&self) -> Target {
         Target::Vpu {
             target: self.caps.target,

@@ -16,7 +16,8 @@
 //! 4. Per query, the best `budget / ratio` blocks stay visible, ties going to the lower block (the
 //!    budget is exact even on equal scores). A block is eligible once every position of it is at or
 //!    before the query. The query's own unfinished block is always visible, unscored. The selection is
-//!    one typed op, [`BlockTopKAttrs`]: a linear radix select on a device, a quadratic rank on the oracle.
+//!    the primitive composition [`ops::block_top_k_packed`]; `compile` forms `OpKind::BlockTopK` from it
+//!    (a linear radix select on a device, a quadratic rank on the oracle).
 //!
 //! A completed block's key is a pure function of its `ratio` raw keys and its first position, so it
 //! never changes and is computed once. Each layer carries two states: the block keys
@@ -39,10 +40,7 @@
 
 use std::num::NonZeroU32;
 
-use poot_graph_ir::{
-    BinOp, BlockTopKAttrs, BlockTopKResult, Builder, RedOp, Scalar, StateRole, TensorType, Traced,
-    ops,
-};
+use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, StateRole, TensorType, Traced, ops};
 use poot_quant::weights::{QsaRole, WeightId, WeightMap, WeightRole};
 
 use crate::components::attention::{BlockSelection, first_writes};
@@ -383,7 +381,7 @@ fn block_keys(
 }
 
 /// `layer`'s block selection: the blocks of cached positions each query of the step reads, as the ids half of a
-/// [`BlockTopKAttrs`] selection (the attention then reads those blocks and the query's own unfinished block). `x`
+/// [`ops::block_top_k_packed`] selection (the attention then reads those blocks and the query's own unfinished block). `x`
 /// is the layer's normed input `[rows, tokens, width]`; the layer's block keys and unfinished-block raw keys are
 /// carried by `step` ([`block_keys`]). The step's capacity must be a multiple of the block `ratio`.
 pub(super) fn qsa_select(
@@ -396,8 +394,9 @@ pub(super) fn qsa_select(
 ) -> Result<BlockSelection, TraceError> {
     let q = query(b, step, x, w, p)?;
     let block_k = block_keys(b, step, layer, x, w, p)?; // [rows, 1, blocks, dim]
+    let packed = select_blocks(b, step, q, block_k, p)?;
     Ok(BlockSelection {
-        ids: select_blocks(b, step, q, block_k, p)?.ids,
+        ids: b.slice(packed, 3, 0, kept_blocks(step, p))?,
         ratio: p.ratio,
     })
 }
@@ -436,30 +435,34 @@ fn block_scores(b: &Builder, q: Traced, block_k: Traced, dim: usize) -> Result<T
     )?)
 }
 
+/// The blocks each query keeps: the budget in blocks, or every block when the budget is above the block count.
+fn kept_blocks(step: &Step, p: &QsaParams) -> usize {
+    p.block_topk().min(step.shape().capacity.get() / p.ratio)
+}
+
 /// The budgeted selection of the blocks each query has completed, from the queries `q` and the block keys
 /// `block_k` `[rows, 1, blocks, dim]`: scoring, then the best `budget / ratio` blocks, ties to the lower block
-/// ([`BlockTopKAttrs`]); a budget above the block count keeps every complete block.
+/// ([`ops::block_top_k_packed`]); a budget above the block count keeps every complete block. The packed I32
+/// result `[rows, 1, tokens, K + blocks]`: the `K` ids, then each block's keep indicator.
 fn select_blocks(
     b: &Builder,
     step: &Step,
     q: Traced,
     block_k: Traced,
     p: &QsaParams,
-) -> Result<BlockTopKResult, TraceError> {
-    let nb = step.shape().capacity.get() / p.ratio;
+) -> Result<Traced, TraceError> {
     debug_assert_eq!(
-        nb * p.ratio,
+        (step.shape().capacity.get() / p.ratio) * p.ratio,
         step.shape().capacity.get(),
         "the model checks the capacity granule"
     );
     let scores = block_scores(b, q, block_k, p.dim)?;
-    Ok(b.block_top_k(
-        BlockTopKAttrs {
-            ratio: p.ratio,
-            k: p.block_topk().min(nb),
-        },
+    Ok(ops::block_top_k_packed(
+        b,
         scores,
         step.pos(),
+        p.ratio,
+        kept_blocks(step, p),
     )?)
 }
 

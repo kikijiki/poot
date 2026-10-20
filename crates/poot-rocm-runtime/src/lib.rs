@@ -10,7 +10,7 @@
 //!   `ptr::copy_nonoverlapping` into/out of a GPU-visible allocation.
 //! - [`RocmContext::synchronize`]: drain the queue (spin on the queue's read index).
 //! - HSACO loading and dispatch: an AQL packet is written, the doorbell rung, and a per-launch
-//!   completion signal awaited. See [`ffi::Funcs`] for the function pointers.
+//!   completion signal awaited. See the crate-private `ffi::Funcs` for the function pointers.
 //!
 //! Safety: no safe public item can cause undefined behavior, and every `unsafe` block states the invariant it
 //! relies on in a `SAFETY:` comment (denied below).
@@ -44,11 +44,9 @@
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-pub mod bindings;
+mod bindings;
 
-pub mod ffi;
-
-mod platform;
+mod ffi;
 
 mod publication;
 
@@ -74,7 +72,6 @@ pub use publication::{
     QueuePublicationError, QueueRingMemory, take_issued_device_store_fence_count,
 };
 pub use queue::{QueueRingProvenance, QueueRole};
-pub use upload::UPLOAD_CHUNK_BYTES;
 
 #[cfg(test)]
 mod tests;

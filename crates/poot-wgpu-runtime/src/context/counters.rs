@@ -49,53 +49,26 @@ impl Context {
     /// the heap usage, from one `VK_EXT_memory_budget` read, so memory other processes took since the
     /// device opened is already out of it. `None` off Vulkan or if the query is unavailable.
     pub fn vram_free_bytes(&self) -> Option<u64> {
-        use ash::vk;
-        // SAFETY: as_hal yields the live wgpu-hal Vulkan adapter for the lifetime of the guard; the
-        // physical device + instance are valid for that borrow, and the property query only reads.
-        unsafe {
-            let hal = self._adapter.as_hal::<wgpu_hal::vulkan::Api>()?;
-            let phys = hal.raw_physical_device();
-            let instance = hal.shared_instance().raw_instance();
-            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-            instance.get_physical_device_memory_properties2(phys, &mut props2);
-            let mem = props2.memory_properties;
-            let free: u64 = (0..mem.memory_heap_count as usize)
-                .filter(|&i| {
-                    mem.memory_heaps[i]
-                        .flags
-                        .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                })
-                .map(|i| budget.heap_budget[i].saturating_sub(budget.heap_usage[i]))
-                .sum();
-            Some(free)
-        }
+        self.device_local_heaps().map(|heaps| heaps.free())
     }
 
     /// Total device-local VRAM available to this process (bytes), from `VK_EXT_memory_budget`
     /// (`heap_budget`, the OS-arbitrated budget: can be below the physical heap size and shrinks when
     /// other processes hold memory). `None` off Vulkan or if the query is unavailable.
     pub fn vram_budget_bytes(&self) -> Option<u64> {
-        use ash::vk;
+        self.device_local_heaps().map(|heaps| heaps.budget)
+    }
+
+    /// The device-local heaps' budget and usage through the wgpu-hal adapter's Vulkan handles; `None` off Vulkan.
+    fn device_local_heaps(&self) -> Option<poot_runtime_common::vulkan_probe::HeapBudget> {
         // SAFETY: as_hal yields the live wgpu-hal Vulkan adapter for the lifetime of the guard; the
         // physical device + instance are valid for that borrow, and the property query only reads.
         unsafe {
             let hal = self._adapter.as_hal::<wgpu_hal::vulkan::Api>()?;
-            let phys = hal.raw_physical_device();
-            let instance = hal.shared_instance().raw_instance();
-            let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-            instance.get_physical_device_memory_properties2(phys, &mut props2);
-            let mem = props2.memory_properties;
-            let total: u64 = (0..mem.memory_heap_count as usize)
-                .filter(|&i| {
-                    mem.memory_heaps[i]
-                        .flags
-                        .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                })
-                .map(|i| budget.heap_budget[i])
-                .sum();
-            Some(total)
+            Some(poot_runtime_common::vulkan_probe::device_local_heap_budget(
+                hal.shared_instance().raw_instance(),
+                hal.raw_physical_device(),
+            ))
         }
     }
 

@@ -1,3 +1,4 @@
+use crate::owner::QueueGuard;
 use crate::{DeviceBuffer, DeviceOwner, Pipeline, RuntimeError};
 use ash::vk;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -302,9 +303,12 @@ impl VulkanGraph {
             .replaying
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // The whole replay holds the device: no host copy through a buffer's mapping can overlap the GPU
+        // access of any submission below, and none can run until the last fence wait returns.
+        let queue = core.owner.lock_queue();
         for trap in &core.traps {
             trap.chunk
-                .write_with_at("replay", trap.offset, 4, &mut |_, out| out.fill(0))?;
+                .write_with_at(&queue, "replay", trap.offset, 4, &mut |_, out| out.fill(0))?;
         }
         for &command_buffer in &core.segments {
             // SAFETY: `core.fence` is this graph's own fence, and no submission signalling it is
@@ -322,10 +326,13 @@ impl VulkanGraph {
             // closed by the cut that opened its successor), and it is not pending (as for the fence
             // above); `core.fence` was just reset. Every buffer and pipeline the command buffers
             // reference is retained by `core`, and leaked with it if the submission is lost.
-            unsafe { core.owner.submit_and_wait(command_buffer, core.fence)? };
+            unsafe {
+                core.owner
+                    .submit_and_wait(&queue, command_buffer, core.fence)?
+            };
         }
         Ok(Replay {
-            fault: core.read_fault()?,
+            fault: core.read_fault(&queue)?,
             time: core.read_time()?,
         })
     }
@@ -333,10 +340,11 @@ impl VulkanGraph {
 
 impl GraphCore {
     /// The first trapping kernel whose error word is nonzero.
-    fn read_fault(&self) -> Result<Option<KernelFault>, RuntimeError> {
+    fn read_fault(&self, queue: &QueueGuard<'_>) -> Result<Option<KernelFault>, RuntimeError> {
         for trap in &self.traps {
             let mut word = [0u8; 4];
-            trap.chunk.read_bytes_at("replay", trap.offset, &mut word)?;
+            trap.chunk
+                .read_bytes_at(queue, "replay", trap.offset, &mut word)?;
             let code = u32::from_le_bytes(word);
             if code != 0 {
                 return Ok(Some(KernelFault {

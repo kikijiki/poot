@@ -42,7 +42,7 @@ fn coopmat_tile_dispatches_and_matches_cpu_on_radv() {
         eprintln!("llc not on PATH; skipping the coopmat dispatch probe");
         return;
     }
-    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out)
+    let artifact = compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out)
         .expect("coopmat tile must compile to SPIR-V");
     if which("spirv-val") {
         let v = std::process::Command::new("spirv-val")
@@ -148,7 +148,7 @@ fn coopmat_multi_tile_matmul_dispatches_and_matches_cpu_on_radv() {
         eprintln!("llc not on PATH; skipping the coopmat multi-tile dispatch probe");
         return;
     }
-    let artifact = compile_kernel(&body, poot_codegen::GpuTarget::SpirvVulkan, &out)
+    let artifact = compile_kernel(&body, poot_target::Backend::SpirvVulkan, &out)
         .expect("coopmat multi-tile matmul must compile to SPIR-V");
     if which("spirv-val") {
         let v = std::process::Command::new("spirv-val")

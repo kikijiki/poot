@@ -87,18 +87,20 @@ fn real_decode_graph(dense: poot_models::test_support::dense::Dense, cap: usize)
 /// POOT-1209: +1, the `[rows]` view of the position every layer's live attention bound reads.
 /// POOT-1229: the pad column is the legalizer's, on a target with DRAM channel data only (SPIR-V here, the Strix
 /// Halo RADV device), so a target without channel data (PTX) runs the 368 of the exact capacity.
+/// POOT-1238: -1 on both, the mask region's launch: the attention states its causal mask by the position, so no
+/// mask is built, and -3 more with channel data, the pad column of that mask is not needed either.
 const QWEN2_0_5B_DISPATCHES: Dispatches = Dispatches {
-    with_channels: 371,
-    without: 368,
+    with_channels: 367,
+    without: 367,
 };
 
 /// Dispatches per token of the 28-layer Qwen3-0.6B real-config decode graph (the legacy tracer planned 539).
 /// POOT-725: 484; POOT-1108: 483, the position cast folded as for Qwen2.5 above; POOT-1150: 486, the hidden
 /// pad column as above. POOT-1209: 487, the `[rows]` view of the position as above. POOT-1229: 484 on a target
-/// without channel data, as above.
+/// without channel data, as above. POOT-1238: 483 on both, the mask launch and the pad column gone as above.
 const QWEN3_0_6B_DISPATCHES: Dispatches = Dispatches {
-    with_channels: 487,
-    without: 484,
+    with_channels: 483,
+    without: 483,
 };
 
 /// The dispatch pin of a decode graph by whether the target carries DRAM channel data (the legalizer pads the
@@ -120,7 +122,7 @@ impl Dispatches {
 /// Dispatches per token of the same Qwen2.5-0.5B config traced over a paged KV pool: the contiguous decode's
 /// minus the one the in-place write does not need. Before attention read the pools in place this was 96 more
 /// (one gather and one transpose per layer and per K and V).
-const QWEN2_0_5B_PAGED_DISPATCHES: usize = 367;
+const QWEN2_0_5B_PAGED_DISPATCHES: usize = 366;
 
 /// Dispatches `program` runs per step: every planned equation but the free ones (an alias or a strided view).
 fn dispatches(program: &Program) -> usize {

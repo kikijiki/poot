@@ -72,6 +72,15 @@ impl Device for FaultyDevice {
     type Recording = ();
     type Error = FaultyError;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    /// A raw-Vulkan device by name: it executes the planner target wgpu also executes, so a label derived
+    /// from the target would read `wgpu`.
+    fn backend_name(&self) -> &'static str {
+        "vulkan"
+    }
+
     fn target(&self) -> Target {
         Target::Gpu {
             backend: Backend::SpirvVulkan,
@@ -299,6 +308,31 @@ fn begin_failure_aborts_exactly_once_and_leaves_no_open_recording() {
         .expect("a later step with the failure cleared must succeed cleanly")
         .read()
         .expect("read the now-successful step's output");
+}
+
+/// POOT-1231 SC-002: a device failure is labelled with the runtime that raised it, not with the planner
+/// target it executes. This device runs the SPIR-V target wgpu also runs and names itself `vulkan`.
+/// Mutation: derive the label in `device_error` from the planner target (`SpirvVulkan` => `wgpu`): the label
+/// reads `wgpu` and this goes red.
+#[test]
+fn a_device_failure_is_labelled_with_the_runtime_that_raised_it() {
+    let (mut engine, control) = new_engine();
+    let (g, store, map) = fixture();
+    let exe = engine.load_weights(store, map).unwrap();
+    let target = engine.device().target();
+    let entry = engine.add_entry(exe, &staged(&g, target)).unwrap();
+
+    control.failures.borrow_mut().begin = true;
+    let error = step_err(
+        &mut engine,
+        exe,
+        entry,
+        "an injected begin failure must surface",
+    );
+    let ExecError::Device(device) = &error else {
+        panic!("a begin failure is a device error, got {error:?}");
+    };
+    assert_eq!(device.backend, "vulkan", "{error}");
 }
 
 /// SC-020 (dispatch point): under the contract's only submission mode, a

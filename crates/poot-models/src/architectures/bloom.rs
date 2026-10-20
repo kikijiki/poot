@@ -297,6 +297,7 @@ impl StandardFamily for Bloom {
             q: h,
             kv: h,
             inter: 0,
+            head_dim: 0,
         };
         family_weights_fused(FAMILY, store, &[rows], params.layers, false, fused)
     }

@@ -3,7 +3,7 @@
 //! ([`poot_ptx_runtime::PtxContext::begin_capture`]/`end_capture`), exactly as `poot_wgpu_device`'s
 //! `WgpuDevice` does for wgpu. The one generic [`poot_executor::Engine`] owns planning, binding, state
 //! sharing and the two-phase state commit; this crate contributes only the backend mechanism (kernel
-//! loading/dispatch, a generated copy kernel, device-timed replay) plus what a device adds to join a
+//! loading/dispatch, a native recorded buffer copy, device-timed replay) plus what a device adds to join a
 //! multi-device program ([`multi_device`]: `Collectives` over capture-scoped sync events, peer copies
 //! and a recorded add, driven by [`poot_executor::Coordinator`]).
 

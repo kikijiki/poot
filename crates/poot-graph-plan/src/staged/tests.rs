@@ -931,22 +931,18 @@ fn a_block_selected_cache_is_counted_at_its_selected_positions() {
         .unwrap()
     };
     let (k, v) = (cache("k"), cache("v"));
-    let out = b
-        .selected_attention(
-            poot_graph_ir::SelectedAttentionAttrs {
-                n_rep: 2,
-                scale: 0.5,
-                softcap: None,
-                ratio: 4,
-                k: 2,
-            },
-            q,
-            k,
-            v,
-            ids,
-            pos,
-        )
-        .unwrap();
+    let out = poot_graph_ir::test_support::composites::selected_attention(
+        &b,
+        poot_graph_ir::SelectedAttentionAttrs {
+            n_rep: 2,
+            scale: 0.5,
+            softcap: None,
+            ratio: 4,
+            k: 2,
+        },
+        [q, k, v, ids, pos],
+    )
+    .unwrap();
     let k_out = b.binary(BinOp::Mul, k, k).unwrap();
     let v_out = b.binary(BinOp::Mul, v, v).unwrap();
     let graph = b

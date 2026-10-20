@@ -3,19 +3,17 @@
 //! (its own chat template, or the raw text), sizes a driver to the model's window, and streams the text
 //! through a sink.
 
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_executor::Executor;
-use poot_graph_plan::{CompileLimits, CompileOptions};
 
 use crate::GenerationControl;
 use crate::core::sampler::Sampler;
 use crate::driver::error::{DriverError, InvalidRequest};
 use crate::driver::stops::StopScanner;
 use crate::driver::{
-    Conversation, DraftPolicy, Driver, DriverOptions, GenerateRequest, Generation, Layout,
-    ModelHandle, PreparedSetLimits, Serving, program_retention,
+    Conversation, Driver, DriverOptions, GenerateRequest, Generation, Layout, ModelHandle, Serving,
 };
 use poot_text::{RenderedChat, Speaker, TextCodec, TextError};
 
@@ -230,21 +228,7 @@ fn driver_options(capacity: NonZeroUsize, granule: NonZeroUsize) -> DriverOption
     // admitted piece, the full chunk included: a window under the chunk shrinks it.
     let chunk = PREFILL_CHUNK.min(capacity.get()) / granule * granule.get();
     let chunk = NonZeroUsize::new(chunk).unwrap_or(granule);
-    let compile = CompileOptions::new(CompileLimits::STANDARD);
-    DriverOptions {
-        prefill: compile.clone(),
-        decode: compile,
-        capacity,
-        prefill_chunk: chunk,
-        trace: super::serving_trace_limits(chunk),
-        prepared: PreparedSetLimits {
-            max_entries: NonZeroUsize::new(64).expect("nonzero"),
-            max_retained_bytes: NonZeroU64::new(1 << 32).expect("nonzero"),
-        },
-        charge: program_retention,
-        draft: DraftPolicy::Off,
-        hidden_window: None,
-    }
+    DriverOptions::generation(capacity, chunk)
 }
 
 /// `request` generated on `executor`, each piece of text passed to `sink` as it is decoded. A run that

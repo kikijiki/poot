@@ -13,7 +13,7 @@ use poot_llm::driver::{
     BackendChoice, Driver, DriverOptions, GenerateRequest, Layout, LoadOptions, ModelHandle,
     Serving, open_executor,
 };
-use poot_llm::{FrontEndSession, GenerationControl, Sampler, tower_options};
+use poot_llm::{FrontEndSession, GenerationControl, Sampler};
 
 /// A loaded SmolVLM: its front end on a vision driver and the text decoder on another.
 struct Smolvlm {
@@ -65,7 +65,10 @@ fn load(choice: BackendChoice) -> Option<Smolvlm> {
     );
     let mut vision = Some(vision);
     let session = FrontEndSession::open(Arc::clone(&handle), |_, positions| {
-        Ok::<_, DriverError>((vision.take().expect("one tower"), tower_options(positions)))
+        Ok::<_, DriverError>((
+            vision.take().expect("one tower"),
+            DriverOptions::tower(positions),
+        ))
     })
     .expect("open the vision tower")
     .expect("smolvlm has a front end");
@@ -165,7 +168,6 @@ fn caption_matches_the_recorded_vlm_runner_tokens_wgpu() {
     caption_matches_the_recorded_vlm_runner_tokens(BackendChoice::Wgpu);
 }
 
-#[cfg(feature = "rocm")]
 #[test]
 #[ignore = "needs the local smolvlm-256m checkpoint + ROCm (17 vision frames, ~1200-token prefill)"]
 fn caption_matches_the_recorded_vlm_runner_tokens_rocm() {
@@ -210,7 +212,6 @@ fn two_captions_on_one_front_end_are_not_stale_wgpu() {
     two_captions_on_one_front_end_are_not_stale(BackendChoice::Wgpu);
 }
 
-#[cfg(feature = "rocm")]
 #[test]
 #[ignore = "needs the local smolvlm-256m checkpoint + ROCm (two captions)"]
 fn two_captions_on_one_front_end_are_not_stale_rocm() {

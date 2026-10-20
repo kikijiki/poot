@@ -34,6 +34,7 @@ fn spec(
         },
         mask: kg::MaskKind::Broadcast,
         bound: kg::KeyBound::Static,
+        sink: kg::AttentionSink::Absent,
         schedule: kg::AttentionSchedule::Streaming { lanes: 4 },
     }
 }
@@ -69,6 +70,10 @@ struct Operands {
     len: Option<Vec<i32>>,
     /// The `[B, Lk]` slot map of a paged key, which reads `k` and `v` as pools.
     read: Option<Vec<i32>>,
+    /// The sink logit of each query head.
+    sinks: Option<Vec<f32>>,
+    /// The `[B, Lq]` query positions of a causal mask, which the kernel reads in the mask's place.
+    positions: Option<Vec<i32>>,
 }
 
 impl Operands {
@@ -89,6 +94,34 @@ impl Operands {
             mask,
             len: None,
             read: None,
+            sinks: None,
+            positions: None,
+        }
+    }
+
+    /// These operands under a causal mask: the kernel reads `positions` and no mask tensor.
+    fn with_positions(self, positions: &[i32]) -> Self {
+        Self {
+            positions: Some(positions.to_vec()),
+            ..self
+        }
+    }
+
+    /// The kernel's fourth parameter: the query positions of a causal mask, else the additive mask.
+    fn mask_buffer(&self) -> Buffer {
+        match &self.positions {
+            Some(positions) => Buffer::from_i32s(positions),
+            None => Buffer::from_f32s(&self.mask),
+        }
+    }
+
+    /// These operands with a sink logit per query head, spread over a range that reaches above and below the
+    /// scores so it takes the row maximum for some heads and not for others.
+    fn with_sinks(self, hq: usize) -> Self {
+        let sinks = (0..hq).map(|h| 3.0 * h as f32 - 2.0).collect();
+        Self {
+            sinks: Some(sinks),
+            ..self
         }
     }
 
@@ -123,6 +156,8 @@ impl Operands {
                 k_shared: self.k_shared.as_deref(),
                 len: self.len.as_deref(),
                 read: self.read.as_deref(),
+                sinks: self.sinks.as_deref(),
+                positions: self.positions.as_deref(),
             },
         )
     }
@@ -145,11 +180,12 @@ fn interpret(spec: &kg::AttentionSpec, caps: &DeviceCaps, operands: &Operands) -
         Buffer::from_f32s(&operands.q),
         Buffer::from_f32s(&operands.k),
         Buffer::from_f32s(&operands.v),
-        Buffer::from_f32s(&operands.mask),
+        operands.mask_buffer(),
     ];
     buffers.extend(operands.k_shared.as_deref().map(Buffer::from_f32s));
     buffers.extend(operands.read.as_deref().map(Buffer::from_i32s));
     buffers.extend(operands.len.as_deref().map(Buffer::from_i32s));
+    buffers.extend(operands.sinks.as_deref().map(Buffer::from_f32s));
     buffers.push(Buffer::from_f32s(&vec![f32::NAN; out_len]));
     run(&generated.body, workgroups, &mut buffers).unwrap();
     buffers.last().unwrap().to_f32s().unwrap()
@@ -208,6 +244,65 @@ fn prefill_matches_the_reference() {
     let got = interpret(&spec, &caps(), &operands);
     let want = attention_reference(&spec, &operands.q, &operands.k, &operands.v, &operands.mask);
     assert_close(&got, &want, 1e-5);
+}
+
+/// A sink: one learned logit per head in the row's softmax, no key and no value. Heads whose sink sits below,
+/// inside and above the range of their scores all match the reference, on a decode over ragged lanes and on a
+/// causal prefill whose rows see different numbers of keys. A kernel that drops the sink, adds its mass but
+/// not to the maximum, or gathers a value row for it differs from the reference by far more than the
+/// tolerance.
+///
+/// Mutation: in `attention_body`, skip the sink's initial `(m, l)` state; the output equals the sinkless
+/// reference and the heads whose sink is large go red.
+#[test]
+fn a_sink_joins_the_softmax_and_no_value_sum() {
+    let decode = with_lanes(
+        kg::AttentionSpec {
+            sink: kg::AttentionSink::PerHead,
+            ..spec(2, 4, 2, 1, 13, 8)
+        },
+        5,
+    );
+    let operands = Operands::new(&decode, additive_mask(2, 1, 13, Some(&[10, 13]))).with_sinks(4);
+    let got = interpret(&decode, &caps(), &operands);
+    assert_close(&got, &operands.reference(&decode), 1e-5);
+    let sinkless = attention_reference(
+        &decode,
+        &operands.q,
+        &operands.k,
+        &operands.v,
+        &operands.mask,
+    );
+    assert!(
+        max_abs_error(&got, &sinkless) > 1e-2,
+        "the sink must change the output, or the row proves nothing"
+    );
+
+    let prefill = kg::AttentionSpec {
+        sink: kg::AttentionSink::PerHead,
+        ..spec(1, 4, 2, 6, 6, 8)
+    };
+    let operands = Operands::new(&prefill, additive_mask(1, 6, 6, None)).with_sinks(4);
+    let got = interpret(&prefill, &caps(), &operands);
+    assert_close(&got, &operands.reference(&prefill), 1e-5);
+}
+
+/// A row with no visible key and a sink divides by the sink's mass alone: zero output, not the NaN a sinkless
+/// row gives (`a_row_with_no_visible_key_is_nan_and_its_neighbours_are_not`).
+#[test]
+fn a_sink_row_with_no_visible_key_is_zero() {
+    let sunk = kg::AttentionSpec {
+        sink: kg::AttentionSink::PerHead,
+        ..spec(2, 2, 1, 1, 6, 8)
+    };
+    let operands = Operands::new(&sunk, additive_mask(2, 1, 6, Some(&[0, 6]))).with_sinks(2);
+    let got = interpret(&sunk, &caps(), &operands);
+    assert_close(&got, &operands.reference(&sunk), 1e-5);
+    let row = sunk.hq * sunk.dv;
+    assert!(
+        got[..row].iter().all(|&x| x == 0.0),
+        "the empty row is zero"
+    );
 }
 
 /// Gemma-style attention-logit softcap on a prefill whose scores reach well past the cap. A kernel that
@@ -525,11 +620,12 @@ fn interpret_split(
         Buffer::from_f32s(&operands.q),
         Buffer::from_f32s(&operands.k),
         Buffer::from_f32s(&operands.v),
-        Buffer::from_f32s(&operands.mask),
+        operands.mask_buffer(),
     ];
     buffers.extend(operands.k_shared.as_deref().map(Buffer::from_f32s));
     buffers.extend(operands.read.as_deref().map(Buffer::from_i32s));
     buffers.extend(operands.len.as_deref().map(Buffer::from_i32s));
+    buffers.extend(operands.sinks.as_deref().map(Buffer::from_f32s));
     let scratch = buffers.len();
     buffers.push(Buffer::from_f32s(&vec![
         scratch_fill;
@@ -565,6 +661,33 @@ fn split_kv_decode_matches_the_reference() {
     let (got, workgroups) = interpret_split(&split, &caps(), &operands, f32::NAN);
     assert_eq!(workgroups, [2 * 3 * 4, 2 * 3], "rows x splits, then rows");
     assert_close(&got, &operands.reference(&split), SPLIT_KV_TOLERANCE);
+}
+
+/// A sink under the split schedule is counted once: only the first split's first lane starts from it. Four
+/// splits of a 41-key cache, then a live length of 5 that leaves every split but the first without a key.
+///
+/// Mutation: start every split from the sink; the combine counts its mass four times and the heads whose sink
+/// matters go red.
+#[test]
+fn a_sink_under_split_kv_is_counted_once() {
+    let base = kg::AttentionSpec {
+        sink: kg::AttentionSink::PerHead,
+        ..with_lanes(spec(2, 3, 1, 1, 41, 8), 4)
+    };
+    let split = with_splits(base, 4, 4);
+    let operands = Operands::new(&split, additive_mask(2, 1, 41, Some(&[33, 41]))).with_sinks(3);
+    let (got, _) = interpret_split(&split, &caps(), &operands, f32::NAN);
+    assert_close(&got, &operands.reference(&split), SPLIT_KV_TOLERANCE);
+
+    let live = kg::AttentionSpec {
+        bound: kg::KeyBound::Live,
+        ..split
+    };
+    let operands = Operands::new(&live, additive_mask(2, 1, 41, None))
+        .with_len(&[5, 41])
+        .with_sinks(3);
+    let (got, _) = interpret_split(&live, &caps(), &operands, f32::NAN);
+    assert_close(&got, &operands.reference(&live), SPLIT_KV_TOLERANCE);
 }
 
 /// A live length of 5 against 4 splits of 11 keys leaves splits 1..4 with no key to visit. The scratch
@@ -773,4 +896,159 @@ fn a_paged_split_kv_with_a_live_bound_never_reads_past_the_length() {
     let (got, _) = interpret_split(&live, &caps(), &operands, f32::NAN);
     assert!(got.iter().all(|x| x.is_finite()), "{got:?}");
     assert_close(&got, &operands.reference(&live), SPLIT_KV_TOLERANCE);
+}
+
+/// The `[B, 1, Lq, Lk]` additive mask of the visibility a causal mask states: key `t` is visible to query row
+/// `(b, i)` when `t <= max(pos, 0)` and, under a window, `pos - t < window`.
+fn mask_of_positions(
+    batch: usize,
+    lq: usize,
+    lk: usize,
+    positions: &[i32],
+    window: Option<usize>,
+) -> Vec<f32> {
+    let mut mask = Vec::new();
+    for b in 0..batch {
+        for i in 0..lq {
+            let position = positions[b * lq + i].max(0) as usize;
+            for t in 0..lk {
+                let visible = t <= position && window.is_none_or(|w| position - t < w);
+                mask.push(if visible { 0.0 } else { -1.0e9 });
+            }
+        }
+    }
+    mask
+}
+
+fn causal(spec: kg::AttentionSpec, window: Option<usize>) -> kg::AttentionSpec {
+    kg::AttentionSpec {
+        mask: kg::MaskKind::Causal { window },
+        ..spec
+    }
+}
+
+/// Key and value rows `t` of batch row `b`, every head, set to NaN: a kernel that reads one has poisoned its
+/// output.
+fn poison_key(operands: &mut Operands, spec: &kg::AttentionSpec, b: usize, t: usize) {
+    let hkv = spec.hq / spec.n_rep;
+    for h in 0..hkv {
+        let row = (b * hkv + h) * spec.lk + t;
+        operands.k[row * spec.dk..(row + 1) * spec.dk].fill(f32::NAN);
+        operands.v[row * spec.dv..(row + 1) * spec.dv].fill(f32::NAN);
+    }
+}
+
+/// A causal mask stated by its positions equals the textbook attention under the visibility it names and the
+/// additive kernel under the mask tensor of that visibility: a decode over ragged lanes, a windowed prefill
+/// (every row a different window), and a long decode whose window starts at a key no lane begins on, so each
+/// lane's first key moves to its own stride.
+///
+/// Mutation: in `attention_body`, start every causal row at its lane's first key (drop the window start); the
+/// windowed rows read keys the window hides and go red.
+#[test]
+fn a_causal_mask_is_the_additive_mask_of_its_positions() {
+    let rows = [
+        (with_lanes(spec(2, 4, 2, 1, 13, 8), 5), vec![4, 12], None),
+        (
+            with_lanes(spec(1, 4, 2, 9, 9, 8), 4),
+            (0..9).collect(),
+            Some(3),
+        ),
+        (
+            with_lanes(spec(2, 2, 1, 1, 40, 8), 4),
+            vec![37, 20],
+            Some(5),
+        ),
+        (with_lanes(spec(1, 2, 1, 1, 40, 8), 4), vec![39], Some(40)),
+    ];
+    for (additive, positions, window) in rows {
+        let structural = causal(additive.clone(), window);
+        let mask = mask_of_positions(additive.batch, additive.lq, additive.lk, &positions, window);
+        let by_mask = Operands::new(&additive, mask);
+        let by_positions = Operands::new(&structural, Vec::new()).with_positions(&positions);
+        let got = interpret(&structural, &caps(), &by_positions);
+        assert_close(&got, &by_positions.reference(&structural), 1e-5);
+        assert_close(&got, &interpret(&additive, &caps(), &by_mask), 1e-5);
+    }
+}
+
+/// A causal row never reads a key it cannot see: the keys past the position and before the window carry NaN,
+/// and the output is finite and equal to the reference. The additive kernel reads every key and takes the NaN.
+///
+/// Mutation: in `attention_body`, leave the causal row's `key_end` at the capacity; the poison past the
+/// position reaches the row and the output goes NaN.
+#[test]
+fn a_causal_row_never_reads_a_key_it_cannot_see() {
+    let spec = causal(with_lanes(spec(2, 2, 1, 1, 30, 8), 4), Some(6));
+    let positions = [17, 5];
+    let mut operands = Operands::new(&spec, Vec::new()).with_positions(&positions);
+    for (b, &position) in positions.iter().enumerate() {
+        for t in 0..30 {
+            if t > position as usize || position as usize - t >= 6 {
+                poison_key(&mut operands, &spec, b, t);
+            }
+        }
+    }
+    let got = interpret(&spec, &caps(), &operands);
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "poison reached the output: {got:?}"
+    );
+    assert_close(&got, &operands.reference(&spec), 1e-5);
+
+    let additive = kg::AttentionSpec {
+        mask: kg::MaskKind::Broadcast,
+        ..spec.clone()
+    };
+    let by_mask = Operands {
+        mask: mask_of_positions(2, 1, 30, &positions, Some(6)),
+        positions: None,
+        ..operands
+    };
+    assert!(
+        interpret(&additive, &caps(), &by_mask)
+            .iter()
+            .any(|x| x.is_nan()),
+        "the fixture must put NaN where an every-key walk reads"
+    );
+}
+
+/// A padded query (position `-1`) sees key 0 and no NaN reaches its row or its neighbour's.
+#[test]
+fn a_causal_row_at_a_negative_position_sees_the_first_key() {
+    let spec = causal(with_lanes(spec(2, 2, 1, 1, 9, 8), 4), None);
+    let operands = Operands::new(&spec, Vec::new()).with_positions(&[-1, 6]);
+    let got = interpret(&spec, &caps(), &operands);
+    assert!(got.iter().all(|x| x.is_finite()), "{got:?}");
+    assert_close(&got, &operands.reference(&spec), 1e-5);
+    // One visible key: the row is that key's value.
+    let row = spec.hq * spec.dv;
+    assert_close(&got[..spec.dv], &operands.v[..spec.dv], 1e-5);
+    assert_eq!(got.len(), 2 * row);
+}
+
+/// A causal row under the split schedule: 4 splits of a 41-key cache with a window, so most splits hold no
+/// visible key and publish the neutral partial, and the keys outside the window are poison.
+#[test]
+fn a_causal_row_under_split_kv_matches_the_reference() {
+    let split = with_splits(
+        causal(with_lanes(spec(2, 3, 1, 1, 41, 8), 4), Some(9)),
+        4,
+        4,
+    );
+    let positions = [40, 12];
+    let mut operands = Operands::new(&split, Vec::new()).with_positions(&positions);
+    for (b, &position) in positions.iter().enumerate() {
+        for t in 0..41 {
+            if t > position as usize || position as usize - t >= 9 {
+                poison_key(&mut operands, &split, b, t);
+            }
+        }
+    }
+    let (got, _) = interpret_split(&split, &caps(), &operands, f32::NAN);
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "poison reached the output: {got:?}"
+    );
+    assert_close(&got, &operands.reference(&split), SPLIT_KV_TOLERANCE);
 }

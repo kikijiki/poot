@@ -38,6 +38,8 @@ poot-test-util.workspace = true
 # SC-002 (card 531c): dispatches pootc's emitted .ptx to prove a real Assert traps on PTX, same as
 # poot-wgpu-runtime does for SpirvVulkan above.
 poot-ptx-runtime.workspace = true
+# `Backend`, the byte-artifact target the import tests compile for.
+poot-target.workspace = true
 
 [package.metadata.rust-analyzer]
 rustc_private = true

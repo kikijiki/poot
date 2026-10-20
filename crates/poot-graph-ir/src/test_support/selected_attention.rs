@@ -42,12 +42,13 @@ impl Case {
         1.0 / (self.d as f32).sqrt()
     }
 
-    /// Deterministic `q`, `k`, `v` in `[-1, 1)`.
+    /// Deterministic `q`, `k`, `v` in `[-1, 1)`, three different tensors: `fill` makes a seed odd, so seeds
+    /// that are one apart would draw the same values twice and a swapped `k` and `v` would go unseen.
     pub fn operands(&self, seed: u64) -> [Vec<f32>; 3] {
         [
             fill(self.batch * self.hq * self.lq * self.d, seed),
-            fill(self.batch * self.hkv() * self.lk * self.d, seed + 1),
             fill(self.batch * self.hkv() * self.lk * self.d, seed + 2),
+            fill(self.batch * self.hkv() * self.lk * self.d, seed + 4),
         ]
     }
 

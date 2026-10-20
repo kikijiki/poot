@@ -884,6 +884,53 @@ fn compile_preserves_every_witness_lane() {
     }
 }
 
+/// Every pooled DSA layer's selection is a `BlockTopK` in the compiled program, on every backend: the tracer
+/// states `ops::block_top_k_packed` over the pools and the selection pass of `compile` forms the op, so a
+/// device runs the linear radix select and not the pairwise rank. One per layer that carries an indexer
+/// cache. Mutation: make the selection pass decline (`form_selection` returns the graph unchanged); the pairwise
+/// rank has no device lowering, so `compile` refuses its `Cast` (`missing: DtypeLowering`) and this row goes red.
+#[test]
+fn the_pooled_selection_compiles_to_a_block_top_k_per_dsa_layer() {
+    use poot_graph_ir::OpKind;
+    let block_top_ks = |graph: &poot_graph_ir::Graph| {
+        graph
+            .eqns()
+            .iter()
+            .filter(|eqn| matches!(eqn.op, OpKind::BlockTopK(_)))
+            .count()
+    };
+    for (label, fx) in [("fixture", fixture()), ("finetune", finetune_fixture())] {
+        let model = model_of(&fx);
+        for tokens in [1, 4] {
+            let graph = bound_step(&*model, tokens);
+            let layers = graph
+                .state()
+                .filter(|(input, _)| {
+                    graph
+                        .meta(*input)
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.ends_with(".index"))
+                })
+                .count();
+            assert!(layers > 0, "{label}: the fixture has pooled DSA layers");
+            assert_eq!(
+                block_top_ks(&graph),
+                0,
+                "{label} {tokens}-token step: the tracer states the composition, not the op"
+            );
+            for backend in backends() {
+                let program = compile(&graph, &target_of(backend), &REPLAY).unwrap();
+                assert_eq!(
+                    block_top_ks(program.graph()),
+                    layers,
+                    "{label} {tokens}-token step on {backend:?}: one BlockTopK per pooled DSA layer"
+                );
+            }
+        }
+    }
+}
+
 /// The carried state of a program by the name the graph gives each value, so the two programs of a
 /// driver step (the target's and the multi-token-prediction layer's) hand the carry over by name
 /// and each keeps its own caches.

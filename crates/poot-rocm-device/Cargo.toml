@@ -13,11 +13,8 @@ poot-codegen.workspace = true
 poot-executor.workspace = true
 poot-graph-plan.workspace = true
 poot-target.workspace = true
-# `RocmDevice::copy`'s one generated copy kernel is the committed `assets/copy_words.kir.json`
-# fixture (Card 548), loaded at construction through `ImportedKernel::CopyWords` (card
-# 559) - never a parser or DSL, the fixture itself is a real `#[kernel]` fn compiled through `pootc`
-# (`just regen-kernel-assets`).
-poot-kernel-ir = { workspace = true, features = ["serde"] }
+# The `rocm-check` probe binary builds its own fixture kernels; the device library compiles nothing.
+poot-kernel-ir.workspace = true
 poot-rocm-runtime.workspace = true
 poot-runtime-common.workspace = true
 thiserror.workspace = true

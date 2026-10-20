@@ -17,6 +17,7 @@
 //! per-dispatch detail for that window is still fully retained ([`Coverage`]).
 
 use poot_runtime_common::Coverage;
+use poot_target::TargetId;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
@@ -92,8 +93,38 @@ pub enum DeviceCoverage {
     Measured(MeasuredDevice),
 }
 
-/// One `step()` call's full timing record: identity (which entry, which replay of it, which
-/// device/backend), the host-wall partition, the device-time coverage, and (detailed mode only) the
+/// Which build produced a timing record: the version of the `poot-profile` crate (the workspace version, shared by
+/// every poot crate; it is not a commit id) and the cargo profile it was compiled with. A report that names no
+/// build cannot say whether a debug binary produced its figures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildIdentity {
+    /// The workspace version `poot-profile` was built at.
+    pub version: &'static str,
+    /// `debug` or `release`.
+    pub profile: &'static str,
+}
+
+impl BuildIdentity {
+    /// The identity of the build this crate was compiled into.
+    pub const fn current() -> Self {
+        BuildIdentity {
+            version: env!("CARGO_PKG_VERSION"),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for BuildIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "poot-profile {} ({})", self.version, self.profile)
+    }
+}
+
+/// One `step()` call's full timing record: identity (which entry, which replay of it), the host-wall partition, the device-time coverage, and (detailed mode only) the
 /// per-dispatch breakdown.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StepTiming {
@@ -106,8 +137,6 @@ pub struct StepTiming {
     pub entry: u64,
     /// The entry's replay sequence number this step corresponds to.
     pub replay: u64,
-    /// Which device/backend produced this record (a debug label, e.g. `"SpirvVulkan"`).
-    pub device_label: String,
     /// Host wall time partitioned into encode, wait and wall.
     pub host: HostTiming,
     /// Device-time coverage of this step.
@@ -191,6 +220,8 @@ fn entry_counters_for(map: &BTreeMap<u64, EntryCounters>, entry: u64) -> EntryCo
 /// `max_retained_steps` and `max_retained_dispatch_records`, oldest evicted first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TimingSnapshot {
+    target: TargetId,
+    build: BuildIdentity,
     cumulative: BTreeMap<u64, EntryCounters>,
     retained: VecDeque<StepTiming>,
     retained_dispatch_count: usize,
@@ -204,8 +235,15 @@ impl TimingSnapshot {
     /// `max_retained_steps == 0` is the counters-only configuration: every cumulative counter still
     /// works exactly, but no per-dispatch detail is ever retained ([`Coverage::Unavailable`] for
     /// every window's detail).
-    pub fn new(max_retained_steps: usize, max_retained_dispatch_records: usize) -> Self {
+    pub fn new(
+        target: TargetId,
+        build: BuildIdentity,
+        max_retained_steps: usize,
+        max_retained_dispatch_records: usize,
+    ) -> Self {
         Self {
+            target,
+            build,
             cumulative: BTreeMap::new(),
             retained: VecDeque::new(),
             retained_dispatch_count: 0,
@@ -216,7 +254,7 @@ impl TimingSnapshot {
         }
     }
 
-    /// Record one step's timing. `entry`/`replay`/`device_label` identify it; `dispatches` is empty
+    /// Record one step's timing. `entry`/`replay` identify it; `dispatches` is empty
     /// unless detailed collection is on for this step. Evicts the oldest retained step(s) first when
     /// either bound would otherwise be exceeded; never evicts or truncates to make room for a step
     /// that has not finished (there is no such state here: a step is recorded only once complete).
@@ -224,7 +262,6 @@ impl TimingSnapshot {
         &mut self,
         entry: u64,
         replay: u64,
-        device_label: impl Into<String>,
         host: HostTiming,
         device: DeviceCoverage,
         dispatches: Vec<DispatchTiming>,
@@ -236,7 +273,6 @@ impl TimingSnapshot {
             seq,
             entry,
             replay,
-            device_label: device_label.into(),
             host,
             device,
             dispatches,
@@ -315,13 +351,6 @@ impl TimingSnapshot {
     }
 }
 
-impl Default for TimingSnapshot {
-    /// Counters-only (Card 552: "`TimingOptions` defaults to counters-only"): no detail ring.
-    fn default() -> Self {
-        Self::new(0, 0)
-    }
-}
-
 /// One `kind_name` bucket's aggregated detail within a window.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OpBucket {
@@ -351,6 +380,10 @@ pub struct DeviceWindow {
 /// implied.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowReport {
+    /// The target whose engine recorded the window.
+    pub target: TargetId,
+    /// The build that recorded it.
+    pub build: BuildIdentity,
     /// The entry identities the window was built over, as passed to [`Report::window`].
     pub entries: Vec<u64>,
     /// Exact number of steps in the window, independent of how much detail is retained.
@@ -394,6 +427,10 @@ impl WindowReport {
         out.push_str(&format!(
             "\n=== poot timing window ({} step(s), {tokens} token(s)) ===\n",
             self.steps
+        ));
+        out.push_str(&format!(
+            "target: {:?}  build: {}\n",
+            self.target, self.build
         ));
         out.push_str(&format!(
             "measured wall (caller's own clock, context only): {:.3} ms\n",
@@ -535,6 +572,8 @@ impl Report {
         }
 
         WindowReport {
+            target: snapshot.target,
+            build: snapshot.build,
             entries: entries.to_vec(),
             steps,
             host,
@@ -554,6 +593,15 @@ mod tests {
     use super::*;
     use poot_runtime_common::Coverage;
 
+    fn snapshot(max_retained_steps: usize, max_retained_dispatch_records: usize) -> TimingSnapshot {
+        TimingSnapshot::new(
+            TargetId::Gpu(poot_target::Backend::SpirvVulkan),
+            BuildIdentity::current(),
+            max_retained_steps,
+            max_retained_dispatch_records,
+        )
+    }
+
     fn host(encode_ms: u64, wait_ms: u64, wall_ms: u64) -> HostTiming {
         HostTiming {
             encode: Duration::from_millis(encode_ms),
@@ -566,12 +614,11 @@ mod tests {
     /// never be subtracted into `other`.
     #[test]
     fn host_partition_sums_to_wall_without_touching_device() {
-        let mut snap = TimingSnapshot::new(16, 64);
+        let mut snap = snapshot(16, 64);
         let mark = snap.mark();
         snap.record(
             1,
             1,
-            "wgpu",
             host(3, 5, 10),
             DeviceCoverage::Measured(MeasuredDevice {
                 sum_of_dispatch_durations: Some(Duration::from_millis(50)),
@@ -594,16 +641,9 @@ mod tests {
     /// A negative residual (clock noise) prints signed, not clamped to zero.
     #[test]
     fn other_nanos_can_be_negative() {
-        let mut snap = TimingSnapshot::new(4, 16);
+        let mut snap = snapshot(4, 16);
         let mark = snap.mark();
-        snap.record(
-            1,
-            1,
-            "wgpu",
-            host(6, 6, 10),
-            DeviceCoverage::Unknown,
-            vec![],
-        );
+        snap.record(1, 1, host(6, 6, 10), DeviceCoverage::Unknown, vec![]);
         let report = Report::window(&snap, &mark, &[1]);
         assert_eq!(report.other_nanos(), -2_000_000);
     }
@@ -612,16 +652,16 @@ mod tests {
     /// another entry and every step before the mark.
     #[test]
     fn window_excludes_other_entries_and_steps_before_the_mark() {
-        let mut snap = TimingSnapshot::new(16, 64);
+        let mut snap = snapshot(16, 64);
         // "prefill" warmup, before the mark.
-        snap.record(1, 1, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(1, 1, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         let mark = snap.mark();
         // timed decode steps, after the mark.
         for i in 0..5u64 {
-            snap.record(2, i, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+            snap.record(2, i, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         }
         // more prefill after the mark too (must still be excluded by the entry filter).
-        snap.record(1, 2, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(1, 2, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
 
         let report = Report::window(&snap, &mark, &[2]);
         assert_eq!(report.steps, 5);
@@ -632,9 +672,9 @@ mod tests {
     /// zero.
     #[test]
     fn unknown_device_time_contributes_no_sum() {
-        let mut snap = TimingSnapshot::new(4, 16);
+        let mut snap = snapshot(4, 16);
         let mark = snap.mark();
-        snap.record(1, 1, "rocm", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(1, 1, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         let report = Report::window(&snap, &mark, &[1]);
         assert_eq!(report.device.sum_of_dispatch_durations, None);
     }
@@ -643,12 +683,11 @@ mod tests {
     /// repeats of the same kind_name merge into one bucket regardless of their `plan_label`.
     #[test]
     fn buckets_key_on_kind_name_not_plan_label() {
-        let mut snap = TimingSnapshot::new(4, 64);
+        let mut snap = snapshot(4, 64);
         let mark = snap.mark();
         snap.record(
             1,
             1,
-            "wgpu",
             host(1, 1, 2),
             DeviceCoverage::Unknown,
             vec![
@@ -684,10 +723,10 @@ mod tests {
     /// eviction reports `Truncated` detail while its exact totals (`steps`) stay correct.
     #[test]
     fn bounded_ring_evicts_oldest_and_reports_truncated_coverage() {
-        let mut snap = TimingSnapshot::new(2, 64);
+        let mut snap = snapshot(2, 64);
         let mark = snap.mark();
         for i in 0..5u64 {
-            snap.record(1, i, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+            snap.record(1, i, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         }
         let report = Report::window(&snap, &mark, &[1]);
         assert_eq!(report.steps, 5, "exact cumulative count survives eviction");
@@ -708,13 +747,12 @@ mod tests {
     /// `assert!(report.perturbed)` fails. Reverted: GREEN.
     #[test]
     fn window_is_perturbed_when_any_retained_step_collected_detail() {
-        let mut snap = TimingSnapshot::new(4, 64);
+        let mut snap = snapshot(4, 64);
         let mark = snap.mark();
-        snap.record(1, 1, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(1, 1, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         snap.record(
             1,
             2,
-            "wgpu",
             host(1, 1, 2),
             DeviceCoverage::Measured(MeasuredDevice {
                 sum_of_dispatch_durations: Some(Duration::from_micros(5)),
@@ -737,7 +775,7 @@ mod tests {
 
         // A window with no detail-collecting steps is never perturbed.
         let mark2 = snap.mark();
-        snap.record(1, 3, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(1, 3, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         let unperturbed = Report::window(&snap, &mark2, &[1]);
         assert!(!unperturbed.perturbed);
         assert!(
@@ -760,12 +798,11 @@ mod tests {
     /// full instead of cleared. Reverted: GREEN.
     #[test]
     fn zero_max_dispatch_records_means_no_dispatch_detail_not_unbounded() {
-        let mut snap = TimingSnapshot::new(4, 0);
+        let mut snap = snapshot(4, 0);
         let mark = snap.mark();
         snap.record(
             1,
             1,
-            "wgpu",
             host(1, 1, 2),
             DeviceCoverage::Unknown,
             vec![
@@ -804,11 +841,11 @@ mod tests {
     /// entry id churns per generation call) discovers them from the snapshot itself.
     #[test]
     fn entries_with_activity_since_finds_only_entries_touched_after_the_mark() {
-        let mut snap = TimingSnapshot::new(8, 64);
-        snap.record(1, 1, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        let mut snap = snapshot(8, 64);
+        snap.record(1, 1, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         let mark = snap.mark();
-        snap.record(2, 1, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
-        snap.record(3, 1, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(2, 1, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(3, 1, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         let mut found = snap.entries_with_activity_since(&mark);
         found.sort();
         assert_eq!(found, vec![2, 3], "entry 1's step was before the mark");
@@ -821,16 +858,9 @@ mod tests {
     /// correct.
     #[test]
     fn render_never_lets_the_callers_measured_wall_corrupt_the_step_sum_identity() {
-        let mut snap = TimingSnapshot::new(4, 16);
+        let mut snap = snapshot(4, 16);
         let mark = snap.mark();
-        snap.record(
-            1,
-            1,
-            "wgpu",
-            host(3, 5, 10),
-            DeviceCoverage::Unknown,
-            vec![],
-        );
+        snap.record(1, 1, host(3, 5, 10), DeviceCoverage::Unknown, vec![]);
         let report = Report::window(&snap, &mark, &[1]);
         // A measured wall much larger than the 10ms step-sum wall (as a real multi-step window's
         // external clock, which also covers inter-step host time, would be).
@@ -847,9 +877,9 @@ mod tests {
     /// line (Card 552 SC-004's rendering half).
     #[test]
     fn render_prints_the_unknown_fallback_not_a_zero_line() {
-        let mut snap = TimingSnapshot::new(4, 16);
+        let mut snap = snapshot(4, 16);
         let mark = snap.mark();
-        snap.record(1, 1, "rocm", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(1, 1, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         let report = Report::window(&snap, &mark, &[1]);
         let text = report.render(1, Duration::from_millis(2));
         assert!(text.contains("device time unknown on this backend"));
@@ -860,9 +890,9 @@ mod tests {
     /// as `Unavailable`, not `Complete` over an empty bucket set.
     #[test]
     fn counters_only_reports_detail_unavailable() {
-        let mut snap = TimingSnapshot::default();
+        let mut snap = snapshot(0, 0);
         let mark = snap.mark();
-        snap.record(1, 1, "wgpu", host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
+        snap.record(1, 1, host(1, 1, 2), DeviceCoverage::Unknown, vec![]);
         let report = Report::window(&snap, &mark, &[1]);
         assert_eq!(report.steps, 1);
         assert_eq!(report.detail, Coverage::Unavailable);

@@ -219,6 +219,13 @@ impl Device for PtxDeviceProxy<'_> {
     type Recording = <PtxDevice as Device>::Recording;
     type Error = <PtxDevice as Device>::Error;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        self.0.copy_mechanism()
+    }
+    fn backend_name(&self) -> &'static str {
+        self.0.backend_name()
+    }
+
     fn target(&self) -> Target {
         self.0.target()
     }

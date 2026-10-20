@@ -512,6 +512,266 @@ fn flash_attention_fuses_a_distinct_value_head_width() {
     );
 }
 
+/// A decode-shaped sink attention over GQA heads (`Hq = 4`, `n_rep = 2`, `cap = 6`): the chain
+/// `ops::attention_masked_sinks` traces, with its constants `sinks [Hq]` among the inputs.
+fn sink_attention_graph() -> Graph {
+    let (hq, n_rep, cap, d) = (4usize, 2usize, 6usize, 8usize);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![2, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![2, hq / n_rep, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![2, hq / n_rep, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![2, 1, 1, cap]))
+        .unwrap();
+    let sinks = b.constant("sinks", TensorType::f32(vec![hq])).unwrap();
+    let out =
+        poot_graph_ir::ops::attention_masked_sinks(&b, q, k, v, n_rep, 0.25, mask, sinks).unwrap();
+    b.finish(out).unwrap()
+}
+
+/// SC-001 (POOT-1238): a sink attention fuses to the fused op's sink variant, whose last operand is the
+/// per-head logits, and records no decline. Mutation: stop accepting the `Max(rowmax, sinks)` row maximum in
+/// `match_attention`; the chain stays decomposed and the decline is `RowMax`.
+#[test]
+fn flash_attention_fuses_a_sink_attention_to_the_sink_variant() {
+    let g = sink_attention_graph();
+    let (optimized, declines) = flash_attention_capped(&g, None).unwrap();
+    assert_eq!(declines, []);
+    let fused: Vec<&Eqn> = optimized
+        .eqns()
+        .iter()
+        .filter(|eqn| is_flash(&eqn.op))
+        .collect();
+    let [attention] = fused[..] else {
+        panic!("expected one fused attention, got {}", fused.len());
+    };
+    let OpKind::Attention(attrs) = &attention.op else {
+        unreachable!()
+    };
+    assert_eq!(attrs.sink, poot_graph_ir::SinkOperand::PerHead);
+    let sinks = g
+        .inputs()
+        .iter()
+        .copied()
+        .find(|&input| g.meta(input).name.as_deref() == Some("sinks"))
+        .unwrap();
+    assert_eq!(attention.inputs.len(), 5);
+    assert!(matches!(attention.inputs.last(), Some(&Operand::Value(last)) if last == sinks));
+}
+
+/// A decode attention over GQA heads (`B = 2`, `Hq = 4`, `cap = 6`) whose mask is `mask_of(pos)`, `pos` the
+/// `[pos_rows, 1]` I32 positions slot.
+fn masked_attention_graph(
+    pos_rows: usize,
+    mask_of: impl Fn(&Builder, poot_graph_ir::Traced) -> poot_graph_ir::Traced,
+) -> Graph {
+    let (hq, n_rep, cap, d) = (4usize, 2usize, 6usize, 8usize);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![2, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![2, hq / n_rep, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![2, hq / n_rep, cap, d]))
+        .unwrap();
+    let pos = b
+        .slot(
+            poot_graph_ir::Slot::Pos,
+            TensorType::new(vec![pos_rows, 1], DType::I32),
+        )
+        .unwrap();
+    let mask = mask_of(&b, pos);
+    let out = poot_graph_ir::ops::attention_masked(&b, q, k, v, n_rep, 0.25, mask).unwrap();
+    b.finish(out).unwrap()
+}
+
+/// The fused attention of `g` and its positions slot.
+fn fused_attention(g: &Graph) -> (poot_graph_ir::AttentionAttrs, Vec<Operand>) {
+    let (optimized, declines) = flash_attention_capped(g, None).unwrap();
+    assert_eq!(declines, []);
+    let fused: Vec<&Eqn> = optimized
+        .eqns()
+        .iter()
+        .filter(|eqn| is_flash(&eqn.op))
+        .collect();
+    let [attention] = fused[..] else {
+        panic!("expected one fused attention, got {}", fused.len());
+    };
+    let OpKind::Attention(attrs) = &attention.op else {
+        unreachable!()
+    };
+    (attrs.clone(), attention.inputs.clone())
+}
+
+/// SC-001 (POOT-1238, R2-C7-006): a mask built by `causal_mask_from_pos`, with or without a window, fuses to the
+/// structural `Causal` mask whose fourth operand is the positions slot itself, not a mask tensor, so no
+/// `[B,1,Lq,Lk]` mask is materialized for the kernel to read. Mutation: stop recognizing the mask in
+/// `match_causal_mask` (return `None`); the attention keeps the additive operand and this row goes red.
+#[test]
+fn flash_attention_states_a_causal_mask_by_its_positions() {
+    for window in [None, Some(3)] {
+        let g = masked_attention_graph(2, |b, pos| {
+            poot_graph_ir::ops::causal_mask_from_pos(b, pos, 6, window).unwrap()
+        });
+        let positions = g
+            .inputs()
+            .iter()
+            .copied()
+            .find(|&input| {
+                g.meta(input).name.as_deref() != Some("q") && g.aval(input).shape == [2, 1]
+            })
+            .unwrap();
+        let (attrs, inputs) = fused_attention(&g);
+        assert_eq!(
+            attrs.mask,
+            poot_graph_ir::MaskOperand::Causal { window },
+            "window {window:?}"
+        );
+        assert!(matches!(inputs[3], Operand::Value(mask) if mask == positions));
+    }
+}
+
+/// Only the exact causal spelling is structural: a materialized mask tensor, a window-less mask scaled by another hidden value, and ALiBi's per-head bias all
+/// stay the additive operand, and fuse as before. Mutation: accept any `Mul(Sub(visible, 1), s)` in
+/// `match_causal_mask` (drop the `-MASK_HIDDEN` comparison); the other-hidden-value row turns `Causal`.
+#[test]
+fn a_mask_that_is_no_causal_mask_stays_additive() {
+    let rows: [(&str, Graph); 3] = [
+        (
+            "a mask tensor",
+            masked_attention_graph(2, |b, _| {
+                b.constant("mask", TensorType::f32(vec![2, 1, 1, 6]))
+                    .unwrap()
+            }),
+        ),
+        (
+            "another hidden value",
+            masked_attention_graph(2, |b, pos| {
+                // `causal_mask_from_pos` spelled by hand, hiding with -5e8 instead of `MASK_HIDDEN`.
+                let pos_f = b.cast(pos, DType::F32).unwrap();
+                let pos_col = b.reshape(pos_f, vec![2, 1, 1, 1]).unwrap();
+                let keys = b.reshape(b.iota(6).unwrap(), vec![1, 1, 1, 6]).unwrap();
+                let visible = b.binary(BinOp::Ge, pos_col, keys).unwrap();
+                let bias = b
+                    .binary_scalar(BinOp::Sub, visible, Scalar::F32(1.0))
+                    .unwrap();
+                b.binary_scalar(BinOp::Mul, bias, Scalar::F32(5.0e8))
+                    .unwrap()
+            }),
+        ),
+        (
+            "an alibi bias",
+            masked_attention_graph(2, |b, pos| {
+                let slopes = b.constant("slopes", TensorType::f32(vec![4])).unwrap();
+                poot_graph_ir::ops::alibi_mask_from_pos(b, pos, 6, None, slopes, 4).unwrap()
+            }),
+        ),
+    ];
+    for (what, g) in rows {
+        let (attrs, _) = fused_attention(&g);
+        assert_eq!(attrs.mask, poot_graph_ir::MaskOperand::Additive, "{what}");
+    }
+    // One positions row for two batch rows is no causal mask of this attention: it is the broadcast mask
+    // tensor the fused op never took, and the chain keeps its decomposition with the reason.
+    let broadcast = masked_attention_graph(1, |b, pos| {
+        poot_graph_ir::ops::causal_mask_from_pos(b, pos, 6, None).unwrap()
+    });
+    let (_, declines) = flash_attention_capped(&broadcast, None).unwrap();
+    assert!(matches!(
+        declines[..],
+        [FusionDecline {
+            reason: FusionDeclineReason::Attention(AttentionDecline::TypeMismatch),
+            ..
+        }]
+    ));
+}
+
+/// The sink chain over `logits` as the row maximum and the normalizer read them, with `mass_logits` the
+/// logits the sink's mass is taken over: the exact spelling when they are the same value.
+fn hand_sink_chain(
+    logits: impl Fn(&Builder) -> (poot_graph_ir::Traced, poot_graph_ir::Traced),
+) -> Graph {
+    let (hq, cap, d) = (2usize, 5usize, 4usize);
+    let b = Builder::for_tests();
+    let q = b.constant("q", TensorType::f32(vec![1, hq, 1, d])).unwrap();
+    let k = b
+        .constant("k", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let v = b
+        .constant("v", TensorType::f32(vec![1, hq, cap, d]))
+        .unwrap();
+    let mask = b
+        .constant("mask", TensorType::f32(vec![1, 1, 1, cap]))
+        .unwrap();
+    let (max_logits, mass_logits) = logits(&b);
+    let kt = b.transpose(k, vec![0, 1, 3, 2]).unwrap();
+    let scores = b
+        .binary_scalar(BinOp::Mul, b.matmul(q, kt).unwrap(), Scalar::F32(0.5))
+        .unwrap();
+    let scores = b.binary(BinOp::Add, scores, mask).unwrap();
+    let row_max = b.reduce(RedOp::Max, scores, 3, true).unwrap();
+    let m = b.binary(BinOp::Max, row_max, max_logits).unwrap();
+    let e = b
+        .unary(UnOp::Exp, b.binary(BinOp::Sub, scores, m).unwrap())
+        .unwrap();
+    let mass = b
+        .unary(UnOp::Exp, b.binary(BinOp::Sub, mass_logits, m).unwrap())
+        .unwrap();
+    let denom = b
+        .binary(BinOp::Add, b.reduce(RedOp::Sum, e, 3, true).unwrap(), mass)
+        .unwrap();
+    let p = b.binary(BinOp::Div, e, denom).unwrap();
+    let out = b.matmul(p, v).unwrap();
+    b.finish(out).unwrap()
+}
+
+/// The sink spelling is exact. The hand-written chain with one `[Hq]` operand viewed as `[1, Hq, 1, 1]` for
+/// both the maximum and the mass fuses; a mass over other logits than the maximum's, and logits that are no
+/// reshape of a `[Hq]` operand, each decline with the check that failed and keep the decomposition.
+/// Mutation: drop the `two_values(..) != Some((logits, m))` comparison of the sink mass; the mismatched row
+/// fuses.
+#[test]
+fn a_sink_chain_off_the_exact_spelling_declines_with_the_failing_check() {
+    let hq = 2usize;
+    let view = |b: &Builder, name: &str| {
+        let sinks = b.constant(name, TensorType::f32(vec![hq])).unwrap();
+        b.reshape(sinks, vec![1, hq, 1, 1]).unwrap()
+    };
+    let decline = |g: &Graph| {
+        let (optimized, declines) = flash_attention_capped(g, None).unwrap();
+        let fused = optimized.eqns().iter().any(|eqn| is_flash(&eqn.op));
+        (fused, declines.iter().map(|d| d.reason).collect::<Vec<_>>())
+    };
+    let attention = |reason| vec![FusionDeclineReason::Attention(reason)];
+
+    let exact = hand_sink_chain(|b| {
+        let logits = view(b, "sinks");
+        (logits, logits)
+    });
+    assert_eq!(decline(&exact), (true, vec![]));
+
+    let other_logits = hand_sink_chain(|b| (view(b, "sinks"), view(b, "other_sinks")));
+    assert_eq!(
+        decline(&other_logits),
+        (false, attention(AttentionDecline::SinkChain))
+    );
+
+    let not_a_view = hand_sink_chain(|b| {
+        let logits = b
+            .constant("sinks", TensorType::f32(vec![1, hq, 1, 1]))
+            .unwrap();
+        (logits, logits)
+    });
+    assert_eq!(
+        decline(&not_a_view),
+        (false, attention(AttentionDecline::SinkLogits))
+    );
+}
+
 fn is_flash(op: &OpKind) -> bool {
     matches!(op, OpKind::Attention(_))
 }

@@ -30,15 +30,15 @@ pub fn repeat_kv_tiled(b: &Builder, k: Traced, n_rep: usize) -> Result<Traced, B
     b.reshape(r, vec![bsz, n_rep * h_kv, seq, d])
 }
 
-/// Attention-sink prefill core (gpt-oss spec 263, promoted for DeepSeek-V4 reuse in spec 281;
-/// derivation in `crates/poot-models/src/gpt_oss.rs`'s module doc): standard scaled-dot-product
-/// causal/windowed attention, but each query row's softmax also includes one extra
-/// position-independent per-head learned logit (`sinks[h]`) that contributes to the row max and
-/// softmax denominator but never to the weighted V sum. `sinks` is `[Hq]`. Implemented without a
-/// concat op (the IR has none): folding the sink into the max/sum over the real columns (two extra
-/// `Max`/`Add`/`Exp` steps) equals concatenating a sink column.
+/// Attention with a per-head sink over the full fixed-capacity cache and an additive mask (gpt-oss, promoted
+/// for DeepSeek-V4 reuse; derivation in `crates/poot-models/src/architectures/gpt_oss.rs`'s module doc):
+/// [`attention_masked`], but each query row's softmax also includes one extra position-independent learned
+/// logit (`sinks[h]`) that contributes to the row maximum and the normalizer but never to the weighted V
+/// sum. `sinks` is `[Hq]`. Implemented without a concat op: folding the sink into the max and the sum over
+/// the real columns equals concatenating a sink column. `OpKind::Attention` with [`crate::SinkOperand::PerHead`]
+/// is the fusion of this chain.
 #[expect(clippy::too_many_arguments)]
-pub fn attention_prefill_with_sink(
+pub fn attention_masked_sinks(
     b: &Builder,
     q: Traced,
     k: Traced,
@@ -47,27 +47,19 @@ pub fn attention_prefill_with_sink(
     scale: f32,
     mask: Traced,
     sinks: Traced,
-    hq: usize,
-    l: usize,
 ) -> Result<Traced, BuilderError> {
-    let k = repeat_kv(b, k, n_rep)?;
-    let v = repeat_kv(b, v, n_rep)?;
-    let kt = b.transpose(k, vec![0, 1, 3, 2])?; // [1,Hq,D,L]
-    let scores = b.matmul(q, kt)?; // [1,Hq,L,L]
-    let scores = b.binary_scalar(BinOp::Mul, scores, Scalar::F32(scale))?;
-    let scores = b.binary(BinOp::Add, scores, mask)?; // causal/windowed mask, broadcast over Hq
-    let last = b.aval(scores)?.rank() - 1;
-    let m_scores = b.reduce(RedOp::Max, scores, last, true)?; // [1,Hq,L,1]
-    let sinks_b = b.broadcast(b.reshape(sinks, vec![1, hq, 1, 1])?, vec![1, hq, l, 1])?;
-    let m = b.binary(BinOp::Max, m_scores, sinks_b)?; // row max INCLUDES the sink logit
-    let shifted = b.binary(BinOp::Sub, scores, m)?;
-    let e = b.unary(UnOp::Exp, shifted)?;
-    let denom_scores = b.reduce(RedOp::Sum, e, last, true)?;
-    let sink_shifted = b.binary(BinOp::Sub, sinks_b, m)?;
-    let e_sink = b.unary(UnOp::Exp, sink_shifted)?;
-    let denom = b.binary(BinOp::Add, denom_scores, e_sink)?; // sink's mass counted, never gathered into V
-    let p = b.binary(BinOp::Div, e, denom)?;
-    b.matmul(p, v) // [1,Hq,L,D]
+    attention_over_keys(
+        b,
+        q,
+        AttentionKeys::Single(k),
+        v,
+        n_rep,
+        scale,
+        mask,
+        None,
+        None,
+        Some(sinks),
+    )
 }
 
 /// Decode attention (single query token), GQA, no mask (l=1 attends all cached keys). `q[1,Hq,1,D]`,
@@ -160,6 +152,7 @@ pub fn attention_masked_softcap(
         mask,
         attn_logit_softcap,
         None,
+        None,
     )
 }
 
@@ -243,6 +236,7 @@ pub fn attention_live(
         mask,
         attn_logit_softcap,
         Some(live_len),
+        None,
     )?;
     Ok(LiveAttention {
         out,
@@ -269,6 +263,7 @@ pub(crate) fn attention_over_keys(
     mask: Traced,
     attn_logit_softcap: Option<f32>,
     live_len: Option<Traced>,
+    sinks: Option<Traced>,
 ) -> Result<Traced, BuilderError> {
     let live = match live_len {
         Some(len) => {
@@ -308,9 +303,30 @@ pub(crate) fn attention_over_keys(
     };
     let last = b.aval(scores)?.rank() - 1;
     let m = b.reduce(RedOp::Max, scores, last, true)?;
+    // A sink is one more logit per head in the row's softmax: it raises the maximum and adds its own mass to
+    // the normalizer, and no value row is gathered for it.
+    let sinks = match sinks {
+        Some(sinks) => {
+            let heads = b.aval(sinks)?.shape[0];
+            Some(b.reshape(sinks, vec![1, heads, 1, 1])?)
+        }
+        None => None,
+    };
+    let m = match sinks {
+        Some(sinks) => b.binary(BinOp::Max, m, sinks)?, // row max INCLUDES the sink logit
+        None => m,
+    };
     let shifted = b.binary(BinOp::Sub, scores, m)?;
     let e = b.unary(UnOp::Exp, shifted)?;
     let denom = b.reduce(RedOp::Sum, e, last, true)?;
+    let denom = match sinks {
+        Some(sinks) => {
+            let sink_shifted = b.binary(BinOp::Sub, sinks, m)?;
+            let e_sink = b.unary(UnOp::Exp, sink_shifted)?;
+            b.binary(BinOp::Add, denom, e_sink)? // the sink's mass, never gathered into V
+        }
+        None => denom,
+    };
     let p = b.binary(BinOp::Div, e, denom)?;
     b.matmul(p, v) // [B,Hq,Lq,Dv]
 }

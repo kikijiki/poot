@@ -44,7 +44,6 @@ pub(crate) fn last_axis(operation: &'static str, shape: &[usize]) -> Result<usiz
 
 mod activation;
 mod attention;
-#[cfg(any(test, feature = "test-support"))]
 mod block_top_k;
 mod counter;
 mod linear;
@@ -65,10 +64,9 @@ pub use activation::{geglu, gelu, gelu_erf, relu, sigmoid, silu, softcap, softpl
 pub(crate) use attention::attention_over_keys;
 pub use attention::{
     AttentionKeys, LiveAttention, attention, attention_live, attention_masked,
-    attention_masked_softcap, attention_prefill_with_sink, attention_softcap, paged_view,
-    repeat_kv, repeat_kv_tiled,
+    attention_masked_sinks, attention_masked_softcap, attention_softcap, paged_view, repeat_kv,
+    repeat_kv_tiled,
 };
-#[cfg(any(test, feature = "test-support"))]
 pub use block_top_k::block_top_k_packed;
 pub use linear::linear;
 pub use moe::{
@@ -91,7 +89,7 @@ pub use prefill::{
 pub use rope::{rope, rope_partial, rope_sectioned, rope_sectioned_partial};
 #[cfg(any(test, feature = "test-support"))]
 pub use rope::{rope_batched, rope_sectioned_batched};
-pub use selected_attention::selected_attention;
+pub use selected_attention::{selected_attention, selected_block_mask};
 #[cfg(any(test, feature = "test-support"))]
 pub use ssm::{
     causal_conv1d_decode, causal_conv1d_prefill, causal_conv1d_prefill_dilated,

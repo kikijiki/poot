@@ -47,7 +47,8 @@ use crate::model::{
     WiringError,
 };
 use crate::names::{
-    ExpertNames, MoeLayers, MoeNames, NameRow, Presence, SharedNames, Source, family_weights_routed,
+    ExpertNames, FusedDims, MoeLayers, MoeNames, NameRow, Presence, SharedNames, Source,
+    family_weights_routed,
 };
 #[cfg(feature = "test-support")]
 use crate::registry::Fixture;
@@ -883,6 +884,7 @@ pub(crate) fn build_family(
         &tables,
         p.layers,
         p.head_required,
+        FusedDims::NONE,
         MoeLayers {
             names: &names,
             sparse: &sparse,

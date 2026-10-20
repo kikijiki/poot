@@ -9,13 +9,13 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use crate::bindings;
-use crate::platform::{DlError, LibHandle};
+use poot_runtime_common::{Library, LoadScope};
 
 /// Loaded HSA library + resolved function pointers. Lives inside [`RocmContext`](crate::RocmContext)
 /// and is dropped after the queue / signals / pools so no symbol is invoked after unload.
 pub(crate) struct Hsa {
-    _lib: LibHandle,
-    pub funcs: Funcs,
+    _lib: Library,
+    pub(crate) funcs: Funcs,
 }
 
 impl Hsa {
@@ -23,30 +23,18 @@ impl Hsa {
     /// `RocmError::LibraryNotFound` if the .so is not on the loader path, or
     /// `RocmError::Driver(HSA_STATUS_ERROR)` if a required symbol is missing.
     pub(crate) fn load() -> Result<Self, super::RocmError> {
-        let candidates = [
-            "libhsa-runtime64.so.1\0",
-            "libhsa-runtime64.so\0",
-            "libhsa-runtime64.so.1.2.3\0",
-        ];
-        let mut last_err: Option<DlError> = None;
-        let lib = candidates
-            .iter()
-            // SAFETY: each candidate names the ROCm HSA runtime, whose initializers are sound to run.
-            .map(|c| unsafe { LibHandle::open(CStr::from_bytes_with_nul(c.as_bytes()).unwrap()) })
-            .find_map(|r| match r {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    last_err = Some(e);
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                super::RocmError::LibraryNotFound(
-                    last_err
-                        .map(|e| e.0)
-                        .unwrap_or_else(|| "no candidate".to_string()),
-                )
-            })?;
+        // SAFETY: each candidate names the ROCm HSA runtime, whose initializers are sound to run.
+        let lib = unsafe {
+            Library::open_first(
+                &[
+                    c"libhsa-runtime64.so.1",
+                    c"libhsa-runtime64.so",
+                    c"libhsa-runtime64.so.1.2.3",
+                ],
+                LoadScope::Global,
+            )
+        }
+        .map_err(|error| super::RocmError::LibraryNotFound(error.to_string()))?;
 
         // SAFETY: `lib` was opened under an HSA runtime soname.
         let funcs = unsafe { Funcs::resolve(&lib) }.map_err(super::RocmError::MissingSymbol)?;
@@ -169,12 +157,6 @@ fnptr!(
 fnptr!(
     HsaQueueAddWriteIndexAcqRel,
     u64,
-    *const bindings::hsa_queue_t,
-    u64
-);
-fnptr!(
-    HsaQueueStoreWriteIndexRelaxed,
-    (),
     *const bindings::hsa_queue_t,
     u64
 );
@@ -355,7 +337,6 @@ declared_as! {
     HsaQueueLoadReadIndexRelaxed = hsa_queue_load_read_index_relaxed;
     HsaQueueAddWriteIndexRelaxed = hsa_queue_add_write_index_relaxed;
     HsaQueueAddWriteIndexAcqRel = hsa_queue_add_write_index_acq_rel;
-    HsaQueueStoreWriteIndexRelaxed = hsa_queue_store_write_index_relaxed;
     HsaAmdAgentIterateMemoryPools = hsa_amd_agent_iterate_memory_pools;
     HsaAmdMemoryPoolGetInfo = hsa_amd_memory_pool_get_info;
     HsaAmdAgentMemoryPoolGetInfo = hsa_amd_agent_memory_pool_get_info;
@@ -382,13 +363,13 @@ declared_as! {
 /// # Safety
 ///
 /// `T` must be the `unsafe extern "C" fn` type of the symbol's C declaration in `lib`.
-unsafe fn resolve_fn<T: Copy>(lib: &LibHandle, name: &CStr) -> Option<T> {
+unsafe fn resolve_fn<T: Copy>(lib: &Library, name: &CStr) -> Option<T> {
     assert_eq!(
         std::mem::size_of::<T>(),
         std::mem::size_of::<*mut c_void>(),
         "a resolved symbol must be a function pointer"
     );
-    let address = lib.sym(name)?;
+    let address = lib.symbol(name)?;
     // SAFETY: `address` is the non-null address of the function `name`, and `T` is a function-pointer
     // type (same size as a data pointer, checked above) matching its declaration (caller contract).
     Some(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&address) })
@@ -396,86 +377,84 @@ unsafe fn resolve_fn<T: Copy>(lib: &LibHandle, name: &CStr) -> Option<T> {
 
 /// All HSA entry points used, resolved once at [`Hsa::load`]. Each dispatch is one load plus an
 /// indirect call, with no `dlsym` per call.
-pub struct Funcs {
+pub(crate) struct Funcs {
     /// `hsa_init`: initialises the HSA runtime (reference-counted).
-    pub hsa_init: HsaInit,
+    pub(crate) hsa_init: HsaInit,
     /// `hsa_shut_down`: releases one `hsa_init` reference.
-    pub hsa_shut_down: HsaShutDown,
+    pub(crate) hsa_shut_down: HsaShutDown,
     /// `hsa_iterate_agents`: enumerates the CPU and GPU agents through a callback.
-    pub hsa_iterate_agents: HsaIterateAgents,
+    pub(crate) hsa_iterate_agents: HsaIterateAgents,
     /// `hsa_agent_get_info`: reads an `HSA_AGENT_INFO_*` attribute of an agent.
-    pub hsa_agent_get_info: HsaAgentGetInfo,
+    pub(crate) hsa_agent_get_info: HsaAgentGetInfo,
     /// `hsa_isa_get_info_alt`: reads an `HSA_ISA_INFO_*` attribute of an ISA.
-    pub hsa_isa_get_info_alt: HsaIsaGetInfoAlt,
+    pub(crate) hsa_isa_get_info_alt: HsaIsaGetInfoAlt,
     /// `hsa_system_get_info`: reads an `HSA_SYSTEM_INFO_*` attribute (timestamp frequency).
-    pub hsa_system_get_info: HsaSystemGetInfo,
+    pub(crate) hsa_system_get_info: HsaSystemGetInfo,
     /// `hsa_amd_profiling_set_profiler_enabled`: turns dispatch timestamping on or off for a queue.
-    pub hsa_amd_profiling_set_profiler_enabled: HsaAmdProfilingSetProfilerEnabled,
+    pub(crate) hsa_amd_profiling_set_profiler_enabled: HsaAmdProfilingSetProfilerEnabled,
     /// `hsa_amd_profiling_get_dispatch_time`: reads a completed dispatch's start and end ticks from its signal.
-    pub hsa_amd_profiling_get_dispatch_time: HsaAmdProfilingGetDispatchTime,
+    pub(crate) hsa_amd_profiling_get_dispatch_time: HsaAmdProfilingGetDispatchTime,
     /// `hsa_signal_create`: creates a completion signal with an initial value.
-    pub hsa_signal_create: HsaSignalCreate,
+    pub(crate) hsa_signal_create: HsaSignalCreate,
     /// `hsa_signal_destroy`: destroys a signal.
-    pub hsa_signal_destroy: HsaSignalDestroy,
+    pub(crate) hsa_signal_destroy: HsaSignalDestroy,
     /// `hsa_signal_store_release`: stores a signal value with release ordering.
-    pub hsa_signal_store_release: HsaSignalStoreRelease,
+    pub(crate) hsa_signal_store_release: HsaSignalStoreRelease,
     /// `hsa_signal_load_relaxed`: loads a signal value with relaxed ordering.
-    pub hsa_signal_load_relaxed: HsaSignalLoadRelaxed,
+    pub(crate) hsa_signal_load_relaxed: HsaSignalLoadRelaxed,
     /// `hsa_signal_wait_scacquire`: waits on a signal condition with system-scope acquire ordering, bounded by a timeout.
-    pub hsa_signal_wait_scacquire: HsaSignalWaitScacquire,
+    pub(crate) hsa_signal_wait_scacquire: HsaSignalWaitScacquire,
     /// `hsa_queue_create`: creates an AQL queue on an agent.
-    pub hsa_queue_create: HsaQueueCreate,
+    pub(crate) hsa_queue_create: HsaQueueCreate,
     /// `hsa_queue_destroy`: destroys a queue.
-    pub hsa_queue_destroy: HsaQueueDestroy,
+    pub(crate) hsa_queue_destroy: HsaQueueDestroy,
     /// `hsa_queue_load_read_index_scacquire`: loads the queue read index with acquire ordering.
-    pub hsa_queue_load_read_index_scacquire: HsaQueueLoadReadIndexScacquire,
+    pub(crate) hsa_queue_load_read_index_scacquire: HsaQueueLoadReadIndexScacquire,
     /// `hsa_queue_load_read_index_relaxed`: loads the queue read index with relaxed ordering.
-    pub hsa_queue_load_read_index_relaxed: HsaQueueLoadReadIndexRelaxed,
+    pub(crate) hsa_queue_load_read_index_relaxed: HsaQueueLoadReadIndexRelaxed,
     /// `hsa_queue_add_write_index_relaxed`: reserves packet slots by advancing the write index, relaxed.
-    pub hsa_queue_add_write_index_relaxed: HsaQueueAddWriteIndexRelaxed,
+    pub(crate) hsa_queue_add_write_index_relaxed: HsaQueueAddWriteIndexRelaxed,
     /// `hsa_queue_add_write_index_acq_rel`: reserves packet slots by advancing the write index, acquire-release.
-    pub hsa_queue_add_write_index_acq_rel: HsaQueueAddWriteIndexAcqRel,
-    /// `hsa_queue_store_write_index_relaxed`: stores the queue write index, relaxed.
-    pub hsa_queue_store_write_index_relaxed: HsaQueueStoreWriteIndexRelaxed,
+    pub(crate) hsa_queue_add_write_index_acq_rel: HsaQueueAddWriteIndexAcqRel,
     /// `hsa_amd_agent_iterate_memory_pools`: enumerates an agent's memory pools through a callback.
-    pub hsa_amd_agent_iterate_memory_pools: HsaAmdAgentIterateMemoryPools,
+    pub(crate) hsa_amd_agent_iterate_memory_pools: HsaAmdAgentIterateMemoryPools,
     /// `hsa_amd_memory_pool_get_info`: reads an `HSA_AMD_MEMORY_POOL_INFO_*` attribute of a pool.
-    pub hsa_amd_memory_pool_get_info: HsaAmdMemoryPoolGetInfo,
+    pub(crate) hsa_amd_memory_pool_get_info: HsaAmdMemoryPoolGetInfo,
     /// `hsa_amd_agent_memory_pool_get_info`: reads an agent-to-pool attribute (link hops, link info).
-    pub hsa_amd_agent_memory_pool_get_info: HsaAmdAgentMemoryPoolGetInfo,
+    pub(crate) hsa_amd_agent_memory_pool_get_info: HsaAmdAgentMemoryPoolGetInfo,
     /// `hsa_amd_memory_pool_allocate`: allocates memory from a pool.
-    pub hsa_amd_memory_pool_allocate: HsaAmdMemoryPoolAllocate,
+    pub(crate) hsa_amd_memory_pool_allocate: HsaAmdMemoryPoolAllocate,
     /// `hsa_amd_memory_pool_free`: frees pool memory.
-    pub hsa_amd_memory_pool_free: HsaAmdMemoryPoolFree,
+    pub(crate) hsa_amd_memory_pool_free: HsaAmdMemoryPoolFree,
     /// `hsa_amd_memory_async_copy`: starts an asynchronous (DMA) copy between agents, completing on a signal.
-    pub hsa_amd_memory_async_copy: HsaAmdMemoryAsyncCopy,
+    pub(crate) hsa_amd_memory_async_copy: HsaAmdMemoryAsyncCopy,
     /// `hsa_amd_memory_fill`: fills device memory with a 32-bit pattern.
-    pub hsa_amd_memory_fill: HsaAmdMemoryFill,
+    pub(crate) hsa_amd_memory_fill: HsaAmdMemoryFill,
     /// `hsa_amd_memory_lock`: pins host memory and maps it for agent access.
-    pub hsa_amd_memory_lock: HsaAmdMemoryLock,
+    pub(crate) hsa_amd_memory_lock: HsaAmdMemoryLock,
     /// `hsa_amd_memory_unlock`: unpins memory pinned by `hsa_amd_memory_lock`.
-    pub hsa_amd_memory_unlock: HsaAmdMemoryUnlock,
+    pub(crate) hsa_amd_memory_unlock: HsaAmdMemoryUnlock,
     /// `hsa_amd_register_system_event_handler`: registers the process's one GPU fault handler.
-    pub hsa_amd_register_system_event_handler: HsaAmdRegisterSystemEventHandler,
+    pub(crate) hsa_amd_register_system_event_handler: HsaAmdRegisterSystemEventHandler,
     // code-object + executable + symbols + signals
     /// `hsa_code_object_reader_create_from_memory`: creates a code-object reader over an in-memory image.
-    pub hsa_code_object_reader_create_from_memory: HsaCodeObjectReaderCreateFromMemory,
+    pub(crate) hsa_code_object_reader_create_from_memory: HsaCodeObjectReaderCreateFromMemory,
     /// `hsa_code_object_reader_destroy`: destroys a code-object reader.
-    pub hsa_code_object_reader_destroy: HsaCodeObjectReaderDestroy,
+    pub(crate) hsa_code_object_reader_destroy: HsaCodeObjectReaderDestroy,
     /// `hsa_executable_create_alt`: creates an executable with a profile and rounding mode.
-    pub hsa_executable_create_alt: HsaExecutableCreateAlt,
+    pub(crate) hsa_executable_create_alt: HsaExecutableCreateAlt,
     /// `hsa_executable_load_agent_code_object`: loads a code object into an executable for one agent.
-    pub hsa_executable_load_agent_code_object: HsaExecutableLoadAgentCodeObject,
+    pub(crate) hsa_executable_load_agent_code_object: HsaExecutableLoadAgentCodeObject,
     /// `hsa_executable_freeze`: freezes an executable so its symbols can be queried.
-    pub hsa_executable_freeze: HsaExecutableFreeze,
+    pub(crate) hsa_executable_freeze: HsaExecutableFreeze,
     /// `hsa_executable_destroy`: destroys an executable.
-    pub hsa_executable_destroy: HsaExecutableDestroy,
+    pub(crate) hsa_executable_destroy: HsaExecutableDestroy,
     /// `hsa_executable_get_symbol_by_name`: looks a symbol up by name for an agent.
-    pub hsa_executable_get_symbol_by_name: HsaExecutableGetSymbolByName,
+    pub(crate) hsa_executable_get_symbol_by_name: HsaExecutableGetSymbolByName,
     /// `hsa_executable_symbol_get_info`: reads an `HSA_EXECUTABLE_SYMBOL_INFO_*` attribute of a symbol.
-    pub hsa_executable_symbol_get_info: HsaExecutableSymbolGetInfo,
+    pub(crate) hsa_executable_symbol_get_info: HsaExecutableSymbolGetInfo,
     /// `hsa_executable_iterate_symbols`: enumerates an executable's symbols through a callback.
-    pub hsa_executable_iterate_symbols: HsaExecutableIterateSymbols,
+    pub(crate) hsa_executable_iterate_symbols: HsaExecutableIterateSymbols,
 }
 
 impl Funcs {
@@ -486,13 +465,13 @@ impl Funcs {
     ///
     /// `lib` must be the HSA runtime library, so each symbol has the header declaration its field type
     /// is checked against (see `declared_as!`).
-    unsafe fn resolve(lib: &LibHandle) -> Result<Self, MissingSymbol> {
+    unsafe fn resolve(lib: &Library) -> Result<Self, &'static str> {
         macro_rules! sym {
             ($p:ident) => {{
                 let name = CStr::from_bytes_with_nul(concat!(stringify!($p), "\0").as_bytes()).unwrap();
                 // SAFETY: the field's type equals the header declaration of `$p` (`declared_as!`), and
                 // `lib` is the HSA runtime (caller contract).
-                unsafe { resolve_fn(lib, name) }.ok_or(MissingSymbol(stringify!($p)))?
+                unsafe { resolve_fn(lib, name) }.ok_or(stringify!($p))?
             }};
         }
         Ok(Funcs {
@@ -515,7 +494,6 @@ impl Funcs {
             hsa_queue_load_read_index_relaxed: sym!(hsa_queue_load_read_index_relaxed),
             hsa_queue_add_write_index_relaxed: sym!(hsa_queue_add_write_index_relaxed),
             hsa_queue_add_write_index_acq_rel: sym!(hsa_queue_add_write_index_acq_rel),
-            hsa_queue_store_write_index_relaxed: sym!(hsa_queue_store_write_index_relaxed),
             hsa_amd_agent_iterate_memory_pools: sym!(hsa_amd_agent_iterate_memory_pools),
             hsa_amd_memory_pool_get_info: sym!(hsa_amd_memory_pool_get_info),
             hsa_amd_agent_memory_pool_get_info: sym!(hsa_amd_agent_memory_pool_get_info),
@@ -540,17 +518,3 @@ impl Funcs {
         })
     }
 }
-
-// `pub`, not `pub(crate)`: reachable through the public `RocmError::MissingSymbol` variant, so it
-// must be as visible as `RocmError`.
-/// An HSA symbol `dlsym` could not resolve in the loaded runtime library; carries the symbol name.
-#[derive(Debug)]
-pub struct MissingSymbol(pub &'static str);
-
-impl std::fmt::Display for MissingSymbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "missing HSA symbol: {}", self.0)
-    }
-}
-
-impl std::error::Error for MissingSymbol {}

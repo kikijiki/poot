@@ -43,7 +43,7 @@ mod multimodal;
 
 pub use multimodal::{
     Apng, ApngError, ApngFrames, FrontEndSession, ImageDecodeError, TowerDrivers, decode_image,
-    encoders, tower_options,
+    encoders,
 };
 
 pub use core::sampler::{Sampler, SamplerFault, TokenLogprob};

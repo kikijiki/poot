@@ -28,7 +28,6 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-#[cfg(feature = "test-support")]
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};

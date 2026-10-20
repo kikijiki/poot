@@ -13,7 +13,7 @@ use std::mem::size_of;
 const LARGE_ERROR_THRESHOLD: usize = 128;
 
 fn error_sizes() -> Vec<(&'static str, usize)> {
-    let mut rows = vec![
+    vec![
         (
             "poot_llm::driver::error::DriverError",
             size_of::<poot_llm::driver::error::DriverError>(),
@@ -23,24 +23,11 @@ fn error_sizes() -> Vec<(&'static str, usize)> {
             "poot_ptx_device::PtxGpuError",
             size_of::<poot_ptx_device::PtxGpuError>(),
         ),
-    ];
-    rows.extend(rocm_error_sizes());
-    rows
-}
-
-/// Separate function rather than a `#[cfg]` on the `extend`, which would leave `rows` unmutated
-/// without the feature and trip `unused_mut` under `-D warnings`.
-#[cfg(feature = "rocm")]
-fn rocm_error_sizes() -> Vec<(&'static str, usize)> {
-    vec![(
-        "poot_rocm_device::RocmGpuError",
-        size_of::<poot_rocm_device::RocmGpuError>(),
-    )]
-}
-
-#[cfg(not(feature = "rocm"))]
-fn rocm_error_sizes() -> Vec<(&'static str, usize)> {
-    Vec::new()
+        (
+            "poot_rocm_device::RocmGpuError",
+            size_of::<poot_rocm_device::RocmGpuError>(),
+        ),
+    ]
 }
 
 /// A1. Real sizes stay well clear of the threshold (max measured: 72 bytes, `PtxGpuError`); every
@@ -79,7 +66,6 @@ fn boxing_a_cause_does_not_change_what_an_error_prints() {
         poot_ptx_device::PtxGpuError::from(plan_cause()).to_string(),
         format!("plan: {PLAN_CAUSE_TEXT}")
     );
-    #[cfg(feature = "rocm")]
     assert_eq!(
         poot_rocm_device::RocmGpuError::from(poot_rocm_runtime::RocmError::LibraryNotFound(
             "t".to_string()
@@ -141,7 +127,7 @@ where
     (link, Box::new(wrap(cause)) as Box<dyn Error>, expected)
 }
 
-fn non_rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
+fn ptx_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
     vec![
         // poot_ptx_device::PtxGpuError (crates/poot-ptx-device/src/lib.rs): 4 links, all explicit `#[source]`.
         source_row(
@@ -167,13 +153,11 @@ fn non_rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)>
     ]
 }
 
-/// The ROCm-gated links: `RocmGpuError` (2). Card 548: `RocmGpuError`
-/// shrank to a thin wrapper over `RocmError`/`CompileError` (the graph-walking executor's own
+/// The ROCm links: `RocmGpuError` (2). Card 548: `RocmGpuError`
+/// shrank to a thin wrapper over `RocmError`/`ArchError` (the graph-walking executor's own
 /// `Plan`/`Eval`/`UseBeforeDef` variants it used to carry moved to the generic
 /// `poot_executor::LoadError`/`ExecError`, which this file does not track - `RocmDevice` never
 /// calls `poot_graph_plan::compile`/`poot_eval::eval` itself).
-/// A separate function for the same `unused_mut` reason as `rocm_error_sizes`.
-#[cfg(feature = "rocm")]
 fn rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
     vec![
         // poot_rocm_device::RocmGpuError (crates/poot-rocm-device/src/error.rs): 2 links, both
@@ -184,16 +168,11 @@ fn rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
             poot_rocm_device::RocmGpuError::from,
         ),
         source_row(
-            "poot_rocm_device::RocmGpuError::Codegen -> poot_codegen::CompileError",
-            poot_codegen::CompileError::Io(std::io::Error::other("t")),
+            "poot_rocm_device::RocmGpuError::Arch -> poot_target::ArchError",
+            poot_target::ArchError::NoGfxCode("t".to_string()),
             poot_rocm_device::RocmGpuError::from,
         ),
     ]
-}
-
-#[cfg(not(feature = "rocm"))]
-fn rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
-    Vec::new()
 }
 
 /// Checks every boxed-cause link in one hop (the parent's immediate `source()`; the full three-level
@@ -201,12 +180,12 @@ fn rocm_chain_links() -> Vec<(&'static str, Box<dyn Error>, Option<String>)> {
 /// `source_row` field, e.g. `RocmGpuError::Eval`, sends only that row's `source()` to `None`.
 #[test]
 fn every_boxed_cause_across_the_device_error_enums_preserves_its_source() {
-    let mut links = non_rocm_chain_links();
+    let mut links = ptx_chain_links();
     links.extend(rocm_chain_links());
 
     assert_eq!(
         links.len(),
-        if cfg!(feature = "rocm") { 6 } else { 4 },
+        6,
         "a link was added or removed without updating this count"
     );
 

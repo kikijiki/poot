@@ -1,8 +1,6 @@
 //! Card 564 on ROCm: qwen2's one body behind `Model`, bound through the weight map (SC-001),
 //! and its fused and stacked views (SC-004). Skips without a device unless the lane requires it.
 
-#![cfg(feature = "rocm")]
-
 use poot_eval::test_support::weight_map_oracle::eval_mapped;
 use poot_executor::{Device, Engine, Executor};
 use poot_models::test_support::weight_map::{self as fixture, Projections};

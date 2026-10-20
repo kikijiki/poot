@@ -20,16 +20,16 @@ test-support = []
 ash.workspace = true
 poot-target.workspace = true
 thiserror.workspace = true
-# The library only dispatches the .spv bytes it is given. These three are for the `poot-vulkan-check`
-# binary, which compiles poot's `add` kernel and cross-checks against wgpu (spec 133 Verification). They
+# The library only dispatches the .spv bytes it is given. These are for the `poot-vulkan-check`
+# binary, which compiles poot's `add` kernel and checks it against the CPU oracle (spec 133 Verification). They
 # are ordinary dependencies because a `[[bin]]` target cannot use `[dev-dependencies]`.
 poot-codegen.workspace = true
 poot-kernel-ir.workspace = true
-poot-wgpu-runtime.workspace = true
 poot-runtime-common.workspace = true
 
 [dev-dependencies]
 poot-kernel-ir = { workspace = true, features = ["test-support"] }
+poot-test-util.workspace = true
 
 [[bin]]
 name = "poot-vulkan-check"

@@ -1,4 +1,4 @@
-//! The `poot-generate` binary at the process boundary: what its command line accepts and refuses. These rows
+//! The `poot generate` command at the process boundary: what its command line accepts and refuses. These rows
 //! run the built binary, so a flag the parser lost or grew shows up here and not only in the library rows that
 //! sit under it (`driver::oneshot`). None needs a model or a device: each ends in the argument parser or in
 //! the backend open, both before a checkpoint is read.
@@ -7,16 +7,21 @@ use std::process::{Command, Output};
 
 use poot_test_util::contained_child::ContainChild;
 
-/// `CARGO_BIN_EXE_poot-generate`, read at runtime: cargo sets it only for test builds that enable the
-/// package's `cli` feature, which the package's own dev-dependency does.
+/// `CARGO_BIN_EXE_poot`, read at runtime: cargo sets it only for test builds that enable the
+/// package's `cli` feature, which the package's own dev-dependency does. No HSA agent is visible to the
+/// child, so a ROCm open fails on a host with an AMD GPU as on one without; the lane's "device required"
+/// switch is cleared, since it would turn that failure into a panic of the open path.
 fn poot_generate(args: &[&str]) -> Output {
-    let bin = std::env::var("CARGO_BIN_EXE_poot-generate")
-        .expect("CARGO_BIN_EXE_poot-generate must be set by cargo for test binaries");
+    let bin = std::env::var("CARGO_BIN_EXE_poot")
+        .expect("CARGO_BIN_EXE_poot must be set by cargo for test binaries");
     Command::new(bin)
         .contained()
+        .env("ROCR_VISIBLE_DEVICES", "")
+        .env_remove("POOT_REQUIRE_ROCM")
+        .arg("generate")
         .args(args)
         .output()
-        .expect("spawn poot-generate")
+        .expect("spawn poot generate")
 }
 
 fn stderr(output: &Output) -> String {
@@ -166,15 +171,30 @@ fn help_lists_the_accepted_flags_and_not_the_missing_ones() {
     );
 }
 
-/// A backend this build lacks is refused naming the cargo feature that enables it, before any model is
-/// read (the model path does not exist). Mutation: drop the feature from `Unsupported::Backend`'s message.
-#[cfg(not(feature = "rocm"))]
+/// `--backend rocm` is a backend of every build: the parser takes it and only the device open can refuse it,
+/// before any model is read (the model path does not exist). Mutation: re-gate ROCm behind a cargo feature
+/// (`Unsupported::Backend`); the refusal then names a feature and the row goes red.
 #[test]
-fn a_backend_not_built_in_names_the_feature_to_enable() {
+fn rocm_is_refused_only_by_the_device_open() {
     let output = poot_generate(&["-m", "/nonexistent", "-p", "hi", "--backend", "rocm"]);
     assert!(!output.status.success());
+    let message = stderr(&output);
     assert!(
-        stderr(&output).contains("--features rocm"),
+        message.contains("rocm")
+            && !message.contains("feature")
+            && !message.contains("unknown backend"),
+        "{message}"
+    );
+}
+
+/// A backend name no choice has is refused by the one parser, naming the accepted ones. Mutation: accept
+/// any name as `auto`.
+#[test]
+fn an_unknown_backend_is_refused_naming_the_accepted_ones() {
+    let output = poot_generate(&["-m", "/nonexistent", "-p", "hi", "--backend", "cuda"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("expected wgpu, rocm, ptx, vulkan or auto"),
         "{}",
         stderr(&output)
     );

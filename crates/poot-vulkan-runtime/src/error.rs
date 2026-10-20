@@ -23,10 +23,11 @@ pub enum RuntimeError {
         "the Vulkan device does not support the robustBufferAccess feature, which debranched SPIR-V requires"
     )]
     RobustBufferAccessUnsupported,
-    /// The chosen device has no memory type that is both host-visible and host-coherent, which the
-    /// staging and length buffers need.
-    #[error("no Vulkan memory type is HOST_VISIBLE | HOST_COHERENT")]
-    NoHostVisibleMemory,
+    /// No compute-capable device has a memory type that is device-local, host-visible and host-coherent.
+    /// Every buffer is allocated from that type and read and written through its mapping, with no staging
+    /// copy, so a device without it cannot run this runtime.
+    #[error("no Vulkan device has a DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT memory type")]
+    NoMappableDeviceLocalMemory,
     /// A dispatch grid is empty or exceeds `maxComputeWorkGroupCount`: `.0` is the requested grid, `.1`
     /// the x-dimension limit it was checked against.
     #[error("dispatch grid {0:?} is empty or exceeds maxComputeWorkGroupCount (x limit {1})")]

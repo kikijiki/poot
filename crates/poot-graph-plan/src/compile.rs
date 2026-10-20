@@ -870,6 +870,10 @@ pub fn compile(
         declines.extend(declined);
         Ok(fused)
     })?;
+    // The selection composites are required, not an optimization: the composition they replace is quadratic
+    // in the block count and has no device lowering, so a target that cannot plan the composite refuses the
+    // composite itself, with its own typed refusal, and never falls back to the rank chain.
+    pipeline.require("form_selection", transform::form_selection)?;
     pipeline.run("dce", transform::dce)?;
     // The two claiming passes are the only rewrites whose refusals the escape gate can mask: their
     // reverts put the packed decomposition back, and the gate is what then refuses that

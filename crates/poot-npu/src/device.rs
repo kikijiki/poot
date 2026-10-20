@@ -511,6 +511,13 @@ impl Device for XdnaDevice {
     type Recording = XdnaRecording;
     type Error = XdnaError;
 
+    fn copy_mechanism(&mut self) -> poot_executor::CopyMechanism<'_, Self::Error> {
+        poot_executor::CopyMechanism::Native
+    }
+    fn backend_name(&self) -> &'static str {
+        "xdna"
+    }
+
     fn target(&self) -> Target {
         Target::Aie {
             target: self.caps.target,
