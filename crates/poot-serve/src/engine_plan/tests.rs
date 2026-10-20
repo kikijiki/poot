@@ -17,9 +17,10 @@ use poot_executor::{
 };
 use poot_graph_plan::{Capability, Target, staged::StagedProgram, staged::TargetSet};
 use poot_llm::driver::{BackendChoice, DraftPolicy, ModelHandle};
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
 use poot_runtime_common::{BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters};
 use poot_target::{AmdArch, Backend, DeviceCaps, TargetId};
+use poot_weights::WeightMap;
 
 use super::*;
 use clap::Parser;

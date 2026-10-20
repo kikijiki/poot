@@ -1,4 +1,4 @@
-use poot_graph_ir::op::{FusedOp, FusedOperand, FusedStep};
+use poot_graph_ir::op::{FusedOp, FusedOperand, FusedStep, LocalId};
 
 use super::fuse::{is_i32_pointwise, lone_pointwise_region};
 use super::{
@@ -62,13 +62,13 @@ pub(crate) fn fuse_widening_casts(g: &Graph) -> Result<Graph, EditError> {
             };
             // The region's local that operand `position` is: a row region's inputs are its operands, an
             // epilogue's local `n >= 1` is the operand after the head's two, and its local 0 is the head.
-            let local = match &eqn.op {
+            let local = LocalId::new(match &eqn.op {
                 OpKind::FusedRow(_) => position,
                 OpKind::ContractionEpilogue { head, .. } if position >= head.operands() => {
                     position - head.operands() + 1
                 }
                 _ => continue,
-            };
+            });
             let Some((cast, source)) = widened_const(value) else {
                 continue;
             };
@@ -103,17 +103,17 @@ pub(crate) fn fuse_widening_casts(g: &Graph) -> Result<Graph, EditError> {
 /// Renumber a region's locals after [`FusedStep`] `Cast` of input `input` is inserted as the first step: the
 /// cast result takes local `n_inputs`, every step result shifts up by one, and every read of `input` moves to
 /// the cast result.
-fn widened_local(local: usize, input: usize, n_inputs: usize) -> usize {
+fn widened_local(local: LocalId, input: LocalId, n_inputs: usize) -> LocalId {
     if local == input {
-        n_inputs
-    } else if local >= n_inputs {
-        local + 1
+        LocalId::new(n_inputs)
+    } else if local.index() >= n_inputs {
+        LocalId::new(local.index() + 1)
     } else {
         local
     }
 }
 
-fn widened_operand(operand: &FusedOperand, input: usize, n_inputs: usize) -> FusedOperand {
+fn widened_operand(operand: &FusedOperand, input: LocalId, n_inputs: usize) -> FusedOperand {
     match operand {
         FusedOperand::Local(local) => FusedOperand::Local(widened_local(*local, input, n_inputs)),
         other => *other,
@@ -121,7 +121,7 @@ fn widened_operand(operand: &FusedOperand, input: usize, n_inputs: usize) -> Fus
 }
 
 /// The widening step itself: a `Cast` to `to` of region input `input`.
-fn widening_step(input: usize, to: DType) -> FusedStep {
+fn widening_step(input: LocalId, to: DType) -> FusedStep {
     FusedStep {
         op: FusedOp::Cast { to },
         inputs: vec![FusedOperand::Local(input)],
@@ -130,7 +130,7 @@ fn widening_step(input: usize, to: DType) -> FusedStep {
 
 /// Insert a `Cast` of input `input` to `to` as `region`'s first step, and read its result wherever the region
 /// read the input.
-fn widen_region_input(region: &mut FusedRegion, input: usize, to: DType) {
+fn widen_region_input(region: &mut FusedRegion, input: LocalId, to: DType) {
     let n = region.n_inputs;
     for step in &mut region.steps {
         for operand in &mut step.inputs {
@@ -145,7 +145,7 @@ fn widen_region_input(region: &mut FusedRegion, input: usize, to: DType) {
 }
 
 /// [`widen_region_input`] for a row region.
-fn widen_row_input(region: &mut RowRegion, input: usize, to: DType) {
+fn widen_row_input(region: &mut RowRegion, input: LocalId, to: DType) {
     let n = region.n_inputs;
     for step in &mut region.steps {
         match step {
@@ -267,7 +267,7 @@ fn fold_into_producer(
         op: FusedOp::Cast { to: DType::F32 },
         inputs: vec![FusedOperand::Local(region.output)],
     });
-    region.output = region.n_inputs + region.steps.len() - 1;
+    region.output = LocalId::new(region.n_inputs + region.steps.len() - 1);
     let cast_out = g.eqns()[cast].out;
     let mut eqns = g.eqns().to_vec();
     let mut removed = vec![cast];
@@ -349,21 +349,24 @@ fn join_reader(
         producer_local.push(at);
     }
     let n_inputs = leaves.len();
-    let producer_step = |local: usize| match local < producer.n_inputs {
-        true => producer_local[local],
-        false => n_inputs + (local - producer.n_inputs),
+    let producer_step = |local: LocalId| {
+        let local = local.index();
+        LocalId::new(match local < producer.n_inputs {
+            true => producer_local[local],
+            false => n_inputs + (local - producer.n_inputs),
+        })
     };
     let produced = n_inputs + producer.steps.len();
-    let consumer_step = |local: usize| {
-        if local == slot {
+    let consumer_step = |local: LocalId| {
+        if local.index() == slot {
             producer_step(producer.output)
-        } else if local < consumer.n_inputs {
-            consumer_local[local]
+        } else if local.index() < consumer.n_inputs {
+            LocalId::new(consumer_local[local.index()])
         } else {
-            produced + (local - consumer.n_inputs)
+            LocalId::new(produced + (local.index() - consumer.n_inputs))
         }
     };
-    let map = |operand: &FusedOperand, local: &dyn Fn(usize) -> usize| match operand {
+    let map = |operand: &FusedOperand, local: &dyn Fn(LocalId) -> LocalId| match operand {
         FusedOperand::Local(l) => FusedOperand::Local(local(*l)),
         other => *other,
     };
@@ -471,7 +474,7 @@ fn fold_into_consumers(
         };
         for (slot, leaf) in leaves.iter().enumerate() {
             if matches!(leaf, Operand::Value(v) if reached.contains(v)) {
-                widen_region_input(&mut region, slot, DType::F32);
+                widen_region_input(&mut region, LocalId::new(slot), DType::F32);
             }
         }
         rewritten.insert(

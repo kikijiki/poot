@@ -3,7 +3,7 @@
 //!
 //! The same fixture is loaded twice: once as one program on one device through an ordinary
 //! [`Engine`], and once as a [`Coordinator`] over two [`PtxDevice`]s whose weights are cut by
-//! [`poot_graph_plan::shard`] (rank `r` binds its [`poot_quant::weights::WeightMap::rank_view`]). Both
+//! [`poot_graph_plan::shard`] (rank `r` binds its [`poot_weights::WeightMap::rank_view`]). Both
 //! decode the same tokens and every logit is compared. A partial sum crosses devices as a peer copy
 //! recorded in the producing stage's CUDA graph and is added to the rank's own partial by an ordinary
 //! add of the consuming stage, so a skipped reduction, a dropped copy or a wrong share changes the

@@ -291,24 +291,31 @@ fn shard_files(index: &serde_json::Value) -> Result<Vec<String>, LoadError> {
 /// `model.safetensors.index.json` layout), each exactly once, as `(file name, mapping)` in load order.
 /// A caller that pins the files checks the pins over these mappings and then builds the store from the
 /// same mappings ([`load_mapped_weight_store`]), so digest, header and tensors come from one inode
-/// (ADR-0103 amendment). Nothing is read from a mapping here.
-pub fn map_weight_files(dir: impl AsRef<Path>) -> Result<Vec<(String, StoredBytes)>, LoadError> {
+/// (ADR-0103 amendment). Nothing is read from a mapping here. The shard index's bytes come from
+/// `read_index` (called with the index file's name) so a caller that pins files reads and checks them
+/// itself.
+pub fn map_weight_files<E: From<LoadError>>(
+    dir: impl AsRef<Path>,
+    read_index: impl FnOnce(&str) -> Result<Vec<u8>, E>,
+) -> Result<Vec<(String, StoredBytes)>, E> {
     let dir = dir.as_ref();
     let single = dir.join("model.safetensors");
     if single.exists() {
         return Ok(vec![map_file(&single)?]);
     }
-    let index_path = dir.join("model.safetensors.index.json");
-    if !index_path.exists() {
+    const INDEX: &str = "model.safetensors.index.json";
+    if !dir.join(INDEX).exists() {
         return Err(LoadError::SafeTensors(
             "no model.safetensors or model.safetensors.index.json in model dir".into(),
-        ));
+        )
+        .into());
     }
-    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(&index_path)?)?;
-    shard_files(&index)?
+    let index: serde_json::Value =
+        serde_json::from_slice(&read_index(INDEX)?).map_err(LoadError::from)?;
+    Ok(shard_files(&index)?
         .into_iter()
         .map(|shard| map_file(&dir.join(shard)))
-        .collect()
+        .collect::<Result<_, LoadError>>()?)
 }
 
 /// Build a [`WeightStore`] from mapped safetensors files ([`map_weight_files`]): every tensor's bytes a
@@ -329,7 +336,11 @@ pub fn load_mapped_weight_store(
 /// files to pin.
 #[cfg(any(test, feature = "test-support"))]
 pub fn load_weight_store(dir: impl AsRef<Path>) -> Result<WeightStore, LoadError> {
-    load_mapped_weight_store(&map_weight_files(dir)?, default_workers())
+    let dir = dir.as_ref();
+    let files = map_weight_files(dir, |name| {
+        std::fs::read(dir.join(name)).map_err(LoadError::from)
+    })?;
+    load_mapped_weight_store(&files, default_workers())
 }
 
 /// Whether `prefix` (a `.weight` tensor's name without that suffix) names one numbered shard of a
@@ -701,7 +712,10 @@ mod tests {
         std::fs::create_dir_all(&*dir).unwrap();
         let index = serde_json::json!({"weight_map": {"w": shard}});
         std::fs::write(dir.join("model.safetensors.index.json"), index.to_string()).unwrap();
-        map_weight_files(&*dir).map(|files| files.len())
+        map_weight_files(&*dir, |name| {
+            std::fs::read(dir.join(name)).map_err(LoadError::from)
+        })
+        .map(|files| files.len())
     }
 
     /// POOT-1196 SC-006: a shard index naming a path (parent component, separator, absolute) is

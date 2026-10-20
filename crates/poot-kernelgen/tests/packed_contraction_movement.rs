@@ -364,15 +364,6 @@ fn scatter_rows(base: &Tensor, src: &Tensor, slots: &[i32]) -> Tensor {
     })
 }
 
-fn permute_rows(src: &Tensor, destination: &[usize]) -> Tensor {
-    build(&src.shape, |c| {
-        let source = destination.iter().position(|&row| row == c[0]).unwrap();
-        let mut source_coord = c.to_vec();
-        source_coord[0] = source;
-        src.at(&source_coord)
-    })
-}
-
 // --- the bank ------------------------------------------------------------------------------------------
 
 /// Every case of the bank, with lane values `width` bits wide.
@@ -775,46 +766,6 @@ fn a_windowed_scatter_composes_to_the_whole_output() {
     }
 }
 
-/// `out[index[s]] = src[s]`: one thread owns one source element, so only element storage runs it.
-fn permuted_scatter_on(kind: Kind, device: &mut Device<'_>) {
-    let src = Tensor::counting(&[4, 3], 50, 32);
-    let destination = [2usize, 0, 3, 1];
-    let expected = permute_rows(&src, &destination);
-    let index: Vec<i32> = destination.iter().map(|&i| i as i32).collect();
-    let spec = MovementSpec::new(
-        kind.storage(),
-        vec![4, 3],
-        MovementOp::PermuteRows {
-            src_shape: vec![4, 3],
-        },
-    );
-    let out = device(&launch(
-        kind,
-        &spec,
-        std::slice::from_ref(&src),
-        Some(&index),
-    ));
-    assert_eq!(kind.tensor(&out, &[4, 3]), expected, "{kind:?}");
-}
-
-#[test]
-fn a_permuted_row_scatter_inverts_the_row_gather() {
-    for kind in [Kind::F32, Kind::I32] {
-        permuted_scatter_on(kind, &mut interpret);
-    }
-    let packed = MovementSpec::new(
-        Storage::BYTE_LANES,
-        vec![4, 3],
-        MovementOp::PermuteRows {
-            src_shape: vec![4, 3],
-        },
-    );
-    assert!(matches!(
-        poot_kernelgen::movement_body("m", &packed, None),
-        Err(KernelGenError::Unsupported { .. })
-    ));
-}
-
 /// The generator refuses the requests it cannot state, with a typed error naming the contract.
 #[test]
 fn malformed_requests_are_typed_refusals() {
@@ -902,15 +853,12 @@ fn malformed_requests_are_typed_refusals() {
 }
 
 /// The whole movement bank on a device: every op on every storage, the FP8 raw-bit fixture, the windowed
-/// scatter on every storage and the permuted scatter on the element storages.
+/// scatter on every storage.
 fn device_bank(device: &mut Device<'_>) {
     every_op_on_every_storage(device);
     fp8_raw_bits_on(device);
     for kind in every_kind() {
         windowed_scatter_on(kind, device);
-    }
-    for kind in [Kind::F32, Kind::I32] {
-        permuted_scatter_on(kind, device);
     }
 }
 

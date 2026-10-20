@@ -14,9 +14,10 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use poot_load::gguf::GgufIndex;
-use poot_quant::weights::{
-    AttnRole, ExpertProj, HyperRole, HyperSite, PleRole, QsaRole, WeightId, WeightKey, WeightMap,
-    WeightRole, WeightStore, WeightView,
+use poot_quant::weights::{WeightKey, WeightStore};
+use poot_weights::{
+    AttnRole, ExpertProj, HyperRole, HyperSite, PleRole, QsaRole, WeightId, WeightMap, WeightRole,
+    WeightView,
 };
 
 use super::gated_residual::HyperParams;

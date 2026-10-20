@@ -78,7 +78,7 @@ library code you select the backend by wiring the matching executor crate (`poot
 tradeoffs.
 
 :::note
-The AMD XDNA2 NPU is an experimental library device, not a serving backend. See
+The AMD XDNA2 and Intel NPUs are library devices, not serving backends yet; they are under active development, with prefill as the goal. See
 [Develop: Backends](./index.md#backends).
 :::
 

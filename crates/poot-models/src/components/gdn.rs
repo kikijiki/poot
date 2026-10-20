@@ -27,8 +27,8 @@
 //! ([`GdnHeadOrder::Grouped`]). [`GdnParams`] names which, and the same graph follows.
 
 use poot_graph_ir::{BinOp, Builder, ScanAttrs, ScanFamily, ScanResult, Traced, UnOp, ops};
-use poot_quant::weights::{GdnRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
+use poot_weights::{GdnRole, WeightId, WeightMap, WeightRole};
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};

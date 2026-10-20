@@ -132,11 +132,12 @@ pub struct Context {
     /// planner's [`poot_target::Target`] identity, which a later query must not change under a program
     /// compiled for it. Feeds [`Context::device_caps`].
     memory_budget_bytes: Option<u64>,
-    /// Same condition as [`Context::effective_max_buffer_size`]'s RADV scoping: the adapter is AMD
-    /// (vendor `0x1002`) over Vulkan. The iGPU display watchdog and the card-095 tiled-GEMM miscompile
-    /// are calibrated facts about that driver stack, not something a device query answers, so
-    /// `device_caps` reports them as a vendor-scoped default exactly where this is true (Card 522 Scope).
-    is_amd_radv: bool,
+    /// The calibration of this device's identity ([`poot_target::calibration::Calibration::of_vulkan_device`]):
+    /// the display watchdog, the tiled-GEMM ceiling and the safe buffer size are observed facts about one
+    /// device, not something a device query answers, so `Unknown` for a device nobody measured.
+    calibration: poot_target::Queried<poot_target::calibration::Calibration>,
+    /// The optional shader features the device was granted at open. Feeds [`Context::device_caps`].
+    shader_features: poot_target::ShaderFeatures,
     /// G4: compute pipelines (shader module + bind-group layout + pipeline) bucketed by kernel key and
     /// matched by the exact module they were built from (card 656), built once and reused across
     /// tokens. `RefCell` for interior mutability on the `&self` dispatch path (single-threaded, like

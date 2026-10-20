@@ -2,7 +2,8 @@
 //! alternating sliding-window and full layers, and a routed block of biased clamped-GLU experts. The
 //! body is `standard_stack` over `standard_layer` with the shared attention and `components::moe`.
 
-use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::{ExpertProj, WeightMap};
 
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::components::ffn::Glu;
@@ -285,7 +286,8 @@ mod family_tests {
 
     use poot_quant::SourceRole;
     use poot_quant::format::WeightFormat;
-    use poot_quant::weights::{HandleFormat, WeightStoreBuilder};
+    use poot_quant::weights::WeightStoreBuilder;
+    use poot_weights::HandleFormat;
     use serde_json::json;
 
     use super::*;

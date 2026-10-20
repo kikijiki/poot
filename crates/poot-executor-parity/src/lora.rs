@@ -17,11 +17,9 @@ use poot_graph_plan::{
     staged::compile_staged,
 };
 use poot_quant::StoredBytes;
-use poot_quant::weights::{
-    AttnRole, DenseWeight, LoraRole, LoraTarget, WeightEntry, WeightId, WeightKey, WeightMap,
-    WeightRole, WeightStore, WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_tensor::{DType, HostTensor};
+use poot_weights::{AttnRole, LoraRole, LoraTarget, WeightId, WeightMap, WeightRole, WeightView};
 
 const BATCH: usize = 3;
 const RANK: usize = 2;
@@ -228,6 +226,7 @@ fn run_projection(
         rows: std::num::NonZeroUsize::new(BATCH).unwrap(),
         adapters: std::num::NonZeroUsize::new(ADAPTERS).unwrap(),
         rank: std::num::NonZeroUsize::new(RANK).unwrap(),
+        factor_dtype: poot_tensor::DType::F32,
         projections: vec![lora_target],
     };
     let program = compile_staged(

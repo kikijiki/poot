@@ -197,7 +197,6 @@ poot-kernelgen::npu_artifact	the_artifact_validator_refuses_inconsistent_abis_an
 poot-kernelgen::npu_artifact	the_cache_identity_sees_shape_toolchain_and_abi	kernelgen `npu_artifact` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::npu_artifact	the_ordinary_handle_carries_the_compiler_derived_abi	kernelgen `npu_artifact` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::npu_artifact	the_region_identity_sees_every_body_the_placement_the_wiring_and_the_offsets	kernelgen `npu_artifact` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
-poot-kernelgen::packed_contraction_movement	a_permuted_row_scatter_inverts_the_row_gather	kernelgen `packed_contraction_movement` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::packed_contraction_movement	a_windowed_scatter_composes_to_the_whole_output	kernelgen `packed_contraction_movement` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::packed_contraction_movement	every_op_matches_the_reference_on_every_storage	kernelgen `packed_contraction_movement` test binary (emit, interpreter or dispatch rows); the lane runs the package whole
 poot-kernelgen::packed_contraction_movement	fp8_special_encodings_move_as_raw_bits_and_decode_like_dense_movement	kernelgen `packed_contraction_movement` test binary (emit, interpreter or dispatch rows); the lane runs the package whole

@@ -6,7 +6,7 @@
 //! component.
 
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced};
-use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{NormRole, WeightId, WeightMap, WeightRole};
 
 use super::config::{DenseDims, Ffn, Glm53Config, Mixer};
 use super::mtp::MtpLayer;

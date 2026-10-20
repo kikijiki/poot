@@ -25,12 +25,10 @@ use poot_graph_ir::{
     IndexRange, PackedSourceName, SlotKey, TensorType, ValueId, packed_stack_source_type,
 };
 use poot_quant::SourceRole;
-use poot_quant::weights::{
-    HandleFormat, StoreGeneration, WeightEntry, WeightId, WeightKey, WeightMap, WeightStore,
-    WeightView,
-};
+use poot_quant::weights::{StoreGeneration, WeightEntry, WeightKey, WeightStore};
 use poot_target::BufferStorage;
 use poot_tensor::{DType, HostView};
+use poot_weights::{HandleFormat, WeightId, WeightMap, WeightView};
 
 use crate::error::{BindError, LoadError};
 use crate::lanes::{EncodeError, Encoding, first_non_finite_f16};
@@ -955,10 +953,9 @@ impl WeightBinder {
 #[cfg(test)]
 mod tests {
     use poot_quant::format::WeightFormat;
-    use poot_quant::weights::{
-        MoeRole, WeightEntry, WeightMap, WeightRole, WeightStore, WeightView,
-    };
+    use poot_quant::weights::{WeightEntry, WeightStore};
     use poot_quant::{PackedPayload, PackedWeight, SourceRole};
+    use poot_weights::{MoeRole, WeightMap, WeightRole, WeightView};
 
     use super::*;
 
@@ -978,7 +975,7 @@ mod tests {
     fn q8_stack() -> (WeightBinder, WeightId, Vec<Arc<PackedPayload>>) {
         let id = WeightId::layer(
             0,
-            WeightRole::Moe(MoeRole::Stack(poot_quant::weights::ExpertProj::Gate)),
+            WeightRole::Moe(MoeRole::Stack(poot_weights::ExpertProj::Gate)),
         );
         let experts: Vec<Arc<PackedPayload>> = (0..3)
             .map(|e| {

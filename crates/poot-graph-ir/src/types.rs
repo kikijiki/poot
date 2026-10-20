@@ -158,6 +158,59 @@ impl fmt::Display for Scalar {
     }
 }
 
+/// The operands of an equation as [`crate::op::OpKind::infer`] reads them: their types, and which of them are
+/// inline literals rather than values. A literal is an immediate the lowering bakes in, so it adopts the
+/// dtype of the value it meets; a value of the same shape and dtype is a real tensor and must agree exactly.
+/// `infer` is the only place that rule is stated, because it is the only place that sees both facts.
+///
+/// A list of value types converts into operands with no literal (`ins.into()`): that is every operand list
+/// outside an equation's own `inputs`, such as a pass probing a candidate op.
+#[derive(Clone, Copy)]
+pub struct Operands<'a> {
+    types: &'a [TensorType],
+    is_literal: &'a dyn Fn(usize) -> bool,
+}
+
+/// The literal predicate of a list of values: nothing is a literal.
+fn no_literals(_: usize) -> bool {
+    false
+}
+
+impl<'a> Operands<'a> {
+    /// The operand `types` of an equation, operand `i` being a literal exactly when `is_literal(i)`.
+    pub fn new(types: &'a [TensorType], is_literal: &'a dyn Fn(usize) -> bool) -> Self {
+        Self { types, is_literal }
+    }
+
+    /// The operand types, in operand order.
+    pub fn types(&self) -> &'a [TensorType] {
+        self.types
+    }
+
+    /// Whether operand `index` is an inline literal.
+    pub fn is_literal(&self, index: usize) -> bool {
+        (self.is_literal)(index)
+    }
+}
+
+impl<'a> From<&'a [TensorType]> for Operands<'a> {
+    fn from(types: &'a [TensorType]) -> Self {
+        Self::new(types, &no_literals)
+    }
+}
+
+impl<'a> From<&'a Vec<TensorType>> for Operands<'a> {
+    fn from(types: &'a Vec<TensorType>) -> Self {
+        types.as_slice().into()
+    }
+}
+
+impl<'a, const N: usize> From<&'a [TensorType; N]> for Operands<'a> {
+    fn from(types: &'a [TensorType; N]) -> Self {
+        types.as_slice().into()
+    }
+}
+
 /// numpy broadcast of two shapes (right-aligned, leading-1 padding). The shared rule behind binary ops
 /// and matmul batch dims.
 pub fn broadcast_shapes(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {

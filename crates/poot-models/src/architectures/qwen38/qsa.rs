@@ -41,7 +41,7 @@
 use std::num::NonZeroU32;
 
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, StateRole, TensorType, Traced, ops};
-use poot_quant::weights::{QsaRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{QsaRole, WeightId, WeightMap, WeightRole};
 
 use crate::components::attention::{BlockSelection, first_writes};
 use crate::components::linear::{Weight, WeightError, linear};

@@ -14,7 +14,7 @@
 
 use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
-use poot_quant::weights::{CompressRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{CompressRole, WeightId, WeightMap, WeightRole};
 
 use super::config::{DeepseekV4Config, LayerKind};
 use super::csa::overlap_pool;

@@ -51,7 +51,10 @@ let handle = ModelHandle::load("/path/to/gptq-model".as_ref(), &registry, &LoadO
 A family the registry does not know is a typed refusal, `DriverError::Unsupported(Unsupported::Registry(..))`.
 The dense, mixture-of-experts (Qwen3-MoE, Granite MoE, Mixtral, OLMoE, gpt-oss), MLA (DeepSeek) and hybrid
 (Nemotron-H) families are registered, as are the BERT encoders and the SmolVLM vision tower (below).
-`LoadOptions::integrity` names a manifest of file lengths and SHA-256 digests the load checks before it reads a tensor.
+`LoadOptions::integrity` names a manifest of file lengths and SHA-256 digests. Every file the load reads must be
+listed: the weight files are checked before any tensor is read, and `config.json`, `tokenizer.json` and the other
+config and chat-template files are hashed once and parsed from those same bytes, so a modified tokenizer fails the
+load and an unlisted file is refused.
 
 Useful accessors after load: `handle.config()` (family, vocabulary, positions, end-of-sequence ids),
 `handle.text()` (tokenizer and chat template), `handle.store()` (the weights as stored).

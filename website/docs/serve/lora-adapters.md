@@ -45,6 +45,9 @@ the request with a `400` too.
   outright at load time; poot does not partially apply an adapter.
 - **DoRA:** not supported. A DoRA checkpoint (LoRA plus a magnitude vector) is rejected with a clear error
   rather than loaded as a plain LoRA with the magnitude term dropped.
+- **Adapter dtype:** F32, F16 or BF16 factors, uploaded in the dtype the adapter file stores them in (a BF16
+  adapter takes half the device memory of its F32 twin) and widened on the device by the correction. The
+  adapters of one load must share one stored dtype; a mixed set is refused at load.
 - **Backends:** verified on wgpu and ROCm.
 
 Design notes and primary sources live under

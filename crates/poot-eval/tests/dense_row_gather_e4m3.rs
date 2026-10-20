@@ -1,6 +1,6 @@
 //! Card 405: coverage for the E4M3 row `DenseRowGather` CPU-oracle evaluation (`poot-eval/src/fp8.rs`,
-//! `poot-eval/src/lib.rs`), alongside `DENSE_ROW_GATHER_SOURCE_DTYPES` (`poot-graph-ir/src/op.rs`) naming
-//! `DType::E4M3FN` next to `DType::BF16`. See `specs/405-dense-row-gather-e4m3/spec.md`.
+//! `poot-eval/src/lib.rs`), where `DType::E4M3FN` is a `DenseRowGather` source beside the floats
+//! (`poot-graph-ir/src/op.rs`). See `specs/405-dense-row-gather-e4m3/spec.md`.
 //!
 //! Two hand-picked E4M3 byte values anchor the tests (hand-picked rather than generated so the data is
 //! known to be non-degenerate):
@@ -11,8 +11,8 @@
 use poot_eval::fp8::e4m3fn_tensor;
 use poot_eval::{EvalOptions, Value};
 use poot_graph_ir::{
-    BinOp, DENSE_ROW_GATHER_SOURCE_DTYPES, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot,
-    Storage, TensorType, ValueId, ValueMeta,
+    BinOp, Eqn, Graph, GraphEdit, OpKind, Operand, Scalar, Slot, Storage, TensorType, ValueId,
+    ValueMeta,
 };
 use poot_tensor::DType;
 use poot_tensor::HostTensor;
@@ -225,9 +225,16 @@ fn dense_row_gather_e4m3_composes_with_downstream_scale() {
     assert_eq!(output.as_f32().unwrap(), expected.as_slice());
 }
 
-/// Checks that this file's premise (`DType::E4M3FN` is admitted) matches the graph-ir table, so a stale copy
-/// of the dtype list here cannot diverge from `op.rs`.
+/// This file's premise is that `infer` types an E4M3FN source: the typed gather is the premise of every row
+/// above, so a change to the admitted sources cannot leave them silently unrun.
 #[test]
-fn dense_row_gather_source_dtypes_include_e4m3fn_here_too() {
-    assert!(DENSE_ROW_GATHER_SOURCE_DTYPES.contains(&DType::E4M3FN));
+fn dense_row_gather_infers_an_e4m3fn_source() {
+    let source = DType::E4M3FN;
+    assert_eq!(
+        OpKind::DenseRowGather { source }.infer(&[
+            TensorType::new(vec![4, 3], source),
+            TensorType::new(vec![2], DType::I32)
+        ]),
+        Ok(TensorType::f32(vec![2, 3]))
+    );
 }

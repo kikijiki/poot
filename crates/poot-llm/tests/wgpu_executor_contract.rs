@@ -26,10 +26,11 @@ use poot_graph_plan::{CompileOptions, Target, staged::compile_staged};
 use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
 use poot_quant::format::{GroupMap, WeightFormat};
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_quant::{PackedComponentRef, StoredBytes};
 use poot_tensor::{DType, HostTensor, HostView};
 use poot_test_util::assert_close_rel;
+use poot_weights::WeightMap;
 use poot_wgpu_device::device::WgpuDevice;
 
 const CAP: usize = 8;
@@ -950,9 +951,9 @@ fn two_phase_state_commit_matches_the_oracle_after_four_steps() {
     assert_eq!(recordings, 1, "one entry, one recording after 4 steps");
 }
 
-/// SC-008: a prefill fixture whose dispatch count exceeds one submit's budget (`FLUSH_EVERY` in
-/// `poot_wgpu_device::device`; a 64-layer model crosses it on dispatch count alone, cheaper to build than
-/// crossing `FLUSH_WORK` by growing the prompt - the CPU oracle below evaluates the raw, unfused
+/// SC-008: a prefill fixture whose dispatch count exceeds one submit's budget (the dispatch bound of
+/// `poot_executor::FlushPolicy`; a 64-layer model crosses it on dispatch count alone, cheaper to build than
+/// crossing the work bound by growing the prompt - the CPU oracle below evaluates the raw, unfused
 /// graph, so a longer prompt costs it quadratically) splits into several real `submit_cached` calls,
 /// and its output still matches the CPU oracle (the split is a host-side batching detail, never a
 /// semantic difference).
@@ -963,9 +964,9 @@ fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() 
     };
     let target = wgpu_target(&device);
     let mut engine = poot_executor::Engine::new(device);
-    // Many thin layers, not a long prompt: `FLUSH_EVERY` (1024 dispatches) is a dispatch-count bound
+    // Many thin layers, not a long prompt: the `FlushPolicy` dispatch bound (1024 dispatches) is a dispatch-count bound
     // independent of per-dispatch size, and each layer contributes a roughly fixed equation count -
-    // cheaper to cross than `FLUSH_WORK` by growing `n` (the CPU oracle below evaluates the raw,
+    // cheaper to cross than the work bound by growing `n` (the CPU oracle below evaluates the raw,
     // unfused graph, so its cost would grow with any larger prompt length).
     let cfg = dense().dims(16, 32, 64);
     let n = 8;
@@ -993,14 +994,14 @@ fn many_layer_prefill_splits_submits_by_dispatch_count_and_matches_the_oracle() 
         submits_after - submits_before > 1,
         "a {n}-token prefill's recorded run must split into more than one submit_cached call \
          (submits before={submits_before}, after={submits_after}); the dispatch work weight must \
-         be too small to exceed FLUSH_WORK/FLUSH_EVERY for this shape"
+         be too small to exceed the FlushPolicy work or dispatch bound for this shape"
     );
 }
 
-/// SC-008: a fixture whose dispatch *count* stays far under `FLUSH_EVERY` but
-/// whose summed `Dispatch::work` crosses `FLUSH_WORK` on its own - the prior dispatch-count fixture
+/// SC-008: a fixture whose dispatch *count* stays far under the `FlushPolicy` dispatch bound but
+/// whose summed `Dispatch::work` crosses its work bound on its own - the prior dispatch-count fixture
 /// never exercises this (an "ignore `Dispatch::work`" probe stayed green against it). `dispatch_work` is an equation's OUTPUT element count only, never the
-/// contracted dimension, so a single-layer decode step with a huge `vocab` crosses `FLUSH_WORK` in
+/// contracted dimension, so a single-layer decode step with a huge `vocab` crosses the work bound in
 /// the lm_head matmul's one equation while the real FLOPs (vocab * hidden) and the CPU oracle's cost
 /// stay small, since hidden/layers/cap all stay tiny.
 #[test]
@@ -1032,7 +1033,7 @@ fn single_decode_step_crosses_flush_work_by_summed_work_and_matches_the_oracle()
     assert!(
         submits_after - submits_before > 1,
         "a huge-vocab decode step's recorded run must split into more than one submit_cached call \
-         by summed Dispatch::work alone, with dispatch count far under FLUSH_EVERY; submits \
+         by summed Dispatch::work alone, with dispatch count far under the FlushPolicy bound; submits \
          before={submits_before}, after={submits_after}"
     );
 }

@@ -37,16 +37,14 @@ use poot_models::model::{
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, ModelParts, RawConfig, Registry};
 use poot_quant::StoredBytes;
-use poot_quant::weights::{
-    AttnRole, DenseWeight, FfnRole, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole,
-    WeightStore, WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_runtime_common::{
     AllocGuard, BufferRole, CompiledKernel, MemoryCounterSnapshot, MemoryCounters,
 };
 use poot_target::{Backend, BufferStorage, DeviceCaps};
 use poot_tensor::DType;
 use poot_text::{ChatFormat, HermesToolCodec};
+use poot_weights::{AttnRole, FfnRole, WeightId, WeightMap, WeightRole, WeightView};
 
 use super::capacity::{AllocationOwner, Footprint, Planner};
 use super::error::{DriverError, InvalidOptions, Unsupported};

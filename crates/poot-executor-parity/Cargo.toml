@@ -19,6 +19,7 @@ poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 poot-eval = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
+poot-weights = { workspace = true, features = ["test-support"] }
 poot-target.workspace = true
 poot-runtime-common.workspace = true
 poot-test-util.workspace = true

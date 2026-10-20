@@ -16,10 +16,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_graph_ir::{BinOp, Builder, Graph, Slot, SlotKey, TensorType, Traced};
-use poot_quant::weights::{
-    AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightStore,
-};
+use poot_quant::weights::WeightStore;
 use poot_tensor::DType;
+use poot_weights::{AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole};
 
 use crate::architectures::bert::{Projection, bidirectional_attention};
 use crate::components::dims::{Field, Fields};

@@ -246,7 +246,6 @@ pub fn decompose(
         | OpKind::Concat { .. }
         | OpKind::Iota { .. }
         | OpKind::Gather { .. }
-        | OpKind::Scatter { .. }
         | OpKind::ScatterUpdate
         | OpKind::MatMul
         | OpKind::PackedDequant { .. }
@@ -254,8 +253,6 @@ pub fn decompose(
         | OpKind::ArgTopK { .. }
         | OpKind::IndexedMatMul
         | OpKind::DynamicUpdateSlice { .. }
-        | OpKind::PackI8
-        | OpKind::UnpackI8 { .. }
         | OpKind::AllReduce { .. }
         | OpKind::AllGather { .. }
         | OpKind::RandomUniform { .. }
@@ -321,14 +318,14 @@ fn region_operand(
 ) -> Result<Option<Operand>, BuilderError> {
     Ok(Some(match operand {
         FusedOperand::Local(local) => {
-            let Some(value) = locals.get(*local) else {
+            let Some(value) = locals.get(local.index()) else {
                 return Ok(None);
             };
             Operand::Value(value.id())
         }
         FusedOperand::Lit(scalar) => Operand::Lit(*scalar),
         FusedOperand::PackLane { input, lane } => {
-            let Some(packed) = locals.get(*input).map(|value| value.id()) else {
+            let Some(packed) = locals.get(input.index()).map(|value| value.id()) else {
                 return Ok(None);
             };
             let Some(ty) = plan.type_of(packed) else {
@@ -385,17 +382,17 @@ fn stage_region(
         locals.push(plan.equation(step.op.kind(), operands)?);
     }
     if region.pack.is_empty() {
-        return Ok(locals.get(region.output).copied());
+        return Ok(locals.get(region.output.index()).copied());
     }
     let mut parts = Vec::with_capacity(region.pack.len());
     for local in &region.pack {
-        let Some(part) = locals.get(*local) else {
+        let Some(part) = locals.get(local.index()) else {
             return Ok(None);
         };
         parts.push(Operand::Value(part.id()));
     }
     let Some(axis) = plan
-        .type_of(locals[region.pack[0]].id())
+        .type_of(locals[region.pack[0].index()].id())
         .and_then(|ty| ty.rank().checked_sub(1))
     else {
         return Ok(None);
@@ -466,14 +463,16 @@ fn fused_row(
             }
             locals.push(plan.equation(op, operands)?);
         }
-        Ok(locals.get(region.output).copied())
+        Ok(locals.get(region.output.index()).copied())
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::op::{AttentionAttrs, BinOp, FusedOp, FusedStep, OpClass, RedOp, SampleRule, UnOp};
+    use crate::op::{
+        AttentionAttrs, BinOp, FusedOp, FusedStep, LocalId, OpClass, RedOp, SampleRule, UnOp,
+    };
     use crate::types::{DType, Scalar};
     use poot_quant::PackedWeight;
     use poot_quant::format::WeightFormat;
@@ -488,7 +487,7 @@ mod tests {
 
     /// The position of `op`'s variant among every `OpKind` variant. Exhaustive with no wildcard, so a
     /// new variant cannot compile until it is placed here, and [`VARIANTS`] then demands a row for it.
-    fn variant(op: &OpKind) -> usize {
+    pub(crate) fn variant(op: &OpKind) -> usize {
         match op {
             OpKind::Unary(_) => 0,
             OpKind::Binary(_) => 1,
@@ -502,36 +501,33 @@ mod tests {
             OpKind::Concat { .. } => 9,
             OpKind::Iota { .. } => 10,
             OpKind::Gather { .. } => 11,
-            OpKind::Scatter { .. } => 12,
-            OpKind::ScatterUpdate => 13,
-            OpKind::MatMul => 14,
-            OpKind::PackedDequant { .. } => 15,
-            OpKind::PackedContraction { .. } => 16,
-            OpKind::PackedRowGather { .. } => 17,
-            OpKind::DenseContraction { .. } => 18,
-            OpKind::DenseRowGather { .. } => 19,
-            OpKind::ContractionEpilogue { .. } => 20,
-            OpKind::ArgTopK { .. } => 21,
-            OpKind::IndexedMatMul => 22,
-            OpKind::DynamicUpdateSlice { .. } => 23,
-            OpKind::PackI8 => 24,
-            OpKind::UnpackI8 { .. } => 25,
-            OpKind::Fused(_) => 26,
-            OpKind::FusedRow(_) => 27,
-            OpKind::Attention(_) => 28,
-            OpKind::Rope { .. } => 29,
-            OpKind::Scan(_) => 34,
-            OpKind::BlockTopK(_) => 36,
-            OpKind::SelectedAttention(_) => 37,
-            OpKind::GroupedDenseContraction { .. } => 35,
-            OpKind::AllReduce { .. } => 30,
-            OpKind::AllGather { .. } => 31,
-            OpKind::RandomUniform { .. } => 32,
-            OpKind::SampleToken { .. } => 33,
+            OpKind::ScatterUpdate => 12,
+            OpKind::MatMul => 13,
+            OpKind::PackedDequant { .. } => 14,
+            OpKind::PackedContraction { .. } => 15,
+            OpKind::PackedRowGather { .. } => 16,
+            OpKind::DenseContraction { .. } => 17,
+            OpKind::DenseRowGather { .. } => 18,
+            OpKind::ContractionEpilogue { .. } => 19,
+            OpKind::ArgTopK { .. } => 20,
+            OpKind::IndexedMatMul => 21,
+            OpKind::DynamicUpdateSlice { .. } => 22,
+            OpKind::Fused(_) => 23,
+            OpKind::FusedRow(_) => 24,
+            OpKind::Attention(_) => 25,
+            OpKind::Rope { .. } => 26,
+            OpKind::Scan(_) => 31,
+            OpKind::BlockTopK(_) => 33,
+            OpKind::SelectedAttention(_) => 34,
+            OpKind::GroupedDenseContraction { .. } => 32,
+            OpKind::AllReduce { .. } => 27,
+            OpKind::AllGather { .. } => 28,
+            OpKind::RandomUniform { .. } => 29,
+            OpKind::SampleToken { .. } => 30,
         }
     }
 
-    const VARIANTS: usize = 38;
+    pub(crate) const VARIANTS: usize = 35;
 
     /// The epilogue region `(head + bias) + residual`: local 0 the head result, 1 the bias, 2 the residual.
     fn bias_residual_region() -> FusedRegion {
@@ -540,14 +536,20 @@ mod tests {
             steps: vec![
                 FusedStep {
                     op: FusedOp::Binary(BinOp::Add),
-                    inputs: vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+                    inputs: vec![
+                        FusedOperand::Local(LocalId::new(0)),
+                        FusedOperand::Local(LocalId::new(1)),
+                    ],
                 },
                 FusedStep {
                     op: FusedOp::Binary(BinOp::Add),
-                    inputs: vec![FusedOperand::Local(3), FusedOperand::Local(2)],
+                    inputs: vec![
+                        FusedOperand::Local(LocalId::new(3)),
+                        FusedOperand::Local(LocalId::new(2)),
+                    ],
                 },
             ],
-            output: 4,
+            output: LocalId::new(4),
             pack: Vec::new(),
         }
     }
@@ -555,7 +557,7 @@ mod tests {
     /// One instance of every `OpKind` variant over canonical operand types (each row types under
     /// `infer`), the composites in each form the evaluator meets (prefill with and without softcap, a
     /// partial rope, an F32 and an I32 pack-lane region).
-    fn canonical_rows() -> Vec<(OpKind, Vec<TensorType>)> {
+    pub(crate) fn canonical_rows() -> Vec<(OpKind, Vec<TensorType>)> {
         let packed = PackedWeight::try_new(WeightFormat::E2m1Row32, [4, 32]).unwrap();
         let sources: Vec<TensorType> = packed
             .sources()
@@ -570,7 +572,7 @@ mod tests {
             }
             operands
         };
-        let local = FusedOperand::Local;
+        let local = |index: usize| FusedOperand::Local(LocalId::new(index));
         let step = |op, inputs| FusedStep { op, inputs };
         let f32_region = FusedRegion {
             n_inputs: 2,
@@ -582,18 +584,21 @@ mod tests {
                 ),
                 step(FusedOp::Binary(BinOp::Div), vec![local(1), local(3)]),
             ],
-            output: 4,
+            output: LocalId::new(4),
             pack: Vec::new(),
         };
-        let lane = |lane| FusedOperand::PackLane { input: 0, lane };
+        let lane = |lane| FusedOperand::PackLane {
+            input: LocalId::new(0),
+            lane,
+        };
         let i32_region = FusedRegion {
             n_inputs: 1,
             steps: vec![
                 step(FusedOp::Binary(BinOp::Add), vec![lane(0), lane(1)]),
                 step(FusedOp::Unary(UnOp::Not), vec![local(1)]),
             ],
-            output: 2,
-            pack: vec![1, 2],
+            output: LocalId::new(2),
+            pack: vec![LocalId::new(1), LocalId::new(2)],
         };
         let softmax = RowRegion {
             n_inputs: 1,
@@ -620,7 +625,7 @@ mod tests {
                     inputs: vec![local(3), local(4)],
                 },
             ],
-            output: 5,
+            output: LocalId::new(5),
         };
         let i32 = DType::I32;
         let decode = vec![
@@ -642,6 +647,7 @@ mod tests {
                 OpKind::Select,
                 vec![typed(&[2], i32), typed(&[2], i32), typed(&[2], i32)],
             ),
+            (OpKind::Select, vec![typed(&[2], i32), f32(&[2]), f32(&[2])]),
             (
                 OpKind::Reduce {
                     op: RedOp::Sum,
@@ -673,10 +679,6 @@ mod tests {
             (
                 OpKind::Gather { axis: 0 },
                 vec![f32(&[4, 3]), typed(&[2], i32)],
-            ),
-            (
-                OpKind::Scatter { axis: 0 },
-                vec![f32(&[3, 2]), typed(&[3], i32)],
             ),
             (
                 OpKind::ScatterUpdate,
@@ -754,8 +756,6 @@ mod tests {
                 OpKind::DynamicUpdateSlice { axis: 0 },
                 vec![f32(&[4, 3]), f32(&[1, 3]), typed(&[], i32)],
             ),
-            (OpKind::PackI8, vec![f32(&[2, 8])]),
-            (OpKind::UnpackI8 { len: 8 }, vec![typed(&[2, 2], i32)]),
             (OpKind::Fused(f32_region), vec![f32(&[3, 4]), f32(&[3, 4])]),
             (OpKind::Fused(i32_region), vec![typed(&[3, 2], i32)]),
             (OpKind::FusedRow(softmax), vec![f32(&[3, 7])]),

@@ -10,7 +10,7 @@ use crate::error::GraphValidationError;
 use crate::op::OpKind;
 use crate::range::IndexRange;
 use crate::rope_table::{self, RopeSpec, RopeTable};
-use crate::types::{DType, Scalar, TensorType};
+use crate::types::{DType, DTypeClass, DTypeClassExt, Operands, Scalar, TensorType};
 use crate::weight_ref::WeightRef;
 
 /// An SSA value: an index into [`Graph::values`] (the jaxpr `Var`, an arena index not object identity).
@@ -282,6 +282,35 @@ pub enum LayerTagError {
         /// The layer the order required at that point.
         expected: usize,
     },
+}
+
+/// A tagged equation follows one tagged with a later layer, so a layer's equations are not one run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "equation {equation} is tagged layer {layer} after an equation tagged layer {previous}: a \
+     layer's equations must not follow a later layer's"
+)]
+pub struct LayerOrderError {
+    /// The index of the equation that breaks the order.
+    pub equation: usize,
+    /// The layer it is tagged with.
+    pub layer: usize,
+    /// The latest layer an earlier equation is tagged with.
+    pub previous: usize,
+}
+
+/// An input declared at a type its slot role does not admit.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{role:?}{} is {actual}, but its role needs {expected}", tag.as_deref().map(|tag| format!(".{tag}")).unwrap_or_default())]
+pub struct SlotTypeError {
+    /// The slot role.
+    pub role: Slot,
+    /// The occurrence tag, if the input is a named occurrence of the role.
+    pub tag: Option<String>,
+    /// The type the role admits, in words.
+    pub expected: &'static str,
+    /// The type the input was declared with.
+    pub actual: TensorType,
 }
 
 /// Stable model-adapter key for one bounded validation witness.
@@ -923,6 +952,62 @@ impl SlotKey {
     pub fn role(&self) -> Slot {
         self.role
     }
+
+    /// Whether an input of this key may be declared at `aval`: the one rule the builder declares a slot by
+    /// and [`Graph::validate`] checks it against. A role names the dtype its binder fills (and, for the
+    /// position tuple, its leading axis), so a graph that declares another cannot be bound.
+    pub fn admits(&self, aval: &TensorType) -> Result<(), SlotTypeError> {
+        let tag = self.tag.as_deref();
+        let expected: Option<&'static str> = match self.role {
+            Slot::Token
+            | Slot::Pos
+            | Slot::SlotMap
+            | Slot::WriteMap
+            | Slot::LoraIdx
+            | Slot::ExpertPoolMap => (aval.dtype != DType::I32).then_some("an I32 tensor"),
+            Slot::MropePosition => {
+                (aval.dtype != DType::I32 || aval.shape.len() != 2 || aval.shape[0] != 3)
+                    .then_some("an I32 tensor of shape [3, N]")
+            }
+            // A standalone boundary: it carries whatever an earlier stage exported (a float activation, an
+            // I32 selector, the I8 carriers of a packed weight).
+            Slot::Activation => None,
+            Slot::TokenEmbed => {
+                (aval.dtype.class() != DTypeClass::Arithmetic).then_some("a float tensor")
+            }
+            Slot::ExpertPool => aval.shape.is_empty().then_some("a tensor with a pool axis"),
+            Slot::Sampler => match tag.map(sampler_dtype) {
+                Some(Some(dtype)) => (aval.dtype != dtype).then(|| {
+                    if dtype == DType::I32 {
+                        "an I32 tensor"
+                    } else {
+                        "an F32 tensor"
+                    }
+                }),
+                _ => Some("one of the sampler inputs by tag"),
+            },
+        };
+        match expected {
+            None => Ok(()),
+            Some(expected) => Err(SlotTypeError {
+                role: self.role,
+                tag: self.tag.clone(),
+                expected,
+                actual: aval.clone(),
+            }),
+        }
+    }
+}
+
+/// The dtype of the sampler input `tag` names: the fixed set a sampler suffix declares
+/// ([`crate::ops::sampling`]).
+fn sampler_dtype(tag: &str) -> Option<DType> {
+    use crate::ops::sampling::{HISTORY_READ_TAG, MASK_TAG, PENALTY_TAG};
+    match tag {
+        "seed" | "top_k" | HISTORY_READ_TAG => Some(DType::I32),
+        "params" | PENALTY_TAG | MASK_TAG => Some(DType::F32),
+        _ => None,
+    }
 }
 
 impl fmt::Display for SlotKey {
@@ -1064,6 +1149,27 @@ pub enum EditError {
         /// The `State` input that lost its pair.
         input: ValueId,
     },
+    /// [`GraphEdit::rebind_const_as_pool`] was asked to pool a value that is not a named `Const` input with a
+    /// leading axis.
+    #[error("value {value} cannot be pooled: {reason}")]
+    NotPoolable {
+        /// The value that was asked to be a pool.
+        value: ValueId,
+        /// What it lacks.
+        reason: &'static str,
+    },
+    /// [`GraphEdit::declare_slot`] was asked for a second input of one kind and tag, which a per-name binder
+    /// could not tell apart.
+    #[error("duplicate tag {tag:?} for slot {slot:?}")]
+    DuplicateSlotTag {
+        /// The slot kind.
+        slot: Slot,
+        /// The repeated tag.
+        tag: String,
+    },
+    /// [`GraphEdit::declare_slot`] was asked for an input at a type its role does not admit.
+    #[error(transparent)]
+    SlotType(#[from] SlotTypeError),
     /// A piece of a split claims a witness the split graph does not carry.
     #[error("witness {id:?} is not a witness of the split graph")]
     WitnessNotClaimable {
@@ -1239,6 +1345,30 @@ impl Graph {
             layers: runs.len(),
             runs,
         })
+    }
+
+    /// The layer tags never run backwards: reading the tagged equations in order, a tag is never below an
+    /// earlier one, so each layer's equations are one run of the tagged sequence. An untagged equation (one
+    /// a transform synthesized between two layers' equations) and a stage graph that starts at a later layer
+    /// are both valid; [`Graph::layer_runs`] is the stricter query a layer cut asks of a whole model graph.
+    fn check_layer_order(&self) -> Result<(), LayerOrderError> {
+        let mut previous: Option<usize> = None;
+        for (equation, eqn) in self.eqns.iter().enumerate() {
+            let Some(LayerIndex(layer)) = eqn.layer else {
+                continue;
+            };
+            if let Some(previous) = previous
+                && layer < previous
+            {
+                return Err(LayerOrderError {
+                    equation,
+                    layer,
+                    previous,
+                });
+            }
+            previous = Some(layer);
+        }
+        Ok(())
     }
 
     /// The abstract type of `id`. Panics when `id` is not a value of this graph.
@@ -1555,27 +1685,36 @@ impl GraphEdit {
     /// the key tagged with the const's own name, which is returned. The const's name is therefore
     /// still how the table is found in the weight map; only its role in the graph changes.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// When `value` is not a named `Const` input with a leading axis.
-    pub fn rebind_const_as_pool(&mut self, value: ValueId, rows: usize) -> SlotKey {
-        let meta = &mut self.draft.values[value];
-        assert_eq!(
-            meta.storage,
-            Storage::Const,
-            "rebind_const_as_pool: {value} is not a const"
-        );
+    /// [`EditError::NotPoolable`] when `value` is not a named `Const` input with a leading axis.
+    pub fn rebind_const_as_pool(
+        &mut self,
+        value: ValueId,
+        rows: usize,
+    ) -> Result<SlotKey, EditError> {
+        let not_poolable = |reason| EditError::NotPoolable { value, reason };
+        let meta = self
+            .draft
+            .values
+            .get_mut(value)
+            .ok_or_else(|| not_poolable("it is not a value of the graph"))?;
+        if meta.storage != Storage::Const {
+            return Err(not_poolable("it is not a const"));
+        }
         let tag = meta
             .name
             .clone()
-            .expect("rebind_const_as_pool: a const input carries its name");
-        let leading = meta
-            .aval
+            .ok_or_else(|| not_poolable("a const input carries its name"))?;
+        let mut pooled = meta.aval.clone();
+        let leading = pooled
             .shape
             .first_mut()
-            .expect("rebind_const_as_pool: a pooled table has a leading expert axis");
+            .ok_or_else(|| not_poolable("a pooled table has a leading expert axis"))?;
         *leading = rows;
         let key = SlotKey::new(Slot::ExpertPool, Some(&tag));
+        key.admits(&pooled)?;
+        meta.aval = pooled;
         meta.storage = Storage::Slot(Slot::ExpertPool);
         meta.name = Some(key.to_string());
         meta.key = Some(key.clone());
@@ -1583,27 +1722,37 @@ impl GraphEdit {
         meta.weight = None;
         self.draft.consts.retain(|&c| c != value);
         self.draft.slots.push((value, Slot::ExpertPool));
-        key
+        Ok(key)
     }
 
     /// Declare a new keyed `slot` input of type `aval`, tagged `tag` like
     /// [`crate::builder::Builder::slot_named`], and return its value. For a transform that rewrites a
     /// finished graph and so has no builder: the key is built here, from typed data.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// When a slot of this kind and tag is already declared.
-    pub fn declare_slot(&mut self, slot: Slot, tag: &str, aval: TensorType) -> ValueId {
+    /// [`EditError::DuplicateSlotTag`] when a slot of this kind and tag is already declared, and
+    /// [`EditError::SlotType`] when `aval` is not a type the slot's role admits.
+    pub fn declare_slot(
+        &mut self,
+        slot: Slot,
+        tag: &str,
+        aval: TensorType,
+    ) -> Result<ValueId, EditError> {
         let key = SlotKey::new(slot, Some(tag));
+        key.admits(&aval)?;
         let name = key.to_string();
-        assert!(
-            !self
-                .draft
-                .values
-                .iter()
-                .any(|v| v.storage == Storage::Slot(slot) && v.name.as_deref() == Some(&name)),
-            "declare_slot: duplicate tag {tag:?} for slot {slot:?}"
-        );
+        if self
+            .draft
+            .values
+            .iter()
+            .any(|v| v.storage == Storage::Slot(slot) && v.name.as_deref() == Some(&name))
+        {
+            return Err(EditError::DuplicateSlotTag {
+                slot,
+                tag: tag.to_string(),
+            });
+        }
         let id = self.draft.values.push(ValueMeta {
             aval,
             storage: Storage::Slot(slot),
@@ -1615,7 +1764,7 @@ impl GraphEdit {
         });
         self.draft.inputs.push(id);
         self.draft.slots.push((id, slot));
-        id
+        Ok(id)
     }
 
     /// Check the whole draft and return it as a [`Graph`].
@@ -1883,6 +2032,28 @@ impl Graph {
             slot_bindings[id] = true;
         }
 
+        // A declared type is the type of what binds it: a computed constant materializes its payload, and a
+        // slot is filled by the binder its role names.
+        for (id, meta) in self.values.iter_enumerated() {
+            match (meta.storage, meta.slot_key()) {
+                (Storage::Computed(computed), _) => {
+                    let materialized = TensorType::new(computed.shape(), computed.dtype());
+                    if meta.aval != materialized {
+                        return Err(GraphValidationError::ComputedTypeMismatch {
+                            value: id,
+                            declared: meta.aval.clone(),
+                            computed: materialized,
+                        });
+                    }
+                }
+                (Storage::Slot(_), Some(key)) => {
+                    key.admits(&meta.aval)
+                        .map_err(|source| GraphValidationError::SlotType { value: id, source })?;
+                }
+                _ => {}
+            }
+        }
+
         for &id in &self.inputs {
             match self.values[id].storage {
                 Storage::Const | Storage::Computed(_) | Storage::State if !const_bindings[id] => {
@@ -2034,17 +2205,6 @@ impl Graph {
                     Operand::Lit(s) => in_types.push(s.ty()),
                 }
             }
-            if let [Operand::Value(a), Operand::Value(b)] = eqn.inputs.as_slice()
-                && matches!(eqn.op, crate::op::OpKind::Binary(_))
-                && crate::op::check_binary_value_dtypes(&in_types[0], &in_types[1]).is_err()
-            {
-                return Err(GraphValidationError::BinaryValueDtypeMismatch {
-                    equation: i,
-                    operation: eqn.op.name(),
-                    left: self.values[*a].aval.dtype,
-                    right: self.values[*b].aval.dtype,
-                });
-            }
             if defined[eqn.out] {
                 return Err(GraphValidationError::EquationOutputRedefined {
                     equation: i,
@@ -2052,13 +2212,15 @@ impl Graph {
                     value: eqn.out,
                 });
             }
-            let inferred = eqn.op.infer(&in_types).map_err(|source| {
-                GraphValidationError::EquationInference {
+            let is_literal = |index: usize| matches!(eqn.inputs.get(index), Some(Operand::Lit(_)));
+            let inferred = eqn
+                .op
+                .infer(Operands::new(&in_types, &is_literal))
+                .map_err(|source| GraphValidationError::EquationInference {
                     equation: i,
                     operation: eqn.op.name(),
                     source,
-                }
-            })?;
+                })?;
             let stored = &self.values[eqn.out].aval;
             if inferred != *stored && !is_matmul_f32_accumulate_widening(&eqn.op, &inferred, stored)
             {
@@ -2071,6 +2233,7 @@ impl Graph {
             }
             defined[eqn.out] = true;
         }
+        self.check_layer_order()?;
         Ok(())
     }
 }
@@ -2270,6 +2433,7 @@ mod tests {
     use crate::builder::Builder;
     use crate::op::{BinOp, OpKind};
     use crate::types::{Scalar, TensorType};
+    use crate::{BuilderError, ComputedConst, LayerIndex, LayerOrderError, SlotKey};
     use crate::{
         EditError, GraphEdit, GraphValidationError, Operand, Slot, StateRole, Storage,
         ValidationId, ValidationPacketError, ValidationPacketLayout, ValueId, ValueMeta,
@@ -2948,7 +3112,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_a_weight_reference_on_a_value_that_is_not_a_constant() {
-        use poot_quant::weights::{WeightId, WeightRole};
+        use poot_weights::{WeightId, WeightRole};
 
         let b = Builder::for_tests();
         let w = b
@@ -2969,6 +3133,239 @@ mod tests {
                 storage: Storage::Device,
             })
         );
+    }
+
+    /// SC-002: a computed constant is the tensor its payload materializes into, so a declared type that
+    /// disagrees (a shape a pass retyped, a dtype another consumer reads) is refused rather than bound.
+    ///
+    /// Mutation: delete the `Storage::Computed` arm of the type check in `Graph::check`; both rows validate.
+    #[test]
+    fn validate_rejects_a_computed_constant_whose_payload_disagrees_with_its_type() {
+        for (retyped, computed) in [
+            (TensorType::f32(vec![5]), TensorType::f32(vec![4])),
+            (
+                TensorType::new(vec![4], DType::I32),
+                TensorType::f32(vec![4]),
+            ),
+        ] {
+            let b = Builder::for_tests();
+            let iota = b
+                .computed(ComputedConst::Iota {
+                    len: 4,
+                    dtype: DType::F32,
+                })
+                .unwrap();
+            // The constant is the result, so no equation re-infers its retyped value: only the payload
+            // check can see the disagreement.
+            let mut graph = b.finish(iota).unwrap().into_draft();
+            graph.values_mut()[iota.id()].aval = retyped.clone();
+            assert_eq!(
+                crate::test_support::verdict(&graph),
+                Err(GraphValidationError::ComputedTypeMismatch {
+                    value: iota.id(),
+                    declared: retyped,
+                    computed,
+                })
+            );
+        }
+    }
+
+    /// A slot input is filled by the binder its role names, so a role declared at a type it cannot bind is
+    /// refused at declaration and again by `validate`, through the one rule [`SlotKey::admits`].
+    ///
+    /// Mutation: make `SlotKey::admits` return `Ok(())` for `Slot::WriteMap`; the writemap rows go red.
+    #[test]
+    fn a_slot_role_declared_at_a_type_it_cannot_bind_is_refused_by_the_builder_and_validate() {
+        let i32s = |shape: &[usize]| TensorType::new(shape.to_vec(), DType::I32);
+        let rows: [(Slot, Option<&str>, TensorType, TensorType); 7] = [
+            (Slot::Token, None, i32s(&[4]), TensorType::f32(vec![4])),
+            (Slot::MropePosition, None, i32s(&[3, 4]), i32s(&[2, 4])),
+            (
+                Slot::SlotMap,
+                Some("read"),
+                i32s(&[2, 8]),
+                TensorType::f32(vec![2, 8]),
+            ),
+            (
+                Slot::WriteMap,
+                Some("write"),
+                i32s(&[8]),
+                TensorType::f32(vec![8]),
+            ),
+            (Slot::LoraIdx, None, i32s(&[2]), TensorType::f32(vec![2])),
+            (
+                Slot::Sampler,
+                Some("seed"),
+                i32s(&[2]),
+                TensorType::f32(vec![2]),
+            ),
+            (
+                Slot::Sampler,
+                Some("params"),
+                TensorType::f32(vec![2, 3]),
+                i32s(&[2, 3]),
+            ),
+        ];
+        for (slot, tag, good, bad) in rows {
+            let declare = |b: &Builder, aval: TensorType| match tag {
+                Some(tag) => b.slot_named(slot, tag, aval),
+                None => b.slot(slot, aval),
+            };
+            // The builder refuses the type at declaration.
+            let b = Builder::for_tests();
+            assert!(
+                matches!(declare(&b, bad.clone()), Err(BuilderError::SlotType(_))),
+                "{slot:?} {tag:?}: {bad}"
+            );
+            // A graph retyped after the fact is refused by `validate`.
+            let b = Builder::for_tests();
+            let input = declare(&b, good).unwrap();
+            let out = b
+                .unary(crate::op::UnOp::Neg, b.cast(input, DType::F32).unwrap())
+                .unwrap();
+            let mut graph = b.finish(out).unwrap().into_draft();
+            graph.values_mut()[input.id()].aval = bad.clone();
+            let verdict = crate::test_support::verdict(&graph);
+            assert!(
+                matches!(
+                    &verdict,
+                    Err(GraphValidationError::SlotType { value, source })
+                        if *value == input.id() && source.actual == bad
+                ),
+                "{slot:?} {tag:?}: {verdict:?}"
+            );
+        }
+    }
+
+    /// A sampler input is told apart by tag: an unknown tag is refused as "not a sampler input" at any dtype,
+    /// which is a different refusal from a known tag at the wrong dtype.
+    ///
+    /// Mutation: make the unknown-tag arm of `SlotKey::admits` accept (`None`); the unknown-tag rows go red.
+    #[test]
+    fn an_unknown_sampler_tag_is_refused_apart_from_a_wrong_dtype() {
+        let unknown = SlotKey::new(Slot::Sampler, Some("bogus"));
+        let wrong_dtype = SlotKey::new(Slot::Sampler, Some("seed"));
+        let untagged = SlotKey::new(Slot::Sampler, None);
+        for aval in [
+            TensorType::f32(vec![2]),
+            TensorType::new(vec![2], DType::I32),
+        ] {
+            for key in [&unknown, &untagged] {
+                let error = key.admits(&aval).expect_err("not a sampler input");
+                assert_eq!(
+                    error.expected, "one of the sampler inputs by tag",
+                    "{key} {aval}"
+                );
+                assert_eq!(error.actual, aval);
+            }
+        }
+        let error = wrong_dtype
+            .admits(&TensorType::f32(vec![2]))
+            .expect_err("seed is I32");
+        assert_eq!(error.expected, "an I32 tensor");
+        assert_eq!(error.tag.as_deref(), Some("seed"));
+        assert!(
+            wrong_dtype
+                .admits(&TensorType::new(vec![2], DType::I32))
+                .is_ok()
+        );
+        let b = Builder::for_tests();
+        assert!(matches!(
+            b.slot_named(Slot::Sampler, "bogus", TensorType::f32(vec![2])),
+            Err(BuilderError::SlotType(e)) if e.expected == "one of the sampler inputs by tag"
+        ));
+    }
+
+    /// The edits a pass makes to a finished graph's inputs return typed errors rather than panicking: pooling
+    /// a value that is no named const with a leading axis, declaring a slot twice, and declaring a slot at a
+    /// type its role cannot bind.
+    ///
+    /// Mutation: turn the `ok_or_else` after `first_mut` in `rebind_const_as_pool` into an `expect`; the scalar
+    /// row panics instead of returning `NotPoolable`.
+    #[test]
+    fn graph_edits_of_inputs_return_typed_errors() {
+        let b = Builder::for_tests();
+        let table = b.constant("table", TensorType::f32(vec![4, 2])).unwrap();
+        let out = b.binary(BinOp::Mul, table, table).unwrap();
+        let g = b.finish(out).unwrap();
+
+        let mut edit = g.edit();
+        assert_eq!(
+            edit.rebind_const_as_pool(out.id(), 2),
+            Err(EditError::NotPoolable {
+                value: out.id(),
+                reason: "it is not a const",
+            })
+        );
+        let g_scalar = {
+            let b = Builder::for_tests();
+            let scalar = b
+                .constant("scalar", TensorType::scalar(DType::F32))
+                .unwrap();
+            (b.finish(scalar).unwrap(), scalar.id())
+        };
+        let mut edit_scalar = g_scalar.0.edit();
+        assert_eq!(
+            edit_scalar.rebind_const_as_pool(g_scalar.1, 2),
+            Err(EditError::NotPoolable {
+                value: g_scalar.1,
+                reason: "a pooled table has a leading expert axis",
+            })
+        );
+
+        let pool = edit.rebind_const_as_pool(table.id(), 2).unwrap();
+        assert_eq!(pool.role(), Slot::ExpertPool);
+        let map = TensorType::new(vec![4], DType::I32);
+        edit.declare_slot(Slot::ExpertPoolMap, "site.0", map.clone())
+            .unwrap();
+        assert_eq!(
+            edit.declare_slot(Slot::ExpertPoolMap, "site.0", map),
+            Err(EditError::DuplicateSlotTag {
+                slot: Slot::ExpertPoolMap,
+                tag: "site.0".into(),
+            })
+        );
+        assert!(matches!(
+            edit.declare_slot(Slot::ExpertPoolMap, "site.1", TensorType::f32(vec![4])),
+            Err(EditError::SlotType(_))
+        ));
+    }
+
+    /// A layer's equations never follow a later layer's: tags that run backwards are a defect of the graph
+    /// itself, caught by `validate`, not only by a later `layer_runs` query.
+    ///
+    /// Mutation: ignore the result of the `check_layer_order` call at the end of `Graph::check`; the row validates.
+    #[test]
+    fn validate_rejects_layer_tags_that_are_not_one_run_per_layer_in_order() {
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![2])).unwrap();
+        let first = {
+            let _layer = b.layer_scope(0);
+            b.unary(crate::op::UnOp::Neg, x).unwrap()
+        };
+        let second = {
+            let _layer = b.layer_scope(1);
+            b.unary(crate::op::UnOp::Neg, first).unwrap()
+        };
+        let mut graph = b.finish(second).unwrap().into_draft();
+        crate::test_support::verdict(&graph).expect("layers 0 then 1 are in order");
+        // Layer 1 first, then layer 0: layer 0's equation follows a later layer's.
+        graph.eqns_mut()[0].layer = Some(LayerIndex(1));
+        graph.eqns_mut()[1].layer = Some(LayerIndex(0));
+        assert_eq!(
+            crate::test_support::verdict(&graph),
+            Err(GraphValidationError::LayerOrder(LayerOrderError {
+                equation: 1,
+                layer: 0,
+                previous: 1,
+            }))
+        );
+        // A stage graph that starts at a later layer, or holds an untagged equation between two layers'
+        // equations, is valid.
+        graph.eqns_mut()[0].layer = Some(LayerIndex(3));
+        graph.eqns_mut()[1].layer = None;
+        crate::test_support::verdict(&graph)
+            .expect("a later first layer and an untagged equation are valid");
     }
 
     #[test]
@@ -3120,18 +3517,20 @@ mod tests {
 
         assert_eq!(
             crate::test_support::verdict(&g),
-            Err(GraphValidationError::BinaryValueDtypeMismatch {
+            Err(GraphValidationError::EquationInference {
                 equation: 0,
                 operation: "add".into(),
-                left: DType::F32,
-                right: DType::I32,
+                source: crate::error::ShapeError::Dtype {
+                    a: TensorType::scalar(DType::F32),
+                    b: TensorType::scalar(DType::I32),
+                },
             })
         );
     }
 
     /// Card 529 (R466-011, SC-001): `infer` rejects `Add` on a packed (I8) or storage-only (E4M3FN)
     /// operand pair, so `Graph::validate` (which calls `infer` on every eqn) does too. Both operands
-    /// share a dtype here, so `BinaryValueDtypeMismatch`'s equality check never fires; this is `infer`'s
+    /// share a dtype here, so the binary dtype-agreement rule never fires; this is `infer`'s
     /// own arithmetic-class rejection at work. The baseline (before Card 529) accepted this graph.
     #[test]
     fn validate_rejects_arithmetic_on_a_packed_or_storage_only_dtype() {
@@ -3225,10 +3624,18 @@ mod tests {
     fn input_key_distinguishes_same_role_tagged_slots() {
         let b = Builder::for_tests();
         let layer0 = b
-            .slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]))
+            .slot_named(
+                Slot::ExpertPoolMap,
+                "layer_0",
+                TensorType::new(vec![4], DType::I32),
+            )
             .unwrap();
         let layer1 = b
-            .slot_named(Slot::ExpertPoolMap, "layer_1", TensorType::f32(vec![4]))
+            .slot_named(
+                Slot::ExpertPoolMap,
+                "layer_1",
+                TensorType::new(vec![4], DType::I32),
+            )
             .unwrap();
         let out = b.binary(BinOp::Add, layer0, layer0).unwrap();
         let g = b.finish(out).unwrap();
@@ -3258,7 +3665,11 @@ mod tests {
     fn input_key_reads_the_stored_key_never_the_name_string() {
         let b = Builder::for_tests();
         let layer0 = b
-            .slot_named(Slot::ExpertPoolMap, "layer_0", TensorType::f32(vec![4]))
+            .slot_named(
+                Slot::ExpertPoolMap,
+                "layer_0",
+                TensorType::new(vec![4], DType::I32),
+            )
             .unwrap();
         let mut g = b.finish(layer0).unwrap().into_draft();
         let original = g.input_key(layer0.id()).expect("declared slot input");

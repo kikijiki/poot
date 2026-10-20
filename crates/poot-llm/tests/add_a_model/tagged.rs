@@ -26,11 +26,10 @@ use poot_models::model::{
     FamilyKey, Model, ModelConfig, ModelError, ModelOutput, StepSpec, TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig};
-use poot_quant::weights::{
-    DenseWeight, WeightEntry, WeightId, WeightKey, WeightMap, WeightRole, WeightStore, WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_tensor::DType;
 use poot_text::{ChatFormat, HermesToolCodec};
+use poot_weights::{WeightId, WeightMap, WeightRole, WeightView};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("poot_fixture_tagged");
 

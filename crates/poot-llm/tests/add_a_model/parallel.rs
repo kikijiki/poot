@@ -26,12 +26,10 @@ use poot_models::components::standard_family::{
 };
 use poot_models::model::{ConfigReason, FamilyKey, ModelError};
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, RawConfig};
-use poot_quant::weights::{
-    AttnRole, DenseWeight, FfnRole, NormRole, WeightEntry, WeightId, WeightKey, WeightMap,
-    WeightRole, WeightStore, WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_tensor::DType;
 use poot_text::ChatFormat;
+use poot_weights::{AttnRole, FfnRole, NormRole, WeightId, WeightMap, WeightRole, WeightView};
 
 pub(crate) const FAMILY: FamilyKey = FamilyKey::new("poot_fixture_neox_parallel");
 

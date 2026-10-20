@@ -75,7 +75,7 @@ fn alibi_slopes_attention_matches_the_oracle_and_the_reference_on_wgpu() {
 /// `4` and `33` (the tiled GEMM), compiled for wgpu: the program
 /// holds one `DenseContraction` and no `Transpose`, and every replayed step matches `eval(g)` of the traced graph
 /// within the parity tolerance (ADR-0101 tier 2). The weight lives on the device as packed binary16 words.
-/// Mutation: remove `DType::F16` from `DENSE_CONTRACTION_WEIGHT_DTYPES`; a `Transpose` is planned and this row goes
+/// Mutation: make `fold_dense_contractions` skip an F16 weight; a `Transpose` is planned and this row goes
 /// red.
 #[test]
 fn f16_checkpoint_orientation_projection_matches_the_oracle_on_wgpu() {

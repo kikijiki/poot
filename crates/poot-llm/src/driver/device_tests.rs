@@ -1798,8 +1798,9 @@ fn a_finetune_like_qwen35_checkpoint_loads_through_model_handle_load() {
 #[test]
 fn a_block_fp8_qwen35_checkpoint_loads_packed_through_model_handle_load() {
     use poot_quant::format::{ScaleEncoding, WeightFormat};
-    use poot_quant::weights::{HandleFormat, WeightEntry};
+    use poot_quant::weights::WeightEntry;
     use poot_quant::{OperandRole, SourceRole};
+    use poot_weights::HandleFormat;
     let registry = Registry::builtin().unwrap();
     let entry = registry
         .entries()
@@ -2217,7 +2218,7 @@ fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice)
             .weights()
             .iter()
             .find(|(_, view, _)| {
-                matches!(view, poot_quant::weights::WeightView::Stored(key) if key.as_str() == name)
+                matches!(view, poot_weights::WeightView::Stored(key) if key.as_str() == name)
             })
             .map(|(_, _, handle)| handle.format)
             .unwrap_or_else(|| panic!("{name} is not mapped"))
@@ -2236,7 +2237,7 @@ fn packed_checkpoints_load_as_stored_through_the_registry(choice: BackendChoice)
             tensor.name
         );
         match handle_of(&tensor.name) {
-            poot_quant::weights::HandleFormat::Packed(weight) => assert!(
+            poot_weights::HandleFormat::Packed(weight) => assert!(
                 matches!(weight.format(), WeightFormat::E4m3PerChannel { .. }),
                 "{}: {:?}",
                 tensor.name,
@@ -3361,14 +3362,14 @@ mod checkpoint {
         let handle = load(&path);
         let mut packed = 0;
         for (_, view, mapped) in handle.model().weights().iter() {
-            let poot_quant::weights::WeightView::Stored(key) = view else {
+            let poot_weights::WeightView::Stored(key) = view else {
                 continue;
             };
             if !key.as_str().ends_with("_proj.weight") {
                 continue;
             }
             match mapped.format {
-                poot_quant::weights::HandleFormat::Packed(weight) => assert!(
+                poot_weights::HandleFormat::Packed(weight) => assert!(
                     matches!(
                         weight.format(),
                         poot_quant::format::WeightFormat::Gptq { .. }
@@ -6178,7 +6179,7 @@ fn resident_weights<S: State>(driver: &Driver<S>) -> (u64, u64) {
 /// every BF16 owner as F32 in the body (`Weight::declare` casts a dense BF16 const to F32 when it
 /// declares it); the resident bytes pass the stored bytes and the row goes red.
 fn qwen4exp_bf16_owners_are_not_widened_per_step(choice: BackendChoice) {
-    use poot_quant::weights::HandleFormat;
+    use poot_weights::HandleFormat;
     let handle = qwen4exp_handle();
     let stored: u64 = handle
         .model()
@@ -6348,7 +6349,8 @@ per_backend!(
 // ---------------------------------------------------------------------------------------------
 
 use poot_load::lora::{LoraAdapter, LoraAdapterConfig, LoraWeight};
-use poot_quant::weights::{LoraTarget, WeightKey, WeightView};
+use poot_quant::weights::WeightKey;
+use poot_weights::{LoraTarget, WeightView};
 
 const LORA_RANK: usize = 2;
 
@@ -6377,9 +6379,35 @@ fn lora_fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// `values` stored as `dtype` (F32, or BF16 rounded to nearest-even) and the same values read back, so a
+/// merged reference sees exactly what the adapter file holds.
+fn lora_factor(
+    dtype: poot_tensor::DType,
+    shape: Vec<usize>,
+    values: &[f32],
+) -> poot_quant::weights::DenseWeight {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|v| match dtype {
+            poot_tensor::DType::BF16 => {
+                let bits = v.to_bits();
+                let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1)) >> 16;
+                (rounded as u16).to_le_bytes().to_vec()
+            }
+            _ => v.to_le_bytes().to_vec(),
+        })
+        .collect();
+    poot_quant::weights::DenseWeight::try_new(dtype, shape, bytes.into()).unwrap()
+}
+
 /// An adapter over every targetable projection of every layer of `handle`'s model, `alpha / rank`
-/// scaled, deterministic from `seed`.
-fn fixture_adapter(handle: &ModelHandle, seed: u64, alpha: f32) -> LoraAdapter {
+/// scaled, deterministic from `seed`, its factors stored as `dtype`.
+fn fixture_adapter(
+    handle: &ModelHandle,
+    seed: u64,
+    alpha: f32,
+    dtype: poot_tensor::DType,
+) -> LoraAdapter {
     let mut weights = HashMap::new();
     for (id, _, shape) in handle.model().weights().iter() {
         let (Some(layer), Some(target)) = (id.layer, LoraTarget::of(id.role)) else {
@@ -6392,10 +6420,15 @@ fn fixture_adapter(handle: &ModelHandle, seed: u64, alpha: f32) -> LoraAdapter {
         weights.insert(
             lora_module(layer, target),
             LoraWeight {
-                a: HostTensor::f32(vec![in_dim, LORA_RANK], lora_fill(in_dim * LORA_RANK, s)),
-                b: HostTensor::f32(
-                    vec![LORA_RANK, out_dim],
-                    lora_fill(LORA_RANK * out_dim, s + 1000),
+                a: lora_factor(
+                    dtype,
+                    vec![LORA_RANK, in_dim],
+                    &lora_fill(in_dim * LORA_RANK, s),
+                ),
+                b: lora_factor(
+                    dtype,
+                    vec![out_dim, LORA_RANK],
+                    &lora_fill(LORA_RANK * out_dim, s + 1000),
                 ),
             },
         );
@@ -6445,12 +6478,31 @@ fn merged_store(handle: &ModelHandle, adapter: &LoraAdapter) -> WeightStore {
             other => panic!("the fixture is F32 or BF16, not {other:?}"),
         };
         let weight = &adapter.weights[&lora_module(layer, target)];
-        let (a, b) = (weight.a.as_f32().unwrap(), weight.b.as_f32().unwrap());
+        let f32s = |factor: &DenseWeight| -> Vec<f32> {
+            let bytes = factor.bytes().as_slice();
+            match factor.dtype() {
+                poot_tensor::DType::F32 => bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&word| f32::from_le_bytes(word))
+                    .collect(),
+                poot_tensor::DType::BF16 => bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&pair| f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16))
+                    .collect(),
+                other => panic!("the fixture adapter is F32 or BF16, not {other:?}"),
+            }
+        };
+        // `A [r, in]`, `B [out, r]`: the adapter file's own layout.
+        let (a, b) = (f32s(&weight.a), f32s(&weight.b));
         let (out_dim, in_dim) = (shape[0], shape[1]);
         for o in 0..out_dim {
             for i in 0..in_dim {
                 let delta: f32 = (0..LORA_RANK)
-                    .map(|k| a[i * LORA_RANK + k] * b[k * out_dim + o])
+                    .map(|k| a[k * in_dim + i] * b[o * LORA_RANK + k])
                     .sum();
                 w[o * in_dim + i] += scale * delta;
             }
@@ -6580,11 +6632,19 @@ fn assert_traced_matches(label: &str, got: &Traced, want: &Traced) {
 /// allocations stay the base's plus the live generations'). Mutation: serve B from A's executable (the
 /// adapter bytes resident under the logical name alone); B's run equals A's reference, not its own.
 /// Mutation: unload A's executable before the in-use check; A's remaining steps fail.
-fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
+///
+/// `dtype` is the dtype the adapters are stored in (POOT-1258 SC-001): a BF16 adapter is uploaded as BF16,
+/// its stack bytes are half the F32 stack's (the byte-accounting rows below), and the run still equals the
+/// merged-weight reference. Mutation: build the stack as F32 whatever the adapters stored; the BF16 row's
+/// byte accounting is off by a factor of two.
+fn adapter_generation_replacement_is_isolated_and_freed(
+    choice: BackendChoice,
+    dtype: poot_tensor::DType,
+) {
     let handle = family_handle("qwen2", NO_EOS);
     let (adapter_a, adapter_b) = (
-        fixture_adapter(&handle, 11, 4.0),
-        fixture_adapter(&handle, 77, 6.0),
+        fixture_adapter(&handle, 11, 4.0, dtype),
+        fixture_adapter(&handle, 77, 6.0, dtype),
     );
     let prompt: Vec<u32> = PROMPT.to_vec();
     let max_new = 6;
@@ -6675,7 +6735,8 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
     assert!(base_bytes > 0, "the base entries uploaded their weights");
 
     // A tensor's worth of stack: per adapted projection `(adapters + 1)` entries of `A [in, r]` and
-    // `B [r, out]` in F32, plus the model-level scale.
+    // `B [r, out]` in the adapters' dtype, plus the model-level F32 scale.
+    let factor_bytes = dtype.byte_size() as u64;
     let stack_bytes = |adapters: usize| -> u64 {
         let mut bytes = 4 * (adapters as u64 + 1);
         for (id, _, shape) in handle.model().weights().iter() {
@@ -6683,8 +6744,9 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
                 let &[out_dim, in_dim] = shape.shape.as_slice() else {
                     continue;
                 };
-                bytes +=
-                    4 * (adapters as u64 + 1) * (in_dim * LORA_RANK + LORA_RANK * out_dim) as u64;
+                bytes += factor_bytes
+                    * (adapters as u64 + 1)
+                    * (in_dim * LORA_RANK + LORA_RANK * out_dim) as u64;
             }
         }
         bytes
@@ -6837,10 +6899,17 @@ fn adapter_generation_replacement_is_isolated_and_freed(choice: BackendChoice) {
 }
 per_backend!(
     BackendChoice,
-    adapter_generation_replacement_is_isolated_and_freed,
+    |choice| adapter_generation_replacement_is_isolated_and_freed(choice, poot_tensor::DType::F32),
     adapter_generation_replacement_is_isolated_and_freed_wgpu,
     adapter_generation_replacement_is_isolated_and_freed_rocm,
     adapter_generation_replacement_is_isolated_and_freed_ptx
+);
+per_backend!(
+    BackendChoice,
+    |choice| adapter_generation_replacement_is_isolated_and_freed(choice, poot_tensor::DType::BF16),
+    bf16_adapter_generation_replacement_is_isolated_and_freed_wgpu,
+    bf16_adapter_generation_replacement_is_isolated_and_freed_rocm,
+    bf16_adapter_generation_replacement_is_isolated_and_freed_ptx
 );
 
 /// The Qwen2.5-VL fixture's 48-word vocabulary: the vision markers and the tokens around them.

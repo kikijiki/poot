@@ -172,7 +172,6 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         // lane; contractions, attention, quantization, and fused regions may reassociate or contract.
         OpKind::Unary(_)
         | OpKind::Gather { .. }
-        | OpKind::Scatter { .. }
         | OpKind::ScatterUpdate
         | OpKind::MatMul
         | OpKind::PackedDequant { .. }
@@ -185,8 +184,6 @@ fn witness_op(op: &OpKind) -> WitnessOp {
         | OpKind::ArgTopK { .. }
         | OpKind::IndexedMatMul
         | OpKind::DynamicUpdateSlice { .. }
-        | OpKind::PackI8
-        | OpKind::UnpackI8 { .. }
         | OpKind::Fused(_)
         | OpKind::FusedRow(_)
         | OpKind::Attention(_)
@@ -466,6 +463,11 @@ pub enum ResourceRefusal {
         /// The device's limit on invocations per workgroup.
         limit: u32,
     },
+    /// The body computes in 64-bit floats and the device was not opened with that shader feature.
+    #[error(
+        "the body computes in 64-bit floats; the device was not opened with the float64 shader feature"
+    )]
+    Float64Unavailable,
     /// The body's static workgroup memory exceeds what the device offers.
     #[error(
         "the body declares {needed} bytes of static workgroup memory; the device offers {available}"
@@ -496,6 +498,9 @@ pub(crate) fn validate_kernel_resources(
         .map(|&extent| u64::from(extent))
         .product();
 
+    if used.uses_float64 && !caps.shader_features.float64 {
+        return Err(ResourceRefusal::Float64Unavailable);
+    }
     for &fragment in &used.fragments {
         if declared.subgroup_lanes.is_none() {
             return Err(ResourceRefusal::FragmentWithoutSubgroup { fragment });

@@ -49,6 +49,7 @@ poot-llm	driver::device_tests::adapter_generation_replacement_is_isolated_and_fr
 poot-llm	driver::device_tests::an_unsupported_request_is_the_same_variant_for_two_families_wgpu
 poot-llm	driver::device_tests::attached_device_limit_refuses_an_oversized_constant_wgpu
 poot-llm	driver::device_tests::bert_encode_matches_the_oracle_whatever_the_padding_wgpu
+poot-llm	driver::device_tests::bf16_adapter_generation_replacement_is_isolated_and_freed_wgpu
 poot-llm	driver::device_tests::capacity_does_not_change_the_tokens_wgpu
 poot-llm	driver::device_tests::chained_decode_steps_equal_stepwise_decode_wgpu
 poot-llm	driver::device_tests::chunked_prefill_equals_token_by_token_wgpu
@@ -312,6 +313,7 @@ poot-wgpu-device::cross_backend	sample_token_topp_nucleus_matches_cpu_cross_back
 poot-wgpu-device::cross_backend	unary_tanh_erf_cross_backend
 poot-wgpu-device::device_timing	counters_only_wgpu_device_reports_unknown_device_time
 poot-wgpu-device::device_timing	timed_wgpu_device_reads_a_nonzero_device_time_for_a_known_kernel
+poot-wgpu-device::flush_policy	a_stage_is_one_submit_without_a_watchdog_budget_and_cut_with_one
 poot-wgpu-device::graph	dense_gemv::a_contraction_keeps_its_lds_width_through_the_planner_on_wgpu
 poot-wgpu-device::graph	dense_gemv::the_dense_gemv_meets_tier_2_in_every_lane_and_launch_on_wgpu
 poot-wgpu-device::graph	epilogue::a_dense_bf16_weight_epilogue_matches_the_oracle_on_wgpu

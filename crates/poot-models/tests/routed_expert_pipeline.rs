@@ -34,7 +34,7 @@ fn granitemoe_step_and_weights(
     tokens: usize,
 ) -> (
     poot_graph_ir::Graph,
-    poot_quant::weights::WeightMap,
+    poot_weights::WeightMap,
     poot_quant::weights::WeightStore,
 ) {
     registered_step_and_weights("granite", Some("granitemoe"), tokens)
@@ -48,7 +48,7 @@ fn registered_step_and_weights(
     tokens: usize,
 ) -> (
     poot_graph_ir::Graph,
-    poot_quant::weights::WeightMap,
+    poot_weights::WeightMap,
     poot_quant::weights::WeightStore,
 ) {
     use poot_models::model::StepShape;
@@ -80,7 +80,7 @@ fn registered_step_and_weights(
 /// positions `0..` with zeroed caches.
 fn oracle_logits(
     g: &poot_graph_ir::Graph,
-    map: &poot_quant::weights::WeightMap,
+    map: &poot_weights::WeightMap,
     store: &poot_quant::weights::WeightStore,
     tokens: &[i32],
 ) -> Vec<f32> {

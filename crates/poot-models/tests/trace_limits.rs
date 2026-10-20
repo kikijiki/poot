@@ -24,11 +24,10 @@ use poot_models::model::{
     TraceError,
 };
 use poot_models::registry::{ConfigSource, FamilyEntry, Fixture, ModelParts, RawConfig, Registry};
-use poot_quant::weights::{
-    DenseWeight, FfnRole, WeightEntry, WeightId, WeightMap, WeightRole, WeightStore, WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_tensor::DType;
 use poot_text::{ChatFormat, HermesToolCodec};
+use poot_weights::{FfnRole, WeightId, WeightMap, WeightRole, WeightView};
 
 thread_local! {
     /// How many times a scripted tracer body ran on this thread.

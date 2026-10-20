@@ -311,8 +311,8 @@ fn adapters(seed: u32) -> Vec<poot_load::lora::LoraAdapter> {
                 weights: std::collections::HashMap::from([(
                     "model.layers.0.self_attn.q_proj".to_string(),
                     poot_load::lora::LoraWeight {
-                        a: poot_tensor::HostTensor::f32(vec![4, 2], fill(8, 1)),
-                        b: poot_tensor::HostTensor::f32(vec![2, 12], fill(24, 2)),
+                        a: crate::driver::lora::test_only::f32_factor(vec![2, 4], &fill(8, 1)),
+                        b: crate::driver::lora::test_only::f32_factor(vec![12, 2], &fill(24, 2)),
                     },
                 )]),
             }

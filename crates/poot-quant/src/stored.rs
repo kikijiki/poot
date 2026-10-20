@@ -7,10 +7,12 @@
 //! loader derives) are an owned heap region of the same type. The region kinds are a private closed enum:
 //! no other crate adds an owner with other invariants.
 //!
-//! Modifying a mapped checkpoint in place is unsupported. A modification already made is refused by
-//! [`StoredBytes::check_unchanged`], an `fstat` identity check on the mapped descriptor that loaders and
-//! binders run at their boundaries; one racing a read in flight is not detected (a truncation ends the
-//! process with `SIGBUS` before any torn value is used). Replacing a checkpoint by rename is always safe.
+//! Modifying a mapped checkpoint in place is unsupported, and the unsupported case is undefined behavior,
+//! not a defined failure: a write while a slice is live is a data race, and the content checks that ran
+//! at load are not repeated at upload (see `mapping`, invariant 4). A modification already made is refused
+//! by [`StoredBytes::check_unchanged`], an `fstat` identity check on the mapped descriptor that loaders
+//! and binders run at their boundaries; one racing a read in flight is not detected (a truncation ends the
+//! process with `SIGBUS`). Replacing a checkpoint by rename is always safe.
 
 #[expect(unsafe_code)]
 mod mapping;

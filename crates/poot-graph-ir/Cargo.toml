@@ -17,6 +17,7 @@ test-support = ["dep:poot-test-util"]
 [dependencies]
 poot-tensor.workspace = true
 poot-quant.workspace = true
+poot-weights.workspace = true
 # `fill`, the seeded fill the scan fixture draws its operands from; present only under `test-support`.
 poot-test-util = { workspace = true, optional = true }
 thiserror.workspace = true

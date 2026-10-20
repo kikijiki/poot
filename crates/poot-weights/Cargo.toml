@@ -1,0 +1,24 @@
+[package]
+name = "poot-weights"
+description = "The weight vocabulary and map: typed weight roles and ids, and a model's table from them to views over a weight store"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Fixtures and views only tests read (the weight map's materialize); enabled only from
+# `[dev-dependencies]` edges, as `poot-quant`'s.
+test-support = ["poot-quant/test-support"]
+
+[dependencies]
+poot-quant.workspace = true
+poot-tensor.workspace = true
+
+[dev-dependencies]
+poot-weights = { path = ".", features = ["test-support"] }
+
+[lints]
+workspace = true

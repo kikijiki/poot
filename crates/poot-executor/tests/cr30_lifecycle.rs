@@ -206,7 +206,7 @@ impl Device for FaultyDevice {
 fn fixture() -> (
     poot_graph_ir::Graph,
     Arc<WeightStore>,
-    Arc<poot_quant::weights::WeightMap>,
+    Arc<poot_weights::WeightMap>,
 ) {
     let b = Builder::for_tests();
     let a = b
@@ -630,7 +630,7 @@ fn carried_state_has_no_ping_pong_pair() {
 fn validated_fixture() -> (
     poot_graph_ir::Graph,
     Arc<WeightStore>,
-    Arc<poot_quant::weights::WeightMap>,
+    Arc<poot_weights::WeightMap>,
 ) {
     let b = Builder::for_tests();
     let a = b

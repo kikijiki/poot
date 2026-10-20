@@ -35,7 +35,8 @@ use poot_graph_plan::{
     multi_device::topology::DeviceId, staged::StageId, staged::StagedProgram, staged::TargetSet,
     staged::TensorParallel,
 };
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 
 use crate::device::{Collectives, Device, DeviceTime, NativeCounters};
 use crate::engine::{Engine, EntryPart, Outgoing, StageSeams, device_error};

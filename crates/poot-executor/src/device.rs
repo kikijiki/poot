@@ -216,6 +216,40 @@ pub struct Dispatch<'a, D: Device + ?Sized> {
     pub work: u64,
 }
 
+/// How a device cuts a long run of dispatches into submits so no one submit runs past the display watchdog.
+///
+/// A device with no watchdog budget ([`poot_target::DeviceCaps::watchdog_budget`] is `None`) has no policy: a
+/// stage is one submit. A device with a budget cuts a run once either bound below is reached. The bounds are
+/// one constant set, next to the [`Dispatch::work`] weight they count, and are a production default rather than
+/// environment-tunable (ADR-0104 decision 5's precedent).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FlushPolicy {
+    max_dispatches: usize,
+    max_work: u64,
+}
+
+impl FlushPolicy {
+    /// The bounds one submit may cover on a device with a watchdog: dispatches, and the summed
+    /// [`Dispatch::work`] of the run. Measured against the Strix Halo display watchdog (cards 163, 258, 546a).
+    const WATCHDOG: Self = Self {
+        max_dispatches: 1024,
+        max_work: 4_000_000,
+    };
+
+    /// The policy of the device `caps` describes: `None` where it has no watchdog budget, so its stage goes
+    /// in one submit.
+    pub fn of(caps: &poot_target::DeviceCaps) -> Option<Self> {
+        caps.watchdog_budget.map(|_| Self::WATCHDOG)
+    }
+
+    /// Whether a run already holding `dispatches` dispatches of `run_work` summed work must be cut before
+    /// adding one more of `work`. An empty run is never cut: a single dispatch heavier than the bound still
+    /// goes out, alone.
+    pub fn must_cut(self, dispatches: usize, run_work: u64, work: u64) -> bool {
+        dispatches >= self.max_dispatches || (dispatches > 0 && run_work + work > self.max_work)
+    }
+}
+
 /// What a device does with a weight's bytes when the engine uploads it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WeightUpload {
@@ -459,4 +493,43 @@ pub trait Collectives: Device {
         dst: &Self::Buffer,
         bytes: usize,
     ) -> Result<(), Self::Error>;
+}
+
+#[cfg(test)]
+mod flush_policy_tests {
+    use super::*;
+    use poot_target::DeviceCaps;
+
+    /// SC-004: the policy exists exactly where the device has a watchdog budget. Mutation: return
+    /// `Some(Self::WATCHDOG)` unconditionally; the budget-less rows fail on `None`.
+    #[test]
+    fn a_device_has_a_flush_policy_exactly_when_it_has_a_watchdog_budget() {
+        assert!(FlushPolicy::of(&DeviceCaps::wgpu_rdna3_igpu()).is_some());
+        assert_eq!(FlushPolicy::of(&DeviceCaps::rocm_default()), None);
+        assert_eq!(FlushPolicy::of(&DeviceCaps::ptx_default()), None);
+        let unbudgeted = DeviceCaps {
+            watchdog_budget: None,
+            ..DeviceCaps::wgpu_rdna3_igpu()
+        };
+        assert_eq!(FlushPolicy::of(&unbudgeted), None);
+    }
+
+    /// A run is cut at the dispatch bound and at the work bound, never when empty, and a single heavy
+    /// dispatch still goes out alone. Mutation: compare the dispatch count with `>` instead of `>=`; the first
+    /// row (1024 dispatches held) stops cutting.
+    #[test]
+    fn a_run_is_cut_at_either_bound_and_never_when_empty() {
+        let policy = FlushPolicy::WATCHDOG;
+        assert!(policy.must_cut(1024, 0, 1), "1024 dispatches are held");
+        assert!(!policy.must_cut(1023, 0, 1));
+        assert!(policy.must_cut(1, 3_000_000, 3_000_000), "6M exceeds 4M");
+        assert!(
+            !policy.must_cut(1, 3_000_000, 1_000_000),
+            "4M is within the bound"
+        );
+        assert!(
+            !policy.must_cut(0, 0, 9_000_000),
+            "an empty run takes the heavy dispatch alone"
+        );
+    }
 }

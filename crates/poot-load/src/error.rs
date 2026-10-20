@@ -26,11 +26,14 @@ pub enum LoadError {
         /// The dtype string as the file spells it.
         name: String,
     },
-    /// A checkpoint dtype is known but has no f32 decoding.
-    #[error("checkpoint dtype {name:?} has no f32 decode")]
-    UndecodableCheckpointDtype {
-        /// The dtype string as the file spells it.
-        name: String,
+    /// A LoRA adapter factor is stored in a dtype the adapter path does not carry: only F32, F16 and BF16
+    /// factors are read, as stored.
+    #[error("lora adapter tensor {tensor}: dtype {dtype:?} is not F32, F16 or BF16")]
+    LoraFactorDtype {
+        /// The adapter tensor's name.
+        tensor: String,
+        /// Its stored dtype.
+        dtype: poot_tensor::DType,
     },
     /// An FP8 block-wise linear has two scale tensors that could both apply, so which one is meant is ambiguous.
     #[error("{prefix}: FP8 block-wise scale is ambiguous because both {first} and {second} exist")]

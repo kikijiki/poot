@@ -38,10 +38,11 @@ use poot_llm::driver::{
 use poot_llm::{GenerationControl, Sampler};
 use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::registry::{Fixture, Registry};
-use poot_quant::weights::{DenseWeight, WeightEntry, WeightMap, WeightStore};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightStore};
 use poot_runtime_common::{BufferRole, DeviceBackend};
 use poot_target::{Backend, DeviceCaps};
 use poot_tensor::HostTensor;
+use poot_weights::WeightMap;
 use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;

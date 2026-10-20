@@ -2,7 +2,7 @@
 //! (R-562-3). [`GGUF_BASE`] holds the rows the `blk.{l}` layout shares; a family adds the rows its
 //! architecture carries beside it (a later table's row for a role replaces an earlier one).
 
-use poot_quant::weights::{AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightRole};
+use poot_weights::{AttnRole, ExpertProj, FfnRole, MoeRole, NormRole, WeightRole};
 
 use super::{FusedPart, NameRow, Presence, Source};
 

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use poot_eval::{EvalOptions, Value, eval};
-use poot_graph_ir::op::{BinOp, FusedOp, OpKind, RowStep, UnOp};
+use poot_graph_ir::op::{BinOp, FusedOp, LocalId, OpKind, RowStep, UnOp};
 use poot_graph_ir::ops::rmsnorm;
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Builder, Graph, ValueId};
@@ -86,7 +86,7 @@ fn a_norm_scale_cast_folds_into_the_row_region_and_evaluates_identically() {
         "the region reads the BF16 weight itself"
     );
     assert!(
-        (0..region.n_inputs).any(|input| region.widens_input(input)),
+        (0..region.n_inputs).any(|input| region.widens_input(LocalId::new(input))),
         "a Cast step widens that input"
     );
     assert!(matches!(
@@ -144,7 +144,7 @@ fn a_bias_cast_folds_into_the_contraction_epilogue_and_evaluates_identically() {
             .any(|input| matches!(input, poot_graph_ir::Operand::Value(v) if *v == bias_const)),
         "the epilogue reads the BF16 bias itself"
     );
-    assert!((1..region.n_inputs).any(|input| region.widens_input(input)));
+    assert!((1..region.n_inputs).any(|input| region.widens_input(LocalId::new(input))));
 
     let (bits, _) = bf16_weight(n, 0.25);
     let inputs: HashMap<ValueId, Value> = HashMap::from([

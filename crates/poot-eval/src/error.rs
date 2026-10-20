@@ -106,7 +106,7 @@ pub enum EvalError {
     /// An E4M3FN carrier refusal, carried through unchanged.
     #[error(transparent)]
     Fp8(#[from] crate::fp8::Fp8Error),
-    /// The one index-validity refusal (deval 4): `Gather`, `Scatter`, `ScatterUpdate`'s
+    /// The one index-validity refusal (deval 4): `Gather`, `ScatterUpdate`'s
     /// non-keep-base rows, `DynamicUpdateSlice`'s runtime start, `ArgTopK`'s rank and
     /// `IndexedMatMul`'s expert id all raise this through [`crate::ops::index_rule::index_at`] instead
     /// of each restating their own rounding and bounds check.

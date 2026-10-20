@@ -25,8 +25,8 @@
 //! [`super::gdn`] does not apply as it stands.
 
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, UnOp, ops};
-use poot_quant::weights::{KdaRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
+use poot_weights::{KdaRole, WeightId, WeightMap, WeightRole};
 
 use super::conv::{ConvParams, ConvWeights, causal_conv};
 use super::linear::{Weight, WeightError, linear};

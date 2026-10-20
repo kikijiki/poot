@@ -8,9 +8,8 @@ use poot_graph_ir::test_support::const_weights::ConstWeights;
 use std::sync::Arc;
 
 use poot_executor::{Device, Engine, Executor, NoSync, StepInputs};
-use poot_executor_parity::{ConstFixture, run_once};
 use poot_graph_ir::builder::Builder;
-use poot_graph_ir::types::{Scalar, TensorType};
+use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Graph, OpKind, Slot};
 use poot_graph_plan::{
     CompileOptions, Target, multi_device::topology::DeviceId, staged::DevicePlacement,
@@ -20,7 +19,7 @@ use poot_graph_plan::{
 use poot_quant::format::WeightFormat;
 use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_runtime_common::DeviceBackend;
-use poot_tensor::{DType, HostTensor, HostView};
+use poot_tensor::{DType, HostView};
 
 use crate::device::WgpuDevice;
 
@@ -285,89 +284,4 @@ fn wgpu_q6k_gemv_determinism_probe() {
          max_abs={max_abs:.6e} n_diff_elems={n_diff}/{n} - cross-wave LDS at GEMV_WIDTH=128 (4 \
          wave32s) is racing on the SPIRV/wgpu backend, the same class of bug fixed for ROCm in card 174."
     );
-}
-
-#[test]
-fn packed_kv_read_path_gpu_matches_cpu() {
-    // Quantized-KV read-side composition as the paged decode graph uses it: quantize (per-row absmax/127 + round + clamp), pack
-    // to i32 words, gather the packed words and per-row scales by an index (paged slot-map fetch), unpack, dequantize. Checks
-    // the packed i32 tensor survives `gather` on the GPU: gather is a 4-byte-word copy and poot-graph-plan's `fty` maps
-    // I32 -> Ty::F32, so it runs its f32 kernel on the i32 bytes; the result must be byte-identical to CPU eval.
-    use poot_graph_ir::op::{BinOp, RedOp, UnOp};
-
-    let Some(device) = wgpu() else {
-        return;
-    };
-    let target = device.target();
-    let mut exec: Box<dyn Executor> = Box::new(Engine::new(device));
-
-    let (rows, cols) = (4usize, 8usize); // 4 tokens x head_dim 8 -> 2 i32 words/row
-    let b = Builder::for_tests();
-    let x = b.constant("x", TensorType::f32(vec![rows, cols])).unwrap();
-    // per-token scale = absmax/127 (the 4c-i quantize composition).
-    let neg = b.unary(UnOp::Neg, x).unwrap();
-    let absx = b.binary(BinOp::Max, x, neg).unwrap();
-    let absmax = b.reduce(RedOp::Max, absx, 1, true).unwrap();
-    let scale = b
-        .binary_scalar(BinOp::Mul, absmax, Scalar::F32(1.0 / 127.0))
-        .unwrap();
-    let q = b.binary(BinOp::Div, x, scale).unwrap();
-    let r = b.unary(UnOp::Round, q).unwrap();
-    let lo = b.binary_scalar(BinOp::Max, r, Scalar::F32(-127.0)).unwrap();
-    let neg_lo = b.unary(UnOp::Neg, lo).unwrap();
-    let m = b
-        .binary_scalar(BinOp::Max, neg_lo, Scalar::F32(-127.0))
-        .unwrap();
-    let codes = b.unary(UnOp::Neg, m).unwrap(); // = min(lo, 127), the clamped int8 codes
-    // pack + the slot-map gather (reverse permutation) on BOTH the i32 words and the f32 scales, then
-    // unpack + dequant - the read path of one cached layer.
-    let packed = b.pack_i8(codes).unwrap(); // [rows, 2] i32 - the storage word tensor
-    let idx = b
-        .constant("idx", TensorType::new(vec![rows], DType::I32))
-        .unwrap();
-    let pg = b.gather(packed, 0, idx).unwrap(); // i32 gather (the byte-copy under test)
-    let sg = b.gather(scale, 0, idx).unwrap(); // f32 scale gather, same permutation
-    let un = b.unpack_i8(pg, cols).unwrap(); // [rows, cols] f32
-    let deq = b.binary(BinOp::Mul, un, sg).unwrap(); // dequant: codes * per-row scale (broadcasts over cols)
-    let g = b.finish(deq).unwrap();
-
-    let xd: Vec<f32> = (0..rows * cols)
-        .map(|i| (i as f32 * 0.41).cos() * 6.0 - 1.0)
-        .collect();
-    let idxd: Vec<i32> = (0..rows).rev().map(|i| i as i32).collect(); // [3,2,1,0]
-    let consts = [
-        ConstFixture {
-            name: "x",
-            tensor: HostTensor::f32(vec![rows, cols], xd.clone()),
-        },
-        ConstFixture {
-            name: "idx",
-            tensor: HostTensor::i32(vec![rows], idxd.clone()),
-        },
-    ];
-    let got = run_once(exec.as_mut(), target, &g, &consts, &[]).unwrap();
-    let got = got.as_f32().expect("the dequant output is F32");
-
-    // Independent hand reference (not eval): per-row quantize-dequantize of the gathered rows. eval cannot be the oracle: its
-    // copy ops drop the i32 payload and its f32 mirror is lossy for arbitrary 32-bit words.
-    assert_eq!(got.len(), rows * cols, "dequant restores [rows, cols]");
-    for (i, &idx) in idxd.iter().enumerate() {
-        let src = idx as usize;
-        let row = &xd[src * cols..src * cols + cols];
-        let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        let scale = absmax / 127.0;
-        for (j, &rv) in row.iter().enumerate() {
-            let code = if scale == 0.0 {
-                0.0
-            } else {
-                (rv / scale).round().clamp(-127.0, 127.0)
-            };
-            let want = code * scale;
-            let g = got[i * cols + j];
-            assert!(
-                (g - want).abs() < 1e-4,
-                "packed-kv read [{i},{j}]: gpu {g} vs ref {want} (src row {src}; i32 gather must survive)"
-            );
-        }
-    }
 }

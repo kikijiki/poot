@@ -27,8 +27,9 @@ use poot_graph_plan::{WeightFormats, bind_packed_weights};
 use poot_models::model::{LogitRows, StepShape, StepSpec};
 use poot_models::test_support::weight_map::Step;
 use poot_quant::PackedComponentRef;
-use poot_quant::weights::{WeightEntry, WeightId, WeightStore};
+use poot_quant::weights::{WeightEntry, WeightStore};
 use poot_tensor::HostTensor;
+use poot_weights::WeightId;
 
 use super::{ModelHandle, serving_trace_limits};
 

@@ -25,6 +25,7 @@ poot-graph-ir.workspace = true
 poot-kernel-ir = { workspace = true, features = ["serde"] }
 poot-kernelgen.workspace = true
 poot-quant.workspace = true
+poot-weights.workspace = true
 poot-runtime-common.workspace = true
 poot-target.workspace = true
 poot-tensor.workspace = true
@@ -34,6 +35,7 @@ blake3.workspace = true
 
 [dev-dependencies]
 poot-quant = { workspace = true, features = ["test-support"] }
+poot-weights = { workspace = true, features = ["test-support"] }
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 # This crate's own `tests/*.rs` integration binaries see its `test_support` (`plan_eqn`, the GPU-target
 # accessors) and the gated `per_eqn_plans_outside_compile` (ADR-0113) through this

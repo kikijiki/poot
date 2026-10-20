@@ -34,6 +34,14 @@ pub(crate) struct hsa_agent_t {
     pub(crate) handle: u64,
 }
 
+/// HSA memory region handle (the core-API view of a segment: global, group, private).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct hsa_region_t {
+    /// Opaque 64-bit runtime handle; 0 is the null handle.
+    pub(crate) handle: u64,
+}
+
 /// HSA ISA handle. Same layout as `hsa_agent_t` but a different object class: passing one where the
 /// other is expected returns `HSA_STATUS_ERROR_INVALID_INDEX`.
 #[repr(C)]
@@ -80,6 +88,13 @@ pub(crate) const HSA_AGENT_INFO_NAME: u32 = 0;
 pub(crate) const HSA_AGENT_INFO_VENDOR_NAME: u32 = 1;
 /// `hsa_agent_get_info` attribute: the largest queue the agent supports, in packets (`uint32_t`).
 pub(crate) const HSA_AGENT_INFO_QUEUE_MAX_SIZE: u32 = 14;
+/// `hsa_agent_get_info` attribute: the largest workgroup extent per dimension (`uint16_t[3]`).
+pub(crate) const HSA_AGENT_INFO_WORKGROUP_MAX_DIM: u32 = 7;
+/// `hsa_agent_get_info` attribute: the largest workgroup, in work-items (`uint32_t`).
+pub(crate) const HSA_AGENT_INFO_WORKGROUP_MAX_SIZE: u32 = 8;
+/// `hsa_agent_get_info` attribute: the largest grid extent per dimension, in work-items (`hsa_dim3_t`, three
+/// `uint32_t`).
+pub(crate) const HSA_AGENT_INFO_GRID_MAX_DIM: u32 = 9;
 /// `hsa_agent_get_info` attribute: the agent's wavefront width in work-items (`uint32_t`).
 pub(crate) const HSA_AGENT_INFO_WAVEFRONT_SIZE: u32 = 6;
 /// Returns an `hsa_device_type_t` (CPU=0, GPU=1, DSP=2). Query this for device type, not
@@ -87,6 +102,15 @@ pub(crate) const HSA_AGENT_INFO_WAVEFRONT_SIZE: u32 = 6;
 pub(crate) const HSA_AGENT_INFO_DEVICE: u32 = 17;
 /// `hsa_agent_get_info` attribute: the agent's first ISA, an [`hsa_isa_t`].
 pub(crate) const HSA_AGENT_INFO_ISA: u32 = 19;
+
+// hsa.h region info attribute ids
+
+/// `hsa_region_get_info` attribute: the region's segment, an `hsa_region_segment_t` (4-byte enum).
+pub(crate) const HSA_REGION_INFO_SEGMENT: u32 = 0;
+/// `hsa_region_get_info` attribute: the region's size in bytes (`size_t`).
+pub(crate) const HSA_REGION_INFO_SIZE: u32 = 2;
+/// `hsa_region_segment_t` value of the group (workgroup-local, LDS) segment.
+pub(crate) const HSA_REGION_SEGMENT_GROUP: u32 = 3;
 
 // hsa.h device types
 
@@ -288,6 +312,10 @@ const _: () = assert!(
 pub(crate) type HsaAgentIterateCb =
     unsafe extern "C" fn(agent: hsa_agent_t, data: *mut c_void) -> hsa_status_t;
 
+/// `hsa_agent_iterate_regions` callback. Return 0 to continue, nonzero to stop.
+pub(crate) type HsaRegionIterateCb =
+    unsafe extern "C" fn(region: hsa_region_t, data: *mut c_void) -> hsa_status_t;
+
 /// `hsa_amd_agent_iterate_memory_pools` callback. Return 0 to continue, nonzero to stop.
 pub(crate) type HsaAmdMemoryPoolIterateCb =
     unsafe extern "C" fn(pool: hsa_amd_memory_pool_t, data: *mut c_void) -> hsa_status_t;
@@ -474,6 +502,8 @@ pub(crate) const HSA_WAIT_STATE_BLOCKED: u32 = 1;
 
 /// C enum parameter type of an `hsa_agent_get_info` attribute id.
 pub(crate) type hsa_agent_info_t = u32;
+/// C enum parameter type of an `hsa_region_get_info` attribute id.
+pub(crate) type hsa_region_info_t = u32;
 /// C enum parameter type of an `hsa_isa_get_info` attribute id.
 pub(crate) type hsa_isa_info_t = u32;
 /// C enum parameter type of an `hsa_system_get_info` attribute id.
@@ -503,6 +533,16 @@ unsafe extern "C" {
     pub(crate) fn hsa_agent_get_info(
         agent: hsa_agent_t,
         attribute: hsa_agent_info_t,
+        value: *mut c_void,
+    ) -> hsa_status_t;
+    pub(crate) fn hsa_agent_iterate_regions(
+        agent: hsa_agent_t,
+        callback: Option<HsaRegionIterateCb>,
+        data: *mut c_void,
+    ) -> hsa_status_t;
+    pub(crate) fn hsa_region_get_info(
+        region: hsa_region_t,
+        attribute: hsa_region_info_t,
         value: *mut c_void,
     ) -> hsa_status_t;
     pub(crate) fn hsa_isa_get_info_alt(

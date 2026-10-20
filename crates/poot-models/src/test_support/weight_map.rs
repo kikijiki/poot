@@ -17,13 +17,11 @@ use poot_graph_plan::{
     staged::TargetSet, staged::compile_staged,
 };
 use poot_quant::format::WeightFormat;
-use poot_quant::weights::{
-    AttnRole, DenseWeight, FfnRole, WeightEntry, WeightKey, WeightMap, WeightRole, WeightStore,
-    WeightView,
-};
+use poot_quant::weights::{DenseWeight, WeightEntry, WeightKey, WeightStore};
 use poot_quant::{PackedPayload, StoredBytes};
 use poot_tensor::{DType, HostTensor, HostView};
 use poot_test_util::assert_close_scaled;
+use poot_weights::{AttnRole, FfnRole, WeightMap, WeightRole, WeightView};
 
 /// A qwen2 checkpoint's dimensions.
 #[derive(Clone, Copy, Debug)]
@@ -255,13 +253,13 @@ pub fn fused(m: &MappedModel) -> (Arc<WeightStore>, Arc<WeightMap>) {
     };
     let mut replaced: Vec<WeightKey> = Vec::new();
     let mut added: Vec<(String, WeightEntry)> = Vec::new();
-    let mut views: Vec<(poot_quant::weights::WeightId, WeightView)> = Vec::new();
+    let mut views: Vec<(poot_weights::WeightId, WeightView)> = Vec::new();
     for (id, view, _) in m.map.iter() {
         let layer = id.layer;
         let view = match (layer, id.role) {
             (Some(l), WeightRole::Attn(AttnRole::Q)) => {
                 let keys = [AttnRole::Q, AttnRole::K, AttnRole::V].map(|role| {
-                    let other = poot_quant::weights::WeightId::layer(l, WeightRole::Attn(role));
+                    let other = poot_weights::WeightId::layer(l, WeightRole::Attn(role));
                     stored(m.map.view(other).unwrap())
                 });
                 let entries: Vec<&WeightEntry> = keys
@@ -279,7 +277,7 @@ pub fn fused(m: &MappedModel) -> (Arc<WeightStore>, Arc<WeightMap>) {
             }
             (Some(l), WeightRole::Attn(role @ (AttnRole::K | AttnRole::V))) => {
                 let row_count = |role| {
-                    let other = poot_quant::weights::WeightId::layer(l, WeightRole::Attn(role));
+                    let other = poot_weights::WeightId::layer(l, WeightRole::Attn(role));
                     m.map.handle(other).unwrap().shape[0]
                 };
                 let (q, k) = (row_count(AttnRole::Q), row_count(AttnRole::K));

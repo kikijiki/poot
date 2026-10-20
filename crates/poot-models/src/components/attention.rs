@@ -17,7 +17,7 @@
 //! is the planner's decision from the device's data, never the tracer's.
 
 use poot_graph_ir::{BinOp, Builder, ComputedConst, Scalar, StateRole, TensorType, Traced, ops};
-use poot_quant::weights::{AttnRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{AttnRole, WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
 use super::norm::{NormParams, norm};

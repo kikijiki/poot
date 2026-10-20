@@ -177,10 +177,6 @@ pub enum ImportedKernel {
     /// Tiled GEMM with a weight per batch entry (per-expert MoE GEMM, per-head attention matmuls); shapes ride in `dims = [E, M, K, N]`.
     TiledGemmBatched,
     // packed.rs
-    /// Packs four signed-int8 codes of f32 input into each i32 word along the last axis (the I8 KV-cache pack).
-    PackI8,
-    /// The inverse of [`ImportedKernel::PackI8`]: unpacks i32 words to f32 int8 codes.
-    UnpackI8,
     /// Axis-0 embedding gather over a dense BF16 table read as packed `u32` lanes, widened to F32 in the kernel.
     PackedBf16RowGather,
     /// The `Cast(BF16 -> F32)` of a BF16 const read from its packed `u32` lanes.

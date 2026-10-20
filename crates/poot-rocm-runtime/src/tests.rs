@@ -2065,11 +2065,10 @@ fn each_creation_plan_publishes_through_its_own_ring_contract() {
 }
 
 /// Card 522 SC-004: `RocmContext::device_caps` compares against a direct HSA query for every field HSA
-/// can answer (the ISA-derived tensor-core family, the pool-size VRAM total), and against the
-/// documented vendor-scoped default for the two HSA does not expose at all (LDS/group-segment size,
-/// per-dimension grid count) or does not need on this backend (the watchdog budget and the card-095
-/// RADV miscompile ceiling, both wgpu/RADV codegen-path defects this backend does not share). Skips
-/// cleanly if ROCm is not installed.
+/// can answer (the ISA-derived tensor-core family, the pool-size VRAM total, the workgroup and grid
+/// limits, the group-segment size), and asserts the two a ROCm device does not have (the watchdog
+/// budget and the card-095 RADV miscompile ceiling, both wgpu/RADV codegen-path defects this backend does
+/// not share). Skips cleanly if ROCm is not installed.
 #[test]
 fn device_caps_matches_a_direct_hsa_query() {
     let ctx = match RocmContext::new() {
@@ -2109,11 +2108,25 @@ fn device_caps_matches_a_direct_hsa_query() {
         "max_buffer_bytes must be the queried coarse-pool total, not a hardcoded ceiling"
     );
 
-    // HSA exposes no group-segment (LDS) size or per-dimension grid-count query this crate's discovery
-    // layer has found, so these two are the documented vendor-scoped default, not a live query.
-    let defaults = poot_target::DeviceCaps::rocm_default();
-    assert_eq!(caps.lds_bytes, defaults.lds_bytes);
-    assert_eq!(caps.max_grid, defaults.max_grid);
+    // The launch limits are fresh HSA queries, not the vendor-scoped defaults: the workgroup and grid extents
+    // from `hsa_agent_get_info` directly, and the workgroup memory from a second walk of the agent's regions.
+    // (`a_live_agent_reports_the_limits_rocminfo_prints` compares them with `rocminfo`.)
+    let (mut dims, mut size, mut grid) = ([0u16; 3], 0u32, [0u32; 3]);
+    // SAFETY: WORKGROUP_MAX_DIM writes a `uint16_t[3]`, WORKGROUP_MAX_SIZE a `uint32_t` and GRID_MAX_DIM an
+    // `hsa_dim3_t` into the locals; `ctx.gpu_agent` is this context's agent.
+    unsafe {
+        let get = ctx.hsa.funcs.hsa_agent_get_info;
+        assert_eq!(get(ctx.gpu_agent, 7, dims.as_mut_ptr().cast()), 0);
+        assert_eq!(get(ctx.gpu_agent, 8, (&raw mut size).cast()), 0);
+        assert_eq!(get(ctx.gpu_agent, 9, grid.as_mut_ptr().cast()), 0);
+    }
+    assert_eq!(caps.max_workgroup_size, dims.map(u32::from));
+    assert_eq!(caps.max_workgroup_invocations, size);
+    assert_eq!(caps.max_grid, grid);
+    // SAFETY: discovery contract (above).
+    let limits = unsafe { crate::discovery::agent_limits(&ctx.hsa.funcs, ctx.gpu_agent) }
+        .expect("the agent's group segment");
+    assert_eq!(caps.lds_bytes, limits.group_segment_bytes);
 
     // Neither the display watchdog nor the card-095 tiled-GEMM miscompile is a ROCm/HSA defect.
     assert!(caps.watchdog_budget.is_none());

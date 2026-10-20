@@ -17,6 +17,7 @@ poot-graph-plan.workspace = true
 poot-codegen.workspace = true
 poot-kernel-ir.workspace = true
 poot-quant.workspace = true
+poot-weights.workspace = true
 poot-target.workspace = true
 poot-runtime-common.workspace = true
 poot-profile.workspace = true
@@ -27,6 +28,7 @@ thiserror.workspace = true
 poot-kernelgen.workspace = true
 poot-graph-plan = { workspace = true, features = ["test-support"] }
 poot-quant = { workspace = true, features = ["test-support"] }
+poot-weights = { workspace = true, features = ["test-support"] }
 poot-graph-ir = { workspace = true, features = ["test-support"] }
 poot-codegen = { workspace = true, features = ["test-support"] }
 # SC-024's two-distinct-bodies-same-display-key fixture: ready-made Body constructors, nothing else.

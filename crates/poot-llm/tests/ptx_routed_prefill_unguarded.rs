@@ -24,10 +24,11 @@ use poot_models::model::Model;
 use poot_models::registry::Registry;
 use poot_models::test_support::weight_map::{self, Step};
 use poot_ptx_device::PtxDevice;
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
 use poot_runtime_common::DeviceBackend;
 use poot_runtime_common::device_skip::open_or_skip;
 use poot_tensor::HostTensor;
+use poot_weights::WeightMap;
 
 /// A hang past this aborts the process: the row is red, never a skip.
 const DEADLINE: Duration = Duration::from_secs(120);

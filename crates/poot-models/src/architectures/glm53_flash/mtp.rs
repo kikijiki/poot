@@ -22,8 +22,8 @@
 //! is off by default and is not implemented: a chain step recomputes them).
 
 use poot_graph_ir::{BinOp, Builder, Scalar, Traced};
-use poot_quant::weights::{MtpRole, WeightId, WeightMap, WeightRole};
 use poot_tensor::DType;
+use poot_weights::{MtpRole, WeightId, WeightMap, WeightRole};
 
 use super::config::{Ffn, Glm53Config};
 use super::stack::FfnWeights;

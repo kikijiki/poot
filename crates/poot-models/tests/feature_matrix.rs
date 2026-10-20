@@ -716,7 +716,7 @@ fn pointwise_graph(op: PointwiseOp) -> Graph {
 /// The F32 pointwise ops the matrix probes on the XDNA2, by the name the NPU page uses. Written by hand: a
 /// probed op that the NPU page does not state the same way fails
 /// `the_xdna2_table_agrees_with_the_npu_page`.
-fn npu_ops() -> [(&'static str, PointwiseOp); 14] {
+fn npu_ops() -> [(&'static str, PointwiseOp); 13] {
     [
         ("add", PointwiseOp::Binary(BinOp::Add)),
         ("sub", PointwiseOp::Binary(BinOp::Sub)),
@@ -731,7 +731,6 @@ fn npu_ops() -> [(&'static str, PointwiseOp); 14] {
         ("sqrt", PointwiseOp::Unary(UnOp::Sqrt)),
         ("tanh", PointwiseOp::Unary(UnOp::Tanh)),
         ("erf", PointwiseOp::Unary(UnOp::Erf)),
-        ("round", PointwiseOp::Unary(UnOp::Round)),
     ]
 }
 

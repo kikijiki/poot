@@ -21,10 +21,12 @@ use poot_graph_plan::LoraPlan;
 use poot_load::lora::{LoraAdapter, LoraWeight};
 use poot_quant::StoredBytes;
 use poot_quant::weights::{
-    DenseWeight, DenseWeightError, DuplicateWeightKey, LoraRole, LoraTarget, WeightEntry, WeightId,
-    WeightKey, WeightMap, WeightMapError, WeightRole, WeightStore, WeightView,
+    DenseWeight, DenseWeightError, DuplicateWeightKey, WeightEntry, WeightKey, WeightStore,
 };
 use poot_tensor::DType;
+use poot_weights::{
+    LoraRole, LoraTarget, WeightId, WeightMap, WeightMapError, WeightRole, WeightView,
+};
 
 use super::prefix_cache::PrefixIdentity;
 
@@ -57,6 +59,12 @@ pub struct GenerationId(NonZeroU32);
 #[cfg(test)]
 pub(crate) mod test_only {
     use super::*;
+
+    /// A factor as an adapter file stores it: `values` row-major in `shape`, F32.
+    pub(crate) fn f32_factor(shape: Vec<usize>, values: &[f32]) -> DenseWeight {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).unwrap()
+    }
 
     impl GenerationId {
         /// A generation id no registry issued, for a test of a refusal that comes before the registry is
@@ -337,15 +345,15 @@ pub enum AdapterError {
         /// The projection named twice.
         target: LoraTarget,
     },
-    /// A factor is not F32 data.
-    #[error("adapter {adapter} layer {layer} {target:?}: a factor is not F32")]
-    NotF32 {
+    /// Two factors of the set are stored in different dtypes: one stack holds one dtype.
+    #[error("adapter {adapter}: a factor is {found:?} but the set's factors are {expected:?}")]
+    MixedDtype {
         /// Index of the adapter in the set.
         adapter: usize,
-        /// The layer the module belongs to.
-        layer: usize,
-        /// The projection the adapter targets.
-        target: LoraTarget,
+        /// The dtype of the set's first factor.
+        expected: DType,
+        /// The dtype of the factor that differs.
+        found: DType,
     },
     /// A stacked adapter tensor could not be built.
     #[error("a stacked adapter tensor: {0}")]
@@ -372,18 +380,53 @@ fn parse_module(module: &str) -> Option<(usize, LoraTarget)> {
     Some((layer.parse().ok()?, target))
 }
 
-fn dense(shape: Vec<usize>, values: &[f32]) -> Result<WeightEntry, DenseWeightError> {
-    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    DenseWeight::try_new(DType::F32, shape, StoredBytes::from(bytes)).map(WeightEntry::Dense)
+fn dense(dtype: DType, shape: Vec<usize>, bytes: Vec<u8>) -> Result<WeightEntry, DenseWeightError> {
+    DenseWeight::try_new(dtype, shape, StoredBytes::from(bytes)).map(WeightEntry::Dense)
+}
+
+/// The dtype every factor of `adapters` is stored in, or [`AdapterError::MixedDtype`]. One stack
+/// tensor holds one dtype, and a factor is never widened, so a set of adapters stored differently
+/// cannot be stacked.
+fn factor_dtype(adapters: &[LoraAdapter]) -> Result<DType, AdapterError> {
+    let mut common: Option<DType> = None;
+    for (slot, adapter) in adapters.iter().enumerate() {
+        for weight in adapter.weights.values() {
+            for found in [weight.a.dtype(), weight.b.dtype()] {
+                let expected = *common.get_or_insert(found);
+                if found != expected {
+                    return Err(AdapterError::MixedDtype {
+                        adapter: slot,
+                        expected,
+                        found,
+                    });
+                }
+            }
+        }
+    }
+    common.ok_or(AdapterError::Empty)
+}
+
+/// Copy the row-major `[rows, cols]` matrix `src` of `width`-byte elements into `dst` transposed:
+/// element `(r, c)` lands at element index `c * dst_stride + r` of `dst`. This is the `x @ W` reading of a
+/// PEFT `[out, in]` factor, taken on the stored bytes without decoding them.
+fn copy_transposed(dst: &mut [u8], dst_stride: usize, src: &[u8], cols: usize, width: usize) {
+    for (index, element) in src.chunks_exact(width).enumerate() {
+        let (r, c) = (index / cols, index % cols);
+        let at = (c * dst_stride + r) * width;
+        dst[at..at + width].copy_from_slice(element);
+    }
 }
 
 /// The adapters of one generation stacked as the LoRA pass reads them: per adapted projection of every
-/// layer, `A [adapters + 1, in, r]` and `B [adapters + 1, r, out]` zero-padded to the largest rank, and
-/// the model-level `scale [adapters + 1]`; entry 0 is the no-adapter row.
+/// layer, `A [adapters + 1, in, r]` and `B [adapters + 1, r, out]` zero-padded to the largest rank, in the
+/// dtype the adapters were stored in, and the model-level F32 `scale [adapters + 1]`; entry 0 is the
+/// no-adapter row.
 #[derive(Debug)]
 pub(crate) struct AdapterStack {
     adapters: NonZeroUsize,
     rank: NonZeroUsize,
+    /// The stored dtype of every stacked factor.
+    dtype: DType,
     projections: Vec<LoraTarget>,
     entries: Vec<(WeightId, WeightEntry)>,
 }
@@ -417,18 +460,21 @@ impl AdapterStack {
             .collect();
         let rank = adapters
             .iter()
-            .flat_map(|adapter| adapter.weights.values().map(|w| w.a.shape()[1]))
+            .flat_map(|adapter| adapter.weights.values().map(|w| w.a.shape()[0]))
             .max()
             .and_then(NonZeroUsize::new)
             .ok_or(AdapterError::Empty)?;
+        let dtype = factor_dtype(adapters)?;
+        let width = dtype.byte_size();
         let r = rank.get();
         let stack = adapters.len() + 1;
 
         let mut scale = vec![0.0f32];
         scale.extend(adapters.iter().map(|adapter| adapter.config.scaling()));
+        let scale_bytes: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut entries = vec![(
             WeightId::model(WeightRole::Lora(LoraRole::Scale)),
-            dense(vec![stack], &scale)?,
+            dense(DType::F32, vec![stack], scale_bytes)?,
         )];
         let mut covered: BTreeSet<(usize, LoraTarget)> = BTreeSet::new();
         for (id, _, handle) in base.iter() {
@@ -441,16 +487,16 @@ impl AdapterStack {
             let &[out_dim, in_dim] = handle.shape.as_slice() else {
                 continue;
             };
-            let mut a = vec![0.0f32; stack * in_dim * r];
-            let mut b = vec![0.0f32; stack * r * out_dim];
+            let mut a = vec![0u8; stack * in_dim * r * width];
+            let mut b = vec![0u8; stack * r * out_dim * width];
             for (slot, mine) in sites.iter().enumerate() {
                 let Some(weight) = mine.get(&(layer, target)) else {
                     continue;
                 };
                 covered.insert((layer, target));
                 let (a_shape, b_shape) = (weight.a.shape().to_vec(), weight.b.shape().to_vec());
-                let rank_here = a_shape.get(1).copied().unwrap_or(0);
-                if a_shape != [in_dim, rank_here] || b_shape != [rank_here, out_dim] {
+                let rank_here = a_shape.first().copied().unwrap_or(0);
+                if a_shape != [rank_here, in_dim] || b_shape != [out_dim, rank_here] {
                     return Err(AdapterError::Shape {
                         adapter: slot,
                         layer,
@@ -461,28 +507,31 @@ impl AdapterStack {
                         inner: in_dim,
                     });
                 }
-                let not_f32 = || AdapterError::NotF32 {
-                    adapter: slot,
-                    layer,
-                    target,
-                };
-                let a_values = weight.a.as_f32().ok_or_else(not_f32)?;
-                let b_values = weight.b.as_f32().ok_or_else(not_f32)?;
+                // `A [r, in]` lands as `[in, r]` at this adapter's entry, `B [out, r]` as `[r, out]`.
                 let a_base = (slot + 1) * in_dim * r;
-                for row in 0..in_dim {
-                    a[a_base + row * r..a_base + row * r + rank_here]
-                        .copy_from_slice(&a_values[row * rank_here..(row + 1) * rank_here]);
-                }
+                copy_transposed(
+                    &mut a[a_base * width..],
+                    r,
+                    weight.a.bytes().as_slice(),
+                    in_dim,
+                    width,
+                );
                 let b_base = (slot + 1) * r * out_dim;
-                b[b_base..b_base + rank_here * out_dim].copy_from_slice(b_values);
+                copy_transposed(
+                    &mut b[b_base * width..],
+                    out_dim,
+                    weight.b.bytes().as_slice(),
+                    rank_here,
+                    width,
+                );
             }
             entries.push((
                 WeightId::layer(layer, WeightRole::Lora(LoraRole::A(target))),
-                dense(vec![stack, in_dim, r], &a)?,
+                dense(dtype, vec![stack, in_dim, r], a)?,
             ));
             entries.push((
                 WeightId::layer(layer, WeightRole::Lora(LoraRole::B(target))),
-                dense(vec![stack, r, out_dim], &b)?,
+                dense(dtype, vec![stack, r, out_dim], b)?,
             ));
         }
         for (slot, mine) in sites.iter().enumerate() {
@@ -497,6 +546,7 @@ impl AdapterStack {
         Ok(Self {
             adapters: count,
             rank,
+            dtype,
             projections: targets.into_iter().collect(),
             entries,
         })
@@ -508,6 +558,7 @@ impl AdapterStack {
             rows,
             adapters: self.adapters,
             rank: self.rank,
+            factor_dtype: self.dtype,
             projections: self.projections.clone(),
         }
     }
@@ -538,12 +589,17 @@ impl AdapterStack {
 #[cfg(test)]
 mod tests {
     use poot_load::lora::LoraAdapterConfig;
-    use poot_tensor::HostTensor;
 
+    use super::test_only::f32_factor;
     use super::*;
 
     fn entry(shape: Vec<usize>) -> WeightEntry {
-        dense(shape.clone(), &vec![0.5; shape.iter().product()]).unwrap()
+        let elements: usize = shape.iter().product();
+        let bytes = vec![0.5f32; elements]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        dense(DType::F32, shape, bytes).unwrap()
     }
 
     /// A base model of two layers: `q` `[6, 4]` (out 6, in 4) in both, `v` `[3, 4]` in layer 0.
@@ -566,7 +622,22 @@ mod tests {
         (store, map)
     }
 
-    fn adapter(
+    /// `values` stored as `dtype` (F32 or BF16; the tests use values both represent exactly).
+    fn factor_as(dtype: DType, shape: Vec<usize>, values: &[f32]) -> DenseWeight {
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|v| match dtype {
+                DType::BF16 => (v.to_bits() >> 16).to_le_bytes()[..2].to_vec(),
+                _ => v.to_le_bytes().to_vec(),
+            })
+            .collect();
+        DenseWeight::try_new(dtype, shape, StoredBytes::from(bytes)).unwrap()
+    }
+
+    /// An adapter of `rank` over `modules` `(path, in, out)`, its factors in PEFT layout (`A [rank, in]`
+    /// all `fill`, `B [out, rank]` all `fill + 1`) stored as `dtype`.
+    fn adapter_as(
+        dtype: DType,
         rank: usize,
         alpha: f32,
         modules: &[(&str, usize, usize)],
@@ -585,10 +656,11 @@ mod tests {
                     (
                         module.to_string(),
                         LoraWeight {
-                            a: HostTensor::f32(vec![in_dim, rank], vec![fill; in_dim * rank]),
-                            b: HostTensor::f32(
-                                vec![rank, out_dim],
-                                vec![fill + 1.0; rank * out_dim],
+                            a: factor_as(dtype, vec![rank, in_dim], &vec![fill; in_dim * rank]),
+                            b: factor_as(
+                                dtype,
+                                vec![out_dim, rank],
+                                &vec![fill + 1.0; rank * out_dim],
                             ),
                         },
                     )
@@ -597,7 +669,16 @@ mod tests {
         }
     }
 
-    fn values(stack: &AdapterStack, id: WeightId) -> Vec<f32> {
+    fn adapter(
+        rank: usize,
+        alpha: f32,
+        modules: &[(&str, usize, usize)],
+        fill: f32,
+    ) -> LoraAdapter {
+        adapter_as(DType::F32, rank, alpha, modules, fill)
+    }
+
+    fn entry_of(stack: &AdapterStack, id: WeightId) -> &DenseWeight {
         let (_, WeightEntry::Dense(dense)) = stack
             .entries
             .iter()
@@ -607,13 +688,163 @@ mod tests {
             panic!("{id} is not dense");
         };
         dense
-            .bytes()
-            .as_slice()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&word| f32::from_le_bytes(word))
-            .collect()
+    }
+
+    /// The stacked entry `id` widened to f32 (F32 and BF16 entries).
+    fn values(stack: &AdapterStack, id: WeightId) -> Vec<f32> {
+        let dense = entry_of(stack, id);
+        let bytes = dense.bytes().as_slice();
+        match dense.dtype() {
+            DType::F32 => bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&word| f32::from_le_bytes(word))
+                .collect(),
+            DType::BF16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| f32::from_bits(u32::from(u16::from_le_bytes(pair)) << 16))
+                .collect(),
+            other => panic!("{id} is {other:?}"),
+        }
+    }
+
+    /// POOT-1258 SC-001: a BF16 adapter is stacked, and so uploaded, as BF16: the `A`/`B` entries the
+    /// executor binds carry the BF16 dtype and half the bytes of the F32 twin, the plan declares BF16
+    /// factors, and only the scale vector is F32. Mutation: restore the f32 decode (build the stack as F32
+    /// whatever the adapter stored); the entries are F32 and the dtype assertions fail.
+    #[test]
+    fn a_bf16_adapter_is_stacked_and_planned_as_bf16() {
+        let (store, map) = base();
+        let modules = [("model.layers.0.self_attn.q_proj", 4, 6)];
+        let a_id = WeightId::layer(0, WeightRole::Lora(LoraRole::A(LoraTarget::AttnQ)));
+        let b_id = WeightId::layer(0, WeightRole::Lora(LoraRole::B(LoraTarget::AttnQ)));
+        let scale_id = WeightId::model(WeightRole::Lora(LoraRole::Scale));
+
+        let narrow =
+            AdapterStack::build(&[adapter_as(DType::BF16, 2, 4.0, &modules, 1.0)], &map).unwrap();
+        let wide =
+            AdapterStack::build(&[adapter_as(DType::F32, 2, 4.0, &modules, 1.0)], &map).unwrap();
+        for id in [a_id, b_id] {
+            assert_eq!(entry_of(&narrow, id).dtype(), DType::BF16, "{id}");
+            assert_eq!(
+                entry_of(&narrow, id).bytes().len() * 2,
+                entry_of(&wide, id).bytes().len(),
+                "{id}: half the bytes of the F32 stack"
+            );
+        }
+        assert_eq!(entry_of(&narrow, scale_id).dtype(), DType::F32);
+        assert_eq!(
+            narrow.plan(NonZeroUsize::MIN).factor_dtype,
+            DType::BF16,
+            "the program declares the factors as stored"
+        );
+        // The uploaded generation store holds the BF16 entries as built.
+        let (extended, _) = narrow.weights(&store, &map).unwrap();
+        let Some(WeightEntry::Dense(uploaded)) = extended.get(&a_id.const_name()) else {
+            panic!("the generation's store holds the A stack");
+        };
+        assert_eq!(uploaded.dtype(), DType::BF16);
+        assert_eq!(
+            values(&narrow, a_id),
+            values(&wide, a_id),
+            "BF16 holds these values exactly"
+        );
+    }
+
+    /// The stack reads PEFT's `A [r, in]` and `B [out, r]` as the `x @ W` factors `[in, r]` and `[r, out]`,
+    /// element by element on the stored bytes: distinct values at every position, a rank-2 adapter
+    /// padded into a rank-3 stack. Mutation: copy `A` without transposing it; position `(i, k)` holds
+    /// `A[i, k]` instead of `A[k, i]`.
+    #[test]
+    fn peft_factors_are_read_transposed_into_the_stack() {
+        let (_, map) = base();
+        let (rank, in_dim, out_dim) = (2usize, 4usize, 6usize);
+        // A[k, i] = 10k + i, B[o, k] = 100 + 10o + k.
+        let a_values: Vec<f32> = (0..rank)
+            .flat_map(|k| (0..in_dim).map(move |i| (10 * k + i) as f32))
+            .collect();
+        let b_values: Vec<f32> = (0..out_dim)
+            .flat_map(|o| (0..rank).map(move |k| (100 + 10 * o + k) as f32))
+            .collect();
+        let narrow = LoraAdapter {
+            config: LoraAdapterConfig {
+                r: rank,
+                lora_alpha: 2.0,
+                target_modules: Vec::new(),
+                use_rslora: false,
+            },
+            weights: [(
+                "model.layers.0.self_attn.q_proj".to_string(),
+                LoraWeight {
+                    a: f32_factor(vec![rank, in_dim], &a_values),
+                    b: f32_factor(vec![out_dim, rank], &b_values),
+                },
+            )]
+            .into(),
+        };
+        // A wider second adapter makes the stack rank 3, so the narrow one is padded.
+        let wide = adapter(3, 3.0, &[("model.layers.0.self_attn.q_proj", 4, 6)], 1.0);
+        let stack = AdapterStack::build(&[narrow, wide], &map).unwrap();
+        let r = 3;
+        let a = values(
+            &stack,
+            WeightId::layer(0, WeightRole::Lora(LoraRole::A(LoraTarget::AttnQ))),
+        );
+        let b = values(
+            &stack,
+            WeightId::layer(0, WeightRole::Lora(LoraRole::B(LoraTarget::AttnQ))),
+        );
+        for i in 0..in_dim {
+            for k in 0..r {
+                let expected = if k < rank { (10 * k + i) as f32 } else { 0.0 };
+                assert_eq!(
+                    a[in_dim * r + i * r + k],
+                    expected,
+                    "A entry 1 at ({i}, {k})"
+                );
+            }
+        }
+        for k in 0..r {
+            for o in 0..out_dim {
+                let expected = if k < rank {
+                    (100 + 10 * o + k) as f32
+                } else {
+                    0.0
+                };
+                assert_eq!(
+                    b[r * out_dim + k * out_dim + o],
+                    expected,
+                    "B entry 1 at ({k}, {o})"
+                );
+            }
+        }
+    }
+
+    /// One stack holds one dtype: a BF16 adapter beside an F32 one is the typed refusal, never a widened
+    /// copy.
+    #[test]
+    fn adapters_stored_in_different_dtypes_cannot_share_a_stack() {
+        let (_, map) = base();
+        let modules = [("model.layers.0.self_attn.q_proj", 4, 6)];
+        let error = AdapterStack::build(
+            &[
+                adapter_as(DType::F32, 2, 4.0, &modules, 1.0),
+                adapter_as(DType::BF16, 2, 4.0, &modules, 1.0),
+            ],
+            &map,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AdapterError::MixedDtype {
+                adapter: 1,
+                expected: DType::F32,
+                found: DType::BF16
+            }
+        );
     }
 
     /// Two adapters of different ranks stack to the larger rank, zero-padded; entry 0 is the no-adapter

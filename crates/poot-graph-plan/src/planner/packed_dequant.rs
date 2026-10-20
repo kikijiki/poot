@@ -117,7 +117,7 @@ fn try_plan_row_gather(
         crate::packed_block_float::PACKED_LOWERING,
         descriptor,
         crate::packed_block_float::PackedKernelOpKind::RowGather,
-        backend,
+        caps,
     )
     .map_err(|missing| site.refuse(missing))?;
     let spec = PackedKernelSpec {
@@ -200,7 +200,7 @@ fn try_plan_contraction(
         crate::packed_block_float::PACKED_LOWERING,
         descriptor,
         crate::packed_block_float::PackedKernelOpKind::Contraction,
-        backend,
+        caps,
     )
     .map_err(|missing| site.refuse(missing))?;
     let k = descriptor.shape()[1];

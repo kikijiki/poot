@@ -4,9 +4,16 @@
 
 mod chat_template_checkpoints {
     use poot_load::gguf::GgufIndex;
-    use poot_text::{ChatFormat, ChatTemplate, TextCodec, read_tokenizer_config_chat};
+    use poot_text::{ChatFormat, ChatTemplate, TextCodec, chat_from_files};
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
+
+    /// The chat template and bos/eos strings of the checkpoint directory `dir`.
+    fn chat_from_dir(dir: &std::path::Path) -> (Option<String>, Option<String>, Option<String>) {
+        let config = std::fs::read(dir.join("tokenizer_config.json")).ok();
+        let jinja = std::fs::read_to_string(dir.join("chat_template.jinja")).ok();
+        chat_from_files(config.as_deref(), jinja.as_deref())
+    }
 
     const MSGS: &[(&str, &str)] = &[("system", "Be terse."), ("user", "Hi")];
 
@@ -69,7 +76,7 @@ mod chat_template_checkpoints {
         else {
             return;
         };
-        let (tmpl, bos, eos) = read_tokenizer_config_chat(&dir);
+        let (tmpl, bos, eos) = chat_from_dir(&dir);
         let tmpl = tmpl.expect("qwen2.5-0.5b ships a chat_template");
         let out = render_chat(&tmpl, MSGS, bos.as_deref(), eos.as_deref(), None).unwrap();
         assert!(out.contains("<|im_start|>user\nHi<|im_end|>"), "got: {out}");
@@ -87,7 +94,7 @@ mod chat_template_checkpoints {
         else {
             return;
         };
-        let (tmpl, bos, eos) = read_tokenizer_config_chat(&dir);
+        let (tmpl, bos, eos) = chat_from_dir(&dir);
         let tmpl = tmpl.expect("qwen2.5 ships a chat_template");
         let tools = serde_json::json!([{
             "type": "function",
@@ -122,7 +129,7 @@ mod chat_template_checkpoints {
         else {
             return;
         };
-        let (tmpl, bos, eos) = read_tokenizer_config_chat(&dir);
+        let (tmpl, bos, eos) = chat_from_dir(&dir);
         let tmpl = tmpl.expect("qwen2.5 ships a chat_template");
         let tools = serde_json::json!([{
             "type": "function",

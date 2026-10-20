@@ -15,7 +15,6 @@ mod packed_kv;
 mod plan_selection;
 mod prefill_qwen3next;
 mod ssm_linear_attn;
-mod tiled_dequant;
 
 use poot_quant::StoredBytes;
 use poot_tensor::DType;

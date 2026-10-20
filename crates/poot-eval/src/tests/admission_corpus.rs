@@ -30,7 +30,7 @@ use poot_tensor::DType;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use poot_graph_ir::op::{ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep};
+use poot_graph_ir::op::{ContractionHead, FusedOp, FusedOperand, FusedRegion, FusedStep, LocalId};
 use poot_graph_ir::{BinOp, Builder, OpKind, Operand, RedOp, StateRole, TensorType, UnOp};
 
 use crate::exact_value::ExactValue;
@@ -376,12 +376,12 @@ fn reduce_broadcast_reshape_transpose_slice_concat_iota_evaluate() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Gather / Scatter / ScatterUpdate / MatMul / ContractionEpilogue / DynamicUpdateSlice / PackI8 / UnpackI8 /
+// Gather / ScatterUpdate / MatMul / ContractionEpilogue / DynamicUpdateSlice /
 // ArgTopK / IndexedMatMul / AllReduce / AllGather.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn gather_scatter_scatter_update_evaluate() {
+fn gather_scatter_update_evaluate() {
     let b = Builder::for_tests();
     let table = b.constant("table", TensorType::f32(vec![3, 2])).unwrap();
     let index = graph_fixtures::i32_constant(&b, "index", vec![2]).unwrap();
@@ -398,24 +398,6 @@ fn gather_scatter_scatter_update_evaluate() {
     assert_eq!(
         out.as_host().unwrap().as_f32().unwrap(),
         &[5.0, 6.0, 1.0, 2.0]
-    );
-
-    let b = Builder::for_tests();
-    let src = b.constant("src", TensorType::f32(vec![2, 2])).unwrap();
-    let index = graph_fixtures::i32_constant(&b, "index", vec![2]).unwrap();
-    let out = b.scatter(src, index).unwrap();
-    let g = b.finish(out).unwrap();
-    let inputs = dense_inputs([
-        (
-            src.id(),
-            HostTensor::f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]),
-        ),
-        (index.id(), HostTensor::i32(vec![2], vec![1, 0])),
-    ]);
-    let out = eval_every_combination("scatter", &g, &inputs).unwrap();
-    assert_eq!(
-        out.as_host().unwrap().as_f32().unwrap(),
-        &[3.0, 4.0, 1.0, 2.0]
     );
 
     let b = Builder::for_tests();
@@ -465,9 +447,12 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
                     n_inputs: 2,
                     steps: vec![FusedStep {
                         op: FusedOp::Binary(BinOp::Add),
-                        inputs: vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+                        inputs: vec![
+                            FusedOperand::Local(LocalId::new(0)),
+                            FusedOperand::Local(LocalId::new(1)),
+                        ],
                     }],
-                    output: 2,
+                    output: LocalId::new(2),
                     pack: Vec::new(),
                 },
             },
@@ -512,7 +497,7 @@ fn matmul_contraction_epilogue_indexed_matmul_evaluate() {
 }
 
 #[test]
-fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
+fn dynamic_update_slice_arg_top_k_evaluate() {
     let b = Builder::for_tests();
     let base = b.constant("base", TensorType::f32(vec![4])).unwrap();
     let update = b.constant("update", TensorType::f32(vec![2])).unwrap();
@@ -529,26 +514,6 @@ fn dynamic_update_slice_pack_unpack_i8_arg_top_k_evaluate() {
     assert_eq!(
         out.as_host().unwrap().as_f32().unwrap(),
         &[0.0, 9.0, 8.0, 0.0]
-    );
-
-    let b = Builder::for_tests();
-    let x = graph_fixtures::i32_constant(&b, "x", vec![4]).unwrap();
-    let packed = b.pack_i8(x).unwrap();
-    let g = b.finish(packed).unwrap();
-    let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
-    let out = eval_every_combination("pack_i8", &g, &inputs).unwrap();
-    assert!(out.as_host().unwrap().as_i32().is_some());
-
-    let b = Builder::for_tests();
-    let x = graph_fixtures::i32_constant(&b, "x", vec![4]).unwrap();
-    let packed = b.pack_i8(x).unwrap();
-    let out = b.unpack_i8(packed, 4).unwrap();
-    let g = b.finish(out).unwrap();
-    let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
-    let out = eval_every_combination("unpack_i8", &g, &inputs).unwrap();
-    assert_eq!(
-        out.as_host().unwrap().as_f32().unwrap(),
-        &[1.0, 2.0, 3.0, 4.0]
     );
 
     // ArgTopK's input is a precomputed per-element RANK (0 = best), not a raw score: `out[r] = i` for
@@ -922,6 +887,52 @@ fn cast_i8_source_chain_rows_evaluate() {
     }
 }
 
+/// POOT-1241 SC-004: the `F32 -> I32` range is the half-open `[-2^31, 2^31)`. `i32::MAX as f32` rounds up
+/// to 2^31, so a `>` comparison against it admitted 2147483648.0 and `as i32` saturated it to `i32::MAX`
+/// without a fault. The words either side of the boundary pin both ends: the largest f32 below 2^31
+/// and `-2^31` cast exactly, and 2^31 and the next f32 below `-2^31` are `CastFault`s.
+///
+/// Mutation: change the `F32 -> I32` range check in `walk.rs` back to `value.abs() > i32::MAX as f32`;
+/// the 2^31 row publishes `i32::MAX` instead of a fault and goes red.
+#[test]
+fn cast_f32_to_i32_range_is_half_open_at_two_to_the_31() {
+    use crate::CastOperand;
+
+    let cast = |value: f32| {
+        let b = Builder::for_tests();
+        let x = b.constant("x", TensorType::f32(vec![1])).unwrap();
+        let y = b.cast(x, poot_tensor::DType::I32).unwrap();
+        let g = b.finish(y).unwrap();
+        let inputs = HashMap::from([(x.id(), Value::from(HostTensor::f32(vec![1], vec![value])))]);
+        eval(&g, &inputs, EvalOptions::default()).map(|result| {
+            result
+                .output
+                .into_host()
+                .expect("a cast evaluates a dense graph")
+                .as_i32()
+                .expect("the cast publishes I32 words")
+                .to_vec()
+        })
+    };
+    let largest_below = f32::from_bits(2147483648.0f32.to_bits() - 1);
+    assert_eq!(cast(largest_below).unwrap(), [2147483520]);
+    assert_eq!(cast(-2147483648.0).unwrap(), [i32::MIN]);
+    for (value, label) in [
+        (2147483648.0f32, "2^31"),
+        (
+            f32::from_bits((-2147483648.0f32).to_bits() + 1),
+            "below -2^31",
+        ),
+    ] {
+        match cast(value) {
+            Err(EvalError::Cast(fault)) => {
+                assert_eq!(fault.value, CastOperand::F32(value), "{label}");
+            }
+            other => panic!("{label}: expected a Cast fault, got {other:?}"),
+        }
+    }
+}
+
 /// Card 555: `Cast(BF16, E4M3FN)` chained after a `Cast(F32, BF16)` - the BF16 value
 /// is one the walk itself published (a BF16 host tensor of words), not an owner/exact or bound BF16
 /// value. Every pair `infer` admits must evaluate on that value too, not only on the bound BF16
@@ -944,7 +955,7 @@ fn cast_bf16_to_e4m3fn_evaluates_a_walk_published_bf16() {
 // ---------------------------------------------------------------------------------------------
 // SC-001's own named row: the BF16/F16 dtype tuples `infer` admits for
 // the families found reading a narrowed operand's empty `data` directly (`Gather` x2,
-// `Scatter`, `IndexedMatMul`, `PackI8`, `Reshape`), plus the Spec-376 BF16 admission table's own
+// `IndexedMatMul`, `Reshape`), plus the Spec-376 BF16 admission table's own
 // `Gather` row (`resolve::classify`), whose mutation this file did not reach before (every row
 // above binds a plain F32 table, never a BF16 one).
 // ---------------------------------------------------------------------------------------------
@@ -1014,26 +1025,6 @@ fn every_infer_admitted_pair_evaluates() {
     assert!(t.numel() > 0, "published an empty payload");
     assert_eq!(t.to_f32().unwrap().as_ref(), &[5.0, 6.0, 1.0, 2.0]);
 
-    // Probe: a BF16 `src` for axis-0 `Scatter` (no `Scatter` row exists in the Spec-376
-    // table at all) must decode through `ops::movement::scatter_axis0`'s `f32_view` read.
-    let b = Builder::for_tests();
-    let src = b
-        .constant("src", TensorType::new(vec![2, 2], DType::BF16))
-        .unwrap();
-    let index = graph_fixtures::i32_constant(&b, "index", vec![2]).unwrap();
-    let out = b.scatter(src, index).unwrap();
-    let g = b.finish(out).unwrap();
-    let inputs = dense_inputs([
-        (src.id(), bf16_host(vec![2, 2], &[1.0, 2.0, 3.0, 4.0])),
-        (index.id(), HostTensor::i32(vec![2], vec![1, 0])),
-    ]);
-    let out = eval_every_combination("scatter bf16 src", &g, &inputs).unwrap();
-    let Value::Host(t) = &out else {
-        panic!("expected dense, got {out:?}")
-    };
-    assert!(t.numel() > 0, "published an empty payload");
-    assert_eq!(t.to_f32().unwrap().as_ref(), &[3.0, 4.0, 1.0, 2.0]);
-
     // Probe: `IndexedMatMul` has no Spec-376 row either, so an F32 activation times a
     // BF16 weight must decode the weight through `to_f32` in `ops::contraction::indexed_matmul`.
     let b = Builder::for_tests();
@@ -1054,21 +1045,6 @@ fn every_infer_admitted_pair_evaluates() {
     ]);
     let out = eval_every_combination("indexed_matmul f32 x bf16 w", &g, &inputs).unwrap();
     assert_eq!(out.as_host().unwrap().as_f32().unwrap(), &[2.0, 1.0]);
-
-    // Probe: `PackI8`'s input declared I32 (rather than its usual F32 quantization
-    // result): `ops::index::pack_i8` must read the I32 words.
-    let b = Builder::for_tests();
-    let x = graph_fixtures::i32_constant(&b, "x", vec![4]).unwrap();
-    let packed = b.pack_i8(x).unwrap();
-    let g = b.finish(packed).unwrap();
-    let inputs = dense_inputs([(x.id(), HostTensor::i32(vec![4], vec![1, 2, 3, 4]))]);
-    let out = eval_every_combination("pack_i8 exact i32 (words only)", &g, &inputs).unwrap();
-    let t = out.as_host().unwrap();
-    assert_eq!(
-        t.as_i32(),
-        Some(&[0x0403_0201_i32][..]),
-        "PackI8 must publish the 4 codes packed into one word, read from the I32 words"
-    );
 
     // Probe: an F32 tensor bound to an F16-declared input is a bind-time
     // `EvalError::Input` (`walk::preflight_bindings`): the walk never converts at bind, so `Reshape`

@@ -21,7 +21,7 @@ use poot_graph_plan::{
     ShardRule, multi_device::topology::DeviceId, staged::DevicePlacement, staged::ExpertPlacement,
     staged::Partition, staged::TargetSet,
 };
-use poot_quant::weights::{WeightId, WeightMap, WeightRole, WeightView};
+use poot_weights::{WeightId, WeightMap, WeightRole, WeightView};
 
 use crate::driver::ModelHandle;
 use crate::driver::error::{DriverError, InvalidOptions};

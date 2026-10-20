@@ -88,8 +88,8 @@ impl Placement {
                 .flat_map(|from| distinct.iter().map(move |to| (*from, *to)))
                 .filter(|(from, to)| from.device != to.device)
                 .flat_map(|(from, to)| {
-                    let to_kinds = target_link_kinds(to.target.id());
-                    target_link_kinds(from.target.id())
+                    let to_kinds = target_link_kinds(&to.target);
+                    target_link_kinds(&from.target)
                         .iter()
                         .filter(move |kind| to_kinds.contains(kind))
                         .map(move |&kind| LinkCapability {

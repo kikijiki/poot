@@ -28,7 +28,7 @@ The common tasks are wrapped as `just` recipes (run `just` with no args to list 
 ```bash
 just build     # cargo build --workspace
 just gate      # the local merge gate: fmt-check, clippy with -D warnings, then just test
-just test      # dead-pub/dependency gates, self-tests, model-free test inventory and doctests
+just test      # dead-pub/dependency gates, self-tests, model-free test inventory and doctests; includes crates-standalone (every library builds alone)
 just check     # cargo check
 just clippy    # lints
 just fmt       # format every crate
@@ -45,7 +45,7 @@ a checkpoint run in separate lanes, and each device lane fails before any test r
 ```bash
 just test-device-wgpu      # the required migrated wgpu cases (executor contract, packed serving, launch widening, I32, cr30 failure lifecycle), wgpu device required
 just test-device-kernels   # pootc and poot-kernelgen kernel suites, wgpu device required
-just test-device-vulkan    # raw Vulkan add dispatch
+just test-device-vulkan    # raw Vulkan: live caps receipt, executor contract, parity table and driver generation rows, under the validation layer
 just test-device-rocm      # poot-rocm-device resident probes and packed-serving cases
 just test-device-ptx       # one PTX probe, on an NVIDIA machine
 just test-real-dims        # tests named *_real_dims, in release

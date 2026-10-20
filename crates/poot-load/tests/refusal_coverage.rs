@@ -39,7 +39,9 @@ fn a_shard_that_is_not_a_regular_file_is_a_map_refusal() {
     let dir = poot_test_util::unique_temp_path("rc-map");
     std::fs::create_dir_all(dir.join("model.safetensors")).unwrap();
     let error = refusal(
-        map_weight_files(&*dir),
+        map_weight_files(&*dir, |name| {
+            std::fs::read(dir.join(name)).map_err(LoadError::from)
+        }),
         "a directory named model.safetensors",
     );
     assert!(
@@ -48,13 +50,13 @@ fn a_shard_that_is_not_a_regular_file_is_a_map_refusal() {
     );
 }
 
-/// A LoRA adapter whose `lora_A` is stored as I64: the dtype is recognized but has no f32 decode, so
-/// the adapter loader refuses it by dtype instead of reading integers as floats.
+/// A LoRA adapter whose `lora_A` is stored as I64: the adapter loader refuses it by dtype instead of
+/// reading integers as floats.
 ///
-/// Mutation: in `lora::dense_f32` report an undecodable dtype as `LoadError::SafeTensors`; red:
-/// `expected UndecodableCheckpointDtype naming I64, got: safetensors: I64`.
+/// Mutation: in `lora::factor` report the dtype as `LoadError::SafeTensors`; red:
+/// `expected LoraFactorDtype naming I64, got: safetensors: I64`.
 #[test]
-fn a_lora_tensor_of_a_dtype_with_no_f32_decode_is_refused() {
+fn a_lora_tensor_of_a_non_float_dtype_is_refused() {
     let dir = poot_test_util::unique_temp_path("rc-lora");
     std::fs::create_dir_all(&*dir).unwrap();
     std::fs::write(
@@ -72,8 +74,14 @@ fn a_lora_tensor_of_a_dtype_with_no_f32_decode_is_refused() {
     .unwrap();
     let error = refusal(LoraAdapter::load(&*dir), "an I64 lora_A");
     assert!(
-        matches!(&error, LoadError::UndecodableCheckpointDtype { name } if name.contains("I64")),
-        "expected UndecodableCheckpointDtype naming I64, got: {error}"
+        matches!(
+            &error,
+            LoadError::LoraFactorDtype {
+                dtype: poot_tensor::DType::I64,
+                ..
+            }
+        ),
+        "expected LoraFactorDtype naming I64, got: {error}"
     );
 }
 

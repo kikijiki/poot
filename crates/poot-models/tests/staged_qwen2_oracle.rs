@@ -16,10 +16,10 @@ use poot_graph_plan::staged::{
 use poot_graph_plan::{CollectiveKind, CompileLimits, CompileOptions, LoraPlan, Target};
 use poot_models::model::{LogitRows, StepSpec};
 use poot_models::test_support::dense::{Dense, Family, step};
-use poot_quant::weights::LoraTarget;
 use poot_target::Backend;
 use poot_tensor::HostTensor;
 use poot_test_util::{device_caps::default_caps_for, fill};
+use poot_weights::LoraTarget;
 
 /// Layers of the traced qwen2.
 const LAYERS: usize = 3;
@@ -136,6 +136,7 @@ fn a_lora_graph_cut_across_stages_equals_the_unpartitioned_adapted_graph() {
         rows: NonZeroUsize::new(rows).unwrap(),
         adapters: NonZeroUsize::new(1).unwrap(),
         rank: NonZeroUsize::new(2).unwrap(),
+        factor_dtype: poot_tensor::DType::F32,
         projections: LoraTarget::ALL.to_vec(),
     };
     let with_lora = options().with_lora(lora);

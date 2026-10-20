@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, BuilderError, Graph, StateRole, TraceBudgetExceeded, TraceLimits};
-use poot_quant::weights::{HandleFormat, WeightId, WeightMap, WeightMapError};
+use poot_weights::{HandleFormat, WeightId, WeightMap, WeightMapError};
 
 use poot_text::{ChatFormat, ToolCallCodec};
 
@@ -312,7 +312,7 @@ impl dyn Model + '_ {
     /// use poot_graph_ir::{Builder, Graph, TraceLimits};
     /// use poot_models::io::ModelSchema;
     /// use poot_models::model::{Model, ModelConfig, StepSpec, TraceError};
-    /// use poot_quant::weights::WeightMap;
+    /// use poot_weights::WeightMap;
     ///
     /// #[derive(Debug)]
     /// struct Skips;

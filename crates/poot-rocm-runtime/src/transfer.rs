@@ -11,9 +11,10 @@ use crate::context::{
     upload_strategy_for_pool,
 };
 use crate::discovery::{
-    GpuPicker, PoolState, agent_isa_name, agent_name, agent_vendor, agent_wavefront_size,
-    amd_agent_is_apu, amd_agent_memory_avail, amd_agent_product_name, amd_agent_u32_info,
-    amd_pool_size, cpu_to_pool_link_types, enable_device_timing, first_cpu_agent, runtime_version,
+    GpuPicker, PoolState, agent_isa_name, agent_limits, agent_name, agent_vendor,
+    agent_wavefront_size, amd_agent_is_apu, amd_agent_memory_avail, amd_agent_product_name,
+    amd_agent_u32_info, amd_pool_size, cpu_to_pool_link_types, enable_device_timing,
+    first_cpu_agent, runtime_version,
 };
 use crate::error::check;
 use crate::ffi::Hsa;
@@ -354,6 +355,9 @@ impl RocmContext {
             amd_agent_u32_info(&hsa.funcs, gpu_agent, HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT)
         };
 
+        // SAFETY: discovery contract (above).
+        let limits = unsafe { agent_limits(&hsa.funcs, gpu_agent) }?;
+
         // From here the shared runtime owner's `Drop` owns `hsa_shut_down`; disarm the guard so it does
         // not also fire.
         shutdown_guard.armed = false;
@@ -377,6 +381,7 @@ impl RocmContext {
             device_ring_receipt,
             vram_total_bytes,
             compute_units,
+            limits,
             timeouts,
             pending: Mutex::default(),
             upload_ring: Mutex::default(),

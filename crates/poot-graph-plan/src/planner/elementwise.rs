@@ -14,7 +14,7 @@ use crate::kernel_mapping::{
 use crate::planner::{GraphTables, Layout};
 use crate::predicates::{ELEMENTWISE_2D_WIDTH, elementwise_fold, row_parallel_width};
 use crate::refusal::Site;
-use poot_target::Backend;
+use poot_graph_ir::LocalId;
 
 /// Plan one elementwise-family equation (Binary/Select/Unary/Rope/Reduce/Fused/FusedRow).
 #[expect(clippy::too_many_arguments)]
@@ -54,9 +54,7 @@ pub(super) fn plan(
     // large `workgroup_size` gets. `finalize` bakes `workgroup_size[0] = ELEMENTWISE_2D_WIDTH` whenever
     // the predicate holds; `generate` derives the matching `x_groups` and grid from the same decision.
     let fold = match lowering {
-        Lowering::Gpu { backend, caps } => {
-            elementwise_fold(g, backend, eqn, out_shape, out_numel, caps)
-        }
+        Lowering::Gpu { caps, .. } => elementwise_fold(g, eqn, out_shape, out_numel, caps),
         // A sequential loop has no grid to fold onto.
         Lowering::Aie(_) => kg::Fold {
             numel: out_numel,
@@ -172,10 +170,7 @@ pub(super) fn plan(
                 DType::BF16 | DType::F16
                     if matches!(
                         lowering,
-                        Lowering::Gpu {
-                            backend: Backend::Nvptx | Backend::AmdGcn(_),
-                            ..
-                        }
+                        Lowering::Gpu { caps, .. } if caps.native_two_byte_floats
                     ) =>
                 {
                     if odt == DType::BF16 {
@@ -222,7 +217,6 @@ pub(super) fn plan(
                     GUnOp::Neg
                     | GUnOp::Recip
                     | GUnOp::Sqrt
-                    | GUnOp::Round
                     | GUnOp::Exp
                     | GUnOp::Log
                     | GUnOp::Tanh
@@ -278,13 +272,13 @@ pub(super) fn plan(
             let locals = region
                 .local_types(&input_tys)
                 .expect("a validated fused region infers");
-            let local_dtype = |local: usize| locals[local].dtype;
+            let local_dtype = |local: LocalId| locals[local.index()].dtype;
             let steps = region
                 .steps
                 .iter()
                 .enumerate()
                 .map(|(j, st)| {
-                    let exact_step = local_dtype(region.n_inputs + j) == DType::I32;
+                    let exact_step = local_dtype(LocalId::new(region.n_inputs + j)) == DType::I32;
                     Ok(kg::FusedStep {
                         op: map_pointwise_step(site, st.op, &st.inputs, exact_step, local_dtype)?,
                         inputs: st
@@ -341,7 +335,9 @@ pub(super) fn plan(
                     Ok(match st {
                         RowStep::Pointwise { op, inputs } => kg::RowOp::Pointwise {
                             op: {
-                                check_widening_step(site, *op, inputs, |id| id < region.n_inputs)?;
+                                check_widening_step(site, *op, inputs, |id| {
+                                    id.index() < region.n_inputs
+                                })?;
                                 map_fused_op(site, *op)?
                             },
                             inputs: inputs
@@ -374,7 +370,7 @@ pub(super) fn plan(
                 steps,
                 // the region's output local id uses the same 0..n_inputs leaves, n_inputs+s steps
                 // numbering as the kernelgen recipe.
-                output: region.output,
+                output: region.output.index(),
             };
             generate(KernelRequest::Row(RowSpec::Fused {
                 out_shape: out_shape.to_vec(),

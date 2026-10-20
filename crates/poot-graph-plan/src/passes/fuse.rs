@@ -3,7 +3,7 @@ use super::{
     HashMap, HashSet, OpKind, Operand, RowRegion, RowStep, TensorType, UnOp, ValueId,
     collapse_reshape_chains, elide_noop_transposes, with_eqns,
 };
-use poot_graph_ir::{ContractionRows, ValueTable};
+use poot_graph_ir::{ContractionRows, LocalId, ValueTable};
 /// The `f32` unaries the pointwise-fusion phase admits into a region. [`kernel_mapping::map_fused_op`]
 /// (`poot-graph-plan`) must lower every one of these inside a fused region: legality here and the
 /// kernel table are one contract (card 536b, R481-007), checked by
@@ -68,7 +68,7 @@ pub(super) fn lone_pointwise_region(g: &Graph, eqn: &Eqn) -> Option<(FusedRegion
                         leaves.push(*value);
                         leaves.len() - 1
                     });
-                FusedOperand::Local(local)
+                FusedOperand::Local(LocalId::new(local))
             }
             Operand::Lit(scalar) => FusedOperand::Lit(*scalar),
         })
@@ -81,7 +81,7 @@ pub(super) fn lone_pointwise_region(g: &Graph, eqn: &Eqn) -> Option<(FusedRegion
     let region = FusedRegion {
         n_inputs,
         steps: vec![step],
-        output: n_inputs,
+        output: LocalId::new(n_inputs),
         pack: Vec::new(),
     };
     Some((region, leaves))
@@ -152,7 +152,7 @@ fn region_layout(
     g: &Graph,
     members: &[usize],
     producer: &ValueTable<Option<usize>>,
-) -> (usize, Vec<ValueId>, HashMap<ValueId, usize>) {
+) -> (usize, Vec<ValueId>, HashMap<ValueId, LocalId>) {
     let member_set: HashSet<usize> = members.iter().copied().collect();
     let consumed_internally = |out: ValueId| -> bool {
         members.iter().any(|&m| {
@@ -167,14 +167,14 @@ fn region_layout(
         .find(|&&m| !consumed_internally(g.eqns()[m].out))
         .expect("a fused region has exactly one escaping (root) output");
 
-    let mut local_of: HashMap<ValueId, usize> = HashMap::new();
+    let mut local_of: HashMap<ValueId, LocalId> = HashMap::new();
     let mut leaves: Vec<ValueId> = Vec::new();
     for &m in members {
         for o in &g.eqns()[m].inputs {
             if let Operand::Value(v) = o {
                 let internal = producer[*v].is_some_and(|p| member_set.contains(&p));
                 if !internal && !local_of.contains_key(v) {
-                    local_of.insert(*v, leaves.len());
+                    local_of.insert(*v, LocalId::new(leaves.len()));
                     leaves.push(*v);
                 }
             }
@@ -182,13 +182,13 @@ fn region_layout(
     }
     let n_inputs = leaves.len();
     for (s, &m) in members.iter().enumerate() {
-        local_of.insert(g.eqns()[m].out, n_inputs + s);
+        local_of.insert(g.eqns()[m].out, LocalId::new(n_inputs + s));
     }
     (root, leaves, local_of)
 }
 
 /// Map an outer operand to a region operand, given the local map.
-fn to_region_operand(o: &Operand, local_of: &HashMap<ValueId, usize>) -> FusedOperand {
+fn to_region_operand(o: &Operand, local_of: &HashMap<ValueId, LocalId>) -> FusedOperand {
     match o {
         Operand::Value(v) => FusedOperand::Local(local_of[v]),
         Operand::Lit(s) => FusedOperand::Lit(*s),
@@ -246,7 +246,7 @@ fn i32_region_leaves(
                 continue;
             }
             if let Some(&input) = leaf_index.get(value) {
-                operand_of.insert(*value, FusedOperand::Local(input));
+                operand_of.insert(*value, FusedOperand::Local(LocalId::new(input)));
                 continue;
             }
             if let Some((slice_eqn, parent, lane)) = i32_unit_last_slice(g, producer, *value) {
@@ -255,19 +255,28 @@ fn i32_region_leaves(
                     leaves.push(parent);
                     index
                 });
-                operand_of.insert(*value, FusedOperand::PackLane { input, lane });
+                operand_of.insert(
+                    *value,
+                    FusedOperand::PackLane {
+                        input: LocalId::new(input),
+                        lane,
+                    },
+                );
                 slice_eqns.push(slice_eqn);
                 continue;
             }
             let input = leaves.len();
             leaf_index.insert(*value, input);
             leaves.push(*value);
-            operand_of.insert(*value, FusedOperand::Local(input));
+            operand_of.insert(*value, FusedOperand::Local(LocalId::new(input)));
         }
     }
     let n_inputs = leaves.len();
     for (step, &member) in members.iter().enumerate() {
-        operand_of.insert(g.eqns()[member].out, FusedOperand::Local(n_inputs + step));
+        operand_of.insert(
+            g.eqns()[member].out,
+            FusedOperand::Local(LocalId::new(n_inputs + step)),
+        );
     }
     let absorbed_slices = slice_eqns
         .into_iter()
@@ -697,14 +706,14 @@ pub(crate) fn fuse_contraction_epilogues(
             }
         }
         let n_inputs = 1 + extras.len();
-        let local_of = |v: ValueId| -> usize {
-            if v == head.out {
+        let local_of = |v: ValueId| -> LocalId {
+            LocalId::new(if v == head.out {
                 0
             } else if let Some(position) = chain.iter().position(|&c| g.eqns()[c].out == v) {
                 n_inputs + position
             } else {
                 1 + leaf_of[&v]
-            }
+            })
         };
         let steps: Vec<FusedStep> = chain
             .iter()
@@ -725,7 +734,7 @@ pub(crate) fn fuse_contraction_epilogues(
             region: FusedRegion {
                 n_inputs,
                 steps,
-                output: n_inputs + chain.len() - 1,
+                output: LocalId::new(n_inputs + chain.len() - 1),
                 pack: Vec::new(),
             },
         };
@@ -954,7 +963,7 @@ fn fuse_i32_pack_concat(
                     .collect(),
             })
             .collect();
-        let pack: Vec<usize> = parts
+        let pack: Vec<LocalId> = parts
             .iter()
             .map(|value| match operand_of[value] {
                 FusedOperand::Local(id) => id,

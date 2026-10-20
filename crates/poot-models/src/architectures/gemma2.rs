@@ -8,7 +8,8 @@
 //! pre-feedforward and post-feedforward), a GeGLU feed-forward, and the embedding scaled by
 //! `sqrt(hidden_size)`.
 
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 
 use crate::components::attention::AttentionParams;
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};

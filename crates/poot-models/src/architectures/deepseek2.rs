@@ -24,8 +24,9 @@ use std::sync::Arc;
 
 use poot_graph_ir::rope_table::RopeFlavor;
 use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{
-    AttnRole, DsaRole, ExpertProj, FfnRole, MlaRole, NormRole, WeightMap, WeightRole, WeightStore,
+use poot_quant::weights::WeightStore;
+use poot_weights::{
+    AttnRole, DsaRole, ExpertProj, FfnRole, MlaRole, NormRole, WeightMap, WeightRole,
 };
 
 use crate::components::dims::{Field, Fields};
@@ -1138,7 +1139,8 @@ pub(crate) mod family_tests {
     use poot_graph_ir::OpKind;
     use poot_graph_plan::{WeightFormats, bind_packed_weights};
     use poot_load::gguf::GgufValue;
-    use poot_quant::weights::{HandleFormat, WeightEntry};
+    use poot_quant::weights::WeightEntry;
+    use poot_weights::HandleFormat;
     use serde_json::json;
 
     use super::*;

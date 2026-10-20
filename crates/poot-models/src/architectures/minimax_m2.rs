@@ -10,9 +10,10 @@
 //! the same family. The checkpoint's quantization (FP8 blocks) is the loader's business; the
 //! family names its tensors and reads them as stored.
 
+use poot_quant::weights::WeightStore;
 #[cfg(feature = "test-support")]
 use poot_quant::weights::{DenseWeight, WeightEntry};
-use poot_quant::weights::{ExpertProj, WeightMap, WeightStore};
+use poot_weights::{ExpertProj, WeightMap};
 
 use crate::components::attention::{AttentionParams, QkNorm};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};

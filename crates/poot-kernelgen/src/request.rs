@@ -127,6 +127,27 @@ pub struct BodyUse {
     pub workgroup: [u32; 3],
     /// Every distinct matrix fragment, in first-use order.
     pub fragments: Vec<FragmentUse>,
+    /// Whether any local or workgroup-local array of the body holds 64-bit floats, so the device must run the
+    /// `Float64` capability.
+    pub uses_float64: bool,
+}
+
+/// Whether `ty` is, or is made of, a 64-bit float.
+fn mentions_float64(ty: &Ty) -> bool {
+    match ty {
+        Ty::F64 => true,
+        Ty::Ref { pointee, .. } => mentions_float64(pointee),
+        Ty::Slice(elem) | Ty::Array { elem, .. } | Ty::Vec { elem, .. } => mentions_float64(elem),
+        Ty::Unit
+        | Ty::Bool
+        | Ty::Usize
+        | Ty::F16
+        | Ty::BF16
+        | Ty::F32
+        | Ty::I32
+        | Ty::U32
+        | Ty::Fragment(_) => false,
+    }
 }
 
 /// A workgroup-local array whose element type has no defined width.
@@ -179,10 +200,16 @@ impl BodyUse {
                 fragments.push(used);
             }
         }
+        let uses_float64 = body.locals.iter().any(|local| mentions_float64(&local.ty))
+            || body
+                .workgroup_locals
+                .iter()
+                .any(|decl| mentions_float64(&decl.elem_ty));
         Ok(Self {
             lds_bytes,
             workgroup: body.workgroup_size,
             fragments,
+            uses_float64,
         })
     }
 }

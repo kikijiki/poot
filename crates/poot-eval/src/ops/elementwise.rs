@@ -25,7 +25,6 @@ pub(crate) fn unary_f32(op: UnOp, x: &HostTensor) -> Result<HostTensor, EvalErro
             UnOp::Log => v.ln(),
             UnOp::Sqrt => v.sqrt(),
             UnOp::Recip => 1.0 / v,
-            UnOp::Round => v.round(),
             // True libm tanh/erf, independent of the devices' expansions, so GPU==CPU rows check device
             // accuracy.
             UnOp::Tanh => libm::tanhf(v),

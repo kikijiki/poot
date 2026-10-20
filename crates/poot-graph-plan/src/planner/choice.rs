@@ -848,7 +848,7 @@ mod tests {
     #[test]
     fn a_template_with_a_mutable_read_param_is_a_typed_plan_error() {
         let PlannedDispatch { mut dispatch } = Planned::imported_dispatch(
-            ImportedKernel::PackI8,
+            ImportedKernel::PackedBf16RowGather,
             Backend::SpirvVulkan,
             Some(vec![4]),
             [8, 1, 1],

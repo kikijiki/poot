@@ -265,29 +265,25 @@ impl Context {
         let measured_max_buffer = device_local_max
             .min(max_allocation)
             .min(u64::from(props.limits.max_storage_buffer_range));
-        let is_amd_radv = props.vendor_id == 0x1002;
-        let (max_buffer_bytes, watchdog_budget, known_miscompiles) = if is_amd_radv {
-            let d = poot_target::DeviceCaps::wgpu_rdna3_igpu();
-            (
-                measured_max_buffer.min(poot_target::AMD_RADV_SAFE_MAX_BUFFER_BYTES),
-                d.watchdog_budget,
-                d.known_miscompiles,
-            )
-        } else {
-            (
-                measured_max_buffer,
-                None,
-                poot_target::KnownMiscompiles::default(),
-            )
-        };
-        // Channel data is per part, read from the device's own name (RADV names Strix Halo in it).
-        let dram_channels = {
+        // The device's name, read once: the calibration table and the channel map are keyed by it.
+        let device_name = {
             let name = bytemuck_cast_i8_to_u8(&props.device_name);
             let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-            poot_target::dram_channels::DramChannels::of_device_name(&String::from_utf8_lossy(
-                &name[..end],
-            ))
+            String::from_utf8_lossy(&name[..end]).into_owned()
         };
+        // Observed facts about one device (display watchdog, tiled-GEMM ceiling, safe buffer size), not driver
+        // answers: only a device the table names gets them, and any other reports none.
+        let calibration =
+            poot_target::calibration::Calibration::of_vulkan_device(props.vendor_id, &device_name)
+                .known()
+                .unwrap_or(poot_target::calibration::Calibration::UNMEASURED);
+        let max_buffer_bytes = calibration
+            .safe_max_buffer_bytes
+            .map_or(measured_max_buffer, |safe| measured_max_buffer.min(safe));
+        let watchdog_budget = calibration.watchdog_budget;
+        let known_miscompiles = calibration.known_miscompiles;
+        // Channel data is per part, read from the device's own name (RADV names Strix Halo in it).
+        let dram_channels = poot_target::dram_channels::DramChannels::of_device_name(&device_name);
         // Card 653: AMD's shader-core properties where the driver exposes them, else
         // the RDNA3 default, as the wgpu runtime does.
         // SAFETY: `physical_device` is from this instance's own enumeration.
@@ -334,6 +330,15 @@ impl Context {
                 unsafe { device_local_heap_budget(&owner.instance, physical_device) }.budget
             }),
             dram_channels,
+            shader_features: features.shader_features(),
+            // SPIR-V holds E4M3FN in packed lanes and has no native two-byte float lane on any Vulkan device.
+            e4m3_storage: poot_target::E4m3Storage::PackedLanes,
+            matrix_lowering: poot_target::MatrixLowering::vulkan(tensor_core),
+            native_two_byte_floats: false,
+            widens_bf16_decode_weight: false,
+            imported_lds_array_bodies: true,
+            peer_transport: false,
+            decode_gemv_max_out_cols: None,
         };
 
         Ok(Context {

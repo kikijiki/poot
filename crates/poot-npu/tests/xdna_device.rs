@@ -273,16 +273,15 @@ fn the_declared_tile_memory_is_the_size_that_links_and_runs() {
 fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
     use poot_graph_ir::RedOp;
     use poot_graph_plan::Capability;
-    use poot_kernelgen::KernelGenError;
 
     let Some(npu) = npu() else { return };
     let target = npu.engine.device().target();
     let f32s = |shape: &[usize]| TensorType::f32(shape.to_vec());
 
-    let unary = {
+    let narrowing_cast = {
         let b = Builder::for_tests();
         let x = b.constant("x", f32s(&[2, 3])).unwrap();
-        let out = b.unary(poot_graph_ir::UnOp::Round, x).unwrap();
+        let out = b.cast(x, poot_tensor::DType::BF16).unwrap();
         b.finish(out).unwrap()
     };
     let leading_reduce = {
@@ -305,14 +304,12 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
         b.finish(out).unwrap()
     };
 
-    let kernelgen_unsupported = |missing: &Capability| {
-        matches!(
-            missing,
-            Capability::KernelGen(KernelGenError::Unsupported { .. })
-        )
-    };
-    let unary = refusal_of(unary, target);
-    assert!(kernelgen_unsupported(&unary.missing), "{unary:?}");
+    let narrowing_cast = refusal_of(narrowing_cast, target);
+    assert_eq!(
+        narrowing_cast.missing,
+        Capability::GpuOnly,
+        "{narrowing_cast:?}"
+    );
     let leading_reduce = refusal_of(leading_reduce, target);
     assert_eq!(
         leading_reduce.missing,
@@ -327,7 +324,7 @@ fn equations_the_npu_cannot_lower_are_refused_with_typed_capabilities() {
         Capability::CollectiveInStage,
         "{collective:?}"
     );
-    for refusal in [&unary, &leading_reduce, &matmul, &collective] {
+    for refusal in [&narrowing_cast, &leading_reduce, &matmul, &collective] {
         assert_eq!(
             refusal.target,
             poot_target::TargetId::Aie(poot_target::AieTargetId::Xdna2)

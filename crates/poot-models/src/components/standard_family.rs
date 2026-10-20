@@ -13,8 +13,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use poot_graph_ir::{Builder, Graph};
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
 use poot_text::{ChatFormat, ToolCallCodec};
+use poot_weights::WeightMap;
 
 use crate::components::attention::{AttentionParams, AttentionWeights, QkNorm, attention};
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields};

@@ -175,12 +175,6 @@ pub enum MovementOp {
         /// When set, the dispatch writes only this window of the output's units.
         window: Option<UnitWindow>,
     },
-    /// `out[index[s], ..] = src[s, ..]` for an `I32` index that is a permutation of the output's rows. One
-    /// thread owns one source element, so only [`Storage::Elements`] stores it.
-    PermuteRows {
-        /// The source tensor's logical shape; its rows are the index's length.
-        src_shape: Vec<usize>,
-    },
 }
 
 /// A data-movement kernel: the storage its tensors share, the output shape, the index mapping and how the
@@ -221,11 +215,10 @@ impl MovementSpec {
     }
 
     /// Threads the dispatch launches: one per output buffer unit (one per source unit for
-    /// [`MovementOp::PermuteRows`] and [`MovementOp::ScatterRows`], one per window thread for a windowed
+    /// [`MovementOp::ScatterRows`], one per window thread for a windowed
     /// scatter).
     pub fn threads(&self) -> usize {
         match &self.op {
-            MovementOp::PermuteRows { src_shape, .. } => src_shape.iter().product(),
             MovementOp::ScatterRows {
                 window: Some(window),
                 ..
@@ -476,25 +469,6 @@ impl MovementSpec {
                         what: "scatter window offset".to_string(),
                         value: window.offset,
                         bound: units,
-                    });
-                }
-                Ok(())
-            }
-            MovementOp::PermuteRows { src_shape } => {
-                if !matches!(self.storage, Storage::Elements { .. }) {
-                    return Err(KernelGenError::Unsupported {
-                        request: G,
-                        reason: "a permuted-row scatter writes one element per thread, so it needs element storage",
-                    });
-                }
-                same_rank("src_shape", src_shape)?;
-                nonempty("src_shape", src_shape)?;
-                if rank == 0 || src_shape != &self.out_shape {
-                    return Err(KernelGenError::ShapeMismatch {
-                        generator: G,
-                        what: "permuted-row scatter source".to_string(),
-                        a: src_shape.clone(),
-                        b: self.out_shape.clone(),
                     });
                 }
                 Ok(())

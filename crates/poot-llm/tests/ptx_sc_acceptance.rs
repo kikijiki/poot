@@ -113,7 +113,7 @@ fn store_for(graphs: &[&Graph]) -> WeightStore {
 }
 
 /// How the executable binds `weights`' store: through the map naming each const by its weight id.
-fn map_source(weights: ConstWeights<'_>) -> Arc<poot_quant::weights::WeightMap> {
+fn map_source(weights: ConstWeights<'_>) -> Arc<poot_weights::WeightMap> {
     Arc::new(weights.map())
 }
 

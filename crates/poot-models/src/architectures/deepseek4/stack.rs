@@ -4,7 +4,7 @@
 //! norm. This is the family's own topology; everything a block computes is a component.
 
 use poot_graph_ir::{Builder, Traced, ValidationId};
-use poot_quant::weights::{NormRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{NormRole, WeightId, WeightMap, WeightRole};
 
 use super::config::{DeepseekV4Config, LayerKind};
 use super::csa::{self, IndexerWeights};

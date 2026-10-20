@@ -138,13 +138,6 @@ pub enum Capability {
         /// The reduced axis.
         axis: usize,
     },
-    /// `Scatter` has no kernel over an axis other than 0 on any target (Card 546a, R-546-4): the
-    /// contract admits no host fallback, so this equation is refused outright rather than routed to
-    /// a host step.
-    ScatterNonZeroAxis {
-        /// The scattered axis.
-        axis: usize,
-    },
     /// The attention kernel keeps one lane's running state (`dv` output channels and two scalars) in
     /// workgroup memory, and not even one lane's fits the device's `lds_bytes`.
     AttentionLds {
@@ -460,9 +453,6 @@ impl fmt::Display for Capability {
             }
             Capability::NonLastAxisReduce { axis } => {
                 write!(f, "no kernel reduces over axis {axis}, only the last axis")
-            }
-            Capability::ScatterNonZeroAxis { axis } => {
-                write!(f, "no kernel scatters over axis {axis}, only axis 0")
             }
             Capability::AttentionLds { dv, lds_bytes } => write!(
                 f,

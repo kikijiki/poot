@@ -46,8 +46,7 @@ impl DramChannels {
     /// (`"amdgcn-amd-amdhsa--gfx1151"`) or a Mesa RADV device name (`"AMD Radeon 8060S Graphics (RADV STRIX_HALO)"`).
     /// `Some` only for a part whose map was measured; any other AMD device has none.
     pub fn of_device_name(name: &str) -> Option<Self> {
-        let name = name.to_ascii_lowercase();
-        (name.contains("gfx1151") || name.contains("strix_halo")).then_some(Self::STRIX_HALO)
+        crate::calibration::is_strix_halo(name).then_some(Self::STRIX_HALO)
     }
 
     /// Whether a read at `row_stride_bytes` per row camps on too few channels.

@@ -44,7 +44,7 @@ const K: usize = 64;
 
 const REPLAY: CompileOptions = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
 
-fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_quant::weights::WeightMap>) {
+fn fixture() -> (Graph, Arc<WeightStore>, Arc<poot_weights::WeightMap>) {
     let b = Builder::for_tests();
     let ta = b.constant("a", TensorType::f32(vec![K])).unwrap();
     let tb = b.constant("b", TensorType::f32(vec![K])).unwrap();

@@ -19,20 +19,21 @@
 
 use crate::LoadError;
 use crate::safetensors::dense_bytes;
-use poot_quant::weights::WeightStore;
-use poot_tensor::HostTensor;
+use poot_quant::weights::{DenseWeight, WeightStore};
+use poot_tensor::DType;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// The dense entry `name` as its logical shape and row-major f32 values.
-fn dense_f32(store: &WeightStore, name: &str) -> Result<(Vec<usize>, Vec<f32>), LoadError> {
+/// The dense entry `name`, as the adapter file stored it: a float tensor of dtype F32, F16 or BF16.
+fn factor(store: &WeightStore, name: &str) -> Result<DenseWeight, LoadError> {
     let dense = dense_bytes(store, name)?;
-    let data = dense
-        .decode_f32()
-        .map_err(|error| LoadError::UndecodableCheckpointDtype {
-            name: format!("{:?}", error.dtype),
-        })?;
-    Ok((dense.shape().to_vec(), data))
+    match dense.dtype() {
+        DType::F32 | DType::F16 | DType::BF16 => Ok(dense.clone()),
+        dtype => Err(LoadError::LoraFactorDtype {
+            tensor: name.to_string(),
+            dtype,
+        }),
+    }
 }
 
 /// The `adapter_config.json` fields this loader needs. PEFT's file has many training and
@@ -79,19 +80,19 @@ impl LoraAdapterConfig {
     }
 }
 
-/// One target module's adapter weights, transposed to poot's `x @ W` layout (as
-/// `SafeTensors::dequant_fp8` transposes the base weight): `a` is `[in, r]` (PEFT stores
-/// `[r, in]`), `b` is `[r, out]` (PEFT stores `[out, r]`). The driver stacks these per generation for
-/// the LoRA compile pass.
+/// One target module's adapter weights exactly as the adapter file stored them, in their stored dtype
+/// (F32, F16 or BF16; never widened): `a` is `[r, in]` and `b` is `[out, r]`, PEFT's `nn.Linear`
+/// orientation. The driver stacks these per generation for the LoRA compile pass, reading them
+/// transposed into poot's `x @ W` layout (`[in, r]` and `[r, out]`) as it copies them.
 #[derive(Debug, Clone)]
 pub struct LoraWeight {
-    /// `[in, r]`. A LoRA adapter is always plain F32.
-    pub a: HostTensor,
-    /// `[r, out]`.
-    pub b: HostTensor,
+    /// `[r, in]`.
+    pub a: DenseWeight,
+    /// `[out, r]`.
+    pub b: DenseWeight,
 }
 
-/// A loaded LoRA adapter: its config plus each target module's transposed `A`/`B` pair, keyed by
+/// A loaded LoRA adapter: its config plus each target module's `A`/`B` pair, keyed by
 /// checkpoint module path with the `base_model.model.` prefix and
 /// `.lora_A/.lora_B[.<adapter>].weight` suffix stripped (e.g. `model.layers.0.self_attn.q_proj`).
 #[derive(Debug, Clone)]
@@ -152,27 +153,24 @@ impl LoraAdapter {
             let b_key = b_by_module.get(&module).ok_or_else(|| {
                 LoadError::SafeTensors(format!("lora adapter: {module} has lora_A but no lora_B"))
             })?;
-            let a = dense_f32(store, &a_key)?;
-            let b = dense_f32(store, b_key)?;
-            if a.0.len() != 2 || b.0.len() != 2 {
+            let a = factor(store, &a_key)?;
+            let b = factor(store, b_key)?;
+            if a.shape().len() != 2 || b.shape().len() != 2 {
                 return Err(LoadError::SafeTensors(format!(
                     "lora adapter: {module} lora_A/lora_B must be 2-D linear weights, got {:?}/{:?}",
-                    a.0, b.0
+                    a.shape(),
+                    b.shape()
                 )));
             }
-            if a.0[0] != config.r || b.0[1] != config.r {
+            if a.shape()[0] != config.r || b.shape()[1] != config.r {
                 return Err(LoadError::SafeTensors(format!(
                     "lora adapter: {module} lora_A shape {:?} / lora_B shape {:?} don't match config r={}",
-                    a.0, b.0, config.r
+                    a.shape(),
+                    b.shape(),
+                    config.r
                 )));
             }
-            weights.insert(
-                module,
-                LoraWeight {
-                    a: transpose_2d(&a),
-                    b: transpose_2d(&b),
-                },
-            );
+            weights.insert(module, LoraWeight { a, b });
         }
         Ok(LoraAdapter { config, weights })
     }
@@ -214,46 +212,41 @@ fn is_dora_magnitude_key(key: &str) -> bool {
     }
 }
 
-/// Transpose a 2-D `(shape, data)` tensor `[r0, r1] -> [r1, r0]` (HF `[out,in]` -> poot's
-/// `[in,out]`, as `SafeTensors::dequant_fp8` does for a base weight).
-fn transpose_2d(t: &(Vec<usize>, Vec<f32>)) -> HostTensor {
-    let (rows, cols) = (t.0[0], t.0[1]);
-    let mut data = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            data[c * rows + r] = t.1[r * cols + c];
-        }
-    }
-    HostTensor::f32(vec![cols, rows], data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The little-endian bytes of `values` stored as `dtype` (F32 or BF16; the values the tests use are
+    /// exactly representable in both).
+    fn encode(dtype: &str, values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|v| match dtype {
+                "BF16" => (v.to_bits() >> 16).to_le_bytes()[..2].to_vec(),
+                _ => v.to_le_bytes().to_vec(),
+            })
+            .collect()
+    }
+
     /// Minimal `adapter_model.safetensors` blob with one target module's `lora_A`/`lora_B` (r=2,
-    /// in=4, out=3), keyed with the PEFT causal-LM prefix (`base_model.model.model.layers...`) and
+    /// in=4, out=3) stored as `dtype`, keyed with the PEFT causal-LM prefix (`base_model.model.model.layers...`) and
     /// a `.default.` adapter-name segment, so the stripped and named forms are shown to parse alike.
-    fn synthetic_adapter_safetensors() -> Vec<u8> {
+    fn synthetic_adapter_safetensors(dtype: &str) -> Vec<u8> {
         let (r, in_dim, out_dim) = (2usize, 4usize, 3usize);
         // lora_A [r,in] row-major, lora_B [out,r] row-major.
-        let a_data: Vec<f32> = (0..r * in_dim).map(|i| i as f32 * 0.1).collect();
-        let b_data: Vec<f32> = (0..out_dim * r).map(|i| i as f32 * 0.1 + 1.0).collect();
-        let mut data = Vec::new();
-        let a_off = data.len();
-        for v in &a_data {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
+        let a_data: Vec<f32> = (0..r * in_dim).map(|i| i as f32 * 0.5).collect();
+        let b_data: Vec<f32> = (0..out_dim * r).map(|i| i as f32 * 0.5 + 1.0).collect();
+        let a_bytes = encode(dtype, &a_data);
+        let b_bytes = encode(dtype, &b_data);
+        let mut data = a_bytes.clone();
         let b_off = data.len();
-        for v in &b_data {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
+        data.extend_from_slice(&b_bytes);
         let end = data.len();
         let key_a = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight";
         let key_b = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight";
         let header = serde_json::json!({
-            key_a: {"dtype": "F32", "shape": [r, in_dim], "data_offsets": [a_off, b_off]},
-            key_b: {"dtype": "F32", "shape": [out_dim, r], "data_offsets": [b_off, end]},
+            key_a: {"dtype": dtype, "shape": [r, in_dim], "data_offsets": [0, b_off]},
+            key_b: {"dtype": dtype, "shape": [out_dim, r], "data_offsets": [b_off, end]},
         });
         let header_bytes = serde_json::to_vec(&header).unwrap();
         let mut blob = Vec::new();
@@ -285,39 +278,78 @@ mod tests {
         assert!(parse_lora_key("model.layers.0.self_attn.q_proj.weight").is_none());
     }
 
+    /// The adapter keeps the factors in the layout and dtype the file stored them: `lora_A` `[r, in]`,
+    /// `lora_B` `[out, r]`, the file's own bytes. BF16 stays BF16 (POOT-1258 SC-001); nothing is widened.
     #[test]
-    fn from_safetensors_transposes_and_indexes_by_module_path() {
+    fn factors_keep_the_stored_layout_and_dtype() {
         let (r, in_dim, out_dim) = (2usize, 4usize, 3usize);
-        let store = crate::safetensors::test_only::load_weight_store_bytes(
-            &synthetic_adapter_safetensors(),
-        )
-        .unwrap();
+        for (dtype, expected) in [("F32", DType::F32), ("BF16", DType::BF16)] {
+            let store = crate::safetensors::test_only::load_weight_store_bytes(
+                &synthetic_adapter_safetensors(dtype),
+            )
+            .unwrap();
+            let config = LoraAdapterConfig {
+                r,
+                lora_alpha: 8.0,
+                target_modules: vec!["q_proj".into()],
+                use_rslora: false,
+            };
+            let adapter = LoraAdapter::from_store(config, &store).unwrap();
+            assert_eq!(adapter.config.scaling(), 4.0); // alpha/r = 8/2
+
+            let w = adapter
+                .weights
+                .get("model.layers.0.self_attn.q_proj")
+                .expect("q_proj adapter present");
+            assert_eq!(w.a.dtype(), expected, "{dtype}: lora_A dtype");
+            assert_eq!(w.b.dtype(), expected, "{dtype}: lora_B dtype");
+            assert_eq!(w.a.shape(), [r, in_dim]);
+            assert_eq!(w.b.shape(), [out_dim, r]);
+            let a_values: Vec<f32> = (0..r * in_dim).map(|i| i as f32 * 0.5).collect();
+            assert_eq!(
+                w.a.bytes().as_slice(),
+                encode(dtype, &a_values).as_slice(),
+                "{dtype}: lora_A bytes are the file's own"
+            );
+            assert!(
+                !adapter
+                    .weights
+                    .contains_key("model.layers.0.self_attn.k_proj")
+            );
+        }
+    }
+
+    /// A non-float adapter tensor (an I32 file) is refused at load, naming the tensor and dtype.
+    #[test]
+    fn a_non_float_factor_is_refused() {
+        let key_a = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight";
+        let key_b = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight";
+        let header = serde_json::json!({
+            key_a: {"dtype": "I32", "shape": [2, 4], "data_offsets": [0, 32]},
+            key_b: {"dtype": "I32", "shape": [3, 2], "data_offsets": [32, 56]},
+        });
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        blob.extend_from_slice(&header_bytes);
+        blob.extend_from_slice(&[0u8; 56]);
+        let store = crate::safetensors::test_only::load_weight_store_bytes(&blob).unwrap();
         let config = LoraAdapterConfig {
-            r,
-            lora_alpha: 8.0,
+            r: 2,
+            lora_alpha: 4.0,
             target_modules: vec!["q_proj".into()],
             use_rslora: false,
         };
-        let adapter = LoraAdapter::from_store(config, &store).unwrap();
-        assert_eq!(adapter.config.scaling(), 4.0); // alpha/r = 8/2
-
-        let w = adapter
-            .weights
-            .get("model.layers.0.self_attn.q_proj")
-            .expect("q_proj adapter present");
-        assert_eq!(w.a.shape(), vec![in_dim, r]);
-        assert_eq!(w.b.shape(), vec![r, out_dim]);
-
-        // spot-check the transpose: lora_A[r,in] row-major 0.0,0.1,0.2,0.3 / 0.4,0.5,0.6,0.7 ->
-        // a[in,r] column-major read: a[0,0]=A[0,0]=0.0, a[0,1]=A[1,0]=0.4, a[1,0]=A[0,1]=0.1.
-        assert!((w.a.as_f32().unwrap()[0] - 0.0).abs() < 1e-6);
-        assert!((w.a.as_f32().unwrap()[1] - 0.4).abs() < 1e-6);
-        assert!((w.a.as_f32().unwrap()[r] - 0.1).abs() < 1e-6);
-
+        let error = LoraAdapter::from_store(config, &store).unwrap_err();
         assert!(
-            !adapter
-                .weights
-                .contains_key("model.layers.0.self_attn.k_proj")
+            matches!(
+                &error,
+                LoadError::LoraFactorDtype {
+                    dtype: DType::I32,
+                    ..
+                }
+            ),
+            "{error}"
         );
     }
 

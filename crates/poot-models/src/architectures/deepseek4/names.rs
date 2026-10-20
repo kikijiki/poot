@@ -1,16 +1,20 @@
 //! DeepSeek-V4's weight map: how the checkpoint's tensor names map onto typed [`WeightId`]s.
 //!
 //! A linear projection is stored dense as `{stem}.weight` or packed under the bare linear id
-//! `{stem}` (the loader joins a quantized `.weight`/`.scale` pair into one packed entry); every
-//! other tensor is stored under its own name. A layer's rows follow its [`LayerKind`] and routing:
-//! only a compressed layer has a compressor, only a CSA layer an indexer, and a hash-routed layer a
+//! `{stem}`; every other tensor is stored under its own name. No loader produces the packed form from
+//! a checkpoint: the packed layouts (E2M1 experts, E4M3 projections with `.scale` siblings) are built
+//! only by this family's test fixtures, and `poot_load`'s packed-linear reader refuses a real
+//! checkpoint's `.scale` siblings by name until a layout row lands.
+//!
+//! A layer's rows follow its [`LayerKind`] and routing: only a compressed layer has a compressor, only a CSA layer an indexer, and a hash-routed layer a
 //! token-to-experts table where a score-routed one has a selection bias. A required row whose tensor
 //! is absent is the typed missing-weight error naming its key; a stored tensor no row claims is
 //! ignored (a fine-tune may add tensors). No count of tensors is checked.
 
-use poot_quant::weights::{
+use poot_quant::weights::{WeightKey, WeightStore};
+use poot_weights::{
     AttnRole, CompressRole, DsaRole, ExpertProj, MhcRole, MlaRole, MoeRole, NormRole, WeightId,
-    WeightKey, WeightMap, WeightRole, WeightStore, WeightView,
+    WeightMap, WeightRole, WeightView,
 };
 
 use super::FAMILY;

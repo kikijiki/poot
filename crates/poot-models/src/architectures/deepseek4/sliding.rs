@@ -8,7 +8,7 @@
 //! output's rotated slice is rotated back by the query's position before the output projection.
 
 use poot_graph_ir::{Builder, Traced, ops};
-use poot_quant::weights::{AttnRole, MlaRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{AttnRole, MlaRole, WeightId, WeightMap, WeightRole};
 
 use super::config::DeepseekV4Config;
 use crate::components::attention::{carried_cache, first_writes};

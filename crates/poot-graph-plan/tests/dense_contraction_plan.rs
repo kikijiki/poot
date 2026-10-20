@@ -79,7 +79,7 @@ fn is_dense_f32(op: &OpKind) -> bool {
 /// at `M = 1`, `4` and `33`, on every backend. The kernel is a generated one reading the weight in `[N, K]`
 /// order: the decode GEMV at `M = 1` and the tiled GEMM above it.
 ///
-/// Mutation: remove `DType::F32` from `DENSE_CONTRACTION_WEIGHT_DTYPES`; the fold skips, a `Transpose` and a
+/// Mutation: make `fold_dense_contractions` skip an F32 weight; the fold skips, a `Transpose` and a
 /// `MatMul` stay in the program and this row goes red.
 #[test]
 fn checkpoint_orientation_projection_plans_one_dense_contraction_and_no_transpose() {
@@ -235,7 +235,7 @@ fn weight_storages(program: &Program) -> (BufferStorage, BufferStorage) {
 /// planned storage is that same packed record: one buffer of two-byte elements in `u32` words, neither widened to
 /// f32 nor native F16.
 ///
-/// Mutation: remove `DType::F16` from `DENSE_CONTRACTION_WEIGHT_DTYPES`; the fold skips, a `Transpose` stays in the
+/// Mutation: make `fold_dense_contractions` skip an F16 weight; the fold skips, a `Transpose` stays in the
 /// program and this row goes red.
 #[test]
 fn an_f16_checkpoint_projection_plans_one_packed_dense_contraction_and_no_transpose() {
@@ -791,6 +791,62 @@ fn a_grouped_weight_that_is_not_bf16_keeps_the_traced_chain() {
                 }
                 Err(CompileError::Plan(_)) if weight == DType::F16 => {}
                 Err(other) => panic!("{weight:?} {backend:?}: {other}"),
+            }
+        }
+    }
+}
+
+/// POOT-1241: `infer` types a grouped contraction over any arithmetic float weight, so a target that has no
+/// grouped body for the weight's dtype says so as a typed `DtypeLowering` refusal naming the equation (the
+/// planner's capability to refuse), not by `infer` rejecting a graph that is well typed.
+///
+/// Mutation: make the planner's grouped arm plan any weight dtype as BF16; the F32 and F16 rows compile and
+/// go red.
+#[test]
+fn a_grouped_contraction_over_a_weight_without_grouped_rows_is_a_typed_refusal() {
+    for weight in [DType::F32, DType::F16] {
+        let b = Builder::for_tests();
+        let x = b
+            .constant("x", TensorType::f32(vec![GROUPS, 4, K]))
+            .unwrap();
+        let w = b
+            .constant("w", TensorType::new(vec![GROUPS * N, K], weight))
+            .unwrap();
+        let blocks = b.reshape(w, vec![GROUPS, N, K]).unwrap();
+        let out = b
+            .matmul(x, b.transpose(blocks, vec![0, 2, 1]).unwrap())
+            .unwrap();
+        let traced = b.finish(out).unwrap();
+        let matmul = traced
+            .eqns()
+            .iter()
+            .position(|eqn| matches!(eqn.op, OpKind::MatMul))
+            .expect("the projection has one matmul");
+        let g = poot_graph_ir::test_support::graph_fixtures::derive(&traced, |draft| {
+            draft.eqns_mut()[matmul].op = OpKind::GroupedDenseContraction {
+                weight,
+                groups: GROUPS,
+            };
+            draft.eqns_mut()[matmul].inputs = vec![Operand::Value(x.id()), Operand::Value(w.id())];
+        })
+        .expect("a grouped contraction over an arithmetic float weight is well typed");
+        let options = CompileOptions::new(poot_graph_plan::CompileLimits::STANDARD);
+        for backend in backends() {
+            match compile(&g, &target(backend), &options) {
+                Err(CompileError::Plan(error)) if matches!(*error, PlanError::Refused(_)) => {
+                    let PlanError::Refused(refusal) = *error else {
+                        unreachable!("matched above")
+                    };
+                    assert_eq!(
+                        refusal.missing,
+                        poot_graph_plan::Capability::DtypeLowering,
+                        "{weight:?} {backend:?}"
+                    );
+                    assert_eq!(refusal.eqn, out.id(), "{weight:?} {backend:?}");
+                }
+                other => panic!(
+                    "{weight:?} {backend:?}: expected a DtypeLowering refusal, got {other:?}"
+                ),
             }
         }
     }

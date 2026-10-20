@@ -243,7 +243,7 @@ pub(crate) fn pool_experts(
             Slot::ExpertPoolMap,
             &tag,
             TensorType::new(vec![site.experts], DType::I32),
-        );
+        )?;
         let ids_aval = g.aval(site.ids).clone();
         let raw = pooled
             .values_mut()
@@ -290,7 +290,7 @@ pub(crate) fn pool_experts(
         }
         let mut weights = Vec::with_capacity(site.tables.len());
         for table in &site.tables {
-            let slot = pooled.rebind_const_as_pool(table.value, slots);
+            let slot = pooled.rebind_const_as_pool(table.value, slots)?;
             weights.push(PooledWeight {
                 name: table.name.clone(),
                 slot,

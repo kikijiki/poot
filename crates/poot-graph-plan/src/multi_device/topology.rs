@@ -5,7 +5,8 @@
 //! order is a different plan.
 
 use crate::CollectiveKind;
-use poot_target::{Backend, TargetId};
+use crate::Target;
+use poot_target::TargetId;
 
 /// Caller-assigned stable device identity. Never reordered, merged, or reassigned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -79,20 +80,18 @@ pub fn validate_topology(topology: &Topology) -> Result<(), TopologyError> {
 /// The cross-device operations `target`'s runtime performs between two of its own devices. A link row
 /// between two devices exists only for a kind both devices' targets implement.
 ///
-/// NVIDIA's runtime has the peer-to-peer transport (point-to-point copies and the ring collectives built
-/// on it). The wgpu, ROCm and Vulkan runtimes have no cross-device transport, so a stage cut between two
-/// of their devices has nothing to carry its boundary. The match is exhaustive: a new backend states its
-/// answer here.
-pub(crate) fn target_link_kinds(target: TargetId) -> &'static [CollectiveKind] {
+/// A runtime with a peer-to-peer transport (NVIDIA's: point-to-point copies and the ring collectives built on
+/// it) reports it in its caps ([`poot_target::DeviceCaps::peer_transport`]). The wgpu, ROCm and Vulkan runtimes
+/// have no cross-device transport, so a stage cut between two of their devices has nothing to carry its
+/// boundary, and an AIE or VPU target has none either.
+pub(crate) fn target_link_kinds(target: &Target) -> &'static [CollectiveKind] {
     match target {
-        TargetId::Gpu(Backend::Nvptx) => &[
+        Target::Gpu { caps, .. } if caps.peer_transport => &[
             CollectiveKind::PointToPoint,
             CollectiveKind::AllReduce,
             CollectiveKind::AllGather,
             CollectiveKind::AllToAll,
         ],
-        TargetId::Gpu(Backend::SpirvVulkan | Backend::AmdGcn(_))
-        | TargetId::Aie(_)
-        | TargetId::Vpu(_) => &[],
+        Target::Gpu { .. } | Target::Aie { .. } | Target::Vpu { .. } => &[],
     }
 }

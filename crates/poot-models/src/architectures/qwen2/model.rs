@@ -7,7 +7,8 @@
 //! weight is declared at its stored dtype, a packed one is rewritten by the one packed-weight
 //! transform from the `WeightMap`.
 
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 
 use crate::components::dims::{DenseDims, DenseSpec, Field, Fields, dense_keys};
 use crate::model::{ConfigReason, FamilyKey, ModelError};
@@ -281,7 +282,8 @@ mod tests {
     use poot_quant::SourceRole;
     use poot_quant::StoredBytes;
     use poot_quant::format::WeightFormat;
-    use poot_quant::weights::{WeightEntry, WeightId, WeightRole};
+    use poot_quant::weights::WeightEntry;
+    use poot_weights::{WeightId, WeightRole};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -841,7 +843,7 @@ mod tests {
         for (id, _, handle) in model.model.weights().iter() {
             if projections.contains(&id.const_name()) {
                 assert!(
-                    matches!(handle.format, poot_quant::weights::HandleFormat::Packed(_)),
+                    matches!(handle.format, poot_weights::HandleFormat::Packed(_)),
                     "{id} is {:?}",
                     handle.format
                 );
@@ -863,7 +865,7 @@ mod tests {
         let view = |role| model.weights().view(WeightId::model(role));
         assert_eq!(
             view(WeightRole::Head),
-            Some(&poot_quant::weights::WeightView::Stored(
+            Some(&poot_weights::WeightView::Stored(
                 "token_embd.weight".into()
             ))
         );
@@ -906,7 +908,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             embed.format,
-            poot_quant::weights::HandleFormat::Packed(_)
+            poot_weights::HandleFormat::Packed(_)
         ));
 
         let prompt = [3, 17, 40, 8];

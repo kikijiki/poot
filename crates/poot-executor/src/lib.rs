@@ -22,8 +22,8 @@ pub use coordinator::{
 };
 pub use device::{
     AieInvocation, Arg, Collectives, CopyKernel, CopyKernelSink, CopyMechanism, Device, DeviceTime,
-    Dispatch, DispatchDeviceTime, LaunchKind, MeasuredDeviceTime, NativeCounters, SupportBound,
-    VpuInvocation, WeightUpload, write_slice,
+    Dispatch, DispatchDeviceTime, FlushPolicy, LaunchKind, MeasuredDeviceTime, NativeCounters,
+    SupportBound, VpuInvocation, WeightUpload, write_slice,
 };
 pub use engine::Engine;
 pub use error::{BindError, ChainError, DeviceError, DispatchError, ExecError, LoadError};
@@ -40,7 +40,8 @@ use poot_graph_plan::{
     multi_device::topology::DeviceId, staged::StageId, staged::StagedProgram, staged::SyncPoint,
     staged::TargetSet,
 };
-use poot_quant::weights::{WeightMap, WeightStore};
+use poot_quant::weights::WeightStore;
+use poot_weights::WeightMap;
 use std::sync::Arc;
 
 /// One executable (weights plus entries) inside one executor. Not a heap address: engine-owned,
@@ -463,7 +464,7 @@ pub trait Executor {
         weights: Arc<WeightMap>,
     ) -> Result<ExecutableId, ExecError>;
     /// Binds `program`'s consts to the store through the executable's weight map (each weight const
-    /// is a [`poot_quant::weights::WeightId::const_name`], or a packed source name over one, bound
+    /// is a [`poot_weights::WeightId::const_name`], or a packed source name over one, bound
     /// through the map's view to byte runs of store entries; a const the map does not name is
     /// unbound, even when a store key equals its name), uploads each stored byte run once per
     /// planned storage and store generation, fills a hosted embed gather from the step's tokens,

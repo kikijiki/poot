@@ -28,8 +28,8 @@ use poot_graph_ir::graph::{Eqn, Graph, Operand, Storage, ValueId, ValueMeta};
 use poot_graph_ir::op::{BinOp, OpKind};
 use poot_graph_ir::types::TensorType;
 use poot_graph_ir::{Builder, IndexRange, Slot, ValueTable, WeightRef};
-use poot_quant::weights::{LoraRole, LoraTarget, WeightId, WeightRole};
 use poot_tensor::DType;
+use poot_weights::{LoraRole, LoraTarget, WeightId, WeightRole};
 
 use super::GraphBudget;
 use crate::ExpansionError;
@@ -48,6 +48,9 @@ pub struct LoraPlan {
     pub adapters: NonZeroUsize,
     /// The common rank every adapter is zero-padded to.
     pub rank: NonZeroUsize,
+    /// The dtype the stacked factors are stored and uploaded in (F32, F16 or BF16). A narrow factor is
+    /// widened to F32 on the device by the correction itself, never on the host.
+    pub factor_dtype: DType,
     /// The projections the adapters correct. Each must occur in the graph.
     pub projections: Vec<LoraTarget>,
 }
@@ -62,6 +65,9 @@ pub enum LoraError {
     /// The plan adapts no projection at all.
     #[error("the LoRA plan names no projection")]
     NoTargets,
+    /// The plan's factor dtype is not a float the correction can contract.
+    #[error("the LoRA factors are {0:?}; the correction contracts F32, F16 or BF16 factors")]
+    FactorDtype(DType),
     /// A contraction's activation is not F32: the stacked factors are, and `IndexedMatMul` contracts
     /// operands of one dtype.
     #[error("{weight}: the activation is {dtype:?}; the LoRA correction contracts F32 activations")]
@@ -131,6 +137,9 @@ pub(crate) fn apply_lora(
     if plan.projections.is_empty() {
         return Err(LoraError::NoTargets);
     }
+    if !matches!(plan.factor_dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return Err(LoraError::FactorDtype(plan.factor_dtype));
+    }
     let sites = sites(g, plan);
     for &target in &plan.projections {
         if !sites.iter().any(|site| site.target == target) {
@@ -157,7 +166,7 @@ pub(crate) fn apply_lora(
             });
         }
     }
-    budget.reserve(STAGE, g, 4 + sites.len() * 12, sites.len() * 11 + 3)?;
+    budget.reserve(STAGE, g, 4 + sites.len() * 14, sites.len() * 13 + 3)?;
 
     // The adapter inputs: the one index slot, the scale vector, and the stacked factors of each
     // adapted (layer, projection). Declared through a builder so the slot carries its typed key.
@@ -190,13 +199,13 @@ pub(crate) fn apply_lora(
         let factor_a = b
             .weight(
                 WeightRef::whole(a),
-                TensorType::f32(vec![stack, site.in_dim, rank]),
+                TensorType::new(vec![stack, site.in_dim, rank], plan.factor_dtype),
             )?
             .id();
         let factor_b = b
             .weight(
                 WeightRef::whole(bb),
-                TensorType::f32(vec![stack, rank, site.out_dim]),
+                TensorType::new(vec![stack, rank, site.out_dim], plan.factor_dtype),
             )?
             .id();
         factors.insert((site.layer, site.target), (factor_a, factor_b));
@@ -213,6 +222,14 @@ pub(crate) fn apply_lora(
         budget,
         layer: None,
     };
+    // A narrow factor is widened on the device once per step, before any contraction reads it: the
+    // correction contracts F32 operands only.
+    if plan.factor_dtype != DType::F32 {
+        for (a, bb) in factors.values_mut() {
+            *a = emitter.val(OpKind::Cast { to: DType::F32 }, vec![*a])?;
+            *bb = emitter.val(OpKind::Cast { to: DType::F32 }, vec![*bb])?;
+        }
+    }
     let mut site_of: HashMap<usize, &Site> = sites.iter().map(|site| (site.eqn, site)).collect();
     // The per-token index for a step of `tokens` tokens per row, emitted once per width.
     let mut token_idx: HashMap<usize, ValueId> = HashMap::new();
@@ -455,7 +472,7 @@ mod tests {
             .weight(
                 WeightRef::whole(WeightId::layer(
                     0,
-                    WeightRole::Attn(poot_quant::weights::AttnRole::Q),
+                    WeightRole::Attn(poot_weights::AttnRole::Q),
                 )),
                 TensorType::f32(vec![4, 4]),
             )
@@ -466,6 +483,7 @@ mod tests {
             rows: NonZeroUsize::new(ROWS).unwrap(),
             adapters: NonZeroUsize::MIN,
             rank: NonZeroUsize::MIN,
+            factor_dtype: poot_tensor::DType::F32,
             projections: vec![LoraTarget::AttnQ, LoraTarget::FfnDown],
         };
         let mut with_plan = options();
@@ -522,7 +540,7 @@ mod tests {
             .weight(
                 WeightRef::whole(WeightId::layer(
                     0,
-                    WeightRole::Attn(poot_quant::weights::AttnRole::Q),
+                    WeightRole::Attn(poot_weights::AttnRole::Q),
                 )),
                 TensorType::new(vec![4, 4], dtype),
             )
@@ -536,6 +554,7 @@ mod tests {
             rows: NonZeroUsize::new(rows).unwrap(),
             adapters: NonZeroUsize::MIN,
             rank: NonZeroUsize::MIN,
+            factor_dtype: poot_tensor::DType::F32,
             projections,
         }
     }
@@ -589,5 +608,69 @@ mod tests {
         let mut with_plan = options();
         with_plan.lora = Some(q_plan(3, vec![LoraTarget::AttnQ]));
         compile(&q_graph(3, DType::F32), &target(), &with_plan).expect("3 rows over 3 step rows");
+    }
+
+    /// POOT-1258 SC-001 (the program side): a plan whose factors are stored BF16 declares the stacked `A`/`B`
+    /// consts as BF16, so the executor uploads them as stored, and widens them with a device `Cast` that
+    /// reads the BF16 const. An F32 plan declares F32 consts and no cast of them. Mutation: declare the
+    /// factors `TensorType::f32` whatever the plan says; the BF16 row finds F32 consts.
+    #[test]
+    fn narrow_factors_are_declared_in_their_stored_dtype_and_widened_on_the_device() {
+        let g = q_graph(2, DType::F32);
+        let lora_consts = |dtype: DType| {
+            let mut plan = q_plan(2, vec![LoraTarget::AttnQ]);
+            plan.factor_dtype = dtype;
+            let mut with_plan = options();
+            with_plan.lora = Some(plan);
+            let program = compile(&g, &target(), &with_plan).expect("the plan compiles");
+            let graph = program.graph();
+            let consts: Vec<(ValueId, DType)> = graph
+                .values()
+                .iter_enumerated()
+                .filter(|(_, meta)| {
+                    meta.weight().is_some_and(|w| {
+                        matches!(
+                            w.id().role,
+                            WeightRole::Lora(LoraRole::A(_) | LoraRole::B(_))
+                        )
+                    })
+                })
+                .map(|(id, meta)| (id, meta.aval.dtype))
+                .collect();
+            let widened = graph
+                .eqns()
+                .iter()
+                .filter(|eqn| {
+                    matches!(eqn.op, OpKind::Cast { to: DType::F32 })
+                        && matches!(eqn.inputs.as_slice(), [Operand::Value(input)]
+                            if consts.iter().any(|(id, _)| id == input))
+                })
+                .count();
+            (consts, widened)
+        };
+        let (bf16, widened) = lora_consts(DType::BF16);
+        assert_eq!(bf16.len(), 2, "one A and one B const");
+        assert!(
+            bf16.iter().all(|&(_, dtype)| dtype == DType::BF16),
+            "{bf16:?}"
+        );
+        assert_eq!(widened, 2, "each BF16 factor is widened by a device Cast");
+        let (f32s, widened) = lora_consts(DType::F32);
+        assert!(
+            f32s.iter().all(|&(_, dtype)| dtype == DType::F32),
+            "{f32s:?}"
+        );
+        assert_eq!(widened, 0, "F32 factors are contracted as they are");
+    }
+
+    /// A factor dtype the correction cannot contract (an integer) is the typed refusal.
+    #[test]
+    fn a_non_float_factor_dtype_is_a_typed_compile_refusal() {
+        let mut plan = q_plan(2, vec![LoraTarget::AttnQ]);
+        plan.factor_dtype = DType::I32;
+        assert_eq!(
+            refused(&q_graph(2, DType::F32), plan),
+            LoraError::FactorDtype(DType::I32)
+        );
     }
 }

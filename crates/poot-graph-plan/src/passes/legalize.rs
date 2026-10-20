@@ -1220,8 +1220,8 @@ mod tests {
 
     use poot_graph_ir::Builder;
     use poot_graph_ir::types::TensorType;
-    use poot_quant::weights::{WeightId, WeightRole};
     use poot_tensor::DType;
+    use poot_weights::{WeightId, WeightRole};
 
     /// The embedding table and the head of the graphs below: the weights the oversized cases name.
     const EMBED: WeightId = WeightId::model(WeightRole::Embed);

@@ -1,7 +1,7 @@
 //! The gated (SwiGLU) feed-forward block: `down(silu(gate(x)) * up(x))`.
 
 use poot_graph_ir::{BinOp, Builder, Scalar, Traced, UnOp, ops};
-use poot_quant::weights::{FfnRole, WeightId, WeightMap, WeightRole};
+use poot_weights::{FfnRole, WeightId, WeightMap, WeightRole};
 
 use super::linear::{Weight, WeightError, linear};
 use super::standard::ParamError;

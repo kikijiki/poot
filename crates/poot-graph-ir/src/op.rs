@@ -5,10 +5,13 @@
 //! separately to `infer`.
 
 use poot_quant::PackedWeight;
+use std::fmt;
 use std::num::NonZeroU32;
 
 use crate::error::{FusedOperandReason, ScanReason, ShapeError};
-use crate::types::{DType, DTypeClass, DTypeClassExt, Scalar, TensorType, broadcast_shapes};
+use crate::types::{
+    DType, DTypeClass, DTypeClassExt, Operands, Scalar, TensorType, broadcast_shapes,
+};
 
 /// Unary primitives. The transcendentals are `Exp`, `Log`, `Sqrt`, `Recip`, `Tanh` and `Erf`; every
 /// activation (`silu`, `gelu`, `gelu_erf`, `sigmoid`, `softplus`) is an [`crate::ops`] composition over them,
@@ -38,8 +41,6 @@ pub enum UnOp {
     Sqrt,
     /// Reciprocal, `1 / x`.
     Recip,
-    /// Round to nearest integer (ties away from zero), `llvm.round.f32` (a primitive IR op).
-    Round,
     /// Hyperbolic tangent (a primitive IR op, `libm::tanhf` on the oracle). Devices expand it in the stable
     /// `exp(x - |x|)` form, so `tanh(+-inf)` and `tanh(+-100)` are exactly `+-1`. Logit softcap
     /// ([`crate::ops::softcap`]) and the transcendental half of the activation set build on it.
@@ -220,20 +221,57 @@ impl FusedOp {
     }
 }
 
+/// A local value of a fused region ([`FusedRegion`], [`RowRegion`]): its position in the region's own value
+/// space, where locals `0..n_inputs` are the external inputs and `n_inputs + j` is the result of step `j`.
+/// Distinct from [`crate::ValueId`] (a graph value), from a leaf or buffer index of a lowering, and from a
+/// lane (a coordinate along a pack axis): each is a `usize` somewhere else, and none can stand for another.
+///
+/// ```compile_fail,E0308
+/// use poot_graph_ir::op::FusedOperand;
+///
+/// let _ = FusedOperand::Local(3usize);
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalId(usize);
+
+impl LocalId {
+    /// The local at `index` of its region's value space.
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// The position of this local in its region's value space.
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl fmt::Debug for LocalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "l{}", self.0)
+    }
+}
+
+impl fmt::Display for LocalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// An operand of a [`FusedStep`]: a local value id, or an inline literal captured from the source graph. Locals
 /// `0..n_inputs` are the region's external inputs (matching the fused eqn's `inputs`, all `Operand::Value`, in
 /// order); locals `n_inputs + j` are the result of step `j`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum FusedOperand {
     /// A local value: an external input (`0..n_inputs`) or an earlier step's result.
-    Local(usize),
+    Local(LocalId),
     /// An inline scalar literal captured from the source graph.
     Lit(Scalar),
     /// Last-axis lane of an external packed I32 input. The input tensor's last dimension is the pack
     /// width; this operand has a trailing unit axis.
     PackLane {
         /// The external packed input read.
-        input: usize,
+        input: LocalId,
         /// The lane (index along the input's last axis) taken.
         lane: usize,
     },
@@ -260,15 +298,15 @@ pub struct FusedRegion {
     /// The steps in execution order; step `j` defines local `n_inputs + j`.
     pub steps: Vec<FusedStep>,
     /// The local that is the region's result.
-    pub output: usize,
+    pub output: LocalId,
     /// When non-empty, the equation output is the last-axis concatenation of these locals, each of
     /// which has a trailing unit axis. Empty means the single [`Self::output`] local.
-    pub pack: Vec<usize>,
+    pub pack: Vec<LocalId>,
 }
 
 impl FusedRegion {
     /// Whether external input `input` is read: by a step, or as the region's output.
-    pub fn reads_input(&self, input: usize) -> bool {
+    pub fn reads_input(&self, input: LocalId) -> bool {
         self.output == input
             || self.steps.iter().any(|step| {
                 step.inputs
@@ -278,7 +316,7 @@ impl FusedRegion {
     }
 
     /// Whether a [`FusedOp::Cast`] step reads external input `input`: the input a lowering widens as it reads it.
-    pub fn widens_input(&self, input: usize) -> bool {
+    pub fn widens_input(&self, input: LocalId) -> bool {
         self.steps.iter().any(|step| {
             matches!(step.op, FusedOp::Cast { .. })
                 && matches!(step.inputs.as_slice(), [FusedOperand::Local(local)] if *local == input)
@@ -303,7 +341,7 @@ impl FusedRegion {
                     FusedOperand::Local(id) => local_ty(&locals, *id)?.clone(),
                     FusedOperand::Lit(s) => s.ty(),
                     FusedOperand::PackLane { input, lane } => {
-                        let source = ins.get(*input).ok_or(ShapeError::FusedOperand(
+                        let source = ins.get(input.index()).ok_or(ShapeError::FusedOperand(
                             FusedOperandReason::PackLaneInput {
                                 input: *input,
                                 inputs: ins.len(),
@@ -313,7 +351,9 @@ impl FusedRegion {
                     }
                 });
             }
-            let ty = step.op.kind().infer(&in_tys)?;
+            let is_literal =
+                |index: usize| matches!(step.inputs.get(index), Some(FusedOperand::Lit(_)));
+            let ty = step.op.kind().infer(Operands::new(&in_tys, &is_literal))?;
             locals.push(ty);
         }
         Ok(locals)
@@ -357,8 +397,8 @@ impl FusedRegion {
 }
 
 /// The type of fused-region local `id`, or the typed fault for a local the region does not define.
-fn local_ty(locals: &[TensorType], id: usize) -> Result<&TensorType, ShapeError> {
-    locals.get(id).ok_or(ShapeError::FusedOperand(
+fn local_ty(locals: &[TensorType], id: LocalId) -> Result<&TensorType, ShapeError> {
+    locals.get(id.index()).ok_or(ShapeError::FusedOperand(
         FusedOperandReason::LocalNotDefined {
             local: id,
             defined: locals.len(),
@@ -368,7 +408,11 @@ fn local_ty(locals: &[TensorType], id: usize) -> Result<&TensorType, ShapeError>
 
 /// The type a [`FusedOperand::PackLane`] of external input `input` (type `source`) reads: the source with
 /// its last axis reduced to the one lane.
-fn pack_lane_ty(source: &TensorType, input: usize, lane: usize) -> Result<TensorType, ShapeError> {
+fn pack_lane_ty(
+    source: &TensorType,
+    input: LocalId,
+    lane: usize,
+) -> Result<TensorType, ShapeError> {
     let mut shape = source.shape.clone();
     match shape.last_mut() {
         Some(width) if lane < *width => *width = 1,
@@ -419,12 +463,12 @@ pub struct RowRegion {
     /// The steps in execution order; step `j` defines local `n_inputs + j`.
     pub steps: Vec<RowStep>,
     /// The local that is the region's result.
-    pub output: usize,
+    pub output: LocalId,
 }
 
 impl RowRegion {
     /// Whether a [`FusedOp::Cast`] step reads external input `input`: the input a lowering widens as it reads it.
-    pub fn widens_input(&self, input: usize) -> bool {
+    pub fn widens_input(&self, input: LocalId) -> bool {
         self.steps.iter().any(|step| {
             matches!(
                 step,
@@ -459,7 +503,9 @@ impl RowRegion {
                         ShapeError,
                     >>(
                     )?;
-                    op.kind().infer(&in_tys)?
+                    let is_literal =
+                        |index: usize| matches!(inputs.get(index), Some(FusedOperand::Lit(_)));
+                    op.kind().infer(Operands::new(&in_tys, &is_literal))?
                 }
                 RowStep::Reduce { op, input } => OpKind::Reduce {
                     op: *op,
@@ -473,43 +519,6 @@ impl RowRegion {
         Ok(local_ty(&locals, self.output)?.clone())
     }
 }
-
-/// The weight dtypes [`OpKind::DenseContraction`] admits, as a table. Card 380 shipped a checkpoint BF16 weight,
-/// the Qwen3.8-27B LM head; Card 645 adds F32, so a family written against checkpoint `[out, in]` orientation
-/// reads its weight without a device `transpose`; Card 1007 adds F16, whose weight the planner stores packed two
-/// elements per `u32` word for the same generated bodies to decode. A further dtype is a row here plus a kernel that
-/// reads it, not another `OpKind` variant or hand-written dispatch branch.
-///
-/// `infer` is the only gate, so an unadmitted dtype never reaches a planner or kernel.
-///
-/// A tracer cannot build one. [`OpKind::DenseContraction`] is compiler-only, so `Builder` exposes no method for
-/// it, enforced by the type system:
-///
-/// ```compile_fail,E0599
-/// use poot_graph_ir::builder::Builder;
-///
-/// let b = Builder::new();
-/// let _ = b.dense_contraction();
-/// ```
-pub const DENSE_CONTRACTION_WEIGHT_DTYPES: &[DType] = &[DType::BF16, DType::F32, DType::F16];
-
-/// The table source dtypes [`OpKind::DenseRowGather`] admits, as a table. Card 381: a checkpoint BF16 embedding
-/// table (Qwen3.8-27B token embedding). Card 405: a checkpoint E4M3FN embedding table (Qwen4Exp PLE, card 363),
-/// decoded with `poot_quant::scalar::e4m3fn_to_f32`. A further narrow float is a row here plus a kernel that
-/// decodes it, not another `OpKind` variant or hand-written dispatch branch.
-///
-/// `infer` is the only gate, so an unadmitted dtype never reaches a planner or kernel.
-///
-/// A tracer cannot build one. [`OpKind::DenseRowGather`] is compiler-only, so `Builder` exposes no method for
-/// it, enforced by the type system:
-///
-/// ```compile_fail,E0599
-/// use poot_graph_ir::builder::Builder;
-///
-/// let b = Builder::new();
-/// let _ = b.dense_row_gather();
-/// ```
-pub const DENSE_ROW_GATHER_SOURCE_DTYPES: &[DType] = &[DType::BF16, DType::E4M3FN];
 
 /// Whether an [`OpKind`] is defined directly or by its decomposition into primitives (see
 /// [`OpKind::class`]).
@@ -567,7 +576,7 @@ pub enum ContractionHead {
     MatMul,
     /// [`OpKind::DenseContraction`] over an activation and a `[N, K]` weight of dtype `weight`.
     Dense {
-        /// The weight's storage dtype, one of [`DENSE_CONTRACTION_WEIGHT_DTYPES`].
+        /// The weight's storage dtype, an arithmetic float.
         weight: DType,
     },
     /// [`OpKind::PackedContraction`] over an f32 activation and the carriers of the packed weight
@@ -788,14 +797,6 @@ pub enum OpKind {
         /// The axis the rows are taken along.
         axis: usize,
     },
-    /// Scatter rows of `src` (input 0) along `axis` by a `[N]` permutation index (input 1), the inverse of an
-    /// axis-0 [`OpKind::Gather`]: `out[index[j], ..] = src[j, ..]`, output the same shape as `src`. `index` must be a
-    /// permutation of `0..N` (N = `src.shape[axis]`); used for argtop-k expert indices in sparse MoE dispatch
-    /// (card 034: scatter `iota` by the per-expert rank to invert it). Axis 0 only.
-    Scatter {
-        /// The axis scattered along; axis 0 only.
-        axis: usize,
-    },
     /// Scatter-update rows into a base (the multi-token paged KV write): `out = base`, then
     /// `out[slots[t], ..] = src[t, ..]` for each source row `t` whose `slots[t] >= 0`. Inputs are
     /// `base [POOL, ..rest]`, `src [N, ..rest]`, and the forward map `slots [N]` (input 2, I32: the pool
@@ -805,8 +806,7 @@ pub enum OpKind {
     /// The kernel writes only the named rows, so the planner requires the output to be donated to `base`'s
     /// own buffer (a state pair whose old value nothing else reads), and refuses the graph otherwise. Two
     /// rows naming one slot would race; the map's single binder, [`crate::ForwardSlotMap`], refuses a
-    /// repeated slot, and the oracle refuses one too. Unlike [`OpKind::Scatter`] (a permutation, every row
-    /// written), this passes the unnamed rows through: the scattered analog of
+    /// repeated slot, and the oracle refuses one too. The unnamed rows pass through: the scattered analog of
     /// [`OpKind::DynamicUpdateSlice`].
     ScatterUpdate,
     /// Batched matmul A[..,M,K] x B[..,K,N] -> [..,M,N], batch dims broadcast (numpy semantics).
@@ -856,10 +856,20 @@ pub enum OpKind {
     /// (`transform::fold_dense_contractions`). Without the fold, lowering the Qwen3.8-27B LM head needs a
     /// transposed copy of a `[vocab, hidden]` matrix or widening it to F32, and the epic forbids both.
     ///
-    /// `weight` is an admitted-dtype table: [`OpKind::infer`] rejects anything outside
-    /// [`DENSE_CONTRACTION_WEIGHT_DTYPES`] (BF16, F32 and F16).
+    /// `weight` is any arithmetic float dtype (BF16, F32 or F16); [`OpKind::infer`] rejects the rest. Which of
+    /// them a target has a body for is the planner's refusal to make, never `infer`'s.
+    ///
+    /// A tracer cannot build one: the op is compiler-only, so `Builder` exposes no method for it, enforced by
+    /// the type system:
+    ///
+    /// ```compile_fail,E0599
+    /// use poot_graph_ir::builder::Builder;
+    ///
+    /// let b = Builder::new();
+    /// let _ = b.dense_contraction();
+    /// ```
     DenseContraction {
-        /// The weight's storage dtype, one of [`DENSE_CONTRACTION_WEIGHT_DTYPES`].
+        /// The weight's storage dtype, an arithmetic float.
         weight: DType,
     },
     /// Compiler-only grouped sibling of [`OpKind::DenseContraction`]: `groups` independent contractions, each over
@@ -891,10 +901,20 @@ pub enum OpKind {
     /// them, which wgpu can only represent as packed `u32` lanes, so every kernel producing one would write two
     /// elements per lane.
     ///
-    /// `source` is an admitted-dtype table: [`OpKind::infer`] rejects anything outside
-    /// [`DENSE_ROW_GATHER_SOURCE_DTYPES`].
+    /// `source` is any dtype with a defined decode to F32: an arithmetic float or E4M3FN. [`OpKind::infer`]
+    /// rejects the rest. Which of them a target has a packed-lane body for is the planner's refusal to make.
+    ///
+    /// A tracer cannot build one: the op is compiler-only, so `Builder` exposes no method for it, enforced by
+    /// the type system:
+    ///
+    /// ```compile_fail,E0599
+    /// use poot_graph_ir::builder::Builder;
+    ///
+    /// let b = Builder::new();
+    /// let _ = b.dense_row_gather();
+    /// ```
     DenseRowGather {
-        /// The table's storage dtype, one of [`DENSE_ROW_GATHER_SOURCE_DTYPES`].
+        /// The table's storage dtype, an arithmetic float or E4M3FN.
         source: DType,
     },
     /// A contraction followed by a pointwise chain: the head's result, then `region`'s steps with local 0 bound to
@@ -939,17 +959,6 @@ pub enum OpKind {
     DynamicUpdateSlice {
         /// The axis the update is written along.
         axis: usize,
-    },
-    /// Pack int8 codes (f32 in `[-127, 127]`) into i32 words, 4 codes per word along the last axis (spec 048): output
-    /// dtype `I32`, last dim -> `ceil(L/4)`. wgpu has no 8-bit buffer, so quantized KV is stored as i32 words (the
-    /// GPTQ-weight pattern), a 4x reduction. Little-endian bytes; a partial tail word zero-pads. Paired with
-    /// [`OpKind::UnpackI8`].
-    PackI8,
-    /// Unpack int8 codes from i32 words (inverse of [`OpKind::PackI8`]): output dtype `F32`, last dim -> `len` (the original
-    /// code count, which the word count alone does not determine). Each byte is read as a signed i8 widened to f32.
-    UnpackI8 {
-        /// The number of int8 codes to unpack, which the word count alone does not determine.
-        len: usize,
     },
     /// A fused elementwise region (G5): a composition of pointwise steps lowered to one kernel. The eqn's
     /// `inputs` are the region's external inputs in order; see [`FusedRegion`].
@@ -1099,7 +1108,7 @@ fn reject_non_arithmetic(op: &'static str, dtype: DType) -> Result<(), ShapeErro
     }
 }
 
-/// Card 529 (R466-010), POOT-725: reject an index-role operand (`Gather`'s and `Scatter`'s index,
+/// Card 529 (R466-010), POOT-725: reject an index-role operand (`Gather`'s index,
 /// `ScatterUpdate`'s `slots`, `IndexedMatMul`'s and friends' `idx`, `DynamicUpdateSlice`'s runtime index)
 /// that is not I32. I32 is the only index dtype.
 fn check_index_dtype(op: &'static str, dtype: DType) -> Result<(), ShapeError> {
@@ -1110,15 +1119,26 @@ fn check_index_dtype(op: &'static str, dtype: DType) -> Result<(), ShapeError> {
     }
 }
 
-/// Card 529 (R466-012): the one `Binary`-operand dtype-agreement rule. `infer`'s own `Binary` arm calls
-/// this for the pair once it has ruled out the literal-coercion carve-out (a differing, scalar-shaped
-/// right operand: `Builder::binary_scalar`'s baked immediate, which `infer` cannot otherwise tell apart
-/// from a same-shaped `Value`). The four call sites that additionally check this ahead of `infer`, for
-/// an earlier and more specific error, call it too: `Builder::binary`, `BuilderAppendPlan::equation_named`,
-/// `Builder::preflight_append`, and `Graph::validate`; unlike `infer`, each of those sees the real
-/// `Operand`s and only runs this rule when BOTH sides are `Operand::Value`, so the literal exception
-/// never applies there in the first place.
-pub(crate) fn check_binary_value_dtypes(a: &TensorType, b: &TensorType) -> Result<(), ShapeError> {
+/// The positive table of `Cast` pairs: a conversion is a value-level definition between the graph's own
+/// dtypes (the floats `F32`/`BF16`/`F16`, the exact integers `I32`/`I8` and the FP8 storage `E4M3FN`), so a
+/// pair outside this table is not a cast at all, whatever a checkpoint can store. An integer converts to
+/// the floats and to the integers, never to FP8; a half-width float or FP8 converts among the floats and
+/// FP8, never to an integer; only `F32` converts to `I32` (the exact-integer path), and nothing converts
+/// to `I8` from a float.
+fn cast_admitted(from: DType, to: DType) -> bool {
+    use DType::{BF16, E4M3FN, F16, F32, I8, I32};
+    match from {
+        F32 => matches!(to, F32 | BF16 | F16 | I32 | E4M3FN),
+        BF16 | F16 | E4M3FN => matches!(to, F32 | BF16 | F16 | E4M3FN),
+        I32 | I8 => matches!(to, F32 | BF16 | F16 | I32 | I8),
+        _ => false,
+    }
+}
+
+/// The operands of an op that move or combine values of one dtype (`Concat`'s parts, `ScatterUpdate`'s base and
+/// source rows, `DynamicUpdateSlice`'s operand and update, a `Binary` pair of values) must agree on it: the
+/// result has one dtype, and a lowering reads every part as that dtype.
+fn check_same_dtype(a: &TensorType, b: &TensorType) -> Result<(), ShapeError> {
     if a.dtype == b.dtype {
         Ok(())
     } else {
@@ -1133,7 +1153,7 @@ pub(crate) fn check_binary_value_dtypes(a: &TensorType, b: &TensorType) -> Resul
 /// strict equality: two passes deliberately build a genuinely mismatched F32-activation x BF16/F16-weight
 /// `MatMul` on purpose, so this is a stated exception, not a gap. `poot_graph_plan`'s `fold_dense_contractions`
 /// folds exactly that pair (behind a `Transpose`) into `DenseContraction` (its own `weight` dtype table is
-/// `DENSE_CONTRACTION_WEIGHT_DTYPES`); the planner's own
+/// `DenseContraction` weight dtype); the planner's own
 /// `poot_graph_plan::widen_mismatched_matmul_dtypes` (card 273) either widens that exact pair with a Cast
 /// or, when `matmul_tensor_core_eligible` says so, runs the mismatched pair directly on a WMMA/coopmat
 /// kernel built for it (a BF16 `[K, N]` decode projection, `matmul_bf16_column_gemv`, stays mixed and is refused). Every other pairing (F16 x BF16, I32 x
@@ -1147,7 +1167,9 @@ impl OpKind {
     /// Infer the output type from the operand types. Pure, host-only, no data. The single source of
     /// truth for every eqn's result shape/dtype.
     #[deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-    pub fn infer(&self, ins: &[TensorType]) -> Result<TensorType, ShapeError> {
+    pub fn infer<'a>(&self, operands: impl Into<Operands<'a>>) -> Result<TensorType, ShapeError> {
+        let operands = operands.into();
+        let ins = operands.types();
         match self {
             OpKind::Unary(op) => {
                 arity(ins, 1)?;
@@ -1177,8 +1199,21 @@ impl OpKind {
                 arity(ins, 2)?;
                 reject_non_arithmetic("Binary", ins[0].dtype)?;
                 reject_non_arithmetic("Binary", ins[1].dtype)?;
+                // A literal right operand is the baked immediate of `Builder::binary_scalar`: a float tensor
+                // takes either form (the immediate converts), an I32 tensor only an I32 immediate. A value must
+                // have the left operand's dtype exactly, rank 0 or not.
+                let agrees = if operands.is_literal(1) {
+                    ins[0].dtype != DType::I32 || ins[1].dtype == DType::I32
+                } else {
+                    ins[0].dtype == ins[1].dtype
+                };
+                if !agrees {
+                    return Err(ShapeError::Dtype {
+                        a: ins[0].clone(),
+                        b: ins[1].clone(),
+                    });
+                }
                 if ins[0].dtype == DType::I32 {
-                    check_binary_value_dtypes(&ins[0], &ins[1])?;
                     if *op == BinOp::Div {
                         return Err(ShapeError::DtypeOp {
                             op: "Binary(Div)",
@@ -1186,14 +1221,6 @@ impl OpKind {
                         });
                     }
                 } else {
-                    // A differing scalar rhs is the established literal-coercion form (the builder bakes it into
-                    // the kernel, e.g. `Builder::binary_scalar`). A non-scalar rhs can only be a real tensor and
-                    // must share the lhs dtype (R466-012, `check_binary_value_dtypes`); `Graph::validate` and the
-                    // builder call sites close the remaining scalar-Value ambiguity because they can inspect
-                    // `Operand` rather than `TensorType` alone.
-                    if !ins[1].shape.is_empty() {
-                        check_binary_value_dtypes(&ins[0], &ins[1])?;
-                    }
                     if matches!(
                         op,
                         BinOp::GeU
@@ -1309,21 +1336,7 @@ impl OpKind {
             OpKind::Cast { to } => {
                 arity(ins, 1)?;
                 let from = ins[0].dtype;
-                // The nine pairs the evaluator never defines (card 555): moved here from
-                // the walk's own declared `REFUSED_CASTS` table, so an unadmitted pair fails at trace
-                // time instead of reaching `eval`.
-                const REFUSED: &[(DType, DType)] = &[
-                    (DType::BF16, DType::I32),
-                    (DType::F16, DType::I32),
-                    (DType::BF16, DType::I8),
-                    (DType::F16, DType::I8),
-                    (DType::I32, DType::E4M3FN),
-                    (DType::I8, DType::E4M3FN),
-                    (DType::E4M3FN, DType::I32),
-                    (DType::E4M3FN, DType::I8),
-                    (DType::F32, DType::I8),
-                ];
-                if REFUSED.contains(&(from, *to)) {
+                if !cast_admitted(from, *to) {
                     return Err(ShapeError::CastUnsupported { from, to: *to });
                 }
                 // same shape, new dtype.
@@ -1398,6 +1411,7 @@ impl OpKind {
                 let mut shape = ins[0].shape.clone();
                 let mut total = 0;
                 for t in ins {
+                    check_same_dtype(&ins[0], t)?;
                     // Every operand must share ins[0]'s rank: otherwise the zip dim-check below ignores the extra dims of a
                     // longer operand, and `t.shape[*axis]` panics when a shorter operand has rank <= axis.
                     if t.rank() != rank {
@@ -1447,17 +1461,17 @@ impl OpKind {
                 shape.extend_from_slice(&data.shape[*axis + 1..]);
                 Ok(TensorType::new(shape, data.dtype))
             }
-            OpKind::Scatter { axis } => {
-                // out[index[j]] = src[j]: a same-shape axis-permutation; out type == src type.
-                arity(ins, 2)?;
-                check_index_dtype("Scatter", ins[1].dtype)?;
-                check_axis(*axis, ins[0].rank())?;
-                Ok(ins[0].clone())
-            }
             OpKind::ArgTopK { k } => {
                 // rank [..,E] -> [..,k]: same leading dims, last axis replaced by k. The ids are I32, the index dtype
                 // `IndexedMatMul` and the other index consumers read.
                 arity(ins, 1)?;
+                // The input is the rank, a count computed by arithmetic, never a storage dtype or an index.
+                if ins[0].dtype.class() != DTypeClass::Arithmetic {
+                    return Err(ShapeError::DtypeOp {
+                        op: "ArgTopK",
+                        dtype: ins[0].dtype,
+                    });
+                }
                 let mut shape = ins[0].shape.clone();
                 let extent = last_axis_mut(&mut shape, "ArgTopK", "input")?;
                 if *k > *extent {
@@ -1469,25 +1483,13 @@ impl OpKind {
                 *extent = *k;
                 Ok(TensorType::new(shape, DType::I32))
             }
-            OpKind::PackI8 => {
-                arity(ins, 1)?;
-                let mut shape = ins[0].shape.clone();
-                let last = last_axis_mut(&mut shape, "PackI8", "input")?;
-                *last = last.div_ceil(4);
-                Ok(TensorType::new(shape, DType::I32))
-            }
-            OpKind::UnpackI8 { len } => {
-                arity(ins, 1)?;
-                let mut shape = ins[0].shape.clone();
-                *last_axis_mut(&mut shape, "UnpackI8", "codes")? = *len;
-                Ok(TensorType::new(shape, DType::F32))
-            }
             OpKind::ScatterUpdate => {
                 // base[POOL,..rest], src[N,..rest], slots[N] -> base's type. Source row t is written to
                 // pool slot slots[t]; every other pool row passes through from base.
                 arity(ins, 3)?;
                 let (base, src, slots) = (&ins[0], &ins[1], &ins[2]);
                 check_index_dtype("ScatterUpdate", slots.dtype)?;
+                check_same_dtype(base, src)?;
                 let Some((_, rest)) = base.shape.split_first() else {
                     return Err(ShapeError::RankTooLow {
                         op: "ScatterUpdate",
@@ -1706,7 +1708,7 @@ impl OpKind {
                 // activation [..,M,K] F32 x weight [N,K] (`weight` dtype) -> [..,M,N] F32. The weight is in checkpoint order,
                 // so its contraction axis is the last one, not the second to last.
                 arity(ins, 2)?;
-                if !DENSE_CONTRACTION_WEIGHT_DTYPES.contains(weight) {
+                if weight.class() != DTypeClass::Arithmetic {
                     return Err(ShapeError::DenseContractionWeightDtype { actual: *weight });
                 }
                 let (activation, source) = (&ins[0], &ins[1]);
@@ -1745,9 +1747,9 @@ impl OpKind {
                 Ok(TensorType::f32(shape))
             }
             OpKind::GroupedDenseContraction { weight, groups } => {
-                // activation [G, M, K] F32 x weight [G * N, K] (BF16 only) -> [G, M, N] F32.
+                // activation [G, M, K] F32 x weight [G * N, K] (an arithmetic float) -> [G, M, N] F32.
                 arity(ins, 2)?;
-                if *weight != DType::BF16 {
+                if weight.class() != DTypeClass::Arithmetic {
                     return Err(ShapeError::DenseContractionWeightDtype { actual: *weight });
                 }
                 let (activation, source) = (&ins[0], &ins[1]);
@@ -1794,7 +1796,7 @@ impl OpKind {
                 // table [V, R] (`source` dtype) x index [S..] I32 -> [S.., R] F32. Same row selection as `Gather { axis: 0 }`
                 // with the widening decode folded in, so the output is F32 whatever the table's storage is.
                 arity(ins, 2)?;
-                if !DENSE_ROW_GATHER_SOURCE_DTYPES.contains(dtype) {
+                if dtype.class() != DTypeClass::Arithmetic && *dtype != DType::E4M3FN {
                     return Err(ShapeError::DenseRowGatherSourceDtype { actual: *dtype });
                 }
                 let (table, index) = (&ins[0], &ins[1]);
@@ -1824,7 +1826,7 @@ impl OpKind {
                 // runs over the head's output shape, so the epilogue never reshapes or reduces it.
                 let head_operands = head.operands();
                 arity(ins, head_operands + region.n_inputs.saturating_sub(1))?;
-                if !region.pack.is_empty() || !region.reads_input(0) {
+                if !region.pack.is_empty() || !region.reads_input(LocalId::new(0)) {
                     return Err(ShapeError::ContractionEpilogueRegion {
                         packed: !region.pack.is_empty(),
                     });
@@ -1846,6 +1848,14 @@ impl OpKind {
                 arity(ins, 3)?;
                 let (x, w, idx) = (&ins[0], &ins[1], &ins[2]);
                 check_index_dtype("IndexedMatMul", idx.dtype)?;
+                reject_non_arithmetic("IndexedMatMul", x.dtype)?;
+                reject_non_arithmetic("IndexedMatMul", w.dtype)?;
+                if !matmul_operand_dtypes_allowed(x.dtype, w.dtype) {
+                    return Err(ShapeError::MatMulOperandDtype {
+                        a: x.dtype,
+                        b: w.dtype,
+                    });
+                }
                 let rank_error = |operand, expected, actual| ShapeError::OperandRank {
                     op: "IndexedMatMul",
                     operand,
@@ -1885,6 +1895,7 @@ impl OpKind {
                 arity(ins, 3)?;
                 let (operand, update, index) = (&ins[0], &ins[1], &ins[2]);
                 check_index_dtype("DynamicUpdateSlice", index.dtype)?;
+                check_same_dtype(operand, update)?;
                 check_axis(*axis, operand.rank())?;
                 if update.rank() != operand.rank() {
                     return Err(ShapeError::OperandRank {
@@ -1937,6 +1948,12 @@ impl OpKind {
                 // Shape-preserving: each rank holds a same-shaped partial; the collective combines across ranks and returns
                 // the full result in the same shape and dtype.
                 arity(ins, 1)?;
+                if ins[0].dtype.class() != DTypeClass::Arithmetic {
+                    return Err(ShapeError::DtypeOp {
+                        op: "AllReduce",
+                        dtype: ins[0].dtype,
+                    });
+                }
                 Ok(ins[0].clone())
             }
             OpKind::AllGather { axis, world } => {
@@ -1986,7 +2003,6 @@ impl OpKind {
     /// | `PackedDequant` | the one quantized primitive (ADR-0103 decision 2); its definition is `poot-quant`'s decoder |
     /// | `PackedRowGather` | the packed gather claim; the oracle defines it directly and decodes only the rows it gathers |
     /// | `ArgTopK` | inverts a rank permutation without the `[.., E]` scatter a decomposition would need |
-    /// | `PackI8`, `UnpackI8` | bit packing of KV codes; no arithmetic decomposition |
     /// | `AllReduce`, `AllGather` | cross-rank collectives; `AllReduce` keeps the shape, `AllGather` multiplies `axis` by `world` |
     /// | `IndexedMatMul` | the row-indexed MoE contraction; revisited when contraction lowering lands (Card 727) |
     /// | `RandomUniform`, `SampleToken` | the sampling primitives (Card 719): counter-based noise and the token rule |
@@ -2006,14 +2022,11 @@ impl OpKind {
             | Self::Concat { .. }
             | Self::Iota { .. }
             | Self::Gather { .. }
-            | Self::Scatter { .. }
             | Self::ScatterUpdate
             | Self::MatMul
             | Self::DynamicUpdateSlice { .. }
             | Self::PackedDequant { .. }
             | Self::ArgTopK { .. }
-            | Self::PackI8
-            | Self::UnpackI8 { .. }
             | Self::AllReduce { .. }
             | Self::AllGather { .. }
             | Self::IndexedMatMul
@@ -2078,7 +2091,6 @@ impl OpKind {
             Self::Concat { .. } => "concat",
             Self::Iota { .. } => "iota",
             Self::Gather { .. } => "gather",
-            Self::Scatter { .. } => "scatter",
             Self::ScatterUpdate => "scatter_update",
             Self::MatMul => "matmul",
             Self::PackedDequant { .. } => "packed_dequant",
@@ -2091,8 +2103,6 @@ impl OpKind {
             Self::ArgTopK { .. } => "arg_top_k",
             Self::IndexedMatMul => "indexed_matmul",
             Self::DynamicUpdateSlice { .. } => "dynamic_update_slice",
-            Self::PackI8 => "pack_i8",
-            Self::UnpackI8 { .. } => "unpack_i8",
             Self::Fused(_) => "fused",
             Self::FusedRow(_) => "fused_row",
             Self::Attention(_) => "attention",
@@ -2155,7 +2165,6 @@ impl OpKind {
             | OpKind::Concat { .. }
             | OpKind::Iota { .. }
             | OpKind::Gather { .. }
-            | OpKind::Scatter { .. }
             | OpKind::ScatterUpdate
             | OpKind::MatMul
             | OpKind::PackedDequant { .. }
@@ -2167,8 +2176,6 @@ impl OpKind {
             | OpKind::ArgTopK { .. }
             | OpKind::IndexedMatMul
             | OpKind::DynamicUpdateSlice { .. }
-            | OpKind::PackI8
-            | OpKind::UnpackI8 { .. }
             | OpKind::Attention(_)
             | OpKind::Rope { .. }
             | OpKind::Scan(_)
@@ -2201,11 +2208,8 @@ impl OpKind {
             OpKind::Concat { axis } => format!("concat ax={axis}"),
             OpKind::Iota { len, dtype } => format!("iota len={len} {dtype}"),
             OpKind::Gather { axis } => format!("gather ax={axis}"),
-            OpKind::Scatter { axis } => format!("scatter ax={axis}"),
             OpKind::ArgTopK { k } => format!("arg_top_k k={k}"),
             OpKind::ScatterUpdate => "scatter_update".to_string(),
-            OpKind::PackI8 => "pack_i8".to_string(),
-            OpKind::UnpackI8 { len } => format!("unpack_i8 len={len}"),
             OpKind::MatMul => "matmul".to_string(),
             OpKind::PackedDequant { descriptor } => {
                 format!("packed_dequant {:?}", descriptor.format()).to_lowercase()
@@ -3227,10 +3231,6 @@ mod tests {
             OpKind::Gather { axis: 0 }.infer(&[f(&[4, 5]), f(&[2])]),
         );
         refused(
-            "Scatter",
-            OpKind::Scatter { axis: 0 }.infer(&[f(&[4, 5]), f(&[4])]),
-        );
-        refused(
             "ScatterUpdate",
             OpKind::ScatterUpdate.infer(&[f(&[4, 5]), f(&[2, 5]), f(&[2])]),
         );
@@ -3312,14 +3312,86 @@ mod tests {
         }
     }
 
-    /// Card 380 FR-002. The admitted weight dtype is a TABLE, and `infer` is the only gate on it.
+    /// POOT-1241 SC-003: `Cast` is a positive table. Over all 15 x 15 dtype pairs, exactly the 27 pairs among
+    /// the graph's float, exact-integer and FP8 dtypes that have a defined conversion are admitted, and every
+    /// other pair is a typed `CastUnsupported` naming it: a storage-only dtype (`U8`, `Bool`, `F64`, ...) is not
+    /// a `Cast` operand or target at all, however a checkpoint can store it.
+    ///
+    /// Mutation: make the final arm of `cast_admitted` return `true` (the shape of the old deny-list, which
+    /// admitted every pair it did not name); `F32 -> U8` and the other storage-only pairs are admitted and the
+    /// row goes red.
     #[test]
-    fn dense_contraction_rejects_an_unadmitted_weight_dtype() {
-        for dtype in [DType::I32, DType::I8, DType::E4M3FN] {
-            assert!(
-                !DENSE_CONTRACTION_WEIGHT_DTYPES.contains(&dtype),
-                "{dtype:?} is in the table; this test needs an unadmitted dtype"
+    fn cast_admits_exactly_the_positive_table() {
+        use DType::{BF16, E4M3FN, F16, F32, I8, I32};
+        let admitted: [(DType, &[DType]); 6] = [
+            (F32, &[F32, BF16, F16, I32, E4M3FN]),
+            (BF16, &[F32, BF16, F16, E4M3FN]),
+            (F16, &[F32, BF16, F16, E4M3FN]),
+            (I32, &[F32, BF16, F16, I32, I8]),
+            (I8, &[F32, BF16, F16, I32, I8]),
+            (E4M3FN, &[F32, BF16, F16, E4M3FN]),
+        ];
+        let all = [
+            DType::Bool,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::I32,
+            DType::U32,
+            DType::I64,
+            DType::U64,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::F64,
+            DType::E4M3FN,
+            DType::E8M0,
+        ];
+        let mut pairs = 0;
+        for from in all {
+            let want: &[DType] = admitted
+                .iter()
+                .find(|(source, _)| *source == from)
+                .map_or(&[], |(_, targets)| targets);
+            for to in all {
+                let result = OpKind::Cast { to }.infer(&[TensorType::new(vec![2], from)]);
+                if want.contains(&to) {
+                    pairs += 1;
+                    assert_eq!(result, Ok(TensorType::new(vec![2], to)), "{from} -> {to}");
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(ShapeError::CastUnsupported { from, to }),
+                        "{from} -> {to}"
+                    );
+                }
+            }
+        }
+        assert_eq!(pairs, 27);
+        assert_eq!(
+            OpKind::Cast { to: DType::U8 }.infer(&[TensorType::f32(vec![2])]),
+            Err(ShapeError::CastUnsupported {
+                from: DType::F32,
+                to: DType::U8,
+            })
+        );
+    }
+
+    /// Card 380 FR-002. A dense contraction reads an arithmetic float weight, and `infer` is the only gate on
+    /// it: an integer or storage-only weight is refused, a float one is typed (a target's lack of a body for it
+    /// is the planner's refusal).
+    #[test]
+    fn dense_contraction_rejects_a_weight_that_is_not_an_arithmetic_float() {
+        for dtype in [DType::BF16, DType::F32, DType::F16] {
+            let op = OpKind::DenseContraction { weight: dtype };
+            assert_eq!(
+                op.infer(&[f(&[1, 3, 5]), TensorType::new(vec![7, 5], dtype)]),
+                Ok(f(&[1, 3, 7])),
+                "{dtype:?}"
             );
+        }
+        for dtype in [DType::I32, DType::I8, DType::E4M3FN] {
             let op = OpKind::DenseContraction { weight: dtype };
             assert!(matches!(
                 op.infer(&[f(&[1, 3, 5]), TensorType::new(vec![7, 5], dtype)]),
@@ -3343,14 +3415,11 @@ mod tests {
         assert_eq!(op.infer(&[table, scalar]), Ok(f(&[5])));
     }
 
-    /// Card 381 FR-002. The admitted source dtype is a TABLE, and `infer` is the only gate on it.
+    /// Card 381 FR-002. A row gather widens its rows to F32, so a source needs a defined decode: `infer` is the
+    /// only gate on it, and an integer source has none.
     #[test]
-    fn dense_row_gather_rejects_an_unadmitted_source_dtype() {
-        for dtype in [DType::F32, DType::F16, DType::I32, DType::I8] {
-            assert!(
-                !DENSE_ROW_GATHER_SOURCE_DTYPES.contains(&dtype),
-                "{dtype:?} is in the table; this test needs an unadmitted dtype"
-            );
+    fn dense_row_gather_rejects_a_source_without_a_decode_to_f32() {
+        for dtype in [DType::I32, DType::I8] {
             let op = OpKind::DenseRowGather { source: dtype };
             assert!(matches!(
                 op.infer(&[
@@ -3411,36 +3480,16 @@ mod tests {
         ));
     }
 
-    /// Card 405 FR-001. `DType::E4M3FN` is a second admitted `DenseRowGather` source through the same table-driven
-    /// gate BF16 uses: no new `OpKind` variant or hand-written branch.
+    /// Card 405 FR-001. `DType::E4M3FN` is a second admitted `DenseRowGather` source through the same gate BF16
+    /// uses: no new `OpKind` variant or hand-written branch.
     #[test]
     fn dense_row_gather_e4m3_source_is_admitted() {
-        assert!(DENSE_ROW_GATHER_SOURCE_DTYPES.contains(&DType::E4M3FN));
         let op = OpKind::DenseRowGather {
             source: DType::E4M3FN,
         };
         let table = TensorType::new(vec![2, 5], DType::E4M3FN);
         let index = TensorType::new(vec![1], DType::I32);
         assert_eq!(op.infer(&[table, index]), Ok(f(&[1, 5])));
-    }
-
-    /// Card 405 FR-004/SC-004. `DENSE_ROW_GATHER_SOURCE_DTYPES` is a `pub const` slice and cannot be un-compiled at
-    /// test time, so this test cannot make `DType::E4M3FN` unadmitted. It checks that the admission gate at
-    /// `infer`'s `DenseRowGather` arm is one table-driven line for every dtype, not a per-dtype branch: it asserts
-    /// the exact variant and field for `DType::F32` (still unadmitted). The same line would raise
-    /// `DenseRowGatherSourceDtype { actual: DType::E4M3FN }` if the E4M3FN row were removed.
-    #[test]
-    fn dense_row_gather_missing_e4m3_row_rejects_by_name() {
-        let unadmitted = DType::F32;
-        assert!(!DENSE_ROW_GATHER_SOURCE_DTYPES.contains(&unadmitted));
-        let op = OpKind::DenseRowGather { source: unadmitted };
-        assert!(matches!(
-            op.infer(&[
-                TensorType::new(vec![2, 5], unadmitted),
-                TensorType::new(vec![1], DType::I32),
-            ]),
-            Err(ShapeError::DenseRowGatherSourceDtype { actual }) if actual == unadmitted
-        ));
     }
 
     /// POOT-1048. The grouped contraction types `[G, M, K] x [G * N, K] -> [G, M, N]`, and every malformed
@@ -3488,8 +3537,20 @@ mod tests {
                 ..
             })
         ));
-        // Only BF16 has grouped device rows.
+        // Any arithmetic float weight types; whether a target has grouped device rows for it is the planner's
+        // refusal. An integer or storage-only weight is not a weight.
         for dtype in [DType::F32, DType::F16] {
+            assert_eq!(
+                OpKind::GroupedDenseContraction {
+                    weight: dtype,
+                    groups: 3
+                }
+                .infer(&[f(&[3, 2, 5]), TensorType::new(vec![12, 5], dtype)]),
+                Ok(f(&[3, 2, 4])),
+                "{dtype:?}"
+            );
+        }
+        for dtype in [DType::I32, DType::E4M3FN] {
             assert!(matches!(
                 OpKind::GroupedDenseContraction { weight: dtype, groups: 3 }
                     .infer(&[f(&[3, 2, 5]), TensorType::new(vec![12, 5], dtype)]),
@@ -4365,12 +4426,22 @@ mod tests {
             })
         ));
 
-        // The established float-tensor/I32-literal coercion remains valid.
+        // The established float-tensor/I32-literal coercion remains valid, and only for a literal: the same
+        // rank-0 I32 as a value is a real tensor and must agree with the float one (R2-L01-005).
+        let operand_types = [f(&[2]), TensorType::scalar(DType::I32)];
+        let second_is_literal = |index: usize| index == 1;
         assert_eq!(
             OpKind::Binary(BinOp::Add)
-                .infer(&[f(&[2]), TensorType::scalar(DType::I32)])
+                .infer(Operands::new(&operand_types, &second_is_literal))
                 .unwrap(),
             f(&[2])
+        );
+        assert_eq!(
+            OpKind::Binary(BinOp::Add).infer(&operand_types),
+            Err(ShapeError::Dtype {
+                a: f(&[2]),
+                b: TensorType::scalar(DType::I32),
+            })
         );
     }
 
@@ -4547,7 +4618,7 @@ mod tests {
                 op,
                 inputs: operands,
             }],
-            output: n_inputs,
+            output: LocalId::new(n_inputs),
             pack: Vec::new(),
         }
     }
@@ -4562,9 +4633,12 @@ mod tests {
             axis: 1,
             steps: vec![RowStep::Pointwise {
                 op: FusedOp::Unary(UnOp::Neg),
-                inputs: vec![FusedOperand::PackLane { input: 0, lane: 0 }],
+                inputs: vec![FusedOperand::PackLane {
+                    input: LocalId::new(0),
+                    lane: 0,
+                }],
             }],
-            output: 1,
+            output: LocalId::new(1),
         };
         assert_eq!(
             region.infer(&[i32_ty(&[2, 4])]),
@@ -4577,9 +4651,12 @@ mod tests {
             axis: 1,
             steps: vec![RowStep::Reduce {
                 op: RedOp::Sum,
-                input: FusedOperand::PackLane { input: 0, lane: 0 },
+                input: FusedOperand::PackLane {
+                    input: LocalId::new(0),
+                    lane: 0,
+                },
             }],
-            output: 1,
+            output: LocalId::new(1),
         };
         assert_eq!(
             reduce.infer(&[i32_ty(&[2, 4])]),
@@ -4600,21 +4677,25 @@ mod tests {
             OpKind::Fused(one_step_fused(
                 1,
                 FusedOp::Unary(UnOp::Neg),
-                vec![FusedOperand::Local(local)],
+                vec![FusedOperand::Local(LocalId::new(local))],
             ))
         };
         let pack_neg = |input, lane| {
             OpKind::Fused(one_step_fused(
                 1,
                 FusedOp::Unary(UnOp::Neg),
-                vec![FusedOperand::PackLane { input, lane }],
+                vec![FusedOperand::PackLane {
+                    input: LocalId::new(input),
+                    lane,
+                }],
             ))
         };
         let pack_of = |locals: Vec<usize>| {
+            let locals = locals.into_iter().map(LocalId::new).collect();
             OpKind::Fused(FusedRegion {
                 n_inputs: 2,
                 steps: Vec::new(),
-                output: 0,
+                output: LocalId::new(0),
                 pack: locals,
             })
         };
@@ -4642,7 +4723,10 @@ mod tests {
             region: one_step_fused(
                 2,
                 FusedOp::Binary(BinOp::Add),
-                vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+                vec![
+                    FusedOperand::Local(LocalId::new(0)),
+                    FusedOperand::Local(LocalId::new(1)),
+                ],
             ),
         };
         let cases: Vec<(&str, OpKind, Vec<TensorType>, ShapeError)> = vec![
@@ -4651,18 +4735,6 @@ mod tests {
                 OpKind::ArgTopK { k: 1 },
                 vec![scalar.clone()],
                 rank_too_low("ArgTopK", "input"),
-            ),
-            (
-                "pack_i8 of a scalar",
-                OpKind::PackI8,
-                vec![scalar.clone()],
-                rank_too_low("PackI8", "input"),
-            ),
-            (
-                "unpack_i8 of a scalar",
-                OpKind::UnpackI8 { len: 4 },
-                vec![i32_scalar.clone()],
-                rank_too_low("UnpackI8", "codes"),
             ),
             (
                 "scatter_update of a scalar base",
@@ -4777,7 +4849,7 @@ mod tests {
                 local_neg(5),
                 vec![f(&[2])],
                 ShapeError::FusedOperand(FusedOperandReason::LocalNotDefined {
-                    local: 5,
+                    local: LocalId::new(5),
                     defined: 1,
                 }),
             ),
@@ -4786,7 +4858,7 @@ mod tests {
                 pack_neg(3, 0),
                 vec![i32_ty(&[2, 4])],
                 ShapeError::FusedOperand(FusedOperandReason::PackLaneInput {
-                    input: 3,
+                    input: LocalId::new(3),
                     inputs: 1,
                 }),
             ),
@@ -4795,7 +4867,7 @@ mod tests {
                 pack_neg(0, 4),
                 vec![i32_ty(&[2, 4])],
                 ShapeError::FusedOperand(FusedOperandReason::PackLaneWidth {
-                    input: 0,
+                    input: LocalId::new(0),
                     lane: 4,
                     width: 4,
                 }),
@@ -4805,7 +4877,7 @@ mod tests {
                 pack_of(vec![0]),
                 vec![f(&[2, 3]), f(&[2, 3])],
                 ShapeError::FusedPack {
-                    local: 0,
+                    local: LocalId::new(0),
                     expected: Box::new(f(&[2, 1])),
                     actual: Box::new(f(&[2, 3])),
                 },
@@ -4815,7 +4887,7 @@ mod tests {
                 pack_of(vec![0, 1]),
                 vec![f(&[2, 1]), f(&[3, 1])],
                 ShapeError::FusedPack {
-                    local: 1,
+                    local: LocalId::new(1),
                     expected: Box::new(f(&[2, 1])),
                     actual: Box::new(f(&[3, 1])),
                 },
@@ -4848,9 +4920,9 @@ mod tests {
             n_inputs: 1,
             steps: vec![FusedStep {
                 op: FusedOp::Binary(op),
-                inputs: vec![FusedOperand::Local(0), FusedOperand::Lit(lit)],
+                inputs: vec![FusedOperand::Local(LocalId::new(0)), FusedOperand::Lit(lit)],
             }],
-            output: 1,
+            output: LocalId::new(1),
             pack: Vec::new(),
         })
     }
@@ -4863,14 +4935,17 @@ mod tests {
             steps: vec![
                 RowStep::Reduce {
                     op: reduce,
-                    input: FusedOperand::Local(0),
+                    input: FusedOperand::Local(LocalId::new(0)),
                 },
                 RowStep::Pointwise {
                     op: FusedOp::Binary(combine),
-                    inputs: vec![FusedOperand::Local(0), FusedOperand::Local(1)],
+                    inputs: vec![
+                        FusedOperand::Local(LocalId::new(0)),
+                        FusedOperand::Local(LocalId::new(1)),
+                    ],
                 },
             ],
-            output,
+            output: LocalId::new(output),
         })
     }
 
@@ -4926,18 +5001,18 @@ mod tests {
                     n_inputs: 1,
                     steps: vec![FusedStep {
                         op: FusedOp::Unary(UnOp::Neg),
-                        inputs: vec![FusedOperand::Local(0)],
+                        inputs: vec![FusedOperand::Local(LocalId::new(0))],
                     }],
-                    output: 1,
-                    pack: vec![1],
+                    output: LocalId::new(1),
+                    pack: vec![LocalId::new(1)],
                 }),
                 OpKind::Fused(FusedRegion {
                     n_inputs: 1,
                     steps: vec![FusedStep {
                         op: FusedOp::Unary(UnOp::Neg),
-                        inputs: vec![FusedOperand::Local(0)],
+                        inputs: vec![FusedOperand::Local(LocalId::new(0))],
                     }],
-                    output: 1,
+                    output: LocalId::new(1),
                     pack: Vec::new(),
                 }),
             ),
@@ -5151,12 +5226,8 @@ mod tests {
                     dtype.hash(h);
                 }
                 OpKind::Gather { axis } => axis.hash(h),
-                OpKind::Scatter { axis } => axis.hash(h),
-                OpKind::Select
-                | OpKind::ScatterUpdate
-                | OpKind::MatMul
-                | OpKind::IndexedMatMul
-                | OpKind::PackI8 => {} // no params beyond the discriminant already hashed
+                OpKind::Select | OpKind::ScatterUpdate | OpKind::MatMul | OpKind::IndexedMatMul => {
+                } // no params beyond the discriminant already hashed
                 OpKind::ContractionEpilogue { head, region } => {
                     head.hash(h);
                     region.n_inputs.hash(h);
@@ -5181,7 +5252,6 @@ mod tests {
                 OpKind::DenseRowGather { source } => source.hash(h),
                 OpKind::ArgTopK { k } => k.hash(h),
                 OpKind::DynamicUpdateSlice { axis } => axis.hash(h),
-                OpKind::UnpackI8 { len } => len.hash(h),
                 OpKind::Fused(region) => {
                     region.n_inputs.hash(h);
                     region.steps.len().hash(h);

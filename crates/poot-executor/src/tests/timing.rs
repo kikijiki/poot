@@ -179,7 +179,7 @@ impl Device for FakeDevice {
 fn fixture() -> (
     poot_graph_ir::Graph,
     Arc<WeightStore>,
-    Arc<poot_quant::weights::WeightMap>,
+    Arc<poot_weights::WeightMap>,
 ) {
     use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_tensor::DType;
@@ -248,7 +248,7 @@ fn load_with(
     (g, store, map): (
         poot_graph_ir::Graph,
         Arc<WeightStore>,
-        Arc<poot_quant::weights::WeightMap>,
+        Arc<poot_weights::WeightMap>,
     ),
 ) -> (crate::ExecutableId, crate::EntryId) {
     let target = engine.device().target();
@@ -265,7 +265,7 @@ fn load_with(
 fn fixture_shared_kind_different_keys() -> (
     poot_graph_ir::Graph,
     Arc<WeightStore>,
-    Arc<poot_quant::weights::WeightMap>,
+    Arc<poot_weights::WeightMap>,
 ) {
     use poot_quant::weights::{DenseWeight, WeightEntry};
     use poot_tensor::DType;

@@ -13,10 +13,8 @@
 
 use poot_graph_ir::ops::MASK_HIDDEN;
 use poot_graph_ir::{BinOp, Builder, RedOp, Scalar, Traced, ops};
-use poot_quant::weights::{
-    AttnRole, CompressRole, DsaRole, MlaRole, WeightId, WeightMap, WeightRole,
-};
 use poot_tensor::DType;
+use poot_weights::{AttnRole, CompressRole, DsaRole, MlaRole, WeightId, WeightMap, WeightRole};
 
 use super::attention::{carried_cache, first_writes};
 use super::linear::{Weight, WeightError, linear};
@@ -724,7 +722,7 @@ mod tests {
 
     mod pooled {
         use super::*;
-        use poot_quant::weights::{AttnRole, CompressRole, MlaRole};
+        use poot_weights::{AttnRole, CompressRole, MlaRole};
 
         const WIDTH: usize = 6;
         const HEADS: usize = 2;

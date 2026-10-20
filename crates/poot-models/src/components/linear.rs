@@ -10,8 +10,8 @@
 //! arm here.
 
 use poot_graph_ir::{BinOp, Builder, TensorType, Traced, WeightRef};
-use poot_quant::weights::{HandleFormat, WeightHandle, WeightId, WeightMap, WeightMapError};
 use poot_tensor::DType;
+use poot_weights::{HandleFormat, WeightHandle, WeightId, WeightMap, WeightMapError};
 
 use crate::model::{ConfigReason, FamilyKey, ModelError};
 use crate::model::{TraceError, WiringError};
@@ -201,7 +201,7 @@ pub fn linear(
 
 #[cfg(test)]
 mod tests {
-    use poot_quant::weights::WeightRole;
+    use poot_weights::WeightRole;
 
     use super::*;
     use crate::components::standard::oracle::{self, Fx};
@@ -211,8 +211,8 @@ mod tests {
     #[test]
     fn linear_matches_an_f64_reference_and_depends_on_weight_and_bias() {
         let (m, k, n) = (3, 5, 4);
-        let w_id = WeightId::layer(0, WeightRole::Attn(poot_quant::weights::AttnRole::Q));
-        let b_id = WeightId::layer(0, WeightRole::Attn(poot_quant::weights::AttnRole::QBias));
+        let w_id = WeightId::layer(0, WeightRole::Attn(poot_weights::AttnRole::Q));
+        let b_id = WeightId::layer(0, WeightRole::Attn(poot_weights::AttnRole::QBias));
         let mut fx = Fx::new(7);
         fx.bf16(w_id, &[n, k]);
         fx.f32(b_id, &[n]);
@@ -257,7 +257,7 @@ mod tests {
         use poot_quant::format::WeightFormat;
 
         let (m, k, n) = (2, 64, 8);
-        let id = WeightId::layer(0, WeightRole::Ffn(poot_quant::weights::FfnRole::Up));
+        let id = WeightId::layer(0, WeightRole::Ffn(poot_weights::FfnRole::Up));
         let mut fx = Fx::new(1);
         fx.packed(
             id,

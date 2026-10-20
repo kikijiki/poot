@@ -11,12 +11,13 @@
 //! with no hyper-connections and the four tensors that fuse the embedding with the hidden state and
 //! norm the output ([`MtpRole`]). The first one is mapped and traced (the `draft` program); the others,
 //! and the embedding and head copies a layer may store (the shared head reads the target's), are
-//! claimed as known: the map's [`LoadReport`](poot_quant::weights::LoadReport) lists them as known,
+//! claimed as known: the map's [`LoadReport`](poot_weights::LoadReport) lists them as known,
 //! not unknown.
 
-use poot_quant::weights::{
+use poot_quant::weights::{WeightKey, WeightStore};
+use poot_weights::{
     AttnRole, CompressRole, DsaRole, ExpertProj, FfnRole, KdaRole, MhcRole, MlaRole, MoeRole,
-    MtpRole, NormRole, WeightId, WeightKey, WeightMap, WeightRole, WeightStore, WeightView,
+    MtpRole, NormRole, WeightId, WeightMap, WeightRole, WeightView,
 };
 
 use super::FAMILY;

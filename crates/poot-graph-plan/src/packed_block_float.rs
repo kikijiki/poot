@@ -2,7 +2,7 @@
 //! format admits, on which backend.
 
 use poot_quant::PackedWeight;
-use poot_target::Backend;
+use poot_target::DeviceCaps;
 
 // --- Card 542a: the descriptor-driven packed kernel lowering table -----------------------------
 
@@ -23,9 +23,8 @@ pub enum PackedKernelOpKind {
 pub struct PackedLoweringRow {
     /// The kernel op the row lowers.
     pub op: PackedKernelOpKind,
-    /// Whether the row lowers on a backend. A predicate, not a list: a [`Backend`] carries the runtime
-    /// `AmdArch`, so it is not `const`-constructible, and admission never depends on which AMD part is attached.
-    pub backends: fn(Backend) -> bool,
+    /// Whether the row lowers on a device. A predicate over the device's caps, never a list of backend names.
+    pub devices: fn(&DeviceCaps) -> bool,
     /// The descriptor predicate a format must satisfy for the row to admit it.
     pub admits: fn(&poot_quant::format::FormatDescriptor) -> bool,
 }
@@ -57,7 +56,7 @@ fn admits_blocks_or_planar(descriptor: &poot_quant::format::FormatDescriptor) ->
 }
 
 /// A row that lowers on every backend.
-fn every_backend(_: Backend) -> bool {
+fn every_device(_: &DeviceCaps) -> bool {
     true
 }
 
@@ -69,30 +68,30 @@ fn every_backend(_: Backend) -> bool {
 pub const PACKED_LOWERING: &[PackedLoweringRow] = &[
     PackedLoweringRow {
         op: PackedKernelOpKind::RowGather,
-        backends: every_backend,
+        devices: every_device,
         admits: admits_blocks,
     },
     PackedLoweringRow {
         op: PackedKernelOpKind::Contraction,
-        backends: every_backend,
+        devices: every_device,
         admits: admits_blocks_or_planar,
     },
 ];
 
-/// Whether `table` has a row admitting `weight`'s descriptor for `kind` on `backend`: the weight's format when
+/// Whether `table` has a row admitting `weight`'s descriptor for `kind` on the device `caps` describes: the weight's format when
 /// it does, else the equation is refused by name (`Capability::PackedLowering`) at claim time, never a panic
 /// (dquant.md section 5, SC-006).
 pub fn admit_packed(
     table: &[PackedLoweringRow],
     weight: PackedWeight,
     kind: PackedKernelOpKind,
-    backend: Backend,
+    caps: &DeviceCaps,
 ) -> Result<poot_quant::format::WeightFormat, crate::refusal::Capability> {
     let format = weight.format();
     let descriptor = format.descriptor();
     let admitted = table
         .iter()
-        .any(|row| row.op == kind && (row.backends)(backend) && (row.admits)(&descriptor));
+        .any(|row| row.op == kind && (row.devices)(caps) && (row.admits)(&descriptor));
     if !admitted {
         return Err(crate::refusal::Capability::PackedLowering { format, op: kind });
     }
@@ -105,10 +104,12 @@ mod packed_lowering_tests {
 
     use super::*;
     use crate::refusal::Capability;
+    use poot_target::Backend;
+    use poot_test_util::device_caps::default_caps_for;
 
     /// A test table row that lowers on the SPIR-V backend only.
-    fn spirv_only(backend: Backend) -> bool {
-        matches!(backend, Backend::SpirvVulkan)
+    fn spirv_only(caps: &DeviceCaps) -> bool {
+        !caps.native_two_byte_floats
     }
 
     /// SC-006 (card 542a): a test-only table without the Gemv row yields
@@ -120,7 +121,7 @@ mod packed_lowering_tests {
         let table = &[
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
-                backends: spirv_only,
+                devices: spirv_only,
                 admits: admits_blocks,
             },
             // No Contraction row: a Gemv contraction has nothing to admit it.
@@ -128,7 +129,7 @@ mod packed_lowering_tests {
         let weight = PackedWeight::try_new(WeightFormat::Q4_0, [4, 32]).unwrap();
         let kind = PackedKernelOpKind::Contraction;
         assert_eq!(
-            admit_packed(table, weight, kind, Backend::SpirvVulkan),
+            admit_packed(table, weight, kind, &default_caps_for(Backend::SpirvVulkan)),
             Err(Capability::PackedLowering {
                 format: WeightFormat::Q4_0,
                 op: kind,
@@ -136,7 +137,12 @@ mod packed_lowering_tests {
         );
         // Restoring the row (the real table) makes the same call succeed.
         assert_eq!(
-            admit_packed(PACKED_LOWERING, weight, kind, Backend::SpirvVulkan),
+            admit_packed(
+                PACKED_LOWERING,
+                weight,
+                kind,
+                &default_caps_for(Backend::SpirvVulkan)
+            ),
             Ok(WeightFormat::Q4_0)
         );
     }
@@ -159,7 +165,7 @@ mod packed_lowering_tests {
                     PACKED_LOWERING,
                     weight,
                     PackedKernelOpKind::Contraction,
-                    backend
+                    &default_caps_for(backend)
                 ),
                 Ok(WeightFormat::Q4_K),
                 "{backend:?}: Q4_K (SubScale/SubMin) must now be admitted (card 542b)"
@@ -176,7 +182,7 @@ mod packed_lowering_tests {
         let table = &[
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
-                backends: spirv_only,
+                devices: spirv_only,
                 admits: admits_blocks,
             },
             // No Contraction row: a Tiled contraction has nothing to admit it.
@@ -184,7 +190,7 @@ mod packed_lowering_tests {
         let weight = PackedWeight::try_new(WeightFormat::Q4_K, [4, 256]).unwrap();
         let kind = PackedKernelOpKind::Contraction;
         assert_eq!(
-            admit_packed(table, weight, kind, Backend::SpirvVulkan),
+            admit_packed(table, weight, kind, &default_caps_for(Backend::SpirvVulkan)),
             Err(Capability::PackedLowering {
                 format: WeightFormat::Q4_K,
                 op: kind,
@@ -192,7 +198,12 @@ mod packed_lowering_tests {
         );
         // Restoring the row (the real table) makes the same call succeed.
         assert_eq!(
-            admit_packed(PACKED_LOWERING, weight, kind, Backend::SpirvVulkan),
+            admit_packed(
+                PACKED_LOWERING,
+                weight,
+                kind,
+                &default_caps_for(Backend::SpirvVulkan)
+            ),
             Ok(WeightFormat::Q4_K)
         );
     }
@@ -219,7 +230,7 @@ mod packed_lowering_tests {
                     PACKED_LOWERING,
                     weight,
                     PackedKernelOpKind::Contraction,
-                    backend
+                    &default_caps_for(backend)
                 ),
                 Ok(format),
                 "{backend:?}: GPTQ Contraction must be admitted (card 542c)"
@@ -239,7 +250,7 @@ mod packed_lowering_tests {
                 PACKED_LOWERING,
                 weight,
                 PackedKernelOpKind::RowGather,
-                Backend::SpirvVulkan
+                &default_caps_for(Backend::SpirvVulkan)
             ),
             Err(Capability::PackedLowering {
                 format,
@@ -266,7 +277,7 @@ mod packed_lowering_tests {
                 PACKED_LOWERING,
                 weight,
                 PackedKernelOpKind::RowGather,
-                Backend::SpirvVulkan
+                &default_caps_for(Backend::SpirvVulkan)
             ),
             Err(Capability::PackedLowering {
                 format,
@@ -281,7 +292,7 @@ mod packed_lowering_tests {
                 PACKED_LOWERING,
                 weight,
                 PackedKernelOpKind::Contraction,
-                Backend::SpirvVulkan
+                &default_caps_for(Backend::SpirvVulkan)
             ),
             Ok(format)
         );
@@ -296,12 +307,12 @@ mod packed_lowering_tests {
         let table = &[
             PackedLoweringRow {
                 op: PackedKernelOpKind::RowGather,
-                backends: spirv_only,
+                devices: spirv_only,
                 admits: admits_blocks,
             },
             PackedLoweringRow {
                 op: PackedKernelOpKind::Contraction,
-                backends: spirv_only,
+                devices: spirv_only,
                 admits: admits_blocks,
             },
             // Every row admits block storage only: a planar descriptor has nothing to admit it.
@@ -312,12 +323,17 @@ mod packed_lowering_tests {
         let weight = PackedWeight::try_new(format, [8, 16]).unwrap();
         let kind = PackedKernelOpKind::Contraction;
         assert_eq!(
-            admit_packed(table, weight, kind, Backend::SpirvVulkan),
+            admit_packed(table, weight, kind, &default_caps_for(Backend::SpirvVulkan)),
             Err(Capability::PackedLowering { format, op: kind })
         );
         // Restoring the row (the real table) makes the same call succeed.
         assert_eq!(
-            admit_packed(PACKED_LOWERING, weight, kind, Backend::SpirvVulkan),
+            admit_packed(
+                PACKED_LOWERING,
+                weight,
+                kind,
+                &default_caps_for(Backend::SpirvVulkan)
+            ),
             Ok(format)
         );
     }

@@ -85,8 +85,6 @@ macro_rules! packed_ops {
                 ..
             }
             | OpKind::DenseRowGather { .. }
-            | OpKind::PackI8
-            | OpKind::UnpackI8 { .. }
     };
 }
 
@@ -192,7 +190,6 @@ macro_rules! movement_ops {
             | OpKind::Slice { .. }
             | OpKind::Concat { .. }
             | OpKind::Gather { .. }
-            | OpKind::Scatter { .. }
             | OpKind::Broadcast { .. }
             | OpKind::Reshape { .. }
             | OpKind::DynamicUpdateSlice { .. }
@@ -263,7 +260,7 @@ pub(crate) fn plan_graph(
         .into_iter()
         .unzip();
     // Storage reads the plans just made: no equation is planned a second time.
-    let storage = value_storage_of_plans(g, id, plans.iter().map(Some))?;
+    let storage = value_storage_of_plans(g, target, plans.iter().map(Some))?;
     let slots = g
         .slots()
         .iter()
@@ -441,7 +438,7 @@ fn plan_eqn_policy(
                     Operand::Value(src)
                         if g.meta(*src).storage.holds_weight_bytes()
                             && g.aval(*src).dtype == DType::BF16
-                            && bf16_const_is_packed(g, views, *src, target.id())
+                            && bf16_const_is_packed(g, views, *src, target)
                 )
             })
             .collect()
@@ -616,51 +613,16 @@ fn plan_gpu_eqn(
     // other op/backend keeps a named rejection before scalar type selection can reinterpret E4M3FN as f32/i8/i32.
     let has_e4m3fn_input = ids.iter().any(|&id| g.aval(id).dtype == DType::E4M3FN);
     if g.aval(eqn.out).dtype == DType::E4M3FN || has_e4m3fn_input {
-        if matches!(eqn.op, OpKind::Gather { .. })
-            && (ids.len() != 2
-                || g.aval(ids[0]).dtype != DType::E4M3FN
-                || g.aval(ids[1]).dtype != DType::I32)
-        {
-            return Err(site.refuse(Capability::DtypeLowering));
-        }
-        if matches!(eqn.op, OpKind::ScatterUpdate)
-            && (ids.len() != 3
-                || g.aval(ids[0]).dtype != DType::E4M3FN
-                || g.aval(ids[1]).dtype != DType::E4M3FN
-                || g.aval(ids[2]).dtype != DType::I32
-                || g.aval(eqn.out).dtype != DType::E4M3FN)
-        {
-            return Err(site.refuse(Capability::DtypeLowering));
-        }
-        if matches!(eqn.op, OpKind::DynamicUpdateSlice { .. }) {
-            let valid_storage = g.aval(eqn.out).dtype == DType::E4M3FN
-                && matches!(eqn.inputs.first(), Some(Operand::Value(id)) if g.aval(*id).dtype == DType::E4M3FN)
-                && matches!(eqn.inputs.get(1), Some(Operand::Value(id)) if g.aval(*id).dtype == DType::E4M3FN)
-                && match eqn.inputs.get(2) {
-                    Some(Operand::Lit(Scalar::I32(_))) => true,
-                    Some(Operand::Value(id)) => g.aval(*id).dtype == DType::I32,
-                    _ => false,
-                };
-            if !valid_storage {
-                return Err(site.refuse(Capability::DtypeLowering));
-            }
-        }
-        // AmdGcn has no E4M3FN tensor storage, but the packed-lane row gather reads the table as
-        // row-padded u32 words like the BF16 one, so it alone is admitted there.
+        // A device without native E4M3FN tensor storage still reads the table through the packed-lane row
+        // gather, which takes it as row-padded u32 words like the BF16 one, so it alone is admitted there.
         let admitted_row_gather = matches!(
             eqn.op,
             OpKind::DenseRowGather {
                 source: DType::E4M3FN
             }
         );
-        if !matches!(backend, Backend::SpirvVulkan | Backend::Nvptx) && !admitted_row_gather {
+        if caps.e4m3_storage == poot_target::E4m3Storage::None && !admitted_row_gather {
             return Err(site.refuse(Capability::E4m3Storage));
-        }
-        if matches!(eqn.op, OpKind::Concat { .. })
-            && (g.aval(eqn.out).dtype != DType::E4M3FN
-                || ids.iter().any(|&id| g.aval(id).dtype != DType::E4M3FN))
-        {
-            return Err(site.refuse(Capability::DtypeLowering));
         }
         if !matches!(
             eqn.op,
@@ -682,17 +644,6 @@ fn plan_gpu_eqn(
         ) {
             return Err(site.refuse(Capability::E4m3Storage));
         }
-    }
-
-    // Card 546a (R-546-4): a non-axis-0 scatter (the `Scatter` op is axis-0-only by definition, so this
-    // is a defensive guard that no live tracer hits) is refused outright on every target: the contract
-    // has no host fallback (Card 626 deleted `Plan::Host`). Non-axis-0 GATHER (`gather_axis_dt`)
-    // and `>2` (and 1-input) CONCAT (`concat_n_dt`) run on-device (card 043); the MoE gate is a primitive
-    // composition (card 061).
-    if let OpKind::Scatter { axis } = eqn.op
-        && axis >= 1
-    {
-        return Err(site.refuse(Capability::ScatterNonZeroAxis { axis }));
     }
 
     // spec 024: the output storage dtype. bf16 is wired only for MatMul, broadcast Binary (value

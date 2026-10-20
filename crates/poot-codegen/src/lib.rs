@@ -96,11 +96,6 @@ pub struct Capability {
     /// `Target::Nvptx` like any other kernel; `false` here just meant PTX paid an extra materialize copy
     /// for no codegen reason (R-546-9, card 549).
     pub strided_views: bool,
-    /// The imported tiled-GEMM bodies (`MatMul`, card 044) compile for this target. Their
-    /// Rust-compiled LDS arrays carry a zeroinitializer in addrspace(3), which AMDGPU LLVM rejects
-    /// (R468-015); AmdGcn takes the synthesized tiled-GEMM body (`kg::tiled_region`) instead, which
-    /// uses an uninitialized `WorkgroupLocalDecl`.
-    pub imported_lds_array_bodies: bool,
 }
 
 /// The capability query for `target`. See [`Capability`]'s fields for what each one means and why it
@@ -109,23 +104,18 @@ pub fn capability(target: Target) -> Capability {
     match target {
         Target::SpirvVulkan => Capability {
             strided_views: true,
-            imported_lds_array_bodies: true,
         },
         Target::SpirvOpenCl => Capability {
             strided_views: true,
-            imported_lds_array_bodies: true,
         },
         Target::AmdGcn(_) => Capability {
             strided_views: true,
-            imported_lds_array_bodies: false,
         },
         Target::Nvptx => Capability {
             strided_views: true,
-            imported_lds_array_bodies: true,
         },
         Target::AieCore => Capability {
             strided_views: false,
-            imported_lds_array_bodies: false,
         },
     }
 }

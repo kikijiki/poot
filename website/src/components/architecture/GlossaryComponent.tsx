@@ -203,12 +203,12 @@ const ENTRIES: Entry[] = [
   },
   {
     term: "OpenVINO",
-    def: "Intel's model compiler/runtime stack. poot had an experimental Intel NPU prefill offload path that emitted OpenVINO IR from the graph; it was removed.",
+    def: "Intel's model compiler/runtime stack. poot lowers graph regions to OpenVINO IR text for the Intel NPU, which the NPU runtime consumes. The NPU is under active development, with prefill as the goal.",
     see: "npu",
   },
   {
     term: "OpKind",
-    def: "The enum of all operations in the graph IR: primitives (Unary, Binary, Select, Reduce, Broadcast, Cast, Reshape, Transpose, Slice, Concat, Gather, Scatter, MatMul, ...) and compiler-introduced composites (Fused, FusedRow, ContractionEpilogue, Attention, Rope, packed and dense contractions). No op records a kernel choice; the planner records it with each plan.",
+    def: "The enum of all operations in the graph IR: primitives (Unary, Binary, Select, Reduce, Broadcast, Cast, Reshape, Transpose, Slice, Concat, Gather, MatMul, ...) and compiler-introduced composites (Fused, FusedRow, ContractionEpilogue, Attention, Rope, packed and dense contractions). No op records a kernel choice; the planner records it with each plan.",
     see: "graph-ir",
   },
   {
@@ -254,11 +254,6 @@ const ENTRIES: Entry[] = [
   {
     term: "Safetensors",
     def: "A file format for storing model weights, used by Hugging Face. poot-load reads tensor byte ranges into typed weight owners, preserving their stored dtype or packed format.",
-  },
-  {
-    term: "Scatter",
-    def: "The inverse of an axis-0 Gather: writes rows of a source into a target through a permutation index. Used in MoE routing. KV cache writes use DynamicUpdateSlice (dense) or ScatterUpdate (paged).",
-    see: "graph-ir",
   },
   {
     term: "Speculative decoding",
